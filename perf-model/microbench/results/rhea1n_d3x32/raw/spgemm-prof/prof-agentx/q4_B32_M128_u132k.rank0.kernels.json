@@ -1,0 +1,458 @@
+{
+ "trace": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31gap/runs/spgemm-prof/prof-agentx/q4_B32_M128_u132k.rank0.trace.json.gz",
+ "replays": 3,
+ "span_us": 12274.02,
+ "busy_us": 13712.82,
+ "pre_forward_us": 4903.58,
+ "activities": 634,
+ "kernels": [
+  {
+   "name": "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl",
+   "us": 7084.1,
+   "pct": 51.58,
+   "calls": 23,
+   "example": "void deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl<3840u, 3584u, 3072u, 896u, 0u, 16u, 16u, 128u, 128u, 8u, 8u, 128u, 128u, 128640u, 2058240u, 11u, 3584u, 128u, 128u, 256u, 212u, 4u, (float)[40800000], (float)[41c80000], true, cutlass::detail::float_e2m1_unpacksmem_t, false, 6144u, 3584u, 3584u, 3072u"
+  },
+  {
+   "name": "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialized_decodecutedslmladcp_without_reducerlocalsSplitPartials",
+   "us": 840.7,
+   "pct": 6.12,
+   "calls": 5,
+   "example": "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialized_decodecutedslmladcp_without_reducerlocalsSplitPartials_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_Th_0"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslgemmsplitkSplitKGemm",
+   "us": 493.51,
+   "pct": 3.59,
+   "calls": 46,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslgemmsplitkSplitKGemm_object_at__tensorptrbf16gmemalign16oi6410_tensorptrbf16gmemalign16oi6410_tensorptrbf16gmemalign1_0"
+  },
+  {
+   "name": "kernel_cutlass_tiled_vllmmodelskimi_k3nvidiaspecialized_decodecutedslmlaqueryMlaQuery",
+   "us": 457.75,
+   "pct": 3.33,
+   "calls": 11,
+   "example": "kernel_cutlass_tiled_vllmmodelskimi_k3nvidiaspecialized_decodecutedslmlaqueryMlaQuery_object_at__tensorptrbf16_gmem_align16_o_128534453441_tensorptrbf16_gmem_align16_o_15361_tensorptrbf16_0"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslkdawideKdaWide",
+   "us": 432.27,
+   "pct": 3.15,
+   "calls": 18,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslkdawideKdaWide_object_at__tensorptrbf16_gmem_align16_o_1289216124481_tensorptrf32_gmem_align16_o_3430721228830721_ten_0"
+  },
+  {
+   "name": "nvjet_sm107_tst_160x64_64x16_2x2_2cta_h_bz_TNN",
+   "us": 377.66,
+   "pct": 2.75,
+   "calls": 18,
+   "example": "nvjet_sm107_tst_160x64_64x16_2x2_2cta_h_bz_TNN"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x32_64x16_2x1_2cta_v_bz_TNT",
+   "us": 369.01,
+   "pct": 2.69,
+   "calls": 23,
+   "example": "nvjet_sm107_tst_64x32_64x16_2x1_2cta_v_bz_TNT"
+  },
+  {
+   "name": "k31dcpx::topk_merge_kernel",
+   "us": 302.68,
+   "pct": 2.2,
+   "calls": 6,
+   "example": "void k31dcpx::topk_merge_kernel<16>(k31dcpx::TopkParams)"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT",
+   "us": 294.73,
+   "pct": 2.15,
+   "calls": 24,
+   "example": "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT"
+  },
+  {
+   "name": "sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel",
+   "us": 247.72,
+   "pct": 1.8,
+   "calls": 49,
+   "example": "void sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel<7168, 1, 3, 1, false, false, true>(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16*, int, int, int, float, __nv_bfloat16 const*, float, int)"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT",
+   "us": 171.12,
+   "pct": 1.25,
+   "calls": 23,
+   "example": "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT"
+  },
+  {
+   "name": "nvjet_sm107_tss_64x32_64x16_2x1_2cta_h_bz_splitK_TNT",
+   "us": 146.88,
+   "pct": 1.07,
+   "calls": 23,
+   "example": "nvjet_sm107_tss_64x32_64x16_2x1_2cta_h_bz_splitK_TNT"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslcommonsp_commSpAllGather",
+   "us": 146.18,
+   "pct": 1.06,
+   "calls": 24,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslcommonsp_commSpAllGather_object_at__tensorptrbf16_gmem_align16_o_32716871681_tensorptrbf16_gmem_align16_o_51271687168_0"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslcommonsp_commSpReduceScatter",
+   "us": 145.95,
+   "pct": 1.06,
+   "calls": 24,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslcommonsp_commSpReduceScatter_object_at__tensorptrbf16_gmem_align16_o_128716871681_tensorptrbf16_gmem_align16_o_412871_0"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsaoverlapQueryWait",
+   "us": 140.08,
+   "pct": 1.02,
+   "calls": 6,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsaoverlapQueryWait_object_at__tensorptri8_gmem_align16_o_512128576737285761_0"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT",
+   "us": 124.87,
+   "pct": 0.91,
+   "calls": 10,
+   "example": "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT"
+  },
+  {
+   "name": "deep_gemm::sm100_paged_mqa_logits",
+   "us": 121.95,
+   "pct": 0.89,
+   "calls": 6,
+   "example": "void deep_gemm::sm100_paged_mqa_logits<32u, 128u, 64u, 4u, 128u, 2u, 8u, 3u, 384u, 8u, 128u, 384u, cutlass::float_e2m1_t, 3u>(unsigned int, unsigned int, unsigned int, unsigned int const*, __nv_bfloat16*, unsigned int const*, unsigned int const*, unsigned int const*, CUtensorMap_st, CUtensorMap_st, "
+  },
+  {
+   "name": "cublasLt::splitKreduce_kernel",
+   "us": 108.61,
+   "pct": 0.79,
+   "calls": 31,
+   "example": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat1"
+  },
+  {
+   "name": "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256PagedKvDenseStaticTokenSparseP1VarSeqQ64Kv128Persistent2CtaKeepsAbForGen",
+   "us": 108.06,
+   "pct": 0.79,
+   "calls": 6,
+   "example": "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256PagedKvDenseStaticTokenSparseP1VarSeqQ64Kv128Persistent2CtaKeepsAbForGen"
+  },
+  {
+   "name": "vllm::situ_and_mul_kernel",
+   "us": 98.9,
+   "pct": 0.72,
+   "calls": 24,
+   "example": "void vllm::situ_and_mul_kernel<c10::BFloat16>(c10::BFloat16*, c10::BFloat16 const*, int, float, float)"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN",
+   "us": 94.71,
+   "pct": 0.69,
+   "calls": 6,
+   "example": "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN"
+  },
+  {
+   "name": "vllm::moe::single_group_topk::detail::single_group_topk_block_kernel",
+   "us": 94.27,
+   "pct": 0.69,
+   "calls": 23,
+   "example": "void vllm::moe::single_group_topk::detail::single_group_topk_block_kernel<float, float, int, (vllm::moe::ScoringFunc)1, 896, 16>(float const*, float*, int*, float const*, long, long, bool, float, bool)"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslmladcpDcpValue",
+   "us": 91.88,
+   "pct": 0.67,
+   "calls": 5,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedslmladcpDcpValue_object_at__tensorptrf32_gmem_align16_o_32384451278643220485121_tensorptrf32_gmem_o_323844153641_tensor_0"
+  },
+  {
+   "name": "kernel_cutlass_kernel_projected_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsadcp_valueDcpValue",
+   "us": 87.95,
+   "pct": 0.64,
+   "calls": 6,
+   "example": "kernel_cutlass_kernel_projected_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsadcp_valueDcpValue_object_at__tensorptrbf16_gmem_align16_o_1281965126553605121_tensorptrf32_gmem_o_128196_0"
+  },
+  {
+   "name": "ncclDevKernel_AllGather_RING",
+   "us": 86.95,
+   "pct": 0.63,
+   "calls": 1,
+   "example": "ncclDevKernel_AllGather_RING(ncclDevKernelArgsStorage<4096ul>)"
+  },
+  {
+   "name": "nvjet_sm107_tst_224x64_64x14_4x2f_2cta_h_bz_TNN",
+   "us": 81.9,
+   "pct": 0.6,
+   "calls": 1,
+   "example": "nvjet_sm107_tst_224x64_64x14_4x2f_2cta_h_bz_TNN"
+  },
+  {
+   "name": "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+   "us": 80.62,
+   "pct": 0.59,
+   "calls": 12,
+   "example": "void flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<(unsigned char)4, __nv_bfloat16, true, float4>(flashinfer::trtllm_mnnvl_allreduce::AllReduceKernelParams<__nv_bfloat16>)"
+  },
+  {
+   "name": "at::native::elementwise_kernel",
+   "us": 80.11,
+   "pct": 0.58,
+   "calls": 17,
+   "example": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x64_64x16_4x1_2cta_v_bz_TNT",
+   "us": 78.45,
+   "pct": 0.57,
+   "calls": 5,
+   "example": "nvjet_sm107_tst_64x64_64x16_4x1_2cta_v_bz_TNT"
+  },
+  {
+   "name": "vllm::rms_norm_kernel",
+   "us": 77.35,
+   "pct": 0.56,
+   "calls": 27,
+   "example": "void vllm::rms_norm_kernel<c10::BFloat16, 8, 2, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 const*, long, float, int, int)"
+  },
+  {
+   "name": "flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport",
+   "us": 66.53,
+   "pct": 0.48,
+   "calls": 10,
+   "example": "void flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport<__nv_bfloat16, (flashinfer::trtllm_mnnvl_allreduce::QuantType)0, true, 1, float4>(flashinfer::trtllm_mnnvl_allreduce::AllReduceKernelParams<__nv_bfloat16>)"
+  },
+  {
+   "name": "nvjet_sm107_tst_192x128_64x11_2x2f_2cta_h_bz_TNN",
+   "us": 63.77,
+   "pct": 0.46,
+   "calls": 1,
+   "example": "nvjet_sm107_tst_192x128_64x11_2x2f_2cta_h_bz_TNN"
+  },
+  {
+   "name": "nvjet_sm107_tst_416x64_64x9_1x2_2cta_h_bz_TNN",
+   "us": 58.6,
+   "pct": 0.43,
+   "calls": 3,
+   "example": "nvjet_sm107_tst_416x64_64x9_1x2_2cta_h_bz_TNN"
+  },
+  {
+   "name": "_prepare_megamoe_inputs_kernel",
+   "us": 52.92,
+   "pct": 0.39,
+   "calls": 23,
+   "example": "_prepare_megamoe_inputs_kernel"
+  },
+  {
+   "name": "nvjet_sm107_tst_96x64_64x16_1x2_2cta_h_bz_splitK_TNN",
+   "us": 50.91,
+   "pct": 0.37,
+   "calls": 5,
+   "example": "nvjet_sm107_tst_96x64_64x16_1x2_2cta_h_bz_splitK_TNN"
+  },
+  {
+   "name": "nvjet_sm107_tst_384x64_64x9_1x2_2cta_h_bz_splitK_TNN",
+   "us": 47.99,
+   "pct": 0.35,
+   "calls": 1,
+   "example": "nvjet_sm107_tst_384x64_64x9_1x2_2cta_h_bz_splitK_TNN"
+  },
+  {
+   "name": "nvjet_sm107_tst_192x64_64x15_1x2_2cta_h_bz_splitK_TNN",
+   "us": 41.33,
+   "pct": 0.3,
+   "calls": 1,
+   "example": "nvjet_sm107_tst_192x64_64x15_1x2_2cta_h_bz_splitK_TNN"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x64_64x16_8x1_2cta_v_bz_TNT",
+   "us": 35.17,
+   "pct": 0.26,
+   "calls": 6,
+   "example": "nvjet_sm107_tst_64x64_64x16_8x1_2cta_v_bz_TNT"
+  },
+  {
+   "name": "nvjet_sm107_tst_64x160_64x16_2x1_2cta_v_bz_TNT",
+   "us": 28.52,
+   "pct": 0.21,
+   "calls": 6,
+   "example": "nvjet_sm107_tst_64x160_64x16_2x1_2cta_v_bz_TNT"
+  },
+  {
+   "name": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsaindexDsaIndex",
+   "us": 26.74,
+   "pct": 0.19,
+   "calls": 6,
+   "example": "kernel_cutlass_kernel_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsaindexDsaIndex_object_at__tensorptrbf16_gmem_align16_o_128534453441_tensorptrbf16_gmem_align16_o_128409640961_tenso_0"
+  },
+  {
+   "name": "kernel_cutlass_tiled_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsaoverlapQueryNorm",
+   "us": 18.1,
+   "pct": 0.13,
+   "calls": 6,
+   "example": "kernel_cutlass_tiled_vllmmodelskimi_k3nvidiaspecialized_decodecutedsldsaoverlapQueryNorm_object_at__tensorptrbf16_gmem_align16_o_128534453441_tensorptrbf16_gmem_align16_o_15361_tensorptrb_0"
+  },
+  {
+   "name": "_gumbel_sample_kernel",
+   "us": 17.11,
+   "pct": 0.12,
+   "calls": 3,
+   "example": "_gumbel_sample_kernel"
+  },
+  {
+   "name": "k31dcpx::topk_pp_win_kernel",
+   "us": 16.67,
+   "pct": 0.12,
+   "calls": 6,
+   "example": "k31dcpx::topk_pp_win_kernel(k31dcpx::TopkParams)"
+  },
+  {
+   "name": "vllm::mnnvl_lamport_all_gather",
+   "us": 15.63,
+   "pct": 0.11,
+   "calls": 1,
+   "example": "void vllm::mnnvl_lamport_all_gather<__nv_bfloat16, 4>(vllm::RankData*, __nv_bfloat16 const*, __nv_bfloat16*, __nv_bfloat16*, unsigned int*, int, int, int)"
+  },
+  {
+   "name": "k31dcpx::topk_pp_hist_kernel",
+   "us": 15.49,
+   "pct": 0.11,
+   "calls": 6,
+   "example": "k31dcpx::topk_pp_hist_kernel(k31dcpx::TopkParams)"
+  },
+  {
+   "name": "at::native::reduce_kernel",
+   "us": 11.93,
+   "pct": 0.09,
+   "calls": 3,
+   "example": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)"
+  },
+  {
+   "name": "flashinfer::ComputeLSEFromMDKernel",
+   "us": 10.92,
+   "pct": 0.08,
+   "calls": 6,
+   "example": "flashinfer::ComputeLSEFromMDKernel(float2*, float*, int, long, float, long, int)"
+  },
+  {
+   "name": "vllm::act_and_mul_kernel",
+   "us": 10.65,
+   "pct": 0.08,
+   "calls": 5,
+   "example": "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)), &(__nv_bfloat162 vllm::packed_silu_kernel<__nv_bfloat162>(__nv_bfloat162 const&, float)), true, true, false, false>(c10::BFloat16*, c10::BFloat16 const*, int, "
+  },
+  {
+   "name": "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN",
+   "us": 9.73,
+   "pct": 0.07,
+   "calls": 1,
+   "example": "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN"
+  },
+  {
+   "name": "at::native::vectorized_elementwise_kernel",
+   "us": 8.99,
+   "pct": 0.07,
+   "calls": 5,
+   "example": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>, false>(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)"
+  },
+  {
+   "name": "k31dcpx::topk_pp_window_kernel",
+   "us": 8.15,
+   "pct": 0.06,
+   "calls": 6,
+   "example": "k31dcpx::topk_pp_window_kernel(k31dcpx::TopkParams)"
+  },
+  {
+   "name": "_wlist_kernel",
+   "us": 7.23,
+   "pct": 0.05,
+   "calls": 1,
+   "example": "_wlist_kernel"
+  },
+  {
+   "name": "_kernel_slots_kernel",
+   "us": 7.2,
+   "pct": 0.05,
+   "calls": 3,
+   "example": "_kernel_slots_kernel"
+  },
+  {
+   "name": "at::native::vectorized_gather_kernel",
+   "us": 7.08,
+   "pct": 0.05,
+   "calls": 4,
+   "example": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)"
+  },
+  {
+   "name": "at::native::_scatter_gather_elementwise_kernel",
+   "us": 5.92,
+   "pct": 0.04,
+   "calls": 3,
+   "example": "void at::native::_scatter_gather_elementwise_kernel<128, 8, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_"
+  },
+  {
+   "name": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+   "us": 5.43,
+   "pct": 0.04,
+   "calls": 2,
+   "example": "void vllm::vocab_embedding::vocab_parallel_embedding_kernel<int, uint4>(uint4*, int const*, uint4 const*, long, long, long, long, long, long, long)"
+  },
+  {
+   "name": "_prepare_dflash_inputs_kernel",
+   "us": 3.23,
+   "pct": 0.02,
+   "calls": 1,
+   "example": "_prepare_dflash_inputs_kernel"
+  },
+  {
+   "name": "at::native::index_elementwise_kernel",
+   "us": 2.99,
+   "pct": 0.02,
+   "calls": 1,
+   "example": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayR"
+  },
+  {
+   "name": "vllm::concat_and_cache_mla_grouped_kernel",
+   "us": 2.82,
+   "pct": 0.02,
+   "calls": 1,
+   "example": "void vllm::concat_and_cache_mla_grouped_kernel<__nv_bfloat16, unsigned char, (vllm::Fp8KVCacheDataType)1>(__nv_bfloat16 const*, __nv_bfloat16 const*, long const*, float const*, long const*, long, long, long, long, long, long, long, int, int, int)"
+  },
+  {
+   "name": "namespace)::CatArrayBatchedCopy_vectorized",
+   "us": 2.26,
+   "pct": 0.02,
+   "calls": 1,
+   "example": "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 2, 128, 1, 16, 8>(char*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 128, 1>, at::"
+  },
+  {
+   "name": "memcpy128_aligned",
+   "us": 2.17,
+   "pct": 0.02,
+   "calls": 1,
+   "example": "memcpy128_aligned"
+  },
+  {
+   "name": "_quant_kernel",
+   "us": 2.14,
+   "pct": 0.02,
+   "calls": 1,
+   "example": "_quant_kernel"
+  },
+  {
+   "name": "vllm::rotary_embedding_kernel",
+   "us": 1.9,
+   "pct": 0.01,
+   "calls": 1,
+   "example": "void vllm::rotary_embedding_kernel<c10::BFloat16, float, false>(long const*, c10::BFloat16*, c10::BFloat16*, float const*, int, long, long, long, int, int, int, long, bool)"
+  },
+  {
+   "name": "_dcp_local_seq_lens_kernel",
+   "us": 1.7,
+   "pct": 0.01,
+   "calls": 1,
+   "example": "_dcp_local_seq_lens_kernel"
+  }
+ ]
+}

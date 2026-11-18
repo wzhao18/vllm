@@ -1,0 +1,4579 @@
+[
+ {
+  "kind": "step",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "step_ms": 12.2456,
+  "model_ach_ms": 3.0112616954347486,
+  "model_sol_ms": 2.1459461236458095,
+  "derate": 4.066601059139116,
+  "multinode_d3x32_ms": 20.92
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.11785791015625,
+  "exposed_ms": 7.11785791015625,
+  "ach_ms": 1.0671255216739506,
+  "derate": 6.670122460374479,
+  "gap_ms": 6.0507323884823
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 1.750649658203125,
+  "exposed_ms": 1.750649658203125,
+  "ach_ms": 0.2688103303015684,
+  "derate": 6.512583263593835,
+  "gap_ms": 1.4818393279015565
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 1.872544921875,
+  "exposed_ms": 1.6559822998046876,
+  "ach_ms": 1.1046298201074587,
+  "derate": 1.6951786813910548,
+  "gap_ms": 0.5513524796972288
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 0.378788330078125,
+  "exposed_ms": 0.333236083984375,
+  "ach_ms": 0.01364648040797459,
+  "derate": 27.757217887241644,
+  "gap_ms": 0.3195896035764004
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 0.5321533203125,
+  "exposed_ms": 0.3928551025390625,
+  "ach_ms": 0.11433350709104519,
+  "derate": 4.654395144974777,
+  "gap_ms": 0.2785215954480173
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 0.340004638671875,
+  "exposed_ms": 0.3097637939453125,
+  "ach_ms": 0.042349278501425267,
+  "derate": 8.0285816123274,
+  "gap_ms": 0.2674145154438872
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 0.387831787109375,
+  "exposed_ms": 0.387831787109375,
+  "ach_ms": 0.15768266868927447,
+  "derate": 2.459571431237168,
+  "gap_ms": 0.23014911842010052
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.254578369140625,
+  "exposed_ms": 0.254578369140625,
+  "ach_ms": 0.20722204779874215,
+  "derate": 1.2285293570106794,
+  "gap_ms": 0.04735632134188285
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.120865234375,
+  "exposed_ms": 0.0604326171875,
+  "ach_ms": 0.035462040863309355,
+  "derate": 3.4082988861493497,
+  "gap_ms": 0.024970576324190644
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.04585791015625,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.megamoe",
+  "busy_ms": 7.06672021484375,
+  "exposed_ms": 7.06672021484375,
+  "ach_ms": 1.0671255216739506,
+  "derate": 6.6222014854995805,
+  "calls": 23,
+  "top_kernels_us": {
+   "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7090.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "TAIL.drafter+final",
+  "busy_ms": 1.750649658203125,
+  "exposed_ms": 1.750649658203125,
+  "ach_ms": 0.2688103303015684,
+  "derate": 6.512583263593835,
+  "calls": 123,
+  "top_kernels_us": {
+   "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 794.7,
+   "sd:mlaqueryMlaQuery": 140.1,
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 99.4,
+   "ncclDevKernel_AllGather_RING": 89.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.topk_merge",
+  "busy_ms": 0.304180908203125,
+  "exposed_ms": 0.2918519287109375,
+  "ach_ms": 0.03850662641509433,
+  "derate": 7.899443200349751,
+  "calls": 6,
+  "top_kernels_us": {
+   "k31dcpx::topk_merge_kernel<16>": 304.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "KDA.core",
+  "busy_ms": 0.387831787109375,
+  "exposed_ms": 0.387831787109375,
+  "ach_ms": 0.15768266868927447,
+  "derate": 2.459571431237168,
+  "calls": 18,
+  "top_kernels_us": {
+   "sd:kdawideKdaWide": 391.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.q_path",
+  "busy_ms": 0.31926904296875,
+  "exposed_ms": 0.1902349853515625,
+  "ach_ms": 0.06352150389842948,
+  "derate": 5.026156866173373,
+  "calls": 12,
+  "top_kernels_us": {
+   "sd:mlaqueryMlaQuery": 320.9,
+   "sd:dsaoverlapQueryNorm": 9.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "ATTNRES",
+  "busy_ms": 0.127987548828125,
+  "exposed_ms": 0.11553125,
+  "ach_ms": 0.013057703894174981,
+  "derate": 9.801688709239304,
+  "calls": 49,
+  "top_kernels_us": {
+   "true>": 125.5,
+   "false>": 3.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.router+latent_down",
+  "busy_ms": 0.39877392578125,
+  "exposed_ms": 0.201722900390625,
+  "ach_ms": 0.1083595326618705,
+  "derate": 3.6801000888920443,
+  "calls": 69,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 251.0,
+   "nvjet_sm107_tss_64x32_64x16_2x1_2cta_h_bz_splitK_TNT": 113.1,
+   "fal": 37.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.sparse_mla",
+  "busy_ms": 0.110961181640625,
+  "exposed_ms": 0.110113037109375,
+  "ach_ms": 0.019179888345323744,
+  "derate": 5.785288195782354,
+  "calls": 12,
+  "top_kernels_us": {
+   "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 110.8,
+   "flashinfer::ComputeLSEFromMDKernel": 6.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.shared_down",
+  "busy_ms": 0.231954345703125,
+  "exposed_ms": 0.231954345703125,
+  "ach_ms": 0.14715425151079137,
+  "derate": 1.576266695129192,
+  "calls": 23,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 233.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.shared_act",
+  "busy_ms": 0.080158203125,
+  "exposed_ms": 0.080158203125,
+  "ach_ms": 0.00041247898374743137,
+  "derate": 194.33281763049138,
+  "calls": 23,
+  "top_kernels_us": {
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 81.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.latent_up",
+  "busy_ms": 0.161857177734375,
+  "exposed_ms": 0.161857177734375,
+  "ach_ms": 0.08615626589928058,
+  "derate": 1.8786466201261696,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT": 166.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.latent_norm",
+  "busy_ms": 0.065904541015625,
+  "exposed_ms": 0.065904541015625,
+  "ach_ms": 8.020424683977832e-05,
+  "derate": 821.7088696971442,
+  "calls": 23,
+  "top_kernels_us": {
+   "true>": 65.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "KDA.in_proj",
+  "busy_ms": 0.301282470703125,
+  "exposed_ms": 0.301282470703125,
+  "ach_ms": 0.2377137700240119,
+  "derate": 1.267416989233278,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_160x64_64x16_2x2_2cta_h_bz_TNN": 320.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.shared_gate_up",
+  "busy_ms": 0.355218994140625,
+  "exposed_ms": 0.355218994140625,
+  "ach_ms": 0.2935494169784173,
+  "derate": 1.2100824378974728,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x32_64x16_2x1_2cta_v_bz_TNT": 378.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "KDA.o_proj",
+  "busy_ms": 0.120818359375,
+  "exposed_ms": 0.120818359375,
+  "ach_ms": 0.05966133410071942,
+  "derate": 2.025069690379973,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 134.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.topk",
+  "busy_ms": 0.09307373046875,
+  "exposed_ms": 0.059977783203125,
+  "ach_ms": 3.0076592564916865e-05,
+  "derate": 3094.557013659744,
+  "calls": 23,
+  "top_kernels_us": {
+   "int,": 97.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.dcp_value",
+  "busy_ms": 0.083091064453125,
+  "exposed_ms": 0.083091064453125,
+  "ach_ms": 0.031147169811320752,
+  "derate": 2.6676922801160803,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsadcp_valueDcpValue": 72.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.prepare",
+  "busy_ms": 0.0511376953125,
+  "exposed_ms": 0.0511376953125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 23,
+  "top_kernels_us": {
+   "_prepare_megamoe_inputs_kernel": 51.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.qkv_a",
+  "busy_ms": 0.063951416015625,
+  "exposed_ms": 0.061984130859375,
+  "ach_ms": 0.015102747625899282,
+  "derate": 4.234422609694973,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN": 71.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "COMM.SP_RS",
+  "busy_ms": 0.146769287109375,
+  "exposed_ms": 0.146769287109375,
+  "ach_ms": 0.10572553459119498,
+  "derate": 1.3882104042025647,
+  "calls": 25,
+  "top_kernels_us": {
+   "sd:commonsp_commSpReduceScatter": 103.1,
+   "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 15.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DENSE",
+  "busy_ms": 0.137024658203125,
+  "exposed_ms": 0.137024658203125,
+  "ach_ms": 0.10518726246577259,
+  "derate": 1.3026734890806018,
+  "calls": 4,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_224x64_64x14_4x2f_2cta_h_bz_TNN": 81.9,
+   "nvjet_sm107_tst_192x64_64x15_1x2_2cta_h_bz_splitK_TNN": 41.4,
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 14.9,
+   "__nv_bfloat16,": 3.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.idx_score",
+  "busy_ms": 0.120865234375,
+  "exposed_ms": 0.0604326171875,
+  "ach_ms": 0.035462040863309355,
+  "derate": 3.4082988861493497,
+  "calls": 6,
+  "top_kernels_us": {
+   "deep_gemm::sm100_paged_mqa_logits": 123.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.o_proj",
+  "busy_ms": 0.038927490234375,
+  "exposed_ms": 0.038927490234375,
+  "ach_ms": 0.019887111366906473,
+  "derate": 1.9574230523570673,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 41.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.w_uv",
+  "busy_ms": 0.0276474609375,
+  "exposed_ms": 0.0276474609375,
+  "ach_ms": 0.012310483157242562,
+  "derate": 2.2458469407217634,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x160_64x16_2x1_2cta_v_bz_TNT": 27.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.topk",
+  "busy_ms": 0.03582373046875,
+  "exposed_ms": 0.017911865234375,
+  "ach_ms": 0.0038426520863309357,
+  "derate": 9.322657806097515,
+  "calls": 18,
+  "top_kernels_us": {
+   "k31dcpx::topk_pp_hist_kernel": 15.5,
+   "k31dcpx::topk_pp_win_kernel": 14.9,
+   "k31dcpx::topk_pp_window_kernel": 5.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "OTHER",
+  "busy_ms": 0.00908837890625,
+  "exposed_ms": 0.00908837890625,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 5,
+  "top_kernels_us": {
+   "fa": 9.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.prologue",
+  "busy_ms": 0.01883203125,
+  "exposed_ms": 0.009416015625,
+  "ach_ms": 0.000484945035971223,
+  "derate": 38.833331312040706,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaindexDsaIndex": 18.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "COMM.SP_AG",
+  "busy_ms": 0.10780908203125,
+  "exposed_ms": 0.10780908203125,
+  "ach_ms": 0.10149651320754717,
+  "derate": 1.062194932852466,
+  "calls": 24,
+  "top_kernels_us": {
+   "sd:commonsp_commSpAllGather": 97.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "EMBED",
+  "busy_ms": 0.002575927734375,
+  "exposed_ms": 0.002575927734375,
+  "ach_ms": 6.601669064748202e-05,
+  "derate": 39.01934055025598,
+  "calls": 1,
+  "top_kernels_us": {
+   "uint4>": 4.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "WAIT",
+  "busy_ms": 0.04585791015625,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaoverlapQueryWait": 45.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.g_proj",
+  "busy_ms": 0.035088623046875,
+  "exposed_ms": 0.0175443115234375,
+  "ach_ms": 0.01954764431654676,
+  "derate": 1.7950307709033284,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_8x1_2cta_v_bz_TNT": 35.1
+  }
+ },
+ {
+  "kind": "step",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "step_ms": 15.2146,
+  "model_ach_ms": 3.588425180815085,
+  "model_sol_ms": 2.601930466318629,
+  "derate": 4.23991005339677,
+  "multinode_d3x32_ms": 26.98
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.676208984375,
+  "exposed_ms": 7.674307983398437,
+  "ach_ms": 1.2029267277496685,
+  "derate": 6.381277269260605,
+  "gap_ms": 6.471381255648769
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 2.911414306640625,
+  "exposed_ms": 2.911414306640625,
+  "ach_ms": 0.34166144087117895,
+  "derate": 8.521342938837376,
+  "gap_ms": 2.569752865769446
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 2.17519775390625,
+  "exposed_ms": 1.9540350341796875,
+  "ach_ms": 1.1296766255386586,
+  "derate": 1.9255047902483247,
+  "gap_ms": 0.8243584086410289
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 0.671528564453125,
+  "exposed_ms": 0.61248095703125,
+  "ach_ms": 0.18059705619647892,
+  "derate": 3.718380457555973,
+  "gap_ms": 0.43188390083477113
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 0.460950927734375,
+  "exposed_ms": 0.46036669921875,
+  "ach_ms": 0.04953055700285054,
+  "derate": 9.306394993858977,
+  "gap_ms": 0.4108361422158995
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 0.69309765625,
+  "exposed_ms": 0.69309765625,
+  "ach_ms": 0.3151743871627216,
+  "derate": 2.199092580109183,
+  "gap_ms": 0.3779232690872784
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 0.38918896484375,
+  "exposed_ms": 0.3351800537109375,
+  "ach_ms": 0.02709287563609307,
+  "derate": 14.364992851673277,
+  "gap_ms": 0.3080871780748444
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.406438720703125,
+  "exposed_ms": 0.406438720703125,
+  "ach_ms": 0.2708414289308176,
+  "derate": 1.5006519582605795,
+  "gap_ms": 0.13559729177230742
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.191427001953125,
+  "exposed_ms": 0.1887066650390625,
+  "ach_ms": 0.07092408172661871,
+  "derate": 2.699040964548435,
+  "gap_ms": 0.11778258331244379
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.125888916015625,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.megamoe",
+  "busy_ms": 7.6225615234375,
+  "exposed_ms": 7.6225615234375,
+  "ach_ms": 1.2029267277496685,
+  "derate": 6.336679822300673,
+  "calls": 23,
+  "top_kernels_us": {
+   "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7625.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "TAIL.drafter+final",
+  "busy_ms": 2.911414306640625,
+  "exposed_ms": 2.911414306640625,
+  "ach_ms": 0.34166144087117895,
+  "derate": 8.521342938837376,
+  "calls": 119,
+  "top_kernels_us": {
+   "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 1556.3,
+   "ncclDevKernel_AllGather_RING": 214.5,
+   "sd:mlaqueryMlaQuery": 187.2,
+   "nvjet_sm107_tst_192x64_64x15_4x2_2cta_v_bz_TNN": 181.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "KDA.core",
+  "busy_ms": 0.69309765625,
+  "exposed_ms": 0.69309765625,
+  "ach_ms": 0.3151743871627216,
+  "derate": 2.199092580109183,
+  "calls": 18,
+  "top_kernels_us": {
+   "sd:kdawideKdaWide": 695.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.topk_merge",
+  "busy_ms": 0.3038447265625,
+  "exposed_ms": 0.303260498046875,
+  "ach_ms": 0.04184525283018867,
+  "derate": 7.26115164832498,
+  "calls": 6,
+  "top_kernels_us": {
+   "k31dcpx::topk_merge_kernel<16>": 290.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.q_path",
+  "busy_ms": 0.372357177734375,
+  "exposed_ms": 0.3234854736328125,
+  "ach_ms": 0.09655925988318989,
+  "derate": 3.856255507600458,
+  "calls": 12,
+  "top_kernels_us": {
+   "sd:mlaqueryMlaQuery": 363.1,
+   "sd:dsaoverlapQueryNorm": 9.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "KDA.in_proj",
+  "busy_ms": 0.448950439453125,
+  "exposed_ms": 0.448950439453125,
+  "ach_ms": 0.24346546119910292,
+  "derate": 1.8440005298574123,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x128_64x11_2x2_2cta_h_bz_TNN": 516.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.topk",
+  "busy_ms": 0.157106201171875,
+  "exposed_ms": 0.157106201171875,
+  "ach_ms": 0.007685304172661871,
+  "derate": 20.4424181063298,
+  "calls": 18,
+  "top_kernels_us": {
+   "k31dcpx::topk_pp_win_kernel": 84.6,
+   "k31dcpx::topk_pp_hist_kernel": 51.5,
+   "k31dcpx::topk_pp_window_kernel": 24.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.router+latent_down",
+  "busy_ms": 0.438453369140625,
+  "exposed_ms": 0.24487451171875,
+  "ach_ms": 0.11044701928057554,
+  "derate": 3.9698071708643776,
+  "calls": 69,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 305.8,
+   "nvjet_sm107_tss_48x64_64x16_2x1_h_bz_splitK_TNN": 92.8,
+   "fal": 46.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "COMM.SP_RS",
+  "busy_ms": 0.270580810546875,
+  "exposed_ms": 0.270580810546875,
+  "ach_ms": 0.13818440251572325,
+  "derate": 1.958113981178788,
+  "calls": 25,
+  "top_kernels_us": {
+   "sd:commonsp_commSpReduceScatter": 152.7,
+   "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 18.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.shared_down",
+  "busy_ms": 0.26864453125,
+  "exposed_ms": 0.26864453125,
+  "ach_ms": 0.14856398273381294,
+  "derate": 1.8082749688485358,
+  "calls": 23,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 274.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.idx_score",
+  "busy_ms": 0.191427001953125,
+  "exposed_ms": 0.1887066650390625,
+  "ach_ms": 0.07092408172661871,
+  "derate": 2.699040964548435,
+  "calls": 6,
+  "top_kernels_us": {
+   "deep_gemm::sm100_paged_mqa_logits": 193.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.sparse_mla",
+  "busy_ms": 0.155793701171875,
+  "exposed_ms": 0.1550498046875,
+  "ach_ms": 0.03835977669064749,
+  "derate": 4.061381859135253,
+  "calls": 12,
+  "top_kernels_us": {
+   "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 150.1,
+   "flashinfer::ComputeLSEFromMDKernel": 7.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "ATTNRES",
+  "busy_ms": 0.131729736328125,
+  "exposed_ms": 0.1265455322265625,
+  "ach_ms": 0.02591532260849385,
+  "derate": 5.083083020735773,
+  "calls": 49,
+  "top_kernels_us": {
+   "true>": 128.3,
+   "false>": 3.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "KDA.o_proj",
+  "busy_ms": 0.1562890625,
+  "exposed_ms": 0.1562890625,
+  "ach_ms": 0.062292203741007184,
+  "derate": 2.508966662181424,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x64_64x15_1x4_2cta_v_bz_TNN": 184.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.latent_up",
+  "busy_ms": 0.1695224609375,
+  "exposed_ms": 0.1695224609375,
+  "ach_ms": 0.08729489496402879,
+  "derate": 1.9419515998885657,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_8x1_2cta_v_badd_TNT": 170.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.shared_act",
+  "busy_ms": 0.080704345703125,
+  "exposed_ms": 0.080704345703125,
+  "ach_ms": 0.0008249579674948627,
+  "derate": 97.82843354819477,
+  "calls": 23,
+  "top_kernels_us": {
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 80.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.dcp_value",
+  "busy_ms": 0.124513671875,
+  "exposed_ms": 0.124513671875,
+  "ach_ms": 0.04471033962264151,
+  "derate": 2.7848965793126235,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsadcp_valueDcpValue": 105.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.latent_norm",
+  "busy_ms": 0.066241455078125,
+  "exposed_ms": 0.066241455078125,
+  "ach_ms": 0.00016040849367955664,
+  "derate": 412.95478536475514,
+  "calls": 23,
+  "top_kernels_us": {
+   "true>": 65.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.shared_gate_up",
+  "busy_ms": 0.358755859375,
+  "exposed_ms": 0.358755859375,
+  "ach_ms": 0.295609793381295,
+  "derate": 1.213612902574765,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_2x1_2cta_v_bz_TNT": 363.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.qkv_a",
+  "busy_ms": 0.080208740234375,
+  "exposed_ms": 0.07646484375,
+  "ach_ms": 0.016145901582733813,
+  "derate": 4.967746138137559,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_2x2_2cta_v_bz_TNT": 94.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.prepare",
+  "busy_ms": 0.0536474609375,
+  "exposed_ms": 0.0517464599609375,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 23,
+  "top_kernels_us": {
+   "_prepare_megamoe_inputs_kernel": 53.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.topk",
+  "busy_ms": 0.0976494140625,
+  "exposed_ms": 0.04882470703125,
+  "ach_ms": 6.015318512983373e-05,
+  "derate": 1623.3456940265917,
+  "calls": 23,
+  "top_kernels_us": {
+   "int,": 102.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.o_proj",
+  "busy_ms": 0.04712060546875,
+  "exposed_ms": 0.04712060546875,
+  "ach_ms": 0.02076406791366906,
+  "derate": 2.269334008377536,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x64_64x15_1x4_2cta_v_bz_TNN": 52.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DENSE",
+  "busy_ms": 0.129121826171875,
+  "exposed_ms": 0.129121826171875,
+  "ach_ms": 0.10581867342075378,
+  "derate": 1.2202177744041807,
+  "calls": 4,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_352x64_64x10_1x2_2cta_h_bz_TNN": 75.1,
+   "nvjet_sm107_tst_192x112_64x10_4x1_2cta_v_bz_splitK_TNT": 43.7,
+   "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 5.2,
+   "__nv_bfloat16,": 4.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.w_uv",
+  "busy_ms": 0.030450927734375,
+  "exposed_ms": 0.030450927734375,
+  "ach_ms": 0.019189493508729727,
+  "derate": 1.586854166865957,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_160x128_64x12_1x2_2cta_h_bz_TNN": 30.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "OTHER",
+  "busy_ms": 0.009488037109375,
+  "exposed_ms": 0.009488037109375,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 5,
+  "top_kernels_us": {
+   "fa": 9.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.prologue",
+  "busy_ms": 0.018864013671875,
+  "exposed_ms": 0.0094320068359375,
+  "ach_ms": 0.00096768,
+  "derate": 19.49406174755601,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaindexDsaIndex": 18.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.g_proj",
+  "busy_ms": 0.047679931640625,
+  "exposed_ms": 0.0238399658203125,
+  "ach_ms": 0.020085133812949643,
+  "derate": 2.3738916596056705,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_2x2_2cta_h_bz_TNT": 48.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "EMBED",
+  "busy_ms": 0.0033759765625,
+  "exposed_ms": 0.0033759765625,
+  "ach_ms": 0.00013203338129496404,
+  "derate": 25.569113881572353,
+  "calls": 1,
+  "top_kernels_us": {
+   "uint4>": 3.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "COMM.SP_AG",
+  "busy_ms": 0.13585791015625,
+  "exposed_ms": 0.13585791015625,
+  "ach_ms": 0.13265702641509433,
+  "derate": 1.0241290177207791,
+  "calls": 24,
+  "top_kernels_us": {
+   "sd:commonsp_commSpAllGather": 128.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "WAIT",
+  "busy_ms": 0.125888916015625,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaoverlapQueryWait": 125.4
+  }
+ },
+ {
+  "kind": "step",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "step_ms": 17.3372,
+  "model_ach_ms": 4.289282607860521,
+  "model_sol_ms": 3.1665637747652178,
+  "derate": 4.041981278693999,
+  "multinode_d3x32_ms": 30.48
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.752280029296875,
+  "exposed_ms": 7.7503994140625,
+  "ach_ms": 1.3387279274139767,
+  "derate": 5.790780837949627,
+  "gap_ms": 6.411671486648523
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 4.0981650390625,
+  "exposed_ms": 4.0981650390625,
+  "ach_ms": 0.27941639145200486,
+  "derate": 14.666874114886845,
+  "gap_ms": 3.818748647610495
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 2.481870361328125,
+  "exposed_ms": 2.1919178466796874,
+  "ach_ms": 1.282516061158455,
+  "derate": 1.9351573336916594,
+  "gap_ms": 0.9094017855212325
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 0.6475615234375,
+  "exposed_ms": 0.6470576171875,
+  "ach_ms": 0.056711835504275825,
+  "derate": 11.41845467845379,
+  "gap_ms": 0.5903457816832243
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 0.988045166015625,
+  "exposed_ms": 0.66991259765625,
+  "ach_ms": 0.24911485802137429,
+  "derate": 3.9662233471873036,
+  "gap_ms": 0.4207977396348757
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 0.8867783203125,
+  "exposed_ms": 0.8867783203125,
+  "ach_ms": 0.47266610563616873,
+  "derate": 1.8761199708173937,
+  "gap_ms": 0.4141122146763313
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 0.39824755859375,
+  "exposed_ms": 0.3362139892578125,
+  "ach_ms": 0.040539270864211545,
+  "derate": 9.823747445475808,
+  "gap_ms": 0.295674718393601
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.530649169921875,
+  "exposed_ms": 0.530649169921875,
+  "ach_ms": 0.3344608100628931,
+  "derate": 1.5865810102597373,
+  "gap_ms": 0.19618835985898192
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.407700927734375,
+  "exposed_ms": 0.2358829345703125,
+  "ach_ms": 0.10638612258992806,
+  "derate": 3.8322754679751196,
+  "gap_ms": 0.12949681198038446
+ },
+ {
+  "kind": "family",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.2687236328125,
+  "exposed_ms": 0.0005908203125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0005908203125
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.megamoe",
+  "busy_ms": 7.6979423828125,
+  "exposed_ms": 7.6979423828125,
+  "ach_ms": 1.3387279274139767,
+  "derate": 5.75019182402703,
+  "calls": 23,
+  "top_kernels_us": {
+   "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7683.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "TAIL.drafter+final",
+  "busy_ms": 4.0981650390625,
+  "exposed_ms": 4.0981650390625,
+  "ach_ms": 0.27941639145200486,
+  "derate": 14.666874114886845,
+  "calls": 118,
+  "top_kernels_us": {
+   "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 2226.9,
+   "sd:mlaqueryMlaQuery": 279.0,
+   "ncclDevKernel_AllGather_RING": 275.3,
+   "sd:mladcpDcpValue": 236.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "KDA.core",
+  "busy_ms": 0.8867783203125,
+  "exposed_ms": 0.8867783203125,
+  "ach_ms": 0.47266610563616873,
+  "derate": 1.8761199708173937,
+  "calls": 18,
+  "top_kernels_us": {
+   "sd:kdaspecializedKdaWS": 885.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.topk_merge",
+  "busy_ms": 0.367396728515625,
+  "exposed_ms": 0.366892822265625,
+  "ach_ms": 0.04518387924528302,
+  "derate": 8.131146210824284,
+  "calls": 6,
+  "top_kernels_us": {
+   "k31dcpx::topk_merge_kernel<16>": 357.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.topk",
+  "busy_ms": 0.280164794921875,
+  "exposed_ms": 0.280164794921875,
+  "ach_ms": 0.011527956258992807,
+  "derate": 24.303075812186755,
+  "calls": 18,
+  "top_kernels_us": {
+   "k31dcpx::topk_pp_win_kernel": 150.8,
+   "k31dcpx::topk_pp_hist_kernel": 101.8,
+   "k31dcpx::topk_pp_window_kernel": 26.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "COMM.SP_RS",
+  "busy_ms": 0.35139697265625,
+  "exposed_ms": 0.35139697265625,
+  "ach_ms": 0.17064327044025157,
+  "derate": 2.059248933460209,
+  "calls": 25,
+  "top_kernels_us": {
+   "sd:commonsp_commSpReduceScatter": 226.5,
+   "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 20.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.q_path",
+  "busy_ms": 0.5855595703125,
+  "exposed_ms": 0.292859619140625,
+  "ach_ms": 0.13185126858741206,
+  "derate": 4.441061330587788,
+  "calls": 12,
+  "top_kernels_us": {
+   "sd:mlaqueryMlaQuery": 579.3,
+   "sd:dsaoverlapQueryNorm": 9.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.shared_gate_up",
+  "busy_ms": 0.4467744140625,
+  "exposed_ms": 0.4467744140625,
+  "ach_ms": 0.29767016978417266,
+  "derate": 1.5009042202194336,
+  "calls": 23,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 461.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "KDA.in_proj",
+  "busy_ms": 0.48586376953125,
+  "exposed_ms": 0.48586376953125,
+  "ach_ms": 0.3418273403471371,
+  "derate": 1.4213718804289883,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT": 571.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.router+latent_down",
+  "busy_ms": 0.455218994140625,
+  "exposed_ms": 0.253291015625,
+  "ach_ms": 0.11253450589928059,
+  "derate": 4.045150334138848,
+  "calls": 69,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_2x2_2cta_v_bz_TNN": 333.4,
+   "nvjet_sm107_tss_64x96_64x16_2x1_2cta_h_bz_splitK_TNT": 98.4,
+   "fal": 42.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.sparse_mla",
+  "busy_ms": 0.1984501953125,
+  "exposed_ms": 0.197618408203125,
+  "ach_ms": 0.05753966503597122,
+  "derate": 3.4489285815000454,
+  "calls": 12,
+  "top_kernels_us": {
+   "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 192.3,
+   "flashinfer::ComputeLSEFromMDKernel": 7.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.idx_score",
+  "busy_ms": 0.407700927734375,
+  "exposed_ms": 0.2358829345703125,
+  "ach_ms": 0.10638612258992806,
+  "derate": 3.8322754679751196,
+  "calls": 6,
+  "top_kernels_us": {
+   "deep_gemm::sm100_paged_mqa_logits": 415.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.shared_down",
+  "busy_ms": 0.250467041015625,
+  "exposed_ms": 0.250467041015625,
+  "ach_ms": 0.14997371395683454,
+  "derate": 1.670072937499664,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 254.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "KDA.o_proj",
+  "busy_ms": 0.1827373046875,
+  "exposed_ms": 0.1827373046875,
+  "ach_ms": 0.08339885126136985,
+  "derate": 2.191124960640117,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x128_64x12_4x1_2cta_v_bz_TNT": 219.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.dcp_value",
+  "busy_ms": 0.154833740234375,
+  "exposed_ms": 0.154833740234375,
+  "ach_ms": 0.05827350943396227,
+  "derate": 2.657017600936467,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsadcp_valueDcpValue": 142.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.shared_act",
+  "busy_ms": 0.0848974609375,
+  "exposed_ms": 0.0848974609375,
+  "ach_ms": 0.001237436951242294,
+  "derate": 68.60750428720372,
+  "calls": 23,
+  "top_kernels_us": {
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 84.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "ATTNRES",
+  "busy_ms": 0.129585693359375,
+  "exposed_ms": 0.12016943359375,
+  "ach_ms": 0.03877294132281272,
+  "derate": 3.3421682477086425,
+  "calls": 49,
+  "top_kernels_us": {
+   "true>": 125.6,
+   "false>": 3.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.latent_up",
+  "busy_ms": 0.167553466796875,
+  "exposed_ms": 0.167553466796875,
+  "ach_ms": 0.08843352402877698,
+  "derate": 1.8946826855203887,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_badd_TNT": 169.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.qkv_a",
+  "busy_ms": 0.09360107421875,
+  "exposed_ms": 0.0889053955078125,
+  "ach_ms": 0.02056013347068493,
+  "derate": 4.552551876776888,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x192_64x15_2x2_2cta_v_bz_TNT": 112.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.latent_norm",
+  "busy_ms": 0.065090087890625,
+  "exposed_ms": 0.065090087890625,
+  "ach_ms": 0.00024061274051933492,
+  "derate": 270.51804384977925,
+  "calls": 23,
+  "top_kernels_us": {
+   "true>": 67.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.g_proj",
+  "busy_ms": 0.16665771484375,
+  "exposed_ms": 0.083328857421875,
+  "ach_ms": 0.027799617087123283,
+  "derate": 5.994964402619252,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x64_64x16_1x2_2cta_v_bz_TNN": 167.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.topk",
+  "busy_ms": 0.105234619140625,
+  "exposed_ms": 0.0526173095703125,
+  "ach_ms": 9.02297776947506e-05,
+  "derate": 1166.2958928773617,
+  "calls": 23,
+  "top_kernels_us": {
+   "int,": 112.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.prepare",
+  "busy_ms": 0.054337646484375,
+  "exposed_ms": 0.05245703125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 23,
+  "top_kernels_us": {
+   "_prepare_megamoe_inputs_kernel": 54.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.o_proj",
+  "busy_ms": 0.057921875,
+  "exposed_ms": 0.057921875,
+  "ach_ms": 0.027799617087123283,
+  "derate": 2.0835493819384037,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x128_64x12_4x1_2cta_v_bz_TNT": 58.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DENSE",
+  "busy_ms": 0.134561767578125,
+  "exposed_ms": 0.134561767578125,
+  "ach_ms": 0.10645008437573499,
+  "derate": 1.2640832402082904,
+  "calls": 4,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x192_64x8_2x1_2cta_v_bz_TNT": 78.3,
+   "nvjet_sm107_tst_192x160_64x9_2x1_2cta_h_bz_splitK_TNT": 47.6,
+   "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 6.6,
+   "__nv_bfloat16,": 5.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.prologue",
+  "busy_ms": 0.04920166015625,
+  "exposed_ms": 0.024600830078125,
+  "ach_ms": 0.001450414964028777,
+  "derate": 33.922471414376425,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaindexDsaIndex": 48.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "COMM.SP_AG",
+  "busy_ms": 0.179252197265625,
+  "exposed_ms": 0.179252197265625,
+  "ach_ms": 0.1638175396226415,
+  "derate": 1.0942185902592463,
+  "calls": 24,
+  "top_kernels_us": {
+   "sd:commonsp_commSpAllGather": 158.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.w_uv",
+  "busy_ms": 0.040512939453125,
+  "exposed_ms": 0.040512939453125,
+  "ach_ms": 0.02606850386021689,
+  "derate": 1.5540953048307367,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_160x192_64x9_1x2_2cta_h_bz_TNN": 40.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "OTHER",
+  "busy_ms": 0.009759765625,
+  "exposed_ms": 0.009759765625,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 5,
+  "top_kernels_us": {
+   "fa": 9.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "EMBED",
+  "busy_ms": 0.003679931640625,
+  "exposed_ms": 0.003679931640625,
+  "ach_ms": 0.00019805007194244602,
+  "derate": 18.580814460367375,
+  "calls": 1,
+  "top_kernels_us": {
+   "uint4>": 3.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "spgemm-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "WAIT",
+  "busy_ms": 0.2687236328125,
+  "exposed_ms": 0.0005908203125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaoverlapQueryWait": 262.3
+  }
+ },
+ {
+  "kind": "step",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "step_ms": 12.4115,
+  "model_ach_ms": 3.0112616954347486,
+  "model_sol_ms": 2.1459461236458095,
+  "derate": 4.121694244912878,
+  "multinode_d3x32_ms": 20.92
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.1351083984375,
+  "exposed_ms": 7.1351083984375,
+  "ach_ms": 1.0671255216739506,
+  "derate": 6.686287839170958,
+  "gap_ms": 6.0679828767635495
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 1.75336865234375,
+  "exposed_ms": 1.75336865234375,
+  "ach_ms": 0.2688103303015684,
+  "derate": 6.522698180448312,
+  "gap_ms": 1.4845583220421816
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 2.110256591796875,
+  "exposed_ms": 1.861118408203125,
+  "ach_ms": 1.1046298201074587,
+  "derate": 1.910374456115614,
+  "gap_ms": 0.7564885880956663
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 0.380180908203125,
+  "exposed_ms": 0.332732666015625,
+  "ach_ms": 0.01364648040797459,
+  "derate": 27.85926457498585,
+  "gap_ms": 0.3190861856076504
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 0.34066064453125,
+  "exposed_ms": 0.3131239013671875,
+  "ach_ms": 0.042349278501425267,
+  "derate": 8.044071979166896,
+  "gap_ms": 0.27077462286576226
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 0.5259111328125,
+  "exposed_ms": 0.3613646240234375,
+  "ach_ms": 0.11433350709104519,
+  "derate": 4.599798835819061,
+  "gap_ms": 0.2470311169323923
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 0.383364501953125,
+  "exposed_ms": 0.383364501953125,
+  "ach_ms": 0.15768266868927447,
+  "derate": 2.4312405741215195,
+  "gap_ms": 0.22568183326385052
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.255140625,
+  "exposed_ms": 0.255140625,
+  "ach_ms": 0.20722204779874215,
+  "derate": 1.2312426583478089,
+  "gap_ms": 0.04791857720125785
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.123489990234375,
+  "exposed_ms": 0.0617449951171875,
+  "ach_ms": 0.035462040863309355,
+  "derate": 3.4823148140394644,
+  "gap_ms": 0.026282954253878145
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.04723193359375,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.megamoe",
+  "busy_ms": 7.086083984375,
+  "exposed_ms": 7.086083984375,
+  "ach_ms": 1.0671255216739506,
+  "derate": 6.640347213568079,
+  "calls": 23,
+  "top_kernels_us": {
+   "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7097.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "TAIL.drafter+final",
+  "busy_ms": 1.75336865234375,
+  "exposed_ms": 1.75336865234375,
+  "ach_ms": 0.2688103303015684,
+  "derate": 6.522698180448312,
+  "calls": 123,
+  "top_kernels_us": {
+   "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 797.6,
+   "sd:mlaqueryMlaQuery": 140.6,
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 99.6,
+   "ncclDevKernel_AllGather_RING": 87.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.topk_merge",
+  "busy_ms": 0.305523681640625,
+  "exposed_ms": 0.295555419921875,
+  "ach_ms": 0.03850662641509433,
+  "derate": 7.934314430642043,
+  "calls": 6,
+  "top_kernels_us": {
+   "k31dcpx::topk_merge_kernel<16>": 300.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "KDA.core",
+  "busy_ms": 0.383364501953125,
+  "exposed_ms": 0.383364501953125,
+  "ach_ms": 0.15768266868927447,
+  "derate": 2.4312405741215195,
+  "calls": 18,
+  "top_kernels_us": {
+   "sd:kdawideKdaWide": 383.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.shared_gate_up",
+  "busy_ms": 0.453477294921875,
+  "exposed_ms": 0.453477294921875,
+  "ach_ms": 0.2935494169784173,
+  "derate": 1.544807343137105,
+  "calls": 46,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x40_64x15_4x1_v_bz_splitK_TNT": 394.2,
+   "__nv_bfloat16,": 63.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.shared_down",
+  "busy_ms": 0.282885009765625,
+  "exposed_ms": 0.282885009765625,
+  "ach_ms": 0.14715425151079137,
+  "derate": 1.922370620361451,
+  "calls": 46,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x40_64x15_4x1_v_bz_splitK_TNT": 243.1,
+   "__nv_bfloat16,": 45.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "ATTNRES",
+  "busy_ms": 0.12768115234375,
+  "exposed_ms": 0.1166890869140625,
+  "ach_ms": 0.013057703894174981,
+  "derate": 9.778223903569167,
+  "calls": 49,
+  "top_kernels_us": {
+   "true>": 123.7,
+   "false>": 3.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.router+latent_down",
+  "busy_ms": 0.412740234375,
+  "exposed_ms": 0.2103231201171875,
+  "ach_ms": 0.1083595326618705,
+  "derate": 3.8089886901130465,
+  "calls": 92,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_splitK_TNT": 221.3,
+   "nvjet_sm107_tss_64x32_64x16_2x1_2cta_h_bz_splitK_TNT": 105.5,
+   "fal": 52.5,
+   "__nv_bfloat16,": 38.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.q_path",
+  "busy_ms": 0.312501708984375,
+  "exposed_ms": 0.1579700927734375,
+  "ach_ms": 0.06352150389842948,
+  "derate": 4.919620755265232,
+  "calls": 12,
+  "top_kernels_us": {
+   "sd:mlaqueryMlaQuery": 297.5,
+   "sd:dsaoverlapQueryNorm": 10.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.sparse_mla",
+  "busy_ms": 0.110912109375,
+  "exposed_ms": 0.1099610595703125,
+  "ach_ms": 0.019179888345323744,
+  "derate": 5.782729668603182,
+  "calls": 12,
+  "top_kernels_us": {
+   "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 112.8,
+   "flashinfer::ComputeLSEFromMDKernel": 5.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.shared_act",
+  "busy_ms": 0.081729736328125,
+  "exposed_ms": 0.081729736328125,
+  "ach_ms": 0.00041247898374743137,
+  "derate": 198.14278920491535,
+  "calls": 23,
+  "top_kernels_us": {
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 82.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "KDA.in_proj",
+  "busy_ms": 0.318486083984375,
+  "exposed_ms": 0.318486083984375,
+  "ach_ms": 0.2377137700240119,
+  "derate": 1.33978811556522,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x64_64x15_4x2_2cta_v_bz_TNN": 334.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.latent_up",
+  "busy_ms": 0.163618896484375,
+  "exposed_ms": 0.163618896484375,
+  "ach_ms": 0.08615626589928058,
+  "derate": 1.8990945670237231,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT": 166.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.latent_norm",
+  "busy_ms": 0.061345458984375,
+  "exposed_ms": 0.061345458984375,
+  "ach_ms": 8.020424683977832e-05,
+  "derate": 764.8654703649675,
+  "calls": 23,
+  "top_kernels_us": {
+   "true>": 62.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.topk",
+  "busy_ms": 0.0976162109375,
+  "exposed_ms": 0.0611600341796875,
+  "ach_ms": 3.0076592564916865e-05,
+  "derate": 3245.587435704581,
+  "calls": 23,
+  "top_kernels_us": {
+   "int,": 105.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "KDA.o_proj",
+  "busy_ms": 0.119618408203125,
+  "exposed_ms": 0.119618408203125,
+  "ach_ms": 0.05966133410071942,
+  "derate": 2.00495697935931,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 128.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.dcp_value",
+  "busy_ms": 0.08436962890625,
+  "exposed_ms": 0.08436962890625,
+  "ach_ms": 0.031147169811320752,
+  "derate": 2.7087414175134787,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsadcp_valueDcpValue": 71.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "MOE.prepare",
+  "busy_ms": 0.0490244140625,
+  "exposed_ms": 0.0490244140625,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 23,
+  "top_kernels_us": {
+   "_prepare_megamoe_inputs_kernel": 50.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.qkv_a",
+  "busy_ms": 0.063392822265625,
+  "exposed_ms": 0.06172900390625,
+  "ach_ms": 0.015102747625899282,
+  "derate": 4.197436376207095,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN": 68.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "COMM.SP_RS",
+  "busy_ms": 0.145763671875,
+  "exposed_ms": 0.145763671875,
+  "ach_ms": 0.10572553459119498,
+  "derate": 1.3786988397705344,
+  "calls": 25,
+  "top_kernels_us": {
+   "sd:commonsp_commSpReduceScatter": 112.6,
+   "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 16.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DENSE",
+  "busy_ms": 0.138097900390625,
+  "exposed_ms": 0.138097900390625,
+  "ach_ms": 0.10518726246577259,
+  "derate": 1.3128766464053703,
+  "calls": 4,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_224x64_64x14_4x2f_2cta_h_bz_TNN": 80.2,
+   "nvjet_sm107_tst_192x64_64x15_1x2_2cta_h_bz_splitK_TNN": 42.8,
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 14.3,
+   "__nv_bfloat16,": 3.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.idx_score",
+  "busy_ms": 0.123489990234375,
+  "exposed_ms": 0.0617449951171875,
+  "ach_ms": 0.035462040863309355,
+  "derate": 3.4823148140394644,
+  "calls": 6,
+  "top_kernels_us": {
+   "deep_gemm::sm100_paged_mqa_logits": 126.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.g_proj",
+  "busy_ms": 0.090114501953125,
+  "exposed_ms": 0.0450572509765625,
+  "ach_ms": 0.01954764431654676,
+  "derate": 4.609992922617511,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 92.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.o_proj",
+  "busy_ms": 0.039296630859375,
+  "exposed_ms": 0.039296630859375,
+  "ach_ms": 0.019887111366906473,
+  "derate": 1.9759848544302572,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 41.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.w_uv",
+  "busy_ms": 0.02852880859375,
+  "exposed_ms": 0.02852880859375,
+  "ach_ms": 0.012310483157242562,
+  "derate": 2.3174402035525143,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x160_64x16_2x1_2cta_v_bz_TNT": 28.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.topk",
+  "busy_ms": 0.035136962890625,
+  "exposed_ms": 0.0175684814453125,
+  "ach_ms": 0.0038426520863309357,
+  "derate": 9.143935516726597,
+  "calls": 18,
+  "top_kernels_us": {
+   "k31dcpx::topk_pp_hist_kernel": 16.3,
+   "k31dcpx::topk_pp_win_kernel": 16.0,
+   "k31dcpx::topk_pp_window_kernel": 4.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "OTHER",
+  "busy_ms": 0.00915234375,
+  "exposed_ms": 0.00915234375,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 5,
+  "top_kernels_us": {
+   "fa": 9.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "DSA.prologue",
+  "busy_ms": 0.018127685546875,
+  "exposed_ms": 0.0090638427734375,
+  "ach_ms": 0.000484945035971223,
+  "derate": 37.38090753021072,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaindexDsaIndex": 18.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "COMM.SP_AG",
+  "busy_ms": 0.109376953125,
+  "exposed_ms": 0.109376953125,
+  "ach_ms": 0.10149651320754717,
+  "derate": 1.0776424693658033,
+  "calls": 24,
+  "top_kernels_us": {
+   "sd:commonsp_commSpAllGather": 105.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "EMBED",
+  "busy_ms": 0.002656005859375,
+  "exposed_ms": 0.002656005859375,
+  "ach_ms": 6.601669064748202e-05,
+  "derate": 40.23233872109135,
+  "calls": 1,
+  "top_kernels_us": {
+   "uint4>": 4.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "group": "WAIT",
+  "busy_ms": 0.04723193359375,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaoverlapQueryWait": 51.0
+  }
+ },
+ {
+  "kind": "step",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "step_ms": 15.488299999999999,
+  "model_ach_ms": 3.588425180815085,
+  "model_sol_ms": 2.601930466318629,
+  "derate": 4.3161830662669525,
+  "multinode_d3x32_ms": 26.98
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.675193115234375,
+  "exposed_ms": 7.67448193359375,
+  "ach_ms": 1.2029267277496685,
+  "derate": 6.380432771323041,
+  "gap_ms": 6.471555205844082
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 2.9117998046875,
+  "exposed_ms": 2.9117998046875,
+  "ach_ms": 0.34166144087117895,
+  "derate": 8.522471243061267,
+  "gap_ms": 2.570138363816321
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 2.753607666015625,
+  "exposed_ms": 2.3899462890625,
+  "ach_ms": 1.1296766255386586,
+  "derate": 2.437518493137481,
+  "gap_ms": 1.2602696635238415
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 0.4542138671875,
+  "exposed_ms": 0.453678466796875,
+  "ach_ms": 0.04953055700285054,
+  "derate": 9.170376726459173,
+  "gap_ms": 0.4041479097940245
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 0.694375732421875,
+  "exposed_ms": 0.694375732421875,
+  "ach_ms": 0.3151743871627216,
+  "derate": 2.203147719815745,
+  "gap_ms": 0.3792013452591534
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 0.396789794921875,
+  "exposed_ms": 0.345892578125,
+  "ach_ms": 0.02709287563609307,
+  "derate": 14.645540039805613,
+  "gap_ms": 0.31879970248890693
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 0.692887939453125,
+  "exposed_ms": 0.4859661865234375,
+  "ach_ms": 0.18059705619647892,
+  "derate": 3.8366513499494914,
+  "gap_ms": 0.3053691303269586
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.40072705078125,
+  "exposed_ms": 0.40072705078125,
+  "ach_ms": 0.2708414289308176,
+  "derate": 1.4795633458410447,
+  "gap_ms": 0.12988562185043243
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.18721826171875,
+  "exposed_ms": 0.15565771484375,
+  "ach_ms": 0.07092408172661871,
+  "derate": 2.6396994809237637,
+  "gap_ms": 0.0847336331171313
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.123826171875,
+  "exposed_ms": 2.44140625e-07,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 2.44140625e-07
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.megamoe",
+  "busy_ms": 7.62312841796875,
+  "exposed_ms": 7.62312841796875,
+  "ach_ms": 1.2029267277496685,
+  "derate": 6.337151085028629,
+  "calls": 23,
+  "top_kernels_us": {
+   "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7627.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "TAIL.drafter+final",
+  "busy_ms": 2.9117998046875,
+  "exposed_ms": 2.9117998046875,
+  "ach_ms": 0.34166144087117895,
+  "derate": 8.522471243061267,
+  "calls": 119,
+  "top_kernels_us": {
+   "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 1557.4,
+   "ncclDevKernel_AllGather_RING": 213.4,
+   "sd:mlaqueryMlaQuery": 185.9,
+   "nvjet_sm107_tst_192x64_64x15_4x2_2cta_v_bz_TNN": 181.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "KDA.core",
+  "busy_ms": 0.694375732421875,
+  "exposed_ms": 0.694375732421875,
+  "ach_ms": 0.3151743871627216,
+  "derate": 2.203147719815745,
+  "calls": 18,
+  "top_kernels_us": {
+   "sd:kdawideKdaWide": 698.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.topk_merge",
+  "busy_ms": 0.29621240234375,
+  "exposed_ms": 0.295677001953125,
+  "ach_ms": 0.04184525283018867,
+  "derate": 7.078757620268259,
+  "calls": 6,
+  "top_kernels_us": {
+   "k31dcpx::topk_merge_kernel<16>": 290.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "KDA.in_proj",
+  "busy_ms": 0.464326904296875,
+  "exposed_ms": 0.464326904296875,
+  "ach_ms": 0.24346546119910292,
+  "derate": 1.907157187758778,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x128_64x11_2x2_2cta_h_bz_TNN": 509.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.latent_up",
+  "busy_ms": 0.279284423828125,
+  "exposed_ms": 0.279284423828125,
+  "ach_ms": 0.08729489496402879,
+  "derate": 3.1993213800555975,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT": 277.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.shared_down",
+  "busy_ms": 0.3283740234375,
+  "exposed_ms": 0.3283740234375,
+  "ach_ms": 0.14856398273381294,
+  "derate": 2.210320546036106,
+  "calls": 46,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN": 271.0,
+   "__nv_bfloat16,": 74.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.shared_gate_up",
+  "busy_ms": 0.4610458984375,
+  "exposed_ms": 0.4610458984375,
+  "ach_ms": 0.295609793381295,
+  "derate": 1.5596435191266338,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_4x2f_2cta_h_bz_TNN": 474.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.topk",
+  "busy_ms": 0.15800146484375,
+  "exposed_ms": 0.15800146484375,
+  "ach_ms": 0.007685304172661871,
+  "derate": 20.558908443180698,
+  "calls": 18,
+  "top_kernels_us": {
+   "k31dcpx::topk_pp_win_kernel": 84.0,
+   "k31dcpx::topk_pp_hist_kernel": 50.3,
+   "k31dcpx::topk_pp_window_kernel": 23.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.router+latent_down",
+  "busy_ms": 0.480100830078125,
+  "exposed_ms": 0.253282470703125,
+  "ach_ms": 0.11044701928057554,
+  "derate": 4.346888066381353,
+  "calls": 92,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN": 268.2,
+   "fal": 92.4,
+   "nvjet_sm107_tss_48x64_64x16_2x1_h_bz_splitK_TNN": 87.1,
+   "__nv_bfloat16,": 51.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "COMM.SP_RS",
+  "busy_ms": 0.262020263671875,
+  "exposed_ms": 0.262020263671875,
+  "ach_ms": 0.13818440251572325,
+  "derate": 1.8961638137275378,
+  "calls": 25,
+  "top_kernels_us": {
+   "sd:commonsp_commSpReduceScatter": 148.1,
+   "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 17.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.sparse_mla",
+  "busy_ms": 0.154625732421875,
+  "exposed_ms": 0.1539381103515625,
+  "ach_ms": 0.03835977669064749,
+  "derate": 4.030934112804008,
+  "calls": 12,
+  "top_kernels_us": {
+   "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 148.8,
+   "flashinfer::ComputeLSEFromMDKernel": 6.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.g_proj",
+  "busy_ms": 0.267029296875,
+  "exposed_ms": 0.1335146484375,
+  "ach_ms": 0.020085133812949643,
+  "derate": 13.294872683538516,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 265.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "KDA.o_proj",
+  "busy_ms": 0.16776171875,
+  "exposed_ms": 0.16776171875,
+  "ach_ms": 0.062292203741007184,
+  "derate": 2.6931414956437294,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x112_64x13_2x1_2cta_v_bz_TNT": 199.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "ATTNRES",
+  "busy_ms": 0.13381005859375,
+  "exposed_ms": 0.1289063720703125,
+  "ach_ms": 0.02591532260849385,
+  "derate": 5.16335685321136,
+  "calls": 49,
+  "top_kernels_us": {
+   "true>": 131.4,
+   "false>": 3.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.q_path",
+  "busy_ms": 0.3861494140625,
+  "exposed_ms": 0.1936588134765625,
+  "ach_ms": 0.09655925988318989,
+  "derate": 3.9990925213142106,
+  "calls": 12,
+  "top_kernels_us": {
+   "sd:mlaqueryMlaQuery": 374.7,
+   "sd:dsaoverlapQueryNorm": 10.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.shared_act",
+  "busy_ms": 0.086433349609375,
+  "exposed_ms": 0.086433349609375,
+  "ach_ms": 0.0008249579674948627,
+  "derate": 104.77303452422653,
+  "calls": 23,
+  "top_kernels_us": {
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 86.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.idx_score",
+  "busy_ms": 0.18721826171875,
+  "exposed_ms": 0.15565771484375,
+  "ach_ms": 0.07092408172661871,
+  "derate": 2.6396994809237637,
+  "calls": 6,
+  "top_kernels_us": {
+   "deep_gemm::sm100_paged_mqa_logits": 188.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.dcp_value",
+  "busy_ms": 0.124625732421875,
+  "exposed_ms": 0.124625732421875,
+  "ach_ms": 0.04471033962264151,
+  "derate": 2.7874029469184345,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsadcp_valueDcpValue": 106.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.qkv_a",
+  "busy_ms": 0.087010498046875,
+  "exposed_ms": 0.08368212890625,
+  "ach_ms": 0.016145901582733813,
+  "derate": 5.389014518701311,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_160x64_64x16_1x4_2cta_h_bz_TNN": 98.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.latent_norm",
+  "busy_ms": 0.0624814453125,
+  "exposed_ms": 0.0624814453125,
+  "ach_ms": 0.00016040849367955664,
+  "derate": 389.5145692055269,
+  "calls": 23,
+  "top_kernels_us": {
+   "true>": 63.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.topk",
+  "busy_ms": 0.100161865234375,
+  "exposed_ms": 0.0541683349609375,
+  "ach_ms": 6.015318512983373e-05,
+  "derate": 1665.113244098166,
+  "calls": 23,
+  "top_kernels_us": {
+   "int,": 103.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "MOE.prepare",
+  "busy_ms": 0.052064697265625,
+  "exposed_ms": 0.051353515625,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 23,
+  "top_kernels_us": {
+   "_prepare_megamoe_inputs_kernel": 53.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.o_proj",
+  "busy_ms": 0.058368896484375,
+  "exposed_ms": 0.058368896484375,
+  "ach_ms": 0.02076406791366906,
+  "derate": 2.8110530521791706,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x112_64x13_2x1_2cta_v_bz_TNT": 56.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DENSE",
+  "busy_ms": 0.1295537109375,
+  "exposed_ms": 0.1295537109375,
+  "ach_ms": 0.10581867342075378,
+  "derate": 1.2242991406854205,
+  "calls": 4,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_352x64_64x10_1x2_2cta_h_bz_TNN": 76.6,
+   "nvjet_sm107_tst_192x112_64x10_4x1_2cta_v_bz_splitK_TNT": 44.7,
+   "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 5.5,
+   "__nv_bfloat16,": 4.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.prologue",
+  "busy_ms": 0.027487060546875,
+  "exposed_ms": 0.0137435302734375,
+  "ach_ms": 0.00096768,
+  "derate": 28.405113825722346,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaindexDsaIndex": 28.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "DSA.w_uv",
+  "busy_ms": 0.03075146484375,
+  "exposed_ms": 0.03075146484375,
+  "ach_ms": 0.019189493508729727,
+  "derate": 1.602515711514766,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_160x128_64x12_1x2_2cta_h_bz_TNN": 30.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "OTHER",
+  "busy_ms": 0.01038330078125,
+  "exposed_ms": 0.01038330078125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 5,
+  "top_kernels_us": {
+   "fa": 10.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "COMM.SP_AG",
+  "busy_ms": 0.138706787109375,
+  "exposed_ms": 0.138706787109375,
+  "ach_ms": 0.13265702641509433,
+  "derate": 1.0456045251259478,
+  "calls": 24,
+  "top_kernels_us": {
+   "sd:commonsp_commSpAllGather": 115.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "EMBED",
+  "busy_ms": 0.003519775390625,
+  "exposed_ms": 0.003519775390625,
+  "ach_ms": 0.00013203338129496404,
+  "derate": 26.65822351971569,
+  "calls": 1,
+  "top_kernels_us": {
+   "uint4>": 3.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "group": "WAIT",
+  "busy_ms": 0.123826171875,
+  "exposed_ms": 2.44140625e-07,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaoverlapQueryWait": 121.2
+  }
+ },
+ {
+  "kind": "step",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "step_ms": 17.43,
+  "model_ach_ms": 4.289282607860521,
+  "model_sol_ms": 3.1665637747652178,
+  "derate": 4.063616598276331,
+  "multinode_d3x32_ms": 30.48
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.752408935546875,
+  "exposed_ms": 7.750521606445313,
+  "ach_ms": 1.3387279274139767,
+  "derate": 5.790877128052612,
+  "gap_ms": 6.411793679031336
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 4.09634375,
+  "exposed_ms": 4.09634375,
+  "ach_ms": 0.27941639145200486,
+  "derate": 14.660355925123405,
+  "gap_ms": 3.816927358547995
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 2.77807080078125,
+  "exposed_ms": 2.3761690673828126,
+  "ach_ms": 1.282516061158455,
+  "derate": 2.1661099497435603,
+  "gap_ms": 1.0936530062243575
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 0.58123974609375,
+  "exposed_ms": 0.5804718017578125,
+  "ach_ms": 0.056711835504275825,
+  "derate": 10.249002539336379,
+  "gap_ms": 0.5237599662535367
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 0.885611572265625,
+  "exposed_ms": 0.885611572265625,
+  "ach_ms": 0.47266610563616873,
+  "derate": 1.8736515305527706,
+  "gap_ms": 0.4129454666294563
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 0.936954833984375,
+  "exposed_ms": 0.6459749755859375,
+  "ach_ms": 0.24911485802137429,
+  "derate": 3.7611358930023493,
+  "gap_ms": 0.3968601175645632
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 0.40240673828125,
+  "exposed_ms": 0.3403736572265625,
+  "ach_ms": 0.040539270864211545,
+  "derate": 9.926343757615495,
+  "gap_ms": 0.299834386362351
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.542982177734375,
+  "exposed_ms": 0.542982177734375,
+  "ach_ms": 0.3344608100628931,
+  "derate": 1.62345530895614,
+  "gap_ms": 0.20852136767148194
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.256450927734375,
+  "exposed_ms": 0.222570556640625,
+  "ach_ms": 0.10638612258992806,
+  "derate": 2.4105674827804475,
+  "gap_ms": 0.11618443405069694
+ },
+ {
+  "kind": "family",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.19889892578125,
+  "exposed_ms": 0.0002080078125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0002080078125
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.megamoe",
+  "busy_ms": 7.697128173828125,
+  "exposed_ms": 7.697128173828125,
+  "ach_ms": 1.3387279274139767,
+  "derate": 5.749583628016697,
+  "calls": 23,
+  "top_kernels_us": {
+   "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7690.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "TAIL.drafter+final",
+  "busy_ms": 4.09634375,
+  "exposed_ms": 4.09634375,
+  "ach_ms": 0.27941639145200486,
+  "derate": 14.660355925123405,
+  "calls": 118,
+  "top_kernels_us": {
+   "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 2225.3,
+   "sd:mlaqueryMlaQuery": 278.5,
+   "ncclDevKernel_AllGather_RING": 277.2,
+   "sd:mladcpDcpValue": 236.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "KDA.core",
+  "busy_ms": 0.885611572265625,
+  "exposed_ms": 0.885611572265625,
+  "ach_ms": 0.47266610563616873,
+  "derate": 1.8736515305527706,
+  "calls": 18,
+  "top_kernels_us": {
+   "sd:kdaspecializedKdaWS": 888.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.topk_merge",
+  "busy_ms": 0.336212646484375,
+  "exposed_ms": 0.3354447021484375,
+  "ach_ms": 0.04518387924528302,
+  "derate": 7.440986743507066,
+  "calls": 6,
+  "top_kernels_us": {
+   "k31dcpx::topk_merge_kernel<16>": 319.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.topk",
+  "busy_ms": 0.245027099609375,
+  "exposed_ms": 0.245027099609375,
+  "ach_ms": 0.011527956258992807,
+  "derate": 21.25503377220334,
+  "calls": 18,
+  "top_kernels_us": {
+   "k31dcpx::topk_pp_win_kernel": 154.8,
+   "k31dcpx::topk_pp_hist_kernel": 66.8,
+   "k31dcpx::topk_pp_window_kernel": 24.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.shared_gate_up",
+  "busy_ms": 0.51997265625,
+  "exposed_ms": 0.51997265625,
+  "ach_ms": 0.29767016978417266,
+  "derate": 1.7468080749475468,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 537.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "COMM.SP_RS",
+  "busy_ms": 0.3624365234375,
+  "exposed_ms": 0.3624365234375,
+  "ach_ms": 0.17064327044025157,
+  "derate": 2.1239426700064463,
+  "calls": 25,
+  "top_kernels_us": {
+   "sd:commonsp_commSpReduceScatter": 221.6,
+   "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 19.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.g_proj",
+  "busy_ms": 0.392373291015625,
+  "exposed_ms": 0.1961866455078125,
+  "ach_ms": 0.027799617087123283,
+  "derate": 14.114341567581208,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:gemmsplitkSplitKGemm": 391.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "KDA.in_proj",
+  "busy_ms": 0.4856240234375,
+  "exposed_ms": 0.4856240234375,
+  "ach_ms": 0.3418273403471371,
+  "derate": 1.4206705143723513,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT": 574.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.router+latent_down",
+  "busy_ms": 0.45494970703125,
+  "exposed_ms": 0.2536739501953125,
+  "ach_ms": 0.11253450589928059,
+  "derate": 4.042757404901517,
+  "calls": 69,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x64_64x16_2x2_2cta_v_bz_TNN": 335.4,
+   "nvjet_sm107_tss_64x96_64x16_2x1_2cta_h_bz_splitK_TNT": 99.0,
+   "fal": 43.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.sparse_mla",
+  "busy_ms": 0.1988505859375,
+  "exposed_ms": 0.1981385498046875,
+  "ach_ms": 0.05753966503597122,
+  "derate": 3.455887096547877,
+  "calls": 12,
+  "top_kernels_us": {
+   "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 190.8,
+   "flashinfer::ComputeLSEFromMDKernel": 8.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.q_path",
+  "busy_ms": 0.5356875,
+  "exposed_ms": 0.2685557861328125,
+  "ach_ms": 0.13185126858741206,
+  "derate": 4.062816427472299,
+  "calls": 12,
+  "top_kernels_us": {
+   "sd:mlaqueryMlaQuery": 527.5,
+   "sd:dsaoverlapQueryNorm": 9.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.idx_score",
+  "busy_ms": 0.256450927734375,
+  "exposed_ms": 0.222570556640625,
+  "ach_ms": 0.10638612258992806,
+  "derate": 2.4105674827804475,
+  "calls": 6,
+  "top_kernels_us": {
+   "deep_gemm::sm100_paged_mqa_logits": 258.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "KDA.o_proj",
+  "busy_ms": 0.184578125,
+  "exposed_ms": 0.184578125,
+  "ach_ms": 0.08339885126136985,
+  "derate": 2.213197450664361,
+  "calls": 18,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x128_64x12_4x1_2cta_v_bz_TNT": 221.8
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.dcp_value",
+  "busy_ms": 0.15614453125,
+  "exposed_ms": 0.15614453125,
+  "ach_ms": 0.05827350943396227,
+  "derate": 2.6795113726066018,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsadcp_valueDcpValue": 141.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.shared_down",
+  "busy_ms": 0.246388671875,
+  "exposed_ms": 0.246388671875,
+  "ach_ms": 0.14997371395683454,
+  "derate": 1.6428790444298502,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 266.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.shared_act",
+  "busy_ms": 0.086850830078125,
+  "exposed_ms": 0.086850830078125,
+  "ach_ms": 0.001237436951242294,
+  "derate": 70.18606482611763,
+  "calls": 23,
+  "top_kernels_us": {
+   "vllm::situ_and_mul_kernel<c10::BFloat16>": 86.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "ATTNRES",
+  "busy_ms": 0.12955224609375,
+  "exposed_ms": 0.1202962646484375,
+  "ach_ms": 0.03877294132281272,
+  "derate": 3.341305603181715,
+  "calls": 49,
+  "top_kernels_us": {
+   "true>": 126.6,
+   "false>": 3.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.latent_up",
+  "busy_ms": 0.168963134765625,
+  "exposed_ms": 0.168963134765625,
+  "ach_ms": 0.08843352402877698,
+  "derate": 1.9106231106502443,
+  "calls": 23,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_badd_TNT": 169.7
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.qkv_a",
+  "busy_ms": 0.09294482421875,
+  "exposed_ms": 0.0885054931640625,
+  "ach_ms": 0.02056013347068493,
+  "derate": 4.520633309665653,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_64x192_64x15_2x2_2cta_v_bz_TNT": 112.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.latent_norm",
+  "busy_ms": 0.066977294921875,
+  "exposed_ms": 0.066977294921875,
+  "ach_ms": 0.00024061274051933492,
+  "derate": 278.36138176769947,
+  "calls": 23,
+  "top_kernels_us": {
+   "true>": 69.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.prepare",
+  "busy_ms": 0.05528076171875,
+  "exposed_ms": 0.0533934326171875,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 23,
+  "top_kernels_us": {
+   "_prepare_megamoe_inputs_kernel": 53.2
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "MOE.topk",
+  "busy_ms": 0.10555419921875,
+  "exposed_ms": 0.052777099609375,
+  "ach_ms": 9.02297776947506e-05,
+  "derate": 1169.8377399957947,
+  "calls": 23,
+  "top_kernels_us": {
+   "int,": 111.9
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.o_proj",
+  "busy_ms": 0.057360595703125,
+  "exposed_ms": 0.057360595703125,
+  "ach_ms": 0.027799617087123283,
+  "derate": 2.0633592010767043,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_128x128_64x12_4x1_2cta_v_bz_TNT": 58.1
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DENSE",
+  "busy_ms": 0.13493017578125,
+  "exposed_ms": 0.13493017578125,
+  "ach_ms": 0.10645008437573499,
+  "derate": 1.2675440942347151,
+  "calls": 4,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_192x192_64x8_2x1_2cta_v_bz_TNT": 82.6,
+   "nvjet_sm107_tst_192x160_64x9_2x1_2cta_h_bz_splitK_TNT": 48.4,
+   "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 6.7,
+   "__nv_bfloat16,": 5.0
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.prologue",
+  "busy_ms": 0.046272216796875,
+  "exposed_ms": 0.0231361083984375,
+  "ach_ms": 0.001450414964028777,
+  "derate": 31.902743659198023,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaindexDsaIndex": 46.3
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "COMM.SP_AG",
+  "busy_ms": 0.180545654296875,
+  "exposed_ms": 0.180545654296875,
+  "ach_ms": 0.1638175396226415,
+  "derate": 1.1021143078620714,
+  "calls": 24,
+  "top_kernels_us": {
+   "sd:commonsp_commSpAllGather": 129.4
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "DSA.w_uv",
+  "busy_ms": 0.039985595703125,
+  "exposed_ms": 0.039985595703125,
+  "ach_ms": 0.02606850386021689,
+  "derate": 1.5338661519484809,
+  "calls": 6,
+  "top_kernels_us": {
+   "nvjet_sm107_tst_160x192_64x9_1x2_2cta_h_bz_TNN": 40.5
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "OTHER",
+  "busy_ms": 0.00976025390625,
+  "exposed_ms": 0.00976025390625,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 5,
+  "top_kernels_us": {
+   "fa": 9.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "EMBED",
+  "busy_ms": 0.0037119140625,
+  "exposed_ms": 0.0037119140625,
+  "ach_ms": 0.00019805007194244602,
+  "derate": 18.742301005468423,
+  "calls": 1,
+  "top_kernels_us": {
+   "uint4>": 3.6
+  }
+ },
+ {
+  "kind": "group",
+  "tag": "rel-24L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "group": "WAIT",
+  "busy_ms": 0.19889892578125,
+  "exposed_ms": 0.0002080078125,
+  "ach_ms": 0.0,
+  "derate": null,
+  "calls": 6,
+  "top_kernels_us": {
+   "sd:dsaoverlapQueryWait": 184.6
+  }
+ },
+ {
+  "kind": "step93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "bench24_step_ms": 12.2456,
+  "projected93_step_ms": 20.41814101037847,
+  "model_ach_ms": 9.81246797282062,
+  "multinode_ms": 20.92
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 6.948518781250001,
+  "exposed_ms": 6.948518781250001,
+  "ach_ms": 4.268502086695802,
+  "derate": 1.6278588226317978,
+  "gap_ms": 2.6800166945541988
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 7.008755574544272,
+  "exposed_ms": 6.1425050862630215,
+  "ach_ms": 4.053394975678396,
+  "derate": 1.729107480667179,
+  "gap_ms": 2.089110110584626
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 1.4566524832589285,
+  "exposed_ms": 1.276731390505421,
+  "ach_ms": 0.051705984904119304,
+  "derate": 28.171835155254534,
+  "gap_ms": 1.2250254056013017
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 2.12861328125,
+  "exposed_ms": 1.57142041015625,
+  "ach_ms": 0.45733402836418074,
+  "derate": 4.654395144974777,
+  "gap_ms": 1.1140863817920692
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 1.3600185546875,
+  "exposed_ms": 1.23905517578125,
+  "ach_ms": 0.16939711400570107,
+  "derate": 8.0285816123274,
+  "gap_ms": 1.069658061775549
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 1.4866885172526043,
+  "exposed_ms": 1.4866885172526043,
+  "ach_ms": 0.6044502299755521,
+  "derate": 2.459571431237168,
+  "gap_ms": 0.8822382872770521
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 0.525,
+  "exposed_ms": 0.525,
+  "ach_ms": 0.2688103303015684,
+  "derate": 1.9530499419833376,
+  "gap_ms": 0.2561896696984316
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.9864911804199219,
+  "exposed_ms": 0.9864911804199219,
+  "ach_ms": 0.7908269987421385,
+  "derate": 1.2474171746652554,
+  "gap_ms": 0.1956641816777834
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.4834609375,
+  "exposed_ms": 0.24173046875,
+  "ach_ms": 0.14184816345323742,
+  "derate": 3.4082988861493497,
+  "gap_ms": 0.09988230529676258
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.0,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "step93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "bench24_step_ms": 15.2146,
+  "projected93_step_ms": 25.9041860414491,
+  "model_ach_ms": 11.339236857532798,
+  "multinode_ms": 26.98
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 8.212552286783856,
+  "exposed_ms": 7.327901407877604,
+  "ach_ms": 4.1502908710690205,
+  "derate": 1.978789569673821,
+  "gap_ms": 3.177610536808584
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.329961843750001,
+  "exposed_ms": 7.322357839843751,
+  "ach_ms": 4.811706910998674,
+  "derate": 1.5233600007920394,
+  "gap_ms": 2.510650928845077
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 2.6861142578125,
+  "exposed_ms": 2.449923828125,
+  "ach_ms": 0.7223882247859157,
+  "derate": 3.718380457555973,
+  "gap_ms": 1.7275356033390845
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 1.8438037109375,
+  "exposed_ms": 1.841466796875,
+  "ach_ms": 0.19812222801140217,
+  "derate": 9.306394993858977,
+  "gap_ms": 1.643344568863598
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 2.6568743489583335,
+  "exposed_ms": 2.6568743489583335,
+  "ach_ms": 1.208168484123766,
+  "derate": 2.199092580109183,
+  "gap_ms": 1.4487058648345674
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 1.4939685606664541,
+  "exposed_ms": 1.2788851168885524,
+  "ach_ms": 0.10264257009600838,
+  "derate": 14.555057996589976,
+  "gap_ms": 1.1762425467925441
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 1.5749500427246095,
+  "exposed_ms": 1.5749500427246095,
+  "ach_ms": 1.0336193308176098,
+  "derate": 1.5237234790092384,
+  "gap_ms": 0.5413307119069996
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.7657080078125,
+  "exposed_ms": 0.75482666015625,
+  "ach_ms": 0.28369632690647484,
+  "derate": 2.699040964548435,
+  "gap_ms": 0.47113033324977516
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 0.697,
+  "exposed_ms": 0.697,
+  "ach_ms": 0.34166144087117895,
+  "derate": 2.040031202300054,
+  "gap_ms": 0.355338559128821
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.0,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "step93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "bench24_step_ms": 17.3372,
+  "projected93_step_ms": 29.782532650701196,
+  "model_ach_ms": 13.37970847570407,
+  "multinode_ms": 30.48
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 9.412362630208333,
+  "exposed_ms": 8.252552571614585,
+  "ach_ms": 4.739842959571863,
+  "derate": 1.9857963039050825,
+  "gap_ms": 3.5127096120427206
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 2.59024609375,
+  "exposed_ms": 2.58823046875,
+  "ach_ms": 0.2268473420171033,
+  "derate": 11.41845467845379,
+  "gap_ms": 2.361383126732897
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.6970425859375,
+  "exposed_ms": 7.689520125,
+  "ach_ms": 5.354911709655907,
+  "derate": 1.4373799239412843,
+  "gap_ms": 2.3346084153440936
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 3.9521806640625,
+  "exposed_ms": 2.679650390625,
+  "ach_ms": 0.9964594320854971,
+  "derate": 3.9662233471873036,
+  "gap_ms": 1.6831909585395028
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 3.39931689453125,
+  "exposed_ms": 3.39931689453125,
+  "ach_ms": 1.8118867382719803,
+  "derate": 1.8761199708173937,
+  "gap_ms": 1.5874301562592699
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 1.5288696886957909,
+  "exposed_ms": 1.2824649284518497,
+  "ach_ms": 0.15357915528789745,
+  "derate": 9.954929663662963,
+  "gap_ms": 1.128885773163952
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 2.0562655334472657,
+  "exposed_ms": 2.0562655334472657,
+  "ach_ms": 1.2764116628930817,
+  "derate": 1.6109736327436772,
+  "gap_ms": 0.7798538705541839
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 0.891,
+  "exposed_ms": 0.891,
+  "ach_ms": 0.27941639145200486,
+  "derate": 3.188789302481012,
+  "gap_ms": 0.6115836085479951
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 1.6308037109375,
+  "exposed_ms": 0.94353173828125,
+  "ach_ms": 0.42554449035971226,
+  "derate": 3.8322754679751196,
+  "gap_ms": 0.5179872479215378
+ },
+ {
+  "kind": "family93",
+  "tag": "spgemm-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.0,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "step93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "bench24_step_ms": 12.4115,
+  "projected93_step_ms": 21.09946902638712,
+  "model_ach_ms": 9.81246797282062,
+  "multinode_ms": 20.92
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 7.953715250651042,
+  "exposed_ms": 6.957162516276042,
+  "ach_ms": 4.053394975678396,
+  "derate": 1.9622354343397956,
+  "gap_ms": 2.9037675405976464
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 6.940065656250001,
+  "exposed_ms": 6.940065656250001,
+  "ach_ms": 4.268502086695802,
+  "derate": 1.6258784733597789,
+  "gap_ms": 2.671563569554199
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 1.461846943757972,
+  "exposed_ms": 1.2740729258011798,
+  "ach_ms": 0.051705984904119304,
+  "derate": 28.27229664938671,
+  "gap_ms": 1.2223669408970603
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 1.362642578125,
+  "exposed_ms": 1.25249560546875,
+  "ach_ms": 0.16939711400570107,
+  "derate": 8.044071979166896,
+  "gap_ms": 1.083098491463049
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 2.10364453125,
+  "exposed_ms": 1.44545849609375,
+  "ach_ms": 0.45733402836418074,
+  "derate": 4.599798835819061,
+  "gap_ms": 0.9881244677295692
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 1.469563924153646,
+  "exposed_ms": 1.469563924153646,
+  "ach_ms": 0.6044502299755521,
+  "derate": 2.4312405741215195,
+  "gap_ms": 0.8651136941780938
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 0.525,
+  "exposed_ms": 0.525,
+  "ach_ms": 0.2688103303015684,
+  "derate": 1.9530499419833376,
+  "gap_ms": 0.2561896696984316
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 0.988669921875,
+  "exposed_ms": 0.988669921875,
+  "ach_ms": 0.7908269987421385,
+  "derate": 1.250172191196739,
+  "gap_ms": 0.19784292313286153
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.4939599609375,
+  "exposed_ms": 0.24697998046875,
+  "ach_ms": 0.14184816345323742,
+  "derate": 3.4823148140394644,
+  "gap_ms": 0.10513181701551258
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B32_M128_u132k",
+  "B": 32,
+  "r": 8.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.0,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "step93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "bench24_step_ms": 15.488299999999999,
+  "projected93_step_ms": 26.997546820880505,
+  "model_ach_ms": 11.339236857532798,
+  "multinode_ms": 26.98
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 10.520421427408856,
+  "exposed_ms": 9.065775919596355,
+  "ach_ms": 4.1502908710690205,
+  "derate": 2.5348636407016536,
+  "gap_ms": 4.9154850485273345
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.323630789062501,
+  "exposed_ms": 7.320786062500002,
+  "ach_ms": 4.811706910998674,
+  "derate": 1.52204424012652,
+  "gap_ms": 2.509079151501327
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 1.81685546875,
+  "exposed_ms": 1.8147138671875,
+  "ach_ms": 0.19812222801140217,
+  "derate": 9.170376726459173,
+  "gap_ms": 1.616591639176098
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 2.661773640950521,
+  "exposed_ms": 2.661773640950521,
+  "ach_ms": 1.208168484123766,
+  "derate": 2.2031477198157456,
+  "gap_ms": 1.453605156826755
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 2.7715517578125,
+  "exposed_ms": 1.94386474609375,
+  "ach_ms": 0.7223882247859157,
+  "derate": 3.8366513499494914,
+  "gap_ms": 1.2214765213078345
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 1.5208725934709821,
+  "exposed_ms": 1.3181844034000318,
+  "ach_ms": 0.10264257009600838,
+  "derate": 14.817171784069801,
+  "gap_ms": 1.2155418333040235
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 1.5528173217773438,
+  "exposed_ms": 1.5528173217773438,
+  "ach_ms": 1.0336193308176098,
+  "derate": 1.5023106432704194,
+  "gap_ms": 0.519197990959734
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 0.697,
+  "exposed_ms": 0.697,
+  "ach_ms": 0.34166144087117895,
+  "derate": 2.040031202300054,
+  "gap_ms": 0.355338559128821
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 0.748873046875,
+  "exposed_ms": 0.622630859375,
+  "ach_ms": 0.28369632690647484,
+  "derate": 2.6396994809237637,
+  "gap_ms": 0.3389345324685252
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B64_M256_u132k",
+  "B": 64,
+  "r": 16.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.0,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ },
+ {
+  "kind": "step93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "bench24_step_ms": 17.43,
+  "projected93_step_ms": 30.166403642310737,
+  "model_ach_ms": 13.37970847570407,
+  "multinode_ms": 30.48
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+  "busy_ms": 10.595792317708334,
+  "exposed_ms": 8.988185384114583,
+  "ach_ms": 4.739842959571863,
+  "derate": 2.2354732863692646,
+  "gap_ms": 4.24834242454272
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+  "busy_ms": 7.700815046875,
+  "exposed_ms": 7.69326573046875,
+  "ach_ms": 5.354911709655907,
+  "derate": 1.438084410054603,
+  "gap_ms": 2.3383540208128433
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+  "busy_ms": 2.324958984375,
+  "exposed_ms": 2.32188720703125,
+  "ach_ms": 0.2268473420171033,
+  "derate": 10.249002539336379,
+  "gap_ms": 2.095039865014147
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+  "busy_ms": 3.7478193359375,
+  "exposed_ms": 2.58389990234375,
+  "ach_ms": 0.9964594320854971,
+  "derate": 3.7611358930023493,
+  "gap_ms": 1.5874404702582527
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+  "busy_ms": 3.3948443603515623,
+  "exposed_ms": 3.3948443603515623,
+  "ach_ms": 1.8118867382719803,
+  "derate": 1.8736515305527703,
+  "gap_ms": 1.5829576220795822
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+  "busy_ms": 1.5454151387117347,
+  "exposed_ms": 1.2989828927176341,
+  "ach_ms": 0.15357915528789745,
+  "derate": 10.062662057326204,
+  "gap_ms": 1.1454037374297366
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "SP comm (AllGather / ReduceScatter push)",
+  "busy_ms": 2.104055938720703,
+  "exposed_ms": 2.104055938720703,
+  "ach_ms": 1.2764116628930817,
+  "derate": 1.6484148491339419,
+  "gap_ms": 0.8276442758276215
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "drafter + final (DSpark k=3 propose)",
+  "busy_ms": 0.891,
+  "exposed_ms": 0.891,
+  "ach_ms": 0.27941639145200486,
+  "derate": 3.188789302481012,
+  "gap_ms": 0.6115836085479951
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "DSA indexer logits (paged_mqa_logits)",
+  "busy_ms": 1.0258037109375,
+  "exposed_ms": 0.8902822265625,
+  "ach_ms": 0.42554449035971226,
+  "derate": 2.4105674827804475,
+  "gap_ms": 0.46473773620278774
+ },
+ {
+  "kind": "family93",
+  "tag": "rel-93L",
+  "case": "q4_B96_M384_u132k",
+  "B": 96,
+  "r": 24.0,
+  "family": "spin wait (QueryWait)",
+  "busy_ms": 0.0,
+  "exposed_ms": 0.0,
+  "ach_ms": 0.0,
+  "derate": null,
+  "gap_ms": 0.0
+ }
+]

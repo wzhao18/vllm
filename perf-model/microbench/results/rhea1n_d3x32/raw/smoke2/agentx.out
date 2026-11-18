@@ -1,0 +1,10 @@
+agentx rc=0
+NQ: specialized decode: q 4 dcp 4 bf16_state False captured 4 rows (96,)..(512,) (capture sizes 4, max 512)
+NQ: capture: measured rows only: verify rows [96, 128, 384, 512], drafter batches [32, 43, 128] of the full capture's 128 rows / 96 batches (same capacity (512,) / [128]; --full-capture for the production list)
+NQ: specialized decode: q 4 dcp 4 bf16_state False captured 4 rows (96,)..(512,) (capture sizes 4, max 512)
+NQ: capture: measured rows only: verify rows [96, 128, 384, 512], drafter batches [32, 43, 128] of the full capture's 128 rows / 96 batches (same capacity (512,) / [128]; --full-capture for the production list)
+NQ: drafter fast-path candidate batches (draft_batches, K=3): [32, 43, 128]
+NQ: KV: production capacity at gpu-memory-utilization 0.93: 5578 blocks (146.52 GiB/rank; upper bound, no CUDA graph memory reserved)
+NQ: KV: bench pool 361 blocks (9.48 GiB/rank, largest case 353 blocks + 8, identical in both arms); 152.39 GiB/rank left for the bench's snapshot, graph and eager transients (min over ranks)
+NQ:   per DP rank: B 32, 128 rows (TP4 group), requests per GPU 8
+[forward] q4_B32_M128_u132k: 32 reqs, 128 tokens, median 12211.0 us

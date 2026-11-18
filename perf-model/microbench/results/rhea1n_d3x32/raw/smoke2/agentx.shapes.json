@@ -1,0 +1,178 @@
+{
+ "cases": [
+  {
+   "name": "q4_B32_M128_u132k",
+   "ctx": {
+    "B": 32,
+    "sum": 4325376,
+    "min": 135168,
+    "p50": 135168,
+    "mean": 135168,
+    "max": 135168,
+    "scale": 1.0
+   },
+   "requests": [
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    },
+    {
+     "query_len": 4,
+     "kv_len": 135172,
+     "num_draft_tokens": 3
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,2 @@
+12:27:36 start spgemm-prof job 72377 node rhea0145 ov spgemm-4fbaa15 rows 128,256,384 ctx u132k prof 1 target /lustre/fsw/coreai_comparch_inferencex/weizha/k31gap/models/k31-view-L24 draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31gap/models/dspark-preview-L24
+12:30:03 end rc=0 q4_B32_M128_u132k: 32 reqs, 128 tokens, median 12245.6 us;q4_B64_M256_u132k: 64 reqs, 256 tokens, median 15214.6 us;q4_B96_M384_u132k: 96 reqs, 384 tokens, median 17337.2 us;
