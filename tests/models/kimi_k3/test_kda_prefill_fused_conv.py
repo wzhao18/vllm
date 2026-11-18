@@ -100,3 +100,67 @@ def test_fused_conv_prefill_bitwise(seqlens, heads, conv_state_dtype):
     assert torch.equal(cs_new, cs_ref)
     assert torch.equal(fs, fs_ref)
     assert torch.equal(out, out_ref)
+
+
+@pytest.mark.parametrize("seqlens,heads", [([37, 1, 2, 200, 16], 4), ([3, 64, 1000], 96)])
+def test_fused_conv_prefill_o_norm_mxfp8(seqlens, heads):
+    """The o_norm + MXFP8 epilogue against kda_norm.rmsnorm_gated_mxfp8 on the
+    stock output: same FP8 codes and scales up to rare one-ulp flips (the sum of
+    squares runs in another order)."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_norm
+    from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda import (
+        fused_conv_prefill,
+    )
+
+    kda_segscan.load_extension()
+    (mixed, beta, g, w, cs, ci, hi, cu, A_log, dt_bias, init) = _inputs(
+        seqlens, heads, torch.bfloat16
+    )
+    T, N, P = sum(seqlens), len(seqlens), heads * D
+    lb, eps = -5.0, 1e-6
+    ws = torch.empty(
+        kda_segscan.workspace_size(T, heads, N), dtype=torch.uint8, device="cuda"
+    )
+    gate = (torch.randn(T, P + 64, device="cuda") * 2).to(torch.bfloat16)[:, :P]
+    norm_w = torch.rand(D, device="cuda") + 0.5
+
+    cs_ref = cs.clone()
+    q, k, v = (
+        x.view(1, T, heads, D) for x in qkv_conv(mixed, w, cs_ref, cu, ci, hi, P)
+    )
+    out_ref = torch.empty(1, T, heads, D, dtype=torch.bfloat16, device="cuda")
+    fs_ref = torch.empty_like(init)
+    torch.ops.k3_flashkda_split.fwd(
+        q, k, v, g, beta, D**-0.5, out_ref, ws, A_log,
+        dt_bias.view(heads, D), lb, init, fs_ref, cu, None, None, 3,
+    )
+    ref = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
+    kda_norm.rmsnorm_gated_mxfp8(out_ref, gate.view(T, heads, D), norm_w, eps, out=ref)
+
+    mx = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
+    mx.scale.zero_()
+    ref_scale = ref.scale.clone()
+    fs = torch.empty_like(init)
+    fused_conv_prefill(
+        mixed_qkv=mixed, conv_weight=w, conv_state=cs.clone(), cache_indices=ci,
+        has_initial_state=hi, null_block_id=-1, g=g, beta=beta, A_log=A_log,
+        dt_bias=dt_bias, lower_bound=lb, initial_state=init, cu_seqlens=cu,
+        out=torch.empty_like(out_ref), final_state=fs, workspace=ws,
+        v_buf=torch.empty_like(out_ref), o_gate=gate, o_norm_weight=norm_w,
+        o_norm_eps=eps, o_mxfp8=mx,
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(fs, fs_ref)
+    rows = ((T + 127) // 128) * 128
+    sf_ref = ref_scale.view(-1)[: rows * P // 32]
+    sf = mx.scale.view(-1)[: rows * P // 32]
+    from vllm.models.kimi_k3.nvidia.mxfp8 import unswizzle_mxfp8_scale
+
+    su = unswizzle_mxfp8_scale(sf, rows, P)[:T]
+    su_ref = unswizzle_mxfp8_scale(sf_ref, rows, P)[:T]
+    assert (su != su_ref).float().mean().item() < 1e-3
+    a = mx.data.view(torch.uint8).to(torch.int16)
+    b = ref.data.view(torch.uint8).to(torch.int16)
+    assert ((a - b).abs() > 1).sum().item() <= T * P * 1e-4
+    assert (a != b).float().mean().item() < 2e-3

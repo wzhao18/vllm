@@ -8,8 +8,8 @@ OV=$1; OUT=$2; mkdir -p $OUT
 B=$OV/benchmarks/kimi_k3/bench_kda_prefill_chain.py
 NCU=$(which ncu 2>/dev/null || ls /usr/local/cuda/bin/ncu 2>/dev/null)
 nvidia-smi --query-gpu=name,clocks.max.sm --format=csv
-python -m pytest -x -q $OV/tests/models/kimi_k3/test_kda_prefill_fused_conv.py 2>&1 | tail -30
-for impl in stock split fused; do
+python -m pytest -q $OV/tests/models/kimi_k3/test_kda_prefill_fused_conv.py 2>&1 | tail -30
+for impl in stock split fusedconv fused; do
   python $B --impl $impl --tokens 16384 --json $OUT/f16k_$impl.json 2>&1 | grep -v Warning
   python $B --impl $impl --tokens 8192 --json $OUT/f8k_$impl.json 2>&1 | grep -v Warning
 done

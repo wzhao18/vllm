@@ -66,11 +66,21 @@ def fused_conv_prefill(
     final_state: torch.Tensor,
     workspace: torch.Tensor,
     v_buf: torch.Tensor,
+    o_gate: torch.Tensor | None = None,
+    o_norm_weight: torch.Tensor | None = None,
+    o_norm_eps: float = 1e-6,
+    o_mxfp8=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Short conv + FlashKDA prefill. mixed_qkv (T, 3 H 128) raw rows;
     conv_state (lines, 3 H 128, >= 3) updated in place; v_buf (1, T, H, 128)
     receives the conv'd V; out (1, T, H, 128) and final_state (N, H, 128, 128)
-    are written. Returns (out, final_state)."""
+    are written. Returns (out, final_state).
+
+    With o_gate (T, >= H 128) bf16 rows, o_norm_weight [128] FP32 and o_mxfp8 (an
+    mxfp8_act.Mxfp8Buffer of T rows), the recurrence epilogue writes the
+    gated RMSNorm (sigmoid) of each output row as o_proj's MXFP8 input
+    (kda_norm.rmsnorm_gated_mxfp8's math; the sum of squares in another order)
+    and out is not written."""
     kda_segscan.load_extension()
     D = out.shape[-1]
     torch.ops.k3_flashkda_split.fwd_conv(
@@ -95,5 +105,10 @@ def fused_conv_prefill(
         None,
         None,
         3,
+        o_gate,
+        o_norm_weight,
+        o_norm_eps,
+        o_mxfp8.data if o_mxfp8 is not None else None,
+        o_mxfp8.scale if o_mxfp8 is not None else None,
     )
     return out, final_state

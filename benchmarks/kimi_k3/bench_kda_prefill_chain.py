@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--json", default="")
     ap.add_argument("--k2-pin", type=int, default=0,
                     help="split: pin the K2 variant (fwd_launch.cu mode bits 5-7)")
-    ap.add_argument("--impl", default="stock", choices=["stock", "split", "fused"])
+    ap.add_argument("--impl", default="stock", choices=["stock", "split", "fusedconv", "fused"])
     args = ap.parse_args()
 
     from vllm.models.kimi_k3.nvidia.ops import kda_conv, kda_norm
@@ -82,6 +82,16 @@ def main():
             cache_indices=sidx, has_initial_state=has_init, null_block_id=-1,
             g=g1, beta=beta, A_log=A_log, dt_bias=dt_bias,
             lower_bound=lower_bound, initial_state=init_state, cu_seqlens=cu,
+            out=out, final_state=final_state, workspace=ws, v_buf=v_buf,
+            o_gate=proj[:, 3 * P: 4 * P], o_norm_weight=norm_w, o_norm_eps=1e-6,
+            o_mxfp8=mx)
+
+    def step_fusedconv():
+        fused_conv_prefill(
+            mixed_qkv=mixed_qkv, conv_weight=conv_w, conv_state=conv_state,
+            cache_indices=sidx, has_initial_state=has_init, null_block_id=-1,
+            g=g1, beta=beta, A_log=A_log, dt_bias=dt_bias,
+            lower_bound=lower_bound, initial_state=init_state, cu_seqlens=cu,
             out=out, final_state=final_state, workspace=ws, v_buf=v_buf)
         kda_norm.rmsnorm_gated_mxfp8(out, g2, norm_w, 1e-6, out=mx)
 
@@ -105,7 +115,8 @@ def main():
             None, None)
         kda_norm.rmsnorm_gated_mxfp8(out, g2, norm_w, 1e-6, out=mx)
 
-    step = {"stock": step_stock, "split": step_split, "fused": step_fused}[args.impl]
+    step = {"stock": step_stock, "split": step_split, "fusedconv": step_fusedconv,
+            "fused": step_fused}[args.impl]
     for _ in range(3):
         step()
     torch.cuda.synchronize()
