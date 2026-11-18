@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-#include "conv_args.h"
+#include "norm_args.h"
 
 namespace norm_mx {
 

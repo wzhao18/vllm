@@ -6,7 +6,6 @@
 // picks a V slicing (16, 32, 64 columns or the full tile) per launch shape,
 // see the policy below.
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -27,7 +26,7 @@ void launch_fwd(
     void* workspace_ptr, int total_tiles, int T_total, int H, int N,
     SeqlenT const* cu_seqlens_ptr, float const* A_log_ptr,
     float const* dt_bias_ptr, float gate_scale, int num_sms,
-    cudaStream_t stream, int mode, ConvFuse const* conv) {
+    cudaStream_t stream, int mode) {
   using BF16 = cutlass::bfloat16_t;
   constexpr int kInputStages = 3;
   constexpr int kOutputStages = 2;
@@ -152,37 +151,22 @@ void launch_fwd(
     using SharedStorageK1T = SharedStorageK1<K1L>;
     int smem_size_k1 = sizeof(SharedStorageK1T);
 
+    auto kernel1 =
+        _flash_kda_fwd_prepare<decltype(tma_load_q), decltype(tma_load_k),
+                               decltype(tma_load_beta), decltype(tma_load_g),
+                               decltype(tma_load_dt_bias), CHUNK, D, kK1Threads,
+                               IsVarlen, SeqlenT>;
+
+    cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_size_k1);
+
     dim3 grid_k1(total_tiles, H);
     dim3 block_k1(kK1Threads);
-    auto launch_k1 = [&](auto fused_tag, ConvFuse const& c, int smem) {
-      auto kernel1 = _flash_kda_fwd_prepare<
-          decltype(tma_load_q), decltype(tma_load_k), decltype(tma_load_beta),
-          decltype(tma_load_g), decltype(tma_load_dt_bias), CHUNK, D,
-          kK1Threads, IsVarlen, SeqlenT, decltype(fused_tag)::value>;
-      cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           smem);
-      kernel1<<<grid_k1, block_k1, smem, stream>>>(
-          tma_load_q, tma_load_k, tma_load_beta, tma_load_g, tma_load_dt_bias,
-          scale, T_total, H, N, cu_seqlens_ptr, total_tiles, A_log_ptr,
-          gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, c);
-    };
-    if (conv != nullptr) {
-      // Kimi-K3 FusedConv: raw Q|K|V rows (tokens, 3P) -> 19 x 128 boxes.
-      ConvFuse c = *conv;
-      Tensor m_raw = make_tensor(
-          make_gmem_ptr(static_cast<BF16 const*>(c.raw)),
-          make_layout(make_shape(T_total, 3 * c.P), make_stride(c.ldx, _1{})));
-      using RawSmemLayout =
-          Layout<Shape<Int<conv_fused::kRawRows>, Int<D>>, Stride<Int<D>, _1>>;
-      auto tma_raw = make_tma_copy(SM90_TMA_LOAD{}, m_raw, RawSmemLayout{});
-      static_assert(sizeof(*tma_raw.get_tma_descriptor()) == sizeof(c.tmap));
-      std::memcpy(c.tmap, tma_raw.get_tma_descriptor(), sizeof(c.tmap));
-      const int raw_off = ((smem_size_k1 + 127) / 128) * 128;
-      launch_k1(std::true_type{}, c,
-                raw_off + 3 * conv_fused::kRawRows * D * int(sizeof(BF16)));
-    } else {
-      launch_k1(std::false_type{}, ConvFuse{}, smem_size_k1);
-    }
+
+    kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+        tma_load_q, tma_load_k, tma_load_beta, tma_load_g, tma_load_dt_bias,
+        scale, T_total, H, N, cu_seqlens_ptr, total_tiles, A_log_ptr,
+        gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
   }
 #endif
 
@@ -211,7 +195,7 @@ void launch_fwd(
     // wave would double the serial chunk chain.
     auto launch_vsplit = [&](auto vd_tag, auto stages_tag, auto min_blocks_tag,
                              auto exact_tag, auto no_out_tag, auto zero_v_tag,
-                             int max_blocks_per_sm, bool forced = false) -> bool {
+                             int max_blocks_per_sm) -> bool {
       constexpr int kVD = decltype(vd_tag)::value;
       constexpr int kStages = decltype(stages_tag)::value;
       constexpr int kMinBlocks = decltype(min_blocks_tag)::value;
@@ -249,7 +233,7 @@ void launch_fwd(
         return blocks;
       }();
       const int blocks = H * (D / kVD) * N;
-      if (!forced && blocks > std::min(resident, max_blocks_per_sm) * num_sms) {
+      if (blocks > std::min(resident, max_blocks_per_sm) * num_sms) {
         return false;
       }
       dim3 grid_k2(H * (D / kVD), N);
@@ -304,28 +288,10 @@ void launch_fwd(
           "k3_flashkda_split: K2 NoOut / ZeroV need exact fp32 state I/O, an "
           "fp32 final state and no checkpoint");
     }
-    // Kimi-K3: mode bits 5-7 pin one K2 variant (benchmarks of the per-shape
-    // policy; 0 = the policy below): 1 VD16, 2 VD32 x3/SM, 3 VD64, 4 VD64 x2/SM,
-    // 5 VD64 x3/SM, 6 VD32 x4/SM, 7 full width. A pinned grid may take waves.
-    const int pin = (mode >> 5) & 7;
-    using B2 = std::integral_constant<int, 2>;
-    using B4 = std::integral_constant<int, 4>;
     auto launch_k2 = [&](auto exact_tag) {
-      if (pin == 1 && launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1, true)) return;
-      if (pin == 2 && launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3, true)) return;
-      if (pin == 3 && launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1, true)) return;
-      if (pin == 4 && launch_vsplit(I64{}, S3{}, B2{}, exact_tag, No{}, No{}, 2, true)) return;
-      if (pin == 5 && launch_vsplit(I64{}, S3{}, B3{}, exact_tag, No{}, No{}, 3, true)) return;
-      if (pin == 6 && launch_vsplit(I32{}, S3{}, B4{}, exact_tag, No{}, No{}, 4, true)) return;
-      if (pin == 0) {
-        if (launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1)) return;
-        if (launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3)) return;
-        if (launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1)) return;
-        // Kimi-K3: past one wave, 64-column slices at two blocks per SM still
-        // beat the full-width kernel (VR200, 96 heads x 3 x 5461, fp32 state:
-        // 422 vs 495 us).
-        if (launch_vsplit(I64{}, S3{}, B2{}, exact_tag, No{}, No{}, 2, true)) return;
-      }
+      if (launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1)) return;
+      if (launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3)) return;
+      if (launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1)) return;
 
       using SharedStorageK2T =
           SharedStorageK2<K2L, kInputStages, kOutputStages>;
@@ -371,7 +337,7 @@ void launch_fwd(
       cutlass::bfloat16_t const*, void const*, float, void*, void*,          \
       SEQLEN_T const*, cutlass::bfloat16_t*, void*, int, int, int, int,      \
       SEQLEN_T const*, float const*, float const*, float, int, cudaStream_t, \
-      int, ConvFuse const*);
+      int);
 
 #define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
   INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T)    \

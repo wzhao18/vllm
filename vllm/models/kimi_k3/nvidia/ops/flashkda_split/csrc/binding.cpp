@@ -20,21 +20,12 @@ STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
       "Tensor(d!)? checkpoint_state=None, "
       "Tensor? checkpoint_offsets=None, int mode=3) -> ()");
   m.def(
-      "fwd_conv(Tensor mixed_qkv, Tensor conv_weight, Tensor(e!) conv_state, "
-      "Tensor cache_indices, Tensor has_initial_state, int null_block_id, "
-      "Tensor(f!) v_out, Tensor g, Tensor beta, float scale, Tensor(a!) out, "
-      "Tensor(c!) workspace, Tensor A_log, Tensor dt_bias, float lower_bound, "
-      "Tensor? initial_state=None, Tensor(b!)? final_state=None, "
-      "Tensor? cu_seqlens=None, Tensor(d!)? checkpoint_state=None, "
-      "Tensor? checkpoint_offsets=None, int mode=3) -> ()");
-  m.def(
       "o_norm_mxfp8(Tensor x, Tensor g, Tensor weight, float eps, Tensor(a!) q, "
       "Tensor(b!) sf) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CUDA, m) {
   m.impl("fwd", TORCH_BOX(&fwd));
-  m.impl("fwd_conv", TORCH_BOX(&fwd_conv));
   m.impl("o_norm_mxfp8", TORCH_BOX(&o_norm_mxfp8));
 }
 

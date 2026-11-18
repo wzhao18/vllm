@@ -6,8 +6,6 @@
 
 #include <cutlass/bfloat16.h>
 
-#include "conv_args.h"
-
 template <int D, bool HasStateIn = true, bool HasStateOut = true,
           bool StateFP32 = false, bool HasCheckpoint = false,
           bool IsVarlen = true, typename SeqlenT = int64_t>
@@ -20,4 +18,4 @@ void launch_fwd(
     void* workspace_ptr, int total_tiles, int T_total, int H, int N,
     SeqlenT const* cu_seqlens_ptr, float const* A_log_ptr,
     float const* dt_bias_ptr, float gate_scale, int num_sms,
-    cudaStream_t stream, int mode, ConvFuse const* conv = nullptr);
+    cudaStream_t stream, int mode);

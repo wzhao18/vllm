@@ -1,10 +1,8 @@
-// Kimi-K3: FlashKDA csrc/smxx/fwd_kernel1.cuh @
-// vllm-project/FlashKDA 17a037d98da5 (MIT, see LICENSE.FlashKDA), plus the
-// FusedConv variant (the short conv in the load path, conv_fused.cuh).
+// Kimi-K3: verbatim copy of FlashKDA csrc/smxx/fwd_kernel1.cuh @
+// vllm-project/FlashKDA 17a037d98da5 (MIT, see LICENSE.FlashKDA).
 #pragma once
 
 #include "utils.cuh"
-#include "conv_fused.cuh"
 
 template <int D, int CHUNK = 16>
 struct K1Layouts {
@@ -83,10 +81,8 @@ struct SharedStorageK1 {
 // ==================== Kernel 1: Prepare ====================
 template <class TmaLoadQ, class TmaLoadK, class TmaLoadBeta, class TmaLoadG,
           class TmaLoadDtBias, int CHUNK, int D, int NumThreads,
-          bool IsVarlen = true, typename SeqlenT = int64_t,
-          bool FusedConv = false>
-// Kimi-K3: FusedConv runs at 6 CTAs per SM (85 registers: no spills).
-__global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_prepare(
+          bool IsVarlen = true, typename SeqlenT = int64_t>
+__global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaLoadQ const tma_load_q,
     CUTE_GRID_CONSTANT TmaLoadK const tma_load_k,
     CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
@@ -95,8 +91,7 @@ __global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_
     int T_total, int H, int N, SeqlenT const* cu_seqlens, int total_tiles,
     float const* A_log_ptr, float gate_scale, cutlass::bfloat16_t* ws_kd,
     cutlass::bfloat16_t* ws_qd, cutlass::bfloat16_t* ws_kr, float* ws_gt,
-    cutlass::bfloat16_t* ws_inv, cutlass::bfloat16_t* ws_mqk,
-    CUTE_GRID_CONSTANT ConvFuse const conv) {
+    cutlass::bfloat16_t* ws_inv, cutlass::bfloat16_t* ws_mqk) {
   // --- constants
   using BF16 = cutlass::bfloat16_t;
   using Layouts = K1Layouts<D, CHUNK>;
@@ -112,24 +107,17 @@ __global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_
   using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
   using TMAGTotalSmemLayout = typename Layouts::TMAGTotalSmemLayout;
   static_assert(NumThreads == 128);
-  // Kimi-K3 FusedConv: q and k come from the raw Q|K|V rows (bulk tensor copies
-  // into raw_smem after the storage) through the short convolution
-  // (conv_fused.cuh) instead of a TMA load of q and k.
-  constexpr uint32_t kRawBytes = 3 * conv_fused::kRawRows * D * sizeof(BF16);
   constexpr uint32_t kTmaTransactionBytes =
       uint32_t(cute::cosize_v<QKLayout>) *
-          uint32_t((FusedConv ? 1 : 3) * sizeof(BF16)) +  // [q + k +] g_bf16
+          uint32_t(3 * sizeof(BF16)) +         // q + k + g_bf16
       uint32_t(32) * uint32_t(sizeof(BF16)) +  // beta (bf16, sigmoid fused)
-      uint32_t(D) * uint32_t(sizeof(float)) +  // dt_bias
-      (FusedConv ? kRawBytes : 0u);
+      uint32_t(D) * uint32_t(sizeof(float));   // dt_bias
 
   // --- shared memory
   extern __shared__ __align__(128) unsigned char shared_mem[];
   using SharedStorageT = SharedStorageK1<Layouts>;
   SharedStorageT& shared_storage =
       *reinterpret_cast<SharedStorageT*>(shared_mem);
-  auto* raw_smem = reinterpret_cast<__nv_bfloat16*>(
-      shared_mem + ((sizeof(SharedStorageT) + 127) / 128) * 128);
 
   // --- per-CTA tile info
   int global_tile_idx = blockIdx.x;
@@ -142,25 +130,15 @@ __global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_
     // Linear scan on cu_seqlens to find (seq_idx, local_t)
     seq_idx = 0;
     tiles_before = 0;
-    bool found = false;
     for (int i = 0; i < N; i++) {
       int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
       int n_tiles = (slen + CHUNK - 1) / CHUNK;
       if (tiles_before + n_tiles > global_tile_idx) {
         seq_idx = i;
-        found = true;
         break;
       }
       tiles_before += n_tiles;
     }
-    // Kimi-K3: a CTA past the last tile (total_tiles is an upper bound) finds
-    // no sequence; FlashKDA then maps it onto sequence 0's first tiles, a
-    // harmless duplicate into an unused workspace slot. FusedConv must not run
-    // it: a duplicate first tile races on the conv state.
-    if constexpr (FusedConv) {
-      if (!found) return;
-    }
-    (void)found;
     local_t = global_tile_idx - tiles_before;
     bos = cu_seqlens[seq_idx];
     eos = cu_seqlens[seq_idx + 1];
@@ -215,20 +193,14 @@ __global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_
     Tensor s_beta_tile = make_tensor(make_smem_ptr(shared_storage.beta.begin()),
                                      TMABetaSmemLayout{});
 
-    if constexpr (!FusedConv) {
-      cute::copy(tma_load_q.with(reinterpret_cast<BarrierType&>(
-                     shared_storage.tma_load_barrier)),
-                 cta_tma_load_q.partition_S(g_q_tile),
-                 cta_tma_load_q.partition_D(s_q_tile));
-      cute::copy(tma_load_k.with(reinterpret_cast<BarrierType&>(
-                     shared_storage.tma_load_barrier)),
-                 cta_tma_load_k.partition_S(g_k_tile),
-                 cta_tma_load_k.partition_D(s_k_tile));
-    } else {
-      conv_fused::issue_raw_loads(conv, head_idx,
-                                  int64_t(bos) + local_t * CHUNK, raw_smem,
-                                  &shared_storage.tma_load_barrier);
-    }
+    cute::copy(tma_load_q.with(reinterpret_cast<BarrierType&>(
+                   shared_storage.tma_load_barrier)),
+               cta_tma_load_q.partition_S(g_q_tile),
+               cta_tma_load_q.partition_D(s_q_tile));
+    cute::copy(tma_load_k.with(reinterpret_cast<BarrierType&>(
+                   shared_storage.tma_load_barrier)),
+               cta_tma_load_k.partition_S(g_k_tile),
+               cta_tma_load_k.partition_D(s_k_tile));
     cute::copy(tma_load_beta.with(reinterpret_cast<BarrierType&>(
                    shared_storage.tma_load_barrier)),
                cta_tma_load_beta.partition_S(g_beta_tile),
@@ -269,14 +241,6 @@ __global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_
   shared_storage.tma_load_barrier.wait(0);
   cutlass::arch::fence_view_async_shared();
   __syncthreads();
-  if constexpr (FusedConv) {
-    conv_fused::tile_conv<CHUNK>(
-        conv, head_idx, seq_idx, bos, seq_len, local_t,
-        reinterpret_cast<__nv_bfloat16*>(shared_storage.q.begin()),
-        reinterpret_cast<__nv_bfloat16*>(shared_storage.k.begin()), H,
-        raw_smem);
-    __syncthreads();
-  }
 
   int compute_tid = threadIdx.x;
   int beta_smem_offset = (head_idx * T_total + int(bos) + local_t * CHUNK) & 7;

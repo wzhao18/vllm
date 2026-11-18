@@ -86,7 +86,6 @@ from vllm.utils.flashinfer import (
     has_flashinfer_recurrent_kda,
 )
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -1153,8 +1152,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if self._o_norm_mxfp8_ok is None:
             from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
 
-            self._o_norm_mxfp8_ok = self.gemm_rs_ar is None and takes_mxfp8_activation(
-                self.o_proj
+            self._o_norm_mxfp8_ok = (
+                self.gemm_rs_ar is None
+                and takes_mxfp8_activation(self.o_proj)
             )
         return (
             self._o_norm_mxfp8_ok
@@ -1163,25 +1163,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
 
     @eager_break_during_capture
-    def _fused_prefill_supported(self, m, mixed_qkv, conv_weights, conv_state) -> bool:
-        """Per-shape dispatch of the fused conv + FlashKDA prefill: the FlashKDA
-        backend where the segment-parallel plan does not apply (no segment
-        buffers: many heads per SM, e.g. 96 heads at TP1) and the fused Q|K|V
-        conv covers the layout."""
-        return (
-            self.kda_prefill_backend == "flashkda"
-            and self._segscan_bufs is None
-            and m.has_initial_state is not None
-            and m.non_spec_query_start_loc is not None
-            and m.non_spec_state_indices_tensor is not None
-            and kda_conv.qkv_conv_supported(
-                mixed_qkv, conv_weights, conv_state, self.local_projection_size
-            )
-            and specialized_prefill_kda.fused_conv_supported(
-                mixed_qkv, conv_weights, conv_state, self.head_dim, False
-            )
-        )
-
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -1221,7 +1202,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_actual_tokens = m.num_actual_tokens
         checkpoint = m.checkpoint
         has_spec_decode = m.num_spec_decodes > 0
-        o_norm_fast = False
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
@@ -1418,61 +1398,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             non_spec_out = None
             if non_spec_token_start is not None:
                 non_spec_out = core_attn_out[:, non_spec_slice]
-            fused_prefill = (
-                m.num_prefills > 0
-                and not has_spec_decode
-                and checkpoint is None
-                and self._fused_prefill_supported(
-                    m, mixed_qkv_ns, conv_weights, conv_state
-                )
-            )
-            if fused_prefill:
-                # Conv in FlashKDA's prepare load path, then the HBM-rate gated
-                # o_norm + MXFP8 kernel (specialized_prefill/kda.py).
-                assert non_spec_query_start_loc is not None
-                assert non_spec_state_indices_tensor is not None
-                assert has_initial_state is not None
-                assert self.gate_lower_bound is not None
-                assert self._flashkda_buffer_specs is not None
-                initial_state = gather_initial_states(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    has_initial_state,
-                )
-                workspace_out, final_state, _, workspace = (
-                    current_workspace_manager().get_simultaneous(
-                        *self._flashkda_buffer_specs
-                    )
-                )
-                num_sequences = initial_state.shape[0]
-                n_ns = mixed_qkv_ns.shape[0]
-                specialized_prefill_kda.fused_conv_prefill(
-                    mixed_qkv=mixed_qkv_ns,
-                    conv_weight=conv_weights,
-                    conv_state=conv_state,
-                    cache_indices=non_spec_state_indices_tensor[:num_sequences],
-                    has_initial_state=has_initial_state[:num_sequences],
-                    null_block_id=NULL_BLOCK_ID,
-                    g=g1_ns,
-                    beta=beta_ns,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=initial_state,
-                    cu_seqlens=non_spec_query_start_loc,
-                    out=core_attn_out[:, :n_ns],
-                    final_state=final_state[:num_sequences],
-                    workspace=workspace,
-                    v_buf=workspace_out[:, :n_ns],
-                )
-                o_norm_fast = True
-                core_attn_out_non_spec = core_attn_out[:, :n_ns]
-                prefill_glue.write_state_rows(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    final_state[:num_sequences],
-                )
-            elif m.num_prefills > 0:
+            if m.num_prefills > 0:
                 q_ns, k_ns, v_ns = mixed_qkv_ns.split(
                     self.local_projection_size, dim=-1
                 )
@@ -1800,7 +1726,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        if o_mxfp8 is not None and o_norm_fast:
+        if (
+            o_mxfp8 is not None
+            and m.num_prefills > 0
+            and self.kda_prefill_backend == "flashkda"
+        ):
+            # Prefill: the HBM-rate gated o_norm + MXFP8 kernel (same layout
+            # contract as kda_norm, checked in forward()).
             specialized_prefill_kda.o_norm_mxfp8(
                 core_attn_out,
                 g2.flatten(-2),

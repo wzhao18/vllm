@@ -22,26 +22,6 @@ void fwd(const torch::stable::Tensor& q, const torch::stable::Tensor& k,
          std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
          std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
          int64_t mode = 3);
-
-// Kimi-K3: fwd with the Q|K|V short convolution in K1's load path.
-void fwd_conv(const torch::stable::Tensor& mixed_qkv,
-              const torch::stable::Tensor& conv_weight,
-              const torch::stable::Tensor& conv_state,
-              const torch::stable::Tensor& cache_indices,
-              const torch::stable::Tensor& has_initial_state,
-              int64_t null_block_id, const torch::stable::Tensor& v_out,
-              const torch::stable::Tensor& g, const torch::stable::Tensor& beta,
-              double scale, const torch::stable::Tensor& out,
-              const torch::stable::Tensor& workspace,
-              const torch::stable::Tensor& A_log,
-              const torch::stable::Tensor& dt_bias, double lower_bound,
-              std::optional<torch::stable::Tensor> initial_state = std::nullopt,
-              std::optional<torch::stable::Tensor> final_state = std::nullopt,
-              std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt,
-              std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
-              std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
-              int64_t mode = 3);
-
 // Kimi-K3: gated o_norm (sigmoid, D = 128) of x (T, H, 128) with the gate rows
 // g (T, >= H 128), written as the MXFP8 o_proj input q (T, H 128) e4m3 + the
 // F8_128x4 swizzled UE8M0 scales sf.
