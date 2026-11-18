@@ -87,6 +87,16 @@ def supported(prefix: torch.Tensor, num_blocks: int, has_output_norm: bool) -> b
     )
 
 
+# Per-shape policy: prefill chunks (the decode steps keep the native AttnRes;
+# the specialized decode backend has its own AttnRes path).
+MIN_ROWS = 1024
+
+
+def use_for(prefix: torch.Tensor) -> bool:
+    """Policy + capability: run the fused kernel for this AttnRes call."""
+    return prefix.shape[0] >= MIN_ROWS and supported(prefix, 0, True)
+
+
 def warmup() -> None:
     _module()
 

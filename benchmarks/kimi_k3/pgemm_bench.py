@@ -128,6 +128,30 @@ def bench_fp8(m, n, k, args):
         )
     except Exception as e:  # noqa: BLE001
         res["cublaslt"] = (float("nan"), [repr(e)[:160]])
+    try:
+        from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+        wq_l, ws_l = mxfp8_quantize(w, is_sf_swizzled_layout=False)
+        pn = (n + 127) // 128 * 128
+        wpad = torch.zeros(pn, k, dtype=wq_l.dtype, device="cuda")
+        wpad[:n] = wq_l
+        spad = torch.zeros(pn, k // 32, dtype=torch.uint8, device="cuda")
+        spad[:n] = ws_l.view(torch.uint8).reshape(n, k // 32)
+        w_sh = shuffle_matrix_a(wpad.view(torch.uint8), 128).view(wq_l.dtype)
+        s_sh = shuffle_matrix_sf_a(spad, 128, num_elts_per_sf=32).reshape(-1)
+
+        def trt():
+            return flashinfer.mm_mxfp8(
+                xq, w_sh.reshape(pn, k).t(), xs, s_sh, out_dtype=torch.bfloat16,
+                backend="trtllm", use_8x4_sf_layout=False,
+            )
+
+        o = trt()[:, :n]
+        err = (o.float() - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
+        t = kernel_times(trt)
+        res["trtllm"] = (t[0], t[1], err)
+    except Exception as e:  # noqa: BLE001
+        res["trtllm"] = (float("nan"), [repr(e)[:160]])
     for backend in ("cute-dsl", "cutlass", "cudnn"):
         try:
             o = flashinfer.mm_mxfp8(xq, wt, xs, ws, backend=backend)
