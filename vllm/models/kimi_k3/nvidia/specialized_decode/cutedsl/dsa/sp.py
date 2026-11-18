@@ -80,11 +80,15 @@ SP_MODES = ("front", "fork", "wait")
 SP_PARTIALS = PROJECTED
 # Rows whose query of all 96 heads is computed on every rank (local_query.LocalQuery:
 # no q publish, QueryWait or q mailbox re-arm), the rest MlaQuery's publish of 24
-# heads. Fork rows only (QueryNorm writes q_c). In-step (gap512 D3 B80 / B92, 320 /
+# heads (fork rows only: QueryNorm writes q_c). In-step (gap512 D3 B80 / B92, 320 /
 # 368 rows) MlaQuery ran 74-89 us per layer on the side stream and QueryWait 30-46
-# us, beside the index chain whose wq_b split-K it slowed to 52-62 us.
-# NQ-TUNE: the publish / local crossover (D-ATTN microbench, runs/D-ATTN).
-SP_LOCAL_QUERY = "17-:local"
+# us, beside the index chain whose wq_b split-K it slowed to 52-62 us. VR200, 1 GPU,
+# cold L2, us, MlaQuery without its publish vs LocalQuery (runs/D-ATTN qpath1-5):
+#   rows      20    32    64    96   128   256   384   512
+#   MlaQuery 17.2  17.4  23.7  32.3  33.4  52.5  72.4  93.1
+#   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
+# NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
+SP_LOCAL_QUERY = "65-:local"
 SP_KERNELS = ("trtllm",)  # the FlashInfer sparse MLA kernel at every row
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
