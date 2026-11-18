@@ -35,9 +35,9 @@ def _impl(dcp_world_size: int, use_shardq: bool):
 def test_layer_skips_inplace_concat_only_when_fused(dcp, shardq, replicated, expected):
     layer = SimpleNamespace(impl=_impl(dcp, shardq))
     q_rep = torch.empty(1) if replicated else None
-    assert MLAAttention._impl_quantizes_query(layer, q_rep) is expected
+    assert MLAAttention._impl_quantizes_query(layer, q_rep, 16) is expected
     # A backend without the hook keeps the in-place concat.
-    assert MLAAttention._impl_quantizes_query(SimpleNamespace(impl=object()), None) is False
+    assert MLAAttention._impl_quantizes_query(SimpleNamespace(impl=object()), None, 16) is False
 
 
 @pytest.mark.parametrize("tokens", [1, 333, 4096])

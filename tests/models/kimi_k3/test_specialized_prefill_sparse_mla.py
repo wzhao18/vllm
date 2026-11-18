@@ -51,14 +51,19 @@ def _reference(q8, kv, slots, lens, scale, out_scale):
     return out
 
 
-@pytest.mark.parametrize("loaders,pipelined", [(3, False), (5, False), (3, True)])
-def test_matches_fp32_reference(loaders, pipelined):
+@pytest.mark.parametrize(
+    "loaders,pipelined,tma,regs",
+    [(3, False, False, ()), (3, True, False, ()), (7, False, True, ()),
+     (7, True, True, (184, 72))],
+)
+def test_matches_fp32_reference(loaders, pipelined, tma, regs):
     lengths = [1, 2, 127, 128, 129, 300, 1000, 2047, 2048, 2048, 64, 255, 256, 2000]
     lengths = lengths * 23  # more rows than SMs: persistent CTAs take several
     q8, kv, slots, lens = _problem(lengths, pool_pages=600, width=2048, seed=0)
     scale, out_scale = 192**-0.5 * 0.7, 1.3
     out = sparse_mla_prefill(q8, kv, 64, slots, lens, scale, out_scale,
-                             loaders=loaders, pipelined=pipelined)
+                             loaders=loaders, pipelined=pipelined, tma=tma,
+                             regs=regs)
     torch.cuda.synchronize()
     ref = _reference(q8, kv, slots, lens, scale, out_scale)
     err = (out.float() - ref).abs()

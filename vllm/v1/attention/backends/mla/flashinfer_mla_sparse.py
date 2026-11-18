@@ -1250,10 +1250,16 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         psm = getattr(self, "_prefill_sparse_mla", None)
         return psm is not None and num_rows >= psm.MIN_ROWS
 
-    def fuses_decode_query_quant(self) -> bool:
-        """Whether ``quantize_decode_query`` takes this layer's MQA query (it
-        declines DCP query gathers and ShardQ exchanges)."""
-        return self.dcp_world_size == 1 and not self.use_shardq
+    def fuses_decode_query_quant(self, num_rows: int) -> bool:
+        """Whether ``quantize_decode_query`` should write this call's MQA query (it
+        declines DCP query gathers and ShardQ exchanges). Prefill-sized calls of the
+        specialized prefill kernel take the layer's in-place concat + quant instead:
+        no head padding there, and the one-kernel quant is slower at that size."""
+        return (
+            self.dcp_world_size == 1
+            and not self.use_shardq
+            and not self._runs_prefill_sparse_mla(num_rows)
+        )
 
     def _padded_query(self, query: torch.Tensor, heads: int) -> torch.Tensor:
         """``query`` [T, H, D] with ``heads`` heads (extra heads zero): a row

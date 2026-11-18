@@ -258,6 +258,22 @@ def cp_rows4(lo, hi, src_lanes, dsts, lane16, rope_dsts, lane):
 
 
 @asm()
+def gather4(dst, desc, bar, col, r0, r1, r2, r3):
+    """TMA tile::gather4: rows r0..r3 (out of range, e.g. -1: zero fill) of one box."""
+    code = ("cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
+            ".mbarrier::complete_tx::bytes [$0],[$1,{$3,$4,$5,$6,$7}],[$2];")
+    ops = (Uint32(dst), Int64(desc), Uint32(bar), Int32(col), Int32(r0), Int32(r1),
+           Int32(r2), Int32(r3))
+    return code, "r,l,r,r,r,r,r,r,~{memory}", ops
+
+
+@asm()
+def ld_global_v4_s32(ptr):
+    return ("ld.global.nc.v4.b32 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,l", (Int64(ptr),),
+            (Int32,) * 4)
+
+
+@asm()
 def cp_async_arrive(bar):
     return "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [$0];", "r,~{memory}", (
         Uint32(bar),)
@@ -292,8 +308,12 @@ def _tiles(n):
 class SparseMlaPrefill:
     """``loaders`` cp.async row-loader warps; ``grid`` persistent CTAs (one per SM)."""
 
-    def __init__(self, loaders: int, grid: int, pipelined: bool = False):
+    def __init__(self, loaders: int, grid: int, pipelined: bool = False,
+                 tma: bool = False, regs: tuple = ()):
         self.loaders, self.grid, self.pipelined = loaders, grid, pipelined
+        # tma: loaders issue TMA tile::gather4 (one lane per 4-row quad) instead of
+        # cp.async rows; regs: (softmax, other) setmaxnreg counts per warpgroup
+        self.tma, self.regs = tma, regs
         # pipelined: two S^T and P^T buffers (all 576 TMEM columns, exclusive) and
         # the MMA order QK(t + 1) before PV(t), so softmax(t + 1) overlaps PV(t)
         self.c_o = C_O_PIPE if pipelined else C_O
@@ -302,7 +322,7 @@ class SparseMlaPrefill:
     @cute.jit
     def __call__(self, q8: Int64, rows: Int32, kv: Int64, unit_rows: Int32, slots: Int64,
                  slot_stride: Int32, lengths: Int64, out: Int64, scale_log2: Float32,
-                 out_scale: Float32, stream: cuda.CUstream):
+                 out_scale: Float32, kv_count: Int32, stream: cuda.CUstream):
         u8 = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
         l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         sw = cuda.CUtensorMapSwizzle
@@ -310,13 +330,18 @@ class SparseMlaPrefill:
                                   sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
         qr = tensormap.encode_map(q8 + D_NOPE, u8, (64, rows * H), (ROW,), (64, H),
                                   sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
-        self.kernel(qn, qr, rows, kv, unit_rows, slots, slot_stride, lengths, out,
-                    scale_log2, out_scale).launch(
+        kvm = tensormap.encode_map(kv, u8, (ROW, kv_count), (ROW,), (128, 1),
+                                   sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
+        kvr = tensormap.encode_map(kv, u8, (ROW, kv_count), (ROW,), (64, 1),
+                                   sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
+        self.kernel(qn, qr, kvm, kvr, rows, kv, unit_rows, slots, slot_stride, lengths,
+                    out, scale_log2, out_scale).launch(
             grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=SMEM_BYTES,
             stream=stream)
 
     @cute.kernel
-    def kernel(self, qn: tensormap.GridMap, qr: tensormap.GridMap, rows: Int32, kv: Int64,
+    def kernel(self, qn: tensormap.GridMap, qr: tensormap.GridMap, kvm: tensormap.GridMap,
+               kvr: tensormap.GridMap, rows: Int32, kv: Int64,
                unit_rows: Int32, slots: Int64, slot_stride: Int32, lengths: Int64,
                out: Int64, scale_log2: Float32, out_scale: Float32):
         tid, _, _ = cute.arch.thread_idx()
@@ -327,8 +352,9 @@ class SparseMlaPrefill:
         raw = smem.allocate_array(Uint8, SMEM_BYTES, byte_alignment=1024)
         base = Uint32(raw.toint())
         if tid == 0:
-            for i, cnt in ((B_QFULL, 1), (B_QEMPTY, 1), (B_KVFULL, 32 * self.loaders),
-                           (B_KVFULL + 1, 32 * self.loaders), (B_KVEMPTY, 1),
+            kvf = 1 if cutlass.const_expr(self.tma) else 32 * self.loaders
+            for i, cnt in ((B_QFULL, 1), (B_QEMPTY, 1), (B_KVFULL, kvf),
+                           (B_KVFULL + 1, kvf), (B_KVEMPTY, 1),
                            (B_KVEMPTY + 1, 1), (B_SFULL, 1), (B_PFULL, SOFTMAX_WARPS),
                            (B_OFULL, 1), (B_OFREE, SOFTMAX_WARPS), (B_SFULL2, 1),
                            (B_PFULL2, SOFTMAX_WARPS), (B_PVDONE, 1)):
@@ -352,11 +378,22 @@ class SparseMlaPrefill:
             cute.make_rmem_tensor((HW,), Float32),
             cute.make_rmem_tensor((12,), Uint32),
         )
+        if cutlass.const_expr(len(self.regs) == 2):
+            if warp < SOFTMAX_WARPS:
+                cute.arch.warpgroup_reg_alloc(self.regs[0])
+            else:
+                cute.arch.warpgroup_reg_dealloc(self.regs[1])
         for pw in cutlass.range_constexpr(self.loaders):
             if warp == SOFTMAX_WARPS + 1 + pw:
-                self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
-                            tensormap.map_address(qr), kv, unit_rows, slots,
-                            slot_stride, lengths)
+                if cutlass.const_expr(self.tma):
+                    self.loader_tma(base, pw, lane, cta, n_mine,
+                                    tensormap.map_address(qn), tensormap.map_address(qr),
+                                    tensormap.map_address(kvm), tensormap.map_address(kvr),
+                                    slots, slot_stride, lengths)
+                else:
+                    self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
+                                tensormap.map_address(qr), kv, unit_rows, slots,
+                                slot_stride, lengths)
         if warp == SOFTMAX_WARPS:
             self.mma(base, lane, taddr, n_mine, lengths, cta)
         if warp < SOFTMAX_WARPS:
@@ -433,6 +470,60 @@ class SparseMlaPrefill:
                             cp_rows4(lo, hi, lanes4, dsts, kv + Int64(lane * 16), rds,
                                      lane)
                 cp_async_arrive(_bar(base, B_KVFULL + s))
+                g = g + 1
+
+    @cute.jit
+    def loader_tma(self, base, pw: cutlass.Constexpr, lane, cta, n_mine, tm_qn, tm_qr,
+                   tm_kv, tm_kr, slots, slot_stride, lengths):
+        """Lane m of loader warp pw gathers 4-row quad pw + nl * m of each tile: four
+        128 B latent boxes (SW128) and the 64 B RoPE box (SW64) by tile::gather4;
+        rows past the valid count read row -1 (TMA zero fill)."""
+        nl: cutlass.Constexpr = self.loaders
+        quads: cutlass.Constexpr = (32 - pw + nl - 1) // nl
+        lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+        lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+        g = Int32(0)
+        for qi in range(n_mine):
+            row = cta + qi * self.grid
+            n = lens[row]
+            tiles = _tiles(n)
+            if cutlass.const_expr(pw == 0):
+                mbar_wait(_bar(base, B_QEMPTY), Uint32((qi & 1) ^ 1))
+                if lane == 0:
+                    mbar_arrive_tx(_bar(base, B_QFULL), Uint32(4 * H * 128 + H * 64))
+                    for j in cutlass.range_constexpr(4):
+                        tma_tile2d(base + Uint32(OFF_QN + j * H * 128), tm_qn,
+                                   _bar(base, B_QFULL), Int32(128 * j), row * H)
+                    tma_tile2d(base + Uint32(OFF_QR), tm_qr, _bar(base, B_QFULL),
+                               Int32(0), row * H)
+            srow = slots + Int64(row) * Int64(slot_stride) * Int64(4)
+            for t in range(tiles):
+                s = g % 2
+                st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
+                full = _bar(base, B_KVFULL + s)
+                if lane == 0:
+                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // 2) & 1) ^ 1))
+                    if cutlass.const_expr(pw == 0):
+                        mbar_arrive_tx(full, Uint32(STAGE))
+                cute.arch.sync_warp()
+                if lane < quads:
+                    q = pw + nl * lane
+                    key = t * 128 + 4 * q
+                    r = ld_global_v4_s32(srow + Int64(key) * Int64(4))
+                    r0, r1, r2, r3 = r[0], r[1], r[2], r[3]
+                    if key >= n:
+                        r0 = Int32(-1)
+                    if key + 1 >= n:
+                        r1 = Int32(-1)
+                    if key + 2 >= n:
+                        r2 = Int32(-1)
+                    if key + 3 >= n:
+                        r3 = Int32(-1)
+                    for a in cutlass.range_constexpr(4):
+                        gather4(st + Uint32(a * 16384) + Uint32(q) * Uint32(512), tm_kv,
+                                full, 128 * a, r0, r1, r2, r3)
+                    gather4(st + Uint32(4 * 16384) + Uint32(q) * Uint32(256), tm_kr, full,
+                            D_NOPE, r0, r1, r2, r3)
                 g = g + 1
 
     # ------------------------------------------------------------------ MMA
@@ -688,6 +779,8 @@ class SparseMlaPrefill:
 MIN_ROWS = 1024
 LOADERS = 3
 PIPELINED = False
+TMA = False
+REGS: tuple = ()
 
 
 def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: int) -> bool:
@@ -706,10 +799,10 @@ def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: 
 
 
 @cache
-def _compiled(loaders: int, grid: int, pipelined: bool):
-    kernel = SparseMlaPrefill(loaders, grid, pipelined)
+def _compiled(loaders: int, grid: int, pipelined: bool, tma: bool, regs: tuple):
+    kernel = SparseMlaPrefill(loaders, grid, pipelined, tma, regs)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0),
-            Int64(0), Float32(1.0), Float32(1.0), cuda.CUstream(0))
+            Int64(0), Float32(1.0), Float32(1.0), Int32(64), cuda.CUstream(0))
     opts = f"--ptxas-options -maxrregcount={min(255, 65536 // kernel.threads // 8 * 8)}"
     return cute.compile(kernel, *args, options=opts)
 
@@ -718,7 +811,7 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None,
                        loaders: int = LOADERS, pipelined: bool = PIPELINED,
-                       ) -> torch.Tensor:
+                       tma: bool = TMA, regs: tuple = REGS) -> torch.Tensor:
     """q8 [T, 96, 576] E4M3 (contiguous); kv_rows: the cache as uint8/E4M3 rows of
     576 B; slots [T, W] int32 physical slots (block * 64 + offset, -1 holes past the
     valid prefix), lengths [T] int32 valid counts; ``scale`` = softmax scale x q
@@ -732,9 +825,9 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
         return out
     sms = torch.cuda.get_device_properties(q8.device).multi_processor_count
     grid = min(sms, t)
-    fn = _compiled(loaders, grid, pipelined)
+    fn = _compiled(loaders, grid, pipelined, tma, tuple(regs))
     stream = cuda.CUstream(torch.cuda.current_stream(q8.device).cuda_stream)
     fn(Int64(q8.data_ptr()), Int32(t), Int64(kv_rows.data_ptr()), Int32(unit_rows),
        Int64(slots.data_ptr()), Int32(slots.stride(0)), Int64(lengths.data_ptr()),
-       Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale), stream)
+       Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale), Int32(kv_rows.shape[0]), stream)
     return out

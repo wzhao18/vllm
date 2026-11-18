@@ -191,15 +191,18 @@ def main():
 
         vr_out = torch.empty(F, H, L, device=dev, dtype=torch.bfloat16)
         for var in a.loaders.split(","):
-            nl, pp = (int(v) for v in (var.split(":") + ["0"])[:2])
-            tag = f"l{nl}p{pp}"
+            nl, pp, tm, rg = (int(v) for v in (var.split(":") + ["0", "0", "0"])[:4])
+            tag = f"l{nl}p{pp}t{tm}r{rg}"
+            regs = (184, 72) if rg else ()
 
-            def vr(i, nl=nl, pp=pp):
+            def vr(i, nl=nl, pp=pp, tm=tm, regs=regs):
                 kv, idx = layers[i % len(layers)]
                 sparse_mla_prefill(qf3, kv.view(-1, 576), 64, idx, seq, 0.0722, 1.0,
-                                   out=vr_out, loaders=nl, pipelined=bool(pp))
+                                   out=vr_out, loaders=nl, pipelined=bool(pp),
+                                   tma=bool(tm), regs=regs)
 
             vr(0)
+            attn(0)  # the stock output of the same layer
             torch.cuda.synchronize()
             d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
             rel = (d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
