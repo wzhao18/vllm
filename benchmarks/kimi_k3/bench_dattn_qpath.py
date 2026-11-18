@@ -134,8 +134,39 @@ def local_arm(rows_list, flush):
         slots = torch.randperm(blocks * UNIT, device=dev)[:rows]
         slots[torch.arange(rows, device=dev) % 4 != 0] = -1
         cache = torch.zeros(blocks, UNIT, FP8_ROW, dtype=torch.uint8, device=dev)
+        from vllm import _custom_ops as ops
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.local_query import (  # noqa: E501
+            pack_query,
+        )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.decode import (  # noqa: E501
+            blas_library,
+        )
+
+        b = local.buffers
+        q = b.q[:rows]
+        lat = b.flat[: 96 * rows * 512].view(96, rows, 512)
+        nope = q.view(rows, 96, 192)[..., :128].transpose(0, 1)
+        kv = b.kv[:rows]
+
+        def lt():
+            with blas_library("cublaslt"):
+                torch.mm(q_c, local.qb.t(), out=q)
+
+        parts = {
+            "all": lambda: local.run(q_c, projected, cache, slots),
+            "qb": lambda: local.projection.run(q_c, q),
+            "qb_lt": lt,
+            "uk": lambda: torch.bmm(nope, local.uk, out=lat),
+            "pack": lambda: pack_query(lat, q, local.q_scale, b.query[:rows]),
+            "kvnorm": lambda: ops.rms_norm(
+                kv, projected[:, 1536:2048], local.kv_norm, 1e-6
+            ),
+            "insert": lambda: ops.concat_and_cache_mla(
+                kv, projected[:, 2048:2112], cache, slots, "fp8", local.k_scale
+            ),
+        }
         out[rows] = (
-            timed(lambda: local.run(q_c, projected, cache, slots), flush=flush),
+            {k: round(timed(f, flush=flush), 2) for k, f in parts.items()},
             local.projection.kinds[rows],
         )
     return out
@@ -145,14 +176,16 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rows", default="128,256,384,512")
     p.add_argument("--out", default="")
+    p.add_argument("--local-only", action="store_true")
     a = p.parse_args()
     flush = torch.empty(1 << 28, device="cuda", dtype=torch.float32)
     res = {}
     rows_list = [int(r) for r in a.rows.split(",")]
     local = local_arm(rows_list, flush)
     for rows in rows_list:
-        r = {"mlaquery": mlaquery_arm(rows, flush)}
-        r.update(torch_arms(rows, flush))
+        r = {} if a.local_only else {"mlaquery": mlaquery_arm(rows, flush)}
+        if not a.local_only:
+            r.update(torch_arms(rows, flush))
         r["local96"], r["local96_tactic"] = local[rows]
         res[rows] = r
         print(rows, json.dumps({k: round(v, 2) if isinstance(v, float) else v for k, v in r.items()}), flush=True)

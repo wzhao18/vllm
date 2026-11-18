@@ -89,10 +89,12 @@ def test_local_query_matches_stock():
         assert (ours[:, GATHERED:] == 0).all()  # padded heads
         if local.projection.kinds[rows] in ("cublas", "lt"):
             assert torch.equal(ours, ref.view(torch.uint8)), rows
-        else:  # split-K q_b: the K order differs (stock tolerance)
+        else:  # split-K q_b: the K order differs (stock tolerance: an FP8 ulp)
+            exact = torch.cat([latent, q[..., 128:]], -1).float() / layer._q_scale
             torch.testing.assert_close(
-                query.float(), ref.float(), atol=3e-2, rtol=7e-2
+                query[:, :GATHERED].float(), exact, atol=3e-2, rtol=7e-2
             )
+            assert (ours != ref.view(torch.uint8)).float().mean() < 1e-3, rows
 
         stock = torch.zeros_like(cache)
         kv = torch.empty(rows, 512, dtype=bf, device=dev)
