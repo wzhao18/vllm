@@ -116,7 +116,7 @@ RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 
 
 def rubin_bucket_capacities(
-    max_tokens_per_rank: int, top_k: int, *, prefill_worker: bool
+    max_tokens_per_rank: int, top_k: int, *, prefill_worker: bool, world_size: int = 16
 ) -> tuple[int, ...]:
     """Ascending token capacities per rank of a server's compiled buckets
     (automatic, no flag): ``max_tokens_per_rank``, preceded by the decode bucket
@@ -127,7 +127,7 @@ def rubin_bucket_capacities(
     decode = RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k
     if (
         not prefill_worker
-        and rubin_kernel_variant(max_tokens_per_rank) == "inference"
+        and rubin_kernel_variant(max_tokens_per_rank, world_size) == "inference"
         and 0 < decode < max_tokens_per_rank
     ):
         return (decode, max_tokens_per_rank)
@@ -163,9 +163,17 @@ def rubin_quant_kind(
     return "nvfp4"
 
 
-def rubin_kernel_variant(max_tokens_per_rank: int) -> Variant:
+# EP sizes whose shipped records are the inference kernel only (FlashInfer a368c5f66
+# default knobs measured at EP28 / EP32, moe_ep32): the generation-phase kernel has no
+# record there, so these servers run the inference kernel at every capacity.
+RUBIN_INFERENCE_ONLY_EP_SIZES = (28, 32)
+
+
+def rubin_kernel_variant(max_tokens_per_rank: int, world_size: int = 16) -> Variant:
     if max_tokens_per_rank <= 0:
         raise ValueError(f"max_tokens_per_rank must be positive: {max_tokens_per_rank}")
+    if world_size in RUBIN_INFERENCE_ONLY_EP_SIZES:
+        return "inference"
     if max_tokens_per_rank <= RUBIN_GENPHASE_MAX_TOKENS_PER_RANK:
         return "genphase"
     return "inference"
@@ -183,7 +191,7 @@ def select_rubin_bucket(
         SHIPPED_KNOBS,
         problem=problem,
         world_size=world_size,
-        points=[(rubin_kernel_variant(max_tokens), max_tokens, None)],
+        points=[(rubin_kernel_variant(max_tokens, world_size), max_tokens, None)],
     )
     return buckets[0], tuple(notes)
 
@@ -202,7 +210,7 @@ def select_rubin_buckets(
     record at the decode capacity."""
     main, notes = select_rubin_bucket(problem, world_size, max_tokens)
     caps = rubin_bucket_capacities(
-        max_tokens, problem.top_k, prefill_worker=prefill_worker
+        max_tokens, problem.top_k, prefill_worker=prefill_worker, world_size=world_size
     )
     buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
     for bucket in buckets:
