@@ -41,7 +41,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | C48 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C48-1P1D-a1118778 | 15,934 | 367.2 | 177.8 | 6.1 | 0.71 | 0.9788 | **yes** |  |
 | C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1118777 | 21,527 | 300.0 | 136.3 | 7.2 | 0.96 | 0.9803 | **yes** |  |
 | C128 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off) (24) | C128-1P1D-a1118779 | 33,119 | 212.2 | 61.5 | 11.6 | 3.00 | 0.9788 | **yes** |  |
-| C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1118813 | 64,045 | 85.5 | 8.5 | 35.5 | 16.21 | 0.9788 | **yes** | REGRESSION under root-cause: -13% tput, p90 TTFT 16.2s vs frozen 6.4s (xdr IB vs frozen spx RoCE; real vs test weights); not accepted yet |
+| C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1118813 | 64,045 | 85.5 | 8.5 | 35.5 | 16.21 | 0.9788 | no | FRONTEND-BOUND, not accepted: single Dynamo frontend (enable_multiple_frontends false) saturates ~13-15 req/s; recv->prefill-route delay mean 8.06s/p90 12.6s vs frozen 0.64/1.82s (lower-rate points 0.02s in both). Engines under-fed: prefill tok/s -13%, decode Running 38.6 vs 51.4; prefill step, KV load, NIXL all unchanged or faster. Rerun with multiple frontends proposed |
 <!-- /POINTS -->
 
 ![per GPU](pareto4_per_gpu.png)
@@ -70,3 +70,19 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
   frozen sweep) and `gsm8k/score.json`.
 - `update_points.py`: rebuilds `points.json`, the two tables above and the plots.
 - `plot_pareto4.py`: the frozen sweep's plot, adding the frozen preview-draft points as a grey dashed series.
+
+## C512 (a1118813): frontend-bound, not accepted (2026-11-18)
+
+64.0K tok/s/GPU @ 85.5 vs frozen 73.7K @ 80.3; p90 TTFT 16.2 s vs 6.4 s. Root cause (RCA workflow, 4 lenses + adversarial verify, then a
+direct check across runs with `preroute.py`): the single Dynamo frontend (`enable_multiple_frontends: false`) is the closed-loop bottleneck.
+Time from `request received` to the prefill `Selected worker`:
+
+| run | req/s at frontend | mean | p50 | p90 |
+|---|---|---|---|---|
+| frozen C512 a1093684 (spx) | 14.9 | 0.64 s | 0.16 s | 1.82 s |
+| release C512 a1118813 (xdr) | 13.2 | 8.06 s | 8.29 s | 12.63 s |
+| all other release/frozen points (C48-C128, 2.3-5.0 req/s) | | 0.02-0.04 s | | 0.03-0.08 s |
+
+Frozen C512 was already at the edge (0.64 s mean); the release run crossed saturation (release tokenizer assets / frontend host are the
+suspected per-request cost increase; unproven). Engines were under-fed, not slow: prefill step 423 vs 442 ms, Mooncake load_get 213 vs 268 ms,
+NIXL 57.6 vs 58.1 ms, hit rate unchanged, ranks balanced; decode Running 38.6 vs 51.4 per engine. Fix: more frontends, then rerun C512.
