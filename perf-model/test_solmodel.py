@@ -55,6 +55,24 @@ class TestModel(unittest.TestCase):
             prims = [e.get("prim") or e["alts"][0]["prim"] for e in comm_events(ALL[tid], "decode", env, ck)["moe"]]
             self.assertEqual(sum(p.startswith("P14 TP-MoE transpose") for p in prims), 2, tid)
 
+    def test_ep16_scope(self):
+        from topologies import SCOPE, in_scope
+        for tid in ("D7-4-16", "D7-2-16", "D7-8-16", "D8-16", "D9-16", "P6-16", "P9", "D1"):
+            self.assertIn(tid, SCOPE)
+        for tid in ("D7-4", "D8", "D9", "D11", "P6", "P7", "D4-32"):
+            self.assertFalse(in_scope(ALL[tid]), tid)
+        for tid in SCOPE:
+            self.assertLessEqual(ALL[tid].gpus, 16, tid)
+        env = Mdl.env_decode(16, 3, 135000)
+        ck = Mdl.ckpt_cfg("mxfp4_release")
+        for tid in ("D7-4-16", "D8-16"):
+            prims = [e.get("prim") or e["alts"][0]["prim"] for e in comm_events(ALL[tid], "decode", env, ck)["moe"]]
+            self.assertEqual(sum(p.startswith("P14 TP-MoE transpose") for p in prims), 2, tid)
+            self.assertTrue(any(p.startswith("P11") for p in prims), tid)
+        _, by = cost.resident_weights(ALL["D8-16"], "decode", "mxfp4_release")
+        per_slot = Mdl.expert_bytes(ck) * Mdl.C["N_MOE"]
+        self.assertAlmostEqual(by["experts"], 56 * per_slot, delta=1.0)
+
     def test_dsadp_decode_push_is_zero_bytes(self):
         env = Mdl.env_decode(16, 3, 135000)
         evs = comm_events(ALL["D7-4"], "decode", env, Mdl.ckpt_cfg("mxfp4_release"))["dsa"]

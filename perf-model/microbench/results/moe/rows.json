@@ -1,0 +1,5010 @@
+[
+ {
+  "case": "megamoe-960",
+  "topology": "mxfp4_release|D2|decode r1",
+  "ep": 8,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 89.38,
+  "measured_kernel_us": 87.53,
+  "measured_vllm_us": 88.69,
+  "t_sol_us": 48.15,
+  "t_ach_us": 71.78,
+  "t_sol_ops_us": 39.23,
+  "t_ach_ops_us": 62.07,
+  "t_sol_comm_P11P12_us": 8.92,
+  "t_ach_comm_P11P12_us": 9.7,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 41.32,
+   "MOE.act": 0.02,
+   "MOE.fc2": 20.68,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.31,
+   "P12 EP-combine": 3.39
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.54647,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.44,
+  "pct_sol": 53.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep8-random-1117232523.log",
+   "ts": "2026-11-18T07:27:45Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-973",
+  "topology": "mxfp4_release|D2|decode r8",
+  "ep": 8,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 145.05,
+  "measured_kernel_us": 143.12,
+  "measured_vllm_us": 145.42,
+  "t_sol_us": 100.4,
+  "t_ach_us": 154.08,
+  "t_sol_ops_us": 89.12,
+  "t_ach_ops_us": 140.97,
+  "t_sol_comm_P11P12_us": 11.28,
+  "t_ach_comm_P11P12_us": 13.11,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 93.46,
+   "MOE.act": 0.14,
+   "MOE.fc2": 46.93,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.47,
+   "P12 EP-combine": 5.64
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.6314,
+  "derate": 0.941,
+  "derate_vs_ops_only": 1.029,
+  "pct_sol": 69.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep8-random-1117232523.log",
+   "ts": "2026-11-18T07:27:45Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-139",
+  "topology": "mxfp4_release|P1|prefill",
+  "ep": 8,
+  "tokens_per_rank": 2048,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 511.38,
+  "measured_kernel_us": 538.21,
+  "measured_vllm_us": 509.68,
+  "t_sol_us": 335.91,
+  "t_ach_us": 499.22,
+  "t_sol_ops_us": 154.32,
+  "t_ach_ops_us": 240.8,
+  "t_sol_comm_P11P12_us": 181.59,
+  "t_ach_comm_P11P12_us": 258.42,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 9.77,
+   "MOE.fc1": 132.4,
+   "MOE.act": 9.18,
+   "MOE.fc2": 71.5,
+   "MOE.combine": 17.95
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 90.92,
+   "P12 EP-combine": 167.5
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.10148,
+  "derate": 1.024,
+  "derate_vs_ops_only": 2.124,
+  "pct_sol": 65.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130697",
+   "nodes": "hecate0368,hecate0377",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep8-random-1117185608.log",
+   "ts": "2026-11-18T02:57:28Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-139",
+  "topology": "mxfp4_release|P5-8|prefill",
+  "ep": 8,
+  "tokens_per_rank": 2048,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 511.38,
+  "measured_kernel_us": 538.21,
+  "measured_vllm_us": 509.68,
+  "t_sol_us": 335.91,
+  "t_ach_us": 499.22,
+  "t_sol_ops_us": 154.32,
+  "t_ach_ops_us": 240.8,
+  "t_sol_comm_P11P12_us": 181.59,
+  "t_ach_comm_P11P12_us": 258.42,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 9.77,
+   "MOE.fc1": 132.4,
+   "MOE.act": 9.18,
+   "MOE.fc2": 71.5,
+   "MOE.combine": 17.95
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 90.92,
+   "P12 EP-combine": 167.5
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.08691,
+  "derate": 1.024,
+  "derate_vs_ops_only": 2.124,
+  "pct_sol": 65.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130697",
+   "nodes": "hecate0368,hecate0377",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep8-random-1117185608.log",
+   "ts": "2026-11-18T02:57:28Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D3|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.40236,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D4-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.30753,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D5|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.39454,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D6|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.41126,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D7-2-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.36131,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D7-4-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.42457,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D7-8-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.4564,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D8-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.46916,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-009",
+  "topology": "mxfp4_release|D9-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 77.8,
+  "measured_kernel_us": 75.7,
+  "measured_vllm_us": 75.05,
+  "t_sol_us": 39.59,
+  "t_ach_us": 59.09,
+  "t_sol_ops_us": 30.65,
+  "t_ach_ops_us": 48.5,
+  "t_sol_comm_P11P12_us": 8.94,
+  "t_ach_comm_P11P12_us": 10.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.02,
+   "MOE.fc1": 32.27,
+   "MOE.act": 0.02,
+   "MOE.fc2": 16.16,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.89,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.29827,
+  "derate": 1.317,
+  "derate_vs_ops_only": 1.604,
+  "pct_sol": 50.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D3|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.44853,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D4-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.37146,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D5|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.44792,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D6|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.4428,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D7-2-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.41942,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D7-4-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.46662,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D7-8-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.4764,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D8-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.39576,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-008",
+  "topology": "mxfp4_release|D9-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 91.36,
+  "measured_kernel_us": 89.46,
+  "measured_vllm_us": 87.82,
+  "t_sol_us": 56.8,
+  "t_ach_us": 85.9,
+  "t_sol_ops_us": 45.33,
+  "t_ach_ops_us": 71.67,
+  "t_sol_comm_P11P12_us": 11.48,
+  "t_ach_comm_P11P12_us": 14.24,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.15,
+   "MOE.fc1": 47.26,
+   "MOE.act": 0.14,
+   "MOE.fc2": 23.83,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 8.13,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.34629,
+  "derate": 1.064,
+  "derate_vs_ops_only": 1.275,
+  "pct_sol": 62.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117183613.log",
+   "ts": "2026-11-18T02:38:43Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-033",
+  "topology": "mxfp4_release|D3|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 97.12,
+  "measured_kernel_us": 95.15,
+  "measured_vllm_us": 92.78,
+  "t_sol_us": 67.52,
+  "t_ach_us": 101.35,
+  "t_sol_ops_us": 47.35,
+  "t_ach_ops_us": 74.6,
+  "t_sol_comm_P11P12_us": 20.17,
+  "t_ach_comm_P11P12_us": 26.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.61,
+   "MOE.fc1": 47.67,
+   "MOE.act": 0.57,
+   "MOE.fc2": 24.62,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 12.39,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.3207,
+  "derate": 0.958,
+  "derate_vs_ops_only": 1.302,
+  "pct_sol": 69.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117185232.log",
+   "ts": "2026-11-18T02:55:04Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-033",
+  "topology": "mxfp4_release|D5|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 97.12,
+  "measured_kernel_us": 95.15,
+  "measured_vllm_us": 92.78,
+  "t_sol_us": 67.52,
+  "t_ach_us": 101.35,
+  "t_sol_ops_us": 47.35,
+  "t_ach_ops_us": 74.6,
+  "t_sol_comm_P11P12_us": 20.17,
+  "t_ach_comm_P11P12_us": 26.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.61,
+   "MOE.fc1": 47.67,
+   "MOE.act": 0.57,
+   "MOE.fc2": 24.62,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 12.39,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.33429,
+  "derate": 0.958,
+  "derate_vs_ops_only": 1.302,
+  "pct_sol": 69.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117185232.log",
+   "ts": "2026-11-18T02:55:04Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-033",
+  "topology": "mxfp4_release|D7-2-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 97.12,
+  "measured_kernel_us": 95.15,
+  "measured_vllm_us": 92.78,
+  "t_sol_us": 67.52,
+  "t_ach_us": 101.35,
+  "t_sol_ops_us": 47.35,
+  "t_ach_ops_us": 74.6,
+  "t_sol_comm_P11P12_us": 20.17,
+  "t_ach_comm_P11P12_us": 26.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.61,
+   "MOE.fc1": 47.67,
+   "MOE.act": 0.57,
+   "MOE.fc2": 24.62,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 12.39,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.33658,
+  "derate": 0.958,
+  "derate_vs_ops_only": 1.302,
+  "pct_sol": 69.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117185232.log",
+   "ts": "2026-11-18T02:55:04Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-033",
+  "topology": "mxfp4_release|D7-4-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 97.12,
+  "measured_kernel_us": 95.15,
+  "measured_vllm_us": 92.78,
+  "t_sol_us": 67.52,
+  "t_ach_us": 101.35,
+  "t_sol_ops_us": 47.35,
+  "t_ach_ops_us": 74.6,
+  "t_sol_comm_P11P12_us": 20.17,
+  "t_ach_comm_P11P12_us": 26.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.61,
+   "MOE.fc1": 47.67,
+   "MOE.act": 0.57,
+   "MOE.fc2": 24.62,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 12.39,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.32464,
+  "derate": 0.958,
+  "derate_vs_ops_only": 1.302,
+  "pct_sol": 69.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117185232.log",
+   "ts": "2026-11-18T02:55:04Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-033",
+  "topology": "mxfp4_release|D7-8-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 97.12,
+  "measured_kernel_us": 95.15,
+  "measured_vllm_us": 92.78,
+  "t_sol_us": 67.52,
+  "t_ach_us": 101.35,
+  "t_sol_ops_us": 47.35,
+  "t_ach_ops_us": 74.6,
+  "t_sol_comm_P11P12_us": 20.17,
+  "t_ach_comm_P11P12_us": 26.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.61,
+   "MOE.fc1": 47.67,
+   "MOE.act": 0.57,
+   "MOE.fc2": 24.62,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 12.39,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.29442,
+  "derate": 0.958,
+  "derate_vs_ops_only": 1.302,
+  "pct_sol": 69.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117185232.log",
+   "ts": "2026-11-18T02:55:04Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-033",
+  "topology": "mxfp4_release|D8-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 97.12,
+  "measured_kernel_us": 95.15,
+  "measured_vllm_us": 92.78,
+  "t_sol_us": 67.52,
+  "t_ach_us": 101.35,
+  "t_sol_ops_us": 47.35,
+  "t_ach_ops_us": 74.6,
+  "t_sol_comm_P11P12_us": 20.17,
+  "t_ach_comm_P11P12_us": 26.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.61,
+   "MOE.fc1": 47.67,
+   "MOE.act": 0.57,
+   "MOE.fc2": 24.62,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 12.39,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.18916,
+  "derate": 0.958,
+  "derate_vs_ops_only": 1.302,
+  "pct_sol": 69.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117185232.log",
+   "ts": "2026-11-18T02:55:04Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-922",
+  "topology": "mxfp4_release|P2b|prefill",
+  "ep": 16,
+  "tokens_per_rank": 2048,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 464.97,
+  "measured_kernel_us": 463.62,
+  "measured_vllm_us": 470.77,
+  "t_sol_us": 344.38,
+  "t_ach_us": 512.54,
+  "t_sol_ops_us": 150.38,
+  "t_ach_ops_us": 235.5,
+  "t_sol_comm_P11P12_us": 194.0,
+  "t_ach_comm_P11P12_us": 277.04,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 9.77,
+   "MOE.fc1": 132.4,
+   "MOE.act": 9.18,
+   "MOE.fc2": 66.2,
+   "MOE.combine": 17.95
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 97.54,
+   "P12 EP-combine": 179.5
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.1302,
+  "derate": 0.907,
+  "derate_vs_ops_only": 1.974,
+  "pct_sol": 74.1,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117190653.log",
+   "ts": "2026-11-18T03:08:15Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-012",
+  "topology": "mxfp4_release|P2|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 900.71,
+  "measured_kernel_us": 896.89,
+  "measured_vllm_us": 914.78,
+  "t_sol_us": 680.15,
+  "t_ach_us": 1015.11,
+  "t_sol_ops_us": 300.75,
+  "t_ach_ops_us": 471.01,
+  "t_sol_comm_P11P12_us": 379.4,
+  "t_ach_comm_P11P12_us": 544.1,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 19.54,
+   "MOE.fc1": 264.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 132.4,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 188.4,
+   "P12 EP-combine": 355.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.15355,
+  "derate": 0.887,
+  "derate_vs_ops_only": 1.912,
+  "pct_sol": 75.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117231259.log",
+   "ts": "2026-11-18T07:14:31Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-012",
+  "topology": "mxfp4_release|P4-4|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 900.71,
+  "measured_kernel_us": 896.89,
+  "measured_vllm_us": 914.78,
+  "t_sol_us": 680.15,
+  "t_ach_us": 1015.11,
+  "t_sol_ops_us": 300.75,
+  "t_ach_ops_us": 471.01,
+  "t_sol_comm_P11P12_us": 379.4,
+  "t_ach_comm_P11P12_us": 544.1,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 19.54,
+   "MOE.fc1": 264.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 132.4,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 188.4,
+   "P12 EP-combine": 355.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.15943,
+  "derate": 0.887,
+  "derate_vs_ops_only": 1.912,
+  "pct_sol": 75.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117231259.log",
+   "ts": "2026-11-18T07:14:31Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-012",
+  "topology": "mxfp4_release|P5-4|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 900.71,
+  "measured_kernel_us": 896.89,
+  "measured_vllm_us": 914.78,
+  "t_sol_us": 680.15,
+  "t_ach_us": 1015.11,
+  "t_sol_ops_us": 300.75,
+  "t_ach_ops_us": 471.01,
+  "t_sol_comm_P11P12_us": 379.4,
+  "t_ach_comm_P11P12_us": 544.1,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 19.54,
+   "MOE.fc1": 264.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 132.4,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 188.4,
+   "P12 EP-combine": 355.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.1388,
+  "derate": 0.887,
+  "derate_vs_ops_only": 1.912,
+  "pct_sol": 75.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117231259.log",
+   "ts": "2026-11-18T07:14:31Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-951",
+  "topology": "mxfp4_release|P6-4-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 900.71,
+  "measured_kernel_us": 896.89,
+  "measured_vllm_us": 914.78,
+  "t_sol_us": 548.11,
+  "t_ach_us": 824.91,
+  "t_sol_ops_us": 300.75,
+  "t_ach_ops_us": 471.01,
+  "t_sol_comm_P11P12_us": 247.36,
+  "t_ach_comm_P11P12_us": 353.9,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 19.54,
+   "MOE.fc1": 264.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 132.4,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 123.7,
+   "P12 EP-combine": 230.2
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.1704,
+  "derate": 1.092,
+  "derate_vs_ops_only": 1.912,
+  "pct_sol": 60.9,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117231259.log",
+   "ts": "2026-11-18T07:14:31Z"
+  },
+  "dedup_model": true,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)",
+   "model assumes rank-level dedup dispatch (P11/P12 scaled by U/k); shipped MegaMoE 6e438852b has no dedup (C7 dedup measured +1.4..3.8% slower in the MegaMoE SOL work), so measured = non-dedup kernel"
+  ]
+ },
+ {
+  "case": "megamoe-041",
+  "topology": "mxfp4_release|P4-2|prefill",
+  "ep": 16,
+  "tokens_per_rank": 8192,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 1788.99,
+  "measured_kernel_us": 1780.96,
+  "measured_vllm_us": 1782.92,
+  "t_sol_us": 1351.79,
+  "t_ach_us": 2020.03,
+  "t_sol_ops_us": 601.59,
+  "t_ach_ops_us": 942.03,
+  "t_sol_comm_P11P12_us": 750.2,
+  "t_ach_comm_P11P12_us": 1078.0,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 39.08,
+   "MOE.fc1": 529.6,
+   "MOE.act": 36.73,
+   "MOE.fc2": 264.8,
+   "MOE.combine": 71.82
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 370.0,
+   "P12 EP-combine": 708.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.17244,
+  "derate": 0.886,
+  "derate_vs_ops_only": 1.899,
+  "pct_sol": 75.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117231259.log",
+   "ts": "2026-11-18T07:14:31Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-915",
+  "topology": "mxfp4_release|P6-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 8192,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 1788.99,
+  "measured_kernel_us": 1780.96,
+  "measured_vllm_us": 1782.92,
+  "t_sol_us": 1087.79,
+  "t_ach_us": 1639.83,
+  "t_sol_ops_us": 601.59,
+  "t_ach_ops_us": 942.03,
+  "t_sol_comm_P11P12_us": 486.2,
+  "t_ach_comm_P11P12_us": 697.8,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 39.08,
+   "MOE.fc1": 529.6,
+   "MOE.act": 36.73,
+   "MOE.fc2": 264.8,
+   "MOE.combine": 71.82
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 240.7,
+   "P12 EP-combine": 457.1
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.18534,
+  "derate": 1.091,
+  "derate_vs_ops_only": 1.899,
+  "pct_sol": 60.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1117231259.log",
+   "ts": "2026-11-18T07:14:31Z"
+  },
+  "dedup_model": true,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)",
+   "model assumes rank-level dedup dispatch (P11/P12 scaled by U/k); shipped MegaMoE 6e438852b has no dedup (C7 dedup measured +1.4..3.8% slower in the MegaMoE SOL work), so measured = non-dedup kernel"
+  ]
+ },
+ {
+  "case": "megamoe-010",
+  "topology": "mxfp4_release|P3-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 3427.12,
+  "measured_kernel_us": 3413.51,
+  "measured_vllm_us": null,
+  "t_sol_us": 2694.99,
+  "t_ach_us": 4030.21,
+  "t_sol_ops_us": 1203.19,
+  "t_ach_ops_us": 1883.81,
+  "t_sol_comm_P11P12_us": 1491.8,
+  "t_ach_comm_P11P12_us": 2146.4,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 78.15,
+   "MOE.fc1": 1059.0,
+   "MOE.act": 73.46,
+   "MOE.fc2": 529.6,
+   "MOE.combine": 143.6
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 733.4,
+   "P12 EP-combine": 1413.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.18046,
+  "derate": 0.85,
+  "derate_vs_ops_only": 1.819,
+  "pct_sol": 78.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1137217",
+   "nodes": "hecate0361,hecate0366,hecate0367,hecate0369",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1118030109.log",
+   "ts": "2026-11-18T11:03:07Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-010",
+  "topology": "mxfp4_release|P9-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 3427.12,
+  "measured_kernel_us": 3413.51,
+  "measured_vllm_us": null,
+  "t_sol_us": 2694.99,
+  "t_ach_us": 4030.21,
+  "t_sol_ops_us": 1203.19,
+  "t_ach_ops_us": 1883.81,
+  "t_sol_comm_P11P12_us": 1491.8,
+  "t_ach_comm_P11P12_us": 2146.4,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 78.15,
+   "MOE.fc1": 1059.0,
+   "MOE.act": 73.46,
+   "MOE.fc2": 529.6,
+   "MOE.combine": 143.6
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 733.4,
+   "P12 EP-combine": 1413.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.18046,
+  "derate": 0.85,
+  "derate_vs_ops_only": 1.819,
+  "pct_sol": 78.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1137217",
+   "nodes": "hecate0361,hecate0366,hecate0367,hecate0369",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1118030109.log",
+   "ts": "2026-11-18T11:03:07Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-010",
+  "topology": "mxfp4_release|P9|prefill",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "model_act": "mxfp8",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 3427.12,
+  "measured_kernel_us": 3413.51,
+  "measured_vllm_us": null,
+  "t_sol_us": 2694.99,
+  "t_ach_us": 4030.21,
+  "t_sol_ops_us": 1203.19,
+  "t_ach_ops_us": 1883.81,
+  "t_sol_comm_P11P12_us": 1491.8,
+  "t_ach_comm_P11P12_us": 2146.4,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 78.15,
+   "MOE.fc1": 1059.0,
+   "MOE.act": 73.46,
+   "MOE.fc2": 529.6,
+   "MOE.combine": 143.6
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 733.4,
+   "P12 EP-combine": 1413.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.18046,
+  "derate": 0.85,
+  "derate_vs_ops_only": 1.819,
+  "pct_sol": 78.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1137217",
+   "nodes": "hecate0361,hecate0366,hecate0367,hecate0369",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-mxfp4w_mxfp8a-ep16-random-1118030109.log",
+   "ts": "2026-11-18T11:03:07Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "quant_kind asserted mxfp4_mxfp8 in bench log (pinned MXFP8 activations at all T)"
+  ]
+ },
+ {
+  "case": "megamoe-1001",
+  "topology": "nvfp4_modelopt|D2|decode r1",
+  "ep": 8,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 89.83,
+  "measured_kernel_us": 88.3,
+  "measured_vllm_us": 85.93,
+  "t_sol_us": 50.39,
+  "t_ach_us": 75.33,
+  "t_sol_ops_us": 41.53,
+  "t_ach_ops_us": 65.7,
+  "t_sol_comm_P11P12_us": 8.87,
+  "t_ach_comm_P11P12_us": 9.63,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 43.74,
+   "MOE.act": 0.02,
+   "MOE.fc2": 21.9,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.23,
+   "P12 EP-combine": 3.39
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.579,
+  "derate": 1.192,
+  "derate_vs_ops_only": 1.367,
+  "pct_sol": 56.1,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1131277",
+   "nodes": "hecate0174,hecate0175",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep8-random-1117183250.log",
+   "ts": "2026-11-18T02:35:18Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-1003",
+  "topology": "nvfp4_modelopt|D2|decode r8",
+  "ep": 8,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 144.05,
+  "measured_kernel_us": 142.29,
+  "measured_vllm_us": 138.21,
+  "t_sol_us": 105.1,
+  "t_ach_us": 161.58,
+  "t_sol_ops_us": 94.24,
+  "t_ach_ops_us": 149.07,
+  "t_sol_comm_P11P12_us": 10.87,
+  "t_ach_comm_P11P12_us": 12.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 98.89,
+   "MOE.act": 0.14,
+   "MOE.fc2": 49.67,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.87,
+   "P12 EP-combine": 5.64
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.65653,
+  "derate": 0.891,
+  "derate_vs_ops_only": 0.966,
+  "pct_sol": 73.0,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1131277",
+   "nodes": "hecate0174,hecate0175",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep8-random-1117183250.log",
+   "ts": "2026-11-18T02:35:18Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-133",
+  "topology": "nvfp4_modelopt|P1|prefill",
+  "ep": 8,
+  "tokens_per_rank": 2048,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 379.36,
+  "measured_kernel_us": 367.91,
+  "measured_vllm_us": 376.09,
+  "t_sol_us": 287.29,
+  "t_ach_us": 424.23,
+  "t_sol_ops_us": 132.46,
+  "t_ach_ops_us": 204.34,
+  "t_sol_comm_P11P12_us": 154.83,
+  "t_ach_comm_P11P12_us": 219.89,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 5.81,
+   "MOE.fc1": 104.6,
+   "MOE.act": 9.18,
+   "MOE.fc2": 66.8,
+   "MOE.combine": 17.95
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 52.39,
+   "P12 EP-combine": 167.5
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.10491,
+  "derate": 0.894,
+  "derate_vs_ops_only": 1.856,
+  "pct_sol": 75.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1132510",
+   "nodes": "hecate0313,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep8-random-1117185556.log",
+   "ts": "2026-11-18T02:57:32Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-133",
+  "topology": "nvfp4_modelopt|P5-8|prefill",
+  "ep": 8,
+  "tokens_per_rank": 2048,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 379.36,
+  "measured_kernel_us": 367.91,
+  "measured_vllm_us": 376.09,
+  "t_sol_us": 287.29,
+  "t_ach_us": 424.23,
+  "t_sol_ops_us": 132.46,
+  "t_ach_ops_us": 204.34,
+  "t_sol_comm_P11P12_us": 154.83,
+  "t_ach_comm_P11P12_us": 219.89,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 5.81,
+   "MOE.fc1": 104.6,
+   "MOE.act": 9.18,
+   "MOE.fc2": 66.8,
+   "MOE.combine": 17.95
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 52.39,
+   "P12 EP-combine": 167.5
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.08707,
+  "derate": 0.894,
+  "derate_vs_ops_only": 1.856,
+  "pct_sol": 75.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1132510",
+   "nodes": "hecate0313,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep8-random-1117185556.log",
+   "ts": "2026-11-18T02:57:32Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D3|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.47417,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D4-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.40057,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D5|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.46393,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D6|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.48588,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D7-2-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.42509,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D7-4-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.47133,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D7-8-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.48744,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D8-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.48941,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-007",
+  "topology": "nvfp4_modelopt|D9-16|decode r1",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 76.99,
+  "measured_kernel_us": 75.24,
+  "measured_vllm_us": 74.77,
+  "t_sol_us": 41.32,
+  "t_ach_us": 61.84,
+  "t_sol_ops_us": 32.44,
+  "t_ach_ops_us": 51.33,
+  "t_sol_comm_P11P12_us": 8.89,
+  "t_ach_comm_P11P12_us": 10.51,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.01,
+   "MOE.fc1": 34.16,
+   "MOE.act": 0.02,
+   "MOE.fc2": 17.11,
+   "MOE.combine": 0.04
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 6.81,
+   "P12 EP-combine": 3.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.38585,
+  "derate": 1.245,
+  "derate_vs_ops_only": 1.5,
+  "pct_sol": 53.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D3|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.51055,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D4-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.46119,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D5|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.5098,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D6|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.50354,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D7-2-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.47895,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D7-4-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.50832,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D7-8-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.50427,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D8-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.42053,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-006",
+  "topology": "nvfp4_modelopt|D9-16|decode r8",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 85.67,
+  "measured_kernel_us": 83.97,
+  "measured_vllm_us": 83.33,
+  "t_sol_us": 58.91,
+  "t_ach_us": 89.28,
+  "t_sol_ops_us": 47.88,
+  "t_ach_ops_us": 75.69,
+  "t_sol_comm_P11P12_us": 11.03,
+  "t_ach_comm_P11P12_us": 13.59,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.09,
+   "MOE.fc1": 49.97,
+   "MOE.act": 0.14,
+   "MOE.fc2": 25.21,
+   "MOE.combine": 0.28
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 7.48,
+   "P12 EP-combine": 6.11
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.42489,
+  "derate": 0.96,
+  "derate_vs_ops_only": 1.132,
+  "pct_sol": 68.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117183328.log",
+   "ts": "2026-11-18T02:36:13Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D3|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.37387,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D4-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.37621,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D5|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.39177,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D7-2-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.37859,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D7-4-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.37348,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D7-8-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.33601,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D8-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.20951,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-013",
+  "topology": "nvfp4_modelopt|D9-16|decode r32",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 88.13,
+  "measured_kernel_us": 86.52,
+  "measured_vllm_us": 88.06,
+  "t_sol_us": 68.04,
+  "t_ach_us": 102.43,
+  "t_sol_ops_us": 49.66,
+  "t_ach_ops_us": 78.27,
+  "t_sol_comm_P11P12_us": 18.38,
+  "t_ach_comm_P11P12_us": 24.17,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 0.36,
+   "MOE.fc1": 50.2,
+   "MOE.act": 0.57,
+   "MOE.fc2": 26.01,
+   "MOE.combine": 1.12
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "m",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 9.81,
+   "P12 EP-combine": 14.36
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.30865,
+  "derate": 0.86,
+  "derate_vs_ops_only": 1.126,
+  "pct_sol": 77.2,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130698",
+   "nodes": "hecate0370,hecate0371,hecate0372,hecate0373",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117185143.log",
+   "ts": "2026-11-18T02:54:12Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-997",
+  "topology": "nvfp4_modelopt|P2b|prefill",
+  "ep": 16,
+  "tokens_per_rank": 2048,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 354.72,
+  "measured_kernel_us": 351.74,
+  "measured_vllm_us": 359.77,
+  "t_sol_us": 257.19,
+  "t_ach_us": 378.93,
+  "t_sol_ops_us": 91.86,
+  "t_ach_ops_us": 143.18,
+  "t_sol_comm_P11P12_us": 165.33,
+  "t_ach_comm_P11P12_us": 235.75,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 5.81,
+   "MOE.fc1": 68.39,
+   "MOE.act": 9.18,
+   "MOE.fc2": 41.85,
+   "MOE.combine": 17.95
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "m",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 56.25,
+   "P12 EP-combine": 179.5
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.10806,
+  "derate": 0.936,
+  "derate_vs_ops_only": 2.477,
+  "pct_sol": 72.5,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1130701",
+   "nodes": "hecate0361,hecate0362,hecate0365,hecate0366",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117190527.log",
+   "ts": "2026-11-18T03:06:52Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-017",
+  "topology": "nvfp4_modelopt|P2|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 653.09,
+  "measured_kernel_us": 648.86,
+  "measured_vllm_us": 644.37,
+  "t_sol_us": 495.14,
+  "t_ach_us": 732.58,
+  "t_sol_ops_us": 173.11,
+  "t_ach_ops_us": 271.08,
+  "t_sol_comm_P11P12_us": 322.03,
+  "t_ach_comm_P11P12_us": 461.5,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 11.62,
+   "MOE.fc1": 136.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 68.39,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 105.8,
+   "P12 EP-combine": 355.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.12969,
+  "derate": 0.891,
+  "derate_vs_ops_only": 2.409,
+  "pct_sol": 75.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117231121.log",
+   "ts": "2026-11-18T07:12:59Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-017",
+  "topology": "nvfp4_modelopt|P4-4|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 653.09,
+  "measured_kernel_us": 648.86,
+  "measured_vllm_us": 644.37,
+  "t_sol_us": 495.14,
+  "t_ach_us": 732.58,
+  "t_sol_ops_us": 173.11,
+  "t_ach_ops_us": 271.08,
+  "t_sol_comm_P11P12_us": 322.03,
+  "t_ach_comm_P11P12_us": 461.5,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 11.62,
+   "MOE.fc1": 136.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 68.39,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 105.8,
+   "P12 EP-combine": 355.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.13718,
+  "derate": 0.891,
+  "derate_vs_ops_only": 2.409,
+  "pct_sol": 75.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117231121.log",
+   "ts": "2026-11-18T07:12:59Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-017",
+  "topology": "nvfp4_modelopt|P5-4|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 653.09,
+  "measured_kernel_us": 648.86,
+  "measured_vllm_us": 644.37,
+  "t_sol_us": 495.14,
+  "t_ach_us": 732.58,
+  "t_sol_ops_us": 173.11,
+  "t_ach_ops_us": 271.08,
+  "t_sol_comm_P11P12_us": 322.03,
+  "t_ach_comm_P11P12_us": 461.5,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 11.62,
+   "MOE.fc1": 136.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 68.39,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 105.8,
+   "P12 EP-combine": 355.7
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.11219,
+  "derate": 0.891,
+  "derate_vs_ops_only": 2.409,
+  "pct_sol": 75.8,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117231121.log",
+   "ts": "2026-11-18T07:12:59Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-999",
+  "topology": "nvfp4_modelopt|P6-4-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 653.09,
+  "measured_kernel_us": 648.86,
+  "measured_vllm_us": 644.37,
+  "t_sol_us": 383.54,
+  "t_ach_us": 571.8,
+  "t_sol_ops_us": 173.11,
+  "t_ach_ops_us": 271.08,
+  "t_sol_comm_P11P12_us": 210.43,
+  "t_ach_comm_P11P12_us": 300.72,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 11.62,
+   "MOE.fc1": 136.8,
+   "MOE.act": 18.36,
+   "MOE.fc2": 68.39,
+   "MOE.combine": 35.91
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 70.52,
+   "P12 EP-combine": 230.2
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.14925,
+  "derate": 1.142,
+  "derate_vs_ops_only": 2.409,
+  "pct_sol": 58.7,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117231121.log",
+   "ts": "2026-11-18T07:12:59Z"
+  },
+  "dedup_model": true,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "model assumes rank-level dedup dispatch (P11/P12 scaled by U/k); shipped MegaMoE 6e438852b has no dedup (C7 dedup measured +1.4..3.8% slower in the MegaMoE SOL work), so measured = non-dedup kernel"
+  ]
+ },
+ {
+  "case": "megamoe-049",
+  "topology": "nvfp4_modelopt|P4-2|prefill",
+  "ep": 16,
+  "tokens_per_rank": 8192,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 1254.22,
+  "measured_kernel_us": 1247.77,
+  "measured_vllm_us": 1247.65,
+  "t_sol_us": 979.64,
+  "t_ach_us": 1455.08,
+  "t_sol_ops_us": 344.14,
+  "t_ach_ops_us": 542.18,
+  "t_sol_comm_P11P12_us": 635.5,
+  "t_ach_comm_P11P12_us": 912.9,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 23.23,
+   "MOE.fc1": 273.6,
+   "MOE.act": 36.73,
+   "MOE.fc2": 136.8,
+   "MOE.combine": 71.82
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 204.9,
+   "P12 EP-combine": 708.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.15438,
+  "derate": 0.862,
+  "derate_vs_ops_only": 2.313,
+  "pct_sol": 78.1,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117231121.log",
+   "ts": "2026-11-18T07:12:59Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-916",
+  "topology": "nvfp4_modelopt|P6-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 8192,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 1254.22,
+  "measured_kernel_us": 1247.77,
+  "measured_vllm_us": 1247.65,
+  "t_sol_us": 756.48,
+  "t_ach_us": 1133.58,
+  "t_sol_ops_us": 344.14,
+  "t_ach_ops_us": 542.18,
+  "t_sol_comm_P11P12_us": 412.34,
+  "t_ach_comm_P11P12_us": 591.4,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 23.23,
+   "MOE.fc1": 273.6,
+   "MOE.act": 36.73,
+   "MOE.fc2": 136.8,
+   "MOE.combine": 71.82
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 134.3,
+   "P12 EP-combine": 457.1
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.16995,
+  "derate": 1.106,
+  "derate_vs_ops_only": 2.313,
+  "pct_sol": 60.3,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1125804",
+   "nodes": "hecate0314,hecate0315,hecate0316,hecate0317",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1117231121.log",
+   "ts": "2026-11-18T07:12:59Z"
+  },
+  "dedup_model": true,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)",
+   "model assumes rank-level dedup dispatch (P11/P12 scaled by U/k); shipped MegaMoE 6e438852b has no dedup (C7 dedup measured +1.4..3.8% slower in the MegaMoE SOL work), so measured = non-dedup kernel"
+  ]
+ },
+ {
+  "case": "megamoe-014",
+  "topology": "nvfp4_modelopt|P3-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 2649.31,
+  "measured_kernel_us": 2632.7,
+  "measured_vllm_us": null,
+  "t_sol_us": 1950.87,
+  "t_ach_us": 2900.43,
+  "t_sol_ops_us": 688.37,
+  "t_ach_ops_us": 1084.33,
+  "t_sol_comm_P11P12_us": 1262.5,
+  "t_ach_comm_P11P12_us": 1816.1,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 46.47,
+   "MOE.fc1": 547.2,
+   "MOE.act": 73.46,
+   "MOE.fc2": 273.6,
+   "MOE.combine": 143.6
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 403.1,
+   "P12 EP-combine": 1413.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.16579,
+  "derate": 0.913,
+  "derate_vs_ops_only": 2.443,
+  "pct_sol": 73.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1137217",
+   "nodes": "hecate0361,hecate0366,hecate0367,hecate0369",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1118030307.log",
+   "ts": "2026-11-18T11:04:45Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-014",
+  "topology": "nvfp4_modelopt|P9-16|prefill",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 2649.31,
+  "measured_kernel_us": 2632.7,
+  "measured_vllm_us": null,
+  "t_sol_us": 1950.87,
+  "t_ach_us": 2900.43,
+  "t_sol_ops_us": 688.37,
+  "t_ach_ops_us": 1084.33,
+  "t_sol_comm_P11P12_us": 1262.5,
+  "t_ach_comm_P11P12_us": 1816.1,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 46.47,
+   "MOE.fc1": 547.2,
+   "MOE.act": 73.46,
+   "MOE.fc2": 273.6,
+   "MOE.combine": 143.6
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 403.1,
+   "P12 EP-combine": 1413.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.16579,
+  "derate": 0.913,
+  "derate_vs_ops_only": 2.443,
+  "pct_sol": 73.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1137217",
+   "nodes": "hecate0361,hecate0366,hecate0367,hecate0369",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1118030307.log",
+   "ts": "2026-11-18T11:04:45Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ },
+ {
+  "case": "megamoe-014",
+  "topology": "nvfp4_modelopt|P9|prefill",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "model_act": "nvfp4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "P11 EP-dispatch",
+   "P12 EP-combine"
+  ],
+  "measured_us": 2649.31,
+  "measured_kernel_us": 2632.7,
+  "measured_vllm_us": null,
+  "t_sol_us": 1950.87,
+  "t_ach_us": 2900.43,
+  "t_sol_ops_us": 688.37,
+  "t_ach_ops_us": 1084.33,
+  "t_sol_comm_P11P12_us": 1262.5,
+  "t_ach_comm_P11P12_us": 1816.1,
+  "per_op_t_ach_us": {
+   "MOE.dispatch": 46.47,
+   "MOE.fc1": 547.2,
+   "MOE.act": 73.46,
+   "MOE.fc2": 273.6,
+   "MOE.combine": 143.6
+  },
+  "per_op_bound": {
+   "MOE.dispatch": "m",
+   "MOE.fc1": "c",
+   "MOE.act": "c",
+   "MOE.fc2": "c",
+   "MOE.combine": "m"
+  },
+  "comm_t_ach_us": {
+   "P11 EP-dispatch": 403.1,
+   "P12 EP-combine": 1413.0
+  },
+  "count_per_step": 92.0,
+  "step_share": 0.16579,
+  "derate": 0.913,
+  "derate_vs_ops_only": 2.443,
+  "pct_sol": 73.6,
+  "kernel_debug": false,
+  "version": {
+   "flashinfer": "6e438852b (tag wzhao/kimi-k3-megamoe-sm107-final-20261117: e5cc18d95 + 19 files)",
+   "vllm_frozen": "036d832e7",
+   "harness": "megamoe-bench run_b10.sh / fi_bench2.py (bench_kimi_k3_moe_ep provider current)",
+   "job": "1137217",
+   "nodes": "hecate0361,hecate0366,hecate0367,hecate0369",
+   "log": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/megamoe-bench/logs/B10-nvfp4w_nvfp4a-ep16-random-1118030307.log",
+   "ts": "2026-11-18T11:04:45Z"
+  },
+  "dedup_model": false,
+  "notes": [
+   "measured = whole fused MegaMoE layer (BF16 in, input quant + routing + NVLink dispatch + fc1 + act + fc2 + combine; persistent phase-interleaved kernel, so dispatch/GEMM/combine are not separable by kernel timing); t_ach/t_sol = MOE.dispatch..combine ops + P11+P12 comm (model adds them serially per MoE layer)",
+   "measured_kernel_us = staged compute only (input quant/routing staging excluded)"
+  ]
+ }
+]

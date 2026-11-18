@@ -18,7 +18,7 @@ import hw as HWm  # noqa: E402
 import kv  # noqa: E402
 import model as Mdl  # noqa: E402
 import prefill as Pre  # noqa: E402
-from topologies import ALL, DECODE, PREFILL  # noqa: E402
+from topologies import ALL, DECODE, PREFILL, SCOPE  # noqa: E402
 
 OUT = os.path.join(HERE, "out")
 COLS = HWm.COLUMNS
@@ -84,6 +84,9 @@ def run_prefill():
                                               note="74K zero-hit request over CP8: one 9.25K-row slice per GPU + KDA "
                                                    "fix-up (+1x KDA core) + log2(8)-round transition exchange")
     out["ttft"] = tt
+    out["scope_ep16"] = [t.id for t in PREFILL if t.id in SCOPE]
+    out["rank_ep16"] = {k: sorted(((tid, v["best"]["tok_s_gpu"], v["bestF"]) for tid, v in per.items() if tid in SCOPE),
+                                   key=lambda x: -x[1]) for k, per in out["res"].items()}
     out["nixl"] = {str(L): Pre.nixl_bytes(L) for L in (78400, 135000, 145000)}
     out["fan_in"] = {t.id: Pre.fan_in(t) for t in PREFILL}
     return out
@@ -122,15 +125,35 @@ def run_decode():
                                              runner=second[1] if second else None,
                                              margin=(c[0] / second[0] - 1) if second else None))
                     out["best"][key] = best
-                    # pareto envelope across topologies (max tok/s/GPU at each interactivity)
-                    pts = sorted(allpts, key=lambda x: -x[1]["tps_user"])
-                    env, mx = [], -1
-                    for tid, p in pts:
-                        if p["tps_gpu"] > mx:
-                            mx = p["tps_gpu"]
-                            env.append(dict(topo=tid, r=p["r"], tps_user=p["tps_user"], tps_gpu=p["tps_gpu"], t_ms=p["t_ms"]))
-                    out["pareto"][key] = env
+                    out["pareto"][key] = _envelope(allpts)
+                    # EP <= 16 scope (2026-11-18)
+                    sp = [(tid, p) for tid, p in allpts if tid in SCOPE]
+                    out.setdefault("best_ep16", {})[key] = _best_per_r(sp)
+                    out.setdefault("pareto_ep16", {})[key] = _envelope(sp)
+    out["scope_ep16"] = [t.id for t in DECODE if t.id in SCOPE]
     return out
+
+
+def _best_per_r(allpts):
+    best = []
+    for r in Dec.R_GRID:
+        cands = sorted((p["tps_gpu"], tid, p["t_ms"], p["tps_user"]) for tid, p in allpts if abs(p["r"] - r) < 1e-9)
+        if cands:
+            c, s = cands[-1], (cands[-2] if len(cands) > 1 else None)
+            best.append(dict(r=r, topo=c[1], tps_gpu=c[0], t_ms=c[2], tps_user=c[3], runner=s[1] if s else None,
+                             margin=(c[0] / s[0] - 1) if s else None))
+    return best
+
+
+def _envelope(allpts):
+    """Pareto envelope across topologies (max tok/s/GPU at each interactivity)."""
+    pts = sorted(allpts, key=lambda x: -x[1]["tps_user"])
+    env, mx = [], -1
+    for tid, p in pts:
+        if p["tps_gpu"] > mx:
+            mx = p["tps_gpu"]
+            env.append(dict(topo=tid, r=p["r"], tps_user=p["tps_user"], tps_gpu=p["tps_gpu"], t_ms=p["t_ms"]))
+    return env
 
 
 # ---------------------------------------------------------------------------------------------- op tables
@@ -367,7 +390,7 @@ def run_meta(dec):
         group_order=Mdl.GROUP_ORDER, assumptions=ASSUMPTIONS, open_questions=OPEN_Q, anchors=anchors,
         op_info={o.id: dict(name=o.name, shapes=o.shapes, layer=o.layer_type, fused=o.fused,
                             cite=o.cite[:2]) for o in Mdl.OPS},
-        reserve_GiB=kv.RESERVE_GIB, agentx=Mdl.AGENTX,
+        reserve_GiB=kv.RESERVE_GIB, agentx=Mdl.AGENTX, scope_ep16=SCOPE,
     )
 
 
@@ -405,6 +428,10 @@ def summary(pre, dec):
         for var in ("base", "O1+O2+O3"):
             b = dec["best"]["%s|3|achievable|%s" % (ck, var)]
             print("  %-9s " % var + " ".join("r%g:%s %.0f" % (x["r"], x["topo"], x["tps_gpu"]) for x in b))
+        print("== %s EP<=16 scope: prefill ranking (O1+O2, achievable) / decode best per r (k=3, achievable, base)" % ck)
+        print("  " + "  ".join("%s %.1fK" % (tid, v / 1e3) for tid, v, _ in pre["rank_ep16"]["%s|achievable|O1+O2" % ck][:6]))
+        b = dec["best_ep16"]["%s|3|achievable|base" % ck]
+        print("  " + " ".join("r%g:%s %.0f" % (x["r"], x["topo"], x["tps_gpu"]) for x in b))
 
 
 if __name__ == "__main__":

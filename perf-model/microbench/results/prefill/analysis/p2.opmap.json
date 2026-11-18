@@ -1,0 +1,1026 @@
+[
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn.in_proj_qkvgfab",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 52.406,
+"busy_ms": 52.456,
+"launches": 68
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubininferencemegablock_scaled_swa",
+"excl_ms": 50.391,
+"busy_ms": 86.437,
+"launches": 68
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.shared_experts.down_proj",
+"kernel": "nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN",
+"excl_ms": 24.532,
+"busy_ms": 25.669,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubininferencemegablock_scaled_swa",
+"excl_ms": 17.241,
+"busy_ms": 30.134,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRsAr_object_at__cutlasscutenvgpu",
+"excl_ms": 16.52,
+"busy_ms": 16.52,
+"launches": 68
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.shared_experts.gate_up_proj",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 14.022,
+"busy_ms": 14.227,
+"launches": 68
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "_Z25_flash_kda_fwd_recurrenceIN4cute9TiledCopyINS0_9Copy_AtomIJNS0_11Copy_TraitsINS0_13SM9",
+"excl_ms": 13.916,
+"busy_ms": 13.916,
+"launches": 68
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "-",
+"kernel": "_push_shard_kernel",
+"excl_ms": 13.173,
+"busy_ms": 13.173,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256PagedKvDenseStaticTokenSparseP1VarS",
+"excl_ms": 11.948,
+"busy_ms": 11.96,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.shared_experts.down_proj",
+"kernel": "nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN",
+"excl_ms": 8.715,
+"busy_ms": 9.121,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.shared_experts.act_fn",
+"kernel": "situ_and_mul_vec8_kernel",
+"excl_ms": 7.888,
+"busy_ms": 11.179,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "Kernel",
+"excl_ms": 5.828,
+"busy_ms": 5.828,
+"launches": 48
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "-",
+"kernel": "sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel",
+"excl_ms": 5.806,
+"busy_ms": 6.322,
+"launches": 136
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn",
+"kernel": "vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRsAr_object_at__cutlasscutenvgpu",
+"excl_ms": 5.696,
+"busy_ms": 5.696,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "_flash_kda_fwd_prepare",
+"excl_ms": 5.49,
+"busy_ms": 5.49,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.g_proj",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 5.113,
+"busy_ms": 5.114,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.routed_expert_down_proj",
+"kernel": "nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN",
+"excl_ms": 4.779,
+"busy_ms": 4.807,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "-",
+"kernel": "_push_shard_kernel",
+"excl_ms": 4.649,
+"busy_ms": 4.649,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "kern_vllmthird_partytrtllm_gvr_torchkernelsblackwelltop_kgvr_topk_decode_self_samplingGvrM",
+"excl_ms": 4.574,
+"busy_ms": 4.574,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "k3conv::qkv_conv_kernel",
+"excl_ms": 4.461,
+"busy_ms": 4.461,
+"launches": 68
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.routed_output_transform",
+"kernel": "nvjet_sm107_tst_288x128_64x9_2x2f_2cta_h_badd_TNN",
+"excl_ms": 4.408,
+"busy_ms": 4.444,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.shared_experts.gate_up_proj",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 3.796,
+"busy_ms": 5.109,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.fused_qkv_a_proj",
+"kernel": "nvjet_sm107_tst_192x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 3.657,
+"busy_ms": 3.677,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "router_kernel_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourcescommunicationnvlink_domaintoke",
+"excl_ms": 3.386,
+"busy_ms": 5.7,
+"launches": 68
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "Memcpy PtoP ",
+"excl_ms": 3.263,
+"busy_ms": 3.333,
+"launches": 216
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.shared_experts.act_fn",
+"kernel": "situ_and_mul_vec8_kernel",
+"excl_ms": 2.835,
+"busy_ms": 3.961,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "reduce_bf16_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubininferencemegatopk",
+"excl_ms": 2.613,
+"busy_ms": 2.613,
+"launches": 68
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "ncclDevKernel_AllGather_RING",
+"excl_ms": 2.601,
+"busy_ms": 2.601,
+"launches": 1
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "_kda_rmsnorm_gated_kernel",
+"excl_ms": 2.418,
+"busy_ms": 2.418,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "-",
+"kernel": "sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel",
+"excl_ms": 2.087,
+"busy_ms": 2.269,
+"launches": 48
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.gate",
+"kernel": "nvjet_sm107_tss_224x128_64x10_1x8_2cta_v_bz_TNN",
+"excl_ms": 2.045,
+"busy_ms": 2.242,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.routed_expert_down_proj",
+"kernel": "nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN",
+"excl_ms": 1.724,
+"busy_ms": 1.724,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.q_b_proj",
+"kernel": "nvjet_sm107_tst_256x128_64x9_2x2f_2cta_h_bz_TNN",
+"excl_ms": 1.704,
+"busy_ms": 1.716,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.routed_output_transform",
+"kernel": "nvjet_sm107_tst_288x128_64x9_2x2f_2cta_h_badd_TNN",
+"excl_ms": 1.566,
+"busy_ms": 1.578,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "shardq_query_quant_kernel",
+"excl_ms": 1.557,
+"busy_ms": 1.557,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "router_kernel_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourcescommunicationnvlink_domaintoke",
+"excl_ms": 1.354,
+"busy_ms": 1.975,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe",
+"kernel": "vllm::moe::single_group_topk::detail::single_group_topk_block_kernel",
+"excl_ms": 1.332,
+"busy_ms": 1.332,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "nvjet_sm107_tst_256x192_64x7_2x1_2cta_Breuse_v_bz_NNT",
+"excl_ms": 1.288,
+"busy_ms": 1.294,
+"launches": 24
+},
+{
+"kind": "L0",
+"path": "mlp.gate_up_proj",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 1.059,
+"busy_ms": 1.061,
+"launches": 1
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn.f_b_proj",
+"kernel": "nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT",
+"excl_ms": 0.972,
+"busy_ms": 1.218,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "nvjet_sm107_tst_128x160_64x8_1x2_h_bz_NNT",
+"excl_ms": 0.97,
+"busy_ms": 0.988,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "reduce_bf16_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubininferencemegatopk",
+"excl_ms": 0.922,
+"busy_ms": 0.922,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer.wkv_index",
+"kernel": "nvjet_sm107_tst_128x160_64x11_2x4_2cta_h_bz_TNT",
+"excl_ms": 0.881,
+"busy_ms": 0.952,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn",
+"kernel": "gate_sigmoid_mul_kernel",
+"excl_ms": 0.857,
+"busy_ms": 0.857,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "_stage_kernel",
+"excl_ms": 0.819,
+"busy_ms": 0.819,
+"launches": 68
+},
+{
+"kind": "L0",
+"path": "self_attn.in_proj_qkvgfab",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 0.768,
+"busy_ms": 0.769,
+"launches": 1
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.gate",
+"kernel": "nvjet_sm107_tss_224x128_64x10_1x8_2cta_v_bz_TNN",
+"excl_ms": 0.734,
+"busy_ms": 0.804,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.routed_expert_norm",
+"kernel": "rms_norm_rows_kernel",
+"excl_ms": 0.667,
+"busy_ms": 0.667,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "device_kernel____tensorptri32gmemo1___tensorptri32gmemo1_tensorptri32gmemo1_tensorptri32gm",
+"excl_ms": 0.665,
+"busy_ms": 0.665,
+"launches": 24
+},
+{
+"kind": "top",
+"path": "draft.model.fc",
+"kernel": "nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN",
+"excl_ms": 0.572,
+"busy_ms": 0.572,
+"launches": 1
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer.wq_index",
+"kernel": "nvjet_sm107_tst_224x192_64x8_1x2_2cta_h_bz_TNN",
+"excl_ms": 0.559,
+"busy_ms": 0.57,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "c10d::symmetric_memory::multimem_barrier_kernel",
+"excl_ms": 0.558,
+"busy_ms": 0.558,
+"launches": 96
+},
+{
+"kind": "L0",
+"path": "mlp.down_proj",
+"kernel": "nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN",
+"excl_ms": 0.536,
+"busy_ms": 0.536,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "ncclDevKernel_AllGather_RING",
+"excl_ms": 0.477,
+"busy_ms": 0.477,
+"launches": 2
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "ncclDevKernel_ReduceScatter_bf16_RING",
+"excl_ms": 0.474,
+"busy_ms": 0.474,
+"launches": 1
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe",
+"kernel": "vllm::moe::single_group_topk::detail::single_group_topk_block_kernel",
+"excl_ms": 0.471,
+"busy_ms": 0.471,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "_mxfp4_k_norm_quant_insert_kernel",
+"excl_ms": 0.462,
+"busy_ms": 0.462,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "Memcpy DtoD ",
+"excl_ms": 0.403,
+"busy_ms": 0.403,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "-",
+"kernel": "c10d::symmetric_memory::multimem_barrier_kernel",
+"excl_ms": 0.399,
+"busy_ms": 0.399,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "sparse_mla_index_remap_kernel",
+"excl_ms": 0.394,
+"busy_ms": 0.394,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "_stage_kernel",
+"excl_ms": 0.29,
+"busy_ms": 0.29,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.q_a_layernorm",
+"kernel": "rms_norm_rows_kernel",
+"excl_ms": 0.278,
+"busy_ms": 0.278,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "c10d::symmetric_memory::multimem_barrier_kernel",
+"excl_ms": 0.273,
+"busy_ms": 0.273,
+"launches": 48
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.mla_attn.mla_attn",
+"kernel": "shardq_kv_insert_kernel",
+"excl_ms": 0.256,
+"busy_ms": 0.256,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "at::native::vectorized_gather_kernel",
+"excl_ms": 0.25,
+"busy_ms": 0.25,
+"launches": 48
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "scatter_rows_kernel",
+"excl_ms": 0.244,
+"busy_ms": 0.244,
+"launches": 68
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRsAr_object_at__cutlasscutenvgpu",
+"excl_ms": 0.242,
+"busy_ms": 0.242,
+"launches": 1
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "block_sparse_moe.routed_expert_norm",
+"kernel": "rms_norm_rows_kernel",
+"excl_ms": 0.237,
+"busy_ms": 0.237,
+"launches": 24
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "_gather_initial_states_kernel",
+"excl_ms": 0.234,
+"busy_ms": 0.272,
+"launches": 68
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "_mxfp4_q_quant_kernel",
+"excl_ms": 0.224,
+"busy_ms": 0.224,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "dcp_shardq_rank_major_pack_kernel",
+"excl_ms": 0.218,
+"busy_ms": 0.218,
+"launches": 24
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "_Z25_flash_kda_fwd_recurrenceIN4cute9TiledCopyINS0_9Copy_AtomIJNS0_11Copy_TraitsINS0_13SM9",
+"excl_ms": 0.204,
+"busy_ms": 0.204,
+"launches": 1
+},
+{
+"kind": "L0",
+"path": "-",
+"kernel": "_push_shard_kernel",
+"excl_ms": 0.194,
+"busy_ms": 0.194,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN",
+"excl_ms": 0.187,
+"busy_ms": 0.188,
+"launches": 1
+},
+{
+"kind": "draft",
+"path": "self_attn.attn",
+"kernel": "flash::flash_fwd_splitkv_kernel",
+"excl_ms": 0.182,
+"busy_ms": 0.182,
+"launches": 5
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "vllm::rms_norm_kernel",
+"excl_ms": 0.18,
+"busy_ms": 0.18,
+"launches": 2
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "self_attn",
+"kernel": "at::native::transpose_copy_tiled_kernel",
+"excl_ms": 0.179,
+"busy_ms": 0.179,
+"launches": 68
+},
+{
+"kind": "L0",
+"path": "mlp.act_fn",
+"kernel": "situ_and_mul_vec8_kernel",
+"excl_ms": 0.171,
+"busy_ms": 0.171,
+"launches": 1
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "vllm::cp_gather_indexer_k_quant_cache_kernel",
+"excl_ms": 0.167,
+"busy_ms": 0.424,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.kv_a_layernorm",
+"kernel": "rms_norm_rows_kernel",
+"excl_ms": 0.16,
+"busy_ms": 0.16,
+"launches": 24
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "vllm::reshape_and_cache_flash_kernel",
+"excl_ms": 0.149,
+"busy_ms": 0.149,
+"launches": 5
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "dcp_shardq_rank_major_signal_kernel",
+"excl_ms": 0.133,
+"busy_ms": 0.133,
+"launches": 24
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "-",
+"kernel": "c10d::symmetric_memory::multimem_barrier_kernel",
+"excl_ms": 0.131,
+"busy_ms": 0.131,
+"launches": 24
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "at::native::vectorized_elementwise_kernel",
+"excl_ms": 0.081,
+"busy_ms": 0.081,
+"launches": 5
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "_flash_kda_fwd_prepare",
+"excl_ms": 0.08,
+"busy_ms": 0.08,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "at::native::CatArrayBatchedCopy_vectorized",
+"excl_ms": 0.078,
+"busy_ms": 0.078,
+"launches": 1
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "deep_gemm::sm100_mqa_logits",
+"excl_ms": 0.069,
+"busy_ms": 9.291,
+"launches": 24
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel",
+"excl_ms": 0.067,
+"busy_ms": 0.072,
+"launches": 1
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "k3conv::qkv_conv_kernel",
+"excl_ms": 0.064,
+"busy_ms": 0.064,
+"launches": 1
+},
+{
+"kind": "draft",
+"path": "drafter/propose",
+"kernel": "flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+"excl_ms": 0.061,
+"busy_ms": 0.072,
+"launches": 9
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "at::native::elementwise_kernel",
+"excl_ms": 0.06,
+"busy_ms": 0.06,
+"launches": 15
+},
+{
+"kind": "draft",
+"path": "mlp.gate_up_proj",
+"kernel": "nvjet_sm107_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT",
+"excl_ms": 0.052,
+"busy_ms": 0.065,
+"launches": 5
+},
+{
+"kind": "KimiK3DSAAttention",
+"path": "self_attn.dsa_indexer",
+"kernel": "at::native::vectorized_elementwise_kernel",
+"excl_ms": 0.048,
+"busy_ms": 0.048,
+"launches": 24
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "vllm::rotary_embedding_kernel",
+"excl_ms": 0.046,
+"busy_ms": 0.046,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "nvjet_sm107_tst_256x16_64x9_4x1_2cta_Breuse_v_bz_TNT",
+"excl_ms": 0.045,
+"busy_ms": 0.045,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "nvjet_sm107_tst_192x8_64x12_4x1f_v_bz_TNT",
+"excl_ms": 0.044,
+"busy_ms": 0.044,
+"launches": 3
+},
+{
+"kind": "L0",
+"path": "-",
+"kernel": "sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel",
+"excl_ms": 0.043,
+"busy_ms": 0.048,
+"launches": 2
+},
+{
+"kind": "top",
+"path": "-",
+"kernel": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+"excl_ms": 0.043,
+"busy_ms": 0.043,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "Memcpy DtoD ",
+"excl_ms": 0.037,
+"busy_ms": 0.037,
+"launches": 1
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "_kda_rmsnorm_gated_kernel",
+"excl_ms": 0.035,
+"busy_ms": 0.035,
+"launches": 1
+},
+{
+"kind": "draft",
+"path": "mlp.down_proj",
+"kernel": "nvjet_sm107_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT",
+"excl_ms": 0.032,
+"busy_ms": 0.034,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "self_attn.qkv_proj",
+"kernel": "nvjet_sm107_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT",
+"excl_ms": 0.024,
+"busy_ms": 0.037,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "self_attn.o_proj",
+"kernel": "nvjet_sm107_tst_64x16_64x16_2x1_2cta_v_bz_TNT",
+"excl_ms": 0.023,
+"busy_ms": 0.023,
+"launches": 5
+},
+{
+"kind": "L0",
+"path": "-",
+"kernel": "c10d::symmetric_memory::multimem_barrier_kernel",
+"excl_ms": 0.019,
+"busy_ms": 0.019,
+"launches": 2
+},
+{
+"kind": "draft",
+"path": "self_attn.rotary_emb",
+"kernel": "vllm::rotary_embedding_kernel",
+"excl_ms": 0.014,
+"busy_ms": 0.014,
+"launches": 5
+},
+{
+"kind": "L0",
+"path": "self_attn.f_b_proj",
+"kernel": "nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT",
+"excl_ms": 0.014,
+"busy_ms": 0.018,
+"launches": 1
+},
+{
+"kind": "draft",
+"path": "self_attn.q_norm",
+"kernel": "vllm::rms_norm_kernel",
+"excl_ms": 0.013,
+"busy_ms": 0.013,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "mlp.gate_up_proj",
+"kernel": "cublasLt::splitKreduce_kernel",
+"excl_ms": 0.013,
+"busy_ms": 0.019,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "self_attn.k_norm",
+"kernel": "vllm::rms_norm_kernel",
+"excl_ms": 0.012,
+"busy_ms": 0.012,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "self_attn.attn",
+"kernel": "vllm::reshape_and_cache_flash_kernel",
+"excl_ms": 0.012,
+"busy_ms": 0.012,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "mlp.down_proj",
+"kernel": "cublasLt::splitKreduce_kernel",
+"excl_ms": 0.012,
+"busy_ms": 0.017,
+"launches": 5
+},
+{
+"kind": "draft",
+"path": "mlp.act_fn",
+"kernel": "vllm::act_and_mul_kernel",
+"excl_ms": 0.012,
+"busy_ms": 0.012,
+"launches": 5
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "at::native::reduce_kernel",
+"excl_ms": 0.011,
+"busy_ms": 0.011,
+"launches": 3
+},
+{
+"kind": "draft",
+"path": "self_attn.qkv_proj",
+"kernel": "cublasLt::splitKreduce_kernel",
+"excl_ms": 0.01,
+"busy_ms": 0.016,
+"launches": 5
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "at::native::indexSelectSmallIndex",
+"excl_ms": 0.008,
+"busy_ms": 0.008,
+"launches": 3
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "_gumbel_sample_kernel",
+"excl_ms": 0.008,
+"busy_ms": 0.008,
+"launches": 3
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "at::native::_scatter_gather_elementwise_kernel",
+"excl_ms": 0.007,
+"busy_ms": 0.007,
+"launches": 3
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+"excl_ms": 0.007,
+"busy_ms": 0.008,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "draft.model.embed_tokens",
+"kernel": "flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+"excl_ms": 0.006,
+"busy_ms": 0.006,
+"launches": 1
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "scatter_rows_kernel",
+"excl_ms": 0.004,
+"busy_ms": 0.004,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "_prepare_dflash_inputs_kernel",
+"excl_ms": 0.003,
+"busy_ms": 0.005,
+"launches": 1
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "_gather_initial_states_kernel",
+"excl_ms": 0.003,
+"busy_ms": 0.004,
+"launches": 1
+},
+{
+"kind": "draft",
+"path": "input_layernorm",
+"kernel": "vllm::rms_norm_kernel",
+"excl_ms": 0.003,
+"busy_ms": 0.003,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "at::native::index_elementwise_kernel",
+"excl_ms": 0.003,
+"busy_ms": 0.003,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "draft.model.embed_tokens",
+"kernel": "vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+"excl_ms": 0.003,
+"busy_ms": 0.003,
+"launches": 1
+},
+{
+"kind": "L0",
+"path": "self_attn",
+"kernel": "at::native::transpose_copy_tiled_kernel",
+"excl_ms": 0.003,
+"busy_ms": 0.003,
+"launches": 1
+},
+{
+"kind": "KimiK3DeltaAttention",
+"path": "block_sparse_moe.experts",
+"kernel": "Memcpy DtoH ",
+"excl_ms": 0.002,
+"busy_ms": 0.002,
+"launches": 1
+},
+{
+"kind": "top",
+"path": "drafter/propose",
+"kernel": "at::native::vectorized_gather_kernel",
+"excl_ms": 0.002,
+"busy_ms": 0.002,
+"launches": 1
+}
+]

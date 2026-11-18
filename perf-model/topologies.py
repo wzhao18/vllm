@@ -94,6 +94,24 @@ PREFILL = [
                    dsa_attn="owner, KV once", moe_dense="SP-local rep W", experts="EP64 rack-wide, O2 dedup + pre-combine",
                    lm_head="vocab/2", drafter="TP2, ctx K/V last 2048 rows only"),
          comm="69 x AG+RS (N=2) + 24 x push + 92 x deduped EP"),
+    Topo("P6-16", "P6 LTP: TP2 KDA + DSA-DP, EP16 + dedup", "prefill", 2, "sp", "dsadp", "rep", 16, dedup=True,
+         proposal="P6",
+         mapping=M(kda="head-TP2 with SP", mla="DSA-DP over the pair", indexer="owner", dsa_attn="owner, KV once",
+                   moe_dense="SP-local rep W", experts="EP16 (8 pairs), O2 dedup + pre-combine", lm_head="vocab/2",
+                   drafter="TP2, ctx K/V last 2048 rows only"),
+         comm="69 x AG+RS (N=2) + 24 x push + 92 x deduped EP16"),
+    Topo("P6-4-16", "P6 LTP: TP4 KDA + DSA-DP, EP16 + dedup", "prefill", 4, "sp", "dsadp", "rep", 16, dedup=True,
+         proposal="P6",
+         mapping=M(kda="head-TP4 with SP", mla="DSA-DP over 4", indexer="owner", dsa_attn="owner, KV once",
+                   moe_dense="SP-local rep W", experts="EP16 (4 groups), O2 dedup + pre-combine", lm_head="vocab/4",
+                   drafter="TP4"),
+         comm="69 x AG+RS (N=4) + 24 x push + 92 x deduped EP16"),
+    Topo("P9-16", "P9 DSA-CP: DEP16 + ShardQ DCP16 on DSA layers", "prefill", 1, "dep", "dsacp", "rep", 16, G=16,
+         proposal="P9",
+         mapping=M(kda="local", mla="local rows, KV t mod 16 over 16 GPUs", indexer="local rows vs gathered ctx",
+                   dsa_attn="DCP16 KV, context gathered per DSA layer", moe_dense="local", experts="EP16",
+                   lm_head="full", drafter="local"),
+         comm="EP16 + per-DSA-layer context gather from 16 GPUs"),
     Topo("P7", "P7 PP4 x DEP16 (stage = ~23 layers)", "prefill", 1, "dep", "local", "rep", 16, S=4, proposal="P7",
          mapping=M(kda="local (stage layers)", mla="local", indexer="local", dsa_attn="local, stage layers only",
                    moe_dense="local", experts="EP16 per stage (each GPU 1/64 of experts)", lm_head="last stage", drafter="last stage"),
@@ -147,6 +165,26 @@ DECODE = [
     Topo("D8", "D8 TP16+DCP16, TP-dense, EP64", "decode", 16, "tp", "dcp", "tp", 64, proposal="D8",
          mapping=M(kda="head-TP16 + AR", mla="as D1", indexer="DCP16 + merge", dsa_attn="DCP16", moe_dense="TP16 (front AG + AR)",
                    experts="EP64 (4 attention groups)", lm_head="vocab/16", drafter="TP16"), comm="AR + DCP16 + front AG + EP64"),
+    # ---- EP <= 16 re-scope (2026-11-18): same layer-typed layouts with the EP domain capped at 16 GPUs (4 nodes)
+    Topo("D7-4-16", "D7 TP4 DSA-DP, TP-dense, EP16", "decode", 4, "sp", "dsadp", "tp", 16, proposal="D7",
+         mapping=M(kda="head-TP4 + SP", mla="DSA-DP over 4", indexer="owner", dsa_attn="owner, KV once",
+                   moe_dense="router/latent/shared TP4 (AG+RS)", experts="EP16 (4 attention groups, 56 experts/GPU)",
+                   lm_head="vocab/4", drafter="TP4"),
+         comm="KDA AG+RS + DSA push + MoE-dense AG/RS + EP16"),
+    Topo("D7-2-16", "D7 TP2 DSA-DP, TP-dense, EP16", "decode", 2, "sp", "dsadp", "tp", 16, proposal="D7",
+         mapping=M(kda="head-TP2", mla="DSA-DP over 2", indexer="owner", dsa_attn="owner", moe_dense="TP2",
+                   experts="EP16 (8 attention groups)", lm_head="vocab/2", drafter="TP2"), comm="as D7-4-16 with N=2"),
+    Topo("D7-8-16", "D7 TP8 DSA-DP, TP-dense, EP16", "decode", 8, "sp", "dsadp", "tp", 16, proposal="D7",
+         mapping=M(kda="head-TP8", mla="DSA-DP over 8", indexer="owner", dsa_attn="owner", moe_dense="TP8",
+                   experts="EP16 (2 attention groups)", lm_head="vocab/8", drafter="TP8"), comm="as D7-4-16 with N=8"),
+    Topo("D8-16", "D8 TP16+DCP16, TP-dense, EP16", "decode", 16, "tp", "dcp", "tp", 16, proposal="D8",
+         mapping=M(kda="head-TP16 + AR", mla="as D1", indexer="DCP16 + merge", dsa_attn="DCP16",
+                   moe_dense="TP16 (router/latent transposes + AR)", experts="EP16 (same 16 GPUs, 56 experts/GPU)",
+                   lm_head="vocab/16", drafter="TP16"), comm="AR + DCP16 + MoE-dense transposes + EP16"),
+    Topo("D9-16", "D9 DSA-CP: DEP16 + DCP16 on DSA", "decode", 1, "dep", "dsacp", "rep", 16, G=16, proposal="D9",
+         mapping=M(kda="local", mla="local rows", indexer="own key shard of 16 GPUs' requests + merge",
+                   dsa_attn="DCP16 KV", moe_dense="local", experts="EP16", lm_head="full", drafter="local"),
+         comm="EP16 + DCP16 on 24 DSA layers"),
     Topo("D9", "D9 DSA-CP: DEP64 + DCP16 on DSA", "decode", 1, "dep", "dsacp", "rep", 64, G=16, proposal="D9",
          mapping=M(kda="local", mla="local rows", indexer="own key shard of 16 GPUs' requests + merge", dsa_attn="DCP16 KV",
                    moe_dense="local", experts="EP64", lm_head="full", drafter="local"), comm="EP + DCP16 on 24 DSA layers"),
@@ -161,6 +199,18 @@ DECODE = [
 ]
 
 ALL = {t.id: t for t in PREFILL + DECODE}
+
+EP_MAX = 16      # 2026-11-18 scope: EP <= 16, at most 16 GPUs (4 VR200 nodes) per engine / EP domain
+
+
+def in_scope(t, ep_max=EP_MAX):
+    """True when the topology fits the EP <= 16 / <= 16-GPU scope (MoE-TP D1 has no EP domain; AFD and PP4 exceed it)."""
+    if t.afd or t.gpus > ep_max:
+        return False
+    return t.experts == "tp" or t.E <= ep_max
+
+
+SCOPE = [t.id for t in PREFILL + DECODE if in_scope(t)]
 
 
 # ---------------------------------------------------------------------------------------------- per-op sharding
