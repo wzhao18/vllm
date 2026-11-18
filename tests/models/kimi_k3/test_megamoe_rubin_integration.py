@@ -254,7 +254,12 @@ def test_decode_bucket_admits_every_shipped_inference_record(world, kind, tokens
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind=kind)
     buckets, _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=False)
-    assert [b.max_tokens for b in buckets] == [256, tokens]
+    decode = (
+        X.RUBIN_WIDE_EP_DECODE_TOKENS
+        if world in X.RUBIN_INFERENCE_ONLY_EP_SIZES
+        else 256
+    )
+    assert [b.max_tokens for b in buckets] == [decode, tokens]
     C.RubinMoeConfig.make(problem, buckets[0], rank=0, world_size=world)
 
 
