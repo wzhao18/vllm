@@ -68,7 +68,7 @@ a{color:var(--accent)}
 <div class="kpi"><div class="v">6 / 8</div><div class="l">Baseline points with AgentX measured: C1, C64, C48, C128, C16, C72 (C16 and C72 gsm8k running). C160 and C512 are waiting for holds.</div></div>
 <div class="kpi"><div class="v">73.7K</div><div class="l">Max throughput, tok/s/GPU at interactivity 80 (frozen C512). Release re-run pending.</div></div>
 <div class="kpi"><div class="v">+15% to +29%</div><div class="l">Interactivity gain of the release draft at the measured points; throughput +1 to +4%.</div></div>
-<div class="kpi"><div class="v">0.979-0.980</div><div class="l">gsm8k strict, real rejection: C1 0.9795, C64 0.9803, C48 0.9788, C128 0.9788.</div></div>
+<div class="kpi"><div class="v">0.978-0.980</div><div class="l">gsm8k strict, real rejection: C1 0.9795, C64 0.9803, C48 0.9788, C128 0.9788, C16 0.9780.</div></div>
 </div>
 
 <h2>Rules</h2>
@@ -127,7 +127,7 @@ a{color:var(--accent)}
 <tr><td>C64</td><td>1P1D (24)</td><td><span class="pill done">done</span></td><td class="n">20,778 → 21,527 <span class="up">+3.6%</span></td><td class="n">233 → 300 <span class="up">+28.9%</span></td><td class="n">0.9803</td><td class="n">4.81 (7)</td></tr>
 <tr><td>C48 1P1D</td><td>1P1D (24)</td><td><span class="pill done">done</span></td><td class="n">15,544 → 15,934 <span class="up">+2.5%</span></td><td class="n">296 → 367 <span class="up">+24.0%</span></td><td class="n">0.9788</td><td class="n">4.79 (7)</td></tr>
 <tr><td>C128 1P1D</td><td>1P1D, k3 (24)</td><td><span class="pill done">done</span></td><td class="n">32,194 → 33,119 <span class="up">+2.9%</span></td><td class="n">185 → 212 <span class="up">+14.9%</span></td><td class="n">0.9788</td><td class="n">3.29 (3)</td></tr>
-<tr><td>C16 1P2D</td><td>1P2D, k7 (40)</td><td><span class="pill run">gsm8k running</span></td><td class="n">3,104 → 3,162 <span class="up">+1.9%</span></td><td class="n">601 → 702 <span class="up">+16.8%</span></td><td class="n">running</td><td class="n">-</td></tr>
+<tr><td>C16 1P2D</td><td>1P2D, k7 (40)</td><td><span class="pill done">done</span></td><td class="n">3,104 → 3,162 <span class="up">+1.9%</span></td><td class="n">601 → 702 <span class="up">+16.8%</span></td><td class="n">0.9780</td><td class="n">4.75 (7)</td></tr>
 <tr><td>C72 1P3D</td><td>1P3D, k7 (56)</td><td><span class="pill run">gsm8k running</span></td><td class="n">10,221 → 10,460 <span class="up">+2.3%</span></td><td class="n">397 → 498 <span class="up">+25.3%</span></td><td class="n">running</td><td class="n">-</td></tr>
 <tr><td>C160 1P1D llh</td><td>1P1D, k3 (24)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">39,734 → -</td><td class="n">162 → -</td><td class="n">-</td><td class="n">-</td></tr>
 <tr><td>C512</td><td>1P1D hybrid: P and D DP4 x (TP4+DCP4), EP16 (32)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">73,736 → -</td><td class="n">80 → -</td><td class="n">0.9803*</td><td class="n">3.25 (3)*</td></tr>
