@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-MOE agent (workflow)",
  "state": "measuring",
- "updated": "2026-11-18T13:45-08:00",
+ "updated": "2026-11-18T14:20-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), SP shard = 96 MoE tokens per GPU, 28 local experts, top-16, L~135K, k=3",
  "baseline_ms": 8.3,
  "current_ms": 8.3,
@@ -66,9 +66,24 @@
    "t": "13:40",
    "what": "FI multi-rank bench at EP4",
    "result": "not runnable in the K3.1 image (FI current provider needs nvshmem4py); multi-GPU work goes through the vendored megamoe_rubin (torch symmetric memory) instead"
+  },
+  {
+   "t": "14:00",
+   "what": "single-call stamps (eager, warm) at T96 1 GPU: when does the weight stream start / end per CTA",
+   "result": "router 0-2.9 us; sizes ready 3.3; first work published 5.0 us median (max 9.0); first weight TMA 5.6 median (max 10.1); last MMA end 32.8/36.7/41.4 us min/med/max (8.6 us CTA imbalance); epilogue end 39.8/41.5; tail barrier end 42.9-44.7. => ~5.5 us front before streaming + ~8 us end imbalance + ~3 us tail + separate reduce"
+  },
+  {
+   "t": "14:10",
+   "what": "knob sweep (full default knobs + one override) at T4/32/96/128, 1 GPU",
+   "result": "base 43.7/45.4/48.2/52.1 us; M128 tiles +0.7-1 us; cluster 2x1 / no fallback CGA = same; N64 rejected by the kernel (fc2_tma_stages). Knobs do not move it: the fixes are kernel-structural (front, tail balance, side kernels)"
+  },
+  {
+   "t": "14:15",
+   "what": "INFRA 1-node step baseline (L24, deep_gemm fp8_fp4 MegaMoE, 28 experts/GPU emulation)",
+   "result": "MegaMoE family r8/r16/r24 = 1937/2671/3423 us per 23 layers = 84/116/149 us/layer vs FI a368c5f66 1-GPU 45/~47/48 us/layer -> the re-vendor + kimi_k3_mega_moe backend is the first big lever; step B queued (runs/D-MOE/step_d/kmm-mx-r8r16r24-prof)"
   }
  ],
- "next": "v1 (vendored megamoe_rubin unit tests + EP4 112-expert bench), b0 EP4 + MX; profiler probe; then in-kernel phase timing (clock stamps) to split the ~18 us fixed latency",
+ "next": "step_d B (kimi_k3_mega_moe, re-vendored) vs INFRA base A; vendored unit tests + EP4 bench (v1); EP4 stamps (vs1) for the dispatch/combine phases; then entry weight-prefetch + tail balancing in the kernel",
  "blockers": "",
  "branch": "wzhao/k31ws-d-moe @ c52b0d8c7e",
  "evidence": [

@@ -4,21 +4,21 @@
  "side": "prefill",
  "owner": "P-MLA workflow agent",
  "state": "implementing",
- "updated": "2026-11-18T13:55-08:00",
- "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, 96 heads/GPU, top-2048, FP8 KV 576 B rows; 24 DSA layers",
- "step_ms": 825,
- "baseline_ms": 67,
- "current_ms": 66.6,
- "achievable_ms": 15.9,
- "target_ms": 17.5,
- "basis": "MEASURED standalone per layer at F16K x 24 (runs/P-MLA/run1,run5,run8: trtllm-gen 2.08 ms + quant 0.204 + pad 0.175 + insert 0.042 + gate 0.129 = 2.63 ms/layer = 63 ms/step; in-step F8K x2 = 67); model ach 15.9 (optables nvfp4_modelopt|P3-16|prefill); measured gather floor implies ~26 ms/step (model omits the per-token gather)",
+ "updated": "2026-11-18T14:05-08:00",
+ "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
+ "step_ms": 218.7,
+ "baseline_ms": 12.24,
+ "current_ms": 12.24,
+ "achievable_ms": 3.86,
+ "target_ms": 4.25,
+ "basis": "MEASURED in-step NVFP4 baseline (INFRA 17:48, wzhao/k31ws-int b31121cf56, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; measured/20261118-1805-nvfp4-prefill.json); achievable = nvfp4_modelopt model at the same slice",
  "gap_analysis": "Per F16K layer (1 GPU, run1): trtllm-gen sparse MLA 2129.5 us (3.29 PF on the 96 real heads; model 643), quant 204.1 + head pad 173.4 + KV insert 42.0 (model prologue 10.9), gate_mul 128.8 (model 7.7). Hardware probes (run2/run3): tcgen05 FP8 2x-K MMA reaches the full rate only with A in TMEM; every SMEM operand byte costs 1/128 clk (128 B/clk/SM operand fetch, measured flat across N and majorness), so both-operands-in-SMEM forms (keys-on-M / transposed) cap at 43% (N=96). TMA writes into SMEM at about 55 B/clk do not slow a full-rate TS MMA (no read/write contention measured). TMA tile::gather4 is issue-bound at about 56 clk per instruction per issuing warp: 1/2/4 warps reach 4.1/7.0/10.9 TB/s of 576 B row gathers; plain LDG gathers reach 18.2 TB/s (1064 us per F16K layer). The per-token gather (2048 rows x 576 B = 19.3 GB per F16K layer, L2->SM) is not in the model (kv_B counts 135 MB of unique KV), and neither is the SMEM operand traffic (36.5 GB per layer at 128 B/clk/SM = 565 us). The stock kernel's 2-CTA HVPerCta256 layout most likely re-gathers V (about 1.9x the minimum gather bytes; inferred from its name and FlashMLA's documented equivalent, ncu is not in the image), which at the measured gather rates explains its 2.1 ms. Measured gather floor (run4): ~18 TB/s for random 576 B rows -> sparse_mla cannot go below ~1.07 ms/layer (25.7 ms/step at F16K) with one gather per token-row; the model (643 us/layer) misses this term. Proposed corrected achievable for the family: 24 x (1.07 + 0.019) = ~26 ms/step (model fix pending owner review).",
  "inefficiencies": [
-  "Stock trtllm-gen kernel: 2-CTA M128 (heads padded 96->128), V re-gathered per CTA half -> about 1.9x the minimum L2->SM bytes; gather-bound (HYPOTHESIS from name + timing; ncu unavailable)",
-  "Perf model omits the per-token KV row gather (19.3 GB/layer at F16K) and the SMEM operand traffic: true floor is max(MMA 566 us at 128 padded rows, SMEM reads 565 us, gather 19.3 GB / L2 rate) per layer",
-  "Query quant and head pad are two separate full passes because the in-place RoPE concat disables the fused quant_pad kernel (MEASURED 377 us/layer at F16K; fix implemented on the branch, measuring)",
-  "gate_mul is a separate pass over [T, 12288] BF16 (MEASURED 129 us/layer)",
-  "FlashInfer prims_ts sparse MLA refuses sm_107 in this image: no drop-in alternative"
+  "Stock trtllm-gen kernel: 2-CTA M128, heads padded 96->128, V half likely re-gathered per CTA -> ~2x the minimum L2->SM gather bytes; its 2.08 ms/layer matches 2x the measured ~1.07 ms gather floor (inference, no ncu in the image)",
+  "Perf model omits the per-token KV row gather: F16K layer gathers 19.3 GB at a measured ~18 TB/s floor (LDG and TMA gather4 alike; die-local KV placement makes no difference) -> ~1.07 ms/layer, 1.67x the model sparse_mla achievable",
+  "Query quant + head pad: two passes (378 us/layer); the one-kernel Triton concat+quant+pad is slower at 16K rows (422 us); a native-96-head attention kernel removes the pad pass (174 us/layer)",
+  "gate_mul separate pass over [T, 12288] BF16 (129 us/layer; target: w_uv batched GEMM epilogue)",
+  "New keys-on-M kernel: correct but ~8.8K clk per 128-key tile (2.2x slower than stock); per-tile serial chain not yet traced (HYPOTHESIS: one tile of gathers in flight with 2 KV stages held QK->softmax->PV)"
  ],
  "rubin_features": [
   "tcgen05 FP8 kind::f8f6f4 with the Rubin 2x-K instruction descriptor",
@@ -92,16 +92,27 @@
    "t": "13:55",
    "what": "run9 queued: realistic logit scale (qmag 0.15 -> ~2.4 log2 std) and softmax shift variants (P_PRE, THR) = (7,1), (4,4.5), (0,8) to cut the lazy-max slow path; stock-precision test now compares both kernels to FP32 (ours <= 1.25x stock error)",
    "result": "pending"
+  },
+  {
+   "t": "14:05",
+   "what": "run9: tests + F16K bench at realistic logit scale (qmag 0.15) with softmax shift variants",
+   "result": "5/5 tests pass (incl. no-worse-than-stock precision vs FP32). Best 4.60 ms/layer ((P_PRE,THR)=(4,4.5), 3 cp.async loaders, base order) vs trtllm-gen 2.08; (7,1) 5.75; pipelined 4.87; TMA gather4 x4 5.53. Dispatch kept off (DISPATCH=False)."
+  },
+  {
+   "t": "15:20",
+   "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
+   "result": "sparse MLA 12.24 vs 3.86 (x3.17)"
   }
  ],
- "next": "run9 results: pick softmax shift + loader variant; then per-phase clock64 trace of the kernel to find the 11K clk/tile serial chain (softmax slow path vs loader vs MMA waits); target first ~2.6K clk/tile (gather-bound)",
- "blockers": "ncu/nsys are not in the image (/usr/local/cuda/bin): root causes are from probes and timing, labelled where inferred",
- "branch": "wzhao/k31ws-p-mla @ c3e6038c74 (+ softmax-shift/variant edits uncommitted; pushed to wzhao18)",
+ "next": "HANDOFF: (1) add clock64 phase stamps (loader issue/land, QK issue/S ready, softmax done, PV done) to SparseMlaPrefill and run benchmark_kimi_k3_prefill_sparse_mla.py --tokens 16384 --qmag 0.15 --loaders 3:0:0:0:1 on 1 GPU (wsgpu -g 1); (2) if gathers in flight are the limit: 3 KV stages via the oversized SMEM carveout (check the CuTe DSL 4.8 launch attribute) or release the RoPE/K part after QK; (3) alternatively build the hwdb-recommended heads-on-M form: 2-CTA M128 (64 heads/CTA incl. pad), Q in TMEM (.ts), O folded 256 cols/CTA, gather each row once (multicast to the pair), target the ~1.07 ms gather floor; (4) then w_uv+gate_mul fused GEMM; (5) set DISPATCH=True only when the kernel beats trtllm-gen at F8K/F16K, step A/B, landed-ready. Commands: stage with mkov.sh <wt> p-mla-<sha>-<n>; scripts in runs/P-MLA/pmla_run*.sh (pytest needs --noconftest: tblib missing in the image).",
+ "blockers": "ncu/nsys not in the image (phase timing must come from in-kernel clock64 stamps); pool contended (1-GPU runs waited 30-60 min)",
+ "branch": "wzhao/k31ws-p-mla @ db27679958 (pushed to wzhao18)",
  "evidence": [
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1 (stock chain)",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run2 (MMA operand fetch, LDG gather)",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run3 (SMEM contention, gather4)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1 (stock chain per kernel)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run2, run3 (tcgen05 operand fetch, SMEM write contention, gather4 1-4 warps)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run4, run5 (gather4 8/16 warps; die-local vs striped)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run8, run9 (specialized kernel tests + F16K bench)",
   "k31ws/findings/P-MLA.md"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }

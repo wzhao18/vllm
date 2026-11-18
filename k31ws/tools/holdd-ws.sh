@@ -20,25 +20,31 @@ est() {  # est <acct> <part> <nodes> <time> [time-min]: epoch of estimated start
   local s; s=$(cd $K/pool && sbatch --test-only -A $1 -p $2 -N $3 --segment=$3 --exclusive -t $4 ${5:+--time-min=$5} \
     --wrap "sleep 1" 2>&1 | grep -oE "start at [0-9T:-]+" | awk '{print $3}')
   [ -n "$s" ] && date -d "$s" +%s || echo 9999999999; }
-sub() {  # sub <class hold1|hold8> <nodes>
+sub() {  # sub <class hold1|hold8> <nodes> [batch|backfill|auto]
   local a now eb ef part t tmin out
   a=$(best_acct); now=$(date +%s)
   eb=$(est $a batch $2 5:00:00); ef=$(est $a backfill $2 8:00:00 2:00:00)
-  if (( eb - now <= 3600 )) || (( eb <= ef )); then part=batch; t=5:00:00; tmin=2:00:00; else part=backfill; t=8:00:00; tmin=2:00:00; fi
+  if [ "$3" = batch ] || { [ "${3:-auto}" = auto ] && { (( eb - now <= 3600 )) || (( eb <= ef )); }; }; then part=batch; t=5:00:00; tmin=2:00:00
+  else part=backfill; t=8:00:00; tmin=2:00:00; fi
   out=$(cd $K/pool && sbatch -A $a -p $part -N $2 --segment=$2 --exclusive -t $t --time-min=$tmin -J $a-k31ws.$1 \
     -o $K/pool/logs/$1-%j.out --wrap "hostname; sleep 30000" 2>&1 | grep -i submitted)
   log "request $1 ${2}n $a $part $t (est batch $(date -d @$eb +%H:%M) backfill $(date -d @$ef +%H:%M)): $out"; }
 cnt() { squeue -h -u $USER -t $2 -o %j 2>/dev/null | grep -c -- "-k31ws\.$1$"; }
+cntp() { squeue -h -u $USER -t $2 -p $3 -o %j 2>/dev/null | grep -c -- "-k31ws\.$1$"; }  # cntp <class> <state> <partition>
 declare -A WARM
 last1=0
 log "holdd-ws start pid $$"
 while :; do
-  T1=6; P1=3; C1=300; T8=1; IDLE_MIN=60; IDLE8_MIN=120
+  T1=6; P1=3; C1=300; T8=1; TB=6; IDLE_MIN=1000000; IDLE8_MIN=1000000
   [ -f $K/pool/holdd.conf ] && . $K/pool/holdd.conf
   now=$(date +%s)
   if [ ! -f $K/pool/STOP ]; then
     r1=$(cnt hold1 R); p1=$(cnt hold1 PD)
     if (( r1 + p1 < T1 )) && (( p1 < P1 )) && (( now - last1 >= C1 )); then sub hold1 1; last1=$now; fi
+    # backfill holds are preempted ~30 min after start (FAST 2026-11-18): always keep TB non-preemptible batch
+    # 1-node holds running+pending in addition, so the pool has a stable core when the batch queue reaches them.
+    rb=$(cntp hold1 R batch); pb=$(cntp hold1 PD batch)
+    (( rb + pb < TB )) && sub hold1 1 batch
     r8=$(cnt hold8 R); p8=$(cnt hold8 PD)
     (( r8 + p8 < T8 )) && sub hold8 8
   fi

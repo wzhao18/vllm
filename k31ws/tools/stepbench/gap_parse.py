@@ -99,7 +99,7 @@ def exposed(labeled):
 
 def seg_type(names):
     j = " ".join(names)
-    if "mega_moe" in j:
+    if "mega_moe" in j or "megamoe" in j:  # deep_gemm mega_moe or the vendored megamoe_rubin (kimi_k3_mega_moe)
         return "MOE"
     if "kdawide" in j or re.search(r"kda", j) and "draft" not in j:
         return "KDA"
@@ -131,7 +131,7 @@ def assign(seg, stype):
             g = "WAIT"
         elif stype == "TAIL":
             g = "TAIL.drafter+final"
-        elif "mega_moe" in n or "megamoe_situ" in n:
+        elif "mega_moe" in n or "megamoe" in n or (stype == "MOE" and n.startswith("_stage_kernel")):
             g = "MOE.megamoe"; moe_seen = True
         elif "prepare_megamoe" in n:
             g = "MOE.prepare"

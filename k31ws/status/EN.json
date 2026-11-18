@@ -3,7 +3,7 @@
  "title": "NVFP4 checkpoint enablement",
  "side": "both",
  "owner": "EN agent (workflow)",
- "state": "landed-ready",
+ "state": "landed",
  "updated": "2026-11-18T16:55-08:00",
  "shape": "P3-16 F16K L78K and D3-32 r8 (load + smoke; no kernel timing owned)",
  "basis": "MEASURED 1-node P3-16 DEP4 slice, L24 NVFP4 view, dummy weights (runs/EN/step_p/nv-smoke2); unit tests in image",
@@ -68,6 +68,11 @@
    "t": "16:52",
    "what": "1-node NVFP4 prefill smoke via INFRA step_p.sh -q nvfp4 (DEP4 slice emulating EP16, L24 NVFP4 view, drafter on), overlay en-6f164db2-1",
    "result": "loads + runs: logged 23 x MegaMoE nvfp4 experts (nvfp4 kernel), 82 x ModelOpt MXFP8 linears (18 KDA x in/o + 23 shared x gate_up/down), 198 BF16; KV 119.8 GiB free/GPU; F16K L78K 211.3 ms/step, F8K 107.6 ms (unprofiled; L24 NVFP4 model achievable F16K 165 ms -> 1.28x)"
+  },
+  {
+   "t": "17:50",
+   "what": "INFRA: merged 6f164db270 into wzhao/k31ws-int (b31121cf56, with a semantic merge fix: sdec callers use mxfp8.is_mxfp8_linear)",
+   "result": "int unit tests 202 passed (EN 145, sp_mxfp8 5, sp_mlp+coverage 52); D3-32 slice A/B MXFP4 r8/r16/r24 7.02/10.14/12.94 vs base 7.06/10.20/13.00 ms (no regression); pushed"
   }
  ],
  "next": "Profiled NVFP4 slice run QUEUED (runs/EN/step_p/nv-prof1, fam.txt when done) to split the 211 ms by family for P-* owners; D3-32 NVFP4 smoke once B3 (D-MOE, EP32 NVFP4) and B4 (D-GEMM, MXFP8 in sdec) land; real-weight load + gsm8k need the NVFP4 checkpoint downloaded (user approval).",

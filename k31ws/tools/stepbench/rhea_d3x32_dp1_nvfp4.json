@@ -1,5 +1,5 @@
 {
- "_source": "release C512 decode role (results/k31vr-release-draft-sweep-20261117 C512-a1118813 decode cmd) with DP 4->1, moe-backend kimi_k3_mega_moe->deep_gemm_mega_moe (as measured D3-32 / gap512 d3x32k3), watermark/serving args dropped | NVFP4 checkpoint view (k31-nvfp4-view*): online-MX quantization-config dropped (EN en_p3x16_dep4_nvfp4.json)",
+ "_source": "release C512 decode role (results/k31vr-release-draft-sweep-20261117 C512-a1118813 decode cmd) with DP 4->1, moe-backend kimi_k3_mega_moe->deep_gemm_mega_moe (as measured D3-32 / gap512 d3x32k3), watermark/serving args dropped | NVFP4 checkpoint view (k31-nvfp4-view*): online-MX quantization-config dropped (EN en_p3x16_dep4_nvfp4.json) | moe-backend kimi_k3_mega_moe (vendored Rubin MegaMoE: the NVFP4 W4A4 kernel; deep_gemm_mega_moe is fp8_fp4 only)",
  "environment": {
   "NCCL_CUMEM_ENABLE": "1",
   "NCCL_NVLS_ENABLE": "1",
@@ -39,7 +39,7 @@
     "max-model-len": 1048576,
     "max-num-batched-tokens": 8192,
     "max-num-seqs": 128,
-    "moe-backend": "deep_gemm_mega_moe",
+    "moe-backend": "kimi_k3_mega_moe",
     "no-enable-flashinfer-autotune": true,
     "sparse-indexer-topk-backend": "deep_select",
     "speculative-config": "{\"method\": \"dspark\", \"model\": \"/raid/common-models/kimi-k3.1-pro-dspark\", \"num_speculative_tokens\": 3, \"attention_backend\": \"TOKENSPEED_MLA\", \"draft_sample_method\": \"probabilistic\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_length\": 3.08}",

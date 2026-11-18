@@ -5,13 +5,13 @@
  "owner": "P-IDX workflow agent",
  "state": "implementing",
  "updated": "2026-11-18T13:55-08:00",
- "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, per GPU, 24 DSA layers",
- "baseline_ms": 53.3,
- "current_ms": 53.3,
- "achievable_ms": 33.5,
- "target_ms": 37,
- "step_ms": 825,
- "basis": "MEASURED 1-GPU stock microbench at the deployed per-GPU shape (runs/P-IDX/stock1.log), x24 DSA layers",
+ "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
+ "baseline_ms": 15.32,
+ "current_ms": 15.32,
+ "achievable_ms": 8.44,
+ "target_ms": 9.28,
+ "step_ms": 218.7,
+ "basis": "MEASURED in-step NVFP4 baseline (INFRA 17:48, wzhao/k31ws-int b31121cf56, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; measured/20261118-1805-nvfp4-prefill.json); achievable = nvfp4_modelopt model at the same slice",
  "gap_analysis": "Stock per DSA layer (1 GPU, 3 x 5461 rows @ 78360 keys, 12 chunks of 512 MB): 2.222 ms = DeepGEMM sm100_mqa_logits 1.558 ms + trtllm_gvr2 BF16 top-k 0.648 ms + weights cast 0.026 ms (x24 = 53.3 ms/forward; the 61.5 ledger projection was high). Model achievable 1.394 ms/layer = idx_score 1.206 (bound: FP32 SIMT epilogue) + topk 0.188. Stock source shows the epilogue is packed BF16 (cvt.rn.relu.bf16x2.f32 + fma.rn.bf16x2, 34 instr per 32 heads), so the true issue floor at stock precision is about 0.66 ms/layer for the logits plus a few instr/element for an in-epilogue exact select -> derived achievable about 0.75 ms/layer (18 ms/forward): the model over-prices this family about 1.9x (model error, to report). Stock inefficiencies: logits kernel runs at about 2.3x the epilogue issue floor (1x-K MMA, BLOCK_Q 4, 3 math WGs) and writes 2.5 GB/layer of BF16 logits that the GVR top-k re-reads (0.65 ms/layer).",
  "inefficiencies": [
   "MEASURED: GVR top-k 0.648 ms/layer re-reading materialised BF16 logits (12 chunk launches)",
@@ -48,6 +48,11 @@
    "t": "13:50",
    "what": "Wrote fused score+select CuTe kernel v1 + check/perf bench; staged overlay p-idx-4fbaa15-1",
    "result": "first compile/run queued"
+  },
+  {
+   "t": "15:20",
+   "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
+   "result": "indexer logits + exact top-k + quant/insert 15.32 vs 8.44 (x1.82)"
   }
  ],
  "next": "Compile/correctness of fused kernel (runs/P-IDX/fused1.log), then perf at P3-16 shape",
@@ -58,5 +63,5 @@
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/stock1.json",
   "perf-model/plan/PLAN_NVFP4.md"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }

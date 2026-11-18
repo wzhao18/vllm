@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-TOPK agent",
  "state": "implementing",
- "updated": "2026-11-18T14:05-08:00",
+ "updated": "2026-11-18T14:50-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K (local \u224833.75K on DCP4), k=3; also r1 (16 rows), r8 (128 rows)",
  "baseline_ms": 2.3,
  "current_ms": 1.83,
@@ -19,7 +19,8 @@
   "MEASURED: ~12 serial 1.5-3 us steps inside the merge kernel (cluster syncs + leader-only work) -> 27 us at r1 for 4.2K keys/CTA",
   "MEASURED: two NVLink rounds per row (window, ties); round latency 1.8 us (r1) to 4.7 us (r24)",
   "merge kernel PDL off (trtllm-gen consumer reads counts before griddepcontrol.wait); on the critical stream",
-  "HYPOTHESIS (checking): bench replays may run below boost clock (GPU idles between reps); re-measuring with warm-up matmuls"
+  "HYPOTHESIS (checking): bench replays may run below boost clock (GPU idles between reps); re-measuring with warm-up matmuls",
+  "MEASURED (phase stamps): in a one-CTA-per-row design each dependent phase costs 0.5-15 us (global loads in series, single-thread loops, atomics with returns); the fix is to load once into registers and keep the chain to ~6 phases"
  ],
  "rubin_features": [
   "NVLink multicast (multimem.st) for the candidate/histogram exchange",
@@ -60,9 +61,19 @@
    "t": "14:05",
    "what": "wrote topk_v2 (csrc/topk_v2.cuh, ops.DcpExchange.topk_v2, decode wiring to v2 with per-launch staging capacity); bench --impl v2 --check (bitwise vs topk_merge); test compares v2 (staged + streamed) with topk_merge on every case",
    "result": "queued on the pool runner (overlay d-topk-ebc6916-5)"
+  },
+  {
+   "t": "14:00",
+   "what": "topk_v2 first versions (one CTA per row; staged keys then sampled-threshold candidates): bitwise equal to topk_merge on every test case incl. IL896/IL1, all tiers exercised (round-1 band cut 73%, tie round 20%, radix 7% of test rows; 100% one-round on bench logits)",
+   "result": "r1 41.5, r24 49-56 us/layer (vs in-tree 27.9/76.3): one NVLink round now 2.5-3.7 us, but per-row local chain still 35+ us (dependent memory latencies + syncs per phase)"
+  },
+  {
+   "t": "14:45",
+   "what": "v3 front end: whole row in registers (20 x 16 B per thread, one memory latency), sample + candidate compaction from registers (warp scan, one atomic per warp), band ids grouped by key without sort, receiver-side counting rank for the tie cut, 64K-position WRITE bitmap",
+   "result": "queued (overlay d-topk-ebc6916-11)"
   }
  ],
- "next": "run v2 bench + test on the pool node; fix; then tune",
+ "next": "measure v3 (bench r1/r8/r24 + test); then PDL-early prologue, cluster split for r1/r8 if needed, step A/B",
  "blockers": "4-GPU pool requests wait 20-30 min (1-GPU runs take single GPUs first); using a runner that keeps the node for queued experiments with a 12-min idle exit",
  "branch": "wzhao/k31ws-d-topk @ 4fbaa15189 (+ uncommitted tie fast path)",
  "evidence": [

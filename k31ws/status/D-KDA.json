@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent",
  "state": "implementing",
- "updated": "2026-11-18T13:45-08:00",
+ "updated": "2026-11-18T15:10-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3; per GPU 24 KDA heads x 96 requests = 2304 (request, head) items/layer",
  "baseline_ms": 3.4,
  "current_ms": 3.4,
@@ -14,11 +14,10 @@
  "basis": "MEASURED: Rhea 1-node profile, 93-layer projection (perf-model/microbench/results/rhea1n_d3x32)",
  "gap_analysis": "MEASURED (runs/D-KDA run2/run3, 1-GPU microbench at the D3-32 per-GPU shape, deferred fold active): KdaWide n32/64/96/128 = 26.0/51.5/74.3/95.0 us/layer, KdaWS (no fold; flush pass extra) 20.5/37.4/48.5/62.3; state stream only 3-6.5 TB/s and a 2-page state ring changes nothing -> not bandwidth / bytes-in-flight bound. In-kernel clock64 trace of KdaFlow (WS + fold) at n96: the 8-warp scan is the bottleneck (verify ~5.5-7K cycles/item vs ~2.5K FP32-pipe floor, fold ~3.5-4.5K/item vs ~1K), scan waits ~0 on the state and ~13% on prep; prep body ~8K cycles/item per warpgroup (global round trips: F_B tile loads, old records, weights), so prep is the next limit once the scan speeds up. Root cause: latency-bound dependency chain per token (k-dot reduce -> v -> update -> q-dot reduce) with only 2 scan warps per SMSP, plus global-latency-bound prep.",
  "inefficiencies": [
-  "MEASURED: scan latency-bound: two cross-lane reductions per token per item with 2 warps/SMSP (verify 2-3x the FP32-pipe floor)",
-  "MEASURED: fold in the scan ~4x its instruction floor (scalar smem reloads of u, 64 KB store issue)",
-  "MEASURED: prep ~8K cycles/item per warpgroup: F_B tiles, old records and weights fetched from global on the critical path",
-  "MEASURED: KdaWS (n>=71 today) does not fold: separate flush pass (3 state passes)",
-  "MEASURED: NOT bandwidth bound today (3-6.5 TB/s); die-local streaming only matters once compute is fixed"
+  "MEASURED: KdaFlow scan fold and verify each ~9K cycles/item at n96 (instruction floor ~1-2K): suspect register cap 128 + local-memory stack (STACK 88) in the fused fold+verify scan",
+  "MEASURED: prep + state load floor 32 us/layer at n96 (~7K cycles/item, 2 prep warpgroups): above the model target on its own",
+  "MEASURED: KdaWS (production n>=71) does not fold: extra flush pass (state R+W) on top of 48.5 us/layer",
+  "MEASURED: HBM only 3-6.5 TB/s in every variant: not bandwidth bound; die-local streaming premature"
  ],
  "rubin_features": [
   "two-die locality domains: per-4 KiB page home die (default interleave) + %smid -> die map (dies.py)",
@@ -53,14 +52,26 @@
    "t": "13:45",
    "what": "KdaFlow v2: per token one fused state pass (t update+q-dot fused with t+1 decay+k-dot, reductions of out_t and dot_t+1 overlap; same per-element op order and reduction trees), fold u preloaded, F_B rows + old records cp.async-staged one item ahead (no global round trips in prep), head-major items, o_s aliased on v_s (smem fit)",
    "result": "run4 queued (overlay d-kda-flow-3)"
+  },
+  {
+   "t": "14:20",
+   "what": "run4 KdaFlow v2 bench + trace",
+   "result": "bitwise 16/16; n8/32/64/96/128 = 11.5/38.0/64.4/91.7/120.0 us/layer (slower than v1)"
+  },
+  {
+   "t": "15:05",
+   "what": "run5 cost attribution (diagnostic SKIP builds)",
+   "result": "n96: full 91.7, no-fold 48.5, no-verify 49.5, neither 32.0 us/layer; fold + verify each ~9K cycles/item vs ~1-2K floor; KdaFlow cubin REG 128 STACK 88 (spill suspect); prep+load floor 32 us > 26.3 model"
   }
  ],
- "next": "run4 results; then: more scan warps per SM (row-split items / 2 items) or move prep math off the scan critical path; die-local row split once memory bound",
+ "next": "ptxas -v / SASS spill check of KdaFlow (runs/D-KDA/ptxas.sh); if spills: cut scan live ranges (fold per chunk without u preload, or 2 x 128-row-half passes), rebalance setmaxnreg; then restructure prep (per-head constants in smem across head-major items, fewer barriers) to get the prep floor below ~10 us at n96",
  "blockers": "pool holds pending (Priority), first expected ~13:30",
- "branch": "wzhao/k31ws-d-kda @ ec25a9bc98 (+ uncommitted v2)",
+ "branch": "wzhao/k31ws-d-kda @ dc31bc9ff5",
  "evidence": [
-  "runs/D-KDA/run2.log (Rhea Lustre k31ws/runs)",
+  "runs/D-KDA/run2.log",
   "runs/D-KDA/run3.log",
+  "runs/D-KDA/run4.log",
+  "runs/D-KDA/run5.log (Rhea Lustre k31ws/runs)",
   "perf-model/microbench/rhea1n/model_rows.json"
  ],
  "ckpt": "pending"

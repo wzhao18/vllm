@@ -4,23 +4,21 @@
  "side": "prefill",
  "owner": "P-GEMM workflow agent",
  "state": "implementing",
- "updated": "2026-11-18T13:50-08:00",
- "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, TP1 M=16384 (and F8K M=8192), NVFP4 ckpt",
- "baseline_ms": 346,
- "current_ms": 346,
- "achievable_ms": 268.3,
- "target_ms": 295,
- "step_ms": 825,
- "basis": "MEASURED standalone 1-GPU VR200 at M=16384 (runs/P-GEMM/a2/gemm.json, CUPTI kernel time, in-tree backend = cuBLASLt/nvjet), weighted by the 93-layer op counts; non-GEMM terms (quant passes, AttnRes, router top-k, latent norm, side-stream interference) still PROJECTED from the ledger until the NVFP4 step profile",
+ "updated": "2026-11-18T14:55-08:00",
+ "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
+ "baseline_ms": 83.89,
+ "current_ms": 83.89,
+ "achievable_ms": 72.7,
+ "target_ms": 79.97,
+ "step_ms": 218.7,
+ "basis": "MEASURED in-step NVFP4 baseline (INFRA 17:48, wzhao/k31ws-int b31121cf56, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; measured/20261118-1805-nvfp4-prefill.json); achievable = nvfp4_modelopt model at the same slice",
  "gap_analysis": "MEASURED per-shape table (M=16384, in-tree cuBLASLt nvjet sm_107 2-CTA tactics): all MXFP8 GEMMs are at the model: KDA in_proj 1083 us = 1.02x (2-CTA 256x256 block-scaled nvjet tactic, so 2x-K is in use; the ledger 1.16-1.40x is stale), KDA o_proj 1.00x, shared gate_up 1.02x, shared down 1.08x. BF16: g_proj 0.97, DSA o_proj 0.94, qb_wq 0.99, qkv_a 1.03, latent_down 1.04, latent_up 1.07, w_uv 1.02, dense gate_up 1.05 - at target. Outliers: router N=896 FP32-out 1.27x (73 vs 58 us), DSA w_uk bmm 1.52x (222 vs 146 us), KDA f_b_proj K=128 1.54x (46 vs 29 us), dense down 1.25x. Sum of my GEMMs: 248.9 ms measured vs 240.8 ms model (1.03x). FlashInfer/cute-dsl/cutlass/trtllm/cudnn MXFP8 backends are all slower than cuBLASLt at M=16384 (cute-dsl 1.14-1.20x, trtllm 2.6-4x). So the family excess is NOT in the GEMM mainloops; it is in the glue: standalone MXFP8 activation quant passes (FlashInfer 40 us per 16384x7168 call = 1.55x its HBM floor; vLLM mxfp8_act producers 81 us = 3.2x their floor, because each thread keeps one 16-B load in flight), the native AttnRes at 1.31-1.37x its byte floor (92-236 us per call), router top-k / latent norm kernels, and (ledger, in-step) the shared experts on the side stream next to the persistent MegaMoE.",
  "inefficiencies": [
-  "MEASURED: standalone BF16->MXFP8 quant of the AttnRes output per MXFP8 consumer (KDA in_proj 69x, shared gate_up 92x per step), ~40 us each at M=16384",
-  "MEASURED: vLLM mxfp8_act producers (situ_and_mul_quantize for shared down etc.) at 3.2x their HBM floor (one 16-B load in flight per thread) - fixed in 539e95c4 (4 in flight), re-measure pending",
-  "MEASURED: native AttnRes 1.31-1.37x its byte floor at M=16384 (cp.async.bulk ring depth 2 x 3 rows in flight per SM; hypothesis: too few bytes in flight for VR HBM)",
-  "MEASURED: router GEMM N=896 FP32-out 1.27x (nvjet 224x128 tile, 4 N-tiles -> wave quantization)",
-  "MEASURED: DSA w_uk bmm 1.52x (nvjet 1-CTA 192x224 tile for [96 x 16384 x 128] @ [128 x 512])",
-  "MEASURED: KDA f_b_proj (K=128, N=12288) 1.54x: memory-bound op, writes 402 MB",
-  "LEDGER (in-step): shared experts on side stream next to persistent MegaMoE get few SMs; router top-k and latent RMSNorm separate kernels"
+  "MEASURED: shared SiTU+MXFP8 quant pass 116 us/layer (92/step = 10.7 ms) vs model 9.2 us: MUFU-bound precise tanhf (3 per element); only hideable inside the gate_up GEMM epilogue (SOL design B3). Model error: shared_act / MOE.topk SIMT cost ignores the precise-transcendental MUFU cost when unfused",
+  "MEASURED: router top-k 43 us/layer vs 4 us floor (precise sigmoid over 896 logits per token); router GEMM 1.30x (N=896 wave quantization)",
+  "MEASURED: standalone MXFP8 quant of the AttnRes output (40 us FlashInfer) per KDA in_proj / shared gate_up call - removed by attn_res_mxfp8 (B1, step A/B running)",
+  "MEASURED: native AttnRes 1.31-1.37x its byte floor; fused variant adds 15-25 us (serial per-token epilogue, 1 CTA/SM): needs a 2-token-per-SM redesign (B2)",
+  "MEASURED: DSA w_uk bmm 1.52x (P-MLA fuses q-quant into it), KDA f_b_proj 1.54x (402 MB BF16 write), dense down 1.25x"
  ],
  "rubin_features": [
   "sm_107a 2x-K block-scaled MMA (mxf8f6f4) for MXFP8",
@@ -58,16 +56,41 @@
    "t": "13:30",
    "what": "mxfp8_act act_quant_kernel: 4 vectors in flight per thread (same per-vector math); attn_res_mxfp8 build fix (no ATen CUDAContext: cusparse.h missing in image)",
    "result": "test + bench queued (runs/P-GEMM/a4, overlay p-gemm-539e95c4-2)"
+  },
+  {
+   "t": "14:20",
+   "what": "attn_res_mxfp8 built (JIT, sm_100f, same --use_fast_math flags as native); bitwise unit test vs native kimi_k3_attn_res + mxfp8_quantize (BF16 out, E4M3 values, swizzled scales, padded scale rows, in-place prefix update, block write)",
+   "result": "all attn_res_mxfp8 cases pass; mxfp8_act tests pass (runs/P-GEMM/a6)"
+  },
+  {
+   "t": "14:20",
+   "what": "AttnRes bench M=16384 (runs/P-GEMM/a5): native vs native+FlashInfer quant vs fused (ring depth 2/3)",
+   "result": "MXFP8-only fused vs native+quant: nb1 108.5 vs 131.8 us, nb4 164.6 vs 190.5, nb8 229.9 (depth 3) vs 275.3; BF16+MXFP8 fused nb4 169.7 vs 190.5. Per-shape ring depth: 3 from 6 source blocks. Fused saves 20-45 us/call but runs 15-25 us above the native kernel: the per-token epilogue is serial in this 1-CTA/SM design"
+  },
+  {
+   "t": "14:20",
+   "what": "mxfp8_act producers: 4 vectors in flight + incremental indexing",
+   "result": "quant 16384x7168 81 -> 51.7 us (FlashInfer 39.8, floor 25.6); situ_and_mul_quantize (shared down input) 139.6 -> 116.4 us (floor 36.4: MUFU-bound precise tanhf, 3 per element)"
+  },
+  {
+   "t": "14:45",
+   "what": "router path bench (runs/P-GEMM/a6)",
+   "result": "router GEMM 74.9 us (model 57.7); prefill_glue.router_topk 43.3 us vs 4.2 us byte floor (precise sigmoid via tanhf over 896 experts + warp-0 select); router||latent_down on two streams 290.7 vs 310.3 us serial"
+  },
+  {
+   "t": "15:20",
+   "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
+   "result": "router+latent+top-k 20.22/11.99, KDA proj MXFP8 26.38/24.45, DSA proj BF16 15.43/14.11, shared MXFP8+SiLU 10.12/9.14, dense+embed 7.03/6.61, AttnRes 4.71/6.40"
   }
  ],
- "next": "a4: bitwise tests (attn_res_mxfp8, mxfp8_act) + AttnRes fused bench (ring depth 2/3) + quant bench new vs base; then router/w_uk/f_b_proj tactics; then NVFP4 step A/B with EN view",
+ "next": "read NVFP4 step A/B (runs/P-GEMM/step_p/pg4x-nvfp4 vs pg4x-base, P3-16 DEP4 slice, drafter excluded); if positive set landed-ready for B1; then B3 (shared gate_up GEMM + SiTU + MXFP8 epilogue on the FlashInfer sm107 CuTe DSL kernel)",
  "blockers": "pool contention (16 waiters at 13:22)",
- "branch": "wzhao/k31ws-p-gemm @ 539e95c4",
+ "branch": "wzhao/k31ws-p-gemm @ 364bffae05 (merges wzhao/k31ws-en 6f164db270)",
  "evidence": [
   "perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill",
   "perf-model/plan/nvfp4_ledgers_summary.txt",
   "perf-model/microbench/results/prefill/README.md",
   "runs/P-GEMM/b1, runs/P-GEMM/a1"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }

@@ -1,1 +1,3 @@
 - 2026-11-18 12:25 PST FusedConv K1 (short conv in FlashKDA prepare's load path; V conv output for K2) implemented on wzhao/k31ws-p-kda 218581f271; removes the separate conv pass (model prices conv with zero activation bytes). Untested: pool holds pending.
+- 2026-11-18 13:05 PST baseline F16K per layer: K2 394 + K1 299 + conv 219 + o_norm 204 = 1119 us (77.2 ms/forward vs model 17.4). In-tree split build K2 full-width 495 vs stock 394 (unexplained); VD64x2 422.
+- 2026-11-18 13:45 PST FlashKDA varlen K1 maps surplus CTAs (total_tiles upper bound) onto sequence 0's first tiles: harmless in stock, a conv-state race once the conv is fused; guarded. FusedConv bitwise == qkv_conv + FlashKDA.

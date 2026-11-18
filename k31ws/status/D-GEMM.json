@@ -3,7 +3,7 @@
  "title": "Decode: low-latency dense GEMM family (BF16 + MXFP8)",
  "side": "decode",
  "owner": "D-GEMM workflow agent",
- "state": "landed-ready",
+ "state": "landed",
  "updated": "2026-11-18T14:05-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows R per TP4 group, n = 96 SP shard rows per GPU), L=135K, k=3",
  "baseline_ms": 6.7,
@@ -79,6 +79,11 @@
    "t": "14:05",
    "what": "coordinator: re-based baseline to the NVFP4 checkpoint with existing kernels (6.7 ms projected)",
    "result": "the earlier 8.9 baseline was the MXFP4 all-BF16 tree; 8.9->6.7 is the precision switch, not kernel work (gap closed now counts kernel work only)"
+  },
+  {
+   "t": "17:50",
+   "what": "INFRA: merged 520afc7416 into wzhao/k31ws-int (b31121cf56, with a semantic merge fix: sdec callers use mxfp8.is_mxfp8_linear)",
+   "result": "int unit tests 202 passed (EN 145, sp_mxfp8 5, sp_mlp+coverage 52); D3-32 slice A/B MXFP4 r8/r16/r24 7.02/10.14/12.94 vs base 7.06/10.20/13.00 ms (no regression); pushed"
   }
  ],
  "next": "HANDOFF / next steps: (1) INFRA: merge wzhao/k31ws-d-gemm 520afc7416 into wzhao/k31ws-int; first NVFP4 D3-32 step (after EN B1/B2) exercises it - check the build log shows kda_in/o_proj/shared_gu/shared_down choices \"mxfp8 fi_cute|scaled_mm\". (2) Streaming kernel redesign (the family is 2.4x model): swap-AB with M-blocking (each CTA owns MB=2-4 weight row tiles, MB x T <= 512 TMEM columns, one x stage feeds MB MMAs -> x traffic T/(128 MB)), split <= 6 so clusters co-schedule (or no cluster: per-tile arrival counter + last-arriver rank-order reduce), deeper ring via 1 CTA/SM full smem, die-local weight homing (common/dies.py localized_like + %smid tile assignment), MXFP8 kind::mxf8f6f4 with in-kernel activation quant (drops ~0.5 ms of quant kernels). Prototype base: wzhao/k31ws-d-gemm-wip cutedsl/gemm/splitk_g.py (correct L2 reduce epilogue). (3) Bench: rsync k31ws/runs-local/D-GEMM/{gemm_bench.py,g_sweep.py} to runs/D-GEMM, stage overlay with tools/mkov.sh, run with wsgpu.sh -g 1 (see run1.sh / run3.sh).",

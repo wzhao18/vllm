@@ -4,19 +4,21 @@
  "side": "prefill",
  "owner": "P-KDA agent",
  "state": "implementing",
- "updated": "2026-11-18T12:56-08:00",
- "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4, 96 KDA heads at TP1, FP32 state (per GPU, per prefill forward, 69 KDA layers)",
- "baseline_ms": 78,
- "current_ms": 78,
- "achievable_ms": 17.4,
- "target_ms": 19.1,
- "step_ms": 825,
- "basis": "PROJECTED (reviewed ledger); model nvfp4_modelopt|P3-16|prefill per layer: conv 55.1 + gate_beta_norm 18.4 + core_prefill 167.0 + o_norm 12.2 = 252.7 us x 69 = 17.4 ms",
- "gap_analysis": "Model prices conv and o_norm with zero activation bytes (fused into the core's load / store) and core_prefill as one memory-bound pass (2.0 GB/layer: q,k,v,g in, o out). Today: separate fused-QKV conv pass (reads 1.2 GB, writes 1.2 GB), FlashKDA K1 prepare (reads q,k,g, writes three bf16 [T,H,D] workspaces + tiles), K2 recurrence (reads v + workspaces, writes o), separate gated o_norm + MXFP8 quant pass. 96 heads x 3 seqs exceed the in-tree v-split build's one-wave limit, so the stock full-width K2 runs (288 CTAs over 212 SMs, chunk-serial over 341 16-token chunks). Baseline per-kernel breakdown at the deployed shape is being measured.",
+ "updated": "2026-11-18T13:50-08:00",
+ "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
+ "baseline_ms": 21.91,
+ "current_ms": 21.91,
+ "achievable_ms": 4.54,
+ "target_ms": 4.99,
+ "step_ms": 218.7,
+ "basis": "MEASURED in-step NVFP4 baseline (INFRA 17:48, wzhao/k31ws-int b31121cf56, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; measured/20261118-1805-nvfp4-prefill.json); achievable = nvfp4_modelopt model at the same slice",
+ "gap_analysis": "Measured per layer at F16K (3 x 5461, 96 heads, FP32 state): 1119 us = FlashKDA recurrence K2 394 + prepare K1 299 + fused Q|K|V conv 219 + gated o_norm/MXFP8 204 (+3 beta transpose); x69 = 77.2 ms vs model 17.4 ms (4.4x). F8K: 581 us/layer (K2 208, K1 153, conv 113, o_norm 104). Per kernel vs its own HBM floor: conv moves 2.4 GB (~11 TB/s, at its floor, only fusion helps); o_norm moves ~1.0 GB in 204 us (~5 TB/s, 2.4x its floor); K1 moves ~2.45 GB (q,k,g in; three bf16 [T,H,D] workspaces out) in 299 us (~8 TB/s); K2 reads ~1.6 GB and is compute/latency bound on legacy warp MMA (FP32 register state, 16-token chunks, 341 serial chunks per (seq, head), 288 items over 212 SMs). The model prices conv and o_norm with zero activation bytes and the core as one 2.0 GB pass, so the gap is (1) unfused conv/o_norm passes (~420 us), (2) the K1->K2 workspace round trip (~2.4 GB), (3) K2 throughput.",
  "inefficiencies": [
-  "No 96-head v-split recurrence build (stock full-width K2, 288 CTAs > 1 wave) [ledger, re-measuring]",
-  "Separate prepare pass K1 with ~1.2 GB workspace round trip [code reading; bytes to be measured]",
-  "Unfused conv (2.4 GB HBM pass) and gated o_norm + MXFP8 quant (~1 GB pass) [code reading]"
+  "MEASURED: separate conv pass 219 us/layer (2.4 GB, at HBM rate)",
+  "MEASURED: o_norm + MXFP8 kernel 204 us/layer at ~5 TB/s (2.4x its HBM floor)",
+  "MEASURED: K1 prepare 299 us/layer writes ~1.2 GB of workspace that K2 re-reads",
+  "MEASURED: K2 recurrence 394 us/layer (stock build); in-tree split build full width 495, VD64 x2/SM 422 (cause of stock vs split difference not yet identified)",
+  "HYPOTHESIS: K2 bound by legacy mma.sync throughput + per-chunk fragment transposes (ncu not available in the image)"
  ],
  "rubin_features": [
   "bulk async copies (TMA) for the g / beta / dt_bias tiles, overlapped with the in-load conv",
@@ -46,14 +48,34 @@
    "t": "12:55",
    "what": "implemented gated o_norm + MXFP8 quant in the full-width K2 epilogue (STORE + 2 idle producer warps; norm_mx.cuh), K2 variant pin bits for the per-shape policy bench (VD16/32/64 at 1-4 blocks/SM, full width), layer wiring in kda.py (per-shape: FlashKDA, no segment buffers, no spec/checkpoint) -> commits fe5b9a8594, e3a3631042, 4c8569c491",
    "result": "all untested on GPU; run ab5 (overlay p-kda-e3a3631-5: tests + stock/split/fusedconv/fused at F16K/F8K + K2 pin sweep + ncu) waiting for a 1-GPU hold"
+  },
+  {
+   "t": "13:05",
+   "what": "baseline breakdown run ab6 (stock / split / pins)",
+   "result": "F16K 1119 us/layer (K2 394, K1 299, conv 219, o_norm 204); split build K2: full 495, VD64 422, VD32x3 450, VD16 645, VD64x3 575, VD32x4 467"
+  },
+  {
+   "t": "13:10",
+   "what": "first fused attempts measured",
+   "result": "K2-epilogue o_norm: K2 3845 us (norm warps hold 32 registers at 2 CTAs/SM) -> reverted for a standalone kernel; FusedConv K1 with per-thread global loads 1076-1186 us -> reworked"
+  },
+  {
+   "t": "13:45",
+   "what": "FusedConv K1 with bulk-tensor raw boxes + 4-channel items + surplus-CTA guard (FlashKDA varlen scan maps surplus CTAs onto sequence 0: duplicate first tile raced on conv state)",
+   "result": "bitwise equal to qkv_conv + FlashKDA (v, out, final state, conv state) at [300,40]x8, 3x5461x8, [3,64,1000]x96; but K1 762 us (vs 299 + 219 conv) -> latency/registers under investigation; o_norm_mx standalone 280 us (int64 division per row) -> fixed, re-measuring"
+  },
+  {
+   "t": "15:20",
+   "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
+   "result": "KDA core 21.91 vs 4.54 (x4.83)"
   }
  ],
- "next": "ab5 results: verify bitwise conv fusion + norm tolerance, per-kernel breakdown, K2 variant sweep, ncu tensor-pipe utilization of K2",
- "blockers": "k31ws 1-GPU holds all pending (Priority) since 13:15; 16 waiters in the pool",
- "branch": "wzhao/k31ws-p-kda @ 4c8569c491",
+ "next": "resource usage (regs/spills) of FusedConv K1 and stock vs split K2; make FusedConv K1 at least conv-pass-free (target K1 <= 360 us); o_norm kernel to ~90 us",
+ "blockers": "no ncu/nsys in the K3.1 image (checked /usr/local/cuda/bin, PATH): root-causing by resource usage + variants",
+ "branch": "wzhao/k31ws-p-kda @ 0f97e2ea",
  "evidence": [
   "perf-model/plan/PLAN_NVFP4.md",
   "perf-model/microbench/results/ops1 kda-077"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }
