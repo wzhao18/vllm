@@ -1,0 +1,26 @@
+{
+ "side": "decode",
+ "step_ms": 30.5,
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
+ "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
+ ],
+ "id": "D-ATTN",
+ "title": "Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)",
+ "baseline_ms": 3.3,
+ "current_ms": 3.3,
+ "achievable_ms": 1.3,
+ "target_ms": 1.45,
+ "gap_analysis": "MlaQuery q path 28-50 us/layer vs 5-10; sparse MLA fmha 18.7 us vs 5 at B50 (96->128 head padding, per-row 2048-row gather); indexer re-streams keys for each of a request's 4 verify rows.",
+ "inefficiencies": [
+  "96->128 head padding",
+  "Per-row KV re-gather",
+  "Unfused q path",
+  "Indexer 4-row key re-streaming"
+ ]
+}

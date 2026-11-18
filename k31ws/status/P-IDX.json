@@ -1,0 +1,24 @@
+{
+ "side": "prefill",
+ "step_ms": 825,
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
+ "state": "queued",
+ "owner": "unassigned",
+ "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md"
+ ],
+ "id": "P-IDX",
+ "title": "Prefill: indexer logits + exact top-k",
+ "baseline_ms": 61.5,
+ "current_ms": 61.5,
+ "achievable_ms": 33.5,
+ "target_ms": 37,
+ "gap_analysis": "topk_select_bf16 2 x ~120 us/layer (7x model); indexer logits re-read.",
+ "inefficiencies": [
+  "Multi-pass top-k",
+  "Logit re-reads"
+ ]
+}

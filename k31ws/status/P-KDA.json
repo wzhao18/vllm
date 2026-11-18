@@ -1,0 +1,25 @@
+{
+ "side": "prefill",
+ "step_ms": 825,
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
+ "state": "queued",
+ "owner": "unassigned",
+ "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md"
+ ],
+ "id": "P-KDA",
+ "title": "Prefill: KDA chain (core + conv + gated o_norm)",
+ "baseline_ms": 78,
+ "current_ms": 78,
+ "achievable_ms": 16,
+ "target_ms": 18,
+ "gap_analysis": "96 heads at TP1 fall off the v-split FlashKDA build: 288 CTAs walk 5.4K tokens chunk-serially; prepare is a separate full pass; conv and gated RMSNorm are standalone HBM passes.",
+ "inefficiencies": [
+  "No 96-head v-split build",
+  "Separate prepare pass",
+  "Unfused conv and o_norm"
+ ]
+}

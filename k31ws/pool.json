@@ -1,0 +1,29 @@
+{
+ "note": "Rolling holds from holdd-ws.sh (1-node class for kernel work, one standing 8-node request for EP32/DP8). GPUs are shared through wsgpu.sh locks.",
+ "holds": [
+  {
+   "job": "72524",
+   "name": "coreai_cserve_dev-k31ws.hold8",
+   "state": "PENDING",
+   "nodes": "8",
+   "start": "2026-11-19T03:09:00",
+   "left": "8:00:00"
+  },
+  {
+   "job": "72521",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "PENDING",
+   "nodes": "1",
+   "start": "2026-11-18T14:50:00",
+   "left": "8:00:00"
+  },
+  {
+   "job": "72377",
+   "name": "cserve-k31gap-hold",
+   "state": "RUNNING",
+   "nodes": "1",
+   "start": "2026-11-18T12:15:46",
+   "left": "1:49:17"
+  }
+ ]
+}

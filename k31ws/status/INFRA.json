@@ -1,0 +1,13 @@
+{
+ "side": "infra",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "basis": "-",
+ "shape": "-",
+ "id": "INFRA",
+ "title": "Node pool, 1-node emulations, profiling and integration branch",
+ "gap_analysis": "Kernel work must iterate on 1-4 GPUs while 8-node EP32 holds queue: 1-node DP-rank slice of D3-32 and a 1-node DEP16 slice, per-family profile parser vs model at the same shapes, integration branch for verified wins.",
+ "next": "Take over the Rhea 1-node D3-32 profile, build the DEP16 1-node slice."
+}

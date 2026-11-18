@@ -1,0 +1,26 @@
+{
+ "side": "decode",
+ "step_ms": 30.5,
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
+ "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
+ ],
+ "id": "D-GEMM",
+ "title": "Decode: low-latency dense GEMM family (BF16 + MXFP8)",
+ "baseline_ms": 8.9,
+ "current_ms": 8.9,
+ "achievable_ms": 4.7,
+ "target_ms": 5.2,
+ "gap_analysis": "Weight-streaming GEMMs at M=32-384 reach 1.8-8.7 TB/s of 13.9 achievable; cuBLAS picks 2-CTA 64xN / 160x64 tiles with 156-448 CTAs; split-K reduce launches ~1.2 ms/step; a CuTe split-K kernel collapses above 200 rows.",
+ "inefficiencies": [
+  "Too few bytes in flight per SM for 30-180 MB weight streams",
+  "Separate split-K reduce kernels",
+  "SplitKGemm tile policy collapse above 200 rows",
+  "MXFP8 activation quant as separate kernels (NVFP4 ckpt)"
+ ]
+}

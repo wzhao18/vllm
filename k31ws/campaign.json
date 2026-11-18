@@ -1,0 +1,34 @@
+{
+ "goal": "Close the gap between the implemented kernels and the perf model's achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.",
+ "steps": {
+  "Prefill DEP16 (tok/s/GPU)": {
+   "now": "13.9K MXFP4 \u00b7 15.4K NVFP4-act",
+   "ach": "30.7K NVFP4",
+   "note": "F16K, L78K"
+  },
+  "Decode r8 (tok/s/GPU)": {
+   "now": "1,178 MXFP4",
+   "ach": "2,855 NVFP4",
+   "note": "D3-32, 20.9 ms step"
+  },
+  "Decode r24 (tok/s/GPU)": {
+   "now": "2,425 MXFP4",
+   "ach": "6,280 NVFP4",
+   "note": "D3-32, 30.5 ms step"
+  }
+ },
+ "findings": [
+  {
+   "t": "11-18",
+   "text": "Topology is not the lever: best unbuilt decode layouts project only +2-5% over DCP4 x DP8 EP32; the step is 2.1-2.3x model achievable, all of it kernel time."
+  },
+  {
+   "t": "11-18",
+   "text": "NVFP4 near-term (enablement only) projects prefill 19.4-20.5K and decode r8 1.2-1.45K; the rest of the gap to 30.7K / 2.9K is kernel efficiency."
+  },
+  {
+   "t": "11-18",
+   "text": "Largest decode gaps (r24, EP16-transferred): BF16 GEMMs 4.2 ms, MegaMoE ~3.4, DCP top-k 2.0, DSA attention 1.7, KDA 1.6, small ops 1.2."
+  }
+ ]
+}

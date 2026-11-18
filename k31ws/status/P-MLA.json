@@ -1,0 +1,25 @@
+{
+ "side": "prefill",
+ "step_ms": 825,
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
+ "state": "queued",
+ "owner": "unassigned",
+ "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md"
+ ],
+ "id": "P-MLA",
+ "title": "Prefill: sparse MLA + prologue",
+ "baseline_ms": 67,
+ "current_ms": 67,
+ "achievable_ms": 16,
+ "target_ms": 17.5,
+ "gap_analysis": "Generation-phase trtllm-gen kernel on 3072 ShardQ rows at ~30% of FP8 MMA rate; 96->128 head padding; V512 split possibly recomputes QK (hypothesis); separate quant/pad/insert prologue kernels plus an unidentified 1 ms CuTe kernel.",
+ "inefficiencies": [
+  "Decode-form kernel used for prefill",
+  "Head padding",
+  "Unfused prologue"
+ ]
+}

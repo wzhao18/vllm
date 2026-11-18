@@ -1,0 +1,25 @@
+{
+ "side": "prefill",
+ "step_ms": 825,
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
+ "state": "queued",
+ "owner": "unassigned",
+ "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md"
+ ],
+ "id": "P-GEMM",
+ "title": "Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops",
+ "baseline_ms": 290,
+ "current_ms": 290,
+ "achievable_ms": 245,
+ "target_ms": 262,
+ "gap_analysis": "MXFP8 KDA in_proj (unaligned N=49376) 1.16-1.40x, shared MXFP8 + SiLU-mul + quant, router/top-k/latent BF16 GEMMs 1.4x, AttnRes 6.6 ms, small BF16 GEMMs + drafter 14 ms excess.",
+ "inefficiencies": [
+  "Unaligned N tactics",
+  "Separate activation quant",
+  "Unfused router/latent epilogues"
+ ]
+}

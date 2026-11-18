@@ -1,0 +1,364 @@
+<title>K3.1 VR200 Kernel Campaign</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+/* layout: status board. Summary first (steps, pool, findings), then one table per side, then one card per workstream */
+:root { --bg:#f5f7f6; --panel:#ffffff; --ink:#15201c; --mute:#5b6a64; --line:#d9e1dd; --acc:#0f7b5f; --acc2:#e3f2ec;
+  --warn:#a35b00; --bad:#b3261e; --good:#0f7b5f; --info:#2f5fa7;
+  --f-d:'Space Grotesk', 'IBM Plex Sans', system-ui, sans-serif; --f-b:'IBM Plex Sans', system-ui, sans-serif; --f-m:'IBM Plex Mono', ui-monospace, monospace; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#0f1513; --panel:#161e1b; --ink:#e3ece8; --mute:#93a39c; --line:#2a3632; --acc:#4cc59d; --acc2:#17322a;
+  --warn:#e3a14a; --bad:#ef7a72; --good:#4cc59d; --info:#86aef0; color-scheme:dark } }
+:root[data-theme="dark"] { --bg:#0f1513; --panel:#161e1b; --ink:#e3ece8; --mute:#93a39c; --line:#2a3632; --acc:#4cc59d; --acc2:#17322a;
+  --warn:#e3a14a; --bad:#ef7a72; --good:#4cc59d; --info:#86aef0; color-scheme:dark }
+body { background:var(--bg); color:var(--ink); font:14px/1.5 var(--f-b); }
+.wrap { max-width:1280px; margin:0 auto; padding-left:max(16px, env(safe-area-inset-left, 0px)); padding-right:max(16px, env(safe-area-inset-right, 0px)); padding-block:24px 64px; }
+h1,h2,h3,h4 { font-family:var(--f-d); text-wrap:balance; margin:0; }
+h1 { font-size:28px; } h2 { font-size:20px; margin-top:32px; } h3 { font-size:16px; margin:22px 0 8px; color:var(--mute); text-transform:uppercase; letter-spacing:.06em; }
+.sub { color:var(--mute); max-width:90ch; }
+.kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-top:16px; }
+.kpi { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; display:flex; flex-direction:column; gap:2px; min-width:0; }
+.kpi small { color:var(--mute); text-transform:uppercase; letter-spacing:.05em; font-size:11px; } .kpi b { font:600 22px var(--f-d); font-variant-numeric:tabular-nums; } .kpi span { color:var(--mute); font-size:12px; }
+.tw { overflow-x:auto; } table { border-collapse:collapse; width:100%; background:var(--panel); border:1px solid var(--line); border-radius:8px; }
+th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; } th { font-size:12px; color:var(--mute); font-weight:500; white-space:nowrap; }
+td.n { text-align:right; font-family:var(--f-m); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.wid { font-family:var(--f-m); font-weight:500; color:var(--acc); text-decoration:none; } .wt { color:var(--mute); font-size:12px; }
+td.nx { color:var(--mute); font-size:12px; min-width:220px; } td.gc { white-space:nowrap; font-family:var(--f-m); font-size:12px; }
+.bar { display:inline-block; width:70px; height:6px; background:var(--line); border-radius:3px; vertical-align:middle; } .bar i { display:block; height:100%; background:var(--acc); border-radius:3px; }
+.st { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); white-space:nowrap; }
+.st-an { color:var(--info); } .st-im { color:var(--acc); } .st-me { color:var(--acc); background:var(--acc2); } .st-bl { color:var(--bad); border-color:var(--bad); }
+.st-la, .st-do { color:var(--good); background:var(--acc2); border-color:var(--good); } .st-q { color:var(--mute); }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-top:16px; }
+.card header { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; } .card h4 { font-size:17px; }
+.meta { display:flex; flex-wrap:wrap; gap:6px 16px; color:var(--mute); font-size:12px; margin:6px 0 10px; }
+.nums { display:grid; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); gap:8px; } .nums div { border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+.nums b { font:600 18px var(--f-d); font-variant-numeric:tabular-nums; display:block; } .nums small { color:var(--mute); font-size:11px; }
+h5 { font:600 13px var(--f-b); margin:14px 0 4px; } .card p { margin:0; max-width:110ch; }
+.two { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:12px; } ul, ol { margin:4px 0; padding-left:20px; }
+table.log td { font-size:12px; } td.t { font-family:var(--f-m); white-space:nowrap; color:var(--mute); }
+.blk { color:var(--bad); margin-top:10px !important; } code { font-family:var(--f-m); font-size:12px; word-break:break-all; }
+.ev { font-size:12px; } .find li { margin:4px 0; }
+</style>
+<div class="wrap">
+<h1>K3.1 VR200 Kernel Campaign</h1>
+<p class="sub">Close the gap between the implemented kernels and the perf model&#x27;s achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.</p>
+<p class="sub">Rendered 2026-11-18 15:26 from the workstream status files. Gap closed = (baseline − now) / (baseline − model achievable). Targets are at most 1.1× model achievable.</p>
+<div class="kpis"><div class='kpi'><small>Prefill DEP16 (tok/s/GPU)</small><b>13.9K MXFP4 · 15.4K NVFP4-act</b><span>model achievable 30.7K NVFP4 · F16K, L78K</span></div><div class='kpi'><small>Decode r8 (tok/s/GPU)</small><b>1,178 MXFP4</b><span>model achievable 2,855 NVFP4 · D3-32, 20.9 ms step</span></div><div class='kpi'><small>Decode r24 (tok/s/GPU)</small><b>2,425 MXFP4</b><span>model achievable 6,280 NVFP4 · D3-32, 30.5 ms step</span></div></div>
+<h2>Key findings</h2><ul class="find"><li><b>11-18</b> Largest decode gaps (r24, EP16-transferred): BF16 GEMMs 4.2 ms, MegaMoE ~3.4, DCP top-k 2.0, DSA attention 1.7, KDA 1.6, small ops 1.2.</li><li><b>11-18</b> NVFP4 near-term (enablement only) projects prefill 19.4-20.5K and decode r8 1.2-1.45K; the rest of the gap to 30.7K / 2.9K is kernel efficiency.</li><li><b>11-18</b> Topology is not the lever: best unbuilt decode layouts project only +2-5% over DCP4 x DP8 EP32; the step is 2.1-2.3x model achievable, all of it kernel time.</li></ul>
+<h2>Workstreams</h2>
+<h3>Infrastructure and enablement</h3><div class="tw"><table>
+<thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
+<th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
+<td><a href="#EN" class="wid">EN</a><div class="wt">NVFP4 checkpoint enablement</div></td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="gc"></td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx">Native ModelOpt NVFP4 load into Rubin MegaMoE + dummy-safe NVFP4 view.</td></tr>
+<tr>
+<td><a href="#HW" class="wid">HW</a><div class="wt">Vera Rubin hardware reference database</div></td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="gc"></td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx">Build the private hwdb and the per-workstream feature briefs.</td></tr>
+<tr>
+<td><a href="#INFRA" class="wid">INFRA</a><div class="wt">Node pool, 1-node emulations, profiling and integration branch</div></td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="gc"></td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx">Take over the Rhea 1-node D3-32 profile, build the DEP16 1-node slice.</td></tr></tbody></table></div><h3>Decode: DCP4 × DP8, EP32</h3><div class="tw"><table>
+<thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
+<th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
+<td><a href="#D-GEMM" class="wid">D-GEMM</a><div class="wt">Decode: low-latency dense GEMM family (BF16 + MXFP8)</div></td>
+<td class="n">8.90</td><td class="n">29%</td>
+<td class="n">4.70</td><td class="n">5.20</td>
+<td class="n">1.9×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#D-MOE" class="wid">D-MOE</a><div class="wt">Decode: MegaMoE NVFP4 EP32 + shared-expert overlap</div></td>
+<td class="n">8.30</td><td class="n">27%</td>
+<td class="n">4.90</td><td class="n">5.40</td>
+<td class="n">1.7×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#D-FUSE" class="wid">D-FUSE</a><div class="wt">Decode: small-op fusion, SP collectives, drafter tail</div></td>
+<td class="n">3.90</td><td class="n">13%</td>
+<td class="n">1.50</td><td class="n">1.65</td>
+<td class="n">2.6×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#D-TOPK" class="wid">D-TOPK</a><div class="wt">Decode: DSA exact top-k + DCP merge</div></td>
+<td class="n">2.30</td><td class="n">8%</td>
+<td class="n">0.22</td><td class="n">0.25</td>
+<td class="n">10.5×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#D-ATTN" class="wid">D-ATTN</a><div class="wt">Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)</div></td>
+<td class="n">3.30</td><td class="n">11%</td>
+<td class="n">1.30</td><td class="n">1.45</td>
+<td class="n">2.5×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#D-KDA" class="wid">D-KDA</a><div class="wt">Decode: KDA core (FP32 state)</div></td>
+<td class="n">3.40</td><td class="n">11%</td>
+<td class="n">1.70</td><td class="n">1.90</td>
+<td class="n">2.0×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr></tbody></table></div><h3>Prefill: DEP16</h3><div class="tw"><table>
+<thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
+<th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
+<td><a href="#P-MOE" class="wid">P-MOE</a><div class="wt">Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream</div></td>
+<td class="n">320</td><td class="n">39%</td>
+<td class="n">198</td><td class="n">218</td>
+<td class="n">1.6×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#P-KDA" class="wid">P-KDA</a><div class="wt">Prefill: KDA chain (core + conv + gated o_norm)</div></td>
+<td class="n">78.00</td><td class="n">9%</td>
+<td class="n">16.00</td><td class="n">18.00</td>
+<td class="n">4.9×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#P-MLA" class="wid">P-MLA</a><div class="wt">Prefill: sparse MLA + prologue</div></td>
+<td class="n">67.00</td><td class="n">8%</td>
+<td class="n">16.00</td><td class="n">17.50</td>
+<td class="n">4.2×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#P-GEMM" class="wid">P-GEMM</a><div class="wt">Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops</div></td>
+<td class="n">290</td><td class="n">35%</td>
+<td class="n">245</td><td class="n">262</td>
+<td class="n">1.2×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr>
+<tr>
+<td><a href="#P-IDX" class="wid">P-IDX</a><div class="wt">Prefill: indexer logits + exact top-k</div></td>
+<td class="n">61.50</td><td class="n">7%</td>
+<td class="n">33.50</td><td class="n">37.00</td>
+<td class="n">1.8×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-q">queued</span></td>
+<td class="nx"></td></tr></tbody></table></div>
+<h2>Node pool (Rhea)</h2><p class="sub">Rolling holds from holdd-ws.sh (1-node class for kernel work, one standing 8-node request for EP32/DP8). GPUs are shared through wsgpu.sh locks.</p>
+<div class="tw"><table><thead><tr><th>Job</th><th>Name</th><th>State</th><th>Nodes</th><th>Start</th><th>Time left</th></tr></thead><tbody><tr><td>72524</td><td>coreai_cserve_dev-k31ws.hold8</td><td>PENDING</td><td>8</td><td>2026-11-19T03:09:00</td><td>8:00:00</td></tr><tr><td>72521</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T14:50:00</td><td>8:00:00</td></tr><tr><td>72377</td><td>cserve-k31gap-hold</td><td>RUNNING</td><td>1</td><td>2026-11-18T12:15:46</td><td>1:49:17</td></tr></tbody></table></div>
+<h2>Workstream details</h2>
+<section class="card" id="EN">
+<header><span class="wid">EN</span><h4>NVFP4 checkpoint enablement</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: -</span><span>Basis: -</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
+<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
+<div><b>–</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>No NVFP4 number exists: MegaMoE format hard-coded to MXFP4 (model.py:816), Rubin MegaMoE refuses NVFP4 scales (experts.py:289/442), no NVFP4 EP32 decode backend, specialized decode raises on MXFP8 projections.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+
+</section><section class="card" id="HW">
+<header><span class="wid">HW</span><h4>Vera Rubin hardware reference database</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: -</span><span>Basis: -</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
+<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
+<div><b>–</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Every kernel workstream needs the VR200-specific features (tcgen05 block-scaled MMA shapes, TMEM, 2-CTA, TMA multicast/.COUNTED, CLC, PDL, locality domains, NVLink6 multimem) and their measured costs in one place.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+
+</section><section class="card" id="INFRA">
+<header><span class="wid">INFRA</span><h4>Node pool, 1-node emulations, profiling and integration branch</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: -</span><span>Basis: -</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
+<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
+<div><b>–</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Kernel work must iterate on 1-4 GPUs while 8-node EP32 holds queue: 1-node DP-rank slice of D3-32 and a 1-node DEP16 slice, per-family profile parser vs model at the same shapes, integration branch for verified wins.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+
+</section><section class="card" id="D-GEMM">
+<header><span class="wid">D-GEMM</span><h4>Decode: low-latency dense GEMM family (BF16 + MXFP8)</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>8.90</b><small>baseline ms</small></div><div><b>8.90</b><small>now ms</small></div>
+<div><b>4.70</b><small>model achievable ms</small></div><div><b>5.20</b><small>target ms</small></div>
+<div><b>30.50</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Weight-streaming GEMMs at M=32-384 reach 1.8-8.7 TB/s of 13.9 achievable; cuBLAS picks 2-CTA 64xN / 160x64 tiles with 156-448 CTAs; split-K reduce launches ~1.2 ms/step; a CuTe split-K kernel collapses above 200 rows.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Too few bytes in flight per SM for 30-180 MB weight streams</li><li>Separate split-K reduce kernels</li><li>SplitKGemm tile policy collapse above 200 rows</li><li>MXFP8 activation quant as separate kernels (NVFP4 ckpt)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+</section><section class="card" id="D-MOE">
+<header><span class="wid">D-MOE</span><h4>Decode: MegaMoE NVFP4 EP32 + shared-expert overlap</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>8.30</b><small>baseline ms</small></div><div><b>8.30</b><small>now ms</small></div>
+<div><b>4.90</b><small>model achievable ms</small></div><div><b>5.40</b><small>target ms</small></div>
+<div><b>30.50</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Vendored deep_gemm fp8_fp4 MegaMoE runs 109-122 us/layer vs FI 91-95 us standalone; ~50 us fixed per call; shared experts run serially after MegaMoE; no NVFP4 EP32 decode backend exists yet.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Old vendored kernel</li><li>Fixed per-call chain (~50 us/layer)</li><li>Shared experts not overlapped</li><li>NVFP4 W4A4 path missing at EP32</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+</section><section class="card" id="D-FUSE">
+<header><span class="wid">D-FUSE</span><h4>Decode: small-op fusion, SP collectives, drafter tail</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>3.90</b><small>baseline ms</small></div><div><b>3.90</b><small>now ms</small></div>
+<div><b>1.50</b><small>model achievable ms</small></div><div><b>1.65</b><small>target ms</small></div>
+<div><b>30.50</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>AttnRes mix 5.8 us x 187 calls vs &lt;1 us; unfused SiLU, latent RMSNorm, router top-k, MegaMoE prep ~1.2 ms; SP RS/AG at the Lamport floor plus separate local-sum kernels; drafter tail 2-3x.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Standalone elementwise kernels the model fuses</li><li>Separate exchange + reduce kernels</li><li>Drafter tail kernels</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+</section><section class="card" id="D-TOPK">
+<header><span class="wid">D-TOPK</span><h4>Decode: DSA exact top-k + DCP merge</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>2.30</b><small>baseline ms</small></div><div><b>2.30</b><small>now ms</small></div>
+<div><b>0.22</b><small>model achievable ms</small></div><div><b>0.25</b><small>target ms</small></div>
+<div><b>30.50</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>topk_merge_kernel&lt;16&gt; 52-77 us/layer vs 6-7 modelled; pp hist/window/win passes 25-45 us vs 1.4; merge grid [2, rows] walks 4 ranks x 2048 candidates serially with remote NVLink reads and flag polls; logits re-read three times; on the critical stream.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>2 CTAs per row serial merge over remote reads</li><li>Three passes over logits</li><li>PDL off on the merge</li><li>Critical-stream placement</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+</section><section class="card" id="D-ATTN">
+<header><span class="wid">D-ATTN</span><h4>Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>3.30</b><small>baseline ms</small></div><div><b>3.30</b><small>now ms</small></div>
+<div><b>1.30</b><small>model achievable ms</small></div><div><b>1.45</b><small>target ms</small></div>
+<div><b>30.50</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>MlaQuery q path 28-50 us/layer vs 5-10; sparse MLA fmha 18.7 us vs 5 at B50 (96-&gt;128 head padding, per-row 2048-row gather); indexer re-streams keys for each of a request&#x27;s 4 verify rows.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>96-&gt;128 head padding</li><li>Per-row KV re-gather</li><li>Unfused q path</li><li>Indexer 4-row key re-streaming</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+</section><section class="card" id="D-KDA">
+<header><span class="wid">D-KDA</span><h4>Decode: KDA core (FP32 state)</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>3.40</b><small>baseline ms</small></div><div><b>3.40</b><small>now ms</small></div>
+<div><b>1.70</b><small>model achievable ms</small></div><div><b>1.90</b><small>target ms</small></div>
+<div><b>30.50</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>KdaWide 30-49 us/layer vs 14-25 modelled: ~35% of HBM on 166 MB FP32 state per layer; per-(head-group, request) CTA grid latency-bound on the q=4 serial update; KdaWS above B80 is a separate kernel.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Latency-bound CTA grid</li><li>35% HBM utilization on state stream</li><li>Two kernels across batch sizes</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+</section><section class="card" id="P-MOE">
+<header><span class="wid">P-MOE</span><h4>Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>320</b><small>baseline ms</small></div><div><b>320</b><small>now ms</small></div>
+<div><b>198</b><small>model achievable ms</small></div><div><b>218</b><small>target ms</small></div>
+<div><b>825</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Vendored megamoe_rubin NVFP4 in-step inferred 281-358 ms vs FI 230.7 ms standalone (2x8K) vs model 197.9; separate router/reduce staging kernels; link-bound layer (1.97 ms link floor) exposes ~0.68 ms/layer of GEMM; shared experts lose their overlap when staging is removed.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Vendored kernel staging</li><li>Partial GEMM/link overlap</li><li>Shared-expert side stream starved of SMs</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+</section><section class="card" id="P-KDA">
+<header><span class="wid">P-KDA</span><h4>Prefill: KDA chain (core + conv + gated o_norm)</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>78.00</b><small>baseline ms</small></div><div><b>78.00</b><small>now ms</small></div>
+<div><b>16.00</b><small>model achievable ms</small></div><div><b>18.00</b><small>target ms</small></div>
+<div><b>825</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>96 heads at TP1 fall off the v-split FlashKDA build: 288 CTAs walk 5.4K tokens chunk-serially; prepare is a separate full pass; conv and gated RMSNorm are standalone HBM passes.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>No 96-head v-split build</li><li>Separate prepare pass</li><li>Unfused conv and o_norm</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+</section><section class="card" id="P-MLA">
+<header><span class="wid">P-MLA</span><h4>Prefill: sparse MLA + prologue</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>67.00</b><small>baseline ms</small></div><div><b>67.00</b><small>now ms</small></div>
+<div><b>16.00</b><small>model achievable ms</small></div><div><b>17.50</b><small>target ms</small></div>
+<div><b>825</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Generation-phase trtllm-gen kernel on 3072 ShardQ rows at ~30% of FP8 MMA rate; 96-&gt;128 head padding; V512 split possibly recomputes QK (hypothesis); separate quant/pad/insert prologue kernels plus an unidentified 1 ms CuTe kernel.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Decode-form kernel used for prefill</li><li>Head padding</li><li>Unfused prologue</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+</section><section class="card" id="P-GEMM">
+<header><span class="wid">P-GEMM</span><h4>Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>290</b><small>baseline ms</small></div><div><b>290</b><small>now ms</small></div>
+<div><b>245</b><small>model achievable ms</small></div><div><b>262</b><small>target ms</small></div>
+<div><b>825</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>MXFP8 KDA in_proj (unaligned N=49376) 1.16-1.40x, shared MXFP8 + SiLU-mul + quant, router/top-k/latent BF16 GEMMs 1.4x, AttnRes 6.6 ms, small BF16 GEMMs + drafter 14 ms excess.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Unaligned N tactics</li><li>Separate activation quant</li><li>Unfused router/latent epilogues</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+</section><section class="card" id="P-IDX">
+<header><span class="wid">P-IDX</span><h4>Prefill: indexer logits + exact top-k</h4>
+<span class="st st-q">queued</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
+<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<div class="nums"><div><b>61.50</b><small>baseline ms</small></div><div><b>61.50</b><small>now ms</small></div>
+<div><b>33.50</b><small>model achievable ms</small></div><div><b>37.00</b><small>target ms</small></div>
+<div><b>825</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>topk_select_bf16 2 x ~120 us/layer (7x model); indexer logits re-read.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Multi-pass top-k</li><li>Logit re-reads</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol></ol>
+
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+</section>
+</div>

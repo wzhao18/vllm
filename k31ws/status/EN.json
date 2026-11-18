@@ -1,0 +1,13 @@
+{
+ "side": "infra",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "basis": "-",
+ "shape": "-",
+ "id": "EN",
+ "title": "NVFP4 checkpoint enablement",
+ "gap_analysis": "No NVFP4 number exists: MegaMoE format hard-coded to MXFP4 (model.py:816), Rubin MegaMoE refuses NVFP4 scales (experts.py:289/442), no NVFP4 EP32 decode backend, specialized decode raises on MXFP8 projections.",
+ "next": "Native ModelOpt NVFP4 load into Rubin MegaMoE + dummy-safe NVFP4 view."
+}

@@ -1,0 +1,13 @@
+{
+ "side": "infra",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "basis": "-",
+ "shape": "-",
+ "id": "HW",
+ "title": "Vera Rubin hardware reference database",
+ "gap_analysis": "Every kernel workstream needs the VR200-specific features (tcgen05 block-scaled MMA shapes, TMEM, 2-CTA, TMA multicast/.COUNTED, CLC, PDL, locality domains, NVLink6 multimem) and their measured costs in one place.",
+ "next": "Build the private hwdb and the per-workstream feature briefs."
+}

@@ -1,0 +1,25 @@
+{
+ "side": "decode",
+ "step_ms": 30.5,
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
+ "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
+ ],
+ "id": "D-KDA",
+ "title": "Decode: KDA core (FP32 state)",
+ "baseline_ms": 3.4,
+ "current_ms": 3.4,
+ "achievable_ms": 1.7,
+ "target_ms": 1.9,
+ "gap_analysis": "KdaWide 30-49 us/layer vs 14-25 modelled: ~35% of HBM on 166 MB FP32 state per layer; per-(head-group, request) CTA grid latency-bound on the q=4 serial update; KdaWS above B80 is a separate kernel.",
+ "inefficiencies": [
+  "Latency-bound CTA grid",
+  "35% HBM utilization on state stream",
+  "Two kernels across batch sizes"
+ ]
+}

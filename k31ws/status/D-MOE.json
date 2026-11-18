@@ -1,0 +1,26 @@
+{
+ "side": "decode",
+ "step_ms": 30.5,
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
+ "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
+ "state": "queued",
+ "owner": "unassigned",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
+ ],
+ "id": "D-MOE",
+ "title": "Decode: MegaMoE NVFP4 EP32 + shared-expert overlap",
+ "baseline_ms": 8.3,
+ "current_ms": 8.3,
+ "achievable_ms": 4.9,
+ "target_ms": 5.4,
+ "gap_analysis": "Vendored deep_gemm fp8_fp4 MegaMoE runs 109-122 us/layer vs FI 91-95 us standalone; ~50 us fixed per call; shared experts run serially after MegaMoE; no NVFP4 EP32 decode backend exists yet.",
+ "inefficiencies": [
+  "Old vendored kernel",
+  "Fixed per-call chain (~50 us/layer)",
+  "Shared experts not overlapped",
+  "NVFP4 W4A4 path missing at EP32"
+ ]
+}

@@ -1,0 +1,25 @@
+{
+ "side": "prefill",
+ "step_ms": 825,
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
+ "state": "queued",
+ "owner": "unassigned",
+ "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
+ "updated": "2026-11-18T12:40-08:00",
+ "work": [],
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md"
+ ],
+ "id": "P-MOE",
+ "title": "Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream",
+ "baseline_ms": 320,
+ "current_ms": 320,
+ "achievable_ms": 198,
+ "target_ms": 218,
+ "gap_analysis": "Vendored megamoe_rubin NVFP4 in-step inferred 281-358 ms vs FI 230.7 ms standalone (2x8K) vs model 197.9; separate router/reduce staging kernels; link-bound layer (1.97 ms link floor) exposes ~0.68 ms/layer of GEMM; shared experts lose their overlap when staging is removed.",
+ "inefficiencies": [
+  "Vendored kernel staging",
+  "Partial GEMM/link overlap",
+  "Shared-expert side stream starved of SMs"
+ ]
+}
