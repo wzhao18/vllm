@@ -4,26 +4,30 @@
 DCP4 = SP4 attention groups over DP4, EP16 MegaMoE, DSpark q4; ``runtime.sp_topology``).
 
 Stock keeps the residual stream row-sharded over the TP group (``sp_shard``: rank r
-owns rows [r n, (r + 1) n), n = R / 4) and runs each layer as all-gather -> attention
-on all R rows (24 of 96 heads per rank) -> o_proj -> reduce-scatter -> AttnRes on the
-shard -> MLP on the shard. This step keeps that layout and replaces only each DSA /
-KDA layer's all-gather .. reduce-scatter with one ``SpAttentionBlock``:
+owns rows [r n, (r + 1) n), n = R / 4) and runs each layer as AttnRes on the shard ->
+all-gather -> attention on all R rows (24 of 96 heads per rank) -> o_proj ->
+reduce-scatter -> AttnRes on the shard -> MLP on the shard. This step keeps that
+layout; each layer boundary is two fused kernels (``attn_res.sp_fused``, family
+``sp_boundary``): ``SpAttnResGather`` (the pre-attention AttnRes, its rows multicast
+into every rank's all-gather box) and ``SpReduceAttnRes`` (the reduce-scatter owner
+sum as the post-attention AttnRes delta), around one ``SpAttentionBlock``:
 
   stage            provider                                          family
-  all-gather       ``SpComm.all_gather`` (multicast, Lamport)        ag
+  AttnRes + AG     ``SpAttnResGather`` (multicast, Lamport)          sp_boundary
   in-projection    ``DecodeProjection`` over the gathered rows        dsa_in / kda_in
   core             ``SpDsaCore`` (DSA) / ``SpKdaCore`` (KDA)          dsa / kda
-  o_proj + RS      ``SpOproj`` (4-rank reduce-scatter)                oproj_rs
+  o_proj           ``SpOproj.produce`` (partial, or pushed by "warp") oproj_rs
+  RS + AttnRes     ``SpReduceAttnRes`` (push, owner sum, re-arm)     sp_boundary
 
 Each MegaMoE layer's MLP runs ``runtime.sp_mlp.SpMlp``: the stock layer's forward
 step for step, its four dense BF16 GEMMs (latent down / up, shared gate_up / down) on
 ``gemm.sp_policy``'s measured tactics (family ``moe_dense``).
 
 Everything else is the stock module, called as the stock forward calls it
-(``Path.DECLARED``, ``shapes.DECLARED_STOCK``): the embedding, ``_pre_attn_norm`` /
-``_post_attn_norm`` (AttnRes) on the shard, the MegaMoE router / experts / norms and the
-dense MLP on the shard (with stock's ``sp_padding_mask``), the aux streams, the final
-AttnRes, the final ``sp_all_gather`` and the norm. The verification (synthetic
+(``Path.DECLARED``, ``shapes.DECLARED_STOCK``): the embedding, the MegaMoE router /
+experts / norms and the dense MLP on the shard (with stock's ``sp_padding_mask``), the
+aux streams, the final AttnRes and the norm. The final row all-gather is
+``SpFinalGather`` (one multicast Lamport kernel; stock ``sp_all_gather``'s rows). The verification (synthetic
 rejection), LM head, sampler and the preview (MLA) DSpark drafter stay stock too, except
 the drafter's MLA attention: ``runtime.draft`` FAST_DCP's TP4 entry runs it on
 cutedsl.draft.attention DraftDcp (publish-only MlaQuery, polled cores with length-keyed
@@ -40,8 +44,8 @@ this path falls back to the stock forward.
 
 Mailbox parities: ``SpComm`` alternates by SP block ordinal (DSA and KDA together),
 the DSA DcpBox by DSA-layer ordinal. With an odd block count the last block of a step
-and the first of the next share a parity; the stock final ``sp_all_gather`` (a TP
-collective) separates them.
+and the first of the next share a parity; the final ``SpFinalGather`` (a TP
+collective: every rank polls every rank's rows) separates them.
 
 RecoverSSM: "deferred" records (``recoverssm.prepare_recoverssm``): the commit after
 sampling only stages each request's accepted count, and the next step's KDA core folds
