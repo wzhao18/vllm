@@ -160,7 +160,9 @@ def test_rubin_megamoe_rows_are_launch_independent():
     )
     from vllm.models.kimi_k3.nvidia.megamoe_rubin.runtime import RubinMegaMoE
 
-    dev = torch.device("cuda")
+    torch.cuda.set_device(0)
+    dev = torch.device("cuda", 0)
+    torch.zeros(1, device=dev)  # the CuTe DSL host queries need a current context
     problem = RubinMoeProblem(num_experts=32, quant_kind="nvfp4")
     knobs = RubinKnobs.from_dict(
         {

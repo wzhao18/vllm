@@ -488,11 +488,16 @@ class KimiK3MegaMoEExperts(nn.Module):
         )
 
     def reserve_sms_for_shared_expert(
-        self, max_sm_count: int = RUBIN_SHARED_OVERLAP_MAX_SMS
+        self,
+        max_sm_count: int = RUBIN_SHARED_OVERLAP_MAX_SMS,
+        *,
+        die_local: bool = True,
     ) -> None:
         """Cap this layer's persistent grid at ``max_sm_count`` (default
         :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`, the decode SP measurement) so a shared
         expert the caller runs on another stream gets the remaining SMs.
+        ``die_local=False`` keeps the cap where the decode die-local policy would
+        take the full grid (the prefill-sized wide-EP layers).
         Every layer of the EP group must make the same call (the bucket keys the
         shared runtime); it must come before the runtime is built."""
         if self.kernel_weights is not None:
@@ -515,7 +520,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         # (bitwise equal). Capped, each die's stream gets the clusters the side
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
         die_mask = None
-        if not self.prefill_worker and all(
+        if die_local and not self.prefill_worker and all(
             bucket.variant == "inference"
             and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
             for bucket in self.buckets
