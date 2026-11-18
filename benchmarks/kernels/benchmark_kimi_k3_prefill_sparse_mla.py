@@ -82,6 +82,7 @@ def main():
     ap.add_argument("--iters", type=int, default=9)
     ap.add_argument("--json", default=None)
     ap.add_argument("--only", default="")
+    ap.add_argument("--loaders", default="3,5")
     a = ap.parse_args()
     dev = torch.device("cuda")
     torch.manual_seed(0)
@@ -182,6 +183,31 @@ def main():
     torch.cuda.synchronize()
     res["attn_finite"] = bool(torch.isfinite(out[:, :H].float()).all())
     st["attn_trtllm"] = time_stage(attn, a.iters)
+    # specialized_prefill sparse MLA (sm_107, native 96 heads, no padded query)
+    try:
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
+            sparse_mla_prefill,
+        )
+
+        vr_out = torch.empty(F, H, L, device=dev, dtype=torch.bfloat16)
+        for nl in [int(x) for x in a.loaders.split(",")]:
+
+            def vr(i, nl=nl):
+                kv, idx = layers[i % len(layers)]
+                sparse_mla_prefill(qf3, kv.view(-1, 576), 64, idx, seq, 0.0722, 1.0,
+                                   out=vr_out, loaders=nl)
+
+            vr(0)
+            torch.cuda.synchronize()
+            d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
+            rel = (d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+            res[f"vr_l{nl}_rel_vs_trtllm"] = rel
+            st[f"attn_vr_l{nl}"] = time_stage(vr, a.iters)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        res["vr_error"] = repr(e)[:400]
     o = torch.empty(F, H * V, device=dev, dtype=torch.bfloat16)
 
     def w_uv(i):

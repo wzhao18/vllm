@@ -1172,6 +1172,20 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 "FLASHINFER_MLA_SPARSE: FlashInfer prims_ts sparse MLA (%s cache)",
                 kv_cache_dtype,
             )
+        # Kimi K3.1 at TP1 (DEP16 prefill, 96 heads, per-tensor FP8 cache) on
+        # Rubin: prefill-sized MQA calls run the specialized prefill sparse MLA
+        # (native 96 heads, no padded query); smaller calls keep trtllm-gen.
+        self._prefill_sparse_mla = None
+        if not self.use_prims_ts and self.dcp_world_size == 1 and not self.use_shardq:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import sparse_mla
+
+            if sparse_mla.supported(
+                self.num_heads,
+                kv_cache_dtype,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            ):
+                self._prefill_sparse_mla = sparse_mla
         # The DCP path's rows that the memory profile claims a working set for
         # (_reserve_trtllm_gen): MLAAttention runs a step's DCP-path MQA in
         # row chunks of at most this many rows (dense-MHA steps have more).
@@ -1221,13 +1235,20 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if self.dcp_world_size > 1 or self.use_shardq:
             return None
         num_heads = ql_nope.shape[1]
-        padded = decode_query_quant_pad(
-            ql_nope, q_pe, q_scale, self._decode_query_heads(num_heads)
+        heads = (
+            num_heads
+            if self._runs_prefill_sparse_mla(ql_nope.shape[0])
+            else self._decode_query_heads(num_heads)
         )
+        padded = decode_query_quant_pad(ql_nope, q_pe, q_scale, heads)
         if padded is None:
             return None
         self._fused_query = padded
         return padded[:, :num_heads]
+
+    def _runs_prefill_sparse_mla(self, num_rows: int) -> bool:
+        psm = getattr(self, "_prefill_sparse_mla", None)
+        return psm is not None and num_rows >= psm.MIN_ROWS
 
     def fuses_decode_query_quant(self) -> bool:
         """Whether ``quantize_decode_query`` takes this layer's MQA query (it
@@ -1552,6 +1573,25 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         assert self._workspace_buffer is not None
         assert self.bmm1_scale is not None
         assert self.bmm2_scale is not None
+
+        if not return_lse and self._runs_prefill_sparse_mla(q.shape[0]):
+            psm = self._prefill_sparse_mla
+            assert psm is not None and q.dtype == torch.float8_e4m3fn, q.dtype
+            if q.shape[1] != psm.H or not q.is_contiguous():
+                q = q[:, : psm.H].contiguous()
+            kv_rows, _ = flat_kv_row_view(kv_cache.view(q.dtype), block_size)
+            # Physical slots are flat rows of kv_rows (block stride included).
+            out = psm.sparse_mla_prefill(
+                q,
+                kv_rows,
+                64,
+                topk_indices,
+                seq_lens,
+                self.bmm1_scale,
+                self.bmm2_scale,
+            )
+            self._fused_query = None
+            return out, None
 
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
