@@ -13,7 +13,7 @@
 
 namespace {
 
-constexpr int kRows = 4;  // rows in flight per warp
+constexpr int kRows = 8;  // rows in flight per warp
 
 __device__ __forceinline__ uint2 ld_nc_v2(const void* p) {
   uint2 v;
@@ -31,27 +31,29 @@ __device__ __forceinline__ void unpack4(uint2 v, float (&f)[4]) {
 }
 
 __global__ void __launch_bounds__(256) o_norm_mx_kernel(
-    const __nv_bfloat16* __restrict__ x, int64_t rows, int heads,
+    const __nv_bfloat16* __restrict__ x, int rows, int heads,
     NormMxArgs const a) {
   const int lane = threadIdx.x % 32;
-  const int64_t warp = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
-  const int64_t nwarps = int64_t(gridDim.x) * blockDim.x / 32;
+  // 32-bit row arithmetic (rows < 2^31; a 64-bit division per row costs more
+  // than the row itself).
+  const int warp = int((blockIdx.x * blockDim.x + threadIdx.x) / 32);
+  const int nwarps = int(gridDim.x * blockDim.x / 32);
   float w[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) w[i] = a.w[lane * 4 + i];
-  for (int64_t r0 = warp * kRows; r0 < rows; r0 += nwarps * kRows) {
+  for (int r0 = warp * kRows; r0 < rows; r0 += nwarps * kRows) {
     uint2 xv[kRows], gv[kRows];
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
-      const int64_t r = min(r0 + j, rows - 1);
-      const int64_t tok = r / heads, head = r % heads;
-      xv[j] = ld_nc_v2(x + r * 128 + lane * 4);
-      gv[j] = ld_nc_v2(static_cast<const __nv_bfloat16*>(a.g) + tok * a.g_ld +
-                       head * 128 + lane * 4);
+      const int r = min(r0 + j, rows - 1);
+      const int tok = r / heads, head = r - tok * heads;
+      xv[j] = ld_nc_v2(x + int64_t(r) * 128 + lane * 4);
+      gv[j] = ld_nc_v2(static_cast<const __nv_bfloat16*>(a.g) +
+                       int64_t(tok) * a.g_ld + head * 128 + lane * 4);
     }
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
-      const int64_t r = r0 + j;
+      const int r = r0 + j;
       if (r >= rows) break;
       float xf[4], gf[4];
       unpack4(xv[j], xf);
@@ -82,14 +84,14 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
           uint32_t(norm_mx::fp8x2(__fmul_rn(y[0], inv), __fmul_rn(y[1], inv))) |
           (uint32_t(norm_mx::fp8x2(__fmul_rn(y[2], inv), __fmul_rn(y[3], inv)))
            << 16);
-      const int64_t tok = r / heads, head = r % heads;
-      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.q) + tok * a.q_ld +
+      const int tok = r / heads, head = r - tok * heads;
+      *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.q) + int64_t(tok) * a.q_ld +
                                    head * 128 + lane * 4) = q;
       if (lane % 8 == 0) {
-        const int64_t col = head * 4 + lane / 8;
-        const int64_t off = (col % 4) + (col / 4) * 512 + (tok % 32) * 16 +
+        const int col = head * 4 + lane / 8;
+        const int off = (col % 4) + (col / 4) * 512 + (tok % 32) * 16 +
                             ((tok % 128) / 32) * 4 +
-                            (tok / 128) * (128 * int64_t(a.sf_cols));
+                        (tok / 128) * (128 * a.sf_cols);
         static_cast<uint8_t*>(a.sf)[off] = uint8_t(e);
       }
     }
@@ -106,5 +108,5 @@ void launch_o_norm_mx(const void* x, int64_t tokens, int heads,
   const int64_t blocks =
       std::min<int64_t>((warps_needed + 7) / 8, int64_t(num_sms) * 8);
   o_norm_mx_kernel<<<dim3(unsigned(blocks)), dim3(256), 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(x), rows, heads, a);
+      static_cast<const __nv_bfloat16*>(x), int(rows), heads, a);
 }
