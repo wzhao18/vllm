@@ -40,7 +40,7 @@ BLOCK = 12
 NBLOCKS = 8
 SENTINEL = -0x80000000
 ROWS = (16, 128, 384)  # n = 4 / 32 / 96 per rank at TP4
-LAYERS = (0, 1, 5, 12, 13, 50, 92)
+LAYERS = (0, 1, 12, 13, 92)  # first, plain, block write, after one, 8 blocks
 
 
 def _cdiv(a, b):
@@ -127,7 +127,7 @@ def _worker(env: dict[str, str]) -> None:
                 d = None if layer == 0 else delta
                 bound = sp_fused.SpBoundary(
                     comm, (pre_w, eps), (post_w, eps), prev,
-                    layer // BLOCK if write else -1, n, {rows: True},
+                    layer // BLOCK if write else -1, CAP // world, {rows: True},
                 )  # fmt: skip
                 res = {}
                 for mode in ("stock", "fused"):
