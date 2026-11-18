@@ -339,7 +339,8 @@ class SpOproj:
         """The o-projection half only, for an owner kernel that follows
         (``attn_res.sp_fused.SpReduceAttnRes``): the GEMM tactics write the partial
         [R, 7168] into ``comm.partial`` and return it (the owner kernel pushes it);
-        "warp" pushes from the GEMM and returns None."""
+        "warp" pushes from the GEMM and returns None. (The MXFP8 o-projection is a
+        GEMM tactic: "mxfp8".)"""
         rows = attn_out.shape[0]
         tactic = self._checked(attn_out)
         comm = self.comm
@@ -347,7 +348,7 @@ class SpOproj:
             partial = comm.partial[:rows]
             torch.mm(attn_out, self.weight.t(), out=partial)
             return partial
-        if tactic == "gemm":
+        if tactic in ("gemm", "mxfp8"):
             partial = comm.partial[:rows]
             self.gemm.run(attn_out, partial)
             return partial
