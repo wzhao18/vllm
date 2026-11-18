@@ -25,7 +25,7 @@ is one ``ClusterAttnRes`` (one 7-CTA cluster per shard row, 1024 columns per CTA
 Each CTA only touches its own 1024 columns of its token's rows, so no grid-wide
 striding; every CTA polls rows that other ranks' CTAs of the same (column, token) store
 in the same kernel, so the whole grid must be co-resident on every rank (checked at
-build: ``max_active_clusters`` >= n).
+build: 7 n CTAs within the per-SM occupancy).
 
 Precision: the AttnRes is ``ClusterAttnRes``'s (stock precision: FP32 statistics, the
 softmax over the saved blocks and the prefix, one BF16 rounding of the normed output;
@@ -42,7 +42,7 @@ import torch
 from cutlass import Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import architecture, dynamic_fake, fake, max_active_clusters
+from ..common.host import architecture, dynamic_fake, fake
 from ..common.mailbox import poll, rearm
 from ..common.primitives import at, launch, load_words, store_relaxed
 from ..common.sp_comm import positive_zero32
@@ -144,21 +144,39 @@ def _options(device):
     return dict(stores_first=rubin, spread_push=rubin, poll_warp=rubin)
 
 
+def _occupancy(code, device):
+    """(CTAs per SM, SMs, registers, max dynamic smem attribute) at this kernel's own
+    shared memory (``kernel.SMEM_BYTES``; the function's max-dynamic attribute is
+    the allowance, not the request)."""
+    import cuda.bindings.driver as cuda
+
+    from ..common.host import _checked, kernel_registers, resolve_kernel
+    from .kernel import SMEM_BYTES
+
+    _, function = resolve_kernel(code, device)
+    attribute = cuda.CUfunction_attribute
+    (allowed,) = _checked(cuda.cuFuncGetAttribute(
+        attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function
+    ))  # fmt: skip
+    (per_sm,) = _checked(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        function, THREADS, SMEM_BYTES
+    ))  # fmt: skip
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return per_sm, sms, kernel_registers(code, device), allowed
+
+
 def _check_clusters(code, device, n_max, what):
     """Every CTA of the grid co-resident (they poll one another across ranks)."""
-    from ..common.host import occupancy
-
-    per_sm, sms = occupancy(code, device, THREADS)
-    clusters = max_active_clusters(code, device, (CLUSTER, n_max, 1), THREADS, CLUSTER)
+    per_sm, sms, registers, allowed = _occupancy(code, device)
     if CLUSTER * n_max > per_sm * sms:
         from ...shapes import Unsupported
 
         raise Unsupported(
             "sp_comm", None,
             f"{what}: {n_max} 7-CTA clusters cannot be co-resident ({per_sm} CTAs "
-            f"per SM x {sms} SMs; cluster API {clusters})",
+            f"per SM x {sms} SMs; {registers} registers, smem allowance {allowed})",
         )  # fmt: skip
-    return per_sm, sms, clusters
+    return per_sm, sms, registers, allowed
 
 
 @cache

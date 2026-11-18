@@ -127,7 +127,7 @@ def _worker(env: dict[str, str]) -> None:
                 d = None if layer == 0 else delta
                 bound = sp_fused.SpBoundary(
                     comm, (pre_w, eps), (post_w, eps), prev,
-                    layer // BLOCK if write else -1, CAP // world, {rows: True},
+                    layer // BLOCK if write else -1, n, {rows: True},
                 )  # fmt: skip
                 res = {}
                 for mode in ("stock", "fused"):

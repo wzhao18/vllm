@@ -81,7 +81,7 @@ class Chain:
                 eps = (1e-6, 1e-6)
                 self._b.append(sp_fused.SpBoundary(
                     self.comm, (self.w[layer][0], eps), (self.w[layer][1], eps),
-                    prev, write, CAP // self.world, {self.rows: True},
+                    prev, write, self.n, {self.rows: True},
                 ))
         return self._b
 
