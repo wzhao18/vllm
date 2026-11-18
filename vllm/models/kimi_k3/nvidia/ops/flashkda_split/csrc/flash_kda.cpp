@@ -408,14 +408,15 @@ void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
   const int64_t P = H * 128;
   const int64_t T = x.numel() / P;
   STD_TORCH_CHECK(g.dim() == 2 && g.size(0) >= T && g.size(1) >= P &&
-                      g.stride(1) == 1 && g.stride(0) % 4 == 0 &&
+                      g.stride(1) == 1 && g.stride(0) % 8 == 0 &&
+                      reinterpret_cast<uintptr_t>(g.const_data_ptr()) % 16 == 0 &&
                       g.scalar_type() == ScalarType::BFloat16,
                   "o_norm_mxfp8: g must be bf16 (T, >= P) unit-stride rows");
   STD_TORCH_CHECK(weight.numel() == 128 && weight.is_contiguous() &&
                       weight.scalar_type() == ScalarType::Float,
                   "o_norm_mxfp8: weight must be FP32 [128]");
   STD_TORCH_CHECK(q.dim() == 2 && q.size(0) >= T && q.size(1) == P &&
-                      q.stride(1) == 1 && q.stride(0) % 4 == 0 &&
+                      q.stride(1) == 1 && q.stride(0) % 16 == 0 &&
                       q.scalar_type() == ScalarType::Float8_e4m3fn,
                   "o_norm_mxfp8: q must be e4m3 (T, P) unit-stride rows");
   STD_TORCH_CHECK(sf.is_contiguous() && sf.scalar_type() == ScalarType::Byte &&

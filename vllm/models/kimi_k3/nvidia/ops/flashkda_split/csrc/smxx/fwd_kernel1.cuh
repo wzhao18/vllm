@@ -85,7 +85,8 @@ template <class TmaLoadQ, class TmaLoadK, class TmaLoadBeta, class TmaLoadG,
           class TmaLoadDtBias, int CHUNK, int D, int NumThreads,
           bool IsVarlen = true, typename SeqlenT = int64_t,
           bool FusedConv = false>
-__global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+// Kimi-K3: FusedConv runs at 6 CTAs per SM (85 registers: no spills).
+__global__ void __launch_bounds__(NumThreads, FusedConv ? 6 : 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaLoadQ const tma_load_q,
     CUTE_GRID_CONSTANT TmaLoadK const tma_load_k,
     CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
