@@ -94,5 +94,6 @@
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw3/log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/mma2/log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw4/log"
- ]
+ ],
+ "ckpt": "pending"
 }

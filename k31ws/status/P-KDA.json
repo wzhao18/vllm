@@ -54,5 +54,6 @@
  "evidence": [
   "perf-model/plan/PLAN_NVFP4.md",
   "perf-model/microbench/results/ops1 kda-077"
- ]
+ ],
+ "ckpt": "pending"
 }

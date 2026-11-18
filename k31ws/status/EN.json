@@ -74,5 +74,6 @@
   "Rhea: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/EN/",
   "tests/models/kimi_k3/test_megamoe_rubin_conversion.py, test_megamoe_rubin_integration.py, test_k31_nvfp4_quant_layout.py",
   "Rhea: runs/EN/t4.log (145 passed)"
- ]
+ ],
+ "ckpt": "pending"
 }

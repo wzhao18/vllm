@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-MLA workflow agent",
  "state": "implementing",
- "updated": "2026-11-18T13:55-08:00",
+ "updated": "2026-11-18T13:35-08:00",
  "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, 96 heads/GPU, top-2048, FP8 KV 576 B rows; 24 DSA layers",
  "step_ms": 825,
  "baseline_ms": 67,
@@ -72,15 +72,26 @@
    "t": "13:55",
    "what": "Wrote specialized_prefill/sparse_mla.py (keys-on-M, native 96 heads, dense 2x-K FP8 MMAs, per-tensor FP8 Q, cp.async row loaders; port of the GB300 T96 v2 prototype) + FLASHINFER_MLA_SPARSE per-shape dispatch (DCP1, no ShardQ, >=1024 rows) + tests + bench stage",
    "result": "committed a79dc10676 (WIP); run6 (test + F16K bench) queued, both pool holds busy with 4-GPU jobs"
+  },
+  {
+   "t": "13:30",
+   "what": "Pipelined variant: exclusive 576-col TMEM, double S^T/P^T, MMA order QK(t+1) before PV(t), explicit PV-done wait for the lazy O rescale; both variants in tests + bench (run7 queued; run6 cancelled in favour of run7)",
+   "result": "committed 9e139d9dbe; pool contended (many 4-GPU jobs queued), run5 (die-local gather + fused query test) and run7 waiting"
+  },
+  {
+   "t": "13:30",
+   "what": "hwdb answer P-MLA-1 read: remote-homed lines are cached in the reading die L2 (a 45 MB request KV becomes L2-resident on both dies after first touch); M64 = half rate; non-scaled FP8 K64 = idesc bit 29 (as used); MUFU ex2 rate confirmed sufficient for the keys-on-M softmax",
+   "result": "die-local KV placement expected to save only first-touch stitch traffic for P-MLA; run5 measures die-0-homed vs striped gather per die before planning placement (directive 2026-11-18)"
   }
  ],
- "next": "run6: correctness vs FP32 ref and vs trtllm-gen, F16K timing with 3/5 loader warps; then v2: exclusive 576-col TMEM with double-buffered S^T and QK(t+1) before PV(t), more loader warps (setmaxnreg), oversized SMEM for a 3rd KV stage if the DSL launch allows it",
+ "next": "run7: correctness (FP32 ref, trtllm-gen) and F16K timing of base/pipelined x 3/5 loader warps; pick the per-shape default; then loader throughput (more warps via setmaxnreg or TMA gather4 producers) toward the ~18 TB/s gather floor; run5: die-local vs striped gather per die",
  "blockers": "ncu/nsys are not in the image (/usr/local/cuda/bin): root causes are from probes and timing, labelled where inferred",
- "branch": "wzhao/k31ws-p-mla @ a79dc10676 (pushed to wzhao18)",
+ "branch": "wzhao/k31ws-p-mla @ 9e139d9dbe (pushed to wzhao18)",
  "evidence": [
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1 (stock chain)",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run2 (MMA operand fetch, LDG gather)",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run3 (SMEM contention, gather4)",
   "k31ws/findings/P-MLA.md"
- ]
+ ],
+ "ckpt": "pending"
 }

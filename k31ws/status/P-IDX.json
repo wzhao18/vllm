@@ -3,21 +3,21 @@
  "title": "Prefill: indexer logits + exact top-k",
  "side": "prefill",
  "owner": "P-IDX workflow agent",
- "state": "analysis",
- "updated": "2026-11-18T13:25-08:00",
+ "state": "implementing",
+ "updated": "2026-11-18T13:55-08:00",
  "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, per GPU, 24 DSA layers",
- "baseline_ms": 61.5,
- "current_ms": 61.5,
+ "baseline_ms": 53.3,
+ "current_ms": 53.3,
  "achievable_ms": 33.5,
  "target_ms": 37,
  "step_ms": 825,
- "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt); 1-GPU stock microbench at the deployed shape running",
- "gap_analysis": "Stock prefill indexer per layer (per GPU): 12 chunks (512 MB logits budget -> 1712 rows x 78K keys per chunk), each = DeepGEMM sm100_mqa_logits (MXFP4 x MXFP4 with the 1x-K block-scaled MMA, BF16 logits written to HBM) + trtllm_gvr2 BF16 exact top-k re-reading the logits. Model achievable per layer: idx_score 1.206 ms (bound 'simt': FP32 relu + head-weight FMA epilogue) + topk 0.188 ms. READ FROM SOURCE (not yet measured): the stock DeepGEMM epilogue is NOT FP32: it is cvt.rn.relu.bf16x2.f32 + packed BF16 HFMA2 with BF16 weights (4 BF16 partial lanes, hadd2 combine), so the model's FP32-SIMT epilogue term over-prices stock math by about 2x (model error, to be confirmed by measurement).",
+ "basis": "MEASURED 1-GPU stock microbench at the deployed per-GPU shape (runs/P-IDX/stock1.log), x24 DSA layers",
+ "gap_analysis": "Stock per DSA layer (1 GPU, 3 x 5461 rows @ 78360 keys, 12 chunks of 512 MB): 2.222 ms = DeepGEMM sm100_mqa_logits 1.558 ms + trtllm_gvr2 BF16 top-k 0.648 ms + weights cast 0.026 ms (x24 = 53.3 ms/forward; the 61.5 ledger projection was high). Model achievable 1.394 ms/layer = idx_score 1.206 (bound: FP32 SIMT epilogue) + topk 0.188. Stock source shows the epilogue is packed BF16 (cvt.rn.relu.bf16x2.f32 + fma.rn.bf16x2, 34 instr per 32 heads), so the true issue floor at stock precision is about 0.66 ms/layer for the logits plus a few instr/element for an in-epilogue exact select -> derived achievable about 0.75 ms/layer (18 ms/forward): the model over-prices this family about 1.9x (model error, to report). Stock inefficiencies: logits kernel runs at about 2.3x the epilogue issue floor (1x-K MMA, BLOCK_Q 4, 3 math WGs) and writes 2.5 GB/layer of BF16 logits that the GVR top-k re-reads (0.65 ms/layer).",
  "inefficiencies": [
-  "HYPOTHESIS: logits materialised in HBM (BF16, ~2.5 GB/layer write + >=1 read by the top-k)",
-  "HYPOTHESIS: stock MMA uses the sm_100 1x-K MXF4 descriptor (half the sm_107 FP4 rate)",
-  "Multi-pass sampling top-k (GVR) over the materialised logits, 12 chunk launches per layer",
-  "Model: idx_score epilogue priced as FP32 SIMT while stock is packed BF16 (model too pessimistic)"
+  "MEASURED: GVR top-k 0.648 ms/layer re-reading materialised BF16 logits (12 chunk launches)",
+  "MEASURED: logits kernel 1.558 ms/layer vs ~0.66 ms epilogue issue floor (2.3x); HYPOTHESIS: 1x-K MMA + BLOCK_Q 4 + epilogue under-occupancy",
+  "Logits round trip through HBM (2.5 GB write + read per layer)",
+  "MODEL ERROR: idx_score epilogue priced as FP32 SIMT; stock math is packed BF16"
  ],
  "rubin_features": [
   "2x-K block-scaled MMA (mxf4 K128) via sm_107a descriptors",
@@ -27,21 +27,36 @@
   "PDL / kernel fusion (expensive kernel boundaries)"
  ],
  "plan": [
-  "Measure stock per-layer time and kernel split at the deployed shape (1 GPU microbench)",
-  "Root-cause logits kernel vs model (MMA kind, epilogue issue rate) and top-k passes",
-  "Design fused sm_107 logits + exact single-pass histogram select (no logits round trip), exact graph-safe overflow path",
-  "Numerics test vs stock logits (bitwise where order unchanged) + exact top-k test",
-  "Microbench vs model, then step A/B with INFRA step_p harness",
-  "Land in vllm/models/kimi_k3/nvidia/specialized_prefill with stock wiring only"
+  "Fused sm_107 CuTe kernel (in progress, specialized_prefill/indexer.py): 2x-K MXF4 MMA (N=256: 8 tokens x 32 heads), 4 epilogue WGs, exact streaming top-k in smem (running threshold + compaction, ties to lowest index), no logits in HBM",
+  "Correctness: logits vs DeepGEMM (bitwise share), exact top-k vs torch reference",
+  "Perf at P3-16 shape vs 0.75 ms/layer floor; tune (WG count, BQ, multicast)",
+  "Ascending-order output + wiring in sparse_attn_indexer prefill path (stock wiring only), unit test",
+  "Step A/B on INFRA step_p harness"
  ],
  "work": [
-  {"t": "13:25", "what": "Read stock path (sparse_attn_indexer chunk loop, DeepGEMM sm100_mqa_logits source from the image, trtllm_gvr2 prefill)", "result": "stock epilogue is packed BF16 (cvt relu bf16x2 + hfma2), logits BF16; 12 chunks/layer at 512 MB budget"}
+  {
+   "t": "13:25",
+   "what": "Read stock path (sparse_attn_indexer chunk loop, DeepGEMM sm100_mqa_logits source from the image, trtllm_gvr2 prefill)",
+   "result": "stock epilogue is packed BF16 (cvt relu bf16x2 + hfma2), logits BF16; 12 chunks/layer at 512 MB budget"
+  },
+  {
+   "t": "13:27",
+   "what": "1-GPU stock microbench at P3-16 shape",
+   "result": "2.222 ms/layer (logits 1.558 + GVR 0.648 + cast 0.026) -> 53.3 ms/forward"
+  },
+  {
+   "t": "13:50",
+   "what": "Wrote fused score+select CuTe kernel v1 + check/perf bench; staged overlay p-idx-4fbaa15-1",
+   "result": "first compile/run queued"
+  }
  ],
- "next": "Run 1-GPU stock microbench (runs/P-IDX/bench_pidx_prefill_indexer.py) at 3 x 5461 @ 78360",
+ "next": "Compile/correctness of fused kernel (runs/P-IDX/fused1.log), then perf at P3-16 shape",
  "blockers": "",
  "branch": "wzhao/k31ws-p-idx @ 4fbaa15189",
  "evidence": [
-  "perf-model/plan/PLAN_NVFP4.md",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/"
- ]
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/stock1.log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/stock1.json",
+  "perf-model/plan/PLAN_NVFP4.md"
+ ],
+ "ckpt": "pending"
 }

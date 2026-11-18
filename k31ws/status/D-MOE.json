@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-MOE agent (workflow)",
  "state": "measuring",
- "updated": "2026-11-18T13:20-08:00",
+ "updated": "2026-11-18T13:45-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), SP shard = 96 MoE tokens per GPU, 28 local experts, top-16, L~135K, k=3",
  "baseline_ms": 8.3,
  "current_ms": 8.3,
@@ -12,13 +12,14 @@
  "target_ms": 4.8,
  "step_ms": 30.5,
  "basis": "baseline: coordinator seed (gap512 EP16 B92 moved to EP32). achievable: model rows at EP32 T=96 tokens/GPU: MegaMoE 37.0 us/layer (ops + P11/P12; moe_ep32 t_ach interp T64/T128) x 92 = 3.40 ms + shared experts MXFP8 0.95 ms (optables nvfp4 D3-32 r8/r32 interp) = 4.35 ms. Measured FI a368c5f66 1-GPU (28 experts, no comm) T96 = 48.9 us/layer.",
- "gap_analysis": "MEASURED 1-GPU EP32-shape emulation (FI a368c5f66, 28 local experts, random top-16, NVFP4, CUDA graph x10, no NVLink): per layer 34.7 / 43.7 / 45.1 / 48.9 / 52.3 us at T 1/4/32/96/128. Per call at T96: main persistent kernel 43.7 us, router kernel 3.5, separate BF16 top-k reduce 2.7, NVFP4 quant+stage 1.9 (partly PDL-overlapped). Hecate EP32 (same kernel, 32 GPUs) adds ~17 us of dispatch/combine at T64-T128 (62.8/69.1 us). The weight stream itself is not the limit: going from ~13 active experts (T1) to 28 (T96) adds ~13 us for ~2x the bytes, i.e. the marginal stream runs near the die-local HBM rate, while ~18-20 us per call is fixed overhead inside the main kernel even with no comm (startup, sizes-ready wait, FC1->FC2 per-expert dependency tail, combine/finalize), plus ~5-8 us in the 3 side kernels. So the gap to the model (37 us/layer incl. comm) = fixed in-kernel latency (~18 us) + comm latency not overlapped with the weight stream (~17 us) + side kernels. Profilers: ncu not found in the image on PATH (probing).",
+ "gap_analysis": "MEASURED 1-GPU EP32-shape emulation (FI a368c5f66, 28 local experts, random top-16, NVFP4, CUDA graph x10, no NVLink): per layer 34.7 / 43.7 / 45.1 / 48.9 / 52.3 us at T 1/4/32/96/128. Per call at T96: main persistent kernel 43.7 us, router kernel 3.5, separate BF16 top-k reduce 2.7, NVFP4 quant+stage 1.9 (partly PDL-overlapped). Hecate EP32 (same kernel, 32 GPUs) adds ~17 us of dispatch/combine at T64-T128 (62.8/69.1 us). The weight stream itself is not the limit: going from ~13 active experts (T1) to 28 (T96) adds ~13 us for ~2x the bytes, i.e. the marginal stream runs near the die-local HBM rate, while ~18-20 us per call is fixed overhead inside the main kernel even with no comm (startup, sizes-ready wait, FC1->FC2 per-expert dependency tail, combine/finalize), plus ~5-8 us in the 3 side kernels. So the gap to the model (37 us/layer incl. comm) = fixed in-kernel latency (~18 us) + comm latency not overlapped with the weight stream (~17 us) + side kernels. In-kernel stamps (T96, 1 GPU): front ~3 us (quant/stage + router before weights stream), stream ~34 us, tail ~5-6 us (CTA end imbalance ~4 us + barrier ~1.2 us), separate reduce ~3 us. No ncu/nsys in the image: diagnostics use globaltimer stamps on the kernel iket ranges.",
  "inefficiencies": [
-  "MEASURED: ~18-20 us/call fixed latency inside the persistent MegaMoE kernel at the EP32 per-GPU shape even without NVLink (T1 30.7 us kernel vs T96 43.7 us)",
-  "MEASURED: dispatch/combine latency at EP32 ~17 us/call on top (EP32 66 vs 1-GPU 49 us at T96), not hidden behind the weight stream",
-  "MEASURED: 3 side kernels per call (router 3.5, top-k reduce 2.7, quant/stage 1.9 us at T96)",
-  "HYPOTHESIS: weight streaming waits for sizes_ready (scheduler gate) although at T>=4 every local expert is active -> weight prefetch could start at kernel entry",
-  "In-tree D3-32 runs vendored DeepGEMM fp8_fp4 (no NVFP4 EP32 backend); shared experts serial on that path"
+  "MEASURED (stamps, 1 GPU T96): weights stream only after the router publishes sizes (~3 us after the call starts); at T>=4 every local expert is active so the weight stream does not depend on routing",
+  "MEASURED: CTA finish imbalance ~4 us at the end of the stream (median vs max last-MMA end), then a ~1.2 us tail barrier",
+  "MEASURED: separate BF16 top-k reduce kernel ~2.7 us and NVFP4 quant/stage kernel ~1.9 us per call around the persistent kernel",
+  "MEASURED (Hecate EP32 vs 1 GPU): ~17 us/call of dispatch/combine latency not hidden behind the weight stream at EP32",
+  "MEASURED: stream phase itself ~85-90% of the die-local HBM rate (weights die-localized + die_split active)",
+  "In-tree D3-32 runs vendored DeepGEMM fp8_fp4 (no NVFP4 EP32 backend); shared experts serial on that path (fix: megamoe_rubin re-vendor, landed on the branch)"
  ],
  "rubin_features": [
   "NVFP4 block-scaled tcgen05 MMA (E4M3 block-16 scales)",
@@ -55,6 +56,16 @@
    "t": "13:15",
    "what": "b0: FI a368c5f66 1-GPU, 28 experts, NVFP4, T 1/4/32/96/128",
    "result": "34.7/43.7/45.1/48.9/52.3 us per layer; main kernel 30.7/39.3/40.5/43.7/46.9 us; runs/D-MOE/out/b0-ep1-nvfp4.json"
+  },
+  {
+   "t": "13:40",
+   "what": "diagnostic globaltimer stamps on every iket range of the FI a368c5f66 kernel (diagnostic FI tree only, runs/D-MOE/fi-a368c-stamp), 1 GPU 28 experts NVFP4 T96",
+   "result": "router kernel 0-2.6 us; main-kernel CTAs start 1.5 us (PDL), sizes ready 3.0 us; local token pull 3.2-8.6 us (max 11.6); weight stream until last MMA 35.4 us median / 39.6 max (~4 us CTA end imbalance); epilogue end 39.8; tail barrier ends 41.0; then the separate top-k reduce kernel (~3 us). Stream phase ~33-36 us runs at ~85-90% of the die-local HBM rate"
+  },
+  {
+   "t": "13:40",
+   "what": "FI multi-rank bench at EP4",
+   "result": "not runnable in the K3.1 image (FI current provider needs nvshmem4py); multi-GPU work goes through the vendored megamoe_rubin (torch symmetric memory) instead"
   }
  ],
  "next": "v1 (vendored megamoe_rubin unit tests + EP4 112-expert bench), b0 EP4 + MX; profiler probe; then in-kernel phase timing (clock stamps) to split the ~18 us fixed latency",
@@ -65,5 +76,6 @@
   "perf-model/microbench/results/gap512/parsed/decode_families.txt",
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/",
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/out/b0-ep1-nvfp4.json"
- ]
+ ],
+ "ckpt": "pending"
 }

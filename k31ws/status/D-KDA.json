@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent",
  "state": "implementing",
- "updated": "2026-11-18T12:50-08:00",
+ "updated": "2026-11-18T13:45-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3; per GPU 24 KDA heads x 96 requests = 2304 (request, head) items/layer",
  "baseline_ms": 3.4,
  "current_ms": 3.4,
@@ -12,12 +12,13 @@
  "target_ms": 1.99,
  "step_ms": 29.78,
  "basis": "MEASURED: Rhea 1-node profile, 93-layer projection (perf-model/microbench/results/rhea1n_d3x32)",
- "gap_analysis": "KdaWide 30-49 us/layer vs model 8.8 (B32) / 26.3 (B96) us/layer. Model achievable is memory bound: per (request, head) item 64 KB FP32 state read + 64 KB write (deferred fold writes the committed checkpoint once) + ~14 KB conv window + records, at the measured full-chip default-allocation HBM rate. Hypotheses (unmeasured): (1) per-item CTA grid keeps too few state bytes in flight per SM (one 64 KB page per CTA, 2 CTAs/SM, load -> compute -> store serialized), (2) FP32 recurrence work per item (~0.8 MFLOP) is ~55% of the memory time, so compute must overlap with streaming, (3) above n=70 KdaWS is used and it does NOT fold: the step pays a separate flush (state read + write) plus a read in KdaWS = 3 state passes instead of 2. Measurement (baseline microbench + ncu) is next.",
+ "gap_analysis": "MEASURED (runs/D-KDA run2/run3, 1-GPU microbench at the D3-32 per-GPU shape, deferred fold active): KdaWide n32/64/96/128 = 26.0/51.5/74.3/95.0 us/layer, KdaWS (no fold; flush pass extra) 20.5/37.4/48.5/62.3; state stream only 3-6.5 TB/s and a 2-page state ring changes nothing -> not bandwidth / bytes-in-flight bound. In-kernel clock64 trace of KdaFlow (WS + fold) at n96: the 8-warp scan is the bottleneck (verify ~5.5-7K cycles/item vs ~2.5K FP32-pipe floor, fold ~3.5-4.5K/item vs ~1K), scan waits ~0 on the state and ~13% on prep; prep body ~8K cycles/item per warpgroup (global round trips: F_B tile loads, old records, weights), so prep is the next limit once the scan speeds up. Root cause: latency-bound dependency chain per token (k-dot reduce -> v -> update -> q-dot reduce) with only 2 scan warps per SMSP, plus global-latency-bound prep.",
  "inefficiencies": [
-  "HYPOTHESIS: latency-bound per-(head, request) CTA grid: few state bytes in flight per SM",
-  "HYPOTHESIS: KdaWS (n>=71) does not fold the deferred commit: separate flush = 3 state passes instead of 2",
-  "HYPOTHESIS: die-oblivious state streaming: half the bytes cross the die-to-die link (default 4 KiB die interleave)",
-  "Two kernels across batch sizes (KdaWide <=70, KdaWS above)"
+  "MEASURED: scan latency-bound: two cross-lane reductions per token per item with 2 warps/SMSP (verify 2-3x the FP32-pipe floor)",
+  "MEASURED: fold in the scan ~4x its instruction floor (scalar smem reloads of u, 64 KB store issue)",
+  "MEASURED: prep ~8K cycles/item per warpgroup: F_B tiles, old records and weights fetched from global on the critical path",
+  "MEASURED: KdaWS (n>=71 today) does not fold: separate flush pass (3 state passes)",
+  "MEASURED: NOT bandwidth bound today (3-6.5 TB/s); die-local streaming only matters once compute is fixed"
  ],
  "rubin_features": [
   "two-die locality domains: per-4 KiB page home die (default interleave) + %smid -> die map (dies.py)",
@@ -42,13 +43,25 @@
    "t": "12:50",
    "what": "wrote KdaFlow (cutedsl/kda/flow.py): persistent warp-specialized record core = KdaWS scan/prep + KdaWide deferred fold (commit-exact) + 2-stage bulk-copy state ring; sp.py kind flow (in FOLDS); bitwise test vs KdaWS triton + stock commit (test_specialized_decode_sp_kda_flow_gpu.py); bench benchmarks/kernels/k31_vr/kda_sp_bench.py",
    "result": "queued on pool (overlay d-kda-flow-1, run runs/D-KDA/run2.log); no pool hold running yet"
+  },
+  {
+   "t": "13:20",
+   "what": "run2 microbench wide/ws/flow1/flow2 n8..128; run3 KdaFlow bitwise tests + clock64 trace",
+   "result": "KdaFlow v1 bitwise equal to KdaWS triton + stock commit (16/16 tests, eager+graph, n3/33/96/128, 1-2 stages); perf v1 = 11.8/32.9/53.5/71.7/93.4 us (n8/32/64/96/128): scan-bound (see gap_analysis)"
+  },
+  {
+   "t": "13:45",
+   "what": "KdaFlow v2: per token one fused state pass (t update+q-dot fused with t+1 decay+k-dot, reductions of out_t and dot_t+1 overlap; same per-element op order and reduction trees), fold u preloaded, F_B rows + old records cp.async-staged one item ahead (no global round trips in prep), head-major items, o_s aliased on v_s (smem fit)",
+   "result": "run4 queued (overlay d-kda-flow-3)"
   }
  ],
- "next": "run2: flow correctness + bench wide/ws/flow1/flow2 at n=8/32/64/96/128 + ncu; then die-local row split if streaming is the limit",
+ "next": "run4 results; then: more scan warps per SM (row-split items / 2 items) or move prep math off the scan critical path; die-local row split once memory bound",
  "blockers": "pool holds pending (Priority), first expected ~13:30",
- "branch": "wzhao/k31ws-d-kda @ 4fbaa15189 (+uncommitted KdaFlow)",
+ "branch": "wzhao/k31ws-d-kda @ ec25a9bc98 (+ uncommitted v2)",
  "evidence": [
-  "perf-model/microbench/results/gap512/parsed/decode_families.txt",
+  "runs/D-KDA/run2.log (Rhea Lustre k31ws/runs)",
+  "runs/D-KDA/run3.log",
   "perf-model/microbench/rhea1n/model_rows.json"
- ]
+ ],
+ "ckpt": "pending"
 }

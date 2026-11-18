@@ -78,5 +78,6 @@
   "rhea:.../runs/D-ATTN/run2.log (trtllm-gen sparse MLA)",
   "rhea:.../runs/D-ATTN/run3.log, qpath5.json (breakdown, small rows)",
   "rhea:.../runs/D-ATTN/step_d/dattn3-r8r16r24-prof (queued A/B)"
- ]
+ ],
+ "ckpt": "pending"
 }

@@ -3,22 +3,24 @@
  "title": "Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops",
  "side": "prefill",
  "owner": "P-GEMM workflow agent",
- "state": "analysis",
- "updated": "2026-11-18T13:25-08:00",
+ "state": "implementing",
+ "updated": "2026-11-18T14:35-08:00",
  "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, TP1 M=16384 (and F8K M=8192), NVFP4 ckpt",
  "baseline_ms": 346,
  "current_ms": 346,
  "achievable_ms": 268.3,
  "target_ms": 295,
  "step_ms": 825,
- "basis": "PROJECTED until the 1-GPU per-shape bench lands: achievable = sum of model t_ach of my op rows (optables nvfp4_modelopt|P3-16|prefill, 93 layers: attnres 24.8, kda_proj 93.7, mla_proj 56.5, router 5.4, latent 42.6, shared 37.4, dense 6.6, drafter 1.2, lm_head 0.2); baseline = achievable + reviewed ledger excess (router path 20.4, shared 19, KDA proj 18, small BF16 14.5, AttnRes 6.6)",
- "gap_analysis": "Seeded from the reviewed ledger (MXFP4 ckpt measurements + standalone MXFP8): MXFP8 KDA in_proj (N=49376) 1.16-1.40x standalone on cuBLASLt _scaled_mm, plus a standalone BF16->MXFP8 activation quant per MXFP8 consumer (+40 us/call, 161 calls/step under NVFP4 since the KDA in_proj and shared gate_up inputs come from AttnRes in BF16); router path (BF16 router GEMM N=896 FP32-out ~2x, separate router top-k, latent RMSNorm) ~20 ms; small-N BF16 GEMMs (qkv_a N=2272, q_proj, f_b_proj K=128) 1.2-3.5x; AttnRes pre/post ~1.3x. Big BF16 GEMMs (g_proj, o_proj, dense) are already at 0.96-1.09x the model (measured). First action: per-shape microbench of every backend at M=16384/8192 to replace the ledger with measured numbers.",
+ "basis": "MEASURED standalone 1-GPU VR200 at M=16384 (runs/P-GEMM/a2/gemm.json, CUPTI kernel time, in-tree backend = cuBLASLt/nvjet), weighted by the 93-layer op counts; non-GEMM terms (quant passes, AttnRes, router top-k, latent norm, side-stream interference) still PROJECTED from the ledger until the NVFP4 step profile",
+ "gap_analysis": "MEASURED per-shape table (M=16384, in-tree cuBLASLt nvjet sm_107 2-CTA tactics): all MXFP8 GEMMs are at the model: KDA in_proj 1083 us = 1.02x (2-CTA 256x256 block-scaled nvjet tactic, so 2x-K is in use; the ledger 1.16-1.40x is stale), KDA o_proj 1.00x, shared gate_up 1.02x, shared down 1.08x. BF16: g_proj 0.97, DSA o_proj 0.94, qb_wq 0.99, qkv_a 1.03, latent_down 1.04, latent_up 1.07, w_uv 1.02, dense gate_up 1.05 - at target. Outliers: router N=896 FP32-out 1.27x (73 vs 58 us), DSA w_uk bmm 1.52x (222 vs 146 us), KDA f_b_proj K=128 1.54x (46 vs 29 us), dense down 1.25x. Sum of my GEMMs: 248.9 ms measured vs 240.8 ms model (1.03x). FlashInfer/cute-dsl/cutlass/trtllm/cudnn MXFP8 backends are all slower than cuBLASLt at M=16384 (cute-dsl 1.14-1.20x, trtllm 2.6-4x). So the family excess is NOT in the GEMM mainloops; it is in the glue: standalone MXFP8 activation quant passes (FlashInfer 40 us per 16384x7168 call = 1.55x its HBM floor; vLLM mxfp8_act producers 81 us = 3.2x their floor, because each thread keeps one 16-B load in flight), the native AttnRes at 1.31-1.37x its byte floor (92-236 us per call), router top-k / latent norm kernels, and (ledger, in-step) the shared experts on the side stream next to the persistent MegaMoE.",
  "inefficiencies": [
-  "HYPOTHESIS: cuBLASLt MXFP8 tactic for N=49376 (not a multiple of 256) is not the best 2-CTA 2x-K tile; standalone 1.16-1.40x",
-  "MEASURED (ledger): separate BF16->MXFP8 activation quant on KDA in_proj and shared gate_up inputs (+40 us/call)",
-  "MEASURED (prefill README): router GEMM N=896 FP32 out at ~2.1-2.8x, router top-k and latent RMSNorm as separate kernels",
-  "MEASURED (prefill README): f_b_proj K=128 small-K GEMM 2.1-3.5x (poor tile)",
-  "MEASURED (gap512): AttnRes pre/post 1.3x"
+  "MEASURED: standalone BF16->MXFP8 quant of the AttnRes output per MXFP8 consumer (KDA in_proj 69x, shared gate_up 92x per step), ~40 us each at M=16384",
+  "MEASURED: vLLM mxfp8_act producers (situ_and_mul_quantize for shared down etc.) at 3.2x their HBM floor (one 16-B load in flight per thread) - fixed in 539e95c4 (4 in flight), re-measure pending",
+  "MEASURED: native AttnRes 1.31-1.37x its byte floor at M=16384 (cp.async.bulk ring depth 2 x 3 rows in flight per SM; hypothesis: too few bytes in flight for VR HBM)",
+  "MEASURED: router GEMM N=896 FP32-out 1.27x (nvjet 224x128 tile, 4 N-tiles -> wave quantization)",
+  "MEASURED: DSA w_uk bmm 1.52x (nvjet 1-CTA 192x224 tile for [96 x 16384 x 128] @ [128 x 512])",
+  "MEASURED: KDA f_b_proj (K=128, N=12288) 1.54x: memory-bound op, writes 402 MB",
+  "LEDGER (in-step): shared experts on side stream next to persistent MegaMoE get few SMs; router top-k and latent RMSNorm separate kernels"
  ],
  "rubin_features": [
   "sm_107a 2x-K block-scaled MMA (mxf8f6f4) for MXFP8",
@@ -35,10 +37,35 @@
   "5. Step A/B with INFRA step_p.sh (P3-16 DEP4 slice, NVFP4 view from EN)"
  ],
  "work": [
-  {"t": "13:20", "what": "worktree /Users/weizha/k31ws-wt/p-gemm (wzhao/k31ws-p-gemm @ 4fbaa15189); wrote benchmarks/kimi_k3/pgemm_bench.py (CUPTI kernel time per backend vs model ach)", "result": "queued on pool (runs/P-GEMM/b1)"}
+  {
+   "t": "13:20",
+   "what": "worktree /Users/weizha/k31ws-wt/p-gemm (wzhao/k31ws-p-gemm @ 4fbaa15189); wrote benchmarks/kimi_k3/pgemm_bench.py (CUPTI kernel time per backend vs model ach)",
+   "result": "queued on pool (runs/P-GEMM/b1)"
+  },
+  {
+   "t": "13:50",
+   "what": "specialized_prefill/attn_res_mxfp8: native AttnRes kernel copy with MXFP8 (E4M3 + F8_128x4 E8M0) written from the output-RMSNorm epilogue, optional BF16 output, ring depth build knob; wired: KDA pre-attn AttnRes writes only MXFP8 in_proj input, MoE post-attn writes BF16 + shared gate_up MXFP8 (>=1024 rows, no SP); bitwise unit test tests/models/kimi_k3/test_k31_prefill_attn_res_mxfp8.py",
+   "result": "queued (runs/P-GEMM/a1, overlay p-gemm-81c2be3c-1 for kernel test+bench)"
+  },
+  {
+   "t": "14:30",
+   "what": "per-shape GEMM table, every backend, M=16384/8192 (runs/P-GEMM/a2/gemm.json)",
+   "result": "all MXFP8 GEMMs 1.00-1.08x model on cuBLASLt nvjet 2-CTA block-scaled tactics; BF16 0.94-1.07x except router 1.27, w_uk 1.52, f_b_proj 1.54, dense down 1.25; GEMM sum 248.9 vs 240.8 ms model (1.03x). Quant: FI 40 us, mxfp8_act 81 us per 16384x7168"
+  },
+  {
+   "t": "14:30",
+   "what": "mxfp8_act act_quant_kernel: 4 vectors in flight per thread (same per-vector math); attn_res_mxfp8 build fix (no ATen CUDAContext: cusparse.h missing in image)",
+   "result": "test + bench queued (runs/P-GEMM/a4, overlay p-gemm-539e95c4-2)"
+  }
  ],
- "next": "read runs/P-GEMM/b1 results; pick per-shape winners; start AttnRes+MXFP8 quant fusion",
+ "next": "a4: bitwise tests (attn_res_mxfp8, mxfp8_act) + AttnRes fused bench (ring depth 2/3) + quant bench new vs base; then router/w_uk/f_b_proj tactics; then NVFP4 step A/B with EN view",
  "blockers": "pool contention (16 waiters at 13:22)",
- "branch": "wzhao/k31ws-p-gemm @ 4fbaa15189",
- "evidence": ["perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill", "perf-model/plan/nvfp4_ledgers_summary.txt", "perf-model/microbench/results/prefill/README.md"]
+ "branch": "wzhao/k31ws-p-gemm @ 539e95c4",
+ "evidence": [
+  "perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill",
+  "perf-model/plan/nvfp4_ledgers_summary.txt",
+  "perf-model/microbench/results/prefill/README.md",
+  "runs/P-GEMM/b1, runs/P-GEMM/a1"
+ ],
+ "ckpt": "pending"
 }

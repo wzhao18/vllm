@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-TOPK agent",
  "state": "implementing",
- "updated": "2026-11-18T13:25-08:00",
+ "updated": "2026-11-18T14:05-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K (local \u224833.75K on DCP4), k=3; also r1 (16 rows), r8 (128 rows)",
  "baseline_ms": 2.3,
  "current_ms": 1.83,
@@ -28,11 +28,12 @@
   "TMA bulk loads of logits tiles"
  ],
  "plan": [
-  "1. 4-GPU microbench (DCP4 group) of the in-tree DcpExchange top-k at r1/r8/r24, L=135K, realistic logits; per-kernel CUPTI times + per-row phase stamps + path stats",
-  "2. root-cause the merge/pre-pass time (ncu on the merge kernel)",
-  "3. redesign: single-pass histogram select over the whole GPU, one multicast exchange, parallel resolve + WRITE, PDL",
-  "4. exactness unit test vs stock (bitwise selection sets), graph-safe tie/overflow path",
-  "5. microbench vs model at r1/r8/r24; step A/B with INFRA harness; landed-ready"
+  "1. DONE measure in-tree top-k at r1/r8/r24 (4-GPU DCP4 bench, phase stamps, path stats)",
+  "2. DONE in-place tie round (ebc6916ed5): -9 us/layer r24",
+  "3. topk_v2 (written, testing): one CTA per row, keys staged once in SMEM by TMA bulk copies, no pre-pass, no cluster barriers; one multicast NVLink round carrying window counts + the global ids of a key band around each rank estimate (ties resolved in round 1); exact tiers: tie round (complete sorted lists), radix select over (key<<24 | ~gid) for anything else",
+  "4. bitwise equality vs topk_merge (which is tested against stock) in tests/models/kimi_k3/test_k31_dcp_exchange.py, staged + streamed paths",
+  "5. microbench v2 vs model at r1/r8/r24; ncu-free phase stamps; tune (hist contention, cluster split for r1/r8)",
+  "6. step A/B with INFRA step_d (rows 128/384), landed-ready"
  ],
  "work": [
   {
@@ -54,14 +55,20 @@
    "t": "13:22",
    "what": "in-place tie round in the centred-1R WRITE (no state machine, no key pass) when every rank has <= 64 ties; tests/models/kimi_k3/test_k31_dcp_exchange.py (4 GPUs) ALL PASS incl. stock-merge comparisons",
    "result": "r1 27.9, r8 43.3, r24 76.3 us/layer (relu); r24 spread 0.8: 69.4"
+  },
+  {
+   "t": "14:05",
+   "what": "wrote topk_v2 (csrc/topk_v2.cuh, ops.DcpExchange.topk_v2, decode wiring to v2 with per-launch staging capacity); bench --impl v2 --check (bitwise vs topk_merge); test compares v2 (staged + streamed) with topk_merge on every case",
+   "result": "queued on the pool runner (overlay d-topk-ebc6916-5)"
   }
  ],
- "next": "clock check (warm-up matmuls); then redesign: keys staged in smem at every batch (small static smem), single pass hist, tie lists on round 1, no pre-pass",
+ "next": "run v2 bench + test on the pool node; fix; then tune",
  "blockers": "4-GPU pool requests wait 20-30 min (1-GPU runs take single GPUs first); using a runner that keeps the node for queued experiments with a 12-min idle exit",
  "branch": "wzhao/k31ws-d-topk @ 4fbaa15189 (+ uncommitted tie fast path)",
  "evidence": [
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-TOPK/base1.log",
   "runs/D-TOPK/base1_model1M.json, base1_local36K.json, tie1_model1M.json, tie1_spread.json",
   "benchmarks/kernels/bench_k31_dcp_topk.py"
- ]
+ ],
+ "ckpt": "pending"
 }

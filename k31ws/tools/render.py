@@ -30,6 +30,8 @@ def fnum(v, nd=2):
 
 
 def closed(s):
+    if s.get("ckpt") != "nvfp4":  # user rule: gap closed only when baseline, current, achievable are all NVFP4-basis
+        return None
     b, c, a = s.get("baseline_ms"), s.get("current_ms"), s.get("achievable_ms")
     try:
         b, c, a = float(b), float(c), float(a)
@@ -67,7 +69,7 @@ def main():
                 ratio = float(s["current_ms"]) / float(s["achievable_ms"])
             except Exception:
                 pass
-            bar = "" if cl is None else f'<span class="bar"><i style="width:{cl*100:.0f}%"></i></span> {cl*100:.0f}%'
+            bar = ("NVFP4 baseline pending" if s.get("ckpt") != "nvfp4" else "–") if cl is None else f'<span class="bar"><i style="width:{cl*100:.0f}%"></i></span> {cl*100:.0f}%'
             out.append(f"""<tr>
 <td><a href="#{E(s['id'])}" class="wid">{E(s['id'])}</a><div class="wt">{E(s.get('title'))}</div></td>
 <td class="n">{fnum(s.get('current_ms'))}</td><td class="n">{'–' if share is None else f'{share:.0f}%'}</td>

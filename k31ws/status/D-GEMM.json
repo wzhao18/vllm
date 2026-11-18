@@ -6,7 +6,7 @@
  "state": "landed-ready",
  "updated": "2026-11-18T14:05-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows R per TP4 group, n = 96 SP shard rows per GPU), L=135K, k=3",
- "baseline_ms": 8.9,
+ "baseline_ms": 6.7,
  "current_ms": 6.7,
  "achievable_ms": 2.8,
  "target_ms": 3.08,
@@ -74,6 +74,11 @@
    "t": "14:05",
    "what": "landing branch = B4 only (520afc7416): Mxfp8Projection + SpAttentionBlock/SpOproj/SpMlp/KDA-pitch wiring + MX_TUNED + unit test",
    "result": "VR200: sp_mxfp8_gpu 5 passed, sp_mlp_gpu + sp_coverage 52 passed (overlay d-gemm-2c2b49e-2, same vllm/ content as 520afc7416). Step-level NVFP4 build not yet exercised (needs EN B1/B2 NVFP4 model view)."
+  },
+  {
+   "t": "14:05",
+   "what": "coordinator: re-based baseline to the NVFP4 checkpoint with existing kernels (6.7 ms projected)",
+   "result": "the earlier 8.9 baseline was the MXFP4 all-BF16 tree; 8.9->6.7 is the precision switch, not kernel work (gap closed now counts kernel work only)"
   }
  ],
  "next": "HANDOFF / next steps: (1) INFRA: merge wzhao/k31ws-d-gemm 520afc7416 into wzhao/k31ws-int; first NVFP4 D3-32 step (after EN B1/B2) exercises it - check the build log shows kda_in/o_proj/shared_gu/shared_down choices \"mxfp8 fi_cute|scaled_mm\". (2) Streaming kernel redesign (the family is 2.4x model): swap-AB with M-blocking (each CTA owns MB=2-4 weight row tiles, MB x T <= 512 TMEM columns, one x stage feeds MB MMAs -> x traffic T/(128 MB)), split <= 6 so clusters co-schedule (or no cluster: per-tile arrival counter + last-arriver rank-order reduce), deeper ring via 1 CTA/SM full smem, die-local weight homing (common/dies.py localized_like + %smid tile assignment), MXFP8 kind::mxf8f6f4 with in-kernel activation quant (drops ~0.5 ms of quant kernels). Prototype base: wzhao/k31ws-d-gemm-wip cutedsl/gemm/splitk_g.py (correct L2 reduce epilogue). (3) Bench: rsync k31ws/runs-local/D-GEMM/{gemm_bench.py,g_sweep.py} to runs/D-GEMM, stage overlay with tools/mkov.sh, run with wsgpu.sh -g 1 (see run1.sh / run3.sh).",
@@ -86,5 +91,6 @@
   "k31ws/runs-local/D-GEMM/model_gemm.json",
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-GEMM/{run1,test2,run3}.log",
   "tests/models/kimi_k3/test_specialized_decode_sp_mxfp8_gpu.py"
- ]
+ ],
+ "ckpt": "pending"
 }

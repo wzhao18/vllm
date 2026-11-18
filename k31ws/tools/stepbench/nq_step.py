@@ -272,8 +272,9 @@ def patch_expert_emulation(emulate_ep):
                 p.data.zero_()
                 p.data[ids % local >= active] = -100.0
             n += 1
-        if n == 0:
-            raise RuntimeError("expert emulation: no e_score_correction_bias found (model has no MoE router bias)")
+        if n == 0:  # the drafter (no MoE) loads through the same loader
+            log(f"expert emulation: {type(model).__name__} has no MoE router bias (drafter): unchanged")
+            return
         log(f"expert emulation: EP{ep} slice emulates EP{emulate_ep}: {n} MoE routers restricted to "
             f"{E // emulate_ep} active experts / EP rank ({E // emulate_ep * ep} of {E})")
 

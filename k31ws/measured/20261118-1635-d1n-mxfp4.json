@@ -1,0 +1,220 @@
+{
+ "slice": "D3-32 1-node DP-rank slice (step_d.sh): TP4=DCP4, EP4 emulating EP32 (28 experts/GPU), 24-layer view, u132k ctx, k=3, DSpark preview drafter (MLA, full context) included",
+ "ckpt": "mxfp4 (k31-view-L24, MXFP8 MoE act)",
+ "overlay": "base-4fbaa15 (wzhao/k31-sp-gemm 4fbaa15189)",
+ "run": "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_d/base-mx-r8r16r24-prof",
+ "model": "tools/stepbench/model_rows_L24.json (mxfp4_release, D3-32 L135K, rescaled to 24 layers)",
+ "units": "ms per decode step (24-layer view)",
+ "cases": {
+  "r8": {
+   "case": "q4_B32_M128_u132k",
+   "step_ms": 7.0585,
+   "model_ach_ms": 3.0112616954347486,
+   "ratio": 2.3440340674147,
+   "target_only_step_ms": 5.313740234375,
+   "target_only_ach_ms": 2.74245136513318,
+   "families": {
+    "drafter + final (DSpark k=3 propose)": {
+     "busy_ms": 1.745,
+     "exposed_ms": 1.745,
+     "ach_ms": 0.269,
+     "ratio": 6.49
+    },
+    "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)": {
+     "busy_ms": 1.937,
+     "exposed_ms": 1.937,
+     "ach_ms": 1.067,
+     "ratio": 1.82
+    },
+    "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)": {
+     "busy_ms": 1.874,
+     "exposed_ms": 1.658,
+     "ach_ms": 1.105,
+     "ratio": 1.7
+    },
+    "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)": {
+     "busy_ms": 0.379,
+     "exposed_ms": 0.332,
+     "ach_ms": 0.014,
+     "ratio": 27.75
+    },
+    "DSA q path + sparse MLA + DCP value (P6/P7b)": {
+     "busy_ms": 0.533,
+     "exposed_ms": 0.393,
+     "ach_ms": 0.114,
+     "ratio": 4.66
+    },
+    "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)": {
+     "busy_ms": 0.343,
+     "exposed_ms": 0.314,
+     "ach_ms": 0.042,
+     "ratio": 8.1
+    },
+    "KDA core (KdaWide: conv+gate+recurrence+o_norm)": {
+     "busy_ms": 0.387,
+     "exposed_ms": 0.387,
+     "ach_ms": 0.158,
+     "ratio": 2.45
+    },
+    "SP comm (AllGather / ReduceScatter push)": {
+     "busy_ms": 0.259,
+     "exposed_ms": 0.259,
+     "ach_ms": 0.207,
+     "ratio": 1.25
+    },
+    "DSA indexer logits (paged_mqa_logits)": {
+     "busy_ms": 0.121,
+     "exposed_ms": 0.06,
+     "ach_ms": 0.035,
+     "ratio": 3.4
+    },
+    "spin wait (QueryWait)": {
+     "busy_ms": 0.046,
+     "exposed_ms": 0.0,
+     "ach_ms": 0.0,
+     "ratio": null
+    }
+   }
+  },
+  "r16": {
+   "case": "q4_B64_M256_u132k",
+   "step_ms": 10.203700000000001,
+   "model_ach_ms": 3.5884251808150855,
+   "ratio": 2.8435036222999366,
+   "target_only_step_ms": 7.29564482421875,
+   "target_only_ach_ms": 3.2467637399439067,
+   "families": {
+    "drafter + final (DSpark k=3 propose)": {
+     "busy_ms": 2.908,
+     "exposed_ms": 2.908,
+     "ach_ms": 0.342,
+     "ratio": 8.51
+    },
+    "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)": {
+     "busy_ms": 2.671,
+     "exposed_ms": 2.669,
+     "ach_ms": 1.203,
+     "ratio": 2.22
+    },
+    "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)": {
+     "busy_ms": 2.172,
+     "exposed_ms": 1.951,
+     "ach_ms": 1.13,
+     "ratio": 1.92
+    },
+    "DSA q path + sparse MLA + DCP value (P6/P7b)": {
+     "busy_ms": 0.67,
+     "exposed_ms": 0.611,
+     "ach_ms": 0.181,
+     "ratio": 3.71
+    },
+    "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)": {
+     "busy_ms": 0.462,
+     "exposed_ms": 0.461,
+     "ach_ms": 0.05,
+     "ratio": 9.32
+    },
+    "KDA core (KdaWide: conv+gate+recurrence+o_norm)": {
+     "busy_ms": 0.693,
+     "exposed_ms": 0.693,
+     "ach_ms": 0.315,
+     "ratio": 2.2
+    },
+    "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)": {
+     "busy_ms": 0.388,
+     "exposed_ms": 0.334,
+     "ach_ms": 0.027,
+     "ratio": 14.32
+    },
+    "SP comm (AllGather / ReduceScatter push)": {
+     "busy_ms": 0.4,
+     "exposed_ms": 0.4,
+     "ach_ms": 0.271,
+     "ratio": 1.48
+    },
+    "DSA indexer logits (paged_mqa_logits)": {
+     "busy_ms": 0.191,
+     "exposed_ms": 0.188,
+     "ach_ms": 0.071,
+     "ratio": 2.7
+    },
+    "spin wait (QueryWait)": {
+     "busy_ms": 0.127,
+     "exposed_ms": 0.0,
+     "ach_ms": 0.0,
+     "ratio": null
+    }
+   }
+  },
+  "r24": {
+   "case": "q4_B96_M384_u132k",
+   "step_ms": 13.004,
+   "model_ach_ms": 4.289282607860521,
+   "ratio": 3.0317424121621,
+   "target_only_step_ms": 8.91344921875,
+   "target_only_ach_ms": 4.009866216408517,
+   "families": {
+    "drafter + final (DSpark k=3 propose)": {
+     "busy_ms": 4.091,
+     "exposed_ms": 4.091,
+     "ach_ms": 0.279,
+     "ratio": 14.64
+    },
+    "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)": {
+     "busy_ms": 3.423,
+     "exposed_ms": 3.422,
+     "ach_ms": 1.339,
+     "ratio": 2.56
+    },
+    "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)": {
+     "busy_ms": 2.486,
+     "exposed_ms": 2.196,
+     "ach_ms": 1.283,
+     "ratio": 1.94
+    },
+    "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)": {
+     "busy_ms": 0.626,
+     "exposed_ms": 0.626,
+     "ach_ms": 0.057,
+     "ratio": 11.04
+    },
+    "DSA q path + sparse MLA + DCP value (P6/P7b)": {
+     "busy_ms": 0.989,
+     "exposed_ms": 0.671,
+     "ach_ms": 0.249,
+     "ratio": 3.97
+    },
+    "KDA core (KdaWide: conv+gate+recurrence+o_norm)": {
+     "busy_ms": 0.887,
+     "exposed_ms": 0.887,
+     "ach_ms": 0.473,
+     "ratio": 1.88
+    },
+    "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)": {
+     "busy_ms": 0.396,
+     "exposed_ms": 0.334,
+     "ach_ms": 0.041,
+     "ratio": 9.77
+    },
+    "SP comm (AllGather / ReduceScatter push)": {
+     "busy_ms": 0.536,
+     "exposed_ms": 0.536,
+     "ach_ms": 0.334,
+     "ratio": 1.6
+    },
+    "DSA indexer logits (paged_mqa_logits)": {
+     "busy_ms": 0.407,
+     "exposed_ms": 0.236,
+     "ach_ms": 0.106,
+     "ratio": 3.82
+    },
+    "spin wait (QueryWait)": {
+     "busy_ms": 0.289,
+     "exposed_ms": 0.001,
+     "ach_ms": 0.0,
+     "ratio": null
+    }
+   }
+  }
+ }
+}

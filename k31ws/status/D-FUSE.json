@@ -64,5 +64,6 @@
   "perf-model/microbench/rhea1n/model_rows.json (B96_L135K)",
   "rhea runs/D-FUSE/run3 (pending)",
   "rhea runs/D-FUSE/run2g-c/chain.json"
- ]
+ ],
+ "ckpt": "pending"
 }

@@ -1,0 +1,6 @@
+# P-GEMM findings (one line each, dated)
+
+- 2026-11-18 13:50 Under nvfp4_modelopt the KDA in_proj and shared gate_up read the AttnRes output in BF16 and re-quantize it per call (161 standalone quant passes/step at DEP16); fused into the AttnRes epilogue (bitwise test pending on pool).
+- 2026-11-18 14:30 MEASURED (1 GPU, M=16384): every MXFP8 prefill GEMM is at the model on the in-tree cuBLASLt path (nvjet sm_107 2-CTA 256x256 block-scaled): KDA in_proj 1.02x, o_proj 1.00x, shared gate_up 1.02x, down 1.08x. The ledger 1.16-1.40x for in_proj is stale (model/ledger fix). FlashInfer MXFP8 backends are all slower (cute-dsl 1.14-1.20x, cudnn = same nvjet, cutlass 2.1-2.7x, trtllm 2.6-4x).
+- 2026-11-18 14:30 MEASURED: BF16 prefill GEMMs 0.94-1.07x except router (N=896, FP32 out) 1.27x, DSA w_uk bmm 1.52x, KDA f_b_proj 1.54x, dense down 1.25x. My GEMM sum 248.9 ms vs 240.8 ms model per 93-layer step (1.03x): the family excess is glue (quant passes, AttnRes, top-k, norms, side-stream), not mainloops.
+- 2026-11-18 14:30 MEASURED: vLLM mxfp8_act producers run at 3.2x their HBM floor (81 us vs FlashInfer 40 us per 16384x7168 quant) because each thread keeps one 16-B load in flight; native AttnRes is 1.31-1.37x its byte floor.
