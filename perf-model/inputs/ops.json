@@ -9,6 +9,7 @@
   "ridge_flop_per_byte": {
    "bf16_mma": 259.0,
    "mxf8f6f4_mma (fp8 rate)": 755.4,
+   "fp8_mma": 755.4,
    "mxf4 mma (block-scaled FP4 x FP4)": 1259.0,
    "fp32_simt": 9.5
   }
@@ -54,6 +55,7 @@
   "Ni": 32,
   "Di": 128,
   "IDX_ROW": 68,
+  "REC_B": 1024,
   "E": 896,
   "TOPK_E": 16,
   "LAT": 3584,
@@ -139,6 +141,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
    "bound_decode_ref": "memory"
@@ -169,6 +173,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
@@ -203,6 +209,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -235,6 +243,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -268,6 +278,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "comm",
    "bound_decode_ref": "comm"
@@ -301,6 +313,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -334,6 +348,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
    "bound_decode_ref": "memory"
@@ -368,6 +384,8 @@
    "phase": "both",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -402,6 +420,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -436,6 +456,8 @@
    "weight_bytes": "0",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -458,8 +480,8 @@
    "flops": "B*q*Hk*7*dk*dv + B*AL*Hk*3*dk*dv",
    "act_in_bytes": "B*q*Hk*(4*dk*2 + 2)",
    "act_out_bytes": "B*q*Hk*dv*2",
-   "state_read_bytes": "B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2",
-   "state_write_bytes": "B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2",
+   "state_read_bytes": "B*Hk*dk*dv*4 + B*AL*Hk*REC_B",
+   "state_write_bytes": "B*Hk*dk*dv*4 + B*q*Hk*REC_B",
    "shard_axis": "heads over TP",
    "cite": [
     "vllm/models/kimi_k3/nvidia/kda.py:1060-1146",
@@ -468,10 +490,12 @@
     "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify.py:1-10",
     "vllm/model_executor/layers/mamba/mamba_utils.py:133-149"
    ],
-   "notes": "Per verify row per head: decay (dk dv), S^T k (2 dk dv), rank-1 update (2 dk dv), q.S (2 dk dv) = 7 dk dv; deferred commit folds the previous step's AL accepted tokens (decay + outer product ~3 dk dv each) in the same pass. SOL traffic: FP32 state read once + written once per request per layer = 2*96*128*128*4 = 12.6 MB (869 MB per request per step over 69 layers) -- THE dominant decode byte term. Records (verify corrections + key-gates, bf16) are written and read back next step. Non-deferred alternatives: stock RecoverSSM commit after sampling (read S twice, write once) or q-slot state writes (write q states).",
+   "notes": "Per verify row per head: decay (dk dv), S^T k (2 dk dv), rank-1 update (2 dk dv), q.S (2 dk dv) = 7 dk dv; deferred commit folds the previous step's AL accepted tokens (decay + outer product ~3 dk dv each) in the same pass. SOL traffic: FP32 state read once + written once per request per layer = 2*96*128*128*4 = 12.6 MB (869 MB per request per step over 69 layers) -- THE dominant decode byte term. Records (REC_B = 1024 B per row per head: FP32 correction [dk] + key_gate [2*dk] in the state dtype, recoverssm/context.py allocate_records) are written for all q rows and read back for the AL accepted rows next step; kv.py capacity uses the same REC_B. Non-deferred alternatives: stock RecoverSSM commit after sampling (read S twice, write once) or q-slot state writes (write q states).",
    "weight_bytes": "0",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
@@ -506,6 +530,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -513,7 +539,7 @@
   },
   {
    "id": "KDA.o_proj",
-   "name": "o_proj 12288 -> 7168",
+   "name": "o_proj 12288 -> 7168 (+ fused o_norm gate read)",
    "layer_type": "kda",
    "kind": "gemm",
    "phase": "both",
@@ -527,19 +553,21 @@
    },
    "flops": "2*(T)*(P)*(H)",
    "weight_bytes": "(P)*(H)*2",
-   "act_in_bytes": "(T)*(P)*2",
+   "act_in_bytes": "(T)*(P)*2 + T*P*2",
    "act_out_bytes": "(T)*(H)*2",
    "shard_axis": "K (row-parallel): partial sums -> all-reduce / reduce-scatter",
    "cite": [
     "vllm/models/kimi_k3/nvidia/kda.py:932-951",
     "vllm/models/kimi_k3/nvidia/kda.py:1047-1058"
    ],
-   "notes": "",
+   "notes": "act_in includes the fused o_norm gate read (T*P*2).",
    "comm": "TP: all-reduce (or RS under SP) of [T,H] bf16 partial sums; fused GEMM-AR (gemm_rs_ar) available",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -575,6 +603,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -610,6 +640,8 @@
    "kv_read_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -645,6 +677,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -678,6 +712,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -709,6 +745,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
    "fused_in_sol": true,
@@ -728,7 +766,8 @@
     "out": "bf16 logits (scratch) / fp32",
     "compute": "mxf4 mma (block-scaled FP4 x FP4)"
    },
-   "flops": "2*Ni*Di*Lsum + 3*Ni*Lsum",
+   "flops": "2*Ni*Di*Lsum",
+   "simt_flops": "4*Ni*Lsum",
    "kv_read_bytes": "Lu*IDX_ROW",
    "act_in_bytes": "T*Ni*(Di/2+8)",
    "act_out_bytes": "Lsum*2*SCRATCH",
@@ -738,12 +777,13 @@
     "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/indexer.py:1-40",
     "vllm/model_executor/layers/sparse_attn_indexer.py"
    ],
-   "notes": "Prefill: causal, Lsum = C*P + C(C+1)/2 per request. Skipped for rows with L <= TOPK (short-context bypass). Decode: one [128 keys x q*32] MMA per tile reads every key once per request per step (kv_read = L*68 B), FLOPs 2*32*128*q*L. SCRATCH=1 when logits are materialized (stock + current specialized: BF16 [T,L] write + read by select); SCRATCH=0 for a fused score+select (new method). At L=135K: 26.5 GFLOP per query row over 24 layers.",
+   "notes": "Prefill: causal, Lsum = C*P + C(C+1)/2 per request. Skipped for rows with L <= TOPK (short-context bypass). Decode: one [128 keys x q*32] MMA per tile reads every key once per request per step (kv_read = L*68 B), FLOPs 2*32*128*q*L. SCRATCH=1 when logits are materialized (stock + current specialized: BF16 [T,L] write + read by select); SCRATCH=0 for a fused score+select (new method). At L=135K: 26.5 GFLOP per query row over 24 layers. Split (review 2026-11-17): flops = the FP4 MMA only; simt_flops = the per-(row,key) FP32 epilogue relu + head-weight FMA over the 32 heads (2 instructions = 4 FMA-FLOP equivalents per head) at the FP32 SIMT rate; t = max(mma, epilogue, bytes). A packed BF16x2 epilogue would halve it but rounds the logits (not stock precision). Microbench: DeepGEMM fp4_mqa_logits times both parts together.",
    "phase": "both",
    "weight_bytes": "0",
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
@@ -779,6 +819,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
    "bound_decode_ref": "memory"
@@ -812,6 +854,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -828,10 +872,12 @@
     "act_in": "bf16",
     "weight": "-",
     "out": "bf16",
-    "compute": "bf16_mma (FP8 KV dequantized to BF16 on load)"
+    "compute": "fp8_mma (FP8 Q x FP8 KV for QK^T, FP8 P x FP8 V; per-tensor FP8 576-B row)"
    },
-   "flops": "2*Nh*(KVL+DR+KVL)*Ltk + 4*Nh*Ltk",
-   "kv_read_bytes": "(min(Lu, Ltk) if PREFILL else Ltk)*MLA_ROW",
+   "flops": "2*Nh*(KVL+DR+KVL)*Ltk",
+   "sfu_ops": "Nh*Ltk",
+   "simt_flops": "4*Nh*Ltk",
+   "kv_read_bytes": "min(Lu, Ltk)*MLA_ROW",
    "l2_gather_bytes": "Ltk*MLA_ROW",
    "act_in_bytes": "T*Nh*(KVL+DR)*2",
    "act_out_bytes": "T*Nh*KVL*2",
@@ -841,7 +887,7 @@
     "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/attn_ds.py:1-40",
     "vllm/models/kimi_k3/nvidia/dsa.py:965-976"
    ],
-   "notes": "l2_gather_bytes = gathered volume (every row reads its 2048 rows: 1.34 MB/row/layer). kv_read_bytes = HBM SOL: prefill unique rows min(Lu, Ltk)*656 (each request's cache once); decode Ltk*656 (no cross-row dedupe; dedupe lower bound B*2048*656) -- in prefill the request's whole cache (L*656 = 88.6 MB/layer at 135K) fits L2 (132 MB) so gather hits L2; in decode q verify rows of a request overlap heavily (union <= q*2048). Intensity on gathered bytes = 2*96*1088/656 = 318 FLOP/B (BF16 ridge 259) -> compute-bound-ish if L2-fed; decode is gather/latency bound. Rows with L<=2048 attend all L keys (Ltk counts min(L, TOPK)).",
+   "notes": "Compute dtype follows the KV row (model.op_dtype): the 576-B per-tensor FP8 row (SM10x default) runs FP8 Q x FP8 KV MMAs (flashinfer_mla_sparse.py:1092-1095 requires FP8 q with an FP8 cache; sdec attn_fi.py runs FP8 query rows [B,H,576]); the 656-B fp8_ds_mla row dequantizes to BF16. sfu_ops = one exp per (row, head, key) at the MUFU rate (co-bound with FP8 MMA: 2176 MMA FLOPs per exp); simt_flops = online-softmax scale/max/sum. kv_read uses one SOL rule in both phases: the union of a request's rows, bounded by min(Lu, Ltk) (prefill: request cache once; decode: q*2048 when L >= q*2048 -- the q verify rows' top-k sets overlap heavily, so the true union is smaller; reading 2048 rows per request instead is worth ~2% of a high-r DEP step). l2_gather_bytes = gathered volume (every row reads its 2048 rows: 1.34 MB/row/layer). kv_read_bytes = HBM SOL: prefill unique rows min(Lu, Ltk)*656 (each request's cache once); decode Ltk*656 (no cross-row dedupe; dedupe lower bound B*2048*656) -- in prefill the request's whole cache (L*656 = 88.6 MB/layer at 135K) fits L2 (132 MB) so gather hits L2; in decode q verify rows of a request overlap heavily (union <= q*2048). Intensity on gathered bytes = 2*96*1088/656 = 318 FLOP/B (BF16 ridge 259) -> compute-bound-ish if L2-fed; decode is gather/latency bound. Rows with L<=2048 attend all L keys (Ltk counts min(L, TOPK)).",
    "phase": "both",
    "weight_bytes": "0",
    "kv_write_bytes": "0",
@@ -850,7 +896,7 @@
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
-   "bound_decode_ref": "compute"
+   "bound_decode_ref": "memory"
   },
   {
    "id": "DSA.w_uv",
@@ -879,6 +925,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "",
    "fused_in_sol": false,
@@ -913,6 +961,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -934,19 +984,21 @@
    },
    "flops": "2*(T)*(Nh*DV)*(H)",
    "weight_bytes": "(Nh*DV)*(H)*2",
-   "act_in_bytes": "(T)*(Nh*DV)*2",
+   "act_in_bytes": "(T)*(Nh*DV)*2 + T*Nh*DV*2",
    "act_out_bytes": "(T)*(H)*2",
    "shard_axis": "K (row-parallel) -> AR/RS",
    "cite": [
     "vllm/models/kimi_k3/nvidia/dsa.py:576-582",
     "vllm/models/kimi_k3/nvidia/dsa.py:877-887"
    ],
-   "notes": "",
+   "notes": "act_in includes the fused gate_mul gate read (T*Nh*DV*2).",
    "comm": "TP: all-reduce / reduce-scatter [T,H] bf16 partial sums; DSA-DP: push_out of o (or o_lat) rows back to the TP group before o_proj",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -980,6 +1032,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1012,6 +1066,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -1046,6 +1102,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1080,6 +1138,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "comm",
    "bound_decode_ref": "comm"
@@ -1100,7 +1160,7 @@
    "flops": "2*T*TOPK_E*LAT*2*I_E",
    "weight_bytes": "E_ACT*LAT*2*I_E*MXFP4_B",
    "act_in_bytes": "T*TOPK_E*LAT*MXFP8_B",
-   "act_out_bytes": "0",
+   "act_out_bytes": "T*TOPK_E*I_E*MXFP8_B*MOE_SPILL",
    "shard_axis": "experts over EP",
    "cite": [
     "vllm/models/kimi_k3/nvidia/model.py:796-819",
@@ -1112,6 +1172,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
@@ -1145,6 +1207,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -1165,21 +1229,23 @@
    },
    "flops": "2*T*TOPK_E*I_E*LAT",
    "weight_bytes": "E_ACT*I_E*LAT*MXFP4_B",
+   "act_in_bytes": "T*TOPK_E*I_E*MXFP8_B*MOE_SPILL",
    "act_out_bytes": "T*TOPK_E*LAT*2",
    "shard_axis": "experts over EP",
    "cite": [
     "vllm/models/kimi_k3/nvidia/model.py:796-819"
    ],
    "phase": "both",
-   "act_in_bytes": "0",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "",
    "fused_in_sol": false,
-   "bound_prefill_ref": "compute",
+   "bound_prefill_ref": "memory",
    "bound_decode_ref": "memory"
   },
   {
@@ -1211,6 +1277,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "comm",
    "bound_decode_ref": "comm"
@@ -1243,6 +1311,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -1277,6 +1347,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1310,6 +1382,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1342,6 +1416,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "compute",
@@ -1376,6 +1452,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1409,6 +1487,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1439,6 +1519,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
    "fused_in_sol": true,
@@ -1473,6 +1555,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1489,21 +1573,23 @@
     "out": "bf16",
     "compute": "fp32_simt"
    },
-   "flops": "T*H*8*(NB+1)",
+   "flops": "(R if (PREFILL and O7) else T)*H*8*(NB+1)",
    "weight_bytes": "2*H*2",
-   "act_in_bytes": "T*H*2*(NB+2)",
-   "act_out_bytes": "T*H*2",
+   "act_in_bytes": "(R if (PREFILL and O7) else T)*H*2*(NB+2)",
+   "act_out_bytes": "(R if (PREFILL and O7) else T)*H*2",
    "shard_axis": "token-parallel",
    "cite": [
     "vllm/models/kimi_k3/nvidia/model.py:1842-1857"
    ],
-   "notes": "Prefill could restrict to the R logit rows + Tc draft rows (new method): only those rows are consumed after the last layer.",
+   "notes": "O7 (prefill): only the R last-token logit rows are consumed after the last layer (the drafter reads the aux captures, not the final hidden). Decode: all T rows.",
    "phase": "both",
    "count_per_forward": "1",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -1536,6 +1622,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "notes": "",
    "fused_in_sol": false,
    "bound_prefill_ref": "comm",
@@ -1567,6 +1655,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
    "fused_in_sol": true,
@@ -1602,6 +1692,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
    "bound_decode_ref": "memory"
@@ -1637,6 +1729,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -1647,28 +1741,30 @@
    "layer_type": "dspark",
    "kind": "memory",
    "count_per_forward": "D_AUX",
-   "shapes": "[T,H] per aux layer (attn_res mix with the consumer layer's weights)",
+   "shapes": "[AUXR,H] per aux layer: prefix_sum + pending_mlp_out (prefix_only mode)",
    "dtype": {
     "act_in": "bf16",
-    "weight": "bf16",
+    "weight": "-",
     "out": "bf16",
     "compute": "fp32_simt"
    },
-   "flops": "T*H*8*(NB+1)",
-   "act_in_bytes": "T*H*2*(NB+2)",
-   "act_out_bytes": "T*H*2",
+   "flops": "(Tc if PREFILL else T)*H",
+   "act_in_bytes": "(Tc if PREFILL else T)*H*2*2",
+   "act_out_bytes": "(Tc if PREFILL else T)*H*2",
    "shard_axis": "token-parallel",
    "cite": [
     "vllm/models/kimi_k3/nvidia/model.py:1693-1728",
     "vllm/models/kimi_k3/nvidia/model.py:1803-1820"
    ],
-   "notes": "Extra attn_res pass per aux layer on every target row (SOL: only Tc rows).",
+   "notes": "Release default VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0 = 'prefix_only' (model.py:1691-1700, vllm/envs.py:232; release sweep logs 'mode=prefix_only'): aux = prefix_sum + pending_mlp_out, one add. Prefill: only the Tc consumed rows (O7: last 2048 per request); decode: all T verify rows (acceptance unknown in the forward).",
    "phase": "both",
    "weight_bytes": "0",
    "kv_read_bytes": "0",
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "memory",
@@ -1704,6 +1800,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1734,6 +1832,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
    "fused_in_sol": true,
@@ -1769,6 +1869,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "compute",
    "bound_decode_ref": "memory"
@@ -1800,6 +1902,8 @@
    "kv_read_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": true,
    "bound_prefill_ref": "memory",
@@ -1834,6 +1938,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -1865,6 +1971,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "notes": "",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
@@ -1899,6 +2007,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -1931,6 +2041,8 @@
    "weight_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
@@ -1964,6 +2076,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -1996,6 +2110,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -2026,6 +2142,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
    "fused_in_sol": true,
@@ -2060,6 +2178,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -2093,6 +2213,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -2128,6 +2250,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
    "bound_decode_ref": "memory"
@@ -2160,6 +2284,8 @@
    "kv_write_bytes": "0",
    "state_read_bytes": "0",
    "state_write_bytes": "0",
+   "simt_flops": "0",
+   "sfu_ops": "0",
    "comm": null,
    "fused_in_sol": false,
    "bound_prefill_ref": "n/a",
@@ -2305,10 +2431,10 @@
     "count": 69.0,
     "flops": 199149043580928.0,
     "weight_bytes": 12155092992.0,
-    "act_bytes": 43989860352.0,
+    "act_bytes": 71772930048.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 3547.0515463917527,
+    "ai": 2372.8551724137933,
     "ridge": 258.9928057553957,
     "bound": "compute"
    },
@@ -2375,12 +2501,12 @@
    {
     "id": "DSA.idx_score",
     "count": 24.0,
-    "flops": 417776051159040.0,
+    "flops": 412936946319360.0,
     "weight_bytes": 0.0,
     "act_bytes": 101720653824.0,
     "kv_bytes": 222578688.0,
     "state_bytes": 0.0,
-    "ai": 4098.124425374313,
+    "ai": 4050.6558026865796,
     "ridge": 1258.9928057553957,
     "bound": "compute"
    },
@@ -2411,13 +2537,13 @@
    {
     "id": "DSA.sparse_mla",
     "count": 24.0,
-    "flops": 168534516695040.0,
+    "flops": 168225279049728.0,
     "weight_bytes": 0.0,
     "act_bytes": 82141249536.0,
     "kv_bytes": 2147229696.0,
     "state_bytes": 0.0,
-    "ai": 1999.49647010663,
-    "ridge": 258.9928057553957,
+    "ai": 1995.827669244049,
+    "ridge": 755.3956834532374,
     "bound": "compute"
    },
    {
@@ -2449,10 +2575,10 @@
     "count": 24.0,
     "flops": 69269232549888.0,
     "weight_bytes": 4227858432.0,
-    "act_bytes": 15300820992.0,
+    "act_bytes": 24964497408.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 3547.0515463917527,
+    "ai": 2372.8551724137933,
     "ridge": 258.9928057553957,
     "bound": "compute"
    },
@@ -2509,10 +2635,10 @@
     "count": 92.0,
     "flops": 1062128232431616.0,
     "weight_bytes": 964304044032.0,
-    "act_bytes": 89137348608.0,
+    "act_bytes": 165540790272.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 1008.2461538461539,
+    "ai": 940.0655737704918,
     "ridge": 755.3956834532374,
     "bound": "compute"
    },
@@ -2533,12 +2659,12 @@
     "count": 92.0,
     "flops": 531064116215808.0,
     "weight_bytes": 482152022016.0,
-    "act_bytes": 172872433664.0,
+    "act_bytes": 249275875328.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 810.7546391752577,
+    "ai": 726.0648905302031,
     "ridge": 755.3956834532374,
-    "bound": "compute"
+    "bound": "memory"
    },
    {
     "id": "MOE.combine",
@@ -2699,12 +2825,12 @@
    {
     "id": "DS.aux_capture",
     "count": 5.0,
-    "flops": 42278584320.0,
+    "flops": 587202560.0,
     "weight_bytes": 0.0,
-    "act_bytes": 12918456320.0,
+    "act_bytes": 3523215360.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 3.272727272727273,
+    "ai": 0.16666666666666666,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -2873,8 +2999,8 @@
     "weight_bytes": 0.0,
     "act_bytes": 2173943808.0,
     "kv_bytes": 0.0,
-    "state_bytes": 57302581248.0,
-    "ai": 4.348949079089924,
+    "state_bytes": 58639641477.12,
+    "ai": 4.253332173346629,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -2895,10 +3021,10 @@
     "count": 69.0,
     "flops": 3111703805952.0,
     "weight_bytes": 12155092992.0,
-    "act_bytes": 687341568.0,
+    "act_bytes": 1121452032.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 242.29859154929576,
+    "ai": 234.37602179836512,
     "ridge": 258.9928057553957,
     "bound": "memory"
    },
@@ -2965,12 +3091,12 @@
    {
     "id": "DSA.idx_score",
     "count": 24.0,
-    "flops": 6874398720000.0,
+    "flops": 6794772480000.0,
     "weight_bytes": 0.0,
     "act_bytes": 1673035776.0,
     "kv_bytes": 14100480000.0,
     "state_bytes": 0.0,
-    "ai": 435.8190537622346,
+    "ai": 430.7709566144095,
     "ridge": 1258.9928057553957,
     "bound": "memory"
    },
@@ -3001,14 +3127,14 @@
    {
     "id": "DSA.sparse_mla",
     "count": 24.0,
-    "flops": 2633351823360.0,
+    "flops": 2628519985152.0,
     "weight_bytes": 0.0,
     "act_bytes": 1283457024.0,
     "kv_bytes": 8254390272.0,
     "state_bytes": 0.0,
-    "ai": 276.09498680738784,
-    "ridge": 258.9928057553957,
-    "bound": "compute"
+    "ai": 275.5883905013193,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
    },
    {
     "id": "DSA.w_uv",
@@ -3039,10 +3165,10 @@
     "count": 24.0,
     "flops": 1082331758592.0,
     "weight_bytes": 4227858432.0,
-    "act_bytes": 239075328.0,
+    "act_bytes": 390070272.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 242.29859154929576,
+    "ai": 234.37602179836512,
     "ridge": 258.9928057553957,
     "bound": "memory"
    },
@@ -3301,12 +3427,12 @@
    {
     "id": "DS.aux_capture",
     "count": 5.0,
-    "flops": 660602880.0,
+    "flops": 9175040.0,
     "weight_bytes": 0.0,
-    "act_bytes": 201850880.0,
+    "act_bytes": 55050240.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 3.272727272727273,
+    "ai": 0.16666666666666666,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -3607,8 +3733,8 @@
     "weight_bytes": 0.0,
     "act_bytes": 4347887616.0,
     "kv_bytes": 0.0,
-    "state_bytes": 59039023104.0,
-    "ai": 7.503854467629749,
+    "state_bytes": 60844922634.240005,
+    "ai": 7.295990943936474,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -3629,10 +3755,10 @@
     "count": 69.0,
     "flops": 6223407611904.0,
     "weight_bytes": 12155092992.0,
-    "act_bytes": 1374683136.0,
+    "act_bytes": 2242904064.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 459.97860962566847,
+    "ai": 432.24120603015075,
     "ridge": 258.9928057553957,
     "bound": "compute"
    },
@@ -3699,12 +3825,12 @@
    {
     "id": "DSA.idx_score",
     "count": 24.0,
-    "flops": 13748797440000.0,
+    "flops": 13589544960000.0,
     "weight_bytes": 0.0,
     "act_bytes": 3346071552.0,
     "kv_bytes": 14100480000.0,
     "state_bytes": 0.0,
-    "ai": 788.0524354065773,
+    "ai": 778.9244149192424,
     "ridge": 1258.9928057553957,
     "bound": "memory"
    },
@@ -3735,14 +3861,14 @@
    {
     "id": "DSA.sparse_mla",
     "count": 24.0,
-    "flops": 5266703646720.0,
+    "flops": 5257039970304.0,
     "weight_bytes": 0.0,
     "act_bytes": 2566914048.0,
     "kv_bytes": 16508780544.0,
     "state_bytes": 0.0,
-    "ai": 276.09498680738784,
-    "ridge": 258.9928057553957,
-    "bound": "compute"
+    "ai": 275.5883905013193,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
    },
    {
     "id": "DSA.w_uv",
@@ -3773,10 +3899,10 @@
     "count": 24.0,
     "flops": 2164663517184.0,
     "weight_bytes": 4227858432.0,
-    "act_bytes": 478150656.0,
+    "act_bytes": 780140544.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 459.97860962566847,
+    "ai": 432.24120603015075,
     "ridge": 258.9928057553957,
     "bound": "compute"
    },
@@ -4035,12 +4161,12 @@
    {
     "id": "DS.aux_capture",
     "count": 5.0,
-    "flops": 1321205760.0,
+    "flops": 18350080.0,
     "weight_bytes": 0.0,
-    "act_bytes": 403701760.0,
+    "act_bytes": 110100480.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 3.272727272727273,
+    "ai": 0.16666666666666666,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -4341,8 +4467,8 @@
     "weight_bytes": 0.0,
     "act_bytes": 271742976.0,
     "kv_bytes": 0.0,
-    "state_bytes": 7162822656.0,
-    "ai": 4.348949079089924,
+    "state_bytes": 7329955184.64,
+    "ai": 4.253332173346629,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -4363,10 +4489,10 @@
     "count": 69.0,
     "flops": 388962975744.0,
     "weight_bytes": 12155092992.0,
-    "act_bytes": 85917696.0,
+    "act_bytes": 140181504.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 31.775397118581456,
+    "ai": 31.63515998528871,
     "ridge": 258.9928057553957,
     "bound": "memory"
    },
@@ -4433,12 +4559,12 @@
    {
     "id": "DSA.idx_score",
     "count": 24.0,
-    "flops": 859299840000.0,
+    "flops": 849346560000.0,
     "weight_bytes": 0.0,
     "act_bytes": 209129472.0,
     "kv_bytes": 1762560000.0,
     "state_bytes": 0.0,
-    "ai": 435.8190537622346,
+    "ai": 430.7709566144095,
     "ridge": 1258.9928057553957,
     "bound": "memory"
    },
@@ -4469,14 +4595,14 @@
    {
     "id": "DSA.sparse_mla",
     "count": 24.0,
-    "flops": 329168977920.0,
+    "flops": 328564998144.0,
     "weight_bytes": 0.0,
     "act_bytes": 160432128.0,
     "kv_bytes": 1031798784.0,
     "state_bytes": 0.0,
-    "ai": 276.09498680738784,
-    "ridge": 258.9928057553957,
-    "bound": "compute"
+    "ai": 275.5883905013193,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
    },
    {
     "id": "DSA.w_uv",
@@ -4507,10 +4633,10 @@
     "count": 24.0,
     "flops": 135291469824.0,
     "weight_bytes": 4227858432.0,
-    "act_bytes": 29884416.0,
+    "act_bytes": 48758784.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 31.775397118581456,
+    "ai": 31.63515998528871,
     "ridge": 258.9928057553957,
     "bound": "memory"
    },
@@ -4769,12 +4895,12 @@
    {
     "id": "DS.aux_capture",
     "count": 5.0,
-    "flops": 82575360.0,
+    "flops": 1146880.0,
     "weight_bytes": 0.0,
-    "act_bytes": 25231360.0,
+    "act_bytes": 6881280.0,
     "kv_bytes": 0.0,
     "state_bytes": 0.0,
-    "ai": 3.272727272727273,
+    "ai": 0.16666666666666666,
     "ridge": 9.46043165467626,
     "bound": "memory"
    },
@@ -4983,11 +5109,11 @@
     "flops": 122093568.0
    },
    "KDA.core_decode": {
-    "bytes": 929320704.0,
+    "bytes": 950212270.0799942,
     "flops": 4041568419.8399963
    },
    "KDA.o_proj": {
-    "bytes": 10739712.0,
+    "bytes": 17522688.0,
     "flops": 48620371968.0
    },
    "DSA.qkv_a_packed": {
@@ -5008,7 +5134,7 @@
    },
    "DSA.idx_score": {
     "bytes": 246461184.0,
-    "flops": 107412480000.0
+    "flops": 106168320000.0
    },
    "DSA.topk": {
     "bytes": 26706432.0,
@@ -5020,14 +5146,14 @@
    },
    "DSA.sparse_mla": {
     "bytes": 149028864.0,
-    "flops": 41146122240.0
+    "flops": 41070624768.0
    },
    "DSA.w_uv": {
     "bytes": 11796480.0,
     "flops": 1207959552.0
    },
    "DSA.o_proj": {
-    "bytes": 3735552.0,
+    "bytes": 6094848.0,
     "flops": 16911433728.0
    },
    "MOE.router": {
@@ -5083,8 +5209,8 @@
     "flops": 8192000.0
    },
    "DS.aux_capture": {
-    "bytes": 3153920.0,
-    "flops": 10321920.0
+    "bytes": 860160.0,
+    "flops": 143360.0
    },
    "DS.fc": {
     "bytes": 344064.0,
@@ -5149,11 +5275,11 @@
     "flops": 183140352.0
    },
    "KDA.core_decode": {
-    "bytes": 959870592.0,
+    "bytes": 985713730.5599976,
     "flops": 5798630522.880005
    },
    "KDA.o_proj": {
-    "bytes": 16109568.0,
+    "bytes": 26284032.0,
     "flops": 72930557952.0
    },
    "DSA.qkv_a_packed": {
@@ -5174,7 +5300,7 @@
    },
    "DSA.idx_score": {
     "bytes": 259531776.0,
-    "flops": 161118720000.0
+    "flops": 159252480000.0
    },
    "DSA.topk": {
     "bytes": 40059648.0,
@@ -5186,14 +5312,14 @@
    },
    "DSA.sparse_mla": {
     "bytes": 223543296.0,
-    "flops": 61719183360.0
+    "flops": 61605937152.0
    },
    "DSA.w_uv": {
     "bytes": 17694720.0,
     "flops": 1811939328.0
    },
    "DSA.o_proj": {
-    "bytes": 5603328.0,
+    "bytes": 9142272.0,
     "flops": 25367150592.0
    },
    "MOE.router": {
@@ -5249,8 +5375,8 @@
     "flops": 12779520.0
    },
    "DS.aux_capture": {
-    "bytes": 4730880.0,
-    "flops": 15482880.0
+    "bytes": 1290240.0,
+    "flops": 215040.0
    },
    "DS.fc": {
     "bytes": 516096.0,
@@ -5323,11 +5449,11 @@
     "flops": 244187136.0
    },
    "KDA.core_decode": {
-    "bytes": 990420480.0,
+    "bytes": 1018637660.159996,
     "flops": 7431971143.679993
    },
    "KDA.o_proj": {
-    "bytes": 21479424.0,
+    "bytes": 35045376.0,
     "flops": 97240743936.0
    },
    "DSA.qkv_a_packed": {
@@ -5348,7 +5474,7 @@
    },
    "DSA.idx_score": {
     "bytes": 272602368.0,
-    "flops": 214824960000.0
+    "flops": 212336640000.0
    },
    "DSA.topk": {
     "bytes": 53412864.0,
@@ -5360,14 +5486,14 @@
    },
    "DSA.sparse_mla": {
     "bytes": 298057728.0,
-    "flops": 82292244480.0
+    "flops": 82141249536.0
    },
    "DSA.w_uv": {
     "bytes": 23592960.0,
     "flops": 2415919104.0
    },
    "DSA.o_proj": {
-    "bytes": 7471104.0,
+    "bytes": 12189696.0,
     "flops": 33822867456.0
    },
    "MOE.router": {
@@ -5423,8 +5549,8 @@
     "flops": 17367040.0
    },
    "DS.aux_capture": {
-    "bytes": 6307840.0,
-    "flops": 20643840.0
+    "bytes": 1720320.0,
+    "flops": 286720.0
    },
    "DS.fc": {
     "bytes": 688128.0,

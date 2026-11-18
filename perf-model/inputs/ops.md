@@ -55,18 +55,18 @@ Symbols: `T` token rows of the forward (prefill: chunk tokens; decode/verify: B*
 | KDA.conv | short causal depthwise conv (q,k,v; width 4) + SiLU | N_KDA | [T, 3P] with FP32 weight [3P, 4], conv state [3P, CONV-1+k] fp32 per request | bf16/fp32/bf16 (fp32_simt) | `T*3*P*(2*CONV + 4)` | `3*P*CONV*4` | `stR (nseq if PREFILL else B)*3*P*(CONV-1)*4 ; stW (nseq if PREFILL else B)*3*P*(CONV-1+(0 if PREFILL else k))*4` | compute / memory | nv/kda.py:707-716<br>nv/kda.py:1405-1488<br>nv/ops/kda_conv.py<br>vllm/model_executor/layers/mamba/mamba_utils.py:296-319 |
 | KDA.gate_beta_norm | KDA gate g=lb*sigmoid(A*(g1+dt_bias)), beta=sigmoid, q/k L2 norm | N_KDA | g1[T,P], beta[T,Hk], q,k [T,Hk,dk] | bf16/fp32 (A_log[Hk], dt_bias[P])/fp32 regs (fp32_simt) | `T*(P*6 + Hk*4 + 2*Hk*dk*3)` | `(Hk + P)*4` | `-` | compute / compute | nv/ops/recoverssm.py:18-60<br>nv/kda.py:702-704<br>nv/kda.py:845-848 |
 | KDA.core_prefill | chunked KDA (FlashKDA K1+K2, segscan) with FP32 state | N_KDA | q,k,v [T,Hk,dk], g [T,Hk,dk], beta [T,Hk]; state [nseq,Hk,dk,dv] fp32 | bf16/-/bf16 (bf16_mma (state staged bf16 into k.S / q.S MMAs, fp32 accum/state)) | `T*Hk*(2*C_KDA*(3*dk + 2*dv) + 6*dk*dv + (2/3)*C_KDA**2)` | `0` | `stR nseq*Hk*dk*dv*4 ; stW nseq*Hk*dk*dv*4*(1 + CKPT)` | memory / n/a | nv/kda.py:1490-1620<br>nv/ops/kda_segscan.py:1-60<br>nv/kda.py:421-476 |
-| KDA.core_decode | KDA verify recurrence (q rows/request) + deferred RecoverSSM commit | N_KDA | q,k,v,g [B*q,Hk,dk]; state [B,Hk,dk,dv] fp32; records u,kg [B,q,Hk,dk] bf16 | bf16/-/bf16 (fp32_simt (FP32 state)) | `B*q*Hk*7*dk*dv + B*AL*Hk*3*dk*dv` | `0` | `stR B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2 ; stW B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2` | n/a / memory | nv/kda.py:1060-1146<br>nv/specialized_decode/recoverssm/__init__.py:1-30<br>nv/specialized_decode/cutedsl/kda/commit.py:1-20<br>nv/specialized_decode/cutedsl/kda/verify.py:1-10<br>vllm/model_executor/layers/mamba/mamba_utils.py:133-149 |
+| KDA.core_decode | KDA verify recurrence (q rows/request) + deferred RecoverSSM commit | N_KDA | q,k,v,g [B*q,Hk,dk]; state [B,Hk,dk,dv] fp32; records u,kg [B,q,Hk,dk] bf16 | bf16/-/bf16 (fp32_simt (FP32 state)) | `B*q*Hk*7*dk*dv + B*AL*Hk*3*dk*dv` | `0` | `stR B*Hk*dk*dv*4 + B*AL*Hk*REC_B ; stW B*Hk*dk*dv*4 + B*q*Hk*REC_B` | n/a / memory | nv/kda.py:1060-1146<br>nv/specialized_decode/recoverssm/__init__.py:1-30<br>nv/specialized_decode/cutedsl/kda/commit.py:1-20<br>nv/specialized_decode/cutedsl/kda/verify.py:1-10<br>vllm/model_executor/layers/mamba/mamba_utils.py:133-149 |
 | KDA.o_norm | gated RMSNorm (o_norm, sigmoid(g2) gate, per-head 128) | N_KDA | [T,Hk,dv] x gate [T,Hk,dv] -> [T,P] | bf16/bf16/fp32 [dv]/bf16 (fp32_simt) | `T*P*8` | `dv*4` | `-` | compute / compute | nv/kda.py:913<br>nv/kda.py:1720-1736<br>nv/ops/kda_norm.py |
-| KDA.o_proj | o_proj 12288 -> 7168 | N_KDA | [T, P] x [P, H] -> [T, H] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(P)*(H)` | `(P)*(H)*2` | `-` | compute / memory | nv/kda.py:932-951<br>nv/kda.py:1047-1058 |
+| KDA.o_proj | o_proj 12288 -> 7168 (+ fused o_norm gate read) | N_KDA | [T, P] x [P, H] -> [T, H] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(P)*(H)` | `(P)*(H)*2` | `-` | compute / memory | nv/kda.py:932-951<br>nv/kda.py:1047-1058 |
 | DSA.qkv_a_packed | packed [q_a | kv_a(+k_pe) | indexer wk | indexer weights_proj] | N_DSA | [T, H] x [H, QLR + KVL + DR + Di + Ni] -> [T, QLR + KVL + DR + Di + Ni] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(H)*(QLR + KVL + DR + Di + Ni)` | `(H)*(QLR + KVL + DR + Di + Ni)*2` | `-` | compute / memory | nv/dsa.py:533-540<br>nv/dsa.py:189-196<br>nv/dsa.py:773-820<br>nv/dsa.py:897-913 |
 | DSA.prologue | fused prologue: q_a RMSNorm, kv_a RMSNorm, FP8 MLA KV insert, indexer key LayerNorm + MXFP4 quant + insert | N_DSA | q_c[T,1536], kv_c[T,512], k_pe[T,64], idx_k[T,128] -> caches | bf16/bf16/fp32 norm weights/bf16 q_c; fp8_ds_mla; mxfp4 (fp32_simt) | `T*(QLR*4 + KVL*6 + Di*10)` | `(QLR + KVL)*2 + Di*8` | `kvW T*(MLA_ROW + IDX_ROW)` | memory / memory | nv/dsa.py:922-948<br>nv/ops/dsa_indexer.py<br>nv/ops/dsa_indexer_mxfp4.py:1-20<br>vllm/models/kimi_k3/common/dsa_cache.py:58-63<br>vllm/v1/attention/backends/mla/flashmla_sparse.py:157-166 |
 | DSA.qb_wq_packed | packed [q_b (96 x 192) | indexer wq (32 x 128)] | N_DSA | [T, QLR] x [QLR, Nh*DQK + Ni*Di] -> [T, Nh*DQK + Ni*Di] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(QLR)*(Nh*DQK + Ni*Di)` | `(QLR)*(Nh*DQK + Ni*Di)*2` | `-` | compute / memory | nv/dsa.py:544-551<br>nv/dsa.py:179-185<br>nv/dsa.py:950-963 |
 | DSA.g_proj | output-gate projection 7168 -> 96*128 | N_DSA | [T, H] x [H, Nh*DV] -> [T, Nh*DV] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(H)*(Nh*DV)` | `(H)*(Nh*DV)*2` | `-` | compute / memory | nv/dsa.py:626-636<br>nv/dsa.py:855-866 |
 | DSA.idx_q_quant | indexer query MXFP4 quant + head-weight fold | N_DSA | index_q [T,32,128] bf16 -> E2M1 [T,32,64] + scales; weights [T,32] | bf16/-/mxfp4 (fp32_simt) | `T*Ni*Di*4` | `0` | `-` | compute / compute | nv/dsa.py:420-440<br>nv/ops/dsa_indexer_mxfp4.py |
-| DSA.idx_score | indexer scoring logits[t,s]=sum_h w[t,h]*relu(q[t,h].k[s]) over the full context | N_DSA | q [T,32,128] mxfp4, keys [L,128] mxfp4 (68 B) -> logits [T, L] | mxfp4/-/bf16 logits (scratch) / fp32 (mxf4 mma (block-scaled FP4 x FP4)) | `2*Ni*Di*Lsum + 3*Ni*Lsum` | `0` | `kvR Lu*IDX_ROW` | compute / memory | nv/dsa.py:420-472<br>nv/specialized_decode/cutedsl/dsa/indexer.py:1-40<br>vllm/model_executor/layers/sparse_attn_indexer.py |
+| DSA.idx_score | indexer scoring logits[t,s]=sum_h w[t,h]*relu(q[t,h].k[s]) over the full context | N_DSA | q [T,32,128] mxfp4, keys [L,128] mxfp4 (68 B) -> logits [T, L] | mxfp4/-/bf16 logits (scratch) / fp32 (mxf4 mma (block-scaled FP4 x FP4)) | `2*Ni*Di*Lsum` | `0` | `kvR Lu*IDX_ROW` | compute / memory | nv/dsa.py:420-472<br>nv/specialized_decode/cutedsl/dsa/indexer.py:1-40<br>vllm/model_executor/layers/sparse_attn_indexer.py |
 | DSA.topk | exact top-2048 over L logits per row (radix select) | N_DSA | logits [T, L] -> indices [T, 2048] int32 | bf16/-/int32 (int/simt) | `Lsum*4` | `0` | `-` | memory / memory | nv/specialized_decode/cutedsl/dsa/indexer.py:20-30<br>nv/dsa.py:270-296<br>nv/dsa_kernels/dcp_prefill_topk_merge/hist_merge.py |
 | DSA.w_uk | W_UK absorption: q_nope [T,96,128] x W_UK^T [96,128,512] -> q_lat | N_DSA | bmm over 96 heads: [T,128]x[128,512] | bf16/bf16 (kv_b_proj first half)/bf16 (bf16_mma) | `2*T*Nh*DN*KVL` | `Nh*DN*KVL*2` | `-` | memory / memory | vllm/model_executor/layers/attention/mla_attention.py:55-120<br>vllm/model_executor/layers/attention/mla_attention.py:419<br>vllm/model_executor/layers/attention/sparse_mla_attention.py:1006 |
-| DSA.sparse_mla | sparse MLA (FlashMLA sparse, absorbed MQA) over top-2048 | N_DSA | q [T,96,576] bf16; KV gathered [T,2048,576] fp8_ds_mla -> o_lat [T,96,512] | bf16/-/bf16 (bf16_mma (FP8 KV dequantized to BF16 on load)) | `2*Nh*(KVL+DR+KVL)*Ltk + 4*Nh*Ltk` | `0` | `kvR (min(Lu, Ltk) if PREFILL else Ltk)*MLA_ROW` | compute / compute | vllm/model_executor/layers/attention/sparse_mla_attention.py:1006-1168<br>nv/specialized_decode/cutedsl/dsa/attn_ds.py:1-40<br>nv/dsa.py:965-976 |
+| DSA.sparse_mla | sparse MLA (FlashMLA sparse, absorbed MQA) over top-2048 | N_DSA | q [T,96,576] bf16; KV gathered [T,2048,576] fp8_ds_mla -> o_lat [T,96,512] | bf16/-/bf16 (fp8_mma (FP8 Q x FP8 KV for QK^T, FP8 P x FP8 V; per-tensor FP8 576-B row)) | `2*Nh*(KVL+DR+KVL)*Ltk` | `0` | `kvR min(Lu, Ltk)*MLA_ROW` | compute / memory | vllm/model_executor/layers/attention/sparse_mla_attention.py:1006-1168<br>nv/specialized_decode/cutedsl/dsa/attn_ds.py:1-40<br>nv/dsa.py:965-976 |
 | DSA.w_uv | W_UV: o_lat [T,96,512] x W_UV [96,512,128] -> [T,96*128] | N_DSA | bmm over 96 heads: [T,512]x[512,128] | bf16/bf16 (kv_b_proj second half)/bf16 (bf16_mma) | `2*T*Nh*KVL*DV` | `Nh*KVL*DV*2` | `-` | memory / memory | vllm/model_executor/layers/attention/mla_attention.py:116<br>vllm/model_executor/layers/attention/mla_attention.py:494-500 |
 | DSA.gate_mul | output gate sigmoid(g) * attn_out | N_DSA | [T, 12288] x [T, 12288] | bf16/-/bf16 (fp32_simt) | `T*Nh*DV*5` | `0` | `-` | compute / compute | nv/dsa.py:868-875<br>nv/mla.py:121-124 |
 | DSA.o_proj | o_proj 12288 -> 7168 | N_DSA | [T, Nh*DV] x [Nh*DV, H] -> [T, H] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(Nh*DV)*(H)` | `(Nh*DV)*(H)*2` | `-` | compute / memory | nv/dsa.py:576-582<br>nv/dsa.py:877-887 |
@@ -76,7 +76,7 @@ Symbols: `T` token rows of the forward (prefill: chunk tokens; decode/verify: B*
 | MOE.dispatch | MegaMoE dispatch of latent rows to expert owners | N_MOE | [T,3584] -> T*16 (token,expert) rows; dedup per destination rank possible | bf16/-/mxfp8 (3584 + 112 B scale) (quant) | `T*LAT*4` | `0` | `-` | comm / comm | nv/megamoe_rubin/experts.py:1-30<br>nv/megamoe_rubin/runtime.py:1-10<br>nv/model.py:796-819 |
 | MOE.fc1 | expert FC1 (w13 gate|up) 3584 -> 6144, MXFP4 weights x MXFP8 act | N_MOE | sum_e [m_e, 3584] x [3584, 6144]; sum m_e = T*16 | mxfp8/mxfp4/fp32 acc -> act (mxf8f6f4_mma (fp8 rate)) | `2*T*TOPK_E*LAT*2*I_E` | `E_ACT*LAT*2*I_E*MXFP4_B` | `-` | compute / memory | nv/model.py:796-819<br>nv/megamoe_rubin/experts.py:1-30 |
 | MOE.act | SiTU(gate)*up (+clamp) and MXFP8 requant (fused in MegaMoE) | N_MOE | [T*16, 2*3072] -> [T*16, 3072] | fp32/-/mxfp8 (fp32_simt) | `T*TOPK_E*I_E*12` | `0` | `-` | compute / compute | nv/ops/situ_and_mul.py:36-45<br>nv/model.py:6-38 (KimiVecSituAndMul) |
-| MOE.fc2 | expert FC2 (w2) 3072 -> 3584, MXFP4 weights x MXFP8 act | N_MOE | sum_e [m_e, 3072] x [3072, 3584] | mxfp8/mxfp4/bf16 (mxf8f6f4_mma (fp8 rate)) | `2*T*TOPK_E*I_E*LAT` | `E_ACT*I_E*LAT*MXFP4_B` | `-` | compute / memory | nv/model.py:796-819 |
+| MOE.fc2 | expert FC2 (w2) 3072 -> 3584, MXFP4 weights x MXFP8 act | N_MOE | sum_e [m_e, 3072] x [3072, 3584] | mxfp8/mxfp4/bf16 (mxf8f6f4_mma (fp8 rate)) | `2*T*TOPK_E*I_E*LAT` | `E_ACT*I_E*LAT*MXFP4_B` | `-` | memory / memory | nv/model.py:796-819 |
 | MOE.combine | MegaMoE combine (weighted sum of 16 expert rows, BF16) | N_MOE | T*16 rows [3584] bf16 -> [T,3584] | bf16/-/bf16 (fp32 acc) | `T*TOPK_E*LAT*2` | `0` | `-` | comm / comm | nv/megamoe_rubin/runtime.py:1-10<br>nv/model.py:1156 |
 | MOE.latent_norm | routed latent RMSNorm (3584) | N_MOE | [T,3584] | bf16/bf16/bf16 (fp32_simt) | `T*LAT*4` | `LAT*2` | `-` | compute / compute | nv/model.py:753-759<br>nv/model.py:213-243 (KimiRoutedOutputTransform) |
 | MOE.latent_up | routed_expert_up_proj 3584 -> 7168 (+ shared output beta-add) | N_MOE | [T, LAT] x [LAT, H] -> [T, H] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(LAT)*(H)` | `(LAT)*(H)*2` | `-` | compute / memory | nv/model.py:761-772<br>nv/model.py:213-243 |
@@ -86,12 +86,12 @@ Symbols: `T` token rows of the forward (prefill: chunk tokens; decode/verify: B*
 | DENSE.gate_up | layer-0 dense MLP gate_up 7168 -> 2*33792 | N_DENSE | [T, H] x [H, 2*I_D] -> [T, 2*I_D] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(H)*(2*I_D)` | `(H)*(2*I_D)*2` | `-` | compute / memory | nv/model.py:1327-1340<br>nv/model.py:419-426 |
 | DENSE.act | layer-0 SiTU-and-mul | N_DENSE | [T, 67584] -> [T, 33792] | bf16/-/bf16 (fp32_simt) | `T*I_D*12` | `0` | `-` | compute / compute | nv/model.py:166-186 |
 | DENSE.down | layer-0 dense MLP down 33792 -> 7168 | N_DENSE | [T, I_D] x [I_D, H] -> [T, H] | bf16/bf16/bf16 (bf16_mma) | `2*(T)*(I_D)*(H)` | `(I_D)*(H)*2` | `-` | compute / memory | nv/model.py:427-438 |
-| F.attnres_final | final AttnRes mix (8 blocks + prefix, no output norm) | 1 | [T,H] + blocks[T,8,H] -> [T,H] | bf16/bf16/bf16 (fp32_simt) | `T*H*8*(NB+1)` | `2*H*2` | `-` | memory / memory | nv/model.py:1842-1857 |
+| F.attnres_final | final AttnRes mix (8 blocks + prefix, no output norm) | 1 | [T,H] + blocks[T,8,H] -> [T,H] | bf16/bf16/bf16 (fp32_simt) | `(R if (PREFILL and O7) else T)*H*8*(NB+1)` | `2*H*2` | `-` | memory / memory | nv/model.py:1842-1857 |
 | F.sp_gather_out | SP all-gather of the final hidden (+aux hidden) rows | 1 | [T/tp, H*(1+D_AUX)] -> [T, ...] | bf16/-/bf16 (none) | `0` | `0` | `-` | comm / comm | nv/model.py:1861-1873 |
 | F.norm | final RMSNorm (applied in compute_logits on logit rows) | 1 | [R,H] | bf16/bf16/bf16 (fp32_simt) | `R*H*4` | `H*2` | `-` | memory / compute | nv/model.py:2246-2254 |
 | F.lm_head | lm_head 7168 -> 163840 (target verify / last-token logits) | 1 | [R, H] x [H, V] -> [R, V] | bf16/bf16/fp32 (bf16_mma) | `2*(R)*(H)*(V)` | `(H)*(V)*2` | `-` | memory / memory | nv/model.py:2246-2300<br>nv/specialized_decode/cutedsl/verify/lmhead.py |
 | F.rejection | probabilistic rejection sampling (target vs draft probs) + bonus | 1 | target logits [B,q,V] (vocab-sharded) , draft logits cache [B,k,V] | fp32 target logits / head_dtype draft logits/-/int32 tokens (fp32_simt) | `B*q*V*8 + B*k*V*6` | `0` | `-` | n/a / memory | nv/model.py:2278-2300<br>nv/specialized_decode/runtime/sampled_verify.py:524-640<br>vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1110<br>vllm/v1/worker/gpu/spec_decode/speculator.py:499-505 |
-| DS.aux_capture | aux hidden capture: AttnRes stream after target layers 75,79,83,87,91 (aux ids 76..92) | D_AUX | [T,H] per aux layer (attn_res mix with the consumer layer's weights) | bf16/bf16/bf16 (fp32_simt) | `T*H*8*(NB+1)` | `0` | `-` | memory / memory | nv/model.py:1693-1728<br>nv/model.py:1803-1820 |
+| DS.aux_capture | aux hidden capture: AttnRes stream after target layers 75,79,83,87,91 (aux ids 76..92) | D_AUX | [AUXR,H] per aux layer: prefix_sum + pending_mlp_out (prefix_only mode) | bf16/-/bf16 (fp32_simt) | `(Tc if PREFILL else T)*H` | `0` | `-` | memory / memory | nv/model.py:1693-1728<br>nv/model.py:1803-1820 |
 | DS.fc | context fc: cat(5 aux) 35840 -> 7168 | 1 | [Tc, D_AUX*H] x [D_AUX*H, H] -> [Tc, H] | bf16/bf16/bf16 (bf16_mma) | `2*(Tc)*(D_AUX*H)*(H)` | `(D_AUX*H)*(H)*2` | `-` | compute / memory | nv/dspark_gqa.py:158-177<br>nv/dspark_gqa.py:327-355<br>vllm/model_executor/models/qwen3_dflash.py:495-510 |
 | DS.hidden_norm | hidden_norm RMSNorm of context rows | 1 | [Tc,H] | bf16/bf16/bf16 (fp32_simt) | `Tc*H*4` | `H*2` | `-` | compute / compute | nv/dspark_gqa.py:170-177 |
 | DS.ctx_kv_proj | context K/V projection of all 5 layers (fused K/V weight) 7168 -> 5*2*16*64 | 1 | [Tc, H] x [H, D_L*2*D_HKV*D_HD] -> [Tc, D_L*2*D_HKV*D_HD] | bf16/bf16/bf16 (bf16_mma) | `2*(Tc)*(H)*(D_L*2*D_HKV*D_HD)` | `(H)*(D_L*2*D_HKV*D_HD)*2` | `-` | compute / memory | nv/dspark_gqa.py:179-201<br>vllm/model_executor/models/qwen3_dflash.py:592-720 |
@@ -118,28 +118,28 @@ Symbols: `T` token rows of the forward (prefill: chunk tokens; decode/verify: B*
 |---|---|---|---|---|---|---|
 | global | 0.00 | 0.23 | 0.23 | 0.00 | 0.00 | 0.00 |
 | all | 0.93 | 0.01 | 344.57 | 0.00 | 0.00 | 43.69 |
-| kda | 1016.62 | 61.26 | 339.04 | 0.00 | 1.36 | 0.00 |
-| dsa | 775.00 | 11.50 | 449.69 | 2.65 | 0.00 | 0.00 |
-| moe | 2166.78 | 1481.40 | 452.63 | 0.00 | 0.00 | 283.62 |
+| kda | 1016.62 | 61.26 | 366.82 | 0.00 | 1.36 | 0.00 |
+| dsa | 769.85 | 11.50 | 459.35 | 2.65 | 0.00 | 0.00 |
+| moe | 2166.78 | 1481.40 | 605.44 | 0.00 | 0.00 | 283.62 |
 | dense_mlp | 23.82 | 1.45 | 3.79 | 0.00 | 0.00 | 0.00 |
 | final | 0.01 | 2.35 | 2.58 | 0.00 | 0.00 | 2.82 |
-| dspark | 10.87 | 0.66 | 14.90 | 0.34 | 0.00 | 0.00 |
-| **total** | 3994.0 | 1558.9 | 1607.4 | 3.0 | 1.4 | 330.1 |
+| dspark | 10.83 | 0.66 | 5.50 | 0.34 | 0.00 | 0.00 |
+| **total** | 3988.8 | 1558.9 | 1788.3 | 3.0 | 1.4 | 330.1 |
 
-Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/13.9 TB/s); sum over all non-comm ops = 785.7 ms (one GPU, no overlap, SOL):
+Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/13.9 TB/s); sum over all non-comm ops = 756.0 ms (one GPU, no overlap, SOL):
 
 | op | TFLOP | HBM GB | AI | ridge | bound | roofline ms | share |
 |---|---|---|---|---|---|---|---|
-| KDA.in_proj | 800.23 | 176.69 | 4529 | 259 | compute | 222.29 | 28.3% |
-| MOE.fc1 | 1062.13 | 1053.44 | 1008 | 755 | compute | 101.16 | 12.9% |
-| MOE.shared_gate_up | 265.53 | 74.86 | 3547 | 259 | compute | 73.76 | 9.4% |
-| KDA.o_proj | 199.15 | 56.14 | 3547 | 259 | compute | 55.32 | 7.0% |
-| MOE.fc2 | 531.06 | 655.02 | 811 | 755 | compute | 50.58 | 6.4% |
-| DSA.sparse_mla | 168.53 | 84.29 | 1999 | 259 | compute | 46.82 | 6.0% |
-| MOE.shared_down | 132.77 | 48.23 | 2753 | 259 | compute | 36.88 | 4.7% |
-| DSA.idx_score | 417.78 | 101.94 | 4098 | 1259 | compute | 23.87 | 3.0% |
-| MOE.latent_down | 77.45 | 37.14 | 2085 | 259 | compute | 21.51 | 2.7% |
-| MOE.latent_up | 77.45 | 37.14 | 2085 | 259 | compute | 21.51 | 2.7% |
+| KDA.in_proj | 800.23 | 176.69 | 4529 | 259 | compute | 222.29 | 29.4% |
+| MOE.fc1 | 1062.13 | 1129.84 | 940 | 755 | compute | 101.16 | 13.4% |
+| MOE.shared_gate_up | 265.53 | 74.86 | 3547 | 259 | compute | 73.76 | 9.8% |
+| KDA.o_proj | 199.15 | 83.93 | 2373 | 259 | compute | 55.32 | 7.3% |
+| MOE.fc2 | 531.06 | 731.43 | 726 | 755 | memory | 52.62 | 7.0% |
+| MOE.shared_down | 132.77 | 48.23 | 2753 | 259 | compute | 36.88 | 4.9% |
+| DSA.idx_score | 412.94 | 101.94 | 4051 | 1259 | compute | 23.60 | 3.1% |
+| MOE.latent_down | 77.45 | 37.14 | 2085 | 259 | compute | 21.51 | 2.8% |
+| MOE.latent_up | 77.45 | 37.14 | 2085 | 259 | compute | 21.51 | 2.8% |
+| DSA.g_proj | 69.27 | 19.53 | 3547 | 259 | compute | 19.24 | 2.5% |
 
 ### decode_B64_k3_L135K
 
@@ -147,26 +147,26 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 |---|---|---|---|---|---|---|
 | global | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
 | all | 0.01 | 0.01 | 5.38 | 0.00 | 0.00 | 0.68 |
-| kda | 15.94 | 61.26 | 5.30 | 0.00 | 63.16 | 0.00 |
-| dsa | 12.46 | 11.50 | 7.19 | 22.36 | 0.00 | 0.00 |
+| kda | 15.94 | 61.26 | 5.73 | 0.00 | 64.50 | 0.00 |
+| dsa | 12.37 | 11.50 | 7.34 | 22.36 | 0.00 | 0.00 |
 | moe | 33.86 | 1467.05 | 7.07 | 0.00 | 0.00 | 4.43 |
 | dense_mlp | 0.37 | 1.45 | 0.06 | 0.00 | 0.00 | 0.00 |
 | final | 0.60 | 2.35 | 0.44 | 0.00 | 0.00 | 0.04 |
-| dspark | 1.49 | 7.63 | 0.86 | 2.69 | 0.00 | 0.00 |
-| **total** | 64.7 | 1551.3 | 26.3 | 25.1 | 63.2 | 5.2 |
+| dspark | 1.49 | 7.63 | 0.71 | 2.69 | 0.00 | 0.00 |
+| **total** | 64.6 | 1551.3 | 26.7 | 25.1 | 64.5 | 5.2 |
 
-Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/13.9 TB/s); sum over all non-comm ops = 120.0 ms (one GPU, no overlap, SOL):
+Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/13.9 TB/s); sum over all non-comm ops = 120.1 ms (one GPU, no overlap, SOL):
 
 | op | TFLOP | HBM GB | AI | ridge | bound | roofline ms | share |
 |---|---|---|---|---|---|---|---|
 | MOE.fc1 | 16.60 | 956.13 | 17 | 755 | memory | 68.79 | 57.3% |
 | MOE.fc2 | 8.30 | 480.07 | 17 | 755 | memory | 34.54 | 28.8% |
-| KDA.core_decode | 0.26 | 59.48 | 4 | 9 | memory | 4.28 | 3.6% |
+| KDA.core_decode | 0.26 | 60.81 | 4 | 9 | memory | 4.38 | 3.6% |
 | KDA.in_proj | 12.50 | 50.84 | 246 | 259 | memory | 3.66 | 3.0% |
 | MOE.shared_gate_up | 4.15 | 17.12 | 242 | 259 | memory | 1.23 | 1.0% |
-| DSA.idx_score | 6.87 | 15.77 | 436 | 1259 | memory | 1.13 | 0.9% |
-| KDA.o_proj | 3.11 | 12.84 | 242 | 259 | memory | 0.92 | 0.8% |
-| DSA.sparse_mla | 2.63 | 9.54 | 276 | 259 | compute | 0.73 | 0.6% |
+| DSA.idx_score | 6.79 | 15.77 | 431 | 1259 | memory | 1.13 | 0.9% |
+| KDA.o_proj | 3.11 | 13.28 | 234 | 259 | memory | 0.96 | 0.8% |
+| DSA.sparse_mla | 2.63 | 9.54 | 276 | 755 | memory | 0.69 | 0.6% |
 | MOE.shared_down | 2.07 | 8.73 | 238 | 259 | memory | 0.63 | 0.5% |
 | KDA.conv | 0.01 | 5.90 | 1 | 9 | memory | 0.42 | 0.4% |
 
@@ -176,13 +176,13 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 |---|---|---|---|---|---|---|
 | global | 0.00 | 0.01 | 0.01 | 0.00 | 0.00 | 0.00 |
 | all | 0.03 | 0.01 | 10.77 | 0.00 | 0.00 | 1.37 |
-| kda | 31.84 | 61.26 | 10.60 | 0.00 | 67.50 | 0.00 |
-| dsa | 24.91 | 11.50 | 14.39 | 30.62 | 0.00 | 0.00 |
+| kda | 31.84 | 61.26 | 11.46 | 0.00 | 69.31 | 0.00 |
+| dsa | 24.74 | 11.50 | 14.69 | 30.62 | 0.00 | 0.00 |
 | moe | 67.71 | 1481.26 | 14.14 | 0.00 | 0.00 | 8.86 |
 | dense_mlp | 0.74 | 1.45 | 0.12 | 0.00 | 0.00 | 0.00 |
 | final | 1.20 | 2.35 | 0.91 | 0.00 | 0.00 | 0.09 |
-| dspark | 3.42 | 8.30 | 1.92 | 2.70 | 0.00 | 0.00 |
-| **total** | 129.9 | 1566.1 | 52.8 | 33.3 | 67.5 | 10.3 |
+| dspark | 3.42 | 8.30 | 1.63 | 2.70 | 0.00 | 0.00 |
+| **total** | 129.7 | 1566.1 | 53.7 | 33.3 | 69.3 | 10.3 |
 
 Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/13.9 TB/s); sum over all non-comm ops = 131.3 ms (one GPU, no overlap, SOL):
 
@@ -191,11 +191,11 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 | MOE.fc1 | 33.19 | 966.99 | 34 | 755 | memory | 69.57 | 53.0% |
 | MOE.fc2 | 16.60 | 487.51 | 34 | 755 | memory | 35.07 | 26.7% |
 | KDA.in_proj | 25.01 | 52.84 | 473 | 259 | compute | 6.95 | 5.3% |
-| KDA.core_decode | 0.48 | 63.39 | 8 | 9 | memory | 4.56 | 3.5% |
+| KDA.core_decode | 0.48 | 65.19 | 7 | 9 | memory | 4.69 | 3.6% |
 | MOE.shared_gate_up | 8.30 | 18.04 | 460 | 259 | compute | 2.30 | 1.8% |
-| KDA.o_proj | 6.22 | 13.53 | 460 | 259 | compute | 1.73 | 1.3% |
-| DSA.sparse_mla | 5.27 | 19.08 | 276 | 259 | compute | 1.46 | 1.1% |
-| DSA.idx_score | 13.75 | 17.45 | 788 | 1259 | memory | 1.26 | 1.0% |
+| KDA.o_proj | 6.22 | 14.40 | 432 | 259 | compute | 1.73 | 1.3% |
+| DSA.sparse_mla | 5.26 | 19.08 | 276 | 755 | memory | 1.37 | 1.0% |
+| DSA.idx_score | 13.59 | 17.45 | 779 | 1259 | memory | 1.26 | 1.0% |
 | MOE.shared_down | 4.15 | 9.36 | 443 | 259 | compute | 1.15 | 0.9% |
 | MOE.latent_down | 2.42 | 5.74 | 422 | 259 | compute | 0.67 | 0.5% |
 
@@ -205,13 +205,13 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 |---|---|---|---|---|---|---|
 | global | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
 | all | 0.00 | 0.01 | 0.67 | 0.00 | 0.00 | 0.09 |
-| kda | 1.99 | 61.26 | 0.66 | 0.00 | 7.90 | 0.00 |
-| dsa | 1.56 | 11.50 | 0.90 | 2.79 | 0.00 | 0.00 |
+| kda | 1.99 | 61.26 | 0.72 | 0.00 | 8.06 | 0.00 |
+| dsa | 1.55 | 11.50 | 0.92 | 2.79 | 0.00 | 0.00 |
 | moe | 4.23 | 668.77 | 0.88 | 0.00 | 0.00 | 0.55 |
 | dense_mlp | 0.05 | 1.45 | 0.01 | 0.00 | 0.00 | 0.00 |
 | final | 0.08 | 2.35 | 0.06 | 0.00 | 0.00 | 0.01 |
-| dspark | 0.19 | 7.62 | 0.11 | 0.34 | 0.00 | 0.00 |
-| **total** | 8.1 | 753.0 | 3.3 | 3.1 | 7.9 | 0.6 |
+| dspark | 0.19 | 7.62 | 0.09 | 0.34 | 0.00 | 0.00 |
+| **total** | 8.1 | 753.0 | 3.3 | 3.1 | 8.1 | 0.6 |
 
 Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/13.9 TB/s); sum over all non-comm ops = 55.2 ms (one GPU, no overlap, SOL):
 
@@ -221,20 +221,20 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 | MOE.fc2 | 1.04 | 211.61 | 5 | 755 | memory | 15.22 | 27.6% |
 | KDA.in_proj | 1.56 | 49.09 | 32 | 259 | memory | 3.53 | 6.4% |
 | MOE.shared_gate_up | 0.52 | 16.32 | 32 | 259 | memory | 1.17 | 2.1% |
-| KDA.o_proj | 0.39 | 12.24 | 32 | 259 | memory | 0.88 | 1.6% |
+| KDA.o_proj | 0.39 | 12.30 | 32 | 259 | memory | 0.88 | 1.6% |
 | MOE.shared_down | 0.26 | 8.18 | 32 | 259 | memory | 0.59 | 1.1% |
-| KDA.core_decode | 0.03 | 7.43 | 4 | 9 | memory | 0.53 | 1.0% |
+| KDA.core_decode | 0.03 | 7.60 | 4 | 9 | memory | 0.55 | 1.0% |
 | MOE.latent_down | 0.15 | 4.79 | 32 | 259 | memory | 0.34 | 0.6% |
 | MOE.latent_up | 0.15 | 4.79 | 32 | 259 | memory | 0.34 | 0.6% |
-| DSA.g_proj | 0.14 | 4.26 | 32 | 259 | memory | 0.31 | 0.6% |
+| DSA.o_proj | 0.14 | 4.28 | 32 | 259 | memory | 0.31 | 0.6% |
 
 ## Decode: marginal bytes/FLOPs per extra request (non-weight, unsharded, L=135K)
 
 | op | k3_L135K MB | k5_L135K MB | k7_L135K MB | k3_L135K GFLOP | k5_L135K GFLOP | k7_L135K GFLOP |
 |---|---|---|---|---|---|---|
-| KDA.core_decode | 929.3 | 959.9 | 990.4 | 4.04 | 5.80 | 7.43 |
-| DSA.idx_score | 246.5 | 259.5 | 272.6 | 107.41 | 161.12 | 214.82 |
-| DSA.sparse_mla | 149.0 | 223.5 | 298.1 | 41.15 | 61.72 | 82.29 |
+| KDA.core_decode | 950.2 | 985.7 | 1018.6 | 4.04 | 5.80 | 7.43 |
+| DSA.idx_score | 246.5 | 259.5 | 272.6 | 106.17 | 159.25 | 212.34 |
+| DSA.sparse_mla | 149.0 | 223.5 | 298.1 | 41.07 | 61.61 | 82.14 |
 | KDA.conv | 91.6 | 111.9 | 132.3 | 0.12 | 0.18 | 0.24 |
 | L.attnres_post | 44.7 | 67.1 | 89.5 | 0.11 | 0.17 | 0.23 |
 | DS.attn | 42.4 | 42.8 | 43.1 | 0.76 | 1.26 | 1.76 |
@@ -243,20 +243,19 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 | KDA.in_proj | 31.2 | 46.8 | 62.4 | 195.37 | 293.05 | 390.74 |
 | DSA.topk | 26.7 | 40.1 | 53.4 | 0.05 | 0.08 | 0.10 |
 | MOE.fc1 | 21.8 | 32.6 | 43.5 | 259.31 | 388.96 | 518.62 |
+| KDA.o_proj | 17.5 | 26.3 | 35.0 | 48.62 | 72.93 | 97.24 |
 | MOE.shared_gate_up | 14.3 | 21.5 | 28.6 | 64.83 | 97.24 | 129.65 |
 | DSA.w_uk | 13.0 | 19.5 | 26.0 | 1.21 | 1.81 | 2.42 |
 | DSA.w_uv | 11.8 | 17.7 | 23.6 | 1.21 | 1.81 | 2.42 |
-| KDA.o_proj | 10.7 | 16.1 | 21.5 | 48.62 | 72.93 | 97.24 |
 | MOE.shared_down | 9.8 | 14.7 | 19.6 | 32.41 | 48.62 | 64.83 |
-| MOE.latent_down | 7.9 | 11.9 | 15.8 | 18.91 | 28.36 | 37.82 |
 | MOE.latent_up | 7.9 | 11.9 | 15.8 | 18.91 | 28.36 | 37.82 |
+| MOE.latent_down | 7.9 | 11.9 | 15.8 | 18.91 | 28.36 | 37.82 |
 | KDA.f_b_proj | 6.9 | 10.3 | 13.7 | 0.87 | 1.30 | 1.74 |
 | MOE.router | 6.6 | 9.9 | 13.2 | 4.73 | 7.09 | 9.45 |
+| DSA.o_proj | 6.1 | 9.1 | 12.2 | 16.91 | 25.37 | 33.82 |
 | DSA.qb_wq_packed | 4.6 | 6.9 | 9.2 | 6.64 | 9.97 | 13.29 |
-| DSA.o_proj | 3.7 | 5.6 | 7.5 | 16.91 | 25.37 | 33.82 |
 | DSA.g_proj | 3.7 | 5.6 | 7.5 | 16.91 | 25.37 | 33.82 |
 | F.rejection | 3.6 | 5.6 | 7.5 | 0.01 | 0.01 | 0.02 |
-| DS.aux_capture | 3.2 | 4.7 | 6.3 | 0.01 | 0.02 | 0.02 |
 | DS.markov | 2.9 | 4.9 | 6.9 | 0.51 | 0.84 | 1.18 |
 | F.lm_head | 2.7 | 4.0 | 5.4 | 9.40 | 14.09 | 18.79 |
 | DS.lm_head | 2.0 | 3.3 | 4.7 | 7.05 | 11.74 | 16.44 |
@@ -264,6 +263,7 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 | DS.norm_ar | 1.7 | 2.9 | 4.0 | 0.00 | 0.00 | 0.00 |
 | DS.gate_up | 1.1 | 1.8 | 2.5 | 6.17 | 10.28 | 14.39 |
 | DSA.prologue | 0.9 | 1.3 | 1.8 | 0.00 | 0.00 | 0.00 |
+| DS.aux_capture | 0.9 | 1.3 | 1.7 | 0.00 | 0.00 | 0.00 |
 | DS.down | 0.6 | 1.1 | 1.5 | 3.08 | 5.14 | 7.19 |
 | F.attnres_final | 0.6 | 0.9 | 1.3 | 0.00 | 0.00 | 0.00 |
 | DENSE.gate_up | 0.6 | 0.9 | 1.2 | 3.88 | 5.81 | 7.75 |
@@ -273,10 +273,10 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 | DENSE.down | 0.3 | 0.5 | 0.7 | 1.94 | 2.91 | 3.88 |
 | DS.ctx_kv_proj | 0.1 | 0.2 | 0.3 | 0.59 | 0.88 | 1.17 |
 | DS.embed | 0.0 | 0.0 | 0.1 | 0.00 | 0.00 | 0.00 |
-| DS.ctx_kv_insert | 0.0 | 0.1 | 0.2 | 0.00 | 0.00 | 0.00 |
-| MOE.act | 0.0 | 0.0 | 0.0 | 0.22 | 0.33 | 0.43 |
 | G.embed | 0.0 | 0.0 | 0.1 | 0.00 | 0.00 | 0.00 |
-| **total** | 1789 | 2095 | 2401 | 1011.3 | 1520.2 | 2028.9 |
+| MOE.act | 0.0 | 0.0 | 0.0 | 0.22 | 0.33 | 0.43 |
+| DS.ctx_kv_insert | 0.0 | 0.1 | 0.2 | 0.00 | 0.00 | 0.00 |
+| **total** | 1817 | 2131 | 2443 | 1010.0 | 1518.2 | 2026.3 |
 
 ## Findings that matter for the SOL model
 

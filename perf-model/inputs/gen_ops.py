@@ -18,6 +18,7 @@ CONST = dict(
     Nh=96, QLR=1536, KVL=512, DN=128, DR=64, DQK=192, DV=128, TOPK=2048,
     MLA_ROW=656,  # fp8_ds_mla bytes/token: 512 fp8 + 4x fp32 scales + 64 bf16 rope
     Ni=32, Di=128, IDX_ROW=68,  # MXFP4 indexer key: 64 B E2M1 + 4 B UE8M0
+    REC_B=128 * 4 + 2 * 128 * 2,  # RecoverSSM record per row per head: FP32 correction [dk] + key_gate [2*dk] BF16
     # MoE
     E=896, TOPK_E=16, LAT=3584, I_E=3072, I_SH=6144, I_D=33792,
     MXFP4_B=0.5 + 1 / 32,   # bytes per MXFP4 weight element incl. UE8M0 scale
@@ -61,6 +62,8 @@ def op(**kw):
     kw.setdefault("kv_write_bytes", "0")
     kw.setdefault("state_read_bytes", "0")
     kw.setdefault("state_write_bytes", "0")
+    kw.setdefault("simt_flops", "0")   # FP32 SIMT work co-issued with the MMA (epilogue / softmax)
+    kw.setdefault("sfu_ops", "0")      # MUFU transcendental ops (exp) co-issued with the MMA
     kw.setdefault("comm", None)
     kw.setdefault("notes", "")
     ops.append(kw)
@@ -203,8 +206,8 @@ op(id="KDA.core_decode", name="KDA verify recurrence (q rows/request) + deferred
    dtype=dict(act_in="bf16", weight="-", out="bf16", compute="fp32_simt (FP32 state)"),
    flops="B*q*Hk*7*dk*dv + B*AL*Hk*3*dk*dv",
    act_in_bytes="B*q*Hk*(4*dk*2 + 2)", act_out_bytes="B*q*Hk*dv*2",
-   state_read_bytes="B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2",
-   state_write_bytes="B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2",
+   state_read_bytes="B*Hk*dk*dv*4 + B*AL*Hk*REC_B",
+   state_write_bytes="B*Hk*dk*dv*4 + B*q*Hk*REC_B",
    shard_axis="heads over TP",
    cite=[R + "kda.py:1060-1146", R + "specialized_decode/recoverssm/__init__.py:1-30",
          R + "specialized_decode/cutedsl/kda/commit.py:1-20",
@@ -215,7 +218,9 @@ op(id="KDA.core_decode", name="KDA verify recurrence (q rows/request) + deferred
          "tokens (decay + outer product ~3 dk dv each) in the same pass. SOL traffic: FP32 "
          "state read once + written once per request per layer = 2*96*128*128*4 = 12.6 MB "
          "(869 MB per request per step over 69 layers) -- THE dominant decode byte term. "
-         "Records (verify corrections + key-gates, bf16) are written and read back next step. "
+         "Records (REC_B = 1024 B per row per head: FP32 correction [dk] + key_gate [2*dk] in the "
+         "state dtype, recoverssm/context.py allocate_records) are written for all q rows and read "
+         "back for the AL accepted rows next step; kv.py capacity uses the same REC_B. "
          "Non-deferred alternatives: stock RecoverSSM commit after sampling (read S twice, "
          "write once) or q-slot state writes (write q states).")
 op(id="KDA.o_norm", name="gated RMSNorm (o_norm, sigmoid(g2) gate, per-head 128)",
@@ -226,7 +231,7 @@ op(id="KDA.o_norm", name="gated RMSNorm (o_norm, sigmoid(g2) gate, per-head 128)
    act_in_bytes="T*P*2*2", act_out_bytes="T*P*2", shard_axis="heads",
    cite=[R + "kda.py:913", R + "kda.py:1720-1736", R + "ops/kda_norm.py"],
    notes="Fused into the decode kernel (output_gate / norm_weight args); separate in prefill.")
-gemm("KDA.o_proj", "o_proj 12288 -> 7168", KDA, "N_KDA", "P", "H",
+gemm("KDA.o_proj", "o_proj 12288 -> 7168 (+ fused o_norm gate read)", KDA, "N_KDA", "P", "H",
      [R + "kda.py:932-951", R + "kda.py:1047-1058"],
      shard="K (row-parallel): partial sums -> all-reduce / reduce-scatter",
      comm="TP: all-reduce (or RS under SP) of [T,H] bf16 partial sums; fused GEMM-AR "
@@ -276,7 +281,8 @@ op(id="DSA.idx_score", name="indexer scoring logits[t,s]=sum_h w[t,h]*relu(q[t,h
    shapes="q [T,32,128] mxfp4, keys [L,128] mxfp4 (68 B) -> logits [T, L]",
    dtype=dict(act_in="mxfp4", weight="-", out="bf16 logits (scratch) / fp32",
               compute="mxf4 mma (block-scaled FP4 x FP4)"),
-   flops="2*Ni*Di*Lsum + 3*Ni*Lsum",
+   flops="2*Ni*Di*Lsum",
+   simt_flops="4*Ni*Lsum",
    kv_read_bytes="Lu*IDX_ROW",
    act_in_bytes="T*Ni*(Di/2+8)", act_out_bytes="Lsum*2*SCRATCH",
    shard_axis="TP: every rank scores the whole context (replicated) unless DCP splits keys / "
@@ -288,7 +294,12 @@ op(id="DSA.idx_score", name="indexer scoring logits[t,s]=sum_h w[t,h]*relu(q[t,h
          "every key once per request per step (kv_read = L*68 B), FLOPs 2*32*128*q*L. "
          "SCRATCH=1 when logits are materialized (stock + current specialized: BF16 "
          "[T,L] write + read by select); SCRATCH=0 for a fused score+select (new method). "
-         "At L=135K: 26.5 GFLOP per query row over 24 layers.")
+         "At L=135K: 26.5 GFLOP per query row over 24 layers. "
+         "Split (review 2026-11-17): flops = the FP4 MMA only; simt_flops = the per-(row,key) "
+         "FP32 epilogue relu + head-weight FMA over the 32 heads (2 instructions = 4 FMA-FLOP "
+         "equivalents per head) at the FP32 SIMT rate; t = max(mma, epilogue, bytes). A packed "
+         "BF16x2 epilogue would halve it but rounds the logits (not stock precision). "
+         "Microbench: DeepGEMM fp4_mqa_logits times both parts together.")
 op(id="DSA.topk", name="exact top-2048 over L logits per row (radix select)",
    layer_type=D, kind="memory", count_per_forward="N_DSA",
    shapes="logits [T, L] -> indices [T, 2048] int32",
@@ -318,15 +329,26 @@ op(id="DSA.sparse_mla", name="sparse MLA (FlashMLA sparse, absorbed MQA) over to
    layer_type=D, kind="attention", count_per_forward="N_DSA",
    shapes="q [T,96,576] bf16; KV gathered [T,2048,576] fp8_ds_mla -> o_lat [T,96,512]",
    dtype=dict(act_in="bf16", weight="-", out="bf16",
-              compute="bf16_mma (FP8 KV dequantized to BF16 on load)"),
-   flops="2*Nh*(KVL+DR+KVL)*Ltk + 4*Nh*Ltk",
-   kv_read_bytes="(min(Lu, Ltk) if PREFILL else Ltk)*MLA_ROW",
+              compute="fp8_mma (FP8 Q x FP8 KV for QK^T, FP8 P x FP8 V; per-tensor FP8 576-B row)"),
+   flops="2*Nh*(KVL+DR+KVL)*Ltk",
+   sfu_ops="Nh*Ltk",
+   simt_flops="4*Nh*Ltk",
+   kv_read_bytes="min(Lu, Ltk)*MLA_ROW",
    l2_gather_bytes="Ltk*MLA_ROW",
    act_in_bytes="T*Nh*(KVL+DR)*2", act_out_bytes="T*Nh*KVL*2",
    shard_axis="heads (TP: 96/tp heads, decode pads to 64/rank); DCP: keys; DSA-DP: request owner",
    cite=["vllm/model_executor/layers/attention/sparse_mla_attention.py:1006-1168",
          R + "specialized_decode/cutedsl/dsa/attn_ds.py:1-40", R + "dsa.py:965-976"],
-   notes="l2_gather_bytes = gathered volume (every row reads its 2048 rows: 1.34 MB/row/layer). "
+   notes="Compute dtype follows the KV row (model.op_dtype): the 576-B per-tensor FP8 row "
+         "(SM10x default) runs FP8 Q x FP8 KV MMAs (flashinfer_mla_sparse.py:1092-1095 requires "
+         "FP8 q with an FP8 cache; sdec attn_fi.py runs FP8 query rows [B,H,576]); the 656-B "
+         "fp8_ds_mla row dequantizes to BF16. sfu_ops = one exp per (row, head, key) at the MUFU "
+         "rate (co-bound with FP8 MMA: 2176 MMA FLOPs per exp); simt_flops = online-softmax "
+         "scale/max/sum. kv_read uses one SOL rule in both phases: the union of a request's "
+         "rows, bounded by min(Lu, Ltk) (prefill: request cache once; decode: q*2048 when "
+         "L >= q*2048 -- the q verify rows' top-k sets overlap heavily, so the true union is "
+         "smaller; reading 2048 rows per request instead is worth ~2% of a high-r DEP step). "
+         "l2_gather_bytes = gathered volume (every row reads its 2048 rows: 1.34 MB/row/layer). "
          "kv_read_bytes = HBM SOL: prefill unique rows min(Lu, Ltk)*656 (each request's cache "
          "once); decode Ltk*656 (no cross-row dedupe; dedupe lower bound B*2048*656) -- in prefill the "
          "request's whole cache (L*656 = 88.6 MB/layer at 135K) fits L2 (132 MB) so gather "
@@ -392,7 +414,7 @@ op(id="MOE.fc1", name="expert FC1 (w13 gate|up) 3584 -> 6144, MXFP4 weights x MX
    shapes="sum_e [m_e, 3584] x [3584, 6144]; sum m_e = T*16",
    dtype=dict(act_in="mxfp8", weight="mxfp4", out="fp32 acc -> act", compute="mxf8f6f4_mma (fp8 rate)"),
    flops="2*T*TOPK_E*LAT*2*I_E", weight_bytes="E_ACT*LAT*2*I_E*MXFP4_B",
-   act_in_bytes="T*TOPK_E*LAT*MXFP8_B", act_out_bytes="0",
+   act_in_bytes="T*TOPK_E*LAT*MXFP8_B", act_out_bytes="T*TOPK_E*I_E*MXFP8_B*MOE_SPILL",
    shard_axis="experts over EP",
    cite=[R + "model.py:796-819", R + "megamoe_rubin/experts.py:1-30"],
    notes="E_ACT = experts touched this step = E*(1-(1-16/896)^T) (all 896 once T >~ 300); "
@@ -410,6 +432,7 @@ op(id="MOE.fc2", name="expert FC2 (w2) 3072 -> 3584, MXFP4 weights x MXFP8 act",
    shapes="sum_e [m_e, 3072] x [3072, 3584]",
    dtype=dict(act_in="mxfp8", weight="mxfp4", out="bf16", compute="mxf8f6f4_mma (fp8 rate)"),
    flops="2*T*TOPK_E*I_E*LAT", weight_bytes="E_ACT*I_E*LAT*MXFP4_B",
+   act_in_bytes="T*TOPK_E*I_E*MXFP8_B*MOE_SPILL",
    act_out_bytes="T*TOPK_E*LAT*2", shard_axis="experts over EP",
    cite=[R + "model.py:796-819"])
 op(id="MOE.combine", name="MegaMoE combine (weighted sum of 16 expert rows, BF16)",
@@ -462,11 +485,12 @@ F = "final"
 op(id="F.attnres_final", name="final AttnRes mix (8 blocks + prefix, no output norm)",
    layer_type=F, kind="memory", shapes="[T,H] + blocks[T,8,H] -> [T,H]",
    dtype=dict(act_in="bf16", weight="bf16", out="bf16", compute="fp32_simt"),
-   flops="T*H*8*(NB+1)", weight_bytes="2*H*2", act_in_bytes="T*H*2*(NB+2)",
-   act_out_bytes="T*H*2", shard_axis="token-parallel",
+   flops="(R if (PREFILL and O7) else T)*H*8*(NB+1)", weight_bytes="2*H*2",
+   act_in_bytes="(R if (PREFILL and O7) else T)*H*2*(NB+2)",
+   act_out_bytes="(R if (PREFILL and O7) else T)*H*2", shard_axis="token-parallel",
    cite=[R + "model.py:1842-1857"],
-   notes="Prefill could restrict to the R logit rows + Tc draft rows (new method): only "
-         "those rows are consumed after the last layer.")
+   notes="O7 (prefill): only the R last-token logit rows are consumed after the last "
+         "layer (the drafter reads the aux captures, not the final hidden). Decode: all T rows.")
 op(id="F.sp_gather_out", name="SP all-gather of the final hidden (+aux hidden) rows",
    layer_type=F, kind="comm", shapes="[T/tp, H*(1+D_AUX)] -> [T, ...]",
    dtype=dict(act_in="bf16", weight="-", out="bf16", compute="none"),
@@ -504,11 +528,16 @@ DS = "dspark"
 op(id="DS.aux_capture", name="aux hidden capture: AttnRes stream after target layers "
                              "75,79,83,87,91 (aux ids 76..92)",
    layer_type=DS, kind="memory", count_per_forward="D_AUX",
-   shapes="[T,H] per aux layer (attn_res mix with the consumer layer's weights)",
-   dtype=dict(act_in="bf16", weight="bf16", out="bf16", compute="fp32_simt"),
-   flops="T*H*8*(NB+1)", act_in_bytes="T*H*2*(NB+2)", act_out_bytes="T*H*2",
+   shapes="[AUXR,H] per aux layer: prefix_sum + pending_mlp_out (prefix_only mode)",
+   dtype=dict(act_in="bf16", weight="-", out="bf16", compute="fp32_simt"),
+   flops="(Tc if PREFILL else T)*H", act_in_bytes="(Tc if PREFILL else T)*H*2*2",
+   act_out_bytes="(Tc if PREFILL else T)*H*2",
    shard_axis="token-parallel", cite=[R + "model.py:1693-1728", R + "model.py:1803-1820"],
-   notes="Extra attn_res pass per aux layer on every target row (SOL: only Tc rows).")
+   notes="Release default VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0 = 'prefix_only' "
+         "(model.py:1691-1700, vllm/envs.py:232; release sweep logs 'mode=prefix_only'): "
+         "aux = prefix_sum + pending_mlp_out, one add. Prefill: only the Tc consumed rows "
+         "(O7: last 2048 per request); decode: all T verify rows (acceptance unknown in the "
+         "forward).")
 gemm("DS.fc", "context fc: cat(5 aux) 35840 -> 7168", DS, "1", "D_AUX*H", "H",
      [R + "dspark_gqa.py:158-177", R + "dspark_gqa.py:327-355",
       "vllm/model_executor/models/qwen3_dflash.py:495-510"], rows="Tc",
@@ -614,10 +643,18 @@ for o in ops:
         o["notes"] = (o["notes"] + " " if o["notes"] else "") + (
             "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its "
             "activation bytes are not HBM traffic (kv/state bytes still count).")
+# A fused binary elementwise op still reads its second input: the consumer carries it.
+for o in ops:
+    if o["id"] == "KDA.o_proj":      # o_norm (fused) gate g2 [T, P] written by in_proj
+        o["act_in_bytes"] += " + T*P*2"
+        o["notes"] = (o["notes"] + " " if o["notes"] else "") + "act_in includes the fused o_norm gate read (T*P*2)."
+    if o["id"] == "DSA.o_proj":      # gate_mul (fused) gate g [T, Nh*DV] written by g_proj
+        o["act_in_bytes"] += " + T*Nh*DV*2"
+        o["notes"] = (o["notes"] + " " if o["notes"] else "") + "act_in includes the fused gate_mul gate read (T*Nh*DV*2)."
 
 # ---------------------------------------------------------------- evaluation
 RIDGE = {  # FLOP/B at 13.9 TB/s
-    "bf16_mma": 3.6e15 / 13.9e12, "mxf8f6f4_mma (fp8 rate)": 10.5e15 / 13.9e12,
+    "bf16_mma": 3.6e15 / 13.9e12, "mxf8f6f4_mma (fp8 rate)": 10.5e15 / 13.9e12, "fp8_mma": 10.5e15 / 13.9e12,
     "mxf4 mma (block-scaled FP4 x FP4)": 17.5e15 / 13.9e12,
     "fp32_simt": 131.5e12 / 13.9e12,
 }
@@ -637,7 +674,7 @@ def env_prefill(Cc=16384, Pp=120000, nseq=1):
     Lsum = Cc * Pp + Cc * (Cc + 1) / 2
     Ltk = Cc * C["TOPK"] if Pp >= C["TOPK"] else sum(min(Pp + i + 1, C["TOPK"]) for i in range(Cc))
     e = dict(C, T=T, B=nseq, nseq=nseq, k=0, q=1, L=L, Lsum=Lsum, Ltk=Ltk, Lu=L, R=nseq,
-             AL=1, Tc=T, Tq=0, PREFILL=True, CKPT=1, SCRATCH=1)
+             AL=1, Tc=T, Tq=0, PREFILL=True, CKPT=1, SCRATCH=1, O7=0, MOE_SPILL=1)
     e["E_ACT"] = C["E"] * (1 - (1 - 16 / C["E"]) ** T)
     return e
 
@@ -646,7 +683,7 @@ def env_decode(Bb=64, kk=3, Ll=135000, AL=3.08):
     q = 1 + kk
     T = Bb * q
     e = dict(C, T=T, B=Bb, nseq=Bb, k=kk, q=q, L=Ll, Lsum=T * Ll, Ltk=T * min(Ll, C["TOPK"]),
-             Lu=Bb * Ll, R=T, AL=AL, Tc=T, Tq=Bb * kk, PREFILL=False, CKPT=0, SCRATCH=1)
+             Lu=Bb * Ll, R=T, AL=AL, Tc=T, Tq=Bb * kk, PREFILL=False, CKPT=0, SCRATCH=1, O7=0, MOE_SPILL=0)
     e["E_ACT"] = C["E"] * (1 - (1 - 16 / C["E"]) ** T)
     return e
 
