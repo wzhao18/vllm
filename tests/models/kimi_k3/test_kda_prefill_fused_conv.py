@@ -31,9 +31,11 @@ def _inputs(seqlens, heads, conv_state_dtype, seed=0):
     g = (torch.randn(1, T, heads, D, device=dev) * 0.5).to(torch.bfloat16)
     w = torch.randn(3 * P, 4, device=dev) * 0.4
     lines = 2 * N + 2
-    conv_state = (torch.randn(lines, 3 * P, 3, device=dev) * 0.7).to(
-        torch.bfloat16
-    ).to(conv_state_dtype)
+    conv_state = (
+        (torch.randn(lines, 3 * P, 3, device=dev) * 0.7)
+        .to(torch.bfloat16)
+        .to(conv_state_dtype)
+    )
     cache_indices = (torch.randperm(lines - 1, device=dev)[:N] + 1).to(torch.int32)
     has_init = torch.rand(N, device=dev) < 0.6
     has_init[0] = True
@@ -46,7 +48,19 @@ def _inputs(seqlens, heads, conv_state_dtype, seed=0):
     init = (torch.randn(N, heads, D, D, device=dev) * 0.05) * has_init[
         :, None, None, None
     ]
-    return mixed, beta, g, w, conv_state, cache_indices, has_init, cu, A_log, dt_bias, init
+    return (
+        mixed,
+        beta,
+        g,
+        w,
+        conv_state,
+        cache_indices,
+        has_init,
+        cu,
+        A_log,
+        dt_bias,
+        init,
+    )
 
 
 @pytest.mark.parametrize(
@@ -81,8 +95,23 @@ def test_fused_conv_prefill_bitwise(seqlens, heads, conv_state_dtype):
     out_ref = torch.empty(1, T, heads, D, dtype=torch.bfloat16, device="cuda")
     fs_ref = torch.empty_like(init)
     torch.ops.k3_flashkda_split.fwd(
-        q, k, v, g, beta, D**-0.5, out_ref, ws, A_log,
-        dt_bias.view(heads, D), lb, init, fs_ref, cu, None, None, 3,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        D**-0.5,
+        out_ref,
+        ws,
+        A_log,
+        dt_bias.view(heads, D),
+        lb,
+        init,
+        fs_ref,
+        cu,
+        None,
+        None,
+        3,
     )
 
     cs_new = cs.clone()
@@ -90,10 +119,23 @@ def test_fused_conv_prefill_bitwise(seqlens, heads, conv_state_dtype):
     fs = torch.empty_like(init)
     v_buf = torch.empty_like(out_ref)
     fused_conv_prefill(
-        mixed_qkv=mixed, conv_weight=w, conv_state=cs_new, cache_indices=ci,
-        has_initial_state=hi, null_block_id=-1, g=g, beta=beta, A_log=A_log,
-        dt_bias=dt_bias, lower_bound=lb, initial_state=init, cu_seqlens=cu,
-        out=out, final_state=fs, workspace=ws, v_buf=v_buf,
+        mixed_qkv=mixed,
+        conv_weight=w,
+        conv_state=cs_new,
+        cache_indices=ci,
+        has_initial_state=hi,
+        null_block_id=-1,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lb,
+        initial_state=init,
+        cu_seqlens=cu,
+        out=out,
+        final_state=fs,
+        workspace=ws,
+        v_buf=v_buf,
     )
     torch.accelerator.synchronize()
     assert torch.equal(v_buf, v)
@@ -102,7 +144,9 @@ def test_fused_conv_prefill_bitwise(seqlens, heads, conv_state_dtype):
     assert torch.equal(out, out_ref)
 
 
-@pytest.mark.parametrize("seqlens,heads", [([37, 1, 2, 200, 16], 4), ([3, 64, 1000], 96)])
+@pytest.mark.parametrize(
+    "seqlens,heads", [([37, 1, 2, 200, 16], 4), ([3, 64, 1000], 96)]
+)
 def test_fused_conv_prefill_o_norm_mxfp8(seqlens, heads):
     """The o_norm + MXFP8 epilogue against kda_norm.rmsnorm_gated_mxfp8 on the
     stock output: same FP8 codes and scales up to rare one-ulp flips (the sum of
@@ -132,8 +176,23 @@ def test_fused_conv_prefill_o_norm_mxfp8(seqlens, heads):
     out_ref = torch.empty(1, T, heads, D, dtype=torch.bfloat16, device="cuda")
     fs_ref = torch.empty_like(init)
     torch.ops.k3_flashkda_split.fwd(
-        q, k, v, g, beta, D**-0.5, out_ref, ws, A_log,
-        dt_bias.view(heads, D), lb, init, fs_ref, cu, None, None, 3,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        D**-0.5,
+        out_ref,
+        ws,
+        A_log,
+        dt_bias.view(heads, D),
+        lb,
+        init,
+        fs_ref,
+        cu,
+        None,
+        None,
+        3,
     )
     ref = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
     kda_norm.rmsnorm_gated_mxfp8(out_ref, gate.view(T, heads, D), norm_w, eps, out=ref)
@@ -143,12 +202,27 @@ def test_fused_conv_prefill_o_norm_mxfp8(seqlens, heads):
     ref_scale = ref.scale.clone()
     fs = torch.empty_like(init)
     fused_conv_prefill(
-        mixed_qkv=mixed, conv_weight=w, conv_state=cs.clone(), cache_indices=ci,
-        has_initial_state=hi, null_block_id=-1, g=g, beta=beta, A_log=A_log,
-        dt_bias=dt_bias, lower_bound=lb, initial_state=init, cu_seqlens=cu,
-        out=torch.empty_like(out_ref), final_state=fs, workspace=ws,
-        v_buf=torch.empty_like(out_ref), o_gate=gate, o_norm_weight=norm_w,
-        o_norm_eps=eps, o_mxfp8=mx,
+        mixed_qkv=mixed,
+        conv_weight=w,
+        conv_state=cs.clone(),
+        cache_indices=ci,
+        has_initial_state=hi,
+        null_block_id=-1,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lb,
+        initial_state=init,
+        cu_seqlens=cu,
+        out=torch.empty_like(out_ref),
+        final_state=fs,
+        workspace=ws,
+        v_buf=torch.empty_like(out_ref),
+        o_gate=gate,
+        o_norm_weight=norm_w,
+        o_norm_eps=eps,
+        o_mxfp8=mx,
     )
     torch.accelerator.synchronize()
     assert torch.equal(fs, fs_ref)
