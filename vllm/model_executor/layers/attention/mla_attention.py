@@ -1303,6 +1303,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     fp8_attention
                     and self.impl.supports_quant_query_input
                     and mqa_q_pe.shape[-1] > 0
+                    and not self._impl_quantizes_query(q_dcp_replicated)
                 ):
                     # Concatenate in place: the bmm writes the NoPE columns of
                     # the token-major (B, N, L + R) query and the RoPE part is
@@ -1963,6 +1964,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
         return spec
+
+    def _impl_quantizes_query(self, q_dcp_replicated: torch.Tensor | None) -> bool:
+        """Whether the backend writes the FP8 MQA query (concat, static quant and
+        its head padding) in one kernel (``quantize_decode_query``). The
+        in-place RoPE concat is then skipped: it would hand the backend an
+        already-concatenated query and cost two more passes (quant, then pad)."""
+        fuses = getattr(self.impl, "fuses_decode_query_quant", None)
+        return q_dcp_replicated is None and fuses is not None and fuses()
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)

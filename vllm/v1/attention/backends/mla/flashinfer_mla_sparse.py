@@ -1229,6 +1229,11 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._fused_query = padded
         return padded[:, :num_heads]
 
+    def fuses_decode_query_quant(self) -> bool:
+        """Whether ``quantize_decode_query`` takes this layer's MQA query (it
+        declines DCP query gathers and ShardQ exchanges)."""
+        return self.dcp_world_size == 1 and not self.use_shardq
+
     def _padded_query(self, query: torch.Tensor, heads: int) -> torch.Tensor:
         """``query`` [T, H, D] with ``heads`` heads (extra heads zero): a row
         slice of the buffer ``quantize_decode_query`` wrote when ``query`` is
