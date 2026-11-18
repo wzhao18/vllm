@@ -82,7 +82,7 @@ PRE_ANALOG = {"P6-16": "P4-2", "P6-32": "P4-2", "P6-4-16": "P4-4",
 PRE_MEASURED = ("P1", "P2", "P3-16", "P4-4", "P4-2", "P2b", "P5-4", "P5-8")    # P2b / P5-x: wave 2
 NOTES = {"D2": "measured path is MoE-TP8 (sdec refuses EP8); the model D2 is EP8 - calibrated = what D2 runs today",
          "D1": "k=3 derates; the k7 r8 MoE path cliff (2.1x) is not in the k=3 curve",
-         "EP32": "MegaMoE family transferred from EP16 rows (no EP32 measurement)"}
+         "EP32": "MegaMoE family from measured FlashInfer SM107 EP32 rows (microbench/results/moe_ep32), x vendored-vs-FI factor for decode"}
 
 
 def _load(p):
