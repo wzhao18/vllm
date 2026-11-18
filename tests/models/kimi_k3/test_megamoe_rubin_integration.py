@@ -750,7 +750,7 @@ def test_nvfp4_mapping_covers_the_export_keys():
     assert ("experts.w13_weight", "experts.1.w3.weight_packed", 1, "w3") in mx
 
 
-def test_nvfp4_parameters_and_dummy_values(ep):
+def test_nvfp4_parameters_and_dummy_values(ep, small_bucket):
     """NVFP4 layers run the NVFP4 kernel at every size (no MX at <= 512 tokens), hold
     the export's tensors as stored, and dummy-load finite power-of-two scales."""
     from vllm.model_executor.model_loader.weight_utils import (

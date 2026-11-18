@@ -2098,6 +2098,32 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         return loaded_params
 
 
+def log_kimi_k3_quant_kinds(model: nn.Module) -> dict[str, int]:
+    """Log (once) and return how many linears / MoE blocks run each precision:
+    the checkpoint's per-layer quantization as this process built it."""
+    kinds: dict[str, int] = {}
+    for module in model.modules():
+        if isinstance(module, KimiMoE) and module.use_mega_moe:
+            experts = module.experts
+            kind = f"MegaMoE {experts.weight_format.name} experts"
+            if hasattr(experts, "quant_kind"):
+                kind += f" ({experts.quant_kind} kernel)"
+        elif isinstance(module, LinearBase):
+            method = module.quant_method
+            spec = getattr(method, "spec", None)
+            kind = type(method).__name__
+            if spec is not None:
+                kind += f"[{spec.weight}]"
+        else:
+            continue
+        kinds[kind] = kinds.get(kind, 0) + 1
+    logger.info_once(
+        "Kimi K3 quantization: %s",
+        "; ".join(f"{n} x {k}" for k, n in sorted(kinds.items())),
+    )
+    return kinds
+
+
 class KimiLinearForCausalLM(
     nn.Module,
     HasInnerState,
@@ -2126,6 +2152,7 @@ class KimiLinearForCausalLM(
             )
         else:
             self.lm_head = PPMissingLayer()
+        log_kimi_k3_quant_kinds(self)
         enable_kimi_k3_low_latency_gemm(self, self.model_config.dtype)
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(
