@@ -107,11 +107,16 @@ def main():
     p.add_argument("--json", default="")
     p.add_argument("--trace", action="store_true", help="KdaFlow cycle trace")
     p.add_argument("--skip", default="", help="KdaFlow diagnostics: fold,store,verify")
+    p.add_argument("--regs", default="", help="KdaFlow scan,prep setmaxnreg")
     a = p.parse_args()
     if a.trace:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.TRACE = True
+    if a.regs:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.SCAN_REGISTERS, flow.PREP_REGISTERS = map(int, a.regs.split(","))
     if a.skip:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
