@@ -22,6 +22,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | point | TPS/GPU (preview -> release) | P90 intvty (preview -> release) | P90 TTFT s (preview -> release) | gsm8k strict | real AL (k) |
 |---|---|---|---|---|---|
 | C1 | 1,342 -> 1,359 (+1.2%) | 778.6 -> 901.4 (+15.8%) | 0.36 -> 0.40 | 0.9659 -> 0.9795 | 4.763 (7) |
+| C16 1P2D | 3,104 -> 3,162 (+1.9%) | 600.6 -> 701.6 (+16.8%) | 0.39 -> 0.44 | 0.9704 -> pending | - (-) |
 | C48 1P1D | 15,544 -> 15,934 (+2.5%) | 296.1 -> 367.2 (+24.0%) | 0.73 -> 0.71 | 0.9674 -> 0.9788 | 4.793 (7) |
 | C64 | 20,778 -> 21,527 (+3.6%) | 232.8 -> 300.0 (+28.9%) | 0.85 -> 0.96 | 0.9689 -> 0.9803 | 4.807 (7) |
 | C128 1P1D | 32,194 -> 33,119 (+2.9%) | 184.6 -> 212.2 (+14.9%) | 3.20 -> 3.00 | 0.9719 -> 0.9788 | 3.293 (3) |
@@ -33,6 +34,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | point | topology (GPUs) | AgentX run | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen | note |
 |---|---|---|---|---|---|---|---|---|---|---|
 | C1 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C1-a1118776 | 1,359 | 901.4 | 332.2 | 5.6 | 0.40 | 0.9795 | **yes** |  |
+| C16 1P2D | 1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7) (40) | C16-1P2D-a1118773 | 3,162 | 701.6 | 297.4 | 3.5 | 0.44 | pending | **yes** |  |
 | C48 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C48-1P1D-a1118778 | 15,934 | 367.2 | 177.8 | 6.1 | 0.71 | 0.9788 | **yes** |  |
 | C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1118777 | 21,527 | 300.0 | 136.3 | 7.2 | 0.96 | 0.9803 | **yes** |  |
 | C128 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off) (24) | C128-1P1D-a1118779 | 33,119 | 212.2 | 61.5 | 11.6 | 3.00 | 0.9788 | **yes** |  |
