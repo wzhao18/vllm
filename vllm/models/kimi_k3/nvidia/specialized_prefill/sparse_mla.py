@@ -50,8 +50,8 @@ OFF_QN = 0  # Q latent: 4 x [96 rows x 128 B] SW128 (B operand of QK, K-major)
 OFF_QR = OFF_QN + 4 * H * 128  # Q RoPE: [96 x 64 B] SW64
 STAGE = 4 * 128 * 128 + 128 * 64  # KV tile: latent SW128 atoms + RoPE SW64
 OFF_KV = OFF_QR + H * 64  # 2 stages (55296 = 54 x 1024)
-OFF_P = OFF_KV + 2 * STAGE  # P^T [128 keys x 96 heads] MN-major, no swizzle
-OFF_RED = OFF_P + H * 128
+OFF_P = OFF_KV + 2 * STAGE  # 2 x P^T [128 keys x 96 heads] MN-major, no swizzle
+OFF_RED = OFF_P + 2 * H * 128
 OFF_MT = OFF_RED + 2 * 4 * HW * 4
 OFF_L = OFF_MT + 2 * HW * 4
 OFF_M = OFF_L + 2 * 4 * HW * 4  # [2 WG][48] running max (log2 units)
@@ -64,7 +64,10 @@ SMEM_BYTES = OFF_TMEM + 16
 B_QFULL, B_QEMPTY, B_KVFULL, B_KVEMPTY, B_SFULL, B_PFULL, B_OFULL, B_OFREE = (
     0, 1, 2, 4, 6, 7, 8, 9,
 )
-C_S, C_O = 0, 128  # TMEM columns: S^T 96, O^T 4 x 96
+# pipelined: second S^T / P^T buffers' barriers and the per-tile PV completion
+B_SFULL2, B_PFULL2, B_PVDONE = 10, 11, 12
+C_S = 0  # TMEM columns: S^T 96 (pipelined: two S^T buffers, 0 and 96)
+C_O, C_O_PIPE = 128, 192  # O^T 4 x 96
 
 # tcgen05 shared-memory descriptors (version bit 46)
 SDESC_SW128 = (1024 >> 4 << 32) | (1 << 46) | (2 << 61)  # 8 rows x 128 B
@@ -260,6 +263,20 @@ def cp_async_arrive(bar):
         Uint32(bar),)
 
 
+@asm()
+def tmem_alloc_exclusive(dst):
+    """All 576 TMEM columns (Rubin exclusive allocation: one CTA per SM)."""
+    code = ("tcgen05.alloc.exclusive.cta_group::1.sync.aligned.shared::cta.b32 [$0], 576; "
+            "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;")
+    return code, "r,~{memory}", (Uint32(dst),)
+
+
+@asm()
+def tmem_free_exclusive(taddr):
+    return ("tcgen05.dealloc.exclusive.cta_group::1.sync.aligned.b32 $0, 576;",
+            "r,~{memory}", (Uint32(taddr),))
+
+
 def _bar(base, i):
     return base + Uint32(OFF_BAR + 8 * i)
 
@@ -275,8 +292,11 @@ def _tiles(n):
 class SparseMlaPrefill:
     """``loaders`` cp.async row-loader warps; ``grid`` persistent CTAs (one per SM)."""
 
-    def __init__(self, loaders: int, grid: int):
-        self.loaders, self.grid = loaders, grid
+    def __init__(self, loaders: int, grid: int, pipelined: bool = False):
+        self.loaders, self.grid, self.pipelined = loaders, grid, pipelined
+        # pipelined: two S^T and P^T buffers (all 576 TMEM columns, exclusive) and
+        # the MMA order QK(t + 1) before PV(t), so softmax(t + 1) overlaps PV(t)
+        self.c_o = C_O_PIPE if pipelined else C_O
         self.threads = 32 * (SOFTMAX_WARPS + 1 + loaders)
 
     @cute.jit
@@ -310,13 +330,17 @@ class SparseMlaPrefill:
             for i, cnt in ((B_QFULL, 1), (B_QEMPTY, 1), (B_KVFULL, 32 * self.loaders),
                            (B_KVFULL + 1, 32 * self.loaders), (B_KVEMPTY, 1),
                            (B_KVEMPTY + 1, 1), (B_SFULL, 1), (B_PFULL, SOFTMAX_WARPS),
-                           (B_OFULL, 1), (B_OFREE, SOFTMAX_WARPS)):
+                           (B_OFULL, 1), (B_OFREE, SOFTMAX_WARPS), (B_SFULL2, 1),
+                           (B_PFULL2, SOFTMAX_WARPS), (B_PVDONE, 1)):
                 mbar_init(_bar(base, i), Uint32(cnt))
             cute.arch.mbarrier_init_fence()
         if warp == 0:
-            cute.arch.alloc_tmem(
-                512, cute.make_ptr(Int32, base + Uint32(OFF_TMEM), cute.AddressSpace.smem))
-            cute.arch.relinquish_tmem_alloc_permit()
+            if cutlass.const_expr(self.pipelined):
+                tmem_alloc_exclusive(base + Uint32(OFF_TMEM))
+            else:
+                cute.arch.alloc_tmem(512, cute.make_ptr(
+                    Int32, base + Uint32(OFF_TMEM), cute.AddressSpace.smem))
+                cute.arch.relinquish_tmem_alloc_permit()
         tc_fence_before()
         cute.arch.sync_threads()
         tc_fence_after()
@@ -342,8 +366,11 @@ class SparseMlaPrefill:
         cute.arch.sync_threads()
         if warp == 0:
             tc_fence_after()
-            cute.arch.dealloc_tmem(
-                cute.make_ptr(Float32, taddr, cute.AddressSpace.tmem), 512)
+            if cutlass.const_expr(self.pipelined):
+                tmem_free_exclusive(taddr)
+            else:
+                cute.arch.dealloc_tmem(
+                    cute.make_ptr(Float32, taddr, cute.AddressSpace.tmem), 512)
 
     # ------------------------------------------------------------------ loaders
     @cute.jit
@@ -420,50 +447,86 @@ class SparseMlaPrefill:
             tiles = _tiles(n)
             mbar_wait(_bar(base, B_QFULL), Uint32(qi & 1))
             tc_fence_after()
-            for t in range(tiles):
-                s = g % 2
-                st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
-                mbar_wait(_bar(base, B_KVFULL + s), Uint32((g // 2) & 1))
-                fence_async_smem()
-                tc_fence_after()
-                if lane == 0:
-                    for j in cutlass.range_constexpr(4):
-                        ad = Uint64(SDESC_SW128) | Uint64((st + Uint32(j * 16384)) >> Uint32(4))
-                        bd = Uint64(SDESC_SW128) | Uint64(
-                            (base + Uint32(OFF_QN + j * H * 128)) >> Uint32(4))
-                        for kk in cutlass.range_constexpr(2):
-                            tc_mma(taddr + Uint32(C_S), ad + Uint64(kk * 4),
-                                   bd + Uint64(kk * 4), Uint32(IDESC_QK),
-                                   Uint32(1 if (j + kk) > 0 else 0))
-                    ad = Uint64(SDESC_SW64) | Uint64((st + Uint32(4 * 16384)) >> Uint32(4))
-                    bd = Uint64(SDESC_SW64) | Uint64((base + Uint32(OFF_QR)) >> Uint32(4))
-                    tc_mma(taddr + Uint32(C_S), ad, bd, Uint32(IDESC_QK), Uint32(1))
-                    tc_commit(_bar(base, B_SFULL))
-                    if t == tiles - 1:
-                        tc_commit(_bar(base, B_QEMPTY))
-                cute.arch.sync_warp()
-                if t == 0:
-                    mbar_wait(_bar(base, B_OFREE), Uint32((qi & 1) ^ 1))
-                mbar_wait(_bar(base, B_PFULL), Uint32(g & 1))
-                tc_fence_after()
-                if lane == 0:
-                    bd0 = Uint64(P_DESC) | Uint64((base + Uint32(OFF_P)) >> Uint32(4))
-                    for b in cutlass.range_constexpr(4):
-                        ad0 = Uint64(SDESC_SW128) | Uint64(
-                            (st + Uint32(b * 16384)) >> Uint32(4))
-                        for kk in cutlass.range_constexpr(2):
-                            acc = Uint32(1)
-                            if t == 0 and kk == 0:
-                                acc = Uint32(0)
-                            # K64 = 64 keys: V^T +8 KB (8 x 1024-B row groups),
-                            # P^T +1 KB (8 x 128-B core matrices along K)
-                            tc_mma(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(kk * 512),
-                                   bd0 + Uint64(kk * 64), Uint32(IDESC_PV), acc)
-                    tc_commit(_bar(base, B_KVEMPTY + s))
-                    if t == tiles - 1:
-                        tc_commit(_bar(base, B_OFULL))
-                cute.arch.sync_warp()
-                g = g + 1
+            if cutlass.const_expr(self.pipelined):
+                # QK(0), then QK(t + 1) before PV(t): softmax(t + 1) overlaps PV(t)
+                self.qk(base, lane, taddr, g, 0, tiles)
+                for t in range(tiles):
+                    if t + 1 < tiles:
+                        self.qk(base, lane, taddr, g + 1, t + 1, tiles)
+                    self.pv(base, lane, taddr, g, t, tiles, qi)
+                    g = g + 1
+            else:
+                for t in range(tiles):
+                    self.qk(base, lane, taddr, g, t, tiles)
+                    self.pv(base, lane, taddr, g, t, tiles, qi)
+                    g = g + 1
+
+    @cute.jit
+    def qk(self, base, lane, taddr, g, t, tiles):
+        """S^T(tile g) = K Q^T into its S^T buffer; frees Q after the row's last."""
+        s = g % 2
+        st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
+        mbar_wait(_bar(base, B_KVFULL + s), Uint32((g // 2) & 1))
+        fence_async_smem()
+        tc_fence_after()
+        cs = Uint32(C_S)
+        sfull = _bar(base, B_SFULL)
+        if cutlass.const_expr(self.pipelined):
+            cs = Uint32(C_S) + Uint32(96) * Uint32(g % 2)
+            if g % 2 == 1:
+                sfull = _bar(base, B_SFULL2)
+        if lane == 0:
+            for j in cutlass.range_constexpr(4):
+                ad = Uint64(SDESC_SW128) | Uint64((st + Uint32(j * 16384)) >> Uint32(4))
+                bd = Uint64(SDESC_SW128) | Uint64(
+                    (base + Uint32(OFF_QN + j * H * 128)) >> Uint32(4))
+                for kk in cutlass.range_constexpr(2):
+                    tc_mma(taddr + cs, ad + Uint64(kk * 4), bd + Uint64(kk * 4),
+                           Uint32(IDESC_QK), Uint32(1 if (j + kk) > 0 else 0))
+            ad = Uint64(SDESC_SW64) | Uint64((st + Uint32(4 * 16384)) >> Uint32(4))
+            bd = Uint64(SDESC_SW64) | Uint64((base + Uint32(OFF_QR)) >> Uint32(4))
+            tc_mma(taddr + cs, ad, bd, Uint32(IDESC_QK), Uint32(1))
+            tc_commit(sfull)
+            if t == tiles - 1:
+                tc_commit(_bar(base, B_QEMPTY))
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def pv(self, base, lane, taddr, g, t, tiles, qi):
+        """O^T += V^T P^T(tile g); frees the KV stage (and P^T buffer)."""
+        s = g % 2
+        st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
+        if t == 0:
+            mbar_wait(_bar(base, B_OFREE), Uint32((qi & 1) ^ 1))
+        pfull = _bar(base, B_PFULL)
+        pbuf = base + Uint32(OFF_P)
+        if cutlass.const_expr(self.pipelined):
+            mbar_wait_sel = g % 2
+            if mbar_wait_sel == 1:
+                pfull = _bar(base, B_PFULL2)
+                pbuf = base + Uint32(OFF_P + H * 128)
+            mbar_wait(pfull, Uint32((g // 2) & 1))
+        else:
+            mbar_wait(pfull, Uint32(g & 1))
+        tc_fence_after()
+        if lane == 0:
+            bd0 = Uint64(P_DESC) | Uint64(pbuf >> Uint32(4))
+            for b in cutlass.range_constexpr(4):
+                ad0 = Uint64(SDESC_SW128) | Uint64((st + Uint32(b * 16384)) >> Uint32(4))
+                for kk in cutlass.range_constexpr(2):
+                    acc = Uint32(1)
+                    if t == 0 and kk == 0:
+                        acc = Uint32(0)
+                    # K64 = 64 keys: V^T +8 KB (8 x 1024-B row groups),
+                    # P^T +1 KB (8 x 128-B core matrices along K)
+                    tc_mma(taddr + Uint32(self.c_o + 96 * b), ad0 + Uint64(kk * 512),
+                           bd0 + Uint64(kk * 64), Uint32(IDESC_PV), acc)
+            tc_commit(_bar(base, B_KVEMPTY + s))
+            if cutlass.const_expr(self.pipelined):
+                tc_commit(_bar(base, B_PVDONE))
+            if t == tiles - 1:
+                tc_commit(_bar(base, B_OFULL))
+        cute.arch.sync_warp()
 
     # ------------------------------------------------------------------ softmax
     @cute.jit
@@ -487,10 +550,22 @@ class SparseMlaPrefill:
                 st_shared_f32(base + Uint32(OFF_M + (wg * HW + r) * 4), Float32(-1e30))
             named_bar(1 + wg, 128)
             for t in range(tiles):
-                mbar_wait(_bar(base, B_SFULL), Uint32(g & 1))
+                cs = Uint32(C_S + h0)
+                pbuf = base + Uint32(OFF_P)
+                pfull = _bar(base, B_PFULL)
+                if cutlass.const_expr(self.pipelined):
+                    sfull = _bar(base, B_SFULL)
+                    if g % 2 == 1:
+                        sfull = _bar(base, B_SFULL2)
+                        cs = Uint32(C_S + 96 + h0)
+                        pbuf = base + Uint32(OFF_P + H * 128)
+                        pfull = _bar(base, B_PFULL2)
+                    mbar_wait(sfull, Uint32((g // 2) & 1))
+                else:
+                    mbar_wait(_bar(base, B_SFULL), Uint32(g & 1))
                 tc_fence_after()
-                a = tmem_ld(lane_addr + Uint32(C_S + h0), 32)
-                b16 = tmem_ld(lane_addr + Uint32(C_S + h0 + 32), 16)
+                a = tmem_ld(lane_addr + cs, 32)
+                b16 = tmem_ld(lane_addr + cs + Uint32(32), 16)
                 for k in cutlass.range_constexpr(32):
                     sv[k] = a[k] * scale_log2
                 for k in cutlass.range_constexpr(16):
@@ -532,9 +607,13 @@ class SparseMlaPrefill:
                     named_bar(1 + wg, 128)
                 # O^T rescale (PV(t-1) finished before QK(t): in-order tensor pipe)
                 if t > 0 and slow:
+                    if cutlass.const_expr(self.pipelined):
+                        # PV(t - 1) runs after QK(t) here: wait for it
+                        mbar_wait(_bar(base, B_PVDONE), Uint32((g - 1) & 1))
+                        tc_fence_after()
                     for b in cutlass.range_constexpr(4):
                         for half in cutlass.range_constexpr(3):
-                            col = lane_addr + Uint32(C_O + 96 * b + h0 + 16 * half)
+                            col = lane_addr + Uint32(self.c_o + 96 * b + h0 + 16 * half)
                             oa = tmem_ld(col, 16)
                             al4 = [ld_shared_v4f(alb + Uint32((wg * HW + 16 * half + 4 * q) * 4))
                                    for q in range(4)]
@@ -557,7 +636,7 @@ class SparseMlaPrefill:
                     words[i] = w0 | (w1 << Uint32(16))
                 for c in cutlass.range_constexpr(3):
                     cn = 3 * wg + c
-                    st_shared_v4(base + Uint32(OFF_P) + Uint32(cn * 2048)
+                    st_shared_v4(pbuf + Uint32(cn * 2048)
                                  + Uint32((r // 8) * 128 + (r % 8) * 16),
                                  words[4 * c], words[4 * c + 1], words[4 * c + 2],
                                  words[4 * c + 3])
@@ -565,7 +644,7 @@ class SparseMlaPrefill:
                 tc_fence_before()
                 cute.arch.sync_warp()
                 if lane == 0:
-                    mbar_arrive(_bar(base, B_PFULL))
+                    mbar_arrive(pfull)
                 g = g + 1
             # ---- epilogue: O = O^T * out_scale / l
             for k in cutlass.range_constexpr(HW):
@@ -592,8 +671,8 @@ class SparseMlaPrefill:
                     inv[4 * k4 + u] = v4[u]
             orow = out + Int64(row) * Int64(H * D_NOPE * 2)
             for b in cutlass.range_constexpr(4):
-                oa = tmem_ld(lane_addr + Uint32(C_O + 96 * b + h0), 32)
-                ob = tmem_ld(lane_addr + Uint32(C_O + 96 * b + h0 + 32), 16)
+                oa = tmem_ld(lane_addr + Uint32(self.c_o + 96 * b + h0), 32)
+                ob = tmem_ld(lane_addr + Uint32(self.c_o + 96 * b + h0 + 32), 16)
                 for k in cutlass.range_constexpr(HW):
                     v = oa[k] if k < 32 else ob[k - 32]
                     st_global_b16(orow + Int64(((h0 + k) * D_NOPE + 128 * b + r) * 2),
@@ -608,6 +687,7 @@ class SparseMlaPrefill:
 # persistent kernel; smaller ones (decode, short chunks) keep the stock kernel.
 MIN_ROWS = 1024
 LOADERS = 3
+PIPELINED = False
 
 
 def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: int) -> bool:
@@ -626,8 +706,8 @@ def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: 
 
 
 @cache
-def _compiled(loaders: int, grid: int):
-    kernel = SparseMlaPrefill(loaders, grid)
+def _compiled(loaders: int, grid: int, pipelined: bool):
+    kernel = SparseMlaPrefill(loaders, grid, pipelined)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0),
             Int64(0), Float32(1.0), Float32(1.0), cuda.CUstream(0))
     opts = f"--ptxas-options -maxrregcount={min(255, 65536 // kernel.threads // 8 * 8)}"
@@ -637,7 +717,8 @@ def _compiled(loaders: int, grid: int):
 def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None,
-                       loaders: int = LOADERS) -> torch.Tensor:
+                       loaders: int = LOADERS, pipelined: bool = PIPELINED,
+                       ) -> torch.Tensor:
     """q8 [T, 96, 576] E4M3 (contiguous); kv_rows: the cache as uint8/E4M3 rows of
     576 B; slots [T, W] int32 physical slots (block * 64 + offset, -1 holes past the
     valid prefix), lengths [T] int32 valid counts; ``scale`` = softmax scale x q
@@ -651,7 +732,7 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
         return out
     sms = torch.cuda.get_device_properties(q8.device).multi_processor_count
     grid = min(sms, t)
-    fn = _compiled(loaders, grid)
+    fn = _compiled(loaders, grid, pipelined)
     stream = cuda.CUstream(torch.cuda.current_stream(q8.device).cuda_stream)
     fn(Int64(q8.data_ptr()), Int32(t), Int64(kv_rows.data_ptr()), Int32(unit_rows),
        Int64(slots.data_ptr()), Int32(slots.stride(0)), Int64(lengths.data_ptr()),

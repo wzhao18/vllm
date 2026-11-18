@@ -190,19 +190,21 @@ def main():
         )
 
         vr_out = torch.empty(F, H, L, device=dev, dtype=torch.bfloat16)
-        for nl in [int(x) for x in a.loaders.split(",")]:
+        for var in a.loaders.split(","):
+            nl, pp = (int(v) for v in (var.split(":") + ["0"])[:2])
+            tag = f"l{nl}p{pp}"
 
-            def vr(i, nl=nl):
+            def vr(i, nl=nl, pp=pp):
                 kv, idx = layers[i % len(layers)]
                 sparse_mla_prefill(qf3, kv.view(-1, 576), 64, idx, seq, 0.0722, 1.0,
-                                   out=vr_out, loaders=nl)
+                                   out=vr_out, loaders=nl, pipelined=bool(pp))
 
             vr(0)
             torch.cuda.synchronize()
             d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
             rel = (d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
-            res[f"vr_l{nl}_rel_vs_trtllm"] = rel
-            st[f"attn_vr_l{nl}"] = time_stage(vr, a.iters)
+            res[f"vr_{tag}_rel_vs_trtllm"] = rel
+            st[f"attn_vr_{tag}"] = time_stage(vr, a.iters)
     except Exception as e:  # noqa: BLE001
         import traceback
 
