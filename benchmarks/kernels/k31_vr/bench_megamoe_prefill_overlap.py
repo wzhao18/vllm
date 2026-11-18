@@ -159,7 +159,7 @@ def main():
     x = torch.randn((T, args.hidden), generator=gen, device=dev).to(torch.bfloat16)
     sw13, sw13_s = mxfp8_weight(2 * args.shared_inter, args.hidden, gen)
     sw2, sw2_s = mxfp8_weight(args.hidden, args.shared_inter, gen)
-    situ = torch.ops._C.situ_and_mul
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
 
     def shared():
         q, s = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
@@ -167,11 +167,12 @@ def main():
             q, sw13, scale_a=s.view(torch.float8_e8m0fnu), scale_b=sw13_s,
             out_dtype=torch.bfloat16,
         )
-        act = torch.empty((T, args.shared_inter), dtype=torch.bfloat16, device=dev)
-        situ(act, gu, problem.situ_beta, problem.situ_linear_beta)
-        q2, s2_ = mxfp8_e4m3_quantize(act, is_sf_swizzled_layout=True)
+        # KimiMLP._act_mxfp8: one fused SiTU-and-mul + MXFP8 quant (down_proj input)
+        qa = mxfp8_act.situ_and_mul_quantize(
+            gu, problem.situ_beta, problem.situ_linear_beta
+        )
         return torch._scaled_mm(
-            q2, sw2, scale_a=s2_.view(torch.float8_e8m0fnu), scale_b=sw2_s,
+            qa.data, sw2, scale_a=qa.scale.view(torch.float8_e8m0fnu), scale_b=sw2_s,
             out_dtype=torch.bfloat16,
         )
 
