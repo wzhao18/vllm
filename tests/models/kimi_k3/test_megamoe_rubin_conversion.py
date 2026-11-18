@@ -213,6 +213,124 @@ def test_nvfp4_kernel_layout_round_trips():
     )
 
 
+def _random_nvfp4_layer(seed, intermediate):
+    """Native NVFP4 experts as a ModelOpt export stores them: random E2M1 codes,
+    random finite non-negative E4M3 block-16 scale bytes, per-expert fp32
+    weight_scale_2 (not powers of two)."""
+    gen = torch.Generator().manual_seed(seed)
+
+    def leg(rows, cols):
+        codes = torch.randint(0, 256, (E, rows, cols // 2), generator=gen)
+        scales = torch.randint(0, 0x7F, (E, rows, cols // 16), generator=gen)
+        return codes.to(torch.uint8), scales.to(torch.uint8).view(torch.float8_e4m3fn)
+
+    w13, s13 = leg(2 * intermediate, H)
+    w2, s2 = leg(H, intermediate)
+    g13 = torch.rand(E, generator=gen) * 1e-3 + 1e-5
+    g2 = torch.rand(E, generator=gen) * 1e-3 + 1e-5
+    return w13, s13, w2, s2, g13, g2
+
+
+def test_nvfp4_checkpoint_layout_is_the_stored_bytes():
+    """A native NVFP4 checkpoint is only re-laid out: the kernel layout holds the
+    stored codes and E4M3 bytes, the alphas are weight_scale_2 bit for bit, and the
+    dequantized kernel weight equals the stock ModelOpt dequantization
+    (code * e4m3 * weight_scale_2) bit for bit."""
+    intermediate = 64
+    w13, s13, w2, s2, g13, g2 = _random_nvfp4_layer(3, intermediate)
+    w = W.prepare_nvfp4_checkpoint_weights(
+        w13, s13, w2, s2, g13, g2, hidden=H, intermediate=intermediate
+    )
+    W.validate_kernel_weights(
+        w, quant_kind="nvfp4", experts=E, hidden=H, intermediate=intermediate
+    )
+    phys13 = w.fc1[0].permute(0, 2, 1).contiguous().view(torch.uint8)
+    assert torch.equal(
+        W.deinterleave_gate_up_16(phys13, intermediate_size=intermediate), w13
+    )
+    assert torch.equal(w.fc2[0].permute(0, 2, 1).contiguous().view(torch.uint8), w2)
+    for e in range(E):
+        plane = W.from_blocked(w.fc1[1][e], 2 * intermediate, H // 16)
+        assert torch.equal(
+            W.deinterleave_gate_up_16(plane, intermediate_size=intermediate),
+            s13[e].view(torch.uint8),
+        )
+        assert torch.equal(
+            W.from_blocked(w.fc2[1][e], H, intermediate // 16), s2[e].view(torch.uint8)
+        )
+    assert torch.equal(_bits(w.fc1_alpha), _bits(g13))
+    assert torch.equal(_bits(w.fc2_alpha), _bits(g2))
+    assert torch.equal(w.fc1_norm_const, torch.ones(E))
+    for codes, scales, g, alpha in ((w13, s13, g13, w.fc1_alpha), (w2, s2, g2, w.fc2_alpha)):
+        stock = (
+            W.unpack_fp4_to_f32(codes)
+            * scales.float().repeat_interleave(16, dim=-1)
+            * g.view(-1, 1, 1)
+        )
+        ours = (
+            W.unpack_fp4_to_f32(codes)
+            * W.e4m3_to_f32(scales).repeat_interleave(16, dim=-1)
+            * alpha.view(-1, 1, 1)
+        )
+        assert torch.equal(_bits(ours), _bits(stock))
+
+
+def test_nvfp4_checkpoint_of_an_mxfp4_layer_matches_the_conversion():
+    """An NVFP4 export of MXFP4 weights (power-of-two global scales, as the K3.1
+    ModelOpt export stores) loads to the same kernel bytes and alphas as the exact
+    in-backend MXFP4 -> NVFP4 conversion."""
+    intermediate = 64
+    w13, s13, w2, s2 = _random_layer(11, intermediate, kmax=-3, spread=12)
+    conv = W.convert_mxfp4_to_nvfp4(
+        w13, s13, w2, s2, hidden=H, intermediate=intermediate
+    )
+    native = W.prepare_nvfp4_checkpoint_weights(
+        conv.w13_codes,
+        conv.w13_scale16.view(torch.float8_e4m3fn),
+        conv.w2_codes,
+        conv.w2_scale16.view(torch.float8_e4m3fn),
+        torch.pow(2.0, conv.c1.double()).float(),
+        torch.pow(2.0, conv.c2.double()).float(),
+        hidden=H,
+        intermediate=intermediate,
+    )
+    converted = W.prepare_nvfp4_weights(
+        w13, s13, w2, s2, hidden=H, intermediate=intermediate
+    )
+    for a, b in (
+        (native.fc1[0], converted.fc1[0]),
+        (native.fc1[1], converted.fc1[1]),
+        (native.fc2[0], converted.fc2[0]),
+        (native.fc2[1], converted.fc2[1]),
+    ):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        assert torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
+    for a, b in (
+        (native.fc1_alpha, converted.fc1_alpha),
+        (native.fc2_alpha, converted.fc2_alpha),
+        (native.fc1_norm_const, converted.fc1_norm_const),
+    ):
+        assert torch.equal(_bits(a), _bits(b))
+
+
+def test_nvfp4_checkpoint_rejects_malformed_experts():
+    intermediate = 64
+    w13, s13, w2, s2, g13, g2 = _random_nvfp4_layer(5, intermediate)
+    args = dict(hidden=H, intermediate=intermediate)
+    with pytest.raises(ValueError, match="w2_scale shape"):
+        W.prepare_nvfp4_checkpoint_weights(w13, s13, w2, s2[..., :-1], g13, g2, **args)
+    with pytest.raises(TypeError, match="E4M3"):
+        W.prepare_nvfp4_checkpoint_weights(
+            w13, s13.view(torch.int8), w2, s2, g13, g2, **args
+        )
+    bad = g2.clone()
+    bad[1] = float("nan")
+    with pytest.raises(ValueError, match="finite and positive"):
+        W.prepare_nvfp4_checkpoint_weights(w13, s13, w2, s2, g13, bad, **args)
+    with pytest.raises(ValueError, match="fp32"):
+        W.prepare_nvfp4_checkpoint_weights(w13, s13, w2, s2, g13.double(), g2, **args)
+
+
 def test_to_blocked_batched_matches_flashinfer():
     gen = torch.Generator().manual_seed(3)
     for rows, cols in ((256, 8), (128, 4), (200, 6), (384, 112)):

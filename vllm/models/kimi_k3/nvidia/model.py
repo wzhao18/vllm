@@ -29,8 +29,10 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_MXFP4,
+    MEGA_MOE_NVFP4,
     DeepGemmMegaMoEExperts,
     MegaMoEActivation,
+    MegaMoEWeightFormat,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
@@ -59,6 +61,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import (
     compressed_tensors,
+)
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -582,15 +588,55 @@ class KimiRoutedOutputTransform(nn.Module):
         return hidden_states
 
 
+def kimi_k3_mega_moe_weight_format(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> MegaMoEWeightFormat:
+    """Routed-expert checkpoint format of the MoE block at prefix.
+
+    ModelOpt checkpoints name it per layer (MIXED_PRECISION quantized_layers
+    entry of {prefix}.experts, or a whole-model NVFP4 export): NVFP4 runs the
+    native NVFP4 MegaMoE path. Every other checkpoint is the canonical MXFP4 one.
+    Raises for ModelOpt expert formats MegaMoE cannot load.
+    """
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        algo = quant_config._resolve_quant_algo(f"{prefix}.experts")
+    elif isinstance(quant_config, ModelOptNvFp4Config):
+        algo = quant_config.quant_method.upper()
+    else:
+        return MEGA_MOE_MXFP4
+    if algo == "NVFP4":
+        return MEGA_MOE_NVFP4
+    raise NotImplementedError(
+        f"{prefix}.experts: MegaMoE has no path for ModelOpt {algo} experts."
+    )
+
+
+# Checkpoint suffix -> parameter suffix of the MegaMoE experts, per format.
+_MEGA_MOE_EXPERT_SUFFIXES = {
+    MEGA_MOE_MXFP4.name: (("weight_packed", "weight"), ("weight_scale", "weight_scale")),
+    MEGA_MOE_NVFP4.name: (
+        ("weight_scale_2", "weight_scale_2"),
+        ("weight_scale", "weight_scale"),
+        ("input_scale", "input_scale"),
+        ("weight", "weight"),
+    ),
+}
+
+
 def make_kimi_k3_mega_moe_expert_params_mapping(
     num_experts: int,
+    weight_format: MegaMoEWeightFormat = MEGA_MOE_MXFP4,
 ) -> list[tuple[str, str, int, str]]:
+    suffixes = _MEGA_MOE_EXPERT_SUFFIXES.get(weight_format.name)
+    if suffixes is None:
+        raise NotImplementedError(
+            f"No Kimi K3 MegaMoE expert mapping for {weight_format.name!r} weights."
+        )
     mapping = []
     for expert_id in range(num_experts):
         for shard_id in ("w1", "w2", "w3"):
             param_prefix = "w13" if shard_id in ("w1", "w3") else "w2"
-            for suffix in ("weight_packed", "weight_scale"):
-                param_suffix = "weight" if suffix == "weight_packed" else suffix
+            for suffix, param_suffix in suffixes:
                 mapping.append(
                     (
                         f"experts.{param_prefix}_{param_suffix}",
@@ -813,7 +859,7 @@ class KimiMoE(nn.Module):
                     alpha=activation_situ_beta or 1.0,
                     beta=activation_situ_linear_beta or 0.0,
                 ),
-                weight_format=MEGA_MOE_MXFP4,
+                weight_format=kimi_k3_mega_moe_weight_format(quant_config, prefix),
                 prefix=f"{prefix}.experts",
             )
         else:
@@ -1924,14 +1970,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 ]
         if self.config.dsa_config is not None:
             stacked_params_mapping += _DSA_STACKED_PARAMS_MAPPING
-        use_mega_moe = any(
-            module.use_mega_moe
+        mega_moe_formats = {
+            module.experts.weight_format
             for module in self.modules()
-            if isinstance(module, KimiMoE)
-        )
+            if isinstance(module, KimiMoE) and module.use_mega_moe
+        }
+        use_mega_moe = bool(mega_moe_formats)
+        if len(mega_moe_formats) > 1:
+            raise NotImplementedError(
+                "Kimi K3 MegaMoE layers with different expert formats: "
+                f"{sorted(f.name for f in mega_moe_formats)}."
+            )
         if self.config.is_moe and use_mega_moe:
             expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
+                self.config.num_experts, next(iter(mega_moe_formats))
             )
         elif self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
