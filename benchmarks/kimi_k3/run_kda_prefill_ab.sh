@@ -9,7 +9,7 @@ B=$OV/benchmarks/kimi_k3/bench_kda_prefill_chain.py
 NCU=$(command -v ncu); [ -z "$NCU" ] && NCU=$(find /usr/local /opt -name ncu -type f 2>/dev/null | head -1)
 echo "ncu=$NCU"
 nvidia-smi --query-gpu=name,clocks.max.sm --format=csv
-python3 -m pytest -q $OV/tests/models/kimi_k3/test_kda_prefill_fused_conv.py 2>&1 | tail -30
+python3 -m pytest -q --noconftest -p no:cacheprovider $OV/tests/models/kimi_k3/test_kda_prefill_fused_conv.py 2>&1 | tail -30
 for impl in stock split fusedconv fused; do
   python3 $B --impl $impl --tokens 16384 --json $OUT/f16k_$impl.json 2>&1 | grep -v Warning
   python3 $B --impl $impl --tokens 8192 --json $OUT/f8k_$impl.json 2>&1 | grep -v Warning
