@@ -49,6 +49,8 @@ from ..common.sp_comm import positive_zero32
 from .kernel import ClusterAttnRes
 
 CLUSTER = 7  # CTAs per row (1024 columns each)
+# (kind, nb) -> (CTAs per SM, SMs, cuOccupancyMaxActiveClusters) of the compiled codes
+RESIDENCY: dict = {}
 THREADS = 128
 
 
@@ -143,15 +145,20 @@ def _options(device):
 
 
 def _check_clusters(code, device, n_max, what):
-    grid = (CLUSTER, n_max, 1)
-    count = max_active_clusters(code, device, grid, THREADS, CLUSTER)
-    if count < n_max:
+    """Every CTA of the grid co-resident (they poll one another across ranks)."""
+    from ..common.host import occupancy
+
+    per_sm, sms = occupancy(code, device, THREADS)
+    clusters = max_active_clusters(code, device, (CLUSTER, n_max, 1), THREADS, CLUSTER)
+    if CLUSTER * n_max > per_sm * sms:
         from ...shapes import Unsupported
 
         raise Unsupported(
             "sp_comm", None,
-            f"{what}: {n_max} 7-CTA clusters cannot be co-resident ({count})",
+            f"{what}: {n_max} 7-CTA clusters cannot be co-resident ({per_sm} CTAs "
+            f"per SM x {sms} SMs; cluster API {clusters})",
         )  # fmt: skip
+    return per_sm, sms, clusters
 
 
 @cache
@@ -168,7 +175,9 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device):
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
         )
-        _check_clusters(code, device, n_max, "SP AttnRes + all-gather")
+        RESIDENCY["gather", nb] = _check_clusters(
+            code, device, n_max, "SP AttnRes + all-gather"
+        )
     return code
 
 
@@ -188,7 +197,9 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device):
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
         )
-        _check_clusters(code, device, n_max, "SP reduce-scatter + AttnRes")
+        RESIDENCY["reduce", nb] = _check_clusters(
+            code, device, n_max, "SP reduce-scatter + AttnRes"
+        )
     return code
 
 

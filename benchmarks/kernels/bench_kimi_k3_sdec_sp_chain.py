@@ -225,6 +225,12 @@ def main():
         chain = Chain(comm, rank, world, rows, args.layers, device)
         if args.check:
             res = chain.check([0, 1, 5, 12, 13, 50, 92])
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
+                sp_fused,
+            )
+
+            if rank == 0:
+                print("residency", sp_fused.RESIDENCY, flush=True)
             if rank == 0:
                 for k, (err, ref) in res.items():
                     print(f"R{rows} check {k:>16}: max|diff| {err:.3e} (max|ref| "
