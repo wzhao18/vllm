@@ -27,7 +27,9 @@ import torch
 
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
+from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
+from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
 from ..shapes import Choice, Unsupported
 from .providers import bf16_weight
@@ -66,18 +68,32 @@ def sp_mlp_cause(mlp):
         return "a TP-sharded shared expert"
     if getattr(shared, "gemm_rs_ar", None) is not None:
         return "a GEMM-RS/AR shared down projection"
-    if shared._act_mxfp8_ok() or transform._norm_mxfp8():
-        return "online-MXFP8 shared down / latent up input"
-    linears = (
-        mlp.routed_expert_down_proj, shared.gate_up_proj, shared.down_proj,
-        transform.up_proj,
-    )  # fmt: skip
+    if transform._norm_mxfp8():
+        return "online-MXFP8 latent up input"
+    mx = shared_mxfp8(mlp)
+    if mx is None:
+        return "one of the shared expert's gate_up / down online MXFP8, not both"
+    if not mx and shared._act_mxfp8_ok():
+        return "online-MXFP8 shared down input"
+    if mx and not shared._act_mxfp8_ok():
+        return "MXFP8 shared expert whose activation cannot write the MXFP8 input"
+    linears = (mlp.routed_expert_down_proj, transform.up_proj)
+    if not mx:
+        linears += (shared.gate_up_proj, shared.down_proj)
     for linear in linears:
         if not isinstance(linear.quant_method, UnquantizedLinearMethod):
             return f"quantized {type(linear.quant_method).__name__} linear"
         if getattr(linear, "bias", None) is not None:
             return "a linear with bias"
     return None
+
+
+def shared_mxfp8(mlp):
+    """True when both shared-expert projections are online MXFP8 (the NVFP4
+    checkpoint), False when neither is, None when mixed."""
+    shared = mlp.shared_experts
+    flags = {is_mxfp8_linear(shared.gate_up_proj), is_mxfp8_linear(shared.down_proj)}
+    return flags.pop() if len(flags) == 1 else None
 
 
 class SpMlp:
@@ -92,18 +108,27 @@ class SpMlp:
             raise Unsupported("moe", None, f"layer {index}: {cause}")
         self.mlp, self.rows = mlp, tuple(sorted(set(rows)))
         shared, transform = mlp.shared_experts, mlp.routed_output_transform
+        self.mxfp8 = bool(shared_mxfp8(mlp))
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
-                "shared_gu": bf16_weight(shared.gate_up_proj),
-                "shared_down": bf16_weight(shared.down_proj),
                 "latent_up": bf16_weight(transform.up_proj),
             }
+            if not self.mxfp8:
+                weights["shared_gu"] = bf16_weight(shared.gate_up_proj)
+                weights["shared_down"] = bf16_weight(shared.down_proj)
         except ValueError as error:  # (re-raised with the layer)
             raise Unsupported("moe", None, f"layer {index}: {error}") from error
         self.gemms = {}
         side = bool(mlp._shared_overlap)  # the shared expert beside MegaMoE
         with torch.accelerator.device_index(weights["latent_down"].device.index):
+            if self.mxfp8:  # NVFP4 checkpoint: MXFP8 W8A8 shared expert (gemm.mxfp8)
+                self.gemms["shared_gu"] = Mxfp8Projection(
+                    shared.gate_up_proj, self.rows, family="shared_gu"
+                )
+                self.gemms["shared_down"] = Mxfp8Projection(
+                    shared.down_proj, self.rows, family="shared_down"
+                )
             for family, weight in weights.items():
                 n, k = weight.shape
                 table = f"{family}_side" if side and family in SHARED else family
@@ -112,8 +137,12 @@ class SpMlp:
                     weight, self.rows, tactics, family=table
                 )
         self.latent = weights["latent_down"].shape[0]
-        self.inter2 = weights["shared_gu"].shape[0]
-        self.hidden = weights["shared_down"].shape[0]
+        if self.mxfp8:
+            self.inter2 = self.gemms["shared_gu"].n
+            self.hidden = self.gemms["shared_down"].n
+        else:
+            self.inter2 = weights["shared_gu"].shape[0]
+            self.hidden = weights["shared_down"].shape[0]
         self.threshold = _stock_threshold()
 
     def choices(self, n):
@@ -123,6 +152,13 @@ class SpMlp:
     def _shared(self, h):
         shared, gemms, n = self.mlp.shared_experts, self.gemms, h.shape[0]
         gate_up = gemms["shared_gu"].run(h, h.new_empty((n, self.inter2)))
+        if self.mxfp8:
+            # stock's online-MXFP8 shared expert: SiTU-and-mul writes the down
+            # projection's MXFP8 input (KimiMLP._act_mxfp8), bitwise act -> quantize
+            down = gemms["shared_down"]
+            act = down.input.view(n)
+            shared.act_mxfp8_into(gate_up, act)
+            return down.run(act, h.new_empty((n, self.hidden)))
         act = shared.act_fn(gate_up)
         return gemms["shared_down"].run(act, h.new_empty((n, self.hidden)))
 
