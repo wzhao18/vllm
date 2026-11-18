@@ -177,8 +177,11 @@ class DcpValue:
         per_row=False,
         partials="bf16",
         preprojected=False,
+        rearm=True,
     ):
-        """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
+        """``rearm`` False: no reader polls this parity's q mailbox (the query of
+        every gathered head is computed on each rank, dsa.local_query), so it is
+        never re-armed. ``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
         base 2 (LOG2E for a natural-log LSE). ``preprojected`` ("proj" only): the
         W_UV argument holds the value rows [DCP * H, B, 128] BF16 a batched GEMM
@@ -189,6 +192,7 @@ class DcpValue:
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
         self.preprojected = preprojected and self.projected
+        self.rearm_q = rearm
         # Rows with nothing to merge send only their LSE (neither polled nor
         # re-armed): "proj", and BF16 for a sparse decode's per-row counts. The MLA
         # BF16 layout (rarely empty: padded requests, short contexts) sends zeros
@@ -226,9 +230,10 @@ class DcpValue:
         the published rows."""
         H, D, B = self.heads, self.size, self.batch
         C, P = self.q_chunks, self.q_heads
-        for c in range(me, B * D * H * C, threads):  # 16 B q mailbox chunks
-            row = c // (D * H * C) * P * C + c % (D * H * C)
-            store_words(mailbox.iterator + row * 16, (Uint32(Q_SENT),) * 4)
+        if cutlass.const_expr(self.rearm_q):
+            for c in range(me, B * D * H * C, threads):  # 16 B q mailbox chunks
+                row = c // (D * H * C) * P * C + c % (D * H * C)
+                store_words(mailbox.iterator + row * 16, (Uint32(Q_SENT),) * 4)
 
     @cute.kernel
     def kernel(self, args):
@@ -653,6 +658,7 @@ def compile_value(
     lse_base_e=True,
     partials="bf16",
     preprojected=False,
+    rearm=True,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -687,6 +693,7 @@ def compile_value(
             True,
             partials,
             preprojected,
+            rearm,
         )
     totals = fake((batch // q,), None, i32, 4)
     width = 512

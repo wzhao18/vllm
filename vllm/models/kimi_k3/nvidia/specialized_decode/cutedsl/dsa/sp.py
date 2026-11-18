@@ -51,8 +51,10 @@ from ..gemm.sp_policy import sp_projection_tactics
 from ..mla.dcp import DcpBox
 from ..mla.query import TILED_FROM
 from .attn_fi import dsa_on_flashinfer
+from ..common.policy import batch_table
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS
+from .local_query import LocalQuery
 from .overlap import INDEX_PRIORITY, overlap_for
 from .prepared import PreparedDsa
 from .r1 import fi_buffers
@@ -76,6 +78,13 @@ SP_MODES = ("front", "fork", "wait")
 # mailboxes (2 x 4 x 512 x 24 x 512 BF16: 200 MiB symmetric). NQ-TUNE: bf16 vs proj
 # at DCP4 / 24 heads.
 SP_PARTIALS = PROJECTED
+# Rows whose query of all 96 heads is computed on every rank (local_query.LocalQuery:
+# no q publish, QueryWait or q mailbox re-arm), the rest MlaQuery's publish of 24
+# heads. Fork rows only (QueryNorm writes q_c). In-step (gap512 D3 B80 / B92, 320 /
+# 368 rows) MlaQuery ran 74-89 us per layer on the side stream and QueryWait 30-46
+# us, beside the index chain whose wq_b split-K it slowed to 52-62 us.
+# NQ-TUNE: the publish / local crossover (D-ATTN microbench, runs/D-ATTN).
+SP_LOCAL_QUERY = "17-:local"
 SP_KERNELS = ("trtllm",)  # the FlashInfer sparse MLA kernel at every row
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
@@ -249,6 +258,18 @@ class SpDsaCore:
                     "dsa", shape, f"query overlap {mode!r} (publish-only modes only)"
                 )
             self.modes[r] = mode
+        table = batch_table(SP_LOCAL_QUERY)
+        self.local_rows = tuple(r for r in rows if table.get(r) == "local")
+        for r in self.local_rows:
+            if self.modes[r] != "fork":
+                raise Unsupported(
+                    "dsa", Shape(r, q), f"local query under {self.modes[r]!r} (fork)"
+                )
+        local = None
+        if self.local_rows:  # (collective: the q_b / W_UK gathers)
+            local = LocalQuery(
+                attention, box.group, box.size, self.local_rows, ctx, box.q_heads
+            )
         indexer = attention.dsa_indexer
         self.topk = indexer.topk_tokens
         fi = fi_buffers(device, max(rows), self.topk, box.q_heads)
@@ -264,6 +285,7 @@ class SpDsaCore:
             overlap=SP_QUERY_OVERLAP,
             partials=SP_PARTIALS,
             priority=INDEX_PRIORITY["sp"],
+            local=local,
         )
         prepared = self.prepared
         # The per-layer FP8 query rows PreparedDsa's QueryStage took: the shared ones
@@ -334,7 +356,8 @@ class SpDsaCore:
         )
         logger.info_once(
             "Kimi K3.1 SP DSA (TP%d = DCP%d, %d heads, q%d, rows %d-%d): query %s; "
-            "MlaQuery publishes, QueryWait polls; top-k %s; trtllm-gen over %d query "
+            "MlaQuery publishes, QueryWait polls (local query of every head at %s); "
+            "top-k %s; trtllm-gen over %d query "
             'heads; DcpValue "%s"; box %d rows (%.0f MiB symmetric)',
             self.ctx.tp,
             self.box.size,
@@ -343,6 +366,7 @@ class SpDsaCore:
             self.rows[0],
             self.rows[-1],
             spans,
+            f"{len(self.local_rows)} sizes" if self.local_rows else "no rows",
             topk,
             self.box.q_heads,
             SP_PARTIALS,
