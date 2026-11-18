@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-MOE agent (workflow)",
  "state": "landed-ready",
- "updated": "2026-11-18T15:15-08:00",
+ "updated": "2026-11-18T15:45-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 74.01,
  "current_ms": 74.01,
@@ -89,9 +89,14 @@
    "t": "15:50",
    "what": "coordinator: current reset to the NVFP4 slice baseline (74.01 ms)",
    "result": "the 2x8K sub-call A/B (-4.8%) ran on the MXFP4 config view; re-measure on the NVFP4 view (step_p.sh -q nvfp4) before it counts"
+  },
+  {
+   "t": "15:45",
+   "what": "r6b live-rows sweep 5K-8K uncapped vs S2/cap212",
+   "result": "linear ~130 us/1K rows, no partial-bucket cliff; S2 no gain; cap without fallback +9-11% above 6912 rows"
   }
  ],
- "next": "r6b (live rows < capacity sweep: possible cliff at 6144/8192 uncapped) -> decide even sub-call split; then MegaMoE epilogue work in the FI a368 drop D-MOE is vendoring (more epilogue warps / MUFU-lighter exact SiTU / reduce absorption); 4-node EP16 run on the hold8 for the deployed number.",
+ "next": "HANDOFF. Done: sub-calls landed-ready @ d0aaaa1a8e (INFRA: merge 3af369ed36+004e6e6b4a into wzhao/k31ws-int; touches model.py KimiMoE init/forward, megamoe_rubin/experts.py forward(out, ep_tokens) + reserve_sms_for_shared_expert(max_sm_count, die_local), new specialized_prefill/{__init__,moe}.py, tests/models/kimi_k3/test_prefill_moe_subcalls.py; specialized_prefill/__init__.py is byte-identical to P-KDA). Next, in order: (1) re-run the step A/B with -q nvfp4 on the integration branch once merged (bash /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/tools/step_p.sh -n P-MOE -t int-nv-prof -q nvfp4 <ovtag> 1) and on the 4-node pool at EP16 (bench_megamoe_prefill_overlap.py --num-experts 896 --tokens 16384 --capacity 8192 with -g 8n, 4 of the 8 nodes) for the deployed number; (2) the dominant gap is inside the MegaMoE main kernel (963 us per 8K with zero NVLink payload vs 525 us model ops): work it in the FI a368c5f66 drop D-MOE vendors (epilogue issue rate: TMEM load + SiTU 6 MUFU/elt + NVFP4 requant per tile on one warp per SMSP; try more epilogue warps with the FI drop at full grid, exact-math MUFU reduction, top-k reduce absorption), measure with all-local routing (bench --routing local) so the link does not mask it; needs in-kernel stamps since ncu/nsys are absent from the image; (3) in-step router 0.9 ms/layer is cross-rank arrival skew (not kernel time): check with the integration slice whether attention/KDA imbalance across DP ranks causes it; (4) shared expert: SM-cap overlap is not profitable (r2/r5); its 611 us is the cuBLASLt MXFP8 GEMMs (P-GEMM) + fused act 159 us.",
  "blockers": "Rhea pool: no k31ws hold running yet (all pending), r1/r2 queued under wsgpu.",
  "branch": "wzhao/k31ws-p-moe @ d0aaaa1a8e",
  "evidence": [

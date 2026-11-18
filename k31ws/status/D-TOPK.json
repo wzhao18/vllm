@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-TOPK agent",
  "state": "implementing",
- "updated": "2026-11-18T15:20-08:00",
+ "updated": "2026-11-18T15:40-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K (local \u224833.75K on DCP4), k=3; also r1 (16 rows), r8 (128 rows)",
  "baseline_ms": 2.3,
  "current_ms": 0.821,
@@ -77,7 +77,7 @@
    "result": "ALL PASS; r1 27.1, r8 26.9, r24 34.2 us/layer; committed 3d340bcf5e and pushed"
   }
  ],
- "next": "distributed sdec DSA test with exchange (queued j23); then find the in-kernel candidate-loop slowdown vs the probe",
+ "next": "(1) read step A/B (runs/D-TOPK/q/done/j24.log; step dirs runs/D-TOPK/step_d/<ov>-r128_384-*/fam.txt, top-k family busy/exposed vs INFRA base) and the integration test j25 (pytest --noconftest tests/distributed/test_kimi_k3_sdec_sp_layers.py -k \"test_sp_dsa_block_matches_stock_layer and not all_rows\"); (2) j26 = overlay d-topk-3d340bcf5-2 (uncommitted in the worktree: theta target q+256, one NaN-propagating max per group, signed-zero-safe group bound) bench r1/r8/r24 + test_k31_dcp_exchange ALL PASS -> commit; (3) cut the per-row chain: ~35 __syncthreads per row with 16 warps; merge resolve steps (hdr/tau/groups/class/tier5) into ~3 synced steps, parallelise band pick, WRITE with fewer barriers; (4) r1/r8: split the key pass of a row over a cluster (CS 8 at 16 rows, 2 at 128) with DSMEM appends into the leader; (5) find why the in-kernel candidate loop runs ~3x slower than benchmarks/kernels/probe_k31_cand_loop.py (SASS diff: cuobjdump -sass of the .so in $K31_DCPX_BUILD_DIR). Runner: runs/D-TOPK/runner.sh via wsgpu -g 4 (jobs in runs/D-TOPK/q/*.sh, logs in q/done); scratch job templates in the session scratchpad dtopk_j*.sh; overlays staged with mkov.sh (tags d-topk-<sha>-<n>).",
  "blockers": "4-GPU pool requests wait 20-30 min (1-GPU runs take single GPUs first); using a runner that keeps the node for queued experiments with a 12-min idle exit",
  "branch": "wzhao/k31ws-d-topk @ 3d340bcf5e",
  "evidence": [

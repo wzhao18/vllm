@@ -153,6 +153,22 @@
   {
    "t": "11-18 15:00",
    "text": "Tooling: the image has no ncu, nsys or nvdisasm (SASS/stall reasons not inspectable). Request to the user pending: download Nsight Compute/Systems to Lustre."
+  },
+  {
+   "t": "11-18 15:40",
+   "text": "P-KDA landed-ready: HBM-rate o_norm + MXFP8 quant kernel, KDA chain 77.2 -> 72.7 ms per F16K forward (model 17.4). Next: persistent multi-tile K1 with fused conv, tcgen05 K2."
+  },
+  {
+   "t": "11-18 15:50",
+   "text": "D-MOE: decode workspace capacity 128 tokens (N128 tile) is 10% faster than the 256-token bucket at T32-T128 on the EP32 per-GPU shape; EP28/EP32 decode bucket record added."
+  },
+  {
+   "t": "11-18 15:45",
+   "text": "P-MOE: prefill MegaMoE time is linear in live rows (~130 us per 1K rows + ~60 us fixed at 56 experts/GPU)."
+  },
+  {
+   "t": "11-18 16:00",
+   "text": "Coordination: 9 of 14 agents ended after their first milestone, short of target; relaunched as continuation agents that keep going until their family is at 1.1x model (plus FAST). 13 Rhea nodes running, nothing waiting."
   }
  ]
 }

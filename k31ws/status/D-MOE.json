@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-MOE agent (workflow)",
  "state": "landed-ready",
- "updated": "2026-11-18T15:40-08:00",
+ "updated": "2026-11-18T16:05-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), SP shard = 96 MoE tokens per GPU, 28 local experts, top-16, L~135K, k=3",
  "baseline_ms": 8.3,
  "current_ms": 6.3,
@@ -113,11 +113,21 @@
    "t": "15:20",
    "what": "megamoe_rubin unit tests (conversion, die_local, integration) on overlay d-moe-a9b8c85bd3-1",
    "result": "144 passed (13 s)"
+  },
+  {
+   "t": "15:50",
+   "what": "capacity sweep at the EP32 per-GPU shape (1 GPU, hint 64): workspace capacity 128 (N128) vs 256/1024 (N256)",
+   "result": "44.9/47.8/50.7 vs 51.0/52.8/55.9 us at T32/96/128 -> wide-EP (EP28/32) decode bucket = 128 tokens with its own N128 record (b5b7ab47d5); applies at real EP32 only (the EP4 slice keeps 256)"
+  },
+  {
+   "t": "16:00",
+   "what": "megamoe_rubin unit tests on d-moe-3e7dd6a218-1",
+   "result": "146 passed (12 s)"
   }
  ],
- "next": "INFRA: merge wzhao/k31ws-d-moe @ a9b8c85bd3 and switch the D3-32 cfg to moe-backend kimi_k3_mega_moe (files runs/D-MOE/rhea_d3x32_dp1_kmm.json, rhea_d3x32_dp8_kmm.json, *_nvfp4_kmm.json). D-MOE next: C1 entry weight prefetch in src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py run_tma_a (before consume_work) as a recorded local difference; measure with runs/D-MOE/stamp.sh (1 GPU) and v1.sh (EP4). 8-node: DMOE_CFG=runs/D-MOE/rhea_d3x32_dp8_kmm.json bash runs/D-MOE/step_multi_moe.sh -n D-MOE d8 <overlay> 128,256,384 1",
+ "next": "(1) INFRA: merge wzhao/k31ws-d-moe @ 3e7dd6a218 and switch D3-32 to moe-backend kimi_k3_mega_moe (cfgs in rhea:.../runs/D-MOE/rhea_d3x32_dp{1,8}[_nvfp4]_kmm.json). (2) step kmm3 (same as kmm2 on the EP4 slice, sanity) running: runs/D-MOE/step_d/kmm3-mx-r8r16r24. (3) 8-node when hold8 runs: DMOE_CFG=$K/runs/D-MOE/rhea_d3x32_dp8_kmm.json bash $K/runs/D-MOE/step_multi_moe.sh -n D-MOE d8 d-moe-3e7dd6a218-1 128,256,384 1, plus EP32 stamps (vstamp.py via vs.sh with --num-experts 896, 32 ranks) to split dispatch/combine. (4) kernel C1 entry weight prefetch: in megamoe_rubin/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py run_tma_a, before sched_consumer.consume_work(): die = sm_locality_domain[%smid], die-rank r = count of same-die SMs below %smid / cluster size; prefetch (cp.async.bulk.prefetch.L2) fc1 weight rows [r*128, r*128+128) of the die-ordered expert sequence (die 0 ascending from expert 0, die 1 descending from expert E-1), record as a local difference in VENDOR.md; measure with stamp.sh (1 GPU, target front 5.5 -> ~2 us) and v1.sh (EP4). (5) C2 tail imbalance (8.6 us) and folding the separate top-k reduce (2.7 us). Tools: runs/D-MOE/{dmoe_bench.py,dmoe_stamp.py,stamp.sh,vstamp.py,vs.sh,v1.sh,k1-3.sh}; local parsers in the D-MOE scratch (stamp_parse3.py, stamp_ranks.py) are mirrored in runs/D-MOE.",
  "blockers": "EP32 numbers need the hold8 (queued for ~03:00-04:00 PST 2026-11-19). NVFP4 checkpoint path needs EN B1/B1b (native NVFP4 MegaMoE weights in megamoe_rubin).",
- "branch": "wzhao/k31ws-d-moe @ a9b8c85bd3",
+ "branch": "wzhao/k31ws-d-moe @ 3e7dd6a218",
  "evidence": [
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/step_d/kmm2-mx-r8r16r24-prof/fam.txt",
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_d/base-mx-r8r16r24-prof/fam.txt",

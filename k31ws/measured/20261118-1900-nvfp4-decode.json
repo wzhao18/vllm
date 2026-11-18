@@ -1,0 +1,661 @@
+{
+ "slice": "D3-32 1-node DP-rank slice (step_d.sh -q nvfp4): TP4=DCP4, EP4 emulating EP32 (28 experts/GPU), 24-layer view (k31-nvfp4-view-L24), u132k ctx, k=3, specialized decode, kimi_k3_mega_moe (re-vendored FI a368c5f66, NVFP4 W4A4), MXFP8 shared + KDA proj, DSpark preview drafter (MLA, full context) included",
+ "ckpt": "nvfp4",
+ "overlay": "trial-9ccf8ab-1 = wzhao/k31ws-int b31121cf56 + wzhao/k31ws-d-moe a9b8c85bd3 (merge 9ccf8ab994)",
+ "run": "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_d/trial-9ccf8ab-nv-r8r16r24-prof",
+ "model": "tools/stepbench/model_rows_L24_nvfp4_modelopt.json (nvfp4_modelopt, D3-32 L135K, 24 layers; achievable excludes LM head / rejection)",
+ "units": "ms per decode step (24-layer view)",
+ "cases": {
+  "r8": {
+   "case": "q4_B32_M128_u132k",
+   "step_ms": 6.6675,
+   "model_ach_ms": 2.6784679252206613,
+   "ratio": 2.4892961895187558,
+   "target_only_step_ms": 4.912373291015625,
+   "target_only_ach_ms": 2.409657594919093,
+   "families": {
+    "drafter + final (DSpark k=3 propose)": {
+     "busy_ms": 1.755,
+     "exposed_ms": 1.755,
+     "ach_ms": 0.269,
+     "ratio": 6.53
+    },
+    "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)": {
+     "busy_ms": 2.161,
+     "exposed_ms": 1.84,
+     "ach_ms": 1.086,
+     "ratio": 1.99
+    },
+    "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)": {
+     "busy_ms": 1.646,
+     "exposed_ms": 1.201,
+     "ach_ms": 0.753,
+     "ratio": 2.18
+    },
+    "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)": {
+     "busy_ms": 0.534,
+     "exposed_ms": 0.418,
+     "ach_ms": 0.013,
+     "ratio": 40.32
+    },
+    "DSA q path + sparse MLA + DCP value (P6/P7b)": {
+     "busy_ms": 0.543,
+     "exposed_ms": 0.4,
+     "ach_ms": 0.114,
+     "ratio": 4.75
+    },
+    "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)": {
+     "busy_ms": 0.346,
+     "exposed_ms": 0.311,
+     "ach_ms": 0.042,
+     "ratio": 8.17
+    },
+    "KDA core (KdaWide: conv+gate+recurrence+o_norm)": {
+     "busy_ms": 0.42,
+     "exposed_ms": 0.42,
+     "ach_ms": 0.158,
+     "ratio": 2.66
+    },
+    "SP comm (AllGather / ReduceScatter push)": {
+     "busy_ms": 0.255,
+     "exposed_ms": 0.255,
+     "ach_ms": 0.207,
+     "ratio": 1.23
+    },
+    "DSA indexer logits (paged_mqa_logits)": {
+     "busy_ms": 0.117,
+     "exposed_ms": 0.058,
+     "ach_ms": 0.035,
+     "ratio": 3.29
+    },
+    "spin wait (QueryWait)": {
+     "busy_ms": 0.043,
+     "exposed_ms": 0.0,
+     "ach_ms": 0.0,
+     "ratio": null
+    }
+   },
+   "groups": {
+    "TAIL.drafter+final": {
+     "busy_ms": 1.755,
+     "exposed_ms": 1.755,
+     "ach_ms": 0.269
+    },
+    "MOE.megamoe": {
+     "busy_ms": 2.161,
+     "exposed_ms": 1.84,
+     "ach_ms": 1.086
+    },
+    "KDA.core": {
+     "busy_ms": 0.42,
+     "exposed_ms": 0.42,
+     "ach_ms": 0.158
+    },
+    "DSA.topk_merge": {
+     "busy_ms": 0.307,
+     "exposed_ms": 0.291,
+     "ach_ms": 0.039
+    },
+    "OTHER": {
+     "busy_ms": 0.248,
+     "exposed_ms": 0.169,
+     "ach_ms": 0.0
+    },
+    "DSA.q_path": {
+     "busy_ms": 0.328,
+     "exposed_ms": 0.195,
+     "ach_ms": 0.064
+    },
+    "ATTNRES": {
+     "busy_ms": 0.134,
+     "exposed_ms": 0.126,
+     "ach_ms": 0.013
+    },
+    "DSA.sparse_mla": {
+     "busy_ms": 0.112,
+     "exposed_ms": 0.111,
+     "ach_ms": 0.019
+    },
+    "MOE.router+latent_down": {
+     "busy_ms": 0.379,
+     "exposed_ms": 0.196,
+     "ach_ms": 0.108
+    },
+    "KDA.in_proj": {
+     "busy_ms": 0.21,
+     "exposed_ms": 0.21,
+     "ach_ms": 0.126
+    },
+    "MOE.latent_up": {
+     "busy_ms": 0.166,
+     "exposed_ms": 0.166,
+     "ach_ms": 0.086
+    },
+    "KDA.o_proj": {
+     "busy_ms": 0.099,
+     "exposed_ms": 0.099,
+     "ach_ms": 0.032
+    },
+    "MOE.topk": {
+     "busy_ms": 0.092,
+     "exposed_ms": 0.064,
+     "ach_ms": 0.0
+    },
+    "MOE.latent_norm": {
+     "busy_ms": 0.057,
+     "exposed_ms": 0.057,
+     "ach_ms": 0.0
+    },
+    "DSA.dcp_value": {
+     "busy_ms": 0.085,
+     "exposed_ms": 0.085,
+     "ach_ms": 0.031
+    },
+    "DSA.qkv_a": {
+     "busy_ms": 0.064,
+     "exposed_ms": 0.064,
+     "ach_ms": 0.015
+    },
+    "MOE.shared_down": {
+     "busy_ms": 0.239,
+     "exposed_ms": 0.12,
+     "ach_ms": 0.077
+    },
+    "COMM.SP_RS": {
+     "busy_ms": 0.146,
+     "exposed_ms": 0.146,
+     "ach_ms": 0.106
+    },
+    "DENSE": {
+     "busy_ms": 0.136,
+     "exposed_ms": 0.136,
+     "ach_ms": 0.105
+    },
+    "DSA.idx_score": {
+     "busy_ms": 0.117,
+     "exposed_ms": 0.058,
+     "ach_ms": 0.035
+    },
+    "DSA.o_proj": {
+     "busy_ms": 0.039,
+     "exposed_ms": 0.039,
+     "ach_ms": 0.02
+    },
+    "DSA.w_uv": {
+     "busy_ms": 0.029,
+     "exposed_ms": 0.029,
+     "ach_ms": 0.012
+    },
+    "DSA.topk": {
+     "busy_ms": 0.04,
+     "exposed_ms": 0.02,
+     "ach_ms": 0.004
+    },
+    "DSA.prologue": {
+     "busy_ms": 0.018,
+     "exposed_ms": 0.009,
+     "ach_ms": 0.0
+    },
+    "COMM.SP_AG": {
+     "busy_ms": 0.108,
+     "exposed_ms": 0.108,
+     "ach_ms": 0.101
+    },
+    "EMBED": {
+     "busy_ms": 0.003,
+     "exposed_ms": 0.003,
+     "ach_ms": 0.0
+    },
+    "WAIT": {
+     "busy_ms": 0.043,
+     "exposed_ms": 0.0,
+     "ach_ms": 0.0
+    },
+    "DSA.g_proj": {
+     "busy_ms": 0.036,
+     "exposed_ms": 0.018,
+     "ach_ms": 0.02
+    },
+    "MOE.shared_gate_up": {
+     "busy_ms": 0.248,
+     "exposed_ms": 0.124,
+     "ach_ms": 0.152
+    }
+   }
+  },
+  "r16": {
+   "case": "q4_B64_M256_u132k",
+   "step_ms": 8.9121,
+   "model_ach_ms": 3.235236926502802,
+   "ratio": 2.7546977864257145,
+   "target_only_step_ms": 5.995917626953125,
+   "target_only_ach_ms": 2.893575485631623,
+   "families": {
+    "drafter + final (DSpark k=3 propose)": {
+     "busy_ms": 2.916,
+     "exposed_ms": 2.916,
+     "ach_ms": 0.342,
+     "ratio": 8.54
+    },
+    "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)": {
+     "busy_ms": 2.185,
+     "exposed_ms": 1.843,
+     "ach_ms": 1.201,
+     "ratio": 1.82
+    },
+    "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)": {
+     "busy_ms": 1.775,
+     "exposed_ms": 1.311,
+     "ach_ms": 0.778,
+     "ratio": 2.28
+    },
+    "KDA core (KdaWide: conv+gate+recurrence+o_norm)": {
+     "busy_ms": 0.774,
+     "exposed_ms": 0.774,
+     "ach_ms": 0.315,
+     "ratio": 2.45
+    },
+    "DSA q path + sparse MLA + DCP value (P6/P7b)": {
+     "busy_ms": 0.673,
+     "exposed_ms": 0.615,
+     "ach_ms": 0.181,
+     "ratio": 3.73
+    },
+    "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)": {
+     "busy_ms": 0.468,
+     "exposed_ms": 0.468,
+     "ach_ms": 0.05,
+     "ratio": 9.44
+    },
+    "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)": {
+     "busy_ms": 0.584,
+     "exposed_ms": 0.436,
+     "ach_ms": 0.026,
+     "ratio": 22.24
+    },
+    "DSA indexer logits (paged_mqa_logits)": {
+     "busy_ms": 0.187,
+     "exposed_ms": 0.185,
+     "ach_ms": 0.071,
+     "ratio": 2.64
+    },
+    "SP comm (AllGather / ReduceScatter push)": {
+     "busy_ms": 0.372,
+     "exposed_ms": 0.372,
+     "ach_ms": 0.271,
+     "ratio": 1.37
+    },
+    "spin wait (QueryWait)": {
+     "busy_ms": 0.128,
+     "exposed_ms": 0.0,
+     "ach_ms": 0.0,
+     "ratio": null
+    }
+   },
+   "groups": {
+    "TAIL.drafter+final": {
+     "busy_ms": 2.916,
+     "exposed_ms": 2.916,
+     "ach_ms": 0.342
+    },
+    "MOE.megamoe": {
+     "busy_ms": 2.185,
+     "exposed_ms": 1.843,
+     "ach_ms": 1.201
+    },
+    "KDA.core": {
+     "busy_ms": 0.774,
+     "exposed_ms": 0.774,
+     "ach_ms": 0.315
+    },
+    "DSA.topk_merge": {
+     "busy_ms": 0.309,
+     "exposed_ms": 0.309,
+     "ach_ms": 0.042
+    },
+    "DSA.q_path": {
+     "busy_ms": 0.373,
+     "exposed_ms": 0.325,
+     "ach_ms": 0.097
+    },
+    "OTHER": {
+     "busy_ms": 0.292,
+     "exposed_ms": 0.2,
+     "ach_ms": 0.0
+    },
+    "DSA.topk": {
+     "busy_ms": 0.158,
+     "exposed_ms": 0.158,
+     "ach_ms": 0.008
+    },
+    "MOE.router+latent_down": {
+     "busy_ms": 0.428,
+     "exposed_ms": 0.24,
+     "ach_ms": 0.11
+    },
+    "DSA.sparse_mla": {
+     "busy_ms": 0.156,
+     "exposed_ms": 0.155,
+     "ach_ms": 0.038
+    },
+    "DSA.idx_score": {
+     "busy_ms": 0.187,
+     "exposed_ms": 0.185,
+     "ach_ms": 0.071
+    },
+    "ATTNRES": {
+     "busy_ms": 0.132,
+     "exposed_ms": 0.126,
+     "ach_ms": 0.026
+    },
+    "KDA.in_proj": {
+     "busy_ms": 0.23,
+     "exposed_ms": 0.23,
+     "ach_ms": 0.132
+    },
+    "COMM.SP_RS": {
+     "busy_ms": 0.234,
+     "exposed_ms": 0.234,
+     "ach_ms": 0.138
+    },
+    "MOE.latent_up": {
+     "busy_ms": 0.171,
+     "exposed_ms": 0.171,
+     "ach_ms": 0.087
+    },
+    "DSA.dcp_value": {
+     "busy_ms": 0.125,
+     "exposed_ms": 0.125,
+     "ach_ms": 0.045
+    },
+    "KDA.o_proj": {
+     "busy_ms": 0.109,
+     "exposed_ms": 0.109,
+     "ach_ms": 0.035
+    },
+    "DSA.qkv_a": {
+     "busy_ms": 0.078,
+     "exposed_ms": 0.077,
+     "ach_ms": 0.016
+    },
+    "MOE.latent_norm": {
+     "busy_ms": 0.057,
+     "exposed_ms": 0.057,
+     "ach_ms": 0.0
+    },
+    "MOE.topk": {
+     "busy_ms": 0.1,
+     "exposed_ms": 0.05,
+     "ach_ms": 0.0
+    },
+    "MOE.shared_down": {
+     "busy_ms": 0.252,
+     "exposed_ms": 0.126,
+     "ach_ms": 0.078
+    },
+    "DSA.o_proj": {
+     "busy_ms": 0.048,
+     "exposed_ms": 0.048,
+     "ach_ms": 0.021
+    },
+    "DENSE": {
+     "busy_ms": 0.13,
+     "exposed_ms": 0.13,
+     "ach_ms": 0.106
+    },
+    "DSA.w_uv": {
+     "busy_ms": 0.031,
+     "exposed_ms": 0.031,
+     "ach_ms": 0.019
+    },
+    "DSA.prologue": {
+     "busy_ms": 0.019,
+     "exposed_ms": 0.01,
+     "ach_ms": 0.001
+    },
+    "COMM.SP_AG": {
+     "busy_ms": 0.138,
+     "exposed_ms": 0.138,
+     "ach_ms": 0.133
+    },
+    "DSA.g_proj": {
+     "busy_ms": 0.049,
+     "exposed_ms": 0.025,
+     "ach_ms": 0.02
+    },
+    "EMBED": {
+     "busy_ms": 0.003,
+     "exposed_ms": 0.003,
+     "ach_ms": 0.0
+    },
+    "WAIT": {
+     "busy_ms": 0.128,
+     "exposed_ms": 0.0,
+     "ach_ms": 0.0
+    },
+    "MOE.shared_gate_up": {
+     "busy_ms": 0.249,
+     "exposed_ms": 0.127,
+     "ach_ms": 0.154
+    }
+   }
+  },
+  "r24": {
+   "case": "q4_B96_M384_u132k",
+   "step_ms": 10.8876,
+   "model_ach_ms": 3.80461390321988,
+   "ratio": 2.861683281655919,
+   "target_only_step_ms": 6.7725716796875,
+   "target_only_ach_ms": 3.525197511767875,
+   "families": {
+    "drafter + final (DSpark k=3 propose)": {
+     "busy_ms": 4.115,
+     "exposed_ms": 4.115,
+     "ach_ms": 0.279,
+     "ratio": 14.73
+    },
+    "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)": {
+     "busy_ms": 2.16,
+     "exposed_ms": 1.581,
+     "ach_ms": 0.82,
+     "ratio": 2.63
+    },
+    "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)": {
+     "busy_ms": 0.651,
+     "exposed_ms": 0.651,
+     "ach_ms": 0.057,
+     "ratio": 11.48
+    },
+    "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)": {
+     "busy_ms": 2.162,
+     "exposed_ms": 1.763,
+     "ach_ms": 1.316,
+     "ratio": 1.64
+    },
+    "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)": {
+     "busy_ms": 0.644,
+     "exposed_ms": 0.472,
+     "ach_ms": 0.039,
+     "ratio": 16.38
+    },
+    "KDA core (KdaWide: conv+gate+recurrence+o_norm)": {
+     "busy_ms": 0.897,
+     "exposed_ms": 0.897,
+     "ach_ms": 0.473,
+     "ratio": 1.9
+    },
+    "DSA q path + sparse MLA + DCP value (P6/P7b)": {
+     "busy_ms": 0.993,
+     "exposed_ms": 0.674,
+     "ach_ms": 0.249,
+     "ratio": 3.99
+    },
+    "SP comm (AllGather / ReduceScatter push)": {
+     "busy_ms": 0.513,
+     "exposed_ms": 0.513,
+     "ach_ms": 0.334,
+     "ratio": 1.53
+    },
+    "DSA indexer logits (paged_mqa_logits)": {
+     "busy_ms": 0.408,
+     "exposed_ms": 0.235,
+     "ach_ms": 0.106,
+     "ratio": 3.84
+    },
+    "spin wait (QueryWait)": {
+     "busy_ms": 0.262,
+     "exposed_ms": 0.002,
+     "ach_ms": 0.0,
+     "ratio": null
+    }
+   },
+   "groups": {
+    "TAIL.drafter+final": {
+     "busy_ms": 4.115,
+     "exposed_ms": 4.115,
+     "ach_ms": 0.279
+    },
+    "MOE.megamoe": {
+     "busy_ms": 2.162,
+     "exposed_ms": 1.763,
+     "ach_ms": 1.316
+    },
+    "KDA.core": {
+     "busy_ms": 0.897,
+     "exposed_ms": 0.897,
+     "ach_ms": 0.473
+    },
+    "DSA.topk_merge": {
+     "busy_ms": 0.363,
+     "exposed_ms": 0.363,
+     "ach_ms": 0.045
+    },
+    "DSA.topk": {
+     "busy_ms": 0.288,
+     "exposed_ms": 0.288,
+     "ach_ms": 0.012
+    },
+    "OTHER": {
+     "busy_ms": 0.344,
+     "exposed_ms": 0.234,
+     "ach_ms": 0.0
+    },
+    "KDA.in_proj": {
+     "busy_ms": 0.32,
+     "exposed_ms": 0.32,
+     "ach_ms": 0.137
+    },
+    "COMM.SP_RS": {
+     "busy_ms": 0.334,
+     "exposed_ms": 0.334,
+     "ach_ms": 0.171
+    },
+    "DSA.q_path": {
+     "busy_ms": 0.59,
+     "exposed_ms": 0.295,
+     "ach_ms": 0.132
+    },
+    "MOE.router+latent_down": {
+     "busy_ms": 0.459,
+     "exposed_ms": 0.26,
+     "ach_ms": 0.113
+    },
+    "DSA.sparse_mla": {
+     "busy_ms": 0.198,
+     "exposed_ms": 0.198,
+     "ach_ms": 0.058
+    },
+    "DSA.idx_score": {
+     "busy_ms": 0.408,
+     "exposed_ms": 0.235,
+     "ach_ms": 0.106
+    },
+    "DSA.dcp_value": {
+     "busy_ms": 0.156,
+     "exposed_ms": 0.156,
+     "ach_ms": 0.058
+    },
+    "KDA.o_proj": {
+     "busy_ms": 0.131,
+     "exposed_ms": 0.131,
+     "ach_ms": 0.037
+    },
+    "ATTNRES": {
+     "busy_ms": 0.134,
+     "exposed_ms": 0.124,
+     "ach_ms": 0.039
+    },
+    "MOE.shared_down": {
+     "busy_ms": 0.322,
+     "exposed_ms": 0.161,
+     "ach_ms": 0.079
+    },
+    "MOE.latent_up": {
+     "busy_ms": 0.17,
+     "exposed_ms": 0.17,
+     "ach_ms": 0.088
+    },
+    "DSA.qkv_a": {
+     "busy_ms": 0.095,
+     "exposed_ms": 0.092,
+     "ach_ms": 0.021
+    },
+    "MOE.latent_norm": {
+     "busy_ms": 0.057,
+     "exposed_ms": 0.057,
+     "ach_ms": 0.0
+    },
+    "DSA.g_proj": {
+     "busy_ms": 0.165,
+     "exposed_ms": 0.083,
+     "ach_ms": 0.028
+    },
+    "MOE.topk": {
+     "busy_ms": 0.106,
+     "exposed_ms": 0.053,
+     "ach_ms": 0.0
+    },
+    "DSA.o_proj": {
+     "busy_ms": 0.058,
+     "exposed_ms": 0.058,
+     "ach_ms": 0.028
+    },
+    "DENSE": {
+     "busy_ms": 0.133,
+     "exposed_ms": 0.133,
+     "ach_ms": 0.106
+    },
+    "DSA.prologue": {
+     "busy_ms": 0.049,
+     "exposed_ms": 0.025,
+     "ach_ms": 0.001
+    },
+    "COMM.SP_AG": {
+     "busy_ms": 0.179,
+     "exposed_ms": 0.179,
+     "ach_ms": 0.164
+    },
+    "DSA.w_uv": {
+     "busy_ms": 0.041,
+     "exposed_ms": 0.041,
+     "ach_ms": 0.026
+    },
+    "EMBED": {
+     "busy_ms": 0.004,
+     "exposed_ms": 0.004,
+     "ach_ms": 0.0
+    },
+    "WAIT": {
+     "busy_ms": 0.262,
+     "exposed_ms": 0.002,
+     "ach_ms": 0.0
+    },
+    "MOE.shared_gate_up": {
+     "busy_ms": 0.265,
+     "exposed_ms": 0.134,
+     "ach_ms": 0.156
+    }
+   }
+  }
+ }
+}
