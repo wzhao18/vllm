@@ -149,7 +149,10 @@ def sp_boundary(decoder, comm, block, rows):
     write = decoder.block_write_idx if decoder.is_block_write_layer else -1
     pushes = {r: block.oproj.pushes(r) for r in rows}
     n_max = rows[-1] // comm.tp
-    return SpBoundary(comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes)
+    first = decoder.layer_idx == 0
+    return SpBoundary(
+        comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first
+    )
 
 
 class SpAttentionBlock:

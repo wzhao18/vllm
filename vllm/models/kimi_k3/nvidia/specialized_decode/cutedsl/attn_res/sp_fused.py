@@ -226,9 +226,10 @@ class SpBoundary:
     (norm, query, out_norm) BF16 [7168] weights and (eps, out_eps) of the stock
     ``_pre_attn_norm`` / ``_post_attn_norm``; ``nb`` the layer's prev_valid_blocks,
     ``write`` its block_write_idx (-1: not a block-write layer). Every kernel is
-    compiled (and its co-residency checked) here, for shard rows up to ``n_max``."""
+    compiled (and its co-residency checked) here, for shard rows up to ``n_max``;
+    ``first``: the step's first layer (its pre-AttnRes has no delta)."""
 
-    def __init__(self, comm, pre, post, nb, write, n_max, push_rows):
+    def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False):
         from ..common.host import to_cute
 
         self.comm, self.nb, self.write = comm, nb, write
@@ -239,10 +240,10 @@ class SpBoundary:
         self.post_w = tuple(to_cute(w.reshape(-1)) for w in post[0])
         self.post_eps = tuple(map(cutlass.Float32, post[1]))
         self.codes = {}
-        for has_delta in (False, True):  # (False: the step's first layer)
-            self.codes[("pre", has_delta)] = compile_gather(
-                nb, has_delta, write, tp, cap, n_max, device
-            )
+        # The step's first layer has no delta (the embedding is the prefix).
+        self.codes[("pre", not first)] = compile_gather(
+            nb, not first, write, tp, cap, n_max, device
+        )
         block = write >= 0
         for push in sorted({bool(p) for p in push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(

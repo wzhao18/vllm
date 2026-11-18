@@ -128,6 +128,7 @@ def _worker(env: dict[str, str]) -> None:
                 bound = sp_fused.SpBoundary(
                     comm, (pre_w, eps), (post_w, eps), prev,
                     layer // BLOCK if write else -1, max(SHARDS), {rows: True},
+                    first=layer == 0,
                 )  # fmt: skip
                 res = {}
                 for mode in ("stock", "fused"):
