@@ -1,11 +1,14 @@
 // Kimi-K3: arguments of the short convolution fused into FlashKDA's prepare
-// kernel (smxx/conv_fused.cuh), and of the gated RMSNorm + MXFP8 quant fused
-// into the recurrence epilogue (smxx/norm_mx.cuh). Host-safe: no device code.
+// kernel (smxx/conv_fused.cuh), and of the gated RMSNorm + MXFP8 quant kernel
+// (smxx/o_norm_mx.cu). Host-safe: no device code.
 #pragma once
 
 #include <cstdint>
 
 struct ConvFuse {
+  // 2D bulk-tensor map of raw (tokens, 3P), box 128 columns x 19 rows (built in
+  // fwd_launch.cu). First member: its 64 B alignment holds in the parameter.
+  alignas(64) unsigned char tmap[128];
   const void* raw;  // bf16 (tokens, >= 3P) packed Q|K|V raw inputs
   int64_t ldx;      // raw row stride (elements)
   const float* w;   // (3P, 4) FP32 conv weights, contiguous

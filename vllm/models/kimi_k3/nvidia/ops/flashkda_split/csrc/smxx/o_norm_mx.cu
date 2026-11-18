@@ -4,6 +4,7 @@
 // _kda_rmsnorm_gated_mxfp8_kernel (norm_mx.cuh); one warp per row, four
 // columns per lane, ROWS rows in flight per warp. The sum of squares is a
 // warp butterfly (another order than Triton's tl.sum: stock tolerance).
+#include <algorithm>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

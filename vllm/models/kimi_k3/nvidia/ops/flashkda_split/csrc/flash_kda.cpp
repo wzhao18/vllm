@@ -40,7 +40,7 @@ static void fwd_impl(const Tensor& q, const Tensor& k, const Tensor& v, const Te
          std::optional<Tensor> final_state, std::optional<Tensor> cu_seqlens,
          std::optional<Tensor> checkpoint_state,
          std::optional<Tensor> checkpoint_offsets, int64_t mode,
-         ConvFuse const* conv, NormMxArgs const* norm) {
+         ConvFuse const* conv) {
   // mode: bit 0 K1 prepare, bit 1 K2 recurrence, bit 2 exact fp32 state I/O,
   // bit 3 K2 without outputs, bit 4 K2 with v = 0 (bits 2-4 need bit 1).
   STD_TORCH_CHECK((mode & ~int64_t(255)) == 0 && (mode & 3) != 0 &&
@@ -282,7 +282,7 @@ static void fwd_impl(const Tensor& q, const Tensor& k, const Tensor& v, const Te
       final_state_raw, checkpoint_state_raw, typed_checkpoint_offsets,       \
       out_ptr, workspace_ptr, total_tiles, int(T_total), int(H), int(N_val), \
       typed_cu_seqlens, A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream, \
-      int(mode), conv, norm)
+      int(mode), conv)
 
 #define DISPATCH_STATE(CKPT, VL)                              \
   if (!has_state_in && !has_state_out && state_fp32) {        \
@@ -327,7 +327,7 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
          std::optional<Tensor> checkpoint_offsets, int64_t mode) {
   fwd_impl(q, k, v, g, beta, scale, out, workspace, A_log, dt_bias,
            lower_bound, initial_state, final_state, cu_seqlens,
-           checkpoint_state, checkpoint_offsets, mode, nullptr, nullptr);
+           checkpoint_state, checkpoint_offsets, mode, nullptr);
 }
 
 // Kimi-K3: the prefill with the Q|K|V short convolution in K1's load path.
@@ -345,10 +345,7 @@ void fwd_conv(const Tensor& mixed_qkv, const Tensor& conv_weight,
               std::optional<Tensor> final_state,
               std::optional<Tensor> cu_seqlens,
               std::optional<Tensor> checkpoint_state,
-              std::optional<Tensor> checkpoint_offsets, int64_t mode,
-              std::optional<Tensor> o_gate, std::optional<Tensor> o_norm_weight,
-              double o_norm_eps, std::optional<Tensor> o_q,
-              std::optional<Tensor> o_sf) {
+              std::optional<Tensor> checkpoint_offsets, int64_t mode) {
   STD_TORCH_CHECK((mode & 1) != 0, "fwd_conv: the conv runs in K1 (mode bit 0)");
   STD_TORCH_CHECK(v_out.dim() == 4 && v_out.size(0) == 1 &&
                       v_out.size(3) == 128 && v_out.is_contiguous() &&
@@ -393,41 +390,52 @@ void fwd_conv(const Tensor& mixed_qkv, const Tensor& conv_weight,
   c.P = int(P);
   c.null_block_id = int(null_block_id);
   c.state_fp32 = conv_state.scalar_type() == ScalarType::Float;
-  // Optional fused o_norm + MXFP8 o_proj input (the bf16 out is then not
-  // written): o_gate (T, >= P) bf16 rows, o_norm_weight [128] FP32, o_q (T, P)
-  // fp8 e4m3 contiguous, o_sf the F8_128x4 swizzled UE8M0 scales.
-  const bool fuse_norm = o_gate.has_value();
-  STD_TORCH_CHECK(fuse_norm == o_norm_weight.has_value() &&
-                      fuse_norm == o_q.has_value() && fuse_norm == o_sf.has_value(),
-                  "fwd_conv: o_gate, o_norm_weight, o_q, o_sf go together");
-  NormMxArgs nm{};
-  if (fuse_norm) {
-    STD_TORCH_CHECK(o_gate->dim() == 2 && o_gate->size(0) == T &&
-                        o_gate->size(1) >= P && o_gate->stride(1) == 1 &&
-                        o_gate->scalar_type() == ScalarType::BFloat16,
-                    "fwd_conv: o_gate must be bf16 (T, >= P) unit-stride rows");
-    STD_TORCH_CHECK(o_norm_weight->numel() == 128 && o_norm_weight->is_contiguous() &&
-                        o_norm_weight->scalar_type() == ScalarType::Float,
-                    "fwd_conv: o_norm_weight must be FP32 [128]");
-    STD_TORCH_CHECK(o_q->dim() == 2 && o_q->size(0) == T && o_q->size(1) == P &&
-                        o_q->stride(1) == 1 &&
-                        o_q->scalar_type() == ScalarType::Float8_e4m3fn,
-                    "fwd_conv: o_q must be fp8 (T, P) unit-stride rows");
-    STD_TORCH_CHECK(o_sf->is_contiguous() &&
-                        o_sf->scalar_type() == ScalarType::Byte &&
-                        o_sf->numel() >= ((T + 127) / 128) * 128 * (P / 32),
-                    "fwd_conv: o_sf too small");
-    nm.g = o_gate->const_data_ptr();
-    nm.g_ld = o_gate->stride(0);
-    nm.w = reinterpret_cast<const float*>(o_norm_weight->const_data_ptr());
-    nm.eps = float(o_norm_eps);
-    nm.q = o_q->mutable_data_ptr();
-    nm.q_ld = o_q->stride(0);
-    nm.sf = o_sf->mutable_data_ptr();
-    nm.sf_cols = int(P / 32);
-  }
   fwd_impl(v_out, v_out, v_out, g, beta, scale, out, workspace, A_log, dt_bias,
            lower_bound, initial_state, final_state, cu_seqlens,
-           checkpoint_state, checkpoint_offsets, mode, &c,
-           fuse_norm ? &nm : nullptr);
+           checkpoint_state, checkpoint_offsets, mode, &c);
+}
+
+void launch_o_norm_mx(const void* x, int64_t tokens, int heads,
+                      NormMxArgs const& a, int num_sms, cudaStream_t stream);
+
+void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
+                  double eps, const Tensor& q, const Tensor& sf) {
+  STD_TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() >= 2 &&
+                      x.size(x.dim() - 1) == 128 &&
+                      x.scalar_type() == ScalarType::BFloat16,
+                  "o_norm_mxfp8: x must be contiguous bf16 (..., H, 128)");
+  const int64_t H = x.size(x.dim() - 2);
+  const int64_t P = H * 128;
+  const int64_t T = x.numel() / P;
+  STD_TORCH_CHECK(g.dim() == 2 && g.size(0) >= T && g.size(1) >= P &&
+                      g.stride(1) == 1 && g.stride(0) % 4 == 0 &&
+                      g.scalar_type() == ScalarType::BFloat16,
+                  "o_norm_mxfp8: g must be bf16 (T, >= P) unit-stride rows");
+  STD_TORCH_CHECK(weight.numel() == 128 && weight.is_contiguous() &&
+                      weight.scalar_type() == ScalarType::Float,
+                  "o_norm_mxfp8: weight must be FP32 [128]");
+  STD_TORCH_CHECK(q.dim() == 2 && q.size(0) >= T && q.size(1) == P &&
+                      q.stride(1) == 1 && q.stride(0) % 4 == 0 &&
+                      q.scalar_type() == ScalarType::Float8_e4m3fn,
+                  "o_norm_mxfp8: q must be e4m3 (T, P) unit-stride rows");
+  STD_TORCH_CHECK(sf.is_contiguous() && sf.scalar_type() == ScalarType::Byte &&
+                      sf.numel() >= ((T + 127) / 128) * 128 * (P / 32),
+                  "o_norm_mxfp8: sf must be uint8 with the padded scale tile");
+  NormMxArgs a{};
+  a.g = g.const_data_ptr();
+  a.g_ld = g.stride(0);
+  a.w = reinterpret_cast<const float*>(weight.const_data_ptr());
+  a.eps = float(eps);
+  a.q = q.mutable_data_ptr();
+  a.q_ld = q.stride(0);
+  a.sf = sf.mutable_data_ptr();
+  a.sf_cols = int(P / 32);
+  int num_sms = 0;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount,
+                         x.get_device_index());
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(
+      aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream_ptr));
+  launch_o_norm_mx(x.const_data_ptr(), T, int(H), a, num_sms,
+                   static_cast<cudaStream_t>(stream_ptr));
 }

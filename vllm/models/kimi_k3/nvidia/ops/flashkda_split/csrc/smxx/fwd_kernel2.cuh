@@ -20,7 +20,6 @@
 #include <type_traits>
 
 #include "utils.cuh"
-#include "norm_mx.cuh"
 
 #include "cutlass/arch/reg_reconfig.h"
 
@@ -254,7 +253,7 @@ template <class TmaLoadV, class TmaLoadBeta, class TmaLoadState,
           bool StateFP32 = false, bool HasCheckpoint = false,
           bool IsVarlen = true, typename SeqlenT = int64_t, int VD = D,
           bool ExactState = false, int MinBlocks = 0, bool NoOut = false,
-          bool ZeroV = false, bool NormMx = false>
+          bool ZeroV = false>
 __global__ void __launch_bounds__(
     NumThreads, MinBlocks ? MinBlocks : k2_min_blocks_per_sm<NumThreads>())
     _flash_kda_fwd_recurrence(
@@ -268,12 +267,8 @@ __global__ void __launch_bounds__(
         SeqlenT const* cu_seqlens, int total_tiles,
         cutlass::bfloat16_t const* ws_kd, cutlass::bfloat16_t const* ws_qd,
         cutlass::bfloat16_t const* ws_kr, float const* ws_gt,
-        cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk,
-        CUTE_GRID_CONSTANT NormMxArgs const norm) {
+        cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk) {
   using BF16 = cutlass::bfloat16_t;
-  // Kimi-K3 NormMx (full width only): the epilogue writes the gated-RMSNorm
-  // MXFP8 o_proj input (norm_mx.cuh) instead of the bf16 output.
-  static_assert(!NormMx || (VD == D && !NoOut), "NormMx: full-width outputs");
   using StateT = std::conditional_t<StateFP32, float, BF16>;
   // Kimi-K3: fp32 state I/O without the bf16 staging (segment partials only).
   constexpr bool kExactState = StateFP32 && ExactState;
@@ -1197,30 +1192,7 @@ __global__ void __launch_bounds__(
     }
   }
 
-  if constexpr (NormMx) {
-    // STORE warp (pipeline) + the two idle warps (64 norm threads).
-    if (warp_id >= kComputeThreads / kWarpSize + 1) {
-      const int nt = int(threadIdx.x) - kComputeThreads - 2 * kWarpSize;
-      const bool is_store = warp_role == WarpRole::STORE && lane_predicate;
-      StorePipelineState out_read;
-      cutlass::arch::NamedBarrier ready(3 * kWarpSize, 6), done(3 * kWarpSize, 7);
-      for (int t = 0; t < t_tiles; ++t) {
-        if (is_store) store_pipeline.consumer_wait(out_read);
-        ready.arrive_and_wait();
-        if (nt >= 0) {
-          int actual_len = min(CHUNK, seq_len - t * CHUNK);
-          Tensor s_out = make_tensor(
-              make_smem_ptr(shared_storage.output[out_read.index()].out.begin()),
-              VOLayout{});
-          norm_mx::tile(s_out, actual_len, int64_t(bos) + t * CHUNK, head_idx,
-                        norm, nt);
-        }
-        done.arrive_and_wait();
-        if (is_store) store_pipeline.consumer_release(out_read);
-        ++out_read;
-      }
-    }
-  } else if (warp_role == WarpRole::STORE && lane_predicate && !NoOut) {
+  if (warp_role == WarpRole::STORE && lane_predicate && !NoOut) {
     Tensor g_out = tma_store_out.get_tma_tensor(make_shape(H, T_total, D));
     auto cta_tma_store = tma_store_out.get_slice(Int<0>{});
     StorePipelineState out_read;

@@ -40,9 +40,11 @@ void fwd_conv(const torch::stable::Tensor& mixed_qkv,
               std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt,
               std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
               std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
-              int64_t mode = 3,
-              std::optional<torch::stable::Tensor> o_gate = std::nullopt,
-              std::optional<torch::stable::Tensor> o_norm_weight = std::nullopt,
-              double o_norm_eps = 1e-6,
-              std::optional<torch::stable::Tensor> o_q = std::nullopt,
-              std::optional<torch::stable::Tensor> o_sf = std::nullopt);
+              int64_t mode = 3);
+
+// Kimi-K3: gated o_norm (sigmoid, D = 128) of x (T, H, 128) with the gate rows
+// g (T, >= H 128), written as the MXFP8 o_proj input q (T, H 128) e4m3 + the
+// F8_128x4 swizzled UE8M0 scales sf.
+void o_norm_mxfp8(const torch::stable::Tensor& x, const torch::stable::Tensor& g,
+                  const torch::stable::Tensor& weight, double eps,
+                  const torch::stable::Tensor& q, const torch::stable::Tensor& sf);

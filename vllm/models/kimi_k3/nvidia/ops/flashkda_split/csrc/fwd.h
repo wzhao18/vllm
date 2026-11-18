@@ -20,5 +20,4 @@ void launch_fwd(
     void* workspace_ptr, int total_tiles, int T_total, int H, int N,
     SeqlenT const* cu_seqlens_ptr, float const* A_log_ptr,
     float const* dt_bias_ptr, float gate_scale, int num_sms,
-    cudaStream_t stream, int mode, ConvFuse const* conv = nullptr,
-    NormMxArgs const* norm = nullptr);
+    cudaStream_t stream, int mode, ConvFuse const* conv = nullptr);

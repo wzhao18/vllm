@@ -11,6 +11,10 @@ for K2, so the dense Q / K round trip and the separate conv launch go away.
 The conv state update is the conv kernel's (the first tile of each sequence is
 its only reader and writes the new state). Outputs, final recurrent state and
 conv state are bitwise those of qkv_conv followed by the same FlashKDA build.
+
+o_norm_mxfp8: the gated o_norm + MXFP8 o_proj input at the HBM rate (one warp
+per (token, head) row; kda_norm.rmsnorm_gated_mxfp8's per-element math, the
+sum of squares in another order).
 """
 
 from __future__ import annotations
@@ -66,21 +70,11 @@ def fused_conv_prefill(
     final_state: torch.Tensor,
     workspace: torch.Tensor,
     v_buf: torch.Tensor,
-    o_gate: torch.Tensor | None = None,
-    o_norm_weight: torch.Tensor | None = None,
-    o_norm_eps: float = 1e-6,
-    o_mxfp8=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Short conv + FlashKDA prefill. mixed_qkv (T, 3 H 128) raw rows;
     conv_state (lines, 3 H 128, >= 3) updated in place; v_buf (1, T, H, 128)
     receives the conv'd V; out (1, T, H, 128) and final_state (N, H, 128, 128)
-    are written. Returns (out, final_state).
-
-    With o_gate (T, >= H 128) bf16 rows, o_norm_weight [128] FP32 and o_mxfp8 (an
-    mxfp8_act.Mxfp8Buffer of T rows), the recurrence epilogue writes the
-    gated RMSNorm (sigmoid) of each output row as o_proj's MXFP8 input
-    (kda_norm.rmsnorm_gated_mxfp8's math; the sum of squares in another order)
-    and out is not written."""
+    are written. Returns (out, final_state)."""
     kda_segscan.load_extension()
     D = out.shape[-1]
     torch.ops.k3_flashkda_split.fwd_conv(
@@ -105,10 +99,20 @@ def fused_conv_prefill(
         None,
         None,
         3,
-        o_gate,
-        o_norm_weight,
-        o_norm_eps,
-        o_mxfp8.data if o_mxfp8 is not None else None,
-        o_mxfp8.scale if o_mxfp8 is not None else None,
     )
     return out, final_state
+
+
+def o_norm_mxfp8(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out,
+) -> None:
+    """Gated RMSNorm (sigmoid) of x (..., H, 128) with gate rows g (T, >= H 128)
+    into out (an mxfp8_act.Mxfp8Buffer of T rows)."""
+    kda_segscan.load_extension()
+    torch.ops.k3_flashkda_split.o_norm_mxfp8(
+        x, g, weight.float().contiguous(), eps, out.data, out.scale
+    )

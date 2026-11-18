@@ -6,6 +6,7 @@
 // picks a V slicing (16, 32, 64 columns or the full tile) per launch shape,
 // see the policy below.
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -26,8 +27,7 @@ void launch_fwd(
     void* workspace_ptr, int total_tiles, int T_total, int H, int N,
     SeqlenT const* cu_seqlens_ptr, float const* A_log_ptr,
     float const* dt_bias_ptr, float gate_scale, int num_sms,
-    cudaStream_t stream, int mode, ConvFuse const* conv,
-    NormMxArgs const* norm) {
+    cudaStream_t stream, int mode, ConvFuse const* conv) {
   using BF16 = cutlass::bfloat16_t;
   constexpr int kInputStages = 3;
   constexpr int kOutputStages = 2;
@@ -154,23 +154,34 @@ void launch_fwd(
 
     dim3 grid_k1(total_tiles, H);
     dim3 block_k1(kK1Threads);
-    auto launch_k1 = [&](auto fused_tag) {
+    auto launch_k1 = [&](auto fused_tag, ConvFuse const& c, int smem) {
       auto kernel1 = _flash_kda_fwd_prepare<
           decltype(tma_load_q), decltype(tma_load_k), decltype(tma_load_beta),
           decltype(tma_load_g), decltype(tma_load_dt_bias), CHUNK, D,
           kK1Threads, IsVarlen, SeqlenT, decltype(fused_tag)::value>;
       cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           smem_size_k1);
-      kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+                           smem);
+      kernel1<<<grid_k1, block_k1, smem, stream>>>(
           tma_load_q, tma_load_k, tma_load_beta, tma_load_g, tma_load_dt_bias,
           scale, T_total, H, N, cu_seqlens_ptr, total_tiles, A_log_ptr,
-          gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
-          conv != nullptr ? *conv : ConvFuse{});
+          gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, c);
     };
     if (conv != nullptr) {
-      launch_k1(std::true_type{});
+      // Kimi-K3 FusedConv: raw Q|K|V rows (tokens, 3P) -> 19 x 128 boxes.
+      ConvFuse c = *conv;
+      Tensor m_raw = make_tensor(
+          make_gmem_ptr(static_cast<BF16 const*>(c.raw)),
+          make_layout(make_shape(T_total, 3 * c.P), make_stride(c.ldx, _1{})));
+      using RawSmemLayout =
+          Layout<Shape<Int<conv_fused::kRawRows>, Int<D>>, Stride<Int<D>, _1>>;
+      auto tma_raw = make_tma_copy(SM90_TMA_LOAD{}, m_raw, RawSmemLayout{});
+      static_assert(sizeof(*tma_raw.get_tma_descriptor()) == sizeof(c.tmap));
+      std::memcpy(c.tmap, tma_raw.get_tma_descriptor(), sizeof(c.tmap));
+      const int raw_off = ((smem_size_k1 + 127) / 128) * 128;
+      launch_k1(std::true_type{}, c,
+                raw_off + 3 * conv_fused::kRawRows * D * int(sizeof(BF16)));
     } else {
-      launch_k1(std::false_type{});
+      launch_k1(std::false_type{}, ConvFuse{}, smem_size_k1);
     }
   }
 #endif
@@ -247,7 +258,7 @@ void launch_fwd(
           tma_store_final_state_vsplit, tma_store_out_vsplit, out_ptr,
           checkpoint_state_ptr, checkpoint_offsets_ptr, T_total, H, N,
           cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
-          ws_mqk, NormMxArgs{});
+          ws_mqk);
       return true;
     };
     using I16 = std::integral_constant<int, 16>;
@@ -306,43 +317,40 @@ void launch_fwd(
       if (pin == 4 && launch_vsplit(I64{}, S3{}, B2{}, exact_tag, No{}, No{}, 2, true)) return;
       if (pin == 5 && launch_vsplit(I64{}, S3{}, B3{}, exact_tag, No{}, No{}, 3, true)) return;
       if (pin == 6 && launch_vsplit(I32{}, S3{}, B4{}, exact_tag, No{}, No{}, 4, true)) return;
-      // The fused o_norm epilogue needs a head's 128 columns in one CTA.
-      if (pin == 0 && norm == nullptr) {
+      if (pin == 0) {
         if (launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1)) return;
         if (launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3)) return;
         if (launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1)) return;
+        // Kimi-K3: past one wave, 64-column slices at two blocks per SM still
+        // beat the full-width kernel (VR200, 96 heads x 3 x 5461, fp32 state:
+        // 422 vs 495 us).
+        if (launch_vsplit(I64{}, S3{}, B2{}, exact_tag, No{}, No{}, 2, true)) return;
       }
 
       using SharedStorageK2T =
           SharedStorageK2<K2L, kInputStages, kOutputStages>;
       int smem_size_k2 = sizeof(SharedStorageK2T);
 
+      auto kernel2 = _flash_kda_fwd_recurrence<
+          decltype(tma_load_v), decltype(tma_load_beta2),
+          decltype(tma_load_initial_state), decltype(tma_store_final_state),
+          decltype(tma_store_out), CHUNK, D, kInputStages, kOutputStages,
+          kK2Threads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
+          IsVarlen, SeqlenT, D, decltype(exact_tag)::value>;
+
+      cudaFuncSetAttribute(kernel2,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size_k2);
+
       // K2 maps x to head so all heads of a sequence launch together.
       // Varlen reverses y in-kernel to process vLLM's trailing prefills first.
       dim3 grid_k2(H, N);
-      auto launch_full = [&](auto norm_tag) {
-        auto kernel2 = _flash_kda_fwd_recurrence<
-            decltype(tma_load_v), decltype(tma_load_beta2),
-            decltype(tma_load_initial_state), decltype(tma_store_final_state),
-            decltype(tma_store_out), CHUNK, D, kInputStages, kOutputStages,
-            kK2Threads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
-            IsVarlen, SeqlenT, D, decltype(exact_tag)::value, 0, false, false,
-            decltype(norm_tag)::value>;
-        cudaFuncSetAttribute(kernel2,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem_size_k2);
-        kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
-            tma_load_v, tma_load_beta2, tma_load_initial_state,
-            tma_store_final_state, tma_store_out, out_ptr, checkpoint_state_ptr,
-            checkpoint_offsets_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
-            norm != nullptr ? *norm : NormMxArgs{});
-      };
-      if (norm != nullptr) {
-        launch_full(std::true_type{});
-      } else {
-        launch_full(std::false_type{});
-      }
+
+      kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
+          tma_load_v, tma_load_beta2, tma_load_initial_state,
+          tma_store_final_state, tma_store_out, out_ptr, checkpoint_state_ptr,
+          checkpoint_offsets_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+          ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
     };
     if constexpr (StateFP32) {
       if (exact_state) {
@@ -363,7 +371,7 @@ void launch_fwd(
       cutlass::bfloat16_t const*, void const*, float, void*, void*,          \
       SEQLEN_T const*, cutlass::bfloat16_t*, void*, int, int, int, int,      \
       SEQLEN_T const*, float const*, float const*, float, int, cudaStream_t, \
-      int, ConvFuse const*, NormMxArgs const*);
+      int, ConvFuse const*);
 
 #define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
   INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T)    \

@@ -84,6 +84,8 @@ def main():
     kda_segscan.load_extension()
     v_buf = torch.empty_like(out)
 
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda import o_norm_mxfp8
+
     def step_fused():
         fused_conv_prefill(
             mixed_qkv=mixed_qkv,
@@ -103,11 +105,8 @@ def main():
             final_state=final_state,
             workspace=ws,
             v_buf=v_buf,
-            o_gate=proj[:, 3 * P : 4 * P],
-            o_norm_weight=norm_w,
-            o_norm_eps=1e-6,
-            o_mxfp8=mx,
         )
+        o_norm_mxfp8(out, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
 
     def step_fusedconv():
         fused_conv_prefill(

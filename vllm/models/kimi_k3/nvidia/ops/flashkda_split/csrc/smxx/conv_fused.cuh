@@ -124,17 +124,46 @@ __device__ __forceinline__ void state_st(const ConvFuse& c, int64_t off,
   }
 }
 
-// One 16-token tile of head `head` for the three planes: Q and K (conv + SiLU,
-// bf16) into the row-major [16, 128] shared tiles, V into c.v_out. Rows past
-// the sequence end are zero in the Q / K tiles and not written to v_out.
-// Then, in the sequence's first tile only, the new conv state. 128 threads:
-// threads 0..95 each run one (plane, 8 channels, 8 rows) stream.
+constexpr int kRawRows = 19;  // a 16-row tile and its 3-row history
+
+// Thread 0: bulk tensor copies of the raw Q, K, V rows [row0 - 3, row0 + 16)
+// of head `head` (columns plane P + 128 head + [0, 128)) into raw_smem
+// (3 x 19 x 128 bf16, row-major), completing on `bar` (3 x 19 x 256 bytes).
+// Rows before the first token are zero-filled (out of bounds); a sequence's
+// first tile takes its history from the conv state instead.
+__device__ __forceinline__ void issue_raw_loads(const ConvFuse& c, int head,
+                                                int64_t row0, void* raw_smem,
+                                                void* bar) {
+  const uint32_t mb = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+#pragma unroll
+  for (int plane = 0; plane < 3; ++plane) {
+    const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(
+        static_cast<__nv_bfloat16*>(raw_smem) + plane * kRawRows * 128));
+    const int x = plane * c.P + head * 128;
+    const int y = int(row0) - 3;
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx"
+        "::bytes [%0], [%1, {%2, %3}], [%4];"
+        :
+        : "r"(dst), "l"(reinterpret_cast<uint64_t>(&c.tmap[0])), "r"(x),
+          "r"(y), "r"(mb)
+        : "memory");
+  }
+}
+
+// One 16-token tile of head `head` for the three planes, from the raw rows in
+// raw_smem: Q and K (conv + SiLU, bf16) into the row-major [16, 128] shared
+// tiles, V into c.v_out. Rows past the sequence end are zero in the Q / K
+// tiles and not written to v_out. Then, in the sequence's first tile only,
+// the new conv state. 128 threads: threads 0..95 each run one (plane, 8
+// channels, 8 rows) stream.
 template <int CHUNK>
 __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
                                           int seq_idx, int64_t bos,
                                           int seq_len, int local_t,
                                           __nv_bfloat16* q_smem,
-                                          __nv_bfloat16* k_smem, int H) {
+                                          __nv_bfloat16* k_smem, int H,
+                                          const __nv_bfloat16* raw_smem) {
   static_assert(CHUNK == 16, "two 8-row halves per tile");
   const int tid = threadIdx.x;
   const int line = c.cache_indices[seq_idx];
@@ -145,8 +174,9 @@ __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
     const int half = (tid / 16) % 2;
     const int cv = tid % 16;
     const int ch = plane * c.P + head * 128 + cv * kVec;
-    const __nv_bfloat16* raw = static_cast<const __nv_bfloat16*>(c.raw);
-    const __nv_bfloat16* xcol = raw + ch;
+    // raw row of position pos: shared row pos - (local_t * CHUNK - 3)
+    const __nv_bfloat16* rs = raw_smem + plane * kRawRows * 128 +
+                              (3 - local_t * CHUNK) * 128 + cv * kVec;
     float w[4][kVec];
     const float4* wv = reinterpret_cast<const float4*>(c.w + int64_t(ch) * 4);
 #pragma unroll
@@ -164,7 +194,7 @@ __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
     for (int k = 0; k < 3; ++k) {
       const int pos = p0 - 3 + k;
       if (pos >= 0) {
-        unpack8(ld_nc_v4(xcol + (bos + pos) * c.ldx), h[k]);
+        unpack8(*reinterpret_cast<const uint4*>(rs + pos * 128), h[k]);
       } else {
         const int64_t so =
             int64_t(line) * c.st_s0 + int64_t(ch) * c.st_s1 + (3 + pos) * c.st_s2;
@@ -180,7 +210,7 @@ __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
       uint4 o = make_uint4(0, 0, 0, 0);
       float cur[kVec];
       if (pos < seq_len) {
-        unpack8(ld_nc_v4(xcol + (bos + pos) * c.ldx), cur);
+        unpack8(*reinterpret_cast<const uint4*>(rs + pos * 128), cur);
         o = conv_row_fma(h[0], h[1], h[2], cur, w);
 #pragma unroll
         for (int i = 0; i < kVec; ++i) {

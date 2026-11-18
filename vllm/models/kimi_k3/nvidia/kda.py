@@ -1182,9 +1182,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             )
         )
 
-    def _o_norm_weight_fp32(self) -> torch.Tensor:
-        return self.o_norm.weight.float().contiguous()
-
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -1224,7 +1221,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_actual_tokens = m.num_actual_tokens
         checkpoint = m.checkpoint
         has_spec_decode = m.num_spec_decodes > 0
-        o_norm_done = False
+        o_norm_fast = False
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
@@ -1430,8 +1427,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 )
             )
             if fused_prefill:
-                # Conv in FlashKDA's prepare load path; when the o_proj takes
-                # MXFP8, the gated o_norm too (specialized_prefill/kda.py).
+                # Conv in FlashKDA's prepare load path, then the HBM-rate gated
+                # o_norm + MXFP8 kernel (specialized_prefill/kda.py).
                 assert non_spec_query_start_loc is not None
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
@@ -1449,7 +1446,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 )
                 num_sequences = initial_state.shape[0]
                 n_ns = mixed_qkv_ns.shape[0]
-                o_norm_fused = o_mxfp8 is not None
                 specialized_prefill_kda.fused_conv_prefill(
                     mixed_qkv=mixed_qkv_ns,
                     conv_weight=conv_weights,
@@ -1468,12 +1464,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     final_state=final_state[:num_sequences],
                     workspace=workspace,
                     v_buf=workspace_out[:, :n_ns],
-                    o_gate=g2[:n_ns].flatten(-2) if o_norm_fused else None,
-                    o_norm_weight=self._o_norm_weight_fp32() if o_norm_fused else None,
-                    o_norm_eps=self.o_norm.eps,
-                    o_mxfp8=o_mxfp8 if o_norm_fused else None,
                 )
-                o_norm_done = o_norm_fused  # written by the recurrence epilogue
+                o_norm_fast = True
                 core_attn_out_non_spec = core_attn_out[:, :n_ns]
                 prefill_glue.write_state_rows(
                     recurrent_state,
@@ -1808,8 +1800,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        if o_norm_done:
-            pass
+        if o_mxfp8 is not None and o_norm_fast:
+            specialized_prefill_kda.o_norm_mxfp8(
+                core_attn_out,
+                g2.flatten(-2),
+                self.o_norm.weight,
+                self.o_norm.eps,
+                o_mxfp8,
+            )
         elif o_mxfp8 is not None:
             # forward() checked kda_norm.supported for these tensors.
             kda_norm.rmsnorm_gated_mxfp8(
