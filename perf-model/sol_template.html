@@ -58,6 +58,15 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space:
 tr:hover td { background: var(--surface-2); }
 .tag { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--border); color: var(--text-2); }
 .tag.new { border-color: var(--s3); color: var(--s3); }
+.tag.t-measured { border-color: var(--good); color: var(--good); }
+.tag.t-projected { border-color: var(--warn); color: var(--text-2); }
+.tag.t-extrapolated { border-color: var(--crit); color: var(--crit); }
+.tag.kd { border-color: var(--crit); color: var(--crit); }
+.tag.act { border-color: var(--accent); color: var(--accent); }
+td.hi { font-weight: 650; }
+.kv-bar { display: flex; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+.kv-bar > div { height: 100%; min-width: 1px; }
+.kv-bar > div + div { border-left: 1px solid var(--surface); }
 .chart { width: 100%; }
 .chart svg { width: 100%; height: auto; display: block; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-2); margin: 6px 0; }
@@ -82,7 +91,8 @@ details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
 <h1>Kimi K3.1-Pro on VR200: speed-of-light model</h1>
 <p class="sub">Op-level, layer-level SOL model of every K3.1 op (DSpark draft included) under each prefill and decode
 sharding strategy, with the communication each strategy adds. Two hardware columns, never fitted:
-<b>SOL</b> = public spec peaks, <b>achievable</b> = our VR200 measurements. Both serving checkpoints. Generated <span id="gen"></span>.</p>
+<b>SOL</b> = public spec peaks, <b>achievable</b> = our VR200 measurements. A third column, <b>calibrated</b> = achievable x
+per-path microbench derates (waves 1-2), sits beside the <b>measured</b> silicon steps. Both serving checkpoints. Generated <span id="gen"></span>.</p>
 
 <div class="bar">
   <div class="ctl">Checkpoint <span class="seg" id="ck"></span></div>
@@ -90,12 +100,65 @@ sharding strategy, with the communication each strategy adds. Two hardware colum
   <div class="ctl">Draft k <span class="seg" id="kk"></span></div>
   <div class="ctl"><button id="theme" class="seg" style="padding:4px 10px;background:var(--surface);color:var(--text-2);border:1px solid var(--border);border-radius:8px;cursor:pointer">theme</button></div>
 </div>
-<nav class="toc"><a href="#sum">Summary</a><a href="#const">Constants</a><a href="#strat">Strategies</a><a href="#pre">Prefill</a><a href="#dec">Decode</a><a href="#ops">Op table</a><a href="#asm">Assumptions</a><a href="#bench">Microbench map</a></nav>
+<nav class="toc"><a href="#sum">Summary</a><a href="#cal">Calibrated vs measured</a><a href="#calPre">Prefill ranking</a><a href="#calBand">Decode winners</a><a href="#calChart">Decode chart</a><a href="#opd">Per-op derates</a><a href="#kdbg">KERNEL-DEBUG</a><a href="#kv">D1 KV capacity</a><a href="#blk">Scope and blockers</a><a href="#const">Constants</a><a href="#strat">Strategies</a><a href="#pre">Prefill</a><a href="#dec">Decode</a><a href="#ops">Op table</a><a href="#asm">Assumptions</a><a href="#bench">Microbench map</a></nav>
 
 <h2 id="sum">Summary</h2>
 <div class="tiles" id="tiles"></div>
 <p class="note">Prefill: fresh tokens/s per GPU at AgentX contexts (5,456 fresh tokens per request over a 72.9K prefix), best chunk per engine.
 Decode: tokens/s per GPU at the requests-per-GPU band, k and checkpoint selected above, within KV capacity at 135K context.</p>
+
+<h2 id="cal">Calibrated vs measured (microbench waves 1-2)</h2>
+<p class="note" id="calRule"></p>
+<div class="tiles" id="calTiles"></div>
+<p class="note">Tags: <span class="tag t-measured">measured</span> the path ran on VR200 at this point;
+<span class="tag t-projected">projected</span> component derates transferred from the closest measured path (analog);
+<span class="tag t-extrapolated">extrapolated</span> outside the measured r or chunk range (never wins a band).
+Calibrated and measured follow the checkpoint selector; measured silicon is mxfp4_release only.</p>
+
+<h3 id="calPre">Prefill per topology: fresh tok/s/GPU at L = 78.4K</h3>
+<div class="tw" style="max-height:560px"><table id="calPreT"></table></div>
+<div class="grid2" style="margin-top:10px">
+  <div><h3>Ranking, calibrated (&le; 32 GPUs)</h3><div class="chart" id="calPreRk"></div></div>
+  <div><h3>Ranking, measured paths only</h3><div class="chart" id="calPreRkM"></div></div>
+</div>
+
+<h3>Decode per topology (k = 3, L = 135K)</h3>
+<div class="ctl" style="margin:6px 0;flex-wrap:wrap">r (requests/GPU) <select id="calR"></select> <span class="seg" id="calMet"></span></div>
+<div class="tw" style="max-height:620px"><table id="calDecT"></table></div>
+
+<h3 id="calBand">Decode winners per requests-per-GPU band</h3>
+<div class="ctl" style="margin:6px 0">Scope <span class="seg" id="calScope"></span></div>
+<div class="tw"><table id="calBandT"></table></div>
+<p class="note">Winner = most r points won in the band (tok/s/GPU), runner-up and its score in brackets. Calibrated skips
+extrapolated points; measured-only uses D1 / D2 / D3 / D3-32 measured points only.</p>
+
+<h3 id="calChart">Decode: model lines vs measured steps (D1, D3, D3-32)</h3>
+<div class="ctl" style="margin:6px 0">Y axis <span class="seg" id="calY"></span></div>
+<div class="legend" id="calLeg"></div>
+<div class="chart" id="calPlot"></div>
+<p class="note">Lines: dotted = SOL, dashed = achievable, solid = calibrated (to the calibrated r<sub>max</sub>).
+Filled circles = measured MXFP8-MoE steps; open squares = release NVFP4-MoE arm (D3, not like-for-like). Log x axis.</p>
+
+<h3 id="opd">Per-op derate breakdown, measured topologies</h3>
+<div class="ctl" style="margin:6px 0;flex-wrap:wrap">Profiled case <select id="opdSel"></select></div>
+<div class="legend"><span><span class="sw" style="background:var(--s2)"></span>measured us / step</span><span><span class="sw" style="background:var(--ach)"></span>model achievable us / step</span><span class="note">label = derate (measured / achievable); <span class="warn">red</span> = KERNEL-DEBUG (&gt; 2.0)</span></div>
+<div class="chart" id="opdPlot"></div>
+<p class="note" id="opdNote"></p>
+<h3>Step derate per measured topology (current model)</h3>
+<div class="tw"><table id="opdTopoT"></table></div>
+<details><summary>Derate by op family (all lanes, derating.json)</summary><div class="tw" style="margin-top:6px"><table id="opdFamT"></table></div></details>
+
+<h3 id="kdbg">KERNEL-DEBUG list, ranked by end-to-end worth</h3>
+<p class="note">Excess = measured minus model achievable per step on the topology where it matters (microbench/RESULTS.md section 3).</p>
+<div class="tw" style="max-height:620px"><table id="kdbgT"></table></div>
+
+<h3 id="kv">D1 KV capacity: where 278.5 GiB goes (per GPU)</h3>
+<div class="kv-bar" id="kvBar"></div>
+<div class="legend" id="kvLeg"></div>
+<div class="tw" style="margin-top:8px"><table id="kvT"></table></div>
+
+<h3 id="blk">Scope and blockers</h3>
+<div class="card" id="blkC"></div>
 
 <h2 id="const">(a) Model and hardware constants</h2>
 <div class="grid2">
@@ -171,7 +234,8 @@ s = SIMT/MUFU (SOL / achievable). Hover an op for shapes and code cite.</p>
 (function () {
 "use strict";
 var M = DATA.meta, PRE = DATA.prefill, DEC = DATA.decode, OPT = DATA.optables;
-var S = { ck: "mxfp4_release", col: "achievable", k: 3, pvar: "O1+O2", dvar: "base", dTopo: "D7-4", dNorm: "step", oSel: null, oSort: "total" };
+var S = { ck: "mxfp4_release", col: "achievable", k: 3, pvar: "O1+O2", dvar: "base", dTopo: "D7-4", dNorm: "step", oSel: null, oSort: "total",
+  calR: 8, calMet: "tps", calScope: "32", calY: "t_ms", opdSel: 0 };
 try { var sv = JSON.parse(localStorage.getItem("k31sol") || "{}"); for (var key in sv) if (key in S) S[key] = sv[key]; } catch (e) {}
 function save() { try { localStorage.setItem("k31sol", JSON.stringify(S)); } catch (e) {} }
 
@@ -437,6 +501,182 @@ function opTable() {
   $("oC").innerHTML = tb.comm.length ? hc : "<tr><td>no communication (single GPU path)</td></tr>";
 }
 
+// ------------------------------------------------------------------ calibration (microbench waves 1-2)
+var CAL = DATA.calibrated, DER = DATA.derating, OPD = DATA.opd, KDBG = DATA.kdbg, STC = DATA.static;
+var CAL_TOPO = ["D1", "D3", "D3-32"], CAL_COL = { "D1": "var(--s1)", "D3": "var(--s2)", "D3-32": "var(--s3)" };
+function tagH(t) { return t ? ' <span class="tag t-' + t + '">' + t + "</span>" : ""; }
+function calCk() { return CAL.decode[S.ck] ? S.ck : "mxfp4_release"; }
+function tname(id) { return TOPO[id] ? TOPO[id].name : id; }
+function measDec(tid, quant) {
+  var bt = DER.by_topology[tid], by = {}, q = quant || "mxfp4_mxfp8", AL = DEC.AL["3"];
+  if (!bt || bt.phase !== "decode" || S.ck !== "mxfp4_release") return [];
+  bt.points.forEach(function (p) { if (p.k === 3 && p.moe_quant === q) by[p.r_per_gpu] = p; });
+  return Object.keys(by).map(Number).sort(function (a, b) { return a - b; }).map(function (r) {
+    var p = by[r]; return { r: r, t_ms: p.measured_ms, tps_gpu: r * AL / p.measured_ms * 1e3, tps_user: AL / p.measured_ms * 1e3, ach_ms: p.model_ach_ms_current, d: p.derate_current }; });
+}
+function measPre(tid) {
+  var bt = DER.by_topology[tid], mx = null, rel = null;
+  if (!bt || bt.phase !== "prefill" || S.ck !== "mxfp4_release") return null;
+  bt.points.forEach(function (p) { if (!p.measured_tok_s_gpu || p.case.indexOf("L78k") < 0) return;
+    if (p.moe_quant === "mxfp4_mxfp8") { if (!mx || p.measured_tok_s_gpu > mx.measured_tok_s_gpu) mx = p; }
+    else if (!rel || p.measured_tok_s_gpu > rel.measured_tok_s_gpu) rel = p; });
+  return mx || rel ? { mx: mx, rel: rel } : null;
+}
+function chunkOf(c) { var m = /pf(\d+)k/.exec(c); return m ? m[1] + "K" : ""; }
+function measRmax(id, k) { return (CAL.derates.measured_rmax || {})[id + "|k" + (k || 3)]; }
+
+function calTiles() {
+  var ck = calCk(), R = CAL.rank[ck], h = [];
+  var pc = R["prefill|calibrated|scope32"][0], pm = R["prefill|calibrated|measured_only"][0];
+  h.push('<div class="tile"><div class="k">prefill best, calibrated</div><div class="v">' + fmt(pc[1]) + ' tok/s/GPU</div><div class="d">' + esc(pc[0]) + " " + esc(tname(pc[0])) + tagH(CAL.prefill[ck][pc[0]].calibrated.tag) + "</div></div>");
+  h.push('<div class="tile"><div class="k">prefill best, measured path</div><div class="v">' + fmt(pm[1]) + ' tok/s/GPU</div><div class="d">' + esc(pm[0]) + " " + esc(tname(pm[0])) + " (F16K, MXFP8 MoE)</div></div>");
+  ["decode|calibrated|scope32", "decode|calibrated|measured_only"].forEach(function (key, i) {
+    var b = R[key]; h.push('<div class="tile"><div class="k">decode winners, ' + (i ? "measured paths only" : "calibrated") + '</div><div class="d" style="font-size:13px;margin-top:4px">' +
+      CAL.bands.map(function (bd) { return "r " + esc(bd) + ": <b>" + (b[bd] ? esc(b[bd].winner) : "-") + "</b>"; }).join("<br>") + "</div></div>");
+  });
+  h.push('<div class="tile"><div class="k">active kernel lane</div><div class="d" style="font-size:13px;margin-top:4px"><b>' + esc(STC.active_lane) + "</b><br>derate 1.95-2.65, 4.1-4.8 ms of the D3 C512 step; applies to every SP layout</div></div>");
+  $("calTiles").innerHTML = h.join("");
+  $("calRule").textContent = CAL.rule + ". Versions: " + DER.versions.tree + "; FlashInfer " + DER.versions.flashinfer + "; " + DER.versions.weights + ".";
+}
+function hbars(el, items, unit) {
+  var W = 380, rowH = 22, L = 70, R = 70, H = items.length * rowH + 24, mx = 0;
+  items.forEach(function (it) { mx = Math.max(mx, it.v); });
+  var tk = ticks(mx, 4), X = function (v) { return L + (W - L - R) * v / tk[tk.length - 1]; }, s = svgBox(el, W, H);
+  tk.forEach(function (v) { NS("line", { x1: X(v), x2: X(v), y1: 2, y2: H - 20, class: "gl" }, s); NS("text", { x: X(v), y: H - 6, "text-anchor": "middle" }, s).textContent = fmt(v); });
+  items.forEach(function (it, i) { var y = 4 + i * rowH;
+    NS("text", { x: L - 6, y: y + 13, "text-anchor": "end" }, s).textContent = it.label;
+    var r = NS("rect", { x: L, y: y + 3, width: Math.max(1, X(it.v) - L), height: 13, rx: 3, fill: it.color }, s);
+    NS("text", { x: X(it.v) + 5, y: y + 14 }, s).textContent = fmt(it.v) + (it.suffix || "");
+    hover(r, it.tip); });
+}
+function calPre() {
+  var ck = calCk(), P = CAL.prefill[ck], ids = Object.keys(P);
+  ids.sort(function (a, b) { return P[b].calibrated.tok_s_gpu - P[a].calibrated.tok_s_gpu; });
+  var h = "<tr><th>id</th><th>topology</th><th class=n>GPUs</th><th class=n>SOL</th><th class=n>achievable</th><th class=n>calibrated</th><th>tag / basis</th><th class=n>cal. 64K</th><th class=n>measured MXFP8</th><th class=n>measured release NVFP4</th><th class=n>cal. / SOL</th></tr>";
+  ids.forEach(function (id) { var p = P[id], c = p.calibrated, x = p.calibrated_bestF_extrapolated, m = measPre(id);
+    h += "<tr><td class=mono>" + id + "</td><td>" + esc(tname(id)) + "</td><td class=n>" + p.gpus + "</td><td class=n>" + fmt(p.sol.tok_s_gpu) + "</td><td class=n>" + fmt(p.achievable.tok_s_gpu) +
+      "</td><td class=\"n hi\">" + fmt(c.tok_s_gpu) + "</td><td>" + tagH(c.tag) + ' <span class="note">F' + c.F / 1024 + "K, derate " + fmt(c.derate, 2) + (c.path !== id ? ", via " + esc(c.path) : "") + (c.dedup_removed ? ", no dedup" : "") + (c.transfer ? ", " + esc(c.transfer) : "") +
+      "</span></td><td class=n>" + (x ? fmt(x.tok_s_gpu) + tagH("extrapolated") : "-") + "</td><td class=n>" + (m && m.mx ? fmt(m.mx.measured_tok_s_gpu) + ' <span class="note">F' + chunkOf(m.mx.case) + "</span>" : "-") +
+      "</td><td class=n>" + (m && m.rel ? fmt(m.rel.measured_tok_s_gpu) : "-") + "</td><td class=n>" + fmt(100 * c.tok_s_gpu / p.sol.tok_s_gpu, 0) + "%</td></tr>"; });
+  $("calPreT").innerHTML = h;
+  var mk = function (key) { return CAL.rank[ck][key].map(function (e) { var c = P[e[0]].calibrated;
+    return { label: e[0], v: e[1], color: c.tag === "measured" ? "var(--ach)" : "var(--sol)", suffix: c.tag === "measured" ? "" : " (" + c.tag + ")",
+      tip: "<b>" + esc(tname(e[0])) + "</b><br>calibrated " + fmt(e[1]) + " tok/s/GPU at F" + c.F / 1024 + "K<br>" + c.tag + (c.path !== e[0] ? " via " + esc(c.path) : "") + ", step derate " + fmt(c.derate, 2) }; }); };
+  hbars($("calPreRk"), mk("prefill|calibrated|scope32"), "tok/s/GPU");
+  hbars($("calPreRkM"), mk("prefill|calibrated|measured_only"), "tok/s/GPU");
+}
+function calDec() {
+  var ck = calCk(), D = CAL.decode[ck], ids = Object.keys(D), rs = {};
+  ids.forEach(function (id) { D[id].points.forEach(function (p) { rs[p.r] = 1; }); });
+  var rl = Object.keys(rs).map(Number).sort(function (a, b) { return a - b; }), sel = $("calR");
+  if (rl.indexOf(+S.calR) < 0) S.calR = 8;
+  sel.innerHTML = rl.map(function (r) { return '<option value="' + r + '"' + (r === +S.calR ? " selected" : "") + ">" + r + "</option>"; }).join("");
+  sel.onchange = function () { S.calR = +sel.value; save(); calDec(); };
+  var r = +S.calR, st = S.calMet === "step", u = st ? "step ms" : "tok/s/GPU";
+  var v = function (o) { return o ? (st ? fmt(o.t_ms, 2) : fmt(o.tps_gpu)) : "-"; };
+  var h = "<tr><th>id</th><th>topology</th><th class=n>GPUs</th><th class=n>r<sub>max</sub> SOL</th><th class=n>r<sub>max</sub> ach</th><th class=n>r<sub>max</sub> cal</th><th class=n>r<sub>max</sub> measured</th><th class=n>SOL " + u + "</th><th class=n>ach " + u + "</th><th class=n>cal " + u + "</th><th>tag / path</th><th class=n>measured " + u + "</th><th class=n>meas / ach step</th></tr>";
+  ids.forEach(function (id) { var t = D[id], p = t.points.filter(function (q) { return q.r === r; })[0] || {}, c = p.calibrated, m = measDec(id).filter(function (q) { return q.r === r; })[0];
+    h += "<tr><td class=mono>" + id + "</td><td>" + esc(tname(id)) + "</td><td class=n>" + t.gpus + "</td><td class=n>" + fmt(t.rmax.sol) + "</td><td class=n>" + fmt(t.rmax.achievable) + '</td><td class=n title="' + esc(t.rmax_cal_method) + '">' + fmt(t.rmax.calibrated) + "</td><td class=n>" + (measRmax(id) ? fmt(measRmax(id)) : "-") +
+      "</td><td class=n>" + v(p.sol) + "</td><td class=n>" + v(p.achievable) + '</td><td class="n hi">' + v(c) + "</td><td>" + (c ? tagH(c.tag) + ' <span class="note">' + (c.path !== id ? "via " + esc(c.path) + ", " : "") + "d " + fmt(c.d_rest, 2) + " / " + fmt(c.d_experts, 2) + "</span>" : '<span class="note">' + (p.sol ? "beyond calibrated r<sub>max</sub>" : "no point") + "</span>") +
+      "</td><td class=n>" + (m ? (st ? fmt(m.t_ms, 2) : fmt(m.tps_gpu)) : "-") + "</td><td class=n>" + (m && m.d ? fmt(m.d, 2) : "-") + "</td></tr>"; });
+  $("calDecT").innerHTML = h + '<tr><td colspan=13 class="note">d = rest-of-step / expert-family derate applied to the achievable column. ' + esc((CAL.derates.notes || {}).EP32 || "") + ". " + esc((CAL.derates.notes || {}).D2 || "") + ".</td></tr>";
+}
+function calBand() {
+  var ck = calCk(), R = CAL.rank[ck], sc = S.calScope, cols = [["sol", "SOL"], ["achievable", "achievable"], ["calibrated", "calibrated"], ["measured_only", "measured paths only"]];
+  var h = "<tr><th class=n>r / GPU</th>" + cols.map(function (c) { return "<th>" + c[1] + "</th>"; }).join("") + "</tr>";
+  CAL.bands.forEach(function (b) {
+    h += "<tr><td class=n>" + esc(b) + "</td>" + cols.map(function (c) {
+      var key = c[0] === "measured_only" ? "decode|calibrated|measured_only" : "decode|" + c[0] + "|scope" + sc, x = (R[key] || {})[b];
+      if (!x) return '<td class="note">' + (c[0] === "sol" || c[0] === "achievable" ? "-" : "no point (r<sub>max</sub> / SP 512-row cap)") + "</td>";
+      var tps = x.by_r.filter(function (q) { return q.topo === x.winner; }).map(function (q) { return q.tps_gpu; }), tags = {};
+      x.by_r.forEach(function (q) { if (q.tag) tags[q.tag] = 1; });
+      return '<td><span class="win">' + esc(x.winner) + "</span> " + x.wins + "/" + x.n_r + (tps.length ? ' <span class="note">' + fmt(Math.min.apply(null, tps)) + "-" + fmt(Math.max.apply(null, tps)) + " tok/s/GPU</span>" : "") +
+        Object.keys(tags).map(tagH).join("") + (x.runner ? '<br><span class="note">runner-up ' + esc(x.runner) + " (" + fmt(x.runner_score, 2) + ")</span>" : "") + "</td>";
+    }).join("") + "</tr>";
+  });
+  $("calBandT").innerHTML = h;
+}
+function calPlot() {
+  var ck = calCk(), D = CAL.decode[ck], yk = S.calY, W = 760, H = 380, L = 56, R = 16, T = 26, B = 42, mx = 0;
+  var x0 = Math.log(0.0625), x1 = Math.log(64), X = function (r) { return L + (W - L - R) * (Math.log(r) - x0) / (x1 - x0); };
+  var series = [], meas = [];
+  CAL_TOPO.forEach(function (id) { if (!D[id]) return;
+    ["sol", "achievable", "calibrated"].forEach(function (col) {
+      var pts = D[id].points.filter(function (p) { return p[col]; }).map(function (p) { return { r: p.r, y: p[col][yk], t: p[col].tag, o: p[col] }; });
+      pts.forEach(function (p) { mx = Math.max(mx, p.y); }); series.push({ id: id, col: col, pts: pts }); });
+    [["mxfp4_mxfp8", "MXFP8 MoE"], ["nvfp4", "release NVFP4 MoE"]].forEach(function (q) {
+      measDec(id, q[0]).forEach(function (p) { mx = Math.max(mx, p[yk]); meas.push({ id: id, q: q, p: p }); }); });
+  });
+  var ty = ticks(mx, 5), Y = function (v) { return H - B - (H - B - T) * v / ty[ty.length - 1]; }, sv = svgBox($("calPlot"), W, H);
+  ty.forEach(function (v) { NS("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), class: "gl" }, sv); NS("text", { x: L - 6, y: Y(v) + 4, "text-anchor": "end" }, sv).textContent = fmt(v); });
+  [0.0625, 0.25, 1, 4, 16, 64].forEach(function (r) { NS("text", { x: X(r), y: H - B + 16, "text-anchor": "middle" }, sv).textContent = r < 1 ? r : r.toFixed(0); });
+  NS("text", { x: (L + W) / 2, y: H - 6, "text-anchor": "middle" }, sv).textContent = "requests per GPU r (log scale), k = 3, L = 135K";
+  NS("text", { x: L, y: 14 }, sv).textContent = yk === "t_ms" ? "step ms" : "tokens/s per user";
+  var dash = { sol: "2 3", achievable: "6 4", calibrated: "" };
+  series.forEach(function (s) { if (!s.pts.length) return;
+    NS("path", { d: s.pts.map(function (p, i) { return (i ? "L" : "M") + X(p.r).toFixed(1) + "," + Y(p.y).toFixed(1); }).join(""), fill: "none", stroke: CAL_COL[s.id], "stroke-width": s.col === "calibrated" ? 2.2 : 1.4, "stroke-dasharray": dash[s.col], opacity: s.col === "sol" ? 0.75 : 1 }, sv);
+    s.pts.forEach(function (p) { var hit = NS("circle", { cx: X(p.r), cy: Y(p.y), r: 6, fill: "transparent" }, sv);
+      if (s.col === "calibrated") NS("circle", { cx: X(p.r), cy: Y(p.y), r: 2.5, fill: p.t === "extrapolated" ? "var(--surface)" : CAL_COL[s.id], stroke: CAL_COL[s.id], "stroke-width": 1 }, sv);
+      hover(hit, "<b>" + esc(tname(s.id)) + "</b> " + s.col + "<br>r = " + p.r + ": step " + fmt(p.o.t_ms, 2) + " ms, " + fmt(p.o.tps_gpu) + " tok/s/GPU, " + fmt(p.o.tps_user) + " tok/s/user" + (p.t ? "<br>" + p.t : "")); });
+  });
+  meas.forEach(function (m) { var cx = X(m.p.r), cy = Y(m.p[yk]), c = CAL_COL[m.id], nd;
+    if (m.q[0] === "nvfp4") nd = NS("rect", { x: cx - 4, y: cy - 4, width: 8, height: 8, fill: "var(--surface)", stroke: c, "stroke-width": 1.8 }, sv);
+    else nd = NS("circle", { cx: cx, cy: cy, r: 4.5, fill: c, stroke: "var(--surface)", "stroke-width": 1.5 }, sv);
+    hover(nd, "<b>" + esc(tname(m.id)) + "</b> measured (" + m.q[1] + ")<br>r = " + m.p.r + ": step " + fmt(m.p.t_ms, 2) + " ms, " + fmt(m.p.tps_gpu) + " tok/s/GPU, " + fmt(m.p.tps_user) + " tok/s/user<br>model achievable " + fmt(m.p.ach_ms, 2) + " ms, derate " + fmt(m.p.d, 2)); });
+  $("calLeg").innerHTML = CAL_TOPO.map(function (id) { return '<span><span class="sw" style="background:' + CAL_COL[id] + '"></span>' + esc(tname(id)) + "</span>"; }).join("");
+}
+function opdPlot() {
+  var sel = $("opdSel");
+  if (!sel.options.length) { sel.innerHTML = OPD.map(function (c, i) { return '<option value="' + i + '">' + esc(c.label) + "</option>"; }).join(""); sel.onchange = function () { S.opdSel = +sel.value; save(); opdPlot(); }; }
+  if (!(S.opdSel >= 0 && S.opdSel < OPD.length)) S.opdSel = 0;
+  sel.value = S.opdSel;
+  var c = OPD[S.opdSel], rows = c.rows.slice().sort(function (a, b) { return b.meas - a.meas; }), N = 18;
+  if (rows.length > N) { var rest = rows.slice(N), o = { name: "other (" + rest.length + " rows)", meas: 0, ach: 0 }; rest.forEach(function (r) { o.meas += r.meas; o.ach += r.ach; }); o.d = o.ach ? o.meas / o.ach : null; rows = rows.slice(0, N).concat([o]); }
+  var W = 760, rowH = 30, L = 250, R = 70, H = rows.length * rowH + 28, mx = 0;
+  rows.forEach(function (r) { mx = Math.max(mx, r.meas, r.ach); });
+  var tk = ticks(mx, 5), X = function (v) { return L + (W - L - R) * v / tk[tk.length - 1]; }, s = svgBox($("opdPlot"), W, H);
+  tk.forEach(function (v) { NS("line", { x1: X(v), x2: X(v), y1: 4, y2: H - 22, class: "gl" }, s); NS("text", { x: X(v), y: H - 6, "text-anchor": "middle" }, s).textContent = fmt(v) + (v === tk[tk.length - 1] ? " us" : ""); });
+  rows.forEach(function (r, i) { var y = 6 + i * rowH, kd = r.d != null && r.d > 2;
+    NS("text", { x: L - 8, y: y + 15, "text-anchor": "end" }, s).textContent = shortName(r.name);
+    NS("rect", { x: L, y: y + 2, width: Math.max(1, X(r.meas) - L), height: 10, rx: 3, fill: "var(--s2)" }, s);
+    NS("rect", { x: L, y: y + 13, width: Math.max(r.ach ? 1 : 0, X(r.ach) - L), height: 10, rx: 3, fill: "var(--ach)" }, s);
+    var lb = NS("text", { x: X(Math.max(r.meas, r.ach)) + 5, y: y + 16 }, s); lb.textContent = r.d != null ? fmt(r.d, 2) + "x" : "not modelled"; if (kd) { lb.setAttribute("style", "fill:var(--crit);font-weight:650"); }
+    hover(NS("rect", { x: 0, y: y, width: W, height: rowH, fill: "transparent" }, s), "<b>" + esc(r.name) + "</b><br>measured " + fmt(r.meas) + " us, model achievable " + fmt(r.ach) + " us<br>derate " + (r.d != null ? fmt(r.d, 2) : "-") + (kd ? " (KERNEL-DEBUG)" : "") + "<br>excess " + fmt((r.meas - r.ach) / 1e3, 2) + " ms per step"); });
+  $("opdNote").textContent = (c.step ? "Step: measured " + fmt(c.step.meas / 1e3, 1) + " ms vs model achievable " + fmt(c.step.ach / 1e3, 1) + " ms (" + fmt(c.step.meas / c.step.ach, 2) + "x). " : "") +
+    "Rows are against the wave-1 model tables (before the 2026-11-18 model fixes); source " + c.src + ". D3-32, P2b, P5-4 and P5-8 (wave 2) have step rows only: torch profiles exist but are not yet broken down.";
+}
+function opdTables() {
+  var h = "<tr><th>topology</th><th>phase</th><th class=n>points</th><th class=n>derate (current model) min-max</th><th>by band / step (wave-1 basis)</th><th>notes</th></tr>";
+  Object.keys(DER.by_topology).forEach(function (id) { var t = DER.by_topology[id], ds = [];
+    t.points.forEach(function (p) { if (p.derate_current != null && (p.moe_quant || "").indexOf("mxfp4") === 0 && (p.k == null || p.k === 3)) ds.push(p.derate_current); });
+    var bb = t.derate_by_band ? Object.keys(t.derate_by_band).map(function (k) { return k + " " + fmt(t.derate_by_band[k].median, 2); }).join(", ") : t.derate_step ? "step median " + fmt(t.derate_step.median, 2) : "";
+    h += "<tr><td class=mono>" + id + "</td><td>" + t.phase + "</td><td class=n>" + ds.length + "</td><td class=n>" + (ds.length ? fmt(Math.min.apply(null, ds), 2) + " - " + fmt(Math.max.apply(null, ds), 2) : "-") + "</td><td>" + esc(bb) + '</td><td class="note">' + esc(t.notes || "") + "</td></tr>"; });
+  $("opdTopoT").innerHTML = h;
+  var f = "<tr><th>phase</th><th>op family</th><th class=n>derate</th><th class=n>range</th><th>notes</th></tr>";
+  Object.keys(DER.by_family).forEach(function (ph) { var F = DER.by_family[ph];
+    Object.keys(F).forEach(function (k) { var x = F[k], d = x.derate;
+      f += "<tr><td>" + esc(ph) + "</td><td>" + esc(k) + "</td><td class=\"n" + (d > 2 ? " warn" : "") + "\">" + (d != null ? fmt(d, 2) : (x.absolute_ms_per_step != null ? "abs " + esc(String(x.absolute_ms_per_step)) + " ms" : "-")) + "</td><td class=n>" + (x.range ? fmt(x.range[0], 2) + "-" + fmt(x.range[1], 2) : "") + '</td><td class="note">' + esc([x.path, x.note].filter(Boolean).join("; ")) + "</td></tr>"; }); });
+  $("opdFamT").innerHTML = f;
+  var kh = "<tr><th class=n>#</th><th>item</th><th class=n>derate</th><th>excess per step</th><th>first hypothesis</th><th>source rows</th></tr>";
+  KDBG.forEach(function (r) { kh += "<tr><td class=n>" + esc(r.n) + "</td><td><b>" + esc(r.title) + "</b>" + (r.n === "1" ? ' <span class="tag act">active lane: in progress</span>' : "") + (r.detail ? '<div class="note">' + esc(r.detail) + "</div>" : "") + "</td><td class=n>" + esc(r.derate) + "</td><td>" + esc(r.excess) + '</td><td class="note">' + esc(r.hyp) + '</td><td class="note">' + esc(r.src) + "</td></tr>"; });
+  $("kdbgT").innerHTML = kh;
+}
+function kvSection() {
+  var K = STC.d1_hbm, col = { w: "var(--s1)", pad: "var(--s8)", nt: "var(--s4)", head: "var(--other)", act: "var(--s5)", start: "var(--s7)", kv: "var(--s3)" };
+  $("kvBar").innerHTML = K.items.map(function (it) { return '<div style="width:' + (100 * it[1] / K.device_GiB).toFixed(2) + "%;background:" + col[it[2]] + '" data-t="' + esc(it[0] + ": " + it[1] + " GiB") + '"></div>'; }).join("");
+  Array.prototype.forEach.call($("kvBar").children, function (d) { hover(d, d.getAttribute("data-t")); });
+  $("kvLeg").innerHTML = K.items.map(function (it) { return '<span><span class="sw" style="background:' + col[it[2]] + '"></span>' + esc(it[0]) + " <b>" + fmt(it[1], 1) + "</b></span>"; }).join("") + '<span class="note">of ' + K.device_GiB + " GiB; weights total " + K.weights_total_GiB + " GiB</span>";
+  var rows = [["D1", 3], ["D1", 7], ["D2", 3], ["D2", 7], ["D3", 3], ["D3-32", 3]];
+  var h = "<tr><th>topology</th><th class=n>k</th><th class=n>measured r<sub>max</sub></th><th class=n>model SOL r<sub>max</sub></th><th class=n>model achievable r<sub>max</sub> (packed pool)</th><th class=n>measured / achievable</th><th class=n>model resident weights GB</th></tr>";
+  rows.forEach(function (x) { var c = DEC.cap["mxfp4_release|" + x[1] + "|" + x[0]] || {}, m = measRmax(x[0], x[1]);
+    h += "<tr><td>" + esc(tname(x[0])) + "</td><td class=n>" + x[1] + "</td><td class=\"n hi\">" + fmt(m) + "</td><td class=n>" + fmt(c.rmax) + "</td><td class=n>" + fmt(c.rmax_ach) + "</td><td class=n>" + (m && c.rmax_ach ? fmt(m / c.rmax_ach, 2) : "-") + "</td><td class=n>" + fmt(c.weights_GB) + "</td></tr>"; });
+  $("kvT").innerHTML = h + '<tr><td colspan=7 class="note">r per GPU at 135K. Measured = bench KV pool at production gpu-memory-utilization (decode lane capacity finding; D3-32: 2329 blocks/rank, 13 blocks/request). D1 holds 88.3 GiB of KV against the model\'s ' + fmt((DEC.cap["mxfp4_release|3|D1"] || {}).free_GB) + " GB free: 28.1 GiB MoE-TP16 padding, 24.0 non-torch and the 0.90 utilization cap are not in the SOL capacity, and each request pins a fixed block floor (24 rows of 1024-token blocks per GPU at k3).</td></tr>";
+}
+function blockers() {
+  $("blkC").innerHTML = "<p>" + esc(STC.scope_note) + "</p><ul>" + STC.blockers.map(function (b) { return "<li><b>" + esc(b[0]) + ".</b> " + esc(b[1]) + "</li>"; }).join("") + "</ul>";
+}
+function calAll() { calTiles(); calPre(); calDec(); calBand(); calPlot(); }
+
 // ------------------------------------------------------------------ assumptions etc.
 function staticBits() {
   $("gen").textContent = M.generated;
@@ -468,7 +708,7 @@ function staticBits() {
 }
 
 function renderAll() {
-  tiles(); stratTable(); preBars(); preStack(); preSens(); preTTFT(); decPareto(); decBand(); decStack(); decCap(); opTable();
+  calAll(); tiles(); stratTable(); preBars(); preStack(); preSens(); preTTFT(); decPareto(); decBand(); decStack(); decCap(); opTable();
 }
 seg("ck", [["mxfp4_release", "mxfp4_release"], ["nvfp4_modelopt", "nvfp4_modelopt"]], "ck", renderAll);
 seg("col", [["sol", "SOL"], ["achievable", "achievable"]], "col", renderAll);
@@ -479,7 +719,10 @@ seg("dNorm", [["step", "ms per step"], ["tok", "us per token"]], "dNorm", decSta
 seg("oSort", [["total", "sort by total time"], ["model", "model order"]], "oSort", opTable);
 $("theme").onclick = function () { var r = document.documentElement, cur = r.getAttribute("data-theme");
   var dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.setAttribute("data-theme", dark ? "light" : "dark"); };
+seg("calMet", [["tps", "tok/s/GPU"], ["step", "step ms"]], "calMet", calDec);
+seg("calScope", [["32", "<= 32 GPUs"], ["16", "<= 16 GPUs"]], "calScope", calBand);
+seg("calY", [["t_ms", "step ms"], ["tps_user", "tok/s/user"]], "calY", calPlot);
 legendGroups("gLeg1"); legendGroups("gLeg2");
-constTables(); staticBits(); renderAll();
+constTables(); staticBits(); opdPlot(); opdTables(); kvSection(); blockers(); renderAll();
 })();
 </script>
