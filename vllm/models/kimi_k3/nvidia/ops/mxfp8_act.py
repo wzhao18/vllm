@@ -241,15 +241,36 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   const int64_t stride = (int64_t)gridDim.x * blockDim.x;
   const int64_t trip = stride * ACT_QUANT_UNROLL;
   const int64_t total_round = (total + trip - 1) / trip * trip;
+  // (row, vector column) advance by (srow, scol) per sub-trip: one 64-bit
+  // division per trip instead of one per vector.
+  const int64_t srow = stride / vecs_per_row;
+  const int scol = (int)(stride - srow * vecs_per_row);
   for (int64_t v0 = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
        v0 < total_round; v0 += trip) {
     uint4 a[ACT_QUANT_UNROLL], b[ACT_QUANT_UNROLL];
+    int64_t rows_u[ACT_QUANT_UNROLL];
+    int cols_u[ACT_QUANT_UNROLL];
+    {
+      int64_t r = v0 / vecs_per_row;
+      int c = (int)(v0 - r * vecs_per_row);
+#pragma unroll
+      for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
+        rows_u[u] = r;
+        cols_u[u] = c;
+        r += srow;
+        c += scol;
+        if (c >= vecs_per_row) {
+          c -= vecs_per_row;
+          ++r;
+        }
+      }
+    }
 #pragma unroll
     for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
       const int64_t v = v0 + u * stride;
       const bool live = v < total;
-      const int64_t row = live ? v / vecs_per_row : 0;
-      const int col = live ? (int)(v - row * vecs_per_row) * 8 : 0;
+      const int64_t row = live ? rows_u[u] : 0;
+      const int col = live ? cols_u[u] * 8 : 0;
       if (live && row < rows) {
         act_load<MODE>(x, g, row, col, d, x_stride, g_stride, a[u], b[u]);
       }
@@ -258,8 +279,8 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
     for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
       const int64_t v = v0 + u * stride;
       const bool live = v < total;
-      const int64_t row = live ? v / vecs_per_row : 0;
-      const int col = live ? (int)(v - row * vecs_per_row) * 8 : 0;
+      const int64_t row = live ? rows_u[u] : 0;
+      const int col = live ? cols_u[u] * 8 : 0;
       const bool real = live && row < rows;
       float out[8];
       if (real) {

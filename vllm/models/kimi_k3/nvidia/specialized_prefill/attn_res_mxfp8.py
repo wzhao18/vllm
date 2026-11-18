@@ -63,6 +63,11 @@ def _module(chunk_depth: int = 2):
                     "--use_fast_math",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
+                    # The native build does not set torch's no-conversion macros.
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
                     f"-DK31PF_CHUNK_DEPTH={chunk_depth}",
                     "-gencode",
                     "arch=compute_100f,code=sm_100f",
