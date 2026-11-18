@@ -15,7 +15,8 @@
 
 namespace conv_fused {
 
-constexpr int kVec = 8;
+constexpr int kVec = 4;       // channels per thread item (K1 runs at <= 64 registers)
+constexpr int kRawRows = 19;  // a 16-row tile and its 3-row history
 
 __device__ __forceinline__ float ex2_ftz(float x) {
   float y;
@@ -44,9 +45,10 @@ __device__ __forceinline__ uint32_t pack2(float a, float b) {
   return *reinterpret_cast<uint32_t*>(&h);
 }
 
-// kda_qkv_conv.cu silu8: div.full.f32 equals a * rcp.approx(d) for
-// 1 + e <= 2^126; larger d redo the 8 values with div.full itself.
-__device__ __forceinline__ uint4 silu8(const float (&acc)[kVec]) {
+// kda_qkv_conv.cu silu8 on 4 values: div.full.f32 equals a * rcp.approx(d)
+// for 1 + e <= 2^126; larger d redo the values with div.full itself (each
+// element's result is the div.full one either way).
+__device__ __forceinline__ uint2 silu4(const float (&acc)[kVec]) {
   float o[kVec];
   float dmax = 0.0f;
 #pragma unroll
@@ -65,11 +67,10 @@ __device__ __forceinline__ uint4 silu8(const float (&acc)[kVec]) {
 #pragma unroll
     for (int i = 0; i < kVec; ++i) o[i] = silu_triton(acc[i]);
   }
-  return make_uint4(pack2(o[0], o[1]), pack2(o[2], o[3]), pack2(o[4], o[5]),
-                    pack2(o[6], o[7]));
+  return make_uint2(pack2(o[0], o[1]), pack2(o[2], o[3]));
 }
 
-__device__ __forceinline__ uint4 conv_row_fma(const float (&h0)[kVec],
+__device__ __forceinline__ uint2 conv_row_fma(const float (&h0)[kVec],
                                               const float (&h1)[kVec],
                                               const float (&h2)[kVec],
                                               const float (&cur)[kVec],
@@ -89,24 +90,14 @@ __device__ __forceinline__ uint4 conv_row_fma(const float (&h0)[kVec],
     acc[2 * q] = a.x;
     acc[2 * q + 1] = a.y;
   }
-  return silu8(acc);
+  return silu4(acc);
 }
 
-__device__ __forceinline__ void unpack8(uint4 v, float (&f)[kVec]) {
-  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    f[2 * i] = __uint_as_float(w[i] << 16);
-    f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
-  }
-}
-
-__device__ __forceinline__ uint4 ld_nc_v4(const __nv_bfloat16* p) {
-  uint4 v;
-  asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-               : "l"(p));
-  return v;
+__device__ __forceinline__ void unpack4(uint2 v, float (&f)[kVec]) {
+  f[0] = __uint_as_float(v.x << 16);
+  f[1] = __uint_as_float(v.x & 0xffff0000u);
+  f[2] = __uint_as_float(v.y << 16);
+  f[3] = __uint_as_float(v.y & 0xffff0000u);
 }
 
 __device__ __forceinline__ float state_ld(const ConvFuse& c, int64_t off) {
@@ -123,8 +114,6 @@ __device__ __forceinline__ void state_st(const ConvFuse& c, int64_t off,
     static_cast<__nv_bfloat16*>(c.state)[off] = __float2bfloat16_rn(v);
   }
 }
-
-constexpr int kRawRows = 19;  // a 16-row tile and its 3-row history
 
 // Thread 0: bulk tensor copies of the raw Q, K, V rows [row0 - 3, row0 + 16)
 // of head `head` (columns plane P + 128 head + [0, 128)) into raw_smem
@@ -155,8 +144,8 @@ __device__ __forceinline__ void issue_raw_loads(const ConvFuse& c, int head,
 // raw_smem: Q and K (conv + SiLU, bf16) into the row-major [16, 128] shared
 // tiles, V into c.v_out. Rows past the sequence end are zero in the Q / K
 // tiles and not written to v_out. Then, in the sequence's first tile only,
-// the new conv state. 128 threads: threads 0..95 each run one (plane, 8
-// channels, 8 rows) stream.
+// the new conv state. 128 threads, 3 x 32 x 4 (plane, 4 channels, 4 rows)
+// items: a warp covers one plane's 128 channels for 4 rows.
 template <int CHUNK>
 __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
                                           int seq_idx, int64_t bos,
@@ -164,40 +153,37 @@ __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
                                           __nv_bfloat16* q_smem,
                                           __nv_bfloat16* k_smem, int H,
                                           const __nv_bfloat16* raw_smem) {
-  static_assert(CHUNK == 16, "two 8-row halves per tile");
+  static_assert(CHUNK == 16, "four 4-row quarters per tile");
   const int tid = threadIdx.x;
   const int line = c.cache_indices[seq_idx];
   const bool skip = c.null_block_id >= 0 && line == c.null_block_id;
   const bool load_init = !skip && c.has_initial_state[seq_idx];
-  if (tid < 96) {
-    const int plane = tid / 32;
-    const int half = (tid / 16) % 2;
-    const int cv = tid % 16;
+  const int cv = tid % 32;
+#pragma unroll 1
+  for (int item = tid / 32; item < 12; item += 4) {
+    const int plane = item / 4;
+    const int r0 = (item % 4) * 4;
     const int ch = plane * c.P + head * 128 + cv * kVec;
-    // raw row of position pos: shared row pos - (local_t * CHUNK - 3)
-    const __nv_bfloat16* rs = raw_smem + plane * kRawRows * 128 +
-                              (3 - local_t * CHUNK) * 128 + cv * kVec;
     float w[4][kVec];
-    const float4* wv = reinterpret_cast<const float4*>(c.w + int64_t(ch) * 4);
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      const float4 v = wv[i];
+      const float4 v = reinterpret_cast<const float4*>(c.w)[int64_t(ch) + i];
       w[0][i] = v.x;
       w[1][i] = v.y;
       w[2][i] = v.z;
       w[3][i] = v.w;
     }
-    const int r0 = half * 8;
     const int p0 = local_t * CHUNK + r0;  // position of the first row
+    // raw row of tile row r (position p0 + r): shared row r0 + r + 3
+    const __nv_bfloat16* rs = raw_smem + plane * kRawRows * 128 + r0 * 128 + cv * kVec;
     float h[3][kVec];
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
-      const int pos = p0 - 3 + k;
-      if (pos >= 0) {
-        unpack8(*reinterpret_cast<const uint4*>(rs + pos * 128), h[k]);
+      if (p0 - 3 + k >= 0) {
+        unpack4(*reinterpret_cast<const uint2*>(rs + k * 128), h[k]);
       } else {
-        const int64_t so =
-            int64_t(line) * c.st_s0 + int64_t(ch) * c.st_s1 + (3 + pos) * c.st_s2;
+        const int64_t so = int64_t(line) * c.st_s0 + int64_t(ch) * c.st_s1 +
+                           (p0 + k) * c.st_s2;
 #pragma unroll
         for (int i = 0; i < kVec; ++i)
           h[k][i] = load_init ? state_ld(c, so + i * c.st_s1) : 0.0f;
@@ -205,12 +191,12 @@ __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
     }
     __nv_bfloat16* tile = plane == 0 ? q_smem : k_smem;
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
+    for (int r = 0; r < 4; ++r) {
       const int pos = p0 + r;
-      uint4 o = make_uint4(0, 0, 0, 0);
-      float cur[kVec];
+      uint2 o = make_uint2(0, 0);
       if (pos < seq_len) {
-        unpack8(*reinterpret_cast<const uint4*>(rs + pos * 128), cur);
+        float cur[kVec];
+        unpack4(*reinterpret_cast<const uint2*>(rs + (r + 3) * 128), cur);
         o = conv_row_fma(h[0], h[1], h[2], cur, w);
 #pragma unroll
         for (int i = 0; i < kVec; ++i) {
@@ -219,41 +205,36 @@ __device__ __forceinline__ void tile_conv(const ConvFuse& c, int head,
           h[2][i] = cur[i];
         }
         if (plane == 2 && !skip) {
-          *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(c.v_out) + ((bos + pos) * H + head) * 128 +
-                                    cv * kVec) = o;
+          *reinterpret_cast<uint2*>(static_cast<__nv_bfloat16*>(c.v_out) +
+                                    ((bos + pos) * H + head) * 128 + cv * kVec) = o;
         }
       }
       if (plane < 2) {
-        *reinterpret_cast<uint4*>(tile + (r0 + r) * 128 + cv * kVec) = o;
+        *reinterpret_cast<uint2*>(tile + (r0 + r) * 128 + cv * kVec) = o;
       }
     }
   }
   if (local_t == 0 && !skip) {
     // Every history read of the old state above happens before the writes.
     __syncthreads();
-    if (tid < 48) {
-      const int plane = tid / 16;
-      const int cv = tid % 16;
+    if (tid < 96) {
+      const int plane = tid / 32;
       const int ch = plane * c.P + head * 128 + cv * kVec;
       const int64_t sb = int64_t(line) * c.st_s0 + int64_t(ch) * c.st_s1;
-      float old[3][kVec];
-#pragma unroll
-      for (int k = 0; k < 3; ++k)
-#pragma unroll
-        for (int i = 0; i < kVec; ++i)
-          old[k][i] = load_init ? state_ld(c, sb + i * c.st_s1 + k * c.st_s2)
-                                : 0.0f;
       float ns[3][kVec];
 #pragma unroll
       for (int j = 0; j < 3; ++j) {
         const int src = seq_len - 3 + j;
         if (src >= 0) {
-          unpack8(ld_nc_v4(static_cast<const __nv_bfloat16*>(c.raw) + ch +
-                           (bos + src) * c.ldx),
-                  ns[j]);
+          const auto* p = static_cast<const __nv_bfloat16*>(c.raw) + ch +
+                          (bos + src) * c.ldx;
+          unpack4(*reinterpret_cast<const uint2*>(p), ns[j]);
         } else {
 #pragma unroll
-          for (int i = 0; i < kVec; ++i) ns[j][i] = old[j + seq_len][i];
+          for (int i = 0; i < kVec; ++i)
+            ns[j][i] = load_init
+                           ? state_ld(c, sb + i * c.st_s1 + (j + seq_len) * c.st_s2)
+                           : 0.0f;
         }
       }
 #pragma unroll

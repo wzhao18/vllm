@@ -141,15 +141,25 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     // Linear scan on cu_seqlens to find (seq_idx, local_t)
     seq_idx = 0;
     tiles_before = 0;
+    bool found = false;
     for (int i = 0; i < N; i++) {
       int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
       int n_tiles = (slen + CHUNK - 1) / CHUNK;
       if (tiles_before + n_tiles > global_tile_idx) {
         seq_idx = i;
+        found = true;
         break;
       }
       tiles_before += n_tiles;
     }
+    // Kimi-K3: a CTA past the last tile (total_tiles is an upper bound) finds
+    // no sequence; FlashKDA then maps it onto sequence 0's first tiles, a
+    // harmless duplicate into an unused workspace slot. FusedConv must not run
+    // it: a duplicate first tile races on the conv state.
+    if constexpr (FusedConv) {
+      if (!found) return;
+    }
+    (void)found;
     local_t = global_tile_idx - tiles_before;
     bos = cu_seqlens[seq_idx];
     eos = cu_seqlens[seq_idx + 1];
