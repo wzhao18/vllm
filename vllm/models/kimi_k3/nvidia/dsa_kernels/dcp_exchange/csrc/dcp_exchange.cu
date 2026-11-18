@@ -376,6 +376,14 @@ __device__ __forceinline__ int count_below(const uint32_t* list, int n, uint32_t
   return lo;
 }
 
+// Whether every rank's tie count at tau fits one tie message, so one round of complete
+// ascending tie lists locates the cut (the centred 1R WRITE's in-place tie round).
+__device__ __forceinline__ bool c1r_ties_fit(const int* ties, int W) {
+  for (int s = 0; s < W; ++s)
+    if (ties[s] > kTieList) return false;
+  return true;
+}
+
 __device__ __forceinline__ void load8_keys(const uint16_t* lrow, int i, int n, bool vec,
                                            uint32_t (&k8)[8]) {
   if (vec && i + 8 <= n) {
@@ -1232,7 +1240,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         // tau outside a window: the octave rounds over every key (leader)
         c1r_stage = 20;
         if (leader && tid == 0) s_fkey_c1r = 65536;
-      } else if (q < 0) {
+      } else if (q < 0 && !c1r_ties_fit(s_ties, p.W)) {
         c1r_stage = 30;  // tie round (leader state machine)
       } else {
         // WRITE: bitmaps of this CTA's tokens above tau and ties, one packed scan
@@ -1300,6 +1308,97 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
               spin_fail(p.err, 20);
           }
         }
+        // Ties straddling >= 2 ranks, every rank's ties fit one tie message
+        // (c1r_ties_fit): the tie round runs here on the row's bitmaps (no key
+        // pass, no leader state machine). Each CTA puts its first tied local
+        // positions (position order) into the leader's G[]; the leader sends this
+        // rank's tied global ids, polls every rank's (each is its rank's complete
+        // ascending tie list), finds the need-th smallest id g* and this rank's
+        // quota (its ties <= g*), and hands the quota to the cluster.
+        int qw = q;
+        if (q < 0) {
+          {
+            uint32_t* gl = leader ? G : cl.map_shared_rank(G, 0);
+            int e = eo + (int)(pre >> 12);
+            for (int w = w0; w < w1 && e < kTieList; ++w) {
+              uint32_t m = bme[w];
+              while (m && e < kTieList) {
+                const int bit = __ffs(m) - 1;
+                m &= m - 1;
+                gl[e++] = (uint32_t)(s0 + w * 32 + bit);
+              }
+            }
+          }
+          __shared__ int s_tq;
+          if (cs > 1) cl.sync();  // the tie positions in the leader's G[]
+          else __syncthreads();
+          if (leader) {
+            DBG(9);
+            STAT(kStTieRound);
+            const int Wn = p.W, IL = p.interleave, nm = s_ties[p.rank];
+            if (tid == 0 && eqt != nm) spin_fail(p.err, 20);
+            const int64_t trow = p.off_tl + ((int64_t)(par * p.cap + row) * Wn) * kTieList;
+            const int nmp = (nm + 3) & ~3;
+            for (int j = tid; j < nmp; j += kThreads) {
+              uint32_t gid = 0;
+              if (j < nm) {
+                const int l = (int)G[j];
+                gid = (uint32_t)(((l / IL) * Wn + p.rank) * IL + l % IL);
+              }
+              msg[j] = tagw(tag, gid);
+            }
+            if (tid == 0) res.kstar = -1;
+            __syncthreads();
+            for (int j = tid * 4; j < nmp; j += kThreads * 4) {
+              const uint4 v = make_uint4(msg[j], msg[j + 1], msg[j + 2], msg[j + 3]);
+              const int64_t off = trow + (int64_t)p.rank * kTieList + j;
+              if (p.mc) mc_st_v4(p.mc + off * 4, v);
+              else
+                for (int d = 0; d < Wn; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
+            }
+            // every rank's list into fine[] (the window sums are no longer read)
+            {
+              const long long t0 = now_ns();
+              for (int j = tid * 4; j < Wn * kTieList; j += kThreads * 4) {
+                const int s = j / kTieList;
+                if (j % kTieList >= ((s_ties[s] + 3) & ~3)) continue;
+                uint4 v = ld_sys_v4(p.box + trow + j);
+                while (!tagged(v, tag)) {
+                  if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 14); break; }
+                  v = ld_sys_v4(p.box + trow + j);
+                }
+                *reinterpret_cast<uint4*>(fine + j) = v;
+              }
+            }
+            __syncthreads();
+            DBG(10);
+            // g*: the id with exactly need - 1 smaller ids over the W ascending lists
+            // (ids are distinct)
+            const int need = s_need;
+            for (int c = tid; c < Wn * kTieList; c += kThreads) {
+              const int s = c / kTieList, j = c % kTieList;
+              if (j >= s_ties[s]) continue;
+              const uint32_t x = fine[c] & 0xFFFFFFu;
+              int r = j;
+              for (int s2 = 0; s2 < Wn; ++s2)
+                if (s2 != s) r += count_below(fine + s2 * kTieList, s_ties[s2], x);
+              if (r == need - 1) res.kstar = (int)x;
+            }
+            for (int j = tid; j < Wn * kTieList; j += kThreads)
+              if (j % kTieList < ((s_ties[j / kTieList] + 3) & ~3)) st_u32(p.box + trow + j, kSent);
+            __syncthreads();
+            if (tid == 0) {
+              const int gs = res.kstar;
+              if (gs < 0) spin_fail(p.err, 16);
+              const int qq = count_below(fine + p.rank * kTieList, nm, (uint32_t)gs + 1u);
+              for (int c = 0; c < cs; ++c) *(c == 0 ? &s_tq : cl.map_shared_rank(&s_tq, c)) = qq;
+            }
+            DBG(14);
+          }
+          if (cs > 1) cl.sync();  // the quota in every CTA
+          else __syncthreads();
+          qw = s_tq;
+        }
         int gp = go + (int)(pre & 0xFFFu), ep = eo + (int)(pre >> 12);
         for (int w = w0; w < w1; ++w) {
           uint32_t m = bmg[w];
@@ -1309,14 +1408,14 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
             orow[gp++] = slot_of(s0 + w * 32 + bit);
           }
           m = bme[w];
-          while (m && ep < q) {
+          while (m && ep < qw) {
             const int bit = __ffs(m) - 1;
             m &= m - 1;
             orow[gtt + ep] = slot_of(s0 + w * 32 + bit);
             ++ep;
           }
         }
-        const int count = gtt + q, per = (K - count + cs - 1) / cs;
+        const int count = gtt + qw, per = (K - count + cs - 1) / cs;
         for (int i = count + crank * per + tid; i < min(K, count + (crank + 1) * per); i += kThreads)
           orow[i] = -1;
         if (leader && tid == 0) p.out_count[row] = count;
