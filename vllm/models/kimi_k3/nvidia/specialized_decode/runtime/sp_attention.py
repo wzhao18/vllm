@@ -70,7 +70,9 @@ from ...dense_draft import is_gqa_dspark
 from ...ops.attn_res import attn_res
 from ..cutedsl.common.sp_comm import SpComm
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
+from ...mxfp8 import is_online_mxfp8
 from ..cutedsl.gemm.decode import DecodeProjection
+from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
 from ..cutedsl.kda.sp import SpKdaCore
 from ..cutedsl.oproj.sp import SpOproj
@@ -130,19 +132,36 @@ class SpAttentionBlock:
         self.kind = kind = attention_kind(attention)
         self.index, self.parity = decoder.layer_idx, ordinal % 2
         where = f"layer {self.index}"
-        try:  # BF16 projections only (a quantized layer is refused, not misread)
+        family = f"{kind}_in"
+        # BF16 projections, or the online-MXFP8 KDA projections of the NVFP4
+        # (modelopt_mixed) checkpoint (``gemm.mxfp8``); any other quantized layer is
+        # refused, not misread.
+        mx_in = kind == "kda" and is_online_mxfp8(attention.in_proj_qkvgfab)
+        mx_out = kind == "kda" and is_online_mxfp8(attention.o_proj)
+        try:
             if kind == "dsa":
                 weight = pack_dsa_projection(attention)
-            else:
+            elif not mx_in:
                 weight = bf16_weight(attention.in_proj_qkvgfab)
-            output = bf16_weight(attention.o_proj)
+            output = None if mx_out else bf16_weight(attention.o_proj)
         except ValueError as error:  # (re-raised with the layer)
             raise Unsupported(kind, None, f"{where}: {error}") from error
-        pitch, k = weight.shape
-        family = f"{kind}_in"
         with torch.accelerator.device_index(step.device.index):
-            tactics = sp_projection_tactics(family, pitch, k, rows, ctx)
-        self.projection = DecodeProjection(weight, rows, tactics, family=family)
+            if mx_in:
+                self.projection = Mxfp8Projection(
+                    attention.in_proj_qkvgfab, rows, family=family, cap=rows[-1]
+                )
+                pitch = self.projection.n
+            else:
+                pitch, k = weight.shape
+                tactics = sp_projection_tactics(family, pitch, k, rows, ctx)
+                self.projection = DecodeProjection(
+                    weight, rows, tactics, family=family
+                )
+            if mx_out:
+                output = Mxfp8Projection(
+                    attention.o_proj, rows, family="o_proj", cap=rows[-1]
+                )
         if kind == "dsa":
             parity = step.dsa_layers % 2  # the DcpBox's own alternation
             step.dsa_layers += 1
@@ -159,7 +178,8 @@ class SpAttentionBlock:
                 kind, None,
                 f"{where}: core pitch {self.core.pitch} != in-projection N {pitch}",
             )  # fmt: skip
-        self.width = output.shape[1]  # heads x 128 (the o_proj input)
+        # heads x 128 (the o_proj input)
+        self.width = output.k if isinstance(output, Mxfp8Projection) else output.shape[1]
         self.oproj = SpOproj(output, step.comm, rows, ctx)
         cap = rows[-1]
         self.projected = step.scratch(f"{kind}.projected", (cap, pitch))
