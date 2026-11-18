@@ -46,6 +46,8 @@ import torch
 from vllm.logger import init_logger
 
 from ...shapes import Choice, Path, Shape, Unsupported
+from ..gemm.decode import DecodeProjection
+from ..gemm.sp_policy import sp_projection_tactics
 from ..mla.dcp import DcpBox
 from ..mla.query import TILED_FROM
 from .attn_fi import dsa_on_flashinfer
@@ -267,6 +269,17 @@ class SpDsaCore:
         # The per-layer FP8 query rows PreparedDsa's QueryStage took: the shared ones
         # (``query_rows``).
         prepared.query_stage.query = shared[0]
+        # wq_b at the SP rows: ``gemm.sp_policy``'s measured tactics (family "wq_b";
+        # the TP16 bins' split-K tiles of 64 token columns re-read the weight per
+        # tile above 64 rows) in place of QueryStage's TP16 table, same operands.
+        stage = prepared.query_stage
+        wq = stage.index_projection.weight
+        n, k = wq.shape
+        tactics = sp_projection_tactics("wq_b", n, k, rows, ctx)
+        stage.index_projection = DecodeProjection(wq, rows, tactics, family="wq_b")
+        stage.index_projection.check_operands(
+            stage.qc[: max(rows)], stage.iq[: max(rows)]
+        )
         self.box = prepared.box  # (r1.DsaBox over ``box``)
         for r in rows:  # the policy PreparedDsa resolved is the one checked above
             shape = Shape(r, q)

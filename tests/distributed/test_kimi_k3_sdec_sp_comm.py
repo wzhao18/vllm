@@ -11,8 +11,11 @@ On 2 or 4 ranks (the deployment is TP4; the mailboxes are generic in TP):
 - ``SpOproj`` "cublas": the shard equals stock's o-projection + reduce-scatter bit
   for bit (F.linear partials, summed in FP32 in rank order, rounded once,
   sanitized: ``mnnvl_lamport_reduce_scatter``);
-- ``SpOproj`` "warp" (fused split-K mma.sync, pushes from the GEMM): within the
-  BF16 rounding of the partials of the FP64 reference (summation order differs);
+- ``SpOproj`` "warp" (fused split-K mma.sync, pushes from the GEMM) and "gemm" with
+  a cuBLASLt partial (the TP4 o_proj table's ``lt`` rows): within the BF16
+  rounding of the partials of the FP64 reference (summation order differs); "gemm"
+  with a cuBLAS partial (every R at TP2, where the TP4 table does not apply) is
+  stock's bit for bit;
 - the mailboxes are re-armed after every block (gather rows [0, R) and every recv
   slot hold the sentinel), across alternating parities and row counts, and in a
   captured AG -> o-projection -> AG -> o-projection graph replayed between eager
@@ -35,7 +38,8 @@ WIDTH = 7168
 CAP = 512
 SENTINEL = -0x80000000
 # Token rows (multiples of 4 and 2): both tactics' ranges, the R <= 64 / > 64 seam,
-# the warp tactic's largest rows and the deployment's largest graph.
+# the warp tactic's largest rows, a cuBLASLt row of the TP4 o_proj table (324) and
+# the deployment's largest graph.
 ROWS = (4, 8, 12, 64, 68, 128, 324, 512, 8)
 WARP_ROWS = (4, 8, 12, 64, 68, 128)
 GRAPH_ROWS, REPLAYS = 64, 3
@@ -108,7 +112,13 @@ def _check_armed(comm, parity, rows):
     assert bool((recv == SENTINEL).all()), ("recv not re-armed", parity, rows)
 
 
-def _step(comm, oproj, step, rank, world, rows, parity, out, weights, exact_only):
+def _stock_bits(tactic) -> bool:
+    """Whether an ``SpOproj.choice`` tactic computes its partial with stock's cuBLAS
+    GEMM (bit-exact shard); cuBLASLt may pick another kernel than ``F.linear``."""
+    return tactic in ("cublas", ("gemm", "cublas"))
+
+
+def _step(comm, oproj, step, rank, world, rows, parity, out, weights, bitwise):
     device = comm.device
     n = rows // world
     gathered = comm.all_gather(_shard(step, rank, n, device), parity)
@@ -120,7 +130,7 @@ def _step(comm, oproj, step, rank, world, rows, parity, out, weights, exact_only
     torch.accelerator.synchronize(device)
     _check_armed(comm, parity, rows)
     stock, exact, scale = _reference(step, world, rank, rows, device, weights)
-    if not exact_only:
+    if bitwise:
         assert bool((shard.view(torch.int16) == stock.view(torch.int16)).all()), (
             "cublas shard != stock", step, rows,
         )  # fmt: skip
@@ -170,10 +180,9 @@ def _worker(env: dict[str, str]) -> None:
             rows = WARP_ROWS if name == "warp" else ROWS
             oproj = sp.SpOproj(weights[rank], comm, sorted(set(rows)), ctx)
             for r in rows:
-                tactic = oproj.choice(r).tactic
                 _step(
                     comm, oproj, step, rank, world, r, step % 2, out, weights,
-                    exact_only=tactic == "warp",
+                    bitwise=_stock_bits(oproj.choice(r).tactic),
                 )  # fmt: skip
                 step += 1
         # A captured two-block step (parities 0, 1), replayed between eager steps.
@@ -215,7 +224,7 @@ def _worker(env: dict[str, str]) -> None:
                 assert error <= (2 * world + 1) * scale * 2**-8, ("graph", replay, p)
             _step(
                 comm, oproj, 2000 + replay, rank, world, 324, replay % 2, out,
-                weights, exact_only=False,
+                weights, bitwise=_stock_bits(oproj.choice(324).tactic),
             )  # fmt: skip
         dist.barrier()
     finally:
@@ -256,8 +265,8 @@ def _distributed_run(fn, world_size: int) -> None:
 def test_sp_comm_and_oproj_rs():
     """SpComm.all_gather and SpOproj (cublas, warp, default table) on 4 ranks when
     there are 4 GPUs (the C512 TP group), else 2: bitwise all-gather, stock-exact
-    cublas reduce-scatter, FP64-bounded warp tactic, re-arming across parities and
-    row counts (4..512), and a captured two-block step replayed."""
+    cublas reduce-scatter, FP64-bounded warp and cuBLASLt partials, re-arming across
+    parities and row counts (4..512), and a captured two-block step replayed."""
     pytest.importorskip("cutlass")
     world = 4 if torch.accelerator.device_count() >= 4 else 2
     _distributed_run(_worker, world_size=world)

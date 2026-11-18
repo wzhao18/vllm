@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The MegaMoE layer's dense BF16 GEMMs on the SP shard (C512 decode role,
+``runtime.sp_attention``): the stock ``KimiMoE.forward`` of the sequence-parallel
+BF16 MegaMoE layer, step for step, with its four dense GEMMs on ``gemm.sp_policy``'s
+measured tactics (``decode.DecodeProjection``) instead of the stock linears' cuBLAS
+call:
+
+  stock step                                       here
+  router gate + grouped top-k (main stream)        the stock ``_router``
+  routed latent down (aux stream, n <= 256)        latent_down  [3584, 7168]
+  MegaMoE experts (+ shared on the side stream)    the stock ``experts``
+  shared gate_up -> SiTU -> down                   shared_gu [12288, 7168] -> the stock
+                                                   act -> shared_down [7168, 6144]
+  latent RMSNorm, up with the shared beta-add      the stock norm -> latent_up
+                                                   (``residual.addmm_``, torch kinds)
+
+Same streams and events as stock, the same operands, FP32 accumulation and one BF16
+rounding per GEMM (the beta-add adds the BF16 shared output in FP32 before its one
+rounding, as stock's cuBLAS epilogue); only the GEMM kernels (and so their FP32
+summation order) differ. A layer this path cannot reproduce exactly (quantized or
+packed MoE linears, the online-MXFP8 inputs, a token-sharded or TP-sharded shared
+expert, a GEMM-RS/AR epilogue) raises ``Unsupported`` at build: never a stock
+fallback for a planned row."""
+
+import torch
+
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+from ..cutedsl.gemm.decode import DecodeProjection
+from ..cutedsl.gemm.sp_policy import sp_projection_tactics
+from ..shapes import Choice, Unsupported
+from .providers import bf16_weight
+
+# Stock: the routed down projection runs on the aux stream up to this many tokens
+# (``model._ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD``); read from the model module.
+FAMILIES = ("latent_down", "shared_gu", "shared_down", "latent_up")
+# On the MegaMoE side stream (``_shared_overlap``) these take ``sp_policy``'s
+# "<family>_side" table (torch kinds: what fits beside the capped MegaMoE grid).
+SHARED = ("shared_gu", "shared_down")
+
+
+def _stock_threshold():
+    from ...model import _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+
+    return _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+
+
+def sp_mlp_cause(mlp):
+    """Why ``mlp`` (a stock KimiMoE) is not the BF16 SP MegaMoE layer this path
+    reproduces, or None."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    if not getattr(mlp, "use_mega_moe", False) or getattr(mlp, "moe_token_shard", 0):
+        return "not MegaMoE on the SP shard"
+    if not getattr(mlp, "use_latent_moe", False):
+        return "no latent MoE projections"
+    if getattr(mlp, "_packed_moe", None) is not None:
+        return "packed MXFP8 MoE projections"
+    if mlp._shared_mxfp8_input():
+        return "online-MXFP8 layer input"
+    shared, transform = mlp.shared_experts, mlp.routed_output_transform
+    if shared is None or transform is None:
+        return "no shared expert / routed output transform"
+    if getattr(shared, "shard_sequence_parallel", True):
+        return "a TP-sharded shared expert"
+    if getattr(shared, "gemm_rs_ar", None) is not None:
+        return "a GEMM-RS/AR shared down projection"
+    if shared._act_mxfp8_ok() or transform._norm_mxfp8():
+        return "online-MXFP8 shared down / latent up input"
+    linears = (
+        mlp.routed_expert_down_proj, shared.gate_up_proj, shared.down_proj,
+        transform.up_proj,
+    )  # fmt: skip
+    for linear in linears:
+        if not isinstance(linear.quant_method, UnquantizedLinearMethod):
+            return f"quantized {type(linear.quant_method).__name__} linear"
+        if getattr(linear, "bias", None) is not None:
+            return "a linear with bias"
+    return None
+
+
+class SpMlp:
+    """One MegaMoE layer's MLP on this rank's shard (module docstring):
+    ``run(h [n, 7168])`` returns a new [n, 7168] BF16 tensor (stock
+    ``mlp(h)``, the dense GEMMs' summation order aside). ``rows``: every captured
+    shard row count n."""
+
+    def __init__(self, mlp, rows, ctx, index):
+        cause = sp_mlp_cause(mlp)
+        if cause is not None:
+            raise Unsupported("moe", None, f"layer {index}: {cause}")
+        self.mlp, self.rows = mlp, tuple(sorted(set(rows)))
+        shared, transform = mlp.shared_experts, mlp.routed_output_transform
+        try:
+            weights = {
+                "latent_down": bf16_weight(mlp.routed_expert_down_proj),
+                "shared_gu": bf16_weight(shared.gate_up_proj),
+                "shared_down": bf16_weight(shared.down_proj),
+                "latent_up": bf16_weight(transform.up_proj),
+            }
+        except ValueError as error:  # (re-raised with the layer)
+            raise Unsupported("moe", None, f"layer {index}: {error}") from error
+        self.gemms = {}
+        side = bool(mlp._shared_overlap)  # the shared expert beside MegaMoE
+        with torch.accelerator.device_index(weights["latent_down"].device.index):
+            for family, weight in weights.items():
+                n, k = weight.shape
+                table = f"{family}_side" if side and family in SHARED else family
+                tactics = sp_projection_tactics(table, n, k, self.rows, ctx)
+                self.gemms[family] = DecodeProjection(
+                    weight, self.rows, tactics, family=table
+                )
+        self.latent = weights["latent_down"].shape[0]
+        self.inter2 = weights["shared_gu"].shape[0]
+        self.hidden = weights["shared_down"].shape[0]
+        self.threshold = _stock_threshold()
+
+    def choices(self, n):
+        """The four GEMM families' choices at ``n`` shard rows."""
+        return {f: self.gemms[f].choice(n) for f in FAMILIES}
+
+    def _shared(self, h):
+        shared, gemms, n = self.mlp.shared_experts, self.gemms, h.shape[0]
+        gate_up = gemms["shared_gu"].run(h, h.new_empty((n, self.inter2)))
+        act = shared.act_fn(gate_up)
+        return gemms["shared_down"].run(act, h.new_empty((n, self.hidden)))
+
+    def run(self, h: torch.Tensor) -> torch.Tensor:
+        mlp, gemms = self.mlp, self.gemms
+        n = h.shape[0]
+        if n not in self.gemms["latent_down"].kinds or h.dim() != 2:
+            raise Unsupported("moe", n, f"shard {tuple(h.shape)} not prepared")
+
+        def down():
+            return gemms["latent_down"].run(h, h.new_empty((n, self.latent)))
+
+        (router_output, topk_ids), routed = maybe_execute_in_parallel(
+            lambda: mlp._router(h),
+            down,
+            mlp._down_proj_events[0],
+            mlp._down_proj_events[1],
+            mlp._down_proj_stream if n <= self.threshold else None,
+        )
+        if mlp._shared_overlap:
+            final, shared_out = maybe_execute_in_parallel(
+                lambda: mlp.experts(routed, router_output, topk_ids),
+                lambda: self._shared(h),
+                mlp._shared_events[0],
+                mlp._shared_events[1],
+                mlp._shared_stream,
+            )
+        else:
+            final = mlp.experts(routed, router_output, topk_ids)
+            shared_out = self._shared(h)
+        norm = mlp.routed_output_transform.norm
+        if norm is not None:
+            final = norm(final)
+        return gemms["latent_up"].run(final, residual=shared_out)
+
+
+def moe_choice(mlps, n):
+    """The ``moe_dense`` coverage note at ``n``: the first layer's four GEMM kinds."""
+    first = next(iter(mlps.values()))
+    choices = first.choices(n)
+    kinds = {
+        f: c.tactic[0] if isinstance(c.tactic, tuple) else c.note
+        for f, c in choices.items()
+    }
+    paths = {c.path for c in choices.values()}
+    path = min(paths, key=lambda p: p.value)  # "generic" before "tuned"
+    note = " ".join(f"{f}:{k}" for f, k in kinds.items())
+    return Choice(path, tuple(sorted(kinds.items())), note=note)

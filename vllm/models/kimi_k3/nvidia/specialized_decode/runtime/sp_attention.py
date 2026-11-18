@@ -15,18 +15,22 @@ KDA layer's all-gather .. reduce-scatter with one ``SpAttentionBlock``:
   core             ``SpDsaCore`` (DSA) / ``SpKdaCore`` (KDA)          dsa / kda
   o_proj + RS      ``SpOproj`` (4-rank reduce-scatter)                oproj_rs
 
+Each MegaMoE layer's MLP runs ``runtime.sp_mlp.SpMlp``: the stock layer's forward
+step for step, its four dense BF16 GEMMs (latent down / up, shared gate_up / down) on
+``gemm.sp_policy``'s measured tactics (family ``moe_dense``).
+
 Everything else is the stock module, called as the stock forward calls it
 (``Path.DECLARED``, ``shapes.DECLARED_STOCK``): the embedding, ``_pre_attn_norm`` /
-``_post_attn_norm`` (AttnRes) on the shard, the MegaMoE / dense MLP on the shard (with
-stock's ``sp_padding_mask``), the aux streams, the final AttnRes, the final
-``sp_all_gather`` and the norm. The verification (synthetic rejection), LM head,
-sampler and the preview (MLA) DSpark drafter stay stock too, except the drafter's MLA
-attention: ``runtime.draft`` FAST_DCP's TP4 entry runs it on cutedsl.draft.attention
-DraftDcp (publish-only MlaQuery, polled cores with length-keyed splits, DcpValue),
-strict; no other preview drafter table has a TP4 entry (SP_DRAFTER_TABLES, checked at
-build). The release (GQA) DSpark drafter is not a declared stock module: its own
-build (``runtime.draft.GqaDraftFastPath``) is strict here, every piece of every
-captured drafter batch specialized or the load refused.
+``_post_attn_norm`` (AttnRes) on the shard, the MegaMoE router / experts / norms and the
+dense MLP on the shard (with stock's ``sp_padding_mask``), the aux streams, the final
+AttnRes, the final ``sp_all_gather`` and the norm. The verification (synthetic
+rejection), LM head, sampler and the preview (MLA) DSpark drafter stay stock too, except
+the drafter's MLA attention: ``runtime.draft`` FAST_DCP's TP4 entry runs it on
+cutedsl.draft.attention DraftDcp (publish-only MlaQuery, polled cores with length-keyed
+splits, DcpValue), strict; no other preview drafter table has a TP4 entry
+(SP_DRAFTER_TABLES, checked at build). The release (GQA) DSpark drafter is not a
+declared stock module: its own build (``runtime.draft.GqaDraftFastPath``) is strict
+here, every piece of every captured drafter batch specialized or the load refused.
 
 R = 4 n for n = 1..128 requests per DP group (0.25..32 requests per GPU): every
 captured R is a multiple of TP4, so SP never pads. Every captured R is served by every
@@ -73,6 +77,7 @@ from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
+from .sp_mlp import SpMlp, moe_choice
 
 logger = init_logger(__name__)
 
@@ -308,6 +313,13 @@ class SpStep:
         }
         self.dense = any(not d.is_moe_layer for d in layers)
         self.moe = any(d.is_moe_layer for d in layers)
+        # The MegaMoE layers' dense BF16 GEMMs on this rank's shard rows (sp_mlp).
+        shards = tuple(sorted({r // ctx.tp for r in rows}))
+        self.mlps = {
+            d.layer_idx: SpMlp(d.mlp, shards, ctx, d.layer_idx)
+            for d in layers
+            if d.is_moe_layer
+        }
         self.table = self.plan_coverage()
         self.table.assert_complete(rows)
         if ctx.rank == 0:
@@ -358,7 +370,10 @@ class SpStep:
         if not self.gqa_drafter:
             declared["drafter"] = DRAFTER_NOTE
         if self.moe:
-            declared["moe"] = f"stock MegaMoE on the shard (EP{ctx.ep})"
+            declared["moe"] = (
+                f"stock MegaMoE router / experts / norms on the shard (EP{ctx.ep}); "
+                "its dense GEMMs: moe_dense"
+            )
         if self.dense:
             declared["dense"] = "stock dense MLP on the shard"
         if method == "synthetic":
@@ -372,11 +387,14 @@ class SpStep:
         TP4 or raises when the model builds it."""
         coverage = Coverage(self.q)
         declared = self.declared()
+        ctx = self.ctx
         for r in self.rows:
             choices = {"ag": self.comm.choice(r)}
             for block in self.blocks.values():
                 for family, choice in block.choices(r).items():
                     choices.setdefault(family, choice)
+            if self.mlps:
+                choices["moe_dense"] = moe_choice(self.mlps, r // ctx.tp)
             if "verify" not in declared:
                 choices["verify"] = Choice(Path.GENERIC, note="VerifyArgmax")
             coverage.specialize(r, choices)
@@ -465,7 +483,8 @@ class SpStep:
             hidden, prefix_sum, residual = layer._post_attn_norm(
                 hidden, residual, prefix_sum
             )
-            hidden = layer.mlp(hidden)
+            mlp = self.mlps.get(index)
+            hidden = layer.mlp(hidden) if mlp is None else mlp.run(hidden)
             if index + 1 in self.aux_layers:
                 aux.append(
                     backbone._capture_aux_hidden_stream(

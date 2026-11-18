@@ -5,9 +5,10 @@ MegaMoE, q4; ``runtime.sp_attention``): the startup of the real ``SpStep`` (and 
 ``SpecializedDecode`` under ``sequence_parallel``) over stand-in providers, for every
 captured R = 4..512 (n = 1..128 requests per DP group, 0.25..32 per GPU):
 
-* the coverage table: every R has the six specialized families (ag, dsa_in, dsa,
-  kda_in, kda, oproj_rs), every other family is a declared stock module, no R is
-  missing or stock, one log line per R;
+* the coverage table: every R has the seven specialized families (ag, dsa_in, dsa,
+  kda_in, kda, oproj_rs, moe_dense: the MegaMoE layers' dense GEMMs on the n = R / 4
+  shard rows), every other family is a declared stock module, no R is missing or
+  stock, one log line per R;
 * the collective build order (SpComm, the DSA DcpBox and scratch, RecoverSSM, then
   the blocks in layer order) and the mailbox parities (SP blocks by ordinal, DSA
   cores by DSA ordinal);
@@ -46,7 +47,7 @@ KDA_PITCH = 4 * HEADS * 128 + 128 + HEADS + 8  # [q | k | v | g | f_a | beta | p
 # A K3.1-like layer stack: a dense first layer, then MoE; KDA and DSA interleaved,
 # an odd count of SP blocks (the step's last and next step's first share a parity).
 KINDS = ("kda", "kda", "dsa", "kda", "dsa", "kda", "kda")
-SPECIALIZED = {"ag", "dsa_in", "dsa", "kda_in", "kda", "oproj_rs"}
+SPECIALIZED = {"ag", "dsa_in", "dsa", "kda_in", "kda", "oproj_rs", "moe_dense"}
 DECLARED = {"embed", "attn_res", "moe", "dense", "final_gather", "lm_head"}
 DECLARED |= {"sampler", "drafter", "verify"}
 
@@ -158,6 +159,20 @@ class Fakes:
                 self.comm = comm
                 fakes.events.add("SpOproj")
 
+        class Mlp:
+            def __init__(self, mlp, rows, ctx, index):
+                assert mlp.use_mega_moe and ctx.sequence_parallel
+                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                gaps = fakes.gaps.get("moe_dense", ())
+                self.parts = {}
+                for f in ("latent_down", "shared_gu", "shared_down", "latent_up"):
+                    self.parts[f] = Provider(rows, gaps)
+                    self.parts[f].family = f
+                fakes.events.add("SpMlp", index)
+
+            def choices(self, n):
+                return {f: p.choice(n) for f, p in self.parts.items()}
+
         def tactics(family, n, k, rows, ctx):
             assert ctx.sequence_parallel and ctx.tp == TP, ctx
             return dict.fromkeys(rows, ("cublas", None))
@@ -185,6 +200,7 @@ class Fakes:
             SpDsaCore=DsaCore,
             SpKdaCore=KdaCore,
             SpOproj=Oproj,
+            SpMlp=Mlp,
             sp_projection_tactics=tactics,
             sp_dsa_box=box,
             sp_dsa_scratch=scratch,
@@ -309,7 +325,8 @@ def runtime(layers=None, rows=ROWS, ctx=None, **backbone):
 
 def test_coverage_every_captured_row(fakes):
     """Every R = 4..512 specialized: the six SP families from the blocks and the
-    mailboxes, the rest declared stock modules; one log line per R."""
+    mailboxes, moe_dense from the SpMlps, the rest declared stock modules; one log
+    line per R."""
     fakes()
     step = sp_attention.SpStep(runtime())
     table = step.coverage()
@@ -358,8 +375,12 @@ def test_collective_build_order_and_parities(fakes):
     assert [e[1] for e in cores] == list(range(len(KINDS)))
     dsa = [e[2] for e in cores if e[0] == "SpDsaCore"]
     assert dsa == [i % 2 for i in range(len(dsa))]
-    # Per block: in-projection, core, o_proj (none built ahead of its layer).
-    per_block = [e[0] for e in events[4:]]
+    # Per block: in-projection, core, o_proj (none built ahead of its layer); then
+    # each MegaMoE layer's SpMlp (no collective) in layer order.
+    mlps = [e for e in events if e[0] == "SpMlp"]
+    assert mlps == [("SpMlp", i) for i in range(1, len(KINDS))]
+    assert names[-len(mlps) :] == ["SpMlp"] * len(mlps)
+    per_block = [e[0] for e in events[4:] if e[0] != "SpMlp"]
     expected = list(
         itertools.chain.from_iterable(
             ("DecodeProjection", "SpDsaCore" if k == "dsa" else "SpKdaCore", "SpOproj")
@@ -486,6 +507,15 @@ def test_a_provider_gap_raises_naming_the_row(fakes, family, gap):
     that R (never a stock R)."""
     fakes(gaps={family: (gap,)})
     with pytest.raises(shapes.Unsupported, match=rf"{family} at {gap}: not prepared"):
+        sp_attention.SpStep(runtime())
+
+
+@pytest.mark.parametrize("gap", [1, 81, 128])
+def test_an_mlp_gemm_gap_raises_naming_the_shard_row(fakes, gap):
+    """The MegaMoE layers' dense GEMMs serve the n = R / 4 shard rows: a shard row
+    they do not serve fails the startup coverage (never a stock MLP)."""
+    fakes(gaps={"moe_dense": (gap,)})
+    with pytest.raises(shapes.Unsupported, match=rf"latent_down at {gap}: not"):
         sp_attention.SpStep(runtime())
 
 

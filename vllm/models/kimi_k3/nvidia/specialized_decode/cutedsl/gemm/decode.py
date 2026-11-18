@@ -31,6 +31,7 @@ NQ-TUNE: no Rubin (SM107) TP4 numbers exist for any tactic here; the table above
 UP's GB300 TP8. Measure warp / split-K / cuBLAS per R at the C512 shapes
 (``sp_policy`` docstring) and fill ``sp_policy``'s TUNED tables."""
 
+import contextlib
 from typing import Any
 
 import torch
@@ -53,11 +54,35 @@ WARP_ROWS = 16  # warp split-K up to here
 SPLIT_K_ROWS = 64  # cluster split-K up to here; cuBLAS past it
 
 # ("warp", WarpSplitKTactic) | ("split_k", (M tile, N tile, split, stages[, Rubin
-# tensor-memory fields])) | ("cublas", None)
+# tensor-memory fields])) | ("cublas", None) | ("lt", None)
 ProjectionTactic = tuple[str, Any]
-KINDS = ("warp", "split_k", "cublas")
+# "cublas": torch.mm, the stock linear's GEMM; "lt": the same torch.mm with torch's
+# cuBLASLt preference (``blas_library``), whose heuristic picks another nvjet kernel at
+# some SP shapes (no split-K reduce launch there). Both sum K in FP32 and round once.
+KINDS = ("warp", "split_k", "cublas", "lt")
+# The torch matmul kinds (no compiled code; ``check_operands`` needs no alignment).
+TORCH_KINDS = ("cublas", "lt")
+
+
+@contextlib.contextmanager
+def blas_library(name):
+    """Torch's preferred BLAS library ``name`` around the block (None: unchanged),
+    restored after it; a graph capture records the kernel picked inside it."""
+    if name is None:
+        yield
+        return
+    previous = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library(name)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_blas_library(previous)
+
+
 # ``SplitKGemm``'s tiles (4-field tactics): weight rows per CTA, token columns per CTA
-SPLIT_M_TILES, SPLIT_N_TILES = (64, 128), (8, 16, 32, 64)
+# (80 / 96: one token tile for the SP MLP's 65-96 shard rows, ``sp_policy``; measured
+# on VR200, the same kernel and K order as the narrower tiles).
+SPLIT_M_TILES, SPLIT_N_TILES = (64, 128), (8, 16, 32, 64, 80, 96)
 
 
 def warp_tactic(m, n, k, sms, sm_bytes=_SM_SMEM_BYTES):
@@ -108,7 +133,8 @@ class DecodeProjection:
     """``out[R, N] = x[R, K] @ weight[N, K]^T`` for each prepared R with the tactic the
     caller names for it: warp split-K (R <= 32), the cluster split-K
     (``PreparedProjection``) or cuBLAS (``torch.mm``). ``family`` names the projection
-    in ``Unsupported`` messages. ``gather``: the AG-fused polled activation input
+    in ``Unsupported`` messages and keys ``choice``'s table (``sp_policy.FAMILIES``,
+    the side-stream kinds included). ``gather``: the AG-fused polled activation input
     (phase 1b, ``sp_comm.SpGatherSource``); not built in phase 1, so passing one
     raises."""
 
@@ -159,7 +185,8 @@ class DecodeProjection:
         # Compiled before capture; codes are shared by (N, K, tactic) across layers.
         self.warp = PreparedWarpSplitK(weight, warp) if warp else None
         self.split = PreparedProjection(weight, split).prepare() if split else None
-        prepared = {"warp": self.warp, "split_k": self.split, "cublas": self}
+        prepared = {"warp": self.warp, "split_k": self.split}
+        prepared |= dict.fromkeys(TORCH_KINDS, self)
         self.engines = {r: prepared[kind] for r, kind in self.kinds.items()}
 
     def _check(self, r, entry, n, k, cta_smem):
@@ -185,7 +212,7 @@ class DecodeProjection:
             if problem is not None:
                 raise Unsupported(self.family, r, problem)
         elif tactic is not None:
-            raise Unsupported(self.family, r, f"cuBLAS takes no tactic ({tactic!r})")
+            raise Unsupported(self.family, r, f"{kind} takes no tactic ({tactic!r})")
         return kind
 
     def check_operands(self, x: torch.Tensor, out: torch.Tensor) -> None:
@@ -209,25 +236,39 @@ class DecodeProjection:
         if rows not in self.kinds and rows < self.rows[-1]:
             problems.append(f"{rows} rows: neither prepared nor >= {self.rows[-1]}")
         kinds = set(self.kinds.values())
-        align = 32 if "warp" in kinds else 16 if "split_k" in kinds else 0
+        align = 32 if "warp" in kinds else 16 if "split_k" in kinds else 0  # torch: 0
         for name, t in (("x", x), ("out", out)):
             if align and t.data_ptr() % align:
                 problems.append(f"{name} at 0x{t.data_ptr():x}: {align} B aligned")
         if problems:
             raise Unsupported(self.family, None, "; ".join(problems))
 
-    def cublas(self, x, out):
-        return torch.mm(x, self.weight.t(), out=out)
+    def cublas(self, x, out, library=None, residual=None):
+        """Torch GEMM (``library`` "cublaslt": torch's cuBLASLt preference). With
+        ``residual``: the stock beta-add ``residual.addmm_(x, weight^T)`` (FP32
+        accumulation plus the BF16 residual in the epilogue, one rounding), in place."""
+        with blas_library(library):
+            if residual is not None:
+                return residual.addmm_(x, self.weight.t())
+            return torch.mm(x, self.weight.t(), out=out)
 
-    def run(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        """``out = x @ weight^T`` with R = ``x.shape[0]``'s prepared tactic."""
-        engine = self.engines.get(x.shape[0])
+    def run(
+        self, x: torch.Tensor, out: torch.Tensor | None = None, residual=None
+    ) -> torch.Tensor:
+        """``out = x @ weight^T`` with R = ``x.shape[0]``'s prepared tactic, or with
+        ``residual`` (torch kinds only): ``residual += x @ weight^T`` as stock's
+        beta-add GEMM, returning ``residual``."""
+        rows = x.shape[0]
+        engine = self.engines.get(rows)
         if engine is None:
-            raise Unsupported(
-                self.family, x.shape[0], f"not prepared ({self.prepared()})"
-            )
+            raise Unsupported(self.family, rows, f"not prepared ({self.prepared()})")
         if engine is self:
-            return self.cublas(x, out)
+            library = "cublaslt" if self.kinds[rows] == "lt" else None
+            return self.cublas(x, out, library, residual)
+        if residual is not None:
+            raise Unsupported(
+                self.family, rows, f"{self.kinds[rows]} has no residual epilogue"
+            )
         return engine.run(x, out)
 
     def prepared(self):
@@ -237,13 +278,20 @@ class DecodeProjection:
         return self.kinds[rows]
 
     def choice(self, rows: int) -> Choice:
-        """TUNED where ``sp_policy``'s measured table names this R's tactic, GENERIC
-        otherwise (every kind, cuBLAS included, is a specialized-path decision)."""
+        """TUNED where ``sp_policy``'s measured table of ``family`` names exactly this
+        R's tactic, GENERIC otherwise (every kind, cuBLAS included, is a
+        specialized-path decision)."""
         from .sp_policy import measured
 
         if rows not in self.kinds:
             raise Unsupported(self.family, rows, f"not prepared ({self.prepared()})")
         kind, tactic = self.tactics[rows]
         n, k = self.weight.shape
-        path = Path.TUNED if measured(n, k, rows, (kind, tactic)) else Path.GENERIC
+        sms = sm_bytes = None
+        if kind == "warp":  # (the measured warp tactic is derived for the device)
+            device = self.weight.device
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            sm_bytes = smem_limits(device.index).sm
+        tuned = measured(self.family, n, k, rows, (kind, tactic), sms, sm_bytes)
+        path = Path.TUNED if tuned else Path.GENERIC
         return Choice(path, tactic=(kind, tactic), note=f"{kind} {n}x{k}")
