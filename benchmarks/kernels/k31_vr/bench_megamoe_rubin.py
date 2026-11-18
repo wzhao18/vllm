@@ -150,6 +150,12 @@ def parse_args():
         help="knob JSON path, inline JSON (v2 file / record / bare knob dict); "
         "default: the backend's shipped knobs/k31_vr.json",
     )
+    p.add_argument(
+        "--num-experts",
+        type=int,
+        default=896,
+        help="global experts (EP-size emulation: 224 on EP4 = 56 experts/rank like EP16)",
+    )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int32")
     p.add_argument("--warmup", type=int, default=10)
@@ -448,6 +454,7 @@ def main():
 
     problem = RubinMoeProblem(
         quant_kind=args.quant_kind,
+        num_experts=args.num_experts,
         input_norm_const=args.input_norm_const,
         fc1_norm_const=args.fc1_norm_const,
     )
