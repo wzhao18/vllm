@@ -152,6 +152,71 @@ __device__ __forceinline__ float situ_activation(float g, float u, float beta,
   const float up_out = clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
   return gate_out * up_out;
 }
+// Vectors (8 columns) per thread per trip: their loads are all issued before
+// any is used, so each SM keeps enough bytes in flight to stream HBM.
+constexpr int ACT_QUANT_UNROLL = 4;
+
+template <int MODE>
+__device__ __forceinline__ void act_load(const uint16_t* __restrict__ x,
+                                         const uint16_t* __restrict__ g,
+                                         int64_t row, int col, int d,
+                                         int64_t x_stride, int64_t g_stride,
+                                         uint4& a, uint4& b) {
+  if (MODE == 0) {
+    a = __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
+  } else if (MODE == 1 || MODE == 2) {
+    const uint16_t* gp = x + row * x_stride + col;
+    a = __ldg(reinterpret_cast<const uint4*>(gp));
+    b = __ldg(reinterpret_cast<const uint4*>(gp + d));
+  } else {
+    a = __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
+    b = __ldg(reinterpret_cast<const uint4*>(g + row * g_stride + col));
+  }
+}
+
+template <int MODE>
+__device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
+                                            float (&out)[8], float beta,
+                                            float linear_beta, bool clamp_up,
+                                            float inv_beta,
+                                            float inv_linear_beta) {
+  if (MODE == 0) {
+    const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&a);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
+  } else if (MODE == 1 || MODE == 2) {
+    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
+    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float gv = bf16_bits_to_float(g16[i]);
+      const float uv = bf16_bits_to_float(u16[i]);
+      float r;
+      if (MODE == 1) {
+        r = situ_activation(gv, uv, beta, linear_beta, clamp_up, inv_beta,
+                            inv_linear_beta);
+      } else {
+        // csrc act_and_mul_kernel: (T)silu(x) * y, both rounded to T.
+        const float s =
+            bf16_bits_to_float(float_to_bf16_bits(gv / (1.0f + expf(-gv))));
+        r = s * uv;
+      }
+      out[i] = bf16_bits_to_float(float_to_bf16_bits(r));
+    }
+  } else {
+    // mla._gate_sigmoid_mul is torch.compiled: one FP32 expression
+    // a * sigmoid(g), rounded to BF16 once.
+    const uint16_t* a16 = reinterpret_cast<const uint16_t*>(&a);
+    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&b);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float gv = bf16_bits_to_float(g16[i]);
+      const float s = 1.0f / (1.0f + expf(-gv));
+      out[i] = bf16_bits_to_float(
+          float_to_bf16_bits(bf16_bits_to_float(a16[i]) * s));
+    }
+  }
+}
 
 // mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 2 silu-and-mul,
 //       3 x * sigmoid(g)  (two inputs, both [rows, d])
@@ -171,72 +236,46 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   const float inv_beta = MODE == 1 ? 1.0f / beta : 0.f;
   const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
   // Every lane runs the same trip count (total is a multiple of 4 vectors,
-  // blockDim a multiple of 32), so the block-amax shuffles are uniform.
+  // blockDim a multiple of 32), so the block-amax shuffles are uniform; the
+  // 4 lanes of an MXFP8 block hold consecutive vectors in every sub-trip.
   const int64_t stride = (int64_t)gridDim.x * blockDim.x;
-  const int64_t total_round = (total + stride - 1) / stride * stride;
-  for (int64_t v = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-       v < total_round; v += stride) {
-    const bool live = v < total;
-    const int64_t row = live ? v / vecs_per_row : 0;
-    const int col = live ? (int)(v - row * vecs_per_row) * 8 : 0;
-    const bool real = live && row < rows;
-    float out[8];
-    if (real) {
-      if (MODE == 0) {
-        const uint4 raw =
-            __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-        const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw);
+  const int64_t trip = stride * ACT_QUANT_UNROLL;
+  const int64_t total_round = (total + trip - 1) / trip * trip;
+  for (int64_t v0 = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+       v0 < total_round; v0 += trip) {
+    uint4 a[ACT_QUANT_UNROLL], b[ACT_QUANT_UNROLL];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
-      } else if (MODE == 1 || MODE == 2) {
-        const uint16_t* gp = x + row * x_stride + col;
-        const uint4 graw = __ldg(reinterpret_cast<const uint4*>(gp));
-        const uint4 uraw = __ldg(reinterpret_cast<const uint4*>(gp + d));
-        const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&graw);
-        const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&uraw);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float gv = bf16_bits_to_float(g16[i]);
-          const float uv = bf16_bits_to_float(u16[i]);
-          float r;
-          if (MODE == 1) {
-            r = situ_activation(gv, uv, beta, linear_beta, clamp_up, inv_beta,
-                                inv_linear_beta);
-          } else {
-            // csrc act_and_mul_kernel: (T)silu(x) * y, both rounded to T.
-            const float s =
-                bf16_bits_to_float(float_to_bf16_bits(gv / (1.0f + expf(-gv))));
-            r = s * uv;
-          }
-          out[i] = bf16_bits_to_float(float_to_bf16_bits(r));
-        }
-      } else {
-        // mla._gate_sigmoid_mul is torch.compiled: one FP32 expression
-        // a * sigmoid(g), rounded to BF16 once.
-        const uint4 araw =
-            __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-        const uint4 graw =
-            __ldg(reinterpret_cast<const uint4*>(g + row * g_stride + col));
-        const uint16_t* a16 = reinterpret_cast<const uint16_t*>(&araw);
-        const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&graw);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float gv = bf16_bits_to_float(g16[i]);
-          const float s = 1.0f / (1.0f + expf(-gv));
-          out[i] = bf16_bits_to_float(
-              float_to_bf16_bits(bf16_bits_to_float(a16[i]) * s));
-        }
+    for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
+      const int64_t v = v0 + u * stride;
+      const bool live = v < total;
+      const int64_t row = live ? v / vecs_per_row : 0;
+      const int col = live ? (int)(v - row * vecs_per_row) * 8 : 0;
+      if (live && row < rows) {
+        act_load<MODE>(x, g, row, col, d, x_stride, g_stride, a[u], b[u]);
       }
-    } else {
-#pragma unroll
-      for (int i = 0; i < 8; ++i) out[i] = 0.f;
     }
-    // Every lane quantizes (uniform shuffles); only real rows store data.
-    quant8_store(out, q + row * q_stride + col, sf, row, col / 8, sf_col_base,
-                 padded_cols, real);
-    // Padding rows (rows <= row < rows_pad) get zero scales.
-    if (live && !real && (threadIdx.x & 3) == 0) {
-      sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+#pragma unroll
+    for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
+      const int64_t v = v0 + u * stride;
+      const bool live = v < total;
+      const int64_t row = live ? v / vecs_per_row : 0;
+      const int col = live ? (int)(v - row * vecs_per_row) * 8 : 0;
+      const bool real = live && row < rows;
+      float out[8];
+      if (real) {
+        act_compute<MODE>(a[u], b[u], out, beta, linear_beta, clamp_up,
+                          inv_beta, inv_linear_beta);
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) out[i] = 0.f;
+      }
+      // Every lane quantizes (uniform shuffles); only real rows store data.
+      quant8_store(out, q + row * q_stride + col, sf, row, col / 8,
+                   sf_col_base, padded_cols, real);
+      // Padding rows (rows <= row < rows_pad) get zero scales.
+      if (live && !real && (threadIdx.x & 3) == 0) {
+        sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+      }
     }
   }
 }
@@ -339,7 +378,8 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
   if (rows == 0) return;
   const int threads = 256;
   const int64_t total = rows_pad * (d / 8);
-  const int blocks = (int)std::min<int64_t>((total + threads - 1) / threads, 2048);
+  const int64_t per_block = (int64_t)threads * ACT_QUANT_UNROLL;
+  const int blocks = (int)std::min<int64_t>((total + per_block - 1) / per_block, 2048);
   auto stream = c10::cuda::getCurrentCUDAStream();
 #define LAUNCH(M)                                                              \
   act_quant_kernel<M><<<blocks, threads, 0, stream>>>(                         \

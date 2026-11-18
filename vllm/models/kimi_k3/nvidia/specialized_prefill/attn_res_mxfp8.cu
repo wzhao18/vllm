@@ -24,8 +24,9 @@
 // native kernel.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -1069,8 +1070,10 @@ void attn_res_mxfp8(torch::Tensor prefix, std::optional<torch::Tensor> delta,
                     double output_norm_eps) {
   int const num_tokens = static_cast<int>(prefix.size(0));
   c10::cuda::CUDAGuard const device_guard(prefix.device());
-  cudaDeviceProp const* properties = at::cuda::getCurrentDeviceProperties();
-  TORCH_CHECK(properties->major == 10,
+  int cc_major = 0, num_sms = 0;
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, prefix.get_device()));
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, prefix.get_device()));
+  TORCH_CHECK(cc_major == 10,
               "Kimi K3 AttnRes requires the SM100 family");
   int64_t const hidden_size = prefix.size(1);
   TORCH_CHECK(hidden_size == 7168, "AttnRes requires hidden_size=7168");
@@ -1098,7 +1101,7 @@ void attn_res_mxfp8(torch::Tensor prefix, std::optional<torch::Tensor> delta,
   int64_t const pad_rows = ((num_tokens + 127) / 128) * 128 - num_tokens;
 
   using namespace k31pf_sm100::fwd_prod_v2;
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   if (pad_rows > 0) {
     // Scale bytes of rows >= num_tokens inside the last 128-row tile.
     sf.view({-1}).narrow(0, (num_tokens / 128) * 128 * sf_padded_cols,
@@ -1121,7 +1124,7 @@ void attn_res_mxfp8(torch::Tensor prefix, std::optional<torch::Tensor> delta,
           static_cast<bf16_t const*>(norm_weight.data_ptr()),
           WRITE_BF16 ? static_cast<bf16_t*>(output->data_ptr()) : nullptr,
           num_tokens, static_cast<float>(eps),
-          properties->multiProcessorCount, stream,
+          num_sms, stream,
           static_cast<bf16_t const*>(output_norm_weight.data_ptr()),
           static_cast<float>(output_norm_eps),
           static_cast<int>(blocks.stride(0)),
