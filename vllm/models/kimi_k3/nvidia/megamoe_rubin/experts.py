@@ -487,9 +487,12 @@ class KimiK3MegaMoEExperts(nn.Module):
             self.w2_weight_scale.data.view(torch.uint8),
         )
 
-    def reserve_sms_for_shared_expert(self) -> None:
-        """Cap this layer's persistent grid at :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`
-        so a shared expert the caller runs on another stream gets the remaining SMs.
+    def reserve_sms_for_shared_expert(
+        self, max_sm_count: int = RUBIN_SHARED_OVERLAP_MAX_SMS
+    ) -> None:
+        """Cap this layer's persistent grid at ``max_sm_count`` (default
+        :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`, the decode SP measurement) so a shared
+        expert the caller runs on another stream gets the remaining SMs.
         Every layer of the EP group must make the same call (the bucket keys the
         shared runtime); it must come before the runtime is built."""
         if self.kernel_weights is not None:
@@ -524,9 +527,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
-                max_sm_count=(
-                    RUBIN_SHARED_OVERLAP_MAX_SMS if die_mask is None else None
-                ),
+                max_sm_count=max_sm_count if die_mask is None else None,
                 die_sm_mask32=die_mask,
             )
             for bucket in self.buckets
@@ -710,6 +711,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         topk_ids: torch.Tensor,
         shared_experts: nn.Module | None = None,
         is_padding: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        ep_tokens: int | None = None,
     ) -> torch.Tensor:
         """Run the routed experts (and an unfused ``shared_experts``) on this rank's
         tokens; arguments and result as :meth:`DeepGemmMegaMoEExperts.forward`.
@@ -718,6 +721,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         or the forward context's under ``VLLM_MOE_SKIP_PADDING``) are masked to -1.
         Every EP rank must call each layer the same number of times (the kernel
         synchronizes the group), as with DeepGEMM MegaMoE.
+        ``out``: optional output rows; ``ep_tokens``: EP-uniform live tokens per
+        rank of this launch (default: from the forward's DP batch sizes), set by
+        callers that split a batch into several launches.
         """
         weights = self.kernel_weights
         if weights is None:
@@ -769,9 +775,10 @@ class KimiK3MegaMoEExperts(nn.Module):
             topk_weights,
             weights,
             bucket=bucket,
+            out=out,
             is_padding=is_padding,
             owner=self.prefix,
-            ep_tokens=self.ep_tokens(num_tokens),
+            ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)
