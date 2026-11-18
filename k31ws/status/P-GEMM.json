@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-GEMM workflow agent",
  "state": "implementing",
- "updated": "2026-11-18T14:35-08:00",
+ "updated": "2026-11-18T13:50-08:00",
  "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, TP1 M=16384 (and F8K M=8192), NVFP4 ckpt",
  "baseline_ms": 346,
  "current_ms": 346,
@@ -30,11 +30,13 @@
   "epilogue fusion (MXFP8 quant in producer epilogues)"
  ],
  "plan": [
-  "1. 1-GPU microbench of all my GEMMs at M=16384/8192, every backend (cuBLASLt, FlashInfer cute-dsl/cutlass/cudnn), vs model achievable; kernel names to identify 1x-K vs 2x-K tactics",
-  "2. Fuse MXFP8 activation quant into AttnRes (KDA in_proj input, MoE input for shared gate_up) - removes ~161 quant passes/step",
-  "3. Per-shape MXFP8 dispatch at M>=4096 (best backend per [N,K]); if none reaches 1.1x, a CuTe DSL 2-CTA 2x-K persistent GEMM for the KDA in_proj",
-  "4. Router GEMM + top-k fusion / tile choice; latent norm fusion",
-  "5. Step A/B with INFRA step_p.sh (P3-16 DEP4 slice, NVFP4 view from EN)"
+  "SOL DESIGN (per 93-layer DEP16 F16K step, model achievable 268.3 ms; bound resources): (A) tensor-bound GEMMs stay on cuBLASLt nvjet sm_107 2-CTA tactics, already 0.94-1.08x (measured), except router N=896 (wave quantization), f_b_proj K=128 (HBM write bound) and w_uk bmm (P-MLA fuses q-quant into it). (B) every HBM-bound glue pass the model prices as fused must disappear: zero standalone MXFP8 quant, zero standalone SiTU pass, router top-k in the router GEMM epilogue, latent RMSNorm in a neighbour. Projected after A+B: ~272 ms (1.01x).",
+  "B1 (done, test pending): AttnRes writes the KDA in_proj / shared gate_up MXFP8 input from its RMSNorm epilogue (specialized_prefill/attn_res_mxfp8): -161 quant passes (~6.4 ms) and -69 BF16 writes (~1.2 ms)",
+  "B2: AttnRes kernel itself to <=1.1x its byte floor (now 1.31-1.37x): deeper cp.async.bulk ring (CHUNK_DEPTH 3-4 with the oversized smem mode), more rows in flight per SM; projected -5 ms",
+  "B3 (largest): shared gate_up GEMM with SiTU + MXFP8 quant epilogue on the FlashInfer sm107 CuTe DSL persistent block-scaled kernel (dual-B TMA: gate rows j and up rows 6144+j in one 256-wide B tile; epilogue rounds to BF16 as cuBLAS, SiTU in FP32, BF16 round, UE8M0 quant); tune its tile/cluster to cuBLASLt speed (now 1.14x default). Removes the 403 MB BF16 write + the MUFU-bound 133 us SiTU+quant pass per layer: projected -11 ms",
+  "B4: router top-k into the router GEMM epilogue (896 FP32 logits/row fit in the epilogue warps) or a router GEMM with N tile = 896/4 to kill wave quantization; latent RMSNorm into the latent_up input path; projected -2 to -3 ms",
+  "A1: f_b_proj (K=128) fused into its consumer (KDA gate prep, with P-KDA) or a write-bound tile; dense down tactic; projected -1.5 ms",
+  "Validate each with the bitwise unit test + 1-GPU bench, then INFRA step_p NVFP4 A/B (EN view)"
  ],
  "work": [
   {
@@ -48,12 +50,12 @@
    "result": "queued (runs/P-GEMM/a1, overlay p-gemm-81c2be3c-1 for kernel test+bench)"
   },
   {
-   "t": "14:30",
+   "t": "13:30",
    "what": "per-shape GEMM table, every backend, M=16384/8192 (runs/P-GEMM/a2/gemm.json)",
    "result": "all MXFP8 GEMMs 1.00-1.08x model on cuBLASLt nvjet 2-CTA block-scaled tactics; BF16 0.94-1.07x except router 1.27, w_uk 1.52, f_b_proj 1.54, dense down 1.25; GEMM sum 248.9 vs 240.8 ms model (1.03x). Quant: FI 40 us, mxfp8_act 81 us per 16384x7168"
   },
   {
-   "t": "14:30",
+   "t": "13:30",
    "what": "mxfp8_act act_quant_kernel: 4 vectors in flight per thread (same per-vector math); attn_res_mxfp8 build fix (no ATen CUDAContext: cusparse.h missing in image)",
    "result": "test + bench queued (runs/P-GEMM/a4, overlay p-gemm-539e95c4-2)"
   }

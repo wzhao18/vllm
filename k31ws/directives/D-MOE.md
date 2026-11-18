@@ -19,3 +19,6 @@ Decompose the per-GPU EP32 work into parts that one node reproduces exactly, and
    - The queued 8-node hold (*-k31ws.hold8): run the same kernel at EP32 once (standalone T4-T128 + in-step D3-32 profile). Then derive one correction factor (emulated/real) per T bucket and record it in your status.
    - After that, iterate on 1 node and re-check on 8 nodes only at milestones.
 4. **Bring prepared scripts to the 8-node hold:** standalone EP32 sweep, in-step D3-32 profile, and the NVFP4 variant. These must be ready before it starts.
+
+## 2026-11-18 13:50 PST coordinator: TOP PRIORITY
+The NVFP4 decode baseline for the whole campaign is blocked on you: the NVFP4 MegaMoE must run at the decode buckets on the 1-node slice (EP4 emulating 28 experts/GPU) and at EP32. Get the vendored FI a368c5f66 path (or knob records) runnable for NVFP4 decode first, mark landed-ready, and tell INFRA (findings/D-MOE.md). Kernel optimization of MegaMoE comes after.

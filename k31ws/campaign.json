@@ -2,9 +2,9 @@
  "goal": "Close the gap between the implemented kernels and the perf model's achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.",
  "steps": {
   "Prefill DEP16 NVFP4 (tok/s/GPU)": {
-   "now": "not measured yet",
+   "now": "1-node slice: 211 ms / 165 ach (1.28x)",
    "ach": "30.7K",
-   "note": "F16K, L78K; NVFP4 baseline run pending (INFRA)"
+   "note": "first NVFP4 smoke (L24 view, F16K L78K, not profiled); F8K 108 ms. Profiled baseline pending"
   },
   "Decode r8 NVFP4 (tok/s/GPU)": {
    "now": "not measured yet",
@@ -93,6 +93,26 @@
   {
    "t": "11-18 14:15",
    "text": "Rule (user): baseline and target are the NVFP4 checkpoint only; MXFP4 numbers are removed from the tracker. Gap closed is shown only for workstreams whose baseline, current and achievable are all NVFP4-basis (ckpt=nvfp4). NVFP4 in-step baselines (decode slice r8/16/24, DEP16 slice) are INFRA's top priority."
+  },
+  {
+   "t": "11-18 14:00",
+   "text": "First NVFP4 number: 1-node DEP16 slice (L24 view) F16K forward 211.3 ms vs NVFP4 model 165 ms (1.28x); 23 MegaMoE NVFP4 + 82 MXFP8 linears confirmed in the log. Profiled per-family baseline next."
+  },
+  {
+   "t": "11-18 14:05",
+   "text": "P-MOE: prefill MegaMoE at the EP4 emulation is NOT link-bound (all-local routing only 1% faster); the FC1/FC2 epilogue (TMEM load, SiTU, NVFP4 requant, one epilogue warp per sub-partition) bounds it, tensor pipe ~26% active. SOL redesign target: epilogue throughput."
+  },
+  {
+   "t": "11-18 14:30",
+   "text": "P-GEMM: prefill GEMMs themselves are 0.94-1.07x model (router, w_uk bmm, f_b_proj, dense down are 1.25-1.54x); the family excess is glue: MXFP8 activation-quant producers run at 3.2x their HBM floor (one 16 B load in flight per thread)."
+  },
+  {
+   "t": "11-18 13:27",
+   "text": "P-IDX: stock prefill indexer 2.22 ms/layer (logits 1.56 + top-k 0.65); the model prices the logits epilogue as FP32 SIMT but stock is packed BF16, so the model over-prices it (model fix)."
+  },
+  {
+   "t": "11-18",
+   "text": "D-MOE: decode MegaMoE NVFP4 at the EP32 per-GPU shape streams weights at 85-90% of die-local HBM; the overhead is fixed: router/stage front ~3 us, CTA-end imbalance ~4 us, tail barrier ~1.2 us, separate reduce ~3 us per layer."
   }
  ]
 }

@@ -1,0 +1,21 @@
+{
+ "id": "FAST",
+ "title": "Iteration speed: GPU queue wait, step-bench startup, cold compiles",
+ "side": "infra",
+ "owner": "FAST workflow agent",
+ "state": "analysis",
+ "updated": "2026-11-18T13:55-08:00",
+ "ckpt": "pending",
+ "basis": "-",
+ "shape": "-",
+ "gap_analysis": "Warm 1-node step bench = ~4 min wall, of which ~40 s is measurement (engine start 30 s, dummy load 23 s, KV profile ~70 s, warmup ~70 s). The dominant delay is the GPU queue: 14 agents share 3 running 1-node holds; 1-GPU jobs wait 10-40 min, 4-GPU jobs 20-30 min.",
+ "plan": [
+  "queue-wait analysis + fair packing in wsgpu.sh",
+  "cut step-bench startup to <90 s",
+  "persistent bench service / engine-free family microbench",
+  "shared content-addressed compile caches",
+  "extend pool to Hecate when login returns"
+ ],
+ "work": [],
+ "next": "queue-wait analysis"
+}

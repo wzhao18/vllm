@@ -6,23 +6,7 @@
    "name": "coreai_cserve_dev-k31ws.hold8",
    "state": "PENDING",
    "nodes": "8",
-   "start": "2026-11-19T02:45:00",
-   "left": "8:00:00"
-  },
-  {
-   "job": "72635",
-   "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "PENDING",
-   "nodes": "1",
-   "start": "2026-11-18T14:23:00",
-   "left": "8:00:00"
-  },
-  {
-   "job": "72662",
-   "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "PENDING",
-   "nodes": "1",
-   "start": "2026-11-18T14:25:00",
+   "start": "2026-11-19T03:21:00",
    "left": "8:00:00"
   },
   {
@@ -38,7 +22,7 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T14:25:00",
+   "start": "2026-11-18T15:07:00",
    "left": "8:00:00"
   },
   {
@@ -46,7 +30,7 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T14:28:00",
+   "start": "2026-11-18T15:10:00",
    "left": "8:00:00"
   },
   {
@@ -54,7 +38,7 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T15:11:00",
+   "start": "2026-11-18T18:15:00",
    "left": "8:00:00"
   },
   {
@@ -62,7 +46,7 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T16:26:00",
+   "start": "2026-11-18T18:49:00",
    "left": "8:00:00"
   },
   {
@@ -70,16 +54,40 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T16:45:00",
+   "start": "2026-11-18T19:06:00",
    "left": "8:00:00"
   },
   {
-   "job": "72601",
+   "job": "73313",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "PENDING",
+   "nodes": "1",
+   "start": "2026-11-18T19:06:00",
+   "left": "8:00:00"
+  },
+  {
+   "job": "73334",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "PENDING",
+   "nodes": "1",
+   "start": "2026-11-18T20:35:00",
+   "left": "8:00:00"
+  },
+  {
+   "job": "72635",
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "RUNNING",
    "nodes": "1",
-   "start": "2026-11-18T12:59:37",
-   "left": "1:30:42"
+   "start": "2026-11-18T13:36:25",
+   "left": "1:59:31"
+  },
+  {
+   "job": "72662",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "RUNNING",
+   "nodes": "1",
+   "start": "2026-11-18T13:37:58",
+   "left": "3:39:04"
   },
   {
    "job": "72521",
@@ -87,7 +95,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T12:54:56",
-   "left": "1:49:01"
+   "left": "1:32:02"
   }
  ]
 }
