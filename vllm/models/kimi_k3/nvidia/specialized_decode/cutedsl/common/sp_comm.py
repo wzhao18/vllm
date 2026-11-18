@@ -453,3 +453,112 @@ class SpComm:
         s = stream(self.device)
         code(to_cute(source), recv, peers, to_cute(out_shard), gather, self._rank, s)
         return out_shard
+
+
+class SpGatherCopy:
+    """The step's final row all-gather (stock ``sp_all_gather`` of the packed
+    [hidden | aux...] shard rows, width W): multicast-store this rank's n rows
+    (sanitized words) into rows [rank n, (rank + 1) n) of every rank's box [cap, W],
+    then poll every chunk of rows [0, TP n), copy it into ``out`` [TP n, W] and re-arm
+    it. One kernel; its CTAs poll stores of every rank's grid: at most one CTA per SM
+    (co-resident). Args: x [n, W], the local box view, its multicast address, out,
+    rank."""
+
+    def __init__(self, tp, grid):
+        self.tp, self.grid = tp, grid
+
+    @cute.jit
+    def __call__(self, *args):
+        launch(self.kernel, args, self.grid, THREADS)
+
+    @cute.kernel
+    def kernel(self, args):
+        x, box, mc, out, rank = args
+        n: cutlass.Constexpr = x.shape[0]
+        width: cutlass.Constexpr = x.shape[1]
+        per: cutlass.Constexpr = width // 8
+        total: cutlass.Constexpr = self.grid * THREADS
+        R: cutlass.Constexpr = self.tp * n
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        g = cta * THREADS + tid
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        for c in range(g, n * per, total):
+            row, column = c // per, c % per * 8
+            words = sanitized(load_vector(at(x, row, column)))
+            offset = Int64(rank * n + row) * width + column
+            multicast_words(mc + offset * 2, words)
+        for c in range(g, R * per, total):
+            row, column = c // per, c % per * 8
+            words = poll_chunk(at(box, row, column))
+            store_words(at(out, row, column), words)
+            rearm(at(box, row, column))
+
+
+@cache
+def compile_gather_copy(n, tp, cap, width, grid, device):
+    with torch.accelerator.device_index(device):
+        x, box, out = fake((n, width)), fake((cap, width)), fake((tp * n, width))
+        kernel = SpGatherCopy(tp, grid)
+        compiled = cute.compile(
+            kernel, x, box, Int64(0), out, Int32(0), make_fake_stream()
+        )
+        what = f"Kimi K3 SP final gather ({tp} x {n} rows x {width})"
+        check_residency(compiled, device, grid, THREADS, what)
+    return compiled
+
+
+class SpFinalGather:
+    """The final all-gather's multicast box [rows_cap, width] (Lamport-armed; the
+    kernel re-arms what it reads). Collective to build."""
+
+    def __init__(self, group, device, tp, rank, *, width, rows_cap):
+        if rows_cap % tp or width % 8:
+            raise Unsupported(
+                "final_gather", None, f"rows_cap {rows_cap} / width {width} TP{tp}"
+            )
+        self.device, self.tp, self.rank = torch.device(device), tp, rank
+        self.width, self.rows_cap = width, rows_cap
+        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.box = symm_mem.empty(
+            (rows_cap, width), dtype=torch.bfloat16, device=self.device
+        )
+        _, self.mc = multicast_rendezvous(self.box, group, "Kimi K3 SP final gather")
+        if not self.mc:
+            raise Unsupported("final_gather", None, "no NVLink multicast")
+        self.box.view(torch.int32).fill_(SENTINEL)
+        torch.accelerator.synchronize(self.device)
+        torch.distributed.barrier(group=group)
+        self._box, self._rank = to_cute(self.box), Int32(rank)
+
+    def grid(self, rows):
+        chunks = rows * self.width // 8
+        return max(1, min(self.sms, -(-chunks // (THREADS * 8))))
+
+    def prepare(self, rows):
+        n = rows // self.tp
+        return compile_gather_copy(
+            n, self.tp, self.rows_cap, self.width, self.grid(rows), self.device.index
+        )
+
+    def run(self, x_shard: torch.Tensor) -> torch.Tensor:
+        n = x_shard.shape[0]
+        rows = n * self.tp
+        if (
+            x_shard.shape[1] != self.width
+            or not x_shard.is_contiguous()
+            or x_shard.dtype != torch.bfloat16
+            or rows > self.rows_cap
+        ):
+            raise Unsupported(
+                "final_gather", rows, f"x_shard {tuple(x_shard.shape)} (width "
+                f"{self.width}, cap {self.rows_cap})",
+            )  # fmt: skip
+        out = x_shard.new_empty((rows, self.width))
+        code = self.prepare(rows)
+        code(
+            to_cute(x_shard), self._box, Int64(self.mc), to_cute(out), self._rank,
+            stream(self.device),
+        )  # fmt: skip
+        return out

@@ -60,16 +60,12 @@ from vllm import envs
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
+from vllm.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 
 from ...dense_draft import is_gqa_dspark
 from ...ops.attn_res import attn_res
 from ..cutedsl.attn_res.sp_fused import SpBoundary
-from ..cutedsl.common.sp_comm import SpComm
+from ..cutedsl.common.sp_comm import SpComm, SpFinalGather
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
@@ -345,6 +341,12 @@ class SpStep:
         self.buffers: dict[str, torch.Tensor] = {}
         owner = runtime.group, self.device, ctx.tp, ctx.rank
         self.comm = SpComm(*owner, width=WIDTH, rows_cap=rows[-1])
+        # [hidden | aux...] rows of the final all-gather (every aux layer is this
+        # rank's: no pipeline stages on the SP path).
+        packed = WIDTH * (1 + len(self.aux_layers))
+        self.final_gather = SpFinalGather(*owner, width=packed, rows_cap=rows[-1])
+        for r in rows:
+            self.final_gather.prepare(r)
         kinds = {attention_kind(d.self_attn) for d in layers}
         self.dsa_box = self.dsa_scratch = None
         self.dsa_layers = 0
@@ -421,7 +423,6 @@ class SpStep:
         declared = {
             "embed": "stock VocabParallelEmbedding",
             "attn_res": "the final AttnRes: stock attn_res on the shard",
-            "final_gather": "stock sp_all_gather",
             "lm_head": "stock",
             "sampler": "stock",
         }
@@ -448,6 +449,9 @@ class SpStep:
         ctx = self.ctx
         for r in self.rows:
             choices = {"ag": self.comm.choice(r)}
+            choices["final_gather"] = Choice(
+                Path.GENERIC, "multicast", note="SpFinalGather (Lamport, one kernel)"
+            )
             choices["sp_boundary"] = Choice(
                 Path.GENERIC, "cluster",
                 note="AttnRes + SP AG / RS fused (attn_res.sp_fused)",
@@ -565,12 +569,14 @@ class SpStep:
             eps=final.variance_epsilon,
             output_norm_eps=0.0,
         )
+        # The final row all-gather on the multicast box (``SpFinalGather``; stock
+        # ``sp_all_gather``'s rows, sanitized words).
         if aux:
             width = hidden.shape[-1]
-            packed = sp_all_gather(torch.cat([hidden, *aux], dim=-1))[:rows]
+            packed = self.final_gather.run(torch.cat([hidden, *aux], dim=-1))[:rows]
             hidden, *aux = packed.split(width, dim=-1)
         else:
-            hidden = sp_all_gather(hidden)[:rows]
+            hidden = self.final_gather.run(hidden.contiguous())[:rows]
         aux = remote + aux
         return runtime.normalize((hidden, aux) if aux else hidden)
 
