@@ -28,16 +28,16 @@ from cutlass._mlir.dialects import llvm, vector
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
-from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32, ScalarF32
-from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
-from flashinfer.moe_ep.batch_invariant.mxfp4_device import ScalarF32 as MxScalarF32
-from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_device import PackedF32, ScalarF32
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.activation_variants import activation_accumulator
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.mxfp4_device import ScalarF32 as MxScalarF32
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.mxfp4_spec import (
     half_amax as mx_half_amax,
     quantize_half_precast as mx_quantize_half_precast,
 )
-from flashinfer.moe_ep.batch_invariant.mxfp8_device import ScalarF32 as Mx8ScalarF32
-from flashinfer.moe_ep.batch_invariant.mxfp8_spec import quantize_half_precast as mx8_quantize_half_precast
-from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.mxfp8_device import ScalarF32 as Mx8ScalarF32
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.mxfp8_spec import quantize_half_precast as mx8_quantize_half_precast
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_spec import (
     fc1_activation, fc2_output, quantize_block_precast,
 )
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
@@ -174,7 +174,7 @@ class QuantImpl:
                 return self.mx_quant_regs_in_pair_threads_impl(prequant_reg, smem_intermediate)
             return self.nvfp4_quant_impl(prequant_reg, norm_const=norm_const)
         if cutlass.const_expr(self.batch_invariant):
-            from flashinfer.moe_ep.batch_invariant.quantized_combine_device import quantize_combine_wire
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.quantized_combine_device import quantize_combine_wire
 
             return quantize_combine_wire(
                 prequant_reg,

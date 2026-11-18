@@ -3846,7 +3846,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -3862,7 +3862,8 @@
    "p50_us": 71.2,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -3911,7 +3912,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -3927,7 +3928,8 @@
    "p50_us": null,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -3976,7 +3978,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -3992,7 +3994,8 @@
    "p50_us": 140.78,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4041,7 +4044,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4057,7 +4060,8 @@
    "p50_us": 79.16,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4106,7 +4110,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4122,7 +4126,8 @@
    "p50_us": null,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4171,7 +4176,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4187,7 +4192,8 @@
    "p50_us": 151.24,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4236,7 +4242,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4252,7 +4258,8 @@
    "p50_us": 69.1,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4301,7 +4308,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4317,7 +4324,8 @@
    "p50_us": 94.5,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4366,7 +4374,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4382,7 +4390,8 @@
    "p50_us": 143.32,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4431,7 +4440,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4447,7 +4456,8 @@
    "p50_us": 77.51,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4496,7 +4506,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4512,7 +4522,8 @@
    "p50_us": 101.07,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,
@@ -4561,7 +4572,7 @@
     ],
     "schedule_policy": [
      "phase_interleave",
-     null
+     64
     ],
     "work_id_mode": "atomic_counter",
     "fc2_use_bulk": true,
@@ -4577,7 +4588,8 @@
    "p50_us": 156.82,
    "source": "flashinfer-a368c5f66-default_knobs",
    "measurement_policy": {
-    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing"
+    "note": "bench mode, capacity = T, CUDA graph x10 calls, 50 samples x 10 replays, slowest rank per sample, median; random routing",
+    "hint_note": "phase_interleave hint 64 (FC1 prologue tiles) instead of the kernel minimum: -0.9/-1.5 us at T96/T128 on the EP32 per-GPU shape (1 GPU, 28 experts; hints 64..336 equal; same tiles, bitwise-identical output); D-MOE runs/D-MOE/out/k2-h*.json"
    },
    "profiling_policy": {
     "cuda_graph_profile_replays": 10,

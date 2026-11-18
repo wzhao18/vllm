@@ -26,7 +26,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32
+from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_device import PackedF32
 
 from cutlass.cutlass_dsl import Float32, Int32, T
 from cutlass._mlir.dialects import llvm
@@ -260,7 +260,7 @@ class TopkReduce:
 
     @cute.kernel
     def _reduce_quantized_bi(self, combine_quant: cute.Tensor, combine_sf: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor, topk_indices: Optional[cute.Tensor] = None):
-        from flashinfer.moe_ep.batch_invariant.quantized_combine_device import ordered_quantized_slot_fold
+        from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.quantized_combine_device import ordered_quantized_slot_fold
 
         worker_idx = cute.arch.block_idx()[0] * Int32(self._threads) + cute.arch.thread_idx()[0]
         token_idx = worker_idx // self.hidden_tiles

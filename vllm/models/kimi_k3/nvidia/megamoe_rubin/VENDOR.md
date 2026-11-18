@@ -10,7 +10,7 @@
   `1667b47a3c911ecade464ab524baf192a0bf5962`) plus that FlashInfer branch's device patches
   (S0/S1 decode landing and dynamic token_in claim, die_split two-ended expert claim,
   NVFP4 decode weight-stream L2 prefetch + evict-first hints, EP28/EP32 geometry). Copied byte
-  for byte; no local difference.
+  for byte except the R1 import rewrite of two files (section "FlashInfer numerics helpers").
 - **Entry points**: `RubinInferenceMegaMoE` (`BlockScaledSwapAbMegaMoeKernel`) and
   `RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`).
 - **Check**: every file is byte-identical to the tag (`git show a368c5f66:<path>`). The CPU unit
@@ -19,7 +19,7 @@
 
 ## Local differences
 
-None in `src/`. Dropped relative to the previous (0.7.3.dev20261031) drop:
+Only the R1 import rewrite (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
 - **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
   epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
@@ -29,6 +29,38 @@ None in `src/`. Dropped relative to the previous (0.7.3.dev20261031) drop:
   idea: die 0 claims from the lowest local expert up, die 1 from the highest down, weights homed
   per expert half by `die_local.place_experts`). The host maps the trusted die-1 SM mask to the
   kernel's `sm_locality_domain` launch argument (uint8 per `%smid`, FlashInfer layout).
+
+## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
+
+The a368c5f66 epilogue and top-k reduce import FlashInfer's batch-invariant numerics helpers
+(`flashinfer.moe_ep.batch_invariant`, which imports `flashinfer.batch_invariant.fp_interface.term`). They are
+vendored under `src/fi_numerics` (`moe_ep_batch_invariant/`: the 16 non-Lean modules; `fp_interface/term.py`),
+with one rewrite: `from ...batch_invariant.fp_interface.term import` -> `from ..fp_interface.term import`. The two
+`src/sources` files that import them get rule R1 (absolute `flashinfer.moe_ep.batch_invariant.` ->
+`vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.`); nothing else changes.
+
+```
+vendored path | FlashInfer source | original sha256 | vendored sha256
+fi_numerics/fp_interface/term.py | flashinfer/batch_invariant/fp_interface/term.py | 28552340a68b34d0e3fe6f3ca17e04e71b6bfaa0801faaa9565d8c4f7e57186c | 28552340a68b34d0e3fe6f3ca17e04e71b6bfaa0801faaa9565d8c4f7e57186c
+fi_numerics/moe_ep_batch_invariant/__init__.py | flashinfer/moe_ep/batch_invariant/__init__.py | 08e7f00cff876a51408741a2439c59764f5995b1cfff17f3dd406a2c85f43165 | 08e7f00cff876a51408741a2439c59764f5995b1cfff17f3dd406a2c85f43165
+fi_numerics/moe_ep_batch_invariant/spec.py | flashinfer/moe_ep/batch_invariant/spec.py | 989928d2153aed69e0fad8105d5ae82d6d3a6e1e8b30f044dc2ce71b61ee8d99 | 0bd1797527a53ae5c829c5bc2daa9af1ec2dd2d69f50fbfec97bb08c0c4e4e4d
+fi_numerics/moe_ep_batch_invariant/a16_spec.py | flashinfer/moe_ep/batch_invariant/a16_spec.py | ba11db083b4cd5bf3d8565b9bc2abe22ca30105d45c6410942880b24a44d0a7b | b7e81a1336ddc4f5619005242726250a1a1ca7257e1763c6d6aa650282504e99
+fi_numerics/moe_ep_batch_invariant/activation_variants.py | flashinfer/moe_ep/batch_invariant/activation_variants.py | 90343dc1ee1adc0f0eb903ec1c9486dec605c38eb4ae6a866aed7cda9223c281 | 90343dc1ee1adc0f0eb903ec1c9486dec605c38eb4ae6a866aed7cda9223c281
+fi_numerics/moe_ep_batch_invariant/device.py | flashinfer/moe_ep/batch_invariant/device.py | 955c082f1852d195873d1f9fe181e94116821008373fe5e3cfba5dff439c327b | 955c082f1852d195873d1f9fe181e94116821008373fe5e3cfba5dff439c327b
+fi_numerics/moe_ep_batch_invariant/mxfp4_device.py | flashinfer/moe_ep/batch_invariant/mxfp4_device.py | 7dc5b7f268d400fd3fa83e88a978eafd0954ca12c9efb276111944382947889f | 7dc5b7f268d400fd3fa83e88a978eafd0954ca12c9efb276111944382947889f
+fi_numerics/moe_ep_batch_invariant/mxfp4_spec.py | flashinfer/moe_ep/batch_invariant/mxfp4_spec.py | be8fc4187c944f2a09bfd73ff4125b91a6b0893b0782d70012c6d4c368196aa2 | 46e4768347059907423c35638a201ff658742e94be0387a2f8d3c03e9b80287b
+fi_numerics/moe_ep_batch_invariant/mxfp8_device.py | flashinfer/moe_ep/batch_invariant/mxfp8_device.py | c0bdc14d04e3ead57a67552b819166d4aeb720d64d4481fb908f83c189fad22f | c0bdc14d04e3ead57a67552b819166d4aeb720d64d4481fb908f83c189fad22f
+fi_numerics/moe_ep_batch_invariant/mxfp8_spec.py | flashinfer/moe_ep/batch_invariant/mxfp8_spec.py | 64742d9c52594df60b702c18c6d0e0abcd2e76125b529422fc15703071d2cb18 | 460b761b2818f36dd9d3032ec2cf8ef025dd2522ecd800572b57f423d959dbbf
+fi_numerics/moe_ep_batch_invariant/numerical_variants.py | flashinfer/moe_ep/batch_invariant/numerical_variants.py | 29b5035ae0071bef0e737fd14a7f68e7e860cb1ae520a8f5dd134d0ccc183b0b | 29b5035ae0071bef0e737fd14a7f68e7e860cb1ae520a8f5dd134d0ccc183b0b
+fi_numerics/moe_ep_batch_invariant/nvfp4_device.py | flashinfer/moe_ep/batch_invariant/nvfp4_device.py | 48c6af6d43f2ce265074cd2250bd1ab30577e5f9b2b1783741f41417158c6292 | 48c6af6d43f2ce265074cd2250bd1ab30577e5f9b2b1783741f41417158c6292
+fi_numerics/moe_ep_batch_invariant/nvfp4_spec.py | flashinfer/moe_ep/batch_invariant/nvfp4_spec.py | e7517ea9afb780268847d1f3f922b6ee8f6441a76da96957c8c94afb66fcadc4 | e879d71a40a7162c8a4753657ee92f4ea473f0e24122df069afd839f0dcd479d
+fi_numerics/moe_ep_batch_invariant/quantized_combine_device.py | flashinfer/moe_ep/batch_invariant/quantized_combine_device.py | 69642a57331ea9c400a7b49c2da61ccbddce106d20363015040275b50f72a586 | 69642a57331ea9c400a7b49c2da61ccbddce106d20363015040275b50f72a586
+fi_numerics/moe_ep_batch_invariant/stage_partition.py | flashinfer/moe_ep/batch_invariant/stage_partition.py | 7f81538ed96c5618c0bb9e775ec23bffb07c76dbb216c786d576f25ab691cfef | 7f81538ed96c5618c0bb9e775ec23bffb07c76dbb216c786d576f25ab691cfef
+fi_numerics/moe_ep_batch_invariant/wire_device.py | flashinfer/moe_ep/batch_invariant/wire_device.py | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f
+fi_numerics/moe_ep_batch_invariant/wire_spec.py | flashinfer/moe_ep/batch_invariant/wire_spec.py | f21445052dc0d7579df6f425ba53fc4891b5b9cebfe22e9791fcd218613ad6bf | b9ae9960f9bfee084f2c61fb32bd2a27d40e7c5f9a99c32a77dce3f964f40aab
+sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py | (R1 | rewrite) | c6ec37d63026c83e85a69eb14c0234c8e74f34a999882739a241f611dd751560 | e3ab102c3ac93e5cb6a81eec0707d078b02f9295674f24122bb5fae64d43dabb
+sources/kernel_src/rubin/inference/mega/topk_reduce.py | (R1 | rewrite) | 44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358 | f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f
+```
 
 ## Rewrite rule
 
@@ -91,7 +123,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 fbea697f91fe5c5f1623568cb3ed45951905c2428bf2a49f330943ed910df4bc  sources/kernel_src/rubin/custom_mix_cga_helpers.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/mega/__init__.py
-c6ec37d63026c83e85a69eb14c0234c8e74f34a999882739a241f611dd751560  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+e3ab102c3ac93e5cb6a81eec0707d078b02f9295674f24122bb5fae64d43dabb  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 850caf943d137eeeeb99e997a6debce7aea14d3db2cd1e1992601b4e3b711af2  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 60963f01d755f52d5f7b6e1e7c76242bc583b4d2e26192e3639f5aaee9caa22c  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
@@ -100,7 +132,7 @@ c6ec37d63026c83e85a69eb14c0234c8e74f34a999882739a241f611dd751560  sources/kernel
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
 f8640f21703099acbf74064368d2d1a6d410760e358bb4341a8b26402b0a8a1f  sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
-44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358  sources/kernel_src/rubin/inference/mega/topk_reduce.py
+f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f  sources/kernel_src/rubin/inference/mega/topk_reduce.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/schedulers/__init__.py
 22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04  sources/kernel_src/schedulers/base.py
 c853ecafc65add0d5aac0e52b65bec89966c6d52d568afa32e58e46d73fdb8fa  sources/kernel_src/schedulers/fc12_mapping.py
