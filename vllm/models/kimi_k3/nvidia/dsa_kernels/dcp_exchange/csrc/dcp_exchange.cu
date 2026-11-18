@@ -2947,6 +2947,8 @@ __global__ void __launch_bounds__(256) o_exchange_kernel(OxParams p) {
 
 }  // namespace k31dcpx
 
+#include "topk_v2.cuh"
+
 // ------------------------------------------------------------------ host side
 using namespace k31dcpx;
 
@@ -3210,7 +3212,92 @@ int64_t max_coresident_ox(int64_t D) {
   return (int64_t)sms * occ;
 }
 
+// ------------------------------------------------------------------ top-k v2 (host)
+// u32 words of the v2 mailboxes: round 1, tie round, radix rounds (2 parities each).
+std::vector<int64_t> topk_v2_layout(int64_t cap, int64_t W) {
+  const int64_t r1 = 2 * cap * W * kV2Msg, tie = 2 * cap * W * kV2Tie,
+                rad = 2 * cap * kV2RadR * W * 256;
+  return {0, r1, r1 + tie, r1 + tie + rad};
+}
+
+static constexpr size_t kV2Dyn = 0;
+
+// Co-resident topk_v2 CTAs (a launch walks rows beyond it in turns, NVLink rounds included).
+int64_t topk_v2_resident() {
+  static int v = 0;
+  if (!v) {
+    int dev, sms, occ = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel, kV2T, kV2Dyn));
+    v = sms * occ;
+  }
+  return v;
+}
+
+void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
+             torch::Tensor out, torch::Tensor out_count, c10::optional<torch::Tensor> block_table,
+             int64_t block_size, int64_t block_stride, int64_t next_n,
+             c10::optional<torch::Tensor> req_of_row, int64_t box, int64_t mc, torch::Tensor peers,
+             int64_t W, int64_t rank, int64_t K, int64_t cap, int64_t interleave,
+             torch::Tensor epoch, torch::Tensor err,
+             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg) {
+  TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
+  TORCH_CHECK(W >= 1 && W <= kV2MaxW, "topk_v2: DCP size must be in [1, 8]");
+  TORCH_CHECK(K >= 1 && K <= kMaxK, "topk_v2: K must be in [1, 2048]");
+  TORCH_CHECK(interleave >= 1);
+  const int T = (int)logits.size(0);
+  if (T == 0) return;
+  TORCH_CHECK(T <= cap && epoch.numel() >= T, "topk_v2: rows > cap");
+  const c10::cuda::CUDAGuard guard(logits.device());
+  V2Params p{};
+  p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  p.lstride = logits.stride(0);
+  p.local_len = local_len.data_ptr<int>();
+  p.global_len = global_len.data_ptr<int>();
+  p.out = out.data_ptr<int>();
+  p.ostride = out.stride(0);
+  p.out_count = out_count.data_ptr<int>();
+  p.block_table = block_table.has_value() ? block_table->data_ptr<int>() : nullptr;
+  p.bt_stride = block_table.has_value() ? block_table->stride(0) : 0;
+  p.block_size = (int)block_size;
+  p.block_stride = block_stride > 0 ? (int)block_stride : (int)block_size;
+  p.next_n = (int)next_n;
+  p.req_of_row = req_of_row.has_value() ? req_of_row->data_ptr<int>() : nullptr;
+  p.box = reinterpret_cast<uint32_t*>(box);
+  p.mc = (uint64_t)mc;
+  p.peers = reinterpret_cast<const uint64_t*>(peers.data_ptr<int64_t>());
+  p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
+  p.interleave = (int)interleave;
+  const auto lay = topk_v2_layout(cap, W);
+  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
+  p.epoch = epoch.data_ptr<int>();
+  p.err = err.data_ptr<int>();
+  p.spin_ns = g_spin_ns;
+  p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
+  TORCH_CHECK(!dbg.has_value() || dbg->numel() >= (int64_t)kV2Dbg * T, "topk_v2: dbg too small");
+  p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  const int nres = (int)topk_v2_resident();
+  TORCH_CHECK(nres >= 1, "topk_v2: no resident CTA");
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)std::min(T, nres), 1, 1);
+  cfg.blockDim = dim3(kV2T, 1, 1);
+  cfg.dynamicSmemBytes = kV2Dyn;
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
+  // PDL: the prologue (barrier init) overlaps the logits kernel; the kernel never
+  // releases its dependents early (they start at its completion).
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel, p));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("topk_v2", &topk_v2);
+  m.def("topk_v2_layout", &topk_v2_layout);
+  m.def("topk_v2_resident", &topk_v2_resident);
   m.def("topk_merge", &topk_merge);
   m.def("o_exchange", &o_exchange);
   m.def("max_coresident_ox", &max_coresident_ox);

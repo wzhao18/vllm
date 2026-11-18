@@ -34,6 +34,12 @@ PHASES = {
     12: "bitmap", 24: "offsets", 15: "enumerated", 11: "ties", 9: "s9", 10: "s10",
     14: "s14", 25: "s25", 26: "s26", 27: "s27", 28: "s28", 8: "row end",
 }
+PHASES_V2 = {0: "start", 9: "loads issued", 10: "sampled", 1: "theta",
+             2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
+             16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
+             22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
+             7: "radix", 17: "gtt", 18: "write scan", 8: "end"}
+STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "-", "-")
 
 
 def make_logits(case, T, width, Lloc, gen, dev):
@@ -68,6 +74,8 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--spin", type=float, default=5.0, help="peer spin limit (s; ncu: long)")
     ap.add_argument("--warm", type=int, default=0, help="8K^3 bf16 matmuls before each replay")
+    ap.add_argument("--impl", default="merge", choices=["merge", "v2"])
+    ap.add_argument("--check", type=int, default=1, help="v2: compare with topk_merge")
     a = ap.parse_args()
 
     dist.init_process_group("nccl")
@@ -115,7 +123,14 @@ def main():
             g2.manual_seed(99 + 7 * rank + B)
             logits = make_logits(case, T, width, L, g2, dev)
 
+            segcap = 0
+
             def call(dbg=None, stats=None):
+                if a.impl == "v2":
+                    ex.topk_v2(logits, L, G, out, cnt, block_table=bt,
+                               block_size=bs, block_stride=bs, req_of_row=req_of_row,
+                               stats=stats, dbg=dbg)
+                    return
                 ex.topk_merge(logits, L, G, out, cnt, max_local_len=max_local,
                               cluster=cluster, segmax=segmax, block_table=bt,
                               block_size=bs, block_stride=bs, req_of_row=req_of_row,
@@ -129,9 +144,23 @@ def main():
             tot = cnt.sum().clone()
             dist.all_reduce(tot)
             ok_count = int(tot) == T * K
+            mism = -1
+            if a.impl == "v2" and a.check:
+                o2, c2 = out.clone(), cnt.clone()
+                ex.topk_merge(logits, L, G, out, cnt, max_local_len=max_local,
+                              cluster=cluster, segmax=segmax, block_table=bt,
+                              block_size=bs, block_stride=bs, req_of_row=req_of_row,
+                              one_round=True, window="center", small_ctx=1 << 30)
+                torch.cuda.synchronize()
+                ex.check()
+                bad = (c2 != cnt) | (o2 != out).any(1)
+                m = torch.tensor([int(bad.sum())], device=dev)
+                dist.all_reduce(m)
+                mism = int(m)
             # path counters + phase stamps (eager, one call)
             stats = torch.zeros(8, dtype=torch.int32, device=dev)
             dbg = torch.zeros(T * 64, dtype=torch.int64, device=dev)
+            phmap = PHASES_V2 if a.impl == "v2" else PHASES
             dist.barrier()
             for _ in range(a.warm):
                 torch.matmul(wa, wa, out=wb)
@@ -140,7 +169,26 @@ def main():
             d = dbg.view(T, 64).cpu()
             t0 = int(d[:, 0][d[:, 0] > 0].min()) if (d[:, 0] > 0).any() else 0
             phases = {}
-            for i, name in PHASES.items():
+            if a.impl == "v2":  # SM clock from (clock64, globaltimer) at row start / end
+                c0, c1, t0n, t1n = d[:, 32].double(), d[:, 40].double(), d[:, 0].double(), d[:, 8].double()
+                okr = t1n > t0n
+                phases["ncand"] = (float(d[:, 31].double().median()), 0, 0)
+                for bi in range(3):  # candidate batches: this thread's loads landed (clock64)
+                    v = d[:, 24 + bi].double()
+                    okb = v > 0
+                    if okb.any():
+                        phases[f"cb{bi}:loaded"] = (round(float(((v - d[:, 32].double())[okb]).median()) / 2.4e3, 2), 0, 0)
+                phases["nband"] = (float(d[:, 30].double().median()), 0, 0)
+                ghz = float(((c1 - c0)[okr] / (t1n - t0n)[okr]).median())
+                phases["ghz"] = (round(ghz, 3), 0, int(okr.sum()))
+                # per-row clock64 deltas from the row start (globaltimer is too coarse)
+                for i, name in phmap.items():
+                    v = d[:, 32 + i].double()
+                    ok_i = (v > 0) & (d[:, i] > 0)
+                    if ok_i.any() and i:
+                        rel = (v - c0)[ok_i] / ghz / 1e3
+                        phases[f"c{i}:{name}"] = (round(float(rel.median()), 2), round(float(rel.max()), 2), int(ok_i.sum()))
+            for i, name in phmap.items():
                 v = d[:, i]
                 v = v[v > 0]
                 if len(v):
@@ -191,8 +239,9 @@ def main():
             st.copy_(stats)
             dist.all_reduce(st)
             r = dict(B=B, T=T, case=case, cluster=cluster, segmax=segmax, max_local=max_local,
-                     us_per_call=round(float(med), 2), ok_count=ok_count,
-                     stats=dict(zip(STAT_NAMES, st.tolist())), phases=phases, kernels=kern,
+                     us_per_call=round(float(med), 2), ok_count=ok_count, impl=a.impl,
+                     segcap=segcap, mismatch_rows=mism,
+                     stats=dict(zip(STATS_V2 if a.impl == "v2" else STAT_NAMES, st.tolist())), phases=phases, kernels=kern,
                      Lmean=float(L.float().mean()))
             results.append(r)
             if rank == 0:
