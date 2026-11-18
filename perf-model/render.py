@@ -42,8 +42,10 @@ SCOPE_NOTE = ("Scope (2026-11-18): at most 32 GPUs per instance; silicon measure
 
 BLOCKERS = [
     ["P3-32 (DEP32 prefill)", "Refused at load on the release tree: the kimi_k3_mega_moe knob table has records only "
-     "for world_size 4/8/16 (KnobLookupError at megamoe_rubin/config.py resolve_knobs). Needs a tuned EP32 knob record; "
-     "until then P3-32 / P9-32 / P6-32 calibrated values are projected from P3-16 / P4-2."],
+     "for world_size 4/8/16 (KnobLookupError at megamoe_rubin/config.py resolve_knobs). Needs a tuned EP32 knob record. "
+     "P3-32 / P9-32 / P6-32 calibrated values keep the P3-16 / P4-2 rest-of-step and take the MegaMoE part from the "
+     "measured FlashInfer SM107 EP32 build (P3-32 13.88K tok/s/GPU; 14.57K without the EP32 T16384 kernel cliff), "
+     "so they assume that build, not the release tree."],
     ["D3-32 r >= 48 (SP decode)", "Specialized decode refuses sequence parallelism above 512 verify rows "
      "(max_num_seqs x q): r48 (B192, 768 rows) raises ValueError. r32 (B128) OOMs in the bench graph capture "
      "(bench artifact). The 32-64 band therefore has no calibrated or measured winner."],
@@ -58,6 +60,29 @@ BLOCKERS = [
 def _load(path):
     with open(path) as f:
         return json.load(f)
+
+
+def megamoe_ep32():
+    """EP16/28/32 MegaMoE derate table + findings from microbench/results/moe_ep32/README.md."""
+    txt = open(os.path.join(MB, "results", "moe_ep32", "README.md")).read()
+    sec = txt.split("## Results vs the current model", 1)[1]
+    rows = []
+    for line in sec.splitlines():
+        if line.startswith("| ") and not line.startswith("| quant") and not line.startswith("|---"):
+            rows.append([c.strip().replace("**", "") for c in line.strip().strip("|").split("|")])
+        elif rows and not line.startswith("|"):
+            break
+    head = [c.strip() for c in sec.split("| quant", 1)[1].split("\n", 1)[0].strip().strip("|").split("|")]
+    return {"head": ["quant"] + head, "rows": rows, "build": "FlashInfer SM107 EP32 build a368c5f66 (6e438852b + EP28/EP32)",
+            "findings": [
+                "Decode (T 4-128 tokens/rank): EP32 measures 0.70-0.85x of EP16 (the model predicts about 0.5-0.55x from "
+                "half the expert weights); a fixed chain of about 50 us per call at every EP dominates (model 17 us), so the "
+                "EP32 decode derate is about 2.0 vs about 1.5 at EP16.",
+                "Prefill cliff at T16384: EP32 is +21% (MX) / +30% (NVFP4) slower than EP16, and EP28 at T8192 is slower "
+                "than EP32. Not root-caused (push-router or landing/combine scaling with routes x fan-out). Not in the "
+                "achievable column; included in calibrated (P3-32 13.88K, 14.57K without the cliff).",
+                "The release tree's megamoe_rubin refuses EP32 (no knob record), so every EP32 calibrated number assumes "
+                "this FI build x 1.2 vendored-kernel factor in decode."]}
 
 
 def kernel_debug():
@@ -141,6 +166,7 @@ def main():
                                             "by_topology", "review_caveats")}
     data["opd"] = op_derates()
     data["kdbg"] = kernel_debug()
+    data["ep32"] = megamoe_ep32()
     data["static"] = {"d1_hbm": D1_HBM, "scope_note": SCOPE_NOTE, "blockers": BLOCKERS,
                       "active_lane": "KERNEL-DEBUG #1: SP-path BF16 dense GEMMs (in progress)"}
     blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")

@@ -151,6 +151,10 @@ Filled circles = measured MXFP8-MoE steps; open squares = release NVFP4-MoE arm 
 <h3 id="kdbg">KERNEL-DEBUG list, ranked by end-to-end worth</h3>
 <p class="note">Excess = measured minus model achievable per step on the topology where it matters (microbench/RESULTS.md section 3).</p>
 <div class="tw" style="max-height:620px"><table id="kdbgT"></table></div>
+<h3>MegaMoE at EP16 / EP28 / EP32: derate (measured / model achievable) by tokens per rank</h3>
+<p class="note" id="ep32N"></p>
+<div class="tw"><table id="ep32T"></table></div>
+<ul id="ep32F"></ul>
 
 <h3 id="kv">D1 KV capacity: where 278.5 GiB goes (per GPU)</h3>
 <div class="kv-bar" id="kvBar"></div>
@@ -579,7 +583,7 @@ function calDec() {
     h += "<tr><td class=mono>" + id + "</td><td>" + esc(tname(id)) + "</td><td class=n>" + t.gpus + "</td><td class=n>" + fmt(t.rmax.sol) + "</td><td class=n>" + fmt(t.rmax.achievable) + '</td><td class=n title="' + esc(t.rmax_cal_method) + '">' + fmt(t.rmax.calibrated) + "</td><td class=n>" + (measRmax(id) ? fmt(measRmax(id)) : "-") +
       "</td><td class=n>" + v(p.sol) + "</td><td class=n>" + v(p.achievable) + '</td><td class="n hi">' + v(c) + "</td><td>" + (c ? tagH(c.tag) + ' <span class="note">' + (c.path !== id ? "via " + esc(c.path) + ", " : "") + "d " + fmt(c.d_rest, 2) + " / " + fmt(c.d_experts, 2) + "</span>" : '<span class="note">' + (p.sol ? "beyond calibrated r<sub>max</sub>" : "no point") + "</span>") +
       "</td><td class=n>" + (m ? (st ? fmt(m.t_ms, 2) : fmt(m.tps_gpu)) : "-") + "</td><td class=n>" + (m && m.d ? fmt(m.d, 2) : "-") + "</td></tr>"; });
-  $("calDecT").innerHTML = h + '<tr><td colspan=13 class="note">d = rest-of-step / expert-family derate applied to the achievable column. ' + esc((CAL.derates.notes || {}).EP32 || "") + ". " + esc((CAL.derates.notes || {}).D2 || "") + ".</td></tr>";
+  $("calDecT").innerHTML = h + '<tr><td colspan=13 class="note">d = rest-of-step / expert-family derate applied to the achievable column. ' + "EP32 layouts take the measured FlashInfer SM107 EP32-build MegaMoE rows (x 1.2 vendored in-step factor in decode). " + esc((CAL.derates.notes || {}).D2 || "") + ".</td></tr>";
 }
 function calBand() {
   var ck = calCk(), R = CAL.rank[ck], sc = S.calScope, cols = [["sol", "SOL"], ["achievable", "achievable"], ["calibrated", "calibrated"], ["measured_only", "measured paths only"]];
@@ -660,6 +664,11 @@ function opdTables() {
   var kh = "<tr><th class=n>#</th><th>item</th><th class=n>derate</th><th>excess per step</th><th>first hypothesis</th><th>source rows</th></tr>";
   KDBG.forEach(function (r) { kh += "<tr><td class=n>" + esc(r.n) + "</td><td><b>" + esc(r.title) + "</b>" + (r.n === "1" ? ' <span class="tag act">active lane: in progress</span>' : "") + (r.detail ? '<div class="note">' + esc(r.detail) + "</div>" : "") + "</td><td class=n>" + esc(r.derate) + "</td><td>" + esc(r.excess) + '</td><td class="note">' + esc(r.hyp) + '</td><td class="note">' + esc(r.src) + "</td></tr>"; });
   $("kdbgT").innerHTML = kh;
+  var E = DATA.ep32; $("ep32N").textContent = E.build + "; slowest rank, random routing, bf16-reference check passed; red = KERNEL-DEBUG (> 2.0), bold = EP32 prefill cliff.";
+  $("ep32T").innerHTML = "<tr>" + E.head.map(function (x, i) { return "<th" + (i > 1 ? " class=n" : "") + ">" + esc(x) + "</th>"; }).join("") + "</tr>" +
+    E.rows.map(function (r) { return "<tr>" + r.map(function (c, i) { var v = parseFloat(String(c).split("-").pop()), cl = i > 1 ? "n" : "";
+      if (i > 1 && v > 2) cl += " warn"; if (i === 8 && r[1] === "32") cl += " hi"; return '<td class="' + cl + '">' + esc(c) + "</td>"; }).join("") + "</tr>"; }).join("");
+  $("ep32F").innerHTML = E.findings.map(function (f) { return "<li>" + esc(f) + "</li>"; }).join("");
 }
 function kvSection() {
   var K = STC.d1_hbm, col = { w: "var(--s1)", pad: "var(--s8)", nt: "var(--s4)", head: "var(--other)", act: "var(--s5)", start: "var(--s7)", kv: "var(--s3)" };
