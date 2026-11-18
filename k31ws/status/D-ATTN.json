@@ -3,22 +3,23 @@
  "title": "Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)",
  "side": "decode",
  "owner": "D-ATTN workflow agent",
- "state": "implementing",
- "updated": "2026-11-18T12:45-08:00",
+ "state": "measuring",
+ "updated": "2026-11-18T13:20-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L~135K, k=3 (per GPU: 24 of 96 heads, DCP4 KV shard)",
  "baseline_ms": 3.3,
  "current_ms": 3.3,
  "achievable_ms": 1.3,
  "target_ms": 1.45,
  "step_ms": 30.5,
- "basis": "MEASURED in-step gap512 EP16 D3 B80/B92cap profiles (perf-model/microbench/results/gap512/parsed); D3-32 r24 transfer",
- "gap_analysis": "Per DSA layer at B92 (368 rows, gap512 in-step): MlaQuery 89 us (side stream, forked against the indexer chain), QueryWait 46 us (polls other ranks' publishes), trtllm-gen sparse MLA 32 us + LSE 1.3 us, DcpValue 25 us, paged_mqa_logits 35 us, DsaIndex 8.5 us; the indexer wq_b split-K GEMM on the main stream runs 62 us while MlaQuery holds the SMs (model ach ~4 us). Model ach per layer at r24: q path (qb_wq+w_uk) ~5 us + P6 q publish ~17 us, sparse_mla ~9.6 us, P7b+w_uv ~13 us, idx_score ~18 us. MlaQuery tiles 64 rows x 24 heads into 8-CTA per-head clusters (1152 CTAs at 368 rows, ~6.5 cluster rounds) and keeps the GB300 schedule for DSA (Rubin staging disabled): HYPOTHESIS that its time is cluster-round latency, not bytes or FLOPs (measuring standalone now).",
+ "basis": "MEASURED in-step gap512 EP16 D3 B80/B92cap (baseline); MEASURED 1-GPU microbench at deployed rows (runs/D-ATTN/run1-3, qpath5); in-step A/B queued",
+ "gap_analysis": "Baseline per DSA layer at B92 (368 rows, gap512 in-step): MlaQuery 89 us (side stream), QueryWait 46 us, trtllm-gen sparse MLA 32 us + LSE 1.3 us, DcpValue 25 us, paged_mqa_logits 35 us, DsaIndex 8.5 us; the indexer wq_b split-K on the main stream runs 62 us while MlaQuery holds the SMs. Microbench (1 GPU, cold L2): MlaQuery alone is cluster-round bound, linear in rows (33/52/72/93 us at R 128/256/384/512). LocalQuery (all 96 heads on every rank, no publish/QueryWait/re-arm) 29/31/37/44 us at the same rows: 2.0x at r24 before counting the removed publish + QueryWait; its cuBLAS q_b (18 us at R384, 1.2 PF) and W_UK bmm (13 us) are themselves 2-3x off SOL. trtllm-gen sparse MLA standalone 26/33/40/47 us at R 128-512 (model ach ~9.6 us at r24): neither HBM-bound (2.8 TB/s) nor MMA-bound (1.4 PF FP8); sharing 80% of keys across a request rows saves only 2 us, so the gap is the kernel structure (~20 us fixed + 0.055 us/row, 128 padded heads), not the per-row gather. Model note: P6 q publish (~17 us/layer at r24) is avoidable under SP by local recompute; the model q path should be min(publish, recompute). PROJECTED family after LocalQuery ~2.6 ms/step (q-path exposure -0.7 ms) pending the in-step A/B.",
  "inefficiencies": [
-  "MlaQuery: per-head 8-CTA cluster tiling, ~6.5 rounds at 368 rows, 89 us vs ~5 us of GEMM work (hypothesis: round latency; standalone bench running)",
-  "P6 q publish: 24 heads x 576 B x R rows multicast to 3 peers (~16 MB/layer at r24) + QueryWait cross-rank poll on the critical path",
-  "Sparse MLA trtllm-gen: 96->128 head padding (+33% MMA), per-row 2048-row KV gather (no sharing across a request's 4 verify rows), 32 us vs ~10 model",
+  "MlaQuery: per-head 8-CTA cluster tiling, cluster-round bound (measured linear 0.18 us/row standalone) -> replaced by LocalQuery from 65 rows",
+  "P6 q publish + QueryWait cross-rank poll + DcpValue q-mailbox re-arm (R x 96 x 576 B sentinel stores/layer) -> removed on local rows",
+  "LocalQuery GEMMs: cuBLAS q_b N=18432 at 1.2 PF (R384) and W_UK bmm 13 us; untuned split-K q_b below 65 rows (D-GEMM tactic item)",
+  "Sparse MLA trtllm-gen: ~20 us fixed + 0.055 us/row, 128 padded heads; measured not BW/MMA bound (dedup alone does not help)",
   "DcpValue proj: 25 us vs ~9 model (P7b push + W_UV + LSE merge)",
-  "Indexer logits: each of a request's 4 verify rows re-streams the keys (35-46 us vs 18 model)"
+  "Indexer logits: SM100 DeepGEMM paged logits runs the varlen next_n=1 form (one row per task), so a request 4 verify rows each stream its keys (L2 absorbs part: 2.2x model, not 4x)"
  ],
  "rubin_features": [
   "tcgen05 UMMA (FP8 / block-scaled MXFP4) with TMEM accumulators",
@@ -28,12 +29,12 @@
   "NVLink multicast only where a push beats local recompute"
  ],
  "plan": [
-  "1. Measure standalone (1 GPU, deployed rows 128/256/384/512): MlaQuery vs cuBLAS q_b GEMM + W_UK bmm for 24 and all 96 heads",
-  "2. q path redesign: each rank already holds every gathered row's q_a, so compute all 96 heads' FP8 query locally (gathered W_qb / W_UK at build) and drop the P6 publish + QueryWait poll; KV insert of owned slots stays",
-  "3. Sparse MLA: native 96-head FP8 decode sharing each request's gathered KV across its 4 verify rows (ncu the trtllm-gen kernel first)",
-  "4. DcpValue: re-measure after 2-3; fuse W_UV + push",
-  "5. Joint 4-row indexer logits",
-  "6. Unit tests vs stock + microbench vs model at r1/r8/r24, step A/B on INFRA harness"
+  "DONE: LocalQuery (wzhao/k31ws-d-attn 72fdf53350), unit test bitwise vs stock on cuBLAS rows",
+  "In-step A/B r8/r16/r24 (step_d dattn3 vs INFRA base-mx) -> landed-ready",
+  "Native 96-head FP8 sparse MLA decode (tcgen05, 2-CTA V split 2x256 with S shared via DSMEM, request-major tiles of 4 rows x 96 heads over the union of their keys, TMA gather4 of FP8 KV rows, trtllm-gen precision: E4M3 P at 448 x 2^(s-m), 128-key running-max steps, FP32 accumulate) target ~10 us at r24",
+  "Joint 4-row indexer logits: one CTA per (request, key block) with M = 4 rows x 32 heads = 128 (block-scaled MXFP4 UMMA), keys streamed once, weighted ReLU head-sum epilogue, BF16 logits as DeepGEMM",
+  "DcpValue: re-measure after the above; fuse W_UV into the sparse kernel epilogue (proj partials) + push",
+  "q path: a fused tcgen05 q_b -> W_UK -> FP8 kernel (no BF16 latent round trip; Triton tl.dot measured 1.8-3.7x slower on sm_107, dropped)"
  ],
  "work": [
   {
@@ -45,14 +46,37 @@
    "t": "12:40",
    "what": "implemented LocalQuery (all 96 heads per rank, no P6 publish / QueryWait / q-mailbox re-arm) for SP rows 17-512; DcpValue rearm flag; unit test vs stock; q-path + sparse-MLA microbenches",
    "result": "committed 33b0d1996f, pushed; GPU runs queued (runs/D-ATTN/run1.log, run2.log), waiting for a pool hold"
+  },
+  {
+   "t": "13:00",
+   "what": "unit tests on VR200 (local query vs stock; existing SP DSA GPU test with the rearm flag)",
+   "result": "1 passed (bitwise on cuBLAS rows, split-K rows within stock tolerance, <0.1% FP8 bytes differ) / 9 passed"
+  },
+  {
+   "t": "13:05",
+   "what": "microbench MlaQuery vs LocalQuery R 20-512; trtllm-gen sparse MLA R 128-512 with/without shared keys",
+   "result": "local 29/31/37/44 vs MlaQuery 33/52/72/93 us at R 128/256/384/512; crossover 65 rows; sparse MLA 26/33/40/47 us, dedup -2 us only"
+  },
+  {
+   "t": "13:10",
+   "what": "fused W_UK + FP8 pack in Triton",
+   "result": "1.8-3.7x slower than bmm + pack on sm_107; reverted"
+  },
+  {
+   "t": "13:15",
+   "what": "crossover SP_LOCAL_QUERY=65-:local committed 72fdf53350, overlay d-attn-72fdf533-1",
+   "result": "step_d A/B queued (12 4-GPU waiters on 2 pool nodes)"
   }
  ],
- "next": "read runs/D-ATTN/run1.log (unit test + q-path bench: MlaQuery vs LocalQuery at R 128/256/384/512) and run2.log (trtllm-gen sparse MLA + ncu at R384); then 4-GPU SP DSA layer A/B",
- "blockers": "pool: no k31ws hold running since 12:15 PT (hold1 x5 and hold8 pending)",
- "branch": "wzhao/k31ws-d-attn @ 33b0d1996f",
+ "next": "When runs/D-ATTN/step_d/dattn3-r8r16r24-prof finishes (overlay d-attn-4fbaa15-3: same choice at 128/256/384 rows), diff fam.txt against runs/INFRA/step_d/base-mx-r8r16r24-prof/fam.txt (DSA q_path, WAIT, g_proj, step total); if the step improves, set state landed-ready with wzhao/k31ws-d-attn @ 72fdf53350. Then start the native sparse MLA kernel (plan item 3) under vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/ with benchmarks/kimi_k3/bench_dattn_sparse.py as the harness. Commands: bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-attn <tag>; on rhea: setsid nohup /tools/step_d.sh -n D-ATTN -t <tag> <ov> 128,256,384 1 > log 2>&1 &",
+ "blockers": "pool contention: 4-GPU step benches wait behind 1-GPU jobs (12 waiters, 2 hold1 nodes at 13:15 PT); ncu/nsys absent from the K3.1 image (no kernel counters; requested via findings)",
+ "branch": "wzhao/k31ws-d-attn @ 72fdf53350",
  "evidence": [
   "perf-model/microbench/results/gap512/parsed/dec_B80.json",
   "perf-model/microbench/results/gap512/parsed/dec_B92cap.json",
-  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-ATTN/"
+  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-ATTN/run1.log (MlaQuery vs LocalQuery)",
+  "rhea:.../runs/D-ATTN/run2.log (trtllm-gen sparse MLA)",
+  "rhea:.../runs/D-ATTN/run3.log, qpath5.json (breakdown, small rows)",
+  "rhea:.../runs/D-ATTN/step_d/dattn3-r8r16r24-prof (queued A/B)"
  ]
 }

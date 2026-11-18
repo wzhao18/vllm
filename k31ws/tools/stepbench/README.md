@@ -31,7 +31,7 @@ Long runs: `setsid nohup bash .../step_d.sh ... > log 2>&1 < /dev/null &` and po
   traffic at decode).
 - **MegaMoE dispatch/combine** spans 4 GPUs of one node instead of 32 (decode) / 16 (prefill) GPUs.
 - **Drafter**: DSpark preview (`dspark-preview-L24`: aux layer ids remapped to the 24-layer target), included by
-  default (`-x` excludes it). Decode: TOKENSPEED_MLA backend per the release config; prefill: FLASH_ATTN.
+  default (`-x` excludes it). Decode: TOKENSPEED_MLA backend per the release config (also at prefill: the preview drafter is MLA with FP8 KV).
 - Context: decode `u132k` (uniform 132K, matches the model's L135K rows) or `agentx`; prefill F16K / F8K at
   KV length 78,360 (prefix hit, 3 requests per GPU) and a fresh 16K.
 - Timing: one-shot CUDA graph per case, rank-max, median of iters x samples (`vllm bench forward`); no LM head,

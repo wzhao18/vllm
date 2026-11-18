@@ -3,8 +3,8 @@
  "title": "Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream",
  "side": "prefill",
  "owner": "P-MOE agent (workflow)",
- "state": "measuring",
- "updated": "2026-11-18T16:25-08:00",
+ "state": "implementing",
+ "updated": "2026-11-18T12:55-08:00",
  "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4; MegaMoE T=16384 tokens/rank, 56 experts/GPU, 92 layers; shared MXFP8 gate_up [12288,7168] + down [7168,6144]",
  "baseline_ms": 320,
  "current_ms": 320,
@@ -33,13 +33,30 @@
   "then the in-kernel items: router/stage/reduce absorption, dispatch/combine interleave across sub-calls"
  ],
  "work": [
-  {"t": "15:40", "what": "claimed workstream; worktree /Users/weizha/k31ws-wt/p-moe on wzhao/k31ws-p-moe @ 4fbaa15189", "result": "reading code"},
-  {"t": "16:05", "what": "bench_megamoe_rubin --num-experts (EP-size emulation), commit e7f2f4676f; FI bench wrapper with expert-count emulation; r1 queued (wsgpu -g 4)", "result": "waiting for pool GPUs (13 waiters, no k31ws hold running)"},
-  {"t": "16:20", "what": "code reading of the in-step path + release-tree P3 F8K profile; new bench_megamoe_prefill_overlap.py (sub-calls + shared overlap at grid caps); r2 chained after r1", "result": "findings/P-MOE.md: knob selection at 16K = i8192 S2/N256 record; shared serial on TP1 DEP; MegaMoE combine-link-bound"}
+  {
+   "t": "12:10",
+   "what": "claimed workstream; worktree /Users/weizha/k31ws-wt/p-moe on wzhao/k31ws-p-moe @ 4fbaa15189",
+   "result": "reading code"
+  },
+  {
+   "t": "12:25",
+   "what": "bench_megamoe_rubin --num-experts (EP-size emulation), commit e7f2f4676f; FI bench wrapper with expert-count emulation; r1 queued (wsgpu -g 4)",
+   "result": "waiting for pool GPUs (13 waiters, no k31ws hold running)"
+  },
+  {
+   "t": "12:35",
+   "what": "code reading of the in-step path + release-tree P3 F8K profile; new bench_megamoe_prefill_overlap.py (sub-calls + shared overlap at grid caps); r2 chained after r1",
+   "result": "findings/P-MOE.md: knob selection at 16K = i8192 S2/N256 record; shared serial on TP1 DEP; MegaMoE combine-link-bound"
+  },
+  {
+   "t": "12:50",
+   "what": "specialized_prefill/moe.py: PrefillSubcallExperts (EP-uniform ceil(T_max/8192) sub-calls, per-launch EP-mean rows, padding/capture handled) + KimiMoE wiring + experts.forward out/ep_tokens + reserve_sms cap param; tests/models/kimi_k3/test_prefill_moe_subcalls.py (CPU plan/wrapper + SM107 bitwise row-independence); commit 3af369ed36, overlay p-moe-3af369ed-1",
+   "result": "queued r3 unit tests (wsgpu -g 1) and step_p subcall-prof (DEP4 slice, profiled); pool: first hold1 ETA 14:03 PST"
+  }
  ],
- "next": "Read r1/r2 when the pool runs them (runs/P-MOE/r1, r2); meanwhile implement specialized_prefill MoE (sub-calls + overlap).",
+ "next": "When the pool runs: r1 (vendored vs FI 8K/16K), r2 (2x8K + shared overlap grid-cap sweep + kernel profile), r3 (unit tests), step_p subcall-prof vs INFRA base-mx-f16f8-prof. Then set the prefill shared-overlap cap from r2 and wire it.",
  "blockers": "Rhea pool: no k31ws hold running yet (all pending), r1/r2 queued under wsgpu.",
- "branch": "wzhao/k31ws-p-moe @ e7f2f4676f",
+ "branch": "wzhao/k31ws-p-moe @ 3af369ed36",
  "evidence": [
   "perf-model/plan/PLAN_NVFP4.md",
   "perf-model/microbench/results/moe/README.md",

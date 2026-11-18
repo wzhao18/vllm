@@ -57,6 +57,46 @@
   {
    "t": "11-18",
    "text": "D-ATTN: LocalQuery implemented (compute all 96 q heads locally under SP instead of publishing FP8 q to peers); unit test + bench queued."
+  },
+  {
+   "t": "11-18",
+   "text": "Policy (user): die-local placement is mandatory wherever the model assumes die-local bandwidth (expert weights; optionally dense weights, KDA state, KV/keys). Kernels are held to the die-local model number; HW agent writing the localization how-to first."
+  },
+  {
+   "t": "11-18",
+   "text": "Policy (user): target the practical speed of light, not marginal gains. Each workstream must state its hardware-limited design (bound resource, minimum kernels/passes, fusion/overlap/localization) and build that design; progress is reported as gap closed toward model achievable."
+  },
+  {
+   "t": "11-18 13:15",
+   "text": "D-FUSE: fused AttnRes + SP all-gather/reduce-scatter chain measured on 4 GPUs: r24 2.02 -> 1.53 ms/step vs model 1.43 (1.07x), r8 0.98 vs 0.84; bit-exact. First family near target."
+  },
+  {
+   "t": "11-18 13:20",
+   "text": "D-TOPK: in-tree DCP top-k measured 30/45/86 us per layer at r1/r8/r24 vs model 6/7/9; ties straddle ranks on 98% of rows; pre-pass sized for 1M context. SOL redesign in progress (first tie fix -11%)."
+  },
+  {
+   "t": "11-18 13:20",
+   "text": "D-MOE: FI a368c5f66 NVFP4 at the EP32 per-GPU shape (28 experts, 1 GPU): 34.7-52 us/layer T1-T128; EP32 adds ~17 us comm on Hecate. Vendored into kimi_k3 byte-identical."
+  },
+  {
+   "t": "11-18 13:20",
+   "text": "D-GEMM: best existing kernels stream 3-7.5 TB/s; NVFP4 dense family projects 6.7 ms vs model 2.8 ms at r24. MXFP8 SP path (B4) landed-ready, tests pass. SOL design (die-local, swap-AB persistent) next."
+  },
+  {
+   "t": "11-18 13:45",
+   "text": "P-MLA: random 576 B KV-row gather saturates at ~18 TB/s from L2 on VR200 (LDG = TMA gather4), so sparse MLA prefill floor is ~1.07 ms/layer at F16K vs model 0.64: model omits re-gather bytes (model fix candidate)."
+  },
+  {
+   "t": "11-18",
+   "text": "HW: 1-CTA MMA with both operands in SMEM is capped at 2/3 of Rubin double-K peak; A in TMEM or 2-CTA reaches full rate. Multi-peer system-scope release stores serialize on NVLink round trips; multicast release is ~3x faster."
+  },
+  {
+   "t": "11-18",
+   "text": "EN: NVFP4 MegaMoE loading landed-ready (6f164db270), 145 unit tests pass on VR200. No EP32 NVFP4 knob records yet."
+  },
+  {
+   "t": "11-18 13:20",
+   "text": "Blockers: only 2 Rhea nodes running (16 GPU requests waiting; next holds est 14:25); ncu/nsys are not in the image, so root causes rely on probes."
   }
  ]
 }

@@ -23,7 +23,16 @@ case $G in 1|2|4|8n) ;; *) echo "-g must be 1, 2, 4 or 8n"; exit 2;; esac
 [ -d $K/ov/$OV ] || { echo "no overlay $K/ov/$OV (stage it with mkov.sh)"; exit 2; }
 mkdir -p $K/pool/locks $K/pool/use $K/pool/wait
 WF=$K/pool/wait/$(hostname -s).$$; echo "$NAME $G $(date +%s)" > $WF
-trap 'rm -f $WF' EXIT
+mkdir -p $K/pool/resv; RESV=''
+trap 'rm -f $WF $RESV' EXIT
+# Node reservation (INFRA 2026-11-18): a whole-node (-g 4) request waiting > RESV_MIN minutes reserves the running
+# 1-node hold node with the fewest busy GPUs; smaller requests skip a node reserved by another live request (they
+# still use every other node), so its GPUs drain to the 4-GPU request instead of being refilled by 1-GPU runs.
+# A reservation is valid while its waiter's wait file exists.
+RESV_MIN=${WS_RESV_MIN:-10}
+live_locks() { local n=0 f; for f in $K/pool/locks/$1.$2.*; do [ -e "$f" ] || continue; flock -n "$f" true || n=$((n+1)); done; echo $n; }
+reserved_by_other() { local f=$K/pool/resv/$1.$2 w; [ -f $f ] || return 1; w=$(cat $f 2>/dev/null); [ "$w" = "$WF" ] && return 1
+  [ -e "$w" ] && return 0; rm -f $f; return 1; }
 T0=$(date +%s)
 try_lock() {  # try_lock <lockfile...>: open + flock -n each, keep fds; on failure release all
   LOCKFDS=()
@@ -53,6 +62,7 @@ while :; do
       left=$(( $(date -d "$E" +%s 2>/dev/null || echo 0) - now ))
       (( left > (MIN + 5) * 60 )) || continue
       for h in $(scontrol show hostnames $N); do
+        reserved_by_other $J $h && continue
         for s in $(seq 0 $G 3); do
           L=(); GL=""; for ((g=s; g<s+G; g++)); do L+=($K/pool/locks/$J.$h.$g); GL="$GL${GL:+,}$g"; done
           if try_lock "${L[@]}"; then
@@ -67,6 +77,18 @@ while :; do
           fi
         done
       done
+    if [ "$G" = 4 ] && [ -z "$RESV" ] && (( $(date +%s) - T0 > RESV_MIN * 60 )); then
+      best=""; bn=9
+      while IFS='|' read -r J N E; do
+        left=$(( $(date -d "$E" +%s 2>/dev/null || echo 0) - $(date +%s) )); (( left > (MIN + 5) * 60 )) || continue
+        for h in $(scontrol show hostnames $N); do
+          reserved_by_other $J $h && continue
+          n=$(live_locks $J $h); (( n < bn )) && { bn=$n; best=$J.$h; }
+        done
+      done < <(squeue -h -u $USER -t R -o "%i|%N|%e|%j" | awk -F'|' '$4 ~ /-k31ws\.hold1/ {print $1"|"$2"|"$3}')
+      if [ -n "$best" ] && [ ! -e $K/pool/resv/$best ]; then RESV=$K/pool/resv/$best; echo $WF > $RESV
+        echo "$(date +%FT%T) $NAME reserve $best (busy $bn)" >> $K/pool/usage.log; echo "wsgpu: $NAME reserved $best"; fi
+    fi
     # 1-node holds always; 8-node holds too while no 8n request is waiting (their GPUs are idle until EP32 work runs;
     # an 8n request then waits for these runs to end, so keep -m honest)
     H8=1; grep -lq ' 8n ' $K/pool/wait/* 2>/dev/null && H8=0

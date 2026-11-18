@@ -4,20 +4,21 @@
  "side": "decode",
  "owner": "D-MOE agent (workflow)",
  "state": "measuring",
- "updated": "2026-11-18T12:50-08:00",
+ "updated": "2026-11-18T13:20-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), SP shard = 96 MoE tokens per GPU, 28 local experts, top-16, L~135K, k=3",
  "baseline_ms": 8.3,
  "current_ms": 8.3,
- "achievable_ms": 4.9,
- "target_ms": 5.4,
+ "achievable_ms": 4.35,
+ "target_ms": 4.8,
  "step_ms": 30.5,
- "basis": "baseline: gap512 EP16 in-step profile B92 (r23) moved to EP32 by the 8-node step delta (coordinator seed). Per-layer reference: moe_ep32 FI a368c5f66 standalone EP32 NVFP4 T64/T128 = 62.8/69.1 us vs model ach 36.1/37.8 us",
- "gap_analysis": "Per layer at EP32 NVFP4 (FI a368c5f66 standalone, Hecate): T1 50.4 us vs ach 17.3 (2.9x), T32 60.2 vs 35.2 (1.71x), T~96 ~66 vs ~37 (1.8x). A fixed per-call chain of ~50 us (same at every EP and both quants) dominates decode; the weight stream itself is a minority of the time. In tree today decode D3-32 runs the vendored DeepGEMM fp8_fp4 MegaMoE (no NVFP4 W4A4 EP32 backend exists), and the shared-expert GEMMs run serially after it (the side-stream overlap only exists on the kimi_k3_mega_moe path, which has no EP32 knobs). Next: 1-GPU (28 experts) and EP4 (112 experts) emulation of the EP32 per-GPU shape with FI a368c5f66 on WS_PYTHONPATH, torch-profiler kernel split + stamp buffer for the fixed chain.",
+ "basis": "baseline: coordinator seed (gap512 EP16 B92 moved to EP32). achievable: model rows at EP32 T=96 tokens/GPU: MegaMoE 37.0 us/layer (ops + P11/P12; moe_ep32 t_ach interp T64/T128) x 92 = 3.40 ms + shared experts MXFP8 0.95 ms (optables nvfp4 D3-32 r8/r32 interp) = 4.35 ms. Measured FI a368c5f66 1-GPU (28 experts, no comm) T96 = 48.9 us/layer.",
+ "gap_analysis": "MEASURED 1-GPU EP32-shape emulation (FI a368c5f66, 28 local experts, random top-16, NVFP4, CUDA graph x10, no NVLink): per layer 34.7 / 43.7 / 45.1 / 48.9 / 52.3 us at T 1/4/32/96/128. Per call at T96: main persistent kernel 43.7 us, router kernel 3.5, separate BF16 top-k reduce 2.7, NVFP4 quant+stage 1.9 (partly PDL-overlapped). Hecate EP32 (same kernel, 32 GPUs) adds ~17 us of dispatch/combine at T64-T128 (62.8/69.1 us). The weight stream itself is not the limit: going from ~13 active experts (T1) to 28 (T96) adds ~13 us for ~2x the bytes, i.e. the marginal stream runs near the die-local HBM rate, while ~18-20 us per call is fixed overhead inside the main kernel even with no comm (startup, sizes-ready wait, FC1->FC2 per-expert dependency tail, combine/finalize), plus ~5-8 us in the 3 side kernels. So the gap to the model (37 us/layer incl. comm) = fixed in-kernel latency (~18 us) + comm latency not overlapped with the weight stream (~17 us) + side kernels. Profilers: ncu not found in the image on PATH (probing).",
  "inefficiencies": [
-  "MEASURED (Hecate moe_ep32): fixed per-call chain ~50 us at T1 vs model 17 us; same at EP16/28/32 and for MX/NVFP4",
-  "In-tree decode uses vendored DeepGEMM fp8_fp4 MegaMoE (no NVFP4 W4A4 at EP32 in any tree)",
-  "Shared experts (MXFP8 under NVFP4 ckpt) serial after MegaMoE on D3-32 (no side-stream overlap on the deep_gemm path)",
-  "HYPOTHESIS: router/landing + phase-interleave scheduler polling + combine barrier dominate the fixed chain (to be measured with the stamp buffer)"
+  "MEASURED: ~18-20 us/call fixed latency inside the persistent MegaMoE kernel at the EP32 per-GPU shape even without NVLink (T1 30.7 us kernel vs T96 43.7 us)",
+  "MEASURED: dispatch/combine latency at EP32 ~17 us/call on top (EP32 66 vs 1-GPU 49 us at T96), not hidden behind the weight stream",
+  "MEASURED: 3 side kernels per call (router 3.5, top-k reduce 2.7, quant/stage 1.9 us at T96)",
+  "HYPOTHESIS: weight streaming waits for sizes_ready (scheduler gate) although at T>=4 every local expert is active -> weight prefetch could start at kernel entry",
+  "In-tree D3-32 runs vendored DeepGEMM fp8_fp4 (no NVFP4 EP32 backend); shared experts serial on that path"
  ],
  "rubin_features": [
   "NVFP4 block-scaled tcgen05 MMA (E4M3 block-16 scales)",
@@ -35,15 +36,34 @@
   "C3: 8-node EP32 confirmation on the hold8 (prepared in advance)"
  ],
  "work": [
-  {"t": "12:35", "what": "claimed; worktree /Users/weizha/k31ws-wt/d-moe on wzhao/k31ws-d-moe @ 4fbaa15189; built FI overlay runs/D-MOE/fi-a368c (a368c5f66 python+csrc+include over the image FI data)", "result": "ok"},
-  {"t": "12:45", "what": "queued b0 benches (EP1 28 experts, EP4 112 experts; NVFP4 + MXFP4; T 1/4/32/96/128) through wsgpu", "result": "waiting for pool GPUs"}
+  {
+   "t": "12:35",
+   "what": "claimed; worktree /Users/weizha/k31ws-wt/d-moe on wzhao/k31ws-d-moe @ 4fbaa15189; built FI overlay runs/D-MOE/fi-a368c (a368c5f66 python+csrc+include over the image FI data)",
+   "result": "ok"
+  },
+  {
+   "t": "12:45",
+   "what": "queued b0 benches (EP1 28 experts, EP4 112 experts; NVFP4 + MXFP4; T 1/4/32/96/128) through wsgpu",
+   "result": "waiting for pool GPUs"
+  },
+  {
+   "t": "13:00",
+   "what": "re-vendored FI a368c5f66 MegaMoE into megamoe_rubin (src byte-identical; S2 dropped, die_split host port, EP28/EP32 knob records, EP>=28 inference-only variant); tests updated; overlay d-moe-c52b0d8c7e-1",
+   "result": "wzhao/k31ws-d-moe @ c52b0d8c7e; unit tests + EP4 bench queued (v1)"
+  },
+  {
+   "t": "13:15",
+   "what": "b0: FI a368c5f66 1-GPU, 28 experts, NVFP4, T 1/4/32/96/128",
+   "result": "34.7/43.7/45.1/48.9/52.3 us per layer; main kernel 30.7/39.3/40.5/43.7/46.9 us; runs/D-MOE/out/b0-ep1-nvfp4.json"
+  }
  ],
- "next": "read b0 results (runs/D-MOE/out/b0-*.json, logs/b0-*.log); then stamp-buffer breakdown of the fixed chain",
- "blockers": "pool GPUs busy (waiting in wsgpu queue)",
- "branch": "wzhao/k31ws-d-moe @ 4fbaa15189",
+ "next": "v1 (vendored megamoe_rubin unit tests + EP4 112-expert bench), b0 EP4 + MX; profiler probe; then in-kernel phase timing (clock stamps) to split the ~18 us fixed latency",
+ "blockers": "",
+ "branch": "wzhao/k31ws-d-moe @ c52b0d8c7e",
  "evidence": [
   "perf-model/microbench/results/moe_ep32/rows.json",
   "perf-model/microbench/results/gap512/parsed/decode_families.txt",
-  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/"
+  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/",
+  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/out/b0-ep1-nvfp4.json"
  ]
 }

@@ -3,48 +3,84 @@
  "title": "Prefill: sparse MLA + prologue",
  "side": "prefill",
  "owner": "P-MLA workflow agent",
- "state": "analysis",
- "updated": "2026-11-18T12:45-08:00",
+ "state": "implementing",
+ "updated": "2026-11-18T13:55-08:00",
  "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, 96 heads/GPU, top-2048, FP8 KV 576 B rows; 24 DSA layers",
  "step_ms": 825,
  "baseline_ms": 67,
  "current_ms": 67,
  "achievable_ms": 15.9,
  "target_ms": 17.5,
- "basis": "MEASURED in-step at F8K x2 (perf-model/microbench/results/prefill rows.json P3-16 pf8k_L78k: sparse_mla 25.43 ms incl. index_remap 0.69, prologue+aux 6.55, gate_mul 1.69 per step); model ach from out/optables.json 'nvfp4_modelopt|P3-16|prefill' (DSA.sparse_mla 643.1 us + DSA.prologue 10.9 us + DSA.gate_mul 7.7 us per layer x 24)",
- "gap_analysis": "Per F8K step (in-step, release tree): trtllm-gen decode-form fmhaSm107a (QkvE4m3 HQk576 HV512 HVPerCta256 SparseP1 Q64Kv128 2Cta) 24.74 ms = 3.2x its model share; standalone at F16K (ops1 sparse_mla-161) 2480 us/layer vs 643 us model ach. Prologue 6.55 ms (scaled_fp8_quant 2.60, _pad_query_heads 2.06, concat_and_cache_mla 0.84, plus ~1 ms unidentified), gate_mul 1.69 ms. Code reading (this tree): at TP1/DCP1 the in-place RoPE concat path leaves q_pe empty, so quantize_decode_query (the fused quant+pad Triton kernel) is skipped and quant + pad run as two passes over a 1.1 GB/1.5 GB query; trtllm-gen writes a 128-head BF16 output that w_uv reads through a strided [:, :96] view. Kernel-level root cause of the 3.2x is not yet measured (ncu run1 queued).",
+ "basis": "MEASURED standalone per layer at F16K x 24 (runs/P-MLA/run1: 2677.8 us/layer in-family = 64.3 ms/step) and in-step at F8K x2 (perf-model/microbench/results/prefill rows.json: 67 ms); model ach from out/optables.json nvfp4_modelopt|P3-16|prefill (DSA.sparse_mla 643.1 + DSA.prologue 10.9 + DSA.gate_mul 7.7 us/layer)",
+ "gap_analysis": "Per F16K layer (1 GPU, run1): trtllm-gen sparse MLA 2129.5 us (3.29 PF on the 96 real heads; model 643), quant 204.1 + head pad 173.4 + KV insert 42.0 (model prologue 10.9), gate_mul 128.8 (model 7.7). Hardware probes (run2/run3): tcgen05 FP8 2x-K MMA reaches the full rate only with A in TMEM; every SMEM operand byte costs 1/128 clk (128 B/clk/SM operand fetch, measured flat across N and majorness), so both-operands-in-SMEM forms (keys-on-M / transposed) cap at 43% (N=96). TMA writes into SMEM at about 55 B/clk do not slow a full-rate TS MMA (no read/write contention measured). TMA tile::gather4 is issue-bound at about 56 clk per instruction per issuing warp: 1/2/4 warps reach 4.1/7.0/10.9 TB/s of 576 B row gathers; plain LDG gathers reach 18.2 TB/s (1064 us per F16K layer). The per-token gather (2048 rows x 576 B = 19.3 GB per F16K layer, L2->SM) is not in the model (kv_B counts 135 MB of unique KV), and neither is the SMEM operand traffic (36.5 GB per layer at 128 B/clk/SM = 565 us). The stock kernel's 2-CTA HVPerCta256 layout most likely re-gathers V (about 1.9x the minimum gather bytes; inferred from its name and FlashMLA's documented equivalent, ncu is not in the image), which at the measured gather rates explains its 2.1 ms. Measured gather floor (run4): ~18 TB/s for random 576 B rows -> sparse_mla cannot go below ~1.07 ms/layer (25.7 ms/step at F16K) with one gather per token-row; the model (643 us/layer) misses this term. Proposed corrected achievable for the family: 24 x (1.07 + 0.019) = ~26 ms/step (model fix pending owner review).",
  "inefficiencies": [
-  "Decode-form trtllm-gen kernel used for prefill: one token per request, 2048 KV rows gathered per token (MEASURED in-step time; per-cause split pending ncu)",
-  "96 -> 128 head padding: 25% of MMA work wasted plus a padded query copy and 128-head output (MEASURED kernel names; cost share pending ncu)",
-  "HVPerCta256: V512 split across CTAs may recompute QK per V half (HYPOTHESIS, ncu pending)",
-  "Query quant and head pad are two separate full passes (scaled_fp8_quant + _pad_query_heads) because the in-place RoPE concat disables the fused quant_pad kernel (code reading, MEASURED 4.66 ms/F8K step)",
-  "gate_mul is a separate pass over the [T, 12288] BF16 output (MEASURED 1.69 ms/F8K step)",
-  "Unidentified ~1 ms kernel in the DSA prologue (to identify in a profile)"
+  "Stock trtllm-gen kernel: 2-CTA M128 (heads padded 96->128), V re-gathered per CTA half -> about 1.9x the minimum L2->SM bytes; gather-bound (HYPOTHESIS from name + timing; ncu unavailable)",
+  "Perf model omits the per-token KV row gather (19.3 GB/layer at F16K) and the SMEM operand traffic: true floor is max(MMA 566 us at 128 padded rows, SMEM reads 565 us, gather 19.3 GB / L2 rate) per layer",
+  "Query quant and head pad are two separate full passes because the in-place RoPE concat disables the fused quant_pad kernel (MEASURED 377 us/layer at F16K; fix implemented on the branch, measuring)",
+  "gate_mul is a separate pass over [T, 12288] BF16 (MEASURED 129 us/layer)",
+  "FlashInfer prims_ts sparse MLA refuses sm_107 in this image: no drop-in alternative"
  ],
  "rubin_features": [
-  "tcgen05 FP8 (kind::f8f6f4) MMA with TMEM accumulators, 2-CTA pairs",
-  "extended TMEM column budget on sm_107 (fits S and the full 512-wide O for a 96-head tile)",
-  "TMA gather4 / async bulk copies for paged KV row gather",
-  "redux.sync f32 max for cross-lane softmax reductions (transposed-tile design option)",
-  "PDL (programmatic dependent launch) between prologue, attention and w_uv"
+  "tcgen05 FP8 kind::f8f6f4 with the Rubin 2x-K instruction descriptor",
+  "TMEM A operands (Q, P) to stay under the SMEM operand-fetch limit",
+  "576-column exclusive TMEM allocation (2-CTA M128 folded O 256 + S + full Q in TMEM)",
+  "cta_group::2 M128 MMA pairs with TMA tile::gather4 multicast to the pair (gather each row once)",
+  "many-warp TMA gather issue (gather4 is issue-bound per warp)",
+  "oversized (>227 KiB) shared memory carveout for deeper KV rings",
+  "PDL between prologue, attention and w_uv"
  ],
  "plan": [
-  "1. Measure the stock chain kernel by kernel at F8K/F16K on 1 GPU (bench in branch) and ncu the trtllm-gen kernel: tensor pipe %, DRAM/L2 bytes, QK recompute check",
-  "2. Bench FlashInfer prims_ts sparse MLA at 96/128 heads as an existing alternative (per-shape dispatch candidate)",
-  "3. Quick prologue win: one fused kernel for RoPE-concat + FP8 quant + (if still needed) head pad; fuse gate_mul into the w_uv bmm epilogue (bitwise vs stock)",
-  "4. New prefill-form CuTe DSL sparse MLA (sm_107): native 96 heads, single QK per KV tile feeding the full 512-wide O in TMEM, double-buffered paged-KV gather, FP8 KV as stored",
-  "5. Unit tests vs stock (tolerance of the stock FP8-P kernel), microbench at F8K/F16K vs model, then step A/B on the INFRA 1-node harness"
+  "1. DONE measure stock chain per kernel at F8K/F16K; probe MMA operand-fetch, SMEM write contention, TMEM copy, gather4 issue rate",
+  "2. Land the prologue fix: one fused concat+FP8 quant+head pad kernel (bitwise vs stock) instead of quant + pad passes (branch wired; measure in bench and step)",
+  "3. Gather floor with 8/16 issuing warps (run4) -> record the model fix (gather + SMEM terms) with measured numbers",
+  "4. New prefill sparse-MLA kernel (specialized_prefill): 2-CTA M128 TS (Q fully in TMEM via exclusive 576 cols), gather each row once with gather4 multicast to the pair from 8+ issuing warps, P in TMEM, O folded 256 cols, persistent over tokens; target the gather/SMEM floor",
+  "5. gate_mul fused into a w_uv batched GEMM epilogue (stock rounding: bf16(out) * bf16(sigmoid))",
+  "6. Unit tests vs stock, microbench F8K/F16K, step A/B on the INFRA harness, landed-ready"
  ],
  "work": [
-  {"t": "12:40", "what": "Read plan, ledgers, microbench rows; traced the DEP16 DSA path in this tree (dsa.py -> mla_attention.forward_impl -> flashinfer_mla_sparse trtllm-gen)", "result": "stock chain identified; quant+pad unfused due to in-place concat path (code reading)"},
-  {"t": "12:45", "what": "Wrote benchmarks/kernels/benchmark_kimi_k3_prefill_sparse_mla.py (stock chain per kernel + prims_ts + ncu script); staged overlay p-mla-4fbaa15-1; run1 queued on the 1-GPU pool", "result": "waiting for a pool hold (all k31ws holds pending)"}
+  {
+   "t": "12:40",
+   "what": "Read plan/ledgers/microbench; traced the DEP16 DSA path (dsa.py -> mla_attention.forward_impl -> flashinfer_mla_sparse trtllm-gen)",
+   "result": "quant+pad unfused because the in-place RoPE concat path leaves q_pe empty (code reading)"
+  },
+  {
+   "t": "13:00",
+   "what": "run1: stock chain per kernel at F8K and F16K (benchmarks/kernels/benchmark_kimi_k3_prefill_sparse_mla.py)",
+   "result": "F16K per layer: attn 2129.5, w_uk 273.9, quant 204.1, pad 173.4, w_uv 155.9, gate 128.8, insert 42.0 us; prims_ts refuses sm_107"
+  },
+  {
+   "t": "13:05",
+   "what": "run2: tcgen05 FP8 2x-K operand-fetch probe + LDG gather floor",
+   "result": "TS full rate at any N; SS capped at 128 B/clk/SM of operands (N=96: 43%); LDG gather 18.2 TB/s = 1064 us per F16K layer"
+  },
+  {
+   "t": "13:15",
+   "what": "run3: SMEM write/read contention, tcgen05.cp rate, TMA gather4 floor (1/2/4 warps)",
+   "result": "55 B/clk bulk TMA writes do not slow full-rate TS MMA; gather4 issue-bound ~56 clk/instr/warp: 4.1/7.0/10.9 TB/s"
+  },
+  {
+   "t": "13:20",
+   "what": "Wired fused query quant: MLAAttention skips the in-place RoPE concat when the backend fuses concat+quant+pad (fuses_decode_query_quant)",
+   "result": "measuring (bench stage fused_quant_pad)"
+  },
+  {
+   "t": "13:40",
+   "what": "run4: TMA gather4 with 8/16 issuing warps",
+   "result": "14.6 / 17.6 TB/s: random 576 B row gather saturates ~18 TB/s (LDG 18.2) -> ~1.07 ms/layer floor at F16K for gather-once kernels (model omits this term)"
+  },
+  {
+   "t": "13:55",
+   "what": "Wrote specialized_prefill/sparse_mla.py (keys-on-M, native 96 heads, dense 2x-K FP8 MMAs, per-tensor FP8 Q, cp.async row loaders; port of the GB300 T96 v2 prototype) + FLASHINFER_MLA_SPARSE per-shape dispatch (DCP1, no ShardQ, >=1024 rows) + tests + bench stage",
+   "result": "committed a79dc10676 (WIP); run6 (test + F16K bench) queued, both pool holds busy with 4-GPU jobs"
+  }
  ],
- "next": "run1 results (runs/P-MLA/run1): per-kernel times + ncu of fmhaSm107a; meanwhile design the prefill-form kernel",
- "blockers": "No running k31ws pool hold at 12:45 (hold1 jobs pending); run1 waits in wsgpu.sh",
- "branch": "wzhao/k31ws-p-mla @ 4fbaa15189 (bench uncommitted)",
+ "next": "run6: correctness vs FP32 ref and vs trtllm-gen, F16K timing with 3/5 loader warps; then v2: exclusive 576-col TMEM with double-buffered S^T and QK(t+1) before PV(t), more loader warps (setmaxnreg), oversized SMEM for a 3rd KV stage if the DSL launch allows it",
+ "blockers": "ncu/nsys are not in the image (/usr/local/cuda/bin): root causes are from probes and timing, labelled where inferred",
+ "branch": "wzhao/k31ws-p-mla @ a79dc10676 (pushed to wzhao18)",
  "evidence": [
-  "perf-model/microbench/results/prefill/rows.json (P3-16 pf8k_L78k DSA rows)",
-  "perf-model/microbench/results/ops1/rows.json sparse_mla-161",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1"
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1 (stock chain)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run2 (MMA operand fetch, LDG gather)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run3 (SMEM contention, gather4)",
+  "k31ws/findings/P-MLA.md"
  ]
 }

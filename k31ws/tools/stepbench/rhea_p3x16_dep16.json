@@ -1,5 +1,5 @@
 {
- "_source": "k31ws INFRA: P3-16 DEP16 prefill role (perf-model/microbench/results/prefill/tools/pf_common.sh P3: TP1 x DP16, EP16, kimi_k3_mega_moe, trtllm_gvr2 exact top-k, MXFP8 MoE act) at the deployed DP16 (4 nodes, EP16), release env; serving-only args dropped. Placed under roles.decode because cfg2bench builds from that role.",
+ "_source": "k31ws INFRA: P3-16 DEP16 prefill role (perf-model/microbench/results/prefill/tools/pf_common.sh P3: TP1 x DP16, EP16, kimi_k3_mega_moe, trtllm_gvr2 exact top-k, MXFP8 MoE act) at the deployed DP16 (4 nodes, EP16), release env; serving-only args dropped. Placed under roles.decode because cfg2bench builds from that role. | drafter on TOKENSPEED_MLA (the preview drafter is MLA with FP8 KV: FLASH_ATTN is invalid)",
  "environment": {
   "NCCL_CUMEM_ENABLE": "1",
   "NCCL_NVLS_ENABLE": "1",
@@ -39,7 +39,7 @@
     "no-enable-flashinfer-autotune": true,
     "quantization-config": "{\"moe\": {\"activation\": \"mxfp8\"}}",
     "sparse-indexer-topk-backend": "trtllm_gvr2",
-    "speculative-config": "{\"method\": \"dspark\", \"model\": \"/raid/common-models/kimi-k3.1-pro-dspark\", \"num_speculative_tokens\": 3, \"attention_backend\": \"FLASH_ATTN\", \"draft_sample_method\": \"probabilistic\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_length\": 3.08}",
+    "speculative-config": "{\"method\": \"dspark\", \"model\": \"/raid/common-models/kimi-k3.1-pro-dspark\", \"num_speculative_tokens\": 3, \"attention_backend\": \"TOKENSPEED_MLA\", \"draft_sample_method\": \"probabilistic\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_length\": 3.08}",
     "additional-config": "{\"decode_backend\": \"auto\"}",
     "tensor-parallel-size": 1,
     "trust-remote-code": true

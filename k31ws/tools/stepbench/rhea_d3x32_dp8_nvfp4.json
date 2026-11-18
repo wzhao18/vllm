@@ -1,0 +1,54 @@
+{
+ "_source": "k31ws INFRA: D3-32 decode role (rhea_d3x32_dp1.json = release C512 decode role, deep_gemm_mega_moe) at the deployed DP8: TP4=DCP4 x DP8, EP32, 8 nodes | NVFP4 checkpoint view (k31-nvfp4-view*): online-MX quantization-config dropped (EN en_p3x16_dep4_nvfp4.json)",
+ "environment": {
+  "NCCL_CUMEM_ENABLE": "1",
+  "NCCL_NVLS_ENABLE": "1",
+  "NCCL_P2P_LEVEL": "NVL",
+  "NCCL_MNNVL_ENABLE": "1",
+  "VLLM_ALLREDUCE_USE_FLASHINFER": "1",
+  "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+  "VLLM_USE_DIRECT_DCP_A2A": "1",
+  "VLLM_USE_DIRECT_DCP_KV_GATHER": "1",
+  "VLLM_USE_DIRECT_DCP_Q_GATHER": "1",
+  "VLLM_USE_NCCL_SYMM_MEM": "0",
+  "VLLM_USE_V2_MODEL_RUNNER": "1",
+  "VLLM_ENABLE_CUDA_COMPATIBILITY": "0",
+  "VLLM_RPC_TIMEOUT": "600000",
+  "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1800"
+ },
+ "roles": {
+  "decode": {
+   "args": {
+    "attention-backend": "FLASHINFER_MLA_SPARSE",
+    "attention-config": "{\"indexer_kv_dtype\": \"mxfp4\"}",
+    "compilation-config": "{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256, 260, 264, 268, 272, 276, 280, 284, 288, 292, 296, 300, 304, 308, 312, 316, 320, 324, 328, 332, 336, 340, 344, 348, 352, 356, 360, 364, 368, 372, 376, 380, 384, 388, 392, 396, 400, 404, 408, 412, 416, 420, 424, 428, 432, 436, 440, 444, 448, 452, 456, 460, 464, 468, 472, 476, 480, 484, 488, 492, 496, 500, 504, 508, 512]}",
+    "cp-kv-cache-interleave-size": 1,
+    "cpu-distributed-timeout-seconds": 1800,
+    "data-parallel-size": 8,
+    "dcp-comm-backend": "a2a",
+    "decode-context-parallel-size": 4,
+    "distributed-timeout-seconds": 1800,
+    "enable-ep-weight-filter": true,
+    "enable-expert-parallel": true,
+    "gpu-memory-utilization": 0.93,
+    "kernel-config": "{\"flashinfer_sparse_mla_kernel\": \"trtllm\"}",
+    "kv-cache-dtype": "fp8",
+    "language-model-only": true,
+    "mamba-ssm-cache-dtype": "float32",
+    "max-cudagraph-capture-size": 512,
+    "max-model-len": 1048576,
+    "max-num-batched-tokens": 8192,
+    "max-num-seqs": 128,
+    "moe-backend": "deep_gemm_mega_moe",
+    "no-enable-flashinfer-autotune": true,
+    "sparse-indexer-topk-backend": "deep_select",
+    "speculative-config": "{\"method\": \"dspark\", \"model\": \"/raid/common-models/kimi-k3.1-pro-dspark\", \"num_speculative_tokens\": 3, \"attention_backend\": \"TOKENSPEED_MLA\", \"draft_sample_method\": \"probabilistic\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_length\": 3.08}",
+    "additional-config": "{\"decode_backend\": \"latency_specialized\"}",
+    "tensor-parallel-size": 4,
+    "trust-remote-code": true,
+    "use-replayssm": true
+   },
+   "env": {}
+  }
+ }
+}

@@ -1,0 +1,49 @@
+{
+ "_source": "k31ws INFRA: P3-16 DEP16 prefill role (perf-model/microbench/results/prefill/tools/pf_common.sh P3: TP1 x DP16, EP16, kimi_k3_mega_moe, trtllm_gvr2 exact top-k, MXFP8 MoE act) at DP4 = one node (EP4 + expert-count emulation EP16), release env; serving-only args dropped. Placed under roles.decode because cfg2bench builds from that role. | NVFP4 checkpoint view (k31-nvfp4-view*): online-MX quantization-config dropped (EN en_p3x16_dep4_nvfp4.json) | drafter on TOKENSPEED_MLA (the preview drafter is MLA with FP8 KV: FLASH_ATTN is invalid)",
+ "environment": {
+  "NCCL_CUMEM_ENABLE": "1",
+  "NCCL_NVLS_ENABLE": "1",
+  "NCCL_P2P_LEVEL": "NVL",
+  "NCCL_MNNVL_ENABLE": "1",
+  "VLLM_ALLREDUCE_USE_FLASHINFER": "1",
+  "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+  "VLLM_USE_DIRECT_DCP_A2A": "1",
+  "VLLM_USE_DIRECT_DCP_KV_GATHER": "1",
+  "VLLM_USE_DIRECT_DCP_Q_GATHER": "1",
+  "VLLM_USE_NCCL_SYMM_MEM": "0",
+  "VLLM_USE_V2_MODEL_RUNNER": "1",
+  "VLLM_ENABLE_CUDA_COMPATIBILITY": "0",
+  "VLLM_RPC_TIMEOUT": "600000",
+  "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1800"
+ },
+ "roles": {
+  "decode": {
+   "args": {
+    "attention-backend": "FLASHINFER_MLA_SPARSE",
+    "attention-config": "{\"indexer_kv_dtype\": \"mxfp4\"}",
+    "compilation-config": "{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [4]}",
+    "cpu-distributed-timeout-seconds": 1800,
+    "data-parallel-size": 4,
+    "distributed-timeout-seconds": 1800,
+    "enable-ep-weight-filter": true,
+    "enable-expert-parallel": true,
+    "gpu-memory-utilization": 0.92,
+    "kv-cache-dtype": "fp8",
+    "language-model-only": true,
+    "mamba-ssm-cache-dtype": "float32",
+    "max-model-len": 131072,
+    "max-num-batched-tokens": 16384,
+    "max-num-seqs": 4,
+    "max-cudagraph-capture-size": 4,
+    "moe-backend": "kimi_k3_mega_moe",
+    "no-enable-flashinfer-autotune": true,
+    "sparse-indexer-topk-backend": "trtllm_gvr2",
+    "speculative-config": "{\"method\": \"dspark\", \"model\": \"/raid/common-models/kimi-k3.1-pro-dspark\", \"num_speculative_tokens\": 3, \"attention_backend\": \"TOKENSPEED_MLA\", \"draft_sample_method\": \"probabilistic\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_length\": 3.08}",
+    "additional-config": "{\"decode_backend\": \"auto\"}",
+    "tensor-parallel-size": 1,
+    "trust-remote-code": true
+   },
+   "env": {}
+  }
+ }
+}

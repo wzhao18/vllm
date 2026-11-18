@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-KDA agent",
  "state": "implementing",
- "updated": "2026-11-18T14:10-08:00",
+ "updated": "2026-11-18T12:56-08:00",
  "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4, 96 KDA heads at TP1, FP32 state (per GPU, per prefill forward, 69 KDA layers)",
  "baseline_ms": 78,
  "current_ms": 78,
@@ -33,19 +33,24 @@
  ],
  "work": [
   {
-   "t": "13:20",
+   "t": "11:45",
    "what": "read plan/ledger/model rows/code; worktree /Users/weizha/k31ws-wt/p-kda on wzhao/k31ws-p-kda @ 4fbaa15189; wrote benchmarks/kimi_k3/bench_kda_prefill_chain.py; overlay p-kda-4fbaa15-1",
    "result": "baseline bench queued on the 1-GPU pool (holds pending)"
   },
   {
-   "t": "14:05",
+   "t": "12:25",
    "what": "implemented FusedConv K1 variant in ops/flashkda_split (conv_fused.cuh: kda_qkv_conv FP32-weight arithmetic bit for bit, conv state from the first tile), torch op k3_flashkda_split.fwd_conv, specialized_prefill/kda.py:fused_conv_prefill, bitwise unit test vs qkv_conv + FlashKDA, bench --impl stock|split|fused; commit 218581f271 pushed",
    "result": "GPU test + A/B queued (overlay p-kda-4fbaa15-2); 1-GPU pool has no running hold since 13:15"
+  },
+  {
+   "t": "12:55",
+   "what": "implemented gated o_norm + MXFP8 quant in the full-width K2 epilogue (STORE + 2 idle producer warps; norm_mx.cuh), K2 variant pin bits for the per-shape policy bench (VD16/32/64 at 1-4 blocks/SM, full width), layer wiring in kda.py (per-shape: FlashKDA, no segment buffers, no spec/checkpoint) -> commits fe5b9a8594, e3a3631042, 4c8569c491",
+   "result": "all untested on GPU; run ab5 (overlay p-kda-e3a3631-5: tests + stock/split/fusedconv/fused at F16K/F8K + K2 pin sweep + ncu) waiting for a 1-GPU hold"
   }
  ],
- "next": "run test + stock/split/fused breakdown at F16K/F8K as soon as a 1-GPU hold starts; then ncu K2",
+ "next": "ab5 results: verify bitwise conv fusion + norm tolerance, per-kernel breakdown, K2 variant sweep, ncu tensor-pipe utilization of K2",
  "blockers": "k31ws 1-GPU holds all pending (Priority) since 13:15; 16 waiters in the pool",
- "branch": "wzhao/k31ws-p-kda @ 218581f271",
+ "branch": "wzhao/k31ws-p-kda @ 4c8569c491",
  "evidence": [
   "perf-model/plan/PLAN_NVFP4.md",
   "perf-model/microbench/results/ops1 kda-077"

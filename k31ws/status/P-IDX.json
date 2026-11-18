@@ -1,24 +1,47 @@
 {
- "side": "prefill",
- "step_ms": 825,
- "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
- "state": "queued",
- "owner": "unassigned",
- "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/plan/PLAN_NVFP4.md"
- ],
  "id": "P-IDX",
  "title": "Prefill: indexer logits + exact top-k",
+ "side": "prefill",
+ "owner": "P-IDX workflow agent",
+ "state": "analysis",
+ "updated": "2026-11-18T13:25-08:00",
+ "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, per GPU, 24 DSA layers",
  "baseline_ms": 61.5,
  "current_ms": 61.5,
  "achievable_ms": 33.5,
  "target_ms": 37,
- "gap_analysis": "topk_select_bf16 2 x ~120 us/layer (7x model); indexer logits re-read.",
+ "step_ms": 825,
+ "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt); 1-GPU stock microbench at the deployed shape running",
+ "gap_analysis": "Stock prefill indexer per layer (per GPU): 12 chunks (512 MB logits budget -> 1712 rows x 78K keys per chunk), each = DeepGEMM sm100_mqa_logits (MXFP4 x MXFP4 with the 1x-K block-scaled MMA, BF16 logits written to HBM) + trtllm_gvr2 BF16 exact top-k re-reading the logits. Model achievable per layer: idx_score 1.206 ms (bound 'simt': FP32 relu + head-weight FMA epilogue) + topk 0.188 ms. READ FROM SOURCE (not yet measured): the stock DeepGEMM epilogue is NOT FP32: it is cvt.rn.relu.bf16x2.f32 + packed BF16 HFMA2 with BF16 weights (4 BF16 partial lanes, hadd2 combine), so the model's FP32-SIMT epilogue term over-prices stock math by about 2x (model error, to be confirmed by measurement).",
  "inefficiencies": [
-  "Multi-pass top-k",
-  "Logit re-reads"
+  "HYPOTHESIS: logits materialised in HBM (BF16, ~2.5 GB/layer write + >=1 read by the top-k)",
+  "HYPOTHESIS: stock MMA uses the sm_100 1x-K MXF4 descriptor (half the sm_107 FP4 rate)",
+  "Multi-pass sampling top-k (GVR) over the materialised logits, 12 chunk launches per layer",
+  "Model: idx_score epilogue priced as FP32 SIMT while stock is packed BF16 (model too pessimistic)"
+ ],
+ "rubin_features": [
+  "2x-K block-scaled MMA (mxf4 K128) via sm_107a descriptors",
+  "576-column exclusive TMEM",
+  "oversized shared memory for per-row histograms",
+  "tcgen05.ld.red (TMEM load with max reduction)",
+  "PDL / kernel fusion (expensive kernel boundaries)"
+ ],
+ "plan": [
+  "Measure stock per-layer time and kernel split at the deployed shape (1 GPU microbench)",
+  "Root-cause logits kernel vs model (MMA kind, epilogue issue rate) and top-k passes",
+  "Design fused sm_107 logits + exact single-pass histogram select (no logits round trip), exact graph-safe overflow path",
+  "Numerics test vs stock logits (bitwise where order unchanged) + exact top-k test",
+  "Microbench vs model, then step A/B with INFRA step_p harness",
+  "Land in vllm/models/kimi_k3/nvidia/specialized_prefill with stock wiring only"
+ ],
+ "work": [
+  {"t": "13:25", "what": "Read stock path (sparse_attn_indexer chunk loop, DeepGEMM sm100_mqa_logits source from the image, trtllm_gvr2 prefill)", "result": "stock epilogue is packed BF16 (cvt relu bf16x2 + hfma2), logits BF16; 12 chunks/layer at 512 MB budget"}
+ ],
+ "next": "Run 1-GPU stock microbench (runs/P-IDX/bench_pidx_prefill_indexer.py) at 3 x 5461 @ 78360",
+ "blockers": "",
+ "branch": "wzhao/k31ws-p-idx @ 4fbaa15189",
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/"
  ]
 }

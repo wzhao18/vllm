@@ -1,0 +1,438 @@
+[
+ {
+  "fam": "latent_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   2,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   4,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   6,
+   8,
+   14
+  ],
+  "us": 8.246933619181315,
+  "tbps": 6.230221603881492,
+  "relerr": 0.002139838645234704
+ },
+ {
+  "fam": "latent_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   8,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 64,
+  "tactic": [
+   128,
+   64,
+   2,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 64,
+  "tactic": [
+   128,
+   64,
+   4,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 64,
+  "tactic": [
+   128,
+   64,
+   6,
+   8,
+   14
+  ],
+  "us": 8.285120328267416,
+  "tbps": 6.201506069223816,
+  "relerr": 0.0021151769906282425
+ },
+ {
+  "fam": "latent_down",
+  "rows": 64,
+  "tactic": [
+   128,
+   64,
+   8,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   2,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   4,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   6,
+   8,
+   13
+  ],
+  "us": 8.476959864298502,
+  "tbps": 6.061161645508379,
+  "relerr": 0.001848967163823545
+ },
+ {
+  "fam": "latent_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   8,
+   8,
+   13
+  ],
+  "us": 11.679519812266031,
+  "tbps": 4.39917263944701,
+  "relerr": 0.001848967163823545
+ },
+ {
+  "fam": "shared_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   2,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   4,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_down",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   6,
+   8,
+   14
+  ],
+  "us": 15.16560051176283,
+  "tbps": 5.807906118302574,
+  "relerr": 0.0019893040880560875
+ },
+ {
+  "fam": "shared_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   2,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   4,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_down",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   6,
+   8,
+   13
+  ],
+  "us": 15.582577387491861,
+  "tbps": 5.652491356834342,
+  "relerr": 0.002120389137417078
+ },
+ {
+  "fam": "latent_up",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   2,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_up",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   4,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_up",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   6,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_up",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   2,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "latent_up",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   4,
+   8,
+   13
+  ],
+  "us": 11.20298703511556,
+  "tbps": 4.586296836633802,
+  "relerr": 0.002433854155242443
+ },
+ {
+  "fam": "latent_up",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   6,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_gu",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   2,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_gu",
+  "rows": 32,
+  "tactic": [
+   128,
+   64,
+   4,
+   8,
+   14
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_gu",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   2,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "shared_gu",
+  "rows": 96,
+  "tactic": [
+   128,
+   96,
+   4,
+   8,
+   13
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "o_proj",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   2,
+   8,
+   12
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "o_proj",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   4,
+   8,
+   12
+  ],
+  "us": 12.380571365356445,
+  "tbps": 3.5572019012978773,
+  "relerr": 0.0026339192409068346
+ },
+ {
+  "fam": "o_proj",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   6,
+   8,
+   12
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "wq_b",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   2,
+   8,
+   12
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "wq_b",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   4,
+   8,
+   12
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "wq_b",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   6,
+   8,
+   12
+  ],
+  "err": "AssertionError()"
+ },
+ {
+  "fam": "wq_b",
+  "rows": 128,
+  "tactic": [
+   128,
+   128,
+   8,
+   8,
+   12
+  ],
+  "err": "AssertionError()"
+ }
+]

@@ -1,25 +1,44 @@
 {
- "side": "prefill",
- "step_ms": 825,
- "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
- "state": "queued",
- "owner": "unassigned",
- "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/plan/PLAN_NVFP4.md"
- ],
  "id": "P-GEMM",
  "title": "Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops",
- "baseline_ms": 290,
- "current_ms": 290,
- "achievable_ms": 245,
- "target_ms": 262,
- "gap_analysis": "MXFP8 KDA in_proj (unaligned N=49376) 1.16-1.40x, shared MXFP8 + SiLU-mul + quant, router/top-k/latent BF16 GEMMs 1.4x, AttnRes 6.6 ms, small BF16 GEMMs + drafter 14 ms excess.",
+ "side": "prefill",
+ "owner": "P-GEMM workflow agent",
+ "state": "analysis",
+ "updated": "2026-11-18T13:25-08:00",
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, TP1 M=16384 (and F8K M=8192), NVFP4 ckpt",
+ "baseline_ms": 346,
+ "current_ms": 346,
+ "achievable_ms": 268.3,
+ "target_ms": 295,
+ "step_ms": 825,
+ "basis": "PROJECTED until the 1-GPU per-shape bench lands: achievable = sum of model t_ach of my op rows (optables nvfp4_modelopt|P3-16|prefill, 93 layers: attnres 24.8, kda_proj 93.7, mla_proj 56.5, router 5.4, latent 42.6, shared 37.4, dense 6.6, drafter 1.2, lm_head 0.2); baseline = achievable + reviewed ledger excess (router path 20.4, shared 19, KDA proj 18, small BF16 14.5, AttnRes 6.6)",
+ "gap_analysis": "Seeded from the reviewed ledger (MXFP4 ckpt measurements + standalone MXFP8): MXFP8 KDA in_proj (N=49376) 1.16-1.40x standalone on cuBLASLt _scaled_mm, plus a standalone BF16->MXFP8 activation quant per MXFP8 consumer (+40 us/call, 161 calls/step under NVFP4 since the KDA in_proj and shared gate_up inputs come from AttnRes in BF16); router path (BF16 router GEMM N=896 FP32-out ~2x, separate router top-k, latent RMSNorm) ~20 ms; small-N BF16 GEMMs (qkv_a N=2272, q_proj, f_b_proj K=128) 1.2-3.5x; AttnRes pre/post ~1.3x. Big BF16 GEMMs (g_proj, o_proj, dense) are already at 0.96-1.09x the model (measured). First action: per-shape microbench of every backend at M=16384/8192 to replace the ledger with measured numbers.",
  "inefficiencies": [
-  "Unaligned N tactics",
-  "Separate activation quant",
-  "Unfused router/latent epilogues"
- ]
+  "HYPOTHESIS: cuBLASLt MXFP8 tactic for N=49376 (not a multiple of 256) is not the best 2-CTA 2x-K tile; standalone 1.16-1.40x",
+  "MEASURED (ledger): separate BF16->MXFP8 activation quant on KDA in_proj and shared gate_up inputs (+40 us/call)",
+  "MEASURED (prefill README): router GEMM N=896 FP32 out at ~2.1-2.8x, router top-k and latent RMSNorm as separate kernels",
+  "MEASURED (prefill README): f_b_proj K=128 small-K GEMM 2.1-3.5x (poor tile)",
+  "MEASURED (gap512): AttnRes pre/post 1.3x"
+ ],
+ "rubin_features": [
+  "sm_107a 2x-K block-scaled MMA (mxf8f6f4) for MXFP8",
+  "2-CTA M256 tiles (full-rate operand fetch), exclusive TMEM allocation",
+  "oversized shared memory for deeper A/B pipelines",
+  "TMA multicast across cluster",
+  "epilogue fusion (MXFP8 quant in producer epilogues)"
+ ],
+ "plan": [
+  "1. 1-GPU microbench of all my GEMMs at M=16384/8192, every backend (cuBLASLt, FlashInfer cute-dsl/cutlass/cudnn), vs model achievable; kernel names to identify 1x-K vs 2x-K tactics",
+  "2. Fuse MXFP8 activation quant into AttnRes (KDA in_proj input, MoE input for shared gate_up) - removes ~161 quant passes/step",
+  "3. Per-shape MXFP8 dispatch at M>=4096 (best backend per [N,K]); if none reaches 1.1x, a CuTe DSL 2-CTA 2x-K persistent GEMM for the KDA in_proj",
+  "4. Router GEMM + top-k fusion / tile choice; latent norm fusion",
+  "5. Step A/B with INFRA step_p.sh (P3-16 DEP4 slice, NVFP4 view from EN)"
+ ],
+ "work": [
+  {"t": "13:20", "what": "worktree /Users/weizha/k31ws-wt/p-gemm (wzhao/k31ws-p-gemm @ 4fbaa15189); wrote benchmarks/kimi_k3/pgemm_bench.py (CUPTI kernel time per backend vs model ach)", "result": "queued on pool (runs/P-GEMM/b1)"}
+ ],
+ "next": "read runs/P-GEMM/b1 results; pick per-shape winners; start AttnRes+MXFP8 quant fusion",
+ "blockers": "pool contention (16 waiters at 13:22)",
+ "branch": "wzhao/k31ws-p-gemm @ 4fbaa15189",
+ "evidence": ["perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill", "perf-model/plan/nvfp4_ledgers_summary.txt", "perf-model/microbench/results/prefill/README.md"]
 }
