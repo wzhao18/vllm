@@ -23,6 +23,7 @@ D3-32):
 re-arms its box.
 """
 
+import os
 import time
 import zlib
 
@@ -40,7 +41,10 @@ BLOCK = 12
 NBLOCKS = 8
 SENTINEL = -0x80000000
 SHARDS = (4, 32, 96)  # n rows per rank: r1 / r8 / r24 of D3-32
-LAYERS = (0, 1, 12, 13, 92)  # first, plain, block write, after one, 8 blocks
+# first, plain, block write, after one, 8 blocks
+LAYERS = tuple(
+    int(x) for x in os.environ.get("SP_FUSED_LAYERS", "0,1,12,13,92").split(",")
+)
 
 
 def _cdiv(a, b):
@@ -134,6 +138,8 @@ def _worker(env: dict[str, str]) -> None:
                 for mode in ("stock", "fused"):
                     prefix, blocks = prefix0.clone(), blocks0.clone()
                     dist.barrier()
+                    if os.environ.get("SP_FUSED_TRACE"):
+                        print(f"rank{rank} R{rows} L{layer} {mode}", flush=True)
                     if mode == "stock":
                         x = attn_res(
                             prefix, d, blocks, *pre_w, num_blocks=prev,
