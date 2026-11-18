@@ -1,4 +1,4 @@
-"""EP <= 16 targets for the microbench lanes: model t_SOL / t_achievable per op for every in-scope topology and band.
+"""Targets (<= 32 GPUs per instance, topologies.SCOPE) for the microbench lanes: model t_SOL / t_achievable per op for every in-scope topology and band.
 
     python3 perf-model/run.py && python3 perf-model/microbench/results/model/make_targets.py
 
@@ -28,7 +28,7 @@ def main():
     cols, ccols = opt["cols"], opt["comm_cols"]
     out = dict(
         generated=meta["generated"], source="perf-model/out/optables.json (run.py), scope = topologies.SCOPE",
-        scope_rule="EP <= 16 and <= 16 GPUs per engine/EP domain (MoE-TP D1 included; AFD, PP4, EP32-72 dropped)",
+        scope_rule="<= 32 GPUs per instance: EP <= 32 (MoE-TP D1 included; AFD, PP4, EP64-72 dropped). The wave-1 targets.json in this directory was built at EP <= 16 with the pre-fix model",
         units="t_sol_us / t_ach_us per op instance; count = instances per step; step_* = whole step in ms",
         bands={"prefill_F16K_L78K": "prefill chunk F=16384 fresh tokens per engine over L=78.4K, 5,456 fresh/request",
                "decode_r1": "decode r=1 request/GPU, k=3 (4 rows/request), L=135K",

@@ -3,7 +3,7 @@
     B_group = r * N requests on one TP group (N = 1 for DEP / DSA-CP); rows = B_group * (1 + k)
     step    = sum over layers (op roofline + comm) + drafter + verify + launch gaps   [cost.step]
     ITL     = step / AL          interactivity (tok/s/user) = AL / step          tok/s/GPU = r * AL / step
-Capacity: r <= r_max (kv.capacity).  Variants: base | O2+O3 (dedup + die-local streaming) | O1+O2+O3 (+two-batch
+Capacity: r <= r_max (kv.capacity; SOL = byte-exact state, achievable = packed block pool with its per-request floor).  Variants: base | O2+O3 (dedup + die-local streaming) | O1+O2+O3 (+two-batch
 overlap, evaluated at half batch twice).  D11 AFD picks the best A:F pool split per r.
 """
 import cost
@@ -53,8 +53,13 @@ def _run(t, ck, col, r, k, L, o1, v, detail):
     res = cost.evaluate(t, "decode", ck, col, env, o2=v["o2"], o3=v["o3"], ops_detail=detail)
     st = cost.step(res, o1=o1, reps=2 if o1 else 1)
     AL = Mdl.AL_GOLDEN[k]
+    mm = res.get("megamoe")
+    # routed-expert component (ms per step): the whole MegaMoE layer (EP) or the routed-expert ops (MoE-TP) - the
+    # calibrated column derates it with the expert-kernel family (calibrate.py)
+    experts_ms = (mm["layer"] * 92 * (2 if o1 else 1) * 1e3) if mm else st["groups"].get("routed experts", 0.0) * 1e3
     out = dict(r=r, o1=o1, t_ms=st["t"] * 1e3, tps_gpu=r * AL / st["t"], tps_user=AL / st["t"],
-               groups={g: x * 1e3 for g, x in st["groups"].items()}, hops=st["hops"], n_comm=st["n_comm"])
+               groups={g: x * 1e3 for g, x in st["groups"].items()}, hops=st["hops"], n_comm=st["n_comm"],
+               experts_ms=experts_ms, rows_per_rank=env["T"] / t.N)
     if detail:
         out["fam"] = {f: x * 1e3 for f, x in st["fam"].items()}
         out["comm_by"] = {p: x * 1e3 for p, x in st["comm_by"].items()}
@@ -131,7 +136,8 @@ def run_afd(t, ck, col, r, k, L, variant):
 
 
 def curve(t, ck, col, k, variant, L=L_DEC):
-    cap = capacity(t, ck, k, L)
+    """SOL column: byte-exact capacity; achievable column: the packed block pool floor (kv.py)."""
+    cap = capacity(t, ck, k, L, col=col)
     pts = []
     for r in r_points(t, cap["rmax"]):
         p = run_point(t, ck, col, r, k, L, variant)

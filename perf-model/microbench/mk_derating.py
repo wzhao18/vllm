@@ -8,6 +8,16 @@ T = ld(R + '/model/targets.json')['targets']
 dec = ld(R + '/decode/rows.json')
 pre = ld(R + '/prefill/rows.json')
 g512 = ld(R + '/gap512/rows.json')
+# wave 2 (2026-11-18): D3-32 EP32 decode, same-session D3 control + release NVFP4-MoE arm, P2b / P5-4 / P5-8 prefill and
+# release NVFP4 arms. Their t_ach (if any) came from a mid-run optables; every point below also gets the CURRENT model's
+# achievable (model_ach_ms_current / derate_current, computed here), which is what calibrate.py uses.
+w2 = ld(R + '/wave2/rows.json')
+for r in w2:
+    if r.get('kind') == 'step':
+        tag = r['case'].split(':')[0]
+        dec.append(dict(r, case='w2:' + r['case'], moe_quant='nvfp4' if tag.startswith('d3rel') else 'mxfp4_mxfp8'))
+    elif r.get('row') == 'full step':
+        pre.append(r)
 
 def ach(topo, band, ck='mxfp4_release'):
     return T[f'{ck}|{topo}|{band}']['step_ach_ms']
@@ -17,21 +27,23 @@ dsteps = collections.defaultdict(list)
 for r in dec:
     if r['kind'] != 'step':
         continue
-    dsteps[(r['topology'], r['k'], r['r_per_gpu'])].append(r)
+    dsteps[(r['topology'], r['k'], r['r_per_gpu'], r.get('moe_quant', 'mxfp4_mxfp8'))].append(r)
 for r in g512:
     if r['group'] == 'STEP' and r['topology'].startswith('D3'):
         B = int(r['case'].split('_B')[1].split('_')[0])
-        dsteps[('D3', 3, B / 4)].append({'case': 'gap512:' + r['case'], 'measured_us': r['measured_us'],
+        dsteps[('D3', 3, B / 4, 'mxfp4_mxfp8')].append({'case': 'gap512:' + r['case'], 'measured_us': r['measured_us'],
                                           't_ach_us': r['t_ach_us'], 'derate': r['derate'], 'notes': r['notes']})
 topo = {}
-for (tp, k, rr), rows in sorted(dsteps.items()):
+for (tp, k, rr, mq), rows in sorted(dsteps.items()):
     meas = statistics.median(x['measured_us'] for x in rows) / 1000
-    a = rows[0]['t_ach_us'] / 1000
+    old = [x['t_ach_us'] for x in rows if x.get('t_ach_us') and not x['case'].startswith('w2:')]
+    a = old[0] / 1000 if old else None
     e = topo.setdefault(tp, {'phase': 'decode', 'points': [], 'source_rows': []})
-    e['points'].append({'k': k, 'r_per_gpu': rr, 'measured_ms': round(meas, 2), 'model_ach_ms': round(a, 2),
-                        'derate': round(meas / a, 3), 'n_rows': len(rows),
-                        'kernel_debug': meas / a > 2.0})
-    e['source_rows'] += [('decode:' + x['case']) if not x['case'].startswith('gap512') else x['case'] for x in rows]
+    e['points'].append({'k': k, 'r_per_gpu': rr, 'moe_quant': mq, 'measured_ms': round(meas, 2),
+                        'model_ach_ms': round(a, 2) if a else None,
+                        'derate': round(meas / a, 3) if a else None, 'n_rows': len(rows),
+                        'kernel_debug': bool(a and meas / a > 2.0)})
+    e['source_rows'] += [('decode:' + x['case']) if not x['case'].startswith(('gap512', 'w2:')) else x['case'] for x in rows]
 
 def band_of(rr):
     return 'r<=0.25' if rr <= 0.25 else 'r0.5-2' if rr <= 2 else 'r3-8' if rr <= 8 else 'r12-24'
@@ -39,6 +51,8 @@ def band_of(rr):
 for tp, e in topo.items():
     bands = collections.defaultdict(list)
     for p in e['points']:
+        if p['derate'] is None or p.get('moe_quant', 'mxfp4_mxfp8') != 'mxfp4_mxfp8':
+            continue
         if tp == 'D1' and p['k'] == 7 and p['r_per_gpu'] == 8:
             continue  # MoE path-switch cliff, excluded from trend (KERNEL-DEBUG listed separately)
         bands[band_of(p['r_per_gpu'])].append(p['derate'])
@@ -46,6 +60,7 @@ for tp, e in topo.items():
                            for b, v in bands.items()}
 topo['D1']['notes'] = 'specialized decode TP16=DCP16, MoE-TP16 (no EP); k7 r8 cliff (51.2 ms, MoE path switch at 1024 rows) excluded from band derates'
 topo['D2']['notes'] = 'ran MoE-TP8 (sdec refuses EP8 token-shard); model D2 is EP8 -> not like-for-like at r>=4'
+topo['D3-32'] = dict(topo['D3-32'], notes='wave 2: DP8 x (TP4=DCP4) SP, EP32, vendored megamoe_rubin (deep_gemm situ); KV 2329 blocks/rank, 13 blocks/request, r_max ~44.8; r32 bench OOM, r48 refused (SP 512 verify-row cap)')
 topo['D3']['notes'] = 'vendored megamoe_rubin (older kernel); SP path uses generic cuBLAS split-K BF16 GEMMs; gap512 C512 rows merged (B32-B92 = r8-23)'
 
 # ---------------- per-topology: prefill step rows ----------------
@@ -56,10 +71,10 @@ for r in pre:
     rel = 'release' in r['case']
     e = topo.setdefault(tp, {'phase': 'prefill', 'points': [], 'source_rows': []})
     tokgpu = r['notes'].split(' tok/s/GPU')[0]
-    e['points'].append({'case': r['case'][:70], 'moe_quant': 'nvfp4 (release default, not like-for-like)' if rel else 'mxfp4_mxfp8',
+    e['points'].append({'case': r['case'], 'moe_quant': 'nvfp4 (release default, not like-for-like)' if rel else 'mxfp4_mxfp8',
                         'measured_ms': round(r['measured_us'] / 1000, 1), 'model_ach_ms': round(r['t_ach_us'] / 1000, 1),
                         'derate': r['derate'], 'measured_tok_s_gpu': float(tokgpu)})
-    e['source_rows'].append('prefill:' + r['case'])
+    e['source_rows'].append(('wave2:' if r.get('wave') == 2 else 'prefill:') + r['case'])
 for r in g512:
     if r['group'] == 'STEP' and r['topology'].startswith('P2'):
         e = topo['P2']
@@ -67,7 +82,7 @@ for r in g512:
                             'measured_ms': round(r['measured_us'] / 1000, 1), 'model_ach_ms': round(r['t_ach_us'] / 1000, 1),
                             'derate': r['derate']})
         e['source_rows'].append('gap512:' + r['case'])
-for tp in ['P1', 'P2', 'P3-16', 'P4-4', 'P4-2']:
+for tp in ['P1', 'P2', 'P3-16', 'P4-4', 'P4-2', 'P2b', 'P5-4', 'P5-8']:
     v = [p['derate'] for p in topo[tp]['points'] if p['moe_quant'] == 'mxfp4_mxfp8']
     topo[tp]['derate_step'] = {'median': round(statistics.median(v), 3), 'min': min(v), 'max': max(v), 'n': len(v)}
 topo['P1']['notes'] = 'P1 AttnRes model error (code runs AttnRes on 1/8 rows + AG; model prices all rows) offsets ~20 ms of excess'
@@ -81,7 +96,7 @@ analog_d = {'D5': 'D3', 'D6': 'D3', 'D7-4-16': 'D3', 'D7-2-16': 'D3', 'D7-8-16':
 meas_at = {}
 for tp in ['D1', 'D2', 'D3']:
     for p in topo[tp]['points']:
-        if p['k'] == 3:
+        if p['k'] == 3 and p['model_ach_ms'] and p.get('moe_quant', 'mxfp4_mxfp8') == 'mxfp4_mxfp8':
             meas_at[(tp, p['r_per_gpu'])] = p
 def analog_pt(tp, rr):
     if (tp, rr) in meas_at:
@@ -126,7 +141,7 @@ for tp, N in Nattn.items():
     key = f'mxfp4_release|{tp}|prefill_F16K_L78K'
     a = T[key]['step_ach_ms']
     model_tps = 16384 / N / (a / 1000)
-    if tp in ('P1', 'P2', 'P3-16', 'P4-4', 'P4-2'):
+    if tp in ('P1', 'P2', 'P3-16', 'P4-4', 'P4-2', 'P2b', 'P5-4', 'P5-8'):
         p16 = [p for p in topo[tp]['points'] if p['moe_quant'] == 'mxfp4_mxfp8' and 'L78k' in p['case'] and ('16k' in p['case'] or tp == 'P3-16')]
         p16 = [p for p in p16 if '16k' in p['case']] or p16
         d = p16[0]['derate']
@@ -211,7 +226,7 @@ fam = {
 
 out = {
  'generated': '2026-11-18',
- 'scope': 'EP <= 16 (<= 16 GPUs); checkpoint mxfp4_release (MXFP8 MoE act, BF16 linears, FP8 MLA KV, MXFP4 idx KV, FP32 KDA state, exact top-k); decode k=3 L=135K, prefill F16K L78K',
+ 'scope': 'waves 1-2: EP <= 16 plus D3-32 (EP32, wave 2); model scope <= 32 GPUs; checkpoint mxfp4_release (MXFP8 MoE act, BF16 linears, FP8 MLA KV, MXFP4 idx KV, FP32 KDA state, exact top-k); decode k=3 L=135K, prefill F16K L78K',
  'definition': 'derate = measured_us / model t_ach_us (achievable column of out/optables.json / microbench/results/model/targets.json). >2.0 = KERNEL-DEBUG.',
  'versions': {
    'tree': 'dsrel/trees/rel-1767cf7 (SOURCE_REV 6a14e2fada)', 'flashinfer': '0.7.3.dev20261031 (in-step); MegaMoE standalone FI 6e438852b (wzhao/kimi-k3-megamoe-sm107-final-20261117)',
@@ -228,6 +243,28 @@ out = {
    'gap512 20-3400x derates on near-zero model terms = unfused op the model does not charge',
  ],
 }
+# ---------------- current-model achievable for every measured step point (calibrate.py basis) ----------------
+import re, sys
+sys.path.insert(0, PM)
+import decode as _Dec, prefill as _Pre  # noqa: E402
+from topologies import ALL as _ALL  # noqa: E402
+for tp, e in topo.items():
+    for p in e['points']:
+        if e['phase'] == 'decode':
+            a = _Dec.run_point(_ALL[tp], 'mxfp4_release', 'achievable', p['r_per_gpu'], p['k'])['t_ms']
+        else:
+            m = re.search(r'model \S+ F(\d+)(?: f(\d+))?', p['case'])
+            if not m or 'L78k' not in p['case'] and 'fresh' not in p['case']:
+                continue
+            F = int(m.group(1)); f = int(m.group(2)) if m.group(2) else _Pre.F_REQ
+            L = _Pre.L_REF if 'L78k' in p['case'] else F
+            act = 'nvfp4' if p['moe_quant'].startswith('nvfp4') else None
+            a = _Pre.run_point(_ALL[tp], 'mxfp4_release', 'achievable', F, L, f_req=min(f, F), moe_act=act)['t_ms']
+        p['model_ach_ms_current'] = round(a, 3)
+        p['derate_current'] = round(p['measured_ms'] / a, 3)
+out['current_model_note'] = ('model_ach_ms / derate: wave-1 basis (targets.json, pre-fix model); model_ach_ms_current / '
+                             'derate_current: the current model (achievable column), recomputed by this script; '
+                             'NVFP4-MoE (release) prefill points use the O4 NVFP4-activation model')
 json.dump(out, open(PM + '/inputs/derating.json', 'w'), indent=1)
 
 # ---------- print tables for RESULTS.md ----------

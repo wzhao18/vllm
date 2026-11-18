@@ -1,6 +1,6 @@
 {
  "generated": "2026-11-18",
- "scope": "EP <= 16 (<= 16 GPUs); checkpoint mxfp4_release (MXFP8 MoE act, BF16 linears, FP8 MLA KV, MXFP4 idx KV, FP32 KDA state, exact top-k); decode k=3 L=135K, prefill F16K L78K",
+ "scope": "waves 1-2: EP <= 16 plus D3-32 (EP32, wave 2); model scope <= 32 GPUs; checkpoint mxfp4_release (MXFP8 MoE act, BF16 linears, FP8 MLA KV, MXFP4 idx KV, FP32 KDA state, exact top-k); decode k=3 L=135K, prefill F16K L78K",
  "definition": "derate = measured_us / model t_ach_us (achievable column of out/optables.json / microbench/results/model/targets.json). >2.0 = KERNEL-DEBUG.",
  "versions": {
   "tree": "dsrel/trees/rel-1767cf7 (SOURCE_REV 6a14e2fada)",
@@ -443,146 +443,194 @@
     {
      "k": 3,
      "r_per_gpu": 0.0625,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 5.18,
      "model_ach_ms": 3.61,
      "derate": 1.437,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 3.781,
+     "derate_current": 1.37
     },
     {
      "k": 3,
      "r_per_gpu": 0.125,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 5.11,
      "model_ach_ms": 4.21,
      "derate": 1.214,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 4.412,
+     "derate_current": 1.158
     },
     {
      "k": 3,
      "r_per_gpu": 0.25,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 6.83,
      "model_ach_ms": 5.32,
      "derate": 1.284,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 5.589,
+     "derate_current": 1.222
     },
     {
      "k": 3,
      "r_per_gpu": 1.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 10.76,
      "model_ach_ms": 8.95,
      "derate": 1.202,
      "n_rows": 3,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 9.169,
+     "derate_current": 1.173
     },
     {
      "k": 3,
      "r_per_gpu": 1.75,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 13.92,
      "model_ach_ms": 10.6,
      "derate": 1.313,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 10.855,
+     "derate_current": 1.282
     },
     {
      "k": 3,
      "r_per_gpu": 2.375,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 15.29,
      "model_ach_ms": 11.47,
      "derate": 1.333,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.778,
+     "derate_current": 1.298
     },
     {
      "k": 3,
      "r_per_gpu": 4.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 18.28,
      "model_ach_ms": 13.08,
      "derate": 1.397,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 13.452,
+     "derate_current": 1.359
     },
     {
      "k": 3,
      "r_per_gpu": 8.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 25.08,
      "model_ach_ms": 16.5,
      "derate": 1.52,
      "n_rows": 2,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 17.223,
+     "derate_current": 1.456
     },
     {
      "k": 7,
      "r_per_gpu": 0.0625,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 4.87,
      "model_ach_ms": 4.22,
      "derate": 1.153,
      "n_rows": 3,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 4.431,
+     "derate_current": 1.099
     },
     {
      "k": 7,
      "r_per_gpu": 0.125,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 6.55,
      "model_ach_ms": 5.34,
      "derate": 1.226,
      "n_rows": 2,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 5.609,
+     "derate_current": 1.168
     },
     {
      "k": 7,
      "r_per_gpu": 0.25,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 8.75,
      "model_ach_ms": 7.0,
      "derate": 1.25,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 7.224,
+     "derate_current": 1.211
     },
     {
      "k": 7,
      "r_per_gpu": 0.375,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 10.35,
      "model_ach_ms": 7.97,
      "derate": 1.298,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 8.343,
+     "derate_current": 1.241
     },
     {
      "k": 7,
      "r_per_gpu": 0.75,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 13.39,
      "model_ach_ms": 9.96,
      "derate": 1.344,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 10.405,
+     "derate_current": 1.287
     },
     {
      "k": 7,
      "r_per_gpu": 1.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 15.04,
      "model_ach_ms": 10.97,
      "derate": 1.371,
      "n_rows": 2,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.268,
+     "derate_current": 1.335
     },
     {
      "k": 7,
      "r_per_gpu": 4.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 24.77,
      "model_ach_ms": 16.22,
      "derate": 1.527,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 16.942,
+     "derate_current": 1.462
     },
     {
      "k": 7,
      "r_per_gpu": 8.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 51.41,
      "model_ach_ms": 22.86,
      "derate": 2.249,
      "n_rows": 2,
-     "kernel_debug": true
+     "kernel_debug": true,
+     "model_ach_ms_current": 23.694,
+     "derate_current": 2.17
     }
    ],
    "source_rows": [
@@ -639,128 +687,170 @@
     {
      "k": 3,
      "r_per_gpu": 0.125,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 7.32,
      "model_ach_ms": 5.09,
      "derate": 1.437,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 4.364,
+     "derate_current": 1.677
     },
     {
      "k": 3,
      "r_per_gpu": 0.25,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 10.76,
      "model_ach_ms": 6.01,
      "derate": 1.79,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 5.134,
+     "derate_current": 2.096
     },
     {
      "k": 3,
      "r_per_gpu": 0.5,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 11.1,
      "model_ach_ms": 7.68,
      "derate": 1.445,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 6.534,
+     "derate_current": 1.699
     },
     {
      "k": 3,
      "r_per_gpu": 1.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 15.48,
      "model_ach_ms": 10.45,
      "derate": 1.482,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 8.861,
+     "derate_current": 1.747
     },
     {
      "k": 3,
      "r_per_gpu": 4.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 33.3,
      "model_ach_ms": 17.78,
      "derate": 1.873,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 14.853,
+     "derate_current": 2.242
     },
     {
      "k": 3,
      "r_per_gpu": 8.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 38.86,
      "model_ach_ms": 20.54,
      "derate": 1.892,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 17.348,
+     "derate_current": 2.24
     },
     {
      "k": 3,
      "r_per_gpu": 9.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 42.66,
      "model_ach_ms": 21.06,
      "derate": 2.026,
      "n_rows": 1,
-     "kernel_debug": true
+     "kernel_debug": true,
+     "model_ach_ms_current": 17.815,
+     "derate_current": 2.395
     },
     {
      "k": 7,
      "r_per_gpu": 0.125,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 9.37,
      "model_ach_ms": 6.03,
      "derate": 1.554,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 5.15,
+     "derate_current": 1.819
     },
     {
      "k": 7,
      "r_per_gpu": 0.25,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 10.94,
      "model_ach_ms": 7.7,
      "derate": 1.421,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 6.551,
+     "derate_current": 1.67
     },
     {
      "k": 7,
      "r_per_gpu": 0.5,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 15.45,
      "model_ach_ms": 10.45,
      "derate": 1.478,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 8.879,
+     "derate_current": 1.74
     },
     {
      "k": 7,
      "r_per_gpu": 1.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 20.96,
      "model_ach_ms": 14.16,
      "derate": 1.481,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.884,
+     "derate_current": 1.764
     },
     {
      "k": 7,
      "r_per_gpu": 4.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 38.51,
      "model_ach_ms": 20.25,
      "derate": 1.902,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 17.051,
+     "derate_current": 2.259
     },
     {
      "k": 7,
      "r_per_gpu": 5.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 47.12,
      "model_ach_ms": 21.21,
      "derate": 2.221,
      "n_rows": 1,
-     "kernel_debug": true
+     "kernel_debug": true,
+     "model_ach_ms_current": 17.959,
+     "derate_current": 2.624
     },
     {
      "k": 7,
      "r_per_gpu": 6.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 49.5,
      "model_ach_ms": 22.18,
      "derate": 2.232,
      "n_rows": 1,
-     "kernel_debug": true
+     "kernel_debug": true,
+     "model_ach_ms_current": 18.921,
+     "derate_current": 2.616
     }
    ],
    "source_rows": [
@@ -813,110 +903,206 @@
     {
      "k": 3,
      "r_per_gpu": 0.25,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 15.57,
      "model_ach_ms": 8.16,
      "derate": 1.908,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 7.539,
+     "derate_current": 2.065
     },
     {
      "k": 3,
      "r_per_gpu": 0.5,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 17.57,
      "model_ach_ms": 9.41,
      "derate": 1.868,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 8.539,
+     "derate_current": 2.058
     },
     {
      "k": 3,
      "r_per_gpu": 1.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 21.19,
      "model_ach_ms": 11.09,
      "derate": 1.911,
-     "n_rows": 3,
-     "kernel_debug": false
+     "n_rows": 4,
+     "kernel_debug": false,
+     "model_ach_ms_current": 9.857,
+     "derate_current": 2.15
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 1.0,
+     "moe_quant": "nvfp4",
+     "measured_ms": 19.77,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 9.857,
+     "derate_current": 2.006
     },
     {
      "k": 3,
      "r_per_gpu": 2.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 22.33,
      "model_ach_ms": 12.71,
      "derate": 1.757,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.033,
+     "derate_current": 2.024
     },
     {
      "k": 3,
      "r_per_gpu": 4.0,
-     "measured_ms": 24.84,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 24.81,
      "model_ach_ms": 13.74,
-     "derate": 1.808,
-     "n_rows": 2,
-     "kernel_debug": false
+     "derate": 1.806,
+     "n_rows": 3,
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.774,
+     "derate_current": 2.107
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 4.0,
+     "moe_quant": "nvfp4",
+     "measured_ms": 22.18,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.774,
+     "derate_current": 1.884
     },
     {
      "k": 3,
      "r_per_gpu": 8.0,
-     "measured_ms": 24.41,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 24.37,
      "model_ach_ms": 14.7,
-     "derate": 1.661,
-     "n_rows": 4,
-     "kernel_debug": false
+     "derate": 1.658,
+     "n_rows": 5,
+     "kernel_debug": false,
+     "model_ach_ms_current": 12.451,
+     "derate_current": 1.957
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 8.0,
+     "moe_quant": "nvfp4",
+     "measured_ms": 21.76,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 12.451,
+     "derate_current": 1.748
     },
     {
      "k": 3,
      "r_per_gpu": 12.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 27.22,
      "model_ach_ms": 15.6,
      "derate": 1.745,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 13.215,
+     "derate_current": 2.06
     },
     {
      "k": 3,
      "r_per_gpu": 12.5,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 29.03,
      "model_ach_ms": 15.71,
      "derate": 1.848,
      "n_rows": 2,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 13.31,
+     "derate_current": 2.181
     },
     {
      "k": 3,
      "r_per_gpu": 16.0,
-     "measured_ms": 30.53,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 30.37,
      "model_ach_ms": 16.51,
-     "derate": 1.849,
-     "n_rows": 4,
-     "kernel_debug": false
+     "derate": 1.839,
+     "n_rows": 5,
+     "kernel_debug": false,
+     "model_ach_ms_current": 13.974,
+     "derate_current": 2.173
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 16.0,
+     "moe_quant": "nvfp4",
+     "measured_ms": 27.66,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 13.974,
+     "derate_current": 1.979
     },
     {
      "k": 3,
      "r_per_gpu": 20.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 33.02,
      "model_ach_ms": 17.7,
      "derate": 1.865,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 14.933,
+     "derate_current": 2.211
     },
     {
      "k": 3,
      "r_per_gpu": 23.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 32.74,
      "model_ach_ms": 18.44,
      "derate": 1.776,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 15.747,
+     "derate_current": 2.079
     },
     {
      "k": 3,
      "r_per_gpu": 24.0,
+     "moe_quant": "mxfp4_mxfp8",
      "measured_ms": 33.34,
      "model_ach_ms": 18.84,
      "derate": 1.77,
      "n_rows": 1,
-     "kernel_debug": false
+     "kernel_debug": false,
+     "model_ach_ms_current": 16.024,
+     "derate_current": 2.081
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 24.0,
+     "moe_quant": "nvfp4",
+     "measured_ms": 30.19,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 16.024,
+     "derate_current": 1.884
     }
    ],
    "source_rows": [
@@ -925,23 +1111,32 @@
     "decode:d3k3:q4_B4_M16_u132k",
     "decode:d3k3p:q4_B4_M16_u132k",
     "decode:d3k3-int5-c512-agentx:q4_B4_M16_agentx",
+    "w2:d3baselo:q4_B4_M16_u132k",
+    "w2:d3rello:q4_B4_M16_u132k",
     "decode:d3k3:q4_B8_M32_u132k",
     "decode:d3k3:q4_B16_M64_u132k",
     "decode:d3k3-int5-c512-agentx:q4_B16_M64_agentx",
+    "w2:d3baselo:q4_B16_M64_u132k",
+    "w2:d3rello:q4_B16_M64_u132k",
     "decode:d3k3:q4_B32_M128_u132k",
     "decode:d3k3p:q4_B32_M128_u132k",
     "decode:d3k3-int5-c512-agentx:q4_B32_M128_agentx",
+    "w2:d3baselo:q4_B32_M128_u132k",
     "gap512:q4_B32_M128_agentx",
+    "w2:d3rello:q4_B32_M128_u132k",
     "decode:d3k3b48:q4_B48_M192_u132k",
     "decode:d3k3-int5-c512-agentx:q4_B50_M200_agentx",
     "gap512:q4_B50_M200_agentx",
     "decode:d3k3b64:q4_B64_M256_u132k",
     "decode:d3k3p64:q4_B64_M256_u132k",
     "decode:d3k3-int5-c512-agentx:q4_B64_M256_agentx",
+    "w2:d3baseb64:q4_B64_M256_u132k",
     "gap512:q4_B64_M256_agentx",
+    "w2:d3relb64:q4_B64_M256_u132k",
     "gap512:q4_B80_M320_agentx",
     "gap512:q4_B92_M368_agentx",
-    "decode:d3k3b96:q4_B96_M384_u132k"
+    "decode:d3k3b96:q4_B96_M384_u132k",
+    "w2:d3relb96:q4_B96_M384_u132k"
    ],
    "derate_by_band": {
     "r<=0.25": {
@@ -957,19 +1152,93 @@
      "n": 3
     },
     "r3-8": {
-     "median": 1.735,
-     "min": 1.661,
-     "max": 1.808,
+     "median": 1.732,
+     "min": 1.658,
+     "max": 1.806,
      "n": 2
     },
     "r12-24": {
-     "median": 1.812,
+     "median": 1.808,
      "min": 1.745,
      "max": 1.865,
      "n": 6
     }
    },
    "notes": "vendored megamoe_rubin (older kernel); SP path uses generic cuBLAS split-K BF16 GEMMs; gap512 C512 rows merged (B32-B92 = r8-23)"
+  },
+  "D3-32": {
+   "phase": "decode",
+   "points": [
+    {
+     "k": 3,
+     "r_per_gpu": 1.0,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 19.27,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 8.671,
+     "derate_current": 2.222
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 4.0,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 20.89,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 9.239,
+     "derate_current": 2.261
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 8.0,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 20.92,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 9.869,
+     "derate_current": 2.12
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 16.0,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 26.98,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 11.4,
+     "derate_current": 2.367
+    },
+    {
+     "k": 3,
+     "r_per_gpu": 24.0,
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 30.48,
+     "model_ach_ms": null,
+     "derate": null,
+     "n_rows": 1,
+     "kernel_debug": false,
+     "model_ach_ms_current": 13.459,
+     "derate_current": 2.265
+    }
+   ],
+   "source_rows": [
+    "w2:d332lo:q4_B4_M16_u132k",
+    "w2:d332lo:q4_B16_M64_u132k",
+    "w2:d332lo:q4_B32_M128_u132k",
+    "w2:d332b64:q4_B64_M256_u132k",
+    "w2:d332b96:q4_B96_M384_u132k"
+   ],
+   "derate_by_band": {},
+   "notes": "wave 2: DP8 x (TP4=DCP4) SP, EP32, vendored megamoe_rubin (deep_gemm situ); KV 2329 blocks/rank, 13 blocks/request, r_max ~44.8; r32 bench OOM, r48 refused (SP 512 verify-row cap)"
   },
   "P1": {
    "phase": "prefill",
@@ -980,15 +1249,19 @@
      "measured_ms": 228.2,
      "model_ach_ms": 218.2,
      "derate": 1.046,
-     "measured_tok_s_gpu": 8974.0
+     "measured_tok_s_gpu": 8974.0,
+     "model_ach_ms_current": 189.236,
+     "derate_current": 1.206
     },
     {
-     "case": "P1 pf16k_L78k release MegaMoE policy (NVFP4 W4A4 MoE) [model P1 F16384",
+     "case": "P1 pf16k_L78k release MegaMoE policy (NVFP4 W4A4 MoE) [model P1 F16384]",
      "moe_quant": "nvfp4 (release default, not like-for-like)",
      "measured_ms": 203.4,
      "model_ach_ms": 218.2,
      "derate": 0.932,
-     "measured_tok_s_gpu": 10069.0
+     "measured_tok_s_gpu": 10069.0,
+     "model_ach_ms_current": 184.998,
+     "derate_current": 1.099
     },
     {
      "case": "P1 pf16k_fresh (1 x 16384 fresh, L 16K) MXFP8 [model P1 F16384]",
@@ -996,7 +1269,9 @@
      "measured_ms": 222.4,
      "model_ach_ms": 212.7,
      "derate": 1.045,
-     "measured_tok_s_gpu": 9209.0
+     "measured_tok_s_gpu": 9209.0,
+     "model_ach_ms_current": 185.834,
+     "derate_current": 1.197
     }
    ],
    "source_rows": [
@@ -1021,7 +1296,9 @@
      "measured_ms": 350.7,
      "model_ach_ms": 282.2,
      "derate": 1.243,
-     "measured_tok_s_gpu": 11680.0
+     "measured_tok_s_gpu": 11680.0,
+     "model_ach_ms_current": 252.86,
+     "derate_current": 1.387
     },
     {
      "case": "P2 pf32k_L78k MXFP8 (production MNBT 32768) [model P2 F32768]",
@@ -1029,7 +1306,9 @@
      "measured_ms": 653.1,
      "model_ach_ms": 551.3,
      "derate": 1.185,
-     "measured_tok_s_gpu": 12544.0
+     "measured_tok_s_gpu": 12544.0,
+     "model_ach_ms_current": 493.162,
+     "derate_current": 1.324
     },
     {
      "case": "P2 pf32k_L78k release MegaMoE policy (NVFP4) [model P2 F32768]",
@@ -1037,7 +1316,9 @@
      "measured_ms": 579.5,
      "model_ach_ms": 551.3,
      "derate": 1.051,
-     "measured_tok_s_gpu": 14136.0
+     "measured_tok_s_gpu": 14136.0,
+     "model_ach_ms_current": 474.592,
+     "derate_current": 1.221
     },
     {
      "case": "P2 pf16k_L78k release MegaMoE policy (NVFP4) [model P2 F16384]",
@@ -1045,7 +1326,9 @@
      "measured_ms": 307.7,
      "model_ach_ms": 282.2,
      "derate": 1.09,
-     "measured_tok_s_gpu": 13312.0
+     "measured_tok_s_gpu": 13312.0,
+     "model_ach_ms_current": 243.575,
+     "derate_current": 1.263
     },
     {
      "case": "P2 pf16k_fresh MXFP8 [model P2 F16384]",
@@ -1053,7 +1336,9 @@
      "measured_ms": 347.7,
      "model_ach_ms": 279.0,
      "derate": 1.246,
-     "measured_tok_s_gpu": 11779.0
+     "measured_tok_s_gpu": 11779.0,
+     "model_ach_ms_current": 246.056,
+     "derate_current": 1.413
     },
     {
      "case": "gap512 C512 pf_q12k_L78k",
@@ -1119,7 +1404,9 @@
      "measured_ms": 330.5,
      "model_ach_ms": 269.1,
      "derate": 1.228,
-     "measured_tok_s_gpu": 12393.0
+     "measured_tok_s_gpu": 12393.0,
+     "model_ach_ms_current": 238.529,
+     "derate_current": 1.386
     },
     {
      "case": "P4-4 pf16k_fresh (4 x 4096 fresh) MXFP8 [model P4-4 F16384 f4096]",
@@ -1127,12 +1414,25 @@
      "measured_ms": 319.8,
      "model_ach_ms": 260.0,
      "derate": 1.23,
-     "measured_tok_s_gpu": 12809.0
+     "measured_tok_s_gpu": 12809.0,
+     "model_ach_ms_current": 231.725,
+     "derate_current": 1.38
+    },
+    {
+     "case": "P4-4 pf16k_L78k(4x4096) release MegaMoE policy (NVFP4) [model P4-4 F16384 f4096]",
+     "moe_quant": "nvfp4 (release default, not like-for-like)",
+     "measured_ms": 285.6,
+     "model_ach_ms": 243.5,
+     "derate": 1.173,
+     "measured_tok_s_gpu": 14341.0,
+     "model_ach_ms_current": 229.244,
+     "derate_current": 1.246
     }
    ],
    "source_rows": [
     "prefill:P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
-    "prefill:P4-4 pf16k_fresh (4 x 4096 fresh) MXFP8 [model P4-4 F16384 f4096]"
+    "prefill:P4-4 pf16k_fresh (4 x 4096 fresh) MXFP8 [model P4-4 F16384 f4096]",
+    "wave2:P4-4 pf16k_L78k(4x4096) release MegaMoE policy (NVFP4) [model P4-4 F16384 f4096]"
    ],
    "derate_step": {
     "median": 1.229,
@@ -1151,7 +1451,9 @@
      "measured_ms": 610.9,
      "model_ach_ms": 486.5,
      "derate": 1.256,
-     "measured_tok_s_gpu": 13409.0
+     "measured_tok_s_gpu": 13409.0,
+     "model_ach_ms_current": 418.385,
+     "derate_current": 1.46
     },
     {
      "case": "P3-16 pf16k_L78k MXFP8 (no profile) [model P3-16 F16384]",
@@ -1159,7 +1461,9 @@
      "measured_ms": 1179.8,
      "model_ach_ms": 960.4,
      "derate": 1.229,
-     "measured_tok_s_gpu": 13887.0
+     "measured_tok_s_gpu": 13887.0,
+     "model_ach_ms_current": 824.704,
+     "derate_current": 1.431
     },
     {
      "case": "P3-16 pf16k_L78k release MegaMoE policy (NVFP4) [model P3-16 F16384]",
@@ -1167,7 +1471,9 @@
      "measured_ms": 1063.3,
      "model_ach_ms": 960.4,
      "derate": 1.107,
-     "measured_tok_s_gpu": 15409.0
+     "measured_tok_s_gpu": 15409.0,
+     "model_ach_ms_current": 787.566,
+     "derate_current": 1.35
     },
     {
      "case": "P3-16 pf8k_L78k release MegaMoE policy (NVFP4) [model P3-16 F8192]",
@@ -1175,7 +1481,9 @@
      "measured_ms": 531.9,
      "model_ach_ms": 486.5,
      "derate": 1.093,
-     "measured_tok_s_gpu": 15401.0
+     "measured_tok_s_gpu": 15401.0,
+     "model_ach_ms_current": 399.816,
+     "derate_current": 1.33
     }
    ],
    "source_rows": [
@@ -1201,7 +1509,9 @@
      "measured_ms": 623.0,
      "model_ach_ms": 500.1,
      "derate": 1.246,
-     "measured_tok_s_gpu": 13150.0
+     "measured_tok_s_gpu": 13150.0,
+     "model_ach_ms_current": 434.692,
+     "derate_current": 1.433
     },
     {
      "case": "P4-2 pf16k_fresh MXFP8 [model P4-2 F16384 f4096]",
@@ -1209,12 +1519,25 @@
      "measured_ms": 607.8,
      "model_ach_ms": 481.9,
      "derate": 1.261,
-     "measured_tok_s_gpu": 13477.0
+     "measured_tok_s_gpu": 13477.0,
+     "model_ach_ms_current": 421.083,
+     "derate_current": 1.443
+    },
+    {
+     "case": "P4-2 pf16k_L78k(4x4096) release MegaMoE policy (NVFP4) [model P4-2 F16384 f4096]",
+     "moe_quant": "nvfp4 (release default, not like-for-like)",
+     "measured_ms": 536.3,
+     "model_ach_ms": 442.8,
+     "derate": 1.211,
+     "measured_tok_s_gpu": 15275.0,
+     "model_ach_ms_current": 416.122,
+     "derate_current": 1.289
     }
    ],
    "source_rows": [
     "prefill:P4-2 pf16k_L78k (4 x 4096 @ 78K) MXFP8 [model P4-2 F16384 f4096]",
-    "prefill:P4-2 pf16k_fresh MXFP8 [model P4-2 F16384 f4096]"
+    "prefill:P4-2 pf16k_fresh MXFP8 [model P4-2 F16384 f4096]",
+    "wave2:P4-2 pf16k_L78k(4x4096) release MegaMoE policy (NVFP4) [model P4-2 F16384 f4096]"
    ],
    "derate_step": {
     "median": 1.253,
@@ -1223,6 +1546,111 @@
     "n": 2
    },
    "notes": "PR #20 tree, no scheduler; owner = batch index mod TP; DSA KV replicated"
+  },
+  "P2b": {
+   "phase": "prefill",
+   "points": [
+    {
+     "case": "P2b pf16k_L78k MXFP8 [model P2b F16384]",
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 212.8,
+     "model_ach_ms": 158.6,
+     "derate": 1.342,
+     "measured_tok_s_gpu": 9624.0,
+     "model_ach_ms_current": 154.578,
+     "derate_current": 1.377
+    },
+    {
+     "case": "P2b pf16k_L78k release MegaMoE policy (NVFP4) [model P2b F16384]",
+     "moe_quant": "nvfp4 (release default, not like-for-like)",
+     "measured_ms": 207.9,
+     "model_ach_ms": 158.6,
+     "derate": 1.311,
+     "measured_tok_s_gpu": 9849.0,
+     "model_ach_ms_current": 149.936,
+     "derate_current": 1.387
+    }
+   ],
+   "source_rows": [
+    "wave2:P2b pf16k_L78k MXFP8 [model P2b F16384]",
+    "wave2:P2b pf16k_L78k release MegaMoE policy (NVFP4) [model P2b F16384]"
+   ],
+   "derate_step": {
+    "median": 1.342,
+    "min": 1.342,
+    "max": 1.342,
+    "n": 1
+   }
+  },
+  "P5-4": {
+   "phase": "prefill",
+   "points": [
+    {
+     "case": "P5-4 pf16k_L78k MXFP8 [model P5-4 F16384]",
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 421.6,
+     "model_ach_ms": 287.9,
+     "derate": 1.464,
+     "measured_tok_s_gpu": 9716.0,
+     "model_ach_ms_current": 282.576,
+     "derate_current": 1.492
+    },
+    {
+     "case": "P5-4 pf16k_L78k release MegaMoE policy (NVFP4) [model P5-4 F16384]",
+     "moe_quant": "nvfp4 (release default, not like-for-like)",
+     "measured_ms": 386.3,
+     "model_ach_ms": 287.9,
+     "derate": 1.342,
+     "measured_tok_s_gpu": 10604.0,
+     "model_ach_ms_current": 273.291,
+     "derate_current": 1.414
+    }
+   ],
+   "source_rows": [
+    "wave2:P5-4 pf16k_L78k MXFP8 [model P5-4 F16384]",
+    "wave2:P5-4 pf16k_L78k release MegaMoE policy (NVFP4) [model P5-4 F16384]"
+   ],
+   "derate_step": {
+    "median": 1.464,
+    "min": 1.464,
+    "max": 1.464,
+    "n": 1
+   }
+  },
+  "P5-8": {
+   "phase": "prefill",
+   "points": [
+    {
+     "case": "P5-8 pf16k_L78k MXFP8 [model P5-8 F16384]",
+     "moe_quant": "mxfp4_mxfp8",
+     "measured_ms": 345.1,
+     "model_ach_ms": 231.7,
+     "derate": 1.489,
+     "measured_tok_s_gpu": 5934.0,
+     "model_ach_ms_current": 225.768,
+     "derate_current": 1.529
+    },
+    {
+     "case": "P5-8 pf16k_L78k release MegaMoE policy (NVFP4) [model P5-8 F16384]",
+     "moe_quant": "nvfp4 (release default, not like-for-like)",
+     "measured_ms": 321.0,
+     "model_ach_ms": 231.7,
+     "derate": 1.386,
+     "measured_tok_s_gpu": 6379.0,
+     "model_ach_ms_current": 221.53,
+     "derate_current": 1.449
+    }
+   ],
+   "source_rows": [
+    "wave2:P5-8 pf16k_L78k MXFP8 [model P5-8 F16384]",
+    "wave2:P5-8 pf16k_L78k release MegaMoE policy (NVFP4) [model P5-8 F16384]"
+   ],
+   "derate_step": {
+    "median": 1.489,
+    "min": 1.489,
+    "max": 1.489,
+    "n": 1
+   }
   }
  },
  "projection_unmeasured": {
@@ -1317,50 +1745,50 @@
    },
    "D3": {
     "model_ach_ms": 14.7,
-    "measured_ms": 24.41,
-    "derate": 1.661,
+    "measured_ms": 24.37,
+    "derate": 1.658,
     "kind": "measured"
    },
    "D4-16": {
     "model_ach_ms": 17.75,
-    "proj_ms_additive": 27.46,
-    "proj_ms_ratio": 29.47,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 27.42,
+    "proj_ms_ratio": 29.43,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    },
    "D5": {
     "model_ach_ms": 14.72,
-    "proj_ms_additive": 24.43,
-    "proj_ms_ratio": 24.44,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 24.39,
+    "proj_ms_ratio": 24.4,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    },
    "D6": {
     "model_ach_ms": 14.89,
-    "proj_ms_additive": 24.6,
-    "proj_ms_ratio": 24.73,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 24.56,
+    "proj_ms_ratio": 24.68,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    },
    "D7-4-16": {
     "model_ach_ms": 14.13,
-    "proj_ms_additive": 23.84,
-    "proj_ms_ratio": 23.46,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 23.8,
+    "proj_ms_ratio": 23.43,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    },
    "D7-2-16": {
     "model_ach_ms": 15.72,
-    "proj_ms_additive": 25.43,
-    "proj_ms_ratio": 26.1,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 25.39,
+    "proj_ms_ratio": 26.06,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    },
    "D7-8-16": {
     "model_ach_ms": 13.84,
-    "proj_ms_additive": 23.55,
-    "proj_ms_ratio": 22.98,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 23.51,
+    "proj_ms_ratio": 22.94,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    },
    "D8-16": {
@@ -1372,9 +1800,9 @@
    },
    "D9-16": {
     "model_ach_ms": 19.04,
-    "proj_ms_additive": 28.75,
-    "proj_ms_ratio": 31.62,
-    "analog": "D3 r8.0 k3 (derate 1.661)",
+    "proj_ms_additive": 28.71,
+    "proj_ms_ratio": 31.56,
+    "analog": "D3 r8.0 k3 (derate 1.658)",
     "kind": "projected"
    }
   },
@@ -1438,9 +1866,10 @@
    },
    "P2b": {
     "model_tok_s_gpu": 12308,
-    "derated_tok_s_gpu": 9918,
-    "kind": "projected",
-    "note": "analog P2 step derate 1.241"
+    "derate": 1.342,
+    "derated_tok_s_gpu": 9171,
+    "kind": "measured",
+    "case": "P2b pf16k_L78k MXFP8 [model P2b F16384]"
    },
    "P3-16": {
     "model_tok_s_gpu": 17060,
@@ -1465,15 +1894,17 @@
    },
    "P5-4": {
     "model_tok_s_gpu": 13120,
-    "derated_tok_s_gpu": 10572,
-    "kind": "projected",
-    "note": "analog P2 step derate 1.241"
+    "derate": 1.464,
+    "derated_tok_s_gpu": 8962,
+    "kind": "measured",
+    "case": "P5-4 pf16k_L78k MXFP8 [model P5-4 F16384]"
    },
    "P5-8": {
     "model_tok_s_gpu": 8035,
-    "derated_tok_s_gpu": 7681,
-    "kind": "projected",
-    "note": "analog P1 step derate 1.046"
+    "derate": 1.489,
+    "derated_tok_s_gpu": 5396,
+    "kind": "measured",
+    "case": "P5-8 pf16k_L78k MXFP8 [model P5-8 F16384]"
    },
    "P6-16": {
     "model_tok_s_gpu": 17519,
@@ -1507,5 +1938,6 @@
   "decode D2 ran MoE-TP8, model D2 is EP8",
   "comm P11/P12 standalone a2a overlap with MegaMoE in production; do not add on top of moe derate",
   "gap512 20-3400x derates on near-zero model terms = unfused op the model does not charge"
- ]
+ ],
+ "current_model_note": "model_ach_ms / derate: wave-1 basis (targets.json, pre-fix model); model_ach_ms_current / derate_current: the current model (achievable column), recomputed by this script; NVFP4-MoE (release) prefill points use the O4 NVFP4-activation model"
 }

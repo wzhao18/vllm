@@ -10,7 +10,8 @@ topologies.comm_events (the optables comm rows carry no N) and their times check
 Priority = sum over uses of (share of step, achievable column) x (gap prior - 1), where the gap prior is the measured
 step / model-achievable ratio of that topology (or the nearest measured proxy, marked).
 
-Scope (2026-11-18): the model scope is topologies.SCOPE (EP <= 16, <= 16 GPUs per engine / EP domain). Three tiers of
+Scope (2026-11-18, wave 1): SCOPE below = topologies.SCOPE restricted to <= 16 GPUs per instance (EP <= 16; the model's
+scope is now <= 32 GPUs, but the wave-1 matrix stays frozen at EP <= 16 so it rebuilds identically). Three tiers of
 topologies: PRIORITY (ranked), COVER (rest of SCOPE: listed with weight 0, never P0/P1 on their own) and OOS (the
 pre-rescope EP64/EP32 ids, kept only so their case ids stay valid; priority 'OOS').
 
@@ -30,7 +31,9 @@ import decode as Dec  # noqa: E402
 import model as Mdl  # noqa: E402
 import prefill as Pre  # noqa: E402
 from hw import HWS  # noqa: E402
-from topologies import ALL, SCOPE, comm_events, op_map  # noqa: E402
+from topologies import ALL, SCOPE as SCOPE32, comm_events, op_map  # noqa: E402
+
+SCOPE = [t for t in SCOPE32 if ALL[t].gpus <= 16]     # wave-1 matrix scope (EP <= 16)
 
 C = Mdl.C
 OPT = json.load(open(os.path.join(ROOT, "out", "optables.json")))
@@ -560,7 +563,7 @@ if __name__ == "__main__":
     doc = dict(
         generated_from="out/optables.json + inputs/ops.json + topologies.op_map/comm_events (build_matrix.py)",
         scope=dict(prefill=PREFILL_T, decode=DECODE_T, cover=COVER_T, out_of_scope=OOS_T, checkpoints=CKS,
-                   rule="topologies.SCOPE (2026-11-18): EP <= 16 and <= 16 GPUs per engine / EP domain; priority = "
+                   rule="topologies.SCOPE at <= 16 GPUs (wave 1, 2026-11-18): EP <= 16 and <= 16 GPUs per engine / EP domain; priority = "
                         "deployed + EP<=16 frontier; cover = rest of SCOPE (weight 0); out_of_scope = EP64/EP32 rows "
                         "kept for id continuity (priority OOS, never benched)",
                    regimes="prefill F=16384 L=78.4K (5,456 fresh/request); decode r in {1,8,32} k=3 L=135K "

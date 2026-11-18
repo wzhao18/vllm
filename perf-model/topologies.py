@@ -106,6 +106,18 @@ PREFILL = [
                    moe_dense="SP-local rep W", experts="EP16 (4 groups), O2 dedup + pre-combine", lm_head="vocab/4",
                    drafter="TP4"),
          comm="69 x AG+RS (N=4) + 24 x push + 92 x deduped EP16"),
+    Topo("P6-32", "P6 LTP: TP2 KDA + DSA-DP, EP32 + dedup", "prefill", 2, "sp", "dsadp", "rep", 32, dedup=True,
+         proposal="P6",
+         mapping=M(kda="head-TP2 with SP", mla="DSA-DP over the pair", indexer="owner", dsa_attn="owner, KV once",
+                   moe_dense="SP-local rep W", experts="EP32 (16 pairs), O2 dedup + pre-combine", lm_head="vocab/2",
+                   drafter="TP2, ctx K/V last 2048 rows only"),
+         comm="69 x AG+RS (N=2) + 24 x push + 92 x deduped EP32"),
+    Topo("P9-32", "P9 DSA-CP: DEP32 + ShardQ DCP16 on DSA layers", "prefill", 1, "dep", "dsacp", "rep", 32, G=16,
+         proposal="P9",
+         mapping=M(kda="local", mla="local rows, KV t mod 16 over 16 GPUs", indexer="local rows vs gathered ctx",
+                   dsa_attn="DCP16 KV, context gathered per DSA layer", moe_dense="local", experts="EP32",
+                   lm_head="full", drafter="local"),
+         comm="EP32 + per-DSA-layer context gather from 16 GPUs"),
     Topo("P9-16", "P9 DSA-CP: DEP16 + ShardQ DCP16 on DSA layers", "prefill", 1, "dep", "dsacp", "rep", 16, G=16,
          proposal="P9",
          mapping=M(kda="local", mla="local rows, KV t mod 16 over 16 GPUs", indexer="local rows vs gathered ctx",
@@ -185,6 +197,29 @@ DECODE = [
          mapping=M(kda="local", mla="local rows", indexer="own key shard of 16 GPUs' requests + merge",
                    dsa_attn="DCP16 KV", moe_dense="local", experts="EP16", lm_head="full", drafter="local"),
          comm="EP16 + DCP16 on 24 DSA layers"),
+    # ---- <= 32-GPU re-scope (2026-11-18): EP32 variants (8 VR200 nodes per EP domain)
+    Topo("D3-32", "D3 DP8x(TP4=DCP4) SP, EP32", "decode", 4, "sp", "dcp", "rep", 32, proposal="D3",
+         mapping=M(kda="SP multicast AG -> head-TP4 -> push RS", mla="DCP4", indexer="DCP4 + merge", dsa_attn="DCP4",
+                   moe_dense="rep W on SP shard", experts="EP32 (8 DP groups, 28 experts/GPU)", lm_head="vocab/4",
+                   drafter="TP4"), comm="SP AG+RS + DCP4 + EP32"),
+    Topo("D7-4-32", "D7 TP4 DSA-DP, TP-dense, EP32", "decode", 4, "sp", "dsadp", "tp", 32, proposal="D7",
+         mapping=M(kda="head-TP4 + SP", mla="DSA-DP over 4", indexer="owner", dsa_attn="owner, KV once",
+                   moe_dense="router/latent/shared TP4 (AG+RS)", experts="EP32 (8 attention groups, 28 experts/GPU)",
+                   lm_head="vocab/4", drafter="TP4"), comm="KDA AG+RS + DSA push + MoE-dense AG/RS + EP32"),
+    Topo("D7-2-32", "D7 TP2 DSA-DP, TP-dense, EP32", "decode", 2, "sp", "dsadp", "tp", 32, proposal="D7",
+         mapping=M(kda="head-TP2", mla="DSA-DP over 2", indexer="owner", dsa_attn="owner", moe_dense="TP2",
+                   experts="EP32 (16 attention groups)", lm_head="vocab/2", drafter="TP2"), comm="as D7-4-32 with N=2"),
+    Topo("D7-8-32", "D7 TP8 DSA-DP, TP-dense, EP32", "decode", 8, "sp", "dsadp", "tp", 32, proposal="D7",
+         mapping=M(kda="head-TP8", mla="DSA-DP over 8", indexer="owner", dsa_attn="owner", moe_dense="TP8",
+                   experts="EP32 (4 attention groups)", lm_head="vocab/8", drafter="TP8"), comm="as D7-4-32 with N=8"),
+    Topo("D8-32", "D8 TP16+DCP16, TP-dense, EP32", "decode", 16, "tp", "dcp", "tp", 32, proposal="D8",
+         mapping=M(kda="head-TP16 + AR", mla="as D1", indexer="DCP16 + merge", dsa_attn="DCP16",
+                   moe_dense="TP16 (router/latent transposes + AR)", experts="EP32 (2 attention groups, 28 experts/GPU)",
+                   lm_head="vocab/16", drafter="TP16"), comm="AR + DCP16 + MoE-dense transposes + EP32"),
+    Topo("D9-32", "D9 DSA-CP: DEP32 + DCP16 on DSA", "decode", 1, "dep", "dsacp", "rep", 32, G=16, proposal="D9",
+         mapping=M(kda="local", mla="local rows", indexer="own key shard of 16 GPUs' requests + merge",
+                   dsa_attn="DCP16 KV", moe_dense="local", experts="EP32", lm_head="full", drafter="local"),
+         comm="EP32 + DCP16 on 24 DSA layers"),
     Topo("D9", "D9 DSA-CP: DEP64 + DCP16 on DSA", "decode", 1, "dep", "dsacp", "rep", 64, G=16, proposal="D9",
          mapping=M(kda="local", mla="local rows", indexer="own key shard of 16 GPUs' requests + merge", dsa_attn="DCP16 KV",
                    moe_dense="local", experts="EP64", lm_head="full", drafter="local"), comm="EP + DCP16 on 24 DSA layers"),
@@ -200,14 +235,15 @@ DECODE = [
 
 ALL = {t.id: t for t in PREFILL + DECODE}
 
-EP_MAX = 16      # 2026-11-18 scope: EP <= 16, at most 16 GPUs (4 VR200 nodes) per engine / EP domain
+EP_MAX = 32      # 2026-11-18 scope (user rule, replaces EP <= 16): at most 32 GPUs (8 VR200 nodes) per instance
 
 
-def in_scope(t, ep_max=EP_MAX):
-    """True when the topology fits the EP <= 16 / <= 16-GPU scope (MoE-TP D1 has no EP domain; AFD and PP4 exceed it)."""
-    if t.afd or t.gpus > ep_max:
+def in_scope(t, max_gpus=EP_MAX):
+    """True when one instance (engine / EP domain) spans <= 32 GPUs: EP <= 32 and gpus <= 32. MoE-TP D1 has no EP
+    domain; AFD (72 GPUs), PP4 (64), EP64/72 exceed it."""
+    if t.afd or t.gpus > max_gpus:
         return False
-    return t.experts == "tp" or t.E <= ep_max
+    return t.experts == "tp" or t.E <= max_gpus
 
 
 SCOPE = [t.id for t in PREFILL + DECODE if in_scope(t)]
@@ -239,6 +275,8 @@ def op_map(op_id, t, phase):
         return d
     if i == "G.embed":
         return head
+    if i.startswith("L.attnres") and phase == "prefill" and t.residual == "tp":
+        return dict(d, row=N)          # TP prefill (P1): AttnRes on the 1/N RS-owned token shard, then AG (comm_events)
     if i.startswith("L.attnres") or i == "F.attnres_final" or i == "DS.aux_capture":
         return dict(d, row=rres)
     if i.startswith("KDA."):
@@ -365,6 +403,15 @@ def ep_events(m, E, ck, dedup, imb=1.0):
             ev("P12 EP-combine", "MegaMoE combine", m * k16 * 7168 * rem * f, imb * m * k16 * 7168 * rem * f, 1, N=E)]
 
 
+def tp_reduce(name, T, N, phase):
+    """Row-parallel output reduction under a replicated (TP) residual. Decode: one all-reduce. Prefill (P1 code
+    path, prefill lane): the o_proj GEMM reduce-scatters (GemmRsAr), AttnRes runs on the 1/N RS-owned token shard and
+    a push all-gather rebuilds the rows (_push_shard_kernel) -> RS + AG instead of AR."""
+    if phase == "prefill":
+        return [RS(name + " RS", T, N), AG("AttnRes shard AG", T / N, N)]
+    return [AR(name + " AR", T * ROW, N)]
+
+
 def comm_events(t, phase, env, ck, imb=1.0, o2=False):
     """Per layer type -> list of comm events (bytes per GPU). Layer types: embed, kda, dsa, moe, dense, final,
     drafter, step."""
@@ -375,9 +422,9 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
     if N > 1:
         if t.residual == "tp":
             out["embed"].append(AR("embed vocab reduce", T * ROW, N))
-            out["kda"].append(AR("o_proj AR", T * ROW, N))
+            out["kda"] += tp_reduce("o_proj", T, N, phase)
             if t.dsa not in ("dsadp", "dsadp_split"):
-                out["dsa"].append(AR("o_proj AR", T * ROW, N))
+                out["dsa"] += tp_reduce("o_proj", T, N, phase)
         else:
             out["embed"].append(RS("embed RS", T, N))
             out["kda"] += [AG("SP AG", n, N), RS("o_proj RS", T, N)]
@@ -431,7 +478,7 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
                 else:
                     out["moe"] += [front, back, AR("shared+latent_up AR", T * ROW, N)]
             elif md == "tokenshard":
-                out["moe"].append(AR("shared partial + routed AR", T * ROW, N))
+                out["moe"] += tp_reduce("shared partial + routed", T, N, phase)
         if t.experts == "ep" and t.E > 1:
             out["moe"] += ep_events(T / N, t.E, ck, t.dedup or o2, imb)
     # dense MLP layer 0
@@ -439,7 +486,7 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
         if t.residual == "sp":
             out["dense"] += [AG("dense AG", n, N), RS("dense RS", T, N)]
         else:
-            out["dense"].append(AR("dense down AR", T * ROW, N))
+            out["dense"] += tp_reduce("dense down", T, N, phase)
     # final + lm_head / verify
     R = env["R"]
     if N > 1:
@@ -464,3 +511,16 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
     if t.E > N and t.experts == "ep":
         out["step"].append(ev("P19 DP sync", "EP lock-step sync", 0, 0, 1, N=t.E))
     return out
+
+
+def comm_row_event(row):
+    """Model comm event for one comm-lane microbench row (microbench/results/comm/rows.json; kind -> size mapping per
+    the comm lane README: AR/RS bytes = full tensor, AG bytes = shard, A2A bytes = per-peer chunk)."""
+    k, N, b, h = row["kind"], row["N"], float(row["bytes_param"]), row["hops"]
+    if k == "ar":
+        return AR(row["primitive"], b, N)
+    if k == "rs":
+        return RS(row["primitive"], b / ROW, N)
+    if k == "bar":
+        return ev(row["primitive"], row["primitive"], 0, 0, max(h, 1), N=N)
+    return ev(row["primitive"], row["primitive"], (N - 1) * b, (N - 1) * b, max(h, 1), N=N)

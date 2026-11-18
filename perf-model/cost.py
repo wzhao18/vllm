@@ -3,12 +3,14 @@
 Per op, per GPU (explicit roofline, no fitted derating):
     t_op = max( FLOPs_gpu / peak[dtype],  bytes_gpu / HBM,  SIMT_gpu / peak_simt + SFU_gpu / peak_mufu )
     bytes_gpu = W/div_w + (A_in + A_out)/div_row + KV/div_kv + State/div_st      (A = 0 for ops fused in SOL)
-    a launched (non-fused) kernel costs max(t_op, per-kernel gap): the gap overlaps the previous kernel under PDL
+    a launched (non-fused) kernel costs max(t_op, gap): gap = 0.78 us graph node (PDL-chained GEMM / elementwise) or
+    the 4 us per-kernel floor for the grid-dependent KERNEL_FLOOR_OPS and the MegaMoE kernel (SOL: 0)
 Per communication event (bytes per GPU over NVLink):
-    push:  t_comm = hops * push_hop(N) + max(bytes_in, bytes_out) / NVLink_per_direction
-    NVLS:  t_comm = alpha(N) + M / algbw(N)      (measured multimem / NCCL NVLS in the achievable column)
+    push:  t_comm = max(hops * push_hop(N) + max(bytes_in, bytes_out) / NVLink_per_direction, exchange floor(N))
+    NVLS:  t_comm = alpha(N) + M / algbw(N)  (RS: alpha + M / RS bw(N); achievable = measured multimem kernels)
     (an all-reduce / reduce-scatter takes the cheapest of its implemented primitives for that column)
-Per layer:  t_layer = sum(max(t_op, gap)) + sync comm + max(0, async comm - attention compute)
+MegaMoE (EP): dispatch + experts + combine are one persistent kernel: max(ops, link) + exposed part (megamoe_time).
+Per layer:  t_layer = sum(max(t_op, floor)) + sync comm + max(0, async comm - attention compute)
 O1 (two-microbatch overlap): the step is evaluated at half the rows and t_layer = max(compute, comm) per half,
 counted twice (weights are streamed twice: that cost is real and kept).
 """
@@ -25,6 +27,25 @@ LAYER_OF = {"global": "embed", "all": "attnres", "kda": "kda", "dsa": "dsa", "mo
 ROW_B = 14336
 COMM_OPS = ("L.sp_gather", "F.sp_gather_out")
 EXPERT_OPS = ("MOE.fc1", "MOE.act", "MOE.fc2")
+# grid-dependent ops that stay separate kernels in any implementation: charged max(roofline, hw.floor_s). The indexer
+# chain carries this floor once (on idx_score); DSA.topk is not flagged fused_in_sol, so it still pays the 0.78 us
+# graph-node gap like any launched kernel (conservative).
+KERNEL_FLOOR_OPS = ("KDA.core_decode", "KDA.core_prefill", "DSA.idx_score", "DSA.sparse_mla")
+MEGAMOE_OPS = ("MOE.dispatch", "MOE.fc1", "MOE.act", "MOE.fc2", "MOE.combine")   # one persistent fused kernel (EP)
+EP_PRIMS = ("P11", "P12")
+
+
+def megamoe_time(ops_s, bw_s, lat_s, n_exp):
+    """MegaMoE layer (dispatch + fc1 + act + fc2 + combine in one persistent phase-interleaved kernel).
+
+    SOL assumption (not measured separately: the kernel cannot be split by timers): the NVLink dispatch/combine bytes
+    stream while the expert GEMMs run, so the layer costs max(ops, link) plus the exposed part. The moe lane is
+    consistent with it (whole fused layer 0.85-1.02 x serial ops + P11 + P12 at prefill sizes, and test_megamoe_rows
+    keeps this term <= every measured kernel). Exposed part: the
+    combine hand-off latency (pipeline drain: the last expert's rows go out after its fc2 and nothing is left to
+    hide them; the dispatch hand-off hides under the local rows and weight prefetch) and one expert's worth of the
+    shorter phase (overlap granularity = one expert slot). lat_s = exposed (combine) latency only."""
+    return max(ops_s, bw_s) + lat_s + min(ops_s, bw_s) / max(n_exp, 1.0)
 _EVAL_CACHE = {}
 
 
@@ -40,7 +61,7 @@ def _full(op, env, ck_key, ck):
     return r
 
 
-def comm_time(e, hw):
+def comm_time(e, hw, fused=False):
     """Cheapest implemented alternative of one comm event in this hardware column.
 
     push    : hops x push hop(N) + max(in, out) / NVLink        (Lamport mailbox / symmetric-memory push)
@@ -55,7 +76,12 @@ def comm_time(e, hw):
         elif k == "nvls_rs":
             t = hw.nvls_ar(a["M"], a["N"], rs=True)
         else:
+            # one launched exchange kernel never beats the measured standalone floor (achievable column); exchanges
+            # fused into a compute kernel (sdec TP path: o-proj+AR, ArNorm, DCP q/merge/value, TP-MoE front/tail)
+            # pay the in-kernel hop only
             t = a["hops"] * hw.push_hop(a.get("N", 2)) + max(a["in_B"], a["out_B"]) / hw.nvl
+            if not fused:
+                t = max(t, hw.exch_floor(a.get("N", 2)))
         if best is None or t < best[0]:
             best = (t, a)
     return best
@@ -154,6 +180,8 @@ def evaluate(t, phase, ck_name, col, env, o2=False, o3=False, moe_act=None, imb=
         tb = _op_time(osc, env, ck, ck_key, t, phase, hw, hbm, msc, imb, mult_x=2.0)["t"] + \
             _op_time(otk, env, ck, ck_key, t, phase, hw, hbm, mtk, imb)["t"]
         sel = "scratch" if ta <= tb else "two-pass"
+    fused_ep = t.experts == "ep" and t.E > 1 and not no_ep
+    ep_ops = 0.0
     for op in Mdl.OPS:
         if not op.in_phase(phase) or op.id in COMM_OPS or op.id in exclude:
             continue
@@ -166,12 +194,21 @@ def evaluate(t, phase, ck_name, col, env, o2=False, o3=False, moe_act=None, imb=
             e_op = dict(env, SCRATCH=1)
         elif sel == "two-pass" and op.id == "DSA.idx_score":
             mx = 2.0
-        r = _op_time(op, e_op, ck, ck_key, t, phase, hw, hbm, m, imb, mult_x=mx)
+        # MegaMoE streams each expert slot from the die that homes it (megamoe_rubin die-local placement): the moe lane
+        # measures EP8 T=32 at 143 us for ~2 GB of touched expert weights (> 13.9 TB/s), so its weight stream runs at
+        # the die-local rate in every variant
+        hb = hw.hbm_die_local if (fused_ep and op.id in MEGAMOE_OPS) else hbm
+        r = _op_time(op, e_op, ck, ck_key, t, phase, hw, hb, m, imb, mult_x=mx)
         tt = r["t"]
         lt = LAYER_OF.get(op.layer_type, "attnres")
         per = cnt if lt in ("embed", "final", "drafter") else 1.0   # per-layer types store one instance
-        # per-kernel gap overlapped under PDL: a launched kernel costs max(roofline, gap); fused ops launch nothing
-        gap = 0.0 if op.fused else max(0.0, hw.kernel_s - tt)
+        # per-kernel floor: a launched kernel costs max(roofline, floor); fused ops launch nothing; the MegaMoE ops are
+        # one persistent kernel (one floor, charged with the layer below)
+        is_mega = fused_ep and op.id in MEGAMOE_OPS
+        if is_mega:
+            ep_ops += tt
+        fl = max(hw.kernel_s, hw.floor_s) if op.id in KERNEL_FLOOR_OPS else hw.kernel_s
+        gap = 0.0 if (op.fused or is_mega) else max(0.0, fl - tt)
         unit[lt]["comp"] += tt * per
         unit[lt]["kernels"] += gap * per
         f = Mdl.FAMILY[op.id]
@@ -188,12 +225,29 @@ def evaluate(t, phase, ck_name, col, env, o2=False, o3=False, moe_act=None, imb=
         ev_all["step"] = []
     comm_unit = {}
     comm_rows = []
+    mega = None
+    fused_x = phase == "decode" and t.residual == "tp"     # specialized-decode TP path fuses its exchanges
     for lt, evs in ev_all.items():
         sync = asyn = 0.0
         hops = 0
         by = {}
+        ep_bw = ep_lat = 0.0
+        ep_by = {}
         for e in evs:
-            tcm, a = comm_time(e, hw)
+            if fused_ep and lt == "moe" and "alts" not in e and e["prim"].startswith(EP_PRIMS):
+                # MegaMoE dispatch / combine: in-kernel pushes (no launch floor), overlapped with the expert GEMMs
+                bw = max(e["in_B"], e["out_B"]) / hw.nvl
+                lat = e["hops"] * hw.push_hop(e.get("N", 2))
+                ep_bw += bw
+                if e["prim"].startswith("P12"):
+                    ep_lat += lat                     # combine drain is exposed; dispatch latency hides
+                ep_by[e["prim"]] = bw + lat
+                hops += e["hops"]
+                if ops_detail:
+                    comm_rows.append(dict(layer=lt, prim=e["prim"], name=e["name"], in_B=e["in_B"], out_B=e["out_B"],
+                                          hops=e["hops"], t=bw + lat, async_=False))
+                continue
+            tcm, a = comm_time(e, hw, fused=fused_x)
             if a.get("async_"):
                 asyn += tcm
             else:
@@ -203,9 +257,20 @@ def evaluate(t, phase, ck_name, col, env, o2=False, o3=False, moe_act=None, imb=
             if ops_detail:
                 comm_rows.append(dict(layer=lt, prim=a["prim"], name=a["name"], in_B=a["in_B"], out_B=a["out_B"],
                                       hops=a["hops"], t=tcm, async_=bool(a.get("async_"))))
+        if ep_by:
+            n_exp = env_x["E_ACT"]
+            mm = megamoe_time(ep_ops, ep_bw, ep_lat, n_exp)
+            exposed = mm - ep_ops                      # >= 0: what the link adds beyond the GEMMs
+            tot = sum(ep_by.values())
+            for p, v in ep_by.items():
+                by[p] = by.get(p, 0.0) + exposed * v / tot
+            sync += exposed
+            unit["moe"]["kernels"] += max(0.0, max(hw.kernel_s, hw.floor_s) - mm)
+            mega = dict(ops=ep_ops, link_bw=ep_bw, link_lat=ep_lat, n_exp=n_exp, layer=mm, exposed=exposed,
+                        serial=ep_ops + ep_bw + ep_lat)
         comm_unit[lt] = dict(sync=sync, asyn=asyn, by=by, n=len(evs), hops=hops)
     return dict(unit=unit, comm=comm_unit, fam=fam, rows=rows, comm_rows=comm_rows, hw=hw,
-                flops=tot_flops, bytes=tot_bytes, topk_select=sel or "scratch")
+                flops=tot_flops, bytes=tot_bytes, topk_select=sel or "scratch", megamoe=mega)
 
 
 LAYER_COUNTS = {"embed": 1, "attnres": None, "kda": 69, "dsa": 24, "moe": 92, "dense": 1, "final": 1, "drafter": 1}

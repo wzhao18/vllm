@@ -6,7 +6,7 @@ freely through NIXL. Both serving checkpoints (`mxfp4_release`, `nvfp4_modelopt`
 `k31vr/sol.html`.
 
 ```
-python3 k31vr/solmodel/run.py      # writes k31vr/solmodel/out/{prefill,decode,optables,meta}.json (~5 s, stdlib only)
+python3 k31vr/solmodel/run.py      # writes k31vr/solmodel/out/{prefill,decode,optables,meta,calibrated}.json (~15 s, stdlib only)
 python3 k31vr/solmodel/render.py   # inlines out/*.json into sol_template.html -> k31vr/sol.html
 ```
 
@@ -31,7 +31,8 @@ Python 3.9+, no third-party packages. `python3 k31vr/solmodel/test_solmodel.py` 
 | `kv.py` | KV and state capacity, r<sub>max</sub> per GPU |
 | `prefill.py` | chunk time, fresh tok/s/GPU, F x L scans, TTFT, NIXL bytes |
 | `decode.py` | step time vs requests per GPU for k = 3/5/7, the AFD pool model, pareto curves |
-| `run.py` | runs everything and writes `out/*.json` |
+| `calibrate.py` | calibrated column: achievable x per-path microbench derate (`inputs/derating.json`, analog rules for unmeasured paths) |
+| `run.py` | runs everything and writes `out/*.json`; `out/calibrated.json` = sol / achievable / calibrated per topology, per r-band, rankings (<= 32 and <= 16 GPUs) |
 | `render.py`, `sol_template.html` | build the self-contained page |
 | `screening/` | the earlier screening scripts behind `proposals.md` §4. These are not the SOL model. |
 
@@ -139,16 +140,37 @@ r<sub>max</sub> is per GPU: a group of N holds N x r requests.
 | BF16 / FP8 / FP4 dense | 4.0 / 17.5 / 35 PF | 3.65 / 10.9 / 21.1 PF |
 | FP32 SIMT | 131.6 TF (212 SMs x 128 x 2 x 2.424 GHz, measured attributes) | same |
 | HBM | 22 TB/s | 13.9 TB/s (17.1 die-local under O3) |
-| NVLink per direction | 1.8 TB/s | 1.25 TB/s ingress |
+| NVLink per direction | 1.8 TB/s | 1.06 TB/s (comm lane maximum: push 1.04, multicast AG 1.05, NVLS RS 1.06 TB/s) |
 | FP32 SIMT / MUFU exp | 131.6 TF / 8.2 Tops (derived) | same |
 | push hop | 2.86 us (no public latency figure; never below our measured one-way flag) | 2.86 us + 0.035 us per polled peer |
-| NVLS all-reduce | 2 hops + M(1+1/N) at NVLink | alpha 12.6 / 12.9 / 12.9 us, algbw 0.33 / 0.29 / 0.46 TB/s (N = 4 / 8 / 16; symmbench multimem + ncclbench NVLS) |
-| per-kernel gap | 0 | 0.78 us, overlapped under PDL (a kernel costs max(roofline, gap)) |
+| NVLS all-reduce | 2 hops + M(1+1/N) at NVLink | alpha 12.6 / 12.9 / 12.9 us (symmbench), algbw 0.64 / 0.77 / 0.84 / 0.88 TB/s (N = 2 / 4 / 8 / 16; comm lane multimem kernel fit) |
+| NVLS reduce-scatter | 2 hops + M at NVLink | alpha + M / 1.06 TB/s (N >= 4), M / 0.88 TB/s at N = 2 (comm lane) |
+| launched exchange | hops only | max(hops x hop + bytes / NVLink, floor(N)), floor = fastest measured standalone exchange 3.86 / 4.22 / 4.49 / 4.89 us (N = 2/4/8/16); exchanges fused into compute kernels (sdec TP path) pay the hop only |
+| per-kernel gap | 0 | 0.78 us graph node, overlapped under PDL (a kernel costs max(roofline, gap)) |
+| per-kernel floor | 0 | 2 us on the grid-dependent kernels (KDA recurrence, indexer, sparse MLA, one per MegaMoE layer): ~4 us measured launched kernel minus the PDL-overlapped launch; bounded by the D1 e2e anchors |
+| MegaMoE expert weights | HBM | die-local 17.1 TB/s (megamoe_rubin placement; EP8 T=32 measures > 13.9 TB/s) |
 
 Neither column is fitted to e2e or step measurements. The anchors in `out/meta.json` and on the page are sanity checks
 only: D1 e2e decode (21 runs), C512 D3 decode step bench (r = B/4), C512 P2 prefill (computed prompt tokens, plus the
 O4 variant and the marginal slope), and PR #20 (24-layer layout ratios). `run.py` prints a WARNING, and the page marks
 in red, every anchor where the achievable column is slower than the measurement.
+
+## 2026-11-18 update: <= 32-GPU scope, wave-1 model fixes, calibrated column
+
+- **Scope** (`topologies.SCOPE`): at most 32 GPUs per instance (EP <= 32). EP32 variants D3-32 (DP8 x TP4 SP), D4-32,
+  D7-{2,4,8}-32, D8-32, D9-32, P3-32, P6-32, P9-32 join the -16 variants; EP64/72, PP4 and AFD stay modelled but unranked.
+- **Model fixes** (`microbench/RESULTS.md` "Model fixes" + adversarial review; physics, not fitted):
+  MegaMoE = max(ops, dispatch + combine bytes) + combine drain hop + one expert of the shorter phase (`cost.megamoe_time`,
+  a SOL overlap assumption checked against every moe row); P1-type TP prefill runs AttnRes on the 1/N RS shard and
+  replaces each sublayer AR by RS (in the o_proj GEMM) + AG (`topologies.tp_reduce`); the hardware rows above; and the
+  packed KV block pool in the achievable capacity at the best pinnable block size (`kv.py`).
+- **Upper-bound tests**: achievable <= every comm row, MegaMoE row, decode step row and shipped e2e anchor (the C512
+  prefill slope fit is allow-listed); achievable KV bytes per request <= the measured deployments.
+- **Calibrated column** (`calibrate.py`): decode = experts x expert-kernel family derate (MegaMoE rows for EP, sdec
+  MoE-TP16 for D1) + rest x the measured front derate (D1 TP front, D3 SP front); prefill = step derate of the path,
+  chunk capped at the largest measured chunk. Points are tagged measured / projected / extrapolated; extrapolated
+  points never win a band, and measured-path-only winners are reported alongside. nvfp4_modelopt is an unmeasured
+  transfer. `run.py` prints the per-band rankings for <= 32 and <= 16 GPUs.
 
 ## Main assumptions
 

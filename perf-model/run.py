@@ -12,13 +12,14 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import calibrate as Cal  # noqa: E402
 import cost  # noqa: E402
 import decode as Dec  # noqa: E402
 import hw as HWm  # noqa: E402
 import kv  # noqa: E402
 import model as Mdl  # noqa: E402
 import prefill as Pre  # noqa: E402
-from topologies import ALL, DECODE, PREFILL, SCOPE  # noqa: E402
+from topologies import ALL, DECODE, EP_MAX, PREFILL, SCOPE  # noqa: E402
 
 OUT = os.path.join(HERE, "out")
 COLS = HWm.COLUMNS
@@ -84,8 +85,8 @@ def run_prefill():
                                               note="74K zero-hit request over CP8: one 9.25K-row slice per GPU + KDA "
                                                    "fix-up (+1x KDA core) + log2(8)-round transition exchange")
     out["ttft"] = tt
-    out["scope_ep16"] = [t.id for t in PREFILL if t.id in SCOPE]
-    out["rank_ep16"] = {k: sorted(((tid, v["best"]["tok_s_gpu"], v["bestF"]) for tid, v in per.items() if tid in SCOPE),
+    out["scope"] = [t.id for t in PREFILL if t.id in SCOPE]
+    out["rank_scope"] = {k: sorted(((tid, v["best"]["tok_s_gpu"], v["bestF"]) for tid, v in per.items() if tid in SCOPE),
                                    key=lambda x: -x[1]) for k, per in out["res"].items()}
     out["nixl"] = {str(L): Pre.nixl_bytes(L) for L in (78400, 135000, 145000)}
     out["fan_in"] = {t.id: Pre.fan_in(t) for t in PREFILL}
@@ -102,6 +103,11 @@ def run_decode():
                 cap = kv.capacity(t, ck, k, Dec.L_DEC)
                 cap189 = kv.capacity(t, ck, k, Mdl.AGENTX["decode_ctx_osl_weighted"])
                 cap["rmax_189K"] = cap189["rmax"]
+                if not t.afd:      # achievable = packed block pool (per-request block floor); calibrated = x measured
+                    ca = kv.capacity(t, ck, k, Dec.L_DEC, col="achievable")
+                    cap["rmax_ach"], cap["per_req_ach_GB"], cap["blocks_ach"] = ca["rmax"], ca["per_req_GB"], ca["blocks"]
+                    cap["rmax_ach_189K"] = kv.capacity(t, ck, k, Mdl.AGENTX["decode_ctx_osl_weighted"], col="achievable")["rmax"]
+                    cap["rmax_cal"], cap["rmax_cal_method"] = Cal.decode_rmax(t, ck, k, ca["rmax"])
                 out["cap"]["%s|%d|%s" % (ck, k, t.id)] = cap
             for col in COLS:
                 for var in Dec.VARIANTS:
@@ -126,11 +132,11 @@ def run_decode():
                                              margin=(c[0] / second[0] - 1) if second else None))
                     out["best"][key] = best
                     out["pareto"][key] = _envelope(allpts)
-                    # EP <= 16 scope (2026-11-18)
+                    # <= 32-GPU scope (2026-11-18)
                     sp = [(tid, p) for tid, p in allpts if tid in SCOPE]
-                    out.setdefault("best_ep16", {})[key] = _best_per_r(sp)
-                    out.setdefault("pareto_ep16", {})[key] = _envelope(sp)
-    out["scope_ep16"] = [t.id for t in DECODE if t.id in SCOPE]
+                    out.setdefault("best_scope", {})[key] = _best_per_r(sp)
+                    out.setdefault("pareto_scope", {})[key] = _envelope(sp)
+    out["scope"] = [t.id for t in DECODE if t.id in SCOPE]
     return out
 
 
@@ -210,10 +216,14 @@ def run_optables():
 ASSUMPTIONS = [
     "SOL column = public VR200 spec peaks (BF16 4 / FP8 17.5 / FP4 35 PF dense, HBM4 22 TB/s, NVLink6 1.8 TB/s per "
     "direction), zero per-kernel gap; there is no public NVLink latency figure, so a dependent hop uses our measured "
-    "one-way flag hand-off (2.86 us) and is never set below a measured hand-off. Achievable column = our Hecate "
-    "measurements (3.65 / 10.9 / 21.1 PF, 13.9 TB/s, 1.25 TB/s ingress, 2.86 us push hop + 0.035 us per polled peer, "
-    "NVLS all-reduce alpha 12.6-12.9 us and algbw 0.29-0.46 TB/s from symmbench + ncclbench, 0.78 us graph node). "
-    "No fitted derating.",
+    "one-way flag (2.86 us) and is never set below a measured hand-off. Achievable column = our Hecate "
+    "measurements (3.65 / 10.9 / 21.1 PF, 13.9 TB/s, 2.86 us push hop + 0.035 us per polled peer, 0.78 us graph node) "
+    "plus the wave-1 microbench fixes (2026-11-18): push 1.06 TB/s (measured ceiling), NVLS AR alpha 12.6-12.9 us + "
+    "algbw 0.64/0.77/0.84/0.88 TB/s (N = 2/4/8/16, multimem kernel), NVLS RS alpha + M / 1.06 TB/s (0.88 at N = 2), "
+    "standalone exchange floor = fastest measured exchange per N (3.86/4.22/4.49/4.89 us; fused sdec TP-path exchanges "
+    "pay the hop only), 2 us floor on the grid-dependent kernels (KDA recurrence, indexer, sparse MLA, MegaMoE), "
+    "MegaMoE expert weights streamed die-local (17.1 TB/s). Tests keep the column at or below every comm / MegaMoE / "
+    "step row and e2e anchor. No fitted derating; the calibrated column (calibrate.py) is the only derated one.",
     "FP32 SIMT (131.6 TF) and MUFU exp (8.2 T/s) rates are derived from measured attributes (212 SMs x 128 lanes x 2, "
     "x 16 MUFU, x 2.424 GHz) in both columns (not measured).",
     "Per-op roofline t = max(FLOPs/peak[dtype], bytes/HBM, SIMT/peak_simt + SFU/peak_mufu); ops are additive (no "
@@ -256,7 +266,15 @@ ASSUMPTIONS = [
     "DcpExchange top-k merge bytes 1536 B per row per peer (inferred); sharded verify 100 B per row per peer. DSA-DP "
     "decode push_in/out move 0 bytes (SP shards hold whole requests, the holder is the owner); prefill pays (N-1)/N.",
     "Capacity: HBM budget 272.48 GiB (measured free at vLLM start) - resident weights - 16 GiB reserve (activations, "
-    "graphs, symmetric buffers, MegaMoE arena). r_max is per GPU (a group of N holds N x r requests).",
+    "graphs, symmetric buffers, MegaMoE arena). r_max is per GPU (a group of N holds N x r requests). SOL = byte-exact "
+    "state; achievable = the packed hybrid block pool at the best pinnable block size (multiples of 64): whole "
+    "bs-token rows of all 24 DSA layers per request (DSA rows ceil((L+1+k)/(bs x DCP)), G >= 3 KDA state groups x "
+    "(1 + k) spec slots, drafter SWA ring; deployed D1 24 / 36 and D2 36 / 52 rows reproduced); the SP path is "
+    "charged the byte-exact state (its measured 13 rows are not G x (1 + k) state rows).",
+    "MegaMoE (EP) is one persistent kernel: layer = max(expert ops, dispatch + combine bytes / NVLink) + combine drain "
+    "hop + one expert's worth of the shorter phase (moe lane: the fused kernel hides the link under the GEMMs).",
+    "P1-type TP prefill: o_proj reduce-scatters in the GEMM, AttnRes runs on the 1/N token shard, a push AG rebuilds the "
+    "rows (RS + AG per sublayer instead of an AR); TP decode (sdec) keeps the fused AR and all-row AttnRes.",
     "Prefill chunks are packed from AgentX requests with 5,456 fresh tokens each over a 72.9K prefix (fresh-weighted "
     "mean); L_ref = 78.4K. Headline = best chunk size per engine in {4K..64K} that fits HBM (0.5 MB per row of live "
     "activations assumed). KDA state checkpoint export for the prefix cache is counted (CKPT=1). KDA core prefill has a "
@@ -390,7 +408,7 @@ def run_meta(dec):
         group_order=Mdl.GROUP_ORDER, assumptions=ASSUMPTIONS, open_questions=OPEN_Q, anchors=anchors,
         op_info={o.id: dict(name=o.name, shapes=o.shapes, layer=o.layer_type, fused=o.fused,
                             cite=o.cite[:2]) for o in Mdl.OPS},
-        reserve_GiB=kv.RESERVE_GIB, agentx=Mdl.AGENTX, scope_ep16=SCOPE,
+        reserve_GiB=kv.RESERVE_GIB, agentx=Mdl.AGENTX, scope=SCOPE, scope_rule="<= %d GPUs per instance" % EP_MAX,
     )
 
 
@@ -404,11 +422,14 @@ def main():
     opt = run_optables()
     print("op tables done %.1fs" % (time.time() - t0))
     meta = run_meta(dec)
-    for name, obj in (("prefill", pre), ("decode", dec), ("optables", opt), ("meta", meta)):
+    cal = run_calibrated(pre, dec)
+    print("calibrated + ranking done %.1fs" % (time.time() - t0))
+    for name, obj in (("prefill", pre), ("decode", dec), ("optables", opt), ("meta", meta), ("calibrated", cal)):
         with open(os.path.join(OUT, name + ".json"), "w") as f:
             json.dump(rnd(obj), f, separators=(",", ":"))
         print("wrote out/%s.json (%.0f KB)" % (name, os.path.getsize(os.path.join(OUT, name + ".json")) / 1e3))
     summary(pre, dec)
+    summary_ranking(cal)
     for a in meta["anchors"]:
         for r in a["rows"]:
             if r["warn"]:
@@ -428,10 +449,141 @@ def summary(pre, dec):
         for var in ("base", "O1+O2+O3"):
             b = dec["best"]["%s|3|achievable|%s" % (ck, var)]
             print("  %-9s " % var + " ".join("r%g:%s %.0f" % (x["r"], x["topo"], x["tps_gpu"]) for x in b))
-        print("== %s EP<=16 scope: prefill ranking (O1+O2, achievable) / decode best per r (k=3, achievable, base)" % ck)
-        print("  " + "  ".join("%s %.1fK" % (tid, v / 1e3) for tid, v, _ in pre["rank_ep16"]["%s|achievable|O1+O2" % ck][:6]))
-        b = dec["best_ep16"]["%s|3|achievable|base" % ck]
+        print("== %s <=%d-GPU scope: prefill ranking (O1+O2, achievable) / decode best per r (k=3, achievable, base)"
+              % (ck, EP_MAX))
+        print("  " + "  ".join("%s %.1fK" % (tid, v / 1e3) for tid, v, _ in pre["rank_scope"]["%s|achievable|O1+O2" % ck][:6]))
+        b = dec["best_scope"]["%s|3|achievable|base" % ck]
         print("  " + " ".join("r%g:%s %.0f" % (x["r"], x["topo"], x["tps_gpu"]) for x in b))
+
+
+# ---------------------------------------------------------------------------------------------- calibrated + ranking
+BANDS = [("<=0.5", 0.0, 0.5), ("1-2", 1.0, 2.0), ("3-8", 3.0, 8.0), ("12-24", 12.0, 24.0), ("32-64", 32.0, 64.0)]
+COLS3 = ("sol", "achievable", "calibrated")
+EP16_GPUS = 16
+
+
+def _pt(p):
+    return None if p is None else dict(t_ms=p["t_ms"], tps_gpu=p["tps_gpu"], tps_user=p["tps_user"])
+
+
+def _decode_cal(ck, dec, k=3):
+    """Per decode topology in scope: grid points with sol / achievable / calibrated (base variant, k=3)."""
+    res_s = {tid: {round(p["r"], 6): p for p in pts} for tid, pts in dec["res"]["%s|%d|sol|base" % (ck, k)].items()}
+    res_a = {tid: {round(p["r"], 6): p for p in pts} for tid, pts in dec["res"]["%s|%d|achievable|base" % (ck, k)].items()}
+    out = {}
+    for t in DECODE:
+        if t.id not in SCOPE:
+            continue
+        cap_a = kv.capacity(t, ck, k, Dec.L_DEC, col="achievable")["rmax"]
+        rcal, how = Cal.decode_rmax(t, ck, k, cap_a)
+        rows = []
+        for r in Dec.R_GRID:
+            key = round(r, 6)
+            ps, pa = res_s[t.id].get(key), res_a[t.id].get(key)
+            if ps is None and pa is None:
+                continue
+            pc = None
+            if pa is not None and r <= rcal + 1e-9:
+                pc = Cal.decode_calibrated(t, ck, pa)
+            rows.append(dict(r=r, sol=_pt(ps), achievable=_pt(pa), calibrated=pc))
+        out[t.id] = dict(gpus=t.gpus, rmax=dict(sol=kv.capacity(t, ck, k, Dec.L_DEC)["rmax"], achievable=cap_a,
+                                                 calibrated=rcal), rmax_cal_method=how,
+                         front=Cal.FRONT.get(t.id), note=Cal.NOTES.get(t.id, ""), points=rows)
+    return out
+
+
+def _band_rank(per, col, ids, tags=None):
+    """Per band: the best topology at every r grid point of the band (by tok/s/GPU; equal r = equal requests per
+    GPU, so this is also the best interactivity). Band winner = the topology that wins the most r points of the band;
+    ties go to the higher mean of tps_gpu / best tps_gpu over the band's points (0 where over capacity).
+    tags: for the calibrated column, only points whose tag is in tags compete ('extrapolated' never does)."""
+    out = {}
+    for name, lo, hi in BANDS:
+        rs = [r for r in Dec.R_GRID if lo - 1e-9 <= r <= hi + 1e-9]
+        by_r, score, wins = [], {}, {}
+        for r in rs:
+            c = sorted(((x[col]["tps_gpu"], tid, x[col].get("tag")) for tid in ids for x in per[tid]["points"]
+                        if abs(x["r"] - r) < 1e-9 and x[col] is not None
+                        and (tags is None or x[col].get("tag") in tags)), reverse=True)
+            if not c:
+                continue
+            by_r.append(dict(r=r, topo=c[0][1], tag=c[0][2], tps_gpu=c[0][0],
+                             tps_user=c[0][0] / r, runner=c[1][1] if len(c) > 1 else None,
+                             margin=(c[0][0] / c[1][0] - 1) if len(c) > 1 else None))
+            wins[c[0][1]] = wins.get(c[0][1], 0) + 1
+            for v, tid, _ in c:
+                score[tid] = score.get(tid, 0.0) + v / c[0][0]
+        if not by_r:
+            out[name] = None
+            continue
+        n = len(by_r)
+        ranked = sorted(score, key=lambda tid: (-wins.get(tid, 0), -score[tid]))
+        out[name] = dict(winner=ranked[0], wins=wins.get(ranked[0], 0), n_r=n, score=score[ranked[0]] / n,
+                         runner=ranked[1] if len(ranked) > 1 else None,
+                         runner_score=score[ranked[1]] / n if len(ranked) > 1 else None, by_r=by_r)
+    return out
+
+
+def run_calibrated(pre, dec):
+    out = dict(rule="calibrated = achievable x per-component microbench derates (calibrate.py); scope <= %d GPUs; "
+                    "base variant (no O1/O2/O3: the measured code has none); decode k=3 L=135K; prefill at L=78.4K, "
+                    "chunk capped at the largest measured chunk of the path (64K reported as extrapolated); "
+                    "'extrapolated' points never win a band; measured_only = D1/D2/D3/D3-32 measured points only; "
+                    "nvfp4_modelopt calibrated = unmeasured transfer" % EP_MAX,
+               derates=Cal.summary(), bands=[b[0] for b in BANDS], decode={}, prefill={}, rank={})
+    for ck in CKS:
+        per = _decode_cal(ck, dec)
+        out["decode"][ck] = per
+        ids32 = list(per)
+        ids16 = [t for t in ids32 if ALL[t].gpus <= EP16_GPUS]
+        rk = {}
+        for scope, ids in (("scope32", ids32), ("scope16", ids16)):
+            rk["decode|sol|" + scope] = _band_rank(per, "sol", ids)
+            rk["decode|achievable|" + scope] = _band_rank(per, "achievable", ids)
+            rk["decode|calibrated|" + scope] = _band_rank(per, "calibrated", ids, tags=("measured", "projected"))
+        rk["decode|calibrated|measured_only"] = _band_rank(per, "calibrated", ids32, tags=("measured",))
+        pp = {}
+        for t in PREFILL:
+            if t.id not in SCOPE:
+                continue
+            ra = pre["res"]["%s|achievable|base" % ck][t.id]
+            rs = pre["res"]["%s|sol|base" % ck][t.id]
+            path = Cal.prefill_path(t.id)
+            Fcap = min(ra["bestF"], Cal.prefill_table(path, ck == "nvfp4_modelopt")["Fmax"])
+            c = Cal.prefill_calibrated(t, ck, Fcap, Pre.L_REF)
+            c64 = Cal.prefill_calibrated(t, ck, ra["bestF"], Pre.L_REF)
+            pp[t.id] = dict(gpus=t.gpus, bestF=ra["bestF"], sol=dict(tok_s_gpu=rs["best"]["tok_s_gpu"], bestF=rs["bestF"]),
+                            achievable=dict(tok_s_gpu=ra["best"]["tok_s_gpu"], t_ms=ra["best"]["t_ms"]),
+                            achievable_O1O2=pre["res"]["%s|achievable|O1+O2" % ck][t.id]["best"]["tok_s_gpu"],
+                            calibrated=c, calibrated_bestF_extrapolated=c64, path=path)
+        out["prefill"][ck] = pp
+        for col in COLS3:
+            def val(v):
+                return v[col]["tok_s_gpu"] if v[col] else 0.0
+            r32 = sorted(((tid, val(v)) for tid, v in pp.items()), key=lambda x: -x[1])
+            rk["prefill|%s|scope32" % col] = r32
+            rk["prefill|%s|scope16" % col] = [x for x in r32 if ALL[x[0]].gpus <= EP16_GPUS]
+        rk["prefill|calibrated|measured_only"] = [x for x in rk["prefill|calibrated|scope32"] if x[0] in Cal.PRE_MEASURED]
+        out["rank"][ck] = rk
+    return out
+
+
+def summary_ranking(cal):
+    for ck in CKS:
+        rk = cal["rank"][ck]
+        print("\n== %s ranking, <=32 GPUs (EP16-only winner in brackets when different)%s"
+              % (ck, "  [calibrated = unmeasured transfer]" if ck != "mxfp4_release" else ""))
+        for col in ("achievable", "calibrated"):
+            a, b = rk["prefill|%s|scope32" % col], rk["prefill|%s|scope16" % col]
+            print("  prefill %-10s " % col + "  ".join("%s %.1fK" % (t, v / 1e3) for t, v in a[:5])
+                  + ("" if a[0][0] == b[0][0] else "   [EP16: %s %.1fK]" % (b[0][0], b[0][1] / 1e3)))
+            x, y = rk["decode|%s|scope32" % col], rk["decode|%s|scope16" % col]
+            print("  decode  %-10s " % col + "  ".join(
+                "%s:%s%s" % (n, x[n]["winner"] if x[n] else "-",
+                             "" if not x[n] or not y[n] or x[n]["winner"] == y[n]["winner"] else "[%s]" % y[n]["winner"])
+                for n in cal["bands"]))
+        m = rk["decode|calibrated|measured_only"]
+        print("  decode  measured-only " + "  ".join("%s:%s" % (n, m[n]["winner"] if m[n] else "-") for n in cal["bands"]))
 
 
 if __name__ == "__main__":
