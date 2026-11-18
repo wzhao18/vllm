@@ -105,7 +105,17 @@ def main():
     p.add_argument("--layers", type=int, default=69)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--json", default="")
+    p.add_argument("--trace", action="store_true", help="KdaFlow cycle trace")
+    p.add_argument("--skip", default="", help="KdaFlow diagnostics: fold,store,verify")
     a = p.parse_args()
+    if a.trace:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.TRACE = True
+    if a.skip:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.SKIP = tuple(a.skip.split(","))
     props = torch.cuda.get_device_properties(0)
     print(f"device {props.name} sms {props.multi_processor_count}", flush=True)
     results = []
