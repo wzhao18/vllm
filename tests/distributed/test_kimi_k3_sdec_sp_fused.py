@@ -156,6 +156,8 @@ def _worker(env: dict[str, str]) -> None:
                     torch.accelerator.synchronize(device)
                     assert _armed(comm, parity, rows), (mode, rows, layer)
                     res[mode] = [t.float() for t in (g, y, prefix, blocks)]
+                if rank == 0:
+                    print(f"R{rows} L{layer} done", flush=True)
                 s, f = res["stock"], res["fused"]
                 assert torch.equal(s[2], f[2]), ("prefix", rows, layer)
                 assert torch.equal(s[3], f[3]), ("blocks", rows, layer)
@@ -163,6 +165,8 @@ def _worker(env: dict[str, str]) -> None:
                     ok, ratio = _close(s[i], f[i], 2)
                     worst[name] = max(worst.get(name, 0.0), ratio)
                     assert ok, (name, rows, layer, ratio)
+        if rank == 0:
+            print("boundaries ok; final gather", flush=True)
         # The final multicast gather: stock rows (sanitized), box re-armed.
         width = 3 * WIDTH
         final = sp_comm.SpFinalGather(
@@ -222,7 +226,7 @@ def _multicast() -> bool:
 
 
 @pytest.mark.skipif(not _multicast(), reason="needs NVLink multicast")
-@pytest.mark.parametrize("world", [4])
+@pytest.mark.parametrize("world", [2, 4])
 def test_sp_fused_boundaries(world):
     if torch.cuda.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
