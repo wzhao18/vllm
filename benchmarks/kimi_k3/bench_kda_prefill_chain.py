@@ -30,6 +30,8 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--row-stride", type=int, default=49376)
     ap.add_argument("--json", default="")
+    ap.add_argument("--k2-pin", type=int, default=0,
+                    help="split: pin the K2 variant (fwd_launch.cu mode bits 5-7)")
     ap.add_argument("--impl", default="stock", choices=["stock", "split", "fused"])
     args = ap.parse_args()
 
@@ -90,7 +92,7 @@ def main():
         torch.ops.k3_flashkda_split.fwd(
             q, k, v, g1, beta, D ** -0.5, out, ws, A_log,
             dt_bias.view(H, D), lower_bound, init_state, final_state, cu,
-            None, None, 3)
+            None, None, 3 | (args.k2_pin << 5))
         kda_norm.rmsnorm_gated_mxfp8(out, g2, norm_w, 1e-6, out=mx)
 
     def step_stock():
@@ -121,7 +123,7 @@ def main():
     rows = sorted(((v / args.iters, cnt[k] // args.iters, k) for k, v in acc.items()),
                   reverse=True)
     total = sum(r[0] for r in rows)
-    print(f"impl={args.impl} shape T={T} N={N} H={H}: total {total:.1f} us/layer")
+    print(f"impl={args.impl} pin={args.k2_pin} shape T={T} N={N} H={H}: total {total:.1f} us/layer")
     for us, c, name in rows:
         print(f"  {us:9.1f} us  x{c}  {name[:150]}")
     if args.json:

@@ -199,7 +199,7 @@ void launch_fwd(
     // wave would double the serial chunk chain.
     auto launch_vsplit = [&](auto vd_tag, auto stages_tag, auto min_blocks_tag,
                              auto exact_tag, auto no_out_tag, auto zero_v_tag,
-                             int max_blocks_per_sm) -> bool {
+                             int max_blocks_per_sm, bool forced = false) -> bool {
       constexpr int kVD = decltype(vd_tag)::value;
       constexpr int kStages = decltype(stages_tag)::value;
       constexpr int kMinBlocks = decltype(min_blocks_tag)::value;
@@ -237,7 +237,7 @@ void launch_fwd(
         return blocks;
       }();
       const int blocks = H * (D / kVD) * N;
-      if (blocks > std::min(resident, max_blocks_per_sm) * num_sms) {
+      if (!forced && blocks > std::min(resident, max_blocks_per_sm) * num_sms) {
         return false;
       }
       dim3 grid_k2(H * (D / kVD), N);
@@ -292,10 +292,24 @@ void launch_fwd(
           "k3_flashkda_split: K2 NoOut / ZeroV need exact fp32 state I/O, an "
           "fp32 final state and no checkpoint");
     }
+    // Kimi-K3: mode bits 5-7 pin one K2 variant (benchmarks of the per-shape
+    // policy; 0 = the policy below): 1 VD16, 2 VD32 x3/SM, 3 VD64, 4 VD64 x2/SM,
+    // 5 VD64 x3/SM, 6 VD32 x4/SM, 7 full width. A pinned grid may take waves.
+    const int pin = (mode >> 5) & 7;
+    using B2 = std::integral_constant<int, 2>;
+    using B4 = std::integral_constant<int, 4>;
     auto launch_k2 = [&](auto exact_tag) {
-      if (launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1)) return;
-      if (launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3)) return;
-      if (launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1)) return;
+      if (pin == 1 && launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1, true)) return;
+      if (pin == 2 && launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3, true)) return;
+      if (pin == 3 && launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1, true)) return;
+      if (pin == 4 && launch_vsplit(I64{}, S3{}, B2{}, exact_tag, No{}, No{}, 2, true)) return;
+      if (pin == 5 && launch_vsplit(I64{}, S3{}, B3{}, exact_tag, No{}, No{}, 3, true)) return;
+      if (pin == 6 && launch_vsplit(I32{}, S3{}, B4{}, exact_tag, No{}, No{}, 4, true)) return;
+      if (pin == 0) {
+        if (launch_vsplit(I16{}, S4{}, B1{}, exact_tag, No{}, No{}, 1)) return;
+        if (launch_vsplit(I32{}, S3{}, B3{}, exact_tag, No{}, No{}, 3)) return;
+        if (launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1)) return;
+      }
 
       using SharedStorageK2T =
           SharedStorageK2<K2L, kInputStages, kOutputStages>;
