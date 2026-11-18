@@ -4,23 +4,23 @@
  "side": "decode",
  "owner": "D-TOPK agent",
  "state": "implementing",
- "updated": "2026-11-18T14:50-08:00",
+ "updated": "2026-11-18T15:20-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K (local \u224833.75K on DCP4), k=3; also r1 (16 rows), r8 (128 rows)",
  "baseline_ms": 2.3,
- "current_ms": 1.83,
+ "current_ms": 0.821,
  "achievable_ms": 0.227,
  "target_ms": 0.25,
  "step_ms": 30.5,
- "basis": "MEASURED microbench (4 GPUs = one DCP4 group on Rhea VR200, decode wiring launch shape, CUDA-graph us/call, relu-like indexer logits, L=135K): in-tree 30.4/45.3/85.7 us per layer at r1/r8/r24 (x24 DSA layers = 0.73/1.09/2.06 ms per step; in-step gap512 B92: 2.26 ms). current_ms = r24 after the in-place tie round (76.3 us x 24). achievable = rhea1n model_rows: r24 1.9 + 7.5 us/layer, r8 0.64 + 6.4, r1 0.08 + 5.9",
- "gap_analysis": "Measured (runs/D-TOPK/base1.log, per-row globaltimer stamps + CUPTI): (1) ties at the K-th bf16 key straddle >= 2 ranks on 98% of rows (stats tie_round 1512/1536 at r24, 504/512 r8, 64/64 r1); the in-tree path sends them to the leader state machine: one more streamed key pass (WRITE->offsets 11 us at r24) + tie round (~3-4 us). (2) at r8/r24 the launch shape is bounded by max_model_len (cluster 2/4, segmax 0) so the 3 pre-pass kernels run: r24 pp_hist 9.7 + pp_window 8.7 + pp_win 22-28 us = 41-46 us, i.e. more than the merge kernel itself; r8 5.4 us. (3) the merge kernel is a chain of ~12 serial leader/cluster steps of 1.5-3 us each (r1, staged keys: pass A 3.3, S1 1.0, estimate 1.8, window 2.6, send 1.1, NVLink round 1.8, resolve 1.7, quota 1.7, bitmap 2.3-3, tie round 2.6, write 1.5): 27 us for 4.2K keys per CTA. The NVLink round itself is 1.8 us at r1 and 4.7 us at r24 (send->polled); two rounds (window + ties) are inherent to the stock global-id tie rule unless the tie lists ride on round 1.",
+ "basis": "MEASURED microbench (4 GPUs = one DCP4 group, Rhea VR200, decode wiring launch, CUDA-graph us/call, relu-like logits, L=135K): v2 27.1/26.9/34.2 us per layer at r1/r8/r24 (in-tree 30.4/45.3/85.7); current_ms = r24 x 24 DSA layers. achievable = rhea1n model_rows B96: DSA.topk 1.9 + P8 7.5 us/layer (r8 0.64 + 6.4, r1 0.08 + 5.9)",
+ "gap_analysis": "v2 (3d340bcf5e) removed the pre-pass kernels, the max_model_len-bound launch shape and the tie round (the band of global ids resolves ties straddling ranks in round 1 on 100% of bench rows). Remaining per-row chain (clock64 phase stamps, r1 / r24 us): sample 1.4/2.2, theta 0.6/0.7, candidate pass 8.5-9.5/10.4, fine window + band + msg 3.5/3.9, NVLink round 2.8-6/3-6 (includes rank skew), resolve 5/6.5, WRITE 3.5/4.5. A standalone probe of the same candidate loop runs 2.9 us (r1) / 3.3 us (r24) and a CTA pulls a 67.5 KB row into registers in 0.8-1.0 us, so the in-kernel loop runs ~3x slower than the probe (no spills: 62 regs, 0 local; cause under investigation); the other phases are chains of small dependent steps (syncs, single-thread loops). Model gap: the model prices one L2 pass + one NVLink round (~9.4 us at r24); the floor from hwdb measurements is ~1 us load + ~3 us round + local merge.",
  "inefficiencies": [
-  "MEASURED: tie round on 98% of rows went through the leader state machine with an extra streamed key pass (fixed: in-place tie round on the WRITE bitmaps, -9.4 us r24, -2 us r8/r1)",
-  "MEASURED: pre-pass kernels 41-46 us at r24 (pp_win 22-28 us alone) because launch shape is bounded by max_model_len (keys never staged at r8/r24)",
-  "MEASURED: ~12 serial 1.5-3 us steps inside the merge kernel (cluster syncs + leader-only work) -> 27 us at r1 for 4.2K keys/CTA",
-  "MEASURED: two NVLink rounds per row (window, ties); round latency 1.8 us (r1) to 4.7 us (r24)",
-  "merge kernel PDL off (trtllm-gen consumer reads counts before griddepcontrol.wait); on the critical stream",
-  "HYPOTHESIS (checking): bench replays may run below boost clock (GPU idles between reps); re-measuring with warm-up matmuls",
-  "MEASURED (phase stamps): in a one-CTA-per-row design each dependent phase costs 0.5-15 us (global loads in series, single-thread loops, atomics with returns); the fix is to load once into registers and keep the chain to ~6 phases"
+  "FIXED: tie round through the leader state machine with an extra key pass (ebc6916ed5)",
+  "FIXED: launch shape bounded by max_model_len -> pre-pass kernels 41-46 us at r24 (v2 has none)",
+  "FIXED: second NVLink round for ties straddling ranks (band of global ids rides on round 1)",
+  "MEASURED: v2 candidate pass 8.5-10 us vs 3 us for the same loop standalone (cause open)",
+  "MEASURED: resolve (5-6.5 us) and WRITE (3.5-4.5 us) are chains of small synced steps; single-thread loops remain (band pick, class)",
+  "MEASURED: one CTA per row leaves 196 of 212 SMs idle at r1 and 84 idle at r8: rows should split over a cluster for the key pass at small batch",
+  "merge kernel PDL: v2 launches with programmatic serialization (prologue overlap) but never releases dependents early (trtllm-gen consumer reads counts before its wait)"
  ],
  "rubin_features": [
   "NVLink multicast (multimem.st) for the candidate/histogram exchange",
@@ -29,12 +29,11 @@
   "TMA bulk loads of logits tiles"
  ],
  "plan": [
-  "1. DONE measure in-tree top-k at r1/r8/r24 (4-GPU DCP4 bench, phase stamps, path stats)",
-  "2. DONE in-place tie round (ebc6916ed5): -9 us/layer r24",
-  "3. topk_v2 (written, testing): one CTA per row, keys staged once in SMEM by TMA bulk copies, no pre-pass, no cluster barriers; one multicast NVLink round carrying window counts + the global ids of a key band around each rank estimate (ties resolved in round 1); exact tiers: tie round (complete sorted lists), radix select over (key<<24 | ~gid) for anything else",
-  "4. bitwise equality vs topk_merge (which is tested against stock) in tests/models/kimi_k3/test_k31_dcp_exchange.py, staged + streamed paths",
-  "5. microbench v2 vs model at r1/r8/r24; ncu-free phase stamps; tune (hist contention, cluster split for r1/r8)",
-  "6. step A/B with INFRA step_d (rows 128/384), landed-ready"
+  "DONE 1-4: measure; in-place tie round; topk_v2 exact (ALL PASS); decode wiring on v2",
+  "5. close the candidate-pass gap (in-kernel 3x slower than probe), then cut per-key instructions (NaN-propagating max as the bound, tighter theta)",
+  "6. collapse resolve/WRITE into fewer synced steps; remove single-thread loops",
+  "7. cluster split of the key pass for r1/r8 (DSMEM candidate merge into the leader)",
+  "8. distributed integration test (tests/distributed/test_kimi_k3_sdec_sp_layers.py exchange) + INFRA step_d A/B at rows 128/384, then landed-ready"
  ],
  "work": [
   {
@@ -71,15 +70,21 @@
    "t": "14:45",
    "what": "v3 front end: whole row in registers (20 x 16 B per thread, one memory latency), sample + candidate compaction from registers (warp scan, one atomic per warp), band ids grouped by key without sort, receiver-side counting rank for the tie cut, 64K-position WRITE bitmap",
    "result": "queued (overlay d-topk-ebc6916-11)"
+  },
+  {
+   "t": "15:15",
+   "what": "v2 iterations: 512 threads, register batches, packed group bound, barrier fix in the full-pass visitor (radix round read partial histograms: trap 39 in the short-context test)",
+   "result": "ALL PASS; r1 27.1, r8 26.9, r24 34.2 us/layer; committed 3d340bcf5e and pushed"
   }
  ],
- "next": "measure v3 (bench r1/r8/r24 + test); then PDL-early prologue, cluster split for r1/r8 if needed, step A/B",
+ "next": "distributed sdec DSA test with exchange (queued j23); then find the in-kernel candidate-loop slowdown vs the probe",
  "blockers": "4-GPU pool requests wait 20-30 min (1-GPU runs take single GPUs first); using a runner that keeps the node for queued experiments with a 12-min idle exit",
- "branch": "wzhao/k31ws-d-topk @ 4fbaa15189 (+ uncommitted tie fast path)",
+ "branch": "wzhao/k31ws-d-topk @ 3d340bcf5e",
  "evidence": [
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-TOPK/base1.log",
-  "runs/D-TOPK/base1_model1M.json, base1_local36K.json, tie1_model1M.json, tie1_spread.json",
-  "benchmarks/kernels/bench_k31_dcp_topk.py"
+  "runs/D-TOPK/base1.log (baseline)",
+  "runs/D-TOPK/q/done/j18.log (v2 ALL PASS + regs), j21/j22.log (phase stamps)",
+  "runs/D-TOPK/q/done/j13.log (row-load probe), j19.log (candidate-loop probe)",
+  "benchmarks/kernels/bench_k31_dcp_topk.py --impl v2"
  ],
  "ckpt": "pending"
 }

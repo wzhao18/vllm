@@ -129,6 +129,30 @@
   {
    "t": "11-18 14:45",
    "text": "Pool: 11 Rhea nodes running (backfill), 0 runs waiting; daemon now also keeps 6 non-preemptible batch holds queued. Rhea ssh dropped once (re-authenticated 14:45)."
+  },
+  {
+   "t": "11-18 15:15",
+   "text": "D-TOPK: topk_v2 (exact, bitwise vs old merge) 27/27/34 us per layer at r1/r8/r24, down from 30/45/86 (model 6/7/9.4): r24 gap 76.3 -> 24.8 us/layer above model. Remaining: in-kernel candidate pass 3x slower than standalone, chains of synced small steps."
+  },
+  {
+   "t": "11-18 15:40",
+   "text": "D-MOE: re-vendored FI a368c5f66 MegaMoE backend (die-local, shared expert on side stream) landed-ready; 1-node decode slice step -7/-13/-16% at r8/16/24 (measured on the MXFP4 view; NVFP4 decode re-measure pending). INFRA trial merge breaks EN megamoe tests (manifest/vendored sources): being reconciled."
+  },
+  {
+   "t": "11-18 14:55",
+   "text": "D-FUSE in-step: fused AttnRes+SP chain exposed 576 -> 417 us/step at r24 L24 (model 365); multicast final gather replaces NCCL ring AG."
+  },
+  {
+   "t": "11-18 14:45",
+   "text": "P-KDA: fused o_norm + MXFP8 quant at HBM rate 145 vs 203 us/layer (F16K); conv fusion into K1 is bitwise but slower until K1 becomes persistent multi-tile."
+  },
+  {
+   "t": "11-18 14:55",
+   "text": "P-IDX: fused indexer v1 (2x-K MXF4 MMA): MMA + TMA 0.58 ms/layer, + stock-precision BF16 epilogue 1.38 ms (logits bitwise equal to DeepGEMM 1.56 ms); exact streaming select still +4-5 ms, being redesigned."
+  },
+  {
+   "t": "11-18 15:00",
+   "text": "Tooling: the image has no ncu, nsys or nvdisasm (SASS/stall reasons not inspectable). Request to the user pending: download Nsight Compute/Systems to Lustre."
   }
  ]
 }

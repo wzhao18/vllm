@@ -4,15 +4,15 @@
  "side": "decode",
  "owner": "D-FUSE workflow agent",
  "state": "measuring",
- "updated": "2026-11-18T13:20-08:00",
+ "updated": "2026-11-18T18:10-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows, 96 SP shard rows per GPU), L~135K, k=3",
  "baseline_ms": 3.9,
- "current_ms": 3.41,
+ "current_ms": 3.52,
  "achievable_ms": 1.82,
  "target_ms": 2.0,
  "step_ms": 30.5,
- "basis": "baseline: gap512 EP16 in-step profile B92 (r23) exposed: AttnRes 0.50, SiTU 0.33, latent norm 0.26, MegaMoE prepare 0.22, router top-k 0.21, SP RS 0.99, SP AG 0.69, drafter+final 0.89 ms. Achievable: rhea1n model_rows B96_L135K (attnres 0.147 + router topk/latent norm/shared act 0.006 + SP AG+RS 1.28 + drafter/final tail ~0.39 ms). current_ms PROJECTED: baseline minus the measured r24 SP-boundary chain saving (0.49 ms/step, 4-GPU chain bench); step A/B pending.",
- "gap_analysis": "Per decoder layer the SP step runs 4 standalone latency-bound kernels between the attention o-projection and the MLP GEMMs: stock attn_res pre (~3-6 us), SpAllGather (7.8 us), SpReduceScatter with push (7.9 us), stock attn_res post. The model charges AG/RS at the Lamport floor and AttnRes as a ~0.75 us memory pass; the measured excess is kernel boundaries + the stock AttnRes using only n of the SMs (one row per CTA). The SP path also keeps SiTU-and-mul, the latent RMSNorm, the router grouped top-k and the MegaMoE prepare as separate kernels (2-4 us each, 92 layers). Re-measuring at the D3-32 per-GPU shape (n=96) on Rhea first.",
+ "basis": "baseline: gap512 EP16 in-step profile B92 (r23) exposed (AttnRes 0.50, SiTU 0.33, latent norm 0.26, prepare 0.22, router top-k 0.21, SP RS 0.99, SP AG 0.69, drafter+final 0.89 ms). current = baseline - measured step A/B (L24 slice, r24) scaled x93/24 for the per-layer part (-0.34 ms) and the final gather (-0.04). Achievable: rhea1n model_rows B96_L135K.",
+ "gap_analysis": "SP boundaries now fused (2 kernels/layer instead of 4): in-step r24 AttnRes+AG+RS = 1.14x model (chain bench 1.07x); the remaining excess is the Lamport collectives themselves (bare AG+RS 16.1 us/layer at n=96 vs model 13.7) -- the RS push (4.1 MB at ~1.1 TB/s per GPU) is serial after the o-proj GEMM; moving it into the GEMM epilogue (D-GEMM) would hide it. Router top-k / prepare move into the FI MegaMoE front with D-MOE's kimi_k3_mega_moe switch; SiTU goes beside MegaMoE on the side stream (and fused with the MXFP8 quant in D-GEMM's B4). Remaining D-FUSE items: latent RMSNorm (proposed into FI's combine-reduce, D-MOE), drafter tail (needs a drafter-on profile; INFRA's drafter emulation currently fails).",
  "inefficiencies": [
   "AttnRes pre/post as standalone stock kernels (one row per CTA; 96 of the SMs busy at n=96) (measured gap512)",
   "SP all-gather and reduce-scatter as separate kernels from the AttnRes they feed / follow (2 extra boundaries per layer)",
@@ -54,16 +54,29 @@
    "t": "13:15",
    "what": "TP4 (D3-32 SP group, 4 GPUs) 93-layer chain bench stock vs fused SP boundaries",
    "result": "per layer r1 11.56->9.48 us, r8 14.51->10.56, r24 21.68->16.42; per step r24 2.02->1.53 ms vs model 1.43 (1.07x), r8 1.35->0.98 vs 0.84 (1.17x); numerics bit-equal prefix/blocks, outputs <=1 BF16 ulp (runs/D-FUSE/run5)"
+  },
+  {
+   "t": "14:55",
+   "what": "step_d.sh A/B (1-node D3-32 DP-rank slice, L24 view, EP32 emulation, drafter excluded, profiled), base-4fbaa15 vs d-fuse-df00866a-5",
+   "result": "step r8 (rows 128) 5259 -> 5213 us (-0.9%), r24 (rows 384) 8873 -> 8785 us (-1.0%); r24 AttnRes+SP AG/RS exposed 576 -> 417 us (24 layers; model AG+RS+AttnRes 365 us -> 1.14x), final gather (TAIL) -44 us; ~70 us of the boundary saving reappears as exposed router/latent_down/MegaMoE overlap shifts (busy unchanged). In-step kernels: SpAttnResGather 9.6 us, SpReduceAttnRes 11.6 us vs stock AG 9.0 + RS 11.8 + 2 x attn_res 7.5 us. runs/D-FUSE/step_d/{base-x,fused5x}-r128_384"
+  },
+  {
+   "t": "18:05",
+   "what": "SpFinalGather microbench (2 GPUs) + merge of wzhao/k31ws-int (D-GEMM MXFP8 SpOproj: produce() serves the 'mxfp8' tactic)",
+   "result": "final gather bit-equal to NCCL all_gather (sanitized words), box re-armed; 6.2/6.8/10.8 us vs NCCL 12.8/21.3/33.1 us at R16/128/384 (width 7168), 6.6/17.6 vs 19.7/39.6 at 6x7168. Queued: 4-GPU unit test (overlay -7), NVFP4 step A/B int-b31121c-1 vs d-fuse-3343e846-8 (-q nvfp4 -x, rows 128/384)"
   }
  ],
- "next": "step_d.sh B arm (fused5-r128_384, profiled) queued vs INFRA base-mx-r8r16r24-prof; then RS via multimem.ld_reduce; router/act/norm with D-GEMM/D-MOE",
+ "next": "read test7 + NVFP4 A/B (runs/D-FUSE/step_d/nv-*); if clean set landed-ready; then drafter-tail profile (needs drafter-on slice)",
  "blockers": "",
- "branch": "wzhao/k31ws-d-fuse @ df00866a",
+ "branch": "wzhao/k31ws-d-fuse @ 3343e8469c (merged wzhao/k31ws-int b31121cf56)",
  "evidence": [
   "perf-model/microbench/results/gap512/parsed/dec_B92cap.txt",
   "perf-model/microbench/rhea1n/model_rows.json (B96_L135K)",
   "rhea runs/D-FUSE/run3 (pending)",
-  "rhea runs/D-FUSE/run2g-c/chain.json"
+  "rhea runs/D-FUSE/run2g-c/chain.json",
+  "rhea runs/D-FUSE/step_d/base-x-r128_384",
+  "rhea runs/D-FUSE/step_d/fused5x-r128_384",
+  "rhea runs/D-FUSE/run5/chain.json"
  ],
  "ckpt": "pending"
 }

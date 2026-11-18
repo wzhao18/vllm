@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-IDX workflow agent",
  "state": "implementing",
- "updated": "2026-11-18T13:55-08:00",
+ "updated": "2026-11-18T15:25-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 15.32,
  "current_ms": 15.32,
@@ -53,15 +53,31 @@
    "t": "15:20",
    "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
    "result": "indexer logits + exact top-k + quant/insert 15.32 vs 8.44 (x1.82)"
+  },
+  {
+   "t": "14:20",
+   "what": "Fused kernel v1 first run on VR200 (check + P3-16 perf)",
+   "result": "logits bitwise equal to DeepGEMM on all valid elements (max 0 ulp), exact top-k on 859/859 test rows; 5.99 ms/layer (slow)"
+  },
+  {
+   "t": "14:55",
+   "what": "Stage split at P3-16 shape (bench modes)",
+   "result": "MMA+TMA pipeline only 0.583 ms; + BF16 logits epilogue 1.382 ms (stock logits kernel 1.558 + writes); + streaming exact select 6.4 ms -> selection is the bottleneck"
+  },
+  {
+   "t": "15:20",
+   "what": "Selection fixes: key scales by one bulk copy (key rows in SF-atom order), weights in registers, fine (one bin per BF16 value) compaction histogram, rank tie cut, thresholds in smem",
+   "result": "5.15 ms/layer, still exact; instrumenting compaction counts/time (runs/P-IDX/fused9.log)"
   }
  ],
- "next": "Compile/correctness of fused kernel (runs/P-IDX/fused1.log), then perf at P3-16 shape",
+ "next": "Read in-kernel stats (compactions, inserts, time split) and fix the selection cost; then epilogue ILP (both tokens loaded before math, early TMEM release)",
  "blockers": "",
- "branch": "wzhao/k31ws-p-idx @ 4fbaa15189",
+ "branch": "wzhao/k31ws-p-idx @ 45d5404879 (+ local WIP)",
  "evidence": [
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/stock1.log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/stock1.json",
-  "perf-model/plan/PLAN_NVFP4.md"
+  "perf-model/plan/PLAN_NVFP4.md",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/fused6.log (stage split)"
  ],
  "ckpt": "nvfp4"
 }

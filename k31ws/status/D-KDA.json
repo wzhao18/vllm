@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent",
  "state": "implementing",
- "updated": "2026-11-18T15:10-08:00",
+ "updated": "2026-11-18T15:40-08:00",
  "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3; per GPU 24 KDA heads x 96 requests = 2304 (request, head) items/layer",
  "baseline_ms": 3.4,
  "current_ms": 3.4,
@@ -62,16 +62,23 @@
    "t": "15:05",
    "what": "run5 cost attribution (diagnostic SKIP builds)",
    "result": "n96: full 91.7, no-fold 48.5, no-verify 49.5, neither 32.0 us/layer; fold + verify each ~9K cycles/item vs ~1-2K floor; KdaFlow cubin REG 128 STACK 88 (spill suspect); prep+load floor 32 us > 26.3 model"
+  },
+  {
+   "t": "15:35",
+   "what": "run6 setmaxnreg split sweep + ptxas -v",
+   "result": "KdaFlow spills 104/96 B, but split 168/88..136/120 leaves n32 at 37.9-38.0 us and worsens n96 (91.4 -> 103.8): spills are not the main cost"
   }
  ],
- "next": "ptxas -v / SASS spill check of KdaFlow (runs/D-KDA/ptxas.sh); if spills: cut scan live ranges (fold per chunk without u preload, or 2 x 128-row-half passes), rebalance setmaxnreg; then restructure prep (per-head constants in smem across head-major items, fewer barriers) to get the prep floor below ~10 us at n96",
- "blockers": "pool holds pending (Priority), first expected ~13:30",
- "branch": "wzhao/k31ws-d-kda @ dc31bc9ff5",
+ "next": "HANDOFF. Done: KdaFlow (cutedsl/kda/flow.py, sp kind \"flow\", in FOLDS, NOT in RECORD_KINDS) = KdaWS + in-kernel deferred fold, bitwise equal to KdaWS triton + stock commit (tests/models/kimi_k3/test_specialized_decode_sp_kda_flow_gpu.py, run with --noconftest: tblib missing); bench benchmarks/kernels/k31_vr/kda_sp_bench.py (--kinds wide ws flow flow1 flow2, --trace, --skip fold,store,verify, --regs s,p). Measured (us/layer n32/n96): KdaWide 26.0/74.3, KdaWS(no fold, +flush extra) 20.5/48.5, KdaFlow v1 32.9/71.7, v2 38.0/91.7; model 8.76/26.3. Next: (1) get SASS (nvdisasm) of KdaFlow scan to find why fold and verify each take ~9K cycles/item (floor 1-2K); (2) measure the deferred flush (KDADeferredCommitContext.flush) at n96 to decide whether KdaFlow v1 already beats KdaWS+flush for n>=71 (dispatch 71-:flow); (3) redesign direction: the per-item serial chain (8 scan warps on one item) cannot reach the model; consider row-split items over more warps (rows are independent; 64-row halves, 16 scan warps) with the prep (conv/gate/norm/fold operands) done once per item by one warpgroup and per-head constants (F_B, conv w, dt) cached in smem across head-major items; die-local row split (4 KiB page parity ^ per-2MiB bit, dies.page_domains) only after compute is fixed (HBM use is 3-6 TB/s today). Commands: stage: bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-kda <tag>; run: ssh rhea, cd runs/D-KDA, (setsid nohup tools/wsgpu.sh -g 1 -m 30 -o <tag> -n D-KDA -- bash <abs path script> > log 2>&1 &); scripts run5.sh/run6.sh in runs/D-KDA are templates.",
+ "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
+ "branch": "wzhao/k31ws-d-kda @ 3de6741dcc",
  "evidence": [
   "runs/D-KDA/run2.log",
   "runs/D-KDA/run3.log",
   "runs/D-KDA/run4.log",
-  "runs/D-KDA/run5.log (Rhea Lustre k31ws/runs)",
+  "runs/D-KDA/run5.log",
+  "runs/D-KDA/run6.log",
+  "runs/D-KDA/ptxas.log (Rhea Lustre k31ws/runs)",
   "perf-model/microbench/rhea1n/model_rows.json"
  ],
  "ckpt": "pending"

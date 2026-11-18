@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-KDA agent",
  "state": "implementing",
- "updated": "2026-11-18T13:50-08:00",
+ "updated": "2026-11-18T15:30-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 21.91,
  "current_ms": 21.91,
@@ -21,17 +21,16 @@
   "HYPOTHESIS: K2 bound by legacy mma.sync throughput + per-chunk fragment transposes (ncu not available in the image)"
  ],
  "rubin_features": [
-  "bulk async copies (TMA) for the g / beta / dt_bias tiles, overlapped with the in-load conv",
-  "packed FP32 FMA (fma.rn.f32x2) and packed FP32 mul/add in the conv + SiLU (IEEE per lane)",
-  "planned: tcgen05 MMA with TMEM-resident accumulators for the 96-head recurrence; larger per-SM shared memory for resident state"
+  "bulk tensor copies (TMA) for the FusedConv raw Q|K|V boxes (exp branch)",
+  "packed FP32 FMA/mul/add (fma.rn.f32x2) in the conv + SiLU (IEEE per lane)",
+  "planned: tcgen05 MMA with the FP32 state as a TMEM accumulator (kind::f16 BF16 operands, stock FlashKDA chunk-16 math) for the 96-head recurrence; persistent TMA-ring K1; larger per-SM shared memory for multi-tile K1 rings"
  ],
  "plan": [
-  "Baseline per-kernel microbench of the chain at F16K and F8K on 1 VR200 GPU (queued)",
-  "Fuse the Q|K|V short conv into FlashKDA prepare (K1 reads raw rows, writes conv V for K2): removes the 2.4 GB conv pass, adds ~0.8 GB (implemented, test pending)",
-  "Fuse gated o_norm + MXFP8 quant into the full-width recurrence epilogue (removes ~0.8 GB o round trip)",
-  "Hide prepare (K1) under the compute-bound recurrence: concurrent K1/K2 with per-tile ready flags (workspace stays in L2)",
-  "Recurrence throughput: balance 288 (seq, head) items over 212 SMs; tcgen05 recurrence (state FP32 in registers/TMEM, MMAs on the tensor core) if ncu shows the legacy MMA pipe bound",
-  "Wire per-shape dispatch in kda.py (stock wiring only), step A/B, landed-ready"
+  "DONE (landing): HBM-rate gated o_norm + MXFP8 kernel: -59 us/layer F16K (-4.1 ms/forward)",
+  "K1 prepare (299 us, ~8 TB/s, latency-bound single-shot CTAs): persistent multi-tile K1 with a TMA ring over (tile, head) items -> its ~2.45 GB floor (~200 us); then FusedConv pays (exp branch has the bitwise conv-in-load code)",
+  "K2 recurrence (394 us): tcgen05 rewrite keeping FlashKDA chunk-16 operands (K1 workspace unchanged): S^T[V,K] FP32 in TMEM/registers, per chunk M=128 (V) x N=32 (kd|qd) x K=128 MMA for k.S/q.S, INV/Mqk 128x16x16, state update 128x128x16 into a separate TMEM accumulator then fma(S, g, P) (stock rounding); 288 items over 212 SMs -> persistent grid with (seq, head, v-half) work items",
+  "Overlap K1 with K2 (per-tile ready flags, K2 high priority): hides K1 under the compute-bound recurrence and keeps the workspace in L2",
+  "Model check: core_prefill t_ach 167 us assumes 2.0 GB at 12 TB/s with all 288 recurrences overlapped; the serial chunk walk (341 x 16-token steps) needs <= 0.49 us per chunk-step per SM pair to fit"
  ],
  "work": [
   {
@@ -68,14 +67,30 @@
    "t": "15:20",
    "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
    "result": "KDA core 21.91 vs 4.54 (x4.83)"
+  },
+  {
+   "t": "14:30",
+   "what": "FusedConv K1 after fixes (TMA raw boxes, 4-ch items, 6 CTAs/SM, surplus-CTA guard)",
+   "result": "bitwise OK, but K1 728 us vs 299 + 220 (stock K1 + conv): K1 is a single-shot, latency-bound CTA per (16-token tile, head); added serial conv phase costs more than the removed pass. Moved to branch wzhao/k31ws-p-kda-fusedconv-exp; needs a persistent multi-tile K1 first"
+  },
+  {
+   "t": "14:45",
+   "what": "o_norm + MXFP8 kernel (o_norm_mx.cu: 8 lanes x 16 cols per (token, head) row, 32-bit row math, 2x4 rows in flight)",
+   "result": "F16K 144.8 us vs stock Triton 203.4; F8K 76.3 vs 103.3 (ab12); numerics test vs kda_norm.rmsnorm_gated_mxfp8 3 passed (ab13)"
+  },
+  {
+   "t": "15:25",
+   "what": "landing branch cleaned to the o_norm kernel + kda.py prefill wiring (FusedConv/K2 epilogue experiments removed); scale bytes written as one 32-bit store per row",
+   "result": "ab14 measuring"
   }
  ],
- "next": "resource usage (regs/spills) of FusedConv K1 and stock vs split K2; make FusedConv K1 at least conv-pass-free (target K1 <= 360 us); o_norm kernel to ~90 us",
+ "next": "ab14 numbers -> landed-ready for the o_norm kernel; then the recurrence: (a) find why the in-tree split build full-width K2 is 495 us vs stock 394 (cutlass version / spill-after-update), (b) tcgen05 K2 design (see plan)",
  "blockers": "no ncu/nsys in the K3.1 image (checked /usr/local/cuda/bin, PATH): root-causing by resource usage + variants",
- "branch": "wzhao/k31ws-p-kda @ 0f97e2ea",
+ "branch": "wzhao/k31ws-p-kda @ 47bc2f3",
  "evidence": [
   "perf-model/plan/PLAN_NVFP4.md",
-  "perf-model/microbench/results/ops1 kda-077"
+  "Rhea runs/P-KDA/ab6 (baseline + split K2 variants), ab10 (FusedConv bitwise dbg), ab12 (o_norm F16K/F8K), ab13 (norm test), ab14",
+  "branch wzhao/k31ws-p-kda-fusedconv-exp @ 3644e4dc89 (FusedConv + K2-epilogue experiments)"
  ],
  "ckpt": "nvfp4"
 }

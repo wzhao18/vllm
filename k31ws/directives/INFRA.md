@@ -4,3 +4,6 @@ Produce NVFP4 in-step baselines NOW: merge EN (wzhao/k31ws-en 6f164db270) into w
 ## 2026-11-18 13:50 PST coordinator: order of the NVFP4 baselines (user asked for an ETA)
 1. Prefill DEP16 NVFP4 slice (EP4, 56 experts/GPU, F8K/F16K): runnable now (EP4 NVFP4 inference knobs 2048/8192 exist). Run it on int-cd9229c-1 as soon as its unit tests pass; post per-family baseline.
 2. Decode D3-32 NVFP4 slice: blocked: the NVFP4 MegaMoE kind has no EP4 decode-bucket and no EP32 knob records in the vendored megamoe_rubin. Merge D-MOE vendored FI a368c5f66 (wzhao/k31ws-d-moe, once its v1 unit tests pass) into int, or use the FI tree via WS_PYTHONPATH, and run the decode slice at r8/r16/r24 on NVFP4 the moment the MoE path runs. Coordinate with D-MOE.
+
+## 2026-11-18 15:50 PST coordinator
+- The NVFP4 DECODE baseline is still missing and is your top priority: reconcile D-MOE (a9b8c85bd3) with EN in wzhao/k31ws-int (megamoe vendored-source manifest tests), then run step_d on the NVFP4 view at r8/r16/r24, profiled, with the per-family table, and post it like the prefill baseline. Decode owners re-base on it.

@@ -3,22 +3,22 @@
  "title": "Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream",
  "side": "prefill",
  "owner": "P-MOE agent (workflow)",
- "state": "measuring",
- "updated": "2026-11-18T13:40-08:00",
+ "state": "landed-ready",
+ "updated": "2026-11-18T15:15-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 74.01,
  "current_ms": 74.01,
  "achievable_ms": 73.33,
  "target_ms": 80.66,
- "step_ms": 218.7,
- "basis": "MEASURED in-step NVFP4 baseline (INFRA 17:48, wzhao/k31ws-int b31121cf56, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; measured/20261118-1805-nvfp4-prefill.json); achievable = nvfp4_modelopt model at the same slice",
- "gap_analysis": "Measured at the EP4-emulated per-GPU shape (runs/P-MOE/r1, r2): vendored megamoe_rubin NVFP4 single 16K launch 2193 us/layer (stage+kernel), 2x8K sub-calls 2124 us (-3.2%, bitwise equal) -> 195.4 ms/step; one 8K call 1077 us. Model (optables P3-16) 2.151 ms/layer at EP16; at the EP4-emulated link volume (0.8x bytes) the same formula gives ~1.6 ms, so the emulated kernel runs ~1.3x its model. Shared MXFP8 expert alone 742 us/layer (68 ms/step) vs model 406 us: the stock SiTU-and-mul alone is 265 us (3 libm tanhf per element) and two MXFP8 quant passes ~70 us. Side-stream overlap of the shared expert does not pay at this shape: the uncapped persistent grid leaves no SMs (2876 vs 2894 serial), and capping the MegaMoE grid by 16/32/48 SMs costs +12.6/+14.3/+22.2% MegaMoE time (best overlap -1.4%). Root-cause hypothesis (r4 + ncu next): the MegaMoE is per-SM-work bound, not only link-bound at this shape: the FC1 epilogue SiTU costs 6 MUFU ops per element (~160 us per 8K call at the MUFU rate on all SMs) plus NVFP4 requant; the model prices MOE.act at 36 us per 8K. r4 splits link vs compute with all-local routing.",
+ "step_ms": 279.3,
+ "basis": "MEASURED: in-step INFRA step_p DEP4 slice (L24, EP16 expert emulation) MegaMoE exposed 67.4 ms per 24-layer F16K forward (was 90.5); x92/23 = ~270 ms/step-equivalent at the emulated shape. Standalone EP4-emulated 2x8K MegaMoE 2.12 ms/layer (195 ms/92 layers). Model at EP16 197.9 ms. Deployed EP16 needs the 4-node pool.",
+ "gap_analysis": "Measured at the EP4-emulated per-GPU shape (runs/P-MOE/r1, r2): vendored megamoe_rubin NVFP4 single 16K launch 2193 us/layer (stage+kernel), 2x8K sub-calls 2124 us (-3.2%, bitwise equal) -> 195.4 ms/step; one 8K call 1077 us. Model (optables P3-16) 2.151 ms/layer at EP16; at the EP4-emulated link volume (0.8x bytes) the same formula gives ~1.6 ms, so the emulated kernel runs ~1.3x its model. Shared MXFP8 expert alone 742 us/layer (68 ms/step) vs model 406 us: the stock SiTU-and-mul alone is 265 us (3 libm tanhf per element) and two MXFP8 quant passes ~70 us. Side-stream overlap of the shared expert does not pay at this shape: the uncapped persistent grid leaves no SMs (2876 vs 2894 serial), and capping the MegaMoE grid by 16/32/48 SMs costs +12.6/+14.3/+22.2% MegaMoE time (best overlap -1.4%). MEASURED root cause (r4): with ALL-LOCAL routing (no NVLink payload) one 8K call still takes 1052 us vs 1065 random: the main kernel is compute/epilogue-bound at ~963 us per 8K call vs model ops 525 us (fc1+act+fc2), ~27% of the FP4 peak; the FC1 epilogue (TMEM load, SiTU 6 MUFU/element, NVFP4 requant) and FC2 token-back are issued by one epilogue warp per SM sub-partition. At EP16 the link time (~0.99 ms per 8K) is of the same size, so the kernel must hide both. In-step the MoE costs ~2.9 ms/layer vs 2.12 standalone: router kernel 0.9 ms/layer in-step (cross-rank arrival skew) vs 0.05 standalone. Shared expert on the production fused SiTU+MXFP8 op: 611 us/layer alone (cuBLASLt MXFP8 gate_up 295 us = ~9.8 PF, fused act 159 us, down 164 us) vs model 406.",
  "inefficiencies": [
-  "Single 16K MegaMoE launch vs 2x8K sub-calls: +3.2% (measured r2; fixed by the sub-call wiring, 3af369ed36)",
-  "Shared expert 742 us vs model 406 us per layer: SiTU-and-mul 265 us (libm tanhf x3, separate pass) + separate MXFP8 quant passes (measured r2 profile)",
-  "Shared expert serial after MegaMoE on TP1 DEP; SM-cap side-stream overlap measured not profitable (cap costs 12-22% MegaMoE time)",
-  "MegaMoE FC1 epilogue SiTU MUFU work (6 MUFU/element) makes the kernel SM-bound beyond the link [hypothesis, r4/ncu pending]",
-  "Router/stage/reduce kernels: reduce_bf16 ~75 us and stage ~15 us per 8K call exposed outside the persistent kernel (r2 profile)"
+  "MegaMoE main kernel compute/epilogue-bound: 963 us per 8K call with zero NVLink payload vs model ops 525 us (r4, measured); epilogue issue rate (1 warp/SMSP), SiTU MUFU and NVFP4 requant per tile are the hypothesis (ncu not in the image)",
+  "In-step router kernel 0.9 ms/layer vs 0.05 standalone: cross-rank arrival skew charged to MegaMoE (step_p profile)",
+  "Top-k reduce 75 us + stage 15 us + router per 8K call outside the persistent kernel (r4 profile)",
+  "Shared expert 611 us vs model 406 us (cuBLASLt MXFP8 gate_up ~9.8 PF; fused act 159 us) - side-stream SM-cap overlap measured not profitable (cap costs 12-22% MegaMoE)",
+  "FIXED (landed-ready): single 16K-capacity launch -> EP-uniform 2x8K sub-calls (-3.2% standalone, -25% MegaMoE in the slice incl. knob-record selection, arena 947 MiB/rank)"
  ],
  "rubin_features": [
   "tcgen05 2-CTA block-scaled MMA (mxf4nvf4, NVFP4 W4A4)",
@@ -74,15 +74,30 @@
    "t": "15:20",
    "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
    "result": "MegaMoE NVFP4 (vendored) 74.01 vs 73.33 (x1.01) at the EP4 emulation (56 experts/GPU, 0.8x EP16 link bytes); re-check at real EP16"
+  },
+  {
+   "t": "14:05",
+   "what": "r4 random vs all-local routing; r5 S2/N128/shared-fused",
+   "result": "local 1052 vs random 1065 us per 8K: compute-bound; N128 tile 1147 (worse); shared fused path 611 us; overlap full-grid 2731 vs serial 2766"
+  },
+  {
+   "t": "15:15",
+   "what": "step A/B (step_p DEP4 slice, profiled) base vs sub-calls",
+   "result": "F16K 293.45 -> 279.29 ms (-4.8%), F8K 147.56 -> 141.30 (-4.2%); MegaMoE exposed 90.48 -> 67.40 ms; numerics unchanged; state landed-ready @ d0aaaa1a8e"
+  },
+  {
+   "t": "15:50",
+   "what": "coordinator: current reset to the NVFP4 slice baseline (74.01 ms)",
+   "result": "the 2x8K sub-call A/B (-4.8%) ran on the MXFP4 config view; re-measure on the NVFP4 view (step_p.sh -q nvfp4) before it counts"
   }
  ],
- "next": "Read r4 + step A/B; then fused shared SiTU+MXFP8 quant kernel and the MegaMoE epilogue root cause.",
+ "next": "r6b (live rows < capacity sweep: possible cliff at 6144/8192 uncapped) -> decide even sub-call split; then MegaMoE epilogue work in the FI a368 drop D-MOE is vendoring (more epilogue warps / MUFU-lighter exact SiTU / reduce absorption); 4-node EP16 run on the hold8 for the deployed number.",
  "blockers": "Rhea pool: no k31ws hold running yet (all pending), r1/r2 queued under wsgpu.",
- "branch": "wzhao/k31ws-p-moe @ bcdfde9e (pushed 004e6e6b4a)",
+ "branch": "wzhao/k31ws-p-moe @ d0aaaa1a8e",
  "evidence": [
-  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MOE/{r1,r2,r3c}",
-  "findings/P-MOE.md",
-  "perf-model/microbench/results/moe/README.md"
+  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MOE/{r1,r2,r3c,r4,r5,step_p/subcall-mx-prof}",
+  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_p/base-mx-f16f8-prof",
+  "findings/P-MOE.md"
  ],
  "ckpt": "nvfp4"
 }
