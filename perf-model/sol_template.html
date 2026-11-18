@@ -1,0 +1,476 @@
+<title>K3.1 SOL Model</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f7f5; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dcdad3; --grid: #e6e4de;
+  --text: #0b0b0b; --text-2: #52514e; --text-3: #7a7973; --accent: #2a78d6;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --other: #b9b7ae; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+  --sol: #86b6ef; --ach: #1c5cab;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #262624; --border: #3a3936; --grid: #2e2d2a;
+    --text: #f0efec; --text-2: #c3c2b7; --text-3: #8f8e86; --accent: #3987e5;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #0ca30c; --s7: #9085e9; --s8: #e66767;
+    --other: #5a5953; --sol: #5598e7; --ach: #b7d3f6;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #262624; --border: #3a3936; --grid: #2e2d2a;
+  --text: #f0efec; --text-2: #c3c2b7; --text-3: #8f8e86; --accent: #3987e5;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #0ca30c; --s7: #9085e9; --s8: #e66767;
+  --other: #5a5953; --sol: #5598e7; --ach: #b7d3f6;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 19px; margin: 40px 0 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+h3 { font-size: 15px; margin: 22px 0 6px; }
+p, li { color: var(--text-2); max-width: 900px; }
+.sub { color: var(--text-2); margin: 0 0 16px; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.bar { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 8px 0; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.ctl { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg button { background: var(--surface); color: var(--text-2); border: 0; padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button.on { background: var(--accent); color: #fff; }
+select { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; font: inherit; font-size: 13px; max-width: 100%; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; margin: 8px 0 0; }
+nav.toc a { color: var(--accent); text-decoration: none; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin: 10px 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.tile .k { font-size: 12px; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; }
+.tile .v { font-size: 24px; font-weight: 650; margin: 2px 0; font-variant-numeric: tabular-nums; }
+.tile .d { font-size: 12.5px; color: var(--text-2); }
+.tw { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { padding: 5px 8px; border-bottom: 1px solid var(--grid); text-align: left; vertical-align: top; }
+th { background: var(--surface-2); color: var(--text-2); font-weight: 600; position: sticky; top: 0; white-space: nowrap; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr:hover td { background: var(--surface-2); }
+.tag { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--border); color: var(--text-2); }
+.tag.new { border-color: var(--s3); color: var(--s3); }
+.chart { width: 100%; }
+.chart svg { width: 100%; height: auto; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-2); margin: 6px 0; }
+.legend span.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.legend label { cursor: pointer; }
+.note { font-size: 12.5px; color: var(--text-3); }
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.15); max-width: 320px; display: none; }
+#tip b { font-weight: 650; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.grid2 > *, .tiles > * { min-width: 0; }
+html, body { overflow-x: hidden; }
+@media (max-width: 760px) { .grid2 { grid-template-columns: minmax(0, 1fr); } h1 { font-size: 22px; } }
+svg text { fill: var(--text-2); font-size: 11px; }
+svg .ax line, svg .ax path { stroke: var(--border); }
+svg .gl { stroke: var(--grid); }
+.win { font-weight: 650; }
+details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+</style>
+
+<main>
+<h1>Kimi K3.1-Pro on VR200: speed-of-light model</h1>
+<p class="sub">Op-level, layer-level SOL model of every K3.1 op (DSpark draft included) under each prefill and decode
+sharding strategy, with the communication each strategy adds. Two hardware columns, never fitted:
+<b>SOL</b> = public spec peaks, <b>achievable</b> = our VR200 measurements. Both serving checkpoints. Generated <span id="gen"></span>.</p>
+
+<div class="bar">
+  <div class="ctl">Checkpoint <span class="seg" id="ck"></span></div>
+  <div class="ctl">Column <span class="seg" id="col"></span></div>
+  <div class="ctl">Draft k <span class="seg" id="kk"></span></div>
+  <div class="ctl"><button id="theme" class="seg" style="padding:4px 10px;background:var(--surface);color:var(--text-2);border:1px solid var(--border);border-radius:8px;cursor:pointer">theme</button></div>
+</div>
+<nav class="toc"><a href="#sum">Summary</a><a href="#const">Constants</a><a href="#strat">Strategies</a><a href="#pre">Prefill</a><a href="#dec">Decode</a><a href="#ops">Op table</a><a href="#asm">Assumptions</a><a href="#bench">Microbench map</a></nav>
+
+<h2 id="sum">Summary</h2>
+<div class="tiles" id="tiles"></div>
+<p class="note">Prefill: fresh tokens/s per GPU at AgentX contexts (5,456 fresh tokens per request over a 72.9K prefix), best chunk per engine.
+Decode: tokens/s per GPU at the requests-per-GPU band, k and checkpoint selected above, within KV capacity at 135K context.</p>
+
+<h2 id="const">(a) Model and hardware constants</h2>
+<div class="grid2">
+  <div><h3>VR200 hardware columns</h3><div class="tw"><table id="hwT"></table></div></div>
+  <div><h3>K3.1-Pro + DSpark</h3><div class="tw"><table id="mdT"></table></div></div>
+</div>
+<h3>Checkpoints: weight bytes per family</h3>
+<div class="tw"><table id="ckT"></table></div>
+
+<h2 id="strat">(b) Strategies: op-family mapping and communication</h2>
+<p>P = prefill, D = decode. Weights per GPU and r<sub>max</sub> (requests per GPU at 135K) for the selected checkpoint and k.
+<span class="tag new">new</span> marks a strategy that is not implemented today.</p>
+<div class="tw" style="max-height:620px"><table id="stT"></table></div>
+
+<h2 id="pre">(c) Prefill</h2>
+<div class="ctl" style="margin:6px 0">Overlays <span class="seg" id="pvar"></span>
+  <span class="note">O1 = two-microbatch overlap (used only where it helps), O2 = dispatch dedup + pre-combine</span></div>
+<h3>Fresh tokens/s per GPU (SOL vs achievable)</h3>
+<div class="legend"><span><span class="sw" style="background:var(--sol)"></span>SOL (spec)</span><span><span class="sw" style="background:var(--ach)"></span>achievable (measured)</span><span class="note">bar end label = achievable; hover for chunk, step, weights</span></div>
+<div class="chart" id="pBars"></div>
+<h3>Where the time goes: GPU-us per fresh token, by op group</h3>
+<div class="legend" id="gLeg1"></div>
+<div class="chart" id="pStack"></div>
+<details><summary>Full family and per-primitive breakdown table (us per fresh token per GPU)</summary><div class="tw" style="margin-top:6px"><table id="pFamT"></table></div></details>
+<h3>Sensitivity: chunk size and context</h3>
+<div class="legend" id="pSensLeg"></div>
+<div class="grid2"><div class="chart" id="pSensF"></div><div class="chart" id="pSensL"></div></div>
+<h3>TTFT lower bound and P/D transfer</h3>
+<div class="tw"><table id="pTT"></table></div>
+<p class="note" id="nixl"></p>
+
+<h2 id="dec">(d) Decode</h2>
+<div class="ctl" style="margin:6px 0">Overlays <span class="seg" id="dvar"></span>
+  <span class="note">O2 dedup, O3 die-local streaming (achievable column only), O1 two-batch overlap where it helps</span></div>
+<h3>Throughput vs interactivity per topology (each curve ends at KV capacity)</h3>
+<div class="legend" id="dLeg"></div>
+<div class="chart" id="dPareto"></div>
+<h3>Best topology per band of requests per GPU</h3>
+<div class="tw"><table id="dBand"></table></div>
+<h3>Step-time breakdown vs requests per GPU</h3>
+<div class="ctl">Topology <select id="dTopo"></select> <span class="seg" id="dNorm"></span></div>
+<div class="legend" id="gLeg2"></div>
+<div class="chart" id="dStack"></div>
+<h3>KV capacity</h3>
+<div class="tw"><table id="dCap"></table></div>
+
+<h2 id="ops">(e) Op table</h2>
+<div class="ctl" style="flex-wrap:wrap">Topology / regime <select id="oSel"></select> <span class="seg" id="oSort"></span></div>
+<p class="note">Numbers are per GPU, per op instance (one layer); "total" multiplies by the count. t = max(FLOPs/peak, bytes/HBM).
+Bound letters: c = compute, m = memory (SOL / achievable). Hover an op for shapes and code cite.</p>
+<div class="grid2">
+  <div><h3>Per layer type (one instance)</h3><div class="tw"><table id="oUnit"></table></div></div>
+  <div><h3>Per-layer timeline (achievable, ms)</h3><div class="legend"><span><span class="sw" style="background:var(--s1)"></span>KDA layer</span><span><span class="sw" style="background:var(--s2)"></span>DSA layer</span></div><div class="chart" id="oLayers"></div></div>
+</div>
+<h3>Ops</h3>
+<div class="tw" style="max-height:560px"><table id="oT"></table></div>
+<h3>Communication events (per instance)</h3>
+<div class="tw" style="max-height:420px"><table id="oC"></table></div>
+
+<h2 id="asm">(f) Assumptions, anchors and open questions</h2>
+<h3>Assumptions</h3><ul id="asmL"></ul>
+<h3>Measured anchors (sanity only, never fitted)</h3><div class="tw"><table id="ancT"></table></div>
+<h3>Open questions</h3><ul id="oqL"></ul>
+
+<h2 id="bench">Microbenchmark mapping (next stage)</h2>
+<div class="tw"><table id="mbT"></table></div>
+</main>
+<div id="tip"></div>
+
+<script>
+/*__DATA__*/
+(function () {
+"use strict";
+var M = DATA.meta, PRE = DATA.prefill, DEC = DATA.decode, OPT = DATA.optables;
+var S = { ck: "mxfp4_release", col: "achievable", k: 3, pvar: "O1+O2", dvar: "base", dTopo: "D7-4", dNorm: "step", oSel: null, oSort: "total" };
+try { var sv = JSON.parse(localStorage.getItem("k31sol") || "{}"); for (var key in sv) if (key in S) S[key] = sv[key]; } catch (e) {}
+function save() { try { localStorage.setItem("k31sol", JSON.stringify(S)); } catch (e) {} }
+
+var GROUPS = M.group_order;
+var GCOL = {}; GROUPS.forEach(function (g, i) { GCOL[g] = "var(--s" + (i + 1) + ")"; });
+var TOPO = {}; M.topologies.forEach(function (t) { TOPO[t.id] = t; });
+var PTOP = M.topologies.filter(function (t) { return t.phase === "prefill"; });
+var DTOP = M.topologies.filter(function (t) { return t.phase === "decode"; });
+var D_FEAT = ["D1", "D3", "D4-72", "D5", "D7-4", "D7-8", "D8", "D11"];
+var P_FEAT = ["P1", "P2", "P3-16", "P4-4", "P6", "P7"];
+function featColor(list, id) { var i = list.indexOf(id); return i < 0 ? "var(--other)" : "var(--s" + (i + 1) + ")"; }
+
+var $ = function (id) { return document.getElementById(id); };
+function fmt(x, d) { if (x == null || isNaN(x)) return "-"; d = d == null ? 1 : d; var a = Math.abs(x);
+  if (a >= 1e4) return (x / 1e3).toFixed(1) + "K"; if (a >= 100) return x.toFixed(0); if (a >= 10) return x.toFixed(d); return x.toFixed(Math.max(d, 2)); }
+function fb(x) { if (!x) return "0"; var a = Math.abs(x); if (a >= 1e9) return (x / 1e9).toFixed(2) + " G"; if (a >= 1e6) return (x / 1e6).toFixed(2) + " M"; if (a >= 1e3) return (x / 1e3).toFixed(1) + " K"; return x.toFixed(0); }
+function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+function seg(id, opts, key, cb) {
+  var el = $(id); el.innerHTML = "";
+  opts.forEach(function (o) { var b = document.createElement("button"); b.textContent = o[1]; if (S[key] == o[0]) b.className = "on";
+    b.onclick = function () { S[key] = o[0]; save(); seg(id, opts, key, cb); cb(); }; el.appendChild(b); });
+}
+var tip = $("tip");
+function showTip(ev, html) { tip.innerHTML = html; tip.style.display = "block"; var x = ev.clientX + 14, y = ev.clientY + 14;
+  var w = tip.offsetWidth, h = tip.offsetHeight; if (x + w > innerWidth - 8) x = ev.clientX - w - 14; if (y + h > innerHeight - 8) y = ev.clientY - h - 14; tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px"; }
+function hideTip() { tip.style.display = "none"; }
+function NS(tag, attrs, parent) { var e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (var a in attrs) e.setAttribute(a, attrs[a]); if (parent) parent.appendChild(e); return e; }
+function svgBox(el, W, H) { el.innerHTML = ""; return NS("svg", { viewBox: "0 0 " + W + " " + H, role: "img" }, el); }
+function hover(node, html) { node.addEventListener("mousemove", function (e) { showTip(e, typeof html === "function" ? html() : html); }); node.addEventListener("mouseleave", hideTip); }
+function nice(max) { if (max <= 0) return 1; var p = Math.pow(10, Math.floor(Math.log10(max))), m = max / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+function ticks(max, n) { var st = nice(max / n), out = [0]; while (out[out.length - 1] < max * 0.9999) out.push(out[out.length - 1] + st); if (out.length < 2) out.push(st); return out; }
+function legendGroups(id) { $(id).innerHTML = GROUPS.map(function (g) { return '<span><span class="sw" style="background:' + GCOL[g] + '"></span>' + g + "</span>"; }).join(""); }
+
+// ------------------------------------------------------------------ summary tiles
+function tiles() {
+  var h = [];
+  M.ckpt_order = ["mxfp4_release", "nvfp4_modelopt"];
+  M.ckpt_order.forEach(function (ck) {
+    var per = PRE.res[ck + "|" + S.col + "|" + S.pvar], best = null;
+    for (var id in per) if (!best || per[id].best.tok_s_gpu > per[best].best.tok_s_gpu) best = id;
+    var b = per[best].best;
+    h.push('<div class="tile"><div class="k">prefill best, ' + ck.split("_")[0] + "</div><div class=v>" + fmt(b.tok_s_gpu) + ' tok/s/GPU</div><div class="d">' + esc(TOPO[best].name) + " (" + S.pvar + ", " + S.col + "), chunk " + per[best].bestF / 1024 + "K, " + fmt(b.req_s_gpu, 2) + " req/s/GPU</div></div>");
+  });
+  var bands = bandRows(S.ck, S.k, S.col, S.dvar);
+  bands.forEach(function (b) {
+    h.push('<div class="tile"><div class="k">decode r ' + b.lo + (b.hi != b.lo ? "-" + b.hi : "") + " req/GPU</div><div class=v>" + esc(b.topo) + '</div><div class="d">' + fmt(b.tlo) + "-" + fmt(b.thi) + " tok/s/GPU; " + esc(TOPO[b.topo].name) + "</div></div>");
+  });
+  $("tiles").innerHTML = h.join("");
+}
+function bandRows(ck, k, col, v) {
+  var best = DEC.best[ck + "|" + k + "|" + col + "|" + v] || [], out = [];
+  best.forEach(function (x) {
+    var last = out[out.length - 1];
+    if (last && last.topo === x.topo) { last.hi = x.r; last.thi = x.tps_gpu; last.items.push(x); }
+    else out.push({ topo: x.topo, lo: x.r, hi: x.r, tlo: x.tps_gpu, thi: x.tps_gpu, items: [x] });
+  });
+  return out;
+}
+
+// ------------------------------------------------------------------ constants tables
+function constTables() {
+  $("hwT").innerHTML = "<tr><th>quantity</th><th class=n>SOL</th><th class=n>achievable</th><th>unit</th><th>source</th></tr>" +
+    M.hw.map(function (r) { return "<tr><td>" + esc(r.name) + "</td><td class=n>" + fmt(r.sol, 2) + "</td><td class=n>" + fmt(r.achievable, 2) + "</td><td>" + r.unit + '</td><td class="note">' + esc(r.source) + "</td></tr>"; }).join("");
+  $("mdT").innerHTML = "<tr><th>item</th><th>value</th><th>source</th></tr>" + M.model.map(function (r) { return "<tr><td>" + esc(r.name) + "</td><td>" + esc(r.value) + '</td><td class="note">' + esc(r.source) + "</td></tr>"; }).join("");
+  $("ckT").innerHTML = "<tr><th>family</th><th>mxfp4_release</th><th class=n>GB</th><th>nvfp4_modelopt</th><th class=n>GB</th></tr>" +
+    M.checkpoints.map(function (r) { return "<tr><td>" + esc(r.family) + "</td><td>" + esc(r.mx_dtype) + "</td><td class=n>" + fmt(r.mx_GB, 2) + "</td><td>" + esc(r.nv_dtype) + "</td><td class=n>" + fmt(r.nv_GB, 2) + "</td></tr>"; }).join("");
+}
+function stratTable() {
+  var keys = ["kda", "mla", "indexer", "dsa_attn", "moe_dense", "experts", "lm_head", "drafter"];
+  var h = "<tr><th>id</th><th>strategy</th><th>KDA</th><th>MLA proj</th><th>indexer</th><th>DSA attn / KV</th><th>MoE dense</th><th>routed experts</th><th>lm_head</th><th>drafter</th><th>communication</th><th class=n>W/GPU GB</th><th class=n>r<sub>max</sub></th></tr>";
+  M.topologies.forEach(function (t) {
+    var w = "-", rm = "-";
+    if (t.phase === "prefill") { var p = PRE.res[S.ck + "|" + S.col + "|base"][t.id]; w = fmt(p.best.weights_GB); }
+    else { var c = DEC.cap[S.ck + "|" + S.k + "|" + t.id]; w = fmt(c.weights_GB); rm = fmt(c.rmax); }
+    h += "<tr><td class=mono>" + t.id + "</td><td>" + esc(t.name) + (t.existing ? "" : ' <span class="tag new">new</span>') + "</td>" +
+      keys.map(function (k) { return "<td>" + esc((t.mapping || {})[k] || "") + "</td>"; }).join("") + '<td class="note">' + esc(t.comm) + "</td><td class=n>" + w + "</td><td class=n>" + rm + "</td></tr>";
+  });
+  $("stT").innerHTML = h;
+}
+
+// ------------------------------------------------------------------ prefill
+function preRes(col, v) { return PRE.res[S.ck + "|" + (col || S.col) + "|" + (v || S.pvar)]; }
+function preBars() {
+  var sol = preRes("sol"), ach = preRes("achievable"), ids = PTOP.map(function (t) { return t.id; });
+  ids.sort(function (a, b) { return ach[b].best.tok_s_gpu - ach[a].best.tok_s_gpu; });
+  var W = 760, rowH = 30, L = 250, R = 60, H = ids.length * rowH + 30;
+  var mx = 0; ids.forEach(function (i) { mx = Math.max(mx, sol[i].best.tok_s_gpu, ach[i].best.tok_s_gpu); });
+  var tk = ticks(mx, 5), X = function (v) { return L + (W - L - R) * v / tk[tk.length - 1]; };
+  var s = svgBox($("pBars"), W, H);
+  tk.forEach(function (v) { NS("line", { x1: X(v), x2: X(v), y1: 4, y2: H - 22, class: "gl" }, s); NS("text", { x: X(v), y: H - 6, "text-anchor": "middle" }, s).textContent = fmt(v); });
+  ids.forEach(function (id, i) {
+    var y = 6 + i * rowH, a = sol[id].best, b = ach[id].best, t = TOPO[id];
+    var lab = NS("text", { x: L - 8, y: y + 15, "text-anchor": "end" }, s); lab.textContent = shortName(t.name);
+    var r1 = NS("rect", { x: L, y: y + 2, width: Math.max(1, X(a.tok_s_gpu) - L), height: 10, rx: 3, fill: "var(--sol)" }, s);
+    var r2 = NS("rect", { x: L, y: y + 13, width: Math.max(1, X(b.tok_s_gpu) - L), height: 10, rx: 3, fill: "var(--ach)" }, s);
+    NS("text", { x: X(Math.max(a.tok_s_gpu, b.tok_s_gpu)) + 5, y: y + 16 }, s).textContent = fmt(b.tok_s_gpu) + (b.feasible ? "" : " (HBM!)");
+    var hit = NS("rect", { x: 0, y: y, width: W, height: rowH, fill: "transparent" }, s);
+    hover(hit, function () { return "<b>" + esc(t.name) + "</b><br>SOL " + fmt(a.tok_s_gpu) + " / achievable " + fmt(b.tok_s_gpu) + " tok/s/GPU<br>chunk " + sol[id].bestF / 1024 + "K / " + ach[id].bestF / 1024 + "K per engine, step " + fmt(a.t_ms) + " / " + fmt(b.t_ms) + " ms<br>" + fmt(b.req_s_gpu, 2) + " req/s/GPU at 5,456 fresh tokens<br>weights " + fmt(b.weights_GB) + " GB/GPU, free " + fmt(b.free_GB) + " GB" + (b.o1 ? "<br>O1 on" : ""); });
+  });
+}
+function shortName(n) { return n.length > 36 ? n.slice(0, 35) + "..." : n; }
+function usPerTok(p) { return 1e6 / p.tok_s_gpu; }
+function usScale(p) { var gs = 0; GROUPS.forEach(function (g) { gs += p.groups[g] || 0; }); return usPerTok(p) / gs; }
+function preStack() {
+  var res = preRes(), ids = PTOP.map(function (t) { return t.id; });
+  ids.sort(function (a, b) { return usPerTok(res[a].best) - usPerTok(res[b].best); });
+  var W = 760, rowH = 26, L = 250, R = 50, H = ids.length * rowH + 30, mx = 0;
+  ids.forEach(function (i) { mx = Math.max(mx, usPerTok(res[i].best)); });
+  var tk = ticks(mx, 5), X = function (v) { return L + (W - L - R) * v / tk[tk.length - 1]; };
+  var s = svgBox($("pStack"), W, H);
+  tk.forEach(function (v) { NS("line", { x1: X(v), x2: X(v), y1: 4, y2: H - 22, class: "gl" }, s); NS("text", { x: X(v), y: H - 6, "text-anchor": "middle" }, s).textContent = fmt(v) + (v === tk[tk.length - 1] ? " us" : ""); });
+  ids.forEach(function (id, i) {
+    var p = res[id].best, y = 6 + i * rowH, gs = 0, x0 = L; GROUPS.forEach(function (g) { gs += p.groups[g] || 0; }); var scale = usPerTok(p) / gs;
+    NS("text", { x: L - 8, y: y + 14, "text-anchor": "end" }, s).textContent = shortName(TOPO[id].name);
+    GROUPS.forEach(function (g) {
+      var v = (p.groups[g] || 0) * scale; if (v <= 0) return;
+      var w = X(v) - L, r = NS("rect", { x: x0, y: y + 2, width: Math.max(0.5, w - 1), height: 17, fill: GCOL[g] }, s);
+      hover(r, "<b>" + esc(TOPO[id].name) + "</b><br>" + g + ": " + fmt(v, 2) + " us/token (" + fmt(100 * v / usPerTok(p)) + "%)<br>total " + fmt(usPerTok(p), 2) + " us/token");
+      x0 += w;
+    });
+    NS("text", { x: x0 + 5, y: y + 15 }, s).textContent = fmt(usPerTok(p), 1);
+  });
+  // family table
+  var fams = M.family_order, prims = {};
+  ids.forEach(function (id) { for (var pr in res[id].best.comm_by) prims[pr] = 1; });
+  var pl = Object.keys(prims).sort();
+  var h = "<tr><th>family / primitive</th>" + ids.map(function (id) { return "<th class=n>" + id + "</th>"; }).join("") + "</tr>";
+  fams.forEach(function (f) { h += "<tr><td>" + esc(M.families[f]) + "</td>" + ids.map(function (id) { var p = res[id].best; return "<td class=n>" + fmt((p.fam[f] || 0) * usScale(p), 2) + "</td>"; }).join("") + "</tr>"; });
+  pl.forEach(function (pr) { h += "<tr><td>comm (exposed) " + esc(pr) + "</td>" + ids.map(function (id) { var p = res[id].best; return "<td class=n>" + fmt((p.comm_by[pr] || 0) * usScale(p), 2) + "</td>"; }).join("") + "</tr>"; });
+  h += "<tr><td><b>total us / token</b></td>" + ids.map(function (id) { return "<td class=n><b>" + fmt(usPerTok(res[id].best), 2) + "</b></td>"; }).join("") + "</tr>";
+  $("pFamT").innerHTML = h;
+}
+function lineChart(el, xs, series, xlab, ylab, xfmt) {
+  var W = 380, H = 250, L = 46, R = 10, T = 26, B = 34, mx = 0;
+  series.forEach(function (s) { s.ys.forEach(function (v) { mx = Math.max(mx, v); }); });
+  var tk = ticks(mx, 4), sv = svgBox(el, W, H);
+  var X = function (i) { return L + (W - L - R) * i / (xs.length - 1); }, Y = function (v) { return H - B - (H - B - T) * v / tk[tk.length - 1]; };
+  tk.forEach(function (v) { NS("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), class: "gl" }, sv); NS("text", { x: L - 5, y: Y(v) + 4, "text-anchor": "end" }, sv).textContent = fmt(v); });
+  xs.forEach(function (x, i) { NS("text", { x: X(i), y: H - B + 15, "text-anchor": "middle" }, sv).textContent = xfmt(x); });
+  NS("text", { x: (L + W - R) / 2, y: H - 3, "text-anchor": "middle" }, sv).textContent = xlab;
+  NS("text", { x: L, y: 12 }, sv).textContent = ylab;
+  series.slice().sort(function (a, b) { return (a.feat ? 1 : 0) - (b.feat ? 1 : 0); }).forEach(function (s) {
+    var d = s.ys.map(function (v, i) { return (i ? "L" : "M") + X(i).toFixed(1) + "," + Y(v).toFixed(1); }).join("");
+    var p = NS("path", { d: d, fill: "none", stroke: s.color, "stroke-width": s.feat ? 2 : 1.2, "stroke-dasharray": s.feat ? "" : "3 3" }, sv);
+    s.ys.forEach(function (v, i) { var c = NS("circle", { cx: X(i), cy: Y(v), r: s.feat ? 4 : 2.5, fill: s.color, stroke: "var(--surface)", "stroke-width": 1.5 }, sv);
+      var hit = NS("circle", { cx: X(i), cy: Y(v), r: 9, fill: "transparent" }, sv); hover(hit, "<b>" + esc(s.name) + "</b><br>" + xlab + " " + xfmt(xs[i]) + ": " + fmt(v) + " " + ylab); });
+  });
+}
+function preSens() {
+  var res = preRes(), Fs = PRE.F_scan, Ls = PRE.L_scan, iRef = Ls.length;
+  var ser = function (fn) { return PTOP.map(function (t) { return { name: t.name, feat: P_FEAT.indexOf(t.id) >= 0, color: featColor(P_FEAT, t.id), ys: fn(res[t.id]) }; }); };
+  lineChart($("pSensF"), Fs, ser(function (r) { return r.grid[iRef].map(function (c) { return c[0]; }); }), "chunk tokens per engine (L = 78K)", "tok/s/GPU", function (x) { return x / 1024 + "K"; });
+  lineChart($("pSensL"), Ls, ser(function (r) { var fi = PRE.F_scan.indexOf(16384); return r.grid.slice(0, Ls.length).map(function (row) { return row[fi][0]; }); }), "context L (chunk 16K)", "tok/s/GPU", function (x) { return Math.round(x / 1000) + "K"; });
+  $("pSensLeg").innerHTML = P_FEAT.map(function (id) { return '<span><span class="sw" style="background:' + featColor(P_FEAT, id) + '"></span>' + esc(TOPO[id].name) + "</span>"; }).join("") + '<span><span class="sw" style="background:var(--other)"></span>other prefill strategies (dashed)</span>';
+}
+function preTTFT() {
+  var h = "<tr><th>topology</th><th class=n>chunk</th><th class=n>TTFT 6K fresh / 73K prefix (ms)</th><th class=n>TTFT 74K zero-hit (ms)</th><th class=n>weights GB/GPU</th><th class=n>free HBM GB/GPU</th><th>P->D fan-in</th></tr>";
+  PTOP.forEach(function (t) { var x = PRE.ttft[S.ck + "|" + S.col + "|" + t.id], p = preRes(null, "base")[t.id].best;
+    h += "<tr><td>" + esc(t.name) + "</td><td class=n>" + x.F / 1024 + "K</td><td class=n>" + fmt(x.ttft_6k_ms) + "</td><td class=n>" + fmt(x.ttft_74k_ms) + "</td><td class=n>" + fmt(p.weights_GB) + "</td><td class=n>" + fmt(p.free_GB) + '</td><td class="note">' + esc(PRE.fan_in[t.id]) + "</td></tr>"; });
+  var p8 = PRE.ttft[S.ck + "|" + S.col + "|P8"];
+  h += '<tr><td>P8 CP8 over fresh tokens (from DEP16 pool) <span class="tag new">new</span></td><td class=n>-</td><td class=n>-</td><td class=n>' + fmt(p8.ttft_74k_ms) + '</td><td class=n>-</td><td class=n>-</td><td class="note">' + esc(p8.note) + "</td></tr>";
+  $("pTT").innerHTML = h;
+  var n = PRE.nixl["135000"], m = PRE.nixl["145000"];
+  $("nixl").textContent = "P->D bytes per request (any P to any D through NIXL): at 135K context " + fmt(n.total_GB, 2) + " GB (DSA KV " + fmt(n.dsa_GB, 2) + " + KDA state/conv " + fmt(n.kda_GB, 2) + " + drafter SWA " + fmt(n.swa_GB, 2) + "); at the 145K ISL mean " + fmt(m.total_GB, 2) + " GB. TTFT is a lower bound: the request runs alone on its engine, no queueing, no transfer.";
+}
+
+// ------------------------------------------------------------------ decode
+function decRes(col, v) { return DEC.res[S.ck + "|" + S.k + "|" + (col || S.col) + "|" + (v || S.dvar)]; }
+function decPareto() {
+  var res = decRes(), W = 760, H = 400, L = 56, R = 16, T = 28, B = 40, mx = 0, mxu = 0;
+  DTOP.forEach(function (t) { (res[t.id] || []).forEach(function (p) { mx = Math.max(mx, p.tps_gpu); mxu = Math.max(mxu, p.tps_user); }); });
+  var ty = ticks(mx, 5), tx = ticks(mxu, 6), sv = svgBox($("dPareto"), W, H);
+  var X = function (v) { return L + (W - L - R) * v / tx[tx.length - 1]; }, Y = function (v) { return H - B - (H - B - T) * v / ty[ty.length - 1]; };
+  ty.forEach(function (v) { NS("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), class: "gl" }, sv); NS("text", { x: L - 6, y: Y(v) + 4, "text-anchor": "end" }, sv).textContent = fmt(v); });
+  tx.forEach(function (v) { NS("text", { x: X(v), y: H - B + 16, "text-anchor": "middle" }, sv).textContent = fmt(v); });
+  NS("text", { x: (L + W) / 2, y: H - 6, "text-anchor": "middle" }, sv).textContent = "interactivity: tokens/s per user (AL / step)";
+  NS("text", { x: L, y: 14 }, sv).textContent = "tokens/s per GPU";
+  var env = DEC.pareto[S.ck + "|" + S.k + "|" + S.col + "|" + S.dvar] || [];
+  var ordered = DTOP.slice().sort(function (a, b) { return (D_FEAT.indexOf(a.id) >= 0) - (D_FEAT.indexOf(b.id) >= 0); });
+  ordered.forEach(function (t) {
+    var pts = res[t.id] || [], feat = D_FEAT.indexOf(t.id) >= 0, c = featColor(D_FEAT, t.id); if (!pts.length) return;
+    NS("path", { d: pts.map(function (p, i) { return (i ? "L" : "M") + X(p.tps_user).toFixed(1) + "," + Y(p.tps_gpu).toFixed(1); }).join(""), fill: "none", stroke: c, "stroke-width": feat ? 2 : 1.2, "stroke-dasharray": feat ? "" : "3 3" }, sv);
+    pts.forEach(function (p, i) {
+      var last = i === pts.length - 1;
+      NS("circle", { cx: X(p.tps_user), cy: Y(p.tps_gpu), r: last ? 5 : (feat ? 3 : 2), fill: last ? "var(--surface)" : c, stroke: c, "stroke-width": last ? 2 : 1 }, sv);
+      var hit = NS("circle", { cx: X(p.tps_user), cy: Y(p.tps_gpu), r: 8, fill: "transparent" }, sv);
+      hover(hit, "<b>" + esc(t.name) + "</b><br>r = " + fmt(p.r, 2) + " requests/GPU" + (last ? " (KV capacity)" : "") + "<br>step " + fmt(p.t_ms, 2) + " ms, ITL " + fmt(p.t_ms / DEC.AL[S.k], 2) + " ms<br>" + fmt(p.tps_user) + " tok/s/user, " + fmt(p.tps_gpu) + " tok/s/GPU" + (p.split ? "<br>A:F split " + p.split.join(":") : "") + (p.o1 ? "<br>O1 on" : ""));
+    });
+  });
+  if (env.length) NS("path", { d: env.map(function (p, i) { return (i ? "L" : "M") + X(p.tps_user).toFixed(1) + "," + Y(p.tps_gpu).toFixed(1); }).join(""), fill: "none", stroke: "var(--text)", "stroke-width": 1, "stroke-dasharray": "6 4", opacity: 0.6 }, sv);
+  $("dLeg").innerHTML = D_FEAT.map(function (id) { return '<span><span class="sw" style="background:' + featColor(D_FEAT, id) + '"></span>' + esc(TOPO[id].name) + "</span>"; }).join("") + '<span><span class="sw" style="background:var(--other)"></span>other decode strategies (dashed)</span><span class="note">open circle = KV capacity limit; dashed black = envelope</span>';
+}
+function decBand() {
+  var rows = bandRows(S.ck, S.k, S.col, S.dvar), sol = bandRows(S.ck, S.k, "sol", S.dvar);
+  var h = "<tr><th class=n>requests / GPU</th><th>best topology (" + S.col + ")</th><th class=n>tok/s/GPU</th><th class=n>step ms</th><th>runner-up (margin at band end)</th></tr>";
+  rows.forEach(function (b) { var x = b.items[b.items.length - 1];
+    h += "<tr><td class=n>" + fmt(b.lo, 3) + (b.hi != b.lo ? " - " + fmt(b.hi, 3) : "") + "</td><td class=win>" + esc(TOPO[b.topo].name) + "</td><td class=n>" + fmt(b.tlo) + " - " + fmt(b.thi) + "</td><td class=n>" + fmt(b.items[0].t_ms, 2) + " - " + fmt(x.t_ms, 2) + "</td><td>" + (x.runner ? esc(TOPO[x.runner].name) + " (+" + fmt(100 * x.margin, 1) + "%)" : "-") + "</td></tr>"; });
+  h += '<tr><td colspan=5 class="note">SOL column bands: ' + sol.map(function (b) { return fmt(b.lo, 3) + (b.hi != b.lo ? "-" + fmt(b.hi, 3) : "") + ": " + b.topo; }).join("; ") + "</td></tr>";
+  $("dBand").innerHTML = h;
+}
+function decStack() {
+  var sel = $("dTopo"); if (!sel.options.length) { DTOP.forEach(function (t) { var o = document.createElement("option"); o.value = t.id; o.textContent = t.name; sel.appendChild(o); }); sel.onchange = function () { S.dTopo = sel.value; save(); decStack(); }; }
+  sel.value = S.dTopo;
+  var pts = decRes()[S.dTopo] || [], W = 760, H = 330, L = 56, R = 12, T = 28, B = 46, mx = 0, AL = DEC.AL[S.k];
+  var val = function (p, g) { var v = p.groups[g] || 0; return S.dNorm === "step" ? v : v / (p.r * AL) * 1e3; };
+  var tot = function (p) { return S.dNorm === "step" ? p.t_ms : p.t_ms / (p.r * AL) * 1e3; };
+  pts.forEach(function (p) { mx = Math.max(mx, tot(p)); });
+  var ty = ticks(mx, 5), sv = svgBox($("dStack"), W, H), n = Math.max(pts.length, 1), bw = (W - L - R) / n;
+  var Y = function (v) { return H - B - (H - B - T) * v / ty[ty.length - 1]; };
+  ty.forEach(function (v) { NS("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), class: "gl" }, sv); NS("text", { x: L - 6, y: Y(v) + 4, "text-anchor": "end" }, sv).textContent = fmt(v); });
+  NS("text", { x: L, y: 14 }, sv).textContent = S.dNorm === "step" ? "ms per step" : "GPU-us per output token";
+  NS("text", { x: (L + W) / 2, y: H - 6, "text-anchor": "middle" }, sv).textContent = "requests per GPU (k = " + S.k + ", AL " + AL + ", L = 135K); last bar = KV capacity";
+  pts.forEach(function (p, i) {
+    var x = L + i * bw + 3, y0 = H - B;
+    GROUPS.forEach(function (g) { var v = val(p, g); if (v <= 0) return; var hgt = (H - B - T) * v / ty[ty.length - 1];
+      var r = NS("rect", { x: x, y: y0 - hgt, width: Math.max(1, bw - 6), height: Math.max(0.5, hgt - 1), fill: GCOL[g] }, sv);
+      hover(r, "<b>" + esc(TOPO[S.dTopo].name) + "</b> r = " + fmt(p.r, 2) + "<br>" + g + ": " + fmt(v, 2) + (S.dNorm === "step" ? " ms" : " us/token") + " (" + fmt(100 * v / tot(p)) + "%)<br>step " + fmt(p.t_ms, 2) + " ms, " + fmt(p.tps_gpu) + " tok/s/GPU, " + fmt(p.tps_user) + " tok/s/user"); y0 -= hgt; });
+    NS("text", { x: x + (bw - 6) / 2, y: H - B + 14, "text-anchor": "middle" }, sv).textContent = fmt(p.r, 2);
+  });
+  if (!pts.length) NS("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }, sv).textContent = "no feasible point (KV capacity)";
+}
+function decCap() {
+  var h = "<tr><th>topology</th><th class=n>weights GB/GPU</th><th class=n>free GB/GPU</th><th class=n>bytes per request (group) GB</th><th class=n>r<sub>max</sub> 135K</th><th class=n>r<sub>max</sub> 189K</th><th class=n>best tok/s/GPU (" + S.col + ")</th></tr>";
+  DTOP.forEach(function (t) { var c = DEC.cap[S.ck + "|" + S.k + "|" + t.id], pts = decRes()[t.id] || [], b = 0; pts.forEach(function (p) { b = Math.max(b, p.tps_gpu); });
+    h += "<tr><td>" + esc(t.name) + "</td><td class=n>" + fmt(c.weights_GB) + "</td><td class=n>" + fmt(c.free_GB) + "</td><td class=n>" + fmt(c.per_req_GB, 2) + "</td><td class=n>" + fmt(c.rmax) + "</td><td class=n>" + fmt(c.rmax_189K) + "</td><td class=n>" + fmt(b) + "</td></tr>"; });
+  $("dCap").innerHTML = h + '<tr><td colspan=7 class="note">Per request (whole group, SOL minimal state, k=' + S.k + "): DSA KV 15,456 B/token x replication + 434 MB FP32 KDA state + FP32 conv + RecoverSSM records + 42 MB drafter SWA. Reserve " + M.reserve_GiB + " GiB per GPU.</td></tr>";
+}
+
+// ------------------------------------------------------------------ op table
+function opTable() {
+  var sel = $("oSel"), keys = Object.keys(OPT.tables).filter(function (k) { return k.indexOf(S.ck + "|") === 0; });
+  sel.innerHTML = keys.map(function (k) { var p = k.split("|"); return '<option value="' + esc(k) + '">' + esc(TOPO[p[1]].name) + " - " + esc(OPT.tables[k].regime) + "</option>"; }).join("");
+  if (!S.oSel || keys.indexOf(S.oSel) < 0) { var alt = S.oSel ? S.ck + "|" + S.oSel.split("|").slice(1).join("|") : null; S.oSel = alt && keys.indexOf(alt) >= 0 ? alt : keys[0]; }
+  sel.value = S.oSel; sel.onchange = function () { S.oSel = sel.value; save(); opTable(); };
+  var tb = OPT.tables[S.oSel];
+  var lt = ["attnres", "kda", "dsa", "moe", "dense", "embed", "final", "drafter"];
+  $("oUnit").innerHTML = "<tr><th>layer type</th><th class=n>count</th><th class=n>compute SOL ms</th><th class=n>comm SOL ms</th><th class=n>compute ach ms</th><th class=n>comm ach ms</th></tr>" +
+    lt.map(function (k) { var a = tb.units_sol[k], b = tb.units_ach[k], n = { attnres: 93, kda: 69, dsa: 24, moe: 92, dense: 1, embed: 1, final: 1, drafter: 1 }[k];
+      return "<tr><td>" + k + "</td><td class=n>" + n + "</td><td class=n>" + fmt(a.comp, 3) + "</td><td class=n>" + fmt(a.comm, 3) + "</td><td class=n>" + fmt(b.comp, 3) + "</td><td class=n>" + fmt(b.comm, 3) + "</td></tr>"; }).join("") +
+    "<tr><td><b>step</b></td><td></td><td class=n colspan=2><b>" + fmt(tb.t_sol_ms, 3) + " ms</b></td><td class=n colspan=2><b>" + fmt(tb.t_ach_ms, 3) + " ms</b></td></tr>";
+  // per-layer bars
+  var pl = tb.per_layer_ach || [], W = 380, H = 200, L = 40, B = 26, T = 8, mx = 0; pl.forEach(function (v) { mx = Math.max(mx, v); });
+  var sv = svgBox($("oLayers"), W, H), ty = ticks(mx, 4), bw = (W - L - 6) / Math.max(pl.length, 1);
+  var Y = function (v) { return H - B - (H - B - T) * v / ty[ty.length - 1]; };
+  ty.forEach(function (v) { NS("line", { x1: L, x2: W - 4, y1: Y(v), y2: Y(v), class: "gl" }, sv); NS("text", { x: L - 4, y: Y(v) + 4, "text-anchor": "end" }, sv).textContent = fmt(v, 2); });
+  var dsa = {}; [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87, 91, 92].forEach(function (i) { dsa[i] = 1; });
+  pl.forEach(function (v, i) { var r = NS("rect", { x: L + i * bw, y: Y(v), width: Math.max(0.6, bw - 0.6), height: H - B - Y(v), fill: dsa[i] ? "var(--s2)" : "var(--s1)" }, sv);
+    hover(r, "layer " + i + " (" + (dsa[i] ? "DSA" : "KDA") + (i === 0 ? " + dense MLP" : " + MoE") + ")<br>" + fmt(v, 3) + " ms achievable, SOL " + fmt((tb.per_layer_sol || [])[i], 3) + " ms"); });
+  [0, 23, 46, 69, 92].forEach(function (i) { NS("text", { x: L + i * bw + bw / 2, y: H - B + 14, "text-anchor": "middle" }, sv).textContent = i; });
+  NS("text", { x: (L + W) / 2, y: H - 3, "text-anchor": "middle" }, sv).textContent = "layer index";
+  // ops
+  var C = OPT.cols, ix = {}; C.forEach(function (c, i) { ix[c] = i; });
+  var rows = tb.ops.slice(), tot = 0; rows.forEach(function (r) { tot += r[ix.t_ach_s] * r[ix.count]; });
+  if (S.oSort === "total") rows.sort(function (a, b) { return b[ix.t_ach_s] * b[ix.count] - a[ix.t_ach_s] * a[ix.count]; });
+  var h = "<tr><th>op</th><th>family</th><th class=n>count</th><th class=n>GFLOP</th><th class=n>weight B</th><th class=n>act B</th><th class=n>KV B</th><th class=n>state B</th><th>dtype</th><th class=n>t SOL us</th><th class=n>t ach us</th><th>bound</th><th class=n>total ach ms</th><th class=n>share</th></tr>";
+  rows.forEach(function (r) { var info = M.op_info[r[0]] || {}, t = r[ix.t_ach_s] * r[ix.count];
+    h += '<tr title="' + esc((info.name || "") + " | " + (info.shapes || "") + " | " + (info.cite || []).join(", ")) + '"><td class=mono>' + r[0] + "</td><td>" + esc(M.families[r[1]] || r[1]) + "</td><td class=n>" + fmt(r[2], 0) + "</td><td class=n>" + fmt(r[3] / 1e9, 3) + "</td><td class=n>" + fb(r[4]) + "</td><td class=n>" + fb(r[5]) + "</td><td class=n>" + fb(r[6]) + "</td><td class=n>" + fb(r[7]) + "</td><td>" + r[8] + "</td><td class=n>" + fmt(r[9] * 1e6, 2) + "</td><td class=n>" + fmt(r[10] * 1e6, 2) + "</td><td>" + r[11] + "/" + r[12] + "</td><td class=n>" + fmt(t * 1e3, 3) + "</td><td class=n>" + fmt(100 * t / tot, 1) + "%</td></tr>"; });
+  $("oT").innerHTML = h;
+  var hc = "<tr><th>layer</th><th>primitive</th><th>what</th><th class=n>in B / GPU</th><th class=n>out B / GPU</th><th class=n>hops</th><th class=n>t SOL us</th><th class=n>t ach us</th><th>async</th></tr>";
+  tb.comm.forEach(function (c) { hc += "<tr><td>" + c[0] + "</td><td class=mono>" + esc(c[1]) + "</td><td>" + esc(c[2]) + "</td><td class=n>" + fb(c[3]) + "</td><td class=n>" + fb(c[4]) + "</td><td class=n>" + c[5] + "</td><td class=n>" + fmt(c[6] * 1e6, 2) + "</td><td class=n>" + fmt(c[7] * 1e6, 2) + "</td><td>" + (c[8] ? "CE" : "") + "</td></tr>"; });
+  $("oC").innerHTML = tb.comm.length ? hc : "<tr><td>no communication (single GPU path)</td></tr>";
+}
+
+// ------------------------------------------------------------------ assumptions etc.
+function staticBits() {
+  $("gen").textContent = M.generated;
+  $("asmL").innerHTML = M.assumptions.map(function (a) { return "<li>" + esc(a) + "</li>"; }).join("");
+  $("oqL").innerHTML = M.open_questions.map(function (a) { return "<li>" + esc(a) + "</li>"; }).join("");
+  var h = "<tr><th>anchor</th><th>measured</th><th>model SOL</th><th>model achievable</th><th>note</th></tr>";
+  M.anchors.forEach(function (a) {
+    if (a.rows) a.rows.forEach(function (r) { h += "<tr><td>" + esc(a.name) + " r=" + r.r + "</td><td class=n>" + fmt(r.measured_ms) + " ms</td><td class=n>" + fmt(r.sol_ms) + " ms</td><td class=n>" + fmt(r.ach_ms) + " ms</td><td class=note>" + esc(a.note) + "</td></tr>"; });
+    else h += "<tr><td>" + esc(a.name) + "</td><td class=n>" + fmt(a.measured_tok_s_gpu) + " tok/s/GPU</td><td class=n>" + fmt(a.sol_tok_s_gpu) + "</td><td class=n>" + fmt(a.ach_tok_s_gpu) + "</td><td class=note>" + esc(a.note) + "</td></tr>";
+  });
+  $("ancT").innerHTML = h;
+  var mb = [
+    ["KDA.in_proj / f_b_proj / o_proj, DSA.*proj, MOE.router/latent/shared, DENSE.*, F.lm_head, DS.qkv/o/gate_up/down/fc/ctx_kv_proj", "GEMM roofline per (M, N, K, dtype) at the per-GPU shard shape", "kernel-microbenchmark: cuBLAS / CuTe GEMM at the exact sharded shapes (M = rows per GPU)"],
+    ["KDA.conv + gate_beta_norm + core_prefill / core_decode + o_norm", "FP32 SIMT + BF16 MMA (prefill chunked), state bytes", "FlashKDA prefill chunk bench; sdec KDA recurrence bench (B, q, heads/N)"],
+    ["DSA.prologue, idx_q_quant, idx_score, topk", "MXFP4 MMA + key scan bytes", "indexer score + exact top-k bench (DCP shard / DSA-DP owner / ShardQ rows)"],
+    ["DSA.w_uk, sparse_mla, w_uv, gate_mul", "BF16 MMA + FP8 KV gather 576 B x 2048 rows", "FlashMLA sparse / CuTe sparse MLA bench at heads per GPU"],
+    ["MOE.dispatch, fc1, act, fc2, combine", "expert weight stream (touched experts / E) + FP8/FP4 MMA + P11/P12", "newest packaged MegaMoE at EP size and rows per rank (dispatch / GEMM / combine timed separately)"],
+    ["L.attnres_pre/post, F.attnres_final, DS.aux_capture", "memory-bound mixes over up to 9 BF16 sources", "AttnRes mix kernel bench (rows x sources)"],
+    ["DS.attn, DS.markov, DS.lm_head, F.rejection", "SWA GQA 2048 window; Markov rank-512 x vocab/N per position", "DSpark draft step bench (sdec) at k and B"],
+    ["comm P1/P1c/P2/P3/P3b/P4/P5/P6/P7b/P8/P9/P13/P14/P16", "hops x hop + max(in, out) / NVLink", "symmbench / ncclbench at the message sizes in the op table comm rows"],
+    ["whole layer / step", "sum of the above per layer (layer-level column)", "vllm bench forward (model-microbenchmark) per layer type and full step; compare with per-layer timeline"],
+  ];
+  $("mbT").innerHTML = "<tr><th>model ops</th><th>model term</th><th>microbench</th></tr>" + mb.map(function (r) { return "<tr><td class=mono>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td><td>" + esc(r[2]) + "</td></tr>"; }).join("");
+}
+
+function renderAll() {
+  tiles(); stratTable(); preBars(); preStack(); preSens(); preTTFT(); decPareto(); decBand(); decStack(); decCap(); opTable();
+}
+seg("ck", [["mxfp4_release", "mxfp4_release"], ["nvfp4_modelopt", "nvfp4_modelopt"]], "ck", renderAll);
+seg("col", [["sol", "SOL"], ["achievable", "achievable"]], "col", renderAll);
+seg("kk", [[3, "3"], [5, "5"], [7, "7"]], "k", renderAll);
+seg("pvar", PRE.variants.map(function (v) { return [v, v]; }), "pvar", function () { tiles(); preBars(); preStack(); preSens(); });
+seg("dvar", DEC.variants.map(function (v) { return [v, v]; }), "dvar", function () { tiles(); decPareto(); decBand(); decStack(); decCap(); });
+seg("dNorm", [["step", "ms per step"], ["tok", "us per token"]], "dNorm", decStack);
+seg("oSort", [["total", "sort by total time"], ["model", "model order"]], "oSort", opTable);
+$("theme").onclick = function () { var r = document.documentElement, cur = r.getAttribute("data-theme");
+  var dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.setAttribute("data-theme", dark ? "light" : "dark"); };
+legendGroups("gLeg1"); legendGroups("gLeg2");
+constTables(); staticBits(); renderAll();
+})();
+</script>
