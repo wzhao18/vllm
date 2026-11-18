@@ -26,7 +26,7 @@ void launch_fwd(
     void* workspace_ptr, int total_tiles, int T_total, int H, int N,
     SeqlenT const* cu_seqlens_ptr, float const* A_log_ptr,
     float const* dt_bias_ptr, float gate_scale, int num_sms,
-    cudaStream_t stream, int mode) {
+    cudaStream_t stream, int mode, ConvFuse const* conv) {
   using BF16 = cutlass::bfloat16_t;
   constexpr int kInputStages = 3;
   constexpr int kOutputStages = 2;
@@ -151,22 +151,26 @@ void launch_fwd(
     using SharedStorageK1T = SharedStorageK1<K1L>;
     int smem_size_k1 = sizeof(SharedStorageK1T);
 
-    auto kernel1 =
-        _flash_kda_fwd_prepare<decltype(tma_load_q), decltype(tma_load_k),
-                               decltype(tma_load_beta), decltype(tma_load_g),
-                               decltype(tma_load_dt_bias), CHUNK, D, kK1Threads,
-                               IsVarlen, SeqlenT>;
-
-    cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_size_k1);
-
     dim3 grid_k1(total_tiles, H);
     dim3 block_k1(kK1Threads);
-
-    kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
-        tma_load_q, tma_load_k, tma_load_beta, tma_load_g, tma_load_dt_bias,
-        scale, T_total, H, N, cu_seqlens_ptr, total_tiles, A_log_ptr,
-        gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+    auto launch_k1 = [&](auto fused_tag) {
+      auto kernel1 = _flash_kda_fwd_prepare<
+          decltype(tma_load_q), decltype(tma_load_k), decltype(tma_load_beta),
+          decltype(tma_load_g), decltype(tma_load_dt_bias), CHUNK, D,
+          kK1Threads, IsVarlen, SeqlenT, decltype(fused_tag)::value>;
+      cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size_k1);
+      kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+          tma_load_q, tma_load_k, tma_load_beta, tma_load_g, tma_load_dt_bias,
+          scale, T_total, H, N, cu_seqlens_ptr, total_tiles, A_log_ptr,
+          gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+          conv != nullptr ? *conv : ConvFuse{});
+    };
+    if (conv != nullptr) {
+      launch_k1(std::true_type{});
+    } else {
+      launch_k1(std::false_type{});
+    }
   }
 #endif
 
@@ -337,7 +341,7 @@ void launch_fwd(
       cutlass::bfloat16_t const*, void const*, float, void*, void*,          \
       SEQLEN_T const*, cutlass::bfloat16_t*, void*, int, int, int, int,      \
       SEQLEN_T const*, float const*, float const*, float, int, cudaStream_t, \
-      int);
+      int, ConvFuse const*);
 
 #define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
   INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T)    \

@@ -33,13 +33,14 @@ int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N) {
   return H * total_tiles * per_tile_bytes;
 }
 
-void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+static void fwd_impl(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
          const Tensor& beta, double scale, const Tensor& out,
          const Tensor& workspace, const Tensor& A_log, const Tensor& dt_bias,
          double lower_bound, std::optional<Tensor> initial_state,
          std::optional<Tensor> final_state, std::optional<Tensor> cu_seqlens,
          std::optional<Tensor> checkpoint_state,
-         std::optional<Tensor> checkpoint_offsets, int64_t mode) {
+         std::optional<Tensor> checkpoint_offsets, int64_t mode,
+         ConvFuse const* conv) {
   // mode: bit 0 K1 prepare, bit 1 K2 recurrence, bit 2 exact fp32 state I/O,
   // bit 3 K2 without outputs, bit 4 K2 with v = 0 (bits 2-4 need bit 1).
   STD_TORCH_CHECK((mode & ~int64_t(31)) == 0 && (mode & 3) != 0 &&
@@ -281,7 +282,7 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
       final_state_raw, checkpoint_state_raw, typed_checkpoint_offsets,       \
       out_ptr, workspace_ptr, total_tiles, int(T_total), int(H), int(N_val), \
       typed_cu_seqlens, A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream, \
-      int(mode))
+      int(mode), conv)
 
 #define DISPATCH_STATE(CKPT, VL)                              \
   if (!has_state_in && !has_state_out && state_fp32) {        \
@@ -315,4 +316,81 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
   STD_TORCH_CHECK(is_varlen && cu_seqlens_is_int32,
                   "k3_flashkda_split: varlen int32 cu_seqlens only");
   dispatch(static_cast<int32_t const*>(cu_seqlens_dev));
+}
+
+void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+         const Tensor& beta, double scale, const Tensor& out,
+         const Tensor& workspace, const Tensor& A_log, const Tensor& dt_bias,
+         double lower_bound, std::optional<Tensor> initial_state,
+         std::optional<Tensor> final_state, std::optional<Tensor> cu_seqlens,
+         std::optional<Tensor> checkpoint_state,
+         std::optional<Tensor> checkpoint_offsets, int64_t mode) {
+  fwd_impl(q, k, v, g, beta, scale, out, workspace, A_log, dt_bias,
+           lower_bound, initial_state, final_state, cu_seqlens,
+           checkpoint_state, checkpoint_offsets, mode, nullptr);
+}
+
+// Kimi-K3: the prefill with the Q|K|V short convolution in K1's load path.
+// mixed_qkv: (T, 3P) raw rows (unit column stride, 16 B aligned rows);
+// conv_weight (3P, 4) FP32; conv_state (lines, 3P, >= 3) bf16 or FP32,
+// updated in place; v_out (1, T, H, 128) receives the V plane's conv output
+// (K2's v). Same outputs as qkv_conv followed by fwd.
+void fwd_conv(const Tensor& mixed_qkv, const Tensor& conv_weight,
+              const Tensor& conv_state, const Tensor& cache_indices,
+              const Tensor& has_initial_state, int64_t null_block_id,
+              const Tensor& v_out, const Tensor& g, const Tensor& beta,
+              double scale, const Tensor& out, const Tensor& workspace,
+              const Tensor& A_log, const Tensor& dt_bias, double lower_bound,
+              std::optional<Tensor> initial_state,
+              std::optional<Tensor> final_state,
+              std::optional<Tensor> cu_seqlens,
+              std::optional<Tensor> checkpoint_state,
+              std::optional<Tensor> checkpoint_offsets, int64_t mode) {
+  STD_TORCH_CHECK((mode & 1) != 0, "fwd_conv: the conv runs in K1 (mode bit 0)");
+  STD_TORCH_CHECK(v_out.dim() == 4 && v_out.size(0) == 1 &&
+                      v_out.size(3) == 128 && v_out.is_contiguous() &&
+                      v_out.scalar_type() == ScalarType::BFloat16,
+                  "fwd_conv: v_out must be a contiguous bf16 (1, T, H, 128)");
+  const int64_t T = v_out.size(1), H = v_out.size(2), P = H * 128;
+  STD_TORCH_CHECK(mixed_qkv.dim() == 2 && mixed_qkv.size(0) == T &&
+                      mixed_qkv.size(1) == 3 * P && mixed_qkv.stride(1) == 1 &&
+                      mixed_qkv.stride(0) % 8 == 0 &&
+                      reinterpret_cast<uintptr_t>(mixed_qkv.const_data_ptr()) %
+                              16 ==
+                          0 &&
+                      mixed_qkv.scalar_type() == ScalarType::BFloat16,
+                  "fwd_conv: mixed_qkv must be bf16 (T, 3P) with 16 B rows");
+  STD_TORCH_CHECK(conv_weight.dim() == 2 && conv_weight.size(0) == 3 * P &&
+                      conv_weight.size(1) == 4 && conv_weight.is_contiguous() &&
+                      conv_weight.scalar_type() == ScalarType::Float,
+                  "fwd_conv: conv_weight must be contiguous FP32 (3P, 4)");
+  STD_TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == 3 * P &&
+                      conv_state.size(2) >= 3 &&
+                      (conv_state.scalar_type() == ScalarType::BFloat16 ||
+                       conv_state.scalar_type() == ScalarType::Float),
+                  "fwd_conv: conv_state must be bf16 / FP32 (lines, 3P, >= 3)");
+  STD_TORCH_CHECK(cache_indices.scalar_type() == ScalarType::Int &&
+                      cache_indices.is_contiguous() &&
+                      has_initial_state.scalar_type() == ScalarType::Bool &&
+                      has_initial_state.is_contiguous(),
+                  "fwd_conv: int32 cache_indices, bool has_initial_state");
+  ConvFuse c{};
+  c.raw = mixed_qkv.const_data_ptr();
+  c.ldx = mixed_qkv.stride(0);
+  c.w = reinterpret_cast<const float*>(conv_weight.const_data_ptr());
+  c.state = conv_state.mutable_data_ptr();
+  c.st_s0 = conv_state.stride(0);
+  c.st_s1 = conv_state.stride(1);
+  c.st_s2 = conv_state.stride(2);
+  c.cache_indices =
+      reinterpret_cast<const int32_t*>(cache_indices.const_data_ptr());
+  c.has_initial_state =
+      reinterpret_cast<const bool*>(has_initial_state.const_data_ptr());
+  c.v_out = v_out.mutable_data_ptr();
+  c.P = int(P);
+  c.null_block_id = int(null_block_id);
+  c.state_fp32 = conv_state.scalar_type() == ScalarType::Float;
+  fwd_impl(v_out, v_out, v_out, g, beta, scale, out, workspace, A_log, dt_bias,
+           lower_bound, initial_state, final_state, cu_seqlens,
+           checkpoint_state, checkpoint_offsets, mode, &c);
 }
