@@ -71,10 +71,10 @@ def mxfp8_weight(linear, family: str):
     """The stock online-MXFP8 linear's weight as (FP8 [N, K] row-major view, swizzled
     E8M0 scales as uint8): its own storage. Raises unless the linear is online MXFP8
     on a kernel whose layout is known (CuTe DSL "kn" view or row-major "nk")."""
-    from ....mxfp8 import _kernel_layout, is_online_mxfp8
+    from ....mxfp8 import _kernel_layout, is_mxfp8_linear
 
     where = getattr(linear, "prefix", type(linear).__name__)
-    if not is_online_mxfp8(linear):
+    if not is_mxfp8_linear(linear):
         raise Unsupported(
             family, None, f"{where}: {type(linear.quant_method).__name__} is not "
             "online MXFP8",
@@ -106,9 +106,9 @@ def mxfp8_weight(linear, family: str):
 def projection_rows(linear) -> int:
     """N of a linear's [N, K] weight: the BF16 one, or an online-MXFP8 one in either
     of its kernels' layouts."""
-    from ....mxfp8 import _kernel_layout, is_online_mxfp8
+    from ....mxfp8 import _kernel_layout, is_mxfp8_linear
 
-    if is_online_mxfp8(linear) and _kernel_layout(linear) == "kn":
+    if is_mxfp8_linear(linear) and _kernel_layout(linear) == "kn":
         return linear.weight.shape[1]
     return linear.weight.shape[0]
 

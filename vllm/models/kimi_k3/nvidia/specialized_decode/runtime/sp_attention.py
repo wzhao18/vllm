@@ -70,7 +70,7 @@ from ...dense_draft import is_gqa_dspark
 from ...ops.attn_res import attn_res
 from ..cutedsl.common.sp_comm import SpComm
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
-from ...mxfp8 import is_online_mxfp8
+from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
@@ -136,8 +136,8 @@ class SpAttentionBlock:
         # BF16 projections, or the online-MXFP8 KDA projections of the NVFP4
         # (modelopt_mixed) checkpoint (``gemm.mxfp8``); any other quantized layer is
         # refused, not misread.
-        mx_in = kind == "kda" and is_online_mxfp8(attention.in_proj_qkvgfab)
-        mx_out = kind == "kda" and is_online_mxfp8(attention.o_proj)
+        mx_in = kind == "kda" and is_mxfp8_linear(attention.in_proj_qkvgfab)
+        mx_out = kind == "kda" and is_mxfp8_linear(attention.o_proj)
         try:
             if kind == "dsa":
                 weight = pack_dsa_projection(attention)

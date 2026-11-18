@@ -27,7 +27,7 @@ import torch
 
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
-from ...mxfp8 import is_online_mxfp8
+from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
@@ -92,7 +92,7 @@ def shared_mxfp8(mlp):
     """True when both shared-expert projections are online MXFP8 (the NVFP4
     checkpoint), False when neither is, None when mixed."""
     shared = mlp.shared_experts
-    flags = {is_online_mxfp8(shared.gate_up_proj), is_online_mxfp8(shared.down_proj)}
+    flags = {is_mxfp8_linear(shared.gate_up_proj), is_mxfp8_linear(shared.down_proj)}
     return flags.pop() if len(flags) == 1 else None
 
 
