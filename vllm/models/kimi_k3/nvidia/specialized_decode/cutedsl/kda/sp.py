@@ -58,7 +58,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ...shapes import Choice, Path, Shape, Unsupported
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
-from . import fused_ws, specialized
+from . import flow, fused_ws, specialized
 from .fused import KdaFused
 from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
@@ -78,10 +78,10 @@ SP_SPEC_SCHEDULE = {24: ""}
 REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
-KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws")
+KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide")
+FOLDS = ("fused", "fused_ws", "wide", "flow")
 MODES = ("deferred", "triton", "none")
 
 
@@ -162,6 +162,14 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFusedWS's shared memory does not fit")
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
+    if kind == "flow":
+        if not record or tokens < 2:
+            raise Unsupported("kda", shape, "KdaFlow runs RecoverSSM record steps only")
+        stages = flow.max_stages(tokens, *streamed, conv_size, limit)
+        if not stages:
+            raise Unsupported("kda", shape, "KdaFlow's shared memory does not fit")
+        ctas = min(items, sms)
+        return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
         if size > min(specialized.SMEM_LIMIT, limit):
