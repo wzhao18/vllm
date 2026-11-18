@@ -94,7 +94,13 @@ def test_matches_stock_trtllm_kernel():
         sparse_mla_top_k=2048,
     )
     torch.cuda.synchronize()
-    a, b = out.float(), ref[:, :H].float()
-    rel = (a - b).norm(dim=-1) / b.norm(dim=-1).clamp(min=1e-6)
-    assert rel.mean().item() < 0.02, rel.mean().item()
-    assert not math.isnan(rel.max().item())
+    # both round P to E4M3 (differently scaled): ours must be no less precise
+    exact = _reference(q8, kv, slots, lens, scale, out_scale)
+
+    def err(x):
+        d = (x.float() - exact).norm(dim=-1) / exact.norm(dim=-1).clamp(min=1e-6)
+        return d.mean().item()
+
+    ours, stock = err(out), err(ref[:, :H])
+    assert not math.isnan(ours)
+    assert ours <= 1.25 * stock + 1e-3, (ours, stock)

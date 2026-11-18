@@ -309,11 +309,14 @@ class SparseMlaPrefill:
     """``loaders`` cp.async row-loader warps; ``grid`` persistent CTAs (one per SM)."""
 
     def __init__(self, loaders: int, grid: int, pipelined: bool = False,
-                 tma: bool = False, regs: tuple = ()):
+                 tma: bool = False, regs: tuple = (),
+                 softmax_shift: tuple = (P_PRE, THR)):
         self.loaders, self.grid, self.pipelined = loaders, grid, pipelined
         # tma: loaders issue TMA tile::gather4 (one lane per 4-row quad) instead of
         # cp.async rows; regs: (softmax, other) setmaxnreg counts per warpgroup
         self.tma, self.regs = tma, regs
+        # (P_PRE, THR): P = 2^(x - m + P_PRE) <= 2^(P_PRE + THR) < 448 (E4M3 max)
+        self.p_pre, self.thr = softmax_shift
         # pipelined: two S^T and P^T buffers (all 576 TMEM columns, exclusive) and
         # the MMA order QK(t + 1) before PV(t), so softmax(t + 1) overlaps PV(t)
         self.c_o = C_O_PIPE if pipelined else C_O
@@ -669,7 +672,7 @@ class SparseMlaPrefill:
                 for k4 in cutlass.range_constexpr(HW // 4):
                     m4 = ld_shared_v4f(base + Uint32(OFF_M + (wg * HW + 4 * k4) * 4))
                     for u in cutlass.range_constexpr(4):
-                        if sv[4 * k4 + u] > m4[u] + Float32(THR):
+                        if sv[4 * k4 + u] > m4[u] + Float32(self.thr):
                             grow = Int32(1)
                 anyg = cute.arch.vote_any_sync(grow != 0)
                 alb = base + Uint32(OFF_AL) + Uint32(g % 2) * Uint32(2 * HW * 4)
@@ -692,7 +695,7 @@ class SparseMlaPrefill:
                             mt = cute.arch.fmax(mt, ld_shared_f32(
                                 base + Uint32(OFF_RED + ((wg * 4 + w) * HW + r) * 4)))
                         mo = ld_shared_f32(base + Uint32(OFF_M + (wg * HW + r) * 4))
-                        if mt > mo + Float32(THR):
+                        if mt > mo + Float32(self.thr):
                             st_shared_f32(alb + Uint32((wg * HW + r) * 4), ex2(mo - mt))
                             st_shared_f32(base + Uint32(OFF_M + (wg * HW + r) * 4), mt)
                     named_bar(1 + wg, 128)
@@ -714,10 +717,10 @@ class SparseMlaPrefill:
                     k = 4 * i
                     m4 = ld_shared_v4f(base + Uint32(OFF_M + (wg * HW + k) * 4))
                     a4 = ld_shared_v4f(alb + Uint32((wg * HW + k) * 4))
-                    w0 = cvt_e4m3x2(ex2(sv[k] - m4[0] + Float32(P_PRE)),
-                                    ex2(sv[k + 1] - m4[1] + Float32(P_PRE)))
-                    w1 = cvt_e4m3x2(ex2(sv[k + 2] - m4[2] + Float32(P_PRE)),
-                                    ex2(sv[k + 3] - m4[3] + Float32(P_PRE)))
+                    w0 = cvt_e4m3x2(ex2(sv[k] - m4[0] + Float32(self.p_pre)),
+                                    ex2(sv[k + 1] - m4[1] + Float32(self.p_pre)))
+                    w1 = cvt_e4m3x2(ex2(sv[k + 2] - m4[2] + Float32(self.p_pre)),
+                                    ex2(sv[k + 3] - m4[3] + Float32(self.p_pre)))
                     q0 = e4m3x2_roundtrip(w0)
                     q1 = e4m3x2_roundtrip(w1)
                     l[k] = l[k] * a4[0] + q0[0]
@@ -777,6 +780,7 @@ class SparseMlaPrefill:
 # Per-shape dispatch: calls of at least MIN_ROWS rows (prefill chunks) run this
 # persistent kernel; smaller ones (decode, short chunks) keep the stock kernel.
 MIN_ROWS = 1024
+DISPATCH = False
 LOADERS = 3
 PIPELINED = False
 TMA = False
@@ -789,6 +793,10 @@ def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: 
     Rubin (sm_107)."""
     from vllm.platforms import current_platform
 
+    # Not dispatched yet: at F16K it is still slower than trtllm-gen (2.8x with
+    # the current loaders, P-MLA run7/run8); enable once it wins at the shape.
+    if not DISPATCH:
+        return False
     return (
         num_heads == H
         and kv_cache_dtype in ("fp8", "fp8_e4m3")
@@ -799,8 +807,9 @@ def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: 
 
 
 @cache
-def _compiled(loaders: int, grid: int, pipelined: bool, tma: bool, regs: tuple):
-    kernel = SparseMlaPrefill(loaders, grid, pipelined, tma, regs)
+def _compiled(loaders: int, grid: int, pipelined: bool, tma: bool, regs: tuple,
+              shift: tuple):
+    kernel = SparseMlaPrefill(loaders, grid, pipelined, tma, regs, shift)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0),
             Int64(0), Float32(1.0), Float32(1.0), Int32(64), cuda.CUstream(0))
     opts = f"--ptxas-options -maxrregcount={min(255, 65536 // kernel.threads // 8 * 8)}"
@@ -811,7 +820,8 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None,
                        loaders: int = LOADERS, pipelined: bool = PIPELINED,
-                       tma: bool = TMA, regs: tuple = REGS) -> torch.Tensor:
+                       tma: bool = TMA, regs: tuple = REGS,
+                       shift: tuple = (P_PRE, THR)) -> torch.Tensor:
     """q8 [T, 96, 576] E4M3 (contiguous); kv_rows: the cache as uint8/E4M3 rows of
     576 B; slots [T, W] int32 physical slots (block * 64 + offset, -1 holes past the
     valid prefix), lengths [T] int32 valid counts; ``scale`` = softmax scale x q
@@ -825,7 +835,7 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
         return out
     sms = torch.cuda.get_device_properties(q8.device).multi_processor_count
     grid = min(sms, t)
-    fn = _compiled(loaders, grid, pipelined, tma, tuple(regs))
+    fn = _compiled(loaders, grid, pipelined, tma, tuple(regs), tuple(shift))
     stream = cuda.CUstream(torch.cuda.current_stream(q8.device).cuda_stream)
     fn(Int64(q8.data_ptr()), Int32(t), Int64(kv_rows.data_ptr()), Int32(unit_rows),
        Int64(slots.data_ptr()), Int32(slots.stride(0)), Int64(lengths.data_ptr()),

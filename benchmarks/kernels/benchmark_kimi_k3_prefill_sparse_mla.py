@@ -83,6 +83,7 @@ def main():
     ap.add_argument("--json", default=None)
     ap.add_argument("--only", default="")
     ap.add_argument("--loaders", default="3,5")
+    ap.add_argument("--qmag", type=float, default=1.0)
     a = ap.parse_args()
     dev = torch.device("cuda")
     torch.manual_seed(0)
@@ -94,7 +95,8 @@ def main():
     )
 
     layers = [make_layer(F, a.ctx, a.reqs, dev, 17 + i) for i in range(a.layers)]
-    q_in = [torch.randn(F, H, P + R, device=dev, dtype=torch.bfloat16) for _ in range(2)]
+    q_in = [torch.randn(F, H, P + R, device=dev, dtype=torch.bfloat16) * a.qmag
+            for _ in range(2)]
     W_UK_T = torch.randn(H, P, L, device=dev, dtype=torch.bfloat16) * 0.05
     W_UV = torch.randn(H, L, V, device=dev, dtype=torch.bfloat16) * 0.05
     gate = torch.randn(F, H * V, device=dev, dtype=torch.bfloat16)
@@ -191,15 +193,16 @@ def main():
 
         vr_out = torch.empty(F, H, L, device=dev, dtype=torch.bfloat16)
         for var in a.loaders.split(","):
-            nl, pp, tm, rg = (int(v) for v in (var.split(":") + ["0", "0", "0"])[:4])
-            tag = f"l{nl}p{pp}t{tm}r{rg}"
+            nl, pp, tm, rg, sh = (int(v) for v in (var.split(":") + ["0"] * 4)[:5])
+            tag = f"l{nl}p{pp}t{tm}r{rg}s{sh}"
             regs = (184, 72) if rg else ()
+            shift = ((7, 1.0), (4, 4.5), (0, 8.0))[sh]
 
-            def vr(i, nl=nl, pp=pp, tm=tm, regs=regs):
+            def vr(i, nl=nl, pp=pp, tm=tm, regs=regs, shift=shift):
                 kv, idx = layers[i % len(layers)]
                 sparse_mla_prefill(qf3, kv.view(-1, 576), 64, idx, seq, 0.0722, 1.0,
                                    out=vr_out, loaders=nl, pipelined=bool(pp),
-                                   tma=bool(tm), regs=regs)
+                                   tma=bool(tm), regs=regs, shift=shift)
 
             vr(0)
             attn(0)  # the stock output of the same layer
