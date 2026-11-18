@@ -1,0 +1,5479 @@
+{
+ "model": "Kimi K3.1-Pro (d9e99b07) + DSpark draft (e4e6e626)",
+ "generated_by": "solmodel_work/gen_ops.py",
+ "conventions": {
+  "bytes_and_flops": "FULL op (unsharded); topology model divides by its shard_axis",
+  "flops": "multiply-add = 2 FLOPs; elementwise ops counted approximately",
+  "formulas": "python expressions over symbols + constants; PREFILL bool, CKPT (0/1 prefix-cache checkpoint export), SCRATCH (0/1 materialized indexer logits), E_ACT (experts touched) are switches",
+  "layer_index": "0-based: config lists are 1-based (is_kda_layer(l) = l+1 in kda_layers, kimi_linear.py:225-235). KDA idx {0,1,2,4,5,6,...,90}; DSA idx {3,7,...,91,92}; layer 0 = KDA + dense MLP; layers 1..92 MoE",
+  "ridge_flop_per_byte": {
+   "bf16_mma": 259.0,
+   "mxf8f6f4_mma (fp8 rate)": 755.4,
+   "mxf4 mma (block-scaled FP4 x FP4)": 1259.0,
+   "fp32_simt": 9.5
+  }
+ },
+ "symbols": {
+  "T": "token rows of the forward (prefill: chunk tokens; decode/verify: B*q)",
+  "B": "requests in the step",
+  "k": "draft tokens per request (DSpark num_speculative_tokens)",
+  "q": "verify rows per request in decode = 1 + k",
+  "L": "context length (KV tokens incl. this step's) of a request",
+  "Lsum": "sum over query rows of visible keys (prefill chunk of C tokens after prefix P: C*P + C*(C+1)/2; decode: B*q*L)",
+  "Ltk": "sum over query rows of min(visible keys, TOPK) (keys a sparse-MLA row reads)",
+  "Lu": "sum over requests of unique context keys touched this step (HBM SOL: each request's cache read once; prefill: P+C, decode: L)",
+  "R": "rows through lm_head (prefill: B last-token rows; decode: B*q)",
+  "AL": "accepted tokens per request per step (incl. bonus)",
+  "Tc": "DSpark context rows (prefill: T, SOL min(T, D_W) per request; decode stock: B*q, SOL: B*AL)",
+  "Tq": "DSpark query rows = B*k (sample_from_anchor: k rows per request)",
+  "nseq": "sequences in a prefill chunk (state read/write count)"
+ },
+ "constants": {
+  "H": 7168,
+  "V": 163840,
+  "NL": 93,
+  "N_KDA": 69,
+  "N_DSA": 24,
+  "N_MOE": 92,
+  "N_DENSE": 1,
+  "Hk": 96,
+  "dk": 128,
+  "dv": 128,
+  "P": 12288,
+  "CONV": 4,
+  "C_KDA": 16,
+  "Nh": 96,
+  "QLR": 1536,
+  "KVL": 512,
+  "DN": 128,
+  "DR": 64,
+  "DQK": 192,
+  "DV": 128,
+  "TOPK": 2048,
+  "MLA_ROW": 656,
+  "Ni": 32,
+  "Di": 128,
+  "IDX_ROW": 68,
+  "E": 896,
+  "TOPK_E": 16,
+  "LAT": 3584,
+  "I_E": 3072,
+  "I_SH": 6144,
+  "I_D": 33792,
+  "MXFP4_B": 0.53125,
+  "MXFP8_B": 1.03125,
+  "ARB": 12,
+  "NB": 8,
+  "D_L": 5,
+  "D_HQ": 96,
+  "D_HKV": 16,
+  "D_HD": 64,
+  "D_I": 14336,
+  "D_W": 2048,
+  "D_R": 512,
+  "D_AUX": 5
+ },
+ "layer_counts": {
+  "kda": 69,
+  "dsa": 24,
+  "moe": 92,
+  "dense": 1,
+  "attnres_blocks": 8,
+  "draft_layers": 5
+ },
+ "params": {
+  "embed": 1174405120,
+  "lm_head": 1174405120,
+  "kda_per_layer": 443727872,
+  "dsa_per_layer": 239632384,
+  "moe_dense_per_layer": 189923328,
+  "experts_per_layer": 29595009024,
+  "dense_mlp_layer0": 726663168,
+  "draft_per_layer": 411041792,
+  "draft_fc": 256901120,
+  "draft_markov": 167772160
+ },
+ "bytes_summary": {
+  "bf16_nonexpert_target_GB": 113.833639936,
+  "mxfp4_experts_GB": 1446.456066048,
+  "draft_bf16_GB": 4.95976448,
+  "kv_per_token_B": {
+   "mla_fp8_ds": 15744,
+   "indexer_mxfp4": 1632,
+   "total_dsa": 17376,
+   "draft_bf16_window_only": 20480
+  },
+  "kda_state_per_request_B": {
+   "recurrent_fp32": 434110464,
+   "conv_fp32_k0": 30523392
+  }
+ },
+ "ops": [
+  {
+   "id": "G.embed",
+   "name": "token embedding lookup",
+   "layer_type": "global",
+   "kind": "gather",
+   "shapes": "ids[T] -> [T, H] from table [V, H]",
+   "dtype": {
+    "act_in": "int32",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "none"
+   },
+   "flops": "0",
+   "weight_bytes": "T*H*2",
+   "act_in_bytes": "T*4",
+   "act_out_bytes": "T*H*2",
+   "shard_axis": "vocab (VocabParallelEmbedding) -> partial rows need AR / SP reduce-scatter",
+   "comm": "TP: all-reduce [T,H] bf16 (or SP: reduce-scatter, sp_embed)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1548",
+    "vllm/models/kimi_k3/nvidia/model.py:233 (sp_embed)",
+    "vllm/models/kimi_k3/nvidia/model.py:1730"
+   ],
+   "notes": "weight_bytes = rows touched only (2.35 GB table never streamed).",
+   "phase": "both",
+   "count_per_forward": "1",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "G.attnres_init",
+   "name": "AttnRes block buffer alloc/seed",
+   "layer_type": "global",
+   "kind": "elementwise",
+   "shapes": "block_residual [T, NB, H] bf16; prefix_sum = embed",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "none"
+   },
+   "flops": "0",
+   "act_out_bytes": "0",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1791-1801"
+   ],
+   "notes": "new_empty only (no traffic); blocks written by block-write layers.",
+   "phase": "both",
+   "count_per_forward": "1",
+   "weight_bytes": "0",
+   "act_in_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "L.attnres_pre",
+   "name": "AttnRes pre-attention mix + input RMSNorm (attn_res kernel)",
+   "layer_type": "all",
+   "kind": "memory",
+   "count_per_forward": "NL",
+   "shapes": "prefix[T,H] (+delta[T,H]) , blocks[T,nb,H] -> [T,H]; nb=cdiv(l,12)",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16 (norm w, proj w [H])",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*H*8*493/NL",
+   "weight_bytes": "2*H*2*2",
+   "act_in_bytes": "T*H*2*(493/NL + 1)",
+   "act_out_bytes": "T*H*2*(1 + 8/93)",
+   "shard_axis": "token-parallel (replicated weights); runs on the rank's token shard under SP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1383-1412",
+    "vllm/models/kimi_k3/nvidia/ops/attn_res.py:35-168",
+    "vllm/models/kimi_k3/nvidia/ops/attn_res.py:170"
+   ],
+   "notes": "Per token: rmsnorm of each source (dot with norm_w*qk_w) -> softmax over sources -> weighted sum -> output RMSNorm(input_layernorm). Sum over 93 layers of sources = 493 (avg 5.30); +1 read for delta, block-write layers (l%12==0, 8 of them) store prefix into blocks. Memory-bound in every regime (AI ~4 FLOP/B).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "L.attnres_post",
+   "name": "AttnRes post-attention mix + post_attention RMSNorm",
+   "layer_type": "all",
+   "kind": "memory",
+   "count_per_forward": "NL",
+   "shapes": "prefix[T,H], delta=attn_out[T,H], blocks[T,nb',H] -> [T,H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*H*8*501/NL",
+   "weight_bytes": "2*H*2*2",
+   "act_in_bytes": "T*H*2*(501/NL + 1)",
+   "act_out_bytes": "T*H*2*2",
+   "shard_axis": "token-parallel",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1414-1449"
+   ],
+   "notes": "sum of sources over layers = 501; delta add writes prefix back (BF16).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "L.sp_gather",
+   "name": "SP all-gather of attention input (topology-dependent)",
+   "layer_type": "all",
+   "kind": "comm",
+   "count_per_forward": "NL",
+   "shapes": "[T/tp, H] -> [T, H] bf16",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "none"
+   },
+   "flops": "0",
+   "act_in_bytes": "T*H*2",
+   "act_out_bytes": "T*H*2",
+   "comm": "SP/TP: all-gather T*H*2 bytes per layer (only when attention is head-sharded and the stream is token-sharded)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1464-1468",
+    "vllm/models/kimi_k3/nvidia/ops/sp_all_gather.py"
+   ],
+   "notes": "Present only in SP topologies (C512 hybrid). Listed so the topology model can switch it on.",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "comm",
+   "bound_decode_ref": "comm"
+  },
+  {
+   "id": "KDA.in_proj",
+   "name": "in_proj_qkvgfab (q|k|v|g full-rank, f_a low-rank gate, beta)",
+   "layer_type": "kda",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_KDA",
+   "shapes": "[T, H] x [H, 4*P + dk + Hk] -> [T, 4*P + dk + Hk]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(4*P + dk + Hk)",
+   "weight_bytes": "(H)*(4*P + dk + Hk)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(4*P + dk + Hk)*2",
+   "shard_axis": "N: q/k/v/g/beta head-sharded over TP; f_a (128) replicated",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:666-693",
+    "vllm/models/kimi_k3/nvidia/kda.py:1001-1015"
+   ],
+   "notes": "N = 4*12288 + 128 + 96 = 49376 (+pad to 16). 353.9M params, 708 MB BF16 per layer (the largest attention weight; 48.8 GB over 69 layers).",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "KDA.f_b_proj",
+   "name": "f_b_proj (gate up-projection 128 -> 12288)",
+   "layer_type": "kda",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_KDA",
+   "shapes": "[T, dk] x [dk, P] -> [T, P]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(dk)*(P)",
+   "weight_bytes": "(dk)*(P)*2",
+   "act_in_bytes": "(T)*(dk)*2",
+   "act_out_bytes": "(T)*(P)*2",
+   "shard_axis": "N (heads)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:695-701",
+    "vllm/models/kimi_k3/nvidia/kda.py:1016"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "KDA.conv",
+   "name": "short causal depthwise conv (q,k,v; width 4) + SiLU",
+   "layer_type": "kda",
+   "kind": "elementwise",
+   "count_per_forward": "N_KDA",
+   "shapes": "[T, 3P] with FP32 weight [3P, 4], conv state [3P, CONV-1+k] fp32 per request",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "fp32",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*3*P*(2*CONV + 4)",
+   "weight_bytes": "3*P*CONV*4",
+   "act_in_bytes": "T*3*P*2",
+   "act_out_bytes": "T*3*P*2",
+   "state_read_bytes": "(nseq if PREFILL else B)*3*P*(CONV-1)*4",
+   "state_write_bytes": "(nseq if PREFILL else B)*3*P*(CONV-1+(0 if PREFILL else k))*4",
+   "shard_axis": "channels (heads) over TP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:707-716",
+    "vllm/models/kimi_k3/nvidia/kda.py:1405-1488",
+    "vllm/models/kimi_k3/nvidia/ops/kda_conv.py",
+    "vllm/model_executor/layers/mamba/mamba_utils.py:296-319"
+   ],
+   "notes": "Fused into the in_proj epilogue / decode kernel in the specialized decode (cutedsl/kda/inproj64.py). Conv state dtype = mamba_cache_dtype (FP32 per mission). Decode cache holds CONV-1+k columns (num_spec). SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "KDA.gate_beta_norm",
+   "name": "KDA gate g=lb*sigmoid(A*(g1+dt_bias)), beta=sigmoid, q/k L2 norm",
+   "layer_type": "kda",
+   "kind": "elementwise",
+   "count_per_forward": "N_KDA",
+   "shapes": "g1[T,P], beta[T,Hk], q,k [T,Hk,dk]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "fp32 (A_log[Hk], dt_bias[P])",
+    "out": "fp32 regs",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*(P*6 + Hk*4 + 2*Hk*dk*3)",
+   "weight_bytes": "(Hk + P)*4",
+   "act_in_bytes": "0",
+   "act_out_bytes": "0",
+   "shard_axis": "heads",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/ops/recoverssm.py:18-60",
+    "vllm/models/kimi_k3/nvidia/kda.py:702-704",
+    "vllm/models/kimi_k3/nvidia/kda.py:845-848"
+   ],
+   "notes": "Always fused into the KDA core kernel (no separate traffic). gate_lower_bound=-5. SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "KDA.core_prefill",
+   "name": "chunked KDA (FlashKDA K1+K2, segscan) with FP32 state",
+   "layer_type": "kda",
+   "kind": "attention",
+   "phase": "prefill",
+   "count_per_forward": "N_KDA",
+   "shapes": "q,k,v [T,Hk,dk], g [T,Hk,dk], beta [T,Hk]; state [nseq,Hk,dk,dv] fp32",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "bf16_mma (state staged bf16 into k.S / q.S MMAs, fp32 accum/state)"
+   },
+   "flops": "T*Hk*(2*C_KDA*(3*dk + 2*dv) + 6*dk*dv + (2/3)*C_KDA**2)",
+   "act_in_bytes": "T*Hk*(3*dk*2 + dk*2 + 2)",
+   "act_out_bytes": "T*Hk*dv*2",
+   "state_read_bytes": "nseq*Hk*dk*dv*4",
+   "state_write_bytes": "nseq*Hk*dk*dv*4*(1 + CKPT)",
+   "shard_axis": "heads over TP (96 heads); segscan splits long sequences into segments",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:1490-1620",
+    "vllm/models/kimi_k3/nvidia/ops/kda_segscan.py:1-60",
+    "vllm/models/kimi_k3/nvidia/kda.py:421-476"
+   ],
+   "notes": "FLOPs per token per head with chunk C: 2C(3dk+2dv) [KK^T, QK^T, W=A(Kg b), U=A(Vb), intra O] + 6 dk dv [W.S, q.S, K^T.Vnew] + (2/3)C^2 [triangular inverse]; C=16 (FlashKDA) -> 119K, C=64 -> 183K FLOP/token/head. Segment-parallel scan (segscan) adds ~2x K2 state flops on segmented sequences (M_p, C_p) -- derate term, not SOL. CKPT=1 when a prefix-cache checkpoint state is exported for the chunk (mamba align mode), else 0. Serial K2 over chunks: parallelism limited to Hk/tp x nseq CTAs pairs (latency term).",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "n/a"
+  },
+  {
+   "id": "KDA.core_decode",
+   "name": "KDA verify recurrence (q rows/request) + deferred RecoverSSM commit",
+   "layer_type": "kda",
+   "kind": "attention",
+   "phase": "decode",
+   "count_per_forward": "N_KDA",
+   "shapes": "q,k,v,g [B*q,Hk,dk]; state [B,Hk,dk,dv] fp32; records u,kg [B,q,Hk,dk] bf16",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "fp32_simt (FP32 state)"
+   },
+   "flops": "B*q*Hk*7*dk*dv + B*AL*Hk*3*dk*dv",
+   "act_in_bytes": "B*q*Hk*(4*dk*2 + 2)",
+   "act_out_bytes": "B*q*Hk*dv*2",
+   "state_read_bytes": "B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2",
+   "state_write_bytes": "B*Hk*dk*dv*4 + B*q*Hk*(dk+dv)*2",
+   "shard_axis": "heads over TP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:1060-1146",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/recoverssm/__init__.py:1-30",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/commit.py:1-20",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify.py:1-10",
+    "vllm/model_executor/layers/mamba/mamba_utils.py:133-149"
+   ],
+   "notes": "Per verify row per head: decay (dk dv), S^T k (2 dk dv), rank-1 update (2 dk dv), q.S (2 dk dv) = 7 dk dv; deferred commit folds the previous step's AL accepted tokens (decay + outer product ~3 dk dv each) in the same pass. SOL traffic: FP32 state read once + written once per request per layer = 2*96*128*128*4 = 12.6 MB (869 MB per request per step over 69 layers) -- THE dominant decode byte term. Records (verify corrections + key-gates, bf16) are written and read back next step. Non-deferred alternatives: stock RecoverSSM commit after sampling (read S twice, write once) or q-slot state writes (write q states).",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "KDA.o_norm",
+   "name": "gated RMSNorm (o_norm, sigmoid(g2) gate, per-head 128)",
+   "layer_type": "kda",
+   "kind": "elementwise",
+   "count_per_forward": "N_KDA",
+   "shapes": "[T,Hk,dv] x gate [T,Hk,dv] -> [T,P]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16/fp32 [dv]",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*P*8",
+   "weight_bytes": "dv*4",
+   "act_in_bytes": "T*P*2*2",
+   "act_out_bytes": "T*P*2",
+   "shard_axis": "heads",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:913",
+    "vllm/models/kimi_k3/nvidia/kda.py:1720-1736",
+    "vllm/models/kimi_k3/nvidia/ops/kda_norm.py"
+   ],
+   "notes": "Fused into the decode kernel (output_gate / norm_weight args); separate in prefill. SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "KDA.o_proj",
+   "name": "o_proj 12288 -> 7168",
+   "layer_type": "kda",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_KDA",
+   "shapes": "[T, P] x [P, H] -> [T, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(P)*(H)",
+   "weight_bytes": "(P)*(H)*2",
+   "act_in_bytes": "(T)*(P)*2",
+   "act_out_bytes": "(T)*(H)*2",
+   "shard_axis": "K (row-parallel): partial sums -> all-reduce / reduce-scatter",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/kda.py:932-951",
+    "vllm/models/kimi_k3/nvidia/kda.py:1047-1058"
+   ],
+   "notes": "",
+   "comm": "TP: all-reduce (or RS under SP) of [T,H] bf16 partial sums; fused GEMM-AR (gemm_rs_ar) available",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.qkv_a_packed",
+   "name": "packed [q_a | kv_a(+k_pe) | indexer wk | indexer weights_proj]",
+   "layer_type": "dsa",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_DSA",
+   "shapes": "[T, H] x [H, QLR + KVL + DR + Di + Ni] -> [T, QLR + KVL + DR + Di + Ni]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(QLR + KVL + DR + Di + Ni)",
+   "weight_bytes": "(H)*(QLR + KVL + DR + Di + Ni)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(QLR + KVL + DR + Di + Ni)*2",
+   "shard_axis": "replicated (disable_tp) in TP; under DSA-DP owned by one card",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:533-540",
+    "vllm/models/kimi_k3/nvidia/dsa.py:189-196",
+    "vllm/models/kimi_k3/nvidia/dsa.py:773-820",
+    "vllm/models/kimi_k3/nvidia/dsa.py:897-913"
+   ],
+   "notes": "N = 1536+512+64+128+32 = 2272. k_pe exists although the model is NoPE (mla_use_nope): the 64 dims are stored, not rotated.",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.prologue",
+   "name": "fused prologue: q_a RMSNorm, kv_a RMSNorm, FP8 MLA KV insert, indexer key LayerNorm + MXFP4 quant + insert",
+   "layer_type": "dsa",
+   "kind": "elementwise",
+   "count_per_forward": "N_DSA",
+   "shapes": "q_c[T,1536], kv_c[T,512], k_pe[T,64], idx_k[T,128] -> caches",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16/fp32 norm weights",
+    "out": "bf16 q_c; fp8_ds_mla; mxfp4",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*(QLR*4 + KVL*6 + Di*10)",
+   "weight_bytes": "(QLR + KVL)*2 + Di*8",
+   "act_in_bytes": "T*(QLR + KVL + DR + Di)*2",
+   "act_out_bytes": "T*QLR*2 + T*KVL*2",
+   "kv_write_bytes": "T*(MLA_ROW + IDX_ROW)",
+   "shard_axis": "token rows (replicated in TP: every rank writes its own copy unless DCP/DSA-DP stores KV once)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:922-948",
+    "vllm/models/kimi_k3/nvidia/ops/dsa_indexer.py",
+    "vllm/models/kimi_k3/nvidia/ops/dsa_indexer_mxfp4.py:1-20",
+    "vllm/models/kimi_k3/common/dsa_cache.py:58-63",
+    "vllm/v1/attention/backends/mla/flashmla_sparse.py:157-166"
+   ],
+   "notes": "fp8_ds_mla row = 656 B (512 FP8 latent + 4 fp32 scales + 64 bf16 rope); MXFP4 indexer key = 68 B. kv_c_normed (bf16) also kept for the prefill path.",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.qb_wq_packed",
+   "name": "packed [q_b (96 x 192) | indexer wq (32 x 128)]",
+   "layer_type": "dsa",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_DSA",
+   "shapes": "[T, QLR] x [QLR, Nh*DQK + Ni*Di] -> [T, Nh*DQK + Ni*Di]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(QLR)*(Nh*DQK + Ni*Di)",
+   "weight_bytes": "(QLR)*(Nh*DQK + Ni*Di)*2",
+   "act_in_bytes": "(T)*(QLR)*2",
+   "act_out_bytes": "(T)*(Nh*DQK + Ni*Di)*2",
+   "shard_axis": "N: q_b head-sharded over TP; wq_index replicated (indexer scored per rank)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:544-551",
+    "vllm/models/kimi_k3/nvidia/dsa.py:179-185",
+    "vllm/models/kimi_k3/nvidia/dsa.py:950-963"
+   ],
+   "notes": "N = 18432 + 4096 = 22528.",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.g_proj",
+   "name": "output-gate projection 7168 -> 96*128",
+   "layer_type": "dsa",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_DSA",
+   "shapes": "[T, H] x [H, Nh*DV] -> [T, Nh*DV]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(Nh*DV)",
+   "weight_bytes": "(H)*(Nh*DV)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(Nh*DV)*2",
+   "shard_axis": "N (heads)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:626-636",
+    "vllm/models/kimi_k3/nvidia/dsa.py:855-866"
+   ],
+   "notes": "Runs on an aux stream overlapping the attention front-end for small batches.",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.idx_q_quant",
+   "name": "indexer query MXFP4 quant + head-weight fold",
+   "layer_type": "dsa",
+   "kind": "elementwise",
+   "count_per_forward": "N_DSA",
+   "shapes": "index_q [T,32,128] bf16 -> E2M1 [T,32,64] + scales; weights [T,32]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "mxfp4",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*Ni*Di*4",
+   "act_in_bytes": "T*(Ni*Di + Ni)*2",
+   "act_out_bytes": "T*Ni*(Di/2 + 4 + 4)",
+   "shard_axis": "rows",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:420-440",
+    "vllm/models/kimi_k3/nvidia/ops/dsa_indexer_mxfp4.py"
+   ],
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "DSA.idx_score",
+   "name": "indexer scoring logits[t,s]=sum_h w[t,h]*relu(q[t,h].k[s]) over the full context",
+   "layer_type": "dsa",
+   "kind": "attention",
+   "count_per_forward": "N_DSA",
+   "shapes": "q [T,32,128] mxfp4, keys [L,128] mxfp4 (68 B) -> logits [T, L]",
+   "dtype": {
+    "act_in": "mxfp4",
+    "weight": "-",
+    "out": "bf16 logits (scratch) / fp32",
+    "compute": "mxf4 mma (block-scaled FP4 x FP4)"
+   },
+   "flops": "2*Ni*Di*Lsum + 3*Ni*Lsum",
+   "kv_read_bytes": "Lu*IDX_ROW",
+   "act_in_bytes": "T*Ni*(Di/2+8)",
+   "act_out_bytes": "Lsum*2*SCRATCH",
+   "shard_axis": "TP: every rank scores the whole context (replicated) unless DCP splits keys / DSA-DP gives the request to one card / ShardQ splits query rows",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:420-472",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/indexer.py:1-40",
+    "vllm/model_executor/layers/sparse_attn_indexer.py"
+   ],
+   "notes": "Prefill: causal, Lsum = C*P + C(C+1)/2 per request. Skipped for rows with L <= TOPK (short-context bypass). Decode: one [128 keys x q*32] MMA per tile reads every key once per request per step (kv_read = L*68 B), FLOPs 2*32*128*q*L. SCRATCH=1 when logits are materialized (stock + current specialized: BF16 [T,L] write + read by select); SCRATCH=0 for a fused score+select (new method). At L=135K: 26.5 GFLOP per query row over 24 layers.",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.topk",
+   "name": "exact top-2048 over L logits per row (radix select)",
+   "layer_type": "dsa",
+   "kind": "memory",
+   "count_per_forward": "N_DSA",
+   "shapes": "logits [T, L] -> indices [T, 2048] int32",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "int32",
+    "compute": "int/simt"
+   },
+   "flops": "Lsum*4",
+   "act_in_bytes": "Lsum*2*SCRATCH",
+   "act_out_bytes": "T*TOPK*4",
+   "shard_axis": "rows; under DCP each rank selects a local top-k then a merge exchange",
+   "comm": "DCP: local top-k candidates exchanged (decode packed top-N merge, prefill histogram merge) -- size T*TOPK*(4..8) B per rank",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/indexer.py:20-30",
+    "vllm/models/kimi_k3/nvidia/dsa.py:270-296",
+    "vllm/models/kimi_k3/nvidia/dsa_kernels/dcp_prefill_topk_merge/hist_merge.py"
+   ],
+   "notes": "Exact (mission). Also converts logical -> physical KV slots.",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.w_uk",
+   "name": "W_UK absorption: q_nope [T,96,128] x W_UK^T [96,128,512] -> q_lat",
+   "layer_type": "dsa",
+   "kind": "gemm",
+   "count_per_forward": "N_DSA",
+   "shapes": "bmm over 96 heads: [T,128]x[128,512]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16 (kv_b_proj first half)",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*T*Nh*DN*KVL",
+   "weight_bytes": "Nh*DN*KVL*2",
+   "act_in_bytes": "T*Nh*DN*2",
+   "act_out_bytes": "T*Nh*(KVL+DR)*2",
+   "shard_axis": "heads",
+   "cite": [
+    "vllm/model_executor/layers/attention/mla_attention.py:55-120",
+    "vllm/model_executor/layers/attention/mla_attention.py:419",
+    "vllm/model_executor/layers/attention/sparse_mla_attention.py:1006"
+   ],
+   "notes": "kv_b_proj [512 -> 96*(128+128)] (12.6M params) is split into W_UK / W_UV; with contexts > TOPK both prefill and decode run the absorbed MQA path (dense MHA prefill only when prefill_max_seq_len <= 2048, sparse_mla_attention.py:172). Query row = 512 latent + 64 rope = 576.",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.sparse_mla",
+   "name": "sparse MLA (FlashMLA sparse, absorbed MQA) over top-2048",
+   "layer_type": "dsa",
+   "kind": "attention",
+   "count_per_forward": "N_DSA",
+   "shapes": "q [T,96,576] bf16; KV gathered [T,2048,576] fp8_ds_mla -> o_lat [T,96,512]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "bf16_mma (FP8 KV dequantized to BF16 on load)"
+   },
+   "flops": "2*Nh*(KVL+DR+KVL)*Ltk + 4*Nh*Ltk",
+   "kv_read_bytes": "(min(Lu, Ltk) if PREFILL else Ltk)*MLA_ROW",
+   "l2_gather_bytes": "Ltk*MLA_ROW",
+   "act_in_bytes": "T*Nh*(KVL+DR)*2",
+   "act_out_bytes": "T*Nh*KVL*2",
+   "shard_axis": "heads (TP: 96/tp heads, decode pads to 64/rank); DCP: keys; DSA-DP: request owner",
+   "cite": [
+    "vllm/model_executor/layers/attention/sparse_mla_attention.py:1006-1168",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/attn_ds.py:1-40",
+    "vllm/models/kimi_k3/nvidia/dsa.py:965-976"
+   ],
+   "notes": "l2_gather_bytes = gathered volume (every row reads its 2048 rows: 1.34 MB/row/layer). kv_read_bytes = HBM SOL: prefill unique rows min(Lu, Ltk)*656 (each request's cache once); decode Ltk*656 (no cross-row dedupe; dedupe lower bound B*2048*656) -- in prefill the request's whole cache (L*656 = 88.6 MB/layer at 135K) fits L2 (132 MB) so gather hits L2; in decode q verify rows of a request overlap heavily (union <= q*2048). Intensity on gathered bytes = 2*96*1088/656 = 318 FLOP/B (BF16 ridge 259) -> compute-bound-ish if L2-fed; decode is gather/latency bound. Rows with L<=2048 attend all L keys (Ltk counts min(L, TOPK)).",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "DSA.w_uv",
+   "name": "W_UV: o_lat [T,96,512] x W_UV [96,512,128] -> [T,96*128]",
+   "layer_type": "dsa",
+   "kind": "gemm",
+   "count_per_forward": "N_DSA",
+   "shapes": "bmm over 96 heads: [T,512]x[512,128]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16 (kv_b_proj second half)",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*T*Nh*KVL*DV",
+   "weight_bytes": "Nh*KVL*DV*2",
+   "act_in_bytes": "T*Nh*KVL*2",
+   "act_out_bytes": "T*Nh*DV*2",
+   "shard_axis": "heads",
+   "cite": [
+    "vllm/model_executor/layers/attention/mla_attention.py:116",
+    "vllm/model_executor/layers/attention/mla_attention.py:494-500"
+   ],
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DSA.gate_mul",
+   "name": "output gate sigmoid(g) * attn_out",
+   "layer_type": "dsa",
+   "kind": "elementwise",
+   "count_per_forward": "N_DSA",
+   "shapes": "[T, 12288] x [T, 12288]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*Nh*DV*5",
+   "act_in_bytes": "T*Nh*DV*2*2",
+   "act_out_bytes": "T*Nh*DV*2",
+   "shard_axis": "heads",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:868-875",
+    "vllm/models/kimi_k3/nvidia/mla.py:121-124"
+   ],
+   "notes": "Fusable into o_proj prologue (mxfp8 variant: gate_sigmoid_mul_quantize). SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "DSA.o_proj",
+   "name": "o_proj 12288 -> 7168",
+   "layer_type": "dsa",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_DSA",
+   "shapes": "[T, Nh*DV] x [Nh*DV, H] -> [T, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(Nh*DV)*(H)",
+   "weight_bytes": "(Nh*DV)*(H)*2",
+   "act_in_bytes": "(T)*(Nh*DV)*2",
+   "act_out_bytes": "(T)*(H)*2",
+   "shard_axis": "K (row-parallel) -> AR/RS",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dsa.py:576-582",
+    "vllm/models/kimi_k3/nvidia/dsa.py:877-887"
+   ],
+   "notes": "",
+   "comm": "TP: all-reduce / reduce-scatter [T,H] bf16 partial sums; DSA-DP: push_out of o (or o_lat) rows back to the TP group before o_proj",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.router",
+   "name": "router gate 7168 -> 896 (fp32 logits)",
+   "layer_type": "moe",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T, H] x [H, E] -> [T, E]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "fp32",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(E)",
+   "weight_bytes": "(H)*(E)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(E)*4",
+   "shard_axis": "replicated (token-parallel)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:684-691",
+    "vllm/model_executor/layers/fused_moe/router/gate_linear.py:25-110"
+   ],
+   "notes": "bf16 x bf16 -> fp32 cuBLAS; overlaps routed down-proj on an aux stream (<=256 tokens).",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.topk",
+   "name": "sigmoid + e_score_correction_bias, top-16 of 896, renormalize",
+   "layer_type": "moe",
+   "kind": "elementwise",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T,896] fp32 -> weights [T,16] fp32, ids [T,16] int32",
+   "dtype": {
+    "act_in": "fp32",
+    "weight": "fp32 bias [896]",
+    "out": "fp32/int32",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*E*6",
+   "weight_bytes": "E*4",
+   "act_in_bytes": "T*E*4",
+   "act_out_bytes": "T*TOPK_E*8",
+   "shard_axis": "token-parallel",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:937-976",
+    "vllm/models/kimi_k3/nvidia/ops/prefill_glue.py"
+   ],
+   "notes": "noaux_tc, one expert group; routed_scaling_factor 1.0. SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "MOE.latent_down",
+   "name": "routed_expert_down_proj 7168 -> 3584 (latent)",
+   "layer_type": "moe",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T, H] x [H, LAT] -> [T, LAT]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(LAT)",
+   "weight_bytes": "(H)*(LAT)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(LAT)*2",
+   "shard_axis": "replicated (ReplicatedLinear) -> token-parallel under SP/DEP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:745-752",
+    "vllm/models/kimi_k3/nvidia/model.py:1005-1049"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.dispatch",
+   "name": "MegaMoE dispatch of latent rows to expert owners",
+   "layer_type": "moe",
+   "kind": "comm",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T,3584] -> T*16 (token,expert) rows; dedup per destination rank possible",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "mxfp8 (3584 + 112 B scale)",
+    "compute": "quant"
+   },
+   "flops": "T*LAT*4",
+   "act_in_bytes": "T*LAT*2",
+   "act_out_bytes": "T*TOPK_E*LAT*MXFP8_B",
+   "comm": "EP: T*min(TOPK_E, EP)*LAT*MXFP8_B bytes leave the rank in the worst case (per (token, destination rank) dedup; fraction (EP-1)/EP remote). In-kernel (fused dispatch, symmetric memory).",
+   "shard_axis": "experts over EP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/megamoe_rubin/experts.py:1-30",
+    "vllm/models/kimi_k3/nvidia/megamoe_rubin/runtime.py:1-10",
+    "vllm/models/kimi_k3/nvidia/model.py:796-819"
+   ],
+   "notes": "Activation dtype: MXFP8 up to 512 tokens/rank (RUBIN_MX_MAX_TOKENS_PER_RANK, experts.py:87), NVFP4 (w4a4, exact MXFP4->NVFP4 weight conversion) above -- mission allows MXFP8 activations; NVFP4 activation is an open rule question.",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "comm",
+   "bound_decode_ref": "comm"
+  },
+  {
+   "id": "MOE.fc1",
+   "name": "expert FC1 (w13 gate|up) 3584 -> 6144, MXFP4 weights x MXFP8 act",
+   "layer_type": "moe",
+   "kind": "grouped_gemm",
+   "count_per_forward": "N_MOE",
+   "shapes": "sum_e [m_e, 3584] x [3584, 6144]; sum m_e = T*16",
+   "dtype": {
+    "act_in": "mxfp8",
+    "weight": "mxfp4",
+    "out": "fp32 acc -> act",
+    "compute": "mxf8f6f4_mma (fp8 rate)"
+   },
+   "flops": "2*T*TOPK_E*LAT*2*I_E",
+   "weight_bytes": "E_ACT*LAT*2*I_E*MXFP4_B",
+   "act_in_bytes": "T*TOPK_E*LAT*MXFP8_B",
+   "act_out_bytes": "0",
+   "shard_axis": "experts over EP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:796-819",
+    "vllm/models/kimi_k3/nvidia/megamoe_rubin/experts.py:1-30"
+   ],
+   "notes": "E_ACT = experts touched this step = E*(1-(1-16/896)^T) (all 896 once T >~ 300); weights 11.7 MB/expert (FC1) -> 10.5 GB/layer. Rows per expert = 16T/896 = T/56: compute-bound only when T/56 >~ 200 (T >~ 11K tokens per EP group).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.act",
+   "name": "SiTU(gate)*up (+clamp) and MXFP8 requant (fused in MegaMoE)",
+   "layer_type": "moe",
+   "kind": "elementwise",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T*16, 2*3072] -> [T*16, 3072]",
+   "dtype": {
+    "act_in": "fp32",
+    "weight": "-",
+    "out": "mxfp8",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*TOPK_E*I_E*12",
+   "shard_axis": "experts",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/ops/situ_and_mul.py:36-45",
+    "vllm/models/kimi_k3/nvidia/model.py:6-38 (KimiVecSituAndMul)"
+   ],
+   "notes": "beta=4, linear_beta=25 (tanh-based SiTU). Fused (no HBM traffic). SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "weight_bytes": "0",
+   "act_in_bytes": "0",
+   "act_out_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "MOE.fc2",
+   "name": "expert FC2 (w2) 3072 -> 3584, MXFP4 weights x MXFP8 act",
+   "layer_type": "moe",
+   "kind": "grouped_gemm",
+   "count_per_forward": "N_MOE",
+   "shapes": "sum_e [m_e, 3072] x [3072, 3584]",
+   "dtype": {
+    "act_in": "mxfp8",
+    "weight": "mxfp4",
+    "out": "bf16",
+    "compute": "mxf8f6f4_mma (fp8 rate)"
+   },
+   "flops": "2*T*TOPK_E*I_E*LAT",
+   "weight_bytes": "E_ACT*I_E*LAT*MXFP4_B",
+   "act_out_bytes": "T*TOPK_E*LAT*2",
+   "shard_axis": "experts over EP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:796-819"
+   ],
+   "phase": "both",
+   "act_in_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.combine",
+   "name": "MegaMoE combine (weighted sum of 16 expert rows, BF16)",
+   "layer_type": "moe",
+   "kind": "comm",
+   "count_per_forward": "N_MOE",
+   "shapes": "T*16 rows [3584] bf16 -> [T,3584]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "fp32 acc"
+   },
+   "flops": "T*TOPK_E*LAT*2",
+   "act_in_bytes": "T*TOPK_E*LAT*2",
+   "act_out_bytes": "T*LAT*2",
+   "comm": "EP: return T*16*LAT*2 B (per (token,expert)) or T*min(16,EP)*LAT*2 B if each rank pre-reduces its experts' rows per token",
+   "shard_axis": "experts",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/megamoe_rubin/runtime.py:1-10",
+    "vllm/models/kimi_k3/nvidia/model.py:1156"
+   ],
+   "notes": "BF16 combine per mission.",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "comm",
+   "bound_decode_ref": "comm"
+  },
+  {
+   "id": "MOE.latent_norm",
+   "name": "routed latent RMSNorm (3584)",
+   "layer_type": "moe",
+   "kind": "elementwise",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T,3584]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*LAT*4",
+   "weight_bytes": "LAT*2",
+   "act_in_bytes": "T*LAT*2",
+   "act_out_bytes": "T*LAT*2",
+   "shard_axis": "token-parallel",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:753-759",
+    "vllm/models/kimi_k3/nvidia/model.py:213-243 (KimiRoutedOutputTransform)"
+   ],
+   "notes": "Fusable into the up-proj prologue. SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "MOE.latent_up",
+   "name": "routed_expert_up_proj 3584 -> 7168 (+ shared output beta-add)",
+   "layer_type": "moe",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T, LAT] x [LAT, H] -> [T, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(LAT)*(H)",
+   "weight_bytes": "(LAT)*(H)*2",
+   "act_in_bytes": "(T)*(LAT)*2",
+   "act_out_bytes": "(T)*(H)*2",
+   "shard_axis": "replicated (token-parallel); shared partial added in epilogue",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:761-772",
+    "vllm/models/kimi_k3/nvidia/model.py:213-243"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.shared_gate_up",
+   "name": "shared experts gate_up 7168 -> 2*6144",
+   "layer_type": "moe",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T, H] x [H, 2*I_SH] -> [T, 2*I_SH]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(2*I_SH)",
+   "weight_bytes": "(H)*(2*I_SH)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(2*I_SH)*2",
+   "shard_axis": "N (TP) or replicated (SP)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:697-716",
+    "vllm/models/kimi_k3/nvidia/model.py:419-426"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "MOE.shared_act",
+   "name": "shared SiTU-and-mul",
+   "layer_type": "moe",
+   "kind": "elementwise",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T, 12288] -> [T, 6144]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*I_SH*12",
+   "act_in_bytes": "T*2*I_SH*2",
+   "act_out_bytes": "T*I_SH*2",
+   "shard_axis": "N",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:6-38",
+    "vllm/models/kimi_k3/nvidia/ops/situ_and_mul.py"
+   ],
+   "notes": "Fusable into gate_up epilogue. SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "MOE.shared_down",
+   "name": "shared experts down 6144 -> 7168",
+   "layer_type": "moe",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_MOE",
+   "shapes": "[T, I_SH] x [I_SH, H] -> [T, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(I_SH)*(H)",
+   "weight_bytes": "(I_SH)*(H)*2",
+   "act_in_bytes": "(T)*(I_SH)*2",
+   "act_out_bytes": "(T)*(H)*2",
+   "shard_axis": "K (row-parallel) -> AR (one fused AR per MoE layer: shared partial + routed rows)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:427-438",
+    "vllm/models/kimi_k3/nvidia/model.py:1108-1119"
+   ],
+   "notes": "",
+   "comm": "TP: all-reduce [T,H] bf16 (token-shard path: one AR carries shared partials + routed rows, model.py:1051-1119)",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DENSE.gate_up",
+   "name": "layer-0 dense MLP gate_up 7168 -> 2*33792",
+   "layer_type": "dense_mlp",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_DENSE",
+   "shapes": "[T, H] x [H, 2*I_D] -> [T, 2*I_D]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(H)*(2*I_D)",
+   "weight_bytes": "(H)*(2*I_D)*2",
+   "act_in_bytes": "(T)*(H)*2",
+   "act_out_bytes": "(T)*(2*I_D)*2",
+   "shard_axis": "N (TP) / replicated under SP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1327-1340",
+    "vllm/models/kimi_k3/nvidia/model.py:419-426"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DENSE.act",
+   "name": "layer-0 SiTU-and-mul",
+   "layer_type": "dense_mlp",
+   "kind": "elementwise",
+   "count_per_forward": "N_DENSE",
+   "shapes": "[T, 67584] -> [T, 33792]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*I_D*12",
+   "act_in_bytes": "T*2*I_D*2",
+   "act_out_bytes": "T*I_D*2",
+   "shard_axis": "N",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:166-186"
+   ],
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "DENSE.down",
+   "name": "layer-0 dense MLP down 33792 -> 7168",
+   "layer_type": "dense_mlp",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "N_DENSE",
+   "shapes": "[T, I_D] x [I_D, H] -> [T, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(T)*(I_D)*(H)",
+   "weight_bytes": "(I_D)*(H)*2",
+   "act_in_bytes": "(T)*(I_D)*2",
+   "act_out_bytes": "(T)*(H)*2",
+   "shard_axis": "K -> AR/RS",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:427-438"
+   ],
+   "notes": "",
+   "comm": "TP: all-reduce [T,H] bf16",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "F.attnres_final",
+   "name": "final AttnRes mix (8 blocks + prefix, no output norm)",
+   "layer_type": "final",
+   "kind": "memory",
+   "shapes": "[T,H] + blocks[T,8,H] -> [T,H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*H*8*(NB+1)",
+   "weight_bytes": "2*H*2",
+   "act_in_bytes": "T*H*2*(NB+2)",
+   "act_out_bytes": "T*H*2",
+   "shard_axis": "token-parallel",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1842-1857"
+   ],
+   "notes": "Prefill could restrict to the R logit rows + Tc draft rows (new method): only those rows are consumed after the last layer.",
+   "phase": "both",
+   "count_per_forward": "1",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "F.sp_gather_out",
+   "name": "SP all-gather of the final hidden (+aux hidden) rows",
+   "layer_type": "final",
+   "kind": "comm",
+   "shapes": "[T/tp, H*(1+D_AUX)] -> [T, ...]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "none"
+   },
+   "flops": "0",
+   "act_in_bytes": "T*H*2*(1+D_AUX)",
+   "act_out_bytes": "T*H*2*(1+D_AUX)",
+   "comm": "SP only: all-gather T*H*2*(1+D_AUX) bytes",
+   "shard_axis": "-",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1861-1873"
+   ],
+   "phase": "both",
+   "count_per_forward": "1",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "notes": "",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "comm",
+   "bound_decode_ref": "comm"
+  },
+  {
+   "id": "F.norm",
+   "name": "final RMSNorm (applied in compute_logits on logit rows)",
+   "layer_type": "final",
+   "kind": "elementwise",
+   "shapes": "[R,H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "R*H*4",
+   "weight_bytes": "H*2",
+   "act_in_bytes": "R*H*2",
+   "act_out_bytes": "R*H*2",
+   "shard_axis": "rows",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:2246-2254"
+   ],
+   "phase": "both",
+   "count_per_forward": "1",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "fused_in_sol": true,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "F.lm_head",
+   "name": "lm_head 7168 -> 163840 (target verify / last-token logits)",
+   "layer_type": "final",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "1",
+   "shapes": "[R, H] x [H, V] -> [R, V]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "fp32",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(R)*(H)*(V)",
+   "weight_bytes": "(H)*(V)*2",
+   "act_in_bytes": "(R)*(H)*2",
+   "act_out_bytes": "(R)*(V)*4",
+   "shard_axis": "N = vocab over TP (each rank its vocab shard)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:2246-2300",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/verify/lmhead.py"
+   ],
+   "notes": "2.35 GB BF16 weights; decode R = B*q rows.",
+   "comm": "TP: argmax/top token exchange or sampled-verify partial reductions (no full-vocab gather on the fast path: verify/exchange.py)",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "F.rejection",
+   "name": "probabilistic rejection sampling (target vs draft probs) + bonus",
+   "layer_type": "final",
+   "kind": "memory",
+   "phase": "decode",
+   "shapes": "target logits [B,q,V] (vocab-sharded) , draft logits cache [B,k,V]",
+   "dtype": {
+    "act_in": "fp32 target logits / head_dtype draft logits",
+    "weight": "-",
+    "out": "int32 tokens",
+    "compute": "fp32_simt"
+   },
+   "flops": "B*q*V*8 + B*k*V*6",
+   "act_in_bytes": "B*q*V*4 + B*k*V*2",
+   "act_out_bytes": "B*q*4",
+   "shard_axis": "vocab over TP (sampled_verify.run on shard logits)",
+   "comm": "TP: per-row LSE / max / sampled-candidate exchange, O(B*q*tp*16 B)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:2278-2300",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/runtime/sampled_verify.py:524-640",
+    "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1110",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py:499-505"
+   ],
+   "notes": "softmax (LSE) of target and draft per row, accept test p/q, residual max(0,p-q) resample at first rejection, bonus sample. Memory-bound on the logit bytes. Prefill: plain sampling of R rows (R*V*4 read).",
+   "count_per_forward": "1",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.aux_capture",
+   "name": "aux hidden capture: AttnRes stream after target layers 75,79,83,87,91 (aux ids 76..92)",
+   "layer_type": "dspark",
+   "kind": "memory",
+   "count_per_forward": "D_AUX",
+   "shapes": "[T,H] per aux layer (attn_res mix with the consumer layer's weights)",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "T*H*8*(NB+1)",
+   "act_in_bytes": "T*H*2*(NB+2)",
+   "act_out_bytes": "T*H*2",
+   "shard_axis": "token-parallel",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/model.py:1693-1728",
+    "vllm/models/kimi_k3/nvidia/model.py:1803-1820"
+   ],
+   "notes": "Extra attn_res pass per aux layer on every target row (SOL: only Tc rows).",
+   "phase": "both",
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.fc",
+   "name": "context fc: cat(5 aux) 35840 -> 7168",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "1",
+   "shapes": "[Tc, D_AUX*H] x [D_AUX*H, H] -> [Tc, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tc)*(D_AUX*H)*(H)",
+   "weight_bytes": "(D_AUX*H)*(H)*2",
+   "act_in_bytes": "(Tc)*(D_AUX*H)*2",
+   "act_out_bytes": "(Tc)*(H)*2",
+   "shard_axis": "replicated; row-sharded over TP for >=256 rows/rank (combine_aux_rows)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:158-177",
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:327-355",
+    "vllm/model_executor/models/qwen3_dflash.py:495-510"
+   ],
+   "notes": "256.9M params (514 MB). Decode stock graph runs all B*q verify rows; SOL B*AL. Prefill (P/D prefill instance) runs it on the 16K chunk; SOL only the last D_W=2048 tokens per request matter for the sliding window (new method).",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.hidden_norm",
+   "name": "hidden_norm RMSNorm of context rows",
+   "layer_type": "dspark",
+   "kind": "elementwise",
+   "shapes": "[Tc,H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "Tc*H*4",
+   "weight_bytes": "H*2",
+   "act_in_bytes": "Tc*H*2",
+   "act_out_bytes": "Tc*H*2",
+   "shard_axis": "rows",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:170-177"
+   ],
+   "phase": "both",
+   "count_per_forward": "1",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "fused_in_sol": true,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "DS.ctx_kv_proj",
+   "name": "context K/V projection of all 5 layers (fused K/V weight) 7168 -> 5*2*16*64",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "both",
+   "count_per_forward": "1",
+   "shapes": "[Tc, H] x [H, D_L*2*D_HKV*D_HD] -> [Tc, D_L*2*D_HKV*D_HD]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tc)*(H)*(D_L*2*D_HKV*D_HD)",
+   "weight_bytes": "(H)*(D_L*2*D_HKV*D_HD)*2",
+   "act_in_bytes": "(Tc)*(H)*2",
+   "act_out_bytes": "(Tc)*(D_L*2*D_HKV*D_HD)*2",
+   "shard_axis": "N (kv heads) or replicated",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:179-201",
+    "vllm/model_executor/models/qwen3_dflash.py:592-720"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "compute",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.ctx_kv_insert",
+   "name": "context k_norm + RoPE + paged KV insert (5 layers)",
+   "layer_type": "dspark",
+   "kind": "elementwise",
+   "shapes": "[Tc, 5, 2, 16, 64] -> 5 BF16 paged caches",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "Tc*D_L*D_HKV*D_HD*10",
+   "act_in_bytes": "Tc*D_L*2*D_HKV*D_HD*2",
+   "kv_write_bytes": "Tc*D_L*2*D_HKV*D_HD*2",
+   "shard_axis": "kv heads",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/gqa_context_kv.py:1-30"
+   ],
+   "notes": "20,480 B per context token (BF16, 5 layers). Prefill SOL: only the last 2048 tokens of the prompt need draft KV. SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "phase": "both",
+   "count_per_forward": "1",
+   "weight_bytes": "0",
+   "act_out_bytes": "0",
+   "kv_read_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": true,
+   "bound_prefill_ref": "memory",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.embed",
+   "name": "draft query embedding (anchor + k-1 mask tokens, target table)",
+   "layer_type": "dspark",
+   "kind": "gather",
+   "phase": "decode",
+   "shapes": "ids[Tq] -> [Tq,H]",
+   "dtype": {
+    "act_in": "int32",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "none"
+   },
+   "flops": "0",
+   "weight_bytes": "Tq*H*2",
+   "act_out_bytes": "Tq*H*2",
+   "shard_axis": "vocab -> AR",
+   "comm": "TP: all-reduce [Tq,H] bf16 (or replicated table)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:246-262",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:1-20"
+   ],
+   "notes": "sample_from_anchor: k query rows per request (anchor + k-1 noise).",
+   "count_per_forward": "1",
+   "act_in_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.norm_ar",
+   "name": "draft input/post RMSNorm with fused all-reduce (x2 per layer) + final",
+   "layer_type": "dspark",
+   "kind": "elementwise",
+   "phase": "decode",
+   "count_per_forward": "2*D_L",
+   "shapes": "[Tq,H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "Tq*H*6",
+   "weight_bytes": "H*2",
+   "act_in_bytes": "Tq*H*2*2",
+   "act_out_bytes": "Tq*H*2*2",
+   "comm": "TP: all-reduce [Tq,H] bf16 per site (fused_allreduce_rms_norm); 2*D_L sites",
+   "shard_axis": "rows",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:83-125"
+   ],
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "notes": "",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.qkv",
+   "name": "draft qkv_proj 7168 -> 96*64 + 2*16*64",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "count_per_forward": "D_L",
+   "shapes": "[Tq, H] x [H, D_HQ*D_HD + 2*D_HKV*D_HD] -> [Tq, D_HQ*D_HD + 2*D_HKV*D_HD]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tq)*(H)*(D_HQ*D_HD + 2*D_HKV*D_HD)",
+   "weight_bytes": "(H)*(D_HQ*D_HD + 2*D_HKV*D_HD)*2",
+   "act_in_bytes": "(Tq)*(H)*2",
+   "act_out_bytes": "(Tq)*(D_HQ*D_HD + 2*D_HKV*D_HD)*2",
+   "shard_axis": "N (heads)",
+   "cite": [
+    "vllm/model_executor/models/qwen3_dflash.py:217-225",
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:95-105"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.attn",
+   "name": "draft sliding-window GQA attention (window 2048, causal in block)",
+   "layer_type": "dspark",
+   "kind": "attention",
+   "phase": "decode",
+   "count_per_forward": "D_L",
+   "shapes": "q [Tq,96,64], KV [min(L,W)+k, 16, 64] bf16 per request",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "bf16_mma (mma.sync)"
+   },
+   "flops": "2*Tq*D_HQ*D_HD*2*D_W + Tq*D_HQ*(D_HD*8)",
+   "kv_read_bytes": "B*D_W*2*D_HKV*D_HD*2",
+   "kv_write_bytes": "Tq*2*D_HKV*D_HD*2",
+   "act_in_bytes": "Tq*(D_HQ + 2*D_HKV)*D_HD*2",
+   "act_out_bytes": "Tq*D_HQ*D_HD*2",
+   "shard_axis": "kv heads over TP (16 kv heads)",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/gqa_window.py:1-40",
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:62-78"
+   ],
+   "notes": "Includes q/k RMSNorm + neox RoPE + query K/V insert. KV read 8.39 MB per request per layer (41.9 MB per draft step). AI = 2*96*64*2/(16*64*2*2) * k ~ 6k FLOP/B -> memory bound.",
+   "weight_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.o_proj",
+   "name": "draft o_proj 6144 -> 7168",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "count_per_forward": "D_L",
+   "shapes": "[Tq, D_HQ*D_HD] x [D_HQ*D_HD, H] -> [Tq, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tq)*(D_HQ*D_HD)*(H)",
+   "weight_bytes": "(D_HQ*D_HD)*(H)*2",
+   "act_in_bytes": "(Tq)*(D_HQ*D_HD)*2",
+   "act_out_bytes": "(Tq)*(H)*2",
+   "shard_axis": "K -> AR",
+   "cite": [
+    "vllm/model_executor/models/qwen3_dflash.py:226-232"
+   ],
+   "notes": "",
+   "comm": "TP: AR fused into the next RMSNorm",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.gate_up",
+   "name": "draft MLP gate_up 7168 -> 2*14336",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "count_per_forward": "D_L",
+   "shapes": "[Tq, H] x [H, 2*D_I] -> [Tq, 2*D_I]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tq)*(H)*(2*D_I)",
+   "weight_bytes": "(H)*(2*D_I)*2",
+   "act_in_bytes": "(Tq)*(H)*2",
+   "act_out_bytes": "(Tq)*(2*D_I)*2",
+   "shard_axis": "N",
+   "cite": [
+    "vllm/model_executor/models/qwen3_dflash.py:365-372"
+   ],
+   "notes": "",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.silu",
+   "name": "draft SiLU-and-mul",
+   "layer_type": "dspark",
+   "kind": "elementwise",
+   "phase": "decode",
+   "count_per_forward": "D_L",
+   "shapes": "[Tq, 28672] -> [Tq, 14336]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "-",
+    "out": "bf16",
+    "compute": "fp32_simt"
+   },
+   "flops": "Tq*D_I*5",
+   "act_in_bytes": "Tq*2*D_I*2",
+   "act_out_bytes": "Tq*D_I*2",
+   "shard_axis": "N",
+   "cite": [
+    "vllm/model_executor/models/qwen2.py (Qwen2MLP)"
+   ],
+   "weight_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "notes": "SOL: fused into the neighbouring GEMM/kernel prologue/epilogue -> its activation bytes are not HBM traffic (kv/state bytes still count).",
+   "fused_in_sol": true,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "compute"
+  },
+  {
+   "id": "DS.down",
+   "name": "draft MLP down 14336 -> 7168",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "count_per_forward": "D_L",
+   "shapes": "[Tq, D_I] x [D_I, H] -> [Tq, H]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "bf16",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tq)*(D_I)*(H)",
+   "weight_bytes": "(D_I)*(H)*2",
+   "act_in_bytes": "(Tq)*(D_I)*2",
+   "act_out_bytes": "(Tq)*(H)*2",
+   "shard_axis": "K -> AR",
+   "cite": [
+    "vllm/model_executor/models/qwen3_dflash.py:365-372"
+   ],
+   "notes": "",
+   "comm": "TP: AR fused into next RMSNorm",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.lm_head",
+   "name": "draft base logits on k rows (target lm_head weights)",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "count_per_forward": "1",
+   "shapes": "[Tq, H] x [H, V] -> [Tq, V]",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16",
+    "out": "fp32",
+    "compute": "bf16_mma"
+   },
+   "flops": "2*(Tq)*(H)*(V)",
+   "weight_bytes": "(H)*(V)*2",
+   "act_in_bytes": "(Tq)*(H)*2",
+   "act_out_bytes": "(Tq)*(V)*4",
+   "shard_axis": "N = vocab over TP",
+   "cite": [
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:363-368",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:285-292"
+   ],
+   "notes": "Same 2.35 GB weight as F.lm_head (re-streamed unless fused with verify).",
+   "comm": null,
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.markov",
+   "name": "sequential Markov head x k: w1[prev] (512) -> w2 512 -> 163840 bias + sample",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "count_per_forward": "k",
+   "shapes": "per position i: [B,512] x [512, V] -> [B,V]; add base logits; gumbel/argmax",
+   "dtype": {
+    "act_in": "bf16",
+    "weight": "bf16 (w1 [V,512] gather, w2 [512,V])",
+    "out": "fp32 logits",
+    "compute": "bf16_mma / gemv"
+   },
+   "flops": "2*B*D_R*V + B*V*6",
+   "weight_bytes": "D_R*V*2 + B*D_R*2",
+   "act_in_bytes": "B*V*4",
+   "act_out_bytes": "B*V*2 + B*4",
+   "shard_axis": "vocab columns over TP (fused sampled_markov_draft), argmax/gumbel exchange per position",
+   "comm": "TP: per-position (max, idx) exchange O(B*tp*8 B) -- k sequential latency-bound rounds",
+   "cite": [
+    "vllm/model_executor/models/qwen3_dspark.py:48-93",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:270-325",
+    "vllm/models/kimi_k3/nvidia/dspark_gqa.py:383-425",
+    "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/markov.py"
+   ],
+   "notes": "w2 = 84M params (168 MB BF16) re-read per position unless the vocab shard stays L2-resident (168/tp MB; fits L2 at tp>=2). Writes the draft-logits cache (head_dtype) for probabilistic rejection. Strictly sequential over k positions.",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "memory"
+  },
+  {
+   "id": "DS.confidence",
+   "name": "confidence head (optional; only with adaptive verification)",
+   "layer_type": "dspark",
+   "kind": "gemm",
+   "phase": "decode",
+   "shapes": "[Tq, 7168+512] fp32 -> [Tq]",
+   "dtype": {
+    "act_in": "fp32",
+    "weight": "fp32",
+    "out": "fp32",
+    "compute": "fp32"
+   },
+   "flops": "2*Tq*(H+D_R)",
+   "weight_bytes": "(H+D_R)*4",
+   "shard_axis": "rows",
+   "cite": [
+    "vllm/model_executor/models/qwen3_dspark.py:164-190",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:106-114"
+   ],
+   "notes": "Off by default (enable_adaptive_verification); excluded from SOL totals.",
+   "count_per_forward": "1",
+   "act_in_bytes": "0",
+   "act_out_bytes": "0",
+   "kv_read_bytes": "0",
+   "kv_write_bytes": "0",
+   "state_read_bytes": "0",
+   "state_write_bytes": "0",
+   "comm": null,
+   "fused_in_sol": false,
+   "bound_prefill_ref": "n/a",
+   "bound_decode_ref": "compute"
+  }
+ ],
+ "reference_evaluations": {
+  "prefill_C16384_P120000": [
+   {
+    "id": "G.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 234881024.0,
+    "act_bytes": 234946560.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "G.attnres_init",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "L.attnres_pre",
+    "count": 93.0,
+    "flops": 463185379328.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 161363263488.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.8703563731212545,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.attnres_post",
+    "count": 93.0,
+    "flops": 470701572096.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 183207198719.99997,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.569155983477795,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.sp_gather",
+    "count": 93.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 43687870464.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "KDA.in_proj",
+    "count": 69.0,
+    "flops": 800226495430656.0,
+    "weight_bytes": 48841949184.0,
+    "act_bytes": 127845531648.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 4529.0503416681595,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.f_b_proj",
+    "count": 69.0,
+    "flops": 3556232921088.0,
+    "weight_bytes": 217055232.0,
+    "act_bytes": 28072476672.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 125.70843989769821,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.conv",
+    "count": 69.0,
+    "flops": 500095254528.0,
+    "weight_bytes": 40697856.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 61046784.0,
+    "ai": 4915.2,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.gate_beta_norm",
+    "count": 69.0,
+    "flops": 167132528640.0,
+    "weight_bytes": 3417984.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 48897.98449612403,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.core_prefill",
+    "count": 69.0,
+    "flops": 12909866385408.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 139132403712.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 1302331392.0,
+    "ai": 91.92787223080886,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.o_norm",
+    "count": 69.0,
+    "flops": 111132278784.0,
+    "weight_bytes": 35328.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3145728.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.o_proj",
+    "count": 69.0,
+    "flops": 199149043580928.0,
+    "weight_bytes": 12155092992.0,
+    "act_bytes": 43989860352.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3547.0515463917527,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.qkv_a_packed",
+    "count": 24.0,
+    "flops": 12807592476672.0,
+    "weight_bytes": 781713408.0,
+    "act_bytes": 7423918080.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1560.8295955529998,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.prologue",
+    "count": 24.0,
+    "flops": 4127195136.0,
+    "weight_bytes": 122880.0,
+    "act_bytes": 3372220416.0,
+    "kv_bytes": 284688384.0,
+    "state_bytes": 0.0,
+    "ai": 1.1285642283525419,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.qb_wq_packed",
+    "count": 24.0,
+    "flops": 27212912787456.0,
+    "weight_bytes": 1660944384.0,
+    "act_bytes": 18924699648.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1321.9364303178484,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.g_proj",
+    "count": 24.0,
+    "flops": 69269232549888.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 15300820992.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3547.0515463917527,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.idx_q_quant",
+    "count": 24.0,
+    "flops": 6442450944.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.idx_score",
+    "count": 24.0,
+    "flops": 417776051159040.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 101720653824.0,
+    "kv_bytes": 222578688.0,
+    "state_bytes": 0.0,
+    "ai": 4098.124425374313,
+    "ridge": 1258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.topk",
+    "count": 24.0,
+    "flops": 201629368320.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 104035909632.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1.9380747381669607,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.w_uk",
+    "count": 24.0,
+    "flops": 4947802324992.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 53150220288.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 92.56497175141243,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.sparse_mla",
+    "count": 24.0,
+    "flops": 168534516695040.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 82141249536.0,
+    "kv_bytes": 2147229696.0,
+    "state_bytes": 0.0,
+    "ai": 1999.49647010663,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.w_uv",
+    "count": 24.0,
+    "flops": 4947802324992.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 48318382080.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 101.7639751552795,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.gate_mul",
+    "count": 24.0,
+    "flops": 24159191040.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.o_proj",
+    "count": 24.0,
+    "flops": 69269232549888.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 15300820992.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3547.0515463917527,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.router",
+    "count": 92.0,
+    "flops": 19361712570368.0,
+    "weight_bytes": 1181745152.0,
+    "act_bytes": 27011317760.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 686.754491017964,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.topk",
+    "count": 92.0,
+    "flops": 8103395328.0,
+    "weight_bytes": 329728.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 24576.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_down",
+    "count": 92.0,
+    "flops": 77446850281472.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 32413581312.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2085.2363636363634,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.dispatch",
+    "count": 92.0,
+    "flops": 21609054208.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 99941875712.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.21621621621621623,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.fc1",
+    "count": 92.0,
+    "flops": 1062128232431616.0,
+    "weight_bytes": 964304044032.0,
+    "act_bytes": 89137348608.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1008.2461538461539,
+    "ridge": 755.3956834532374,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.act",
+    "count": 92.0,
+    "flops": 889058230272.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.fc2",
+    "count": 92.0,
+    "flops": 531064116215808.0,
+    "weight_bytes": 482152022016.0,
+    "act_bytes": 172872433664.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 810.7546391752577,
+    "ridge": 755.3956834532374,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.combine",
+    "count": 92.0,
+    "flops": 172872433664.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 183676960768.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.9411764705882353,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.latent_norm",
+    "count": 92.0,
+    "flops": 21609054208.0,
+    "weight_bytes": 659456.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 32768.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_up",
+    "count": 92.0,
+    "flops": 77446850281472.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 32413581312.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2085.2363636363634,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_gate_up",
+    "count": 92.0,
+    "flops": 265532058107904.0,
+    "weight_bytes": 16206790656.0,
+    "act_bytes": 58653147136.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3547.0515463917527,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_act",
+    "count": 92.0,
+    "flops": 111132278784.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_down",
+    "count": 92.0,
+    "flops": 132766029053952.0,
+    "weight_bytes": 8103395328.0,
+    "act_bytes": 40131100672.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2752.512,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.gate_up",
+    "count": 1.0,
+    "flops": 15874199126016.0,
+    "weight_bytes": 968884224.0,
+    "act_bytes": 2449473536.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 4643.808588957055,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.act",
+    "count": 1.0,
+    "flops": 6643777536.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.down",
+    "count": 1.0,
+    "flops": 7937099563008.0,
+    "weight_bytes": 484442112.0,
+    "act_bytes": 1342177280.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 4345.239954075775,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "F.attnres_final",
+    "count": 1.0,
+    "flops": 8455716864.0,
+    "weight_bytes": 28672.0,
+    "act_bytes": 2583691264.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.2726909546902223,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "F.sp_gather_out",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 2818572288.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "F.norm",
+    "count": 1.0,
+    "flops": 28672.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "F.lm_head",
+    "count": 1.0,
+    "flops": 2348810240.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 669696.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.9997149598982572,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.aux_capture",
+    "count": 5.0,
+    "flops": 42278584320.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 12918456320.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.272727272727273,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.fc",
+    "count": 1.0,
+    "flops": 8418135900160.0,
+    "weight_bytes": 513802240.0,
+    "act_bytes": 1409286144.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 4377.404580152672,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.hidden_norm",
+    "count": 1.0,
+    "flops": 469762048.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 32768.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.ctx_kv_proj",
+    "count": 1.0,
+    "flops": 2405181685760.0,
+    "weight_bytes": 146800640.0,
+    "act_bytes": 570425344.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3353.4502923976606,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.ctx_kv_insert",
+    "count": 1.0,
+    "flops": 838860800.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 335544320.0,
+    "state_bytes": 0.0,
+    "ai": 2.5,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   }
+  ],
+  "decode_B64_k3_L135K": [
+   {
+    "id": "G.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 3670016.0,
+    "act_bytes": 3671040.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "G.attnres_init",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "L.attnres_pre",
+    "count": 93.0,
+    "flops": 7237271552.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 2521300992.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.8643925466966254,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.attnres_post",
+    "count": 93.0,
+    "flops": 7354712064.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 2862612479.9999995,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.5644532421570396,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.sp_gather",
+    "count": 93.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 682622976.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "KDA.in_proj",
+    "count": 69.0,
+    "flops": 12503538991104.0,
+    "weight_bytes": 48841949184.0,
+    "act_bytes": 1997586432.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 245.94125102844055,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.f_b_proj",
+    "count": 69.0,
+    "flops": 55566139392.0,
+    "weight_bytes": 217055232.0,
+    "act_bytes": 438632448.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 84.7448275862069,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.conv",
+    "count": 69.0,
+    "flops": 7813988352.0,
+    "weight_bytes": 40697856.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 5860491264.0,
+    "ai": 1.3241379310344827,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.gate_beta_norm",
+    "count": 69.0,
+    "flops": 2611445760.0,
+    "weight_bytes": 3417984.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 764.031007751938,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.core_decode",
+    "count": 69.0,
+    "flops": 258660378869.76,
+    "weight_bytes": 0.0,
+    "act_bytes": 2173943808.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 57302581248.0,
+    "ai": 4.348949079089924,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.o_norm",
+    "count": 69.0,
+    "flops": 1736441856.0,
+    "weight_bytes": 35328.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 49152.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.o_proj",
+    "count": 69.0,
+    "flops": 3111703805952.0,
+    "weight_bytes": 12155092992.0,
+    "act_bytes": 687341568.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 242.29859154929576,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.qkv_a_packed",
+    "count": 24.0,
+    "flops": 200118632448.0,
+    "weight_bytes": 781713408.0,
+    "act_bytes": 115998720.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 222.92071835304424,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.prologue",
+    "count": 24.0,
+    "flops": 64487424.0,
+    "weight_bytes": 122880.0,
+    "act_bytes": 52690944.0,
+    "kv_bytes": 4448256.0,
+    "state_bytes": 0.0,
+    "ai": 1.1261802575107296,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.qb_wq_packed",
+    "count": 24.0,
+    "flops": 425201762304.0,
+    "weight_bytes": 1660944384.0,
+    "act_bytes": 295698432.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 217.3118971061093,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.g_proj",
+    "count": 24.0,
+    "flops": 1082331758592.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 239075328.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 242.29859154929576,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.idx_q_quant",
+    "count": 24.0,
+    "flops": 100663296.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.idx_score",
+    "count": 24.0,
+    "flops": 6874398720000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 1673035776.0,
+    "kv_bytes": 14100480000.0,
+    "state_bytes": 0.0,
+    "ai": 435.8190537622346,
+    "ridge": 1258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.topk",
+    "count": 24.0,
+    "flops": 3317760000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 1709211648.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1.941105423592339,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.w_uk",
+    "count": 24.0,
+    "flops": 77309411328.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 830472192.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 68.26666666666667,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.sparse_mla",
+    "count": 24.0,
+    "flops": 2633351823360.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 1283457024.0,
+    "kv_bytes": 8254390272.0,
+    "state_bytes": 0.0,
+    "ai": 276.09498680738784,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.w_uv",
+    "count": 24.0,
+    "flops": 77309411328.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 754974720.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 73.14285714285714,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.gate_mul",
+    "count": 24.0,
+    "flops": 377487360.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.o_proj",
+    "count": 24.0,
+    "flops": 1082331758592.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 239075328.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 242.29859154929576,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.router",
+    "count": 92.0,
+    "flops": 302526758912.0,
+    "weight_bytes": 1181745152.0,
+    "act_bytes": 422051840.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 188.6315789473684,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.topk",
+    "count": 92.0,
+    "flops": 126615552.0,
+    "weight_bytes": 329728.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 384.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_down",
+    "count": 92.0,
+    "flops": 1210107035648.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 506462208.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 231.2258064516129,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.dispatch",
+    "count": 92.0,
+    "flops": 337641472.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 1561591808.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.21621621621621623,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.fc1",
+    "count": 92.0,
+    "flops": 16595753631744.0,
+    "weight_bytes": 954733699227.2455,
+    "act_bytes": 1392771072.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 17.35727871496949,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.act",
+    "count": 92.0,
+    "flops": 13891534848.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.fc2",
+    "count": 92.0,
+    "flops": 8297876815872.0,
+    "weight_bytes": 477366849613.6228,
+    "act_bytes": 2701131776.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 17.28479535721723,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.combine",
+    "count": 92.0,
+    "flops": 2701131776.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 2869952512.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.9411764705882353,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.latent_norm",
+    "count": 92.0,
+    "flops": 337641472.0,
+    "weight_bytes": 659456.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 512.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_up",
+    "count": 92.0,
+    "flops": 1210107035648.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 506462208.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 231.2258064516129,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.shared_gate_up",
+    "count": 92.0,
+    "flops": 4148938407936.0,
+    "weight_bytes": 16206790656.0,
+    "act_bytes": 916455424.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 242.29859154929576,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.shared_act",
+    "count": 92.0,
+    "flops": 1736441856.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_down",
+    "count": 92.0,
+    "flops": 2074469203968.0,
+    "weight_bytes": 8103395328.0,
+    "act_bytes": 627048448.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 237.61325966850828,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DENSE.gate_up",
+    "count": 1.0,
+    "flops": 248034361344.0,
+    "weight_bytes": 968884224.0,
+    "act_bytes": 38273024.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 246.27173347214992,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DENSE.act",
+    "count": 1.0,
+    "flops": 103809024.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.down",
+    "count": 1.0,
+    "flops": 124017180672.0,
+    "weight_bytes": 484442112.0,
+    "act_bytes": 20971520.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 245.37759336099586,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "F.attnres_final",
+    "count": 1.0,
+    "flops": 132120576.0,
+    "weight_bytes": 28672.0,
+    "act_bytes": 40370176.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.270404542228531,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "F.sp_gather_out",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 44040192.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "F.norm",
+    "count": 1.0,
+    "flops": 7340032.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 512.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "F.lm_head",
+    "count": 1.0,
+    "flops": 601295421440.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 171442176.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 238.58539629706678,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "F.rejection",
+    "count": 1.0,
+    "flops": 524288000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 230687744.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.272717184316476,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.aux_capture",
+    "count": 5.0,
+    "flops": 660602880.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 201850880.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.272727272727273,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.fc",
+    "count": 1.0,
+    "flops": 131533373440.0,
+    "weight_bytes": 513802240.0,
+    "act_bytes": 22020096.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 245.4794520547945,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.hidden_norm",
+    "count": 1.0,
+    "flops": 7340032.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 512.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.ctx_kv_proj",
+    "count": 1.0,
+    "flops": 37580963840.0,
+    "weight_bytes": 146800640.0,
+    "act_bytes": 8912896.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 241.34680134680136,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.ctx_kv_insert",
+    "count": 1.0,
+    "flops": 13107200.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 5242880.0,
+    "state_bytes": 0.0,
+    "ai": 2.5,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 2752512.0,
+    "act_bytes": 2752512.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.norm_ar",
+    "count": 10.0,
+    "flops": 82575360.0,
+    "weight_bytes": 143360.0,
+    "act_bytes": 110100480.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.7490247074122237,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.qkv",
+    "count": 5.0,
+    "flops": 112742891520.0,
+    "weight_bytes": 587202560.0,
+    "act_bytes": 29491200.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 182.81827842720512,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.attn",
+    "count": 5.0,
+    "flops": 48365568000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 27525120.0,
+    "kv_bytes": 2688286720.0,
+    "state_bytes": 0.0,
+    "ai": 17.80888030888031,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.o_proj",
+    "count": 5.0,
+    "flops": 84557168640.0,
+    "weight_bytes": 440401920.0,
+    "act_bytes": 25559040.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 181.46835443037975,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.gate_up",
+    "count": 5.0,
+    "flops": 394600120320.0,
+    "weight_bytes": 2055208960.0,
+    "act_bytes": 68812800.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 185.77969762419008,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.silu",
+    "count": 5.0,
+    "flops": 68812800.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.down",
+    "count": 5.0,
+    "flops": 197300060160.0,
+    "weight_bytes": 1027604480.0,
+    "act_bytes": 41287680.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 184.58369098712447,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.lm_head",
+    "count": 1.0,
+    "flops": 450971566080.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 128581632.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 182.0348129728586,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.markov",
+    "count": 3.0,
+    "flops": 32400998400.0,
+    "weight_bytes": 503513088.0,
+    "act_bytes": 188744448.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 46.804833049878134,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.confidence",
+    "count": 1.0,
+    "flops": 2949120.0,
+    "weight_bytes": 30720.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 96.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   }
+  ],
+  "decode_B64_k7_L135K": [
+   {
+    "id": "G.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 7340032.0,
+    "act_bytes": 7342080.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "G.attnres_init",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "L.attnres_pre",
+    "count": 93.0,
+    "flops": 14474543104.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 5042601984.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.8674186915675515,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.attnres_post",
+    "count": 93.0,
+    "flops": 14709424128.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 5725224959.999999,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.566839782654379,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.sp_gather",
+    "count": 93.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 1365245952.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "KDA.in_proj",
+    "count": 69.0,
+    "flops": 25007077982208.0,
+    "weight_bytes": 48841949184.0,
+    "act_bytes": 3995172864.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 473.28614831614533,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.f_b_proj",
+    "count": 69.0,
+    "flops": 111132278784.0,
+    "weight_bytes": 217055232.0,
+    "act_bytes": 877264896.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 101.55371900826447,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.conv",
+    "count": 69.0,
+    "flops": 15627976704.0,
+    "weight_bytes": 40697856.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 8465154048.0,
+    "ai": 1.8373205741626795,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.gate_beta_norm",
+    "count": 69.0,
+    "flops": 5222891520.0,
+    "weight_bytes": 3417984.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1528.062015503876,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.core_decode",
+    "count": 69.0,
+    "flops": 475646153195.52,
+    "weight_bytes": 0.0,
+    "act_bytes": 4347887616.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 59039023104.0,
+    "ai": 7.503854467629749,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.o_norm",
+    "count": 69.0,
+    "flops": 3472883712.0,
+    "weight_bytes": 35328.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 98304.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.o_proj",
+    "count": 69.0,
+    "flops": 6223407611904.0,
+    "weight_bytes": 12155092992.0,
+    "act_bytes": 1374683136.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 459.97860962566847,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.qkv_a_packed",
+    "count": 24.0,
+    "flops": 400237264896.0,
+    "weight_bytes": 781713408.0,
+    "act_bytes": 231997440.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 394.82389449185416,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.prologue",
+    "count": 24.0,
+    "flops": 128974848.0,
+    "weight_bytes": 122880.0,
+    "act_bytes": 105381888.0,
+    "kv_bytes": 8896512.0,
+    "state_bytes": 0.0,
+    "ai": 1.127389903329753,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.qb_wq_packed",
+    "count": 24.0,
+    "flops": 850403524608.0,
+    "weight_bytes": 1660944384.0,
+    "act_bytes": 591396864.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 377.56424581005587,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.g_proj",
+    "count": 24.0,
+    "flops": 2164663517184.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 478150656.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 459.97860962566847,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.idx_q_quant",
+    "count": 24.0,
+    "flops": 201326592.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.idx_score",
+    "count": 24.0,
+    "flops": 13748797440000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 3346071552.0,
+    "kv_bytes": 14100480000.0,
+    "state_bytes": 0.0,
+    "ai": 788.0524354065773,
+    "ridge": 1258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.topk",
+    "count": 24.0,
+    "flops": 6635520000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 3418423296.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1.941105423592339,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.w_uk",
+    "count": 24.0,
+    "flops": 154618822656.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 1660944384.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 78.76923076923077,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.sparse_mla",
+    "count": 24.0,
+    "flops": 5266703646720.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 2566914048.0,
+    "kv_bytes": 16508780544.0,
+    "state_bytes": 0.0,
+    "ai": 276.09498680738784,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.w_uv",
+    "count": 24.0,
+    "flops": 154618822656.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 1509949440.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 85.33333333333333,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.gate_mul",
+    "count": 24.0,
+    "flops": 754974720.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.o_proj",
+    "count": 24.0,
+    "flops": 2164663517184.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 478150656.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 459.97860962566847,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.router",
+    "count": 92.0,
+    "flops": 605053517824.0,
+    "weight_bytes": 1181745152.0,
+    "act_bytes": 844103680.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 298.6666666666667,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.topk",
+    "count": 92.0,
+    "flops": 253231104.0,
+    "weight_bytes": 329728.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 768.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_down",
+    "count": 92.0,
+    "flops": 2420214071296.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 1012924416.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 421.6470588235294,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.dispatch",
+    "count": 92.0,
+    "flops": 675282944.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 3123183616.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.21621621621621623,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.fc1",
+    "count": 92.0,
+    "flops": 33191507263488.0,
+    "weight_bytes": 964209062060.0288,
+    "act_bytes": 2785542144.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 34.32439759145216,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.act",
+    "count": 92.0,
+    "flops": 27783069696.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.fc2",
+    "count": 92.0,
+    "flops": 16595753631744.0,
+    "weight_bytes": 482104531030.0144,
+    "act_bytes": 5402263552.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 34.042097087022356,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.combine",
+    "count": 92.0,
+    "flops": 5402263552.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 5739905024.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.9411764705882353,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.latent_norm",
+    "count": 92.0,
+    "flops": 675282944.0,
+    "weight_bytes": 659456.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1024.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_up",
+    "count": 92.0,
+    "flops": 2420214071296.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 1012924416.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 421.6470588235294,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_gate_up",
+    "count": 92.0,
+    "flops": 8297876815872.0,
+    "weight_bytes": 16206790656.0,
+    "act_bytes": 1832910848.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 459.97860962566847,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_act",
+    "count": 92.0,
+    "flops": 3472883712.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_down",
+    "count": 92.0,
+    "flops": 4148938407936.0,
+    "weight_bytes": 8103395328.0,
+    "act_bytes": 1254096896.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 443.3814432989691,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.gate_up",
+    "count": 1.0,
+    "flops": 496068722688.0,
+    "weight_bytes": 968884224.0,
+    "act_bytes": 76546048.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 474.5115346038114,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.act",
+    "count": 1.0,
+    "flops": 207618048.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.down",
+    "count": 1.0,
+    "flops": 248034361344.0,
+    "weight_bytes": 484442112.0,
+    "act_bytes": 41943040.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 471.203187250996,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "F.attnres_final",
+    "count": 1.0,
+    "flops": 264241152.0,
+    "weight_bytes": 28672.0,
+    "act_bytes": 80740352.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.2715654952076676,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "F.sp_gather_out",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 88080384.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "F.norm",
+    "count": 1.0,
+    "flops": 14680064.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1024.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "F.lm_head",
+    "count": 1.0,
+    "flops": 1202590842880.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 342884352.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 446.77834047526295,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "F.rejection",
+    "count": 1.0,
+    "flops": 1111490560.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 482347008.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.30433804204296,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.aux_capture",
+    "count": 5.0,
+    "flops": 1321205760.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 403701760.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.272727272727273,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.fc",
+    "count": 1.0,
+    "flops": 263066746880.0,
+    "weight_bytes": 513802240.0,
+    "act_bytes": 44040192.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 471.57894736842104,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.hidden_norm",
+    "count": 1.0,
+    "flops": 14680064.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1024.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.ctx_kv_proj",
+    "count": 1.0,
+    "flops": 75161927680.0,
+    "weight_bytes": 146800640.0,
+    "act_bytes": 17825792.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 456.56050955414014,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.ctx_kv_insert",
+    "count": 1.0,
+    "flops": 26214400.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 10485760.0,
+    "state_bytes": 0.0,
+    "ai": 2.5,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 6422528.0,
+    "act_bytes": 6422528.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.norm_ar",
+    "count": 10.0,
+    "flops": 192675840.0,
+    "weight_bytes": 143360.0,
+    "act_bytes": 256901120.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.7495817066369214,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.qkv",
+    "count": 5.0,
+    "flops": 263066746880.0,
+    "weight_bytes": 587202560.0,
+    "act_bytes": 68812800.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 401.006993006993,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.attn",
+    "count": 5.0,
+    "flops": 112852992000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 64225280.0,
+    "kv_bytes": 2693529600.0,
+    "state_bytes": 0.0,
+    "ai": 40.92205323193917,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.o_proj",
+    "count": 5.0,
+    "flops": 197300060160.0,
+    "weight_bytes": 440401920.0,
+    "act_bytes": 59637760.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 394.56880733944956,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.gate_up",
+    "count": 5.0,
+    "flops": 920733614080.0,
+    "weight_bytes": 2055208960.0,
+    "act_bytes": 160563200.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 415.536231884058,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.silu",
+    "count": 5.0,
+    "flops": 160563200.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.down",
+    "count": 5.0,
+    "flops": 460366807040.0,
+    "weight_bytes": 1027604480.0,
+    "act_bytes": 96337920.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 409.6,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.lm_head",
+    "count": 1.0,
+    "flops": 1052266987520.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 300023808.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 397.25666782126774,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.markov",
+    "count": 7.0,
+    "flops": 75602329600.0,
+    "weight_bytes": 1174863872.0,
+    "act_bytes": 440403712.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 46.804833049878134,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.confidence",
+    "count": 1.0,
+    "flops": 6881280.0,
+    "weight_bytes": 30720.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 224.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   }
+  ],
+  "decode_B8_k3_L135K": [
+   {
+    "id": "G.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 458752.0,
+    "act_bytes": 458880.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "G.attnres_init",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "L.attnres_pre",
+    "count": 93.0,
+    "flops": 904658944.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 315162624.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.822687421721238,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.attnres_post",
+    "count": 93.0,
+    "flops": 919339008.0,
+    "weight_bytes": 5332992.0,
+    "act_bytes": 357826559.99999994,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.5315016579819996,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "L.sp_gather",
+    "count": 93.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 85327872.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "KDA.in_proj",
+    "count": 69.0,
+    "flops": 1562942373888.0,
+    "weight_bytes": 48841949184.0,
+    "act_bytes": 249698304.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.83723614633318,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.f_b_proj",
+    "count": 69.0,
+    "flops": 6945767424.0,
+    "weight_bytes": 217055232.0,
+    "act_bytes": 54829056.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 25.546777546777548,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.conv",
+    "count": 69.0,
+    "flops": 976748544.0,
+    "weight_bytes": 40697856.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 732561408.0,
+    "ai": 1.263157894736842,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.gate_beta_norm",
+    "count": 69.0,
+    "flops": 326430720.0,
+    "weight_bytes": 3417984.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 95.50387596899225,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.core_decode",
+    "count": 69.0,
+    "flops": 32332547358.72,
+    "weight_bytes": 0.0,
+    "act_bytes": 271742976.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 7162822656.0,
+    "ai": 4.348949079089924,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "KDA.o_norm",
+    "count": 69.0,
+    "flops": 217055232.0,
+    "weight_bytes": 35328.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 6144.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "KDA.o_proj",
+    "count": 69.0,
+    "flops": 388962975744.0,
+    "weight_bytes": 12155092992.0,
+    "act_bytes": 85917696.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.775397118581456,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.qkv_a_packed",
+    "count": 24.0,
+    "flops": 25014829056.0,
+    "weight_bytes": 781713408.0,
+    "act_bytes": 14499840.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.417247978270264,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.prologue",
+    "count": 24.0,
+    "flops": 8060928.0,
+    "weight_bytes": 122880.0,
+    "act_bytes": 6586368.0,
+    "kv_bytes": 556032.0,
+    "state_bytes": 0.0,
+    "ai": 1.1095137420718817,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.qb_wq_packed",
+    "count": 24.0,
+    "flops": 53150220288.0,
+    "weight_bytes": 1660944384.0,
+    "act_bytes": 36962304.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.303381194997684,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.g_proj",
+    "count": 24.0,
+    "flops": 135291469824.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 29884416.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.775397118581456,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.idx_q_quant",
+    "count": 24.0,
+    "flops": 12582912.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.idx_score",
+    "count": 24.0,
+    "flops": 859299840000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 209129472.0,
+    "kv_bytes": 1762560000.0,
+    "state_bytes": 0.0,
+    "ai": 435.8190537622346,
+    "ridge": 1258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.topk",
+    "count": 24.0,
+    "flops": 414720000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 213651456.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 1.941105423592339,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.w_uk",
+    "count": 24.0,
+    "flops": 9663676416.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 103809024.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 23.813953488372093,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.sparse_mla",
+    "count": 24.0,
+    "flops": 329168977920.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 160432128.0,
+    "kv_bytes": 1031798784.0,
+    "state_bytes": 0.0,
+    "ai": 276.09498680738784,
+    "ridge": 258.9928057553957,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.w_uv",
+    "count": 24.0,
+    "flops": 9663676416.0,
+    "weight_bytes": 301989888.0,
+    "act_bytes": 94371840.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 24.38095238095238,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DSA.gate_mul",
+    "count": 24.0,
+    "flops": 47185920.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DSA.o_proj",
+    "count": 24.0,
+    "flops": 135291469824.0,
+    "weight_bytes": 4227858432.0,
+    "act_bytes": 29884416.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.775397118581456,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.router",
+    "count": 92.0,
+    "flops": 37815844864.0,
+    "weight_bytes": 1181745152.0,
+    "act_bytes": 52756480.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 30.632478632478634,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.topk",
+    "count": 92.0,
+    "flops": 15826944.0,
+    "weight_bytes": 329728.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 48.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_down",
+    "count": 92.0,
+    "flops": 151263379456.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 63307776.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.577092511013216,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.dispatch",
+    "count": 92.0,
+    "flops": 42205184.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 195198976.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.21621621621621623,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.fc1",
+    "count": 92.0,
+    "flops": 2074469203968.0,
+    "weight_bytes": 422548720361.7537,
+    "act_bytes": 174096384.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 4.9073982330499275,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.act",
+    "count": 92.0,
+    "flops": 1736441856.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.fc2",
+    "count": 92.0,
+    "flops": 1037234601984.0,
+    "weight_bytes": 211274360180.87686,
+    "act_bytes": 337641472.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 4.90158683761923,
+    "ridge": 755.3956834532374,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.combine",
+    "count": 92.0,
+    "flops": 337641472.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 358744064.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.9411764705882353,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "MOE.latent_norm",
+    "count": 92.0,
+    "flops": 42205184.0,
+    "weight_bytes": 659456.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 64.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.latent_up",
+    "count": 92.0,
+    "flops": 151263379456.0,
+    "weight_bytes": 4726980608.0,
+    "act_bytes": 63307776.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.577092511013216,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.shared_gate_up",
+    "count": 92.0,
+    "flops": 518617300992.0,
+    "weight_bytes": 16206790656.0,
+    "act_bytes": 114556928.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.775397118581456,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "MOE.shared_act",
+    "count": 92.0,
+    "flops": 217055232.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "MOE.shared_down",
+    "count": 92.0,
+    "flops": 259308650496.0,
+    "weight_bytes": 8103395328.0,
+    "act_bytes": 78381056.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.69344141488578,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DENSE.gate_up",
+    "count": 1.0,
+    "flops": 31004295168.0,
+    "weight_bytes": 968884224.0,
+    "act_bytes": 4784128.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.842767718920374,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DENSE.act",
+    "count": 1.0,
+    "flops": 12976128.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DENSE.down",
+    "count": 1.0,
+    "flops": 15502147584.0,
+    "weight_bytes": 484442112.0,
+    "act_bytes": 2621440.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.82777179763186,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "F.attnres_final",
+    "count": 1.0,
+    "flops": 16515072.0,
+    "weight_bytes": 28672.0,
+    "act_bytes": 5046272.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.2542372881355934,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "F.sp_gather_out",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 5505024.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "comm"
+   },
+   {
+    "id": "F.norm",
+    "count": 1.0,
+    "flops": 917504.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 64.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "F.lm_head",
+    "count": 1.0,
+    "flops": 75161927680.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 21430272.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.710675477645367,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "F.rejection",
+    "count": 1.0,
+    "flops": 65536000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 28835968.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 2.272717184316476,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.aux_capture",
+    "count": 5.0,
+    "flops": 82575360.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 25231360.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 3.272727272727273,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.fc",
+    "count": 1.0,
+    "flops": 16441671680.0,
+    "weight_bytes": 513802240.0,
+    "act_bytes": 2752512.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.82948490230906,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.hidden_norm",
+    "count": 1.0,
+    "flops": 917504.0,
+    "weight_bytes": 14336.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 64.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.ctx_kv_proj",
+    "count": 1.0,
+    "flops": 4697620480.0,
+    "weight_bytes": 146800640.0,
+    "act_bytes": 1114112.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 31.758972086840938,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.ctx_kv_insert",
+    "count": 1.0,
+    "flops": 1638400.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 655360.0,
+    "state_bytes": 0.0,
+    "ai": 2.5,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.embed",
+    "count": 1.0,
+    "flops": 0.0,
+    "weight_bytes": 344064.0,
+    "act_bytes": 344064.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.0,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.norm_ar",
+    "count": 10.0,
+    "flops": 10321920.0,
+    "weight_bytes": 143360.0,
+    "act_bytes": 13762560.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 0.7422680412371134,
+    "ridge": 9.46043165467626,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.qkv",
+    "count": 5.0,
+    "flops": 14092861440.0,
+    "weight_bytes": 587202560.0,
+    "act_bytes": 3686400.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 23.85027034521004,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.attn",
+    "count": 5.0,
+    "flops": 6045696000.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 3440640.0,
+    "kv_bytes": 336035840.0,
+    "state_bytes": 0.0,
+    "ai": 17.80888030888031,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.o_proj",
+    "count": 5.0,
+    "flops": 10569646080.0,
+    "weight_bytes": 440401920.0,
+    "act_bytes": 3194880.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 23.827146814404433,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.gate_up",
+    "count": 5.0,
+    "flops": 49325015040.0,
+    "weight_bytes": 2055208960.0,
+    "act_bytes": 8601600.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 23.89997221450403,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.silu",
+    "count": 5.0,
+    "flops": 8601600.0,
+    "weight_bytes": 0.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": Infinity,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   },
+   {
+    "id": "DS.down",
+    "count": 5.0,
+    "flops": 24662507520.0,
+    "weight_bytes": 1027604480.0,
+    "act_bytes": 5160960.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 23.880066629650194,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.lm_head",
+    "count": 1.0,
+    "flops": 56371445760.0,
+    "weight_bytes": 2348810240.0,
+    "act_bytes": 16072704.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 23.83688626239253,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.markov",
+    "count": 3.0,
+    "flops": 4050124800.0,
+    "weight_bytes": 503341056.0,
+    "act_bytes": 23593056.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 7.686207265321247,
+    "ridge": 258.9928057553957,
+    "bound": "memory"
+   },
+   {
+    "id": "DS.confidence",
+    "count": 1.0,
+    "flops": 368640.0,
+    "weight_bytes": 30720.0,
+    "act_bytes": 0.0,
+    "kv_bytes": 0.0,
+    "state_bytes": 0.0,
+    "ai": 12.0,
+    "ridge": 9.46043165467626,
+    "bound": "compute"
+   }
+  ]
+ },
+ "decode_per_request_marginal": {
+  "k3_L135K": {
+   "L.attnres_pre": {
+    "bytes": 39395328.0,
+    "flops": 113082368.0
+   },
+   "L.attnres_post": {
+    "bytes": 44728320.00000048,
+    "flops": 114917376.0
+   },
+   "KDA.in_proj": {
+    "bytes": 31212288.0,
+    "flops": 195367796736.0
+   },
+   "KDA.f_b_proj": {
+    "bytes": 6853632.0,
+    "flops": 868220928.0
+   },
+   "KDA.conv": {
+    "bytes": 91570176.0,
+    "flops": 122093568.0
+   },
+   "KDA.core_decode": {
+    "bytes": 929320704.0,
+    "flops": 4041568419.8399963
+   },
+   "KDA.o_proj": {
+    "bytes": 10739712.0,
+    "flops": 48620371968.0
+   },
+   "DSA.qkv_a_packed": {
+    "bytes": 1812480.0,
+    "flops": 3126853632.0
+   },
+   "DSA.prologue": {
+    "bytes": 892800.0,
+    "flops": 1007616.0
+   },
+   "DSA.qb_wq_packed": {
+    "bytes": 4620288.0,
+    "flops": 6643777536.0
+   },
+   "DSA.g_proj": {
+    "bytes": 3735552.0,
+    "flops": 16911433728.0
+   },
+   "DSA.idx_score": {
+    "bytes": 246461184.0,
+    "flops": 107412480000.0
+   },
+   "DSA.topk": {
+    "bytes": 26706432.0,
+    "flops": 51840000.0
+   },
+   "DSA.w_uk": {
+    "bytes": 12976128.0,
+    "flops": 1207959552.0
+   },
+   "DSA.sparse_mla": {
+    "bytes": 149028864.0,
+    "flops": 41146122240.0
+   },
+   "DSA.w_uv": {
+    "bytes": 11796480.0,
+    "flops": 1207959552.0
+   },
+   "DSA.o_proj": {
+    "bytes": 3735552.0,
+    "flops": 16911433728.0
+   },
+   "MOE.router": {
+    "bytes": 6594560.0,
+    "flops": 4726980608.0
+   },
+   "MOE.latent_down": {
+    "bytes": 7913472.0,
+    "flops": 18907922432.0
+   },
+   "MOE.fc1": {
+    "bytes": 21762048.0,
+    "flops": 259308650496.0
+   },
+   "MOE.act": {
+    "bytes": 0.0,
+    "flops": 217055232.0
+   },
+   "MOE.fc2": {
+    "bytes": 42205184.0,
+    "flops": 129654325248.0
+   },
+   "MOE.latent_up": {
+    "bytes": 7913472.0,
+    "flops": 18907922432.0
+   },
+   "MOE.shared_gate_up": {
+    "bytes": 14319616.0,
+    "flops": 64827162624.0
+   },
+   "MOE.shared_down": {
+    "bytes": 9797632.0,
+    "flops": 32413581312.0
+   },
+   "DENSE.gate_up": {
+    "bytes": 598016.0,
+    "flops": 3875536896.0
+   },
+   "DENSE.down": {
+    "bytes": 327680.0,
+    "flops": 1937768448.0
+   },
+   "F.attnres_final": {
+    "bytes": 630784.0,
+    "flops": 2064384.0
+   },
+   "F.lm_head": {
+    "bytes": 2678784.0,
+    "flops": 9395240960.0
+   },
+   "F.rejection": {
+    "bytes": 3604496.0,
+    "flops": 8192000.0
+   },
+   "DS.aux_capture": {
+    "bytes": 3153920.0,
+    "flops": 10321920.0
+   },
+   "DS.fc": {
+    "bytes": 344064.0,
+    "flops": 2055208960.0
+   },
+   "DS.ctx_kv_proj": {
+    "bytes": 139264.0,
+    "flops": 587202560.0
+   },
+   "DS.norm_ar": {
+    "bytes": 1720320.0,
+    "flops": 1290240.0
+   },
+   "DS.qkv": {
+    "bytes": 460800.0,
+    "flops": 1761607680.0
+   },
+   "DS.attn": {
+    "bytes": 42434560.0,
+    "flops": 755712000.0
+   },
+   "DS.o_proj": {
+    "bytes": 399360.0,
+    "flops": 1321205760.0
+   },
+   "DS.gate_up": {
+    "bytes": 1075200.0,
+    "flops": 6165626880.0
+   },
+   "DS.down": {
+    "bytes": 645120.0,
+    "flops": 3082813440.0
+   },
+   "DS.lm_head": {
+    "bytes": 2009088.0,
+    "flops": 7046430720.0
+   },
+   "DS.markov": {
+    "bytes": 2949132.0,
+    "flops": 506265600.0
+   }
+  },
+  "k5_L135K": {
+   "L.attnres_pre": {
+    "bytes": 59092992.0,
+    "flops": 169623552.0
+   },
+   "L.attnres_post": {
+    "bytes": 67092480.0,
+    "flops": 172376064.0
+   },
+   "KDA.in_proj": {
+    "bytes": 46818432.0,
+    "flops": 293051695104.0
+   },
+   "KDA.f_b_proj": {
+    "bytes": 10280448.0,
+    "flops": 1302331392.0
+   },
+   "KDA.conv": {
+    "bytes": 111919104.0,
+    "flops": 183140352.0
+   },
+   "KDA.core_decode": {
+    "bytes": 959870592.0,
+    "flops": 5798630522.880005
+   },
+   "KDA.o_proj": {
+    "bytes": 16109568.0,
+    "flops": 72930557952.0
+   },
+   "DSA.qkv_a_packed": {
+    "bytes": 2718720.0,
+    "flops": 4690280448.0
+   },
+   "DSA.prologue": {
+    "bytes": 1339200.0,
+    "flops": 1511424.0
+   },
+   "DSA.qb_wq_packed": {
+    "bytes": 6930432.0,
+    "flops": 9965666304.0
+   },
+   "DSA.g_proj": {
+    "bytes": 5603328.0,
+    "flops": 25367150592.0
+   },
+   "DSA.idx_score": {
+    "bytes": 259531776.0,
+    "flops": 161118720000.0
+   },
+   "DSA.topk": {
+    "bytes": 40059648.0,
+    "flops": 77760000.0
+   },
+   "DSA.w_uk": {
+    "bytes": 19464192.0,
+    "flops": 1811939328.0
+   },
+   "DSA.sparse_mla": {
+    "bytes": 223543296.0,
+    "flops": 61719183360.0
+   },
+   "DSA.w_uv": {
+    "bytes": 17694720.0,
+    "flops": 1811939328.0
+   },
+   "DSA.o_proj": {
+    "bytes": 5603328.0,
+    "flops": 25367150592.0
+   },
+   "MOE.router": {
+    "bytes": 9891840.0,
+    "flops": 7090470912.0
+   },
+   "MOE.latent_down": {
+    "bytes": 11870208.0,
+    "flops": 28361883648.0
+   },
+   "MOE.fc1": {
+    "bytes": 32643072.0,
+    "flops": 388962975744.0
+   },
+   "MOE.act": {
+    "bytes": 0.0,
+    "flops": 325582848.0
+   },
+   "MOE.fc2": {
+    "bytes": 63307776.0,
+    "flops": 194481487872.0
+   },
+   "MOE.latent_up": {
+    "bytes": 11870208.0,
+    "flops": 28361883648.0
+   },
+   "MOE.shared_gate_up": {
+    "bytes": 21479424.0,
+    "flops": 97240743936.0
+   },
+   "MOE.shared_down": {
+    "bytes": 14696448.0,
+    "flops": 48620371968.0
+   },
+   "DENSE.gate_up": {
+    "bytes": 897024.0,
+    "flops": 5813305344.0
+   },
+   "DENSE.down": {
+    "bytes": 491520.0,
+    "flops": 2906652672.0
+   },
+   "F.attnres_final": {
+    "bytes": 946176.0,
+    "flops": 3096576.0
+   },
+   "F.lm_head": {
+    "bytes": 4018176.0,
+    "flops": 14092861440.0
+   },
+   "F.rejection": {
+    "bytes": 5570584.0,
+    "flops": 12779520.0
+   },
+   "DS.aux_capture": {
+    "bytes": 4730880.0,
+    "flops": 15482880.0
+   },
+   "DS.fc": {
+    "bytes": 516096.0,
+    "flops": 3082813440.0
+   },
+   "DS.ctx_kv_proj": {
+    "bytes": 208896.0,
+    "flops": 880803840.0
+   },
+   "DS.ctx_kv_insert": {
+    "bytes": 122880.0,
+    "flops": 307200.0
+   },
+   "DS.norm_ar": {
+    "bytes": 2867200.0,
+    "flops": 2150400.0
+   },
+   "DS.qkv": {
+    "bytes": 768000.0,
+    "flops": 2936012800.0
+   },
+   "DS.attn": {
+    "bytes": 42762240.0,
+    "flops": 1259520000.0
+   },
+   "DS.o_proj": {
+    "bytes": 665600.0,
+    "flops": 2202009600.0
+   },
+   "DS.gate_up": {
+    "bytes": 1792000.0,
+    "flops": 10276044800.0
+   },
+   "DS.down": {
+    "bytes": 1075200.0,
+    "flops": 5138022400.0
+   },
+   "DS.lm_head": {
+    "bytes": 3348480.0,
+    "flops": 11744051200.0
+   },
+   "DS.markov": {
+    "bytes": 4915220.0,
+    "flops": 843776000.0
+   }
+  },
+  "k7_L135K": {
+   "G.embed": {
+    "bytes": 114720.0,
+    "flops": 0.0
+   },
+   "L.attnres_pre": {
+    "bytes": 78790656.0,
+    "flops": 226164736.0
+   },
+   "L.attnres_post": {
+    "bytes": 89456640.00000095,
+    "flops": 229834752.0
+   },
+   "KDA.in_proj": {
+    "bytes": 62424576.0,
+    "flops": 390735593472.0
+   },
+   "KDA.f_b_proj": {
+    "bytes": 13707264.0,
+    "flops": 1736441856.0
+   },
+   "KDA.conv": {
+    "bytes": 132268032.0,
+    "flops": 244187136.0
+   },
+   "KDA.core_decode": {
+    "bytes": 990420480.0,
+    "flops": 7431971143.679993
+   },
+   "KDA.o_proj": {
+    "bytes": 21479424.0,
+    "flops": 97240743936.0
+   },
+   "DSA.qkv_a_packed": {
+    "bytes": 3624960.0,
+    "flops": 6253707264.0
+   },
+   "DSA.prologue": {
+    "bytes": 1785600.0,
+    "flops": 2015232.0
+   },
+   "DSA.qb_wq_packed": {
+    "bytes": 9240576.0,
+    "flops": 13287555072.0
+   },
+   "DSA.g_proj": {
+    "bytes": 7471104.0,
+    "flops": 33822867456.0
+   },
+   "DSA.idx_score": {
+    "bytes": 272602368.0,
+    "flops": 214824960000.0
+   },
+   "DSA.topk": {
+    "bytes": 53412864.0,
+    "flops": 103680000.0
+   },
+   "DSA.w_uk": {
+    "bytes": 25952256.0,
+    "flops": 2415919104.0
+   },
+   "DSA.sparse_mla": {
+    "bytes": 298057728.0,
+    "flops": 82292244480.0
+   },
+   "DSA.w_uv": {
+    "bytes": 23592960.0,
+    "flops": 2415919104.0
+   },
+   "DSA.o_proj": {
+    "bytes": 7471104.0,
+    "flops": 33822867456.0
+   },
+   "MOE.router": {
+    "bytes": 13189120.0,
+    "flops": 9453961216.0
+   },
+   "MOE.latent_down": {
+    "bytes": 15826944.0,
+    "flops": 37815844864.0
+   },
+   "MOE.fc1": {
+    "bytes": 43524096.0,
+    "flops": 518617300992.0
+   },
+   "MOE.act": {
+    "bytes": 0.0,
+    "flops": 434110464.0
+   },
+   "MOE.fc2": {
+    "bytes": 84410368.0,
+    "flops": 259308650496.0
+   },
+   "MOE.latent_up": {
+    "bytes": 15826944.0,
+    "flops": 37815844864.0
+   },
+   "MOE.shared_gate_up": {
+    "bytes": 28639232.0,
+    "flops": 129654325248.0
+   },
+   "MOE.shared_down": {
+    "bytes": 19595264.0,
+    "flops": 64827162624.0
+   },
+   "DENSE.gate_up": {
+    "bytes": 1196032.0,
+    "flops": 7751073792.0
+   },
+   "DENSE.down": {
+    "bytes": 655360.0,
+    "flops": 3875536896.0
+   },
+   "F.attnres_final": {
+    "bytes": 1261568.0,
+    "flops": 4128768.0
+   },
+   "F.lm_head": {
+    "bytes": 5357568.0,
+    "flops": 18790481920.0
+   },
+   "F.rejection": {
+    "bytes": 7536672.0,
+    "flops": 17367040.0
+   },
+   "DS.aux_capture": {
+    "bytes": 6307840.0,
+    "flops": 20643840.0
+   },
+   "DS.fc": {
+    "bytes": 688128.0,
+    "flops": 4110417920.0
+   },
+   "DS.ctx_kv_proj": {
+    "bytes": 278528.0,
+    "flops": 1174405120.0
+   },
+   "DS.ctx_kv_insert": {
+    "bytes": 163840.0,
+    "flops": 409600.0
+   },
+   "DS.embed": {
+    "bytes": 100352.0,
+    "flops": 0.0
+   },
+   "DS.norm_ar": {
+    "bytes": 4014080.0,
+    "flops": 3010560.0
+   },
+   "DS.qkv": {
+    "bytes": 1075200.0,
+    "flops": 4110417920.0
+   },
+   "DS.attn": {
+    "bytes": 43089920.0,
+    "flops": 1763328000.0
+   },
+   "DS.o_proj": {
+    "bytes": 931840.0,
+    "flops": 3082813440.0
+   },
+   "DS.gate_up": {
+    "bytes": 2508800.0,
+    "flops": 14386462720.0
+   },
+   "DS.down": {
+    "bytes": 1505280.0,
+    "flops": 7193231360.0
+   },
+   "DS.lm_head": {
+    "bytes": 4687872.0,
+    "flops": 16441671680.0
+   },
+   "DS.markov": {
+    "bytes": 6881308.0,
+    "flops": 1181286400.0
+   }
+  }
+ }
+}

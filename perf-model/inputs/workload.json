@@ -1,0 +1,2755 @@
+{
+ "_meta": {
+  "built_by": "k31vr/solmodel/inputs/workload_src/build_workload.py",
+  "date": "2026-11-17",
+  "population": "aiperf profile_export.jsonl(.gz) records with benchmark_phase == 'profiling' and was_cancelled == false, all 16 runs of results/k31vr-frozen-sweep-20261114 that kept the per-request export (C512 kept only the summary). Pooled = all records of those runs (dominated by C>=96).",
+  "dataset": "semianalysis_cc_traces_weka_062126 (AgentX 'agentx profile', duration 3600 s, closed loop)",
+  "units": "tokens unless stated; s = seconds; B = bytes"
+ },
+ "pooled": {
+  "n_requests": 270887,
+  "isl": {
+   "n": 270887,
+   "mean": 144974.5849560887,
+   "min": 224,
+   "max": 950780,
+   "p10": 22494.0,
+   "p25": 48780.0,
+   "p50": 99706.0,
+   "p75": 185528.0,
+   "p90": 311156.0,
+   "p95": 474269.4,
+   "p99": 744730.0
+  },
+  "osl": {
+   "n": 270887,
+   "mean": 1047.5752804675012,
+   "min": 1,
+   "max": 59903,
+   "p10": 111.0,
+   "p25": 196.0,
+   "p50": 444.0,
+   "p75": 1048.0,
+   "p90": 2423.0,
+   "p95": 4021.0,
+   "p99": 9566.0
+  },
+  "cached_prefix_tokens": {
+   "n": 270887,
+   "mean": 139518.3017568211,
+   "min": 0,
+   "max": 928640,
+   "p10": 0.0,
+   "p25": 43904.0,
+   "p50": 94080.0,
+   "p75": 181120.0,
+   "p90": 307584.0,
+   "p95": 469248.0,
+   "p99": 742400.0
+  },
+  "fresh_prefill_tokens": {
+   "n": 270887,
+   "mean": 5456.283199267591,
+   "min": 2,
+   "max": 950780,
+   "p10": 439.0,
+   "p25": 867.0,
+   "p50": 1967.0,
+   "p75": 3353.0,
+   "p90": 8654.0,
+   "p95": 17762.70000000001,
+   "p99": 74421.42000000004
+  },
+  "prefix_hit_rate_token_weighted": 0.9623638639771224,
+  "zero_hit_request_frac": 0.12195121951219512,
+  "cache_read_granularity_tokens": 128,
+  "source_kind_mix": {
+   "weka_main": 0.4078342629952711,
+   "weka_subagent": 0.44792847201969826,
+   "weka_flat": 0.14423726498503067
+  },
+  "by_source_kind": {
+   "weka_main": {
+    "isl_mean": 190603.28468368982,
+    "osl_mean": 1368.4322257121391,
+    "fresh_mean": 4748.756121183595,
+    "hit_rate": 0.9750856543261347
+   },
+   "weka_subagent": {
+    "isl_mean": 61177.25522095304,
+    "osl_mean": 724.4937941947288,
+    "fresh_mean": 5110.724505101452,
+    "hit_rate": 0.9164603824306415
+   },
+   "weka_flat": {
+    "isl_mean": 276190.7636926699,
+    "osl_mean": 1143.6734746109746,
+    "fresh_mean": 8529.964347870598,
+    "hit_rate": 0.969115678475902
+   }
+  },
+  "fresh_size_bucket_request_frac": {
+   "[0,1024)": 0.28110614389025684,
+   "[1024,2048)": 0.24101562644202196,
+   "[2048,4096)": 0.27040057293262504,
+   "[4096,8192)": 0.1019576428547697,
+   "[8192,16384)": 0.05170052457297692,
+   "[16384,32768)": 0.027280748060999605,
+   "[32768,65536)": 0.01524620967414457,
+   "[65536,131072)": 0.006895864327191781,
+   "[131072,1000000000)": 0.004396667245013603
+  },
+  "fresh_size_bucket_token_mass": {
+   "[0,1024)": 0.02859908463120734,
+   "[1024,2048)": 0.06847795533709758,
+   "[2048,4096)": 0.14076896413632936,
+   "[4096,8192)": 0.10773214377328368,
+   "[8192,16384)": 0.10587593143955953,
+   "[16384,32768)": 0.11494720189824419,
+   "[32768,65536)": 0.12491644969447557,
+   "[65536,131072)": 0.12014323503163322,
+   "[131072,1000000000)": 0.18853903405816952
+  },
+  "fresh_token_weighted_mean_cached_prefix": 72907.89007320564,
+  "fresh_token_weighted_mean_end_context": 156650.5500353497,
+  "decode_context_osl_weighted": {
+   "mean": 189264.72243457902,
+   "p10": 35156.5,
+   "p25": 77835.5,
+   "p50": 147635.5,
+   "p75": 243617.5,
+   "p90": 389461.5,
+   "p95": 577095.5,
+   "p99": 762151.5
+  },
+  "decode_context_decode_time_weighted": {
+   "mean": 188378.08266270766,
+   "p50": 147763.0,
+   "p90": 385111.0,
+   "p99": 760513.0
+  },
+  "first_turn_in_window_frac": 0.12824166534385187,
+  "first_turn_isl_mean": 26076.612711937592,
+  "first_turn_fresh_mean": 16770.79274014796,
+  "same_conversation_turn_growth": {
+   "isl_minus_prev_isl": {
+    "n": 236148,
+    "mean": 3073.525166421058,
+    "min": -807276,
+    "max": 619401,
+    "p10": 290.0,
+    "p25": 673.0,
+    "p50": 1633.0,
+    "p75": 2913.0,
+    "p90": 6179.299999999988,
+    "p95": 10272.0,
+    "p99": 33109.0
+   },
+   "isl_minus_prev_isl_plus_osl": {
+    "n": 236148,
+    "mean": 2082.465157443637,
+    "min": -815809,
+    "max": 619289,
+    "p10": -312.0,
+    "p25": 127.0,
+    "p50": 674.0,
+    "p75": 1792.0,
+    "p90": 5325.599999999977,
+    "p95": 9233.0,
+    "p99": 31481.32999999993
+   },
+   "note": "negative values = context compaction/truncation between turns; the median new-input growth per follow-up turn is ~1.6K tokens, i.e. the measured fresh mean (5.46K) carries ~2-3x structural growth from partial-block tails, misses (12% zero-hit), and evictions"
+  },
+  "same_conversation_gap_s": {
+   "n": 236148,
+   "mean": 27.958544368108807,
+   "min": -3489.554445028305,
+   "max": 4318.839951038361,
+   "p10": 0.8162808179855346,
+   "p25": 1.3970052599906921,
+   "p50": 2.742169141769409,
+   "p75": 8.11036902666092,
+   "p90": 60.35779376029966,
+   "p95": 184.94239692687987,
+   "p99": 1451.6644929718968
+  },
+  "same_conversation_gap_note": "next-turn start minus previous-turn end within one conversation_id; includes parent waits on subagents, so it is NOT the per-request think time; use closed_loop_idle_per_request_s"
+ },
+ "think_time": {
+  "closed_loop_idle_per_request_s": {
+   "mean_request_weighted_C>=16": 16.24,
+   "min": 15.16,
+   "max": 18.98
+  },
+  "definition": "C / lambda - mean request latency (Little's law per run): the idle time each of the C closed-loop session slots spends between a response and its next request",
+  "use": "request rate per session slot = 1 / (idle + latency); in-flight requests = C x latency / (idle + latency) (30-40% of C at C>=96)"
+ },
+ "attention_work_moments": {
+  "n_requests": 270887,
+  "mean_fresh": 5456.283199267591,
+  "mean_fresh_x_cached": 397806095.7004803,
+  "mean_fresh_sq_half": 228461834.30671278,
+  "mean_dense_attn_pairs_prefill": 626270658.1487926,
+  "mean_sparse_attn_pairs_prefill_topk2048": 10929124.64765751,
+  "mean_osl": 1047.5752804675012,
+  "mean_decode_ctx_sum_per_request": 198269568.4746481,
+  "mean_isl": 144974.5849560887,
+  "E_isl_plus_osl": 146022.1602365562,
+  "decode_ctx_per_output_token_mean": 189265.222434579,
+  "dense_pairs_per_fresh_token": 114779.72005427767
+ },
+ "attention_work_note": "mean_dense_attn_pairs_prefill = E[fresh*cached + fresh*(fresh+1)/2] (indexer logits per request); dense_pairs_per_fresh_token = average keys the indexer scores per fresh token; mean_sparse_attn_pairs_prefill_topk2048 = E[sum over fresh tokens of min(ctx, 2048)] (~2003 per fresh token); decode_ctx_per_output_token_mean = E[sum over output tokens of ctx]/E[OSL]",
+ "histograms": {
+  "hist_isl_request_frac": [
+   {
+    "lo": 0,
+    "hi": 1024,
+    "frac": 0.008608755680412866
+   },
+   {
+    "lo": 1024,
+    "hi": 2048,
+    "frac": 0.002270319358256395
+   },
+   {
+    "lo": 2048,
+    "hi": 4096,
+    "frac": 0.0592977883767032
+   },
+   {
+    "lo": 4096,
+    "hi": 8192,
+    "frac": 0.009860200009598098
+   },
+   {
+    "lo": 8192,
+    "hi": 16384,
+    "frac": 0.011835193272471548
+   },
+   {
+    "lo": 16384,
+    "hi": 32768,
+    "frac": 0.057979895676056804
+   },
+   {
+    "lo": 32768,
+    "hi": 65536,
+    "frac": 0.19769128824934382
+   },
+   {
+    "lo": 65536,
+    "hi": 98304,
+    "frac": 0.14785870122966402
+   },
+   {
+    "lo": 98304,
+    "hi": 131072,
+    "frac": 0.11766529955295012
+   },
+   {
+    "lo": 131072,
+    "hi": 196608,
+    "frac": 0.15361756008963148
+   },
+   {
+    "lo": 196608,
+    "hi": 262144,
+    "frac": 0.08799610169554095
+   },
+   {
+    "lo": 262144,
+    "hi": 393216,
+    "frac": 0.08056495882046757
+   },
+   {
+    "lo": 393216,
+    "hi": 524288,
+    "frac": 0.023338144687637282
+   },
+   {
+    "lo": 524288,
+    "hi": 786432,
+    "frac": 0.03676440729898445
+   },
+   {
+    "lo": 786432,
+    "hi": 1048576,
+    "frac": 0.004651386002281394
+   }
+  ],
+  "hist_fresh_request_frac": [
+   {
+    "lo": 0,
+    "hi": 1024,
+    "frac": 0.28110614389025684
+   },
+   {
+    "lo": 1024,
+    "hi": 2048,
+    "frac": 0.24101562644202196
+   },
+   {
+    "lo": 2048,
+    "hi": 4096,
+    "frac": 0.27040057293262504
+   },
+   {
+    "lo": 4096,
+    "hi": 8192,
+    "frac": 0.1019576428547697
+   },
+   {
+    "lo": 8192,
+    "hi": 16384,
+    "frac": 0.05170052457297692
+   },
+   {
+    "lo": 16384,
+    "hi": 32768,
+    "frac": 0.027280748060999605
+   },
+   {
+    "lo": 32768,
+    "hi": 65536,
+    "frac": 0.01524620967414457
+   },
+   {
+    "lo": 65536,
+    "hi": 98304,
+    "frac": 0.004219471587783836
+   },
+   {
+    "lo": 98304,
+    "hi": 131072,
+    "frac": 0.002676392739407945
+   },
+   {
+    "lo": 131072,
+    "hi": 196608,
+    "frac": 0.0025176549631396117
+   },
+   {
+    "lo": 196608,
+    "hi": 262144,
+    "frac": 0.0008047636099185269
+   },
+   {
+    "lo": 262144,
+    "hi": 393216,
+    "frac": 0.0006423342574579068
+   },
+   {
+    "lo": 393216,
+    "hi": 524288,
+    "frac": 0.0001255135905377519
+   },
+   {
+    "lo": 524288,
+    "hi": 786432,
+    "frac": 0.0002731766382292247
+   },
+   {
+    "lo": 786432,
+    "hi": 1048576,
+    "frac": 3.3224185730581386e-05
+   }
+  ],
+  "hist_fresh_token_mass": [
+   {
+    "lo": 0,
+    "hi": 1024,
+    "frac": 0.02859908463120734
+   },
+   {
+    "lo": 1024,
+    "hi": 2048,
+    "frac": 0.06847795533709758
+   },
+   {
+    "lo": 2048,
+    "hi": 4096,
+    "frac": 0.14076896413632936
+   },
+   {
+    "lo": 4096,
+    "hi": 8192,
+    "frac": 0.10773214377328368
+   },
+   {
+    "lo": 8192,
+    "hi": 16384,
+    "frac": 0.10587593143955953
+   },
+   {
+    "lo": 16384,
+    "hi": 32768,
+    "frac": 0.11494720189824419
+   },
+   {
+    "lo": 32768,
+    "hi": 65536,
+    "frac": 0.12491644969447557
+   },
+   {
+    "lo": 65536,
+    "hi": 98304,
+    "frac": 0.06357617345670577
+   },
+   {
+    "lo": 98304,
+    "hi": 131072,
+    "frac": 0.05656706157492746
+   },
+   {
+    "lo": 131072,
+    "hi": 196608,
+    "frac": 0.07008569540523706
+   },
+   {
+    "lo": 196608,
+    "hi": 262144,
+    "frac": 0.034169347438311404
+   },
+   {
+    "lo": 262144,
+    "hi": 393216,
+    "frac": 0.036123931517787665
+   },
+   {
+    "lo": 393216,
+    "hi": 524288,
+    "frac": 0.010175317852349713
+   },
+   {
+    "lo": 524288,
+    "hi": 786432,
+    "frac": 0.03241622527338026
+   },
+   {
+    "lo": 786432,
+    "hi": 1048576,
+    "frac": 0.005568516571103411
+   }
+  ],
+  "hist_cached_prefix_fresh_token_weighted": [
+   {
+    "lo": 0,
+    "hi": 1024,
+    "frac": 0.4726175050002345
+   },
+   {
+    "lo": 1024,
+    "hi": 2048,
+    "frac": 3.599370601878234e-07
+   },
+   {
+    "lo": 2048,
+    "hi": 4096,
+    "frac": 2.997220256827176e-07
+   },
+   {
+    "lo": 4096,
+    "hi": 8192,
+    "frac": 3.6602622098047457e-07
+   },
+   {
+    "lo": 8192,
+    "hi": 16384,
+    "frac": 0.008333551037746006
+   },
+   {
+    "lo": 16384,
+    "hi": 32768,
+    "frac": 0.04934804617202515
+   },
+   {
+    "lo": 32768,
+    "hi": 65536,
+    "frac": 0.1272096053220651
+   },
+   {
+    "lo": 65536,
+    "hi": 98304,
+    "frac": 0.08754314281210492
+   },
+   {
+    "lo": 98304,
+    "hi": 131072,
+    "frac": 0.06291413215581845
+   },
+   {
+    "lo": 131072,
+    "hi": 196608,
+    "frac": 0.08137208754280656
+   },
+   {
+    "lo": 196608,
+    "hi": 262144,
+    "frac": 0.045192589049918845
+   },
+   {
+    "lo": 262144,
+    "hi": 393216,
+    "frac": 0.03664727662043365
+   },
+   {
+    "lo": 393216,
+    "hi": 524288,
+    "frac": 0.012398804008443402
+   },
+   {
+    "lo": 524288,
+    "hi": 786432,
+    "frac": 0.014834839087738791
+   },
+   {
+    "lo": 786432,
+    "hi": 1048576,
+    "frac": 0.001587395505357813
+   }
+  ],
+  "hist_decode_ctx_osl_weighted": [
+   {
+    "lo": 0,
+    "hi": 1024,
+    "frac": 0.0005495595490821454
+   },
+   {
+    "lo": 1024,
+    "hi": 2048,
+    "frac": 0.000431335406164454
+   },
+   {
+    "lo": 2048,
+    "hi": 4096,
+    "frac": 0.056769369977801916
+   },
+   {
+    "lo": 4096,
+    "hi": 8192,
+    "frac": 0.007747936499937758
+   },
+   {
+    "lo": 8192,
+    "hi": 16384,
+    "frac": 0.006465960959673882
+   },
+   {
+    "lo": 16384,
+    "hi": 32768,
+    "frac": 0.02243890990567247
+   },
+   {
+    "lo": 32768,
+    "hi": 65536,
+    "frac": 0.10788755967435766
+   },
+   {
+    "lo": 65536,
+    "hi": 98304,
+    "frac": 0.12256896210116112
+   },
+   {
+    "lo": 98304,
+    "hi": 131072,
+    "frac": 0.11643388355596754
+   },
+   {
+    "lo": 131072,
+    "hi": 196608,
+    "frac": 0.20989242075200373
+   },
+   {
+    "lo": 196608,
+    "hi": 262144,
+    "frac": 0.13083495074126192
+   },
+   {
+    "lo": 262144,
+    "hi": 393216,
+    "frac": 0.11897337507656827
+   },
+   {
+    "lo": 393216,
+    "hi": 524288,
+    "frac": 0.03558160127305297
+   },
+   {
+    "lo": 524288,
+    "hi": 786432,
+    "frac": 0.05724255903520586
+   },
+   {
+    "lo": 786432,
+    "hi": 1048576,
+    "frac": 0.006181615492088305
+   }
+  ],
+  "hist_osl_request_frac": [
+   {
+    "lo": 0,
+    "hi": 64,
+    "frac": 0.033390306659234294
+   },
+   {
+    "lo": 64,
+    "hi": 128,
+    "frac": 0.1028288548361494
+   },
+   {
+    "lo": 128,
+    "hi": 256,
+    "frac": 0.18743608958717103
+   },
+   {
+    "lo": 256,
+    "hi": 512,
+    "frac": 0.22361722784777416
+   },
+   {
+    "lo": 512,
+    "hi": 1024,
+    "frac": 0.1968902162156176
+   },
+   {
+    "lo": 1024,
+    "hi": 2048,
+    "frac": 0.13723434494826256
+   },
+   {
+    "lo": 2048,
+    "hi": 4096,
+    "frac": 0.06983354682948979
+   },
+   {
+    "lo": 4096,
+    "hi": 8192,
+    "frac": 0.03466759202176553
+   },
+   {
+    "lo": 8192,
+    "hi": 16384,
+    "frac": 0.011632156581895772
+   },
+   {
+    "lo": 16384,
+    "hi": 1000000,
+    "frac": 0.002469664472639883
+   }
+  ]
+ },
+ "per_run": [
+  {
+   "run": "C1-a1093683",
+   "concurrency": 1,
+   "n_profiling_requests": 404,
+   "isl_mean": 285366.0,
+   "isl_p50": 294692.0,
+   "isl_p90": 593800.0,
+   "cached_mean": 279768.0,
+   "fresh_mean": 5598.0,
+   "fresh_p50": 2122.0,
+   "hit_rate_token_weighted": 0.9804,
+   "zero_hit_request_frac": 0.042,
+   "osl_mean": 1753.0,
+   "osl_p50": 728.0,
+   "decode_ctx_osl_weighted_mean": 371751.0,
+   "req_per_s": 0.112,
+   "mean_request_latency_s": 2.52,
+   "closed_loop_idle_per_request_s": 6.4,
+   "mean_inflight_requests": 0.3,
+   "fresh_tok_per_s": 628.0,
+   "out_tok_per_s": 197.0,
+   "ttft_p50_s": 0.27,
+   "ttft_p90_s": 0.36,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C1-a1093683/agentx/logs/agentic/conc_1/aiperf_artifacts/profile_export.jsonl"
+  },
+  {
+   "run": "C8-a1093682",
+   "concurrency": 8,
+   "n_profiling_requests": 1457,
+   "isl_mean": 169807.0,
+   "isl_p50": 110941.0,
+   "isl_p90": 422308.0,
+   "cached_mean": 165516.0,
+   "fresh_mean": 4291.0,
+   "fresh_p50": 1919.0,
+   "hit_rate_token_weighted": 0.9747,
+   "zero_hit_request_frac": 0.03,
+   "osl_mean": 1166.0,
+   "osl_p50": 469.0,
+   "decode_ctx_osl_weighted_mean": 242392.0,
+   "req_per_s": 0.406,
+   "mean_request_latency_s": 1.99,
+   "closed_loop_idle_per_request_s": 17.73,
+   "mean_inflight_requests": 0.8,
+   "fresh_tok_per_s": 1741.0,
+   "out_tok_per_s": 473.0,
+   "ttft_p50_s": 0.19,
+   "ttft_p90_s": 0.35,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C8-a1093682/agentx/logs/agentic/conc_8/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "concurrency": 16,
+   "n_profiling_requests": 2791,
+   "isl_mean": 159265.0,
+   "isl_p50": 111651.0,
+   "isl_p90": 305910.0,
+   "cached_mean": 154667.0,
+   "fresh_mean": 4598.0,
+   "fresh_p50": 1697.0,
+   "hit_rate_token_weighted": 0.9711,
+   "zero_hit_request_frac": 0.039,
+   "osl_mean": 1029.0,
+   "osl_p50": 371.0,
+   "decode_ctx_osl_weighted_mean": 211342.0,
+   "req_per_s": 0.775,
+   "mean_request_latency_s": 1.68,
+   "closed_loop_idle_per_request_s": 18.98,
+   "mean_inflight_requests": 1.3,
+   "fresh_tok_per_s": 3562.0,
+   "out_tok_per_s": 797.0,
+   "ttft_p50_s": 0.2,
+   "ttft_p90_s": 0.39,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999/agentx/logs/agentic/conc_16/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "concurrency": 48,
+   "n_profiling_requests": 8293,
+   "isl_mean": 161140.0,
+   "isl_p50": 95931.0,
+   "isl_p90": 363122.0,
+   "cached_mean": 156025.0,
+   "fresh_mean": 5115.0,
+   "fresh_p50": 1899.0,
+   "hit_rate_token_weighted": 0.9683,
+   "zero_hit_request_frac": 0.103,
+   "osl_mean": 1056.0,
+   "osl_p50": 443.0,
+   "decode_ctx_osl_weighted_mean": 204532.0,
+   "req_per_s": 2.3,
+   "mean_request_latency_s": 3.32,
+   "closed_loop_idle_per_request_s": 17.55,
+   "mean_inflight_requests": 7.6,
+   "fresh_tok_per_s": 11765.0,
+   "out_tok_per_s": 2428.0,
+   "ttft_p50_s": 0.26,
+   "ttft_p90_s": 0.73,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681/agentx/logs/agentic/conc_48/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C64-a1093680",
+   "concurrency": 64,
+   "n_profiling_requests": 11967,
+   "isl_mean": 149503.0,
+   "isl_p50": 89357.0,
+   "isl_p90": 351189.0,
+   "cached_mean": 144414.0,
+   "fresh_mean": 5089.0,
+   "fresh_p50": 2000.0,
+   "hit_rate_token_weighted": 0.966,
+   "zero_hit_request_frac": 0.14,
+   "osl_mean": 1042.0,
+   "osl_p50": 461.0,
+   "decode_ctx_osl_weighted_mean": 194142.0,
+   "req_per_s": 3.312,
+   "mean_request_latency_s": 4.16,
+   "closed_loop_idle_per_request_s": 15.16,
+   "mean_inflight_requests": 13.8,
+   "fresh_tok_per_s": 16858.0,
+   "out_tok_per_s": 3450.0,
+   "ttft_p50_s": 0.32,
+   "ttft_p90_s": 0.85,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C64-a1093680/agentx/logs/agentic/conc_64/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "concurrency": 72,
+   "n_profiling_requests": 14085,
+   "isl_mean": 145618.0,
+   "isl_p50": 85960.0,
+   "isl_p90": 349421.0,
+   "cached_mean": 140226.0,
+   "fresh_mean": 5392.0,
+   "fresh_p50": 2072.0,
+   "hit_rate_token_weighted": 0.963,
+   "zero_hit_request_frac": 0.156,
+   "osl_mean": 1068.0,
+   "osl_p50": 477.0,
+   "decode_ctx_osl_weighted_mean": 191132.0,
+   "req_per_s": 3.902,
+   "mean_request_latency_s": 2.8,
+   "closed_loop_idle_per_request_s": 15.65,
+   "mean_inflight_requests": 10.9,
+   "fresh_tok_per_s": 21040.0,
+   "out_tok_per_s": 4167.0,
+   "ttft_p50_s": 0.38,
+   "ttft_p90_s": 1.08,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025/agentx/logs/agentic/conc_72/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "concurrency": 96,
+   "n_profiling_requests": 16937,
+   "isl_mean": 145009.0,
+   "isl_p50": 93525.0,
+   "isl_p90": 323229.0,
+   "cached_mean": 139499.0,
+   "fresh_mean": 5511.0,
+   "fresh_p50": 2033.0,
+   "hit_rate_token_weighted": 0.962,
+   "zero_hit_request_frac": 0.151,
+   "osl_mean": 1057.0,
+   "osl_p50": 470.0,
+   "decode_ctx_osl_weighted_mean": 188325.0,
+   "req_per_s": 4.692,
+   "mean_request_latency_s": 3.79,
+   "closed_loop_idle_per_request_s": 16.67,
+   "mean_inflight_requests": 17.8,
+   "fresh_tok_per_s": 25854.0,
+   "out_tok_per_s": 4957.0,
+   "ttft_p50_s": 0.51,
+   "ttft_p90_s": 1.51,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C96-1P2D-a1093473/agentx/logs/agentic/conc_96/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "concurrency": 96,
+   "n_profiling_requests": 16826,
+   "isl_mean": 144329.0,
+   "isl_p50": 93059.0,
+   "isl_p90": 320751.0,
+   "cached_mean": 139069.0,
+   "fresh_mean": 5261.0,
+   "fresh_p50": 2034.0,
+   "hit_rate_token_weighted": 0.9636,
+   "zero_hit_request_frac": 0.149,
+   "osl_mean": 1054.0,
+   "osl_p50": 469.0,
+   "decode_ctx_osl_weighted_mean": 187384.0,
+   "req_per_s": 4.667,
+   "mean_request_latency_s": 4.08,
+   "closed_loop_idle_per_request_s": 16.49,
+   "mean_inflight_requests": 19.0,
+   "fresh_tok_per_s": 24552.0,
+   "out_tok_per_s": 4920.0,
+   "ttft_p50_s": 0.59,
+   "ttft_p90_s": 1.91,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C96-1P2D-k3-a1097000/agentx/logs/agentic/conc_96/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "concurrency": 112,
+   "n_profiling_requests": 18398,
+   "isl_mean": 139990.0,
+   "isl_p50": 92746.0,
+   "isl_p90": 302844.0,
+   "cached_mean": 134673.0,
+   "fresh_mean": 5317.0,
+   "fresh_p50": 2010.0,
+   "hit_rate_token_weighted": 0.962,
+   "zero_hit_request_frac": 0.143,
+   "osl_mean": 1040.0,
+   "osl_p50": 463.0,
+   "decode_ctx_osl_weighted_mean": 181239.0,
+   "req_per_s": 5.082,
+   "mean_request_latency_s": 6.11,
+   "closed_loop_idle_per_request_s": 15.93,
+   "mean_inflight_requests": 31.1,
+   "fresh_tok_per_s": 27022.0,
+   "out_tok_per_s": 5288.0,
+   "ttft_p50_s": 0.99,
+   "ttft_p90_s": 2.75,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C112-1P1D-a1094730/agentx/logs/agentic/conc_112/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "concurrency": 128,
+   "n_profiling_requests": 20162,
+   "isl_mean": 137889.0,
+   "isl_p50": 95836.0,
+   "isl_p90": 290042.0,
+   "cached_mean": 132402.0,
+   "fresh_mean": 5487.0,
+   "fresh_p50": 2031.0,
+   "hit_rate_token_weighted": 0.9602,
+   "zero_hit_request_frac": 0.141,
+   "osl_mean": 1061.0,
+   "osl_p50": 471.0,
+   "decode_ctx_osl_weighted_mean": 179831.0,
+   "req_per_s": 5.561,
+   "mean_request_latency_s": 6.6,
+   "closed_loop_idle_per_request_s": 16.41,
+   "mean_inflight_requests": 36.7,
+   "fresh_tok_per_s": 30510.0,
+   "out_tok_per_s": 5897.0,
+   "ttft_p50_s": 1.14,
+   "ttft_p90_s": 3.2,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270/agentx/logs/agentic/conc_128/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "concurrency": 128,
+   "n_profiling_requests": 19815,
+   "isl_mean": 137893.0,
+   "isl_p50": 96058.0,
+   "isl_p90": 290446.0,
+   "cached_mean": 132353.0,
+   "fresh_mean": 5540.0,
+   "fresh_p50": 2040.0,
+   "hit_rate_token_weighted": 0.9598,
+   "zero_hit_request_frac": 0.142,
+   "osl_mean": 1060.0,
+   "osl_p50": 472.0,
+   "decode_ctx_osl_weighted_mean": 179616.0,
+   "req_per_s": 5.468,
+   "mean_request_latency_s": 7.36,
+   "closed_loop_idle_per_request_s": 16.05,
+   "mean_inflight_requests": 40.2,
+   "fresh_tok_per_s": 30294.0,
+   "out_tok_per_s": 5794.0,
+   "ttft_p50_s": 0.99,
+   "ttft_p90_s": 6.8,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C128-1P1D-llh-a1096428/agentx/logs/agentic/conc_128/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "concurrency": 160,
+   "n_profiling_requests": 23020,
+   "isl_mean": 144533.0,
+   "isl_p50": 103136.0,
+   "isl_p90": 303657.0,
+   "cached_mean": 138783.0,
+   "fresh_mean": 5749.0,
+   "fresh_p50": 1950.0,
+   "hit_rate_token_weighted": 0.9602,
+   "zero_hit_request_frac": 0.112,
+   "osl_mean": 1063.0,
+   "osl_p50": 437.0,
+   "decode_ctx_osl_weighted_mean": 190354.0,
+   "req_per_s": 6.358,
+   "mean_request_latency_s": 8.96,
+   "closed_loop_idle_per_request_s": 16.21,
+   "mean_inflight_requests": 57.0,
+   "fresh_tok_per_s": 36554.0,
+   "out_tok_per_s": 6755.0,
+   "ttft_p50_s": 2.22,
+   "ttft_p90_s": 6.88,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C160-1P1D-a1093679/agentx/logs/agentic/conc_160/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "concurrency": 160,
+   "n_profiling_requests": 23603,
+   "isl_mean": 145521.0,
+   "isl_p50": 103441.0,
+   "isl_p90": 307255.0,
+   "cached_mean": 139910.0,
+   "fresh_mean": 5612.0,
+   "fresh_p50": 1942.0,
+   "hit_rate_token_weighted": 0.9614,
+   "zero_hit_request_frac": 0.111,
+   "osl_mean": 1063.0,
+   "osl_p50": 438.0,
+   "decode_ctx_osl_weighted_mean": 191093.0,
+   "req_per_s": 6.506,
+   "mean_request_latency_s": 7.9,
+   "closed_loop_idle_per_request_s": 16.7,
+   "mean_inflight_requests": 51.4,
+   "fresh_tok_per_s": 36507.0,
+   "out_tok_per_s": 6914.0,
+   "ttft_p50_s": 1.16,
+   "ttft_p90_s": 4.67,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427/agentx/logs/agentic/conc_160/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "concurrency": 160,
+   "n_profiling_requests": 24224,
+   "isl_mean": 147646.0,
+   "isl_p50": 105185.0,
+   "isl_p90": 314072.0,
+   "cached_mean": 142072.0,
+   "fresh_mean": 5574.0,
+   "fresh_p50": 1921.0,
+   "hit_rate_token_weighted": 0.9622,
+   "zero_hit_request_frac": 0.11,
+   "osl_mean": 1063.0,
+   "osl_p50": 439.0,
+   "decode_ctx_osl_weighted_mean": 192362.0,
+   "req_per_s": 6.681,
+   "mean_request_latency_s": 6.73,
+   "closed_loop_idle_per_request_s": 17.21,
+   "mean_inflight_requests": 45.0,
+   "fresh_tok_per_s": 37240.0,
+   "out_tok_per_s": 7102.0,
+   "ttft_p50_s": 0.77,
+   "ttft_p90_s": 1.64,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C160-2P1D-a1094590/agentx/logs/agentic/conc_160/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "concurrency": 224,
+   "n_profiling_requests": 32539,
+   "isl_mean": 147317.0,
+   "isl_p50": 106009.0,
+   "isl_p90": 309513.0,
+   "cached_mean": 141909.0,
+   "fresh_mean": 5409.0,
+   "fresh_p50": 1848.0,
+   "hit_rate_token_weighted": 0.9633,
+   "zero_hit_request_frac": 0.095,
+   "osl_mean": 1022.0,
+   "osl_p50": 412.0,
+   "decode_ctx_osl_weighted_mean": 192241.0,
+   "req_per_s": 8.972,
+   "mean_request_latency_s": 8.83,
+   "closed_loop_idle_per_request_s": 16.13,
+   "mean_inflight_requests": 79.3,
+   "fresh_tok_per_s": 48525.0,
+   "out_tok_per_s": 9172.0,
+   "ttft_p50_s": 0.98,
+   "ttft_p90_s": 1.88,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C224-2P1D-a1093685/agentx/logs/agentic/conc_224/aiperf_artifacts/profile_export.jsonl.gz"
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "concurrency": 256,
+   "n_profiling_requests": 36366,
+   "isl_mean": 142538.0,
+   "isl_p50": 102352.0,
+   "isl_p90": 298180.0,
+   "cached_mean": 136996.0,
+   "fresh_mean": 5542.0,
+   "fresh_p50": 1879.0,
+   "hit_rate_token_weighted": 0.9611,
+   "zero_hit_request_frac": 0.106,
+   "osl_mean": 1004.0,
+   "osl_p50": 416.0,
+   "decode_ctx_osl_weighted_mean": 185197.0,
+   "req_per_s": 10.018,
+   "mean_request_latency_s": 10.23,
+   "closed_loop_idle_per_request_s": 15.32,
+   "mean_inflight_requests": 102.5,
+   "fresh_tok_per_s": 55520.0,
+   "out_tok_per_s": 10061.0,
+   "ttft_p50_s": 1.21,
+   "ttft_p90_s": 2.43,
+   "source": "results/k31vr-frozen-sweep-20261114/runs/C256-2P1D-a1095076/agentx/logs/agentic/conc_256/aiperf_artifacts/profile_export.jsonl.gz"
+  }
+ ],
+ "prefill_engines_steady_state": [
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0055_prefill_w0.out",
+   "steady_mean_prompt_tok_per_s": 395.0,
+   "steady_mean_running": 0.01,
+   "steady_mean_waiting": 0.0,
+   "local_hbm_prefix_hit_pct": 96.3,
+   "external_mooncake_hit_pct_of_remaining": 0.0
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0210_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 27115.0,
+   "steady_mean_running": 1.32,
+   "steady_mean_waiting": 4.15,
+   "local_hbm_prefix_hit_pct": 68.4,
+   "external_mooncake_hit_pct_of_remaining": 88.3
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0361_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 31094.0,
+   "steady_mean_running": 1.81,
+   "steady_mean_waiting": 5.99,
+   "local_hbm_prefix_hit_pct": 61.7,
+   "external_mooncake_hit_pct_of_remaining": 89.2
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0163_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 30543.0,
+   "steady_mean_running": 2.08,
+   "steady_mean_waiting": 8.68,
+   "local_hbm_prefix_hit_pct": 58.7,
+   "external_mooncake_hit_pct_of_remaining": 88.9
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0055_prefill_w0.out",
+   "steady_mean_prompt_tok_per_s": 3600.0,
+   "steady_mean_running": 0.08,
+   "steady_mean_waiting": 0.01,
+   "local_hbm_prefix_hit_pct": 93.4,
+   "external_mooncake_hit_pct_of_remaining": 45.0
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0364_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 36894.0,
+   "steady_mean_running": 2.72,
+   "steady_mean_waiting": 16.0,
+   "local_hbm_prefix_hit_pct": 43.3,
+   "external_mooncake_hit_pct_of_remaining": 91.8
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0001_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 37202.0,
+   "steady_mean_running": 2.62,
+   "steady_mean_waiting": 8.89,
+   "local_hbm_prefix_hit_pct": 47.1,
+   "external_mooncake_hit_pct_of_remaining": 91.7
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0313_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 19024.0,
+   "steady_mean_running": 0.72,
+   "steady_mean_waiting": 1.44,
+   "local_hbm_prefix_hit_pct": 53.3,
+   "external_mooncake_hit_pct_of_remaining": 92.3
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0317_prefill_w1.out.gz",
+   "steady_mean_prompt_tok_per_s": 18710.0,
+   "steady_mean_running": 0.75,
+   "steady_mean_waiting": 1.45,
+   "local_hbm_prefix_hit_pct": 53.3,
+   "external_mooncake_hit_pct_of_remaining": 91.8
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0020_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 25319.0,
+   "steady_mean_running": 0.97,
+   "steady_mean_waiting": 2.15,
+   "local_hbm_prefix_hit_pct": 39.6,
+   "external_mooncake_hit_pct_of_remaining": 93.9
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0030_prefill_w1.out.gz",
+   "steady_mean_prompt_tok_per_s": 24079.0,
+   "steady_mean_running": 0.92,
+   "steady_mean_waiting": 2.37,
+   "local_hbm_prefix_hit_pct": 39.1,
+   "external_mooncake_hit_pct_of_remaining": 94.2
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0289_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 28988.0,
+   "steady_mean_running": 1.37,
+   "steady_mean_waiting": 4.05,
+   "local_hbm_prefix_hit_pct": 33.0,
+   "external_mooncake_hit_pct_of_remaining": 94.2
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0293_prefill_w1.out.gz",
+   "steady_mean_prompt_tok_per_s": 28015.0,
+   "steady_mean_running": 1.24,
+   "steady_mean_waiting": 4.38,
+   "local_hbm_prefix_hit_pct": 35.5,
+   "external_mooncake_hit_pct_of_remaining": 93.9
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0362_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 11693.0,
+   "steady_mean_running": 0.35,
+   "steady_mean_waiting": 0.23,
+   "local_hbm_prefix_hit_pct": 86.9,
+   "external_mooncake_hit_pct_of_remaining": 76.3
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0313_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 29914.0,
+   "steady_mean_running": 3.81,
+   "steady_mean_waiting": 6.57,
+   "local_hbm_prefix_hit_pct": 18.4,
+   "external_mooncake_hit_pct_of_remaining": 93.7
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0315_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 29865.0,
+   "steady_mean_running": 3.82,
+   "steady_mean_waiting": 6.35,
+   "local_hbm_prefix_hit_pct": 19.0,
+   "external_mooncake_hit_pct_of_remaining": 93.7
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0318_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 28045.0,
+   "steady_mean_running": 3.77,
+   "steady_mean_waiting": 6.35,
+   "local_hbm_prefix_hit_pct": 18.3,
+   "external_mooncake_hit_pct_of_remaining": 94.2
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0319_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 29256.0,
+   "steady_mean_running": 3.93,
+   "steady_mean_waiting": 6.45,
+   "local_hbm_prefix_hit_pct": 18.0,
+   "external_mooncake_hit_pct_of_remaining": 93.9
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0334_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 17199.0,
+   "steady_mean_running": 0.57,
+   "steady_mean_waiting": 0.32,
+   "local_hbm_prefix_hit_pct": 80.6,
+   "external_mooncake_hit_pct_of_remaining": 82.0
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0343_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 21641.0,
+   "steady_mean_running": 0.82,
+   "steady_mean_waiting": 0.63,
+   "local_hbm_prefix_hit_pct": 79.8,
+   "external_mooncake_hit_pct_of_remaining": 81.7
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0047_prefill_w0.out",
+   "steady_mean_prompt_tok_per_s": 1704.0,
+   "steady_mean_running": 0.02,
+   "steady_mean_waiting": 0.0,
+   "local_hbm_prefix_hit_pct": 96.2,
+   "external_mooncake_hit_pct_of_remaining": 0.0
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0343_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 26135.0,
+   "steady_mean_running": 1.06,
+   "steady_mean_waiting": 1.21,
+   "local_hbm_prefix_hit_pct": 73.3,
+   "external_mooncake_hit_pct_of_remaining": 85.6
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0343_prefill_w0.out.gz",
+   "steady_mean_prompt_tok_per_s": 24879.0,
+   "steady_mean_running": 1.34,
+   "steady_mean_waiting": 1.94,
+   "local_hbm_prefix_hit_pct": 75.1,
+   "external_mooncake_hit_pct_of_remaining": 85.3
+  }
+ ],
+ "prefill_engines_note": "steady state = last 75% of the 10 s logger windows. local_hbm_prefix_hit_pct = vLLM 'Prefix cache hit rate' (HBM); external = 'External prefix cache hit rate' (Mooncake, % of tokens not hit locally that were found). Prompt tok/s is computed (fresh) tokens.",
+ "prefill_scheduling": {
+  "max_num_batched_tokens": {
+   "prefill TP8+DCP8 (all 1P/2P runs)": 16384,
+   "prefill DP4 x TP4/DCP4 (C512)": 32768,
+   "decode": 8192
+  },
+  "c512_shardq_counters": [
+   {
+    "run": "C512-a1093684",
+    "engine_log": "hecate0313_prefill_w0.out.gz",
+    "role": "prefill",
+    "max_num_batched_tokens": 32768,
+    "available_kv_gib_per_gpu": 78.9,
+    "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+    "shardq_steps": 9571,
+    "shardq_tokens": 149200045,
+    "mean_tokens_per_step": 15589.0,
+    "window_p10_p50_p90_tokens_per_step": [
+     6042.0,
+     15927.0,
+     31778.0
+    ],
+    "steps_per_s": 2.14
+   },
+   {
+    "run": "C512-a1093684",
+    "engine_log": "hecate0315_prefill_w0.out.gz",
+    "role": "prefill",
+    "max_num_batched_tokens": 32768,
+    "available_kv_gib_per_gpu": 78.9,
+    "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+    "shardq_steps": 9566,
+    "shardq_tokens": 151741103,
+    "mean_tokens_per_step": 15863.0,
+    "window_p10_p50_p90_tokens_per_step": [
+     5852.0,
+     16695.0,
+     31793.0
+    ],
+    "steps_per_s": 2.12
+   },
+   {
+    "run": "C512-a1093684",
+    "engine_log": "hecate0318_prefill_w0.out.gz",
+    "role": "prefill",
+    "max_num_batched_tokens": 32768,
+    "available_kv_gib_per_gpu": 78.9,
+    "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+    "shardq_steps": 9526,
+    "shardq_tokens": 145115661,
+    "mean_tokens_per_step": 15234.0,
+    "window_p10_p50_p90_tokens_per_step": [
+     5840.0,
+     15510.0,
+     31854.0
+    ],
+    "steps_per_s": 2.12
+   },
+   {
+    "run": "C512-a1093684",
+    "engine_log": "hecate0319_prefill_w0.out.gz",
+    "role": "prefill",
+    "max_num_batched_tokens": 32768,
+    "available_kv_gib_per_gpu": 78.9,
+    "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+    "shardq_steps": 9690,
+    "shardq_tokens": 150834785,
+    "mean_tokens_per_step": 15566.0,
+    "window_p10_p50_p90_tokens_per_step": [
+     5822.0,
+     16101.0,
+     31908.0
+    ],
+    "steps_per_s": 2.14
+   }
+  ],
+  "note": "only the C512 prefill logs carry the per-window 'DCP ShardQ prefill ... steps, tokens' counter: ~15.2-15.9K tokens per step (mean), ~2.1 steps/s per DP4 engine at mnbt 32768. TP8 prefill runs pack chunks up to 16384 tokens; fresh token mass is 50% in requests with > 16K fresh tokens, so long requests split into 16K/32K chunks while the 81% of requests with < 4K fresh tokens share a step."
+ },
+ "engine_kv_memory": [
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0055_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0056_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0057_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": 52106161
+  },
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0058_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0059_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C1-a1093683",
+   "engine_log": "hecate0060_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0210_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0211_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0212_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": 58613015
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0213_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0214_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C112-1P1D-a1094730",
+   "engine_log": "hecate0215_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0361_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0366_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0371_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": 58613015
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0373_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0375_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-a1096270",
+   "engine_log": "hecate0376_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0163_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0165_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0167_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": 58613015
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0169_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0175_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C128-1P1D-llh-a1096428",
+   "engine_log": "hecate0176_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0055_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0056_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0057_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0058_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0059_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0060_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0061_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0062_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0063_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C16-1P2D-a1096999",
+   "engine_log": "hecate0064_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0364_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0367_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0370_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": 58613015
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0371_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0373_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-a1093679",
+   "engine_log": "hecate0375_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0001_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0009_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0011_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": 58613015
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0012_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0013_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-1P1D-llh-a1096427",
+   "engine_log": "hecate0015_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0313_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0315_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0317_prefill_w1.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0318_prefill_w1.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0319_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": 58613015
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0320_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0321_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C160-2P1D-a1094590",
+   "engine_log": "hecate0322_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 86.14,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0020_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0023_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0030_prefill_w1.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0031_prefill_w1.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0032_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": 55836672
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0033_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0034_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C224-2P1D-a1093685",
+   "engine_log": "hecate0035_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0289_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0291_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0293_prefill_w1.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0296_prefill_w1.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0297_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": 55836672
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0298_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0299_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C256-2P1D-a1095076",
+   "engine_log": "hecate0304_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 82.06,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0362_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0365_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0366_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 88.95,
+   "logged_kv_capacity_tokens_at_max_model_len": 51218904
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0369_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 88.95,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0374_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 88.95,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C48-1P1D-a1093681",
+   "engine_log": "hecate0376_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 88.95,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0313_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 32768,
+   "available_kv_gib_per_gpu": 78.9,
+   "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+   "shardq_steps": 9571,
+   "shardq_tokens": 149200045,
+   "mean_tokens_per_step": 15589.0,
+   "window_p10_p50_p90_tokens_per_step": [
+    6042.0,
+    15927.0,
+    31778.0
+   ],
+   "steps_per_s": 2.14
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0315_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 32768,
+   "available_kv_gib_per_gpu": 78.9,
+   "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+   "shardq_steps": 9566,
+   "shardq_tokens": 151741103,
+   "mean_tokens_per_step": 15863.0,
+   "window_p10_p50_p90_tokens_per_step": [
+    5852.0,
+    16695.0,
+    31793.0
+   ],
+   "steps_per_s": 2.12
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0318_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 32768,
+   "available_kv_gib_per_gpu": 78.9,
+   "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+   "shardq_steps": 9526,
+   "shardq_tokens": 145115661,
+   "mean_tokens_per_step": 15234.0,
+   "window_p10_p50_p90_tokens_per_step": [
+    5840.0,
+    15510.0,
+    31854.0
+   ],
+   "steps_per_s": 2.12
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0319_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 32768,
+   "available_kv_gib_per_gpu": 78.9,
+   "logged_kv_capacity_tokens_at_max_model_len": 16867093,
+   "shardq_steps": 9690,
+   "shardq_tokens": 150834785,
+   "mean_tokens_per_step": 15566.0,
+   "window_p10_p50_p90_tokens_per_step": [
+    5822.0,
+    16101.0,
+    31908.0
+   ],
+   "steps_per_s": 2.14
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0320_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.39,
+   "logged_kv_capacity_tokens_at_max_model_len": 19323757
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0321_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.39,
+   "logged_kv_capacity_tokens_at_max_model_len": 19323757
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0322_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.39,
+   "logged_kv_capacity_tokens_at_max_model_len": 19323757
+  },
+  {
+   "run": "C512-a1093684",
+   "engine_log": "hecate0323_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.39,
+   "logged_kv_capacity_tokens_at_max_model_len": 19323757
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0334_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0335_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0338_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0340_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0341_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C64-a1093680",
+   "engine_log": "hecate0342_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0343_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0345_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0346_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0347_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0348_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0350_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0351_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0352_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0353_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0354_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0356_decode_w2.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0357_decode_w2.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0358_decode_w2.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C72-1P3D-a1098025",
+   "engine_log": "hecate0359_decode_w2.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0047_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0048_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0049_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": 52106161
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0050_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0052_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C8-a1093682",
+   "engine_log": "hecate0054_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 90.49,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0343_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": 10504484
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0344_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 29.48,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0345_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0347_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0348_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0350_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0352_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": 50361895
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0353_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0356_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-a1093473",
+   "engine_log": "hecate0357_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 87.46,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0343_prefill_w0.out.gz",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": 12044826
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0346_prefill_w0.out",
+   "role": "prefill",
+   "max_num_batched_tokens": 16384,
+   "available_kv_gib_per_gpu": 30.57,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0347_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": 61127214
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0351_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0352_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0353_decode_w0.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0354_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": 61127214
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0356_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0357_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  },
+  {
+   "run": "C96-1P2D-k3-a1097000",
+   "engine_log": "hecate0358_decode_w1.out",
+   "role": "decode",
+   "max_num_batched_tokens": 8192,
+   "available_kv_gib_per_gpu": 89.84,
+   "logged_kv_capacity_tokens_at_max_model_len": null
+  }
+ ],
+ "kv_state_bytes": {
+  "_note": "All bytes are for the whole model and one request/token, before any sharding. B = bytes. Layer counts from release config.json text_config: dsa_config.dsa_layers (24, 1-based 4..92,93) and linear_attn_config.kda_layers (69).",
+  "dsa_kv_per_token_per_layer": {
+   "mla_latent_fp8_standard": {
+    "bytes": 576,
+    "layout": "kv_lora 512 + rope 64, all FP8 E4M3, one per-tensor scale (no per-token scale)",
+    "source": "vllm/models/kimi_k3/nvidia/mla.py get_kv_cache_spec (state_content_bytes None unless fp8_ds_mla); engine logs 'Using standard fp8 KV cache format'; decode NIXL log 'arrays 24 x row 576 B'; block_len 589824 = 1024 x 576"
+   },
+   "indexer_key_mxfp4": {
+    "bytes": 68,
+    "layout": "index_head_dim 128 as FP4 E2M1 (64 B) + 4 UE8M0 scales (block 32)",
+    "source": "release decode NIXL log 'arrays ... 24 x index_value 64 B, 24 x index_scale 4 B'; block_len 69632 = 1024 x 68"
+   },
+   "alt_mla_fp8_ds_mla": {
+    "bytes": 656,
+    "layout": "512 FP8 + 4 x FP32 scales + 64 BF16 rope",
+    "source": "mla.py state_content_bytes=656"
+   },
+   "alt_indexer_fp8": {
+    "bytes": 132,
+    "layout": "128 FP8 + FP32 scale (DeepSeek V3.2 indexer cache format)"
+   }
+  },
+  "dsa_kv_per_token_all_layers": {
+   "sol_fp8_mla_plus_mxfp4_indexer": 15456,
+   "mla_part": 13824,
+   "indexer_part": 1632,
+   "alt_fp8_mla_plus_fp8_indexer": 16992,
+   "alt_fp8_ds_mla_plus_mxfp4_indexer": 17376,
+   "deployed_packed_row_bytes_per_token": 15606.0,
+   "deployed_packed_row_note": "release decode logs: '1024-row blocks 15980544 B apart' (24 x (576+64+4) x 1024 = 15,826,944 + 153,600 B per row block = +150 B/token packing slack, ~1%)"
+  },
+  "kda_state_per_request_per_layer": {
+   "recurrent_fp32": {
+    "bytes": 6291456,
+    "shape": "[96 heads, 128, 128] FP32",
+    "source": "mamba_utils.py kda_state_shape/kda_state_dtype (mamba-ssm-cache-dtype float32); logs mamba_ssm_size 393216 per rank at TP16 = 6 heads"
+   },
+   "conv_window_fp32_sol": {
+    "bytes": 442368,
+    "shape": "[3 x 96 x 128 = 36864 ch, 3 cols] FP32",
+    "note": "SOL / user rule: FP32 conv state, window = conv_kernel-1 = 3 columns"
+   },
+   "conv_with_spec_cols_fp32": {
+    "bytes_per_k": {
+     "3": 884736,
+     "5": 1179648,
+     "7": 1474560
+    },
+    "note": "kda_state_shape widens the conv state to 3 + num_spec columns"
+   },
+   "conv_deployed_bf16_with_spec_cols": {
+    "bytes_per_k": {
+     "3": 442368,
+     "5": 589824,
+     "7": 737280
+    },
+    "source": "deployed mamba_cache_dtype=auto -> BF16 (model dtype); logs mamba_ssm_size conv 46080 B/rank at TP16 k7 = 2304 ch x 10 x 2 B, 110592 at TP4 k3 = 9216 x 6 x 2"
+   }
+  },
+  "kda_state_per_request_all_layers": {
+   "sol_one_state_fp32_conv3": 464633856,
+   "one_state_fp32_conv_3plus_k": {
+    "3": 495157248,
+    "5": 515506176,
+    "7": 535855104
+   },
+   "deployed_page_set_bf16_conv_3plus_k": {
+    "3": 464633856,
+    "5": 474808320,
+    "7": 484982784
+   },
+   "deployed_resident_align_mode": {
+    "3": 2787803136,
+    "5": 3798466560,
+    "7": 4849827840
+   },
+   "deployed_resident_note": "mamba_cache_mode=align (prefix caching on) keeps 2 + num_speculative_blocks (=k unless use_replayssm) + num_prefill_checkpoint_blocks (1) page sets per request (v1/kv_cache_interface.py MambaSpec.max_memory_usage_bytes; model_executor/layers/mamba/abstract.py). use_replayssm=False by default (vllm/config/cache.py:380). A SOL design keeps 1 state (+ replay/recompute of the verify window); per-token verify states would be (1+k) sets.",
+   "independent_of_context_length": true
+  },
+  "drafter_swa_kv": {
+   "per_token_bytes": 20480,
+   "layout": "5 layers x 16 KV heads x 64 x (K,V) x BF16",
+   "window_tokens": 2048,
+   "sol_per_request_bytes": 41943040,
+   "deployed_bound_per_request_bytes": 48496640,
+   "deployed_bound_note": "window + FA2 key-tile slack (tile 256 - hit unit 64, gqa_draft.py _hit_unit_block) + one 128-token page; k+1 verify rows ignored",
+   "source": "DSpark e4e6e626 config.json (num_key_value_heads 16, head_dim 64, sliding_window 2048, 5 layers, bf16); release decode logs block_len 32768 = 128 tok x 1 KV head/rank x 64 x 2 x 2 B at TP16 ('GqaWindow on 128-token pages')",
+   "frozen_sweep_note": "the 20261114 frozen sweep used the preview MLA drafter (kimi-k3.1-pro-dspark-preview, TOKENSPEED_MLA), which keeps its own MLA cache (dense_draft.py); the release GQA drafter replaces it"
+  },
+  "sharding_rules": {
+   "dsa_kv": "stored once per DCP group, tokens interleaved across DCP ranks (cp-kv-cache-interleave-size 1); TP without DCP replicates the latent KV on every TP rank (MQA latent); DSA-DP (PRs #20/#23) stores it once per TP group on the owner card; DEP/DP attention: on the request's DP rank",
+   "kda_state": "sharded by heads across TP (96/TP heads per rank); replicated across DCP ranks that are not TP ranks (MambaSpec.max_num_blocks_per_req: never CP-sharded); under DP attention the whole state is on the request's rank",
+   "drafter_kv": "sharded by the 16 KV heads across TP up to 16; replicated beyond 16 (logs 'NIXL draft at DCP 1 (16 KV heads)')"
+  },
+  "deployed_capacity_reconciliation": {
+   "_note": "vLLM logs 'GPU KV cache size' = num_blocks / blocks_per_request(at max_model_len 1,048,576) x 1,048,576 (v1/core/kv_cache_utils.py get_max_concurrency_for_kv_cache_config). Inverting it gives the pool rows a request takes beyond its DSA rows = the KDA/drafter state reservation of the deployed allocator.",
+   "decode_TP16_DCP16_k7_release_gqa_drafter": {
+    "num_blocks_per_rank": 5932,
+    "row_bytes_per_rank": 15980544,
+    "logged_tokens": 58132269,
+    "blocks_per_1M_request": 107.0,
+    "dsa_rows": 64,
+    "state_rows": "43 = 10 KDA page sets (align: 2 + k7 + 1 ckpt) x 4 rows + 3 drafter-window rows",
+    "state_bytes_per_request_all_ranks": 10994614272,
+    "vs_sol_state": 21.7,
+    "source": "k31vr-release-draft-sweep-20261117/runs/C1-a1118776/agentx/logs/hecate0245_decode_w0.out"
+   },
+   "decode_TP16_DCP16_k7_frozen_preview_drafter": {
+    "num_blocks_per_rank": 4995,
+    "logged_tokens": 50361895,
+    "blocks_per_1M_request": 104.0,
+    "dsa_rows": 64,
+    "state_rows": "40 = 10 KDA page sets x 4 rows",
+    "source": "frozen C64-a1093680 hecate0338_decode_w0.out"
+   },
+   "decode_DP4_TP4_DCP4_k3_replayssm_C512": {
+    "num_blocks_per_rank": 1290,
+    "row_bytes_per_rank_approx": 75236840,
+    "logged_tokens": 19323757,
+    "blocks_per_1M_request": 70.0,
+    "dsa_rows": 64,
+    "state_rows": "6 = 3 KDA page sets (align with use-replayssm: 2 + 0 + 1) x 2 rows",
+    "state_bytes_per_request_all_ranks": 1805684158,
+    "source": "frozen C512-a1093684 hecate0320_decode_w0.out; config.yaml decode 'use-replayssm: true'"
+   },
+   "takeaway": "the deployed TP16 low-latency decode reserves ~11.0 GB of state per request (10.2 GB KDA in 40 rows + 0.77 GB drafter in 3 rows; 22x the 0.51 GB SOL state+drafter), more than the DSA KV of a 189K-token context (2.9 GB); the C512 replayssm config reserves ~1.8 GB. The SOL model should use kda_state_per_request_all_layers.sol_one_state_fp32_conv3 (+ drafter) and treat the deployed numbers as an implementation gap."
+  },
+  "examples_per_request_bytes": {
+   "isl_mean": {
+    "context_tokens": 144975,
+    "dsa_kv": 2240727185,
+    "kda_sol": 464633856,
+    "drafter_sol": 41943040,
+    "total_sol": 2747304081,
+    "total_deployed_k7": 7160797853
+   },
+   "decode_ctx_osl_weighted_mean": {
+    "context_tokens": 189265,
+    "dsa_kv": 2925275550,
+    "kda_sol": 464633856,
+    "drafter_sol": 41943040,
+    "total_sol": 3431852446,
+    "total_deployed_k7": 7851989738
+   },
+   "isl_p50": {
+    "context_tokens": 99706,
+    "dsa_kv": 1541055936,
+    "kda_sol": 464633856,
+    "drafter_sol": 41943040,
+    "total_sol": 2047632832,
+    "total_deployed_k7": 6454336316
+   },
+   "isl_p90": {
+    "context_tokens": 311156,
+    "dsa_kv": 4809227136,
+    "kda_sol": 464633856,
+    "drafter_sol": 41943040,
+    "total_sol": 5315804032,
+    "total_deployed_k7": 9754225016
+   },
+   "ctx_1M_max_model_len": {
+    "context_tokens": 1048576,
+    "dsa_kv": 16206790656,
+    "kda_sol": 464633856,
+    "drafter_sol": 41943040,
+    "total_sol": 16713367552,
+    "total_deployed_k7": 21262401536
+   }
+  },
+  "pd_transfer_per_request_bytes": {
+   "isl_mean": {
+    "context_tokens": 144975,
+    "dsa_kv": 2240727185,
+    "kda_one_state_sol": 464633856,
+    "drafter_window": 41943040,
+    "note": "P->D pull of the whole prompt KV (cached + fresh) + final KDA state + drafter window; per fresh prefill token this is ISL/fresh = 26.6x the fresh-token KV"
+   },
+   "isl_p50": {
+    "context_tokens": 99706,
+    "dsa_kv": 1541055936,
+    "kda_one_state_sol": 464633856,
+    "drafter_window": 41943040,
+    "note": "P->D pull of the whole prompt KV (cached + fresh) + final KDA state + drafter window; per fresh prefill token this is ISL/fresh = 26.6x the fresh-token KV"
+   }
+  }
+ },
+ "weights": {
+  "_note": "Release Kimi-K3.1-Pro d9e99b07, bytes summed from every safetensors shard header (497,340 tensors). GB = 1e9 B. Sharding classes say how a topology divides each class.",
+  "source": "hecate:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07/model-0000*-of-000096.safetensors headers (st_headers.py); derived/k31_release_tensors.json.gz",
+  "by_category_bytes": {
+   "moe_routed_experts_mxfp4": 1446456066048,
+   "kda_attn_bf16_f32": 61258257408,
+   "moe_shared_experts_bf16": 24310185984,
+   "dsa_mla_attn_bf16": 11145412608,
+   "moe_latent_up_down_norm_bf16": 9454620672,
+   "lm_head_bf16": 2348810240,
+   "embed_tokens_bf16": 2348810240,
+   "layer0_dense_mlp_bf16": 1453326336,
+   "moe_router_bf16": 1182074880,
+   "vision_tower_and_projector_bf16": 894717952,
+   "dsa_indexer_proj_bf16": 357052416,
+   "layer_norms_and_attn_res_bf16": 7999488,
+   "final_norms_bf16": 43008
+  },
+  "by_category_params": {
+   "kda_attn_bf16_f32": 30618088704,
+   "layer_norms_and_attn_res_bf16": 3999744,
+   "layer0_dense_mlp_bf16": 726663168,
+   "moe_router_bf16": 590955008,
+   "moe_latent_up_down_norm_bf16": 4727310336,
+   "moe_shared_experts_bf16": 12155092992,
+   "moe_routed_experts_mxfp4": 2722740830208,
+   "dsa_mla_attn_bf16": 5572706304,
+   "dsa_indexer_proj_bf16": 178526208,
+   "lm_head_bf16": 1174405120,
+   "embed_tokens_bf16": 1174405120,
+   "final_norms_bf16": 21504,
+   "vision_tower_and_projector_bf16": 447358976
+  },
+  "text_model_total_bytes": 1560322659328,
+  "sharding_class": {
+   "moe_routed_experts_mxfp4": "EP (896 experts; 92 MoE layers x 896 x 17,547,264 B)",
+   "moe_latent_up_down_norm_bf16": "TP or replicated (per layer 7168x3584 up + 3584x7168 down)",
+   "moe_shared_experts_bf16": "TP or replicated (2 shared experts fused: 6144 = 2 x 3072)",
+   "moe_router_bf16": "replicated (896 x 7168 + FP32 bias)",
+   "kda_attn_bf16_f32": "TP (q/k/v/g 12288x7168, o 7168x12288, b 96x7168, f_a 128x7168, f_b 12288x128, FP32 conv weights 3 x 12288x4, A_log, dt_bias)",
+   "dsa_mla_attn_bf16": "TP over heads for q_b/kv_b/o/g; q_a/kv_a replicated or TP (q_a 1536x7168, q_b 18432x1536, kv_a 576x7168, kv_b 24576x512, o 7168x12288, output gate g 12288x7168)",
+   "dsa_indexer_proj_bf16": "replicated or TP (wq_b 4096x1536, wk 128x7168, weights_proj 32x7168)",
+   "layer0_dense_mlp_bf16": "TP (gate/up 33792x7168, down 7168x33792)",
+   "embed_tokens_bf16": "vocab-parallel over TP or replicated (163840 x 7168)",
+   "lm_head_bf16": "vocab-parallel over TP (163840 x 7168)",
+   "vision_tower_and_projector_bf16": "loaded by vLLM for the multimodal arch; not on the text path"
+  },
+  "per_layer_bytes": {
+   "routed_expert_one_expert_mxfp4": 17547264,
+   "routed_experts_one_layer_mxfp4": 15722348544,
+   "moe_layer_nonexpert_bf16": 379857408,
+   "kda_attention_layer": 887800832,
+   "dsa_attention_layer_mla": 464392192,
+   "dsa_indexer_layer": 14877184,
+   "layer0_dense_mlp": 1453326336
+  },
+  "nvfp4_checkpoint_alt": {
+   "routed_experts_bytes": 1531541716992.0,
+   "routed_experts_bytes_note": "NVFP4 group 16 with FP8 scales = 0.5625 B/param vs MXFP4 0.53125 (global scales ignored); see inputs/checkpoints.json",
+   "shared_experts_mxfp8_bytes": 12534939648.0,
+   "kda_projections_mxfp8_bytes_approx": 31451599872.0
+  },
+  "drafter_dspark_e4e6e626": {
+   "file_bytes": 4959959810,
+   "bf16_tensors": {
+    "fc_aux_35840_to_7168": 513802240,
+    "per_layer": {
+     "q_proj": 88080384,
+     "k_proj": 14680064,
+     "v_proj": 14680064,
+     "o_proj": 88080384,
+     "mlp_gate_up_down": 616562688
+    },
+    "layers": 5,
+    "markov_head_w1_w2": 335544320,
+    "confidence_head": 15362
+   },
+   "shares_target": [
+    "embed_tokens",
+    "lm_head"
+   ],
+   "aux_hidden_state_layer_ids": [
+    76,
+    80,
+    84,
+    88,
+    92
+   ],
+   "source": "hecate .../cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626/{config.json, model.safetensors header}"
+  },
+  "measured_loaded_weights_gib_per_gpu": [
+   {
+    "role": "decode TP16+DCP16 (release GQA drafter)",
+    "gib": 131.18,
+    "source": "k31vr-release-draft-sweep-20261117/runs/C1-a1118776 hecate0245_decode_w0.out 'Model loading took'"
+   },
+   {
+    "role": "decode TP16+DCP16 (preview MLA drafter)",
+    "gib": 132.42,
+    "source": "frozen C64-a1093680 hecate0338_decode_w0.out"
+   },
+   {
+    "role": "prefill TP8+DCP8",
+    "gib": 205.85,
+    "source": "frozen C64-a1093680 hecate0334_prefill_w0.out.gz"
+   },
+   {
+    "role": "C512 prefill DP4 x TP4/DCP4 (16 GPUs)",
+    "gib": 154.62,
+    "source": "frozen C512-a1093684 hecate0313_prefill_w0.out.gz"
+   },
+   {
+    "role": "C512 decode DP4 x TP4/DCP4 (16 GPUs)",
+    "gib": 60.11,
+    "source": "frozen C512-a1093684 hecate0320_decode_w0.out"
+   }
+  ]
+ },
+ "hbm": {
+  "device_total_gib": 278.54,
+  "free_at_startup_gib": 272.48,
+  "source": "engine logs 'Free memory on device (272.48/278.54 GiB) on startup' (all VR200 runs)",
+  "deployed_gpu_memory_utilization": {
+   "prefill": 0.92,
+   "decode": 0.9,
+   "C512 decode": 0.93
+  },
+  "deployed_non_kv_examples": [
+   {
+    "role": "decode TP16+DCP16 release",
+    "consumed_weights_plus_nontorch_gib": 155.15,
+    "peak_activation_gib": 7.25,
+    "cudagraph_gib": 1.43,
+    "available_kv_gib": 88.29
+   },
+   {
+    "role": "prefill TP8+DCP8",
+    "consumed_weights_plus_nontorch_gib": 218.32,
+    "peak_activation_gib": 8.46,
+    "cudagraph_gib": 1.63,
+    "available_kv_gib": 29.48
+   },
+   {
+    "role": "C512 prefill DP4xTP4",
+    "consumed_weights_plus_nontorch_gib": 169.4,
+    "peak_activation_gib": 7.95,
+    "cudagraph_gib": 0.43,
+    "available_kv_gib": 78.9
+   },
+   {
+    "role": "C512 decode DP4xTP4",
+    "consumed_weights_plus_nontorch_gib": 161.13,
+    "peak_activation_gib": 7.52,
+    "cudagraph_gib": 5.37,
+    "available_kv_gib": 90.39
+   }
+  ],
+  "note": "non-torch includes NCCL/symmetric-memory buffers and the Mooncake/NIXL registrations; 'consumed' minus 'Model loading took' = non-torch + runtime buffers (~22-24 GiB decode TP16, ~12 GiB prefill TP8, ~15 GiB C512 prefill, ~101 GiB C512 decode incl. dloan/side buffers)"
+ }
+}
