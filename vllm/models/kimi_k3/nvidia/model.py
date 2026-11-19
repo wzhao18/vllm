@@ -161,6 +161,10 @@ logger = init_logger(__name__)
 # it the GEMMs saturate the device and the cross-stream sync is pure overhead,
 # so it falls back to sequential.
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
+# Prefill chunks from this many tokens overlap again: the router GEMM (N = 896,
+# a few waves) and its latency-bound top-k fill the latent down GEMM's last
+# waves instead of running alone.
+_ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS = 4096
 
 
 def shard_sequence_parallel_mlp(
@@ -831,6 +835,9 @@ class KimiMoE(nn.Module):
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
             self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
             self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
+            # Shared experts beside the routing front of prefill chunks.
+            self._prefill_shared_side_stream = torch.cuda.Stream()
+            self._prefill_shared_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -1089,6 +1096,24 @@ class KimiMoE(nn.Module):
         )
         return pack_k(act.activation())
 
+    def _prefill_shared_stream(self, num_tokens: int) -> torch.cuda.Stream | None:
+        """The stream that overlaps the shared experts with the routing front
+        of a MegaMoE prefill chunk (from _ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS
+        tokens), else None."""
+        if (
+            not self.use_mega_moe
+            or self._shared_overlap
+            or self.shared_experts is None
+            or self.routed_expert_down_proj is None
+            or num_tokens < _ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS
+        ):
+            return None
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        if BreakableCUDAGraphCapture.is_active():
+            return None
+        return self._prefill_shared_side_stream
+
     def _maybe_overlap_router_and_down_proj(
         self,
         hidden_states: torch.Tensor,
@@ -1130,6 +1155,7 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[1],
                 self._down_proj_stream
                 if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                or num_tokens >= _ROUTED_DOWN_PROJ_STREAM_PREFILL_TOKENS
                 else None,
             )
         )
@@ -1239,24 +1265,43 @@ class KimiMoE(nn.Module):
         )
         if shared_mxfp8_input is not None:
             assert mxfp8_input is None and self.use_mega_moe
+        # The shared expert reads the un-projected hidden states, so it stays
+        # outside the latent-space MegaMoE launch.
+        shared_input = (
+            shared_mxfp8_input
+            if shared_mxfp8_input is not None
+            else hidden_states
+            if mxfp8_input is None
+            else mxfp8_input
+        )
+        prefill_shared = self._prefill_shared_stream(num_tokens)
+        if prefill_shared is not None:
+            # The shared experts run beside the router, its top-k and the
+            # latent down GEMM and join before MegaMoE (whose persistent grid
+            # takes every SM): same kernels and math, only concurrent.
+            start, done = self._prefill_shared_events
+            start.record()
+            with torch.cuda.stream(prefill_shared):
+                start.wait()
+                shared_output = self.shared_experts(shared_input)
+                done.record()
         # Overlap the gate with the routed down projection; the returned hidden
-        # states are already down-projected. Keep the original ``hidden_states``
-        # for the shared experts.
+        # states are already down-projected.
         routed_hidden_states, router_output, topk_ids = (
             self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
         )
-        if self.use_mega_moe:
+        if prefill_shared is not None:
+            done.wait()
+            assert self.routed_output_transform is not None
+            final_hidden_states = self._routed_experts(
+                routed_hidden_states, router_output, topk_ids
+            )
+            final_hidden_states = self.routed_output_transform(
+                final_hidden_states, residual=shared_output
+            )
+        elif self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
-            # The shared expert reads the un-projected hidden states, so it
-            # stays outside the latent-space MegaMoE launch.
-            shared_input = (
-                shared_mxfp8_input
-                if shared_mxfp8_input is not None
-                else hidden_states
-                if mxfp8_input is None
-                else mxfp8_input
-            )
             if self._shared_overlap:
                 final_hidden_states, shared_output = maybe_execute_in_parallel(
                     lambda: self._routed_experts(
