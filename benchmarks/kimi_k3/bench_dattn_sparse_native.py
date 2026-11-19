@@ -75,8 +75,9 @@ def main():
     p.add_argument("--stages", type=int, default=3)
     p.add_argument("--clusters", type=int, default=0)
     p.add_argument("--stamps", action="store_true")
-    p.add_argument("--loaders", type=int, default=8)
+    p.add_argument("--loaders", type=int, default=6)
     p.add_argument("--no-mc", action="store_true")
+    p.add_argument("--v1", action="store_true", help="the V-split pair kernel")
     p.add_argument("--check", type=int, default=24)
     p.add_argument("--no-trtllm", action="store_true")
     p.add_argument("--out", default="")
@@ -86,6 +87,19 @@ def main():
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla import (
         sparse_mla_decode,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_km import (
+        sparse_mla_decode_km,
+    )
+
+    def native(query, kv, slots, valid, lat, lse, bmm1, bmm2, stamps=None):
+        if a.v1:
+            return sparse_mla_decode(query, kv, slots, valid, lat, lse, bmm1, bmm2,
+                                     stages=a.stages, clusters=a.clusters or None,
+                                     loaders=a.loaders, multicast=not a.no_mc,
+                                     stamps=stamps)
+        return sparse_mla_decode_km(query, kv, slots, valid, lat, lse, bmm1, bmm2,
+                                    grid=a.clusters or None, stages=a.stages,
+                                    loaders=a.loaders, stamps=stamps)
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import _kv_counters
 
     dev, heads = "cuda", 128
@@ -121,10 +135,7 @@ def main():
                 **extra)
 
         def nat():
-            sparse_mla_decode(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n,
-                              bmm1, bmm2, stages=a.stages,
-                              clusters=a.clusters or None, loaders=a.loaders,
-                              multicast=not a.no_mc)
+            native(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n, bmm1, bmm2)
 
         nat()
         torch.cuda.synchronize()
@@ -155,13 +166,18 @@ def main():
                                   5),
             )
         out["native_us"] = round(timed(nat, flush=flush), 2)
+        if not a.v1:
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_km import (  # noqa: E501
+                kernel_info,
+            )
+
+            grid = a.clusters or min(torch.cuda.get_device_properties(0).multi_processor_count, rows)
+            out["regs_local"] = kernel_info(0, grid, a.stages, a.loaders)
         if a.stamps:
             st = torch.zeros(424 * 64, dtype=torch.int64, device=dev)
             flush.zero_()
-            sparse_mla_decode(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n,
-                              bmm1, bmm2, stages=a.stages,
-                              clusters=a.clusters or None, stamps=st,
-                              loaders=a.loaders, multicast=not a.no_mc)
+            native(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n, bmm1, bmm2,
+                   stamps=st)
             torch.cuda.synchronize()
             st = st.view(424, 64)
             used = st[:, 0] > 0
@@ -171,7 +187,7 @@ def main():
             rel[st == 0] = float("nan")
             med = rel.nanmedian(dim=0).values
             mx = torch.where(torch.isnan(rel), torch.full_like(rel, -1), rel).max(0).values
-            names = {0: "start", 1: "setup", 40: "mma_q0", 41: "qk0_issued",
+            names = {0: "start", 1: "setup", 40: "mma_q0", 41: "qk0_issued", 31: "t1_a_ld", 32: "t1_b_redux", 33: "t1_c_bar1", 34: "t1_d_bar2", 35: "t1_e_exp", 36: "t1_f_pvwait", 37: "t1_g_resc",
                      44: "mma_q1", 45: "qk1_issued"}
             for ri in range(2):
                 names[2 + 16 * ri] = f"r{ri}_qfull"
