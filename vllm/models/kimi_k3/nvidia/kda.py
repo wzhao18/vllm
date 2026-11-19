@@ -870,6 +870,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
         self._segscan_bufs: kda_segscan.SegBuffers | None = None
+        self._frost = False
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -893,6 +894,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     torch.device("cuda", torch.accelerator.current_device_index()),
                     N,
                 )
+            # cuDNN FROST chunked core where available (per-shape policy:
+            # every checkpoint-free, segment-plan-free prefill).
+            self._frost = specialized_prefill_kda.frost_supported(
+                torch.device("cuda", torch.accelerator.current_device_index())
+            )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
@@ -1393,6 +1399,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
         # Prefill or plain-decode path.
         core_attn_out_non_spec = None
+        prefill_core_out = core_attn_out
         if mixed_qkv_ns is not None:
             assert g1_ns is not None and beta_ns is not None
             non_spec_out = None
@@ -1597,6 +1604,30 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             recurrent_state=recurrent_state,
                             cu_seqlens=non_spec_query_start_loc,
                         )
+                    elif self._frost:
+                        frost_out, last_recurrent_state = (
+                            specialized_prefill_kda.frost_prefill(
+                                q=q_ns,
+                                k=k_ns,
+                                v=v_ns,
+                                g=g1_ns,
+                                beta=beta_ns,
+                                A_log=self.A_log,
+                                dt_bias=self.dt_bias,
+                                lower_bound=self.gate_lower_bound,
+                                initial_state=initial_state,
+                                cu_seqlens=non_spec_query_start_loc,
+                            )
+                        )
+                        if (
+                            flashkda_out.data_ptr() == core_attn_out.data_ptr()
+                            and frost_out.shape[1] == core_attn_out.shape[1]
+                        ):
+                            # Pure prefill: o_norm reads the FROST output.
+                            prefill_core_out = frost_out
+                        else:
+                            flashkda_out.copy_(frost_out)
+                        core_attn_out_non_spec = flashkda_out
                     else:
                         (
                             core_attn_out_non_spec,
@@ -1734,7 +1765,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             # Prefill: the HBM-rate gated o_norm + MXFP8 kernel (same layout
             # contract as kda_norm, checked in forward()).
             specialized_prefill_kda.o_norm_mxfp8(
-                core_attn_out,
+                prefill_core_out,
                 g2.flatten(-2),
                 self.o_norm.weight,
                 self.o_norm.eps,
