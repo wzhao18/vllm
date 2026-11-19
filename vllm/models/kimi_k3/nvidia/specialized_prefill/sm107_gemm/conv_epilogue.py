@@ -1,0 +1,569 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Epilogue of the KDA in_proj Q|K|V GEMM: BF16 round, width-4 causal conv
+(FP32, stock FMA order), Triton-lowered SiLU, BF16 Q|K|V planes and the
+optional inverse L2 norms of the Q / K head rows.
+
+Each epilogue thread owns one output row (TMEM lane). The three previous rows
+come from warp shuffles, and for the first three lanes of a warp from the
+previous warp through shared memory. Rows 0-2 of every 128-row block and rows
+0-2 of every sequence are left to ``conv_fixup``; the epilogue saves the
+pre-conv BF16 rows that the fix-up and the conv state update read.
+
+Side buffer rows (BF16, n columns): block b rows 0-2 at ``6b + r`` and rows
+125-127 at ``6b + 3 + r - 125``; sequence s rows 0-2 at ``6 Mb + 6s + pos`` and
+its last three rows at ``6 Mb + 6s + 3 + pos - (len - 3)``.
+"""
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+from cutlass import Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
+from cutlass.utils.gemm.sm100 import (
+    epilogue_tmem_copy_and_partition,
+    transform_partitioned_tensor_layout,
+)
+
+_ASM = dict(
+    is_align_stack=False,
+    asm_dialect=llvm.AsmDialect.AD_ATT,
+)
+
+
+def _v(x, cls, loc, ip):
+    return cls(x).ir_value(loc=loc, ip=ip)
+
+
+@dsl_user_op
+def pack_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(lo, Float32, loc, ip), _v(hi, Float32, loc, ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+# $0 bf16x2 out, $1 sum-of-squares out; $2..$5 rows t-3..t (bf16x2);
+# $6..$13 FP32 weights (tap0 lo, tap0 hi, ..., tap3 hi); $14 sum-of-squares in.
+_CONV_PAIR = """{
+.reg .b32 l<4>, h<4>, yp, yl, yh;
+.reg .b64 X<4>, W<4>, A;
+.reg .f32 a<2>, t<2>, e<2>, d<2>, r<2>, y<2>, s;
+shl.b32 l0, $2, 16;
+and.b32 h0, $2, -65536;
+shl.b32 l1, $3, 16;
+and.b32 h1, $3, -65536;
+shl.b32 l2, $4, 16;
+and.b32 h2, $4, -65536;
+shl.b32 l3, $5, 16;
+and.b32 h3, $5, -65536;
+mov.b64 X0, {l0, h0};
+mov.b64 X1, {l1, h1};
+mov.b64 X2, {l2, h2};
+mov.b64 X3, {l3, h3};
+mov.b64 W0, {$6, $7};
+mov.b64 W1, {$8, $9};
+mov.b64 W2, {$10, $11};
+mov.b64 W3, {$12, $13};
+mov.b64 A, 0;
+fma.rn.f32x2 A, X0, W0, A;
+fma.rn.f32x2 A, X1, W1, A;
+fma.rn.f32x2 A, X2, W2, A;
+fma.rn.f32x2 A, X3, W3, A;
+mov.b64 {a0, a1}, A;
+mul.f32 t0, a0, 0fBFB8AA3B;
+mul.f32 t1, a1, 0fBFB8AA3B;
+ex2.approx.ftz.f32 e0, t0;
+ex2.approx.ftz.f32 e1, t1;
+add.f32 d0, e0, 0f3F800000;
+add.f32 d1, e1, 0f3F800000;
+div.full.f32 r0, a0, d0;
+div.full.f32 r1, a1, d1;
+cvt.rn.bf16x2.f32 yp, r1, r0;
+shl.b32 yl, yp, 16;
+and.b32 yh, yp, -65536;
+mov.b32 y0, yl;
+mov.b32 y1, yh;
+fma.rn.f32 s, y0, y0, $14;
+fma.rn.f32 $1, y1, y1, s;
+mov.b32 $0, yp;
+}"""
+
+
+@dsl_user_op
+def conv_pair(x3, x2, x1, x0, w, s_in, *, loc=None, ip=None):
+    """Conv + SiLU of one column pair: rows (t-3, t-2, t-1, t) as bf16x2,
+    weights ``w`` = 8 FP32 (tap-major lo/hi). Returns (bf16x2, sum of squares)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.f32()]),
+        [_v(x, Uint32, loc, ip) for x in (x3, x2, x1, x0)]
+        + [_v(v, Float32, loc, ip) for v in w]
+        + [_v(s_in, Float32, loc, ip)],
+        _CONV_PAIR,
+        "=r,=f," + ",".join(["r"] * 4 + ["f"] * 9),
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    y = Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip))
+    s = Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip))
+    return y, s
+
+
+@dsl_user_op
+def shfl_up(v: Uint32, d: int, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(v, Uint32, loc, ip)],
+            f"shfl.sync.up.b32 $0, $1, {d}, 0, -1;",
+            "=r,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def sel(c: Int32, a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
+    """``c != 0 ? a : b``."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(c, Int32, loc, ip), _v(a, Uint32, loc, ip), _v(b, Uint32, loc, ip)],
+            "{ .reg .pred p; setp.ne.s32 p, $1, 0; selp.b32 $0, $2, $3, p; }",
+            "=r,r,r,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def self32(c: Int32, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [_v(c, Int32, loc, ip), _v(a, Float32, loc, ip), _v(b, Float32, loc, ip)],
+            "{ .reg .pred p; setp.ne.s32 p, $1, 0; selp.f32 $0, $2, $3, p; }",
+            "=f,r,f,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def ldg_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(addr, Int64, loc, ip)],
+            "ld.global.nc.s32 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def ldg_f32x4(addr: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [_v(addr, Int64, loc, ip)],
+        "ld.global.nc.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    return [
+        Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    ]
+
+
+@dsl_user_op
+def stg_v4(addr: Int64, pred: Int32, a, b, c, d, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip)]
+        + [_v(x, Uint32, loc, ip) for x in (a, b, c, d)],
+        "{ .reg .pred p; setp.ne.s32 p, $1, 0; "
+        "@p st.global.v4.b32 [$0], {$2, $3, $4, $5}; }",
+        "l,r,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def stg_f32(addr: Int64, pred: Int32, v: Float32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip), _v(v, Float32, loc, ip)],
+        "{ .reg .pred p; setp.ne.s32 p, $1, 0; @p st.global.f32 [$0], $2; }",
+        "l,r,f",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def sts_v4(addr: Int32, pred: Int32, a, b, c, d, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int32, loc, ip), _v(pred, Int32, loc, ip)]
+        + [_v(x, Uint32, loc, ip) for x in (a, b, c, d)],
+        "{ .reg .pred p; setp.ne.s32 p, $1, 0; "
+        "@p st.shared.v4.b32 [$0], {$2, $3, $4, $5}; }",
+        "r,r,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def lds_v4(addr: Int32, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_v(addr, Int32, loc, ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    return [
+        Uint32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    ]
+
+
+@dsl_user_op
+def rsqrt_eps(s: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [_v(s, Float32, loc, ip)],
+            "{ .reg .f32 t; add.f32 t, $1, 0f358637BD; rsqrt.approx.ftz.f32 $0, t; }",
+            "=f,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+def b2i(c) -> Int32:
+    return Int32(c)
+
+
+@cute.jit
+def find_seq(qsl_addr: Int64, nseq: Int32, top: Int32, nsteps: Int32, row: Int32):
+    """Largest s in [0, nseq) with qsl[s] <= row (qsl[0] <= row)."""
+    s = Int32(0)
+    step = top
+    for _ in cutlass.range(nsteps, unroll=1):
+        cand = s + step
+        if cand < nseq:
+            if ldg_s32(qsl_addr + Int64(cand) * 4) <= row:
+                s = cand
+        step = step // 2
+    return s
+
+
+@cute.jit
+def epilogue_kda_conv(
+    gemm_kernel,
+    epi_tidx: Int32,
+    tCtAcc_base: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    tCcC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    mma_tile_coord_mnl: tuple,
+    m_rows: Int32,
+    n_cols: Int32,
+    conv: tuple,
+    smem_x: Int32,
+    norms: Constexpr,
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+) -> pipeline.PipelineState:
+    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv
+    tCgC = transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = epilogue_tmem_copy_and_partition(
+        gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
+    )
+    thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tidx)
+    tTR_cC = thr_copy_t2r.partition_D(
+        cute.flat_divide(transform_partitioned_tensor_layout(tCcC_base), epi_tile)
+    )[(None, None, None, None, None, *mma_tile_coord_mnl)]
+    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+
+    epi_m = cute.size(tTR_tAcc.shape, mode=[3])
+    epi_n = cute.size(tTR_tAcc.shape, mode=[4])
+    ncol = cute.size(tTR_rAcc)
+    npair = ncol // 2
+    nq = npair // 4
+    p_dim = n_cols // 3
+    n_blk = (m_rows + 127) // 128
+    bar = gemm_kernel.epilog_sync_bar_id
+
+    # Sequence of each row block, before the accumulator wait (overlaps the MMA).
+    rows = []
+    for mi in cutlass.range_constexpr(epi_m):
+        row = tTR_cC[(None, None, None, mi, 0)][0][0]
+        s = find_seq(qsl_addr, nseq, top, nsteps, row)
+        start = ldg_s32(qsl_addr + Int64(s) * 4)
+        end = ldg_s32(qsl_addr + Int64(s + 1) * 4)
+        rows.append((row, s, start, end))
+
+    acc_pipeline.consumer_wait(acc_consumer_state)
+    for mi in cutlass.range_constexpr(epi_m):
+        row, s, start, end = rows[mi]
+        rb = row % 128
+        lane = row % 32
+        wq = rb // 32
+        pos = row - start
+        ln = end - start
+        valid = b2i(row < m_rows) * b2i(row < end)
+        fix = b2i(rb < 3) | b2i(pos < 3)
+        store = valid * (1 - fix)
+        side_tile = Int64(row // 128) * 6
+        side_seq = Int64(n_blk) * 6 + Int64(s) * 6
+        w_head = valid * b2i(rb < 3)
+        r_head = side_tile + Int64(rb)
+        w_tail = valid * b2i(rb >= 125)
+        r_tail = side_tile + Int64(rb - 122)
+        w_shead = valid * b2i(pos < 3)
+        r_shead = side_seq + Int64(pos)
+        w_stail = valid * b2i(pos >= ln - 3)
+        r_stail = side_seq + Int64(pos - ln + 6)
+        w_xchg = b2i(lane >= 29)
+        l0 = b2i(lane == 0)
+        l1 = b2i(lane == 1)
+        l2 = b2i(lane == 2)
+        ssq = Float32(0.0)
+        for ni in cutlass.range_constexpr(epi_n):
+            cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, mi, ni)], tTR_rAcc)
+            if cutlass.const_expr(mi == epi_m - 1 and ni == epi_n - 1):
+                cute.arch.fence_view_async_tmem_load()
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(acc_consumer_state)
+                acc_consumer_state.advance()
+            col = tTR_cC[(None, None, None, mi, ni)][0][1]
+            xs = [
+                pack_bf16x2(tTR_rAcc[2 * p], tTR_rAcc[2 * p + 1])
+                for p in range(npair)
+            ]
+            # Pre-conv rows for the fix-up and the conv state.
+            sid = mi * epi_n + ni
+            for wr, rr in (
+                (w_head, r_head),
+                (w_tail, r_tail),
+                (w_shead, r_shead),
+                (w_stail, r_stail),
+            ):
+                base = side_addr + (rr * Int64(n_cols) + Int64(col)) * 2
+                for q in cutlass.range_constexpr(nq):
+                    stg_v4(base + q * 16, wr, *xs[4 * q : 4 * q + 4])
+            # Warp-boundary rows through shared memory.
+            xbase = smem_x + ((sid * 4 + wq) * 3 + (lane - 29)) * (npair * 4)
+            for q in cutlass.range_constexpr(nq):
+                sts_v4(xbase + q * 16, w_xchg, *xs[4 * q : 4 * q + 4])
+            cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+            pbase = smem_x + ((sid * 4 + (wq + 3) % 4) * 3) * (npair * 4)
+            prev = [[], [], []]
+            for j in cutlass.range_constexpr(3):
+                for q in cutlass.range_constexpr(nq):
+                    prev[j] += lds_v4(pbase + j * (npair * 4) + q * 16)
+            ys = []
+            for p in cutlass.range_constexpr(npair):
+                p1 = sel(l0, prev[2][p], shfl_up(xs[p], 1))
+                p2 = sel(l0, prev[1][p], sel(l1, prev[2][p], shfl_up(xs[p], 2)))
+                p3 = sel(
+                    l0,
+                    prev[0][p],
+                    sel(l1, prev[1][p], sel(l2, prev[2][p], shfl_up(xs[p], 3))),
+                )
+                c = col + 2 * p
+                wa = ldg_f32x4(w_addr + Int64(c) * 16)
+                wb = ldg_f32x4(w_addr + Int64(c + 1) * 16)
+                wv = [wa[0], wb[0], wa[1], wb[1], wa[2], wb[2], wa[3], wb[3]]
+                if cutlass.const_expr(norms and p == 0):
+                    ssq = self32(b2i(col % 128 == 0), Float32(0.0), ssq)
+                y, ssq = conv_pair(p3, p2, p1, xs[p], wv, ssq)
+                ys.append(y)
+            part = col // p_dim
+            cc = col - part * p_dim
+            obase = out_addr + ((Int64(part) * Int64(m_rows) + Int64(row)) * Int64(p_dim) + Int64(cc)) * 2
+            for q in cutlass.range_constexpr(nq):
+                stg_v4(obase + q * 16, store, *ys[4 * q : 4 * q + 4])
+            if cutlass.const_expr(norms):
+                head_end = b2i((col + ncol) % 128 == 0) * b2i(part < 2)
+                h = p_dim // 128
+                naddr = norm_addr + ((Int64(part) * Int64(m_rows) + Int64(row)) * Int64(h) + Int64(cc // 128)) * 4
+                stg_f32(naddr, store * head_end, rsqrt_eps(ssq))
+    return acc_consumer_state
+
+
+@cute.jit
+def epilogue_kda_conv_drain(
+    gemm_kernel,
+    tidx: Int32,
+    tCtAcc_base: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    tCcC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    mma_tile_coord_mnl: tuple,
+    m_rows: Int32,
+    n_cols: Int32,
+    conv: tuple,
+    smem_x: Int32,
+    norms: Constexpr,
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+) -> pipeline.PipelineState:
+    """Eight epilogue warps for the B-reuse tile (one TMEM accumulator stage):
+    warp group g owns M block g. Each thread drains its row (BF16-rounded) into
+    registers and releases the accumulator before the conv, so the next tile's
+    MMA overlaps the conv math."""
+    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv
+    g = tidx // 128
+    epi_tidx = tidx % 128
+    tCgC = transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = epilogue_tmem_copy_and_partition(
+        gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
+    )
+    thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tidx)
+    tTR_cC = thr_copy_t2r.partition_D(
+        cute.flat_divide(transform_partitioned_tensor_layout(tCcC_base), epi_tile)
+    )[(None, None, None, None, None, *mma_tile_coord_mnl)]
+    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+
+    epi_m = cute.size(tTR_tAcc.shape, mode=[3])
+    epi_n = cute.size(tTR_tAcc.shape, mode=[4])
+    if cutlass.const_expr(epi_m != 2):
+        raise ValueError(f"drain conv epilogue needs 2 M blocks per CTA, got {epi_m}")
+    ncol = cute.size(tTR_rAcc)
+    npair = ncol // 2
+    nq = npair // 4
+    p_dim = n_cols // 3
+    n_blk = (m_rows + 127) // 128
+    bar = gemm_kernel.epilog_sync_bar_id
+
+    row = tTR_cC[(None, None, None, g, 0)][0][0]
+    s = find_seq(qsl_addr, nseq, top, nsteps, row)
+    start = ldg_s32(qsl_addr + Int64(s) * 4)
+    end = ldg_s32(qsl_addr + Int64(s + 1) * 4)
+
+    acc_pipeline.consumer_wait(acc_consumer_state)
+    xs_all = []
+    for ni in cutlass.range_constexpr(epi_n):
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, g, ni)], tTR_rAcc)
+        xs_all.append(
+            [pack_bf16x2(tTR_rAcc[2 * p], tTR_rAcc[2 * p + 1]) for p in range(npair)]
+        )
+    cute.arch.fence_view_async_tmem_load()
+    with cute.arch.elect_one():
+        acc_pipeline.consumer_release(acc_consumer_state)
+    acc_consumer_state.advance()
+
+    rb = row % 128
+    lane = row % 32
+    wq = rb // 32
+    pos = row - start
+    ln = end - start
+    valid = b2i(row < m_rows) * b2i(row < end)
+    fix = b2i(rb < 3) | b2i(pos < 3)
+    store = valid * (1 - fix)
+    side_tile = Int64(row // 128) * 6
+    side_seq = Int64(n_blk) * 6 + Int64(s) * 6
+    side_w = (
+        (valid * b2i(rb < 3), side_tile + Int64(rb)),
+        (valid * b2i(rb >= 125), side_tile + Int64(rb - 122)),
+        (valid * b2i(pos < 3), side_seq + Int64(pos)),
+        (valid * b2i(pos >= ln - 3), side_seq + Int64(pos - ln + 6)),
+    )
+    w_xchg = b2i(lane >= 29)
+    l0 = b2i(lane == 0)
+    l1 = b2i(lane == 1)
+    l2 = b2i(lane == 2)
+    ssq = Float32(0.0)
+    for ni in cutlass.range_constexpr(epi_n):
+        col = tTR_cC[(None, None, None, g, ni)][0][1]
+        xs = xs_all[ni]
+        for wr, rr in side_w:
+            base = side_addr + (rr * Int64(n_cols) + Int64(col)) * 2
+            for q in cutlass.range_constexpr(nq):
+                stg_v4(base + q * 16, wr, *xs[4 * q : 4 * q + 4])
+        sid = g * epi_n + ni
+        xbase = smem_x + ((sid * 4 + wq) * 3 + (lane - 29)) * (npair * 4)
+        for q in cutlass.range_constexpr(nq):
+            sts_v4(xbase + q * 16, w_xchg, *xs[4 * q : 4 * q + 4])
+        cute.arch.barrier(barrier_id=bar, number_of_threads=256)
+        pbase = smem_x + ((sid * 4 + (wq + 3) % 4) * 3) * (npair * 4)
+        ys = []
+        for q in cutlass.range_constexpr(nq):
+            pv = [lds_v4(pbase + j * (npair * 4) + q * 16) for j in range(3)]
+            for i in cutlass.range_constexpr(4):
+                p = 4 * q + i
+                p1 = sel(l0, pv[2][i], shfl_up(xs[p], 1))
+                p2 = sel(l0, pv[1][i], sel(l1, pv[2][i], shfl_up(xs[p], 2)))
+                p3 = sel(
+                    l0,
+                    pv[0][i],
+                    sel(l1, pv[1][i], sel(l2, pv[2][i], shfl_up(xs[p], 3))),
+                )
+                c = col + 2 * p
+                wa = ldg_f32x4(w_addr + Int64(c) * 16)
+                wb = ldg_f32x4(w_addr + Int64(c + 1) * 16)
+                wv = [wa[0], wb[0], wa[1], wb[1], wa[2], wb[2], wa[3], wb[3]]
+                if cutlass.const_expr(norms and p == 0):
+                    ssq = self32(b2i(col % 128 == 0), Float32(0.0), ssq)
+                y, ssq = conv_pair(p3, p2, p1, xs[p], wv, ssq)
+                ys.append(y)
+        part = col // p_dim
+        cc = col - part * p_dim
+        obase = out_addr + (
+            (Int64(part) * Int64(m_rows) + Int64(row)) * Int64(p_dim) + Int64(cc)
+        ) * 2
+        for q in cutlass.range_constexpr(nq):
+            stg_v4(obase + q * 16, store, *ys[4 * q : 4 * q + 4])
+        if cutlass.const_expr(norms):
+            head_end = b2i((col + ncol) % 128 == 0) * b2i(part < 2)
+            h = p_dim // 128
+            naddr = norm_addr + (
+                (Int64(part) * Int64(m_rows) + Int64(row)) * Int64(h) + Int64(cc // 128)
+            ) * 4
+            stg_f32(naddr, store * head_end, rsqrt_eps(ssq))
+    return acc_consumer_state

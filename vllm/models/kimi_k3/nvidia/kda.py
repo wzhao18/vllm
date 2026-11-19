@@ -987,6 +987,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             ),
         )
 
+    def _prefill_in_proj(self):
+        """SM107 prefill in_proj with the Q|K|V conv epilogue
+        (specialized_prefill.kda_in_proj), built on first use."""
+        state = getattr(self, "_prefill_in_proj_state", None)
+        if state is None:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_in_proj import (
+                KdaPrefillInProj,
+            )
+
+            state = KdaPrefillInProj(self) if KdaPrefillInProj.supported(self) else False
+            self._prefill_in_proj_state = state
+        return state or None
+
     def forward(
         self,
         hidden_states: "torch.Tensor | QuantizedActivation",
@@ -1000,6 +1013,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_tokens = qa.data.size(0) if qa is not None else hidden_states.size(0)
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
+        qkv_conv_out = None
         if (
             qa is None
             and 0 < num_tokens <= self._projection_overlap_max_tokens
@@ -1024,17 +1038,34 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 dim=-1,
             )
         else:
-            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
-            split_sizes = [
-                3 * self.local_projection_size,
-                self.local_projection_size,
-                self.head_dim,
-                self.local_num_heads,
-            ]
-            if self.in_proj_padding:
-                split_sizes.append(self.in_proj_padding)
-            projected = projected_qkvgfab.split(split_sizes, dim=-1)
-            mixed_qkv, g_proj_states, f_a, beta = projected[:4]
+            fused = None
+            prefill_in_proj = self._prefill_in_proj() if qa is not None else None
+            if prefill_in_proj is not None:
+                fused = prefill_in_proj(self, qa, num_tokens)
+            if fused is not None:
+                # Prefill: Q|K|V conv ran in the in_proj epilogue (+ conv state).
+                qkv_conv_out, rest = fused
+                mixed_qkv = None
+                split_sizes = [
+                    self.local_projection_size,
+                    self.head_dim,
+                    self.local_num_heads,
+                ]
+                if self.in_proj_padding:
+                    split_sizes.append(self.in_proj_padding)
+                g_proj_states, f_a, beta = rest.split(split_sizes, dim=-1)[:3]
+            else:
+                projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+                split_sizes = [
+                    3 * self.local_projection_size,
+                    self.local_projection_size,
+                    self.head_dim,
+                    self.local_num_heads,
+                ]
+                if self.in_proj_padding:
+                    split_sizes.append(self.in_proj_padding)
+                projected = projected_qkvgfab.split(split_sizes, dim=-1)
+                mixed_qkv, g_proj_states, f_a, beta = projected[:4]
             g1 = self.f_b_proj(f_a)[0]
 
         beta = beta.unsqueeze(0)
@@ -1062,6 +1093,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
             o_mxfp8=o_mxfp8,
+            qkv_conv_out=qkv_conv_out,
         )
         if o_mxfp8 is not None:
             return self.o_proj(o_mxfp8.activation())[0]
@@ -1184,6 +1216,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
         o_mxfp8: Mxfp8Buffer | None = None,
+        qkv_conv_out: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1215,7 +1248,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_actual_tokens = m.num_actual_tokens
         checkpoint = m.checkpoint
         has_spec_decode = m.num_spec_decodes > 0
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        if qkv_conv_out is not None:
+            # (3, tokens, P) conv output of the prefill in_proj epilogue.
+            assert not has_spec_decode and m.num_decodes == 0
+            mixed_qkv = qkv_conv_out[:, :num_actual_tokens]
+        else:
+            mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
@@ -1413,9 +1451,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             if non_spec_token_start is not None:
                 non_spec_out = core_attn_out[:, non_spec_slice]
             if m.num_prefills > 0:
-                q_ns, k_ns, v_ns = mixed_qkv_ns.split(
-                    self.local_projection_size, dim=-1
-                )
+                if qkv_conv_out is None:
+                    q_ns, k_ns, v_ns = mixed_qkv_ns.split(
+                        self.local_projection_size, dim=-1
+                    )
 
                 # Separate convolution calls accept row-strided packed inputs
                 # and produce dense Q/K/V without an additional V copy.
@@ -1454,7 +1493,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     and non_spec_query_start_loc is not None
                     and non_spec_state_indices_tensor is not None
                 )
-                if have_meta and kda_conv.qkv_conv_supported(
+                if qkv_conv_out is not None:
+                    q_ns, k_ns, v_ns = mixed_qkv_ns.unbind(0)
+                elif have_meta and kda_conv.qkv_conv_supported(
                     mixed_qkv_ns,
                     conv_weights,
                     conv_state,
