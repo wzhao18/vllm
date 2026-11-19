@@ -14,7 +14,7 @@
 #include <vector>
 #define CK(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { const char* s; cuGetErrorString(r_, &s); printf("CU error %s line %d\n", s, __LINE__); exit(1); } } while (0)
 #define RK(x) do { cudaError_t r_ = (x); if (r_ != cudaSuccess) { printf("CUDA error %s line %d\n", cudaGetErrorString(r_), __LINE__); exit(1); } } while (0)
-constexpr int BLK = 4352, CH = 4;  // block bytes, blocks per claim
+constexpr int BLK = 4352, CH = 16;  // block bytes, blocks per claim
 
 __device__ __forceinline__ unsigned sa(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void wait_cta(unsigned b, unsigned ph) {
@@ -99,7 +99,8 @@ int main(int argc, char** argv) {
          NREQ, NBLK, nt, (double)nt * BLK / 1e6, TH, D, smem, l0.size(), l1.size(), (double)nt * BLK / 18.5e6);
   for (int mode = 0; mode < 2; ++mode) {
     const unsigned char* pool = mode ? (const unsigned char*)va : ps;
-    std::vector<float> tc, tw;
+    std::vector<float> tc, tw, sp;
+    std::vector<unsigned long long> hst(2 * nsm);
     for (int it = 0; it < 2 * iters + 1; ++it) {
       bool cold = it % 2 == 0;
       if (cold) RK(cudaMemsetAsync(flush, it, FL));
@@ -109,8 +110,12 @@ int main(int argc, char** argv) {
       cudaEventRecord(e1); RK(cudaEventSynchronize(e1)); RK(cudaGetLastError());
       float ms; cudaEventElapsedTime(&ms, e0, e1);
       if (it) (cold ? tc : tw).push_back(ms * 1000);
+      if (it && cold) { RK(cudaMemcpy(hst.data(), st, 16 * nsm, cudaMemcpyDeviceToHost)); unsigned long long a = ~0ull, b = 0;
+        for (int i = 0; i < nsm; ++i) { a = std::min(a, hst[2 * i]); b = std::max(b, hst[2 * i + 1]); } sp.push_back((b - a) / 1e3); }
     }
     std::sort(tc.begin(), tc.end()); std::sort(tw.begin(), tw.end());
+    std::sort(sp.begin(), sp.end());
+    printf("  SPAN %s: in-kernel cold median %.2f us (%.1f TB/s)\n", mode ? "die-local" : "striped", sp[sp.size() / 2], (double)nt * BLK / sp[sp.size() / 2] / 1e6);
     printf("  RESULT %s: cold median %.2f us (min %.2f, %.1f TB/s) | warm median %.2f us\n", mode ? "die-local+claim" : "striped",
            tc[tc.size() / 2], tc[0], (double)nt * BLK / tc[tc.size() / 2] / 1e6, tw[tw.size() / 2]);
   }
