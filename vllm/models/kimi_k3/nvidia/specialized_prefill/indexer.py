@@ -25,12 +25,12 @@ top-k re-reading them) by two kernels that never materialize the logits:
   sort_rows           Triton: each row's selected key indices in ascending order,
                       -1 padded (deterministic output order).
 
-Stock precision (DeepGEMM SM100 MQA logits, MXFP4 Q and K, BF16 weights):
-logit[t, k] = sum over heads h of bf16(relu(q[t, h] . k)) * w[t, h], each head
-term rounded to BF16 by cvt.rn.relu.bf16x2.f32 and accumulated by BF16x2 FMAs in
-two partial sums (heads 4i, 4i + 1 and 4i + 2, 4i + 3), then
-(s0.lo + s1.lo) + (s0.hi + s1.hi) in BF16. The only order difference is inside
-the MMA (one K = 128 instruction instead of two K = 64 instructions).
+Precision (at least stock): logit[t, k] = sum over heads h of
+bf16(relu(q[t, h] . k)) * w[t, h] with MXFP4 Q and K and BF16 weights, as the
+stock DeepGEMM SM100 MQA logits, but the head sum runs on the tensor core (BF16
+products, FP32 accumulation, one rounding to BF16 at the end) instead of the stock
+BF16x2 FMA chain. The logits are therefore at least as precise as stock and may
+differ from it in the last BF16 bit; the top-k is exact over these logits.
 """
 
 import functools
@@ -53,19 +53,32 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives imp
 HEADS = 32
 DIM = 128
 TILE = 128  # keys per MMA tile (M)
-BQ = 8  # query tokens per work item
+BQ = 6  # query tokens per work item
 N = BQ * HEADS  # MMA N
 KV_STAGES = 6
 Q_STAGES = 2
 ACC_STAGES = 2
-EPI_WG = 4  # epilogue warpgroups (2 tokens per thread)
-TOK_WG = BQ // EPI_WG  # tokens per epilogue warpgroup
+EPI_WG = BQ  # epilogue warpgroups (one token per thread)
 PRODUCER = 4 * EPI_WG
 MMA_WARP = PRODUCER + 1
 THREADS = 32 * (MMA_WARP + 1)
-TMEM_COLS = 576  # exclusive allocation: 2 x N accumulators + scale factors
+TMEM_COLS = 576  # exclusive allocation: 2 x N accumulators, scale factors, head sum
 SF_WORDS_A = TILE  # one 32-bit word (four UE8M0) per key
-SF_WORDS_B = N
+SF_WORDS_B = (N + 127) // 128 * 128  # the SF atom rounds N up to 128 rows
+# Head sum on the tensor core (per warpgroup = token): the relu'd BF16 head
+# logits (A2, 16 TMEM columns = 32 heads) times the token's BF16 head weights
+# (B2, block column of a K16 x N16 smem matrix) into an FP32 column of D2, two
+# M128 N16 K16 MMAs issued by the warpgroup itself (the small-N issue floor is per
+# issuing warp). D2 regions are N16 wide at a stride of D2_STRIDE columns, so the
+# used column (D2_USE) of a region lies in no other region (the zero-initialising
+# first MMA of a warpgroup never touches another warpgroup's sum).
+A2_COLS = HEADS // 2
+D2_STRIDE = 12  # MMA D columns must be 4-aligned; 12 leaves columns 4..11 exclusive
+D2_USE = 8
+B2_BYTES = 512  # one K16 x N16 BF16 matrix (four 8 x 16 B core matrices)
+B2_LBO = 128
+B2_SBO = 256
+MMA2_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((16 >> 3) << 17) | ((TILE >> 4) << 24)
 
 
 # --------------------------------------------------------------------------
@@ -249,6 +262,62 @@ def fence_async_shared():
     return "fence.proxy.async.shared::cta;", "~{memory}", ()
 
 
+@asm()
+def tmem_st16(taddr, *vals):
+    """tcgen05.st 32x32b.x16: 16 columns of this warp's 32 TMEM lanes."""
+    regs = ",".join(f"${i + 1}" for i in range(16))
+    code = "tcgen05.st.sync.aligned.32x32b.x16.b32 [$0], {" + regs + "};"
+    return code, "r," + ",".join(["r"] * 16) + ",~{memory}", (
+        Int32(taddr), *[Uint32(v) for v in vals])
+
+
+@asm(Float32)
+def tmem_ld1(taddr):
+    return "tcgen05.ld.sync.aligned.32x32b.x1.b32 {$0}, [$1];", "=f,r,~{memory}", (Int32(taddr),)
+
+
+@asm()
+def tmem_wait_st():
+    return "tcgen05.wait::st.sync.aligned;", "~{memory}", ()
+
+
+@asm()
+def tc_fence_before():
+    return "tcgen05.fence::before_thread_sync;", "~{memory}", ()
+
+
+@asm()
+def tc_fence_after():
+    return "tcgen05.fence::after_thread_sync;", "~{memory}", ()
+
+
+@asm()
+def mma2_bf16(d, a, bdesc, acc):
+    """tcgen05.mma kind::f16 M128 N16 K16, A from TMEM, issued by one elected lane
+    (the whole warp calls it with warp-uniform operands)."""
+    code = (
+        "{ .reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.b32 Q, $3, 0; "
+        f"@P tcgen05.mma.cta_group::1.kind::f16 [$0], [$1], $2, {MMA2_IDESC:#x}, Q; }}"
+    )
+    return code, "r,r,l,r,~{memory}", (Int32(d), Int32(a), Int64(bdesc), Int32(acc))
+
+
+@asm()
+def tc_commit(mbar):
+    code = (
+        "{ .reg .pred P; elect.sync _|P, 0xffffffff; "
+        "@P tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [$0]; }"
+    )
+    return code, "r,~{memory}", (Int32(mbar),)
+
+
+@asm(Uint32, pure=True)
+def bf16_of(v: Float32):
+    """cvt.rn.bf16.f32 into the low half (high half zero)."""
+    code = "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.u32.u16 $0, h; }"
+    return code, "=r,f", (v,)
+
+
 @cute.jit
 def order16(bits: Uint32) -> Uint32:
     """Order-preserving 16-bit key of BF16 ``bits``; -0 is keyed as +0."""
@@ -403,7 +472,17 @@ class IndexerScore:
         self.sfb_cols = (
             cute.cosize(cute.recast_layout(32, sf_t.width, tsfb_layout)) & 0xFFFF
         )
-        assert ACC_STAGES * N + self.sfa_cols + self.sfb_cols <= TMEM_COLS
+        # TMEM operand columns of tcgen05.mma must be 4-aligned
+        sf_end = ACC_STAGES * N + self.sfa_cols + self.sfb_cols
+        self.a2_col = (sf_end + 3) // 4 * 4
+        if cutlass.const_expr(
+            (sf_end + 15) // 16 * 16 + EPI_WG * A2_COLS + (EPI_WG - 1) * D2_STRIDE + 16
+            <= TMEM_COLS
+        ):
+            self.a2_col = (sf_end + 15) // 16 * 16
+        self.d2_col = self.a2_col + EPI_WG * A2_COLS
+        assert self.d2_col + (EPI_WG - 1) * D2_STRIDE + 16 <= TMEM_COLS, (
+            self.sfa_cols, self.sfb_cols)
         a_one = cute.slice_(a_layout, (None, None, None, 0))
         b_one = cute.slice_(b_layout, (None, None, None, 0))
         tma_k, tma_k_tensor = cute.nvgpu.make_tiled_tma_atom_A(
@@ -493,7 +572,10 @@ class IndexerScore:
             acc_empty: cute.struct.MemRange[cutlass.Int64, ACC_STAGES]
             tmem_hold: Int32
             row_end: cute.struct.MemRange[Int32, Q_STAGES * BQ]
-            w: cute.struct.Align[cute.struct.MemRange[Uint32, Q_STAGES * BQ * 16], 16]
+            w2: cute.struct.Align[
+                cute.struct.MemRange[Uint32, Q_STAGES * BQ * 2 * B2_BYTES // 4], 1024
+            ]
+            d2_full: cute.struct.MemRange[cutlass.Int64, EPI_WG]
             hist: cute.struct.Align[cute.struct.MemRange[Uint32, BQ * S_BINS], 16]
             wscan: cute.struct.Align[cute.struct.MemRange[Uint32, EPI_WG * 4], 16]
 
@@ -515,7 +597,14 @@ class IndexerScore:
         acc_full = st.acc_full.data_ptr()
         acc_empty = st.acc_empty.data_ptr()
         end_a = st.row_end.data_ptr().toint()
-        w_a = st.w.data_ptr().toint()
+        w_a = st.w2.data_ptr().toint()
+        d2_full = st.d2_full.data_ptr()
+        # B2 matrices: zero once (only the weight rows change per item)
+        for i in cutlass.range_constexpr((Q_STAGES * BQ * 2 * B2_BYTES // 4 + THREADS - 1) // THREADS):
+            wi = i * THREADS + tidx
+            if wi < Q_STAGES * BQ * 2 * B2_BYTES // 4:
+                st_shared_u32(w_a + wi * 4, Uint32(0))
+        fence_async_shared()
         sfa_a = sSFA.iterator.toint()
         sfb_a = sSFB.iterator.toint()
         if tidx == 0:
@@ -528,6 +617,8 @@ class IndexerScore:
             for i in cutlass.range_constexpr(ACC_STAGES):
                 cute.arch.mbarrier_init(acc_full + i, 1)
                 cute.arch.mbarrier_init(acc_empty + i, 4 * EPI_WG)
+            for i in cutlass.range_constexpr(EPI_WG):
+                cute.arch.mbarrier_init(d2_full + i, 1)
             cute.arch.mbarrier_init_fence()
         if warp == PRODUCER:
             cpasync.prefetch_descriptor(tma_k)
@@ -575,14 +666,35 @@ class IndexerScore:
                     if lane < ntok:
                         e = row_len[token0 + lane]
                     st_shared_u32(end_a + (qs * BQ + lane) * 4, Uint32(e))
-                for i in cutlass.range_constexpr(4):
-                    wi = lane * 4 + i  # BQ * 16 = 128 words
-                    tok = wi // 16
-                    v = Uint32(0)
-                    if tok < ntok:
-                        v = Uint32(weights[token0 + tok, wi % 16])
-                    st_shared_u32(w_a + (qs * BQ * 16 + wi) * 4, v)
-                for c in cutlass.range_constexpr(N // 128):
+                # B2 (token t, head chunk c): K-major K16 x N16, the weights of heads
+                # 16 c .. 16 c + 15 in row n = D2_USE (= core row 0 of N group 1).
+                # Rows are written at the core offsets of both readings of the
+                # no-swizzle descriptor (LBO = K step, SBO = N step and the swap);
+                # the extra copies land in unused D2 columns.
+                for i in cutlass.range_constexpr((BQ * 2 * 3 + 31) // 32):
+                    idx = i * 32 + lane
+                    if idx < BQ * 2 * 3:
+                        m = idx // 3
+                        part = idx % 3
+                        tok = m // 2
+                        word0 = Int32((m % 2) * 8)
+                        off = Int32(B2_SBO)
+                        if part == 1:
+                            off = Int32(B2_SBO + B2_LBO)
+                            word0 = word0 + 4
+                        if part == 2:
+                            off = Int32(B2_LBO)
+                        v0 = Uint32(0)
+                        v1 = Uint32(0)
+                        v2 = Uint32(0)
+                        v3 = Uint32(0)
+                        if tok < ntok:
+                            v0 = Uint32(weights[token0 + tok, word0])
+                            v1 = Uint32(weights[token0 + tok, word0 + 1])
+                            v2 = Uint32(weights[token0 + tok, word0 + 2])
+                            v3 = Uint32(weights[token0 + tok, word0 + 3])
+                        st_shared_v4(w_a + (qs * BQ * 2 + m) * B2_BYTES + off, v0, v1, v2, v3)
+                for c in cutlass.range_constexpr(SF_WORDS_B // 128):
                     words = []
                     for i in cutlass.range_constexpr(4):
                         r = c * 128 + 32 * i + lane
@@ -681,6 +793,7 @@ class IndexerScore:
             self.epilogue(
                 tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
                 logits, row_bin, (end_a, w_a, st.hist.data_ptr().toint(), st.wscan.data_ptr().toint()),
+                d2_full,
                 warp, tidx, bid,
                 lane,
             )
@@ -720,35 +833,37 @@ class IndexerScore:
     @cute.jit
     def epilogue(
         self, tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
-        logits, row_bin, sm, warp, tidx, bid, lane,
+        logits, row_bin, sm, d2_full, warp, tidx, bid, lane,
     ):
-        """Every epilogue warp reads every tile: warpgroup wg owns tokens 2 wg and
-        2 wg + 1 of the item, its warp w % 4 the TMEM lane quarter (32 keys). The
-        head weights of the two tokens stay in registers for the whole item. Tiles
-        come in pairs (accumulator stages 0 and 1; items have an even tile count),
-        each read with one 32-head load per token and released at once. Each thread
-        forms the BF16 logits of its key for both tokens at stock precision, stores
-        them straight to the row-major scratch (row t at row_base[t], MMA-row order;
-        tokens past the item's end write a dummy row) and counts them in the row's
-        histogram of the top 11 bits. At the end of the item the warpgroup finds,
-        per row, the rank (in value order) of the bin holding the topk-th largest
-        logit and the count above it (``row_bin``), for the select."""
+        """Warpgroup wg owns token wg of every item, its warp w % 4 the TMEM lane
+        quarter (32 keys). Per tile each thread loads its key's 32 head logits,
+        releases the accumulator stage, writes the relu'd BF16 head logits to the
+        warpgroup's A2 columns and (after a warpgroup barrier) one warp issues the
+        two head-sum MMAs into the warpgroup's D2 column. The FP32 sum of the
+        previous tile is read meanwhile (one MMA round trip of slack), rounded to
+        BF16 and stored (mode < PUBLISH, plus the histogram) or published. At the
+        end of an item in mode 0 the warpgroup finds the row's bound bin (``row_bin``)."""
         end_a, w_a, hist_a, wscan_a = sm
         wg = warp // 4
         lt = tidx % 128
         wq = lt // 32
         out_a = logits.iterator.toint()
+        tbase = Int32(tAcc.iterator.toint())
         ph = Int32(0)
+        dph = Int32(0)
         jq = Int32(0)
         n_rows = row_base.shape[0] - 1
         key_in_tile = 4 * (lt % 32) + lt // 32
-        tok_a = 2 * wg
-        # this warp's TMEM lane quarter, column 0 of accumulator stage 0
-        tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * HEADS
-        hist0 = hist_a + tok_a * (S_BINS * 4)
-        hist1 = hist0 + S_BINS * 4
-        # zero the histograms once (re-zeroed after every item)
-        for i in cutlass.range_constexpr(2 * S_BINS // 128):
+        lane_q = (wq * 32) << 16
+        tmem_q = tbase + lane_q + wg * HEADS
+        a2_q = tbase + lane_q + self.a2_col + wg * A2_COLS
+        d2_q = tbase + lane_q + self.d2_col + wg * D2_STRIDE + D2_USE
+        a2_m = tbase + self.a2_col + wg * A2_COLS
+        d2_m = tbase + self.d2_col + wg * D2_STRIDE
+        d2_bar = d2_full + wg
+        d2_bar_a = d2_full.toint() + wg * 8
+        hist0 = hist_a + wg * (S_BINS * 4)
+        for i in cutlass.range_constexpr(S_BINS // 128):
             st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
         wg_sync(wg)
         for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
@@ -757,169 +872,128 @@ class IndexerScore:
             ntiles = items[item, 3]
             qs = jq % Q_STAGES
             cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
-            end0 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a) * 4))
-            end1 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a + 1) * 4))
-            row0 = token0 + tok_a
-            row1 = token0 + tok_a + 1
-            if tok_a >= ntok:
+            end0 = Int32(ld_shared_u32(end_a + (qs * BQ + wg) * 4))
+            row0 = token0 + wg
+            if wg >= ntok:
                 row0 = n_rows
-            if tok_a + 1 >= ntok:
-                row1 = n_rows
             ntp = ntiles + (ntiles & 1)
-            # running pointers: position lt of the item's newest tile pair's first tile
-            first = Int64((ntp - 1) * TILE + lt) * 2
-            ptr0 = out_a + row_base[row0] * 2 + first
-            ptr1 = out_a + row_base[row1] * 2 + first
+            # this row's scratch row (MMA-row order: key position lt of each tile)
+            rowp = out_a + row_base[row0] * 2 + Int64(lt) * 2
             thr = Uint32(0)
-            cand0 = ptr0
-            cand1 = ptr1
-            p0 = ptr0
-            p1 = ptr1
-            lim0 = ptr0
-            lim1 = ptr1
+            cand0 = rowp
+            p0 = rowp
+            lim0 = rowp
             if cutlass.const_expr(self.mode >= PUBLISH):
-                # BF16 thresholds of both rows (row_bin[3 r], the dummy row's is NaN)
-                # and their candidate lists (row_base in 16-bit units)
-                thr = (Uint32(row_bin[3 * row1]) << Uint32(16)) | (
-                    Uint32(row_bin[3 * row0]) & Uint32(0xFFFF)
-                )
-                # this thread's column of each row's candidate region: word 0
-                # the count, then one word per kept key (tile << 16 | BF16)
+                # BF16 threshold (the dummy row's is NaN) and this thread's column
+                # of the row's candidate region: word 0 the count, then one word
+                # per kept key (tile << 16 | BF16)
+                thr = Uint32(row_bin[3 * row0]) & Uint32(0xFFFF)
                 cand0 = out_a + row_base[row0] * 2 + lt * 4
-                cand1 = out_a + row_base[row1] * 2 + lt * 4
                 p0 = cand0 + TILE * 4
-                p1 = cand1 + TILE * 4
                 lim0 = cand0 + REGION * 4
-                lim1 = cand1 + REGION * 4
-            # tile pairs whose newer tile reaches past a row end (causal edge)
-            full_tiles = cutlass.min(end0, end1) // TILE
-            # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
-            wbase = w_a + (qs * BQ * 16 + tok_a * 16) * 4
-            w = []
-            for j in cutlass.range_constexpr(2):
-                wj = []
-                for i in cutlass.range_constexpr(4):
-                    v = lds_v4(wbase + (j * 16 + 4 * i) * 4)
-                    wj.extend(v)
-                w.append(wj)
+            # B2 descriptors of this token's two head chunks
+            b2 = w_a + (qs * BQ + wg) * 2 * B2_BYTES
+            desc0 = (Int64((b2 >> 4) & 0x3FFF) | Int64(
+                ((B2_LBO >> 4) << 16) | ((B2_SBO >> 4) << 32) | (1 << 46)))
+            full_tiles = end0 // TILE
+            n_edge = cutlass.max(ntp + 1 - full_tiles, 0) // 2
+            # the pending tile (its head sum in flight): tile index, mask
+            pt = Int32(-1)
+            pm = Uint32(0)
+            for pp in cutlass.range(n_edge, unroll=1):
+                for st in cutlass.range_constexpr(ACC_STAGES):
+                    pt, pm, p0 = self.tile(
+                        True, ntp - 1 - 2 * pp - st, st, ph, tmem_q, a2_q, d2_q, a2_m, d2_m,
+                        d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq, pt, pm, rowp,
+                        p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
+                    )
+                    dph = dph ^ 1
+                ph = ph ^ 1
+            for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
+                for st in cutlass.range_constexpr(ACC_STAGES):
+                    pt, pm, p0 = self.tile(
+                        False, ntp - 1 - 2 * pp - st, st, ph, tmem_q, a2_q, d2_q, a2_m, d2_m,
+                        d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq, pt, pm, rowp,
+                        p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
+                    )
+                    dph = dph ^ 1
+                ph = ph ^ 1
+            # the item's last head sum
+            if pt >= 0:
+                cute.arch.mbarrier_wait(d2_bar, dph ^ 1)
+                tc_fence_after()
+                v = tmem_wait_n(tmem_ld1(d2_q))[0]
+                p0 = self.finish(v, pt, pm, rowp, p0, thr, lim0, ntiles, hist0)
+            # B2 of this q stage no longer read
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(q_empty + qs)
-            # tile pairs whose newer tile reaches past a row end (causal edge, and
-            # the repeated tile of an odd count) come first (newest to oldest);
-            # the rest run without masking
-            n_edge = cutlass.max(ntp + 1 - full_tiles, 0) // 2
-            for pp in cutlass.range(n_edge, unroll=1):
-                ptr0, ptr1, p0, p1 = self.tile_pair(
-                    True, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
-                    key_in_tile, hist0, hist1,
-                )
-                ph = ph ^ 1
-            for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
-                ptr0, ptr1, p0, p1 = self.tile_pair(
-                    False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
-                    key_in_tile, hist0, hist1,
-                )
-                ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
-                # this thread's candidate counts of both rows
-                # (a full column counts as overflowed: the row is recomputed)
+                # this thread's candidate count (a full column counts as
+                # overflowed: the row is recomputed)
                 st_global_u32(cand0, Uint32((p0 - cand0) // (TILE * 4) - 1))
-                st_global_u32(cand1, Uint32((p1 - cand1) // (TILE * 4) - 1))
             elif cutlass.const_expr(self.mode == 0):
-                # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
                 self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-                self.row_bound(hist1, end1, row1, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-                for i in cutlass.range_constexpr(2 * S_BINS // 128):
+                for i in cutlass.range_constexpr(S_BINS // 128):
                     st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
                 wg_sync(wg)
             jq += 1
 
     @cute.jit
-    def tile_pair(
-        self, edge: cutlass.Constexpr, t_hi, ph, tmem_q, acc_full, acc_empty, lane, w,
-        ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles, key_in_tile, hist0,
-        hist1,
+    def tile(
+        self, edge: cutlass.Constexpr, t, st: cutlass.Constexpr, ph, tmem_q, a2_q, d2_q,
+        a2_m, d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq, pt, pm, rowp,
+        p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
     ):
-        """Both accumulator stages of one tile pair (tiles t_hi and t_hi - 1): the
-        BF16 logits of this thread's key for its two tokens, stored (mode < PUBLISH,
-        plus the histograms) or published. ``edge``: mask keys past the row ends
-        and the repeated tile of an odd count."""
-        # head-half pipeline: the TMEM load of the next half (heads 16-31 of this
-        # stage, then heads 0-15 of the next stage) is issued before this half's
-        # math; a stage is released as soon as its last half landed
-        cute.arch.mbarrier_wait(acc_full, ph)
-        h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
-        h0n = h0
-        for st in cutlass.range_constexpr(ACC_STAGES):
-            t = t_hi - st
-            col = tmem_q + st * N
-            if cutlass.const_expr(st > 0):
-                h0 = tmem_wait_n(*h0n)
-            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
-            ss = self.reduce_half(h0, w, None, 0)
-            h1 = tmem_wait_n(*h1)
-            cute.arch.sync_warp()
-            if lane == 0:
-                cute.arch.mbarrier_arrive(acc_empty + st)
-            if cutlass.const_expr(st + 1 < ACC_STAGES):
-                cute.arch.mbarrier_wait(acc_full + st + 1, ph)
-                h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
-            ss = self.reduce_half(h1, w, ss, HEADS // 2)
-            r = self.combine2(ss)
-            if cutlass.const_expr(edge):
-                kidx = t * TILE + key_in_tile
-                if kidx >= end0 or t >= ntiles:
-                    r = r | Uint32(0xFFFF)
-                if kidx >= end1 or t >= ntiles:
-                    r = r | Uint32(0xFFFF0000)
-            if cutlass.const_expr(self.mode >= PUBLISH):
-                tw = Uint32(t) << Uint32(16)
-                p0 = publish_lo(p0, r, thr, tw, lim0)
-                p1 = publish_hi(p1, r, thr, tw, lim1)
-            elif cutlass.const_expr(edge):
-                if t < ntiles:
-                    st_global_u16(ptr0 - st * TILE * 2, r)
-                    st_global_u16(ptr1 - st * TILE * 2, r >> Uint32(16))
-            else:
-                st_global_u16_off(ptr0, r, -st * TILE * 2)
-                st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
-            if cutlass.const_expr(self.mode == 0):
-                # histogram of the raw top 11 bits (masked keys land in bin 2047,
-                # the lowest rank)
-                red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
-                red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
-        return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
+        """Tile t in accumulator stage st: relu'd BF16 head logits -> A2, head-sum
+        MMAs -> D2; finishes the pending tile pt (whose sum is read before the new
+        MMAs overwrite D2). ``edge``: mask keys past the row end and the repeated
+        tile of an odd count. Returns the new pending (tile, mask) and p0."""
+        cute.arch.mbarrier_wait(acc_full + st, ph)
+        col = tmem_q + st * N
+        h = tmem_wait_n(*tmem_ld16(col), *tmem_ld16(col + HEADS // 2))
+        cute.arch.sync_warp()
+        if lane == 0:
+            cute.arch.mbarrier_arrive(acc_empty + st)
+        a = [relu_bf16x2(h[2 * i], h[2 * i + 1]) for i in range(HEADS // 2)]
+        v = Float32(0.0)
+        if pt >= 0:
+            # the pending head sum (also frees A2 and D2)
+            cute.arch.mbarrier_wait(d2_bar, dph ^ 1)
+            tc_fence_after()
+            v = tmem_wait_n(tmem_ld1(d2_q))[0]
+        tmem_st16(a2_q, *a)
+        tmem_wait_st()
+        tc_fence_before()
+        wg_sync(wg)
+        if wq == 0:
+            tc_fence_after()
+            mma2_bf16(d2_m, a2_m, desc0, 0)
+            mma2_bf16(d2_m, a2_m + 8, desc0 + (B2_BYTES >> 4), 1)
+            tc_commit(d2_bar_a)
+        if pt >= 0:
+            p0 = self.finish(v, pt, pm, rowp, p0, thr, lim0, ntiles, hist0)
+        m = Uint32(0)
+        if cutlass.const_expr(edge):
+            if t * TILE + key_in_tile >= end0 or t >= ntiles:
+                m = Uint32(0xFFFF)
+        return Int32(t), m, p0
 
     @cute.jit
-    def reduce_half(self, buf, w, ss, h0: cutlass.Constexpr):
-        """Heads h0 .. h0 + 15 of both tokens (buf: token 0's 16 values, then token
-        1's) into the running BF16 logit sums at stock precision: per token, s0
-        takes head pairs (4i, 4i + 1), s1 (4i + 2, 4i + 3), each head term
-        relu-rounded to BF16 and BF16x2-FMA'd with its weight."""
-        if cutlass.const_expr(ss is None):
-            ss = [[Uint32(0), Uint32(0)] for _ in range(2)]
+    def finish(self, v, t, m, rowp, p0, thr, lim0, ntiles, hist0):
+        """The BF16 logit of this thread's key in tile t (``m``: masked) stored or
+        published."""
+        r = bf16_of(v) | m
+        if cutlass.const_expr(self.mode >= PUBLISH):
+            p0 = publish_lo(p0, r, thr, Uint32(t) << Uint32(16), lim0)
         else:
-            ss = [list(x) for x in ss]
-        for h in cutlass.range_constexpr(0, HEADS // 2, 4):
-            for j in cutlass.range_constexpr(2):
-                b = 16 * j + h
-                k = (h0 + h) // 2
-                ss[j][0] = fma_bf16x2(relu_bf16x2(buf[b], buf[b + 1]), w[j][k], ss[j][0])
-                ss[j][1] = fma_bf16x2(
-                    relu_bf16x2(buf[b + 2], buf[b + 3]), w[j][k + 1], ss[j][1]
-                )
-        return ss
-
-    @cute.jit
-    def combine2(self, ss):
-        """(s0 + s1) per token, then low + high half: both tokens' BF16 logits."""
-        p0 = add_bf16x2(ss[0][0], ss[0][1])
-        p1 = add_bf16x2(ss[1][0], ss[1][1])
-        return add_bf16x2(prmt(p0, p1, 0x5410), prmt(p0, p1, 0x7632))
+            if t < ntiles:
+                st_global_u16(rowp + Int64(t) * (TILE * 2), r)
+        if cutlass.const_expr(self.mode == 0):
+            # histogram of the raw top 11 bits (masked keys land in bin 2047)
+            red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
+        return p0
 
     @cute.jit
     def row_bound(self, hist, length, row, n_rows, row_bin, scan_a, wg, lt, wq, lane):
