@@ -342,6 +342,109 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
   }
 }
 
+// situ4_pair with the SiTU form fixed at compile time (A_POW, CLAMP): the
+// same operations in the same order, without the runtime branches.
+template <int A_POW, bool CLAMP>
+__device__ __forceinline__ uint32_t situ4_pair_ct(uint32_t gw, uint32_t uw,
+                                                  const float2 k_a,
+                                                  const float2 k_b,
+                                                  const float2 k_c,
+                                                  const float2 bb) {
+  const float2 one = make_float2(1.0f, 1.0f);
+  const float2 neg_one = make_float2(-1.0f, -1.0f);
+  const float2 g = bf16x2_to_f2(gw), u = bf16x2_to_f2(uw);
+  const float2 xb = f2mul(g, k_b);
+  const float2 eb = make_float2(fminf(ex2_approx(xb.x), 1.0e9f),
+                                fminf(ex2_approx(xb.y), 1.0e9f));
+  float2 ea;
+  if (A_POW > 0) {
+    ea = eb;
+#pragma unroll
+    for (int i = 1; i < A_POW; ++i) ea = f2mul(ea, eb);
+  } else {
+    const float2 xa = f2mul(g, k_a);
+    ea = make_float2(ex2_approx(xa.x), ex2_approx(xa.y));
+  }
+  float2 num, den;
+  if (CLAMP) {
+    const float2 xc = f2mul(u, k_c);
+    const float2 ec = make_float2(fminf(ex2_approx(xc.x), 1.0e9f),
+                                  fminf(ex2_approx(xc.y), 1.0e9f));
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), f2fma(ec, neg_one, one)), bb);
+    den = f2mul(f2mul(f2add(ea, one), f2add(eb, one)), f2add(ec, one));
+  } else {
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), bb), u);
+    den = f2mul(f2add(ea, one), f2add(eb, one));
+  }
+  const float2 r = f2mul(num, make_float2(rcp_approx(den.x), rcp_approx(den.y)));
+  const __nv_bfloat162 h = __float22bfloat162_rn(r);
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// Mode 4 for d % 1024 == 0, d <= 32768, 16-byte aligned rows: one CTA per
+// (padded) row and one thread per 32-column MXFP8 block, so the block amax
+// stays in registers and the indexing is two integer ops. Bytes equal
+// act_quant_kernel<4> (same SiTU and quantization steps).
+template <int A_POW, bool CLAMP>
+__global__ void __launch_bounds__(1024) situ4_row_kernel(
+    uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
+    const uint16_t* __restrict__ x, const int64_t rows, const int d,
+    const int64_t x_stride, const int64_t q_stride, const int sf_col_base,
+    const int padded_cols, const float beta, const float linear_beta) {
+  const float log2e = 1.4426950408889634f;
+  const float kb = -2.0f * log2e / beta;
+  const float kc = CLAMP ? -2.0f * log2e / linear_beta : 0.0f;
+  const float bbs = CLAMP ? beta * linear_beta : beta;
+  const float2 k_a = make_float2(-log2e, -log2e), k_b = make_float2(kb, kb);
+  const float2 k_c = make_float2(kc, kc), bb = make_float2(bbs, bbs);
+  const int64_t row = blockIdx.x;
+  const int blk = threadIdx.x;
+  const int64_t sf_off = swizzled_sf_offset(row, sf_col_base + blk, padded_cols);
+  if (row >= rows) {
+    sf[sf_off] = 0;
+    return;
+  }
+  const uint4* gp =
+      reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
+  const uint4* up = reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
+  uint4 a[4], b[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) a[i] = __ldg(gp + i);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) b[i] = __ldg(up + i);
+  uint32_t h[16];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    h[4 * i + 0] = situ4_pair_ct<A_POW, CLAMP>(a[i].x, b[i].x, k_a, k_b, k_c, bb);
+    h[4 * i + 1] = situ4_pair_ct<A_POW, CLAMP>(a[i].y, b[i].y, k_a, k_b, k_c, bb);
+    h[4 * i + 2] = situ4_pair_ct<A_POW, CLAMP>(a[i].z, b[i].z, k_a, k_b, k_c, bb);
+    h[4 * i + 3] = situ4_pair_ct<A_POW, CLAMP>(a[i].w, b[i].w, k_a, k_b, k_c, bb);
+  }
+  // amax on the BF16 values (exact).
+  __nv_bfloat162 m = __habs2(*reinterpret_cast<const __nv_bfloat162*>(&h[0]));
+#pragma unroll
+  for (int i = 1; i < 16; ++i)
+    m = __hmax2(m, __habs2(*reinterpret_cast<const __nv_bfloat162*>(&h[i])));
+  const float amax = fmaxf(__low2float(m), __high2float(m));
+  const uint32_t e = float_to_ue8m0(amax * (1.0f / 448.0f));
+  const float inv = ue8m0_to_inv_scale(e);
+  const float2 inv2 = make_float2(inv, inv);
+  uint32_t w[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float2 v0 = f2mul(
+        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[2 * i])), inv2);
+    const float2 v1 = f2mul(
+        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[2 * i + 1])),
+        inv2);
+    w[i] = (uint32_t)fp8x2(v0.x, v0.y) | ((uint32_t)fp8x2(v1.x, v1.y) << 16);
+  }
+  uint4* qp = reinterpret_cast<uint4*>(q + row * q_stride + blk * 32);
+  qp[0] = make_uint4(w[0], w[1], w[2], w[3]);
+  qp[1] = make_uint4(w[4], w[5], w[6], w[7]);
+  sf[sf_off] = (uint8_t)e;
+}
+
 // mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 4 the same with the
 //       routed experts' MUFU-light SiTU, 2 silu-and-mul,
 //       3 x * sigmoid(g)  (two inputs, both [rows, d])
@@ -544,6 +647,36 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
     g_stride = g->stride(0);
   }
   if (rows == 0) return;
+  if (mode == 4 && d % 1024 == 0 && d <= 32768 && q.stride(0) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0) {
+    const bool clamp = linear_beta > 0.0;
+    const float half = 0.5f * (float)beta;
+    const int a_pow =
+        (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+    auto stream = c10::cuda::getCurrentCUDAStream();
+#define ROW_LAUNCH(P, C)                                                       \
+  situ4_row_kernel<P, C><<<(unsigned)rows_pad, (unsigned)(d / 32), 0, stream>>>( \
+      reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
+      reinterpret_cast<uint8_t*>(sf.data_ptr()),                               \
+      reinterpret_cast<const uint16_t*>(x.data_ptr()), rows, (int)d,           \
+      x.stride(0), q.stride(0), (int)sf_col_base, (int)padded_cols,            \
+      (float)beta, (float)linear_beta)
+    switch (a_pow * 2 + (clamp ? 1 : 0)) {
+      case 0: ROW_LAUNCH(0, false); break;
+      case 1: ROW_LAUNCH(0, true); break;
+      case 2: ROW_LAUNCH(1, false); break;
+      case 3: ROW_LAUNCH(1, true); break;
+      case 4: ROW_LAUNCH(2, false); break;
+      case 5: ROW_LAUNCH(2, true); break;
+      case 6: ROW_LAUNCH(3, false); break;
+      case 7: ROW_LAUNCH(3, true); break;
+      case 8: ROW_LAUNCH(4, false); break;
+      default: ROW_LAUNCH(4, true); break;
+    }
+#undef ROW_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
   const int threads = 256;
   const int64_t total = rows_pad * (d / 8);
   const int64_t per_block = (int64_t)threads * ACT_QUANT_UNROLL;
