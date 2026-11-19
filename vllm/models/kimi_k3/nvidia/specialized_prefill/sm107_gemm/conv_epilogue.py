@@ -567,3 +567,316 @@ def epilogue_kda_conv_drain(
             ) * 4
             stg_f32(naddr, store * head_end, rsqrt_eps(ssq))
     return acc_consumer_state
+
+
+# $0 bf16x2 out, $1 sum of squares out; $2..$7 taps t-3..t-1 as FP32 (lo, hi);
+# $8 row t (bf16x2); $9..$16 weights (tap-major lo/hi); $17 sum of squares in.
+# SiLU: a * rcp.approx(1 + e), which equals div.full.f32 while 1 + e <= 2^126;
+# larger denominators take div.full itself.
+_CONV_ROW = """{
+.reg .b32 l3, h3, yp, yl, yh;
+.reg .b64 X<4>, W<4>, A, R, D, E, T;
+.reg .f32 a<2>, d<2>, r<2>, e<2>, y<2>, s;
+.reg .pred p0, p1;
+shl.b32 l3, $8, 16;
+and.b32 h3, $8, -65536;
+mov.b64 X0, {$2, $3};
+mov.b64 X1, {$4, $5};
+mov.b64 X2, {$6, $7};
+mov.b64 X3, {l3, h3};
+mov.b64 W0, {$9, $10};
+mov.b64 W1, {$11, $12};
+mov.b64 W2, {$13, $14};
+mov.b64 W3, {$15, $16};
+mov.b64 A, 0;
+fma.rn.f32x2 A, X0, W0, A;
+fma.rn.f32x2 A, X1, W1, A;
+fma.rn.f32x2 A, X2, W2, A;
+fma.rn.f32x2 A, X3, W3, A;
+mov.b64 T, 0xBFB8AA3BBFB8AA3B;
+mul.rn.f32x2 E, A, T;
+mov.b64 {e0, e1}, E;
+ex2.approx.ftz.f32 e0, e0;
+ex2.approx.ftz.f32 e1, e1;
+add.f32 d0, e0, 0f3F800000;
+add.f32 d1, e1, 0f3F800000;
+rcp.approx.ftz.f32 r0, d0;
+rcp.approx.ftz.f32 r1, d1;
+mov.b64 R, {r0, r1};
+mul.rn.f32x2 R, A, R;
+mov.b64 {r0, r1}, R;
+mov.b64 {a0, a1}, A;
+setp.gt.f32 p0, d0, 0f7E800000;
+setp.gt.f32 p1, d1, 0f7E800000;
+@p0 div.full.f32 r0, a0, d0;
+@p1 div.full.f32 r1, a1, d1;
+cvt.rn.bf16x2.f32 yp, r1, r0;
+shl.b32 yl, yp, 16;
+and.b32 yh, yp, -65536;
+mov.b32 y0, yl;
+mov.b32 y1, yh;
+fma.rn.f32 s, y0, y0, $17;
+fma.rn.f32 $1, y1, y1, s;
+mov.b32 $0, yp;
+}"""
+
+
+@dsl_user_op
+def conv_row(h, x, w, s_in, *, loc=None, ip=None):
+    """h: 6 FP32 taps (rows t-3..t-1, lo/hi); x: row t bf16x2; w: 8 FP32."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.f32()]),
+        [_v(v, Float32, loc, ip) for v in h]
+        + [_v(x, Uint32, loc, ip)]
+        + [_v(v, Float32, loc, ip) for v in w]
+        + [_v(s_in, Float32, loc, ip)],
+        _CONV_ROW,
+        "=r,=f," + ",".join(["f"] * 6 + ["r"] + ["f"] * 9),
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    y = Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip))
+    s = Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip))
+    return y, s
+
+
+@dsl_user_op
+def unpack_bf16x2(x: Uint32, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [_v(x, Uint32, loc, ip)],
+        "{ .reg .b32 l, h; shl.b32 l, $2, 16; and.b32 h, $2, -65536; "
+        "mov.b32 $0, l; mov.b32 $1, h; }",
+        "=f,=f,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def lds_u32(addr: Int32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(addr, Int32, loc, ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def stg_u32(addr: Int64, pred: Int32, v: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip), _v(v, Uint32, loc, ip)],
+        "{ .reg .pred p; setp.ne.s32 p, $1, 0; @p st.global.b32 [$0], $2; }",
+        "l,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def shfl_xor_f32(v: Float32, d: int, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [_v(v, Float32, loc, ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {d}, 31, -1;",
+            "=f,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+#: Shared-memory row pitch of a drained 32-column subtile, in 32-bit words;
+#: 16-byte chunks are XOR-swizzled by row % 4 against bank conflicts.
+_PITCH = 16
+#: Shared bytes the column-wise conv epilogue needs (two warp groups).
+CONV_SMEM_BYTES = 2 * 128 * _PITCH * 4
+
+
+@cute.jit
+def epilogue_kda_conv_t(
+    gemm_kernel,
+    tidx: Int32,
+    tCtAcc_base: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    tCcC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    mma_tile_coord_mnl: tuple,
+    m_rows: Int32,
+    n_cols: Int32,
+    conv: tuple,
+    smem_x: Int32,
+    norms: Constexpr,
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+) -> pipeline.PipelineState:
+    """Drain-and-release (8 warps, warp group g = M block g of the B-reuse
+    tile), then the conv runs column-wise: per 32-column subtile the group's
+    128 BF16 rows go through shared memory and thread (pair cp, chunk rc)
+    sweeps rows 16 rc .. 16 rc + 15 of columns 2 cp, 2 cp + 1 with a sliding
+    window, weights in registers and coalesced 4-byte stores."""
+    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv
+    g = tidx // 128
+    gt = tidx % 128
+    tCgC = transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = epilogue_tmem_copy_and_partition(
+        gemm_kernel, gt, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
+    )
+    thr_copy_t2r = tiled_copy_t2r.get_slice(gt)
+    tTR_cC = thr_copy_t2r.partition_D(
+        cute.flat_divide(transform_partitioned_tensor_layout(tCcC_base), epi_tile)
+    )[(None, None, None, None, None, *mma_tile_coord_mnl)]
+    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+
+    epi_m = cute.size(tTR_tAcc.shape, mode=[3])
+    epi_n = cute.size(tTR_tAcc.shape, mode=[4])
+    ncol = cute.size(tTR_rAcc)
+    if cutlass.const_expr(epi_m != 2 or ncol != 32):
+        raise ValueError(f"conv epilogue: need 2 M blocks x 32 columns, got {epi_m}/{ncol}")
+    p_dim = n_cols // 3
+    n_blk = (m_rows + 127) // 128
+    bar = 3 + g
+
+    # This thread's TMEM row (drain) and its column-pass coordinates.
+    trow = tTR_cC[(None, None, None, g, 0)][0][0]
+    blk0 = trow - trow % 128
+    cp = gt % 16
+    rc = gt // 16
+    r0 = blk0 + rc * 16
+    s = find_seq(qsl_addr, nseq, top, nsteps, r0)
+    start = ldg_s32(qsl_addr + Int64(s) * 4)
+    end = ldg_s32(qsl_addr + Int64(s + 1) * 4)
+
+    acc_pipeline.consumer_wait(acc_consumer_state)
+    xs_all = []
+    for ni in cutlass.range_constexpr(epi_n):
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, g, ni)], tTR_rAcc)
+        xs_all.append([pack_bf16x2(tTR_rAcc[2 * p], tTR_rAcc[2 * p + 1]) for p in range(16)])
+    cute.arch.fence_view_async_tmem_load()
+    with cute.arch.elect_one():
+        acc_pipeline.consumer_release(acc_consumer_state)
+    acc_consumer_state.advance()
+
+    # Per-row sequence facts of rows r0 .. r0 + 15 (sequence boundaries inside
+    # the chunk advance s).
+    # Per-row flags of rows r0 .. r0 + 15: bit 0 = conv output stored here,
+    # bit 1 = pre-conv row saved for the fix-up / conv state (sequence
+    # boundaries inside the chunk advance s).
+    flags = []
+    for i in cutlass.range_constexpr(16):
+        t = r0 + i
+        while b2i(t >= end) * b2i(s + 1 < nseq) != 0:
+            s = s + 1
+            start = end
+            end = ldg_s32(qsl_addr + Int64(s + 1) * 4)
+        pos = t - start
+        valid = b2i(t < m_rows) * b2i(t < end)
+        fix = b2i(pos < 3)
+        edge = fix | b2i(pos >= end - start - 3)
+        if cutlass.const_expr(i < 3):
+            fix = fix | b2i(rc == 0)
+            edge = edge | b2i(rc == 0)
+        if cutlass.const_expr(i >= 13):
+            edge = edge | b2i(rc == 7)
+        flags.append(valid * (1 - fix) + 2 * valid * edge)
+
+    gbase = smem_x + g * (128 * _PITCH * 4)
+    wrow = gbase + (trow % 128) * (_PITCH * 4)
+    cq = cp // 4
+    cr = (cp % 4) * 4
+    ssq = [Float32(0.0) for _ in range(16)]
+    for ni in cutlass.range_constexpr(epi_n):
+        xs = xs_all[ni]
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        for q in cutlass.range_constexpr(4):
+            sts_v4(wrow + (((trow % 4) ^ q) * 16), Int32(1), *xs[4 * q : 4 * q + 4])
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        col0 = tTR_cC[(None, None, None, g, ni)][0][1]
+        col = col0 + 2 * cp
+        part = col0 // p_dim
+        cc = col - part * p_dim
+        wa = ldg_f32x4(w_addr + Int64(col) * 16)
+        wb = ldg_f32x4(w_addr + Int64(col + 1) * 16)
+        wv = [wa[0], wb[0], wa[1], wb[1], wa[2], wb[2], wa[3], wb[3]]
+        # Window: rows r0 - 3 .. r0 - 1 (clamped into the block; those
+        # outputs are block-start fix-up rows when rc == 0).
+        hw = []
+        for j in cutlass.range_constexpr(3):
+            rr = rc * 16 - 3 + j
+            rr = rr + 3 * b2i(rc == 0)
+            hw.append(unpack_bf16x2(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr)))
+        obase = out_addr + (
+            (Int64(part) * Int64(m_rows) + Int64(r0)) * Int64(p_dim) + Int64(cc)
+        ) * 2
+        sbase = side_addr + Int64(col) * 2
+        for i in cutlass.range_constexpr(16):
+            t = r0 + i
+            rr = rc * 16 + i
+            x = lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr)
+            fl = flags[i]
+            sq_in = ssq[i]
+            if cutlass.const_expr(norms):
+                sq_in = self32(b2i(col0 % 128 == 0), Float32(0.0), ssq[i])
+            y, ssq[i] = conv_row(
+                (hw[0][0], hw[0][1], hw[1][0], hw[1][1], hw[2][0], hw[2][1]),
+                x, wv, sq_in,
+            )  # fmt: skip
+            stg_u32(obase + Int64(i) * Int64(p_dim) * 2, fl % 2, y)
+            # Pre-conv rows for the fix-up / conv state (rare rows).
+            if fl >= 2:
+                es = find_seq(qsl_addr, nseq, top, nsteps, t)
+                e0 = ldg_s32(qsl_addr + Int64(es) * 4)
+                eln = ldg_s32(qsl_addr + Int64(es + 1) * 4) - e0
+                pos = t - e0
+                side_seq = Int64(n_blk) * 6 + Int64(es) * 6
+                tb = Int64(t // 128) * 6
+                rb = t % 128
+                stg_u32(sbase + (tb + Int64(rb)) * Int64(n_cols) * 2, b2i(rb < 3), x)
+                stg_u32(sbase + (tb + Int64(rb - 122)) * Int64(n_cols) * 2, b2i(rb >= 125), x)
+                stg_u32(sbase + (side_seq + Int64(pos)) * Int64(n_cols) * 2, b2i(pos < 3), x)
+                stg_u32(
+                    sbase + (side_seq + Int64(pos - eln + 6)) * Int64(n_cols) * 2,
+                    b2i(pos >= eln - 3),
+                    x,
+                )
+            hw = [hw[1], hw[2], unpack_bf16x2(x)]
+        if cutlass.const_expr(norms):
+            # Head end: reduce the 16 column-pair lanes, lane cp == 0 stores.
+            if b2i((col0 + 32) % 128 == 0) * b2i(part < 2) != 0:
+                h = p_dim // 128
+                for i in cutlass.range_constexpr(16):
+                    v = ssq[i]
+                    v = v + shfl_xor_f32(v, 8)
+                    v = v + shfl_xor_f32(v, 4)
+                    v = v + shfl_xor_f32(v, 2)
+                    v = v + shfl_xor_f32(v, 1)
+                    t = r0 + i
+                    ok = b2i(cp == 0) * (flags[i] % 2)
+                    naddr = norm_addr + (
+                        (Int64(part) * Int64(m_rows) + Int64(t)) * Int64(h)
+                        + Int64(cc // 128)
+                    ) * 4
+                    stg_f32(naddr, ok, rsqrt_eps(v))
+    return acc_consumer_state

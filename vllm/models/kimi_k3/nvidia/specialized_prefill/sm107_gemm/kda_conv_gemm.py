@@ -34,7 +34,8 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
     def __init__(
         self, tactic, conv: bool = False, norms: bool = False, drain: bool = False
     ):
-        (tm, tn), cluster, inst_m, swz, raster = tactic
+        (tm, tn), cluster, inst_m, swz, raster = tactic[:5]
+        split_producer = len(tactic) > 5 and bool(tactic[5])
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
@@ -59,6 +60,9 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             self.tmem_alloc_barrier = pipeline.NamedBarrier(
                 barrier_id=self.tmem_ptr_sync_bar_id, num_threads=32 * 9
             )
+        if split_producer:
+            self.tma_b_warp_id = self.tma_warp_id + 1
+            self.threads_per_cta += 32
 
 
 def _ptr(dtype, t: torch.Tensor, align: int = 16):
@@ -220,3 +224,35 @@ def reference_inv_norms(y: torch.Tensor, part_dim: int) -> torch.Tensor:
     """FP32 ``rsqrt(sum(y^2) + eps)`` per Q / K head row of ``y`` (3, M, P)."""
     qk = y[:2].float().unflatten(-1, (part_dim // 128, 128))
     return torch.rsqrt(qk.square().sum(-1) + L2_NORM_EPS)
+
+
+class MixedGemm:
+    """BF16 ``x @ W.T``, preferred / fallback cluster launch (full SM coverage)."""
+
+    def __init__(self, weight_nk, scale, tile, preferred, fallback):
+        from .dense_blockscaled_gemm_sm107 import (
+            Sm107BlockScaledPersistentDenseGemmMixedClustersKernel as K,
+        )
+
+        self.weight, self.scale = weight_nk, scale
+        self.n, self.k = weight_nk.shape
+        self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
+        self.gemm = K(SF_VEC, (256, tile[1], 64), (tile[0], tile[1], 128), preferred, fallback)
+        hw = cutlass_utils.HardwareInfo()
+        self.pmac = hw.get_max_active_clusters(preferred[0] * preferred[1])
+        self.fmac = hw.get_max_active_clusters(fallback[0] * fallback[1])
+        self._compiled = None
+
+    def __call__(self, x, x_scale, out):
+        from cutlass.cute.runtime import from_dlpack
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)
+        alpha = from_dlpack(self.alpha)
+        layouts = (OperandMajorMode.K, OperandMajorMode.K, cutlass_utils.LayoutEnum.ROW_MAJOR)
+        if self._compiled is None:
+            self._compiled = cute.compile(
+                self.gemm, *args, layouts, problem, self.pmac, self.fmac, stream,
+                alpha, lambda v: v, tail[0],
+            )  # fmt: skip
+        self._compiled(*args, problem, stream, alpha, tail[0])

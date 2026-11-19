@@ -84,17 +84,26 @@ def deinterleave_shared_cols(y_sh: torch.Tensor) -> torch.Tensor:
     )
 
 
+DEFAULT_TACTIC = (TILE, CLUSTER, False)
+
+
 class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
-    def __init__(self, n_lat_tiles: int, a_pow: int, clamp_up: bool):
+    def __init__(
+        self, n_lat_tiles: int, a_pow: int, clamp_up: bool, tactic=DEFAULT_TACTIC
+    ):
+        tile, cluster, split_producer = tactic
         super().__init__(
             SF_VEC,
-            (INST_M, TILE[1], 64),
-            (TILE[0], TILE[1], 128),
-            CLUSTER,
+            (INST_M, tile[1], 64),
+            (tile[0], tile[1], 128),
+            cluster,
             prefetch_dist=0,
             swizzle_size=SWIZZLE,
             raster_order=RASTER,
         )
+        if split_producer:
+            self.tma_b_warp_id = self.tma_warp_id + 1
+            self.threads_per_cta += 32
         self.situ_n_lat_tiles = n_lat_tiles
         self.situ_a_pow = a_pow
         self.situ_clamp_up = clamp_up
@@ -116,7 +125,9 @@ class PackedSituGemm:
         n_lat: int,
         beta: float,
         linear_beta: float | None,
+        tactic=DEFAULT_TACTIC,
     ) -> None:
+        self.tactic = tactic
         n, k = weight_nk.shape
         if n_lat % TILE[1] or (n - n_lat) % TILE[1] or k % 128:
             raise ValueError(f"packed SiTU GEMM: unsupported N/K ({n_lat}, {n}, {k})")
@@ -165,20 +176,19 @@ class PackedSituGemm:
         )  # fmt: skip
         key = (
             self.n_lat // TILE[1], self.a_pow, self.clamp_up,
-            x.device.index, self.n, self.k,
+            x.device.index, self.n, self.k, self.tactic,
         )  # fmt: skip
         if self._compiled is None:
             self._compiled = _COMPILED.get(key)
         if self._compiled is None:
-            gemm = _Kernel(*key[:3])
+            gemm = _Kernel(*key[:3], self.tactic)
             layouts = (
                 OperandMajorMode.K,
                 OperandMajorMode.K,
                 cutlass_utils.LayoutEnum.ROW_MAJOR,
             )
-            mac = cutlass_utils.HardwareInfo().get_max_active_clusters(
-                CLUSTER[0] * CLUSTER[1]
-            )
+            cl = self.tactic[1]
+            mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
             self._compiled = cute.compile(
                 gemm,
                 *args,

@@ -11,5 +11,12 @@ case "$1" in
     grep -E "$F" /tmp/pgc1.log | grep -v "^\s*$" | cut -c1-700 | tail -30
     for x in $(ls /tmp/pgc_dump/*kda_conv*.ptx 2>/dev/null | head -2); do echo "== $x"; ptxas -arch=sm_107a -v $x -o /tmp/pgc.cubin 2>&1 | grep -E "registers|spill" | head -4; done
     ls /tmp/pgc_dump | head -5 ;;
+  skel) shift; timeout 1500 python3 benchmarks/kimi_k3/pgemm_conv_bench.py --mode skel "$@" 2>&1 | grep -E "$F" | cut -c1-400 | head -40 ;;
+  b3) shift; timeout 1500 python3 benchmarks/kimi_k3/pgemm_conv_bench.py --mode b3 "$@" 2>&1 | grep -E "$F" | cut -c1-400 | head -40 ;;
   test) timeout 900 python3 -m pytest --noconftest -q tests/models/kimi_k3/test_kda_conv_gemm.py 2>&1 | grep -E 'passed|failed|Error|assert|^E ' | head -30 ;;
 esac
+if [ "$1" = ncu ]; then
+  cd /k31ov; shift
+  timeout 1500 ncu -k regex:kda_conv_gemm -c 1 --launch-skip 1 --section WarpStateStats --section SchedulerStats --section ComputeWorkloadAnalysis --section SpeedOfLight --section Occupancy --section LaunchStats --section SourceCounters python3 benchmarks/kimi_k3/pgemm_conv_bench.py --mode ncu "$@" > /tmp/pgc_ncu.log 2>&1
+  grep -E "Stall|stall|Issue|Eligible|Active Warps|Registers|Duration|Throughput|Local|Warp Cycles|smsp|Executed Ipc|Branch|ERR|Error" /tmp/pgc_ncu.log | grep -v "^\s*$" | head -60
+fi
