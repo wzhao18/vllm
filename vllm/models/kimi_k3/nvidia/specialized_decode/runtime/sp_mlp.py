@@ -54,8 +54,10 @@ SHARED = ("shared_gu", "shared_down")
 # Shard rows on the pinned GEMM (``ltpin``). In-step (D3-32 NVFP4 slice, step
 # median vs the router || latent down pair): n32 / n64 -34..-39 / -52..-64 us per
 # 24-layer step; n96 +28..+54 (the GEMM at 96 rows is no faster than the pair), so
-# n96 keeps the stock pair:
-ROUTER_LATENT = {"*": "25-72:ltpin"}
+# n96 keeps the stock router || latent down pair (``split``) and feeds route_stage
+# from the router GEMM's FP32 logits and the BF16 latent (no stock top-k, no
+# MegaMoE ``_stage_kernel``):
+ROUTER_LATENT = {"*": "25-72:ltpin,73-96:split"}
 
 
 def _stock_threshold():
@@ -148,6 +150,19 @@ class SpMlp:
                 mlp.gate.weight.shape[0],
             )  # fmt: skip
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
+        split_rows = tuple(
+            r for r in self.rows
+            if rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) == "split"
+        )  # fmt: skip
+        self.split_rows = frozenset()
+        if (
+            split_rows
+            and route_stage_cause(mlp) is None
+            and getattr(mlp.gate, "out_dtype", None) == torch.float32
+        ):
+            planned = self.route_stage.rows if self.route_stage is not None else ()
+            self.route_stage = RouteStage(mlp, (*planned, *split_rows))
+            self.split_rows = frozenset(split_rows)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -229,6 +244,12 @@ class SpMlp:
             out["latent_down"] = Choice(
                 Path.TUNED, tactic=("ltpin", None), note="router|latent_down ltpin"
             )
+        elif n in self.split_rows:
+            out["latent_down"] = Choice(
+                out["latent_down"].path,
+                tactic=out["latent_down"].tactic,
+                note="router || latent_down -> route_stage",
+            )
         return out
 
     def mx_input(self):
@@ -265,7 +286,22 @@ class SpMlp:
 
         fused_norm = self.fused_norm
         route = self.route_stage
-        if route is not None and route.ready(n):
+        if n in self.split_rows and route.ready(n):
+            # Stock router GEMM || latent down, then route_stage stages the top-k
+            # routes (from the FP32 logits) and the quantized BF16 latent.
+            (logits, _), latent = maybe_execute_in_parallel(
+                lambda: mlp.gate(h),
+                down,
+                mlp._down_proj_events[0],
+                mlp._down_proj_events[1],
+                mlp._down_proj_stream if n <= self.threshold else None,
+            )
+            staged = route.stage(logits, latent)
+
+            def experts(shared=None):
+                return route.launch(staged, fused_norm, shared)
+
+        elif route is not None and route.ready(n):
             # Router | latent down as one FP32 GEMM, then one kernel stages its
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent

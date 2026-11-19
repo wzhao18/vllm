@@ -4,7 +4,9 @@
 ``specialized_decode.cutedsl.moe.route_stage``) is bitwise the stock chain it
 replaces: ``fused_grouped_topk`` on the FP32 router logits, the latent rounded to
 BF16, then ``megamoe_rubin.staging.stage_inputs`` (NVFP4 and MXFP8 staging, padding
-rows, dead rows, SF pad columns, tied scores, the route-error flag untouched).
+rows, dead rows, SF pad columns, tied scores, the route-error flag untouched), fed
+either the concatenated FP32 GEMM rows or (split front) the FP32 logits beside the
+BF16 latent.
 One GPU, a few seconds."""
 
 import pytest
@@ -43,7 +45,8 @@ def _buffers(nvfp4, dev):
 @pytest.mark.parametrize("n", [32, 96, 128])
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("ties", [False, True])
-def test_route_stage_bitwise(nvfp4, n, padded, ties):
+@pytest.mark.parametrize("split", [False, True])
+def test_route_stage_bitwise(nvfp4, n, padded, ties, split):
     dev = torch.device("cuda")
     torch.manual_seed(n + 2 * nvfp4 + 4 * padded + 8 * ties)
     y = torch.randn((n, E + LATENT), device=dev) * 3.0
@@ -84,9 +87,15 @@ def test_route_stage_bitwise(nvfp4, n, padded, ties):
         is_padding=pad,
     )
     got = _buffers(nvfp4, dev)
+    logits, latent = y, None
+    if split:  # router GEMM logits + the BF16 latent down output (strided rows)
+        logits = y[:, :E].contiguous()
+        latent = torch.empty((n, LATENT + 64), device=dev, dtype=torch.bfloat16)
+        latent = latent[:, :LATENT]
+        latent.copy_(y[:, E:])
     route_stage._module().route_stage(
-        y, E, bias, got[0], got[1], got[2], got[3], got[4], pad, E, True, SCALE,
-        nvfp4, 1.0,
+        logits, E, bias, got[0], got[1], got[2], got[3], got[4], pad, E, True,
+        SCALE, nvfp4, 1.0, latent,
     )  # fmt: skip
     torch.accelerator.synchronize()
     for name, a, b in zip(("x", "x_sf", "topk_idx", "topk_weights", "err"), got, ref):
@@ -102,5 +111,12 @@ def test_route_stage_rejects_bad_shapes():
     b = _buffers(True, dev)
     with pytest.raises(RuntimeError):
         route_stage._module().route_stage(
-            y, E, torch.zeros(E, device=dev), *b, None, E, True, 1.0, True, 1.0
+            y, E, torch.zeros(E, device=dev), *b, None, E, True, 1.0, True, 1.0, None
+        )
+    # split front: y must hold only the logits beside a BF16 latent
+    y = torch.zeros((8, E + LATENT), device=dev)
+    lat = torch.zeros((8, LATENT), device=dev, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        route_stage._module().route_stage(
+            y, E, torch.zeros(E, device=dev), *b, None, E, True, 1.0, True, 1.0, lat
         )

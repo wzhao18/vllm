@@ -3,7 +3,9 @@
 """Router top-k + MegaMoE staging in one launch (SP decode MoE front).
 
 Input: the router | latent down GEMM's FP32 rows ``y [n, E + latent]``
-(``runtime.sp_mlp``: router logits in columns ``0:E``, the latent in ``E:``).
+(``runtime.sp_mlp``: router logits in columns ``0:E``, the latent in ``E:``), or
+(split front) the router GEMM's FP32 logits ``y [n, E]`` beside the latent down's
+BF16 output ``latent [n, latent]``.
 One block per row:
 
 * all 8 warps: stock's sigmoid + correction-bias single-group top-k on the
@@ -96,6 +98,9 @@ __device__ __forceinline__ uint64_t warp_max_u64(uint64_t v) {
 struct Args {
   const float* y;
   int64_t ldy;
+  // Split front: the BF16 latent rows (null: the latent is y's columns E:).
+  const __nv_bfloat16* lat;
+  int64_t ldl;
   int32_t num_logits;
   const float* bias;
   uint8_t* x;
@@ -375,7 +380,23 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
   constexpr int vec = NVFP4 ? 16 : 32;
   bool const quant = threadIdx.x < a.hidden / vec;
   float4 in[8];
-  if (quant) {
+  if (quant && a.lat != nullptr) {
+    // BF16 -> FP32 is exact; the BF16 rounding in the quantizers is then exact.
+    const uint4* src = reinterpret_cast<const uint4*>(
+        a.lat + int64_t{row} * a.ldl + int64_t{threadIdx.x} * vec);
+#pragma unroll
+    for (int q = 0; q < vec / 8; ++q) {
+      uint4 const u = src[q];
+      uint32_t const w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        in[2 * q + h] = make_float4(__uint_as_float(w[2 * h] << 16),
+                                    __uint_as_float(w[2 * h] & 0xffff0000u),
+                                    __uint_as_float(w[2 * h + 1] << 16),
+                                    __uint_as_float(w[2 * h + 1] & 0xffff0000u));
+      }
+    }
+  } else if (quant) {
     const float4* src = reinterpret_cast<const float4*>(
         yrow + a.num_logits + int64_t{threadIdx.x} * vec);
 #pragma unroll
@@ -399,7 +420,7 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                  torch::Tensor& idx, torch::Tensor& sw, torch::Tensor& err,
                  const c10::optional<torch::Tensor>& pad, int64_t num_experts,
                  bool renormalize, double routed_scaling_factor, bool nvfp4,
-                 double norm_const) {
+                 double norm_const, const c10::optional<torch::Tensor>& latent) {
   TORCH_CHECK(y.scalar_type() == at::kFloat && y.dim() == 2 &&
                   y.stride(1) == 1 && y.stride(0) % 4 == 0 &&
                   y.data_ptr<float>() != nullptr &&
@@ -415,7 +436,20 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                   err.scalar_type() == at::kLong && err.numel() == 2,
               "route_stage: session buffers");
   const int64_t n = y.size(0);
-  const int64_t hidden = y.size(1) - num_logits;
+  const __nv_bfloat16* lat_ptr = nullptr;
+  int64_t ldl = 0;
+  int64_t hidden = y.size(1) - num_logits;
+  if (latent.has_value()) {
+    TORCH_CHECK(latent->scalar_type() == at::kBFloat16 && latent->dim() == 2 &&
+                    latent->size(0) == n && latent->stride(1) == 1 &&
+                    latent->stride(0) % 8 == 0 && y.size(1) == num_logits &&
+                    reinterpret_cast<uintptr_t>(latent->data_ptr()) % 16 == 0,
+                "route_stage: latent must be BF16 rows, 16-byte aligned, beside "
+                "logits-only y");
+    lat_ptr = reinterpret_cast<const __nv_bfloat16*>(latent->data_ptr());
+    ldl = latent->stride(0);
+    hidden = latent->size(1);
+  }
   const int64_t capacity = idx.size(0), topk = idx.size(1);
   const int64_t vec = nvfp4 ? 16 : 32;
   TORCH_CHECK(num_logits % 4 == 0 && num_logits <= 1024 && topk <= 32 &&
@@ -438,6 +472,8 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
   Args a;
   a.y = y.data_ptr<float>();
   a.ldy = y.stride(0);
+  a.lat = lat_ptr;
+  a.ldl = ldl;
   a.num_logits = (int32_t)num_logits;
   a.bias = bias.data_ptr<float>();
   a.x = x.data_ptr<uint8_t>();
@@ -486,7 +522,7 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                  torch::Tensor& idx, torch::Tensor& sw, torch::Tensor& err,
                  const c10::optional<torch::Tensor>& pad, int64_t num_experts,
                  bool renormalize, double routed_scaling_factor, bool nvfp4,
-                 double norm_const);
+                 double norm_const, const c10::optional<torch::Tensor>& latent);
 """
 
 _lock = threading.Lock()
@@ -578,9 +614,10 @@ class RouteStage:
             and experts.capture_fn is None
         )
 
-    def stage(self, y: torch.Tensor):
-        """Stage ``y``'s routes and quantized latent into the MegaMoE session of
-        its bucket; returns the handle :meth:`launch` takes."""
+    def stage(self, y: torch.Tensor, latent: torch.Tensor | None = None):
+        """Stage ``y``'s routes and quantized latent (``latent``: the BF16 latent
+        beside logits-only ``y``) into the MegaMoE session of its bucket; returns
+        the handle :meth:`launch` takes."""
         import vllm.envs as envs
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
@@ -590,7 +627,8 @@ class RouteStage:
         rt = experts.get_runtime()
         session = rt.sessions[bucket]
         p = rt.problem
-        if y.shape[1] - self.num_logits != p.hidden or session.topk_idx.shape[1] != experts.top_k:
+        hidden = y.shape[1] - self.num_logits if latent is None else latent.shape[1]
+        if hidden != p.hidden or session.topk_idx.shape[1] != experts.top_k:
             raise Unsupported("moe", n, "route_stage: MegaMoE problem shape")
         pad = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -612,6 +650,7 @@ class RouteStage:
             self.scale,
             p.quant_kind == "nvfp4",
             float(p.input_norm_const),
+            latent,
         )
         return rt, session, n
 
