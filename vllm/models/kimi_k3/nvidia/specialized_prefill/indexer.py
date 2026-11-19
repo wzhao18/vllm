@@ -294,10 +294,11 @@ def ge_bf16x2(r, thr):
 
 
 def _publish_code(half: str, sel: str) -> str:
+    # $0 is tied to $1 (same register): unchanged unless the key is kept
     return (
         "{ .reg .pred a, b, c; .reg .b32 v; setp.ge.bf16x2 a|b, $2, $3; "
         f"setp.lt.and.u64 c, $1, $5, {half}; prmt.b32 v, $2, $4, {sel}; "
-        "mov.b64 $0, $1; @c st.global.b32 [$1], v; @c add.u64 $0, $1, 512; }"
+        "@c st.global.b32 [$1], v; @c add.u64 $0, $1, 512; }"
     )
 
 
@@ -305,13 +306,13 @@ def _publish_code(half: str, sel: str) -> str:
 def publish_lo(ptr, r, thr, tw, lim):
     """Low BF16 of r >= low of thr (and ptr < lim): store (tw | low) at ptr and
     advance it one 128-word slot."""
-    return _publish_code("a", "0x7610"), "=l,l,r,r,r,l,~{memory}", (
+    return _publish_code("a", "0x7610"), "=l,0,r,r,r,l,~{memory}", (
         Int64(ptr), Uint32(r), Uint32(thr), Uint32(tw), Int64(lim))
 
 
 @asm(Int64)
 def publish_hi(ptr, r, thr, tw, lim):
-    return _publish_code("b", "0x7632"), "=l,l,r,r,r,l,~{memory}", (
+    return _publish_code("b", "0x7632"), "=l,0,r,r,r,l,~{memory}", (
         Int64(ptr), Uint32(r), Uint32(thr), Uint32(tw), Int64(lim))
 
 
@@ -1898,28 +1899,55 @@ def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None
     -1 padded), without host reads. Returns (row_bin, candidates): row r was
     recomputed by the full path iff row_bin[3 r + 1] != 0 (``recover_all``: every
     row, for tests)."""
+    args = (sp, q, q_scale, keys, key_scale, weights_bf16)
+    thresholds(*args, ctas=ctas)
+    cand = publish(*args, ctas=ctas, mode=mode)
+    cand_select(sp, cand, out)
+    recover(*args, out, ctas=ctas, recover_all=recover_all)
+    return sp.row_bin, cand
+
+
+def thresholds(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None):
+    """Each row's PUBLISH threshold (row_bin[3 r]): the rank-th largest logit of
+    the request's sampled keys."""
     dev = q.device
-    t = sp.t
-    # 1) thresholds: score the sampled keys, the rank-th largest per row
     sk = keys[sp.sample_idx].contiguous()
     ssf = key_scale.reshape(-1)[sp.sample_idx].contiguous()
-    s_logits = torch.empty((t + 1) * SAMPLES, dtype=torch.bfloat16, device=dev)
-    stream = torch.cuda.current_stream(dev).cuda_stream
+    s_logits = torch.empty((sp.t + 1) * SAMPLES, dtype=torch.bfloat16, device=dev)
     score(q, q_scale, sk, ssf, weights_bf16, sp.s_row_len, sp.s_items, sp.s_row_base,
           s_logits, sp.s_bin, ctas=ctas, n_items=sp.n_s_items)
-    _thr_select_kernel()(s_logits.view(torch.int16), sp.rank, sp.row_bin, stream)
-    # 2) scores, keeping the keys at or above the threshold
-    cand = torch.empty((t + 1) * REGION, dtype=torch.int32, device=dev)
+    _thr_select_kernel()(
+        s_logits.view(torch.int16), sp.rank, sp.row_bin,
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+
+
+def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLISH):
+    """Scores of every row, keeping the keys at or above its threshold (returns the
+    candidate regions)."""
+    cand = torch.empty((sp.t + 1) * REGION, dtype=torch.int32, device=q.device)
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items, sp.cand_base,
           cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
           n_items=sp.n_items)
-    # 3) exact top-k from the candidates
+    return cand
+
+
+def cand_select(sp, cand, out):
+    """Exact top-k of every row from its candidates; flags the rows it cannot
+    settle (row_bin[3 r + 1])."""
     _cand_select_kernel(out.shape[1])(
-        cand, sp.row_len, sp.row_bin, out.view(-1), stream
+        cand, sp.row_len, sp.row_bin, out.view(-1),
+        torch.cuda.current_stream(out.device).cuda_stream,
     )
-    # 4) flagged rows (threshold missed or a lane overflowed) through the full
-    # path, without a host read (graph-safe): items holding no flagged row run one
-    # masked tile pair, unflagged rows keep the candidate result
+
+
+def recover(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
+            recover_all=False):
+    """Flagged rows (threshold missed, a lane overflowed, too many ties) through the
+    full path, without a host read (graph-safe): only the items holding a flagged
+    row are scored; unflagged rows keep the candidate result."""
+    dev = q.device
+    t = sp.t
     flag = sp.row_bin[1 : 3 * t : 3] != 0
     if recover_all:
         flag = torch.ones_like(flag)
@@ -1936,7 +1964,6 @@ def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None
     bitmap = torch.empty(t * sp.words, dtype=torch.int32, device=dev)
     rec_cand = torch.empty(t * CAND, dtype=torch.int32, device=dev)
     select(logits, sp.row_base, rec_len, rec_bin, bitmap, rec_cand, out, ctas=ctas)
-    return sp.row_bin, cand
 
 
 def plan(row_counts, row_lens_last, key_bases, device):

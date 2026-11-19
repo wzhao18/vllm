@@ -243,6 +243,9 @@ def perf_sel(args):
         d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
         sp.cand_base, cand.view(torch.bfloat16), rb0, mode=pidx.PUBLISH), args.iters)
     res["score_store"] = timed(lambda: run_score(d), args.iters)
+    args5 = (sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"])
+    res["thresholds"] = timed(lambda: pidx.thresholds(*args5), args.iters)
+    res["recover_idle"] = timed(lambda: pidx.recover(*args5, d["out"]), args.iters)
     res["total_recover_all"] = timed(lambda: pidx.selective_topk(
         sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
         recover_all=True), args.iters)
