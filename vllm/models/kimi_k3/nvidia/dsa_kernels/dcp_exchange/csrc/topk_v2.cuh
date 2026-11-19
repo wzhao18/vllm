@@ -214,7 +214,9 @@ struct V2Sm {
 // caller runs the row again with the complete body (out of line) at the next epoch, on
 // every rank alike (the tier comes from the exchanged words).
 template <bool kFast>
-__device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const int row, const int ep,
+// ep_in < 0: the row's epoch is read here (after the copy is issued). Returns 0, or
+// 1 + the epoch used when the complete body must run the row.
+__device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const int row, const int ep_in,
                                       uint32_t& bar_phase) {
   uint32_t* const hist = sm.hist;
   uint32_t* const cpos = sm.cpos;
@@ -321,6 +323,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       return 0;
     }
     if (Gl >= (1 << 24) && tid == 0) spin_fail(p.err, 13);
+    const int ep = ep_in >= 0 ? ep_in : p.epoch[row];
     const uint32_t tag = (uint32_t)(ep % 255);
     const int par = ep & 1;
     V2STAT(0);
@@ -669,7 +672,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) Sx[kV2Fine] = s_beyond;
         __syncthreads();
-        if (kFast || K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
+        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
         // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
         // candidates (32 keys per bin, the whole key range) locate it; rebase there
         V2STAT(7);
@@ -1020,7 +1023,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if constexpr (kFast) {
       if (tier != 1) {  // the same on every rank: the complete body takes the row
         __syncthreads();
-        return 1;
+        return 1 + ep;
       }
     }
     if (tier == 1) V2STAT(1);
@@ -1344,8 +1347,8 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
   // PDL: the prologue above overlaps the logits kernel's tail; every global read follows
   asm volatile("griddepcontrol.wait;" ::: "memory");
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
-    const int ep = p.epoch[row];
-    if (v2_row<true>(p, sm, row, ep, bar_phase)) v2_row_full(p, sm, row, ep + 1 == 510 ? 0 : ep + 1, bar_phase);
+    const int r = v2_row<true>(p, sm, row, -1, bar_phase);
+    if (r) v2_row_full(p, sm, row, r == 510 ? 0 : r, bar_phase);  // epoch r - 1 + 1
   }
 }
 
