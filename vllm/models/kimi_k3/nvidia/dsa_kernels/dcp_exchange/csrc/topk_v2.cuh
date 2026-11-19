@@ -299,20 +299,24 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       }
       return make_uint4(w[0], w[1], w[2], w[3]);
     };
-    // group g of the SMEM path (g < ng)
-    auto sgroup = [&](int g) -> uint4 {
-      if (g >= g_lo && g < g_hi && g < gs_hi) return srow[g];
-      return load_group(g);
-    };
+    // group g of the SMEM path (g < ng; the partial head / tail groups are patched in below)
+    auto sgroup = [&](int g) -> uint4 { return srow[g]; };
     // visit groups [ga, gb): fn(position of the group's first key, its 8 raw bf16 values);
     // every thread must call it (it ends with a CTA barrier)
     auto for_keys = [&](int ga, int gb, auto&& fn) {
       for (int g = ga + tid; g < gb; g += kV2T) fn(8 * g - sh, load_group(g));
       __syncthreads();
     };
+    // partial head / tail groups (masked, key by key), loaded while the copy lands
+    const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
+    uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
+    if (tid == 0 && phead) pg = load_group(0);
+    if (tid == 32 && ptail) pg = load_group(g_hi);
     mbar_wait(&s_bar, bar_phase);
     bar_phase ^= 1u;
-    __syncthreads();  // histogram zeroed
+    if (tid == 0 && phead) srow[0] = pg;
+    if (tid == 32 && ptail) srow[g_hi] = pg;
+    __syncthreads();  // histogram zeroed, partial groups in place
     V2DBG(9);
     if (regp) {
       // sample: one group in kV2SampleStride (spread over the 8 residues)
