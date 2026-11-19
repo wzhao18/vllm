@@ -327,7 +327,7 @@ class SparseMlaDecodeKM:
         base = Uint32(raw.toint())
         if tid == 0:
             self.mark(stamp, cta, 0)
-            for i, count in ((B_QFULL, 1), (B_QEMPTY, NSOFT), (B_OEMPTY, 4), (B_LFIN, NG)):
+            for i, count in ((B_QFULL, 1), (B_QEMPTY, 1), (B_OEMPTY, 4), (B_LFIN, NG)):
                 mbar_init(self.bar(base, i), Uint32(count))
             for blk in cutlass.range_constexpr(4):
                 mbar_init(self.bar(base, B_PVBLK + blk), Uint32(1))
@@ -530,7 +530,7 @@ class SparseMlaDecodeKM:
 
     # ------------------------------------------------------------------ MMA
     @cute.jit
-    def qk(self, base, taddr, g, stamp, cta, mark):
+    def qk(self, base, taddr, g, stamp, cta, mark, last):
         s = g % self.stages
         st = base + Uint32(self.off_kv) + Uint32(s) * Uint32(STAGE)
         b = g & 1
@@ -551,6 +551,8 @@ class SparseMlaDecodeKM:
         bd = Uint64(SDESC_SW64) | Uint64((base + Uint32(self.off_q + 4 * QBLK)) >> Uint32(4))
         mma_ss(d, ad, bd, Uint32(IDESC_QK), Uint32(1))
         tc_commit(self.bar(base, B_SFULL + b))
+        if last:  # the row's last QK: Q is free once it completes
+            tc_commit(self.bar(base, B_QEMPTY))
 
     @cute.jit
     def drain(self, base, n_mine, stamp, cta):
@@ -578,10 +580,11 @@ class SparseMlaDecodeKM:
             if n > 0:
                 tiles = _tiles(n)
                 mbar_wait(self.bar(base, B_QFULL), ro & 1)
-                self.qk(base, taddr, g, stamp, cta, ro * 8)
+                self.qk(base, taddr, g, stamp, cta, ro * 8, tiles == 1)
                 for t in range(tiles):
                     if t + 1 < tiles:
-                        self.qk(base, taddr, g + 1, stamp, cta, ro * 8 + t + 1)
+                        self.qk(base, taddr, g + 1, stamp, cta, ro * 8 + t + 1,
+                                t + 2 == tiles)
                     if t == 0:
                         mbar_wait(self.bar(base, B_OEMPTY), (ro & 1) ^ 1)
                     b = g & 1
@@ -736,8 +739,6 @@ class SparseMlaDecodeKM:
                     cute.arch.sync_warp()
                     if lane == 0:
                         mbar_arrive(self.bar(base, B_SEMPTY + b))
-                        if t == tiles - 1:  # the row's last QK is complete: Q is free
-                            mbar_arrive(self.bar(base, B_QEMPTY))
                     sub = (warp == SOFT0) & (lane == 0) & (ro == 0) & (t == 1)
                     if sub:
                         self.mark(stamp, cta, 31)
