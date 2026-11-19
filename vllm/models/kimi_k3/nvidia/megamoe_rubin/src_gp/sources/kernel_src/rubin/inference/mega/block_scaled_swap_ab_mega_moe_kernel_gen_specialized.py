@@ -1221,6 +1221,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 f"promised_launchable_sm_count, got grid {grid} ({grid_cta_count} CTAs), "
                 f"{self.launch_cluster_count} x {self.cluster_size}, {self.promised_launchable_sm_count}."
             )
+        producer_done = None
+        if cutlass.const_expr(self.reduce_acquires_producer_done):
+            producer_done = self._device_workspace.tensor(self.producer_done_region)
         self._device_workspace.remove_device_members()
         # vLLM-local E2b: the fused-RMSNorm top-k reduce runs in this kernel's tail (one token row per CTA,
         # epilogue warps after their last tile) instead of a separate launch that waits for SMs and the grid.
@@ -1295,11 +1298,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_term=shared_output if cutlass.const_expr(self.reduce_shared_output) else None,
                 rmsnorm_weight=rmsnorm_weight,
                 rmsnorm_eps=rmsnorm_eps,
-                producer_done=(
-                    self._device_workspace.tensor(self.producer_done_region)
-                    if cutlass.const_expr(self.reduce_acquires_producer_done)
-                    else None
-                ),
+                producer_done=producer_done,
             )
         elif cutlass.const_expr(rmsnorm_weight is not None):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
