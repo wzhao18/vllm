@@ -378,3 +378,56 @@ void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
   launch_o_norm_mx(x.const_data_ptr(), T, int(H), a, num_sms,
                    static_cast<cudaStream_t>(stream_ptr));
 }
+
+void launch_k64_tc(void const* kd, void const* qd, void const* kr, void const* inv,
+                   void const* mqk, float const* gt, void const* beta, void const* v,
+                   float const* init_state, float* final_state, void* out,
+                   int const* cu_seqlens, int T_total, int H, int N, int C_total,
+                   int flags, long long* dbg, cudaStream_t stream);
+
+void k64_rec(const Tensor& kd, const Tensor& qd, const Tensor& kr, const Tensor& inv,
+             const Tensor& mqk, const Tensor& gt, const Tensor& beta, const Tensor& v,
+             const Tensor& init_state, const Tensor& final_state, const Tensor& out,
+             const Tensor& cu_seqlens, int64_t flags, const Tensor& dbg) {
+  STD_TORCH_CHECK(v.dim() == 3 && v.size(2) == 128 && v.is_contiguous() &&
+                      v.scalar_type() == ScalarType::BFloat16,
+                  "k64_rec: v must be contiguous bf16 (T, H, 128)");
+  const int64_t T = v.size(0), H = v.size(1);
+  const int64_t N = cu_seqlens.numel() - 1;
+  STD_TORCH_CHECK(gt.dim() == 3 && gt.size(0) == H && gt.size(2) == 128 &&
+                      gt.scalar_type() == ScalarType::Float && gt.is_contiguous(),
+                  "k64_rec: g_total must be fp32 (H, C, 128)");
+  const int64_t C = gt.size(1);
+  for (const Tensor* t : {&kd, &qd, &kr}) {
+    STD_TORCH_CHECK(t->is_contiguous() && t->numel() == H * C * 64 * 128 &&
+                        t->scalar_type() == ScalarType::BFloat16,
+                    "k64_rec: kd / qd / kr images must be bf16 (H, C, 64 x 128)");
+  }
+  for (const Tensor* t : {&inv, &mqk}) {
+    STD_TORCH_CHECK(t->is_contiguous() && t->numel() == H * C * 64 * 64 &&
+                        t->scalar_type() == ScalarType::BFloat16,
+                    "k64_rec: INV / Mqk images must be bf16 (H, C, 64 x 64)");
+  }
+  STD_TORCH_CHECK(beta.is_contiguous() && beta.numel() == H * T &&
+                      beta.scalar_type() == ScalarType::BFloat16,
+                  "k64_rec: beta must be bf16 (H, T)");
+  STD_TORCH_CHECK(init_state.numel() == N * H * 128 * 128 &&
+                      final_state.numel() == N * H * 128 * 128 &&
+                      init_state.scalar_type() == ScalarType::Float &&
+                      final_state.scalar_type() == ScalarType::Float,
+                  "k64_rec: states must be fp32 (N, H, 128, 128)");
+  STD_TORCH_CHECK(out.numel() == T * H * 128 && out.scalar_type() == ScalarType::BFloat16,
+                  "k64_rec: out must be bf16 (T, H, 128)");
+  STD_TORCH_CHECK(cu_seqlens.scalar_type() == ScalarType::Int, "k64_rec: int32 cu_seqlens");
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(
+      aoti_torch_get_current_cuda_stream(v.get_device_index(), &stream_ptr));
+  launch_k64_tc(kd.const_data_ptr(), qd.const_data_ptr(), kr.const_data_ptr(),
+                inv.const_data_ptr(), mqk.const_data_ptr(),
+                reinterpret_cast<const float*>(gt.const_data_ptr()), beta.const_data_ptr(),
+                v.const_data_ptr(), reinterpret_cast<const float*>(init_state.const_data_ptr()),
+                reinterpret_cast<float*>(final_state.mutable_data_ptr()), out.mutable_data_ptr(),
+                reinterpret_cast<const int*>(cu_seqlens.const_data_ptr()), int(T), int(H),
+                int(N), int(C), int(flags), reinterpret_cast<long long*>(dbg.mutable_data_ptr()),
+                static_cast<cudaStream_t>(stream_ptr));
+}

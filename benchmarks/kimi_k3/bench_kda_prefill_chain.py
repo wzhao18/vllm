@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--row-stride", type=int, default=49376)
     ap.add_argument("--json", default="")
-    ap.add_argument("--impl", default="stock", choices=["stock", "split", "onorm", "tc"])
+    ap.add_argument("--impl", default="stock", choices=["stock", "split", "onorm", "tc", "fla"])
     args = ap.parse_args()
 
     import vllm._flashkda_C  # noqa: F401
@@ -177,7 +177,25 @@ def main():
         )
         o_norm_mxfp8(out, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
 
+    def step_fla():
+        # vLLM's FLA chunk_kda (chunk 64, sub-chunk 16 intra, Triton): the
+        # chunk-64 recurrence as a measured reference for the chain latency.
+        from vllm.models.kimi_k3.nvidia.ops.third_party.kda.chunk import (
+            chunk_kda_with_fused_gate,
+        )
+
+        q, k, v = kda_conv.qkv_conv(
+            mixed_qkv, conv_w, conv_state, cu, sidx, has_init, P
+        ).unbind(0)
+        q, k, v = (x.view(1, T, H, D) for x in (q, k, v))
+        chunk_kda_with_fused_gate(
+            q, k, v, g1, beta.contiguous(), A_log, dt_bias, D**-0.5,
+            init_state, True, lower_bound, True, cu, out,
+        )
+        o_norm_mxfp8(out, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
+
     step = {
+        "fla": step_fla,
         "tc": step_tc,
         "stock": step_stock,
         "split": step_split,
