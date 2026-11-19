@@ -1988,20 +1988,16 @@ def _vp_markov_keys(
     if PUBLISH:
         # The request's last program on this rank publishes the rank's key (never 0)
         # into slot ``box_offset + req`` of every rank's mailbox and re-arms. A key
-        # is its own flag (nothing else is read through the mailbox): relaxed stores,
-        # no system-scope fence per peer.
+        # is its own flag (nothing else is read through the mailbox): plain stores,
+        # no system-scope fence or remote atomic per peer.
         done = tl.atomic_add(count_ptr + req, 1, sem="acq_rel", scope="gpu")
         if done == programs - 1:
             final = tl.atomic_xchg(keys_ptr + req, 0, sem="acq_rel", scope="gpu")
             tl.atomic_xchg(count_ptr + req, 0, sem="relaxed", scope="gpu")
             for r in tl.static_range(TP):
+                # (plain stores: a remote atomic waits for its reply, four in a row)
                 peer = tl.load(peers_ptr + r) + (box_offset + req) * 8
-                tl.atomic_xchg(
-                    peer.to(tl.pointer_type(tl.int64)),
-                    final,
-                    sem="relaxed",
-                    scope="sys",
-                )
+                tl.store(peer.to(tl.pointer_type(tl.int64)), final)
 
 
 @triton.jit
@@ -2010,7 +2006,7 @@ def _vp_take(slot):
     got = tl.atomic_add(slot, 0, sem="relaxed", scope="sys")
     while got == 0:
         got = tl.atomic_add(slot, 0, sem="relaxed", scope="sys")
-    tl.atomic_xchg(slot, 0, sem="relaxed", scope="gpu")
+    tl.store(slot, 0)
     return got
 
 
