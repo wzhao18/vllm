@@ -6,7 +6,9 @@ One ``DcpxDecode`` per model (one set of symmetric mailboxes, every DSA layer in
 turn; the device epochs make CUDA graph replays carry no host state). On pure-decode
 steps of at most ``cap`` rows it replaces the stock local top-k + generic all-gather
 merge + ``triton_filter_and_convert_dcp_index`` (or the #63 one-round DCP top-k
-merge) by ``DcpExchange.topk_merge`` on the bf16 indexer logits. Its output is
+merge) by ``DcpExchange.topk_v2`` (csrc/topk_v2.cuh: one CTA per row, one NVLink
+round whose message also carries the tie band; exact tiers otherwise; the same
+selection and output as ``topk_merge``) on the bf16 indexer logits. Its output is
 already this rank's KV slots (through the MLA block table, as
 ``triton_filter_and_convert_dcp_index`` maps them) and their count, so it is
 independent of the interleave. Hooks: the indexer op's decode branch
