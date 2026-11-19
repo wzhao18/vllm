@@ -92,11 +92,19 @@ def stock_attention_core(attn: nn.Module, qkv: torch.Tensor, positions: torch.Te
     return attn.attn(q, k, v)
 
 
+def _no_window_attention(why: str, impl, layer) -> None:
+    logger.info_once(
+        "Kimi K3.1 DSpark draft attention: stock path (%s: %s %s)",
+        why, type(impl).__name__, getattr(impl, "vllm_flash_attn_version", None),
+    )  # fmt: skip
+    return None
+
+
 def _eager_window_attention(layer: nn.Module, q, k, v) -> torch.Tensor | None:
-    """Prefill draft steps (eager): the query block's K/V insert as the backend
-    does it, then ``draft_attention.attention`` (FlashAttention 2 math, keys
-    split over the window) in place of FlashAttention 2's one-split schedule.
-    None where it does not cover the call (the caller runs the layer)."""
+    """Draft steps without the specialized GQA attention: the query block's K/V
+    insert as the backend does it, then ``draft_attention.attention`` (FlashAttention
+    2 math, keys split over the window) in place of FlashAttention 2's one-split
+    schedule. None where it does not cover the call (the caller runs the layer)."""
     from vllm.forward_context import get_forward_context, is_forward_context_available
     from vllm.models.kimi_k3.nvidia.specialized_prefill import draft_attention
     from vllm.v1.attention.backend import AttentionType
@@ -107,50 +115,68 @@ def _eager_window_attention(layer: nn.Module, q, k, v) -> torch.Tensor | None:
 
     impl = getattr(layer, "impl", None)
     if (
-        torch.cuda.is_current_stream_capturing()
-        or not is_forward_context_available()
+        not is_forward_context_available()
         or type(impl) is not FlashAttentionImpl
         or impl.vllm_flash_attn_version != 2
         or impl.attn_type != AttentionType.DECODER
-        or impl.kv_cache_dtype != "auto"
+        or impl.kv_cache_dtype not in ("auto", "bfloat16")
         or impl.alibi_slopes is not None
         or impl.logits_soft_cap not in (None, 0, 0.0)
         or getattr(impl, "sinks", None) is not None
         or impl.kv_sharing_target_layer_name is not None
         or q.dtype != torch.bfloat16
     ):
-        return None
+        return _no_window_attention("layer/impl", impl, layer)
     meta = get_forward_context().attn_metadata
     if isinstance(meta, dict):
         meta = meta.get(layer.layer_name)
     if (
         type(meta) is not FlashAttentionMetadata
-        or meta.causal is not False
+        or not isinstance(meta.causal, bool)
         or meta.max_dcp_context_kv_len
         or meta.rswa_prefix_lens is not None
         or meta.mm_prefix_query_range_tensor is not None
-        or meta.num_actual_tokens != q.shape[0]
+        or meta.num_actual_tokens > q.shape[0]
         or not isinstance(layer.kv_cache, torch.Tensor)
     ):
-        return None
+        why = (
+            f"metadata {type(meta).__name__} causal "
+            f"{getattr(meta, 'causal', None)!r} rows "
+            f"{getattr(meta, 'num_actual_tokens', None)}/{q.shape[0]}"
+        )
+        return _no_window_attention(why, impl, layer)
     hd, nkv = impl.head_size, impl.num_kv_heads
     key_cache, value_cache = layer.kv_cache.transpose(1, 2).split(hd, dim=-1)
     if not draft_attention.covers(
         meta.max_query_len, impl.num_heads, nkv, hd, key_cache, value_cache
     ):
-        return None
+        return _no_window_attention("shape", impl, layer)
+    # FlashAttention's causal mask is its local window with no right side.
+    window = tuple(impl.sliding_window)
+    if meta.causal:
+        window = (window[0], 0)
     tokens = q.shape[0]
     impl.do_kv_cache_update(
         layer, k.view(tokens, nkv, hd), v.view(tokens, nkv, hd), layer.kv_cache,
         meta.slot_mapping,
     )  # fmt: skip
-    out = torch.empty((tokens, impl.num_heads, hd), dtype=q.dtype, device=q.device)
+    alloc = torch.empty if meta.num_actual_tokens == tokens else torch.zeros
+    out = alloc((tokens, impl.num_heads, hd), dtype=q.dtype, device=q.device)
     draft_attention.attention(
         q.view(tokens, impl.num_heads, hd), key_cache, value_cache,
         meta.block_table, meta.seq_lens, meta.query_start_loc, meta.max_query_len,
-        impl.scale, tuple(impl.sliding_window), out,
+        impl.scale, window, out,
     )  # fmt: skip
     return out.view(tokens, impl.num_heads * hd)
+
+
+def _uncovered(states: torch.Tensor, why: str) -> bool:
+    """Log (once) why a long context step keeps the stock K/V path; False."""
+    logger.info_once(
+        "Kimi K3.1 DSpark context K/V: stock path at %d rows (%s)",
+        states.shape[0], why,
+    )  # fmt: skip
+    return False
 
 
 class K3GqaDSparkDecoderLayer(DFlashQwen3DecoderLayer):
@@ -313,24 +339,29 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
         )
 
     def _store_context_kv_rows(self, states, positions, slot_mapping) -> bool:
-        """Eager context steps (prefill): the stock K/V step with the RoPE and the
-        per-layer cache insert in one pass per layer (``prefill_glue.rope_store_kv``,
-        bitwise the stock ``rotary_embedding`` + ``reshape_and_cache_flash``) and
-        the K norm read from the token-major projection (no layer-major copy).
-        False (nothing done) where it does not cover the call."""
+        """Context steps without the specialized decode fast path: the stock K/V
+        step with the RoPE and the per-layer cache insert in one pass per layer
+        (``prefill_glue.rope_store_kv``, bitwise the stock ``rotary_embedding`` +
+        ``reshape_and_cache_flash``) and the K norm read from the token-major
+        projection (no layer-major copy). False (nothing done) where it does not
+        cover the call."""
         from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
         from vllm.v1.attention.backend import AttentionType
 
         if (
             slot_mapping is None
             or not hasattr(self, "_num_attn_layers")
-            or torch.cuda.is_current_stream_capturing()
             or getattr(self.layers[0].self_attn, "v_scale", None) is not None
             or not self._rope_is_neox
             or self._rope_head_size != self._head_dim
             or positions.dtype != torch.int64
         ):
-            return False
+            return _uncovered(
+                states,
+                f"rope "
+                f"{self._rope_is_neox} {self._rope_head_size} positions "
+                f"{positions.dtype} slots {slot_mapping is None}",
+            )
         num_ctx, layers = states.shape[0], self._num_attn_layers
         nkv, hd = self._num_kv_heads, self._head_dim
         per_layer = isinstance(slot_mapping, (list, tuple))
@@ -349,25 +380,30 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
                 type(impl).do_kv_cache_update
                 is not FlashAttentionImpl.do_kv_cache_update
                 or impl.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER)
-                or impl.kv_cache_dtype != "auto"
+                or impl.kv_cache_dtype not in ("auto", "bfloat16")
                 or slots[i].numel() > num_ctx
                 or not isinstance(attn.kv_cache, torch.Tensor)
             ):
-                return False
+                return _uncovered(
+                    states,
+                    f"KV cache layer {type(impl).__name__} {impl.attn_type} "
+                    f"{impl.kv_cache_dtype} {type(attn.kv_cache).__name__} "
+                    f"{slots[i].numel()}/{num_ctx}",
+                )
             caches.append(attn.kv_cache.transpose(1, 2).split(hd, dim=-1))
         if all(c is None for c in caches):
-            return False
+            return _uncovered(states, "no slots")
         # Coverage on the K norm buffer (the projection's K / V row views differ
         # only in their row stride, 2 * L * nkv * hd elements: a multiple of 8).
-        knorm = torch.empty((num_ctx, nkv, hd), dtype=states.dtype, device=states.device)
+        knorm = states.new_empty((num_ctx, nkv, hd))
         if not prefill_glue.use_head_rms_norm(knorm, self._k_norm_weights[0]):
-            return False
+            return _uncovered(states, "K norm shape")
         for i, cache in enumerate(caches):
             if cache is not None and not prefill_glue.use_rope_store_kv(
                 knorm[: slots[i].numel()], knorm[: slots[i].numel()], positions,
                 cos_sin, slots[i], *cache,
             ):  # fmt: skip
-                return False
+                return _uncovered(states, "cache insert layout")
         kv = self._project_context_kv_token_major(states, num_ctx, layers, nkv, hd)
         if tuple(kv.shape) != (num_ctx, layers, 2, nkv, hd) or not kv.is_contiguous():
             raise RuntimeError(
@@ -388,6 +424,7 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
                     f"Kimi K3 DSpark context K/V: layer {i} insert not covered"
                 )
             prefill_glue.rope_store_kv(*args, key_cache, value_cache)
+        logger.info_once("Kimi K3.1 DSpark context K/V: fused RoPE + insert")
         return True
 
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:

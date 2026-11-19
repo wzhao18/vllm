@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """specialized_prefill.draft_attention == FlashAttention 2 (the DSpark drafter's
-backend) on the prefill draft step: non-causal sliding-window GQA over a paged
-BF16 cache in FlashAttention's [blocks, kv_heads, page, 2 x head_dim] layout, a few
-query rows per request, windows shorter and longer than the context."""
+backend) on the prefill draft step: causal and non-causal sliding-window GQA over
+a paged BF16 cache in FlashAttention's [blocks, kv_heads, page, 2 x head_dim]
+layout, a few query rows per request, windows shorter and longer than the
+context."""
 
 import pytest
 import torch
@@ -16,9 +17,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("window", [2048, -1])
 @pytest.mark.parametrize("page", [16, 64])
-def test_draft_attention_matches_flash_attn_2(window, page):
+def test_draft_attention_matches_flash_attn_2(causal, window, page):
     from vllm.models.kimi_k3.nvidia.specialized_prefill import draft_attention
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -37,10 +39,12 @@ def test_draft_attention_matches_flash_attn_2(window, page):
     q = torch.randn(reqs * q_len, heads, hd, device="cuda").to(torch.bfloat16)
     scale = hd**-0.5
     win = (window - 1, window - 1) if window > 0 else (-1, -1)
+    if causal:
+        win = (win[0], 0)
     ref = flash_attn_varlen_func(
         q=q, k=key_cache, v=value_cache, cu_seqlens_q=cu_q, max_seqlen_q=q_len,
         seqused_k=seq_lens, max_seqlen_k=int(seq_lens.max()), softmax_scale=scale,
-        causal=False, window_size=list(win), block_table=block_table, fa_version=2,
+        causal=causal, window_size=list(win), block_table=block_table, fa_version=2,
     )  # fmt: skip
     assert draft_attention.covers(q_len, heads, kv_heads, hd, key_cache, value_cache)
     out = torch.empty_like(q)

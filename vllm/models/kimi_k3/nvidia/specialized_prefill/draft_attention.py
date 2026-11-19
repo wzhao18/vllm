@@ -20,6 +20,7 @@ from vllm.triton_utils import tl, triton
 _BLOCK_N = 64
 _SPLITS = 16
 _MAX_ROWS = 64
+_MERGE_ROWS = 8
 
 
 @triton.jit
@@ -99,32 +100,31 @@ def _split_kernel(
 @triton.jit
 def _merge_kernel(
     OUT, ACC, ML, CUQ, stride_ot, stride_oh,
-    GROUP: tl.constexpr, ROWS: tl.constexpr, D: tl.constexpr, SPLITS: tl.constexpr,
+    GROUP: tl.constexpr, ROWS: tl.constexpr, RB: tl.constexpr, D: tl.constexpr,
+    SPLITS: tl.constexpr,
 ):  # fmt: skip
     r = tl.program_id(0)
     h = tl.program_id(1)
     heads = tl.num_programs(1)
     q0 = tl.load(CUQ + r)
     sq = tl.load(CUQ + r + 1) - q0
-    m_idx = tl.arange(0, ROWS)
+    m_idx = tl.program_id(2) * RB + tl.arange(0, RB)
     tok = m_idx // GROUP
     qh = h * GROUP + m_idx % GROUP
     d = tl.arange(0, D)
     sp = tl.arange(0, SPLITS)
     base = (r * heads + h) * SPLITS + sp
-    m = tl.load(ML + (base * 2)[:, None] * ROWS + m_idx[None, :])  # [S, ROWS]
+    m = tl.load(ML + (base * 2)[:, None] * ROWS + m_idx[None, :])  # [S, RB]
     l_ = tl.load(ML + (base * 2 + 1)[:, None] * ROWS + m_idx[None, :])
     m_max = tl.max(m, 0)
     m_max = tl.where(m_max == float("-inf"), 0.0, m_max)
     w = tl.exp2(m - m_max[None, :])
     den = tl.sum(w * l_, 0)
-    out = tl.zeros([ROWS, D], tl.float32)
-    for i in tl.static_range(SPLITS):
-        a = tl.load(ACC + ((r * heads + h) * SPLITS + i) * ROWS * D
-                    + m_idx[:, None] * D + d[None, :])  # fmt: skip
-        wi = tl.sum(tl.where(sp[:, None] == i, w, 0.0), 0)
-        out += a * wi[:, None]
-    out = out / den[:, None]
+    acc = tl.load(
+        ACC + ((base * ROWS)[:, None, None] + m_idx[None, :, None]) * D
+        + d[None, None, :]
+    )  # fmt: skip
+    out = tl.sum(acc * w[:, :, None], 0) / den[:, None]
     tl.store(
         OUT + (q0 + tok)[:, None] * stride_ot + qh[:, None] * stride_oh + d[None, :],
         out.to(OUT.dtype.element_ty),
@@ -162,8 +162,8 @@ def attention(
     window: tuple[int, int],
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Non-causal (FlashAttention local-window convention, bottom-right aligned)
-    attention of ``q`` [tokens, heads, head_dim] over the paged caches into ``out``
+    """FlashAttention local-window attention (bottom-right aligned; causal =
+    ``window[1] == 0``) of ``q`` [tokens, heads, head_dim] over the paged caches into ``out``
     [tokens, heads, head_dim]; callers check :func:`covers`."""
     num_reqs = seq_lens.shape[0]
     heads, head_dim = q.shape[1], q.shape[2]
@@ -186,8 +186,9 @@ def attention(
         PAGE=key_cache.shape[1], GROUP=group, ROWS=rows, D=head_dim,
         BLOCK_N=_BLOCK_N, SPLITS=_SPLITS, num_warps=4,
     )  # fmt: skip
-    _merge_kernel[(num_reqs, kv_heads)](
+    _merge_kernel[(num_reqs, kv_heads, rows // _MERGE_ROWS)](
         out, acc, ml, query_start_loc, out.stride(0), out.stride(1),
-        GROUP=group, ROWS=rows, D=head_dim, SPLITS=_SPLITS, num_warps=4,
+        GROUP=group, ROWS=rows, RB=_MERGE_ROWS, D=head_dim, SPLITS=_SPLITS,
+        num_warps=4,
     )  # fmt: skip
     return out

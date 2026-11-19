@@ -530,38 +530,36 @@ __global__ void __launch_bounds__(128)
 // ---------------------------------------------------------------------------
 
 
+// BF16(sigmoid(g)) by table: g is BF16, so the rounded sigmoid takes at most
+// 2^16 values. Each CTA builds the entries of |g| in [2^-16, 2^16) (both
+// signs, 16 KiB of BF16 bits) with the exact expression of
+// gate_sigmoid_mul_vec8; zeros, subnormals, huge values, Inf and NaN take the
+// expression directly. Bitwise equal; the precise expf + IEEE division per
+// element (2 MUFU ops) become one shared-memory load.
+constexpr int GATE_LUT_E0 = 111;
+constexpr int GATE_LUT_NE = 32;
+constexpr int GATE_LUT_N = 2 * GATE_LUT_NE * 128;
+
 __device__ __forceinline__ uint16_t gate_sigmoid_bf16(float gv) {
   float const sig = 1.0f / (1.0f + ::expf(-gv));
   return c10::BFloat16(sig).x;
 }
 
-// BF16(sigmoid(g)) of a BF16 g: ex2.approx / rcp.approx (2 MUFU ops, relative
-// error < 2^-17 including the rounding of the exponent argument for |g| <= 64),
-// rounded to BF16 unless the FP32 value lies within 256 FP32 ulps of a BF16
-// rounding midpoint, where the stock expression (precise expf + IEEE division,
-// as ATen's sigmoid) decides; |g| > 64, Inf and NaN take the stock expression.
-// Bitwise equal to the stock BF16 sigmoid for every BF16 g (all 2^16 values
-// tested).
-__device__ __forceinline__ uint32_t gate_sigmoid_bits(uint32_t b) {
-  const float g = __uint_as_float(b << 16);
-  if (!(fabsf(g) <= 64.0f)) return gate_sigmoid_bf16(g);
-  float t, s;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(t) : "f"(g * -1.4426950408889634f));
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(s) : "f"(1.0f + t));
-  const uint32_t u = __float_as_uint(s);
-  const uint32_t rem = u & 0xffffu;
-  if (rem - 0x7f00u <= 0x200u) return gate_sigmoid_bf16(g);
-  return (u + 0x8000u) >> 16;
-}
-
-__device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_fast(uint4 a, uint4 g) {
+__device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
+    uint4 a, uint4 g, const uint16_t* __restrict__ lut) {
   const uint16_t* gh = reinterpret_cast<const uint16_t*>(&g);
   const uint32_t* aw = reinterpret_cast<const uint32_t*>(&a);
   uint4 o;
   uint32_t* ow = reinterpret_cast<uint32_t*>(&o);
   uint32_t s[8];
 #pragma unroll
-  for (int j = 0; j < 8; ++j) s[j] = gate_sigmoid_bits(gh[j]);
+  for (int j = 0; j < 8; ++j) {
+    const uint32_t b = gh[j];
+    const uint32_t e = ((b >> 7) & 0xffu) - (uint32_t)GATE_LUT_E0;
+    s[j] = e < (uint32_t)GATE_LUT_NE
+               ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
+               : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
+  }
   // BF16 x BF16 products, rounded by cvt.rn.bf16x2 (RNE, as c10::BFloat16 for
   // every non-NaN value) on packed pairs.
 #pragma unroll
@@ -586,6 +584,15 @@ __global__ void __launch_bounds__(512) gate_sigmoid_mul_kernel(uint16_t* __restr
                                         int64_t gate_stride,
                                         int64_t out_stride) {
   constexpr int U = 4;  // loads in flight per thread
+  __shared__ uint16_t lut[GATE_LUT_N];
+  for (int i = threadIdx.x; i < GATE_LUT_N; i += blockDim.x) {
+    const uint32_t bits = ((uint32_t)(i >> 12) << 15) |
+                          ((uint32_t)(((i >> 7) & (GATE_LUT_NE - 1)) +
+                                      GATE_LUT_E0) << 7) |
+                          (uint32_t)(i & 0x7f);
+    lut[i] = gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)bits));
+  }
+  __syncthreads();
   int32_t const stride = gridDim.x * blockDim.x;
   for (int32_t v0 = blockIdx.x * blockDim.x + threadIdx.x; v0 < total_vecs;
        v0 += stride * U) {
@@ -613,7 +620,7 @@ __global__ void __launch_bounds__(512) gate_sigmoid_mul_kernel(uint16_t* __restr
     for (int u = 0; u < U; ++u) {
       if (v0 + u * stride < total_vecs) {
         *reinterpret_cast<uint4*>(out + oo[u]) =
-            gate_sigmoid_mul_vec8_fast(a[u], g[u]);
+            gate_sigmoid_mul_vec8_lut(a[u], g[u], lut);
       }
     }
   }
