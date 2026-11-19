@@ -161,9 +161,15 @@ class SpMlp:
         """The four GEMM families' choices at ``n`` shard rows."""
         return {f: self.gemms[f].choice(n) for f in FAMILIES}
 
-    def _shared(self, h):
+    def mx_input(self):
+        """The MXFP8 shared gate_up's input scratch (``gemm.mxfp8.Mxfp8Input``) a
+        producer may fill (``run(prequantized=True)``), or None (BF16 shared)."""
+        return self.gemms["shared_gu"].input if self.mxfp8 else None
+
+    def _shared(self, h, prequantized=False):
         shared, gemms, n = self.mlp.shared_experts, self.gemms, h.shape[0]
-        gate_up = gemms["shared_gu"].run(h, h.new_empty((n, self.inter2)))
+        x = gemms["shared_gu"].input.view(n) if prequantized else h
+        gate_up = gemms["shared_gu"].run(x, h.new_empty((n, self.inter2)))
         if self.mxfp8:
             # stock's online-MXFP8 shared expert: SiTU-and-mul writes the down
             # projection's MXFP8 input (KimiMLP._act_mxfp8), bitwise act -> quantize
@@ -174,7 +180,11 @@ class SpMlp:
         act = shared.act_fn(gate_up)
         return gemms["shared_down"].run(act, h.new_empty((n, self.hidden)))
 
-    def run(self, h: torch.Tensor) -> torch.Tensor:
+    def run(self, h: torch.Tensor, prequantized: bool = False) -> torch.Tensor:
+        """``prequantized``: the shared gate_up's MXFP8 input scratch already holds
+        ``h`` quantized (``mx_input``; the post-AttnRes wrote it)."""
+        if prequantized and not self.mxfp8:
+            raise Unsupported("moe", h.shape[0], "an MXFP8 input for a BF16 shared")
         mlp, gemms = self.mlp, self.gemms
         n = h.shape[0]
         if n not in self.gemms["latent_down"].kinds or h.dim() != 2:
@@ -202,14 +212,14 @@ class SpMlp:
         if mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
                 experts,
-                lambda: self._shared(h),
+                lambda: self._shared(h, prequantized),
                 mlp._shared_events[0],
                 mlp._shared_events[1],
                 mlp._shared_stream,
             )
         else:
             final = experts()
-            shared_out = self._shared(h)
+            shared_out = self._shared(h, prequantized)
         norm = mlp.routed_output_transform.norm
         if norm is not None and fused_norm is None:
             final = norm(final)

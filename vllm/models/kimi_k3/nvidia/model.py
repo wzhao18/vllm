@@ -128,6 +128,9 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_mxfp8 as prefill_attn_res_mxfp8,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -694,6 +697,9 @@ class KimiMoE(nn.Module):
         # Routed MoE on 1/TP token shards over a replicated stream (prefill
         # workers); exclusive with sequence parallelism.
         self.moe_token_shard = self.use_mega_moe and use_moe_token_shard(vllm_config)
+        # Prefill-worker MegaMoE policy (specialized_prefill.moe); None: stock.
+        self._prefill_moe = None
+        self._prefill_subcalls = None
         assert not (self.moe_token_shard and use_sequence_parallel)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -841,12 +847,26 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
+            max_num_tokens = mega_moe_max_num_tokens(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                self.tp_size,
+                token_sharded=use_sequence_parallel or self.moe_token_shard,
+            )
+            from .specialized_prefill.moe import prefill_moe_policy
+
+            self._prefill_moe = prefill_moe_policy(
+                vllm_config,
+                tp_size=self.tp_size,
+                sequence_parallel=use_sequence_parallel,
+                token_shard=self.moe_token_shard,
+                max_num_tokens=max_num_tokens,
+            )
             self.experts = mega_moe_experts_cls(vllm_config)(
                 vllm_config,
-                max_num_tokens=mega_moe_max_num_tokens(
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    self.tp_size,
-                    token_sharded=use_sequence_parallel or self.moe_token_shard,
+                max_num_tokens=(
+                    max_num_tokens
+                    if self._prefill_moe is None
+                    else self._prefill_moe.capacity
                 ),
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
@@ -906,6 +926,14 @@ class KimiMoE(nn.Module):
             self.experts.reserve_sms_for_shared_expert()
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
+        if self._prefill_moe is not None and self._prefill_moe.subcalls:
+            from .specialized_prefill.moe import PrefillSubcallExperts
+
+            self._prefill_subcalls = PrefillSubcallExperts(
+                self.experts,
+                self._prefill_moe.capacity,
+                vllm_config.parallel_config.data_parallel_size,
+            )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -1021,6 +1049,19 @@ class KimiMoE(nn.Module):
             return router_logits, None
         return self._grouped_topk(hidden_states, router_logits)
 
+    def _routed_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """MegaMoE routed experts; prefill workers split the batch into
+        EP-uniform capacity sub-calls (specialized_prefill.moe)."""
+        subcalls = self._prefill_subcalls
+        if subcalls is None:
+            return self.experts(hidden_states, topk_weights, topk_ids)
+        return subcalls(hidden_states, topk_weights, topk_ids)
+
     def _packed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE layer on the packed GEMMs of pack_projections()."""
         pack_n, pack_k, latent, inter = self._packed_moe
@@ -1041,7 +1082,7 @@ class KimiMoE(nn.Module):
             num_tokens, inter + latent, hidden_states.device, hidden_states.dtype
         )
         self.shared_experts.act_mxfp8_into(y[:, latent:], act, 0)
-        routed = self.experts(y[:, :latent], router_output, topk_ids)
+        routed = self._routed_experts(y[:, :latent], router_output, topk_ids)
         norm = self.routed_output_transform.norm
         mxfp8_act.rms_norm_quantize(
             routed, norm.weight, norm.variance_epsilon, out=act, col=inter
@@ -1164,7 +1205,25 @@ class KimiMoE(nn.Module):
             )
         return tensor_model_parallel_all_reduce(output)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def takes_shared_mxfp8_input(self) -> bool:
+        """forward() can take the shared experts' gate_up input as MXFP8
+        from the producer of the layer input (``shared_mxfp8_input``): the
+        MegaMoE path with online-MXFP8 shared experts that quantizes nothing
+        else from the layer input (BF16 router and latent down_proj)."""
+        return (
+            not self.moe_token_shard
+            and self.use_mega_moe
+            and getattr(self, "_packed_moe", None) is None
+            and isinstance(self.shared_experts, KimiMLP)
+            and self.shared_experts.mxfp8_input()
+            and not self._shared_mxfp8_input()
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_mxfp8_input: QuantizedActivation | None = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.moe_token_shard:
@@ -1178,6 +1237,8 @@ class KimiMoE(nn.Module):
         mxfp8_input = (
             mxfp8_act.quantize(hidden_states) if self._shared_mxfp8_input() else None
         )
+        if shared_mxfp8_input is not None:
+            assert mxfp8_input is None and self.use_mega_moe
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
@@ -1189,17 +1250,25 @@ class KimiMoE(nn.Module):
             assert topk_ids is not None
             # The shared expert reads the un-projected hidden states, so it
             # stays outside the latent-space MegaMoE launch.
-            shared_input = hidden_states if mxfp8_input is None else mxfp8_input
+            shared_input = (
+                shared_mxfp8_input
+                if shared_mxfp8_input is not None
+                else hidden_states
+                if mxfp8_input is None
+                else mxfp8_input
+            )
             if self._shared_overlap:
                 final_hidden_states, shared_output = maybe_execute_in_parallel(
-                    lambda: self.experts(routed_hidden_states, router_output, topk_ids),
+                    lambda: self._routed_experts(
+                        routed_hidden_states, router_output, topk_ids
+                    ),
                     lambda: self.shared_experts(shared_input),
                     self._shared_events[0],
                     self._shared_events[1],
                     self._shared_stream,
                 )
             else:
-                final_hidden_states = self.experts(
+                final_hidden_states = self._routed_experts(
                     routed_hidden_states, router_output, topk_ids
                 )
                 shared_output = (
@@ -1502,9 +1571,17 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        hidden_states, prefix_sum, residual = self._pre_attn_norm(
-            hidden_states, residual, prefix_sum
-        )
+        pre_mxfp8, post_mxfp8 = self._attn_res_mxfp8_consumers(prefix_sum)
+        if pre_mxfp8:
+            # Prefill: the AttnRes writes the KDA in_proj's MXFP8 input (its
+            # only consumer) instead of BF16.
+            hidden_states = self._attn_res_mxfp8(
+                prefix_sum, hidden_states, residual, pre=True
+            )[1]
+        else:
+            hidden_states, prefix_sum, residual = self._pre_attn_norm(
+                hidden_states, residual, prefix_sum
+            )
         assert hidden_states is not None
 
         M = None
@@ -1522,6 +1599,19 @@ class KimiDecoderLayer(nn.Module):
             # Add SP padding if needed, and then perform reduce scatter.
             hidden_states = sp_reduce_scatter(hidden_states)
 
+        if post_mxfp8:
+            # Prefill: the AttnRes also writes the shared experts' MXFP8
+            # gate_up input (the router / latent down_proj read the BF16).
+            if self.is_block_write_layer:
+                if _gemm_ar_owns(hidden_states):
+                    hidden_states = hidden_states.clone()
+                prefix_sum = hidden_states
+            hidden_states, shared_mxfp8 = self._attn_res_mxfp8(
+                prefix_sum, hidden_states, residual, pre=False
+            )
+            hidden_states = self.mlp(hidden_states, shared_mxfp8_input=shared_mxfp8)
+            return hidden_states, prefix_sum, residual
+
         hidden_states, prefix_sum, residual = self._post_attn_norm(
             hidden_states, residual, prefix_sum
         )
@@ -1529,6 +1619,79 @@ class KimiDecoderLayer(nn.Module):
         # MoE/MLP.
         hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
+
+    def _attn_res_mxfp8_capabilities(self) -> tuple[bool, bool]:
+        """(pre, post): the pre-attention / post-attention AttnRes output feeds
+        an online-MXFP8 projection that can take it as MXFP8 from the AttnRes
+        epilogue (specialized_prefill ``attn_res_mxfp8``): the KDA in_proj (the
+        pre-attention AttnRes' only consumer) and the MegaMoE shared experts'
+        gate_up."""
+        caps = getattr(self, "_attn_res_mxfp8_caps", None)
+        if caps is None:
+            base = self.use_attn_res and not self.use_sequence_parallel
+            pre = (
+                base
+                and isinstance(self.self_attn, KimiK3DeltaAttention)
+                and takes_mxfp8_activation(self.self_attn.in_proj_qkvgfab)
+            )
+            post = (
+                base
+                and isinstance(self.mlp, KimiMoE)
+                and self.mlp.takes_shared_mxfp8_input()
+            )
+            caps = self._attn_res_mxfp8_caps = (pre, post)
+        return caps
+
+    def _attn_res_mxfp8_consumers(
+        self, prefix_sum: torch.Tensor | None
+    ) -> tuple[bool, bool]:
+        """The capabilities, for this step's shape (prefill chunks only)."""
+        caps = self._attn_res_mxfp8_capabilities()
+        if not (caps[0] or caps[1]) or prefix_sum is None:
+            return False, False
+        if not prefill_attn_res_mxfp8.use_for(prefix_sum):
+            return False, False
+        return caps
+
+    def _attn_res_mxfp8(
+        self,
+        prefix_sum: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        residual: torch.Tensor,
+        pre: bool,
+    ):
+        """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
+        the MXFP8 output (BF16 output only after attention)."""
+        if pre:
+            return prefill_attn_res_mxfp8.attn_res_mxfp8(
+                prefix_sum,
+                hidden_states,
+                residual,
+                self.self_attention_res_norm.weight,
+                self.self_attention_res_proj.weight.squeeze(0),
+                self.input_layernorm.weight,
+                num_blocks=self.prev_valid_blocks,
+                block_write_idx=(
+                    self.block_write_idx if self.is_block_write_layer else -1
+                ),
+                eps=self.self_attention_res_norm.variance_epsilon,
+                output_norm_eps=self.input_layernorm.variance_epsilon,
+                bf16_out=False,
+            )
+        prefix_delta = None if self.is_block_write_layer else hidden_states
+        return prefill_attn_res_mxfp8.attn_res_mxfp8(
+            prefix_sum,
+            prefix_delta,
+            residual,
+            self.mlp_res_norm.weight,
+            self.mlp_res_proj.weight.squeeze(0),
+            self.post_attention_layernorm.weight,
+            num_blocks=self.prev_valid_blocks + self.is_block_write_layer,
+            block_write_idx=-1,
+            eps=self.mlp_res_norm.variance_epsilon,
+            output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            bf16_out=True,
+        )
 
 
 # (param_name, shard_name, shard_id) for the merged DSA wkv_index.
@@ -2186,6 +2349,12 @@ class KimiLinearForCausalLM(
         ):
             # Build the fused MXFP8 activation producers at load, not mid-step.
             mxfp8_act.warmup()
+            if any(
+                any(layer._attn_res_mxfp8_capabilities())
+                for layer in self.modules()
+                if isinstance(layer, KimiDecoderLayer)
+            ):
+                prefill_attn_res_mxfp8.warmup()
             logger.info_once(
                 "Kimi K3: online-MXFP8 projections take fused MXFP8 activations."
             )

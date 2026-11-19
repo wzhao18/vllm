@@ -22,3 +22,9 @@ void fwd(const torch::stable::Tensor& q, const torch::stable::Tensor& k,
          std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
          std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
          int64_t mode = 3);
+// Kimi-K3: gated o_norm (sigmoid, D = 128) of x (T, H, 128) with the gate rows
+// g (T, >= H 128), written as the MXFP8 o_proj input q (T, H 128) e4m3 + the
+// F8_128x4 swizzled UE8M0 scales sf.
+void o_norm_mxfp8(const torch::stable::Tensor& x, const torch::stable::Tensor& g,
+                  const torch::stable::Tensor& weight, double eps,
+                  const torch::stable::Tensor& q, const torch::stable::Tensor& sf);

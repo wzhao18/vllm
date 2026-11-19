@@ -61,6 +61,7 @@ from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
 from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
     KDARecoverSSMRecords,
@@ -70,6 +71,9 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
     CuteRecoverSSMVerify,
     can_use_cute_recoverssm,
     compile_state_commit,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    kda as specialized_prefill_kda,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -979,14 +983,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: "torch.Tensor | QuantizedActivation",
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
+        # A QuantizedActivation is in_proj's MXFP8 input written by the
+        # prefill AttnRes (specialized_prefill.attn_res_mxfp8).
+        qa = hidden_states if isinstance(hidden_states, QuantizedActivation) else None
+        act_dtype = qa.orig_dtype if qa is not None else hidden_states.dtype
+        act_device = qa.data.device if qa is not None else hidden_states.device
+        num_tokens = qa.data.size(0) if qa is not None else hidden_states.size(0)
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
         if (
-            0 < num_tokens <= self._projection_overlap_max_tokens
+            qa is None
+            and 0 < num_tokens <= self._projection_overlap_max_tokens
             and hidden_states.stride() == (self.hidden_size, 1)
             and projection_events is not None
             and projection_aux_stream is not None
@@ -1026,8 +1036,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            dtype=act_dtype,
+            device=act_device,
         )
         # Online-MXFP8 o_proj: the output gate norm writes o_proj's MXFP8 input
         # (preallocated here: _forward breaks the CUDA graph capture).
@@ -1036,8 +1046,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             o_mxfp8 = Mxfp8Buffer(
                 num_tokens,
                 self.local_num_heads * self.head_dim,
-                hidden_states.device,
-                hidden_states.dtype,
+                act_device,
+                act_dtype,
             )
         self._forward(
             mixed_qkv=mixed_qkv,
@@ -1723,7 +1733,21 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        if o_mxfp8 is not None:
+        if (
+            o_mxfp8 is not None
+            and m.num_prefills > 0
+            and self.kda_prefill_backend == "flashkda"
+        ):
+            # Prefill: the HBM-rate gated o_norm + MXFP8 kernel (same layout
+            # contract as kda_norm, checked in forward()).
+            specialized_prefill_kda.o_norm_mxfp8(
+                core_attn_out,
+                g2.flatten(-2),
+                self.o_norm.weight,
+                self.o_norm.eps,
+                o_mxfp8,
+            )
+        elif o_mxfp8 is not None:
             # forward() checked kda_norm.supported for these tensors.
             kda_norm.rmsnorm_gated_mxfp8(
                 core_attn_out, g2, self.o_norm.weight, self.o_norm.eps, out=o_mxfp8
