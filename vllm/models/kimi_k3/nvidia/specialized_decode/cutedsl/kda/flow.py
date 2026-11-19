@@ -201,21 +201,15 @@ def bulk_commit():
     return "cp.async.bulk.commit_group;", "~{memory}", ()
 
 
-def flat(pointer, elements):
-    """A 1-D view of ``elements`` contiguous elements at ``pointer``."""
-    return cute.make_tensor(pointer, cute.make_layout(elements))
-
-
 @cute.jit
 def group_load(dst, src, elements: cutlass.Constexpr, per: cutlass.Constexpr, c):
     """``elements`` contiguous elements global -> shared by the group's threads (16 B
     cp.async each, ``per`` elements per 16 B; the caller commits)."""
     chunks: cutlass.Constexpr = elements // per
-    d, s = flat(dst, elements), flat(src, elements)
     for r in cutlass.range_constexpr(-(-chunks // GROUP_THREADS)):
         i = c + GROUP_THREADS * r
         if i < chunks:
-            copy_g2s(at(d, i * per), at(s, i * per))
+            copy_g2s(dst + i * per, src + i * per)
 
 
 @cute.jit
@@ -223,11 +217,10 @@ def group_store(dst, src, elements: cutlass.Constexpr, per: cutlass.Constexpr, c
     """``elements`` contiguous elements shared -> global by the group's threads
     (16 B each; the same chunk per thread as ``group_load``)."""
     chunks: cutlass.Constexpr = elements // per
-    d, s = flat(dst, elements), flat(src, elements)
     for r in cutlass.range_constexpr(-(-chunks // GROUP_THREADS)):
         i = c + GROUP_THREADS * r
         if i < chunks:
-            store_words(at(d, i * per), smem_words(at(s, i * per)))
+            store_words(dst + i * per, smem_words(src + i * per))
 
 
 class KdaFlow(KdaWS):
