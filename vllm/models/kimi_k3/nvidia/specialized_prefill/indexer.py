@@ -900,23 +900,43 @@ class IndexerScore:
             # the pending tile (its head sum in flight): tile index, mask
             pt = Int32(-1)
             pm = Uint32(0)
+            # the item's first tile (stage 0): loaded here, later tiles are
+            # prefetched by their predecessor
+            cute.arch.mbarrier_wait(acc_full, ph)
+            h = list(tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS // 2)))
+            cute.arch.sync_warp()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(acc_empty)
+            npairs = ntp // 2
             for pp in cutlass.range(n_edge, unroll=1):
-                for st in cutlass.range_constexpr(ACC_STAGES):
-                    pt, pm, p0 = self.tile(
-                        True, ntp - 1 - 2 * pp - st, st, ph, tmem_q, a2_q, d2_q, a2_m, d2_m,
-                        d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq, pt, pm, rowp,
-                        p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
-                    )
-                    dph = dph ^ 1
+                pt, pm, p0, h = self.tile(
+                    True, ntp - 1 - 2 * pp, 0, Int32(1), ph, h, tmem_q, a2_q, d2_q, a2_m,
+                    d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq,
+                    pt, pm, rowp, p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
+                )
+                dph = dph ^ 1
+                pt, pm, p0, h = self.tile(
+                    True, ntp - 2 - 2 * pp, 1, npairs - 1 - pp, ph ^ 1, h, tmem_q,
+                    a2_q, d2_q, a2_m, d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full,
+                    acc_empty, lane, wg, wq, pt, pm, rowp, p0, thr, lim0, end0, ntiles,
+                    key_in_tile, hist0,
+                )
+                dph = dph ^ 1
                 ph = ph ^ 1
-            for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
-                for st in cutlass.range_constexpr(ACC_STAGES):
-                    pt, pm, p0 = self.tile(
-                        False, ntp - 1 - 2 * pp - st, st, ph, tmem_q, a2_q, d2_q, a2_m, d2_m,
-                        d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq, pt, pm, rowp,
-                        p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
-                    )
-                    dph = dph ^ 1
+            for pp in cutlass.range(n_edge, npairs, unroll=1):
+                pt, pm, p0, h = self.tile(
+                    False, ntp - 1 - 2 * pp, 0, Int32(1), ph, h, tmem_q, a2_q, d2_q, a2_m,
+                    d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq,
+                    pt, pm, rowp, p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
+                )
+                dph = dph ^ 1
+                pt, pm, p0, h = self.tile(
+                    False, ntp - 2 - 2 * pp, 1, npairs - 1 - pp, ph ^ 1, h, tmem_q,
+                    a2_q, d2_q, a2_m, d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full,
+                    acc_empty, lane, wg, wq, pt, pm, rowp, p0, thr, lim0, end0, ntiles,
+                    key_in_tile, hist0,
+                )
+                dph = dph ^ 1
                 ph = ph ^ 1
             # the item's last head sum
             if pt >= 0:
@@ -942,29 +962,37 @@ class IndexerScore:
 
     @cute.jit
     def tile(
-        self, edge: cutlass.Constexpr, t, st: cutlass.Constexpr, ph, tmem_q, a2_q, d2_q,
-        a2_m, d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane, wg, wq, pt, pm, rowp,
-        p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
+        self, edge: cutlass.Constexpr, t, st: cutlass.Constexpr, nxt, nph, h, tmem_q,
+        a2_q, d2_q, a2_m, d2_m, d2_bar, d2_bar_a, dph, desc0, acc_full, acc_empty, lane,
+        wg, wq, pt, pm, rowp, p0, thr, lim0, end0, ntiles, key_in_tile, hist0,
     ):
-        """Tile t in accumulator stage st: relu'd BF16 head logits -> A2, head-sum
-        MMAs -> D2; finishes the pending tile pt (whose sum is read before the new
-        MMAs overwrite D2). ``edge``: mask keys past the row end and the repeated
-        tile of an odd count. Returns the new pending (tile, mask) and p0."""
-        cute.arch.mbarrier_wait(acc_full + st, ph)
-        col = tmem_q + st * N
-        h = tmem_wait_n(*tmem_ld16(col), *tmem_ld16(col + HEADS // 2))
-        cute.arch.sync_warp()
-        if lane == 0:
-            cute.arch.mbarrier_arrive(acc_empty + st)
+        """Tile t (head logits ``h``, already loaded from accumulator stage st):
+        relu'd BF16 head logits -> A2, head-sum MMAs -> D2. Meanwhile the next
+        tile (stage st ^ 1, parity ``nph``; ``nxt`` = 0: none) is loaded and its
+        stage released, and the pending tile pt is finished (its sum is read
+        before the new MMAs overwrite D2). ``edge``: mask keys past the row end
+        and the repeated tile of an odd count. Returns the new pending (tile,
+        mask), p0 and the next tile's head logits."""
         a = [relu_bf16x2(h[2 * i], h[2 * i + 1]) for i in range(HEADS // 2)]
-        v = Float32(0.0)
         if pt >= 0:
             # the pending head sum (also frees A2 and D2)
             cute.arch.mbarrier_wait(d2_bar, dph ^ 1)
             tc_fence_after()
-            v = tmem_wait_n(tmem_ld1(d2_q))[0]
+        v = tmem_ld1(d2_q)
         tmem_st16(a2_q, *a)
+        col = tmem_q + (st ^ 1) * N
+        hn = h
+        if nxt > 0:
+            cute.arch.mbarrier_wait(acc_full + (st ^ 1), nph)
+            hn = list(tmem_ld16(col)) + list(tmem_ld16(col + HEADS // 2))
+        w = tmem_wait_n(v, *hn)
+        v = w[0]
+        hn = list(w[1:])
         tmem_wait_st()
+        if nxt > 0:
+            cute.arch.sync_warp()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(acc_empty + (st ^ 1))
         tc_fence_before()
         wg_sync(wg)
         if wq == 0:
@@ -978,7 +1006,7 @@ class IndexerScore:
         if cutlass.const_expr(edge):
             if t * TILE + key_in_tile >= end0 or t >= ntiles:
                 m = Uint32(0xFFFF)
-        return Int32(t), m, p0
+        return Int32(t), m, p0, hn
 
     @cute.jit
     def finish(self, v, t, m, rowp, p0, thr, lim0, ntiles, hist0):
