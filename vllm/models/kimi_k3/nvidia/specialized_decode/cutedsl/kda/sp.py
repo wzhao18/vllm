@@ -165,10 +165,13 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
     if kind == "flow":
         if not record or tokens < 2:
             raise Unsupported("kda", shape, "KdaFlow runs RecoverSSM record steps only")
-        stages = flow.max_stages(tokens, *streamed, conv_size, limit)
+        budget = flow.smem_budget(device)
+        stages = flow.max_stages(tokens, *streamed, conv_size, budget)
         if not stages:
             raise Unsupported("kda", shape, "KdaFlow's shared memory does not fit")
         ctas = min(items, sms)
+        if -(-items // ctas) > flow.max_items_per_cta(requests):
+            raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
         return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)

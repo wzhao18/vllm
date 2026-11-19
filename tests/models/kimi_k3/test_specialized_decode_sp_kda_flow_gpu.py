@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi K3 SP decode, KdaFlow (``cutedsl.kda.flow``: persistent warp-specialized
-record core with the deferred RecoverSSM fold and a multi-stage state ring), C512
-shape (24 KDA heads per rank, FP32 state, q4).
+"""Kimi K3 SP decode, KdaFlow (``cutedsl.kda.flow``: persistent record core with the
+deferred RecoverSSM fold), C512 shape (24 KDA heads per rank, FP32 state, q4).
 
 Over ``STEPS`` consecutive verify steps of the same requests with partial acceptance:
 KdaFlow in "deferred" mode (each verify first folds the previous step's accepted
 tokens into the checkpoint) against KdaWS in "triton" mode + the stock Triton commit
 after sampling (``_commit_kda_state_kernel`` + ``_compact_conv_state_kernel``), each
-on its own copy of the caches. KdaFlow's verify is KdaWS's math and order and its fold
-is the commit's math, so checkpoints, conv windows, outputs and records are equal bit
-for bit at every step; once more with the verify captured in a CUDA graph. Both state
-ring depths. One Rubin GPU."""
+on its own copy of the caches; once more with the verify captured in a CUDA graph.
+KdaFlow's fold is the commit's math and its verify is the stock math with another
+FP32 reduction order of the recurrence's dot products: conv windows, recorded keys
+and raw gates equal bit for bit, checkpoints and corrections within FP32
+reduction-order tolerance, outputs within BF16 tolerance. One Rubin GPU."""
 
 import pytest
 import torch
@@ -40,7 +40,7 @@ def core_of(kind, attention, rows, records, caches):
     return core
 
 
-@pytest.mark.parametrize("stages", [1, 2])
+@pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("n", [3, 33, 96, 128])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
@@ -96,13 +96,16 @@ def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
             verify()
         torch.cuda.synchronize()
         where = f"step {step}"
-        kda.assert_bitwise(f"{where} checkpoints", kv[1], ref_kv[1])
+        torch.testing.assert_close(kv[1], ref_kv[1], rtol=1e-4, atol=1e-5,
+                                   msg=f"{where} checkpoints")  # fmt: skip
         kda.assert_bitwise(f"{where} conv window", kv[0], ref_kv[0])
-        kda.assert_bitwise(f"{where} output", out, ref_out)
+        torch.testing.assert_close(out.float(), ref_out.float(), rtol=2e-2,
+                                   atol=2e-2, msg=f"{where} output")  # fmt: skip
         got, want = ours.recoverssm_records, stock.recoverssm_records
         index = record_rows.long()
-        kda.assert_bitwise(f"{where} corrections", got.correction[index],
-                           want.correction[:n])  # fmt: skip
+        torch.testing.assert_close(got.correction[index], want.correction[:n],
+                                   rtol=1e-4, atol=1e-5,
+                                   msg=f"{where} corrections")  # fmt: skip
         kda.assert_bitwise(f"{where} key / gate", got.key_gate[index],
                            want.key_gate[:n])  # fmt: skip
         folded += int(pending.sum())

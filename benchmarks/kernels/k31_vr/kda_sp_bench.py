@@ -106,17 +106,24 @@ def main():
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--json", default="")
     p.add_argument("--trace", action="store_true", help="KdaFlow cycle trace")
-    p.add_argument("--skip", default="", help="KdaFlow diagnostics: fold,store,verify")
-    p.add_argument("--regs", default="", help="KdaFlow scan,prep setmaxnreg")
+    p.add_argument("--skip", default="", help="KdaFlow diagnostics: fold,store,verify,prep")
+    p.add_argument("--hang", action="store_true", help="KdaFlow stuck-wait report")
+    p.add_argument("--scalar", action="store_true", help="KdaFlow scalar FP32 pairs")
+    p.add_argument("--fence", action="store_true", help="KdaFlow fold chunk fence")
     a = p.parse_args()
     if a.trace:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.TRACE = True
-    if a.regs:
+    if a.hang:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
-        flow.SCAN_REGISTERS, flow.PREP_REGISTERS = map(int, a.regs.split(","))
+        flow.HANG = True
+    if a.scalar or a.fence:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.PACKED = not a.scalar
+        flow.FOLD_FENCE = a.fence
     if a.skip:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
