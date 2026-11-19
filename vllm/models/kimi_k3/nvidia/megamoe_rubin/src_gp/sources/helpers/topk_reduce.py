@@ -981,7 +981,12 @@ class TopkReduce:
         valid_slots = Int32(cute.arch.vote_ballot_sync(lane_valid))
 
         sumsq = Float32(0)
+        # The norm weight does not depend on the cells: load it before polling so its latency is off the tail.
+        weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
         if active:
+            load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+            cute.copy(load_atom, mark_alignment(wsrc, tile_bytes), weight)
             terms = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))[
                 (None, None), (0, hidden_tile_idx)
             ]
@@ -1063,10 +1068,6 @@ class TopkReduce:
             total = total + partial[w]
         scale = cute.math.rsqrt(total / Float32(self.hidden) + rmsnorm_eps, fastmath=True)
         if active:
-            load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
-            weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
-            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
-            cute.copy(load_atom, mark_alignment(wsrc, tile_bytes), weight)
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             for i in cutlass.range_constexpr(hidden_per_thread):
                 out[i] = out_dtype(Float32(x[i]) * scale * Float32(weight[i]))
