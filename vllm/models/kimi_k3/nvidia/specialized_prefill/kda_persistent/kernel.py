@@ -353,6 +353,16 @@ def _pkd(
         p_ft,
         cute.make_layout((C, 8, 8, 2, STAGES), stride=(64, 1, 8, 2048, STAGE_ELTS)),
     )
+    # channel-pair forms of the raw q (FT) / k (KD) tiles for the fused conv:
+    # (row, pair elt, pair, seg8, blk, stage)
+    v_ki2 = cute.make_tensor(
+        p_ft,
+        cute.make_layout((C, 2, 4, 8, 2, STAGES), stride=(64, 1, 2, 8, 2048, STAGE_ELTS)),
+    )
+    v_kd2 = cute.make_tensor(
+        p_kd,
+        cute.make_layout((C, 2, 4, 8, 2, STAGES), stride=(64, 1, 2, 8, 4096, STAGE_ELTS)),
+    )
     # Gram halves share one swizzled [64,32] image: G^T occupies rows
     # 0..31 and L occupies the otherwise-unused rows 32..63.  Besides
     # reclaiming 2 KiB/stage, this matches the tcgen05 result's native
@@ -2054,107 +2064,77 @@ def _pkd(
                         cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
                     if cutlass.const_expr(FUSED_CONV_ == 1):
                         # Width-4 causal conv + SiLU of the raw q/k tiles, in
-                        # place (the qkv_conv arithmetic: FP32 weights, FMA
-                        # chain oldest tap first, SiLU, BF16 rounding).
-                        # Thread = (plane, 8-channel group, 8-row quarter):
-                        # the 3 halo rows are read first (tile rows, else raw
-                        # global rows of the sequence, else the conv history
-                        # of the sequence), then each thread slides over its
-                        # own rows and overwrites them.
+                        # place (the qkv_conv arithmetic: FP32 weights, oldest
+                        # tap first, SiLU, BF16 rounding). Thread = (plane,
+                        # channel pair): it slides down all C rows of its two
+                        # channels, so only its own registers carry the halo
+                        # (rows -3..-1: raw global rows of the sequence, else
+                        # the sequence's conv history) and no other thread
+                        # reads what it overwrites.
                         cpl = ptl >> 6
-                        csg = ptl & 15
-                        crq = (ptl >> 4) & 3
-                        cgrp = cpl * (H_ * D // 8) + hidx * (D // 8) + csg
+                        cc0 = (ptl & 63) * 2
+                        cpi = (cc0 & 7) >> 1
+                        cs8 = (cc0 >> 3) & 7
+                        cbk = cc0 >> 6
+                        cgrp = cpl * (H_ * D // 8) + hidx * (D // 8) + (cc0 >> 3)
                         cseq0 = cutlass.Int32(cu[seq_idx])
-                        ch0 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                        ch1 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                        ch2 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                        ccur = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                        cw4 = cute.make_rmem_tensor((4,), cutlass.Float32)
-                        cacc = cute.make_rmem_tensor((4,), cutlass.Float32)
+                        cw = cute.make_rmem_tensor((4, 2), cutlass.Float32)
+                        for ctap in cutlass.range_constexpr(4):
+                            cute.autovec_copy(
+                                cute.local_tile(conv_wg, (1, 1, 2), (cgrp, ctap, cpi)),
+                                cw[(ctap, None)],
+                            )
+                        cwin = cute.make_rmem_tensor((3, 2), cutlass.Float32)
+                        c2 = cute.make_rmem_tensor((2,), cutlass.BFloat16)
                         for cj in cutlass.range_constexpr(3):
-                            clr = crq * 8 - 3 + cj
-                            cdst = ch0 if cj == 0 else (ch1 if cj == 1 else ch2)
-                            if clr >= 0:
+                            ctok = r0 - 3 + cj
+                            if ctok >= cseq0:
                                 if cpl == 0:
                                     cute.autovec_copy(
-                                        v_ki8[(clr, None, csg & 7, csg >> 3, inst)], cdst
+                                        cute.local_tile(q, (1, 1, 2), (ctok, hidx, cc0 >> 1)), c2
                                     )
                                 else:
                                     cute.autovec_copy(
-                                        v_kd8[(clr, None, csg & 7, csg >> 3, inst)], cdst
+                                        cute.local_tile(k, (1, 1, 2), (ctok, hidx, cc0 >> 1)), c2
                                     )
                             else:
-                                ctok = r0 + clr
-                                if ctok >= cseq0:
-                                    if cpl == 0:
-                                        cute.autovec_copy(
-                                            cute.local_tile(q, (1, 1, 8), (ctok, hidx, csg)),
-                                            cdst,
-                                        )
-                                    else:
-                                        cute.autovec_copy(
-                                            cute.local_tile(k, (1, 1, 8), (ctok, hidx, csg)),
-                                            cdst,
-                                        )
-                                else:
-                                    cute.autovec_copy(
-                                        cute.local_tile(
-                                            conv_hist,
-                                            (1, 1, 8),
-                                            (seq_idx, 3 + ctok - cseq0, cgrp),
-                                        ),
-                                        cdst,
-                                    )
-                        ibar.arrive_and_wait()
-                        for crr in cutlass.range_constexpr(8):
-                            clr = crq * 8 + crr
+                                cute.autovec_copy(
+                                    cute.local_tile(
+                                        conv_hist,
+                                        (1, 1, 2),
+                                        (seq_idx, 3 + ctok - cseq0, cgrp * 4 + cpi),
+                                    ),
+                                    c2,
+                                )
+                            cwin[cj, 0] = cutlass.Float32(c2[0])
+                            cwin[cj, 1] = cutlass.Float32(c2[1])
+                        for crr in cutlass.range_constexpr(C):
                             if cpl == 0:
-                                cute.autovec_copy(
-                                    v_ki8[(clr, None, csg & 7, csg >> 3, inst)], ccur
-                                )
+                                csl = v_ki2[(crr, None, cpi, cs8, cbk, inst)]
                             else:
-                                cute.autovec_copy(
-                                    v_kd8[(clr, None, csg & 7, csg >> 3, inst)], ccur
-                                )
-                            cout = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                            for chf in cutlass.range_constexpr(2):
-                                for ctap in cutlass.range_constexpr(4):
-                                    cute.autovec_copy(
-                                        cute.local_tile(
-                                            conv_wg, (1, 1, 4), (cgrp, ctap, chf)
-                                        ),
-                                        cw4,
-                                    )
-                                    csrc = (
-                                        ch0
-                                        if ctap == 0
-                                        else (ch1 if ctap == 1 else (ch2 if ctap == 2 else ccur))
-                                    )
-                                    for cu4 in cutlass.range_constexpr(4):
-                                        cx = cutlass.Float32(csrc[chf * 4 + cu4])
-                                        if cutlass.const_expr(ctap == 0):
-                                            cacc[cu4] = cx * cw4[cu4]
-                                        else:
-                                            cacc[cu4] = cx * cw4[cu4] + cacc[cu4]
-                                for cu4 in cutlass.range_constexpr(4):
-                                    ca = cacc[cu4]
-                                    cd = _exp2f(ca * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
-                                    cout[chf * 4 + cu4] = cutlass.BFloat16(
-                                        ca * cute.math.rcp(cd, approx=True, ftz=True)
-                                    )
-                            if cpl == 0:
-                                cute.autovec_copy(
-                                    cout, v_ki8[(clr, None, csg & 7, csg >> 3, inst)]
-                                )
-                            else:
-                                cute.autovec_copy(
-                                    cout, v_kd8[(clr, None, csg & 7, csg >> 3, inst)]
-                                )
-                            for cu8 in cutlass.range_constexpr(8):
-                                ch0[cu8] = ch1[cu8]
-                                ch1[cu8] = ch2[cu8]
-                                ch2[cu8] = ccur[cu8]
+                                csl = v_kd2[(crr, None, cpi, cs8, cbk, inst)]
+                            cute.autovec_copy(csl, c2)
+                            cx0 = cutlass.Float32(c2[0])
+                            cx1 = cutlass.Float32(c2[1])
+                            ca0 = cwin[0, 0] * cw[0, 0]
+                            ca1 = cwin[0, 1] * cw[0, 1]
+                            ca0 = cwin[1, 0] * cw[1, 0] + ca0
+                            ca1 = cwin[1, 1] * cw[1, 1] + ca1
+                            ca0 = cwin[2, 0] * cw[2, 0] + ca0
+                            ca1 = cwin[2, 1] * cw[2, 1] + ca1
+                            ca0 = cx0 * cw[3, 0] + ca0
+                            ca1 = cx1 * cw[3, 1] + ca1
+                            cd0 = _exp2f(ca0 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
+                            cd1 = _exp2f(ca1 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
+                            c2[0] = cutlass.BFloat16(ca0 * cute.math.rcp(cd0, approx=True, ftz=True))
+                            c2[1] = cutlass.BFloat16(ca1 * cute.math.rcp(cd1, approx=True, ftz=True))
+                            cute.autovec_copy(c2, csl)
+                            cwin[0, 0] = cwin[1, 0]
+                            cwin[0, 1] = cwin[1, 1]
+                            cwin[1, 0] = cwin[2, 0]
+                            cwin[1, 1] = cwin[2, 1]
+                            cwin[2, 0] = cx0
+                            cwin[2, 1] = cx1
                         ibar.arrive_and_wait()
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
