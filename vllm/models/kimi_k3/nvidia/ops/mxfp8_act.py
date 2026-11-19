@@ -547,15 +547,28 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
   const int threads = 256;
   const int64_t total = rows_pad * (d / 8);
   const int64_t per_block = (int64_t)threads * ACT_QUANT_UNROLL;
-  const int blocks = (int)std::min<int64_t>((total + per_block - 1) / per_block, 2048);
+  const int64_t need = (total + per_block - 1) / per_block;
   auto stream = c10::cuda::getCurrentCUDAStream();
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, x.get_device());
+  // One resident wave of CTAs (grid-stride loop): a partial second wave would
+  // leave the SMs of the first wave idle for its whole duration.
 #define LAUNCH(M)                                                              \
+  {                                                                            \
+    static int occ_##M = 0;                                                    \
+    if (occ_##M == 0)                                                          \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_##M,                  \
+                                                    act_quant_kernel<M>,       \
+                                                    threads, 0);               \
+    const int blocks =                                                         \
+        (int)std::min<int64_t>(need, (int64_t)sms * std::max(occ_##M, 1));     \
   act_quant_kernel<M><<<blocks, threads, 0, stream>>>(                         \
       reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
       reinterpret_cast<uint8_t*>(sf.data_ptr()),                               \
       reinterpret_cast<const uint16_t*>(x.data_ptr()), gp, rows, rows_pad,     \
       (int)d, x.stride(0), g_stride, q.stride(0), (int)sf_col_base,            \
-      (int)padded_cols, (float)beta, (float)linear_beta)
+      (int)padded_cols, (float)beta, (float)linear_beta);                      \
+  }
   switch (mode) {
     case 0: LAUNCH(0); break;
     case 1: LAUNCH(1); break;

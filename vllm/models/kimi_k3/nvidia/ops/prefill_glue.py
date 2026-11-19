@@ -639,11 +639,19 @@ void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                          attn.get_device());
-  const int64_t max_blocks = (int64_t)sms * 4;
-  const int blocks =
-      (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   const bool contig = attn.stride(0) == d && gate.stride(0) == d &&
                       out.stride(0) == d;
+  // One resident wave of CTAs (grid-stride loop).
+  static int occ[2] = {0, 0};
+  if (occ[contig] == 0) {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ[contig],
+        contig ? gate_sigmoid_mul_kernel<true> : gate_sigmoid_mul_kernel<false>,
+        threads, 0);
+  }
+  const int64_t max_blocks = (int64_t)sms * std::max(occ[contig], 1);
+  const int blocks =
+      (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   auto stream = c10::cuda::getCurrentCUDAStream();
   auto* op = reinterpret_cast<uint16_t*>(out.data_ptr());
   auto* ap = reinterpret_cast<const uint16_t*>(attn.data_ptr());
