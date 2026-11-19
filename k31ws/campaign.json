@@ -1,20 +1,15 @@
 {
  "goal": "Close the gap between the implemented kernels and the perf model's achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.",
  "steps": {
-  "Prefill DEP16 NVFP4 slice (ms, F16K)": {
-   "now": "198.9 (int 5718ef2d89)",
-   "ach": "164.5",
-   "note": "baseline 218.7; P-MOE S3 not yet merged (197.2 on its branch)"
+  "Prefill DEP16 NVFP4, 4 nodes real EP16 (tok/s/GPU)": {
+   "now": "20.7K (790.3 ms F16K)",
+   "ach": "628.2 ms per-op sum (1.26x); model 30.7K at best chunk",
+   "note": "int 5718ef2d89; 1-node slice 198.9 vs 164.5"
   },
-  "Decode r8 NVFP4 slice (ms/step)": {
-   "now": "6.67",
-   "ach": "2.68",
-   "note": "target-only 4.91 vs 2.41 (preview-drafter tail removed)"
-  },
-  "Decode r24 NVFP4 slice (ms/step)": {
-   "now": "10.78 (int)",
-   "ach": "3.80",
-   "note": "baseline 10.89; D-TOPK (-0.33 ms) and D-FUSE (-0.19 ms) landed-ready, not yet merged"
+  "Decode NVFP4, 8 nodes real EP32 (ms/step)": {
+   "now": "r8 19.10 / r16 24.86 / r24 29.75",
+   "ach": "9.50 / 11.46 / 13.50 (2.0-2.2x)",
+   "note": "int 5718ef2d89; preview drafter tail ~4 ms at r24 is an artifact"
   }
  },
  "findings": [
@@ -217,6 +212,14 @@
   {
    "t": "11-18 16:55",
    "text": "8-node: original hold8 72524 lost its start estimate; added a backfill 8-node request (est 18:18 today) and a batch one (est 05:31)."
+  },
+  {
+   "t": "11-18 17:00",
+   "text": "FULL-TOPOLOGY NVFP4 BASELINES (int 5718ef2d89): decode D3-32 on 8 nodes real EP32 r8/r16/r24 19.10/24.86/29.75 ms vs 9.50/11.46/13.50 (2.0-2.2x); prefill DEP16 on 4 nodes real EP16 790.3 ms F16K = 20.7K tok/s/GPU vs 628.2 per-op achievable (1.26x). Biggest decode gaps (r24): GEMMs 5.74 vs 2.93, MegaMoE 6.55 vs 5.27, KDA 3.43 vs 1.81, DSA attention 2.68 vs 1.00, top-k 2.55 vs 0.23, small ops 2.02 vs 0.15. Biggest prefill gaps: KDA 79.8 vs 17.4, router/latent 80.5 vs 48.0, indexer 61.6 vs 33.8, sparse MLA 49.2 vs 15.4; MegaMoE 261.5 vs 293.3 (below model: model fix)."
+  },
+  {
+   "t": "11-18 17:00",
+   "text": "HW (measured): die-local HBM read 18.4 TB/s (model 17.1, 7% conservative), default 12.75, remote 7.0; 1-CTA SS MMA capped at 2/3 double-K peak (TMEM-A or 2-CTA reaches full); counted TMA stores rejected by CUDA 13.4 ptxas (use multicast store / bulk multicast); 4-GPU flag round 10.9 us chained vs 3.3 us multicast."
   }
  ]
 }

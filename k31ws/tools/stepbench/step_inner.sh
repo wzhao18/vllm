@@ -3,7 +3,7 @@
 # overlay, Lustre caches, CUDA_VISIBLE_DEVICES = the locked GPUs, NQ_BUILD per overlay). Reads <out>.cfg.sh
 # (cfg2bench.py) and <out>.shapes.json (nq_shapes.py) and launches NQ_WORLD local ranks of nq_step.py (one per locked
 # GPU; RANK / LOCAL_RANK / WORLD_SIZE / MASTER_* set here, so nq_step.py's SLURM rendezvous is skipped).
-# env: NQ_EMULATE_EP (expert-count emulation, default 32), NQ_ITERS, NQ_SAMPLES.
+# env: NQ_EMULATE_EP (expert-count emulation, default 32), NQ_ITERS, NQ_SAMPLES, NQ_JIT_WARMUP=1 (keep the server JIT warmups).
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); K=/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws
 OUT=$1; shift
 source $OUT.cfg.sh
@@ -21,7 +21,7 @@ PIDS=()
 for ((r = 0; r < NQ_WORLD; r++)); do
   RANK=$r LOCAL_RANK=$r python3 $D/nq_step.py --capture-sizes "$NQ_CAP" --max-capture $NQ_MAXCAP \
     --full-capture-sizes "$NQ_FULLCAP" --measured-rows "$NQ_ROWS" --overlay "${WS_OVDIR:-$K/ov/$WS_OV}" \
-    --emulate-ep ${NQ_EMULATE_EP:-32} -- \
+    --emulate-ep ${NQ_EMULATE_EP:-32} ${NQ_JIT_WARMUP:+--jit-warmup} -- \
     "${NQ_ARGS[@]}" --shapes $OUT.shapes.json --kv-len-jitter 0 --routing balanced --seed 0 \
     --iters ${NQ_ITERS:-20} --samples ${NQ_SAMPLES:-5} --output-json $OUT.json "$@" > $OUT.rank$r.log 2>&1 &
   PIDS+=($!)
@@ -37,7 +37,7 @@ while :; do
     if [ $c != 0 ]; then rc=$c; echo "NQ rank $i exit $c: killing the others"; for q in "${PIDS[@]}"; do [ -n "$q" ] && kill $q 2>/dev/null; done; fi
   done
   (( alive )) || break
-  sleep 5
+  sleep 1
 done
 cat $OUT.rank0.log
 for ((r = 1; r < NQ_WORLD; r++)); do grep -a "Traceback\|Error" $OUT.rank$r.log | head -5 | sed "s/^/rank$r: /"; done

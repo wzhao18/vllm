@@ -1,0 +1,1969 @@
+{
+ "prefill": {
+  "mxfp4_release|F16384": {
+   "ckpt": "mxfp4_release",
+   "F": 16384,
+   "L": 78356.2831992676,
+   "t_sol_ms": 776.7809857116437,
+   "t_ach_ms": 991.7679255172661,
+   "t_sol_ms_93": 667.541958105816,
+   "t_ach_ms_93": 824.6707380273597,
+   "ops": {
+    "G.embed": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 21.35579927272727,
+     "t_ach_us": 33.80054561151079,
+     "t_ach_us_93": 33.80054561151079,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "G.attnres_init": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 0.0,
+     "t_ach_us": 0.0,
+     "t_ach_us_93": 0.0,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "L.attnres_pre": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 7334.936203636364,
+     "t_ach_us": 11609.251545323741,
+     "t_ach_us_93": 11609.251545323741,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "L.attnres_post": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 8327.842350545452,
+     "t_ach_us": 13180.757677122303,
+     "t_ach_us_93": 13180.757677122303,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "KDA.in_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 200056.62385766397,
+     "t_ach_us": 219240.1357344263,
+     "t_ach_us_93": 219240.1357344263,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "KDA.f_b_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 1285.8878138181817,
+     "t_ach_us": 2035.2181225899278,
+     "t_ach_us_93": 2035.2181225899278,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.conv": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 3801.4063142163272,
+     "t_ach_us": 3801.4063142163272,
+     "t_ach_us_93": 3801.4063142163272,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.gate_beta_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 1270.4352699420886,
+     "t_ach_us": 1270.4352699420886,
+     "t_ach_us_93": 1270.4352699420886,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.core_prefill": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 11488.769531250002,
+     "t_ach_us": 11488.769531250002,
+     "t_ach_us_93": 11488.769531250002,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.o_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 844.7569587147394,
+     "t_ach_us": 844.7569587147394,
+     "t_ach_us_93": 844.7569587147394,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.o_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 49787.260895232,
+     "t_ach_us": 54561.38180299398,
+     "t_ach_us_93": 54561.38180299398,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.qkv_a_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 3201.898119168,
+     "t_ach_us": 3508.9294456635616,
+     "t_ach_us_93": 3508.9294456635616,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.prologue": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 164.79883636363635,
+     "t_ach_us": 260.832690647482,
+     "t_ach_us_93": 260.832690647482,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.qb_wq_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 6803.228196864,
+     "t_ach_us": 7455.592544508492,
+     "t_ach_us_93": 7455.592544508492,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.g_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 17317.308137472,
+     "t_ach_us": 18977.871931476166,
+     "t_ach_us_93": 18977.871931476166,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.idx_q_quant": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 48.97141789650663,
+     "t_ach_us": 48.97141789650663,
+     "t_ach_us_93": 48.97141789650663,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.idx_score": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 28934.755836372133,
+     "t_ach_us": 28934.755836372133,
+     "t_ach_us_93": 28934.755836372133,
+     "bound_ach": "simt",
+     "dtype": "fp4"
+    },
+    "DSA.topk": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 2849.914577316655,
+     "t_ach_us": 4510.6561655371515,
+     "t_ach_us_93": 4510.6561655371515,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.w_uk": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 2429.6459170909093,
+     "t_ach_us": 3845.48274647482,
+     "t_ach_us_93": 3845.48274647482,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.sparse_mla": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 11753.140295161591,
+     "t_ach_us": 15433.51183942459,
+     "t_ach_us_93": 15433.51183942459,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DSA.w_uv": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 2210.0169076363636,
+     "t_ach_us": 3497.868486906475,
+     "t_ach_us_93": 3497.868486906475,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.gate_mul": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 183.64281711189986,
+     "t_ach_us": 183.64281711189986,
+     "t_ach_us_93": 183.64281711189986,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.o_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 17317.308137472,
+     "t_ach_us": 18977.871931476166,
+     "t_ach_us_93": 18977.871931476166,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.router": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 4840.428142592,
+     "t_ach_us": 5304.578786402192,
+     "t_ach_us_93": 5304.578786402192,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.topk": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 61.59686157294974,
+     "t_ach_us": 61.59686157294974,
+     "t_ach_us_93": 61.59686157294974,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_down": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 19361.712570368,
+     "t_ach_us": 21218.31514560877,
+     "t_ach_us_93": 21218.31514560877,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.dispatch": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 4542.812532363636,
+     "t_ach_us": 5844.554135204678,
+     "t_ach_us_93": 5844.554135204678,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.fc1": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 60693.0418532352,
+     "t_ach_us": 97442.95710381799,
+     "t_ach_us_93": 97442.95710381799,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "MOE.act": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 6758.055669717915,
+     "t_ach_us": 6758.055669717915,
+     "t_ach_us_93": 6758.055669717915,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.fc2": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 30346.5209266176,
+     "t_ach_us": 48721.47855190899,
+     "t_ach_us_93": 48721.47855190899,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "MOE.combine": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 8348.952762181818,
+     "t_ach_us": 10741.342734970758,
+     "t_ach_us_93": 10741.342734970758,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.latent_norm": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 164.258297527866,
+     "t_ach_us": 164.258297527866,
+     "t_ach_us_93": 164.258297527866,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_up": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 19361.712570368,
+     "t_ach_us": 21218.31514560877,
+     "t_ach_us_93": 21218.31514560877,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.shared_gate_up": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 66383.014526976,
+     "t_ach_us": 72748.50907065863,
+     "t_ach_us_93": 72748.50907065863,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.shared_act": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 844.7569587147394,
+     "t_ach_us": 844.7569587147394,
+     "t_ach_us_93": 844.7569587147394,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.shared_down": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 33191.507263488,
+     "t_ach_us": 36374.25453532932,
+     "t_ach_us_93": 36374.25453532932,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DENSE.gate_up": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 3968.5497815039994,
+     "t_ach_us": 4349.095650963288,
+     "t_ach_us_93": 4349.095650963288,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DENSE.act": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 50.50177470577246,
+     "t_ach_us": 50.50177470577246,
+     "t_ach_us_93": 50.50177470577246,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DENSE.down": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 1984.2748907519997,
+     "t_ach_us": 2174.547825481644,
+     "t_ach_us_93": 2174.547825481644,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "F.attnres_final": {
+     "fam": "attnres",
+     "count": 1.0,
+     "t_sol_us": 0.022828293255131964,
+     "t_ach_us": 0.03613111162682757,
+     "t_ach_us_93": 0.03613111162682757,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.norm": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 0.0006544781075794737,
+     "t_ach_us": 0.00103136690647482,
+     "t_ach_us_93": 0.00103136690647482,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.lm_head": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 106.85551326899494,
+     "t_ach_us": 169.12383395092726,
+     "t_ach_us_93": 169.12383395092726,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DS.aux_capture": {
+     "fam": "drafter",
+     "count": 5.0,
+     "t_sol_us": 60.11351187416689,
+     "t_ach_us": 95.14368785839365,
+     "t_ach_us_93": 95.14368785839365,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DS.fc": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 789.9716973757185,
+     "t_ach_us": 865.7224080829792,
+     "t_ach_us_93": 865.7224080829792,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.hidden_norm": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 1.340371164322762,
+     "t_ach_us": 1.340371164322762,
+     "t_ach_us_93": 1.340371164322762,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DS.ctx_kv_proj": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 225.70619925020526,
+     "t_ach_us": 247.34925945227977,
+     "t_ach_us_93": 247.34925945227977,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.ctx_kv_insert": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 5.725096368968275,
+     "t_ach_us": 9.061303605561298,
+     "t_ach_us_93": 9.061303605561298,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    }
+   },
+   "comm": {
+    "COMM.P11.moe": {
+     "prim": "P11 EP-dispatch",
+     "layer": "moe",
+     "t_sol_us": 46951.94239999999,
+     "t_ach_us": 79453.357081761,
+     "events": 92.0
+    },
+    "COMM.P12.moe": {
+     "prim": "P12 EP-combine",
+     "layer": "moe",
+     "t_sol_us": 90300.84586666667,
+     "t_ach_us": 153202.88080503145,
+     "events": 92.0
+    },
+    "COMM.P19.step": {
+     "prim": "P19 DP sync",
+     "layer": "step",
+     "t_sol_us": 2.86,
+     "t_ach_us": 4.89,
+     "events": 1.0
+    }
+   },
+   "fam_ach": {
+    "embed": 0.033800545611510795,
+    "attnres": 24.79004535355767,
+    "kda_proj": 275.8367356600102,
+    "kda_core": 17.405368074123157,
+    "mla_proj": 56.44725990361757,
+    "dsa_attn": 15.694344530072073,
+    "indexer": 33.49438341980579,
+    "router": 5.366175647975142,
+    "latent": 42.600888588745406,
+    "experts": 169.50838819562034,
+    "shared": 109.96752056470268,
+    "dense_mlp": 6.5741452511507035,
+    "lm_head": 0.16912486531783374,
+    "drafter": 1.2186170301635368,
+    "launch": 0.0015238688883731724
+   },
+   "fam_sol": {
+    "embed": 0.021355799272727273,
+    "attnres": 15.662801382475074,
+    "kda_proj": 251.1297725667142,
+    "kda_core": 17.405368074123157,
+    "mla_proj": 49.46304823281517,
+    "dsa_attn": 11.917939131525229,
+    "indexer": 31.833641831585297,
+    "router": 4.902025004164949,
+    "latent": 38.88768343826386,
+    "experts": 110.68938374411618,
+    "shared": 100.41927874917872,
+    "dense_mlp": 6.003326446961771,
+    "lm_head": 0.1068561677471025,
+    "drafter": 1.0828568760333817,
+    "launch": 0.0
+   }
+  },
+  "mxfp4_release|F8192": {
+   "ckpt": "mxfp4_release",
+   "F": 8192,
+   "L": 78356.2831992676,
+   "t_sol_ms": 394.60327573638955,
+   "t_ach_ms": 502.20814937030127,
+   "t_sol_ms_93": 339.720641933475,
+   "t_ach_ms_93": 418.3517052606491,
+   "ops": {
+    "G.embed": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 10.677899636363636,
+     "t_ach_us": 16.900272805755396,
+     "t_ach_us_93": 16.900272805755396,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "G.attnres_init": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 0.0,
+     "t_ach_us": 0.0,
+     "t_ach_us_93": 0.0,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "L.attnres_pre": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 3667.5893061818183,
+     "t_ach_us": 5804.817606906475,
+     "t_ach_us_93": 5804.817606906475,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "L.attnres_post": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 4164.042379636363,
+     "t_ach_us": 6590.570672805754,
+     "t_ach_us_93": 6590.570672805754,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "KDA.in_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 100028.31192883199,
+     "t_ach_us": 109620.06786721315,
+     "t_ach_us_93": 109620.06786721315,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "KDA.f_b_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 647.8769803636364,
+     "t_ach_us": 1025.4168034532374,
+     "t_ach_us_93": 1025.4168034532374,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.conv": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 1900.7031571081636,
+     "t_ach_us": 1900.7031571081636,
+     "t_ach_us_93": 1900.7031571081636,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.gate_beta_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 635.2176349710443,
+     "t_ach_us": 635.2176349710443,
+     "t_ach_us_93": 635.2176349710443,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.core_prefill": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 11488.769531250002,
+     "t_ach_us": 11488.769531250002,
+     "t_ach_us_93": 11488.769531250002,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.o_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 422.3784793573697,
+     "t_ach_us": 422.3784793573697,
+     "t_ach_us_93": 422.3784793573697,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.o_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 24893.630447616,
+     "t_ach_us": 27280.69090149699,
+     "t_ach_us_93": 27280.69090149699,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.qkv_a_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 1600.949059584,
+     "t_ach_us": 1754.4647228317808,
+     "t_ach_us_93": 1754.4647228317808,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.prologue": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 82.40221090909093,
+     "t_ach_us": 130.4207654676259,
+     "t_ach_us_93": 130.4207654676259,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.qb_wq_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 3401.614098432,
+     "t_ach_us": 3727.796272254246,
+     "t_ach_us_93": 3727.796272254246,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.g_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 8658.654068736,
+     "t_ach_us": 9488.935965738083,
+     "t_ach_us_93": 9488.935965738083,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.idx_q_quant": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 24.485708948253315,
+     "t_ach_us": 24.485708948253315,
+     "t_ach_us_93": 24.485708948253315,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.idx_score": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 14467.377918186066,
+     "t_ach_us": 14467.377918186066,
+     "t_ach_us_93": 14467.377918186066,
+     "bound_ach": "simt",
+     "dtype": "fp4"
+    },
+    "DSA.topk": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 1424.9572886583276,
+     "t_ach_us": 2255.3280827685758,
+     "t_ach_us_93": 2255.3280827685758,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.w_uk": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 1221.686365090909,
+     "t_ach_us": 1933.604318848921,
+     "t_ach_us_93": 1933.604318848921,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.sparse_mla": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 5876.5701475807955,
+     "t_ach_us": 7716.755919712295,
+     "t_ach_us_93": 7716.755919712295,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DSA.w_uv": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 1111.8718603636364,
+     "t_ach_us": 1759.7971890647482,
+     "t_ach_us_93": 1759.7971890647482,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.gate_mul": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 91.82140855594993,
+     "t_ach_us": 91.82140855594993,
+     "t_ach_us_93": 91.82140855594993,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.o_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 8658.654068736,
+     "t_ach_us": 9488.935965738083,
+     "t_ach_us_93": 9488.935965738083,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.router": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 2420.214071296,
+     "t_ach_us": 2652.289393201096,
+     "t_ach_us_93": 2652.289393201096,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.topk": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 30.79843078647487,
+     "t_ach_us": 30.79843078647487,
+     "t_ach_us_93": 30.79843078647487,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_down": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 9680.856285184,
+     "t_ach_us": 10609.157572804384,
+     "t_ach_us_93": 10609.157572804384,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.dispatch": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 2271.406266181818,
+     "t_ach_us": 2922.277067602339,
+     "t_ach_us_93": 2922.277067602339,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.fc1": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 30346.5209266176,
+     "t_ach_us": 48721.47855190899,
+     "t_ach_us_93": 48721.47855190899,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "MOE.act": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 3379.0278348589577,
+     "t_ach_us": 3379.0278348589577,
+     "t_ach_us_93": 3379.0278348589577,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.fc2": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 15173.2604633088,
+     "t_ach_us": 24360.739275954496,
+     "t_ach_us_93": 24360.739275954496,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "MOE.combine": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 4174.476381090909,
+     "t_ach_us": 5370.671367485379,
+     "t_ach_us_93": 5370.671367485379,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.latent_norm": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 82.129148763933,
+     "t_ach_us": 82.129148763933,
+     "t_ach_us_93": 82.129148763933,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_up": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 9680.856285184,
+     "t_ach_us": 10609.157572804384,
+     "t_ach_us_93": 10609.157572804384,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.shared_gate_up": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 33191.507263488,
+     "t_ach_us": 36374.25453532932,
+     "t_ach_us_93": 36374.25453532932,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.shared_act": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 422.3784793573697,
+     "t_ach_us": 422.3784793573697,
+     "t_ach_us_93": 422.3784793573697,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.shared_down": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 16595.753631744,
+     "t_ach_us": 18187.12726766466,
+     "t_ach_us_93": 18187.12726766466,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DENSE.gate_up": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 1984.2748907519997,
+     "t_ach_us": 2174.547825481644,
+     "t_ach_us_93": 2174.547825481644,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DENSE.act": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 25.25088735288623,
+     "t_ach_us": 25.25088735288623,
+     "t_ach_us_93": 25.25088735288623,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DENSE.down": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 992.1374453759998,
+     "t_ach_us": 1087.273912740822,
+     "t_ach_us_93": 1087.273912740822,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "F.attnres_final": {
+     "fam": "attnres",
+     "count": 1.0,
+     "t_sol_us": 0.012065782991202348,
+     "t_ach_us": 0.019096922719888606,
+     "t_ach_us_93": 0.019096922719888606,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.norm": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 0.0006516363636363637,
+     "t_ach_us": 0.00103136690647482,
+     "t_ach_us_93": 0.00103136690647482,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.lm_head": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 106.80980754358838,
+     "t_ach_us": 169.0514939538809,
+     "t_ach_us_93": 169.0514939538809,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DS.aux_capture": {
+     "fam": "drafter",
+     "count": 5.0,
+     "t_sol_us": 30.056755937083445,
+     "t_ach_us": 47.571843929196824,
+     "t_ach_us_93": 47.571843929196824,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DS.fc": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 394.98584868785923,
+     "t_ach_us": 432.8612040414896,
+     "t_ach_us_93": 432.8612040414896,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.hidden_norm": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 0.670185582161381,
+     "t_ach_us": 0.670185582161381,
+     "t_ach_us_93": 0.670185582161381,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DS.ctx_kv_proj": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 112.85309962510263,
+     "t_ach_us": 123.67462972613988,
+     "t_ach_us_93": 123.67462972613988,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.ctx_kv_insert": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 2.8625481844841376,
+     "t_ach_us": 4.530651802780649,
+     "t_ach_us_93": 4.530651802780649,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    }
+   },
+   "comm": {
+    "COMM.P11.moe": {
+     "prim": "P11 EP-dispatch",
+     "layer": "moe",
+     "t_sol_us": 23739.0912,
+     "t_ach_us": 40035.30787421384,
+     "events": 92.0
+    },
+    "COMM.P12.moe": {
+     "prim": "P12 EP-combine",
+     "layer": "moe",
+     "t_sol_us": 45281.98293333334,
+     "t_ach_us": 76755.75506918239,
+     "events": 92.0
+    },
+    "COMM.P19.step": {
+     "prim": "P19 DP sync",
+     "layer": "step",
+     "t_sol_us": 2.86,
+     "t_ach_us": 4.89,
+     "events": 1.0
+    }
+   },
+   "fam_ach": {
+    "embed": 0.016900272805755397,
+    "attnres": 12.39540737663495,
+    "kda_proj": 137.92617557216337,
+    "kda_core": 14.447068802686578,
+    "mla_proj": 28.245355843031803,
+    "dsa_attn": 7.847176685179921,
+    "indexer": 16.747191709902896,
+    "router": 2.683087823987571,
+    "latent": 21.300444294372703,
+    "experts": 84.75419409781017,
+    "shared": 54.98376028235134,
+    "dense_mlp": 3.2870726255753517,
+    "lm_head": 0.16905252532078738,
+    "drafter": 0.6093085150817684,
+    "launch": 0.0015409030772801113
+   },
+   "fam_sol": {
+    "embed": 0.010677899636363637,
+    "attnres": 7.831643751601173,
+    "kda_proj": 125.56981935681164,
+    "kda_core": 14.447068802686578,
+    "mla_proj": 24.74525092949849,
+    "dsa_attn": 5.958972358489887,
+    "indexer": 15.916820915792648,
+    "router": 2.4510125020824747,
+    "latent": 19.44384171913193,
+    "experts": 55.34469187205809,
+    "shared": 50.20963937458936,
+    "dense_mlp": 3.0016632234808855,
+    "lm_head": 0.10681045917995201,
+    "drafter": 0.5414284380166908,
+    "launch": 0.0
+   }
+  },
+  "nvfp4_modelopt|F16384": {
+   "ckpt": "nvfp4_modelopt",
+   "F": 16384,
+   "L": 78356.2831992676,
+   "t_sol_ms": 438.7655893747613,
+   "t_ach_ms": 628.2088892532992,
+   "t_sol_ms_93": 376.04228351975394,
+   "t_ach_ms_93": 532.8347494635915,
+   "ops": {
+    "G.embed": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 21.35579927272727,
+     "t_ach_us": 33.80054561151079,
+     "t_ach_us_93": 33.80054561151079,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "G.attnres_init": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 0.0,
+     "t_ach_us": 0.0,
+     "t_ach_us_93": 0.0,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "L.attnres_pre": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 7334.936203636364,
+     "t_ach_us": 11609.251545323741,
+     "t_ach_us_93": 11609.251545323741,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "L.attnres_post": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 8327.842350545452,
+     "t_ach_us": 13180.757677122303,
+     "t_ach_us_93": 13180.757677122303,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "KDA.in_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 45727.2283103232,
+     "t_ach_us": 73415.27481015192,
+     "t_ach_us_93": 73415.27481015192,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "KDA.f_b_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 1285.8878138181817,
+     "t_ach_us": 2035.2181225899278,
+     "t_ach_us_93": 2035.2181225899278,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.conv": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 3801.4063142163272,
+     "t_ach_us": 3801.4063142163272,
+     "t_ach_us_93": 3801.4063142163272,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.gate_beta_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 1270.4352699420886,
+     "t_ach_us": 1270.4352699420886,
+     "t_ach_us_93": 1270.4352699420886,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.core_prefill": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 11488.769531250002,
+     "t_ach_us": 11488.769531250002,
+     "t_ach_us_93": 11488.769531250002,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.o_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 844.7569587147394,
+     "t_ach_us": 844.7569587147394,
+     "t_ach_us_93": 844.7569587147394,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.o_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 11379.9453474816,
+     "t_ach_us": 18270.554456965874,
+     "t_ach_us_93": 18270.554456965874,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DSA.qkv_a_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 3201.898119168,
+     "t_ach_us": 3508.9294456635616,
+     "t_ach_us_93": 3508.9294456635616,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.prologue": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 164.79883636363635,
+     "t_ach_us": 260.832690647482,
+     "t_ach_us_93": 260.832690647482,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.qb_wq_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 6803.228196864,
+     "t_ach_us": 7455.592544508492,
+     "t_ach_us_93": 7455.592544508492,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.g_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 17317.308137472,
+     "t_ach_us": 18977.871931476166,
+     "t_ach_us_93": 18977.871931476166,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.idx_q_quant": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 48.97141789650663,
+     "t_ach_us": 48.97141789650663,
+     "t_ach_us_93": 48.97141789650663,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.idx_score": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 28934.755836372133,
+     "t_ach_us": 28934.755836372133,
+     "t_ach_us_93": 28934.755836372133,
+     "bound_ach": "simt",
+     "dtype": "fp4"
+    },
+    "DSA.topk": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 2849.914577316655,
+     "t_ach_us": 4510.6561655371515,
+     "t_ach_us_93": 4510.6561655371515,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.w_uk": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 2429.6459170909093,
+     "t_ach_us": 3845.48274647482,
+     "t_ach_us_93": 3845.48274647482,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.sparse_mla": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 11753.140295161591,
+     "t_ach_us": 15433.51183942459,
+     "t_ach_us_93": 15433.51183942459,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DSA.w_uv": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 2210.0169076363636,
+     "t_ach_us": 3497.868486906475,
+     "t_ach_us_93": 3497.868486906475,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.gate_mul": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 183.64281711189986,
+     "t_ach_us": 183.64281711189986,
+     "t_ach_us_93": 183.64281711189986,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.o_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 17317.308137472,
+     "t_ach_us": 18977.871931476166,
+     "t_ach_us_93": 18977.871931476166,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.router": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 4840.428142592,
+     "t_ach_us": 5304.578786402192,
+     "t_ach_us_93": 5304.578786402192,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.topk": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 61.59686157294974,
+     "t_ach_us": 61.59686157294974,
+     "t_ach_us_93": 61.59686157294974,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_down": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 19361.712570368,
+     "t_ach_us": 21218.31514560877,
+     "t_ach_us_93": 21218.31514560877,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.dispatch": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 2701.131776,
+     "t_ach_us": 3475.1402966081864,
+     "t_ach_us_93": 3475.1402966081864,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.fc1": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 30346.5209266176,
+     "t_ach_us": 50337.830920929664,
+     "t_ach_us_93": 50337.830920929664,
+     "bound_ach": "compute",
+     "dtype": "fp4"
+    },
+    "MOE.act": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 6758.055669717915,
+     "t_ach_us": 6758.055669717915,
+     "t_ach_us_93": 6758.055669717915,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.fc2": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 15173.2604633088,
+     "t_ach_us": 25168.915460464832,
+     "t_ach_us_93": 25168.915460464832,
+     "bound_ach": "compute",
+     "dtype": "fp4"
+    },
+    "MOE.combine": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 8348.952762181818,
+     "t_ach_us": 10741.342734970758,
+     "t_ach_us_93": 10741.342734970758,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.latent_norm": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 164.258297527866,
+     "t_ach_us": 164.258297527866,
+     "t_ach_us_93": 164.258297527866,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_up": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 19361.712570368,
+     "t_ach_us": 21218.31514560877,
+     "t_ach_us_93": 21218.31514560877,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.shared_gate_up": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 15173.2604633088,
+     "t_ach_us": 24360.739275954496,
+     "t_ach_us_93": 24360.739275954496,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "MOE.shared_act": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 844.7569587147394,
+     "t_ach_us": 844.7569587147394,
+     "t_ach_us_93": 844.7569587147394,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.shared_down": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 7586.6302316544,
+     "t_ach_us": 12180.369637977248,
+     "t_ach_us_93": 12180.369637977248,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DENSE.gate_up": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 3968.5497815039994,
+     "t_ach_us": 4349.095650963288,
+     "t_ach_us_93": 4349.095650963288,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DENSE.act": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 50.50177470577246,
+     "t_ach_us": 50.50177470577246,
+     "t_ach_us_93": 50.50177470577246,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DENSE.down": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 1984.2748907519997,
+     "t_ach_us": 2174.547825481644,
+     "t_ach_us_93": 2174.547825481644,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "F.attnres_final": {
+     "fam": "attnres",
+     "count": 1.0,
+     "t_sol_us": 0.022828293255131964,
+     "t_ach_us": 0.03613111162682757,
+     "t_ach_us_93": 0.03613111162682757,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.norm": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 0.0006544781075794737,
+     "t_ach_us": 0.00103136690647482,
+     "t_ach_us_93": 0.00103136690647482,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.lm_head": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 106.85551326899494,
+     "t_ach_us": 169.12383395092726,
+     "t_ach_us_93": 169.12383395092726,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DS.aux_capture": {
+     "fam": "drafter",
+     "count": 5.0,
+     "t_sol_us": 60.11351187416689,
+     "t_ach_us": 95.14368785839365,
+     "t_ach_us_93": 95.14368785839365,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DS.fc": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 789.9716973757185,
+     "t_ach_us": 865.7224080829792,
+     "t_ach_us_93": 865.7224080829792,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.hidden_norm": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 1.340371164322762,
+     "t_ach_us": 1.340371164322762,
+     "t_ach_us_93": 1.340371164322762,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DS.ctx_kv_proj": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 225.70619925020526,
+     "t_ach_us": 247.34925945227977,
+     "t_ach_us_93": 247.34925945227977,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.ctx_kv_insert": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 5.725096368968275,
+     "t_ach_us": 9.061303605561298,
+     "t_ach_us_93": 9.061303605561298,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    }
+   },
+   "comm": {
+    "COMM.P11.moe": {
+     "prim": "P11 EP-dispatch",
+     "layer": "moe",
+     "t_sol_us": 25849.350400000007,
+     "t_ach_us": 43618.76689308176,
+     "events": 92.0
+    },
+    "COMM.P12.moe": {
+     "prim": "P12 EP-combine",
+     "layer": "moe",
+     "t_sol_us": 90300.84586666667,
+     "t_ach_us": 153202.88080503145,
+     "events": 92.0
+    },
+    "COMM.P19.step": {
+     "prim": "P19 DP sync",
+     "layer": "step",
+     "t_sol_us": 2.86,
+     "t_ach_us": 4.89,
+     "events": 1.0
+    }
+   },
+   "fam_ach": {
+    "embed": 0.033800545611510795,
+    "attnres": 24.79004535355767,
+    "kda_proj": 93.72104738970772,
+    "kda_core": 17.405368074123157,
+    "mla_proj": 56.44725990361757,
+    "dsa_attn": 15.694344530072073,
+    "indexer": 33.49438341980579,
+    "router": 5.366175647975142,
+    "latent": 42.600888588745406,
+    "experts": 96.48128508269136,
+    "shared": 37.38586587264648,
+    "dense_mlp": 6.5741452511507035,
+    "lm_head": 0.16912486531783374,
+    "drafter": 1.2186170301635368,
+    "launch": 0.0015238688883731724
+   },
+   "fam_sol": {
+    "embed": 0.021355799272727273,
+    "attnres": 15.662801382475074,
+    "kda_proj": 58.39306147162298,
+    "kda_core": 17.405368074123157,
+    "mla_proj": 49.46304823281517,
+    "dsa_attn": 11.917939131525229,
+    "indexer": 31.833641831585297,
+    "router": 4.902025004164949,
+    "latent": 38.88768343826386,
+    "experts": 63.32792159782613,
+    "shared": 23.60464765367794,
+    "dense_mlp": 6.003326446961771,
+    "lm_head": 0.1068561677471025,
+    "drafter": 1.0828568760333817,
+    "launch": 0.0
+   }
+  },
+  "nvfp4_modelopt|F8192": {
+   "ckpt": "nvfp4_modelopt",
+   "F": 8192,
+   "L": 78356.2831992676,
+   "t_sol_ms": 225.59557756794842,
+   "t_ach_ms": 320.42863123831773,
+   "t_sol_ms_93": 193.9708046404445,
+   "t_ach_ms_93": 272.43371097876405,
+   "ops": {
+    "G.embed": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 10.677899636363636,
+     "t_ach_us": 16.900272805755396,
+     "t_ach_us_93": 16.900272805755396,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "G.attnres_init": {
+     "fam": "embed",
+     "count": 1.0,
+     "t_sol_us": 0.0,
+     "t_ach_us": 0.0,
+     "t_ach_us_93": 0.0,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "L.attnres_pre": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 3667.5893061818183,
+     "t_ach_us": 5804.817606906475,
+     "t_ach_us_93": 5804.817606906475,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "L.attnres_post": {
+     "fam": "attnres",
+     "count": 93.0,
+     "t_sol_us": 4164.042379636363,
+     "t_ach_us": 6590.570672805754,
+     "t_ach_us_93": 6590.570672805754,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "KDA.in_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 22863.6141551616,
+     "t_ach_us": 36707.63740507596,
+     "t_ach_us_93": 36707.63740507596,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "KDA.f_b_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 647.8769803636364,
+     "t_ach_us": 1025.4168034532374,
+     "t_ach_us_93": 1025.4168034532374,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.conv": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 1900.7031571081636,
+     "t_ach_us": 1900.7031571081636,
+     "t_ach_us_93": 1900.7031571081636,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.gate_beta_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 635.2176349710443,
+     "t_ach_us": 635.2176349710443,
+     "t_ach_us_93": 635.2176349710443,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.core_prefill": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 11488.769531250002,
+     "t_ach_us": 11488.769531250002,
+     "t_ach_us_93": 11488.769531250002,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "KDA.o_norm": {
+     "fam": "kda_core",
+     "count": 69.0,
+     "t_sol_us": 422.3784793573697,
+     "t_ach_us": 422.3784793573697,
+     "t_ach_us_93": 422.3784793573697,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "KDA.o_proj": {
+     "fam": "kda_proj",
+     "count": 69.0,
+     "t_sol_us": 5689.9726737408,
+     "t_ach_us": 9135.277228482937,
+     "t_ach_us_93": 9135.277228482937,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DSA.qkv_a_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 1600.949059584,
+     "t_ach_us": 1754.4647228317808,
+     "t_ach_us_93": 1754.4647228317808,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.prologue": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 82.40221090909093,
+     "t_ach_us": 130.4207654676259,
+     "t_ach_us_93": 130.4207654676259,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.qb_wq_packed": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 3401.614098432,
+     "t_ach_us": 3727.796272254246,
+     "t_ach_us_93": 3727.796272254246,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.g_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 8658.654068736,
+     "t_ach_us": 9488.935965738083,
+     "t_ach_us_93": 9488.935965738083,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DSA.idx_q_quant": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 24.485708948253315,
+     "t_ach_us": 24.485708948253315,
+     "t_ach_us_93": 24.485708948253315,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.idx_score": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 14467.377918186066,
+     "t_ach_us": 14467.377918186066,
+     "t_ach_us_93": 14467.377918186066,
+     "bound_ach": "simt",
+     "dtype": "fp4"
+    },
+    "DSA.topk": {
+     "fam": "indexer",
+     "count": 24.0,
+     "t_sol_us": 1424.9572886583276,
+     "t_ach_us": 2255.3280827685758,
+     "t_ach_us_93": 2255.3280827685758,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DSA.w_uk": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 1221.686365090909,
+     "t_ach_us": 1933.604318848921,
+     "t_ach_us_93": 1933.604318848921,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.sparse_mla": {
+     "fam": "dsa_attn",
+     "count": 24.0,
+     "t_sol_us": 5876.5701475807955,
+     "t_ach_us": 7716.755919712295,
+     "t_ach_us_93": 7716.755919712295,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DSA.w_uv": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 1111.8718603636364,
+     "t_ach_us": 1759.7971890647482,
+     "t_ach_us_93": 1759.7971890647482,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DSA.gate_mul": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 91.82140855594993,
+     "t_ach_us": 91.82140855594993,
+     "t_ach_us_93": 91.82140855594993,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DSA.o_proj": {
+     "fam": "mla_proj",
+     "count": 24.0,
+     "t_sol_us": 8658.654068736,
+     "t_ach_us": 9488.935965738083,
+     "t_ach_us_93": 9488.935965738083,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.router": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 2420.214071296,
+     "t_ach_us": 2652.289393201096,
+     "t_ach_us_93": 2652.289393201096,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.topk": {
+     "fam": "router",
+     "count": 92.0,
+     "t_sol_us": 30.79843078647487,
+     "t_ach_us": 30.79843078647487,
+     "t_ach_us_93": 30.79843078647487,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_down": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 9680.856285184,
+     "t_ach_us": 10609.157572804384,
+     "t_ach_us_93": 10609.157572804384,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.dispatch": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 1350.565888,
+     "t_ach_us": 1737.5701483040932,
+     "t_ach_us_93": 1737.5701483040932,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.fc1": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 15173.2604633088,
+     "t_ach_us": 25168.915460464832,
+     "t_ach_us_93": 25168.915460464832,
+     "bound_ach": "compute",
+     "dtype": "fp4"
+    },
+    "MOE.act": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 3379.0278348589577,
+     "t_ach_us": 3379.0278348589577,
+     "t_ach_us_93": 3379.0278348589577,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.fc2": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 7586.6302316544,
+     "t_ach_us": 12584.457730232416,
+     "t_ach_us_93": 12584.457730232416,
+     "bound_ach": "compute",
+     "dtype": "fp4"
+    },
+    "MOE.combine": {
+     "fam": "experts",
+     "count": 92.0,
+     "t_sol_us": 4174.476381090909,
+     "t_ach_us": 5370.671367485379,
+     "t_ach_us_93": 5370.671367485379,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "MOE.latent_norm": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 82.129148763933,
+     "t_ach_us": 82.129148763933,
+     "t_ach_us_93": 82.129148763933,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.latent_up": {
+     "fam": "latent",
+     "count": 92.0,
+     "t_sol_us": 9680.856285184,
+     "t_ach_us": 10609.157572804384,
+     "t_ach_us_93": 10609.157572804384,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "MOE.shared_gate_up": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 7586.6302316544,
+     "t_ach_us": 12180.369637977248,
+     "t_ach_us_93": 12180.369637977248,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "MOE.shared_act": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 422.3784793573697,
+     "t_ach_us": 422.3784793573697,
+     "t_ach_us_93": 422.3784793573697,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "MOE.shared_down": {
+     "fam": "shared",
+     "count": 92.0,
+     "t_sol_us": 3793.3151158272,
+     "t_ach_us": 6090.184818988624,
+     "t_ach_us_93": 6090.184818988624,
+     "bound_ach": "compute",
+     "dtype": "fp8"
+    },
+    "DENSE.gate_up": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 1984.2748907519997,
+     "t_ach_us": 2174.547825481644,
+     "t_ach_us_93": 2174.547825481644,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DENSE.act": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 25.25088735288623,
+     "t_ach_us": 25.25088735288623,
+     "t_ach_us_93": 25.25088735288623,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DENSE.down": {
+     "fam": "dense_mlp",
+     "count": 1.0,
+     "t_sol_us": 992.1374453759998,
+     "t_ach_us": 1087.273912740822,
+     "t_ach_us_93": 1087.273912740822,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "F.attnres_final": {
+     "fam": "attnres",
+     "count": 1.0,
+     "t_sol_us": 0.012065782991202348,
+     "t_ach_us": 0.019096922719888606,
+     "t_ach_us_93": 0.019096922719888606,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.norm": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 0.0006516363636363637,
+     "t_ach_us": 0.00103136690647482,
+     "t_ach_us_93": 0.00103136690647482,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "F.lm_head": {
+     "fam": "lm_head",
+     "count": 1.0,
+     "t_sol_us": 106.80980754358838,
+     "t_ach_us": 169.0514939538809,
+     "t_ach_us_93": 169.0514939538809,
+     "bound_ach": "memory",
+     "dtype": "bf16"
+    },
+    "DS.aux_capture": {
+     "fam": "drafter",
+     "count": 5.0,
+     "t_sol_us": 30.056755937083445,
+     "t_ach_us": 47.571843929196824,
+     "t_ach_us_93": 47.571843929196824,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    },
+    "DS.fc": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 394.98584868785923,
+     "t_ach_us": 432.8612040414896,
+     "t_ach_us_93": 432.8612040414896,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.hidden_norm": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 0.670185582161381,
+     "t_ach_us": 0.670185582161381,
+     "t_ach_us_93": 0.670185582161381,
+     "bound_ach": "compute",
+     "dtype": "simt"
+    },
+    "DS.ctx_kv_proj": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 112.85309962510263,
+     "t_ach_us": 123.67462972613988,
+     "t_ach_us_93": 123.67462972613988,
+     "bound_ach": "compute",
+     "dtype": "bf16"
+    },
+    "DS.ctx_kv_insert": {
+     "fam": "drafter",
+     "count": 1.0,
+     "t_sol_us": 2.8625481844841376,
+     "t_ach_us": 4.530651802780649,
+     "t_ach_us_93": 4.530651802780649,
+     "bound_ach": "memory",
+     "dtype": "simt"
+    }
+   },
+   "comm": {
+    "COMM.P11.moe": {
+     "prim": "P11 EP-dispatch",
+     "layer": "moe",
+     "t_sol_us": 13187.7952,
+     "t_ach_us": 22118.012779874214,
+     "events": 92.0
+    },
+    "COMM.P12.moe": {
+     "prim": "P12 EP-combine",
+     "layer": "moe",
+     "t_sol_us": 45281.98293333334,
+     "t_ach_us": 76755.75506918239,
+     "events": 92.0
+    },
+    "COMM.P19.step": {
+     "prim": "P19 DP sync",
+     "layer": "step",
+     "t_sol_us": 2.86,
+     "t_ach_us": 4.89,
+     "events": 1.0
+    }
+   },
+   "fam_ach": {
+    "embed": 0.016900272805755397,
+    "attnres": 12.39540737663495,
+    "kda_proj": 46.86833143701213,
+    "kda_core": 14.447068802686578,
+    "mla_proj": 28.245355843031803,
+    "dsa_attn": 7.847176685179921,
+    "indexer": 16.747191709902896,
+    "router": 2.683087823987571,
+    "latent": 21.300444294372703,
+    "experts": 48.24064254134568,
+    "shared": 18.69293293632324,
+    "dense_mlp": 3.2870726255753517,
+    "lm_head": 0.16905252532078738,
+    "drafter": 0.6093085150817684,
+    "launch": 0.0015409030772801113
+   },
+   "fam_sol": {
+    "embed": 0.010677899636363637,
+    "attnres": 7.831643751601173,
+    "kda_proj": 29.201463809266038,
+    "kda_core": 14.447068802686578,
+    "mla_proj": 24.74525092949849,
+    "dsa_attn": 5.958972358489887,
+    "indexer": 15.916820915792648,
+    "router": 2.4510125020824747,
+    "latent": 19.44384171913193,
+    "experts": 31.663960798913067,
+    "shared": 11.80232382683897,
+    "dense_mlp": 3.0016632234808855,
+    "lm_head": 0.10681045917995201,
+    "drafter": 0.5414284380166908,
+    "launch": 0.0
+   }
+  }
+ },
+ "_view": "L93"
+}

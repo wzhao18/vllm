@@ -3,7 +3,7 @@
  "title": "NVFP4 checkpoint enablement",
  "side": "both",
  "owner": "EN agent (workflow)",
- "state": "landed-ready",
+ "state": "landed",
  "updated": "2026-11-18T16:55-08:00",
  "shape": "D3-32 (EP32, 28 experts/GPU, 1-node slice + 8-node d8) and P3-16 (DEP16): NVFP4 load/run + numerics; no kernel timing owned",
  "basis": "MEASURED 1-node P3-16 DEP4 slice, L24 NVFP4 view, dummy weights (runs/EN/step_p/nv-smoke2); unit tests in image",
@@ -119,6 +119,11 @@
    "t": "16:50",
    "what": "GPU test test_k31_nvfp4_mxfp8_linear_gpu.py: real stock shared-expert linears with the export's ModelOpt MXFP8 config, checkpoint-format tensors through the weight loaders",
    "result": "2 passed in 18.7 s (runs/EN/m1.log): sdec storage == checkpoint bytes (weight + unswizzled scales bitwise); stock apply and sdec Mxfp8Projection within one BF16 rounding of FP32 dequant at R 1..128. Committed e49d1d3a87"
+  },
+  {
+   "t": "20:01",
+   "what": "INFRA: merged e49d1d3a87 into wzhao/k31ws-int @ 9d3cb2b0c2",
+   "result": "int tests (1-GPU 229 + NVFP4 native MegaMoE 5 + MXFP8 linear 2) pass; pushed"
   }
  ],
  "next": "INFRA: merge wzhao/k31ws-en @ e49d1d3a87 (2 GPU test files, no code changes). EN remaining work is gated on the real checkpoint: (1) user approval to download nvidia/Kimi-K3.1-Pro-NVFP4 to Lustre (~1.6 TB); (2) then real-weight load on the L24 slice, read the FC2-input RMS per layer (accuracy risk), real-rejection gsm8k LOW/HIGH; (3) on the first d8 NVFP4 run (step_multi.sh -q nvfp4 d8, overlay with D-MOE EP32 records) check Available KV cache memory vs the ~150 GiB projection. Owners: run test_megamoe_rubin_nvfp4_native_gpu.py (D-MOE/P-MOE) and test_k31_nvfp4_mxfp8_linear_gpu.py (D-GEMM/P-GEMM) on every kernel change: wsgpu.sh -g 1 -o <ov> -- bash runs/EN/en_gpu_test2.sh -s <test>.",

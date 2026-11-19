@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-FUSE workflow agent",
  "state": "landed-ready",
- "updated": "2026-11-18T16:45-08:00",
+ "updated": "2026-11-18T17:15-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.98,
  "current_ms": 0.79,
@@ -14,11 +14,10 @@
  "basis": "MEASURED in-step NVFP4 baseline (INFRA 18:52 EST, measured/20261118-1900-nvfp4-decode.json); achievable = nvfp4_modelopt at the same slice",
  "gap_analysis": "SP boundaries now fused (2 kernels/layer instead of 4): in-step r24 AttnRes+AG+RS = 1.14x model (chain bench 1.07x); the remaining excess is the Lamport collectives themselves (bare AG+RS 16.1 us/layer at n=96 vs model 13.7) -- the RS push (4.1 MB at ~1.1 TB/s per GPU) is serial after the o-proj GEMM; moving it into the GEMM epilogue (D-GEMM) would hide it. Router top-k / prepare move into the FI MegaMoE front with D-MOE's kimi_k3_mega_moe switch; SiTU goes beside MegaMoE on the side stream (and fused with the MXFP8 quant in D-GEMM's B4). Remaining D-FUSE items: latent RMSNorm (proposed into FI's combine-reduce, D-MOE), drafter tail (needs a drafter-on profile; INFRA's drafter emulation currently fails).",
  "inefficiencies": [
-  "AttnRes pre/post as standalone stock kernels (one row per CTA; 96 of the SMs busy at n=96) (measured gap512)",
-  "SP all-gather and reduce-scatter as separate kernels from the AttnRes they feed / follow (2 extra boundaries per layer)",
-  "R>64 o-proj partial pushed by a separate pass inside the RS kernel (re-reads the partial)",
-  "SiTU-and-mul, latent RMSNorm, router grouped top-k, MegaMoE prepare unfused (92 layers x 4 kernels)",
-  "Drafter tail: NCCL ring AllGather (75 us) for the final aux gather, unfused ArNorm/GQA window kernels (hypothesis pending profile)"
+  "SP boundary collectives at ~1.10-1.17x model after fusion: RS push (4.1 MB/GPU at n=96) runs serially after the o-proj GEMM; a GEMM-epilogue push (D-GEMM) would overlap it (measured: next GEMM PDL-launches ~9 us before each fused kernel ends)",
+  "Latent RMSNorm standalone (2.9 us x 92 calls; proposed into the FI MegaMoE combine-reduce, D-MOE)",
+  "Router top-k / prepare / SiTU: moved to D-MOE (FI MegaMoE front) / D-GEMM (side-stream MXFP8 shared expert with fused act quant) -- not D-FUSE items any more",
+  "Slice drafter is the preview MLA (full-context attention 2.2 ms/step); release GQA drafter tail unmeasured on Rhea"
  ],
  "rubin_features": [
   "thread-block clusters + DSMEM reductions (cluster AttnRes)",
@@ -84,10 +83,15 @@
    "t": "19:52",
    "what": "INFRA: 6758683397 not merged: test_specialized_decode_sp_coverage.py fails (meta device in SpFinalGather/sp_comm) - see findings/INFRA.md",
    "result": "NVFP4 decode with D-FUSE (+EN, D-TOPK): 6.53/8.53/10.29 ms vs int 6.67/8.86/10.78"
+  },
+  {
+   "t": "17:05",
+   "what": "drafter-on NVFP4 A/B r24 (preview MLA drafter in the L24 slice)",
+   "result": "step 10847 -> 10635 us (-2.0%); TAIL 4.04 ms dominated by the preview drafter full-context MLA attention (2.23 ms) -- not the release GQA window drafter; drafter context AG still NCCL ring 190 us/step (model ~6 us). runs/D-FUSE/step_d/nvd-{int,fused14}-r384"
   }
  ],
- "next": "drafter-on NVFP4 A/B at r24 queued (nvd-fused14-r384 vs nvd-int-r384) for the tail breakdown; then drafter-tail fusion; latent RMSNorm proposal pending D-MOE",
- "blockers": "",
+ "next": "HANDOFF: (1) INFRA merges wzhao/k31ws-d-fuse @ 6758683397 (landed-ready; merge-clean with k31ws-int b31121cf56). (2) release GQA drafter tail: needs a slice with the release GQA DSpark drafter (preview MLA drafter in the L24 slice spends 2.2 ms in full-context attention and an NCCL context AG that the release drafter does not have); then profile TAIL with step_d.sh and fuse ArNorm/GQA-window/GEMM tail per kernel list. (3) with D-GEMM: o-proj GEMM epilogue push to owner slots (positive_zero32 words into recv[parity][rank][row][col]) then build SpBoundary with push_rows[R]=False (SpReduceAttnRes push=False) for those R: hides the 4.1 MB/GPU RS push at r24 (~3 us/layer). (4) D-MOE: latent RMSNorm into the FI combine-reduce epilogue.",
+ "blockers": "Drafter tail needs a release-GQA-drafter slice (INFRA); the L24 slice uses the preview MLA drafter.",
  "branch": "wzhao/k31ws-d-fuse @ 6758683397 (merged wzhao/k31ws-int b31121cf56)",
  "evidence": [
   "rhea runs/D-FUSE/run5/chain.json (TP4 chain bench)",

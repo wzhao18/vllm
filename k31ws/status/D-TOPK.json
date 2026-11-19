@@ -3,7 +3,7 @@
  "title": "Decode: DSA exact top-k + DCP merge",
  "side": "decode",
  "owner": "D-TOPK agent",
- "state": "landed-ready",
+ "state": "landed",
  "updated": "2026-11-18T16:40-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.636,
@@ -100,6 +100,11 @@
    "t": "16:55",
    "what": "coordinator: units aligned to the slice (6 DSA layers, busy)",
    "result": "in-step r24 106 -> 49 us/layer = 0.636 -> 0.294 ms on the NVFP4 slice"
+  },
+  {
+   "t": "20:01",
+   "what": "INFRA: merged b162ec54a6 into wzhao/k31ws-int @ 9d3cb2b0c2",
+   "result": "int tests pass (dcp_exchange_policy 32, sdec DSA block vs stock 4); NVFP4 decode slice r8/r16/r24 6.67/8.86/10.78 -> 6.59/8.66/10.47 ms (with EN, test-only); pushed"
   }
  ],
  "next": "landed-ready for INFRA merge (wzhao/k31ws-d-topk @ b162ec54a6). Next optimisation round, in order of measured size: (1) per-row chain after the candidate pass (~15 us: fine window/band 3.5, resolve 5, WRITE 3.5): ~35 __syncthreads with 16 warps; merge resolve steps into ~3 synced steps (every thread derives maxlo/minhi/tiers redundantly from rx; one scan for tau), parallelise band pick, WRITE with fewer barriers; (2) candidate pass 8.7 us in-kernel vs 2.9 us for the identical loop in benchmarks/kernels/probe_k31_cand_loop.py (not candidate count, not spills: 62 regs, 0 local) - diff SASS (cuobjdump -sass on the .so in $K31_DCPX_BUILD_DIR) / try the loop as a __noinline__ device function; (3) r1/r8 cluster split of the key pass (16/128 rows use 16/128 of 212 SMs); (4) NVLink round 2.8-6 us includes rank skew: consider issuing the round-1 send before the band pass (two messages). How to run: stage overlay (bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-topk d-topk-<sha>-<n>), start runs/D-TOPK/runner.sh via wsgpu.sh -g 4 (IDLE/MAXMIN env), drop job scripts into runs/D-TOPK/q/ (templates: session scratchpad dtopk_j21.sh bench, dtopk_j24.sh step A/B, test via torchrun tests/models/kimi_k3/test_k31_dcp_exchange.py).",

@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-MLA workflow agent (resumed 16:00)",
  "state": "measuring",
- "updated": "2026-11-18T17:32-08:00",
+ "updated": "2026-11-18T18:35-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "step_ms": 218.7,
  "baseline_ms": 12.24,
@@ -122,11 +122,16 @@
    "t": "17:30",
    "what": "run13-15: SOL kernel correct (tests pass after a 1/l race fix); F16K 2.85 ms; knob decomposition",
    "result": "tensor-only 1.09 ms, tensor+gather 1.58 ms (shared-memory bandwidth shared by SS operand reads and gather writes), epilogue staging stores 15-17K clk/token and softmax 2.9K clk/tile starved by the tensor core's smem reads. Next: PV via the Rubin B collector (P^T fetched once per K step), packed epilogue stores (run16)."
+  },
+  {
+   "t": "18:30",
+   "what": "run16-18: B collector in PV (PV-only 0.64->0.57 ms); hybrid kernel sparse_mla_h2 (QK heads-on-M with Q in TMEM, row-per-thread softmax, PV keys-on-M + B collector); 2-WG softmax",
+   "result": "h2 correct (tests pass); F16K 3.15 -> 2.71 ms (stock 2.08); softmax 1.3K clk per 64-key subtile; now gather-paced (72 KB stage lands 7.2K clk after issue). run19: Q load on its own warp (gathers no longer wait for the token's last QK), slot loads hoisted above the stage wait, loader stamps."
   }
  ],
- "next": "run13: SOL kernel tests + F16K bench + phase stamps; then attack the bound stage until ~1.18 ms/layer (corrected target), dispatch on, step_p A/B.",
+ "next": "run19 result -> if gather-paced: 4th KV stage by moving Q latent staging out of smem (registers->TMEM) and dropping the BF16 staging; then dispatch (DISPATCH) once < 2.08 ms, step_p A/B.",
  "blockers": "ncu/nsys not in the image (phase timing must come from in-kernel clock64 stamps); pool contended (1-GPU runs waited 30-60 min)",
- "branch": "wzhao/k31ws-p-mla @ db27679958 (pushed to wzhao18)",
+ "branch": "wzhao/k31ws-p-mla @ ff70ac6a58 (+ uncommitted h2 work)",
  "evidence": [
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1 (stock chain per kernel)",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run2, run3 (tcgen05 operand fetch, SMEM write contention, gather4 1-4 warps)",

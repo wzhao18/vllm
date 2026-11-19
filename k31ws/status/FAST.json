@@ -3,10 +3,10 @@
  "title": "Iteration time: GPU pool scheduling, step-bench startup, JIT caches",
  "side": "infra",
  "owner": "FAST agent (workflow)",
- "state": "implementing",
- "updated": "2026-11-18T16:42-08:00",
+ "state": "measuring",
+ "updated": "2026-11-18T17:12-08:00",
  "shape": "Wall time of one warm-cache D3-32 1-node step bench (r8/r16/r24, prof=1, base-4fbaa15), container start to exit, ms; plus pool GPU-min lost to failed runs",
- "basis": "MEASURED: runs/FAST/step_d/tri-1 (261 s, cold flashkda/dcpx), tri-2 (1076 s: 965 s model init stalled on flashkda rebuild lock); pool/usage.log",
+ "basis": "MEASURED: warm D3-32 step bench wall (container start to exit), base-4fbaa15 r8/r16/r24 prof: baseline 247 s (findings 14:00), tri-1 261 s; current runs/FAST/step_d/cut-2 85 s (same-node A/B vs jw-2: medians within 0.05%)",
  "gap_analysis": "A warm D3-32 step bench takes 247 s wall for ~40 s of cases: container+imports 8 s, config 11 s, dist init 10 s, model+dummy load 23 s, KV profile run 42 s, KV prepare + CuTe compiles 21 s, JIT kernel warmup 10 s, prefill-glue + tokenspeed MLA Triton compiles 39 s, router/CuTe warmup 5 s, serving-shape warmup 18 s, cases 28 s (incl. late Triton JITs), teardown 13 s. Root cause of most JIT time: the container /tmp (TRITON_CACHE_DIR, CUDA_CACHE_PATH) is a fresh tmpfs per srun step, so every run recompiled every Triton kernel; fixed (Lustre caches), effect being measured. Cold builds on new sources: flashkda_split 80-135 s, dcp_exchange 34 s (was rebuilt per overlay; now shared by digest). Kimi K3 CuTe cache misses 26-45 kernels/rank on a warm overlay (key includes real tensor addresses): ~27 s per start. NVFP4 slices: model init 235-291 s + MegaMoE runtime setup up to 154 s, not yet attributed. Queue: 80% of hold-GPU-minutes lock-busy but 32% of that in failed runs; holds are backfill jobs preempted 30-60 min after start (PreemptMode CANCEL), so the pool is 2-3 nodes for 14 agents and waits are 5-47 min for 4-GPU requests.",
  "inefficiencies": [
   "Digest-keyed torch-extension builds (flashkda 75 s, kda_conv, dcpx, dsac) embed absolute overlay source paths in build.ninja: every overlay rebuilds the shared digest dir; flashkda e9eff3bc rebuilt 23x back to back 15:25-15:53, runs queue on its lock up to 16 min (fix: fixed /k31ov mount, testing)",
@@ -20,11 +20,13 @@
  ],
  "rubin_features": [],
  "plan": [
-  "IN TEST fixed overlay mount /k31ov (wsgpu.sh, step_multi.sh, wsenv.sh, step_inner/step_rank --overlay WS_OVDIR): one build per digest across overlays",
-  "READY nq_step.py: enable_jit_warmup=False by default (--jit-warmup to keep) + os._exit after results; A/B vs tri-2 medians 7064.3/10169.6/12999.4 us",
-  "READY wsprep.py + wsgpu.sh -P: CPU preflight (shipped .py compile, overlay import, Kimi packages, vLLM arg parse) + extension prebuild on a hold node's CPUs while waiting; step_d/p/multi use -P strict:<cfg>",
-  "NEXT install atomically (new file + mv), A/B step bench, measure failed-GPU-min after rollout",
-  "LOW CuTe address-keyed misses: tri-2 ranks 1-2 compile 4-6 kernels (2-3 s); report to owners only"
+  "DONE fixed /k31ov overlay mount (one build per digest)",
+  "DONE startup cuts (verified same-node A/B, decode)",
+  "DONE wsgpu -P preflight + prebuild; step_d/p/multi use it",
+  "DONE prefill A/B (within spread)",
+  "NEXT failed-GPU-min and model-init time after the old waiters drain (usage.log + rank0 'Initializing model took')",
+  "NEXT D-ATTN: DcpValue/SplitPartials CuTe address-keyed misses (~13 s/start)",
+  "NEXT attribute NVFP4 model init (MegaMoE runtime setup) on the prefill slice"
  ],
  "work": [
   {
@@ -61,9 +63,19 @@
    "t": "16:37",
    "what": "cut-1: step_d base-4fbaa15 r8/r16/r24 prof with enable_jit_warmup off + os._exit + -P strict preflight",
    "result": "medians 7059.8/10205.3/12995.6 us vs tri-1 7063.2/10166.8/12995.4 (-0.05/+0.38/0.00%); engine init 23.9 s vs 51-62 s; preflight (compile+import+arg parse) ok in 8.4 s on CPUs; model init 548 s = transition flashkda lock wait"
+  },
+  {
+   "t": "17:05",
+   "what": "same-node pair jw-2 (server warmups) vs cut-2 (cuts) on rhea0033; installed nq_step cuts + step_* -P strict",
+   "result": "medians 7025.2/10109.2/12905.0 vs 7028.6/10107.7/12910.3 us (+0.05/-0.01/+0.04%); engine init 53.4 -> 9.7 s; cut-2 wall 85 s (target 88 s)"
+  },
+  {
+   "t": "17:12",
+   "what": "prefill A/B NVFP4 step_p pjw-1 vs pcut-1 (same node)",
+   "result": "F16K 208459.8 vs 208998.8 us (+0.26%, spread 0.57-1.08%), F8K 107066.1 vs 107108.3 (+0.04%); engine init 52.5 -> 6.0 s"
   }
  ],
- "next": "same-node pair jw-2 (server warmups) vs cut-2 (cuts) on base-4fbaa15 to settle r16 +0.38%; then install nq_step cuts + step_* -P strict",
+ "next": "Read prefill A/B; then usage.log failed fraction + model-init distribution after 18:00",
  "blockers": "GPU queue: 2 running hold1 nodes for ~17 requests; FAST measurement waits like everyone else. Hecate login needs MFA.",
  "branch": "none (tools only, k31ws/tools on Rhea, mirrored locally)",
  "evidence": [
@@ -74,5 +86,5 @@
  "baseline_ms": 247000,
  "achievable_ms": 80000,
  "target_ms": 88000,
- "current_ms": 261000
+ "current_ms": 85000
 }

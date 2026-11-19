@@ -18,5 +18,7 @@ fi
 t tests/distributed/test_kimi_k3_sdec_sp_layers.py -k "test_sp_dsa_block_matches_stock_layer and not all_rows"
 # D-FUSE (6758683397): SP fused AttnRes / comm (TP4)
 [ -f tests/distributed/test_kimi_k3_sdec_sp_fused.py ] && t tests/distributed/test_kimi_k3_sdec_sp_fused.py
+# D-ATTN (72fdf53350): SP DSA local query vs stock
+[ -f tests/models/kimi_k3/test_specialized_decode_sp_local_query_gpu.py ] && t tests/models/kimi_k3/test_specialized_decode_sp_local_query_gpu.py
 echo "== int_tests4 rc=$rc"
 exit $rc

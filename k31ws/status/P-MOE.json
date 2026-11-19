@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-MOE agent (workflow)",
  "state": "landed-ready",
- "updated": "2026-11-18T17:15-08:00",
+ "updated": "2026-11-18T17:40-08:00",
  "shape": "NVFP4 1-node DEP4 slice (step_p.sh -q nvfp4; L24 view: 23 MoE layers; EP16 expert emulation 56/GPU), F16K at L78K, MegaMoE family busy ms per forward (in-step)",
  "baseline_ms": 74.01,
  "current_ms": 52.32,
@@ -30,11 +30,9 @@
   "packed f32x2 FMA + MUFU ex2/rcp in the SiTU epilogue"
  ],
  "plan": [
-  "SOL design (per 16K layer per GPU at EP16, NVFP4): bound = max(link, tensor) with full overlap, not the model's serial sum. Link: P11+P12 ach 0.47+1.67 ms (model rows); tensor fc1+fc2 at 21.1 PF ach 0.82 ms; SiTU 0.07 ms; so a fully overlapped kernel is link-bound at ~2.1-2.2 ms/layer vs model serial 3.19 ms (73.33/23). Minimum kernels: router(+PDL) -> one persistent dispatch/FC1/act/FC2/combine kernel per 8K sub-call -> top-k reduce absorbed (reduce_topk_in_kernel) = 2 launches per sub-call.",
-  "Compute side (measured all-local 963 us per 8K main kernel vs 410 us at 21.1 PF): epilogue-bound. Step 1 (r8 probe, running): SiTU MUFU sensitivity stock 6 MUFU/elt vs none vs tanh.approx (3) vs one-reciprocal form (3 ex2 + 1 rcp); if MUFU is a real term, land the 4-MUFU exact-class form (same ex2/rcp approximations, order differs).",
-  "Step 2: FC2 epilogue (BF16 token-back of 131K x 7168 values per 8K call per GPU) instruction count per element; probe with stores elided to size it; then widen per-thread TMEM loads / bulk-store path.",
-  "Link side: r7 real EP16 (queued, 8n hold) measures 16K vs 2x8K and shared-expert overlap caps 0/-16/-32 where the kernel is link-bound (the EP4 emulation cannot show it).",
-  "In-step router 0.9 ms/layer = cross-rank arrival skew: compare per-rank attention time in the NVFP4 slice profile."
+  "DONE (landed-ready 055b80ab3d): 2x8K sub-calls + S3 one-reciprocal SiTU; in-step NVFP4 MegaMoE 74.01 -> 52.32 ms (model ach 73.33, serial-sum model).",
+  "SOL design for the main kernel (measured: epilogue-bound 46% acc-empty waits, operand 23%; ~410 us tensor floor vs 1006 us per 8K launch at EP4): (a) FC1 epilogue: release the TMEM stage right after the last subtile's tcgen05.ld (compute/quant/store of that subtile after release); move the per-token scalar NVFP4 SF stores into the smem stage + one TMA store; (b) verify FC1-vs-FC2 attribution by adding an FC2-tile count to the probe; (c) operand side: weight reuse across token tiles (scheduler support for cluster N>1 A-multicast; today rejected) to cut ~9 GB/launch of weight L2->SM traffic.",
+  "r7 real EP16 (queued on the 8n pool): standalone 16K vs 2x8K + shared overlap caps; DEP16 93-layer NVFP4 step base vs sub-calls. When it runs, rebuild an overlay on the int head with S3 for the step if the queue allows."
  ],
  "work": [
   {
@@ -146,10 +144,15 @@
    "t": "16:55",
    "what": "coordinator: target switched to the model SOL (44.9 ms) at the slice",
    "result": "measured 52.3 ms is already 0.71x the nvfp4 achievable (73.3): the model MoE rows are pessimistic at this slice (perf-model fix pending); judge against SOL and the real EP16 4-node run"
+  },
+  {
+   "t": "17:35",
+   "what": "r13/r14 MMA-warp clock-stamp probes (S3 + %clock64; probe worktree /Users/weizha/k31ws-wt/p-moe-probe2, uncommitted)",
+   "result": "MMA warp: 46% waiting acc-empty (epilogue), 23% ab-full (operands), ~31% issue; acc waits attributed to FC1-held stages (tentative)"
   }
  ],
- "next": "INFRA: merge wzhao/k31ws-p-moe @ 055b80ab3d (sub-calls + S3; NVFP4 in-step verified, tests pass). Then: r13 clock-stamp result (acc-empty vs ab-full waits in the MMA warp) -> pick the main-kernel redesign lever; r7 real EP16 (queued 8n).",
- "blockers": "Rhea pool: no k31ws hold running yet (all pending), r1/r2 queued under wsgpu.",
+ "next": "HANDOFF. INFRA: merge wzhao/k31ws-p-moe @ 055b80ab3d (sub-calls + S3, NVFP4 in-step verified, VR tests pass; D-MOE re-vendor must carry S3 in block_scaled_swap_ab_fc12_epilogue.py + VENDOR.md manifest). Family is at target on the slice metric (52.32 vs target 80.66). Next agent: (1) r7 results when the 8n hold arrives: runs/P-MOE/r7/{bench.log,r7.jsonl,step-base/x.log,step-sub/x.log,done.txt} (r7 uses overlay p-moe-1e85ee4c-1 = sub-calls without S3; queued wsgpu -g 8n pid on login-rhea01, log runs/P-MOE/r7.wsgpu.log); (2) FC1 epilogue early-release + SF via smem (plan a) in the vendored epilogue as S4, probe with r13-style stamps (probe worktree /Users/weizha/k31ws-wt/p-moe-probe2; scripts runs/P-MOE/scripts/r13.sh,r14.sh; bench: torchrun --nproc_per_node 4 benchmarks/kernels/k31_vr/bench_megamoe_prefill_overlap.py --num-experts 224 --tokens 8192 --capacity 8192 --knobs <r10 KN> --grid-caps 0 --modes moe --routing random|local); (3) in-step A/B: bash tools/step_p.sh -n P-MOE -t <tag> -q nvfp4 <overlay> 1.",
+ "blockers": "Real EP16 needs the 8-node pool hold (r7 queued, wait up to 20 h).",
  "branch": "wzhao/k31ws-p-moe @ 055b80ab3d",
  "evidence": [
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MOE/{r1,r2,r3c,r4,r5,step_p/subcall-mx-prof}",

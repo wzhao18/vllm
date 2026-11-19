@@ -15,6 +15,6 @@ fi
 cd /tmp
 exec python3 $D/nq_step.py --init-file $OUT.rdv --capture-sizes "$NQ_CAP" --max-capture $NQ_MAXCAP \
   --full-capture-sizes "$NQ_FULLCAP" --measured-rows "$NQ_ROWS" --overlay "${WS_OVDIR:-$K/ov/$WS_OV}" \
-  --emulate-ep ${NQ_EMULATE_EP:-0} -- \
+  --emulate-ep ${NQ_EMULATE_EP:-0} ${NQ_JIT_WARMUP:+--jit-warmup} -- \
   "${NQ_ARGS[@]}" --shapes $OUT.shapes.json --kv-len-jitter 0 --routing ${NQ_ROUTING:-balanced} --seed 0 \
   --iters ${NQ_ITERS:-20} --samples ${NQ_SAMPLES:-5} --output-json $OUT.json "$@"

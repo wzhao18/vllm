@@ -3,23 +3,22 @@
  "title": "Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)",
  "side": "decode",
  "owner": "D-ATTN workflow agent",
- "state": "implementing",
- "updated": "2026-11-18T19:40-08:00",
+ "state": "landed-ready",
+ "updated": "2026-11-18T20:45-08:00",
  "shape": "D3-32 r24 1-node DP-rank slice, NVFP4 ckpt (k31-nvfp4-view-L24: 6 DSA layers), 384 verify rows/rank, u132k, k=3; family = DSA q path + sparse MLA + DCP value + prologue + indexer logits, in-step exposed",
  "baseline_ms": 0.909,
- "current_ms": 0.909,
+ "current_ms": 0.621,
  "achievable_ms": 0.355,
  "target_ms": 0.39,
  "step_ms": 10.89,
- "basis": "MEASURED in-step NVFP4 slice (INFRA measured/20261118-1900-nvfp4-decode.json, r24: q_path 0.295 + sparse_mla 0.198 + dcp_value 0.156 + prologue 0.025 + idx_score 0.235 ms exposed); achievable = nvfp4_modelopt L24 rows (0.249 + 0.106). r8 0.458 vs 0.149, r16 0.800 vs 0.252.",
- "gap_analysis": "NVFP4 slice r24, per DSA layer (6 layers): q path 49 us exposed (98 busy: MlaQuery side stream + QueryWait spin) vs 22 ach; trtllm-gen sparse MLA 33 vs 9.7; DcpValue 26 vs 9.7; indexer logits 39 exposed (68 busy) vs 17.7. SOL designs: (1) q path: LocalQuery (no publish/QueryWait) then a fused tcgen05 q_b->W_UK->FP8 kernel, bound by the 96-head q_b + W_UK weight stream; (2) sparse MLA: native kernel, bound by the per-row KV gather (384 rows x ~512 local keys x 576 B = 113 MB/layer at ~13-18 TB/s = 6.3-8.7 us; MMA 2.3K+1K clk per row-CTA with Q and P in TMEM is below it), projected ~9-10 us; (3) joint 4-row indexer: one M128 (4 rows x 32 heads) block-scaled MMA per key tile, keys streamed once per request (~218 MB/rank at HBM ~15.6 us) vs DeepGEMM's per-row streams; (4) DcpValue: W_UV in the sparse kernel epilogue + one-round multicast push.",
+ "basis": "MEASURED in-step NVFP4 slice r24 (6 DSA layers). Baseline INFRA trial-9ccf8ab-nv-r8r16r24-prof: q_path 0.295 + sparse_mla 0.198 + dcp_value 0.156 + prologue 0.025 + idx_score 0.235 = 0.909 ms. Current runs/D-ATTN/step_d/dattn-nv-8befd4a-r8r16r24-prof (same content + LocalQuery): q path 0.095 (DSA.q_path 0.008 + the local q_b/W_UK kernels the name classifier files under DSA.o_proj/w_uv: +0.077/+0.010) + sparse_mla 0.197 + dcp_value 0.152 + prologue 0.032 + idx_score 0.145 = 0.621 ms; achievable 0.355 (nvfp4_modelopt L24 rows). Step 10.888 -> 10.396 ms (r16 8.912 -> 8.533, r8 6.668 -> 6.610).",
+ "gap_analysis": "After LocalQuery (r24, us per DSA layer exposed): q path 16 (ach 22: model charges the P6 publish), sparse MLA 33 (ach 9.7), DcpValue 25 (ach 9.7), prologue 5, indexer logits 24 (ach 17.7). Remaining gap is sparse MLA + DcpValue + indexer. Sparse MLA SOL design: every SM must receive each gathered KV row once (384 rows x ~512 local keys x 576 B = 113 MB/layer); measured per-SM TMA gather4 receive ~25-35 B/clk -> ~8-11 us; MMA in the keys-on-M form (S^T = K Q^T with N = 96 real heads, O^T 4 x 96 TMEM cols, A = K/V^T from the gathered tile, B = Q^T/P^T) is smem-operand-fetch bound at ~238 KB per 128 keys -> ~6.6 us, overlappable -> projected ~10-12 us vs 9.7 model (the model has no per-row gather term; P-MLA measured the same floor). v1 (V-split pair) measured 49.5 us at R384 standalone vs trtllm-gen 40.6: bound by 2x SM-side receive (both CTAs need all 576 B of each row). Indexer: joint 4-row M128 MMA, keys streamed once per request. DcpValue: W_UV + push in one kernel.",
  "inefficiencies": [
-  "MlaQuery: per-head 8-CTA cluster tiling, cluster-round bound (measured linear 0.18 us/row standalone) -> replaced by LocalQuery from 65 rows",
-  "P6 q publish + QueryWait cross-rank poll + DcpValue q-mailbox re-arm (R x 96 x 576 B sentinel stores/layer) -> removed on local rows",
-  "LocalQuery GEMMs: cuBLAS q_b N=18432 at 1.2 PF (R384) and W_UK bmm 13 us; untuned split-K q_b below 65 rows (D-GEMM tactic item)",
-  "Sparse MLA trtllm-gen: ~20 us fixed + 0.055 us/row, 128 padded heads; measured not BW/MMA bound (dedup alone does not help)",
-  "DcpValue proj: 25 us vs ~9 model (P7b push + W_UV + LSE merge)",
-  "Indexer logits: SM100 DeepGEMM paged logits runs the varlen next_n=1 form (one row per task), so a request 4 verify rows each stream its keys (L2 absorbs part: 2.2x model, not 4x)"
+  "Sparse MLA trtllm-gen: ~20 us fixed + 0.055 us/row, 128 padded heads (measured standalone 40.6 us at R384)",
+  "Native v1 V-split pair: 2x SM receive bytes (each CTA needs full rows for QK) -> replaced by keys-on-M",
+  "DcpValue proj: 25 us/layer vs ~9.7 model (W_UV bmm of all gathered heads + push + LSE merge)",
+  "Indexer logits: DeepGEMM paged logits streams keys per verify row (24 us/layer vs 17.7)",
+  "LocalQuery GEMMs: cuBLAS q_b 96 heads + W_UK bmm ~16 us/layer (below the model q path; fusable later)"
  ],
  "rubin_features": [
   "tcgen05 UMMA (FP8 / block-scaled MXFP4) with TMEM accumulators",
@@ -29,11 +28,12 @@
   "NVLink multicast only where a push beats local recompute"
  ],
  "plan": [
-  "DONE LocalQuery (wzhao/k31ws-d-attn 72fdf53350); NVFP4 in-step A/B r8/r16/r24 running (overlay dattn-nv-8befd4a-1 = INFRA NVFP4 baseline content + LocalQuery)",
-  "Native sparse MLA decode (dsa/sparse_mla.py): 2-CTA cluster per row (V halves), gather4 multicast of 128-key tiles, Q and P in TMEM (.ts MMAs), exact running-max E4M3 P like trtllm-gen; target <= 10 us/layer at r24 (bench_dattn_sparse_native.py)",
-  "Joint 4-row indexer logits kernel (M128 = 4 rows x 32 heads, keys once per request)",
-  "DcpValue: fold W_UV + push into the sparse kernel epilogue",
-  "q path: fused tcgen05 q_b -> W_UK -> FP8 (no BF16 latent round trip)"
+  "DONE LocalQuery: NVFP4 in-step -0.49 ms/step at r24 (landed-ready wzhao/k31ws-d-attn @ 72fdf53350)",
+  "DONE native sparse MLA v1 (V-split pair) as measured reference (dfb3f4f7c1): correct, 49.5 us R384",
+  "Native sparse MLA v2 keys-on-M (in progress): 1 CTA/SM persistent over rows, index ring, 3 x 72 KB gather4 stages, S^T double-buffered (2 x 96 cols) + O^T 384 cols in exclusive TMEM, exact running max per head (E4M3 P at 448 x 2^(x - m) as trtllm-gen), O^T rescale on growth; target <= 11 us at R384",
+  "Wire v2 into SpDsaCore (SP_KERNELS per-shape), unit test vs trtllm-gen, in-step A/B",
+  "Joint 4-row indexer logits kernel (M128 = 4 rows x 32 heads), keys once per request",
+  "DcpValue: W_UV + push fused"
  ],
  "work": [
   {
@@ -70,11 +70,26 @@
    "t": "19:35",
    "what": "re-based on the NVFP4 decode baseline (INFRA 19:00); NVFP4 LocalQuery A/B launched (trial worktree 9ccf8ab994 + 72fdf53350 = 8befd4a203); wrote native sparse MLA decode kernel + harness",
    "result": "pending"
+  },
+  {
+   "t": "20:40",
+   "what": "NVFP4 in-step A/B of LocalQuery (r8/r16/r24) on the INFRA NVFP4 baseline content",
+   "result": "step 6.668/8.912/10.888 -> 6.610/8.533/10.396 ms; family r24 0.909 -> 0.621 ms (ach 0.355, 52% of gap)"
+  },
+  {
+   "t": "20:40",
+   "what": "native sparse MLA v1 (V-split pair) built + 9 microbench iterations with globaltimer stamps",
+   "result": "matches trtllm-gen to 1 BF16 ulp; 49.5 us vs 40.6 at R384; bound by 2x per-SM receive -> keys-on-M rewrite"
+  },
+  {
+   "t": "20:18",
+   "what": "INFRA: 72fdf53350 not merged: test_sp_dsa_block_matches_stock_layer[mxfp4-merge] fails at R68 (q codes 7.25 apart vs ulp 0.03125); see findings/INFRA.md",
+   "result": "NVFP4 decode slice with it 6.53/8.36/10.15 vs int 6.59/8.66/10.47 ms"
   }
  ],
- "next": "Read runs/D-ATTN/sp/sp1.log (first native sparse MLA compile/correctness/timing at R128/R384) and runs/D-ATTN/step_d/dattn-nv-8befd4a-r8r16r24-prof/fam.txt (LocalQuery NVFP4 A/B vs INFRA trial-9ccf8ab-nv-r8r16r24-prof).",
- "blockers": "pool contention: 4-GPU step benches wait behind 1-GPU jobs (12 waiters, 2 hold1 nodes at 13:15 PT); ncu/nsys absent from the K3.1 image (no kernel counters; requested via findings)",
- "branch": "wzhao/k31ws-d-attn @ 72fdf53350 (+ uncommitted dsa/sparse_mla.py)",
+ "next": "Write the keys-on-M sparse MLA (dsa/sparse_mla.py SparseMlaDecodeT) reusing the v1 index ring / loaders / Q pipelining; microbench with benchmarks/kimi_k3/dattn_sp.sh <ov> <name> --rows 128,384 --stamps on rhea.",
+ "blockers": "",
+ "branch": "wzhao/k31ws-d-attn @ dfb3f4f7c1 (landed-ready piece: LocalQuery 72fdf53350)",
  "evidence": [
   "k31ws/measured/20261118-1900-nvfp4-decode.json",
   "rhea:.../runs/D-ATTN/step_d/dattn-nv-8befd4a-r8r16r24-prof",

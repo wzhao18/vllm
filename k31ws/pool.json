@@ -2,7 +2,23 @@
  "note": "Rolling holds from holdd-ws.sh (1-node class for kernel work, one standing 8-node request for EP32/DP8). GPUs are shared through wsgpu.sh locks.",
  "holds": [
   {
+   "job": "74565",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "COMPLETING",
+   "nodes": "1",
+   "start": "2026-11-18T16:32:07",
+   "left": "1:52:26"
+  },
+  {
    "job": "72524",
+   "name": "coreai_cserve_dev-k31ws.hold8",
+   "state": "PENDING",
+   "nodes": "8",
+   "start": "N/A",
+   "left": "8:00:00"
+  },
+  {
+   "job": "74729",
    "name": "coreai_cserve_dev-k31ws.hold8",
    "state": "PENDING",
    "nodes": "8",
@@ -14,24 +30,24 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T19:29:00",
+   "start": "2026-11-18T19:52:00",
    "left": "8:00:00"
   },
   {
-   "job": "73572",
+   "job": "74802",
    "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "RUNNING",
+   "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T15:42:24",
-   "left": "52:31"
+   "start": "2026-11-18T20:00:00",
+   "left": "8:00:00"
   },
   {
-   "job": "74511",
+   "job": "74826",
    "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "RUNNING",
+   "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T16:28:00",
-   "left": "2:07:07"
+   "start": "N/A",
+   "left": "8:00:00"
   },
   {
    "job": "74500",
@@ -39,7 +55,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T16:20:46",
-   "left": "1:49:53"
+   "left": "1:23:01"
   },
   {
    "job": "74587",
@@ -47,15 +63,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T16:37:17",
-   "left": "2:08:24"
-  },
-  {
-   "job": "74565",
-   "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "RUNNING",
-   "nodes": "1",
-   "start": "2026-11-18T16:32:07",
-   "left": "2:19:14"
+   "left": "1:41:32"
   },
   {
    "job": "74071",
@@ -63,7 +71,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:51:24",
-   "left": "2:59:31"
+   "left": "2:32:39"
   },
   {
    "job": "74062",
@@ -71,7 +79,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:50:22",
-   "left": "2:58:29"
+   "left": "2:31:37"
   },
   {
    "job": "74059",
@@ -79,7 +87,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:49:51",
-   "left": "2:57:58"
+   "left": "2:31:06"
   },
   {
    "job": "74056",
@@ -87,7 +95,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:48:48",
-   "left": "2:56:55"
+   "left": "2:30:03"
   },
   {
    "job": "74046",
@@ -95,7 +103,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:47:46",
-   "left": "2:55:53"
+   "left": "2:29:01"
   },
   {
    "job": "74040",
@@ -103,7 +111,15 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:46:44",
-   "left": "2:54:51"
+   "left": "2:27:59"
+  },
+  {
+   "job": "74730",
+   "name": "coreai_cserve_dev-k31ws.hold8",
+   "state": "RUNNING",
+   "nodes": "8",
+   "start": "2026-11-18T16:54:49",
+   "left": "4:36:04"
   }
  ]
 }

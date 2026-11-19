@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent (resumed)",
  "state": "implementing",
- "updated": "2026-11-18T16:50-08:00",
+ "updated": "2026-11-18T17:03-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
@@ -79,12 +79,22 @@
    "result": "ptxas: 168 regs at entry, 308 B spills; bitwise test n33 and 69-layer bench did not finish (hang)"
   },
   {
-   "t": "16:45",
+   "t": "16:37",
    "what": "run8 hang diagnosis build (bounded mbarrier waits + role markers)",
    "result": "n8 and n96 single-layer runs complete with no stuck mbarrier wait; run9 isolates layers / setmaxnreg / PDL chaining"
+  },
+  {
+   "t": "16:50",
+   "what": "run9/run10: hang = warps reaching aligned barriers (bar.sync / setmaxnreg) diverged after single-lane mbarrier waits; fixed with warp convergence + a smem item table (no global loads in the refill path)",
+   "result": "v3 bitwise equal to KdaWS + stock commit (n33 eager/graph); but n32/64/96/128 = 35.2/69.4/96.8/126.9 us/layer (worse than v1)"
+  },
+  {
+   "t": "17:00",
+   "what": "run11 attribution at n96 (us/layer): full 96.4, no verify 71.3, no fold 58.0, neither 39.3; register split 200/104 .. 232/40 changes nothing; ptxas 168 regs + 180 B spills",
+   "result": "(1) the single prep warpgroup (starved of issue by the scan warps) bounds at 39 us alone; (2) fold costs +32 us for ~9 FP32 ops per element: spills under the 168-register compile budget + data-dependent branches around the state. Redesign v4: no prep warpgroup and no setmaxnreg (256 threads, 255-register budget): each scan group preps its own next item (latency hidden by the other group FP passes), branch-free fold (masked tokens are exact zeros / identity), item table in smem"
   }
  ],
- "next": "run9 result: find the multi-launch hang, then bitwise tests + microbench n8..128",
+ "next": "run12: v4 bitwise test + microbench n8..128 + attribution + trace",
  "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
  "branch": "wzhao/k31ws-d-kda @ 3de6741dcc",
  "evidence": [
