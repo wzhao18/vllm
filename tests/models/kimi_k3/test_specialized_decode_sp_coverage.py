@@ -326,6 +326,7 @@ def runtime(layers=None, rows=ROWS, ctx=None, **backbone):
         use_sequence_parallel=True,
         use_attn_res=True,
         aux_hidden_state_layers=(2, 5),
+        embed_tokens=None,  # no vocab shard: SpEmbedScatter declines (stock embedding)
     )
     stock.update(backbone)
     if layers is None:
@@ -659,7 +660,7 @@ def sp_decode(fakes, monkeypatch):
     backbone = SimpleNamespace(
         layers=layers, start_layer=0, end_layer=len(layers),
         aux_hidden_state_layers=(2, 5), config=SimpleNamespace(num_attention_heads=96),
-        use_sequence_parallel=True, use_attn_res=True,
+        use_sequence_parallel=True, use_attn_res=True, embed_tokens=None,
     )  # fmt: skip
     config = DecodeConfig(
         max_context=1 << 20, mla_core="auto", dsa_core="auto", dcp=TP, q=Q,
