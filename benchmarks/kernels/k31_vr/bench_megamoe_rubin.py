@@ -159,7 +159,7 @@ def parse_args():
     p.add_argument(
         "--dedup",
         default=None,
-        choices=("standalone_warps", "reuse_dispatch_warps", "wg2"),
+        choices=("standalone_warps", "reuse_dispatch_warps", "wg2", "wg2s"),
         help="run the inference record on the refreshed dedup-combine kernel "
         "(variant inference_dedup) with this token-back transport; wg2: two epilogue "
         "warpgroups (inference_dedup_wg2, reuse_dispatch_warps)",
@@ -579,11 +579,17 @@ def main():
         buckets = [
             dataclasses.replace(
                 b,
-                variant="inference_dedup_wg2" if args.dedup == "wg2" else "inference_dedup",
+                variant=(
+                    "inference_dedup_wg2"
+                    if args.dedup in ("wg2", "wg2s")
+                    else "inference_dedup"
+                ),
                 knobs=dataclasses.replace(
                     b.knobs,
                     token_back_mode=(
-                        "reuse_dispatch_warps" if args.dedup == "wg2" else args.dedup
+                        {"wg2": "reuse_dispatch_warps", "wg2s": "standalone_warps"}.get(
+                            args.dedup, args.dedup
+                        )
                     ),
                 ),
             )

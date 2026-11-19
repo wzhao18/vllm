@@ -481,13 +481,6 @@ class RubinMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
-        if self.kernel_variant == "inference_dedup_wg2" and (
-            self.token_back_mode != "reuse_dispatch_warps"
-        ):
-            raise ValueError(
-                "two epilogue warpgroups with the dedup combine need reuse_dispatch_warps "
-                "(16 warps per CTA)."
-            )
         if self.kernel_variant in ("inference_dedup", "inference_dedup_wg2"):
             if self.token_back_mode == "epi_warps":
                 raise ValueError(
