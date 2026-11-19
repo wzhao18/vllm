@@ -43,11 +43,14 @@ def make(reqs, seed=0, dev="cuda", zero_rows=None):
         [r for r, _ in reqs], [kv for _, kv in reqs], bases, dev
     )
     logits = torch.empty(scratch, dtype=torch.bfloat16, device=dev)
-    row_bin = torch.zeros(2 * t, dtype=torch.int32, device=dev)
+    row_bin = torch.zeros(3 * t, dtype=torch.int32, device=dev)
+    words = max(pads) // 32
+    bitmap = torch.zeros(t * words, dtype=torch.int32, device=dev)
+    cand = torch.zeros(t * pidx.CAND, dtype=torch.int32, device=dev)
     out = torch.empty(t, 2048, dtype=torch.int32, device=dev)
     return dict(reqs=reqs, q=q, q_scale=q_scale, w=w_bf16, k8=k8, k_sf=k_sf,
                 bases=bases, items=items, row_len=row_len, row_base=row_base,
-                logits=logits, row_bin=row_bin, out=out)
+                logits=logits, row_bin=row_bin, bitmap=bitmap, cand=cand, out=out)
 
 
 def run_score(d, mode=0):
@@ -56,7 +59,8 @@ def run_score(d, mode=0):
 
 
 def run_select(d):
-    pidx.select(d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"])
+    pidx.select(d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["bitmap"],
+                d["cand"], d["out"])
 
 
 def stock_logits(d, r):
@@ -155,24 +159,23 @@ def perf(args):
     res["fill"] = timed(lambda: d["logits"].fill_(0), args.iters)
     print(f"torch fill of the scratch: {res['fill']:.3f} ms", flush=True)
     run_score(d)
-    res["select"] = timed(lambda: run_select(d), args.iters)
-    for groups in args.groups:
-        for unroll in args.unrolls:
-            for smode in args.smodes:
-                kw = dict(groups=groups, unroll=unroll, mode=smode)
-                tag = f"select_g{groups}_u{unroll}_m{smode}"
-                res[tag] = timed(lambda: pidx.select(
-                    d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"], **kw),
-                    args.iters)
-                dbg = torch.zeros(8, dtype=torch.int64, device="cuda")
-                pidx.select(d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"],
-                            dbg=dbg, **kw)
-                torch.cuda.synchronize()
-                v = dbg.tolist()
-                n = max(v[0], 1)
-                print(f"{tag}: {res[tag]:.3f} ms; clk per row: zero {v[1] / n:.0f} stream "
-                      f"{v[2] / n:.0f} digit {v[3] / n:.0f} resolve {v[4] / n:.0f} emit "
-                      f"{v[5] / n:.0f} (stream load-wait {v[6] / n:.0f}, dense {v[7] / n:.0f})", flush=True)
+    def sel_only():
+        d["row_bin"][2::3].zero_()  # the scorer zeroes the candidate counts
+        run_select(d)
+    res["select"] = timed(sel_only, args.iters)
+    words = d["bitmap"].numel() // d["row_len"].shape[0]
+    ctas = torch.cuda.get_device_properties(0).multi_processor_count
+    mark, fin = pidx._select_kernels(ctas * 4, 2048, words)
+    st = torch.cuda.current_stream().cuda_stream
+    a = (d["logits"].view(torch.int16), d["row_base"], d["row_len"], d["row_bin"],
+         d["bitmap"], d["cand"])
+    def mark_only():
+        d["row_bin"][2::3].zero_()
+        mark(*a, st)
+    res["mark"] = timed(mark_only, args.iters)
+    res["finish"] = timed(lambda: fin(*a, d["out"], st), args.iters)
+    print(f"select (mark + finish): {res['select']:.3f} ms; mark {res['mark']:.3f}, "
+          f"finish {res['finish']:.3f} (incl. a count reset)", flush=True)
     res["score+select"] = timed(lambda: (run_score(d), run_select(d)), args.iters)
     print(f"select {res['select']:.3f} ms; score+select {res['score+select']:.3f} ms "
           f"per layer (items {d['items'].shape[0]}, scratch "
