@@ -282,7 +282,7 @@ class KdaChain(KdaFlow):
         state_full, ops_full = bars, bars + CHAIN_SLOTS
         if tid == 0:
             for s in cutlass.range_constexpr(CHAIN_SLOTS):  # one arrival per warp quarter
-                cute.arch.mbarrier_init(state_full + s, PAGE_BYTES // COPY_BYTES)
+                cute.arch.mbarrier_init(state_full + s, 1)
             for b in cutlass.range_constexpr(2 * GROUPS):
                 cute.arch.mbarrier_init(ops_full + b, 1)
             cute.arch.mbarrier_init_fence()
@@ -317,6 +317,19 @@ class KdaChain(KdaFlow):
         ops = block_views(at(blocks, 0, 0), 2 * GROUPS, BLOCK, T)
         self.scan_items(args, g, c, count, pages, table, betas, blocks, ops,
                         sums[g, None, None], state_full, ops_full, first)  # fmt: skip
+
+    @cute.jit
+    def load_page(self, args, pages, s, table, j, state_full):
+        """Table item j's whole state page into page slot s: ONE 64 KiB bulk copy
+        (a single TMA op of this size streams ~3x a 16 KiB op per issuing thread)."""
+        slot, head = table[j, SLOT], table[j, HEAD]
+        barrier = state_full + s
+        if slot > 0:
+            cute.arch.mbarrier_arrive_and_expect_tx(barrier, PAGE_BYTES)
+            source = args[9][Int64(slot), None, None, None]
+            copy_g2s(at(pages, s, 0), at(source, head, 0, 0), PAGE_BYTES, barrier)
+        else:
+            cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
 
     @cute.jit
     def release_slot(self, args, c, j, count, pages, table, state_full, stored):
@@ -375,19 +388,17 @@ class KdaChain(KdaFlow):
                 destination = state[Int64(slot), head, None, None]
                 self.scan(acc, b, s, pages, pending, lane_in, base, xv, fw_s, fu_s,
                           fd_s, destination, pending > 0)  # fmt: skip
-                self.store_quarter(pages, s, destination, pending > 0, warp, lane)
+                fence_async_shared()  # the slot's generic reads before its refill
                 values = self.rows_reduce(acc, lane_in)
                 self.solve(values, b, betas, j, own, v_s, ce_s,
                            args[18][rec, head, None, None], po)  # fmt: skip
                 pm[0], pm[1], pm[2] = Int32(1), token, head
-                if lane == 0:
-                    if pending > 0:
-                        wait_bulk_reads()
-                    if j + CHAIN_SLOTS < count:
-                        self.load_quarter(args, pages, s, table, j + CHAIN_SLOTS,
-                                          state_full, warp)  # fmt: skip
-                cute.arch.sync_warp()
                 self.finish_alone(args, g, c, sums_g, po, pg, pm, nw)
+                if c == 0:  # the group's scan reads of slot s are done (group-synced)
+                    if j + CHAIN_SLOTS < count:
+                        self.load_page(args, pages, s, table, j + CHAIN_SLOTS,
+                                       state_full)  # fmt: skip
+                cute.arch.sync_warp()
             else:
                 self.release_slot(args, c, j, count, pages, table, state_full, False)
                 for t in cutlass.range_constexpr(T):
