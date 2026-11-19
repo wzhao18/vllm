@@ -27,8 +27,7 @@ def _rel_rms(a, b):
 def test_frost_prefill_matches_flashkda(lens, heads):
     from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
 
-    if not sp_kda.frost_supported(torch.device("cuda")):
-        pytest.skip("cuDNN frontend >= 1.33 (kda_frost) not installed")
+    assert sp_kda.frost_supported(torch.device("cuda"))
     import vllm._flashkda_C  # noqa: F401
 
     torch.manual_seed(0)
@@ -61,8 +60,7 @@ def test_frost_strided_beta():
     FROST must read it exactly like a contiguous copy."""
     from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
 
-    if not sp_kda.frost_supported(torch.device("cuda")):
-        pytest.skip("cuDNN frontend >= 1.33 (kda_frost) not installed")
+    assert sp_kda.frost_supported(torch.device("cuda"))
     torch.manual_seed(1)
     T, H, bf = 300, 8, torch.bfloat16
     cu = torch.tensor([0, 100, 300], dtype=torch.int32, device="cuda")
@@ -76,3 +74,16 @@ def test_frost_strided_beta():
     ref = sp_kda._frost_fn(q, k, v, g, beta.contiguous(), cu, **kw)[0]
     got = sp_kda._frost_fn(q, k, v, g, beta, cu, **kw)[0]
     assert torch.equal(got, ref)
+
+
+def test_frost_requires_cudnn_frontend_133(monkeypatch):
+    """An older cuDNN frontend on SM10x is an install error, not a silent
+    FlashKDA fallback."""
+    import cudnn
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    monkeypatch.setattr(sp_kda, "_frost_fn", None)
+    monkeypatch.setattr(cudnn, "__version__", "1.32.1")
+    with pytest.raises(RuntimeError, match="older than 1.33"):
+        sp_kda.frost_supported(torch.device("cuda"))
