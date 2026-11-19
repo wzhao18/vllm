@@ -23,12 +23,13 @@ def main():
         x = torch.randn(m, 2 * d, device="cuda").bfloat16() * 2
         floor = (m * 2 * d * 2 + m * d + m * d // 32) / ACH_HBM * 1e6
         r = {"case": "situ_quant_shared", "M": m, "floor_us": round(floor, 1)}
-        r["situ_lut"] = kernel_times(lambda: mxfp8_act.situ_and_mul_quantize(x, 1.0, None))[0]
-        r["situ_lut_clamp"] = kernel_times(
-            lambda: mxfp8_act.situ_and_mul_quantize(x, 1.0, 10.0))[0]
+        for b, lb in ((4.0, 25.0), (1.0, None)):
+            for mode in (1, 4, 5):
+                r["mode%d_b%g_lb%s" % (mode, b, lb)] = kernel_times(
+                    lambda: mxfp8_act._act_quant(mode, x, d, beta=b, linear_beta=lb))[0]
         ref = torch.empty(m, d, device="cuda", dtype=torch.bfloat16)
         r["stock_situ_bf16_only"] = kernel_times(
-            lambda: torch.ops._C.situ_and_mul(ref, x, 1.0, -1.0))[0]
+            lambda: torch.ops._C.situ_and_mul(ref, x, 4.0, 25.0))[0]
         print(json.dumps(r), flush=True)
 
         logits = torch.randn(m, 896, device="cuda") * 2
@@ -52,7 +53,7 @@ def main():
             xd = (torch.randn(m, 2 * dd, device="cuda") * 2).bfloat16()
             r = {"case": "situ_and_mul_bf16_d%d" % dd, "M": m,
                  "floor_us": round(m * dd * 6 / ACH_HBM * 1e6, 1)}
-            r["lut"] = kernel_times(lambda: situ_and_mul(xd, 1.0, None))[0]
+            r["lut"] = kernel_times(lambda: situ_and_mul(xd, 4.0, 25.0))[0]
             print(json.dumps(r), flush=True)
             del xd
         lat = torch.randn(m, 3584, device="cuda").bfloat16()

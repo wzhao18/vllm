@@ -114,8 +114,9 @@ def test_situ_and_mul_quantize_matches_unfused(rows, d, linear_beta):
     _assert_same_quant(qa, ref)
 
 
-@pytest.mark.parametrize("beta,linear_beta", [(1.0, None), (1.0, 10.0), (3.0, 7.0)])
-def test_situ_table_form_bitwise_all_bf16_inputs(beta, linear_beta):
+@pytest.mark.parametrize("mode", [4, 5])
+@pytest.mark.parametrize("beta,linear_beta", [(1.0, None), (4.0, 25.0), (3.0, 7.0)])
+def test_situ_table_form_bitwise_all_bf16_inputs(mode, beta, linear_beta):
     """The SiTU table form (>= 1024 rows) equals the per-element form (< 1024
     rows) bit for bit on every BF16 gate and up value, incl. zeros, subnormals,
     huge values, Inf and NaN (the table's out-of-window fallback)."""
@@ -127,7 +128,7 @@ def test_situ_table_form_bitwise_all_bf16_inputs(beta, linear_beta):
     perm = torch.randperm(rows * d, generator=torch.Generator().manual_seed(0))
     u = g.reshape(-1)[perm].view(rows, d)
     x = torch.cat([g, u], dim=1).cuda()
-    whole = mxfp8_act.situ_and_mul_quantize(x, beta, linear_beta)
+    whole = mxfp8_act._act_quant(mode, x, d, beta=beta, linear_beta=linear_beta)
     sf_part = part * d // 32
     for r0 in range(0, rows, part):
         piece = mxfp8_act.situ_and_mul_quantize(x[r0 : r0 + part], beta, linear_beta)
