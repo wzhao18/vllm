@@ -4,7 +4,7 @@
  "side": "infra",
  "owner": "FAST agent (workflow)",
  "state": "implementing",
- "updated": "2026-11-18T16:05-08:00",
+ "updated": "2026-11-18T16:42-08:00",
  "shape": "Wall time of one warm-cache D3-32 1-node step bench (r8/r16/r24, prof=1, base-4fbaa15), container start to exit, ms; plus pool GPU-min lost to failed runs",
  "basis": "MEASURED: runs/FAST/step_d/tri-1 (261 s, cold flashkda/dcpx), tri-2 (1076 s: 965 s model init stalled on flashkda rebuild lock); pool/usage.log",
  "gap_analysis": "A warm D3-32 step bench takes 247 s wall for ~40 s of cases: container+imports 8 s, config 11 s, dist init 10 s, model+dummy load 23 s, KV profile run 42 s, KV prepare + CuTe compiles 21 s, JIT kernel warmup 10 s, prefill-glue + tokenspeed MLA Triton compiles 39 s, router/CuTe warmup 5 s, serving-shape warmup 18 s, cases 28 s (incl. late Triton JITs), teardown 13 s. Root cause of most JIT time: the container /tmp (TRITON_CACHE_DIR, CUDA_CACHE_PATH) is a fresh tmpfs per srun step, so every run recompiled every Triton kernel; fixed (Lustre caches), effect being measured. Cold builds on new sources: flashkda_split 80-135 s, dcp_exchange 34 s (was rebuilt per overlay; now shared by digest). Kimi K3 CuTe cache misses 26-45 kernels/rank on a warm overlay (key includes real tensor addresses): ~27 s per start. NVFP4 slices: model init 235-291 s + MegaMoE runtime setup up to 154 s, not yet attributed. Queue: 80% of hold-GPU-minutes lock-busy but 32% of that in failed runs; holds are backfill jobs preempted 30-60 min after start (PreemptMode CANCEL), so the pool is 2-3 nodes for 14 agents and waits are 5-47 min for 4-GPU requests.",
@@ -51,9 +51,19 @@
    "t": "16:00",
    "what": "tri-1/tri-2 timelines + build dir forensics",
    "result": "tri-2 model init 965 s: flashkda shared build dir rebuilt per overlay (build.ninja embeds $K/ov/<tag> paths; .ninja_log: 23 rebuilds 15:25-15:53); usage.log 41% of 1209 GPU-min in failed runs"
+  },
+  {
+   "t": "16:21",
+   "what": "installed /k31ov fixed overlay mount (wsgpu.sh, wsenv.sh, step_multi.sh, step_inner/step_rank) + wsgpu -P preflight option + wsprep.py",
+   "result": "mount verified (build.ninja carries /k31ov; dcpx loaded 0.0 s across overlays int->base); transition: old waiters still rewrite paths, flashkda 290-414 s per test run until they drain"
+  },
+  {
+   "t": "16:37",
+   "what": "cut-1: step_d base-4fbaa15 r8/r16/r24 prof with enable_jit_warmup off + os._exit + -P strict preflight",
+   "result": "medians 7059.8/10205.3/12995.6 us vs tri-1 7063.2/10166.8/12995.4 (-0.05/+0.38/0.00%); engine init 23.9 s vs 51-62 s; preflight (compile+import+arg parse) ok in 8.4 s on CPUs; model init 548 s = transition flashkda lock wait"
   }
  ],
- "next": "Read /k31ov mount test (runs/FAST/ext/t1.log), install tools, A/B step bench",
+ "next": "same-node pair jw-2 (server warmups) vs cut-2 (cuts) on base-4fbaa15 to settle r16 +0.38%; then install nq_step cuts + step_* -P strict",
  "blockers": "GPU queue: 2 running hold1 nodes for ~17 requests; FAST measurement waits like everyone else. Hecate login needs MFA.",
  "branch": "none (tools only, k31ws/tools on Rhea, mirrored locally)",
  "evidence": [

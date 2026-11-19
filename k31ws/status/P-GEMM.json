@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-GEMM workflow agent",
  "state": "measuring",
- "updated": "2026-11-18T15:45-08:00",
+ "updated": "2026-11-18T16:40-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 83.89,
  "current_ms": 83.89,
@@ -86,10 +86,15 @@
    "t": "15:36",
    "what": "NVFP4 step A/B (INFRA step_p.sh -q nvfp4, P3-16 DEP4 slice, L24 view, drafter on): arm p-gemm-364bffae-4 (attn_res_mxfp8 wiring + mxfp8_act + EN enablement) vs en-6f164db2-1",
    "result": "arm: pf16k 213.8 ms (spread 1.2%), pf8k 110.2 ms (1.3%). Same-session base arm failed (DistStoreError timeout, infra); EN base from 13:23 = 211.3 / 107.6 ms (different node/time). No step gain visible yet: expected B1 gain on the L24 slice is ~0.5-1 ms, below run-to-run spread. Rerun base (ab-nv-base2) + profiled arm (ab-nv-pgemm-prof) queued to confirm the fused kernel is active and attribute per family"
+  },
+  {
+   "t": "16:35",
+   "what": "profiled arm ab-nv-pgemm-prof and first base arm ab-nv-base",
+   "result": "both died in init with torch DistStoreError (CUDASymmetricMemory rendezvous wait timeout after 1800 s), infra not code (the unprofiled arm of the same overlay ran); ab-nv-base2 running (started 16:37 on rhea0030)"
   }
  ],
  "next": "HANDOFF: (1) read runs/P-GEMM/step_p/ab-nv-base2 and ab-nv-pgemm-prof (fam.txt): confirm k31pf attn_res_mxfp8 kernels replace attn_res + mxfp8 quant in KDA/MoE layers and the step is not slower; if it is slower, find which kernel (suspect: fused AttnRes per-token epilogue +15-25 us vs native) and gate the pre path by num_blocks; only then set landed-ready for B1 (branch wzhao/k31ws-p-gemm). (2) B3 (largest lever, ~11 ms/93-layer step): shared gate_up GEMM with SiTU + MXFP8 epilogue on FlashInfer sm107 CuTe DSL Sm107BlockScaledPersistentDenseGemmKernel (fi-sm107-opt flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py, has epilogue_op + epilogue_tma_store_mxfp8); first sweep _get_sm107_mxfp8_tactics at M=16384 N=12288 K=7168 to match cuBLASLt (264 us); then dual-B TMA (gate rows j, up rows 6144+j). (3) router top-k 43 us -> fuse into a router GEMM epilogue or a multi-token-per-block top-k; (4) AttnRes 2-token-per-SM redesign. Bench scripts: benchmarks/kimi_k3/pgemm_{bench,attnres_bench,quant_bench,router_bench}.py; runners runs/P-GEMM/run_a*.sh",
- "blockers": "pool contention (17 waiters); one A/B base arm lost to a DistStoreError timeout",
+ "blockers": "Two 4-GPU step runs lost to CUDASymmetricMemory DistStoreError rendezvous timeouts (reported to INFRA in findings); pool contention",
  "branch": "wzhao/k31ws-p-gemm @ 364bffae05 (merges wzhao/k31ws-en 6f164db270)",
  "evidence": [
   "perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill",

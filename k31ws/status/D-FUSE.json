@@ -79,6 +79,11 @@
    "t": "16:25",
    "what": "coordinator: re-based on the NVFP4 decode slice baseline",
    "result": "small ops 0.47/0.04 + SP comm 0.51/0.33; NVFP4 A/B: AttnRes+AG/RS exposed 591 -> 402 us"
+  },
+  {
+   "t": "19:52",
+   "what": "INFRA: 6758683397 not merged: test_specialized_decode_sp_coverage.py fails (meta device in SpFinalGather/sp_comm) - see findings/INFRA.md",
+   "result": "NVFP4 decode with D-FUSE (+EN, D-TOPK): 6.53/8.53/10.29 ms vs int 6.67/8.86/10.78"
   }
  ],
  "next": "drafter-on NVFP4 A/B at r24 queued (nvd-fused14-r384 vs nvd-int-r384) for the tail breakdown; then drafter-tail fusion; latent RMSNorm proposal pending D-MOE",

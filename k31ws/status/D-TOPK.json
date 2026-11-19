@@ -3,15 +3,15 @@
  "title": "Decode: DSA exact top-k + DCP merge",
  "side": "decode",
  "owner": "D-TOPK agent",
- "state": "implementing",
- "updated": "2026-11-18T15:40-08:00",
+ "state": "landed-ready",
+ "updated": "2026-11-18T16:40-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
- "baseline_ms": 0.65,
- "current_ms": 0.65,
+ "baseline_ms": 0.636,
+ "current_ms": 0.294,
  "achievable_ms": 0.06,
  "target_ms": 0.066,
  "step_ms": 10.89,
- "basis": "MEASURED in-step NVFP4 baseline (INFRA 18:52 EST, measured/20261118-1900-nvfp4-decode.json); achievable = nvfp4_modelopt at the same slice",
+ "basis": "MEASURED in-step (INFRA step_d recipe run in the D-TOPK runner, 1-node D3-32 slice, 6 DSA layers, u132k, rows 128/384, profile): top-k family busy 57 -> 37 us/layer (r8), 106 -> 49 us/layer (r24); current_ms = 49 us x 24 DSA layers. Microbench (4-GPU DCP4, CUDA graph): r1/r8/r24 27/27/35 us per layer (in-tree 30/45/86). achievable = rhea1n model_rows B96: DSA.topk 1.9 + P8 7.5 us/layer (0.227 ms/step); r8 0.64 + 6.4; r1 0.08 + 5.9",
  "gap_analysis": "v2 (3d340bcf5e) removed the pre-pass kernels, the max_model_len-bound launch shape and the tie round (the band of global ids resolves ties straddling ranks in round 1 on 100% of bench rows). Remaining per-row chain (clock64 phase stamps, r1 / r24 us): sample 1.4/2.2, theta 0.6/0.7, candidate pass 8.5-9.5/10.4, fine window + band + msg 3.5/3.9, NVLink round 2.8-6/3-6 (includes rank skew), resolve 5/6.5, WRITE 3.5/4.5. A standalone probe of the same candidate loop runs 2.9 us (r1) / 3.3 us (r24) and a CTA pulls a 67.5 KB row into registers in 0.8-1.0 us, so the in-kernel loop runs ~3x slower than the probe (no spills: 62 regs, 0 local; cause under investigation); the other phases are chains of small dependent steps (syncs, single-thread loops). Model gap: the model prices one L2 pass + one NVLink round (~9.4 us at r24); the floor from hwdb measurements is ~1 us load + ~3 us round + local merge.",
  "inefficiencies": [
   "FIXED: tie round through the leader state machine with an extra key pass (ebc6916ed5)",
@@ -80,16 +80,36 @@
    "t": "16:25",
    "what": "coordinator: re-based on the NVFP4 decode slice baseline",
    "result": "top-k + merge 0.65 vs 0.06 (topk_v2 not yet in-step)"
+  },
+  {
+   "t": "16:25",
+   "what": "in-step A/B base-4fbaa15 vs d-topk-3d340bcf5-1 (rows 128/384, 6 DSA layers, profiled) + integration tests",
+   "result": "top-k family busy r8 340 -> 223 us, r24 637 -> 296 us; step r8 6993 -> 6872 us (-1.7%), r24 12891 -> 12558 us (-2.6%) on the 24-layer slice (x4 for 24 DSA layers: ~-0.5 / -1.3 ms per full step); tests/distributed/test_kimi_k3_sdec_sp_layers.py DSA (merge+exchange, mxfp4+fp8) 4 passed; test_k31_dcp_exchange_policy 32 passed"
+  },
+  {
+   "t": "16:30",
+   "what": "df636ba746 theta at q+256 (870 candidates), one NaN-propagating max per group, signed-zero-safe bound; b162ec54a6 docstring",
+   "result": "test_k31_dcp_exchange ALL PASS; radix/full-pass rows halve; bench unchanged (26.8/27.0/34.7): the candidate pass cost is not in the candidate count"
+  },
+  {
+   "t": "16:30",
+   "what": "released the pool node (runner stopped)",
+   "result": ""
+  },
+  {
+   "t": "16:55",
+   "what": "coordinator: units aligned to the slice (6 DSA layers, busy)",
+   "result": "in-step r24 106 -> 49 us/layer = 0.636 -> 0.294 ms on the NVFP4 slice"
   }
  ],
- "next": "(1) read step A/B (runs/D-TOPK/q/done/j24.log; step dirs runs/D-TOPK/step_d/<ov>-r128_384-*/fam.txt, top-k family busy/exposed vs INFRA base) and the integration test j25 (pytest --noconftest tests/distributed/test_kimi_k3_sdec_sp_layers.py -k \"test_sp_dsa_block_matches_stock_layer and not all_rows\"); (2) j26 = overlay d-topk-3d340bcf5-2 (uncommitted in the worktree: theta target q+256, one NaN-propagating max per group, signed-zero-safe group bound) bench r1/r8/r24 + test_k31_dcp_exchange ALL PASS -> commit; (3) cut the per-row chain: ~35 __syncthreads per row with 16 warps; merge resolve steps (hdr/tau/groups/class/tier5) into ~3 synced steps, parallelise band pick, WRITE with fewer barriers; (4) r1/r8: split the key pass of a row over a cluster (CS 8 at 16 rows, 2 at 128) with DSMEM appends into the leader; (5) find why the in-kernel candidate loop runs ~3x slower than benchmarks/kernels/probe_k31_cand_loop.py (SASS diff: cuobjdump -sass of the .so in $K31_DCPX_BUILD_DIR). Runner: runs/D-TOPK/runner.sh via wsgpu -g 4 (jobs in runs/D-TOPK/q/*.sh, logs in q/done); scratch job templates in the session scratchpad dtopk_j*.sh; overlays staged with mkov.sh (tags d-topk-<sha>-<n>).",
- "blockers": "4-GPU pool requests wait 20-30 min (1-GPU runs take single GPUs first); using a runner that keeps the node for queued experiments with a 12-min idle exit",
- "branch": "wzhao/k31ws-d-topk @ 3d340bcf5e",
+ "next": "landed-ready for INFRA merge (wzhao/k31ws-d-topk @ b162ec54a6). Next optimisation round, in order of measured size: (1) per-row chain after the candidate pass (~15 us: fine window/band 3.5, resolve 5, WRITE 3.5): ~35 __syncthreads with 16 warps; merge resolve steps into ~3 synced steps (every thread derives maxlo/minhi/tiers redundantly from rx; one scan for tau), parallelise band pick, WRITE with fewer barriers; (2) candidate pass 8.7 us in-kernel vs 2.9 us for the identical loop in benchmarks/kernels/probe_k31_cand_loop.py (not candidate count, not spills: 62 regs, 0 local) - diff SASS (cuobjdump -sass on the .so in $K31_DCPX_BUILD_DIR) / try the loop as a __noinline__ device function; (3) r1/r8 cluster split of the key pass (16/128 rows use 16/128 of 212 SMs); (4) NVLink round 2.8-6 us includes rank skew: consider issuing the round-1 send before the band pass (two messages). How to run: stage overlay (bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-topk d-topk-<sha>-<n>), start runs/D-TOPK/runner.sh via wsgpu.sh -g 4 (IDLE/MAXMIN env), drop job scripts into runs/D-TOPK/q/ (templates: session scratchpad dtopk_j21.sh bench, dtopk_j24.sh step A/B, test via torchrun tests/models/kimi_k3/test_k31_dcp_exchange.py).",
+ "blockers": "",
+ "branch": "wzhao/k31ws-d-topk @ b162ec54a6",
  "evidence": [
-  "runs/D-TOPK/base1.log (baseline)",
-  "runs/D-TOPK/q/done/j18.log (v2 ALL PASS + regs), j21/j22.log (phase stamps)",
-  "runs/D-TOPK/q/done/j13.log (row-load probe), j19.log (candidate-loop probe)",
-  "benchmarks/kernels/bench_k31_dcp_topk.py --impl v2"
+  "runs/D-TOPK/step_d/base-4fbaa15-r128_384-1518/fam.txt vs runs/D-TOPK/step_d/d-topk-3d340bcf5-1-r128_384-1549/fam.txt (in-step A/B)",
+  "runs/D-TOPK/q/done/j25.log (distributed sdec DSA + policy tests), j26.log (ALL PASS + bench of df636ba746)",
+  "runs/D-TOPK/base1.log (baseline microbench), q/done/j13.log + j19.log (row-load / candidate-loop probes)",
+  "benchmarks/kernels/bench_k31_dcp_topk.py --impl v2 (bitwise check vs topk_merge), tests/models/kimi_k3/test_k31_dcp_exchange.py"
  ],
  "ckpt": "nvfp4"
 }

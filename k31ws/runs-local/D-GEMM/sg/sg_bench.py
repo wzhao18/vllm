@@ -94,8 +94,8 @@ def main():
     res = {"sms": sms, "rows": []}
     global NOST
     NOST = torch.empty(0, dtype=torch.int64, device=dev)
-    ws = torch.empty(sms * 2 * 256 * 128, dtype=torch.float32, device=dev)
-    shapes = [SHAPES[0], SHAPES[1], SHAPES[3], SHAPES[5], SHAPES[6]] if quick else SHAPES
+    ws = torch.empty(2 * sms * 2 * 256 * 128, dtype=torch.float32, device=dev)
+    shapes = [SHAPES[0], SHAPES[3], SHAPES[6]] if quick else SHAPES
     for name, n, k, rows in shapes:
         wbytes = n * k * 2
         copies = max(4, min(24, (400 << 20) // wbytes))
@@ -122,24 +122,28 @@ def main():
                                    for i in range(copies)])
                 row.update(us_torch=t_mm, model_us=wbytes / 13.9e6)
                 st2 = stages_for(ext, bn, 113 * 1024)
-                for tag, sv_, pf in (("s1", st, 0), ("s2", st2, 12), ("s2p24", st2, 24)):
-                    ext.run(ws_list[0], x, outs[0], ws, cnts[0], sms, sv_, NOST, pf)
+                for tag, sv_, pf, gr in (("s1", st, 0, sms), ("s2", st2, 12, sms), ("g2", st2, 0, 2 * sms)):
+                    cnts = [torch.zeros((n + 127) // 128, dtype=torch.int32, device=dev)
+                            for _ in range(copies)]
+                    ext.run(ws_list[0], x, outs[0], ws, cnts[0], gr, sv_, NOST, pf)
                     torch.cuda.synchronize()
                     e2 = ((outs[0].float() - ref).abs().max() / ref.abs().max()).item()
                     t_sg = chain_time([lambda i=i: ext.run(ws_list[i], x, outs[i], ws, cnts[i],
-                                                           sms, sv_, NOST, pf)
+                                                           gr, sv_, NOST, pf)
                                        for i in range(copies)])
-                    stamps = torch.zeros(sms * 8, dtype=torch.int64, device=dev)
+                    stamps = torch.zeros(gr * 8, dtype=torch.int64, device=dev)
                     for i in (1, 2):
-                        ext.run(ws_list[i], x, outs[i], ws, cnts[i], sms, sv_, NOST, pf)
-                    ext.run(ws_list[3], x, outs[3], ws, cnts[3], sms, sv_, stamps, pf)
+                        ext.run(ws_list[i], x, outs[i], ws, cnts[i], gr, sv_, NOST, pf)
+                    ext.run(ws_list[3], x, outs[3], ws, cnts[3], gr, sv_, stamps, pf)
                     torch.cuda.synchronize()
-                    sv = stamps.view(sms, 8).cpu()
+                    sv = stamps.view(gr, 8).cpu()
                     sv = sv[sv[:, 0] > 0]
                     t0 = sv[:, 0].min().item()
                     prof = {}
                     for j, nm in enumerate(["entry", "pdl_wait", "acc_full", "part_stored",
-                                            "cnt_passed", "done"]):
+                                            "cnt_passed", "done", "smid", "last_full"]):
+                        if nm == "smid":
+                            continue
                         col = sv[:, j]
                         col = col[col > 0]
                         if len(col):

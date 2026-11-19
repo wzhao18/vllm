@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent (resumed)",
  "state": "implementing",
- "updated": "2026-11-18T16:05-08:00",
+ "updated": "2026-11-18T16:50-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
@@ -72,9 +72,19 @@
    "t": "16:25",
    "what": "coordinator: re-based on the NVFP4 decode slice baseline",
    "result": "KDA core 0.90 vs 0.47"
+  },
+  {
+   "t": "16:10",
+   "what": "KdaFlow v3 written (flow.py rewrite: 2 scan groups x 4 warps, 8 rows x 16 keys per thread, KdaWS reduction tree kept for bit parity; 1 prep warpgroup with head constants in registers + both heads F_B staged once; per-group page slot; state stored from registers, evict-first; ~292 KB smem, oversized mode); run7 (overlay d-kda-v3-1)",
+   "result": "ptxas: 168 regs at entry, 308 B spills; bitwise test n33 and 69-layer bench did not finish (hang)"
+  },
+  {
+   "t": "16:45",
+   "what": "run8 hang diagnosis build (bounded mbarrier waits + role markers)",
+   "result": "n8 and n96 single-layer runs complete with no stuck mbarrier wait; run9 isolates layers / setmaxnreg / PDL chaining"
   }
  ],
- "next": "Implement KdaFlow v3 (two scan groups x 8 rows/thread, one prep warpgroup, 1 page slot per group) and run test + microbench.",
+ "next": "run9 result: find the multi-launch hang, then bitwise tests + microbench n8..128",
  "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
  "branch": "wzhao/k31ws-d-kda @ 3de6741dcc",
  "evidence": [

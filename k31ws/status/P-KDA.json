@@ -3,8 +3,8 @@
  "title": "Prefill: KDA chain (core + conv + gated o_norm)",
  "side": "prefill",
  "owner": "P-KDA agent (resumed 16:00)",
- "state": "implementing",
- "updated": "2026-11-18T16:35-08:00",
+ "state": "landed",
+ "updated": "2026-11-18T17:20-08:00",
  "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4 config (KDA in/o_proj MXFP8 -> o_norm writes the MXFP8 o_proj input), 96 KDA heads at TP1, FP32 state; per GPU per prefill forward, 69 KDA layers",
  "baseline_ms": 77.2,
  "current_ms": 72.7,
@@ -12,7 +12,7 @@
  "target_ms": 19.1,
  "step_ms": 218.7,
  "basis": "MEASURED microbench on 1 VR200 GPU at the deployed per-GPU shape, NVFP4 config (benchmarks/kimi_k3/bench_kda_prefill_chain.py, CUPTI kernel sums x 69): baseline 1118 us/layer, current 1054 us/layer (ab14); model nvfp4_modelopt|P3-16|prefill conv 55.1 + gate_beta_norm 18.4 + core_prefill 167.0 + o_norm 12.2 = 252.7 us/layer",
- "gap_analysis": "Per layer at F16K now: recurrence K2 394 + prepare K1 299 + Q|K|V conv 220 + o_norm/MXFP8 139 (was 203) = 1054 us; F8K 551 (was 580). Remaining gap 801 us/layer vs model 253. K2 (394 us): FlashKDA chunk-16 recurrence on legacy warp MMA with an FP32 register state; 288 (seq, head) walks of 341 chunks over 212 SMs at 2 CTAs/SM; v-split variants of the in-tree build measured 422-645 us (none beat stock); the in-tree full-width build is 495 vs stock 394 (unexplained, same source family; check cutlass version / spill-after-update). K1 (299 us): single-shot CTA per (16-token tile, head), 98K CTAs, ~8 TB/s for ~2.45 GB (q,k,g in; kd,qd,kr workspaces out) -> latency-bound; fusing the conv into it made it slower (728 us) because the added serial phase lengthens every CTA. conv (220 us): 2.4 GB at ~11 TB/s (at its standalone floor; only fusion removes it). o_norm (139 us): ~1.0 GB at ~7 TB/s (floor ~85 us). Model note: core_prefill t_ach 167 us assumes one 2.0 GB pass with conv/o_norm fused and the recurrence fully hidden; with 341 serial 16-token steps per item that needs <= ~0.5 us per step at 1.36 items per SM, i.e. a tensor-core (tcgen05) recurrence.",
+ "gap_analysis": "Per layer at F16K: recurrence K2 394 (stock FlashKDA mma.sync) + prepare K1 299 + Q|K|V conv 220 + o_norm/MXFP8 139 = 1054 us; model 253. The recurrence is a serial chain of 341 chunk steps per (seq, head) item and 288 items over 212 SMs, so its time is chunk-step LATENCY x 341, not throughput: model's 167 us core needs <= 0.49 us (1.1K clk) per step. Measured (in-kernel clock stamps): a tcgen05 chunk step costs MMA1 K=128 as dependent accumulating MMAs ~70 clk each, ~350 clk per tensor-core hand-off, plus single-warp-per-SMSP SIMT; stock mma.sync K2 = 1.16 us/step (HMMA rate is 1/4 of tcgen05, measured). Remaining after K2: K1 299 (latency-bound single-shot CTAs), conv 220 (at HBM rate), o_norm 139 (at ~7 TB/s); these are throughput work that must run concurrently with the latency-bound recurrence (same kernel / co-resident) to approach the model.",
  "inefficiencies": [
   "MEASURED: K2 recurrence 394 us/layer: legacy mma.sync + per-chunk FP32->BF16 state fragment conversions/transposes, 1.36 items per SM (no ncu in the image to split latency vs pipe)",
   "MEASURED: K1 prepare 299 us/layer: latency-bound single-shot CTAs; writes ~1.2 GB workspace that K2 re-reads",
@@ -97,6 +97,21 @@
    "t": "16:30",
    "what": "tc1: tcgen05 recurrence v1 (3 MMA round trips per chunk) vs in-tree K2 on the same K1 workspace",
    "result": "BITWISE equal (out + final state) at [16]x1, [40,23]x2, [300,17,129]x8, slow-decay [200,64]x4, F16K 3x5461x96; but 635 us at F16K (1.86 us per chunk step) vs stock K2 394 -> latency-bound chain; tc2 queued with clock stamps + CUDA-core INV variant (2 round trips)"
+  },
+  {
+   "t": "17:05",
+   "what": "tc2/tc3: clock-stamped chunk chain of the tcgen05 recurrence (CTA 0, chunks 100-131); variants: CUDA-core INV (2 round trips), kd|qd as one N=32 MMA + FFMA2 + out off chain, 2 math warpgroups",
+   "result": "all bitwise vs FlashKDA K2. Chunk period 3.7-4.9K clk: MMA1 (8-16 dependent accumulating MMAs) 580-930 clk, each MMA hand-off (mbarrier to the MMA warp and back) ~350 clk, state update 630 (was 1430 before FFMA2 / out moved), out 840 clk sits in the math warps' program order. CUDA-core INV slower (single warp per SMSP issue-bound: 2000 clk); 2 warpgroups slower (more barrier arrivals, 104-reg budget). F16K 625-773 us vs stock K2 394"
+  },
+  {
+   "t": "17:20",
+   "what": "v4: MMAs issued by math thread 0 (named barrier instead of mbarrier hand-off to an MMA warp), MMA1 as two independent K-half accumulators issued batch by batch while the state update runs, out(c) under MMA1(c+1)",
+   "result": "tc4 queued"
+  },
+  {
+   "t": "19:33",
+   "what": "INFRA: merged wzhao/k31ws-p-kda 47bc2f317f into wzhao/k31ws-int (5718ef2, clean)",
+   "result": "int tests 229 passed (incl. test_kda_o_norm_mxfp8 3); NVFP4 prefill slice in-step: o_norm 3.82 -> 2.60 ms per 18 KDA layers (212 -> 144 us/layer), KDA core 22.25 -> 21.30 ms; step F16K 199.8 -> 198.9 ms, F8K 100.9 -> 101.0 (within noise); NVFP4 decode unchanged (6.67/8.86/10.78 ms); pushed"
   }
  ],
  "next": "tc2: per-stage chunk latency from clock stamps; cut the chain (CUDA-core INV, K-slice pipelined state update into MMA1)",

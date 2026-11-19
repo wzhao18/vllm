@@ -2,9 +2,9 @@
  "goal": "Close the gap between the implemented kernels and the perf model's achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.",
  "steps": {
   "Prefill DEP16 NVFP4 slice (ms, F16K)": {
-   "now": "199.8 (int e4514e51af)",
+   "now": "198.9 (int 5718ef2d89)",
    "ach": "164.5",
-   "note": "was 218.7 at baseline; 1-node DEP16 slice, L24, L78K"
+   "note": "baseline 218.7; P-MOE S3 not yet merged (197.2 on its branch)"
   },
   "Decode r8 NVFP4 slice (ms/step)": {
    "now": "6.67",
@@ -12,9 +12,9 @@
    "note": "target-only 4.91 vs 2.41 (preview-drafter tail removed)"
   },
   "Decode r24 NVFP4 slice (ms/step)": {
-   "now": "10.89",
+   "now": "10.78 (int)",
    "ach": "3.80",
-   "note": "target-only 6.77 vs 3.53"
+   "note": "baseline 10.89; D-TOPK (-0.33 ms) and D-FUSE (-0.19 ms) landed-ready, not yet merged"
   }
  },
  "findings": [
@@ -193,6 +193,30 @@
   {
    "t": "11-18 16:20",
    "text": "P-MOE: in the prefill MegaMoE main kernel, the SiTU transcendentals cost ~170 us of 1055 us per 8K launch (no-transcendental probe 888 us); cheaper exact-equivalent SiTU forms are being evaluated."
+  },
+  {
+   "t": "11-18 16:25",
+   "text": "D-TOPK in-step on NVFP4 slice: top-k family 106 -> 49 us/layer at r24 (57 -> 37 at r8), step -0.33 ms at r24; exact; landed-ready. Still 8x model."
+  },
+  {
+   "t": "11-18 16:45",
+   "text": "P-MOE S3 (cheaper exact SiTU in the MegaMoE epilogue) in-step NVFP4: MegaMoE 56.6 -> 52.3 ms at F16K; the MMA warp waits 46% of its loop for accumulator stages (epilogue-bound)."
+  },
+  {
+   "t": "11-18 17:30",
+   "text": "P-MLA: keys-on-M kernel decomposition at F16K: full 2.85 ms vs tensor-only 1.09 ms (matches the SS operand-fetch model): softmax sits on the tensor critical path and the per-token epilogue does scattered 2-byte stores. Next: overlap softmax with MMA, TMEM-A operand."
+  },
+  {
+   "t": "11-18 20:40",
+   "text": "D-GEMM: raw tcgen05/TMA stream-K GEMM prototype is correct but still 1.1-1.4x cuBLAS at small shapes after 2 CTAs/SM; L2 split reduce cost grows with contributors."
+  },
+  {
+   "t": "11-18",
+   "text": "HW: HBM writes hit the same ceiling for any placement; in-place read+write state updates gain ~1.22x from die-local placement; batch several tcgen05.ld before one wait (~1.35x)."
+  },
+  {
+   "t": "11-18 16:55",
+   "text": "8-node: original hold8 72524 lost its start estimate; added a backfill 8-node request (est 18:18 today) and a batch one (est 05:31)."
   }
  ]
 }

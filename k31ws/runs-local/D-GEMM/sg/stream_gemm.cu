@@ -38,6 +38,7 @@ struct Params {
   unsigned long long* stamps;  // [grid][8] globaltimer ns (benchmarks) or null
   int n, k, r, bn;
   int tiles, kb, chunk, total, stages;
+  int pf;  // weight boxes requested into L2 ahead of the ring (0: the whole chunk at entry)
   long long ldo;
 };
 
@@ -166,7 +167,12 @@ __global__ void __launch_bounds__(kThreads, 1)
   const int end = min(p.total, begin + p.chunk);
 
   if (threadIdx.x == 0) asm volatile("griddepcontrol.launch_dependents;");
-  if (threadIdx.x == 0) STAMP(0);
+  if (threadIdx.x == 0) {
+    STAMP(0);
+    unsigned smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    if (p.stamps) p.stamps[blockIdx.x * 8 + 6] = smid;
+  }
   if (begin >= end) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
     return;
@@ -213,7 +219,8 @@ __global__ void __launch_bounds__(kThreads, 1)
         mbar_expect_tx(full0 + 8 * i, stage_bytes);
         tma_2d_evict_first(st, &tw, (g % p.kb) * 64, (g / p.kb) * 128, full0 + 8 * i);
       }
-      for (int i = pre; i < n_kb; ++i) {
+      const int pf_end = p.pf > 0 ? min(n_kb, pre + p.pf) : n_kb;
+      for (int i = pre; i < pf_end; ++i) {
         const int g = begin + i;
         tma_prefetch_2d(&tw, (g % p.kb) * 64, (g / p.kb) * 128);
       }
@@ -224,6 +231,10 @@ __global__ void __launch_bounds__(kThreads, 1)
         tma_2d(ring_s + i * stage_bytes + kWBox, &tx, (g % p.kb) * 64, 0, full0 + 8 * i);
       }
       for (int i = pre; i < n_kb; ++i) {
+        if (p.pf > 0 && i + p.pf < n_kb) {
+          const int gp = begin + i + p.pf;
+          tma_prefetch_2d(&tw, (gp % p.kb) * 64, (gp / p.kb) * 128);
+        }
         const int s = i % p.stages;
         const uint32_t ph = (i / p.stages) & 1;
         mbar_wait(empty0 + 8 * s, ph ^ 1);
@@ -246,6 +257,7 @@ __global__ void __launch_bounds__(kThreads, 1)
         const int seg = g >= split0 ? 1 : 0;
         const bool first = (g == begin) || (g == split0);
         mbar_wait(full0 + 8 * s, ph);
+        if (i + 1 == n_kb) STAMP(7);  // last stage's operands landed
         asm volatile("tcgen05.fence::after_thread_sync;");
         const uint32_t st = ring_s + s * stage_bytes;
         const uint64_t a = smem_desc(st), bd = smem_desc(st + kWBox);
@@ -394,7 +406,7 @@ int smem_bytes(int bn, int stages) {
 // cnt: uint32 tile counters (zero at first use, owned by this weight's call site).
 void run(torch::Tensor w, torch::Tensor x, torch::Tensor out, torch::Tensor ws,
          torch::Tensor cnt, int64_t grid, int64_t stages,
-         torch::Tensor stamps) {
+         torch::Tensor stamps, int64_t pf) {
   TORCH_CHECK(w.dtype() == torch::kBFloat16 && x.dtype() == torch::kBFloat16 &&
               out.dtype() == torch::kBFloat16);
   TORCH_CHECK(w.is_contiguous() && x.is_contiguous() && out.stride(1) == 1);
@@ -417,6 +429,7 @@ void run(torch::Tensor w, torch::Tensor x, torch::Tensor out, torch::Tensor ws,
            reinterpret_cast<unsigned*>(cnt.data_ptr()),
            stamps.numel() ? reinterpret_cast<unsigned long long*>(stamps.data_ptr()) : nullptr,
            n, k, r, bn, tiles, kb, chunk, total, static_cast<int>(stages),
+           static_cast<int>(pf),
            out.stride(0)};
   const int smem = smem_bytes(bn, stages);
   static int configured = 0;
