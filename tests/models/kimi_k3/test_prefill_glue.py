@@ -87,6 +87,24 @@ def test_rms_norm_matches_vllm_c(pg, rows, width, cols):
     assert torch.equal(_bits(pg.rms_norm(x, w, 1e-6)), _bits(ref))
 
 
+@pytest.mark.parametrize("tokens,heads,head_dim,extra", [(6156, 8, 64, 512), (2048, 4, 128, 0)])
+def test_head_rms_norm_matches_vllm_c(pg, tokens, heads, head_dim, extra):
+    """Per-head q / k norms of a strided qkv slice (8 / 16-thread stock blocks)."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(tokens)
+    width = heads * head_dim + extra
+    base = torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16) * 3
+    base[0] = 0
+    base[1, :8] = 3.0e38
+    x = base[:, : heads * head_dim].view(tokens, heads, head_dim)
+    w = (torch.rand(head_dim, device="cuda") + 0.5).to(torch.bfloat16)
+    assert pg.use_head_rms_norm(x, w)
+    ref = torch.empty(x.shape, dtype=x.dtype, device="cuda")
+    ops.rms_norm(ref, x, w, 1e-6)
+    assert torch.equal(_bits(pg.rms_norm(x, w, 1e-6)), _bits(ref))
+
+
 def test_rows_rms_norm_module(pg):
     from vllm.config import VllmConfig, set_current_vllm_config
 
