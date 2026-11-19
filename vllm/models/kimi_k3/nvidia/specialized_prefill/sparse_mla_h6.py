@@ -51,8 +51,8 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     ld_shared_u32,
     mbar_arrive,
     mbar_arrive_tx,
-    mbar_init,
     mbar_wait,
+    mbar_init,
     named_bar,
     st_shared_f32,
     st_shared_u32,
@@ -111,8 +111,8 @@ P_BYTES = H * 64
 OFF_QN = 0  # Q latent atoms 0-1 staging (copied into TMEM per token; epilogue staging)
 OFF_QS = OFF_QN + 2 * ATOM  # 2 x QS_BYTES (token parity): A of the SS QK MMAs
 OFF_P = OFF_QS + 2 * QS_BYTES  # 3 x P [96 heads x 64 keys] E4M3, K-major SW64
-OFF_AL = OFF_P + NP * P_BYTES  # [3][96] alpha of the subtile (lazy-max rescale)
-OFF_FLAG = OFF_AL + NP * H * 4  # [3] u32 (unused slots kept for alignment)
+OFF_AL = OFF_P + NP * P_BYTES  # [2 WG][2 (u // 2 parity)][96] alpha (lazy-max rescale)
+OFF_FLAG = OFF_AL + 4 * H * 4  # [3] u32 (unused slots kept for alignment)
 OFF_INV = OFF_FLAG + 16  # [96] out_scale / l of the token in its epilogue
 OFF_TOK0 = OFF_INV + H * 4  # token parity 0: [2 WG][2 (l, m)][96]
 OFF_BAR = OFF_TOK0 + 4 * H * 4
@@ -202,6 +202,16 @@ def tmem_st_o4(addr, v0, v1, v2, v3):
     return code, "r,r,r,r,f,f,f,f,~{memory}", (a, a + Uint32(96), a + Uint32(192),
                                                a + Uint32(288), Float32(v0), Float32(v1),
                                                Float32(v2), Float32(v3))
+
+
+@asm()
+def tmem_ld_max64(addr):
+    """64 columns of this thread's TMEM lane and their maximum (tcgen05.ld.red)."""
+    regs = ",".join(f"${i}" for i in range(64))
+    code = (f"tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32 {{{regs}}}, $64, [$65]; "
+            "tcgen05.wait::ld.sync.aligned;")
+    return (code, ",".join(["=f"] * 65 + ["r", "~{memory}"]), (Uint32(addr),),
+            (Float32,) * 65)
 
 
 @cute.jit
@@ -590,7 +600,14 @@ class SparseMlaPrefillH6:
         mbar_wait(_bar(base, B_SFULL + u % 2), Uint32((u // 2) & 1))
         self.ss(base, cta, lane, u, 8 * wg + 1, 1)
         tc_fence_after()
-        sa = tmem_ld(lane_addr + Uint32(C_S) + Uint32(64) * Uint32(u % 2), 64)
+        s_addr = lane_addr + Uint32(C_S) + Uint32(64) * Uint32(u % 2)
+        smax = Float32(0.0)
+        if cutlass.const_expr(masked):
+            sa = tmem_ld(s_addr, 64)
+        else:
+            sm = tmem_ld_max64(s_addr)
+            sa = sm[:64]
+            smax = sm[64]
         for k in cutlass.range_constexpr(64):
             xv[k] = sa[k]
         tc_fence_before()
@@ -607,7 +624,9 @@ class SparseMlaPrefillH6:
                 for k in cutlass.range_constexpr(64):
                     if 64 * i + k >= n:
                         xv[k] = Float32(-math.inf)
-            xm = _tree_max([xv[k] for k in range(64)]) * scale_log2
+                xm = _tree_max([xv[k] for k in range(64)]) * scale_log2
+            else:
+                xm = smax * scale_log2
             # lazy-max decision after the previous subtile's (other WG) decision
             if u >= 1:
                 named_bar(Uint32(1 + sp + 3 * (1 - wg)), 64)
@@ -627,6 +646,17 @@ class SparseMlaPrefillH6:
             if mp != mp_last:
                 lw = lw * ex2(mp_last - mp)
                 mp_last = mp
+        # publish the heads that grew (ballot masks, alphas) and OR them over the WG
+        # here, where the warps are already in step; the rescale runs after P
+        par = Uint32(wg * 2) + Uint32((u // 2) % 2)
+        gm = base + Uint32(OFF_GMASK) + par * Uint32(16)
+        alb = base + Uint32(OFF_AL) + par * Uint32(H * 4)
+        gw = ballot(Uint32(grow))
+        if lane == 0 and sp < 3:
+            st_shared_u32(gm + Uint32(4 * sp), gw)
+        if grow != 0:
+            st_shared_f32(alb + Uint32(h * 4), alpha)
+        anyg = bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow))
         self.ss(base, cta, lane, u, 8 * wg + 3, 1)
         if u >= NP:
             mbar_wait(_bar(base, B_PEMPTY + u % NP), Uint32((u // NP - 1) & 1))
@@ -655,19 +685,12 @@ class SparseMlaPrefillH6:
                     w[0], w[1], w[2], w[3])
             a0, a1 = fadd2(a0, a1, b0, b1)
             lw = lw + (a0 + a1)
-            st_shared_f32(base + Uint32(OFF_AL) + Uint32(u % NP) * Uint32(H * 4)
-                          + Uint32(h * 4), alpha)
         self.ss(base, cta, lane, u, 8 * wg + 5, 1)
         # heads of this subtile that grew: rescale their O^T columns (one per block)
         # after PV(u - 1), before PV(u); every other column has alpha = 1
-        gm = base + Uint32(OFF_GMASK) + Uint32(wg * 32) + Uint32((u // 2) % 2) * Uint32(16)
-        gw = ballot(Uint32(grow))
-        if lane == 0 and sp < 3:
-            st_shared_u32(gm + Uint32(4 * sp), gw)
-        if bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow)) != Uint32(0):
+        if anyg != Uint32(0):
             mbar_wait(_bar(base, B_PEMPTY + (u - 1) % NP), Uint32(((u - 1) // NP) & 1))
             tc_fence_after()
-            alb = base + Uint32(OFF_AL) + Uint32(u % NP) * Uint32(H * 4)
             for w in cutlass.range_constexpr(3):
                 m = ld_shared_u32(gm + Uint32(4 * w))
                 while m != Uint32(0):
