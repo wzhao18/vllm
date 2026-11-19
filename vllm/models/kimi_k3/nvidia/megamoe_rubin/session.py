@@ -28,7 +28,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from .config import RubinMoeConfig
+from .config import DEDUP_VARIANTS, RubinMoeConfig
 from .symm_arena import ALIGN, SymmetricArena, aligned, ensure_not_capturing
 from .weights import RubinMoeWeights, validate_kernel_weights
 
@@ -118,7 +118,7 @@ def _src(cfg: RubinMoeConfig):
     the inference kernel."""
     import importlib
 
-    name = "src_gp" if cfg.kernel_variant == "genphase" else "src"
+    name = "src" if cfg.kernel_variant == "inference" else "src_gp"
     pkg = importlib.import_module(f"{__package__}.{name}")
     importlib.import_module(f"{__package__}.{name}.sources.api")
     importlib.import_module(f"{__package__}.{name}.sources.quant_def")
@@ -250,11 +250,17 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     if cfg.kernel_variant == "genphase":
         for name in ("token_in_flag_batch", "token_back_mode"):
             impl_fields.pop(name)
-    kernel_cls = (
-        src.RubinInferenceGenphaseMegaMoE  # src_gp exports at the package root
-        if cfg.kernel_variant == "genphase"
-        else src.sources.RubinInferenceMegaMoE
-    )
+    if cfg.kernel_variant == "inference_dedup_wg2":
+        impl_fields["epilogue_warpgroups"] = 2
+    if cfg.kernel_variant in DEDUP_VARIANTS:
+        impl_fields["combine_dedup"] = True
+        impl_fields["token_back_ready_granularity"] = "expert"
+    kernel_cls = {  # src_gp exports at the package root
+        "genphase": lambda: src.RubinInferenceGenphaseMegaMoE,
+        "inference_dedup": lambda: src.RubinInferenceMegaMoE,
+        "inference_dedup_wg2": lambda: src.RubinInferenceMegaMoE,
+        "inference": lambda: src.sources.RubinInferenceMegaMoE,
+    }[cfg.kernel_variant]()
     return kernel_cls(problem_desc, ImplDesc(impl_fields))
 
 
@@ -334,6 +340,7 @@ class RubinMegaMoeSession:
         self.kernel = self.kernels.get(False, self.kernels.get(True))
         if not all(
             getattr(k, "masks_invalid_combine_slots", False)
+            or getattr(k, "combine_dedup", False)
             for k in self.kernels.values()
         ):
             raise RuntimeError(
@@ -394,6 +401,17 @@ class RubinMegaMoeSession:
         self.local_workspace = torch.zeros(
             (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
         )
+        # Per-launch scratch of the refreshed inference kernel (src_gp; any content
+        # at launch, nothing survives it). The caching allocator aligns to 512 B.
+        self.tmp_buffer = (
+            torch.empty(
+                (max(int(self.kernel.get_tmp_buffer_bytes()), 1),),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if getattr(self.kernel, "separate_tmp_buffer", False)
+            else None
+        )
         # The fused shared expert's BF16 output rows (local; read after the launch).
         self.shared_output = (
             torch.empty(
@@ -438,6 +456,11 @@ class RubinMegaMoeSession:
             "fc2_weight_sf": _to_cute(w.fc2[1]),
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
+            **(
+                {"tmp_buffer": _to_cute_ptr(self.tmp_buffer)}
+                if self.tmp_buffer is not None
+                else {}
+            ),
             "peer_rank_ptr_mapper_host": self.peer_mapper,
             "stream": _cu_stream(torch.cuda.current_stream()),
         }
@@ -556,6 +579,8 @@ class RubinMegaMoeSession:
         if use_s2 is None:
             use_s2 = self.use_s2(None)
         variant = (use_s2, rmsnorm is not None)
+        if rmsnorm is not None and self.cfg.kernel_variant in DEDUP_VARIANTS:
+            raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
         if rmsnorm is not None:
             kwargs.update(self._rmsnorm_kwargs(*rmsnorm))
         if variant not in self.compiled:
@@ -666,4 +691,5 @@ class RubinMegaMoeSession:
             setattr(self, name, None)
         self._shared_bound.clear()
         self.topk_idx = self.local_workspace = self.empty_output = None
+        self.tmp_buffer = None
         self.shared_output = None

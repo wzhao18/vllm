@@ -25,7 +25,13 @@ import torch
 from .weights import MX_BLOCK, NV_BLOCK, fp4_storage_dtype, is_power_of_two
 
 QuantKind = Literal["mxfp4_mxfp8", "nvfp4"]
-Variant = Literal["inference", "genphase"]
+Variant = Literal["inference", "genphase", "inference_dedup", "inference_dedup_wg2"]
+# "inference_dedup": the refreshed inference kernel (src_gp, FlashInfer main) with the
+# deduplicated combine: the owner rank pre-reduces a token's local expert rows (FP32,
+# one BF16 rounding) and returns one row per (source rank, token); the separate reduce
+# sums the rank rows in ascending rank order (TopkReduceDedup).
+VARIANTS = ("inference", "genphase", "inference_dedup", "inference_dedup_wg2")
+DEDUP_VARIANTS = ("inference_dedup", "inference_dedup_wg2")  # prefill only
 
 # (act data dtype or None = packed fp4, act/weight SF dtype, sf_vec_size,
 #  2x-mode instr K)
@@ -173,7 +179,7 @@ class RubinBucket:
     shared: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
-        if self.variant not in ("inference", "genphase"):
+        if self.variant not in VARIANTS:
             raise ValueError(f"unknown variant {self.variant!r}.")
         if type(self.max_tokens) is not int or self.max_tokens <= 0:
             raise ValueError("max_tokens must be a positive int.")
@@ -265,7 +271,7 @@ class RubinMoeConfig:
     def __post_init__(self) -> None:  # noqa: C901 - verbatim rule list
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
-        if self.kernel_variant not in ("inference", "genphase"):
+        if self.kernel_variant not in VARIANTS:
             raise ValueError(f"unsupported kernel_variant {self.kernel_variant!r}.")
         if self.shared is not None and self.kernel_variant != "genphase":
             raise ValueError("the fused shared expert runs on the GenPhase kernel only.")
@@ -475,6 +481,19 @@ class RubinMoeConfig:
                 raise ValueError(
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
+
+        if self.kernel_variant in DEDUP_VARIANTS:
+            if self.token_back_mode == "epi_warps":
+                raise ValueError(
+                    "the dedup combine pushes rank rows from the combine warps "
+                    "(standalone_warps or reuse_dispatch_warps)."
+                )
+            if not self.fc2_use_bulk:
+                raise ValueError("the dedup combine requires fc2_use_bulk=True.")
+            if self.die_sm_mask32 is not None:
+                raise ValueError("the dedup inference kernel has no die-split schedule.")
+            if self.world_size > 32:
+                raise ValueError("the dedup combine supports at most 32 ranks.")
 
     # -- derived ----------------------------------------------------------------------
 

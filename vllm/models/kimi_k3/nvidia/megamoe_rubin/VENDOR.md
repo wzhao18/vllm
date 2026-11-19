@@ -19,7 +19,7 @@
 
 ## Local differences
 
-The R1 import rewrite (below), S3, E2a and E4a (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
+The R1 import rewrite (below), S3, S6, E2a and E4a (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
 - **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
   epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
@@ -47,6 +47,19 @@ The R1 import rewrite (below), S3, E2a and E4a (below). Dropped relative to the 
   - Accuracy: rel-L2 vs the fp32 oracle 1.73e-3 (stock) vs 1.83e-3. Not bit-identical to the
     stock core (different rounding order of the same approximations).
   - When: every non-batch-invariant launch whose problem carries SiTU betas (no knob/env).
+
+- **S6** (vLLM-local, not upstream) in `sources/communication/nvlink_domain/token_comm.py` (sha256 in the
+  manifest below): the static token_in (prefill dispatch pull: not decode landing, not dynamic claim, not
+  die_split, token_in_flag_batch 1) keeps `token_in_ring_depth` = 4 remote row pulls in flight per transfer warp
+  (4 shared-memory stages, one mbarrier each) instead of one pull -> store -> flag round trip at a time.
+  - Why: each transfer warp walks ~145 dispatched rows per 8192-token launch at EP16, and every row paid a full
+    NVLink read round trip before the next pull started.
+  - What: same rows, same order, same per-row store / scale copy / read drain / ready flag; only the pull of row
+    j + 4 is issued as soon as row j's stage is free (`_token_in_ring`). Bitwise-identical output.
+  - Measured on VR200, real EP16 (16 GPUs, 896 experts = 56/GPU, NVFP4, 8192 tokens/rank, same-time A/B on two
+    4-node halves of one NVL72): one launch 1269 -> 1211 us, 2 x 8192 2523 -> 2413 us; all-local routing
+    959 -> 971 us (no remote pulls to hide).
+  - When: every launch on the static token_in path (no knob/env).
 
 - **E2a** (vLLM-local, not upstream): the latent RMSNorm folded into the BF16 top-k reduce.
   `topk_reduce.py` gains `_reduce_bf16_rmsnorm` and `TopkReduce.__call__(rmsnorm_weight=,
@@ -151,7 +164,7 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
-2c61f81041d4226349956bb9899ee0942f8fe34aed9dc6047d89bbfa951ba66a  sources/communication/nvlink_domain/token_comm.py
+15c482cc351a9c3a9674d26067c736f24a71e0f781cf4fba9a7e4914e758f016  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
@@ -267,6 +280,25 @@ p50 (682 vs 731 us).
   SM -> die mask (impl field ``die_sm_mask32``, ``die_local.current_die_sm_mask32``) when the CuTe
   DSL build has no ``cute.arch.locality_domain_id`` (DSL 4.8.0). ``common/ptx_helpers.read_smid``,
   ``BlockScaledSwapAbGenphaseMoeKernel._die_from_mask``.
+- **S3** (vLLM-local, as on ``src``): ``block_scaled_swap_ab_fc12_epilogue.py`` gated activation keeps the
+  ``src`` SiTU core (one reciprocal per element, ex2/rcp only) instead of FlashInfer main's
+  ``situ_pair_tanh_approx`` (two ``tanh.approx.f32`` per element, ~2^-11 relative error, lower precision than
+  the a368c5f66 sigmoid form). ``use_tanh_sigmoid`` and SwiGLU keep the upstream code. Prefill dedup epilogue
+  only (``SwapABGatedActEpilogueDedup.situ_core_s3``); the GenPhase decode epilogue keeps the upstream core.
+- **W2 / W2S** (vLLM-local): two epilogue warpgroups on the dedup combine. Upstream allows
+  ``epilogue_warpgroups=2`` only with ``epi_warps`` token back (no dedup).
+  ``block_scaled_swap_ab_fc12_epilogue_dedup.py``: each warpgroup stages and pushes its own token half of every
+  FC2 subtile (``split_token_halves`` store mapping, per-warpgroup barrier, as the upstream UBLK path);
+  ``block_scaled_swap_ab_mega_moe_kernel.py``: the 2-warpgroup check admits the dedup combine with
+  ``reuse_dispatch_warps`` (16 warps, W2) or ``standalone_warps`` (W2S: 20 warps, token-back warps 16-19,
+  ``token_warp_register_count`` 56 for warps 12-19 and 144 epilogue registers; setmaxnreg moves registers only
+  inside the CTA's 640 x 96 launch allocation, so a 160-register epilogue deadlocks). Variant
+  ``inference_dedup_wg2``. Same per-row math and output bits as the 1-warpgroup dedup kernel.
+- **inference_dedup** (``config.Variant``): the refreshed inference kernel ``RubinInferenceMegaMoE`` with
+  ``combine_dedup`` (owner-side FP32 pre-reduce of a token's local expert rows, one BF16 row per (source
+  rank, token), ``TopkReduceDedup`` sums the rank rows in ascending rank order; routing weights at FC1). The
+  session allocates its per-launch ``tmp_buffer``. Used by prefill-sized NVFP4 inference buckets
+  (``experts.RUBIN_DEDUP_MIN_TOKENS``).
 - **S-SH** (vLLM-local): the decode scheduler (``GenphaseDecodeFc12Scheduler``) carries the fused
   shared expert's tile stream (``SharedExpertStreamMixin`` from ``fc12_scheduler``) ahead of its
   routed sources, so the die-aware decode form takes the fused shared expert (upstream refuses

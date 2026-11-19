@@ -235,8 +235,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if type(self.epilogue_warpgroups) is not int or self.epilogue_warpgroups not in (1, 2):
             raise ValueError(f"epilogue_warpgroups must be 1 or 2, got {self.epilogue_warpgroups!r}.")
         self.two_epilogue_warpgroups = self.epilogue_warpgroups == 2
+        # vLLM-local W2: the dedup combine also runs two epilogue warpgroups when its rank rows go back
+        # through the dispatch warps (the 16-warp layout below; standalone warps would need 20).
         if self.two_epilogue_warpgroups and (
-            self.token_back_mode != "epi_warps" or self.combine_dedup or self.comm_clusters > 0
+            (self.token_back_mode != "epi_warps" and not self.combine_dedup)
+            or (self.combine_dedup and self.token_back_mode not in ("reuse_dispatch_warps", "standalone_warps"))
+            or self.comm_clusters > 0
         ):
             raise ValueError(
                 "epilogue_warpgroups=2 requires token_back_mode epi_warps, no combine dedup and no communication "
@@ -245,6 +249,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         n_warps = 16 if self.token_back_mode in ("standalone_warps", "hybrid_warps") else 12
         # Two epilogue warpgroups share every accumulator tile (see SwapABGatedActEpilogue), which takes the CTA to
         # 16 warps: epilogue 0-7, MMA 8, TMA A 9, TMA B 10, scheduler 11, transfer 12-15.
+        # Registers of the warps from transfer_warp_idx_start on (dispatch / token-back warps).
+        self.token_warp_register_count = 80
         if self.two_epilogue_warpgroups:
             n_warps = 16
             self.epilogue_warp_ids = tuple(range(8))
@@ -256,6 +262,14 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             self.token_in_end_warp_idx = 16
             self.scheduler_consumer_thread_count = 11 * 32
             self.epilogue_register_count = 176
+            if self.token_back_mode == "standalone_warps":
+                # vLLM-local W2S (dedup combine): standalone token-back warps 16-19 on top of the 16-warp
+                # layout. setmaxnreg moves registers only within the CTA's launch allocation (640 x 96): the
+                # epilogue's increase (256 x 48) must come from the other warps' decreases (128 x 16-24 +
+                # 256 x 40), so 144 epilogue / 80 MMA-TMA / 56 dispatch and token-back registers.
+                n_warps = 20
+                self.epilogue_register_count = 144
+                self.token_warp_register_count = 56
         self.threads_per_cta = n_warps * 32
         # With fewer registers, cuTeDSL 4.10 spills the accumulator-barrier address here and reloads it every tile.
         self.other_warp_register_count = 80
@@ -1604,6 +1618,10 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             12 * 32
             if self.token_back_mode in ("standalone_warps", "hybrid_warps") or self.two_epilogue_warpgroups
             else 8 * 32
+        ) + (
+            4 * 32
+            if self.two_epilogue_warpgroups and self.token_back_mode == "standalone_warps"
+            else 0
         )
         finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
@@ -1751,7 +1769,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             finalize_barrier.arrive_unaligned()
 
         if warp_idx >= Int32(self.transfer_warp_idx_start):
-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
+            cute.arch.warpgroup_reg_dealloc(self.token_warp_register_count)
             if warp_idx < Int32(self.token_in_end_warp_idx):
                 iket.range_push("mega.token_in")
                 self.token_comm.token_in(self._smem_workspace, smem_base)
@@ -2086,7 +2104,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
 
             # Donate registers from complete warpgroups, including idle warps.
             if warp_idx >= Int32(self.transfer_warp_idx_start):
-                cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
+                cute.arch.warpgroup_reg_dealloc(self.token_warp_register_count)
             if cutlass.const_expr(self.token_back_on_compute_ctas):
                 if (warp_idx >= self.token_comm.combine_warp_start) & (
                     warp_idx < self.token_comm.combine_warp_start + self.token_comm.combine_warp_count

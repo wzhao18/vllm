@@ -61,6 +61,7 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from .config import (
+    DEDUP_VARIANTS,
     SHIPPED_KNOBS,
     QuantKind,
     RubinBucket,
@@ -130,6 +131,17 @@ RUBIN_WIDE_EP_DECODE_TOKENS = 128
 # 65.6 us at 32 / 96 / 128 tokens per rank (rel-L2 vs the bf16 reference 0.166 both).
 # EP28 keeps the inference kernel (not measured).
 RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
+
+# Prefill-sized NVFP4 inference buckets (at least RUBIN_DEDUP_MIN_TOKENS tokens per rank:
+# the P3-16 8192-token sub-call) run the refreshed inference kernel with the deduplicated
+# combine and two epilogue warpgroups (variant inference_dedup_wg2, token back from
+# standalone warps): one BF16 row per (owner rank, token) crosses NVLink instead of one
+# per route (EP16 top-16: ~10.3 instead of 16 rows per token), and the FC1/FC2 epilogue
+# (the compute-side bound) runs on 8 warps. Measured on VR200 (NVFP4, 56 experts/GPU,
+# 2 x 8192 tokens/rank, random routing): EP4 2110 (shipped) -> 1893 (dedup) -> 1736 us.
+RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
+RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
+RUBIN_DEDUP_MIN_TOKENS = 4096
 RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     mma_tiler_mnk=(256, 128, 256),
     cluster_shape_mn=(4, 1),
@@ -268,10 +280,31 @@ def select_rubin_buckets(
     if world_size in RUBIN_GENPHASE_DECODE_EP_SIZES and problem.quant_kind == "nvfp4":
         buckets = [_genphase_decode(b) for b in buckets]
         main = _genphase_decode(main)
+    if problem.quant_kind == "nvfp4":
+        buckets = [_prefill_dedup(b) for b in buckets]
+        main = _prefill_dedup(main)
     for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
     return (*buckets, main), notes + extra
+
+
+def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
+    """A prefill-sized inference bucket on the refreshed dedup-combine kernel (same
+    tile/schedule knobs, token back from standalone warps); others unchanged."""
+    if (
+        bucket.variant != "inference"
+        or bucket.die_sm_mask32 is not None
+        or bucket.max_tokens < RUBIN_DEDUP_MIN_TOKENS
+    ):
+        return bucket
+    return dataclasses.replace(
+        bucket,
+        variant=RUBIN_DEDUP_VARIANT,
+        knobs=dataclasses.replace(
+            bucket.knobs, token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE
+        ),
+    )
 
 
 def _genphase_decode(bucket: RubinBucket) -> RubinBucket:
@@ -696,24 +729,29 @@ class KimiK3MegaMoEExperts(nn.Module):
         # die-local 148.3 / 158.6 / 158.9, full-grid die-local 140.8 / 149.8 / 150.5
         # (bitwise equal). Capped, each die's stream gets the clusters the side
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
+        # The prefill-sized dedup buckets have no die-split schedule: they keep the
+        # die-oblivious form and leave the decode buckets' die-local choice alone.
         die_mask = None
         if die_local and not self.prefill_worker and all(
             tuple(bucket.knobs.schedule_policy)[0]
             == ("decode" if bucket.variant == "genphase" else "phase_interleave")
             for bucket in self.buckets
+            if bucket.variant not in DEDUP_VARIANTS
         ):
             from . import die_local
 
             die_mask = die_local.current_die_sm_mask32()
-        self.buckets = tuple(
-            dataclasses.replace(
+
+        def _placed(bucket: RubinBucket) -> RubinBucket:
+            mask = None if bucket.variant in DEDUP_VARIANTS else die_mask
+            return dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
-                max_sm_count=max_sm_count if die_mask is None else None,
-                die_sm_mask32=die_mask,
+                max_sm_count=max_sm_count if mask is None else None,
+                die_sm_mask32=mask,
             )
-            for bucket in self.buckets
-        )
+
+        self.buckets = tuple(_placed(bucket) for bucket in self.buckets)
         self.bucket = self.buckets[-1]
         # The overlap runs under sequence parallelism: each TP rank holds a 1/TP
         # shard of its DP batch (sequence_parallel_chunk).
