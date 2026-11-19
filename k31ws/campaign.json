@@ -220,6 +220,30 @@
   {
    "t": "11-18 17:00",
    "text": "HW (measured): die-local HBM read 18.4 TB/s (model 17.1, 7% conservative), default 12.75, remote 7.0; 1-CTA SS MMA capped at 2/3 double-K peak (TMEM-A or 2-CTA reaches full); counted TMA stores rejected by CUDA 13.4 ptxas (use multicast store / bulk multicast); 4-GPU flag round 10.9 us chained vs 3.3 us multicast."
+  },
+  {
+   "t": "11-18 17:20",
+   "text": "FAST: step-bench iteration cut 247 s -> ~85 s (persistent Lustre JIT caches, fixed overlay mount, model-registry cache thrash fixed, CPU-side pre-check before taking GPUs)."
+  },
+  {
+   "t": "11-18 18:10",
+   "text": "D-MOE landed-ready 4b58015c31 (reconciled with EN, 157 megamoe tests pass): decode MegaMoE exposed ~1.5-1.6 ms per 23 layers on the die-split slice."
+  },
+  {
+   "t": "11-18 20:40",
+   "text": "D-ATTN: LocalQuery in-step on NVFP4 slice brings the DSA attention family 0.91 -> 0.62 ms (model 0.36), but INFRA blocked the merge: test_sp_dsa_block_matches_stock_layer fails at R68 (q codes). Native sparse MLA decode v1 is exact but 49.5 vs 40.6 us (trtllm-gen) at R384."
+  },
+  {
+   "t": "11-18 17:55",
+   "text": "P-KDA model note: the prefill KDA recurrence is latency-bound per 16-token step (stock 1.16 us, tcgen05 floor ~0.85 us), so the core floor is ~290 us/layer, not the model 167 us (bytes/BW). Model fix candidate."
+  },
+  {
+   "t": "11-18 17:05",
+   "text": "P-IDX: stock-precision idx_score hardware floor 0.66 ms/layer at full issue (model prices an FP32 epilogue at 1.21 ms: model over-prices)."
+  },
+  {
+   "t": "11-18 18:10",
+   "text": "P-MLA: hybrid-orientation sparse MLA kernel (QK heads-on-M with Q in TMEM, PV keys-on-M, 576 TMEM cols) is correct; timing in progress."
   }
  ]
 }

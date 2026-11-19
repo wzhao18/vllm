@@ -2,14 +2,6 @@
  "note": "Rolling holds from holdd-ws.sh (1-node class for kernel work, one standing 8-node request for EP32/DP8). GPUs are shared through wsgpu.sh locks.",
  "holds": [
   {
-   "job": "74565",
-   "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "COMPLETING",
-   "nodes": "1",
-   "start": "2026-11-18T16:32:07",
-   "left": "1:52:26"
-  },
-  {
    "job": "72524",
    "name": "coreai_cserve_dev-k31ws.hold8",
    "state": "PENDING",
@@ -30,7 +22,7 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T19:52:00",
+   "start": "2026-11-18T19:09:00",
    "left": "8:00:00"
   },
   {
@@ -38,11 +30,19 @@
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T20:00:00",
+   "start": "2026-11-18T19:50:00",
    "left": "8:00:00"
   },
   {
    "job": "74826",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "PENDING",
+   "nodes": "1",
+   "start": "N/A",
+   "left": "8:00:00"
+  },
+  {
+   "job": "74895",
    "name": "coreai_cserve_dev-k31ws.hold1",
    "state": "PENDING",
    "nodes": "1",
@@ -55,7 +55,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T16:20:46",
-   "left": "1:23:01"
+   "left": "1:19:53"
   },
   {
    "job": "74587",
@@ -63,7 +63,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T16:37:17",
-   "left": "1:41:32"
+   "left": "1:38:24"
   },
   {
    "job": "74071",
@@ -71,7 +71,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:51:24",
-   "left": "2:32:39"
+   "left": "2:29:31"
   },
   {
    "job": "74062",
@@ -79,7 +79,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:50:22",
-   "left": "2:31:37"
+   "left": "2:28:29"
   },
   {
    "job": "74059",
@@ -87,7 +87,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:49:51",
-   "left": "2:31:06"
+   "left": "2:27:58"
   },
   {
    "job": "74056",
@@ -95,7 +95,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:48:48",
-   "left": "2:30:03"
+   "left": "2:26:55"
   },
   {
    "job": "74046",
@@ -103,7 +103,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:47:46",
-   "left": "2:29:01"
+   "left": "2:25:53"
   },
   {
    "job": "74040",
@@ -111,7 +111,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:46:44",
-   "left": "2:27:59"
+   "left": "2:24:51"
   },
   {
    "job": "74730",
@@ -119,7 +119,7 @@
    "state": "RUNNING",
    "nodes": "8",
    "start": "2026-11-18T16:54:49",
-   "left": "4:36:04"
+   "left": "4:32:56"
   }
  ]
 }

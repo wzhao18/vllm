@@ -7,7 +7,7 @@
  "updated": "2026-11-18T17:10-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 15.32,
- "current_ms": 53.3,
+ "current_ms": 15.32,
  "achievable_ms": 8.44,
  "target_ms": 9.28,
  "step_ms": 218.7,
@@ -88,6 +88,11 @@
    "t": "16:59",
    "what": "Store path experiments (natural order + scale transpose warp, per-warp 64 B bulk stores, MMA-row-order staging with warpgroup bulk stores, maxima in select) + in-kernel clock64 phase profile",
    "result": "MMA-only 0.54 ms; score 2.28 ms (epilogue issue-bound ~45%); select 0.96 ms; total 3.24 ms vs stock 2.22 -> not landable yet (runs/P-IDX/two12.log)"
+  },
+  {
+   "t": "17:25",
+   "what": "coordinator: current reset to slice units (15.32 ms, 24 DSA layers x 0.638)",
+   "result": "53.3 was a 93-layer x per-layer number; report current in the slice scope of the baseline"
   }
  ],
  "next": "Raise epilogue occupancy in IndexerScore (6 epilogue WGs, 1-token TMEM batches; check REG via benchmarks/kimi_k3/dump_pidx_sass.sh: cuobjdump -res-usage, no nvdisasm in image), re-run: on Rhea login: bash k31vr-dev/k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/p-idx <tag>; wsgpu.sh -g 1 -m 20 -o <tag> -n P-IDX -- env CUTE_DSL_ARCH=sm_107a bash benchmarks/kimi_k3/run_pidx.sh runs/P-IDX/<name> (prints stock reference, --check exactness, score modes 2=MMA only, 3=no global store, 0=full, clk profile, select).",

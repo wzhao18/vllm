@@ -4,7 +4,7 @@
  "side": "infra",
  "owner": "FAST agent (workflow)",
  "state": "measuring",
- "updated": "2026-11-18T17:12-08:00",
+ "updated": "2026-11-18T17:30-08:00",
  "shape": "Wall time of one warm-cache D3-32 1-node step bench (r8/r16/r24, prof=1, base-4fbaa15), container start to exit, ms; plus pool GPU-min lost to failed runs",
  "basis": "MEASURED: warm D3-32 step bench wall (container start to exit), base-4fbaa15 r8/r16/r24 prof: baseline 247 s (findings 14:00), tri-1 261 s; current runs/FAST/step_d/cut-2 85 s (same-node A/B vs jw-2: medians within 0.05%)",
  "gap_analysis": "A warm D3-32 step bench takes 247 s wall for ~40 s of cases: container+imports 8 s, config 11 s, dist init 10 s, model+dummy load 23 s, KV profile run 42 s, KV prepare + CuTe compiles 21 s, JIT kernel warmup 10 s, prefill-glue + tokenspeed MLA Triton compiles 39 s, router/CuTe warmup 5 s, serving-shape warmup 18 s, cases 28 s (incl. late Triton JITs), teardown 13 s. Root cause of most JIT time: the container /tmp (TRITON_CACHE_DIR, CUDA_CACHE_PATH) is a fresh tmpfs per srun step, so every run recompiled every Triton kernel; fixed (Lustre caches), effect being measured. Cold builds on new sources: flashkda_split 80-135 s, dcp_exchange 34 s (was rebuilt per overlay; now shared by digest). Kimi K3 CuTe cache misses 26-45 kernels/rank on a warm overlay (key includes real tensor addresses): ~27 s per start. NVFP4 slices: model init 235-291 s + MegaMoE runtime setup up to 154 s, not yet attributed. Queue: 80% of hold-GPU-minutes lock-busy but 32% of that in failed runs; holds are backfill jobs preempted 30-60 min after start (PreemptMode CANCEL), so the pool is 2-3 nodes for 14 agents and waits are 5-47 min for 4-GPU requests.",
@@ -73,9 +73,19 @@
    "t": "17:12",
    "what": "prefill A/B NVFP4 step_p pjw-1 vs pcut-1 (same node)",
    "result": "F16K 208459.8 vs 208998.8 us (+0.26%, spread 0.57-1.08%), F8K 107066.1 vs 107108.3 (+0.04%); engine init 52.5 -> 6.0 s"
+  },
+  {
+   "t": "17:20",
+   "what": "CPU cProfile of ModelConfig: registry inspect subprocess 9.1 s every start (modelinfos single shared file flipped by overlays); installed per-overlay VLLM_CACHE_ROOT (own modelinfos, symlinks to shared builds)",
+   "result": "ModelConfig 13.3 -> 7.2 s on the second start"
+  },
+  {
+   "t": "17:30",
+   "what": "CPU import profile of the drafter backend (8 s silent in-run after TOKENSPEED_MLA)",
+   "result": "~680 source compiles per start (overlay pyc not reused); testing PYTHONPYCACHEPREFIX per overlay"
   }
  ],
- "next": "Read prefill A/B; then usage.log failed fraction + model-init distribution after 18:00",
+ "next": "pyc prefix test (runs/FAST/pyc.out); then pool failed-fraction + model-init distribution since 17:00",
  "blockers": "GPU queue: 2 running hold1 nodes for ~17 requests; FAST measurement waits like everyone else. Hecate login needs MFA.",
  "branch": "none (tools only, k31ws/tools on Rhea, mirrored locally)",
  "evidence": [
