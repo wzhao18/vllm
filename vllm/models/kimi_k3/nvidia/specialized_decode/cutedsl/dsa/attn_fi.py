@@ -109,7 +109,10 @@ def fi_kernels(kv_cache_dtype) -> tuple[str, ...]:
 
 
 def kernel_for(rows, dcp, kernels):
-    """The sparse MLA kernel of one batch: the measured choice among ``kernels``."""
+    """The sparse MLA kernel of one batch: the measured choice among ``kernels`` (a
+    "rows:kernel" batch table string: its entry for ``rows``, trtllm-gen elsewhere)."""
+    if isinstance(kernels, str):
+        return batch_table(kernels).get(rows, "trtllm")
     if len(kernels) == 1:
         return kernels[0]
     choice = batch_table(FI_KERNEL["dcp" if dcp else "tp"]).get(rows, "prims_ts")
@@ -286,9 +289,35 @@ class FlashInferCore:
             lse = self.lse[: rows * heads].view(rows, heads)
         if self.kernels[rows] == "prims_ts":
             self.prims_ts(query, kv, slots, valid, latent, lse)
+        elif self.kernels[rows] == "km":
+            self.keys_on_m(query, kv, slots, valid, latent, lse)
         else:
             self.trtllm(query, kv, stride_rows, slots, valid, latent, lse, block_size)
         return latent, lse
+
+    def keys_on_m(self, query, kv, slots, valid, latent, lse):
+        """sparse_mla_km: the Rubin keys-on-M sparse MLA over the 96 real heads (the
+        trtllm-gen arithmetic: E4M3 P at 448 of the running max, FP32 sums, one
+        unsplit pass per row as trtllm-gen at these row counts; base-2 LSE)."""
+        from .sparse_mla_km import H, sparse_mla_decode_km
+
+        impl = self.impl
+        if lse is None or self.fmt != "native" or self.heads < H:
+            raise ValueError(
+                f"Kimi K3.1 DSA keys-on-M sparse MLA: DCP LSE, a per-tensor FP8 cache "
+                f"and >= {H} query heads (got heads {self.heads}, {self.fmt})"
+            )
+        impl._prepare_mqa_kernel(self.layer, query.device)
+        sparse_mla_decode_km(
+            query.view(torch.uint8),
+            kv.view(torch.uint8),
+            slots,
+            valid,
+            latent,
+            lse,
+            impl.bmm1_scale,
+            impl.bmm2_scale,
+        )
 
     def prims_ts(self, query, kv, slots, valid, latent, lse):
         layer = self.layer
