@@ -2115,8 +2115,6 @@ def _pkd(
                     # -- phase 3: q/k load + l2norm + anchored decorations --
                     # (unroll=2 measured-closed: 1.569x -> 1.445x fixed_h96 —
                     # the 48-reg prep diet spills, reconfirming the v60 re-roll)
-                    if tma:
-                        cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
                     if cutlass.const_expr(FUSED_CONV_ == 1):
                         # Width-4 causal conv + SiLU of the raw q/k tiles, in
                         # place (the qkv_conv arithmetic: FP32 weights, oldest
@@ -2163,6 +2161,9 @@ def _pkd(
                                 )
                             fz_cwin[fz_cj, 0] = cutlass.Float32(fz_c2[0])
                             fz_cwin[fz_cj, 1] = cutlass.Float32(fz_c2[1])
+                    if tma:
+                        cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
+                    if cutlass.const_expr(FUSED_CONV_ == 1):
                         for fz_crr in cutlass.range_constexpr(C):
                             if fz_cpl == 0:
                                 cute.autovec_copy(
