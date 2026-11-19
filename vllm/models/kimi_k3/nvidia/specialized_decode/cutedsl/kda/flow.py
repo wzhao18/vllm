@@ -119,6 +119,10 @@ PACKED = True
 # chunk's vectors before using the current ones (PREFETCH).
 FOLD_FENCE = 1
 PREFETCH = False
+# Verify passes: token t's update pass fused with token t + 1's decay pass (one pass
+# over the state per token, two independent accumulator sets; same per-element
+# operations and order).
+FUSED = True
 # Item table columns.
 SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
 META = 8
@@ -225,7 +229,7 @@ class KdaFlow(KdaWS):
         )
         self.stages = stages
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
-        self.fold_fence, self.prefetch = FOLD_FENCE, PREFETCH
+        self.fold_fence, self.prefetch, self.fused = FOLD_FENCE, PREFETCH, FUSED
         self.skip = tuple(SKIP)
 
     @cute.jit
@@ -647,13 +651,21 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr(self.trace):
                     td = clock64()
                     tr[3] = tr[3] + (td - tc)
-                for t in cutlass.range_constexpr(T):
+                if cutlass.const_expr(self.fused):
+                    release = (args, c, j, count, pages, table, state_full, stored)
                     if cutlass.const_expr("verify" not in self.skip):
-                        self.verify_token(hist, t, g, betas[j, t], lane_in, base,
-                                          q_s, k_s, v_s, d_s, uo)  # fmt: skip
-                    if cutlass.const_expr(t == min(1, T - 1)):
-                        self.release_slot(args, c, j, count, pages, table, state_full,
-                                          stored)  # fmt: skip
+                        self.verify_fused(hist, g, betas, j, lane_in, base, q_s, k_s,
+                                          v_s, d_s, uo, release)  # fmt: skip
+                    else:
+                        self.release_slot(*release)
+                else:
+                    for t in cutlass.range_constexpr(T):
+                        if cutlass.const_expr("verify" not in self.skip):
+                            self.verify_token(hist, t, g, betas[j, t], lane_in, base,
+                                              q_s, k_s, v_s, d_s, uo)  # fmt: skip
+                        if cutlass.const_expr(t == min(1, T - 1)):
+                            self.release_slot(args, c, j, count, pages, table,
+                                              state_full, stored)  # fmt: skip
                 if cutlass.const_expr(self.trace):
                     te = clock64()
                     tr[4] = tr[4] + (te - td)
@@ -823,6 +835,77 @@ class KdaFlow(KdaWS):
         else:
             o = self.row_sum8(partials, lane_in)
         o_s[b, t, own] = Float32(BFloat16(o))
+
+    @cute.jit
+    def correction(self, dots, t, b, beta_t, lane_in, base, v_s, uo):
+        """Token t's corrections from the decay pass's partials: lane l's row
+        base + l into the store buffer, then the lane group's 8 rows back."""
+        own = base + lane_in
+        partials = [pair_total(dots[rr, None, None]) for rr in range(ROWS)]
+        dot = self.row_sum8(partials, lane_in)
+        uo[t, own] = (v_s[b, t, own] - dot) * beta_t
+        cute.arch.sync_warp()  # the lane group's corrections are in uo
+        u_lo = load_shared_f32x4(at(uo, t, base))
+        u_hi = load_shared_f32x4(at(uo, t, base + 4))
+        return [u_lo[0], u_lo[1], u_lo[2], u_lo[3], u_hi[0], u_hi[1], u_hi[2],
+                u_hi[3]]  # fmt: skip
+
+    @cute.jit
+    def verify_fused(self, hist, b, betas, j, lane_in, base, q_s, k_s, v_s, d_s, uo,
+                     release):  # fmt: skip
+        """The q verify tokens with one pass over the state per token: token t's
+        update pass (S += k_t u_t, out_t = S q_t) fused with token t + 1's decay pass
+        (S *= d_t+1, dot_t+1 = S k_t+1); each element sees KdaWS's operations in
+        KdaWS's order."""
+        T: cutlass.Constexpr = self.tokens
+        o_s = v_s
+        own = base + lane_in
+
+        def chunk_of(buffer, t, ch):
+            return load_shared_f32x4(at(buffer, b, t, 4 * (lane_in + LANES * ch)))
+
+        dots = zeros((ROWS, 2, 2), Float32)
+        for ch in cutlass.range_constexpr(CHUNKS):
+            d4, k4 = chunk_of(d_s, 0, ch), chunk_of(k_s, 0, ch)
+            for rr in cutlass.range_constexpr(ROWS):
+                for pp in cutlass.range_constexpr(2):
+                    pair = (hist[rr, ch, 2 * pp], hist[rr, ch, 2 * pp + 1])
+                    pair = self.pmul(pair, (d4[2 * pp], d4[2 * pp + 1]))
+                    hist[rr, ch, 2 * pp], hist[rr, ch, 2 * pp + 1] = pair
+                    acc = (dots[rr, pp, 0], dots[rr, pp, 1])
+                    acc = self.pfma(pair, (k4[2 * pp], k4[2 * pp + 1]), acc)
+                    dots[rr, pp, 0], dots[rr, pp, 1] = acc
+        u = self.correction(dots, 0, b, betas[j, 0], lane_in, base, v_s, uo)
+        for t in cutlass.range_constexpr(T):
+            NEXT: cutlass.Constexpr = t + 1 < T
+            outs = zeros((ROWS, 2, 2), Float32)
+            dots = zeros((ROWS, 2, 2), Float32)
+            for ch in cutlass.range_constexpr(CHUNKS):
+                k4, q4 = chunk_of(k_s, t, ch), chunk_of(q_s, t, ch)
+                if cutlass.const_expr(NEXT):
+                    d4n, k4n = chunk_of(d_s, t + 1, ch), chunk_of(k_s, t + 1, ch)
+                for rr in cutlass.range_constexpr(ROWS):
+                    for pp in cutlass.range_constexpr(2):
+                        pair = (hist[rr, ch, 2 * pp], hist[rr, ch, 2 * pp + 1])
+                        kp = (k4[2 * pp], k4[2 * pp + 1])
+                        pair = self.pfma(kp, (u[rr], u[rr]), pair)
+                        acc = (outs[rr, pp, 0], outs[rr, pp, 1])
+                        acc = self.pfma(pair, (q4[2 * pp], q4[2 * pp + 1]), acc)
+                        outs[rr, pp, 0], outs[rr, pp, 1] = acc
+                        if cutlass.const_expr(NEXT):
+                            pair = self.pmul(pair, (d4n[2 * pp], d4n[2 * pp + 1]))
+                            acc = (dots[rr, pp, 0], dots[rr, pp, 1])
+                            acc = self.pfma(pair, (k4n[2 * pp], k4n[2 * pp + 1]), acc)
+                            dots[rr, pp, 0], dots[rr, pp, 1] = acc
+                        hist[rr, ch, 2 * pp], hist[rr, ch, 2 * pp + 1] = pair
+            if cutlass.const_expr(NEXT):
+                u = self.correction(dots, t + 1, b, betas[j, t + 1], lane_in, base, v_s,
+                                    uo)  # fmt: skip
+            partials = [pair_total(outs[rr, None, None]) for rr in range(ROWS)]
+            o = self.row_sum8(partials, lane_in)
+            o_s[b, t, own] = Float32(BFloat16(o))
+            if cutlass.const_expr(t == min(1, T - 1)):
+                self.release_slot(*release)
 
     @cute.jit
     def epilogue(self, args, g, c, o_s, g_s, out_sums, nw, oo):
