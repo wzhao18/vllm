@@ -435,6 +435,54 @@ void k64_rec(const Tensor& kdq, const Tensor& kr, const Tensor& inv,
                 static_cast<cudaStream_t>(stream_ptr));
 }
 
+void launch_kc64_tc(void const* wq, void const* u, void const* kr, void const* mqk,
+                    float const* gt, float const* init_state, float* final_state, void* out,
+                    int const* cu_seqlens, int H, int N, int C_total, int flags, long long* dbg,
+                    cudaStream_t stream);
+
+// Chunk-64 state chain with the FP32 state in tensor memory (kc64_tc.cu).
+// wq [H][C][16][128][8], u [H][C][64][128], kr [H][C][8][128][8],
+// mqk [H][C][8][64][8] bf16 images; gt (H, C, 128) fp32; states (N, H, 128 v,
+// 128 k) fp32 (init_state with numel 0 = zero state); out (T, H, 128) bf16.
+void kc64_rec(const Tensor& wq, const Tensor& u, const Tensor& kr, const Tensor& mqk,
+              const Tensor& gt, const Tensor& init_state, const Tensor& final_state,
+              const Tensor& out, const Tensor& cu_seqlens, int64_t flags, const Tensor& dbg) {
+  STD_TORCH_CHECK(out.dim() == 3 && out.size(2) == 128 && out.is_contiguous() &&
+                      out.scalar_type() == ScalarType::BFloat16,
+                  "kc64_rec: out must be contiguous bf16 (T, H, 128)");
+  const int64_t H = out.size(1);
+  const int64_t N = cu_seqlens.numel() - 1;
+  STD_TORCH_CHECK(gt.dim() == 3 && gt.size(0) == H && gt.size(2) == 128 &&
+                      gt.scalar_type() == ScalarType::Float && gt.is_contiguous(),
+                  "kc64_rec: g_total must be fp32 (H, C, 128)");
+  const int64_t C = gt.size(1);
+  STD_TORCH_CHECK(wq.is_contiguous() && wq.numel() == H * C * 128 * 128 &&
+                      wq.scalar_type() == ScalarType::BFloat16, "kc64_rec: w|qd image");
+  STD_TORCH_CHECK(u.is_contiguous() && u.numel() == H * C * 64 * 128 &&
+                      u.scalar_type() == ScalarType::BFloat16, "kc64_rec: u image");
+  STD_TORCH_CHECK(kr.is_contiguous() && kr.numel() == H * C * 64 * 128 &&
+                      kr.scalar_type() == ScalarType::BFloat16, "kc64_rec: kr image");
+  STD_TORCH_CHECK(mqk.is_contiguous() && mqk.numel() == H * C * 64 * 64 &&
+                      mqk.scalar_type() == ScalarType::BFloat16, "kc64_rec: Mqk image");
+  const bool has_init = init_state.numel() > 0;
+  STD_TORCH_CHECK((!has_init || (init_state.numel() == N * H * 128 * 128 &&
+                                 init_state.scalar_type() == ScalarType::Float)) &&
+                      final_state.numel() == N * H * 128 * 128 &&
+                      final_state.scalar_type() == ScalarType::Float,
+                  "kc64_rec: states must be fp32 (N, H, 128, 128)");
+  STD_TORCH_CHECK(cu_seqlens.scalar_type() == ScalarType::Int, "kc64_rec: int32 cu_seqlens");
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(
+      aoti_torch_get_current_cuda_stream(out.get_device_index(), &stream_ptr));
+  launch_kc64_tc(wq.const_data_ptr(), u.const_data_ptr(), kr.const_data_ptr(),
+                 mqk.const_data_ptr(), reinterpret_cast<const float*>(gt.const_data_ptr()),
+                 has_init ? reinterpret_cast<const float*>(init_state.const_data_ptr()) : nullptr,
+                 reinterpret_cast<float*>(final_state.mutable_data_ptr()), out.mutable_data_ptr(),
+                 reinterpret_cast<const int*>(cu_seqlens.const_data_ptr()), int(H), int(N),
+                 int(C), int(flags), reinterpret_cast<long long*>(dbg.mutable_data_ptr()),
+                 static_cast<cudaStream_t>(stream_ptr));
+}
+
 void launch_prep64(void const* q, void const* k, void const* g, void const* beta,
                    int64_t row_stride_qk, int64_t row_stride_g, int64_t row_stride_beta,
                    float const* a_log, float const* dt_bias, float lower_bound, float scale,
