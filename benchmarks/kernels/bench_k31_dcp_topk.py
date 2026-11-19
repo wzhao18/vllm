@@ -76,7 +76,10 @@ def main():
     ap.add_argument("--warm", type=int, default=0, help="8K^3 bf16 matmuls before each replay")
     ap.add_argument("--impl", default="merge", choices=["merge", "v2"])
     ap.add_argument("--check", type=int, default=1, help="v2: compare with topk_merge")
+    ap.add_argument("--k", type=int, default=2048, help="top-k (1-GPU ncu emulation: K / DCP)")
     a = ap.parse_args()
+    global K
+    K = a.k
 
     dist.init_process_group("nccl")
     rank, W = dist.get_rank(), dist.get_world_size()
