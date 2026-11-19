@@ -920,7 +920,16 @@ def barrier_sync_unaligned(barrier_id, num_threads, *, loc=None, ip=None):
 
 
 
+
+@dsl_user_op
+def read_smid(*, loc=None, ip=None) -> Int32:
+    """%smid of the calling thread's SM (vLLM-local, VENDOR.md S-DIE)."""
+    return Int32(
+        llvm.inline_asm(T.i32(), [], "mov.u32 $0, %smid;", "=r", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
+    )
+
 __all__ = [
+    "read_smid",
     "barrier_sync_unaligned",
     "TmaCacheHintEvictFirst",
     "cp_async_bulk_s2g",

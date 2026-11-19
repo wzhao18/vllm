@@ -228,6 +228,7 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         # die claims the tiles of the experts homed on it (die_local.place_experts:
         # [0, E/2) on die 0), reading its die from %locality_domain_id.
         impl_fields["die_aware"] = "expert_half"
+        impl_fields["die_sm_mask32"] = tuple(cfg.die_sm_mask32)
     elif cfg.die_sm_mask32 is not None:
         # Die-local expert streams: FlashInfer's two-ended expert claim over the
         # die-homed weights (die_local.place_experts); the kernel reads the die of

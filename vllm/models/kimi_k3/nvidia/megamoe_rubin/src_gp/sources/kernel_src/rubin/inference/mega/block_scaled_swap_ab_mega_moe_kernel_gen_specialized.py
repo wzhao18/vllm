@@ -92,7 +92,7 @@ from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
 )
-from ......common.ptx_helpers import barrier_sync_unaligned
+from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -200,6 +200,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             "total_helper_slots": OptionalRequirement(int),
             # None = off; cluster_shape_mn is not declared here: it is checked by value below.
             "die_aware": OptionalRequirement(Optional[str]),
+            # vLLM-local (VENDOR.md S-DIE): the trusted SM -> die mask (bit s of the 32-bit
+            # words set when SM s is on die 1) when the DSL has no %locality_domain_id.
+            "die_sm_mask32": OptionalRequirement(Optional[tuple]),
             **shared_kernel_impl_requirements(),
         }
 
@@ -287,6 +290,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         self.die_aware = impl_desc.get("die_aware") or "off"
+        self.die_sm_mask32 = impl_desc.get("die_sm_mask32")
         if self.die_aware not in ("off", "on", "expert_half"):
             raise ValueError(f"die_aware must be off, on or expert_half, got {self.die_aware!r}.")
         # on: each expert's weight rows are halved between the dies (die-major weights, n_split);
@@ -693,6 +697,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     def require_zero_workspace_leading_bytes(self) -> Tuple[int, int]:
         return self._device_workspace.require_zero_workspace_leading_bytes
 
+    @cute.jit
+    def _die_from_mask(self) -> Int32:
+        """Die of this SM from the trusted mask (vLLM-local, VENDOR.md S-DIE)."""
+        smid = read_smid()
+        word = smid >> 5
+        bit = smid & 31
+        die = Int32(0)
+        for w in cutlass.range_constexpr(len(self.die_sm_mask32)):
+            if cutlass.const_expr(self.die_sm_mask32[w] != 0):
+                if word == w:
+                    die = Int32((cutlass.Uint32(self.die_sm_mask32[w]) >> cutlass.Uint32(bit)) & cutlass.Uint32(1))
+        return die
+
     def name(self) -> str:
         """Canonical encoding of every constexpr: the compiled-kernel cache key.
 
@@ -926,7 +943,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             ):
                 if cutlass.const_expr(scalar is None):
                     raise ValueError(f"{self.quant_kind} requires {scalar_name}.")
-        if cutlass.const_expr(self.die_aware != "off" and not hasattr(cute.arch, "locality_domain_id")):
+        if cutlass.const_expr(
+            self.die_aware != "off" and self.die_sm_mask32 is None and not hasattr(cute.arch, "locality_domain_id")
+        ):
             raise RuntimeError(
                 "die_aware reads the die of each SM with cute.arch.locality_domain_id (PTX %locality_domain_id), "
                 "which this CuTe DSL build lacks: use one that provides cute.arch.locality_domain_id."
@@ -1496,7 +1515,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             die = None
             if cutlass.const_expr(self.die_aware != "off"):
                 # %locality_domain_id is the die of this CTA's SM; a cluster lies within one GPC, so within one die.
-                die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
+                if cutlass.const_expr(self.die_sm_mask32 is not None):
+                    die = cute.arch.make_warp_uniform(self._die_from_mask())
+                else:
+                    die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
             self.scheduler.assign_device_members(
                 expert_token_sizes=scheduler_expert_sizes,
                 block_idx=block_idx,
