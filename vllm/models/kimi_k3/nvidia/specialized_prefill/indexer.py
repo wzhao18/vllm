@@ -995,11 +995,13 @@ def key_of(words, e: int) -> Uint32:
 
 
 CAND = 4096  # bound-bin keys kept per row (more: the finish kernel's exact path)
-CHUNK_V = 1024  # 16-byte vectors per mark work unit (8192 positions)
-MARK_THREADS = 128
+CHUNK_V = 2048  # 16-byte vectors per mark work unit (16384 positions)
+MARK_THREADS = 256
+MARK_LOADS = CHUNK_V // MARK_THREADS  # loads in flight per thread (one round per unit)
 MARK_BUF = 2048  # bound-bin keys of one mark chunk kept in shared memory
 FIN_THREADS = 128  # four rows per finish CTA, one warp each
 TIE_BUF = 512  # threshold ties ranked in shared memory per row
+FIN_BATCH = 8  # global loads in flight per lane in the finish kernel
 
 
 @asm(Uint32)
@@ -1011,6 +1013,12 @@ def atom_add_global(address, value):
 @asm()
 def red_or_global(address, value):
     return "red.global.or.b32 [$0], $1;", "l,r,~{memory}", (Int64(address), Uint32(value))
+
+
+@asm()
+def ldg_cg_v4(address):
+    code = "ld.global.cg.v4.u32 {$0,$1,$2,$3}, [$4];"
+    return code, "=r,=r,=r,=r,l,~{memory}", (Int64(address),), (Uint32,) * 4
 
 
 @asm(Uint32)
@@ -1091,17 +1099,17 @@ class PrefillMark:
                 high = low + Uint32(32)
                 positive = low >= Uint32(0x8000)
                 low_f = float_of_bits((low ^ Uint32(0x8000)) << Uint32(16))
-                for i in cutlass.range_constexpr(CHUNK_V // MARK_THREADS // 4):
-                    # four rounds of two vectors in flight per thread
+                for i in cutlass.range_constexpr(1):
+                    # the unit's vectors all in flight at once
                     batch = []
-                    for k in cutlass.range_constexpr(4):
-                        v = v0 + (i * 4 + k) * MARK_THREADS + tid
+                    for k in cutlass.range_constexpr(MARK_LOADS):
+                        v = v0 + k * MARK_THREADS + tid
                         words4 = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
                         if v < vectors:
                             words4 = ldg_v4(address + Int64(v) * 16)
                         batch.append(words4)
-                    for k in cutlass.range_constexpr(4):
-                        v = v0 + (i * 4 + k) * MARK_THREADS + tid
+                    for k in cutlass.range_constexpr(MARK_LOADS):
+                        v = v0 + k * MARK_THREADS + tid
                         sel, nb = vector_masks(batch[k], v, vectors, low, high, low_f, positive)
                         # bitmap word of four consecutive vectors (lanes 4j .. 4j + 3)
                         wbits = sel << Uint32((lane % 4) * 8)
@@ -1223,9 +1231,16 @@ class PrefillFinish:
                             if key >= low and key < high:
                                 red_shared(fine_a + (key & Uint32(31)) * 4, 1)
                 else:
-                    for c in cutlass.range(lane, Int32(n_cand), 32, unroll=1):
-                        x = ld_global_u32(crow + c * 4)
-                        red_shared(fine_a + (x & Uint32(31)) * 4, 1)
+                    for c0 in cutlass.range(lane, Int32(n_cand), 32 * FIN_BATCH, unroll=1):
+                        xs = []
+                        for k in cutlass.range_constexpr(FIN_BATCH):
+                            x = Uint32(0)
+                            if c0 + 32 * k < Int32(n_cand):
+                                x = ld_global_u32(crow + (c0 + 32 * k) * 4)
+                            xs.append(x)
+                        for k in cutlass.range_constexpr(FIN_BATCH):
+                            if c0 + 32 * k < Int32(n_cand):
+                                red_shared(fine_a + (xs[k] & Uint32(31)) * 4, 1)
                 cute.arch.sync_warp()
                 count = ld_shared_u32(fine_a + lane * 4)
                 d, above_d = low_digit(count, need, lane)
@@ -1273,11 +1288,22 @@ class PrefillFinish:
                     # bitmap; otherwise the ties' positions into a warp buffer
                     st_shared_u32(tcnt_a, Uint32(0))
                     cute.arch.sync_warp()
-                    for c in cutlass.range(lane, Int32(n_cand), 32, unroll=1):
-                        x = ld_global_u32(crow + c * 4)
+                    for c0 in cutlass.range(lane, Int32(n_cand), 32 * FIN_BATCH, unroll=1):
+                      xs = []
+                      for k in cutlass.range_constexpr(FIN_BATCH):
+                        x = Uint32(0xFFFFFFFF)
+                        if c0 + 32 * k < Int32(n_cand):
+                            x = ld_global_u32(crow + (c0 + 32 * k) * 4)
+                        xs.append(x)
+                      for k in cutlass.range_constexpr(FIN_BATCH):
+                        x = xs[k]
                         lo = x & Uint32(31)
                         p = x >> Uint32(5)
-                        if lo > d or (lo == d and all_ties):
+                        if x == Uint32(0xFFFFFFFF):
+                            lo = d + Uint32(64)
+                        if lo == d + Uint32(64):
+                            pass
+                        elif lo > d or (lo == d and all_ties):
                             red_or_global(brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31)))
                         elif lo == d:
                             slot = atom_add_shared(tcnt_a, Uint32(1))
@@ -1319,20 +1345,40 @@ class PrefillFinish:
                 fence_acq_rel_gpu()
                 cute.arch.sync_warp()
                 # the bitmap's positions in order (each lane a contiguous run of words)
-                per = (words + 31) // 32
+                per = ((words + 31) // 32 + 3) // 4 * 4
                 w0 = cutlass.min(lane * per, words)
                 w1 = cutlass.min(w0 + per, words)
                 cnt = Uint32(0)
-                for i in cutlass.range(w0, w1, unroll=1):
-                    cnt += popc(ld_global_cg(brow + i * 4))
+                for i0 in cutlass.range(w0, w1, 4 * FIN_BATCH, unroll=1):
+                    qs = []
+                    for k in cutlass.range_constexpr(FIN_BATCH):
+                        q = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                        if i0 + 4 * k < w1:
+                            q = ldg_cg_v4(brow + (i0 + 4 * k) * 4)
+                        qs.append(q)
+                    for k in cutlass.range_constexpr(FIN_BATCH):
+                        for j in cutlass.range_constexpr(4):
+                            if i0 + 4 * k + j < w1:
+                                cnt += popc(qs[k][j])
                 slot = warp_inclusive(cnt, lane) - cnt
-                for i in cutlass.range(w0, w1, unroll=1):
-                    m = ld_global_cg(brow + i * 4)
-                    while m != Uint32(0):
-                        b = popc((m & (Uint32(0) - m)) - Uint32(1))
-                        st_global_s32(orow + Int64(slot) * 4, key_index(i * 32 + Int32(b)))
-                        slot += Uint32(1)
-                        m = m & (m - Uint32(1))
+                for i0 in cutlass.range(w0, w1, 4 * FIN_BATCH, unroll=1):
+                    qs = []
+                    for k in cutlass.range_constexpr(FIN_BATCH):
+                        q = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                        if i0 + 4 * k < w1:
+                            q = ldg_cg_v4(brow + (i0 + 4 * k) * 4)
+                        qs.append(q)
+                    for k in cutlass.range_constexpr(FIN_BATCH):
+                        for j in cutlass.range_constexpr(4):
+                            m = qs[k][j]
+                            if i0 + 4 * k + j >= w1:
+                                m = Uint32(0)
+                            while m != Uint32(0):
+                                b = popc((m & (Uint32(0) - m)) - Uint32(1))
+                                p = (i0 + 4 * k + j) * 32 + Int32(b)
+                                st_global_s32(orow + Int64(slot) * 4, key_index(p))
+                                slot += Uint32(1)
+                                m = m & (m - Uint32(1))
             cute.arch.sync_warp()
 
 
