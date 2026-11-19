@@ -90,12 +90,12 @@ SP_PARTIALS = PROJECTED
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
 SP_LOCAL_QUERY = "65-:local"
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere). The
-# Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) where it wins: one row per CTA.
-# VR200, 1 GPU, CUDA graphs, 512 local keys per row, us (runs/D-ATTN/sp km31):
-#   rows        128   256   384
-#   km         17.4  30.6  35.3
-#   trtllm-gen 21.0  28.5  35.1
-SP_KERNELS = "1-128:km"
+# Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) wins standalone at 128 rows (VR200,
+# 1 GPU, CUDA graphs, 512 local keys per row: 17.4 vs 21.0 us; 30.6 vs 28.5 at 256,
+# 35.3 vs 35.1 at 384; runs/D-ATTN/sp km31) but not in the step: on the D3-32 slice
+# at 128 rows the DSA sparse core stayed at ~18 us per layer and the overlapped
+# g_proj slowed (one 1024-thread CTA with all TMEM per SM; dattn-t15km2-prof).
+SP_KERNELS = ""
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
