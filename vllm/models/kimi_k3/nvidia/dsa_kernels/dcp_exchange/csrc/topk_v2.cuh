@@ -141,11 +141,10 @@ __device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* ws, uint32_t* 
   return before + x - v;
 }
 
-// h[bin] += 1 for every lane with `valid`, one atomic per distinct bin of the warp (bf16
-// logits tie a lot: same-bin atomics of a warp serialize). Every lane of the warp calls it.
+// h[bin] += 1 when valid (a warp-aggregated form with match_any measured slower: r24
+// 25.1 vs 19.6 us per call, the sample 2.3x longer)
 __device__ __forceinline__ void v2_hist_add(uint32_t* h, uint32_t bin, bool valid) {
-  const uint32_t m = __match_any_sync(0xFFFFFFFFu, valid ? bin : 0xFFFFFFFFu);
-  if (valid && (int)(threadIdx.x & 31) == __ffs(m) - 1) atomicAdd(&h[bin], (uint32_t)__popc(m));
+  if (valid) atomicAdd(&h[bin], 1u);
 }
 
 // kV2FB consecutive (16-byte aligned) histogram words -> v; returns their sum
