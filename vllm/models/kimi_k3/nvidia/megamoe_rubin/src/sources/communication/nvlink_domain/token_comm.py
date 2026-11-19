@@ -1319,6 +1319,9 @@ class TokenCommNonDeterministic(KernelComponent):
     token_in_dynamic_claim_max_routes: ClassVar[int] = 4096
 
     token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
+    # vLLM S6: static prefill token_in keeps this many remote row pulls in flight per transfer warp (a ring of
+    # shared-memory stages, one mbarrier each) instead of one pull -> store -> flag round trip at a time.
+    token_in_ring_depth: ClassVar[int] = 4
     token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"
     expert_sizes_smem_region = "nvlink.token_comm.main_smem.expert_sizes"
     token_in_activation_smem_region = "nvlink.token_comm.main_smem.token_in_activation"
@@ -1388,6 +1391,13 @@ class TokenCommNonDeterministic(KernelComponent):
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
         self.decode_landing = self._router.decode_landing
+        self.token_in_ring = (
+            not self.token_in_dynamic_claim
+            and not self.decode_landing
+            and not self.die_split
+            and self.token_in_flag_batch == 1
+        )
+        self.token_in_stages_per_warp = self.token_in_ring_depth if self.token_in_ring else 1
         # Landing (T * topk <= 16384) takes the landing token_in loop with dynamic claim up to 4096 routes and the
         # static warp stride above (16K pulls over every resident warp: no single-counter contention).
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
@@ -1728,7 +1738,9 @@ class TokenCommNonDeterministic(KernelComponent):
                 )
 
     def register_smem_regions(self, workspace: SmemWorkspace) -> None:
-        workspace.register_mbarrier(self.token_in_mbarrier_region, self.transfer_warp_count)
+        workspace.register_mbarrier(
+            self.token_in_mbarrier_region, self.transfer_warp_count * self.token_in_stages_per_warp
+        )
         if self.token_back_enabled:
             workspace.register_mbarrier(self.token_back_mbarrier_region, self.transfer_warp_count)
         workspace.register_tensor(
@@ -1739,13 +1751,16 @@ class TokenCommNonDeterministic(KernelComponent):
         token_in_lifetime.register_tensor(
             self.token_in_activation_smem_region,
             self.activation_dtype,
-            (self.transfer_warp_count, self.hidden_size),
+            (self.transfer_warp_count * self.token_in_stages_per_warp, self.hidden_size),
             byte_alignment=16,
         )
         token_in_lifetime.register_tensor(
             self.token_in_sf_smem_region,
             self.activation_sf_dtype,
-            (self.transfer_warp_count, (self.activation_sf_vector_size, self.activation_sf_hidden_padded)),
+            (
+                self.transfer_warp_count * self.token_in_stages_per_warp,
+                (self.activation_sf_vector_size, self.activation_sf_hidden_padded),
+            ),
             stride=(self.activation_sf_hidden_padded, (0, 1)),
             byte_alignment=16,
         )
@@ -1938,8 +1953,10 @@ class TokenCommNonDeterministic(KernelComponent):
         warp_mbarrier = token_in_mbarriers + transfer_warp_idx
         warp_activation_stage = token_in_activation[transfer_warp_idx, None]
         warp_sf_stage = token_in_sf[transfer_warp_idx, (None, None)]
-        if lane_idx == Int32(0):
-            cute.arch.mbarrier_init(warp_mbarrier, 1)
+        if cutlass.const_expr(not self.token_in_ring):
+            # (S6: the ring initialises its own per-stage mbarriers.)
+            if lane_idx == Int32(0):
+                cute.arch.mbarrier_init(warp_mbarrier, 1)
         cute.arch.sync_warp()
 
         fc1_activation_pointer = self._device_workspace.ptr(self.fc1_activation_region)
@@ -1994,7 +2011,21 @@ class TokenCommNonDeterministic(KernelComponent):
             thread_idx=lane_idx,
         )
 
-        if cutlass.const_expr(not self.token_in_dynamic_claim and not self.decode_landing):
+        if cutlass.const_expr(self.token_in_ring):
+            self._token_in_ring(
+                smem_workspace,
+                smem_base,
+                owned_sizes,
+                pool_expert_bases,
+                token_metadata_pointer,
+                fc1_activation_pointer,
+                fc1_activation_sf,
+                fc1_ready_counter,
+                global_warp_idx,
+                global_warp_count,
+                flag_tracker,
+            )
+        elif cutlass.const_expr(not self.token_in_dynamic_claim and not self.decode_landing):
             local_expert = start_expert
             while (local_expert < Int32(self.experts_per_rank)) & (local_expert >= Int32(0)):
                 expert_token_count = owned_sizes[local_expert]
@@ -2355,6 +2386,183 @@ class TokenCommNonDeterministic(KernelComponent):
             )
             transfer_lifetime_barrier.arrive_and_wait()
             iket.range_pop()
+
+    @cute.jit
+    def _token_in_ring_issue(
+        self,
+        token_metadata_pointer,
+        pool_token_idx: Int32,
+        stage_activation,
+        stage_sf,
+        stage_mbarrier,
+        activation_bytes: int,
+        activation_sf_bytes: int,
+    ) -> None:
+        """Start the remote pull of one dispatched row (data + scales) into one ring stage."""
+        metadata = TokenSrcMetadata.load(
+            token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
+        )
+        peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+        remote_activation_address = (
+            self._token_comm_args.activation.iterator.toint()
+            + peer_offset
+            + Int64(metadata.src_token) * Int64(self.bytes_per_token)
+        )
+        remote_sf = cute.make_tensor(
+            cute.make_ptr(
+                self._token_comm_args.activation_sf.dtype,
+                self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
+                AddressSpace.gmem,
+                assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
+            ),
+            self._token_comm_args.activation_sf.layout,
+        )
+        remote_sf_row = remote_sf[Int64(metadata.src_token), None]
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(stage_mbarrier, Int32(activation_bytes + activation_sf_bytes))
+            tma_load_1d(stage_activation.iterator, Int64(remote_activation_address), stage_mbarrier, Int32(activation_bytes))
+            tma_load_1d(stage_sf.iterator, remote_sf_row.iterator, stage_mbarrier, Int32(activation_sf_bytes))
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _token_in_ring(
+        self,
+        smem_workspace: SmemWorkspace,
+        smem_base: cute.Pointer,
+        owned_sizes: cute.Tensor,
+        pool_expert_bases: cute.Tensor,
+        token_metadata_pointer,
+        fc1_activation_pointer,
+        fc1_activation_sf: cute.Tensor,
+        fc1_ready_counter,
+        global_warp_idx: Int32,
+        global_warp_count: Int32,
+        flag_tracker,
+    ) -> None:
+        """S6 static token_in: this warp's dense tokens global_warp_idx + j * global_warp_count, in order, with
+        ``token_in_ring_depth`` remote pulls in flight. Per row the store, scale copy, read drain and ready flag are
+        the stock sequence; only the pull of row j + depth is issued as soon as row j's stage is free."""
+        depth = self.token_in_ring_depth
+        transfer_warp_idx = self._transfer_warp_idx
+        lane_idx = self._lane_idx
+        token_in_mbarriers = smem_workspace.ptr(self.token_in_mbarrier_region, smem_base)
+        token_in_activation = smem_workspace.tensor(self.token_in_activation_smem_region, smem_base)
+        token_in_sf = smem_workspace.tensor(self.token_in_sf_smem_region, smem_base)
+        stage_base = transfer_warp_idx * Int32(depth)
+        first_stage_activation = token_in_activation[stage_base, None]
+        first_stage_sf = token_in_sf[stage_base, (None, None)]
+        activation_bytes = cute.cosize(first_stage_activation) * int(self.activation_dtype.width) // 8
+        activation_sf_bytes = cute.cosize(first_stage_sf) * int(self.activation_sf_dtype.width) // 8
+        sf_copy_elements = 4
+        sf_copy_atom = _copy_atom(self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width))
+        if lane_idx == Int32(0):
+            for stage in cutlass.range_constexpr(depth):
+                cute.arch.mbarrier_init(token_in_mbarriers + stage_base + Int32(stage), 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_warp()
+
+        total_tokens = Int32(0)
+        for expert in cutlass.range(self.experts_per_rank, unroll=1):
+            total_tokens = total_tokens + owned_sizes[expert]
+        row_count = Int32(0)
+        if global_warp_idx < total_tokens:
+            row_count = (total_tokens - global_warp_idx + global_warp_count - Int32(1)) // global_warp_count
+
+        # Issue cursor: expert walk for the row whose pull is started next.
+        issue_expert = Int32(0)
+        issue_begin = Int32(0)
+        for prologue_row in cutlass.range_constexpr(depth):
+            if Int32(prologue_row) < row_count:
+                dense_token_idx = global_warp_idx + Int32(prologue_row) * global_warp_count
+                while dense_token_idx >= issue_begin + owned_sizes[issue_expert]:
+                    issue_begin = issue_begin + owned_sizes[issue_expert]
+                    issue_expert = issue_expert + Int32(1)
+                pool_token_idx = pool_expert_bases[issue_expert] + (dense_token_idx - issue_begin)
+                self._token_in_ring_issue(
+                    token_metadata_pointer,
+                    pool_token_idx,
+                    token_in_activation[stage_base + Int32(prologue_row), None],
+                    token_in_sf[stage_base + Int32(prologue_row), (None, None)],
+                    token_in_mbarriers + stage_base + Int32(prologue_row),
+                    activation_bytes,
+                    activation_sf_bytes,
+                )
+
+        # Process cursor: expert walk (with SF and ready-slot extents) for the row being landed.
+        local_expert = Int32(0)
+        expert_valid_begin = Int32(0)
+        expert_sf_begin = Int32(0)
+        expert_ready_slot_begin = Int32(0)
+        for row in cutlass.range(row_count, unroll=1):
+            dense_token_idx = global_warp_idx + row * global_warp_count
+            while dense_token_idx >= expert_valid_begin + owned_sizes[local_expert]:
+                expert_token_count = owned_sizes[local_expert]
+                expert_valid_begin = expert_valid_begin + expert_token_count
+                expert_sf_begin = expert_sf_begin + self._padded(expert_token_count, self.sf_padding_block)
+                expert_ready_slot_begin = expert_ready_slot_begin + self._slots(expert_token_count)
+                local_expert = local_expert + Int32(1)
+            token_in_expert = dense_token_idx - expert_valid_begin
+            pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
+            sf_token_idx = expert_sf_begin + token_in_expert
+            ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+
+            stage = stage_base + row % Int32(depth)
+            stage_activation = token_in_activation[stage, None]
+            stage_sf = token_in_sf[stage, (None, None)]
+            stage_mbarrier = token_in_mbarriers + stage
+            cute.arch.mbarrier_wait(stage_mbarrier, (row // Int32(depth)) & Int32(1))
+
+            destination_activation = cute.make_ptr(
+                self.activation_dtype,
+                fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                AddressSpace.gmem,
+                assumed_align=16,
+            )
+            with cute.arch.elect_one():
+                cp_async_bulk_s2g(destination_activation, stage_activation.iterator, Int32(activation_bytes))
+            cute.arch.sync_warp()
+            cute.arch.cp_async_bulk_commit_group()
+
+            source_sf_values = cute.slice_(stage_sf, (0, None))
+            source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
+            destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
+            destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
+            destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
+            destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
+            sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
+            for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
+                sf_vector_idx = Int32(sf_round * 32) + lane_idx
+                if sf_vector_idx < Int32(sf_vector_count):
+                    cute.copy(
+                        sf_copy_atom,
+                        source_sf_vectors[None, sf_vector_idx],
+                        destination_sf_vectors[None, sf_vector_idx],
+                    )
+
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.sync_warp()
+            ready_address = (fc1_ready_counter + ready_slot_idx).toint()
+            flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
+            cute.arch.sync_warp()
+
+            # The stage is free again (bulk store read it, scales copied out): start the pull of row + depth.
+            next_row = row + Int32(depth)
+            if next_row < row_count:
+                next_dense_token = global_warp_idx + next_row * global_warp_count
+                while next_dense_token >= issue_begin + owned_sizes[issue_expert]:
+                    issue_begin = issue_begin + owned_sizes[issue_expert]
+                    issue_expert = issue_expert + Int32(1)
+                self._token_in_ring_issue(
+                    token_metadata_pointer,
+                    pool_expert_bases[issue_expert] + (next_dense_token - issue_begin),
+                    stage_activation,
+                    stage_sf,
+                    stage_mbarrier,
+                    activation_bytes,
+                    activation_sf_bytes,
+                )
+        flag_tracker.fire()
+        cute.arch.sync_warp()
 
     @cute.jit
     def _stateless_pace(self, reference_window: Int32, current_window: Int32) -> None:

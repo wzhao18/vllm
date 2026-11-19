@@ -19,7 +19,7 @@
 
 ## Local differences
 
-The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
+The R1 import rewrite (below), S3 and S6 (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
 - **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
   epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
@@ -47,6 +47,19 @@ The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (
   - Accuracy: rel-L2 vs the fp32 oracle 1.73e-3 (stock) vs 1.83e-3. Not bit-identical to the
     stock core (different rounding order of the same approximations).
   - When: every non-batch-invariant launch whose problem carries SiTU betas (no knob/env).
+
+- **S6** (vLLM-local, not upstream) in `sources/communication/nvlink_domain/token_comm.py` (sha256 in the
+  manifest below): the static token_in (prefill dispatch pull: not decode landing, not dynamic claim, not
+  die_split, token_in_flag_batch 1) keeps `token_in_ring_depth` = 4 remote row pulls in flight per transfer warp
+  (4 shared-memory stages, one mbarrier each) instead of one pull -> store -> flag round trip at a time.
+  - Why: each transfer warp walks ~145 dispatched rows per 8192-token launch at EP16, and every row paid a full
+    NVLink read round trip before the next pull started.
+  - What: same rows, same order, same per-row store / scale copy / read drain / ready flag; only the pull of row
+    j + 4 is issued as soon as row j's stage is free (`_token_in_ring`). Bitwise-identical output.
+  - Measured on VR200, real EP16 (16 GPUs, 896 experts = 56/GPU, NVFP4, 8192 tokens/rank, same-time A/B on two
+    4-node halves of one NVL72): one launch 1269 -> 1211 us, 2 x 8192 2523 -> 2413 us; all-local routing
+    959 -> 971 us (no remote pulls to hide).
+  - When: every launch on the static token_in path (no knob/env).
 
 ## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
 
@@ -122,7 +135,7 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
-8736c9dd051ee56496c1c55b064d9e73a45dcaa247ee4cadabc197edd767c449  sources/communication/nvlink_domain/token_comm.py
+85af242d5c6fbaaac54ebec895dc87b0b0aec0facd28614f8fa1ffb4266d0bf2  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
