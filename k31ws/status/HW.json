@@ -4,10 +4,10 @@
  "side": "infra",
  "owner": "HW agent (workflow)",
  "state": "implementing",
- "updated": "2026-11-18T19:00-08:00",
+ "updated": "2026-11-18T19:58-08:00",
  "shape": "-",
  "basis": "MEASURED on Rhea (runs/HW/hw1-hw3) + local ptxas 13.4 + CuTe DSL 4.8.0 source + internal docs (private hwdb; internal numbers not reproduced here)",
- "gap_analysis": "hwdb v1.10. die-locality-howto.md is complete and verified on Rhea (hw6-hw12): rules section 0b plus measured tables (placement, SM map, claim patterns, TMA issue capacity, load forms, gathers, writes, graph capture, torch LocalizedAllocator). Key measured facts: die-local read is about 1.41x striped. Fine 2 MiB mixed placement is free, but only with a die-matched claim. The per-die SM split varies by part (106/106, 108/104, 102/110). A TMA issuing thread completes about one ring stage per 0.37 us, so a single producer moving 16 KiB stages is capped near 0.6x of die-local for any placement; fix with 2 or more producer warps (distinct warp_id%4) or 32 KiB or larger stages. The NVFP4 MegaMoE tile streams at about 93% of die-local, while the MXFP4 K128 tile is capped near half. 256-bit LDG is the best register-path load (about 195 GB/s per SM). cp.async 16 B is slow (do not use for streaming). Row gathers: warp loads or gather4 from 16 warps are fast; per-row 1D bulk is not. Writes get no locality gain; in-place read-modify-write gains 1.22x; bulk reduce-add into global runs at about half the write rate. 2-CTA M256 MMA reaches about 95% of the double-K peak only at N256 (about 2/3 at N128). TMEM ld is about 800 B/clk/SM when batched.",
+ "gap_analysis": "hwdb v1.11. die-locality-howto.md is complete and verified on Rhea (hw6-hw12): rules section 0b plus measured tables (placement, SM map, claim patterns, TMA issue capacity, load forms, gathers, writes, graph capture, torch LocalizedAllocator). Key measured facts: die-local read is about 1.41x striped. Fine 2 MiB mixed placement is free, but only with a die-matched claim. The per-die SM split varies by part (106/106, 108/104, 102/110). A TMA issuing thread completes about one ring stage per 0.37 us, so a single producer moving 16 KiB stages is capped near 0.6x of die-local for any placement; fix with 2 or more producer warps (distinct warp_id%4) or 32 KiB or larger stages. The NVFP4 MegaMoE tile streams at about 93% of die-local, while the MXFP4 K128 tile is capped near half. 256-bit LDG is the best register-path load (about 195 GB/s per SM). cp.async 16 B is slow (do not use for streaming). Row gathers: warp loads or gather4 from 16 warps are fast; per-row 1D bulk is not. Writes get no locality gain; in-place read-modify-write gains 1.22x; bulk reduce-add into global runs at about half the write rate. 2-CTA M256 MMA reaches about 95% of the double-K peak only at N256 (about 2/3 at N128). TMEM ld is about 800 B/clk/SM when batched. hw13/14 (v1.11): TMA producer subpartition placement <=4% (issuer count matters); multicast free but cross-CTA slot handshake on the issue path halves a ring; tcgen05.mma from 2 warps legal, one in-order pipe, commit waits for all queued MMAs, ~300-400 clk per commit->wait->issue edge.",
  "inefficiencies": [
   "No Nsight Compute/Systems in the K3.1 image: counter-based root-causing (bytes, tensor pipe utilisation) is unavailable to every workstream unless a host install is mounted (flagged to INFRA in briefs/INFRA.md)",
   "Counted TMA stores, early A-buffer release MMA flag and TMA L2 management ops exist in hardware/ptxas internals but have no public PTX spelling in CUDA 13.4"
@@ -28,7 +28,7 @@
   "v1 database: INDEX + topics + all briefs (done)",
   "Answer workstream requests every ~20 min (D-TOPK-1, P-MLA-1, P-KDA-1 answered)",
   "Rhea probes hw1/hw2/hw3 (done): attrs, FP32, oversized smem, graph/PDL, die-local BW, HMMA, MUFU, smem atomics, L2 residency, cross-die L2, redux",
-  "Next probes: 4-GPU peer store / multimem.st.async / ld_reduce small-message latency; tcgen05 rate check of sm_107a 2x-K vs sm_100f 1x-K block-scaled MMA (CuTe DSL dense GEMM); TMA gather4 576 B row gather bandwidth",
+  "Next probes: multicast with split producer/consumer warps (does it reach dup-load rate); 8-warp TMEM ld; hw4b NVLink variants on an idle 4-GPU node",
   "Keep briefs current with measured facts; record model errors"
  ],
  "work": [
@@ -141,9 +141,24 @@
    "t": "18:55",
    "what": "hw12 write paths by placement",
    "result": "writes ~11.7 TB/s any path, RMW 1.22x die-local, bulk reduce-add ~6 TB/s; third per-die split 102/110; howto sec 14 + briefs"
+  },
+  {
+   "t": "19:40",
+   "what": "hw13 TMA producer warp subpartition placement + cluster multicast load (runs/HW/hw13)",
+   "result": "subpartition placement <=4% (issuer count matters: 1/2/3/4 warps 75/134/180/214 GB/s/SM); 1D bulk multicast with per-stage cluster handshake delivers 0.3-0.4x of per-CTA duplicate L2 loads; follow-up hw13b queued"
+  },
+  {
+   "t": "19:42",
+   "what": "hw14 tcgen05.mma from two warps (rate, commit scope, handoff) for P-MLA split QK/PV issue",
+   "result": "legal + full rate; one in-order MMA pipe; commit waits for all queued MMAs incl. other warps; issuer back-pressured after ~5 MMAs; commit->wait->issue edge ~300-400 clk; topic 01 sec 8 + briefs P-MLA/D-ATTN/P-KDA/D-KDA/P-IDX"
+  },
+  {
+   "t": "19:55",
+   "what": "hw13b multicast follow-up (1D vs tensor multicast, dup + handshake control)",
+   "result": "multicast itself free; per-stage cluster slot-release handshake on the issue path halves the stream; topic 04 + briefs P-GEMM/P-MOE/D-MOE/D-GEMM"
   }
  ],
- "next": "HANDOFF: (1) poll /Users/weizha/k31ws-hwdb/requests every ~20 min (none open at 19:00 PT); answer in <file>.answer.md; mirror with rsync -a /Users/weizha/k31ws-hwdb/ rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/hwdb/. (2) Probes are queued with: ssh rhea 'mkdir -p $K/runs/HW/<n> && cd $K/runs/HW/<n> && (setsid nohup bash $K/tools/wsgpu.sh -g 1 -m 10 -n HW -- bash $K/hwdb/bench/run_<n>.sh $K/runs/HW/<n> > $K/runs/HW/<n>/log 2>&1 < /dev/null &)'. Validate PTX locally first with bash ~/.cache/k31ws-ptxas/probe.sh <cases>. (3) Candidate probes: TMA issuers placed on distinct vs same subpartition (warp_id%4) to confirm the internal-doc queue model; 8-warp TMEM ld; multicast TMA load rate across a 2/4-CTA cluster (MegaMoE B operand); hw4b NVLink variants on an idle node (-g 4). (4) The die-locality-howto (topics/die-locality-howto.md) sections 9-14 hold the raw tables; section 0b holds the rules. Keep 0b current when new data lands.",
+ "next": "HANDOFF: (1) poll /Users/weizha/k31ws-hwdb/requests every ~20 min (none open at 19:58 PT); answer in <file>.answer.md; mirror with rsync -a /Users/weizha/k31ws-hwdb/ rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/hwdb/. (2) Queue probes: tar the .cu + run_<n>.sh to $K/hwdb/bench over one ssh and launch setsid nohup bash $K/tools/wsgpu.sh -g 1 -m 10 -n HW -- bash $K/hwdb/bench/run_<n>.sh $K/runs/HW/<n> > $K/runs/HW/<n>/log (one ssh per >=3 min). Validate PTX locally: bash ~/.cache/k31ws-ptxas/probe.sh <cases> (one statement line per case, separate with single ;, BSD sed breaks ;;). (3) Candidate probes: multicast ring with separate producer warp + consumer warps (hw13b says handshake, not multicast, is the cost); 8-warp TMEM ld; hw4b NVLink on -g 4. (4) Rules live in topics/die-locality-howto.md 0b, topic 01 sec 8 (multi-warp MMA), topic 04 (issue + multicast).",
  "blockers": "none (probes run on 1 GPU via wsgpu)",
  "branch": "- (no code branch; private hwdb at /Users/weizha/k31ws-hwdb, mirror k31ws/hwdb on Lustre)",
  "evidence": [
@@ -165,7 +180,10 @@
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/mma2cta/log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/tmem/log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw12/log",
-  "/Users/weizha/k31ws-hwdb/bench/"
+  "/Users/weizha/k31ws-hwdb/bench/",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw13/log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw14/log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw13b/log"
  ],
  "ckpt": "pending"
 }

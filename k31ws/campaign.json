@@ -14,12 +14,17 @@
   "Decode r24 NVFP4 slice (ms/step)": {
    "now": "10.01 (int 95f48ac5b4)",
    "ach": "3.34 (fused MegaMoE model row)",
-   "note": "baseline 10.89; r8 6.19 vs 2.40"
+   "note": "release-drafter reference pending (preview drafter numbers are void)"
   },
   "Prefill DEP16 NVFP4 slice (ms, F16K)": {
    "now": "197.8 (int 95f48ac5b4)",
    "ach": "140.6 (fused MegaMoE model row)",
-   "note": "baseline 218.7"
+   "note": "release-drafter reference pending"
+  },
+  "Decode r8 NVFP4 slice (ms/step)": {
+   "now": "6.19 (preview drafter: void)",
+   "ach": "2.40",
+   "note": "release-drafter reference pending"
   }
  },
  "findings": [
@@ -318,6 +323,10 @@
   {
    "t": "11-18 19:40",
    "text": "D-GEMM: a dependent small-M GEMM has a measured floor of ~6-9 us per call on VR200 (post-dependency MMA, cross-SM reduce, kernel end) even with weights pre-streamed, so the decode GEMM model number is only reachable via cross-op overlap/fusion; the new design targets that."
+  },
+  {
+   "t": "11-18 20:05",
+   "text": "Rule (user): only the release DSpark drafter counts. All references are being re-measured with it; preview-drafter numbers are void. The release drafter tail is a real decode family (D-FUSE)."
   }
  ]
 }

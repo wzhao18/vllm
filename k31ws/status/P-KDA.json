@@ -2,9 +2,9 @@
  "id": "P-KDA",
  "title": "Prefill: KDA chain (core + conv + gated o_norm)",
  "side": "prefill",
- "owner": "P-KDA agent (resumed 16:00)",
- "state": "landed-ready",
- "updated": "2026-11-18T17:55-08:00",
+ "owner": "P-KDA agent (resumed 19:35)",
+ "state": "analysis",
+ "updated": "2026-11-18T19:55-08:00",
  "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4 config (KDA in/o_proj MXFP8 -> o_norm writes the MXFP8 o_proj input), 96 KDA heads at TP1, FP32 state; per GPU per prefill forward, 69 KDA layers",
  "baseline_ms": 77.2,
  "current_ms": 72.7,
@@ -12,7 +12,7 @@
  "target_ms": 19.1,
  "step_ms": 218.7,
  "basis": "MEASURED microbench on 1 VR200 GPU at the deployed per-GPU shape, NVFP4 config (benchmarks/kimi_k3/bench_kda_prefill_chain.py, CUPTI kernel sums x 69): baseline 1118 us/layer, current 1054 us/layer (ab14); model nvfp4_modelopt|P3-16|prefill conv 55.1 + gate_beta_norm 18.4 + core_prefill 167.0 + o_norm 12.2 = 252.7 us/layer",
- "gap_analysis": "Per layer at F16K: K2 394 (stock FlashKDA mma.sync) + K1 299 + Q|K|V conv 220 + o_norm/MXFP8 139 = 1054 us (72.7 ms/forward); model 253 us (17.4 ms). MEASURED: the recurrence is chunk-step-LATENCY bound (341 serial 16-token steps per (seq, head) item; 288 items on 212 SMs: 76 SMs hold 2 items and set the time). Stock = 1.16 us/step. A bitwise-exact tcgen05 rewrite (V on MMA M, fp32 state row per thread in registers, bf16 S^T as the TMEM A operand) measures 4.5K clk/step: 8 dependent K=16 MMAs for K=128 ~580 clk, each tensor-core hand-off ~300-350 clk, tcgen05.mma issue blocks ~70 clk; projected floor ~0.8-0.9 us/step (280-310 us) - the 4x tensor rate does not help a 16-row serial chain. The model's core_prefill 167 us needs <= 0.49 us/step with the recurrence fully hidden: not reachable with measured step latencies (model fix candidate: core floor = 341 x min step latency). K2 is also extremely sensitive to co-runners (overlapping K1 slowed K1+K2 693/765 -> 1112 us), so hiding K1/conv/o_norm needs them to run at low occupancy at near-HBM rate per SM (persistent, TMA-ring) on the SMs that hold one recurrence item.",
+ "gap_analysis": "Per layer at F16K: K2 394 + K1 299 + conv 220 + o_norm 139 = 1054 us (72.7 ms/forward) vs model 253 us (17.4 ms). MEASURED (sc1): K2 is SM-throughput bound on the 76 SMs that hold 2 of the 288 (seq, head) items (~1300 clk per item-step, mma.sync tensor floor 832); a lone chain is 0.52 us/step. Even perfectly balanced, an mma.sync recurrence has a tensor floor of 288 x 341 x 832 clk / 212 SMs = 169 us (= the whole model core row), so the SOL recurrence must run on tcgen05 (4x rate). Bytes: K1 writes a 1.34 GB workspace and K2 reads 1.73 GB (+ conv pass 2.4 GB + o_norm pass ~1 GB); the hardware-limited design reads only raw q|k|v, g, beta and writes MXFP8 o once (~2.2 GB ~ 180 us at 12.3 TB/s). SIMT: conv 98K FMA + ~24K exp per 64-token item-step; at 1.36 items/SM ~130 us if spread over all SMs - under the HBM time.",
  "inefficiencies": [
   "MEASURED: recurrence latency-bound: 1.16 us per chunk step (stock mma.sync); tcgen05 step 2.0 us+ (dependent K=16 accumulation chain, blocking MMA issue, ~300-350 clk per tensor-core hand-off)",
   "MEASURED: K1 prepare 299 us: 98K single-shot CTAs; when co-resident with K2 it slows K2 (latency-bound) -> needs a persistent low-occupancy pipelined K1",
@@ -26,11 +26,10 @@
  ],
  "plan": [
   "DONE (landed-ready 47bc2f317f): HBM-rate gated o_norm + MXFP8 kernel: -59 us/layer F16K",
-  "Persistent K1 (one CTA per SM, 4 warps, TMA ring over chunk-major (chunk, seq, head) items, double-buffered tiles) at near-HBM rate per SM; then FusedConv inside it (wzhao/k31ws-p-kda-fusedconv-exp has the bitwise conv-in-load code)",
-  "Co-schedule: persistent K1 on the SMs that hold one recurrence item (K2 grid packed 2/SM on 144 SMs costs nothing: the 2-item SMs already set K2 time) using the mode-bit-9 flag protocol (already bitwise-verified), K2 never sharing an SM with K1",
-  "o_norm + MXFP8 as a flag-driven consumer of K2 output tiles on the same K1 SMs",
-  "Recurrence step latency: mma.sync design with per-warp independent 16-column chains (no cross-warp sync), items balanced 2.7/SM via V-split; tcgen05 only if the dependent-accumulation latency can be broken (independent K partials, measured)",
-  "Model fix proposal: core_prefill floor = 341 x measured min chunk-step latency, not bytes/BW"
+  "SOL DESIGN (projected ~185-200 us/layer vs model 253; bound = HBM 2.2 GB): one persistent fused kernel per KDA layer, 2 items per SM (256 TMEM cols each): producer warps load raw q|k|v rows + g + beta by TMA, apply conv/L2norm/gate/cumsum/decay in smem and build the chunk-64 intra matrices (INV64 from 16x16 blocks, Mqk64) on tcgen05; math warps run the chunk-64 recurrence on tcgen05 (V on M, fp32 state row per thread in registers, bf16 S^T as A operand; MMA1 [kd|qd] M128 N128 K128, MMA2 INV M128 N64 K64, MMA3 kr^T@U M128 N128 K64 + Mqk@U), 86 chain steps per item instead of 341; epilogue gated o_norm + MXFP8.",
+  "Step 1 (now): measure FLA's chunk-64 Triton chain on VR200 at F16K (evidence for chunk-64 chain time), then a standalone chunk-64 tcgen05 recurrence microbench fed by a torch-built chunk-64 workspace: target <= 100 us at 288 items (vs 394)",
+  "Step 2: in-kernel chunk-64 producer (conv + norm + gate + intra) replacing K1 + the conv pass (removes ~3 GB of HBM traffic)",
+  "Step 3: o_norm + MXFP8 epilogue; in-step A/B with step_p.sh -q nvfp4"
  ],
  "work": [
   {
@@ -122,9 +121,14 @@
    "t": "17:50",
    "what": "tc5/tc6: overlapped K1 + K2 (mode bit 9: chunk-major K1 publishes per-(head, tile) flags, K2 on a high-priority stream acquires them); found and fixed the in-tree full-width K2 shared-memory overflow (ExactState state_lo 32 KB pushed it to 1 block/SM: 288 blocks in two waves, and the overlap deadlocked); residency guard + flag watchdog",
    "result": "overlap is bitwise-correct but SLOWER: K1+K2 1112 us vs 765 serial in-tree (693 stock _flashkda_C): K1's CTAs fill the free slots on the 136 single-item SMs and stretch the latency-bound recurrence. In-tree K1+K2 after the smem fix 765 (was ~794)."
+  },
+  {
+   "t": "19:40",
+   "what": "resumed; FlashKDA K1/K2 time vs (seq, head) items per GPU at 5461 tok/seq (stock, 1 GPU, run sc1: 106/212/288/424/636/848 items)",
+   "result": "K2 178/236/394/396/599/775 us, K1 113/220/299/440/664/893 us. A lone chunk chain runs at 0.52 us per 16-token step (178 us for 341 steps); at >= 2 items/SM K2 is SM-THROUGHPUT bound at ~1300 clk per item-step (0.57 us), i.e. 1.56x the mma.sync tensor floor (832 clk, 2043 FLOP/clk/SM). CORRECTION of the earlier 'latency-bound 1.16 us/step' reading: 1.16 us is two items sharing an SM; the ~290 us 'latency floor' model-fix proposal is withdrawn (it only holds for one 16-token chain per SM on tcgen05 with 3 hand-offs per step). K1 is throughput bound (~1.04 us per item, 8.5 TB/s on its workspace traffic)."
   }
  ],
- "next": "HANDOFF: build the persistent K1 (benchmark it standalone at 68-136 CTAs: target <= 394 us on 136 SMs), then co-run with K2 via mode bit 9 placing K2 2/SM (e.g. grid of 144 persistent K2 CTAs x 2 items or green-context split). Commands: stage mkov.sh /Users/weizha/k31ws-wt/p-kda <tag>; on Rhea: bash $K/runs/P-KDA/launch_ws.sh $K/runs/P-KDA/<run>.log -g 1 -m 25 -o <tag> -n P-KDA -- bash $K/ov/<tag>/benchmarks/kimi_k3/run_k2tc.sh $K/ov/<tag> $K/runs/P-KDA/<run> --modes 35 --wall 0,3,515 [--stamps 35] (K=/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws; the script has timeout 600 and flushes). Modes: 3 in-tree K1+K2, +32 tcgen05 K2, +256 clock stamps, +512 overlap (max chunks << 16).",
+ "next": "read fla1 (FLA chunk-64 per-kernel times at 106/212/288/424 items), then write the chunk-64 tcgen05 recurrence microbench",
  "blockers": "no ncu/nsys in the K3.1 image; Rhea ssh rate limiting (poll <= 1 per 3 min)",
  "branch": "wzhao/k31ws-p-kda @ aa0753e84d (pushed; landed-ready piece remains 47bc2f317f: o_norm_mx kernel + kda.py prefill wiring)",
  "evidence": [

@@ -2,25 +2,24 @@
  "id": "P-MOE",
  "title": "Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream",
  "side": "prefill",
- "owner": "P-MOE agent (workflow)",
- "state": "landed",
- "updated": "2026-11-18T18:25-08:00",
- "shape": "NVFP4 1-node DEP4 slice (step_p.sh -q nvfp4; L24 view: 23 MoE layers; EP16 expert emulation 56/GPU), F16K at L78K, MegaMoE family busy ms per forward (in-step)",
+ "owner": "P-MOE agent (workflow, resumed 19:35)",
+ "state": "implementing",
+ "updated": "2026-11-18T19:50-08:00",
+ "shape": "NVFP4 1-node DEP4 slice (step_p.sh -q nvfp4, die-split EP16 emulation 56 experts/GPU, L24 view: 23 MoE layers), F16K at L78K, MegaMoE family busy ms per forward (in-step). Deciding check: real DEP16 4 nodes (93 layers).",
  "baseline_ms": 74.01,
- "current_ms": 52.32,
- "achievable_ms": 44.9,
- "target_ms": 49.4,
- "step_ms": 197.16,
- "basis": "MEASURED in-step NVFP4 (step_p -q nvfp4, DEP4 slice, EP16 emulation 56 experts/GPU, L24 view, F16K at L78K, profiled, pf_fam.py): baseline 74.01 (INFRA int-b31121c-1) -> 56.64 (2x8K sub-calls, p-moe-1e85ee4c-1) -> 52.32 (+S3 one-reciprocal SiTU, p-moe-s3-1); achievable 73.33 = nvfp4_modelopt experts + P11/P12 rows (serial sum) at the same 23 layers. Step 218.70 -> 197.16 ms. Real EP16 (4 nodes) pending r7.",
- "gap_analysis": "Measured at the EP4-emulated per-GPU shape (runs/P-MOE/r1, r2): vendored megamoe_rubin NVFP4 single 16K launch 2193 us/layer (stage+kernel), 2x8K sub-calls 2124 us (-3.2%, bitwise equal) -> 195.4 ms/step; one 8K call 1077 us. Model (optables P3-16) 2.151 ms/layer at EP16; at the EP4-emulated link volume (0.8x bytes) the same formula gives ~1.6 ms, so the emulated kernel runs ~1.3x its model. Shared MXFP8 expert alone 742 us/layer (68 ms/step) vs model 406 us: the stock SiTU-and-mul alone is 265 us (3 libm tanhf per element) and two MXFP8 quant passes ~70 us. Side-stream overlap of the shared expert does not pay at this shape: the uncapped persistent grid leaves no SMs (2876 vs 2894 serial), and capping the MegaMoE grid by 16/32/48 SMs costs +12.6/+14.3/+22.2% MegaMoE time (best overlap -1.4%). MEASURED root cause (r4): with ALL-LOCAL routing (no NVLink payload) one 8K call still takes 1052 us vs 1065 random: the main kernel is compute/epilogue-bound at ~963 us per 8K call vs model ops 525 us (fc1+act+fc2), ~27% of the FP4 peak; the FC1 epilogue (TMEM load, SiTU 6 MUFU/element, NVFP4 requant) and FC2 token-back are issued by one epilogue warp per SM sub-partition. At EP16 the link time (~0.99 ms per 8K) is of the same size, so the kernel must hide both. In-step the MoE costs ~2.9 ms/layer vs 2.12 standalone: router kernel 0.9 ms/layer in-step (cross-rank arrival skew) vs 0.05 standalone. Shared expert on the production fused SiTU+MXFP8 op: 611 us/layer alone (cuBLASLt MXFP8 gate_up 295 us = ~9.8 PF, fused act 159 us, down 164 us) vs model 406.",
+ "current_ms": 55.7,
+ "achievable_ms": 49.5,
+ "target_ms": 54.45,
+ "step_ms": 197.4,
+ "basis": "MEASURED in-step NVFP4. Slice: baseline 74.01 (int b31121c, single 16K launch, pre-die-split emulation) -> 55.7 ms (int c8a403a = sub-calls + S3, die-split emulation, INFRA 18:05) vs fused L24 achievable 49.5 (INFRA 17:50 model row fix; replaces the additive 73.3 and the 44.9 SOL target). REAL DEP16 (4 nodes, 93 layers, int c8a403a, INFRA 18:35): MegaMoE 263.8 ms vs fused achievable 197.9 (x1.33, target 217.7); the slice is ~13% optimistic (in-node dispatch).",
+ "gap_analysis": "Real EP16 per 8K sub-call (rank 0 / rank 9 of p16-t7c8a403-nv-prof): main persistent kernel 1341 / 1421 us, router 199 / 279 us, top-k reduce 74 us. The same kernel in the 1-node slice: ~960 us, all-local compute floor 926 us (S3) -> the EP16 link adds ~420 us per launch; S3 (-3 ms on the slice) did not move real EP16. Root cause (code + arithmetic, to be confirmed with the r16 EP16 probe): the knob record uses token_back_mode epi_warps: the FC2 epilogue pushes every route row to its source rank as 28 separate 256-byte UBLK (cp.async.bulk) remote stores (one per 128-hidden CTA tile): per 8K launch per GPU 131K routes x 15/16 remote = 0.88 GB BF16 in 3.4M remote bulk ops, issued from the epilogue warps that already bound the compute side (MMA warp waits 46% on acc-empty, r13/r14). Dispatch pulls one 2 KB row per (token, expert) with one row in flight per transfer warp (0.23 GB). Model (perf-model P3-16, dedup=False): link = per-route bytes at the achievable NVLink rate, 2.14 ms per 16K layer, fused layer = max(ops, link) + drain. SOL design (O2 in the model, beyond its P3-16 row): (1) FC2 epilogue stores BF16 rows locally (local tile store, no remote ops on the epilogue path); (2) per (source rank, source token) group the transfer warps sum the group's local rows in fp32 in fixed top-k order, round to BF16 once and push ONE 7 KB row per group with a multi-stage bulk ring (>= 4 rows in flight per warp); the source top-k reduce sums <= 16 rank partials in rank order (deterministic); (3) dispatch dedup: pull each token once per destination rank and write it to its c local pool rows. Bytes per token 16 -> 10.35 rows (-35%), remote ops per route 28 -> ~0.2 (one 7 KB op per group). Projection per 8K launch: link 0.72 GB at ~1.1 TB/s = 0.65 ms < compute 0.93 ms -> compute-bound layer ~2.0-2.1 ms per 16K (~185-195 ms over 92 layers vs fused achievable 197.9, target 217.7). Precision: BF16 combine wire format kept, fp32 accumulation; partial sums are rounded to BF16 once per (token, rank) instead of once per route.",
  "inefficiencies": [
-  "FIXED (landed-ready 055b80ab3d): SiTU core 3 ex2 + 3 rcp MUFU per element -> 2 ex2 + 1 rcp (in-step MegaMoE -7.6%)",
-  "Main kernel at the EP4 emulation still 926 us (all-local) / 1006 us (random) per 8K vs ~410 us tensor at 21.1 PF; ~15 GB L2->SM operand traffic per launch at tile 256x256 (weights re-read per 256-token tile; cluster N>1 weight multicast unsupported); neither L2 (~50%) nor tensor (~44%) saturated: pipeline-limited; r13 MMA-warp clock stamps pending",
-  "MegaMoE main kernel compute/epilogue-bound: 963 us per 8K call with zero NVLink payload vs model ops 525 us (r4, measured); epilogue issue rate (1 warp/SMSP), SiTU MUFU and NVFP4 requant per tile are the hypothesis (ncu not in the image)",
-  "In-step router kernel 0.9 ms/layer vs 0.05 standalone: cross-rank arrival skew charged to MegaMoE (step_p profile)",
-  "Top-k reduce 75 us + stage 15 us + router per 8K call outside the persistent kernel (r4 profile)",
-  "Shared expert 611 us vs model 406 us (cuBLASLt MXFP8 gate_up ~9.8 PF; fused act 159 us) - side-stream SM-cap overlap measured not profitable (cap costs 12-22% MegaMoE)",
-  "FIXED (landed-ready): single 16K-capacity launch -> EP-uniform 2x8K sub-calls (-3.2% standalone, -25% MegaMoE in the slice incl. knob-record selection, arena 947 MiB/rank)"
+  "FC2 combine = 3.4M 256-byte remote UBLK stores per 8K launch issued by the epilogue warps (epi_warps token-back): op-count/latency bound at EP16, on the compute critical path",
+  "No rank-level dedup/pre-combine: 16 BF16 rows per token cross NVLink instead of ~10.35 (model P3-16 also prices 16)",
+  "Router 199-279 us per 8K launch at real EP16 (36 us in the slice): cross-rank metadata push absorbs arrival skew",
+  "Compute side: MMA warp waits 46% on acc-empty (FC1 epilogue), 23% on operands (r13/r14, EP4 probe)",
+  "Top-k reduce 74 us per 8K launch outside the persistent kernel",
+  "FIXED (int c8a403a): 2x8K sub-calls; S3 one-reciprocal SiTU"
  ],
  "rubin_features": [
   "tcgen05 2-CTA block-scaled MMA (mxf4nvf4, NVFP4 W4A4)",
@@ -30,9 +29,10 @@
   "packed f32x2 FMA + MUFU ex2/rcp in the SiTU epilogue"
  ],
  "plan": [
-  "DONE (landed-ready 055b80ab3d): 2x8K sub-calls + S3 one-reciprocal SiTU; in-step NVFP4 MegaMoE 74.01 -> 52.32 ms (model ach 73.33, serial-sum model).",
-  "SOL design for the main kernel (measured: epilogue-bound 46% acc-empty waits, operand 23%; ~410 us tensor floor vs 1006 us per 8K launch at EP4): (a) FC1 epilogue: release the TMEM stage right after the last subtile's tcgen05.ld (compute/quant/store of that subtile after release); move the per-token scalar NVFP4 SF stores into the smem stage + one TMA store; (b) verify FC1-vs-FC2 attribution by adding an FC2-tile count to the probe; (c) operand side: weight reuse across token tiles (scheduler support for cluster N>1 A-multicast; today rejected) to cut ~9 GB/launch of weight L2->SM traffic.",
-  "r7 real EP16 (queued on the 8n pool): standalone 16K vs 2x8K + shared overlap caps; DEP16 93-layer NVFP4 step base vs sub-calls. When it runs, rebuild an overlay on the int head with S3 for the step if the queue allows."
+  "r15 (EP4, 1 node): token_back_mode epi_warps vs reuse_dispatch_warps vs standalone_warps x random/local (does local FC2 + transfer-warp push work and what does it cost on the compute side)",
+  "r16 (real EP16, 8n hold, prewarm on 1 node): same variants + all-local floor at 896 experts: measure the link share at the deployed topology",
+  "Implement transfer-warp combine ring (multi-stage, whole-row ops) -> then group pre-combine (router emits per (src rank, src token) groups; fp32 sum in top-k order; one row per group; reduce over rank partials) -> dispatch dedup",
+  "Validate: rel-L2 vs oracle, bitwise launch independence tests, EP4 + EP16 standalone, step_p -q nvfp4 slice, real DEP16 step"
  ],
  "work": [
   {
@@ -154,11 +154,16 @@
    "t": "18:25",
    "what": "INFRA: S3 (055b80ab3d) ported onto the re-vendored a368c5f66 epilogue (41869ff62e, hunk applied unchanged; VENDOR.md S3 + manifest) and 055b80ab3d merged -s ours into wzhao/k31ws-int c8a403aa7f (pushed); merge int back into wzhao/k31ws-p-moe before new work",
    "result": "int tests pass; NVFP4 prefill slice (die-split emulation) F16K 199.0 -> 197.4 ms, F8K 100.7 -> 99.7; MegaMoE 58.9 -> 55.7 ms vs fused L24 achievable 49.5 (x1.12; the additive 73.3 double counted the link overlap, findings/INFRA.md 17:50)"
+  },
+  {
+   "t": "19:45",
+   "what": "resumed (3rd agent): fast-forwarded wzhao/k31ws-p-moe to int 4071a79bdd; read real-EP16 profile (INFRA p16-t7c8a403-nv-prof, rank 0/9)",
+   "result": "per 8K sub-call: main kernel 1341/1421 us (slice ~960, all-local 926), router 199/279 us (slice 36), reduce 74 us: real EP16 gap is the link (combine as 256 B UBLK ops from the epilogue), not FC1; r7 had failed at prep (step configs), INFRA p16 runs supersede it"
   }
  ],
- "next": "HANDOFF. INFRA: merge wzhao/k31ws-p-moe @ 055b80ab3d (sub-calls + S3, NVFP4 in-step verified, VR tests pass; D-MOE re-vendor must carry S3 in block_scaled_swap_ab_fc12_epilogue.py + VENDOR.md manifest). Family is at target on the slice metric (52.32 vs target 80.66). Next agent: (1) r7 results when the 8n hold arrives: runs/P-MOE/r7/{bench.log,r7.jsonl,step-base/x.log,step-sub/x.log,done.txt} (r7 uses overlay p-moe-1e85ee4c-1 = sub-calls without S3; queued wsgpu -g 8n pid on login-rhea01, log runs/P-MOE/r7.wsgpu.log); (2) FC1 epilogue early-release + SF via smem (plan a) in the vendored epilogue as S4, probe with r13-style stamps (probe worktree /Users/weizha/k31ws-wt/p-moe-probe2; scripts runs/P-MOE/scripts/r13.sh,r14.sh; bench: torchrun --nproc_per_node 4 benchmarks/kernels/k31_vr/bench_megamoe_prefill_overlap.py --num-experts 224 --tokens 8192 --capacity 8192 --knobs <r10 KN> --grid-caps 0 --modes moe --routing random|local); (3) in-step A/B: bash tools/step_p.sh -n P-MOE -t <tag> -q nvfp4 <overlay> 1.",
- "blockers": "Real EP16 needs the 8-node pool hold (r7 queued, wait up to 20 h).",
- "branch": "wzhao/k31ws-p-moe @ 055b80ab3d",
+ "next": "r15 on 1 node (overlay p-moe-4071a79-1 = int 4071a79bdd), then implement the transfer-warp combine ring in token_comm.token_back",
+ "blockers": "Real EP16 runs need the 8-node pool hold (2 hold8 pending).",
+ "branch": "wzhao/k31ws-p-moe @ 4071a79bdd (fast-forwarded to int)",
  "evidence": [
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MOE/{r1,r2,r3c,r4,r5,step_p/subcall-mx-prof}",
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_p/base-mx-f16f8-prof",

@@ -2,17 +2,17 @@
  "id": "D-MOE",
  "title": "Decode: MegaMoE NVFP4 EP32 + shared-expert overlap",
  "side": "decode",
- "owner": "D-MOE agent (workflow, resumed)",
- "state": "landed",
- "updated": "2026-11-18T18:25-08:00",
+ "owner": "D-MOE agent (workflow, resumed 2)",
+ "state": "active",
+ "updated": "2026-11-18T19:50-08:00",
  "shape": "D3-32 r24 1-node slice (EP4 emulating EP32: 28 active experts/rank split 14+14 over the die halves, EP32 MegaMoE records via knob_world_size; SP shard 96 MoE tokens/GPU, top-16, L~135K, k=3); ms = 23-layer slice x4 (92 MoE layers)",
- "baseline_ms": 7.14,
- "current_ms": 6.41,
- "achievable_ms": 5.26,
- "target_ms": 5.79,
+ "baseline_ms": 1.786,
+ "current_ms": 1.599,
+ "achievable_ms": 0.85,
+ "target_ms": 0.935,
  "step_ms": 30.5,
- "basis": "MEASURED in-step, NVFP4 checkpoint, same harness (runs/D-MOE/sb = stepbench + die-split active set): baseline = int b31121cf56 + D-MOE 01ace2323a with the slice picking the EP4 prefill records (runs/D-MOE/step_d/base-die2-nv-r8r16r24-prof: MegaMoE exposed 1824/1846/1786 us per 23 layers at r8/r16/r24); current = 4b58015c31 with the slice on the EP32 records (step_d/hook-die2-nv-r8r16r24-prof: 1504/1461/1603; step 6460/8634/10647 us); achievable nvfp4_modelopt 1086/1201/1316. NOTE: the gain is the slice now measuring the configuration production EP32 already runs (128-token N128 bucket, phase_interleave, die-local, full grid); it is a measurement fix, not new kernel speed. INFRA trial-9ccf8ab (old emulation, all active experts on die 0) read 1763 at r24.",
- "gap_analysis": "r24 remaining gap 1603 -> 1316 (target 1448): ~12.5 us/layer exposed above achievable. Per layer in-step (EP4-emulated EP32 config): router kernel ~7 us + stage ~3 us + main persistent kernel + separate top-k reduce ~3.6 us; the main kernel shares SMs/HBM with the side-stream shared expert (serializing it or running it beside the MoE front only were both measured worse). Stamps (EP4 graph replay, T96): after all sizes are visible the main kernel needs ~55 us (1 GPU ~40): token pull up to 11.6 us, CTA end spread ~9 us, tail NVLink barrier ~1-3 us; router publish_sizes 3.4 us. E1 (entry L2 prefetch of the FC1 stream head) measured neutral/negative: the front is not where the time goes. SOL path: E2 fold the top-k reduce into the kernel tail (removes a kernel boundary ~3 us/layer), E3 finer/LPT last FC2 wave (CTA end spread 9 -> ~2 us), E4 router size publication as one multicast release (EP32: 31 peers), E5 run the shared expert as extra work items of the persistent grid instead of a concurrent cuBLAS kernel. EP32 dispatch/combine (+~17 us/layer on Hecate) needs the 8-node hold.",
+ "basis": "MEASURED in-step, NVFP4 checkpoint, L24 1-node D3-32 slice at r24 (die-split emulation, EP32 records), MegaMoE family exposed per 23 layers (ms): baseline int 9d3cb2b0c2 = 1.786 (runs/INFRA/step_d/ref9d3-ds-nv-prof), current int c8a403aa7f (D-MOE 4b58015c31 merged) = 1.599 (t7-ds-nv-prof); achievable = fused nvfp4_modelopt MegaMoE row L24 r24 0.85 (INFRA 17:50 model fix; was 1.316 additive). Real EP32 (8 nodes, 93 layers, int 5718ef2): exposed 6.55 vs fused ach 3.40 ms.",
+ "gap_analysis": "Real EP32 r24 in-step per layer (d8-int5718ef2 traces, 32 ranks): stage 3.0 us -> MegaMoE router kernel 15.5 us (size exchange + metadata push over 31 peers + rank skew; main kernel PDL-resident at +0.8) -> main kernel ends +80 (min/med/max over ranks 73/80/86 us: ~12 us arrival skew) -> separate reduce 4.2 -> latent rms_norm 2.6 -> latent_up. Shared expert on the side stream: gate_up runs beside the router (-1..10 us), act_quant 10.5-20 us (9.7 us, starved by the full MegaMoE grid), shared down cannot get SMs until MegaMoE ends (74-85 us) and finishes ~4 us after the main kernel: it becomes critical once the reduce/norm shrink. SOL per layer at r24 ~ max(520 MB die-local stream 30 us, NVLink combine ~10 us) + 2 dependent NVLink rounds ~6 us = fused model 36.6 us. Gap to close ~33 us/layer: (1) front: router 15.5 us at EP32 (1-node 3.4) -> single-round size publication (multimem) + weight prefetch into L2 during the wait (E1, 126 MB L2 = ~5 us of stream); (2) tail: reduce 4.2 + norm 2.6 -> one fused kernel (E2a, in test) then into the kernel tail (E2b); (3) shared expert: run it in the router-wait window or on a fixed SM budget so it neither starves MegaMoE nor trails it; (4) main kernel after sizes 60-65 us vs 1-GPU 40: needs the real-EP32 stamps (queued 8n) to split comm vs stream vs imbalance.",
  "inefficiencies": [
   "FIXED on the branch: D3-32 decode used DeepGEMM fp8_fp4 MegaMoE (149 us/layer exposed at r24 in the slice); kimi_k3_mega_moe on the re-vendored kernel: 68 us/layer exposed",
   "MEASURED (stamps, 1 GPU T96): weights stream only after the router publishes sizes (~3 us after the call starts); at T>=4 every local expert is active so the weight stream does not depend on routing",
@@ -30,11 +30,11 @@
   "PDL (programmatic dependent launch) to overlap the MegaMoE prologue with the router GEMM"
  ],
  "plan": [
-  "DONE reconcile with int: 01ace2323a (int tests green)",
-  "DONE slice emulation fix: knob_world_size hook (4b58015c31) + die-split active set (INFRA to adopt in nq_step)",
-  "E2 top-k reduce folded into the kernel tail (all CTAs after an epilogue grid sync; fp32 sum order unchanged)",
-  "E3 tail balance; E4 multicast size publication; E5 shared expert inside the persistent grid",
-  "8-node EP32: DMOE_CFG=$K/runs/D-MOE/rhea_d3x32_dp8_nvfp4_kmm.json bash $K/runs/D-MOE/step_multi_moe.sh -n D-MOE d8 d-moe-4b58015c31-1 128,256,384 1; correction factor emulated/real per bucket"
+  "RUNNING 8n real-EP32 standalone (runs/D-MOE/vs8.sh plan: plain T4-128, stamped T4-96, E1 0/40 MiB) -> per-phase split at real EP32",
+  "IN TEST E2a fused reduce+latent RMSNorm (wzhao/k31ws-d-moe 728a82c351, merged int 0289388c5b): unit test + slice A/B vs int trial9-4071a79-1",
+  "E2b reduce+norm into the main kernel tail (after the NVLink barrier with an epilogue grid sync)",
+  "E4 router: one-round size publication (multimem.st.async.release) + E1 L2 weight prefetch during the size wait, judged at real EP32",
+  "E5 shared expert placement: run in the router-wait window / SM-budgeted beside MegaMoE; in-step A/B on the 8n hold (1-node front is too short to judge)"
  ],
  "work": [
   {
@@ -181,11 +181,26 @@
    "t": "18:25",
    "what": "INFRA: merged wzhao/k31ws-d-moe 4b58015c31 into wzhao/k31ws-int (c8a403aa7f, pushed); stepbench nq_step adopted the die-split active set + knob_world_size hook",
    "result": "int tests pass (incl. megamoe_rubin 160, sp_layers DSA 4); NVFP4 decode slice (die-split emulation) 6576/8673/10520 -> 6381/8438/10302 us, MegaMoE exposed 1786 -> 1599 us at r24 vs fused achievable 850 (MegaMoE family achievable is now the fused model layer: see findings/INFRA.md 17:50)"
+  },
+  {
+   "t": "19:40",
+   "what": "resumed; analysed real-EP32 in-step traces (INFRA d8-int5718ef2, r24, 32 ranks, ep32_trace.py / ep32_tl.py)",
+   "result": "main kernel min/med/max over ranks 73/80/86 us; router kernel 15.5 us at EP32 (vs 3.4 on 1 GPU); shared down waits for MegaMoE to end and trails it by ~4 us; act_quant starved 9.7 us"
+  },
+  {
+   "t": "19:37",
+   "what": "queued 8n real-EP32 standalone bench (vs8.sh: plain T4/32/64/96/128, globaltimer stamps T4-96, E1 entry L2 prefetch 0/40 MiB/die)",
+   "result": "waiting for the hold8 (D-TOPK on rhea0278 until ~20:23)"
+  },
+  {
+   "t": "19:48",
+   "what": "E2a: fused top-k reduce + latent RMSNorm (one CTA per token row, stock rms_norm math, PDL), sp_mlp folds the norm for the Rubin backend; merged int 4071a79bdd -> 0289388c5b; overlay d-moe-0289388c5b-1",
+   "result": "unit tests + slice A/B (vs trial9-4071a79-1) queued"
   }
  ],
- "next": "HANDOFF. (1) INFRA: merge wzhao/k31ws-d-moe @ 4b58015c31 (includes 01ace2323a reconcile; tests: runs/D-MOE/logs/t4.log, t5.log) and adopt runs/D-MOE/sb/nq_step.py emulation changes in tools/stepbench (diff vs tools/stepbench/nq_step.py). (2) In-step A/B for D-MOE: bash $K/runs/D-MOE/sb/step_d_dmoe.sh -n D-MOE -q nvfp4 -t <tag> <overlay> 128,256,384 1 (overlay built with mkov.sh on a worktree that contains 4b58015c31). (3) E2: in block_scaled_swap_ab_mega_moe_kernel.py, pass output_activation + topk_indices to _kernel; in token_comm.reset_tail use epilogue_grid_sync=True when reducing in-kernel, then the transfer warps of every CTA run the TopkReduce._reduce_bf16 body for tokens [cta*T/grid ...) and __call__ skips the separate reduce launch; update VENDOR.md manifest (sha of changed files) and record as local difference; measure with epf.sh-style bench (runs/D-MOE/epf.sh, --die-local) at 1 GPU and EP4, then the slice. (4) 8-node hold (~04:50): see plan item 5; also standalone EP32 stamps (vs.sh needs a multi-node variant: srun --overlap --jobid $WS_JOB -N8 --ntasks-per-node=4 bash wsenv.sh python3 vstamp.py --num-experts 896 ..., modelled on tools/step_multi.sh lines 43-52).",
- "blockers": "EP32 dispatch/combine numbers need the 8-node hold (~04:50).",
- "branch": "wzhao/k31ws-d-moe @ 4b58015c31 (landed-ready)",
+ "next": "Collect t6 (unit tests), step_d e2a vs ref9 (runs/D-MOE/step_d/{e2a,ref9}-nv-r8r16r24-prof/fam.txt), and the 8n vs8 results (runs/D-MOE/logs/vs8-1.log, out/ep32/*.jsonl, stamps out/ep32/vs-ep32s.*). Then E2b / E4 per the real-EP32 split.",
+ "blockers": "Real-EP32 split needs the 8-node hold (queued behind D-TOPK/INFRA on 74730 until ~21:54).",
+ "branch": "wzhao/k31ws-d-moe @ 0289388c5b (E2a in test)",
  "evidence": [
   "rhea:$K/runs/D-MOE/step_d/hook-die2-nv-r8r16r24-prof/fam.txt",
   "rhea:$K/runs/D-MOE/step_d/base-die2-nv-r8r16r24-prof/fam.txt",

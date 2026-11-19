@@ -2,9 +2,9 @@
  "id": "D-KDA",
  "title": "Decode: KDA core (FP32 state)",
  "side": "decode",
- "owner": "D-KDA agent (resumed)",
- "state": "landed-ready",
- "updated": "2026-11-18T19:58-08:00",
+ "owner": "D-KDA agent (resumed 2)",
+ "state": "implementing",
+ "updated": "2026-11-18T20:55-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
@@ -12,12 +12,13 @@
  "target_ms": 0.517,
  "step_ms": 10.89,
  "basis": "MEASURED in-step (Rhea 1-node profile, 93-layer projection, perf-model/microbench/results/rhea1n_d3x32). current_ms stays the production dispatch (KdaWS + flush) until KdaFlow beats it; KdaFlow progress is microbench (1 GPU, n96 = r24, 69 layers in one CUDA graph, deferred fold active): 64.6 us/layer",
- "gap_analysis": "MEASURED (1-GPU microbench, D3-32 per-GPU shape, 69 layers / CUDA graph, deferred fold with 1..4 pending tokens, us/layer): KdaFlow v8 n32/64/96/128 = 21.8/38.9/53.6/71.0 vs model 8.76/17.5/26.3/35 (x2.0-2.5). Per group-item at n96 (2 groups of 4 warps, 255 regs): prep 5K, fold+checkpoint 4K, verify 7.4K, epilogue 1.7K cycles -> ~9K cycles per item per SM vs the ~5K memory budget. Instruction stream is lean (SASS histogram: ~3.4K instr/item/thread, FP2 43%) and smem-path traffic ~3K cycles/item; the remaining gap is latency: prep and epilogue (MUFU, barriers, reductions) run on the same warps as the FP32 passes, and only 2 warps per SMSP fit (128 state registers per thread). Memory skeleton alone (no compute) 36.7 us at n96 because pages land early and wait for a free group.",
+ "gap_analysis": "SOL DESIGN (n96 = r24, 2304 (request, head) items, 302 MB state R+W per layer): bound resource = HBM read-modify-write of the FP32 state. Floor: striped in-place RMW ~24.7 us, die-local ~20.2 us; model achievable 26.3, target 28.9. Compute must hide fully under the stream. Minimum work per state element: one load, one store, fold (n+1 FMA with w_t = kn_t P_t) and the q-token verify in CHUNK FORM: the verify never writes state (deferred commit), so every output needs only 2q matrix-vector products against the folded S_0 (A_t = S_0 (G_t k_t), B_t = S_0 (G_t q_t), G_t = decay products) plus per-row scalar recurrences u_t = (v_t - A_t - sum_s<t c_ts u_s) beta_t, o_t = B_t + sum_s<=t e_ts u_s with q^2 per-item couplings (c_ts, e_ts) from one block reduction in prep. Per element 13 FP32 ops in ONE pass (was ~25 over 5 serial passes with 4 per-token row reductions + smem round trips); rows are independent, so each warp owns a 32-row quarter end to end (own TMA store, no per-token group barriers). Measured v8 (previous): n96 51.9 us; per group-item prep 5K, fold 4K, verify 7.4K, epilogue 1.7K cycles; memory skeleton (loads + checkpoint stores only) 36.6 us -> both compute and the stream must improve. Path: (1) chunk-form scan [v11, implemented, measuring], (2) stream: decouple store-read waits from the groups, more bytes in flight (quarter-granular ring), (3) die-local state placement + die-matched claim (RMW 1.22x). Projected: (1) n96 ~30-36 us (then stream-bound), (2) ~27, (3) ~23-25 us.",
  "inefficiencies": [
-  "MEASURED: prep (conv/norm/decay/fold operands) ~5K cycles per item on the scan warps; not overlapped within a group",
-  "MEASURED: verify ~7.4K cycles/item for 1024 FP2 per thread (2K pipe cycles): per-token chain decay pass -> 8-lane butterfly -> correction broadcast via smem -> update pass",
-  "MEASURED: setmaxnreg does not give a third (prep) warpgroup without the scan losing its registers: ptxas compiles at the 168-register launch cap (v9 verify 11-14K cycles/item)",
-  "MEASURED: in-step baseline slice likely has no pending RecoverSSM commits (no flush kernel in its profile): not production-representative for KDA"
+  "MEASURED (v8): verify = 4 serial state passes per token chain with 8-lane row reductions + smem broadcast of corrections between passes (7.4K cycles/group-item); fixed by chunk form (v11)",
+  "MEASURED (v8): memory skeleton alone 36.6 us at n96 (8.3 TB/s RMW vs 12.2 striped / 14.95 die-local measured RMW): groups block on wait_bulk_reads before refilling their slot; 3 x 64 KiB slots",
+  "MEASURED: prep ~5K cycles/item latency on the scan warps (MUFU, block reductions); v11 merges the recorded-key norms and couplings into one reduction round",
+  "CONFIRMED (code): the step slice runs pending = 0 (record_rows = -1 for dummy batches): no fold, no state write in-step; INFRA to fix in nq_step",
+  "PLANNED: state is 4 KiB-striped; die-local placement needs the KDA state slots homed per die + die-matched item claim"
  ],
  "rubin_features": [
   "two-die locality domains: per-4 KiB page home die (default interleave) + %smid -> die map (dies.py)",
@@ -26,11 +27,11 @@
   "programmatic dependent launch"
  ],
  "plan": [
-  "DONE: KdaFlow v8 (one state pass: fold + verify + o_norm; bulk-copy I/O; prologue F_B gate projection; 3-slot page ring) dispatched from n21",
-  "DONE (87c9de2e01): fused verify passes (+2-5%)",
-  "NEXT 2: overlap prep(j+1) with verify(j) inside each group (software pipelining across tokens); needs double-buffered operand blocks: free ~32 KB smem (raw gates as decays computed per item from smem are 16 KB; MAX_ITEMS 16 -> 12 at n<=105; hcs 17 KB)",
-  "NEXT 3: fix the bench flush kind (KdaCommitF32 dt_bias operand ndim) to quote KdaWS+flush at n71+ exactly; ask INFRA to run the step slice with pending > 0",
-  "NEXT 4: in-step A/B on the int overlay (step_d.sh r8/r16/r24) once INFRA merges cb9821adf6"
+  "DONE: KdaFlow v8 + fused verify (87c9de2e01, landed-ready)",
+  "NOW: v11 chunk-form scan (9c96cbbec5, run32 on overlay d-kda-c11-1): test + n32..128 bench + attribution",
+  "NEXT: stream redesign: quarter-granular page ring, store-read waits off the critical path, >= 4 pages in flight",
+  "NEXT: die-local state microbench (localized slots + %smid die claim) -> production placement plan (state allocation hook in sdec)",
+  "NEXT: in-step A/B on an int overlay once INFRA's slice sets pending > 0"
  ],
  "work": [
   {
@@ -162,10 +163,20 @@
    "t": "19:55",
    "what": "run31 fused verify passes (token t update + t+1 decay in one state pass), commit 87c9de2e01",
    "result": "flow test 8/8, 255 regs, 0 spills; n32/64/96/128 = 21.6/37.3/51.9/67.7 us/layer (x69 n96 = 3.58 ms) vs two passes 21.6/38.9/52.9/71.0. landed-ready sha updated"
+  },
+  {
+   "t": "20:40",
+   "what": "code check of the deferred commit in the step slice (INFRA question)",
+   "result": "CONFIRMED: dummy/capture batches bind recoverssm_request_slots=None -> record_rows=-1 -> pending 0: no fold, no state write in-step. Fix proposal in findings."
+  },
+  {
+   "t": "20:55",
+   "what": "v11 chunk-form KdaFlow written (commit 9c96cbbec5): one pass fold + 2q-vector products, per-row token solve, swizzled scan vectors (conflict-free broadcast), per-warp quarter checkpoint stores, merged prep reduction",
+   "result": "run32 queued (overlay d-kda-c11-1)"
   }
  ],
- "next": "HANDOFF. Branch wzhao/k31ws-d-kda @ 87c9de2e01 (landed-ready; dispatch commit cb9821adf6 + fused verify 87c9de2e01). Code: vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/flow.py (KdaFlow v8), sp.py (dispatch), tests/models/kimi_k3/test_specialized_decode_sp_kda_flow_gpu.py, benchmarks/kernels/k31_vr/kda_sp_bench.py (--kinds flow wide ws flush, --skip prep,fold,verify,store,epi,reduce, --trace, --fence N, --noprefetch, --scalar). Commands: stage: bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-kda <tag>; run (Rhea): cd $K/runs/D-KDA; setsid nohup $K/tools/wsgpu.sh -g 1 -m 45 -o <tag> -n D-KDA -- bash $K/runs/D-KDA/runNN.sh > runNN.log 2>&1 &; templates run25.sh (test+bench+attribution+trace), run27.sh (dispatch table), run29b.sh (SP KDA test files). SASS histogram tool: ~/.cache/k31ws-ptxas/dkda/sassop.py (compile kernel PTX with the image ptxas in colima, classify opcodes). Next design steps: plan NEXT 2-4 (prep/verify overlap inside a group is the largest remaining lever: prep ~5K of the ~18K cycles per group-item). Dead ends (measured): 2-row layouts (smem return path), half-row 4-group layout, warp-specialized prep WG with setmaxnreg, per-warp quarter refills, register-path checkpoint stores, synchronous global accesses in the item loop.",
- "blockers": "None hard. In-step A/B waits on INFRA merging cb9821adf6 into wzhao/k31ws-int; the step slice probably runs with pending = 0 (no fold), which understates KDA cost for every core.",
+ "next": "run32 results (runs/D-KDA/run32.log): correctness at tolerance, n96 us/layer, attribution; then stream redesign",
+ "blockers": "In-step A/B is not representative until the step slice sets pending > 0 (finding 20:40, INFRA).",
  "branch": "wzhao/k31ws-d-kda @ 87c9de2e01",
  "evidence": [
   "runs/D-KDA/run19.log .. run30b.log (Rhea Lustre k31ws/runs/D-KDA)",

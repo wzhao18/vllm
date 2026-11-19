@@ -19,5 +19,7 @@ t tests/models/kimi_k3/test_specialized_decode_sp_mlp_gpu.py tests/models/kimi_k
 # (no tblib) and --noconftest skips it: deselect those (pre-existing, not P-GEMM's)
 [ -f tests/models/kimi_k3/test_mxfp8_act.py ] && t tests/models/kimi_k3/test_mxfp8_act.py -k "not rms_norm_quantize_matches_rmsnorm and not linear_consumes_produced_activation and not dispatch_backends_agree and not packed_moe_gemms_match_separate"
 for f in tests/models/kimi_k3/test_k31_vec_situ.py tests/models/kimi_k3/test_prefill_glue.py tests/models/kimi_k3/test_k31_prefill_attn_res_mxfp8.py; do [ -f $f ] && t $f; done
+# D-KDA (87c9de2e01): KdaFlow (deferred RecoverSSM) + the SP KDA cores it dispatches with
+for f in tests/models/kimi_k3/test_specialized_decode_sp_kda_flow_gpu.py tests/models/kimi_k3/test_specialized_decode_sp_kda_gpu.py tests/models/kimi_k3/test_specialized_decode_sp_kda_fold_gpu.py tests/models/kimi_k3/test_specialized_decode_sp_kda_deferred_path_gpu.py tests/models/kimi_k3/test_specialized_decode_sp_recoverssm_gpu.py; do [ -f $f ] && t $f; done
 echo "== int_tests rc=$rc"
 exit $rc

@@ -333,6 +333,35 @@ def patch_expert_emulation(emulate_ep):
 KERNEL_PAGE = 64
 
 
+def patch_recoverssm_pending():
+    """Bench-only (INFRA 2026-11-18, from D-KDA): exercise the deferred RecoverSSM commit in the slice. Capture and dummy
+    batches bind no request slots, so the deferring KDA builders stage record_rows = -1 for every row: every KDA core
+    then sees no pending replay, folds nothing and writes no state (a read-only state stream, half the production
+    bytes). Production always has pending >= 1 (the bonus token). After each deferred build, point the speculative rows
+    at distinct record slots 0..n-1 and set their pending count to num_spec + 1 (every draft accepted, as the bench's
+    propose assumes). record_rows / pending are staged buffers the captured graphs read at replay."""
+    try:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.recoverssm import state as RS
+    except ImportError:
+        return
+    if getattr(RS, "_k31ws_pending_patch", False) or not hasattr(RS, "_build_deferred"):
+        return
+    orig = RS._build_deferred
+    import torch
+
+    def _build_deferred(builder, m, context, num_spec_decodes, *a, **k):
+        d = orig(builder, m, context, num_spec_decodes, *a, **k)
+        if builder.recoverssm_request_slots is None and num_spec_decodes > 0:
+            n = min(num_spec_decodes, d.record_rows.shape[0], d.pending.shape[0])
+            d.record_rows[:n].copy_(torch.arange(n, dtype=d.record_rows.dtype, device=d.record_rows.device))
+            d.pending[:n].fill_(builder.num_spec + 1)
+        return d
+
+    RS._build_deferred = _build_deferred
+    RS._k31ws_pending_patch = True
+    log("recoverssm: bench rows bind record slots 0..n-1 with pending = num_spec + 1 (deferred commit exercised)")
+
+
 def patch_fill(fill_index, fill_mla):
     """$W/c1/dsacore/tools/bench_b1_step.py patch_fill_index (2026-11-01 fix): random index
     keys per 64-key kernel page with an MX-aware 1.0 scale word; optional MLA rows."""
@@ -638,6 +667,7 @@ def main():
     patch_specialized_decode(sizes, args.max_capture, full, parse_sizes(args.measured_rows))
     patch_fill(not args.no_fill_index, args.fill_mla)
     patch_expert_emulation(args.emulate_ep)
+    patch_recoverssm_pending()
     if "--shapes" in rest:
         patch_kv_pool(rest[rest.index("--shapes") + 1], "--exclude-drafter" not in rest,
                       args.free_floor_gib)

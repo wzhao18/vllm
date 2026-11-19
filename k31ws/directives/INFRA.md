@@ -17,3 +17,6 @@ Produce NVFP4 in-step baselines NOW: merge EN (wzhao/k31ws-en 6f164db270) into w
 
 ## 2026-11-18 19:40 PST coordinator
 - Release DSpark drafter config (e4e6e626: config.json, config.py, README, no weights) copied from Hecate to Rhea at /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/models/dspark-release. Build dspark-release-L24 (aux layer ids remapped to the L24 target like dspark-preview-L24) and make it the default drafter of step_d/step_multi; re-post the NVFP4 decode reference with the release drafter (the ~4 ms preview tail goes away).
+
+## 2026-11-18 20:05 PST coordinator: TOP PRIORITY
+- Build dspark-release-L24 (and the 93-layer release view for step_multi), make it the default drafter everywhere (step_d, step_p, step_multi), and re-post the NVFP4 decode and prefill references on int with the release drafter (profiled, per-family). Owners re-base on those. Mirror the release config to Hecate.
