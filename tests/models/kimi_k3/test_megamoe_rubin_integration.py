@@ -285,8 +285,9 @@ def test_deployment_buckets_per_role(
     monkeypatch, ep, role, world, mnbt, tp, token_sharded, caps
 ):
     """The experts module's buckets at the deployed roles' capacities: the P/D
-    prefill workers (both kimi_k3_mega_moe) keep one bucket on the shipped record,
-    the decode role adds the 256 decode bucket on the same record."""
+    prefill workers (both kimi_k3_mega_moe) keep one bucket on the shipped record
+    (prefill-sized NVFP4: dedup combine), the decode role adds the 256 decode bucket
+    on the same record."""
     ep.world_size = world
     tokens = kimi_model.mega_moe_max_num_tokens(mnbt, tp, token_sharded)
     config = _vllm_config(mnbt=mnbt, dp=4)
@@ -298,8 +299,10 @@ def test_deployment_buckets_per_role(
         module = _experts(config, ep=ep, max_num_tokens=tokens, **K31)
     assert tuple(b.max_tokens for b in module.buckets) == caps
     main, _ = X.select_rubin_bucket(module.problem, world, tokens)
-    assert module.bucket == main
-    assert all(b.knobs == main.knobs for b in module.buckets)
+    # prefill-sized NVFP4 buckets: the dedup combine on the same tile knobs
+    want = X._prefill_dedup(main) if module.problem.quant_kind == "nvfp4" else main
+    assert module.bucket == want
+    assert all(b.knobs in (main.knobs, want.knobs) for b in module.buckets)
     for b in module.buckets:
         C.RubinMoeConfig.make(module.problem, b, rank=0, world_size=world)
 

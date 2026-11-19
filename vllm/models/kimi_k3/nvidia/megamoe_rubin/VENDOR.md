@@ -280,14 +280,18 @@ p50 (682 vs 731 us).
   SM -> die mask (impl field ``die_sm_mask32``, ``die_local.current_die_sm_mask32``) when the CuTe
   DSL build has no ``cute.arch.locality_domain_id`` (DSL 4.8.0). ``common/ptx_helpers.read_smid``,
   ``BlockScaledSwapAbGenphaseMoeKernel._die_from_mask``.
-- **S3** (vLLM-local, as on src): block_scaled_swap_ab_fc12_epilogue.py gated activation keeps the
-  src SiTU core (one reciprocal per element, ex2/rcp only) instead of FlashInfer main's
-  situ_pair_tanh_approx (two tanh.approx.f32 per element, ~2^-11 relative error, lower precision than
-  the a368c5f66 sigmoid form). use_tanh_sigmoid and SwiGLU keep the upstream code.
-- **inference_dedup** (config.Variant): the refreshed inference kernel RubinInferenceMegaMoE with
-  combine_dedup (owner-side FP32 pre-reduce of a token's local expert rows, one BF16 row per (source rank,
-  token), TopkReduceDedup sums the rank rows in ascending rank order; routing weights at FC1). The session
-  allocates its per-launch tmp_buffer.
+- **S3** (vLLM-local, as on ``src``): ``block_scaled_swap_ab_fc12_epilogue.py`` gated activation keeps the
+  ``src`` SiTU core (one reciprocal per element, ex2/rcp only) instead of FlashInfer main's
+  ``situ_pair_tanh_approx`` (two ``tanh.approx.f32`` per element, ~2^-11 relative error, lower precision than
+  the a368c5f66 sigmoid form). ``use_tanh_sigmoid`` and SwiGLU keep the upstream code.
+- **S6** (vLLM-local, as on ``src``): ``sources/communication/nvlink_domain/token_comm_dedup.py`` static
+  token_in (``token_in_flag_batch`` 1) keeps ``token_in_ring_depth`` = 4 remote row pulls in flight per
+  transfer warp (``_token_in_ring``, ported from ``src``); same rows, order, stores, scale copies and flags.
+- **inference_dedup** (``config.Variant``): the refreshed inference kernel ``RubinInferenceMegaMoE`` with
+  ``combine_dedup`` (owner-side FP32 pre-reduce of a token's local expert rows, one BF16 row per (source
+  rank, token), ``TopkReduceDedup`` sums the rank rows in ascending rank order; routing weights at FC1). The
+  session allocates its per-launch ``tmp_buffer``. Used by prefill-sized NVFP4 inference buckets
+  (``experts.RUBIN_DEDUP_MIN_TOKENS``).
 - **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
   (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
   own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing
