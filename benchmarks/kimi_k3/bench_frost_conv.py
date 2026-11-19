@@ -23,6 +23,7 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--pad-cols", type=int, default=256)
     ap.add_argument("--no-time", action="store_true")
+    ap.add_argument("--fused-only", action="store_true")
     args = ap.parse_args()
 
     from cudnn.linear_attention.ops import kimi_delta_attention
@@ -81,6 +82,17 @@ def main():
         kda_conv.qkv_conv_state(qkv, st_fused, cu, idx, has_init)
         return o, fs
 
+    if args.fused_only:
+        t0 = time.time()
+        run_fused()
+        torch.cuda.synchronize()
+        print(f"fused first call {time.time() - t0:.1f} s", flush=True)
+        t0 = time.time()
+        for _ in range(args.iters):
+            run_fused()
+        torch.cuda.synchronize()
+        print(f"fused {(time.time() - t0) * 1e6 / args.iters:.1f} us/call (wall)", flush=True)
+        return
     t0 = time.time()
     o_ref, fs_ref = run_ref()
     torch.cuda.synchronize()
