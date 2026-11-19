@@ -86,25 +86,24 @@ def placed(w, t0, dies):
 
 
 def variants(ext, sms, n, k, r):
+    """(csize, W slots, x slots, issuers, x group, label) at 1 and 2 CTAs per SM."""
     tiles = (n + 127) // 128
     kb = k // 64
     bn = (r + 15) // 16 * 16
     out = []
-    for per_sm, budget in ((1, 227 * 1024), (2, 113 * 1024)):
-        for mult in (1, 2):
-            c = max(1, min(16, kb, round(mult * sms / tiles)))
-            if c > r:
+    for label, budget, cta_per_sm in (("1x", 227 * 1024, 1), ("2x", 113 * 1024, 2)):
+        c = max(1, min(16, kb, r, (cta_per_sm * sms) // tiles))
+        nkb = -(-kb // c)
+        for xg in (4, 8):
+            xg = min(xg, nkb)
+            wst = min(32, nkb)
+            while wst > 3 and ext.smem_bytes(bn, wst, 2, xg) > budget:
+                wst -= 1
+            if ext.smem_bytes(bn, wst, 2, xg) > budget:
                 continue
-            for skb in (1, 2):
-                st = 16
-                while st > 2 and ext.smem_bytes(bn, st, skb) > budget:
-                    st -= 1
-                if ext.smem_bytes(bn, st, skb) > budget:
-                    continue
-                for nprod in (3,):
-                    v = (c, st, skb, nprod, per_sm)
-                    if v not in out:
-                        out.append(v)
+            v = (c, wst, 2, 3, xg, label)
+            if v not in out:
+                out.append(v)
     return out
 
 
@@ -169,12 +168,17 @@ def main():
             row["err_torch"] = ((bf - ref).abs().max() / ref.abs().max()).item()
             row["us_torch"] = round(chain_time(
                 [lambda i=i: torch.mm(x, ws[i].t(), out=outs[i]) for i in range(copies)]), 2)
+            row["us_torch_warm"] = round(chain_time(
+                [lambda i=i: torch.mm(x, ws[0].t(), out=outs[i]) for i in range(copies)]), 2)
             vs = []
-            for c, st, skb, nprod, per_sm in variants(ext, sms, n, k, r):
-                smem = ext.smem_bytes((r + 15) // 16 * 16, st, skb)
-                occ = ext.max_clusters(c, smem)
+            for c, st, skb, nprod, xg, per_sm in variants(ext, sms, n, k, r):  # skb = x slots
+                smem = ext.smem_bytes((r + 15) // 16 * 16, st, skb, xg)
+                try:
+                    occ = ext.max_clusters(c, smem)
+                except Exception as e:  # noqa: BLE001
+                    occ = repr(e)[:80]
                 for place in ("striped", "die"):
-                    tag = f"c{c}.s{st}.k{skb}.p{nprod}.{per_sm}x.{place}"
+                    tag = f"c{c}.w{st}.x{skb}g{xg}.{per_sm}.{place}"
                     try:
                         cnts = [torch.zeros(4, dtype=torch.int32, device=dev)
                                 for _ in range(copies)]
@@ -186,20 +190,26 @@ def main():
                         def call(i, stamps=nost):
                             a0, a1, tt, sd = args[i]
                             ext.run(a0, a1, tt, x, outs[i], cnts[i], sd, c, st, skb,
-                                    nprod, stamps)
+                                    nprod, xg, stamps)
                         outs[0].zero_()
                         call(0)
                         call(0)
                         torch.cuda.synchronize()
                         err = ((outs[0].float() - ref).abs().max() / ref.abs().max()).item()
                         us = chain_time([lambda i=i: call(i) for i in range(copies)])
+
+                        def callw(i):
+                            a0, a1, tt, sd = args[0]
+                            ext.run(a0, a1, tt, x, outs[i], cnts[i], sd, c, st, skb,
+                                    nprod, xg, nost)
+                        usw = chain_time([lambda i=i: callw(i) for i in range(copies)])
                         grid = tiles * c
                         stamps = torch.zeros(grid * 8, dtype=torch.int64, device=dev)
                         call(1)
                         call(2)
                         call(3, stamps)
                         torch.cuda.synchronize()
-                        vs.append(dict(tag=tag, occ_clusters=occ, us=round(us, 2), err=err,
+                        vs.append(dict(tag=tag, occ_clusters=occ, us=round(us, 2), us_warm=round(usw, 2), err=err,
                                        tbs=round(wbytes / us / 1e6, 2),
                                        prof=phases(stamps, grid)))
                     except Exception as e:  # noqa: BLE001
