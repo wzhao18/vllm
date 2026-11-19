@@ -68,6 +68,7 @@ from ..common import mx_rows
 from ..common.primitives import (
     alloc,
     bits_float,
+    float_bits,
     pack_fp8,
     store_words,
     asm,
@@ -266,6 +267,11 @@ def bulk_commit():
 @asm()
 def store_u8(pointer, value):
     return "st.global.u8 [$0], $1;", "l,r,~{memory}", (pointer, Uint32(value))
+
+
+@asm(Uint32)
+def warp_max_u32(value):
+    return "redux.sync.max.u32 $0, $1, 0xffffffff;", "=r,r", (Uint32(value),)
 
 
 @asm(Int32)
@@ -722,7 +728,10 @@ class KdaFlow(KdaWS):
         if cutlass.const_expr(self.trace):
             ps[2] = clock64()
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.mx):
+            # (With MXFP8 outputs the o_proj GEMM follows directly: its CTAs start at
+            # this CTA's exit, so its pre-wait weight loads do not slow the tail.)
+            cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.trace):
             ps[3] = clock64()
         # The F_A rows (16 B per thread, all in flight at once) and the betas:
@@ -1158,9 +1167,7 @@ class KdaFlow(KdaWS):
             width: cutlass.Constexpr = args[10].shape[1]
             data, scale = args[self.mx_at], args[self.mx_at + 1]
             x = Float32(value)
-            amax = mx_rows.max_abs(Float32(0), x)
-            for k in cutlass.range_constexpr(5):
-                amax = mx_rows.fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 1 << k))
+            amax = bits_float(warp_max_u32(float_bits(x) & 0x7FFFFFFF))  # BF16, no NaN
             e = mx_rows.ue8m0(amax * bits_float(Uint32(mx_rows.INV_448)))
             q = x * bits_float(mx_rows.inverse_scale_bits(e))
             q1 = cute.arch.shuffle_sync_down(q, 1)
