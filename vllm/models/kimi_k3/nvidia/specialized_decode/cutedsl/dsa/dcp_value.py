@@ -48,7 +48,6 @@ from ..common.primitives import (
     zeros,
 )
 from .sparse_mla import (
-    bulk_load,
     SDESC_SW128,
     fence_mbar_init,
     ld_shared_u32,
@@ -87,13 +86,6 @@ TC_OUT = 128 * 128 * 2
 # Its epilogue warps (warp % 4 = TMEM lane quadrant), clear of the TMA and MMA
 # issuers (warps 0 and 1), which run ahead into the next unit.
 TC_EPI = 4
-# The next kernel's weight (the DSA o-projection) is read into L2 by one idle thread of
-# every projecting CTA during the projection (TMA bulk loads of WARM_CHUNK bytes into
-# one discarded shared-memory chunk): the o-projection GEMM then streams it from L2.
-# DcpValue's own HBM traffic is small (its loads are L2-bound), so the touch is free.
-WARM_CHUNK = 16384
-WARM_MAX = 48  # chunks per CTA at most
-WARM_WARP = 2  # idle while the projection runs (TMA warp 0, MMA warp 1, epilogue 4-7)
 # kind::f16: FP32 D, BF16 A and B (K-major), N = 128, M = 128
 TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
 
@@ -506,17 +498,13 @@ class DcpValue:
         smem = cutlass.utils.SmemAllocator()
         scales = alloc(smem, Float32, (16 * self.merge_tiles, D))
         ring = Uint32(smem.allocate_array(
-            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128 + WARM_CHUNK,
-            byte_alignment=1024,
+            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128, byte_alignment=1024
         ).toint())
         outs = ring + Uint32(TC_STAGES * TC_STAGE)
         bars = outs + Uint32(2 * TC_OUT)  # full[st], empty[st]
         acc_full = bars + Uint32(16 * TC_STAGES)  # [2]
         acc_free = acc_full + Uint32(16)  # [2]
         slot_addr = acc_free + Uint32(16)
-        warm_bar = slot_addr + Uint32(16)
-        warm_dst = outs + Uint32(2 * TC_OUT + 128)
-        warm, warm_bytes = args[14], args[15]
         tid, _, _ = cute.arch.thread_idx()
         head, y, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -529,7 +517,6 @@ class DcpValue:
             for b in cutlass.range_constexpr(2):
                 mbar_init(acc_full + Uint32(8 * b), Uint32(1))
                 mbar_init(acc_free + Uint32(8 * b), Uint32(128))
-            mbar_init(warm_bar, Uint32(1))
             fence_mbar_init()
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
@@ -541,17 +528,6 @@ class DcpValue:
         cute.arch.sync_threads()
         tc_fence_after()
         taddr = ld_shared_u32(slot_addr)
-        chunks = Int32(warm_bytes // WARM_CHUNK)
-        n_warm = (chunks - c + G - 1) // G  # chunks c, c + G, ..
-        # (the mbarrier's transaction count stays below 2^20 bytes)
-        n_warm = cutlass.select_(n_warm > WARM_MAX, Int32(WARM_MAX), n_warm)
-        if warp == WARM_WARP:
-            if lane == 0:
-                if n_warm > 0:
-                    mbar_arrive_tx(warm_bar, Uint32(n_warm * WARM_CHUNK))
-                    for j in range(n_warm):
-                        src = warm + Int64(c + j * G) * Int64(WARM_CHUNK)
-                        bulk_load(warm_dst, src, Uint32(WARM_CHUNK), warm_bar)
         if warp == 0:
             if lane == 0:
                 kc = Int32(0)
@@ -653,10 +629,6 @@ class DcpValue:
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
         self.merge_rows(args, scales, tid, y)
-        if warp == WARM_WARP:
-            if lane == 0:
-                if n_warm > 0:  # the loads land before the CTA's shared memory goes
-                    mbar_wait(warm_bar, 0)
 
     @cute.jit
     def merge_rows(self, args, scales, tid, y):
@@ -1117,7 +1089,6 @@ def compile_value(
     peers = fake((size,), None, torch.int64, 8)
     output = fake((batch, heads * 128), (heads * 128, 1))
     args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
-    args += (gate, totals, output, Int32(0), Int32(0), Int64(0), Int64(0))
-    args += (make_fake_stream(),)
+    args += (gate, totals, output, Int32(0), Int32(0), make_fake_stream())
     with torch.accelerator.device_index(device):
         return cute.compile(value, *args)

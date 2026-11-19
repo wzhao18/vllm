@@ -267,7 +267,6 @@ def main():
                 names[13 + 16 * ri] = f"r{ri}_Odone"
                 names[14 + 16 * ri] = f"r{ri}_epi"
             for t in range(8):
-                names[38 + t] = f"r0_iss{t}"
                 names[48 + t] = f"r0_kv{t}"
                 names[56 + t] = f"r0_p{t}"
             out["stamps_us_median_max"] = {

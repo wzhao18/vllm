@@ -222,8 +222,6 @@ class SpAttentionBlock:
         # heads x 128 (the o_proj input)
         self.width = output.k if isinstance(output, Mxfp8Projection) else output.shape[1]
         self.oproj = SpOproj(output, step.comm, rows, ctx)
-        if kind == "dsa":  # DcpValue reads the o-projection weight into L2
-            self.core.prepared.warm = output
         cap = rows[-1]
         self.projected = step.scratch(f"{kind}.projected", (cap, pitch))
         self.attn_out = step.scratch(f"attn_out.{self.width}", (cap, self.width))

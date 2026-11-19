@@ -133,8 +133,7 @@ def local_slots(metadata, topk, dcp, rank, interleave, stride_rows):
 
 
 def run_value(
-    kernel, box, parity, publish, heads, core, lengths, uv, projected, out, w_uv=None,
-    warm=None,
+    kernel, box, parity, publish, heads, core, lengths, uv, projected, out, w_uv=None
 ):
     """DcpValue over the sparse decode's ``core`` output: its padded-head latent
     rows, LSE and per-row valid counts (``lengths``: the requests' global lengths)
@@ -163,16 +162,8 @@ def run_value(
         uv = to_cute(values)
     v_args = (to_cute(latent), to_cute(lse, 4), counts, *boxes, *peers, mailbox, uv)
     s = stream(out.device)
-    tail = (cutlass.Int32(parity), rank, *warm_args(warm), s)
-    kernel(*v_args, gate, lens, to_cute(out), *tail)
+    kernel(*v_args, gate, lens, to_cute(out), cutlass.Int32(parity), rank, s)
     return out
-
-
-def warm_args(warm):
-    """DcpValue's L2 touch of the next kernel's weight ``warm`` (or nothing)."""
-    if warm is None:
-        return cutlass.Int64(0), cutlass.Int64(0)
-    return cutlass.Int64(warm.data_ptr()), cutlass.Int64(warm.numel() * warm.element_size())
 
 
 def run_core_value(

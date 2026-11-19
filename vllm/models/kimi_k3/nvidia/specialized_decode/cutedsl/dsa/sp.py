@@ -94,8 +94,10 @@ SP_LOCAL_QUERY = "65-:local"
 # write the latent, QK and PV from separate warps, all-TMA gathers) where it wins
 # standalone (VR200, 1 GPU, CUDA graphs, cold L2, 512 local keys per row, 4 rows per
 # request sharing 80% of their keys; runs/D-ATTN/sp kmhE): 128 rows 16.0 vs 20.6 us,
-# 384 rows 31.1 vs 34.0; trtllm-gen at 256 rows (29.2 vs 27.4).
-SP_KERNELS = "65-:km,192-319:trtllm"
+# 384 rows 31.1 vs 34.0; trtllm-gen at 256 rows (29.2 vs 27.4). In-step (D3-32 slice,
+# 3 runs each, dattn-kmg/kmh) km wins at 384 rows (step -14 us) but not at 128 rows
+# (step +19 us although the DSA family drops 15 us), so km runs from 320 rows.
+SP_KERNELS = "320-:km"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
