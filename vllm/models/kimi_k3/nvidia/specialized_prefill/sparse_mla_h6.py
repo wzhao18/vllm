@@ -343,7 +343,9 @@ class SparseMlaPrefillH6:
                 subs = _subs(n)
                 srow = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(16 * q)
                 c0, c1, c2, c3 = ld_global_v4_s32(srow)
-                for t in range(subs):
+                # unroll=1: the 2x LLVM unroll (register stage addresses, BRA.DIV gather
+                # blocks) ran the kernel at 3.63 vs 2.02 ms/layer (P-MLA runs 64-71)
+                for t in cutlass.range(subs, unroll=1):
                     s = g % NS
                     st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                     full = _bar(base, B_KVFULL + s)
