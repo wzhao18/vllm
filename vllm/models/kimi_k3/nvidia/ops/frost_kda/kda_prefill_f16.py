@@ -1413,13 +1413,15 @@ def compute0_warp_group(
                 if cutlass.const_expr(cfg.fused_conv):
                     conv_args = (cfg, raw_stage, conv_prev_stage, decay_row, f16_segment, f16_segment_dim, conv_from_state, conv_slot, conv_row_valid)
                     sW = sConvW.data_ptr()
+                if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
+                    conv_v_out.append(
+                        (raw_f16_idx, conv_tile_row8(*conv_args, sV_raw.data_ptr(), sW + 8 * cfg.d_k, dim_base, mConvState, conv_ch_v + dim_base))
+                    )
+                if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 2) == 0):
                     raw_q_vec_f32 = conv_tile_row8(*conv_args, sQ_raw.data_ptr(), sW, dim_base, mConvState, conv_ch_q + dim_base).to(cutlass.Float32)
                     raw_k_vec_f32 = conv_tile_row8(
                         *conv_args, sK_raw.data_ptr(), sW + 4 * cfg.d_k, dim_base, mConvState, conv_ch_k + dim_base
                     ).to(cutlass.Float32)
-                    conv_v_out.append(
-                        (raw_f16_idx, conv_tile_row8(*conv_args, sV_raw.data_ptr(), sW + 8 * cfg.d_k, dim_base, mConvState, conv_ch_v + dim_base))
-                    )
                 else:
                     raw_q_frag = (sQ_ptr + raw_f16_idx).load(count=8, alignment=16)
                     raw_k_frag = (sK_ptr + raw_f16_idx).load(count=8, alignment=16)
@@ -1437,11 +1439,12 @@ def compute0_warp_group(
                         q_sq_even, q_sq_odd = ffma2(q_val0, q_val1, q_val0, q_val1, q_sq_even, q_sq_odd)
                         k_sq_even, k_sq_odd = ffma2(k_val0, k_val1, k_val0, k_val1, k_sq_even, k_sq_odd)
 
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
                 bars.mb_vconv_done[conv_vc_stage].wait(cutlass.Int32(((chunk_count // cfg.vconv_stages) + 1) % 2))
                 for v_idx, v_vec in conv_v_out:
                     (sVc_raw.data_ptr() + conv_vc_stage * (cfg.d_v * cfg.b_t) + v_idx).store(v_vec, alignment=16)
                 bars.mb_vconv_ready[conv_vc_stage].arrive()
+            if cutlass.const_expr(cfg.fused_conv):
                 if cg0_local_warp == 0:
                     if cum_chunk > 0:
                         bars.mb_raw_done[conv_prev_stage].arrive()
@@ -2075,7 +2078,7 @@ def compute1_warp_group(
 
             # ---- Y stage: Y = Beta * (V - k state) -----------------------------------
             bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
                 vc_stage = cutlass.Int32(cum_chunk_base % cfg.vconv_stages)
                 sV_ptr = sVc_raw.data_ptr() + vc_stage * (cfg.d_v * cfg.b_t)
                 bars.mb_vconv_ready[vc_stage].wait(cutlass.Int32((cum_chunk_base // cfg.vconv_stages) % 2))
@@ -2090,7 +2093,7 @@ def compute1_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
                 bars.mb_vconv_done[vc_stage].arrive()
             bars.mb_beta_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             beta_fp32 = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
@@ -2401,7 +2404,7 @@ def compute1_warp_group(
             bars.mb_o_tmastg_ready[drain_o_stage].arrive()
 
             # ---- Y stage: Y = Beta * (V - k state) -----------------------------------
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
                 vc_stage = cutlass.Int32(cum_chunk % cfg.vconv_stages)
                 sV_ptr = sVc_raw.data_ptr() + vc_stage * (cfg.d_v * cfg.b_t)
                 bars.mb_vconv_ready[vc_stage].wait(cutlass.Int32((cum_chunk // cfg.vconv_stages) % 2))
@@ -2416,7 +2419,7 @@ def compute1_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
                 bars.mb_vconv_done[vc_stage].arrive()
             bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
 
@@ -3438,6 +3441,7 @@ class KdaPrefillCfg:
     vconv_stages: int = 4
     vconv_cosize: int = 1
     conv_w_cosize: int = 1
+    conv_dbg: int = 0  # TEMP experiment knob: 1 no V conv, 2 no q/k conv, 4 four V-conv stages
 
 
 def build_cfg(
@@ -3546,7 +3550,10 @@ def build_cfg(
         if steep or cfg.d_v != 128 or cfg.d_k != 128 or tiles_per_head != 1:
             raise ValueError(f"fused conv needs steep off, d_k = d_v = 128 and one tile per head (steep {cfg.steep_mode}, d_v {cfg.d_v})")
         cfg.fused_conv = True
-        cfg.vconv_stages = 2
+        import os
+
+        cfg.conv_dbg = int(os.environ.get("K31_FROST_CONV_DBG", "0"))
+        cfg.vconv_stages = 4 if cfg.conv_dbg & 4 else 2
         cfg.vconv_cosize = cfg.vconv_stages * cfg.d_v * cfg.b_t
         cfg.conv_w_cosize = 3 * 4 * cfg.d_k
     return cfg
