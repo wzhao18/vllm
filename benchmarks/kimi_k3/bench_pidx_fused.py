@@ -22,13 +22,16 @@ from vllm.utils.deep_gemm import (
 )
 
 
-def make(reqs, seed=0, dev="cuda"):
-    """reqs: list of (rows, kv_len)."""
+def make(reqs, seed=0, dev="cuda", zero_rows=None):
+    """reqs: list of (rows, kv_len); zero_rows: token rows whose head weights are 0
+    (all logits tie)."""
     g = torch.Generator(device=dev).manual_seed(seed)
     t = sum(r for r, _ in reqs)
     index_q = torch.randn(t, 32, 128, device=dev, dtype=torch.bfloat16, generator=g)
     index_w = torch.randn(t, 32, device=dev, dtype=torch.float32, generator=g)
     q, q_scale, w = mxfp4_q_quant(index_q, index_w, (128**-0.5) * (32**-0.5), 32)
+    if zero_rows is not None:
+        w[zero_rows] = 0
     _, w_bf16 = mqa_logits_mx_inputs(q.view(torch.int8), q_scale, w)
     pads = [(kv + 127) // 128 * 128 for _, kv in reqs]
     nk = sum(pads)
@@ -40,20 +43,20 @@ def make(reqs, seed=0, dev="cuda"):
         [r for r, _ in reqs], [kv for _, kv in reqs], bases, dev
     )
     logits = torch.empty(scratch, dtype=torch.bfloat16, device=dev)
-    tops = torch.empty(scratch // 8 + 64, dtype=torch.int16, device=dev)
+    row_bin = torch.zeros(2 * t, dtype=torch.int32, device=dev)
     out = torch.empty(t, 2048, dtype=torch.int32, device=dev)
     return dict(reqs=reqs, q=q, q_scale=q_scale, w=w_bf16, k8=k8, k_sf=k_sf,
                 bases=bases, items=items, row_len=row_len, row_base=row_base,
-                logits=logits, tops=tops, out=out)
+                logits=logits, row_bin=row_bin, out=out)
 
 
 def run_score(d, mode=0):
     pidx.score(d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["row_len"],
-               d["items"], d["row_base"], d["logits"], d["tops"], mode=mode)
+               d["items"], d["row_base"], d["logits"], d["row_bin"], mode=mode)
 
 
 def run_select(d):
-    pidx.select(d["logits"], d["tops"], d["row_base"], d["row_len"], d["out"])
+    pidx.select(d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"])
 
 
 def stock_logits(d, r):
@@ -91,8 +94,12 @@ def ref_topk(bits_row, n, k):
 
 
 def check(args):
-    reqs = [(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000)]
-    d = make(reqs, seed=1)
+    # request 2 ties completely (candidate path with ties), the first 64 rows of
+    # request 3 overflow the candidate buffer (exact path), request 5 is longer than
+    # the vector-maxima buffer (exact path)
+    reqs = [(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000), (3, 140000)]
+    zero = list(range(337, 346)) + list(range(346, 346 + 64))
+    d = make(reqs, seed=1, zero_rows=zero)
     run_score(d)
     run_select(d)
     torch.cuda.synchronize()
@@ -145,18 +152,15 @@ def perf(args):
         for mode in args.modes:
             res[f"score_mode{mode}"] = timed(lambda: run_score(d, mode), args.iters)
             print(f"score mode {mode}: {res[f'score_mode{mode}']:.3f} ms", flush=True)
-    d["tops"][-32:].zero_()
-    run_score(d, 4)
-    torch.cuda.synchronize()
-    pv = d["tops"][-32:].view(torch.int64)[:5].tolist()
-    n = max(pv[4], 1)
-    res["prof"] = dict(acc_wait=pv[0] / n, ld_math=pv[1] / n, stage=pv[2] / n,
-                       barrier=pv[3] / n, tiles_per_warp=n)
-    print("epilogue clk per processed tile:", res["prof"], flush=True)
     res["fill"] = timed(lambda: d["logits"].fill_(0), args.iters)
     print(f"torch fill of the scratch: {res['fill']:.3f} ms", flush=True)
     run_score(d)
     res["select"] = timed(lambda: run_select(d), args.iters)
+    for groups in args.groups:
+        res[f"select_g{groups}"] = timed(lambda: pidx.select(
+            d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"],
+            groups=groups), args.iters)
+        print(f"select groups {groups}: {res[f'select_g{groups}']:.3f} ms", flush=True)
     res["score+select"] = timed(lambda: (run_score(d), run_select(d)), args.iters)
     print(f"select {res['select']:.3f} ms; score+select {res['score+select']:.3f} ms "
           f"per layer (items {d['items'].shape[0]}, scratch "
@@ -171,6 +175,7 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--modes", type=int, nargs="+", default=[0])
     ap.add_argument("--reps", type=int, default=1)
+    ap.add_argument("--groups", type=int, nargs="+", default=[4])
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     out = {}
