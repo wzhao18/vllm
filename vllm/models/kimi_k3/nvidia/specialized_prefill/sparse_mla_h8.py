@@ -22,9 +22,10 @@ Pipeline (P-MLA runs 45-61):
   budgets above the launch count at <= 640 threads), softmax warpgroups run at 144.
 * Each softmax warpgroup keeps l relative to the last m it used; both are combined
   at the token end. The lazy-max O^T rescale (rare) and, for the warpgroup that owns
-  a token's last subtile, the next token's Q copy into TMEM and the epilogue
-  (16x256b TMEM loads -> stmatrix.trans -> SW128 staging -> TMA store) run in the
-  softmax warpgroups: there is no separate output warpgroup.
+  a token's last subtile, the epilogue (16x256b TMEM loads -> stmatrix.trans -> SW128
+  staging -> TMA store) run in the softmax warpgroups: there is no separate output
+  warpgroup. The QK warp copies each token's latent Q from the staging into TMEM
+  (tcgen05.cp) between the tokens' QK MMAs.
 * 9 gather warps (TMA tile::gather4), slot indices by prefetched global loads.
 """
 
@@ -93,6 +94,7 @@ P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M
 NS = 6  # 64-key KV stages
 NP = 3  # P buffers
 NLD = 9  # gather warps
+GATHER_PARTS = 2  # issuing lanes per quad
 STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
 # warps: 0-3 / 4-7 softmax warpgroups (thread = head; warps 3 and 7 hold padding rows
 # 96-127 and only take part in barriers, rescales, Q copies and epilogues), 8 PV,
@@ -198,6 +200,13 @@ def mma_cb_e(d, a, b, idesc, acc, op: str):
 
 
 @asm()
+def cp_e(t, sdesc):
+    """128 rows x 32 bytes from shared memory (descriptor) to tensor memory."""
+    code = "{ .reg .pred e; " + _ELECT + "@e tcgen05.cp.cta_group::1.128x256b [$0], $1; }"
+    return code, "r,l,~{memory}", (Uint32(t), Uint64(sdesc))
+
+
+@asm()
 def commit_e(bar):
     code = ("{ .reg .pred e; " + _ELECT + "@e tcgen05.commit.cta_group::1.mbarrier::arrive::one"
             ".shared::cluster.b64 [$0]; }")
@@ -270,9 +279,12 @@ class SparseMlaPrefillH8:
         # ssmask: roles whose sstamp sites are compiled (1 softmax, 2 QK, 4 PV, 8 gather)
         # pin: loader code-layout experiment (1: clock read only at the two gather stamp
         # sites, 2: the guarded stamp store to a scratch word)
-        knobs = tuple(knobs) + (0,) * (8 - len(knobs))
+        # parts: issuing lanes per 4-row quad (its 5 gather4 ops are spread over them)
+        knobs = tuple(knobs) + (0,) * (9 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
-         self.pad, self.ssmask, self.pin) = knobs[:8]
+         self.pad, self.ssmask, self.pin, self.parts) = knobs[:9]
+        if not self.parts:
+            self.parts = GATHER_PARTS
         if self.sstamp and not self.ssmask:
             self.ssmask = 15
         self.smem = SMEM_BYTES + (1024 if self.sstamp or self.pad else 0)
@@ -315,7 +327,7 @@ class SparseMlaPrefillH8:
         raw = smem.allocate_array(Uint8, self.smem, byte_alignment=1024)
         base = Uint32(raw.toint())
         if tid == 0:
-            for i, cnt in ((B_QTM, 4), (B_QLFREE, 4), (B_OFULL, 1), (B_EPIDONE, 1)):
+            for i, cnt in ((B_QTM, 4), (B_QLFREE, 1), (B_OFULL, 1), (B_EPIDONE, 1)):
                 mbar_init(_bar(base, i), Uint32(cnt))
             for j in cutlass.range_constexpr(2):
                 mbar_init(_bar(base, B_SFULL + j), Uint32(1))
@@ -414,10 +426,15 @@ class SparseMlaPrefillH8:
                                    Int32(128 * j), row * H)
                     tma_tile2d(qs, tm_qr, full, Int32(0), row * H)
         else:
-            # lane l gathers quad q = pw + NLD l of every 64-key stage; its 4 slot indices
-            # are loaded one stage ahead
-            q = pw + NLD * lane
-            if lane >= quads:
+            # lanes P j .. P j + P - 1 gather quad q = pw + NLD j of every 64-key stage
+            # (P = parts; lane part p issues ops p, p + P, ... of the quad's 4 latent atoms
+            # + RoPE): TMA gather4 throughput scales with issuing threads, not warps
+            # (hwdb 17: ~32 issuers per SM); the 4 slot indices are loaded one stage ahead
+            npart = self.parts
+            part = lane % npart
+            q = pw + NLD * (lane // npart)
+            act = lane < quads * npart
+            if not act:
                 q = pw  # idle lanes read a valid slot of the stage (unused)
             g = Int32(0)
             for qi in range(n_mine):
@@ -451,7 +468,7 @@ class SparseMlaPrefillH8:
                                 mbar_arrive_tx(full, Uint32(STAGE64))
                     cute.arch.sync_warp()
                     if cutlass.const_expr(not self.no_gather):
-                        if lane < quads:
+                        if act:
                             r0 = (r[0] >> 6) * unit_rows + (r[0] & 63)
                             r1 = (r[1] >> 6) * unit_rows + (r[1] & 63)
                             r2 = (r[2] >> 6) * unit_rows + (r[2] & 63)
@@ -464,11 +481,17 @@ class SparseMlaPrefillH8:
                                 r2 = Int32(-1)
                             if r[3] < 0 or key + 3 >= n:
                                 r3 = Int32(-1)
-                            for a in cutlass.range_constexpr(4):
-                                gather4(st + Uint32(a * 8192) + Uint32(q) * Uint32(512), tm_kv,
-                                        full, 128 * a, r0, r1, r2, r3)
-                            gather4(st + Uint32(4 * 8192) + Uint32(q) * Uint32(256), tm_kr,
-                                    full, D_NOPE, r0, r1, r2, r3)
+                            for k in cutlass.range_constexpr((5 + npart - 1) // npart):
+                                a = part + npart * k
+                                if a < 5:
+                                    dst = st + Uint32(a * 8192) + Uint32(q) * Uint32(512)
+                                    desc = tm_kv
+                                    col = 128 * a
+                                    if a == 4:
+                                        dst = st + Uint32(4 * 8192) + Uint32(q) * Uint32(256)
+                                        desc = tm_kr
+                                        col = Int32(D_NOPE)
+                                    gather4(dst, desc, full, col, r0, r1, r2, r3)
                     if pw == 0:
                         self.ss(base, cta, lane, g, 23, 8)
                         self.lpin(base, cta, lane, g)
@@ -483,8 +506,18 @@ class SparseMlaPrefillH8:
         u = Int32(0)
         for qi in range(n_mine):
             subs = _subs(lens[cta + qi * self.grid])
-            mbar_wait(_bar(base, B_QTM), Uint32(qi & 1))
+            # the next token's latent Q: staging -> TMEM by tcgen05.cp from this warp, once
+            # the previous token's QK MMAs (which read C_Q) have completed; cp -> mma
+            # is ordered in the tensor pipe
+            mbar_wait(_bar(base, B_QFULL + qi % 2), Uint32((qi // 2) & 1))
+            if qi >= 1:
+                mbar_wait(_bar(base, B_QREMPTY + (qi - 1) % 2), Uint32(((qi - 1) // 2) & 1))
             tc_fence_after()
+            qd = Uint64(SDESC_SW128) | Uint64((base + Uint32(OFF_QN)) >> Uint32(4))
+            for j in cutlass.range_constexpr(4):
+                for c in cutlass.range_constexpr(4):
+                    cp_e(taddr + Uint32(C_Q + 32 * j + 8 * c), qd + Uint64(j * ATOM // 16 + 2 * c))
+            commit_e(_bar(base, B_QLFREE))
             for i in range(subs):
                 if u >= 1:
                     mbar_wait(_bar(base, B_SFREE + (u - 1) % 2), Uint32(((u - 1) // 2) & 1))
@@ -570,8 +603,6 @@ class SparseMlaPrefillH8:
         total = Int32(0)
         for qi in range(n_mine):
             total = total + _subs(lens[cta + qi * self.grid])
-        if wg == 0 and n_mine > 0:
-            self.q_copy(base, h, lane, lane_addr, Int32(0))
         u = Int32(0)
         for qi in range(n_mine):
             row = cta + qi * self.grid
@@ -591,8 +622,9 @@ class SparseMlaPrefillH8:
                                                cta, False)
                 u = u + 1
             # ---- token end. The WG owning the last subtile (u - 1) combines
-            # l = l0 2^(m0 - m) + l1 2^(m1 - m), m = max(m0, m1), copies the next token's
-            # Q into TMEM and runs the epilogue; the other WG hands over (l, m) and goes on.
+            # l = l0 2^(m0 - m) + l1 2^(m1 - m), m = max(m0, m1) and runs the epilogue (in
+            # the Q staging, once the next token's Q is in TMEM); the other WG hands over
+            # (l, m) and goes on.
             owner = (u - 1) % 2 == wg
             tok = base + Uint32(OFF_TOK0)
             if qi % 2 == 1:
@@ -615,7 +647,7 @@ class SparseMlaPrefillH8:
                     named_bar_arrive(Uint32(7 + sp), 64)
             if owner:
                 if qi + 1 < n_mine:
-                    self.q_copy(base, h, lane, lane_addr, qi + 1)
+                    mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
 
     @cute.jit
@@ -736,29 +768,6 @@ class SparseMlaPrefillH8:
         return mp_last, lw
 
     @cute.jit
-    def q_copy(self, base, h, lane, lane_addr, qi):
-        """Q latent atoms 0-3 of token qi (staging, SW128) -> TMEM columns C_Q (lane =
-        head), once the previous token's last QK has completed."""
-        mbar_wait(_bar(base, B_QFULL + qi % 2), Uint32((qi // 2) & 1))
-        if qi >= 1:
-            mbar_wait(_bar(base, B_QREMPTY + (qi - 1) % 2), Uint32(((qi - 1) // 2) & 1))
-        tc_fence_after()
-        if h < H:
-            for j in cutlass.range_constexpr(4):
-                words = []
-                for c in cutlass.range_constexpr(8):
-                    a = base + Uint32(OFF_QN) + Uint32(j * H * 128) + Uint32(h * 128) + (
-                        (Uint32(c) ^ Uint32(h % 8)) << Uint32(4))
-                    w4 = ld_shared_v4u(a)
-                    words.extend([w4[0], w4[1], w4[2], w4[3]])
-                tmem_st_u32(lane_addr + Uint32(C_Q) + Uint32(32 * j), words)
-        tc_fence_before()
-        cute.arch.sync_warp()
-        if lane == 0:
-            mbar_arrive(_bar(base, B_QLFREE))
-            mbar_arrive(_bar(base, B_QTM))
-
-    @cute.jit
     def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o):
         """O^T block b (lanes = dims, columns = heads) -> BF16 [heads x dims]: 16x256b
         TMEM loads give each thread two adjacent heads of one dim (an m8n8 b16
@@ -769,7 +778,7 @@ class SparseMlaPrefillH8:
         mbar_wait(_bar(base, B_OFULL), Uint32(qi & 1))
         tc_fence_after()
         bid = Uint32(10 + wg)
-        named_bar(bid, 128)  # 1/l of every head written; this WG's Q copy reads done
+        named_bar(bid, 128)  # 1/l of every head written
         t4 = lane % 4
         j = lane % 8
         mk = lane // 8  # matrix this lane addresses in stmatrix.x4
