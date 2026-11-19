@@ -113,8 +113,9 @@ __global__ void __launch_bounds__(256) skel(Args a) {
   int die = 0, rdie = 0;
   unsigned sm = smid() & 1023;
   if (a.match) { rdie = a.sm_die[sm] & 1; die = rdie ^ (a.swap & 1); }
-  const int G = (rdie ? a.n_on1 : a.n_on0) * a.P;
-  const int gi = a.sm_rank[sm] * a.P + iss;
+  const int n_on = rdie ? a.n_on1 : a.n_on0;
+  const int G = n_on * a.P;
+  const int gi = iss * n_on + a.sm_rank[sm];  // issuer-major: every SM gets work first
   unsigned long long* st = a.stamps + ((size_t)(a.layer * gridDim.x + blockIdx.x) * 4 + iss) * 3;
   if (producer && lane == 0 && iss < a.P) for (int i = 0; i < a.S; ++i) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&full[iss * a.S + i])));
@@ -303,8 +304,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests", default="32,64,96")
     ap.add_argument("--replays", type=int, default=20)
-    ap.add_argument("--units", default="256,512")
-    ap.add_argument("--forms", default="t1x64x3,t2x32x3,t4x16x3,t2x48x2,b2x32x3")
+    ap.add_argument("--units", default="128,256,512")
+    ap.add_argument("--forms", default="t2x32x3,t4x16x3,t4x24x2,b4x16x3")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
