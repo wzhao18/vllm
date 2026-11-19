@@ -91,13 +91,21 @@ def test_fold_matches_stock_commit_then_verify(n, graph):
         torch.cuda.synchronize()
         where = f"step {step}"
         # The fold committed the previous step's tokens as the stock commit did.
-        kda.assert_bitwise(f"{where} checkpoints", kv[1], ref_kv[1])
-        kda.assert_bitwise(f"{where} conv window", kv[0], ref_kv[0])
-        kda.assert_bitwise(f"{where} output", out, ref_out)
         got, want = ours.recoverssm_records, stock.recoverssm_records
         index = record_rows.long()
-        kda.assert_bitwise(f"{where} corrections", got.correction[index],
-                           want.correction[:n])  # fmt: skip
+        pairs = [("checkpoints", kv[1], ref_kv[1]), ("output", out, ref_out),
+                 ("corrections", got.correction[index], want.correction[:n])]  # fmt: skip
+        kda.assert_bitwise(f"{where} conv window", kv[0], ref_kv[0])
+        for name, a, b in pairs:
+            if record_kind(HEADS, n) != "flow":
+                kda.assert_bitwise(f"{where} {name}", a, b)
+                continue
+            # KdaFlow's chunk-form verify sums the FP32 dot products in another
+            # order: FP32 tolerance growing with the chain, BF16 outputs.
+            fp32 = dict(rtol=1e-4 * (step + 1), atol=1e-5 * (step + 1))
+            tol = dict(rtol=2e-2, atol=2e-2) if name == "output" else fp32
+            torch.testing.assert_close(a.float(), b.float(), msg=f"{where} {name}",
+                                       **tol)  # fmt: skip
         kda.assert_bitwise(f"{where} key / gate", got.key_gate[index],
                            want.key_gate[:n])  # fmt: skip
         folded += int(pending.sum())

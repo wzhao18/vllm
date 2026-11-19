@@ -294,7 +294,8 @@ def test_deferred_serving_path_matches_stock(n, graph, eager_rows):
             step_md = build_step()  # a fresh deferred per step (flush once)
             core.run(projected, out, caches=caches, metadata=step_md)
         torch.cuda.synchronize()
-        exact &= kind in FOLDS
+        # KdaFlow's chunk-form verify sums the FP32 dot products in another order.
+        exact &= kind in FOLDS and kind != "flow"
         where = f"{kind} step {step}" + ("" if exact else " (FP32 order)")
         got, want = ours.recoverssm_records, stock.recoverssm_records
         index = idx_mapping.long()
