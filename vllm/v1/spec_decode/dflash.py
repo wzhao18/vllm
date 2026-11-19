@@ -204,76 +204,44 @@ class DFlashProposer(SpecDecodeBaseProposer):
             return None
         return rows
 
-    @override
-    def propose(
-        self,
-        num_speculative_tokens,
-        target_token_ids: torch.Tensor,
-        target_positions: torch.Tensor,
-        target_hidden_states: torch.Tensor,
-        next_token_ids: torch.Tensor,
-        token_indices_to_sample: torch.Tensor | None,
-        common_attn_metadata: CommonAttentionMetadata,
-        sampling_metadata,
-        mm_embed_inputs=None,
-        num_rejected_tokens_gpu: torch.Tensor | None = None,
-        slot_mappings=None,
-    ) -> torch.Tensor:
-        # Prefill chunks longer than the draft window: drop the context rows
-        # whose draft K/V is never read (see _window_rows) before the fc and
-        # K/V projections run over them.
-        self.num_speculative_tokens = num_speculative_tokens
-        cad = common_attn_metadata
-        rows = (
-            None
-            if torch.cuda.is_current_stream_capturing()
-            else self._window_rows(cad)
-        )
+    def context_rows(self, cad: CommonAttentionMetadata) -> np.ndarray | None:
+        """Rows of the step's draft context to keep (see ``_window_rows``),
+        or None to keep all; never trims inside a CUDA graph capture."""
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        rows = self._window_rows(cad)
         if rows is not None:
-            qsl_total = cad.query_start_loc_cpu[cad.num_reqs]
             logger.info_once(
                 "DFlash: context rows outside the draft window skipped "
                 "(window %d, hit alignment %s): %d of %d rows kept",
                 self._context_window(),
                 self._context_hit_alignment(),
                 rows.size,
-                int(qsl_total),
+                int(cad.query_start_loc_cpu[cad.num_reqs]),
             )
-            counts = np.diff(
-                np.searchsorted(rows, cad.query_start_loc_cpu[: cad.num_reqs + 1])
-            )
-            qsl_cpu = torch.zeros(cad.num_reqs + 1, dtype=torch.int32)
-            qsl_cpu[1:] = torch.from_numpy(np.cumsum(counts)).to(torch.int32)
-            index = torch.from_numpy(rows).pin_memory().to(
-                target_hidden_states.device, non_blocking=True
-            )
-            target_token_ids = target_token_ids[index]
-            target_positions = target_positions[..., index]
-            target_hidden_states = target_hidden_states[index]
-            cad = replace(
-                cad,
-                query_start_loc=qsl_cpu.pin_memory().to(
-                    cad.query_start_loc.device, non_blocking=True
-                ),
-                query_start_loc_cpu=qsl_cpu,
-                num_actual_tokens=int(rows.size),
-                max_query_len=int(counts.max()),
-                slot_mapping=cad.slot_mapping[index]
-                if cad.slot_mapping.shape[0] >= int(qsl_total)
-                else cad.slot_mapping,
-            )
-        return super().propose(
-            num_speculative_tokens,
-            target_token_ids,
-            target_positions,
-            target_hidden_states,
-            next_token_ids,
-            token_indices_to_sample,
+        return rows
+
+    @staticmethod
+    def trim_context_metadata(
+        cad: CommonAttentionMetadata, rows: np.ndarray, index: torch.Tensor
+    ) -> CommonAttentionMetadata:
+        """``cad`` restricted to ``rows`` (``index``: the same rows on device)."""
+        qsl = cad.query_start_loc_cpu[: cad.num_reqs + 1]
+        counts = np.diff(np.searchsorted(rows, qsl.numpy()))
+        qsl_cpu = torch.zeros(cad.num_reqs + 1, dtype=torch.int32)
+        qsl_cpu[1:] = torch.from_numpy(np.cumsum(counts)).to(torch.int32)
+        total = int(qsl[-1])
+        return replace(
             cad,
-            sampling_metadata,
-            mm_embed_inputs=mm_embed_inputs,
-            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            slot_mappings=slot_mappings,
+            query_start_loc=qsl_cpu.pin_memory().to(
+                cad.query_start_loc.device, non_blocking=True
+            ),
+            query_start_loc_cpu=qsl_cpu,
+            num_actual_tokens=int(rows.size),
+            max_query_len=int(counts.max()),
+            slot_mapping=cad.slot_mapping[index]
+            if cad.slot_mapping.shape[0] >= total
+            else cad.slot_mapping,
         )
 
     @override

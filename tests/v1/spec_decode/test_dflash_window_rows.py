@@ -98,3 +98,29 @@ def test_window_rows_f16k_saving():
     p = _proposer(2048)
     rows = p._window_rows(_cad([5461, 5461, 5462], [83821, 83821, 83822]))
     assert rows.size == 3 * (2048 + NUM_SPEC + 1)
+
+
+def test_trim_context_metadata():
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    qlens, seq_lens = [3000, 4], [3000, 900]
+    qsl = torch.tensor([0, 3000, 3004], dtype=torch.int32)
+    cad = CommonAttentionMetadata(
+        query_start_loc=qsl.clone(),
+        query_start_loc_cpu=qsl,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=3004,
+        max_query_len=3000,
+        max_seq_len=3000,
+        block_table_tensor=torch.zeros(2, 4, dtype=torch.int32),
+        slot_mapping=torch.arange(3004),
+    )
+    p = _proposer(2048)
+    rows = p._window_rows(_cad(qlens, seq_lens))
+    index = torch.from_numpy(rows)
+    out = DFlashProposer.trim_context_metadata(cad, rows, index)
+    assert out.query_start_loc_cpu.tolist() == [0, 2052, 2056]
+    assert out.num_actual_tokens == 2056 and out.max_query_len == 2052
+    assert torch.equal(out.slot_mapping, torch.from_numpy(rows))
+    assert torch.equal(out.seq_lens, cad.seq_lens)
