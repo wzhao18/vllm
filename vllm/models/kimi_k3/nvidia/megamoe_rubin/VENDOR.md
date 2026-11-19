@@ -267,3 +267,20 @@ beats the N=128 record at every measured point (4350 tok: 729 vs 810 us on the 1
 shared-overlap grid, 693 vs 781 us full grid). The i8192 record is the C512 prefill bucket,
 which fell back to the i4096 record before. The i4096 record wins the equal-capacity tie on
 p50 (682 vs 731 us).
+
+## src_gp: refreshed GenPhase kernel (FlashInfer main)
+
+- **Source**: FlashInfer main `855eece4e9b5b796a46148664a3e27da571cd98b` (2026-11-18, includes
+  #9426 "refresh SM107 MegaMoE sources"), `flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src`
+  (69 files; provider source revision `70a6878de7852ed837d6a4dfc1572728226fbbc4`). Used for the
+  GenPhase kernel only (``session._src``); the inference kernel stays on ``src`` (a368c5f66).
+- **R1** (as for ``src``): ``flashinfer.moe_ep.batch_invariant`` imports rewritten to
+  ``src.fi_numerics.moe_ep_batch_invariant`` (byte-identical to FlashInfer main's copies).
+- **S-DIE** (vLLM-local): ``die_aware`` reads the die of each SM from ``%smid`` and the trusted
+  SM -> die mask (impl field ``die_sm_mask32``, ``die_local.current_die_sm_mask32``) when the CuTe
+  DSL build has no ``cute.arch.locality_domain_id`` (DSL 4.8.0). ``common/ptx_helpers.read_smid``,
+  ``BlockScaledSwapAbGenphaseMoeKernel._die_from_mask``.
+- **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
+  (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
+  own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing
+  weights applied at FC1 (``apply_topk_at_fc1``, the deployed math) with the separate reduce.
