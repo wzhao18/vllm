@@ -725,6 +725,32 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
 }
 
 
+
+__device__ __forceinline__ void ffma2p(float& d0, float& d1, float a0, float a1, float b0, float b1,
+                                       float c0, float c1) {
+  asm("{\n .reg .b64 a, b, c, d;\n mov.b64 a, {%2, %3};\n mov.b64 b, {%4, %5};\n"
+      " mov.b64 c, {%6, %7};\n fma.rn.ftz.f32x2 d, a, b, c;\n mov.b64 {%0, %1}, d;\n}"
+      : "=f"(d0), "=f"(d1)
+      : "f"(a0), "f"(a1), "f"(b0), "f"(b1), "f"(c0), "f"(c1));
+}
+__device__ __forceinline__ void fadd2p(float& d0, float& d1, float a0, float a1, float b0, float b1) {
+  asm("{\n .reg .b64 a, b, d;\n mov.b64 a, {%2, %3};\n mov.b64 b, {%4, %5};\n"
+      " add.rn.ftz.f32x2 d, a, b;\n mov.b64 {%0, %1}, d;\n}"
+      : "=f"(d0), "=f"(d1)
+      : "f"(a0), "f"(a1), "f"(b0), "f"(b1));
+}
+__device__ __forceinline__ void fmul2p(float& d0, float& d1, float a0, float a1, float b0, float b1) {
+  asm("{\n .reg .b64 a, b, d;\n mov.b64 a, {%2, %3};\n mov.b64 b, {%4, %5};\n"
+      " mul.rn.ftz.f32x2 d, a, b;\n mov.b64 {%0, %1}, d;\n}"
+      : "=f"(d0), "=f"(d1)
+      : "f"(a0), "f"(a1), "f"(b0), "f"(b1));
+}
+__device__ __forceinline__ float tanh_ap(float x) {
+  float th;
+  asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(x));
+  return th;
+}
+
 // kp64 (no conv, WY images for kc64 v3): post-conv rows in, kd / v as row-major
 // MMA operands, INVb = bf16(INV * beta) as the A operand of [w | u].
 struct SmemK {
@@ -807,15 +833,21 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
     for (int X = 0; X < 2; ++X) {
       float f[8];
       unpack8(*reinterpret_cast<uint4 const*>(raw + X * kRawBox + t * 256 + 16 * cg), f);
-      float ss = 0.0f;
+      float s0 = 0.0f, s1 = 0.0f;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) ss += f[i] * f[i];
+      for (int m = 0; m < 4; ++m) ffma2p(s0, s1, f[2 * m], f[2 * m + 1], f[2 * m], f[2 * m + 1], s0, s1);
+      float ss = s0 + s1;
 #pragma unroll
       for (int o = 8; o >= 1; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
       const float r = rsqrtf(ss + 1e-6f);
+      uint32_t o4[4];
 #pragma unroll
-      for (int i = 0; i < 8; ++i) f[i] *= r;
-      *reinterpret_cast<uint4*>(&s.qkn[X][t][8 * cg]) = pack8(f);
+      for (int m = 0; m < 4; ++m) {
+        float a0, a1;
+        fmul2p(a0, a1, f[2 * m], f[2 * m + 1], r, r);
+        o4[m] = pack2(a0, a1);
+      }
+      *reinterpret_cast<uint4*>(&s.qkn[X][t][8 * cg]) = make_uint4(o4[0], o4[1], o4[2], o4[3]);
     }
     *reinterpret_cast<uint4*>(&sk.kv[1][t][8 * cg]) =
         *reinterpret_cast<uint4 const*>(raw + 2 * kRawBox + t * 256 + 16 * cg);
@@ -825,18 +857,23 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
 
   // ---- gate activation + chunk-relative cumsum ----------------------------------
   {
-    float dt[8];
+    const float ha = 0.5f * amp, hg = 0.5f * p.gate_scale;
+    float dta[8];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) dt[i] = s.dt[8 * cg + i];
+    for (int i = 0; i < 8; ++i) dta[i] = ha * s.dt[8 * cg + i];
     float run[8] = {};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       float gv[8];
       unpack8(*reinterpret_cast<uint4 const*>(raw + kOffRawG + (t_first + j) * 256 + 16 * cg), gv);
-      const bool okj = t_first + j < valid;
+      if (t_first + j < valid) {
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        run[i] += okj ? p.gate_scale * sigmoid_tanh(amp * (gv[i] + dt[i])) : 0.0f;
+        for (int m = 0; m < 4; ++m) {
+          float x0, x1, y0, y1;
+          ffma2p(x0, x1, gv[2 * m], gv[2 * m + 1], ha, ha, dta[2 * m], dta[2 * m + 1]);
+          ffma2p(y0, y1, tanh_ap(x0), tanh_ap(x1), hg, hg, hg, hg);
+          fadd2p(run[2 * m], run[2 * m + 1], run[2 * m], run[2 * m + 1], y0, y1);
+        }
       }
       float4* gp = reinterpret_cast<float4*>(&s.c.g[t_first + j][8 * cg]);
       gp[0] = make_float4(run[0], run[1], run[2], run[3]);
@@ -853,14 +890,10 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
     for (int t2 = 0; t2 < tg; ++t2) {
       const float4* tp = reinterpret_cast<const float4*>(&s.tot[t2][8 * cg]);
       const float4 a = tp[0], b = tp[1];
-      pre[0] += a.x;
-      pre[1] += a.y;
-      pre[2] += a.z;
-      pre[3] += a.w;
-      pre[4] += b.x;
-      pre[5] += b.y;
-      pre[6] += b.z;
-      pre[7] += b.w;
+      fadd2p(pre[0], pre[1], pre[0], pre[1], a.x, a.y);
+      fadd2p(pre[2], pre[3], pre[2], pre[3], a.z, a.w);
+      fadd2p(pre[4], pre[5], pre[4], pre[5], b.x, b.y);
+      fadd2p(pre[6], pre[7], pre[6], pre[7], b.z, b.w);
     }
     const int last = valid - 1;
 #pragma unroll
@@ -868,14 +901,10 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
       const int t = t_first + j;
       float4* gp = reinterpret_cast<float4*>(&s.c.g[t][8 * cg]);
       float4 a = gp[0], b = gp[1];
-      a.x += pre[0];
-      a.y += pre[1];
-      a.z += pre[2];
-      a.w += pre[3];
-      b.x += pre[4];
-      b.y += pre[5];
-      b.z += pre[6];
-      b.w += pre[7];
+      fadd2p(a.x, a.y, a.x, a.y, pre[0], pre[1]);
+      fadd2p(a.z, a.w, a.z, a.w, pre[2], pre[3]);
+      fadd2p(b.x, b.y, b.x, b.y, pre[4], pre[5]);
+      fadd2p(b.z, b.w, b.z, b.w, pre[6], pre[7]);
       gp[0] = a;
       gp[1] = b;
       if ((t & 15) == 0) {
@@ -1118,12 +1147,21 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
       if (8 * jg >= 16 * ((i >> 4) + 1))
         *reinterpret_cast<uint4*>(mqk + (jg * 64 + i) * 8) = make_uint4(0, 0, 0, 0);
     }
-    for (int e = tid; e < kC * kC / 2; e += kThreads) {
-      const int i = e >> 5, j = 2 * (e & 31);
+    {
+      // beta_j = 0 for j >= valid (s.beta), rows i >= valid zero
+      const int i = tid >> 2, j0 = 16 * (tid & 3);
       const bool iv = i < valid;
-      const float v0 = (iv && j <= i && j < valid) ? X[i][j] * s.beta[j] : 0.0f;
-      const float v1 = (iv && j + 1 <= i && j + 1 < valid) ? X[i][j + 1] * s.beta[j + 1] : 0.0f;
-      *reinterpret_cast<uint32_t*>(&sk.invb[i][j]) = pack2(v0, v1);
+      uint32_t pk[8];
+#pragma unroll
+      for (int e = 0; e < 16; e += 2) {
+        const int j = j0 + e;
+        float v0, v1;
+        fmul2p(v0, v1, X[i][j], X[i][j + 1], s.beta[j], s.beta[j + 1]);
+        pk[e / 2] = pack2((iv && j <= i) ? v0 : 0.0f, (iv && j + 1 <= i) ? v1 : 0.0f);
+      }
+      uint4* dst = reinterpret_cast<uint4*>(&sk.invb[i][j0]);
+      dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+      dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
     }
   }
   __syncthreads();
@@ -1153,8 +1191,9 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
         }
       }
     }
-    __nv_bfloat16* wimg = p.kdq + img * (2 * kC * kD);
-    __nv_bfloat16* uimg = p.v_img + img * (kC * kD);
+    // staging in the (now free) raw/op/inv union: w rows [16 kg][64 t][8], u [8 tg][128 v][8 t]
+    __nv_bfloat16* wst = reinterpret_cast<__nv_bfloat16*>(s.a.raw);
+    __nv_bfloat16* ust = wst + kC * kD;
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
 #pragma unroll
@@ -1164,13 +1203,25 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
           const int i = 16 * mt + g + 8 * hh, n = n0 + 8 * nt + 2 * tq;
           const float x0 = acc[mt][nt][2 * hh], x1 = acc[mt][nt][2 * hh + 1];
           if (bsel == 0) {
-            stg32(wimg + ((n >> 3) * 128 + 64 + i) * 8 + (n & 7), pack2(x0, x1));
+            *reinterpret_cast<uint32_t*>(wst + ((n >> 3) * 64 + i) * 8 + (n & 7)) = pack2(x0, x1);
           } else {
-            uimg[((i >> 3) * 128 + n) * 8 + (i & 7)] = __float2bfloat16(x0);
-            uimg[((i >> 3) * 128 + n + 1) * 8 + (i & 7)] = __float2bfloat16(x1);
+            ust[((i >> 3) * 128 + n) * 8 + (i & 7)] = __float2bfloat16(x0);
+            ust[((i >> 3) * 128 + n + 1) * 8 + (i & 7)] = __float2bfloat16(x1);
           }
         }
       }
+    }
+  }
+  __syncthreads();
+  {
+    uint4 const* wst = reinterpret_cast<uint4 const*>(s.a.raw);
+    uint4* wimg = reinterpret_cast<uint4*>(p.kdq + img * (2 * kC * kD));
+    uint4* uimg = reinterpret_cast<uint4*>(p.v_img + img * (kC * kD));
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int e = tid + kThreads * r;  // 1024 x 16 B of w rows: kg = e / 64, t = e % 64
+      wimg[(e >> 6) * 128 + 64 + (e & 63)] = wst[e];
+      uimg[e] = wst[1024 + e];
     }
   }
   stamp(14);
