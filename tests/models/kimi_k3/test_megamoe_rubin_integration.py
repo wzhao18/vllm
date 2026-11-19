@@ -217,14 +217,15 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
         problem, world, tokens, prefill_worker=False
     )
     main, _ = X.select_rubin_bucket(problem, world, tokens)
+    nv = problem.quant_kind == "nvfp4"
     assert [b.max_tokens for b in buckets] == [256, tokens]
-    assert buckets[-1] == main
-    assert all(b.variant == "inference" and b.knobs == main.knobs for b in buckets)
+    # prefill-sized NVFP4 buckets run the dedup combine (same tile knobs)
+    assert buckets[-1] == (X._prefill_dedup(main) if nv else main)
+    assert buckets[0].variant == "inference" and buckets[0].knobs == main.knobs
     assert any("decode bucket" in n for n in notes)
     for b in buckets:  # every admission rule holds at both capacities
         C.RubinMoeConfig.make(problem, b, rank=0, world_size=world)
-    # a P/D prefill worker keeps its one bucket (NVFP4: on the dedup-combine kernel)
-    nv = problem.quant_kind == "nvfp4"
+    # a P/D prefill worker keeps its one bucket
     assert X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)[0] == (
         X._prefill_dedup(main) if nv else main,
     )
@@ -975,8 +976,8 @@ def test_knob_world_size_emulates_wide_ep_on_a_slice():
 
 @pytest.mark.parametrize("world", [4, 16])
 def test_prefill_worker_nvfp4_runs_dedup_combine(world):
-    """NVFP4 P/D prefill workers run the refreshed dedup-combine kernel with the
-    same tile knobs and standalone-warp token back; decode servers keep theirs."""
+    """Prefill-sized NVFP4 buckets run the refreshed dedup-combine kernel with the
+    same tile knobs and standalone-warp token back; the decode bucket keeps its kernel."""
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind="nvfp4")
     main, _ = X.select_rubin_bucket(problem, world, 8192)
@@ -988,7 +989,8 @@ def test_prefill_worker_nvfp4_runs_dedup_combine(world):
     )
     C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=world)
     decode, _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=False)
-    assert all(b.variant != "inference_dedup" for b in decode)
+    assert [b.variant for b in decode] == ["inference", "inference_dedup"]
+    assert decode[0].max_tokens < X.RUBIN_DEDUP_MIN_TOKENS
     with pytest.raises(ValueError, match="combine warps"):
         C.RubinMoeConfig.make(
             problem,
