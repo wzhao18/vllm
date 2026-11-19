@@ -195,6 +195,16 @@ def main():
 
             t_s = _time_graph(skeleton)
             line += f" skeleton {(t_s - t_p) / L:.2f}"
+            nopf = torch.zeros(4, dtype=torch.int64, device=dev)  # probe bit 2: no L2 prefetch
+
+            def no_prefetch(c=c):
+                for i in range(L):
+                    pm.prod(src, h, busy, nostamp, carve)
+                    fm.moe_front(ws[i], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True,
+                                 1.0, *c, nopf)  # fmt: skip
+
+            t_n = _time_graph(no_prefetch)
+            line += f" no-L2-prefetch {(t_n - t_p) / L:.2f}"
         print(line, flush=True)
         # Stamped single layer (eager, after a warm call): phase times after the
         # producer's end, median over CTAs.

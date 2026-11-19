@@ -78,7 +78,7 @@ struct Params {
   int wg;  // K blocks per weight slot (one barrier, wg x tr x 128 B)
   int tr;  // weight rows per tile = MMA N (128 or 256): x is read once per tr rows
   int rows_w;  // E + L
-  int debug;  // microbench probes only (0 in production): bit 0 skips the MMAs
+  int debug;  // microbench probes only (0 in production): bit 0 skips the MMAs, bit 2 the L2 prefetch
   int yfull;  // test hook: y also holds the FP32 latent columns (y.size(1) >= E + L)
 };
 
@@ -142,6 +142,16 @@ __device__ __forceinline__ void tma_3d_ef(uint32_t dst, const CUtensorMap* map, 
       "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
       ".L2::cache_hint [%0], [%1, {%2, %3, %4}], [%5], pol; }" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(0), "r"(row), "r"(kb), "r"(bar)
+      : "memory");
+}
+// L2 prefetch of one weight box (no smem, no barrier): the K blocks the ring cannot
+// hold before griddepcontrol.wait are pulled into L2 while the predecessor runs, so
+// the post-wait ring refills hit L2 instead of HBM latency.
+__device__ __forceinline__ void tma_3d_prefetch(const CUtensorMap* map, int row, int kb) {
+  asm volatile(
+      "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" ::"l"(
+          reinterpret_cast<uint64_t>(map)),
+      "r"(0), "r"(row), "r"(kb)
       : "memory");
 }
 __device__ __forceinline__ void tma_2d_ef(uint32_t dst, const CUtensorMap* map, int c0,
@@ -350,6 +360,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const int nxp = p.xst < 4 ? p.xst : 4;
   if (prod >= 0) {
     const int ngw = (nkb + p.wg - 1) / p.wg;
+    if (lane == 0 && !(p.debug & 4)) {  // probe bit 2: no L2 prefetch
+      for (int gw = p.wst + prod; gw < ngw; gw += p.nprod)
+        tma_3d_prefetch(&tw, wrow, kb_lo + gw * p.wg);
+    }
     for (int gw = 0; gw < ngw; ++gw) {
       const int s = gw % p.wst;
       if (s % p.nprod != prod) continue;
