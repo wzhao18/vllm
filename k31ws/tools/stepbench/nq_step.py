@@ -556,6 +556,35 @@ def report_cases():
     fmain.run_case = run_case
 
 
+def bench_kernel_config(rest, jit_warmup):
+    """FAST 2026-11-18 (bench startup): kernel_config.enable_jit_warmup=False unless --jit-warmup. The engine's JIT
+    warmups (JIT registry, Kimi K3 Triton warmup incl. the prefill glue + tokenspeed MLA keys ~37 s, warmup_kernels and
+    the serving-shape warmup, per-layer warmup registrations) exist so a SERVER never compiles while serving. The bench
+    runs an eager pass and a graph capture per case before it times anything, so every kernel a case uses is compiled
+    before its timed replays either way; only startup time changes (verified: identical medians, findings/FAST.md)."""
+    import json
+
+    if jit_warmup:
+        return rest
+    rest = list(rest)
+    for i, a in enumerate(rest):
+        if a == "--kernel-config" and i + 1 < len(rest):
+            cfg = json.loads(rest[i + 1])
+            cfg["enable_jit_warmup"] = False
+            rest[i + 1] = json.dumps(cfg)
+            break
+        if a.startswith("--kernel-config="):
+            cfg = json.loads(a.split("=", 1)[1])
+            cfg["enable_jit_warmup"] = False
+            rest[i] = "--kernel-config=" + json.dumps(cfg)
+            break
+    else:
+        rest += ["--kernel-config", json.dumps({"enable_jit_warmup": False})]
+    log("startup: kernel_config.enable_jit_warmup=False (bench: every case compiles in its eager pass before timing; "
+        "--jit-warmup keeps the server warmups)")
+    return rest
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init-file", default="")
@@ -571,11 +600,14 @@ def main():
                     help="k31ws: restrict routing to E/emulate_ep experts per EP rank (bench-only bias edit)")
     ap.add_argument("--no-fill-index", action="store_true")
     ap.add_argument("--fill-mla", action="store_true")
+    ap.add_argument("--jit-warmup", action="store_true",
+                    help="keep the engine's server JIT warmups (default off: startup time only, same medians)")
     ap.add_argument("--free-floor-gib", type=float, default=16.0,
                     help="memory the bench KV pool must leave for snapshot / graph / transients")
     args, rest = ap.parse_known_args()
     if rest and rest[0] == "--":
         rest = rest[1:]
+    rest = bench_kernel_config(rest, args.jit_warmup)
     rendezvous(args.init_file)
     apply_overlay(args.overlay)
     sizes = parse_sizes(args.capture_sizes)
@@ -605,3 +637,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # FAST 2026-11-18: results (output JSON, profiles) are written and every rank has left the last collective when
+    # forward_main returns; the engine / NCCL / symmetric-memory teardown that follows took ~13 s per run. Exit now
+    # (an exception above still exits non-zero through the normal path).
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

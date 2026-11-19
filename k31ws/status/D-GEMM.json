@@ -2,100 +2,52 @@
  "id": "D-GEMM",
  "title": "Decode: low-latency dense GEMM family (BF16 + MXFP8)",
  "side": "decode",
- "owner": "D-GEMM workflow agent",
- "state": "landed",
- "updated": "2026-11-18T14:05-08:00",
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows R per TP4 group, n = 96 SP shard rows per GPU), L=135K, k=3",
- "baseline_ms": 6.7,
- "current_ms": 6.7,
- "achievable_ms": 2.8,
- "target_ms": 3.08,
- "step_ms": 30.5,
- "basis": "baseline 8.9: gap512 EP16 in-step BF16 family (mxfp4 tree). current 6.7: PROJECTED nvfp4 r24 from the D-GEMM bench1 standalone per-call times (1 GPU, chained cold weights) with the best existing kernel per op x op count (+ separate MXFP8 input quant 1.5-3 us/call); no in-step nvfp4 step exists yet. achievable 2.80: perf model nvfp4_modelopt D3-32 r24 for my ops (model_gemm.py).",
- "gap_analysis": "bench1 (VR200, D3-32 per-GPU shapes, r24 = R384 gathered / n96 shard rows), best existing kernel vs model ach per call: kda_in MXFP8 14.6 (cuBLASLt) +3.0 quant vs 7.40 us; KDA o_proj MXFP8 6.3 +1.9 quant vs 2.07; shared gate_up MXFP8 12.2 +1.7 quant vs 6.80; shared down MXFP8 7.75 vs 3.45; latent down BF16 9.5 vs 3.84; latent up 7.5 vs 3.84; router 4.95 vs 1.05; DSA in 14.4 vs 8.06; q_b+wq_b 9.6 vs 2.81; DSA o_proj 9.2 vs 4.63; f_b 1.7 vs 0.23. Achieved weight streaming: 3-7.5 TB/s on 13-90 MB weights (only kda_in BF16 at R16 reaches 11.8 TB/s). Small weights (o_proj 22 MB MXFP8, router 13 MB, q_b/wq_b 13-14 MB) sit at a ~4-5 us per-kernel floor: launch + ramp + drain dominate. FlashInfer CUTLASS MXFP8 is 2-6x slower than CuTe DSL / cuBLASLt at every shape; trtllm-gen MXFP8 only competitive at <=16 rows. The existing Rubin TMEM-staged split-K (SplitKTmemGemm64) does not help at these shapes (latent down n96 8.5 us, shared down 15.6 us). Root cause in the vendored split-K (code-read, to confirm with ncu): its FP32 reduce mailbox ((split-1) x 128 x N-tile) is allocated beside the operand ring, so at 32-128 token columns any split > 2 leaves 1-2 ring stages -> too few weight bytes in flight; and rank 0 alone sums all partials.",
+ "owner": "D-GEMM workflow agent (resumed 2026-11-18 19:00)",
+ "state": "implementing",
+ "updated": "2026-11-18T19:20-08:00",
+ "shape": "NVFP4 checkpoint, D3-32 r24 1-node DP-rank slice (24-layer view k31-nvfp4-view-L24, u132k, k=3): R = 384 gathered rows (attention projections), n = 96 shard rows (MoE dense GEMMs) per GPU; per decode step, exposed time",
+ "baseline_ms": 1.581,
+ "current_ms": 1.581,
+ "achievable_ms": 0.820,
+ "target_ms": 0.902,
+ "step_ms": 10.888,
+ "ckpt": "nvfp4",
+ "basis": "MEASURED in-step (NVFP4 decode baseline, INFRA measured/20261118-1900-nvfp4-decode.json, run rhea runs/INFRA/step_d/trial-9ccf8ab-nv-r8r16r24-prof, overlay trial-9ccf8ab-1 = int b31121cf56 + d-moe). Family = fam.py 'BF16 dense GEMMs' groups (KDA in/o_proj, DSA qkv_a/g/o/w_uv, router+latent_down, latent_up, shared gate_up/down, dense layer). achievable = nvfp4_modelopt model_rows_L24 for the same groups. r8 / r16 rows: 1.201 / 1.311 exposed vs 0.753 / 0.778 achievable.",
+ "gap_analysis": "Per precision at r24 (exposed vs achievable, us per L24 step): MXFP8 (KDA in/o_proj, shared gate_up/down, quant kernels counted elsewhere) 746 vs 411; BF16 (DSA qkv_a/g/o/w_uv, router+latent_down, latent_up, dense layer) 835 vs 410. Every op in-step is a cuBLAS nvjet kernel (MXFP8: nvjet qqtst Avec32UE8M0). Per call (busy) vs model: KDA in_proj 17.8 vs 7.6 us (92 MB -> 5.2 TB/s), KDA o_proj 7.3 vs 2.1, router+latent_down 3 kernels 20 vs 4.9 (router on main and latent down on aux stream), latent_up 7.4 vs 3.8, DSA qkv_a 15.9 vs 3.4, g_proj 27.6 vs 4.6 (busy, half exposed), DSA o_proj 9.6 vs 4.6, shared down 14.0 vs 3.5 (side stream beside MegaMoE). Root cause: generic library tiles stream weights at 3-7 TB/s (too few bytes in flight per SM, many CTAs per weight byte, separate split-K reduce kernels, no weight prefetch across kernel boundaries); the model streams at 13.9 TB/s striped.",
  "inefficiencies": [
-  "Weight streams at 3-7.5 TB/s vs 13.9 (16.5 die-local): too few bytes in flight per SM (vendored split-K: mailbox smem eats the ring above split 2; cuBLAS tile choice) [bench1 measured; per-kernel ncu pending]",
-  "Swap-AB split-K with one 128-row weight tile per CTA re-streams the activation tile per CTA: x bytes ~ T/128 of the weight bytes (0.75x at n96) [g_full sweep: time grows with token tile T at fixed weight]",
-  "Cluster split 7-8 over 28-56 weight tiles exceeds the co-scheduled cluster count -> 2 waves (split 6 is the ceiling for 28 tiles) [g_full + providers.py WIDE_B64 notes]",
-  "Per-kernel floor ~4-5 us on 13-22 MB weights (o_proj MXFP8, router, q_b, wq_b): launch/ramp/drain not hidden [bench1]",
-  "MXFP8 activation quant as separate kernels: 1.5-3.0 us x ~230 calls/step (~0.5 ms) [bench1 q_k3/q_fi]",
-  "Separate RS after o_proj partial GEMM (SpOproj gemm/mxfp8 tactic) [code]",
-  "FlashInfer CUTLASS MXFP8 backend 2-6x slower than CuTe DSL/cuBLASLt at decode shapes (avoid) [bench1]",
-  "sdec SP path refused MXFP8 linears (B4) -> FIXED on branch (Mxfp8Projection), unit tests pass"
+  "cuBLAS nvjet tiles stream weights at 3-7 TB/s vs 13.9 striped / ~18 die-local [in-step kernels, gap.json]",
+  "separate split-K reduce launches (nvjet splitK variants: router, dense layer) [gap.json kernel names]",
+  "no weight prefetch across kernel boundaries: each GEMM pays launch + ramp + grid-end drain (~3-4 us) [hwdb launch costs; bench1 small-weight floor]",
+  "MXFP8 activation quant as separate kernels before each MXFP8 GEMM [bench1]",
+  "x re-read per 128-row weight tile at R=384 (3x the weight bytes from L2) unless x is shared across CTAs [design analysis]"
  ],
  "rubin_features": [
-  "PDL: weights requested before griddepcontrol.wait",
-  "tcgen05 MMA swap-AB (weights on M, tokens on N), TMEM accumulators",
-  "cluster barrier release/acquire for the split-K reduce (no DSMEM mailbox)",
-  "planned: die-local weight homing + %smid die-aware tile assignment",
-  "planned: tcgen05 block-scaled MXFP8 (kind::mxf8f6f4) with in-kernel activation quant",
-  "L2 evict_first on streamed weights"
+  "tcgen05 MMA swap-AB (weights M128, tokens N), TMEM accumulators, 2 segments per CTA",
+  "TMA 128B-swizzled boxes, L2 evict_first on streamed weights",
+  "1 CTA per SM, whole shared memory as the weight ring",
+  "PDL: weight boxes requested before griddepcontrol.wait, launch_dependents at entry",
+  "planned: cluster TMA multicast of the token box (R=384), die-local weight homing + per-die chunks, kind::mxf8f6f4 2x-K with in-kernel activation quant, oversized shared memory"
  ],
  "plan": [
-  "1. DONE bench1: all families x all backends at D3-32 shapes",
-  "2. DONE (WIP commit) B4 Mxfp8Projection + SpOproj/SpMlp/KDA wiring, MX_TUNED, unit tests pass on VR200",
-  "3. SplitKGemmG: split-K with L2 reduce (whole smem for the weight ring) for BF16 families; sweep; wire into sp_policy as kind g",
-  "4. MXFP8 variant of the streaming kernel with fused activation quant (removes ~0.5 ms quant kernels)",
-  "5. die-local weights (common/dies.py) for the big streams; PDL prefetch for the small-weight floor",
-  "6. step A/B via INFRA stepbench; landed-ready"
+  "SOL design (recorded 19:15): one persistent stream-K kernel per GEMM, 1 CTA/SM, equal weight bytes per SM (K-block chunks spanning <= 2 tiles), swap-AB tcgen05 M128 x N=R with TMEM accumulators, weight ring = whole smem (~128 KB+ weights in flight per SM), split tiles reduced through L2 in the same kernel (each contributor sums its token share in contributor order: deterministic, one rounding), PDL weight prefetch before the dependency wait so HBM stays busy across GEMM boundaries. Bound: weight bytes / HBM rate (13.9 striped, ~18 die-local) + ~1 us tail per GEMM. Projected r24 family: ~0.85-0.90 ms striped (<= target 0.90), ~0.75 die-local.",
+  "1. BF16 kernel stream_gemm (R <= 256) + microbench at D3-32 shapes vs cuBLAS chained cold weights [in progress]",
+  "2. R = 384: 2 accumulators of N=192 + token box shared across a 2-CTA cluster (multicast) to keep L2 x traffic <= weight bytes",
+  "3. MXFP8 variant: kind::mxf8f6f4 (sm_107a 2x-K), weight SF via tcgen05.cp, activation quant fused in the producer path (drops the separate quant kernels)",
+  "4. router + latent_down as one GEMM over the concatenated weight (same input); beta-add epilogue for latent_up",
+  "5. die-local weights (common/dies.py localized allocation) + die-aware chunk assignment by %smid",
+  "6. wire into sdec (DecodeProjection kind 'stream', Mxfp8Projection), unit tests, step_d A/B on int overlay, landed-ready"
  ],
  "work": [
-  {
-   "t": "12:35",
-   "what": "claimed workstream; worktree /Users/weizha/k31ws-wt/d-gemm (wzhao/k31ws-d-gemm @ 4fbaa15189); computed model rows at D3-32 r1/8/16/24/32 for both checkpoints",
-   "result": "nvfp4 r24 family achievable 2.80 ms (KDA in 7.40 us x69, shared gu 6.80 / down 3.45 us x92, latent down/up 3.84 us x92 ...); runs-local/D-GEMM/model_gemm.json"
-  },
-  {
-   "t": "13:10",
-   "what": "B4 first cut: specialized_decode/cutedsl/gemm/mxfp8.py Mxfp8Projection (stock linear storage, no copy; per-R kind fi_cute/fi_cutlass/scaled_mm, GENERIC = stock KimiK3Mxfp8Kernel rule, shared MXFP8 input scratch); wired KDA in_proj (SpAttentionBlock), KDA o_proj (SpOproj mxfp8 tactic: GEMM into SpComm.partial + RS push), shared expert gate_up/down (SpMlp, stock act_mxfp8_into producer); unit test test_specialized_decode_sp_mxfp8_gpu.py",
-   "result": "staged overlay d-gemm-4fbaa15-1; bench1 (all families, D3-32 shapes) + unit test queued on pool (waiting for a hold1)"
-  },
-  {
-   "t": "13:20",
-   "what": "bench1 on VR200 (rhea0145): 12 families x BF16 table/cuBLAS/cuBLASLt and MXFP8 fi_cute/fi_cutlass/fi_trtllm/scaled_mm + quant, at R16/128/256/384 and n4/32/64/96; tmem1 sweep of SplitKTmemGemm64",
-   "result": "see gap_analysis; runs-local/D-GEMM/bench1.json, tmem1.json. Projected nvfp4 r24 family with best existing kernels: 6.7 ms vs 2.80 ach"
-  },
-  {
-   "t": "13:30",
-   "what": "MX_TUNED filled from bench1; unit tests on VR200 (overlay d-gemm-2c2b49e-2)",
-   "result": "test_specialized_decode_sp_mxfp8_gpu 5 passed; sp_mlp_gpu + sp_coverage 52 passed; commit 18d1ead542"
-  },
-  {
-   "t": "13:35",
-   "what": "wrote SplitKGemmG (cutedsl/gemm/splitk_g.py): vendored split-K mainloop + L2 workspace reduce + cluster barrier, owner-by-column rank-order sums",
-   "result": "correctness + tactic sweep queued (run3, overlay d-gemm-2c2b49e-3)"
-  },
-  {
-   "t": "13:55",
-   "what": "SplitKGemmG run3 on VR200: correctness ok at all 10 shapes (rel err <= 3.4e-3, one BF16 rounding); sweep vs table",
-   "result": "slower than the table everywhere (latent_down n96 13.8 vs 9.5 us, shared_gu n32 18.1 vs 15.2, dsa_o R128 15.3 vs 6.9). Diagnosis (measured trends): x-tile traffic per CTA (T/128 of the weights), 3-5 ring stages at T=96-128, split>6 clusters run in 2 waves. Prototype parked on wzhao/k31ws-d-gemm-wip; g_full.json"
-  },
-  {
-   "t": "14:05",
-   "what": "landing branch = B4 only (520afc7416): Mxfp8Projection + SpAttentionBlock/SpOproj/SpMlp/KDA-pitch wiring + MX_TUNED + unit test",
-   "result": "VR200: sp_mxfp8_gpu 5 passed, sp_mlp_gpu + sp_coverage 52 passed (overlay d-gemm-2c2b49e-2, same vllm/ content as 520afc7416). Step-level NVFP4 build not yet exercised (needs EN B1/B2 NVFP4 model view)."
-  },
-  {
-   "t": "14:05",
-   "what": "coordinator: re-based baseline to the NVFP4 checkpoint with existing kernels (6.7 ms projected)",
-   "result": "the earlier 8.9 baseline was the MXFP4 all-BF16 tree; 8.9->6.7 is the precision switch, not kernel work (gap closed now counts kernel work only)"
-  },
-  {
-   "t": "17:50",
-   "what": "INFRA: merged 520afc7416 into wzhao/k31ws-int (b31121cf56, with a semantic merge fix: sdec callers use mxfp8.is_mxfp8_linear)",
-   "result": "int unit tests 202 passed (EN 145, sp_mxfp8 5, sp_mlp+coverage 52); D3-32 slice A/B MXFP4 r8/r16/r24 7.02/10.14/12.94 vs base 7.06/10.20/13.00 ms (no regression); pushed"
-  }
+  {"t": "12:35-14:05", "what": "previous agent: model rows, bench1 (all backends), B4 MXFP8 sdec path (520afc7416, merged into int b31121cf56), SplitKGemmG prototype (parked: slower than cuBLAS)", "result": "see findings/D-GEMM.md; B4 landed in int"},
+  {"t": "19:05", "what": "re-based on the measured NVFP4 decode baseline (INFRA 19:00, in-step L24 slice); merged wzhao/k31ws-int b31121cf56 into wzhao/k31ws-d-gemm", "result": "family r24 exposed 1.581 ms vs ach 0.820 (MXFP8 746 vs 411 us, BF16 835 vs 410 us); r8 1.201 vs 0.753, r16 1.311 vs 0.778. Gap closed so far: 0% (kernel work starts now). MXFP8 family gap closed: 0%."},
+  {"t": "19:20", "what": "wrote stream_gemm.cu (BF16 stream-K weight-streaming GEMM, raw tcgen05/TMA, in-kernel L2 split reduce, PDL weight prefetch) + sg_bench.py", "result": "quick correctness/timing run queued (runs/D-GEMM/sg/q1)"}
  ],
- "next": "HANDOFF / next steps: (1) INFRA: merge wzhao/k31ws-d-gemm 520afc7416 into wzhao/k31ws-int; first NVFP4 D3-32 step (after EN B1/B2) exercises it - check the build log shows kda_in/o_proj/shared_gu/shared_down choices \"mxfp8 fi_cute|scaled_mm\". (2) Streaming kernel redesign (the family is 2.4x model): swap-AB with M-blocking (each CTA owns MB=2-4 weight row tiles, MB x T <= 512 TMEM columns, one x stage feeds MB MMAs -> x traffic T/(128 MB)), split <= 6 so clusters co-schedule (or no cluster: per-tile arrival counter + last-arriver rank-order reduce), deeper ring via 1 CTA/SM full smem, die-local weight homing (common/dies.py localized_like + %smid tile assignment), MXFP8 kind::mxf8f6f4 with in-kernel activation quant (drops ~0.5 ms of quant kernels). Prototype base: wzhao/k31ws-d-gemm-wip cutedsl/gemm/splitk_g.py (correct L2 reduce epilogue). (3) Bench: rsync k31ws/runs-local/D-GEMM/{gemm_bench.py,g_sweep.py} to runs/D-GEMM, stage overlay with tools/mkov.sh, run with wsgpu.sh -g 1 (see run1.sh / run3.sh).",
- "blockers": "GPU pool contended (each 1-GPU run waits 10-40 min); NVFP4 step-level check depends on EN (B1/B2 NVFP4 model view).",
- "branch": "wzhao/k31ws-d-gemm @ 520afc7416 (B4, landed-ready); wzhao/k31ws-d-gemm-wip @ 18d1ead542 (+ SplitKGemmG prototype, not for landing)",
+ "next": "q1 result -> fix/compile; full sweep of D3-32 shapes; then R=384 path and MXFP8 variant",
+ "blockers": "",
+ "branch": "wzhao/k31ws-d-gemm @ b31121cf56 (merged int; stream_gemm WIP uncommitted)",
  "evidence": [
-  "k31ws/runs-local/D-GEMM/bench1.json (all families x backends)",
-  "k31ws/runs-local/D-GEMM/g_full.json (SplitKGemmG sweep)",
-  "k31ws/runs-local/D-GEMM/tmem1.json",
-  "k31ws/runs-local/D-GEMM/model_gemm.json",
-  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-GEMM/{run1,test2,run3}.log",
-  "tests/models/kimi_k3/test_specialized_decode_sp_mxfp8_gpu.py"
- ],
- "ckpt": "pending"
+  "k31ws/measured/20261118-1900-nvfp4-decode.json",
+  "rhea runs/INFRA/step_d/trial-9ccf8ab-nv-r8r16r24-prof/gap.json",
+  "k31ws/runs-local/D-GEMM/sg/ (stream_gemm.cu, sg_bench.py)"
+ ]
 }

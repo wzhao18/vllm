@@ -3,8 +3,8 @@
  "title": "Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops",
  "side": "prefill",
  "owner": "P-GEMM workflow agent",
- "state": "implementing",
- "updated": "2026-11-18T14:55-08:00",
+ "state": "measuring",
+ "updated": "2026-11-18T15:45-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 83.89,
  "current_ms": 83.89,
@@ -81,10 +81,15 @@
    "t": "15:20",
    "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
    "result": "router+latent+top-k 20.22/11.99, KDA proj MXFP8 26.38/24.45, DSA proj BF16 15.43/14.11, shared MXFP8+SiLU 10.12/9.14, dense+embed 7.03/6.61, AttnRes 4.71/6.40"
+  },
+  {
+   "t": "15:36",
+   "what": "NVFP4 step A/B (INFRA step_p.sh -q nvfp4, P3-16 DEP4 slice, L24 view, drafter on): arm p-gemm-364bffae-4 (attn_res_mxfp8 wiring + mxfp8_act + EN enablement) vs en-6f164db2-1",
+   "result": "arm: pf16k 213.8 ms (spread 1.2%), pf8k 110.2 ms (1.3%). Same-session base arm failed (DistStoreError timeout, infra); EN base from 13:23 = 211.3 / 107.6 ms (different node/time). No step gain visible yet: expected B1 gain on the L24 slice is ~0.5-1 ms, below run-to-run spread. Rerun base (ab-nv-base2) + profiled arm (ab-nv-pgemm-prof) queued to confirm the fused kernel is active and attribute per family"
   }
  ],
- "next": "read NVFP4 step A/B (runs/P-GEMM/step_p/pg4x-nvfp4 vs pg4x-base, P3-16 DEP4 slice, drafter excluded); if positive set landed-ready for B1; then B3 (shared gate_up GEMM + SiTU + MXFP8 epilogue on the FlashInfer sm107 CuTe DSL kernel)",
- "blockers": "pool contention (16 waiters at 13:22)",
+ "next": "HANDOFF: (1) read runs/P-GEMM/step_p/ab-nv-base2 and ab-nv-pgemm-prof (fam.txt): confirm k31pf attn_res_mxfp8 kernels replace attn_res + mxfp8 quant in KDA/MoE layers and the step is not slower; if it is slower, find which kernel (suspect: fused AttnRes per-token epilogue +15-25 us vs native) and gate the pre path by num_blocks; only then set landed-ready for B1 (branch wzhao/k31ws-p-gemm). (2) B3 (largest lever, ~11 ms/93-layer step): shared gate_up GEMM with SiTU + MXFP8 epilogue on FlashInfer sm107 CuTe DSL Sm107BlockScaledPersistentDenseGemmKernel (fi-sm107-opt flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py, has epilogue_op + epilogue_tma_store_mxfp8); first sweep _get_sm107_mxfp8_tactics at M=16384 N=12288 K=7168 to match cuBLASLt (264 us); then dual-B TMA (gate rows j, up rows 6144+j). (3) router top-k 43 us -> fuse into a router GEMM epilogue or a multi-token-per-block top-k; (4) AttnRes 2-token-per-SM redesign. Bench scripts: benchmarks/kimi_k3/pgemm_{bench,attnres_bench,quant_bench,router_bench}.py; runners runs/P-GEMM/run_a*.sh",
+ "blockers": "pool contention (17 waiters); one A/B base arm lost to a DistStoreError timeout",
  "branch": "wzhao/k31ws-p-gemm @ 364bffae05 (merges wzhao/k31ws-en 6f164db270)",
  "evidence": [
   "perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill",

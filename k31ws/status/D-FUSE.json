@@ -3,15 +3,15 @@
  "title": "Decode: small-op fusion, SP collectives, drafter tail",
  "side": "decode",
  "owner": "D-FUSE workflow agent",
- "state": "measuring",
- "updated": "2026-11-18T18:10-08:00",
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows, 96 SP shard rows per GPU), L~135K, k=3",
- "baseline_ms": 3.9,
- "current_ms": 3.52,
- "achievable_ms": 1.82,
- "target_ms": 2.0,
- "step_ms": 30.5,
- "basis": "baseline: gap512 EP16 in-step profile B92 (r23) exposed (AttnRes 0.50, SiTU 0.33, latent norm 0.26, prepare 0.22, router top-k 0.21, SP RS 0.99, SP AG 0.69, drafter+final 0.89 ms). current = baseline - measured step A/B (L24 slice, r24) scaled x93/24 for the per-layer part (-0.34 ms) and the final gather (-0.04). Achievable: rhea1n model_rows B96_L135K.",
+ "state": "landed-ready",
+ "updated": "2026-11-18T16:45-08:00",
+ "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
+ "baseline_ms": 0.98,
+ "current_ms": 0.79,
+ "achievable_ms": 0.37,
+ "target_ms": 0.407,
+ "step_ms": 10.89,
+ "basis": "MEASURED in-step NVFP4 baseline (INFRA 18:52 EST, measured/20261118-1900-nvfp4-decode.json); achievable = nvfp4_modelopt at the same slice",
  "gap_analysis": "SP boundaries now fused (2 kernels/layer instead of 4): in-step r24 AttnRes+AG+RS = 1.14x model (chain bench 1.07x); the remaining excess is the Lamport collectives themselves (bare AG+RS 16.1 us/layer at n=96 vs model 13.7) -- the RS push (4.1 MB at ~1.1 TB/s per GPU) is serial after the o-proj GEMM; moving it into the GEMM epilogue (D-GEMM) would hide it. Router top-k / prepare move into the FI MegaMoE front with D-MOE's kimi_k3_mega_moe switch; SiTU goes beside MegaMoE on the side stream (and fused with the MXFP8 quant in D-GEMM's B4). Remaining D-FUSE items: latent RMSNorm (proposed into FI's combine-reduce, D-MOE), drafter tail (needs a drafter-on profile; INFRA's drafter emulation currently fails).",
  "inefficiencies": [
   "AttnRes pre/post as standalone stock kernels (one row per CTA; 96 of the SMs busy at n=96) (measured gap512)",
@@ -64,19 +64,33 @@
    "t": "18:05",
    "what": "SpFinalGather microbench (2 GPUs) + merge of wzhao/k31ws-int (D-GEMM MXFP8 SpOproj: produce() serves the 'mxfp8' tactic)",
    "result": "final gather bit-equal to NCCL all_gather (sanitized words), box re-armed; 6.2/6.8/10.8 us vs NCCL 12.8/21.3/33.1 us at R16/128/384 (width 7168), 6.6/17.6 vs 19.7/39.6 at 6x7168. Queued: 4-GPU unit test (overlay -7), NVFP4 step A/B int-b31121c-1 vs d-fuse-3343e846-8 (-q nvfp4 -x, rows 128/384)"
+  },
+  {
+   "t": "16:15",
+   "what": "NVFP4 step A/B (step_d.sh -q nvfp4 -x, L24 view, profiled): int-b31121c-1 (k31ws-int) vs d-fuse-3343e846-8 (merged int + D-FUSE)",
+   "result": "r8 4897 -> 4823 us (-1.5%), r24 6841 -> 6651 us (-2.8%); r24 AttnRes + SP AG/RS exposed 591 -> 402 us (model 365), final gather (TAIL) 102.5 -> 59.5 us. runs/D-FUSE/step_d/nv-{int,fused8}-r128_384"
+  },
+  {
+   "t": "16:40",
+   "what": "4-GPU unit test tests/distributed/test_kimi_k3_sdec_sp_fused.py (TP2 + TP4, shard rows 4/32/96, layer kinds first/plain/block-write/after-write/8-blocks, + SpFinalGather)",
+   "result": "2 passed in 41 s (warm CuTe cache): prefix/blocks bit-equal to stock, gathered/post rows worst 1.0 ulp of the row max (bound 2), mailboxes + final box re-armed, final gather bit-equal (sanitized). LANDED-READY: wzhao/k31ws-d-fuse @ 6758683397 (merge-clean with k31ws-int; MXFP8 o-proj served)"
+  },
+  {
+   "t": "16:25",
+   "what": "coordinator: re-based on the NVFP4 decode slice baseline",
+   "result": "small ops 0.47/0.04 + SP comm 0.51/0.33; NVFP4 A/B: AttnRes+AG/RS exposed 591 -> 402 us"
   }
  ],
- "next": "read test7 + NVFP4 A/B (runs/D-FUSE/step_d/nv-*); if clean set landed-ready; then drafter-tail profile (needs drafter-on slice)",
+ "next": "drafter-on NVFP4 A/B at r24 queued (nvd-fused14-r384 vs nvd-int-r384) for the tail breakdown; then drafter-tail fusion; latent RMSNorm proposal pending D-MOE",
  "blockers": "",
- "branch": "wzhao/k31ws-d-fuse @ 3343e8469c (merged wzhao/k31ws-int b31121cf56)",
+ "branch": "wzhao/k31ws-d-fuse @ 6758683397 (merged wzhao/k31ws-int b31121cf56)",
  "evidence": [
-  "perf-model/microbench/results/gap512/parsed/dec_B92cap.txt",
-  "perf-model/microbench/rhea1n/model_rows.json (B96_L135K)",
-  "rhea runs/D-FUSE/run3 (pending)",
-  "rhea runs/D-FUSE/run2g-c/chain.json",
-  "rhea runs/D-FUSE/step_d/base-x-r128_384",
-  "rhea runs/D-FUSE/step_d/fused5x-r128_384",
-  "rhea runs/D-FUSE/run5/chain.json"
+  "rhea runs/D-FUSE/run5/chain.json (TP4 chain bench)",
+  "rhea runs/D-FUSE/step_d/{base-x,fused5x}-r128_384 (BF16/MXFP4 A/B)",
+  "rhea runs/D-FUSE/step_d/nv-{int,fused8}-r128_384 (NVFP4 A/B)",
+  "rhea runs/D-FUSE/test14.full (unit test)",
+  "rhea runs/D-FUSE/fg2.log (final gather microbench)",
+  "perf-model/microbench/rhea1n/model_rows.json (B96_L135K)"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }

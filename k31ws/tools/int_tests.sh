@@ -11,6 +11,8 @@ t tests/models/kimi_k3/test_megamoe_rubin_conversion.py tests/models/kimi_k3/tes
 t tests/models/kimi_k3/test_specialized_decode_sp_mxfp8_gpu.py
 t tests/models/kimi_k3/test_specialized_decode_sp_mlp_gpu.py tests/models/kimi_k3/test_specialized_decode_sp_coverage.py
 # P-MOE (d0aaaa1a8e)
-t tests/models/kimi_k3/test_prefill_moe_subcalls.py
+[ -f tests/models/kimi_k3/test_prefill_moe_subcalls.py ] && t tests/models/kimi_k3/test_prefill_moe_subcalls.py
+# P-KDA (47bc2f317f)
+[ -f tests/models/kimi_k3/test_kda_o_norm_mxfp8.py ] && t tests/models/kimi_k3/test_kda_o_norm_mxfp8.py
 echo "== int_tests rc=$rc"
 exit $rc

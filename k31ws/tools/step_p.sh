@@ -36,7 +36,7 @@ EXTRA=(); [ "$PROF" = 1 ] && EXTRA+=(--profile-dir $R/prof-pf); [ -n "$XD" ] && 
 { echo "STEP_P ov=$OV cases=$CASES prof=$PROF ckpt=$Q emulate_ep=$EMU exclude_drafter=${XD:-0} name=$NAME start=$(date +%FT%T)"
   cat $R/pf.shapes.txt; grep '^#' $R/pf.cfg.sh; } > $R/pf.log
 echo "$(date +%T) start $TAG" > $R/status.txt
-NQ_ITERS=${NQ_ITERS:-3} NQ_SAMPLES=${NQ_SAMPLES:-3} NQ_EMULATE_EP=$EMU bash $K/tools/wsgpu.sh -g 4 -m $MIN -o $OV -n $NAME -- \
+NQ_ITERS=${NQ_ITERS:-3} NQ_SAMPLES=${NQ_SAMPLES:-3} NQ_EMULATE_EP=$EMU bash $K/tools/wsgpu.sh -g 4 -m $MIN -o $OV -n $NAME -P strict:$R/pf.cfg.sh -- \
   bash $S/step_inner.sh $R/pf "${EXTRA[@]}" >> $R/pf.log 2>&1
 rc=$?
 echo "STEP_P end rc=$rc $(date +%FT%T)" >> $R/pf.log

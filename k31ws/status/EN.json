@@ -3,15 +3,16 @@
  "title": "NVFP4 checkpoint enablement",
  "side": "both",
  "owner": "EN agent (workflow)",
- "state": "landed",
+ "state": "landed-ready",
  "updated": "2026-11-18T16:55-08:00",
- "shape": "P3-16 F16K L78K and D3-32 r8 (load + smoke; no kernel timing owned)",
+ "shape": "D3-32 (EP32, 28 experts/GPU, 1-node slice + 8-node d8) and P3-16 (DEP16): NVFP4 load/run + numerics; no kernel timing owned",
  "basis": "MEASURED 1-node P3-16 DEP4 slice, L24 NVFP4 view, dummy weights (runs/EN/step_p/nv-smoke2); unit tests in image",
  "gap_analysis": "Enablement, not a kernel family. B1/B1b/B5/B6 done in code + CPU tests: the MegaMoE format follows the ModelOpt quantized_layers entry of each block's experts; megamoe_rubin loads ModelOpt NVFP4 experts natively (E2M1 codes, E4M3 block-16 scales, per-expert weight_scale_2, input_scale) as a pure re-layout with alpha = weight_scale_2 and unit norm constants, which equals the stock NVFP4 MoE math for the export's unit input scales (verified on real scalar scales of 4 layers). Kernel-layout dequant == stock ModelOpt dequant bitwise; NVFP4 export of MXFP4 weights == in-backend exact conversion bitwise. ModelOpt MXFP8 checkpoint linears (shared experts, KDA in/o_proj) now take the kimi_k3 MXFP8 fast paths (per-shape kernel dispatch, packing, producer-fused activation quant), previously keyed on online MXFP8 only. Not yet run on GPU: the pool had no running hold (unit tests + 1-node NVFP4 smoke queued). Decode NVFP4 additionally needs B3 (EP32 NVFP4 knobs/FI re-vendor, D-MOE) and B4 (MXFP8 projections in sdec, D-GEMM).",
  "inefficiencies": [
   "NVFP4 expert bytes per expert are ~9% above MXFP4 (E4M3 scale per 16 vs E8M0 per 32): routed-expert weight streaming at decode grows accordingly (model item, not a bug)",
   "An NVFP4 checkpoint forces the NVFP4 kernel kind at every bucket: the MX kind's small-batch advantage (as fast or faster up to 256 tokens/rank at EP16) is unavailable",
-  "No EP4 genphase NVFP4 knob records: 1-node slices must run >1024 tokens/rank (inference variant)"
+  "No EP4 genphase NVFP4 knob records: 1-node slices must run >1024 tokens/rank (inference variant)",
+  "ACCURACY RISK (not perf): unit FC2-input global scale + routing weight before the FC2 requant loses NVFP4 range below FC2-input RMS ~2^-6 (measured quantizer); pow2 fc1_norm_const would fix it exactly but raises precision above the stock MoE-EP path: needs real activation stats + gsm8k"
  ],
  "rubin_features": [
   "NVFP4 block-scaled MMA (E2M1 x E4M3 block-16 scales) via the vendored Rubin MegaMoE",
@@ -73,18 +74,68 @@
    "t": "17:50",
    "what": "INFRA: merged 6f164db270 into wzhao/k31ws-int (b31121cf56, with a semantic merge fix: sdec callers use mxfp8.is_mxfp8_linear)",
    "result": "int unit tests 202 passed (EN 145, sp_mxfp8 5, sp_mlp+coverage 52); D3-32 slice A/B MXFP4 r8/r16/r24 7.02/10.14/12.94 vs base 7.06/10.20/13.00 ms (no regression); pushed"
+  },
+  {
+   "t": "16:00",
+   "what": "resumed (new agent); state check: INFRA NVFP4 decode baseline (int b31121cf56 + D-MOE a9b8c85bd3, step_d -q nvfp4) ran end to end; D-MOE branch carries EP28/EP32 nvfp4 inference knob records (128/256/512)",
+   "result": "NVFP4 decode runs on the 1-node slice; EP32 knobs exist (B3 on D-MOE, not yet in int)"
+  },
+  {
+   "t": "16:05",
+   "what": "tools/step_multi.sh: new -q mxfp4|nvfp4 (d8 -> rhea_d3x32_dp8_nvfp4.json + k31-nvfp4-view; p16 -> rhea_p3x16_dep16_nvfp4.json); installed atomically locally + Rhea",
+   "result": "cfg2bench renders both NVFP4 multi-node configs (kimi_k3_mega_moe, no online-MX quantization-config); the 8-node NVFP4 runs need only -q nvfp4"
+  },
+  {
+   "t": "16:08",
+   "what": "measured weight memory, L24 slice (Model loading took, rank 0): NVFP4 trial-9ccf8ab vs MXFP4 base-mx",
+   "result": "104.49 vs 103.46 GiB; experts 89.15 vs 84.19 GiB (NVFP4 +5.9% bytes/expert), non-expert 15.34 vs 19.27 GiB (MXFP8 shared/KDA -3.9 GiB); KV available 146.93 vs 146.52 GiB"
+  },
+  {
+   "t": "16:12",
+   "what": "new GPU numerics test test_megamoe_rubin_nvfp4_native_gpu.py: native ModelOpt NVFP4 layer (generic E4M3 block scales, per-expert weight_scale_2 incl. 2^-13/2^-12) through the real kernel at the EP32 per-GPU shape (28 experts, top-16, n=1/37/128) vs stock ModelOpt NVFP4 MoE math from the canonical tensors + kernel-layout oracle + full-precision sanity",
+   "result": "queued on en-b31121c-nvg1 (int content) and trial-9ccf8ab-1 (int + D-MOE re-vendored kernel): runs/EN/g1.log, g1-dmoe.log"
+  },
+  {
+   "t": "16:25",
+   "what": "GPU numerics test (5430bd956a) on VR200: native NVFP4 layer through the kernel at the EP32 decode bucket, on int (en-b31121c-nvg1) and on int + D-MOE re-vendored kernel (trial-9ccf8ab-1)",
+   "result": "4 passed in 12.5 s on both; kernel vs stock ModelOpt math rel L2 1.7e-3, oracle vs stock 0.0 (exact re-layout + alphas), kernel vs full precision 0.164 (W4A4); rolled per-expert alphas -> > 0.1 (kernel reads each expert's weight_scale_2). runs/EN/g5*.log"
+  },
+  {
+   "t": "16:28",
+   "what": "checked EP32 NVFP4 bucket plan (D-MOE experts.py + resolve_knobs): d8 main bucket 2048 tokens/rank (MNBT 8192 / TP4) resolves to the largest EP32 nvfp4 record (512) with a warning; decode bucket 128 has its own record",
+   "result": "d8 NVFP4 init will not hit KnobLookupError; no EN change needed"
+  },
+  {
+   "t": "16:35",
+   "what": "numerics test extended to the EP16 prefill bucket (56 experts, cap 2048, n=2048) -> 203ca4381a; LANDED-READY wzhao/k31ws-en @ 203ca4381a (test-only, on top of int b31121cf56)",
+   "result": "5 passed in 17.4 s on int and on int + D-MOE kernel; prefill shape kernel vs stock 1.7e-3 (runs/EN/g6*.log)"
+  },
+  {
+   "t": "16:40",
+   "what": "FC2-input NVFP4 requant probe (unit global scale, the export's input_scale 1.0; routing weight applied before it per the MoE-EP contract)",
+   "result": "rel quant error 0.092 at RMS >= 2^-5, 0.105 at 2^-6, 0.134 at 2^-7, 0.258 at 2^-8 (15% blocks zeroed); a pow2 fc1_norm_const holds 0.092 at any RMS (runs/EN/uf1.log). Same math as stock FI MoE-EP; accuracy RISK to decide with real activation stats + gsm8k"
+  },
+  {
+   "t": "16:50",
+   "what": "GPU test test_k31_nvfp4_mxfp8_linear_gpu.py: real stock shared-expert linears with the export's ModelOpt MXFP8 config, checkpoint-format tensors through the weight loaders",
+   "result": "2 passed in 18.7 s (runs/EN/m1.log): sdec storage == checkpoint bytes (weight + unswizzled scales bitwise); stock apply and sdec Mxfp8Projection within one BF16 rounding of FP32 dequant at R 1..128. Committed e49d1d3a87"
   }
  ],
- "next": "Profiled NVFP4 slice run QUEUED (runs/EN/step_p/nv-prof1, fam.txt when done) to split the 211 ms by family for P-* owners; D3-32 NVFP4 smoke once B3 (D-MOE, EP32 NVFP4) and B4 (D-GEMM, MXFP8 in sdec) land; real-weight load + gsm8k need the NVFP4 checkpoint downloaded (user approval).",
- "blockers": "Real checkpoint not on Lustre (download needs user approval). Decode NVFP4 blocked on B3/B4 (other owners).",
- "branch": "wzhao/k31ws-en @ 6f164db270",
+ "next": "INFRA: merge wzhao/k31ws-en @ e49d1d3a87 (2 GPU test files, no code changes). EN remaining work is gated on the real checkpoint: (1) user approval to download nvidia/Kimi-K3.1-Pro-NVFP4 to Lustre (~1.6 TB); (2) then real-weight load on the L24 slice, read the FC2-input RMS per layer (accuracy risk), real-rejection gsm8k LOW/HIGH; (3) on the first d8 NVFP4 run (step_multi.sh -q nvfp4 d8, overlay with D-MOE EP32 records) check Available KV cache memory vs the ~150 GiB projection. Owners: run test_megamoe_rubin_nvfp4_native_gpu.py (D-MOE/P-MOE) and test_k31_nvfp4_mxfp8_linear_gpu.py (D-GEMM/P-GEMM) on every kernel change: wsgpu.sh -g 1 -o <ov> -- bash runs/EN/en_gpu_test2.sh -s <test>.",
+ "blockers": "Real checkpoint not on Lustre (download needs user approval): real-weight load, real activation-scale checks and gsm8k wait on it.",
+ "branch": "wzhao/k31ws-en @ e49d1d3a87 (landed-ready: test-only on top of int b31121cf56)",
  "evidence": [
   "k31ws/findings/EN.md",
   "Rhea: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/models/k31-nvfp4-view, k31-nvfp4-view-L24",
   "Rhea: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/EN/",
   "tests/models/kimi_k3/test_megamoe_rubin_conversion.py, test_megamoe_rubin_integration.py, test_k31_nvfp4_quant_layout.py",
   "Rhea: runs/EN/t4.log (145 passed)",
-  "Rhea: runs/EN/step_p/nv-smoke2 (pf.log, pf.rank0.log)"
+  "Rhea: runs/EN/step_p/nv-smoke2 (pf.log, pf.rank0.log)",
+  "tests/models/kimi_k3/test_megamoe_rubin_nvfp4_native_gpu.py",
+  "Rhea: runs/EN/g5.log, g5-dmoe.log",
+  "tools/step_multi.sh -q nvfp4",
+  "tests/models/kimi_k3/test_k31_nvfp4_mxfp8_linear_gpu.py",
+  "Rhea: runs/EN/m1.log, g6*.log, uf1.log"
  ],
  "ckpt": "pending",
  "step_ms": 211.3

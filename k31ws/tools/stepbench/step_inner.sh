@@ -20,7 +20,7 @@ cd /tmp
 PIDS=()
 for ((r = 0; r < NQ_WORLD; r++)); do
   RANK=$r LOCAL_RANK=$r python3 $D/nq_step.py --capture-sizes "$NQ_CAP" --max-capture $NQ_MAXCAP \
-    --full-capture-sizes "$NQ_FULLCAP" --measured-rows "$NQ_ROWS" --overlay "$K/ov/$WS_OV" \
+    --full-capture-sizes "$NQ_FULLCAP" --measured-rows "$NQ_ROWS" --overlay "${WS_OVDIR:-$K/ov/$WS_OV}" \
     --emulate-ep ${NQ_EMULATE_EP:-32} -- \
     "${NQ_ARGS[@]}" --shapes $OUT.shapes.json --kv-len-jitter 0 --routing balanced --seed 0 \
     --iters ${NQ_ITERS:-20} --samples ${NQ_SAMPLES:-5} --output-json $OUT.json "$@" > $OUT.rank$r.log 2>&1 &

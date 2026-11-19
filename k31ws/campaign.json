@@ -1,20 +1,20 @@
 {
  "goal": "Close the gap between the implemented kernels and the perf model's achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.",
  "steps": {
-  "Prefill DEP16 NVFP4 (tok/s/GPU)": {
-   "now": "slice 218.7 ms vs 164.5 ach (1.33x)",
-   "ach": "30.7K",
-   "note": "1-node DEP16 slice, L24, F16K L78K, profiled; F8K 110.9 vs 83.9"
+  "Prefill DEP16 NVFP4 slice (ms, F16K)": {
+   "now": "199.8 (int e4514e51af)",
+   "ach": "164.5",
+   "note": "was 218.7 at baseline; 1-node DEP16 slice, L24, L78K"
   },
-  "Decode r8 NVFP4 (tok/s/GPU)": {
-   "now": "not measured yet",
-   "ach": "2,855",
-   "note": "D3-32; NVFP4 baseline pending"
+  "Decode r8 NVFP4 slice (ms/step)": {
+   "now": "6.67",
+   "ach": "2.68",
+   "note": "target-only 4.91 vs 2.41 (preview-drafter tail removed)"
   },
-  "Decode r24 NVFP4 (tok/s/GPU)": {
-   "now": "not measured yet",
-   "ach": "6,280",
-   "note": "D3-32; NVFP4 baseline pending"
+  "Decode r24 NVFP4 slice (ms/step)": {
+   "now": "10.89",
+   "ach": "3.80",
+   "note": "target-only 6.77 vs 3.53"
   }
  },
  "findings": [
@@ -169,6 +169,30 @@
   {
    "t": "11-18 16:00",
    "text": "Coordination: 9 of 14 agents ended after their first milestone, short of target; relaunched as continuation agents that keep going until their family is at 1.1x model (plus FAST). 13 Rhea nodes running, nothing waiting."
+  },
+  {
+   "t": "11-18 16:10",
+   "text": "Controlled same-node A/B (prefill DEP16 slice): NVFP4 is 1.31-1.34x faster than the MXFP4 checkpoint (not 1.75x). 95% of the saving is KDA projections + shared experts going BF16 -> MXFP8 (3x tensor rate on VR200). MegaMoE is unchanged: at prefill (>512 tok/rank) the MXFP4 checkpoint already runs the NVFP4 W4A4 kernel. Model fixes needed: MXFP4 prefill MegaMoE rows, and MoE comm added serially at EP16 volume (perf-model/microbench/results/prefill_nvfp4_vs_mxfp4)."
+  },
+  {
+   "t": "11-18 15:52",
+   "text": "NVFP4 DECODE BASELINE (1-node D3-32 DP-rank slice, L24): step r8/r16/r24 6.67/8.91/10.89 ms vs achievable 2.68/3.24/3.80 (2.5-2.9x); target-only (preview drafter removed) 4.91/6.00/6.77 vs 2.41/2.89/3.53 (~2x). r24 excess: drafter (preview artifact) 3.8, GEMMs 0.76, top-k 0.59, MegaMoE 0.44, DSA attention 0.55, KDA 0.43, small ops 0.43, SP comm 0.18 ms."
+  },
+  {
+   "t": "11-18 16:19",
+   "text": "Integration branch wzhao/k31ws-int e4514e51af = D-GEMM + EN + D-MOE + P-MOE: NVFP4 prefill slice F16K 218.7 -> 199.8 ms (P-MOE 8K sub-calls -6.5%); MegaMoE prefill now measures 0.77x the model (model MoE comm/fc rows look pessimistic: model fix pending, real EP16 4-node check needed)."
+  },
+  {
+   "t": "11-18 16:15",
+   "text": "D-FUSE on NVFP4: step r24 -2.8% (6841 -> 6651 us L24); AttnRes + SP AG/RS at 1.10x model: at target. Landed-ready."
+  },
+  {
+   "t": "11-18 16:40",
+   "text": "NVFP4 ACCURACY RISK (EN): with the export unit input scales, the FC2-input NVFP4 requant (routing weight applied before it) loses range for small activations (rel error 0.26 at RMS 2^-8, 15% blocks zeroed). Stock path has the same math; a power-of-two fc1 norm constant fixes it exactly. Needs real activation stats + gsm8k: real checkpoint download needs user approval."
+  },
+  {
+   "t": "11-18 16:20",
+   "text": "P-MOE: in the prefill MegaMoE main kernel, the SiTU transcendentals cost ~170 us of 1055 us per 8K launch (no-transcendental probe 888 us); cheaper exact-equivalent SiTU forms are being evaluated."
   }
  ]
 }

@@ -4,10 +4,10 @@
  "side": "infra",
  "owner": "HW agent (workflow)",
  "state": "implementing",
- "updated": "2026-11-18T14:50-08:00",
+ "updated": "2026-11-18T17:05-08:00",
  "shape": "-",
  "basis": "MEASURED on Rhea (runs/HW/hw1-hw3) + local ptxas 13.4 + CuTe DSL 4.8.0 source + internal docs (private hwdb; internal numbers not reproduced here)",
- "gap_analysis": "hwdb v1.3 is live (INDEX with eleven key facts, 13 topic files, 13 briefs, 3 answered requests). Measured on Rhea: die-local HBM read about 7 percent above the perf model's die-local achievable rate (model error, conservative), default striped and all-remote rates confirmed; oversized shared memory verified up to its documented limit; FP32 packed FMA (FFMA2) has the same peak as scalar FFMA (it only halves instruction count); legacy warp-level BF16 MMA runs at one quarter of the tcgen05 rate; a die caches lines homed on the other die in its own L2 after first touch (re-reads run at local-L2 rate until a die's working set exceeds its L2). From the image toolchain: block-scaled MMA on sm_107 has no M64 shape; non-scaled FP8 MMA has the Rubin double-K form; TMEM load-with-reduce (row max/min) is new on sm_107; counted TMA stores are not exposed in CUDA 13.4 PTX, while asynchronous release multicast stores and bulk multicast copy/reduce are; nvcc -arch=sm_107a also emits a non-arch-specific PTX pass (use explicit gencode); arch-specific sm_100a cubins do not run on VR200; the K3.1 image has no ncu/nsys. Measured tcgen05 issue rates: a 1-CTA MMA reading both operands from shared memory is capped at two thirds of the double-K peak; A in TMEM (or 2-CTA M256) is required for peak - every compute-bound kernel design must account for it. NVLink: multicast stores cost the same latency as unicast; chained per-peer release stores serialise.",
+ "gap_analysis": "hwdb v1.5: die-locality how-to published (topics/die-locality-howto.md) and verified on Rhea (hw6, hw7). Measured: 106 SMs per die (pair rule holds for the 12 non-split SMs); die-local read 1.41x striped with the full map; one VA range of alternating 2 MiB die chunks + die-matched claim = die-local rate, die-oblivious claim = striped; per-SM read throughput cap means a die-local stream needs all SMs of the die; one die alone = half chip; writes gain nothing, copies 1.2x; graph capture with localized memory works; torch LocalizedAllocator pools in the image home tensors per die incl. inside graph capture; no green-context launch penalty with empty kernels. New (hw7-hw9): TMA ring throughput per issuing thread = bytes per stage / ~0.37 us regardless of ring depth; the standard GEMM form (one producer warp, 16 KiB boxes) caps at ~0.5-0.6x of die-local for any placement, so die-localizing such kernels gains nothing until each issuer moves >= 32 KiB per stage or 2+ issuers stream; the MegaMoE weight operand (one TMA warp, 8-16 KiB per stage) is flagged as issue-capped (hw10 MegaMoE-like stage probe running); per-die SM split varies by part (106/106, 108/104); per-row 1D bulk and gather4 row gathers are op-rate bound, warp loads are the fast gather. Earlier: tcgen05 smem-operand cap 2/3 (A in TMEM or 2-CTA for peak), NVLink multicast latency.",
  "inefficiencies": [
   "No Nsight Compute/Systems in the K3.1 image: counter-based root-causing (bytes, tensor pipe utilisation) is unavailable to every workstream unless a host install is mounted (flagged to INFRA in briefs/INFRA.md)",
   "Counted TMA stores, early A-buffer release MMA flag and TMA L2 management ops exist in hardware/ptxas internals but have no public PTX spelling in CUDA 13.4"
@@ -81,10 +81,30 @@
    "t": "14:45",
    "what": "Queued hw5 (HBM write and read+write bandwidth by die placement; 576 B random-row gather via bulk copies, L2-resident vs HBM footprints) on the pool; withdrew my queued 4-GPU probe to unblock workstream 4-GPU step benches",
    "result": "pending: pool holds busy/expiring; next holds ~22:00 PT"
+  },
+  {
+   "t": "16:00",
+   "what": "hw5 read (write/copy by placement; 576 B bulk gather), hw6 die-locality validation (map, placement, SM scaling, graph, green ctx, torch APIs, gathers), hw7 TMA ring + LocalizedAllocator; wrote topics/die-locality-howto.md; briefs D-GEMM/D-MOE/D-KDA/P-MOE/INFRA/D-TOPK/P-IDX/D-ATTN/P-MLA updated",
+   "result": "see findings; TMA single-issuer ring cap and gather op-rate cap are new design constraints"
+  },
+  {
+   "t": "16:20",
+   "what": "queued hw8 (TMA issue structure: static vs atomic claims, producer/consumer warps, producer warps per CTA, 64 KiB tensor boxes; gather4 with 4-16 issuing warps)",
+   "result": "running on rhea0204"
+  },
+  {
+   "t": "16:55",
+   "what": "hw8 (issue structure) + hw9 (op latency, lanes vs warps, ops per stage) read; rule written to die-locality-howto sections 11-12, INDEX fact 15, briefs D-MOE/P-MOE/D-GEMM/P-GEMM/D-KDA/INFRA/D-FUSE/P-KDA (weight streams) and D-ATTN/P-MLA/P-IDX/D-TOPK (gathers)",
+   "result": "TMA issue rule: bytes/stage/issuer / 0.37 us; GEMM form capped ~9-11 TB/s"
+  },
+  {
+   "t": "17:00",
+   "what": "queued hw10: MegaMoE-like stage (A 8/16/32 KiB + SF, B tokens on the same barrier, 1-4 A lanes)",
+   "result": "running rhea0253"
   }
  ],
- "next": "HANDOFF: (1) read /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw5/log when it runs (wsgpu waiter already queued) and fold write/copy die-local rates into hwdb topics/07 + topics/13 + briefs/D-KDA.md, gather rates into briefs/D-ATTN.md, P-MLA.md; (2) re-run bench/run_hw4.sh (-g 4, outdir hw4b) for the fence+relaxed / multicast-relaxed all-to-all variants when a whole node is idle (do not compete with workstream step benches); (3) re-ask internal-doc questions in scratch q4 (MMA_READ_SHM_A PTX spelling, fabric.* syntax, multicast object pool size, TMA L2 CCTL PTX, TMEM ld/st bandwidth) with nvinfo chat; (4) 2-CTA M256 MMA rate check (extend bench/mma_rate.cu with cluster launch + cta_group::2); (5) poll /Users/weizha/k31ws-hwdb/requests every ~20 min, answer in <file>.answer.md, rsync hwdb to Lustre k31ws/hwdb.",
- "blockers": "Pool: hold1 nodes reserved by INFRA / expiring; HW probes wait (low priority by design).",
+ "next": "(1) read rhea:k31ws/runs/HW/hw10/log -> confirm/refute the MegaMoE weight-issue cap and the lane-split fix; write to die-locality-howto sec 12 + briefs D-MOE/P-MOE; (2) poll /Users/weizha/k31ws-hwdb/requests every ~20 min, answer in <file>.answer.md, rsync hwdb to rhea k31ws/hwdb; (3) pending probes: 2-CTA cluster TMA multicast stage rate (MegaMoE uses 2-CTA M256 + cluster 2/4), hw4b NVLink variants (-g 4, idle node only), 2-CTA M256 MMA rate.",
+ "blockers": "none (probes run on 1 GPU via wsgpu)",
  "branch": "- (no code branch; private hwdb at /Users/weizha/k31ws-hwdb, mirror k31ws/hwdb on Lustre)",
  "evidence": [
   "/Users/weizha/k31ws-hwdb/INDEX.md",
@@ -93,7 +113,13 @@
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw2/log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw3/log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/mma2/log",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw4/log"
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw4/log",
+  "/Users/weizha/k31ws-hwdb/topics/die-locality-howto.md",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw5/log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw6/log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw7/log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw8/log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/hw9/log"
  ],
  "ckpt": "pending"
 }

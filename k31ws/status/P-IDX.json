@@ -4,7 +4,7 @@
  "side": "prefill",
  "owner": "P-IDX workflow agent",
  "state": "implementing",
- "updated": "2026-11-18T15:25-08:00",
+ "updated": "2026-11-18T16:10-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 15.32,
  "current_ms": 15.32,
@@ -68,9 +68,19 @@
    "t": "15:20",
    "what": "Selection fixes: key scales by one bulk copy (key rows in SF-atom order), weights in registers, fine (one bin per BF16 value) compaction histogram, rank tie cut, thresholds in smem",
    "result": "5.15 ms/layer, still exact; instrumenting compaction counts/time (runs/P-IDX/fused9.log)"
+  },
+  {
+   "t": "15:35",
+   "what": "In-kernel stats (iid random logits): 11K inserts and ~9 compactions per token; each compaction stalls the CTA through the 2-stage accumulator ring",
+   "result": "root cause of the slow select (compaction = several latency-bound passes with contended smem atomics)"
+  },
+  {
+   "t": "16:05",
+   "what": "Redesign: per-token histogram of buffered keys (one bin per BF16 value above a base) maintained by the token warp; threshold raised every tile by a warp scan (exact); compaction becomes one filter pass + rebase; ILP epilogue variant (both tokens loaded, early TMEM release)",
+   "result": "first try hung (unbounded while loop in the DSL, step cancelled); bounded warp-scan version running (runs/P-IDX/fused11.log)"
   }
  ],
- "next": "Read in-kernel stats (compactions, inserts, time split) and fix the selection cost; then epilogue ILP (both tokens loaded before math, early TMEM release)",
+ "next": "Measure the histogram-tracked select + ILP epilogue (fused11), then wiring into sparse_attn_indexer prefill path",
  "blockers": "",
  "branch": "wzhao/k31ws-p-idx @ 45d5404879 (+ local WIP)",
  "evidence": [

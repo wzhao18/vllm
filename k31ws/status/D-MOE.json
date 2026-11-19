@@ -2,17 +2,17 @@
  "id": "D-MOE",
  "title": "Decode: MegaMoE NVFP4 EP32 + shared-expert overlap",
  "side": "decode",
- "owner": "D-MOE agent (workflow)",
- "state": "landed-ready",
- "updated": "2026-11-18T16:05-08:00",
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), SP shard = 96 MoE tokens per GPU, 28 local experts, top-16, L~135K, k=3",
- "baseline_ms": 8.3,
- "current_ms": 6.3,
- "achievable_ms": 4.35,
- "target_ms": 4.8,
+ "owner": "D-MOE agent (workflow, resumed)",
+ "state": "measuring",
+ "updated": "2026-11-18T17:15-08:00",
+ "shape": "D3-32 r24 1-node slice (EP4, 28 experts/GPU emulation, SP shard 96 MoE tokens/GPU, top-16, L~135K, k=3); ms = 23-layer slice x4 (92 MoE layers)",
+ "baseline_ms": 7.05,
+ "current_ms": 7.05,
+ "achievable_ms": 5.26,
+ "target_ms": 5.79,
  "step_ms": 30.5,
- "basis": "current: PROJECTED from the 1-node D3-32 slice (INFRA step_d, L24, EP4 with 28 experts/GPU emulation, mxfp4 ckpt, r24): MegaMoE family exposed 1564 us / 23 layers = 68 us/layer x 92 = 6.3 ms (was 3422 us = 149 us/layer on deep_gemm fp8_fp4). achievable: model rows at EP32 T=96 tokens/GPU: MegaMoE 37.0 us/layer x 92 = 3.40 ms + shared MXFP8 0.95 ms = 4.35 ms; slice model ach for the MegaMoE family at r24 = 1339 us/23 layers. baseline: coordinator seed.",
- "gap_analysis": "Step A/B on the 1-node D3-32 slice (L24, u132k, profiled; A = INFRA base deep_gemm fp8_fp4 MegaMoE, B = kimi_k3_mega_moe on the re-vendored FI a368c5f66 kernel, die-local weights, shared expert on the SP side stream): step r8/r16/r24 = 7058/10204/13004 -> 6548/8919/10943 us (-7.2/-12.6/-15.8%). MegaMoE family exposed r24 3422 -> 1564 us (1.17x the slice model achievable 1339 on exposed time; busy 2225 = 1.66x, the shared expert now overlaps it). Remaining kernel gap, MEASURED with globaltimer stamps at the EP32 per-GPU shape on 1 GPU (T96, 48 us/layer vs ~37 model): ~5.5 us before the weight stream starts (router + scheduler publish), weight stream ~34 us at ~85-90% of die-local HBM, ~8.6 us CTA finish imbalance, ~3 us tail barrier/exit, separate top-k reduce ~2.7 us. At EP32 (Hecate, same kernel) dispatch/combine adds ~17 us/layer that is not hidden behind the stream: the 8-node run is needed to split it.",
+ "basis": "MEASURED in-step, NVFP4 checkpoint: INFRA NVFP4 decode slice trial-9ccf8ab (int b31121cf56 + D-MOE a9b8c85bd3, k31-nvfp4 view L24, profiled) MegaMoE family exposed r8/r16/r24 = 1840/1843/1763 us per 23 layers vs nvfp4_modelopt achievable 1086/1201/1316; ms here = r24 x4. Baseline = first NVFP4 decode measurement (the campaign-start deep_gemm fp8_fp4 path cannot load the NVFP4 checkpoint).",
+ "gap_analysis": "In-step NVFP4 (r24): main persistent kernel 81.9 us/layer busy (1-GPU EP32-shape bench: 43.7), router kernel 7.4, separate top-k reduce 3.6, stage 3.0; busy is flat over r8..r24 (~94 us/layer) while achievable grows 47->57: the time is fixed latency + EP comm, not the weight stream. EP4 graph-replay stamps (T96, NVFP4, 2026-11-18 16:20, runs/D-MOE/out/vs-ep4nv96.p1): from the moment all sizes are visible (S) to kernel end ~55 us on every rank (1 GPU: ~40): token pull S+0.4..S+3.5-11.6, FC1 weight stream S+1.3..S+43-53 (CTA end spread ~9 us), tail NVLink barrier ends S+54-55; before S each rank spends ~6 us in its router (publish_sizes alone 3.4 us) plus waiting for the slowest rank. The HBM weight stream is idle for the whole front. SOL design (per layer, EP32 T96): weight stream 520 MB die-local ~30 us + one dispatch round + one combine round (~2.6 us each) => ~37 us = model. Path: (E1) entry L2 prefetch of each die's FC1 stream head during the front (router/size exchange/token pull), (E2) fold the top-k reduce into the kernel tail after the NVLink barrier (one grid-end + launch less), (E3) tail balance (finer/LPT last FC2 wave, die-aware), (E4) router publish as one multicast release instead of per-peer releases.",
  "inefficiencies": [
   "FIXED on the branch: D3-32 decode used DeepGEMM fp8_fp4 MegaMoE (149 us/layer exposed at r24 in the slice); kimi_k3_mega_moe on the re-vendored kernel: 68 us/layer exposed",
   "MEASURED (stamps, 1 GPU T96): weights stream only after the router publishes sizes (~3 us after the call starts); at T>=4 every local expert is active so the weight stream does not depend on routing",
@@ -30,13 +30,13 @@
   "PDL (programmatic dependent launch) to overlap the MegaMoE prologue with the router GEMM"
  ],
  "plan": [
-  "DONE B3: FI a368c5f66 re-vendored into megamoe_rubin (byte-identical src + R1 import rewrite, numerics helpers vendored, EP28/EP32 records with hint 64, die_split host port); unit tests 144 pass",
-  "DONE step A/B on the 1-node slice: kimi_k3_mega_moe -15.8% step at r24",
-  "INTEGRATION: recipe/step cfg moe-backend deep_gemm_mega_moe -> kimi_k3_mega_moe for D3-32 (runs/D-MOE/rhea_d3x32_dp{1,8}[_nvfp4]_kmm.json); NVFP4 ckpt needs EN B1/B1b (native NVFP4 params) on top",
-  "C1 entry weight prefetch: at kernel entry (PDL, before sizes_ready) each CTA L2-prefetches its die-rank share of the first fc1 wave (die from sm_locality_domain; die 0 experts ascending, die 1 descending); hides the ~5.5 us front at 1 GPU and more of the dispatch latency at EP32",
-  "C2 tail: CTA finish imbalance ~8.6 us -> finer tail work units or LPT order of the last fc2 tiles; fold the separate top-k reduce (~2.7 us) into the combine",
-  "C3 8-node EP32: step_multi d8 with runs/D-MOE/rhea_d3x32_dp8_kmm.json + standalone EP32 bench with stamps (vstamp.py) to split dispatch/combine (~17 us/layer at EP32)",
-  "C4 capacity: measure the 256-token decode bucket vs a 128-token bucket at T32-T128 (live rows are a runtime arg, but router geometry follows capacity)"
+  "DONE: reconciled with int (01ace2323a, int tests green) for the NVFP4 decode baseline",
+  "S1 shared-expert placement: the side-stream overlap with the persistent die-local grid costs more than it hides; measure serial vs front-only overlap in-step, keep the per-shape winner (sp_mlp, specialized_decode)",
+  "E1 entry FC1 L2 prefetch (implementing, vendored kernel local difference E1): sweep 0/16/32/48 MiB per die at 1 GPU T4-T128, then EP4 die-local",
+  "E2 top-k reduce in the kernel tail (after tail.nvlink_barrier), fp32 sum order unchanged => removes the reduce launch + grid end (~3.6 us in-step)",
+  "E3 tail imbalance: LPT/finer last wave so CTA end spread 9 us -> ~2 us",
+  "E4 router size publication: one multimem/fence + relaxed stores instead of chained per-peer release (EP32: 31 peers)",
+  "8-node EP32 (hold8): step_multi d8 with runs/D-MOE/rhea_d3x32_dp8_nvfp4_kmm.json + EP32 stamps (vs.sh with 896 experts, 32 ranks)"
  ],
  "work": [
   {
@@ -123,11 +123,41 @@
    "t": "16:00",
    "what": "megamoe_rubin unit tests on d-moe-3e7dd6a218-1",
    "result": "146 passed (12 s)"
+  },
+  {
+   "t": "19:10",
+   "what": "INFRA: merged wzhao/k31ws-d-moe a9b8c85bd3 into wzhao/k31ws-int (9ccf8ab994, clean)",
+   "result": "int tests 214 passed; NVFP4 decode slice runs (r8/r16/r24 6.67/8.91/10.89 ms, the campaign NVFP4 decode baseline); NVFP4 prefill slice A/B vs int b31121cf56: F16K 218.7 -> 213.6 ms, F8K 110.9 -> 110.6 ms; pushed"
+  },
+  {
+   "t": "15:55",
+   "what": "merged wzhao/k31ws-int b31121cf56 into wzhao/k31ws-d-moe (clean) -> 01ace2323a; int_tests.sh + megamoe_rubin tests on overlay d-moe-01ace2323a-1",
+   "result": "159 + 5 + 52 + 156 passed (runs/D-MOE/logs/t4.log); pushed; landed-ready for INFRA"
+  },
+  {
+   "t": "16:00",
+   "what": "read INFRA NVFP4 decode slice trial-9ccf8ab (int + D-MOE a9b8c85bd3)",
+   "result": "MegaMoE exposed r8/r16/r24 1840/1843/1763 us /23 layers vs ach 1086/1201/1316; main kernel 81-82 us/layer in-step"
+  },
+  {
+   "t": "16:20",
+   "what": "EP4 graph-replay globaltimer stamps, NVFP4, T32/T96 (vs.sh, overlay d-moe-01ace2323a-diag1)",
+   "result": "after sizes visible ~55 us to kernel end on all ranks (1 GPU ~40); router publish_sizes 3.4 us; token pull up to 11.6 us; FC1 stream starts S+1.3; CTA end spread ~9 us"
+  },
+  {
+   "t": "16:35",
+   "what": "E1 entry L2 prefetch of each die FC1 stream head (vendored kernel local change), sweep 0/16/32/48 MiB per die; bench_megamoe_rubin --die-local (55d473994e)",
+   "result": "1 GPU T96 49.5 -> 49.8/51.2/53.7 us (worse); EP4 die-local T32/T96 56.9/56.6 -> 54.8/55.8 at 32 MiB. Not landed (runs/D-MOE/e1-entry-prefetch.patch)"
+  },
+  {
+   "t": "16:45",
+   "what": "standalone EP4 die-local NVFP4 graph replay vs in-step traces (trial-9ccf8ab, r24, 4 ranks)",
+   "result": "standalone router+main+reduce 56.6 us; in-step main kernel alone 86-88 us; the SP side-stream shared expert chain (gate_up 11.8 + act_quant 7.0 + down 12.0 us) overlaps its first ~29 us. The overlap + skew costs ~30 us/layer of MegaMoE time"
   }
  ],
- "next": "(1) INFRA: merge wzhao/k31ws-d-moe @ 3e7dd6a218 and switch D3-32 to moe-backend kimi_k3_mega_moe (cfgs in rhea:.../runs/D-MOE/rhea_d3x32_dp{1,8}[_nvfp4]_kmm.json). (2) step kmm3 (same as kmm2 on the EP4 slice, sanity) running: runs/D-MOE/step_d/kmm3-mx-r8r16r24. (3) 8-node when hold8 runs: DMOE_CFG=$K/runs/D-MOE/rhea_d3x32_dp8_kmm.json bash $K/runs/D-MOE/step_multi_moe.sh -n D-MOE d8 d-moe-3e7dd6a218-1 128,256,384 1, plus EP32 stamps (vstamp.py via vs.sh with --num-experts 896, 32 ranks) to split dispatch/combine. (4) kernel C1 entry weight prefetch: in megamoe_rubin/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py run_tma_a, before sched_consumer.consume_work(): die = sm_locality_domain[%smid], die-rank r = count of same-die SMs below %smid / cluster size; prefetch (cp.async.bulk.prefetch.L2) fc1 weight rows [r*128, r*128+128) of the die-ordered expert sequence (die 0 ascending from expert 0, die 1 descending from expert E-1), record as a local difference in VENDOR.md; measure with stamp.sh (1 GPU, target front 5.5 -> ~2 us) and v1.sh (EP4). (5) C2 tail imbalance (8.6 us) and folding the separate top-k reduce (2.7 us). Tools: runs/D-MOE/{dmoe_bench.py,dmoe_stamp.py,stamp.sh,vstamp.py,vs.sh,v1.sh,k1-3.sh}; local parsers in the D-MOE scratch (stamp_parse3.py, stamp_ranks.py) are mirrored in runs/D-MOE.",
- "blockers": "EP32 numbers need the hold8 (queued for ~03:00-04:00 PST 2026-11-19). NVFP4 checkpoint path needs EN B1/B1b (native NVFP4 MegaMoE weights in megamoe_rubin).",
- "branch": "wzhao/k31ws-d-moe @ 3e7dd6a218",
+ "next": "A/B in-step with the shared expert serialized (runs/D-MOE/step_d/serial2-nv-r8r16r24-prof, overlay d-moe-serial-diag2) vs trial-9ccf8ab; if serial wins, make the SP policy per shape (serial or front-only overlap: launch the shared chain at MLP entry beside the router/latent_down so it ends before the persistent grid starts).",
+ "blockers": "EP32 numbers need the 8-node hold (hold8 ~04:50).",
+ "branch": "wzhao/k31ws-d-moe @ 55d473994e (landed-ready: 01ace2323a + bench option)",
  "evidence": [
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/step_d/kmm2-mx-r8r16r24-prof/fam.txt",
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_d/base-mx-r8r16r24-prof/fam.txt",
@@ -135,5 +165,5 @@
   "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/out/ (b0, k1/k2 knob sweeps, stamps, v2 EP4 bench)",
   "perf-model/microbench/results/moe_ep32/rows.json"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }

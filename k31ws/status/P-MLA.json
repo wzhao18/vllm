@@ -2,9 +2,9 @@
  "id": "P-MLA",
  "title": "Prefill: sparse MLA + prologue",
  "side": "prefill",
- "owner": "P-MLA workflow agent",
- "state": "implementing",
- "updated": "2026-11-18T14:05-08:00",
+ "owner": "P-MLA workflow agent (resumed 16:00)",
+ "state": "measuring",
+ "updated": "2026-11-18T16:12-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "step_ms": 218.7,
  "baseline_ms": 12.24,
@@ -30,12 +30,13 @@
   "PDL between prologue, attention and w_uv"
  ],
  "plan": [
-  "1. DONE measure stock chain per kernel at F8K/F16K; probe MMA operand-fetch, SMEM write contention, TMEM copy, gather4 issue rate",
-  "2. Land the prologue fix: one fused concat+FP8 quant+head pad kernel (bitwise vs stock) instead of quant + pad passes (branch wired; measure in bench and step)",
-  "3. Gather floor with 8/16 issuing warps (run4) -> record the model fix (gather + SMEM terms) with measured numbers",
-  "4. New prefill sparse-MLA kernel (specialized_prefill): 2-CTA M128 TS (Q fully in TMEM via exclusive 576 cols), gather each row once with gather4 multicast to the pair from 8+ issuing warps, P in TMEM, O folded 256 cols, persistent over tokens; target the gather/SMEM floor",
-  "5. gate_mul fused into a w_uv batched GEMM epilogue (stock rounding: bf16(out) * bf16(sigmoid))",
-  "6. Unit tests vs stock, microbench F8K/F16K, step A/B on the INFRA harness, landed-ready"
+  "1. DONE stock chain, operand-fetch, gather floors (LDG, gather4 1-16 warps, multicast pairs, aligned pitch)",
+  "2. DONE model fix evidence: delivered-bytes cap ~18 TB/s -> F16K floor 1.07 ms/layer for one gather per token-row; corrected achievable for the slice = 6 x (1.07 + 0.019) = 6.53 ms (target 7.2)",
+  "3. Keys-on-M kernel to the floor: phase trace (run11) -> 3-stage ring + many TMA gather warps + pipelined MMA order + cheap softmax; target ~1.12-1.2 ms/layer",
+  "4. Dispatch on (DISPATCH=True when it beats trtllm-gen at F8K/F16K): removes the head-pad pass (174 us/layer)",
+  "5. Prologue: Q FP8 quant fused (into the attention kernel's Q load or the w_uk epilogue, stock rounding)",
+  "6. gate_mul into the w_uv epilogue",
+  "7. tests vs stock, microbench F8K/F16K, step_p A/B on an int-based overlay, landed-ready"
  ],
  "work": [
   {
@@ -102,9 +103,19 @@
    "t": "15:20",
    "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline (slice units, not 93 layers)",
    "result": "sparse MLA 12.24 vs 3.86 (x3.17)"
+  },
+  {
+   "t": "16:05",
+   "what": "run10: gather floor with multicast CTA pairs (cluster 2, each CTA gathers half the quads, multicast to both) and a 128 B aligned row pitch",
+   "result": "single-CTA 16 warps 17.5 TB/s (1104 us at F16K); multicast pairs deliver 18.7 TB/s total = 9.3 TB/s unique (2071 us); pitch 640 no change. The cap is on bytes delivered into SMs: a KV row placed in two SMs costs twice. Rules out every 2-CTA V-split layout (incl. stock's); the SOL form is one SM per token with all 96 heads and all 512 V dims (keys-on-M, S^T 96 + O^T 384 TMEM cols)."
+  },
+  {
+   "t": "16:10",
+   "what": "run11 queued: clock64 phase stamps (loader issue, KV landed, S ready, P ready, PV issue, epilogue) in SparseMlaPrefill; 3-stage KV ring via the oversized carveout; 7/15 TMA gather warps with setmaxnreg",
+   "result": "pending"
   }
  ],
- "next": "HANDOFF: (1) add clock64 phase stamps (loader issue/land, QK issue/S ready, softmax done, PV done) to SparseMlaPrefill and run benchmark_kimi_k3_prefill_sparse_mla.py --tokens 16384 --qmag 0.15 --loaders 3:0:0:0:1 on 1 GPU (wsgpu -g 1); (2) if gathers in flight are the limit: 3 KV stages via the oversized SMEM carveout (check the CuTe DSL 4.8 launch attribute) or release the RoPE/K part after QK; (3) alternatively build the hwdb-recommended heads-on-M form: 2-CTA M128 (64 heads/CTA incl. pad), Q in TMEM (.ts), O folded 256 cols/CTA, gather each row once (multicast to the pair), target the ~1.07 ms gather floor; (4) then w_uv+gate_mul fused GEMM; (5) set DISPATCH=True only when the kernel beats trtllm-gen at F8K/F16K, step A/B, landed-ready. Commands: stage with mkov.sh <wt> p-mla-<sha>-<n>; scripts in runs/P-MLA/pmla_run*.sh (pytest needs --noconftest: tblib missing in the image).",
+ "next": "run11 phase trace -> pick the bound stage; SOL design (keys-on-M, one SM per token): 3-stage TMA gather4 ring with >=7 issuing warps, QK(t+1) before PV(t), softmax off the tensor critical path, Q double-buffer if exposed; target ~2.1K clk per 128-key tile (gather 2.0K, SS MMA 1.9K) = ~1.12 ms/layer at F16K.",
  "blockers": "ncu/nsys not in the image (phase timing must come from in-kernel clock64 stamps); pool contended (1-GPU runs waited 30-60 min)",
  "branch": "wzhao/k31ws-p-mla @ db27679958 (pushed to wzhao18)",
  "evidence": [

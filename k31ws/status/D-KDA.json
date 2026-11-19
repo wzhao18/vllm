@@ -2,16 +2,16 @@
  "id": "D-KDA",
  "title": "Decode: KDA core (FP32 state)",
  "side": "decode",
- "owner": "D-KDA agent",
+ "owner": "D-KDA agent (resumed)",
  "state": "implementing",
- "updated": "2026-11-18T15:40-08:00",
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3; per GPU 24 KDA heads x 96 requests = 2304 (request, head) items/layer",
- "baseline_ms": 3.4,
- "current_ms": 3.4,
- "achievable_ms": 1.81,
- "target_ms": 1.99,
- "step_ms": 29.78,
- "basis": "MEASURED: Rhea 1-node profile, 93-layer projection (perf-model/microbench/results/rhea1n_d3x32)",
+ "updated": "2026-11-18T16:05-08:00",
+ "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
+ "baseline_ms": 0.9,
+ "current_ms": 0.9,
+ "achievable_ms": 0.47,
+ "target_ms": 0.517,
+ "step_ms": 10.89,
+ "basis": "MEASURED in-step NVFP4 baseline (INFRA 18:52 EST, measured/20261118-1900-nvfp4-decode.json); achievable = nvfp4_modelopt at the same slice",
  "gap_analysis": "MEASURED (runs/D-KDA run2/run3, 1-GPU microbench at the D3-32 per-GPU shape, deferred fold active): KdaWide n32/64/96/128 = 26.0/51.5/74.3/95.0 us/layer, KdaWS (no fold; flush pass extra) 20.5/37.4/48.5/62.3; state stream only 3-6.5 TB/s and a 2-page state ring changes nothing -> not bandwidth / bytes-in-flight bound. In-kernel clock64 trace of KdaFlow (WS + fold) at n96: the 8-warp scan is the bottleneck (verify ~5.5-7K cycles/item vs ~2.5K FP32-pipe floor, fold ~3.5-4.5K/item vs ~1K), scan waits ~0 on the state and ~13% on prep; prep body ~8K cycles/item per warpgroup (global round trips: F_B tile loads, old records, weights), so prep is the next limit once the scan speeds up. Root cause: latency-bound dependency chain per token (k-dot reduce -> v -> update -> q-dot reduce) with only 2 scan warps per SMSP, plus global-latency-bound prep.",
  "inefficiencies": [
   "MEASURED: KdaFlow scan fold and verify each ~9K cycles/item at n96 (instruction floor ~1-2K): suspect register cap 128 + local-memory stack (STACK 88) in the fused fold+verify scan",
@@ -26,11 +26,11 @@
   "programmatic dependent launch"
  ],
  "plan": [
-  "Baseline microbench at deployed per-GPU shapes n=32/64/96/128 (r8/r16/r24/r32), deferred fold active, 69 layers over disjoint state sets in one CUDA graph",
-  "ncu KdaWide / KdaWS at n=32 and n=96: dram throughput, bytes in flight, stall reasons",
-  "Design one per-shape persistent kernel family: multi-stage bulk-copy state ring, fold + verify + conv + gate + o_norm fused, deep memory pipeline; die-local row split (value rows are independent) as the step to the die-local roofline",
-  "Bitwise/stock-tolerance unit tests vs the stock commit + verify (reuse test_specialized_decode_sp_kda_fold_gpu.py)",
-  "Microbench vs model at r8/r16/r24/r32; step A/B via INFRA harness; landed-ready"
+  "SOL DESIGN (KdaFlow v3, one persistent kernel, one state pass): per SM two independent scan groups (4 warps each, 128 threads, thread = 8 rows x 16 keys, 128 FP32 state regs, same per-row partial/butterfly tree as KdaWS so bitwise parity holds) run two items concurrently so one group's reduction/broadcast latency hides under the other's FP32 passes; fold (stock commit association) + verify + gated o_norm per item from registers; folded state written straight from registers (coalesced 128 B rows, evict-first); state pages bulk-copied into a per-group smem slot as soon as the group has the previous page in registers (2 x 64 KiB in flight per SM); one prep warpgroup with no global round trips in its body (per-head conv/F_B/dt constants cached: F_B for the CTA's <=2 heads staged once in smem; per-item rows, conv window, old records cp.async-staged one item ahead).",
+  "Bound resources at n96 (per SM, ~10.9 items): FP32 pipe ~3K cycles/item (fold ~7.8 + verify 16 FP32 ops per state element, FFMA2) = ~14 us; state R+W 302 MB at the striped HBM rate ~22-24 us -> memory bound, projected ~24-26 us/layer (x69 = 1.7-1.8 ms) vs model achievable 26.3 us (1.81 ms), target 28.9 us (1.99 ms).",
+  "Step 1: implement v3 in cutedsl/kda/flow.py (replaces v1/v2), bitwise test vs KdaWS triton + stock commit, microbench n32/64/96/128.",
+  "Step 2: if FP/prep bound: clock64 trace per role; tune groups/regs; if memory bound below target: 2-stage ring per group (oversized smem) / die-local state placement.",
+  "Step 3: dispatch flow for the measured winning n range (RECORD_KINDS), in-step slice A/B on the int overlay, landed-ready."
  ],
  "work": [
   {
@@ -67,9 +67,14 @@
    "t": "15:35",
    "what": "run6 setmaxnreg split sweep + ptxas -v",
    "result": "KdaFlow spills 104/96 B, but split 168/88..136/120 leaves n32 at 37.9-38.0 us and worsens n96 (91.4 -> 103.8): spills are not the main cost"
+  },
+  {
+   "t": "16:25",
+   "what": "coordinator: re-based on the NVFP4 decode slice baseline",
+   "result": "KDA core 0.90 vs 0.47"
   }
  ],
- "next": "HANDOFF. Done: KdaFlow (cutedsl/kda/flow.py, sp kind \"flow\", in FOLDS, NOT in RECORD_KINDS) = KdaWS + in-kernel deferred fold, bitwise equal to KdaWS triton + stock commit (tests/models/kimi_k3/test_specialized_decode_sp_kda_flow_gpu.py, run with --noconftest: tblib missing); bench benchmarks/kernels/k31_vr/kda_sp_bench.py (--kinds wide ws flow flow1 flow2, --trace, --skip fold,store,verify, --regs s,p). Measured (us/layer n32/n96): KdaWide 26.0/74.3, KdaWS(no fold, +flush extra) 20.5/48.5, KdaFlow v1 32.9/71.7, v2 38.0/91.7; model 8.76/26.3. Next: (1) get SASS (nvdisasm) of KdaFlow scan to find why fold and verify each take ~9K cycles/item (floor 1-2K); (2) measure the deferred flush (KDADeferredCommitContext.flush) at n96 to decide whether KdaFlow v1 already beats KdaWS+flush for n>=71 (dispatch 71-:flow); (3) redesign direction: the per-item serial chain (8 scan warps on one item) cannot reach the model; consider row-split items over more warps (rows are independent; 64-row halves, 16 scan warps) with the prep (conv/gate/norm/fold operands) done once per item by one warpgroup and per-head constants (F_B, conv w, dt) cached in smem across head-major items; die-local row split (4 KiB page parity ^ per-2MiB bit, dies.page_domains) only after compute is fixed (HBM use is 3-6 TB/s today). Commands: stage: bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-kda <tag>; run: ssh rhea, cd runs/D-KDA, (setsid nohup tools/wsgpu.sh -g 1 -m 30 -o <tag> -n D-KDA -- bash <abs path script> > log 2>&1 &); scripts run5.sh/run6.sh in runs/D-KDA are templates.",
+ "next": "Implement KdaFlow v3 (two scan groups x 8 rows/thread, one prep warpgroup, 1 page slot per group) and run test + microbench.",
  "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
  "branch": "wzhao/k31ws-d-kda @ 3de6741dcc",
  "evidence": [
@@ -81,5 +86,5 @@
   "runs/D-KDA/ptxas.log (Rhea Lustre k31ws/runs)",
   "perf-model/microbench/rhea1n/model_rows.json"
  ],
- "ckpt": "pending"
+ "ckpt": "nvfp4"
 }

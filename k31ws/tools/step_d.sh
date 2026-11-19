@@ -36,7 +36,7 @@ EXTRA=(); [ "$PROF" = 1 ] && EXTRA+=(--profile-dir $R/prof-agentx); [ -n "$XD" ]
 { echo "STEP_D ov=$OV rows=$ROWS ctx=$CTX prof=$PROF ckpt=$Q emulate_ep=$EMU exclude_drafter=${XD:-0} name=$NAME start=$(date +%FT%T)"
   cat $R/agentx.shapes.txt; grep '^#' $R/agentx.cfg.sh; } > $R/agentx.log
 echo "$(date +%T) start $TAG" > $R/status.txt
-NQ_EMULATE_EP=$EMU bash $K/tools/wsgpu.sh -g 4 -m $MIN -o $OV -n $NAME -- \
+NQ_EMULATE_EP=$EMU bash $K/tools/wsgpu.sh -g 4 -m $MIN -o $OV -n $NAME -P strict:$R/agentx.cfg.sh -- \
   env NQ_EMULATE_EP=$EMU bash $S/step_inner.sh $R/agentx "${EXTRA[@]}" >> $R/agentx.log 2>&1
 rc=$?
 echo "STEP_D end rc=$rc $(date +%FT%T)" >> $R/agentx.log

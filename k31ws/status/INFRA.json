@@ -4,10 +4,10 @@
  "side": "infra",
  "owner": "INFRA agent (workflow)",
  "state": "measuring",
- "updated": "2026-11-18T17:55-05:00",
+ "updated": "2026-11-18T19:40-05:00",
  "shape": "NVFP4 checkpoint. D3-32 DP-rank slice (1 node, DCP4, EP4 emulating EP32) r8/r16/r24 at L132K; P3-16 DEP4-on-1-node slice (EP4 emulating EP16) F16K/F8K at L78K; 24-layer view",
- "basis": "MEASURED NVFP4 prefill slice (int b31121cf56, k31-nvfp4-view-L24): runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; NVFP4 decode slice pending the NVFP4 MegaMoE decode path (trial merge with D-MOE queued)",
- "gap_analysis": "NVFP4 prefill baseline (P3-16 slice, L24 view, F16K at L78K): 218.7 ms per forward vs 164.5 nvfp4_modelopt achievable (x1.33); F8K 110.9 vs 83.9 (x1.32). Largest family gaps at F16K (busy vs achievable, ms): KDA core 21.9 vs 4.5, router/latent/top-k/norm 20.2 vs 12.0, DSA sparse MLA 12.2 vs 3.9, indexer + exact top-k 15.3 vs 8.4, preview-drafter tail 4.3 vs 1.4; MegaMoE NVFP4 74.0 vs 73.3 and the MXFP8 / BF16 GEMM families are within 1.1x. NVFP4 decode baseline: blocked on an NVFP4 MegaMoE that runs at the decode buckets (vendored megamoe_rubin lacks EP4 decode buckets / EP32 knobs; D-MOE re-vendored FI a368c5f66 on wzhao/k31ws-d-moe, trial-merged onto int as wzhao/k31ws-int-dmoe-trial a022cf34de, slice run queued as soon as Rhea ssh is back). Harness facts: the specialized decode reads moe.gate.weight in its fused MoE front, so the bench routing fixture never reached the sdec graph (old slice: all 224 local experts per GPU); fixed with a bench-only expert-count emulation.",
+ "basis": "MEASURED NVFP4 slices on wzhao/k31ws-int 9ccf8ab994 (EN + D-GEMM + D-MOE): decode runs/INFRA/step_d/trial-9ccf8ab-nv-r8r16r24-prof, prefill runs/INFRA/step_p/int-b31121c-nv-f16f8-prof (+ trial-9ccf8ab-nv-f16f8 A/B)",
+ "gap_analysis": "NVFP4 decode slice (D3-32 DP rank, L24 view, u132k, int 9ccf8ab994): r8/r16/r24 6.67/8.91/10.89 ms vs nvfp4 achievable 2.68/3.24/3.80 (x2.49/2.75/2.86); target-only x2.04/2.07/1.92. r24 exposed vs achievable: preview-drafter tail 4.12 vs 0.28 (slice artifact), GEMMs 1.58 vs 0.82, MegaMoE NVFP4 1.76 vs 1.32, top-k 0.65 vs 0.06, small elementwise 0.47 vs 0.04, KDA core 0.90 vs 0.47, DSA q/MLA/DCP 0.67 vs 0.25, SP comm 0.51 vs 0.33, indexer 0.24 vs 0.11. NVFP4 prefill slice (P3-16 DEP4, L24, L78K): F16K 213.6 ms / F8K 110.6 ms on int 9ccf8ab994 vs achievable 164.5 / 83.9 (x1.30 / x1.32); biggest gaps KDA core 21.9 vs 4.5, router/latent/top-k/norm 20.2 vs 12.0, DSA sparse MLA 12.2 vs 3.9, indexer + top-k 15.3 vs 8.4. Harness: specialized decode reads moe.gate.weight in its fused MoE front, so the bench routing fixture never reached the sdec graph; fixed with a bench-only expert-count emulation (28 / 56 experts per GPU).",
  "inefficiencies": [
   "Slice deviation: 24-layer view (896 experts x 93 layers do not fit at EP4); model rows rescaled to the same layer counts",
   "Slice deviation: MegaMoE dispatch/combine over 4 GPUs instead of 32 (decode) / 16 (prefill)",
@@ -16,28 +16,75 @@
  ],
  "rubin_features": [],
  "plan": [
-  "NVFP4 decode slice r8/r16/r24 profiled on int + D-MOE (trial overlay trial-a022cf3-1), per-family vs nvfp4 rows -> measured/<ts>-nvfp4-decode.json + findings",
-  "Merge D-MOE into int once landed-ready (its unit tests), re-run int tests + slices",
-  "Integration wzhao/k31ws-int: merge each landed-ready workstream, int_tests.sh (owners' tests) + NVFP4 step A/B, push, mark landed",
-  "step_multi.sh d8 / p16 (NVFP4 configs ready) for the hold8 job",
-  "Pool: FAST owns wsgpu/wsplan scheduling now; INFRA keeps holdd running and conf tuned (no idle releases)"
+  "P-MOE (d0aaaa1a8e) on trial2 e4514e5: tests 226 passed after a test-stub fix; NVFP4 prefill A/B running -> merge + push + mark landed",
+  "Merge further landed-ready workstreams: int_tests.sh (owners tests) + NVFP4 step A/B (step_d/step_p -q nvfp4) per merge",
+  "step_multi.sh d8 / p16 with NVFP4 configs (kimi_k3_mega_moe) for the hold8 job; real EP32 calibration of the slice",
+  "Pool: holdd running; FAST owns wsgpu/wsplan scheduling"
  ],
  "work": [
-  {"t": "15:35", "what": "claimed; worktree /Users/weizha/k31ws-wt/infra + wzhao/k31ws-int at 4fbaa15189 pushed to wzhao18; holdd-ws running", "result": "hold1 x3 + hold8 pending"},
-  {"t": "15:46", "what": "step benches for all owners: step_d.sh, step_p.sh, step_multi.sh d8/p16 (k31ws/tools/stepbench), L24 model rows (nvfp4_modelopt + reference)", "result": "nvfp4 L24 achievable: decode r8/r16/r24 2.74/3.30/3.88 ms; prefill F16K/F8K 164.5/83.9 ms"},
-  {"t": "15:46", "what": "root-caused the old slice's MoE deviation (sdec fused router front bypasses the routing fixture); bench-only expert-count emulation", "result": "confirmed in-run: 28 active experts / EP rank (decode), 56 (prefill)"},
-  {"t": "16:05", "what": "pool: node reservation for whole-node requests (since superseded by FAST's wsplan scheduler)", "result": "whole-node runs started within minutes instead of starving"},
-  {"t": "16:55", "what": "int: merged D-GEMM 520afc7416 + EN 6f164db270; fixed the semantic break (is_online_mxfp8 renamed by EN) -> b31121cf56", "result": "int tests 202 passed; decode slice A/B no regression vs base; pushed; D-GEMM and EN marked landed"},
-  {"t": "17:45", "what": "NVFP4 prefill baseline, P3-16 slice F16K/F8K profiled on int b31121cf56 (k31-nvfp4-view-L24)", "result": "218.7 / 110.9 ms vs nvfp4 achievable 164.5 / 83.9 (x1.33 / x1.32); per family in measured/20261118-1805-nvfp4-prefill.json"},
-  {"t": "17:55", "what": "trial merge int + D-MOE c52b0d8c7e (wzhao/k31ws-int-dmoe-trial a022cf34de, clean); NVFP4 decode config uses kimi_k3_mega_moe", "result": "overlay staging + NVFP4 decode slice blocked by the Rhea ssh outage (login closes new connections)"}
+  {
+   "t": "15:35",
+   "what": "claimed; worktree /Users/weizha/k31ws-wt/infra + wzhao/k31ws-int at 4fbaa15189 pushed to wzhao18; holdd-ws running",
+   "result": "hold1 x3 + hold8 pending"
+  },
+  {
+   "t": "15:46",
+   "what": "step benches for all owners: step_d.sh, step_p.sh, step_multi.sh d8/p16 (k31ws/tools/stepbench), L24 model rows (nvfp4_modelopt + reference)",
+   "result": "nvfp4 L24 achievable: decode r8/r16/r24 2.74/3.30/3.88 ms; prefill F16K/F8K 164.5/83.9 ms"
+  },
+  {
+   "t": "15:46",
+   "what": "root-caused the old slice's MoE deviation (sdec fused router front bypasses the routing fixture); bench-only expert-count emulation",
+   "result": "confirmed in-run: 28 active experts / EP rank (decode), 56 (prefill)"
+  },
+  {
+   "t": "16:05",
+   "what": "pool: node reservation for whole-node requests (since superseded by FAST's wsplan scheduler)",
+   "result": "whole-node runs started within minutes instead of starving"
+  },
+  {
+   "t": "16:55",
+   "what": "int: merged D-GEMM 520afc7416 + EN 6f164db270; fixed the semantic break (is_online_mxfp8 renamed by EN) -> b31121cf56",
+   "result": "int tests 202 passed; decode slice A/B no regression vs base; pushed; D-GEMM and EN marked landed"
+  },
+  {
+   "t": "17:45",
+   "what": "NVFP4 prefill baseline, P3-16 slice F16K/F8K profiled on int b31121cf56 (k31-nvfp4-view-L24)",
+   "result": "218.7 / 110.9 ms vs nvfp4 achievable 164.5 / 83.9 (x1.33 / x1.32); per family in measured/20261118-1805-nvfp4-prefill.json"
+  },
+  {
+   "t": "17:55",
+   "what": "trial merge int + D-MOE c52b0d8c7e (wzhao/k31ws-int-dmoe-trial a022cf34de, clean); NVFP4 decode config uses kimi_k3_mega_moe",
+   "result": "overlay staging + NVFP4 decode slice blocked by the Rhea ssh outage (login closes new connections)"
+  },
+  {
+   "t": "19:00",
+   "what": "NVFP4 decode baseline on int + D-MOE (trial 9ccf8ab994), profiled r8/r16/r24",
+   "result": "6.67/8.91/10.89 ms vs nvfp4 ach 2.68/3.24/3.80; measured/20261118-1900-nvfp4-decode.json; posted per family to findings"
+  },
+  {
+   "t": "19:10",
+   "what": "merged D-MOE a9b8c85bd3 into int (ff to 9ccf8ab994), pushed; D-MOE marked landed",
+   "result": "int tests 214 passed; NVFP4 prefill A/B F16K 218.7 -> 213.6 ms, F8K 110.9 -> 110.6"
+  },
+  {
+   "t": "19:10",
+   "what": "P-MOE d0aaaa1a8e trial merge (conflict in megamoe_rubin/experts.py resolved: EN _nvfp4_alphas + P-MOE reserve_sms signature) + sp_mlp test-stub fix",
+   "result": "trial2 e4514e5: 226 passed; NVFP4 prefill A/B queued"
+  },
+  {
+   "t": "19:40",
+   "what": "landed P-MOE d0aaaa1a8e into int (e4514e51af), pushed",
+   "result": "NVFP4 prefill F16K 213.6 -> 199.8 ms, F8K 110.6 -> 100.9; tests 226 passed"
+  }
  ],
- "next": "When ssh is back: mkov.sh /Users/weizha/k31ws-wt/trial trial-a022cf3-1; rsync tools/stepbench; on Rhea: setsid nohup bash $K/tools/step_d.sh -n INFRA -q nvfp4 -t trial-a022cf3-nv-r8r16r24-prof trial-a022cf3-1 128,256,384 1 and int_tests.sh on the same overlay.",
- "blockers": "Rhea login closes new ssh connections (rate limit incident); waiting for the user to re-authenticate the shared master. NVFP4 decode also needs D-MOE's NVFP4 decode MegaMoE path to run in the sdec graph.",
- "branch": "wzhao/k31ws-int @ b31121cf56 (pushed); wzhao/k31ws-int-dmoe-trial @ a022cf34de (local trial); wzhao/k31ws-infra @ 4fbaa15189",
+ "next": "P-KDA trial3 (5718ef2): tests + NVFP4 prefill A/B vs 199.8/100.9 ms -> land; NVFP4 decode re-check on trial3 (P-MOE touched KimiMoE.forward).",
+ "blockers": "",
+ "branch": "wzhao/k31ws-int @ e4514e51af (pushed); wzhao/k31ws-int-pkda-trial @ 5718ef2 (local, P-KDA under test)",
  "evidence": [
+  "k31ws/measured/20261118-1900-nvfp4-decode.json",
   "k31ws/measured/20261118-1805-nvfp4-prefill.json",
   "k31ws/tools/stepbench/README.md",
-  "Rhea: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_p/int-b31121c-nv-f16f8-prof (fam.txt, gap.json, prof-pf/)",
-  "Rhea: runs/INFRA/int-b31121c-1-tests.log (202 passed)"
+  "Rhea: runs/INFRA/step_d/trial-9ccf8ab-nv-r8r16r24-prof, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof, runs/INFRA/*-tests.log"
  ]
 }

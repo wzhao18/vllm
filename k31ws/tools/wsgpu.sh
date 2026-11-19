@@ -1,5 +1,5 @@
 #!/bin/bash
-# wsgpu.sh [-g 1|2|4|8n] [-m MINUTES] [-w WAITMIN] [-o OVTAG] [-i IMG] [-n NAME] -- CMD [ARGS...]
+# wsgpu.sh [-g 1|2|4|8n] [-m MINUTES] [-w WAITMIN] [-o OVTAG] [-i IMG] [-n NAME] [-P std|strict|strict:CFG] -- CMD [ARGS...]
 # Run CMD inside the K3.1 image on free GPUs of the shared k31ws node pool on Rhea (run it on the Rhea login node).
 #  -g   GPUs: 1, 2 or 4 on one node (default 1), or 8n = a whole 8-node pool hold (EP32/DP8 work; CMD then runs ONCE
 #       on the login node with WS_JOB / WS_NODES exported so it can srun --overlap itself across the 8 nodes).
@@ -8,7 +8,12 @@
 #  -w   how long to wait for free GPUs (default 240 min) before giving up (exit 75).
 #  -o   overlay tag under $K/ov (default base-4fbaa15); the image's vllm is replaced by $K/ov/<tag> on PYTHONPATH.
 #  -n   label for the usage log (use your workstream id, e.g. D-TOPK).
-# Inside the container, wsenv.sh sets PYTHONPATH, Lustre caches, CUDA_VISIBLE_DEVICES=<the locked GPUs>, then execs CMD.
+#  -P   CPU preflight + extension prebuild while the request waits (tools/wsprep.py, on a pool node's CPUs, no GPU):
+#       compiles the overlay's shipped .py, imports vllm (+ the Kimi K3 packages; fatal with strict), parses a step
+#       bench config (strict:<out>.cfg.sh) and prebuilds the digest-keyed Kimi torch extensions. A fatal preflight
+#       failure before GPUs are assigned ends the request (exit 3, log in pool/prep/); later it is only reported.
+# The overlay is also bind-mounted at the fixed path /k31ov (FAST: torch-extension builds embed source paths;
+# one path for every overlay stops digest-keyed builds being redone per overlay). Inside the container, wsenv.sh sets PYTHONPATH, Lustre caches, CUDA_VISIBLE_DEVICES=<the locked GPUs>, then execs CMD.
 # GPUs are locked per (hold, gpu) with flock on Lustre for the whole run: two runs never share a GPU.
 # Pool holds are the jobs named *-k31ws.hold* (maintained by holdd-ws.sh). Never scancel them yourself.
 # Scheduling (FAST 2026-11-18, tools/wsplan.py): fair round-robin across agents, best-fit packing of 1/2-GPU runs onto
@@ -18,8 +23,9 @@
 K=/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws
 G=1; MIN=30; WAIT=240; OV=base-4fbaa15; NAME=${WS_NAME:-anon}
 IMG=/lustre/fsw/coreai_comparch_inferencex/weizha/images/kimi-k31-wzhao-nov-11-aarch64.sqsh
-while getopts g:m:w:o:i:n: o; do
-  case $o in g) G=$OPTARG;; m) MIN=$OPTARG;; w) WAIT=$OPTARG;; o) OV=$OPTARG;; i) IMG=$OPTARG;; n) NAME=$OPTARG;;
+PREP=''
+while getopts g:m:w:o:i:n:P: o; do
+  case $o in g) G=$OPTARG;; m) MIN=$OPTARG;; w) WAIT=$OPTARG;; o) OV=$OPTARG;; i) IMG=$OPTARG;; n) NAME=$OPTARG;; P) PREP=$OPTARG;;
     *) exit 2;; esac
 done
 shift $((OPTIND-1)); [ "$1" = -- ] && shift
@@ -48,8 +54,27 @@ preempted() {  # preempted <job> <planned end epoch>: the hold is gone or now en
   [ "$st" = RUNNING ] || return 0
   e=$(date -d "$(squeue -h -j $1 -o %e 2>/dev/null)" +%s 2>/dev/null || echo 0)
   (( e < $2 - 60 )); }
+PREPLOG=''; PREPPID=''
+prep_start() {  # CPU preflight + prebuild on a pool node (background srun step, no GPU)
+  local a=() J N H
+  case $PREP in std) ;; strict) a=(--strict);; strict:*) a=(--strict --cfg "${PREP#strict:}");; *) echo "wsgpu: -P std|strict|strict:CFG"; exit 2;; esac
+  read -r J N < <(squeue -h -u $USER -t R -o "%i %N %j" | awk '$3 ~ /-k31ws\.hold/ {print $1, $2}' | shuf -n1)
+  [ -n "$J" ] || return 0
+  H=$(scontrol show hostnames $N | head -1); mkdir -p $K/pool/prep; PREPLOG=$K/pool/prep/$ME.log
+  ( WS_OV=$OV WS_GPUS= timeout 1800 srun --overlap --jobid $J -w $H -N1 -n1 --container-image=$IMG \
+      --container-mounts=/lustre:/lustre,$K/ov/$OV:/k31ov --no-container-mount-home --container-workdir=/tmp \
+      bash $K/tools/wsenv.sh python3 $K/tools/wsprep.py "${a[@]}" > $PREPLOG 2>&1 < /dev/null
+    echo "wsprep rc=$? host=$H" >> $PREPLOG ) &
+  PREPPID=$!; echo "wsgpu: preflight on $H's CPUs (log $PREPLOG)"; }
+prep_failed() {  # the preflight finished with a fatal failure
+  [ -n "$PREPLOG" ] && grep -q '^wsprep rc=3 ' $PREPLOG 2>/dev/null; }
+[ -n "$PREP" ] && prep_start
 tries=0
 while :; do
+  if prep_failed; then
+    grep '^wsprep: FAIL' $PREPLOG; ulog "$NAME ov=$OV preflight FAILED before GPUs ($PREPLOG)"
+    echo "wsgpu: preflight failed (no GPUs taken); full log $PREPLOG"; exit 3
+  fi
   now=$(date +%s)
   if [ "$G" = 8n ]; then
     while IFS='|' read -r J N E; do
@@ -81,7 +106,7 @@ while :; do
         ulog "$NAME job=$J node=$H gpus=$GL ov=$OV start waited=$((TS - T0))s"
         echo "wsgpu: $NAME on $H gpus $GL (hold $J) after $((TS - T0)) s"
         WS_OV=$OV WS_GPUS=$GL srun --overlap --jobid $J -w $H -N1 -n1 --container-image=$IMG \
-          --container-mounts=/lustre:/lustre --no-container-mount-home --container-workdir=/tmp \
+          --container-mounts=/lustre:/lustre,$K/ov/$OV:/k31ov --no-container-mount-home --container-workdir=/tmp \
           bash $K/tools/wsenv.sh "$@"
         rc=$?; touch $K/pool/use/$J; rm -f $RF; unlock_all
         ulog "$NAME job=$J node=$H gpus=$GL rc=$rc end dur=$(( $(date +%s) - TS ))s"

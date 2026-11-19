@@ -2,9 +2,9 @@
  "id": "P-KDA",
  "title": "Prefill: KDA chain (core + conv + gated o_norm)",
  "side": "prefill",
- "owner": "P-KDA agent",
- "state": "landed-ready",
- "updated": "2026-11-18T15:45-08:00",
+ "owner": "P-KDA agent (resumed 16:00)",
+ "state": "implementing",
+ "updated": "2026-11-18T16:35-08:00",
  "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4 config (KDA in/o_proj MXFP8 -> o_norm writes the MXFP8 o_proj input), 96 KDA heads at TP1, FP32 state; per GPU per prefill forward, 69 KDA layers",
  "baseline_ms": 77.2,
  "current_ms": 72.7,
@@ -25,11 +25,12 @@
   "planned: tcgen05 MMA with the FP32 state as a TMEM accumulator (kind::f16 BF16 operands, stock FlashKDA chunk-16 math) for the 96-head recurrence; persistent TMA-ring K1; larger per-SM shared memory for multi-tile K1 rings"
  ],
  "plan": [
-  "DONE (landing): HBM-rate gated o_norm + MXFP8 kernel: -59 us/layer F16K (-4.1 ms/forward)",
-  "K1 prepare (299 us, ~8 TB/s, latency-bound single-shot CTAs): persistent multi-tile K1 with a TMA ring over (tile, head) items -> its ~2.45 GB floor (~200 us); then FusedConv pays (exp branch has the bitwise conv-in-load code)",
-  "K2 recurrence (394 us): tcgen05 rewrite keeping FlashKDA chunk-16 operands (K1 workspace unchanged): S^T[V,K] FP32 in TMEM/registers, per chunk M=128 (V) x N=32 (kd|qd) x K=128 MMA for k.S/q.S, INV/Mqk 128x16x16, state update 128x128x16 into a separate TMEM accumulator then fma(S, g, P) (stock rounding); 288 items over 212 SMs -> persistent grid with (seq, head, v-half) work items",
-  "Overlap K1 with K2 (per-tile ready flags, K2 high priority): hides K1 under the compute-bound recurrence and keeps the workspace in L2",
-  "Model check: core_prefill t_ach 167 us assumes 2.0 GB at 12 TB/s with all 288 recurrences overlapped; the serial chunk walk (341 x 16-token steps) needs <= 0.49 us per chunk-step per SM pair to fit"
+  "DONE (landed-ready 47bc2f317f): HBM-rate gated o_norm + MXFP8 kernel: -59 us/layer F16K",
+  "SOL design (one persistent kernel per layer): per SM 1-2 (seq, head) items; loader warps TMA the raw q|k|v|g|beta rows (conv halo from the previous chunk), conv + gate cumsum + L2 norm + kd/qd/kr + INV/Mqk prep warps fill an smem ring (K1 work, no workspace in HBM), recurrence warps run the chunk chain on tcgen05 with the fp32 state row-per-thread in registers and bf16 S^T as the tensor-memory A operand, epilogue warps do gated o_norm + MXFP8. HBM traffic = raw activations in + MXFP8 out (~2.0 GB, ~160 us); recurrence = 341 serial chunk steps per item, must be <= ~0.45 us/step to hide under the bytes",
+  "Step 1 (in progress): tcgen05 recurrence (k2_tc.cuh, mode bit 5) on the unchanged K1 workspace; target K2 394 -> <= ~170 us",
+  "Step 2: cut the chunk-step latency (fine-grained K-slice pipelining of the state update into MMA1, MMA issue overlap) using in-kernel clock stamps",
+  "Step 3: move K1 prep (+ FusedConv from wzhao/k31ws-p-kda-fusedconv-exp) into producer warps of the recurrence kernel (removes K1 299 + conv 220 us and the workspace round trip)",
+  "Step 4: o_norm + MXFP8 epilogue inside the recurrence kernel (removes the 139 us pass)"
  ],
  "work": [
   {
@@ -86,11 +87,21 @@
    "t": "15:40",
    "what": "ab14: landing branch (o_norm kernel + one 32-bit scale store per row)",
    "result": "tests 3 passed (FP8 codes/scales vs kda_norm.rmsnorm_gated_mxfp8 within stock tolerance); F16K o_norm 138.7 us vs 203.2 (chain 1054 vs 1118 us/layer = 72.7 vs 77.2 ms/forward); F8K 72.6 vs 103.2 (chain 551 vs 580)"
+  },
+  {
+   "t": "16:10",
+   "what": "resumed; wrote the tcgen05 recurrence k2_tc.cuh (V on MMA M, fp32 state row per math thread in registers, bf16 S^T as tensor-memory A operand, K1 workspace tiles as smem B operands, 2 CTAs/SM, mode bit 5) + k2tc_diag.py + bench impl tc; commit 459f300b4c, overlay p-kda-tc1",
+   "result": "run tc1 queued (diag vs in-tree K2 + F16K times)"
+  },
+  {
+   "t": "16:30",
+   "what": "tc1: tcgen05 recurrence v1 (3 MMA round trips per chunk) vs in-tree K2 on the same K1 workspace",
+   "result": "BITWISE equal (out + final state) at [16]x1, [40,23]x2, [300,17,129]x8, slow-decay [200,64]x4, F16K 3x5461x96; but 635 us at F16K (1.86 us per chunk step) vs stock K2 394 -> latency-bound chain; tc2 queued with clock stamps + CUDA-core INV variant (2 round trips)"
   }
  ],
- "next": "LANDED-READY: INFRA merge wzhao/k31ws-p-kda @ 47bc2f317f (o_norm_mx kernel + kda.py prefill wiring; test tests/models/kimi_k3/test_kda_o_norm_mxfp8.py; bench benchmarks/kimi_k3/bench_kda_prefill_chain.py --impl stock|onorm). Then (handoff): 1) persistent multi-tile K1 with a TMA ring over (tile, head) items (target ~200 us), then re-enable FusedConv from wzhao/k31ws-p-kda-fusedconv-exp (bitwise conv-in-load, -220 us conv pass); 2) tcgen05 recurrence keeping FlashKDA chunk-16 operands: S^T[V=128,K=128] FP32 (registers or TMEM), per chunk one M128xN32xK128 MMA for k.S|q.S (kd|qd stacked as B), INV and Mqk 128x16x16, state product 128x128x16 into a separate TMEM accumulator then fma(S, g_total, P) for stock rounding; persistent grid over (seq, head) items; 3) overlap K1 with K2 via per-tile ready flags. Run: stage overlay with mkov.sh, then on Rhea: wsgpu.sh -g 1 -m 30 -o <tag> -n P-KDA -- bash <ov>/benchmarks/kimi_k3/run_kda_prefill_ab.sh <ov> <outdir>",
+ "next": "tc2: per-stage chunk latency from clock stamps; cut the chain (CUDA-core INV, K-slice pipelined state update into MMA1)",
  "blockers": "no ncu/nsys in the K3.1 image; Rhea ssh rate limiting (poll <= 1 per 3 min)",
- "branch": "wzhao/k31ws-p-kda @ 47bc2f317f",
+ "branch": "wzhao/k31ws-p-kda @ ff1cb6bc29 (landed-ready piece: 47bc2f317f)",
  "evidence": [
   "perf-model/plan/PLAN_NVFP4.md",
   "Rhea runs/P-KDA/ab6 (baseline + split K2 variants), ab10 (FusedConv bitwise dbg), ab12 (o_norm F16K/F8K), ab13 (norm test), ab14",

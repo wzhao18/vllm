@@ -13,6 +13,12 @@
 #    different sources would rebuild each other under one lock).
 K=/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws
 OVD=$K/ov/${WS_OV:?WS_OV}
+# Fixed overlay path (FAST 2026-11-18): wsgpu.sh / step_multi.sh bind-mount the overlay at /k31ov. Torch-extension
+# builds (k3_flashkda_split, k3_kda_conv, dcp_exchange, dsa_core) are keyed by source digest in shared dirs but their
+# build.ninja embeds the absolute source paths, so every overlay with the same sources rewrote build.ninja and rebuilt
+# (flashkda 75 s, back to back, runs queued on its lock for up to 13 min). One path for all overlays: one build.
+if [ -f /k31ov/vllm/__init__.py ] && [ "$(stat -c %d:%i /k31ov)" = "$(stat -c %d:%i $OVD)" ]; then OVD=/k31ov; fi
+export WS_OVDIR=$OVD
 export PYTHONPATH=${WS_PYTHONPATH:+$WS_PYTHONPATH:}$OVD:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps
 export HOME=$K/home XDG_CACHE_HOME=$K/cache/xdg XDG_CONFIG_HOME=$K/cache/xdg-config XDG_DATA_HOME=$K/cache/xdg-data
 export HF_HOME=$K/cache/hf PIP_CACHE_DIR=$K/cache/pip UV_CACHE_DIR=$K/cache/uv

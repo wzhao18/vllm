@@ -3,12 +3,13 @@
  "title": "Iteration time: GPU pool scheduling, step-bench startup, JIT caches",
  "side": "infra",
  "owner": "FAST agent (workflow)",
- "state": "measuring",
- "updated": "2026-11-18T14:10-08:00",
- "shape": "Iteration = queue wait + startup + measurement of one 1-node D3-32 step bench (r8/r16/r24) or one 1-GPU kernel microbench",
- "basis": "MEASURED from Rhea pool/usage.log (12:54-14:02), step bench logs (runs/INFRA/step_d/base-mx-r8r16r24-prof, runs/D-FUSE/step_d/fused5x-r128_384, runs/EN/step_p/nv-smoke2, runs/INFRA/step_p/int-cd9229c-nv-f16f8-prof), sacct of holds 72521/72601",
+ "state": "implementing",
+ "updated": "2026-11-18T16:05-08:00",
+ "shape": "Wall time of one warm-cache D3-32 1-node step bench (r8/r16/r24, prof=1, base-4fbaa15), container start to exit, ms; plus pool GPU-min lost to failed runs",
+ "basis": "MEASURED: runs/FAST/step_d/tri-1 (261 s, cold flashkda/dcpx), tri-2 (1076 s: 965 s model init stalled on flashkda rebuild lock); pool/usage.log",
  "gap_analysis": "A warm D3-32 step bench takes 247 s wall for ~40 s of cases: container+imports 8 s, config 11 s, dist init 10 s, model+dummy load 23 s, KV profile run 42 s, KV prepare + CuTe compiles 21 s, JIT kernel warmup 10 s, prefill-glue + tokenspeed MLA Triton compiles 39 s, router/CuTe warmup 5 s, serving-shape warmup 18 s, cases 28 s (incl. late Triton JITs), teardown 13 s. Root cause of most JIT time: the container /tmp (TRITON_CACHE_DIR, CUDA_CACHE_PATH) is a fresh tmpfs per srun step, so every run recompiled every Triton kernel; fixed (Lustre caches), effect being measured. Cold builds on new sources: flashkda_split 80-135 s, dcp_exchange 34 s (was rebuilt per overlay; now shared by digest). Kimi K3 CuTe cache misses 26-45 kernels/rank on a warm overlay (key includes real tensor addresses): ~27 s per start. NVFP4 slices: model init 235-291 s + MegaMoE runtime setup up to 154 s, not yet attributed. Queue: 80% of hold-GPU-minutes lock-busy but 32% of that in failed runs; holds are backfill jobs preempted 30-60 min after start (PreemptMode CANCEL), so the pool is 2-3 nodes for 14 agents and waits are 5-47 min for 4-GPU requests.",
  "inefficiencies": [
+  "Digest-keyed torch-extension builds (flashkda 75 s, kda_conv, dcpx, dsac) embed absolute overlay source paths in build.ninja: every overlay rebuilds the shared digest dir; flashkda e9eff3bc rebuilt 23x back to back 15:25-15:53, runs queue on its lock up to 16 min (fix: fixed /k31ov mount, testing)",
   "Triton + CUDA JIT caches on per-step tmpfs: all Triton kernels recompiled every run (fixed in wsenv.sh, measuring)",
   "dcp_exchange torch extension rebuilt 34 s per new overlay although digest-named (fixed: shared build root)",
   "CuTe cache keys include real tensor addresses: ~26-45 kernels/rank recompiled every start, ~27 s (owner: kernels traced with real buffers)",
@@ -19,27 +20,49 @@
  ],
  "rubin_features": [],
  "plan": [
-  "DONE scheduler v2: wsplan.py fair round-robin + best-fit packing + head-of-line reservation + 5 s polling + preemption auto-requeue + waited/dur logging; wsq.sh queue view",
-  "DONE wsenv.sh: Triton/CUDA JIT caches on Lustre, shared digest-named extension builds, per-checkout FlashInfer cache",
-  "MEASURING cold vs warm-cache step bench pair on base-4fbaa15 (runs/FAST/step_d/tri-1, tri-2; one acquisition) vs the 247 s baseline",
-  "NEXT bench-only startup cuts in nq_step.py / cfg2bench: kernel_config enable_jit_warmup=false (skips warmup_kernels + serving_shape_warmup), skip prefill-only warmups in step_d, os._exit after results to drop 13 s teardown; target < 90 s to first measurement; verify medians identical vs the baseline run",
-  "NEXT attribute the NVFP4 model-init 235-291 s and MegaMoE runtime 154 s (py-spy via srun --overlap on a run) and the CuTe address-keyed misses; hand fixes to owners",
-  "NEXT prebuild of changed extensions (flashkda_split, dcpx, dsac) on a hold node's CPUs while the request waits for GPUs",
-  "NEXT CPU-side preflight (imports + config) before a request takes GPUs, to stop failed runs burning node time",
-  "WATCH Hecate login for more GPUs (14:05: MFA keyboard-interactive denied)"
+  "IN TEST fixed overlay mount /k31ov (wsgpu.sh, step_multi.sh, wsenv.sh, step_inner/step_rank --overlay WS_OVDIR): one build per digest across overlays",
+  "READY nq_step.py: enable_jit_warmup=False by default (--jit-warmup to keep) + os._exit after results; A/B vs tri-2 medians 7064.3/10169.6/12999.4 us",
+  "READY wsprep.py + wsgpu.sh -P: CPU preflight (shipped .py compile, overlay import, Kimi packages, vLLM arg parse) + extension prebuild on a hold node's CPUs while waiting; step_d/p/multi use -P strict:<cfg>",
+  "NEXT install atomically (new file + mv), A/B step bench, measure failed-GPU-min after rollout",
+  "LOW CuTe address-keyed misses: tri-2 ranks 1-2 compile 4-6 kernels (2-3 s); report to owners only"
  ],
  "work": [
-  {"t": "13:52", "what": "queue analysis of pool/usage.log + wait files + sacct", "result": "80% lock-busy of 594 hold-GPU-min, 154 GPU-min in failed runs; 1-GPU median run 30 s, 4-GPU 148 s; waits 5-47 min (4 GPU), 1-16 min (1 GPU); holds 72601/72521 PREEMPTED at 43/54 min (backfill, PreemptEligible +30 min, CANCEL)"},
-  {"t": "13:55", "what": "startup breakdown of the warm base step bench and slow runs", "result": "247 s wall, ~40 s cases; container /tmp is tmpfs per step (verified by mount): Triton cache cold every run; dcpx rebuilt 34 s per overlay; flashkda_split 80-135 s per source change; CuTe 26-45 misses/rank on warm overlay"},
-  {"t": "13:58", "what": "wsenv.sh v2 installed atomically (backup pool/wsenv.sh.bak-pre-fast)", "result": "Triton/CUDA caches on Lustre, shared dcpx/dsac builds; measurement queued (runs/FAST/step_d/tri-1,2)"},
-  {"t": "14:03", "what": "wsgpu.sh v2 + wsplan.py + wsq.sh installed atomically (backup pool/wsgpu.sh.bak-pre-fast)", "result": "dry-run plan on live state OK; -w 0 smoke OK; old waiters keep old code until they exit"}
+  {
+   "t": "13:52",
+   "what": "queue analysis of pool/usage.log + wait files + sacct",
+   "result": "80% lock-busy of 594 hold-GPU-min, 154 GPU-min in failed runs; 1-GPU median run 30 s, 4-GPU 148 s; waits 5-47 min (4 GPU), 1-16 min (1 GPU); holds 72601/72521 PREEMPTED at 43/54 min (backfill, PreemptEligible +30 min, CANCEL)"
+  },
+  {
+   "t": "13:55",
+   "what": "startup breakdown of the warm base step bench and slow runs",
+   "result": "247 s wall, ~40 s cases; container /tmp is tmpfs per step (verified by mount): Triton cache cold every run; dcpx rebuilt 34 s per overlay; flashkda_split 80-135 s per source change; CuTe 26-45 misses/rank on warm overlay"
+  },
+  {
+   "t": "13:58",
+   "what": "wsenv.sh v2 installed atomically (backup pool/wsenv.sh.bak-pre-fast)",
+   "result": "Triton/CUDA caches on Lustre, shared dcpx/dsac builds; measurement queued (runs/FAST/step_d/tri-1,2)"
+  },
+  {
+   "t": "14:03",
+   "what": "wsgpu.sh v2 + wsplan.py + wsq.sh installed atomically (backup pool/wsgpu.sh.bak-pre-fast)",
+   "result": "dry-run plan on live state OK; -w 0 smoke OK; old waiters keep old code until they exit"
+  },
+  {
+   "t": "16:00",
+   "what": "tri-1/tri-2 timelines + build dir forensics",
+   "result": "tri-2 model init 965 s: flashkda shared build dir rebuilt per overlay (build.ninja embeds $K/ov/<tag> paths; .ninja_log: 23 rebuilds 15:25-15:53); usage.log 41% of 1209 GPU-min in failed runs"
+  }
  ],
- "next": "Read runs/FAST/step_d/tri-1 and tri-2 timelines (cold vs warm Lustre Triton cache) when the twice job runs; then the bench-only warmup skips in nq_step.py and an A/B for identical medians.",
+ "next": "Read /k31ov mount test (runs/FAST/ext/t1.log), install tools, A/B step bench",
  "blockers": "GPU queue: 2 running hold1 nodes for ~17 requests; FAST measurement waits like everyone else. Hecate login needs MFA.",
  "branch": "none (tools only, k31ws/tools on Rhea, mirrored locally)",
  "evidence": [
   "k31ws/findings/FAST.md",
   "k31ws/tools/wsplan.py, wsgpu.sh, wsenv.sh, wsq.sh",
   "Rhea: k31ws/pool/usage.log, runs/FAST/step_d/tri-1, tri-2"
- ]
+ ],
+ "baseline_ms": 247000,
+ "achievable_ms": 80000,
+ "target_ms": 88000,
+ "current_ms": 261000
 }

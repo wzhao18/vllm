@@ -10,28 +10,12 @@
    "left": "8:00:00"
   },
   {
-   "job": "73029",
+   "job": "74511",
    "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "RUNNING",
+   "state": "PENDING",
    "nodes": "1",
-   "start": "2026-11-18T15:16:28",
-   "left": "1:32:35"
-  },
-  {
-   "job": "73313",
-   "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "RUNNING",
-   "nodes": "1",
-   "start": "2026-11-18T15:38:47",
-   "left": "1:52:54"
-  },
-  {
-   "job": "73334",
-   "name": "coreai_cserve_dev-k31ws.hold1",
-   "state": "RUNNING",
-   "nodes": "1",
-   "start": "2026-11-18T15:39:18",
-   "left": "2:25:25"
+   "start": "2026-11-18T16:45:00",
+   "left": "8:00:00"
   },
   {
    "job": "73572",
@@ -39,7 +23,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T15:42:24",
-   "left": "1:52:31"
+   "left": "1:22:32"
   },
   {
    "job": "73591",
@@ -47,7 +31,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T15:42:55",
-   "left": "1:53:02"
+   "left": "1:23:03"
   },
   {
    "job": "73618",
@@ -55,7 +39,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T15:45:30",
-   "left": "2:04:37"
+   "left": "1:34:38"
   },
   {
    "job": "73756",
@@ -63,7 +47,15 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T15:49:07",
-   "left": "2:04:14"
+   "left": "1:34:15"
+  },
+  {
+   "job": "74500",
+   "name": "coreai_cserve_dev-k31ws.hold1",
+   "state": "RUNNING",
+   "nodes": "1",
+   "start": "2026-11-18T16:20:46",
+   "left": "2:19:54"
   },
   {
    "job": "74071",
@@ -71,7 +63,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:51:24",
-   "left": "3:59:31"
+   "left": "3:29:32"
   },
   {
    "job": "74062",
@@ -79,7 +71,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:50:22",
-   "left": "3:58:29"
+   "left": "3:28:30"
   },
   {
    "job": "74059",
@@ -87,7 +79,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:49:51",
-   "left": "3:57:58"
+   "left": "3:27:59"
   },
   {
    "job": "74056",
@@ -95,7 +87,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:48:48",
-   "left": "3:56:55"
+   "left": "3:26:56"
   },
   {
    "job": "74046",
@@ -103,7 +95,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:47:46",
-   "left": "3:55:53"
+   "left": "3:25:54"
   },
   {
    "job": "74040",
@@ -111,7 +103,7 @@
    "state": "RUNNING",
    "nodes": "1",
    "start": "2026-11-18T14:46:44",
-   "left": "3:54:51"
+   "left": "3:24:52"
   }
  ]
 }

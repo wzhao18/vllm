@@ -4,3 +4,4 @@
 - 2026-11-18 14:30 PST FusedConv in FlashKDA K1 is bitwise but slower (K1 728 vs 299+220): K1 is a latency-bound single-shot CTA per (tile, head); fusion needs a persistent multi-tile K1 first. Code on wzhao/k31ws-p-kda-fusedconv-exp.
 - 2026-11-18 14:45 PST HBM-rate o_norm+MXFP8 kernel: F16K 145 vs 203 us/layer (stock Triton ~5 TB/s), F8K 76 vs 103. K2-epilogue fusion was 3845 us (producer warps have 32 regs at 2 CTAs/SM) - not viable without a K2 redesign.
 - 2026-11-18 15:40 PST LANDED-READY wzhao/k31ws-p-kda @ 47bc2f317f: o_norm+MXFP8 kernel, F16K chain 1118 -> 1054 us/layer (77.2 -> 72.7 ms/forward), F8K 580 -> 551. Next levers: persistent K1 (+FusedConv from exp branch), tcgen05 K2.
+- 2026-11-18 16:30 PST tcgen05 chunk-16 recurrence (V on MMA M, fp32 state row per thread in registers, bf16 S^T as TMEM A operand) is BITWISE equal to FlashKDA K2 on first build, but 635 us at F16K (1.86 us/chunk, 3 MMA round trips): latency-bound; working on the chain.
