@@ -441,8 +441,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 producer_arrivals=(
                     self.promised_launchable_sm_count if self.reduce_acquires_producer_done else None
                 ),
+                norm_split=self.reduce_norm_split,
             )
         )
+
+    # vLLM-local: CTAs per token row of the fused-RMSNorm reduce (TopkReduce ``norm_split``). One whole-row CTA
+    # (448 threads x 128 registers at hidden 3584) needs an empty SM, so it waits for this grid's CTAs to exit;
+    # quarter-row CTAs fit beside them and the reduce spreads over every SM.
+    reduce_norm_split: ClassVar[int] = 4
 
     @property
     def reduce_acquires_producer_done(self) -> bool:

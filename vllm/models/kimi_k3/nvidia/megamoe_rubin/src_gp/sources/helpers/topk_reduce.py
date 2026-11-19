@@ -59,6 +59,20 @@ def ld_relaxed_sys_v2_b64(address):
 
 
 @cute.jit
+def st_shared_cluster_f32(address, value, peer):
+    """Store ``value`` to cluster CTA ``peer``'s copy of this CTA's shared address ``address``."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Uint32(address).ir_value(), Float32(value).ir_value(), Int32(peer).ir_value()],
+        "{ .reg .b32 dst; mapa.shared::cluster.u32 dst, $0, $2; st.shared::cluster.f32 [dst], $1; }",
+        "r,f,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+
+
+@cute.jit
 def _zero_half_mask(word):
     """Nonzero exactly when one of the word's four 16-bit halves is zero (exact for "any")."""
     return (word - Int64(0x0001000100010001)) & (word ^ Int64(-1)) & Int64(-0x7FFF7FFF7FFF8000)
@@ -212,6 +226,7 @@ class TopkReduce:
         outlive_producer: bool = False,
         producer_arrivals: Optional[int] = None,
         batch_invariant: bool = False,
+        norm_split: int = 1,
     ) -> None:
         """``internode = (experts_per_rank, ranks_per_node, remote_node_slots)`` enables the ordered reduce
         with one BF16 node partial per remote node (design invariant I11): a token's local top-k cells
@@ -220,7 +235,13 @@ class TopkReduce:
         ``outlive_producer`` keeps the polled reduce from completing before its producer grid, for producers
         that also write outputs the reduce does not poll. With ``producer_arrivals`` the last CTA waits
         instead for that many release-arrivals on the ``producer_done`` counter (one per producer CTA once
-        its stores are drained) and re-arms it, so the reduce does not wait out the producer's tail."""
+        its stores are drained) and re-arms it, so the reduce does not wait out the producer's tail.
+        ``norm_split`` (fused-RMSNorm reduce only): a token row is spread over a cluster of that many CTAs
+        that exchange their sum-of-squares partials through distributed shared memory. Small CTAs fit
+        beside the producer's resident CTAs, so the reduce runs on every SM instead of waiting for whole SMs."""
+        self.norm_split = int(norm_split)
+        if self.norm_split not in (1, 2, 4, 8):
+            raise ValueError(f"norm_split must be 1, 2, 4 or 8, got {norm_split}.")
         self.producer_arrivals = None if producer_arrivals is None else int(producer_arrivals)
         if self.producer_arrivals is not None and not outlive_producer:
             raise ValueError("producer_arrivals refines outlive_producer.")
@@ -310,6 +331,7 @@ class TopkReduce:
                 f"hidden_per_thread) = {align} for combine_format {combine_format}."
             )
         self.hidden_tiles = self.hidden // self.hidden_per_thread
+        self.norm_tiles_per_cta = (self.hidden_tiles + self.norm_split - 1) // self.norm_split
         # tail guard only needed when the worker count per token is not a whole
         # number of CTAs; prefetch only when topk is small enough to hoist.
         self.require_predicate = self.hidden_tiles % self._threads != 0
@@ -461,11 +483,12 @@ class TopkReduce:
                 raise ValueError("the fused RMSNorm reduce takes the polled bf16 combine plane only.")
             if cutlass.const_expr(topk_indices is None):
                 raise ValueError("The polled bf16 reduce needs topk_indices to skip dropped slots.")
-            norm_threads = (self.hidden_tiles + 31) // 32 * 32
+            split = self.norm_split
+            norm_threads = (self.norm_tiles_per_cta + 31) // 32 * 32
             if cutlass.const_expr(norm_threads > 1024):
                 raise ValueError(f"fused RMSNorm reduce: hidden {self.hidden} needs more than 1024 threads.")
             rmsnorm_weight = cute.make_tensor(rmsnorm_weight.iterator, cute.make_layout((self.hidden,)))
-            self._reduce_bf16_ll_rmsnorm(
+            kernel = self._reduce_bf16_ll_rmsnorm(
                 combine_quant,
                 topk_score,
                 reduced_output,
@@ -474,7 +497,19 @@ class TopkReduce:
                 rmsnorm_eps,
                 shared_term,
                 producer_done,
-            ).launch(grid=[reduced_output.shape[0], 1, 1], block=[norm_threads, 1, 1], stream=stream, use_pdl=True)
+            )
+            if cutlass.const_expr(split == 1):
+                kernel.launch(
+                    grid=[reduced_output.shape[0], 1, 1], block=[norm_threads, 1, 1], stream=stream, use_pdl=True
+                )
+            else:
+                kernel.launch(
+                    grid=[reduced_output.shape[0] * split, 1, 1],
+                    block=[norm_threads, 1, 1],
+                    cluster=[split, 1, 1],
+                    stream=stream,
+                    use_pdl=True,
+                )
             return
 
         if cutlass.const_expr(self.ll_encoded):
@@ -951,19 +986,29 @@ class TopkReduce:
         num_topk: cutlass.Constexpr[int] = self.num_topk
         prefetch = self.prefetch
         out_dtype = reduced_output.element_type
-        warps: cutlass.Constexpr[int] = (hidden_tiles + 31) // 32
+        split: cutlass.Constexpr[int] = self.norm_split
+        tiles_per_cta: cutlass.Constexpr[int] = self.norm_tiles_per_cta
+        warps: cutlass.Constexpr[int] = (tiles_per_cta + 31) // 32
         if cutlass.const_expr(hidden_per_thread * cutlass.BFloat16.width != 128):
             raise ValueError("The polled bf16 reduce reads one 16-byte cell per top-k slot.")
 
-        token_idx = cute.arch.block_idx()[0]
         thread_idx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.make_warp_uniform(thread_idx // Int32(32))
         lane_idx = cute.arch.lane_idx()
-        hidden_tile_idx = thread_idx
-        active = thread_idx < Int32(hidden_tiles)
+        if cutlass.const_expr(split == 1):
+            token_idx = cute.arch.block_idx()[0]
+            hidden_tile_idx = thread_idx
+            active = thread_idx < Int32(hidden_tiles)
+        else:
+            # Cluster rank = block index modulo the (split, 1, 1) cluster: rank q owns tiles [q * tiles_per_cta, ...).
+            token_idx = cute.arch.block_idx()[0] // Int32(split)
+            part = cute.arch.block_idx()[0] % Int32(split)
+            hidden_tile_idx = part * Int32(tiles_per_cta) + thread_idx
+            active = (thread_idx < Int32(tiles_per_cta)) & (hidden_tile_idx < Int32(hidden_tiles))
 
         smem = cutlass_utils.SmemAllocator()
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
+        cluster_partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
 
         score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
@@ -1066,6 +1111,16 @@ class TopkReduce:
         total = Float32(0)
         for w in cutlass.range_constexpr(warps):
             total = total + partial[w]
+        if cutlass.const_expr(split > 1):
+            # Every CTA of the cluster gets every partial, then sums them in rank order: one total row-wide.
+            if thread_idx == Int32(0):
+                for peer in cutlass.range_constexpr(split):
+                    st_shared_cluster_f32((cluster_partial.iterator + part).toint(), total, Int32(peer))
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            total = Float32(0)
+            for peer in cutlass.range_constexpr(split):
+                total = total + cluster_partial[peer]
         scale = cute.math.rsqrt(total / Float32(self.hidden) + rmsnorm_eps, fastmath=True)
         if active:
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
