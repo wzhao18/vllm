@@ -11,3 +11,6 @@ Produce NVFP4 in-step baselines NOW: merge EN (wzhao/k31ws-en 6f164db270) into w
 ## 2026-11-18 18:25 PST coordinator
 - Multi-node runs must never cold-compile: before any 8n/4n run on a new overlay, run a 1-node step slice (same configs) on that overlay to warm the shared CuTe/Triton/extension caches, and verify zero JIT compiles in its log. Add this as an automatic pre-step in step_multi.sh.
 - Integration backlog: D-ATTN, D-FUSE, D-MOE, P-GEMM, P-KDA, P-MOE are landed-ready. Merge them in order of measured gain, one trial per merge, then re-measure the NVFP4 slices and post the new reference numbers.
+
+## 2026-11-18 18:55 PST coordinator
+- Check D-KDA hypothesis: does the decode step slice exercise production deferred-commit mode (pending > 0, RecoverSSM fold, state write) or run with pending = 0? If not representative, fix the slice so KDA is measured as in production, and re-post the decode reference.

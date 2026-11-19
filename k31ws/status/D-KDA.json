@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent (resumed)",
  "state": "implementing",
- "updated": "2026-11-18T18:40-08:00",
+ "updated": "2026-11-18T19:20-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
@@ -127,11 +127,31 @@
    "t": "18:25",
    "what": "coordinator: current reset to the slice scope of the baseline (0.90 ms, 18 KDA layers, r24)",
    "result": "3.4 was a 93-layer number; report in the baseline scope"
+  },
+  {
+   "t": "18:30",
+   "what": "v7 (half-row groups, 16 warps): 67.6 us at n96 (no gain); v8 = v6 framework + KdaWS 8-row thread layout (run25), commit 04b2fa75b9",
+   "result": "root cause of v6/v7 parity: shared-memory return path (LDS.128 = 4 cycles per warp instruction, broadcast or not): 2-row layouts issue ~450 LDS.128 per thread-item (~7.4K cycles/item). v8 (8 rows per thread, vector chunk reused over 8 rows): n32/64/96/128 = 21.6/38.0/53.1/70.6 us/layer, flow test 8/8, 0 spills; beats production KdaWide at n32/n64 (26.0/51.5). n96 per group-item: prep 5K, fold 4K, verify 7.4K, epilogue 1.7K cycles: latency-bound prep/epilogue on the FP warps"
+  },
+  {
+   "t": "18:30",
+   "what": "harness check",
+   "result": "HYPOTHESIS for INFRA: the in-step baseline at r24 (KdaWS 49.2 us/layer) has no flush kernel in its profile -> the step slice likely runs with zero pending commits (no RecoverSSM fold, no state write); production deferred mode pays a full fold pass (KdaWS needs the separate flush; KdaFlow/KdaWide fold inline). Microbench here always folds 1..4 pending tokens (R+W)."
+  },
+  {
+   "t": "19:05",
+   "what": "v9 (warp-specialized prep WG + 2 scan WGs, setmaxnreg 216/72): ptxas compiles the whole kernel at the 168-register launch cap (scan code loses ILP: verify 11-14K cycles/item vs 7.4K in v8) and a record race; dropped",
+   "result": "setmaxnreg does not raise the compile-time budget of the scan region here; warp specialization with a third warpgroup costs the scan its registers"
+  },
+  {
+   "t": "19:10",
+   "what": "run27 deferred-mode comparison, us/layer (KdaFlow v8 / KdaWide / KdaWS without its flush): n8 10.5/8.6/11.5, n16 14.0/13.3/12.2, n24 20.2/24.5/15.7, n32 21.8/26.1/21.2, n48 29.8/39.2/30.8, n64 38.9/51.7/37.4, n71 44.2/56.7/41.3, n96 53.6/74.3/48.7, n128 71.0/95.2/62.6",
+   "result": "KdaFlow beats the production dispatch (KdaWide n3..70; KdaWS + a separate full-state flush pass n71+) from n24 up: r8 -17%, r16 -25% vs KdaWide; r24/r32 vs KdaWS-core-only it is 7-13% slower but KdaWS needs the flush pass (bench flush kind failed to run; to measure). Dispatch proposal: 1-2 split, 3-20 wide, 21+ flow"
   }
  ],
- "next": "v7 (4 half-row groups) implement + test + microbench",
+ "next": "v10 (per-warp quarter-page stores/refills, per-warp output stores, lane-parallel staging) measure; run the SP KDA test files with the new dispatch; landed-ready",
  "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
- "branch": "wzhao/k31ws-d-kda @ 097ecf925b",
+ "branch": "wzhao/k31ws-d-kda @ 04b2fa75b9",
  "evidence": [
   "runs/D-KDA/run2.log",
   "runs/D-KDA/run3.log",

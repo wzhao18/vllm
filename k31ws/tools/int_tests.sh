@@ -14,5 +14,7 @@ t tests/models/kimi_k3/test_specialized_decode_sp_mlp_gpu.py tests/models/kimi_k
 [ -f tests/models/kimi_k3/test_prefill_moe_subcalls.py ] && t tests/models/kimi_k3/test_prefill_moe_subcalls.py
 # P-KDA (47bc2f317f)
 [ -f tests/models/kimi_k3/test_kda_o_norm_mxfp8.py ] && t tests/models/kimi_k3/test_kda_o_norm_mxfp8.py
+# P-GEMM (cd5a5401ed): MXFP8 act quant, prefill glue (router top-k, gate tables), AttnRes MXFP8 output
+for f in tests/models/kimi_k3/test_mxfp8_act.py tests/models/kimi_k3/test_k31_vec_situ.py tests/models/kimi_k3/test_prefill_glue.py tests/models/kimi_k3/test_k31_prefill_attn_res_mxfp8.py; do [ -f $f ] && t $f; done
 echo "== int_tests rc=$rc"
 exit $rc

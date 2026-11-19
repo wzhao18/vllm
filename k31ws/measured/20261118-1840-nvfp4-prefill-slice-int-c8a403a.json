@@ -1,0 +1,172 @@
+{
+ "slice": "P3-16 1-node DEP4 slice (step_p.sh -q nvfp4): EP4 emulating EP16 (56 active experts/GPU split 28+28 over the dies), L24 view, L78K prefix hit, preview drafter incl. (prefill code identical on int 95f48ac5b4: 197.8/100.4 ms unprofiled)",
+ "ckpt": "nvfp4",
+ "overlay": "trial7-c8a403a-1 (wzhao/k31ws-int c8a403aa7f)",
+ "run": "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/step_p/t7-ds-pf-prof",
+ "model": "tools/stepbench/pf_model_rows_L24.json with the fused MegaMoE layer (step ach = t_ach_ms_fused)",
+ "units": "ms per step (decode) / per prefill forward (prefill) per GPU",
+ "cases": {
+  "pf16k_L78k": {
+   "step_ms": 197.362,
+   "model_ach_ms": 140.617,
+   "model_sol_ms": 100.374,
+   "ratio": 1.404,
+   "tok_s_gpu": 83015.2,
+   "families": {
+    "KDA core (conv, prepare, recurrence, gated norm)": {
+     "busy_ms": 21.114,
+     "exposed_ms": 21.114,
+     "ach_ms": 4.541,
+     "ratio": 4.65
+    },
+    "Router + latent down/up + latent norm + top-k": {
+     "busy_ms": 20.726,
+     "exposed_ms": 20.726,
+     "ach_ms": 11.992,
+     "ratio": 1.73
+    },
+    "DSA sparse MLA": {
+     "busy_ms": 12.519,
+     "exposed_ms": 12.519,
+     "ach_ms": 3.858,
+     "ratio": 3.24
+    },
+    "DSA indexer logits + exact top-k + quant/insert": {
+     "busy_ms": 15.592,
+     "exposed_ms": 15.592,
+     "ach_ms": 8.439,
+     "ratio": 1.85
+    },
+    "MegaMoE (router-comm, dispatch, fc1/act/fc2, combine)": {
+     "busy_ms": 55.656,
+     "exposed_ms": 55.656,
+     "ach_ms": 49.482,
+     "ratio": 1.12
+    },
+    "Drafter + tail": {
+     "busy_ms": 4.39,
+     "exposed_ms": 4.39,
+     "ach_ms": 1.388,
+     "ratio": 3.16
+    },
+    "comm / other": {
+     "busy_ms": 2.757,
+     "exposed_ms": 2.757,
+     "ach_ms": 0.0,
+     "ratio": null
+    },
+    "DSA projections (qkv_a, q_b/wq, w_uk, w_uv, g_proj, o_proj)": {
+     "busy_ms": 15.801,
+     "exposed_ms": 15.801,
+     "ach_ms": 14.112,
+     "ratio": 1.12
+    },
+    "KDA in/f_b/o projections": {
+     "busy_ms": 26.098,
+     "exposed_ms": 26.098,
+     "ach_ms": 24.449,
+     "ratio": 1.07
+    },
+    "Shared experts (gate_up, act, down)": {
+     "busy_ms": 10.194,
+     "exposed_ms": 10.194,
+     "ach_ms": 9.135,
+     "ratio": 1.12
+    },
+    "Dense layer + embed": {
+     "busy_ms": 7.067,
+     "exposed_ms": 7.067,
+     "ach_ms": 6.608,
+     "ratio": 1.07
+    },
+    "AttnRes": {
+     "busy_ms": 4.797,
+     "exposed_ms": 4.797,
+     "ach_ms": 6.397,
+     "ratio": 0.75
+    }
+   }
+  },
+  "pf8k_L78k": {
+   "step_ms": 99.73,
+   "model_ach_ms": 71.94,
+   "model_sol_ms": 51.778,
+   "ratio": 1.386,
+   "tok_s_gpu": 82141.7,
+   "families": {
+    "KDA core (conv, prepare, recurrence, gated norm)": {
+     "busy_ms": 11.051,
+     "exposed_ms": 11.051,
+     "ach_ms": 3.769,
+     "ratio": 2.93
+    },
+    "Router + latent down/up + latent norm + top-k": {
+     "busy_ms": 10.819,
+     "exposed_ms": 10.819,
+     "ach_ms": 5.996,
+     "ratio": 1.8
+    },
+    "DSA sparse MLA": {
+     "busy_ms": 6.26,
+     "exposed_ms": 6.26,
+     "ach_ms": 1.929,
+     "ratio": 3.24
+    },
+    "DSA indexer logits + exact top-k + quant/insert": {
+     "busy_ms": 7.57,
+     "exposed_ms": 7.57,
+     "ach_ms": 4.219,
+     "ratio": 1.79
+    },
+    "MegaMoE (router-comm, dispatch, fc1/act/fc2, combine)": {
+     "busy_ms": 26.816,
+     "exposed_ms": 26.816,
+     "ach_ms": 24.779,
+     "ratio": 1.08
+    },
+    "Drafter + tail": {
+     "busy_ms": 2.814,
+     "exposed_ms": 2.814,
+     "ach_ms": 0.778,
+     "ratio": 3.61
+    },
+    "comm / other": {
+     "busy_ms": 1.48,
+     "exposed_ms": 1.48,
+     "ach_ms": 0.0,
+     "ratio": null
+    },
+    "KDA in/f_b/o projections": {
+     "busy_ms": 13.415,
+     "exposed_ms": 13.415,
+     "ach_ms": 12.227,
+     "ratio": 1.1
+    },
+    "DSA projections (qkv_a, q_b/wq, w_uk, w_uv, g_proj, o_proj)": {
+     "busy_ms": 8.139,
+     "exposed_ms": 8.139,
+     "ach_ms": 7.061,
+     "ratio": 1.15
+    },
+    "Shared experts (gate_up, act, down)": {
+     "busy_ms": 5.517,
+     "exposed_ms": 5.517,
+     "ach_ms": 4.568,
+     "ratio": 1.21
+    },
+    "Dense layer + embed": {
+     "busy_ms": 3.651,
+     "exposed_ms": 3.651,
+     "ach_ms": 3.304,
+     "ratio": 1.1
+    },
+    "AttnRes": {
+     "busy_ms": 2.462,
+     "exposed_ms": 2.462,
+     "ach_ms": 3.199,
+     "ratio": 0.77
+    }
+   }
+  }
+ }
+}

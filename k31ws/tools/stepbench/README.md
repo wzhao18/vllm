@@ -29,6 +29,11 @@ Long runs: `setsid nohup bash .../step_d.sh ... > log 2>&1 < /dev/null &` and po
   never reaches its graph; the bench's balanced fixture is made emulation-aware too (stock paths), and its per-case
   bias reset is undone. Without it the slice touches all 224 local experts per GPU (8x the deployed expert weight
   traffic at decode).
+- **Die-split active set + EP-size records** (INFRA 2026-11-18 17:35, from D-MOE): the E/N active experts per rank are
+  split over the two die halves of the rank's local experts (local ids [0, a/2) and [L/2, L/2 + a/2)), as the deployed
+  die-local placement streams them, and decode MegaMoE selects the emulated EP size's buckets/records (megamoe_rubin
+  select_rubin_buckets knob_world_size hook; EP32 128-token record at decode). References measured before this change
+  are not comparable to runs after it.
 - **MegaMoE dispatch/combine** spans 4 GPUs of one node instead of 32 (decode) / 16 (prefill) GPUs.
 - **Drafter**: DSpark preview (`dspark-preview-L24`: aux layer ids remapped to the 24-layer target), included by
   default (`-x` excludes it). Decode: TOKENSPEED_MLA backend per the release config (also at prefill: the preview drafter is MLA with FP8 KV).
@@ -36,6 +41,15 @@ Long runs: `setsid nohup bash .../step_d.sh ... > log 2>&1 < /dev/null &` and po
   KV length 78,360 (prefix hit, 3 requests per GPU) and a fresh 16K.
 - Timing: one-shot CUDA graph per case, rank-max, median of iters x samples (`vllm bench forward`); no LM head,
   rejection or CPU step overhead.
+
+## Model rows: fused MegaMoE (INFRA 2026-11-18 17:50)
+
+perf-model prices a MegaMoE layer as one fused kernel (cost.megamoe_time: the NVLink dispatch/combine stream runs under
+the expert GEMMs). The rows carry that layer as `megamoe` (per view) and `t_{sol,ach}_ms_fused` (the additive step with
+the fused MegaMoE in place of MOE.dispatch..combine + COMM.P11/P12); gap_parse/pf_fam use them for the MegaMoE family
+and the step header. With it the per-family sum equals the model step (prefill F16K 532.8 ms; decode r24 11.71 vs 11.77
+ms, 93 layers). Regenerate: `python3 mk_model_rows.py` (L24) and `python3 mk_model_rows.py --L93`.
+Per-family tables for k31ws/measured/: `mk_measured.py <gap.json> <out.json> decode|prefill <slice> <overlay> <run>`.
 
 ## Parsing
 

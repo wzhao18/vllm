@@ -4,19 +4,19 @@
  "side": "prefill",
  "owner": "P-IDX workflow agent (resumed 17:20)",
  "state": "implementing",
- "updated": "2026-11-18T18:05-08:00",
+ "updated": "2026-11-18T20:25-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 15.32,
  "current_ms": 15.32,
  "achievable_ms": 8.44,
  "target_ms": 9.28,
  "step_ms": 218.7,
- "basis": "baseline MEASURED in-step (INFRA NVFP4 prefill baseline 17:48: idx_score 9.86 + DSA.topk 4.77 + idx quant/insert 0.70 over 6 DSA layers); current = stock until the new path is wired in-step; new-path progress is 1-GPU microbench at the deployed per-GPU shape (3 x 5461 rows at 78360 keys) per DSA layer",
- "gap_analysis": "Target 9.28 ms over 6 DSA layers = 1.55 ms/layer for score + select + quant/insert (stock in-step 2.55 ms/layer). SOL design (hardware limit at stock precision): one persistent tcgen05 score kernel (keys on M=128, 8 tokens x 32 heads on N=256, 2x-K MXF4 MMA, accumulators in exclusive TMEM, epilogue = stock packed-BF16 relu/convert + BF16x2 FMA chains, logits written once as BF16) + one bandwidth-bound exact select (one streaming read of the logits, vector-maxima histogram, hot-vector gather, exact two-digit radix over candidates). Bound resource of the score: the packed-BF16 FMA pipe in the epilogue (MEASURED probe on VR200: BF16x2 FMA issues at half the FP32 FMA instruction rate; convert co-issues on another pipe) -> 32 epilogue instructions per (token, key) at stock precision -> ~0.68 ms/layer floor; MMA + key stream measured 0.54 ms/layer and runs under it. Select floor: one read of 2.5 GB logits/layer (~0.2 ms). Projected SOL ~0.9 (score) + 0.25 (select) + 0.12 (quant/insert) = ~1.27 ms/layer = 7.6 ms vs target 9.28. MODEL NOTE: the model prices idx_score as an FP32-SIMT epilogue (1.206 ms/layer); stock math is packed BF16 whose binding pipe gives ~0.68 ms/layer, so the model over-prices the score epilogue by ~1.8x while its total (1.41 ms/layer) remains a valid target.",
+ "basis": "baseline MEASURED in-step (INFRA NVFP4 prefill baseline 17:48: idx_score 9.86 + DSA.topk 4.77 + idx quant/insert 0.70 over 6 DSA layers); current = stock until the new path is wired in-step. New-path microbench (1 GPU, P3-16 per-GPU shape 3 x 5461 rows at 78360 keys, per DSA layer): score 1.48 ms (bitwise = DeepGEMM) + best select 0.65 ms (row-group select, commit 16cf954219) = 2.13 ms vs stock 2.22 ms",
+ "gap_analysis": "Target 9.28 ms over 6 DSA layers = 1.43 ms/layer for score + select in-step (+0.12 quant/insert). Stock in-step 2.55 ms/layer. SOL design: (1) persistent tcgen05 score (keys on M=128, 8 tokens x 32 heads on N=256, 2x-K MXF4, 2 TMEM accumulator stages, stock packed-BF16 epilogue, BF16 logits written once, per-row 11-bit histogram -> row bound); (2) bandwidth-bound exact select: one streaming read of the logits marks keys above the bound bin in a position bitmap and keeps the bound bin's keys, exact low digit + lowest-position ties, bitmap written out in position order. Hardware floors per layer: score epilogue ~0.68 ms (MEASURED probe: BF16x2 FMA pipe binds; 32 instr per (token,key)), TMEM reads 0.39 ms, MMA+key stream 0.54 ms (measured), select read of 2.5 GB ~0.18 ms. MEASURED state: score 1.48 ms = ~93 executed instr per warp-tile (64 math) at ~61% issue efficiency; the TMEM read burst (all 16 warps load the stage at once, ~160 clk/tile) is not overlapped with math; every in-warp pipelining variant (half-tile x16, token-granularity x32, with setmaxnreg 104/112) spilled or ran slower (1.56-2.10 ms). Select: the row-group kernel is latency-bound (0.65 ms); the two-kernel mark+finish (exact) runs 1.30 + 0.37 ms because both keep too few bytes in flight: global loads inside loops are serialized (asm volatile + memory clobbers stop the compiler from batching them) and mark keeps only ~32 KB in flight per SM (HBM needs ~128 KB). MODEL NOTE: the model prices idx_score as an FP32-SIMT epilogue (1.206 ms/layer); stock math is packed BF16 (binding pipe ~0.68 ms/layer), so the model over-prices the score epilogue ~1.8x; its total (1.41 ms/layer) remains a valid target.",
  "inefficiencies": [
-  "MEASURED (fixed in e2): previous score epilogue spilled (STACK 64 at the 96-register cap) and only half the epilogue warps read each tile -> 2.28 ms; now every warp reads every tile, weights in registers, no spills: 1.62 ms",
-  "MEASURED: e2 score epilogue lockstep stalls: all 16 warps wait on the same accumulator stage and TMEM load latency is exposed per chunk (clock stamps: ~700 clk per tile per warp vs ~420 issue demand) -> e3 adds a two-buffer TMEM load pipeline",
-  "MEASURED: old PrefillSelect 0.96 ms/layer: one 1024-thread CTA per row, latency-bound serial phases -> replaced by persistent 4-row-group select (e3, measuring)",
+  "MEASURED: score epilogue ~61% issue efficiency: TMEM read burst per tile (128 KB, ~160 clk) not overlapped with the 64-instruction reduction; register cap 96 (18 warps) blocks double-buffering",
+  "MEASURED: select kernels keep too few bytes in flight: loop-carried global loads serialized (volatile asm), mark ~32 KB/SM in flight vs ~128 KB needed; finish walks cand / bitmap words one dependent load at a time",
+  "MEASURED: BF16 threshold ties are common (~tens of keys equal the k-th value) -> tie ordering must be cheap (now ranked in shared memory)",
   "MODEL ERROR: idx_score epilogue priced as FP32 SIMT; stock math is packed BF16 (binding pipe measured)"
  ],
  "rubin_features": [
@@ -26,29 +26,93 @@
   "PDL between score and select"
  ],
  "plan": [
-  "Score: 4-chunk two-buffer TMEM pipeline (e3), then trim per-tile overhead (uniform causal-edge test, fewer address ops); target <= 0.95 ms/layer microbench",
-  "Select: persistent 4 row groups x 256 threads per CTA, one streaming read + hot-vector gather + exact radix over candidates, exact overflow path; target <= 0.3 ms/layer",
-  "Wire into the prefill indexer (specialized_prefill entry + minimal hook in vllm/models/kimi_k3/nvidia/dsa.py: one score+select per layer over all prefill rows, keys gathered 128-aligned per request), unit test vs stock (bitwise logits, exact top-k), step A/B with step_p.sh -q nvfp4 on wzhao/k31ws-int",
-  "Then fuse index q quant + key insert (0.70 vs 0.08 ms) if still above target"
+  "Select (biggest remaining lever): PrefillMark is still ~4x above its HBM floor (0.83 vs ~0.2 ms): per 2048-vector unit it pays 4 CTA barriers + one global atomic round trip + one shared-memory slot claim per warp-vector. Next: fixed per-(row, chunk) candidate regions (count per chunk, no global atomic; finish reads all chunks' lists), one slot claim per warp per unit, persistent units with the next unit's loads issued before the current is processed (2 CTAs/SM x 256 threads at <=128 regs). PrefillFinish 0.19 ms: process 2 rows per warp-pass or more warps per CTA. Target mark ~0.2 + finish ~0.05 ms/layer.",
+  "Score: overlap the TMEM read burst with math without more registers: stagger warpgroups (odd WGs process the tile pair in the opposite stage order) or split each stage into two N=128 MMAs with separate full barriers so half the WGs start early; target <= 1.1 ms/layer",
+  "Wire in-step: hook in sparse_attn_indexer prefill branch (vllm/model_executor/layers/sparse_attn_indexer.py, minimal) -> specialized_prefill.indexer entry for non-DCP / non-PCP / MXFP4 / sm_107 pure-prefill steps: per step (cache on chunk.logits_inputs) one host read of cu_seqlen_ks/ke -> plan(); per layer: stock cp_gather_indexer_k_quant_cache per request into a 128-aligned key buffer, mqa_logits_mx_inputs, score, select into topk_indices_buffer rows; scratch from the workspace manager (logits ~2.4 GB at F16K: chunk rows if the budget requires)",
+  "Unit test tests/models/kimi_k3/test_specialized_prefill_indexer_gpu.py from bench_pidx_fused.check (bitwise logits vs DeepGEMM, exact top-k incl. ties / overflow / >131072-key rows); step A/B: step_p.sh -n P-IDX -q nvfp4 <overlay on wzhao/k31ws-int> 1"
  ],
  "work": [
-  {"t": "13:27", "what": "1-GPU stock microbench at P3-16 shape", "result": "2.222 ms/layer (DeepGEMM logits 1.558 + trtllm_gvr2 0.648 + cast 0.026)"},
-  {"t": "14:20", "what": "Fused kernel v1 first run on VR200", "result": "logits bitwise equal to DeepGEMM; exact top-k; 5.99 ms/layer (in-epilogue streaming select too slow, rejected)"},
-  {"t": "15:20", "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline", "result": "indexer logits + exact top-k + quant/insert 15.32 vs 8.44 (x1.82)"},
-  {"t": "16:59", "what": "Two-kernel path (score + PrefillSelect)", "result": "score 2.28 + select 0.96 = 3.24 ms/layer vs stock 2.22 (runs/P-IDX/two12.log)"},
-  {"t": "17:30", "what": "Probe of epilogue instruction rates on VR200 (runs/P-IDX/probe/probe1.log)", "result": "BF16x2 FMA is the binding pipe (half rate); convert + BF16x2 FMA co-issue at full issue -> stock-precision score epilogue floor ~0.68 ms/layer"},
-  {"t": "17:45", "what": "Score epilogue e2: all 16 warps per tile (2 tokens per warpgroup, warp = TMEM lane quarter), weights in registers, 16-head half loads, direct row-major stores, no smem staging/barriers", "result": "1.62 ms/layer (was 2.28), no spills (96 regs), logits bitwise equal to DeepGEMM, top-k exact 899/899 (runs/P-IDX/e2a.log)"},
-  {"t": "18:00", "what": "e3: two-buffer 4-chunk TMEM load pipeline in the epilogue + new persistent row-group exact select", "result": "running (runs/P-IDX/e3c.log)"}
+  {
+   "t": "13:27",
+   "what": "1-GPU stock microbench at P3-16 shape",
+   "result": "2.222 ms/layer (DeepGEMM logits 1.558 + trtllm_gvr2 0.648 + cast 0.026)"
+  },
+  {
+   "t": "14:20",
+   "what": "Fused kernel v1 first run on VR200",
+   "result": "logits bitwise equal to DeepGEMM; exact top-k; 5.99 ms/layer (in-epilogue streaming select too slow, rejected)"
+  },
+  {
+   "t": "15:20",
+   "what": "coordinator: re-based on the measured NVFP4 in-step slice baseline",
+   "result": "indexer logits + exact top-k + quant/insert 15.32 vs 8.44 (x1.82)"
+  },
+  {
+   "t": "16:59",
+   "what": "Two-kernel path (score + PrefillSelect)",
+   "result": "score 2.28 + select 0.96 = 3.24 ms/layer vs stock 2.22 (runs/P-IDX/two12.log)"
+  },
+  {
+   "t": "17:30",
+   "what": "Probe of epilogue instruction rates on VR200 (runs/P-IDX/probe/probe1.log)",
+   "result": "BF16x2 FMA is the binding pipe (half rate); convert + BF16x2 FMA co-issue at full issue -> stock-precision score epilogue floor ~0.68 ms/layer"
+  },
+  {
+   "t": "17:45",
+   "what": "Score epilogue e2: all 16 warps per tile (2 tokens per warpgroup, warp = TMEM lane quarter), weights in registers, 16-head half loads, direct row-major stores, no smem staging/barriers",
+   "result": "1.62 ms/layer (was 2.28), no spills (96 regs), logits bitwise equal to DeepGEMM, top-k exact 899/899 (runs/P-IDX/e2a.log)"
+  },
+  {
+   "t": "18:00",
+   "what": "e3: two-buffer 4-chunk TMEM load pipeline in the epilogue + new persistent row-group exact select",
+   "result": "running (runs/P-IDX/e3c.log)"
+  },
+  {
+   "t": "18:05",
+   "what": "Diagnostic modes on the all-warp epilogue (no math / no TMEM loads / no stores)",
+   "result": "MMA+loads 0.54, math+stores without TMEM loads 1.12, stores 0.23 ms/layer: the epilogue is instruction-bound (~137 PTX instr per warp-tile for 64 math) with ~78% issue efficiency"
+  },
+  {
+   "t": "18:30",
+   "what": "Select v3: score kernel keeps a per-row 11-bit histogram and writes each row's bound bin + count above; select streams the row once, lists hot vectors, dense pass sets a position bitmap + keeps bound-bin keys, exact low digit + lowest-position ties, written in position order (overflow / long rows: second read per 128K segment)",
+   "result": "exact on all check rows; 0.74 ms/layer (was 0.96); measured per-row phases: stream 70K clk incl. dense 33K, emit 13K"
+  },
+  {
+   "t": "18:45",
+   "what": "Score e9: explicit TMEM loads (registers tied through the wait), tile pairs over both accumulator stages, running pointers with immediate offsets, bfe histogram bins",
+   "result": "1.485 ms/layer (was 1.62-1.71), bitwise equal to DeepGEMM; score + select 2.23 ms/layer = stock parity (runs/P-IDX/e9a.log); a 4-token/8-warp variant spilled and ran 3.6 ms (rejected)"
+  },
+  {
+   "t": "19:10",
+   "what": "Score in-warp pipelining variants (half-tile x16 two-buffer, token-granularity x32, 4 tokens/thread with 8 warps, setmaxnreg 104/112 with 2 idle warps)",
+   "result": "all slower than e9 (1.56-3.56 ms: spills at the 96-register cap or fewer warps); e9 kept: 1.48 ms/layer"
+  },
+  {
+   "t": "19:30",
+   "what": "Select variants: 12-bit bins (score 1.59, select 0.65: rejected), all-ties fast emit, warp-aggregated slot claims, BF16-max prefilter",
+   "result": "row-group select 0.65-0.67 ms/layer, exact"
+  },
+  {
+   "t": "20:00",
+   "what": "Two-kernel select PrefillMark + PrefillFinish (baa429e3b1)",
+   "result": "exact on all check rows; mark 1.30 + finish 0.37 ms/layer: latency-bound (serialized global loads, ~32 KB in flight per SM) -> next: explicit load batching (runs/P-IDX/e14c.log)"
+  },
+  {
+   "t": "20:20",
+   "what": "Batched global loads in PrefillMark (8 x 16-B loads per thread per 2048-vector unit, 256 threads) and PrefillFinish (8 loads in flight per lane; v4 bitmap reads)",
+   "result": "exact; mark 0.83 + finish 0.19 ms/layer (was 1.30 + 0.37); score 1.48 -> score + select 2.50 (row-group select at 16cf954219 still best: 0.65)"
+  }
  ],
- "next": "Read runs/P-IDX/e3c.log (check exactness incl. tie / overflow / long-row cases, score + select perf); then trim score overhead and wire in-step.",
+ "next": "1) PrefillMark: fixed per-(row,chunk) candidate regions + prefetch of the next unit (plan 1). Run: on the Mac: bash k31vr-dev/k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/p-idx <tag>; on Rhea (K=/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws): cd $K && setsid nohup bash tools/wsgpu.sh -g 1 -m 20 -o <tag> -n P-IDX -- env CUTE_DSL_ARCH=sm_107a bash benchmarks/kimi_k3/run_pidx2.sh $K/runs/P-IDX/<name> --check --perf --modes 0 > $K/runs/P-IDX/<name>.log 2>&1 < /dev/null & (log: exactness JSON incl. tie/overflow/long-row cases, score ms, select mark/finish ms, REG/STACK per kernel). 2) Score TMEM-burst overlap (plan 2). 3) In-step wiring + unit test + step_p A/B (plan 3-4). Rule of thumb learned: in these CuTe DSL SIMT kernels, every global/shared load inside a loop is serialized by the volatile asm helpers -> always issue a batch of independent loads before consuming them.",
  "blockers": "",
- "branch": "wzhao/k31ws-p-idx @ 5979d7fc44 (+ uncommitted e3 work in /Users/weizha/k31ws-wt/p-idx)",
+ "branch": "wzhao/k31ws-p-idx @ 9cf352badf (pushed to wzhao18)",
  "evidence": [
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/stock1.log",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/two12.log",
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/probe/probe1.log",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/e2a.log",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/e2b.log"
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/e9a.log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/e11a.log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/e13c.log",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-IDX/e14c.log"
  ],
  "ckpt": "nvfp4"
 }

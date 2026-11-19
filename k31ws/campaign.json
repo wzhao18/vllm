@@ -10,6 +10,16 @@
    "now": "r8 19.10 / r16 24.86 / r24 29.75",
    "ach": "9.50 / 11.46 / 13.50 (2.0-2.2x)",
    "note": "int 5718ef2d89; preview drafter tail ~4 ms at r24 is an artifact"
+  },
+  "Decode r24 NVFP4 slice (ms/step)": {
+   "now": "10.01 (int 95f48ac5b4)",
+   "ach": "3.34 (fused MegaMoE model row)",
+   "note": "baseline 10.89; r8 6.19 vs 2.40"
+  },
+  "Prefill DEP16 NVFP4 slice (ms, F16K)": {
+   "now": "197.8 (int 95f48ac5b4)",
+   "ach": "140.6 (fused MegaMoE model row)",
+   "note": "baseline 218.7"
   }
  },
  "findings": [
@@ -276,6 +286,22 @@
   {
    "t": "11-18 18:05",
    "text": "8-node D3-32 run on a new overlay died at startup: CUDA symmetric-memory rendezvous timed out (1800 s) while 32 ranks cold-compiled CuTe kernels. Fix: pre-warm the overlay compile caches on 1 node before every multi-node run."
+  },
+  {
+   "t": "11-18 18:40",
+   "text": "INT 95f48ac5b4 (+D-MOE, P-MOE, D-FUSE): NVFP4 slices decode r8/r16/r24 6.19/8.23/10.01 ms (baseline 6.67/8.91/10.89), prefill F16K 197.8 ms (baseline 218.7). Model achievable now uses a fused MegaMoE row: decode 2.40/2.86/3.34, prefill 140.6. Graph-vs-eager rms on the NVFP4 slice rose to 6.4e-2 after D-FUSE: D-FUSE must prove it benign."
+  },
+  {
+   "t": "11-18 19:05",
+   "text": "D-FUSE: its own kernels are at the measured floor (boundary pair ~1.07x); the rest of its family gap sits in neighbours (KDA o_proj act_quant, latent RMSNorm in MegaMoE reduce, o-proj epilogue push)."
+  },
+  {
+   "t": "11-18 20:20",
+   "text": "P-IDX: batching 8 independent global loads before use cut the exact-select kernels 1.6x (mark 1.30 -> 0.83, finish 0.37 -> 0.19 ms/layer)."
+  },
+  {
+   "t": "11-18",
+   "text": "D-KDA: the decode slice may run KDA with no pending deferred commit (no fold, no state write), unlike production; INFRA checking measurement scope."
   }
  ]
 }

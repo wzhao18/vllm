@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-ATTN workflow agent",
  "state": "landed-ready",
- "updated": "2026-11-18T22:30-08:00",
+ "updated": "2026-11-19T00:15-08:00",
  "shape": "D3-32 r24 1-node DP-rank slice, NVFP4 ckpt (k31-nvfp4-view-L24: 6 DSA layers), 384 verify rows/rank, u132k, k=3; family = DSA q path + sparse MLA + DCP value + prologue + indexer logits, in-step exposed",
  "baseline_ms": 0.909,
  "current_ms": 0.621,
@@ -29,9 +29,9 @@
  ],
  "plan": [
   "DONE LocalQuery: NVFP4 in-step -0.49 ms/step at r24 (landed-ready wzhao/k31ws-d-attn @ 72fdf53350)",
-  "DONE native sparse MLA v1 (V-split pair) as measured reference (dfb3f4f7c1): correct, 49.5 us R384",
-  "Native sparse MLA v2 keys-on-M (in progress): 1 CTA/SM persistent over rows, index ring, 3 x 72 KB gather4 stages, S^T double-buffered (2 x 96 cols) + O^T 384 cols in exclusive TMEM, exact running max per head (E4M3 P at 448 x 2^(x - m) as trtllm-gen), O^T rescale on growth; target <= 11 us at R384",
-  "Wire v2 into SpDsaCore (SP_KERNELS per-shape), unit test vs trtllm-gen, in-step A/B",
+  "DONE sparse MLA v1 (V-split pair, reference) and v2 keys-on-M (5280297039): 38.1 us at R384 vs trtllm-gen 40.7",
+  "Sparse MLA v2 -> SOL (<= ~11 us at R384): (1) O^T rescale off the softmax critical path (correction warps or rescale only the grown heads' columns), (2) gather issue: more gather warps / fewer TMA per row, 4 stages (trim the index ring / Q stage), (3) row-split work units for balance (rows/CTA 1-2 at R384), (4) per-tile softmax <= 0.5 us",
+  "Wire v2 into SpDsaCore per shape (SP_KERNELS) where it beats trtllm-gen; unit test vs trtllm-gen; NVFP4 in-step A/B",
   "Joint 4-row indexer logits kernel (M128 = 4 rows x 32 heads), keys once per request",
   "DcpValue: W_UV + push fused"
  ],
@@ -90,11 +90,16 @@
    "t": "22:30",
    "what": "keys-on-M sparse MLA (dsa/sparse_mla_km.py): S^T = K Q^T (N = 96 real heads), O^T 4 x 96 TMEM cols, index ring, merged Q/index loader, gather4 loader warps; 8 microbench rounds with phase stamps",
    "result": "correct first run (same FP32-reference error as trtllm-gen, 1 BF16 ulp apart); best 49.7 us at R384 (trtllm-gen 41). Bounds found: per-warp gather4 issue ~30-35 ns/instr (1 warp 4 us/tile, 4 warps 1.5 us), register cap = 65536/threads rounded to 128 threads, ptxas ignores setmaxnreg regions (1168 B spills), per-head row-sum rmem tensor lowered to local memory -> softmax 1.5-4 us/tile. In flight: register-carried row sums + skipped redundant alpha ex2 (km8)"
+  },
+  {
+   "t": "00:10",
+   "what": "keys-on-M sparse MLA: lean softmax (combining warp per 32-head group, 448 folded into the exponent bias), register-carried row sums, warpgroup-aligned roles + setmaxnreg in-branch (6 gather warps, softmax 128 regs)",
+   "result": "R384 38.1 us vs trtllm-gen 40.7 (R128 21.6 vs 26.1), accuracy equal; tile ~2 us = rescale 0.8 + gather 1.7 (overlapped) + softmax 0.9 (runs/D-ATTN/sp/km10.json)"
   }
  ],
- "next": "km8 result (runs/D-ATTN/sp/km8a, km8b): softmax per tile (stamps t1_*) must drop below the gather time; then raise gather issue (loaders 6-8 within the 96/128-reg budget), then wire.",
+ "next": "HANDOFF (context limit). Kernel: vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/sparse_mla_km.py (class SparseMlaDecodeKM; host fn sparse_mla_decode_km(query [R,Hq,576] fp8, kv_rows [N,576], slots [R,W] int32, valid [R], latent [R,Hq,512] bf16, lse [R,Hq] fp32, scale=bmm1, out_scale=bmm2)). Microbench loop (1 GPU, ~5 min): bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-attn <tag>; on rhea: setsid nohup bash $K/ov/<tag>/benchmarks/kimi_k3/dattn_sp.sh <tag> <name> --rows 128,384 --stamps > /dev/null 2>&1 < /dev/null & (result runs/D-ATTN/sp/<name>.{log,json}: native/trtllm us, regs_local, error vs FP32 ref, r0_* phase stamps: S_t = softmax start of tile t, p_t = P ready, kv_t = KV tile arrival, t1_* = softmax sub-phases of tile 1). dattn_sass.sh <tag> <name> dumps PTX + ptxas -v spills. Next steps in order: rescale off the critical path, gather issue rate, then wire (SpDsaCore SP_KERNELS / attn_fi.FlashInferCore.decode shape: query is the 128-head q mailbox, slots/valid from FlashInferCore.convert) + unit test + in-step A/B via step_d.sh -q nvfp4 on an overlay built from wzhao/k31ws-int + this branch.",
  "blockers": "",
- "branch": "wzhao/k31ws-d-attn @ dfb3f4f7c1 (landed-ready piece: LocalQuery 72fdf53350)",
+ "branch": "wzhao/k31ws-d-attn @ 5280297039 (landed-ready piece: LocalQuery 72fdf53350; sparse MLA kernels not wired)",
  "evidence": [
   "k31ws/measured/20261118-1900-nvfp4-decode.json",
   "rhea:.../runs/D-ATTN/step_d/dattn-nv-8befd4a-r8r16r24-prof",

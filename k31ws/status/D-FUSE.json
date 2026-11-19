@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-FUSE workflow agent",
  "state": "landed-ready",
- "updated": "2026-11-18T18:25-08:00",
+ "updated": "2026-11-18T19:10-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3, target only (-x); ms per decode step",
  "baseline_ms": 0.98,
  "current_ms": 0.65,
@@ -12,7 +12,7 @@
  "target_ms": 0.411,
  "step_ms": 6.265,
  "basis": "MEASURED in-step NVFP4 (step_d -q nvfp4 -x, profiled, rhea runs/D-FUSE/step_d/nvB-mx11): family = ATTNRES (fused AttnRes+AG/RS kernels) + SP comm + OTHER (act_quant) + latent RMSNorm + router top-k exposed; achievable = nvfp4_modelopt rows at the same slice (AG 164 + RS 171 + AttnRes 39 us); baseline 0.98 = INFRA NVFP4 decode baseline 18:52 (small 0.47 + SP comm 0.51)",
- "gap_analysis": "Measured r24 in-step chain (trial4, one KDA+MoE layer = 217 us): the D-FUSE family on the critical path is SpAttnResGather 9.6 us + act_quant(kda_in) 4.0 + act_quant(o_proj) 2.8 + SpReduceAttnRes (ends 10.6 us after the o-proj) + latent rms_norm 2.6 (+ router top-k 4.4, D-MOE); the shared expert's act_quant 2.8 + SiTU-quant 7.1 run on the side stream inside the MegaMoE window (D-MOE measured that overlap costs MegaMoE ~30 us/layer of contention). SOL design for the family: (1) no standalone quantization: every MXFP8 operand is written by its producer (kda_in input by the AG kernel, shared_gu by the RS kernel [done, b435317d85]; o_proj input by KdaWS's o_norm epilogue [D-KDA]; shared down by the SiTU epilogue [D-GEMM]); (2) one fused kernel per layer boundary (done) at the collective floor: AG = multicast of the shard (MXFP8 halves it on KDA layers) + one latency, RS = 4.1 MB unicast push + one latency (NVLS in-switch reduce rejected: same egress bytes plus a flag round); (3) latent RMSNorm into the MegaMoE reduce (D-MOE E2), top-k into the MegaMoE front (D-MOE). Projected family at r24 with (1)-(3): ~0.40-0.45 ms vs achievable 0.37.",
+ "gap_analysis": "r24 in-step (nvB-mx11, NVFP4 slice, target only): family exposed 650 us = fused SP boundary kernels 384 + SP comm 15 (model AG+RS+AttnRes 374: 1.07x) + act_quant 136 (18 KDA o_proj inputs on the critical path ~45; 23 SiTU+quant on the side stream) + latent RMSNorm 56 + router top-k 54 (exposure accounting; not critical: the aux-stream latent_down GEMM bounds MegaMoE's start). Measured floors of the D-FUSE-owned part: RS push at our SM push rate (16-B/32-B/bulk forms equal), AG latency-bound (MXFP8 half bytes no faster in the fused kernel), fused AttnRes adds 0.2-1.2 us over the bare collectives. SOL design for the rest (producer-side fusion, not D-FUSE kernels): (1) KDA o_proj MXFP8 input from the KDA core's o_norm epilogue (D-KDA, helper common/mx_rows.store); (2) o-projection GEMM epilogue pushing rows to the SP owners (D-GEMM stream_gemm) -> SpReduceAttnRes push=False: hides ~5 us/layer of serial push; (3) latent RMSNorm in the MegaMoE reduce (D-MOE); (4) SiTU+MXFP8 quant in the shared gate_up epilogue (D-GEMM). With (1)-(3) the family projects to ~0.40-0.45 ms vs achievable 0.374.",
  "inefficiencies": [
   "KDA o_proj input act_quant (2.5 us x 18 layers, critical path): belongs in KdaWS's o_norm epilogue (D-KDA; helper common/mx_rows.store ready)",
   "Shared expert SiTU + MXFP8 quant (act_quant<1> 5.5 us x 23, side stream inside the MegaMoE window): into the shared gate_up GEMM epilogue (D-GEMM stream_gemm)",
@@ -110,18 +110,31 @@
    "t": "18:00",
    "what": "chain microbench (TP4, 93 layers) comm / fused / fused_mx",
    "result": "per layer R16 6.52 / 8.12 / 8.88 us, R128 9.33 / 10.53 / 10.77, R384 16.00 / 16.43 / 16.61: the MXFP8 all-gather (half the bytes) is not faster: the boundary is latency-bound, the MX win is the removed act_quant kernel (runs/D-FUSE/chain12.log)"
+  },
+  {
+   "t": "18:40",
+   "what": "INFRA: merged wzhao/k31ws-d-fuse 6942f8c901 into wzhao/k31ws-int (95f48ac5b4, pushed)",
+   "result": "int_tests4 all pass (sp_coverage 52, sp_fused 2, sp_layers DSA 4); NVFP4 decode slice 6381/8438/10302 -> 6190/8232/10011 us (r8/r16/r24, die-split emulation); prefill unchanged 197.8/100.4 ms. Note: graph-vs-eager rel rms 0 -> 6.4e-2 on the NVFP4 view (MXFP4 view 2e-4); documented as not a correctness signal with dummy weights, but please confirm it is rounding-order amplification (e.g. one layer bitwise check vs the int graph on NVFP4)"
+  },
+  {
+   "t": "18:50",
+   "what": "RS push probe (bench_kimi_k3_sdec_sp_push.py): 16-B stores vs 32-B v8 vs 2-KiB cp.async.bulk; AG multicast 8-B vs 16-B vs half payload",
+   "result": "push R384 7.77 / 7.90 / 7.72 us (no gain: not op-bound, ~0.93 TB/s per GPU = our SM push rate); multicast 8-B vs 16-B equal; half payload faster standalone but the fused MXFP8 AG was not (boundary latency-bound). RS alone (chain) R16/128/384 3.52/4.75/8.33 us, AG 3.05/4.19/7.36 (runs/D-FUSE/push14-16.log, chain13.log)"
   }
  ],
- "next": "INFRA: merge wzhao/k31ws-d-fuse @ 6942f8c901 (supersedes 07d32c2d24). D-FUSE: RS push via bulk copies (link-rate push) microbench; coordinate the producer-side quant / norm / top-k fusions with D-KDA / D-MOE / D-GEMM; release drafter config needed for the drafter tail.",
- "blockers": "Drafter tail: the release GQA DSpark drafter config (Inferact/Kimi-K3.1-Pro-DSpark e4e6e626 config.json) is not on Rhea (Hecate only; needs the user). Remaining small ops sit in other workstreams' kernels (KdaWS, MegaMoE reduce/front, shared gate_up GEMM).",
- "branch": "wzhao/k31ws-d-fuse @ 6942f8c901 (merged wzhao/k31ws-int 9d3cb2b0c2)",
+ "next": "INFRA: merge wzhao/k31ws-d-fuse @ c85d9f8c59 (or 6942f8c901 without the probes). Owners: D-KDA (1), D-GEMM (2)+(4), D-MOE (3) per findings/D-FUSE.md 17:50/18:40. D-FUSE next session: (a) when D-GEMM's o-proj epilogue push exists, build SpBoundary with push_rows[R]=False for those R (SpReduceAttnRes push=False) and A/B with step_d -q nvfp4 -x; (b) when the release drafter config is on Rhea: copy tools/step_d.sh to runs/D-FUSE/step_d_rel.sh with DRAFT=<release L24 view>, profile TAIL, fuse the GQA drafter tail; (c) re-run the A/B on the merged int (step_d.sh -n D-FUSE -q nvfp4 -x <overlay> 128,256,384 1).",
+ "blockers": "Release GQA drafter config (Inferact/Kimi-K3.1-Pro-DSpark e4e6e626 config.json) is not on Rhea (Hecate only, needs the user): blocks the drafter-tail item. The remaining small ops are in D-KDA / D-GEMM / D-MOE kernels (requests in findings).",
+ "branch": "wzhao/k31ws-d-fuse @ c85d9f8c59 (merged wzhao/k31ws-int 9d3cb2b0c2; landing content = 6942f8c901 + benchmark probes)",
  "evidence": [
   "rhea runs/D-FUSE/run5/chain.json (TP4 chain bench)",
   "rhea runs/D-FUSE/step_d/{base-x,fused5x}-r128_384 (BF16/MXFP4 A/B)",
   "rhea runs/D-FUSE/step_d/nv-{int,fused8}-r128_384 (NVFP4 A/B)",
   "rhea runs/D-FUSE/test14.full (unit test)",
   "rhea runs/D-FUSE/fg2.log (final gather microbench)",
-  "perf-model/microbench/rhea1n/model_rows.json (B96_L135K)"
+  "perf-model/microbench/rhea1n/model_rows.json (B96_L135K)",
+  "rhea runs/D-FUSE/step_d/{nvA-bd341,nvB-mx11} (NVFP4 A/B)",
+  "rhea runs/D-FUSE/t10.log, t11.log (tests)",
+  "rhea runs/D-FUSE/chain12.log, chain13.log, push14.log, push15.log, push16.log (microbench)"
  ],
  "ckpt": "nvfp4"
 }
