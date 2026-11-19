@@ -95,7 +95,7 @@ def main():
         eq = torch.equal(a, b)
         diff = (a - b).abs()
         rel = (diff.pow(2).mean().sqrt() / b.pow(2).mean().sqrt().clamp_min(1e-30)).item()
-        bad = torch.nonzero(diff.view(-1) > 0)
+        bad = torch.nonzero(diff.reshape(-1) > 0)
         first = bad[0].item() if bad.numel() else -1
         print(f"check {name}: bitwise {eq} rel-rms {rel:.3e} max {diff.max().item():.3e} "
               f"mismatches {bad.numel()} first {first} nan {torch.isnan(a).any().item()}", flush=True)
