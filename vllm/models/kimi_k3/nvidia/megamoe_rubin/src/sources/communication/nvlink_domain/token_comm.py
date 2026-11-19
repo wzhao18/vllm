@@ -195,6 +195,10 @@ class _MetadataPushRouter(KernelComponent):
         )
         # A source sends at most max_tokens_per_rank * topk routes to one destination: the landing row capacity.
         self.landing_capacity_per_source = self.max_tokens_per_rank * self.topk
+        # E4a (vLLM-local): at decode a destination reads only its own experts' columns of the size, total and
+        # source-prefix rows, so a source sends each peer just that slice (experts_per_rank x 4 B per row instead of
+        # the full expert_count_padded row: 32x fewer bytes at EP32). Needs 16 B aligned slices for the bulk copies.
+        self.slim_size_rows = self.decode_landing and self.experts_per_rank % 4 == 0
         if self.decode_landing:
             # One CTA: histogram, publish sizes + prefixes + landing metadata behind sizes_ready, exit.
             self.router_push_cta_count = 0
@@ -275,7 +279,10 @@ class _MetadataPushRouter(KernelComponent):
         workspace.register_mbarrier(self.router_helper_load_mbarrier_region, 1)
         overlay = workspace.create_overlay("nvlink.token_comm.router_smem.role")
         data_lifetime = overlay.add_lifetime("data_cta")
-        data_lifetime.register_tensor(self.router_data_histogram_region, cutlass.Int32, (self.expert_count_with_trash,))
+        # 16 B aligned: it is the source of the size-row bulk copies (E4a slices start at a 16 B column offset).
+        data_lifetime.register_tensor(
+            self.router_data_histogram_region, cutlass.Int32, (self.expert_count_with_trash,), byte_alignment=16
+        )
         data_lifetime.register_tensor(
             self.router_data_prefix_region, cutlass.Int32, (self.expert_count_with_trash,), byte_alignment=16
         )
@@ -650,23 +657,28 @@ class _MetadataPushRouter(KernelComponent):
         """
         cute.arch.fence_proxy(kind="async.shared", space="cta")
         cute.arch.sync_threads()
-        row_bytes = Int32(self.expert_count_padded * 4)
+        row_elements = self.experts_per_rank if cutlass.const_expr(self.slim_size_rows) else self.expert_count_padded
+        row_bytes = Int32(row_elements * 4)
         matrix_address = self._device_workspace.ptr(self.src_prefix_by_rank_region).toint()
         rank_round_count = ceil_div(self.world_size, self.router_warps_per_cta)
         for rank_round in cutlass.range_constexpr(rank_round_count):
             destination_rank = self._router_warp_idx + Int32(rank_round * self.router_warps_per_cta)
             if destination_rank < Int32(self.world_size):
                 peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
+                # E4a: only the destination's own expert columns (slice begin 0 for the full row).
+                column_begin = Int32(0)
+                if cutlass.const_expr(self.slim_size_rows):
+                    column_begin = destination_rank * Int32(self.experts_per_rank)
                 destination_row_address = (
                     matrix_address
                     + peer_offset
-                    + Int64(Int32(self._router_local_rank) * Int32(self.expert_count_padded)) * Int64(4)
+                    + Int64(Int32(self._router_local_rank) * Int32(self.expert_count_padded) + column_begin) * Int64(4)
                 )
                 destination_row = cute.make_ptr(
                     cutlass.Int32, destination_row_address, AddressSpace.gmem, assumed_align=16
                 )
                 with cute.arch.elect_one():
-                    cp_async_bulk_s2g(destination_row, source_prefix.iterator, row_bytes)
+                    cp_async_bulk_s2g(destination_row, source_prefix.iterator + column_begin, row_bytes)
                     cute.arch.cp_async_bulk_commit_group()
 
     @cute.jit
@@ -925,7 +937,8 @@ class _MetadataPushRouter(KernelComponent):
         cute.arch.fence_proxy(kind="async.shared", space="cta")
         cute.arch.sync_threads()
         block_thread_count = self.router_warps_per_cta * 32
-        row_bytes = Int32(self.expert_count_padded * 4)
+        row_elements = self.experts_per_rank if cutlass.const_expr(self.slim_size_rows) else self.expert_count_padded
+        row_bytes = Int32(row_elements * 4)
         matrix_address = self._device_workspace.ptr(self.sizes_by_rank_region).toint()
         total_address = self._device_workspace.ptr(self.sizes_region).toint()
         rank_round_count = ceil_div(self.world_size, self.router_warps_per_cta)
@@ -933,20 +946,29 @@ class _MetadataPushRouter(KernelComponent):
             destination_rank = self._router_warp_idx + Int32(rank_round * self.router_warps_per_cta)
             if destination_rank < Int32(self.world_size):
                 peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
+                # E4a: only the destination's own expert columns of the size row and of the totals.
+                column_begin = Int32(0)
+                if cutlass.const_expr(self.slim_size_rows):
+                    column_begin = destination_rank * Int32(self.experts_per_rank)
                 destination_row_address = (
                     matrix_address
                     + peer_offset
-                    + Int64(Int32(self._router_local_rank) * Int32(self.expert_count_padded)) * Int64(4)
+                    + Int64(Int32(self._router_local_rank) * Int32(self.expert_count_padded) + column_begin) * Int64(4)
                 )
                 destination_row = cute.make_ptr(
                     cutlass.Int32, destination_row_address, AddressSpace.gmem, assumed_align=16
                 )
                 destination_total = cute.make_ptr(
-                    cutlass.Int32, total_address + peer_offset, AddressSpace.gmem, assumed_align=16
+                    cutlass.Int32,
+                    total_address + peer_offset + Int64(column_begin) * Int64(4),
+                    AddressSpace.gmem,
+                    assumed_align=16,
                 )
                 with cute.arch.elect_one():
-                    cp_async_bulk_s2g(destination_row, smem_expert_counts.iterator, row_bytes)
-                    cp_reduce_async_bulk_add_u32_s2g(destination_total, smem_expert_counts.iterator, row_bytes)
+                    cp_async_bulk_s2g(destination_row, smem_expert_counts.iterator + column_begin, row_bytes)
+                    cp_reduce_async_bulk_add_u32_s2g(
+                        destination_total, smem_expert_counts.iterator + column_begin, row_bytes
+                    )
                     cute.arch.cp_async_bulk_commit_group()
 
         def finalize() -> None:

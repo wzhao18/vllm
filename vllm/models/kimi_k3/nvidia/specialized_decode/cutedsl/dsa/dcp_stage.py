@@ -53,9 +53,11 @@ def compile_dcp_value(
     lse_base_e,
     partials,
     cap=64,
+    rearm=True,
 ):
     """DcpValue of one batch (DSA layout over the ``q_heads``-padded mailbox of
-    ``cap`` rows; ``partials``: the DcpBox's)."""
+    ``cap`` rows; ``partials``: the DcpBox's; ``rearm`` False: the q mailbox was
+    not published, local_query)."""
     return compile_value(
         heads,
         dcp,
@@ -71,6 +73,7 @@ def compile_dcp_value(
         lse_base_e=lse_base_e,
         partials=partials,
         preprojected=partials == PROJECTED,
+        rearm=rearm,
     )
 
 
