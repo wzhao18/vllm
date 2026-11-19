@@ -143,6 +143,56 @@ MB_BRAW = 66
 MB_GRAM = 71
 
 
+@dsl_user_op
+def _silu_fma(x, *, loc=None, ip=None):
+    """SiLU x * sigmoid(x) on the FMA/ALU pipes only (the prep's MUFU is
+    saturated): 2^t by rounding split + degree-6 polynomial on [-1/2, 1/2]
+    (rel. err ~1e-7), 1 / (1 + e) by a bit-trick seed + 3 Newton steps;
+    within FP32 rounding of ex2/rcp, far below the BF16 output rounding."""
+    xv = cutlass.Float32(x).ir_value(loc=loc, ip=ip)
+    y = llvm.inline_asm(
+        T.f32(),
+        [xv],
+        "{\n"
+        ".reg .f32 t, n, f, p, s, d, r, e;\n"
+        ".reg .b32 ni, ri;\n"
+        "mul.f32 t, $1, 0fBFB8AA3B;\n"
+        "max.f32 t, t, 0fC2FC0000;\n"
+        "min.f32 t, t, 0f42FC0000;\n"
+        "add.rn.f32 n, t, 0f4B400000;\n"
+        "mov.b32 ni, n;\n"
+        "sub.rn.f32 n, n, 0f4B400000;\n"
+        "sub.rn.f32 f, t, n;\n"
+        "fma.rn.f32 p, f, 0f39218489, 0f3AAEC3FF;\n"
+        "fma.rn.f32 p, p, f, 0f3C1D955B;\n"
+        "fma.rn.f32 p, p, f, 0f3D635847;\n"
+        "fma.rn.f32 p, p, f, 0f3E75FDF0;\n"
+        "fma.rn.f32 p, p, f, 0f3F317218;\n"
+        "fma.rn.f32 p, p, f, 0f3F800000;\n"
+        "sub.s32 ni, ni, 0x4B400000;\n"
+        "add.s32 ni, ni, 127;\n"
+        "shl.b32 ni, ni, 23;\n"
+        "mov.b32 s, ni;\n"
+        "fma.rn.f32 d, p, s, 0f3F800000;\n"
+        "mov.b32 ri, d;\n"
+        "sub.s32 ri, 0x7EF311C3, ri;\n"
+        "mov.b32 r, ri;\n"
+        "fma.rn.f32 e, d, r, 0fBF800000;\n"
+        "fma.rn.f32 r, r, e, r;\n".replace("fma.rn.f32 r, r, e, r", "neg.f32 e, e;\nfma.rn.f32 r, r, e, r")
+        + "fma.rn.f32 e, d, r, 0fBF800000;\nneg.f32 e, e;\nfma.rn.f32 r, r, e, r;\n"
+        + "fma.rn.f32 e, d, r, 0fBF800000;\nneg.f32 e, e;\nfma.rn.f32 r, r, e, r;\n"
+        + "mul.rn.f32 $0, $1, r;\n"
+        "}",
+        "=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(y)
+
+
 def _flat2(t):
     """A (1, 1, 2) global tile as a rank-1 (2,) tensor."""
     return cute.make_tensor(t.iterator, cute.make_layout((2,)))
@@ -2132,10 +2182,8 @@ def _pkd(
                             fz_ca1 = fz_cwin[2, 1] * fz_cw[2, 1] + fz_ca1
                             fz_ca0 = fz_cx0 * fz_cw[3, 0] + fz_ca0
                             fz_ca1 = fz_cx1 * fz_cw[3, 1] + fz_ca1
-                            fz_cd0 = _exp2f(fz_ca0 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
-                            fz_cd1 = _exp2f(fz_ca1 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
-                            fz_c2[0] = cutlass.BFloat16(fz_ca0 * cute.math.rcp(fz_cd0, approx=True, ftz=True))
-                            fz_c2[1] = cutlass.BFloat16(fz_ca1 * cute.math.rcp(fz_cd1, approx=True, ftz=True))
+                            fz_c2[0] = cutlass.BFloat16(_silu_fma(fz_ca0))
+                            fz_c2[1] = cutlass.BFloat16(_silu_fma(fz_ca1))
                             if fz_cpl == 0:
                                 cute.autovec_copy(
                                     fz_c2, v_ki2[(fz_crr, None, fz_cpi, fz_cs8, fz_cbk, inst)]
