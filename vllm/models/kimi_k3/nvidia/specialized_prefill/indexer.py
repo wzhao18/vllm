@@ -279,7 +279,7 @@ def order16(bits: Uint32) -> Uint32:
 
 PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
 PUBLISH_STAGGER = 7  # PUBLISH, odd warpgroups read the accumulator stages in reverse
-SLOTS = 64  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
+SLOTS = 96  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
 REGION = (SLOTS + 1) * TILE  # words per row: lane counts, then SLOTS words per lane
 CAP = SLOTS * TILE
 
@@ -292,6 +292,28 @@ def ge_bf16x2(r, thr):
         "selp.u32 a, 1, 0, p; selp.u32 b, 2, 0, q; or.b32 $0, a, b; }"
     )
     return code, "=r,r,r", (Uint32(r), Uint32(thr))
+
+
+def _publish_code(half: str, sel: str) -> str:
+    return (
+        "{ .reg .pred a, b, c; .reg .b32 v; setp.ge.bf16x2 a|b, $2, $3; "
+        f"setp.lt.and.u64 c, $1, $5, {half}; prmt.b32 v, $2, $4, {sel}; "
+        "mov.b64 $0, $1; @c st.global.b32 [$1], v; @c add.u64 $0, $1, 512; }"
+    )
+
+
+@asm(Int64)
+def publish_lo(ptr, r, thr, tw, lim):
+    """Low BF16 of r >= low of thr (and ptr < lim): store (tw | low) at ptr and
+    advance it one 128-word slot."""
+    return _publish_code("a", "0x7610"), "=l,l,r,r,r,l,~{memory}", (
+        Int64(ptr), Uint32(r), Uint32(thr), Uint32(tw), Int64(lim))
+
+
+@asm(Int64)
+def publish_hi(ptr, r, thr, tw, lim):
+    return _publish_code("b", "0x7632"), "=l,l,r,r,r,l,~{memory}", (
+        Int64(ptr), Uint32(r), Uint32(thr), Uint32(tw), Int64(lim))
 
 
 @cute.jit
@@ -771,8 +793,10 @@ class IndexerScore:
                 # the count, then one word per kept key (tile << 16 | BF16)
                 cand0 = out_a + row_base[row0] * 2 + lt * 4
                 cand1 = out_a + row_base[row1] * 2 + lt * 4
-                c0 = Uint32(0)
-                c1 = Uint32(0)
+                p0 = cand0 + TILE * 4
+                p1 = cand1 + TILE * 4
+                lim0 = cand0 + REGION * 4
+                lim1 = cand1 + REGION * 4
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
             # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
@@ -814,16 +838,9 @@ class IndexerScore:
                                 r = r | Uint32(0xFFFF)
                             if kidx >= end1 or t >= ntiles:
                                 r = r | Uint32(0xFFFF0000)
-                        m = ge_bf16x2(r, thr)
                         tw = Uint32(t) << Uint32(16)
-                        if (m & Uint32(1)) != Uint32(0):
-                            if c0 < Uint32(SLOTS):
-                                st_global_u32(cand0 + Int64(c0 + 1) * (TILE * 4), tw | (r & Uint32(0xFFFF)))
-                            c0 += Uint32(1)
-                        if (m & Uint32(2)) != Uint32(0):
-                            if c1 < Uint32(SLOTS):
-                                st_global_u32(cand1 + Int64(c1 + 1) * (TILE * 4), tw | (r >> Uint32(16)))
-                            c1 += Uint32(1)
+                        p0 = publish_lo(p0, r, thr, tw, lim0)
+                        p1 = publish_hi(p1, r, thr, tw, lim1)
                     elif t_hi >= full_tiles:
                         # causal edge (and the repeated tile of an odd count)
                         kidx = t * TILE + key_in_tile
@@ -847,8 +864,9 @@ class IndexerScore:
                 ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # this thread's candidate counts of both rows
-                st_global_u32(cand0, c0)
-                st_global_u32(cand1, c1)
+                # (a full column counts as overflowed: the row is recomputed)
+                st_global_u32(cand0, Uint32((p0 - cand0) // (TILE * 4) - 1))
+                st_global_u32(cand1, Uint32((p1 - cand1) // (TILE * 4) - 1))
             else:
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
@@ -1489,19 +1507,11 @@ class CandSelect:
         )
 
     @cute.jit
-    def entry(self, cand, base, cnt_a, idx):
-        """(valid, key index, order16 key) of candidate idx = slot * TILE + lane."""
-        j = idx % TILE
-        s = idx // TILE
-        ok = Int32(0)
-        pos = Int32(0)
-        key = Uint32(0)
-        if Uint32(s) < ld_shared_u32(cnt_a + j * 4):
-            wd = Uint32(cand[base + (s + 1) * TILE + j])
-            ok = Int32(1)
-            pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
-            key = order16(wd & Uint32(0xFFFF))
-        return ok, pos, key
+    def entry(self, cand, base, j, s):
+        """(key index, order16 key) of lane j's candidate s."""
+        wd = Uint32(cand[base + (s + 1) * TILE + j])
+        pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
+        return pos, order16(wd & Uint32(0xFFFF))
 
     @cute.kernel
     def kernel(self, cand, row_len, row_bin, out):
@@ -1529,13 +1539,16 @@ class CandSelect:
         cute.arch.sync_threads()
         if tid < TILE:
             c = Uint32(cand[base + tid])
-            if c > Uint32(SLOTS):
+            if c >= Uint32(SLOTS):
                 st_shared_u32(info_a + 24, Uint32(1))
                 c = Uint32(SLOTS)
             st_shared_u32(cnt_a + tid * 4, c)
             red_shared(info_a + 20, c)
         cute.arch.sync_threads()
         total = Int32(ld_shared_u32(info_a + 20))
+        j = tid % TILE
+        half = tid // TILE
+        cj = Int32(ld_shared_u32(cnt_a + j * 4))
         bad = Int32(ld_shared_u32(info_a + 24))
         if total < kk:
             bad = Int32(1)
@@ -1543,17 +1556,17 @@ class CandSelect:
             row_bin[3 * row + 1] = bad
         if bad == 0:
             if total <= Int32(K):
-                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
-                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
-                    if ok != 0:
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cand, base, j, s)
+                    if True:
                         slot = atom_add_shared(info_a + 12, Uint32(1))
                         out[orow + Int32(slot)] = pos
                 for i in cutlass.range(total + tid, K, CS_THREADS, unroll=1):
                     out[orow + i] = Int32(-1)
             else:
-                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
-                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
-                    if ok != 0:
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cand, base, j, s)
+                    if True:
                         red_shared(hist_a + ((key >> Uint32(8)) << Uint32(2)), 1)
                 cute.arch.sync_threads()
                 if w == 0:
@@ -1564,9 +1577,9 @@ class CandSelect:
                 cute.arch.sync_threads()
                 st_shared_u32(hist_a + tid * 4, Uint32(0))
                 cute.arch.sync_threads()
-                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
-                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
-                    if ok != 0:
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cand, base, j, s)
+                    if True:
                         if (key >> Uint32(8)) == b1:
                             red_shared(hist_a + ((key & Uint32(0xFF)) << Uint32(2)), 1)
                 cute.arch.sync_threads()
@@ -1577,9 +1590,9 @@ class CandSelect:
                 above = above1 + ld_shared_u32(info_a + 4)
                 m = ld_shared_u32(info_a + 8)
                 need = Uint32(K) - above
-                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
-                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
-                    if ok != 0:
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cand, base, j, s)
+                    if True:
                         if key > t:
                             slot = atom_add_shared(info_a + 12, Uint32(1))
                             out[orow + Int32(slot)] = pos
