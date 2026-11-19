@@ -72,6 +72,9 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
     can_use_cute_recoverssm,
     compile_state_commit,
 )
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    kda as specialized_prefill_kda,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -1730,7 +1733,21 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        if o_mxfp8 is not None:
+        if (
+            o_mxfp8 is not None
+            and m.num_prefills > 0
+            and self.kda_prefill_backend == "flashkda"
+        ):
+            # Prefill: the HBM-rate gated o_norm + MXFP8 kernel (same layout
+            # contract as kda_norm, checked in forward()).
+            specialized_prefill_kda.o_norm_mxfp8(
+                core_attn_out,
+                g2.flatten(-2),
+                self.o_norm.weight,
+                self.o_norm.eps,
+                o_mxfp8,
+            )
+        elif o_mxfp8 is not None:
             # forward() checked kda_norm.supported for these tensors.
             kda_norm.rmsnorm_gated_mxfp8(
                 core_attn_out, g2, self.o_norm.weight, self.o_norm.eps, out=o_mxfp8

@@ -15,13 +15,7 @@ with the NVSHMEM allocations replaced by views of the :class:`SymmetricArena`:
 A launch is ``compiled(**kwargs)``: router, the PDL MegaMoE kernel, then the separate
 BF16 ``TopkReduce`` writing ``out[:n]`` directly.
 
-Epilogue variant (S2, VENDOR.md; automatic, no flag): a session on a capped grid
-(``max_sm_count``, the shared-expert overlap) whose launch is S2-eligible runs the
-second-epilogue-warpgroup kernel up to :data:`S2_MAX_TOKENS_PER_RANK` EP-averaged live
-tokens per rank and the stock epilogue above; both variants are compiled from the same
-config, share the carved workspace (layout asserted equal at build) and the cross-rank
-protocol, and produce bitwise-identical outputs. Uncapped sessions trace the stock
-epilogue only. No host sync, allocation or masked
+One kernel per session (the a368c5f66 drop has a single epilogue variant). No host sync, allocation or masked
 fill (BF16 separate reduction masks invalid slots in-kernel: asserted at build), so it
 is CUDA graph safe after warmup. Every EP rank must launch the same session the same
 number of times in the same order (the barrier state persists across launches).
@@ -39,26 +33,13 @@ from .symm_arena import ALIGN, SymmetricArena, aligned, ensure_not_capturing
 from .weights import RubinMoeWeights, validate_kernel_weights
 
 _SCALAR_NAMES = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+# FlashInfer ``die_local.SM_LOCALITY_MAP_SIZE`` (the kernel's die map extent).
+SM_LOCALITY_MAP_SIZE = 1024
 _MAX_ACTIVE_CLUSTERS: dict[tuple[int, int], int] = {}
 _COMPILED: dict[tuple, Any] = {}
 _BIND_CACHE_LIMIT = 1024
 _OUTPUT_CACHE_LIMIT = 4
 
-# S2 (second epilogue warpgroup) policy, per launch. Measured on VR200 at real EP16
-# (4 nodes x 4 GPUs, 896 experts, top-16, NVFP4, random routing; CUDA graph p50, MAX
-# over ranks), S2 vs the stock epilogue on the same knobs:
-# - full grid: S2 slower everywhere (N=128 +12-14%, N=256 +1-2.5% at 2880-8192 tokens),
-#   so uncapped sessions never trace it;
-# - 148-SM capped grid (shared-expert overlap), tile N=256 (the EP16 i8192 record), both
-#   variants in one process on the same routes (two runs agree within 0.3%):
-#     tokens/rank  2048  4350  5504  6144  6400  6656  6912  7168  7424  7680  8192
-#     stock us      422   779   975  1066  1121  1152  1188  1245  1276  1305  1405
-#     S2 us         398   730   933  1015  1051  1106  1176  1255  1359  1432  1491
-#     delta        -5.8  -6.3  -4.4  -4.7  -6.2  -4.0  -1.0  +0.8  +6.5  +9.8  +6.1 %
-#   so S2 runs up to 6912 tokens (the last measured win) and the stock epilogue above.
-# The token count is the EP-uniform live tokens per rank (EP mean, which sets each
-# rank's expert work); every EP rank must pick the same variant.
-S2_MAX_TOKENS_PER_RANK = 6912
 
 
 def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
@@ -127,8 +108,8 @@ def _max_active_clusters(cluster_size: int) -> int:
 def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     """FlashInfer ``Sm107BlockScaledSymmBuffer._build_kernel`` (BF16 combine, SiTU).
 
-    ``epilogue_warpgroups`` (inference kernel only): 1 = stock epilogue, 2 = S2, None =
-    the kernel's default (S2 wherever eligible)."""
+    ``epilogue_warpgroups``: None or 1 (the a368c5f66 kernels have one epilogue
+    warpgroup; the S2 variant of the previous drop is gone)."""
     import cutlass
     from cutlass.cute.nvgpu import OperandMajorMode
 
@@ -208,12 +189,19 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     }
     if cfg.fc2_tma_stages is not None:
         impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
-    if epilogue_warpgroups is not None:
-        if cfg.kernel_variant == "genphase":
-            raise ValueError("the genphase kernel has a single epilogue warpgroup.")
-        impl_fields["epilogue_warpgroups"] = epilogue_warpgroups
+    if epilogue_warpgroups not in (None, 1):
+        # FlashInfer a368c5f66 kernels have one epilogue warpgroup (the vLLM-local
+        # S2 of the 0.7.3.dev20261031 drop is not carried over; VENDOR.md).
+        raise ValueError(f"unsupported epilogue_warpgroups={epilogue_warpgroups}.")
     if cfg.die_sm_mask32 is not None:
-        impl_fields["die_sm_mask32"] = tuple(cfg.die_sm_mask32)
+        # Die-local expert streams: FlashInfer's two-ended expert claim over the
+        # die-homed weights (die_local.place_experts); the kernel reads the die of
+        # each SM from the ``sm_locality_domain`` launch argument.
+        if cfg.kernel_variant == "genphase" or tuple(cfg.schedule_policy)[0] != (
+            "phase_interleave"
+        ):
+            raise ValueError("die-local streams need the phase-interleaved schedule.")
+        impl_fields["die_split"] = True
     if cfg.fallback_cluster_shape_mn is not None:
         impl_fields["fallback_cluster_shape_mn"] = tuple(cfg.fallback_cluster_shape_mn)
         impl_fields["preferred_cluster_count"] = preferred_count
@@ -227,26 +215,10 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
 
 
 def build_kernels(cfg: RubinMoeConfig) -> dict[bool, Any]:
-    """The session's kernel objects keyed by ``use_s2``: S2 for capped-grid S2-eligible
-    inference launches up to :data:`S2_MAX_TOKENS_PER_RANK` live tokens, the stock
-    epilogue for every other live count (none when the capacity is within the S2
-    range)."""
-    if cfg.kernel_variant == "genphase":
-        return {False: build_kernel(cfg)}
-    if cfg.max_sm_count is None:
-        return {False: build_kernel(cfg, 1)}
-    s2 = build_kernel(cfg)  # S2 where eligible, else the stock epilogue
-    if s2.epilogue_warpgroups == 1:
-        return {False: s2}
-    if cfg.max_tokens_per_rank <= S2_MAX_TOKENS_PER_RANK:
-        return {True: s2}
-    stock = build_kernel(cfg, 1)
-    if _workspace_layout(stock) != _workspace_layout(s2):
-        raise RuntimeError(
-            "Rubin MegaMoE S2 and stock epilogue kernels disagree on the device "
-            "workspace layout; they cannot share a session."
-        )
-    return {True: s2, False: stock}
+    """The session's kernel objects keyed by ``use_s2`` (always ``{False: kernel}``
+    since the FlashInfer a368c5f66 drop: one epilogue variant, VENDOR.md)."""
+    # FlashInfer a368c5f66: one epilogue variant (no S2), so one kernel per session.
+    return {False: build_kernel(cfg)}
 
 
 def _workspace_layout(kernel) -> tuple:
@@ -407,7 +379,24 @@ class RubinMegaMoeSession:
         if self.cfg.quant_kind == "nvfp4":
             for name in _SCALAR_NAMES:
                 kwargs[name] = _to_cute(getattr(w, name), assumed_align=4)
+        if self.cfg.die_sm_mask32 is not None:
+            kwargs["sm_locality_domain"] = _to_cute(self._sm_locality_domain())
         return kwargs
+
+    def _sm_locality_domain(self) -> torch.Tensor:
+        """uint8 ``[SM_LOCALITY_MAP_SIZE]`` die of each ``%smid`` (the die_split
+        scheduler's map; FlashInfer ``die_local.sm_locality_domain_map`` layout),
+        from the session's trusted die-1 SM mask."""
+        t = getattr(self, "_sm_domains", None)
+        if t is None:
+            mask = self.cfg.die_sm_mask32
+            domains = [0] * SM_LOCALITY_MAP_SIZE
+            for sm in range(min(32 * len(mask), SM_LOCALITY_MAP_SIZE)):
+                if (mask[sm // 32] >> (sm % 32)) & 1:
+                    domains[sm] = 1
+            t = torch.tensor(domains, dtype=torch.uint8, device=self.device)
+            self._sm_domains = t
+        return t
 
     def _check_output(self, output: torch.Tensor) -> None:
         if (
@@ -427,10 +416,7 @@ class RubinMegaMoeSession:
     def use_s2(self, ep_tokens: int | None) -> bool:
         """The epilogue variant for a launch whose EP-uniform live tokens per rank are
         ``ep_tokens`` (None: the capacity). Same answer on every EP rank."""
-        if len(self.kernels) == 1:
-            return next(iter(self.kernels))
-        tokens = self.cfg.max_tokens_per_rank if ep_tokens is None else ep_tokens
-        return tokens <= S2_MAX_TOKENS_PER_RANK
+        return next(iter(self.kernels))
 
     def prepare(
         self, w: RubinMoeWeights, output: torch.Tensor, use_s2: bool | None = None

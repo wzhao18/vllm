@@ -9,7 +9,92 @@ import cutlass.pipeline as pipeline
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_from_mlir_values
 
-from ...helpers.ptx_helpers import mbarrier_arrive_expect_tx_on_peer, nanosleep, store_i32_to_peer_cluster_smem_async
+from ...helpers.ptx_helpers import (
+    mbarrier_arrive_expect_tx_on_peer,
+    nanosleep,
+    store_i32_to_peer_cluster_smem_async,
+    two_ended_claim_u64,
+)
+
+
+TWO_ENDED_EXHAUSTED_ID = 0x3FFFFFFF  # beyond every stream end; IDs stay below 2**30
+TWO_ENDED_HELD_BIT = 30  # payload bit: an FC2 ID the cluster must hold until its FC1 block is fully claimed
+TWO_ENDED_STREAM_BIT = 31  # payload bit: 1 = FC2 (Linear2) stream
+
+
+class TwoEndedFc12Claim:
+    """Arguments of one claim from the two-ended FC1 (counter 0) / FC2 (counter 1) streams (die_split).
+
+    Each counter is one 64-bit word: low = IDs claimed from the bottom, high = IDs claimed from the top
+    (``two_ended_claim_u64``). FC1 / FC2 IDs are token-block major with ``fc1_per_block`` / ``fc2_per_block`` IDs
+    per token block. ``held_fc2`` is the FC2 ID this cluster holds (-1: none).
+    """
+
+    def __init__(
+        self,
+        claim_from_top: Int32,
+        total_fc1: Int32,
+        total_fc2: Int32,
+        held_fc2: Int32,
+        fc1_per_block: int,
+        fc2_per_block: int,
+    ) -> None:
+        self.claim_from_top = claim_from_top
+        self.total_fc1 = total_fc1
+        self.total_fc2 = total_fc2
+        self.held_fc2 = held_fc2
+        self.fc1_per_block = fc1_per_block
+        self.fc2_per_block = fc2_per_block
+
+
+@cute.jit
+def _fc1_block_claimed(fc1_word: Int64, fc2_id: Int32, claim: TwoEndedFc12Claim) -> Boolean:
+    """Whether every FC1 ID of the token block of ``fc2_id`` was claimed (from either end) in ``fc1_word``."""
+    low = Int32(fc1_word & Int64(0xFFFFFFFF))
+    high = Int32(fc1_word >> Int64(32))
+    first = (fc2_id // Int32(claim.fc2_per_block)) * Int32(claim.fc1_per_block)
+    return (
+        (low + high >= claim.total_fc1)
+        | (first + Int32(claim.fc1_per_block) <= low)
+        | (first >= claim.total_fc1 - high)
+    )
+
+
+@cute.jit
+def _two_ended_leader_claim(counter_pointer: cute.Pointer, preferred_stream, claim: TwoEndedFc12Claim) -> Int32:
+    """One leader-lane step of the two-ended FC1/FC2 streams; returns a payload for the cluster broadcast:
+    ``work_id | held << 30 | stream << 31`` (work_id ``TWO_ENDED_EXHAUSTED_ID``: that stream is exhausted).
+
+    Dependency rule: an FC2 tile is published only after every FC1 tile of its token block was claimed, so every
+    tile depends only on tiles claimed before it and in-order per-CTA execution cannot deadlock, whichever end the
+    clusters of the two dies claim from. (The one-ended scheduler gets this from its global FC1 prologue watermark,
+    which does not bound each end.) A freshly claimed FC2 ID whose block is not yet covered comes back with the held
+    bit; while a cluster holds one, each step either releases it (stream FC2, held bit clear) once covered, or
+    claims one FC1 tile from the cluster's end. The FC1 word is read before the claim, only for FC2 claims and while holding.
+    """
+    stream = Int32(preferred_stream)
+    if claim.held_fc2 >= Int32(0):
+        stream = Int32(0)
+    # Relaxed is enough: FC1 claim counts only grow, so any earlier value is a conservative snapshot.
+    fc1_word = Int64(0)
+    if (stream == Int32(1)) | (claim.held_fc2 >= Int32(0)):
+        fc1_word = cute.arch.load(counter_pointer, Int64, sem="relaxed", scope="gpu")
+    release_held = Boolean(False)
+    if claim.held_fc2 >= Int32(0):
+        release_held = _fc1_block_claimed(fc1_word, claim.held_fc2, claim)
+    payload = claim.held_fc2 | (Int32(1) << Int32(TWO_ENDED_STREAM_BIT))
+    if not release_held:
+        total = claim.total_fc2
+        if stream == Int32(0):
+            total = claim.total_fc1
+        work_id = two_ended_claim_u64(counter_pointer + stream, claim.claim_from_top, total)
+        if work_id == Int32(0x7FFFFFFF):
+            work_id = Int32(TWO_ENDED_EXHAUSTED_ID)
+        payload = work_id | (stream << Int32(TWO_ENDED_STREAM_BIT))
+        if (stream == Int32(1)) & (work_id != Int32(TWO_ENDED_EXHAUSTED_ID)):
+            if not _fc1_block_claimed(fc1_word, work_id, claim):
+                payload = payload | (Int32(1) << Int32(TWO_ENDED_HELD_BIT))
+    return payload
 
 
 class GridStrideWorkIdState:
@@ -302,9 +387,13 @@ def _claim_grid_stride_work_id(work_id_state: GridStrideWorkIdState) -> Tuple[In
 
 @cute.jit
 def _claim_atomic_counter_work_id(
-    work_id_state: AtomicCounterWorkIdState, atomic_counter_index=0
+    work_id_state: AtomicCounterWorkIdState, atomic_counter_index=0, two_ended=None
 ) -> Tuple[Int32, AtomicCounterWorkIdState]:
-    """Claim from one selected counter and broadcast the ID within the cluster."""
+    """Claim from one selected counter and broadcast the ID within the cluster.
+
+    With ``two_ended`` (``TwoEndedFc12Claim``) the leader may switch the stream; the broadcast and the returned
+    value are then ``work_id | stream << 31``.
+    """
     invalid_static_index = isinstance(atomic_counter_index, int) and (
         atomic_counter_index < 0 or atomic_counter_index >= work_id_state.counter_count
     )
@@ -323,7 +412,12 @@ def _claim_atomic_counter_work_id(
         lane_idx = thread_idx % Int32(32)
         atomic_work_id = Int32(0)
         if lane_idx == Int32(0):
-            atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
+            if cutlass.const_expr(two_ended is None):
+                atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
+            else:
+                atomic_work_id = _two_ended_leader_claim(
+                    work_id_state.counter_pointer, atomic_counter_index, two_ended
+                )
         atomic_work_id = cute.arch.shuffle_sync(atomic_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
         if lane_idx < Int32(work_id_state.cluster_size):
             store_i32_to_peer_cluster_smem_async(
@@ -545,7 +639,7 @@ def initialize_fixed_group_mixed_cga_work_id_state(
 
 @cute.jit
 def _claim_fixed_group_fallback_work_id(
-    work_id_state: FixedGroupMixedCgaAtomicCounterWorkIdState, atomic_counter_index=0
+    work_id_state: FixedGroupMixedCgaAtomicCounterWorkIdState, atomic_counter_index=0, two_ended=None
 ) -> Tuple[Int32, FixedGroupMixedCgaAtomicCounterWorkIdState]:
     """Claim one canonical ID and hand it to every member of a fixed fallback group."""
     atomic_counter_state = work_id_state.atomic_counter_state
@@ -586,11 +680,21 @@ def _claim_fixed_group_fallback_work_id(
 
             claimed_work_id = Int32(0)
             if lane_idx == Int32(0):
-                claimed_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1), sem="relaxed", scope="gpu")
+                if cutlass.const_expr(two_ended is None):
+                    claimed_work_id = cute.arch.atomic_add(
+                        selected_counter_pointer, Int32(1), sem="relaxed", scope="gpu"
+                    )
+                else:
+                    claimed_work_id = _two_ended_leader_claim(
+                        atomic_counter_state.counter_pointer, atomic_counter_index, two_ended
+                    )
             claimed_work_id = Int32(
                 cute.arch.shuffle_sync(claimed_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
             )
-            claimed_payload = claimed_work_id | (Int32(atomic_counter_index) << Int32(31))
+            if cutlass.const_expr(two_ended is None):
+                claimed_payload = claimed_work_id | (Int32(atomic_counter_index) << Int32(31))
+            else:
+                claimed_payload = claimed_work_id
             token = (Int64(work_id_state.next_generation) << Int64(32)) | (Int64(claimed_payload) & Int64(0xFFFFFFFF))
             if lane_idx == Int32(0):
                 cute.arch.store(group_token_pointer, token, sem="relaxed", scope="gpu")
@@ -635,18 +739,25 @@ def _claim_fixed_group_fallback_work_id(
 
 @cute.jit
 def _claim_fixed_group_mixed_cga_work_id(
-    work_id_state: FixedGroupMixedCgaAtomicCounterWorkIdState, atomic_counter_index=0
+    work_id_state: FixedGroupMixedCgaAtomicCounterWorkIdState, atomic_counter_index=0, two_ended=None
 ) -> Tuple[Int32, FixedGroupMixedCgaAtomicCounterWorkIdState]:
     """Claim directly for a preferred cluster or through its fixed fallback group."""
     linear_work_id = Int32(0)
     if work_id_state.is_preferred_cluster:
-        linear_work_id, atomic_counter_state = _claim_atomic_counter_work_id(
-            work_id_state.atomic_counter_state, atomic_counter_index
+        payload, atomic_counter_state = _claim_atomic_counter_work_id(
+            work_id_state.atomic_counter_state, atomic_counter_index, two_ended
         )
         work_id_state.atomic_counter_state = atomic_counter_state
-        work_id_state.claimed_counter_index = Int32(atomic_counter_index)
+        if cutlass.const_expr(two_ended is None):
+            linear_work_id = payload
+            work_id_state.claimed_counter_index = Int32(atomic_counter_index)
+        else:
+            linear_work_id = payload & Int32(0x7FFFFFFF)
+            work_id_state.claimed_counter_index = (payload >> Int32(31)) & Int32(1)
     else:
-        linear_work_id, work_id_state = _claim_fixed_group_fallback_work_id(work_id_state, atomic_counter_index)
+        linear_work_id, work_id_state = _claim_fixed_group_fallback_work_id(
+            work_id_state, atomic_counter_index, two_ended
+        )
     return linear_work_id, work_id_state
 
 
@@ -701,14 +812,22 @@ def _claim_cluster_launch_control_work_id(
 
 
 @cute.jit
-def claim_work_id(work_id_state, atomic_counter_index=0):
-    """Claim the next work ID using the backend encoded by the state type."""
+def claim_work_id(work_id_state, atomic_counter_index=0, two_ended=None):
+    """Claim the next work ID using the backend encoded by the state type.
+
+    With ``two_ended`` a plain ``AtomicCounterWorkIdState`` returns ``work_id | stream << 31``; the fixed-group
+    mixed state decodes it into ``claimed_counter_index``.
+    """
+    if cutlass.const_expr(two_ended is not None and not isinstance(
+        work_id_state, (AtomicCounterWorkIdState, FixedGroupMixedCgaAtomicCounterWorkIdState)
+    )):
+        raise ValueError("two-ended claims require atomic-counter work IDs.")
     if cutlass.const_expr(isinstance(work_id_state, GridStrideWorkIdState)):
         return _claim_grid_stride_work_id(work_id_state)
     if cutlass.const_expr(isinstance(work_id_state, AtomicCounterWorkIdState)):
-        return _claim_atomic_counter_work_id(work_id_state, atomic_counter_index)
+        return _claim_atomic_counter_work_id(work_id_state, atomic_counter_index, two_ended)
     if cutlass.const_expr(isinstance(work_id_state, FixedGroupMixedCgaAtomicCounterWorkIdState)):
-        return _claim_fixed_group_mixed_cga_work_id(work_id_state, atomic_counter_index)
+        return _claim_fixed_group_mixed_cga_work_id(work_id_state, atomic_counter_index, two_ended)
     if cutlass.const_expr(isinstance(work_id_state, ClusterLaunchControlWorkIdState)):
         return _claim_cluster_launch_control_work_id(work_id_state)
     raise TypeError(f"Unsupported work-ID state: {type(work_id_state).__name__}.")
@@ -717,6 +836,9 @@ def claim_work_id(work_id_state, atomic_counter_index=0):
 __all__ = [
     "AtomicCounterWorkIdState",
     "ClusterLaunchControlWorkIdState",
+    "TWO_ENDED_EXHAUSTED_ID",
+    "TWO_ENDED_HELD_BIT",
+    "TwoEndedFc12Claim",
     "FixedGroupMixedCgaAtomicCounterWorkIdState",
     "GridStrideWorkIdState",
     "GridWorkId",
