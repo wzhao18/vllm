@@ -161,7 +161,37 @@ __device__ __forceinline__ void st_remote(float* local, uint32_t peer, float v) 
   asm volatile("st.shared::cluster.f32 [%0], %1;" :: "r"(r), "f"(v) : "memory");
 }
 
-struct Xs { float wsum[16 * 16]; float x[3 * 8 * 16]; };
+struct Xs { float wsum[16 * 16]; float x[3 * 8 * 16]; unsigned long long bar[3]; };
+
+// One-sided DSMEM exchange (as ClusterAttnRes): every CTA pushes its partials into each
+// peer's slot with st.async completing on the peer's round mbarrier (expect_tx armed
+// at init); before the cluster's start barrier.
+__device__ __forceinline__ void xs_init(Xs& s, int cs, int cnt0, int cnt1) {
+  if (threadIdx.x == 0 && cs > 1) {
+    const int cnt[3] = {cnt0, cnt1, 1};
+    for (int r = 0; r < 3; ++r) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&s.bar[r]);
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(b) : "memory");
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(b), "r"(cs * cnt[r] * 4) : "memory");
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+}
+__device__ __forceinline__ void push_async(float* local, unsigned long long* bar, uint32_t peer, float v) {
+  uint32_t a = (uint32_t)__cvta_generic_to_shared(local), b = (uint32_t)__cvta_generic_to_shared(bar), ra, rb;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(a), "r"(peer));
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rb) : "r"(b), "r"(peer));
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
+               :: "r"(ra), "r"(__float_as_uint(v)), "r"(rb) : "memory");
+}
+__device__ __forceinline__ void mb_wait(unsigned long long* bar) {
+  uint32_t b = (uint32_t)__cvta_generic_to_shared(bar), done = 0;
+  while (!done) {
+    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(done) : "r"(b) : "memory");
+  }
+}
 
 // Cluster-sum CNT per-thread partials (round r); every thread gets the totals.
 template <int CNT>
@@ -180,9 +210,9 @@ __device__ __forceinline__ void exchange(float* vals, float* tot, Xs& s, int r, 
     float v = 0.f;
     for (int w = 0; w < nw; ++w) v += s.wsum[w * 16 + threadIdx.x];
     float* slot = &s.x[(r * 8 + me) * 16 + threadIdx.x];
-    if (cs > 1) { for (int p = 0; p < cs; ++p) st_remote(slot, p, v); } else { *slot = v; }
+    if (cs > 1) { for (int p = 0; p < cs; ++p) push_async(slot, &s.bar[r], p, v); } else { *slot = v; }
   }
-  if (cs > 1) cl_sync(); else __syncthreads();
+  if (cs > 1) mb_wait(&s.bar[r]); else __syncthreads();
 #pragma unroll
   for (int i = 0; i < CNT; ++i) {
     float t = 0.f;
@@ -295,7 +325,13 @@ __device__ __forceinline__ void owner_sum(const Prm& p, int lrow, int col, float
   }
   unpack(posz4(pack8(acc)), cur);  // one BF16 rounding, no -0 (all-reduce boundary)
 }
-__device__ __forceinline__ unsigned long long tnow() { __syncthreads(); return gtime(); }
+#ifndef STAMPS
+#define STAMPS 1
+#endif
+__device__ __forceinline__ unsigned long long tnow() {
+  if (!STAMPS) return 0;
+  __syncthreads(); return gtime();
+}
 // per (layer, kernel) slots: [min start, min wait-done, max wait-done, max end,
 // sum(pre-wait part), sum(wait-done -> exchange done), sum(exchange done -> end), CTAs]
 __device__ __forceinline__ void tflush(const Prm& p, int k, unsigned long long a, unsigned long long b,
@@ -327,6 +363,7 @@ __global__ void __launch_bounds__(128, 4) today_k(Prm p) {
   const unsigned long long ta = tnow();
   const int part = blockIdx.x, token = blockIdx.y, n = p.n;
   const int col = (part * 128 + threadIdx.x) * 8;
+  xs_init(s, 7, 2 * NB, 4);
   cl_arrive_relaxed();
   asm volatile("griddepcontrol.launch_dependents;");
   St st;
@@ -381,6 +418,7 @@ __global__ void __launch_bounds__(512, 1) gemm_k(Prm p) {
   long long wb = (long long)g * per, we = min(p.w16, wb + per);
   if (wb > we) wb = we;
   long long wm = min(we, wb + p.pre16);
+  xs_init(s, cs, 2 * NB, 4);
   if (cs > 1) cl_arrive_relaxed();
   if (p.do_w) acc ^= stream_w(p.w, wb, wm);
   // row-owner cluster cl owns shard row cl (one row per cluster: n <= G / cs)
@@ -544,10 +582,10 @@ int64_t max_clusters(int64_t cs, int64_t smem);
 """
 
 
-def _module(nb):
+def _module(nb, stamps=1):
     from torch.utils.cpp_extension import load_inline
 
-    src = f"#define NB {nb}\n" + _CUDA_SRC
+    src = f"#define NB {nb}\n#define STAMPS {stamps}\n" + _CUDA_SRC
     tag = hashlib.sha256((src + _CPP_SRC).encode()).hexdigest()[:16]
     root = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
     build = os.path.join(root, "k3_sp_boundary_cal", tag)
@@ -577,8 +615,9 @@ def main():
     ap.add_argument("--chunks", default="2")
     ap.add_argument("--rs", default="2")
     ap.add_argument("--nb", type=int, default=8)
+    ap.add_argument("--stamps", type=int, default=1)
     ap.add_argument("--smem-kb", type=int, default=200)
-    ap.add_argument("--modes", default="w,wl,today,fz")
+    ap.add_argument("--modes", default="w,wl,today,real,fz")
     args = ap.parse_args()
     dist.init_process_group(backend="nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -593,9 +632,9 @@ def main():
     except (AttributeError, ImportError):
         pass
     if rank == 0:
-        _module(args.nb)
+        _module(args.nb, args.stamps)
     dist.barrier()
-    mod = _module(args.nb)
+    mod = _module(args.nb, args.stamps)
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     words = 2 * 4 * NMAX * WORDS + 2 * RMAX * WORDS
     box = symm_mem.empty((words,), dtype=torch.int32, device=dev)
@@ -624,6 +663,27 @@ def main():
     bufs = [x.data_ptr() for x in (blocks, prefix, normw, query, outnorm, partial, act, mlp,
                                    ctr, ts, sink)]
     prefix0 = prefix.clone()
+    real_blocks = blocks[:, : args.nb].contiguous()
+    real_cache = {}
+
+    def real_bound(R):
+        """Today's SpBoundary (SpReduceAttnRes + SpAttnResGather), same nb / shapes."""
+        if R not in real_cache:
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
+                sp_fused,
+            )
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+                sp_comm,
+            )
+
+            if "comm" not in real_cache:
+                real_cache["comm"] = sp_comm.SpComm(group, dev, world, rank, rows_cap=RMAX)
+            w3 = (normw, query, outnorm)
+            real_cache[R] = sp_fused.SpBoundary(
+                real_cache["comm"], (w3, (1e-6, 1e-6)), (w3, (1e-6, 1e-6)), args.nb, -1,
+                NMAX, {R: True},
+            )  # fmt: skip
+        return real_cache[R]
     torch.cuda.synchronize()
     dist.barrier()
     smem = args.smem_kb * 1024
@@ -632,7 +692,7 @@ def main():
         cfgs = []
         for pre in [int(x) for x in args.pre_kb.split(",")]:
             for mode in args.modes.split(","):
-                if mode in ("today", "wl") and pre != 0:
+                if mode in ("today", "wl", "real") and pre != 0:
                     continue
                 for ch in ([int(x) for x in args.chunks.split(",")] if mode == "fz" else [1]):
                     for rs in ([int(x) for x in args.rs.split(",")] if mode == "fz" else [2]):
@@ -647,6 +707,8 @@ def main():
             else:
                 seq = [(k, 1, int(mode == "fz")) for k in range(4)]
             early = int(mode in ("fz", "w"))
+            n = R // 4
+            bound = real_bound(R) if mode == "real" else None
 
             def chain():
                 ts.copy_(ts0)
@@ -658,6 +720,11 @@ def main():
                         mod.launch(kind, dw, dx, rank, R, par, i, w.data_ptr(), W_BYTES[k],
                                    pre * 1024, peers, box.data_ptr(), mc, bufs, grid, ch, rs,
                                    smem, early)
+                        if bound is not None and kind == 0:  # today's SpReduceAttnRes
+                            bound.reduce(prefix[:n], real_blocks[:n], act[:n], par,
+                                         partial[:R])
+                        if bound is not None and kind == 2:  # today's SpAttnResGather
+                            bound.gather(mlp[:n], prefix[:n], real_blocks[:n], par)
 
             box.fill_(-1)
             prefix.copy_(prefix0)
@@ -713,9 +780,9 @@ def main():
             for pre, mode, ch, rs in cfgs:
                 key = (R, pre, mode, ch, rs)
                 t = res[key]
-                base = "wl" if mode == "today" else "w"
+                base = "wl" if mode in ("today", "real") else "w"
                 w = res.get((R, pre, base, 1, 2))
-                ex = f" exposed {t - w:.2f}" if mode in ("today", "fz") and w else ""
+                ex = f" exposed {t - w:.2f}" if mode in ("today", "fz", "real") and w else ""
                 print(f"R{R} r{R // 16} pre{pre}K {mode} c{ch} rs{rs}: {t:.2f} us/layer{ex}",
                       flush=True)
                 for k, v in stats[key].items():
