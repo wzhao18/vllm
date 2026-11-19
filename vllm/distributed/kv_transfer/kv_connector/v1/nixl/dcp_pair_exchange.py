@@ -26,6 +26,7 @@ reference of the exchange, the oracle of the tests; and the D rank's exchanger,
 which runs it with Triton kernels and one NCCL round per chunk of units.
 """
 
+import copy
 import enum
 import hashlib
 import os
@@ -70,20 +71,34 @@ class PairUnit:
     block_id: int
     has_partner: bool
     """Whether P block ``2j + 1`` exists. Without it, rows ``[B/2, B)`` are 0."""
+    num_sources: int | None = None
+    """Ratio ``R = D DCP / P DCP`` above 2 (staged exchange, see
+    ``stage_units``): how many of the unit's ``R`` P blocks ``R j + s`` exist.
+    None at ratio 2, where it is ``1 + has_partner``."""
+    remote_dcp_size: int | None = None
+    """P's DCP size ``W`` when the ratio is above 2; None: half this DCP size."""
+
+    @property
+    def sources(self) -> int:
+        """P blocks of the unit that exist, out of ``R``."""
+        return 1 + self.has_partner if self.num_sources is None else self.num_sources
 
 
 def num_pair_units(
-    num_local_blocks: int, num_cached_blocks: int, num_remote_blocks: int
+    num_local_blocks: int,
+    num_cached_blocks: int,
+    num_remote_blocks: int,
+    ratio: int = 2,
 ) -> int:
-    """Units of one group: the blocks the parity-0 rank pulls.
+    """Units of one group: the blocks the source-0 ranks pull.
 
-    Rank ``c`` reads P block ``c + 2(m + i)`` into its ``i``-th uncached block,
-    so the parity-0 rank pulls ``min(len(local), ceil((n_R - 2m) / 2))`` blocks.
-    The parity-1 rank pulls as many, or one fewer when the last unit has no
-    partner: that needs ``n_R - 2m`` odd, and D's list not to be the limit.
+    Rank ``r`` (source ``s = r // W``) reads P block ``s + R(m + i)`` into its
+    ``i``-th uncached block, so the source-0 ranks pull
+    ``min(len(local), ceil((n_R - Rm) / R))`` blocks; the others pull as many,
+    or one fewer in the last unit when P's blocks run out first.
     """
-    remote_pairs = cdiv(num_remote_blocks - 2 * num_cached_blocks, 2)
-    return max(0, min(num_local_blocks, remote_pairs))
+    remote_units = cdiv(num_remote_blocks - ratio * num_cached_blocks, ratio)
+    return max(0, min(num_local_blocks, remote_units))
 
 
 def pair_units(
@@ -91,6 +106,8 @@ def pair_units(
     num_cached: Sequence[int],
     remote_ids: Sequence[Sequence[int]],
     groups: Iterable[int],
+    ratio: int = 2,
+    remote_dcp_size: int | None = None,
 ) -> list[PairUnit]:
     """Exchange plan of one request, in group order.
 
@@ -103,18 +120,84 @@ def pair_units(
         num_cached: D's prefix-cache hit per group, in blocks.
         remote_ids: P's block list per group.
         groups: The DCP-sharded attention groups.
+        ratio: ``R``, D's DCP size over P's: a power of two.
+        remote_dcp_size: P's DCP size ``W``, recorded on the units when
+            ``ratio`` is above 2 (the worker then runs ``log2(R)`` stages).
 
     Returns:
-        One unit per D block the parity-0 rank pulls. Only the last unit of a
-        group can lack a partner.
+        One unit per D block the source-0 ranks pull. Only the last unit of a
+        group can lack sources.
 
     """
+    staged = ratio > 2
     units = []
     for g in groups:
         local, remote, m = local_ids[g], remote_ids[g], num_cached[g]
-        for i in range(num_pair_units(len(local), m, len(remote))):
-            units.append(PairUnit(g, local[i], 2 * (m + i) + 1 < len(remote)))
+        for i in range(num_pair_units(len(local), m, len(remote), ratio)):
+            first = ratio * (m + i)
+            units.append(
+                PairUnit(
+                    g,
+                    local[i],
+                    first + 1 < len(remote),
+                    min(ratio, len(remote) - first) if staged else None,
+                    remote_dcp_size if staged else None,
+                )
+            )
     return units
+
+
+def exchange_strides(dcp_size: int, remote_dcp_size: int) -> list[int]:
+    """Partner strides of the exchange stages from P DCP ``W`` to D DCP
+    ``R W``: ``W, 2W, ..., R W / 2``. Raises unless ``R`` is a power of two
+    of at least 2.
+
+    Stage ``t`` is the pair exchange at stride ``W 2^t``: it swaps the stride
+    bit of the rank with the lowest row bit, so after ``log2(R)`` stages rank
+    ``r`` holds the tokens of residue ``r`` mod ``R W`` in interleave-1 order.
+    """
+    ratio, rest = divmod(dcp_size, remote_dcp_size)
+    if rest or ratio < 2 or ratio & (ratio - 1):
+        raise NixlPairModeError(
+            f"DCP pair exchange needs a D DCP ({dcp_size}) that is P's "
+            f"({remote_dcp_size}) times a power of two"
+        )
+    return [remote_dcp_size << t for t in range(ratio.bit_length() - 1)]
+
+
+def all_exchange_strides(dcp_size: int) -> list[int]:
+    """Every stride a P DCP size can need at this D DCP size (largest first):
+    ``dcp_size / 2^k`` while it is an integer."""
+    strides = []
+    stride = dcp_size
+    while stride % 2 == 0:
+        stride //= 2
+        strides.append(stride)
+    return strides
+
+
+def stage_units(
+    units: Sequence[PairUnit], dcp_rank: int, stride: int, remote_dcp_size: int
+) -> list[PairUnit]:
+    """The units rank ``dcp_rank`` exchanges at stage ``stride`` (a staged
+    exchange's ``exchange_strides``), with their stage partner flag.
+
+    At stage ``t`` the pair holds the P blocks of sources ``[low, low + 2^t)``
+    (parity 0) and ``[high, high + 2^t)`` (parity 1), ``high = low + 2^t``.
+    Sources past the unit's ``sources`` do not exist and stand for zero
+    blocks: without parity-1 sources the unit has no partner (rows
+    ``[B/2, B)`` are zeroed, as in the one-stage exchange), and without
+    parity-0 sources both ranks hold nothing yet and skip it. Partners compute
+    the same list.
+    """
+    t = (stride // remote_dcp_size).bit_length() - 1
+    low = ((dcp_rank // remote_dcp_size) >> (t + 1)) << (t + 1)
+    high = low | (1 << t)
+    return [
+        PairUnit(u.group, u.block_id, high < u.sources, u.sources, remote_dcp_size)
+        for u in units
+        if low < u.sources
+    ]
 
 
 def check_pair_coverage(
@@ -164,6 +247,16 @@ class PairLayout:
     """``c``: the parity of the P blocks this rank pulled, and the half it keeps.
     Its ``send`` fills half ``c`` of the partner's block."""
     block_size: int
+    dcp_size: int | None = None
+    """The DCP size; None: twice the partner distance (one-stage exchange)."""
+
+    @property
+    def stride(self) -> int:
+        return abs(self.partner - self.dcp_rank)
+
+    @property
+    def group_size(self) -> int:
+        return 2 * self.stride if self.dcp_size is None else self.dcp_size
 
     @property
     def half(self) -> int:
@@ -192,21 +285,34 @@ def pair_layout(
     remote_dcp_size: int,
     block_size: int,
     interleave: int,
+    stride: int | None = None,
 ) -> PairLayout:
-    """Row maps of D rank ``dcp_rank``; raises unless pair mode applies."""
-    if interleave != 1 or dcp_size != 2 * remote_dcp_size or block_size % 2:
+    """Row maps of D rank ``dcp_rank`` at the exchange stage of partner
+    ``stride`` (default: P's DCP size, the first stage); raises unless pair
+    mode applies: interleave 1, an even block size and a D DCP that is P's
+    times a power of two (one stage at ratio 2, ``log2`` of it above)."""
+    if interleave != 1 or block_size % 2:
         raise NixlPairModeError(
-            "DCP pair exchange needs interleave 1, an even block size and a D DCP "
-            f"twice P's; got interleave {interleave}, block size {block_size}, "
-            f"D DCP {dcp_size} and P DCP {remote_dcp_size}"
+            "DCP pair exchange needs interleave 1 and an even block size; got "
+            f"interleave {interleave}, block size {block_size}, D DCP {dcp_size} "
+            f"and P DCP {remote_dcp_size}"
+        )
+    strides = exchange_strides(dcp_size, remote_dcp_size)
+    stride = remote_dcp_size if stride is None else stride
+    if stride not in strides:
+        raise NixlPairModeError(
+            f"DCP pair exchange: stride {stride} is not a stage of D DCP "
+            f"{dcp_size} over P DCP {remote_dcp_size} (stages {strides})"
         )
     if not 0 <= dcp_rank < dcp_size:
         raise ValueError(f"DCP rank {dcp_rank} is outside DCP size {dcp_size}")
+    parity = (dcp_rank // stride) % 2
     return PairLayout(
         dcp_rank=dcp_rank,
-        partner=(dcp_rank + remote_dcp_size) % dcp_size,
-        parity=dcp_rank // remote_dcp_size,
+        partner=dcp_rank - stride if parity else dcp_rank + stride,
+        parity=parity,
         block_size=block_size,
+        dcp_size=None if len(strides) == 1 else dcp_size,
     )
 
 
@@ -554,25 +660,53 @@ def reference_pair_exchange(
     assert dcp_size % 2 == 0 and len(tables) == dcp_size
     assert len({(u.group, u.block_id) for u in units}) == len(units)
     for group in dict.fromkeys(u.group for u in units):
-        group_units = [u for u in units if u.group == group]
-        block_ids = [u.block_id for u in group_units]
-        layouts = [
-            pair_layout(r, dcp_size, dcp_size // 2, tables[r][group].block_size, 1)
-            for r in range(dcp_size)
-        ]
-        packed = [
-            reference_pack(buffers[r], tables[r][group], layouts[r], block_ids)
-            for r in range(dcp_size)
-        ]
-        for r, layout in enumerate(layouts):
-            reference_unpack(
-                buffers[r],
-                tables[r][group],
-                layout,
-                group_units,
-                keep=packed[r][0],
-                recv=packed[layout.partner][1],
-            )
+        by_remote: dict[int, list[PairUnit]] = {}
+        for u in units:
+            if u.group == group:
+                remote = u.remote_dcp_size or dcp_size // 2
+                by_remote.setdefault(remote, []).append(u)
+        for remote, group_units in by_remote.items():
+            for stride in exchange_strides(dcp_size, remote):
+                _reference_stage(buffers, tables, group, group_units, remote, stride)
+
+
+def _reference_stage(
+    buffers: Sequence[torch.Tensor],
+    tables: Sequence[Mapping[int, PairRowTable]],
+    group: int,
+    units: Sequence[PairUnit],
+    remote_dcp_size: int,
+    stride: int,
+) -> None:
+    """One exchange stage of ``units`` on every D rank, in place."""
+    dcp_size = len(buffers)
+    layouts = [
+        pair_layout(
+            r, dcp_size, remote_dcp_size, tables[r][group].block_size, 1, stride
+        )
+        for r in range(dcp_size)
+    ]
+    rank_units = [
+        stage_units(units, r, stride, remote_dcp_size) for r in range(dcp_size)
+    ]
+    packed = [
+        reference_pack(
+            buffers[r],
+            tables[r][group],
+            layouts[r],
+            [u.block_id for u in rank_units[r]],
+        )
+        for r in range(dcp_size)
+    ]
+    for r, layout in enumerate(layouts):
+        reference_unpack(
+            buffers[r],
+            tables[r][group],
+            layout,
+            rank_units[r],
+            keep=packed[r][0],
+            recv=packed[layout.partner][1],
+        )
 
 
 def reference_read_pages(
@@ -978,7 +1112,7 @@ def _dcp_communicator(layout: PairLayout) -> Any:
             "DCP pair exchange needs the DCP group's PyNccl communicator, which "
             f"is {state} (device communicator: {type(communicator).__name__})"
         )
-    dcp_size = 2 * abs(layout.partner - layout.dcp_rank)
+    dcp_size = layout.group_size
     if (group.rank_in_group, group.world_size) != (layout.dcp_rank, dcp_size):
         raise NixlPairModeError(
             f"DCP pair exchange: DCP rank {layout.dcp_rank} of {dcp_size} is rank "
@@ -1114,6 +1248,34 @@ class DcpPairExchanger:
             )
             for n in range(chunk_units + 1)
         ]
+
+    def for_layout(self, layout: PairLayout) -> "DcpPairExchanger":
+        """The exchanger of another stage of this rank (``layout``'s partner
+        and parity), sharing the table, communicator and buffers: stages run
+        one after another on the same stream."""
+        if (layout.dcp_rank, layout.block_size) != (
+            self.layout.dcp_rank,
+            self.layout.block_size,
+        ):
+            raise NixlPairModeError(
+                "DCP pair exchange: a stage layout of another rank or block size"
+            )
+        stage = copy.copy(self)
+        stage.layout = layout
+        stage._plan = _launch_plan(
+            self.table,
+            _row_classes(self.table),
+            layout.parity,
+            self.device,
+        )
+        stage._swaps = [
+            (
+                _p2p_op(torch.distributed.isend, self.send[:n], layout.partner),
+                _p2p_op(torch.distributed.irecv, self.recv[:n], layout.partner),
+            )
+            for n in range(self.chunk_units + 1)
+        ]
+        return stage
 
     @property
     def signature(self) -> tuple:
@@ -1408,3 +1570,104 @@ def build_dcp_pair_exchanger(
                 "or MXFP4 indexer layout"
             )
     return DcpPairExchanger(table, layout, device, chunk_units=chunk_units)
+
+
+class DcpStagedExchanger:
+    """The DCP exchange of one D rank for every P DCP size ``W`` this D DCP
+    size can pair with (``dcp_size / W`` a power of two of at least 2).
+
+    Holds one pair exchanger per partner stride (``all_exchange_strides``),
+    sharing one set of buffers. A request pulled from P DCP ``W`` runs the
+    stages of ``exchange_strides(dcp_size, W)`` in order: one stage at ratio 2
+    (the original pair exchange), ``log2(R)`` at ratio ``R``. ``warm_up`` and
+    ``exchange`` run on every rank of the DCP group with the same units.
+    """
+
+    def __init__(self, stages: Mapping[int, DcpPairExchanger], dcp_size: int):
+        strides = all_exchange_strides(dcp_size)
+        if sorted(stages) != sorted(strides):
+            raise NixlPairModeError(
+                f"DCP staged exchange at DCP {dcp_size} needs the strides "
+                f"{strides}, got {sorted(stages)}"
+            )
+        self.stages = dict(stages)
+        self.dcp_size = dcp_size
+        # The one-stage exchange of the default peer (P DCP = half this one).
+        self.first = self.stages[dcp_size // 2]
+
+    @property
+    def table(self) -> PairRowTable:
+        return self.first.table
+
+    @property
+    def layout(self) -> PairLayout:
+        return self.first.layout
+
+    @property
+    def dcp_rank(self) -> int:
+        return self.first.layout.dcp_rank
+
+    def warm_up(self) -> None:
+        """Warm every stage up, largest stride first, on every rank."""
+        for stride in sorted(self.stages, reverse=True):
+            self.stages[stride].warm_up()
+
+    def exchange(self, units: Sequence[PairUnit]) -> None:
+        """Run the stages of every P DCP size among ``units``, in the order
+        the sizes first appear (the same on every rank)."""
+        by_remote: dict[int, list[PairUnit]] = {}
+        for u in units:
+            remote = u.remote_dcp_size or self.dcp_size // 2
+            by_remote.setdefault(remote, []).append(u)
+        for remote, group_units in by_remote.items():
+            strides = exchange_strides(self.dcp_size, remote)
+            if len(strides) == 1:
+                # Ratio 2: the one-stage exchange of the units as planned.
+                self.stages[strides[0]].exchange(group_units)
+                continue
+            for stride in strides:
+                self.stages[stride].exchange(
+                    stage_units(group_units, self.dcp_rank, stride, remote)
+                )
+
+    def record_event(self) -> torch.cuda.Event:
+        return self.first.record_event()
+
+
+def build_dcp_staged_exchanger(
+    regions: Sequence[PairRegion],
+    *,
+    index_kernel_rows: int,
+    index_value_bytes: int,
+    dcp_rank: int,
+    dcp_size: int,
+    block_size: int,
+    interleave: int,
+    device: torch.device,
+    chunk_units: int = 4,
+) -> DcpStagedExchanger:
+    """The staged exchanger of a D rank: ``build_dcp_pair_exchanger`` at the
+    largest stride (P DCP = half this one), then the other strides' stages
+    sharing its buffers. Not warmed up."""
+    strides = all_exchange_strides(dcp_size)
+    if not strides:
+        raise NixlPairModeError(
+            f"DCP pair exchange needs an even DCP size, got {dcp_size}"
+        )
+
+    def layout(stride: int) -> PairLayout:
+        # The stage of ``stride`` exists for P DCP ``stride`` (its first stage).
+        return pair_layout(dcp_rank, dcp_size, stride, block_size, interleave)
+
+    first = build_dcp_pair_exchanger(
+        regions,
+        index_kernel_rows=index_kernel_rows,
+        index_value_bytes=index_value_bytes,
+        layout=layout(strides[0]),
+        device=device,
+        chunk_units=chunk_units,
+    )
+    stages = {strides[0]: first}
+    for stride in strides[1:]:
+        stages[stride] = first.for_layout(layout(stride))
+    return DcpStagedExchanger(stages, dcp_size)

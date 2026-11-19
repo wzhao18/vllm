@@ -356,7 +356,7 @@ def test_validate_hybrid_hetero_dcp_accepts(worker_kwargs, meta_kwargs):
         ({"pair": True}, {"interleave": 1}),
         (PAIR, {"interleave": None}),
         ({**PAIR, "mode": "push"}, {"interleave": 1}),
-        (PAIR, {"interleave": 1, "dcp": 4}),
+        (PAIR, {"interleave": 1, "dcp": 3}),
         ({"interleave": 16, "pair": True}, {"interleave": 16}),
         ({"block": 512, "phys": 8, "interleave": 1}, {}),
         # Pair mode moves half-blocks of equal per-rank blocks, without PCP.
@@ -369,7 +369,7 @@ def test_validate_hybrid_hetero_dcp_accepts(worker_kwargs, meta_kwargs):
         "decoder-at-block-interleave",
         "peer-without-interleave",
         "push-mode",
-        "dcp-ratio-not-2",
+        "dcp-ratio-not-pow2",
         "interleave-neither-1-nor-block",
         "with-block-size-mismatch",
         "pair-with-block-size-mismatch",
@@ -381,6 +381,31 @@ def test_validate_hybrid_hetero_dcp_interleave_mismatch_is_fatal(
 ):
     """Any other interleave combination needs a different mapping, so it stops
     the decoder (NixlPeerConfigMismatch) even alongside non-fatal problems."""
+    with pytest.raises(NixlPeerConfigMismatch, match="cp_kv_cache_interleave_size"):
+        _validate_hybrid(worker_kwargs, meta_kwargs)
+
+
+# The production pairing DEP16 prefill (TP1, DCP1) -> D3-32 decode (TP4 = DCP4,
+# interleave 1): staged pair mode at ratio 4 once the per-rank blocks match.
+DEP16_TO_DCP4 = {"block": 4096, "tp": 4, "dcp": 4, **PAIR}
+
+
+def test_validate_hybrid_hetero_dcp_accepts_dcp1_to_dcp4_staged():
+    _validate_hybrid(DEP16_TO_DCP4, {"block": 4096, "interleave": 1, "dcp": 1})
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,meta_kwargs",
+    [
+        # Unpinned P block (16384 at TP1) against D's 4096: not a pair peer.
+        (DEP16_TO_DCP4, {"block": 16384, "interleave": 1, "dcp": 1}),
+        # Ratio 3 is not a power of two.
+        ({"block": 4096, "tp": 12, "dcp": 12, **PAIR},
+         {"block": 4096, "interleave": 1, "dcp": 4}),
+    ],
+    ids=["dep16-unpinned-block", "ratio-3"],
+)
+def test_validate_hybrid_hetero_dcp_rejects_unstageable(worker_kwargs, meta_kwargs):
     with pytest.raises(NixlPeerConfigMismatch, match="cp_kv_cache_interleave_size"):
         _validate_hybrid(worker_kwargs, meta_kwargs)
 

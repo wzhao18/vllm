@@ -117,7 +117,7 @@ from vllm.v1.worker.utils import select_common_block_size
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
-        DcpPairExchanger,
+        DcpStagedExchanger,
         PairRegion,
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -137,6 +137,12 @@ class NixlPeerConfigMismatch(RuntimeError):
     """A peer whose configuration needs a different KV mapping, e.g. another
     DCP interleave. Fatal: the handshake records it and the worker's main thread
     re-raises it, instead of failing requests into a silent recompute."""
+
+
+def _is_pow2_ratio(ratio: int) -> bool:
+    """Whether a D/P DCP ratio is a power of two of at least 2 (the ratios
+    the staged DCP pair exchange serves)."""
+    return ratio >= 2 and ratio & (ratio - 1) == 0
 
 
 def _describe_interleave(interleave: int | None) -> str:
@@ -286,7 +292,7 @@ class NixlBaseConnectorWorker:
     # it rewrites, the last metadata whose exchanges ran, and the event recorded
     # after each step's exchanges with that step's metadata (see
     # finalize_loaded_kv).
-    _pair_exchanger: "DcpPairExchanger | None" = None
+    _pair_exchanger: "DcpStagedExchanger | None" = None
     _pair_group: int | None = None
     _pair_consumed: NixlConnectorMetadata | None = None
     _pair_events: tuple[tuple[NixlConnectorMetadata, torch.cuda.Event], ...] = ()
@@ -2515,17 +2521,16 @@ class NixlBaseConnectorWorker:
                 f"got {chunk_units!r}."
             )
         device = kv_caches[regions[0].layer_name].device
-        exchanger = dcp_pair_exchange.build_dcp_pair_exchanger(
+        # One stage per partner stride: P DCP = half this DCP size takes one
+        # stage, P DCP = DCP / R (R a power of two) log2(R) stages.
+        exchanger = dcp_pair_exchange.build_dcp_staged_exchanger(
             regions,
             index_kernel_rows=index_kernel_rows,
             index_value_bytes=index_value_bytes,
-            layout=dcp_pair_exchange.pair_layout(
-                self.dcp_rank,
-                self.dcp_size,
-                self.dcp_size // 2,
-                regions[0].spec.block_size,
-                self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
-            ),
+            dcp_rank=self.dcp_rank,
+            dcp_size=self.dcp_size,
+            block_size=regions[0].spec.block_size,
+            interleave=self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             device=device,
             chunk_units=chunk_units,
         )
@@ -3583,9 +3588,10 @@ class NixlBaseConnectorWorker:
         self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
     ) -> bool:
         """Whether this decoder pulls from the peer in DCP pair mode: interleave
-        1 on both sides, the same per-rank block, no PCP, local DCP = 2 x remote
-        DCP, and pull mode with ``dcp_pair_exchange`` on. Partner decoder ranks
-        then swap half-blocks after the reads."""
+        1 on both sides, the same per-rank block, no PCP, local DCP = R x remote
+        DCP with R a power of two (2, 4, ...), and pull mode with
+        ``dcp_pair_exchange`` on. Partner decoder ranks then swap half-blocks
+        after the reads, in log2(R) stages."""
         local_block = self.block_size * self._physical_blocks_per_logical_kv_block
         remote_block = (
             nixl_agent_meta.block_size
@@ -3596,7 +3602,8 @@ class NixlBaseConnectorWorker:
             self._dcp_pair_exchange is True
             and self._TRANSFER_MODE == "pull"
             and local_interleave == nixl_agent_meta.cp_kv_cache_interleave_size == 1
-            and self.dcp_size == 2 * remote_dcp_size
+            and self.dcp_size % remote_dcp_size == 0
+            and _is_pow2_ratio(self.dcp_size // remote_dcp_size)
             and local_block == remote_block
             and self.pcp_size == nixl_agent_meta.pcp_size == 1
         )
@@ -3626,7 +3633,7 @@ class NixlBaseConnectorWorker:
         return (
             "cp_kv_cache_interleave_size must equal the per-rank block size on "
             "each DCP-sharded side, or be 1 on both sides with the same per-rank "
-            "block, no PCP, local DCP = 2 x remote DCP, pull mode and "
+            "block, no PCP, local DCP = remote DCP x 2^k (k >= 1), pull mode and "
             f"dcp_pair_exchange on (local: DCP {self.dcp_size}, PCP "
             f"{self.pcp_size}, interleave {local_interleave}, block {local_block}, "
             f"{self._TRANSFER_MODE} mode, dcp_pair_exchange "

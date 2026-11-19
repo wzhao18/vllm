@@ -217,7 +217,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         num_external_tokens: int,
     ) -> None:
         """DCP pair mode: record the blocks partner ranks exchange once every
-        rank has pulled ``request`` from a prefiller with half this DCP size.
+        rank has pulled ``request`` from a prefiller with this DCP size over
+        a power of two (one exchange stage per factor of 2).
 
         Raises:
             NixlPairModeError: The prefiller did not advertise its DCP size, or
@@ -237,9 +238,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 f"{request.request_id} did not advertise its DCP size"
             )
         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
-        if remote_dcp_size * 2 != dcp_size:
-            # An equal DCP size needs no exchange; the handshake rejects others.
+        if remote_dcp_size == dcp_size:
+            # An equal DCP size needs no exchange; the handshake rejects
+            # ratios other than powers of two.
             return
+        ratio = dcp_size // remote_dcp_size
         remote_block_ids = params["remote_block_ids"]
         num_tokens = self._get_remote_prefill_token_count(
             len(request.prompt_token_ids or [])
@@ -256,6 +259,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             local_num_computed_blocks,
             remote_block_ids,
             self._pair_groups,
+            ratio=ratio,
+            remote_dcp_size=remote_dcp_size,
         ):
             self._pair_plans[request.request_id] = units
         if self._fingerprint:
