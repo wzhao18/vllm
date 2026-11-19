@@ -160,8 +160,8 @@ __device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
 // (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
 // write_outputs (verbatim) and the stager's route rules on warp 0.
 // Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
-// warp 0 selects the top-k of the 8 sorted warp lists (exact: the global top-k
-// is inside the union of the per-warp top-k).
+// warp 0 selects the top-k of the 8 sorted warp lists (exact:
+// the global top-k is inside the union of the per-warp top-k).
 __device__ __forceinline__ void route_block(const Args& a, int32_t row,
                                             const float (&lg)[kPer],
                                             const float* s_bias, float* s_unb,
@@ -578,20 +578,14 @@ class RouteStage:
             and experts.capture_fn is None
         )
 
-    def run(self, y: torch.Tensor, output_rmsnorm=None) -> torch.Tensor:
-        """Stage ``y``'s routes and latent, launch MegaMoE; returns its BF16
-        ``[n, latent]`` output (``output_rmsnorm`` applied in its reduce), as
-        ``experts(latent, topk_weights, topk_ids, output_rmsnorm=...)``."""
+    def stage(self, y: torch.Tensor):
+        """Stage ``y``'s routes and quantized latent into the MegaMoE session of
+        its bucket; returns the handle :meth:`launch` takes."""
         import vllm.envs as envs
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
-        from ....megamoe_rubin.experts import _rmsnorm_args
-
         experts = self.mlp.experts
         n = y.shape[0]
-        weights = experts.kernel_weights
-        if weights is None:
-            raise RuntimeError(f"{experts.prefix}: Rubin MegaMoE not prepared.")
         bucket = experts.select_bucket(n)
         rt = experts.get_runtime()
         session = rt.sessions[bucket]
@@ -619,7 +613,20 @@ class RouteStage:
             p.quant_kind == "nvfp4",
             float(p.input_norm_const),
         )
-        out = torch.empty((n, p.hidden), dtype=torch.bfloat16, device=y.device)
+        return rt, session, n
+
+    def launch(self, staged, output_rmsnorm=None) -> torch.Tensor:
+        """MegaMoE on a :meth:`stage`-d session: its BF16 ``[n, latent]`` output
+        (``output_rmsnorm`` applied in its reduce), as ``experts(latent,
+        topk_weights, topk_ids, output_rmsnorm=...)``."""
+        from ....megamoe_rubin.experts import _rmsnorm_args
+
+        rt, session, n = staged
+        experts = self.mlp.experts
+        weights = experts.kernel_weights
+        if weights is None:
+            raise RuntimeError(f"{experts.prefix}: Rubin MegaMoE not prepared.")
+        out = torch.empty((n, rt.problem.hidden), dtype=torch.bfloat16, device=session.topk_idx.device)
         rmsnorm = None if output_rmsnorm is None else _rmsnorm_args(output_rmsnorm)
         session.launch(weights, out, experts.ep_tokens(n), rmsnorm)
         owner = experts.prefix

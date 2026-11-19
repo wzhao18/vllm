@@ -51,8 +51,11 @@ SHARED = ("shared_gu", "shared_down")
 # (``moe.route_stage``) then runs stock's grouped top-k on the logits and the
 # MegaMoE stager on the latent, so the chain to MegaMoE is GEMM -> stage, not
 # router GEMM -> split-K reduce -> top-k -> (latent down join) -> stage.
-# Shard rows on the pinned GEMM (``ltpin``):
-ROUTER_LATENT = {"*": "25-104:ltpin"}
+# Shard rows on the pinned GEMM (``ltpin``). In-step (D3-32 NVFP4 slice, step
+# median vs the router || latent down pair): n32 / n64 -34..-39 / -52..-64 us per
+# 24-layer step; n96 +28..+54 (the GEMM at 96 rows is no faster than the pair), so
+# n96 keeps the stock pair:
+ROUTER_LATENT = {"*": "25-72:ltpin"}
 
 
 def _stock_threshold():
@@ -241,9 +244,12 @@ class SpMlp:
             packed, gemm, _ = self.router_latent
             y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
             gemm.run(packed, h, y)
+            # Staged before the shared expert forks to its stream: nothing
+            # competes with the MegaMoE front.
+            staged = route.stage(y)
 
             def experts():
-                return route.run(y, fused_norm)
+                return route.launch(staged, fused_norm)
 
         else:
             (router_output, topk_ids), routed = maybe_execute_in_parallel(
