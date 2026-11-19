@@ -84,7 +84,10 @@ __device__ __forceinline__ bool mbar_try(uint32_t bar, uint32_t parity) {
 __device__ __forceinline__ void wait_wd(uint32_t bar, uint32_t parity, int id, int c,
                                         long long* dbg) {
   for (uint32_t i = 0; !mbar_try(bar, parity); ++i) {
-    if (i == (1u << 22)) {
+    // Back off: a dozen warps polling mbarriers steal shared-memory and
+    // issue slots from the SIMT passes.
+    __nanosleep(64);
+    if (i == (1u << 20)) {
       atomicCAS(reinterpret_cast<unsigned long long*>(dbg), 0ull,
                 (1ull << 63) | (uint64_t(blockIdx.y) << 40) | (uint64_t(blockIdx.x) << 24) |
                     (uint64_t(threadIdx.x >> 5) << 16) | (uint64_t(id) << 10) | uint64_t(c & 1023));
