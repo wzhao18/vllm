@@ -52,8 +52,8 @@ constexpr int kOffSb = kOffKrm + 2 * kKrmSlot;   // B [16 kg][16 vg][8 k][8 v] b
 constexpr int kOffVn = kOffSb + 32768;           // B [8 tg][16 vg][8 t][8 v] bf16
 constexpr int kOffBar = kOffVn + 16384;
 // barriers: full_wq, empty_wq, full_u, empty_u, full_krm[2], empty_krm[2],
-// d1, d3, vnew_rdy, sb_rdy, o_rd
-constexpr int kNumBars = 13;
+// then per v-half chain h: d1, d3, vnew_rdy, sb_rdy, o_rd (at bar0 + 64 + 40 h)
+constexpr int kNumBars = 18;
 constexpr int kSmemBytes = kOffBar + 8 * kNumBars + 16;
 
 constexpr uint32_t kColD1 = 0;
@@ -84,9 +84,6 @@ __device__ __forceinline__ bool mbar_try(uint32_t bar, uint32_t parity) {
 __device__ __forceinline__ void wait_wd(uint32_t bar, uint32_t parity, int id, int c,
                                         long long* dbg) {
   for (uint32_t i = 0; !mbar_try(bar, parity); ++i) {
-    // Back off: a dozen warps polling mbarriers steal shared-memory and
-    // issue slots from the SIMT passes.
-    __nanosleep(64);
     if (i == (1u << 20)) {
       atomicCAS(reinterpret_cast<unsigned long long*>(dbg), 0ull,
                 (1ull << 63) | (uint64_t(blockIdx.y) << 40) | (uint64_t(blockIdx.x) << 24) |
@@ -124,8 +121,10 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
   const uint32_t bar0 = sbase + kOffBar;
   const uint32_t full_wq = bar0, empty_wq = bar0 + 8, full_u = bar0 + 16, empty_u = bar0 + 24;
   const uint32_t full_krm0 = bar0 + 32, empty_krm0 = bar0 + 48;
-  const uint32_t d1_bar = bar0 + 64, d3_bar = bar0 + 72, vnew_rdy = bar0 + 80;
-  const uint32_t sb_rdy = bar0 + 88, o_rd = bar0 + 96;
+  // The two v halves of S are independent chains (v columns never mix):
+  // each has its own issuer and hand-off barriers, so one half's MMAs run
+  // under the other half's SIMT passes.
+  auto hb = [&](int h, int i) { return bar0 + 64 + 40 * uint32_t(h) + 8 * uint32_t(i); };
   uint32_t* tmem_slot = reinterpret_cast<uint32_t*>(smem + kOffBar + 8 * kNumBars);
 
   // Rows 0-63 of both Mqk A images stay zero (MMA2's dead lanes 0-63).
@@ -136,18 +135,20 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
   }
   if (threadIdx.x == 0) {
     mbar_init(full_wq, 1);
-    mbar_init(empty_wq, 1);
+    mbar_init(empty_wq, 2);
     mbar_init(full_u, 1);
     mbar_init(empty_u, 4);
     for (int s = 0; s < 2; ++s) {
       mbar_init(full_krm0 + 8 * s, 1);
-      mbar_init(empty_krm0 + 8 * s, 1);
+      mbar_init(empty_krm0 + 8 * s, 2);
     }
-    mbar_init(d1_bar, 1);
-    mbar_init(d3_bar, 1);
-    mbar_init(vnew_rdy, 4);
-    mbar_init(sb_rdy, 8);
-    mbar_init(o_rd, 4);
+    for (int h = 0; h < 2; ++h) {
+      mbar_init(hb(h, 0), 1);
+      mbar_init(hb(h, 1), 1);
+      mbar_init(hb(h, 2), 2);
+      mbar_init(hb(h, 3), 4);
+      mbar_init(hb(h, 4), 2);
+    }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   if (warp == 1) {
@@ -188,11 +189,6 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
         if (c >= 1) wait_wd(empty_wq, uint32_t(c - 1) & 1u, 1, c, dbg);
         mbar_expect_tx(full_wq, 32768);
         bulk_g2s(sbase + kOffWq, wq_img + img(c) * (2 * kC * kD), 32768, full_wq);
-      }
-    }
-  } else if (warp == 2) {
-    if (lane == 0) {
-      for (int c = 0; c < n_chunks; ++c) {
         if (c >= 1) wait_wd(empty_u, uint32_t(c - 1) & 1u, 2, c, dbg);
         mbar_expect_tx(full_u, 16384);
         bulk_g2s(sbase + kOffU, u_img + img(c) * (kC * kD), 16384, full_u);
@@ -213,11 +209,14 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
         bulk_g2s(sbase + krm(s) + 32768, gt_ptr + img(c) * kD, 512, fb);
       }
     }
-  } else if (warp == 1) {
+  } else if (warp == 1 || warp == 2) {
+    const int h = warp - 1;
+    const uint32_t d1_bar = hb(h, 0), d3_bar = hb(h, 1), vnew_rdy = hb(h, 2);
+    const uint32_t sb_rdy = hb(h, 3), o_rd = hb(h, 4);
     if (lane == 0 && n_chunks > 0) {
-      constexpr uint32_t kI = idesc_bf16(128, 1);  // A K-major, B MN-major, M128 N128
+      constexpr uint32_t kI = idesc_bf16(64, 1);  // A K-major, B MN-major, M128 N64
       auto stamp = [&](int c, int slot) {
-        if (dbg_cta && c < 96) dbg[16 + c * 8 + slot] = clock64();
+        if (dbg_cta && h == 0 && c < 96) dbg[16 + c * 8 + slot] = clock64();
       };
       for (int c = 0; c < n_chunks; ++c) {
         const int s = c & 1;
@@ -229,8 +228,8 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
         stamp(c, 1);
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-          mma_ss(tmem + kColD1, sdesc(sbase + kOffWq + 4096 * j, 2048, 128),
-                 sdesc(sbase + kOffSb + 4096 * j, 2048, 128), kI, j != 0);
+          mma_ss(tmem + kColD1 + 64 * h, sdesc(sbase + kOffWq + 4096 * j, 2048, 128),
+                 sdesc(sbase + kOffSb + 1024 * h + 4096 * j, 2048, 128), kI, j != 0);
         tc_commit(d1_bar);
         tc_commit(empty_wq);
         wait_wd(vnew_rdy, uint32_t(c) & 1u, 7, c, dbg);
@@ -239,12 +238,12 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
         stamp(c, 2);
 #pragma unroll
         for (int j = 0; j < 4; ++j)
-          mma_ss(tmem + kColD1, sdesc(sbase + krm(s) + 16384 + 4096 * j, 2048, 128),
-                 sdesc(sbase + kOffVn + 4096 * j, 2048, 128), kI, 1);
+          mma_ss(tmem + kColD1 + 64 * h, sdesc(sbase + krm(s) + 16384 + 4096 * j, 2048, 128),
+                 sdesc(sbase + kOffVn + 1024 * h + 4096 * j, 2048, 128), kI, 1);
 #pragma unroll
         for (int j = 0; j < 4; ++j)
-          mma_ss(tmem + kColS, sdesc(sbase + krm(s) + 4096 * j, 2048, 128),
-                 sdesc(sbase + kOffVn + 4096 * j, 2048, 128), kI, 1);
+          mma_ss(tmem + kColS + 64 * h, sdesc(sbase + krm(s) + 4096 * j, 2048, 128),
+                 sdesc(sbase + kOffVn + 1024 * h + 4096 * j, 2048, 128), kI, 1);
         tc_commit(d3_bar);
         tc_commit(empty_krm0 + 8 * s);
         stamp(c, 3);
@@ -254,6 +253,8 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
     // SIMT warps: quadrant qd (tensor-memory lanes 32 qd ..), column half hv.
     const int qd = warp & 3;
     const int hv = (warp - 4) >> 2;
+    const uint32_t d1_bar = hb(hv, 0), d3_bar = hb(hv, 1), vnew_rdy = hb(hv, 2);
+    const uint32_t sb_rdy = hb(hv, 3), o_rd = hb(hv, 4);
     const int r = 32 * qd + lane;  // lane row: token (D1) or k (S)
     const uint32_t trow = tmem + (uint32_t(32 * qd) << 16);
     uint4* sb = reinterpret_cast<uint4*>(smem + kOffSb);
