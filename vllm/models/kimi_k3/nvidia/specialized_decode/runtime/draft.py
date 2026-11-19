@@ -2019,6 +2019,8 @@ def _vp_markov_keys(
 def _vp_markov_fused(
     keys_ptr,
     emb_ptr,
+    anchors_ptr,
+    w1_ptr,
     w2_ptr,
     base_ptr,
     base_stride,
@@ -2042,6 +2044,7 @@ def _vp_markov_fused(
     BK: tl.constexpr,
     RANK: tl.constexpr,
     TP: tl.constexpr,
+    ANCHORED: tl.constexpr,
 ):
     """``_vp_markov_keys`` with the Markov bias of its columns computed in place:
     one program per BN vocabulary columns and every request (BM-row tiles), the bias
@@ -2057,9 +2060,15 @@ def _vp_markov_fused(
         reqs = m0 + tl.arange(0, BM)
         live_m = reqs < batch
         acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if ANCHORED:  # the first position: markov_w1 rows of the anchors
+            src = w1_ptr + tl.load(anchors_ptr + reqs, mask=live_m, other=0).to(
+                tl.int64
+            )[:, None] * RANK
+        else:  # emb: the rows the previous position's select copied
+            src = emb_ptr + reqs[:, None] * RANK
         for k0 in tl.static_range(0, RANK, BK):
             a = tl.load(
-                emb_ptr + reqs[:, None] * RANK + (k0 + ks)[None, :],
+                src + (k0 + ks)[None, :],
                 mask=live_m[:, None],
                 other=0.0,
             )
@@ -2290,7 +2299,10 @@ class VocabParallelMarkov:
         if draft.shape != (batch, self.steps) or draft.stride(1) != 1:
             raise ValueError(f"Markov drafting: unexpected draft {tuple(draft.shape)}")
         keys, emb = self._buffers(batch)
-        torch.index_select(self.w1, 0, anchors.long(), out=emb)
+        poll = self.box is not None
+        fused = poll and batch <= VP_MARKOV_FUSED_ROWS
+        if not fused:
+            torch.index_select(self.w1, 0, anchors.long(), out=emb)
         sampled = sampling is not None
         if sampled:
             temperature, seeds, slots, positions, cache = sampling
@@ -2300,16 +2312,16 @@ class VocabParallelMarkov:
             strides = (0, 0)
         grid = (batch, triton.cdiv(self.vocab_rank, VP_MARKOV_BLOCK))
         lo = self.rank * self.vocab_rank
-        poll = self.box is not None
         if poll and batch > self.cap:
             raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
-        fused = poll and batch <= VP_MARKOV_FUSED_ROWS
         bm = min(128, max(16, triton.next_power_of_2(batch)))
         for step in range(self.steps):
             if fused:
                 _vp_markov_fused[(self.vocab_rank // VP_MARKOV_BN,)](
                     keys,
                     emb,
+                    anchors,
+                    self.w1,
                     self.w2,
                     base,
                     base.stride(0),
@@ -2332,6 +2344,7 @@ class VocabParallelMarkov:
                     BK=64,
                     RANK=self.markov_rank,
                     TP=self.tp,
+                    ANCHORED=step == 0,
                     num_warps=8,
                 )
                 _vp_markov_select[(batch,)](
