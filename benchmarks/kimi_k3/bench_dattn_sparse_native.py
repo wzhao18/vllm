@@ -126,7 +126,7 @@ def main():
     p.add_argument("--stages", type=int, default=3)
     p.add_argument("--clusters", type=int, default=0)
     p.add_argument("--stamps", action="store_true")
-    p.add_argument("--loaders", type=int, default=14)
+    p.add_argument("--loaders", type=int, default=17)
     p.add_argument("--no-mc", action="store_true")
     p.add_argument("--cpa", type=int, default=0, help="km: TMA latent blocks, rest by cp.async (0: all TMA)")
     p.add_argument("--no-epi-store", action="store_true", help="km: drop epilogue stores")
