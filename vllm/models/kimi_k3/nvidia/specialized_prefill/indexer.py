@@ -1870,41 +1870,59 @@ class RecPlan:
         tot_a = sum_a + (RP_THREADS // 32) * 4
         t = row_len.shape[0]
         n = items.shape[0]
-        for i in cutlass.range(tid, t, RP_THREADS, unroll=1):
-            v = Int32(-1)
-            if row_bin[3 * i + 1] != 0:
-                v = row_len[i]
-            rec_len[i] = v
-        base = Uint32(0)
-        for c0 in cutlass.range(0, n, RP_THREADS, unroll=1):
-            item = c0 + tid
-            act = Uint32(0)
-            if item < n:
-                tok0 = items[item, 0]
-                ntok = items[item, 1]
-                for k in cutlass.range_constexpr(BQ):
-                    if k < ntok:
-                        if row_bin[3 * (tok0 + k) + 1] != 0:
-                            act = Uint32(1)
-            b = ballot(act)
-            if lane == 0:
-                st_shared_u32(sum_a + w * 4, popc(b))
-            cute.arch.sync_threads()
-            if w == 0:
-                v = ld_shared_u32(sum_a + lane * 4)
-                inc = warp_inclusive(v, lane)
-                st_shared_u32(sum_a + lane * 4, inc - v)
-                if lane == 31:
-                    st_shared_u32(tot_a, inc)
-            cute.arch.sync_threads()
-            if act != Uint32(0):
-                dst = Int32(base + ld_shared_u32(sum_a + w * 4) + popc(b & lanemask_lt()))
-                for k in cutlass.range_constexpr(4):
-                    items_rec[dst, k] = items[item, k]
-            base = base + ld_shared_u32(tot_a)
-            cute.arch.sync_threads()
+        # no flagged row (the common case): nothing to recover
         if tid == 0:
-            n_active[0] = Int32(base)
+            st_shared_u32(tot_a, Uint32(0))
+        cute.arch.sync_threads()
+        anyf = Uint32(0)
+        for i in cutlass.range(tid, t, RP_THREADS, unroll=4):
+            if row_bin[3 * i + 1] != 0:
+                anyf = Uint32(1)
+        anyw = ballot(anyf)
+        if lane == 0:
+            if anyw != Uint32(0):
+                st_shared_u32(tot_a, Uint32(1))
+        cute.arch.sync_threads()
+        if ld_shared_u32(tot_a) == Uint32(0):
+            if tid == 0:
+                n_active[0] = Int32(0)
+        else:
+            cute.arch.sync_threads()
+            for i in cutlass.range(tid, t, RP_THREADS, unroll=1):
+                v = Int32(-1)
+                if row_bin[3 * i + 1] != 0:
+                    v = row_len[i]
+                rec_len[i] = v
+            base = Uint32(0)
+            for c0 in cutlass.range(0, n, RP_THREADS, unroll=1):
+                item = c0 + tid
+                act = Uint32(0)
+                if item < n:
+                    tok0 = items[item, 0]
+                    ntok = items[item, 1]
+                    for k in cutlass.range_constexpr(BQ):
+                        if k < ntok:
+                            if row_bin[3 * (tok0 + k) + 1] != 0:
+                                act = Uint32(1)
+                b = ballot(act)
+                if lane == 0:
+                    st_shared_u32(sum_a + w * 4, popc(b))
+                cute.arch.sync_threads()
+                if w == 0:
+                    v = ld_shared_u32(sum_a + lane * 4)
+                    inc = warp_inclusive(v, lane)
+                    st_shared_u32(sum_a + lane * 4, inc - v)
+                    if lane == 31:
+                        st_shared_u32(tot_a, inc)
+                cute.arch.sync_threads()
+                if act != Uint32(0):
+                    dst = Int32(base + ld_shared_u32(sum_a + w * 4) + popc(b & lanemask_lt()))
+                    for k in cutlass.range_constexpr(4):
+                        items_rec[dst, k] = items[item, k]
+                base = base + ld_shared_u32(tot_a)
+                cute.arch.sync_threads()
+            if tid == 0:
+                n_active[0] = Int32(base)
 
 
 @functools.cache
