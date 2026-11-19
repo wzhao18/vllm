@@ -83,7 +83,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Float32, Int32, Int64
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
@@ -908,6 +908,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         shared_fc2_weight: Optional[cute.Tensor] = None,  # (1, shared_intermediate_downproj, shared_output)
         shared_fc2_weight_sf: Optional[cute.Tensor] = None,  # (1, packed)
         shared_output: Optional[cute.Tensor] = None,  # (max_tokens_per_rank, shared_output) BF16, local
+        rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a, output = rms_norm(reduce)
+        rmsnorm_eps: Optional[Float32] = None,
     ) -> None:
         """Launch generation-phase dispatch, fused FC12, and the optional top-k reduce."""
         check_reduce_operand_alignment(output_activation=output_activation, shared_output=shared_output)
@@ -1233,7 +1235,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 stream,
                 topk_indices=topk_indices,
                 shared_term=shared_output if cutlass.const_expr(self.reduce_shared_output) else None,
+                rmsnorm_weight=rmsnorm_weight,
+                rmsnorm_eps=rmsnorm_eps,
             )
+        elif cutlass.const_expr(rmsnorm_weight is not None):
+            raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
 
     @property
     def lazy_comm_waits(self) -> bool:

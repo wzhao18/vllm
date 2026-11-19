@@ -273,6 +273,10 @@ p50 (682 vs 731 us).
   shared under ``("decode", L)``). Without a lead only. Shared FC1 is claimed before the
   expert-sizes gate (it streams under the dispatch); the scheduler warp's explicit decode sizes
   wait is skipped when the shared stream owns the gate.
+- **E2a** (vLLM-local, as for ``src``): ``TopkReduce._reduce_bf16_ll_rmsnorm``: the polled BF16 reduce
+  of one token row per CTA followed by the consumer's stock RMSNorm (``rmsnorm_weight`` /
+  ``rmsnorm_eps`` through the GenPhase kernel's ``__call__``), replacing the separate
+  ``rms_norm`` launch after the GenPhase bucket.
 - **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
   (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
   own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing
