@@ -163,6 +163,13 @@ logger = init_logger(__name__)
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
+def packed_situ_gemm_deinterleave(y_sh: torch.Tensor) -> torch.Tensor:
+    """``[gate | up]`` of packed shared gate_up columns whose weight rows are
+    interleaved in 128-row chunks (``sm107_gemm.interleave_shared_rows``)."""
+    m, n_sh = y_sh.shape
+    return y_sh.unflatten(1, (n_sh // 256, 2, 128)).transpose(1, 2).reshape(m, n_sh)
+
+
 def shard_sequence_parallel_mlp(
     hidden_size: int,
     intermediate_size: int,
@@ -1007,6 +1014,36 @@ class KimiMoE(nn.Module):
             latent,
             inter,
         )
+        self._situ_gemm = self._packed_situ_gemm(shared, self._packed_moe[0], latent)
+
+    @staticmethod
+    def _packed_situ_gemm(shared, pack_n, latent: int):
+        """On SM107 with a SiTU shared expert: the packed GEMM with the shared
+        SiTU + MXFP8 epilogue (specialized_prefill.sm107_gemm). Interleaves the
+        shared gate/up rows of the packed weight in place, so the unfused
+        ``pack_n`` output needs ``deinterleave_shared_cols``."""
+        if not current_platform.is_device_capability((10, 7)) or not isinstance(
+            shared.act_fn, (SituAndMul, KimiVecSituAndMul)
+        ):
+            return None
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import (
+            packed_situ_gemm,
+        )
+
+        holder = pack_n.holder
+        weight = holder.weight.data.t()
+        if not weight.is_contiguous():
+            raise RuntimeError("packed SiTU GEMM needs the [N, K] K-major weight")
+        packed_situ_gemm.interleave_shared_rows(
+            weight, holder.weight_scale.data, latent, weight.shape[1]
+        )
+        return packed_situ_gemm.PackedSituGemm(
+            weight,
+            holder.weight_scale.data,
+            latent,
+            shared.act_fn.beta,
+            shared.act_fn.linear_beta,
+        )
 
     def _grouped_topk(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
@@ -1067,22 +1104,36 @@ class KimiMoE(nn.Module):
         pack_n, pack_k, latent, inter = self._packed_moe
         num_tokens = hidden_states.shape[0]
         x = mxfp8_act.quantize(hidden_states)
-        (router_output, topk_ids), y = maybe_execute_in_parallel(
+        # [act(shared gate_up) | norm(routed latent out)]: the packed down/up
+        # GEMM input; the shared half is written before MegaMoE runs.
+        act = mxfp8_act.Mxfp8Buffer(
+            num_tokens, inter + latent, hidden_states.device, hidden_states.dtype
+        )
+        situ = self._situ_gemm
+        if situ is not None and num_tokens >= mxfp8_act.SITU_FAST_MIN_ROWS:
+            # The shared SiTU (mode 4, as situ_and_mul_quantize_auto at these
+            # row counts) runs in the packed GEMM's epilogue.
+            y = hidden_states.new_empty((num_tokens, latent))
+            front = lambda: situ(x.data, x.scale, act, y)  # noqa: E731
+        else:
+            y = None
+            front = lambda: pack_n(x)  # noqa: E731
+        (router_output, topk_ids), out = maybe_execute_in_parallel(
             lambda: self._router(hidden_states),
-            lambda: pack_n(x),
+            front,
             self._down_proj_events[0],
             self._down_proj_events[1],
             self._down_proj_stream
             if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
             else None,
         )
-        # [act(shared gate_up) | norm(routed latent out)]: the packed down/up
-        # GEMM input; the shared half is written before MegaMoE runs.
-        act = mxfp8_act.Mxfp8Buffer(
-            num_tokens, inter + latent, hidden_states.device, hidden_states.dtype
-        )
-        self.shared_experts.act_mxfp8_into(y[:, latent:], act, 0)
-        routed = self._routed_experts(y[:, :latent], router_output, topk_ids)
+        if y is None:
+            y_sh = out[:, latent:]
+            if situ is not None:
+                y_sh = packed_situ_gemm_deinterleave(y_sh)
+            self.shared_experts.act_mxfp8_into(y_sh, act, 0)
+            y = out[:, :latent]
+        routed = self._routed_experts(y, router_output, topk_ids)
         norm = self.routed_output_transform.norm
         mxfp8_act.rms_norm_quantize(
             routed, norm.weight, norm.variance_epsilon, out=act, col=inter
