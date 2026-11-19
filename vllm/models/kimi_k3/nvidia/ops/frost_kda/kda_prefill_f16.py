@@ -3722,6 +3722,11 @@ def build_cfg(
         if cfg.conv_dbg & 2:
             cfg.num_regs_compute_group_0 = 136
             cfg.num_regs_compute_group_1 = 128
+        if cfg.conv_dbg & 16:
+            cfg.num_regs_compute_group_0 = 96
+            cfg.num_regs_compute_group_1 = 96
+            cfg.num_regs_other = 96
+            cfg.num_regs_conv = 96
         cfg.vconv_cosize = cfg.vconv_stages * cfg.d_v * cfg.b_t
         cfg.conv_w_cosize = 3 * 4 * cfg.d_k
         cfg.qkconv_cosize = cfg.vconv_stages * cfg.d_k * cfg.b_t
