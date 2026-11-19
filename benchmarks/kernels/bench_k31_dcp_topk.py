@@ -39,7 +39,7 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
              7: "radix", 17: "gtt", 18: "write scan", 8: "end"}
-STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "-", "-")
+STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
 
 
 def make_logits(case, T, width, Lloc, gen, dev):
@@ -121,7 +121,17 @@ def main():
         for case in a.cases.split(","):
             g2 = torch.Generator(device=dev)
             g2.manual_seed(99 + 7 * rank + B)
-            logits = make_logits(case, T, width, L, g2, dev)
+            if case.startswith("dump:"):  # logits / lengths dumped from a decode step
+                dmp = torch.load(case[5:].replace("{rank}", str(rank)))
+                assert dmp["logits"].shape[0] == T, (dmp["logits"].shape, T)
+                L = dmp["local"].to(dev, torch.int32).contiguous()
+                G = dmp["glob"].to(dev, torch.int32).contiguous()
+                logits = torch.full((T, width), float("nan"), dtype=torch.bfloat16, device=dev)
+                logits[:, : dmp["logits"].shape[1]] = dmp["logits"].to(dev)
+                if rank == 0:
+                    print("dump stats", dmp["stats"].tolist(), "L", int(L.min()), int(L.max()), flush=True)
+            else:
+                logits = make_logits(case, T, width, L, g2, dev)
 
             segcap = 0
 
