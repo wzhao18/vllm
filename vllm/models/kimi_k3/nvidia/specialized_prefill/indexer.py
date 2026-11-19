@@ -58,7 +58,7 @@ N = BQ * HEADS  # MMA N
 KV_STAGES = 6
 Q_STAGES = 2
 ACC_STAGES = 2
-EPI_WG = 4  # epilogue warpgroups (2 tokens per thread)
+EPI_WG = 2  # epilogue warpgroups (4 tokens per thread)
 TOK_WG = BQ // EPI_WG  # tokens per epilogue warpgroup
 PRODUCER = 4 * EPI_WG
 MMA_WARP = PRODUCER + 1
@@ -736,17 +736,20 @@ class IndexerScore:
         self, tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
         logits, row_bin, sm, warp, tidx, bid, lane,
     ):
-        """Every epilogue warp reads every tile: warpgroup wg owns tokens 2 wg and
-        2 wg + 1 of the item, its warp w % 4 the TMEM lane quarter (32 keys). The
-        head weights of the two tokens stay in registers for the whole item. Tiles
-        come in pairs (accumulator stages 0 and 1; items have an even tile count),
-        each read with one 32-head load per token and released at once. Each thread
-        forms the BF16 logits of its key for both tokens at stock precision, stores
-        them straight to the row-major scratch (row t at row_base[t], MMA-row order;
-        tokens past the item's end write a dummy row) and counts them in the row's
-        histogram of the top 11 bits. At the end of the item the warpgroup finds,
-        per row, the rank (in value order) of the bin holding the topk-th largest
-        logit and the count above it (``row_bin``), for the select."""
+        """Every epilogue warp reads every tile: warpgroup wg owns tokens
+        TOK_WG * wg .. TOK_WG * wg + TOK_WG - 1 of the item (two token pairs, A and
+        B), its warp w % 4 the TMEM lane quarter (32 keys). The head weights of the
+        tokens stay in registers for the whole item. Tiles come in pairs
+        (accumulator stages 0 and 1; items have an even tile count), each read with
+        one 32-head load per token and released once all are read. Each thread
+        forms the BF16 logits of its key for its tokens at stock precision and
+        stores them straight to the row-major scratch (row t at row_base[t],
+        MMA-row order; tokens past the item's end write a dummy row) and counts
+        them in the row's histogram of the top 11 bits, or (PUBLISH) keeps the
+        keys at or above the row's threshold in its candidate column. At the end
+        of an item (store mode) the warpgroup finds, per row, the rank (in value
+        order) of the bin holding the topk-th largest logit and the count above it
+        (``row_bin``), for the select."""
         end_a, w_a, hist_a, wscan_a = sm
         wg = warp // 4
         lt = tidx % 128
@@ -756,13 +759,12 @@ class IndexerScore:
         jq = Int32(0)
         n_rows = row_base.shape[0] - 1
         key_in_tile = 4 * (lt % 32) + lt // 32
-        tok_a = 2 * wg
+        tok_a = TOK_WG * wg
         # this warp's TMEM lane quarter, column 0 of accumulator stage 0
         tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * HEADS
         hist0 = hist_a + tok_a * (S_BINS * 4)
-        hist1 = hist0 + S_BINS * 4
         # zero the histograms once (re-zeroed after every item)
-        for i in cutlass.range_constexpr(2 * S_BINS // 128):
+        for i in cutlass.range_constexpr(TOK_WG * S_BINS // 128):
             st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
         wg_sync(wg)
         for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
@@ -771,46 +773,48 @@ class IndexerScore:
             ntiles = items[item, 3]
             qs = jq % Q_STAGES
             cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
-            end0 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a) * 4))
-            end1 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a + 1) * 4))
-            row0 = token0 + tok_a
-            row1 = token0 + tok_a + 1
-            if tok_a >= ntok:
-                row0 = n_rows
-            if tok_a + 1 >= ntok:
-                row1 = n_rows
+            ends = []
+            rows = []
+            for i in cutlass.range_constexpr(TOK_WG):
+                ends.append(Int32(ld_shared_u32(end_a + (qs * BQ + tok_a + i) * 4)))
+                ri = token0 + tok_a + i
+                if tok_a + i >= ntok:
+                    ri = n_rows
+                rows.append(ri)
             ntp = ntiles + (ntiles & 1)
             # running pointers: position lt of the item's newest tile pair's first tile
             first = Int64((ntp - 1) * TILE + lt) * 2
-            ptr0 = out_a + row_base[row0] * 2 + first
-            ptr1 = out_a + row_base[row1] * 2 + first
-            thr = Uint32(0)
-            cand0 = ptr0
-            cand1 = ptr1
-            p0 = ptr0
-            p1 = ptr1
-            lim0 = ptr0
-            lim1 = ptr1
+            ptr0 = out_a + row_base[rows[0]] * 2 + first
+            ptr1 = out_a + row_base[rows[1]] * 2 + first
+            ptr2 = out_a + row_base[rows[2]] * 2 + first
+            ptr3 = out_a + row_base[rows[3]] * 2 + first
+            thr_a = Uint32(0)
+            thr_b = Uint32(0)
+            cands = [ptr0, ptr1, ptr2, ptr3]
+            p0, p1, p2, p3 = ptr0, ptr1, ptr2, ptr3
+            lims = [ptr0, ptr1, ptr2, ptr3]
             if cutlass.const_expr(self.mode >= PUBLISH):
-                # BF16 thresholds of both rows (row_bin[3 r], the dummy row's is NaN)
-                # and their candidate lists (row_base in 16-bit units)
-                thr = (Uint32(row_bin[3 * row1]) << Uint32(16)) | (
-                    Uint32(row_bin[3 * row0]) & Uint32(0xFFFF)
+                # BF16 thresholds of each token pair's rows (row_bin[3 r], the dummy
+                # row's is NaN) and their candidate lists (row_base in 16-bit
+                # units): this thread's column of each row's candidate region, word
+                # 0 the count, then one word per kept key (tile << 16 | BF16)
+                thr_a = (Uint32(row_bin[3 * rows[1]]) << Uint32(16)) | (
+                    Uint32(row_bin[3 * rows[0]]) & Uint32(0xFFFF)
                 )
-                # this thread's column of each row's candidate region: word 0
-                # the count, then one word per kept key (tile << 16 | BF16)
-                cand0 = out_a + row_base[row0] * 2 + lt * 4
-                cand1 = out_a + row_base[row1] * 2 + lt * 4
-                p0 = cand0 + TILE * 4
-                p1 = cand1 + TILE * 4
-                lim0 = cand0 + REGION * 4
-                lim1 = cand1 + REGION * 4
-            # tile pairs whose newer tile reaches past a row end (causal edge)
-            full_tiles = cutlass.min(end0, end1) // TILE
-            # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
+                thr_b = (Uint32(row_bin[3 * rows[3]]) << Uint32(16)) | (
+                    Uint32(row_bin[3 * rows[2]]) & Uint32(0xFFFF)
+                )
+                cands = [out_a + row_base[rows[i]] * 2 + lt * 4 for i in range(TOK_WG)]
+                p0 = cands[0] + TILE * 4
+                p1 = cands[1] + TILE * 4
+                p2 = cands[2] + TILE * 4
+                p3 = cands[3] + TILE * 4
+                lims = [cands[i] + REGION * 4 for i in range(TOK_WG)]
+            full_tiles = cutlass.min(cutlass.min(ends[0], ends[1]), cutlass.min(ends[2], ends[3])) // TILE
+            # head weights (BF16x2) of the tokens: w[j][i] = heads 2i, 2i + 1
             wbase = w_a + (qs * BQ * 16 + tok_a * 16) * 4
             w = []
-            for j in cutlass.range_constexpr(2):
+            for j in cutlass.range_constexpr(TOK_WG):
                 wj = []
                 for i in cutlass.range_constexpr(4):
                     v = lds_v4(wbase + (j * 16 + 4 * i) * 4)
@@ -824,30 +828,34 @@ class IndexerScore:
             # the rest run without masking
             n_edge = cutlass.max(ntp + 1 - full_tiles, 0) // 2
             for pp in cutlass.range(n_edge, unroll=1):
-                ptr0, ptr1, p0, p1 = self.tile_pair(
-                    True, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
-                    key_in_tile, hist0, hist1,
+                ptr0, ptr1, ptr2, ptr3, p0, p1, p2, p3 = self.tile_pair(
+                    True, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane, w,
+                    ptr0, ptr1, ptr2, ptr3, p0, p1, p2, p3, thr_a, thr_b, lims, ends,
+                    ntiles, key_in_tile, hist0,
                 )
                 ph = ph ^ 1
             for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
-                ptr0, ptr1, p0, p1 = self.tile_pair(
-                    False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
-                    key_in_tile, hist0, hist1,
+                ptr0, ptr1, ptr2, ptr3, p0, p1, p2, p3 = self.tile_pair(
+                    False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane, w,
+                    ptr0, ptr1, ptr2, ptr3, p0, p1, p2, p3, thr_a, thr_b, lims, ends,
+                    ntiles, key_in_tile, hist0,
                 )
                 ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
-                # this thread's candidate counts of both rows
+                # this thread's candidate counts of its rows
                 # (a full column counts as overflowed: the row is recomputed)
-                st_global_u32(cand0, Uint32((p0 - cand0) // (TILE * 4) - 1))
-                st_global_u32(cand1, Uint32((p1 - cand1) // (TILE * 4) - 1))
+                ps = [p0, p1, p2, p3]
+                for i in cutlass.range_constexpr(TOK_WG):
+                    st_global_u32(cands[i], Uint32((ps[i] - cands[i]) // (TILE * 4) - 1))
             else:
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
-                self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-                self.row_bound(hist1, end1, row1, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-                for i in cutlass.range_constexpr(2 * S_BINS // 128):
+                for i in cutlass.range_constexpr(TOK_WG):
+                    self.row_bound(
+                        hist0 + i * S_BINS * 4, ends[i], rows[i], n_rows, row_bin,
+                        wscan_a + wg * 16, wg, lt, wq, lane,
+                    )
+                for i in cutlass.range_constexpr(TOK_WG * S_BINS // 128):
                     st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
                 wg_sync(wg)
             jq += 1
@@ -855,13 +863,14 @@ class IndexerScore:
     @cute.jit
     def tile_pair(
         self, edge: cutlass.Constexpr, t_hi, ph, tmem_q, acc_full, acc_empty, lane, w,
-        ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles, key_in_tile, hist0,
-        hist1,
+        ptr0, ptr1, ptr2, ptr3, p0, p1, p2, p3, thr_a, thr_b, lims, ends, ntiles,
+        key_in_tile, hist0,
     ):
         """Both accumulator stages of one tile pair (tiles t_hi and t_hi - 1): the
-        BF16 logits of this thread's key for its two tokens, stored (mode < PUBLISH,
-        plus the histograms) or published. ``edge``: mask keys past the row ends
-        and the repeated tile of an odd count."""
+        BF16 logits of this thread's key for its tokens (pair A: tokens 0, 1, pair
+        B: tokens 2, 3), stored (mode < PUBLISH, plus the histograms) or
+        published. ``edge``: mask keys past the row ends and the repeated tile of
+        an odd count."""
         for st in cutlass.range_constexpr(ACC_STAGES):
             t = t_hi - st
             cute.arch.mbarrier_wait(acc_full + st, ph)
@@ -870,33 +879,52 @@ class IndexerScore:
             fb = tmem_ld32(col + HEADS)
             fa = tmem_wait32(*fa)
             fb = tmem_wait32(*fb)
+            ra = self.reduce2((fa, fb), w[0], w[1])
+            fc = tmem_ld32(col + 2 * HEADS)
+            fd = tmem_ld32(col + 3 * HEADS)
+            fc = tmem_wait32(*fc)
+            fd = tmem_wait32(*fd)
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(acc_empty + st)
-            r = self.reduce2((fa, fb), w[0], w[1])
+            rb = self.reduce2((fc, fd), w[2], w[3])
             if cutlass.const_expr(edge):
                 kidx = t * TILE + key_in_tile
-                if kidx >= end0 or t >= ntiles:
-                    r = r | Uint32(0xFFFF)
-                if kidx >= end1 or t >= ntiles:
-                    r = r | Uint32(0xFFFF0000)
+                if kidx >= ends[0] or t >= ntiles:
+                    ra = ra | Uint32(0xFFFF)
+                if kidx >= ends[1] or t >= ntiles:
+                    ra = ra | Uint32(0xFFFF0000)
+                if kidx >= ends[2] or t >= ntiles:
+                    rb = rb | Uint32(0xFFFF)
+                if kidx >= ends[3] or t >= ntiles:
+                    rb = rb | Uint32(0xFFFF0000)
             if cutlass.const_expr(self.mode >= PUBLISH):
                 tw = Uint32(t) << Uint32(16)
-                p0 = publish_lo(p0, r, thr, tw, lim0)
-                p1 = publish_hi(p1, r, thr, tw, lim1)
+                p0 = publish_lo(p0, ra, thr_a, tw, lims[0])
+                p1 = publish_hi(p1, ra, thr_a, tw, lims[1])
+                p2 = publish_lo(p2, rb, thr_b, tw, lims[2])
+                p3 = publish_hi(p3, rb, thr_b, tw, lims[3])
             elif cutlass.const_expr(edge):
                 if t < ntiles:
-                    st_global_u16(ptr0 - st * TILE * 2, r)
-                    st_global_u16(ptr1 - st * TILE * 2, r >> Uint32(16))
+                    st_global_u16(ptr0 - st * TILE * 2, ra)
+                    st_global_u16(ptr1 - st * TILE * 2, ra >> Uint32(16))
+                    st_global_u16(ptr2 - st * TILE * 2, rb)
+                    st_global_u16(ptr3 - st * TILE * 2, rb >> Uint32(16))
             else:
-                st_global_u16_off(ptr0, r, -st * TILE * 2)
-                st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
+                st_global_u16_off(ptr0, ra, -st * TILE * 2)
+                st_global_u16_off(ptr1, ra >> Uint32(16), -st * TILE * 2)
+                st_global_u16_off(ptr2, rb, -st * TILE * 2)
+                st_global_u16_off(ptr3, rb >> Uint32(16), -st * TILE * 2)
             if cutlass.const_expr(self.mode < PUBLISH):
                 # histogram of the raw top 11 bits (masked keys land in bin 2047,
                 # the lowest rank)
-                red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
-                red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
-        return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
+                hb = hist0 + S_BINS * 4
+                red_shared(hist0 + (bfe(ra, 5, 11) << Uint32(2)), 1)
+                red_shared(hb + (ra >> Uint32(21) << Uint32(2)), 1)
+                red_shared(hb + S_BINS * 4 + (bfe(rb, 5, 11) << Uint32(2)), 1)
+                red_shared(hb + 2 * S_BINS * 4 + (rb >> Uint32(21) << Uint32(2)), 1)
+        d = 2 * TILE * 2
+        return ptr0 - d, ptr1 - d, ptr2 - d, ptr3 - d, p0, p1, p2, p3
 
     @cute.jit
     def reduce2(self, buf, w0, w1):
