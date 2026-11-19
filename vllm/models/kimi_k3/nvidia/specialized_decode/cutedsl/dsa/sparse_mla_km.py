@@ -76,10 +76,15 @@ HW = 32  # heads per softmax group (4 warps, one per TMEM lane quarter)
 NG = H // HW  # softmax groups
 # Warpgroup-aligned roles (setmaxnreg is per warpgroup): WG0 = warp 0 (TMEM owner +
 # Q / index loader), warp 1 (MMA), warps 2-3 (KV gathers); WG1-3 = warps 4..15
-# (softmax); WG4 = warps 16..19 (KV gathers).
+# (softmax); WG4 = warps 16..19 (KV gathers); WG5 = warps 20..23 (O^T correction).
 NW = 16
 SOFT0 = 4
-LEAN_REGS, SOFT_REGS = 48, 128
+CORR0 = NW + 4  # first correction warp
+# Register pool: 64 per thread x 1024 threads = 65536 >= 512 x 40 (lean: TMEM / Q /
+# MMA / 14 gather warps) + 384 x 96 (softmax) + 128 x 56 (correction).
+LEAN_REGS, SOFT_REGS, CORR_REGS = 40, 96, 56
+GATHER2 = CORR0 + 4  # warps 24..31: more KV gather warps (TMA issue rate per warp)
+LOADERS = 2 + 4 + 8
 NSOFT = 4 * NG  # softmax warps
 MAX_ROWS = 16  # rows per CTA
 QBLK = H * 128  # one 128 B column block of the query rows [96 x 128 B]
@@ -87,14 +92,19 @@ QBYTES = 4 * QBLK + H * 64
 PBYTES = TN * H  # P^T [128 keys x 96 heads] E4M3
 
 # Barriers
-B_QFULL, B_QEMPTY, B_PFULL, B_PVDONE, B_OEMPTY = range(5)
-B_SFULL = 5  # + buffer
-B_SEMPTY = 7  # + buffer
-B_IDXFULL = 9  # + row parity
-B_IDXEMPTY = 11  # + row parity
-B_KVFULL = 13  # + stage
-B_KVEMPTY = 21  # + stage
-NBAR = 29
+B_QFULL, B_QEMPTY = 0, 1
+B_PFULL = 2  # + P buffer (tile parity): P^T, the tile's rescale factors and flags
+B_PVDONE = 4  # + P buffer: PV of that tile complete
+B_OEMPTY = 6
+B_SFULL = 7  # + buffer
+B_SEMPTY = 9  # + buffer
+B_IDXFULL = 11  # + row parity
+B_IDXEMPTY = 13  # + row parity
+B_KVFULL = 15  # + stage
+B_KVEMPTY = 23  # + stage
+B_PVBLK = 31  # + O^T block: that block's PV of the tile complete
+B_OREADY = 35  # + O^T block: corrected for the next tile's PV
+NBAR = 39
 
 C_S, C_O = 0, 192  # TMEM: S^T 2 x 96 | O^T 4 x 96
 
@@ -207,26 +217,26 @@ class SparseMlaDecodeKM:
 
     def __init__(self, grid: int, stages: int = 3, loaders: int = 6,
                  stamps: bool = False):
-        assert 2 <= stages <= 8 and loaders == 6
+        assert 2 <= stages <= 8 and loaders == LOADERS
         self.grid, self.stages, self.loaders, self.stamps = grid, stages, loaders, stamps
-        self.threads = 32 * (NW + 4)
+        self.threads = 32 * (GATHER2 + 8)
         off = 0
         self.off_kv = off
         off += stages * STAGE
         self.off_q = off
         off += QBYTES
-        self.off_p = off
-        off += PBYTES
+        self.off_p = off  # 2 x P^T (tile parity)
+        off += 2 * PBYTES
         self.off_idx = off
         off += 2 * IDXB
         self.off_tmax = off  # [3 groups][4 quarters][32] FP32 tile maxima / sums
         off += NG * 4 * HW * 4
         self.off_bias = off  # [96] m - log2(448): P = 2^(x - bias) = 448 x 2^(x - m)
         off += H * 4
-        self.off_alpha = off  # [96] 2^(m_old - m_new) of this tile
-        off += H * 4
-        self.off_flag = off  # [3] a head's max grew in this tile
-        off += 16
+        self.off_alpha = off  # [2][96] 2^(m_old - m_new) of a tile (tile parity)
+        off += 2 * H * 4
+        self.off_flag = off  # [2][3] a head's max grew in the tile (tile parity)
+        off += 32
         self.off_l = off  # [96] final row sums
         off += H * 4
         self.off_n = off
@@ -288,10 +298,14 @@ class SparseMlaDecodeKM:
         base = Uint32(raw.toint())
         if tid == 0:
             self.mark(stamp, cta, 0)
-            for i, count in ((B_QFULL, 1), (B_QEMPTY, NSOFT), (B_PFULL, NSOFT),
-                             (B_PVDONE, 1), (B_OEMPTY, NSOFT)):
+            for i, count in ((B_QFULL, 1), (B_QEMPTY, NSOFT), (B_OEMPTY, NSOFT)):
                 mbar_init(self.bar(base, i), Uint32(count))
+            for blk in cutlass.range_constexpr(4):
+                mbar_init(self.bar(base, B_PVBLK + blk), Uint32(1))
+                mbar_init(self.bar(base, B_OREADY + blk), Uint32(4))
             for b in cutlass.range_constexpr(2):
+                mbar_init(self.bar(base, B_PFULL + b), Uint32(NSOFT))
+                mbar_init(self.bar(base, B_PVDONE + b), Uint32(1))
                 mbar_init(self.bar(base, B_SFULL + b), Uint32(1))
                 mbar_init(self.bar(base, B_SEMPTY + b), Uint32(NSOFT))
                 mbar_init(self.bar(base, B_IDXFULL + b), Uint32(1))
@@ -317,6 +331,9 @@ class SparseMlaDecodeKM:
             cute.arch.warpgroup_reg_alloc(SOFT_REGS)
             self.softmax(base, warp, lane, taddr, cta, n_mine, out, out_stride, lse,
                          lse_stride, scale_log2, out_scale, stamp)
+        elif (warp >= CORR0) & (warp < GATHER2):
+            cute.arch.warpgroup_reg_dealloc(CORR_REGS)
+            self.correct(base, warp, lane, taddr, n_mine)
         else:
             cute.arch.warpgroup_reg_dealloc(LEAN_REGS)
             if warp == 0:
@@ -327,7 +344,8 @@ class SparseMlaDecodeKM:
                 if lane == 0:
                     self.mma(base, taddr, n_mine, stamp, cta)
             if (warp == 2) | (warp == 3) | (warp >= NW):
-                lw = cutlass.select_(warp >= NW, warp - NW + 2, warp - 2)
+                lw = cutlass.select_(warp >= GATHER2, warp - GATHER2 + 6,
+                                     cutlass.select_(warp >= NW, warp - NW + 2, warp - 2))
                 self.loader(base, lw, lane, cta, n_mine, tensormap.map_address(kvm),
                             tensormap.map_address(kvr))
         tc_fence_before()
@@ -437,6 +455,7 @@ class SparseMlaDecodeKM:
     @cute.jit
     def mma(self, base, taddr, n_mine, stamp, cta):
         g = Int32(0)
+        gc = Int32(0)  # corrected tiles (every tile but a row's first)
         ro = Int32(0)
         for i in range(n_mine):
             n = self.nrow(base, i)
@@ -449,14 +468,23 @@ class SparseMlaDecodeKM:
                         self.qk(base, taddr, g + 1, stamp, cta, ro * 8 + t + 1)
                     if t == 0:
                         mbar_wait(self.bar(base, B_OEMPTY), (ro & 1) ^ 1)
-                    mbar_wait(self.bar(base, B_PFULL), g & 1)
+                    b = g & 1
+                    mbar_wait(self.bar(base, B_PFULL + b), (g >> 1) & 1)
                     if ro * 8 + t < 8:
                         self.mark(stamp, cta, 56 + t)
                     tc_fence_after()
                     s = g % self.stages
                     st = base + Uint32(self.off_kv) + Uint32(s) * Uint32(STAGE)
-                    pdesc = Uint64(P_DESC) | Uint64((base + Uint32(self.off_p)) >> Uint32(4))
+                    pdesc = Uint64(P_DESC) | Uint64(
+                        (base + Uint32(self.off_p) + Uint32(b) * Uint32(PBYTES))
+                        >> Uint32(4))
+                    # Block by block: the correction warps rescale O^T block blk (by
+                    # this tile's factors, after the previous PV of blk) while the
+                    # tensor pipe runs the other blocks.
                     for blk in cutlass.range_constexpr(4):
+                        if t > 0:
+                            mbar_wait(self.bar(base, B_OREADY + blk), gc & 1)
+                            tc_fence_after()
                         vd = Uint64(SDESC_SW128) | Uint64(
                             (st + Uint32(blk * TN * 128)) >> Uint32(4))
                         for kk in cutlass.range_constexpr(2):
@@ -465,10 +493,53 @@ class SparseMlaDecodeKM:
                                 acc = Uint32(kk)
                             mma_ss(taddr + Uint32(C_O + 96 * blk), vd + Uint64(kk * 512),
                                    pdesc + Uint64(kk * 64), Uint32(IDESC_PV), acc)
+                        tc_commit(self.bar(base, B_PVBLK + blk))
                     tc_commit(self.bar(base, B_KVEMPTY + s))
-                    tc_commit(self.bar(base, B_PVDONE))
+                    tc_commit(self.bar(base, B_PVDONE + b))
+                    if t > 0:
+                        gc = gc + 1
                     g = g + 1
                 ro = ro + 1
+
+    # ------------------------------------------------------------------ correction
+    @cute.jit
+    def correct(self, base, warp, lane, taddr, n_mine):
+        """O^T rescale off the softmax path: warp q (TMEM lane quarter q) owns dims
+        32q .. 32q + 31 of every 128-dim block. For every tile but a row's first: once
+        the softmax published the tile's factors (PFULL), block by block after the
+        previous tile's PV of that block, multiply the columns of the groups whose
+        max grew by 2^(m_old - m_new) and hand the block to the MMA (OREADY)."""
+        lanes = Uint32((warp % 4) * 32) << Uint32(16)
+        g = Int32(0)
+        for i in range(n_mine):
+            n = self.nrow(base, i)
+            if n > 0:
+                tiles = _tiles(n)
+                for t in range(tiles):
+                    if t > 0:
+                        b = g & 1
+                        mbar_wait(self.bar(base, B_PFULL + b), (g >> 1) & 1)
+                        asl = base + Uint32(self.off_alpha) + Uint32(b) * Uint32(H * 4)
+                        fl = base + Uint32(self.off_flag) + Uint32(b) * Uint32(16)
+                        grew = [ld_shared_u32(fl + Uint32(4 * k)) != Uint32(0)
+                                for k in range(NG)]
+                        for blk in cutlass.range_constexpr(4):
+                            mbar_wait(self.bar(base, B_PVBLK + blk), (g - 1) & 1)
+                            tc_fence_after()
+                            for k in cutlass.range_constexpr(NG):
+                                if grew[k]:
+                                    col = taddr + lanes + Uint32(C_O + 96 * blk + HW * k)
+                                    ov = tmem_ld32(col)
+                                    vals = []
+                                    for c in cutlass.range_constexpr(HW // 4):
+                                        a4 = ld_shared_v4f(asl + Uint32(4 * (HW * k + 4 * c)))
+                                        vals.extend([ov[4 * c + e] * a4[e] for e in range(4)])
+                                    tmem_st32(col, vals)
+                            tc_fence_before()
+                            cute.arch.sync_warp()
+                            if lane == 0:
+                                mbar_arrive(self.bar(base, B_OREADY + blk))
+                    g = g + 1
 
     # ------------------------------------------------------------------ softmax
     @cute.jit
@@ -488,8 +559,8 @@ class SparseMlaDecodeKM:
         h0 = k * HW
         tbuf = base + Uint32(self.off_tmax) + Uint32((k * 4) * HW * 4)
         bias_s = base + Uint32(self.off_bias) + Uint32(4 * h0)
-        alpha_s = base + Uint32(self.off_alpha) + Uint32(4 * h0)
-        flag_s = base + Uint32(self.off_flag) + Uint32(4 * k)
+        alpha_g = base + Uint32(self.off_alpha) + Uint32(4 * h0)
+        flag_g = base + Uint32(self.off_flag) + Uint32(4 * k)
         lfin = base + Uint32(self.off_l)
         key = wt
         combiner = quarter == 0  # lane = head h0 + lane
@@ -507,6 +578,8 @@ class SparseMlaDecodeKM:
                 m = neg  # combiner: running max of head h0 + lane (log2 units)
                 for t in range(tiles):
                     b = g & 1
+                    alpha_s = alpha_g + Uint32(b) * Uint32(H * 4)
+                    flag_s = flag_g + Uint32(b) * Uint32(16)
                     mbar_wait(self.bar(base, B_SFULL + b), (g >> 1) & 1)
                     if (warp == SOFT0) & (lane == 0) & (ro < 2) & (t < 10):
                         self.mark(stamp, cta, 3 + 16 * ro + t)
@@ -551,49 +624,34 @@ class SparseMlaDecodeKM:
                     named_bar(Uint32(1) + Uint32(k), Uint32(128))
                     if sub:
                         self.mark(stamp, cta, 34)
-                    grew = ld_shared_u32(flag_s) != Uint32(0)
+                    # Row sums: l = l x 2^(m_old - m_new) + p, one FMA per head (the
+                    # factor is exactly 1 where the max held, 0 on a row's first tile).
                     pwords = []
                     lnew = []
                     for c in cutlass.range_constexpr(HW // 4):
                         b4 = ld_shared_v4f(bias_s + Uint32(16 * c))
+                        a4 = ld_shared_v4f(alpha_s + Uint32(16 * c))
                         p4 = [ex2(fma_f(x[4 * c + e], scale_log2, -b4[e])) for e in range(4)]
                         pwords.append(e4m3x4(p4[0], p4[1], p4[2], p4[3]))
-                        lnew.extend(p4)
-                    if grew & (t > 0):
-                        for c in cutlass.range_constexpr(HW // 4):
-                            a4 = ld_shared_v4f(alpha_s + Uint32(16 * c))
-                            for e in cutlass.range_constexpr(4):
-                                h = 4 * c + e
-                                lnew[h] = fma_f(lp[h], a4[e], lnew[h])
-                    else:
-                        lnew = [lp[h] + lnew[h] for h in range(HW)]
+                        for e in cutlass.range_constexpr(4):
+                            lnew.append(fma_f(lp[4 * c + e], a4[e], p4[e]))
                     if sub:
                         self.mark(stamp, cta, 35)
-                    if g > 0:  # PV(g - 1) is complete: P^T is free, O^T is stable
-                        mbar_wait(self.bar(base, B_PVDONE), (g - 1) & 1)
+                    if g >= 2:  # PV(g - 2) is complete: its P^T buffer is free
+                        mbar_wait(self.bar(base, B_PVDONE + b), ((g >> 1) & 1) ^ 1)
                     if sub:
                         self.mark(stamp, cta, 36)
+                    pb = pbase + Uint32(b) * Uint32(PBYTES)
                     for c in cutlass.range_constexpr(2):
-                        st_shared_v4(pbase + Uint32((2 * k + c) * 2048), pwords[4 * c],
+                        st_shared_v4(pb + Uint32((2 * k + c) * 2048), pwords[4 * c],
                                      pwords[4 * c + 1], pwords[4 * c + 2], pwords[4 * c + 3])
-                    tc_fence_after()
-                    if grew & (t > 0):  # uniform: the group's flag
-                        al = []
-                        for c in cutlass.range_constexpr(HW // 4):
-                            a4 = ld_shared_v4f(alpha_s + Uint32(16 * c))
-                            al.extend([a4[0], a4[1], a4[2], a4[3]])
-                        for blk in cutlass.range_constexpr(4):
-                            col = taddr + lanes + Uint32(C_O + 96 * blk + HW * k)
-                            ov = tmem_ld32(col)
-                            tmem_st32(col, [ov[h] * al[h] for h in range(HW)])
                     if sub:
                         self.mark(stamp, cta, 37)
                     lp = lnew
                     fence_async_smem()
-                    tc_fence_before()
                     cute.arch.sync_warp()
                     if lane == 0:
-                        mbar_arrive(self.bar(base, B_PFULL))
+                        mbar_arrive(self.bar(base, B_PFULL + b))
                     g = g + 1
                 # Epilogue: row sums over the 128 key lanes, then O^T after the last PV.
                 tot = []
@@ -619,7 +677,7 @@ class SparseMlaDecodeKM:
                                   * Int64(4), m + lg2(lt) - log2_448)
                     st_shared_f32(lfin + Uint32(4) * Uint32(h0 + lane), out_scale / lt)
                 named_bar(Uint32(1) + Uint32(k), Uint32(128))
-                mbar_wait(self.bar(base, B_PVDONE), (g - 1) & 1)
+                mbar_wait(self.bar(base, B_PVDONE + ((g - 1) & 1)), ((g - 1) >> 1) & 1)
                 if (warp == SOFT0) & (lane == 0) & (ro < 2):
                     self.mark(stamp, cta, 13 + 16 * ro)
                 tc_fence_after()
@@ -707,7 +765,7 @@ def _compiled(grid: int, stages: int, loaders: int, stamps: bool):
 
 
 def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_scale,
-                         grid=None, stages=3, loaders=6, stamps=None):
+                         grid=None, stages=3, loaders=LOADERS, stamps=None):
     """As ``sparse_mla.sparse_mla_decode`` (``query`` [R, Hq, 576] contiguous)."""
     rows, q_heads = query.shape[0], query.shape[1]
     assert query.shape[2] == ROW and query.is_contiguous() and q_heads >= H
@@ -732,7 +790,7 @@ def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_s
     return latent, lse
 
 
-def kernel_info(device, grid, stages=3, loaders=6):
+def kernel_info(device, grid, stages=3, loaders=LOADERS):
     """(registers per thread, local memory bytes per thread) of the compiled kernel
     (benchmarks: spill check)."""
     from ..common.host import _checked, resolve_kernel
