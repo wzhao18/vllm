@@ -23,6 +23,9 @@ STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
       "o_norm_mxfp8(Tensor x, Tensor g, Tensor weight, float eps, Tensor(a!) q, "
       "Tensor(b!) sf) -> ()");
   m.def(
+      "o_norm_mxfp8_ref(Tensor x, Tensor g, Tensor weight, float eps, Tensor(a!) q, "
+      "Tensor(b!) sf) -> ()");
+  m.def(
       "k64_rec(Tensor kdq, Tensor kr, Tensor inv, Tensor mqk, "
       "Tensor gt, Tensor beta, Tensor v, Tensor init_state, "
       "Tensor(a!) final_state, Tensor(b!) out, Tensor cu_seqlens, int flags, "
@@ -43,6 +46,7 @@ STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CUDA, m) {
   m.impl("fwd", TORCH_BOX(&fwd));
   m.impl("o_norm_mxfp8", TORCH_BOX(&o_norm_mxfp8));
+  m.impl("o_norm_mxfp8_ref", TORCH_BOX(&o_norm_mxfp8_ref));
   m.impl("k64_rec", TORCH_BOX(&k64_rec));
   m.impl("prep64", TORCH_BOX(&prep64));
   m.impl("prep64_tc", TORCH_BOX(&prep64_tc));
