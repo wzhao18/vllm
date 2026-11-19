@@ -237,6 +237,18 @@ class SpReduceScatter:
                     owner = row // n
                     offset = cute.crd2idx((rank, row - owner * n, column), recv.layout)
                     store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
+        self.reduce_owned(recv, out, gather, g)
+
+    @cute.jit
+    def reduce_owned(self, recv, out, gather, g):
+        """Poll, sum in rank order, store and re-arm this rank's n rows; re-arm the
+        gather rows [0, R) of the same parity (``g``: this thread's global index)."""
+        tp: cutlass.Constexpr = self.tp
+        R: cutlass.Constexpr = self.rows
+        n: cutlass.Constexpr = R // tp
+        width: cutlass.Constexpr = out.shape[1]
+        per: cutlass.Constexpr = width // 8
+        total: cutlass.Constexpr = self.grid * THREADS
         for i in cutlass.range_constexpr(rounds(n * per, self.grid)):
             c = g + i * total
             if c < n * per:
@@ -263,6 +275,55 @@ class SpReduceScatter:
             c = g + i * total
             if c < R * per:
                 rearm(at(gather, c // per, c % per * 8))
+
+
+class SpEmbedScatter(SpReduceScatter):
+    """The SP decode's input embedding straight into the row shards: the vocab-
+    parallel gather (stock ``VocabParallelEmbedding``: this rank's vocabulary shard
+    rows, zeros for ids it does not hold) pushed as the reduce-scatter's partial,
+    then ``SpReduceScatter``'s owner half. Replaces the masked gather, the TP
+    all-reduce of all R rows and the shard slice. Exactly one rank holds a valid id's
+    row, so the rank-order FP32 sum is that row bit for bit (a -0 becomes +0, as in
+    the all-reduce's x + 0).
+
+    Args: ids [R] (int32 / int64), weight [shard, width] (this rank's vocabulary
+    rows), start (the shard's first id), vocab (ids >= vocab are zero), then
+    ``SpReduceScatter``'s recv, peers, out, gather, rank."""
+
+    def __init__(self, tp, rows, grid):
+        super().__init__(tp, rows, grid, True)
+
+    @cute.kernel
+    def kernel(self, args):
+        ids, weight, start, vocab, recv, peers, out, gather, rank = args
+        tp: cutlass.Constexpr = self.tp
+        R: cutlass.Constexpr = self.rows
+        n: cutlass.Constexpr = R // tp
+        width: cutlass.Constexpr = out.shape[1]
+        per: cutlass.Constexpr = width // 8
+        total: cutlass.Constexpr = self.grid * THREADS
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        g = cta * THREADS + tid
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        for i in cutlass.range_constexpr(rounds(R * per, self.grid)):
+            c = g + i * total
+            if c < R * per:
+                row, column = c // per, c % per * 8
+                token = Int64(ids[row])
+                local = token - start
+                held = zeros((4,), Uint32)
+                valid = (token >= 0) & (token < vocab)
+                if valid & (local >= 0) & (local < weight.shape[0]):
+                    words = sanitized(load_vector(at(weight, local, column)))
+                    for j in cutlass.range_constexpr(4):
+                        held[j] = words[j]
+                owner = row // n
+                offset = cute.crd2idx((rank, row - owner * n, column), recv.layout)
+                words = tuple(held[j] for j in range(4))
+                store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
+        self.reduce_owned(recv, out, gather, g)
 
 
 def _check_rounds(count, what):
@@ -301,6 +362,26 @@ def compile_reduce_scatter(rows, tp, cap, width, grid, push, device):
         args = (partial, recv, peers, out, gather, Int32(0))
         compiled = cute.compile(kernel, *args, make_fake_stream())
         what = f"Kimi K3 SP reduce-scatter ({rows} rows, TP{tp})"
+        check_residency(compiled, device, grid, THREADS, what)
+    return compiled
+
+
+@cache
+def compile_embed_scatter(rows, tp, cap, width, grid, shard, ids_dtype, device):
+    """``SpEmbedScatter`` of ``rows`` token ids over ``grid`` CTAs."""
+    _check_rounds(rounds(rows * width // 8, grid), "SP embedding scatter")
+    with torch.accelerator.device_index(device):
+        size = torch.empty((), dtype=ids_dtype).element_size()
+        ids = fake((rows,), None, ids_dtype, size)
+        weight = fake((shard, width))
+        recv = fake((tp, cap // tp, width))
+        peers = fake((tp,), None, torch.int64)
+        out, gather = fake((rows // tp, width)), fake((cap, width))
+        args = (ids, weight, Int64(0), Int64(0), recv, peers, out, gather, Int32(0))
+        compiled = cute.compile(
+            SpEmbedScatter(tp, rows, grid), *args, make_fake_stream()
+        )
+        what = f"Kimi K3 SP embedding scatter ({rows} rows, TP{tp})"
         check_residency(compiled, device, grid, THREADS, what)
     return compiled
 
@@ -434,6 +515,27 @@ class SpComm:
             rows, self.tp, self.rows_cap, self.width, self.grid(rows), push,
             self.device.index,
         )  # fmt: skip
+
+    def embed_scatter(
+        self, ids, weight, start: int, vocab: int, out_shard, parity: int
+    ) -> torch.Tensor:
+        """``SpEmbedScatter``: this rank's shard [n, width] of the embedding of the
+        R = len(ids) tokens (``weight``: this rank's vocabulary rows from id
+        ``start``) into ``out_shard``. Re-arms gather[parity][:R]."""
+        rows = ids.shape[0]
+        n = self.shard(rows)
+        if out_shard.shape != (n, self.width) or not out_shard.is_contiguous():
+            raise Unsupported("embed", rows, f"out_shard {tuple(out_shard.shape)}")
+        gather, _, recv, peers = self._views[parity]
+        code = compile_embed_scatter(
+            rows, self.tp, self.rows_cap, self.width, self.grid(rows),
+            weight.shape[0], ids.dtype, self.device.index,
+        )  # fmt: skip
+        size = ids.element_size()
+        args = (to_cute(ids, size), to_cute(weight), Int64(start), Int64(vocab))
+        code(*args, recv, peers, to_cute(out_shard), gather, self._rank,
+             stream(self.device))  # fmt: skip
+        return out_shard
 
     def views(self, parity: int):
         """(local gather, its multicast address, local recv, peers) of ``parity``
