@@ -139,7 +139,7 @@ def main():
     print(f"SMs {sms}; layers {L}; producer busy {args.busy_us} us; carveout {carve}")
     print(f"  moe_front registers/local bytes: {fm.moe_front_attrs()}")
     for c in range(2, 9):
-        sm_ = fm.moe_front_smem(32, 8, 4, 2)
+        sm_ = fm.moe_front_smem(32, 8, 2, 2)
         print(f"  max co-resident clusters C={c} smem {sm_ // 1024}K: {fm.moe_front_max_clusters(c, sm_)}")
     for n in [int(r) for r in args.rows.split(",")]:
         src = torch.randn((n, K), device=dev).to(torch.bfloat16)
