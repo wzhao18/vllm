@@ -42,6 +42,19 @@ def main():
             r["stock"] = kernel_times(lambda: ops.grouped_topk(logits, 1, 1, 16, True, 2.5, bias, 1))[0]
             print(json.dumps(r), flush=True)
 
+        a = torch.randn(m, 8192, device="cuda").bfloat16()
+        g = (torch.randn(m, 8192, device="cuda") * 3).bfloat16()
+        r = {"case": "dsa_gate_sigmoid_mul", "M": m, "floor_us": round(m * 8192 * 6 / ACH_HBM * 1e6, 1)}
+        r["lut"] = kernel_times(lambda: prefill_glue.gate_sigmoid_mul(a, g))[0]
+        print(json.dumps(r), flush=True)
+        from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
+        for dd in (18432, 6144):
+            xd = (torch.randn(m, 2 * dd, device="cuda") * 2).bfloat16()
+            r = {"case": "situ_and_mul_bf16_d%d" % dd, "M": m,
+                 "floor_us": round(m * dd * 6 / ACH_HBM * 1e6, 1)}
+            r["lut"] = kernel_times(lambda: situ_and_mul(xd, 1.0, None))[0]
+            print(json.dumps(r), flush=True)
+            del xd
         lat = torch.randn(m, 3584, device="cuda").bfloat16()
         w = torch.randn(3584, device="cuda").bfloat16()
         r = {"case": "latent_rms_norm", "M": m, "floor_us": round(m * 3584 * 4 / ACH_HBM * 1e6, 1)}

@@ -393,17 +393,38 @@ __global__ void __launch_bounds__(128)
 // bf16 mul, 8 columns per thread.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ uint4 gate_sigmoid_mul_vec8(uint4 a, uint4 g) {
+
+// BF16(sigmoid(g)) by table: g is BF16, so the rounded sigmoid takes at most
+// 2^16 values. Each CTA builds the entries of |g| in [2^-16, 2^16) (both
+// signs, 16 KiB of BF16 bits) with the exact expression of
+// gate_sigmoid_mul_vec8; zeros, subnormals, huge values, Inf and NaN take the
+// expression directly. Bitwise equal; the precise expf + IEEE division per
+// element (2 MUFU ops) become one shared-memory load.
+constexpr int GATE_LUT_E0 = 111;
+constexpr int GATE_LUT_NE = 32;
+constexpr int GATE_LUT_N = 2 * GATE_LUT_NE * 128;
+
+__device__ __forceinline__ uint16_t gate_sigmoid_bf16(float gv) {
+  float const sig = 1.0f / (1.0f + ::expf(-gv));
+  return c10::BFloat16(sig).x;
+}
+
+__device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
+    uint4 a, uint4 g, const uint16_t* __restrict__ lut) {
   const uint16_t* ah = reinterpret_cast<const uint16_t*>(&a);
   const uint16_t* gh = reinterpret_cast<const uint16_t*>(&g);
   uint4 o;
   uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    float const gv = bf16_bits_to_float(gh[j]);
-    float const sig = 1.0f / (1.0f + ::expf(-gv));
-    float const sb = (float)c10::BFloat16(sig);
-    oh[j] = c10::BFloat16(bf16_bits_to_float(ah[j]) * sb).x;
+    const uint32_t b = gh[j];
+    const uint32_t e = ((b >> 7) & 0xffu) - (uint32_t)GATE_LUT_E0;
+    const uint16_t sbits =
+        e < (uint32_t)GATE_LUT_NE
+            ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
+            : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
+    oh[j] = c10::BFloat16(bf16_bits_to_float(ah[j]) *
+                          bf16_bits_to_float(sbits)).x;
   }
   return o;
 }
@@ -418,6 +439,15 @@ __global__ void gate_sigmoid_mul_kernel(uint16_t* __restrict__ out,
                                         int64_t gate_stride,
                                         int64_t out_stride) {
   constexpr int U = 4;  // loads in flight per thread
+  __shared__ uint16_t lut[GATE_LUT_N];
+  for (int i = threadIdx.x; i < GATE_LUT_N; i += blockDim.x) {
+    const uint32_t bits = ((uint32_t)(i >> 12) << 15) |
+                          ((uint32_t)(((i >> 7) & (GATE_LUT_NE - 1)) +
+                                      GATE_LUT_E0) << 7) |
+                          (uint32_t)(i & 0x7f);
+    lut[i] = gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)bits));
+  }
+  __syncthreads();
   int32_t const stride = gridDim.x * blockDim.x;
   for (int32_t v0 = blockIdx.x * blockDim.x + threadIdx.x; v0 < total_vecs;
        v0 += stride * U) {
@@ -444,7 +474,8 @@ __global__ void gate_sigmoid_mul_kernel(uint16_t* __restrict__ out,
 #pragma unroll
     for (int u = 0; u < U; ++u) {
       if (v0 + u * stride < total_vecs) {
-        *reinterpret_cast<uint4*>(out + oo[u]) = gate_sigmoid_mul_vec8(a[u], g[u]);
+        *reinterpret_cast<uint4*>(out + oo[u]) =
+            gate_sigmoid_mul_vec8_lut(a[u], g[u], lut);
       }
     }
   }
@@ -592,13 +623,14 @@ void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
               reinterpret_cast<uintptr_t>(gate.data_ptr()) % 16 == 0 &&
               reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0);
   if (rows == 0) return;
-  const int threads = 256;
+  // 1024-thread CTAs, 2 per SM: each CTA's table build is ~3% of its work.
+  const int threads = 1024;
   const int64_t total = rows * (d / 8);
   TORCH_CHECK(total < (int64_t{1} << 31));
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                          attn.get_device());
-  const int64_t max_blocks = (int64_t)sms * 8;
+  const int64_t max_blocks = (int64_t)sms * 2;
   const int blocks =
       (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   const bool contig = attn.stride(0) == d && gate.stride(0) == d &&

@@ -64,3 +64,20 @@ def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
         assert torch.equal(_bits(ours), _bits(dispatched))
     else:
         assert torch.equal(_bits(ours), _bits(cuda_op))
+
+
+@pytest.mark.parametrize("beta,linear_beta", [(1.0, None), (1.0, 10.0), (3.0, 7.0)])
+def test_vec_situ_table_form_every_bf16_input(beta, linear_beta):
+    """The table form (>= 1024 rows) equals the CUDA op on every BF16 gate and
+    up value: zeros, subnormals, huge values, Inf and NaN included."""
+    from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
+
+    rows, cols = 2048, 768
+    bits = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16)
+    g = bits.repeat(rows * cols // (1 << 16)).view(torch.bfloat16).view(rows, cols)
+    perm = torch.randperm(rows * cols, generator=torch.Generator().manual_seed(0))
+    u = g.reshape(-1)[perm].view(rows, cols)
+    x = torch.cat([g, u], dim=1).cuda()
+    ref = torch.empty(rows, cols, device="cuda", dtype=torch.bfloat16)
+    torch.ops._C.situ_and_mul(ref, x, beta, -1.0 if linear_beta is None else linear_beta)
+    assert torch.equal(_bits(situ_and_mul(x, beta, linear_beta)), _bits(ref))
