@@ -15,8 +15,9 @@ D3-32):
 
 - the reduce-scatter sum, the updated / new prefix rows and the saved blocks are
   stock's (FP32 rank-order sums, one rounding; zero signs aside);
-- the gathered rows and the post-AttnRes output are within the BF16 rounding of the
-  stock op (the AttnRes summation order differs: ClusterAttnRes);
+- the gathered rows and the post-AttnRes output are within one BF16 ulp of the row's
+  largest magnitude of the stock op (the AttnRes summation order differs:
+  ClusterAttnRes);
 - every mailbox is re-armed after each boundary pair.
 
 ``SpFinalGather`` returns stock ``sp_all_gather``'s rows (sanitized words) and
@@ -80,8 +81,11 @@ def _ulp(x):
 
 
 def _close(a, b, ulps):
-    """|a - b| <= ulps BF16 ulps of the larger magnitude, elementwise."""
-    bound = ulps * _ulp(torch.maximum(a.abs(), b.abs())) + 2.0**-60
+    """|a - b| <= ulps BF16 ulps of the row's largest magnitude (the AttnRes mixes and
+    normalizes whole rows in FP32; a different summation order moves an element by a
+    fraction of the row scale's rounding, also where sources cancel)."""
+    scale = torch.maximum(a.abs(), b.abs()).amax(dim=-1, keepdim=True)
+    bound = ulps * _ulp(scale) + 2.0**-60
     return bool(((a - b).abs() <= bound).all()), ((a - b).abs() / bound).max().item()
 
 
@@ -176,7 +180,7 @@ def _worker(env: dict[str, str]) -> None:
                 assert torch.equal(s[2], f[2]), ("prefix", rows, layer)
                 assert torch.equal(s[3], f[3]), ("blocks", rows, layer)
                 for name, i in (("gather", 0), ("post", 1)):
-                    ok, ratio = _close(s[i], f[i], 2)
+                    ok, ratio = _close(s[i], f[i], 1)
                     worst[name] = max(worst.get(name, 0.0), ratio)
                     assert ok, (name, rows, layer, ratio)
         if rank == 0:
