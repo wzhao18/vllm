@@ -31,13 +31,14 @@ constexpr int NWARP_SLOT = 5;
 struct Maps { CUtensorMap qkv, g, og, beta, out, qkv_h, g_h, og_h, beta_h, out_h, qd, kd, vd, gd, ogd, outd; };
 
 __device__ __forceinline__ unsigned sa(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
+__device__ volatile unsigned* g_diag;
 __device__ __forceinline__ void mb_wait(unsigned b, unsigned ph) {
   unsigned ok = 0; long long n = 0;
   while (true) {
     asm volatile("{.reg .pred P; mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2; selp.u32 %0, 1, 0, P;}"
                  : "=r"(ok) : "r"(b), "r"(ph) : "memory");
     if (ok) return;
-    if (++n > 400000000LL) { printf("WATCHDOG blk %d tid %d\n", blockIdx.x, threadIdx.x); __trap(); }
+    if (++n > 400000000LL) { g_diag[0] = 1; g_diag[1] = blockIdx.x; g_diag[2] = threadIdx.x; g_diag[3] = b; __threadfence_system(); printf("WATCHDOG blk %d tid %d\n", blockIdx.x, threadIdx.x); __trap(); }
   }
 }
 __device__ __forceinline__ void tma2(unsigned dst, const CUtensorMap* m, int c0, int c1, unsigned bar) {
@@ -125,7 +126,7 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
       }
       int seq = ch / H, head = ch % H, tok = seq * a.seqlen + k * C;
       if (lane == 0)
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(fb), "r"(5 * TILE + (a.hm | a.dl ? C * 2 : BETA_BYTES)) : "memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(fb), "r"(5 * TILE + BETA_BYTES) : "memory");
       __syncwarp();
       int who = a.iss6 ? lane : 0;
       if (a.iss6 ? lane < 6 : lane == 0) {
@@ -134,12 +135,12 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
           if (a.dl) {   // die-local head-major, rows head * Tpad + tok
             const CUtensorMap* mm = t == 0 ? &M.qd : t == 1 ? &M.kd : t == 2 ? &M.vd : t == 3 ? &M.gd : &M.ogd;
             if (t < 5) tma2(d, mm, 0, head * a.Tpad + tok, fb);
-            else tma2(d, &M.beta_h, tok, head, fb);
+            else tma2(d, &M.beta, (head / 8) * 8, tok, fb);
           } else if (a.hm) {   // head-major [tensor][H][T][128]: every tile is one contiguous 8 KiB block
             if (t < 3) tma2(d, &M.qkv_h, 0, (t * H + head) * a.T + tok, fb);
             else if (t == 3) tma2(d, &M.g_h, 0, head * a.T + tok, fb);
             else if (t == 4) tma2(d, &M.og_h, 0, head * a.T + tok, fb);
-            else tma2(d, &M.beta_h, tok, head, fb);
+            else tma2(d, &M.beta, (head / 8) * 8, tok, fb);
           } else if (t < 3) tma2(d, &M.qkv, t * P + head * D, tok, fb);
           else if (t == 3) tma2(d, &M.g, head * D, tok, fb);
           else if (t == 4) tma2(d, &M.og, head * D, tok, fb);
@@ -372,12 +373,15 @@ int main(int argc, char** argv) {
   printf("SOL bytes %.3f GB -> %.1f us @19.4 TB/s, %.1f us @17.7 TB/s\n", bytes / 1e9, bytes / 19.4e12 * 1e6, bytes / 17.7e12 * 1e6);
   struct V { const char* name; int mode, S_total, iss6, fma, mufu, onorm, hm, noout, dl; };
   std::vector<V> vs = {
-      {"TM chain S=6", 0, 6, 1}, {"HM chain S=6", 0, 6, 1, 0, 0, 0, 1}, {"HM rrbal S=6", 1, 6, 1, 0, 0, 0, 1},
+      {"TM chain S=6", 0, 6, 1},
       {"DL chain S=4", 0, 4, 1, 0, 0, 0, 0, 0, 1}, {"DL chain S=6", 0, 6, 1, 0, 0, 0, 0, 0, 1},
       {"DL chain S=7", 0, 7, 1, 0, 0, 0, 0, 0, 1}, {"DL rrbal S=4", 1, 4, 1, 0, 0, 0, 0, 0, 1},
       {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL rrbal S=7", 1, 7, 1, 0, 0, 0, 0, 0, 1},
       {"DL chain S=6 noout", 0, 6, 1, 0, 0, 0, 0, 1, 1}, {"DL chain S=6 iss1", 0, 6, 0, 0, 0, 0, 0, 0, 1},
-      {"DL chain S=6 +onorm", 0, 6, 1, 0, 0, 1, 0, 0, 1}};
+      {"DL chain S=6 +onorm", 0, 6, 1, 0, 0, 1, 0, 0, 1},
+      {"HM chain S=6", 0, 6, 1, 0, 0, 0, 1}, {"HM rrbal S=6", 1, 6, 1, 0, 0, 0, 1}};
+  unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
+  { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
   cudaEvent_t e0, e1; CR(cudaEventCreate(&e0)); CR(cudaEventCreate(&e1));
   printf("attr maxdyn: %s\n", cudaGetErrorString(cudaFuncSetAttribute(skel_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448)));
   printf("attr oversized: %s\n", cudaGetErrorString(cudaFuncSetAttribute(skel_k, cudaFuncAttributeSharedMemoryMode, cudaSharedMemoryModeAllowOversizedSharedMemory)));
@@ -397,7 +401,8 @@ int main(int argc, char** argv) {
       cudaError_t le = cudaLaunchKernelEx(&cfg, skel_k, M, a);
       if (le != cudaSuccess) { printf("SKEL %-24s launch failed: %s\n", v.name, cudaGetErrorString(le)); cudaGetLastError(); break; }
       CR(cudaEventRecord(e1));
-      CR(cudaEventSynchronize(e1));
+      { cudaError_t se = cudaEventSynchronize(e1);
+        if (se != cudaSuccess) { printf("SKEL %-24s FAILED %s diag %u blk %u tid %u bar %u\n", v.name, cudaGetErrorString(se), hdiag[0], hdiag[1], hdiag[2], hdiag[3]); exit(3); } }
       CR(cudaGetLastError());
       float ms; CR(cudaEventElapsedTime(&ms, e0, e1));
       if (it >= 3) ts.push_back(ms * 1000.f);
