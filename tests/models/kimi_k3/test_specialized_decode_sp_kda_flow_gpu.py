@@ -81,6 +81,10 @@ def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
 
     replay = None
     if graph:
+        # One eager launch first, on scratch caches (as the runner warms up before
+        # capturing): loads the kernel module outside the capture.
+        scratch = [t.clone() for t in kv]
+        core.run(projected, out, caches=scratch, metadata=deferred)
         torch.cuda.synchronize()
         replay = torch.cuda.CUDAGraph()
         with torch.cuda.graph(replay):  # (captured, not run)

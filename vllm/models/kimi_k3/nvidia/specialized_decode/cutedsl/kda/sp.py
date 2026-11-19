@@ -46,6 +46,13 @@ n96 45.7 against 49.5). KdaStream wins nowhere. The cores differ from each other
 in FP32 reduction order (not bit for bit; each one's error against the stock verify is
 the same, the chain test's bound). REPLAY (KdaFused / KdaFusedWS) in "deferred" mode
 once its precision is accepted.
+
+"deferred" (the serving mode: every request has 1..q pending tokens to fold), the same
+graph with the pending commits, us per layer (KdaWS without its flush, which adds a
+full state pass): n8 KdaWide 8.6 (KdaFlow 10.5); n16 KdaWide 13.3 (KdaFlow 14.0);
+from n24 KdaFlow, which folds in its own single state pass: n24 20.2 (KdaWide 24.5),
+n32 21.8 (26.1), n48 29.8 (39.2), n64 38.9 (51.7), n71 44.2 (56.7; KdaWS 41.3 + flush),
+n96 53.6 (74.3; KdaWS 48.7 + flush), n128 71.0 (95.2; KdaWS 62.6 + flush).
 """
 
 from functools import cache
@@ -68,7 +75,7 @@ from .wide import KdaWide
 
 K = 128
 # Record core per request count n, by heads per rank (items = heads x n, see above).
-RECORD_KINDS = {24: "1-2:split,3-70:wide,71-:ws"}
+RECORD_KINDS = {24: "1-2:split,3-20:wide,21-:flow"}
 # Record KdaSplit geometry ("early.lanes.occupancy.cluster", as prepared.SPEC_SCHEDULE)
 # by n; empty: the batch defaults (eight-CTA clusters at n1, then four; 16 lanes).
 SP_SPEC_SCHEDULE = {24: ""}

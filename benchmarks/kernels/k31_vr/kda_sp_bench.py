@@ -27,7 +27,59 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import sp  # noqa
 Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
 
 
+def bench_flush(n, layers, iters, seed=0):
+    """The deferred flush KdaWS needs before its verify (production n >= 71): the
+    FP32 commit of every layer's pending replay (KDADeferredCommitContext.flush) on
+    one cache for all layers (the same pages per layer: as many bytes as the
+    deployed per-layer caches)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.recoverssm.context import (
+        KDADeferredCommitContext,
+    )
+
+    g = torch.Generator().manual_seed(seed)
+    kv = list(kda.caches(n + 2))
+    owners = []
+    for i in range(layers):
+        attention = kda.layer(seed=i)
+        attention.kv_cache = kv
+        owners.append(attention)
+    context = KDADeferredCommitContext.create(
+        owners, spec_query_len=Q, max_num_reqs=MAX_REQS
+    )
+    slots = (torch.randperm(n + 1, generator=g)[:n] + 1).to(torch.int32)
+    state_indices = slots.view(n, 1).to(kda.DEVICE)
+    record_rows = torch.randperm(MAX_REQS, generator=g)[:n].to(torch.int32)
+    record_rows = record_rows.to(kda.DEVICE)
+    pending = torch.randint(1, Q + 1, (MAX_REQS,), generator=g).to(torch.int32)
+    pending = pending.to(kda.DEVICE)
+
+    def run():
+        context.flush(state_indices, record_rows, pending)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(iters):
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1e3 / layers)
+    times.sort()
+    del graph
+    return times[len(times) // 2], times[0]
+
+
 def bench(n, kind, layers, iters, seed=0):
+    if kind == "flush":
+        return bench_flush(n, layers, iters, seed)
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
     stages = None
