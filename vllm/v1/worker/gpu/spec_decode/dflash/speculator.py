@@ -601,7 +601,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
         index = self._stage_context_rows(rows)
         n = int(rows.size)
-        kept = [h[index] for h in aux_hidden_states]
+        kept = gather_aux_rows(aux_hidden_states, index)
         combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
         if combine_aux_rows is not None:
             combine_aux_rows(kept, 0, n, self.hidden_states[:n])
@@ -927,6 +927,41 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+
+@triton.jit
+def _gather_rows_kernel(
+    out_ptr, out_stride, src_ptr, src_stride, index_ptr, width, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width
+    src_row = tl.load(index_ptr + row).to(tl.int64)
+    vals = tl.load(src_ptr + src_row * src_stride + cols, mask=mask)
+    tl.store(out_ptr + row.to(tl.int64) * out_stride + cols, vals, mask=mask)
+
+
+def gather_aux_rows(
+    aux_hidden_states: list[torch.Tensor], index: torch.Tensor
+) -> list[torch.Tensor]:
+    """[h[index] for h in aux_hidden_states] as adjacent column blocks of one
+    row-major buffer, so the drafter's fc reads them without a concat."""
+    h0 = aux_hidden_states[0]
+    n, width, count = index.numel(), h0.shape[-1], len(aux_hidden_states)
+    packed = h0.new_empty((n, count * width))
+    views = [packed[:, i * width : (i + 1) * width] for i in range(count)]
+    if n == 0:
+        return views
+    # One program per row: whole-row loads in flight (8 warps x 64 B / thread).
+    block = min(triton.next_power_of_2(width), 8192)
+    grid = (n, triton.cdiv(width, block))
+    for h, out in zip(aux_hidden_states, views):
+        assert h.dim() == 2 and h.stride(1) == 1 and h.shape[-1] == width
+        _gather_rows_kernel[grid](
+            out, out.stride(0), h, h.stride(0), index, width, BLOCK=block,
+            num_warps=8,
+        )
+    return views
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
