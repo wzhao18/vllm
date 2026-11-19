@@ -123,13 +123,13 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
 // One CTA per SM walks tokens t = blockIdx.x, + gridDim.x, ... A producer lane copies the
 // token's H x 128 o rows and its H x 128 gate columns (two contiguous rows of the inputs)
 // into a kOStages-deep shared-memory ring with one transaction barrier per stage; 8
-// consumer warps (one 4-row step each at H = 96) normalize the H rows from shared memory with the v1 lane map and
+// consumer warps (two 4-row steps each at H = 96) normalize the H rows from shared memory with the v1 lane map and
 // arithmetic, except: the products x * rstd * w * sigmoid and the E4M3 scaling run as
 // packed f32x2 multiplies (same per-lane rounding), and sigmoid's 1 / (1 + e) is
 // rcp.approx (equal to div.full for 1 + e <= 2^126; a row with a larger 1 + e is redone
 // with div.full). Bit for bit the v1 output.
 constexpr int kOStages = 4;
-constexpr int kOConsumerWarps = 24;
+constexpr int kOConsumerWarps = 12;
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -169,6 +169,87 @@ __device__ __forceinline__ float rcp_approx(float x) {
   float y;
   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
+}
+
+// One 4-row warp step of token t: head h0 + lane / 8 of the staged stage.
+__device__ __forceinline__ void o_norm_step(const uint8_t* stage, uint32_t row_bytes, int h0, int heads, int t,
+                                            int sub, int part, int lane, const float (&w)[16], NormMxArgs const& a) {
+    const int head = h0 + sub;
+    const int hh = min(head, heads - 1);
+    const uint4* xs = reinterpret_cast<const uint4*>(stage + hh * 256 + part * 32);
+    const uint4* gs = reinterpret_cast<const uint4*>(stage + row_bytes + hh * 256 + part * 32);
+    const uint4 xv0 = xs[0], xv1 = xs[1], gv0 = gs[0], gv1 = gs[1];
+    const uint32_t xw[8] = {xv0.x, xv0.y, xv0.z, xv0.w, xv1.x, xv1.y, xv1.z, xv1.w};
+    const uint32_t gw[8] = {gv0.x, gv0.y, gv0.z, gv0.w, gv1.x, gv1.y, gv1.z, gv1.w};
+    float xf[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      xf[2 * i] = lo(xw[i]);
+      xf[2 * i + 1] = hi(xw[i]);
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+      const float2 sq = __fmul2_rn(make_float2(xf[i], xf[i + 1]), make_float2(xf[i], xf[i + 1]));
+      ss = __fadd_rn(__fadd_rn(ss, sq.x), sq.y);
+    }
+#pragma unroll
+    for (int o = 1; o <= 4; o <<= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
+    const float rstd =
+        norm_mx::div_full(1.0f, norm_mx::sqrt_approx(__fadd_rn(norm_mx::div_full(ss, 128.0f), a.eps)));
+    // sigmoid(g) = 1 / (1 + ex2(g * -log2 e)): the reciprocal, the division where 1 + e > 2^126
+    float sg[16], dmax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+      const float2 tt = __fmul2_rn(make_float2(lo(gw[i / 2]), hi(gw[i / 2])),
+                                   make_float2(-1.44269502162933349609375f, -1.44269502162933349609375f));
+      float e0, e1;
+      asm("ex2.approx.f32 %0, %1;" : "=f"(e0) : "f"(tt.x));
+      asm("ex2.approx.f32 %0, %1;" : "=f"(e1) : "f"(tt.y));
+      const float2 d = __fadd2_rn(make_float2(1.0f, 1.0f), make_float2(e0, e1));
+      dmax = fmaxf(dmax, fmaxf(d.x, d.y));
+      sg[i] = rcp_approx(d.x);
+      sg[i + 1] = rcp_approx(d.y);
+    }
+    if (__any_sync(0xffffffffu, dmax > 0x1p126f)) {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        const float gf = (i % 2 == 0) ? lo(gw[i / 2]) : hi(gw[i / 2]);
+        sg[i] = norm_mx::sigmoid_triton(gf);
+      }
+    }
+    float y[16], amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+      float2 v = __fmul2_rn(make_float2(xf[i], xf[i + 1]), make_float2(rstd, rstd));
+      v = __fmul2_rn(v, make_float2(w[i], w[i + 1]));
+      v = __fmul2_rn(v, make_float2(sg[i], sg[i + 1]));
+      const __nv_bfloat162 vb = __floats2bfloat162_rn(v.x, v.y);
+      y[i] = __low2float(vb);
+      y[i + 1] = __high2float(vb);
+      amax = fmaxf(amax, fmaxf(fabsf(y[i]), fabsf(y[i + 1])));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    float inv;
+    const uint32_t e = norm_mx::ue8m0(amax, inv);
+    uint32_t e4 = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) e4 |= __shfl_sync(0xffffffffu, e, (lane & ~7) + 2 * j) << (8 * j);
+    if (head < heads) {
+      uint32_t q[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float2 p0 = __fmul2_rn(make_float2(y[4 * i], y[4 * i + 1]), make_float2(inv, inv));
+        const float2 p1 = __fmul2_rn(make_float2(y[4 * i + 2], y[4 * i + 3]), make_float2(inv, inv));
+        q[i] = uint32_t(norm_mx::fp8x2(p0.x, p0.y)) | (uint32_t(norm_mx::fp8x2(p1.x, p1.y)) << 16);
+      }
+      *reinterpret_cast<uint4*>(static_cast<uint8_t*>(a.q) + int64_t(t) * a.q_ld + head * 128 + part * 16) =
+          make_uint4(q[0], q[1], q[2], q[3]);
+      if (part == 0) {
+        const int off = head * 512 + (t % 32) * 16 + ((t % 128) / 32) * 4 + (t / 128) * (128 * a.sf_cols);
+        *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.sf) + off) = e4;
+      }
+    }
 }
 
 __global__ void __launch_bounds__((kOConsumerWarps + 1) * 32, 1)
@@ -211,83 +292,10 @@ __global__ void __launch_bounds__((kOConsumerWarps + 1) * 32, 1)
     const int s = it % kOStages;
     mbar_wait(&full[s], (it / kOStages) & 1);
     const uint8_t* stage = smem + s * 2 * row_bytes;
-    for (int h0 = warp * 4; h0 < heads; h0 += kOConsumerWarps * 4) {
-      const int head = h0 + sub;
-      const int hh = min(head, heads - 1);
-      const uint4* xs = reinterpret_cast<const uint4*>(stage + hh * 256 + part * 32);
-      const uint4* gs = reinterpret_cast<const uint4*>(stage + row_bytes + hh * 256 + part * 32);
-      const uint4 xv0 = xs[0], xv1 = xs[1], gv0 = gs[0], gv1 = gs[1];
-      const uint32_t xw[8] = {xv0.x, xv0.y, xv0.z, xv0.w, xv1.x, xv1.y, xv1.z, xv1.w};
-      const uint32_t gw[8] = {gv0.x, gv0.y, gv0.z, gv0.w, gv1.x, gv1.y, gv1.z, gv1.w};
-      float xf[16];
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        xf[2 * i] = lo(xw[i]);
-        xf[2 * i + 1] = hi(xw[i]);
-      }
-      float ss = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 16; i += 2) {
-        const float2 sq = __fmul2_rn(make_float2(xf[i], xf[i + 1]), make_float2(xf[i], xf[i + 1]));
-        ss = __fadd_rn(__fadd_rn(ss, sq.x), sq.y);
-      }
-#pragma unroll
-      for (int o = 1; o <= 4; o <<= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
-      const float rstd =
-          norm_mx::div_full(1.0f, norm_mx::sqrt_approx(__fadd_rn(norm_mx::div_full(ss, 128.0f), a.eps)));
-      // sigmoid(g) = 1 / (1 + ex2(g * -log2 e)): the reciprocal, the division where 1 + e > 2^126
-      float sg[16], dmax = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 16; i += 2) {
-        const float2 tt = __fmul2_rn(make_float2(lo(gw[i / 2]), hi(gw[i / 2])),
-                                     make_float2(-1.44269502162933349609375f, -1.44269502162933349609375f));
-        float e0, e1;
-        asm("ex2.approx.f32 %0, %1;" : "=f"(e0) : "f"(tt.x));
-        asm("ex2.approx.f32 %0, %1;" : "=f"(e1) : "f"(tt.y));
-        const float2 d = __fadd2_rn(make_float2(1.0f, 1.0f), make_float2(e0, e1));
-        dmax = fmaxf(dmax, fmaxf(d.x, d.y));
-        sg[i] = rcp_approx(d.x);
-        sg[i + 1] = rcp_approx(d.y);
-      }
-      if (__any_sync(0xffffffffu, dmax > 0x1p126f)) {
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          const float gf = (i % 2 == 0) ? lo(gw[i / 2]) : hi(gw[i / 2]);
-          sg[i] = norm_mx::sigmoid_triton(gf);
-        }
-      }
-      float y[16], amax = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 16; i += 2) {
-        float2 v = __fmul2_rn(make_float2(xf[i], xf[i + 1]), make_float2(rstd, rstd));
-        v = __fmul2_rn(v, make_float2(w[i], w[i + 1]));
-        v = __fmul2_rn(v, make_float2(sg[i], sg[i + 1]));
-        const __nv_bfloat162 vb = __floats2bfloat162_rn(v.x, v.y);
-        y[i] = __low2float(vb);
-        y[i + 1] = __high2float(vb);
-        amax = fmaxf(amax, fmaxf(fabsf(y[i]), fabsf(y[i + 1])));
-      }
-      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-      float inv;
-      const uint32_t e = norm_mx::ue8m0(amax, inv);
-      uint32_t e4 = 0;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) e4 |= __shfl_sync(0xffffffffu, e, (lane & ~7) + 2 * j) << (8 * j);
-      if (head < heads) {
-        uint32_t q[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const float2 p0 = __fmul2_rn(make_float2(y[4 * i], y[4 * i + 1]), make_float2(inv, inv));
-          const float2 p1 = __fmul2_rn(make_float2(y[4 * i + 2], y[4 * i + 3]), make_float2(inv, inv));
-          q[i] = uint32_t(norm_mx::fp8x2(p0.x, p0.y)) | (uint32_t(norm_mx::fp8x2(p1.x, p1.y)) << 16);
-        }
-        *reinterpret_cast<uint4*>(static_cast<uint8_t*>(a.q) + int64_t(t) * a.q_ld + head * 128 + part * 16) =
-            make_uint4(q[0], q[1], q[2], q[3]);
-        if (part == 0) {
-          const int off = head * 512 + (t % 32) * 16 + ((t % 128) / 32) * 4 + (t / 128) * (128 * a.sf_cols);
-          *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.sf) + off) = e4;
-        }
-      }
+    for (int h0 = warp * 4; h0 < heads; h0 += 2 * kOConsumerWarps * 4) {
+      o_norm_step(stage, row_bytes, h0, heads, t, sub, part, lane, w, a);
+      if (h0 + kOConsumerWarps * 4 < heads)
+        o_norm_step(stage, row_bytes, h0 + kOConsumerWarps * 4, heads, t, sub, part, lane, w, a);
     }
     mbar_arrive(&empty[s]);
   }
