@@ -742,7 +742,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         if die_local and not self.prefill_worker and all(
             tuple(bucket.knobs.schedule_policy)[0]
             == ("decode" if bucket.variant == "genphase" else "phase_interleave")
-            and bucket.variant != "inference_dedup"  # no die-split schedule
+            and not bucket.variant.startswith("inference_dedup")  # no die-split schedule
             for bucket in self.buckets
         ):
             from . import die_local

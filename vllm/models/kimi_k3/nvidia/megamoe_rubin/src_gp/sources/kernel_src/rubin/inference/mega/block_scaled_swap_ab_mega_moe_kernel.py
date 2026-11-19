@@ -235,8 +235,12 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if type(self.epilogue_warpgroups) is not int or self.epilogue_warpgroups not in (1, 2):
             raise ValueError(f"epilogue_warpgroups must be 1 or 2, got {self.epilogue_warpgroups!r}.")
         self.two_epilogue_warpgroups = self.epilogue_warpgroups == 2
+        # vLLM-local W2: the dedup combine also runs two epilogue warpgroups when its rank rows go back
+        # through the dispatch warps (the 16-warp layout below; standalone warps would need 20).
         if self.two_epilogue_warpgroups and (
-            self.token_back_mode != "epi_warps" or self.combine_dedup or self.comm_clusters > 0
+            (self.token_back_mode != "epi_warps" and not self.combine_dedup)
+            or (self.combine_dedup and self.token_back_mode != "reuse_dispatch_warps")
+            or self.comm_clusters > 0
         ):
             raise ValueError(
                 "epilogue_warpgroups=2 requires token_back_mode epi_warps, no combine dedup and no communication "

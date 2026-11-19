@@ -59,7 +59,7 @@ def parse_args():
     )
     p.add_argument("--modes", default="moe,shared,serial,overlap")
     p.add_argument(
-        "--variant", choices=("inference", "inference_dedup"), default="inference"
+        "--variant", choices=("inference", "inference_dedup", "inference_dedup_wg2"), default="inference"
     )
     p.add_argument(
         "--routing", choices=("random", "local"), default="random",

@@ -30,7 +30,7 @@ Variant = Literal["inference", "genphase", "inference_dedup"]
 # deduplicated combine: the owner rank pre-reduces a token's local expert rows (FP32,
 # one BF16 rounding) and returns one row per (source rank, token); the separate reduce
 # sums the rank rows in ascending rank order (TopkReduceDedup).
-VARIANTS = ("inference", "genphase", "inference_dedup")
+VARIANTS = ("inference", "genphase", "inference_dedup", "inference_dedup_wg2")
 
 # (act data dtype or None = packed fp4, act/weight SF dtype, sf_vec_size,
 #  2x-mode instr K)
@@ -481,7 +481,14 @@ class RubinMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
-        if self.kernel_variant == "inference_dedup":
+        if self.kernel_variant == "inference_dedup_wg2" and (
+            self.token_back_mode != "reuse_dispatch_warps"
+        ):
+            raise ValueError(
+                "two epilogue warpgroups with the dedup combine need reuse_dispatch_warps "
+                "(16 warps per CTA)."
+            )
+        if self.kernel_variant in ("inference_dedup", "inference_dedup_wg2"):
             if self.token_back_mode == "epi_warps":
                 raise ValueError(
                     "the dedup combine pushes rank rows from the combine warps "

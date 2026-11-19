@@ -243,12 +243,15 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     if cfg.kernel_variant == "genphase":
         for name in ("token_in_flag_batch", "token_back_mode"):
             impl_fields.pop(name)
-    if cfg.kernel_variant == "inference_dedup":
+    if cfg.kernel_variant == "inference_dedup_wg2":
+        impl_fields["epilogue_warpgroups"] = 2
+    if cfg.kernel_variant in ("inference_dedup", "inference_dedup_wg2"):
         impl_fields["combine_dedup"] = True
         impl_fields["token_back_ready_granularity"] = "expert"
     kernel_cls = {  # src_gp exports at the package root
         "genphase": lambda: src.RubinInferenceGenphaseMegaMoE,
         "inference_dedup": lambda: src.RubinInferenceMegaMoE,
+        "inference_dedup_wg2": lambda: src.RubinInferenceMegaMoE,
         "inference": lambda: src.sources.RubinInferenceMegaMoE,
     }[cfg.kernel_variant]()
     return kernel_cls(problem_desc, ImplDesc(impl_fields))
@@ -569,7 +572,7 @@ class RubinMegaMoeSession:
         if use_s2 is None:
             use_s2 = self.use_s2(None)
         variant = (use_s2, rmsnorm is not None)
-        if rmsnorm is not None and self.cfg.kernel_variant == "inference_dedup":
+        if rmsnorm is not None and self.cfg.kernel_variant.startswith("inference_dedup"):
             raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
         if rmsnorm is not None:
             kwargs.update(self._rmsnorm_kwargs(*rmsnorm))

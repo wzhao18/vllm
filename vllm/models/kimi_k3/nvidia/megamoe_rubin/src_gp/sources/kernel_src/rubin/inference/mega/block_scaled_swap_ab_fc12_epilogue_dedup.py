@@ -117,17 +117,26 @@ def fc2_dedup_bulk_store_function(
     data_subtile = subtile
     if cutlass.const_expr(data_subtile.element_type is not cutlass.BFloat16):
         raise ValueError("The dedup FC2 store expects a BF16 payload.")
-    if cutlass.const_expr(cute.size(data_subtile) != epi._EpilogueTokenTileSize):
-        raise ValueError("BF16 bulk staging requires one register per token in the 64-token subtile.")
+    # One register per staged token row: all 64 rows of the subtile, or with two warpgroups (vLLM-local W2)
+    # this warpgroup's rows [32 * warpgroup_idx, +32).
+    if cutlass.const_expr(epi.two_epilogue_warpgroups):
+        staged_token_rows = epi._EpilogueTokenTileSize // 2
+        token_row_base = epi.warpgroup_idx * Int32(staged_token_rows)
+        smem_read_write_bar = epi._warpgroup_sync_barrier(epi.warpgroup_idx)
+    else:
+        staged_token_rows = epi._EpilogueTokenTileSize
+        token_row_base = 0
+        smem_read_write_bar = SwapABGatedActEpilogue.epilogue_sync_barrier()
+    if cutlass.const_expr(cute.size(data_subtile) != staged_token_rows):
+        raise ValueError("BF16 bulk staging requires one register per staged token row.")
     warp_idx = epi.warp_idx
     lane_idx = epi.lane_idx
-    smem_read_write_bar = SwapABGatedActEpilogue.epilogue_sync_barrier()
     stage_idx = epilogue_iter_idx % Int32(epi.fc2_tma_stages)
     smem_stage = smem_tensor[None, None, stage_idx]
 
     warp_hidden_base = Int32(warp_idx * 32)
-    for token_idx in cutlass.range_constexpr(epi._EpilogueTokenTileSize):
-        smem_stage[token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]
+    for token_idx in cutlass.range_constexpr(staged_token_rows):
+        smem_stage[token_row_base + token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]
 
     cute.arch.fence_proxy("async.shared", space="cta")
     smem_read_write_bar.arrive_and_wait()
@@ -136,10 +145,18 @@ def fc2_dedup_bulk_store_function(
     if cutlass.const_expr(epi.fc2_hidden_needs_predicate):
         copy_elems = fc2_output_router.valid_hidden_this_cta_tile
     copy_bytes = copy_elems * Int32(epi.combine_format.act_dtype.width // 8)
-    scratch_row = warp_idx * Int32(16) + lane_idx % Int32(16)
+    if cutlass.const_expr(epi.two_epilogue_warpgroups):
+        scratch_row = (
+            epi.warpgroup_idx * Int32(epi._EpilogueTokenTileSize // 2) + warp_idx * Int32(8) + lane_idx % Int32(8)
+        )
+    else:
+        scratch_row = warp_idx * Int32(16) + lane_idx % Int32(16)
     copy_iters: cutlass.Constexpr[int] = fc2_output_router.mapping.domain.axis_size("iter_idx")
     for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
-        owned_subtile = Int32(ublk_iter_idx * 2) + lane_idx // Int32(16)
+        if cutlass.const_expr(epi.two_epilogue_warpgroups):
+            owned_subtile = lane_idx // Int32(8)
+        else:
+            owned_subtile = Int32(ublk_iter_idx * 2) + lane_idx // Int32(16)
         if owned_subtile == subtile_idx:
             dst_ptr, kind = fc2_output_router.get_data_dst(ublk_iter_idx)
             if kind != Int32(0):
@@ -178,6 +195,10 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         # Not super().__init__(): the base picks its store pipeline and freezes; dedup installs its own.
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
+        # vLLM-local W2: the epilogue warpgroup of this thread; a constant 0 with one warpgroup.
+        self.warpgroup_idx = (
+            tidx // (base._EpilogueWarpCnt * 32) if base.two_epilogue_warpgroups else Int32(0)
+        )
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
         self.tma_atom_fc2_output = None
@@ -198,6 +219,7 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
                 combine_format=base.combine_format,
                 cta_token_tile_size=base.cta_tile_n,
                 cta_hidden_tile_size=base.cta_tile_m,
+                split_token_halves=base.two_epilogue_warpgroups,
             ),
             store_function=fc2_dedup_bulk_store_function,
         )
@@ -237,7 +259,12 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
             element_bytes=self.combine_format.act_dtype.width // 8,
             reduce_topk_in_kernel=self.reduce_topk_in_kernel,
             mapping=self.process_pipeline.store_out_mapping,
-            epi_tid=self.tidx,
+            # With two warpgroups the store mapping spans both (0-255).
+            epi_tid=(
+                self.tidx + self.warpgroup_idx * Int32(self._EpilogueWarpCnt * 32)
+                if self.two_epilogue_warpgroups
+                else self.tidx
+            ),
         )
 
     @cute.jit
