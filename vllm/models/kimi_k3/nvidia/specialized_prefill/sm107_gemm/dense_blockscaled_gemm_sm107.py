@@ -49,6 +49,9 @@ from .situ_epilogue import epilogue_situ_mxfp8
 from .epilogue_utils import (
     epilogue_tma_store_mxfp8,
     epilogue_tma_store_with_alpha,
+    epilogue_skel_release,
+    epilogue_tma_store_staged,
+    epilogue_drain_store,
 )
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
@@ -573,6 +576,28 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         return num_acc_stage, num_ab_stage, num_c_stage
 
+    def _restage_full_c(self, tiled_mma):
+        """One C smem buffer per epilogue subtile (whole tile staged); the
+        A/B stages take what is left."""
+        t = self.mma_tiler
+        ab = (
+            cute.size_in_bytes(self.a_dtype, sm100_utils.make_smem_layout_a(tiled_mma, t, self.a_dtype, 1))
+            + cute.size_in_bytes(self.b_dtype, sm100_utils.make_smem_layout_b(tiled_mma, t, self.b_dtype, 1))
+            + cute.size_in_bytes(self.sf_dtype, blockscaled_utils.make_smem_layout_sfa(tiled_mma, t, self.sf_vec_size, 1))
+            + cute.size_in_bytes(self.sf_dtype, blockscaled_utils.make_smem_layout_sfb(tiled_mma, t, self.sf_vec_size, 1))
+        )  # fmt: skip
+        cb = cute.size_in_bytes(
+            self.c_dtype,
+            sm100_utils.make_smem_layout_epi(self.c_dtype, self.c_layout, self.epi_tile, 1),
+        )
+        n_sub = (self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]) // (
+            cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
+        )
+        self.num_c_stage = n_sub
+        self.num_ab_stage = (self.smem_capacity - 1024 - n_sub * cb) // ab
+        if self.num_ab_stage < 2:
+            raise ValueError(f"staged epilogue: {n_sub} C buffers leave {self.num_ab_stage} A/B stages")
+
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
 
@@ -684,6 +709,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.enable_breuse,
         )
 
+        if getattr(self, "epi_staged", False):
+            self._restage_full_c(tiled_mma)
+
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -750,6 +778,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.cta_tile_shape_mnk[1] * self.num_acc_stage * (2 if self.enable_breuse else 1)
         )
 
+        if getattr(self, "sf_tmem_slots", 1) == 2:
+            need = self.num_accumulator_tmem_cols + 2 * self.num_sf_tmem_cols
+            if need > self.num_tmem_alloc_cols or self.cta_tile_shape_mnk[1] in (64, 192):
+                raise ValueError(f"sf2: needs {need} TMEM cols of {self.num_tmem_alloc_cols}")
         # Set prefetch distance for both initial and rolling prefetch (unified control)
         # None = use num_ab_stage (default), 0 = disable prefetch, >0 = explicit distance
         if self.prefetch_dist_param is None:
@@ -1676,7 +1708,17 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         #
         # Specialized TMA load warp
         #
-        if warp_idx == self.tma_warp_id:
+        # K-interleaved producers (tma_kil_warp_id): two warps issue whole
+        # stages (A, B, SFA, SFB) for even / odd k-blocks, which doubles the
+        # stage issue rate of a single TMA issuer.
+        kil = cutlass.const_expr(getattr(self, "tma_kil_warp_id", -1) >= 0)
+        kil_warp = getattr(self, "tma_kil_warp_id", -1)
+        if warp_idx == self.tma_warp_id or warp_idx == kil_warp:
+            kil_parity = warp_idx - self.tma_warp_id
+            kil_mod = 2 if cutlass.const_expr(kil) else 1
+            # skel_hot: every stage reloads k-block 0 (L2-hot operands) to
+            # separate operand delivery from the MMA issue path.
+            hot_k = 0 if cutlass.const_expr(getattr(self, "skel_hot", False)) else 1
             #
             # Persistent tile scheduling loop
             #
@@ -1734,62 +1776,64 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
-                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    mine = (ab_producer_state.count % kil_mod) == kil_parity
+                    if mine:
+                        ab_pipeline.producer_acquire(ab_producer_state)
 
-                    # TMA load A/B/SFA/SFB
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_slice[(None, ab_producer_state.count)],
-                        tAsA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=a_full_mcast_mask,
-                    )
-                    if cutlass.const_expr(self.tma_b_warp_id is None):
+                        # TMA load A/B/SFA/SFB
                         cute.copy(
-                            tma_atom_b,
-                            tBgB_slice[(None, ab_producer_state.count)],
-                            tBsB[(None, ab_producer_state.index)],
+                            tma_atom_a,
+                            tAgA_slice[(None, ab_producer_state.count * hot_k)],
+                            tAsA[(None, ab_producer_state.index)],
                             tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                            mcast_mask=b_full_mcast_mask,
+                            mcast_mask=a_full_mcast_mask,
                         )
-                    cute.copy(
-                        tma_atom_sfa,
-                        tAgSFA_slice[(None, ab_producer_state.count)],
-                        tAsSFA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=sfa_full_mcast_mask,
-                    )
-                    if cutlass.const_expr(self.tma_b_warp_id is None):
-                        cute.copy(
-                            tma_atom_sfb,
-                            tBgSFB_slice[(None, ab_producer_state.count)],
-                            tBsSFB[(None, ab_producer_state.index)],
-                            tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                            mcast_mask=sfb_full_mcast_mask,
-                        )
-
-                    # Prefetch: Rolling prefetch for next tiles
-                    if self.prefetch_enabled:
-                        if k_tile < k_tile_cnt - self.prefetch_dist:
-                            future_k_tile = ab_producer_state.count + self.prefetch_dist
-                            cute.prefetch(
-                                tma_atom_a,
-                                tAgA_slice[(None, future_k_tile)],
-                            )
-                            cute.prefetch(
+                        if cutlass.const_expr(self.tma_b_warp_id is None):
+                            cute.copy(
                                 tma_atom_b,
-                                tBgB_slice[(None, future_k_tile)],
+                                tBgB_slice[(None, ab_producer_state.count * hot_k)],
+                                tBsB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                mcast_mask=b_full_mcast_mask,
                             )
-                            cute.prefetch(
-                                tma_atom_sfa,
-                                tAgSFA_slice[(None, future_k_tile)],
-                            )
-                            cute.prefetch(
+                        cute.copy(
+                            tma_atom_sfa,
+                            tAgSFA_slice[(None, ab_producer_state.count * hot_k)],
+                            tAsSFA[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                            mcast_mask=sfa_full_mcast_mask,
+                        )
+                        if cutlass.const_expr(self.tma_b_warp_id is None):
+                            cute.copy(
                                 tma_atom_sfb,
-                                tBgSFB_slice[(None, future_k_tile)],
+                                tBgSFB_slice[(None, ab_producer_state.count * hot_k)],
+                                tBsSFB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                mcast_mask=sfb_full_mcast_mask,
                             )
 
-                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
+                        # Prefetch: Rolling prefetch for next tiles
+                        if self.prefetch_enabled:
+                            if k_tile < k_tile_cnt - self.prefetch_dist:
+                                future_k_tile = ab_producer_state.count + self.prefetch_dist
+                                cute.prefetch(
+                                    tma_atom_a,
+                                    tAgA_slice[(None, future_k_tile)],
+                                )
+                                cute.prefetch(
+                                    tma_atom_b,
+                                    tBgB_slice[(None, future_k_tile)],
+                                )
+                                cute.prefetch(
+                                    tma_atom_sfa,
+                                    tAgSFA_slice[(None, future_k_tile)],
+                                )
+                                cute.prefetch(
+                                    tma_atom_sfb,
+                                    tBgSFB_slice[(None, future_k_tile)],
+                                )
+
+                        # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
@@ -1804,7 +1848,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             # Wait A/B buffer empty
             #
-            ab_pipeline.producer_tail(ab_producer_state)
+            if warp_idx == self.tma_warp_id:
+                ab_pipeline.producer_tail(ab_producer_state)
 
         # Second producer warp: B + SFB into the same stages. It only waits for
         # the stage to be empty; the A warp posts the whole stage's expect_tx
@@ -1950,12 +1995,31 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        tCtSFA_k = tCtSFA
+                        tCtSFB_k = tCtSFB_mma
+                        sfa_s2t_k = sfa_s2t_bundle
+                        sfb_s2t_k = sfb_s2t_bundle
+                        if cutlass.const_expr(getattr(self, "sf_tmem_slots", 1) == 2):
+                            # Two TMEM scale-factor slots: the s2t copy of
+                            # k-block k+1 never overwrites the slot the MMAs
+                            # of k-block k still read.
+                            sf_off = (k_tile % 2) * self.num_sf_tmem_cols
+                            tCtSFA_k = cute.make_tensor(
+                                cute.recast_ptr(acc_tmem_ptr + self.num_accumulator_tmem_cols + sf_off, dtype=self.sf_dtype),
+                                tCtSFA_layout,
+                            )
+                            tCtSFB_k = cute.make_tensor(
+                                cute.recast_ptr(acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + sf_off, dtype=self.sf_dtype),
+                                tCtSFB_layout,
+                            )
+                            sfa_s2t_k = self._mainloop_s2t_copy_and_partition(sSFA, tCtSFA_k)
+                            sfb_s2t_k = self._mainloop_s2t_copy_and_partition(sSFB, tCtSFB_k)
 
                         if cutlass.const_expr(not self._is_interleaved_utccp()):
                             # Unless UTCCPs are to be interleaved, all SFA/SFB for all
                             # k_blocks are copied before MMA are executed
                             self._mainloop_s2t_copies(
-                                ab_consumer_state.index, sfa_s2t_bundle, sfb_s2t_bundle
+                                ab_consumer_state.index, sfa_s2t_k, sfb_s2t_k
                             )
 
                         # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
@@ -2003,8 +2067,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 cute.gemm(
                                     tiled_mma_bkeep,
                                     tCtAcc_bkeep,
-                                    [tCrA[a_kblk_crd_keep], tCtSFA[sfa_kblk_crd_keep]],
-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
+                                    [tCrA[a_kblk_crd_keep], tCtSFA_k[sfa_kblk_crd_keep]],
+                                    [tCrB[b_kblk_crd], tCtSFB_k[sfb_kblk_crd]],
                                     tCtAcc_bkeep,
                                 )
                                 # Reuse
@@ -2017,9 +2081,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tCtAcc_breuse,
                                     [
                                         tCrA[a_kblk_crd_reuse],
-                                        tCtSFA[sfa_kblk_crd_reuse],
+                                        tCtSFA_k[sfa_kblk_crd_reuse],
                                     ],
-                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]],
+                                    [tCrB[b_kblk_crd], tCtSFB_k[sfb_kblk_crd]],
                                     tCtAcc_breuse,
                                 )
                             else:
@@ -2219,6 +2283,21 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         acc_consumer_state,
                         acc_pipeline,
                         c_pipeline,
+                    )
+                elif cutlass.const_expr(getattr(self, "epi_drain", False)):
+                    acc_consumer_state = epilogue_drain_store(
+                        self, tidx, tCtAcc, tCgC, epi_tile, alpha_value,
+                        mma_tile_coord_mnl, acc_consumer_state, acc_pipeline,
+                    )  # fmt: skip
+                elif cutlass.const_expr(getattr(self, "epi_staged", False)):
+                    acc_consumer_state = epilogue_tma_store_staged(
+                        self, tidx, warp_idx, tma_atom_c, tCtAcc, sC, tCgC,
+                        epi_tile, epilogue_op, alpha_value, mma_tile_coord_mnl,
+                        acc_consumer_state, acc_pipeline, c_pipeline,
+                    )  # fmt: skip
+                elif cutlass.const_expr(getattr(self, "skel_noepi", False)):
+                    acc_consumer_state = epilogue_skel_release(
+                        acc_consumer_state, acc_pipeline
                     )
                 else:
                     acc_consumer_state = epilogue_tma_store_with_alpha(

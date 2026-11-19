@@ -36,6 +36,15 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
     ):
         (tm, tn), cluster, inst_m, swz, raster = tactic[:5]
         split_producer = len(tactic) > 5 and bool(tactic[5])
+        # tactic[7]: epilogue variant ("" store after full drain, "early" TMEM
+        # released after the last load, "noepi" skeleton with no output).
+        flags = set((tactic[7] if len(tactic) > 7 else "").split("+"))
+        self.epi_early_release = "early" in flags
+        self.skel_noepi = "noepi" in flags
+        self.epi_staged = "staged" in flags
+        self.skel_hot = "hot" in flags
+        self.sf_tmem_slots = 2 if "sf2" in flags else 1
+        self.epi_drain = "drain" in flags
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
@@ -47,7 +56,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         )
         self.conv_norms = norms
         self.conv_drain = conv and drain
-        if self.conv_drain:
+        if self.conv_drain or self.epi_drain:
             # Two warp groups drain the two M blocks of the B-reuse tile.
             self.epilog_warp_id = tuple(range(8))
             self.epilogue_warp_id = self.epilog_warp_id
@@ -60,7 +69,11 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             self.tmem_alloc_barrier = pipeline.NamedBarrier(
                 barrier_id=self.tmem_ptr_sync_bar_id, num_threads=32 * 9
             )
-        if split_producer:
+        if split_producer and tactic[5] == 2:
+            # Second producer warp issues the odd k-blocks (whole stages).
+            self.tma_kil_warp_id = self.tma_warp_id + 1
+            self.threads_per_cta += 32
+        elif split_producer:
             self.tma_b_warp_id = self.tma_warp_id + 1
             self.threads_per_cta += 32
 

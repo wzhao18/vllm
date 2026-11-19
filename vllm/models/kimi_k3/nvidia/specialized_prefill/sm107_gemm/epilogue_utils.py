@@ -545,9 +545,17 @@ def epilogue_tma_store_with_alpha(
 
     subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
     num_prev_subtiles = num_tiles_executed * subtile_cnt
+    early = const_expr(getattr(gemm_kernel, "epi_early_release", False))
     for subtile_idx in range(subtile_cnt):
         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+        if const_expr(early):
+            # The accumulator is in registers after the last TMEM load: hand
+            # TMEM back to the MMA warp before the smem/TMA store of the tile.
+            if subtile_idx == subtile_cnt - 1:
+                cute.arch.fence_view_async_tmem_load()
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(acc_consumer_state)
 
         # Apply alpha in Float32 BEFORE converting to c_dtype to avoid overflow
         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
@@ -571,6 +579,151 @@ def epilogue_tma_store_with_alpha(
 
     epilog_sync_barrier.arrive_and_wait()
 
+    if const_expr(not early):
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(acc_consumer_state)
+    acc_consumer_state.advance()
+    return acc_consumer_state
+
+
+@cute.jit
+def epilogue_tma_store_staged(
+    gemm_kernel,
+    epi_tidx: Int32,
+    warp_idx: Int32,
+    tma_atom_c: cute.CopyAtom,
+    tCtAcc_base: cute.Tensor,
+    sC: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    epilogue_op: Constexpr,
+    alpha_value: cutlass.Float32,
+    mma_tile_coord_mnl: Tuple[Int32, Int32, Int32],
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+    c_pipeline: pipeline.PipelineAsync,
+) -> pipeline.PipelineState:
+    """Whole-tile staged epilogue (one C smem buffer per subtile).
+
+    TMEM -> registers -> smem for every subtile with no CTA barrier in
+    between, TMEM handed back right after the last load, then one warp
+    issues the TMA stores of the whole tile and waits for them only at the
+    start of the next tile. Same values/rounding as
+    ``epilogue_tma_store_with_alpha``.
+    """
+    tCgC = transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = epilogue_tmem_copy_and_partition(
+        gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
+    )
+    tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, gemm_kernel.c_dtype)
+    tiled_copy_r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(
+        gemm_kernel, tiled_copy_t2r, tTR_rC, epi_tidx, sC
+    )
+    tCgC_epi = cute.flat_divide(tCgC, epi_tile)
+    bSG_sC, bSG_gC_partitioned = cpasync.tma_partition(
+        tma_atom_c,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sC, 0, 2),
+        cute.group_modes(tCgC_epi, 0, 2),
+    )
+    epilog_sync_barrier = pipeline.NamedBarrier(
+        barrier_id=gemm_kernel.epilog_sync_bar_id,
+        num_threads=32 * len(gemm_kernel.epilogue_warp_id),
+    )
+    bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
+    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+
+    # The previous tile's stores must have read their smem before reuse.
+    if warp_idx == gemm_kernel.epilogue_warp_id[0]:
+        c_pipeline.producer_tail()
+    epilog_sync_barrier.arrive_and_wait()
+
+    acc_pipeline.consumer_wait(acc_consumer_state)
+    for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
+        if subtile_idx == subtile_cnt - 1:
+            cute.arch.fence_view_async_tmem_load()
+            with cute.arch.elect_one():
+                acc_pipeline.consumer_release(acc_consumer_state)
+        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+        acc_vec = epilogue_op((acc_vec * alpha_value).to(gemm_kernel.c_dtype))
+        tRS_rC.store(acc_vec)
+        cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, subtile_idx)])
+    acc_consumer_state.advance()
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    epilog_sync_barrier.arrive_and_wait()
+    if warp_idx == gemm_kernel.epilogue_warp_id[0]:
+        for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+            cute.copy(tma_atom_c, bSG_sC[(None, subtile_idx)], bSG_gC[(None, subtile_idx)])
+        c_pipeline.producer_commit()
+    return acc_consumer_state
+
+
+@cute.jit
+def epilogue_drain_store(
+    gemm_kernel,
+    tidx: Int32,
+    tCtAcc_base: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    alpha_value: cutlass.Float32,
+    mma_tile_coord_mnl: Tuple[Int32, Int32, Int32],
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+) -> pipeline.PipelineState:
+    """Drain-and-release BF16 epilogue for the B-reuse tile (8 warps; warp
+    group g drains M block g): every thread loads its TMEM row (all column
+    subtiles) into registers as C values, hands TMEM back to the MMA warp,
+    then stores its row with 16-byte vector stores while the next tile's
+    mainloop runs. Full tiles only (M, N multiples of the tile)."""
+    g = tidx // 128
+    gt = tidx % 128
+    tCgC = transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = epilogue_tmem_copy_and_partition(
+        gemm_kernel, gt, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
+    )
+    thr_copy_t2r = tiled_copy_t2r.get_slice(gt)
+    tTR_gC = thr_copy_t2r.partition_D(cute.flat_divide(tCgC, epi_tile))[
+        (None, None, None, None, None, *mma_tile_coord_mnl)
+    ]
+    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+    epi_n = cute.size(tTR_tAcc.shape, mode=[4])
+
+    acc_pipeline.consumer_wait(acc_consumer_state)
+    frags = []
+    for ni in cutlass.range_constexpr(epi_n):
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, g, ni)], tTR_rAcc)
+        rC = cute.make_rmem_tensor(tTR_rAcc.shape, gemm_kernel.c_dtype)
+        rC.store((tTR_rAcc.load() * alpha_value).to(gemm_kernel.c_dtype))
+        frags.append(rC)
+    cute.arch.fence_view_async_tmem_load()
+    with cute.arch.elect_one():
+        acc_pipeline.consumer_release(acc_consumer_state)
+    acc_consumer_state.advance()
+
+    atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), gemm_kernel.c_dtype, num_bits_per_copy=128
+    )
+    for ni in cutlass.range_constexpr(epi_n):
+        cute.copy(atom, frags[ni], tTR_gC[(None, None, None, g, ni)])
+    return acc_consumer_state
+
+
+@cute.jit
+def epilogue_skel_release(
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+) -> pipeline.PipelineState:
+    """Skeleton: hand the accumulator straight back (mainloop-only timing)."""
+    acc_pipeline.consumer_wait(acc_consumer_state)
     with cute.arch.elect_one():
         acc_pipeline.consumer_release(acc_consumer_state)
     acc_consumer_state.advance()

@@ -15,6 +15,14 @@ case "$1" in
   b3) shift; timeout 1500 python3 benchmarks/kimi_k3/pgemm_conv_bench.py --mode b3 "$@" 2>&1 | grep -E "$F" | cut -c1-400 | head -40 ;;
   test) timeout 900 python3 -m pytest --noconftest -q tests/models/kimi_k3/test_kda_conv_gemm.py 2>&1 | grep -E 'passed|failed|Error|assert|^E ' | head -30 ;;
 esac
+if [ "$1" = ncuskel ]; then
+  # $2 = JSON tactic; profiles nvjet and the CuTe kernel once each at M16384
+  cd /k31ov; S="--section SpeedOfLight --section ComputeWorkloadAnalysis --section MemoryWorkloadAnalysis --section Occupancy --section LaunchStats --section WarpStateStats --section SchedulerStats"
+  for KR in nvjet cutlass; do
+    timeout 900 ncu -k regex:$KR -c 1 $S python3 benchmarks/kimi_k3/pgemm_conv_bench.py --mode skel --ms 16384 --tactic "$2" > /tmp/pgn_$KR.log 2>&1
+    echo "=== ncu $KR"; grep -E '^  [a-zA-Z_]|Duration|Frequency|Throughput|Pipe|Busy|Issue|Eligible|Hit Rate|Registers|Shared Memory Config|Block Size|Grid Size|Warp Cycles|Stall|ERR|rror' /tmp/pgn_$KR.log | grep -v '^\s*$' | cut -c1-150 | head -45
+  done
+fi
 if [ "$1" = ncu ]; then
   cd /k31ov; shift
   timeout 1500 ncu -k regex:kda_conv_gemm -c 1 --launch-skip 1 --section WarpStateStats --section SchedulerStats --section ComputeWorkloadAnalysis --section SpeedOfLight --section Occupancy --section LaunchStats --section SourceCounters python3 benchmarks/kimi_k3/pgemm_conv_bench.py --mode ncu "$@" > /tmp/pgc_ncu.log 2>&1
