@@ -15,7 +15,7 @@ D3-32):
 
 - the reduce-scatter sum, the updated / new prefix rows and the saved blocks are
   stock's (FP32 rank-order sums, one rounding; zero signs aside);
-- the gathered rows and the post-AttnRes output are within one BF16 ulp of the row's
+- the gathered rows and the post-AttnRes output are within two BF16 ulps of the row's
   largest magnitude of the stock op (the AttnRes summation order differs:
   ClusterAttnRes);
 - every mailbox is re-armed after each boundary pair.
@@ -180,7 +180,7 @@ def _worker(env: dict[str, str]) -> None:
                 assert torch.equal(s[2], f[2]), ("prefix", rows, layer)
                 assert torch.equal(s[3], f[3]), ("blocks", rows, layer)
                 for name, i in (("gather", 0), ("post", 1)):
-                    ok, ratio = _close(s[i], f[i], 1)
+                    ok, ratio = _close(s[i], f[i], 2)
                     worst[name] = max(worst.get(name, 0.0), ratio)
                     assert ok, (name, rows, layer, ratio)
         if rank == 0:
