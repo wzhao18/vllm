@@ -74,7 +74,7 @@ def frost_prefill(
         k.reshape(T, H, D).contiguous(),
         v.reshape(T, H, D).contiguous(),
         g.reshape(T, H, D).contiguous(),
-        beta.reshape(T, H).contiguous(),
+        beta.reshape(T, H),  # row-strided view: FROST reads it in place
         cu_seqlens,
         scale=D**-0.5,
         initial_state=initial_state,

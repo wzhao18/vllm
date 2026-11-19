@@ -54,3 +54,25 @@ def test_frost_prefill_matches_flashkda(lens, heads):
     assert not torch.isnan(o).any()
     assert _rel_rms(o, out) < 2e-2
     assert _rel_rms(state, fs) < 2e-2
+
+
+def test_frost_strided_beta():
+    """frost_prefill passes beta as a row-strided view of the projection:
+    FROST must read it exactly like a contiguous copy."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    if not sp_kda.frost_supported(torch.device("cuda")):
+        pytest.skip("cuDNN frontend >= 1.33 (kda_frost) not installed")
+    torch.manual_seed(1)
+    T, H, bf = 300, 8, torch.bfloat16
+    cu = torch.tensor([0, 100, 300], dtype=torch.int32, device="cuda")
+    q, k, v, g = (torch.randn(T, H, D, device="cuda").to(bf) for _ in range(4))
+    beta = torch.randn(T, H + 7, device="cuda").to(bf)[:, :H]
+    kw = dict(scale=D**-0.5, initial_state=torch.zeros(2, H, D, D, device="cuda"),
+              output_final_state=True, use_qk_l2norm_in_kernel=True,
+              use_beta_sigmoid_in_kernel=True, safe_gate=True, gate_lower_bound=-5.0,
+              a_log=torch.zeros(H, device="cuda"), dt_bias=torch.zeros(H, D, device="cuda"),
+              plan_name="kda_frost")
+    ref = sp_kda._frost_fn(q, k, v, g, beta.contiguous(), cu, **kw)[0]
+    got = sp_kda._frost_fn(q, k, v, g, beta, cu, **kw)[0]
+    assert torch.equal(got, ref)
