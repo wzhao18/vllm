@@ -133,7 +133,8 @@ B_OREADY, B_PEMPTY = 16, 19  # x3 (P buffer u % 3)
 B_KVFULL, B_KVEMPTY = 22, 28  # x NS
 assert B_KVEMPTY + NS <= 40
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
-# 7-9 token-end l/m exchange (per sub-partition), 10 + wg warpgroup-wide
+# 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
+# warpgroup-wide
 C_Q, C_S, C_O = 0, 64, 192  # Q latent dims 0-255; S buffers at 64 and 128; O^T
 
 # instruction descriptors (dense kind::f8f6f4, E4M3 x E4M3 -> FP32, Rubin K64 bit 29)
