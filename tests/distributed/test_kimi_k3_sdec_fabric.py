@@ -22,6 +22,8 @@ from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
 
 BLOCK = 4096
+TOTALS = 64 * 1024 + 4 * 4096  # window byte of the 4 u32 reduce-add totals (after the blocks)
+RED_COUNTER = 512  # counter 2
 THREADS = 128
 EAGER, REPLAYS, NODES = 3, 5, 64
 
@@ -58,8 +60,11 @@ def _probe_class():
             smem = cutlass.utils.SmemAllocator()
             words = alloc(smem, Uint32, BLOCK // 4, align=128)
             bar = alloc(smem, Int64, 1, 8).iterator
+            addend = alloc(smem, Uint32, 4, align=16)
             for i in cutlass.range(tid, BLOCK // 4, THREADS):
                 words[i] = (Uint32(tag) << 20) | (Uint32(rank) << 16) | Uint32(i)
+            if tid < 4:
+                addend[tid] = Uint32(rank + 1)
             fabric.source_fence()
             if tid == 0:
                 fabric.barrier_init(bar)
@@ -70,13 +75,16 @@ def _probe_class():
                 for r in cutlass.range_constexpr(self.world):
                     if Int32(r) != rank:
                         fabric.put(bar, base + r, offset, 0, source, BLOCK)
+                        fabric.red_add(bar, base + r, TOTALS, RED_COUNTER, addend.iterator, 16)
                 fabric.put_multimem(bar, mc, offset, 0, source, BLOCK)
-                fabric.submit_expect(bar, BLOCK * self.world)
+                fabric.submit_expect(bar, BLOCK * self.world + 16 * (self.world - 1))
                 errors = fabric.wait(bar, 0)
                 target = fabric.advance(expected, (self.world - 1) * BLOCK)
                 fabric.wait_counter(local, target)
                 target = fabric.advance(expected + 8 * MAX_CTAS, self.world * BLOCK)
                 fabric.wait_counter(replica, target)
+                target = fabric.advance(expected + 16 * MAX_CTAS, 16 * (self.world - 1))
+                fabric.wait_counter(local + RED_COUNTER, target)
                 if errors != Uint32(0):
                     count_error(status)
 
@@ -103,7 +111,7 @@ def _worker(env: dict[str, str]) -> None:
         )
 
         rank, world = dist.get_rank(), dist.get_world_size()
-        window = FabricWindow(dist.group.WORLD, world * BLOCK, multicast=True)
+        window = FabricWindow(dist.group.WORLD, world * BLOCK + 4096, multicast=True)
         status = torch.zeros(1, dtype=torch.int32, device=device)
         probe = _probe_class()(world)
         status_ptr = Int64(status.data_ptr())
@@ -127,6 +135,11 @@ def _worker(env: dict[str, str]) -> None:
             assert counters == [calls * (world - 1) * BLOCK, calls * world * BLOCK]
             assert window.expected[0, 0].item() == counters[0]
             assert window.expected[1, 0].item() == counters[1]
+            reds = int(window.local[RED_COUNTER : RED_COUNTER + 8].view(torch.int64).item())
+            assert reds == calls * (world - 1) * 16 == window.expected[2, 0].item()
+            totals = window.local[TOTALS : TOTALS + 16].view(torch.int32).tolist()
+            peers = sum(r + 1 for r in range(world) if r != rank)
+            assert totals == [calls * peers] * 4, totals
 
         for tag in range(1, EAGER + 1):
             call(tag)
