@@ -27,6 +27,15 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import sp  # noqa
 Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
 
 
+PENDING = 0  # pending replay tokens per request; 0: uniform 1..Q
+
+
+def _pending(g):
+    if PENDING:
+        return torch.full((MAX_REQS,), PENDING, dtype=torch.int32)
+    return torch.randint(1, Q + 1, (MAX_REQS,), generator=g).to(torch.int32)
+
+
 def bench_flush(n, layers, iters, seed=0):
     """The deferred flush KdaWS needs before its verify (production n >= 71): the
     FP32 commit of every layer's pending replay (KDADeferredCommitContext.flush) on
@@ -50,8 +59,7 @@ def bench_flush(n, layers, iters, seed=0):
     state_indices = slots.view(n, 1).to(kda.DEVICE)
     record_rows = torch.randperm(MAX_REQS, generator=g)[:n].to(torch.int32)
     record_rows = record_rows.to(kda.DEVICE)
-    pending = torch.randint(1, Q + 1, (MAX_REQS,), generator=g).to(torch.int32)
-    pending = pending.to(kda.DEVICE)
+    pending = _pending(g).to(kda.DEVICE)
 
     def run():
         context.flush(state_indices, record_rows, pending)
@@ -106,7 +114,7 @@ def bench(n, kind, layers, iters, seed=0):
             attention.deferred_recoverssm = True
             checkpoints = order[i * n : (i + 1) * n].to(torch.int32).view(n, 1)
             record_rows = torch.randperm(MAX_REQS, generator=g)[:n].to(torch.int32)
-            pending = torch.randint(1, Q + 1, (MAX_REQS,), generator=g).to(torch.int32)
+            pending = _pending(g)
             metadata = kda.Module(
                 spec_state_indices_tensor=checkpoints.to(kda.DEVICE),
                 num_accepted_tokens=torch.ones(n, dtype=torch.int32, device=kda.DEVICE),
@@ -164,8 +172,11 @@ def main():
     p.add_argument("--fence", type=int, default=0, help="KdaFlow fold fence interval")
     p.add_argument("--noprefetch", action="store_true", help="KdaFlow no prefetch")
     p.add_argument("--slots", type=int, default=0, help="KdaFlow page slots")
+    p.add_argument("--pending", type=int, default=0, help="pending tokens (0: 1..Q)")
     p.add_argument("--unfused", action="store_true", help="KdaFlow two verify passes")
     a = p.parse_args()
+    global PENDING
+    PENDING = a.pending
     if a.trace:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
