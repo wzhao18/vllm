@@ -64,6 +64,9 @@ struct V2Cfg {
 constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
 constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
+// hot kernel row buffer (uint4): rx, candidate slots, message, window
+constexpr int kV2HotSrow = (kV2RxW + kV2Cand + kV2Msg + kV2Win + 3) / 4;
+static_assert(kV2HotSrow <= 5 * 1024 && kV2Fine + 1 <= kV2Cand, "topk_v2: hot row buffer");
 // stats (rows): 0 exchanged, 1 resolved in round 1, 2 tie round, 3 radix, 4 select all
 // valid, 5 full-pass message, 6 sample bound failed (re-thresholded from the SMEM row),
 // 7 fine range rebased (the q-th key far above theta)
@@ -1509,7 +1512,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 
 
 // SMEM of one row (both kernels), the mbarrier, then the PDL wait
-#define V2_KERNEL_PROLOGUE(T)                                                                   __shared__ __align__(16) uint32_t hist[kCoarseBins];                                       __shared__ __align__(16) uint32_t cpos[kV2Cand];                                           __shared__ __align__(16) uint16_t ckey[kV2Cand];                                           __shared__ __align__(128) uint4 srow[V2Cfg<T>::kNR * (T)];                                        __shared__ __align__(8) uint64_t s_bar;                                                    __shared__ uint32_t warp_sums[64];                                                         __shared__ int s_i[16];                                                                    __shared__ uint32_t s_u[16];                                                               __shared__ unsigned long long s_pref;                                                      __shared__ long long s_dbg[32];                                                            const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};        if (threadIdx.x == 0) {                                                                      mbar_init(&s_bar, kV2Cp);                                                                  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");                     }                                                                                          __syncthreads();                                                                           uint32_t bar_phase = 0;                                                                    asm volatile("griddepcontrol.wait;" ::: "memory");
+#define V2_KERNEL_PROLOGUE(T, NSROW)                                                                   __shared__ __align__(16) uint32_t hist[kCoarseBins];                                       __shared__ __align__(16) uint32_t cpos[kV2Cand];                                           __shared__ __align__(16) uint16_t ckey[kV2Cand];                                           __shared__ __align__(128) uint4 srow[NSROW];                                        __shared__ __align__(8) uint64_t s_bar;                                                    __shared__ uint32_t warp_sums[64];                                                         __shared__ int s_i[16];                                                                    __shared__ uint32_t s_u[16];                                                               __shared__ unsigned long long s_pref;                                                      __shared__ long long s_dbg[32];                                                            const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};        if (threadIdx.x == 0) {                                                                      mbar_init(&s_bar, kV2Cp);                                                                  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");                     }                                                                                          __syncthreads();                                                                           uint32_t bar_phase = 0;                                                                    asm volatile("griddepcontrol.wait;" ::: "memory");
 
 // The common case: one compact row body (PDL: the prologue overlaps the logits kernel's
 // tail; every global read follows the wait). Rows that need the complete body are left
@@ -1520,7 +1523,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 // instance carries no stamp code.
 template <int T, bool kDbg>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params p) {
-  V2_KERNEL_PROLOGUE(T)
+  // the hot body keeps the row in registers: its SMEM row buffer holds only the round's
+  // words, slots, message and window (~62 KB per CTA instead of ~110 KB, so a CTA can be
+  // resident beside the logits kernel's last CTAs and start at the PDL release)
+  V2_KERNEL_PROLOGUE(T, kV2HotSrow)
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true, T, kDbg>(p, sm, row, -1, bar_phase);
     if (threadIdx.x == 0) p.redo[row] = r;
@@ -1532,7 +1538,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params 
 // A small grid (kV2RedoCtas): row r goes to CTA r % grid on every rank, so a CTA's rows
 // run in the same order everywhere; the flags of a CTA's rows are read at once.
 __global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
-  V2_KERNEL_PROLOGUE(kV2T)
+  V2_KERNEL_PROLOGUE(kV2T, V2Cfg<kV2T>::kNR * kV2T)
   int any = 0;
   for (int row = blockIdx.x + threadIdx.x * gridDim.x; row < p.T; row += kV2T * gridDim.x) any |= p.redo[row];
   if (!__syncthreads_or(any)) return;
