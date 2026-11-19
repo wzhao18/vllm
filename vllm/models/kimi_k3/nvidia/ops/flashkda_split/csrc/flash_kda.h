@@ -24,13 +24,16 @@ void fwd(const torch::stable::Tensor& q, const torch::stable::Tensor& k,
          int64_t mode = 3);
 // Kimi-K3: gated o_norm (sigmoid, D = 128) of x (T, H, 128) with the gate rows
 // g (T, >= H 128), written as the MXFP8 o_proj input q (T, H 128) e4m3 + the
-// F8_128x4 swizzled UE8M0 scales sf.
+// F8_128x4 swizzled UE8M0 scales sf. head0 > 0: x holds heads [head0, head0 + H)
+// of the gate rows and of q/sf (a head window of a wider output).
 void o_norm_mxfp8(const torch::stable::Tensor& x, const torch::stable::Tensor& g,
                   const torch::stable::Tensor& weight, double eps,
-                  const torch::stable::Tensor& q, const torch::stable::Tensor& sf);
+                  const torch::stable::Tensor& q, const torch::stable::Tensor& sf,
+                  int64_t head0);
 void o_norm_mxfp8_ref(const torch::stable::Tensor& x, const torch::stable::Tensor& g,
                   const torch::stable::Tensor& weight, double eps,
-                  const torch::stable::Tensor& q, const torch::stable::Tensor& sf);
+                  const torch::stable::Tensor& q, const torch::stable::Tensor& sf,
+                  int64_t head0);
 // Kimi-K3 (dev): chunk-64 tcgen05 KDA recurrence on prepared chunk-64 images
 // (smxx/k64_tc.cu); flags bit 0: clock stamps into dbg, bit 1: every chunk
 // reads chunk 0's images (compute-only timing).

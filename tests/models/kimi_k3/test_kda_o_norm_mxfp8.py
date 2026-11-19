@@ -71,3 +71,30 @@ def test_o_norm_mxfp8_staged_matches_direct(tokens, heads):
     torch.accelerator.synchronize()
     assert torch.equal(outs[0].data.view(torch.uint8), outs[1].data.view(torch.uint8))
     assert torch.equal(outs[0].scale, outs[1].scale)
+
+
+@pytest.mark.parametrize("tokens,split", [(300, 70), (2051, 70), (129, 1)])
+def test_o_norm_mxfp8_head_windows(tokens, split):
+    """Two head windows (head0 = 0 and head0 = split) of one MXFP8 buffer give
+    the bytes of a single call over all heads (the head-split FROST path)."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_segscan
+    from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
+
+    kda_segscan.load_extension()
+    torch.manual_seed(2)
+    H = 96
+    T, P = tokens, H * D
+    x = (torch.randn(1, T, H, D, device="cuda") * 3).to(torch.bfloat16)
+    gate = (torch.randn(T, P + 64, device="cuda") * 2).to(torch.bfloat16)[:, :P]
+    w = (torch.rand(D, device="cuda") + 0.5).contiguous()
+    op = torch.ops.k3_flashkda_split.o_norm_mxfp8
+    ref = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
+    ref.scale.zero_()
+    op(x, gate, w, 1e-6, ref.data, ref.scale)
+    out = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
+    out.scale.zero_()
+    op(x[:, :, :split].contiguous(), gate, w, 1e-6, out.data, out.scale, 0)
+    op(x[:, :, split:].contiguous(), gate, w, 1e-6, out.data, out.scale, split)
+    torch.accelerator.synchronize()
+    assert torch.equal(out.data.view(torch.uint8), ref.data.view(torch.uint8))
+    assert torch.equal(out.scale, ref.scale)

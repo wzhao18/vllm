@@ -339,7 +339,8 @@ void launch_o_norm_mx_ldg(const void* x, int64_t tokens, int heads,
                           NormMxArgs const& a, int num_sms, cudaStream_t stream);
 
 static void o_norm_mxfp8_impl(const Tensor& x, const Tensor& g, const Tensor& weight,
-                              double eps, const Tensor& q, const Tensor& sf, bool staged) {
+                              double eps, const Tensor& q, const Tensor& sf, int64_t head0,
+                              bool staged) {
   STD_TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() >= 2 &&
                       x.size(x.dim() - 1) == 128 &&
                       x.scalar_type() == ScalarType::BFloat16,
@@ -347,7 +348,10 @@ static void o_norm_mxfp8_impl(const Tensor& x, const Tensor& g, const Tensor& we
   const int64_t H = x.size(x.dim() - 2);
   const int64_t P = H * 128;
   const int64_t T = x.numel() / P;
-  STD_TORCH_CHECK(g.dim() == 2 && g.size(0) >= T && g.size(1) >= P &&
+  const int64_t P_out = q.size(1);
+  STD_TORCH_CHECK(head0 >= 0 && P_out >= (head0 * 128 + P),
+                  "o_norm_mxfp8: heads [head0, head0 + H) must fit q");
+  STD_TORCH_CHECK(g.dim() == 2 && g.size(0) >= T && g.size(1) >= head0 * 128 + P &&
                       g.stride(1) == 1 && g.stride(0) % 8 == 0 &&
                       reinterpret_cast<uintptr_t>(g.const_data_ptr()) % 16 == 0 &&
                       g.scalar_type() == ScalarType::BFloat16,
@@ -355,22 +359,23 @@ static void o_norm_mxfp8_impl(const Tensor& x, const Tensor& g, const Tensor& we
   STD_TORCH_CHECK(weight.numel() == 128 && weight.is_contiguous() &&
                       weight.scalar_type() == ScalarType::Float,
                   "o_norm_mxfp8: weight must be FP32 [128]");
-  STD_TORCH_CHECK(q.dim() == 2 && q.size(0) >= T && q.size(1) == P &&
+  STD_TORCH_CHECK(q.dim() == 2 && q.size(0) >= T && P_out % 128 == 0 &&
                       q.stride(1) == 1 && q.stride(0) % 16 == 0 &&
                       q.scalar_type() == ScalarType::Float8_e4m3fn,
                   "o_norm_mxfp8: q must be e4m3 (T, P) unit-stride rows");
   STD_TORCH_CHECK(sf.is_contiguous() && sf.scalar_type() == ScalarType::Byte &&
-                      sf.numel() >= ((T + 127) / 128) * 128 * (P / 32),
+                      sf.numel() >= ((T + 127) / 128) * 128 * (P_out / 32),
                   "o_norm_mxfp8: sf must be uint8 with the padded scale tile");
   NormMxArgs a{};
-  a.g = g.const_data_ptr();
+  a.g = static_cast<const uint8_t*>(g.const_data_ptr()) + head0 * 128 * 2;
   a.g_ld = g.stride(0);
   a.w = reinterpret_cast<const float*>(weight.const_data_ptr());
   a.eps = float(eps);
-  a.q = q.mutable_data_ptr();
+  a.q = static_cast<uint8_t*>(q.mutable_data_ptr()) + head0 * 128;
   a.q_ld = q.stride(0);
-  a.sf = sf.mutable_data_ptr();
-  a.sf_cols = int(P / 32);
+  // F8_128x4 tiles: one head = 4 scale columns = 512 contiguous bytes per 128 rows
+  a.sf = static_cast<uint8_t*>(sf.mutable_data_ptr()) + head0 * 512;
+  a.sf_cols = int(P_out / 32);
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount,
                          x.get_device_index());
@@ -382,14 +387,14 @@ static void o_norm_mxfp8_impl(const Tensor& x, const Tensor& g, const Tensor& we
 }
 
 void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
-                  double eps, const Tensor& q, const Tensor& sf) {
-  o_norm_mxfp8_impl(x, g, weight, eps, q, sf, true);
+                  double eps, const Tensor& q, const Tensor& sf, int64_t head0) {
+  o_norm_mxfp8_impl(x, g, weight, eps, q, sf, head0, true);
 }
 
 // The direct-load kernel: the parity reference of o_norm_mxfp8 in tests.
 void o_norm_mxfp8_ref(const Tensor& x, const Tensor& g, const Tensor& weight,
-                      double eps, const Tensor& q, const Tensor& sf) {
-  o_norm_mxfp8_impl(x, g, weight, eps, q, sf, false);
+                      double eps, const Tensor& q, const Tensor& sf, int64_t head0) {
+  o_norm_mxfp8_impl(x, g, weight, eps, q, sf, head0, false);
 }
 
 void launch_k64_tc(void const* kdq, void const* kr, void const* inv, void const* mqk, float const* gt, void const* beta, void const* v,

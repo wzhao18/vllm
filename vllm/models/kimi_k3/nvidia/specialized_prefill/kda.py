@@ -150,10 +150,12 @@ def o_norm_mxfp8(
     weight: torch.Tensor,
     eps: float,
     out,
+    head0: int = 0,
 ) -> None:
     """Gated RMSNorm (sigmoid) of x (..., H, 128) with gate rows g (T, >= H 128)
-    into ``out`` (an ``mxfp8_act.Mxfp8Buffer`` of T rows)."""
+    into ``out`` (an ``mxfp8_act.Mxfp8Buffer`` of T rows). ``head0`` places x at
+    heads [head0, head0 + H) of g and out."""
     kda_segscan.load_extension()
     torch.ops.k3_flashkda_split.o_norm_mxfp8(
-        x, g, weight.float().contiguous(), eps, out.data, out.scale
+        x, g, weight.float().contiguous(), eps, out.data, out.scale, head0
     )
