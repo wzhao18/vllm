@@ -315,7 +315,10 @@ class DcpValue:
             bm = tensormap.encode_map(
                 w_uv.iterator.toint(), bf, (512, 128, self.size * self.heads),
                 (1024, 128 * 1024), (64, 128, 1), sw, l2)
-            launch(self.kernel_tc, (*args[:-1], am, bm, args[-1]), self.grid, 512)
+            # The descriptors are grid-constant parameters (not tuple members, which
+            # the kernel would copy to local memory, an invalid TMA source).
+            self.kernel_tc(args[:-1], am, bm).launch(
+                grid=self.grid, block=(512, 1, 1), stream=args[-1], use_pdl=True)
         else:
             kernel = self.kernel_projected if self.projected else self.kernel
             launch(kernel, args, self.grid, 512)
@@ -430,7 +433,7 @@ class DcpValue:
                 self.merge_projected(args, scales, tid, t)
 
     @cute.kernel
-    def kernel_tc(self, args):
+    def kernel_tc(self, args, am: tensormap.GridMap, bm: tensormap.GridMap):
         """"proj" above PROJ_ROWS rows: CTA c = y H + head projects units c, c + G,
         .. (unit u: gathered head u % (DCP H), rows 128 (u // (DCP H)) ..) on
         tcgen05 and pushes the value rows and LSEs to the heads' owners (warp 0 the
@@ -438,7 +441,6 @@ class DcpValue:
         merges tiles y, y + grid[1], .. of head ``head``."""
         rows_lse, lens, box, _, peers, lpeers, mailbox = args[1:8]
         parity, rank = args[12], args[13]
-        am, bm = args[14], args[15]
         H, D, B = self.heads, self.size, self.batch
         G: cutlass.Constexpr = H * self.grid[1]
         DH: cutlass.Constexpr = D * H

@@ -177,6 +177,20 @@ def _case(box, size, rank, batch, parity, skew):
     ref[(totals.repeat_interleave(Q) == 0)] = 0
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
+    # The served steps replay the value exchange from a CUDA graph.
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream(dev)
+    stream.wait_stream(torch.cuda.current_stream(dev))
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        run_value(*args, totals, None, projected, out, w_uv_gathered)
+    dist.barrier()
+    for _ in range(2):
+        out.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        dist.barrier()
+        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
 
 def _worker(rank, size, port, skew):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import sp
