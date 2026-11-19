@@ -1046,6 +1046,17 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
         mma16816(ca, a, b[2], b[3]);
         mma16816(cm, q, b[2], b[3]);
       }
+      if (J < I && valid == kC) {
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+          const int i = 16 * I + g + 8 * hh;
+          const int j = 8 * n + 2 * tq;
+          const float bi = s.beta[i];
+          *reinterpret_cast<float2*>(&s.c.l[i][j]) = make_float2(ca[2 * hh] * bi, ca[2 * hh + 1] * bi);
+          stg32(mqk + ((j >> 3) * 64 + i) * 8 + (j & 7), pack2(cm[2 * hh], cm[2 * hh + 1]));
+        }
+        continue;
+      }
 #pragma unroll
       for (int hh = 0; hh < 2; ++hh) {
         const int i = 16 * I + g + 8 * hh;
@@ -1150,14 +1161,15 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
     {
       // beta_j = 0 for j >= valid (s.beta), rows i >= valid zero
       const int i = tid >> 2, j0 = 16 * (tid & 3);
-      const bool iv = i < valid;
-      uint32_t pk[8];
+      uint32_t pk[8] = {};
+      if (j0 <= i) {
 #pragma unroll
-      for (int e = 0; e < 16; e += 2) {
-        const int j = j0 + e;
-        float v0, v1;
-        fmul2p(v0, v1, X[i][j], X[i][j + 1], s.beta[j], s.beta[j + 1]);
-        pk[e / 2] = pack2((iv && j <= i) ? v0 : 0.0f, (iv && j + 1 <= i) ? v1 : 0.0f);
+        for (int e = 0; e < 16; e += 2) {
+          const int j = j0 + e;
+          float v0, v1;
+          fmul2p(v0, v1, X[i][j], X[i][j + 1], s.beta[j], s.beta[j + 1]);
+          pk[e / 2] = pack2(v0, v1);
+        }
       }
       uint4* dst = reinterpret_cast<uint4*>(&sk.invb[i][j0]);
       dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
@@ -1170,6 +1182,43 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
   {
     const int g = lane >> 2, tq = lane & 3;
     const int bsel = warp >> 2, n0 = 32 * (warp & 3);
+    __nv_bfloat16* wst = reinterpret_cast<__nv_bfloat16*>(s.a.raw);
+    __nv_bfloat16* ust = wst + kC * kD;
+    if (bsel == 1) {
+      // u^T [v = n0.. n0 + 32][t]: A = v^T from kv[1] [t][v] (ldmatrix.trans), B = INVb rows
+      float au[2][8][4] = {};
+#pragma unroll
+      for (int ks = 0; ks < 4; ++ks) {
+        uint32_t a[2][4];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+          const int q = lane >> 3;
+          ldsm_x4_t(smem_u32(&sk.kv[1][16 * ks + (lane & 7) + 8 * (q >> 1)][n0 + 16 * mt + 8 * (q & 1)]),
+                    a[mt]);
+        }
+#pragma unroll
+        for (int np = 0; np < 4; ++np) {
+          uint32_t b[4];
+          ldsm_x4(smem_u32(&sk.invb[16 * np + (lane & 7) + 8 * (lane >> 4)][16 * ks + 8 * ((lane >> 3) & 1)]),
+                  b);
+#pragma unroll
+          for (int mt = 0; mt < 2; ++mt) {
+            mma16816(au[mt][2 * np], a[mt], b[0], b[1]);
+            mma16816(au[mt][2 * np + 1], a[mt], b[2], b[3]);
+          }
+        }
+      }
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh) {
+            const int v = n0 + 16 * mt + g + 8 * hh, t = 8 * nt + 2 * tq;
+            *reinterpret_cast<uint32_t*>(ust + (nt * 128 + v) * 8 + 2 * tq) =
+                pack2(au[mt][nt][2 * hh], au[mt][nt][2 * hh + 1]);
+          }
+    } else {
     float acc[4][4][4] = {};
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
@@ -1178,7 +1227,7 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
       for (int np = 0; np < 2; ++np) {
         const int kr0 = 16 * ks + (lane & 7) + 8 * ((lane >> 3) & 1);
         const int nc = n0 + 16 * np + 8 * (lane >> 4);
-        ldsm_x4_t(smem_u32(&sk.kv[bsel][kr0][nc]), b[np]);
+        ldsm_x4_t(smem_u32(&sk.kv[0][kr0][nc]), b[np]);
       }
 #pragma unroll
       for (int mt = 0; mt < 4; ++mt) {
@@ -1191,9 +1240,6 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
         }
       }
     }
-    // staging in the (now free) raw/op/inv union: w rows [16 kg][64 t][8], u [8 tg][128 v][8 t]
-    __nv_bfloat16* wst = reinterpret_cast<__nv_bfloat16*>(s.a.raw);
-    __nv_bfloat16* ust = wst + kC * kD;
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
 #pragma unroll
@@ -1202,16 +1248,12 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
         for (int hh = 0; hh < 2; ++hh) {
           const int i = 16 * mt + g + 8 * hh, n = n0 + 8 * nt + 2 * tq;
           const float x0 = acc[mt][nt][2 * hh], x1 = acc[mt][nt][2 * hh + 1];
-          if (bsel == 0) {
-            *reinterpret_cast<uint32_t*>(wst + ((n >> 3) * 64 + i) * 8 + (n & 7)) = pack2(x0, x1);
-          } else {
-            ust[((i >> 3) * 128 + n) * 8 + (i & 7)] = __float2bfloat16(x0);
-            ust[((i >> 3) * 128 + n + 1) * 8 + (i & 7)] = __float2bfloat16(x1);
-          }
+          *reinterpret_cast<uint32_t*>(wst + ((n >> 3) * 64 + i) * 8 + (n & 7)) = pack2(x0, x1);
         }
       }
     }
   }
+    }
   __syncthreads();
   {
     uint4 const* wst = reinterpret_cast<uint4 const*>(s.a.raw);
