@@ -101,6 +101,7 @@ def _get_compiled(
         gate_roll,
         partial_tma,
         _WYPROBE,
+        _TPROBE,
         wy,
         tf4,
     )

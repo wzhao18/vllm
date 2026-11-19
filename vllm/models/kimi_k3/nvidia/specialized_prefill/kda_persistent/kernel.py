@@ -36,6 +36,15 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
+def _clk64():
+    # TPROBE_ == 2 phase stamps (dev probe): SM clock64
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(), [], "mov.u64 $0, %clock64;", "=l", has_side_effects=True, asm_dialect=0
+        )
+    )
+
+
 @dsl_user_op
 def _bulk_prefetch_l2(addr, size, *, loc=None, ip=None):
     gmem_addr = llvm.addrspacecast(
@@ -739,6 +748,14 @@ def _pkd(
         # Previous chunk's MB_OFIN; a parity-1 wait on a fresh barrier passes.
         ofin_stage = cutlass.Int32(STAGES - 1)
         ofin_phase = cutlass.Int32(1)
+        sa1 = cutlass.Int64(0)
+        sa2 = cutlass.Int64(0)
+        sa3 = cutlass.Int64(0)
+        sa4 = cutlass.Int64(0)
+        sa5 = cutlass.Int64(0)
+        sa6 = cutlass.Int64(0)
+        sa7 = cutlass.Int64(0)
+        san = cutlass.Int64(0)
         for kx in cutlass.range(k1 - k0):
             chain = cute.arch.make_warp_uniform(schain[k0 + kx])
             seq_idx = chain // H_
@@ -835,7 +852,13 @@ def _pkd(
                 cute.copy(mst_st, r_mst, mst_sthr.partition_D(msth))
             cute.arch.fence_view_async_tmem_store()
             for t in cutlass.range(t_tiles):  # noqa: B007
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_0 = _clk64()
                 cute.arch.mbarrier_wait(mb + MB_QK + csc, p_qk)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_1 = _clk64()
+                    sa1 = sa1 + (c_1 - c_0)
+                    san = san + cutlass.Int64(1)
                 m0 = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + 64, dtype=cutlass.Float32),
                     mst_base.layout,
@@ -876,6 +899,9 @@ def _pkd(
                     cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
                     cute.copy(mst_st, rcur, mst_sthr.partition_D(msth))
                 cute.arch.fence_view_async_tmem_store()
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_2 = _clk64()
+                    sa2 = sa2 + (c_2 - c_1)
                 state_inp_bar.arrive()
                 p_oe ^= 1
                 p_inp ^= 1
@@ -904,6 +930,9 @@ def _pkd(
                 if cutlass.const_expr(WY_ == 0):
                     cute.arch.mbarrier_wait(mb + MB_VFULL + csc, p_vf)
                 cute.arch.mbarrier_wait(mb + MB_OOUT + csc, p_oo)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_3 = _clk64()
+                    sa3 = sa3 + (c_3 - c_2)
                 twri = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + ri4_col, dtype=cutlass.BFloat16),
                     w32b_base.layout,
@@ -987,8 +1016,14 @@ def _pkd(
                     cute.arch.mbarrier_arrive(mb + MB_VFREE + csc)
                 if cutlass.const_expr(WYPROBE_ == 0 and WY_ == 0):
                     u_inp_bar.arrive()
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_4 = _clk64()
+                    sa4 = sa4 + (c_4 - c_3)
                 if cutlass.const_expr(WY_ == 0):
                     cute.arch.mbarrier_wait(mb + MB_U2ACC + csc, p_u2a)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_5 = _clk64()
+                    sa5 = sa5 + (c_5 - c_4)
                 if cutlass.const_expr(TF4_ == 0):
                     if cutlass.const_expr(GATE2_ == 1):
                         for half in cutlass.range_constexpr(2):
@@ -1025,7 +1060,13 @@ def _pkd(
                         cute.arch.fence_view_async_tmem_store()
                         u2_inp_bar.arrive()
 
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_6 = _clk64()
+                    sa6 = sa6 + (c_6 - c_5)
                 cute.arch.mbarrier_wait(mb + MB_FIN + csc, p_fin)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    c_7 = _clk64()
+                    sa7 = sa7 + (c_7 - c_6)
                 ofin_stage = csc
                 ofin_phase = p_fin
                 csc += 1
@@ -1101,6 +1142,17 @@ def _pkd(
                 if warp == 0:
                     with cute.arch.elect_one():
                         tprobe[slot * 64 + kx * 2 + 1] = cute.arch.globaltimer()
+            if cutlass.const_expr(TPROBE_ == 2):
+                if warp == 0:
+                    with cute.arch.elect_one():
+                        tprobe[slot * 64 + 40 + 1] = sa1
+                        tprobe[slot * 64 + 40 + 2] = sa2
+                        tprobe[slot * 64 + 40 + 3] = sa3
+                        tprobe[slot * 64 + 40 + 4] = sa4
+                        tprobe[slot * 64 + 40 + 5] = sa5
+                        tprobe[slot * 64 + 40 + 6] = sa6
+                        tprobe[slot * 64 + 40 + 7] = sa7
+                        tprobe[slot * 64 + 48] = san
 
     # =====================================================================
     # EPILOGUE warpgroup (warps 4-7)
@@ -1322,11 +1374,13 @@ def _pkd(
                 for phase_t in cutlass.range(phase_tiles):
                     t = phase_base + phase_t
                     cc_t = seq_len - t * C
-                    if cutlass.const_expr(GATE2_ == 0):
+                    # TF4_: the master windows only need MMA4a (FIN); the
+                    # OUT leg (OFIN) is waited right before the OUT load.
+                    if cutlass.const_expr(GATE2_ == 0 and TF4_ == 0):
                         cute.arch.mbarrier_wait(mb + MB_OFIN + cse, pe_fin)
                     if cutlass.const_expr(True):
                         if t + 1 < t_tiles:
-                            if cutlass.const_expr(GATE2_ == 1):
+                            if cutlass.const_expr(GATE2_ == 1 or TF4_ == 1):
                                 cute.arch.mbarrier_wait(mb + MB_FIN + cse, pe_state)
                             cute.arch.mbarrier_wait(mb + MB_QK + csn, pqn)
                             h0q = cute.make_tensor(
@@ -1382,7 +1436,7 @@ def _pkd(
                             if csn == STAGES:
                                 csn = 0
                                 pqn ^= 1
-                    if cutlass.const_expr(GATE2_ == 1):
+                    if cutlass.const_expr(GATE2_ == 1 or TF4_ == 1):
                         cute.arch.mbarrier_wait(mb + MB_OFIN + cse, pe_fin)
                     cute.copy(o16_cp, out_thr.partition_S(t_out), r_o)
                     cute.arch.fence_view_async_tmem_load()
