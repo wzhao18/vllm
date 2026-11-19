@@ -42,7 +42,7 @@ HEADS = 24
 
 CUDA = r"""
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
 constexpr int PG = 65536;
@@ -136,46 +136,70 @@ __device__ __forceinline__ void arrive(unsigned b) {
 
 // TMA ring: S slots x 64 KiB, warp 0 lane 0 claims + issues (OPS bulk copies per page),
 // NC consumer threads read their 128 B of the page from smem, write it back by STG.
+__device__ __forceinline__ float2 ffma2(float2 a, float2 b, float2 c) {
+  float2 d;
+  asm("{.reg .b64 ra, rb, rc, rd;\n mov.b64 ra, {%2, %3};\n mov.b64 rb, {%4, %5};\n"
+      " mov.b64 rc, {%6, %7};\n fma.rn.f32x2 rd, ra, rb, rc;\n mov.b64 {%0, %1}, rd;}"
+      : "=f"(d.x), "=f"(d.y)
+      : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y), "f"(c.x), "f"(c.y));
+  return d;
+}
+
 // Scan math of one item on this thread's U rows x 8 keys (rows u * NC / 16 + c / 16,
 // keys 8 (c % 16) + [0, 8)): fold S = fma(S0, D, sum_t u_t w_t) (4 pending tokens),
 // then acc[row][m] += S x_m over the 8 scan vectors (FFMA2), the 16 lanes sharing
 // the rows reduce by a transposed butterfly. Operands: D[128] W[4][128]
 // X[128 keys][8] Ur[4][128 rows] (constant in the skeleton).
-template <int NC, int U>
+template <int M>
+__device__ __forceinline__ float2 fm(float2 a, float2 b, float2 c) {
+  if (M == 2) return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+  return ffma2(a, b, c);
+}
+
+template <int NC, int U, int M>
 __device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* ops, int c) {
   const float* D = ops; const float* W = ops + 128; const float* X = ops + 640;
   const float* Ur = ops + 1664;
-  const int kb = (c & 15) * 8;
+  const int l = c & 15;  // operands swizzled by lane: conflict-free shared loads
   float2 acc[U][4];
 #pragma unroll
   for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int m = 0; m < 4; ++m) acc[u][m] = make_float2(0.f, 0.f);
+  float ut[U][4];
 #pragma unroll
-  for (int u = 0; u < U; ++u) {
-    const int row = (u * NC + c) / 16;
-    float ut[4];
+  for (int u = 0; u < U; ++u)
 #pragma unroll
-    for (int t = 0; t < 4; ++t) ut[t] = Ur[t * 128 + row];
+    for (int t = 0; t < 4; ++t) ut[u][t] = Ur[t * 128 + (u * NC + c) / 16];
 #pragma unroll
-    for (int e = 0; e < 8; e += 2) {
-      const int k = kb + e;
+  for (int e = 0; e < 8; e += 2) {
+    const int p = (e >> 1) * 16 + l;
+    float2 w[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) w[t] = *(const float2*)(W + (t * 64 + p) * 2);
+    const float2 d = *(const float2*)(D + p * 2);
+    float4 x[2][2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float4* xp = (const float4*)X + ((e + h) * 2) * 16 + l;
+      x[h][0] = xp[0]; x[h][1] = xp[16];
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
       float2 fc = make_float2(-0.f, -0.f);
 #pragma unroll
-      for (int t = 3; t >= 0; --t)
-        fc = __ffma2_rn(make_float2(ut[t], ut[t]), *(const float2*)(W + t * 128 + k), fc);
+      for (int t = 3; t >= 0; --t) fc = fm<M>(make_float2(ut[u][t], ut[u][t]), w[t], fc);
       float2 s = make_float2(__uint_as_float(v[u][e]), __uint_as_float(v[u][e + 1]));
-      float2 n = __ffma2_rn(s, *(const float2*)(D + k), fc);
+      float2 n = fm<M>(s, d, fc);
       v[u][e] = __float_as_uint(n.x); v[u][e + 1] = __float_as_uint(n.y);
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const float nv = h ? n.y : n.x;
-        const float4* xp = (const float4*)(X + (k + h) * 8);
-        float4 x0 = xp[0], x1 = xp[1];
-        acc[u][0] = __ffma2_rn(make_float2(nv, nv), make_float2(x0.x, x0.y), acc[u][0]);
-        acc[u][1] = __ffma2_rn(make_float2(nv, nv), make_float2(x0.z, x0.w), acc[u][1]);
-        acc[u][2] = __ffma2_rn(make_float2(nv, nv), make_float2(x1.x, x1.y), acc[u][2]);
-        acc[u][3] = __ffma2_rn(make_float2(nv, nv), make_float2(x1.z, x1.w), acc[u][3]);
+        const float2 nn = make_float2(nv, nv);
+        acc[u][0] = fm<M>(nn, make_float2(x[h][0].x, x[h][0].y), acc[u][0]);
+        acc[u][1] = fm<M>(nn, make_float2(x[h][0].z, x[h][0].w), acc[u][1]);
+        acc[u][2] = fm<M>(nn, make_float2(x[h][1].x, x[h][1].y), acc[u][2]);
+        acc[u][3] = fm<M>(nn, make_float2(x[h][1].z, x[h][1].w), acc[u][3]);
       }
     }
   }
@@ -208,6 +232,8 @@ __device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* 
 
 template <int NC, int S, int OPS, int MATH = 0>
 __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
+  const int SB = a.sin_b + a.ring_b;  // small inputs ride on the slot barrier
+  const size_t SL = PG + SB;
   extern __shared__ __align__(1024) unsigned char smem[];
   __shared__ __align__(8) unsigned long long full[S], empty[S];
   __shared__ int s_item[S];
@@ -231,12 +257,17 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
         s_item[s] = pg;
         if (pg < 0) { arrive(sa(&full[s])); break; }
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
-                     :: "r"(sa(&full[s])), "r"(PG) : "memory");
+                     :: "r"(sa(&full[s])), "r"(PG + SB) : "memory");
         for (int o = 0; o < OPS; ++o)
           asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                       :: "r"(sa(smem + (size_t)s * PG + o * (PG / OPS))),
+                       :: "r"(sa(smem + (size_t)s * SL + o * (PG / OPS))),
                           "l"(a.state + (size_t)pg * PG + o * (PG / OPS)), "r"(PG / OPS),
                           "r"(sa(&full[s])) : "memory");
+        if (SB) {
+          char* d = (char*)smem + (size_t)s * SL + PG;
+          if (a.sin_b) asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" :: "r"(sa(d)), "l"(a.sin + (size_t)pg * a.sin_b), "r"(a.sin_b), "r"(sa(&full[s])) : "memory");
+          if (a.ring_b) asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" :: "r"(sa(d + a.sin_b)), "l"(a.ring + (size_t)pg * a.ring_b), "r"(a.ring_b), "r"(sa(&full[s])) : "memory");
+        }
         if (!waited && j == S - 1) {
           asm volatile("griddepcontrol.launch_dependents;");
           waited = true;
@@ -253,23 +284,21 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
     wait_par(sa(&full[s]), (j / S) & 1);
     int pg = s_item[s];
     if (pg < 0) break;
-    for (int o = c * 32; o < a.sin_b; o += NC * 32) {
-      unsigned r[8]; LDV8(r, a.sin + (size_t)pg * a.sin_b + o); acc ^= r[0] ^ r[7]; }
-    for (int o = c * 32; o < a.ring_b; o += NC * 32) {
-      unsigned r[8]; LDV8(r, a.ring + (size_t)pg * a.ring_b + o); acc ^= r[0] ^ r[7]; }
+    for (int o = c * 16; o < SB; o += NC * 16) {
+      uint4 r = *(const uint4*)(smem + (size_t)s * SL + PG + o); acc ^= r.x ^ r.w; }
     bool wr = a.wmod == 1 || (a.wmod > 0 && pg % a.wmod == a.step);
     constexpr int U = PG / (NC * 32);
     unsigned v[U][8];
 #pragma unroll
     for (int u = 0; u < U; ++u) {
-      const uint4* p = (const uint4*)(smem + (size_t)s * PG + (size_t)(u * NC + c) * 32);
+      const uint4* p = (const uint4*)(smem + (size_t)s * SL + (size_t)(u * NC + c) * 32);
       uint4 x = p[0], y = p[1];
       v[u][0] = x.x; v[u][1] = x.y; v[u][2] = x.z; v[u][3] = x.w;
       v[u][4] = y.x; v[u][5] = y.y; v[u][6] = y.z; v[u][7] = y.w;
     }
     __syncwarp();
     if ((c & 31) == 0) arrive(sa(&empty[s]));
-    if (MATH) acc ^= scan_math<NC, U>(v, (const float*)(smem + (size_t)S * PG), c);
+    if (MATH) acc ^= scan_math<NC, U, MATH>(v, (const float*)(smem + (size_t)S * SL), c);
     if (wr) {
       char* b = a.state + (size_t)pg * PG;
 #pragma unroll
@@ -293,7 +322,7 @@ template <int NC, int S, int OPS, int MATH = 0>
 static void go_tma(const Args& a, cudaStream_t st) {
   int dev; cudaGetDevice(&dev);
   int nsm; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
-  size_t sm = (size_t)S * PG + (MATH ? 8704 : 0);
+  size_t sm = (size_t)S * (PG + a.sin_b + a.ring_b) + (MATH ? 8704 : 0);
   cudaFuncSetAttribute(tma_k<NC, S, OPS, MATH>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(nsm); cfg.blockDim = dim3(NC + 32); cfg.stream = st;
@@ -302,7 +331,9 @@ static void go_tma(const Args& a, cudaStream_t st) {
   at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   at[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = at; cfg.numAttrs = 1;
-  TORCH_CHECK(cudaLaunchKernelEx(&cfg, tma_k<NC, S, OPS, MATH>, a) == cudaSuccess, "launch tma");
+  cudaError_t e = cudaLaunchKernelEx(&cfg, tma_k<NC, S, OPS, MATH>, a);
+  int optin = 0; cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  TORCH_CHECK(e == cudaSuccess, "launch tma: ", cudaGetErrorString(e), " smem ", sm, " optin ", optin);
 }
 
 template <int NT, int MINB>
@@ -325,7 +356,7 @@ void launch(int64_t form, int64_t state, int64_t P, int64_t sin, int64_t sin_b,
   Args a{(char*)state, (int)P, (const char*)sin, (int)sin_b, (char*)sout, (int)sout_b,
          (const char*)ring, (int)ring_b, (const int*)dom, (int*)ctr, (int)mode,
          (int)n0, (int)n1, (int)wmod, (int)step, (float*)sink};
-  cudaStream_t s = at::cuda::getCurrentCUDAStream();
+  cudaStream_t s = c10::cuda::getCurrentCUDAStream().stream();
   switch (form) {
     case 5121: go<512, 1>(a, s); break;
     case 5122: go<512, 2>(a, s); break;
@@ -339,6 +370,7 @@ void launch(int64_t form, int64_t state, int64_t P, int64_t sin, int64_t sin_b,
     case 70542: go_tma<512, 4, 2>(a, s); break;
     case 70241: go_tma<256, 4, 1>(a, s); break;
     case 170531: go_tma<512, 3, 1, 1>(a, s); break;
+    case 270531: go_tma<512, 3, 1, 2>(a, s); break;
     case 170541: go_tma<512, 4, 1, 1>(a, s); break;
     case 170241: go_tma<256, 4, 1, 1>(a, s); break;
     default: TORCH_CHECK(false, "form");
@@ -351,6 +383,9 @@ std::vector<int64_t> attrs(int64_t form) {
     case 5121: cudaFuncGetAttributes(&f, skel_k<512, 1>); break;
     case 5122: cudaFuncGetAttributes(&f, skel_k<512, 2>); break;
     case 2564: cudaFuncGetAttributes(&f, skel_k<256, 4>); break;
+    case 70531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 0>); break;
+    case 170531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 1>); break;
+    case 270531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 2>); break;
     default: cudaFuncGetAttributes(&f, skel_k<256, 2>); break;
   }
   return {f.numRegs, (int64_t)f.localSizeBytes};
@@ -366,7 +401,7 @@ std::vector<int64_t> attrs(int64_t);
 
 def _module():
     return load_inline(
-        name="k31_kda_skel_v3",
+        name="k31_kda_skel_v10",
         cpp_sources=CPP,
         cuda_sources=CUDA,
         functions=["launch", "attrs"],
@@ -380,10 +415,10 @@ def parse_arm(arm):
         if arm.startswith(kind):
             form = arm[len(kind):]
             if form.startswith("t"):  # t<NC>s<S>o<OPS>: TMA ring, NC consumers
-                nc, ops = form[1:].rstrip("m").split("o")
+                nc, ops = form[1:].rstrip("mf").split("o")
                 nc, slots = (nc.split("s") + ["3"])[:2]
                 code = (5 if nc == "512" else 2) * 100 + 10 * int(slots) + int(ops)
-                return kind, 70000 + code + (100000 if form.endswith("m") else 0)
+                return kind, 70000 + code + {"m": 100000, "f": 200000}.get(form[-1], 0)
             nt, minb = form.split("x")
             return kind, int(nt) * 10 + int(minb)
     raise ValueError(arm)
@@ -394,7 +429,7 @@ def run(mod, n, arm, place, args, dom):
     P = n * HEADS
     L = args.layers
     ppad = (P + 63) // 64 * 64  # even chunk count: every layer starts on die 0
-    dev = torch.device("cuda")
+    dev = torch.device("cuda", 0)
     if place == "local":
         backing = dies.localized_empty(L * ppad * PG, [0, 1], dev)
         mode = 2
@@ -493,16 +528,18 @@ def main():
     mod = _module()
     for arm in args.arms:
         _, form = parse_arm(arm)
-        if form >= 70000:
-            continue
         regs, local = mod.attrs(form)
         print(f"{arm}: regs {regs} local {local} B", flush=True)
-    dom = dies.sm_domain_table(torch.device("cuda"))
+    dom = dies.sm_domain_table(torch.device("cuda", 0))
     print(f"SMs per die: {int((dom == 0).sum())} / {int((dom == 1).sum())}", flush=True)
     for n in args.n:
         for place in args.place:
             for arm in args.arms:
-                run(mod, n, arm, place, args, dom)
+                try:
+                    run(mod, n, arm, place, args, dom)
+                except RuntimeError as error:
+                    print(f"{arm} n{n}: {str(error).splitlines()[0][:160]}", flush=True)
+                    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
