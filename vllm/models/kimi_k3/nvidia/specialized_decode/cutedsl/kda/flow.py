@@ -927,7 +927,8 @@ class KdaFlow(KdaWS):
                 terms[2 * t] = values[0, t] * values[0, t]
                 terms[2 * t + 1] = values[1, t] * values[1, t]
                 terms[NV + T * T + t] = old_keys[t] * old_keys[t]
-            for key, i in index.items():
+            for i in cutlass.range_constexpr(len(index)):
+                key = list(index)[i]
                 kind, t, s = key
                 weighted = values[1, s]
                 if cutlass.const_expr(s < t):
@@ -957,7 +958,8 @@ class KdaFlow(KdaWS):
                 pos = (((chunk * 4 + e) * (NV // 4) + h) * LANES + lane_in) * 4
                 store_shared_f32x4(at(xv, blk, pos), [vec[4 * h + i] for i in range(4)])
             # The couplings, normalized (thread i: coupling i).
-            for key, i in index.items():
+            for i in cutlass.range_constexpr(len(index)):
+                key = list(index)[i]
                 kind, t, s = key
                 if c == i:
                     norm = mul_rn(fk[s], fk[t])
