@@ -350,7 +350,7 @@ def main():
 
     maps = {}
     for bname, b in bufs.items():
-        for sbk in (16, 32, 48, 64):
+        for sbk in sorted({int(f[1:].split("x")[1]) for f in args.forms.split(",")}):
             maps[(bname, sbk)] = tensor_maps([(
                 b.data_ptr(), cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
                 (64, 2, b.numel() // 256), (128, 256), (64, 2, (sbk << 10) // 256),
