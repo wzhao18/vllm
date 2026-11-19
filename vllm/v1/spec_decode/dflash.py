@@ -4,6 +4,7 @@
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
 from typing_extensions import override
 
@@ -35,6 +36,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+        # Draft sliding window (None: full attention); resolved on first use.
+        self._context_window_cache: int | None | bool = False
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
@@ -107,6 +110,171 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def _warn_if_multimodal(self):
         # Override to allow multimodal inputs since DFlash supports Qwen3.5 models
         pass
+
+    def _context_window(self) -> int | None:
+        """The widest sliding window of the draft attention layers, or None
+        when any draft layer attends to its full context."""
+        if self._context_window_cache is not False:
+            return self._context_window_cache
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+
+        layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
+        windows = [
+            getattr(layers[name], "sliding_window", None)
+            for name in self._draft_attn_layer_names
+            if name in layers
+        ]
+        window = (
+            max(windows)
+            if windows and all(isinstance(w, int) and w > 0 for w in windows)
+            else None
+        )
+        self._context_window_cache = window
+        return window
+
+    def _context_hit_alignment(self) -> int | None:
+        """Token granularity at which a later request can resume from this
+        request's cached KV (prefix caching or a KV connector), or None."""
+        cache = self.vllm_config.cache_config
+        if not cache.enable_prefix_caching and (
+            self.vllm_config.kv_transfer_config is None
+        ):
+            return None
+        units = [
+            u
+            for u in (
+                getattr(cache, "cache_hit_alignment_tokens", None),
+                getattr(cache, "hash_block_size", None),
+                getattr(cache, "prefix_match_unit", None),
+                cache.block_size,
+            )
+            if isinstance(u, int) and u > 0
+        ]
+        return min(units) if units else 1
+
+    def _window_rows(self, cad: CommonAttentionMetadata) -> np.ndarray | None:
+        """Context rows whose draft K/V can ever be read, when that is a strict
+        subset of the step's rows; else None.
+
+        Draft queries sit past the context and attend through a sliding window
+        of W positions, so a request continuing from this step reads only the
+        K/V of its last W context positions, and a later request resuming from
+        a prefix-cache hit at position h reads only [h - W, h); hits land on
+        multiples of the hit alignment. Keep, per request, the rows within
+        W + num_speculative_tokens + 1 of its chunk end and of every hit point
+        inside its chunk; the other rows' K/V is never read, so skipping their
+        fc / K/V projection does not change any draft."""
+        window = self._context_window()
+        if window is None or cad.seq_lens_cpu_upper_bound is None:
+            return None
+        span = window + self.num_speculative_tokens + 1
+        qsl = cad.query_start_loc_cpu[: cad.num_reqs + 1].numpy()
+        qlen = np.diff(qsl)
+        if qlen.size == 0 or int(qlen.max()) <= span:
+            return None
+        align = self._context_hit_alignment()
+        if align is not None and align <= span:
+            return None
+        seq_ends = cad.seq_lens_cpu_upper_bound[: cad.num_reqs].numpy()
+        pieces = []
+        for r in range(cad.num_reqs):
+            lo, hi = int(qsl[r]), int(qsl[r + 1])
+            if hi - lo <= span:
+                pieces.append(np.arange(lo, hi, dtype=np.int64))
+                continue
+            # A long chunk is a prefill chunk: no draft tokens, so its rows'
+            # positions are end - n .. end - 1 exactly.
+            end_pos = int(seq_ends[r])
+            start_pos = end_pos - (hi - lo)
+            keep = np.zeros(hi - lo, dtype=bool)
+            keep[-span:] = True
+            if align is not None:
+                first = (start_pos // align + 1) * align
+                for h in range(first, end_pos, align):
+                    keep[max(0, h - span - start_pos) : h - start_pos] = True
+            pieces.append(lo + np.flatnonzero(keep))
+        rows = np.concatenate(pieces)
+        if rows.size == int(qsl[cad.num_reqs]):
+            return None
+        return rows
+
+    @override
+    def propose(
+        self,
+        num_speculative_tokens,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata,
+        mm_embed_inputs=None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mappings=None,
+    ) -> torch.Tensor:
+        # Prefill chunks longer than the draft window: drop the context rows
+        # whose draft K/V is never read (see _window_rows) before the fc and
+        # K/V projections run over them.
+        self.num_speculative_tokens = num_speculative_tokens
+        cad = common_attn_metadata
+        rows = (
+            None
+            if torch.cuda.is_current_stream_capturing()
+            else self._window_rows(cad)
+        )
+        if rows is not None:
+            qsl_total = cad.query_start_loc_cpu[cad.num_reqs]
+            logger.info_once(
+                "DFlash: context rows outside the draft window skipped "
+                "(window %d, hit alignment %s): %d of %d rows kept",
+                self._context_window(),
+                self._context_hit_alignment(),
+                rows.size,
+                int(qsl_total),
+            )
+            counts = np.diff(
+                np.searchsorted(rows, cad.query_start_loc_cpu[: cad.num_reqs + 1])
+            )
+            qsl_cpu = torch.zeros(cad.num_reqs + 1, dtype=torch.int32)
+            qsl_cpu[1:] = torch.from_numpy(np.cumsum(counts)).to(torch.int32)
+            index = torch.from_numpy(rows).pin_memory().to(
+                target_hidden_states.device, non_blocking=True
+            )
+            target_token_ids = target_token_ids[index]
+            target_positions = target_positions[..., index]
+            target_hidden_states = target_hidden_states[index]
+            cad = replace(
+                cad,
+                query_start_loc=qsl_cpu.pin_memory().to(
+                    cad.query_start_loc.device, non_blocking=True
+                ),
+                query_start_loc_cpu=qsl_cpu,
+                num_actual_tokens=int(rows.size),
+                max_query_len=int(counts.max()),
+                slot_mapping=cad.slot_mapping[index]
+                if cad.slot_mapping.shape[0] >= int(qsl_total)
+                else cad.slot_mapping,
+            )
+        return super().propose(
+            num_speculative_tokens,
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            next_token_ids,
+            token_indices_to_sample,
+            cad,
+            sampling_metadata,
+            mm_embed_inputs=mm_embed_inputs,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            slot_mappings=slot_mappings,
+        )
 
     @override
     def set_inputs_first_pass(

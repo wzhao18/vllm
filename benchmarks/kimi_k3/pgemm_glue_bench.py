@@ -24,7 +24,7 @@ def main():
         floor = (m * 2 * d * 2 + m * d + m * d // 32) / ACH_HBM * 1e6
         r = {"case": "situ_quant_shared", "M": m, "floor_us": round(floor, 1)}
         for b, lb in ((4.0, 25.0), (1.0, None)):
-            for mode in (1,):
+            for mode in (1, 4):
                 r["mode%d_b%g_lb%s" % (mode, b, lb)] = kernel_times(
                     lambda: mxfp8_act._act_quant(mode, x, d, beta=b, linear_beta=lb))[0]
         ref = torch.empty(m, d, device="cuda", dtype=torch.bfloat16)

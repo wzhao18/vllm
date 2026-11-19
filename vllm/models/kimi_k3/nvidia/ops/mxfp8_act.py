@@ -152,6 +152,46 @@ __device__ __forceinline__ float situ_activation(float g, float u, float beta,
   const float up_out = clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
   return gate_out * up_out;
 }
+// SiTU with the MUFU-light form of the routed experts' MegaMoE FC1 epilogue
+// (FlashInfer block_scaled_swap_ab_fc12_epilogue, vLLM S3): with
+// A = e^-g, B = e^(-2g/beta), C = e^(-2u/linear_beta),
+//   sigmoid(g) = 1/(1+A), tanh(g/beta) = (1-B)/(1+B), tanh(u/lbeta) = (1-C)/(1+C)
+//   out = beta*lbeta * (1-B)(1-C) / ((1+A)(1+B)(1+C))
+// on ex2.approx / rcp.approx (2 ex2 + 1 rcp when beta/2 is a small integer).
+// Not bitwise equal to the precise-tanhf form above (test bound: BF16 noise).
+__device__ __forceinline__ float ex2_approx(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float rcp_approx(float x) {
+  float y;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float situ_activation_fast(float g, float u,
+                                                      float k_a, float k_b,
+                                                      float k_c, float bb,
+                                                      int a_pow, bool clamp_up) {
+  const float eb = fminf(ex2_approx(g * k_b), 1.0e9f);
+  float ea;
+  if (a_pow > 0) {
+    ea = eb;
+    for (int i = 1; i < a_pow; ++i) ea *= eb;
+  } else {
+    ea = ex2_approx(g * k_a);
+  }
+  if (clamp_up) {
+    const float ec = fminf(ex2_approx(u * k_c), 1.0e9f);
+    const float num = (fmaf(eb, -1.0f, 1.0f) * fmaf(ec, -1.0f, 1.0f)) * bb;
+    const float den = ((ea + 1.0f) * (eb + 1.0f)) * (ec + 1.0f);
+    return num * rcp_approx(den);
+  }
+  const float num = fmaf(eb, -1.0f, 1.0f) * bb;
+  const float den = (ea + 1.0f) * (eb + 1.0f);
+  return (num * rcp_approx(den)) * u;
+}
+
 // Vectors (8 columns) per thread per trip: their loads are all issued before
 // any is used, so each SM keeps enough bytes in flight to stream HBM.
 constexpr int ACT_QUANT_UNROLL = 4;
@@ -164,7 +204,7 @@ __device__ __forceinline__ void act_load(const uint16_t* __restrict__ x,
                                          uint4& a, uint4& b) {
   if (MODE == 0) {
     a = __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-  } else if (MODE == 1 || MODE == 2) {
+  } else if (MODE == 1 || MODE == 2 || MODE == 4) {
     const uint16_t* gp = x + row * x_stride + col;
     a = __ldg(reinterpret_cast<const uint4*>(gp));
     b = __ldg(reinterpret_cast<const uint4*>(gp + d));
@@ -184,6 +224,25 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
     const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&a);
 #pragma unroll
     for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
+  } else if (MODE == 4) {
+    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
+    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
+    // inv_beta / inv_linear_beta carry beta / linear_beta here (see kernel).
+    const float bt = inv_beta, lbt = inv_linear_beta;
+    const float log2e = 1.4426950408889634f;
+    const float k_a = -log2e, k_b = -2.0f * log2e / bt;
+    const float k_c = clamp_up ? -2.0f * log2e / lbt : 0.0f;
+    const float bb = clamp_up ? bt * lbt : bt;
+    const float half = 0.5f * bt;
+    const int a_pow =
+        (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float r = situ_activation_fast(bf16_bits_to_float(g16[i]),
+                                           bf16_bits_to_float(u16[i]), k_a,
+                                           k_b, k_c, bb, a_pow, clamp_up);
+      out[i] = bf16_bits_to_float(float_to_bf16_bits(r));
+    }
   } else if (MODE == 1 || MODE == 2) {
     const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
     const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
@@ -218,7 +277,8 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
   }
 }
 
-// mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 2 silu-and-mul,
+// mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 4 the same with the
+//       routed experts' MUFU-light SiTU, 2 silu-and-mul,
 //       3 x * sigmoid(g)  (two inputs, both [rows, d])
 template <int MODE>
 __global__ void act_quant_kernel(uint8_t* __restrict__ q,
@@ -233,8 +293,10 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   const int vecs_per_row = d / 8;
   const int64_t total = rows_pad * vecs_per_row;
   const bool clamp_up = linear_beta > 0.0f;
-  const float inv_beta = MODE == 1 ? 1.0f / beta : 0.f;
-  const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+  // MODE 4 takes beta / linear_beta themselves (its constants derive from them).
+  const float inv_beta = MODE == 1 ? 1.0f / beta : (MODE == 4 ? beta : 0.f);
+  const float inv_linear_beta =
+      clamp_up ? (MODE == 4 ? linear_beta : 1.0f / linear_beta) : 0.0f;
   // Every lane runs the same trip count (total is a multiple of 4 vectors,
   // blockDim a multiple of 32), so the block-amax shuffles are uniform; the
   // 4 lanes of an MXFP8 block hold consecutive vectors in every sub-trip.
@@ -414,6 +476,7 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
     case 1: LAUNCH(1); break;
     case 2: LAUNCH(2); break;
     case 3: LAUNCH(3); break;
+    case 4: LAUNCH(4); break;
     default: TORCH_CHECK(false, "bad mode");
   }
 #undef LAUNCH
@@ -579,6 +642,42 @@ def situ_and_mul_quantize(
     """``situ_and_mul(x)`` ([rows, 2d] -> [rows, d]) as MXFP8."""
     return _act_quant(
         1, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
+    )
+
+
+# Rows from which the shared-expert SiTU uses the routed experts' MUFU-light
+# form (prefill: the precise-tanhf form is FMA-issue bound at ~4x its HBM
+# floor there; decode-sized calls are latency bound and keep the precise form).
+SITU_FAST_MIN_ROWS = 2048
+
+
+def situ_and_mul_quantize_auto(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    out: Mxfp8Buffer | None = None,
+    col: int = 0,
+):
+    """``situ_and_mul_quantize``, per shape: the routed experts' MUFU-light
+    SiTU (MegaMoE FC1 form) from ``SITU_FAST_MIN_ROWS`` rows, else the precise
+    form."""
+    rows = x.numel() // x.shape[-1]
+    mode = 4 if rows >= SITU_FAST_MIN_ROWS else 1
+    return _act_quant(
+        mode, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
+    )
+
+
+def situ_and_mul_quantize_fast(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    out: Mxfp8Buffer | None = None,
+    col: int = 0,
+):
+    """``situ_and_mul(x)`` as MXFP8 with the routed experts' SiTU form."""
+    return _act_quant(
+        4, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
     )
 
 
