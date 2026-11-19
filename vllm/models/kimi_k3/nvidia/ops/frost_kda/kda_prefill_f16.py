@@ -1275,12 +1275,13 @@ def conv_warp_group(
                 ch_k,
                 ch_v,
             )
-            if chunk_idx == cutlass.Int32(0):
-                conv_chunk(cfg, 1, *conv_args)
-            else:
-                prev = count - cutlass.Uint32(1)
-                bars.mb_raw_ready[cutlass.Int32(prev % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((prev // cfg.smem_raw_bar_stages) % 2))
-                conv_chunk(cfg, 0, *conv_args)
+            if cutlass.const_expr((cfg.conv_dbg & 1) == 0):
+                if chunk_idx == cutlass.Int32(0):
+                    conv_chunk(cfg, 1, *conv_args)
+                else:
+                    prev = count - cutlass.Uint32(1)
+                    bars.mb_raw_ready[cutlass.Int32(prev % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((prev // cfg.smem_raw_bar_stages) % 2))
+                    conv_chunk(cfg, 0, *conv_args)
             bars.mb_vconv_ready[vc].arrive()
             if cum > cutlass.Int32(0):
                 bars.mb_raw_done[prev_stage].arrive()
@@ -3593,6 +3594,7 @@ class KdaPrefillCfg:
     conv_warp_ids: tuple[int, ...] = ()
     num_regs_conv: int = 40
     conv_barrier_id: int = 9
+    conv_dbg: int = 0  # TEMP bisect knob (K31_FROST_CONV_DBG): 1 conv group skips the conv, 2 registers 136/128/48/40
 
 
 def build_cfg(
@@ -3711,6 +3713,12 @@ def build_cfg(
         cfg.num_regs_compute_group_0 = 144
         cfg.num_regs_compute_group_1 = 128
         cfg.num_regs_other = 48
+        import os
+
+        cfg.conv_dbg = int(os.environ.get("K31_FROST_CONV_DBG", "0"))
+        if cfg.conv_dbg & 2:
+            cfg.num_regs_compute_group_0 = 136
+            cfg.num_regs_compute_group_1 = 128
         cfg.vconv_cosize = cfg.vconv_stages * cfg.d_v * cfg.b_t
         cfg.conv_w_cosize = 3 * 4 * cfg.d_k
         cfg.qkconv_cosize = cfg.vconv_stages * cfg.d_k * cfg.b_t
