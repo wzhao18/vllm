@@ -155,17 +155,17 @@ __device__ __forceinline__ void write_outputs(
   }
 }
 
-// Top-2 of this lane's keys (expert j * 32 + lane, score s_sel[j * 32 + lane])
-// strictly below `limit` (0 = none).
+// Top-2 of this lane's keys (expert j * 32 + lane, score sel[j]) strictly
+// below `limit` (0 = none).
 template <int VPL>
-__device__ __forceinline__ void lane_top2(const float* s_sel, int32_t lane,
-                                          uint64_t limit, uint64_t& h1,
-                                          uint64_t& h2) {
+__device__ __forceinline__ void lane_top2_regs(const float (&sel)[VPL],
+                                               int32_t lane, uint64_t limit,
+                                               uint64_t& h1, uint64_t& h2) {
   h1 = 0;
   h2 = 0;
-#pragma unroll 4
+#pragma unroll
   for (int j = 0; j < VPL; ++j) {
-    uint64_t k = make_key(s_sel[j * 32 + lane], j * 32 + lane);
+    uint64_t k = make_key(sel[j], j * 32 + lane);
     k = k < limit ? k : 0;
     if (k > h1) {
       h2 = h1;
@@ -176,125 +176,134 @@ __device__ __forceinline__ void lane_top2(const float* s_sel, int32_t lane,
   }
 }
 
-// One token per 128-thread block: the four warps score a quarter of the
-// experts each (the precise sigmoid is a long dependent chain per element),
-// then warp 0 selects.
-template <int VPL>
-__global__ void __launch_bounds__(128)
+// One token per warp, its VPL * 32 selection scores in registers; WARPS
+// tokens in flight per block and a grid of resident blocks striding over the
+// tokens. All warps score and select (the old one-token-per-block form left
+// 3 of 4 warps idle through the serial selection, so the kernel ran latency
+// bound at ~16 selecting warps per SM). The unbiased score of a selected
+// expert is recomputed from its logit (same expression, same value).
+template <int VPL, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32)
     router_topk_kernel(const float* __restrict__ scores, int64_t ld,
                        const float* __restrict__ bias, float* topk_values,
                        int32_t* topk_indices, int32_t num_tokens,
                        int32_t num_experts, int32_t topk, bool renormalize,
                        float routed_scaling_factor) {
-  static_assert(VPL % 4 == 0);
-  __shared__ float s_sel[VPL * 32];
-  __shared__ float s_unb[VPL * 32];
-  __shared__ uint64_t cand_keys[32];
+  __shared__ float s_bias[VPL * 32];
+  __shared__ uint64_t cand_keys[WARPS][32];
   auto warp = cg::tiled_partition<32>(cg::this_thread_block());
   int32_t const lane = threadIdx.x & 31;
   int32_t const wid = threadIdx.x >> 5;
-  int32_t const token = blockIdx.x;
-  const float* row = scores + int64_t{token} * ld;
-#pragma unroll
-  for (int jj = 0; jj < VPL / 4; ++jj) {
-    int32_t const e = (wid * (VPL / 4) + jj) * 32 + lane;
-    float unb = 0.0F, sel = -INFINITY;
-    if (e < num_experts) {
-      preprocess_score(row[e], bias[e], unb, sel);
-    }
-    s_sel[e] = sel;
-    s_unb[e] = unb;
+  for (int e = threadIdx.x; e < VPL * 32; e += WARPS * 32) {
+    s_bias[e] = e < num_experts ? bias[e] : 0.0F;
   }
   __syncthreads();
-  if (wid != 0) return;
-
-  // Warp 0 reads the scores back from shared memory as it needs them (no
-  // per-lane score array: 16 resident blocks per SM).
-  float lane_max = -INFINITY;
-#pragma unroll
-  for (int j = 0; j < VPL; ++j) lane_max = fmaxf(lane_max, s_sel[j * 32 + lane]);
-
-  // Prefilter: tau = the topk-th largest lane maximum. At least topk scores
-  // are >= tau, so no score below tau ranks in the top k (the key orders by
-  // score first); the candidates (score >= tau) are usually a few dozen.
-  float m = lane_max;
-#pragma unroll
-  for (int k = 2; k <= 32; k <<= 1) {
-#pragma unroll
-    for (int j = k >> 1; j > 0; j >>= 1) {
-      float const o = __shfl_xor_sync(kFull, m, j);
-      bool const keep_max = ((lane & j) == 0) == ((lane & k) == 0);
-      m = keep_max ? fmaxf(m, o) : fminf(m, o);
-    }
-  }
-  float const tau = __shfl_sync(kFull, m, topk - 1);
-  int32_t count = 0;
-#pragma unroll
-  for (int j = 0; j < VPL; ++j) count += s_sel[j * 32 + lane] >= tau ? 1 : 0;
-  int32_t incl = count;
-#pragma unroll
-  for (int off = 1; off < 32; off <<= 1) {
-    int32_t const o = __shfl_up_sync(kFull, incl, off);
-    if (lane >= off) incl += o;
-  }
-  int32_t const num_cand = __shfl_sync(kFull, incl, 31);
-
-  uint64_t lane_packed = 0;
-  if (num_cand <= 32) {
-    // Exact order of the candidates: a 32-lane bitonic sort of their keys,
-    // largest first (lane r holds rank r).
-    int32_t pos = incl - count;
+  for (int32_t token = blockIdx.x * WARPS + wid; token < num_tokens;
+       token += gridDim.x * WARPS) {
+    const float* row = scores + int64_t{token} * ld;
+    float in[VPL];
 #pragma unroll
     for (int j = 0; j < VPL; ++j) {
-      float const sv = s_sel[j * 32 + lane];
-      if (sv >= tau) cand_keys[pos++] = make_key(sv, j * 32 + lane);
+      int32_t const e = j * 32 + lane;
+      in[j] = e < num_experts ? __ldg(row + e) : 0.0F;
     }
-    __syncwarp();
-    uint64_t key = lane < num_cand ? cand_keys[lane] : 0;
+    float sel[VPL];
+    float lane_max = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < VPL; ++j) {
+      int32_t const e = j * 32 + lane;
+      float unb = 0.0F, s = -INFINITY;
+      if (e < num_experts) {
+        preprocess_score(in[j], s_bias[e], unb, s);
+      }
+      sel[j] = s;
+      lane_max = fmaxf(lane_max, s);
+    }
+
+    // Prefilter: tau = the topk-th largest lane maximum. At least topk scores
+    // are >= tau, so no score below tau ranks in the top k (the key orders by
+    // score first); the candidates (score >= tau) are usually a few dozen.
+    float m = lane_max;
 #pragma unroll
     for (int k = 2; k <= 32; k <<= 1) {
 #pragma unroll
       for (int j = k >> 1; j > 0; j >>= 1) {
-        uint32_t const ohi = __shfl_xor_sync(kFull, uint32_t(key >> 32), j);
-        uint32_t const olo = __shfl_xor_sync(kFull, uint32_t(key), j);
-        uint64_t const o = (uint64_t(ohi) << 32) | olo;
+        float const o = __shfl_xor_sync(kFull, m, j);
         bool const keep_max = ((lane & j) == 0) == ((lane & k) == 0);
-        key = keep_max ? (key > o ? key : o) : (key < o ? key : o);
+        m = keep_max ? fmaxf(m, o) : fminf(m, o);
       }
     }
-    lane_packed = key;
-  } else {
-    // Many scores tied at tau: select rank by rank from every lane's keys.
-    uint64_t h1, h2;
-    lane_top2<VPL>(s_sel, lane, ~uint64_t{0}, h1, h2);
-    bool h2_valid = true;
-    for (int kk = 0; kk < topk; ++kk) {
-      uint64_t const best = warp_max_u64(h1);
-      if (lane == kk) lane_packed = best;
-      if (h1 == best) {  // the one lane holding it
-        if (h2_valid) {
-          h1 = h2;
-          h2_valid = false;
-        } else {
-          lane_top2<VPL>(s_sel, lane, best, h1, h2);
-          h2_valid = true;
+    float const tau = __shfl_sync(kFull, m, topk - 1);
+    int32_t count = 0;
+#pragma unroll
+    for (int j = 0; j < VPL; ++j) count += sel[j] >= tau ? 1 : 0;
+    int32_t incl = count;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      int32_t const o = __shfl_up_sync(kFull, incl, off);
+      if (lane >= off) incl += o;
+    }
+    int32_t const num_cand = __shfl_sync(kFull, incl, 31);
+
+    uint64_t lane_packed = 0;
+    if (num_cand <= 32) {
+      // Exact order of the candidates: a 32-lane bitonic sort of their keys,
+      // largest first (lane r holds rank r).
+      int32_t pos = incl - count;
+#pragma unroll
+      for (int j = 0; j < VPL; ++j) {
+        if (sel[j] >= tau) cand_keys[wid][pos++] = make_key(sel[j], j * 32 + lane);
+      }
+      __syncwarp();
+      uint64_t key = lane < num_cand ? cand_keys[wid][lane] : 0;
+      __syncwarp();
+#pragma unroll
+      for (int k = 2; k <= 32; k <<= 1) {
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+          uint32_t const ohi = __shfl_xor_sync(kFull, uint32_t(key >> 32), j);
+          uint32_t const olo = __shfl_xor_sync(kFull, uint32_t(key), j);
+          uint64_t const o = (uint64_t(ohi) << 32) | olo;
+          bool const keep_max = ((lane & j) == 0) == ((lane & k) == 0);
+          key = keep_max ? (key > o ? key : o) : (key < o ? key : o);
+        }
+      }
+      lane_packed = key;
+    } else {
+      // Many scores tied at tau: select rank by rank from every lane's keys.
+      uint64_t h1, h2;
+      lane_top2_regs<VPL>(sel, lane, ~uint64_t{0}, h1, h2);
+      bool h2_valid = true;
+      for (int kk = 0; kk < topk; ++kk) {
+        uint64_t const best = warp_max_u64(h1);
+        if (lane == kk) lane_packed = best;
+        if (h1 == best) {  // the one lane holding it
+          if (h2_valid) {
+            h1 = h2;
+            h2_valid = false;
+          } else {
+            lane_top2_regs<VPL>(sel, lane, best, h1, h2);
+            h2_valid = true;
+          }
         }
       }
     }
-  }
 
-  float lane_score = -INFINITY;
-  int32_t lane_expert = -1;
-  if (lane < topk) {
-    unpack_key(lane_packed, lane_score, lane_expert);
+    float lane_score = -INFINITY;
+    int32_t lane_expert = -1;
+    if (lane < topk) {
+      unpack_key(lane_packed, lane_score, lane_expert);
+    }
+    float lane_unbiased = 0.0F;
+    if (lane < topk && lane_expert >= 0 && lane_expert < num_experts) {
+      float s;
+      preprocess_score(__ldg(row + lane_expert), s_bias[lane_expert],
+                       lane_unbiased, s);
+    }
+    write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
+                  topk, topk_values, topk_indices, renormalize,
+                  routed_scaling_factor);
   }
-  float const lane_unbiased =
-      lane < topk && lane_expert >= 0 && lane_expert < num_experts
-          ? s_unb[lane_expert]
-          : 0.0F;
-  write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
-                topk, topk_values, topk_indices, renormalize,
-                routed_scaling_factor);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,11 +493,22 @@ void router_topk(torch::Tensor& topk_values, torch::Tensor& topk_indices,
   const int64_t k = topk_values.size(1);
   TORCH_CHECK(bias.numel() == e && k <= 32 && e >= k && e <= 1024);
   if (n == 0) return;
-  const dim3 grid((unsigned)n), block(128);
+  constexpr int kWarps = 8;
   auto stream = c10::cuda::getCurrentCUDAStream();
   const int vpl = (int)((e + 31) / 32);
+  static const int sms = [] {
+    int dev = 0, v = 0;
+    TORCH_CHECK(cudaGetDevice(&dev) == cudaSuccess);
+    TORCH_CHECK(cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount,
+                                       dev) == cudaSuccess);
+    return v;
+  }();
+  // Up to 8 resident 256-thread blocks per SM (register bound at VPL 28-32).
+  const dim3 grid((unsigned)std::min<int64_t>((n + kWarps - 1) / kWarps,
+                                              (int64_t)sms * 8)),
+      block(kWarps * 32);
 #define K3_TOPK_LAUNCH(V)                                                   \
-  router_topk_kernel<V><<<grid, block, 0, stream>>>(                        \
+  router_topk_kernel<V, kWarps><<<grid, block, 0, stream>>>(                \
       scores.data_ptr<float>(), scores.stride(0), bias.data_ptr<float>(),   \
       topk_values.data_ptr<float>(), topk_indices.data_ptr<int32_t>(),      \
       (int32_t)n, (int32_t)e, (int32_t)k, renormalize,                      \
