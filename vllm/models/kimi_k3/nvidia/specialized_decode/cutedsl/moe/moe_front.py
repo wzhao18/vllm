@@ -198,7 +198,9 @@ __device__ __forceinline__ float4 rank_sum(uint32_t off, int csize) {
   return acc;
 }
 
-__global__ void __launch_bounds__(kThreads, 2)  // <= 128 registers: room beside the AttnRes CTAs
+// <= 96 registers per thread (24 K per CTA): room beside three AttnRes CTAs (13 K each).
+template <bool NVFP4>
+__global__ void __maxnreg__(96)  // launched with kThreads
     moe_front_kernel(const __grid_constant__ CUtensorMap tw,
                      const __grid_constant__ CUtensorMap tx,
                      const __grid_constant__ Params p) {
@@ -344,7 +346,7 @@ __global__ void __launch_bounds__(kThreads, 2)  // <= 128 registers: room beside
       }
     } else {
       // Latent: BF16 round + the stager's quantization of each block of this tile.
-      const int vec = a.scale_mult > 0.0F ? 16 : 32;
+      constexpr int vec = NVFP4 ? 16 : 32;
       const int per = 128 / vec;
       const int nf = (t1 - t0) * per;
       const int blk0 = (tile - p.rtiles) * per;
@@ -352,17 +354,14 @@ __global__ void __launch_bounds__(kThreads, 2)  // <= 128 registers: room beside
         const int t = t0 + f / per, b = f % per;
         float4 in[8];
 #pragma unroll
-        for (int q = 0; q < 8; ++q) {
-          if (q < vec / 4)
-            in[q] = rank_sum(ring_s + (t * 128 + b * vec + 4 * q) * 4, p.csize);
-        }
+        for (int q = 0; q < vec / 4; ++q)
+          in[q] = rank_sum(ring_s + (t * 128 + b * vec + 4 * q) * 4, p.csize);
         if (p.yfull) {
           float4* dst = reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + tile * 128 + b * vec);
 #pragma unroll
-          for (int q = 0; q < 8; ++q)
-            if (q < vec / 4) dst[q] = in[q];
+          for (int q = 0; q < vec / 4; ++q) dst[q] = in[q];
         }
-        if (vec == 16) {
+        if constexpr (NVFP4) {
           quant_nvfp4(a, t, blk0 + b, in);
         } else {
           quant_mxfp8(a, t, blk0 + b, in);
@@ -439,10 +438,10 @@ int64_t smem_bytes(int64_t bn, int64_t wst, int64_t xst, int64_t xg) {
 }
 
 static void set_attrs(int smem) {
-  TORCH_CHECK(cudaFuncSetAttribute(moe_front_kernel,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   smem) == cudaSuccess,
-              "moe_front: smem attribute ", smem);
+  for (const void* f : {(const void*)moe_front_kernel<true>, (const void*)moe_front_kernel<false>})
+    TORCH_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) ==
+                    cudaSuccess,
+                "moe_front: smem attribute ", smem);
 }
 
 }  // namespace k3front
@@ -568,12 +567,20 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   at[1].val.clusterDim.z = 1;
   cfg.attrs = at;
   cfg.numAttrs = 2;
-  const cudaError_t rc = cudaLaunchKernelEx(&cfg, moe_front_kernel, tw, tx, p);
+  const cudaError_t rc = nvfp4 ? cudaLaunchKernelEx(&cfg, moe_front_kernel<true>, tw, tx, p)
+                              : cudaLaunchKernelEx(&cfg, moe_front_kernel<false>, tw, tx, p);
   TORCH_CHECK(rc == cudaSuccess, "moe_front launch: ", cudaGetErrorString(rc));
 }
 
 int64_t moe_front_smem(int64_t bn, int64_t wst, int64_t xst, int64_t xg) {
   return k3front::smem_bytes(bn, wst, xst, xg);
+}
+
+// (registers per thread, local memory bytes per thread) of the NVFP4 kernel.
+std::vector<int64_t> moe_front_attrs() {
+  cudaFuncAttributes fa;
+  TORCH_CHECK(cudaFuncGetAttributes(&fa, k3front::moe_front_kernel<true>) == cudaSuccess);
+  return {fa.numRegs, (int64_t)fa.localSizeBytes};
 }
 
 // Co-resident clusters of csize CTAs at this shared memory size.
@@ -592,7 +599,7 @@ int64_t moe_front_max_clusters(int64_t csize, int64_t smem) {
   cfg.attrs = at;
   cfg.numAttrs = 1;
   int nc = -1;
-  const cudaError_t e = cudaOccupancyMaxActiveClusters(&nc, moe_front_kernel, &cfg);
+  const cudaError_t e = cudaOccupancyMaxActiveClusters(&nc, moe_front_kernel<true>, &cfg);
   return e == cudaSuccess ? nc : -static_cast<int64_t>(e);
 }
 """
@@ -608,6 +615,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                int64_t wg, const torch::Tensor& stamps);
 int64_t moe_front_smem(int64_t bn, int64_t wst, int64_t xst, int64_t xg);
 int64_t moe_front_max_clusters(int64_t csize, int64_t smem);
+std::vector<int64_t> moe_front_attrs();
 """
 
 
@@ -647,7 +655,7 @@ def _module():
                 name=f"k3_moe_front_{tag}",
                 cpp_sources=_CPP_SRC,
                 cuda_sources=src,
-                functions=["moe_front", "moe_front_smem", "moe_front_max_clusters"],
+                functions=["moe_front", "moe_front_smem", "moe_front_max_clusters", "moe_front_attrs"],
                 extra_cuda_cflags=[
                     "-O3",
                     "-U__CUDA_NO_HALF_OPERATORS__",
@@ -666,8 +674,11 @@ def _module():
 
 # Launch shape per bucket of shard rows: (cluster size, weight ring slots, token ring
 # slots, weight issuers, K blocks per token slot, K blocks per weight slot). Chosen by the microbench
-# (runs/D-MOEFRONT); the shared-memory total stays beside the AttnRes grid.
-CONFIGS = {32: (5, 4, 4, 3, 2, 2), 64: (5, 4, 4, 3, 1, 2), 96: (5, 4, 4, 3, 1, 2)}
+# (runs/D-MOEFRONT). C = 4: all 35 clusters co-resident (46 fit at this shared memory;
+# C = 5 / 6 fit 32 / 28 and run a second wave). The token ring is as deep as the
+# weight ring: tokens come from L2 one K block per slot, and a shallow token ring
+# (4 slots) capped the mainloop at ~3 K blocks per us.
+CONFIGS = {32: (4, 5, 8, 3, 1, 2), 64: (4, 4, 8, 3, 1, 2), 96: (4, 4, 6, 3, 1, 2)}
 
 
 def config_for(n: int):

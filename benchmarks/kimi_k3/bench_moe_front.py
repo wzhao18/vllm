@@ -136,6 +136,7 @@ def main():
     carve = args.carveout
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     print(f"SMs {sms}; layers {L}; producer busy {args.busy_us} us; carveout {carve}")
+    print(f"  moe_front registers/local bytes: {fm.moe_front_attrs()}")
     for c in range(2, 9):
         sm_ = fm.moe_front_smem(32, 8, 4, 2)
         print(f"  max co-resident clusters C={c} smem {sm_ // 1024}K: {fm.moe_front_max_clusters(c, sm_)}")
@@ -189,12 +190,19 @@ def main():
         grid = 35 * c[0]
         st = torch.zeros(grid * 8, dtype=torch.int64, device=dev)
         end = torch.zeros(1, dtype=torch.int64, device=dev)
-        for _ in range(3):
-            end.zero_()
-            st.zero_()
+        def stamped():
             pm.prod(src, h, busy, end, carve)
             fm.moe_front(ws[0], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True, 1.0,
                          *c, st)  # fmt: skip
+
+        stamped()
+        g = torch.cuda.CUDAGraph()  # graph launch: no CPU gap between the two kernels
+        with torch.cuda.graph(g):
+            stamped()
+        for _ in range(3):
+            end.zero_()
+            st.zero_()
+            g.replay()
             torch.cuda.synchronize()
         s = (st.view(grid, 8).double() - float(end.item())) / 1000.0
         names = ["entry", "x-wait", "lastMMA", "accum", "reduced", "topk-go", "end"]
