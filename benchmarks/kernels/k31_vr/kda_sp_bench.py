@@ -163,6 +163,7 @@ def main():
     p.add_argument("--scalar", action="store_true", help="KdaFlow scalar FP32 pairs")
     p.add_argument("--fence", type=int, default=0, help="KdaFlow fold fence interval")
     p.add_argument("--noprefetch", action="store_true", help="KdaFlow no prefetch")
+    p.add_argument("--page-ops", type=int, default=0, help="KdaFlow bulk copies per page")
     p.add_argument("--unfused", action="store_true", help="KdaFlow two verify passes")
     a = p.parse_args()
     if a.trace:
@@ -183,6 +184,10 @@ def main():
         flow.PACKED = not a.scalar
         flow.FOLD_FENCE = a.fence or flow.FOLD_FENCE
         flow.PREFETCH = not a.noprefetch
+    if a.page_ops:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.PAGE_OPS = a.page_ops
     if a.skip:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 

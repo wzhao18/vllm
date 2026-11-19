@@ -117,6 +117,8 @@ PACKED = True
 FOLD_FENCE = 1
 # Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms (<= 32).
 SUMS = 32
+# Bulk copies per state page load.
+PAGE_OPS = 4
 # Item table columns.
 SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
 META = 8
@@ -300,12 +302,12 @@ class KdaFlow(KdaWS):
         if slot > 0:
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, PAGE_BYTES)
             source = args[9][Int64(slot), None, None, None]
-            for i in cutlass.range_constexpr(PAGE_BYTES // COPY_BYTES):
-                rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
+            for i in cutlass.range_constexpr(PAGE_OPS):
+                rows: cutlass.Constexpr = K // PAGE_OPS
                 copy_g2s(
                     at(pages, s, i * rows * K),
                     at(source, head, i * rows, 0),
-                    COPY_BYTES,
+                    PAGE_BYTES // PAGE_OPS,
                     barrier,
                 )
         else:
@@ -323,6 +325,8 @@ class KdaFlow(KdaWS):
         size: cutlass.Constexpr = conv_state.element_type.width // 8
         part_bytes: cutlass.Constexpr = K * self.window * size
         slot, head, pending = table[j, SLOT], table[j, HEAD], table[j, PENDING]
+        if cutlass.const_expr("stagein" in self.skip):
+            slot = Int32(0)
         if slot > 0:
             rows: cutlass.Constexpr = 4 * T * K * 2 + 3 * part_bytes
             records: cutlass.Constexpr = T * 2 * K * 2 + T * K * 4
@@ -599,7 +603,10 @@ class KdaFlow(KdaWS):
                                sums_g, kgo)  # fmt: skip
             self.group_sync(g)  # the block is complete; the staging buffers are read
             if c == 0:
-                if slot > 0:  # the new key / gate records and convolution window
+                recst = slot > 0
+                if cutlass.const_expr("recst" in self.skip):
+                    recst = slot < 0
+                if recst:  # the new key / gate records and convolution window
                     convs = buffers[0]
                     part_bytes: cutlass.Constexpr = (
                         K * self.window * convs.element_type.width // 8
@@ -666,9 +673,11 @@ class KdaFlow(KdaWS):
                 fence_async_shared()  # corrections and outputs leave by bulk stores
                 self.group_sync(g)
                 if c == 0:
-                    store_bulk(at(args[18], rec, head, 0, 0), at(uo, 0, 0), T * K * 4)
-                    for t in cutlass.range_constexpr(T):
-                        store_bulk(at(output, token + t, head * K), at(oo, t, 0), K * 2)
+                    if cutlass.const_expr("outst" not in self.skip):
+                        store_bulk(at(args[18], rec, head, 0, 0), at(uo, 0, 0), T * K * 4)
+                        for t in cutlass.range_constexpr(T):
+                            store_bulk(at(output, token + t, head * K), at(oo, t, 0),
+                                       K * 2)  # fmt: skip
                     bulk_commit()
                 cute.arch.sync_warp()
                 if cutlass.const_expr(self.trace):
