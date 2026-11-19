@@ -278,7 +278,6 @@ def order16(bits: Uint32) -> Uint32:
 
 
 PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
-PUBLISH_STAGGER = 7  # PUBLISH, odd warpgroups read the accumulator stages in reverse
 SLOTS = 96  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
 REGION = (SLOTS + 1) * TILE  # words per row: lane counts, then SLOTS words per lane
 CAP = SLOTS * TILE
@@ -785,6 +784,13 @@ class IndexerScore:
             first = Int64((ntp - 1) * TILE + lt) * 2
             ptr0 = out_a + row_base[row0] * 2 + first
             ptr1 = out_a + row_base[row1] * 2 + first
+            thr = Uint32(0)
+            cand0 = ptr0
+            cand1 = ptr1
+            p0 = ptr0
+            p1 = ptr1
+            lim0 = ptr0
+            lim1 = ptr1
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # BF16 thresholds of both rows (row_bin[3 r], the dummy row's is NaN)
                 # and their candidate lists (row_base in 16-bit units)
@@ -813,56 +819,23 @@ class IndexerScore:
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(q_empty + qs)
-            for pp in cutlass.range(ntp // 2, unroll=1):
-                t_hi = ntp - 1 - 2 * pp
-                for st0 in cutlass.range_constexpr(ACC_STAGES):
-                    st = st0
-                    if cutlass.const_expr(self.mode == PUBLISH_STAGGER):
-                        # odd warpgroups take the pair's stages in the other order,
-                        # so half the warps read TMEM while the others reduce
-                        st = Int32(st0) ^ (wg & 1)
-                    t = t_hi - st
-                    cute.arch.mbarrier_wait(acc_full + st, ph)
-                    col = tmem_q + st * N
-                    fa = tmem_ld32(col)
-                    fb = tmem_ld32(col + HEADS)
-                    fa = tmem_wait32(*fa)
-                    fb = tmem_wait32(*fb)
-                    cute.arch.sync_warp()
-                    if lane == 0:
-                        cute.arch.mbarrier_arrive(acc_empty + st)
-                    r = self.reduce2((fa, fb), w[0], w[1])
-                    if cutlass.const_expr(self.mode >= PUBLISH):
-                        kidx = t * TILE + key_in_tile
-                        if t_hi >= full_tiles:
-                            # causal edge, and the repeated tile of an odd count
-                            if kidx >= end0 or t >= ntiles:
-                                r = r | Uint32(0xFFFF)
-                            if kidx >= end1 or t >= ntiles:
-                                r = r | Uint32(0xFFFF0000)
-                        tw = Uint32(t) << Uint32(16)
-                        p0 = publish_lo(p0, r, thr, tw, lim0)
-                        p1 = publish_hi(p1, r, thr, tw, lim1)
-                    elif t_hi >= full_tiles:
-                        # causal edge (and the repeated tile of an odd count)
-                        kidx = t * TILE + key_in_tile
-                        if kidx >= end0:
-                            r = r | Uint32(0xFFFF)
-                        if kidx >= end1:
-                            r = r | Uint32(0xFFFF0000)
-                        if t < ntiles:
-                            st_global_u16(ptr0 - st * TILE * 2, r)
-                            st_global_u16(ptr1 - st * TILE * 2, r >> Uint32(16))
-                    else:
-                        st_global_u16_off(ptr0, r, -st * TILE * 2)
-                        st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
-                    if cutlass.const_expr(self.mode < PUBLISH):
-                        # histogram of the raw top 11 bits (masked keys land in bin
-                        # 2047, the lowest rank)
-                        red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
-                        red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
-                ptr0 = ptr0 - 2 * TILE * 2
-                ptr1 = ptr1 - 2 * TILE * 2
+            # tile pairs whose newer tile reaches past a row end (causal edge, and
+            # the repeated tile of an odd count) come first (newest to oldest);
+            # the rest run without masking
+            n_edge = cutlass.max(ntp + 1 - full_tiles, 0) // 2
+            for pp in cutlass.range(n_edge, unroll=1):
+                ptr0, ptr1, p0, p1 = self.tile_pair(
+                    True, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
+                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
+                    key_in_tile, hist0, hist1,
+                )
+                ph = ph ^ 1
+            for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
+                ptr0, ptr1, p0, p1 = self.tile_pair(
+                    False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
+                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
+                    key_in_tile, hist0, hist1,
+                )
                 ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # this thread's candidate counts of both rows
@@ -878,6 +851,52 @@ class IndexerScore:
                     st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
                 wg_sync(wg)
             jq += 1
+
+    @cute.jit
+    def tile_pair(
+        self, edge: cutlass.Constexpr, t_hi, ph, tmem_q, acc_full, acc_empty, lane, w,
+        ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles, key_in_tile, hist0,
+        hist1,
+    ):
+        """Both accumulator stages of one tile pair (tiles t_hi and t_hi - 1): the
+        BF16 logits of this thread's key for its two tokens, stored (mode < PUBLISH,
+        plus the histograms) or published. ``edge``: mask keys past the row ends
+        and the repeated tile of an odd count."""
+        for st in cutlass.range_constexpr(ACC_STAGES):
+            t = t_hi - st
+            cute.arch.mbarrier_wait(acc_full + st, ph)
+            col = tmem_q + st * N
+            fa = tmem_ld32(col)
+            fb = tmem_ld32(col + HEADS)
+            fa = tmem_wait32(*fa)
+            fb = tmem_wait32(*fb)
+            cute.arch.sync_warp()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(acc_empty + st)
+            r = self.reduce2((fa, fb), w[0], w[1])
+            if cutlass.const_expr(edge):
+                kidx = t * TILE + key_in_tile
+                if kidx >= end0 or t >= ntiles:
+                    r = r | Uint32(0xFFFF)
+                if kidx >= end1 or t >= ntiles:
+                    r = r | Uint32(0xFFFF0000)
+            if cutlass.const_expr(self.mode >= PUBLISH):
+                tw = Uint32(t) << Uint32(16)
+                p0 = publish_lo(p0, r, thr, tw, lim0)
+                p1 = publish_hi(p1, r, thr, tw, lim1)
+            elif cutlass.const_expr(edge):
+                if t < ntiles:
+                    st_global_u16(ptr0 - st * TILE * 2, r)
+                    st_global_u16(ptr1 - st * TILE * 2, r >> Uint32(16))
+            else:
+                st_global_u16_off(ptr0, r, -st * TILE * 2)
+                st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
+            if cutlass.const_expr(self.mode < PUBLISH):
+                # histogram of the raw top 11 bits (masked keys land in bin 2047,
+                # the lowest rank)
+                red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
+                red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
+        return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
 
     @cute.jit
     def reduce2(self, buf, w0, w1):
@@ -1477,6 +1496,16 @@ CS_THREADS = 256
 CS_BATCH = 8  # candidate loads in flight per thread (CandSelect staging)
 
 
+@asm()
+def atom_min_shared(address, value):
+    return "red.shared.min.u32 [$0], $1;", "r,r,~{memory}", (Int32(address), Uint32(value))
+
+
+@asm()
+def atom_max_shared(address, value):
+    return "red.shared.max.u32 [$0], $1;", "r,r,~{memory}", (Int32(address), Uint32(value))
+
+
 @cute.jit
 def _top_bin(hist_a, need, lane, info_a):
     """Warp 0: the highest bin b of a 256-bin histogram with count(bins >= b) >=
@@ -1526,6 +1555,18 @@ class CandSelect:
         pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
         return pos, order16(wd & Uint32(0xFFFF))
 
+    @cute.jit
+    def emit(self, flag, pos, slot_a, out, orow, lane):
+        """Write pos at the next output slot for every lane with flag (one shared
+        atomic per warp; all lanes of the warp call it)."""
+        b = ballot(flag)
+        base = Uint32(0)
+        if lane == 0 and b != Uint32(0):
+            base = atom_add_shared(slot_a, popc(b))
+        base = cute.arch.shuffle_sync(base, 0)
+        if flag != Uint32(0):
+            out[orow + Int32(base + popc(b & lanemask_lt()))] = pos
+
     @cute.kernel
     def kernel(self, cand, row_len, row_bin, out):
         K = self.topk
@@ -1536,13 +1577,15 @@ class CandSelect:
         smem = utils.SmemAllocator()
         hist = smem.allocate_tensor(Uint32, cute.make_layout(256 + 8 + TILE), 16)
         hist_a = hist.iterator.toint()
-        # b, above, count of b, out slot, tie slot, total, overflow
+        # b, above, count of b, out slot, tie slot, total, overflow, key min / max
         info_a = hist_a + 256 * 4
         cnt_a = info_a + 8 * 4
         ties = smem.allocate_tensor(Int32, cute.make_layout(CAP), 16)
         ties_a = ties.iterator.toint()
         cbuf = smem.allocate_tensor(Uint32, cute.make_layout(CAP), 16)
         cbuf_a = cbuf.iterator.toint()
+        lim = smem.allocate_tensor(Uint32, cute.make_layout(4), 16)
+        lim_a = lim.iterator.toint()
         cute.arch.griddepcontrol_wait()
         n = row_len[row]
         kk = cutlass.min(n, Int32(K))
@@ -1551,6 +1594,9 @@ class CandSelect:
         for i in cutlass.range_constexpr((256 + 8) // CS_THREADS + 1):
             if i * CS_THREADS + tid < 256 + 8:
                 st_shared_u32(hist_a + (i * CS_THREADS + tid) * 4, Uint32(0))
+        if tid == 0:
+            st_shared_u32(lim_a, Uint32(0xFFFF))  # key min
+            st_shared_u32(lim_a + 4, Uint32(0))  # key max
         cute.arch.sync_threads()
         if tid < TILE:
             c = Uint32(cand[base + tid])
@@ -1564,6 +1610,10 @@ class CandSelect:
         j = tid % TILE
         half = tid // TILE
         cj = Int32(ld_shared_u32(cnt_a + j * 4))
+        # a warp's lanes are 32 consecutive key lanes: loop to the warp's longest
+        cjw = cj
+        for i in cutlass.range_constexpr(5):
+            cjw = cutlass.max(cjw, cute.arch.shuffle_sync_bfly(cjw, 1 << i))
         bad = Int32(ld_shared_u32(info_a + 24))
         if total < kk:
             bad = Int32(1)
@@ -1571,7 +1621,9 @@ class CandSelect:
             row_bin[3 * row + 1] = bad
         if bad == 0:
             # stage this lane column's candidates in shared memory once, many
-            # loads in flight (the passes below re-read them)
+            # loads in flight, and find the key range
+            kmin = Uint32(0xFFFF)
+            kmax = Uint32(0)
             for s0 in cutlass.range(half, cj, 2 * CS_BATCH, unroll=1):
                 ws = []
                 for k in cutlass.range_constexpr(CS_BATCH):
@@ -1582,55 +1634,83 @@ class CandSelect:
                 for k in cutlass.range_constexpr(CS_BATCH):
                     if s0 + 2 * k < cj:
                         st_shared_u32(cbuf_a + ((s0 + 2 * k) * TILE + j) * 4, ws[k])
+                        key = order16(ws[k] & Uint32(0xFFFF))
+                        kmin = cutlass.min(kmin, key)
+                        kmax = cutlass.max(kmax, key)
+            for i in cutlass.range_constexpr(5):
+                kmin = cutlass.min(kmin, cute.arch.shuffle_sync_bfly(kmin, 1 << i))
+                kmax = cutlass.max(kmax, cute.arch.shuffle_sync_bfly(kmax, 1 << i))
+            if lane == 0:
+                atom_min_shared(lim_a, kmin)
+                atom_max_shared(lim_a + 4, kmax)
             cute.arch.sync_threads()
             if total <= Int32(K):
-                for s in cutlass.range(half, cj, 2, unroll=2):
-                    pos, key = self.entry(cbuf_a, j, s)
-                    if True:
-                        slot = atom_add_shared(info_a + 12, Uint32(1))
-                        out[orow + Int32(slot)] = pos
+                for s in cutlass.range(half, cjw, 2, unroll=1):
+                    pos = Int32(0)
+                    key = Uint32(0)
+                    valid = Uint32(0)
+                    if s < cj:
+                        pos, key = self.entry(cbuf_a, j, s)
+                        valid = Uint32(1)
+                    self.emit(valid, pos, info_a + 12, out, orow, lane)
                 for i in cutlass.range(total + tid, K, CS_THREADS, unroll=1):
                     out[orow + i] = Int32(-1)
             else:
+                # value-relative radix: bins of 2^shift keys above the row's lowest
+                # candidate (the candidates span a few hundred BF16 values: spread
+                # over the 256 bins, no hot-bin atomics), then the low bits
+                k0 = ld_shared_u32(lim_a)
+                span = ld_shared_u32(lim_a + 4) - k0
+                shift = Uint32(0)
+                if span > Uint32(255):
+                    shift = Uint32(24) - clz(span)
                 for s in cutlass.range(half, cj, 2, unroll=2):
                     pos, key = self.entry(cbuf_a, j, s)
-                    if True:
-                        red_shared(hist_a + ((key >> Uint32(8)) << Uint32(2)), 1)
+                    red_shared(hist_a + (((key - k0) >> shift) << Uint32(2)), 1)
                 cute.arch.sync_threads()
                 if w == 0:
                     _top_bin(hist_a, Uint32(K), lane, info_a)
                 cute.arch.sync_threads()
                 b1 = ld_shared_u32(info_a)
-                above1 = ld_shared_u32(info_a + 4)
-                cute.arch.sync_threads()
-                st_shared_u32(hist_a + tid * 4, Uint32(0))
-                cute.arch.sync_threads()
-                for s in cutlass.range(half, cj, 2, unroll=2):
-                    pos, key = self.entry(cbuf_a, j, s)
-                    if True:
-                        if (key >> Uint32(8)) == b1:
-                            red_shared(hist_a + ((key & Uint32(0xFF)) << Uint32(2)), 1)
-                cute.arch.sync_threads()
-                if w == 0:
-                    _top_bin(hist_a, Uint32(K) - above1, lane, info_a)
-                cute.arch.sync_threads()
-                t = (b1 << Uint32(8)) | ld_shared_u32(info_a)
-                above = above1 + ld_shared_u32(info_a + 4)
+                above = ld_shared_u32(info_a + 4)
                 m = ld_shared_u32(info_a + 8)
+                t = k0 + (b1 << shift)
+                if shift != Uint32(0):
+                    cute.arch.sync_threads()
+                    st_shared_u32(hist_a + tid * 4, Uint32(0))
+                    cute.arch.sync_threads()
+                    for s in cutlass.range(half, cj, 2, unroll=2):
+                        pos, key = self.entry(cbuf_a, j, s)
+                        if ((key - k0) >> shift) == b1:
+                            red_shared(
+                                hist_a + (((key - k0) & ((Uint32(1) << shift) - Uint32(1))) << Uint32(2)), 1
+                            )
+                    cute.arch.sync_threads()
+                    if w == 0:
+                        _top_bin(hist_a, Uint32(K) - above, lane, info_a)
+                    cute.arch.sync_threads()
+                    t = t + ld_shared_u32(info_a)
+                    above = above + ld_shared_u32(info_a + 4)
+                    m = ld_shared_u32(info_a + 8)
                 need = Uint32(K) - above
-                for s in cutlass.range(half, cj, 2, unroll=2):
-                    pos, key = self.entry(cbuf_a, j, s)
-                    if True:
+                for s in cutlass.range(half, cjw, 2, unroll=1):
+                    pos = Int32(0)
+                    key = Uint32(0)
+                    take = Uint32(0)
+                    tie = Uint32(0)
+                    if s < cj:
+                        pos, key = self.entry(cbuf_a, j, s)
                         if key > t:
-                            slot = atom_add_shared(info_a + 12, Uint32(1))
-                            out[orow + Int32(slot)] = pos
+                            take = Uint32(1)
                         elif key == t:
                             if m == need:
-                                slot = atom_add_shared(info_a + 12, Uint32(1))
-                                out[orow + Int32(slot)] = pos
+                                take = Uint32(1)
                             else:
-                                jt = atom_add_shared(info_a + 16, Uint32(1))
-                                st_shared_u32(ties_a + jt * 4, Uint32(pos))
+                                tie = Uint32(1)
+                    self.emit(take, pos, info_a + 12, out, orow, lane)
+                    if tie != Uint32(0):
+                        jt = atom_add_shared(info_a + 16, Uint32(1))
+                        st_shared_u32(ties_a + jt * 4, Uint32(pos))
                 cute.arch.sync_threads()
                 if m != need:
                     for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):

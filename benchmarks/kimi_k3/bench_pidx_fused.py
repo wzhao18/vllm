@@ -239,17 +239,9 @@ def perf_sel(args):
     res["flagged"] = int((row_bin[1:3 * sp.t:3] != 0).sum())
     res["cand_mean"] = float(lane_counts(cand, sp.t).float().mean())
     rb0 = row_bin.clone()
-    for mode in (pidx.PUBLISH, pidx.PUBLISH_STAGGER):
-        res[f"publish{mode}"] = timed(lambda: pidx.score(
-            d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
-            sp.cand_base, cand.view(torch.bfloat16), rb0, mode=mode), args.iters)
-    ref = torch.sort(d["out"], dim=1).values
-    pidx.selective_topk(sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
-                        mode=pidx.PUBLISH_STAGGER)
-    res["stagger_equal"] = bool(torch.equal(torch.sort(d["out"], dim=1).values, ref))
-    res["total_stagger"] = timed(lambda: pidx.selective_topk(
-        sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
-        mode=pidx.PUBLISH_STAGGER), args.iters)
+    res["publish"] = timed(lambda: pidx.score(
+        d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
+        sp.cand_base, cand.view(torch.bfloat16), rb0, mode=pidx.PUBLISH), args.iters)
     res["score_store"] = timed(lambda: run_score(d), args.iters)
     res["total_recover_all"] = timed(lambda: pidx.selective_topk(
         sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
