@@ -76,6 +76,7 @@ struct Args {
   unsigned long long* stamps;  // [layers][grid * 4][3]: producer start, producer end, consumer end
   const void* tmap;       // 3-D BF16 map (64, K|V, rows of 256 B) of the cache, 128 B swizzle
   unsigned long long base; // cache base (row = (addr - base) / 256)
+  int cap_sms;            // CTAs whose SM rank >= cap_sms exit (calibration)
   int form, layer;        // form 0: 1-D bulk, 1: tensor TMA boxes of SB / 256 rows
   unsigned* sink;
 };
@@ -116,6 +117,7 @@ __global__ void __launch_bounds__(256) skel(Args a) {
   const int n_on = rdie ? a.n_on1 : a.n_on0;
   const int G = n_on * a.P;
   const int gi = iss * n_on + a.sm_rank[sm];  // issuer-major: every SM gets work first
+  if (a.sm_rank[sm] >= a.cap_sms) return;
   unsigned long long* st = a.stamps + ((size_t)(a.layer * gridDim.x + blockIdx.x) * 4 + iss) * 3;
   if (producer && lane == 0 && iss < a.P) for (int i = 0; i < a.S; ++i) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&full[iss * a.S + i])));
@@ -214,7 +216,7 @@ void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg
             int64_t partial, int64_t out, int64_t sm_die, int64_t match, int64_t swap, int64_t steal,
             int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink,
             int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps,
-            int64_t tmap, int64_t base, int64_t form, int64_t layer) {
+            int64_t tmap, int64_t base, int64_t form, int64_t layer, int64_t cap_sms) {
   Args a;
   a.items = (const Item*)items; a.nitems = (const int*)nitems; a.cap = (int)cap;
   a.ctr = (int*)ctr; a.seg_ctr = (int*)seg_ctr; a.seg_nj = (const int*)seg_nj;
@@ -223,7 +225,7 @@ void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg
   a.P = (int)P; a.S = (int)S; a.SB = (int)SB; a.sink = (unsigned*)sink;
   a.statik = (int)statik; a.sm_rank = (const int*)sm_rank; a.n_on0 = (int)n_on0; a.n_on1 = (int)n_on1;
   a.stamps = (unsigned long long*)stamps;
-  a.tmap = (const void*)tmap; a.base = (unsigned long long)base; a.form = (int)form; a.layer = (int)layer;
+  a.tmap = (const void*)tmap; a.base = (unsigned long long)base; a.form = (int)form; a.layer = (int)layer; a.cap_sms = (int)cap_sms;
   static bool init = false;
   if (!init) { cudaFuncSetAttribute(skel, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024); init = true; }
   cudaLaunchConfig_t cfg = {};
@@ -244,7 +246,7 @@ void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg
             int64_t partial, int64_t out, int64_t sm_die, int64_t match, int64_t swap, int64_t steal,
             int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink,
             int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps,
-            int64_t tmap, int64_t base, int64_t form, int64_t layer);
+            int64_t tmap, int64_t base, int64_t form, int64_t layer, int64_t cap_sms);
 """
 
 _mod = None
@@ -310,6 +312,7 @@ def main():
     ap.add_argument("--requests", default="32,64,96")
     ap.add_argument("--replays", type=int, default=20)
     ap.add_argument("--packed", action="store_true")
+    ap.add_argument("--sm-cap", type=int, default=1024)
     ap.add_argument("--arms", default="")
     ap.add_argument("--units", default="128,256,512")
     ap.add_argument("--forms", default="t2x32x3,t4x16x3,t4x24x2,b4x16x3")
@@ -410,8 +413,10 @@ def main():
                                 sm_die.data_ptr(), match, swap, steal, P, S, SB, sms, smem,
                                 sink.data_ptr(), statik,
                                 (rank_match if match else rank_all).data_ptr(),
-                                seen[0] if match else sms, seen[1] if match else 0,
-                                stamps.data_ptr(), tmap, bufs[bname].data_ptr(), tform, li)
+                                min(seen[0], args.sm_cap) if match else min(sms, args.sm_cap),
+                                min(seen[1], args.sm_cap) if match else 0,
+                                stamps.data_ptr(), tmap, bufs[bname].data_ptr(), tform, li,
+                                args.sm_cap)
 
                     out.zero_()
                     chain()
