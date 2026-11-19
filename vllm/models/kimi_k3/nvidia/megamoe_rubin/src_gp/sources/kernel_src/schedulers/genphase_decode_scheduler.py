@@ -9,7 +9,7 @@ past the last source the scheduler returns Done. A source is (side, phase): "own
 (``%locality_domain_id``), "other" the other die; the counter of (side, phase) is die(side) * 2 + phase, die(own) =
 this CTA's die, die(other) = 1 - die (die-blind: die 0, counters 0 / 1).
     off            FC1, FC2
-    expert_half    FC1 own, FC2 own, FC1 other, FC2 other
+    expert_half    FC1 own, FC2 own, FC2 other                  (never FC1 other; with a lead no steal pass)
     on (n_split)   FC1 own, FC2 own, FC2 other                  (never FC1 other; with a lead no steal pass)
 The steal pass (the other die's sources) starts with fresh forward-only cursors.
 
@@ -79,14 +79,15 @@ Liveness relies on these kernel invariants; changing any of them needs a new arg
       fully before its increment.)
   K5  The fc1_done slot of FC2 (owner, token block k) is completed by the FC1 tiles of token block k of: the single
       stream (off), the same owner (expert_half), both owners (n_split).
-  K6  n_split only: each die runs at least one cluster that stays until that die's FC1 counter is exhausted (an
-      n_split cluster claims its own die's FC1 first and leaves only at Done). Premise, which the kernel's host guard
+  K6  die-aware forms: each die runs at least one cluster that stays until that die's FC1 counter is exhausted (a
+      die-aware cluster claims its own die's FC1 first and leaves only at Done; no cluster claims the other die's
+      FC1, so a die's FC1 stream is drained only by its own clusters). Premise, which the kernel's host guard
       assumes and nothing checks at run time (green contexts, MPS): more CTAs than the larger die has SMs are resident
       at once, and a cluster lies within one die. It holds when this grid and the communication grid fit on the GPU
       and everything that can hold SMs when the launch starts (the previous
       call's tail stragglers and top-k reduce, the communication grid) finishes without waiting for this launch, so
-      the whole grid becomes resident. off / expert_half do not need it: a die without clusters is drained by the
-      other die's later sources.
+      the whole grid becomes resident. off does not need it. expert_half took the other die's FC1 in its steal pass
+      before (no premise), at one claim round trip per cluster at the end of every call (~3 us/call at EP1, measured).
   K7  TMA-A arrives on the W5 mbarrier once per unit it takes (Done included), right after ``consume_work`` and before
       any load of that unit; it never waits on it.
 Liveness. K1 orders each cluster's consumers by claim order. FC1 has no tile dependency (K2), and its delayed/batched
@@ -157,7 +158,7 @@ from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWork
 # phase 0 = FC1, 1 = FC2. Safety-critical: n_split never claims the other die's FC1 (K6 and the argument above).
 _SOURCES = {
     "off": ((0, 0), (0, 1)),
-    "expert_half": ((0, 0), (0, 1), (1, 0), (1, 1)),
+    "expert_half": ((0, 0), (0, 1), (1, 1)),
     "on": ((0, 0), (0, 1), (1, 1)),
 }
 

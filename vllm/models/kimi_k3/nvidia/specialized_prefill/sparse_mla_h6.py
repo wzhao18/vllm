@@ -602,11 +602,13 @@ class SparseMlaPrefillH6:
             tok = base + Uint32(OFF_TOK0)
             if qi % 2 == 1:
                 tok = base + Uint32(OFF_TOK1)
+            # token-parity barriers (7-9 / 12-14), see sparse_mla_h8
+            xbar = Uint32(7 + sp) + Uint32(5) * Uint32(qi % 2)
             if real:
                 st_shared_f32(tok + Uint32((wg * 2 * H + h) * 4), lw)
                 st_shared_f32(tok + Uint32((wg * 2 * H + H + h) * 4), mp_last)
                 if owner:
-                    named_bar(Uint32(7 + sp), 64)
+                    named_bar(xbar, 64)
                     o = 1 - wg
                     l1 = ld_shared_f32(tok + Uint32((o * 2 * H + h) * 4))
                     m1 = ld_shared_f32(tok + Uint32((o * 2 * H + H + h) * 4))
@@ -617,7 +619,7 @@ class SparseMlaPrefillH6:
                         iv = out_scale / lt
                     st_shared_f32(base + Uint32(OFF_INV + h * 4), iv)
                 else:
-                    named_bar_arrive(Uint32(7 + sp), 64)
+                    named_bar_arrive(xbar, 64)
             if owner:
                 if qi + 1 < n_mine:
                     self.q_copy(base, h, lane, lane_addr, qi + 1)

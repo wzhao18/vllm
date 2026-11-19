@@ -270,7 +270,13 @@ def main():
     ap.add_argument("--json", default="")
     ap.add_argument("--sel", action="store_true")
     ap.add_argument("--ncu", action="store_true")
+    ap.add_argument("--samples", type=int, default=0)
+    ap.add_argument("--margin", type=float, default=0.0)
     a = ap.parse_args()
+    if a.samples:
+        pidx.SAMPLES = a.samples
+    if a.margin:
+        pidx.MARGIN = a.margin
     out = {}
     if a.check:
         out["check"] = check(a)

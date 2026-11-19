@@ -163,3 +163,19 @@ def test_sol_matches_fp32_reference(scale_mul, kernel):
     rel = rel[~zero]
     assert rel.mean().item() < 0.02, rel.mean().item()
     assert rel.max().item() < 0.08, rel.max().item()
+
+
+def test_two_short_tokens_per_cta():
+    """Two 1-subtile tokens per persistent CTA: the token-end l/m exchange barriers are
+    token-parity double-buffered (one set let the second token's owner complete a
+    barrier generation with the first token's arrive and hang the kernel)."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    lengths = [1, 0, 64, 2048] * (sms // 2)  # CTA c: tokens c, c + sms (same kind)
+    q8, kv, slots, lens = _problem(lengths, pool_pages=64, width=2048, seed=3)
+    out = sparse_mla_prefill_h6(q8, kv, slots, lens, 192**-0.5, 1.3)
+    torch.cuda.synchronize()
+    ref = _reference(q8, kv, slots, lens, 192**-0.5, 1.3)
+    nz = lens > 0
+    rel = (out.float() - ref).norm(dim=-1)[nz] / ref.norm(dim=-1)[nz].clamp(min=1e-6)
+    assert rel.mean().item() < 0.02, rel.mean().item()
+    assert (out[~nz].float() == 0).all()
