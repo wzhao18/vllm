@@ -447,11 +447,15 @@ def main():
                     spans, gaps = [], []
                     for li in range(LAYERS):
                         v = sva[li][sva[li][:, 0] > 0]
+                        if v.numel() == 0:
+                            spans.append(-1.0)
+                            continue
                         spans.append((int(v[:, 2].max()) - int(v[:, 0].min())) / 1e3)
                         if li:
                             gaps.append((int(v[:, 0].min()) - prev_end) / 1e3)
                         prev_end = int(v[:, 2].max())
-                    sv = sva[LAYERS - 1][sva[LAYERS - 1][:, 0] > 0]
+                    sv = sva.reshape(-1, 3)
+                    sv = sv[sv[:, 0] > 0]
                     t0 = int(sv[:, 0].min())
                     dur = ((sv[:, 2] - sv[:, 0]).float() / 1e3).sort().values
                     stamps.zero_()
