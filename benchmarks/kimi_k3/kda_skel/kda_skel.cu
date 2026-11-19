@@ -212,6 +212,7 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
       if (ctid == 0) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
       named_bar(bar_id, NCT);
       unsigned char scale_b = (unsigned char)acc;
+      bool released = false;
       if (a.onorm) {   // gated RMSNorm + MXFP8 of a 32x128 BF16 O tile (pricing: O = the q tile, gate = the og tile)
         const int tk = ctid / TPT, part = ctid % TPT;
         const uint4* orow = (const uint4*)(st + tk * 256 + part * CPT * 2);
@@ -231,13 +232,21 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
             y[q4 * 8 + 2 * e] = lo; y[q4 * 8 + 2 * e + 1] = hi; ss = fmaf(lo, lo, ss); ss = fmaf(hi, hi, ss);
           }
         }
+        uint4 gw[CPT / 8];
+#pragma unroll
+        for (int q4 = 0; q4 < CPT / 8; ++q4) gw[q4] = grow[q4];
+        if (!(a.mode == 0 && k == a.nchunk - 1)) {   // stage fully read into registers: release it before the math
+          named_bar(bar_id, NCT);
+          if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
+          released = true;
+        }
 #pragma unroll
         for (int m = 1; m < TPT; m <<= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
         const float rstd = rsqrtf(ss * (1.f / 128.f) + 1e-6f);
         float amax = 0.f;
 #pragma unroll
         for (int q4 = 0; q4 < CPT / 8; ++q4) {
-          uint4 u = grow[q4]; unsigned uu[4] = {u.x, u.y, u.z, u.w};
+          uint4 u = gw[q4]; unsigned uu[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
             float gt = e & 1 ? __uint_as_float(uu[e >> 1] & 0xffff0000u) : __uint_as_float(uu[e >> 1] << 16);
@@ -274,7 +283,7 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       named_bar(bar_id, NCT);
       const bool late_rel = a.mode == 0 && k == a.nchunk - 1;   // state-out reads the stage
-      if (!late_rel && ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
+      if (!late_rel && !released && ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
       if (ctid == 0 && !a.noout) {
         asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                      :: "l"(a.dl ? &M.outd : a.hm ? &M.out_h : &M.out), "r"(a.hm | a.dl ? 0 : head * D),
@@ -403,10 +412,9 @@ int main(int argc, char** argv) {
   // MUFU 41K (SiLU 24.6K + gate/decay 8.2K + o_norm sigmoid 8.2K); KDA pass without conv+SiLU: FMA 70K, MUFU 16K
   std::vector<V> vs = NSLOT == 2 ? std::vector<V>{
       {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL piece S=6", 2, 6, 1, 0, 0, 0, 0, 0, 1},
-      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL piece S=6 noout", 2, 6, 1, 0, 0, 0, 0, 1, 1}}
+      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL piece S=7 +onorm", 2, 7, 1, 0, 0, 1, 0, 0, 1}}
     : std::vector<V>{
-      {"DL piece 1slot S=2", 2, 2, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3", 2, 3, 1, 0, 0, 0, 0, 0, 1},
-      {"DL rrbal 1slot S=3", 1, 3, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3 +onorm", 2, 3, 1, 0, 0, 1, 0, 0, 1}};
+      {"DL piece 1slot S=3", 2, 3, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3 +onorm", 2, 3, 1, 0, 0, 1, 0, 0, 1}};
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
   { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
   cudaEvent_t e0, e1; CR(cudaEventCreate(&e0)); CR(cudaEventCreate(&e1));
