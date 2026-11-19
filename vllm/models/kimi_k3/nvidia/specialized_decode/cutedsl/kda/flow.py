@@ -64,8 +64,12 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
+from ..common import mx_rows
 from ..common.primitives import (
     alloc,
+    bits_float,
+    pack_fp8,
+    store_words,
     asm,
     at,
     copy_g2s,
@@ -123,9 +127,14 @@ PACKED = True
 FOLD_FENCE = 1
 # Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms (<= 32).
 SUMS = 32
-# Item table columns.
-SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
+# Item table columns (HSEL: the item's head slot, 0 or 1).
+SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD, HSEL = range(8)
 META = 8
+# Die-matched claim (state cache in alternating-die 2 MiB chunks): the die table
+# operand holds the die of every smid, then the address parity (dies.alternating_parity).
+DIE_TABLE = 1024
+# Prologue scratch words (Int32, over page slot 0 before its first fill).
+SC_REQ, SC_CNT, SC_WS, SC_CL, SC_HL, SC_MINE = 0, 128, 192, 200, 204, 208
 # Per-head channel constants: conv weights [3, 4], biases [3], exp(A_log), dt.
 CONSTS = 17
 A_EXP, DT = 15, 16
@@ -163,6 +172,27 @@ def max_stages(tokens, conv_dim_first, window, conv_size, limit):
     if not conv_dim_first:
         return 0
     return int(shared_bytes(tokens, conv_dim_first, window, conv_size) <= limit)
+
+
+def die_operands(state, requests_cap, heads):
+    """(die table, claim counters) for die-matched items when the FP32 state cache
+    lives in alternating-die 2 MiB chunks with 64 KiB-aligned head pages (a page then
+    sits on one die); None for any other placement (the static head-major ranges)."""
+    from ..common import dies
+
+    parity = dies.alternating_parity(state)
+    if parity is None or requests_cap > SC_CNT - SC_REQ or 2 * heads > SC_WS - SC_CNT:
+        return None
+    page = K * K * state.element_size()
+    strides = (state.data_ptr(), state.stride(0) * 4, state.stride(1) * 4)
+    if state.stride(1) * state.element_size() != page or any(s % page for s in strides):
+        return None
+    domains = dies.sm_domains(state.device.index)
+    table = torch.zeros(DIE_TABLE + 1, dtype=torch.int32)
+    table[: len(domains)] = torch.tensor(domains, dtype=torch.int32)
+    table[DIE_TABLE] = parity
+    claim = torch.zeros(2, dtype=torch.int64, device=state.device)
+    return table.to(state.device), claim
 
 
 def max_items_per_cta(requests):
@@ -233,6 +263,39 @@ def bulk_commit():
     return "cp.async.bulk.commit_group;", "~{memory}", ()
 
 
+@asm()
+def store_u8(pointer, value):
+    return "st.global.u8 [$0], $1;", "l,r,~{memory}", (pointer, Uint32(value))
+
+
+@asm(Int32)
+def read_smid():
+    return "mov.u32 $0, %smid;", "=r", ()
+
+
+@asm(Int64)
+def atomic_add_u64(pointer, value):
+    """Global 64-bit atomic add (acquire-release, GPU scope); returns the old value."""
+    code = "atom.acq_rel.gpu.global.add.u64 $0, [$1], $2;"
+    return code, "=l,l,l,~{memory}", (pointer, Int64(value))
+
+
+@asm()
+def store_relaxed_u64(pointer, value):
+    return "st.relaxed.gpu.global.u64 [$0], $1;", "l,l,~{memory}", (pointer, Int64(value))
+
+
+@asm()
+def red_shared_add(pointer, value):
+    return "red.shared.add.u32 [$0], $1;", "r,r,~{memory}", (pointer, Int32(value))
+
+
+@asm(Int32)
+def shfl_up(value, delta):
+    code = "shfl.sync.up.b32 $0, $1, $2, 0, -1;"
+    return code, "=r,r,r", (Int32(value), Int32(delta))
+
+
 class KdaFlow(KdaWS):
     """KdaWS's operands and semantics for RecoverSSM record steps (``tokens`` q > 1,
     records always written, dim-first convolution window); with the deferred
@@ -250,12 +313,19 @@ class KdaFlow(KdaWS):
         window,
         ctas,
         stages=1,
+        dies=False,
+        mx=False,
     ):
+        """dies: die-matched items (operands: die table, claim counters); mx: the
+        outputs also as the MXFP8 o_proj input (operands: FP8 data, F8_128x4 scales),
+        both after the deferred operands."""
         assert 2 <= tokens <= 4 and stages == 1 and conv_dim_first
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
+        self.dies, self.mx = dies, mx
+        self.die_at, self.mx_at = 22, 22 + 2 * int(dies)
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
         self.fold_fence = FOLD_FENCE
         self.skip = tuple(SKIP)
@@ -398,6 +468,119 @@ class KdaFlow(KdaWS):
             if c == 0:
                 cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
 
+    @cute.jit
+    def die_claim(self, args, tid, cta, scratch):
+        """Die-matched items (state cache in alternating-die 2 MiB chunks): the items,
+        head-major, ordered by the home die of their state page (die-0 items, then
+        die-1 items) form one list; a CTA on die 0 claims the next C items from its
+        bottom, a CTA on die 1 from its top, with one 64-bit atomic on (taken from
+        the bottom, taken from the top), so claims never overlap and cover the list
+        (ctas x C >= items); a CTA that meets the other die's items reads them
+        remotely. Every claim spans at most two heads when each non-empty (die,
+        head) run has at least C - 1 items; otherwise (every CTA computes the same
+        counts) the CTAs take the static head-major ranges. Leaves the CTA's items in
+        scratch[SC_MINE + j] and returns their count. The last CTA to claim resets
+        the counters for the layer's next launch."""
+        T: cutlass.Constexpr = self.tokens
+        H: cutlass.Constexpr = self.heads
+        requests: cutlass.Constexpr = args[10].shape[0] // T
+        N: cutlass.Constexpr = H * requests
+        C: cutlass.Constexpr = -(-N // self.ctas)
+        IPT: cutlass.Constexpr = -(-N // THREADS)
+        table, claim = args[self.die_at], args[self.die_at + 1]
+        if tid < 2 * H:
+            scratch[SC_CNT + tid] = Int32(0)
+        if tid < requests:
+            scratch[SC_REQ + tid] = Int32(args[8][tid, args[17][tid] - 1])
+        cute.arch.sync_warp()
+        cute.arch.barrier()
+        parity = Int64(table[DIE_TABLE])
+        bits = Int32(0)
+        zeros = Int32(0)
+        for i in cutlass.range_constexpr(IPT):
+            item = tid * IPT + i
+            if item < N:
+                head, request = item // requests, item % requests
+                slot = scratch[SC_REQ + request]
+                page = args[9][Int64(slot), None, None, None]
+                address = at(page, head, 0, 0).toint()
+                die = Int32(((address >> 21) ^ parity) & 1)
+                bits = bits | (die << i)
+                red_shared_add(scratch.iterator + (SC_CNT + die * H + head), 1)
+                zeros = zeros + 1 - die
+        lane, warp = tid % 32, tid // 32
+        inclusive = zeros
+        for k in cutlass.range_constexpr(5):
+            up = shfl_up(inclusive, 1 << k)
+            if lane >= (1 << k):
+                inclusive = inclusive + up
+        if lane == 31:
+            scratch[SC_WS + warp] = inclusive
+        cute.arch.sync_warp()
+        cute.arch.barrier()
+        before = Int32(0)
+        total = Int32(0)
+        for w in cutlass.range_constexpr(THREADS // 32):
+            s = scratch[SC_WS + w]
+            total = total + s
+            if w < warp:
+                before = before + s
+        if tid == 0:
+            valid = Int32(1)
+            for e in cutlass.range_constexpr(2 * H):
+                run = scratch[SC_CNT + e]
+                if run > 0:
+                    if run < C - 1:
+                        valid = Int32(0)
+            start = Int32(N * cta // self.ctas)
+            count = Int32(N * (cta + 1) // self.ctas) - start
+            if valid > 0:
+                die = table[read_smid() & (DIE_TABLE - 1)]
+                step = Int64(C)
+                if die > 0:
+                    step = Int64(C) << 32
+                old = atomic_add_u64(claim.iterator, step)
+                low = Int32(old & 0xFFFFFFFF)
+                high = Int32(old >> 32)
+                left = cutlass.max(Int32(N) - low - high, Int32(0))
+                count = cutlass.min(Int32(C), left)
+                start = low
+                if die > 0:
+                    start = Int32(N) - high - count
+                done = atomic_add_u64(claim.iterator + 1, 1)
+                if done == self.ctas - 1:
+                    store_relaxed_u64(claim.iterator, 0)
+                    store_relaxed_u64(claim.iterator + 1, 0)
+            scratch[SC_CL] = start
+            scratch[SC_CL + 1] = count
+            scratch[SC_CL + 2] = valid
+            scratch[SC_HL] = Int32(-1)
+            scratch[SC_MINE] = Int32(0)  # (an empty claim: head 0's constants)
+        cute.arch.sync_warp()
+        cute.arch.barrier()
+        start, count = scratch[SC_CL], scratch[SC_CL + 1]
+        if scratch[SC_CL + 2] > 0:
+            p0 = before + inclusive - zeros  # die-0 items before this thread's
+            p1 = tid * IPT - p0
+            for i in cutlass.range_constexpr(IPT):
+                item = tid * IPT + i
+                if item < N:
+                    die = (bits >> i) & 1
+                    position = p0
+                    if die > 0:
+                        position = total + p1
+                        p1 = p1 + 1
+                    else:
+                        p0 = p0 + 1
+                    if position >= start:
+                        if position < start + count:
+                            scratch[SC_MINE + position - start] = item
+        elif tid < count:
+            scratch[SC_MINE + tid] = start + tid
+        cute.arch.sync_warp()
+        cute.arch.barrier()
+        return count
+
     # ----------------------------------------------------------------- kernel
     @cute.kernel
     def kernel(self, args):
@@ -423,6 +606,11 @@ class KdaFlow(KdaWS):
 
         smem = cutlass.utils.SmemAllocator()
         pages = alloc(smem, Float32, (SLOTS, K * K), align=1024)
+        scratch = cute.make_tensor(
+            cute.recast_ptr(at(pages, 0, 0), dtype=Int32), cute.make_layout(1024)
+        )
+        if cutlass.const_expr(self.dies):  # die-matched items
+            count = self.die_claim(args, tid, cta, scratch)
         hcs = alloc(smem, Float32, (2, CONSTS, K))  # per head slot, channel
         raw = alloc(smem, BFloat16, (MAX_ITEMS, T, K), align=16)  # raw gates
         table = alloc(smem, Int32, (MAX_ITEMS, META))
@@ -471,10 +659,21 @@ class KdaFlow(KdaWS):
             cute.arch.mbarrier_init_fence()
         # The item table: host-staged step metadata (slot table, accepted counts,
         # record rows, pending counts), no predecessor output.
+        h0 = first // requests
+        h1 = (first + count - 1) // requests
+        if cutlass.const_expr(self.dies):
+            h0 = scratch[SC_MINE] // requests
         if tid < count:
+            item = first + tid
+            if cutlass.const_expr(self.dies):
+                item = scratch[SC_MINE + tid]
             head, request, slot, conv_slot, conv_offset, pending, rec = self.item_info(
-                args, first + tid
+                args, item
             )
+            table[tid, HSEL] = Int32(head != h0)
+            if cutlass.const_expr(self.dies):
+                if head != h0:  # the second head (claims span at most two)
+                    scratch[SC_HL] = head
             table[tid, SLOT] = slot
             table[tid, HEAD] = head
             table[tid, REQUEST] = request
@@ -487,9 +686,11 @@ class KdaFlow(KdaWS):
         ps = zeros(8, Int64)  # TRACE: prologue stamps
         if cutlass.const_expr(self.trace):
             ps[1] = clock64()
-        h0 = first // requests
-        h1 = (first + count - 1) // requests
-        heads = h1 - h0 + 1
+        if cutlass.const_expr(self.dies):
+            h1 = scratch[SC_HL]
+            if h1 < 0:
+                h1 = h0
+        heads = Int32(1) + Int32(h1 != h0)
         # Before the PDL wait: the channel weights of the CTA's heads (synchronous
         # loads, issued before the state stream they would queue behind), then the
         # first pages (this layer's state) and the F_B rows.
@@ -501,12 +702,12 @@ class KdaFlow(KdaWS):
                 rows = hcs[hw, None, None]
                 if lane < 12:
                     copy_g2s(at(rows, lane, 0),
-                             at(args[1], lane // 4, lane % 4, (h0 + hw) * K), K * 4,
+                             at(args[1], lane // 4, lane % 4, (h0 + (h1 - h0) * hw) * K), K * 4,
                              fb_full)  # fmt: skip
                 if lane == 12:
-                    copy_g2s(at(rows, DT, 0), at(args[7], (h0 + hw) * K), K * 4, fb_full)
+                    copy_g2s(at(rows, DT, 0), at(args[7], (h0 + (h1 - h0) * hw) * K), K * 4, fb_full)
         elif hslot < heads:
-            self.head_constants(hcs[hslot, None, None], args, h0 + hslot, tid % K)
+            self.head_constants(hcs[hslot, None, None], args, h0 + (h1 - h0) * hslot, tid % K)
         if tid == 0:  # F_B first (L2-resident): the gate projection waits on it
             hc_bytes = 0
             if cutlass.const_expr(BULK_HC):
@@ -515,7 +716,7 @@ class KdaFlow(KdaWS):
                                                     heads * K * K * 2 + hc_bytes)  # fmt: skip
             for h in cutlass.range_constexpr(2):
                 if h < heads:
-                    copy_g2s(at(fbs, h, 0, 0), at(f_b, (h0 + h) * K, 0), K * K * 2,
+                    copy_g2s(at(fbs, h, 0, 0), at(f_b, (h1 if h > 0 else h0) * K, 0), K * K * 2,
                              fb_full)  # fmt: skip
         cute.arch.sync_warp()
         if cutlass.const_expr(self.trace):
@@ -545,7 +746,7 @@ class KdaFlow(KdaWS):
             betas[item, t] = triton_sigmoid(Float32(beta[row, table[item, HEAD]]))
         if cutlass.const_expr(BULK_HC):  # noqa: SIM102
             if hslot < heads:  # read by the groups after the gate projection's barrier
-                hcs[hslot, A_EXP, tid % K] = triton_exp(Float32(args[6][h0 + hslot]))
+                hcs[hslot, A_EXP, tid % K] = triton_exp(Float32(args[6][h0 + (h1 - h0) * hslot]))
         for k in cutlass.range_constexpr(FA_ROUNDS):
             idx = tid + k * THREADS
             item = idx // (T * FA_CHUNKS)
@@ -621,7 +822,7 @@ class KdaFlow(KdaWS):
             if j < count:
                 head = table[j, HEAD]
                 if head != cached:
-                    fb = fbs[head - h0, None, None]
+                    fb = fbs[table[j, HSEL], None, None]
                     for m in cutlass.range_constexpr(2):
                         for chunk in cutlass.range_constexpr(8):
                             feature = 32 * wq + 16 * m + group_id
@@ -710,7 +911,7 @@ class KdaFlow(KdaWS):
             item_buffers = (buffers[0][jj % 2, None, None], *buffers[1:])
             if cutlass.const_expr("prep" not in self.skip):
                 self.prep_item(args, g, c, j, slot, pending, table[j, CONV_OFFSET],
-                               raw, hcs[head - h0, None, None], item_buffers, ops,
+                               raw, hcs[table[j, HSEL], None, None], item_buffers, ops,
                                sums_g, kgo, pt, po)  # fmt: skip
             if cutlass.const_expr(self.trace):
                 tp = clock64()
@@ -788,7 +989,7 @@ class KdaFlow(KdaWS):
             else:
                 self.release_slot(args, c, j, count, pages, table, state_full, False)
                 for t in cutlass.range_constexpr(T):
-                    output[token + t, head * K + c] = BFloat16(0)
+                    self.store_output(args, token + t, head, c, BFloat16(0))
         if pm[0] != 0:  # the group's last item
             self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
@@ -943,7 +1144,36 @@ class KdaFlow(KdaWS):
             rstd = reciprocal(sqrt_approx(variance))
             sigmoid_gate = triton_sigmoid(pg[t])
             result = po[t] * rstd * nw * sigmoid_gate
-            output[token + t, head * K + c] = BFloat16(result)
+            self.store_output(args, token + t, head, c, BFloat16(result))
+
+    @cute.jit
+    def store_output(self, args, row, head, c, value):
+        """Output (row, head * K + c) (thread c = channel c; warp-collective): BF16,
+        or with mx the MXFP8 o_proj input instead (one 32-column block per warp,
+        the act_quant numerics of common.mx_rows; a word of +0, +0, +0, -0 bytes is
+        stored as 0, as mx_rows does)."""
+        if cutlass.const_expr(not self.mx):
+            args[10][row, head * K + c] = value
+        else:
+            width: cutlass.Constexpr = args[10].shape[1]
+            data, scale = args[self.mx_at], args[self.mx_at + 1]
+            x = Float32(value)
+            amax = mx_rows.max_abs(Float32(0), x)
+            for k in cutlass.range_constexpr(5):
+                amax = mx_rows.fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 1 << k))
+            e = mx_rows.ue8m0(amax * bits_float(Uint32(mx_rows.INV_448)))
+            q = x * bits_float(mx_rows.inverse_scale_bits(e))
+            q1 = cute.arch.shuffle_sync_down(q, 1)
+            q2 = cute.arch.shuffle_sync_down(q, 2)
+            q3 = cute.arch.shuffle_sync_down(q, 3)
+            word = mx_rows.positive_zero32(pack_fp8((q, q1, q2, q3)))
+            column = head * K + c
+            if c % 4 == 0:
+                store_words(at(data, row, column), (word,))
+            if c % 32 == 0:
+                where = mx_rows.scale_offset(row, column // mx_rows.BLOCK,
+                                             width // mx_rows.BLOCK)  # fmt: skip
+                store_u8(scale.iterator + where, e)
 
     @cute.jit
     def finish_alone(self, args, g, c, sums, po, pg, pm, nw):

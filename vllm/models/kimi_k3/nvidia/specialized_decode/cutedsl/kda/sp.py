@@ -144,7 +144,9 @@ def fits_fused_ws(specs, tokens, device):
 
 def make_core(kind, specs, heads, tokens, record, has_bias, device):
     """The kernel object of ``kind`` for a step's operand layouts ``specs`` (no GPU
-    work); raises ``Unsupported`` where the kind cannot run them."""
+    work); raises ``Unsupported`` where the kind cannot run them. KdaFlow options
+    ride on the kind: "flow+dies" (die-matched items), "+mx" (MXFP8 outputs)."""
+    kind, *options = kind.split("+")
     requests = specs[0][0][0] // tokens
     items, mode = heads * requests, 0  # gate mode 0: one chain of eight F_B MMAs
     props = torch.cuda.get_device_properties(device)
@@ -187,7 +189,8 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             return chain.KdaChain(
                 heads, tokens, mode, has_bias, *streamed, ctas, items, stages
             )
-        return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
+        return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages,
+                            dies="dies" in options, mx="mx" in options)  # fmt: skip
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
         if size > min(specialized.SMEM_LIMIT, limit):
@@ -291,6 +294,10 @@ class SpKdaCore:
         self.conv_dim_first = is_conv_state_dim_first()
         self.kinds, self.kernels, self.specs = {}, {}, {}
         self.plain = None
+        # The o_proj's MXFP8 input scratch (gemm.mxfp8.Mxfp8Input), set before
+        # prepare_caches: KdaFlow then writes its outputs there (run returns the view).
+        self.mx_input = None
+        self.die_ops = None
         if records == "none":
             if getattr(attention, "recoverssm_records", None) is not None:
                 raise Unsupported("kda", None, "mode 'none' on a RecoverSSM layer")
@@ -360,6 +367,10 @@ class SpKdaCore:
                 cause = "the deferred FP32 commit cannot fold this state cache"
                 raise Unsupported("kda", None, cause)
         meta = dict(device="meta")
+        self.die_ops = None
+        if self.mode == "deferred" and "flow" in self.kinds.values():
+            n_cap = max(self.rows) // self.q
+            self.die_ops = flow.die_operands(state, n_cap, self.heads)
         for r in self.rows:
             n, kind = r // self.q, self.kinds[r]
             projected = torch.empty((r, self.pitch), dtype=torch.bfloat16, **meta)
@@ -371,6 +382,15 @@ class SpKdaCore:
                 count = self.records[0].shape[0]  # one pending count per record slot
                 pending = torch.empty(count, dtype=torch.int32, **meta)
                 deferred = (torch.empty(n, dtype=torch.int32, **meta), pending)
+            flavor = kind
+            if kind == "flow" and self.die_ops is not None:
+                deferred = (*deferred, *self.die_ops)
+                flavor += "+dies"
+            if kind == "flow" and self.mx_input is not None and self.mode == "deferred":
+                view = self.mx_input.view(r)
+                mx = (view.data.view(torch.uint8), view.scale)
+                deferred = (*deferred, *(torch.empty_like(t, **meta) for t in mx))
+                flavor += "+mx"
             if kind == "chain":
                 items = self.heads * n
                 chain_scratch(self.device, items)  # allocated before any capture
@@ -380,8 +400,10 @@ class SpKdaCore:
             specs = tuple(map(layout, operands))
             if kind == "fused_ws" and not fits_fused_ws(specs, self.q, self.device):
                 self.kinds[r] = kind = "fused"  # KdaFused: no persistent page staging
+            if kind != "flow":
+                flavor = kind
             options = (self.heads, self.q, True, self.has_bias, self.device.index)
-            self.kernels[r] = executable(specs, kind, *options)
+            self.kernels[r] = executable(specs, flavor, *options)
             self.specs[r] = specs
         return self
 
@@ -413,6 +435,11 @@ class SpKdaCore:
             if self.kinds[rows] not in FOLDS:
                 deferred.flush()  # this core verifies from committed checkpoints
             extra = (deferred.record_rows[:n], deferred.pending)
+            if self.kinds[rows] == "flow" and self.die_ops is not None:
+                extra = (*extra, *self.die_ops)
+            if self.kinds[rows] == "flow" and self.mx_input is not None:
+                mx_out = self.mx_input.view(rows)
+                extra = (*extra, mx_out.data.view(torch.uint8), mx_out.scale)
             if self.kinds[rows] == "chain":
                 extra = (*extra, chain_scratch(self.device, self.heads * n, grow=False))
         slots = slots[:n]
@@ -427,6 +454,8 @@ class SpKdaCore:
             raise Unsupported("kda", Shape(rows, self.q), cause)
         views = tuple(to_cute(t, 16) for t in tensors)
         kernel(*views[:13], *self.scalars, *views[13:], stream(self.device))
+        if extra and self.kinds[rows] == "flow" and self.mx_input is not None:
+            return self.mx_input.view(rows)
         return out
 
     def choice(self, rows):

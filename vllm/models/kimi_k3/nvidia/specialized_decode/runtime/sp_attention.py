@@ -222,6 +222,9 @@ class SpAttentionBlock:
         # heads x 128 (the o_proj input)
         self.width = output.k if isinstance(output, Mxfp8Projection) else output.shape[1]
         self.oproj = SpOproj(output, step.comm, rows, ctx)
+        if mx_out and set(self.oproj.tactics.values()) == {"mxfp8"}:
+            # KdaFlow writes the MXFP8 o_proj input itself (no act_quant kernel).
+            self.core.mx_input = output.input
         cap = rows[-1]
         self.projected = step.scratch(f"{kind}.projected", (cap, pitch))
         self.attn_out = step.scratch(f"attn_out.{self.width}", (cap, self.width))
@@ -245,7 +248,9 @@ class SpAttentionBlock:
                 index_slots=indexer.slot_mapping, metadata=metadata, q=step.q,
             )  # fmt: skip
         else:
-            self.core.run(projected, attn_out, caches=caches, metadata=metadata)
+            attn_out = self.core.run(
+                projected, attn_out, caches=caches, metadata=metadata
+            )
         return self.oproj.produce(attn_out, self.parity)
 
     def run(self, x_shard, caches, metadata, step):
@@ -269,7 +274,9 @@ class SpAttentionBlock:
                 index_slots=indexer.slot_mapping, metadata=metadata, q=step.q,
             )  # fmt: skip
         else:
-            self.core.run(projected, attn_out, caches=caches, metadata=metadata)
+            attn_out = self.core.run(
+                projected, attn_out, caches=caches, metadata=metadata
+            )
         shard = x_shard.new_empty((n, WIDTH))
         return self.oproj.run(attn_out, shard, self.parity)
 

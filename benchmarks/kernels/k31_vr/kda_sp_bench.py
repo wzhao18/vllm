@@ -29,6 +29,11 @@ Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
 
 GAP = 0  # see neighbour(); negative: time the neighbours alone
 PENDING = 0  # pending replay tokens per request; 0: uniform 1..Q
+# State placement: striped (default allocation), local (alternating-die 2 MiB chunks,
+# die-matched items), static (alternating chunks, head-major ranges), swap (die-matched
+# with the die table inverted: every item remote).
+PLACE = "striped"
+MX = False  # KdaFlow writes the MXFP8 o_proj input (I5) instead of BF16
 
 
 def _pending(g):
@@ -101,6 +106,13 @@ def bench(n, kind, layers, iters, seed=0):
     rows = Q * n
     slots = layers * n + 2
     kv = list(kda.caches(slots))
+    real_die_operands = flow.die_operands
+    if PLACE != "striped":
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+        kv[1] = dies.localized_like(kv[1], [0, 1])
+    if PLACE == "static":
+        flow.die_operands = lambda *args: None
     g = torch.Generator().manual_seed(seed)
     order = torch.randperm(slots - 1, generator=g) + 1
     projected = torch.randn(rows, kda.PITCH, generator=torch.Generator().manual_seed(1))
@@ -127,9 +139,20 @@ def bench(n, kind, layers, iters, seed=0):
                 ),
             )
             core = sp.SpKdaCore(attention, (rows,), records="deferred", ctx=kda.context())
+            if MX:
+                from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import (
+                    mxfp8,
+                )
+
+                core.mx_input = mxfp8.shared_input("o_proj", rows, DIM, kda.DEVICE)
             core.prepare_caches(kv)
+            if PLACE in ("local", "swap") and kind == "flow":
+                assert core.die_ops is not None, "state not die-localized"
+            if PLACE == "swap":
+                core.die_ops[0][flow.DIE_TABLE] ^= 1
             calls.append((core, metadata))
     finally:
+        flow.die_operands = real_die_operands
         sp.RECORD_KINDS.clear()
         sp.RECORD_KINDS.update(saved)
         flow.max_stages = real_stages
@@ -196,6 +219,8 @@ def main():
     p.add_argument("--slots", type=int, default=0, help="KdaFlow page slots")
     p.add_argument("--gap", type=int, default=0, help="non-PDL neighbour per layer (<0: alone)")
     p.add_argument("--pending", type=int, default=0, help="pending tokens (0: 1..Q)")
+    p.add_argument("--place", nargs="+", default=["striped"])
+    p.add_argument("--mx", action="store_true", help="KdaFlow MXFP8 outputs")
     p.add_argument("--unfused", action="store_true", help="KdaFlow two verify passes")
     a = p.parse_args()
     global PENDING
@@ -231,8 +256,11 @@ def main():
     props = torch.cuda.get_device_properties(0)
     print(f"device {props.name} sms {props.multi_processor_count}", flush=True)
     results = []
-    for n in a.n:
-        for kind in a.kinds:
+    global PLACE, MX
+    MX = a.mx
+    for n, place, kind in [(n, pl, k) for n in a.n for pl in a.place for k in a.kinds]:
+        PLACE = place
+        if True:
             try:
                 med, best = bench(n, kind, a.layers, a.iters)
             except Exception as exc:  # noqa: BLE001
@@ -241,12 +269,12 @@ def main():
             items = HEADS * n
             mb = items * (2 * 128 * 128 * 4) / 1e6
             print(
-                f"n{n:4d} r{n / 4:5.1f} {kind:9s} {med:7.2f} us/layer (best {best:7.2f})"
+                f"n{n:4d} r{n / 4:5.1f} {kind:5s} {place:7s} {med:7.2f} us/layer (best {best:7.2f})"
                 f"  state R+W {mb:6.1f} MB -> {mb / med:5.2f} TB/s"
                 f"  x69 {med * 69 / 1e3:5.3f} ms",
                 flush=True,
             )
-            results.append(dict(n=n, kind=kind, us=med, best=best))
+            results.append(dict(n=n, kind=kind, place=place, us=med, best=best))
             torch.cuda.empty_cache()
     if a.json:
         with open(a.json, "w") as f:

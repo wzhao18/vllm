@@ -41,6 +41,8 @@ from .host import to_cute
 from .primitives import asm, launch
 
 PAGE, CHUNK = 4096, 2 << 20
+# Live LocalizedMemory ranges: base -> (nbytes, per-chunk domains).
+_RANGES: dict[int, tuple[int, tuple[int, ...]]] = {}
 # Cold-load medians are ~700 (near die) vs ~1100 (far die) SM cycles.
 MIN_GAP_CYCLES = 150
 # Home die of the 4 KiB page k of a 2 MiB physical page, up to the per-chunk bit c.
@@ -101,6 +103,8 @@ class LocalizedMemory:
             )
             start = i
         _checked(cuda.cuMemSetAccess(self.base, self.nbytes, [access], 1), "access")
+        _RANGES[self.base] = (self.nbytes, self.domains)
+        weakref.finalize(self, _RANGES.pop, self.base, None)
 
     @staticmethod
     def _release(base, nbytes, handles):
@@ -149,6 +153,25 @@ def localized_like(tensor, domains):
     out = raw.view(tensor.dtype).view(tensor.shape)
     out.copy_(tensor)
     return out
+
+
+def alternating_parity(tensor: torch.Tensor) -> int | None:
+    """For ``tensor`` inside a LocalizedMemory range whose 2 MiB chunks alternate
+    dies (chunk i on die (i + d0) & 1): the parity p with home die of address a =
+    ((a >> 21) ^ p) & 1. None otherwise (default or differently placed memory)."""
+    storage = tensor.untyped_storage()
+    start = tensor.data_ptr()
+    end = max(storage.data_ptr() + storage.nbytes(), start + 1)
+    for base, (nbytes, domains) in list(_RANGES.items()):
+        if not base <= start < base + nbytes:
+            continue
+        if end > base + nbytes or len(domains) < 2:
+            return None
+        d0 = domains[0]
+        if d0 not in (0, 1) or any(d != (i + d0) & 1 for i, d in enumerate(domains)):
+            return None
+        return ((base >> 21) ^ d0) & 1
+    return None
 
 
 @functools.cache

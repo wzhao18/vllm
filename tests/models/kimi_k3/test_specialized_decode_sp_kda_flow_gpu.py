@@ -21,6 +21,7 @@ from tests.models.kimi_k3.test_specialized_decode_sp_recoverssm_gpu import (
     accepted_counts,
     commit,
 )
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow, sp
 
 Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
@@ -40,17 +41,26 @@ def core_of(kind, attention, rows, records, caches):
     return core
 
 
-@pytest.mark.parametrize("kind", ["flow", "chain"])
+@pytest.mark.parametrize(
+    "kind", ["flow", "chain", "flow-local"], ids=["flow", "chain", "flow_die_local"]
+)
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("n", [3, 33, 96, 128])
 def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, kind, monkeypatch):
+    """flow-local: the FP32 state cache in alternating-die 2 MiB chunks, so KdaFlow's
+    CTAs claim the items whose pages sit on their own die (die-matched claim)."""
     monkeypatch.setattr(flow, "max_stages", lambda *args: stages)
+    kind, local = kind.split("-")[0], kind.endswith("local")
+    if local and dies.domain_count(torch.cuda.current_device()) < 2:
+        pytest.skip("a single-die device")
     sp.executable.cache_clear()
     rows, slots = Q * n, 2 * n + 2
     stock, ours = kda.layer(), kda.layer()  # the same weights, their own records
     ours.deferred_recoverssm = True
     kv = kda.caches(slots)
+    if local:
+        kv = (kv[0], dies.localized_like(kv[1], [0, 1]))
     ref_kv = tuple(t.clone() for t in kv)
     _, metadata = kda.step(n, slots)
     checkpoints = metadata.spec_state_indices_tensor[:, 0].contiguous()
@@ -70,6 +80,7 @@ def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, kind, monkeypat
     )
     ref_core = core_of("ws", stock, rows, "triton", ref_kv)
     core = core_of(kind, ours, rows, "deferred", kv)
+    assert (core.die_ops is not None) == local
     projected = torch.empty(rows, kda.PITCH, dtype=torch.bfloat16, device=kda.DEVICE)
     out, ref_out = (
         torch.empty(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE)
@@ -122,3 +133,56 @@ def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, kind, monkeypat
         pending[index] = accepted
     assert folded > 0
     sp.executable.cache_clear()
+
+
+def test_flow_mxfp8_output_is_act_quant_of_bf16():
+    """KdaFlow with the o_proj's MXFP8 input attached writes, bit for bit, the
+    act_quant (ops.mxfp8_act.quantize) of the BF16 outputs it writes without it."""
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (
+        Mxfp8Input,
+    )
+
+    sp.executable.cache_clear()
+    n = 33
+    rows, slots = Q * n, 2 * n + 2
+    kv = kda.caches(slots)
+    projected, metadata = kda.step(n, slots)
+    record_rows = torch.arange(n, dtype=torch.int32, device=kda.DEVICE)
+    pending = torch.zeros(MAX_REQS, dtype=torch.int32, device=kda.DEVICE)
+    deferred = kda.Module(
+        **vars(metadata),
+        recoverssm_deferred=kda.Module(
+            record_rows=record_rows, pending=pending, flush=None
+        ),
+    )
+    outs = []
+    for mx in (False, True):
+        layer = kda.layer()
+        layer.deferred_recoverssm = True
+        saved = dict(sp.RECORD_KINDS)
+        sp.RECORD_KINDS[HEADS] = "1-:flow"
+        try:
+            core = sp.SpKdaCore(layer, (rows,), records="deferred", ctx=kda.context())
+        finally:
+            sp.RECORD_KINDS.clear()
+            sp.RECORD_KINDS.update(saved)
+        if mx:
+            core.mx_input = Mxfp8Input(rows, DIM, kda.DEVICE)
+        caches = [t.clone() for t in kv]
+        core.prepare_caches(caches)
+        out = torch.zeros(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE)
+        outs.append(core.run(projected, out, caches=caches, metadata=deferred))
+    torch.cuda.synchronize()
+    bf16, got = outs
+    assert isinstance(got, mxfp8_act.Mxfp8Buffer)
+    want = mxfp8_act.quantize(bf16)
+    words = want.data.view(torch.int32)
+    words = torch.where(words == -(2**31), torch.zeros_like(words), words)
+    kda.assert_bitwise("FP8 data", got.data.view(torch.int32), words)
+    r = torch.arange(rows, device=kda.DEVICE).view(-1, 1)
+    b = torch.arange(DIM // 32, device=kda.DEVICE).view(1, -1)
+    where = (b & 3) + (b >> 2) * 512 + (r & 31) * 16 + ((r & 127) >> 5) * 4
+    where = where + (r >> 7) * (128 * (DIM // 32))
+    mismatch = (got.scale[where] != want.scale[where]).sum().item()
+    assert mismatch == 0, f"{mismatch} scale bytes differ"
