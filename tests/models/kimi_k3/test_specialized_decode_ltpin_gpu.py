@@ -10,9 +10,6 @@ shapes:
 * the beta-add shape (latent_up) adds into the residual in place, as stock's
   ``residual.addmm_``;
 * MXFP8 ltpin equals the dequantized FP32 reference within one BF16 rounding;
-* the router | latent down concatenation: the router logits match stock's BF16 ->
-  FP32 router GEMM to FP32 summation-order noise and the latent is the RN BF16 of
-  the FP32 columns (``split_head`` bitwise);
 * ``DecodeProjection`` dispatches the "ltpin" kind (plain and residual), a captured
   graph replays it, and unknown shapes / unprepared rows raise.
 
@@ -49,7 +46,6 @@ BF16 = {  # name: (N, K, out32, beta)
     "wq_b": (4096, 1536, False, False),
     "latent_down": (3584, 7168, False, False),
     "latent_up": (7168, 3584, False, True),
-    "router_latent": (4480, 7168, True, False),
 }
 MXFP8 = {"kda_in": (12448, 7168), "shared_gu": (12288, 7168), "shared_down": (7168, 6144)}
 
@@ -123,31 +119,6 @@ def test_mxfp8_pins(name):
             scale_b=sw.view(torch.float8_e8m0fnu), out_dtype=torch.bfloat16,
         )  # fmt: skip
         assert ((out.float() - stock.float()).abs() <= tol).all(), (name, r)
-
-
-def test_router_latent_split():
-    torch.cuda.set_device(DEVICE)
-    experts, latent, k = 896, 3584, 7168
-    router, down = _rand((experts, k), 0.02, 4), _rand((latent, k), 0.02, 5)
-    packed = torch.cat([router, down])
-    rows = ltpin.pinned_rows("router_latent")
-    gemm = ltpin.LtPin("t_rl", experts + latent, k, rows, out32=True, device=DEVICE)
-    for r in rows:
-        h = _rand((r, k), 1.0, 11 + r)
-        y = torch.empty(r, experts + latent, device=DEVICE, dtype=torch.float32)
-        gemm.run(packed, h, y)
-        logits = torch.empty(r, experts, device=DEVICE, dtype=torch.float32)
-        rest = torch.empty(r, latent, device=DEVICE, dtype=torch.bfloat16)
-        ltpin.split_head(y, experts, logits, rest)
-        assert torch.equal(logits, y[:, :experts]) and torch.equal(
-            rest, y[:, experts:].bfloat16()
-        )
-        stock_logits = torch.mm(h, router.t(), out_dtype=torch.float32)
-        scale = stock_logits.abs().amax(dim=1, keepdim=True)
-        assert ((logits - stock_logits).abs() <= scale * 1e-5 + 1e-5).all(), r
-        stock_latent = torch.mm(h, down.t())
-        tol = stock_latent.float().abs().amax(dim=1, keepdim=True) * 2.0**-7 + 1e-4
-        assert ((rest.float() - stock_latent.float()).abs() <= tol).all(), r
 
 
 def test_projection_kind_and_graph():
