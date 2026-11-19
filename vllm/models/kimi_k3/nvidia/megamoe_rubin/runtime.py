@@ -345,6 +345,7 @@ class RubinMegaMoE:
         is_padding: torch.Tensor | None = None,
         owner: str | None = None,
         ep_tokens: int | None = None,
+        rmsnorm: tuple[torch.Tensor, float] | None = None,
     ) -> torch.Tensor:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
@@ -361,6 +362,9 @@ class RubinMegaMoE:
         kernels); unnamed callers always poll.
         ``ep_tokens``: the EP-uniform live tokens per rank that pick the bucket's
         epilogue variant (None: the capacity); same value on every EP rank.
+        ``rmsnorm``: ``(weight, eps)`` of the output's consumer RMSNorm, applied in
+        the reduce (``out[:n] = rms_norm(sum ...)``, stock vLLM ``rms_norm`` numerics;
+        :meth:`prepare_rmsnorm` compiles it before CUDA graph capture).
         """
         session = self.sessions.get(bucket)
         if session is None:
@@ -373,7 +377,7 @@ class RubinMegaMoE:
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
-            session.launch(weights, session.empty_output, ep_tokens)
+            session.launch(weights, session.empty_output, ep_tokens, rmsnorm)
             result = hidden.new_empty((0, self.problem.hidden))
         else:
             if out is None:
@@ -385,12 +389,24 @@ class RubinMegaMoE:
             elif out.shape[0] < n:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
-            session.launch(weights, result, ep_tokens)
+            session.launch(weights, result, ep_tokens, rmsnorm)
         if owner is None or self._poll_owner in (None, owner):
             if owner is not None:
                 self._poll_owner = owner
             self.poll_route_errors()
         return result
+
+    def prepare_rmsnorm(
+        self, weights: RubinMoeWeights, norm_weight: torch.Tensor, eps: float
+    ) -> None:
+        """Compile (local, no launch: not collective) every bucket's fused-RMSNorm
+        reduce variant for ``forward(..., rmsnorm=(norm_weight, eps))``; call before
+        CUDA graph capture (compiles are refused while capturing)."""
+        ensure_not_capturing("RubinMegaMoE fused RMSNorm compile")
+        for b in self.buckets:
+            session = self.sessions[b]
+            for use_s2 in sorted(session.kernels):
+                session.prepare(weights, session.empty_output, use_s2, (norm_weight, eps))
 
     def destroy(self) -> None:
         ensure_not_capturing("RubinMegaMoE teardown")
