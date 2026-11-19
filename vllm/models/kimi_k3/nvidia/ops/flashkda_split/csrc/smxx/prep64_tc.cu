@@ -1,22 +1,25 @@
 // Kimi-K3: chunk-64 KDA prepare on the raw in_proj rows (short conv fused),
 // tensor-core block products, for the chunk-64 tcgen05 recurrence (k64_tc.cu).
 //
-// One CTA per (chunk, head), 256 threads; thread (tg, cg) = (tid >> 4, tid & 15)
-// owns tokens 4 tg .. 4 tg + 3 and channels 8 cg .. 8 cg + 7.
-//   conv     q|k|v = SiLU(causal width-4 conv) of the raw rows, FP32 weights,
-//            FP32 conv state: the qkv_conv kernel's arithmetic (bit for bit),
-//            the chunk-0 CTA of a sequence reads and rewrites its conv state
+// One CTA per (chunk, head), 256 threads, two CTAs per SM.
+//   conv     q|k|v = SiLU(causal width-4 conv) of the raw rows (2D TMA boxes with
+//            3 history rows), FP32 weights and conv state: the qkv_conv kernel's
+//            arithmetic (bit for bit); the chunk-0 CTA of a sequence reads and
+//            rewrites its conv state
 //   v image  bf16 post-conv v, [8 t-groups][128 v][8 t]
 //   qn, kn   = bf16(x * rsqrt(sum x^2 + 1e-6))
 //   gc       = cumsum_t gate_scale * sigmoid(exp(A_log) (g + dt_bias)) (FP32,
 //            chunk-relative), gT = gc[last valid row], g_total = exp2(gT)
-//   kd = bf16(kn * bf16(exp2 gc)), qd = bf16(bf16(qn * bf16(exp2 gc)) * bf16(scale)),
-//   kr = bf16(kn * bf16(exp2(gT - gc)))
-//   A, Mq    per 16-row block I with the reference row r = 16 I: row operand
-//            bf16(kn_i * bf16(exp2(gc_i - gc_r))) (<= 1), column operand
-//            bf16(kn_j * bf16(exp2(gc_r - gc_j))), mma.sync m16n8k16 BF16 -> FP32
-//   INV      = (I + beta tril(A, -1))^-1 in FP32 (16x16 diagonal blocks by forward
-//            substitution, off-diagonal blocks by block products), bf16 image
+//   kd = kn * bf16(exp2 gc), qd = (qn * bf16(exp2 gc)) * bf16(scale),
+//   kr = kn * bf16(exp2(gT - gc))                       (bf16 products, RN)
+//   A, Mq    16-row blocks I with the reference row r_I = 16 I: row operands
+//            kn_i * bf16(exp2(gc_i - gc_rI)) (<= 1) and (qn_i * that) * bf16(scale),
+//            column operand kn_j * bf16(exp2(gc_rJ - gc_j)) of j's own block J,
+//            scaled by bf16(exp2(gc_rI - gc_rJ)) (<= 1) for the tiles I > J;
+//            mma.sync m16n8k16 BF16 -> FP32
+//   INV      = (I + beta tril(A, -1))^-1: 16x16 diagonal blocks by FP32 forward
+//            substitution, off-diagonal blocks by BF16 tensor-core block products
+//            (FlashKDA's 16x16 merge, one warp per block column), bf16 image
 //   Mqk      = bf16(tril(Mq))
 // The images are k64_tc.cu's (rows past the sequence end zero).
 #include <cstddef>
@@ -33,37 +36,41 @@ constexpr int kC = 64;
 constexpr int kD = 128;
 constexpr int kPitch = 136;  // bf16 per operand row: conflict-free ldmatrix
 constexpr int kThreads = 256;
+constexpr int kRawRows = kC + 3;
+constexpr int kRawBox = kRawRows * kD * 2;
+constexpr int kOffRawG = 3 * kRawBox;
+constexpr int kRawBytes = 3 * kRawBox + kC * kD * 2;
+constexpr int kKrPitch = 24;  // bf16 per row of the per-warp kr transpose tile (16 x 16)
 
 struct Smem {
-  // region A: raw rows (TMA) until the gate pass, then the MMA operands
-  __nv_bfloat16 rk[kC * kPitch];
-  __nv_bfloat16 rq[kC * kPitch];
   union {
-    __nv_bfloat16 ck[160 * kPitch];  // column operands of blocks 0..3 (16, 32, 48, 64 rows)
+    unsigned char raw[kRawBytes];  // q | k | v boxes (67 rows) and the gate box (64 rows)
     struct {
-      float x[kC][kC + 1];
-      float t[3][16][17];
+      __nv_bfloat16 rk[kC * kPitch];
+      __nv_bfloat16 rq[kC * kPitch];
+      __nv_bfloat16 ck[kC * kPitch];  // column operand, own-block reference
+      __nv_bfloat16 krs[8][16 * kKrPitch];
+    } op;
+    struct {
+      float x[kC][kC + 4];  // INV
+      float t[3][16][20];   // per-warp T tiles of the block-column chains
     } inv;
-  } u;
-  __nv_bfloat16 qkn[2][kC][kD];  // bf16 normalized post-conv q, k
+  } a;
+  __nv_bfloat16 qkn[2][kC][kPitch];  // bf16 normalized post-conv q, k (padded rows)
   union {
-    float g[kC][kD + 4];  // chunk-relative gate cumsum
-    float l[kC][kC + 1];  // beta_i A_ij below the diagonal
-  } w;
+    float g[kC][kD + 4];                // chunk-relative gate cumsum
+    __nv_bfloat16 vs[8][8 * kPitch];    // per-warp v transpose tiles (8 tokens x 128)
+    float l[kC][kC + 4];                // beta_i A_ij below the diagonal
+  } c;
+  __nv_bfloat162 pf[6][kD / 2];  // bf16 exp2(gc_rI - gc_rJ), I > J (pair I (I - 1) / 2 + J)
+  float tot[16][kD];
+  float wc[3][4][kD];  // conv weights of this head, [q|k|v][tap][channel]
+  float dt[kD];
   float gref[4][kD];
   float gT[kD];
   float beta[kC];
   alignas(8) uint64_t bar;
 };
-
-// Raw rows staged by TMA at the start of the CTA (aliases rk / rq / u.ck, which
-// are written only after the conv and the gate have read them): q, k, v boxes of
-// 67 rows (3 history rows + 64) and the gate box of 64 rows, 256 B per row.
-constexpr int kRawRows = kC + 3;
-constexpr int kRawBox = kRawRows * kD * 2;
-constexpr int kOffRawG = 3 * kRawBox;
-constexpr int kRawBytes = 3 * kRawBox + kC * kD * 2;
-static_assert(kRawBytes <= int(offsetof(Smem, qkn)), "raw rows must fit in rk | rq | u");
 
 struct Params {
   CUtensorMap tm_x;  // raw q|k|v rows: dims (3 H 128, T), box (128, 67)
@@ -206,8 +213,18 @@ __device__ __forceinline__ uint32_t smem_u32(void const* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
-// Rows of column block I in s.u.ck start at kCkBase[I].
-__device__ __forceinline__ int ck_base(int I) { return I * (I + 1) * 8; }
+__device__ __forceinline__ uint32_t hmul2(uint32_t a, uint32_t b) {
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+
+__device__ __forceinline__ void ldsm_x4_t(uint32_t addr, uint32_t (&r)[4]) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
+}
+
+__device__ __forceinline__ void stg32(void* p, uint32_t v) { *reinterpret_cast<uint32_t*>(p) = v; }
 
 __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_constant__ Params p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -246,7 +263,7 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
   };
   stamp(0);
   const uint32_t bar = smem_u32(&s.bar);
-  unsigned char* raw = smem_raw;
+  unsigned char* raw = s.a.raw;
   if (tid == 0) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bar) : "memory");
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -258,7 +275,6 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
       tma2d(smem_u32(raw + X * kRawBox), &p.tm_x, X * H * kD + h * kD, tok0 - 3, bar);
     tma2d(smem_u32(raw + kOffRawG), &p.tm_g, h * kD, tok0, bar);
   }
-
   if (tid < kC) {
     float b = 0.0f;
     if (tid < valid) {
@@ -268,9 +284,8 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
     s.beta[tid] = b;
   }
 
-  // ---- short conv (q, k, v) ----------------------------------------------------
+  // ---- short conv (v, q, k): thread (tg, cg) = tokens 4 tg.., channels 8 cg.. ----
   const int t_first = 4 * tg;
-  const bool active = t_first < valid;
   int64_t line = 0;
   bool load_init = false, write_state = false;
   if (c_in_seq == 0) {
@@ -279,7 +294,18 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
     load_init = !null_line && p.has_init[seq];
     write_state = !null_line && tg == 0;
   }
-  __syncthreads();  // barrier init visible
+  const bool hist_from_state = c_in_seq == 0 && tg == 0;
+  for (int e = tid; e < 3 * kD; e += kThreads) {
+    const int X = e >> 7, c = e & (kD - 1);
+    const float4 wv = __ldg(reinterpret_cast<float4 const*>(p.conv_w + (int64_t(X) * HD + h * kD + c) * 4));
+    s.wc[X][0][c] = wv.x;
+    s.wc[X][1][c] = wv.y;
+    s.wc[X][2][c] = wv.z;
+    s.wc[X][3][c] = wv.w;
+  }
+  if (tid < kD) s.dt[tid] = p.dt_bias[h * kD + tid];
+  const float amp = expf(p.a_log[h]);
+  __syncthreads();  // barrier init, weights visible
   {
     uint32_t ok = 0;
     while (!ok) {
@@ -294,33 +320,32 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
   stamp(15);
 #pragma unroll 1
   for (int xi = 0; xi < 3; ++xi) {
-    const int X = xi == 0 ? 2 : xi - 1;  // v (straight to its image), then q, k
+    const int X = xi == 0 ? 2 : xi - 1;  // v (to its image), then q, k
     const int ch0 = X * HD + h * kD + 8 * cg;
     unsigned char const* rawx = raw + X * kRawBox + 16 * cg;
     float w[4][8];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float4 wv = __ldg(reinterpret_cast<float4 const*>(p.conv_w + int64_t(ch0 + i) * 4));
-      w[0][i] = wv.x;
-      w[1][i] = wv.y;
-      w[2][i] = wv.z;
-      w[3][i] = wv.w;
+    for (int k = 0; k < 4; ++k) {
+      const float4* wp = reinterpret_cast<const float4*>(&s.wc[X][k][8 * cg]);
+      const float4 a = wp[0], b = wp[1];
+      w[k][0] = a.x;
+      w[k][1] = a.y;
+      w[k][2] = a.z;
+      w[k][3] = a.w;
+      w[k][4] = b.x;
+      w[k][5] = b.y;
+      w[k][6] = b.z;
+      w[k][7] = b.w;
     }
-    uint4 o0 = make_uint4(0, 0, 0, 0), o1 = o0, o2 = o0, o3 = o0;
-    if (active || write_state) {
-      float hist[3][8];
+    float hist[3][8];
+#pragma unroll
+    for (int k = 0; k < 3; ++k) unpack8(*reinterpret_cast<uint4 const*>(rawx + (t_first + k) * 256), hist[k]);
+    if (hist_from_state) {
       float* st = p.conv_state + line * p.st_s0 + int64_t(ch0) * p.st_s1;
 #pragma unroll
-      for (int k = 0; k < 3; ++k) {
-        const int pos = t_first - 3 + k;  // chunk-relative
-        if (pos >= 0 || c_in_seq > 0) {
-          unpack8(*reinterpret_cast<uint4 const*>(rawx + (pos + 3) * 256), hist[k]);
-        } else {
+      for (int k = 0; k < 3; ++k)
 #pragma unroll
-          for (int i = 0; i < 8; ++i)
-            hist[k][i] = load_init ? st[i * p.st_s1 + k * p.st_s2] : 0.0f;
-        }
-      }
+        for (int i = 0; i < 8; ++i) hist[k][i] = load_init ? st[i * p.st_s1 + k * p.st_s2] : 0.0f;
       if (write_state) {
         // new state: the last 3 inputs of the sequence (shifted in after the old
         // state for sequences shorter than 3); this thread read the old state above.
@@ -331,55 +356,52 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
           if (src >= 0) {
             unpack8(ldg16(p.x + int64_t(bos + src) * p.ldx + ch0), ns);
           } else {
+            const int k = j + seq_len;  // 0..2; selects keep hist in registers
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-              const int k = j + seq_len;  // 0..2; selects keep hist in registers
-              ns[i] = k == 0 ? hist[0][i] : (k == 1 ? hist[1][i] : hist[2][i]);
-            }
+            for (int i = 0; i < 8; ++i) ns[i] = k == 0 ? hist[0][i] : (k == 1 ? hist[1][i] : hist[2][i]);
           }
 #pragma unroll
           for (int i = 0; i < 8; ++i) st[i * p.st_s1 + j * p.st_s2] = ns[i];
         }
       }
+    }
+    uint4 ov[4];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        if (t_first + j < valid) {
-          float cur[8], o[8];
-          unpack8(*reinterpret_cast<uint4 const*>(rawx + (t_first + j + 3) * 256), cur);
-          conv_row(hist[0], hist[1], hist[2], cur, w, o);
-          const uint4 ov = pack8(o);
-          if (j == 0) o0 = ov;
-          if (j == 1) o1 = ov;
-          if (j == 2) o2 = ov;
-          if (j == 3) o3 = ov;
+    for (int j = 0; j < 4; ++j) {
+      float cur[8], o[8];
+      unpack8(*reinterpret_cast<uint4 const*>(rawx + (t_first + j + 3) * 256), cur);
+      conv_row(hist[0], hist[1], hist[2], cur, w, o);
+      ov[j] = t_first + j < valid ? pack8(o) : make_uint4(0, 0, 0, 0);
 #pragma unroll
-          for (int i = 0; i < 8; ++i) {
-            hist[0][i] = hist[1][i];
-            hist[1][i] = hist[2][i];
-            hist[2][i] = cur[i];
-          }
-        }
+      for (int i = 0; i < 8; ++i) {
+        hist[0][i] = hist[1][i];
+        hist[1][i] = hist[2][i];
+        hist[2][i] = cur[i];
       }
     }
     if (X == 2) {
-      // v image: channel c, tokens t_first..t_first+3 -> 8 contiguous bytes
-      __nv_bfloat16* vb = p.v_img + img * (kC * kD) + ((t_first >> 3) * kD + 8 * cg) * 8 + (t_first & 7);
-      const uint32_t a0[4] = {o0.x, o0.y, o0.z, o0.w}, a1[4] = {o1.x, o1.y, o1.z, o1.w};
-      const uint32_t a2[4] = {o2.x, o2.y, o2.z, o2.w}, a3[4] = {o3.x, o3.y, o3.z, o3.w};
+      // v image: the warp's 8 tokens (= t-group warp) x 128 channels through a
+      // shared tile, transposed by ldmatrix: lane gets tokens 2 (l % 4) + {0, 1}
+      // of channel l / 4 of each 8x8 tile -> 32-bit stores, 128 B per tile row.
+      __nv_bfloat16* vt = s.c.vs[warp];
 #pragma unroll
-      for (int m = 0; m < 4; ++m) {
-        *reinterpret_cast<uint2*>(vb + (2 * m) * 8) =
-            make_uint2(__byte_perm(a0[m], a1[m], 0x5410), __byte_perm(a2[m], a3[m], 0x5410));
-        *reinterpret_cast<uint2*>(vb + (2 * m + 1) * 8) =
-            make_uint2(__byte_perm(a0[m], a1[m], 0x7632), __byte_perm(a2[m], a3[m], 0x7632));
+      for (int j = 0; j < 4; ++j)
+        *reinterpret_cast<uint4*>(vt + (4 * (tg & 1) + j) * kPitch + 8 * cg) = ov[j];
+      __syncwarp();
+      __nv_bfloat16* vb = p.v_img + img * (kC * kD) + warp * (kD * 8) + 2 * (lane & 3);
+#pragma unroll
+      for (int m4 = 0; m4 < 4; ++m4) {
+        uint32_t r[4];
+        ldsm_x4_t(smem_u32(vt + (lane & 7) * kPitch + 8 * (4 * m4 + (lane >> 3))), r);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) stg32(vb + (8 * (4 * m4 + q) + (lane >> 2)) * 8, r[q]);
       }
     } else {
-      // L2 norm (16 lanes per token) -> bf16(x * rsqrt(sum x^2 + 1e-6)) in shared memory
+      // L2 norm (16 lanes per token) -> bf16(x * rsqrt(sum x^2 + 1e-6))
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const uint4 ov = j == 0 ? o0 : (j == 1 ? o1 : (j == 2 ? o2 : o3));
         float f[8];
-        unpack8(ov, f);
+        unpack8(ov[j], f);
         float ss = 0.0f;
 #pragma unroll
         for (int i = 0; i < 8; ++i) ss += f[i] * f[i];
@@ -392,32 +414,29 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
       }
     }
   }
-  __syncthreads();  // raw q|k|v rows (halo reads) done: the raw q box holds the scan totals
+  __syncthreads();  // raw q|k|v reads and the v tiles done
   stamp(1);
 
   // ---- gate activation + chunk-relative cumsum ----------------------------------
-  float* tot = reinterpret_cast<float*>(raw);  // [16][128]
   {
-    const float amp = expf(p.a_log[h]);
     float dt[8];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) dt[i] = p.dt_bias[h * kD + 8 * cg + i];
+    for (int i = 0; i < 8; ++i) dt[i] = s.dt[8 * cg + i];
     float run[8] = {};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      float gv[8] = {};
-      if (t_first + j < valid) {
-        unpack8(*reinterpret_cast<uint4 const*>(raw + kOffRawG + (t_first + j) * 256 + 16 * cg), gv);
+      float gv[8];
+      unpack8(*reinterpret_cast<uint4 const*>(raw + kOffRawG + (t_first + j) * 256 + 16 * cg), gv);
+      const bool okj = t_first + j < valid;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) gv[i] = p.gate_scale * sigmoid_tanh(amp * (gv[i] + dt[i]));
+      for (int i = 0; i < 8; ++i) {
+        run[i] += okj ? p.gate_scale * sigmoid_tanh(amp * (gv[i] + dt[i])) : 0.0f;
       }
-#pragma unroll
-      for (int i = 0; i < 8; ++i) run[i] += gv[i];
-      float4* gp = reinterpret_cast<float4*>(&s.w.g[t_first + j][8 * cg]);
+      float4* gp = reinterpret_cast<float4*>(&s.c.g[t_first + j][8 * cg]);
       gp[0] = make_float4(run[0], run[1], run[2], run[3]);
       gp[1] = make_float4(run[4], run[5], run[6], run[7]);
     }
-    float4* tp = reinterpret_cast<float4*>(tot + tg * kD + 8 * cg);
+    float4* tp = reinterpret_cast<float4*>(&s.tot[tg][8 * cg]);
     tp[0] = make_float4(run[0], run[1], run[2], run[3]);
     tp[1] = make_float4(run[4], run[5], run[6], run[7]);
   }
@@ -426,7 +445,7 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
   {
     float pre[8] = {};
     for (int t2 = 0; t2 < tg; ++t2) {
-      const float4* tp = reinterpret_cast<const float4*>(tot + t2 * kD + 8 * cg);
+      const float4* tp = reinterpret_cast<const float4*>(&s.tot[t2][8 * cg]);
       const float4 a = tp[0], b = tp[1];
       pre[0] += a.x;
       pre[1] += a.y;
@@ -441,111 +460,114 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const int t = t_first + j;
-      float* gp = &s.w.g[t][8 * cg];
-      float v[8];
-#pragma unroll
-      for (int i = 0; i < 8; ++i) v[i] = gp[i] + pre[i];
-#pragma unroll
-      for (int i = 0; i < 8; ++i) gp[i] = v[i];
+      float4* gp = reinterpret_cast<float4*>(&s.c.g[t][8 * cg]);
+      float4 a = gp[0], b = gp[1];
+      a.x += pre[0];
+      a.y += pre[1];
+      a.z += pre[2];
+      a.w += pre[3];
+      b.x += pre[4];
+      b.y += pre[5];
+      b.z += pre[6];
+      b.w += pre[7];
+      gp[0] = a;
+      gp[1] = b;
       if ((t & 15) == 0) {
-#pragma unroll
-        for (int i = 0; i < 8; ++i) s.gref[t >> 4][8 * cg + i] = v[i];
+        float4* rp = reinterpret_cast<float4*>(&s.gref[t >> 4][8 * cg]);
+        rp[0] = a;
+        rp[1] = b;
       }
       if (t == last) {
-#pragma unroll
-        for (int i = 0; i < 8; ++i) s.gT[8 * cg + i] = v[i];
+        float4* rp = reinterpret_cast<float4*>(&s.gT[8 * cg]);
+        rp[0] = a;
+        rp[1] = b;
       }
     }
   }
   __syncthreads();
   stamp(3);
 
-  // ---- decayed images and the factored block operands ---------------------------
+  // ---- images and MMA operands: thread (tl, cgi) = tokens tl + 16 j, channels 8 cgi.. ----
   {
-    const float sc = bfr(p.scale);
-    const int blk = tg >> 2;
-    float gT[8], gr[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      gT[i] = s.gT[8 * cg + i];
-      gr[i] = s.gref[blk][8 * cg + i];
+    const int tl = tid & 15, cgi = tid >> 4;
+    // block-pair factors bf16(exp2(gc_rI - gc_rJ)), I > J
+    for (int e = tid; e < 6 * (kD / 2); e += kThreads) {
+      const int pr = e >> 6, d = 2 * (e & 63);
+      const int I = pr == 0 ? 1 : (pr < 3 ? 2 : 3);
+      const int J = pr - I * (I - 1) / 2;
+      s.pf[pr][e & 63] = __floats2bfloat162_rn(ex2(s.gref[I][d] - s.gref[J][d]),
+                                               ex2(s.gref[I][d + 1] - s.gref[J][d + 1]));
     }
-    __nv_bfloat16* kdq = p.kdq + img * (2 * kC * kD) + (cg * 128) * 8;
-    uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0, k2 = k0, k3 = k0;
-#pragma unroll
+    uint32_t sc2;
+    {
+      const __nv_bfloat162 sc = __floats2bfloat162_rn(p.scale, p.scale);
+      sc2 = *reinterpret_cast<const uint32_t*>(&sc);
+    }
+    float gT[8];
+    {
+      const float4* gp = reinterpret_cast<const float4*>(&s.gT[8 * cgi]);
+      const float4 a = gp[0], b = gp[1];
+      gT[0] = a.x; gT[1] = a.y; gT[2] = a.z; gT[3] = a.w;
+      gT[4] = b.x; gT[5] = b.y; gT[6] = b.z; gT[7] = b.w;
+    }
+    __nv_bfloat16* kdq = p.kdq + img * (2 * kC * kD) + (cgi * 128) * 8;
+    __nv_bfloat16* krt = s.a.op.krs[warp];
+    __nv_bfloat16* krb = p.kr + img * (kC * kD) + 2 * (lane & 3);
+#pragma unroll 1
     for (int j = 0; j < 4; ++j) {
-      const int t = t_first + j;
+      const int t = tl + 16 * j;
       const bool ok = t < valid;
-      float kn[8], qn[8], gc[8];
-      unpack8(*reinterpret_cast<uint4 const*>(&s.qkn[1][t][8 * cg]), kn);
-      unpack8(*reinterpret_cast<uint4 const*>(&s.qkn[0][t][8 * cg]), qn);
+      const uint4 knv = *reinterpret_cast<uint4 const*>(&s.qkn[1][t][8 * cgi]);
+      const uint4 qnv = *reinterpret_cast<uint4 const*>(&s.qkn[0][t][8 * cgi]);
+      const uint32_t kn2[4] = {knv.x, knv.y, knv.z, knv.w};
+      const uint32_t qn2[4] = {qnv.x, qnv.y, qnv.z, qnv.w};
+      float gc[8], gr[8];
       {
-        const float4* gp = reinterpret_cast<const float4*>(&s.w.g[t][8 * cg]);
+        const float4* gp = reinterpret_cast<const float4*>(&s.c.g[t][8 * cgi]);
         const float4 a = gp[0], b = gp[1];
-        gc[0] = a.x;
-        gc[1] = a.y;
-        gc[2] = a.z;
-        gc[3] = a.w;
-        gc[4] = b.x;
-        gc[5] = b.y;
-        gc[6] = b.z;
-        gc[7] = b.w;
+        gc[0] = a.x; gc[1] = a.y; gc[2] = a.z; gc[3] = a.w;
+        gc[4] = b.x; gc[5] = b.y; gc[6] = b.z; gc[7] = b.w;
+        const float4* rp = reinterpret_cast<const float4*>(&s.gref[j][8 * cgi]);
+        const float4 c = rp[0], d = rp[1];
+        gr[0] = c.x; gr[1] = c.y; gr[2] = c.z; gr[3] = c.w;
+        gr[4] = d.x; gr[5] = d.y; gr[6] = d.z; gr[7] = d.w;
       }
+      uint32_t kd[4], qd[4], kr[4], rk[4], rq[4], ck[4];
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        const float d0 = gc[2 * m] - gr[2 * m], d1 = gc[2 * m + 1] - gr[2 * m + 1];
+        const uint32_t e = pack2(ex2(gc[2 * m]), ex2(gc[2 * m + 1]));
+        const uint32_t er = pack2(ex2(gT[2 * m] - gc[2 * m]), ex2(gT[2 * m + 1] - gc[2 * m + 1]));
+        const uint32_t fr = pack2(ex2(d0), ex2(d1));
+        const uint32_t ff = pack2(ex2(-d0), ex2(-d1));
+        const uint32_t k2 = ok ? kn2[m] : 0u, q2 = ok ? qn2[m] : 0u;
+        kd[m] = hmul2(k2, e);
+        qd[m] = hmul2(hmul2(q2, e), sc2);
+        kr[m] = hmul2(k2, er);
+        rk[m] = hmul2(k2, fr);
+        rq[m] = hmul2(hmul2(q2, fr), sc2);
+        ck[m] = hmul2(k2, ff);
+      }
+      *reinterpret_cast<uint4*>(kdq + t * 8) = make_uint4(kd[0], kd[1], kd[2], kd[3]);
+      *reinterpret_cast<uint4*>(kdq + (64 + t) * 8) = make_uint4(qd[0], qd[1], qd[2], qd[3]);
+      *reinterpret_cast<uint4*>(&s.a.op.rk[t * kPitch + 8 * cgi]) = make_uint4(rk[0], rk[1], rk[2], rk[3]);
+      *reinterpret_cast<uint4*>(&s.a.op.rq[t * kPitch + 8 * cgi]) = make_uint4(rq[0], rq[1], rq[2], rq[3]);
+      *reinterpret_cast<uint4*>(&s.a.op.ck[t * kPitch + 8 * cgi]) = make_uint4(ck[0], ck[1], ck[2], ck[3]);
+      // kr image: the warp's 16 tokens x 16 channels, transposed through a shared tile
+      *reinterpret_cast<uint4*>(krt + tl * kKrPitch + 8 * (cgi & 1)) = make_uint4(kr[0], kr[1], kr[2], kr[3]);
+      __syncwarp();
       {
-        float kd[8], qd[8];
+        // matrices: (tokens 0-7 | 8-15) x (channels 0-7 | 8-15) of the tile
+        uint32_t r[4];
+        const int mi = lane >> 3;
+        ldsm_x4_t(smem_u32(krt + (8 * (mi & 1) + (lane & 7)) * kKrPitch + 8 * (mi >> 1)), r);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float e = bfr(ex2(gc[i]));
-          kd[i] = ok ? kn[i] * e : 0.0f;
-          qd[i] = ok ? bfr(qn[i] * e) * sc : 0.0f;
-        }
-        *reinterpret_cast<uint4*>(kdq + t * 8) = pack8(kd);
-        *reinterpret_cast<uint4*>(kdq + (64 + t) * 8) = pack8(qd);
-      }
-      {
-        float kr[8];
-#pragma unroll
-        for (int i = 0; i < 8; ++i) kr[i] = ok ? kn[i] * bfr(ex2(gT[i] - gc[i])) : 0.0f;
-        const uint4 kv = pack8(kr);
-        if (j == 0) k0 = kv;
-        if (j == 1) k1 = kv;
-        if (j == 2) k2 = kv;
-        if (j == 3) k3 = kv;
-      }
-      {
-        float rk[8], rq[8];
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float fr = bfr(ex2(gc[i] - gr[i]));
-          rk[i] = ok ? kn[i] * fr : 0.0f;
-          rq[i] = ok ? bfr(qn[i] * fr) * sc : 0.0f;
-        }
-        *reinterpret_cast<uint4*>(&s.rk[t * kPitch + 8 * cg]) = pack8(rk);
-        *reinterpret_cast<uint4*>(&s.rq[t * kPitch + 8 * cg]) = pack8(rq);
-      }
-      // column operands of blocks I >= blk
-#pragma unroll
-      for (int I = 0; I < 4; ++I) {
-        if (I >= blk) {
-          float cv[8];
-#pragma unroll
-          for (int i = 0; i < 8; ++i) {
-            const float f = bfr(ex2(s.gref[I][8 * cg + i] - gc[i]));
-            cv[i] = ok ? kn[i] * f : 0.0f;
-          }
-          *reinterpret_cast<uint4*>(&s.u.ck[(ck_base(I) + t) * kPitch + 8 * cg]) = pack8(cv);
+        for (int q = 0; q < 4; ++q) {
+          const int tgrp = 2 * j + (q & 1), ch = 16 * warp + 8 * (q >> 1) + (lane >> 2);
+          stg32(krb + (tgrp * kD + ch) * 8, r[q]);
         }
       }
-    }
-    __nv_bfloat16* krb = p.kr + img * (kC * kD) + ((t_first >> 3) * kD + 8 * cg) * 8 + (t_first & 7);
-    const uint32_t a0[4] = {k0.x, k0.y, k0.z, k0.w}, a1[4] = {k1.x, k1.y, k1.z, k1.w};
-    const uint32_t a2[4] = {k2.x, k2.y, k2.z, k2.w}, a3[4] = {k3.x, k3.y, k3.z, k3.w};
-#pragma unroll
-    for (int m = 0; m < 4; ++m) {
-      *reinterpret_cast<uint2*>(krb + (2 * m) * 8) =
-          make_uint2(__byte_perm(a0[m], a1[m], 0x5410), __byte_perm(a2[m], a3[m], 0x5410));
-      *reinterpret_cast<uint2*>(krb + (2 * m + 1) * 8) =
-          make_uint2(__byte_perm(a0[m], a1[m], 0x7632), __byte_perm(a2[m], a3[m], 0x7632));
+      __syncwarp();
     }
     if (tid < kD) p.gt[img * kD + tid] = valid > 0 ? exp2f(s.gT[tid]) : 1.0f;
   }
@@ -561,18 +583,25 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
     const int g = lane >> 2, tq = lane & 3;
     const uint32_t a_row = 16 * I + (lane & 15);
     const uint32_t a_col = (lane >> 4) * 8;
-    const uint32_t rk_base = smem_u32(s.rk) + (a_row * kPitch + a_col) * 2;
-    const uint32_t rq_base = smem_u32(s.rq) + (a_row * kPitch + a_col) * 2;
+    const uint32_t rk_base = smem_u32(s.a.op.rk) + (a_row * kPitch + a_col) * 2;
+    const uint32_t rq_base = smem_u32(s.a.op.rq) + (a_row * kPitch + a_col) * 2;
     __nv_bfloat16* mqk = p.mqk + img * (kC * kC);
     for (int n = n0; n < n0 + nn; ++n) {
+      const int J = n >> 1;
+      const bool scale_b = J < I;
+      uint32_t const* pf = reinterpret_cast<uint32_t const*>(s.pf[scale_b ? I * (I - 1) / 2 + J : 0]);
       float ca[4] = {}, cm[4] = {};
-      // B: rows (8 n .. 8 n + 7) of block I's column operand; x4 = two k-steps
-      const uint32_t b_base =
-          smem_u32(s.u.ck) + ((ck_base(I) + 8 * n + (lane & 7)) * kPitch + (lane >> 3) * 8) * 2;
+      const uint32_t b_base = smem_u32(s.a.op.ck) + ((8 * n + (lane & 7)) * kPitch + (lane >> 3) * 8) * 2;
 #pragma unroll
       for (int ks = 0; ks < 8; ks += 2) {
         uint32_t b[4], a[4], q[4];
         ldsm_x4(b_base + ks * 32, b);
+        if (scale_b) {
+          b[0] = hmul2(b[0], pf[8 * ks + tq]);
+          b[1] = hmul2(b[1], pf[8 * ks + 4 + tq]);
+          b[2] = hmul2(b[2], pf[8 * ks + 8 + tq]);
+          b[3] = hmul2(b[3], pf[8 * ks + 12 + tq]);
+        }
         ldsm_x4(rk_base + ks * 32, a);
         ldsm_x4(rq_base + ks * 32, q);
         mma16816(ca, a, b[0], b[1]);
@@ -587,23 +616,23 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
         const int i = 16 * I + g + 8 * hh;
         const int j = 8 * n + 2 * tq;
         const float bi = s.beta[i];
-        s.w.l[i][j] = j < i ? ca[2 * hh] * bi : 0.0f;
-        s.w.l[i][j + 1] = j + 1 < i ? ca[2 * hh + 1] * bi : 0.0f;
+        s.c.l[i][j] = j < i ? ca[2 * hh] * bi : 0.0f;
+        s.c.l[i][j + 1] = j + 1 < i ? ca[2 * hh + 1] * bi : 0.0f;
         const bool iv = i < valid;
         const float m0 = (iv && j <= i && j < valid) ? cm[2 * hh] : 0.0f;
         const float m1 = (iv && j + 1 <= i && j + 1 < valid) ? cm[2 * hh + 1] : 0.0f;
-        *reinterpret_cast<uint32_t*>(mqk + ((j >> 3) * 64 + i) * 8 + (j & 7)) = pack2(m0, m1);
+        stg32(mqk + ((j >> 3) * 64 + i) * 8 + (j & 7), pack2(m0, m1));
       }
     }
   }
   __syncthreads();
   stamp(5);
 
-  // ---- INV = (I + L)^-1, FP32 ---------------------------------------------------
-  auto& X = s.u.inv.x;
-  auto& L = s.w.l;
-  auto& Tm = s.u.inv.t;
+  // ---- INV = (I + L)^-1 -------------------------------------------------------------
+  auto& X = s.a.inv.x;
+  auto& L = s.c.l;
   if (tid < kC) {
+    // 16x16 diagonal blocks: FP32 forward substitution, one column per thread
     const int I = tid >> 4, jj = tid & 15, o = 16 * I;
     float x[16];
 #pragma unroll
@@ -618,60 +647,59 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
   }
   __syncthreads();
   stamp(6);
-  // level 1: X[I+1][I] = -X[I+1][I+1] (L[I+1][I] X[I][I]), I = 0..2
-  for (int e = tid; e < 768; e += kThreads) {
-    const int I = e >> 8, r = (e >> 4) & 15, c = e & 15;
-    float acc = 0.0f;
+  if (warp < 3) {
+    // block column J = warp: X[I][J] = -X[I][I] (sum_{k=J}^{I-1} L[I][k] X[k][J]),
+    // I = J+1..3, on BF16 tensor-core products with FP32 accumulation
+    const int J = warp, g = lane >> 2, tq = lane & 3;
+    float (*Tt)[20] = s.a.inv.t[warp];
+    for (int I = J + 1; I < 4; ++I) {
+      float tacc[2][4] = {};
+      for (int k = J; k < I; ++k) {
+        uint32_t a[4];
+        const int r0 = 16 * I + g, c0 = 16 * k + 2 * tq;
+        a[0] = pack2(L[r0][c0], L[r0][c0 + 1]);
+        a[1] = pack2(L[r0 + 8][c0], L[r0 + 8][c0 + 1]);
+        a[2] = pack2(L[r0][c0 + 8], L[r0][c0 + 9]);
+        a[3] = pack2(L[r0 + 8][c0 + 8], L[r0 + 8][c0 + 9]);
 #pragma unroll
-    for (int k = 0; k < 16; ++k) acc += L[16 * (I + 1) + r][16 * I + k] * X[16 * I + k][16 * I + c];
-    Tm[I][r][c] = acc;
-  }
-  __syncthreads();
-  stamp(7);
-  for (int e = tid; e < 768; e += kThreads) {
-    const int I = e >> 8, r = (e >> 4) & 15, c = e & 15;
-    float acc = 0.0f;
+        for (int nt = 0; nt < 2; ++nt) {
+          const int col = 16 * J + 8 * nt + g, kr0 = 16 * k + 2 * tq;
+          const uint32_t b0 = pack2(X[kr0][col], X[kr0 + 1][col]);
+          const uint32_t b1 = pack2(X[kr0 + 8][col], X[kr0 + 9][col]);
+          mma16816(tacc[nt], a, b0, b1);
+        }
+      }
 #pragma unroll
-    for (int k = 0; k < 16; ++k) acc += X[16 * (I + 1) + r][16 * (I + 1) + k] * Tm[I][k][c];
-    X[16 * (I + 1) + r][16 * I + c] = -acc;
-  }
-  __syncthreads();
-  stamp(8);
-  // level 2: X[I+2][I] = -X[I+2][I+2] (L[I+2][I] X[I][I] + L[I+2][I+1] X[I+1][I]), I = 0, 1
-  for (int e = tid; e < 512; e += kThreads) {
-    const int I = e >> 8, r = (e >> 4) & 15, c = e & 15;
-    float acc = 0.0f;
+      for (int nt = 0; nt < 2; ++nt) {
+        Tt[g][8 * nt + 2 * tq] = tacc[nt][0];
+        Tt[g][8 * nt + 2 * tq + 1] = tacc[nt][1];
+        Tt[g + 8][8 * nt + 2 * tq] = tacc[nt][2];
+        Tt[g + 8][8 * nt + 2 * tq + 1] = tacc[nt][3];
+      }
+      __syncwarp();
+      uint32_t a[4];
+      {
+        const int r0 = 16 * I + g, c0 = 16 * I + 2 * tq;
+        a[0] = pack2(X[r0][c0], X[r0][c0 + 1]);
+        a[1] = pack2(X[r0 + 8][c0], X[r0 + 8][c0 + 1]);
+        a[2] = pack2(X[r0][c0 + 8], X[r0][c0 + 9]);
+        a[3] = pack2(X[r0 + 8][c0 + 8], X[r0 + 8][c0 + 9]);
+      }
 #pragma unroll
-    for (int k = 0; k < 32; ++k) acc += L[16 * (I + 2) + r][16 * I + k] * X[16 * I + k][16 * I + c];
-    Tm[I][r][c] = acc;
-  }
-  __syncthreads();
-  stamp(9);
-  for (int e = tid; e < 512; e += kThreads) {
-    const int I = e >> 8, r = (e >> 4) & 15, c = e & 15;
-    float acc = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 16; ++k) acc += X[16 * (I + 2) + r][16 * (I + 2) + k] * Tm[I][k][c];
-    X[16 * (I + 2) + r][16 * I + c] = -acc;
-  }
-  __syncthreads();
-  stamp(10);
-  // level 3: X[3][0] = -X[3][3] (L[3][0] X[0][0] + L[3][1] X[1][0] + L[3][2] X[2][0])
-  {
-    const int r = tid >> 4, c = tid & 15;
-    float acc = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 48; ++k) acc += L[48 + r][k] * X[k][c];
-    Tm[0][r][c] = acc;
-  }
-  __syncthreads();
-  stamp(11);
-  {
-    const int r = tid >> 4, c = tid & 15;
-    float acc = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 16; ++k) acc += X[48 + r][48 + k] * Tm[0][k][c];
-    X[48 + r][c] = -acc;
+      for (int nt = 0; nt < 2; ++nt) {
+        float xacc[4] = {};
+        const int col = 8 * nt + g;
+        const uint32_t b0 = pack2(Tt[2 * tq][col], Tt[2 * tq + 1][col]);
+        const uint32_t b1 = pack2(Tt[2 * tq + 8][col], Tt[2 * tq + 9][col]);
+        mma16816(xacc, a, b0, b1);
+        const int r0 = 16 * I + g, c0 = 16 * J + 8 * nt + 2 * tq;
+        X[r0][c0] = -xacc[0];
+        X[r0][c0 + 1] = -xacc[1];
+        X[r0 + 8][c0] = -xacc[2];
+        X[r0 + 8][c0 + 1] = -xacc[3];
+      }
+      __syncwarp();
+    }
   }
   __syncthreads();
   stamp(12);

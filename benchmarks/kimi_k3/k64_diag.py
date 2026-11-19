@@ -411,6 +411,7 @@ def main():
     ap.add_argument("--e2e", action="store_true")
     ap.add_argument("--prep", action="store_true")
     ap.add_argument("--preptc", action="store_true")
+    ap.add_argument("--ptime", action="store_true")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
@@ -430,6 +431,8 @@ def main():
     if a.preptc:
         for lens, H in (([64], 2), ([2], 2), ([300, 17, 129], 4), ([1000, 777, 5], 8)):
             preptc_check(lens, H)
+        preptc_time()
+    if a.ptime:
         preptc_time()
     if a.e2e:
         for lens, H in (([300, 17, 129], 4), ([1000, 777], 8)):
