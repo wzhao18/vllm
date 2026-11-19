@@ -303,18 +303,29 @@ __device__ __forceinline__ long long recv_ix(const Prm& p, int par, int src, int
 __device__ __forceinline__ long long gather_ix(const Prm& p, int par, int row) {
   return (long long)2 * 4 * p.nmax * WORDS + ((long long)par * p.rmax + row) * WORDS;
 }
+// Lamport poll of 4 words at once: every pass issues the loads of all still-armed
+// words back to back (one round trip per pass, not one per word).
+__device__ __forceinline__ void poll4(const uint32_t* const* q, uint4* got) {
+  bool ok[4] = {false, false, false, false};
+  bool all;
+  do {
+    all = true;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      if (!ok[i]) got[i] = ld_vol(q[i]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { ok[i] = ok[i] || !armed(got[i]); all = all && ok[i]; }
+  } while (!all);
+}
 // Sum the 4 TP slots of shard row lrow (these 8 columns) in rank order, re-arm them.
 __device__ __forceinline__ void owner_sum(const Prm& p, int lrow, int col, float* cur) {
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   const uint4 s4 = make_uint4(SENT, SENT, SENT, SENT);
   uint4 got[4];
+  const uint32_t* q[4];
 #pragma unroll
-  for (int src = 0; src < 4; ++src) {
-    uint32_t* q = p.box + recv_ix(p, p.par, src, lrow) + col / 2;
-    uint4 v;
-    do { v = ld_vol(q); } while (armed(v));
-    got[src] = v;
-  }
+  for (int src = 0; src < 4; ++src) q[src] = p.box + recv_ix(p, p.par, src, lrow) + col / 2;
+  poll4(q, got);
 #pragma unroll
   for (int src = 0; src < 4; ++src) {
     st_vol(p.box + recv_ix(p, p.par, src, lrow) + col / 2, s4);
@@ -393,12 +404,13 @@ __global__ void __launch_bounds__(128, 4) today_k(Prm p) {
     st_mc(p.mc + (unsigned long long)(gather_ix(p, p.par, p.rank * n + token) + col / 2) * 4, out);
     td = tnow();
     uint32_t acc = 0;
+    const uint32_t* q[4];
+    uint4 got[4];
 #pragma unroll
-    for (int o = 0; o < 4; ++o) {
-      uint4 v;
-      do { v = ld_vol(p.box + gather_ix(p, p.par, o * n + token) + col / 2); } while (armed(v));
-      acc ^= v.x;
-    }
+    for (int o = 0; o < 4; ++o) q[o] = p.box + gather_ix(p, p.par, o * n + token) + col / 2;
+    poll4(q, got);
+#pragma unroll
+    for (int o = 0; o < 4; ++o) acc ^= got[o].x;
     if (acc == 0x12345678u) p.sink[0] = acc;
   }
   tflush(p, KIND, ta, tb, tc, td);
@@ -493,10 +505,15 @@ __global__ void __launch_bounds__(512, 1) gemm_k(Prm p) {
     if (p.do_x) {  // poll the gathered rows, then a local grid flag
       long long tot = (long long)R * (WORDS / 4);
       const uint32_t* gb = p.box + gather_ix(p, par, 0);
-      for (long long i = (long long)g * blockDim.x + threadIdx.x; i < tot; i += (long long)G * blockDim.x) {
-        uint4 v;
-        do { v = ld_vol(gb + i * 4); } while (armed(v));
-        acc ^= v.x;
+      const long long st = (long long)G * blockDim.x;
+      for (long long i = (long long)g * blockDim.x + threadIdx.x; i < tot; i += 4 * st) {
+        const uint32_t* q[4];
+        uint4 got[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) q[u] = gb + min(i + u * st, tot - 1) * 4;
+        poll4(q, got);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) acc ^= got[u].x;
       }
       grid_flag(p, 2, G);
       td = tnow();
