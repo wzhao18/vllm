@@ -30,6 +30,7 @@ def _cute(t, align=16):
 
 def _compile(hidden, **kw):
     import cuda.bindings.driver as cuda
+    import cutlass
     import cutlass.cute as cute
 
     from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.sources.kernel_src.rubin.inference.mega.topk_reduce import (  # noqa: E501
@@ -41,13 +42,18 @@ def _compile(hidden, **kw):
 
     op = TopkReduce(hidden, TOPK, CombineFormat.parse("bf16"), num_experts=E)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    args = {k: (_cute(v) if isinstance(v, torch.Tensor) else v) for k, v in kw.items()}
+    def conv(v):
+        if isinstance(v, torch.Tensor):
+            return _cute(v)
+        return cutlass.Float32(v) if isinstance(v, float) else v
+
+    args = {k: conv(v) for k, v in kw.items()}
     fn = cute.compile(op, combine_sf=None, topk_score=None, stream=stream, **args)
     return lambda **call: fn(
         combine_sf=None,
         topk_score=None,
         stream=stream,
-        **{k: (_cute(v) if isinstance(v, torch.Tensor) else v) for k, v in call.items()},
+        **{k: conv(v) for k, v in call.items()},
     )
 
 

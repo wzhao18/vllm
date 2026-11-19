@@ -521,9 +521,11 @@ class RubinMegaMoeSession:
         key = (weight.data_ptr(), float(eps))
         hit = self._norm_bound.get(key)
         if hit is None:
+            import cutlass
+
             hit = {
                 "rmsnorm_weight": _to_cute(weight, dynamic_leading=False),
-                "rmsnorm_eps": float(eps),
+                "rmsnorm_eps": cutlass.Float32(float(eps)),
             }
             self._norm_bound[key] = hit
             if len(self._norm_bound) > _BIND_CACHE_LIMIT:
