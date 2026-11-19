@@ -952,12 +952,14 @@ def gather_aux_rows(
     views = [packed[:, i * width : (i + 1) * width] for i in range(count)]
     if n == 0:
         return views
-    block = 1024
+    # One program per row: whole-row loads in flight (8 warps x 64 B / thread).
+    block = min(triton.next_power_of_2(width), 8192)
     grid = (n, triton.cdiv(width, block))
     for h, out in zip(aux_hidden_states, views):
         assert h.dim() == 2 and h.stride(1) == 1 and h.shape[-1] == width
         _gather_rows_kernel[grid](
-            out, out.stride(0), h, h.stride(0), index, width, BLOCK=block
+            out, out.stride(0), h, h.stride(0), index, width, BLOCK=block,
+            num_warps=8,
         )
     return views
 
