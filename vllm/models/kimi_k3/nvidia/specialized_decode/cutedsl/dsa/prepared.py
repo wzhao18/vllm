@@ -143,6 +143,7 @@ def compile_core(
     partials="bf16",
     cap=64,
     release=True,
+    rearm=True,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
@@ -154,7 +155,8 @@ def compile_core(
     ``lse_base_e``, else base 2). ``nvfp4``: that FP8 query over an nvfp4_ds_mla
     cache (FlashInfer prims_ts). ``overlap``: the query overlap mode (overlap.py).
     ``partials``: the DcpBox's partial rows. ``release``: the query launches the
-    next kernel early (PDL)."""
+    next kernel early (PDL). ``rearm`` False: DcpValue leaves the q mailbox alone
+    (the batch's query is local_query's, never published)."""
     qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
@@ -179,7 +181,9 @@ def compile_core(
         index_kernel = compile_index(batch, heads, pitch, index_kv)
         if dcp:
             args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
-            value_kernel = compile_dcp_value(*args, fp8, lse_base_e, partials, cap)
+            value_kernel = compile_dcp_value(
+                *args, fp8, lse_base_e, partials, cap, rearm
+            )
         else:
             latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
             gate = fake((batch, heads * 128), (pitch, 1))
@@ -246,6 +250,7 @@ class PreparedDsa:
         core="auto",
         partials=None,
         priority=None,
+        local=None,
     ):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
@@ -280,6 +285,11 @@ class PreparedDsa:
                 "the FLASHINFER_MLA_SPARSE backend"
             )
         self.box, self.parity = dcp, parity
+        # local_query.LocalQuery (DCP only): its row counts compute every gathered
+        # head's query on this rank (no q publish, QueryWait or q mailbox re-arm).
+        if local is not None and dcp is None:
+            raise ValueError("Kimi K3.1 DSA local query: DCP only")
+        self.local = local
         # The DcpBox mailboxes hold cap rows: a wider batch would store past them.
         assert dcp is None or max(pitches) <= dcp.cap, (max(pitches), dcp.cap)
         self.dcp = dcp.size if dcp is not None else 1
@@ -431,6 +441,11 @@ class PreparedDsa:
             lse_base_e = self.cores[batch, q] != "trtllm"  # trtllm-gen: base 2
             overlap = self.overlaps[batch, q]
             cap = self.box.cap if self.box is not None else 64
+            if self.is_local(batch) and overlap != "fork":
+                raise ValueError(
+                    f"Kimi K3.1 DSA local query at {batch} rows: overlap {overlap!r} "
+                    "(fork only: QueryNorm writes its q_c rows)"
+                )
             self.kernels[batch, q] = compile_core(
                 *args,
                 fp8=self.fp8,
@@ -440,6 +455,7 @@ class PreparedDsa:
                 partials=partials,
                 cap=cap,
                 release=(batch, q) not in self.held(LATE),
+                rearm=not self.is_local(batch),
             )
             if overlap != "serial" or batch <= FUSED_INDEX:
                 self.overlap_kernels[batch, q] = self.compile_overlap(
@@ -685,6 +701,23 @@ class PreparedDsa:
                 first = compile_front(*args)
         return first, wait, norm
 
+    def is_local(self, batch):
+        """Whether batch rows run local_query's query of every gathered head."""
+        return self.local is not None and batch in self.local.rows
+
+    def run_local(self, projected, cache, slots, q):
+        """local_query: QueryNorm's q_c rows on the compute stream (the indexer
+        reads them), then on the query side stream every gathered head's FP8 query
+        and this rank's KV insert. Returns what makes the sparse core wait for it."""
+        stage, batch = self.query_stage, projected.shape[0]
+        stage.run_norm(self.overlap_kernels[batch, q][2], projected)
+        main = torch.cuda.current_stream(self.device)
+        side = side_stream(self.device.index)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            self.local.run(stage.qc[:batch], projected, cache, slots)
+        return lambda: torch.cuda.current_stream(self.device).wait_stream(side)
+
     def run_query(self, projected, cache, slots, q, publish=(), poll=True):
         """MlaQuery and the q_c rows per the overlap mode. Returns what makes the
         sparse core wait for the query (None: it is already in stream order).
@@ -733,18 +766,22 @@ class PreparedDsa:
             return stage.run_front(front, projected, index_slots, normalized=True)
         return stage.run_index(kernel, projected, index_slots)
 
-    def dcp_core(self, cache, topk, metadata, batch, projected=None, join=None, q=1):
+    def dcp_core(
+        self, cache, topk, metadata, batch, projected=None, join=None, q=1, query=None
+    ):
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
         local shard into the DcpValue rows, LSE and per-row valid counts: on a
         per-tensor FP8 cache FlashInfer over this rank's flat rows, on fp8_ds_mla
         FlashMLA as the stock decode. ``topk``: the global ids, or None with
         ``projected``: on FlashInfer the indexer stage's DCP merge (#63) gives this
         rank's rows directly, else the stock op's global ids are filtered to them.
-        ``join``: what makes the sparse decode wait for the query (run_query)."""
+        ``join``: what makes the sparse decode wait for the query (run_query);
+        ``query``: the gathered query rows (default the q mailbox)."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
 
         indexer, md = self.indexer, metadata
-        query = self.box.q[self.parity, :batch]
+        if query is None:
+            query = self.box.q[self.parity, :batch]
         if self.fi is not None:
             stride_rows = self.fi.rows(cache, md.block_size)[1]
             merged = None
@@ -803,7 +840,13 @@ class PreparedDsa:
         stage = self.query_stage
         publish = publish_args(box, p)
         sparse = self.core_step(batch, q) if self.dsac is not None else None
-        join = self.run_query(projected, cache, slots, q, publish, sparse is None)
+        query = None
+        if self.is_local(batch):
+            assert sparse is None, "the DSA sparse core polls the q mailbox"
+            join = self.run_local(projected, cache, slots, q)
+            query = self.local.query[:batch].view(torch.uint8)
+        else:
+            join = self.run_query(projected, cache, slots, q, publish, sparse is None)
         uv = stage.views[4]
         if sparse is not None:  # the DSA sparse core, then DcpValue(pushed)
             self.run_index(index, projected, index_slots, q)
@@ -814,7 +857,8 @@ class PreparedDsa:
             return run_core_value(*args, projected, out)
         if (batch, q) not in self.prioritized:
             self.run_index(index, projected, index_slots, q)
-            core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+            args = cache, None, metadata, batch, projected, join, q
+            core = self.dcp_core(*args, query=query)
         else:
             # wq_b through the sparse core on the high-priority index stream.
             main = torch.cuda.current_stream(self.device)
@@ -822,7 +866,8 @@ class PreparedDsa:
             hi.wait_stream(main)
             with torch.cuda.stream(hi):
                 self.run_index(index, projected, index_slots, q)
-                core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+                args = cache, None, metadata, batch, projected, join, q
+                core = self.dcp_core(*args, query=query)
             main.wait_stream(hi)
         w_uv = None
         if box.mailbox(batch).format == PROJECTED:

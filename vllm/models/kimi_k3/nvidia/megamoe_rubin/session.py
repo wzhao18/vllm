@@ -306,7 +306,8 @@ class RubinMegaMoeSession:
         self.name = self.kernel.name()
         self.names = {s2: k.name() for s2, k in self.kernels.items()}
         self._carved = False
-        self.compiled: dict[bool, Any] = {}
+        self.compiled: dict[tuple[bool, bool], Any] = {}
+        self._norm_bound: OrderedDict[tuple, dict] = OrderedDict()
         self._bound: OrderedDict[tuple, tuple[dict, RubinMoeWeights]] = OrderedDict()
         self._out_bound: OrderedDict[tuple, Any] = OrderedDict()
 
@@ -419,7 +420,11 @@ class RubinMegaMoeSession:
         return next(iter(self.kernels))
 
     def prepare(
-        self, w: RubinMoeWeights, output: torch.Tensor, use_s2: bool | None = None
+        self,
+        w: RubinMoeWeights,
+        output: torch.Tensor,
+        use_s2: bool | None = None,
+        rmsnorm: tuple[torch.Tensor, float] | None = None,
     ) -> dict:
         """Compile on first use (never during capture), bind (host-only; legal during
         capture for an already compiled session) and cache the launch arguments.
@@ -431,6 +436,10 @@ class RubinMegaMoeSession:
         device) in a small LRU: eager
         callers hand a fresh output each call, and CUDA graph replays reuse their pool
         addresses, so a large output cache would only pin freed activations.
+
+        ``rmsnorm`` ``(weight [hidden] BF16, eps)``: the output is the stock vLLM
+        ``rms_norm`` of the reduced row (vLLM-local E2a, fused into the reduce; its own
+        compiled variant, compiled on first use like the plain one).
         """
         if not self._carved:
             raise RuntimeError("session used before its workspace was carved.")
@@ -477,13 +486,16 @@ class RubinMegaMoeSession:
         kwargs = {**base, "output_activation": out_cute}
         if use_s2 is None:
             use_s2 = self.use_s2(None)
-        if use_s2 not in self.compiled:
+        variant = (use_s2, rmsnorm is not None)
+        if rmsnorm is not None:
+            kwargs.update(self._rmsnorm_kwargs(*rmsnorm))
+        if variant not in self.compiled:
             kernel = self.kernels[use_s2]
             import cutlass
 
             ckey = compile_cache_key(
                 self.cfg, self.names[use_s2], cutlass.__version__, self.device.index
-            )
+            ) + (variant[1],)
             compiled = _COMPILED.get(ckey)
             if compiled is None:
                 ensure_not_capturing("Rubin MegaMoE kernel compile")
@@ -491,24 +503,55 @@ class RubinMegaMoeSession:
 
                 compiled = cute.compile(kernel, **kwargs)
                 _COMPILED[ckey] = compiled
-            self.compiled[use_s2] = compiled
+            self.compiled[variant] = compiled
         return kwargs
+
+    def _rmsnorm_kwargs(self, weight: torch.Tensor, eps: float) -> dict:
+        if (
+            weight.shape != (self.cfg.hidden,)
+            or weight.dtype != torch.bfloat16
+            or weight.device != self.device
+            or not weight.is_contiguous()
+            or weight.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"rmsnorm weight must be a contiguous, 16-byte aligned BF16 ({self.cfg.hidden},) "
+                f"vector on {self.device}."
+            )
+        key = (weight.data_ptr(), float(eps))
+        hit = self._norm_bound.get(key)
+        if hit is None:
+            import cutlass
+
+            hit = {
+                "rmsnorm_weight": _to_cute(weight, dynamic_leading=False),
+                "rmsnorm_eps": cutlass.Float32(float(eps)),
+            }
+            self._norm_bound[key] = hit
+            if len(self._norm_bound) > _BIND_CACHE_LIMIT:
+                self._norm_bound.popitem(last=False)
+        else:
+            self._norm_bound.move_to_end(key)
+        return hit
 
     def launch(
         self,
         w: RubinMoeWeights,
         output: torch.Tensor,
         ep_tokens: int | None = None,
+        rmsnorm: tuple[torch.Tensor, float] | None = None,
     ) -> None:
         """One launch; ``ep_tokens`` (EP-uniform live tokens per rank, None = the
-        capacity) picks the epilogue variant (:meth:`use_s2`)."""
+        capacity) picks the epilogue variant (:meth:`use_s2`); ``rmsnorm`` as in
+        :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
-        kwargs = self.prepare(w, output, use_s2)
-        self.compiled[use_s2](**kwargs)
+        kwargs = self.prepare(w, output, use_s2, rmsnorm)
+        self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
     def release(self) -> None:
         self._bound.clear()
         self._out_bound.clear()
+        self._norm_bound.clear()
         self._carved = False
         for name, _, _ in self.symmetric_plan:
             setattr(self, name, None)
