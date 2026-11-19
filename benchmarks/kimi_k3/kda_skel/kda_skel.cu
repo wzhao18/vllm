@@ -104,10 +104,15 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
   __syncthreads();
   if (a.mode == 0 && chain < 0) return;
   // item enumeration
-  long long n_items, it0 = 0, it_step = 1;
+  long long n_items, it0 = 0, it_step = 1, it_end;
   if (a.mode == 0) n_items = 2 + a.nchunk;
   else if (!a.dl) { it0 = blockIdx.x * 2 + slot; it_step = 2 * gridDim.x; n_items = (long long)a.nchain * a.nchunk; }
   else { it0 = drank * 2 + slot; it_step = 2 * nd; n_items = (long long)cpd * a.nchunk; }
+  it_end = n_items;
+  if (a.mode == 2) {   // balanced contiguous pieces: each slot owns a contiguous run of chunk-items (piece-split chains)
+    const long long ns = a.dl ? 2LL * nd : 2LL * gridDim.x, g = a.dl ? drank * 2 + slot : blockIdx.x * 2 + slot;
+    it0 = g * n_items / ns; it_end = (g + 1) * n_items / ns; it_step = 1;
+  }
   auto decode = [&](long long j, int& ch, int& k) {
     if (a.mode == 0) { ch = chain; k = (int)j - 2; }
     else if (!a.dl) { ch = (int)(j / a.nchunk); k = (int)(j % a.nchunk); }
@@ -115,7 +120,7 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
   };
   if (role == 0) {
     long long i = 0;
-    for (long long j = it0; j < n_items; j += it_step, ++i) {
+    for (long long j = it0; j < it_end; j += it_step, ++i) {
       int ch, k; decode(j, ch, k);
       int sl = (int)(i % S);
       unsigned fb = sa(&full[slot][sl]), eb = sa(&empty[slot][sl]);
@@ -159,8 +164,9 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
     const int ctid = threadIdx.x - slot * NWARP_SLOT * 32 - 32;   // 0..NCT-1
     const int bar_id = 1 + slot;
     unsigned acc = 0;
+    float wv[CPT]; int whead = -1;
     long long i = 0, nout = 0;
-    for (long long j = it0; j < n_items; j += it_step, ++i) {
+    for (long long j = it0; j < it_end; j += it_step, ++i) {
       int ch, k; decode(j, ch, k);
       int sl = (int)(i % S);
       unsigned char* st = ring + (size_t)sl * STAGE;
@@ -204,7 +210,11 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
         const int tk = ctid / TPT, part = ctid % TPT;
         const uint4* orow = (const uint4*)(st + tk * 256 + part * CPT * 2);
         const uint4* grow = (const uint4*)(st + 4 * TILE + tk * 256 + part * CPT * 2);
-        const float* wr = a.w + head * D + part * CPT;
+        if (head != whead) {
+          whead = head;
+#pragma unroll
+          for (int i = 0; i < CPT; ++i) wv[i] = a.w[head * D + part * CPT + i];
+        }
         float y[CPT]; float ss = 0.f;
 #pragma unroll
         for (int q4 = 0; q4 < CPT / 8; ++q4) {
@@ -229,7 +239,7 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
             asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ex) : "f"(gt * -1.4426950409f));
             asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sg) : "f"(1.f + ex));
             int i = q4 * 8 + e;
-            y[i] = y[i] * rstd * __ldg(wr + i) * sg;
+            y[i] = y[i] * rstd * wv[i] * sg;
             amax = fmaxf(amax, fabsf(y[i]));
           }
         }
@@ -384,10 +394,10 @@ int main(int argc, char** argv) {
   // fused-math pipe load per 32-token chunk-item (lane-ops): FMA 135K (conv 49K + SiLU poly part + o_norm 33K + prep),
   // MUFU 41K (SiLU 24.6K + gate/decay 8.2K + o_norm sigmoid 8.2K); KDA pass without conv+SiLU: FMA 70K, MUFU 16K
   std::vector<V> vs = {
-      {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL chain S=6", 0, 6, 1, 0, 0, 0, 0, 0, 1},
-      {"DL rrbal S=6 +onorm", 1, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL chain S=6 +onorm", 0, 6, 1, 0, 0, 1, 0, 0, 1},
-      {"DL rrbal +FMA70K", 1, 6, 1, 70000, 0, 0, 0, 0, 1}, {"DL rrbal +MUFU16K", 1, 6, 1, 0, 16000, 0, 0, 0, 1},
-      {"DL rrbal +70K/16K", 1, 6, 1, 70000, 16000, 0, 0, 0, 1}, {"DL rrbal +135K/41K", 1, 6, 1, 135000, 41000, 0, 0, 0, 1}};
+      {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL piece S=6", 2, 6, 1, 0, 0, 0, 0, 0, 1},
+      {"DL chain S=6", 0, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL piece S=4", 2, 4, 1, 0, 0, 0, 0, 0, 1},
+      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL chain S=6 +onorm", 0, 6, 1, 0, 0, 1, 0, 0, 1},
+      {"DL piece +MUFU16K", 2, 6, 1, 0, 16000, 0, 0, 0, 1}, {"DL piece +FMA70K", 2, 6, 1, 70000, 0, 0, 0, 0, 1}};
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
   { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
   cudaEvent_t e0, e1; CR(cudaEventCreate(&e0)); CR(cudaEventCreate(&e1));
