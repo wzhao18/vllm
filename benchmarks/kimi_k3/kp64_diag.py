@@ -16,6 +16,7 @@ import k64_diag as k64  # noqa: E402
 import kc64_diag as kc  # noqa: E402
 
 D, C64 = 128, 64
+V2 = False  # --v2: prep_chunk standalone (null_block_id -2)
 bf = torch.bfloat16
 
 
@@ -45,7 +46,7 @@ def kp64(q, k, v, g, beta, A_log, dt_bias, lb, scale, lens, dbg=None, x=None, ou
                u_img3=torch.zeros(H, C, 8, 128, 8, dtype=bf, device=dev), C=C)
     dbg = torch.zeros(1, dtype=torch.int64, device=dev) if dbg is None else dbg
     torch.ops.k3_flashkda_split.prep64_tc(
-        x, e, e, ei, eb, -1, g[0], beta[0], A_log, dt_bias, lb, scale, cu,
+        x, e, e, ei, eb, -2 if V2 else -1, g[0], beta[0], A_log, dt_bias, lb, scale, cu,
         out["wq_img3"], out["kr_img"], torch.empty(0, dtype=bf, device=dev), out["mqk_img"],
         out["gt"], out["u_img3"], torch.empty(0, dtype=bf, device=dev), dbg)
     return out, cu, x
@@ -111,7 +112,10 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--phases", action="store_true")
+    ap.add_argument("--v2", action="store_true")
     a = ap.parse_args()
+    global V2
+    V2 = a.v2
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 
     kda_segscan.load_extension()
