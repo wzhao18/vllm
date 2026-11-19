@@ -271,6 +271,20 @@ def _worker(env: dict[str, str]) -> None:
             dist.barrier()
             assert bool((final.box.view(torch.int32) == SENTINEL).all()), rows
             dist.barrier()
+            # The same gather with column block 1 pushed early from a side stream
+            # (SpStep's early aux) and blocks 0 and 2 with the final kernel.
+            parts = [x[:, i * WIDTH : (i + 1) * WIDTH].contiguous() for i in range(3)]
+            side = torch.cuda.Stream(device)
+            side.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(side):
+                final.push(parts[1], WIDTH)
+            torch.cuda.current_stream(device).wait_stream(side)
+            got = final.run(None, cols=((parts[0], 0), (parts[2], 2 * WIDTH)))
+            torch.accelerator.synchronize(device)
+            assert torch.equal(got.view(torch.int32), want.view(torch.int32)), rows
+            dist.barrier()
+            assert bool((final.box.view(torch.int32) == SENTINEL).all()), rows
+            dist.barrier()
         if rank == 0:
             print("worst ulp ratios", worst)
         dist.barrier()

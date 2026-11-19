@@ -362,6 +362,10 @@ class SpStep:
                 raise Unsupported("sp_step", shape, f"not whole q{self.q} requests")
             shard_rows(shape, ctx)
         self.shard_cap = rows[-1] // ctx.tp
+        if self.shard_cap >= 256:  # normalize: one stock RMSNorm launch per shard
+            raise Unsupported(
+                "sp_step", None, f"{self.shard_cap} shard rows (final norm < 256)"
+            )
         self.layers = layers = runtime.layers
         for decoder in layers:
             sp_layer(decoder, self)
@@ -378,8 +382,30 @@ class SpStep:
         # rank's: no pipeline stages on the SP path).
         packed = WIDTH * (1 + len(self.aux_layers))
         self.final_gather = SpFinalGather(*owner, width=packed, rows_cap=rows[-1])
+        # Early aux columns. In the stock prefix-only capture an aux stream is
+        # prefix_sum + the layer's MLP output: exactly the prefix row the next layer's
+        # pre-AttnRes stores, which stays until that layer's reduce. A side stream
+        # multicasts it into the final box meanwhile ({gather layer: packed column});
+        # the other columns go with the final gather.
+        self.early_aux: dict[int, int] = {}
+        prefix_only = not (backbone._aux_attn_res_stream and backbone.use_attn_res)
+        indices = {d.layer_idx for d in layers}
+        for k, a in enumerate(self.aux_layers):
+            if prefix_only and a in indices and a != backbone.start_layer:
+                self.early_aux[a] = WIDTH * (1 + k)
+        self.tail_cols = (0,) + tuple(
+            WIDTH * (1 + k)
+            for k, a in enumerate(self.aux_layers)
+            if a not in self.early_aux
+        )
+        self.side = torch.cuda.Stream(self.device) if self.early_aux else None
         for r in rows:
             self.final_gather.prepare(r)
+            if self.early_aux:
+                widths = (WIDTH,) * len(self.tail_cols)
+                self.final_gather.prepare(r, self.tail_cols, widths)
+            for col in self.early_aux.values():
+                self.final_gather.prepare_push(r, col, WIDTH)
         kinds = {attention_kind(d.self_attn) for d in layers}
         self.dsa_box = self.dsa_scratch = None
         self.dsa_layers = 0
@@ -577,11 +603,20 @@ class SpStep:
         prefix_sum, hidden = hidden, None
         # The prefix sum is updated in place (the embedding shard first): the fused
         # boundaries store each updated / new prefix row into it.
+        early = self.early_aux
+        main = torch.cuda.current_stream(self.device)
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
             block, bound = self.blocks[index], self.bounds[index]
             gathered = bound.gather(hidden, prefix_sum, residual, block.parity)
+            col = early.get(index)
+            if col is not None:  # prefix_sum now holds the previous layer's aux row
+                self.side.wait_stream(main)
+                with torch.cuda.stream(self.side):
+                    self.final_gather.push(prefix_sum, col)
             partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
+            if col is not None:  # the reduce updates prefix_sum in place
+                main.wait_stream(self.side)
             out = prefix_sum.new_empty(prefix_sum.shape)
             hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
@@ -589,7 +624,7 @@ class SpStep:
                 hidden = layer.mlp(hidden)
             else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
                 hidden = mlp.run(hidden, prequantized=bound.out_mx is not None)
-            if index + 1 in self.aux_layers:
+            if index + 1 in self.aux_layers and index + 1 not in early:
                 aux.append(
                     backbone._capture_aux_hidden_stream(
                         index, prefix_sum, hidden, residual
@@ -608,16 +643,26 @@ class SpStep:
             eps=final.variance_epsilon,
             output_norm_eps=0.0,
         )
+        # The backbone's final norm on this rank's rows, before the gather: a shard
+        # has < 256 rows, so the stock RMSNorm kernel reduces each row as
+        # ``runtime.normalize`` does in its 255-row chunks (bit-equal rows, one
+        # small kernel instead of two chunks and a cat over the gathered rows).
+        hidden = runtime.normalize(hidden)
         # The final row all-gather on the multicast box (``SpFinalGather``; stock
         # ``sp_all_gather``'s rows, sanitized words).
-        if aux:
+        if early:
+            width = hidden.shape[-1]
+            sources = tuple(zip((hidden, *aux), self.tail_cols))
+            packed = self.final_gather.run(None, cols=sources)[:rows]
+            hidden, *aux = packed.split(width, dim=-1)
+        elif aux:
             width = hidden.shape[-1]
             packed = self.final_gather.run(torch.cat([hidden, *aux], dim=-1))[:rows]
             hidden, *aux = packed.split(width, dim=-1)
         else:
             hidden = self.final_gather.run(hidden.contiguous())[:rows]
         aux = remote + aux
-        return runtime.normalize((hidden, aux) if aux else hidden)
+        return (hidden, aux) if aux else hidden
 
     def prepare_kv(self):
         """Compile every block's core for the bound KV cache (the profiling cache,
