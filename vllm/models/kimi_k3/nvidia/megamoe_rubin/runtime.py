@@ -29,6 +29,7 @@ update the device flag only: call :meth:`check_route_errors` (or
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -276,8 +277,10 @@ class RubinMegaMoE:
         *,
         ids_dtypes: Sequence[torch.dtype] = (torch.int32, torch.int64),
         weight_dtypes: Sequence[torch.dtype] = (torch.float32, torch.bfloat16),
+        shared: Any = None,
     ) -> None:
-        """Collective; run on all EP ranks before CUDA graph capture.
+        """Collective; run on all EP ranks before CUDA graph capture. ``shared``:
+        a layer's ``FusedSharedArgs`` for the fused-shared buckets.
 
         1. Compiles the stager for every (ids dtype, weights dtype) the caller will
            pass (token count and strides are not specialized), on the real shape: one
@@ -327,9 +330,13 @@ class RubinMegaMoE:
             # ep_tokens 0 selects a session's S2 variant, the capacity its stock one.
             for use_s2 in sorted(self.sessions[b].kernels):
                 ep_tokens = 0 if use_s2 else b.max_tokens
+                fused = shared if self.sessions[b].cfg.shared is not None else None
+                if self.sessions[b].cfg.shared is not None and shared is None:
+                    raise ValueError(f"bucket {b} fuses the shared expert: pass shared.")
                 self.forward(
-                    empty, ids, wts, weights, bucket=b, ep_tokens=ep_tokens
-                )
+                    empty, ids, wts, weights, bucket=b, ep_tokens=ep_tokens,
+                    shared=fused,
+                )  # fmt: skip
         group_barrier(self.group)
         self.check_route_errors()
 
@@ -346,7 +353,8 @@ class RubinMegaMoE:
         owner: str | None = None,
         ep_tokens: int | None = None,
         rmsnorm: tuple[torch.Tensor, float] | None = None,
-    ) -> torch.Tensor:
+        shared: Any = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
         ``hidden`` (n, H) BF16; ``topk_ids`` (n, top_k) int32/int64 GLOBAL PHYSICAL
@@ -364,7 +372,12 @@ class RubinMegaMoE:
         epilogue variant (None: the capacity); same value on every EP rank.
         ``rmsnorm``: ``(weight, eps)`` of the output's consumer RMSNorm, applied in
         the reduce (``out[:n] = rms_norm(sum ...)``, stock vLLM ``rms_norm`` numerics;
-        :meth:`prepare_rmsnorm` compiles it before CUDA graph capture).
+        :meth:`prepare_rmsnorm` compiles it before CUDA graph capture). GenPhase
+        buckets run the stock ``rms_norm`` kernel on the reduced rows instead.
+        ``shared``: ``session.FusedSharedArgs`` of a fused-shared bucket (required
+        there, refused elsewhere); the result is then ``(routed, shared_out)`` with
+        ``shared_out`` the shared expert's BF16 [n, hidden] rows (session-owned,
+        valid until the next launch of this bucket).
         """
         session = self.sessions.get(bucket)
         if session is None:
@@ -375,9 +388,12 @@ class RubinMegaMoE:
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
+        unfused_norm = rmsnorm if session.cfg.kernel_variant == "genphase" else None
+        if unfused_norm is not None:
+            rmsnorm = None
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
-            session.launch(weights, session.empty_output, ep_tokens, rmsnorm)
+            session.launch(weights, session.empty_output, ep_tokens, rmsnorm, shared)
             result = hidden.new_empty((0, self.problem.hidden))
         else:
             if out is None:
@@ -389,11 +405,19 @@ class RubinMegaMoE:
             elif out.shape[0] < n:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
-            session.launch(weights, result, ep_tokens, rmsnorm)
+            session.launch(weights, result, ep_tokens, rmsnorm, shared)
+            if unfused_norm is not None:
+                from vllm import _custom_ops as ops
+
+                normed = torch.empty_like(result)
+                ops.rms_norm(normed, result, unfused_norm[0], unfused_norm[1])
+                result = normed
         if owner is None or self._poll_owner in (None, owner):
             if owner is not None:
                 self._poll_owner = owner
             self.poll_route_errors()
+        if shared is not None:
+            return result, session.shared_output[:n]
         return result
 
     def prepare_rmsnorm(
@@ -405,6 +429,8 @@ class RubinMegaMoE:
         ensure_not_capturing("RubinMegaMoE fused RMSNorm compile")
         for b in self.buckets:
             session = self.sessions[b]
+            if session.cfg.kernel_variant == "genphase":
+                continue  # stock rms_norm after the launch (forward)
             for use_s2 in sorted(session.kernels):
                 session.prepare(weights, session.empty_output, use_s2, (norm_weight, eps))
 

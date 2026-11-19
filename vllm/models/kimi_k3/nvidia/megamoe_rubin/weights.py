@@ -708,6 +708,49 @@ def prepare_mxfp4_mxfp8_weights(
     return RubinMoeWeights("mxfp4_mxfp8", fc1, fc2)
 
 
+def prepare_mxfp8_shared_weights(
+    gate_up: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down: torch.Tensor,
+    down_scale: torch.Tensor,
+    *,
+    hidden: int,
+    intermediate: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """An MXFP8 E4M3 shared expert (the stock linears' storage: row-major FP8
+    ``gate_up [2I, H]`` (gate rows first) / ``down [H, I]`` with F8_128x4 swizzled
+    E8M0 block-32 scales) -> the GenPhase kernel's fused-shared (FC1, FC2) pairs
+    (FlashInfer ``preprocess_prequantized_block_scaled_weights`` layout: 16-row
+    gate/up stripes, K-major ``[1, K, N]`` views, re-swizzled scales). FC2 views the
+    down weight in place; FC1 is a striped copy. Same bytes, no requantization."""
+    fp8, e8m0 = torch.float8_e4m3fn, torch.float8_e8m0fnu
+    if (
+        gate_up.dtype != fp8
+        or down.dtype != fp8
+        or tuple(gate_up.shape) != (2 * intermediate, hidden)
+        or tuple(down.shape) != (hidden, intermediate)
+        or not gate_up.is_contiguous()
+        or not down.is_contiguous()
+        or hidden % 128
+        or intermediate % 128
+    ):
+        raise ValueError(
+            f"shared expert must be row-major FP8 E4M3 gate_up {(2 * intermediate, hidden)}"
+            f" and down {(hidden, intermediate)} (128-aligned)."
+        )
+    s13 = from_blocked(_u8(gate_up_scale).reshape(-1), 2 * intermediate, hidden // MX_BLOCK)
+    s2 = from_blocked(_u8(down_scale).reshape(-1), hidden, intermediate // MX_BLOCK)
+    d13 = interleave_gate_up_16(_u8(gate_up)[None], intermediate_size=intermediate)
+    s13 = interleave_gate_up_16(s13[None], intermediate_size=intermediate)
+    d13 = d13.contiguous()
+    d2 = _u8(down)[None]
+    if d2.data_ptr() % 16:
+        raise ValueError("shared down weight must be 16-byte aligned.")
+    fc1 = (d13.view(fp8).permute(0, 2, 1), to_blocked_batched(s13.contiguous()).view(e8m0))
+    fc2 = (d2.view(fp8).permute(0, 2, 1), to_blocked_batched(s2[None].contiguous()).view(e8m0))
+    return fc1, fc2
+
+
 def _nvfp4_kernel_weights(
     w13_codes: torch.Tensor,
     w13_scale16: torch.Tensor,
