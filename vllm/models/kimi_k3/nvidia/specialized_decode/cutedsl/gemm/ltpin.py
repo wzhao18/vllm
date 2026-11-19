@@ -62,6 +62,11 @@ PINS: dict[tuple[str, int], tuple[str, int]] = {
     ("latent_up", 32): ("00000050000000420000000100000023000000000000000000020000000000020001fef0000000010000000e0000000e00000044000e000e0000000000000000", 0),  # noqa: E501
     ("latent_up", 64): ("00000050000000420000000100000023000000000000000000020000000000000001fef0000000010000000e0000000e00000044000e000e0000000000000000", 0),  # noqa: E501
     ("latent_up", 96): ("00000086000000420000000100000023000000000000000000060000000000020001fef0000000010000000e0000000e00000044000e000e0000000000000000", 0),  # noqa: E501
+    # router | latent down BF16 4480 x 7168, FP32 output (D-GEMM rl32 search, 13.8,
+    # cold): 8.28 / 9.16 / 9.67 vs heuristic 9.13 / 10.74 / 9.92
+    ("router_latent", 32): ("0000000d000000420000000300000023000000000000000200030000000000030001fef0000000010000000e0000000e00000044000000000000000000000000", 1720336),  # noqa: E501
+    ("router_latent", 64): ("0000003b000000420000000100000023000000000000000000020000000000020001fef0000000010000000e0000000e00000044000000000000000000000000", 0),  # noqa: E501
+    ("router_latent", 96): ("0000005c000000420000000100000023000000000000000000050000000000020001fef0000000010000000e0000000e00000044000000000000000000000000", 0),  # noqa: E501
     # kda_in MXFP8 12448 x 7168 (R128 only): 9.98 vs 12.56 (fi_cute 10.96)
     ("kda_in", 128): ("00000014000000420000000100000024000000000000000000030000000000030001fef0000000010000001c0000001c00000044000e000e0000000000000000", 0),  # noqa: E501
     # shared_gu MXFP8 12288 x 7168: 9.58 vs 11.76 / 9.67 vs 10.60 / 9.73 vs 12.12
@@ -82,6 +87,7 @@ SHAPES: dict[tuple, str] = {
     (4096, 1536, "bf16", False, False): "wq_b",
     (3584, 7168, "bf16", False, False): "latent_down",
     (7168, 3584, "bf16", False, True): "latent_up",
+    (4480, 7168, "bf16", True, False): "router_latent",
     (12448, 7168, "mxfp8", False, False): "kda_in",
     (12288, 7168, "mxfp8", False, False): "shared_gu",
     (7168, 6144, "mxfp8", False, False): "shared_down",
@@ -113,6 +119,7 @@ std::vector<int64_t> lt_plan(int64_t n, int64_t k, int64_t rows, bool mx, bool o
 void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::Tensor& out,
             const c10::optional<torch::Tensor>& ws, const c10::optional<torch::Tensor>& wsf,
             const c10::optional<torch::Tensor>& xsf);
+void lt_split(const torch::Tensor& y, int64_t head, torch::Tensor& logits, torch::Tensor& rest);
 """
 
 _CUDA_SRC = r"""
@@ -121,6 +128,7 @@ _CUDA_SRC = r"""
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <cublasLt.h>
+#include <cuda_bf16.h>
 #include <mutex>
 #include <vector>
 
@@ -249,6 +257,39 @@ void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::T
                          &p.algo, wsp, p.ws, c10::cuda::getCurrentCUDAStream()));
 }
 
+// y [R, W] FP32 -> logits [R, head] FP32 (copy) + rest [R, W - head] BF16 (RN).
+__global__ void split_kernel(const float* __restrict__ y, int64_t rows, int64_t width, int64_t head,
+                             float* __restrict__ logits, __nv_bfloat16* __restrict__ rest) {
+  int64_t r = blockIdx.y;
+  const float4* src = reinterpret_cast<const float4*>(y + r * width);
+  for (int64_t c4 = blockIdx.x * blockDim.x + threadIdx.x; c4 < width / 4;
+       c4 += (int64_t)gridDim.x * blockDim.x) {
+    float4 v = src[c4];
+    int64_t c = c4 * 4;
+    if (c < head) {
+      reinterpret_cast<float4*>(logits + r * head)[c4] = v;
+    } else {
+      __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+      __nv_bfloat162* d = reinterpret_cast<__nv_bfloat162*>(rest + r * (width - head) + (c - head));
+      d[0] = lo; d[1] = hi;
+    }
+  }
+}
+
+void lt_split(const torch::Tensor& y, int64_t head, torch::Tensor& logits, torch::Tensor& rest) {
+  int64_t rows = y.size(0), width = y.size(1);
+  TORCH_CHECK(y.scalar_type() == at::kFloat && y.is_contiguous() && width % 4 == 0 && head % 4 == 0,
+              "ltpin: split input");
+  check_packed(logits, rows, head, "logits");
+  check_packed(rest, rows, width - head, "rest");
+  if (rows == 0) return;
+  const c10::cuda::CUDAGuard guard(y.device());
+  dim3 grid((unsigned)((width / 4 + 255) / 256), (unsigned)rows);
+  split_kernel<<<grid, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      y.data_ptr<float>(), rows, width, head, logits.data_ptr<float>(),
+      reinterpret_cast<__nv_bfloat16*>(rest.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 """
 
 _lock = threading.Lock()
@@ -274,7 +315,7 @@ def _module():
                 name=f"k3_ltpin_{tag}",
                 cpp_sources=_CPP_SRC,
                 cuda_sources=_CUDA_SRC,
-                functions=["lt_version", "lt_plan", "lt_run"],
+                functions=["lt_version", "lt_plan", "lt_run", "lt_split"],
                 extra_cuda_cflags=["-O3"],
                 extra_ldflags=["-lcublasLt"],
                 build_directory=build,
@@ -355,6 +396,12 @@ class LtPin:
         pid, ws = plan
         _module().lt_run(pid, w, x, out, ws, w_scale, x_scale)
         return out
+
+
+def split_head(y: torch.Tensor, head: int, logits: torch.Tensor, rest: torch.Tensor):
+    """``y`` FP32 [R, W] -> ``logits`` = y[:, :head] (FP32, packed) and ``rest`` =
+    bf16_rn(y[:, head:]) in one kernel (the concatenated router | latent down)."""
+    _module().lt_split(y, head, logits, rest)
 
 
 def warmup() -> None:
