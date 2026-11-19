@@ -729,8 +729,8 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
 // MMA operands, INVb = bf16(INV * beta) as the A operand of [w | u].
 struct SmemK {
   Smem s;
-  __nv_bfloat16 kv[2][kC][kPitch];   // kd (bf16 kn * e) | post-conv v rows
-  __nv_bfloat16 invb[kC][kC + 8];
+  alignas(128) __nv_bfloat16 kv[2][kC][kPitch];   // kd (bf16 kn * e) | post-conv v rows
+  alignas(128) __nv_bfloat16 invb[kC][kC + 8];
 };
 
 __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant__ Params p) {
