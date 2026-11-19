@@ -34,7 +34,9 @@ def pg():
 
 
 @pytest.mark.parametrize("rows", [1, 7, 300, 4350, 16384])
-@pytest.mark.parametrize("kind", ["rand", "ties", "nonfinite", "zeros", "ep_bias"])
+@pytest.mark.parametrize(
+    "kind", ["rand", "ties", "near_ties", "pairs", "nonfinite", "zeros", "ep_bias"]
+)
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_router_topk_matches_grouped_topk(pg, rows, kind, renormalize):
     from vllm import _custom_ops as ops
@@ -46,6 +48,14 @@ def test_router_topk_matches_grouped_topk(pg, rows, kind, renormalize):
     if kind == "ties":
         x = (x * 4).round() / 4
         bias = (bias * 64).round() / 64
+    elif kind == "near_ties":
+        # Exact scores closer than the fast prefilter's error.
+        x = (x * 4).round() / 4 + torch.randn_like(x) * 3e-6
+        bias = (bias * 64).round() / 64
+    elif kind == "pairs":
+        # Few candidates, each top score with a sub-ulp-of-fast twin.
+        x[:, 1::2] = x[:, 0::2] + torch.randn_like(x[:, 0::2]) * 1e-6
+        bias[1::2] = bias[0::2]
     elif kind == "nonfinite":
         x[::7, ::13] = float("inf")
         x[::5, ::11] = float("nan")

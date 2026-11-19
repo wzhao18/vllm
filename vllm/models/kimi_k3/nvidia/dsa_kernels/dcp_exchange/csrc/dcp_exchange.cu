@@ -3231,6 +3231,10 @@ int64_t topk_v2_resident() {
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     // two ~108 KB CTAs per SM (one row each): the largest SMEM carveout
     C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_redo_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    int occ2 = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ2, topk_v2_redo_kernel, kV2T, kV2Dyn));
+    TORCH_CHECK(occ2 >= 1, "topk_v2: the complete row body does not fit");
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel, kV2T, kV2Dyn));
     v = sms * occ;
   }
@@ -3250,7 +3254,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   TORCH_CHECK(interleave >= 1);
   const int T = (int)logits.size(0);
   if (T == 0) return;
-  TORCH_CHECK(T <= cap && epoch.numel() >= T, "topk_v2: rows > cap");
+  TORCH_CHECK(T <= cap && epoch.numel() >= 2 * cap, "topk_v2: rows > cap or epoch < 2 cap");
   const c10::cuda::CUDAGuard guard(logits.device());
   V2Params p{};
   p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
@@ -3275,6 +3279,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   const auto lay = topk_v2_layout(cap, W);
   p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
   p.epoch = epoch.data_ptr<int>();
+  p.redo = p.epoch + cap;  // the epoch buffer's second half
   p.err = err.data_ptr<int>();
   p.spin_ns = g_spin_ns;
   p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
@@ -3295,6 +3300,9 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   cfg.attrs = attr;
   cfg.numAttrs = 1;
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel, p));
+  // the rows that need the complete body (rare; most CTAs exit after the PDL wait)
+  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

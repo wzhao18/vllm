@@ -158,10 +158,31 @@ def parse_args():
     )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
     p.add_argument(
+        "--active-experts",
+        type=int,
+        default=None,
+        help="random routing over A active experts per rank, split over the two die "
+        "halves of the local experts (the step slice's EP-size emulation: 896 experts "
+        "at EP4 with A=28 is 224 local slots, 28 active)",
+    )
+    p.add_argument(
         "--die-local",
         action="store_true",
         help="decode-server placement: die_split schedule + experts homed per die half "
         "(die_local.place_experts), as KimiK3MegaMoEExperts does on decode servers",
+    )
+    p.add_argument(
+        "--shared",
+        default=None,
+        help="HIDDEN,INTER: fuse a random MXFP8 E4M3 shared expert of that shape "
+        "(Kimi K3.1: 7168,6144) into the GenPhase kernel; reports its rel-L2 vs "
+        "the stock MXFP8 chain (FP32 GEMMs, SiTU, MXFP8 requant)",
+    )
+    p.add_argument(
+        "--shared-l2-position",
+        choices=("early", "tail"),
+        default=None,
+        help="fused shared FC2 placement (default: the session's)",
     )
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int32")
     p.add_argument("--warmup", type=int, default=10)
@@ -311,11 +332,55 @@ def ckpt_mxfp4_layer(W, path, layer, experts, offset, hidden, inter, device):
 # ---------------------------------------------------------------------------------
 
 
-def make_routes(n, num_experts, topk, world, rank, kind, seed, device, ids_dtype):
+def make_shared(W, shape, rows, seed, device):
+    """Random MXFP8 E4M3 shared expert in the stock linears' storage (row-major FP8,
+    F8_128x4 scales) + a capacity MXFP8 input; returns (FusedSharedArgs, ref(n))."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.reference import _situ
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.session import FusedSharedArgs
+
+    hidden, inter = shape
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    def q(t):
+        data, sf = W.quantize_mxfp8_block32(t)
+        return data, sf
+
+    def dq(data, sf):
+        f = data.float().reshape(*data.shape[:-1], -1, 32)
+        return (f * W.e8m0_to_f32(sf).unsqueeze(-1)).reshape(data.shape)
+
+    w13 = torch.randn((2 * inter, hidden), generator=gen, device=device) * hidden**-0.5
+    w2 = torch.randn((hidden, inter), generator=gen, device=device) * inter**-0.5
+    x = torch.randn((max(rows, 128), hidden), generator=gen, device=device)
+    (d13, s13), (d2, s2), (dx, sx) = q(w13), q(w2), q(x)
+    fc1, fc2 = W.prepare_mxfp8_shared_weights(
+        d13, W.to_blocked(s13), d2, W.to_blocked(s2), hidden=hidden, intermediate=inter
+    )
+    args = FusedSharedArgs(dx, W.to_blocked(sx), fc1, fc2)
+    w13f, w2f, xf = dq(d13, s13), dq(d2, s2), dq(dx, sx)
+
+    def ref(n, exact_act=False):
+        gu = xf[:n] @ w13f.t()
+        act = _situ(gu[:, :inter], gu[:, inter:], 4.0, 25.0).float()
+        if not exact_act:  # stock: BF16 SiTU output requantized to MXFP8
+            act = dq(*q(act.to(torch.bfloat16)))
+        return (act @ w2f.t()).to(torch.bfloat16).float()
+
+    return args, ref
+
+
+def make_routes(
+    n, num_experts, topk, world, rank, kind, seed, device, ids_dtype, active=None
+):
     g = torch.Generator(device=device)
     g.manual_seed(seed * 7919 + rank)
     if kind == "random":
         scores = torch.rand((n, num_experts), generator=g, device=device)
+        if active is not None:
+            local = torch.arange(num_experts, device=device) % (num_experts // world)
+            half = num_experts // world // 2
+            on = (local < active // 2) | ((local >= half) & (local < half + active // 2))
+            scores = scores.masked_fill(~on, -1.0)
         ids = scores.topk(topk, dim=1).indices
     else:
         # balanced: token t's j-th route goes to rank (t + j) % W, distinct local
@@ -521,6 +586,16 @@ def main():
             )
             for b in buckets
         ]
+    shared_shape = None
+    if args.shared:
+        import dataclasses
+
+        shared_shape = tuple(int(v) for v in args.shared.split(","))
+        if args.shared_l2_position is not None:
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as rubin_session
+
+            rubin_session.RUBIN_FUSED_SHARED_L2_POSITION = args.shared_l2_position
+        buckets = [dataclasses.replace(b, shared=shared_shape) for b in buckets]
     bucket_of = {b.max_tokens: b for b in buckets}
     if rank == 0:
         for note in notes:
@@ -555,7 +630,13 @@ def main():
         weights = die_local.place_experts(weights)
     if weights.report is not None and rank == 0:
         print(weights.report.summary().splitlines()[0], flush=True)
-    moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),))
+    fused = None
+    if shared_shape is not None:
+        fused, shared_ref = make_shared(W, shared_shape, max(caps), args.seed + rank, device)
+        if args.die_local:
+            fc1 = die_local.place_halves(fused.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
+            fused = fused._replace(fc1=(fc1, fused.fc1[1]))
+    moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),), shared=fused)
     ident = env_identity(os.path.dirname(mr.__file__))
     cycles_per_us = sleep_cycles_per_us()
     delay_cycles = int(args.delay_us * cycles_per_us)
@@ -583,13 +664,13 @@ def main():
         ).to(torch.bfloat16)
         ids, wts = make_routes(
             n, problem.num_experts, problem.top_k, world, rank, args.routing,
-            args.seed + n, device, args.ids_dtype,
+            args.seed + n, device, args.ids_dtype, args.active_experts,
         )
         check_routes(ids, problem.num_experts)
         out = torch.empty(
             (max(n, 1), problem.hidden), dtype=torch.bfloat16, device=device
         )
-        moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out)
+        res = moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused)
         torch.cuda.synchronize()
         moe.check_route_errors()
 
@@ -655,11 +736,24 @@ def main():
 
         target = out[:n] if n else session.empty_output
 
+        if fused is not None and n:
+            got = res[1].float()
+            want = shared_ref(n)
+            exact = shared_ref(n, exact_act=True)
+
+            def rel(a, b):
+                return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+            result["shared_rel_l2"] = rel(got, want)
+            # noise floor: the stock chain and the kernel vs an unquantized activation
+            result["shared_rel_l2_stock_vs_exact_act"] = rel(want, exact)
+            result["shared_rel_l2_kernel_vs_exact_act"] = rel(got, exact)
+
         def launch():
-            session.launch(weights, target)
+            session.launch(weights, target, shared=fused)
 
         def forward():
-            moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out)
+            moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused)
 
         # eager (FlashInfer tuner protocol of the knob records), then CUDA graphs
         for _ in range(args.warmup):
