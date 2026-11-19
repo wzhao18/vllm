@@ -40,7 +40,11 @@ from .config import RouteIdError, RubinBucket, RubinMoeConfig, RubinMoeProblem
 from .session import RubinMegaMoeSession, layout_tag
 from .staging import PREFILL_STAGE_MIN_TOKENS, stage_inputs
 from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
-from .weights import RubinMoeWeights, prepare_weights
+from .weights import (
+    RubinMoeWeights,
+    prepare_nvfp4_checkpoint_weights,
+    prepare_weights,
+)
 
 logger = init_logger(__name__)
 
@@ -166,6 +170,42 @@ class RubinMegaMoE:
             fc1_norm_const=p.fc1_norm_const,
             layer_id=layer_id,
             expert_offset=self.rank * self.experts_per_rank,
+        )
+
+    def prepare_nvfp4_checkpoint_weights(
+        self,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w13_global: torch.Tensor,
+        w2_global: torch.Tensor,
+    ) -> RubinMoeWeights:
+        """Native NVFP4 local-expert weights (E4M3 block-16 scales + per-expert
+        ``weight_scale_2``) -> kernel layout, as stored (no conversion)."""
+        p = self.problem
+        if p.quant_kind != "nvfp4":
+            raise ValueError(
+                f"NVFP4 checkpoint weights need the nvfp4 kernel, not {p.quant_kind!r}."
+            )
+        if p.input_norm_const != 1.0 or p.fc1_norm_const != 1.0:
+            raise ValueError(
+                "NVFP4 checkpoint alphas assume unit activation norm constants."
+            )
+        if w13.shape[0] != self.experts_per_rank:
+            raise ValueError(
+                f"expected {self.experts_per_rank} local experts (linear EP "
+                f"placement), got {w13.shape[0]}."
+            )
+        return prepare_nvfp4_checkpoint_weights(
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            w13_global,
+            w2_global,
+            hidden=p.hidden,
+            intermediate=p.intermediate,
         )
 
     # -- route-id errors ------------------------------------------------------------
@@ -305,6 +345,7 @@ class RubinMegaMoE:
         is_padding: torch.Tensor | None = None,
         owner: str | None = None,
         ep_tokens: int | None = None,
+        rmsnorm: tuple[torch.Tensor, float] | None = None,
     ) -> torch.Tensor:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
@@ -321,6 +362,9 @@ class RubinMegaMoE:
         kernels); unnamed callers always poll.
         ``ep_tokens``: the EP-uniform live tokens per rank that pick the bucket's
         epilogue variant (None: the capacity); same value on every EP rank.
+        ``rmsnorm``: ``(weight, eps)`` of the output's consumer RMSNorm, applied in
+        the reduce (``out[:n] = rms_norm(sum ...)``, stock vLLM ``rms_norm`` numerics;
+        :meth:`prepare_rmsnorm` compiles it before CUDA graph capture).
         """
         session = self.sessions.get(bucket)
         if session is None:
@@ -333,7 +377,7 @@ class RubinMegaMoE:
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
-            session.launch(weights, session.empty_output, ep_tokens)
+            session.launch(weights, session.empty_output, ep_tokens, rmsnorm)
             result = hidden.new_empty((0, self.problem.hidden))
         else:
             if out is None:
@@ -345,12 +389,24 @@ class RubinMegaMoE:
             elif out.shape[0] < n:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
-            session.launch(weights, result, ep_tokens)
+            session.launch(weights, result, ep_tokens, rmsnorm)
         if owner is None or self._poll_owner in (None, owner):
             if owner is not None:
                 self._poll_owner = owner
             self.poll_route_errors()
         return result
+
+    def prepare_rmsnorm(
+        self, weights: RubinMoeWeights, norm_weight: torch.Tensor, eps: float
+    ) -> None:
+        """Compile (local, no launch: not collective) every bucket's fused-RMSNorm
+        reduce variant for ``forward(..., rmsnorm=(norm_weight, eps))``; call before
+        CUDA graph capture (compiles are refused while capturing)."""
+        ensure_not_capturing("RubinMegaMoE fused RMSNorm compile")
+        for b in self.buckets:
+            session = self.sessions[b]
+            for use_s2 in sorted(session.kernels):
+                session.prepare(weights, session.empty_output, use_s2, (norm_weight, eps))
 
     def destroy(self) -> None:
         ensure_not_capturing("RubinMegaMoE teardown")

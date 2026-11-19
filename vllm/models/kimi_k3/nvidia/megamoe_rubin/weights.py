@@ -708,6 +708,34 @@ def prepare_mxfp4_mxfp8_weights(
     return RubinMoeWeights("mxfp4_mxfp8", fc1, fc2)
 
 
+def _nvfp4_kernel_weights(
+    w13_codes: torch.Tensor,
+    w13_scale16: torch.Tensor,
+    w2_codes: torch.Tensor,
+    w2_scale16: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    fc1_norm_const: torch.Tensor,
+    *,
+    intermediate: int,
+    report: ConversionReport | None = None,
+) -> RubinMoeWeights:
+    """Canonical-order NVFP4 codes + E4M3 block-16 scale bytes -> kernel layout."""
+    d13 = interleave_gate_up_16(_u8(w13_codes), intermediate_size=intermediate)
+    s13 = interleave_gate_up_16(_u8(w13_scale16), intermediate_size=intermediate)
+    fc1 = (
+        _aligned_k_major_view(d13),
+        to_blocked_batched(s13.contiguous()).view(torch.float8_e4m3fn),
+    )
+    fc2 = (
+        _aligned_k_major_view(_u8(w2_codes)),
+        to_blocked_batched(_u8(w2_scale16).contiguous()).view(torch.float8_e4m3fn),
+    )
+    return RubinMoeWeights(
+        "nvfp4", fc1, fc2, fc1_alpha, fc2_alpha, fc1_norm_const, report=report
+    )
+
+
 def prepare_nvfp4_weights(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -738,18 +766,110 @@ def prepare_nvfp4_weights(
         input_norm_const=input_norm_const,
         fc1_norm_const=fc1_norm_const,
     )
-    d13 = interleave_gate_up_16(conv.w13_codes, intermediate_size=intermediate)
-    s13 = interleave_gate_up_16(conv.w13_scale16, intermediate_size=intermediate)
-    fc1 = (
-        _aligned_k_major_view(d13),
-        to_blocked_batched(s13.contiguous()).view(torch.float8_e4m3fn),
+    return _nvfp4_kernel_weights(
+        conv.w13_codes,
+        conv.w13_scale16,
+        conv.w2_codes,
+        conv.w2_scale16,
+        fc1_alpha,
+        fc2_alpha,
+        norm1,
+        intermediate=intermediate,
+        report=conv.report,
     )
-    fc2 = (
-        _aligned_k_major_view(conv.w2_codes),
-        to_blocked_batched(conv.w2_scale16).view(torch.float8_e4m3fn),
+
+
+# --------------------------------------------------------------------------------------
+# Native NVFP4 checkpoints (ModelOpt export)
+# --------------------------------------------------------------------------------------
+
+
+def check_canonical_nvfp4(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_global: torch.Tensor,
+    w2_global: torch.Tensor,
+    *,
+    hidden: int,
+    intermediate: int,
+) -> int:
+    """Validate one layer's native NVFP4 experts; returns the local expert count.
+
+    ``w13`` ``(E, 2I, H/2)`` / ``w2`` ``(E, H, I/2)`` packed E2M1; ``*_scale`` the
+    E4M3 block-16 scales ``(E, 2I, H/16)`` / ``(E, H, I/16)``; ``*_global`` the
+    per-expert FP32 ``weight_scale_2`` ``(E,)``, finite and positive.
+    """
+    if any(t.dim() != 3 for t in (w13, w13_scale, w2, w2_scale)):
+        raise ValueError("NVFP4 w13 / w13_scale / w2 / w2_scale must all be 3D.")
+    experts = w13.shape[0]
+    expected = {
+        "w13": (w13, (experts, 2 * intermediate, hidden // 2)),
+        "w13_scale": (w13_scale, (experts, 2 * intermediate, hidden // NV_BLOCK)),
+        "w2": (w2, (experts, hidden, intermediate // 2)),
+        "w2_scale": (w2_scale, (experts, hidden, intermediate // NV_BLOCK)),
+    }
+    for name, (tensor, shape) in expected.items():
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} shape {tuple(tensor.shape)} != expected {shape}.")
+        if tensor.element_size() != 1:
+            raise TypeError(f"{name} must be a 1-byte dtype, got {tensor.dtype}.")
+    for name in ("w13_scale", "w2_scale"):
+        if expected[name][0].dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise TypeError(f"{name} must be E4M3 (uint8 or float8_e4m3fn).")
+    for name, g in (("w13 weight_scale_2", w13_global), ("w2 weight_scale_2", w2_global)):
+        if g.shape != (experts,) or g.dtype != torch.float32:
+            raise ValueError(f"{name} must be fp32 ({experts},), got {g.dtype} {g.shape}.")
+        if not bool(torch.isfinite(g).all()) or not bool((g > 0).all()):
+            raise ValueError(f"{name} must be finite and positive.")
+    if experts <= 0 or hidden % (4 * MX_BLOCK) or intermediate % (2 * MX_BLOCK):
+        raise ValueError(
+            "need experts > 0, hidden % 128 == 0 and intermediate % 64 == 0 "
+            f"(got E={experts}, H={hidden}, I={intermediate})."
+        )
+    return experts
+
+
+def prepare_nvfp4_checkpoint_weights(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_global: torch.Tensor,
+    w2_global: torch.Tensor,
+    *,
+    hidden: int,
+    intermediate: int,
+) -> RubinMoeWeights:
+    """A native NVFP4 checkpoint's experts, as stored, in the kernel layout.
+
+    Codes and E4M3 block scales are only re-laid out. The per-expert epilogue
+    alphas are the checkpoint's ``weight_scale_2`` (activation global scale 1.0:
+    ``input_norm_const = fc1_norm_const = 1``), the stock NVFP4 MoE alphas
+    ``input_scale * weight_scale_2`` for the unit input scales the caller asserts.
+    """
+    check_canonical_nvfp4(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        w13_global,
+        w2_global,
+        hidden=hidden,
+        intermediate=intermediate,
     )
-    return RubinMoeWeights(
-        "nvfp4", fc1, fc2, fc1_alpha, fc2_alpha, norm1, report=conv.report
+    fc1_alpha = w13_global.to(torch.float32).contiguous()
+    fc2_alpha = w2_global.to(torch.float32).contiguous()
+    return _nvfp4_kernel_weights(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        fc1_alpha,
+        fc2_alpha,
+        torch.ones_like(fc1_alpha),
+        intermediate=intermediate,
     )
 
 
