@@ -237,8 +237,12 @@ def test_dsa_wide_proj_grid_resident():
     SM count: at DCP16 96 projecting CTAs, then 6 x min(tiles, (SMs - 96) // 6)
     merging ones (19 on 212 SMs: 210 CTAs from 304 rows), whose whole grid fits at
     one 512-thread CTA per SM (check_proj_residency) at DL7's (q8, 128 / 256 rows)
-    and DL3's (q4, 128 to 512 rows) wide rows."""
+    and DL3's (q4, 128 to 512 rows) wide rows; above PROJ_ROWS the tcgen05
+    projection's units spread over H x (SMs // H) CTAs."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.dcp_value import (
+        projects_on_tc,
+    )
 
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if sms <= 152:
@@ -251,8 +255,11 @@ def test_dsa_wide_proj_grid_resident():
         args = rows, heads, pitch, specs, device, q, 16, 128, sms, "proj"
         *_, value = wide.compile_core(*args, fp8=True, cap=512)
         grid = wide.check_proj_residency(value, heads, 16, rows, sms, device)
-        merge = min(-(-rows // 16), (sms - 16 * heads) // heads)
-        assert grid == (heads, 16 + merge, 1) and heads * grid[1] <= sms, grid
+        want = (heads, sms // heads, 1)  # tcgen05 projection units on every CTA
+        if not projects_on_tc(rows):
+            merge = min(-(-rows // 16), (sms - 16 * heads) // heads)
+            want = (heads, 16 + merge, 1)
+        assert grid == want and heads * grid[1] <= sms, grid
 
 
 @pytest.mark.parametrize(

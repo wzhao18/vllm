@@ -130,7 +130,8 @@ def layer(overlap, seed=0):
         _prefill_subcalls=None,
     )  # fmt: skip
     for name in ("forward", "_maybe_overlap_router_and_down_proj",
-                 "_shared_mxfp8_input", "_routed_experts"):  # fmt: skip
+                 "_shared_mxfp8_input", "_routed_experts",
+                 "_prefill_shared_stream"):  # fmt: skip
         setattr(mlp, name, types.MethodType(getattr(kimi.KimiMoE, name), mlp))
     return mlp
 
