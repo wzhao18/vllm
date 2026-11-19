@@ -34,7 +34,6 @@ void lt_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& w,
 
 _CUDA_SRC = r"""
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cublasLt.h>
 #include <cstring>
@@ -46,6 +45,16 @@ _CUDA_SRC = r"""
   } while (0)
 
 namespace {
+// The image's ATen/cuda/CUDAContext.h needs cusparse.h (absent): an own handle.
+cublasLtHandle_t handle() {
+  static cublasLtHandle_t h = [] {
+    cublasLtHandle_t x;
+    LT_CHECK(cublasLtCreate(&x));
+    return x;
+  }();
+  return h;
+}
+
 struct Desc {
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
@@ -90,7 +99,7 @@ int64_t lt_check(const torch::Tensor& x, const torch::Tensor& w, const torch::Te
   cublasLtMatmulAlgo_t a = as_algo(algo);
   cublasLtMatmulHeuristicResult_t r;
   std::memset(&r, 0, sizeof r);
-  cublasStatus_t s = cublasLtMatmulAlgoCheck(at::cuda::getCurrentCUDABlasLtHandle(), d.op, d.a, d.b,
+  cublasStatus_t s = cublasLtMatmulAlgoCheck(handle(), d.op, d.a, d.b,
                                              d.c, d.c, &a, &r);
   if (s != CUBLAS_STATUS_SUCCESS || r.state != CUBLAS_STATUS_SUCCESS) return -1;
   return (int64_t)r.workspaceSize;
@@ -106,7 +115,7 @@ void lt_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& w,
   cublasLtMatmulAlgo_t a = as_algo(algo);
   float alpha = 1.f, beta = 0.f;
   auto stream = c10::cuda::getCurrentCUDAStream(x.device().index());
-  LT_CHECK(cublasLtMatmul(at::cuda::getCurrentCUDABlasLtHandle(), d.op, &alpha, w.data_ptr(), d.a,
+  LT_CHECK(cublasLtMatmul(handle(), d.op, &alpha, w.data_ptr(), d.a,
                           x.data_ptr(), d.b, &beta, out.data_ptr(), d.c, out.data_ptr(), d.c, &a,
                           workspace.data_ptr(), (size_t)workspace.numel() * workspace.element_size(),
                           stream.stream()));
