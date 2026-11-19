@@ -132,6 +132,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     shared_fc1_output_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_output"
     shared_fc1_output_sf_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_output_sf"
     shared_fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_done_counter"
+    # vLLM-local: per-CTA "stores drained" arrivals that the standalone reduce acquires (VENDOR.md).
+    producer_done_region: ClassVar[str] = "rubin.genphase_moe.producer_done"
 
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
@@ -436,7 +438,21 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 batch_invariant=bool(problem_desc.get("batch_invariant", False)),
                 shared_term=self.reduce_shared_output,
                 outlive_producer=self.shared_expert and self.epilogue.combine_ll_encoded,
+                producer_arrivals=(
+                    self.promised_launchable_sm_count if self.reduce_acquires_producer_done else None
+                ),
             )
+        )
+
+    @property
+    def reduce_acquires_producer_done(self) -> bool:
+        """The fused shared output is the one output the standalone reduce does not poll; its completion is
+        ordered through per-CTA arrivals instead of the reduce waiting for this grid's completion."""
+        return (
+            self.shared_expert
+            and not self.reduce_topk_in_kernel
+            and self.epilogue.combine_ll_encoded
+            and not self.reduce_shared_output
         )
 
     # ------------------------------------------------------------------
@@ -655,6 +671,15 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 buffer_space="shared",
                 mem_order=(2, 1, 0),
                 byte_alignment=128,
+                reset="zero_on_first_allocate",
+            )
+        if self.reduce_acquires_producer_done:
+            device_workspace.register(
+                self.producer_done_region,
+                cutlass.Int32,
+                (1,),
+                buffer_space="local",
+                byte_alignment=16,
                 reset="zero_on_first_allocate",
             )
         self.scheduler.register_device_workspace(device_workspace)
@@ -1233,6 +1258,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_term=shared_output if cutlass.const_expr(self.reduce_shared_output) else None,
                 rmsnorm_weight=rmsnorm_weight,
                 rmsnorm_eps=rmsnorm_eps,
+                producer_done=(
+                    self._device_workspace.tensor(self.producer_done_region)
+                    if cutlass.const_expr(self.reduce_acquires_producer_done)
+                    else None
+                ),
             )
         elif cutlass.const_expr(rmsnorm_weight is not None):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
@@ -1855,6 +1885,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 lane_idx = cute.arch.lane_idx()
                 is_last = Int32(0)
                 if lane_idx == Int32(0):
+                    if cutlass.const_expr(self.reduce_acquires_producer_done):
+                        # The reduce's completion orders the shared output through this arrival.
+                        cute.arch.atomic_add(
+                            self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="acq_rel", scope="gpu"
+                        )
                     if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))

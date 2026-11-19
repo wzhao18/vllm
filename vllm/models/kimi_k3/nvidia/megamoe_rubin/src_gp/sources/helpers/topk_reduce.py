@@ -210,6 +210,7 @@ class TopkReduce:
         internode: Optional[Tuple[int, int, int]] = None,
         shared_term: bool = False,
         outlive_producer: bool = False,
+        producer_arrivals: Optional[int] = None,
         batch_invariant: bool = False,
     ) -> None:
         """``internode = (experts_per_rank, ranks_per_node, remote_node_slots)`` enables the ordered reduce
@@ -217,7 +218,12 @@ class TopkReduce:
         stay separate terms; the first top-k slot that names an expert of remote node ``n`` contributes
         that node's returned partial once and the node's other slots contribute nothing.
         ``outlive_producer`` keeps the polled reduce from completing before its producer grid, for producers
-        that also write outputs the reduce does not poll."""
+        that also write outputs the reduce does not poll. With ``producer_arrivals`` the last CTA waits
+        instead for that many release-arrivals on the ``producer_done`` counter (one per producer CTA once
+        its stores are drained) and re-arms it, so the reduce does not wait out the producer's tail."""
+        self.producer_arrivals = None if producer_arrivals is None else int(producer_arrivals)
+        if self.producer_arrivals is not None and not outlive_producer:
+            raise ValueError("producer_arrivals refines outlive_producer.")
         self.batch_invariant = bool(batch_invariant)
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
@@ -391,6 +397,7 @@ class TopkReduce:
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, added after the top-k terms
         rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a (VENDOR.md)
         rmsnorm_eps: Optional[Float32] = None,
+        producer_done: Optional[cute.Tensor] = None,  # int32 x1: producer_arrivals counter (see __init__)
     ):
         """Launch the reduce.
 
@@ -439,6 +446,8 @@ class TopkReduce:
             if cutlass.const_expr(self.internode is not None):
                 raise ValueError("shared_term is not supported by the internode reduce.")
             shared_term = shared_term_view(shared_term, self.hidden)
+        if cutlass.const_expr((self.producer_arrivals is None) != (producer_done is None)):
+            raise ValueError("producer_done goes with producer_arrivals.")
 
         if cutlass.const_expr(self.batch_invariant and not self.combine_format.is_quantized):
             self._reduce_bf16_bi(combine_quant, topk_score, reduced_output, topk_indices).launch(
@@ -457,14 +466,23 @@ class TopkReduce:
                 raise ValueError(f"fused RMSNorm reduce: hidden {self.hidden} needs more than 1024 threads.")
             rmsnorm_weight = cute.make_tensor(rmsnorm_weight.iterator, cute.make_layout((self.hidden,)))
             self._reduce_bf16_ll_rmsnorm(
-                combine_quant, topk_score, reduced_output, topk_indices, rmsnorm_weight, rmsnorm_eps, shared_term
+                combine_quant,
+                topk_score,
+                reduced_output,
+                topk_indices,
+                rmsnorm_weight,
+                rmsnorm_eps,
+                shared_term,
+                producer_done,
             ).launch(grid=[reduced_output.shape[0], 1, 1], block=[norm_threads, 1, 1], stream=stream, use_pdl=True)
             return
 
         if cutlass.const_expr(self.ll_encoded):
             if cutlass.const_expr(topk_indices is None):
                 raise ValueError("The polled bf16 reduce needs topk_indices to skip dropped slots.")
-            self._reduce_bf16_ll(combine_quant, topk_score, reduced_output, topk_indices, shared_term).launch(
+            self._reduce_bf16_ll(
+                combine_quant, topk_score, reduced_output, topk_indices, shared_term, producer_done
+            ).launch(
                 grid=grid, block=block, stream=stream, use_pdl=True
             )
             return
@@ -746,6 +764,7 @@ class TopkReduce:
         reduced_output: cute.Tensor,
         topk_indices: cute.Tensor,
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, or None
+        producer_done: Optional[cute.Tensor] = None,
     ):
         """The bf16 ``_reduce_cell`` over the self-validating plane: poll, reduce, zero.
 
@@ -890,7 +909,26 @@ class TopkReduce:
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             # Only the last CTA waits, so the reduce completes after the producer grid without holding its earlier waves.
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (cute.arch.thread_idx()[0] == Int32(0)):
-                cute.arch.griddepcontrol_wait()
+                self._wait_producer(producer_done)
+
+    @cute.jit
+    def _wait_producer(self, producer_done: Optional[cute.Tensor]) -> None:
+        """One thread: order the reduce's completion after the producer's unpolled outputs.
+
+        Without ``producer_arrivals`` that is the producer grid's completion. With it, every producer CTA
+        release-adds 1 once its stores are drained; acquiring the full count orders those stores before
+        this grid's completion without waiting for the producer's tail (reset, peer signals, exit). The
+        count is re-armed here: all arrivals of this call are in, and this grid never triggers its
+        dependents early, so nothing after it in the stream (the next call's producer included) starts
+        before this CTA exits."""
+        if cutlass.const_expr(self.producer_arrivals is None):
+            cute.arch.griddepcontrol_wait()
+        else:
+            counter = producer_done.iterator
+            while cute.arch.load(counter, Int32, sem="acquire", scope="gpu") < Int32(self.producer_arrivals):
+                nanosleep(32)
+            cute.arch.store(counter, Int32(0), sem="relaxed", scope="gpu")
+            cute.arch.fence_acq_rel_gpu()
 
     @cute.kernel
     def _reduce_bf16_ll_rmsnorm(
@@ -902,6 +940,7 @@ class TopkReduce:
         rmsnorm_weight: cute.Tensor,
         rmsnorm_eps: Float32,
         shared_term: Optional[cute.Tensor] = None,
+        producer_done: Optional[cute.Tensor] = None,
     ):
         """vLLM-local E2a on the polled plane: ``_reduce_bf16_ll`` of one token row per CTA (thread = one 8-wide
         hidden tile; same poll, top-k order and FP32 FMA form, same cell reset), then the stock vLLM ``rms_norm`` of
@@ -1036,7 +1075,7 @@ class TopkReduce:
             cute.copy(store_atom, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):
-                cute.arch.griddepcontrol_wait()
+                self._wait_producer(producer_done)
 
     @cute.kernel
     def _reduce_persistent(
