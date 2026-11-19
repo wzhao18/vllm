@@ -74,6 +74,24 @@
   - Outputs are bit-identical (same per-tile math and top-k reduction order; checked by an
     output fingerprint on every A/B point in `$W/hti/p2/megamoe-prefill`).
 
+- **S3** (vLLM-local, not upstream) in `sources/kernel_src/rubin/inference/mega/`
+  `block_scaled_swap_ab_fc12_epilogue.py` (on top of S2; local sha256 in the manifest below):
+  the FC1 SiTU core with one reciprocal per element.
+  - Why: the stock core evaluates three sigmoids (3 ex2 + 3 rcp MUFU ops per output element);
+    at the EP16 prefill shape (8192 tokens/rank, 56 experts/GPU, i6144) that is ~2.4G MUFU ops per
+    launch. Measured on VR200 (EP4 standing in for EP16, one 8192 launch, NVFP4): the main kernel
+    takes 1055 us with all-local routing and 1059 us with random routing; with the activation
+    removed (timing probe) 888 / 1007 us.
+  - What: with A = e^-g, B = e^(-2g/beta), C = e^(-2u/linear_beta),
+    out = beta*linear_beta*(1-B)(1-C) / ((1+A)(1+B)(1+C)); the same primitives (ex2.approx,
+    rcp.approx) in another order, and A = B^(beta/2) by multiplies when beta/2 is an integer
+    1..4 (Kimi K3 beta 4: 2 ex2 + 1 rcp). B, C are clamped at 1e9 so the denominator stays
+    finite (saturated region only). The SwiGLU core is unchanged.
+  - Measured (same probe shape): all-local 1054 -> 941 us, random routing 1059 -> 1006 us
+    (= the no-activation probe); rel-L2 vs the fp32 oracle 1.73e-3 (stock) vs 1.83e-3.
+    Not bit-identical to the stock core (different rounding order of the same approximations).
+  - When: every launch whose problem carries SiTU betas (no knob/env).
+
 - **DL (die-local expert streams)** (vLLM-local, not upstream), two parts. Independent of
   S2: the scheduler (DL) and the epilogue (S2) are separate compile-time impl fields, and
   either, both or neither may be set; the per-tile math is the same in every combination.
@@ -159,7 +177,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 fbea697f91fe5c5f1623568cb3ed45951905c2428bf2a49f330943ed910df4bc  sources/kernel_src/rubin/custom_mix_cga_helpers.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/mega/__init__.py
-61b09a92891324247afc6eaf2de67ae2750e14401e16ad9b0b063a100cef07d3  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+83dd01fdde2abcd169a795fb31aa913cfe941de0df5af9c8f3af8c6106b9ddcd  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 ed192f39cce199441a3116869898f0c1c275aeb0ac5218d809b8d3f0b68be7ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 e7f3aa713f90170f3f2c4b616af7a338ee4cb3cdef34621cb21e6ad8a90aabf6  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
