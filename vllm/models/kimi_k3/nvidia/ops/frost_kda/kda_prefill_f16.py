@@ -1078,13 +1078,15 @@ def tmaldg_warp(
 def conv_silu_bf16x2(a0: cutlass.Float32, a1: cutlass.Float32) -> cutlass.Int32:
     """SiLU of two conv accumulators packed to bf16x2 (low half = a0): the stock
     ``causal_conv1d_fn`` / ops/kda_qkv_conv expression, x / (1 + ex2(x * -log2 e)) with
-    ex2.approx.ftz and the full-range division, rounded to nearest even."""
+    ex2.approx.ftz and the full-range division (= x * rcp.approx(d) for d <= 2^126, as ops/kda_qkv_conv), rounded to nearest even."""
     return inline_ptx(
-        "{ .reg .f32 t0, t1, e0, e1, d0, d1, r0, r1; "
+        "{ .reg .f32 t0, t1, e0, e1, d0, d1, r0, r1; .reg .pred p0, p1; "
         "mul.f32 t0, $1, 0fBFB8AA3B; mul.f32 t1, $2, 0fBFB8AA3B; "
         "ex2.approx.ftz.f32 e0, t0; ex2.approx.ftz.f32 e1, t1; "
         "add.f32 d0, e0, 0f3F800000; add.f32 d1, e1, 0f3F800000; "
-        "div.full.f32 r0, $1, d0; div.full.f32 r1, $2, d1; "
+        "rcp.approx.ftz.f32 r0, d0; rcp.approx.ftz.f32 r1, d1; mul.f32 r0, $1, r0; mul.f32 r1, $2, r1; "
+        "setp.gt.f32 p0, d0, 0f7E800000; setp.gt.f32 p1, d1, 0f7E800000; "
+        "@p0 div.full.f32 r0, $1, d0; @p1 div.full.f32 r1, $2, d1; "
         "cvt.rn.bf16x2.f32 $0, r1, r0; }",
         write_only_types=[cutlass.Int32],
         read_only_args=[a0, a1],

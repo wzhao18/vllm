@@ -1454,7 +1454,47 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     and non_spec_query_start_loc is not None
                     and non_spec_state_indices_tensor is not None
                 )
-                if have_meta and kda_conv.qkv_conv_supported(
+                # cuDNN FROST with the short conv fused into its q/k/v loads
+                # (ops/frost_kda): no separate conv pass. Per-shape policy: the
+                # checkpoint-free, segment-plan-free FROST prefill whose cuDNN plan
+                # the fused kernels cover; q_ns/k_ns/v_ns stay the raw columns.
+                fused_frost = None
+                if (
+                    self._frost
+                    and checkpoint is None
+                    and (
+                        self._segscan_bufs is None
+                        or m.non_spec_query_start_loc_cpu is None
+                        or kda_segscan.make_plan(
+                            m.non_spec_query_start_loc_cpu,
+                            self.local_num_heads,
+                            mixed_qkv_ns.device,
+                            None,
+                            sms=self._segscan_bufs.sms,
+                            max_parts=self._segscan_bufs.n,
+                        )
+                        is None
+                    )
+                    and have_meta
+                    and kda_conv.qkv_conv_supported(
+                        mixed_qkv_ns,
+                        conv_weights,
+                        conv_state,
+                        self.local_projection_size,
+                    )
+                ):
+                    assert non_spec_query_start_loc is not None
+                    assert self.gate_lower_bound is not None
+                    fused_frost = specialized_prefill_kda.frost_conv_plan(
+                        mixed_qkv_ns.shape[0],
+                        non_spec_query_start_loc.shape[0] - 1,
+                        self.local_num_heads,
+                        self.gate_lower_bound,
+                        mixed_qkv_ns.device,
+                    )
+                if fused_frost is not None:
+                    pass
+                elif have_meta and kda_conv.qkv_conv_supported(
                     mixed_qkv_ns,
                     conv_weights,
                     conv_state,
@@ -1536,6 +1576,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         if self._segscan_bufs is not None
                         and m.non_spec_query_start_loc_cpu is not None
                         and flashkda_out.is_contiguous()
+                        and fused_frost is None
                         else None
                     )
                     if (
@@ -1611,6 +1652,33 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             recurrent_state=recurrent_state,
                             cu_seqlens=non_spec_query_start_loc,
                         )
+                    elif fused_frost is not None:
+                        assert non_spec_state_indices_tensor is not None
+                        assert has_initial_state is not None
+                        frost_out, last_recurrent_state = (
+                            specialized_prefill_kda.frost_conv_prefill(
+                                fused_frost,
+                                mixed_qkv_ns,
+                                conv_weights,
+                                conv_state,
+                                non_spec_state_indices_tensor,
+                                has_initial_state,
+                                g=g1_ns,
+                                beta=beta_ns,
+                                A_log=self.A_log,
+                                dt_bias=self.dt_bias,
+                                initial_state=initial_state,
+                                cu_seqlens=non_spec_query_start_loc,
+                            )
+                        )
+                        if (
+                            flashkda_out.data_ptr() == core_attn_out.data_ptr()
+                            and frost_out.shape[1] == core_attn_out.shape[1]
+                        ):
+                            prefill_core_out = frost_out
+                        else:
+                            flashkda_out.copy_(frost_out)
+                        core_attn_out_non_spec = flashkda_out
                     elif self._frost:
                         frost_out, last_recurrent_state = (
                             specialized_prefill_kda.frost_prefill(

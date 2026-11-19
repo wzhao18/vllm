@@ -44,7 +44,7 @@ def main():
     conv_w = (torch.randn(3 * HD, 4, dtype=torch.float32, device=dev) * 0.5).contiguous()
     lines = N + 5
     state0 = torch.randn(lines, 3 * HD, 3, dtype=bf, device=dev).float()
-    idx = torch.tensor([(5 + 3 * i) % lines for i in range(N)], dtype=torch.int32, device=dev)
+    idx = torch.tensor([1 + (5 + 3 * i) % (lines - 1) for i in range(N)], dtype=torch.int32, device=dev)
     has_init = torch.tensor([i % 2 == 0 for i in range(N)], dtype=torch.bool, device=dev)
     g = torch.randn(T, H, D, dtype=bf, device=dev) * 0.5
     beta = torch.randn(T, H, dtype=bf, device=dev)

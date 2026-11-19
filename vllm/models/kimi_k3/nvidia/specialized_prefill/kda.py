@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm.models.kimi_k3.nvidia.ops import kda_segscan
+from vllm.models.kimi_k3.nvidia.ops import kda_conv, kda_segscan
 
 _FROST_MIN_VERSION = (1, 33)
 _frost_fn = None
@@ -88,6 +88,58 @@ def frost_prefill(
         plan_name="kda_frost",
     )[:2]
     return o.view(1, T, H, D), final_state
+
+
+def frost_conv_plan(
+    tokens: int, num_seqs: int, heads: int, lower_bound: float, device
+):
+    """The FROST plan with the short conv fused into its q/k/v loads
+    (ops/frost_kda) at this batch shape, or None where cuDNN plans a launch the
+    fused kernels do not cover (piece chains); the caller then runs qkv_conv and
+    frost_prefill."""
+    from vllm.models.kimi_k3.nvidia.ops.frost_kda.launcher import (
+        frost_conv_plan as _plan,
+    )
+
+    plan = _plan(tokens, num_seqs, heads, 128, lower_bound, device)
+    return plan if plan.supported else None
+
+
+def frost_conv_prefill(
+    plan,
+    qkv: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Short conv + KDA chunked prefill of the raw in_proj Q|K|V columns qkv
+    (T, 3 H 128): causal_conv1d_fn + frost_prefill in one FROST launch
+    (bit for bit the unfused result), then the conv state update."""
+    T, H = g.shape[1], g.shape[2]
+    slot = torch.where(has_initial_state, state_indices, -1).to(torch.int32)
+    o, final_state = plan(
+        qkv,
+        g.reshape(T, H, 128).contiguous(),
+        beta.reshape(T, H),
+        A_log,
+        dt_bias,
+        initial_state,
+        cu_seqlens,
+        conv_weight,
+        conv_state,
+        slot,
+    )
+    kda_conv.qkv_conv_state(
+        qkv, conv_state, cu_seqlens, state_indices, has_initial_state
+    )
+    return o.view(1, T, H, 128), final_state
 
 
 def o_norm_mxfp8(
