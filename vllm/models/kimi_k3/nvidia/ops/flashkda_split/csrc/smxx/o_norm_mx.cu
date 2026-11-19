@@ -129,7 +129,11 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
 // rcp.approx (equal to div.full for 1 + e <= 2^126; a row with a larger 1 + e is redone
 // with div.full). Bit for bit the v1 output.
 constexpr int kOStages = 4;
-constexpr int kOConsumerWarps = 12;
+#ifndef K3_ONORM_WARPS
+#define K3_ONORM_WARPS 8
+#endif
+constexpr int kOConsumerWarps = K3_ONORM_WARPS;
+constexpr int kOSteps = (96 + 4 * kOConsumerWarps - 1) / (4 * kOConsumerWarps);  // 4-row steps per warp at H = 96
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -292,10 +296,11 @@ __global__ void __launch_bounds__((kOConsumerWarps + 1) * 32, 1)
     const int s = it % kOStages;
     mbar_wait(&full[s], (it / kOStages) & 1);
     const uint8_t* stage = smem + s * 2 * row_bytes;
-    for (int h0 = warp * 4; h0 < heads; h0 += 2 * kOConsumerWarps * 4) {
-      o_norm_step(stage, row_bytes, h0, heads, t, sub, part, lane, w, a);
-      if (h0 + kOConsumerWarps * 4 < heads)
-        o_norm_step(stage, row_bytes, h0 + kOConsumerWarps * 4, heads, t, sub, part, lane, w, a);
+    for (int h0 = warp * 4; h0 < heads; h0 += kOSteps * kOConsumerWarps * 4) {
+#pragma unroll
+      for (int j = 0; j < kOSteps; ++j)
+        if (j == 0 || h0 + j * kOConsumerWarps * 4 < heads)
+          o_norm_step(stage, row_bytes, h0 + j * kOConsumerWarps * 4, heads, t, sub, part, lane, w, a);
     }
     mbar_arrive(&empty[s]);
   }
