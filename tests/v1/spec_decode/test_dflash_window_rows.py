@@ -117,10 +117,15 @@ def test_trim_context_metadata():
         slot_mapping=torch.arange(3004),
     )
     p = _proposer(2048)
+    p.device = torch.device("cuda")
+    p._context_stage = None
+    cad.slot_mapping = cad.slot_mapping.cuda()
     rows = p._window_rows(_cad(qlens, seq_lens))
-    index = torch.from_numpy(rows)
-    out = DFlashProposer.trim_context_metadata(cad, rows, index)
+    index, out = p.trim_context(cad, rows)
+    torch.cuda.synchronize()
+    assert torch.equal(index.cpu(), torch.from_numpy(rows))
+    assert out.query_start_loc.cpu().tolist() == [0, 2052, 2056]
     assert out.query_start_loc_cpu.tolist() == [0, 2052, 2056]
     assert out.num_actual_tokens == 2056 and out.max_query_len == 2052
-    assert torch.equal(out.slot_mapping, torch.from_numpy(rows))
+    assert torch.equal(out.slot_mapping.cpu(), torch.from_numpy(rows))
     assert torch.equal(out.seq_lens, cad.seq_lens)

@@ -4997,14 +4997,9 @@ class GPUModelRunner(
         if rows is None:
             hidden = torch.cat([h[:num_tokens] for h in aux_hidden_states], dim=-1)
             return target_token_ids, target_positions, hidden, cad
-        index = torch.from_numpy(rows).pin_memory().to(self.device, non_blocking=True)
+        index, cad = self.drafter.trim_context(cad, rows)
         hidden = torch.cat([h[index] for h in aux_hidden_states], dim=-1)
-        return (
-            target_token_ids[index],
-            target_positions[..., index],
-            hidden,
-            self.drafter.trim_context_metadata(cad, rows, index),
-        )
+        return target_token_ids[index], target_positions[..., index], hidden, cad
 
     @instrument(span_name="Loading (GPU)")
     def load_model(

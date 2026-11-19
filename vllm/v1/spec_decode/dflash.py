@@ -38,6 +38,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
         )
         # Draft sliding window (None: full attention); resolved on first use.
         self._context_window_cache: int | None | bool = False
+        # Pinned / device staging of the kept context rows (trim_context).
+        self._context_stage: tuple | None = None
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
@@ -206,9 +208,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
     def context_rows(self, cad: CommonAttentionMetadata) -> np.ndarray | None:
         """Rows of the step's draft context to keep (see ``_window_rows``),
-        or None to keep all; never trims inside a CUDA graph capture."""
-        if torch.cuda.is_current_stream_capturing():
-            return None
+        or None to keep all."""
         rows = self._window_rows(cad)
         if rows is not None:
             logger.info_once(
@@ -221,28 +221,52 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
         return rows
 
-    @staticmethod
-    def trim_context_metadata(
-        cad: CommonAttentionMetadata, rows: np.ndarray, index: torch.Tensor
-    ) -> CommonAttentionMetadata:
-        """``cad`` restricted to ``rows`` (``index``: the same rows on device)."""
+    def trim_context(
+        self, cad: CommonAttentionMetadata, rows: np.ndarray
+    ) -> tuple[torch.Tensor, CommonAttentionMetadata]:
+        """The kept rows on device and ``cad`` restricted to them.
+
+        Host values reach the device through persistent pinned staging
+        buffers (stable addresses, so the copies may also sit in a captured
+        graph), reused only after the previous step's copies completed."""
         qsl = cad.query_start_loc_cpu[: cad.num_reqs + 1]
         counts = np.diff(np.searchsorted(rows, qsl.numpy()))
-        qsl_cpu = torch.zeros(cad.num_reqs + 1, dtype=torch.int32)
-        qsl_cpu[1:] = torch.from_numpy(np.cumsum(counts)).to(torch.int32)
+        n, nq = int(rows.size), cad.num_reqs + 1
+        stage = self._context_stage
+        if stage is None or stage[0].shape[0] < n or stage[2].shape[0] < nq:
+            rows_cap = max(n, int(qsl[-1]))
+            stage = (
+                torch.empty(rows_cap, dtype=torch.int64, pin_memory=True),
+                torch.empty(rows_cap, dtype=torch.int64, device=self.device),
+                torch.empty(max(nq, 2), dtype=torch.int32, pin_memory=True),
+                torch.empty(max(nq, 2), dtype=torch.int32, device=self.device),
+                torch.cuda.Event(),
+            )
+            self._context_stage = stage
+        capturing = torch.cuda.is_current_stream_capturing()
+        if stage is not None and not capturing:
+            stage[4].synchronize()
+        rows_h, rows_d, qsl_h, qsl_d, done = stage
+        rows_h[:n].numpy()[:] = rows
+        qsl_h[0] = 0
+        qsl_h[1:nq].numpy()[:] = np.cumsum(counts)
+        index = rows_d[:n]
+        index.copy_(rows_h[:n], non_blocking=True)
+        qsl_d[:nq].copy_(qsl_h[:nq], non_blocking=True)
+        if not capturing:
+            done.record()
         total = int(qsl[-1])
-        return replace(
+        trimmed = replace(
             cad,
-            query_start_loc=qsl_cpu.pin_memory().to(
-                cad.query_start_loc.device, non_blocking=True
-            ),
-            query_start_loc_cpu=qsl_cpu,
-            num_actual_tokens=int(rows.size),
+            query_start_loc=qsl_d[:nq],
+            query_start_loc_cpu=qsl_h[:nq].clone(),
+            num_actual_tokens=n,
             max_query_len=int(counts.max()),
             slot_mapping=cad.slot_mapping[index]
             if cad.slot_mapping.shape[0] >= total
             else cad.slot_mapping,
         )
+        return index, trimmed
 
     @override
     def set_inputs_first_pass(
