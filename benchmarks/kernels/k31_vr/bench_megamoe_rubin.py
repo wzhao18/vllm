@@ -158,6 +158,14 @@ def parse_args():
     )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
     p.add_argument(
+        "--active-experts",
+        type=int,
+        default=None,
+        help="random routing over A active experts per rank, split over the two die "
+        "halves of the local experts (the step slice's EP-size emulation: 896 experts "
+        "at EP4 with A=28 is 224 local slots, 28 active)",
+    )
+    p.add_argument(
         "--die-local",
         action="store_true",
         help="decode-server placement: die_split schedule + experts homed per die half "
@@ -361,11 +369,18 @@ def make_shared(W, shape, rows, seed, device):
     return args, ref
 
 
-def make_routes(n, num_experts, topk, world, rank, kind, seed, device, ids_dtype):
+def make_routes(
+    n, num_experts, topk, world, rank, kind, seed, device, ids_dtype, active=None
+):
     g = torch.Generator(device=device)
     g.manual_seed(seed * 7919 + rank)
     if kind == "random":
         scores = torch.rand((n, num_experts), generator=g, device=device)
+        if active is not None:
+            local = torch.arange(num_experts, device=device) % (num_experts // world)
+            half = num_experts // world // 2
+            on = (local < active // 2) | ((local >= half) & (local < half + active // 2))
+            scores = scores.masked_fill(~on, -1.0)
         ids = scores.topk(topk, dim=1).indices
     else:
         # balanced: token t's j-th route goes to rank (t + j) % W, distinct local
@@ -646,7 +661,7 @@ def main():
         ).to(torch.bfloat16)
         ids, wts = make_routes(
             n, problem.num_experts, problem.top_k, world, rank, args.routing,
-            args.seed + n, device, args.ids_dtype,
+            args.seed + n, device, args.ids_dtype, args.active_experts,
         )
         check_routes(ids, problem.num_experts)
         out = torch.empty(
