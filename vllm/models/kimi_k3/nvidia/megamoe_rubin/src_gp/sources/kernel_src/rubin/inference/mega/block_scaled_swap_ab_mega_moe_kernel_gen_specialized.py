@@ -322,16 +322,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self._resolve_shared_expert(problem_desc, impl_desc)
 
         if self.die_aware != "off" and self.promised_launchable_sm_count <= self.largest_die_sm_count:
-            # Requiring more CTAs than one die can hold guarantees both dies only under K6's full-residency premise.
-            # n_split needs this for liveness; expert_half imposes the same guard for locality.
-            needs = (
-                "n_split needs more than {count} resident CTAs (K6: a cluster on each die)"
-                if self.n_split
-                else "expert_half is only supported with more than {count} resident CTAs (a cluster on each die; "
-                "liveness does not need it, the die-aware placement does)"
-            )
+            # Requiring more CTAs than one die can hold guarantees both dies only under K6's full-residency premise,
+            # which both die-aware forms need for liveness (no cluster steals the other die's FC1).
+            needs = "{form} needs more than {count} resident CTAs (K6: a cluster on each die)"
             raise ValueError(
-                f"{needs.format(count=self.largest_die_sm_count)}, got {self.launch_cluster_count} x "
+                f"{needs.format(form=self.die_aware, count=self.largest_die_sm_count)}, "
+                f"got {self.launch_cluster_count} x "
                 f"{self.cluster_size}."
             )
 
