@@ -170,6 +170,12 @@ def stamps(lens, H, flags=1):
     n = min(80, (lens[-1] + 63) // 64 - 1)
     step = [(st[c + 1, 0] - st[c, 0]).item() for c in range(4, n)]
     seg = lambda a, b: sum((st[c, b] - st[c, a]).item() for c in range(4, n)) / (n - 4)  # noqa: E731
+    ps = dbg[16 + 96 * 8:16 + 96 * 8 + 48 * 4].view(48, 4).cpu()
+    m = min(n, 47)
+    pseg = lambda a, b: sum((ps[c, b] - ps[c, a]).item() for c in range(4, m)) / (m - 4)  # noqa: E731
+    print(f"state pass CTA0: start->LDTM done {sum((ps[c, 0] - st[c, 6]).item() for c in range(4, m)) / (m - 4):.0f}, "
+          f"cvt+STS half {pseg(0, 1):.0f}, ->before wait::st {pseg(1, 2):.0f}, wait::st {pseg(2, 3):.0f}, "
+          f"proxy fence+arrive {sum((st[c, 7] - ps[c, 3]).item() for c in range(4, m)) / (m - 4):.0f}", flush=True)
     print(f"stamps CTA0: chain step {sum(step) / len(step):.0f} clk; wait->MMA1 {seg(0, 1):.0f}, "
           f"MMA1->MMA2/3 issue (W read + vnew) {seg(1, 2):.0f}, MMA2/3 issue {seg(2, 3):.0f}; "
           f"MMA1 issue->vnew start {seg(1, 4):.0f}, vnew {seg(4, 5):.0f}, MMA2/3 issue->state start "

@@ -265,6 +265,9 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
     auto sstamp = [&](int c, int slot) {
       if (sst && c < 96) dbg[16 + c * 8 + slot] = clock64();
     };
+    auto pstamp = [&](int c, int i) {
+      if (sst && c < 48) dbg[16 + 96 * 8 + c * 4 + i] = clock64();
+    };
     auto put_sb = [&](int c0, uint32_t const* pk) {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
@@ -380,12 +383,14 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
         uint32_t sv[32];
         K2TC_LD32(trow + kColS + c0, sv);
         tc_wait_ld();
+        if (b == 0) pstamp(c, 0);
         if (more) {
           uint32_t pk[16];
 #pragma unroll
           for (int i = 0; i < 16; ++i)
             pk[i] = pack_bf16(__uint_as_float(sv[2 * i]), __uint_as_float(sv[2 * i + 1]));
           put_sb(c0, pk);
+          if (b == 0) pstamp(c, 1);
 #pragma unroll
           for (int i = 0; i < 32; ++i) sv[i] = __float_as_uint(__uint_as_float(sv[i]) * gn);
           K2TC_ST16(trow + kColS + c0, sv);
@@ -397,8 +402,10 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
         }
       }
       if (more) {
+        pstamp(c, 2);
         tc_wait_st();
         tc_fence_before();
+        pstamp(c, 3);
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncwarp();
         sstamp(c, 7);
