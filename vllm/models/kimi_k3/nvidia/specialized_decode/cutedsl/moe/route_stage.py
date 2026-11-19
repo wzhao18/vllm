@@ -615,10 +615,13 @@ class RouteStage:
         )
         return rt, session, n
 
-    def launch(self, staged, output_rmsnorm=None) -> torch.Tensor:
+    def launch(self, staged, output_rmsnorm=None, shared=None):
         """MegaMoE on a :meth:`stage`-d session: its BF16 ``[n, latent]`` output
         (``output_rmsnorm`` applied in its reduce), as ``experts(latent,
-        topk_weights, topk_ids, output_rmsnorm=...)``."""
+        topk_weights, topk_ids, output_rmsnorm=...)``. ``shared``: the layer's
+        ``FusedSharedArgs`` on a fused-shared bucket; the result is then
+        ``(routed, shared_out)``. A fused-shared bucket called without it runs
+        its shared tiles on the warmed operands and drops that output."""
         from ....megamoe_rubin.experts import _rmsnorm_args
 
         rt, session, n = staged
@@ -628,9 +631,16 @@ class RouteStage:
             raise RuntimeError(f"{experts.prefix}: Rubin MegaMoE not prepared.")
         out = torch.empty((n, rt.problem.hidden), dtype=torch.bfloat16, device=session.topk_idx.device)
         rmsnorm = None if output_rmsnorm is None else _rmsnorm_args(output_rmsnorm)
-        session.launch(weights, out, experts.ep_tokens(n), rmsnorm)
+        fused = shared
+        if session.cfg.shared is not None and shared is None:
+            fused = getattr(rt, "_warm_shared", None)
+            if fused is None:
+                raise RuntimeError(f"{experts.prefix}: this bucket fuses the shared expert: pass shared.")
+        session.launch(weights, out, experts.ep_tokens(n), rmsnorm, fused)
         owner = experts.prefix
         if rt._poll_owner in (None, owner):
             rt._poll_owner = owner
             rt.poll_route_errors()
+        if shared is not None:
+            return out, session.shared_output[:n]
         return out

@@ -219,14 +219,6 @@ def popc(value):
 
 
 @asm()
-def tmem_ld32(taddr):
-    """tcgen05.ld 32x32b.x32: 32 columns of this warp's 32 TMEM lanes (one per thread)."""
-    regs = ",".join(f"${i}" for i in range(32))
-    code = "tcgen05.ld.sync.aligned.32x32b.x32.b32 {" + regs + "}, [$32];"
-    return code, ",".join(["=f"] * 32) + ",r,~{memory}", (Int32(taddr),), (Float32,) * 32
-
-
-@asm()
 def tmem_ld16(taddr):
     """tcgen05.ld 32x32b.x16: 16 columns of this warp's 32 TMEM lanes (one per thread)."""
     regs = ",".join(f"${i}" for i in range(16))
@@ -240,14 +232,6 @@ def tmem_wait_n(*vals):
     n = len(vals)
     cons = ",".join(["=f"] * n) + "," + ",".join(str(i) for i in range(n))
     return "tcgen05.wait::ld.sync.aligned;", cons, tuple(vals), (Float32,) * n
-
-
-@asm()
-def tmem_wait32(*vals):
-    """tcgen05.wait::ld, with the loaded registers tied through it (their uses cannot
-    move above the wait)."""
-    cons = ",".join(["=f"] * 32) + "," + ",".join(str(i) for i in range(32))
-    return "tcgen05.wait::ld.sync.aligned;", cons, tuple(vals), (Float32,) * 32
 
 
 @asm(Uint32, pure=True)
@@ -864,18 +848,28 @@ class IndexerScore:
         BF16 logits of this thread's key for its two tokens, stored (mode < PUBLISH,
         plus the histograms) or published. ``edge``: mask keys past the row ends
         and the repeated tile of an odd count."""
+        # head-half pipeline: the TMEM load of the next half (heads 16-31 of this
+        # stage, then heads 0-15 of the next stage) is issued before this half's
+        # math; a stage is released as soon as its last half landed
+        cute.arch.mbarrier_wait(acc_full, ph)
+        h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
+        h0n = h0
         for st in cutlass.range_constexpr(ACC_STAGES):
             t = t_hi - st
-            cute.arch.mbarrier_wait(acc_full + st, ph)
             col = tmem_q + st * N
-            fa = tmem_ld32(col)
-            fb = tmem_ld32(col + HEADS)
-            fa = tmem_wait32(*fa)
-            fb = tmem_wait32(*fb)
+            if cutlass.const_expr(st > 0):
+                h0 = tmem_wait_n(*h0n)
+            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
+            ss = self.reduce_half(h0, w, None, 0)
+            h1 = tmem_wait_n(*h1)
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(acc_empty + st)
-            r = self.reduce2((fa, fb), w[0], w[1])
+            if cutlass.const_expr(st + 1 < ACC_STAGES):
+                cute.arch.mbarrier_wait(acc_full + st + 1, ph)
+                h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
+            ss = self.reduce_half(h1, w, ss, HEADS // 2)
+            r = self.combine2(ss)
             if cutlass.const_expr(edge):
                 kidx = t * TILE + key_in_tile
                 if kidx >= end0 or t >= ntiles:
@@ -901,20 +895,28 @@ class IndexerScore:
         return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
 
     @cute.jit
-    def reduce2(self, buf, w0, w1):
-        """BF16 logits of two tokens (packed: token 0 low) at stock precision: per
-        token, s0 takes head pairs (4i, 4i + 1), s1 (4i + 2, 4i + 3), each head term
-        relu-rounded to BF16 and BF16x2-FMA'd with its weight; then
-        (s0.lo + s1.lo) + (s0.hi + s1.hi)."""
-        ss = [[Uint32(0), Uint32(0)] for _ in range(2)]
-        ws = [w0, w1]
-        for h in cutlass.range_constexpr(0, HEADS, 4):
+    def reduce_half(self, buf, w, ss, h0: cutlass.Constexpr):
+        """Heads h0 .. h0 + 15 of both tokens (buf: token 0's 16 values, then token
+        1's) into the running BF16 logit sums at stock precision: per token, s0
+        takes head pairs (4i, 4i + 1), s1 (4i + 2, 4i + 3), each head term
+        relu-rounded to BF16 and BF16x2-FMA'd with its weight."""
+        if cutlass.const_expr(ss is None):
+            ss = [[Uint32(0), Uint32(0)] for _ in range(2)]
+        else:
+            ss = [list(x) for x in ss]
+        for h in cutlass.range_constexpr(0, HEADS // 2, 4):
             for j in cutlass.range_constexpr(2):
-                fr = buf[j]
-                ss[j][0] = fma_bf16x2(relu_bf16x2(fr[h], fr[h + 1]), ws[j][h // 2], ss[j][0])
+                b = 16 * j + h
+                k = (h0 + h) // 2
+                ss[j][0] = fma_bf16x2(relu_bf16x2(buf[b], buf[b + 1]), w[j][k], ss[j][0])
                 ss[j][1] = fma_bf16x2(
-                    relu_bf16x2(fr[h + 2], fr[h + 3]), ws[j][h // 2 + 1], ss[j][1]
+                    relu_bf16x2(buf[b + 2], buf[b + 3]), w[j][k + 1], ss[j][1]
                 )
+        return ss
+
+    @cute.jit
+    def combine2(self, ss):
+        """(s0 + s1) per token, then low + high half: both tokens' BF16 logits."""
         p0 = add_bf16x2(ss[0][0], ss[0][1])
         p1 = add_bf16x2(ss[1][0], ss[1][1])
         return add_bf16x2(prmt(p0, p1, 0x5410), prmt(p0, p1, 0x7632))
