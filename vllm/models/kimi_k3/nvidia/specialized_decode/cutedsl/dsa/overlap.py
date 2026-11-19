@@ -20,13 +20,16 @@ from functools import cache
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32
+from cutlass import BFloat16, Float32, Int64
 
 from ..common.policy import batch_table
 from ..common.primitives import (
     alloc,
     at,
+    asm,
+    at,
     bf16x2,
+    div_rn,
     fma,
     fma2,
     launch,
@@ -34,6 +37,7 @@ from ..common.primitives import (
     load_volatile,
     load_words,
     mul2,
+    pack_fp8,
     published,
     query_norm_rsqrt,
     store_words,
@@ -127,14 +131,32 @@ def index_stream(device_index):
     return torch.cuda.Stream(device=device_index, priority=highest)
 
 
+@asm(Float32, pure=True)
+def kv_norm_rsqrt(total: Float32, eps: Float32):
+    """The stock rms_norm's ``rsqrtf(variance / 512 + epsilon)`` (kv_a, 512 wide)."""
+    code = "{ .reg .f32 mean; div.rn.f32 mean,$1,0f44000000; "
+    code += "add.f32 mean,mean,$2; rsqrt.approx.f32 $0,mean; }"
+    return code, "=f,f,f", (total, eps)
+
+
 class QueryNorm:
     """The q_a RMSNorm of ``batch`` rows of the packed projection -> q_c [B, 1536]
-    BF16, exactly as MlaQuery (``heads``) computes it for the same batch."""
+    BF16, exactly as MlaQuery (``heads``) computes it for the same batch.
 
-    def __init__(self, heads: int, batch: int):
-        self.batch = batch
+    ``insert`` (local query rows, per-tensor FP8 MLA cache): also this rank's KV
+    insert, the stock ``rms_norm(kv_a)`` + ``concat_and_cache_mla(..., "fp8")`` of
+    ``local_query.LocalQuery`` (two launches on its side stream before): each row's
+    kv_a RMSNorm (BF16 ``x * rstd * w``, the sum of squares in another FP32 order),
+    divided by k_scale with the row's k_pe, to FP8 E4M3 (satfinite) at its slot
+    (slot < 0: another rank's token, skipped). Extra operands: the kv_a norm weight,
+    the cache [pages, block, 576] bytes, the slots, k_scale [1] and the kv_a eps."""
+
+    def __init__(self, heads: int, batch: int, insert: bool = False):
+        self.batch, self.insert = batch, insert
         self.wide = batch >= TILED_FROM[heads]
         self.grid = -(-batch // 8) if self.wide else batch
+        if insert and not self.wide:
+            raise ValueError(f"QueryNorm KV insert: tiled rows only, not {batch}")
 
     @cute.jit
     def __call__(self, *args):
@@ -177,7 +199,7 @@ class QueryNorm:
     @cute.kernel
     def tiled(self, args):
         """One row per warp: 48 columns per lane, MlaQuery.tiled's packed pairs."""
-        qkv, w_qa, qc, eps = args
+        qkv, w_qa, qc, eps = args[:4]
         tid, _, _ = cute.arch.thread_idx()
         tile, _, _ = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
@@ -185,6 +207,10 @@ class QueryNorm:
         gamma = []
         for i in cutlass.range_constexpr(6):
             gamma += list(load_bf16x8(w_qa.iterator + 256 * i + 8 * lane))
+        kv_gamma = []
+        if cutlass.const_expr(self.insert):
+            for i in cutlass.range_constexpr(2):
+                kv_gamma += list(load_bf16x8(args[4].iterator + 256 * i + 8 * lane))
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         if row < self.batch:
@@ -208,6 +234,46 @@ class QueryNorm:
                     y = mul2(mul2(x, (rr, rr)), (gamma[e], gamma[e + 1]))
                     words.append(bf16x2(*y))
                 store_words(at(qc, row, 256 * i + 8 * lane), tuple(words))
+            if cutlass.const_expr(self.insert):
+                self.insert_kv(args, row, lane, kv_gamma)
+
+    @cute.jit
+    def insert_kv(self, args, row, lane, kv_gamma):
+        """This rank's KV row of ``row`` into the FP8 cache (class docstring): lane
+        l normalizes kv_a columns 256 i + 8 l + [0, 8), i < 2; lanes 0-7 carry k_pe."""
+        qkv, cache, slots, k_scale, eps = args[0], *args[5:9]
+        slot = Int64(slots[row])
+        if slot >= 0:
+            values: list = []
+            for i in cutlass.range_constexpr(2):
+                source = at(qkv, row, 1536 + 256 * i + 8 * lane)
+                for word in load_words(source, count=4, mutable=True):
+                    values += list(unpack_bf16(word))
+            total = Float32(0)
+            for e in cutlass.range_constexpr(16):
+                total = fma(values[e], values[e], total)
+            rr = kv_norm_rsqrt(warp_sum(total), eps)
+            ks = k_scale[0]
+            page, offset = slot // cache.shape[1], slot % cache.shape[1]
+            for i in cutlass.range_constexpr(2):
+                words = []
+                for e in cutlass.range_constexpr(8 * i, 8 * i + 8, 4):
+                    quads = [
+                        div_rn(Float32(BFloat16(values[e + k] * rr * kv_gamma[e + k])), ks)
+                        for k in range(4)
+                    ]
+                    words.append(pack_fp8(tuple(quads)))
+                store_words(at(cache, page, offset, 256 * i + 8 * lane), tuple(words))
+            if lane < 8:
+                pe: list = []
+                for word in load_words(at(qkv, row, 2048 + 8 * lane), count=4,
+                                       mutable=True):  # fmt: skip
+                    pe += list(unpack_bf16(word))
+                low = pack_fp8((div_rn(pe[0], ks), div_rn(pe[1], ks),
+                                div_rn(pe[2], ks), div_rn(pe[3], ks)))  # fmt: skip
+                high = pack_fp8((div_rn(pe[4], ks), div_rn(pe[5], ks),
+                                 div_rn(pe[6], ks), div_rn(pe[7], ks)))  # fmt: skip
+                store_words(at(cache, page, offset, 512 + 8 * lane), (low, high))
 
 
 class QueryWait:
