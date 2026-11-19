@@ -26,7 +26,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import mqa_logits_mx_inputs
 
 _KEY = "kimi_k3_pidx"
-GROUP_ROWS = 8192
+GROUP_ROWS = 16384
 
 
 def applicable(
