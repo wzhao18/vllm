@@ -107,7 +107,8 @@ def test_frost_prefill_in_place_matches_gathered():
     A_log = torch.randn(H, device="cuda") * 0.5
     dt_bias = torch.randn(H * D, device="cuda") * 0.1
     pool = torch.randn(7, H, D, D, device="cuda") * 0.1
-    idx = torch.tensor([5, 2, 3], dtype=torch.int32, device="cuda")
+    # a strided view, as the scheduler's index tensor can be
+    idx = torch.tensor([5, 0, 2, 0, 3, 0], dtype=torch.int32, device="cuda")[::2]
     has_init = torch.tensor([True, False, True], device="cuda")
     h0 = pool[idx.long()].clone()
     h0[~has_init] = 0
