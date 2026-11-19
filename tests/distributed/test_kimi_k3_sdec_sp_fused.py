@@ -24,6 +24,7 @@ re-arms its box.
 """
 
 import os
+import sys
 import time
 import zlib
 
@@ -199,8 +200,14 @@ def _worker(env: dict[str, str]) -> None:
         if rank == 0:
             print("worst ulp ratios", worst)
         dist.barrier()
-    finally:
-        dist.destroy_process_group()
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)  # (a peer may wait in a collective: never hang the test)
+    dist.destroy_process_group()
 
 
 def _run(world):
