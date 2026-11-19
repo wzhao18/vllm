@@ -133,10 +133,12 @@ RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
 
 # Prefill-sized NVFP4 inference buckets (at least RUBIN_DEDUP_MIN_TOKENS tokens per rank:
 # the P3-16 8192-token sub-call) run the refreshed inference kernel with the deduplicated
-# combine (variant inference_dedup, token back from standalone
-# warps): one BF16 row per (owner rank, token) crosses NVLink instead of one per route
-# (EP16 top-16: ~10.3 instead of 16 rows per token). Measured on VR200 (NVFP4, 56
-# experts/GPU, 2 x 8192 tokens/rank, random routing): EP4 2110 -> 1893 us.
+# combine and two epilogue warpgroups (variant inference_dedup_wg2, token back from
+# standalone warps): one BF16 row per (owner rank, token) crosses NVLink instead of one
+# per route (EP16 top-16: ~10.3 instead of 16 rows per token), and the FC1/FC2 epilogue
+# (the compute-side bound) runs on 8 warps. Measured on VR200 (NVFP4, 56 experts/GPU,
+# 2 x 8192 tokens/rank, random routing): EP4 2110 (shipped) -> 1893 (dedup) -> 1736 us.
+RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
 RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
 RUBIN_DEDUP_MIN_TOKENS = 4096
 RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
@@ -309,7 +311,7 @@ def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
         return bucket
     return dataclasses.replace(
         bucket,
-        variant="inference_dedup",
+        variant=RUBIN_DEDUP_VARIANT,
         knobs=dataclasses.replace(
             bucket.knobs, token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE
         ),

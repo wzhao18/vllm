@@ -284,6 +284,15 @@ p50 (682 vs 731 us).
   ``src`` SiTU core (one reciprocal per element, ex2/rcp only) instead of FlashInfer main's
   ``situ_pair_tanh_approx`` (two ``tanh.approx.f32`` per element, ~2^-11 relative error, lower precision than
   the a368c5f66 sigmoid form). ``use_tanh_sigmoid`` and SwiGLU keep the upstream code.
+- **W2 / W2S** (vLLM-local): two epilogue warpgroups on the dedup combine. Upstream allows
+  ``epilogue_warpgroups=2`` only with ``epi_warps`` token back (no dedup).
+  ``block_scaled_swap_ab_fc12_epilogue_dedup.py``: each warpgroup stages and pushes its own token half of every
+  FC2 subtile (``split_token_halves`` store mapping, per-warpgroup barrier, as the upstream UBLK path);
+  ``block_scaled_swap_ab_mega_moe_kernel.py``: the 2-warpgroup check admits the dedup combine with
+  ``reuse_dispatch_warps`` (16 warps, W2) or ``standalone_warps`` (W2S: 20 warps, token-back warps 16-19,
+  ``token_warp_register_count`` 56 for warps 12-19 and 144 epilogue registers; setmaxnreg moves registers only
+  inside the CTA's 640 x 96 launch allocation, so a 160-register epilogue deadlocks). Variant
+  ``inference_dedup_wg2``. Same per-row math and output bits as the 1-warpgroup dedup kernel.
 - **inference_dedup** (``config.Variant``): the refreshed inference kernel ``RubinInferenceMegaMoE`` with
   ``combine_dedup`` (owner-side FP32 pre-reduce of a token's local expert rows, one BF16 row per (source
   rank, token), ``TopkReduceDedup`` sums the rank rows in ascending rank order; routing weights at FC1). The

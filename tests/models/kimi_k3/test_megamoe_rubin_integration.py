@@ -985,14 +985,14 @@ def test_prefill_worker_nvfp4_runs_dedup_combine(world):
     problem = C.RubinMoeProblem(quant_kind="nvfp4")
     main, _ = X.select_rubin_bucket(problem, world, 8192)
     (bucket,), _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=True)
-    assert bucket.variant == "inference_dedup"
+    assert bucket.variant == X.RUBIN_DEDUP_VARIANT
     assert bucket.knobs.token_back_mode == X.RUBIN_DEDUP_TOKEN_BACK_MODE
     assert dataclasses.replace(bucket.knobs, token_back_mode="epi_warps") == (
         dataclasses.replace(main.knobs, token_back_mode="epi_warps")
     )
     C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=world)
     decode, _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=False)
-    assert [b.variant for b in decode] == ["inference", "inference_dedup"]
+    assert [b.variant for b in decode] == ["inference", X.RUBIN_DEDUP_VARIANT]
     assert decode[0].max_tokens < X.RUBIN_DEDUP_MIN_TOKENS
     with pytest.raises(ValueError, match="combine warps"):
         C.RubinMoeConfig.make(
