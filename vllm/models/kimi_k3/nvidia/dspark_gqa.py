@@ -54,6 +54,7 @@ from vllm.models.kimi_k3.nvidia.dspark_mla import (
     _CONTEXT_ROW_SHARD_MIN_ROWS,
     _aux_rows,
 )
+from vllm.models.kimi_k3.nvidia.ops import prefill_glue
 
 logger = init_logger(__name__)
 
@@ -171,7 +172,13 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
         return self.normalize(projected)
 
     def normalize(self, rows: torch.Tensor) -> torch.Tensor:
-        """``hidden_norm`` with the stock context step's kernel (``ops.rms_norm``)."""
+        """``hidden_norm`` with the stock context step's kernel (``ops.rms_norm``),
+        or its bitwise-equal prefill replay on long context steps."""
+        weight = self.hidden_norm.weight.data
+        if prefill_glue.use_rms_norm(rows, weight):
+            return prefill_glue.rms_norm(
+                rows, weight, self.hidden_norm.variance_epsilon
+            )
         out = torch.empty_like(rows)
         ops.rms_norm(
             out, rows, self.hidden_norm.weight.data, self.hidden_norm.variance_epsilon

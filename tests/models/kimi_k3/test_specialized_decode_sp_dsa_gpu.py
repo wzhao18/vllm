@@ -62,13 +62,18 @@ def test_sp_policy_covers_every_row():
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
         TILED_FROM,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.attn_fi import (
+        kernel_for,
+    )
 
     assert sp.SP_HEADS == HEADS and sp.SP_ROWS == CAP
     assert TILED_FROM[HEADS] <= ROWS[0]
     modes = {r: overlap_for(r, sp.SP_QUERY_OVERLAP, True, True) for r in ROWS}
     assert set(modes.values()) <= set(sp.SP_MODES), modes
     assert "serial" not in sp.SP_MODES
-    assert sp.SP_PARTIALS == "proj" and sp.SP_KERNELS == ("trtllm",)
+    assert sp.SP_PARTIALS == "proj"
+    kernels = {r: kernel_for(r, True, sp.SP_KERNELS) for r in ROWS}
+    assert set(kernels.values()) <= {"km", "trtllm"}, kernels
 
 
 def test_query_geometry_24_heads():

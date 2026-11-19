@@ -46,7 +46,9 @@ CAP = 512
 BLOCK = 12
 NBLOCKS = 8
 SENTINEL = -0x80000000
-SHARDS = (4, 32, 96)  # n rows per rank: r1 / r8 / r24 of D3-32
+# n rows per rank: r1 / r8 / r24 of D3-32 and the rows_cap (n_max: the full grid of
+# 7-CTA clusters co-resident at the 93-layer 8-block AttnRes)
+SHARDS = (4, 32, 96, 128)
 # first, plain, block write, after one, 8 blocks
 LAYERS = tuple(
     int(x) for x in os.environ.get("SP_FUSED_LAYERS", "0,1,12,13,92").split(",")
