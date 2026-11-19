@@ -920,11 +920,11 @@ class KimiK3MegaMoEExperts(nn.Module):
             )
 
         # Without EPLB the padding mask is folded into the stager launch.
-        rmsnorm = None
+        extra = {}
         if output_rmsnorm is not None:
             if shared_experts is not None:
                 raise ValueError("output_rmsnorm with an unfused shared expert is not supported.")
-            rmsnorm = _rmsnorm_args(output_rmsnorm)
+            extra["rmsnorm"] = _rmsnorm_args(output_rmsnorm)
         y = self.get_runtime().forward(
             hidden_states,
             topk_ids,
@@ -935,7 +935,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             is_padding=is_padding,
             owner=self.prefix,
             ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
-            rmsnorm=rmsnorm,
+            **extra,
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)
