@@ -50,7 +50,7 @@ from ..gemm.decode import DecodeProjection
 from ..gemm.sp_policy import sp_projection_tactics
 from ..mla.dcp import DcpBox
 from ..mla.query import TILED_FROM
-from .attn_fi import dsa_on_flashinfer
+from .attn_fi import dsa_on_flashinfer, kernel_for
 from ..common.policy import batch_table
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS
@@ -89,11 +89,13 @@ SP_PARTIALS = PROJECTED
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
 SP_LOCAL_QUERY = "65-:local"
-# The sparse MLA kernel per row count ("rows:kernel" table or a kernel tuple): FlashInfer
-# trtllm-gen at every row. The Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) is
-# wired but not selected: it is KV-gather bound (~25-30 GB/s per SM on random 576 B
-# rows) and not yet faster than trtllm-gen at R384 (runs/D-ATTN/sp km10-km13).
-SP_KERNELS = ("trtllm",)
+# The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere). The
+# Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) where it wins: one row per CTA.
+# VR200, 1 GPU, CUDA graphs, 512 local keys per row, us (runs/D-ATTN/sp km31):
+#   rows        128   256   384
+#   km         17.4  30.6  35.3
+#   trtllm-gen 21.0  28.5  35.1
+SP_KERNELS = "1-128:km"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
@@ -409,6 +411,6 @@ class SpDsaCore:
         mode = self.modes[rows]
         return Choice(
             Path.GENERIC,
-            tactic=(mode, SP_KERNELS[0], SP_PARTIALS),
-            note=f"sp {mode}/{SP_KERNELS[0]}/{SP_PARTIALS}",
+            tactic=(mode, kernel_for(rows, True, SP_KERNELS), SP_PARTIALS),
+            note=f"sp {mode}/{kernel_for(rows, True, SP_KERNELS)}/{SP_PARTIALS}",
         )
