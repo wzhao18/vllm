@@ -3229,6 +3229,8 @@ int64_t topk_v2_resident() {
     int dev, sms, occ = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    // two ~108 KB CTAs per SM (one row each): the largest SMEM carveout
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel, kV2T, kV2Dyn));
     v = sms * occ;
   }
@@ -3253,6 +3255,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   V2Params p{};
   p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
   p.lstride = logits.stride(0);
+  p.lcols = (int)logits.size(1);
   p.local_len = local_len.data_ptr<int>();
   p.global_len = global_len.data_ptr<int>();
   p.out = out.data_ptr<int>();
