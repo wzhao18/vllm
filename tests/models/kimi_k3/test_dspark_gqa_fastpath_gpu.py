@@ -439,10 +439,15 @@ def _vp_markov_main(rank, world, device, group):
 
     vocab, rank_dim, steps = 163840, 512, 3
     gen = torch.Generator(device=device).manual_seed(4242)
-    w1 = torch.randn((vocab, rank_dim), generator=gen, device=device) * 0.05
-    w1 = w1.bfloat16()
-    w2 = torch.randn((vocab, rank_dim), generator=gen, device=device) * 0.05
-    w2 = w2.bfloat16()
+    # Markov weights on a 2^-6 grid in [-1/8, 1/8]: every product is a multiple of
+    # 2^-12 and every 512-term sum stays below 2^3, so the FP32 bias is exact in any
+    # accumulation order (the mailbox variant computes it inside its keys kernel,
+    # not with the shard GEMM) and the checks stay bitwise.
+    def grid_weight():
+        w = torch.randint(-8, 9, (vocab, rank_dim), generator=gen, device=device)
+        return (w.float() / 64).bfloat16()
+
+    w1, w2 = grid_weight(), grid_weight()
 
     def gather(x):
         out = torch.empty((world * x.shape[0],), dtype=x.dtype, device=x.device)

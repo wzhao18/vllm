@@ -29,7 +29,13 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
+from vllm.v1.worker.gpu.sample.gumbel import (
+    _DRAFT_NOISE_SALT,
+    _log1p_neg_stable,
+    gumbel_noised_argmax,
+    murmur3_uniform32,
+    spec_step_seed,
+)
 
 from ..cutedsl.common.policy import batch_table
 from ..shapes import (
@@ -1910,6 +1916,10 @@ class GqaDraftFastPath(DraftFastPath):
 # differ (cuBLAS on the shard's columns).
 
 VP_MARKOV_BLOCK = 1024  # vocabulary columns per program (the stock sampler's block)
+# Mailbox (polled) batches up to this many requests run ``_vp_markov_fused`` (the
+# bias GEMM inside the keys kernel), VP_MARKOV_BN vocabulary columns per program.
+VP_MARKOV_FUSED_ROWS = 1 << 30
+VP_MARKOV_BN = 128
 
 
 @triton.jit
@@ -2003,6 +2013,111 @@ def _vp_markov_keys(
                 # (plain stores: a remote atomic waits for its reply, four in a row)
                 peer = tl.load(peers_ptr + r) + (box_offset + req) * 8
                 tl.store(peer.to(tl.pointer_type(tl.int64)), final)
+
+
+@triton.jit
+def _vp_markov_fused(
+    keys_ptr,
+    emb_ptr,
+    w2_ptr,
+    base_ptr,
+    base_stride,
+    cache_ptr,
+    cache_stride0,
+    cache_stride1,
+    slots_ptr,
+    pos_ptr,
+    temp_ptr,
+    seeds_ptr,
+    batch,
+    step,
+    steps,
+    lo,
+    count_ptr,
+    peers_ptr,
+    box_offset,
+    SAMPLED: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    RANK: tl.constexpr,
+    TP: tl.constexpr,
+):
+    """``_vp_markov_keys`` with the Markov bias of its columns computed in place:
+    one program per BN vocabulary columns and every request (BM-row tiles), the bias
+    tile bf16(emb @ w2[cols].T) (FP32 accumulation) never leaves the chip. Same
+    logits add, cache row, Gumbel-max score and key per (request, column) as
+    ``_vp_markov_keys``; the program that finishes last publishes every request's
+    key to the TP mailboxes and re-arms (one counter per launch)."""
+    block = tl.program_id(0)
+    cols = block * BN + tl.arange(0, BN)
+    tokens = lo + cols
+    ks = tl.arange(0, BK)
+    for m0 in range(0, batch, BM):
+        reqs = m0 + tl.arange(0, BM)
+        live_m = reqs < batch
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in tl.static_range(0, RANK, BK):
+            a = tl.load(
+                emb_ptr + reqs[:, None] * RANK + (k0 + ks)[None, :],
+                mask=live_m[:, None],
+                other=0.0,
+            )
+            b = tl.load(w2_ptr + cols[None, :] * RANK + (k0 + ks)[:, None])
+            acc = tl.dot(a, b, acc)
+        bias = acc.to(tl.bfloat16)
+        rows = reqs * steps + step
+        base = tl.load(
+            base_ptr + rows[:, None] * base_stride + cols[None, :],
+            mask=live_m[:, None],
+            other=0.0,
+        )
+        logits = (base.to(tl.float32) + bias.to(tl.float32)).to(tl.bfloat16)
+        values = tl.where(live_m[:, None], logits.to(tl.float32), float("-inf"))
+        if SAMPLED:
+            slot = tl.load(slots_ptr + rows, mask=live_m, other=-1)
+            live = live_m & (slot >= 0)
+            temp = tl.load(temp_ptr + slot, mask=live, other=0.0).to(tl.float32)
+            tl.store(
+                cache_ptr
+                + slot[:, None] * cache_stride0
+                + step * cache_stride1
+                + tokens[None, :],
+                logits,
+                mask=live[:, None],
+            )
+            seed = tl.load(seeds_ptr + slot, mask=live, other=0)
+            seed = spec_step_seed(seed, step)
+            pos = tl.load(pos_ptr + rows, mask=live_m, other=1) - 1
+            # gumbel_noised_argmax (IS_DRAFTING, FP32, APPLY_TEMPERATURE) per row
+            hot = (temp != 0.0)[:, None]
+            scaled = tl.where(hot, values / temp[:, None], values)
+            u = murmur3_uniform32(
+                seed[:, None], (pos + _DRAFT_NOISE_SALT)[:, None], tokens[None, :]
+            )
+            noise = -tl.log(-_log1p_neg_stable(u))
+            noised = tl.where(live_m[:, None], scaled + noise, float("-inf"))
+            values = tl.where(hot, noised, scaled)
+        value, index = tl.max(values, axis=1, return_indices=True)
+        token = (lo + block * BN + index).to(tl.int64)
+        key = (_vp_ordered(value).to(tl.int64) << 31) | (0x7FFFFFFF - token)
+        # (acq_rel: each maximum is performed before this thread reaches the barrier,
+        # which orders it before the count below; one counter per launch)
+        tl.atomic_max(keys_ptr + reqs, key, mask=live_m, sem="acq_rel", scope="gpu")
+    tl.debug_barrier()
+    done = tl.atomic_add(count_ptr, 1, sem="acq_rel", scope="gpu")
+    if done == tl.num_programs(0) - 1:
+        for m0 in range(0, batch, BM):
+            reqs = m0 + tl.arange(0, BM)
+            live_m = reqs < batch
+            final = tl.atomic_xchg(
+                keys_ptr + reqs, tl.zeros((BM,), tl.int64), mask=live_m,
+                sem="acq_rel", scope="gpu",
+            )  # fmt: skip
+            for r in tl.static_range(TP):
+                peer = tl.load(peers_ptr + r) + (box_offset + reqs) * 8
+                tl.store(peer.to(tl.pointer_type(tl.int64)), final, mask=live_m)
+        tl.atomic_xchg(count_ptr, 0, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -2188,7 +2303,42 @@ class VocabParallelMarkov:
         poll = self.box is not None
         if poll and batch > self.cap:
             raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
+        fused = poll and batch <= VP_MARKOV_FUSED_ROWS
+        bm = min(128, max(16, triton.next_power_of_2(batch)))
         for step in range(self.steps):
+            if fused:
+                _vp_markov_fused[(self.vocab_rank // VP_MARKOV_BN,)](
+                    keys,
+                    emb,
+                    self.w2,
+                    base,
+                    base.stride(0),
+                    cache,
+                    *strides,
+                    slots,
+                    positions,
+                    temperature,
+                    seeds,
+                    batch,
+                    step,
+                    self.steps,
+                    lo,
+                    self.count,
+                    self.peers[step],
+                    self.rank * self.cap,
+                    SAMPLED=sampled,
+                    BM=bm,
+                    BN=VP_MARKOV_BN,
+                    BK=64,
+                    RANK=self.markov_rank,
+                    TP=self.tp,
+                    num_warps=8,
+                )
+                _vp_markov_select[(batch,)](
+                    self.box[step], keys, draft, draft.stride(0), emb, self.w1,
+                    self.cap, step, TP=self.tp, RANK=self.markov_rank, POLL=True,
+                )  # fmt: skip
+                continue
             bias = torch.nn.functional.linear(emb, self.w2)
             _vp_markov_keys[grid](
                 keys,
