@@ -547,10 +547,13 @@ void prep64_tc(const Tensor& x, const Tensor& conv_w, const Tensor& conv_state,
   STD_TORCH_CHECK(x.dim() == 2 && x.size(1) == 3 * H * 128 && x.stride(1) == 1 &&
                       x.stride(0) % 8 == 0 && x.scalar_type() == ScalarType::BFloat16,
                   "prep64_tc: x must be bf16 (T, 3 H 128) with 16 B aligned rows");
-  STD_TORCH_CHECK(conv_w.scalar_type() == ScalarType::Float && conv_w.is_contiguous() &&
+  // conv_w with numel 0: kp64 (post-conv q|k|v rows in x; kdq -> qd|w image, v_img -> u
+  // image [tg][v][8 t] for kc64 v3; inv / beta_out / conv tensors unused).
+  const bool no_conv = conv_w.numel() == 0;
+  STD_TORCH_CHECK(no_conv || conv_w.scalar_type() == ScalarType::Float && conv_w.is_contiguous() &&
                       conv_w.size(0) == 3 * H * 128 && conv_w.size(1) == 4,
                   "prep64_tc: conv weight (3 H 128, 4) FP32");
-  STD_TORCH_CHECK(conv_state.scalar_type() == ScalarType::Float && conv_state.dim() == 3 &&
+  STD_TORCH_CHECK(no_conv || conv_state.scalar_type() == ScalarType::Float && conv_state.dim() == 3 &&
                       conv_state.size(1) == 3 * H * 128 && conv_state.size(2) >= 3,
                   "prep64_tc: conv state (lines, 3 H 128, >= 3) FP32");
   STD_TORCH_CHECK(g.dim() == 3 && g.size(0) == T && g.stride(1) == 128 && g.stride(2) == 1 &&
@@ -560,15 +563,16 @@ void prep64_tc(const Tensor& x, const Tensor& conv_w, const Tensor& conv_state,
   const int64_t C = gt.size(1);
   STD_TORCH_CHECK(gt.dim() == 3 && gt.size(0) == H && gt.is_contiguous() &&
                       kdq.numel() == H * C * 128 * 128 && kr.numel() == H * C * 64 * 128 &&
-                      inv.numel() == H * C * 64 * 64 && mqk.numel() == H * C * 64 * 64 &&
-                      v_img.numel() == H * C * 64 * 128 && beta_out.numel() == H * T,
+                      (no_conv || inv.numel() == H * C * 64 * 64) && mqk.numel() == H * C * 64 * 64 &&
+                      v_img.numel() == H * C * 64 * 128 && (no_conv || beta_out.numel() == H * T),
                   "prep64_tc: image shapes");
   void* stream_ptr = nullptr;
   TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream_ptr));
   launch_prep64_tc(
-      x.const_data_ptr(), x.stride(0), reinterpret_cast<const float*>(conv_w.const_data_ptr()),
-      reinterpret_cast<float*>(conv_state.mutable_data_ptr()), conv_state.stride(0),
-      conv_state.stride(1), conv_state.stride(2),
+      x.const_data_ptr(), x.stride(0),
+      no_conv ? nullptr : reinterpret_cast<const float*>(conv_w.const_data_ptr()),
+      reinterpret_cast<float*>(conv_state.mutable_data_ptr()), no_conv ? 0 : conv_state.stride(0),
+      no_conv ? 0 : conv_state.stride(1), no_conv ? 0 : conv_state.stride(2),
       reinterpret_cast<const int32_t*>(cache_indices.const_data_ptr()), cache_indices.stride(0),
       reinterpret_cast<const bool*>(has_init.const_data_ptr()), int(null_block_id),
       g.const_data_ptr(), g.stride(0), beta.const_data_ptr(), beta.stride(0),

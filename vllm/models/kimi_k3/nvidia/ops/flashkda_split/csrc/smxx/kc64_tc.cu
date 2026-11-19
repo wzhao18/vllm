@@ -711,30 +711,22 @@ __global__ void __launch_bounds__(kThreads, 1) kc3_kernel(
       tc_fence_before();
       __syncwarp();
       if (lane == 0) mbar_arrive(o_empty);
-      // Stage out rows [t][v] in shared memory, then bulk row stores.
-      const bool ost = warp == kOut0 && lane == 0;
-      if (ost) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
-      asm volatile("bar.sync 2, %0;" ::"n"(32 * kOutWarps) : "memory");
+      // Transpose through shared memory ([t][v] rows), then coalesced 16 B stores.
       __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(smem + kOffOut + (c & 1) * 16384);
 #pragma unroll
       for (int i = 0; i < 64; ++i) ob[i * kD + r] = __float2bfloat16_rn(__uint_as_float(o[i]));
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       asm volatile("bar.sync 2, %0;" ::"n"(32 * kOutWarps) : "memory");
-      if (ost) {
-        const int t0 = c * kC;
-        const int nv = min(kC, seq_len - t0);
-        __nv_bfloat16* dst = out_ptr + (int64_t(bos) + t0) * H * kD + int64_t(head) * kD;
-        const uint32_t src = sbase + kOffOut + (c & 1) * 16384;
-        for (int i = 0; i < nv; ++i)
-          asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], 256;" ::"l"(
-                           dst + int64_t(i) * H * kD),
-                       "r"(src + 256 * i)
-                       : "memory");
-        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+      const int ot = threadIdx.x - 32 * kOut0;  // 0..127
+      const int t0 = c * kC;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int e = ot + 128 * i, t = e >> 4, ch = e & 15;
+        if (t0 + t < seq_len)
+          *reinterpret_cast<uint4*>(out_ptr + (int64_t(bos) + t0 + t) * H * kD + int64_t(head) * kD +
+                                    8 * ch) = reinterpret_cast<uint4 const*>(ob)[e];
       }
     }
   }
-  if (warp == kOut0 && lane == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
   tc_fence_before();
   __syncthreads();
   if (warp == 1) {

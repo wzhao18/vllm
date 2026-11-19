@@ -724,6 +724,455 @@ __global__ void __launch_bounds__(kThreads, 2) prep64_tc_kernel(const __grid_con
   stamp(14);
 }
 
+
+// kp64 (no conv, WY images for kc64 v3): post-conv rows in, kd / v as row-major
+// MMA operands, INVb = bf16(INV * beta) as the A operand of [w | u].
+struct SmemK {
+  Smem s;
+  __nv_bfloat16 kv[2][kC][kPitch];   // kd (bf16 kn * e) | post-conv v rows
+  __nv_bfloat16 invb[kC][kC + 8];
+};
+
+__global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant__ Params p) {
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  SmemK& sk = *reinterpret_cast<SmemK*>(smem_raw);
+  Smem& s = sk.s;
+  const int ci = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const int tg = tid >> 4, cg = tid & 15;
+  const int H = p.H;
+  const int HD = H * kD;
+
+  int seq = 0, tok0 = 0, valid = 0, c_in_seq = 0, seq_len = 0, bos = 0;
+  {
+    int base = 0;
+    for (int b = 0; b < p.N; ++b) {
+      const int s0 = p.cu_seqlens[b], len = p.cu_seqlens[b + 1] - s0;
+      const int nc = (len + kC - 1) / kC;
+      if (ci < base + nc) {
+        seq = b;
+        bos = s0;
+        seq_len = len;
+        c_in_seq = ci - base;
+        tok0 = s0 + c_in_seq * kC;
+        valid = min(kC, len - c_in_seq * kC);
+        break;
+      }
+      base += nc;
+    }
+  }
+  const int64_t img = int64_t(h) * p.C_total + ci;
+  auto stamp = [&](int k) {
+    if (p.dbg != nullptr && tid == 0 && h < 2) {
+      unsigned long long t;
+      asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+      p.dbg[(int64_t(h) * p.C_total + ci) * 16 + k] = (long long)t;
+    }
+  };
+  stamp(0);
+  const uint32_t bar = smem_u32(&s.bar);
+  unsigned char* raw = s.a.raw;
+  if (tid == 0) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bar) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar),
+                 "r"(4 * kC * kD * 2)
+                 : "memory");
+#pragma unroll
+    for (int X = 0; X < 3; ++X)
+      tma2d(smem_u32(raw + X * kRawBox), &p.tm_x, X * H * kD + h * kD, tok0, bar);
+    tma2d(smem_u32(raw + kOffRawG), &p.tm_g, h * kD, tok0, bar);
+  }
+  if (tid < kC) {
+    float b = 0.0f;
+    if (tid < valid) {
+      b = bfr(sigmoid_tanh(__bfloat162float(p.beta[int64_t(tok0 + tid) * p.ldb + h])));
+    }
+    s.beta[tid] = b;
+  }
+
+  // ---- post-conv rows: q, k -> bf16 l2-normalized rows, v rows -> kv[1] ----------
+  const int t_first = 4 * tg;
+  asm volatile(
+      "{\n .reg .pred P1;\nW_%=:\n mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], 0;\n"
+      " @!P1 bra W_%=;\n}" ::"r"(bar)
+      : "memory");
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int t = t_first + j;
+#pragma unroll
+    for (int X = 0; X < 2; ++X) {
+      float f[8];
+      unpack8(*reinterpret_cast<uint4 const*>(raw + X * kRawBox + t * 256 + 16 * cg), f);
+      float ss = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) ss += f[i] * f[i];
+#pragma unroll
+      for (int o = 8; o >= 1; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+      const float r = rsqrtf(ss + 1e-6f);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) f[i] *= r;
+      *reinterpret_cast<uint4*>(&s.qkn[X][t][8 * cg]) = pack8(f);
+    }
+    *reinterpret_cast<uint4*>(&sk.kv[1][t][8 * cg]) =
+        *reinterpret_cast<uint4 const*>(raw + 2 * kRawBox + t * 256 + 16 * cg);
+  }
+  __syncthreads();  // raw q|k|v reads done
+  stamp(1);
+
+  // ---- gate activation + chunk-relative cumsum ----------------------------------
+  {
+    float dt[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) dt[i] = s.dt[8 * cg + i];
+    float run[8] = {};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float gv[8];
+      unpack8(*reinterpret_cast<uint4 const*>(raw + kOffRawG + (t_first + j) * 256 + 16 * cg), gv);
+      const bool okj = t_first + j < valid;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        run[i] += okj ? p.gate_scale * sigmoid_tanh(amp * (gv[i] + dt[i])) : 0.0f;
+      }
+      float4* gp = reinterpret_cast<float4*>(&s.c.g[t_first + j][8 * cg]);
+      gp[0] = make_float4(run[0], run[1], run[2], run[3]);
+      gp[1] = make_float4(run[4], run[5], run[6], run[7]);
+    }
+    float4* tp = reinterpret_cast<float4*>(&s.tot[tg][8 * cg]);
+    tp[0] = make_float4(run[0], run[1], run[2], run[3]);
+    tp[1] = make_float4(run[4], run[5], run[6], run[7]);
+  }
+  __syncthreads();
+  stamp(2);
+  {
+    float pre[8] = {};
+    for (int t2 = 0; t2 < tg; ++t2) {
+      const float4* tp = reinterpret_cast<const float4*>(&s.tot[t2][8 * cg]);
+      const float4 a = tp[0], b = tp[1];
+      pre[0] += a.x;
+      pre[1] += a.y;
+      pre[2] += a.z;
+      pre[3] += a.w;
+      pre[4] += b.x;
+      pre[5] += b.y;
+      pre[6] += b.z;
+      pre[7] += b.w;
+    }
+    const int last = valid - 1;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int t = t_first + j;
+      float4* gp = reinterpret_cast<float4*>(&s.c.g[t][8 * cg]);
+      float4 a = gp[0], b = gp[1];
+      a.x += pre[0];
+      a.y += pre[1];
+      a.z += pre[2];
+      a.w += pre[3];
+      b.x += pre[4];
+      b.y += pre[5];
+      b.z += pre[6];
+      b.w += pre[7];
+      gp[0] = a;
+      gp[1] = b;
+      if ((t & 15) == 0) {
+        float4* rp = reinterpret_cast<float4*>(&s.gref[t >> 4][8 * cg]);
+        rp[0] = a;
+        rp[1] = b;
+      }
+      if (t == last) {
+        float4* rp = reinterpret_cast<float4*>(&s.gT[8 * cg]);
+        rp[0] = a;
+        rp[1] = b;
+      }
+    }
+  }
+  __syncthreads();
+  stamp(3);
+
+  // ---- images and MMA operands: thread (tl, cgi) = tokens tl + 16 j, channels 8 cgi.. ----
+  {
+    const int tl = tid & 15, cgi = tid >> 4;
+    // block-pair factors bf16(exp2(gc_rI - gc_rJ)), I > J
+    for (int e = tid; e < 6 * (kD / 2); e += kThreads) {
+      const int pr = e >> 6, d = 2 * (e & 63);
+      const int I = pr == 0 ? 1 : (pr < 3 ? 2 : 3);
+      const int J = pr - I * (I - 1) / 2;
+      s.pf[pr][e & 63] = __floats2bfloat162_rn(ex2(s.gref[I][d] - s.gref[J][d]),
+                                               ex2(s.gref[I][d + 1] - s.gref[J][d + 1]));
+    }
+    uint32_t sc2;
+    {
+      const __nv_bfloat162 sc = __floats2bfloat162_rn(p.scale, p.scale);
+      sc2 = *reinterpret_cast<const uint32_t*>(&sc);
+    }
+    float gT[8];
+    {
+      const float4* gp = reinterpret_cast<const float4*>(&s.gT[8 * cgi]);
+      const float4 a = gp[0], b = gp[1];
+      gT[0] = a.x; gT[1] = a.y; gT[2] = a.z; gT[3] = a.w;
+      gT[4] = b.x; gT[5] = b.y; gT[6] = b.z; gT[7] = b.w;
+    }
+    __nv_bfloat16* kdq = p.kdq + img * (2 * kC * kD) + (cgi * 128) * 8;
+    __nv_bfloat16* krt = s.a.op.krs[warp];
+    __nv_bfloat16* krb = p.kr + img * (kC * kD) + 2 * (lane & 3);
+#pragma unroll 1
+    for (int j = 0; j < 4; ++j) {
+      const int t = tl + 16 * j;
+      const bool ok = t < valid;
+      const uint4 knv = *reinterpret_cast<uint4 const*>(&s.qkn[1][t][8 * cgi]);
+      const uint4 qnv = *reinterpret_cast<uint4 const*>(&s.qkn[0][t][8 * cgi]);
+      const uint32_t kn2[4] = {knv.x, knv.y, knv.z, knv.w};
+      const uint32_t qn2[4] = {qnv.x, qnv.y, qnv.z, qnv.w};
+      float gc[8], gr[8];
+      {
+        const float4* gp = reinterpret_cast<const float4*>(&s.c.g[t][8 * cgi]);
+        const float4 a = gp[0], b = gp[1];
+        gc[0] = a.x; gc[1] = a.y; gc[2] = a.z; gc[3] = a.w;
+        gc[4] = b.x; gc[5] = b.y; gc[6] = b.z; gc[7] = b.w;
+        const float4* rp = reinterpret_cast<const float4*>(&s.gref[j][8 * cgi]);
+        const float4 c = rp[0], d = rp[1];
+        gr[0] = c.x; gr[1] = c.y; gr[2] = c.z; gr[3] = c.w;
+        gr[4] = d.x; gr[5] = d.y; gr[6] = d.z; gr[7] = d.w;
+      }
+      uint32_t kd[4], qd[4], kr[4], rk[4], rq[4], ck[4];
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        const float d0 = gc[2 * m] - gr[2 * m], d1 = gc[2 * m + 1] - gr[2 * m + 1];
+        const uint32_t e = pack2(ex2(gc[2 * m]), ex2(gc[2 * m + 1]));
+        const uint32_t er = pack2(ex2(gT[2 * m] - gc[2 * m]), ex2(gT[2 * m + 1] - gc[2 * m + 1]));
+        const uint32_t fr = pack2(ex2(d0), ex2(d1));
+        const uint32_t ff = pack2(ex2(-d0), ex2(-d1));
+        const uint32_t k2 = ok ? kn2[m] : 0u, q2 = ok ? qn2[m] : 0u;
+        kd[m] = hmul2(k2, e);
+        qd[m] = hmul2(hmul2(q2, e), sc2);
+        kr[m] = hmul2(k2, er);
+        rk[m] = hmul2(k2, fr);
+        rq[m] = hmul2(hmul2(q2, fr), sc2);
+        ck[m] = hmul2(k2, ff);
+      }
+      *reinterpret_cast<uint4*>(&sk.kv[0][t][8 * cgi]) = make_uint4(kd[0], kd[1], kd[2], kd[3]);
+      *reinterpret_cast<uint4*>(kdq + t * 8) = make_uint4(qd[0], qd[1], qd[2], qd[3]);
+      *reinterpret_cast<uint4*>(&s.a.op.rk[t * kPitch + 8 * cgi]) = make_uint4(rk[0], rk[1], rk[2], rk[3]);
+      *reinterpret_cast<uint4*>(&s.a.op.rq[t * kPitch + 8 * cgi]) = make_uint4(rq[0], rq[1], rq[2], rq[3]);
+      *reinterpret_cast<uint4*>(&s.a.op.ck[t * kPitch + 8 * cgi]) = make_uint4(ck[0], ck[1], ck[2], ck[3]);
+      // kr image: the warp's 16 tokens x 16 channels, transposed through a shared tile
+      *reinterpret_cast<uint4*>(krt + tl * kKrPitch + 8 * (cgi & 1)) = make_uint4(kr[0], kr[1], kr[2], kr[3]);
+      __syncwarp();
+      {
+        // matrices: (tokens 0-7 | 8-15) x (channels 0-7 | 8-15) of the tile
+        uint32_t r[4];
+        const int mi = lane >> 3;
+        ldsm_x4_t(smem_u32(krt + (8 * (mi & 1) + (lane & 7)) * kKrPitch + 8 * (mi >> 1)), r);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int tgrp = 2 * j + (q & 1), ch = 16 * warp + 8 * (q >> 1) + (lane >> 2);
+          stg32(krb + (tgrp * kD + ch) * 8, r[q]);
+        }
+      }
+      __syncwarp();
+    }
+    if (tid < kD) p.gt[img * kD + tid] = valid > 0 ? exp2f(s.gT[tid]) : 1.0f;
+  }
+  __syncthreads();
+  stamp(4);
+
+  // ---- A, Mq block products (mma.sync) ------------------------------------------
+  {
+    // (row block I, first n-tile, n-tiles) per warp: 20 n-tiles of 8 columns
+    const int I = warp < 3 ? 3 : (warp < 5 ? 2 : (warp < 7 ? 1 : 0));
+    const int n0 = warp < 3 ? 3 * warp : (warp < 5 ? 3 * (warp - 3) : (warp < 7 ? 2 * (warp - 5) : 0));
+    const int nn = (warp == 2 || warp >= 5) ? 2 : 3;
+    const int g = lane >> 2, tq = lane & 3;
+    const uint32_t a_row = 16 * I + (lane & 15);
+    const uint32_t a_col = (lane >> 4) * 8;
+    const uint32_t rk_base = smem_u32(s.a.op.rk) + (a_row * kPitch + a_col) * 2;
+    const uint32_t rq_base = smem_u32(s.a.op.rq) + (a_row * kPitch + a_col) * 2;
+    __nv_bfloat16* mqk = p.mqk + img * (kC * kC);
+    for (int n = n0; n < n0 + nn; ++n) {
+      const int J = n >> 1;
+      const bool scale_b = J < I;
+      uint32_t const* pf = reinterpret_cast<uint32_t const*>(s.pf[scale_b ? I * (I - 1) / 2 + J : 0]);
+      float ca[4] = {}, cm[4] = {};
+      const uint32_t b_base = smem_u32(s.a.op.ck) + ((8 * n + (lane & 7)) * kPitch + (lane >> 3) * 8) * 2;
+#pragma unroll
+      for (int ks = 0; ks < 8; ks += 2) {
+        uint32_t b[4], a[4], q[4];
+        ldsm_x4(b_base + ks * 32, b);
+        if (scale_b) {
+          b[0] = hmul2(b[0], pf[8 * ks + tq]);
+          b[1] = hmul2(b[1], pf[8 * ks + 4 + tq]);
+          b[2] = hmul2(b[2], pf[8 * ks + 8 + tq]);
+          b[3] = hmul2(b[3], pf[8 * ks + 12 + tq]);
+        }
+        ldsm_x4(rk_base + ks * 32, a);
+        ldsm_x4(rq_base + ks * 32, q);
+        mma16816(ca, a, b[0], b[1]);
+        mma16816(cm, q, b[0], b[1]);
+        ldsm_x4(rk_base + (ks + 1) * 32, a);
+        ldsm_x4(rq_base + (ks + 1) * 32, q);
+        mma16816(ca, a, b[2], b[3]);
+        mma16816(cm, q, b[2], b[3]);
+      }
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int i = 16 * I + g + 8 * hh;
+        const int j = 8 * n + 2 * tq;
+        const float bi = s.beta[i];
+        s.c.l[i][j] = j < i ? ca[2 * hh] * bi : 0.0f;
+        s.c.l[i][j + 1] = j + 1 < i ? ca[2 * hh + 1] * bi : 0.0f;
+        const bool iv = i < valid;
+        const float m0 = (iv && j <= i && j < valid) ? cm[2 * hh] : 0.0f;
+        const float m1 = (iv && j + 1 <= i && j + 1 < valid) ? cm[2 * hh + 1] : 0.0f;
+        stg32(mqk + ((j >> 3) * 64 + i) * 8 + (j & 7), pack2(m0, m1));
+      }
+    }
+  }
+  __syncthreads();
+  stamp(5);
+
+  // ---- INV = (I + L)^-1 -------------------------------------------------------------
+  auto& X = s.a.inv.x;
+  auto& L = s.c.l;
+  if (tid < kC) {
+    // 16x16 diagonal blocks: FP32 forward substitution, one column per thread
+    const int I = tid >> 4, jj = tid & 15, o = 16 * I;
+    float x[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      float acc = i == jj ? 1.0f : 0.0f;
+#pragma unroll
+      for (int k = 0; k < i; ++k) acc -= L[o + i][o + k] * x[k];
+      x[i] = acc;
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) X[o + i][o + jj] = x[i];
+  }
+  __syncthreads();
+  stamp(6);
+  if (warp < 3) {
+    // block column J = warp: X[I][J] = -X[I][I] (sum_{k=J}^{I-1} L[I][k] X[k][J]),
+    // I = J+1..3, on BF16 tensor-core products with FP32 accumulation
+    const int J = warp, g = lane >> 2, tq = lane & 3;
+    float (*Tt)[20] = s.a.inv.t[warp];
+    for (int I = J + 1; I < 4; ++I) {
+      float tacc[2][4] = {};
+      for (int k = J; k < I; ++k) {
+        uint32_t a[4];
+        const int r0 = 16 * I + g, c0 = 16 * k + 2 * tq;
+        a[0] = pack2(L[r0][c0], L[r0][c0 + 1]);
+        a[1] = pack2(L[r0 + 8][c0], L[r0 + 8][c0 + 1]);
+        a[2] = pack2(L[r0][c0 + 8], L[r0][c0 + 9]);
+        a[3] = pack2(L[r0 + 8][c0 + 8], L[r0 + 8][c0 + 9]);
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const int col = 16 * J + 8 * nt + g, kr0 = 16 * k + 2 * tq;
+          const uint32_t b0 = pack2(X[kr0][col], X[kr0 + 1][col]);
+          const uint32_t b1 = pack2(X[kr0 + 8][col], X[kr0 + 9][col]);
+          mma16816(tacc[nt], a, b0, b1);
+        }
+      }
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        Tt[g][8 * nt + 2 * tq] = tacc[nt][0];
+        Tt[g][8 * nt + 2 * tq + 1] = tacc[nt][1];
+        Tt[g + 8][8 * nt + 2 * tq] = tacc[nt][2];
+        Tt[g + 8][8 * nt + 2 * tq + 1] = tacc[nt][3];
+      }
+      __syncwarp();
+      uint32_t a[4];
+      {
+        const int r0 = 16 * I + g, c0 = 16 * I + 2 * tq;
+        a[0] = pack2(X[r0][c0], X[r0][c0 + 1]);
+        a[1] = pack2(X[r0 + 8][c0], X[r0 + 8][c0 + 1]);
+        a[2] = pack2(X[r0][c0 + 8], X[r0][c0 + 9]);
+        a[3] = pack2(X[r0 + 8][c0 + 8], X[r0 + 8][c0 + 9]);
+      }
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        float xacc[4] = {};
+        const int col = 8 * nt + g;
+        const uint32_t b0 = pack2(Tt[2 * tq][col], Tt[2 * tq + 1][col]);
+        const uint32_t b1 = pack2(Tt[2 * tq + 8][col], Tt[2 * tq + 9][col]);
+        mma16816(xacc, a, b0, b1);
+        const int r0 = 16 * I + g, c0 = 16 * J + 8 * nt + 2 * tq;
+        X[r0][c0] = -xacc[0];
+        X[r0][c0 + 1] = -xacc[1];
+        X[r0 + 8][c0] = -xacc[2];
+        X[r0 + 8][c0 + 1] = -xacc[3];
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+  stamp(12);
+
+  // ---- Mqk above the diagonal blocks; INVb = bf16(INV_ij * beta_j) -------------------
+  {
+    __nv_bfloat16* mqk = p.mqk + img * (kC * kC);
+    for (int uidx = tid; uidx < 512; uidx += kThreads) {
+      const int jg = uidx >> 6, i = uidx & 63;
+      if (8 * jg >= 16 * ((i >> 4) + 1))
+        *reinterpret_cast<uint4*>(mqk + (jg * 64 + i) * 8) = make_uint4(0, 0, 0, 0);
+    }
+    for (int e = tid; e < kC * kC / 2; e += kThreads) {
+      const int i = e >> 5, j = 2 * (e & 31);
+      const bool iv = i < valid;
+      const float v0 = (iv && j <= i && j < valid) ? X[i][j] * s.beta[j] : 0.0f;
+      const float v1 = (iv && j + 1 <= i && j + 1 < valid) ? X[i][j + 1] * s.beta[j + 1] : 0.0f;
+      *reinterpret_cast<uint32_t*>(&sk.invb[i][j]) = pack2(v0, v1);
+    }
+  }
+  __syncthreads();
+  stamp(13);
+  // ---- [w | u] = INVb @ [kd | v]: warp w owns 32 columns (w < 4: kd, else v) ----
+  {
+    const int g = lane >> 2, tq = lane & 3;
+    const int bsel = warp >> 2, n0 = 32 * (warp & 3);
+    float acc[4][4][4] = {};
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      uint32_t b[2][4];
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        const int kr0 = 16 * ks + (lane & 7) + 8 * ((lane >> 3) & 1);
+        const int nc = n0 + 16 * np + 8 * (lane >> 4);
+        ldsm_x4_t(smem_u32(&sk.kv[bsel][kr0][nc]), b[np]);
+      }
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        uint32_t a[4];
+        ldsm_x4(smem_u32(&sk.invb[16 * mt + (lane & 15)][16 * ks + 8 * (lane >> 4)]), a);
+#pragma unroll
+        for (int np = 0; np < 2; ++np) {
+          mma16816(acc[mt][2 * np], a, b[np][0], b[np][1]);
+          mma16816(acc[mt][2 * np + 1], a, b[np][2], b[np][3]);
+        }
+      }
+    }
+    __nv_bfloat16* wimg = p.kdq + img * (2 * kC * kD);
+    __nv_bfloat16* uimg = p.v_img + img * (kC * kD);
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) {
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+          const int i = 16 * mt + g + 8 * hh, n = n0 + 8 * nt + 2 * tq;
+          const float x0 = acc[mt][nt][2 * hh], x1 = acc[mt][nt][2 * hh + 1];
+          if (bsel == 0) {
+            stg32(wimg + ((n >> 3) * 128 + 64 + i) * 8 + (n & 7), pack2(x0, x1));
+          } else {
+            uimg[((i >> 3) * 128 + n) * 8 + (i & 7)] = __float2bfloat16(x0);
+            uimg[((i >> 3) * 128 + n + 1) * 8 + (i & 7)] = __float2bfloat16(x1);
+          }
+        }
+      }
+    }
+  }
+  stamp(14);
+}
+
 }  // namespace prep64tc
 
 void launch_prep64_tc(void const* x, int64_t ldx, float const* conv_w, float* conv_state,
@@ -756,6 +1205,17 @@ void launch_prep64_tc(void const* x, int64_t ldx, float const* conv_w, float* co
                      lower_bound * 1.4426950408889634f, scale, cu_seqlens, N, H, T, C_total,
                      static_cast<bf*>(kdq), static_cast<bf*>(kr), static_cast<bf*>(inv),
                      static_cast<bf*>(mqk), gt, static_cast<bf*>(v_img), static_cast<bf*>(beta_out), dbg};
+  if (conv_w == nullptr) {
+    // kp64: x = post-conv q|k|v rows; kdq -> qd|w image, v_img -> u image [tg][v][8 t]
+    make_map(&p.tm_x, x, int64_t(3) * H * 128, T, ldx, prep64tc::kC);
+    make_map(&p.tm_g, g, int64_t(H) * 128, T, ldg, prep64tc::kC);
+    const int smk = sizeof(prep64tc::SmemK);
+    cudaFuncSetAttribute(prep64tc::kp64_kernel, cudaFuncAttributeSharedMemoryMode,
+                         cudaSharedMemoryModeAllowOversizedSharedMemory);
+    cudaFuncSetAttribute(prep64tc::kp64_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smk);
+    prep64tc::kp64_kernel<<<dim3(C_total, H), prep64tc::kThreads, smk, stream>>>(p);
+    return;
+  }
   make_map(&p.tm_x, x, int64_t(3) * H * 128, T, ldx, prep64tc::kRawRows);
   make_map(&p.tm_g, g, int64_t(H) * 128, T, ldg, prep64tc::kC);
   const int smem = sizeof(prep64tc::Smem);
