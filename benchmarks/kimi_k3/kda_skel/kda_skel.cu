@@ -20,7 +20,13 @@
 #define CK(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { printf("CU err %d line %d\n", (int)r_, __LINE__); exit(1); } } while (0)
 #define CR(x) do { cudaError_t r_ = (x); if (r_ != cudaSuccess) { printf("CUDA err %s line %d\n", cudaGetErrorString(r_), __LINE__); exit(1); } } while (0)
 
-constexpr int H = 96, D = 128, C = 32, P = H * D;     // P = 12288 channels per tensor
+#ifndef CHUNK
+#define CHUNK 32
+#endif
+#ifndef NSLOT
+#define NSLOT 2
+#endif
+constexpr int H = 96, D = 128, C = CHUNK, P = H * D;     // P = 12288 channels per tensor
 constexpr int TILE = C * D * 2;                        // 8 KiB BF16 tile
 constexpr int BETA_BYTES = C * 8 * 2;                  // 32 rows x 8 heads BF16 box (512 B)
 constexpr int STAGE = 5 * TILE + 1024;                 // q k v g og + beta, 1 KiB aligned = 41984 B
@@ -70,13 +76,13 @@ struct Args {
 };
 
 // item -> (chain, k) ; k < 0 : state-in half (-1, -2)
-__global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_constant__ Maps M, Args a) {
+__global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __grid_constant__ Maps M, Args a) {
   extern __shared__ __align__(1024) unsigned char sm[];
   __shared__ __align__(8) unsigned long long full[2][16], empty[2][16];
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int slot = warp / NWARP_SLOT, role = warp % NWARP_SLOT;   // role 0 producer, 1-4 consumers
   // which chains / items this slot owns
-  int chain = -1, nslots_used = 2;
+  int chain = -1, nslots_used = NSLOT;
   unsigned smid_; asm volatile("mov.u32 %0, %%smid;" : "=r"(smid_));
   const int die = a.dl ? a.sm_die[smid_ & 1023] : 0, drank = a.dl ? a.sm_rank[smid_ & 1023] : 0;
   const int nd = die ? a.nd1 : a.nd0, cpd = a.nchain / 2;   // chains per die
@@ -106,11 +112,11 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
   // item enumeration
   long long n_items, it0 = 0, it_step = 1, it_end;
   if (a.mode == 0) n_items = 2 + a.nchunk;
-  else if (!a.dl) { it0 = blockIdx.x * 2 + slot; it_step = 2 * gridDim.x; n_items = (long long)a.nchain * a.nchunk; }
-  else { it0 = drank * 2 + slot; it_step = 2 * nd; n_items = (long long)cpd * a.nchunk; }
+  else if (!a.dl) { it0 = blockIdx.x * NSLOT + slot; it_step = NSLOT * gridDim.x; n_items = (long long)a.nchain * a.nchunk; }
+  else { it0 = drank * NSLOT + slot; it_step = NSLOT * nd; n_items = (long long)cpd * a.nchunk; }
   it_end = n_items;
   if (a.mode == 2) {   // balanced contiguous pieces: each slot owns a contiguous run of chunk-items (piece-split chains)
-    const long long ns = a.dl ? 2LL * nd : 2LL * gridDim.x, g = a.dl ? drank * 2 + slot : blockIdx.x * 2 + slot;
+    const long long ns = a.dl ? (long long)NSLOT * nd : (long long)NSLOT * gridDim.x, g = a.dl ? drank * NSLOT + slot : blockIdx.x * NSLOT + slot;
     it0 = g * n_items / ns; it_end = (g + 1) * n_items / ns; it_step = 1;
   }
   auto decode = [&](long long j, int& ch, int& k) {
@@ -267,6 +273,8 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
       }
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       named_bar(bar_id, NCT);
+      const bool late_rel = a.mode == 0 && k == a.nchunk - 1;   // state-out reads the stage
+      if (!late_rel && ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
       if (ctid == 0 && !a.noout) {
         asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
                      :: "l"(a.dl ? &M.outd : a.hm ? &M.out_h : &M.out), "r"(a.hm | a.dl ? 0 : head * D),
@@ -282,7 +290,7 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
         asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
       }
-      if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
+      if (late_rel && ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
     }
     if (ctid == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
     if (acc == 0x9e3779b9u) a.sink[0] = acc;
@@ -393,11 +401,12 @@ int main(int argc, char** argv) {
   struct V { const char* name; int mode, S_total, iss6, fma, mufu, onorm, hm, noout, dl; };
   // fused-math pipe load per 32-token chunk-item (lane-ops): FMA 135K (conv 49K + SiLU poly part + o_norm 33K + prep),
   // MUFU 41K (SiLU 24.6K + gate/decay 8.2K + o_norm sigmoid 8.2K); KDA pass without conv+SiLU: FMA 70K, MUFU 16K
-  std::vector<V> vs = {
+  std::vector<V> vs = NSLOT == 2 ? std::vector<V>{
       {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL piece S=6", 2, 6, 1, 0, 0, 0, 0, 0, 1},
-      {"DL chain S=6", 0, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL piece S=4", 2, 4, 1, 0, 0, 0, 0, 0, 1},
-      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL chain S=6 +onorm", 0, 6, 1, 0, 0, 1, 0, 0, 1},
-      {"DL piece +MUFU16K", 2, 6, 1, 0, 16000, 0, 0, 0, 1}, {"DL piece +FMA70K", 2, 6, 1, 70000, 0, 0, 0, 0, 1}};
+      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL piece S=6 noout", 2, 6, 1, 0, 0, 0, 0, 1, 1}}
+    : std::vector<V>{
+      {"DL piece 1slot S=2", 2, 2, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3", 2, 3, 1, 0, 0, 0, 0, 0, 1},
+      {"DL rrbal 1slot S=3", 1, 3, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3 +onorm", 2, 3, 1, 0, 0, 1, 0, 0, 1}};
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
   { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
   cudaEvent_t e0, e1; CR(cudaEventCreate(&e0)); CR(cudaEventCreate(&e1));
@@ -407,13 +416,13 @@ int main(int argc, char** argv) {
   for (auto& v : vs) {
     Args a{nseq, seqlen, nchunk, nchain, v.mode, v.S_total, v.iss6, v.fma, v.mufu, v.onorm, v.hm, v.noout, (int)T,
            v.dl, (int)Tpad, nd[0], nd[1], dsm_die, dsm_rank, wgt, state, scales, sink};
-    size_t smem = (size_t)v.S_total * STAGE + 4 * OUT_TILE;
+    size_t smem = (size_t)v.S_total * STAGE + 2 * NSLOT * OUT_TILE;
     std::vector<float> ts;
     for (int it = 0; it < iters + 3; ++it) {
       CR(cudaMemsetAsync(flush, it, FL));   // evict L2 between iterations
       CR(cudaEventRecord(e0));
       cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute la[1];
-      cfg.gridDim = dim3(nsm); cfg.blockDim = dim3(2 * NWARP_SLOT * 32); cfg.dynamicSmemBytes = smem;
+      cfg.gridDim = dim3(nsm); cfg.blockDim = dim3(NSLOT * NWARP_SLOT * 32); cfg.dynamicSmemBytes = smem;
       la[0].id = cudaLaunchAttributeSharedMemoryMode; la[0].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
       cfg.attrs = la; cfg.numAttrs = 1;
       cudaError_t le = cudaLaunchKernelEx(&cfg, skel_k, M, a);
