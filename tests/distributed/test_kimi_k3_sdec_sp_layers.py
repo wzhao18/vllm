@@ -1088,15 +1088,38 @@ def _dsa_attention(config, rank, topk_buffer):
             )  # fmt: skip
     finally:
         torch.set_default_dtype(torch.float32)
-    torch.manual_seed(5 + rank)
+    # Tensor-parallel shards draw per rank; every replicated weight (q_a / kv_a
+    # projections, norms, the indexer) is the same on every rank, as a loaded
+    # checkpoint is: under SP each rank projects every gathered row with them, and
+    # the local query (dsa.local_query) builds the other ranks' heads from its own
+    # q_c rows.
+    from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    sharded = {
+        f"{prefix}.{name}" if prefix else name
+        for prefix, module in attn.named_modules()
+        if isinstance(module, (ColumnParallelLinear, RowParallelLinear))
+        and module.tp_size > 1
+        for name, _ in module.named_parameters(recurse=False)
+    }
+    assert any("q_b_proj" in n for n in sharded), sorted(sharded)
+    gen = torch.Generator(device="cuda")
     with torch.no_grad():
-        for name, param in attn.named_parameters():
+        for i, (name, param) in enumerate(attn.named_parameters()):
+            gen.manual_seed(1000 * i + 5 + (rank if name in sharded else 0))
+
+            def draw(fn, p=param):
+                return fn(p.shape, generator=gen, device=p.device, dtype=p.dtype)
+
             if name.endswith("bias"):
-                param.copy_(torch.randn_like(param) / 10)
+                param.copy_(draw(torch.randn) / 10)
             elif "norm" in name:
-                param.copy_(torch.rand_like(param) + 0.5)
+                param.copy_(draw(torch.rand) + 0.5)
             else:
-                param.copy_(torch.randn_like(param) * param.shape[-1] ** -0.5)
+                param.copy_(draw(torch.randn) * param.shape[-1] ** -0.5)
     attn.mla_attn.mla_attn.process_weights_after_loading(torch.bfloat16)
     attn.o_proj.reduce_results = False  # (KimiDecoderLayer under SP)
     return attn
