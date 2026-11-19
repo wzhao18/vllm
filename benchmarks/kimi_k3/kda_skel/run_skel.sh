@@ -7,8 +7,8 @@ nvidia-smi --query-gpu=name,clocks.sm,clocks.mem --format=csv,noheader | head -1
 NVCC=/usr/local/cuda/bin/nvcc
 for B in ${BUILDS:-8:32:2 8:64:1 8:32:1}; do
   IFS=: read W CH NS NG <<< "$B"; NG=${NG:-1}; X=$OUT/kda_skel_${W}_${CH}_${NS}_${NG}
-  $NVCC -O3 -std=c++17 -DNCW=$W -DCHUNK=$CH -DNSLOT=$NS -DNGRP=$NG -gencode arch=compute_107a,code=sm_107a -o $X $D/kda_skel.cu \
-    -lcuda > $X.build.log 2>&1 || { grep -m20 -i -A2 error $X.build.log; continue; }
+  $NVCC -O3 -std=c++17 -DNCW=$W -DCHUNK=$CH -DNSLOT=$NS -DNGRP=$NG -Xptxas -v -gencode arch=compute_107a,code=sm_107a -o $X $D/kda_skel.cu \
+    -lcuda > $X.build.log 2>&1 || { grep -m20 -i -A2 error $X.build.log; continue; }; grep -E "registers|spill" $X.build.log | head -4
   echo "== NCW=$W CHUNK=$CH NSLOT=$NS NGRP=$NG F16K"; timeout 300 $X 3 5461 ${ITERS:-15}
   echo "== NCW=$W CHUNK=$CH NSLOT=$NS NGRP=$NG F8K"; timeout 300 $X 3 2731 ${ITERS:-15}
 done

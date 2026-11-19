@@ -104,6 +104,7 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
     chain = cl < cpd ? dchain(cl) : -1;
   }
   const int S = a.S_total / nslots_used;
+  if (S % NGRP) { if (threadIdx.x == 0 && blockIdx.x == 0) printf("S %d not a multiple of NGRP\n", S); return; }
   unsigned char* ring = sm + (size_t)slot * S * STAGE;
   unsigned char* ob = sm + (size_t)a.S_total * STAGE + (size_t)slot * NGRP * 2 * OUT_TILE;
   if (threadIdx.x == 0) {
@@ -421,7 +422,8 @@ int main(int argc, char** argv) {
   // MUFU 41K (SiLU 24.6K + gate/decay 8.2K + o_norm sigmoid 8.2K); KDA pass without conv+SiLU: FMA 70K, MUFU 16K
   std::vector<V> vs = NSLOT == 2 ? std::vector<V>{
       {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL piece S=6", 2, 6, 1, 0, 0, 0, 0, 0, 1},
-      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL piece S=7 +onorm", 2, 7, 1, 0, 0, 1, 0, 0, 1}}
+      {"DL piece S=4", 2, 4, 1, 0, 0, 0, 0, 0, 1},
+      {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL piece S=4 +onorm", 2, 4, 1, 0, 0, 1, 0, 0, 1}}
     : std::vector<V>{
       {"DL piece 1slot S=3", 2, 3, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3 +onorm", 2, 3, 1, 0, 0, 1, 0, 0, 1}};
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
