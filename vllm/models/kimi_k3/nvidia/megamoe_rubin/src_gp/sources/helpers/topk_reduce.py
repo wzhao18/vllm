@@ -1040,26 +1040,36 @@ class TopkReduce:
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
-        # Slot validity is a property of the row: every warp takes it from one ballot (lanes < top-k).
-        lane_valid = cutlass.Boolean(False)
-        if lane_idx < Int32(num_topk):
-            index = topk_indices[token_idx, lane_idx]
-            if cutlass.const_expr(topk_indices.element_type is cutlass.Int32):
-                lane_valid = cutlass.Uint32(index) < cutlass.Uint32(self.num_experts)
-            else:
-                lane_valid = cutlass.Uint64(index) < cutlass.Uint64(self.num_experts)
-        valid_slots = Int32(cute.arch.vote_ballot_sync(lane_valid))
-
+        # Every load that does not depend on another issues first: the routing (slot validity), the norm weight
+        # and the first poll of every cell; only then the ballot waits for the routing. One load latency, not two.
+        index_lane = lane_idx
+        if lane_idx >= Int32(num_topk):
+            index_lane = Int32(0)
+        index = topk_indices[token_idx, index_lane]
         sumsq = Float32(0)
-        # The norm weight does not depend on the cells: load it before polling so its latency is off the tail.
         weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
+        words = cute.make_rmem_tensor((num_topk * 2,), Int64)
+        terms = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))[
+            (None, None), (0, hidden_tile_idx)
+        ]
         if active:
             load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
             wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
             cute.copy(load_atom, mark_alignment(wsrc, tile_bytes), weight)
-            terms = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))[
-                (None, None), (0, hidden_tile_idx)
-            ]
+            for k in cutlass.range_constexpr(num_topk):
+                low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
+                words[2 * k] = low
+                words[2 * k + 1] = high
+
+        # Slot validity is a property of the row: every warp takes it from one ballot (lanes < top-k).
+        if cutlass.const_expr(topk_indices.element_type is cutlass.Int32):
+            lane_valid = cutlass.Uint32(index) < cutlass.Uint32(self.num_experts)
+        else:
+            lane_valid = cutlass.Uint64(index) < cutlass.Uint64(self.num_experts)
+        lane_valid = lane_valid & (lane_idx < Int32(num_topk))
+        valid_slots = Int32(cute.arch.vote_ballot_sync(lane_valid))
+
+        if active:
             if cutlass.const_expr(topk_score is not None):
                 if cutlass.const_expr(prefetch):
                     cute.autovec_copy(topk_score[token_idx, None], score_reg)
@@ -1067,11 +1077,6 @@ class TopkReduce:
                 for k in cutlass.range_constexpr(num_topk):
                     score_reg[k] = score_dtype(1)
 
-            words = cute.make_rmem_tensor((num_topk * 2,), Int64)
-            for k in cutlass.range_constexpr(num_topk):
-                low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
-                words[2 * k] = low
-                words[2 * k + 1] = high
             for k in cutlass.range_constexpr(num_topk):
                 if (valid_slots >> Int32(k)) & Int32(1) == Int32(0):
                     words[2 * k] = Int64(-1)
