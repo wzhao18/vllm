@@ -2948,6 +2948,7 @@ __global__ void __launch_bounds__(256) o_exchange_kernel(OxParams p) {
 }  // namespace k31dcpx
 
 #include "topk_v2.cuh"
+#include "topk_skel.cuh"
 
 // ------------------------------------------------------------------ host side
 using namespace k31dcpx;
@@ -3316,8 +3317,65 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T>, p));
 }
 
+// Benchmark only (SOL skeleton): topk_v2's launch shape with topk_skel_kernel (no redo).
+void topk_skel(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
+               torch::Tensor out, torch::Tensor out_count, int64_t box, int64_t mc, torch::Tensor peers,
+               int64_t W, int64_t rank, int64_t K, int64_t cap, torch::Tensor epoch, torch::Tensor err,
+               int64_t mode, int64_t threads) {
+  TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
+  const int T = (int)logits.size(0);
+  if (T == 0) return;
+  TORCH_CHECK(T <= cap && W <= kV2MaxW && K <= kMaxK);
+  const c10::cuda::CUDAGuard guard(logits.device());
+  V2Params p{};
+  p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  p.lstride = logits.stride(0);
+  p.lcols = (int)logits.size(1);
+  p.local_len = local_len.data_ptr<int>();
+  p.global_len = global_len.data_ptr<int>();
+  p.out = out.data_ptr<int>();
+  p.ostride = out.stride(0);
+  p.out_count = out_count.data_ptr<int>();
+  p.box = reinterpret_cast<uint32_t*>(box);
+  p.mc = (uint64_t)mc;
+  p.peers = reinterpret_cast<const uint64_t*>(peers.data_ptr<int64_t>());
+  p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
+  const auto lay = topk_v2_layout(cap, W);
+  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
+  p.epoch = epoch.data_ptr<int>();
+  p.redo = p.epoch + cap;
+  p.err = err.data_ptr<int>();
+  p.spin_ns = g_spin_ns;
+  int nwide = 0;
+  const int nres = (int)topk_v2_resident_of(&nwide);
+  const bool wide = threads == 1024 || (threads == 0 && T <= nwide);
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)std::min(T, wide ? nwide : nres), 1, 1);
+  cfg.blockDim = dim3(wide ? 1024 : kV2T, 1, 1);
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  if (mode >= 10) {  // rung 0: fixed-round exact selection (topk_fx_kernel)
+    static bool attr = false;
+    if (!attr) {
+      C10_CUDA_CHECK(cudaFuncSetAttribute(topk_fx_kernel<kV2T>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      C10_CUDA_CHECK(cudaFuncSetAttribute(topk_fx_kernel<1024>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      attr = true;
+    }
+    if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_fx_kernel<1024>, p, (int)mode));
+    else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_fx_kernel<kV2T>, p, (int)mode));
+    return;
+  }
+  if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_skel_kernel<1024>, p, (int)mode));
+  else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_skel_kernel<kV2T>, p, (int)mode));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_v2", &topk_v2);
+  m.def("topk_skel", &topk_skel);
   m.def("topk_v2_layout", &topk_v2_layout);
   m.def("topk_v2_resident", &topk_v2_resident);
   m.def("topk_merge", &topk_merge);

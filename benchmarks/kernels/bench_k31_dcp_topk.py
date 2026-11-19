@@ -108,7 +108,10 @@ def main():
                          "lengths, epochs, outputs) so only code stays evicted")
     ap.add_argument("--skew-us", type=float, default=0.0,
                     help="the last rank sleeps this long before each call (in-step rank skew)")
-    ap.add_argument("--impl", default="merge", choices=["merge", "v2"])
+    ap.add_argument("--impl", default="merge", choices=["merge", "v2", "skel"])
+    ap.add_argument("--skel-mode", type=int, default=7,
+                    help="skel: 1 read row, 2 one 768 B message + poll, 4 write K ids (bits)")
+    ap.add_argument("--skel-threads", type=int, default=0, help="skel: 512 | 1024 | 0 (as v2)")
     ap.add_argument("--check", type=int, default=1, help="v2: compare with topk_merge")
     ap.add_argument("--k", type=int, default=2048, help="top-k (1-GPU ncu emulation: K / DCP)")
     a = ap.parse_args()
@@ -186,6 +189,9 @@ def main():
                             torch.amax(t_)
                 if a.skew_us > 0 and rank == W - 1:
                     torch.cuda._sleep(int(a.skew_us * 2400))
+                if a.impl == "skel":
+                    ex.topk_skel(logits, L, G, out, cnt, a.skel_mode, a.skel_threads)
+                    return
                 if a.impl == "v2":
                     ex.topk_v2(logits, L, G, out, cnt, block_table=bt,
                                block_size=bs, block_stride=bs, req_of_row=req_of_row,
@@ -203,7 +209,7 @@ def main():
             ex.check()
             tot = cnt.sum().clone()
             dist.all_reduce(tot)
-            ok_count = int(tot) == T * K
+            ok_count = int(tot) == T * K if (a.impl != "skel" or a.skel_mode >= 20) else None
             mism = -1
             if a.impl == "v2" and a.check:
                 o2, c2 = out.clone(), cnt.clone()

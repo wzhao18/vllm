@@ -394,6 +394,15 @@ class DcpExchange:
             self.v2_epoch, self.err, stats, dbg,
         )  # fmt: skip
 
+    def topk_skel(self, logits, local_len, global_len, out, out_count, mode: int = 7,
+                  threads: int = 0) -> None:
+        """Benchmark only: data-movement skeleton of topk_v2 (csrc/topk_skel.cuh)."""
+        self.ext.topk_skel(
+            logits, local_len, global_len, out, out_count, self.v2_box.data_ptr(), self.v2_mc,
+            self.v2_peers, self.W, self.rank, self.K, self.cap, self.v2_epoch, self.err, mode,
+            threads,
+        )  # fmt: skip
+
     def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:
         """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each; ``pre``:
         a pre-pass launch, ``topk_prepass``) that fit on the GPU at once; a launch
