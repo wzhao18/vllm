@@ -41,8 +41,8 @@ TOKEN = 256  # bytes per token per head: K 64 + V 64 BF16
 WINDOW = 2048
 LAYERS = 5
 LAYER_PAGE = HEADS * PAGE * TOKEN  # 4 MiB
-ROW_STRIDE = LAYERS * LAYER_PAGE + 128
-FIRST = 128
+ROW_STRIDE = LAYERS * LAYER_PAGE + 256  # deployed: + 128 (rows 256 B aligned here for the 3-D map)
+FIRST = 0
 CHUNK = 2 << 20
 PART = 1184  # floats per partial: 18 rows x 64 + 18 LSE, padded
 MAXJ = 16
@@ -73,7 +73,10 @@ struct Args {
   int match, swap, steal, P, S, SB, statik;
   const int* sm_rank;     // [1024] rank of the SM among its die (match) or all SMs
   int n_on0, n_on1;       // SMs per die (match) or all SMs in n_on0
-  unsigned long long* stamps;  // [grid * 4][3]: producer start, producer end, consumer end
+  unsigned long long* stamps;  // [layers][grid * 4][3]: producer start, producer end, consumer end
+  const void* tmap;       // 3-D BF16 map (64, K|V, rows of 256 B) of the cache, 128 B swizzle
+  unsigned long long base; // cache base (row = (addr - base) / 256)
+  int form, layer;        // form 0: 1-D bulk, 1: tensor TMA boxes of SB / 256 rows
   unsigned* sink;
 };
 
@@ -112,7 +115,7 @@ __global__ void __launch_bounds__(256) skel(Args a) {
   if (a.match) { rdie = a.sm_die[sm] & 1; die = rdie ^ (a.swap & 1); }
   const int G = (rdie ? a.n_on1 : a.n_on0) * a.P;
   const int gi = a.sm_rank[sm] * a.P + iss;
-  unsigned long long* st = a.stamps + ((size_t)blockIdx.x * 4 + iss) * 3;
+  unsigned long long* st = a.stamps + ((size_t)(a.layer * gridDim.x + blockIdx.x) * 4 + iss) * 3;
   if (producer && lane == 0 && iss < a.P) for (int i = 0; i < a.S; ++i) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&full[iss * a.S + i])));
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&empty[iss * a.S + i])));
@@ -150,10 +153,17 @@ __global__ void __launch_bounds__(256) skel(Args a) {
           mymeta[sl] = -1;
           asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(b) : "memory");
         } else {
-          unsigned n = min((unsigned)a.SB, bytes - (unsigned)q * a.SB);
+          unsigned n = a.form ? (unsigned)a.SB : min((unsigned)a.SB, bytes - (unsigned)q * a.SB);
           mymeta[sl] = it * 2 + (q == nst - 1);
           asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(b), "r"(n) : "memory");
-          bulk(sa(myring + (size_t)sl * a.SB), src + (size_t)q * a.SB, n, b);
+          unsigned dst = sa(myring + (size_t)sl * a.SB);
+          if (a.form) {
+            int row = (int)(((unsigned long long)src - a.base) >> 8) + q * (a.SB >> 8);
+            asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+                         :: "r"(dst), "l"(a.tmap), "r"(0), "r"(0), "r"(row), "r"(b) : "memory");
+          } else {
+            bulk(dst, src + (size_t)q * a.SB, n, b);
+          }
         }
       }
       if (it < 0) break;
@@ -202,7 +212,8 @@ __global__ void __launch_bounds__(256) skel(Args a) {
 void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg_ctr, int64_t seg_nj,
             int64_t partial, int64_t out, int64_t sm_die, int64_t match, int64_t swap, int64_t steal,
             int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink,
-            int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps) {
+            int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps,
+            int64_t tmap, int64_t base, int64_t form, int64_t layer) {
   Args a;
   a.items = (const Item*)items; a.nitems = (const int*)nitems; a.cap = (int)cap;
   a.ctr = (int*)ctr; a.seg_ctr = (int*)seg_ctr; a.seg_nj = (const int*)seg_nj;
@@ -211,6 +222,7 @@ void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg
   a.P = (int)P; a.S = (int)S; a.SB = (int)SB; a.sink = (unsigned*)sink;
   a.statik = (int)statik; a.sm_rank = (const int*)sm_rank; a.n_on0 = (int)n_on0; a.n_on1 = (int)n_on1;
   a.stamps = (unsigned long long*)stamps;
+  a.tmap = (const void*)tmap; a.base = (unsigned long long)base; a.form = (int)form; a.layer = (int)layer;
   static bool init = false;
   if (!init) { cudaFuncSetAttribute(skel, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024); init = true; }
   cudaLaunchConfig_t cfg = {};
@@ -230,7 +242,8 @@ _CPP_SRC = r"""
 void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg_ctr, int64_t seg_nj,
             int64_t partial, int64_t out, int64_t sm_die, int64_t match, int64_t swap, int64_t steal,
             int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink,
-            int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps);
+            int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps,
+            int64_t tmap, int64_t base, int64_t form, int64_t layer);
 """
 
 _mod = None
@@ -290,8 +303,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests", default="32,64,96")
     ap.add_argument("--replays", type=int, default=20)
-    ap.add_argument("--units", default="128,256,512")
-    ap.add_argument("--forms", default="1x64x3,2x32x3,4x16x3,2x48x2")
+    ap.add_argument("--units", default="256,512")
+    ap.add_argument("--forms", default="t1x64x3,t2x32x3,t4x16x3,t2x48x2,b2x32x3")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
@@ -330,7 +343,18 @@ def main():
         seen[dies_of[s]] += 1
     rank_match = rank_match.to(dev)
     rank_all = torch.arange(1024, dtype=torch.int32, device=dev)
-    stamps = torch.zeros(sms * 4 * 3, dtype=torch.int64, device=dev)
+    stamps = torch.zeros(LAYERS * sms * 4 * 3, dtype=torch.int64, device=dev)
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import tensor_maps
+    import cuda.bindings.driver as cuda
+
+    maps = {}
+    for bname, b in bufs.items():
+        for sbk in (16, 32, 48, 64):
+            maps[(bname, sbk)] = tensor_maps([(
+                b.data_ptr(), cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                (64, 2, b.numel() // 256), (128, 256), (64, 2, (sbk << 10) // 256),
+                cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+                cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B)], dev)
     rng = random.Random(1234)
     sink = torch.zeros(4, dtype=torch.int32, device=dev)
     for n_req in [int(x) for x in args.requests.split(",")]:
@@ -357,7 +381,9 @@ def main():
                 imbalance = max(int(nit[:, 0].sum()), int(nit[:, 1].sum())) / max(
                     1, int(nit.sum()) / 2) if match else 1.0
                 for form in args.forms.split(","):
-                    P, sbk, S = (int(x) for x in form.split("x"))
+                    tform = int(form[0] == "t")
+                    P, sbk, S = (int(x) for x in form[1:].split("x"))
+                    tmap = maps[(bname, sbk)].data_ptr() if tform else 0
                     SB = sbk << 10
                     smem = max(P * S * SB, 116 << 10)
                     if P * S * SB > (200 << 10) or P * S > 64:
@@ -375,7 +401,7 @@ def main():
                                 sink.data_ptr(), statik,
                                 (rank_match if match else rank_all).data_ptr(),
                                 seen[0] if match else sms, seen[1] if match else 0,
-                                stamps.data_ptr())
+                                stamps.data_ptr(), tmap, bufs[bname].data_ptr(), tform, li)
 
                     out.zero_()
                     chain()
@@ -401,13 +427,20 @@ def main():
                     tbs = total / t / 1e6
                     key = arm
                     if key not in best or t < best[key][0]:
-                        best[key] = (t, f"U{unit_k}K P{P} SB{sbk}K S{S}")
-                    sv = stamps.view(sms, 4, 3)[:, :P].reshape(-1, 3).cpu()
-                    sv = sv[sv[:, 0] > 0]
+                        best[key] = (t, f"U{unit_k}K {form}")
+                    sva = stamps.view(LAYERS, sms, 4, 3)[:, :, :P].reshape(LAYERS, -1, 3).cpu()
+                    spans, gaps = [], []
+                    for li in range(LAYERS):
+                        v = sva[li][sva[li][:, 0] > 0]
+                        spans.append((int(v[:, 2].max()) - int(v[:, 0].min())) / 1e3)
+                        if li:
+                            gaps.append((int(v[:, 0].min()) - prev_end) / 1e3)
+                        prev_end = int(v[:, 2].max())
+                    sv = sva[LAYERS - 1][sva[LAYERS - 1][:, 0] > 0]
                     t0 = int(sv[:, 0].min())
                     dur = ((sv[:, 2] - sv[:, 0]).float() / 1e3).sort().values
                     stamps.zero_()
-                    print(f"N{n_req} R{n_req * 4} {arm} U{unit_k}K P{P} SB{sbk}K S{S}: "
+                    print(f"N{n_req} R{n_req * 4} {arm} U{unit_k}K {form}: "
                           f"{t:.2f} us/layer {tbs:.1f} TB/s imb {imbalance:.3f} "
                           f"{'ok' if ok else 'FAIL'} | last layer: span "
                           f"{(int(sv[:, 2].max()) - t0) / 1e3:.2f} start-spread "
