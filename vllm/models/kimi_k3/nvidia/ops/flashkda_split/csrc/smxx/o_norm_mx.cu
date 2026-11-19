@@ -227,7 +227,10 @@ __global__ void __launch_bounds__((kOConsumerWarps + 1) * 32, 1)
       }
       float ss = 0.0f;
 #pragma unroll
-      for (int i = 0; i < 16; ++i) ss = __fadd_rn(ss, __fmul_rn(xf[i], xf[i]));
+      for (int i = 0; i < 16; i += 2) {
+        const float2 sq = __fmul2_rn(make_float2(xf[i], xf[i + 1]), make_float2(xf[i], xf[i + 1]));
+        ss = __fadd_rn(__fadd_rn(ss, sq.x), sq.y);
+      }
 #pragma unroll
       for (int o = 1; o <= 4; o <<= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
       const float rstd =
@@ -235,14 +238,16 @@ __global__ void __launch_bounds__((kOConsumerWarps + 1) * 32, 1)
       // sigmoid(g) = 1 / (1 + ex2(g * -log2 e)): the reciprocal, the division where 1 + e > 2^126
       float sg[16], dmax = 0.0f;
 #pragma unroll
-      for (int i = 0; i < 16; ++i) {
-        const float gf = (i % 2 == 0) ? lo(gw[i / 2]) : hi(gw[i / 2]);
-        float tt, e;
-        asm("mul.f32 %0, %1, 0fBFB8AA3B;" : "=f"(tt) : "f"(gf));
-        asm("ex2.approx.f32 %0, %1;" : "=f"(e) : "f"(tt));
-        const float d = __fadd_rn(1.0f, e);
-        dmax = fmaxf(dmax, d);
-        sg[i] = rcp_approx(d);
+      for (int i = 0; i < 16; i += 2) {
+        const float2 tt = __fmul2_rn(make_float2(lo(gw[i / 2]), hi(gw[i / 2])),
+                                     make_float2(-1.44269502162933349609375f, -1.44269502162933349609375f));
+        float e0, e1;
+        asm("ex2.approx.f32 %0, %1;" : "=f"(e0) : "f"(tt.x));
+        asm("ex2.approx.f32 %0, %1;" : "=f"(e1) : "f"(tt.y));
+        const float2 d = __fadd2_rn(make_float2(1.0f, 1.0f), make_float2(e0, e1));
+        dmax = fmaxf(dmax, fmaxf(d.x, d.y));
+        sg[i] = rcp_approx(d.x);
+        sg[i + 1] = rcp_approx(d.y);
       }
       if (__any_sync(0xffffffffu, dmax > 0x1p126f)) {
 #pragma unroll
@@ -257,8 +262,9 @@ __global__ void __launch_bounds__((kOConsumerWarps + 1) * 32, 1)
         float2 v = __fmul2_rn(make_float2(xf[i], xf[i + 1]), make_float2(rstd, rstd));
         v = __fmul2_rn(v, make_float2(w[i], w[i + 1]));
         v = __fmul2_rn(v, make_float2(sg[i], sg[i + 1]));
-        y[i] = __bfloat162float(__float2bfloat16_rn(v.x));
-        y[i + 1] = __bfloat162float(__float2bfloat16_rn(v.y));
+        const __nv_bfloat162 vb = __floats2bfloat162_rn(v.x, v.y);
+        y[i] = __low2float(vb);
+        y[i + 1] = __high2float(vb);
         amax = fmaxf(amax, fmaxf(fabsf(y[i]), fabsf(y[i + 1])));
       }
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
