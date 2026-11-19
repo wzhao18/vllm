@@ -168,6 +168,11 @@ class Chain:
         hidden = None
         do_attn = variant in ("full", "attnres")
         do_comm = variant in ("full", "comm")
+        if variant == "rs":  # the reduce-scatter alone (comm - rs = the all-gather)
+            for layer in range(self.layers):
+                comm.reduce_scatter(self.rs_out[layer % 2], layer % 2, self.rows,
+                                    self.partial)
+            return
         for layer in range(self.layers):
             parity = layer % 2
             prev = cdiv(layer, BLOCK)
