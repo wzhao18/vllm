@@ -117,8 +117,6 @@ PACKED = True
 FOLD_FENCE = 1
 # Block sums per prep: 2q norms, q^2 token couplings, q recorded-key norms (<= 32).
 SUMS = 32
-# Bulk copies per state page load.
-PAGE_OPS = 4
 # Item table columns.
 SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
 META = 8
@@ -194,6 +192,12 @@ def store_bulk_evict(dst, src, size):
     code += "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint "
     code += "[$0], [$1], $2, pol; }"
     return code, "l,r,r,~{memory}", (dst, src, Int32(size))
+
+
+@asm()
+def arrive_threads(barrier_id, count):
+    """bar.arrive: count this warp in and go on (the waiters use bar.sync)."""
+    return "bar.arrive $0, $1;", "r,r,~{memory}", (Int32(barrier_id), Int32(count))
 
 
 @asm()
@@ -294,24 +298,26 @@ class KdaFlow(KdaWS):
         return head, request, slot, conv_slot, conv_offset, pending, rec
 
     @cute.jit
-    def load_page(self, args, pages, s, table, j, state_full):
-        """Bulk-copy table item j's state page into page slot ``s`` (or complete the
-        phase of a padded row)."""
+    def load_quarter(self, args, pages, s, table, j, state_full, w):
+        """Bulk-copy rows 32 w + [0, 32) (warp w's) of table item j's state page into
+        page slot ``s``: one of the slot barrier's four arrivals (a padded row's
+        arrival carries no bytes)."""
         slot, head = table[j, SLOT], table[j, HEAD]
         barrier = state_full + s
         if slot > 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(barrier, PAGE_BYTES)
+            rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
+            cute.arch.mbarrier_arrive_and_expect_tx(barrier, COPY_BYTES)
             source = args[9][Int64(slot), None, None, None]
-            for i in cutlass.range_constexpr(PAGE_OPS):
-                rows: cutlass.Constexpr = K // PAGE_OPS
-                copy_g2s(
-                    at(pages, s, i * rows * K),
-                    at(source, head, i * rows, 0),
-                    PAGE_BYTES // PAGE_OPS,
-                    barrier,
-                )
+            copy_g2s(at(pages, s, w * rows * K), at(source, head, w * rows, 0),
+                     COPY_BYTES, barrier)  # fmt: skip
         else:
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
+
+    @cute.jit
+    def load_page(self, args, pages, s, table, j, state_full):
+        """Table item j's whole state page into page slot ``s`` (one thread)."""
+        for w in cutlass.range_constexpr(PAGE_BYTES // COPY_BYTES):
+            self.load_quarter(args, pages, s, table, j, state_full, w)
 
     @cute.jit
     def stage_item(self, args, table, j, buffers, barrier, parity, c):
@@ -431,8 +437,8 @@ class KdaFlow(KdaWS):
         )
 
         if tid == 0:
-            for s in cutlass.range_constexpr(SLOTS):
-                cute.arch.mbarrier_init(state_full + s, 1)
+            for s in cutlass.range_constexpr(SLOTS):  # one arrival per warp quarter
+                cute.arch.mbarrier_init(state_full + s, PAGE_BYTES // COPY_BYTES)
             for g in cutlass.range_constexpr(GROUPS):
                 cute.arch.mbarrier_init(stage_full + g, 1)
             cute.arch.mbarrier_init(fb_full, 1)
@@ -672,14 +678,14 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr("solve" not in self.skip):
                     values = self.rows_reduce(acc, lane_in)
                     self.solve(values, g, betas, j, own, v_s, uo, ce_s)
-                if lane == 0:  # the warp's quarter is read: the slot can refill
-                    if cutlass.const_expr("pagewait" not in self.skip):
-                        wait_bulk_reads()
-                cute.arch.sync_warp()
-                self.group_sync(g)  # every quarter is read; every row's outputs
-                if c == 0:
+                # Each warp refills its own quarter of the slot once that quarter's
+                # checkpoint store has read it (no group barrier: thread c owns row
+                # c's outputs, which its epilogue thread reads).
+                if lane == 0:
+                    wait_bulk_reads()
                     if j + SLOTS < count:
-                        self.load_page(args, pages, s, table, j + SLOTS, state_full)
+                        self.load_quarter(args, pages, s, table, j + SLOTS,
+                                          state_full, warp)  # fmt: skip
                 cute.arch.sync_warp()
                 if cutlass.const_expr(self.trace):
                     te = clock64()
@@ -687,7 +693,11 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr("epi" not in self.skip):
                     self.epilogue(args, g, c, v_s, g_s, sums_g[1], nw, oo)
                 fence_async_shared()  # corrections and outputs leave by bulk stores
-                self.group_sync(g)
+                cute.arch.sync_warp()
+                if warp == 0:  # warp 0 waits for the group's rows and stores them
+                    sync_threads(3 + g, GROUP_THREADS)
+                else:
+                    arrive_threads(3 + g, GROUP_THREADS)
                 if c == 0:
                     if cutlass.const_expr("outst" not in self.skip):
                         store_bulk(at(args[18], rec, head, 0, 0), at(uo, 0, 0), T * K * 4)
