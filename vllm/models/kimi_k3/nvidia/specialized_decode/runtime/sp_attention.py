@@ -213,7 +213,12 @@ class SpAttentionBlock:
             self.slots = attention.mla_attn.mla_attn.layer_name  # (as run_dsa)
             self.index_prefix = attention.dsa_indexer.k_cache.prefix
         else:
-            self.core = SpKdaCore(attention, rows, records=step.records, ctx=ctx)
+            # The MXFP8 o_proj's input written by the KDA core itself where it can
+            # (``SpKdaCore.mx_rows``), not by a standalone quantization of attn_out.
+            self.core = SpKdaCore(
+                attention, rows, records=step.records, ctx=ctx, mx_out=mx_out
+            )
+        self.mx_input = output.input if mx_out else None
         if self.core.pitch != pitch:
             raise Unsupported(
                 kind, None,
@@ -236,7 +241,7 @@ class SpAttentionBlock:
         rows = gathered.shape[0] if isinstance(gathered, torch.Tensor) else gathered.rows
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
-        attn_out = self.attn_out[:rows]
+        attn_out = self.core_output(rows)
         if self.kind == "dsa":
             indexer = get_forward_context().attn_metadata[self.index_prefix]
             self.core.run(
@@ -258,7 +263,7 @@ class SpAttentionBlock:
         gathered = comm.all_gather(x_shard, self.parity)
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
-        attn_out = self.attn_out[:rows]
+        attn_out = self.core_output(rows)
         if self.kind == "dsa":
             # The packed indexer's write slots come from its own metadata
             # (``providers.Attention.run_dsa``).
@@ -272,6 +277,13 @@ class SpAttentionBlock:
             self.core.run(projected, attn_out, caches=caches, metadata=metadata)
         shard = x_shard.new_empty((n, WIDTH))
         return self.oproj.run(attn_out, shard, self.parity)
+
+    def core_output(self, rows):
+        """The core's output at ``rows``: BF16 ``attn_out``, or the MXFP8 o_proj's
+        input view where the KDA core writes it (``SpKdaCore.writes_mxfp8``)."""
+        if self.kind == "kda" and self.core.writes_mxfp8(rows):
+            return self.mx_input.view(rows)
+        return self.attn_out[:rows]
 
     @property
     def comm(self) -> SpComm:
@@ -332,6 +344,30 @@ def check_stock_drafter(tp):
     return tuple(sorted(tables))
 
 
+def sp_embedding(embedding, ctx):
+    """(weight, start, vocab) of the vocabulary shard ``SpEmbedScatter`` gathers from
+    (stock ``VocabParallelEmbedding``: rank r holds ids [r shard, (r + 1) shard) below
+    ``org_vocab_size``), or None where its layout is not that one (the stock module
+    then runs, declared)."""
+    weight = getattr(embedding, "weight", None)
+    shards = getattr(embedding, "shard_indices", None)
+    if (
+        weight is None
+        or shards is None
+        or weight.dtype != torch.bfloat16
+        or weight.dim() != 2
+        or weight.shape[1] != WIDTH
+        or not weight.is_contiguous()
+        or getattr(embedding, "num_added_embeddings", 0)
+        or shards.org_vocab_start_index != ctx.rank * weight.shape[0]
+        or shards.padded_org_vocab_start_index != shards.org_vocab_start_index
+        or shards.padded_org_vocab_end_index - shards.org_vocab_start_index
+        != weight.shape[0]
+    ):
+        return None
+    return weight.detach(), shards.org_vocab_start_index, embedding.org_vocab_size
+
+
 class SpStep:
     """Builds the SP blocks on a ``SpecializedDecode`` (``runtime``, built with
     ``sequence_parallel``) and runs its captured steps (module docstring). All
@@ -380,6 +416,7 @@ class SpStep:
         self.final_gather = SpFinalGather(*owner, width=packed, rows_cap=rows[-1])
         for r in rows:
             self.final_gather.prepare(r)
+        self.embedding = sp_embedding(backbone.embed_tokens, ctx)
         kinds = {attention_kind(d.self_attn) for d in layers}
         self.dsa_box = self.dsa_scratch = None
         self.dsa_layers = 0
@@ -457,11 +494,12 @@ class SpStep:
         spec = get_current_vllm_config().speculative_config
         method = getattr(spec, "rejection_sample_method", None)
         declared = {
-            "embed": "stock VocabParallelEmbedding",
             "attn_res": "the final AttnRes: stock attn_res on the shard",
             "lm_head": "stock",
             "sampler": "stock",
         }
+        if self.embedding is None:
+            declared["embed"] = "stock VocabParallelEmbedding"
         if not self.gqa_drafter:
             declared["drafter"] = DRAFTER_NOTE
         if self.moe:
@@ -488,6 +526,12 @@ class SpStep:
             choices["final_gather"] = Choice(
                 Path.GENERIC, "multicast", note="SpFinalGather (Lamport, one kernel)"
             )
+            if self.embedding is not None:
+                choices["embed"] = Choice(
+                    Path.GENERIC, "scatter",
+                    note="vocab-parallel gather pushed as the SP reduce-scatter "
+                    "(SpEmbedScatter)",
+                )  # fmt: skip
             choices["sp_boundary"] = Choice(
                 Path.GENERIC, "cluster",
                 note="AttnRes + SP AG / RS fused (attn_res.sp_fused)",
@@ -556,9 +600,9 @@ class SpStep:
         runtime = self.runtime
         backbone = runtime.backbone
         x = inputs_embeds
-        if x is None:
+        if x is None and self.embedding is None:
             x = backbone.embed_input_ids(input_ids)
-        rows = x.shape[0]
+        rows = (x if x is not None else input_ids).shape[0]
         if rows not in self.rows:
             raise Unsupported(
                 "sp_step", Shape(rows, step.q), "not a captured row count"
@@ -567,8 +611,20 @@ class SpStep:
         # forward context when the stock deployment skips them.
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             context = get_forward_context()
-            context.is_padding = sp_padding_mask(context.is_padding, x)
-        hidden = sp_shard(x)
+            rows_like = x if x is not None else input_ids
+            context.is_padding = sp_padding_mask(context.is_padding, rows_like)
+        if x is None:
+            # This rank's shard rows of the embedding, straight from the vocabulary
+            # shards (SpEmbedScatter, the reduce-scatter parity of block 1: block 0
+            # re-arms nothing it uses; module docstring of common.sp_comm).
+            weight, start, vocab = self.embedding
+            shard = backbone.embed_tokens.weight.new_empty((rows // self.ctx.tp, WIDTH))
+            parity = 1 % self.comm.parities
+            hidden = self.comm.embed_scatter(
+                input_ids, weight, start, vocab, shard, parity
+            )
+        else:
+            hidden = sp_shard(x)
         remote = backbone.collect_remote_aux_hidden_states(None)
         aux = [hidden] if backbone.start_layer in self.aux_layers else []
         residual = hidden.new_empty(
