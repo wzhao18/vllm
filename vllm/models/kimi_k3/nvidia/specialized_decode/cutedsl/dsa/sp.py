@@ -50,7 +50,7 @@ from ..gemm.decode import DecodeProjection
 from ..gemm.sp_policy import sp_projection_tactics
 from ..mla.dcp import DcpBox
 from ..mla.query import TILED_FROM
-from .attn_fi import dsa_on_flashinfer
+from .attn_fi import dsa_on_flashinfer, kernel_for
 from ..common.policy import batch_table
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS
@@ -89,7 +89,13 @@ SP_PARTIALS = PROJECTED
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
 SP_LOCAL_QUERY = "65-:local"
-SP_KERNELS = ("trtllm",)  # the FlashInfer sparse MLA kernel at every row
+# The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere). The
+# Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) wins standalone at 128 rows (VR200,
+# 1 GPU, CUDA graphs, 512 local keys per row: 17.4 vs 21.0 us; 30.6 vs 28.5 at 256,
+# 35.3 vs 35.1 at 384; runs/D-ATTN/sp km31) but not in the step: on the D3-32 slice
+# at 128 rows the DSA sparse core stayed at ~18 us per layer and the overlapped
+# g_proj slowed (one 1024-thread CTA with all TMEM per SM; dattn-t15km2-prof).
+SP_KERNELS = ""
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
@@ -311,7 +317,8 @@ class SpDsaCore:
             shape = Shape(r, q)
             core, mode = prepared.cores[r, q], prepared.overlaps[r, q]
             fmt = self.box.mailbox(r).format
-            if (core, mode, fmt) != ("trtllm", self.modes[r], SP_PARTIALS):
+            kernel = kernel_for(r, True, SP_KERNELS)
+            if (core, mode, fmt) != (kernel, self.modes[r], SP_PARTIALS):
                 raise Unsupported("dsa", shape, f"resolved {core} / {mode} / {fmt}")
         if prepared.dsac is not None:  # (sp_unsupported refused it)
             raise Unsupported("dsa", None, "the DSA sparse core")
@@ -405,6 +412,6 @@ class SpDsaCore:
         mode = self.modes[rows]
         return Choice(
             Path.GENERIC,
-            tactic=(mode, SP_KERNELS[0], SP_PARTIALS),
-            note=f"sp {mode}/{SP_KERNELS[0]}/{SP_PARTIALS}",
+            tactic=(mode, kernel_for(rows, True, SP_KERNELS), SP_PARTIALS),
+            note=f"sp {mode}/{kernel_for(rows, True, SP_KERNELS)}/{SP_PARTIALS}",
         )

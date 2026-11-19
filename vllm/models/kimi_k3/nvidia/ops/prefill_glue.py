@@ -388,6 +388,55 @@ __global__ void __launch_bounds__(128)
   }
 }
 
+// Stock blocks of SEG = 8 / 16 threads (hidden 64 / 128, e.g. per-head q / k
+// norms): cub's logical warp of SEG lanes (shuffle-down offsets 1..SEG/2),
+// replayed by SEG-lane segments, 32 / SEG rows per warp.
+template <int SEG>
+__global__ void __launch_bounds__(128)
+    rms_norm_seg_kernel(uint16_t* __restrict__ out,
+                        const uint16_t* __restrict__ input, int64_t in_stride,
+                        const uint16_t* __restrict__ weight, float epsilon,
+                        int32_t num_tokens, int32_t hidden_size,
+                        int32_t heads) {
+  int32_t const lane = threadIdx.x & 31;
+  int32_t const seg_lane = lane & (SEG - 1);
+  int32_t const row = (blockIdx.x * 128 + threadIdx.x) / SEG;
+  bool const live = row < num_tokens;
+  uint4 data = make_uint4(0, 0, 0, 0);
+  float s = 0.0f;
+  if (live) {
+    data = reinterpret_cast<const uint4*>(
+        input + int64_t{row / heads} * in_stride +
+        int64_t{row % heads} * hidden_size)[seg_lane];
+    const uint16_t* h = reinterpret_cast<const uint16_t*>(&data);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float x = bf16_bits_to_float(h[j]);
+      s += x * x;
+    }
+  }
+#pragma unroll
+  for (int off = 1; off < SEG; off <<= 1) {
+    float o = __shfl_down_sync(kFull, s, off);
+    if (seg_lane + off < SEG) s = o + s;
+  }
+  float const s_variance = __shfl_sync(
+      kFull, rsqrtf(s / hidden_size + epsilon), lane & ~(SEG - 1));
+  if (!live) return;
+  uint4 wr = __ldg(reinterpret_cast<const uint4*>(weight) + seg_lane);
+  const uint16_t* h = reinterpret_cast<const uint16_t*>(&data);
+  const uint16_t* wh = reinterpret_cast<const uint16_t*>(&wr);
+  uint4 o;
+  uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    float x = bf16_bits_to_float(h[j]);
+    float wv = bf16_bits_to_float(wh[j]);
+    oh[j] = c10::BFloat16(x * s_variance * wv).x;
+  }
+  reinterpret_cast<uint4*>(out + int64_t{row} * hidden_size)[seg_lane] = o;
+}
+
 // ---------------------------------------------------------------------------
 // gate_sigmoid_mul: ATen bf16 sigmoid (1 / (1 + exp(-x)) in fp32) then ATen
 // bf16 mul, 8 columns per thread.
@@ -411,20 +460,29 @@ __device__ __forceinline__ uint16_t gate_sigmoid_bf16(float gv) {
 
 __device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
     uint4 a, uint4 g, const uint16_t* __restrict__ lut) {
-  const uint16_t* ah = reinterpret_cast<const uint16_t*>(&a);
   const uint16_t* gh = reinterpret_cast<const uint16_t*>(&g);
+  const uint32_t* aw = reinterpret_cast<const uint32_t*>(&a);
   uint4 o;
-  uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
+  uint32_t* ow = reinterpret_cast<uint32_t*>(&o);
+  uint32_t s[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     const uint32_t b = gh[j];
     const uint32_t e = ((b >> 7) & 0xffu) - (uint32_t)GATE_LUT_E0;
-    const uint16_t sbits =
-        e < (uint32_t)GATE_LUT_NE
-            ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
-            : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
-    oh[j] = c10::BFloat16(bf16_bits_to_float(ah[j]) *
-                          bf16_bits_to_float(sbits)).x;
+    s[j] = e < (uint32_t)GATE_LUT_NE
+               ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
+               : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
+  }
+  // BF16 x BF16 products, rounded by cvt.rn.bf16x2 (RNE, as c10::BFloat16 for
+  // every non-NaN value) on packed pairs.
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    const float2 av = make_float2(__uint_as_float(aw[p] << 16),
+                                  __uint_as_float(aw[p] & 0xffff0000u));
+    const float2 sv = make_float2(__uint_as_float(s[2 * p] << 16),
+                                  __uint_as_float(s[2 * p + 1] << 16));
+    const __nv_bfloat162 r = __floats2bfloat162_rn(av.x * sv.x, av.y * sv.y);
+    ow[p] = *reinterpret_cast<const uint32_t*>(&r);
   }
   return o;
 }
@@ -534,16 +592,23 @@ void router_topk(torch::Tensor& topk_values, torch::Tensor& topk_indices,
                                        dev) == cudaSuccess);
     return v;
   }();
-  // Up to 8 resident 256-thread blocks per SM (register bound at VPL 28-32).
-  const dim3 grid((unsigned)std::min<int64_t>((n + kWarps - 1) / kWarps,
-                                              (int64_t)sms * 8)),
-      block(kWarps * 32);
+  const dim3 block(kWarps * 32);
+  // One resident wave of blocks (grid-stride over the tokens), from the
+  // occupancy of the instantiation (register bound at VPL 28-32).
 #define K3_TOPK_LAUNCH(V)                                                   \
+  {                                                                         \
+    static int occ_##V = 0;                                                 \
+    if (occ_##V == 0)                                                       \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(                        \
+          &occ_##V, router_topk_kernel<V, kWarps>, kWarps * 32, 0);         \
+    const dim3 grid((unsigned)std::min<int64_t>(                            \
+        (n + kWarps - 1) / kWarps, (int64_t)sms * std::max(occ_##V, 1)));   \
   router_topk_kernel<V, kWarps><<<grid, block, 0, stream>>>(                \
       scores.data_ptr<float>(), scores.stride(0), bias.data_ptr<float>(),   \
       topk_values.data_ptr<float>(), topk_indices.data_ptr<int32_t>(),      \
       (int32_t)n, (int32_t)e, (int32_t)k, renormalize,                      \
-      (float)routed_scaling_factor)
+      (float)routed_scaling_factor);                                       \
+  }
   if (vpl <= 8) {
     K3_TOPK_LAUNCH(8);
   } else if (vpl <= 16) {
@@ -563,17 +628,41 @@ void rms_norm_rows(torch::Tensor& out, const torch::Tensor& input,
   TORCH_CHECK(input.scalar_type() == at::kBFloat16 &&
               out.scalar_type() == at::kBFloat16 &&
               weight.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(input.dim() == 2 && input.stride(1) == 1 && out.is_contiguous() &&
+  // 3-D [T, H, D] (per-head norms; rows = T * H, head stride D) is taken by
+  // the segment kernels only.
+  const bool heads3 = input.dim() == 3;
+  TORCH_CHECK((input.dim() == 2 || (heads3 && input.stride(1) == input.size(2))) &&
+              input.stride(-1) == 1 && out.is_contiguous() &&
               weight.is_contiguous() && weight.dim() == 1);
-  const int64_t n = input.size(0);
-  const int64_t h = input.size(1);
-  TORCH_CHECK(h % 8 == 0 && weight.numel() == h && out.size(1) == h);
+  const int64_t heads = heads3 ? input.size(1) : 1;
+  const int64_t n = input.size(0) * heads;
+  const int64_t h = input.size(-1);
+  TORCH_CHECK(h % 8 == 0 && weight.numel() == h && out.numel() == n * h);
   TORCH_CHECK(input.stride(0) % 8 == 0 &&
               reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
               reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0 &&
               reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0);
-  TORCH_CHECK(block_size % 32 == 0 && block_size >= 32 && block_size <= 256);
   if (n == 0) return;
+  if ((block_size == 8 || block_size == 16) && h == block_size * 8) {
+    auto seg_stream = c10::cuda::getCurrentCUDAStream();
+    const dim3 seg_grid((unsigned)((n * block_size + 127) / 128));
+#define K3_RMS_SEG_LAUNCH(S)                                                \
+  rms_norm_seg_kernel<S><<<seg_grid, 128, 0, seg_stream>>>(                 \
+      reinterpret_cast<uint16_t*>(out.data_ptr()),                          \
+      reinterpret_cast<const uint16_t*>(input.data_ptr()), input.stride(0), \
+      reinterpret_cast<const uint16_t*>(weight.data_ptr()), (float)epsilon, \
+      (int32_t)n, (int32_t)h, (int32_t)heads)
+    if (block_size == 8) {
+      K3_RMS_SEG_LAUNCH(8);
+    } else {
+      K3_RMS_SEG_LAUNCH(16);
+    }
+#undef K3_RMS_SEG_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  TORCH_CHECK(!heads3 && block_size % 32 == 0 && block_size >= 32 &&
+              block_size <= 256);
   const int nw = (int)(block_size / 32);
   const int64_t num_vec = h / 8;
   const int vpt = (int)((num_vec + block_size - 1) / block_size);
@@ -630,11 +719,19 @@ void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                          attn.get_device());
-  const int64_t max_blocks = (int64_t)sms * 4;
-  const int blocks =
-      (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   const bool contig = attn.stride(0) == d && gate.stride(0) == d &&
                       out.stride(0) == d;
+  // One resident wave of CTAs (grid-stride loop).
+  static int occ[2] = {0, 0};
+  if (occ[contig] == 0) {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ[contig],
+        contig ? gate_sigmoid_mul_kernel<true> : gate_sigmoid_mul_kernel<false>,
+        threads, 0);
+  }
+  const int64_t max_blocks = (int64_t)sms * std::max(occ[contig], 1);
+  const int blocks =
+      (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   auto stream = c10::cuda::getCurrentCUDAStream();
   auto* op = reinterpret_cast<uint16_t*>(out.data_ptr());
   auto* ap = reinterpret_cast<const uint16_t*>(attn.data_ptr());
@@ -811,6 +908,8 @@ def use_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> bool:
     hidden = x.shape[1]
     block = stock_rms_norm_block_size(x.shape[0], hidden)
     vpt = -(-(hidden // 8) // block)
+    if block in (8, 16):
+        return hidden == block * 8
     return (
         block % 32 == 0
         and vpt <= RMS_NORM_MAX_VECS_PER_LANE
@@ -818,11 +917,39 @@ def use_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def use_head_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Per-shape policy + capability for :func:`rms_norm` of per-head norms,
+    ``x`` = [tokens, heads, head_dim] (head stride head_dim): stock blocks of
+    8 / 16 threads (head_dim 64 / 128), replayed one row per lane segment."""
+    if not (
+        x.dim() == 3
+        and x.shape[0] * x.shape[1] >= RMS_NORM_MIN_ROWS
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and weight.numel() == x.shape[2]
+        and x.stride(2) == 1
+        and x.stride(1) == x.shape[2]
+        and x.stride(0) % 8 == 0
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    ):
+        return False
+    block = stock_rms_norm_block_size(x.shape[0] * x.shape[1], x.shape[2])
+    return block in (8, 16) and x.shape[2] == block * 8
+
+
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``_C.rms_norm`` of a 2-D BF16 ``x`` (row stride allowed), bitwise equal;
     the caller checks :func:`use_rms_norm`."""
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-    block = stock_rms_norm_block_size(x.shape[0], x.shape[1])
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    block = stock_rms_norm_block_size(x.numel() // x.shape[-1], x.shape[-1])
     _module().rms_norm_rows(out, x, weight, float(eps), block)
     return out
 

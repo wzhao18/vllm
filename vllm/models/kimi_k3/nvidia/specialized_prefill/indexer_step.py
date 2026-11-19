@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Kimi K3.1 prefill indexer on sm_107: one layer's exact prefill top-k through the
+selective path of ``indexer`` (sampled thresholds, candidate-publishing MXFP4
+score, exact candidate select, on-device recovery of unsettled rows), called by
+the stock sparse_attn_indexer for single-rank (no DCP / PCP / ShardQ) MXFP4
+prefills in place of its per-chunk logits + top-k loop.
+
+The stock loop splits the rows into chunks that bound the materialized logits;
+this path writes no logits on its common path, so it regroups consecutive chunks
+into groups of about GROUP_ROWS rows (fewer, longer launches: the persistent
+score kernel's tail stays small) and bounds only the recovery scratch.
+
+Per step (cached on the first chunk's ``logits_inputs`` by the step's first DSA
+layer, outside graph capture): one host read of the row bounds of all chunks ->
+segments (one request's rows in one chunk), their 128-aligned key layout and a
+SelectivePlan per group. Per layer, with no host reads: each segment's keys
+gathered to its aligned base and the selective top-k of each group.
+"""
+
+import torch
+
+from vllm import _custom_ops as ops
+from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer as pidx
+from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import mqa_logits_mx_inputs
+
+_KEY = "kimi_k3_pidx"
+GROUP_ROWS = 8192
+
+
+def applicable(
+    use_fp4_cache: bool,
+    topk_tokens: int,
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    dcp_world_size: int,
+    has_shardq: bool,
+    has_candidate_blocks: bool,
+    chunks,
+) -> bool:
+    from vllm.logger import init_logger
+
+    ok = (
+        use_fp4_cache
+        and topk_tokens == 2048
+        and q_scale is not None
+        and q_quant.shape[1] == pidx.HEADS
+        and dcp_world_size == 1
+        and not has_shardq
+        and not has_candidate_blocks
+        and len(chunks) > 0
+        and all(c.pcp_deinterleave_idx is None for c in chunks)
+        and current_platform.is_device_capability((10, 7))
+    )
+    init_logger(__name__).info_once(
+        "Kimi K3.1 sm_107 selective prefill indexer: %s (fp4=%s topk=%d heads=%d "
+        "dcp=%d shardq=%s)", "on" if ok else "off", use_fp4_cache, topk_tokens,
+        q_quant.shape[1], dcp_world_size, has_shardq,
+    )
+    return ok
+
+
+class _Group:
+    """Consecutive rows [r0, r1) of the layer: their segments (one request's rows
+    in one chunk), the key gathers (one per request: a request split over chunks
+    shares its keys) and the SelectivePlan."""
+
+    def __init__(self, segs, r0, r1, device):
+        self.r0, self.r1 = r0, r1
+        # segs: (chunk, request in chunk, rows, last row's keys, key count, request)
+        widest = {}
+        for c, b, _, _, n, req in segs:
+            if req not in widest or n > widest[req][2]:
+                widest[req] = (c, b, n)
+        base_of, self.gathers, nk = {}, [], 0
+        for req, (c, b, n) in widest.items():
+            base_of[req] = nk
+            self.gathers.append(
+                (c, b, n, nk, torch.tensor([0, n], dtype=torch.int32, device=device))
+            )
+            nk += (n + pidx.TILE - 1) // pidx.TILE * pidx.TILE
+        self.nk = max(nk, pidx.TILE)
+        self.sp = pidx.SelectivePlan(
+            [s[2] for s in segs], [s[3] for s in segs], [base_of[s[5]] for s in segs],
+            device,
+        )
+        assert self.sp.t == r1 - r0
+
+
+def _layout(chunks, device):
+    cached = chunks[0].logits_inputs.get(_KEY)
+    if cached is not None:
+        return cached
+    assert not torch.cuda.is_current_stream_capturing(), (
+        "the selective prefill indexer layout is built by the step's first "
+        "(eager) forward"
+    )
+    host = [
+        (
+            c.cu_seqlen_ks.to("cpu", non_blocking=True),
+            c.cu_seqlen_ke.to("cpu", non_blocking=True),
+            c.local_cu_seq_lens.to("cpu", non_blocking=True),
+            c.block_table.to("cpu", non_blocking=True),
+        )
+        for c in chunks
+    ]
+    torch.cuda.current_stream(device).synchronize()
+    groups, segs, r0 = [], [], chunks[0].token_start
+    next_row = r0
+    for ci, (c, (ks, ke, cu, bt)) in enumerate(zip(chunks, host)):
+        ks, ke, cu = ks.tolist(), ke.tolist(), cu.tolist()
+        assert c.token_start == next_row and len(ks) == c.token_end - c.token_start, (
+            "prefill chunks must cover consecutive rows"
+        )
+        next_row = c.token_end
+        starts = {s: b for b, s in enumerate(cu[:-1])}
+        i = 0
+        while i < len(ks):
+            j = i
+            while j + 1 < len(ks) and ks[j + 1] == ks[i]:
+                j += 1
+            b = starts[ks[i]]
+            n = cu[b + 1] - cu[b]
+            # the request's identity: its blocks (a request split over chunks has
+            # the same block table row in each)
+            req = bt[b].numpy().tobytes()
+            segs.append((ci, b, j - i + 1, ke[j] - ks[i], n, req))
+            i = j + 1
+        rows = sum(s[2] for s in segs)
+        if rows >= GROUP_ROWS or ci == len(chunks) - 1:
+            groups.append(_Group(segs, r0, r0 + rows, device))
+            segs, r0 = [], r0 + rows
+    chunks[0].logits_inputs[_KEY] = groups
+    return groups
+
+
+def layer_topk(
+    chunks,
+    kv_cache: torch.Tensor,
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor,
+    weights: torch.Tensor,
+    topk_buffer: torch.Tensor,
+) -> None:
+    """Exact top-k of every prefill row of the layer into ``topk_buffer[rows,
+    :2048]`` (request-local key indices, unordered, -1 padded)."""
+    dev = q_quant.device
+    for g in _layout(chunks, dev):
+        sp = g.sp
+        keys = torch.empty((g.nk, 64), dtype=torch.uint8, device=dev)
+        scales = torch.empty((g.nk, 4), dtype=torch.uint8, device=dev)
+        for ci, b, n, base, cu in g.gathers:
+            ops.cp_gather_indexer_k_quant_cache(
+                kv_cache,
+                keys[base : base + n],
+                scales[base : base + n],
+                chunks[ci].block_table[b : b + 1],
+                cu,
+            )
+        rows = slice(g.r0, g.r1)
+        _, w16 = mqa_logits_mx_inputs(
+            q_quant[rows].view(torch.int8), q_scale[rows], weights[rows]
+        )
+        dst = topk_buffer[rows, :2048]
+        out = dst if dst.is_contiguous() else torch.empty(
+            (sp.t, 2048), dtype=torch.int32, device=dev
+        )
+        pidx.selective_topk(
+            sp,
+            q_quant[rows].contiguous().view(torch.uint8),
+            q_scale[rows].contiguous(),
+            keys,
+            scales.view(torch.int32).view(g.nk),
+            w16.contiguous(),
+            out,
+        )
+        if out is not dst:
+            dst.copy_(out)

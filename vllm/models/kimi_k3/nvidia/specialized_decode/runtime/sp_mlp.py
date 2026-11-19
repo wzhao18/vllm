@@ -33,7 +33,8 @@ from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
-from ..shapes import Choice, Unsupported
+from ..cutedsl.moe.route_stage import RouteStage, route_stage_cause
+from ..shapes import Choice, Path, Shape, Unsupported, rows_policy
 from .providers import bf16_weight
 
 # Stock: the routed down projection runs on the aux stream up to this many tokens
@@ -42,6 +43,19 @@ FAMILIES = ("latent_down", "shared_gu", "shared_down", "latent_up")
 # On the MegaMoE side stream (``_shared_overlap``) these take ``sp_policy``'s
 # "<family>_side" table (torch kinds: what fits beside the capped MegaMoE grid).
 SHARED = ("shared_gu", "shared_down")
+# Router gate | routed latent down as ONE GEMM over the load-time concatenated
+# [896 + 3584, 7168] weight (the two stock linears become row views of it), FP32
+# output: the router logits are the FP32 columns 0:896 exactly as stock's cuBLAS
+# BF16 -> FP32 router GEMM, the latent the round-to-nearest BF16 of the FP32 columns
+# 896: as stock's BF16 latent down (summation order aside). One kernel
+# (``moe.route_stage``) then runs stock's grouped top-k on the logits and the
+# MegaMoE stager on the latent, so the chain to MegaMoE is GEMM -> stage, not
+# router GEMM -> split-K reduce -> top-k -> (latent down join) -> stage.
+# Shard rows on the pinned GEMM (``ltpin``). In-step (D3-32 NVFP4 slice, step
+# median vs the router || latent down pair): n32 / n64 -34..-39 / -52..-64 us per
+# 24-layer step; n96 +28..+54 (the GEMM at 96 rows is no faster than the pair), so
+# n96 keeps the stock pair:
+ROUTER_LATENT = {"*": "25-72:ltpin"}
 
 
 def _stock_threshold():
@@ -111,6 +125,29 @@ class SpMlp:
         self.mlp, self.rows = mlp, tuple(sorted(set(rows)))
         shared, transform = mlp.shared_experts, mlp.routed_output_transform
         self.mxfp8 = bool(shared_mxfp8(mlp))
+        # Router | latent down concatenation (before any GEMM reads the weights:
+        # the stock linears become views of the packed weight).
+        concat_rows = tuple(
+            r for r in self.rows
+            if rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) == "ltpin"
+        )  # fmt: skip
+        self.router_latent = self.route_stage = None
+        if (
+            concat_rows
+            and router_concat_cause(mlp) is None
+            and route_stage_cause(mlp) is None
+        ):
+            from ..cutedsl.gemm.ltpin import LtPin
+
+            packed = pack_router_latent(mlp)
+            n, k = packed.shape
+            self.router_latent = (
+                packed,
+                LtPin("router_latent", n, k, concat_rows, out32=True,
+                      device=packed.device),
+                mlp.gate.weight.shape[0],
+            )  # fmt: skip
+            self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -159,7 +196,13 @@ class SpMlp:
 
     def choices(self, n):
         """The four GEMM families' choices at ``n`` shard rows."""
-        return {f: self.gemms[f].choice(n) for f in FAMILIES}
+        out = {f: self.gemms[f].choice(n) for f in FAMILIES}
+        concat = self.router_latent
+        if concat is not None and n in concat[1].plans:
+            out["latent_down"] = Choice(
+                Path.TUNED, tactic=("ltpin", None), note="router|latent_down ltpin"
+            )
+        return out
 
     def mx_input(self):
         """The MXFP8 shared gate_up's input scratch (``gemm.mxfp8.Mxfp8Input``) a
@@ -193,21 +236,36 @@ class SpMlp:
         def down():
             return gemms["latent_down"].run(h, h.new_empty((n, self.latent)))
 
-        (router_output, topk_ids), routed = maybe_execute_in_parallel(
-            lambda: mlp._router(h),
-            down,
-            mlp._down_proj_events[0],
-            mlp._down_proj_events[1],
-            mlp._down_proj_stream if n <= self.threshold else None,
-        )
         fused_norm = self.fused_norm
+        route = self.route_stage
+        if route is not None and route.ready(n):
+            # Router | latent down as one FP32 GEMM, then one kernel stages its
+            # top-k routes and the quantized latent into MegaMoE (route_stage).
+            packed, gemm, _ = self.router_latent
+            y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
+            gemm.run(packed, h, y)
+            # Staged before the shared expert forks to its stream: nothing
+            # competes with the MegaMoE front.
+            staged = route.stage(y)
 
-        def experts():
-            if fused_norm is None:
-                return mlp.experts(routed, router_output, topk_ids)
-            return mlp.experts(
-                routed, router_output, topk_ids, output_rmsnorm=fused_norm
+            def experts():
+                return route.launch(staged, fused_norm)
+
+        else:
+            (router_output, topk_ids), routed = maybe_execute_in_parallel(
+                lambda: mlp._router(h),
+                down,
+                mlp._down_proj_events[0],
+                mlp._down_proj_events[1],
+                mlp._down_proj_stream if n <= self.threshold else None,
             )
+
+            def experts():
+                if fused_norm is None:
+                    return mlp.experts(routed, router_output, topk_ids)
+                return mlp.experts(
+                    routed, router_output, topk_ids, output_rmsnorm=fused_norm
+                )
 
         if mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
@@ -230,6 +288,51 @@ def _rubin_megamoe(experts) -> bool:
     from ...megamoe_rubin.experts import KimiK3MegaMoEExperts
 
     return isinstance(experts, KimiK3MegaMoEExperts)
+
+
+def router_concat_cause(mlp):
+    """Why the router | latent down concatenation would not reproduce stock's router
+    GEMM at the SP shard rows (> 16: stock's BF16 -> FP32 cuBLAS tier), or None."""
+    from ..cutedsl.gemm.ltpin import shape_name
+
+    gate = getattr(mlp, "gate", None)
+    if gate is None:
+        return "no router gate linear"
+    weight = gate.weight
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        return f"router weight {weight.dtype}"
+    if getattr(gate, "bias", None) is not None:
+        return "router bias"
+    if gate.out_dtype != torch.float32 or not getattr(gate, "allow_cublas_router_gemm", False):
+        return "router is not the BF16 -> FP32 cuBLAS GEMM"
+    for flag in ("allow_fp32_router_gemm", "allow_ll_fp32w_gemm",
+                 "allow_bf16x3_router_gemm", "allow_rocm_bf16x3_router_gemm"):  # fmt: skip
+        if getattr(gate, flag, False):
+            return f"router tier {flag}"
+    down = mlp.routed_expert_down_proj.weight
+    if down.dtype != torch.bfloat16 or down.shape[1] != weight.shape[1]:
+        return "latent down weight"
+    n, k = weight.shape[0] + down.shape[0], weight.shape[1]
+    if shape_name(n, k, "bf16", out32=True) != "router_latent":
+        return f"no pinned router | latent down GEMM for [{n}, {k}]"
+    return None
+
+
+def pack_router_latent(mlp):
+    """One [router | latent down] BF16 weight; the stock router gate and routed down
+    projection become row views of it (no second copy)."""
+    packed = getattr(mlp, "packed_router_latent", None)
+    if packed is not None:
+        return packed
+    linears = (mlp.gate, mlp.routed_expert_down_proj)
+    packed = torch.cat([linear.weight.data for linear in linears])
+    row = 0
+    for linear in linears:
+        rows = linear.weight.shape[0]
+        linear.weight.data = packed[row : row + rows]
+        row += rows
+    mlp.packed_router_latent = packed
+    return packed
 
 
 def moe_choice(mlps, n):

@@ -497,7 +497,7 @@ class KimiMLP(nn.Module):
         if isinstance(self.act_fn, SiluAndMul):
             mxfp8_act.silu_and_mul_quantize(gate_up, out=out, col=col)
         else:
-            mxfp8_act.situ_and_mul_quantize(
+            mxfp8_act.situ_and_mul_quantize_auto(
                 gate_up, self.act_fn.beta, self.act_fn.linear_beta, out=out, col=col
             )
 
@@ -507,7 +507,7 @@ class KimiMLP(nn.Module):
             return None
         if isinstance(self.act_fn, SiluAndMul):
             return mxfp8_act.silu_and_mul_quantize(gate_up)
-        return mxfp8_act.situ_and_mul_quantize(
+        return mxfp8_act.situ_and_mul_quantize_auto(
             gate_up, self.act_fn.beta, self.act_fn.linear_beta
         )
 
