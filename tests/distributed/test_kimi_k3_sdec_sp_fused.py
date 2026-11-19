@@ -264,7 +264,11 @@ def _worker(env: dict[str, str]) -> None:
                               for r in range(world)])
             want.view(torch.int32)[:, 7::101] = 0
             assert torch.equal(got.view(torch.int32), want.view(torch.int32)), rows
+            # Every rank done with this gather before the re-arm check, and checked
+            # before any rank multicasts the next one into the boxes.
+            dist.barrier()
             assert bool((final.box.view(torch.int32) == SENTINEL).all()), rows
+            dist.barrier()
         if rank == 0:
             print("worst ulp ratios", worst)
         dist.barrier()
@@ -291,9 +295,13 @@ def _run(world):
         p = ctx.Process(target=_worker, args=(env,))
         p.start()
         procs.append(p)
+    # A failed rank exits at once (os._exit); its peers may spin on device waits
+    # for it, so stop them as soon as any rank fails (or at the deadline).
     deadline = time.monotonic() + 600
-    for p in procs:
-        p.join(timeout=max(0.0, deadline - time.monotonic()))
+    while time.monotonic() < deadline and any(p.is_alive() for p in procs):
+        if any(p.exitcode not in (None, 0) for p in procs):
+            break
+        time.sleep(0.5)
     for p in procs:
         if p.is_alive():
             p.kill()

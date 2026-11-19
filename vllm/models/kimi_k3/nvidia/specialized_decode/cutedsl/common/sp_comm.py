@@ -600,7 +600,9 @@ def compile_gather_copy(n, tp, cap, width, grid, device):
 
 class SpFinalGather:
     """The final all-gather's multicast box [rows_cap, width] (Lamport-armed; the
-    kernel re-arms what it reads). Collective to build."""
+    kernel re-arms what it reads). Collective to build. One box: a rank may start
+    the next gather only once every rank has read this one (a decode step's
+    collectives separate two final gathers)."""
 
     def __init__(self, group, device, tp, rank, *, width, rows_cap):
         if rows_cap % tp or width % 8:
