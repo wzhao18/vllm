@@ -1503,6 +1503,9 @@ class PrefillFinish:
 CS_THREADS = 256
 CS_BATCH = 8  # candidate loads in flight per thread (CandSelect staging)
 CS_TIES = 1024  # threshold ties ranked per row (more: the row takes the full path)
+# candidate slots per lane staged in shared memory (lanes average ~34 at the
+# deployed margin; later slots are read from the region): 32 KiB, so 8 CTAs/SM
+CS_SLOTS = 64
 RP_THREADS = 1024  # RecPlan threads (one CTA)
 
 
@@ -1560,12 +1563,34 @@ class CandSelect:
         )
 
     @cute.jit
-    def entry(self, cbuf_a, j, s):
-        """(key index, order16 key) of lane j's candidate s, staged in shared memory
-        as order16 key << 16 | tile."""
-        wd = ld_shared_u32(cbuf_a + (s * TILE + j) * 4)
+    def entry(self, cbuf_a, j, s, cand, base):
+        """(key index, order16 key) of lane j's candidate s: staged in shared memory
+        as order16 key << 16 | tile for the first CS_SLOTS slots, the rest read
+        from the candidate region."""
+        wd = Uint32(0)
+        if s < CS_SLOTS:
+            wd = ld_shared_u32(cbuf_a + (s * TILE + j) * 4)
+        else:
+            raw = Uint32(cand[base + (s + 1) * TILE + j])
+            wd = (order16(raw & Uint32(0xFFFF)) << Uint32(16)) | (raw >> Uint32(16))
         pos = Int32(wd & Uint32(0xFFFF)) * TILE + 4 * (j % 32) + j // 32
         return pos, wd >> Uint32(16)
+
+    @cute.jit
+    def block_offset(self, v, tid, lane, w, buf_a):
+        """Exclusive prefix sum of v over the CTA (all threads call it); buf_a:
+        CS_THREADS // 32 shared words, free until the next row."""
+        inc = warp_inclusive(v, lane)
+        cute.arch.sync_threads()
+        if lane == 31:
+            st_shared_u32(buf_a + w * 4, inc)
+        cute.arch.sync_threads()
+        pre = Uint32(0)
+        for i in cutlass.range_constexpr(CS_THREADS // 32):
+            x = ld_shared_u32(buf_a + i * 4)
+            if i < w:
+                pre += x
+        return pre + inc - v
 
     @cute.jit
     def emit(self, flag, pos, slot_a, out, orow, lane):
@@ -1594,7 +1619,7 @@ class CandSelect:
         cnt_a = info_a + 8 * 4
         ties = smem.allocate_tensor(Int32, cute.make_layout(CS_TIES), 16)
         ties_a = ties.iterator.toint()
-        cbuf = smem.allocate_tensor(Uint32, cute.make_layout(CAP), 16)
+        cbuf = smem.allocate_tensor(Uint32, cute.make_layout(CS_SLOTS * TILE), 16)
         cbuf_a = cbuf.iterator.toint()
         lim = smem.allocate_tensor(Uint32, cute.make_layout(4), 16)
         lim_a = lim.iterator.toint()
@@ -1622,10 +1647,6 @@ class CandSelect:
         j = tid % TILE
         half = tid // TILE
         cj = Int32(ld_shared_u32(cnt_a + j * 4))
-        # a warp's lanes are 32 consecutive key lanes: loop to the warp's longest
-        cjw = cj
-        for i in cutlass.range_constexpr(5):
-            cjw = cutlass.max(cjw, cute.arch.shuffle_sync_bfly(cjw, 1 << i))
         bad = Int32(ld_shared_u32(info_a + 24))
         if total < kk:
             bad = Int32(1)
@@ -1646,10 +1667,11 @@ class CandSelect:
                 for k in cutlass.range_constexpr(CS_BATCH):
                     if s0 + 2 * k < cj:
                         key = order16(ws[k] & Uint32(0xFFFF))
-                        st_shared_u32(
-                            cbuf_a + ((s0 + 2 * k) * TILE + j) * 4,
-                            (key << Uint32(16)) | (ws[k] >> Uint32(16)),
-                        )
+                        if s0 + 2 * k < CS_SLOTS:
+                            st_shared_u32(
+                                cbuf_a + ((s0 + 2 * k) * TILE + j) * 4,
+                                (key << Uint32(16)) | (ws[k] >> Uint32(16)),
+                            )
                         kmin = cutlass.min(kmin, key)
                         kmax = cutlass.max(kmax, key)
             for i in cutlass.range_constexpr(5):
@@ -1660,14 +1682,13 @@ class CandSelect:
                 atom_max_shared(lim_a + 4, kmax)
             cute.arch.sync_threads()
             if total <= Int32(K):
-                for s in cutlass.range(half, cjw, 2, unroll=1):
-                    pos = Int32(0)
-                    key = Uint32(0)
-                    valid = Uint32(0)
-                    if s < cj:
-                        pos, key = self.entry(cbuf_a, j, s)
-                        valid = Uint32(1)
-                    self.emit(valid, pos, info_a + 12, out, orow, lane)
+                # every candidate: contiguous output ranges from a block scan
+                mine = Uint32(cutlass.max(cj - half + 1, 0) // 2)
+                o = Int32(self.block_offset(mine, tid, lane, w, cnt_a))
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cbuf_a, j, s, cand, base)
+                    out[orow + o] = pos
+                    o += 1
                 for i in cutlass.range(total + tid, K, CS_THREADS, unroll=1):
                     out[orow + i] = Int32(-1)
             else:
@@ -1680,7 +1701,7 @@ class CandSelect:
                 if span > Uint32(255):
                     shift = Uint32(24) - clz(span)
                 for s in cutlass.range(half, cj, 2, unroll=2):
-                    pos, key = self.entry(cbuf_a, j, s)
+                    pos, key = self.entry(cbuf_a, j, s, cand, base)
                     red_shared(hist_a + (((key - k0) >> shift) << Uint32(2)), 1)
                 cute.arch.sync_threads()
                 if w == 0:
@@ -1695,7 +1716,7 @@ class CandSelect:
                     st_shared_u32(hist_a + tid * 4, Uint32(0))
                     cute.arch.sync_threads()
                     for s in cutlass.range(half, cj, 2, unroll=2):
-                        pos, key = self.entry(cbuf_a, j, s)
+                        pos, key = self.entry(cbuf_a, j, s, cand, base)
                         if ((key - k0) >> shift) == b1:
                             red_shared(
                                 hist_a + (((key - k0) & ((Uint32(1) << shift) - Uint32(1))) << Uint32(2)), 1
@@ -1708,22 +1729,26 @@ class CandSelect:
                     above = above + ld_shared_u32(info_a + 4)
                     m = ld_shared_u32(info_a + 8)
                 need = Uint32(K) - above
-                for s in cutlass.range(half, cjw, 2, unroll=1):
-                    pos = Int32(0)
-                    key = Uint32(0)
-                    take = Uint32(0)
-                    tie = Uint32(0)
-                    if s < cj:
-                        pos, key = self.entry(cbuf_a, j, s)
-                        if key > t:
-                            take = Uint32(1)
-                        elif key == t:
-                            if m == need:
-                                take = Uint32(1)
-                            else:
-                                tie = Uint32(1)
-                    self.emit(take, pos, info_a + 12, out, orow, lane)
-                    if tie != Uint32(0):
+                # keys above t (and the ties at t when all of them fit): a count,
+                # a block scan, then contiguous output ranges; other ties ranked
+                # below by key index
+                t_in = Uint32(0)
+                if m == need:
+                    t_in = Uint32(1)
+                mine = Uint32(0)
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cbuf_a, j, s, cand, base)
+                    if key > t:
+                        mine += Uint32(1)
+                    elif key == t:
+                        mine += t_in
+                o = Int32(self.block_offset(mine, tid, lane, w, cnt_a))
+                for s in cutlass.range(half, cj, 2, unroll=2):
+                    pos, key = self.entry(cbuf_a, j, s, cand, base)
+                    if key > t or (key == t and t_in != Uint32(0)):
+                        out[orow + o] = pos
+                        o += 1
+                    elif key == t:
                         jt = atom_add_shared(info_a + 16, Uint32(1))
                         if jt < Uint32(CS_TIES):
                             st_shared_u32(ties_a + jt * 4, Uint32(pos))
