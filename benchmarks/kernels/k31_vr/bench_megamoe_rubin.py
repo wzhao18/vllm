@@ -187,6 +187,12 @@ def parse_args():
         "the stock MXFP8 chain (FP32 GEMMs, SiTU, MXFP8 requant)",
     )
     p.add_argument(
+        "--rmsnorm",
+        action="store_true",
+        help="fuse the consumer RMSNorm (random BF16 weight, Kimi K3.1 latent norm) "
+        "into the top-k reduce, as the decode path deploys it",
+    )
+    p.add_argument(
         "--shared-l2-position",
         choices=("early", "tail"),
         default=None,
@@ -667,6 +673,12 @@ def main():
             fc1 = die_local.place_halves(fused.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
             fused = fused._replace(fc1=(fc1, fused.fc1[1]))
     moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),), shared=fused)
+    rms = None
+    if args.rmsnorm:
+        gen = torch.Generator(device=device).manual_seed(args.seed + 7)
+        norm_w = (1 + 0.1 * torch.randn(problem.hidden, generator=gen, device=device)).to(torch.bfloat16)
+        rms = (norm_w, 1e-6)
+        moe.prepare_rmsnorm(weights, *rms)
     ident = env_identity(os.path.dirname(mr.__file__))
     cycles_per_us = sleep_cycles_per_us()
     delay_cycles = int(args.delay_us * cycles_per_us)
@@ -700,7 +712,9 @@ def main():
         out = torch.empty(
             (max(n, 1), problem.hidden), dtype=torch.bfloat16, device=device
         )
-        res = moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused)
+        res = moe.forward(
+            hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms
+        )
         torch.cuda.synchronize()
         moe.check_route_errors()
 
@@ -780,10 +794,12 @@ def main():
             result["shared_rel_l2_kernel_vs_exact_act"] = rel(got, exact)
 
         def launch():
-            session.launch(weights, target, shared=fused)
+            session.launch(weights, target, rmsnorm=rms, shared=fused)
 
         def forward():
-            moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused)
+            moe.forward(
+                hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms
+            )
 
         # eager (FlashInfer tuner protocol of the knob records), then CUDA graphs
         for _ in range(args.warmup):
