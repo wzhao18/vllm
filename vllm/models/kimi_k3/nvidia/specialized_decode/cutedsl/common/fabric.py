@@ -73,6 +73,24 @@ def put_multimem(barrier, endpoint, offset, counter, source, size):
     return code, "r,l,l,r,r,r,~{memory}", operands
 
 
+_RED_TYPES = ("u32", "u64", "f16", "bf16", "f32", "f64")
+
+
+@asm()
+def red_add(barrier, endpoint, offset, counter, source, size, dtype="u32"):
+    """Counted ``fabric.try_red ... add.<dtype>``: element-wise add of ``size`` bytes
+    at smem ``source`` into window byte ``offset`` of ``endpoint`` (order across
+    senders unspecified: exact for integers), counted like ``put``."""
+    assert dtype in _RED_TYPES, dtype
+    code = (
+        "fabric.try_red.async.shared::cta.mbarrier::complete_tx::16B"
+        ".mbarrier::report::fabric.counted::bytes.relaxed.sys.add."
+        f"{dtype} [$0,$1,$2],[$3],$4,[$5];"
+    )
+    operands = (Uint32(endpoint), Int64(offset), Int64(counter), source, Uint32(size), barrier)
+    return code, "r,l,l,r,r,r,~{memory}", operands
+
+
 @asm()
 def submit_expect(barrier, size):
     """Submit this thread's queued puts and arrive on ``barrier`` expecting ``size``
