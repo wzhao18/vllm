@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+#include <string>
 
 #define CK(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { printf("CU err %d line %d\n", (int)r_, __LINE__); exit(1); } } while (0)
 #define CR(x) do { cudaError_t r_ = (x); if (r_ != cudaSuccess) { printf("CUDA err %s line %d\n", cudaGetErrorString(r_), __LINE__); exit(1); } } while (0)
@@ -50,6 +51,7 @@ struct Maps { CUtensorMap qkv, g, og, beta, out, qkv_h, g_h, og_h, beta_h, out_h
 
 __device__ __forceinline__ unsigned sa(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ volatile unsigned* g_diag;
+__device__ __forceinline__ unsigned long long gtime() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
 __device__ __forceinline__ void mb_wait(unsigned b, unsigned ph) {
   unsigned ok = 0; long long n = 0;
   while (true) {
@@ -74,6 +76,9 @@ __device__ __forceinline__ void named_bar(int id, int n) { asm volatile("bar.syn
 
 struct Args {
   int nseq, seqlen, nchunk, nchain, mode, S_total, iss6, fma, mufu, onorm, hm, noout, T;
+  int mix;                 // interleave the FMA and MUFU work in one instruction stream (as compiled math does)
+  int erel;                // release the stage right after its words are in registers (SIMT on registers only)
+  int lat;                 // serial chain-step latency surrogate (clk) per chunk-item on the slot critical path
   int dl, Tpad, nd0, nd1;    // die-local: heads [0,48) homed on die 0, [48,96) on die 1; chains die-matched
   const int* sm_die; const int* sm_rank;
   const float* w;          // [H*128] o_norm weight
@@ -116,6 +121,7 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
+  if (threadIdx.x == 0) atomicMin(&a.sink[2], gtime());   // kernel span (no launch latency): first CTA start
   if (a.mode == 0 && chain < 0) return;
   // item enumeration
   long long n_items, it0 = 0, it_step = 1, it_end;
@@ -193,8 +199,15 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
         continue;
       }
+      const long long t_full = clock64();
       int seq = ch / H, head = ch % H, tok = seq * a.seqlen + k * C;
       acc += *(const unsigned*)(st + ctid * ((5 * TILE / GT) & ~3));
+      bool released = false;
+      if (a.erel && !a.onorm && !(a.mode == 0 && k == a.nchunk - 1)) {
+        named_bar(bar_id, GT);
+        if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
+        released = true;
+      }
       if (a.fma | a.mufu) {   // SIMT pipe load of the fused math (conv+SiLU, gate, o_norm): FFMA2 + MUFU ex2
         unsigned long long x[8];
         float f0 = __uint_as_float((acc & 0x007fffffu) | 0x3f000000u);
@@ -202,12 +215,27 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         for (int j = 0; j < 8; ++j) { float2 t = make_float2(f0 + j, f0 - j); x[j] = *(unsigned long long*)&t; }
         float2 tm = make_float2(0.999f, 0.998f), td = make_float2(1e-3f, 2e-3f);
         unsigned long long cm = *(unsigned long long*)&tm, cd = *(unsigned long long*)&td;
-        for (int r = 0; r < a.fma / NCT; r += 16) {
+        float y0[4] = {f0 * -1.f, f0 * -0.5f, f0 * -0.25f, f0 * -0.125f};
+        if (a.mix) {   // one loop: 8 FFMA2 per iteration, 4 ex2 spread evenly over the iterations
+          const int fi = (a.fma / NCT + 15) / 16, ui = (a.mufu / NCT + 3) / 4;
+          const int ni = fi > ui ? fi : ui;
+          for (int r = 0; r < ni; ++r) {
+            if (r * fi / ni != (r + 1) * fi / ni) {
+#pragma unroll
+              for (int j = 0; j < 8; ++j) asm volatile("fma.rn.f32x2 %0, %0, %1, %2;" : "+l"(x[j]) : "l"(cm), "l"(cd));
+            }
+            if (r * ui / ni != (r + 1) * ui / ni) {
+#pragma unroll
+              for (int j = 0; j < 4; ++j) asm volatile("ex2.approx.ftz.f32 %0, %0;" : "+f"(y0[j]));
+            }
+          }
+        }
+        for (int r = 0; r < (a.mix ? 0 : a.fma / NCT); r += 16) {
 #pragma unroll
           for (int j = 0; j < 8; ++j) asm volatile("fma.rn.f32x2 %0, %0, %1, %2;" : "+l"(x[j]) : "l"(cm), "l"(cd));
         }
-        float y[4] = {f0 * -1.f, f0 * -0.5f, f0 * -0.25f, f0 * -0.125f};
-        for (int r = 0; r < a.mufu / NCT; r += 4) {
+        float* y = y0;
+        for (int r = 0; r < (a.mix ? 0 : a.mufu / NCT); r += 4) {
 #pragma unroll
           for (int j = 0; j < 4; ++j) asm volatile("ex2.approx.ftz.f32 %0, %0;" : "+f"(y[j]));
         }
@@ -218,11 +246,13 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         for (int j = 0; j < 4; ++j) sx ^= __float_as_uint(y[j]);
         acc += sx;
       }
+      if (a.lat && ctid == 0) {   // chain step (TMEM store, MMA, commit wait, TMEM load) overlapped with the SIMT load
+        while (clock64() < t_full + a.lat) { }
+      }
       unsigned char* o = ob + (size_t)(grp * 2 + (nout & 1)) * OUT_TILE;
       if (ctid == 0) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
       named_bar(bar_id, GT);
       unsigned char scale_b = (unsigned char)acc;
-      bool released = false;
       if (a.onorm) {   // gated RMSNorm + MXFP8 of a 32x128 BF16 O tile (pricing: O = the q tile, gate = the og tile)
         const int tk = ctid / TPT, part = ctid % TPT;
         const uint4* orow = (const uint4*)(st + tk * 256 + part * CPT * 2);
@@ -314,6 +344,8 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
     if (ctid == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
     if (acc == 0x9e3779b9u) a.sink[0] = acc;
   }
+  __syncthreads();
+  if (threadIdx.x == 0) atomicMax(&a.sink[3], gtime());   // last CTA end
 }
 
 static void enc(CUtensorMap* m, CUtensorMapDataType dt, int esz, void* p, uint64_t cols, uint64_t rows, uint64_t rowbytes,
@@ -417,7 +449,7 @@ int main(int argc, char** argv) {
   // SOL bytes (exact tensors, no over-fetch)
   double bytes = (double)T * (5.0 * P * 2 + H * 2 + P + H * 4) + (double)nchain * 65536 * 2;
   printf("SOL bytes %.3f GB -> %.1f us @19.4 TB/s, %.1f us @17.7 TB/s\n", bytes / 1e9, bytes / 19.4e12 * 1e6, bytes / 17.7e12 * 1e6);
-  struct V { const char* name; int mode, S_total, iss6, fma, mufu, onorm, hm, noout, dl; };
+  struct V { const char* name; int mode, S_total, iss6, fma, mufu, onorm, hm, noout, dl, lat = 0, erel = 0, mix = 0; };
   // fused-math pipe load per 32-token chunk-item (lane-ops): FMA 135K (conv 49K + SiLU poly part + o_norm 33K + prep),
   // MUFU 41K (SiLU 24.6K + gate/decay 8.2K + o_norm sigmoid 8.2K); KDA pass without conv+SiLU: FMA 70K, MUFU 16K
   std::vector<V> vs = NSLOT == 2 ? std::vector<V>{
@@ -426,6 +458,31 @@ int main(int argc, char** argv) {
       {"DL piece S=6 +onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1}, {"DL piece S=4 +onorm", 2, 4, 1, 0, 0, 1, 0, 0, 1}}
     : std::vector<V>{
       {"DL piece 1slot S=3", 2, 3, 1, 0, 0, 0, 0, 0, 1}, {"DL piece 1slot S=3 +onorm", 2, 3, 1, 0, 0, 1, 0, 0, 1}};
+  if (argc > 4 && std::string(argv[4]) == "m2") {   // M2/M3: chain latency surrogate + KDA-pass SIMT load (conv+SiLU off) + o_norm role
+    const int F = 70000 * C / 32, U = 16000 * C / 32;   // lane-ops per chunk-item, scaled from the 32-token budget
+    if (NSLOT == 1) vs = {{"m2 piece data", 2, 3, 1, 0, 0, 0, 0, 0, 1, 0}, {"m2 piece L1700", 2, 3, 1, 0, 0, 0, 0, 0, 1, 1700},
+                          {"m2 piece L2600", 2, 3, 1, 0, 0, 0, 0, 0, 1, 2600}, {"m2 piece L3400", 2, 3, 1, 0, 0, 0, 0, 0, 1, 3400},
+                          {"m2 piece SIMT", 2, 3, 1, F, U, 0, 0, 0, 1, 0}, {"m2 piece L2600 SIMT", 2, 3, 1, F, U, 0, 0, 0, 1, 2600},
+                          {"m3 piece L2600 SIMT onorm", 2, 3, 1, F, U, 1, 0, 0, 1, 2600}, {"m3 piece onorm", 2, 3, 1, 0, 0, 1, 0, 0, 1, 0}};
+    else vs = {{"m2 piece data", 2, 6, 1, 0, 0, 0, 0, 0, 1, 0}, {"m2 piece L1060", 2, 6, 1, 0, 0, 0, 0, 0, 1, 1060},
+               {"m2 piece L1700", 2, 6, 1, 0, 0, 0, 0, 0, 1, 1700}, {"m2 piece SIMT", 2, 6, 1, F, U, 0, 0, 0, 1, 0},
+               {"m2 piece L1060 SIMT", 2, 6, 1, F, U, 0, 0, 0, 1, 1060}, {"m3 piece L1060 SIMT onorm", 2, 6, 1, F, U, 1, 0, 0, 1, 1060},
+               {"m3 piece onorm", 2, 6, 1, 0, 0, 1, 0, 0, 1, 0}};
+  }
+  if (argc > 4 && std::string(argv[4]) == "m2b") {   // re-model: SIMT attribution (FMA / MUFU), early release, chain + SIMT
+    const int F = 70000 * C / 32, U = 16000 * C / 32, Ls = NSLOT == 1 ? 1700 : 1060, S = NSLOT == 1 ? 3 : 6;
+    vs = {{"b data", 2, S, 1, 0, 0, 0, 0, 0, 1, 0, 0}, {"b FMA", 2, S, 1, F, 0, 0, 0, 0, 1, 0, 0},
+          {"b MUFU", 2, S, 1, 0, U, 0, 0, 0, 1, 0, 0}, {"b SIMT", 2, S, 1, F, U, 0, 0, 0, 1, 0, 0},
+          {"b SIMT erel", 2, S, 1, F, U, 0, 0, 0, 1, 0, 1}, {"b L SIMT erel", 2, S, 1, F, U, 0, 0, 0, 1, Ls, 1},
+          {"b L erel", 2, S, 1, 0, 0, 0, 0, 0, 1, Ls, 1}, {"b SIMT noout", 2, S, 1, F, U, 0, 0, 1, 1, 0, 0}};
+  }
+  if (argc > 4 && std::string(argv[4]) == "m2c") {   // interleaved SIMT mix (+ chain latency, + o_norm role)
+    const int F = 70000 * C / 32, U = 16000 * C / 32, Ls = NSLOT == 1 ? 1700 : 1060, S = NSLOT == 1 ? 3 : 6;
+    vs = {{"c data", 2, S, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0}, {"c SIMT seq", 2, S, 1, F, U, 0, 0, 0, 1, 0, 0, 0},
+          {"c SIMT mix", 2, S, 1, F, U, 0, 0, 0, 1, 0, 0, 1}, {"c L SIMT mix", 2, S, 1, F, U, 0, 0, 0, 1, Ls, 0, 1},
+          {"c L2600 SIMT mix", 2, S, 1, F, U, 0, 0, 0, 1, 2600, 0, 1}, {"c onorm", 2, S, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0},
+          {"c L SIMT mix onorm", 2, S, 1, F, U, 1, 0, 0, 1, Ls, 0, 1}};
+  }
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
   { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
   cudaEvent_t e0, e1; CR(cudaEventCreate(&e0)); CR(cudaEventCreate(&e1));
@@ -434,11 +491,12 @@ int main(int argc, char** argv) {
   cudaGetLastError();
   for (auto& v : vs) {
     Args a{nseq, seqlen, nchunk, nchain, v.mode, v.S_total, v.iss6, v.fma, v.mufu, v.onorm, v.hm, v.noout, (int)T,
-           v.dl, (int)Tpad, nd[0], nd[1], dsm_die, dsm_rank, wgt, state, scales, sink};
+           v.mix, v.erel, v.lat, v.dl, (int)Tpad, nd[0], nd[1], dsm_die, dsm_rank, wgt, state, scales, sink};
     size_t smem = (size_t)v.S_total * STAGE + 2 * NSLOT * NGRP * OUT_TILE;
-    std::vector<float> ts;
+    std::vector<float> ts, sp;
     for (int it = 0; it < iters + 3; ++it) {
       CR(cudaMemsetAsync(flush, it, FL));   // evict L2 between iterations
+      CR(cudaMemsetAsync(sink + 2, 0xff, 8)); CR(cudaMemsetAsync(sink + 3, 0, 8));
       CR(cudaEventRecord(e0));
       cudaLaunchConfig_t cfg = {}; cudaLaunchAttribute la[1];
       cfg.gridDim = dim3(nsm); cfg.blockDim = dim3(NSLOT * NWARP_SLOT * 32); cfg.dynamicSmemBytes = smem;
@@ -451,10 +509,11 @@ int main(int argc, char** argv) {
         if (se != cudaSuccess) { printf("SKEL %-24s FAILED %s diag %u blk %u tid %u bar %u\n", v.name, cudaGetErrorString(se), hdiag[0], hdiag[1], hdiag[2], hdiag[3]); exit(3); } }
       CR(cudaGetLastError());
       float ms; CR(cudaEventElapsedTime(&ms, e0, e1));
-      if (it >= 3) ts.push_back(ms * 1000.f);
+      if (it >= 3) { ts.push_back(ms * 1000.f); unsigned long long hs[2]; CR(cudaMemcpy(hs, sink + 2, 16, cudaMemcpyDeviceToHost)); sp.push_back((hs[1] - hs[0]) * 1e-3f); }
     }
     if (ts.empty()) continue;
-    std::sort(ts.begin(), ts.end());
+    std::sort(ts.begin(), ts.end()); std::sort(sp.begin(), sp.end());
+    printf("SPAN %-24s kernel span med %7.1f us (event %7.1f)\n", v.name, sp[sp.size() / 2], ts[ts.size() / 2]);
     float med = ts[ts.size() / 2];
     printf("SKEL %-24s smem %6zu B  med %7.1f us  min %7.1f  -> %5.2f TB/s  = %5.1f%% of SOL@19.4  %5.1f%% of 130us-target\n",
            v.name, smem, med, ts[0], bytes / (med * 1e-6) / 1e12, bytes / 19.4e12 * 1e6 / med * 100, 130.0 / med * 100);
