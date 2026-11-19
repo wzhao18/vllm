@@ -95,11 +95,13 @@ def main():
                     use_beta_sigmoid_in_kernel=True, safe_gate=True, gate_lower_bound=lb,
                     a_log=A_log, dt_bias=dt_bias, plan_name="kda_frost",
                 )[:2]
-        elif impl in ("fip", "fipprobe"):
+        elif impl in ("fip", "fipprobe", "fipprobe2"):
             if impl == "fip":
                 from fi_persistent import forward as fip
-            else:
+            elif impl == "fipprobe":
                 from fi_probe import forward as fip
+            else:
+                from fi_probe2 import forward as fip
 
             out = torch.empty_like(q)
             fstate = torch.empty_like(init_state)
