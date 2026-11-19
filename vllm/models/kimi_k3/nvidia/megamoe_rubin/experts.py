@@ -760,6 +760,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         if self.kernel_weights is None:
             raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
         self.get_runtime().warmup(self.kernel_weights, shared=shared)
+        self._warm_fused_shared = shared
 
     # -- runtime / kernel layout -----------------------------------------------------
 
@@ -1010,12 +1011,19 @@ class KimiK3MegaMoEExperts(nn.Module):
             if shared_experts is not None:
                 raise ValueError("output_rmsnorm with an unfused shared expert is not supported.")
             extra["rmsnorm"] = _rmsnorm_args(output_rmsnorm)
+        drop_shared = False
         if fused_shared is not None:
             if shared_experts is not None or bucket.shared is None:
                 raise ValueError(f"{self.prefix}: no fused shared expert at {num_tokens} tokens.")
             extra["shared"] = fused_shared
         elif bucket.shared is not None:
-            raise ValueError(f"{self.prefix}: the {bucket.max_tokens} bucket fuses the shared expert.")
+            # A caller outside the specialized decoder (the stock forward, e.g. a
+            # bench's context prefill) runs its own shared expert: the fused bucket's
+            # shared tiles run on the warmed operands and their output is dropped.
+            extra["shared"] = getattr(self, "_warm_fused_shared", None)
+            if extra["shared"] is None:
+                raise ValueError(f"{self.prefix}: the {bucket.max_tokens} bucket fuses the shared expert.")
+            drop_shared = True
         y = self.get_runtime().forward(
             hidden_states,
             topk_ids,
@@ -1028,6 +1036,8 @@ class KimiK3MegaMoEExperts(nn.Module):
             ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
             **extra,
         )
+        if drop_shared:
+            y = y[0]
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y
