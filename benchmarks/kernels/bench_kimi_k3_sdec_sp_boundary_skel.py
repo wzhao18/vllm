@@ -47,7 +47,7 @@ ATTNRES_SOL_US = {128: (4.3 + 3.8) / 24, 256: (8.5 + 7.5) / 24, 384: (12.7 + 11.
 
 _CUDA_SRC = r"""
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 #include <stdint.h>
 
@@ -222,7 +222,7 @@ void launch(int64_t kind, int64_t do_w, int64_t do_x, int64_t rank, int64_t R, i
   p.ctr = reinterpret_cast<unsigned int*>(ctr); p.sink = reinterpret_cast<uint32_t*>(sink);
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(grid); cfg.blockDim = dim3(threads); cfg.dynamicSmemBytes = 0;
-  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;
