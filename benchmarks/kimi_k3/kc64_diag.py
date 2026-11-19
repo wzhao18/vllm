@@ -18,6 +18,7 @@ import k64_diag as k64  # noqa: E402
 
 C64, D = 64, 128
 bf = torch.bfloat16
+V3 = False  # --v3: all-.ts chain kernel (flags bit 4), u image [8 tg][128 v][8 t]
 
 
 def err(a, b):
@@ -50,6 +51,7 @@ def images(p, v, lens, H):
     x = dict(w=w, u=u, qd=p["qd"], kr=p["kr"], mqk=p["mqk"], gt=p["gt"], C=C)
     x["wq_img"] = (torch.cat([w, p["qd"]], 2).view(H, C, 2 * C64, 16, 8).permute(0, 1, 3, 2, 4).contiguous())
     x["u_img"] = u.contiguous()
+    x["u_img3"] = u.view(H, C, 8, 8, D).permute(0, 1, 2, 4, 3).contiguous()
     x["kr_img"] = p["kr"].transpose(-1, -2).reshape(H, C, D, 8, 8).permute(0, 1, 3, 2, 4).contiguous()
     x["mqk_img"] = p["mqk"].view(H, C, C64, 8, 8).permute(0, 1, 3, 2, 4).contiguous()
     return x
@@ -81,7 +83,9 @@ def run(x, s0, cu, T, H, flags=0, dbg=None, out=None, fin=None):
     out = torch.empty(T, H, D, dtype=bf, device="cuda") if out is None else out
     fin = torch.empty(N, H, D, D, device="cuda") if fin is None else fin
     dbg = torch.zeros(1024 + 4 * H * N + 64, dtype=torch.int64, device="cuda") if dbg is None else dbg
-    torch.ops.k3_flashkda_split.kc64_rec(x["wq_img"], x["u_img"], x["kr_img"], x["mqk_img"], x["gt"],
+    if V3:
+        flags |= 16
+    torch.ops.k3_flashkda_split.kc64_rec(x["wq_img"], x["u_img3" if V3 else "u_img"], x["kr_img"], x["mqk_img"], x["gt"],
                                          s0, fin, out, cu, flags, dbg)
     return out, fin, dbg
 
@@ -118,7 +122,7 @@ def check(lens, H):
 def rand_images(lens, H, dev="cuda"):
     C = sum((n + C64 - 1) // C64 for n in lens)
     r = lambda *s: (torch.randn(*s, device=dev) * 0.05).to(bf)  # noqa: E731
-    return dict(wq_img=r(H, C, 16, 128, 8), u_img=r(H, C, 64, 128), kr_img=r(H, C, 8, 128, 8),
+    return dict(wq_img=r(H, C, 16, 128, 8), u_img=r(H, C, 64, 128), u_img3=r(H, C, 8, 128, 8), kr_img=r(H, C, 8, 128, 8),
                 mqk_img=r(H, C, 8, 64, 8), gt=torch.rand(H, C, D, device=dev) * 0.5 + 0.5, C=C)
 
 
@@ -182,13 +186,34 @@ def stamps(lens, H, flags=1):
           f"{seg(3, 6):.0f}, state pass {seg(6, 7):.0f}, state end->next MMA1 {sum((st[c + 1, 1] - st[c, 7]).item() for c in range(4, n)) / (n - 4):.0f}", flush=True)
 
 
+def stamps3(lens, H, flags=1):
+    T = sum(lens)
+    x = rand_images(lens, H)
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
+    s0 = torch.zeros(len(lens), H, D, D, device="cuda")
+    _, _, dbg = run(x, s0, cu, T, H, flags)
+    torch.cuda.synchronize()
+    if dbg[0].item() != 0:
+        print(f"WATCHDOG {dbg[0].item():#x}")
+    st = dbg[16:16 + 96 * 8].view(96, 8).cpu()
+    n = min(80, (lens[-1] + 63) // 64 - 1)
+    step = sum((st[c + 1, 0] - st[c, 0]).item() for c in range(4, n)) / (n - 4)
+    seg = lambda a, b: sum((st[c, b] - st[c, a]).item() for c in range(4, n)) / (n - 4)  # noqa: E731
+    print(f"v3 stamps CTA0: chain step {step:.0f} clk; P bf16 image+sync {seg(0, 1):.0f}, MMA W+Oq issue {seg(1, 2):.0f}, "
+          f"decay st {seg(2, 3):.0f}, wait W {seg(3, 4):.0f}, vnew+sync {seg(4, 5):.0f}, MMA S+O issue {seg(5, 6):.0f}, "
+          f"wait S {seg(6, 7):.0f}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--stamps", action="store_true")
     ap.add_argument("--heads", type=int, default=96)
+    ap.add_argument("--v3", action="store_true")
     a = ap.parse_args()
+    global V3
+    V3 = a.v3
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 
     kda_segscan.load_extension()
@@ -201,8 +226,12 @@ def main():
         time_it(F16K, a.heads, flags=2)
         time_it([5461], 96)
     if a.stamps:
-        stamps(F16K, a.heads)
-        stamps(F16K, a.heads, 3)
+        if V3:
+            stamps3(F16K, a.heads)
+            stamps3(F16K, a.heads, 3)
+        else:
+            stamps(F16K, a.heads)
+            stamps(F16K, a.heads, 3)
 
 
 if __name__ == "__main__":

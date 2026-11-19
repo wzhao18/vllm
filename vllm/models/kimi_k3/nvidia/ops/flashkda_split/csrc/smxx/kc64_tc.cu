@@ -430,6 +430,303 @@ __global__ void __launch_bounds__(kThreads, 2) kc64_tc_kernel(
 
 }  // namespace kc64tc
 
+// ---------------------------------------------------------------------------
+// kc64 v3: the same chunk-64 WY chain with every MMA in the .ts form and the
+// MMAs issued by the SIMT warps themselves (named barrier, no issuer warp).
+//
+// Orientation: V on the MMA M dimension (tensor-memory lane = value row v).
+// Tensor memory (512 columns, one CTA per SM):
+//   [0, 128)   S^T fp32 [v][k], pre-multiplied by g_total(c) in the pass
+//   [128, 192) bf16 S^T(c) [v][k]          A of W and Oq
+//   [192, 256) W^T(c) = S^T w^T [v][t]     fp32
+//   [256, 288) vnew^T(c) bf16 [v][t]       A of S += vnew^T kr, O += vnew^T Mqk^T
+//   [320, 448) O^T double buffer (64 columns each): Oq + Mqk @ vnew
+// Shared memory images (B operands, K-major 8x8 core matrices) per stage:
+//   w|qd [16 kg][128 rows][8], kr^T [8 tg][128 k][8], Mqk [8 sg][64 t][8],
+//   u [8 tg][128 v][8 t] (SIMT), g_total fp32 [128].
+// Chain per chunk (16 chain warps, thread = (v, 32-column quarter)):
+//   P:    LD S^T, bf16 image -> [128,192), bar.sync, MMA W + Oq,
+//         S^T *= g_total(c) in place (under the MMA)
+//   vnew: wait W, vnew = bf16(u - W) -> [256,288), bar.sync, MMA S += ...,
+//         commit s_rdy, MMA O += ..., commit o_full, release the stage
+//   wait s_rdy.
+// Out warps (8) read O^T(c) and store out rows behind the chain.
+namespace kc3 {
+
+using namespace k2tc;
+using kc64tc::wait_wd;
+using kc64tc::gtimer;
+
+constexpr int kC = 64;
+constexpr int kD = 128;
+constexpr int kChainWarps = 16;
+constexpr int kOutWarps = 8;
+constexpr int kThreads = 32 * (1 + kChainWarps + kOutWarps);  // 800
+constexpr int kStageWq = 0, kStageKr = 32768, kStageMqk = 49152, kStageU = 57344,
+              kStageGt = 73728;
+constexpr int kStageTx = 32768 + 16384 + 8192 + 16384 + 512;
+constexpr int kStageBytes = 74752;
+constexpr int kStages = 2;
+constexpr int kOffBar = kStages * kStageBytes;
+// barriers: full[2], empty[2], w_rdy, s_rdy, o_full[2], o_empty[2]
+constexpr int kNumBars = 10;
+constexpr int kSmemBytes = kOffBar + 8 * kNumBars + 16;
+
+constexpr uint32_t kColS = 0, kColSb = 128, kColW = 192, kColVn = 256, kColO = 320;
+
+__device__ __forceinline__ void chain_sync() {
+  asm volatile("bar.sync 1, 512;" ::: "memory");
+}
+
+template <bool HasStateIn>
+__global__ void __launch_bounds__(kThreads, 1) kc3_kernel(
+    __nv_bfloat16 const* __restrict__ wq_img, __nv_bfloat16 const* __restrict__ u_img,
+    __nv_bfloat16 const* __restrict__ kr_img, __nv_bfloat16 const* __restrict__ mqk_img,
+    float const* __restrict__ gt_ptr, float const* __restrict__ init_state,
+    float* __restrict__ final_state, __nv_bfloat16* __restrict__ out_ptr,
+    int const* __restrict__ cu_seqlens, int H, int N, int C_total, int flags,
+    long long* __restrict__ dbg) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  extern __shared__ __align__(1024) unsigned char smem[];
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int head = blockIdx.x;
+  const int seq = N - 1 - int(blockIdx.y);
+  const uint32_t sbase = smem_u32(smem);
+  const uint32_t bar0 = sbase + kOffBar;
+  auto full = [&](int s) { return bar0 + 8 * uint32_t(s); };
+  auto empty = [&](int s) { return bar0 + 16 + 8 * uint32_t(s); };
+  const uint32_t w_rdy = bar0 + 32, s_rdy = bar0 + 40;
+  auto o_full = [&](int b) { return bar0 + 48 + 8 * uint32_t(b); };
+  auto o_empty = [&](int b) { return bar0 + 64 + 8 * uint32_t(b); };
+  uint32_t* tmem_slot = reinterpret_cast<uint32_t*>(smem + kOffBar + 8 * kNumBars);
+
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < kStages; ++s) {
+      mbar_init(full(s), 1);
+      mbar_init(empty(s), 1);
+    }
+    mbar_init(w_rdy, 1);
+    mbar_init(s_rdy, 1);
+    for (int b = 0; b < 2; ++b) {
+      mbar_init(o_full(b), 1);
+      mbar_init(o_empty(b), kOutWarps);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  if (warp == 1) {
+    asm volatile(
+        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" ::"r"(
+            smem_u32(tmem_slot))
+        : "memory");
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+  }
+  tc_fence_before();
+  __syncthreads();
+  tc_fence_after();
+  const uint32_t tmem = *tmem_slot;
+
+  const int bos = cu_seqlens[seq];
+  const int seq_len = cu_seqlens[seq + 1] - bos;
+  const int n_chunks = (seq_len + kC - 1) / kC;
+  int cbase = 0;
+  for (int i = 0; i < seq; ++i) cbase += (cu_seqlens[i + 1] - cu_seqlens[i] + kC - 1) / kC;
+  const bool reuse = (flags & 2) != 0;
+  auto img = [&](int c) { return int64_t(head) * C_total + cbase + (reuse ? 0 : c); };
+  const int cta_id = blockIdx.y * gridDim.x + blockIdx.x;
+  const bool dbg_cta = (flags & 1) && blockIdx.x == 0 && blockIdx.y == 0;
+  if ((flags & 8) && threadIdx.x == 0) {
+    unsigned sm;
+    asm volatile("mov.u32 %0, %smid;" : "=r"(sm));
+    dbg[1024 + 4 * cta_id] = gtimer();
+    dbg[1024 + 4 * cta_id + 2] = sm;
+  }
+  auto stage = [&](int c) { return (c % kStages) * kStageBytes; };
+
+  if (warp == 0) {
+    if (lane == 0) {
+      for (int c = 0; c < n_chunks; ++c) {
+        const int s = c % kStages;
+        if (c >= kStages) wait_wd(empty(s), uint32_t((c - kStages) / kStages) & 1u, 1, c, dbg);
+        const uint32_t fb = full(s), st = sbase + stage(c);
+        mbar_expect_tx(fb, kStageTx);
+        bulk_g2s(st + kStageWq, wq_img + img(c) * (kD * kD), 32768, fb);
+        bulk_g2s(st + kStageKr, kr_img + img(c) * (kC * kD), 16384, fb);
+        bulk_g2s(st + kStageMqk, mqk_img + img(c) * (kC * kC), 8192, fb);
+        bulk_g2s(st + kStageU, u_img + img(c) * (kC * kD), 16384, fb);
+        bulk_g2s(st + kStageGt, gt_ptr + img(c) * kD, 512, fb);
+      }
+    }
+  } else if (warp <= kChainWarps) {
+    // Chain warps: lane quadrant qd, 32-column quarter qc.
+    const int qd = warp & 3;
+    const int qc = (warp - 1) >> 2;
+    const int r = 32 * qd + lane;  // v
+    const uint32_t trow = tmem + (uint32_t(32 * qd) << 16);
+    const bool issuer = warp == 1 && lane == 0;
+    const int64_t st_base = (int64_t(seq) * H + head) * kD * kD + int64_t(r) * kD + 32 * qc;
+    const bool sst = dbg_cta && issuer;
+    auto stamp = [&](int c, int slot) {
+      if (sst && c < 96) dbg[16 + c * 8 + slot] = clock64();
+    };
+    constexpr uint32_t kI64 = idesc_bf16(64, 0);
+    constexpr uint32_t kI128 = idesc_bf16(128, 0);
+
+    {
+      // Initial state row v, k in [32 qc, 32 qc + 32) -> S^T (undecayed).
+      uint32_t sv[32];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        float4 x = HasStateIn ? reinterpret_cast<float4 const*>(init_state + st_base)[i]
+                              : make_float4(0.f, 0.f, 0.f, 0.f);
+        sv[4 * i] = __float_as_uint(x.x);
+        sv[4 * i + 1] = __float_as_uint(x.y);
+        sv[4 * i + 2] = __float_as_uint(x.z);
+        sv[4 * i + 3] = __float_as_uint(x.w);
+      }
+      K2TC_ST16(trow + kColS + 32 * qc, sv);
+      K2TC_ST16(trow + kColS + 32 * qc + 16, (sv + 16));
+      tc_wait_st();
+    }
+
+    for (int c = 0; c < n_chunks; ++c) {
+      const uint32_t cp = uint32_t(c) & 1u;
+      const int b = c & 1;
+      const uint32_t st = sbase + stage(c);
+      unsigned char const* sp = smem + stage(c);
+      stamp(c, 0);
+      wait_wd(full(c % kStages), uint32_t(c / kStages) & 1u, 2, c, dbg);
+      // P: bf16 S^T(c) image.
+      uint32_t sv[32];
+      K2TC_LD32(trow + kColS + 32 * qc, sv);
+      float g[32];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float4 x = reinterpret_cast<float4 const*>(sp + kStageGt)[8 * qc + i];
+        g[4 * i] = x.x;
+        g[4 * i + 1] = x.y;
+        g[4 * i + 2] = x.z;
+        g[4 * i + 3] = x.w;
+      }
+      tc_wait_ld();
+      {
+        uint32_t pk[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+          pk[i] = pack_bf16(__uint_as_float(sv[2 * i]), __uint_as_float(sv[2 * i + 1]));
+        K2TC_ST16(trow + kColSb + 16 * qc, pk);
+      }
+      tc_wait_st();
+      tc_fence_before();
+      chain_sync();
+      stamp(c, 1);
+      if (issuer) {
+        tc_fence_after();
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          mma_ts(tmem + kColW, tmem + kColSb + 8 * j, sdesc(st + kStageWq + 4096 * j, 2048, 128),
+                 kI64, j != 0);
+        tc_commit(w_rdy);
+        if (c >= 2) wait_wd(o_empty(b), uint32_t((c - 2) >> 1) & 1u, 3, c, dbg);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          mma_ts(tmem + kColO + 64 * b, tmem + kColSb + 8 * j,
+                 sdesc(st + kStageWq + 1024 + 4096 * j, 2048, 128), kI64, j != 0);
+        stamp(c, 2);
+      }
+      // S^T *= g_total(c) under the MMAs.
+#pragma unroll
+      for (int i = 0; i < 32; ++i) sv[i] = __float_as_uint(__uint_as_float(sv[i]) * g[i]);
+      K2TC_ST16(trow + kColS + 32 * qc, sv);
+      K2TC_ST16(trow + kColS + 32 * qc + 16, (sv + 16));
+      stamp(c, 3);
+      // vnew^T = bf16(u - W) for t in [16 qc, 16 qc + 16).
+      uint4 const* us = reinterpret_cast<uint4 const*>(sp + kStageU);
+      const uint4 u0 = us[(2 * qc) * 128 + r];
+      const uint4 u1 = us[(2 * qc + 1) * 128 + r];
+      wait_wd(w_rdy, cp, 4, c, dbg);
+      tc_fence_after();
+      stamp(c, 4);
+      uint32_t w[16];
+      K2TC_LD16(trow + kColW + 16 * qc, w);
+      tc_wait_ld();
+      {
+        const uint32_t up[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+        uint32_t vn[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+          vn[e] = pack_bf16(bf16_lo(up[e]) - __uint_as_float(w[2 * e]),
+                            bf16_hi(up[e]) - __uint_as_float(w[2 * e + 1]));
+        K2TC_ST8(trow + kColVn + 8 * qc, vn);
+      }
+      tc_wait_st();
+      tc_fence_before();
+      chain_sync();
+      stamp(c, 5);
+      if (issuer) {
+        tc_fence_after();
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          mma_ts(tmem + kColS, tmem + kColVn + 8 * j, sdesc(st + kStageKr + 4096 * j, 2048, 128),
+                 kI128, 1);
+        tc_commit(s_rdy);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          mma_ts(tmem + kColO + 64 * b, tmem + kColVn + 8 * j,
+                 sdesc(st + kStageMqk + 2048 * j, 1024, 128), kI64, 1);
+        tc_commit(o_full(b));
+        tc_commit(empty(c % kStages));
+        stamp(c, 6);
+      }
+      wait_wd(s_rdy, cp, 5, c, dbg);
+      tc_fence_after();
+      stamp(c, 7);
+    }
+    {
+      uint32_t sv[32];
+      K2TC_LD32(trow + kColS + 32 * qc, sv);
+      tc_wait_ld();
+      float4* dst = reinterpret_cast<float4*>(final_state + st_base);
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        dst[i] = make_float4(__uint_as_float(sv[4 * i]), __uint_as_float(sv[4 * i + 1]),
+                             __uint_as_float(sv[4 * i + 2]), __uint_as_float(sv[4 * i + 3]));
+    }
+  } else {
+    // Out warps: lane quadrant qd, 32-token half hh of O^T(c).
+    const int qd = warp & 3;
+    const int hh = (warp - 1 - kChainWarps) >> 2;
+    const int r = 32 * qd + lane;  // v
+    const uint32_t trow = tmem + (uint32_t(32 * qd) << 16);
+    for (int c = 0; c < n_chunks; ++c) {
+      const int b = c & 1;
+      wait_wd(o_full(b), uint32_t(c >> 1) & 1u, 6, c, dbg);
+      tc_fence_after();
+      uint32_t o[32];
+      K2TC_LD32(trow + kColO + 64 * b + 32 * hh, o);
+      tc_wait_ld();
+      tc_fence_before();
+      __syncwarp();
+      if (lane == 0) mbar_arrive(o_empty(b));
+      const int t0 = c * kC + 32 * hh;
+      __nv_bfloat16* dst = out_ptr + (int64_t(bos) + t0) * H * kD + int64_t(head) * kD + r;
+#pragma unroll
+      for (int i = 0; i < 32; ++i)
+        if (t0 + i < seq_len) dst[int64_t(i) * H * kD] = __float2bfloat16_rn(__uint_as_float(o[i]));
+    }
+  }
+  tc_fence_before();
+  __syncthreads();
+  if (warp == 1) {
+    tc_fence_after();
+    if ((flags & 8) && lane == 0) dbg[1024 + 4 * cta_id + 1] = gtimer();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem) : "memory");
+  }
+#endif
+}
+
+}  // namespace kc3
+
 void launch_kc64_tc(void const* wq, void const* u, void const* kr, void const* mqk,
                     float const* gt, float const* init_state, float* final_state, void* out,
                     int const* cu_seqlens, int H, int N, int C_total, int flags, long long* dbg,
@@ -445,6 +742,23 @@ void launch_kc64_tc(void const* wq, void const* u, void const* kr, void const* m
         init_state, final_state, static_cast<__nv_bfloat16*>(out), cu_seqlens, H, N, C_total,
         flags, dbg);
   };
+  if (flags & 16) {
+    // v3: all-.ts chain, one CTA per SM (u image [8 tg][128 v][8 t]).
+    auto launch3 = [&](auto kernel) {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kc3::kSmemBytes);
+      kernel<<<dim3(H, N), dim3(kc3::kThreads), kc3::kSmemBytes, stream>>>(
+          static_cast<__nv_bfloat16 const*>(wq), static_cast<__nv_bfloat16 const*>(u),
+          static_cast<__nv_bfloat16 const*>(kr), static_cast<__nv_bfloat16 const*>(mqk), gt,
+          init_state, final_state, static_cast<__nv_bfloat16*>(out), cu_seqlens, H, N, C_total,
+          flags, dbg);
+    };
+    if (init_state != nullptr) {
+      launch3(kc3::kc3_kernel<true>);
+    } else {
+      launch3(kc3::kc3_kernel<false>);
+    }
+    return;
+  }
   if (init_state != nullptr) {
     launch(kc64_tc_kernel<true>);
   } else {
