@@ -265,7 +265,10 @@ class SpMlp:
 
         fused_norm = self.fused_norm
         route = self.route_stage
-        staged_route = route is not None and route.ready(n)
+        # The fused-shared MegaMoE session launches with the shared expert's
+        # arguments, so it takes precedence over the staged route front.
+        fused = self.fused_shared is not None and mlp.experts.fused_shared(n)
+        staged_route = not fused and route is not None and route.ready(n)
         if staged_route:
             # Router | latent down as one FP32 GEMM, then one kernel stages its
             # top-k routes and the quantized latent into MegaMoE (route_stage).
@@ -295,11 +298,7 @@ class SpMlp:
                     routed, router_output, topk_ids, output_rmsnorm=fused_norm
                 )
 
-        if (
-            not staged_route
-            and self.fused_shared is not None
-            and mlp.experts.fused_shared(n)
-        ):
+        if fused:
             if not prequantized:
                 gemms["shared_gu"].input.quantize(h)
             final, shared_out = mlp.experts(
