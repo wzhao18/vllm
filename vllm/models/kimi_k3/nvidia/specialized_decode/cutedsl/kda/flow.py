@@ -184,6 +184,19 @@ def store_shared_f32x4(pointer, values):
     )
 
 
+@asm((Uint32,) * 4)
+def load_global_u32x4(pointer):
+    return "ld.global.v4.u32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,l", (pointer,)
+
+
+@asm()
+def store_shared_u32x4(pointer, values):
+    return "st.shared.v4.b32 [$0], {$1, $2, $3, $4};", "r,r,r,r,r,~{memory}", (
+        pointer,
+        *values,
+    )
+
+
 @asm()
 def store_global_f32x4(pointer, values):
     """16 B register -> global store, streaming (evict-first) cache policy."""
@@ -414,8 +427,6 @@ class KdaFlow(KdaWS):
         raw = alloc(smem, BFloat16, (MAX_ITEMS, T, K), align=16)  # raw gates
         table = alloc(smem, Int32, (MAX_ITEMS, META))
         betas = alloc(smem, Float32, (MAX_ITEMS, 8))  # sigmoid(beta) per token
-        # The 16 B of each item token's projection row that hold its beta.
-        beta_raw = alloc(smem, BFloat16, (MAX_ITEMS, T, 8), align=16)
         # Per group: the 2q scan vectors (2 blocks), v (then the outputs), the fold
         # weights w_t.
         qkvd = alloc(smem, Float32, (GROUPS, 4, T, K), align=128)
@@ -483,10 +494,25 @@ class KdaFlow(KdaWS):
         # loads, issued before the state stream they would queue behind), then the
         # first pages (this layer's state) and the F_B rows.
         hslot = tid // K
-        if hslot < heads:
+        BULK_HC: cutlass.Constexpr = self.bulk_head_constants(args)
+        if cutlass.const_expr(BULK_HC):  # conv weight and dt rows: 13 copies a head
+            lane, hw = tid % 32, tid // 32
+            if hw < heads:
+                rows = hcs[hw, None, None]
+                if lane < 12:
+                    copy_g2s(at(rows, lane, 0),
+                             at(args[1], lane // 4, lane % 4, (h0 + hw) * K), K * 4,
+                             fb_full)  # fmt: skip
+                if lane == 12:
+                    copy_g2s(at(rows, DT, 0), at(args[7], (h0 + hw) * K), K * 4, fb_full)
+        elif hslot < heads:
             self.head_constants(hcs[hslot, None, None], args, h0 + hslot, tid % K)
         if tid == 0:  # F_B first (L2-resident): the gate projection waits on it
-            cute.arch.mbarrier_arrive_and_expect_tx(fb_full, heads * K * K * 2)
+            hc_bytes = 0
+            if cutlass.const_expr(BULK_HC):
+                hc_bytes = heads * 13 * K * 4
+            cute.arch.mbarrier_arrive_and_expect_tx(fb_full,
+                                                    heads * K * K * 2 + hc_bytes)  # fmt: skip
             for h in cutlass.range_constexpr(2):
                 if h < heads:
                     copy_g2s(at(fbs, h, 0, 0), at(f_b, (h0 + h) * K, 0), K * K * 2,
@@ -498,17 +524,35 @@ class KdaFlow(KdaWS):
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.trace):
             ps[3] = clock64()
-        if tid == 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(fa_full, count * T * (K * 2 + 16))
-        cute.arch.sync_warp()
-        cute.arch.barrier()  # fa_full's byte count
-        if tid < count * T:  # F_A rows first: the gate projection waits on them
+        # The F_A rows (16 B per thread, all in flight at once) and the betas:
+        # synchronous loads, before the page burst they would queue behind (dozens
+        # of small bulk copies cost thousands of cycles of issue).
+        FA_CHUNKS: cutlass.Constexpr = K * 2 // 16
+        FA_ROUNDS: cutlass.Constexpr = MAX_ITEMS * T * FA_CHUNKS // THREADS
+        fav = cute.make_rmem_tensor((FA_ROUNDS, 4), Uint32)
+        for k in cutlass.range_constexpr(FA_ROUNDS):
+            idx = tid + k * THREADS
+            item = idx // (T * FA_CHUNKS)
+            if item < count:
+                t, part = (idx // FA_CHUNKS) % T, idx % FA_CHUNKS
+                row = table[item, REQUEST] * T + t
+                v = load_global_u32x4(at(f_a, row, part * 8))
+                for e in cutlass.range_constexpr(4):
+                    fav[k, e] = v[e]
+        if tid < count * T:  # read by the groups after the gate projection's barrier
             item, t = tid // T, tid % T
             row = table[item, REQUEST] * T + t
-            copy_g2s(at(fas, item, t, 0), at(f_a, row, 0), K * 2, fa_full)
-            chunk = (table[item, HEAD] // 8) * 8
-            copy_g2s(at(beta_raw, item, t, 0), at(beta, row, chunk), 16, fa_full)
-        cute.arch.sync_warp()
+            betas[item, t] = triton_sigmoid(Float32(beta[row, table[item, HEAD]]))
+        if cutlass.const_expr(BULK_HC):  # noqa: SIM102
+            if hslot < heads:  # read by the groups after the gate projection's barrier
+                hcs[hslot, A_EXP, tid % K] = triton_exp(Float32(args[6][h0 + hslot]))
+        for k in cutlass.range_constexpr(FA_ROUNDS):
+            idx = tid + k * THREADS
+            item = idx // (T * FA_CHUNKS)
+            if item < count:
+                t, part = (idx // FA_CHUNKS) % T, idx % FA_CHUNKS
+                store_shared_u32x4(at(fas, item, t, part * 8),
+                                   [fav[k, e] for e in range(4)])  # fmt: skip
         g = tid // GROUP_THREADS
         c = tid % GROUP_THREADS
         buffers = (
@@ -523,7 +567,6 @@ class KdaFlow(KdaWS):
         self.bwait(fb_full, 0, "fb_full")
         if cutlass.const_expr(self.trace):
             ps[7] = clock64()
-        self.bwait(fa_full, 0, "fa_full")
         # The state stream starts once the small copies the prologue waits on have
         # landed (issued earlier, they queue behind the chip-wide page burst); its
         # first pages fill during the gate projection.
@@ -532,10 +575,7 @@ class KdaFlow(KdaWS):
                 if s < count:
                     self.load_page(args, pages, s, table, s, state_full)
         cute.arch.sync_warp()
-        if tid < count:  # read by the groups after the gate projection's barrier
-            lane8 = table[tid, HEAD] % 8
-            for t in cutlass.range_constexpr(T):
-                betas[tid, t] = triton_sigmoid(Float32(beta_raw[tid, t, lane8]))
+        cute.arch.barrier()  # F_A
         if cutlass.const_expr(self.trace):
             ps[4] = clock64()
         if cutlass.const_expr("gate" not in self.skip):
@@ -915,6 +955,15 @@ class KdaFlow(KdaWS):
         self.group_sync(g)  # sums free again
 
     # ------------------------------------------------------------------- prep
+    def bulk_head_constants(self, args):
+        """The conv weight and dt rows bulk-copy straight into the head table (FP32,
+        no conv bias)."""
+        return (
+            not self.has_bias
+            and args[1].element_type == Float32
+            and args[7].element_type == Float32
+        )
+
     @cute.jit
     def head_constants(self, hc, args, head, c):
         """Per-head operands of channel c into hc[:, c]: conv weights [3, 4], biases
