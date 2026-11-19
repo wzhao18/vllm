@@ -303,7 +303,7 @@ def main():
                           flush=True)
         import importlib
 
-        for kname in [k for k in ("h4", "h5", "h6", "h7") if k in kernels]:
+        for kname in [k for k in ("h4", "h5", "h6", "h7", "h8") if k in kernels]:
             kfn = getattr(importlib.import_module(
                 f"vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_{kname}"),
                 f"sparse_mla_prefill_{kname}")
@@ -328,7 +328,7 @@ def main():
                 if a.stamps:
                     res[f"stamps_{kname}_{kn}"] = stamp_report(v4, dev)
                     print(kname, kn, res[f"stamps_{kname}_{kn}"], flush=True)
-                if (len(knobs) > 8 and knobs[8]) or (kname == "h6" and len(knobs) > 4
+                if (len(knobs) > 8 and knobs[8]) or (kname in ("h6", "h8") and len(knobs) > 4
                                                        and knobs[4]):
                     sb = torch.zeros(256, dtype=torch.int32, device=dev)
                     v4(0, stamps=sb)
