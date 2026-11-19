@@ -3,8 +3,8 @@
  "title": "Decode: MegaMoE NVFP4 EP32 + shared-expert overlap",
  "side": "decode",
  "owner": "D-MOE agent (workflow, resumed)",
- "state": "landed-ready",
- "updated": "2026-11-18T18:15-08:00",
+ "state": "landed",
+ "updated": "2026-11-18T18:25-08:00",
  "shape": "D3-32 r24 1-node slice (EP4 emulating EP32: 28 active experts/rank split 14+14 over the die halves, EP32 MegaMoE records via knob_world_size; SP shard 96 MoE tokens/GPU, top-16, L~135K, k=3); ms = 23-layer slice x4 (92 MoE layers)",
  "baseline_ms": 7.14,
  "current_ms": 6.41,
@@ -176,6 +176,11 @@
    "t": "18:05",
    "what": "committed knob_world_size hook + unit test (4b58015c31), pushed; megamoe_rubin tests on d-moe-4b58015c31-1; in-step confirm with the private stepbench (hook, no diag patch)",
    "result": "157 passed; MegaMoE exposed 1504/1461/1603 us, step 6460/8634/10647 us (r8/r16/r24) = the diag run"
+  },
+  {
+   "t": "18:25",
+   "what": "INFRA: merged wzhao/k31ws-d-moe 4b58015c31 into wzhao/k31ws-int (c8a403aa7f, pushed); stepbench nq_step adopted the die-split active set + knob_world_size hook",
+   "result": "int tests pass (incl. megamoe_rubin 160, sp_layers DSA 4); NVFP4 decode slice (die-split emulation) 6576/8673/10520 -> 6381/8438/10302 us, MegaMoE exposed 1786 -> 1599 us at r24 vs fused achievable 850 (MegaMoE family achievable is now the fused model layer: see findings/INFRA.md 17:50)"
   }
  ],
  "next": "HANDOFF. (1) INFRA: merge wzhao/k31ws-d-moe @ 4b58015c31 (includes 01ace2323a reconcile; tests: runs/D-MOE/logs/t4.log, t5.log) and adopt runs/D-MOE/sb/nq_step.py emulation changes in tools/stepbench (diff vs tools/stepbench/nq_step.py). (2) In-step A/B for D-MOE: bash $K/runs/D-MOE/sb/step_d_dmoe.sh -n D-MOE -q nvfp4 -t <tag> <overlay> 128,256,384 1 (overlay built with mkov.sh on a worktree that contains 4b58015c31). (3) E2: in block_scaled_swap_ab_mega_moe_kernel.py, pass output_activation + topk_indices to _kernel; in token_comm.reset_tail use epilogue_grid_sync=True when reducing in-kernel, then the transfer warps of every CTA run the TopkReduce._reduce_bf16 body for tokens [cta*T/grid ...) and __call__ skips the separate reduce launch; update VENDOR.md manifest (sha of changed files) and record as local difference; measure with epf.sh-style bench (runs/D-MOE/epf.sh, --die-local) at 1 GPU and EP4, then the slice. (4) 8-node hold (~04:50): see plan item 5; also standalone EP32 stamps (vs.sh needs a multi-node variant: srun --overlap --jobid $WS_JOB -N8 --ntasks-per-node=4 bash wsenv.sh python3 vstamp.py --num-experts 896 ..., modelled on tools/step_multi.sh lines 43-52).",

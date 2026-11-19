@@ -260,6 +260,22 @@
   {
    "t": "11-18 20:40",
    "text": "P-GEMM attribution: prefill MOE glue per layer = shared SiTU + MXFP8 act quant 160 us + FI quant 40 us + latent RMSNorm 29 us; router top-k 65 us (latency-bound, 1 token per 128 threads)."
+  },
+  {
+   "t": "11-18 17:45",
+   "text": "D-TOPK r2/r3: 24.8/24.3/29.4 us/layer at r1/r8/r24 (from 26.8/27.0/34.7), exact."
+  },
+  {
+   "t": "11-18 18:20",
+   "text": "D-FUSE: MXFP8 SP boundaries (KDA all-gather published as MXFP8, shared gate_up input written as MXFP8 by the fused kernels) remove separate act_quant kernels; family 0.79 -> 0.65 ms on the NVFP4 slice (model 0.37)."
+  },
+  {
+   "t": "11-18 22:00",
+   "text": "P-GEMM in-step NVFP4: family 83.9 -> 83.4 ms (target 80.0); router top-k 65 -> 29 us/layer; separate FI MXFP8 quant passes removed."
+  },
+  {
+   "t": "11-18 18:05",
+   "text": "8-node D3-32 run on a new overlay died at startup: CUDA symmetric-memory rendezvous timed out (1800 s) while 32 ranks cold-compiled CuTe kernels. Fix: pre-warm the overlay compile caches on 1 node before every multi-node run."
   }
  ]
 }

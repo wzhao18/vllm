@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-ATTN workflow agent",
  "state": "landed-ready",
- "updated": "2026-11-18T20:45-08:00",
+ "updated": "2026-11-18T22:30-08:00",
  "shape": "D3-32 r24 1-node DP-rank slice, NVFP4 ckpt (k31-nvfp4-view-L24: 6 DSA layers), 384 verify rows/rank, u132k, k=3; family = DSA q path + sparse MLA + DCP value + prologue + indexer logits, in-step exposed",
  "baseline_ms": 0.909,
  "current_ms": 0.621,
@@ -85,9 +85,14 @@
    "t": "20:18",
    "what": "INFRA: 72fdf53350 not merged: test_sp_dsa_block_matches_stock_layer[mxfp4-merge] fails at R68 (q codes 7.25 apart vs ulp 0.03125); see findings/INFRA.md",
    "result": "NVFP4 decode slice with it 6.53/8.36/10.15 vs int 6.59/8.66/10.47 ms"
+  },
+  {
+   "t": "22:30",
+   "what": "keys-on-M sparse MLA (dsa/sparse_mla_km.py): S^T = K Q^T (N = 96 real heads), O^T 4 x 96 TMEM cols, index ring, merged Q/index loader, gather4 loader warps; 8 microbench rounds with phase stamps",
+   "result": "correct first run (same FP32-reference error as trtllm-gen, 1 BF16 ulp apart); best 49.7 us at R384 (trtllm-gen 41). Bounds found: per-warp gather4 issue ~30-35 ns/instr (1 warp 4 us/tile, 4 warps 1.5 us), register cap = 65536/threads rounded to 128 threads, ptxas ignores setmaxnreg regions (1168 B spills), per-head row-sum rmem tensor lowered to local memory -> softmax 1.5-4 us/tile. In flight: register-carried row sums + skipped redundant alpha ex2 (km8)"
   }
  ],
- "next": "Write the keys-on-M sparse MLA (dsa/sparse_mla.py SparseMlaDecodeT) reusing the v1 index ring / loaders / Q pipelining; microbench with benchmarks/kimi_k3/dattn_sp.sh <ov> <name> --rows 128,384 --stamps on rhea.",
+ "next": "km8 result (runs/D-ATTN/sp/km8a, km8b): softmax per tile (stamps t1_*) must drop below the gather time; then raise gather issue (loaders 6-8 within the 96/128-reg budget), then wire.",
  "blockers": "",
  "branch": "wzhao/k31ws-d-attn @ dfb3f4f7c1 (landed-ready piece: LocalQuery 72fdf53350)",
  "evidence": [

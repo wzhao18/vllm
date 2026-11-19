@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-TOPK agent",
  "state": "implementing",
- "updated": "2026-11-18T17:50-08:00",
+ "updated": "2026-11-18T18:05-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.636,
  "current_ms": 0.294,
@@ -14,13 +14,11 @@
  "basis": "MEASURED in-step (INFRA step_d recipe run in the D-TOPK runner, 1-node D3-32 slice, 6 DSA layers, u132k, rows 128/384, profile): top-k family busy 57 -> 37 us/layer (r8), 106 -> 49 us/layer (r24); current_ms = 49 us x 24 DSA layers. Microbench (4-GPU DCP4, CUDA graph): r1/r8/r24 27/27/35 us per layer (in-tree 30/45/86). achievable = rhea1n model_rows B96: DSA.topk 1.9 + P8 7.5 us/layer (0.227 ms/step); r8 0.64 + 6.4; r1 0.08 + 5.9",
  "gap_analysis": "SOL design (per row, r24 one wave of 384 one-CTA rows): bound = one read of the row's 68 KB of bf16 logits (L2-resident after the logits kernel; all bytes in flight at once) + ONE dependent NVLink round + a short local merge; floor ~ load latency + round + ~2 us. Measured v2 chain at r24 (microbench, clock stamps): sample 2.2 + theta 0.7 + candidate pass 10.8 (3-4 serial memory latencies: batches of 4 groups/thread) + message build 3.7 (~12 synced steps, single-thread band search) + round 4.3 + resolve 7.0 + WRITE 4.0 = 34.7 us vs model 9.4. In-step 49 us: the kernel starts right at the logits kernel's end (no hidden PDL overlap), so the extra ~14 us over the microbench is in-kernel (diagnosing with in-step stats/stamps). Redesign: (1) register-resident row: the row's groups are loaded speculatively before its lengths are known (one latency for both), sample/theta/candidates from registers; (2) candidates compacted in POSITION order by a (slot, warp, lane) scan (no bitmap pass later); (3) KV-slot gather of every candidate in the round's shadow; post-round = resolve + one packed scan + scatter; (4) pollers back off (spinning warps steal issue slots and L2 from co-resident rows); (5) message build and resolve collapsed to ~3 synced steps each, no single-thread loops. Projection r24 microbench ~1.5 load + 1 sample/theta/cand + 1.5 message + 3-4 round + 2.5 resolve/write = ~10-11 us (target 11 in-step).",
  "inefficiencies": [
-  "FIXED: tie round through the leader state machine with an extra key pass (ebc6916ed5)",
-  "FIXED: launch shape bounded by max_model_len -> pre-pass kernels 41-46 us at r24 (v2 has none)",
-  "FIXED: second NVLink round for ties straddling ranks (band of global ids rides on round 1)",
-  "MEASURED: v2 candidate pass 8.5-10 us vs 3 us for the same loop standalone (cause open)",
-  "MEASURED: resolve (5-6.5 us) and WRITE (3.5-4.5 us) are chains of small synced steps; single-thread loops remain (band pick, class)",
-  "MEASURED: one CTA per row leaves 196 of 212 SMs idle at r1 and 84 idle at r8: rows should split over a cluster for the key pass at small batch",
-  "merge kernel PDL: v2 launches with programmatic serialization (prologue overlap) but never releases dependents early (trtllm-gen consumer reads counts before its wait)"
+  "FIXED: tie round, max_model_len launch shape, second NVLink round (v2)",
+  "FIXED (r2): WRITE bitmap pass + slot gather after the round (slots now in the round shadow, one scan)",
+  "FIXED (r3): 4-barrier block scans (now 1), single-thread band search, resolve 15+ barriers (now 3)",
+  "MEASURED: kernel text 280 KB, hot path straight-line code executed once per CTA -> instruction fetch bound (candidate pass 7-8 us from registers); fix: SMEM-resident row + short rolled loops (r4)",
+  "MEASURED: in-step 38-61 us/call vs microbench ~30: diag run with in-step stats/stamps pending"
  ],
  "rubin_features": [
   "NVLink multicast (multimem.st) for the candidate/histogram exchange",
@@ -111,9 +109,19 @@
    "t": "17:50",
    "what": "resumed (new agent): read in-step trace: topk_v2 starts at the logits kernel's end on every layer (no PDL overlap hiding), 38-61 us/call in-step vs 34.7 microbench; implemented register-resident front end (r1) and position-ordered candidates + slot gather in the round shadow + one-scan WRITE + poll backoff (r2)",
    "result": "queued on the D-TOPK runner (j27 r1 bench+test, j28 in-step diag, j29 r2 bench+test)"
+  },
+  {
+   "t": "17:45",
+   "what": "r1 register front end / r2 position-ordered candidates + slots in the round shadow + one-scan WRITE + poll backoff / r3 one-barrier scans + resolve in 3 barriers + parallel band pick (bench 4-GPU DCP4, CUDA graph, relu; test_k31_dcp_exchange vs topk_merge)",
+   "result": "all ALL PASS, mism 0; r1/r8/r24 us/layer: v2 26.8/27.0/34.7 -> r1 28.5/28.0/33.2 -> r2 26.5/26.1/30.8 -> r3 24.8/24.3/29.4; WRITE 4 -> 1.6 us; register-resident candidate pass still ~7-8 us from REGISTERS (not memory)"
+  },
+  {
+   "t": "17:55",
+   "what": "cuobjdump -elf of the built extension",
+   "result": "topk_v2_kernel .text = 280 KB (~18K SASS instructions); the per-row chain executes long straight-line code once per CTA (cold instruction fetch): the unrolled 9-slot register compaction alone ~1K instructions -> hypothesis: the chain is instruction-fetch bound, not memory or sync bound"
   }
  ],
- "next": "results of j27/j29 (microbench phases + ALL PASS), then j28 in-step stats/stamps; next collapse message build + resolve",
+ "next": "r4 (SMEM row via 8 bulk copies, rolled sample/compaction loops, exchange buffers aliased into the row buffer, carveout for 2 CTAs/SM) bench+test queued (j37); in-step diag j36 running",
  "blockers": "",
  "branch": "wzhao/k31ws-d-topk @ b162ec54a6",
  "evidence": [

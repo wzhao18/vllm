@@ -4,14 +4,14 @@
  "side": "decode",
  "owner": "D-KDA agent (resumed)",
  "state": "implementing",
- "updated": "2026-11-18T18:05-08:00",
+ "updated": "2026-11-18T18:40-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
  "achievable_ms": 0.47,
  "target_ms": 0.517,
  "step_ms": 10.89,
- "basis": "MEASURED in-step NVFP4 baseline (INFRA 18:52 EST, measured/20261118-1900-nvfp4-decode.json); achievable = nvfp4_modelopt at the same slice",
+ "basis": "MEASURED in-step (Rhea 1-node profile, 93-layer projection, perf-model/microbench/results/rhea1n_d3x32). current_ms stays the production dispatch (KdaWS + flush) until KdaFlow beats it; KdaFlow progress is microbench (1 GPU, n96 = r24, 69 layers in one CUDA graph, deferred fold active): 64.6 us/layer",
  "gap_analysis": "MEASURED (runs/D-KDA run2/run3, 1-GPU microbench at the D3-32 per-GPU shape, deferred fold active): KdaWide n32/64/96/128 = 26.0/51.5/74.3/95.0 us/layer, KdaWS (no fold; flush pass extra) 20.5/37.4/48.5/62.3; state stream only 3-6.5 TB/s and a 2-page state ring changes nothing -> not bandwidth / bytes-in-flight bound. In-kernel clock64 trace of KdaFlow (WS + fold) at n96: the 8-warp scan is the bottleneck (verify ~5.5-7K cycles/item vs ~2.5K FP32-pipe floor, fold ~3.5-4.5K/item vs ~1K), scan waits ~0 on the state and ~13% on prep; prep body ~8K cycles/item per warpgroup (global round trips: F_B tile loads, old records, weights), so prep is the next limit once the scan speeds up. Root cause: latency-bound dependency chain per token (k-dot reduce -> v -> update -> q-dot reduce) with only 2 scan warps per SMSP, plus global-latency-bound prep.",
  "inefficiencies": [
   "MEASURED: KdaFlow scan fold and verify each ~9K cycles/item at n96 (instruction floor ~1-2K): suspect register cap 128 + local-memory stack (STACK 88) in the fused fold+verify scan",
@@ -107,11 +107,31 @@
    "t": "17:55",
    "what": "run17/18 isolation at n96 (us/layer): page reads alone 15.3-15.8 (9.6 TB/s), + checkpoint STG from registers 36.2 (+20.5), + prep 50.5, + verify FP passes w/o shuffles ~+12, + row-reduction/broadcast shuffles (8 lanes/row: 22 SHFL per token) +24, + fold +12 -> 100.9; SM clock 2.4 GHz (not throttled)",
    "result": "dominant costs: register-path checkpoint stores and cross-lane reductions. v5: pair layout (2 rows x 64 keys per thread, register chunk j = key chunk j ^ (c%8): conflict-free smem, 1 SHFL per dot), checkpoint written back into its smem slot + one async bulk store (evict-first), CTA 3-slot page ring, F_B fragments from L2 (smem for the ring). Reduction order changes vs KdaWS: flow test now checks checkpoints/corrections at FP32 tolerance, outputs at BF16 tolerance, conv/keys/gates bitwise"
+  },
+  {
+   "t": "17:50",
+   "what": "run19 v5 (pair layout, 3-slot page ring, bulk-store checkpoint): flow test 8/8 (tolerance vs KdaWS+stock commit; keys/gates/conv bitwise)",
+   "result": "n32/64/96/128 = 32.9/61.7/86.6/115.1 us/layer; shuffles now free; prep +36 us at n96 (trace: F_B fragment loads from L2 ~8K cycles/item, record stores) -> synchronous global accesses queue behind the saturated state stream"
+  },
+  {
+   "t": "18:05",
+   "what": "run21 v6: no synchronous global access in the item loops (prologue F_B gate projection for all CTA items; per-item inputs bulk-copied one item ahead on an mbarrier; records/window/corrections/outputs bulk-stored from smem); commit 097ecf925b",
+   "result": "flow test 8/8; n32/64/96/128 = 25.8/47.1/64.6/85.4 us/layer (x69 n96 = 4.46 ms). n96 attribution: page reads 21.0, +checkpoint store 36.6, full 64.6; skip verify 47.4, skip fold 50.3, skip prep 54.2. Per group-item trace: prep 5K, fold+store 6K, verify 9K, epilogue 2.5K cycles: FP phases run at ~25-30% of the FP32 pipe (latency-bound: 2 warps per SMSP, LDS latency per chunk)"
+  },
+  {
+   "t": "18:35",
+   "what": "run22/23 + local SASS opcode histograms (image ptxas in the colima VM, opcode table from PTX probes; no nvdisasm needed): static instructions per item and thread: verify 1448 (FP2 960), fold 768 (FP2 512), prep 680, epilogue 192, skeleton+prologue ~2.7K; fold fence/prefetch variants change <5%",
+   "result": "instruction stream is lean (~3.4K/item/thread, ~15 us/layer at full issue at n96) but issue efficiency is ~25%: 2 warps per SMSP cannot hide LDS/shuffle/barrier latency. v7: 4 groups of half-row items (2 pairs, 16 warps/SM, ~110 regs/thread, same smem), so each SMSP holds 4 warps"
+  },
+  {
+   "t": "18:25",
+   "what": "coordinator: current reset to the slice scope of the baseline (0.90 ms, 18 KDA layers, r24)",
+   "result": "3.4 was a 93-layer number; report in the baseline scope"
   }
  ],
- "next": "run19: v5 test + microbench + attribution",
+ "next": "v7 (4 half-row groups) implement + test + microbench",
  "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
- "branch": "wzhao/k31ws-d-kda @ 3de6741dcc",
+ "branch": "wzhao/k31ws-d-kda @ 097ecf925b",
  "evidence": [
   "runs/D-KDA/run2.log",
   "runs/D-KDA/run3.log",

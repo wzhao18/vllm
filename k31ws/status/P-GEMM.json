@@ -3,18 +3,18 @@
  "title": "Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops",
  "side": "prefill",
  "owner": "P-GEMM workflow agent",
- "state": "implementing",
- "updated": "2026-11-18T20:45-08:00",
+ "state": "landed-ready",
+ "updated": "2026-11-18T22:05-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "baseline_ms": 83.89,
- "current_ms": 84.53,
+ "current_ms": 83.41,
  "achievable_ms": 72.7,
  "target_ms": 79.97,
  "step_ms": 218.7,
- "basis": "baseline: MEASURED in-step NVFP4 (INFRA 17:48, int b31121cf56). current: int 5718ef2 profiled slice (trial3), my changes not yet in-step. achievable = nvfp4_modelopt at the same slice",
- "gap_analysis": "MEASURED on int 5718ef2 (INFRA trial3 profiled slice, pf16k, per MoE layer, rank0): the GEMM mainloops are at 1.00-1.09x model (cuBLASLt nvjet sm_107 2-CTA). The family excess is glue the model prices as fused/free: shared SiTU+MXFP8 quant act_quant 160 us/layer (x23 = 3.7 ms; floor 36 us; MUFU-bound: 3 precise tanhf per element), FlashInfer MXFP8 quant of the AttnRes output 40 us x 41 calls (1.6 ms; removed by B1 attn_res_mxfp8), router top-k 65 us/layer (1.5 ms; byte floor 4 us; latency-bound: 1 token per 128-thread block, 3 of 4 warps idle in the serial select), latent RMSNorm 29 us/layer (0.67 ms; floor 17), DSA gate sigmoid-mul 131 us/call x6 (floor 58; 2 MUFU per element), dense BF16 SiTU 221 us/call x3, router GEMM 78 vs 58 us (N=896 waves). In pf_fam these land in MOE.latent_norm (catch-all: act_quant + FI quant + rms 5.55 ms vs 0.04 model) and MOE.topk (1.51 vs 0.02).",
+ "basis": "MEASURED in-step NVFP4 1-node DEP4 slice, profiled (runs/P-GEMM/step_p/c4-nv-prof, overlay p-gemm-c4-cd5a5401 = int 9d3cb2b + P-GEMM); baseline 83.89 (INFRA 17:48) and the int 5718ef2 reference 84.53 are the same scope; achievable = nvfp4_modelopt at the same slice",
+ "gap_analysis": "MEASURED in-step (c4-nv-prof, per MoE layer): 83.41 ms vs target 79.97 (achievable 72.7). GEMM mainloops at 0.96-1.10x model. Remaining excess: shared SiTU+MXFP8 act_quant 151 us/layer = 3.47 ms (the model prices it fused; standalone it is FMA-issue bound on 3 precise tanhf per element, ~32 us per tanhf pass, 4x its HBM floor; exact BF16 lookup tables do not help, measured), attn_res_mxfp8 fused epilogue +22 us per call over native AttnRes (41 calls: 0.9 ms; net it still saves 0.7 ms vs native + FI quant), router GEMM N=896 76 vs 58 us (0.4 ms), latent RMSNorm 28 vs 17 us floor (0.25 ms), router top-k 29 vs 4 us floor (0.6 ms), latent_down/up 1.06-1.09x, DSA gate sigmoid-mul 128 us x6.",
  "inefficiencies": [
-  "MEASURED: shared SiTU+MXFP8 quant pass 116 us/layer (92/step = 10.7 ms) vs model 9.2 us: MUFU-bound precise tanhf (3 per element); only hideable inside the gate_up GEMM epilogue (SOL design B3). Model error: shared_act / MOE.topk SIMT cost ignores the precise-transcendental MUFU cost when unfused",
+  "MEASURED: shared SiTU+MXFP8 quant 151 us/layer in-step vs model ~0 (priced as fused): FMA-issue bound on 3 precise tanhf per element (~32 us per tanhf pass); BF16 tables do not beat it (bank-conflicted gathers). SOL = gate_up GEMM epilogue fusion (B3).",
   "MEASURED: router top-k 43 us/layer vs 4 us floor (precise sigmoid over 896 logits per token); router GEMM 1.30x (N=896 wave quantization)",
   "MEASURED: standalone MXFP8 quant of the AttnRes output (40 us FlashInfer) per KDA in_proj / shared gate_up call - removed by attn_res_mxfp8 (B1, step A/B running)",
   "MEASURED: native AttnRes 1.31-1.37x its byte floor; fused variant adds 15-25 us (serial per-token epilogue, 1 CTA/SM): needs a 2-token-per-SM redesign (B2)",
@@ -28,12 +28,10 @@
   "epilogue fusion (MXFP8 quant in producer epilogues)"
  ],
  "plan": [
-  "SOL DESIGN (per family, bound resource): tensor-bound GEMMs stay on cuBLASLt 2-CTA tactics (at model). Every transcendental glue pass becomes HBM-bound or disappears: SiTU / sigmoid inputs are BF16, so the precise-transcendental result is a function of a 16-bit input -> per-CTA shared-memory tables built with the exact stock expressions (bitwise equal, out-of-window values computed directly), turning the MUFU-bound passes into HBM-streaming passes; router top-k one token per warp in registers (issue-bound ~10 us); AttnRes writes the MXFP8 GEMM input (B1). Projected family after these: ~79.5 ms vs target 79.97 (achievable 72.7).",
-  "C1 (implemented 20:30, testing): SiTU+MXFP8 by table (act_quant mode 4, >= 1024 rows); router top-k one warp per token. Projected -2.6 ms (act 160->~50 us/layer) and -1.2 ms (top-k 65->~12).",
-  "C2 (implemented): BF16 tables for DSA gate_sigmoid_mul (-0.4 ms) and dense BF16 SiTU (-0.3 ms).",
-  "B1 (done earlier): attn_res_mxfp8 removes 41 FI quant passes/step (-1.6 ms) minus fused epilogue cost; confirm in the profiled slice.",
-  "Then: latent RMSNorm at its byte floor (-0.3 ms), router GEMM N=896 tactic (-0.4 ms); stretch SOL: shared gate_up GEMM with SiTU+MXFP8 epilogue (removes the 403 MB BF16 round trip, -1 ms).",
-  "Validate: bitwise unit tests + 1-GPU glue bench (runs/P-GEMM/c1,c2), then profiled step_p -q nvfp4 on the overlay vs int reference (198.9 ms F16K; per-group from trial3 prof)."
+  "LANDED-READY: wzhao/k31ws-p-gemm @ cd5a5401ed (merges int 9d3cb2b0c2): B1 attn_res_mxfp8 (AttnRes writes the KDA in_proj / shared gate_up MXFP8 input), mxfp8_act 4-vector producers, router top-k one warp per token, DSA gate sigmoid BF16 table. All bitwise-tested.",
+  "B3 (decisive, -3.5 ms -> ~79.9 ms = target): shared gate_up GEMM (M=16384, N=12288, K=7168, MXFP8) with the SiTU + BF16 round + MXFP8 quant epilogue writing the shared_down MXFP8 input directly: the CUDA-core SiTU work (~100 us) hides under the tensor-bound mainloop (~265 us) and the 403 MB BF16 round trip disappears. Needs a persistent 2-CTA M256xN256 block-scaled kernel at cuBLASLt speed (FlashInfer sm107 CuTe DSL Sm107BlockScaledPersistentDenseGemmKernel is 1.14x cuBLAS by default: sweep its tactics first) with gate/up interleaved weight rows (permute the gate_up weight at load so each 256-wide N tile holds 128 gate + the matching 128 up columns) and an epilogue doing exactly situ_activation + c10 BF16 rounding + FlashInfer MXFP8 quant (bitwise test vs mxfp8_act mode 1).",
+  "B2: attn_res_mxfp8 epilogue overhead (+22 us/call, 0.9 ms): 2 tokens per SM / split the per-token quant epilogue across warps.",
+  "Small: router GEMM N=896 tactic (0.4 ms), latent RMSNorm to byte floor (0.25), router top-k further (0.6), gate sigmoid-mul in-step shape check."
  ],
  "work": [
   {
@@ -100,16 +98,35 @@
    "t": "20:40",
    "what": "C1: SiTU+MXFP8 table form + router top-k one warp per token (6d7ea75c89); C2: gate sigmoid table + BF16 SiTU table (42269497)",
    "result": "C1 SiTU tests incl. exhaustive all-BF16-input bitwise test: 45 passed (runs/P-GEMM/c1); router tests + bench running"
+  },
+  {
+   "t": "21:20",
+   "what": "C1-C3 glue bench, 1 GPU M=16384 (runs/P-GEMM/c1,c3); all bitwise tests pass (SiTU exhaustive 45, vec situ 19, router top-k 50)",
+   "result": "router top-k one warp per token 25 us (old k31 kernel 65 in-step / stock grouped_topk 54; floor 4.2). SiTU+MXFP8 at the model betas (4, 25): direct 148 us, gate+up tables 151, gate table 179: NOT a win (shared-memory gathers with bank conflicts cost as much as tanhf) -> tables dropped. Measured: each precise tanhf pass costs ~32 us at 100M elements (beta 1/no clamp = 2 tanhf: 116 us; model betas = 3 tanhf: 148 us): the standalone SiTU is FMA-issue bound at ~4x its HBM floor at stock precision; only a GEMM-epilogue fusion (CUDA cores idle under the tensor-bound gate_up mainloop) reaches the model"
+  },
+  {
+   "t": "21:35",
+   "what": "c4 = router top-k per warp + gate_sigmoid_mul BF16 table (512-thr fix) + B1 attn_res_mxfp8, on int 9d3cb2b; profiled step_p -q nvfp4 (runs/P-GEMM/step_p/c4-nv-prof) + glue bench (runs/P-GEMM/c4)",
+   "result": "running"
+  },
+  {
+   "t": "22:00",
+   "what": "profiled step_p -q nvfp4 on p-gemm-c4-cd5a5401 (runs/P-GEMM/step_p/c4-nv-prof); glue bench + all tests on the same overlay (runs/P-GEMM/c4: mxfp8_act 36, vec situ 16, prefill_glue 84 passed)",
+   "result": "F16K 198.25 ms (int ref 198.9; MegaMoE group +2.4 ms run-to-run, not mine). My family 83.41 ms (int 84.53): router+latent+top-k 18.76 (20.91; router_topk 65 -> 29 us/layer), AttnRes 5.75 (4.83: attn_res_mxfp8 114-119 us vs native 92-97), FI MXFP8 quant passes gone (-1.6 ms, 0.7 of it in the KDA-core group), KDA proj 26.17, DSA proj 15.56, shared 10.11, dense 7.06. gate_sigmoid_mul table: 83 us in the 1-GPU bench (16384x8192) but 128 us/call in-step (int 131): no in-step gain, shape to check"
   }
  ],
- "next": "read runs/P-GEMM/c1 + c2 (tests, glue bench); then profiled step_p -q nvfp4 on p-gemm-c2-42269497 and per-group compare vs trial3 prof",
- "blockers": "Two 4-GPU step runs lost to CUDASymmetricMemory DistStoreError rendezvous timeouts (reported to INFRA in findings); pool contention",
- "branch": "wzhao/k31ws-p-gemm @ 42269497 (merges wzhao/k31ws-int 9d3cb2b0c2)",
+ "next": "HANDOFF: (1) INFRA: merge wzhao/k31ws-p-gemm @ cd5a5401ed (tests: tests/models/kimi_k3/test_mxfp8_act.py, test_k31_vec_situ.py, test_prefill_glue.py, test_k31_prefill_attn_res_mxfp8.py). (2) B3 as in plan: first a 1-GPU microbench of the FlashInfer sm107 MXFP8 CuTe DSL GEMM at 16384x12288x7168 over its tactics vs cuBLASLt 264 us (harness benchmarks/kimi_k3/pgemm_bench.py), then the interleaved-weight SiTU+MXFP8 epilogue. Kernel attribution of a slice profile: python3 $K/runs/P-GEMM/scripts/knames.py <prof-pf>/pf16k_L78k.rank0.trace.json.gz 60 (local copy /Users/weizha/k31ws-wt/p-gemm-scripts/). Runners runs/P-GEMM/scripts/run_c*.sh; step: tools/step_p.sh -n P-GEMM -q nvfp4 -t <tag> <overlay> 1.",
+ "blockers": "",
+ "branch": "wzhao/k31ws-p-gemm @ cd5a5401ed (pushed; merges wzhao/k31ws-int 9d3cb2b0c2)",
  "evidence": [
   "perf-model/out/optables.json nvfp4_modelopt|P3-16|prefill",
   "perf-model/plan/nvfp4_ledgers_summary.txt",
   "perf-model/microbench/results/prefill/README.md",
-  "runs/P-GEMM/b1, runs/P-GEMM/a1"
+  "runs/P-GEMM/b1, runs/P-GEMM/a1",
+  "runs/P-GEMM/step_p/c4-nv-prof",
+  "runs/P-GEMM/c1",
+  "runs/P-GEMM/c3",
+  "runs/P-GEMM/c4"
  ],
  "ckpt": "nvfp4"
 }
