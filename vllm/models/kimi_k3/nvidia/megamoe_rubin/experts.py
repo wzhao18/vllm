@@ -754,13 +754,23 @@ class KimiK3MegaMoEExperts(nn.Module):
         takes ``fused_shared=``)."""
         return self.select_bucket(num_tokens).shared is not None
 
-    def warmup_fused_shared(self, shared) -> None:
+    def warmup_fused_shared(self, shared):
         """Collective: build, compile and warm the fused-shared runtime with one
-        layer's ``session.FusedSharedArgs``."""
+        layer's ``session.FusedSharedArgs``; returns the arguments to launch with
+        (FC1 homed per die on die-local buckets)."""
         if self.kernel_weights is None:
             raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
+        if self.bucket.die_sm_mask32 is not None:
+            from .die_local import place_halves
+
+            # FC1 [1, K, N] is a K-major view of the striped [1, N, K] copy: home its
+            # feature halves per die (the decode scheduler claims them die-local).
+            w = shared.fc1[0]
+            placed = place_halves(w.permute(0, 2, 1)).permute(0, 2, 1)
+            shared = shared._replace(fc1=(placed, shared.fc1[1]))
         self.get_runtime().warmup(self.kernel_weights, shared=shared)
         self._warm_fused_shared = shared
+        return shared
 
     # -- runtime / kernel layout -----------------------------------------------------
 

@@ -477,6 +477,53 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             blocks0, blocks1 = _count_stream_token_blocks(self._mapping)
             self._lead_k_per_owner = (blocks0, blocks1) if self.expert_half else (blocks0,)
 
+    @property
+    def shared_stream_count(self) -> int:
+        """Die-aware: one shared FC1 counter per die (its home half of the FC1 feature blocks) plus the FC2
+        counter; die-blind: the mixin's FC1 + FC2 counters."""
+        count = SharedExpertStreamMixin.shared_stream_count.fget(self)
+        return count + (1 if count and self.die_count == 2 else 0)
+
+    @cute.jit
+    def _claim_die_half(self, work_id_worker, side: Int32):
+        """Claim from the shared FC1 counter of die ``side`` (its feature blocks [base, base + count), every token
+        block). Returns (cluster-level shared FC1 id or -1 past the end, worker)."""
+        feature_blocks = self._shared_feature_blocks[0]
+        half = feature_blocks // 2
+        count = Int32(half) + Int32(feature_blocks - 2 * half) * side
+        base = Int32(half) * side
+        local_id = work_id_worker.claim_next_work(self._shared_stream_index + side)
+        shared_id = Int32(-1)
+        if local_id < count * Int32(self.shared_token_blocks):
+            token_block = local_id // count
+            shared_id = token_block * Int32(feature_blocks) + base + (local_id - token_block * count)
+        return shared_id, work_id_worker
+
+    @cute.jit
+    def _claim_shared_tile(self, work_id_worker, stage: Int32, next_id: Int32, fc2: int):
+        """Die-aware (vLLM-local S-SH): shared FC1 tiles of this die's home half first (the die-local FC1 copy,
+        ``weights.prepare_mxfp8_shared_weights``), then the other die's; FC2 from its own counter. Die-blind: the
+        mixin's single FC1 / FC2 counters."""
+        if cutlass.const_expr(self.die_count == 1):
+            return SharedExpertStreamMixin._claim_shared_tile(self, work_id_worker, stage, next_id, fc2)
+        work_tile = make_fc12_done_tile(True)
+        if cutlass.const_expr(fc2 == 1):
+            local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2)
+            if local_id < Int32(self._shared_phase_tiles[1]):
+                work_tile = self._decode_shared_tile(local_id, 1)
+            else:
+                stage = stage + Int32(1)
+        else:
+            own = Int32(self._mapping.owner_index)
+            shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
+            if shared_id < Int32(0):
+                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
+            if shared_id >= Int32(0):
+                work_tile = self._decode_shared_tile(shared_id, 0)
+            else:
+                stage = stage + Int32(1)
+        return work_tile, stage, next_id, work_id_worker
+
     @cute.jit
     def finish_claim_channel(self) -> None:
         """Scheduler warp, once after the last claim (last-arriver tail): see the worker's docstring."""

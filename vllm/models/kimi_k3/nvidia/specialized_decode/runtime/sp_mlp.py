@@ -170,8 +170,9 @@ class SpMlp:
                 hidden=self.hidden, intermediate=self.inter2 // 2,
             )  # fmt: skip
             buf = gu.input.buf
-            self.fused_shared = FusedSharedArgs(buf.data, buf.scale, fc1, fc2)
-            mlp.experts.warmup_fused_shared(self.fused_shared)
+            self.fused_shared = mlp.experts.warmup_fused_shared(
+                FusedSharedArgs(buf.data, buf.scale, fc1, fc2)
+            )
         # Rubin MegaMoE: the latent RMSNorm folds into the kernel's top-k reduce (one
         # kernel and one [n, latent] round trip fewer per layer); compiled here, before
         # capture. Other MegaMoE backends keep the separate stock norm.
