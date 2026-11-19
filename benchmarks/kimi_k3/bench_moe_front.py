@@ -139,7 +139,7 @@ def main():
     print(f"SMs {sms}; layers {L}; producer busy {args.busy_us} us; carveout {carve}")
     print(f"  moe_front registers/local bytes: {fm.moe_front_attrs()}")
     for c in range(2, 9):
-        sm_ = fm.moe_front_smem(32, 8, 2, 2)
+        sm_ = fm.moe_front_smem(32, 8, 2, 2, 128)
         print(f"  max co-resident clusters C={c} smem {sm_ // 1024}K: {fm.moe_front_max_clusters(c, sm_)}")
     for n in [int(r) for r in args.rows.split(",")]:
         src = torch.randn((n, K), device=dev).to(torch.bfloat16)
@@ -172,8 +172,8 @@ def main():
                 line += f" | base n/a ({type(e).__name__}: {str(e)[:80]})"
         cfgs = [tuple(int(v) for v in c.split(",")) for c in args.cfg] or [moe_front.config_for(n)]
         for c in cfgs:
-            csize, wst, xst, nprod, xg, wg = c
-            smem = fm.moe_front_smem((n + 15) // 16 * 16, wst * wg, xst, xg)
+            csize, wst, xst, nprod, xg, wg, tr = c
+            smem = fm.moe_front_smem((n + 15) // 16 * 16, wst * wg, xst, xg, tr)
             mc = fm.moe_front_max_clusters(csize, smem)
 
             def front(c=c):
@@ -199,7 +199,7 @@ def main():
         # Stamped single layer (eager, after a warm call): phase times after the
         # producer's end, median over CTAs.
         c = cfgs[0]
-        grid = 35 * c[0]
+        grid = -(-(E + LATENT) // c[6]) * c[0]
         st = torch.zeros(grid * 328 + args.debug, dtype=torch.int64, device=dev)
         end = torch.zeros(1, dtype=torch.int64, device=dev)
         def stamped():

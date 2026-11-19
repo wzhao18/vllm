@@ -75,7 +75,9 @@ struct Params {
   unsigned* cnt;     // [1] router CTAs done [2] CTAs finished (written after griddepcontrol.wait only)
   unsigned long long* stamps;  // [grid][8] globaltimer or null
   int k, bn, tiles, rtiles, kb, csize, wst, xst, nprod, xg;
-  int wg;  // K blocks per weight slot (one barrier, wg x 16 KB)
+  int wg;  // K blocks per weight slot (one barrier, wg x tr x 128 B)
+  int tr;  // weight rows per tile = MMA N (128 or 256): x is read once per tr rows
+  int rows_w;  // E + L
   int debug;  // microbench probes only (0 in production): bit 0 skips the MMAs
   int yfull;  // test hook: y also holds the FP32 latent columns (y.size(1) >= E + L)
 };
@@ -242,8 +244,8 @@ __device__ __forceinline__ unsigned long long globaltimer() {
     if (p.stamps) p.stamps[blockIdx.x * kStampStride + (i)] = globaltimer(); \
   } while (0)
 
-__host__ __device__ inline int ring_w_bytes(int bn, int wst) {
-  return wst * kWBox > bn * 128 * 4 ? wst * kWBox : bn * 128 * 4;
+__host__ __device__ inline int ring_w_bytes(int bn, int wst, int tr) {
+  return wst * tr * 128 > bn * tr * 4 ? wst * tr * 128 : bn * tr * 4;
 }
 
 // Sum of the C ranks' partial float4 at `off` (rank order, deterministic).
@@ -279,7 +281,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   uint8_t* ring = reinterpret_cast<uint8_t*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   const int xbytes = kXRows * 128;
-  const int wring = ring_w_bytes(p.bn, p.wst * p.wg);
+  const int wring = ring_w_bytes(p.bn, p.wst * p.wg, p.tr);
+  const int wbox = p.tr * 128;  // one tr x 64 BF16 weight K block
   uint64_t* bars = reinterpret_cast<uint64_t*>(ring + wring + p.xst * p.xg * xbytes);
   // fullW[kMaxW] emptyW[kMaxW] fullX[kMaxX] emptyX[kMaxX] acc
   uint32_t* slot = reinterpret_cast<uint32_t*>(bars + 2 * kMaxW + 2 * kMaxX + 1);
@@ -311,7 +314,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   }
   // Router correction bias (a weight: before the dependency).
   for (int e = threadIdx.x; e < a.num_logits; e += kThreads) s_bias[e] = a.bias[e];
-  const int cols = 128;  // D [128 tokens, 128 weight rows] FP32
+  const int cols = p.tr;  // D [128 tokens, tr weight rows] FP32
   if (warp == 1) {
     asm volatile(
         "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(
@@ -328,7 +331,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   // counter: the next call's CTAs may start (transitive PDL) before this grid ends,
   // and nothing before griddepcontrol.wait may touch shared global state.
   const int tile = static_cast<int>(blockIdx.x) / p.csize;
-  const int wrow = tile * 128;
+  const int wrow = tile * p.tr;
   const int kb_lo = (static_cast<int>(rank) * p.kb) / p.csize;
   const int kb_hi = ((static_cast<int>(rank) + 1) * p.kb) / p.csize;
   const int nkb = kb_hi - kb_lo;
@@ -353,8 +356,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       if (gw >= p.wst) mbar_wait(ew0 + 8 * s, ((gw / p.wst) & 1) ^ 1);
       if (lane == 0) {
         if (gw < 64) STAMPC(136 + gw);
-        mbar_expect_tx(fw0 + 8 * s, p.wg * kWBox);
-        tma_3d_ef(ring_s + s * p.wg * kWBox, &tw, wrow, kb_lo + gw * p.wg, fw0 + 8 * s);
+        mbar_expect_tx(fw0 + 8 * s, p.wg * wbox);
+        tma_3d_ef(ring_s + s * p.wg * wbox, &tw, wrow, kb_lo + gw * p.wg, fw0 + 8 * s);
       }
       __syncwarp();
     }
@@ -393,7 +396,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   } else if (warp == 1) {
     // kind::f16, BF16 A/B, FP32 D, K-major both, N = bn, M = 128.
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
-                           (static_cast<uint32_t>(128 >> 3) << 17) | (8u << 24);
+                           (static_cast<uint32_t>(p.tr >> 3) << 17) | (8u << 24);
     for (int it = 0; it < nkb; ++it) {
       const int g = it / p.xg, j = it % p.xg;
       const int gw = it / p.wg, jw = it % p.wg;
@@ -408,7 +411,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         if (it + 1 == nkb) STAMP(2);
       }
       // Warp-uniform operands: slot indices derive from the loop counter only.
-      const uint64_t ad = smem_desc(ring_s + (probe ? 0 : (sw * p.wg + jw) * kWBox));
+      const uint64_t ad = smem_desc(ring_s + (probe ? 0 : (sw * p.wg + jw) * wbox));
       const uint64_t bd = smem_desc(xring_s + (probe ? 0 : (sx * p.xg + j) * xbytes));
       if (!(p.debug & 1)) {
 #pragma unroll
@@ -434,11 +437,11 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     float* part = reinterpret_cast<float*>(ring);
     const uint32_t ta = tmem + (static_cast<uint32_t>(q * 32) << 16);
     if (q * 32 < a.n) {  // warp-uniform (tcgen05.ld is .aligned)
-      for (int c = 0; c < 128; c += 16) {
+      for (int c = 0; c < p.tr; c += 16) {
         float v[16];
         tmem_ld16(ta + c, v);
         if (tok < a.n) {
-          float4* dst = reinterpret_cast<float4*>(part + tok * 128 + c);
+          float4* dst = reinterpret_cast<float4*>(part + tok * p.tr + c);
 #pragma unroll
           for (int j = 0; j < 4; ++j)
             dst[j] = make_float4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
@@ -452,28 +455,35 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   {
     const int t0 = (static_cast<int>(rank) * n) / p.csize;
     const int t1 = ((static_cast<int>(rank) + 1) * n) / p.csize;
-    if (tile < p.rtiles) {
+    // Router columns [0, rc) and latent columns [rc, lc) of this tile (a tile
+    // may hold both: E is a multiple of 128, not of tr).
+    const int rc = max(0, min(p.tr, a.num_logits - wrow));
+    const int lc = min(p.tr, p.rows_w - wrow);
+    if (rc > 0) {
       // Router logits: FP32 rows of y.
-      const int nf = (t1 - t0) * 32;
+      const int per4 = rc / 4;
+      const int nf = (t1 - t0) * per4;
       for (int f = threadIdx.x; f < nf; f += kThreads) {
-        const int t = t0 + (f >> 5), r4 = (f & 31) * 4;
-        const float4 acc = rank_sum(ring_s + (t * 128 + r4) * 4, p.csize);
-        *reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + tile * 128 + r4) = acc;
+        const int t = t0 + f / per4, r4 = (f % per4) * 4;
+        const float4 acc = rank_sum(ring_s + (t * p.tr + r4) * 4, p.csize);
+        *reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + wrow + r4) = acc;
       }
-    } else {
+    }
+    if (lc > rc) {
       // Latent: BF16 round + the stager's quantization of each block of this tile.
       constexpr int vec = NVFP4 ? 16 : 32;
-      const int per = 128 / vec;
+      const int per = (lc - rc) / vec;
       const int nf = (t1 - t0) * per;
-      const int blk0 = (tile - p.rtiles) * per;
+      const int blk0 = (wrow + rc - a.num_logits) / vec;
       for (int f = threadIdx.x; f < nf; f += kThreads) {
         const int t = t0 + f / per, b = f % per;
+        const int c0 = rc + b * vec;
         float4 in[8];
 #pragma unroll
         for (int q = 0; q < vec / 4; ++q)
-          in[q] = rank_sum(ring_s + (t * 128 + b * vec + 4 * q) * 4, p.csize);
+          in[q] = rank_sum(ring_s + (t * p.tr + c0 + 4 * q) * 4, p.csize);
         if (p.yfull) {
-          float4* dst = reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + tile * 128 + b * vec);
+          float4* dst = reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + wrow + c0);
 #pragma unroll
           for (int q = 0; q < vec / 4; ++q) dst[q] = in[q];
         }
@@ -550,9 +560,9 @@ static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_r
   TORCH_CHECK(rc == CUDA_SUCCESS, "moe_front: cuTensorMapEncodeTiled ", static_cast<int>(rc));
 }
 
-int64_t smem_bytes(int64_t bn, int64_t wst, int64_t xst, int64_t xg) {
+int64_t smem_bytes(int64_t bn, int64_t wst, int64_t xst, int64_t xg, int64_t tr) {
   // wst: weight K blocks resident in the ring (slots x wg)
-  return 1024 + ring_w_bytes(bn, wst) + xst * xg * kXRows * 128 +
+  return 1024 + ring_w_bytes(bn, wst, tr) + xst * xg * kXRows * 128 +
          (2 * kMaxW + 2 * kMaxX + 1) * 8 + 16;
 }
 
@@ -573,7 +583,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                int64_t num_logits, int64_t num_experts, bool renormalize,
                double routed_scaling_factor, bool nvfp4, double norm_const,
                int64_t csize, int64_t wst, int64_t xst, int64_t nprod, int64_t xg,
-               int64_t wg, const torch::Tensor& stamps) {
+               int64_t wg, int64_t tr, const torch::Tensor& stamps) {
   using namespace k3front;
   TORCH_CHECK(w.scalar_type() == at::kBFloat16 && h.scalar_type() == at::kBFloat16 &&
                   w.is_contiguous() && h.is_contiguous(),
@@ -608,7 +618,8 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
               "moe_front: session shapes");
   const int64_t kb = k / 64;
-  const int64_t tiles = rows_w / 128;
+  TORCH_CHECK(tr == 128 || tr == 256, "moe_front: tile rows 128 or 256");
+  const int64_t tiles = (rows_w + tr - 1) / tr;
   TORCH_CHECK(csize >= 1 && csize <= kMaxC && kb >= csize && n >= csize &&
                   tiles * csize >= n && wst >= 1 && wst <= kMaxW && xst >= 1 &&
                   xst <= kMaxX && nprod >= 1 && nprod <= 3 && nprod <= wst && xg >= 1 &&
@@ -654,7 +665,9 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.k = (int)k;
   p.bn = (int)((n + 15) / 16 * 16);
   p.tiles = (int)tiles;
-  p.rtiles = (int)(num_logits / 128);
+  p.rtiles = (int)((num_logits + tr - 1) / tr);  // tiles holding router rows
+  p.tr = (int)tr;
+  p.rows_w = (int)rows_w;
   p.kb = (int)kb;
   p.csize = (int)csize;
   p.wst = (int)wst;
@@ -665,9 +678,9 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.debug = (int)(stamps.numel() > 0 ? stamps.numel() % 8 : 0);
   p.yfull = y.size(1) >= rows_w ? 1 : 0;
   CUtensorMap tw, tx;
-  make_map(&tw, w.data_ptr(), (int)rows_w, (int)k, 128, (int)wg);
+  make_map(&tw, w.data_ptr(), (int)rows_w, (int)k, (int)tr, (int)wg);
   make_map(&tx, h.data_ptr(), (int)n, (int)k, kXRows, (int)xg);
-  const int smem = (int)smem_bytes(p.bn, wst * wg, xst, xg);
+  const int smem = (int)smem_bytes(p.bn, wst * wg, xst, xg, tr);
   static int configured = 0;
   if (smem > configured) {
     set_attrs(smem);
@@ -693,8 +706,8 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   TORCH_CHECK(rc == cudaSuccess, "moe_front launch: ", cudaGetErrorString(rc));
 }
 
-int64_t moe_front_smem(int64_t bn, int64_t wst, int64_t xst, int64_t xg) {
-  return k3front::smem_bytes(bn, wst, xst, xg);
+int64_t moe_front_smem(int64_t bn, int64_t wst, int64_t xst, int64_t xg, int64_t tr) {
+  return k3front::smem_bytes(bn, wst, xst, xg, tr);
 }
 
 // (registers per thread, local memory bytes per thread) of the NVFP4 kernel.
@@ -733,8 +746,8 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                int64_t num_logits, int64_t num_experts, bool renormalize,
                double routed_scaling_factor, bool nvfp4, double norm_const,
                int64_t csize, int64_t wst, int64_t xst, int64_t nprod, int64_t xg,
-               int64_t wg, const torch::Tensor& stamps);
-int64_t moe_front_smem(int64_t bn, int64_t wst, int64_t xst, int64_t xg);
+               int64_t wg, int64_t tr, const torch::Tensor& stamps);
+int64_t moe_front_smem(int64_t bn, int64_t wst, int64_t xst, int64_t xg, int64_t tr);
 int64_t moe_front_max_clusters(int64_t csize, int64_t smem);
 std::vector<int64_t> moe_front_attrs();
 """
@@ -799,7 +812,8 @@ def _module():
 # C = 5 / 6 fit 32 / 28 and run a second wave). The token ring is as deep as the
 # weight ring: tokens come from L2 one K block per slot, and a shallow token ring
 # (4 slots) capped the mainloop at ~3 K blocks per us.
-CONFIGS = {32: (4, 4, 2, 3, 2, 2), 64: (4, 4, 2, 3, 2, 2), 96: (4, 4, 2, 3, 2, 2)}
+# (csize, wst, xst, nprod, xg, wg, tile rows)
+CONFIGS = {32: (4, 4, 2, 3, 2, 2, 128), 64: (4, 4, 2, 3, 2, 2, 128), 96: (4, 4, 2, 3, 2, 2, 128)}
 
 
 def config_for(n: int):

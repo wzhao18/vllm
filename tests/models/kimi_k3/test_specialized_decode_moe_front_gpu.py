@@ -49,7 +49,8 @@ def _same(got, ref):
 @pytest.mark.parametrize("nvfp4", [True, False])
 @pytest.mark.parametrize("n", [32, 64, 96])
 @pytest.mark.parametrize("padded", [False, True])
-def test_moe_front_matches_route_stage(nvfp4, n, padded):
+@pytest.mark.parametrize("tiles", ["config", "tr256"])
+def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     dev = torch.device("cuda")
     torch.manual_seed(n + 2 * nvfp4 + 4 * padded)
     h = torch.randn((n, K), device=dev).to(torch.bfloat16)
@@ -58,7 +59,8 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded):
     w[E : E + 64] = 0  # zero latent blocks
     bias = (torch.randn(E, device=dev) * 0.1).float()
     pad = (torch.rand(n, device=dev) < 0.3) if padded else None
-    cfg = moe_front.config_for(n)
+    # tr256: 256-row weight tiles (a tile holds router and latent rows), 8-CTA clusters
+    cfg = moe_front.config_for(n) if tiles == "config" else (8, 2, 2, 2, 2, 2, 256)
     stamps = torch.empty(0, dtype=torch.int64, device=dev)
     cnt = torch.zeros(4, dtype=torch.int32, device=dev)
     mod = moe_front._module()
@@ -119,5 +121,5 @@ def test_moe_front_rejects_bad_shapes():
         moe_front._module().moe_front(
             w, h, torch.zeros((32, E), device=dev), torch.zeros(4, dtype=torch.int32,
             device=dev), torch.zeros(E, device=dev), *b, None, E, E, True, 1.0, True,
-            1.0, 5, 4, 4, 3, 1, 2, torch.empty(0, dtype=torch.int64, device=dev),
+            1.0, 5, 4, 4, 3, 1, 2, 128, torch.empty(0, dtype=torch.int64, device=dev),
         )  # fmt: skip
