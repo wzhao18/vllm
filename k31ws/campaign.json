@@ -302,6 +302,10 @@
   {
    "t": "11-18",
    "text": "D-KDA: the decode slice may run KDA with no pending deferred commit (no fold, no state write), unlike production; INFRA checking measurement scope."
+  },
+  {
+   "t": "11-18 19:25",
+   "text": "INT 4071a79bdd = + P-GEMM (router top-k fused path, MXFP8 quant passes removed); tests pass. Landed-ready queue: D-ATTN, D-KDA, P-KDA."
   }
  ]
 }
