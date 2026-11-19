@@ -307,7 +307,21 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
     const int sh0 = (8 - head0) & 7;
     const int gs_lo = sh0 ? 1 : 0, gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
-    if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+    // hot body: the row lives in registers. Warp w owns groups [32 kNR w, 32 kNR (w + 1)):
+    // vector j of lane l is group 32 (kNR w + j) + l (coalesced 16-byte loads; position
+    // order = (warp, vector, lane)), all loads in flight before the lengths are read
+    constexpr int kRg = kFast ? kV2NR : 1;
+    uint4 rg[kRg];
+    const int gw0 = (tid >> 5) * 32 * kV2NR + (tid & 31);
+    if constexpr (kFast) {
+      const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
+#pragma unroll
+      for (int j = 0; j < kRg; ++j) {
+        const int g = gw0 + 32 * j;
+        rg[j] = (g >= gs_lo && g < gs_hi) ? __ldg(gb + g) : make_uint4(~0u, ~0u, ~0u, ~0u);
+      }
+    }
+    if (!kFast && (tid & 31) == 0 && (tid >> 5) < kV2Cp) {
       // the previous row's generic SMEM writes before the async-proxy copy
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       const int n = max(0, gs_hi - gs_lo), c = tid >> 5;
@@ -333,8 +347,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       return (uint32_t)(((pos / IL) * W + p.rank) * IL + pos % IL);
     };
     if (K31_RARE(Gl <= K)) {  // the whole context (every rank sees the same global length)
-      mbar_wait(&s_bar, bar_phase);
-      bar_phase ^= 1u;
+      if constexpr (!kFast) {
+        mbar_wait(&s_bar, bar_phase);
+        bar_phase ^= 1u;
+      }
       for (int i = tid; i < L; i += kV2T) orow[i] = slot_of(i);
       for (int i = L + tid; i < K; i += kV2T) orow[i] = -1;
       if (tid == 0) p.out_count[row] = L;
@@ -383,17 +399,45 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     };
     // partial head / tail groups (masked, key by key), loaded while the copy lands
     const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
-    uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
-    if (tid == 0 && phead) pg = load_group(0);
-    if (tid == 32 && ptail) pg = load_group(g_hi);
-    // (sampling from global memory while the copy lands measured slower: r24 20.0 vs 18.5 us)
-    mbar_wait(&s_bar, bar_phase);
-    bar_phase ^= 1u;
-    if (tid == 0 && phead) srow[0] = pg;
-    if (tid == 32 && ptail) srow[g_hi] = pg;
-    __syncthreads();  // histogram zeroed, partial groups in place
+    if constexpr (kFast) {
+      // groups outside the full ones: the partial head / tail key by key, the rest NaN
+      if (regp) {
+#pragma unroll
+        for (int j = 0; j < kRg; ++j) {
+          const int g = gw0 + 32 * j;
+          if (K31_RARE(g < g_lo || g >= g_hi)) rg[j] = load_group(g);
+        }
+      }
+      __syncthreads();  // histogram zeroed
+    } else {
+      uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
+      if (tid == 0 && phead) pg = load_group(0);
+      if (tid == 32 && ptail) pg = load_group(g_hi);
+      // (sampling from global memory while the copy lands measured slower: r24 20.0 vs 18.5 us)
+      mbar_wait(&s_bar, bar_phase);
+      bar_phase ^= 1u;
+      if (tid == 0 && phead) srow[0] = pg;
+      if (tid == 32 && ptail) srow[g_hi] = pg;
+      __syncthreads();  // histogram zeroed, partial groups in place
+    }
     V2DBG(9);
-    if (K31_LIKELY(regp)) {
+    // sampled groups (hot body): want / want_e scale by nsg / ng
+    int nsg = 0;
+    if constexpr (kFast) {
+      const int js = tid % kRg;
+      uint4 sv = rg[0];
+#pragma unroll
+      for (int j = 1; j < kRg; ++j)
+        if (js == j) sv = rg[j];
+      const int gsmp = gw0 + 32 * js;
+      const Keys8 k8(sv);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t k = k8.key(j);
+        v2_hist_add(hist, k >> 4, regp && k != 0u);
+      }
+      nsg = __syncthreads_count(regp && gsmp < ng);
+    } else if (K31_LIKELY(regp)) {
       // sample: one group in kV2SampleStride (spread over the 8 residues)
 #pragma unroll 1
       for (int g0 = 0; g0 < ng; g0 += kV2T * kV2SampleStride) {  // warp-uniform trip count
@@ -423,12 +467,14 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
     }
-    __syncthreads();
+    if constexpr (!kFast) __syncthreads();
     V2DBG(10);
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
       // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
-      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+      const uint32_t want = kFast ? (uint32_t)(((uint64_t)(q + 256u) * (uint32_t)nsg + (uint32_t)ng - 1u) /
+                                               (uint32_t)max(ng, 1))
+                                  : (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -445,7 +491,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // the sample's estimate of the q-th key (its coarse bin): the fine histogram is
       // centered there, so rows with a wide upper tail (q-th key more than kV2Fine keys
       // above theta) need no rebase pass
-      const uint32_t want_e = max(1u, q / kV2SampleStride);
+      const uint32_t want_e =
+          max(1u, kFast ? (uint32_t)((uint64_t)q * (uint32_t)nsg / (uint32_t)max(ng, 1)) : q / kV2SampleStride);
       if (ab < want_e && ab + v >= want_e) {
         uint32_t run = ab;
         for (int i = kV2PB - 1; i >= 0; --i) {
@@ -526,9 +573,86 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       V2DBG(26);
       return nv;
     };
+    // the hot body's candidate pass over the registers: every key >= thv with its position,
+    // in position order (warp, vector, lane): per-vector lane offsets from one packed warp
+    // scan (3 vectors per word, 10-bit fields), warp bases from one CTA scan
+    auto cand_rf = [&](int thv) -> uint32_t {
+      const uint32_t t2 = v2_th_bf16(thv);
+      const bool kx = thv == 0x8000;
+      const int lane = tid & 31;
+      constexpr int kPW = (kRg + 2) / 3;
+      constexpr int kMW = (kRg + 3) / 4;
+      uint32_t mk[kMW];  // 8-bit key masks of the vectors, 4 per word
+      uint32_t pk[kPW];  // per-vector hit counts, 3 per word (10-bit fields)
+#pragma unroll
+      for (int w = 0; w < kMW; ++w) mk[w] = 0u;
+#pragma unroll
+      for (int w = 0; w < kPW; ++w) pk[w] = 0u;
+      uint32_t nv = 0;
+#pragma unroll
+      for (int j = 0; j < kRg; ++j) {
+        const uint4 r = rg[j];
+        nv += v2_is_nan2(v2_max_nan(r)) ? v2_nvalid(r) : 8u;
+        uint32_t m8;
+        if (!kx) {
+          const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
+          const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);
+          m8 = (((lo & 0x08040201u) * 0x01010101u) >> 24) | ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
+        } else {
+          const Keys8 k8(r);
+          m8 = 0;
+#pragma unroll 1
+          for (int b = 0; b < 8; ++b) m8 |= (k8.key(b) >= (uint32_t)thv ? 1u : 0u) << b;
+        }
+        mk[j / 4] |= m8 << (8 * (j % 4));
+        pk[j / 3] += (uint32_t)__popc(m8) << (10 * (j % 3));
+      }
+      V2DBG(24);
+      uint32_t tw[kPW];  // warp totals per vector
+#pragma unroll
+      for (int w = 0; w < kPW; ++w) {
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+          const uint32_t y = __shfl_up_sync(0xffffffffu, pk[w], o);
+          if (lane >= o) pk[w] += y;
+        }
+        tw[w] = __shfl_sync(0xffffffffu, pk[w], 31);
+      }
+      uint32_t run = 0;
+#pragma unroll
+      for (int j = 0; j < kRg; ++j) run += (tw[j / 3] >> (10 * (j % 3))) & 0x3FFu;
+      uint32_t ctot;
+      const int wb = (int)v2_scan<T>(lane == 31 ? run : 0u, V2WS, &ctot);
+      V2DBG(25);
+      if (tid == 0) s_cnt = (int)ctot;
+      run = 0;
+#pragma unroll
+      for (int j = 0; j < kRg; ++j) {
+        uint32_t m = (mk[j / 4] >> (8 * (j % 4))) & 0xFFu;
+        int c = wb + (int)(run + ((pk[j / 3] >> (10 * (j % 3))) & 0x3FFu)) - __popc(m);
+        run += (tw[j / 3] >> (10 * (j % 3))) & 0x3FFu;
+        const int p0 = 8 * (gw0 + 32 * j) - sh;
+        const uint4 r = rg[j];
+        while (m) {
+          const int b = __ffs(m) - 1;
+          m &= m - 1;
+          if (c < kV2Cand) {
+            const uint32_t wd = (b & 4) ? ((b & 2) ? r.w : r.z) : ((b & 2) ? r.y : r.x);
+            cpos[c] = (uint32_t)(p0 + b);
+            ckey[c] = (uint16_t)(keys2((b & 1) ? (wd >> 16) : (wd & 0xFFFFu)) & 0xFFFFu);
+          }
+          ++c;
+        }
+      }
+      V2DBG(26);
+      return nv;
+    };
     {
       uint32_t nv = 0;
-      if (regp) nv += cand_regp(th);
+      if (regp) {
+        if constexpr (kFast) nv += cand_rf(th);
+        else nv += cand_regp(th);
+      }
       const int nfull = regp ? 0 : g_hi - g_lo;
       const int npart = regp ? 0 : ng - max(0, nfull);
       for (int b0 = 0; !kFast && K31_RARE(!regp) && b0 < max(0, nfull) + (npart > 0 ? kV2RegG * kV2T : 0); b0 += kV2RegG * kV2T) {
