@@ -130,6 +130,13 @@ RUBIN_WIDE_EP_DECODE_TOKENS = 128
 # 65.6 us at 32 / 96 / 128 tokens per rank (rel-L2 vs the bf16 reference 0.166 both).
 # EP28 keeps the inference kernel (not measured).
 RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
+
+# P/D prefill workers (NVFP4, inference-kernel buckets) run the refreshed inference kernel
+# with the deduplicated combine (variant inference_dedup, token back from standalone
+# warps): one BF16 row per (owner rank, token) crosses NVLink instead of one per route
+# (EP16 top-16: ~10.3 instead of 16 rows per token). Measured on VR200 (NVFP4, 56
+# experts/GPU, 2 x 8192 tokens/rank, random routing): EP4 2110 -> 1893 us.
+RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
 RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     mma_tiler_mnk=(256, 128, 256),
     cluster_shape_mn=(4, 1),
@@ -280,10 +287,27 @@ def select_rubin_buckets(
     if world_size in RUBIN_GENPHASE_DECODE_EP_SIZES and problem.quant_kind == "nvfp4":
         buckets = [_genphase_decode(b) for b in buckets]
         main = _genphase_decode(main)
+    if prefill_worker and problem.quant_kind == "nvfp4":
+        buckets = [_prefill_dedup(b) for b in buckets]
+        main = _prefill_dedup(main)
     for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
     return (*buckets, main), notes + extra
+
+
+def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
+    """A prefill worker's inference bucket on the refreshed dedup-combine kernel
+    (same tile/schedule knobs, token back from standalone warps)."""
+    if bucket.variant != "inference" or bucket.die_sm_mask32 is not None:
+        return bucket
+    return dataclasses.replace(
+        bucket,
+        variant="inference_dedup",
+        knobs=dataclasses.replace(
+            bucket.knobs, token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE
+        ),
+    )
 
 
 def _genphase_decode(bucket: RubinBucket) -> RubinBucket:

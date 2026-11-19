@@ -15,6 +15,7 @@
 - the S1 token_comm drop is recorded in VENDOR.md.
 """
 
+import dataclasses
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -222,9 +223,10 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
     assert any("decode bucket" in n for n in notes)
     for b in buckets:  # every admission rule holds at both capacities
         C.RubinMoeConfig.make(problem, b, rank=0, world_size=world)
-    # a P/D prefill worker keeps its one bucket
+    # a P/D prefill worker keeps its one bucket (NVFP4: on the dedup-combine kernel)
+    nv = problem.quant_kind == "nvfp4"
     assert X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)[0] == (
-        main,
+        X._prefill_dedup(main) if nv else main,
     )
     # a genphase server keeps its one bucket
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(512))
@@ -969,3 +971,28 @@ def test_knob_world_size_emulates_wide_ep_on_a_slice():
     assert tuple(emulated[0].knobs.schedule_policy)[0] == "decode"
     native, _ = X.select_rubin_buckets(problem, 4, 2048, prefill_worker=False)
     assert native != ep32
+
+
+@pytest.mark.parametrize("world", [4, 16])
+def test_prefill_worker_nvfp4_runs_dedup_combine(world):
+    """NVFP4 P/D prefill workers run the refreshed dedup-combine kernel with the
+    same tile knobs and standalone-warp token back; decode servers keep theirs."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+    main, _ = X.select_rubin_bucket(problem, world, 8192)
+    (bucket,), _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=True)
+    assert bucket.variant == "inference_dedup"
+    assert bucket.knobs.token_back_mode == X.RUBIN_DEDUP_TOKEN_BACK_MODE
+    assert dataclasses.replace(bucket.knobs, token_back_mode="epi_warps") == (
+        dataclasses.replace(main.knobs, token_back_mode="epi_warps")
+    )
+    C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=world)
+    decode, _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=False)
+    assert all(b.variant != "inference_dedup" for b in decode)
+    with pytest.raises(ValueError, match="combine warps"):
+        C.RubinMoeConfig.make(
+            problem,
+            dataclasses.replace(bucket, knobs=main.knobs),
+            rank=0,
+            world_size=world,
+        )
