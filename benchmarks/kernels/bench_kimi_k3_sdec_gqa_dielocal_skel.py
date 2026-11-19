@@ -180,9 +180,11 @@ __global__ void __launch_bounds__(256) skel(Args a) {
     long long i = 0;
     while (true) {
       int sl = (int)(i % a.S);
-      wait_par(sa(&myfull[sl]), (unsigned)((i / a.S) & 1));
+      // one lane waits (the MMA issuer of the real kernel); the warp parks at syncwarp
+      if (lane == 0) wait_par(sa(&myfull[sl]), (unsigned)((i / a.S) & 1));
+      if (!a.lean) __syncwarp();
       int m = mymeta[sl];
-      acc += myring[(size_t)sl * a.SB + 4 * lane];
+      if (lane == 0) acc += myring[(size_t)sl * a.SB];
       if (!a.lean) __syncwarp();
       if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&myempty[sl])) : "memory");
       ++i;
@@ -317,8 +319,8 @@ def main():
     ap.add_argument("--lean", action="store_true")
     ap.add_argument("--sm-cap", type=int, default=1024)
     ap.add_argument("--arms", default="")
-    ap.add_argument("--units", default="128,256,512")
-    ap.add_argument("--forms", default="t2x32x3,t4x16x3,t4x24x2,b4x16x3")
+    ap.add_argument("--units", default="256,512")
+    ap.add_argument("--forms", default="b2x32x3,t2x32x3,t4x16x3,b1x64x3")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
@@ -464,8 +466,8 @@ def main():
                     stamps.zero_()
                     print(f"N{n_req} R{n_req * 4} {arm} U{unit_k}K {form}: "
                           f"{t:.2f} us/layer {tbs:.1f} TB/s imb {imbalance:.3f} "
-                          f"{'ok' if ok else 'FAIL'} | last layer: span "
-                          f"{(int(sv[:, 2].max()) - t0) / 1e3:.2f} start-spread "
+                          f"{'ok' if ok else 'FAIL'} | kernel span/layer "
+                          f"{sum(x for x in spans if x > 0) / max(1, sum(1 for x in spans if x > 0)):.2f} start-spread "
                           f"{(int(sv[:, 0].max()) - t0) / 1e3:.2f} issuer p50 "
                           f"{float(dur[len(dur) // 2]):.2f} max {float(dur[-1]):.2f} us",
                           flush=True)
