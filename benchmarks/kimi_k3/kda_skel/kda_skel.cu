@@ -37,7 +37,14 @@ constexpr int STATE_HALF = 32768;                      // FP32 state 64 KiB as t
 #endif
 constexpr int NCT = NCW * 32;                  // consumer threads per chain slot
 constexpr int NWARP_SLOT = 1 + NCW;
-constexpr int TPT = NCT / C, CPT = D / TPT;    // o_norm: threads per token, channels per thread
+#ifndef EARLYREL
+#define EARLYREL 0
+#endif
+#ifndef NGRP
+#define NGRP 1
+#endif
+constexpr int GT = NCT / NGRP;                 // consumer threads per item group (groups ping-pong items)
+constexpr int TPT = GT / C, CPT = D / TPT;    // o_norm: threads per token, channels per thread
 
 struct Maps { CUtensorMap qkv, g, og, beta, out, qkv_h, g_h, og_h, beta_h, out_h, qd, kd, vd, gd, ogd, outd; };
 
@@ -98,7 +105,7 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
   }
   const int S = a.S_total / nslots_used;
   unsigned char* ring = sm + (size_t)slot * S * STAGE;
-  unsigned char* ob = sm + (size_t)a.S_total * STAGE + (size_t)slot * 2 * OUT_TILE;
+  unsigned char* ob = sm + (size_t)a.S_total * STAGE + (size_t)slot * NGRP * 2 * OUT_TILE;
   if (threadIdx.x == 0) {
     for (int s = 0; s < 2; ++s)
       for (int i = 0; i < 16; ++i) {
@@ -167,24 +174,26 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
       __syncwarp();
     }
   } else {
-    const int ctid = threadIdx.x - slot * NWARP_SLOT * 32 - 32;   // 0..NCT-1
-    const int bar_id = 1 + slot;
+    const int ctid_all = threadIdx.x - slot * NWARP_SLOT * 32 - 32;   // 0..NCT-1
+    const int grp = ctid_all / GT, ctid = ctid_all % GT;
+    const int bar_id = 1 + slot * NGRP + grp;
     unsigned acc = 0;
     float wv[CPT]; int whead = -1;
     long long i = 0, nout = 0;
     for (long long j = it0; j < it_end; j += it_step, ++i) {
+      if ((int)(i % NGRP) != grp) continue;
       int ch, k; decode(j, ch, k);
       int sl = (int)(i % S);
       unsigned char* st = ring + (size_t)sl * STAGE;
       mb_wait(sa(&full[slot][sl]), (unsigned)((i / S) & 1));
       if (k < 0) {
-        acc += st[ctid * (STATE_HALF / NCT)];
-        named_bar(bar_id, NCT);
+        acc += st[ctid * (STATE_HALF / GT)];
+        named_bar(bar_id, GT);
         if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
         continue;
       }
       int seq = ch / H, head = ch % H, tok = seq * a.seqlen + k * C;
-      acc += *(const unsigned*)(st + ctid * ((5 * TILE / NCT) & ~3));
+      acc += *(const unsigned*)(st + ctid * ((5 * TILE / GT) & ~3));
       if (a.fma | a.mufu) {   // SIMT pipe load of the fused math (conv+SiLU, gate, o_norm): FFMA2 + MUFU ex2
         unsigned long long x[8];
         float f0 = __uint_as_float((acc & 0x007fffffu) | 0x3f000000u);
@@ -208,9 +217,9 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         for (int j = 0; j < 4; ++j) sx ^= __float_as_uint(y[j]);
         acc += sx;
       }
-      unsigned char* o = ob + (nout & 1) * OUT_TILE;
+      unsigned char* o = ob + (size_t)(grp * 2 + (nout & 1)) * OUT_TILE;
       if (ctid == 0) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
-      named_bar(bar_id, NCT);
+      named_bar(bar_id, GT);
       unsigned char scale_b = (unsigned char)acc;
       bool released = false;
       if (a.onorm) {   // gated RMSNorm + MXFP8 of a 32x128 BF16 O tile (pricing: O = the q tile, gate = the og tile)
@@ -235,8 +244,8 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         uint4 gw[CPT / 8];
 #pragma unroll
         for (int q4 = 0; q4 < CPT / 8; ++q4) gw[q4] = grow[q4];
-        if (!(a.mode == 0 && k == a.nchunk - 1)) {   // stage fully read into registers: release it before the math
-          named_bar(bar_id, NCT);
+        if (EARLYREL && !(a.mode == 0 && k == a.nchunk - 1)) {   // stage fully read into registers: release it before the math
+          named_bar(bar_id, GT);
           if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
           released = true;
         }
@@ -278,10 +287,10 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         if ((part * CPT) % 32 == 0 && tok + tk < (seq + 1) * a.seqlen)
           a.scales[(size_t)(tok + tk) * (H * 4) + head * 4 + part * CPT / 32] = scale_b;
       } else {
-        for (int q = ctid; q < OUT_TILE / 16; q += NCT) ((uint4*)o)[q] = make_uint4(acc, q, k, ch);
+        for (int q = ctid; q < OUT_TILE / 16; q += GT) ((uint4*)o)[q] = make_uint4(acc, q, k, ch);
       }
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      named_bar(bar_id, NCT);
+      named_bar(bar_id, GT);
       const bool late_rel = a.mode == 0 && k == a.nchunk - 1;   // state-out reads the stage
       if (!late_rel && !released && ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
       if (ctid == 0 && !a.noout) {
@@ -424,7 +433,7 @@ int main(int argc, char** argv) {
   for (auto& v : vs) {
     Args a{nseq, seqlen, nchunk, nchain, v.mode, v.S_total, v.iss6, v.fma, v.mufu, v.onorm, v.hm, v.noout, (int)T,
            v.dl, (int)Tpad, nd[0], nd[1], dsm_die, dsm_rank, wgt, state, scales, sink};
-    size_t smem = (size_t)v.S_total * STAGE + 2 * NSLOT * OUT_TILE;
+    size_t smem = (size_t)v.S_total * STAGE + 2 * NSLOT * NGRP * OUT_TILE;
     std::vector<float> ts;
     for (int it = 0; it < iters + 3; ++it) {
       CR(cudaMemsetAsync(flush, it, FL));   // evict L2 between iterations
