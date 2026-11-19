@@ -175,19 +175,22 @@ void launch_fwd(
 #if BLOCK_LEVEL_K2 >= 0
   if (mode & 2) {
     // Kimi-K3: bit 5 runs the recurrence on the tcgen05 tensor cores
-    // (k2_tc.cuh; fp32 state, varlen, no checkpoint). Bit 6 is a development
-    // switch of the kr descriptor offsets.
+    // (k2_tc.cuh; fp32 state, varlen, no checkpoint). Bit 8 dumps dev clock
+    // stamps over CTA (0, 0)'s final state; bit 7 runs U = INV @ u on the
+    // CUDA cores.
     if (mode & 32) {
       if constexpr (StateFP32 && !HasCheckpoint && IsVarlen &&
                     std::is_same_v<SeqlenT, int32_t>) {
-        auto kernel = k2tc::k2_tc_kernel<HasStateIn, HasStateOut>;
+        auto kernel = (mode & 128)
+                          ? k2tc::k2_tc_kernel<HasStateIn, HasStateOut, true>
+                          : k2tc::k2_tc_kernel<HasStateIn, HasStateOut, false>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              k2tc::kSmemBytes);
         kernel<<<dim3(H, N), dim3(k2tc::kThreads), k2tc::kSmemBytes, stream>>>(
             v_ptr, beta_ptr, static_cast<float const*>(initial_state_ptr),
             static_cast<float*>(final_state_ptr), out_ptr, T_total, H, N,
             cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
-            ws_mqk, int((mode >> 6) & 1));
+            ws_mqk, int((mode >> 8) & 1));
         return;
       } else {
         throw std::runtime_error(

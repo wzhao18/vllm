@@ -69,6 +69,7 @@ def main():
     ap.add_argument("--modes", default="35,99")
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--iters", type=int, default=10)
+    ap.add_argument("--stamps", default="")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 
@@ -85,6 +86,18 @@ def main():
             ok1 = stats(f"mode {m} out  ", ref_o, o)
             ok2 = stats(f"mode {m} state", ref_s, s)
             print(f"    mode {m}: {'OK' if ok1 and ok2 else 'MISMATCH'}")
+    for m in [int(x) for x in args.stamps.split(",") if x]:
+        x = inputs([5461, 5461, 5462], 96)
+        run(x, m)
+        _, fin = run(x, m | 256)
+        st = fin[2, 0].reshape(-1)[:512].view(torch.int64).reshape(32, 8).cpu()
+        d = st - st[:, :1]
+        per = (st[1:, 0] - st[:-1, 0]).float().mean().item()
+        print(f"mode {m} stamps (clk rel. to full-wait; math: d1 U_rdy d3 s_rdy end; "
+              f"mma: s_rdy d1_commit), chunk period {per:.0f} clk")
+        for r in range(0, 32, 8):
+            print("   ", d[r].tolist())
+        print("    mean", d[:, 1:].float().mean(0).round().tolist())
     if not args.time:
         return
     from torch.profiler import ProfilerActivity, profile
