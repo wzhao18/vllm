@@ -1820,9 +1820,12 @@ class GqaDraftFastPath(DraftFastPath):
         if not batches:
             return None, []
         try:
+            from vllm.distributed import get_tp_group
+
             markov = VocabParallelMarkov(
-                head.markov_w1.weight, head.markov_w2.weight, tp, rank, steps
-            )
+                head.markov_w1.weight, head.markov_w2.weight, tp, rank, steps,
+                group=get_tp_group().device_group, cap=max(batches),
+            )  # fmt: skip
         except ValueError as error:
             fail("DSpark drafter Markov sampling", str(error))
             return None, []
@@ -1935,8 +1938,14 @@ def _vp_markov_keys(
     steps,
     lo,
     vocab_rank,
+    count_ptr,
+    peers_ptr,
+    box_offset,
+    programs,
     SAMPLED: tl.constexpr,
     BLOCK: tl.constexpr,
+    TP: tl.constexpr,
+    PUBLISH: tl.constexpr,
 ):
     req = tl.program_id(0)
     block = tl.program_id(1)
@@ -1976,6 +1985,28 @@ def _vp_markov_keys(
     token = (lo + block * BLOCK + index).to(tl.int64)
     key = (_vp_ordered(value).to(tl.int64) << 31) | (0x7FFFFFFF - token)
     tl.atomic_max(keys_ptr + req, key)
+    if PUBLISH:
+        # The request's last program on this rank publishes the rank's key (never 0)
+        # into slot ``box_offset + req`` of every rank's mailbox and re-arms.
+        done = tl.atomic_add(count_ptr + req, 1, sem="acq_rel", scope="gpu")
+        if done == programs - 1:
+            final = tl.atomic_xchg(keys_ptr + req, 0, sem="acq_rel", scope="gpu")
+            tl.atomic_xchg(count_ptr + req, 0, sem="relaxed", scope="gpu")
+            for r in tl.static_range(TP):
+                peer = tl.load(peers_ptr + r) + (box_offset + req) * 8
+                tl.atomic_xchg(
+                    peer.to(tl.pointer_type(tl.int64)), final, sem="release", scope="sys"
+                )
+
+
+@triton.jit
+def _vp_take(slot):
+    """A mailbox slot's key once a rank published it (never 0); re-arms the slot."""
+    got = tl.atomic_add(slot, 0, sem="acquire", scope="sys")
+    while got == 0:
+        got = tl.atomic_add(slot, 0, sem="acquire", scope="sys")
+    tl.atomic_xchg(slot, 0, sem="relaxed", scope="gpu")
+    return got
 
 
 @triton.jit
@@ -1990,14 +2021,22 @@ def _vp_markov_select(
     step,
     TP: tl.constexpr,
     RANK: tl.constexpr,
+    POLL: tl.constexpr,
 ):
     req = tl.program_id(0)
-    best = tl.load(gathered_ptr + req)
-    for r in tl.static_range(1, TP):
-        best = tl.maximum(best, tl.load(gathered_ptr + r * num_reqs + req))
+    if POLL:
+        # This parity's mailbox [TP, num_reqs] (``gathered_ptr``): wait for every
+        # rank's published key, then re-arm the slots (the keys re-armed already).
+        best = _vp_take(gathered_ptr + req)
+        for r in tl.static_range(1, TP):
+            best = tl.maximum(best, _vp_take(gathered_ptr + r * num_reqs + req))
+    else:
+        best = tl.load(gathered_ptr + req)
+        for r in tl.static_range(1, TP):
+            best = tl.maximum(best, tl.load(gathered_ptr + r * num_reqs + req))
+        tl.store(keys_ptr + req, 0)
     token = 0x7FFFFFFF - (best & 0x7FFFFFFF)
     tl.store(draft_ptr + req * draft_stride + step, token)
-    tl.store(keys_ptr + req, 0)
     cols = tl.arange(0, RANK)
     row = tl.load(w1_ptr + token * RANK + cols)
     tl.store(emb_ptr + req * RANK + cols, row)
@@ -2010,7 +2049,7 @@ class VocabParallelMarkov:
     ``vocab_rank``, ``markov_rank``). ``gather``: the TP group's all-gather along
     dim 0 (in-graph)."""
 
-    def __init__(self, w1, w2, tp, rank, steps, gather=None):
+    def __init__(self, w1, w2, tp, rank, steps, gather=None, group=None, cap=0):
         vocab, markov_rank = w2.shape
         if tuple(w1.shape) != tuple(w2.shape) or vocab % (tp * VP_MARKOV_BLOCK):
             raise ValueError(f"unsupported Markov head shapes {tuple(w2.shape)}")
@@ -2031,6 +2070,30 @@ class VocabParallelMarkov:
         self.gather = gather
         self.batches: set[tuple[int, bool]] = set()
         self.buffers: dict[int, tuple] = {}
+        # ``group`` (a process group, with ``cap`` = the largest batch): the keys'
+        # all-gather becomes peer stores into a mailbox [parity, TP, cap] polled by
+        # the select (one parity per draft position; no collective launch).
+        self.cap, self.box, self.peers = cap, None, None
+        self.count = None
+        if group is not None and tp > 1:
+            from ..symm import peer_rendezvous
+            import torch.distributed._symmetric_memory as symm_mem
+
+            if cap <= 0:
+                raise ValueError("Markov drafting: a mailbox needs the largest batch")
+            box = symm_mem.empty((2, tp, cap), dtype=torch.int64, device=self.device)
+            box.zero_()
+            handle = peer_rendezvous(box, group)
+            size = box[0].numel() * 8
+            self.box = box
+            self.peers = torch.tensor(
+                [[int(b) + p * size for b in handle.buffer_ptrs] for p in range(2)],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.count = torch.zeros(cap, dtype=torch.int32, device=self.device)
+            torch.accelerator.synchronize(self.device)
+            torch.distributed.barrier(group=group)
 
     def covers(self, batch, sampled=False):
         return batch > 0
@@ -2109,6 +2172,9 @@ class VocabParallelMarkov:
             strides = (0, 0)
         grid = (batch, triton.cdiv(self.vocab_rank, VP_MARKOV_BLOCK))
         lo = self.rank * self.vocab_rank
+        poll = self.box is not None
+        if poll and batch > self.cap:
+            raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
         for step in range(self.steps):
             bias = torch.nn.functional.linear(emb, self.w2)
             _vp_markov_keys[grid](
@@ -2127,19 +2193,25 @@ class VocabParallelMarkov:
                 self.steps,
                 lo,
                 self.vocab_rank,
+                self.count if poll else keys,
+                self.peers[step % 2] if poll else keys,
+                self.rank * self.cap,
+                grid[1],
                 SAMPLED=sampled,
                 BLOCK=VP_MARKOV_BLOCK,
+                TP=self.tp,
+                PUBLISH=poll,
             )
-            gathered = self.gather(keys)
             _vp_markov_select[(batch,)](
-                gathered,
+                self.box[step % 2] if poll else self.gather(keys),
                 keys,
                 draft,
                 draft.stride(0),
                 emb,
                 self.w1,
-                batch,
+                self.cap if poll else batch,
                 step,
                 TP=self.tp,
                 RANK=self.markov_rank,
+                POLL=poll,
             )
