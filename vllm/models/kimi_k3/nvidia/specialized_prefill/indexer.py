@@ -1173,13 +1173,13 @@ class PrefillMark:
         self.words = words  # bitmap words per row (stride)
 
     @cute.jit
-    def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, s):
-        self.kernel(logits, row_base, row_len, row_bin, bitmap, cand).launch(
+    def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, gate, s):
+        self.kernel(logits, row_base, row_len, row_bin, bitmap, cand, gate).launch(
             grid=(self.ctas, 1, 1), block=(MARK_THREADS, 1, 1), stream=s, use_pdl=True,
         )
 
     @cute.kernel
-    def kernel(self, logits, row_base, row_len, row_bin, bitmap, cand):
+    def kernel(self, logits, row_base, row_len, row_bin, bitmap, cand, gate):
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -1191,7 +1191,9 @@ class PrefillMark:
             st_shared_u32(cnt_a, Uint32(0))
         cute.arch.sync_threads()
         cute.arch.griddepcontrol_wait()
-        n_rows = row_len.shape[0]
+        n_rows = Int32(row_len.shape[0])
+        if gate[0] == 0:
+            n_rows = Int32(0)  # nothing to select (recovery with no flagged row)
         cpr = (self.words * 32 + CHUNK_V * 8 - 1) // (CHUNK_V * 8)
         logits_a = logits.iterator.toint()
         bm_a = bitmap.iterator.toint()
@@ -1283,13 +1285,13 @@ class PrefillFinish:
         self.words = words
 
     @cute.jit
-    def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, out, s):
-        self.kernel(logits, row_base, row_len, row_bin, bitmap, cand, out).launch(
+    def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, out, gate, s):
+        self.kernel(logits, row_base, row_len, row_bin, bitmap, cand, out, gate).launch(
             grid=(self.ctas, 1, 1), block=(FIN_THREADS, 1, 1), stream=s, use_pdl=True,
         )
 
     @cute.kernel
-    def kernel(self, logits, row_base, row_len, row_bin, bitmap, cand, out):
+    def kernel(self, logits, row_base, row_len, row_bin, bitmap, cand, out, gate):
         K = self.topk
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -1304,7 +1306,9 @@ class PrefillFinish:
         tcnt_a = tbuf.iterator.toint() + w * (TIE_BUF + 4) * 4
         tie_buf_a = tcnt_a + 16
         cute.arch.griddepcontrol_wait()
-        n_rows = row_len.shape[0]
+        n_rows = Int32(row_len.shape[0])
+        if gate[0] == 0:
+            n_rows = Int32(0)  # nothing to select (recovery with no flagged row)
         out_a = out.iterator.toint()
         bm_a = bitmap.iterator.toint()
         cand_a = cand.iterator.toint()
@@ -1496,6 +1500,9 @@ class PrefillFinish:
 CS_THREADS = 256
 CS_BATCH = 8  # candidate loads in flight per thread (CandSelect staging)
 CS_TIES = 1024  # threshold ties ranked per row (more: the row takes the full path)
+CS_BIN_BITS = 10
+RP_THREADS = 1024  # RecPlan threads (one CTA)
+CS_BINS = 1 << CS_BIN_BITS  # CandSelect histogram bins
 
 
 @asm()
@@ -1509,22 +1516,23 @@ def atom_max_shared(address, value):
 
 
 @cute.jit
-def _top_bin(hist_a, need, lane, info_a):
-    """Warp 0: the highest bin b of a 256-bin histogram with count(bins >= b) >=
+def _top_bin(hist_a, need, lane, info_a, nb: cutlass.Constexpr = 256):
+    """Warp 0: the highest bin b of an nb-bin histogram with count(bins >= b) >=
     need; info = (b, count above b, count of b)."""
+    per = nb // 32
     s = Uint32(0)
-    for j in cutlass.range_constexpr(8):
-        s += ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4)
+    for j in cutlass.range_constexpr(per):
+        s += ld_shared_u32(hist_a + (nb - 1 - per * lane - j) * 4)
     incl = warp_inclusive(s, lane)
     hit = ballot(incl >= need)
     first = Int32(popc((hit & (Uint32(0) - hit)) - Uint32(1)))
     if lane == first:
         run = incl - s
         found = Int32(0)
-        for j in cutlass.range_constexpr(8):
-            c = ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4)
+        for j in cutlass.range_constexpr(per):
+            c = ld_shared_u32(hist_a + (nb - 1 - per * lane - j) * 4)
             if found == 0 and run + c >= need:
-                st_shared_u32(info_a, Uint32(255 - 8 * lane - j))
+                st_shared_u32(info_a, Uint32(nb - 1 - per * lane - j))
                 st_shared_u32(info_a + 4, run)
                 st_shared_u32(info_a + 8, c)
                 found = Int32(1)
@@ -1553,10 +1561,11 @@ class CandSelect:
 
     @cute.jit
     def entry(self, cbuf_a, j, s):
-        """(key index, order16 key) of lane j's candidate s (staged in shared memory)."""
+        """(key index, order16 key) of lane j's candidate s, staged in shared memory
+        as order16 key << 16 | tile."""
         wd = ld_shared_u32(cbuf_a + (s * TILE + j) * 4)
-        pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
-        return pos, order16(wd & Uint32(0xFFFF))
+        pos = Int32(wd & Uint32(0xFFFF)) * TILE + 4 * (j % 32) + j // 32
+        return pos, wd >> Uint32(16)
 
     @cute.jit
     def emit(self, flag, pos, slot_a, out, orow, lane):
@@ -1578,10 +1587,10 @@ class CandSelect:
         w = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         smem = utils.SmemAllocator()
-        hist = smem.allocate_tensor(Uint32, cute.make_layout(256 + 8 + TILE), 16)
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(CS_BINS + 8 + TILE), 16)
         hist_a = hist.iterator.toint()
-        # b, above, count of b, out slot, tie slot, total, overflow, key min / max
-        info_a = hist_a + 256 * 4
+        # b, above, count of b, out slot, tie slot, total, overflow
+        info_a = hist_a + CS_BINS * 4
         cnt_a = info_a + 8 * 4
         ties = smem.allocate_tensor(Int32, cute.make_layout(CS_TIES), 16)
         ties_a = ties.iterator.toint()
@@ -1594,8 +1603,8 @@ class CandSelect:
         kk = cutlass.min(n, Int32(K))
         base = Int64(row) * REGION
         orow = Int64(row) * K
-        for i in cutlass.range_constexpr((256 + 8) // CS_THREADS + 1):
-            if i * CS_THREADS + tid < 256 + 8:
+        for i in cutlass.range_constexpr((CS_BINS + 8) // CS_THREADS + 1):
+            if i * CS_THREADS + tid < CS_BINS + 8:
                 st_shared_u32(hist_a + (i * CS_THREADS + tid) * 4, Uint32(0))
         if tid == 0:
             st_shared_u32(lim_a, Uint32(0xFFFF))  # key min
@@ -1636,8 +1645,11 @@ class CandSelect:
                     ws.append(v)
                 for k in cutlass.range_constexpr(CS_BATCH):
                     if s0 + 2 * k < cj:
-                        st_shared_u32(cbuf_a + ((s0 + 2 * k) * TILE + j) * 4, ws[k])
                         key = order16(ws[k] & Uint32(0xFFFF))
+                        st_shared_u32(
+                            cbuf_a + ((s0 + 2 * k) * TILE + j) * 4,
+                            (key << Uint32(16)) | (ws[k] >> Uint32(16)),
+                        )
                         kmin = cutlass.min(kmin, key)
                         kmax = cutlass.max(kmax, key)
             for i in cutlass.range_constexpr(5):
@@ -1660,19 +1672,20 @@ class CandSelect:
                     out[orow + i] = Int32(-1)
             else:
                 # value-relative radix: bins of 2^shift keys above the row's lowest
-                # candidate (the candidates span a few hundred BF16 values: spread
-                # over the 256 bins, no hot-bin atomics), then the low bits
+                # candidate (the candidates span a few hundred BF16 values: one
+                # exact pass over CS_BINS bins, no hot-bin atomics), then the low
+                # bits when the span is wider
                 k0 = ld_shared_u32(lim_a)
                 span = ld_shared_u32(lim_a + 4) - k0
                 shift = Uint32(0)
-                if span > Uint32(255):
-                    shift = Uint32(24) - clz(span)
+                if span >= Uint32(CS_BINS):
+                    shift = Uint32(32 - CS_BIN_BITS) - clz(span)
                 for s in cutlass.range(half, cj, 2, unroll=2):
                     pos, key = self.entry(cbuf_a, j, s)
                     red_shared(hist_a + (((key - k0) >> shift) << Uint32(2)), 1)
                 cute.arch.sync_threads()
                 if w == 0:
-                    _top_bin(hist_a, Uint32(K), lane, info_a)
+                    _top_bin(hist_a, Uint32(K), lane, info_a, CS_BINS)
                 cute.arch.sync_threads()
                 b1 = ld_shared_u32(info_a)
                 above = ld_shared_u32(info_a + 4)
@@ -1680,7 +1693,8 @@ class CandSelect:
                 t = k0 + (b1 << shift)
                 if shift != Uint32(0):
                     cute.arch.sync_threads()
-                    st_shared_u32(hist_a + tid * 4, Uint32(0))
+                    for i in cutlass.range_constexpr(CS_BINS // CS_THREADS):
+                        st_shared_u32(hist_a + (i * CS_THREADS + tid) * 4, Uint32(0))
                     cute.arch.sync_threads()
                     for s in cutlass.range(half, cj, 2, unroll=2):
                         pos, key = self.entry(cbuf_a, j, s)
@@ -1690,7 +1704,7 @@ class CandSelect:
                             )
                     cute.arch.sync_threads()
                     if w == 0:
-                        _top_bin(hist_a, Uint32(K) - above, lane, info_a)
+                        _top_bin(hist_a, Uint32(K) - above, lane, info_a, CS_BINS)
                     cute.arch.sync_threads()
                     t = t + ld_shared_u32(info_a)
                     above = above + ld_shared_u32(info_a + 4)
@@ -1836,6 +1850,84 @@ def _thr_select_kernel():
     return cute.compile(ThrSelect(), *args, options="--enable-tvm-ffi")
 
 
+class RecPlan:
+    """Recovery plan of the selective path (one CTA): the items holding a row that
+    CandSelect flagged (row_bin[3 r + 1]), compacted in order, their count, and
+    the full-path select's row lengths (-1: the row is settled)."""
+
+    @cute.jit
+    def __call__(self, row_bin, items, row_len, items_rec, n_active, rec_len, s):
+        self.kernel(row_bin, items, row_len, items_rec, n_active, rec_len).launch(
+            grid=(1, 1, 1), block=(RP_THREADS, 1, 1), stream=s,
+        )
+
+    @cute.kernel
+    def kernel(self, row_bin, items, row_len, items_rec, n_active, rec_len):
+        tid, _, _ = cute.arch.thread_idx()
+        w = tid // 32
+        lane = tid % 32
+        smem = utils.SmemAllocator()
+        buf = smem.allocate_tensor(Uint32, cute.make_layout(RP_THREADS // 32 + 1), 16)
+        sum_a = buf.iterator.toint()
+        tot_a = sum_a + (RP_THREADS // 32) * 4
+        t = row_len.shape[0]
+        n = items.shape[0]
+        for i in cutlass.range(tid, t, RP_THREADS, unroll=1):
+            v = Int32(-1)
+            if row_bin[3 * i + 1] != 0:
+                v = row_len[i]
+            rec_len[i] = v
+        base = Uint32(0)
+        for c0 in cutlass.range(0, n, RP_THREADS, unroll=1):
+            item = c0 + tid
+            act = Uint32(0)
+            if item < n:
+                tok0 = items[item, 0]
+                ntok = items[item, 1]
+                for k in cutlass.range_constexpr(BQ):
+                    if k < ntok:
+                        if row_bin[3 * (tok0 + k) + 1] != 0:
+                            act = Uint32(1)
+            b = ballot(act)
+            if lane == 0:
+                st_shared_u32(sum_a + w * 4, popc(b))
+            cute.arch.sync_threads()
+            if w == 0:
+                v = ld_shared_u32(sum_a + lane * 4)
+                inc = warp_inclusive(v, lane)
+                st_shared_u32(sum_a + lane * 4, inc - v)
+                if lane == 31:
+                    st_shared_u32(tot_a, inc)
+            cute.arch.sync_threads()
+            if act != Uint32(0):
+                dst = Int32(base + ld_shared_u32(sum_a + w * 4) + popc(b & lanemask_lt()))
+                for k in cutlass.range_constexpr(4):
+                    items_rec[dst, k] = items[item, k]
+            base = base + ld_shared_u32(tot_a)
+            cute.arch.sync_threads()
+        if tid == 0:
+            n_active[0] = Int32(base)
+
+
+@functools.cache
+def _rec_plan_kernel():
+    from cutlass.cute.runtime import make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
+
+    t, n = cute.sym_int(), cute.sym_int()
+    args = (
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((n, 4), dtype=cutlass.Int32),
+        fake((t,), dtype=cutlass.Int32),
+        fake((n, 4), dtype=cutlass.Int32),
+        fake((1,), dtype=cutlass.Int32),
+        fake((t,), dtype=cutlass.Int32),
+        make_fake_stream(),
+    )
+    return cute.compile(RecPlan(), *args, options="--enable-tvm-ffi")
+
+
 class SelectivePlan:
     """Per-step layout of the selective path (sampled thresholds -> PUBLISH ->
     CandSelect) for requests r with ``row_counts[r]`` rows whose last row sees
@@ -1848,10 +1940,7 @@ class SelectivePlan:
         )
         t = sum(row_counts)
         self.t = t
-        # recovery (full path for flagged rows): each item's rows, the bitmap stride
-        self.item_rows = self.items[:, :1] + torch.arange(BQ, device=device)
-        self.item_valid = torch.arange(BQ, device=device) < self.items[:, 1:2]
-        self.item_rows.clamp_(max=max(t - 1, 0))
+        # recovery (full path for flagged rows): the bitmap stride
         self.n_items = torch.full((1,), self.items.shape[0], dtype=torch.int32,
                                   device=device)
         self.words = max(
@@ -1948,22 +2037,27 @@ def recover(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
     row are scored; unflagged rows keep the candidate result."""
     dev = q.device
     t = sp.t
-    flag = sp.row_bin[1 : 3 * t : 3] != 0
-    if recover_all:
-        flag = torch.ones_like(flag)
-    active = (flag[sp.item_rows] & sp.item_valid).any(dim=1)
-    # the items holding a flagged row first (stable: longest first), counted on device
-    items = sp.items[torch.argsort((~active).to(torch.int8), stable=True)]
-    n_active = active.sum(dtype=torch.int32).view(1)
+    if recover_all:  # tests: every row
+        items, n_active = sp.items, sp.n_items
+        rec_len = sp.row_len
+    else:
+        # the items holding a flagged row (compacted, in order), their count and
+        # the select's row lengths (-1: settled) in one small kernel
+        items = torch.empty_like(sp.items)
+        n_active = torch.empty(1, dtype=torch.int32, device=dev)
+        rec_len = torch.empty_like(sp.row_len)
+        _rec_plan_kernel()(
+            sp.row_bin, sp.items, sp.row_len, items, n_active, rec_len,
+            torch.cuda.current_stream(dev).cuda_stream,
+        )
     logits = torch.empty(sp.scratch, dtype=torch.bfloat16, device=dev)
     rec_bin = torch.empty(3 * (t + 1), dtype=torch.int32, device=dev)
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, items, sp.row_base,
           logits, rec_bin, ctas=ctas, n_items=n_active)
-    # unflagged rows: length -1, skipped by the select (their candidate result stays)
-    rec_len = torch.where(flag, sp.row_len, -1)
     bitmap = torch.empty(t * sp.words, dtype=torch.int32, device=dev)
     rec_cand = torch.empty(t * CAND, dtype=torch.int32, device=dev)
-    select(logits, sp.row_base, rec_len, rec_bin, bitmap, rec_cand, out, ctas=ctas)
+    select(logits, sp.row_base, rec_len, rec_bin, bitmap, rec_cand, out, ctas=ctas,
+           gate=n_active)
 
 
 def plan(row_counts, row_lens_last, key_bases, device):
@@ -2041,13 +2135,16 @@ def _select_kernels(ctas, topk, words):
         fake((cute.sym_int(),), dtype=cutlass.Int32),
         fake((cute.sym_int(),), dtype=cutlass.Int32),
     )
+    gate = fake((1,), dtype=cutlass.Int32)
     mark = cute.compile(
-        PrefillMark(ctas, topk, words), *common, make_fake_stream(), options="--enable-tvm-ffi"
+        PrefillMark(ctas, topk, words), *common, gate, make_fake_stream(),
+        options="--enable-tvm-ffi",
     )
     fin = cute.compile(
         PrefillFinish(ctas * 8, topk, words),
         *common,
         fake((t, topk), dtype=cutlass.Int32),
+        gate,
         make_fake_stream(),
         options="--enable-tvm-ffi",
     )
@@ -2082,14 +2179,18 @@ def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
     )
 
 
-def select(logits, row_base, row_len, row_bin, bitmap, cand, out, ctas=None):
-    """Exact top-k key indices of every row (position order, -1 padded) into ``out``.
-    ``bitmap``: Int32 [T * words] (words = bitmap words per row, the longest row's
-    positions / 32), ``cand``: Int32 [T * CAND]; ``row_bin`` Int32 [3 T] from score."""
+def select(logits, row_base, row_len, row_bin, bitmap, cand, out, ctas=None, gate=None):
+    """Exact top-k key indices of every row (ties to the lowest key index, -1 padded)
+    into ``out``; rows with a negative length are skipped. ``bitmap``: Int32
+    [T * words] (words = bitmap words per row, the longest row's positions / 32),
+    ``cand``: Int32 [T * CAND]; ``row_bin`` Int32 [3 T] from score. ``gate``
+    (Int32 [1], device): 0 skips every row."""
     ctas = ctas or torch.cuda.get_device_properties(out.device).multi_processor_count
     words = bitmap.numel() // row_len.shape[0]
     mark, fin = _select_kernels(ctas * 4, out.shape[1], words)
     stream = torch.cuda.current_stream(out.device).cuda_stream
+    if gate is None:
+        gate = torch.ones(1, dtype=torch.int32, device=out.device)
     args = (logits.view(torch.int16), row_base, row_len, row_bin, bitmap, cand)
-    mark(*args, stream)
-    fin(*args, out, stream)
+    mark(*args, gate, stream)
+    fin(*args, out, gate, stream)
