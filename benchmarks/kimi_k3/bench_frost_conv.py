@@ -43,7 +43,8 @@ def main():
     qkv = x_full[:, : 3 * HD]
     conv_w = (torch.randn(3 * HD, 4, dtype=torch.float32, device=dev) * 0.5).contiguous()
     lines = N + 5
-    state0 = torch.randn(lines, 3 * HD, 3, dtype=bf, device=dev).float()
+    # the model's conv state: a (lines, 3, dim) cache viewed as (lines, dim, 3)
+    state0 = torch.randn(lines, 3, 3 * HD, dtype=bf, device=dev).float().transpose(1, 2)
     idx = torch.tensor([1 + (5 + 3 * i) % (lines - 1) for i in range(N)], dtype=torch.int32, device=dev)
     has_init = torch.tensor([i % 2 == 0 for i in range(N)], dtype=torch.bool, device=dev)
     g = torch.randn(T, H, D, dtype=bf, device=dev) * 0.5
@@ -59,7 +60,7 @@ def main():
     if not plan.supported:
         return
 
-    st_ref = state0.clone()
+    st_ref = state0.transpose(1, 2).clone().transpose(1, 2)
 
     def run_ref():
         planes = kda_conv.qkv_conv(qkv, conv_w, st_ref, cu, idx, has_init, HD)
@@ -72,11 +73,11 @@ def main():
         )[:2]
         return o, fs
 
-    st_fused = state0.clone()
+    st_fused = state0.transpose(1, 2).clone().transpose(1, 2)
     slot = torch.where(has_init, idx, torch.full_like(idx, -1))
 
     def run_fused():
-        o, fs = plan(qkv, g, beta, A_log, dt_bias, init_state, cu, conv_w, st_fused, slot)
+        o, fs = plan(qkv, g, beta, A_log, dt_bias, init_state, cu, conv_w, st_fused, slot, idx, has_init)
         kda_conv.qkv_conv_state(qkv, st_fused, cu, idx, has_init)
         return o, fs
 

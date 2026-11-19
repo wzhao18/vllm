@@ -135,6 +135,8 @@ def frost_conv_prefill(
         conv_weight,
         conv_state,
         slot,
+        state_indices,
+        has_initial_state,
     )
     kda_conv.qkv_conv_state(
         qkv, conv_state, cu_seqlens, state_indices, has_initial_state

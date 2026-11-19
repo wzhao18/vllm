@@ -6,9 +6,10 @@ The plan is cuDNN's own (``CompiledKda`` of cudnn-frontend 1.33 over a graph nod
 of this call's shapes); only its uncut launch is swapped for the vendored one in
 this package, whose TMA loads read the raw Q|K|V columns of the in_proj output
 and whose CG0 warps convolve them (stock conv arithmetic, bit for bit) before the
-q/k L2 norm and the V operand. Plans the vendored launch does not cover (piece
-chains, the d_v split / prep path, a tail launch) report ``supported`` False and
-the caller runs the conv and FROST unfused.
+q/k L2 norm and the V operand. A tail launch (the (sequence, head) tiles past the
+full waves: cuDNN's d_v split or chain kernels) reads conv'd planes of its
+sequences from qkv_conv. Prep-path and piece-chain plans report supported
+False; the caller then runs the conv and FROST unfused.
 """
 
 from __future__ import annotations
@@ -102,14 +103,10 @@ class FrostConvKda:
             ),
         )
         plan = CompiledKda(node, kda_prefill_f16)
-        self.supported = (
-            not plan.chain
-            and (plan.prep or not plan.dv_split)
-            and (plan.tail is None or (plan.tail.dv_split and plan.tail_prep))
-        )
-        # The prep kernel convolves V into this (T, H, D) plane for the prep-fed
-        # prefill (prep path or its d_v split tail).
-        self.v_plane = plan.prep or plan.tail is not None
+        self.supported = not (plan.chain or plan.prep or plan.dv_split)
+        # A tail launch (the tiles past the full waves) runs cuDNN's own kernels on
+        # conv'd planes of its sequences (qkv_conv over those sequences only).
+        self.tail_seq = plan.tail.batch_base if plan.tail is not None else None
         if not self.supported:
             return
         # Ragged pieces split long sequences into chain pieces at run time; those
@@ -142,20 +139,44 @@ class FrostConvKda:
         conv_weight: torch.Tensor,
         conv_state: torch.Tensor,
         conv_slot: torch.Tensor,
+        conv_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """qkv: raw in_proj Q|K|V columns (T, 3 H D) bf16, rows 16 B aligned;
         g (T, H, D) raw gate logits; beta (T, H) logits (row-strided OK);
         conv_weight (3 H D, 4) FP32; conv_state (lines, 3 H D, >= 3);
-        conv_slot (N,) int32 = the sequence's conv-state line, -1 for none."""
+        conv_slot (N,) int32 = the sequence's conv-state line, -1 for none;
+        conv_indices / has_initial_state: the qkv_conv metadata (tail planes).
+        Reads the conv state; qkv_conv_state updates it afterwards."""
         from cudnn.frost.workspace import Workspace
 
         T, N, H, D = self.shape
         q, k, v = (qkv[:, i * H * D : (i + 1) * H * D].view(T, H, D) for i in range(3))
         o = torch.empty(T, H, D, dtype=qkv.dtype, device=qkv.device)
         final_state = torch.empty(N, H, D, D, dtype=torch.float32, device=qkv.device)
-        v_out = torch.empty_like(o) if self.v_plane else o
+        tail = (None, None, None)
+        if self.tail_seq is not None:
+            from vllm.models.kimi_k3.nvidia.ops import kda_conv
+
+            b = self.tail_seq
+            planes = kda_conv.qkv_conv(
+                qkv,
+                conv_weight,
+                conv_state,
+                cu_seqlens[b:],
+                conv_indices[b:],
+                has_initial_state[b:],
+                H * D,
+                write_state=False,
+            )
+            tail = tuple(t.view(T, H, D) for t in planes.unbind(0))
         self._conv = dict(
-            conv_w=conv_weight, conv_state=conv_state, conv_slot=conv_slot, conv_v_out=v_out
+            conv_w=conv_weight,
+            conv_state=conv_state,
+            conv_slot=conv_slot,
+            conv_tail_q=tail[0],
+            conv_tail_k=tail[1],
+            conv_tail_v=tail[2],
         )
         views = [
             q,

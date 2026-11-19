@@ -235,6 +235,7 @@ struct Params {
   __nv_bfloat16* out;  // (3, tokens, C)
   int64_t ldx, st_s0, st_s1, st_s2, ci_s0, out_s0, out_s1;
   int num_seqs, parts, num_col_blocks, part_dim, null_block_id, has_null_block;
+  int write_state;  // 0: the conv state is updated afterwards (qkv_conv_state)
 };
 
 // Last sequence s with qsl[s] <= t (the non-empty sequence holding row t when qsl[0] <= t < qsl[num_seqs]).
@@ -269,11 +270,12 @@ __device__ __forceinline__ int part_start(const Params& p, int r) {
 template <typename StateT>
 __device__ __noinline__ void begin_seq(const __nv_bfloat16* __restrict__ x, int64_t ldx, StateT* st, int64_t st_s1,
                                        int64_t st_s2, bool load_init, int seq_start, int seqlen,
-                                       float (*hist)[kVec]) {
+                                       float (*hist)[kVec], bool write_state = true) {
 #pragma unroll
   for (int k = 0; k < 3; ++k)
 #pragma unroll
     for (int i = 0; i < kVec; ++i) hist[k][i] = load_init ? state_ld(st + i * st_s1 + k * st_s2) : 0.0f;
+  if (!write_state) return;
   float ns[3][kVec];
 #pragma unroll
   for (int j = 0; j < 3; ++j) {
@@ -413,7 +415,8 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
     auto seq_hist = [&]() {
       begin_seq<StateT>(xcol, p.ldx,
                         reinterpret_cast<StateT*>(p.state) + line * p.st_s0 + static_cast<int64_t>(c0) * p.st_s1,
-                        p.st_s1, p.st_s2, p.has_initial_state[seq], seq_start, seq_end - seq_start, hb);
+                        p.st_s1, p.st_s2, p.has_initial_state[seq], seq_start, seq_end - seq_start, hb,
+                        p.write_state != 0);
 #pragma unroll
       for (int k = 0; k < 3; ++k)
 #pragma unroll
@@ -476,7 +479,8 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
     auto seq_hist = [&]() {
       begin_seq<StateT>(xcol, p.ldx,
                         reinterpret_cast<StateT*>(p.state) + line * p.st_s0 + static_cast<int64_t>(c0) * p.st_s1,
-                        p.st_s1, p.st_s2, p.has_initial_state[seq], seq_start, seq_end - seq_start, hb);
+                        p.st_s1, p.st_s2, p.has_initial_state[seq], seq_start, seq_end - seq_start, hb,
+                        p.write_state != 0);
 #pragma unroll
       for (int k = 0; k < 3; ++k) h[k] = to_raw(hb[k]);
     };
@@ -538,7 +542,8 @@ void dispatch(const Params& p, int64_t tokens, int nc, cudaStream_t stream) {
 // out = conv(x) as (3, tokens, part_dim); conv_states updated in place.
 void qkv_conv(torch::Tensor const& x, torch::Tensor const& weight, torch::Tensor& conv_states,
               torch::Tensor const& query_start_loc, torch::Tensor const& cache_indices,
-              torch::Tensor const& has_initial_state, torch::Tensor& out, int64_t null_block_id, int64_t warps) {
+              torch::Tensor const& has_initial_state, torch::Tensor& out, int64_t null_block_id, int64_t warps,
+              bool write_state) {
   const int64_t tokens = x.size(0);
   const int64_t dim = 3 * out.size(2);
   const int num_seqs = query_start_loc.size(0) - 1;
@@ -565,6 +570,7 @@ void qkv_conv(torch::Tensor const& x, torch::Tensor const& weight, torch::Tensor
   p.num_col_blocks = static_cast<int>(dim / (warps * kWarpCols));
   p.null_block_id = static_cast<int>(null_block_id);
   p.has_null_block = null_block_id >= 0;
+  p.write_state = write_state ? 1 : 0;
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
   const bool st32 = conv_states.scalar_type() == at::kFloat;
   const bool w32 = weight.scalar_type() == at::kFloat;
@@ -635,7 +641,7 @@ void qkv_conv_state(torch::Tensor const& x, torch::Tensor& conv_states, torch::T
 TORCH_LIBRARY_FRAGMENT(k3_kda_conv, m) {
   m.def(
       "qkv_conv(Tensor x, Tensor weight, Tensor(a!) conv_states, Tensor query_start_loc, Tensor cache_indices, "
-      "Tensor has_initial_state, Tensor(b!) out, int null_block_id, int warps) -> ()");
+      "Tensor has_initial_state, Tensor(b!) out, int null_block_id, int warps, bool write_state=True) -> ()");
   m.def(
       "qkv_conv_state(Tensor x, Tensor(a!) conv_states, Tensor query_start_loc, Tensor cache_indices, "
       "Tensor has_initial_state, int dim, int null_block_id) -> ()");

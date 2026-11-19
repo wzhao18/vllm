@@ -1094,46 +1094,68 @@ def conv_silu_bf16x2(a0: cutlass.Float32, a1: cutlass.Float32) -> cutlass.Int32:
 
 
 @cute.jit
-def conv_tile_row8(cfg, raw_stage, prev_stage, row, seg, seg_dim, from_state, slot, row_valid, s_base, sW, ch_local, mConvState, ch):
+def conv_tile_row8(cfg, from_state: cutlass.Constexpr, raw_stage, prev_stage, row, seg, seg_dim, slot, row_valid, s_base, sW, ch_local, mConvState, ch):
     """Width-4 causal conv + SiLU of one tile row's 8 channels [ch, ch + 8) of a raw
     in_proj plane staged in ``s_base`` (the 128B-swizzled TMA ring of 64-column
-    segments): taps rows row - 3 .. row of the stage, rows before the chunk from the
-    previous ring stage, or before token 0 from the FP32 conv state (zero without
-    one, ``slot`` < 0). Arithmetic of the stock conv: bf16 inputs in FP32, FP32
-    weights, acc = x[t-3] w0 + x[t-2] w1 + x[t-1] w2 + x[t] w3 as an FMA chain, SiLU,
-    bf16. Rows past the sequence give zero (the unfused path's TMA zero fill).
-    Returns the 8 bf16 values."""
+    segments): taps rows row - 3 .. row of the stage; rows before the chunk from the
+    previous ring stage (``from_state`` False: branch-free addressing) or, for the
+    sequence's first chunk, from the FP32 conv state (zero without one, ``slot`` < 0).
+    Arithmetic of the stock conv: bf16 inputs in FP32, FP32 weights (``sW``: [tap][d_k]
+    at ``ch_local``), acc = x[t-3] w0 + x[t-2] w1 + x[t-1] w2 + x[t] w3 as an FMA
+    chain, SiLU, bf16. Rows past the sequence give zero (the unfused path's TMA zero
+    fill). Returns the 8 bf16 values as 4 packed words."""
     stage_elems = cfg.d_k * cfg.b_t
     seg_base = seg * (cfg.b_t * 64)
     x = cutlass.Array(cutlass.Float32, 32, alignment=16)
     for tap in cutlass.range_constexpr(4):
         src = row + cutlass.Int32(tap - 3)
-        prev = src < cutlass.Int32(0)
-        r = src + cutlass.Int32(cfg.b_t) if prev else src
-        stage = prev_stage if prev else raw_stage
+        if cutlass.const_expr(tap == 3):
+            r = row
+            stage = raw_stage
+        else:
+            neg = cutlass.Int32(0) - (src >> 31)  # 1 for a row before the chunk
+            r = src + neg * cutlass.Int32(cfg.b_t)
+            stage = raw_stage + neg * (prev_stage - raw_stage)
         idx = stage * stage_elems + seg_base + r * 64 + swizzle_xor_128b(r, seg_dim, elem_bytes=2)
         vals = (s_base + idx).load(count=8, alignment=16).to(cutlass.Float32)
         for i in cutlass.range_constexpr(8):
             x[tap * 8 + i] = vals[i]
-        if cutlass.const_expr(tap < 3):
-            if prev:
-                if from_state:
+        if cutlass.const_expr(from_state and tap < 3):
+            if src < cutlass.Int32(0):
+                for i in cutlass.range_constexpr(8):
+                    x[tap * 8 + i] = cutlass.Float32(0.0)
+                if slot >= cutlass.Int32(0):
                     for i in cutlass.range_constexpr(8):
-                        x[tap * 8 + i] = cutlass.Float32(0.0)
-                    if slot >= cutlass.Int32(0):
-                        for i in cutlass.range_constexpr(8):
-                            x[tap * 8 + i] = mConvState[slot, ch + cutlass.Int32(i), src + cutlass.Int32(3)].to(cutlass.Float32)
+                        x[tap * 8 + i] = mConvState[slot, ch + cutlass.Int32(i), src + cutlass.Int32(3)].to(cutlass.Float32)
     w = [(sW + tap * cfg.d_k + ch_local).load(count=8, alignment=16) for tap in range(4)]
     zero = opaque_f32_zero()
-    out = cutlass.Array(cutlass.Int32, 4, alignment=16)
+    out = []
     for p in cutlass.range_constexpr(4):
         a0, a1 = ffma2(x[2 * p], x[2 * p + 1], w[0][2 * p], w[0][2 * p + 1], zero, zero)
         a0, a1 = ffma2(x[8 + 2 * p], x[8 + 2 * p + 1], w[1][2 * p], w[1][2 * p + 1], a0, a1)
         a0, a1 = ffma2(x[16 + 2 * p], x[16 + 2 * p + 1], w[2][2 * p], w[2][2 * p + 1], a0, a1)
         a0, a1 = ffma2(x[24 + 2 * p], x[24 + 2 * p + 1], w[3][2 * p], w[3][2 * p + 1], a0, a1)
         packed = conv_silu_bf16x2(a0, a1)
-        out[p] = packed if row_valid else cutlass.Int32(0)
-    return cutlass.Vector.from_elements((out[0], out[1], out[2], out[3]), cutlass.Int32).bitcast(cfg.io_dtype)
+        out.append(packed if row_valid else cutlass.Int32(0))
+    return out
+
+
+@cute.jit
+def conv_rows(cfg, from_state: cutlass.Constexpr, raw_stage, prev_stage, row, lane_in_row_group, slot, row_valid, sQ, sK, sV, sW, mConvState, ch_q, ch_k, ch_v, words):
+    """The thread's conv outputs of one chunk: q, k, v x both 64-column halves of its
+    row, packed bf16 into ``words`` [(tensor * 2 + half) * 4 + j]."""
+    for half in cutlass.range_constexpr(2):
+        dim_base = half * 64 + lane_in_row_group * 8
+        seg = dim_base // 64
+        seg_dim = dim_base - seg * 64
+        tile_args = (cfg, from_state, raw_stage, prev_stage, row, seg, seg_dim, slot, row_valid)
+        rq = conv_tile_row8(*tile_args, sQ, sW, dim_base, mConvState, ch_q + dim_base)
+        rk = conv_tile_row8(*tile_args, sK, sW + 4 * cfg.d_k, dim_base, mConvState, ch_k + dim_base)
+        rv = conv_tile_row8(*tile_args, sV, sW + 8 * cfg.d_k, dim_base, mConvState, ch_v + dim_base)
+        for j in cutlass.range_constexpr(4):
+            words[(0 * 2 + half) * 4 + j] = rq[j]
+            words[(1 * 2 + half) * 4 + j] = rk[j]
+            words[(2 * 2 + half) * 4 + j] = rv[j]
 
 
 @cute.jit
@@ -1306,7 +1328,6 @@ def compute0_warp_group(
                 # history rows before the chunk: the previous ring stage (same tile, held by
                 # the extra raw_done arrival below), or at token 0 the conv state
                 conv_prev_stage = cutlass.Int32((chunk_count + cutlass.Uint32(cfg.smem_raw_stages - 1)) % cfg.smem_raw_stages)
-                conv_from_state = chunk_idx == cutlass.Int32(0)
                 conv_slot = cutlass.Int32(mConvSlot[batch_idx])
                 conv_row_valid = chunk_start + decay_row < batch_seqlen
                 conv_vc_stage = cutlass.Int32(chunk_count % cfg.vconv_stages)
@@ -1314,6 +1335,28 @@ def compute0_warp_group(
                 conv_ch_k = conv_ch_q + cutlass.Int32(mConvW.shape[0] // 3)
                 conv_ch_v = conv_ch_k + cutlass.Int32(mConvW.shape[0] // 3)
                 conv_v_out = []
+                conv_words = cutlass.Array(cutlass.Int32, 24, alignment=16)
+                conv_rows_args = (
+                    raw_stage,
+                    conv_prev_stage,
+                    decay_row,
+                    lane_in_row_group,
+                    conv_slot,
+                    conv_row_valid,
+                    sQ_raw.data_ptr(),
+                    sK_raw.data_ptr(),
+                    sV_raw.data_ptr(),
+                    sConvW.data_ptr(),
+                    mConvState,
+                    conv_ch_q,
+                    conv_ch_k,
+                    conv_ch_v,
+                    conv_words,
+                )
+                if chunk_idx == cutlass.Int32(0):
+                    conv_rows(cfg, True, *conv_rows_args)
+                else:
+                    conv_rows(cfg, False, *conv_rows_args)
 
             # ---- Gate prefix scan ----------------------------------------------------
             gate_raw = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
@@ -1411,17 +1454,10 @@ def compute0_warp_group(
                 f16_segment_dim = dim_base - f16_segment * 64
                 raw_f16_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
                 if cutlass.const_expr(cfg.fused_conv):
-                    conv_args = (cfg, raw_stage, conv_prev_stage, decay_row, f16_segment, f16_segment_dim, conv_from_state, conv_slot, conv_row_valid)
-                    sW = sConvW.data_ptr()
-                if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
-                    conv_v_out.append(
-                        (raw_f16_idx, conv_tile_row8(*conv_args, sV_raw.data_ptr(), sW + 8 * cfg.d_k, dim_base, mConvState, conv_ch_v + dim_base))
-                    )
-                if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 2) == 0):
-                    raw_q_vec_f32 = conv_tile_row8(*conv_args, sQ_raw.data_ptr(), sW, dim_base, mConvState, conv_ch_q + dim_base).to(cutlass.Float32)
-                    raw_k_vec_f32 = conv_tile_row8(
-                        *conv_args, sK_raw.data_ptr(), sW + 4 * cfg.d_k, dim_base, mConvState, conv_ch_k + dim_base
-                    ).to(cutlass.Float32)
+                    cw = [[conv_words[(t * 2 + dim_half) * 4 + j] for j in range(4)] for t in range(3)]
+                    raw_q_vec_f32 = cutlass.Vector.from_elements(tuple(cw[0]), cutlass.Int32).bitcast(cfg.io_dtype).to(cutlass.Float32)
+                    raw_k_vec_f32 = cutlass.Vector.from_elements(tuple(cw[1]), cutlass.Int32).bitcast(cfg.io_dtype).to(cutlass.Float32)
+                    conv_v_out.append((raw_f16_idx, cutlass.Vector.from_elements(tuple(cw[2]), cutlass.Int32).bitcast(cfg.io_dtype)))
                 else:
                     raw_q_frag = (sQ_ptr + raw_f16_idx).load(count=8, alignment=16)
                     raw_k_frag = (sK_ptr + raw_f16_idx).load(count=8, alignment=16)
@@ -1439,7 +1475,7 @@ def compute0_warp_group(
                         q_sq_even, q_sq_odd = ffma2(q_val0, q_val1, q_val0, q_val1, q_sq_even, q_sq_odd)
                         k_sq_even, k_sq_odd = ffma2(k_val0, k_val1, k_val0, k_val1, k_sq_even, k_sq_odd)
 
-            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
+            if cutlass.const_expr(cfg.fused_conv):
                 bars.mb_vconv_done[conv_vc_stage].wait(cutlass.Int32(((chunk_count // cfg.vconv_stages) + 1) % 2))
                 for v_idx, v_vec in conv_v_out:
                     (sVc_raw.data_ptr() + conv_vc_stage * (cfg.d_v * cfg.b_t) + v_idx).store(v_vec, alignment=16)
@@ -2078,7 +2114,7 @@ def compute1_warp_group(
 
             # ---- Y stage: Y = Beta * (V - k state) -----------------------------------
             bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
-            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
+            if cutlass.const_expr(cfg.fused_conv):
                 vc_stage = cutlass.Int32(cum_chunk_base % cfg.vconv_stages)
                 sV_ptr = sVc_raw.data_ptr() + vc_stage * (cfg.d_v * cfg.b_t)
                 bars.mb_vconv_ready[vc_stage].wait(cutlass.Int32((cum_chunk_base // cfg.vconv_stages) % 2))
@@ -2093,7 +2129,7 @@ def compute1_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
+            if cutlass.const_expr(cfg.fused_conv):
                 bars.mb_vconv_done[vc_stage].arrive()
             bars.mb_beta_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             beta_fp32 = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
@@ -2404,7 +2440,7 @@ def compute1_warp_group(
             bars.mb_o_tmastg_ready[drain_o_stage].arrive()
 
             # ---- Y stage: Y = Beta * (V - k state) -----------------------------------
-            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
+            if cutlass.const_expr(cfg.fused_conv):
                 vc_stage = cutlass.Int32(cum_chunk % cfg.vconv_stages)
                 sV_ptr = sVc_raw.data_ptr() + vc_stage * (cfg.d_v * cfg.b_t)
                 bars.mb_vconv_ready[vc_stage].wait(cutlass.Int32((cum_chunk // cfg.vconv_stages) % 2))
@@ -2419,7 +2455,7 @@ def compute1_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 1) == 0):
+            if cutlass.const_expr(cfg.fused_conv):
                 bars.mb_vconv_done[vc_stage].arrive()
             bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
 
@@ -3441,7 +3477,6 @@ class KdaPrefillCfg:
     vconv_stages: int = 4
     vconv_cosize: int = 1
     conv_w_cosize: int = 1
-    conv_dbg: int = 0  # TEMP experiment knob: 1 no V conv, 2 no q/k conv, 4 four V-conv stages
 
 
 def build_cfg(
@@ -3550,10 +3585,7 @@ def build_cfg(
         if steep or cfg.d_v != 128 or cfg.d_k != 128 or tiles_per_head != 1:
             raise ValueError(f"fused conv needs steep off, d_k = d_v = 128 and one tile per head (steep {cfg.steep_mode}, d_v {cfg.d_v})")
         cfg.fused_conv = True
-        import os
-
-        cfg.conv_dbg = int(os.environ.get("K31_FROST_CONV_DBG", "0"))
-        cfg.vconv_stages = 4 if cfg.conv_dbg & 4 else 2
+        cfg.vconv_stages = 2
         cfg.vconv_cosize = cfg.vconv_stages * cfg.d_v * cfg.b_t
         cfg.conv_w_cosize = 3 * 4 * cfg.d_k
     return cfg

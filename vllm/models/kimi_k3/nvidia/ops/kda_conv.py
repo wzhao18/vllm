@@ -857,6 +857,7 @@ def qkv_conv(
     has_initial_state: torch.Tensor,
     part_dim: int,
     null_block_id: int | None = NULL_BLOCK_ID,
+    write_state: bool = True,
 ) -> torch.Tensor:
     """``causal_conv1d_fn`` (width 4, SiLU, no bias) of the packed Q|K|V columns
     ``x`` (tokens, 3 * part_dim), conv state (cache lines, 3 * part_dim, >= 3)
@@ -877,6 +878,7 @@ def qkv_conv(
         out,
         null_block_id if null_block_id is not None else -1,
         _qkv_conv_warps(dim, num_tokens),
+        write_state,
     )
     return out
 
