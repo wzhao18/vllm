@@ -1392,7 +1392,9 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params 
   V2_KERNEL_PROLOGUE(T)
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true, T, kDbg>(p, sm, row, -1, bar_phase);
-    if (threadIdx.x == 0) p.redo[row] = r;
+    // a row the hot body cannot finish (the same rows on every rank) runs the complete
+    // body right away in the same CTA (no second kernel: ~1.4 us per call in-step)
+    if (K31_RARE(r != 0)) v2_row<false, T, true>(p, sm, row, r == 510 ? 0 : r, bar_phase);
   }
 }
 

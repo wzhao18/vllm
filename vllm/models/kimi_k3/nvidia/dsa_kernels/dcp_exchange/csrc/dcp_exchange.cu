@@ -3318,10 +3318,6 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
     if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024, false>, p));
     else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T, false>, p));
   }
-  // the rows that need the complete body (rare; most CTAs exit after the PDL wait)
-  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
-  cfg.blockDim = dim3(kV2T, 1, 1);
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
