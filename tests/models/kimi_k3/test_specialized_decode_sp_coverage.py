@@ -326,6 +326,8 @@ def runtime(layers=None, rows=ROWS, ctx=None, **backbone):
         use_sequence_parallel=True,
         use_attn_res=True,
         aux_hidden_state_layers=(2, 5),
+        _aux_attn_res_stream=False,
+        start_layer=0,
     )
     stock.update(backbone)
     if layers is None:
