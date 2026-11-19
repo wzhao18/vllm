@@ -118,3 +118,44 @@ def test_frost_prefill_in_place_matches_gathered():
     torch.accelerator.synchronize()
     assert torch.equal(o, o_ref)
     assert torch.equal(pool, expect)
+
+
+def test_frost_prefill_in_place_o_norm_head_split():
+    """frost_prefill_in_place_o_norm (two head groups, the second on a side
+    stream, o_norm into head windows of one MXFP8 buffer) equals
+    frost_prefill_in_place + o_norm_mxfp8 over all heads."""
+    from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    assert sp_kda.frost_supported(torch.device("cuda"))
+    torch.manual_seed(0)
+    lens, H, split = [300, 1, 1029], 8, 3
+    T = sum(lens)
+    bf = torch.bfloat16
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
+    v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+    beta = torch.randn(1, T, H, device="cuda").to(bf)
+    A_log = torch.randn(H, device="cuda") * 0.5
+    dt_bias = torch.randn(H * D, device="cuda") * 0.1
+    g2 = (torch.randn(T, H * D + 64, device="cuda") * 2).to(bf)[:, : H * D]
+    w = torch.rand(D, device="cuda") + 0.5
+    pool0 = torch.randn(7, H, D, D, device="cuda") * 0.1
+    idx = torch.tensor([5, 2, 3], dtype=torch.int32, device="cuda")
+    has_init = torch.tensor([True, False, True], device="cuda")
+    pool_ref, pool = pool0.clone(), pool0.clone()
+    ref, out = Mxfp8Buffer(T, H * D, "cuda", bf), Mxfp8Buffer(T, H * D, "cuda", bf)
+    ref.scale.zero_()
+    out.scale.zero_()
+    o = sp_kda.frost_prefill_in_place(q, k, v, g, beta, A_log, dt_bias, -5.0, pool_ref, idx, has_init, cu)
+    sp_kda.o_norm_mxfp8(o, g2, w, 1e-6, ref)
+    sp_kda.frost_prefill_in_place_o_norm(
+        q, k, v, g, beta, A_log, dt_bias, -5.0, pool, idx, has_init, cu, g2, w, 1e-6, out, split
+    )
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(pool, pool_ref, rtol=1e-5, atol=1e-6)
+    a = out.data.view(torch.uint8).to(torch.int16)
+    b = ref.data.view(torch.uint8).to(torch.int16)
+    assert (a != b).float().mean().item() <= 1e-3
+    assert ((a - b).abs() > 1).float().mean().item() <= 1e-4
+    assert (out.scale != ref.scale).float().mean().item() <= 1e-3

@@ -161,16 +161,101 @@ def frost_prefill_in_place(
     return o.view(1, T, H, D)
 
 
+def frost_head_split(num_seqs: int, heads: int, device: torch.device) -> int:
+    """Head split for FROST + o_norm overlap: 0 when the (sequence, head) items
+    fit one wave of SMs, else the largest head count whose items fit one wave."""
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if num_seqs * heads <= sms:
+        return 0
+    split = sms // num_seqs
+    return split if 0 < split < heads else 0
+
+
+_side_stream: dict = {}
+
+
+def frost_prefill_in_place_o_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    g2: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    out,
+    split: int,
+) -> None:
+    """``frost_prefill_in_place`` + ``o_norm_mxfp8`` as two head groups: heads
+    [0, split) fill one wave of SMs with whole (sequence, head) items, then the
+    remaining heads run (FROST's prep + d_v-half launches leave SMs idle) on a
+    side stream while the o_norm of the first group fills those SMs."""
+    assert _frost_fn and 0 < split < q.shape[2]
+    T, H, D = q.shape[1], q.shape[2], q.shape[3]
+    row = state_pool[0].numel()
+    block = 4096
+    _zero_new_state_rows[(state_indices.numel(), triton.cdiv(row, block))](
+        state_pool, state_indices, has_initial_state, state_pool.stride(0), ROW=row, BLOCK=block
+    )
+    q3, k3, v3, g3 = (x.reshape(T, H, D) for x in (q, k, v, g))
+    b2 = beta.reshape(T, H)
+    dt = dt_bias.view(H, D)
+    w = norm_weight.float().contiguous()
+    kda_segscan.load_extension()
+
+    def core(lo: int, hi: int) -> torch.Tensor:
+        return _frost_fn(
+            q3[:, lo:hi],
+            k3[:, lo:hi],
+            v3[:, lo:hi],
+            g3[:, lo:hi],
+            b2[:, lo:hi],
+            cu_seqlens,
+            scale=D**-0.5,
+            initial_state=state_pool[:, lo:hi],
+            state_indices=state_indices,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=True,
+            gate_lower_bound=lower_bound,
+            a_log=A_log[lo:hi],
+            dt_bias=dt[lo:hi],
+            plan_name="kda_frost",
+        )[0]
+
+    side = _side_stream.get(q.device)
+    if side is None:
+        side = _side_stream[q.device] = torch.cuda.Stream(q.device, priority=-1)
+    main = torch.cuda.current_stream(q.device)
+    o_a = core(0, split)
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        o_b = core(split, H)
+        torch.ops.k3_flashkda_split.o_norm_mxfp8(o_b, g2, w, eps, out.data, out.scale, split)
+    torch.ops.k3_flashkda_split.o_norm_mxfp8(o_a, g2, w, eps, out.data, out.scale, 0)
+    main.wait_stream(side)
+
+
 def o_norm_mxfp8(
     x: torch.Tensor,
     g: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     out,
+    head0: int = 0,
 ) -> None:
     """Gated RMSNorm (sigmoid) of x (..., H, 128) with gate rows g (T, >= H 128)
-    into ``out`` (an ``mxfp8_act.Mxfp8Buffer`` of T rows)."""
+    into ``out`` (an ``mxfp8_act.Mxfp8Buffer`` of T rows). ``head0`` places x at
+    heads [head0, head0 + H) of g and out."""
     kda_segscan.load_extension()
     torch.ops.k3_flashkda_split.o_norm_mxfp8(
-        x, g, weight.float().contiguous(), eps, out.data, out.scale
+        x, g, weight.float().contiguous(), eps, out.data, out.scale, head0
     )

@@ -1410,6 +1410,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         # Prefill or plain-decode path.
         core_attn_out_non_spec = None
         prefill_core_out = core_attn_out
+        o_norm_done = False
         if mixed_qkv_ns is not None:
             assert g1_ns is not None and beta_ns is not None
             non_spec_out = None
@@ -1628,6 +1629,43 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             recurrent_state=recurrent_state,
                             cu_seqlens=non_spec_query_start_loc,
                         )
+                    elif (
+                        frost_in_place
+                        and o_mxfp8 is not None
+                        and m.num_decodes == 0
+                        and flashkda_out.data_ptr() == core_attn_out.data_ptr()
+                        and q_ns.shape[1] == core_attn_out.shape[1]
+                        and (
+                            head_split := specialized_prefill_kda.frost_head_split(
+                                non_spec_query_start_loc.numel() - 1,
+                                q_ns.shape[2],
+                                q_ns.device,
+                            )
+                        )
+                    ):
+                        # Pure prefill over more (sequence, head) items than one
+                        # wave: o_norm of the first head group overlaps the tail.
+                        specialized_prefill_kda.frost_prefill_in_place_o_norm(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            g=g1_ns,
+                            beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            state_pool=recurrent_state,
+                            state_indices=non_spec_state_indices_tensor,
+                            has_initial_state=has_initial_state,
+                            cu_seqlens=non_spec_query_start_loc,
+                            g2=g2.flatten(-2),
+                            norm_weight=self.o_norm.weight,
+                            eps=self.o_norm.eps,
+                            out=o_mxfp8,
+                            split=head_split,
+                        )
+                        o_norm_done = True
+                        core_attn_out_non_spec = flashkda_out
                     elif frost_in_place:
                         frost_out = specialized_prefill_kda.frost_prefill_in_place(
                             q=q_ns,
@@ -1805,7 +1843,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        if (
+        if o_norm_done:
+            pass
+        elif (
             o_mxfp8 is not None
             and m.num_prefills > 0
             and self.kda_prefill_backend == "flashkda"

@@ -21,10 +21,10 @@ STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
       "Tensor? checkpoint_offsets=None, int mode=3) -> ()");
   m.def(
       "o_norm_mxfp8(Tensor x, Tensor g, Tensor weight, float eps, Tensor(a!) q, "
-      "Tensor(b!) sf) -> ()");
+      "Tensor(b!) sf, int head0=0) -> ()");
   m.def(
       "o_norm_mxfp8_ref(Tensor x, Tensor g, Tensor weight, float eps, Tensor(a!) q, "
-      "Tensor(b!) sf) -> ()");
+      "Tensor(b!) sf, int head0=0) -> ()");
   m.def(
       "k64_rec(Tensor kdq, Tensor kr, Tensor inv, Tensor mqk, "
       "Tensor gt, Tensor beta, Tensor v, Tensor init_state, "
