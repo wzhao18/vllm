@@ -217,7 +217,8 @@ class DcpExchange:
             [int(x) for x in hv.buffer_ptrs], dtype=torch.int64, device=device
         )
         self.v2_mc = int(getattr(hv, "multicast_ptr", 0) or 0)
-        self.v2_epoch = torch.zeros(cap, dtype=torch.int32, device=device)
+        # [0, cap): row epochs; [cap, 2 cap): rows left to the complete body
+        self.v2_epoch = torch.zeros(2 * cap, dtype=torch.int32, device=device)
         self.mailbox_bytes += 4 * int(lay[3])
 
         # ---- O mailboxes, one per head dim

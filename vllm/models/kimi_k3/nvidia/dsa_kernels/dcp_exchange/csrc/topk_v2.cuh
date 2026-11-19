@@ -81,6 +81,7 @@ struct V2Params {
   int W, rank, K, T, cap, interleave;
   int64_t off_r1, off_tie, off_rad;
   int* epoch;
+  int* redo;  // per row: 0, or the epoch the complete body runs the row at (+1)
   int* err;
   long long spin_ns;
   int* stats;
@@ -211,7 +212,7 @@ struct V2Sm {
 // executed code cold from L2; the rare paths inline made the hot path 2x slower there):
 // a rank whose candidates or window fall outside the fast path sends a saturated
 // message, which every rank reads as tier 3; any tier other than 1 returns 1 and the
-// caller runs the row again with the complete body (out of line) at the next epoch, on
+// redo kernel runs the row again with the complete body at the next epoch, on
 // every rank alike (the tier comes from the exchanged words).
 template <bool kFast>
 // ep_in < 0: the row's epoch is read here (after the copy is issued). Returns 0, or
@@ -335,7 +336,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // most kV2NR x kV2T groups are read from the SMEM copy (fast path: short loops);
     // longer rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
     for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
-    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; }
+    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; }
     const int head = min(L, head0);
     const int sh = (8 - head) & 7;  // == sh0 when L >= 8
     const int ng = (L + sh + 7) >> 3;
@@ -420,6 +421,17 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         for (int i = kV2PB - 1; i >= 0; --i) {
           run += hist[bb * kV2PB + i];
           if (run >= want) { s_th = (bb * kV2PB + i) * 16; break; }
+        }
+      }
+      // the sample's estimate of the q-th key (its coarse bin): the fine histogram is
+      // centered there, so rows with a wide upper tail (q-th key more than kV2Fine keys
+      // above theta) need no rebase pass
+      const uint32_t want_e = max(1u, q / kV2SampleStride);
+      if (ab < want_e && ab + v >= want_e) {
+        uint32_t run = ab;
+        for (int i = kV2PB - 1; i >= 0; --i) {
+          run += hist[bb * kV2PB + i];
+          if (run >= want_e) { s_i[14] = (bb * kV2PB + i) * 16; break; }
         }
       }
       __syncthreads();
@@ -643,7 +655,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     bool pdone = false;
     int ew = -1;
     uint32_t wtot = 0;
-    int fb = th;  // the fine histogram's base key
+    // the fine histogram's base key: theta, or kV2Fine / 2 below the estimated q-th key
+    int fb = s_i[14] >= 0 ? max(th, s_i[14] - kV2Fine / 2) : th;
     if (fast) {
       // thread t owns fine keys [kV2FB (kV2T - 1 - t), + kV2FB); Sx[b]: candidates with
       // fine key >= b (beyond included); the row buffer is free until the round
@@ -1321,34 +1334,30 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #undef V2STAT
 }
 
-__device__ __noinline__ int v2_row_full(const V2Params& p, const V2Sm& sm, int row, int ep, uint32_t& bar_phase) {
-  return v2_row<false>(p, sm, row, ep, bar_phase);
-}
 
+// SMEM of one row (both kernels), the mbarrier, then the PDL wait
+#define V2_KERNEL_PROLOGUE                                                                   __shared__ __align__(16) uint32_t hist[kCoarseBins];                                       __shared__ __align__(16) uint32_t cpos[kV2Cand];                                           __shared__ __align__(16) uint16_t ckey[kV2Cand];                                           __shared__ __align__(128) uint4 srow[kV2NR * kV2T];                                        __shared__ __align__(8) uint64_t s_bar;                                                    __shared__ uint32_t warp_sums[64];                                                         __shared__ int s_i[16];                                                                    __shared__ uint32_t s_u[16];                                                               __shared__ unsigned long long s_pref;                                                      __shared__ long long s_dbg[32];                                                            const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};        if (threadIdx.x == 0) {                                                                      mbar_init(&s_bar, kV2Cp);                                                                  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");                     }                                                                                          __syncthreads();                                                                           uint32_t bar_phase = 0;                                                                    asm volatile("griddepcontrol.wait;" ::: "memory");
+
+// The common case: one compact row body (PDL: the prologue overlaps the logits kernel's
+// tail; every global read follows the wait). Rows that need the complete body are left
+// to topk_v2_redo_kernel, launched right after: a call into the complete body from here
+// (out of line) cost ~2 us per call (stack frame, CTA start), the complete body inline
+// ~8 us in-step (instruction fetch).
 __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
-  __shared__ __align__(16) uint32_t hist[kCoarseBins];  // histograms; later bitmaps / scratch
-  __shared__ __align__(16) uint32_t cpos[kV2Cand];
-  __shared__ __align__(16) uint16_t ckey[kV2Cand];
-  // the row's keys (fast path); after the candidate pass the exchange buffers live there
-  __shared__ __align__(128) uint4 srow[kV2NR * kV2T];
-  __shared__ __align__(8) uint64_t s_bar;
-  __shared__ uint32_t warp_sums[64];  // two scan buffers (V2WS alternates)
-  __shared__ int s_i[16];
-  __shared__ uint32_t s_u[16];
-  __shared__ unsigned long long s_pref;
-  __shared__ long long s_dbg[32];
-  const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};
-  if (threadIdx.x == 0) {
-    mbar_init(&s_bar, kV2Cp);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
-  __syncthreads();
-  uint32_t bar_phase = 0;
-  // PDL: the prologue above overlaps the logits kernel's tail; every global read follows
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  V2_KERNEL_PROLOGUE
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true>(p, sm, row, -1, bar_phase);
-    if (r) v2_row_full(p, sm, row, r == 510 ? 0 : r, bar_phase);  // epoch r - 1 + 1
+    if (threadIdx.x == 0) p.redo[row] = r;
+  }
+}
+
+// The rows topk_v2_kernel left (the same rows on every rank: the tier comes from the
+// exchanged words), with the complete body at the next epoch; CTAs without one exit.
+__global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
+  V2_KERNEL_PROLOGUE
+  for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
+    const int r = p.redo[row];
+    if (r) v2_row<false>(p, sm, row, r == 510 ? 0 : r, bar_phase);
   }
 }
 
