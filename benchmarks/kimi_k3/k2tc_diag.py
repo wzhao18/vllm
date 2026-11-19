@@ -89,6 +89,20 @@ def main():
             ok2 = stats(f"mode {m} state", ref_s, s)
             print(f"    mode {m}: {'OK' if ok1 and ok2 else 'MISMATCH'}")
     for m in [int(x) for x in args.wall.split(",") if x]:
+        if m & 512:
+            for lens_s, H_s in [([40, 23], 2), ([300, 17, 129], 8)]:
+                xs = inputs(lens_s, H_s)
+                mc_s = max((n + 15) // 16 for n in lens_s)
+                T_s = sum(lens_s)
+                ws_s = torch.zeros(
+                    torch.ops.k3_flashkda_split.get_workspace_size(T_s, H_s, len(lens_s)),
+                    dtype=torch.uint8, device="cuda")
+                r_o, r_s = run(xs, 3)
+                o_s, s_s = run(xs, m | (mc_s << 16), ws_s)
+                ok = stats(f"small {lens_s} mode {m} out", r_o, o_s) and stats(
+                    f"small {lens_s} mode {m} state", r_s, s_s)
+                print(f"    small {lens_s} mode {m}: {'OK' if ok else 'MISMATCH'}",
+                      flush=True)
         lens = [5461, 5461, 5462]
         x = inputs(lens, 96)
         T = sum(lens)
@@ -124,7 +138,8 @@ def main():
         e1.record()
         torch.cuda.synchronize()
         print(f"WALL mode {m} ({'stock _flashkda_C' if m == 0 else mm}): "
-              f"{e0.elapsed_time(e1) * 1000 / args.iters:.1f} us per K1+K2 call")
+              f"{e0.elapsed_time(e1) * 1000 / args.iters:.1f} us per K1+K2 call",
+              flush=True)
     for m in [int(x) for x in args.stamps.split(",") if x]:
         x = inputs([5461, 5461, 5462], 96)
         run(x, m)

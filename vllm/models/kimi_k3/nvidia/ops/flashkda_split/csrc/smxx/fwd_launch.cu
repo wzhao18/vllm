@@ -225,6 +225,20 @@ void launch_fwd(
   }
 #endif
 
+  // The overlapped K2 spins on K1's flags, so its whole grid must be
+  // resident at once (a high-priority K2 block waiting for a slot would
+  // starve K1).
+  auto require_resident = [&](auto kernel, int threads, int smem, int blocks) {
+    if (!overlap) return;
+    int per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, smem);
+    if (per_sm * num_sms < blocks) {
+      throw std::runtime_error(
+          "k3_flashkda_split: overlapped K1 / K2 needs the K2 grid resident (" +
+          std::to_string(blocks) + " blocks, " + std::to_string(per_sm) +
+          " per SM)");
+    }
+  };
   // ===== Launch Kernel 2 (recurrence) =====
 #if BLOCK_LEVEL_K2 >= 0
   if (mode & 2) {
@@ -238,6 +252,7 @@ void launch_fwd(
           cudaFuncSetAttribute(kernel,
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
                                k2tc::kSmemBytes);
+          require_resident(kernel, threads, k2tc::kSmemBytes, H * N);
           kernel<<<dim3(H, N), dim3(threads), k2tc::kSmemBytes, k2_stream>>>(
               v_ptr, beta_ptr, static_cast<float const*>(initial_state_ptr),
               static_cast<float*>(final_state_ptr), out_ptr, T_total, H, N,
@@ -283,7 +298,8 @@ void launch_fwd(
       constexpr bool kZeroV = decltype(zero_v_tag)::value;
       constexpr int kThreads = (kVD >= 64 ? 128 : (kVD / 16) * 32) + 2 * 32;
       using L = K2Layouts<D, CHUNK, kVD>;
-      using SharedStorageK2T = SharedStorageK2<L, kStages, kOutputStages>;
+      using SharedStorageK2T = SharedStorageK2<L, kStages, kOutputStages,
+                                               StateFP32 && kExact>;
       const int smem_size_k2 = int(sizeof(SharedStorageK2T));
       auto tma_load_v_vsplit =
           make_tma_copy(SM90_TMA_LOAD{}, m_v, typename L::TMAVOLayout{});
@@ -373,7 +389,8 @@ void launch_fwd(
       if (launch_vsplit(I64{}, S3{}, B1{}, exact_tag, No{}, No{}, 1)) return;
 
       using SharedStorageK2T =
-          SharedStorageK2<K2L, kInputStages, kOutputStages>;
+          SharedStorageK2<K2L, kInputStages, kOutputStages,
+                          StateFP32 && decltype(exact_tag)::value>;
       int smem_size_k2 = sizeof(SharedStorageK2T);
 
       auto kernel2 = _flash_kda_fwd_recurrence<
@@ -390,6 +407,7 @@ void launch_fwd(
       // K2 maps x to head so all heads of a sequence launch together.
       // Varlen reverses y in-kernel to process vLLM's trailing prefills first.
       dim3 grid_k2(H, N);
+      require_resident(kernel2, kK2Threads, smem_size_k2, H * N);
 
       kernel2<<<grid_k2, block_k2, smem_size_k2, k2_stream>>>(
           tma_load_v, tma_load_beta2, tma_load_initial_state,

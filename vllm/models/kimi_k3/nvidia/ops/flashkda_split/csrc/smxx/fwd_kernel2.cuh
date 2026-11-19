@@ -85,7 +85,8 @@ struct K2Layouts {
       prepend(FP32StateSmemLayout{}.layout_b())));
 };
 
-template <class Layouts, int InputStages, int OutputStages>
+template <class Layouts, int InputStages, int OutputStages,
+          bool ExactState = true>
 struct SharedStorageK2 {
   using BF16 = cutlass::bfloat16_t;
   using VOLayout = typename Layouts::VOLayout;
@@ -98,9 +99,10 @@ struct SharedStorageK2 {
   alignas(
       128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_acc;
   // Kimi-K3: low 16 bits of the fp32 state (ExactState I/O), state_acc then
-  // holds the high 16 bits.
-  alignas(
-      128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_lo;
+  // holds the high 16 bits. Without ExactState it is a stub, so the
+  // full-width K2 keeps FlashKDA's shared-memory footprint (two blocks per SM).
+  alignas(128) cute::ArrayEngine<
+      BF16, ExactState ? cute::cosize_v<StateSmemLayout> : 64> state_lo;
 
   struct InputStorage {
     alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<VOLayout>> v;
@@ -297,7 +299,8 @@ __global__ void __launch_bounds__(
   using TMAVOLayout = typename Layouts::TMAVOLayout;
   using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
   using TMAStateSmemLayout = typename Layouts::TMAStateSmemLayout;
-  using SharedStorageT = SharedStorageK2<Layouts, InputStages, OutputStages>;
+  using SharedStorageT =
+      SharedStorageK2<Layouts, InputStages, OutputStages, kExactState>;
 
   // --- shared memory
   extern __shared__ __align__(128) unsigned char shared_mem[];

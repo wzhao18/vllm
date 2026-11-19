@@ -48,9 +48,15 @@ __device__ __forceinline__ void k3_publish_tile(unsigned* flag) {
 }
 __device__ __forceinline__ void k3_acquire_tile(unsigned const* flag) {
   unsigned v;
+  long long spins = 0;
   do {
     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(flag)
                  : "memory");
+    if (++spins == (1ll << 27)) {
+      printf("k3_flashkda_split: tile flag %p never published (block %d %d)\n",
+             flag, int(blockIdx.x), int(blockIdx.y));
+      __trap();
+    }
   } while (v == 0);
   asm volatile("fence.proxy.async.global;" ::: "memory");
 }
