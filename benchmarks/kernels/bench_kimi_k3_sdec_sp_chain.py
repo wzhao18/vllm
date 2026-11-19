@@ -68,25 +68,32 @@ class Chain:
                 ws.append(tuple(t.to(device) for t in (norm, query, out)))
             self.w.append(ws)
 
-    def boundaries(self):
+    def boundaries(self, mx=False):
+        """``mx``: the MXFP8 forms (MXFP8 all-gather of every layer, the post-AttnRes
+        also writing an MXFP8 input scratch): the NVFP4 checkpoint's KDA layers."""
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
             sp_fused,
         )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import mxfp8
 
-        if getattr(self, "_b", None) is None:
-            self._b = []
+        key = "_bmx" if mx else "_b"
+        if getattr(self, key, None) is None:
+            bounds = []
+            scratch = mxfp8.Mxfp8Input(self.n, WIDTH, self.comm.device) if mx else None
             for layer in range(self.layers):
                 prev = cdiv(layer, BLOCK)
                 write = layer // BLOCK if layer % BLOCK == 0 else -1
                 eps = (1e-6, 1e-6)
-                self._b.append(sp_fused.SpBoundary(
+                bounds.append(sp_fused.SpBoundary(
                     self.comm, (self.w[layer][0], eps), (self.w[layer][1], eps),
                     prev, write, self.n, {self.rows: True}, layer == 0,
+                    gather_mx=mx, out_mx=scratch,
                 ))
-        return self._b
+            setattr(self, key, bounds)
+        return getattr(self, key)
 
-    def run_fused(self):
-        bounds = self.boundaries()
+    def run_fused(self, mx=False):
+        bounds = self.boundaries(mx)
         hidden = None
         for layer in range(self.layers):
             parity = layer % 2
@@ -153,8 +160,8 @@ class Chain:
     def run(self, variant):
         from vllm.models.kimi_k3.nvidia.ops.attn_res import attn_res
 
-        if variant == "fused":
-            return self.run_fused()
+        if variant in ("fused", "fused_mx"):
+            return self.run_fused(variant == "fused_mx")
 
         comm, n = self.comm, self.n
         prefix = self.prefix
@@ -266,7 +273,7 @@ def main():
             if rank == 0:
                 print(f"{key:>20}: graph {t.item():9.1f} us  "
                       f"{t.item() / args.layers:7.2f} us/layer", flush=True)
-            if args.profile and variant in ("full", "fused"):
+            if args.profile and variant in ("full", "fused", "fused_mx"):
                 from torch.profiler import ProfilerActivity, profile
 
                 dist.barrier()
