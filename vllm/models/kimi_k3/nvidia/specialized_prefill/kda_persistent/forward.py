@@ -68,6 +68,7 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    fused_conv: bool = False,
 ):
     key = (
         dev.index,
@@ -95,6 +96,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        fused_conv,
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -138,6 +140,8 @@ def _get_compiled(
         )
         mfl = torch.zeros(2, dtype=torch.int32, device=dev)
         tpr = torch.zeros(G * 64, dtype=torch.int64, device=dev)
+        cwg = torch.empty(2 * H * D // 8, 4, 8, dtype=torch.float32, device=dev)
+        chist = torch.empty(N, 3, 2 * H * D, dtype=bf, device=dev)
         out = torch.empty(T, H, D, dtype=bf, device=dev)
         nc2 = (T // 2 + C32 - 1) // C32
         exp_ws = torch.empty(H * nc2 * 64, 1, 256, dtype=bf, device=dev)
@@ -169,6 +173,8 @@ def _get_compiled(
                 mk(exp_ws),
                 mk(expt),
                 mk(tpr, 8),
+                from_dlpack(cwg, assumed_align=16),
+                mk(chist),
                 cutlass.Int64(0),
                 cutlass.Int32(1),
                 cutlass.Int32(G),
@@ -202,6 +208,7 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                FUSED_CONV_=1 if fused_conv else 0,
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
@@ -238,6 +245,58 @@ def _dummy_mid(dev: torch.device):
         )
         _DUMMY_MID[key] = tensors
     return tensors
+
+
+def conv_weight_groups(weight: torch.Tensor, H: int) -> torch.Tensor:
+    """Q|K conv weights (>= 2 H D, 4) FP32 as the kernel's (2 H D / 8, 4, 8)
+    groups: 8 channels x 4 taps, tap-major."""
+    w = weight[: 2 * H * D].float()
+    return w.view(2 * H * D // 8, 8, 4).transpose(1, 2).contiguous()
+
+
+def conv_qk_history(
+    x: torch.Tensor,
+    conv_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    H: int,
+) -> torch.Tensor:
+    """History rows (positions -3..-1) of the Q|K channels per sequence, then
+    the conv state update of those channels (the last 3 raw rows, shifted in
+    after the old state for sequences shorter than 3), as qkv_conv does.
+
+    x: (T, >= 2 H D) raw BF16 rows; conv_states: (lines, >= 2 H D, >= 3).
+    Returns (N, 3, 2 H D) BF16."""
+    P2 = 2 * H * D
+    lines = cache_indices.long()
+    old = conv_states[lines, :P2, :3].float()  # (N, P2, 3)
+    old = old * has_initial_state.view(-1, 1, 1).to(old.dtype)
+    hist = old.transpose(1, 2).to(torch.bfloat16).contiguous()
+    starts = cu_seqlens[:-1].long()
+    lens = cu_seqlens[1:].long() - starts
+    j = torch.arange(3, device=x.device)
+    src = lens.view(-1, 1) - 3 + j.view(1, 3)  # (N, 3) position in sequence
+    rows = x[(starts.view(-1, 1) + src.clamp_min(0)).view(-1), :P2].view(-1, 3, P2)
+    hist_shift = torch.gather(
+        hist.float(), 1, (src + 3).clamp(0, 2).view(-1, 3, 1).expand(-1, 3, P2)
+    )
+    new = torch.where((src >= 0).view(-1, 3, 1), rows.float(), hist_shift)
+    conv_states[lines, :P2, :3] = new.transpose(1, 2).to(conv_states.dtype)
+    return hist
+
+
+_DUMMY_CONV: dict = {}
+
+
+def _dummy_conv(H: int, dev: torch.device):
+    key = (dev.index, H)
+    if key not in _DUMMY_CONV:
+        _DUMMY_CONV[key] = (
+            torch.zeros(2 * H * D // 8, 4, 8, dtype=torch.float32, device=dev),
+            torch.zeros(1, 3, 2 * H * D, dtype=torch.bfloat16, device=dev),
+        )
+    return _DUMMY_CONV[key]
 
 
 def _tprobe_buf(G: int, dev: torch.device):
@@ -288,6 +347,7 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    conv=None,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -359,7 +419,9 @@ def _launch_forward(
         cluster_size=cluster_size,
         gate_roll=gate_roll,
         partial_tma=partial_tma,
+        fused_conv=conv is not None,
     )
+    conv_wg, conv_hist = conv if conv is not None else _dummy_conv(H, dev)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
         qf,
@@ -384,6 +446,8 @@ def _launch_forward(
         exp_ws,
         expt,
         _tprobe_buf(G, dev),
+        conv_wg,
+        conv_hist,
         0,
         have_state,
         G,
@@ -623,7 +687,11 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     plan=None,
+    conv=None,
 ):
+    """``conv``: optional (weights (2 H D / 8, 4, 8) FP32, history (N, 3, 2 H D)
+    BF16) from ``conv_prep``: q and k are then the raw (pre-conv) planes and
+    the kernel applies the width-4 conv + SiLU to them in its prep phase."""
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
         cu32,
@@ -674,5 +742,6 @@ def fwd(
         lower_bound_m5=lower_bound == -5.0,
         approximate_split=False,
         gate_roll=not fixed,
-        partial_tma=not fixed,
+        partial_tma=(not fixed) or conv is not None,
+        conv=conv,
     )

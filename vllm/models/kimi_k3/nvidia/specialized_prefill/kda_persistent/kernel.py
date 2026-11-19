@@ -198,6 +198,8 @@ def _pkd(
     mflags: cute.Tensor,
     expt: cute.Tensor,
     tprobe: cute.Tensor,
+    conv_wg: cute.Tensor,
+    conv_hist: cute.Tensor,
     failure_addr: cutlass.Int64,
     have_state: cutlass.Int32,
     do_export: cutlass.Int32,
@@ -232,6 +234,7 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    FUSED_CONV_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -2049,6 +2052,110 @@ def _pkd(
                     # the 48-reg prep diet spills, reconfirming the v60 re-roll)
                     if tma:
                         cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
+                    if cutlass.const_expr(FUSED_CONV_ == 1):
+                        # Width-4 causal conv + SiLU of the raw q/k tiles, in
+                        # place (the qkv_conv arithmetic: FP32 weights, FMA
+                        # chain oldest tap first, SiLU, BF16 rounding).
+                        # Thread = (plane, 8-channel group, 8-row quarter):
+                        # the 3 halo rows are read first (tile rows, else raw
+                        # global rows of the sequence, else the conv history
+                        # of the sequence), then each thread slides over its
+                        # own rows and overwrites them.
+                        cpl = ptl >> 6
+                        csg = ptl & 15
+                        crq = (ptl >> 4) & 3
+                        cgrp = cpl * (H_ * D // 8) + hidx * (D // 8) + csg
+                        cseq0 = cutlass.Int32(cu[seq_idx])
+                        ch0 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                        ch1 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                        ch2 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                        ccur = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                        cw4 = cute.make_rmem_tensor((4,), cutlass.Float32)
+                        cacc = cute.make_rmem_tensor((4,), cutlass.Float32)
+                        for cj in cutlass.range_constexpr(3):
+                            clr = crq * 8 - 3 + cj
+                            cdst = ch0 if cj == 0 else (ch1 if cj == 1 else ch2)
+                            if clr >= 0:
+                                if cpl == 0:
+                                    cute.autovec_copy(
+                                        v_ki8[(clr, None, csg & 7, csg >> 3, inst)], cdst
+                                    )
+                                else:
+                                    cute.autovec_copy(
+                                        v_kd8[(clr, None, csg & 7, csg >> 3, inst)], cdst
+                                    )
+                            else:
+                                ctok = r0 + clr
+                                if ctok >= cseq0:
+                                    if cpl == 0:
+                                        cute.autovec_copy(
+                                            cute.local_tile(q, (1, 1, 8), (ctok, hidx, csg)),
+                                            cdst,
+                                        )
+                                    else:
+                                        cute.autovec_copy(
+                                            cute.local_tile(k, (1, 1, 8), (ctok, hidx, csg)),
+                                            cdst,
+                                        )
+                                else:
+                                    cute.autovec_copy(
+                                        cute.local_tile(
+                                            conv_hist,
+                                            (1, 1, 8),
+                                            (seq_idx, 3 + ctok - cseq0, cgrp),
+                                        ),
+                                        cdst,
+                                    )
+                        ibar.arrive_and_wait()
+                        for crr in cutlass.range_constexpr(8):
+                            clr = crq * 8 + crr
+                            if cpl == 0:
+                                cute.autovec_copy(
+                                    v_ki8[(clr, None, csg & 7, csg >> 3, inst)], ccur
+                                )
+                            else:
+                                cute.autovec_copy(
+                                    v_kd8[(clr, None, csg & 7, csg >> 3, inst)], ccur
+                                )
+                            cout = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                            for chf in cutlass.range_constexpr(2):
+                                for ctap in cutlass.range_constexpr(4):
+                                    cute.autovec_copy(
+                                        cute.local_tile(
+                                            conv_wg, (1, 1, 4), (cgrp, ctap, chf)
+                                        ),
+                                        cw4,
+                                    )
+                                    csrc = (
+                                        ch0
+                                        if ctap == 0
+                                        else (ch1 if ctap == 1 else (ch2 if ctap == 2 else ccur))
+                                    )
+                                    for cu4 in cutlass.range_constexpr(4):
+                                        cx = cutlass.Float32(csrc[chf * 4 + cu4])
+                                        if cutlass.const_expr(ctap == 0):
+                                            cacc[cu4] = cx * cw4[cu4]
+                                        else:
+                                            cacc[cu4] = cx * cw4[cu4] + cacc[cu4]
+                                for cu4 in cutlass.range_constexpr(4):
+                                    ca = cacc[cu4]
+                                    cd = _exp2f(ca * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
+                                    cout[chf * 4 + cu4] = cutlass.BFloat16(
+                                        ca * cute.math.rcp(cd, approx=True, ftz=True)
+                                    )
+                            if cpl == 0:
+                                cute.autovec_copy(
+                                    cout, v_ki8[(clr, None, csg & 7, csg >> 3, inst)]
+                                )
+                            else:
+                                cute.autovec_copy(
+                                    cout, v_kd8[(clr, None, csg & 7, csg >> 3, inst)]
+                                )
+                            for cu8 in cutlass.range_constexpr(8):
+                                ch0[cu8] = ch1[cu8]
+                                ch1[cu8] = ch2[cu8]
+                                ch2[cu8] = ccur[cu8]
+                        ibar.arrive_and_wait()
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
                         # four-row half-warp pairing. QK_ROWPAIR_ only selects
@@ -2402,6 +2509,8 @@ def _launch_pkd(
     exp_ws: cute.Tensor,
     expt: cute.Tensor,
     tprobe: cute.Tensor,
+    conv_wg: cute.Tensor,
+    conv_hist: cute.Tensor,
     failure_addr: cutlass.Int64,
     have_state: cutlass.Int32,
     gcnt: cutlass.Int32,
@@ -2435,6 +2544,7 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    FUSED_CONV_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2625,6 +2735,8 @@ def _launch_pkd(
         mflags,
         expt,
         tprobe,
+        conv_wg,
+        conv_hist,
         failure_addr,
         have_state,
         do_export,
@@ -2659,6 +2771,7 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        FUSED_CONV_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
