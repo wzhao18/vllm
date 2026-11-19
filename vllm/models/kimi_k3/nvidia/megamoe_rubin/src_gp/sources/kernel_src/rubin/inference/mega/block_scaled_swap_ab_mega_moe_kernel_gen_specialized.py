@@ -442,6 +442,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     self.promised_launchable_sm_count if self.reduce_acquires_producer_done else None
                 ),
                 norm_split=self.reduce_norm_split,
+                early_gate=self.reduce_launches_early,
             )
         )
 
@@ -449,6 +450,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     # (448 threads x 128 registers at hidden 3584) needs an empty SM, so it waits for this grid's CTAs to exit;
     # quarter-row CTAs fit beside them and the reduce spreads over every SM.
     reduce_norm_split: ClassVar[int] = 4
+    # vLLM-local: release the fused-RMSNorm reduce at this kernel's entry instead of its tail, so its CTAs are
+    # resident (gated on producer_done, see TopkReduce ``early_gate``) when the last combine cells land.
+    early_reduce_launch: ClassVar[bool] = True
+
+    @property
+    def reduce_launches_early(self) -> bool:
+        return self.early_reduce_launch and self.reduce_acquires_producer_done and self.reduce_norm_split > 1
 
     @property
     def reduce_acquires_producer_done(self) -> bool:
@@ -683,7 +691,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             device_workspace.register(
                 self.producer_done_region,
                 cutlass.Int32,
-                (1,),
+                (2,),
                 buffer_space="local",
                 byte_alignment=16,
                 reset="zero_on_first_allocate",
@@ -1633,6 +1641,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             self._smem_workspace, smem_base, cta_coord_in_cluster, hidden, intermediate_gateup
         )
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        if cutlass.const_expr(self.reduce_launches_early):
+            # The gated reduce may be resident from here on (every CTA of this grid is already resident).
+            cute.arch.griddepcontrol_launch_dependents()
 
         if warp_idx == self.scheduler_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
