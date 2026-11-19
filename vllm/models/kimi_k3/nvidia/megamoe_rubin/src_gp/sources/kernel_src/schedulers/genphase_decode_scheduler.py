@@ -461,6 +461,7 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             owner_count=self.die_count,
             expert_half=self.expert_half,
             expert_remap=expert_remap if self.expert_half else None,
+            sizes_load_sorted=True,  # the GenPhase communication grid ranks slots by descending load
         )
         self._source = Int32(0)
         self._assign_shared_expert_stream(block_idx, device_workspace)

@@ -1009,6 +1009,7 @@ class PhaseInterleavedFc12MappingState:
         owner_count: int = 1,  # die-aware owners (dies)
         expert_half: bool = False,
         expert_remap: Optional[cute.Tensor] = None,  # slot -> expert, expert_half only
+        sizes_load_sorted: bool = False,
     ) -> None:
         if type(dfc1_m_group) is not int or dfc1_m_group not in (1, 16):
             raise ValueError("dfc1_m_group must be 1 or 16")
@@ -1020,6 +1021,9 @@ class PhaseInterleavedFc12MappingState:
         self.owner_count = owner_count
         self.expert_half = expert_half
         self.expert_remap = expert_remap
+        # Slots hold descending loads (every non-empty slot precedes every empty one): a cursor that reaches an
+        # empty slot has reached the end of its stream, so a seek stops there instead of walking the empty tail.
+        self.sizes_load_sorted = sizes_load_sorted
         self.expert_count = expert_count
         self.mapping_cta_tile_shape_mnk = mapping_cta_tile_shape_mnk
         self.mapping_cluster_shape_mn = mapping_cluster_shape_mn
@@ -1093,6 +1097,7 @@ class PhaseInterleavedFc12MappingState:
             owner_count=self.owner_count,
             expert_half=self.expert_half,
             expert_remap=expert_remap,
+            sizes_load_sorted=self.sizes_load_sorted,
         )
         if value_index != len(values):
             raise ValueError(
@@ -1134,6 +1139,7 @@ def create_phase_interleaved_fc12_mapping_state(
     owner_count: int = 1,
     expert_half: bool = False,
     expert_remap: Optional[cute.Tensor] = None,
+    sizes_load_sorted: bool = False,
 ) -> PhaseInterleavedFc12MappingState:
     """Create independent monotonic mapping cursors for the FC1 and FC2 streams."""
     mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
@@ -1162,6 +1168,7 @@ def create_phase_interleaved_fc12_mapping_state(
         owner_count=owner_count,
         expert_half=expert_half,
         expert_remap=expert_remap,
+        sizes_load_sorted=sizes_load_sorted,
     )
 
 
@@ -1237,6 +1244,9 @@ def _seek_phase_cursor(
         cursor = _advance_phase_cursor(cursor, mapping_state)
         expert_tile_end = cursor.expert_tile_end
         next_expert_idx = cursor.expert_idx + Int32(1)
+        if cutlass.const_expr(mapping_state.sizes_load_sorted):
+            if cursor.current_expert_token_count == Int32(0):
+                next_expert_idx = Int32(mapping_state.expert_count)
     return cursor
 
 
