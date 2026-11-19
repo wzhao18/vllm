@@ -257,6 +257,7 @@ __global__ void __launch_bounds__(kThreads, 1)
         const int seg = g >= split0 ? 1 : 0;
         const bool first = (g == begin) || (g == split0);
         mbar_wait(full0 + 8 * s, ph);
+        if (i + 1 == n_kb) STAMP(7);  // last stage's operands landed
         asm volatile("tcgen05.fence::after_thread_sync;");
         const uint32_t st = ring_s + s * stage_bytes;
         const uint64_t a = smem_desc(st), bd = smem_desc(st + kWBox);
