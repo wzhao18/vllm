@@ -12,18 +12,21 @@ rows, a DcpMailbox beside it (r1.DsaBox)."""
 import math
 from functools import cache
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 import torch.distributed._symmetric_memory as symm_mem
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
 from ...symm import peer_rendezvous
+from ..common import tensormap
 from ..common.host import fake
 from ..common.policy import batch_table
 from ..common.primitives import (
     alloc,
+    asm,
     at,
     bf16x2,
     bits_float,
@@ -44,6 +47,17 @@ from ..common.primitives import (
     warp_sum,
     zeros,
 )
+from .sparse_mla import (
+    SDESC_SW128,
+    fence_mbar_init,
+    ld_shared_u32,
+    mbar_arrive_tx,
+    mbar_init,
+    mbar_wait,
+    tc_commit,
+    tc_fence_after,
+    tc_fence_before,
+)
 
 LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends
 # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.
@@ -59,6 +73,64 @@ PROJECTED = "proj"
 # GB300 DcpValue at 320 rows: 16 -> 64.7 us, 32 -> 55.7, 64 -> 54.6, but 64 loses
 # 1-2 us at 80-160 rows).
 PROJ_ROWS = 32
+# "proj" above PROJ_ROWS rows: the projection on tcgen05 (kind::f16, BF16 in, FP32
+# accumulation; the legacy mma.sync path runs at a quarter of its rate): units of
+# (gathered head, 128 rows) [128 x 512] x [512 x 128] spread over every CTA, K in
+# 64-element blocks through a TMA ring (A: the latent rows, B: the head's W_UV).
+TC_STAGES = 4
+TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
+# kind::f16: FP32 D, BF16 A and B (K-major), N = 128, M = 128
+TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
+
+
+def projects_on_tc(batch):
+    """Whether a DSA "proj" DcpValue of ``batch`` rows projects on tcgen05 itself
+    (dcp_stage then passes the gathered W_UV, not the bmm's value rows)."""
+    return batch > PROJ_ROWS
+
+
+@asm()
+def _tma3d(dst, tmap, bar, c0, c1, c2):
+    code = (
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx"
+        "::bytes [$0], [$1, {$3, $4, $5}], [$2];"
+    )
+    return code, "r,l,r,r,r,r,~{memory}", (
+        Uint32(dst), Int64(tmap), Uint32(bar), Int32(c0), Int32(c1), Int32(c2))
+
+
+@asm()
+def _mma_f16(d, a, b, idesc, acc):
+    code = (
+        "{ .reg .pred p; setp.ne.b32 p, $4, 0; "
+        "tcgen05.mma.cta_group::1.kind::f16 [$0], $1, $2, $3, p; }"
+    )
+    return code, "r,l,l,r,r,~{memory}", (
+        Uint32(d), Uint64(a), Uint64(b), Uint32(idesc), Uint32(acc))
+
+
+@asm()
+def _tmem_alloc128(dst):
+    code = (
+        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [$0], 128; "
+        "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"
+    )
+    return code, "r,~{memory}", (Uint32(dst),)
+
+
+@asm()
+def _tmem_free128(taddr):
+    return ("tcgen05.dealloc.cta_group::1.sync.aligned.b32 $0, 128;", "r,~{memory}",
+            (Uint32(taddr),))
+
+
+@asm()
+def _tmem_ld32(addr):
+    regs = ",".join(f"${i}" for i in range(32))
+    code = (f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{regs}}}, [$32]; "
+            "tcgen05.wait::ld.sync.aligned;")
+    return code, ",".join(["=f"] * 32 + ["r", "~{memory}"]), (Uint32(addr),), (
+        Float32,) * 32
 # Both formats are exact up to BF16 rounding (no lossy 8-bit partials).
 FORMATS = ("bf16", PROJECTED)
 # The default exchange per layer kind. K3.1 DSA: the one automatic policy
@@ -191,6 +263,7 @@ class DcpValue:
         assert partials in FORMATS, partials
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
+        self.tc = False
         self.preprojected = preprojected and self.projected
         self.rearm_q = rearm
         # Rows with nothing to merge send only their LSE (neither polled nor
@@ -206,6 +279,15 @@ class DcpValue:
         if self.projected:
             # Rows each projecting step stages and pushes (16-row MMA blocks).
             self.prows = min(PROJ_ROWS, tiles * 16)
+            # Above one step the projection runs on tcgen05 (TC_IDESC) in units of
+            # (gathered head, 128 rows) over every CTA (grid <= SMs), which then
+            # merge; no CTA waits before its units (see the class docstring).
+            self.tc = not self.preprojected and per_row and projects_on_tc(batch)
+            if self.tc:
+                self.mtiles = -(-batch // 128)
+                self.units = size * heads * self.mtiles
+                self.grid = (heads, max(1, sms // heads), 1)
+                return
             merge = min(tiles, max(1, (sms - size * heads) // heads))
             self.grid = (heads, size + merge, 1)
             # One CTA per SM at most (the progress argument above).
@@ -220,8 +302,26 @@ class DcpValue:
 
     @cute.jit
     def __call__(self, *args):
-        kernel = self.kernel_projected if self.projected else self.kernel
-        launch(kernel, args, self.grid, 512)
+        if cutlass.const_expr(self.projected and self.tc):
+            rows, w_uv = args[0], args[8]
+            bf = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+            sw = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+            l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+            # A: latent rows of one gathered head [128 rows x 64]; B: its W_UV
+            # [128 outputs x 64] (latent-contiguous, gather_heads' layout)
+            am = tensormap.encode_map(
+                rows.iterator.toint(), bf, (512, self.q_heads, self.batch),
+                (1024, self.q_heads * 1024), (64, 1, 128), sw, l2)
+            bm = tensormap.encode_map(
+                w_uv.iterator.toint(), bf, (512, 128, self.size * self.heads),
+                (1024, 128 * 1024), (64, 128, 1), sw, l2)
+            # The descriptors are grid-constant parameters (not tuple members, which
+            # the kernel would copy to local memory, an invalid TMA source).
+            self.kernel_tc(args[:-1], am, bm).launch(
+                grid=self.grid, block=(512, 1, 1), stream=args[-1], use_pdl=True)
+        else:
+            kernel = self.kernel_projected if self.projected else self.kernel
+            launch(kernel, args, self.grid, 512)
 
     @cute.jit
     def rearm(self, mailbox, me, threads):
@@ -331,6 +431,115 @@ class DcpValue:
             cute.arch.griddepcontrol_launch_dependents()
             for t in range(y - D, self.tiles, merges):
                 self.merge_projected(args, scales, tid, t)
+
+    @cute.kernel
+    def kernel_tc(self, args, am: tensormap.GridMap, bm: tensormap.GridMap):
+        """"proj" above PROJ_ROWS rows: CTA c = y H + head projects units c, c + G,
+        .. (unit u: gathered head u % (DCP H), rows 128 (u // (DCP H)) ..) on
+        tcgen05 and pushes the value rows and LSEs to the heads' owners (warp 0 the
+        TMA ring, warp 1 the MMAs, warps 0-3 the epilogue, thread = row), then
+        merges tiles y, y + grid[1], .. of head ``head``."""
+        rows_lse, lens, box, _, peers, lpeers, mailbox = args[1:8]
+        parity, rank = args[12], args[13]
+        H, D, B = self.heads, self.size, self.batch
+        G: cutlass.Constexpr = H * self.grid[1]
+        DH: cutlass.Constexpr = D * H
+        cap = box.shape[1]
+        smem = cutlass.utils.SmemAllocator()
+        scales = alloc(smem, Float32, (16, D))
+        ring = Uint32(smem.allocate_array(
+            Uint8, TC_STAGES * TC_STAGE + 128, byte_alignment=1024).toint())
+        bars = ring + Uint32(TC_STAGES * TC_STAGE)
+        done, slot_addr = bars + Uint32(16 * TC_STAGES), bars + Uint32(16 * TC_STAGES + 8)
+        tid, _, _ = cute.arch.thread_idx()
+        head, y, _ = cute.arch.block_idx()
+        lane = tid % 32
+        warp = cute.arch.make_warp_uniform(tid // 32)
+        c = y * H + head
+        if tid == 0:
+            for st in cutlass.range_constexpr(TC_STAGES):
+                mbar_init(bars + Uint32(8 * st), Uint32(1))
+                mbar_init(bars + Uint32(8 * (TC_STAGES + st)), Uint32(1))
+            mbar_init(done, Uint32(1))
+            fence_mbar_init()
+        tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
+        # Allocate TMEM only once the predecessor grid is complete: under PDL its
+        # CTAs may still be resident here and allocate TMEM after this CTA would.
+        cute.arch.griddepcontrol_wait()
+        if warp == 0:
+            _tmem_alloc128(slot_addr)
+        tc_fence_before()
+        cute.arch.sync_threads()
+        tc_fence_after()
+        taddr = ld_shared_u32(slot_addr)
+        kc = Int32(0)
+        uc = Int32(0)
+        for u in range(c, self.units, G):
+            gh = u % DH
+            t0 = (u // DH) * 128
+            if warp == 0:
+                if lane == 0:
+                    for k in cutlass.range_constexpr(8):
+                        st = (kc + k) % TC_STAGES
+                        ph = ((kc + k) // TC_STAGES) & 1
+                        full = bars + Uint32(8) * Uint32(st)
+                        mbar_wait(bars + Uint32(8) * Uint32(TC_STAGES + st), ph ^ 1)
+                        mbar_arrive_tx(full, Uint32(TC_STAGE))
+                        dst = ring + Uint32(TC_STAGE) * Uint32(st)
+                        _tma3d(dst, tm_a, full, 64 * k, gh, t0)
+                        _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k, 0, gh)
+            if warp == 1:
+                if lane == 0:
+                    for k in cutlass.range_constexpr(8):
+                        st = (kc + k) % TC_STAGES
+                        ph = ((kc + k) // TC_STAGES) & 1
+                        mbar_wait(bars + Uint32(8) * Uint32(st), ph)
+                        tc_fence_after()
+                        src = ring + Uint32(TC_STAGE) * Uint32(st)
+                        for kk in cutlass.range_constexpr(4):
+                            ad = Uint64(SDESC_SW128) | Uint64((src + Uint32(32 * kk)) >> 4)
+                            bd = Uint64(SDESC_SW128) | Uint64(
+                                (src + Uint32(TC_STAGE // 2 + 32 * kk)) >> 4)
+                            _mma_f16(taddr, ad, bd, Uint32(TC_IDESC),
+                                     Uint32(1 if k + kk > 0 else 0))
+                        tc_commit(bars + Uint32(8) * Uint32(TC_STAGES + st))
+                    tc_commit(done)
+            kc = kc + 8
+            if warp < 4:
+                mbar_wait(done, uc & 1)
+                tc_fence_after()
+                t = t0 + 32 * warp + lane
+                live = t < B
+                lse = Float32(EMPTY_LSE)
+                if live:
+                    lse = self.sent_lse(rows_lse, lens, t, gh)
+                owner = gh // H
+                slot = ((parity * D + rank) * cap + t) * H + gh % H
+                send = live & (lse > Float32(EMPTY_LSE))
+                for c4 in cutlass.range_constexpr(4):  # (warp-collective TMEM loads)
+                    v = _tmem_ld32(taddr + (Uint32(32 * warp) << Uint32(16))
+                                   + Uint32(32 * c4))
+                    if send:
+                        words = [pack_pair(v[2 * i], v[2 * i + 1], policy="latent")
+                                 for i in range(16)]
+                        for q4 in cutlass.range_constexpr(4):
+                            target = peers[owner] + (Int64(slot) * 128
+                                                     + 32 * c4 + 8 * q4) * 2
+                            store_relaxed(target, tuple(words[4 * q4: 4 * q4 + 4]))
+                if live:
+                    store_relaxed(lpeers[owner] + Int64(slot) * 4, (float_bits(lse),))
+                tc_fence_before()
+            cute.arch.sync_threads()  # TMEM is read: the next unit may overwrite it
+            uc = uc + 1
+        # Free TMEM before the dependents launch: a dependent CTA placed on this SM
+        # while the merge spins may require TMEM column 0 (exclusive allocators).
+        if warp == 0:
+            tc_fence_after()
+            _tmem_free128(taddr)
+        self.rearm(mailbox, c * 512 + tid, G * 512)
+        cute.arch.griddepcontrol_launch_dependents()
+        for t in range(y, self.tiles, self.grid[1]):
+            self.merge_projected(args, scales, tid, t)
 
     @cute.jit
     def push_values(self, args, gh, tid):
