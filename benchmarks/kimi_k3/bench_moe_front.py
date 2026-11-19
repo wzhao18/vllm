@@ -120,6 +120,7 @@ def main():
     ap.add_argument("--busy-us", type=float, default=6.0)
     ap.add_argument("--cfg", action="append", default=[])
     ap.add_argument("--no-base", action="store_true")
+    ap.add_argument("--debug", type=int, default=0)
     ap.add_argument("--carveout", type=int, default=-1, help="producer preferred smem carveout (-1 default)")
     args = ap.parse_args()
     dev = torch.device("cuda")
@@ -188,7 +189,7 @@ def main():
         # producer's end, median over CTAs.
         c = cfgs[0]
         grid = 35 * c[0]
-        st = torch.zeros(grid * 8, dtype=torch.int64, device=dev)
+        st = torch.zeros(grid * 328 + args.debug, dtype=torch.int64, device=dev)
         end = torch.zeros(1, dtype=torch.int64, device=dev)
         def stamped():
             pm.prod(src, h, busy, end, carve)
@@ -204,16 +205,38 @@ def main():
             st.zero_()
             g.replay()
             torch.cuda.synchronize()
-        s = (st.view(grid, 8).double() - float(end.item())) / 1000.0
-        names = ["entry", "x-wait", "lastMMA", "accum", "reduced", "topk-go", "end"]
+        sv = st[: grid * 328].view(grid, 328)
+        s = (sv.double() - float(end.item())) / 1000.0
+        names = ["entry", "x-wait", "lastMMA", "accum", "reduced", "topk-go", "end"]  # globaltimer
         parts = []
         for i, nm in enumerate(names):
             v = s[:, i]
-            v = v[st.view(grid, 8)[:, i] != 0]
+            v = v[sv[:, i] != 0]
             if v.numel():
                 parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
         print(f"  stamps n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
               flush=True)
+        for cta in (0, grid - 1):
+            raw = sv[cta].double()
+            # clock stamps -> us after the producer end via the CTA's entry/end pairs
+            hz = (raw[199] - raw[7]) / max(float(raw[6] - raw[0]), 1.0)  # cycles per ns
+            row = s[cta].clone()
+            for i in list(range(8, 198)) + list(range(200, 328)):
+                if sv[cta, i] != 0:
+                    row[i] = s[cta, 0] + (raw[i] - raw[7]) / hz / 1000.0
+            ok = sv[cta] != 0
+            print(f"  cta{cta} clock {hz.item():.3f} GHz; W slots landed at dependency release: {int(sv[cta, 198]):b}")
+            row[198] = 0
+            xr = [f"{row[8 + i].item():.1f}" for i in range(64) if ok[8 + i]]
+            wr = [f"{row[72 + i].item():.1f}" for i in range(64) if ok[72 + i]]
+            wi = [f"{row[136 + i].item():.1f}" for i in range(64) if ok[136 + i]]
+            mi = [f"{row[200 + i].item():.1f}" for i in range(64) if ok[200 + i]]
+            print(f"  cta{cta} mma-issued {' '.join(mi)}")
+            xi = [f"{row[264 + i].item():.2f}" for i in range(64) if ok[264 + i]]
+            print(f"  cta{cta} x-issue {' '.join(xi)}")
+            print(f"  cta{cta} x-ready {' '.join(xr)}")
+            print(f"  cta{cta} W-ready {' '.join(wr)}")
+            print(f"  cta{cta} W-issue {' '.join(wi)}", flush=True)
 
 
 if __name__ == "__main__":

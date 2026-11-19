@@ -71,9 +71,25 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded):
     torch.accelerator.synchronize()
     ref_y = (h.double() @ w.double().t()).float()
     assert torch.isfinite(y).all()
-    err = ((y - ref_y).abs() / (ref_y.abs() + 1.0)).max().item()
-    # Tensor-core FP32 accumulation is not IEEE-exact (cuBLAS: the same class).
-    assert err < 2e-3, f"GEMM rows: max scaled error {err}"
+    # Error relative to the sum of |products| (the accumulation's own scale: the test
+    # weights include 1e3-scaled rows whose dot products cancel).
+    mag = (h.double().abs() @ w.double().abs().t()).float() + 1e-3
+
+    def scaled(a):
+        return ((a - ref_y).abs() / mag).max().item()
+
+    # Tensor-core FP32 accumulation is not IEEE-exact: hold it to cuBLAS's error on
+    # the same BF16 -> FP32 GEMM (the stock router path).
+    cublas = scaled(torch.mm(h, w.t(), out_dtype=torch.float32))
+    err = scaled(y)
+    where = ""
+    if err > max(4.0 * cublas, 1e-5):  # where (debug aid in the assertion message)
+        e = (y - ref_y).abs() / mag
+        tiles = e.amax(dim=0).view(-1, 128).amax(dim=1)
+        bad = (tiles > 2.0 * cublas).nonzero().flatten().tolist()
+        r, c = divmod(int(e.argmax()), e.shape[1])
+        where = f"; bad 128-col tiles {bad}; worst row {r} col {c} y {y[r, c].item()} ref {ref_y[r, c].item()}"
+    assert err <= max(4.0 * cublas, 1e-5), f"GEMM rows: scaled error {err} vs cuBLAS {cublas}{where}"
     assert cnt.eq(0).all(), f"counters not reset: {cnt.tolist()}"
 
     ref = _buffers(nvfp4, dev)

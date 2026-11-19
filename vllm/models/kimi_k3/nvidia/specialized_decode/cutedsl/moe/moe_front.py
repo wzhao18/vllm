@@ -57,9 +57,17 @@ namespace k3front {
 
 constexpr int kThreads = kWarps * 32;  // 256: w0/w2/w3 weight TMA, w1 MMA, w5 tokens, w4-7 TMEM
 constexpr int kWBox = 128 * 128;       // one 128 x 64 BF16 weight box
+// Tokens are the MMA M operand (128 rows; rows >= n are the TMA's zero fill) and a
+// 128-row weight tile the N operand. A tcgen05 MMA occupies the tensor pipe for a
+// time set by M and its operand bytes, not by tiny N: weights-as-M with N = n tokens
+// (the swap-AB form) ran one M128 N32 K16 MMA per ~250 clk, 4x below this form.
+constexpr int kXRows = 128;
 constexpr int kMaxW = 24;
 constexpr int kMaxX = 8;
 constexpr int kMaxC = 8;
+// Diagnostic stamps per CTA: [0, 8) phases, [8, 72) token-ready per K block, [72, 136)
+// weight-ready per K block, [136, 200) weight-issue per weight slot group.
+constexpr int kStampStride = 328;
 
 struct Params {
   Args a;            // route_stage's arguments (y = router logits rows, ldy)
@@ -68,6 +76,7 @@ struct Params {
   unsigned long long* stamps;  // [grid][8] globaltimer or null
   int k, bn, tiles, rtiles, kb, csize, wst, xst, nprod, xg;
   int wg;  // K blocks per weight slot (one barrier, wg x 16 KB)
+  int debug;  // microbench probes only (0 in production): bit 0 skips the MMAs
   int yfull;  // test hook: y also holds the FP32 latent columns (y.size(1) >= E + L)
 };
 
@@ -90,12 +99,47 @@ __device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
       "r"(parity)
       : "memory");
 }
+// For long waits: one polling thread that backs off, so the waiting warps do not take
+// shared-memory/barrier bandwidth from the issuing threads (measured: 128 spinning
+// threads stretched every TMA issue and MMA round to ~0.3-0.45 us).
+__device__ __forceinline__ void mbar_wait_sleep(uint32_t bar, uint32_t parity) {
+  uint32_t done = 0;
+  while (true) {
+    asm volatile(
+        "{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; "
+        "selp.u32 %0, 1, 0, p; }"
+        : "=r"(done)
+        : "r"(bar), "r"(parity)
+        : "memory");
+    if (done) break;
+    __nanosleep(128);
+  }
+}
 __device__ __forceinline__ void tma_2d(uint32_t dst, const CUtensorMap* map, int c0,
                                        int c1, uint32_t bar) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
       " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(bar)
+      : "memory");
+}
+// 3-D maps {64 columns, rows, K blocks}: one op = box[2] consecutive K blocks of a
+// row range, stored as consecutive [rows][64] SWIZZLE_128B tiles.
+__device__ __forceinline__ void tma_3d(uint32_t dst, const CUtensorMap* map, int row,
+                                       int kb, uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(0), "r"(row), "r"(kb), "r"(bar)
+      : "memory");
+}
+__device__ __forceinline__ void tma_3d_ef(uint32_t dst, const CUtensorMap* map, int row,
+                                          int kb, uint32_t bar) {
+  asm volatile(
+      "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+      ".L2::cache_hint [%0], [%1, {%2, %3, %4}], [%5], pol; }" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(0), "r"(row), "r"(kb), "r"(bar)
       : "memory");
 }
 __device__ __forceinline__ void tma_2d_ef(uint32_t dst, const CUtensorMap* map, int c0,
@@ -170,9 +214,15 @@ __device__ __forceinline__ unsigned long long globaltimer() {
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
 }
+// Per-K-block stamps: SM clock (cheap); phases: globaltimer. Slot 7 / 199 hold the
+// clock at entry / end for the conversion.
+#define STAMPC(i) \
+  do { \
+    if (p.stamps) p.stamps[blockIdx.x * kStampStride + (i)] = clock64(); \
+  } while (0)
 #define STAMP(i) \
   do { \
-    if (p.stamps) p.stamps[blockIdx.x * 8 + (i)] = globaltimer(); \
+    if (p.stamps) p.stamps[blockIdx.x * kStampStride + (i)] = globaltimer(); \
   } while (0)
 
 __host__ __device__ inline int ring_w_bytes(int bn, int wst) {
@@ -211,7 +261,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const Args& a = p.a;
   uint8_t* ring = reinterpret_cast<uint8_t*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
-  const int xbytes = p.bn * 128;
+  const int xbytes = kXRows * 128;
   const int wring = ring_w_bytes(p.bn, p.wst * p.wg);
   uint64_t* bars = reinterpret_cast<uint64_t*>(ring + wring + p.xst * p.xg * xbytes);
   // fullW[kMaxW] emptyW[kMaxW] fullX[kMaxX] emptyX[kMaxX] acc
@@ -222,9 +272,15 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const uint32_t fw0 = smem_u32(bars), ew0 = fw0 + 8 * kMaxW, fx0 = ew0 + 8 * kMaxW,
                  ex0 = fx0 + 8 * kMaxX, acc0 = ex0 + 8 * kMaxX;
 
+  if (threadIdx.x == 32) {
+    // Descriptor prefetch (as CUTLASS): every TMA below names one of these two maps.
+    asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tw)) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tx)) : "memory");
+  }
   if (threadIdx.x == 0) {
     asm volatile("griddepcontrol.launch_dependents;");
     STAMP(0);
+    STAMPC(7);
     for (int s = 0; s < p.wst; ++s) {
       mbar_init(fw0 + 8 * s, 1);
       mbar_init(ew0 + 8 * s, 1);
@@ -238,7 +294,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   }
   // Router correction bias (a weight: before the dependency).
   for (int e = threadIdx.x; e < a.num_logits; e += kThreads) s_bias[e] = a.bias[e];
-  const int cols = p.bn <= 32 ? 32 : p.bn <= 64 ? 64 : p.bn <= 128 ? 128 : 256;
+  const int cols = 128;  // D [128 tokens, 128 weight rows] FP32
   if (warp == 1) {
     asm volatile(
         "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(
@@ -259,75 +315,117 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const int kb_lo = (static_cast<int>(rank) * p.kb) / p.csize;
   const int kb_hi = ((static_cast<int>(rank) + 1) * p.kb) / p.csize;
   const int nkb = kb_hi - kb_lo;
-
-  // Weight issuers: warps 0, 2, 3 lane 0 (distinct SM subpartitions); issuer i owns
-  // the slots s with s % nprod == i. Weights never wait for the predecessor grid.
+  // One TMA op per ring slot (3-D maps: wg / xg K blocks per op) and several issuing
+  // warps: a TMA issuing thread completes ~one op per ~0.3 us whatever the op size or
+  // ring depth (hwdb hw8/hw13; measured here: one 4 KB token op per ~0.3-0.45 us
+  // capped the whole mainloop). Weight slots: warps 0, 2, 3 (slot s -> s % nprod);
+  // token slots: warps 4.. (slot s -> 4 + s % nxp). A slot's box may run past this
+  // rank's K range (the next rank's blocks or zero fill): loaded, never used.
   int prod = -1;
-  if (lane == 0) prod = warp == 0 ? 0 : warp == 2 ? 1 : warp == 3 ? 2 : -1;
+  // Whole warps run the loops (waits on every lane, lane 0 issues: the CUTLASS form;
+  // a lone lane with the other 31 parked at a __syncwarp issued each tcgen05 / TMA
+  // instruction at ~0.05-0.1 us).
+  prod = warp == 0 ? 0 : warp == 2 ? 1 : warp == 3 ? 2 : -1;
   if (prod >= p.nprod) prod = -1;
+  const int nxp = p.xst < 4 ? p.xst : 4;
   if (prod >= 0) {
     const int ngw = (nkb + p.wg - 1) / p.wg;
     for (int gw = 0; gw < ngw; ++gw) {
       const int s = gw % p.wst;
       if (s % p.nprod != prod) continue;
       if (gw >= p.wst) mbar_wait(ew0 + 8 * s, ((gw / p.wst) & 1) ^ 1);
-      const int nk = min(p.wg, nkb - gw * p.wg);
-      mbar_expect_tx(fw0 + 8 * s, nk * kWBox);
-      for (int j = 0; j < nk; ++j)
-        tma_2d_ef(ring_s + (s * p.wg + j) * kWBox, &tw, (kb_lo + gw * p.wg + j) * 64, wrow,
-                  fw0 + 8 * s);
+      if (lane == 0) {
+        if (gw < 64) STAMPC(136 + gw);
+        mbar_expect_tx(fw0 + 8 * s, p.wg * kWBox);
+        tma_3d_ef(ring_s + s * p.wg * kWBox, &tw, wrow, kb_lo + gw * p.wg, fw0 + 8 * s);
+      }
+      __syncwarp();
     }
-  } else if (warp == 5 && lane == 0) {
-    // Token issuer: after the predecessor grid (it wrote h).
+  } else if (warp >= 4 && warp - 4 < nxp) {
+    // Token issuers: after the predecessor grid (it wrote h).
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    STAMP(1);
+    if (warp == 4 && lane == 0) {
+      STAMP(1);
+      if (p.stamps) {  // which weight slots have landed by the dependency release
+        uint32_t mask = 0;
+        for (int s = 0; s < p.wst; ++s) {
+          uint32_t ok;
+          asm volatile(
+              "{ .reg .pred q; mbarrier.test_wait.parity.shared::cta.b64 q, [%1], 0; "
+              "selp.u32 %0, 1, 0, q; }"
+              : "=r"(ok)
+              : "r"(fw0 + 8 * s)
+              : "memory");
+          mask |= ok << s;
+        }
+        p.stamps[blockIdx.x * kStampStride + 198] = mask;
+      }
+    }
     const int ng = (nkb + p.xg - 1) / p.xg;
     for (int g = 0; g < ng; ++g) {
       const int s = g % p.xst;
+      if (s % nxp != warp - 4) continue;
       if (g >= p.xst) mbar_wait(ex0 + 8 * s, ((g / p.xst) & 1) ^ 1);
-      const int nk = min(p.xg, nkb - g * p.xg);
-      mbar_expect_tx(fx0 + 8 * s, nk * xbytes);
-      for (int j = 0; j < nk; ++j)
-        tma_2d(xring_s + (s * p.xg + j) * xbytes, &tx, (kb_lo + g * p.xg + j) * 64, 0,
-               fx0 + 8 * s);
+      if (lane == 0) {
+        if (g < 64) STAMPC(264 + g);
+        mbar_expect_tx(fx0 + 8 * s, p.xg * xbytes);
+        tma_3d(xring_s + s * p.xg * xbytes, &tx, 0, kb_lo + g * p.xg, fx0 + 8 * s);
+      }
+      __syncwarp();
     }
-  } else if (warp == 1 && lane == 0) {
+  } else if (warp == 1) {
     // kind::f16, BF16 A/B, FP32 D, K-major both, N = bn, M = 128.
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
-                           (static_cast<uint32_t>(p.bn >> 3) << 17) | (8u << 24);
+                           (static_cast<uint32_t>(128 >> 3) << 17) | (8u << 24);
     for (int it = 0; it < nkb; ++it) {
       const int g = it / p.xg, j = it % p.xg;
       const int gw = it / p.wg, jw = it % p.wg;
       const int sw = gw % p.wst, sx = g % p.xst;
-      if (j == 0) mbar_wait(fx0 + 8 * sx, (g / p.xst) & 1);
-      if (jw == 0) mbar_wait(fw0 + 8 * sw, (gw / p.wst) & 1);
-      if (it + 1 == nkb) STAMP(2);
+      const bool probe = (p.debug & 2) && it > 0;  // probe: MMA issue rate on slot 0 data
+      if (j == 0 && !probe) mbar_wait(fx0 + 8 * sx, (g / p.xst) & 1);
+      if (lane == 0 && it < 64) STAMPC(8 + it);
+      if (jw == 0 && !probe) mbar_wait(fw0 + 8 * sw, (gw / p.wst) & 1);
       asm volatile("tcgen05.fence::after_thread_sync;");
-      const uint64_t ad = smem_desc(ring_s + (sw * p.wg + jw) * kWBox);
-      const uint64_t bd = smem_desc(xring_s + (sx * p.xg + j) * xbytes);
+      if (lane == 0) {
+        if (it < 64) STAMPC(72 + it);
+        if (it + 1 == nkb) STAMP(2);
+        const uint64_t ad = smem_desc(ring_s + (probe ? 0 : (sw * p.wg + jw) * kWBox));
+        const uint64_t bd = smem_desc(xring_s + (probe ? 0 : (sx * p.xg + j) * xbytes));
+        if (!(p.debug & 1)) {
 #pragma unroll
-      for (int kk = 0; kk < 4; ++kk)
-        mma_bf16(tmem, ad + 2 * kk, bd + 2 * kk, idesc, (it == 0 && kk == 0) ? 0u : 1u);
-      if (jw == p.wg - 1 || it + 1 == nkb) mma_commit(ew0 + 8 * sw);
-      if (j == p.xg - 1 || it + 1 == nkb) mma_commit(ex0 + 8 * sx);
+          for (int kk = 0; kk < 4; ++kk)
+            mma_bf16(tmem, bd + 2 * kk, ad + 2 * kk, idesc, (it == 0 && kk == 0) ? 0u : 1u);
+        }
+        if (it < 64) STAMPC(136 + 64 + it);
+        if (jw == p.wg - 1 || it + 1 == nkb) mma_commit(ew0 + 8 * sw);
+        if (j == p.xg - 1 || it + 1 == nkb) mma_commit(ex0 + 8 * sx);
+      }
+      __syncwarp();
     }
-    mma_commit(acc0);
+    if (lane == 0) mma_commit(acc0);
   }
   __syncwarp();
   asm volatile("griddepcontrol.wait;" ::: "memory");  // before any global write
   if (warp >= 4) {
-    // TMEM -> own shared memory partial [bn][128] FP32 (thread = weight row).
-    const int q = warp & 3, wr = q * 32 + lane;
-    mbar_wait(acc0, 0);
+    // TMEM -> own shared memory partial [n][128] FP32 (TMEM lane = token row).
+    const int q = warp & 3, tok = q * 32 + lane;
+    if (lane == 0) mbar_wait_sleep(acc0, 0);
+    __syncwarp();
     if (threadIdx.x == 128) STAMP(3);
     asm volatile("tcgen05.fence::after_thread_sync;");
     float* part = reinterpret_cast<float*>(ring);
     const uint32_t ta = tmem + (static_cast<uint32_t>(q * 32) << 16);
-    for (int c = 0; c < p.bn; c += 16) {
-      float v[16];
-      tmem_ld16(ta + c, v);
+    if (q * 32 < a.n) {  // warp-uniform (tcgen05.ld is .aligned)
+      for (int c = 0; c < 128; c += 16) {
+        float v[16];
+        tmem_ld16(ta + c, v);
+        if (tok < a.n) {
+          float4* dst = reinterpret_cast<float4*>(part + tok * 128 + c);
 #pragma unroll
-      for (int j = 0; j < 16; ++j) part[(c + j) * 128 + wr] = v[j];
+          for (int j = 0; j < 4; ++j)
+            dst[j] = make_float4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
+        }
+      }
     }
   }
   asm volatile("tcgen05.fence::before_thread_sync;");
@@ -410,6 +508,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   }
   if (threadIdx.x == 0) {
     STAMP(6);
+    STAMPC(199);
     // The last CTA of the grid (every top-k CTA is past its wait) resets the
     // counters for the next call.
     if (atomicAdd(p.cnt + 2, 1u) == gridDim.x - 1) {
@@ -419,13 +518,15 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   }
 }
 
-static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_rows) {
-  cuuint64_t dims[2] = {static_cast<cuuint64_t>(k), static_cast<cuuint64_t>(rows)};
-  cuuint64_t strides[1] = {static_cast<cuuint64_t>(k) * 2};
-  cuuint32_t box[2] = {64, static_cast<cuuint32_t>(box_rows)};
-  cuuint32_t es[2] = {1, 1};
+static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_rows,
+                     int box_kb) {
+  // {64 columns, rows, K blocks}: K block j of row r at r * k + 64 j.
+  cuuint64_t dims[3] = {64, static_cast<cuuint64_t>(rows), static_cast<cuuint64_t>(k / 64)};
+  cuuint64_t strides[2] = {static_cast<cuuint64_t>(k) * 2, 128};
+  cuuint32_t box[3] = {64, static_cast<cuuint32_t>(box_rows), static_cast<cuuint32_t>(box_kb)};
+  cuuint32_t es[3] = {1, 1, 1};
   CUresult rc = cuTensorMapEncodeTiled(
-      m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(ptr), dims, strides, box,
+      m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(ptr), dims, strides, box,
       es, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TORCH_CHECK(rc == CUDA_SUCCESS, "moe_front: cuTensorMapEncodeTiled ", static_cast<int>(rc));
@@ -433,7 +534,7 @@ static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_r
 
 int64_t smem_bytes(int64_t bn, int64_t wst, int64_t xst, int64_t xg) {
   // wst: weight K blocks resident in the ring (slots x wg)
-  return 1024 + ring_w_bytes(bn, wst) + xst * xg * bn * 128 +
+  return 1024 + ring_w_bytes(bn, wst) + xst * xg * kXRows * 128 +
          (2 * kMaxW + 2 * kMaxX + 1) * 8 + 16;
 }
 
@@ -493,7 +594,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   TORCH_CHECK(csize >= 1 && csize <= kMaxC && kb >= csize && n >= csize &&
                   tiles * csize >= n && wst >= 1 && wst <= kMaxW && xst >= 1 &&
                   xst <= kMaxX && nprod >= 1 && nprod <= 3 && nprod <= wst && xg >= 1 &&
-                  xg <= 16 && wg >= 1 && wg <= 4,
+                  xg <= 8 && wg >= 1 && wg <= 4,
               "moe_front: launch configuration");
   const bool* pad_ptr = nullptr;
   if (pad.has_value()) {
@@ -542,10 +643,11 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.nprod = (int)nprod;
   p.xg = (int)xg;
   p.wg = (int)wg;
+  p.debug = (int)(stamps.numel() > 0 ? stamps.numel() % 8 : 0);
   p.yfull = y.size(1) >= rows_w ? 1 : 0;
   CUtensorMap tw, tx;
-  make_map(&tw, w.data_ptr(), (int)rows_w, (int)k, 128);
-  make_map(&tx, h.data_ptr(), (int)n, (int)k, p.bn);
+  make_map(&tw, w.data_ptr(), (int)rows_w, (int)k, 128, (int)wg);
+  make_map(&tx, h.data_ptr(), (int)n, (int)k, kXRows, (int)xg);
   const int smem = (int)smem_bytes(p.bn, wst * wg, xst, xg);
   static int configured = 0;
   if (smem > configured) {
@@ -678,7 +780,7 @@ def _module():
 # C = 5 / 6 fit 32 / 28 and run a second wave). The token ring is as deep as the
 # weight ring: tokens come from L2 one K block per slot, and a shallow token ring
 # (4 slots) capped the mainloop at ~3 K blocks per us.
-CONFIGS = {32: (4, 5, 8, 3, 1, 2), 64: (4, 4, 8, 3, 1, 2), 96: (4, 4, 6, 3, 1, 2)}
+CONFIGS = {32: (4, 4, 2, 3, 2, 2), 64: (4, 4, 2, 3, 2, 2), 96: (4, 4, 2, 3, 2, 2)}
 
 
 def config_for(n: int):
