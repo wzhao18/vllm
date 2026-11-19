@@ -376,6 +376,14 @@ __device__ __forceinline__ int count_below(const uint32_t* list, int n, uint32_t
   return lo;
 }
 
+// Whether every rank's tie count at tau fits one tie message, so one round of complete
+// ascending tie lists locates the cut (the centred 1R WRITE's in-place tie round).
+__device__ __forceinline__ bool c1r_ties_fit(const int* ties, int W) {
+  for (int s = 0; s < W; ++s)
+    if (ties[s] > kTieList) return false;
+  return true;
+}
+
 __device__ __forceinline__ void load8_keys(const uint16_t* lrow, int i, int n, bool vec,
                                            uint32_t (&k8)[8]) {
   if (vec && i + 8 <= n) {
@@ -1232,7 +1240,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         // tau outside a window: the octave rounds over every key (leader)
         c1r_stage = 20;
         if (leader && tid == 0) s_fkey_c1r = 65536;
-      } else if (q < 0) {
+      } else if (q < 0 && !c1r_ties_fit(s_ties, p.W)) {
         c1r_stage = 30;  // tie round (leader state machine)
       } else {
         // WRITE: bitmaps of this CTA's tokens above tau and ties, one packed scan
@@ -1300,6 +1308,97 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
               spin_fail(p.err, 20);
           }
         }
+        // Ties straddling >= 2 ranks, every rank's ties fit one tie message
+        // (c1r_ties_fit): the tie round runs here on the row's bitmaps (no key
+        // pass, no leader state machine). Each CTA puts its first tied local
+        // positions (position order) into the leader's G[]; the leader sends this
+        // rank's tied global ids, polls every rank's (each is its rank's complete
+        // ascending tie list), finds the need-th smallest id g* and this rank's
+        // quota (its ties <= g*), and hands the quota to the cluster.
+        int qw = q;
+        if (q < 0) {
+          {
+            uint32_t* gl = leader ? G : cl.map_shared_rank(G, 0);
+            int e = eo + (int)(pre >> 12);
+            for (int w = w0; w < w1 && e < kTieList; ++w) {
+              uint32_t m = bme[w];
+              while (m && e < kTieList) {
+                const int bit = __ffs(m) - 1;
+                m &= m - 1;
+                gl[e++] = (uint32_t)(s0 + w * 32 + bit);
+              }
+            }
+          }
+          __shared__ int s_tq;
+          if (cs > 1) cl.sync();  // the tie positions in the leader's G[]
+          else __syncthreads();
+          if (leader) {
+            DBG(9);
+            STAT(kStTieRound);
+            const int Wn = p.W, IL = p.interleave, nm = s_ties[p.rank];
+            if (tid == 0 && eqt != nm) spin_fail(p.err, 20);
+            const int64_t trow = p.off_tl + ((int64_t)(par * p.cap + row) * Wn) * kTieList;
+            const int nmp = (nm + 3) & ~3;
+            for (int j = tid; j < nmp; j += kThreads) {
+              uint32_t gid = 0;
+              if (j < nm) {
+                const int l = (int)G[j];
+                gid = (uint32_t)(((l / IL) * Wn + p.rank) * IL + l % IL);
+              }
+              msg[j] = tagw(tag, gid);
+            }
+            if (tid == 0) res.kstar = -1;
+            __syncthreads();
+            for (int j = tid * 4; j < nmp; j += kThreads * 4) {
+              const uint4 v = make_uint4(msg[j], msg[j + 1], msg[j + 2], msg[j + 3]);
+              const int64_t off = trow + (int64_t)p.rank * kTieList + j;
+              if (p.mc) mc_st_v4(p.mc + off * 4, v);
+              else
+                for (int d = 0; d < Wn; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
+            }
+            // every rank's list into fine[] (the window sums are no longer read)
+            {
+              const long long t0 = now_ns();
+              for (int j = tid * 4; j < Wn * kTieList; j += kThreads * 4) {
+                const int s = j / kTieList;
+                if (j % kTieList >= ((s_ties[s] + 3) & ~3)) continue;
+                uint4 v = ld_sys_v4(p.box + trow + j);
+                while (!tagged(v, tag)) {
+                  if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 14); break; }
+                  v = ld_sys_v4(p.box + trow + j);
+                }
+                *reinterpret_cast<uint4*>(fine + j) = v;
+              }
+            }
+            __syncthreads();
+            DBG(10);
+            // g*: the id with exactly need - 1 smaller ids over the W ascending lists
+            // (ids are distinct)
+            const int need = s_need;
+            for (int c = tid; c < Wn * kTieList; c += kThreads) {
+              const int s = c / kTieList, j = c % kTieList;
+              if (j >= s_ties[s]) continue;
+              const uint32_t x = fine[c] & 0xFFFFFFu;
+              int r = j;
+              for (int s2 = 0; s2 < Wn; ++s2)
+                if (s2 != s) r += count_below(fine + s2 * kTieList, s_ties[s2], x);
+              if (r == need - 1) res.kstar = (int)x;
+            }
+            for (int j = tid; j < Wn * kTieList; j += kThreads)
+              if (j % kTieList < ((s_ties[j / kTieList] + 3) & ~3)) st_u32(p.box + trow + j, kSent);
+            __syncthreads();
+            if (tid == 0) {
+              const int gs = res.kstar;
+              if (gs < 0) spin_fail(p.err, 16);
+              const int qq = count_below(fine + p.rank * kTieList, nm, (uint32_t)gs + 1u);
+              for (int c = 0; c < cs; ++c) *(c == 0 ? &s_tq : cl.map_shared_rank(&s_tq, c)) = qq;
+            }
+            DBG(14);
+          }
+          if (cs > 1) cl.sync();  // the quota in every CTA
+          else __syncthreads();
+          qw = s_tq;
+        }
         int gp = go + (int)(pre & 0xFFFu), ep = eo + (int)(pre >> 12);
         for (int w = w0; w < w1; ++w) {
           uint32_t m = bmg[w];
@@ -1309,14 +1408,14 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
             orow[gp++] = slot_of(s0 + w * 32 + bit);
           }
           m = bme[w];
-          while (m && ep < q) {
+          while (m && ep < qw) {
             const int bit = __ffs(m) - 1;
             m &= m - 1;
             orow[gtt + ep] = slot_of(s0 + w * 32 + bit);
             ++ep;
           }
         }
-        const int count = gtt + q, per = (K - count + cs - 1) / cs;
+        const int count = gtt + qw, per = (K - count + cs - 1) / cs;
         for (int i = count + crank * per + tid; i < min(K, count + (crank + 1) * per); i += kThreads)
           orow[i] = -1;
         if (leader && tid == 0) p.out_count[row] = count;
@@ -2848,6 +2947,8 @@ __global__ void __launch_bounds__(256) o_exchange_kernel(OxParams p) {
 
 }  // namespace k31dcpx
 
+#include "topk_v2.cuh"
+
 // ------------------------------------------------------------------ host side
 using namespace k31dcpx;
 
@@ -3111,7 +3212,103 @@ int64_t max_coresident_ox(int64_t D) {
   return (int64_t)sms * occ;
 }
 
+// ------------------------------------------------------------------ top-k v2 (host)
+// u32 words of the v2 mailboxes: round 1, tie round, radix rounds (2 parities each).
+std::vector<int64_t> topk_v2_layout(int64_t cap, int64_t W) {
+  const int64_t r1 = 2 * cap * W * kV2Msg, tie = 2 * cap * W * kV2Tie,
+                rad = 2 * cap * kV2RadR * W * 256;
+  return {0, r1, r1 + tie, r1 + tie + rad};
+}
+
+static constexpr size_t kV2Dyn = 0;
+
+// Co-resident topk_v2 CTAs (a launch walks rows beyond it in turns, NVLink rounds included).
+int64_t topk_v2_resident() {
+  static int v = 0;
+  if (!v) {
+    int dev, sms, occ = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    // two ~108 KB CTAs per SM (one row each): the largest SMEM carveout
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_redo_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    int occ2 = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ2, topk_v2_redo_kernel, kV2T, kV2Dyn));
+    TORCH_CHECK(occ2 >= 1, "topk_v2: the complete row body does not fit");
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel, kV2T, kV2Dyn));
+    v = sms * occ;
+  }
+  return v;
+}
+
+void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
+             torch::Tensor out, torch::Tensor out_count, c10::optional<torch::Tensor> block_table,
+             int64_t block_size, int64_t block_stride, int64_t next_n,
+             c10::optional<torch::Tensor> req_of_row, int64_t box, int64_t mc, torch::Tensor peers,
+             int64_t W, int64_t rank, int64_t K, int64_t cap, int64_t interleave,
+             torch::Tensor epoch, torch::Tensor err,
+             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg) {
+  TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
+  TORCH_CHECK(W >= 1 && W <= kV2MaxW, "topk_v2: DCP size must be in [1, 8]");
+  TORCH_CHECK(K >= 1 && K <= kMaxK, "topk_v2: K must be in [1, 2048]");
+  TORCH_CHECK(interleave >= 1);
+  const int T = (int)logits.size(0);
+  if (T == 0) return;
+  TORCH_CHECK(T <= cap && epoch.numel() >= 2 * cap, "topk_v2: rows > cap or epoch < 2 cap");
+  const c10::cuda::CUDAGuard guard(logits.device());
+  V2Params p{};
+  p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  p.lstride = logits.stride(0);
+  p.lcols = (int)logits.size(1);
+  p.local_len = local_len.data_ptr<int>();
+  p.global_len = global_len.data_ptr<int>();
+  p.out = out.data_ptr<int>();
+  p.ostride = out.stride(0);
+  p.out_count = out_count.data_ptr<int>();
+  p.block_table = block_table.has_value() ? block_table->data_ptr<int>() : nullptr;
+  p.bt_stride = block_table.has_value() ? block_table->stride(0) : 0;
+  p.block_size = (int)block_size;
+  p.block_stride = block_stride > 0 ? (int)block_stride : (int)block_size;
+  p.next_n = (int)next_n;
+  p.req_of_row = req_of_row.has_value() ? req_of_row->data_ptr<int>() : nullptr;
+  p.box = reinterpret_cast<uint32_t*>(box);
+  p.mc = (uint64_t)mc;
+  p.peers = reinterpret_cast<const uint64_t*>(peers.data_ptr<int64_t>());
+  p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
+  p.interleave = (int)interleave;
+  const auto lay = topk_v2_layout(cap, W);
+  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
+  p.epoch = epoch.data_ptr<int>();
+  p.redo = p.epoch + cap;  // the epoch buffer's second half
+  p.err = err.data_ptr<int>();
+  p.spin_ns = g_spin_ns;
+  p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
+  TORCH_CHECK(!dbg.has_value() || dbg->numel() >= (int64_t)kV2Dbg * T, "topk_v2: dbg too small");
+  p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  const int nres = (int)topk_v2_resident();
+  TORCH_CHECK(nres >= 1, "topk_v2: no resident CTA");
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)std::min(T, nres), 1, 1);
+  cfg.blockDim = dim3(kV2T, 1, 1);
+  cfg.dynamicSmemBytes = kV2Dyn;
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
+  // PDL: the prologue (barrier init) overlaps the logits kernel; the kernel never
+  // releases its dependents early (they start at its completion).
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel, p));
+  // the rows that need the complete body (rare; most CTAs exit after the PDL wait)
+  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("topk_v2", &topk_v2);
+  m.def("topk_v2_layout", &topk_v2_layout);
+  m.def("topk_v2_resident", &topk_v2_resident);
   m.def("topk_merge", &topk_merge);
   m.def("o_exchange", &o_exchange);
   m.def("max_coresident_ox", &max_coresident_ox);

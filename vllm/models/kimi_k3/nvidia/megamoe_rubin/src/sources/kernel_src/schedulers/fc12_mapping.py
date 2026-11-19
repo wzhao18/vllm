@@ -920,10 +920,13 @@ class PhaseInterleavedFc12MappingState:
         num_fc1_intermediate_blocks: int,
         num_fc2_hidden_blocks: int,
         dfc1_m_group: int = 1,
+        bidirectional: bool = False,
     ) -> None:
         if type(dfc1_m_group) is not int or dfc1_m_group not in (1, 16):
             raise ValueError("dfc1_m_group must be 1 or 16")
         self.dfc1_m_group = dfc1_m_group
+        # Two-ended (die-split) streams: cursors may also move toward lower experts.
+        self.bidirectional = bidirectional
         self.expert_count = expert_count
         self.mapping_cta_tile_shape_mnk = mapping_cta_tile_shape_mnk
         self.mapping_cluster_shape_mn = mapping_cluster_shape_mn
@@ -985,6 +988,7 @@ class PhaseInterleavedFc12MappingState:
             num_fc1_intermediate_blocks=self.num_fc1_intermediate_blocks,
             num_fc2_hidden_blocks=self.num_fc2_hidden_blocks,
             dfc1_m_group=self.dfc1_m_group,
+            bidirectional=self.bidirectional,
         )
         if value_index != len(values):
             raise ValueError(
@@ -1022,6 +1026,7 @@ def create_phase_interleaved_fc12_mapping_state(
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
     dfc1_m_group: int = 1,
+    bidirectional: bool = False,
 ) -> PhaseInterleavedFc12MappingState:
     """Create independent monotonic mapping cursors for the FC1 and FC2 streams."""
     mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
@@ -1042,7 +1047,98 @@ def create_phase_interleaved_fc12_mapping_state(
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
         dfc1_m_group=dfc1_m_group,
+        bidirectional=bidirectional,
     )
+
+
+@cute.jit
+def _phase_expert_token_count(mapping_state: PhaseInterleavedFc12MappingState, expert_idx: Int32) -> Int32:
+    token_count = Int32(0)
+    if cutlass.const_expr(mapping_state.expert_token_sizes is not None):
+        token_count = mapping_state.expert_token_sizes[expert_idx]
+    else:
+        prefix_end = mapping_state.expert_token_prefix_sum[expert_idx]
+        prefix_begin = Int32(0)
+        if expert_idx > Int32(0):
+            prefix_begin = mapping_state.expert_token_prefix_sum[expert_idx - Int32(1)]
+        token_count = prefix_end - prefix_begin
+    return token_count
+
+
+@cute.jit
+def _retreat_phase_cursor(
+    cursor: _PhaseFc12CursorState, mapping_state: PhaseInterleavedFc12MappingState
+) -> _PhaseFc12CursorState:
+    """Inverse of ``_advance_phase_cursor``: move to the previous expert (two-ended streams)."""
+    cursor.expert_idx = cursor.expert_idx - Int32(1)
+    token_count = _phase_expert_token_count(mapping_state, cursor.expert_idx)
+    token_block_count = (token_count + Int32(mapping_state.mapping_cluster_tile_m - 1)) // Int32(
+        mapping_state.mapping_cluster_tile_m
+    )
+    cursor.data_cumulative = cursor.data_cumulative - padded_expert_rows(
+        token_count, Int32(mapping_state.token_padding_block)
+    )
+    cursor.sf_cumulative = cursor.sf_cumulative - padded_expert_rows(
+        token_count, Int32(mapping_state.sf_padding_block)
+    )
+    cursor.token_block_cumulative = cursor.token_block_cumulative - token_block_count
+    cursor.current_expert_token_count = token_count
+    cursor.current_token_block_count = token_block_count
+    cursor.expert_tile_end = cursor.expert_tile_start
+    cursor.expert_tile_start = cursor.expert_tile_end - token_block_count * Int32(cursor.blocks_per_token_block)
+    return cursor
+
+
+@cute.jit
+def phase_stream_totals(mapping_state: PhaseInterleavedFc12MappingState) -> Tuple[Int32, Int32, Int32]:
+    """Warp-cooperative (token blocks, padded data rows, padded SF rows) summed over all local experts.
+
+    Every lane of the calling warp must participate; every lane returns the totals.
+    """
+    thread_idx, _, _ = cute.arch.thread_idx()
+    lane_idx = thread_idx % Int32(32)
+    token_blocks = Int32(0)
+    data_rows = Int32(0)
+    sf_rows = Int32(0)
+    for batch_base in cutlass.range_constexpr(0, mapping_state.expert_count, 32):
+        expert_idx = Int32(batch_base) + lane_idx
+        if expert_idx < Int32(mapping_state.expert_count):
+            token_count = _phase_expert_token_count(mapping_state, expert_idx)
+            token_blocks = token_blocks + (token_count + Int32(mapping_state.mapping_cluster_tile_m - 1)) // Int32(
+                mapping_state.mapping_cluster_tile_m
+            )
+            data_rows = data_rows + padded_expert_rows(token_count, Int32(mapping_state.token_padding_block))
+            sf_rows = sf_rows + padded_expert_rows(token_count, Int32(mapping_state.sf_padding_block))
+    token_blocks = Int32(
+        cute.arch.shuffle_sync(_warp_inclusive_sum(token_blocks, lane_idx), offset=31, mask=0xFFFFFFFF, mask_and_clamp=31)
+    )
+    data_rows = Int32(
+        cute.arch.shuffle_sync(_warp_inclusive_sum(data_rows, lane_idx), offset=31, mask=0xFFFFFFFF, mask_and_clamp=31)
+    )
+    sf_rows = Int32(
+        cute.arch.shuffle_sync(_warp_inclusive_sum(sf_rows, lane_idx), offset=31, mask=0xFFFFFFFF, mask_and_clamp=31)
+    )
+    return token_blocks, data_rows, sf_rows
+
+
+@cute.jit
+def place_phase_cursor_at_end(
+    cursor: _PhaseFc12CursorState,
+    mapping_state: PhaseInterleavedFc12MappingState,
+    total_token_blocks: Int32,
+    total_data_rows: Int32,
+    total_sf_rows: Int32,
+) -> _PhaseFc12CursorState:
+    """Park a cursor on the virtual expert past the last one, for a stream claimed from the top."""
+    cursor.expert_idx = Int32(mapping_state.expert_count)
+    cursor.current_expert_token_count = Int32(0)
+    cursor.current_token_block_count = Int32(0)
+    cursor.data_cumulative = total_data_rows
+    cursor.sf_cumulative = total_sf_rows
+    cursor.token_block_cumulative = total_token_blocks
+    cursor.expert_tile_start = total_token_blocks * Int32(cursor.blocks_per_token_block)
+    cursor.expert_tile_end = cursor.expert_tile_start
+    return cursor
 
 
 @cute.jit
@@ -1084,6 +1180,13 @@ def _advance_phase_cursor(
 def _seek_phase_cursor(
     linear_work_id: Int32, cursor: _PhaseFc12CursorState, mapping_state: PhaseInterleavedFc12MappingState
 ) -> _PhaseFc12CursorState:
+    if cutlass.const_expr(mapping_state.bidirectional):
+        expert_tile_start = cursor.expert_tile_start
+        expert_idx = cursor.expert_idx
+        while linear_work_id < expert_tile_start and expert_idx > Int32(0):
+            cursor = _retreat_phase_cursor(cursor, mapping_state)
+            expert_tile_start = cursor.expert_tile_start
+            expert_idx = cursor.expert_idx
     expert_tile_end = cursor.expert_tile_end
     next_expert_idx = cursor.expert_idx + Int32(1)
     while linear_work_id >= expert_tile_end and next_expert_idx < Int32(mapping_state.expert_count):
@@ -1230,5 +1333,7 @@ __all__ = [
     "map_fc12_linear_work_id",
     "map_phase_interleaved_fc12_work_id",
     "peek_ready_bit",
+    "phase_stream_totals",
+    "place_phase_cursor_at_end",
     "resolve_phase_interleaved_fc1_claim_target",
 ]

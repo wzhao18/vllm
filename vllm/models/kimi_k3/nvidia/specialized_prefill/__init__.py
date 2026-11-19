@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Kimi K3.1 specialized prefill kernels (Rubin / sm_107) and their dispatch (stock gets wiring only)."""

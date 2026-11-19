@@ -46,11 +46,15 @@ import torch
 from vllm.logger import init_logger
 
 from ...shapes import Choice, Path, Shape, Unsupported
+from ..gemm.decode import DecodeProjection
+from ..gemm.sp_policy import sp_projection_tactics
 from ..mla.dcp import DcpBox
 from ..mla.query import TILED_FROM
-from .attn_fi import dsa_on_flashinfer
+from .attn_fi import dsa_on_flashinfer, kernel_for
+from ..common.policy import batch_table
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS
+from .local_query import LocalQuery
 from .overlap import INDEX_PRIORITY, overlap_for
 from .prepared import PreparedDsa
 from .r1 import fi_buffers
@@ -74,7 +78,24 @@ SP_MODES = ("front", "fork", "wait")
 # mailboxes (2 x 4 x 512 x 24 x 512 BF16: 200 MiB symmetric). NQ-TUNE: bf16 vs proj
 # at DCP4 / 24 heads.
 SP_PARTIALS = PROJECTED
-SP_KERNELS = ("trtllm",)  # the FlashInfer sparse MLA kernel at every row
+# Rows whose query of all 96 heads is computed on every rank (local_query.LocalQuery:
+# no q publish, QueryWait or q mailbox re-arm), the rest MlaQuery's publish of 24
+# heads (fork rows only: QueryNorm writes q_c). In-step (gap512 D3 B80 / B92, 320 /
+# 368 rows) MlaQuery ran 74-89 us per layer on the side stream and QueryWait 30-46
+# us, beside the index chain whose wq_b split-K it slowed to 52-62 us. VR200, 1 GPU,
+# cold L2, us, MlaQuery without its publish vs LocalQuery (runs/D-ATTN qpath1-5):
+#   rows      20    32    64    96   128   256   384   512
+#   MlaQuery 17.2  17.4  23.7  32.3  33.4  52.5  72.4  93.1
+#   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
+# NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
+SP_LOCAL_QUERY = "65-:local"
+# The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere). The
+# Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) wins standalone at 128 rows (VR200,
+# 1 GPU, CUDA graphs, 512 local keys per row: 17.4 vs 21.0 us; 30.6 vs 28.5 at 256,
+# 35.3 vs 35.1 at 384; runs/D-ATTN/sp km31) but not in the step: on the D3-32 slice
+# at 128 rows the DSA sparse core stayed at ~18 us per layer and the overlapped
+# g_proj slowed (one 1024-thread CTA with all TMEM per SM; dattn-t15km2-prof).
+SP_KERNELS = ""
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
@@ -247,6 +268,18 @@ class SpDsaCore:
                     "dsa", shape, f"query overlap {mode!r} (publish-only modes only)"
                 )
             self.modes[r] = mode
+        table = batch_table(SP_LOCAL_QUERY)
+        self.local_rows = tuple(r for r in rows if table.get(r) == "local")
+        for r in self.local_rows:
+            if self.modes[r] != "fork":
+                raise Unsupported(
+                    "dsa", Shape(r, q), f"local query under {self.modes[r]!r} (fork)"
+                )
+        local = None
+        if self.local_rows:  # (collective: the q_b / W_UK gathers)
+            local = LocalQuery(
+                attention, box.group, box.size, self.local_rows, ctx, box.q_heads
+            )
         indexer = attention.dsa_indexer
         self.topk = indexer.topk_tokens
         fi = fi_buffers(device, max(rows), self.topk, box.q_heads)
@@ -262,17 +295,30 @@ class SpDsaCore:
             overlap=SP_QUERY_OVERLAP,
             partials=SP_PARTIALS,
             priority=INDEX_PRIORITY["sp"],
+            local=local,
         )
         prepared = self.prepared
         # The per-layer FP8 query rows PreparedDsa's QueryStage took: the shared ones
         # (``query_rows``).
         prepared.query_stage.query = shared[0]
+        # wq_b at the SP rows: ``gemm.sp_policy``'s measured tactics (family "wq_b";
+        # the TP16 bins' split-K tiles of 64 token columns re-read the weight per
+        # tile above 64 rows) in place of QueryStage's TP16 table, same operands.
+        stage = prepared.query_stage
+        wq = stage.index_projection.weight
+        n, k = wq.shape
+        tactics = sp_projection_tactics("wq_b", n, k, rows, ctx)
+        stage.index_projection = DecodeProjection(wq, rows, tactics, family="wq_b")
+        stage.index_projection.check_operands(
+            stage.qc[: max(rows)], stage.iq[: max(rows)]
+        )
         self.box = prepared.box  # (r1.DsaBox over ``box``)
         for r in rows:  # the policy PreparedDsa resolved is the one checked above
             shape = Shape(r, q)
             core, mode = prepared.cores[r, q], prepared.overlaps[r, q]
             fmt = self.box.mailbox(r).format
-            if (core, mode, fmt) != ("trtllm", self.modes[r], SP_PARTIALS):
+            kernel = kernel_for(r, True, SP_KERNELS)
+            if (core, mode, fmt) != (kernel, self.modes[r], SP_PARTIALS):
                 raise Unsupported("dsa", shape, f"resolved {core} / {mode} / {fmt}")
         if prepared.dsac is not None:  # (sp_unsupported refused it)
             raise Unsupported("dsa", None, "the DSA sparse core")
@@ -321,7 +367,8 @@ class SpDsaCore:
         )
         logger.info_once(
             "Kimi K3.1 SP DSA (TP%d = DCP%d, %d heads, q%d, rows %d-%d): query %s; "
-            "MlaQuery publishes, QueryWait polls; top-k %s; trtllm-gen over %d query "
+            "MlaQuery publishes, QueryWait polls (local query of every head at %s); "
+            "top-k %s; trtllm-gen over %d query "
             'heads; DcpValue "%s"; box %d rows (%.0f MiB symmetric)',
             self.ctx.tp,
             self.box.size,
@@ -330,6 +377,7 @@ class SpDsaCore:
             self.rows[0],
             self.rows[-1],
             spans,
+            f"{len(self.local_rows)} sizes" if self.local_rows else "no rows",
             topk,
             self.box.q_heads,
             SP_PARTIALS,
@@ -364,6 +412,6 @@ class SpDsaCore:
         mode = self.modes[rows]
         return Choice(
             Path.GENERIC,
-            tactic=(mode, SP_KERNELS[0], SP_PARTIALS),
-            note=f"sp {mode}/{SP_KERNELS[0]}/{SP_PARTIALS}",
+            tactic=(mode, kernel_for(rows, True, SP_KERNELS), SP_PARTIALS),
+            note=f"sp {mode}/{kernel_for(rows, True, SP_KERNELS)}/{SP_PARTIALS}",
         )

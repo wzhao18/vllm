@@ -11,7 +11,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....helpers.cute_py_helpers import (
@@ -21,6 +21,7 @@ from .....helpers.cute_py_helpers import (
     tcgen05_smem_alloc_type,
 )
 from .....helpers.dsl_helpers import spin_wait, tma_multicast_mask
+from .....helpers.ptx_helpers import TmaCacheHintEvictFirst
 from .....helpers.iket_compat import iket
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import ceil_div, round_up, strides_equal_ignoring_singletons
@@ -47,6 +48,15 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
     sfa_smem_tensor_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.sfa_smem_tensor"
     sfb_smem_tensor_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.sfb_smem_tensor"
     acc_pipeline_mbarriers_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.acc_pipeline_mbarriers"
+    # Weight-stream hints for NVFP4 N <= 128 tiles (decode: one token block per expert, so every weight byte is read from
+    # HBM exactly once and the kernel is weight-bandwidth bound). The TMA-A warp prefetches weight (A + SFA) k-tiles
+    # into L2 this many bytes per CTA ahead of the k-tile it loads, so HBM sees more bytes in flight per SM than the
+    # AB smem pipeline alone holds, and its weight loads carry an L2 evict-first policy so the once-read stream does
+    # not displace the token / FC1-output / scale-factor lines. Off elsewhere: N256 tiles (several token blocks reuse
+    # each weight tile from L2) measured +1.2..1.6% slower with either hint, and the MXFP4-weight x MXFP8-activation
+    # kernels measured +12..17% slower at T16-T512 with both hints on.
+    weight_l2_prefetch_bytes: ClassVar[int] = 128 * 1024
+    weight_stream_hint_max_tile_n: ClassVar[int] = 128
     tmem_holding_buffer_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_holding_buffer"
     tmem_deallocation_mbarrier_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_deallocation_mbarrier"
     tmem_allocation_barrier_id: ClassVar[int] = 2
@@ -78,6 +88,8 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self._validate_desc_inputs(problem_desc, impl_desc)
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        # Pin instruction N together with its matching two-CTA input split.
+        self.batch_invariant = bool(problem_desc.get("batch_invariant", False))
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
         self.sf_dtype = self.quant_kind.sf_dtype
@@ -95,11 +107,6 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
-        # vLLM S2: epilogue warpgroups sharing the TMEM allocation (each consumes its own acc stages).
-        self.num_epilogue_warpgroups = impl_desc.get("epilogue_warpgroups", 1)
-        self.tmem_sharing_thread_count = 32 * (
-            1 + self.num_epilogue_warpgroups * self.num_accumulator_consumer_warps_per_cta
-        )
 
         self.architecture = "sm_107"
         self.mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -178,6 +185,12 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
 
         self._select_ab_stage_plan()
         self.num_tma_load_bytes = self.ab_stage_tma_bytes * self.mma_cta_count
+        self.weight_load_evict_first = (
+            self.quant_kind is QuantKind.nvfp4 and self.cta_tile_n <= self.weight_stream_hint_max_tile_n
+        )
+        self.weight_l2_prefetch_ktiles = (
+            self.weight_l2_prefetch_bytes // self.a_stage_tma_bytes if self.weight_load_evict_first else 0
+        )
 
     def _validate_configuration(self) -> None:
         if self.mma_k_mode != "2x":
@@ -285,6 +298,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         # Native mixed FP4 halves its SMEM region, so the budget can select more AB stages.
         # TMA completion still counts packed source bytes, independent of the SMEM allocation type.
         self.ab_stage_payload_bytes = sum(region.nbytes for region in stage_one_regions)
+        self.a_stage_tma_bytes = packed_bytes(stage_one_regions[0], self.a_dtype) + stage_one_regions[2].nbytes
         self.ab_stage_tma_bytes = (
             packed_bytes(stage_one_regions[0], self.a_dtype)
             + packed_bytes(stage_one_regions[1], self.b_dtype)
@@ -633,7 +647,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         """Bind the SM107 TMEM allocator to finalized SMEM regions."""
         allocation_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_allocation_barrier_id,
-            num_threads=self.tmem_sharing_thread_count,
+            num_threads=32 * (1 + self.num_accumulator_consumer_warps_per_cta),
         )
         return utils.TmemAllocator(
             smem_workspace.ptr(self.tmem_holding_buffer_region, smem_base),
@@ -732,30 +746,60 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
                 global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
+                if cutlass.const_expr(self.weight_l2_prefetch_ktiles > 0):
+                    for prefetch_idx in cutlass.range(Int32(self.weight_l2_prefetch_ktiles), unroll=1):
+                        if prefetch_idx < k_tile_count:
+                            cute.prefetch(fc1_tma_a_atom, global_a_slice[(None, prefetch_idx)])
+                            cute.prefetch(fc1_tma_sfa_atom, global_sfa_slice[(None, prefetch_idx)])
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+                    if cutlass.const_expr(self.weight_l2_prefetch_ktiles > 0):
+                        prefetch_idx = k_tile_idx + Int32(self.weight_l2_prefetch_ktiles)
+                        if prefetch_idx < k_tile_count:
+                            cute.prefetch(fc1_tma_a_atom, global_a_slice[(None, prefetch_idx)])
+                            cute.prefetch(fc1_tma_sfa_atom, global_sfa_slice[(None, prefetch_idx)])
                     ab_pipeline.producer_acquire(ab_pipeline_state, empty_status)
                     tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
                     stage_index = ab_pipeline_state.index
                     ab_pipeline_state.advance()
                     if k_tile_idx + 1 < k_tile_count:
                         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-                    cute.copy(
-                        fc1_tma_a_atom,
-                        global_a_slice[(None, k_tile_idx)],
-                        partitioned_smem_a[(None, stage_index)],
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=a_descriptor_ptr,
-                        mcast_mask=multicast_mask,
-                    )
-                    cute.copy(
-                        fc1_tma_sfa_atom,
-                        global_sfa_slice[(None, k_tile_idx)],
-                        partitioned_smem_sfa[(None, stage_index)],
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=sfa_descriptor_ptr,
-                        mcast_mask=multicast_mask,
-                    )
+                    if cutlass.const_expr(self.weight_load_evict_first):
+                        cute.copy(
+                            fc1_tma_a_atom,
+                            global_a_slice[(None, k_tile_idx)],
+                            partitioned_smem_a[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=a_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                            cache_policy=Int64(TmaCacheHintEvictFirst),
+                        )
+                        cute.copy(
+                            fc1_tma_sfa_atom,
+                            global_sfa_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfa[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfa_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                            cache_policy=Int64(TmaCacheHintEvictFirst),
+                        )
+                    else:
+                        cute.copy(
+                            fc1_tma_a_atom,
+                            global_a_slice[(None, k_tile_idx)],
+                            partitioned_smem_a[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=a_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                        )
+                        cute.copy(
+                            fc1_tma_sfa_atom,
+                            global_sfa_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfa[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfa_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                        )
             else:
                 iket.range_push("tma_weight_fc2")
                 k_tile_count = self.fc2_k_tile_count
@@ -790,30 +834,60 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
                 global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
+                if cutlass.const_expr(self.weight_l2_prefetch_ktiles > 0):
+                    for prefetch_idx in cutlass.range(Int32(self.weight_l2_prefetch_ktiles), unroll=1):
+                        if prefetch_idx < k_tile_count:
+                            cute.prefetch(fc2_tma_a_atom, global_a_slice[(None, prefetch_idx)])
+                            cute.prefetch(fc2_tma_sfa_atom, global_sfa_slice[(None, prefetch_idx)])
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+                    if cutlass.const_expr(self.weight_l2_prefetch_ktiles > 0):
+                        prefetch_idx = k_tile_idx + Int32(self.weight_l2_prefetch_ktiles)
+                        if prefetch_idx < k_tile_count:
+                            cute.prefetch(fc2_tma_a_atom, global_a_slice[(None, prefetch_idx)])
+                            cute.prefetch(fc2_tma_sfa_atom, global_sfa_slice[(None, prefetch_idx)])
                     ab_pipeline.producer_acquire(ab_pipeline_state, empty_status)
                     tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
                     stage_index = ab_pipeline_state.index
                     ab_pipeline_state.advance()
                     if k_tile_idx + 1 < k_tile_count:
                         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-                    cute.copy(
-                        fc2_tma_a_atom,
-                        global_a_slice[(None, k_tile_idx)],
-                        partitioned_smem_a[(None, stage_index)],
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=a_descriptor_ptr,
-                        mcast_mask=multicast_mask,
-                    )
-                    cute.copy(
-                        fc2_tma_sfa_atom,
-                        global_sfa_slice[(None, k_tile_idx)],
-                        partitioned_smem_sfa[(None, stage_index)],
-                        tma_bar_ptr=tma_barrier,
-                        tma_desc_ptr=sfa_descriptor_ptr,
-                        mcast_mask=multicast_mask,
-                    )
+                    if cutlass.const_expr(self.weight_load_evict_first):
+                        cute.copy(
+                            fc2_tma_a_atom,
+                            global_a_slice[(None, k_tile_idx)],
+                            partitioned_smem_a[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=a_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                            cache_policy=Int64(TmaCacheHintEvictFirst),
+                        )
+                        cute.copy(
+                            fc2_tma_sfa_atom,
+                            global_sfa_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfa[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfa_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                            cache_policy=Int64(TmaCacheHintEvictFirst),
+                        )
+                    else:
+                        cute.copy(
+                            fc2_tma_a_atom,
+                            global_a_slice[(None, k_tile_idx)],
+                            partitioned_smem_a[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=a_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                        )
+                        cute.copy(
+                            fc2_tma_sfa_atom,
+                            global_sfa_slice[(None, k_tile_idx)],
+                            partitioned_smem_sfa[(None, stage_index)],
+                            tma_bar_ptr=tma_barrier,
+                            tma_desc_ptr=sfa_descriptor_ptr,
+                            mcast_mask=multicast_mask,
+                        )
 
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
@@ -910,7 +984,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
                         load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile), mma_tiler_n=self.mma_tiler_mnk[1]
                         )
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
@@ -988,7 +1062,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
                         load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile), mma_tiler_n=self.mma_tiler_mnk[1]
                         )
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
@@ -1067,7 +1141,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         fragment_a = tiled_mma.make_fragment_A(self.a_smem_tensor)
         fragment_b = tiled_mma.make_fragment_B(self.b_smem_tensor)
 
-        barrier_sync_unaligned(self.tmem_allocation_barrier_id, self.tmem_sharing_thread_count)
+        barrier_sync_unaligned(self.tmem_allocation_barrier_id, 32 * (1 + self.num_accumulator_consumer_warps_per_cta))
         accumulator_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
         accumulator_layout = cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride)
         accumulator_base = cute.make_tensor(accumulator_pointer, accumulator_layout)
@@ -1167,7 +1241,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                             b_window_frag=b_stage_frag,
                             sfa_window_tensor=tmem_sfa,
                             sfb_window_tensor=mma_tmem_sfb,
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
                             mma_instruction_mnk=self.mma_instruction_mnk,
                             window_instruction_offset=0,
                             window_instruction_count=self.num_mma_instructions_per_ab_stage,
@@ -1201,7 +1275,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                             b_window_frag=b_stage_frag,
                             sfa_window_tensor=tmem_sfa,
                             sfb_window_tensor=mma_tmem_sfb,
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
                             mma_instruction_mnk=self.mma_instruction_mnk,
                             window_instruction_offset=0,
                             window_instruction_count=self.num_mma_instructions_per_ab_stage,

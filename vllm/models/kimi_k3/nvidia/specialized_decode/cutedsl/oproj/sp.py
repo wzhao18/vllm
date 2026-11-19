@@ -24,12 +24,18 @@ precision). Tactics per token rows (``SP_OPROJ``, ``shapes.rows_policy``):
   ``SpReduceScatter(push=True)`` (pushes, owner reduce). Given stock's partials the
   shard is stock's bit for bit. A declared tactic of this provider, not a stock
   fallback: the communication is this provider's.
+- "gemm": as "cublas", with the partial GEMM's kind per R from
+  ``gemm.sp_policy`` (family ``o_proj``: cuBLAS or torch's cuBLASLt preference, the
+  measured VR200 table; FP32 accumulation, one rounding, the summation order may
+  differ from stock's cuBLAS kernel). The table is measured at TP4; at any other TP
+  the partial GEMM is "cublas" at every R (stock's bits, as the "cublas" tactic).
 
 Both re-arm the all-gather rows of their parity (``SpReduceScatter``).
 
 NQ-TUNE: ``SP_OPROJ`` is GENERIC (no VR200 measurement yet): "warp" where its
-weight streaming should be bandwidth-bound (R <= 64), "cublas" above, where
-mma.sync falls behind tcgen05. To measure per R (4 GPUs, 24 heads): the pair vs
+weight streaming should be bandwidth-bound (R <= 64), "gemm" above, where
+mma.sync falls behind tcgen05 (its partial GEMM's kind is ``sp_policy``'s measured
+table; the RS stays a separate push). To measure per R (4 GPUs, 24 heads): the pair vs
 stock o-projection + ``mnnvl_lamport_reduce_scatter``; S (4 / 8), features per CTA;
 a tcgen05 streaming producer for R > 64 (``OprojUmma``-style ring, tokens on N,
 pushes to row owners) to replace "cublas"; polling the owner slots in the GEMM's
@@ -61,13 +67,16 @@ from ..common.primitives import (
     thread,
 )
 from ..common.sp_comm import SpComm, positive_zero32
+from ..gemm.decode import TORCH_KINDS, DecodeProjection
+from ..gemm.mxfp8 import Mxfp8Projection
+from ..gemm.sp_policy import SP_TP, sp_projection_tactics
 
 WIDTH = 7168  # output features (the hidden size)
 SPLITS = 8  # CTAs per cluster: K slices
 FEATURES = 128  # output features per CTA (8 warps x 16)
 WARP_ROWS = 128  # rows whose x / partial tiles fit one CTA's shared memory
 # Tactic per TP on token rows (GENERIC, module docstring: NQ-TUNE).
-SP_OPROJ = {4: "4-64:warp,65-:cublas"}
+SP_OPROJ = {4: "4-64:warp,65-:gemm"}
 
 
 @asm((Float32,) * 4)
@@ -213,14 +222,17 @@ class SpOproj:
     ``comm.gather[parity][:R]``. Every R of ``rows`` is compiled (and its polling
     kernels residency-checked) at build; nothing falls back at run."""
 
-    def __init__(self, weight: torch.Tensor, comm: SpComm, rows, ctx: Context):
+    def __init__(self, weight, comm: SpComm, rows, ctx: Context):
         self.comm, self.ctx = comm, ctx
-        k = weight.shape[1] if weight.ndim == 2 else 0
         if not ctx.sequence_parallel or ctx.tp != comm.tp:
             raise Unsupported(
                 "oproj_rs", None, f"SP o-projection at TP{ctx.tp} (comm TP{comm.tp}, "
                 f"sequence parallel {ctx.sequence_parallel})",
             )  # fmt: skip
+        if isinstance(weight, Mxfp8Projection):
+            self._init_mxfp8(weight, rows)
+            return
+        k = weight.shape[1] if weight.ndim == 2 else 0
         if (
             weight.dtype != torch.bfloat16
             or weight.shape != (comm.width, k)
@@ -241,6 +253,21 @@ class SpOproj:
         self.tactics: dict[int, str] = {}
         self.codes: dict[int, object] = {}
         index = weight.device.index
+        gemm_rows = tuple(
+            r for r in rows if sp_tactic(ctx.tp, Shape(r, ctx.q)) == "gemm"
+        )
+        self.gemm = None
+        if gemm_rows:
+            if ctx.tp == SP_TP:
+                tactics = sp_projection_tactics("o_proj", WIDTH, k, gemm_rows, ctx)
+            else:  # (the table is TP4's: stock's GEMM, its bits, at other TPs)
+                tactics = dict.fromkeys(gemm_rows, ("cublas", None))
+            bad = {r: t for r, t in tactics.items() if t[0] not in TORCH_KINDS}
+            if bad:  # (the partial slots' alignment is the torch kinds' only)
+                raise Unsupported(
+                    "oproj_rs", min(bad), f"partial GEMM tactics {bad} (torch kinds)"
+                )
+            self.gemm = DecodeProjection(weight, gemm_rows, tactics, family="o_proj")
         for r in rows:
             shape = Shape(r, ctx.q)
             comm.shard(r)  # raises for rows the mailbox cannot carry
@@ -252,19 +279,100 @@ class SpOproj:
                         f"K % {32 * SPLITS} == 0 (K {k})",
                     )  # fmt: skip
                 self.codes[r] = compile_warp(r, k, comm.tp, comm.rows_cap, index)
-            elif tactic != "cublas":
+            elif tactic not in ("cublas", "gemm"):
                 raise Unsupported("oproj_rs", shape, f"unknown tactic {tactic!r}")
             # the owner half of either tactic and the all-gather (residency-checked)
-            comm.reduce_scatter_code(r, push=tactic == "cublas")
+            comm.reduce_scatter_code(r, push=tactic != "warp")
             comm.prepare(r)
             self.tactics[r] = tactic
+
+    def _init_mxfp8(self, projection, rows):
+        """The online-MXFP8 o-projection (NVFP4 checkpoint KDA layers): at every R the
+        MXFP8 partial GEMM (``gemm.mxfp8``: attn_out quantized as stock's online
+        linear does, FP32 accumulation, one BF16 rounding) into ``SpComm.partial``,
+        then ``SpReduceScatter(push=True)``: the "gemm" tactic with an MXFP8 GEMM."""
+        comm, ctx = self.comm, self.ctx
+        if projection.n != comm.width or comm.width != WIDTH:
+            raise Unsupported(
+                "oproj_rs", None, f"MXFP8 weight [{projection.n}, {projection.k}] "
+                f"(want [{WIDTH}, k])",
+            )  # fmt: skip
+        k = projection.k
+        if ctx.heads_per_rank and k != ctx.heads_per_rank * 128:
+            raise Unsupported(
+                "oproj_rs", None, f"K {k} != {ctx.heads_per_rank} heads x 128"
+            )
+        missing = [r for r in rows if r not in projection.kinds]
+        if missing:
+            raise Unsupported("oproj_rs", min(missing), "MXFP8 GEMM not prepared")
+        self.weight, self.k, self.wview = None, k, None
+        self.gemm, self.codes, self.tactics = projection, {}, {}
+        for r in rows:
+            comm.shard(r)  # raises for rows the mailbox cannot carry
+            comm.reduce_scatter_code(r, push=True)
+            comm.prepare(r)
+            self.tactics[r] = "mxfp8"
 
     def choice(self, rows: int) -> Choice:
         tactic = self.tactics.get(rows)
         if tactic is None:
             raise Unsupported("oproj_rs", rows, "not prepared")
+        if tactic == "mxfp8":
+            choice = self.gemm.choice(rows)
+            note = f"sp oproj {choice.note} + RS push"
+            return Choice(choice.path, (tactic, choice.tactic[1]), note=note)
+        if tactic == "gemm":
+            choice = self.gemm.choice(rows)
+            kind = choice.tactic[0]
+            note = f"sp oproj {kind} + RS push"
+            path = choice.path if self.ctx.tp == SP_TP else Path.GENERIC
+            return Choice(path, (tactic, kind), note=note)
         note = f"sp oproj {tactic}" + (f" S{SPLITS}" if tactic == "warp" else "")
         return Choice(Path.GENERIC, tactic, note=note + " (NQ-TUNE)")
+
+    def pushes(self, rows: int) -> bool:
+        """Whether the owner kernel must push this rank's partial at ``rows`` (the
+        GEMM tactics stage it in ``comm.partial``; "warp" pushes from the GEMM)."""
+        return self.tactics[rows] != "warp"
+
+    def produce(self, attn_out: torch.Tensor, parity: int):
+        """The o-projection half only, for an owner kernel that follows
+        (``attn_res.sp_fused.SpReduceAttnRes``): the GEMM tactics write the partial
+        [R, 7168] into ``comm.partial`` and return it (the owner kernel pushes it);
+        "warp" pushes from the GEMM and returns None. (The MXFP8 o-projection is a
+        GEMM tactic: "mxfp8".)"""
+        rows = attn_out.shape[0]
+        tactic = self._checked(attn_out)
+        comm = self.comm
+        if tactic == "cublas":
+            partial = comm.partial[:rows]
+            torch.mm(attn_out, self.weight.t(), out=partial)
+            return partial
+        if tactic in ("gemm", "mxfp8"):
+            partial = comm.partial[:rows]
+            self.gemm.run(attn_out, partial)
+            return partial
+        _, _, recv, peers = comm.views(parity)
+        self.codes[rows](
+            to_cute(attn_out), self.wview, recv, peers, Int32(comm.rank),
+            stream(self.weight.device),
+        )  # fmt: skip
+        return None
+
+    def _checked(self, attn_out):
+        rows = attn_out.shape[0]
+        tactic = self.tactics.get(rows)
+        if (
+            tactic is None
+            or attn_out.dtype != torch.bfloat16
+            or attn_out.shape[1] != self.k
+            or attn_out.stride() != (self.k, 1)
+        ):
+            raise Unsupported(
+                "oproj_rs", rows, f"attn_out {tuple(attn_out.shape)} stride "
+                f"{attn_out.stride()} {attn_out.dtype} (prepared: [R, {self.k}] BF16)",
+            )  # fmt: skip
+        return tactic
 
     def run(
         self, attn_out: torch.Tensor, out_shard: torch.Tensor, parity: int
@@ -285,6 +393,10 @@ class SpOproj:
         if tactic == "cublas":
             partial = comm.partial[:rows]
             torch.mm(attn_out, self.weight.t(), out=partial)
+            return comm.reduce_scatter(out_shard, parity, rows, partial)
+        if tactic in ("gemm", "mxfp8"):
+            partial = comm.partial[:rows]
+            self.gemm.run(attn_out, partial)
             return comm.reduce_scatter(out_shard, parity, rows, partial)
         _, _, recv, peers = comm.views(parity)
         self.codes[rows](

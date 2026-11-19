@@ -4,29 +4,37 @@
 DCP4 = SP4 attention groups over DP4, EP16 MegaMoE, DSpark q4; ``runtime.sp_topology``).
 
 Stock keeps the residual stream row-sharded over the TP group (``sp_shard``: rank r
-owns rows [r n, (r + 1) n), n = R / 4) and runs each layer as all-gather -> attention
-on all R rows (24 of 96 heads per rank) -> o_proj -> reduce-scatter -> AttnRes on the
-shard -> MLP on the shard. This step keeps that layout and replaces only each DSA /
-KDA layer's all-gather .. reduce-scatter with one ``SpAttentionBlock``:
+owns rows [r n, (r + 1) n), n = R / 4) and runs each layer as AttnRes on the shard ->
+all-gather -> attention on all R rows (24 of 96 heads per rank) -> o_proj ->
+reduce-scatter -> AttnRes on the shard -> MLP on the shard. This step keeps that
+layout; each layer boundary is two fused kernels (``attn_res.sp_fused``, family
+``sp_boundary``): ``SpAttnResGather`` (the pre-attention AttnRes, its rows multicast
+into every rank's all-gather box) and ``SpReduceAttnRes`` (the reduce-scatter owner
+sum as the post-attention AttnRes delta), around one ``SpAttentionBlock``:
 
   stage            provider                                          family
-  all-gather       ``SpComm.all_gather`` (multicast, Lamport)        ag
+  AttnRes + AG     ``SpAttnResGather`` (multicast, Lamport)          sp_boundary
   in-projection    ``DecodeProjection`` over the gathered rows        dsa_in / kda_in
   core             ``SpDsaCore`` (DSA) / ``SpKdaCore`` (KDA)          dsa / kda
-  o_proj + RS      ``SpOproj`` (4-rank reduce-scatter)                oproj_rs
+  o_proj           ``SpOproj.produce`` (partial, or pushed by "warp") oproj_rs
+  RS + AttnRes     ``SpReduceAttnRes`` (push, owner sum, re-arm)     sp_boundary
+
+Each MegaMoE layer's MLP runs ``runtime.sp_mlp.SpMlp``: the stock layer's forward
+step for step, its four dense BF16 GEMMs (latent down / up, shared gate_up / down) on
+``gemm.sp_policy``'s measured tactics (family ``moe_dense``).
 
 Everything else is the stock module, called as the stock forward calls it
-(``Path.DECLARED``, ``shapes.DECLARED_STOCK``): the embedding, ``_pre_attn_norm`` /
-``_post_attn_norm`` (AttnRes) on the shard, the MegaMoE / dense MLP on the shard (with
-stock's ``sp_padding_mask``), the aux streams, the final AttnRes, the final
-``sp_all_gather`` and the norm. The verification (synthetic rejection), LM head,
-sampler and the preview (MLA) DSpark drafter stay stock too, except the drafter's MLA
-attention: ``runtime.draft`` FAST_DCP's TP4 entry runs it on cutedsl.draft.attention
-DraftDcp (publish-only MlaQuery, polled cores with length-keyed splits, DcpValue),
-strict; no other preview drafter table has a TP4 entry (SP_DRAFTER_TABLES, checked at
-build). The release (GQA) DSpark drafter is not a declared stock module: its own
-build (``runtime.draft.GqaDraftFastPath``) is strict here, every piece of every
-captured drafter batch specialized or the load refused.
+(``Path.DECLARED``, ``shapes.DECLARED_STOCK``): the embedding, the MegaMoE router /
+experts / norms and the dense MLP on the shard (with stock's ``sp_padding_mask``), the
+aux streams, the final AttnRes and the norm. The final row all-gather is
+``SpFinalGather`` (one multicast Lamport kernel; stock ``sp_all_gather``'s rows). The verification (synthetic
+rejection), LM head, sampler and the preview (MLA) DSpark drafter stay stock too, except
+the drafter's MLA attention: ``runtime.draft`` FAST_DCP's TP4 entry runs it on
+cutedsl.draft.attention DraftDcp (publish-only MlaQuery, polled cores with length-keyed
+splits, DcpValue), strict; no other preview drafter table has a TP4 entry
+(SP_DRAFTER_TABLES, checked at build). The release (GQA) DSpark drafter is not a
+declared stock module: its own build (``runtime.draft.GqaDraftFastPath``) is strict
+here, every piece of every captured drafter batch specialized or the load refused.
 
 R = 4 n for n = 1..128 requests per DP group (0.25..32 requests per GPU): every
 captured R is a multiple of TP4, so SP never pads. Every captured R is served by every
@@ -36,8 +44,8 @@ this path falls back to the stock forward.
 
 Mailbox parities: ``SpComm`` alternates by SP block ordinal (DSA and KDA together),
 the DSA DcpBox by DSA-layer ordinal. With an odd block count the last block of a step
-and the first of the next share a parity; the stock final ``sp_all_gather`` (a TP
-collective) separates them.
+and the first of the next share a parity; the final ``SpFinalGather`` (a TP
+collective: every rank polls every rank's rows) separates them.
 
 RecoverSSM: "deferred" records (``recoverssm.prepare_recoverssm``): the commit after
 sampling only stages each request's accepted count, and the next step's KDA core folds
@@ -56,23 +64,23 @@ from vllm import envs
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_shard,
-)
+from vllm.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 
 from ...dense_draft import is_gqa_dspark
 from ...ops.attn_res import attn_res
-from ..cutedsl.common.sp_comm import SpComm
+from ..cutedsl.attn_res.sp_fused import SpBoundary
+from ..cutedsl.common.sp_comm import SpComm, SpFinalGather
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
+from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
+from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
 from ..cutedsl.kda.sp import SpKdaCore
 from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
+from .sp_mlp import SpMlp, moe_choice
 
 logger = init_logger(__name__)
 
@@ -113,6 +121,46 @@ def sp_layer(decoder, step):
         )  # fmt: skip
 
 
+def sp_boundary(decoder, comm, block, rows, mlp=None):
+    """The layer's fused SP boundaries (``attn_res.sp_fused.SpBoundary``): the stock
+    ``_pre_attn_norm`` / ``_post_attn_norm`` weights, block pattern and epsilons. An
+    MXFP8 in-projection (the NVFP4 checkpoint's KDA layers) takes the all-gather as
+    MXFP8; an ``SpMlp`` with an MXFP8 shared expert (``mlp``) takes its gate_up input
+    quantized by the post-AttnRes."""
+    pre = (
+        (
+            decoder.self_attention_res_norm.weight,
+            decoder.self_attention_res_proj.weight,
+            decoder.input_layernorm.weight,
+        ),
+        (
+            decoder.self_attention_res_norm.variance_epsilon,
+            decoder.input_layernorm.variance_epsilon,
+        ),
+    )
+    post = (
+        (
+            decoder.mlp_res_norm.weight,
+            decoder.mlp_res_proj.weight,
+            decoder.post_attention_layernorm.weight,
+        ),
+        (
+            decoder.mlp_res_norm.variance_epsilon,
+            decoder.post_attention_layernorm.variance_epsilon,
+        ),
+    )
+    write = decoder.block_write_idx if decoder.is_block_write_layer else -1
+    pushes = {r: block.oproj.pushes(r) for r in rows}
+    n_max = rows[-1] // comm.tp
+    first = decoder.layer_idx == 0
+    gather_mx = isinstance(block.projection, Mxfp8Projection)
+    out_mx = None if mlp is None else mlp.mx_input()
+    return SpBoundary(
+        comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first,
+        gather_mx=gather_mx, out_mx=out_mx,
+    )  # fmt: skip
+
+
 class SpAttentionBlock:
     """One DSA / KDA layer's all-gather -> in-projection -> core -> o_proj with its
     reduce-scatter (module docstring): ``run(x_shard [n, 7168])`` returns the layer's
@@ -125,19 +173,36 @@ class SpAttentionBlock:
         self.kind = kind = attention_kind(attention)
         self.index, self.parity = decoder.layer_idx, ordinal % 2
         where = f"layer {self.index}"
-        try:  # BF16 projections only (a quantized layer is refused, not misread)
+        family = f"{kind}_in"
+        # BF16 projections, or the online-MXFP8 KDA projections of the NVFP4
+        # (modelopt_mixed) checkpoint (``gemm.mxfp8``); any other quantized layer is
+        # refused, not misread.
+        mx_in = kind == "kda" and is_mxfp8_linear(attention.in_proj_qkvgfab)
+        mx_out = kind == "kda" and is_mxfp8_linear(attention.o_proj)
+        try:
             if kind == "dsa":
                 weight = pack_dsa_projection(attention)
-            else:
+            elif not mx_in:
                 weight = bf16_weight(attention.in_proj_qkvgfab)
-            output = bf16_weight(attention.o_proj)
+            output = None if mx_out else bf16_weight(attention.o_proj)
         except ValueError as error:  # (re-raised with the layer)
             raise Unsupported(kind, None, f"{where}: {error}") from error
-        pitch, k = weight.shape
-        family = f"{kind}_in"
         with torch.accelerator.device_index(step.device.index):
-            tactics = sp_projection_tactics(family, pitch, k, rows, ctx)
-        self.projection = DecodeProjection(weight, rows, tactics, family=family)
+            if mx_in:
+                self.projection = Mxfp8Projection(
+                    attention.in_proj_qkvgfab, rows, family=family, cap=rows[-1]
+                )
+                pitch = self.projection.n
+            else:
+                pitch, k = weight.shape
+                tactics = sp_projection_tactics(family, pitch, k, rows, ctx)
+                self.projection = DecodeProjection(
+                    weight, rows, tactics, family=family
+                )
+            if mx_out:
+                output = Mxfp8Projection(
+                    attention.o_proj, rows, family="o_proj", cap=rows[-1]
+                )
         if kind == "dsa":
             parity = step.dsa_layers % 2  # the DcpBox's own alternation
             step.dsa_layers += 1
@@ -154,13 +219,34 @@ class SpAttentionBlock:
                 kind, None,
                 f"{where}: core pitch {self.core.pitch} != in-projection N {pitch}",
             )  # fmt: skip
-        self.width = output.shape[1]  # heads x 128 (the o_proj input)
+        # heads x 128 (the o_proj input)
+        self.width = output.k if isinstance(output, Mxfp8Projection) else output.shape[1]
         self.oproj = SpOproj(output, step.comm, rows, ctx)
         cap = rows[-1]
         self.projected = step.scratch(f"{kind}.projected", (cap, pitch))
         self.attn_out = step.scratch(f"attn_out.{self.width}", (cap, self.width))
         for parity in range(step.comm.parities):  # every tactic takes the operands
             self.projection.check_operands(step.comm.gather[parity], self.projected)
+
+    def attend(self, gathered, caches, metadata, step):
+        """In-projection + core over the all-gathered rows ``gathered`` [R, 7168]
+        (``attn_res.sp_fused.SpAttnResGather`` filled them), then the o-projection
+        half (``SpOproj.produce``): returns this rank's partial to push, or None when
+        the o-projection pushed it."""
+        rows = gathered.shape[0] if isinstance(gathered, torch.Tensor) else gathered.rows
+        projected = self.projected[:rows]
+        self.projection.run(gathered, projected)
+        attn_out = self.attn_out[:rows]
+        if self.kind == "dsa":
+            indexer = get_forward_context().attn_metadata[self.index_prefix]
+            self.core.run(
+                projected, attn_out, cache=caches[0],
+                slots=step.slot_mapping[self.slots],
+                index_slots=indexer.slot_mapping, metadata=metadata, q=step.q,
+            )  # fmt: skip
+        else:
+            self.core.run(projected, attn_out, caches=caches, metadata=metadata)
+        return self.oproj.produce(attn_out, self.parity)
 
     def run(self, x_shard, caches, metadata, step):
         """``x_shard`` [n, 7168] BF16: the stock ``_pre_attn_norm`` output on this
@@ -288,6 +374,12 @@ class SpStep:
         self.buffers: dict[str, torch.Tensor] = {}
         owner = runtime.group, self.device, ctx.tp, ctx.rank
         self.comm = SpComm(*owner, width=WIDTH, rows_cap=rows[-1])
+        # [hidden | aux...] rows of the final all-gather (every aux layer is this
+        # rank's: no pipeline stages on the SP path).
+        packed = WIDTH * (1 + len(self.aux_layers))
+        self.final_gather = SpFinalGather(*owner, width=packed, rows_cap=rows[-1])
+        for r in rows:
+            self.final_gather.prepare(r)
         kinds = {attention_kind(d.self_attn) for d in layers}
         self.dsa_box = self.dsa_scratch = None
         self.dsa_layers = 0
@@ -308,6 +400,22 @@ class SpStep:
         }
         self.dense = any(not d.is_moe_layer for d in layers)
         self.moe = any(d.is_moe_layer for d in layers)
+        # The MegaMoE layers' dense BF16 GEMMs on this rank's shard rows (sp_mlp).
+        shards = tuple(sorted({r // ctx.tp for r in rows}))
+        self.mlps = {
+            d.layer_idx: SpMlp(d.mlp, shards, ctx, d.layer_idx)
+            for d in layers
+            if d.is_moe_layer
+        }
+        # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
+        # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
+        self.bounds = {
+            d.layer_idx: sp_boundary(
+                d, self.comm, self.blocks[d.layer_idx], rows,
+                self.mlps.get(d.layer_idx),
+            )  # fmt: skip
+            for d in layers
+        }
         self.table = self.plan_coverage()
         self.table.assert_complete(rows)
         if ctx.rank == 0:
@@ -350,15 +458,17 @@ class SpStep:
         method = getattr(spec, "rejection_sample_method", None)
         declared = {
             "embed": "stock VocabParallelEmbedding",
-            "attn_res": "stock attn_res on the shard",
-            "final_gather": "stock sp_all_gather",
+            "attn_res": "the final AttnRes: stock attn_res on the shard",
             "lm_head": "stock",
             "sampler": "stock",
         }
         if not self.gqa_drafter:
             declared["drafter"] = DRAFTER_NOTE
         if self.moe:
-            declared["moe"] = f"stock MegaMoE on the shard (EP{ctx.ep})"
+            declared["moe"] = (
+                f"stock MegaMoE router / experts / norms on the shard (EP{ctx.ep}); "
+                "its dense GEMMs: moe_dense"
+            )
         if self.dense:
             declared["dense"] = "stock dense MLP on the shard"
         if method == "synthetic":
@@ -372,11 +482,21 @@ class SpStep:
         TP4 or raises when the model builds it."""
         coverage = Coverage(self.q)
         declared = self.declared()
+        ctx = self.ctx
         for r in self.rows:
             choices = {"ag": self.comm.choice(r)}
+            choices["final_gather"] = Choice(
+                Path.GENERIC, "multicast", note="SpFinalGather (Lamport, one kernel)"
+            )
+            choices["sp_boundary"] = Choice(
+                Path.GENERIC, "cluster",
+                note="AttnRes + SP AG / RS fused (attn_res.sp_fused)",
+            )  # fmt: skip
             for block in self.blocks.values():
                 for family, choice in block.choices(r).items():
                     choices.setdefault(family, choice)
+            if self.mlps:
+                choices["moe_dense"] = moe_choice(self.mlps, r // ctx.tp)
             if "verify" not in declared:
                 choices["verify"] = Choice(Path.GENERIC, note="VerifyArgmax")
             coverage.specialize(r, choices)
@@ -455,17 +575,20 @@ class SpStep:
             (hidden.size(0), backbone.num_attn_res_blocks, hidden.size(1))
         )
         prefix_sum, hidden = hidden, None
+        # The prefix sum is updated in place (the embedding shard first): the fused
+        # boundaries store each updated / new prefix row into it.
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
-            hidden, prefix_sum, residual = layer._pre_attn_norm(
-                hidden, residual, prefix_sum
-            )
-            block = self.blocks[index]
-            hidden = block.run(hidden, caches_of(layer.self_attn), md, step)
-            hidden, prefix_sum, residual = layer._post_attn_norm(
-                hidden, residual, prefix_sum
-            )
-            hidden = layer.mlp(hidden)
+            block, bound = self.blocks[index], self.bounds[index]
+            gathered = bound.gather(hidden, prefix_sum, residual, block.parity)
+            partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
+            out = prefix_sum.new_empty(prefix_sum.shape)
+            hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
+            mlp = self.mlps.get(index)
+            if mlp is None:
+                hidden = layer.mlp(hidden)
+            else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
+                hidden = mlp.run(hidden, prequantized=bound.out_mx is not None)
             if index + 1 in self.aux_layers:
                 aux.append(
                     backbone._capture_aux_hidden_stream(
@@ -485,12 +608,14 @@ class SpStep:
             eps=final.variance_epsilon,
             output_norm_eps=0.0,
         )
+        # The final row all-gather on the multicast box (``SpFinalGather``; stock
+        # ``sp_all_gather``'s rows, sanitized words).
         if aux:
             width = hidden.shape[-1]
-            packed = sp_all_gather(torch.cat([hidden, *aux], dim=-1))[:rows]
+            packed = self.final_gather.run(torch.cat([hidden, *aux], dim=-1))[:rows]
             hidden, *aux = packed.split(width, dim=-1)
         else:
-            hidden = sp_all_gather(hidden)[:rows]
+            hidden = self.final_gather.run(hidden.contiguous())[:rows]
         aux = remote + aux
         return runtime.normalize((hidden, aux) if aux else hidden)
 

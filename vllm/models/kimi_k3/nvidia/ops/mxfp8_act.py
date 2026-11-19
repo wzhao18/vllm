@@ -103,7 +103,8 @@ __device__ __forceinline__ float bf16_bits_to_float(uint16_t b) {
 }
 
 __device__ __forceinline__ uint16_t float_to_bf16_bits(float f) {
-  return c10::BFloat16(f).x;
+  // cvt.rn.bf16.f32: RNE as c10::BFloat16 for every non-NaN value.
+  return __bfloat16_as_ushort(__float2bfloat16_rn(f));
 }
 
 // Byte offset of scale block `col` of `row` in the F8_128x4 swizzled layout
@@ -152,8 +153,300 @@ __device__ __forceinline__ float situ_activation(float g, float u, float beta,
   const float up_out = clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
   return gate_out * up_out;
 }
+// SiTU with the MUFU-light form of the routed experts' MegaMoE FC1 epilogue
+// (FlashInfer block_scaled_swap_ab_fc12_epilogue, vLLM S3): with
+// A = e^-g, B = e^(-2g/beta), C = e^(-2u/linear_beta),
+//   sigmoid(g) = 1/(1+A), tanh(g/beta) = (1-B)/(1+B), tanh(u/lbeta) = (1-C)/(1+C)
+//   out = beta*lbeta * (1-B)(1-C) / ((1+A)(1+B)(1+C))
+// on ex2.approx / rcp.approx (2 ex2 + 1 rcp when beta/2 is a small integer).
+// Not bitwise equal to the precise-tanhf form above (test bound: BF16 noise).
+__device__ __forceinline__ float ex2_approx(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float rcp_approx(float x) {
+  float y;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+struct Situ4Consts {
+  float2 k_a, k_b, k_c, bb;  // per-element constants, duplicated for f32x2
+  int a_pow;                 // A = B^a_pow when beta/2 is 1..4, else 0
+  bool clamp_up;
+};
 
-// mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 2 silu-and-mul,
+__device__ __forceinline__ float2 f2mul(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fmul2_rn(a, b);
+#else
+  return make_float2(a.x * b.x, a.y * b.y);
+#endif
+}
+__device__ __forceinline__ float2 f2fma(float2 a, float2 b, float2 c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __ffma2_rn(a, b, c);
+#else
+  return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+__device__ __forceinline__ float2 f2add(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fadd2_rn(a, b);
+#else
+  return make_float2(a.x + b.x, a.y + b.y);
+#endif
+}
+__device__ __forceinline__ float2 bf16x2_to_f2(uint32_t w) {
+  return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
+// SiTU of two (gate, up) BF16 pairs, rounded to BF16 (the stock activation
+// output dtype), returned as packed bf16x2.
+__device__ __forceinline__ __nv_bfloat162 situ4_pair(uint32_t gw, uint32_t uw,
+                                                     const Situ4Consts& c) {
+  const float2 one = make_float2(1.0f, 1.0f);
+  const float2 neg_one = make_float2(-1.0f, -1.0f);
+  const float2 g = bf16x2_to_f2(gw), u = bf16x2_to_f2(uw);
+  const float2 xb = f2mul(g, c.k_b);
+  float2 eb = make_float2(fminf(ex2_approx(xb.x), 1.0e9f),
+                          fminf(ex2_approx(xb.y), 1.0e9f));
+  float2 ea;
+  if (c.a_pow > 0) {
+    ea = eb;
+    for (int i = 1; i < c.a_pow; ++i) ea = f2mul(ea, eb);
+  } else {
+    const float2 xa = f2mul(g, c.k_a);
+    ea = make_float2(ex2_approx(xa.x), ex2_approx(xa.y));
+  }
+  float2 num, den;
+  if (c.clamp_up) {
+    const float2 xc = f2mul(u, c.k_c);
+    const float2 ec = make_float2(fminf(ex2_approx(xc.x), 1.0e9f),
+                                  fminf(ex2_approx(xc.y), 1.0e9f));
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), f2fma(ec, neg_one, one)), c.bb);
+    den = f2mul(f2mul(f2add(ea, one), f2add(eb, one)), f2add(ec, one));
+  } else {
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), c.bb), u);
+    den = f2mul(f2add(ea, one), f2add(eb, one));
+  }
+  const float2 r = f2mul(num, make_float2(rcp_approx(den.x), rcp_approx(den.y)));
+  return __float22bfloat162_rn(r);
+}
+
+// SiTU + MXFP8 quant of one 8-column vector (a: gate, b: up): the same E8M0 /
+// E4M3 steps as quant8_store, on packed operands.
+__device__ __forceinline__ void situ4_quant_store(
+    const uint4& a, const uint4& b, const Situ4Consts& c,
+    uint8_t* __restrict__ q, uint8_t* __restrict__ sf, int64_t row, int col8,
+    int sf_col_base, int padded_cols, bool real) {
+  __nv_bfloat162 h[4];
+  if (real) {
+    h[0] = situ4_pair(a.x, b.x, c);
+    h[1] = situ4_pair(a.y, b.y, c);
+    h[2] = situ4_pair(a.z, b.z, c);
+    h[3] = situ4_pair(a.w, b.w, c);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = __float2bfloat162_rn(0.0f);
+  }
+  // amax on the BF16 values (exact).
+  __nv_bfloat162 m = __hmax2(__habs2(h[0]), __habs2(h[1]));
+  m = __hmax2(m, __hmax2(__habs2(h[2]), __habs2(h[3])));
+  float amax = fmaxf(__low2float(m), __high2float(m));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+  const uint32_t e = float_to_ue8m0(amax * (1.0f / 448.0f));
+  const float inv = ue8m0_to_inv_scale(e);
+  if (!real) return;
+  const float2 inv2 = make_float2(inv, inv);
+  uint32_t w[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 v = f2mul(__bfloat1622float2(h[i]), inv2);
+    w[i] = (uint32_t)fp8x2(v.x, v.y);
+  }
+  uint2 packed;
+  packed.x = w[0] | (w[1] << 16);
+  packed.y = w[2] | (w[3] << 16);
+  *reinterpret_cast<uint2*>(q) = packed;
+  if ((threadIdx.x & 3) == 0) {
+    sf[swizzled_sf_offset(row, sf_col_base + (col8 >> 2), padded_cols)] =
+        (uint8_t)e;
+  }
+}
+
+// Vectors (8 columns) per thread per trip: their loads are all issued before
+// any is used, so each SM keeps enough bytes in flight to stream HBM.
+constexpr int ACT_QUANT_UNROLL = 4;
+
+template <int MODE>
+__device__ __forceinline__ void act_load(const uint16_t* __restrict__ x,
+                                         const uint16_t* __restrict__ g,
+                                         int64_t row, int col, int d,
+                                         int64_t x_stride, int64_t g_stride,
+                                         uint4& a, uint4& b) {
+  if (MODE == 0) {
+    a = __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
+  } else if (MODE == 1 || MODE == 2 || MODE == 4) {
+    const uint16_t* gp = x + row * x_stride + col;
+    a = __ldg(reinterpret_cast<const uint4*>(gp));
+    b = __ldg(reinterpret_cast<const uint4*>(gp + d));
+  } else {
+    a = __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
+    b = __ldg(reinterpret_cast<const uint4*>(g + row * g_stride + col));
+  }
+}
+
+template <int MODE>
+__device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
+                                            float (&out)[8], float beta,
+                                            float linear_beta, bool clamp_up,
+                                            float inv_beta,
+                                            float inv_linear_beta) {
+  if (MODE == 0) {
+    const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&a);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
+  } else if (MODE == 1 || MODE == 2) {
+    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
+    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float gv = bf16_bits_to_float(g16[i]);
+      const float uv = bf16_bits_to_float(u16[i]);
+      float r;
+      if (MODE == 1) {
+        r = situ_activation(gv, uv, beta, linear_beta, clamp_up, inv_beta,
+                            inv_linear_beta);
+      } else {
+        // csrc act_and_mul_kernel: (T)silu(x) * y, both rounded to T.
+        const float s =
+            bf16_bits_to_float(float_to_bf16_bits(gv / (1.0f + expf(-gv))));
+        r = s * uv;
+      }
+      out[i] = bf16_bits_to_float(float_to_bf16_bits(r));
+    }
+  } else {
+    // mla._gate_sigmoid_mul is torch.compiled: one FP32 expression
+    // a * sigmoid(g), rounded to BF16 once.
+    const uint16_t* a16 = reinterpret_cast<const uint16_t*>(&a);
+    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&b);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float gv = bf16_bits_to_float(g16[i]);
+      const float s = 1.0f / (1.0f + expf(-gv));
+      out[i] = bf16_bits_to_float(
+          float_to_bf16_bits(bf16_bits_to_float(a16[i]) * s));
+    }
+  }
+}
+
+// situ4_pair with the SiTU form fixed at compile time (A_POW, CLAMP): the
+// same operations in the same order, without the runtime branches.
+template <int A_POW, bool CLAMP>
+__device__ __forceinline__ uint32_t situ4_pair_ct(uint32_t gw, uint32_t uw,
+                                                  const float2 k_a,
+                                                  const float2 k_b,
+                                                  const float2 k_c,
+                                                  const float2 bb) {
+  const float2 one = make_float2(1.0f, 1.0f);
+  const float2 neg_one = make_float2(-1.0f, -1.0f);
+  const float2 g = bf16x2_to_f2(gw), u = bf16x2_to_f2(uw);
+  const float2 xb = f2mul(g, k_b);
+  const float2 eb = make_float2(fminf(ex2_approx(xb.x), 1.0e9f),
+                                fminf(ex2_approx(xb.y), 1.0e9f));
+  float2 ea;
+  if (A_POW > 0) {
+    ea = eb;
+#pragma unroll
+    for (int i = 1; i < A_POW; ++i) ea = f2mul(ea, eb);
+  } else {
+    const float2 xa = f2mul(g, k_a);
+    ea = make_float2(ex2_approx(xa.x), ex2_approx(xa.y));
+  }
+  float2 num, den;
+  if (CLAMP) {
+    const float2 xc = f2mul(u, k_c);
+    const float2 ec = make_float2(fminf(ex2_approx(xc.x), 1.0e9f),
+                                  fminf(ex2_approx(xc.y), 1.0e9f));
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), f2fma(ec, neg_one, one)), bb);
+    den = f2mul(f2mul(f2add(ea, one), f2add(eb, one)), f2add(ec, one));
+  } else {
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), bb), u);
+    den = f2mul(f2add(ea, one), f2add(eb, one));
+  }
+  const float2 r = f2mul(num, make_float2(rcp_approx(den.x), rcp_approx(den.y)));
+  const __nv_bfloat162 h = __float22bfloat162_rn(r);
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// Mode 4 for d % 1024 == 0, d <= 32768, 16-byte aligned rows: one CTA per
+// (padded) row and one thread per 32-column MXFP8 block, so the block amax
+// stays in registers and the indexing is two integer ops. Bytes equal
+// act_quant_kernel<4> (same SiTU and quantization steps).
+template <int A_POW, bool CLAMP>
+__global__ void __launch_bounds__(1024) situ4_row_kernel(
+    uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
+    const uint16_t* __restrict__ x, const int64_t rows, const int d,
+    const int64_t x_stride, const int64_t q_stride, const int sf_col_base,
+    const int padded_cols, const float beta, const float linear_beta) {
+  const float log2e = 1.4426950408889634f;
+  const float kb = -2.0f * log2e / beta;
+  const float kc = CLAMP ? -2.0f * log2e / linear_beta : 0.0f;
+  const float bbs = CLAMP ? beta * linear_beta : beta;
+  const float2 k_a = make_float2(-log2e, -log2e), k_b = make_float2(kb, kb);
+  const float2 k_c = make_float2(kc, kc), bb = make_float2(bbs, bbs);
+  const int64_t row = blockIdx.x;
+  const int blk = threadIdx.x;
+  const int64_t sf_off = swizzled_sf_offset(row, sf_col_base + blk, padded_cols);
+  if (row >= rows) {
+    sf[sf_off] = 0;
+    return;
+  }
+  const uint4* gp =
+      reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
+  const uint4* up = reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
+  uint4 a[4], b[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) a[i] = __ldg(gp + i);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) b[i] = __ldg(up + i);
+  uint32_t h[16];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    h[4 * i + 0] = situ4_pair_ct<A_POW, CLAMP>(a[i].x, b[i].x, k_a, k_b, k_c, bb);
+    h[4 * i + 1] = situ4_pair_ct<A_POW, CLAMP>(a[i].y, b[i].y, k_a, k_b, k_c, bb);
+    h[4 * i + 2] = situ4_pair_ct<A_POW, CLAMP>(a[i].z, b[i].z, k_a, k_b, k_c, bb);
+    h[4 * i + 3] = situ4_pair_ct<A_POW, CLAMP>(a[i].w, b[i].w, k_a, k_b, k_c, bb);
+  }
+  // amax on the BF16 values (exact).
+  __nv_bfloat162 m = __habs2(*reinterpret_cast<const __nv_bfloat162*>(&h[0]));
+#pragma unroll
+  for (int i = 1; i < 16; ++i)
+    m = __hmax2(m, __habs2(*reinterpret_cast<const __nv_bfloat162*>(&h[i])));
+  const float amax = fmaxf(__low2float(m), __high2float(m));
+  const uint32_t e = float_to_ue8m0(amax * (1.0f / 448.0f));
+  const float inv = ue8m0_to_inv_scale(e);
+  const float2 inv2 = make_float2(inv, inv);
+  uint32_t w[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float2 v0 = f2mul(
+        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[2 * i])), inv2);
+    const float2 v1 = f2mul(
+        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[2 * i + 1])),
+        inv2);
+    w[i] = (uint32_t)fp8x2(v0.x, v0.y) | ((uint32_t)fp8x2(v1.x, v1.y) << 16);
+  }
+  uint4* qp = reinterpret_cast<uint4*>(q + row * q_stride + blk * 32);
+  qp[0] = make_uint4(w[0], w[1], w[2], w[3]);
+  qp[1] = make_uint4(w[4], w[5], w[6], w[7]);
+  sf[sf_off] = (uint8_t)e;
+}
+
+// mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 4 the same with the
+//       routed experts' MUFU-light SiTU, 2 silu-and-mul,
 //       3 x * sigmoid(g)  (two inputs, both [rows, d])
 template <int MODE>
 __global__ void act_quant_kernel(uint8_t* __restrict__ q,
@@ -170,73 +463,90 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   const bool clamp_up = linear_beta > 0.0f;
   const float inv_beta = MODE == 1 ? 1.0f / beta : 0.f;
   const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+  Situ4Consts c4;
+  if (MODE == 4) {
+    const float log2e = 1.4426950408889634f;
+    const float kb = -2.0f * log2e / beta;
+    const float kc = clamp_up ? -2.0f * log2e / linear_beta : 0.0f;
+    const float bb = clamp_up ? beta * linear_beta : beta;
+    const float half = 0.5f * beta;
+    c4.k_a = make_float2(-log2e, -log2e);
+    c4.k_b = make_float2(kb, kb);
+    c4.k_c = make_float2(kc, kc);
+    c4.bb = make_float2(bb, bb);
+    c4.a_pow = (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+    c4.clamp_up = clamp_up;
+  }
   // Every lane runs the same trip count (total is a multiple of 4 vectors,
-  // blockDim a multiple of 32), so the block-amax shuffles are uniform.
+  // blockDim a multiple of 32), so the block-amax shuffles are uniform; the
+  // 4 lanes of an MXFP8 block hold consecutive vectors in every sub-trip.
   const int64_t stride = (int64_t)gridDim.x * blockDim.x;
-  const int64_t total_round = (total + stride - 1) / stride * stride;
-  for (int64_t v = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-       v < total_round; v += stride) {
-    const bool live = v < total;
-    const int64_t row = live ? v / vecs_per_row : 0;
-    const int col = live ? (int)(v - row * vecs_per_row) * 8 : 0;
-    const bool real = live && row < rows;
-    float out[8];
-    if (real) {
-      if (MODE == 0) {
-        const uint4 raw =
-            __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-        const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw);
+  const int64_t trip = stride * ACT_QUANT_UNROLL;
+  const int64_t total_round = (total + trip - 1) / trip * trip;
+  // (row, vector column) advance by (srow, scol) per sub-trip: one 64-bit
+  // division per trip instead of one per vector.
+  const int64_t srow = stride / vecs_per_row;
+  const int scol = (int)(stride - srow * vecs_per_row);
+  for (int64_t v0 = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+       v0 < total_round; v0 += trip) {
+    uint4 a[ACT_QUANT_UNROLL], b[ACT_QUANT_UNROLL];
+    int64_t rows_u[ACT_QUANT_UNROLL];
+    int cols_u[ACT_QUANT_UNROLL];
+    {
+      int64_t r = v0 / vecs_per_row;
+      int c = (int)(v0 - r * vecs_per_row);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
-      } else if (MODE == 1 || MODE == 2) {
-        const uint16_t* gp = x + row * x_stride + col;
-        const uint4 graw = __ldg(reinterpret_cast<const uint4*>(gp));
-        const uint4 uraw = __ldg(reinterpret_cast<const uint4*>(gp + d));
-        const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&graw);
-        const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&uraw);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float gv = bf16_bits_to_float(g16[i]);
-          const float uv = bf16_bits_to_float(u16[i]);
-          float r;
-          if (MODE == 1) {
-            r = situ_activation(gv, uv, beta, linear_beta, clamp_up, inv_beta,
-                                inv_linear_beta);
-          } else {
-            // csrc act_and_mul_kernel: (T)silu(x) * y, both rounded to T.
-            const float s =
-                bf16_bits_to_float(float_to_bf16_bits(gv / (1.0f + expf(-gv))));
-            r = s * uv;
-          }
-          out[i] = bf16_bits_to_float(float_to_bf16_bits(r));
-        }
-      } else {
-        // mla._gate_sigmoid_mul is torch.compiled: one FP32 expression
-        // a * sigmoid(g), rounded to BF16 once.
-        const uint4 araw =
-            __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-        const uint4 graw =
-            __ldg(reinterpret_cast<const uint4*>(g + row * g_stride + col));
-        const uint16_t* a16 = reinterpret_cast<const uint16_t*>(&araw);
-        const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&graw);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float gv = bf16_bits_to_float(g16[i]);
-          const float s = 1.0f / (1.0f + expf(-gv));
-          out[i] = bf16_bits_to_float(
-              float_to_bf16_bits(bf16_bits_to_float(a16[i]) * s));
+      for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
+        rows_u[u] = r;
+        cols_u[u] = c;
+        r += srow;
+        c += scol;
+        if (c >= vecs_per_row) {
+          c -= vecs_per_row;
+          ++r;
         }
       }
-    } else {
-#pragma unroll
-      for (int i = 0; i < 8; ++i) out[i] = 0.f;
     }
-    // Every lane quantizes (uniform shuffles); only real rows store data.
-    quant8_store(out, q + row * q_stride + col, sf, row, col / 8, sf_col_base,
-                 padded_cols, real);
-    // Padding rows (rows <= row < rows_pad) get zero scales.
-    if (live && !real && (threadIdx.x & 3) == 0) {
-      sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+#pragma unroll
+    for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
+      const int64_t v = v0 + u * stride;
+      const bool live = v < total;
+      const int64_t row = live ? rows_u[u] : 0;
+      const int col = live ? cols_u[u] * 8 : 0;
+      if (live && row < rows) {
+        act_load<MODE>(x, g, row, col, d, x_stride, g_stride, a[u], b[u]);
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < ACT_QUANT_UNROLL; ++u) {
+      const int64_t v = v0 + u * stride;
+      const bool live = v < total;
+      const int64_t row = live ? rows_u[u] : 0;
+      const int col = live ? cols_u[u] * 8 : 0;
+      const bool real = live && row < rows;
+      if (MODE == 4) {
+        situ4_quant_store(a[u], b[u], c4, q + row * q_stride + col, sf, row,
+                          col / 8, sf_col_base, padded_cols, real);
+        if (live && !real && (threadIdx.x & 3) == 0) {
+          sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+        }
+        continue;
+      }
+      float out[8];
+      if (real) {
+        act_compute<MODE>(a[u], b[u], out, beta, linear_beta, clamp_up,
+                          inv_beta, inv_linear_beta);
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) out[i] = 0.f;
+      }
+      // Every lane quantizes (uniform shuffles); only real rows store data.
+      quant8_store(out, q + row * q_stride + col, sf, row, col / 8,
+                   sf_col_base, padded_cols, real);
+      // Padding rows (rows <= row < rows_pad) get zero scales.
+      if (live && !real && (threadIdx.x & 3) == 0) {
+        sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+      }
     }
   }
 }
@@ -337,22 +647,67 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
     g_stride = g->stride(0);
   }
   if (rows == 0) return;
+  if (mode == 4 && d % 1024 == 0 && d <= 32768 && q.stride(0) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0) {
+    const bool clamp = linear_beta > 0.0;
+    const float half = 0.5f * (float)beta;
+    const int a_pow =
+        (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+    auto stream = c10::cuda::getCurrentCUDAStream();
+#define ROW_LAUNCH(P, C)                                                       \
+  situ4_row_kernel<P, C><<<(unsigned)rows_pad, (unsigned)(d / 32), 0, stream>>>( \
+      reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
+      reinterpret_cast<uint8_t*>(sf.data_ptr()),                               \
+      reinterpret_cast<const uint16_t*>(x.data_ptr()), rows, (int)d,           \
+      x.stride(0), q.stride(0), (int)sf_col_base, (int)padded_cols,            \
+      (float)beta, (float)linear_beta)
+    switch (a_pow * 2 + (clamp ? 1 : 0)) {
+      case 0: ROW_LAUNCH(0, false); break;
+      case 1: ROW_LAUNCH(0, true); break;
+      case 2: ROW_LAUNCH(1, false); break;
+      case 3: ROW_LAUNCH(1, true); break;
+      case 4: ROW_LAUNCH(2, false); break;
+      case 5: ROW_LAUNCH(2, true); break;
+      case 6: ROW_LAUNCH(3, false); break;
+      case 7: ROW_LAUNCH(3, true); break;
+      case 8: ROW_LAUNCH(4, false); break;
+      default: ROW_LAUNCH(4, true); break;
+    }
+#undef ROW_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
   const int threads = 256;
   const int64_t total = rows_pad * (d / 8);
-  const int blocks = (int)std::min<int64_t>((total + threads - 1) / threads, 2048);
+  const int64_t per_block = (int64_t)threads * ACT_QUANT_UNROLL;
+  const int64_t need = (total + per_block - 1) / per_block;
   auto stream = c10::cuda::getCurrentCUDAStream();
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, x.get_device());
+  // One resident wave of CTAs (grid-stride loop): a partial second wave would
+  // leave the SMs of the first wave idle for its whole duration.
 #define LAUNCH(M)                                                              \
+  {                                                                            \
+    static int occ_##M = 0;                                                    \
+    if (occ_##M == 0)                                                          \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_##M,                  \
+                                                    act_quant_kernel<M>,       \
+                                                    threads, 0);               \
+    const int blocks =                                                         \
+        (int)std::min<int64_t>(need, (int64_t)sms * std::max(occ_##M, 1));     \
   act_quant_kernel<M><<<blocks, threads, 0, stream>>>(                         \
       reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
       reinterpret_cast<uint8_t*>(sf.data_ptr()),                               \
       reinterpret_cast<const uint16_t*>(x.data_ptr()), gp, rows, rows_pad,     \
       (int)d, x.stride(0), g_stride, q.stride(0), (int)sf_col_base,            \
-      (int)padded_cols, (float)beta, (float)linear_beta)
+      (int)padded_cols, (float)beta, (float)linear_beta);                      \
+  }
   switch (mode) {
     case 0: LAUNCH(0); break;
     case 1: LAUNCH(1); break;
     case 2: LAUNCH(2); break;
     case 3: LAUNCH(3); break;
+    case 4: LAUNCH(4); break;
     default: TORCH_CHECK(false, "bad mode");
   }
 #undef LAUNCH
@@ -518,6 +873,42 @@ def situ_and_mul_quantize(
     """``situ_and_mul(x)`` ([rows, 2d] -> [rows, d]) as MXFP8."""
     return _act_quant(
         1, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
+    )
+
+
+# Rows from which the shared-expert SiTU uses the routed experts' MUFU-light
+# form (prefill: the precise-tanhf form is FMA-issue bound at ~4x its HBM
+# floor there; decode-sized calls are latency bound and keep the precise form).
+SITU_FAST_MIN_ROWS = 2048
+
+
+def situ_and_mul_quantize_auto(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    out: Mxfp8Buffer | None = None,
+    col: int = 0,
+):
+    """``situ_and_mul_quantize``, per shape: the routed experts' MUFU-light
+    SiTU (MegaMoE FC1 form) from ``SITU_FAST_MIN_ROWS`` rows, else the precise
+    form."""
+    rows = x.numel() // x.shape[-1]
+    mode = 4 if rows >= SITU_FAST_MIN_ROWS else 1
+    return _act_quant(
+        mode, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
+    )
+
+
+def situ_and_mul_quantize_fast(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    out: Mxfp8Buffer | None = None,
+    col: int = 0,
+):
+    """``situ_and_mul(x)`` as MXFP8 with the routed experts' SiTU form."""
+    return _act_quant(
+        4, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
     )
 
 

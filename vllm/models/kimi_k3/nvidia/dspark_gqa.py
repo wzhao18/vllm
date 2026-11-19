@@ -54,8 +54,19 @@ from vllm.models.kimi_k3.nvidia.dspark_mla import (
     _CONTEXT_ROW_SHARD_MIN_ROWS,
     _aux_rows,
 )
+from vllm.models.kimi_k3.nvidia.ops import prefill_glue
 
 logger = init_logger(__name__)
+
+
+def _head_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Per-head RMSNorm ``norm(x)`` of [tokens, heads, head_dim]; long context
+    steps take the bitwise-equal prefill replay of the stock kernel (whose
+    8-thread blocks run ~20x over the byte floor)."""
+    weight = norm.weight.data
+    if x.dim() == 3 and prefill_glue.use_head_rms_norm(x, weight):
+        return prefill_glue.rms_norm(x, weight, norm.variance_epsilon)
+    return norm(x)
 
 
 def stock_attention_core(attn: nn.Module, qkv: torch.Tensor, positions: torch.Tensor):
@@ -64,16 +75,108 @@ def stock_attention_core(attn: nn.Module, qkv: torch.Tensor, positions: torch.Te
     insert of the query block); [rows, q_size]."""
     q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
     q_shape, k_shape = q.shape, k.shape
-    q = attn.q_norm(
-        q.view(*q_shape[:-1], q_shape[-1] // attn.head_dim, attn.head_dim)
+    q = _head_norm(
+        attn.q_norm,
+        q.view(*q_shape[:-1], q_shape[-1] // attn.head_dim, attn.head_dim),
     ).view(q_shape)
-    k = attn.k_norm(
-        k.view(*k_shape[:-1], k_shape[-1] // attn.head_dim, attn.head_dim)
+    k = _head_norm(
+        attn.k_norm,
+        k.view(*k_shape[:-1], k_shape[-1] // attn.head_dim, attn.head_dim),
     ).view(k_shape)
     q, k = attn.rotary_emb(positions, q, k)
     if attn.v_scale is not None:
         v = v * attn.v_scale
+    out = _eager_window_attention(attn.attn, q, k, v)
+    if out is not None:
+        return out
     return attn.attn(q, k, v)
+
+
+def _no_window_attention(why: str, impl, layer) -> None:
+    logger.info_once(
+        "Kimi K3.1 DSpark draft attention: stock path (%s: %s %s)",
+        why, type(impl).__name__, getattr(impl, "vllm_flash_attn_version", None),
+    )  # fmt: skip
+    return None
+
+
+def _eager_window_attention(layer: nn.Module, q, k, v) -> torch.Tensor | None:
+    """Draft steps without the specialized GQA attention: the query block's K/V
+    insert as the backend does it, then ``draft_attention.attention`` (FlashAttention
+    2 math, keys split over the window) in place of FlashAttention 2's one-split
+    schedule. None where it does not cover the call (the caller runs the layer)."""
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import draft_attention
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.backends.flash_attn import (
+        FlashAttentionImpl,
+        FlashAttentionMetadata,
+    )
+
+    impl = getattr(layer, "impl", None)
+    if (
+        not is_forward_context_available()
+        or type(impl) is not FlashAttentionImpl
+        or impl.vllm_flash_attn_version != 2
+        or impl.attn_type != AttentionType.DECODER
+        or impl.kv_cache_dtype not in ("auto", "bfloat16")
+        or impl.alibi_slopes is not None
+        or impl.logits_soft_cap not in (None, 0, 0.0)
+        or getattr(impl, "sinks", None) is not None
+        or impl.kv_sharing_target_layer_name is not None
+        or q.dtype != torch.bfloat16
+    ):
+        return _no_window_attention("layer/impl", impl, layer)
+    meta = get_forward_context().attn_metadata
+    if isinstance(meta, dict):
+        meta = meta.get(layer.layer_name)
+    if (
+        type(meta) is not FlashAttentionMetadata
+        or not isinstance(meta.causal, bool)
+        or meta.max_dcp_context_kv_len
+        or meta.rswa_prefix_lens is not None
+        or meta.mm_prefix_query_range_tensor is not None
+        or meta.num_actual_tokens > q.shape[0]
+        or not isinstance(layer.kv_cache, torch.Tensor)
+    ):
+        why = (
+            f"metadata {type(meta).__name__} causal "
+            f"{getattr(meta, 'causal', None)!r} rows "
+            f"{getattr(meta, 'num_actual_tokens', None)}/{q.shape[0]}"
+        )
+        return _no_window_attention(why, impl, layer)
+    hd, nkv = impl.head_size, impl.num_kv_heads
+    key_cache, value_cache = layer.kv_cache.transpose(1, 2).split(hd, dim=-1)
+    if not draft_attention.covers(
+        meta.max_query_len, impl.num_heads, nkv, hd, key_cache, value_cache
+    ):
+        return _no_window_attention("shape", impl, layer)
+    # FlashAttention's causal mask is its local window with no right side.
+    window = tuple(impl.sliding_window)
+    if meta.causal:
+        window = (window[0], 0)
+    tokens = q.shape[0]
+    impl.do_kv_cache_update(
+        layer, k.view(tokens, nkv, hd), v.view(tokens, nkv, hd), layer.kv_cache,
+        meta.slot_mapping,
+    )  # fmt: skip
+    alloc = torch.empty if meta.num_actual_tokens == tokens else torch.zeros
+    out = alloc((tokens, impl.num_heads, hd), dtype=q.dtype, device=q.device)
+    draft_attention.attention(
+        q.view(tokens, impl.num_heads, hd), key_cache, value_cache,
+        meta.block_table, meta.seq_lens, meta.query_start_loc, meta.max_query_len,
+        impl.scale, window, out,
+    )  # fmt: skip
+    return out.view(tokens, impl.num_heads * hd)
+
+
+def _uncovered(states: torch.Tensor, why: str) -> bool:
+    """Log (once) why a long context step keeps the stock K/V path; False."""
+    logger.info_once(
+        "Kimi K3.1 DSpark context K/V: stock path at %d rows (%s)",
+        states.shape[0], why,
+    )  # fmt: skip
+    return False
 
 
 class K3GqaDSparkDecoderLayer(DFlashQwen3DecoderLayer):
@@ -171,7 +274,13 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
         return self.normalize(projected)
 
     def normalize(self, rows: torch.Tensor) -> torch.Tensor:
-        """``hidden_norm`` with the stock context step's kernel (``ops.rms_norm``)."""
+        """``hidden_norm`` with the stock context step's kernel (``ops.rms_norm``),
+        or its bitwise-equal prefill replay on long context steps."""
+        weight = self.hidden_norm.weight.data
+        if prefill_glue.use_rms_norm(rows, weight):
+            return prefill_glue.rms_norm(
+                rows, weight, self.hidden_norm.variance_epsilon
+            )
         out = torch.empty_like(rows)
         ops.rms_norm(
             out, rows, self.hidden_norm.weight.data, self.hidden_norm.variance_epsilon
@@ -221,9 +330,118 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
             context_states, context_positions, context_slot_mapping
         ):
             return
+        if self._store_context_kv_rows(
+            context_states, context_positions, context_slot_mapping
+        ):
+            return
         super().precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    def _store_context_kv_rows(self, states, positions, slot_mapping) -> bool:
+        """Context steps without the specialized decode fast path: the stock K/V
+        step with the RoPE and the per-layer cache insert in one pass per layer
+        (``prefill_glue.rope_store_kv``, bitwise the stock ``rotary_embedding`` +
+        ``reshape_and_cache_flash``) and the K norm read from the token-major
+        projection (no layer-major copy). False (nothing done) where it does not
+        cover the call."""
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+        from vllm.v1.attention.backend import AttentionType
+
+        if (
+            slot_mapping is None
+            or not hasattr(self, "_num_attn_layers")
+            or getattr(self.layers[0].self_attn, "v_scale", None) is not None
+            or not self._rope_is_neox
+            or self._rope_head_size != self._head_dim
+            or positions.dtype != torch.int64
+        ):
+            return _uncovered(
+                states,
+                f"rope "
+                f"{self._rope_is_neox} {self._rope_head_size} positions "
+                f"{positions.dtype} slots {slot_mapping is None}",
+            )
+        num_ctx, layers = states.shape[0], self._num_attn_layers
+        nkv, hd = self._num_kv_heads, self._head_dim
+        per_layer = isinstance(slot_mapping, (list, tuple))
+        slots = [slot_mapping[i] if per_layer else slot_mapping for i in range(layers)]
+        cos_sin = self._rope_cos_sin_cache
+        if cos_sin.dtype != states.dtype:
+            cos_sin = cos_sin.to(dtype=states.dtype)
+        caches = []
+        for i in range(layers):
+            if slots[i] is None:
+                caches.append(None)
+                continue
+            attn = self._attn_layers[i]
+            impl = attn.impl
+            if (
+                type(impl).do_kv_cache_update
+                is not FlashAttentionImpl.do_kv_cache_update
+                or impl.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER)
+                or impl.kv_cache_dtype not in ("auto", "bfloat16")
+                or slots[i].numel() > num_ctx
+                or not isinstance(attn.kv_cache, torch.Tensor)
+            ):
+                return _uncovered(
+                    states,
+                    f"KV cache layer {type(impl).__name__} {impl.attn_type} "
+                    f"{impl.kv_cache_dtype} {type(attn.kv_cache).__name__} "
+                    f"{slots[i].numel()}/{num_ctx}",
+                )
+            caches.append(attn.kv_cache.transpose(1, 2).split(hd, dim=-1))
+        if all(c is None for c in caches):
+            return _uncovered(states, "no slots")
+        # Coverage on the K norm buffer (the projection's K / V row views differ
+        # only in their row stride, 2 * L * nkv * hd elements: a multiple of 8).
+        knorm = states.new_empty((num_ctx, nkv, hd))
+        if not prefill_glue.use_head_rms_norm(knorm, self._k_norm_weights[0]):
+            return _uncovered(states, "K norm shape")
+        for i, cache in enumerate(caches):
+            if cache is not None and not prefill_glue.use_rope_store_kv(
+                knorm[: slots[i].numel()], knorm[: slots[i].numel()], positions,
+                cos_sin, slots[i], *cache,
+            ):  # fmt: skip
+                return _uncovered(states, "cache insert layout")
+        kv = self._project_context_kv_token_major(states, num_ctx, layers, nkv, hd)
+        if tuple(kv.shape) != (num_ctx, layers, 2, nkv, hd) or not kv.is_contiguous():
+            raise RuntimeError(
+                "Kimi K3 DSpark context K/V: projection layout "
+                f"{tuple(kv.shape)} / {kv.stride()} after the coverage check"
+            )
+        for i in range(layers):
+            if caches[i] is None:
+                continue
+            n = slots[i].numel()
+            prefill_glue.rms_norm(
+                kv[:, i, 0], self._k_norm_weights[i], self._rms_norm_eps, out=knorm
+            )
+            key_cache, value_cache = caches[i]
+            args = (knorm[:n], kv[:n, i, 1], positions, cos_sin, slots[i])
+            if not prefill_glue.use_rope_store_kv(*args, key_cache, value_cache):
+                raise RuntimeError(
+                    f"Kimi K3 DSpark context K/V: layer {i} insert not covered"
+                )
+            prefill_glue.rope_store_kv(*args, key_cache, value_cache)
+        logger.info_once("Kimi K3.1 DSpark context K/V: fused RoPE + insert")
+        return True
+
+    def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
+        """The stock grouped per-layer K RMSNorm ([L, ctx, kv_heads, head_dim],
+        weight [L, head_dim]); long context steps replay it per layer
+        bitwise (the stock 8-thread blocks run ~20x over the byte floor)."""
+        weights = self._k_norm_weights
+        if all_k.dim() != 4 or not prefill_glue.use_head_rms_norm(
+            all_k[0], weights[0]
+        ):
+            return super()._normalize_context_k(all_k)
+        out = torch.empty_like(all_k)
+        for layer in range(all_k.shape[0]):
+            prefill_glue.rms_norm(
+                all_k[layer], weights[layer], self._rms_norm_eps, out=out[layer]
+            )
+        return out
 
     def _fused_context_kv(self, states, positions, slot_mapping) -> bool:
         fast = self._fast_context_kv

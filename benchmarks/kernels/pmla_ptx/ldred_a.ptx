@@ -1,0 +1,9 @@
+.version VER
+.target sm_107a
+.address_size 64
+.visible .entry k(.param .u32 p, .param .u64 o) {
+.reg .b32 %r<4>; .reg .f32 %f<8>; .reg .b64 %rd<2>;
+ld.param.u32 %r1, [p]; ld.param.u64 %rd1, [o];
+tcgen05.ld.red.sync.aligned.32x32b.x4.max.f32 {%f1,%f2,%f3,%f4}, %f5, [%r1];
+tcgen05.wait::ld.sync.aligned;
+add.f32 %f6, %f1, %f5; add.f32 %f6, %f6, %f4; st.global.f32 [%rd1], %f6; ret; }

@@ -54,6 +54,7 @@ from ...shapes import refuse
 from ..common.host import dynamic_view, stream, tensor_maps, to_cute
 from .gqa_context_kv import compile_context_kv
 from .gqa_window import TB, compile_window
+from .gqa_window_umma import KB, compile_window_umma, kv_map_5d
 
 logger = init_logger(__name__)
 
@@ -74,6 +75,11 @@ KV_HEADS = (1, 2, 4)  # KV heads per rank: TP16, TP8, TP4
 #   (1, 3) TP16 k3: B1-8 3.3-4.4, B16 4.8, B28-38 6.5-6.8, B64 8.5, B128 12.1
 #   (4, 3) TP4 k3 (C512): B1 3.7, B4-8 4.8-6.8, B16 8.6, B32 12.2, B50 14.7,
 #          B64 19.3, B128 32.6
+# Key groups 0: GqaWindowUmma (tcgen05, gqa_window_umma; ring stages of 64 keys), which
+# streams the window at near HBM rate once the grid holds two CTAs on most SMs: TP4 k3
+# B96 23.3 vs GqaWindow's best 29.6 (B64 20.4 vs 19.6, B32 12.9 vs 12.3: one CTA per
+# (request, KV head) is a serial stage chain at small batches; above ~106 requests
+# its 97 KB / 256-column CTAs exceed one wave).
 # The TP8 rows (prefill instances, which run the stock drafter) and TP4 k7 (no
 # deployment) take shapes measured at the same CTA counts.
 GQA_WINDOW = {
@@ -92,7 +98,8 @@ GQA_WINDOW = {
     (4, 7): ((8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)),
              (0, (1, 2, 3, 0))),
     (4, 3): ((2, (16, 4, 2, 8)), (8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)),
-             (52, (2, 4, 3, 0)), (64, (2, 2, 3, 0)), (0, (1, 2, 3, 0))),
+             (52, (2, 4, 3, 0)), (64, (2, 2, 3, 0)), (106, (1, 0, 5, 0)),
+             (0, (1, 2, 3, 0))),
 }  # fmt: skip
 
 
@@ -261,7 +268,12 @@ class GqaAttentionState:
             blocks,
             cache.stride(0),
             head_stride,
-            tensor_maps([spec], self.device),
+            # (+ the 5-D map GqaWindowUmma loads a stage with, at descriptor + 128)
+            tensor_maps(
+                [spec] + ([kv_map_5d(cache, self.kv_heads, head_stride)]
+                          if page % KB == 0 else []),
+                self.device,
+            ),  # fmt: skip
         )
         for shape in set(self.shapes.values()):
             if shape is not None:
@@ -279,6 +291,16 @@ class GqaAttentionState:
 
     def window(self, page, shape):
         splits, kgroups, ring, ahead = shape
+        if kgroups == 0:  # GqaWindowUmma (tcgen05): splits CTAs per (request, head)
+            if page % KB:
+                raise ValueError(
+                    f"GqaWindowUmma launch shape {shape} on {page}-token pages"
+                )
+            return compile_window_umma(
+                GROUP, self.kv_heads, self.q, page, ring, WINDOW, None,
+                self.max_position, self.device.index,
+                round_norm=window_options().get("round_norm", False), splits=splits,
+            )  # fmt: skip
         return compile_window(
             GROUP, self.kv_heads, self.q, page, splits, kgroups, ring, WINDOW, None,
             self.max_position, self.device.index, ahead=ahead, **window_options(),
@@ -379,7 +401,7 @@ class GqaAttentionState:
             to_cute(layer.q_norm.weight.data),
             to_cute(layer.k_norm.weight.data),
             dynamic_view(out),
-            Int64(bound.descriptor.data_ptr()),
+            Int64(bound.descriptor.data_ptr() + (128 if shape[1] == 0 else 0)),
             Int64(cache.data_ptr()),
             Int64(bound.block_stride),
             Int64(bound.head_stride),

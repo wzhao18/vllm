@@ -29,7 +29,7 @@ import cutlass
 import torch
 
 from ..common.host import stream, to_cute
-from .dcp_value import PROJECTED, compile_value
+from .dcp_value import PROJECTED, compile_value, projects_on_tc
 
 
 @cache
@@ -53,9 +53,11 @@ def compile_dcp_value(
     lse_base_e,
     partials,
     cap=64,
+    rearm=True,
 ):
     """DcpValue of one batch (DSA layout over the ``q_heads``-padded mailbox of
-    ``cap`` rows; ``partials``: the DcpBox's)."""
+    ``cap`` rows; ``partials``: the DcpBox's; ``rearm`` False: the q mailbox was
+    not published, local_query)."""
     return compile_value(
         heads,
         dcp,
@@ -70,7 +72,8 @@ def compile_dcp_value(
         dsa_bf16=not fp8,
         lse_base_e=lse_base_e,
         partials=partials,
-        preprojected=partials == PROJECTED,
+        preprojected=partials == PROJECTED and not projects_on_tc(batch),
+        rearm=rearm,
     )
 
 
@@ -148,7 +151,10 @@ def run_value(
     latent = latent.as_strided((batch, 1, gathered, 512), (padded * 512, 0, 512, 1))
     lse = lse.as_strided((batch, 1, gathered), (padded, 0, 1))
     mailbox, _, rank = publish
-    if mail.format == PROJECTED:
+    if mail.format == PROJECTED and projects_on_tc(batch):
+        assert w_uv is not None
+        uv = to_cute(w_uv)  # DcpValue projects on tcgen05
+    elif mail.format == PROJECTED:
         assert w_uv is not None
         rows = projected_rows(out.device, box.cap, gathered)
         values = rows[: gathered * batch * 128].view(gathered, batch, 128)

@@ -28,7 +28,10 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+    load_dflash_model,
+    window_context_rows,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -326,6 +329,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._context_slot_mappings
         )
 
+        # Widest draft sliding window (None: some draft group attends to its
+        # full context): bounds the context rows whose K/V is ever read.
+        windows = [
+            get_kv_cache_spec_sliding_window(
+                kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            )
+            for gid in self.draft_kv_cache_group_ids
+        ]
+        self._context_window: int | None = (
+            max(windows) if all(isinstance(w, int) and w > 0 for w in windows) else None
+        )
+        self._context_stage: tuple | None = None
         # Map each draft decoder layer to the index (within draft_kv_cache_group_ids)
         # of the kv-cache group its cache belongs to. Models that share a single group
         # leave this as None and share one context slot mapping.
@@ -485,6 +500,121 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             hidden_states = last_hidden_states[start:num_tokens]
         self.hidden_states[start:num_tokens].copy_(hidden_states)
+
+    def _context_hit_alignment(self) -> int | None:
+        """Granularity at which a later request can resume from this step's
+        cached draft K/V (prefix caching or a KV connector), or None."""
+        cache = self.vllm_config.cache_config
+        if not cache.enable_prefix_caching and self.vllm_config.kv_transfer_config is None:
+            return None
+        units = [
+            u
+            for u in (
+                getattr(cache, "cache_hit_alignment_tokens", None),
+                getattr(cache, "hash_block_size", None),
+                getattr(cache, "prefix_match_unit", None),
+                cache.block_size,
+            )
+            if isinstance(u, int) and u > 0
+        ]
+        return min(units) if units else 1
+
+    def _window_context_rows(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> np.ndarray | None:
+        """The context rows to combine and store (``window_context_rows``), or
+        None for all. Only when the context anchor publishes nothing (it would
+        index the uncompacted rows)."""
+        if (
+            self._context_window is None
+            or type(self).prepare_context_anchor
+            is not DFlashSpeculator.prepare_context_anchor
+        ):
+            return None
+        rows = window_context_rows(
+            input_batch.query_start_loc_np[: num_reqs + 1],
+            input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy(),
+            self._context_window + self.num_speculative_steps + 1,
+            self._context_hit_alignment(),
+        )
+        if rows is not None:
+            logger.info_once(
+                "DFlash: context rows outside the draft window skipped "
+                "(window %d, hit alignment %s): %d of %d rows kept",
+                self._context_window,
+                self._context_hit_alignment(),
+                rows.size,
+                int(input_batch.query_start_loc_np[num_reqs]),
+            )
+        return rows
+
+    def _stage_context_rows(self, rows: np.ndarray) -> torch.Tensor:
+        """``rows`` on device, staged through persistent pinned / device
+        buffers (stable addresses, so the copy may also sit in a captured
+        graph); reused once the previous step's copy completed."""
+        n = int(rows.size)
+        stage = self._context_stage
+        capturing = torch.cuda.is_current_stream_capturing()
+        if stage is None or stage[0].shape[0] < n:
+            cap = max(n, self.max_num_tokens)
+            stage = (
+                torch.empty(cap, dtype=torch.int64, pin_memory=True),
+                torch.empty(cap, dtype=torch.int64, device=self.device),
+                torch.cuda.Event(),
+            )
+            self._context_stage = stage
+        elif not capturing:
+            stage[2].synchronize()
+        host, dev, done = stage
+        host[:n].numpy()[:] = rows
+        dev[:n].copy_(host[:n], non_blocking=True)
+        if not capturing:
+            done.record()
+        return dev[:n]
+
+    def _store_context(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+        num_target_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_rejected: torch.Tensor | None,
+        dummy_run: bool,
+    ) -> None:
+        """Combine the target hidden states and store the context K/V, over
+        only the rows whose draft K/V can be read (long prefill chunks of a
+        sliding-window drafter), else over all rows."""
+        rows = (
+            None
+            if dummy_run or not aux_hidden_states
+            else self._window_context_rows(input_batch, num_reqs)
+        )
+        if rows is None:
+            self._store_hidden_states(
+                num_target_tokens, last_hidden_states, aux_hidden_states
+            )
+            self.prepare_context_anchor(
+                num_reqs, input_batch.query_start_loc, num_rejected
+            )
+            self._precompute_context_kv(0, num_target_tokens, dummy_run)
+            return
+        index = self._stage_context_rows(rows)
+        n = int(rows.size)
+        kept = gather_aux_rows(aux_hidden_states, index)
+        combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
+        if combine_aux_rows is not None:
+            combine_aux_rows(kept, 0, n, self.hidden_states[:n])
+        else:
+            self.hidden_states[:n].copy_(
+                self.model.combine_hidden_states(torch.cat(kept, dim=-1))
+            )
+        self.context_positions[:n].copy_(self.context_positions[index])
+        for i in range(self._context_slot_mappings.shape[0]):
+            self._context_slot_mappings[i, :n].copy_(
+                self._context_slot_mappings[i][index]
+            )
+        self._precompute_context_kv(0, n)
 
     def prepare_context_anchor(
         self,
@@ -691,10 +821,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         if num_speculative_tokens == 0:
             # No drafts are needed: store the context K/V to keep the drafter in
             # sync, and skip the query pass.
-            self._store_hidden_states(
-                num_target_tokens, last_hidden_states, aux_hidden_states
+            self._store_context(
+                input_batch,
+                num_reqs,
+                num_target_tokens,
+                last_hidden_states,
+                aux_hidden_states,
+                None,
+                dummy_run,
             )
-            self._precompute_context_kv(0, num_target_tokens, dummy_run)
             return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
@@ -749,13 +884,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                 dummy_run,
             )
         else:
-            self._store_hidden_states(
-                num_target_tokens, last_hidden_states, aux_hidden_states
+            self._store_context(
+                input_batch,
+                num_reqs,
+                num_target_tokens,
+                last_hidden_states,
+                aux_hidden_states,
+                num_rejected,
+                dummy_run,
             )
-            self.prepare_context_anchor(
-                num_reqs, input_batch.query_start_loc, num_rejected
-            )
-            self._precompute_context_kv(0, num_target_tokens, dummy_run)
 
         if rebuild_metadata:
             draft_attn_metadata = self._build_uniform_attn_metadata(
@@ -790,6 +927,41 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+
+@triton.jit
+def _gather_rows_kernel(
+    out_ptr, out_stride, src_ptr, src_stride, index_ptr, width, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width
+    src_row = tl.load(index_ptr + row).to(tl.int64)
+    vals = tl.load(src_ptr + src_row * src_stride + cols, mask=mask)
+    tl.store(out_ptr + row.to(tl.int64) * out_stride + cols, vals, mask=mask)
+
+
+def gather_aux_rows(
+    aux_hidden_states: list[torch.Tensor], index: torch.Tensor
+) -> list[torch.Tensor]:
+    """[h[index] for h in aux_hidden_states] as adjacent column blocks of one
+    row-major buffer, so the drafter's fc reads them without a concat."""
+    h0 = aux_hidden_states[0]
+    n, width, count = index.numel(), h0.shape[-1], len(aux_hidden_states)
+    packed = h0.new_empty((n, count * width))
+    views = [packed[:, i * width : (i + 1) * width] for i in range(count)]
+    if n == 0:
+        return views
+    # One program per row: whole-row loads in flight (8 warps x 64 B / thread).
+    block = min(triton.next_power_of_2(width), 8192)
+    grid = (n, triton.cdiv(width, block))
+    for h, out in zip(aux_hidden_states, views):
+        assert h.dim() == 2 and h.stride(1) == 1 and h.shape[-1] == width
+        _gather_rows_kernel[grid](
+            out, out.stride(0), h, h.stride(0), index, width, BLOCK=block,
+            num_warps=8,
+        )
+    return views
 
 
 @triton.jit(do_not_specialize=["num_reqs"])

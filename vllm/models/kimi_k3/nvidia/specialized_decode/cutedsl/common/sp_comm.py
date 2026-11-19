@@ -59,6 +59,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ...shapes import Choice, Path, Unsupported
 from ...symm import multicast_rendezvous, peer_rendezvous
+from . import mx_rows
 from .host import check_residency, fake, stream, to_cute
 from .mailbox import rearm
 from .primitives import (
@@ -83,6 +84,8 @@ THREADS = 256
 CHUNKS_PER_THREAD = 2
 # The poll's pending mask is one Uint32: at most this many chunks per thread.
 MAX_ROUNDS = 32
+# SpGatherCopy: 16-byte chunks per thread in flight per batch.
+GATHER_BATCH = 8
 
 
 @asm(Uint32, pure=True)
@@ -322,11 +325,16 @@ class SpComm:
         self.rows_cap, self.parities = rows_cap, parities
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         bf16 = dict(dtype=torch.bfloat16, device=self.device)
-        self.gather = symm_mem.empty((parities, rows_cap, width), **bf16)
+        # Each parity's box: rows_cap BF16 rows, then the E8M0 scale region of the
+        # MXFP8 form of the same all-gather (``mx_view``: an MXFP8 in-projection's
+        # input, FP8 rows over the box's first bytes; ``common.mx_rows``).
+        self.mx_scale_bytes = mx_rows.scale_bytes(rows_cap, width)
+        extra = -(-self.mx_scale_bytes // (2 * width))
+        box = symm_mem.empty((parities, rows_cap + extra, width), **bf16)
+        self.box = box
+        self.gather = box[:, :rows_cap]
         self.recv = symm_mem.empty((parities, tp, rows_cap // tp, width), **bf16)
-        _, self.gather_mc = multicast_rendezvous(
-            self.gather, group, "Kimi K3 SP all-gather"
-        )
+        _, self.gather_mc = multicast_rendezvous(box, group, "Kimi K3 SP all-gather")
         if not self.gather_mc:  # the all-gather stores through it: no fallback
             raise Unsupported("sp_comm", None, "no NVLink multicast")
         handle = peer_rendezvous(self.recv, group)
@@ -335,24 +343,70 @@ class SpComm:
         bases = [[int(b) + p * size for b in ptrs] for p in range(parities)]
         self.peers = torch.tensor(bases, dtype=torch.int64, device=self.device)
         self.partial = torch.empty((rows_cap, width), **bf16)
-        for t in (self.gather, self.recv):
+        for t in (self.box, self.recv):
             t.view(torch.int32).fill_(SENTINEL)
+        # The MXFP8 scale regions have their own sentinel (E8M0 0xFF is never a
+        # scale; 0x80000000 may be four).
+        self.box[:, rows_cap:].view(torch.int32).fill_(mx_rows.SCALE_SENTINEL - 2**32)
         torch.accelerator.synchronize(self.device)
         torch.distributed.barrier(group=group)
         # cute views per parity: local gather, its multicast address, local recv, peers
+        pitch = box[0].numel() * 2  # bytes per parity
+        scales = rows_cap * width * 2  # the scale region's byte offset in a box
         self._views = [
             (
                 to_cute(self.gather[p]),
-                Int64(self.gather_mc + p * self.gather[0].numel() * 2),
+                Int64(self.gather_mc + p * pitch),
                 to_cute(self.recv[p]),
                 to_cute(self.peers[p]),
             )
             for p in range(parities)
         ]
+        # MXFP8 views per parity: (data mc, scale mc, local data, local scales)
+        self._mx = [
+            tuple(
+                Int64(base + p * pitch + offset)
+                for base, offset in (
+                    (self.gather_mc, 0), (self.gather_mc, scales),
+                    (box.data_ptr(), 0), (box.data_ptr(), scales),
+                )
+            )
+            for p in range(parities)
+        ]  # fmt: skip
+        self._mx_views: dict = {}
         self._rank = Int32(rank)
 
     def nbytes(self) -> int:
-        return sum(t.numel() * 2 for t in (self.gather, self.recv, self.partial))
+        return sum(t.numel() * 2 for t in (self.box, self.recv, self.partial))
+
+    def mx_addresses(self, parity: int):
+        """(data multicast, scale multicast, local data, local scales) addresses of
+        the MXFP8 form of ``parity``'s box (kernel arguments)."""
+        return self._mx[parity]
+
+    def mx_view(self, parity: int, rows: int):
+        """The MXFP8 all-gather of ``rows`` rows in ``parity``'s box as an
+        ``ops.mxfp8_act.Mxfp8Buffer`` (FP8 [rows, width] over the box's first bytes,
+        F8_128x4 scales of whole 128-row tiles; padding rows are never read into
+        stored outputs). Read plainly once its gather kernel ended."""
+        key = parity, rows
+        view = self._mx_views.get(key)
+        if view is None:
+            from ....ops import mxfp8_act
+
+            self.shard(rows)
+            flat = self.box[parity].view(torch.uint8).reshape(-1)
+            view = object.__new__(mxfp8_act.Mxfp8Buffer)
+            view.rows, view.k = rows, self.width
+            view.padded_cols = self.width // mx_rows.BLOCK
+            view.data = flat[: rows * self.width].view(torch.float8_e4m3fn).view(
+                rows, self.width
+            )
+            start = self.rows_cap * self.width * 2
+            view.scale = flat[start : start + mx_rows.scale_bytes(rows, self.width)]
+            view.orig_dtype = torch.bfloat16
+            self._mx_views[key] = view
+        return view
 
     def shard(self, rows: int) -> int:
         """The shard rows n = rows / TP; Unsupported for rows this box cannot carry."""
@@ -453,3 +507,149 @@ class SpComm:
         s = stream(self.device)
         code(to_cute(source), recv, peers, to_cute(out_shard), gather, self._rank, s)
         return out_shard
+
+
+class SpGatherCopy:
+    """The step's final row all-gather (stock ``sp_all_gather`` of the packed
+    [hidden | aux...] shard rows, width W): multicast-store this rank's n rows
+    (sanitized words) into rows [rank n, (rank + 1) n) of every rank's box [cap, W],
+    then poll every chunk of rows [0, TP n), copy it into ``out`` [TP n, W] and re-arm
+    it. One kernel; its CTAs poll stores of every rank's grid: at most one CTA per SM
+    (co-resident). Args: x [n, W], the local box view, its multicast address, out,
+    rank."""
+
+    def __init__(self, tp, grid):
+        self.tp, self.grid = tp, grid
+
+    @cute.jit
+    def __call__(self, *args):
+        launch(self.kernel, args, self.grid, THREADS)
+
+    @cute.kernel
+    def kernel(self, args):
+        x, box, mc, out, rank = args
+        n: cutlass.Constexpr = x.shape[0]
+        width: cutlass.Constexpr = x.shape[1]
+        per: cutlass.Constexpr = width // 8
+        total: cutlass.Constexpr = self.grid * THREADS
+        R: cutlass.Constexpr = self.tp * n
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        g = cta * THREADS + tid
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        # GATHER_BATCH chunks per thread in flight: all loads, then all stores (a
+        # load -> store chain per chunk leaves the push and the poll latency bound).
+        U: cutlass.Constexpr = GATHER_BATCH
+        held = cute.make_rmem_tensor(4 * U, Uint32)
+        for base in range(g, n * per, total * U):
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < n * per:
+                    words = load_vector(at(x, c // per, c % per * 8))
+                    for j in cutlass.range_constexpr(4):
+                        held[4 * i + j] = words[j]
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < n * per:
+                    row, column = c // per, c % per * 8
+                    words = sanitized(tuple(held[4 * i + j] for j in range(4)))
+                    offset = Int64(rank * n + row) * width + column
+                    multicast_words(mc + offset * 2, words)
+        for base in range(g, R * per, total * U):
+            pending = Uint32(0)
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < R * per:
+                    pending |= Uint32(1 << i)
+            while pending != 0:
+                again = Uint32(0)
+                for i in cutlass.range_constexpr(U):
+                    if (pending >> i) & 1:
+                        c = base + i * total
+                        words = load_vector(
+                            at(box, c // per, c % per * 8), cache="volatile"
+                        )
+                        for j in cutlass.range_constexpr(4):
+                            held[4 * i + j] = words[j]
+                        if not published(words):
+                            again |= Uint32(1 << i)
+                pending = again
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < R * per:
+                    row, column = c // per, c % per * 8
+                    store_words(
+                        at(out, row, column), tuple(held[4 * i + j] for j in range(4))
+                    )
+                    rearm(at(box, row, column))
+
+
+@cache
+def compile_gather_copy(n, tp, cap, width, grid, device):
+    with torch.accelerator.device_index(device):
+        x, box, out = fake((n, width)), fake((cap, width)), fake((tp * n, width))
+        kernel = SpGatherCopy(tp, grid)
+        compiled = cute.compile(
+            kernel, x, box, Int64(0), out, Int32(0), make_fake_stream()
+        )
+        what = f"Kimi K3 SP final gather ({tp} x {n} rows x {width})"
+        check_residency(compiled, device, grid, THREADS, what)
+    return compiled
+
+
+class SpFinalGather:
+    """The final all-gather's multicast box [rows_cap, width] (Lamport-armed; the
+    kernel re-arms what it reads). Collective to build. One box: a rank may start
+    the next gather only once every rank has read this one (a decode step's
+    collectives separate two final gathers)."""
+
+    def __init__(self, group, device, tp, rank, *, width, rows_cap):
+        if rows_cap % tp or width % 8:
+            raise Unsupported(
+                "final_gather", None, f"rows_cap {rows_cap} / width {width} TP{tp}"
+            )
+        self.device, self.tp, self.rank = torch.device(device), tp, rank
+        self.width, self.rows_cap = width, rows_cap
+        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.box = symm_mem.empty(
+            (rows_cap, width), dtype=torch.bfloat16, device=self.device
+        )
+        _, self.mc = multicast_rendezvous(self.box, group, "Kimi K3 SP final gather")
+        if not self.mc:
+            raise Unsupported("final_gather", None, "no NVLink multicast")
+        self.box.view(torch.int32).fill_(SENTINEL)
+        torch.accelerator.synchronize(self.device)
+        torch.distributed.barrier(group=group)
+        self._box, self._rank = to_cute(self.box), Int32(rank)
+
+    def grid(self, rows):
+        chunks = rows * self.width // 8
+        return max(1, min(self.sms, -(-chunks // (THREADS * 8))))
+
+    def prepare(self, rows):
+        n = rows // self.tp
+        return compile_gather_copy(
+            n, self.tp, self.rows_cap, self.width, self.grid(rows), self.device.index
+        )
+
+    def run(self, x_shard: torch.Tensor) -> torch.Tensor:
+        n = x_shard.shape[0]
+        rows = n * self.tp
+        if (
+            x_shard.shape[1] != self.width
+            or not x_shard.is_contiguous()
+            or x_shard.dtype != torch.bfloat16
+            or rows > self.rows_cap
+        ):
+            raise Unsupported(
+                "final_gather", rows, f"x_shard {tuple(x_shard.shape)} (width "
+                f"{self.width}, cap {self.rows_cap})",
+            )  # fmt: skip
+        out = x_shard.new_empty((rows, self.width))
+        code = self.prepare(rows)
+        code(
+            to_cute(x_shard), self._box, Int64(self.mc), to_cute(out), self._rank,
+            stream(self.device),
+        )  # fmt: skip
+        return out

@@ -11,7 +11,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Float32, Int32
 
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
@@ -19,10 +19,10 @@ from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tme
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.iket_compat import iket
 from .....helpers.smem_workspace import SmemWorkspace
+from .....helpers.software_sync import NvlinkBarrier
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
-from ....schedulers.die_split_fc12_scheduler import DieSplitPhaseInterleavedFc12Scheduler
 from ....schedulers.fc12_scheduler import (
     BlackwellFusedFc12Scheduler,
     PhaseInterleavedFc12Scheduler,
@@ -55,21 +55,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     scheduler_consumer_thread_count: ClassVar[int] = 7 * 32
     epilogue_register_count: ClassVar[int] = 256
     scheduler_register_count: ClassVar[int] = 72
-    # vLLM local difference S2: prefill-scale inference launches run a second epilogue warpgroup
-    # (warps 12-15) that takes every other accumulator stage. The epilogue (SiTU + NVFP4 requant,
-    # BF16 FC2 token-back) issues from one warp per SM sub-partition and measured ~3.5x slower
-    # than the MMA per tile at the C512 prefill shape, so the tensor pipe idled ~74%.
-    # Automatic (no knob): N=128/256 tiles, 2CTA, epi_warps token-back (named barriers 3, 8, 11,
-    # 14, 15 are free there), and more routes per rank than two_warpgroup_epilogue_min_routes.
-    second_epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (12, 13, 14, 15)
-    # 512 threads launch at <= 128 registers; setmaxnreg then moves registers between warpgroups:
-    # 2 x 128 x (184 - 128) = 14336 <= 65536 - 2 x 128 x 128 - 32 x (3 x 64 + 72) - 128 x 64 = 16128.
-    two_warpgroup_epilogue_register_count: ClassVar[int] = 184
-    # Strictly more routes per rank than a 2048-token bucket: at 2048 capacity the second warpgroup
-    # was neutral (C256 prefill, -0.2%) to slightly slower (decode 300-1024 tokens, +0.6..+2%).
-    two_warpgroup_epilogue_min_routes: ClassVar[int] = 2048 * 16
-    # Reuses the TMEM-allocation barrier id: its only other use completes before any epilogue work.
-    epilogue_done_barrier_id: ClassVar[int] = 2
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, object]:
@@ -112,9 +97,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
-            # vLLM S2: 1 or 2 epilogue warpgroups; None (absent) = 2 wherever S2 is eligible.
-            "epilogue_warpgroups": OptionalRequirement(Optional[int]),
-            "die_sm_mask32": OptionalRequirement(Optional[tuple]),
+            "die_split": OptionalRequirement(bool),
+            # ((local data offset, shared data offset), ((data region, reserved bytes), ...)): see
+            # DeviceWorkspace.set_data_layout. Lets several kernels share one workspace allocation.
+            "workspace_data_layout": OptionalRequirement(Optional[tuple]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -159,23 +145,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
-        self.die_sm_mask32 = impl_desc.get("die_sm_mask32")
+        self.workspace_data_layout = impl_desc.get("workspace_data_layout")
 
         self.occupancy = 1
         self.architecture = "sm_107"
         self.local_expert_count = self.expert_count // self.world_size
-        self.epilogue_warpgroups = self._select_epilogue_warpgroups(impl_desc.get("epilogue_warpgroups"))
-        if self.epilogue_warpgroups == 2:
-            # One flag per tile: a warpgroup must not hold a done flag while it waits for a later
-            # accumulator stage that the other warpgroup's flags gate (batching measured +-1%).
-            self.epi_flag_batches = (1, 1)
-            self.epilogue_register_count = self.two_warpgroup_epilogue_register_count
-            self.scheduler_consumer_thread_count = (3 + 2 * len(self.epilogue_warp_ids)) * 32
-        sixteen_warps = self.token_back_mode == "standalone_warps" or self.epilogue_warpgroups == 2
-        self.threads_per_cta = 16 * 32 if sixteen_warps else 12 * 32
-        # Warps [transfer_warp_idx_start, transfer_warp_end_idx) run token_in (+ standalone token-back).
-        self.transfer_warp_end_idx = 16 if self.token_back_mode == "standalone_warps" else 12
-        self.other_warp_register_count = 64 if sixteen_warps else 72
+        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
+        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
 
         self.mixed_cga_config = NonClcMixedCgaConfig(
             preferred_cluster_shape=self.cluster_shape_mn,
@@ -248,7 +224,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "max_tokens": self.max_tokens,
                 "num_scheduler_consumer_threads": self.scheduler_consumer_thread_count,
                 "num_accumulator_consumer_warps_per_cta": len(self.epilogue_warp_ids),
-                "epilogue_warpgroups": self.epilogue_warpgroups,
                 "communication_enabled": True,
                 "token_back_push_data": self.token_comm.token_back_push_data,
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
@@ -258,8 +233,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         scheduler_type = (
             BlackwellFusedFc12Scheduler if self.schedule_mode == "grouped" else PhaseInterleavedFc12Scheduler
         )
-        if self.schedule_mode == "phase_interleave" and impl_desc.get("die_sm_mask32") is not None:
-            scheduler_type = DieSplitPhaseInterleavedFc12Scheduler
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
@@ -271,9 +244,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self._device_workspace = self._build_device_workspace()
         self.token_comm._configure_tail_reset_ownership(self._device_workspace)
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
-        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
+        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count)
+            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count, batch_invariant=bool(problem_desc.get("batch_invariant", False)))
         )
 
     def _validate_geometry(self) -> None:
@@ -396,31 +369,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             if self.use_2cta_instrs and fallback_cluster_m % 2 != 0:
                 raise ValueError("Two-CTA MMA requires an even fallback cluster M.")
 
-    def s2_eligible(self) -> bool:
-        """S2 needs N=128/256 2CTA epi_warps launches above two_warpgroup_epilogue_min_routes."""
-        return (
-            isinstance(self.max_tokens_per_rank, int)
-            and self.token_back_mode == "epi_warps"
-            and self.mma_tiler_mnk[1] in (128, 256)
-            and self.use_2cta_instrs
-            and self.max_tokens_per_rank * self.topk > self.two_warpgroup_epilogue_min_routes
-        )
-
-    def _select_epilogue_warpgroups(self, requested: Optional[int]) -> int:
-        """S2: 2 epilogue warpgroups where eligible (or as requested), else the stock 1.
-
-        The caller may request the stock epilogue (1) on an eligible launch: both variants
-        share the device workspace layout, the cross-rank protocol and the per-tile math.
-        """
-        if requested not in (None, 1, 2):
-            raise ValueError(f"epilogue_warpgroups must be 1 or 2, got {requested}.")
-        eligible = self.s2_eligible()
-        if requested == 2 and not eligible:
-            raise ValueError("two epilogue warpgroups need an S2-eligible launch.")
-        if requested == 1 or not eligible:
-            return 1
-        return 2
-
     def _resolve_schedule_hint(self) -> None:
         if self.schedule_mode != "phase_interleave":
             return
@@ -477,6 +425,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
+        # Tail-reset state is double-buffered by call parity, so the tail needs a
+        # single NVLink barrier (TokenComm.reset_tail). The NVLink barrier phase
+        # counter advances once per call and supplies the parity.
+        device_workspace.enable_tail_parity(NvlinkBarrier.phase_counter_region)
+        if self.workspace_data_layout is not None:
+            data_start, leading_data = self.workspace_data_layout
+            device_workspace.set_data_layout(tuple(data_start), tuple(tuple(item) for item in leading_data))
         device_workspace.finalize()
         return device_workspace
 
@@ -507,6 +462,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
         )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        bi_enabled = bool(getattr(self.epilogue, "batch_invariant", False))
+        bi_variant = getattr(self.epilogue, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             f"sm107_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -523,14 +486,21 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
             f"singlectareset{int(self.token_comm.tail_reset_single_cta)}_"
-            f"epiflag{epi_flags}_epiwg{self.epilogue_warpgroups}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
+            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
-            f"die{'none' if self.die_sm_mask32 is None else 'split'}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            + bi_suffix
+            # Workspace region offsets are codegen-time constants.
+            + (
+                ""
+                if self.workspace_data_layout is None
+                else "_wsl" + "x".join(str(v) for v in self.workspace_data_layout[0])
+                + "".join(f"_{name.rsplit('.', 1)[-1]}{nbytes}" for name, nbytes in self.workspace_data_layout[1])
+            )
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -661,6 +631,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
+        sm_locality_domain: Optional[cute.Tensor] = None,  # (1024,) uint8 die of each %smid (die_split only)
+        rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a, output = RMSNorm(reduce)
+        rmsnorm_eps: Optional[Float32] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
@@ -853,6 +826,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.epilogue.prepare_tma_store_params(fc1_output_gemm, fc2_output)
         )
 
+        if cutlass.const_expr(getattr(self.scheduler, "die_split", False) and sm_locality_domain is None):
+            raise ValueError("die_split scheduling needs the sm_locality_domain map.")
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
         self._device_workspace.remove_device_members()
         kernel = self._kernel(
@@ -890,6 +865,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            sm_locality_domain,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -915,8 +891,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             reduce_indices = topk_indices if cutlass.const_expr(self.masks_invalid_combine_slots) else None
             self._topk_reduce(
                 pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream,
-                topk_indices=reduce_indices,
+                topk_indices=reduce_indices, rmsnorm_weight=rmsnorm_weight, rmsnorm_eps=rmsnorm_eps,
             )
+        elif cutlass.const_expr(rmsnorm_weight is not None):
+            raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
 
     @cute.kernel
     def _kernel(
@@ -955,6 +933,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        sm_locality_domain: Optional[cute.Tensor],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -962,7 +941,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         smem_allocator = utils.SmemAllocator()
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
-        self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        self._device_workspace.assign_device_members(local_workspace, shared_workspace, load_tail_parity=True)
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
         if cutlass.const_expr(isinstance(self.hidden_size, int)):
@@ -1056,12 +1035,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
         )
         finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
-        if cutlass.const_expr(self.epilogue_warpgroups == 2):
-            finalize_barrier_thread_count = 12 * 32
-        epilogue_done_barrier = pipeline.NamedBarrier(
-            barrier_id=self.epilogue_done_barrier_id, num_threads=32 * 2 * len(self.epilogue_warp_ids)
-        )
-        tmem_sharing_threads = 32 * (1 + self.epilogue_warpgroups * self._mainloop.num_accumulator_consumer_warps_per_cta)
         finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
         if warp_idx == self.scheduler_warp_id:
@@ -1071,9 +1044,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_push("scheduler.register_group")
                 scheduler.initialize_fallback_group()
                 iket.range_pop()
+            die_split = getattr(scheduler, "die_split", False)
+            if cutlass.const_expr(die_split):
+                scheduler.probe_die(sm_locality_domain)
             iket.range_push("scheduler.wait_sizes_ready")
             self.token_comm.wait_for_sizes_ready(self._device_workspace)
             iket.range_pop()
+            if cutlass.const_expr(die_split):
+                scheduler.prepare_streams()
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
@@ -1150,7 +1128,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             iket.range_push("mega.epilogue")
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
-            barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, tmem_sharing_threads)
+            barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
             self.epilogue.run(
                 self._smem_workspace,
@@ -1173,48 +1151,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
             )
-            if cutlass.const_expr(self.epilogue_warpgroups == 2):
-                # The second warpgroup reads TMEM until it arrives here; free only after it.
-                epilogue_done_barrier.arrive_and_wait()
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             iket.range_pop()
             finalize_barrier.arrive_unaligned()
 
-        if cutlass.const_expr(self.epilogue_warpgroups == 2):
-            if warp_idx >= Int32(self.second_epilogue_warp_ids[0]):
-                cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
-                iket.range_push("mega.epilogue_wg1")
-                sched_consumer = scheduler.make_consumer()
-                barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, tmem_sharing_threads)
-                tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
-                self.epilogue.run(
-                    self._smem_workspace,
-                    smem_base,
-                    tmem_pointer,
-                    acc_pipeline,
-                    sched_consumer,
-                    kernel_extension,
-                    fc1_output_tma_atom,
-                    fc1_output_tma_tensor,
-                    fc1_output_sf,
-                    fc2_output_tma_atom,
-                    fc2_output_tma_tensor,
-                    fc2_output,
-                    fc1_done_counter,
-                    thread_idx,
-                    token_src_metadata,
-                    fc2_done_counter,
-                    fc2_output_sf,
-                    peer_rank_ptr_mapper,
-                    optional_epilogue_args,
-                    warpgroup=1,
-                )
-                iket.range_pop()
-                epilogue_done_barrier.arrive_unaligned()
-                finalize_barrier.arrive_unaligned()
-
-        if warp_idx >= Int32(self.transfer_warp_idx_start) and warp_idx < Int32(self.transfer_warp_end_idx):
+        if warp_idx >= Int32(self.transfer_warp_idx_start):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             if warp_idx < Int32(self.token_in_end_warp_idx):
                 iket.range_push("mega.token_in")

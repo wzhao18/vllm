@@ -33,8 +33,10 @@ def pg():
     return prefill_glue
 
 
-@pytest.mark.parametrize("rows", [1, 7, 300, 4350])
-@pytest.mark.parametrize("kind", ["rand", "ties", "nonfinite", "zeros"])
+@pytest.mark.parametrize("rows", [1, 7, 300, 4350, 16384])
+@pytest.mark.parametrize(
+    "kind", ["rand", "ties", "near_ties", "pairs", "nonfinite", "zeros", "ep_bias"]
+)
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_router_topk_matches_grouped_topk(pg, rows, kind, renormalize):
     from vllm import _custom_ops as ops
@@ -46,10 +48,21 @@ def test_router_topk_matches_grouped_topk(pg, rows, kind, renormalize):
     if kind == "ties":
         x = (x * 4).round() / 4
         bias = (bias * 64).round() / 64
+    elif kind == "near_ties":
+        # Exact scores closer than the fast prefilter's error.
+        x = (x * 4).round() / 4 + torch.randn_like(x) * 3e-6
+        bias = (bias * 64).round() / 64
+    elif kind == "pairs":
+        # Few candidates, each top score with a sub-ulp-of-fast twin.
+        x[:, 1::2] = x[:, 0::2] + torch.randn_like(x[:, 0::2]) * 1e-6
+        bias[1::2] = bias[0::2]
     elif kind == "nonfinite":
         x[::7, ::13] = float("inf")
         x[::5, ::11] = float("nan")
         x[1::9, 5::17] = -float("inf")
+    elif kind == "ep_bias":
+        # The step bench's EP16 emulation: 56 of every 224 experts active.
+        bias[torch.arange(experts, device="cuda") % 224 >= 56] = -100.0
     elif kind == "zeros":
         x.zero_()
         bias.zero_()
@@ -82,6 +95,41 @@ def test_rms_norm_matches_vllm_c(pg, rows, width, cols):
     ref = torch.empty(x.shape, dtype=x.dtype, device="cuda")
     ops.rms_norm(ref, x, w, 1e-6)
     assert torch.equal(_bits(pg.rms_norm(x, w, 1e-6)), _bits(ref))
+
+
+@pytest.mark.parametrize("tokens,heads,head_dim,extra", [(6156, 8, 64, 512), (2048, 4, 128, 0)])
+def test_head_rms_norm_matches_vllm_c(pg, tokens, heads, head_dim, extra):
+    """Per-head q / k norms of a strided qkv slice (8 / 16-thread stock blocks)."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(tokens)
+    width = heads * head_dim + extra
+    base = torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16) * 3
+    base[0] = 0
+    base[1, :8] = 3.0e38
+    x = base[:, : heads * head_dim].view(tokens, heads, head_dim)
+    w = (torch.rand(head_dim, device="cuda") + 0.5).to(torch.bfloat16)
+    assert pg.use_head_rms_norm(x, w)
+    ref = torch.empty(x.shape, dtype=x.dtype, device="cuda")
+    ops.rms_norm(ref, x, w, 1e-6)
+    assert torch.equal(_bits(pg.rms_norm(x, w, 1e-6)), _bits(ref))
+
+
+def test_grouped_head_rms_norm_matches_vllm_c(pg):
+    """The DSpark context K norm: [L, ctx, kv_heads, 64] with per-layer weights
+    [L, 64] in one stock call, replayed per layer."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(5)
+    x = torch.randn(5, 3000, 16, 64, device="cuda", dtype=torch.bfloat16) * 3
+    w = (torch.rand(5, 64, device="cuda") + 0.5).to(torch.bfloat16)
+    ref = torch.empty_like(x)
+    ops.rms_norm(ref, x, w, 1e-6)
+    out = torch.empty_like(x)
+    for layer in range(5):
+        assert pg.use_head_rms_norm(x[layer], w[layer])
+        pg.rms_norm(x[layer], w[layer], 1e-6, out=out[layer])
+    assert torch.equal(_bits(out), _bits(ref))
 
 
 def test_rows_rms_norm_module(pg):
@@ -181,3 +229,40 @@ def test_write_state_rows_strided_index(pg, idx_dtype, cols, rows):
     out = dst0.clone()
     pg.write_state_rows(out, idx, src)
     assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("rows", [2048, 6156])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_rope_store_kv_matches_rotary_and_cache(pg, rows, block_size):
+    """RoPE + K/V cache insert == ops.rotary_embedding (NeoX, in place) followed
+    by reshape_and_cache_flash ("auto" BF16 cache), the DSpark context step's
+    layout: K / V row views of a token-major [rows, L, 2, nkv, hd] projection,
+    skipped (-1) slots."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(rows + block_size)
+    layers, nkv, hd, max_pos = 5, 16, 64, 1 << 17
+    kv = torch.randn(rows, layers, 2, nkv, hd, device="cuda", dtype=torch.bfloat16)
+    kv[0, 2, 0, :, :4] = 3.0e38
+    k = kv[:, 2, 0].contiguous()
+    v = kv[:, 2, 1]
+    positions = torch.randint(0, max_pos, (rows,), device="cuda", dtype=torch.int64)
+    inv = 1.0 / (50000.0 ** (torch.arange(0, hd, 2, device="cuda").float() / hd))
+    freqs = torch.arange(max_pos, device="cuda").float()[:, None] * inv[None]
+    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.bfloat16)
+    blocks = rows // block_size + 8
+    slots = torch.randperm(blocks * block_size, device="cuda")[:rows]
+    slots[::7] = -1
+    # FlashAttention's cache [blocks, nkv, block_size, 2 * hd] viewed as its
+    # do_kv_cache_update does.
+    ref = torch.randn(blocks, nkv, block_size, 2 * hd, device="cuda").to(torch.bfloat16)
+    out = ref.clone()
+    rk, rv = ref.transpose(1, 2).split(hd, dim=-1)
+    ok, ov = out.transpose(1, 2).split(hd, dim=-1)
+    ref_k = k.clone()
+    ops.rotary_embedding(positions, ref_k.view(rows, nkv * hd), None, hd, cos_sin, True)
+    scale = torch.ones((), device="cuda")
+    ops.reshape_and_cache_flash(ref_k, v, rk, rv, slots, "auto", scale, scale)
+    assert pg.use_rope_store_kv(k, v, positions, cos_sin, slots, ok, ov)
+    pg.rope_store_kv(k, v, positions, cos_sin, slots, ok, ov)
+    assert torch.equal(_bits(out), _bits(ref))

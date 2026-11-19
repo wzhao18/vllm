@@ -458,6 +458,9 @@ class DraftFastPath:
         self.lm_logits = None
         self.wide_batches = rows(WIDE_LM_HEAD) & self.batches
         self.lm_wide = None
+        # The stock LM-head GEMM's rows on pinned cuBLASLt algorithms (lt_pin), for
+        # the batches no fast LM head serves: prepared with the LM head.
+        self.lm_pins = None
         self.overlap_batches = rows(CONTEXT_OVERLAP)
         # NQ-NOFALLBACK: eager drafter calls (no captured graph) on the stock Markov
         # loop, counted per cause.
@@ -847,6 +850,7 @@ class DraftFastPath:
         sampled = sampling is not None
         if not torch.cuda.is_current_stream_capturing():
             self.prepare_lm_head(model)
+            self.prepare_lm_pins(model)
             # An eager drafter call (no captured graph: warmup, a step above the
             # captured sizes): the stock Markov loop, a run-time property counted
             # per cause (NQ-NOFALLBACK).
@@ -894,6 +898,11 @@ class DraftFastPath:
                 "its fast LM-head kernel is not prepared or does not take the rows",
                 Shape(batch * self.steps, self.steps),
             )
+        elif self.lm_pins is not None and self.lm_pins.takes(hidden):
+            # The stock LM-head GEMM (this rank's vocabulary shard of the base
+            # logits) on a pinned cuBLASLt algorithm: the same FP32 accumulation.
+            base = hidden.new_empty((hidden.shape[0], self.lm_pins.weight.shape[0]))
+            self.lm_pins.run(hidden, base)
         else:
             # The stock LM-head GEMM of the drafter, without its all-gather: this
             # rank's vocabulary shard of the base logits, bitwise as stock.
@@ -914,6 +923,30 @@ class DraftFastPath:
         slots = slots.long()
         own = cache[slots, :, lo : lo + markov.vocab_rank].contiguous()
         cache[slots] = get_tp_group().all_gather(own, dim=-1)
+
+    def prepare_lm_pins(self, model):
+        """Pinned cuBLASLt algorithms for the stock LM-head GEMM's rows (the batches
+        without a fast LM head), once the (shared) LM head is there."""
+        if self.lm_pins is not None or self.markov is None:
+            return
+        weight = getattr(getattr(model, "lm_head", None), "weight", None)
+        vocab_rank = getattr(self.markov, "vocab_rank", None)
+        if (
+            weight is None
+            or weight.dim() != 2
+            or weight.shape[0] != vocab_rank
+            or weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or getattr(model.lm_head, "bias", None) is not None
+            or model.logits_processor.scale != 1.0
+            or model.logits_processor.soft_cap is not None
+        ):
+            return
+        from ..lt_pin import pinned
+
+        fast = self.lm_batches | self.wide_batches
+        rows = [b * self.steps for b in sorted(self.batches - fast)]
+        self.lm_pins = pinned(weight, rows)
 
     def prepare_lm_head(self, model):
         """The LM-head GEMV of FAST_LM_HEAD batches (it reads the shard in place),
@@ -1159,16 +1192,21 @@ def gqa_projection_tactic(shape, tp, rows):
 
 def gqa_projection(weight, tp, rows):
     """The prepared split-K projection of ``weight`` for ``rows`` (or None)."""
+    from ..lt_pin import with_pins
+
     policies = {}
     for r in rows:
         tactic = gqa_projection_tactic(weight.shape, tp, r)
         if tactic is not None:
             policies[r] = tactic
-    if not policies:
-        return None
-    from ..cutedsl.gemm.projection import PreparedProjection
+    prepared = None
+    if policies:
+        from ..cutedsl.gemm.projection import PreparedProjection
 
-    return PreparedProjection(weight, policies).prepare()
+        prepared = PreparedProjection(weight, policies).prepare()
+    # Rows above the split-K bins: pinned cuBLASLt algorithms where the heuristic
+    # pick is slow (lt_pin.PINS; e.g. TP4 gate_up at 288 rows 30.1 -> 17.1 us).
+    return with_pins(prepared, weight, rows)
 
 
 def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
@@ -1236,6 +1274,9 @@ def gqa_context_projection(prepared, tp):
     ring = {r: t for r, t in tactics.items() if len(t) == 4 and t[1] <= 16}
     current = prepared.projection.policies if prepared.projection is not None else {}
     if not tactics or (tactics == current and set(ring) == set(prepared.polled)):
+        from ..lt_pin import with_pins
+
+        prepared.projection = with_pins(prepared.projection, shard, prepared.rows)
         return sorted(current), sorted(prepared.polled)
     index = prepared.device.index
     prepared.projection = PreparedProjection(shard, tactics).prepare()
@@ -1779,9 +1820,12 @@ class GqaDraftFastPath(DraftFastPath):
         if not batches:
             return None, []
         try:
+            from vllm.distributed import get_tp_group
+
             markov = VocabParallelMarkov(
-                head.markov_w1.weight, head.markov_w2.weight, tp, rank, steps
-            )
+                head.markov_w1.weight, head.markov_w2.weight, tp, rank, steps,
+                group=get_tp_group().device_group, cap=max(batches),
+            )  # fmt: skip
         except ValueError as error:
             fail("DSpark drafter Markov sampling", str(error))
             return None, []
@@ -1894,8 +1938,14 @@ def _vp_markov_keys(
     steps,
     lo,
     vocab_rank,
+    count_ptr,
+    peers_ptr,
+    box_offset,
+    programs,
     SAMPLED: tl.constexpr,
     BLOCK: tl.constexpr,
+    TP: tl.constexpr,
+    PUBLISH: tl.constexpr,
 ):
     req = tl.program_id(0)
     block = tl.program_id(1)
@@ -1934,7 +1984,35 @@ def _vp_markov_keys(
         value, index = tl.max(values, axis=0, return_indices=True)
     token = (lo + block * BLOCK + index).to(tl.int64)
     key = (_vp_ordered(value).to(tl.int64) << 31) | (0x7FFFFFFF - token)
-    tl.atomic_max(keys_ptr + req, key)
+    if PUBLISH:
+        # (relaxed: the count's acq_rel below orders it before the last program's
+        # read; one fence per program)
+        tl.atomic_max(keys_ptr + req, key, sem="relaxed", scope="gpu")
+    else:
+        tl.atomic_max(keys_ptr + req, key)
+    if PUBLISH:
+        # The request's last program on this rank publishes the rank's key (never 0)
+        # into slot ``box_offset + req`` of every rank's mailbox and re-arms. A key
+        # is its own flag (nothing else is read through the mailbox): plain stores,
+        # no system-scope fence or remote atomic per peer.
+        done = tl.atomic_add(count_ptr + req, 1, sem="acq_rel", scope="gpu")
+        if done == programs - 1:
+            final = tl.atomic_xchg(keys_ptr + req, 0, sem="acq_rel", scope="gpu")
+            tl.atomic_xchg(count_ptr + req, 0, sem="relaxed", scope="gpu")
+            for r in tl.static_range(TP):
+                # (plain stores: a remote atomic waits for its reply, four in a row)
+                peer = tl.load(peers_ptr + r) + (box_offset + req) * 8
+                tl.store(peer.to(tl.pointer_type(tl.int64)), final)
+
+
+@triton.jit
+def _vp_take(slot):
+    """A mailbox slot's key once a rank published it (never 0); re-arms the slot."""
+    got = tl.atomic_add(slot, 0, sem="relaxed", scope="sys")
+    while got == 0:
+        got = tl.atomic_add(slot, 0, sem="relaxed", scope="sys")
+    tl.store(slot, 0)
+    return got
 
 
 @triton.jit
@@ -1949,14 +2027,22 @@ def _vp_markov_select(
     step,
     TP: tl.constexpr,
     RANK: tl.constexpr,
+    POLL: tl.constexpr,
 ):
     req = tl.program_id(0)
-    best = tl.load(gathered_ptr + req)
-    for r in tl.static_range(1, TP):
-        best = tl.maximum(best, tl.load(gathered_ptr + r * num_reqs + req))
+    if POLL:
+        # This position's mailbox [TP, num_reqs] (``gathered_ptr``): wait for every
+        # rank's published key, then re-arm the slots (the keys re-armed already).
+        best = _vp_take(gathered_ptr + req)
+        for r in tl.static_range(1, TP):
+            best = tl.maximum(best, _vp_take(gathered_ptr + r * num_reqs + req))
+    else:
+        best = tl.load(gathered_ptr + req)
+        for r in tl.static_range(1, TP):
+            best = tl.maximum(best, tl.load(gathered_ptr + r * num_reqs + req))
+        tl.store(keys_ptr + req, 0)
     token = 0x7FFFFFFF - (best & 0x7FFFFFFF)
     tl.store(draft_ptr + req * draft_stride + step, token)
-    tl.store(keys_ptr + req, 0)
     cols = tl.arange(0, RANK)
     row = tl.load(w1_ptr + token * RANK + cols)
     tl.store(emb_ptr + req * RANK + cols, row)
@@ -1969,7 +2055,7 @@ class VocabParallelMarkov:
     ``vocab_rank``, ``markov_rank``). ``gather``: the TP group's all-gather along
     dim 0 (in-graph)."""
 
-    def __init__(self, w1, w2, tp, rank, steps, gather=None):
+    def __init__(self, w1, w2, tp, rank, steps, gather=None, group=None, cap=0):
         vocab, markov_rank = w2.shape
         if tuple(w1.shape) != tuple(w2.shape) or vocab % (tp * VP_MARKOV_BLOCK):
             raise ValueError(f"unsupported Markov head shapes {tuple(w2.shape)}")
@@ -1982,14 +2068,45 @@ class VocabParallelMarkov:
         lo = rank * self.vocab_rank
         self.w2 = w2.detach()[lo : lo + self.vocab_rank]
         self.device = w2.device
-        if gather is None:
+        if gather is None and group is None:
             from vllm.distributed import get_tp_group
 
-            group = get_tp_group()
-            gather = lambda x: group.all_gather(x, dim=0)  # noqa: E731
+            coordinator = get_tp_group()
+            gather = lambda x: coordinator.all_gather(x, dim=0)  # noqa: E731
         self.gather = gather
         self.batches: set[tuple[int, bool]] = set()
         self.buffers: dict[int, tuple] = {}
+        # ``group`` (a process group, with ``cap`` = the largest batch): the keys'
+        # all-gather becomes peer stores into a mailbox [steps, TP, cap] polled by
+        # the select (no collective launch). One mailbox per draft position: a peer
+        # reuses position k's slots only after its select of position k + 1 (or of
+        # the next run's first position), which waits for this rank's keys of that
+        # position, published after this rank consumed (re-armed) position k. Two
+        # parities would race at odd ``steps`` (position steps - 1, then 0 again).
+        self.cap, self.box, self.peers = cap, None, None
+        self.count = None
+        if group is not None and tp > 1:
+            from ..symm import peer_rendezvous
+            import torch.distributed._symmetric_memory as symm_mem
+
+            if cap <= 0:
+                raise ValueError("Markov drafting: a mailbox needs the largest batch")
+            slots = max(steps, 2)
+            box = symm_mem.empty(
+                (slots, tp, cap), dtype=torch.int64, device=self.device
+            )
+            box.zero_()
+            handle = peer_rendezvous(box, group)
+            size = box[0].numel() * 8
+            self.box = box
+            self.peers = torch.tensor(
+                [[int(b) + p * size for b in handle.buffer_ptrs] for p in range(slots)],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.count = torch.zeros(cap, dtype=torch.int32, device=self.device)
+            torch.accelerator.synchronize(self.device)
+            torch.distributed.barrier(group=group)
 
     def covers(self, batch, sampled=False):
         return batch > 0
@@ -2068,6 +2185,9 @@ class VocabParallelMarkov:
             strides = (0, 0)
         grid = (batch, triton.cdiv(self.vocab_rank, VP_MARKOV_BLOCK))
         lo = self.rank * self.vocab_rank
+        poll = self.box is not None
+        if poll and batch > self.cap:
+            raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
         for step in range(self.steps):
             bias = torch.nn.functional.linear(emb, self.w2)
             _vp_markov_keys[grid](
@@ -2086,19 +2206,25 @@ class VocabParallelMarkov:
                 self.steps,
                 lo,
                 self.vocab_rank,
+                self.count if poll else keys,
+                self.peers[step] if poll else keys,
+                self.rank * self.cap,
+                grid[1],
                 SAMPLED=sampled,
                 BLOCK=VP_MARKOV_BLOCK,
+                TP=self.tp,
+                PUBLISH=poll,
             )
-            gathered = self.gather(keys)
             _vp_markov_select[(batch,)](
-                gathered,
+                self.box[step] if poll else self.gather(keys),
                 keys,
                 draft,
                 draft.stride(0),
                 emb,
                 self.w1,
-                batch,
+                self.cap if poll else batch,
                 step,
                 TP=self.tp,
                 RANK=self.markov_rank,
+                POLL=poll,
             )
