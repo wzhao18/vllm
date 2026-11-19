@@ -163,6 +163,23 @@ __device__ __forceinline__ void mma_bf16(uint32_t tmem, uint64_t a, uint64_t b,
       "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p; }" ::"r"(tmem),
       "l"(a), "l"(b), "r"(idesc), "r"(acc));
 }
+// Warp-uniform issue (hwdb hw28c): the whole warp executes the asm, elect.sync picks
+// the issuing lane inside it, so the descriptors stay in uniform registers (a
+// lane-0 branch turns them into an R2UR waterfall: ~88 clk per MMA, ~250 measured here).
+__device__ __forceinline__ void mma_bf16_el(uint32_t tmem, uint64_t a, uint64_t b,
+                                            uint32_t idesc, uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; "
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, Q; }" ::"r"(tmem),
+      "l"(a), "l"(b), "r"(idesc), "r"(acc));
+}
+__device__ __forceinline__ void mma_commit_el(uint32_t bar) {
+  asm volatile(
+      "{ .reg .pred P; elect.sync _|P, 0xffffffff; "
+      "@P tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0]; }" ::"r"(
+          bar)
+      : "memory");
+}
 __device__ __forceinline__ void mma_commit(uint32_t bar) {
   asm volatile(
       "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
@@ -389,20 +406,21 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       if (lane == 0) {
         if (it < 64) STAMPC(72 + it);
         if (it + 1 == nkb) STAMP(2);
-        const uint64_t ad = smem_desc(ring_s + (probe ? 0 : (sw * p.wg + jw) * kWBox));
-        const uint64_t bd = smem_desc(xring_s + (probe ? 0 : (sx * p.xg + j) * xbytes));
-        if (!(p.debug & 1)) {
-#pragma unroll
-          for (int kk = 0; kk < 4; ++kk)
-            mma_bf16(tmem, bd + 2 * kk, ad + 2 * kk, idesc, (it == 0 && kk == 0) ? 0u : 1u);
-        }
-        if (it < 64) STAMPC(136 + 64 + it);
-        if (jw == p.wg - 1 || it + 1 == nkb) mma_commit(ew0 + 8 * sw);
-        if (j == p.xg - 1 || it + 1 == nkb) mma_commit(ex0 + 8 * sx);
       }
+      // Warp-uniform operands: slot indices derive from the loop counter only.
+      const uint64_t ad = smem_desc(ring_s + (probe ? 0 : (sw * p.wg + jw) * kWBox));
+      const uint64_t bd = smem_desc(xring_s + (probe ? 0 : (sx * p.xg + j) * xbytes));
+      if (!(p.debug & 1)) {
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk)
+          mma_bf16_el(tmem, bd + 2 * kk, ad + 2 * kk, idesc, (it == 0 && kk == 0) ? 0u : 1u);
+      }
+      if (lane == 0 && it < 64) STAMPC(136 + 64 + it);
+      if (jw == p.wg - 1 || it + 1 == nkb) mma_commit_el(ew0 + 8 * sw);
+      if (j == p.xg - 1 || it + 1 == nkb) mma_commit_el(ex0 + 8 * sx);
       __syncwarp();
     }
-    if (lane == 0) mma_commit(acc0);
+    mma_commit_el(acc0);
   }
   __syncwarp();
   asm volatile("griddepcontrol.wait;" ::: "memory");  // before any global write
@@ -630,8 +648,9 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   TORCH_CHECK(!nvfp4 || a.scale_mult > 0.0F, "moe_front: norm_const");
   p.y = y.data_ptr<float>();
   p.cnt = reinterpret_cast<unsigned*>(cnt.data_ptr<int32_t>());
-  p.stamps = stamps.numel() ? reinterpret_cast<unsigned long long*>(stamps.data_ptr())
-                            : nullptr;
+  // numel < 8: probe bits only (timed skeleton runs), no stamps.
+  p.stamps = stamps.numel() >= 8 ? reinterpret_cast<unsigned long long*>(stamps.data_ptr())
+                                 : nullptr;
   p.k = (int)k;
   p.bn = (int)((n + 15) / 16 * 16);
   p.tiles = (int)tiles;

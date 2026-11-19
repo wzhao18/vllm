@@ -184,6 +184,17 @@ def main():
 
             t_f = _time_graph(front)
             line += f" | front{c} smem {smem // 1024}K clusters {mc} {(t_f - t_p) / L:.2f}"
+            # Skeleton: same bytes, barriers, reduce and epilogue, no MMAs (probe bit 0).
+            skel = torch.zeros(1, dtype=torch.int64, device=dev)
+
+            def skeleton(c=c):
+                for i in range(L):
+                    pm.prod(src, h, busy, nostamp, carve)
+                    fm.moe_front(ws[i], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True,
+                                 1.0, *c, skel)  # fmt: skip
+
+            t_s = _time_graph(skeleton)
+            line += f" skeleton {(t_s - t_p) / L:.2f}"
         print(line, flush=True)
         # Stamped single layer (eager, after a warm call): phase times after the
         # producer's end, median over CTAs.
