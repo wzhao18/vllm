@@ -83,6 +83,12 @@ TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
 TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
 
 
+def projects_on_tc(batch):
+    """Whether a DSA "proj" DcpValue of ``batch`` rows projects on tcgen05 itself
+    (dcp_stage then passes the gathered W_UV, not the bmm's value rows)."""
+    return batch > PROJ_ROWS
+
+
 @asm()
 def _tma3d(dst, tmap, bar, c0, c1, c2):
     code = (
@@ -276,7 +282,7 @@ class DcpValue:
             # Above one step the projection runs on tcgen05 (TC_IDESC) in units of
             # (gathered head, 128 rows) over every CTA (grid <= SMs), which then
             # merge; no CTA waits before its units (see the class docstring).
-            self.tc = not self.preprojected and batch > PROJ_ROWS
+            self.tc = not self.preprojected and per_row and projects_on_tc(batch)
             if self.tc:
                 self.mtiles = -(-batch // 128)
                 self.units = size * heads * self.mtiles
@@ -499,20 +505,24 @@ class DcpValue:
                 mbar_wait(done, uc & 1)
                 tc_fence_after()
                 t = t0 + 32 * warp + lane
-                if t < B:
+                live = t < B
+                lse = Float32(EMPTY_LSE)
+                if live:
                     lse = self.sent_lse(rows_lse, lens, t, gh)
-                    owner = gh // H
-                    slot = ((parity * D + rank) * cap + t) * H + gh % H
-                    if lse > Float32(EMPTY_LSE):
-                        for c4 in cutlass.range_constexpr(4):
-                            v = _tmem_ld32(taddr + (Uint32(32 * warp) << Uint32(16))
-                                           + Uint32(32 * c4))
-                            words = [pack_pair(v[2 * i], v[2 * i + 1], policy="latent")
-                                     for i in range(16)]
-                            for q4 in cutlass.range_constexpr(4):
-                                target = peers[owner] + (Int64(slot) * 128
-                                                         + 32 * c4 + 8 * q4) * 2
-                                store_relaxed(target, tuple(words[4 * q4: 4 * q4 + 4]))
+                owner = gh // H
+                slot = ((parity * D + rank) * cap + t) * H + gh % H
+                send = live & (lse > Float32(EMPTY_LSE))
+                for c4 in cutlass.range_constexpr(4):  # (warp-collective TMEM loads)
+                    v = _tmem_ld32(taddr + (Uint32(32 * warp) << Uint32(16))
+                                   + Uint32(32 * c4))
+                    if send:
+                        words = [pack_pair(v[2 * i], v[2 * i + 1], policy="latent")
+                                 for i in range(16)]
+                        for q4 in cutlass.range_constexpr(4):
+                            target = peers[owner] + (Int64(slot) * 128
+                                                     + 32 * c4 + 8 * q4) * 2
+                            store_relaxed(target, tuple(words[4 * q4: 4 * q4 + 4]))
+                if live:
                     store_relaxed(lpeers[owner] + Int64(slot) * 4, (float_bits(lse),))
                 tc_fence_before()
             cute.arch.sync_threads()  # TMEM is read: the next unit may overwrite it
