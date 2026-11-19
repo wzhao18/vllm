@@ -90,10 +90,27 @@ def time_it(lens, H, iters=20):
     print(f"kp64 time lens={lens} H={H}: {e0.elapsed_time(e1) * 1e3 / iters:.1f} us/call", flush=True)
 
 
+def phases(lens, H):
+    lb, scale = -5.0, D ** -0.5
+    q, k, v, g, beta, A_log, dt_bias = inputs(lens, H)
+    C = sum((n + C64 - 1) // C64 for n in lens)
+    dbg = torch.zeros(2 * C * 16, dtype=torch.int64, device="cuda")
+    img, _, x = kp64(q, k, v, g, beta, A_log, dt_bias, lb, scale, lens, dbg=dbg)
+    kp64(q, k, v, g, beta, A_log, dt_bias, lb, scale, lens, dbg=dbg, x=x, out=img)
+    torch.cuda.synchronize()
+    st = dbg.view(2 * C, 16)[:C].cpu().double()
+    names = [(0, 1, "load+l2norm"), (1, 2, "gate"), (2, 3, "cumsum"), (3, 4, "images+operands"),
+             (4, 5, "A/Mq mma"), (5, 6, "INV diag"), (6, 12, "INV offdiag"), (12, 13, "INVb"),
+             (13, 14, "w|u mma+store"), (0, 14, "total")]
+    print("kp64 phases (ns, mean over head-0 CTAs): " + ", ".join(
+        f"{n} {(st[:, b] - st[:, a]).mean().item():.0f}" for a, b, n in names), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--time", action="store_true")
+    ap.add_argument("--phases", action="store_true")
     a = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 
@@ -103,6 +120,8 @@ def main():
         check([700, 1000], 8)
     if a.time:
         time_it([5461, 5461, 5462], 96)
+    if a.phases:
+        phases([5461, 5461, 5462], 96)
 
 
 if __name__ == "__main__":
