@@ -10,6 +10,7 @@
 
 #include "flash_kda.h"
 #include "fwd.h"
+#include "norm_args.h"
 
 using torch::headeronly::ScalarType;
 using torch::stable::Tensor;
@@ -315,4 +316,51 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
   STD_TORCH_CHECK(is_varlen && cu_seqlens_is_int32,
                   "k3_flashkda_split: varlen int32 cu_seqlens only");
   dispatch(static_cast<int32_t const*>(cu_seqlens_dev));
+}
+
+// Kimi-K3: gated o_norm + MXFP8 o_proj input (smxx/o_norm_mx.cu).
+void launch_o_norm_mx(const void* x, int64_t tokens, int heads,
+                      NormMxArgs const& a, int num_sms, cudaStream_t stream);
+
+void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
+                  double eps, const Tensor& q, const Tensor& sf) {
+  STD_TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() >= 2 &&
+                      x.size(x.dim() - 1) == 128 &&
+                      x.scalar_type() == ScalarType::BFloat16,
+                  "o_norm_mxfp8: x must be contiguous bf16 (..., H, 128)");
+  const int64_t H = x.size(x.dim() - 2);
+  const int64_t P = H * 128;
+  const int64_t T = x.numel() / P;
+  STD_TORCH_CHECK(g.dim() == 2 && g.size(0) >= T && g.size(1) >= P &&
+                      g.stride(1) == 1 && g.stride(0) % 8 == 0 &&
+                      reinterpret_cast<uintptr_t>(g.const_data_ptr()) % 16 == 0 &&
+                      g.scalar_type() == ScalarType::BFloat16,
+                  "o_norm_mxfp8: g must be bf16 (T, >= P) unit-stride rows");
+  STD_TORCH_CHECK(weight.numel() == 128 && weight.is_contiguous() &&
+                      weight.scalar_type() == ScalarType::Float,
+                  "o_norm_mxfp8: weight must be FP32 [128]");
+  STD_TORCH_CHECK(q.dim() == 2 && q.size(0) >= T && q.size(1) == P &&
+                      q.stride(1) == 1 && q.stride(0) % 16 == 0 &&
+                      q.scalar_type() == ScalarType::Float8_e4m3fn,
+                  "o_norm_mxfp8: q must be e4m3 (T, P) unit-stride rows");
+  STD_TORCH_CHECK(sf.is_contiguous() && sf.scalar_type() == ScalarType::Byte &&
+                      sf.numel() >= ((T + 127) / 128) * 128 * (P / 32),
+                  "o_norm_mxfp8: sf must be uint8 with the padded scale tile");
+  NormMxArgs a{};
+  a.g = g.const_data_ptr();
+  a.g_ld = g.stride(0);
+  a.w = reinterpret_cast<const float*>(weight.const_data_ptr());
+  a.eps = float(eps);
+  a.q = q.mutable_data_ptr();
+  a.q_ld = q.stride(0);
+  a.sf = sf.mutable_data_ptr();
+  a.sf_cols = int(P / 32);
+  int num_sms = 0;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount,
+                         x.get_device_index());
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(
+      aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream_ptr));
+  launch_o_norm_mx(x.const_data_ptr(), T, int(H), a, num_sms,
+                   static_cast<cudaStream_t>(stream_ptr));
 }

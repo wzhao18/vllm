@@ -150,7 +150,19 @@ def parse_args():
         help="knob JSON path, inline JSON (v2 file / record / bare knob dict); "
         "default: the backend's shipped knobs/k31_vr.json",
     )
+    p.add_argument(
+        "--num-experts",
+        type=int,
+        default=896,
+        help="global experts (EP-size emulation: 224 on EP4 = 56 experts/rank like EP16)",
+    )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
+    p.add_argument(
+        "--die-local",
+        action="store_true",
+        help="decode-server placement: die_split schedule + experts homed per die half "
+        "(die_local.place_experts), as KimiK3MegaMoEExperts does on decode servers",
+    )
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int32")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50, help="timed samples per metric")
@@ -448,6 +460,7 @@ def main():
 
     problem = RubinMoeProblem(
         quant_kind=args.quant_kind,
+        num_experts=args.num_experts,
         input_norm_const=args.input_norm_const,
         fc1_norm_const=args.fc1_norm_const,
     )
@@ -490,6 +503,24 @@ def main():
         points=list(by_cap.values()),
         device_name=torch.cuda.get_device_name(),
     )
+    if args.die_local:
+        import dataclasses
+
+        from vllm.models.kimi_k3.nvidia.megamoe_rubin import die_local
+
+        mask = die_local.current_die_sm_mask32()
+        if mask is None:
+            raise SystemExit("--die-local: no trusted SM -> die map on this GPU")
+        # as KimiK3MegaMoEExperts on decode servers: one cluster shape, full grid
+        buckets = [
+            dataclasses.replace(
+                b,
+                knobs=dataclasses.replace(b.knobs, fallback_cluster_shape_mn=None),
+                max_sm_count=None,
+                die_sm_mask32=mask,
+            )
+            for b in buckets
+        ]
     bucket_of = {b.max_tokens: b for b in buckets}
     if rank == 0:
         for note in notes:
@@ -520,6 +551,8 @@ def main():
     except W.NonRepresentableError as exc:
         print(f"[rank {rank}] {exc}", flush=True)
         raise
+    if args.die_local:
+        weights = die_local.place_experts(weights)
     if weights.report is not None and rank == 0:
         print(weights.report.summary().splitlines()[0], flush=True)
     moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),))

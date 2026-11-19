@@ -240,8 +240,11 @@ class SpKdaCore:
             raise Unsupported("kda", None, "the SP KDA core runs an FP32 SSM state")
         if attention.gate_lower_bound is None:
             raise Unsupported("kda", None, "a bounded KDA gate (gate_lower_bound)")
-        weight = attention.in_proj_qkvgfab.weight
-        self.pitch = weight.shape[0]  # packed in-projection columns (12440 at C512)
+        # packed in-projection columns (12448 at C512): N of the BF16 [N, K] weight
+        # or of the online-MXFP8 one (``gemm.mxfp8``: its own [N, K] FP8 rows)
+        from ..gemm.mxfp8 import projection_rows
+
+        self.pitch = projection_rows(attention.in_proj_qkvgfab)
         if self.pitch < 4 * self.dim + K + heads or self.pitch % 8:
             cause = f"in-projection pitch {self.pitch} (16-byte rows, >= 4 D + 128 + H)"
             raise Unsupported("kda", None, cause)
