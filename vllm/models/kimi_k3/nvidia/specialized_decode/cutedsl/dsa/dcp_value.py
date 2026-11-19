@@ -51,6 +51,7 @@ from .sparse_mla import (
     SDESC_SW128,
     fence_mbar_init,
     ld_shared_u32,
+    mbar_arrive,
     mbar_arrive_tx,
     mbar_init,
     mbar_wait,
@@ -79,6 +80,12 @@ PROJ_ROWS = 32
 # 64-element blocks through a TMA ring (A: the latent rows, B: the head's W_UV).
 TC_STAGES = 4
 TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
+# A unit's BF16 value rows [128 x 128], staged for its one bulk push (two buffers:
+# a unit's push is in flight while the next one's epilogue writes).
+TC_OUT = 128 * 128 * 2
+# Its epilogue warps (warp % 4 = TMEM lane quadrant), clear of the TMA and MMA
+# issuers (warps 0 and 1), which run ahead into the next unit.
+TC_EPI = 4
 # kind::f16: FP32 D, BF16 A and B (K-major), N = 128, M = 128
 TC_IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
 
@@ -110,18 +117,53 @@ def _mma_f16(d, a, b, idesc, acc):
 
 
 @asm()
-def _tmem_alloc128(dst):
+def _tmem_alloc256(dst):
     code = (
-        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [$0], 128; "
+        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [$0], 256; "
         "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"
     )
     return code, "r,~{memory}", (Uint32(dst),)
 
 
 @asm()
-def _tmem_free128(taddr):
-    return ("tcgen05.dealloc.cta_group::1.sync.aligned.b32 $0, 128;", "r,~{memory}",
+def _tmem_free256(taddr):
+    return ("tcgen05.dealloc.cta_group::1.sync.aligned.b32 $0, 256;", "r,~{memory}",
             (Uint32(taddr),))
+
+
+@asm()
+def _bulk_push(dst, src, nbytes):
+    """One bulk copy of ``nbytes`` from shared memory to (peer) global memory."""
+    return ("cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2; "
+            "cp.async.bulk.commit_group;", "l,r,r,~{memory}",
+            (Int64(dst), Uint32(src), Uint32(nbytes)))
+
+
+@asm()
+def _bulk_read_wait1():
+    return "cp.async.bulk.wait_group.read 1;", "~{memory}", ()
+
+
+@asm()
+def _bulk_wait0():
+    return "cp.async.bulk.wait_group 0;", "~{memory}", ()
+
+
+@asm()
+def _fence_async_shared():
+    return "fence.proxy.async.shared::cta;", "~{memory}", ()
+
+
+@asm()
+def _epi_sync():
+    """Barrier 1 over the 128 epilogue threads."""
+    return "bar.sync 1, 128;", "~{memory}", ()
+
+
+@asm()
+def _st_shared4(addr, w0, w1, w2, w3):
+    return "st.shared.v4.b32 [$0], {$1, $2, $3, $4};", "r,r,r,r,r,~{memory}", (
+        Uint32(addr), Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3))
 
 
 @asm()
@@ -170,12 +212,15 @@ def partials_for(spec, batch):
 
 class DcpMailbox:
     """One partials format's peer-store mailboxes: partial rows [2, DCP, CAP, H, 512]
-    BF16 ("proj": BF16 value rows [..., 128]) and LSE [2, DCP, CAP, H] FP32,
-    sentinel-filled, and their peers' addresses."""
+    BF16 and LSE [2, DCP, CAP, H] FP32 ("proj": head-major value rows [2, DCP, H,
+    CAP, 128] BF16, the 16 B chunks of row t XOR-permuted by t % 8, and LSE [2, DCP,
+    H, CAP]), sentinel-filled, and their peers' addresses."""
 
     def __init__(self, group, device, size, cap, heads, fmt):
         assert fmt in FORMATS, fmt
         shape, empty = (2, size, cap, heads), symm_mem.empty
+        if fmt == PROJECTED:  # head-major: a unit's rows are contiguous
+            shape = (2, size, heads, cap)
         self.format = fmt
         width = 128 if fmt == PROJECTED else 512
         self.partial = empty((*shape, width), dtype=torch.bfloat16, device=device)
@@ -436,21 +481,29 @@ class DcpValue:
     def kernel_tc(self, args, am: tensormap.GridMap, bm: tensormap.GridMap):
         """"proj" above PROJ_ROWS rows: CTA c = y H + head projects units c, c + G,
         .. (unit u: gathered head u % (DCP H), rows 128 (u // (DCP H)) ..) on
-        tcgen05 and pushes the value rows and LSEs to the heads' owners (warp 0 the
-        TMA ring, warp 1 the MMAs, warps 0-3 the epilogue, thread = row), then
-        merges tiles y, y + grid[1], .. of head ``head``."""
+        tcgen05 and pushes each unit's value rows to the head's owner in one bulk
+        copy (the rows are contiguous there, rows with nothing to merge carry the
+        sentinel) and its LSEs, then merges tiles y, y + grid[1], .. of head
+        ``head``. Warp 0 issues the TMA ring and warp 1 the MMAs into two TMEM
+        accumulators, both running ahead of the epilogue warps TC_EPI.. TC_EPI + 3
+        (thread = row), which stage a unit's BF16 rows in one of two buffers while
+        the previous unit's push is in flight."""
         rows_lse, lens, box, _, peers, lpeers, mailbox = args[1:8]
         parity, rank = args[12], args[13]
         H, D, B = self.heads, self.size, self.batch
         G: cutlass.Constexpr = H * self.grid[1]
         DH: cutlass.Constexpr = D * H
-        cap = box.shape[1]
+        cap = box.shape[2]
         smem = cutlass.utils.SmemAllocator()
         scales = alloc(smem, Float32, (16, D))
         ring = Uint32(smem.allocate_array(
-            Uint8, TC_STAGES * TC_STAGE + 128, byte_alignment=1024).toint())
-        bars = ring + Uint32(TC_STAGES * TC_STAGE)
-        done, slot_addr = bars + Uint32(16 * TC_STAGES), bars + Uint32(16 * TC_STAGES + 8)
+            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128, byte_alignment=1024
+        ).toint())
+        outs = ring + Uint32(TC_STAGES * TC_STAGE)
+        bars = outs + Uint32(2 * TC_OUT)  # full[st], empty[st]
+        acc_full = bars + Uint32(16 * TC_STAGES)  # [2]
+        acc_free = acc_full + Uint32(16)  # [2]
+        slot_addr = acc_free + Uint32(16)
         tid, _, _ = cute.arch.thread_idx()
         head, y, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -460,25 +513,26 @@ class DcpValue:
             for st in cutlass.range_constexpr(TC_STAGES):
                 mbar_init(bars + Uint32(8 * st), Uint32(1))
                 mbar_init(bars + Uint32(8 * (TC_STAGES + st)), Uint32(1))
-            mbar_init(done, Uint32(1))
+            for b in cutlass.range_constexpr(2):
+                mbar_init(acc_full + Uint32(8 * b), Uint32(1))
+                mbar_init(acc_free + Uint32(8 * b), Uint32(128))
             fence_mbar_init()
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
         # CTAs may still be resident here and allocate TMEM after this CTA would.
         cute.arch.griddepcontrol_wait()
         if warp == 0:
-            _tmem_alloc128(slot_addr)
+            _tmem_alloc256(slot_addr)
         tc_fence_before()
         cute.arch.sync_threads()
         tc_fence_after()
         taddr = ld_shared_u32(slot_addr)
-        kc = Int32(0)
-        uc = Int32(0)
-        for u in range(c, self.units, G):
-            gh = u % DH
-            t0 = (u // DH) * 128
-            if warp == 0:
-                if lane == 0:
+        if warp == 0:
+            if lane == 0:
+                kc = Int32(0)
+                for u in range(c, self.units, G):
+                    gh = u % DH
+                    t0 = (u // DH) * 128
                     for k in cutlass.range_constexpr(8):
                         st = (kc + k) % TC_STAGES
                         ph = ((kc + k) // TC_STAGES) & 1
@@ -488,8 +542,16 @@ class DcpValue:
                         dst = ring + Uint32(TC_STAGE) * Uint32(st)
                         _tma3d(dst, tm_a, full, 64 * k, gh, t0)
                         _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k, 0, gh)
-            if warp == 1:
-                if lane == 0:
+                    kc = kc + 8
+        if warp == 1:
+            if lane == 0:
+                kc = Int32(0)
+                j = Int32(0)
+                for u in range(c, self.units, G):
+                    b = j & 1
+                    mbar_wait(acc_free + Uint32(8) * Uint32(b), ((j >> 1) & 1) ^ 1)
+                    tc_fence_after()
+                    acc = taddr + Uint32(128) * Uint32(b)
                     for k in cutlass.range_constexpr(8):
                         st = (kc + k) % TC_STAGES
                         ph = ((kc + k) // TC_STAGES) & 1
@@ -500,42 +562,69 @@ class DcpValue:
                             ad = Uint64(SDESC_SW128) | Uint64((src + Uint32(32 * kk)) >> 4)
                             bd = Uint64(SDESC_SW128) | Uint64(
                                 (src + Uint32(TC_STAGE // 2 + 32 * kk)) >> 4)
-                            _mma_f16(taddr, ad, bd, Uint32(TC_IDESC),
+                            _mma_f16(acc, ad, bd, Uint32(TC_IDESC),
                                      Uint32(1 if k + kk > 0 else 0))
                         tc_commit(bars + Uint32(8) * Uint32(TC_STAGES + st))
-                    tc_commit(done)
-            kc = kc + 8
-            if warp < 4:
-                mbar_wait(done, uc & 1)
-                tc_fence_after()
-                t = t0 + 32 * warp + lane
+                    tc_commit(acc_full + Uint32(8) * Uint32(b))
+                    kc = kc + 8
+                    j = j + 1
+        if (warp >= TC_EPI) & (warp < TC_EPI + 4):
+            row = tid - 32 * TC_EPI
+            quad = Uint32(32 * (warp - TC_EPI)) << Uint32(16)
+            j = Int32(0)
+            for u in range(c, self.units, G):
+                b = j & 1
+                gh = u % DH
+                t0 = (u // DH) * 128
+                t = t0 + row
                 live = t < B
                 lse = Float32(EMPTY_LSE)
                 if live:
                     lse = self.sent_lse(rows_lse, lens, t, gh)
-                owner = gh // H
-                slot = ((parity * D + rank) * cap + t) * H + gh % H
                 send = live & (lse > Float32(EMPTY_LSE))
+                owner = gh // H
+                base = ((parity * D + rank) * H + gh % H) * cap
+                if row == 0:  # this buffer's push (two units ago) has read it
+                    _bulk_read_wait1()
+                _epi_sync()
+                mbar_wait(acc_full + Uint32(8) * Uint32(b), (j >> 1) & 1)
+                tc_fence_after()
+                out = outs + Uint32(TC_OUT) * Uint32(b) + Uint32(256) * Uint32(row)
+                swz = row % 8  # chunk ^ (t % 8): conflict-free rows, as the mailbox
+                acc = taddr + Uint32(128) * Uint32(b) + quad
                 for c4 in cutlass.range_constexpr(4):  # (warp-collective TMEM loads)
-                    v = _tmem_ld32(taddr + (Uint32(32 * warp) << Uint32(16))
-                                   + Uint32(32 * c4))
-                    if send:
-                        words = [pack_pair(v[2 * i], v[2 * i + 1], policy="latent")
-                                 for i in range(16)]
-                        for q4 in cutlass.range_constexpr(4):
-                            target = peers[owner] + (Int64(slot) * 128
-                                                     + 32 * c4 + 8 * q4) * 2
-                            store_relaxed(target, tuple(words[4 * q4: 4 * q4 + 4]))
-                if live:
-                    store_relaxed(lpeers[owner] + Int64(slot) * 4, (float_bits(lse),))
+                    v = _tmem_ld32(acc + Uint32(32 * c4))
+                    for q4 in cutlass.range_constexpr(4):
+                        words = (Uint32(PAIR_SENT),) * 4
+                        if send:
+                            words = tuple(
+                                pack_pair(v[8 * q4 + 2 * i], v[8 * q4 + 2 * i + 1],
+                                          policy="latent")
+                                for i in range(4))
+                        chunk = Uint32(swz ^ Int32(4 * c4 + q4))
+                        _st_shared4(out + chunk * Uint32(16), *words)
                 tc_fence_before()
-            cute.arch.sync_threads()  # TMEM is read: the next unit may overwrite it
-            uc = uc + 1
+                mbar_arrive(acc_free + Uint32(8) * Uint32(b))  # TMEM read
+                if live:
+                    lse_at = lpeers[owner] + Int64(base + t) * 4
+                    store_relaxed(lse_at, (float_bits(lse),))
+                _fence_async_shared()
+                _epi_sync()
+                if row == 0:
+                    n = B - t0
+                    if n > 128:
+                        n = 128
+                    _bulk_push(peers[owner] + Int64(base + t0) * 256,
+                               outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
+                j = j + 1
+            if row == 0:
+                _bulk_wait0()
+        cute.arch.sync_threads()
         # Free TMEM before the dependents launch: a dependent CTA placed on this SM
         # while the merge spins may require TMEM column 0 (exclusive allocators).
         if warp == 0:
             tc_fence_after()
-            _tmem_free128(taddr)
+            _tmem_free256(taddr)
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
         for t in range(y, self.tiles, self.grid[1]):
@@ -551,7 +640,7 @@ class DcpValue:
         rows_lse, lens, box, _, peers, lpeers = args[1:7]
         values, parity, rank = args[8], args[12], args[13]
         H, D, B = self.heads, self.size, self.batch
-        cap = box.shape[1]
+        cap = box.shape[2]
         chunk, owner = tid % 16, gh // H
         per: cutlass.Constexpr = 4  # rows per thread per round
         for r0 in range(tid // 16, B, 32 * per):
@@ -569,9 +658,10 @@ class DcpValue:
                 loads.append((t, lse, words))
             for t, lse, words in loads:
                 if t < B:
-                    slot = ((parity * D + rank) * cap + t) * H + gh % H
+                    slot = ((parity * D + rank) * H + gh % H) * cap + t
                     if lse > Float32(EMPTY_LSE):
-                        target = peers[owner] + (Int64(slot) * 128 + 8 * chunk) * 2
+                        chunk_at = Int64(slot) * 128 + 8 * (chunk ^ (t % 8))
+                        target = peers[owner] + chunk_at * 2
                         store_relaxed(target, tuple(no_neg_zero(w) for w in words))
                     if chunk == 0:
                         address = lpeers[owner] + Int64(slot) * 4
@@ -613,7 +703,7 @@ class DcpValue:
         box, _, peers, lpeers = args[3:7]
         parity, rank = args[12], args[13]
         H, D, B, R = self.heads, self.size, self.batch, self.prows
-        cap = box.shape[1]
+        cap = box.shape[2]
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
         cute.arch.sync_threads()  # the previous step's readers are done
@@ -652,13 +742,14 @@ class DcpValue:
             t = t0 + row
             if (row < R) & (t < B):
                 lse = tile[j]
-                slot = ((parity * D + rank) * cap + t) * H + gh % H
+                slot = ((parity * D + rank) * H + gh % H) * cap + t
                 owner = gh // H
                 if lse > Float32(EMPTY_LSE):
                     sent = load_words(
                         values.iterator + row * 136 + 8 * chunk, count=4, shared=True
                     )
-                    target = peers[owner] + (Int64(slot) * 128 + 8 * chunk) * 2
+                    chunk_at = Int64(slot) * 128 + 8 * (chunk ^ (t % 8))
+                    target = peers[owner] + chunk_at * 2
                     store_relaxed(target, sent)
                 if chunk == 0:
                     store_relaxed(lpeers[owner] + Int64(slot) * 4, (float_bits(lse),))
@@ -677,7 +768,7 @@ class DcpValue:
         if t0 + warp < B:  # warp r: the source weights of request t0 + r
             lse = Float32(EMPTY_LSE)
             if lane < D:
-                source = at(lbox, lane, t0 + warp, head)
+                source = at(lbox, lane, head, t0 + warp)
                 word = load_volatile(source)[0]
                 while word == Uint32(LSE_SENT):
                     word = load_volatile(source)[0]
@@ -707,7 +798,7 @@ class DcpValue:
                 merged = zeros(8, Float32)
                 for s0 in cutlass.range_constexpr(0, D, 8):  # 8 polls in flight
                     sources = [
-                        at(box, s, t, head, 8 * chunk)
+                        at(box, s, head, t, 8 * (chunk ^ (t % 8)))
                         for s in range(s0, min(D, s0 + 8))
                     ]
                     loads = [load_volatile(source, count=4) for source in sources]
@@ -911,8 +1002,9 @@ def compile_value(
         w_uv, width = fake((gathered, 512, 128), (128 * 512, 1, 512)), 128
         if preprojected:  # the bmm's value rows instead
             w_uv = fake((gathered, batch, 128), (batch * 128, 128, 1))
-    box = fake((size, cap, heads, width), None, torch.bfloat16)
-    lbox = fake((size, cap, heads), None, f32, 4)
+    lead = (size, heads, cap) if partials == PROJECTED else (size, cap, heads)
+    box = fake((*lead, width), None, torch.bfloat16)
+    lbox = fake(lead, None, f32, 4)
     peers = fake((size,), None, torch.int64, 8)
     output = fake((batch, heads * 128), (heads * 128, 1))
     args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
