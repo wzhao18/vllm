@@ -92,7 +92,7 @@ from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
 )
-from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
+from ......common.ptx_helpers import barrier_sync_unaligned, nanosleep, read_smid
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -136,6 +136,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     producer_done_region: ClassVar[str] = "rubin.genphase_moe.producer_done"
     # vLLM-local E2b: per-CTA, per-epilogue-warp sum-of-squares partials of the in-kernel norm reduce.
     e2b_partial_region: ClassVar[str] = "rubin.genphase_moe.e2b_partial"
+    e2b_count_region: ClassVar[str] = "rubin.genphase_moe.e2b_count"
+    e2b_gen_region: ClassVar[str] = "rubin.genphase_moe.e2b_gen"
 
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
@@ -695,6 +697,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 buffer_space="local",
                 byte_alignment=16,
             )
+            for region in (self.e2b_count_region, self.e2b_gen_region):
+                device_workspace.register(
+                    region, cutlass.Int32, (1,), buffer_space="local", byte_alignment=16, reset="zero_on_first_allocate"
+                )
         if self.reduce_acquires_producer_done:
             device_workspace.register(
                 self.producer_done_region,
@@ -1849,8 +1855,25 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             if cutlass.const_expr(e2b_output is not None):
                 # E2b: this CTA's epilogue warps have stored their last tile; reduce + normalize token row
-                # linear_cta_idx (rows <= CTAs, host-checked). Polling cannot deadlock: every routed tile is
-                # claimed by a resident CTA (dynamic claims) and peers' epilogues never wait for this one.
+                # linear_cta_idx (rows <= CTAs, host-checked). The row CTAs first wait until every CTA of this
+                # grid is through its tiles (sense-reversing arrival: count + generation), so their polling of
+                # the combine plane never competes with this rank's remaining weight stream. Every CTA arrives
+                # without waiting, and the waiters are row CTAs only; the grid fits the SMs (one CTA per SM).
+                epi_threads = 32 * len(self.epilogue_warp_ids)
+                cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epi_threads)
+                if thread_idx == Int32(0):
+                    gen_ptr = self._device_workspace.ptr(self.e2b_gen_region)
+                    count_ptr = self._device_workspace.ptr(self.e2b_count_region)
+                    gen0 = cute.arch.load(gen_ptr, Int32, sem="acquire", scope="gpu")
+                    old = cute.arch.atomic_add(count_ptr, Int32(1), sem="acq_rel", scope="gpu")
+                    if old == Int32(self.promised_launchable_sm_count - 1):
+                        cute.arch.store(count_ptr, Int32(0), sem="relaxed", scope="gpu")
+                        cute.arch.fence_acq_rel_gpu()
+                        cute.arch.store(gen_ptr, gen0 + Int32(1), sem="relaxed", scope="gpu")
+                    elif linear_cta_idx < Int32(e2b_output.shape[0]):
+                        while cute.arch.load(gen_ptr, Int32, sem="acquire", scope="gpu") == gen0:
+                            nanosleep(256)
+                cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epi_threads)
                 if linear_cta_idx < Int32(e2b_output.shape[0]):
                     iket.range_push("epilogue.e2b_reduce")
                     warps = len(self.epilogue_warp_ids)
