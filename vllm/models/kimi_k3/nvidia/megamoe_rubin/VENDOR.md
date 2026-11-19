@@ -19,7 +19,7 @@
 
 ## Local differences
 
-The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
+The R1 import rewrite (below), S3 and E2a (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
 - **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
   epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
@@ -47,6 +47,20 @@ The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (
   - Accuracy: rel-L2 vs the fp32 oracle 1.73e-3 (stock) vs 1.83e-3. Not bit-identical to the
     stock core (different rounding order of the same approximations).
   - When: every non-batch-invariant launch whose problem carries SiTU betas (no knob/env).
+
+- **E2a** (vLLM-local, not upstream): the latent RMSNorm folded into the BF16 top-k reduce.
+  `topk_reduce.py` gains `_reduce_bf16_rmsnorm` and `TopkReduce.__call__(rmsnorm_weight=,
+  rmsnorm_eps=)`; `block_scaled_swap_ab_mega_moe_kernel.py` `__call__` passes the two optional
+  arguments to its separate reduce (and imports `Float32`).
+  - Why: on the decode critical path the reduce (~4 us) is followed by the stock `rms_norm`
+    kernel (~2.6 us) over the same [n, latent] rows; the norm is the reduce output's only consumer.
+  - What: one CTA per token row, thread = one 8-wide hidden tile; the same FP32 per-element top-k
+    order and invalid-route masking as `_reduce_bf16` (reduce part bit-identical), BF16 rounding,
+    then stock vLLM `rms_norm`: FP32 sum of squares of the BF16 row (another order),
+    `s = rsqrt(sum / hidden + eps)` (approximate rsqrt, as `rsqrtf`), `out = bf16(x * s * w)`.
+    PDL launch with `griddepcontrol.wait`. Only the BF16, non-batch-invariant reduce.
+  - When: callers pass `rmsnorm=(weight, eps)` (`RubinMegaMoE.forward`; the sdec SP MegaMoE layer
+    for its latent norm). Absent: the stock reduce, unchanged.
 
 ## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
 
@@ -77,7 +91,7 @@ fi_numerics/moe_ep_batch_invariant/stage_partition.py | flashinfer/moe_ep/batch_
 fi_numerics/moe_ep_batch_invariant/wire_device.py | flashinfer/moe_ep/batch_invariant/wire_device.py | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f
 fi_numerics/moe_ep_batch_invariant/wire_spec.py | flashinfer/moe_ep/batch_invariant/wire_spec.py | f21445052dc0d7579df6f425ba53fc4891b5b9cebfe22e9791fcd218613ad6bf | b9ae9960f9bfee084f2c61fb32bd2a27d40e7c5f9a99c32a77dce3f964f40aab
 sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py | (R1 | rewrite) | c6ec37d63026c83e85a69eb14c0234c8e74f34a999882739a241f611dd751560 | e3ab102c3ac93e5cb6a81eec0707d078b02f9295674f24122bb5fae64d43dabb (R1 only; + S3: 2f3661c14a197f52ce66235010aeb78a0eb02ed34534d0f5d3f0de66dfd65ad8)
-sources/kernel_src/rubin/inference/mega/topk_reduce.py | (R1 | rewrite) | 44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358 | f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f
+sources/kernel_src/rubin/inference/mega/topk_reduce.py | (R1 | rewrite) | 44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358 | f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f (R1 only; + E2a: 1b5580b85ab4471a9126f5913568f8c41e8bce6fa916ea3eebde70550ac45d89)
 ```
 
 ## Rewrite rule
@@ -145,12 +159,12 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 850caf943d137eeeeb99e997a6debce7aea14d3db2cd1e1992601b4e3b711af2  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 60963f01d755f52d5f7b6e1e7c76242bc583b4d2e26192e3639f5aaee9caa22c  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-413acdb503943619a72e5decbfc2fadd99981c1bb9684808b9420141886c71e5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+beb008ac37d9b424f2787fdc7fe5f50babc24138d7711dd21c48680d09e204ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 9179cb6a1f53f55fb6a0f03a269f3a1702567cdf9e2798ec33c50834259e6e42  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
 f8640f21703099acbf74064368d2d1a6d410760e358bb4341a8b26402b0a8a1f  sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
-f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f  sources/kernel_src/rubin/inference/mega/topk_reduce.py
+1b5580b85ab4471a9126f5913568f8c41e8bce6fa916ea3eebde70550ac45d89  sources/kernel_src/rubin/inference/mega/topk_reduce.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/schedulers/__init__.py
 22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04  sources/kernel_src/schedulers/base.py
 c853ecafc65add0d5aac0e52b65bec89966c6d52d568afa32e58e46d73fdb8fa  sources/kernel_src/schedulers/fc12_mapping.py
