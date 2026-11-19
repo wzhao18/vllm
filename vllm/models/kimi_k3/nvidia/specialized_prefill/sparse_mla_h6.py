@@ -133,7 +133,8 @@ B_OREADY, B_PEMPTY = 16, 19  # x3 (P buffer u % 3)
 B_KVFULL, B_KVEMPTY = 22, 28  # x NS
 assert B_KVEMPTY + NS <= 40
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
-# 7-9 token-end l/m exchange (per sub-partition), 10 + wg warpgroup-wide
+# 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
+# warpgroup-wide
 C_Q, C_S, C_O = 0, 64, 192  # Q latent dims 0-255; S buffers at 64 and 128; O^T
 
 # instruction descriptors (dense kind::f8f6f4, E4M3 x E4M3 -> FP32, Rubin K64 bit 29)
@@ -602,11 +603,13 @@ class SparseMlaPrefillH6:
             tok = base + Uint32(OFF_TOK0)
             if qi % 2 == 1:
                 tok = base + Uint32(OFF_TOK1)
+            # token-parity barriers (7-9 / 12-14), see sparse_mla_h8
+            xbar = Uint32(7 + sp) + Uint32(5) * Uint32(qi % 2)
             if real:
                 st_shared_f32(tok + Uint32((wg * 2 * H + h) * 4), lw)
                 st_shared_f32(tok + Uint32((wg * 2 * H + H + h) * 4), mp_last)
                 if owner:
-                    named_bar(Uint32(7 + sp), 64)
+                    named_bar(xbar, 64)
                     o = 1 - wg
                     l1 = ld_shared_f32(tok + Uint32((o * 2 * H + h) * 4))
                     m1 = ld_shared_f32(tok + Uint32((o * 2 * H + H + h) * 4))
@@ -617,7 +620,7 @@ class SparseMlaPrefillH6:
                         iv = out_scale / lt
                     st_shared_f32(base + Uint32(OFF_INV + h * 4), iv)
                 else:
-                    named_bar_arrive(Uint32(7 + sp), 64)
+                    named_bar_arrive(xbar, 64)
             if owner:
                 if qi + 1 < n_mine:
                     self.q_copy(base, h, lane, lane_addr, qi + 1)

@@ -872,6 +872,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
         self._segscan_bufs: kda_segscan.SegBuffers | None = None
         self._frost = False
+        self._kda_persistent = False
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -902,6 +903,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 vllm_config
             ) and specialized_prefill_kda.frost_supported(
                 torch.device("cuda", torch.accelerator.current_device_index())
+            )
+            # Persistent CuTe DSL core (FP32 state in TMEM, LPT chain pieces
+            # with exact state handoffs): F16K 316 us vs FROST 464 on VR200.
+            self._kda_persistent = (
+                self._frost
+                and self.gate_lower_bound is not None
+                and -5.0 <= self.gate_lower_bound < 0.0
+                and specialized_prefill_kda.persistent_supported(
+                    torch.device("cuda", torch.accelerator.current_device_index())
+                )
             )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1615,20 +1626,40 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             cu_seqlens=non_spec_query_start_loc,
                         )
                     elif self._frost:
-                        frost_out, last_recurrent_state = (
-                            specialized_prefill_kda.frost_prefill(
-                                q=q_ns,
-                                k=k_ns,
-                                v=v_ns,
-                                g=g1_ns,
-                                beta=beta_ns,
-                                A_log=self.A_log,
-                                dt_bias=self.dt_bias,
-                                lower_bound=self.gate_lower_bound,
-                                initial_state=initial_state,
-                                cu_seqlens=non_spec_query_start_loc,
+                        if (
+                            self._kda_persistent
+                            and m.non_spec_query_start_loc_cpu is not None
+                        ):
+                            frost_out, last_recurrent_state = (
+                                specialized_prefill_kda.persistent_prefill(
+                                    q=q_ns,
+                                    k=k_ns,
+                                    v=v_ns,
+                                    g=g1_ns,
+                                    beta=beta_ns,
+                                    A_log=self.A_log,
+                                    dt_bias=self.dt_bias,
+                                    lower_bound=self.gate_lower_bound,
+                                    initial_state=initial_state,
+                                    cu_seqlens=non_spec_query_start_loc,
+                                    cu_seqlens_cpu=m.non_spec_query_start_loc_cpu,
+                                )
                             )
-                        )
+                        else:
+                            frost_out, last_recurrent_state = (
+                                specialized_prefill_kda.frost_prefill(
+                                    q=q_ns,
+                                    k=k_ns,
+                                    v=v_ns,
+                                    g=g1_ns,
+                                    beta=beta_ns,
+                                    A_log=self.A_log,
+                                    dt_bias=self.dt_bias,
+                                    lower_bound=self.gate_lower_bound,
+                                    initial_state=initial_state,
+                                    cu_seqlens=non_spec_query_start_loc,
+                                )
+                            )
                         if (
                             flashkda_out.data_ptr() == core_attn_out.data_ptr()
                             and frost_out.shape[1] == core_attn_out.shape[1]
