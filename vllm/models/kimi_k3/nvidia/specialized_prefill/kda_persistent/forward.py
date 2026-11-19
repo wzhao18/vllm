@@ -26,6 +26,7 @@ LOG2E = 1.4426950408889634
 
 # Device compilation controls and caches.
 _TPROBE = 0
+_WYPROBE = 0  # dev timing probe (numerically wrong), see kernel WYPROBE_
 _COMPILED: dict = {}
 _DUMMY_EXP: dict = {}
 _DUMMY_MID: dict = {}
@@ -68,7 +69,11 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    wy: bool = False,
+    tf4: bool = False,
 ):
+    if tf4 and (not wy or restore_tail):
+        raise ValueError("tf4 needs the WY route without restore_tail")
     key = (
         dev.index,
         torch.cuda.get_device_capability(dev),
@@ -95,6 +100,9 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        _WYPROBE,
+        wy,
+        tf4,
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -181,6 +189,9 @@ def _get_compiled(
                 H_=H,
                 stream=stream,
                 TPROBE_=_TPROBE,
+                WYPROBE_=_WYPROBE,
+                WY_=1 if wy else 0,
+                TF4_=1 if tf4 else 0,
                 GATE2_=gate2,
                 FINAL_=1 if store_final_state else 0,
                 SPLIT_=1 if has_split and not approximate_split else 0,
@@ -288,6 +299,8 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    wy=False,
+    tf4=False,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -359,6 +372,8 @@ def _launch_forward(
         cluster_size=cluster_size,
         gate_roll=gate_roll,
         partial_tma=partial_tma,
+        wy=wy,
+        tf4=tf4,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
@@ -675,4 +690,6 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
+        wy=not fixed,
+        tf4=not fixed,
     )
