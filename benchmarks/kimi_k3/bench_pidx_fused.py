@@ -157,10 +157,22 @@ def perf(args):
     run_score(d)
     res["select"] = timed(lambda: run_select(d), args.iters)
     for groups in args.groups:
-        res[f"select_g{groups}"] = timed(lambda: pidx.select(
-            d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"],
-            groups=groups), args.iters)
-        print(f"select groups {groups}: {res[f'select_g{groups}']:.3f} ms", flush=True)
+        for unroll in args.unrolls:
+            for smode in args.smodes:
+                kw = dict(groups=groups, unroll=unroll, mode=smode)
+                tag = f"select_g{groups}_u{unroll}_m{smode}"
+                res[tag] = timed(lambda: pidx.select(
+                    d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"], **kw),
+                    args.iters)
+                dbg = torch.zeros(8, dtype=torch.int64, device="cuda")
+                pidx.select(d["logits"], d["row_base"], d["row_len"], d["row_bin"], d["out"],
+                            dbg=dbg, **kw)
+                torch.cuda.synchronize()
+                v = dbg.tolist()
+                n = max(v[0], 1)
+                print(f"{tag}: {res[tag]:.3f} ms; clk per row: zero {v[1] / n:.0f} stream "
+                      f"{v[2] / n:.0f} digit {v[3] / n:.0f} resolve {v[4] / n:.0f} emit "
+                      f"{v[5] / n:.0f} (stream load-wait {v[6] / n:.0f}, dense {v[7] / n:.0f})", flush=True)
     res["score+select"] = timed(lambda: (run_score(d), run_select(d)), args.iters)
     print(f"select {res['select']:.3f} ms; score+select {res['score+select']:.3f} ms "
           f"per layer (items {d['items'].shape[0]}, scratch "
@@ -176,6 +188,8 @@ def main():
     ap.add_argument("--modes", type=int, nargs="+", default=[0])
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--groups", type=int, nargs="+", default=[4])
+    ap.add_argument("--unrolls", type=int, nargs="+", default=[8])
+    ap.add_argument("--smodes", type=int, nargs="+", default=[0])
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     out = {}
