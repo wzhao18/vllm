@@ -39,7 +39,7 @@ from ..token_protocol import TokenSrcMetadata
 from .symmetric_buffer import SymmetricBufferDevice
 
 
-TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps", "group_combine"]
+TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 TokenBackScheduleMode = Literal["static", "atomic_counter"]
 
 
@@ -1315,14 +1315,6 @@ class TokenCommNonDeterministic(KernelComponent):
     pre_reduced_activation_sf_region = "nvlink.token_comm.pre_reduced_activation_sf"
     token_back_schedule_region = "nvlink.token_comm.token_back_schedule"
     token_in_schedule_region = "nvlink.token_comm.token_in_schedule"
-    # S4 group_combine (vLLM-local): per (source rank, source token) routes still to combine on this rank, the pool
-    # row + 1 of each of its routes by source top-k slot (both self-cleaning: every launch returns them to zero), and
-    # the count of transfer warps that finished token_in (the group counts are final once it reaches every warp).
-    group_count_region = "nvlink.token_comm.group_count"
-    group_members_region = "nvlink.token_comm.group_members"
-    dispatch_done_region = "nvlink.token_comm.dispatch_done"
-    group_combine_chunks_per_pass: ClassVar[int] = 7
-    group_combine_register_count: ClassVar[int] = 152
     # Decode buckets claim token_in work dynamically (late-entering CTAs must not own pulls); prefill keeps the static stride.
     token_in_dynamic_claim_max_routes: ClassVar[int] = 4096
 
@@ -1387,7 +1379,6 @@ class TokenCommNonDeterministic(KernelComponent):
             problem_desc["max_tokens_per_rank"] * problem_desc["topk"] <= self.token_in_dynamic_claim_max_routes
         )
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
-        self.group_combine = self.token_back_mode == "group_combine"
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
         # die_split (die-local expert weights): the die-0 clusters compute from the lowest expert up and the die-1
         # clusters from the highest expert down, so token_in pulls from both ends too (even transfer warps from the
@@ -1397,11 +1388,6 @@ class TokenCommNonDeterministic(KernelComponent):
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
         self.decode_landing = self._router.decode_landing
-        if self.group_combine and (self.decode_landing or self.token_in_dynamic_claim):
-            raise ValueError(
-                "token_back_mode group_combine is a prefill mode: it needs the static token_in schedule "
-                f"(max_tokens_per_rank * topk > {self.token_in_dynamic_claim_max_routes})."
-            )
         # Landing (T * topk <= 16384) takes the landing token_in loop with dynamic claim up to 4096 routes and the
         # static warp stride above (16K pulls over every resident warp: no single-counter contention).
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
@@ -1438,17 +1424,8 @@ class TokenCommNonDeterministic(KernelComponent):
             raise NotImplementedError("TokenComm supports at most 16384 global experts.")
         if self.topk > self.expert_count:
             raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
-        if self.token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps", "group_combine"):
+        if self.token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
             raise ValueError(f"Unsupported token_back_mode {self.token_back_mode!r}.")
-        if self.group_combine:
-            if self.reduce_topk_in_kernel or self.combine_format.is_quantized:
-                raise ValueError("group_combine needs the separate reduce and a BF16 combine.")
-            if not self.apply_topk_at_fc1:
-                raise ValueError("group_combine sums routes before the reduce: routing weights must apply at FC1/FC2.")
-            if self.topk > 32:
-                raise ValueError("group_combine needs topk <= 32 (one member slot per lane).")
-            if (self.hidden_size * 2) % 512 != 0:
-                raise ValueError("group_combine needs hidden_size * 2 divisible by 512.")
         if self.token_back_schedule_mode not in ("static", "atomic_counter"):
             raise ValueError(
                 f"token_back_schedule_mode must be static or atomic_counter, got {self.token_back_schedule_mode!r}."
@@ -1722,19 +1699,6 @@ class TokenCommNonDeterministic(KernelComponent):
             workspace.register(
                 self.token_back_schedule_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
             )
-        if self.group_combine:
-            group_count = self.world_size * self.max_tokens_per_rank
-            workspace.register(
-                self.group_count_region, cutlass.Int32, (group_count,), buffer_space="local",
-                reset="zero_on_first_allocate",
-            )
-            workspace.register(
-                self.group_members_region, cutlass.Int32, (group_count * self.topk,), buffer_space="local",
-                reset="zero_on_first_allocate",
-            )
-            workspace.register(
-                self.dispatch_done_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
-            )
         if self.token_in_dynamic_claim:
             workspace.register(
                 self.token_in_schedule_region,
@@ -1785,8 +1749,7 @@ class TokenCommNonDeterministic(KernelComponent):
             stride=(self.activation_sf_hidden_padded, (0, 1)),
             byte_alignment=16,
         )
-        if not self.token_back_enabled or self.group_combine:
-            # group_combine moves rows global -> registers -> peer: no shared-memory stage.
+        if not self.token_back_enabled:
             return
 
         if self.token_back_mode == "standalone_warps":
@@ -2066,8 +2029,6 @@ class TokenCommNonDeterministic(KernelComponent):
                     metadata = TokenSrcMetadata.load(
                         token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
                     )
-                    if cutlass.const_expr(self.group_combine):
-                        self._record_group_member(metadata, pool_token_idx)
                     peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
                     remote_activation_address = (
                         self._token_comm_args.activation.iterator.toint()
@@ -2387,13 +2348,6 @@ class TokenCommNonDeterministic(KernelComponent):
         flag_tracker.fire()
         cute.arch.sync_warp()
         iket.range_pop()
-        if cutlass.const_expr(self.group_combine):
-            # Membership stores and count increments of this warp are ordered before the release.
-            if lane_idx == Int32(0):
-                cute.arch.atomic_add(
-                    self._device_workspace.ptr(self.dispatch_done_region), Int32(1), sem="release", scope="gpu"
-                )
-            cute.arch.sync_warp()
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode != "standalone_warps"):
             iket.range_push("token_in.transfer_barrier")
             transfer_lifetime_barrier = pipeline.NamedBarrier(
@@ -2439,9 +2393,6 @@ class TokenCommNonDeterministic(KernelComponent):
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         if cutlass.const_expr(not self.token_back_enabled):
-            return
-        if cutlass.const_expr(self.group_combine):
-            self._group_token_back(smem_workspace, smem_base)
             return
         if cutlass.const_expr(
             self.combine_format.is_quantized and self._token_comm_args.pre_reduced_activation_sf is None
@@ -2856,205 +2807,6 @@ class TokenCommNonDeterministic(KernelComponent):
         iket.range_pop()
         # with cute.arch.elect_one():
         #     cute.printf(" final data_average_window: {} ", data_average_window)
-
-    @cute.jit
-    def _record_group_member(self, metadata: TokenSrcMetadata, pool_token_idx: Int32) -> None:
-        """group_combine: note this route's pool row under its (source rank, source token) group."""
-        if self._lane_idx == Int32(0):
-            group = metadata.src_rank * Int32(self.max_tokens_per_rank) + metadata.src_token
-            members = self._device_workspace.tensor(self.group_members_region)
-            members[group * Int32(self.topk) + metadata.src_topk] = pool_token_idx + Int32(1)
-            cute.arch.atomic_add(
-                self._device_workspace.ptr(self.group_count_region) + group, Int32(1), sem="relaxed", scope="gpu"
-            )
-
-    @cute.jit
-    def _group_token_back(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
-        """group_combine token-back (S4): one pre-combined BF16 row per (source rank, source token).
-
-        The FC2 epilogue stores every route row locally (pool index space). Each transfer warp claims 32 dense
-        routes at a time (one per lane), waits for the FC2 of their experts, and decrements their groups' counts in
-        parallel; for every group its lane emptied, the warp sums the group's local rows in fp32 in ascending source
-        top-k order, rounds once to BF16 and stores the row into the source rank's combine plane at the group's
-        lowest top-k slot (the reduce reads only those leader slots). NVLink carries one row per (token,
-        destination rank) instead of one per route, as whole-row 16-byte-per-lane stores off the epilogue path.
-        """
-        transfer_warp_idx = self._transfer_warp_idx
-        lane_idx = self._lane_idx
-        global_worker_idx = self._linear_cta_idx * Int32(self.transfer_warp_count) + transfer_warp_idx
-        global_worker_count = Int32(self.promised_launchable_sm_count * self.transfer_warp_count)
-        owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
-        pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
-        token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)
-        fc2_done = self._device_workspace.ptr(self.fc2_done_region)
-        group_count = self._device_workspace.ptr(self.group_count_region)
-        dispatch_done = self._device_workspace.ptr(self.dispatch_done_region)
-        total_routes, _, _, _ = self._owned_size_totals(owned_sizes)
-
-        iket.range_push("token_back.wait_dispatch")
-        while cute.arch.load(dispatch_done, Int32, sem="acquire", scope="gpu") < global_worker_count:
-            nanosleep(200)
-        iket.range_pop()
-
-        batch = self._claim_group_batch(global_worker_idx, global_worker_count, Int32(0))
-        batch_round = Int32(1)
-        local_expert = Int32(0)
-        expert_valid_begin = Int32(0)
-        iket.range_push("token_back.group_work")
-        while batch < total_routes:
-            route = batch + lane_idx
-            batch_end = cutlass.min(batch + Int32(32), total_routes)
-            emptied = Int32(0)
-            src_rank = Int32(0)
-            src_token = Int32(0)
-            # Walk the experts this batch touches (claims increase, so the cursor only moves forward).
-            walking = Int32(1)
-            while walking != Int32(0):
-                expert_token_count = owned_sizes[local_expert]
-                expert_valid_end = expert_valid_begin + expert_token_count
-                if expert_valid_end > batch:
-                    token_tile_count = (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(
-                        self.tokens_per_fc1_ready_slot
-                    )
-                    completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
-                    while (
-                        cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target
-                    ):
-                        nanosleep(500)
-                    if (route >= expert_valid_begin) & (route < expert_valid_end) & (route < batch_end):
-                        pool_token_idx = pool_expert_bases[local_expert] + (route - expert_valid_begin)
-                        metadata = TokenSrcMetadata.load(
-                            token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
-                        )
-                        src_rank = metadata.src_rank
-                        src_token = metadata.src_token
-                        group = src_rank * Int32(self.max_tokens_per_rank) + src_token
-                        previous = cute.arch.atomic_add(group_count + group, Int32(-1), sem="acq_rel", scope="gpu")
-                        if previous == Int32(1):
-                            emptied = Int32(1)
-                if expert_valid_end >= batch_end:
-                    walking = Int32(0)
-                else:
-                    expert_valid_begin = expert_valid_end
-                    local_expert = local_expert + Int32(1)
-            cute.arch.sync_warp()
-            for j in cutlass.range(32, unroll=1):
-                if Int32(cute.arch.shuffle_sync(emptied, j)) != Int32(0):
-                    group_rank = Int32(cute.arch.shuffle_sync(src_rank, j))
-                    group_token = Int32(cute.arch.shuffle_sync(src_token, j))
-                    self._combine_group(
-                        group_rank * Int32(self.max_tokens_per_rank) + group_token, group_rank, group_token
-                    )
-            batch = self._claim_group_batch(global_worker_idx, global_worker_count, batch_round)
-            batch_round = batch_round + Int32(1)
-        iket.range_pop()
-        # Order this warp's peer stores before the tail barrier signal.
-        cute.arch.fence_acq_rel_sys()
-
-    @cute.jit
-    def _claim_group_batch(self, global_worker_idx: Int32, global_worker_count: Int32, batch_round: Int32) -> Int32:
-        """First dense route of this warp's next 32-route batch (atomic counter or static stride)."""
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
-            claimed = Int32(0)
-            if self._lane_idx == Int32(0):
-                claimed = cute.arch.atomic_add(
-                    self._device_workspace.ptr(self.token_back_schedule_region), Int32(32), sem="relaxed", scope="gpu"
-                )
-            return Int32(cute.arch.shuffle_sync(claimed, Int32(0)))
-        return (global_worker_idx + batch_round * global_worker_count) * Int32(32)
-
-    @cute.jit
-    def _combine_group(self, group: Int32, src_rank: Int32, src_token: Int32) -> None:
-        """Sum one group's local FC2 rows (fp32, ascending top-k) and store the BF16 row to its source rank.
-
-        Lane k < topk holds the pool row + 1 of the group's top-k slot k (0: not on this rank) and clears it. The
-        members are walked two at a time (lowest set slots first) so both rows' loads are in flight together.
-        """
-        lane_idx = self._lane_idx
-        topk: cutlass.Constexpr[int] = self.topk
-        row_bytes: cutlass.Constexpr[int] = self.hidden_size * 2
-        chunk_count: cutlass.Constexpr[int] = row_bytes // 512
-        per_pass: cutlass.Constexpr[int] = (
-            self.group_combine_chunks_per_pass if chunk_count % self.group_combine_chunks_per_pass == 0 else 4
-        )
-        members = self._device_workspace.tensor(self.group_members_region)
-        member = Int32(0)
-        if lane_idx < Int32(topk):
-            member = members[group * Int32(topk) + lane_idx]
-            members[group * Int32(topk) + lane_idx] = Int32(0)
-        present = Int32(0)
-        if member != Int32(0):
-            present = Int32(1) << lane_idx
-        # Distinct powers of two: the warp sum is the OR of the slot bits.
-        slot_mask = Int32(cute.arch.shuffle_sync(_warp_inclusive_sum(present, lane_idx), Int32(31)))
-        leader_bit = slot_mask & (Int32(0) - slot_mask)
-        leader = cute.arch.popc(leader_bit - Int32(1))
-
-        peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), src_rank, Int64(0))
-        remote_plane = cute.make_tensor(
-            cute.make_ptr(
-                self._token_comm_args.pre_reduced_activation.dtype,
-                self._token_comm_args.pre_reduced_activation.iterator.toint() + peer_offset,
-                AddressSpace.gmem,
-                assumed_align=(self._token_comm_args.pre_reduced_activation.iterator.max_alignment),
-            ),
-            self._token_comm_args.pre_reduced_activation.layout,
-        )
-        destination_row = remote_plane[Int64(src_token), leader, None].iterator.toint()
-        local_rows = self._device_workspace.ptr(self.fc2_activation_region).toint()
-        lane_offset = Int64(lane_idx * Int32(16))
-        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
-        for pass_base in cutlass.range_constexpr(0, chunk_count, per_pass):
-            chunks: cutlass.Constexpr[int] = min(per_pass, chunk_count - pass_base)
-            acc = cute.make_rmem_tensor((8, chunks), cutlass.Float32)
-            acc.fill(0.0)
-            remaining = slot_mask
-            while remaining != Int32(0):
-                first_bit = remaining & (Int32(0) - remaining)
-                remaining = remaining ^ first_bit
-                second_bit = remaining & (Int32(0) - remaining)
-                remaining = remaining ^ second_bit
-                first_row = Int32(cute.arch.shuffle_sync(member, cute.arch.popc(first_bit - Int32(1)))) - Int32(1)
-                second_slot = cute.arch.popc(second_bit - Int32(1))
-                if second_bit == Int32(0):
-                    second_slot = Int32(0)
-                second_row = Int32(cute.arch.shuffle_sync(member, second_slot)) - Int32(1)
-                first_terms = cute.make_rmem_tensor((8, chunks), cutlass.BFloat16)
-                second_terms = cute.make_rmem_tensor((8, chunks), cutlass.BFloat16)
-                self._load_row_chunks(first_terms, local_rows, first_row, lane_offset, pass_base, copy_atom)
-                if second_bit != Int32(0):
-                    self._load_row_chunks(second_terms, local_rows, second_row, lane_offset, pass_base, copy_atom)
-                for c in cutlass.range_constexpr(chunks):
-                    acc[None, c].store(acc[None, c].load() + first_terms[None, c].load().to(cutlass.Float32))
-                if second_bit != Int32(0):
-                    for c in cutlass.range_constexpr(chunks):
-                        acc[None, c].store(acc[None, c].load() + second_terms[None, c].load().to(cutlass.Float32))
-            for c in cutlass.range_constexpr(chunks):
-                out = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                out.store(acc[None, c].load().to(cutlass.BFloat16))
-                destination = cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        destination_row + Int64((pass_base + c) * 512) + lane_offset,
-                        AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((8,)),
-                )
-                cute.copy(copy_atom, out, destination)
-
-    def _load_row_chunks(self, terms, local_rows, row, lane_offset, pass_base: int, copy_atom) -> None:
-        """Traced inline: 16-byte loads of chunks [pass_base, pass_base + chunks) of one local FC2 row."""
-        chunks = cute.size(terms, mode=[1])
-        row_address = local_rows + Int64(row) * Int64(self.hidden_size * 2) + lane_offset
-        for c in range(chunks):  # plain Python loop: this helper is traced inline
-            source = cute.make_tensor(
-                cute.make_ptr(
-                    cutlass.BFloat16, row_address + Int64((pass_base + c) * 512), AddressSpace.gmem, assumed_align=16
-                ),
-                cute.make_layout((8,)),
-            )
-            cute.copy(copy_atom, source, terms[None, c])
 
     @cute.jit
     def _land_route_metadata(

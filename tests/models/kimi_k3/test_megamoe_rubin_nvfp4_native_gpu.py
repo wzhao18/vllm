@@ -37,12 +37,6 @@ SHAPES = {
     "ep32_decode": (28, 128, dict(max_tokens=128)),
     "ep16_prefill": (56, 2048, dict(world_size=16, kernel_variant="inference",
                                     max_tokens=2048)),
-    # S4: the same record with group_combine token-back (FC2 rows stored locally, one
-    # fp32-summed row per (token, destination rank), leader-slot reduce). On one GPU
-    # every token is a single group of all its routes.
-    "ep16_prefill_group": (56, 2048, dict(world_size=16, kernel_variant="inference",
-                                          max_tokens=2048),
-                           dict(token_back_mode="group_combine")),
 }  # fmt: skip
 SITU = dict(situ_beta=4.0, situ_linear_beta=25.0)
 
@@ -153,7 +147,7 @@ def build():
     def get(shape):
         if shape in cache:
             return cache[shape]
-        experts, cap, want, *knob_overrides = SHAPES[shape]
+        experts, cap, want = SHAPES[shape]
         problem = C.RubinMoeProblem(num_experts=experts, quant_kind="nvfp4")
         # A shipped NVFP4 record of this capacity (its knobs; the EP size is a server
         # property, the tiles and math are the same at EP1).
@@ -164,8 +158,9 @@ def build():
         ]
         assert records, f"no shipped NVFP4 knob record {want}"
         rec = min(records, key=lambda r: r.get("p50_us") or float("inf"))
-        knobs = dict(rec["knobs"], **(knob_overrides[0] if knob_overrides else {}))
-        bucket = C.RubinBucket(rec["kernel_variant"], cap, C.RubinKnobs.from_dict(knobs))
+        bucket = C.RubinBucket(
+            rec["kernel_variant"], cap, C.RubinKnobs.from_dict(rec["knobs"])
+        )
         moe = RubinMegaMoE(problem, None, [bucket])
         layer = _checkpoint_layer(problem, W, device, seed=7)
         weights = moe.prepare_nvfp4_checkpoint_weights(*layer)
@@ -179,8 +174,7 @@ def build():
 @pytest.mark.parametrize(
     "shape,n",
     [("ep32_decode", 1), ("ep32_decode", 37), ("ep32_decode", 128),
-     ("ep16_prefill", 2048), ("ep16_prefill_group", 2048),
-     ("ep16_prefill_group", 333)],
+     ("ep16_prefill", 2048)],
 )  # fmt: skip
 def test_native_nvfp4_kernel_matches_stock_math(build, shape, n):
     C, R, W, problem, moe, bucket, layer, weights = build(shape)

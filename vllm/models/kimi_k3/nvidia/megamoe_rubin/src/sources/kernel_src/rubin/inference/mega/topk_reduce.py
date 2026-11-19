@@ -166,13 +166,8 @@ class TopkReduce:
     # topk loop (small enough to not bloat registers; a CTA-broadcast read).
     _prefetch_limit: ClassVar[int] = 16
 
-    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None, *, batch_invariant: bool = False, group_experts_per_rank: Optional[int] = None) -> None:
+    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None, *, batch_invariant: bool = False) -> None:
         self.batch_invariant = bool(batch_invariant)
-        # S4 group_combine: each (token, destination rank) group lands one pre-combined row at its lowest top-k
-        # slot; only those leader slots are summed (in top-k order).
-        self.group_experts_per_rank = None if group_experts_per_rank is None else int(group_experts_per_rank)
-        if self.group_experts_per_rank is not None and (combine_format.is_quantized or batch_invariant):
-            raise ValueError("Leader-slot (group_combine) reduce supports the BF16 non-batch-invariant combine only.")
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
@@ -206,9 +201,6 @@ class TopkReduce:
         if cutlass.const_expr(topk_indices is not None):
             if cutlass.const_expr(self.num_experts is None):
                 raise ValueError("Masked combine requires a static expert count.")
-        if cutlass.const_expr(self.group_experts_per_rank is not None):
-            if cutlass.const_expr(topk_indices is None or topk_score is not None):
-                raise ValueError("Leader-slot reduce needs the top-k indices and no reduce-time routing weights.")
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
         grid = [(total_workers + threads - 1) // threads, 1, 1]
@@ -331,14 +323,6 @@ class TopkReduce:
             if cutlass.const_expr(self.batch_invariant):
                 acc.fill(0)
 
-            if cutlass.const_expr(self.group_experts_per_rank is not None):
-                route_ranks = cute.make_rmem_tensor((num_topk,), Int32)
-                for k in cutlass.range_constexpr(num_topk):
-                    route_expert = topk_indices[token_idx, Int32(k)]
-                    route_ranks[k] = Int32(-1)
-                    if (route_expert >= 0) & (route_expert < self.num_experts):
-                        route_ranks[k] = route_expert // Int32(self.group_experts_per_rank)
-
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
                 # Invalid routes never write a combine slot. Suppress the
@@ -347,10 +331,6 @@ class TopkReduce:
                 if cutlass.const_expr(topk_indices is not None):
                     expert = topk_indices[token_idx, Int32(k)]
                     valid_route = (expert >= 0) & (expert < self.num_experts)
-                    if cutlass.const_expr(self.group_experts_per_rank is not None):
-                        # Only the group leader (lowest top-k slot of its destination rank) holds a row.
-                        for j in cutlass.range_constexpr(k):
-                            valid_route = valid_route & (route_ranks[j] != route_ranks[k])
                     term.fill(0)
                     if valid_route:
                         cute.copy(
