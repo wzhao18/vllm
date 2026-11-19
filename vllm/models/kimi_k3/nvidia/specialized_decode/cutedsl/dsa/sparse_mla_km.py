@@ -99,7 +99,7 @@ PBYTES = TN * H  # P^T [128 keys x 96 heads] E4M3
 
 # Barriers
 NCORR = 4 * NG  # correction warps
-B_QFULL, B_QEMPTY = 0, 1
+B_QEMPTY = 1
 B_PFULL = 2  # + P buffer (tile parity): P^T, the tile's rescale factors and flags
 B_PVDONE = 4  # + P buffer: PV of that tile complete
 B_SFULL = 6  # + buffer
@@ -114,7 +114,8 @@ B_OEMPTY = 38  # + O^T block: read by the row's epilogue
 B_ALPHA = 42  # + NG x tile parity + group: the tile's rescale factors published
 B_LFULL = 48  # + group: the row's 1 / (448 l) published
 B_LEMPTY = 51  # + group: the epilogue read them
-NBAR = 54
+B_QBLK = 54  # + query block (4 latent column blocks, RoPE): landed
+NBAR = 59
 
 C_S, C_O = 0, 192  # TMEM: S^T 2 x 96 | O^T 4 x 96
 
@@ -344,8 +345,9 @@ class SparseMlaDecodeKM:
         base = Uint32(raw.toint())
         if tid == 0:
             self.mark(stamp, cta, 0)
-            for i, count in ((B_QFULL, 1), (B_QEMPTY, 1)):
-                mbar_init(self.bar(base, i), Uint32(count))
+            mbar_init(self.bar(base, B_QEMPTY), Uint32(1))
+            for j in cutlass.range_constexpr(5):
+                mbar_init(self.bar(base, B_QBLK + j), Uint32(1))
             for blk in cutlass.range_constexpr(4):
                 mbar_init(self.bar(base, B_PVBLK + blk), Uint32(1))
                 mbar_init(self.bar(base, B_OREADY + blk), Uint32(NCORR))
@@ -435,11 +437,14 @@ class SparseMlaDecodeKM:
                           self.bar(base, B_IDXFULL + b))
                 if cutlass.const_expr(not self.gather_only):
                     mbar_wait(self.bar(base, B_QEMPTY), (rq & 1) ^ 1)
-                    full = self.bar(base, B_QFULL)
-                    mbar_arrive_tx(full, Uint32(QBYTES))
+                    # Block by block: the row's first QK starts on the first block.
                     for j in cutlass.range_constexpr(4):
+                        full = self.bar(base, B_QBLK + j)
+                        mbar_arrive_tx(full, Uint32(QBLK))
                         tma_tile2d(base + Uint32(self.off_q + j * QBLK), tm_qn, full,
                                    Int32(128 * j), row * q_heads)
+                    full = self.bar(base, B_QBLK + 4)
+                    mbar_arrive_tx(full, Uint32(H * 64))
                     tma_tile2d(base + Uint32(self.off_q + 4 * QBLK), tm_qr, full, Int32(0),
                                row * q_heads)
                 rq = rq + 1
@@ -565,7 +570,7 @@ class SparseMlaDecodeKM:
 
     # ------------------------------------------------------------------ MMA
     @cute.jit
-    def qk(self, base, taddr, g, stamp, cta, mark, last):
+    def qk(self, base, taddr, g, stamp, cta, mark, last, first, ro):
         s = g % self.stages
         st = base + Uint32(self.off_kv) + Uint32(s) * Uint32(STAGE)
         b = g & 1
@@ -577,11 +582,16 @@ class SparseMlaDecodeKM:
         tc_fence_after()
         d = taddr + Uint32(C_S) + Uint32(96) * Uint32(b)
         for kk in cutlass.range_constexpr(8):
+            if cutlass.const_expr(kk % 2 == 0):
+                if first:
+                    mbar_wait(self.bar(base, B_QBLK + kk // 2), ro & 1)
             off = (kk // 2) * TN * 128 + (kk % 2) * 64
             ad = Uint64(SDESC_SW128) | Uint64((st + Uint32(off)) >> Uint32(4))
             qoff = self.off_q + (kk // 2) * QBLK + (kk % 2) * 64
             bd = Uint64(SDESC_SW128) | Uint64((base + Uint32(qoff)) >> Uint32(4))
             mma_ss(d, ad, bd, Uint32(IDESC_QK), Uint32(1 if kk > 0 else 0))
+        if first:
+            mbar_wait(self.bar(base, B_QBLK + 4), ro & 1)
         ad = Uint64(SDESC_SW64) | Uint64((st + Uint32(4 * TN * 128)) >> Uint32(4))
         bd = Uint64(SDESC_SW64) | Uint64((base + Uint32(self.off_q + 4 * QBLK)) >> Uint32(4))
         mma_ss(d, ad, bd, Uint32(IDESC_QK), Uint32(1))
@@ -614,9 +624,9 @@ class SparseMlaDecodeKM:
             n = self.nrow(base, i)
             if n > 0:
                 tiles = _tiles(n)
-                mbar_wait(self.bar(base, B_QFULL), ro & 1)
                 for t in range(tiles):
-                    self.qk(base, taddr, g, stamp, cta, ro * 8 + t, t + 1 == tiles)
+                    self.qk(base, taddr, g, stamp, cta, ro * 8 + t, t + 1 == tiles,
+                            t == 0, ro)
                     g = g + 1
                 ro = ro + 1
 
