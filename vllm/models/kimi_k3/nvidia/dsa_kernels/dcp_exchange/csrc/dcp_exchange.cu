@@ -3232,13 +3232,15 @@ int64_t topk_v2_resident_of(int* wide) {
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     // ~110 KB CTAs (one row each): the largest SMEM carveout
-    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<kV2T>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<1024>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<kV2T, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<1024, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<kV2T, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<1024, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_redo_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ2, topk_v2_redo_kernel, kV2T, kV2Dyn));
     TORCH_CHECK(occ2 >= 1, "topk_v2: the complete row body does not fit");
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel<kV2T>, kV2T, kV2Dyn));
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occw, topk_v2_kernel<1024>, 1024, kV2Dyn));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel<kV2T, false>, kV2T, kV2Dyn));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occw, topk_v2_kernel<1024, false>, 1024, kV2Dyn));
     v = sms * occ;
     w = sms * occw;
   }
@@ -3309,8 +3311,13 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024>, p));
-  else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T>, p));
+  if (p.dbg) {
+    if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024, true>, p));
+    else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T, true>, p));
+  } else {
+    if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024, false>, p));
+    else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T, false>, p));
+  }
   // the rows that need the complete body (rare; most CTAs exit after the PDL wait)
   cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
   cfg.blockDim = dim3(kV2T, 1, 1);
