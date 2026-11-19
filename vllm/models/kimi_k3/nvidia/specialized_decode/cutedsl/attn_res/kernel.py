@@ -11,6 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 
+from ..common import mx_rows
 from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
     add_rn,
@@ -90,13 +91,20 @@ class ClusterAttnRes:
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
         stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
-        out_mc=False,
+        out_mc=False, out_mx=None,
     ):  # fmt: skip
         # ``out_mc`` (row-sharded AttnRes, M >= 256, ``attn_res.sharded``): the output
         # row (and the aux rows) go to every rank's Lamport all-gather row row0 + token
         # at the trailing multicast address (the aux args are multicast addresses too)
         # instead of ``output`` (-0 halves made +0: the sentinel's word).
         self.out_mc = out_mc
+        # ``out_mx`` ("publish" / "store"): the normed output row goes out as MXFP8
+        # (``common.mx_rows``: FP8 data [rows, 7168] + F8_128x4 E8M0 scales) instead
+        # of BF16: "publish" multicasts it into every rank's Lamport MXFP8 box row
+        # row0 + token (output = (data mc, row0, scale mc)), "store" writes BF16
+        # ``output`` and also its MXFP8 row token locally (output = (tensor, data
+        # address, scale address)).
+        self.out_mx = out_mx
         # ``poll_warp`` (Rubin): the delta's Lamport poll exits by a warp vote
         # (``common.mailbox.poll_warp``), so the exchange's shuffles that follow do not
         # wait for per-lane poll loops to reconverge. Same words.
@@ -302,6 +310,8 @@ class ClusterAttnRes:
                 values[3] = dot8(mixture, 0, mixture, 0)
         row = (words[0], words[1], words[2], words[3])
         row0 = output[1] if cutlass.const_expr(self.out_mc) else None
+        if cutlass.const_expr(self.out_mx == "publish"):
+            row0 = output[1]
         if cutlass.const_expr(self.stores_first):
             self.store_rows(row, prefix, blocks, aux, token, col, row0)
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
@@ -343,7 +353,18 @@ class ClusterAttnRes:
                     result[0, i] = fma(ca, mixture[0, i], cp * v[NEW, i]) * v[G, i]
         for j in cutlass.range_constexpr(4):
             words[j] = bf16x2(result[0, 2 * j], result[0, 2 * j + 1])
-        if cutlass.const_expr(self.out_mc):
+        if cutlass.const_expr(self.out_mx is not None):
+            rounded = cute.make_rmem_tensor((1, 8), Float32)
+            unpack(words, rounded, 0)
+            values = tuple(rounded[0, i] for i in range(8))
+            if cutlass.const_expr(self.out_mx == "publish"):
+                mc, row0, smc = output
+                mx_rows.publish(values, mc, smc, row0 + token, col, 7168)
+            else:
+                out, data, scale = output
+                store_words(at(out, token, col), tuple(words[j] for j in range(4)))
+                mx_rows.store(values, data, scale, token, col, 7168)
+        elif cutlass.const_expr(self.out_mc):
             mc, row0 = output
             offset = Int64((row0 + token) * 7168 + col) * 2
             multicast_words(mc + offset, tuple(no_neg_zero(words[j]) for j in range(4)))
