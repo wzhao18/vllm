@@ -134,6 +134,9 @@ def frost_prefill_in_place(
     copies run. Returns the output (1, T, H, 128)."""
     assert _frost_fn
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
+    # FROST takes buffers as dense kernel arguments: the scheduler's index
+    # tensor can be a strided view.
+    state_indices = state_indices.contiguous()
     row = state_pool[0].numel()
     block = 4096
     _zero_new_state_rows[(state_indices.numel(), triton.cdiv(row, block))](
