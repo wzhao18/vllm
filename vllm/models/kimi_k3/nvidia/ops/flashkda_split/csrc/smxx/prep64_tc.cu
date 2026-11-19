@@ -793,6 +793,9 @@ __global__ void __launch_bounds__(kThreads, 1) kp64_kernel(const __grid_constant
 
   // ---- post-conv rows: q, k -> bf16 l2-normalized rows, v rows -> kv[1] ----------
   const int t_first = 4 * tg;
+  if (tid < kD) s.dt[tid] = p.dt_bias[h * kD + tid];
+  const float amp = expf(p.a_log[h]);
+  __syncthreads();  // barrier init, dt visible
   asm volatile(
       "{\n .reg .pred P1;\nW_%=:\n mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], 0;\n"
       " @!P1 bra W_%=;\n}" ::"r"(bar)
