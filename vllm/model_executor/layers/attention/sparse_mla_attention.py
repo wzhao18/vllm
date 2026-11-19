@@ -1029,6 +1029,17 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         assert row_offset == 0 or self.dcp_world_size > 1
         if not isinstance(index_group, HiSparseMLAIndexGroup):
             _, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, block_size)
+            if self.dcp_world_size == 1 and self.mqa_takes_logical_topk(num_tokens):
+                return self._forward_mqa_logical_topk(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    topk,
+                    attn_metadata.req_id_per_token[:num_tokens],
+                    attn_metadata.block_table,
+                    layer=layer,
+                    block_size=block_size,
+                    block_stride_rows=block_stride_rows,
+                )
             # A model's DCP decode exchange (sparse_attn_indexer.DCP_DECODE_TOPK_HOOKS)
             # left this rank's KV slots and their counts: nothing to convert.
             dcp_counts = (
@@ -1379,6 +1390,25 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         return_lse: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``return_lse`` None means ``need_to_return_lse_for_decode``."""
+        raise NotImplementedError
+
+    def mqa_takes_logical_topk(self, num_rows: int) -> bool:
+        """Whether this backend's MQA kernel maps the request-relative top-k of a
+        ``num_rows`` call through the block table itself (no index remap pass)."""
+        return False
+
+    def _forward_mqa_logical_topk(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor,
+        logical_topk: torch.Tensor,
+        req_id_per_token: torch.Tensor,
+        block_table: torch.Tensor,
+        *,
+        layer: AttentionLayer,
+        block_size: int,
+        block_stride_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         raise NotImplementedError
 
     def shardq_query_heads(self, num_heads: int) -> int:
