@@ -579,6 +579,8 @@ class RubinMegaMoeSession:
         if use_s2 is None:
             use_s2 = self.use_s2(None)
         variant = (use_s2, rmsnorm is not None)
+        if rmsnorm is not None and self.cfg.kernel_variant in DEDUP_VARIANTS:
+            raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
         if rmsnorm is not None:
             kwargs.update(self._rmsnorm_kwargs(*rmsnorm))
         if variant not in self.compiled:

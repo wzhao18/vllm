@@ -299,9 +299,6 @@ p50 (682 vs 731 us).
   rank, token), ``TopkReduceDedup`` sums the rank rows in ascending rank order; routing weights at FC1). The
   session allocates its per-launch ``tmp_buffer``. Used by prefill-sized NVFP4 inference buckets
   (``experts.RUBIN_DEDUP_MIN_TOKENS``).
-- **E2a-dedup** (vLLM-local): ``TopkReduceDedup`` with ``rmsnorm_weight`` / ``rmsnorm_eps`` (through the inference kernel's
-  ``__call__``, dedup combine only): one token row per CTA, the same ascending-rank FP32 fold, then the consumer's
-  stock RMSNorm of the BF16-rounded row (as E2a on the GenPhase reduce); writes only the normalized row.
 - **S-SH** (vLLM-local): the decode scheduler (``GenphaseDecodeFc12Scheduler``) carries the fused
   shared expert's tile stream (``SharedExpertStreamMixin`` from ``fc12_scheduler``) ahead of its
   routed sources, so the die-aware decode form takes the fused shared expert (upstream refuses

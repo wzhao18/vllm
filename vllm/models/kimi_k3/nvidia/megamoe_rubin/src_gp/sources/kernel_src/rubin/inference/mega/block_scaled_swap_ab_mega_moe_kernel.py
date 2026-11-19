@@ -1054,12 +1054,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         shared_fc2_weight: Optional[cute.Tensor] = None,  # (1, shared_intermediate_downproj, shared_output)
         shared_fc2_weight_sf: Optional[cute.Tensor] = None,  # (1, packed)
         shared_output: Optional[cute.Tensor] = None,  # (max_tokens_per_rank, shared_output) BF16, local
-        rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a-dedup, output = rms_norm(reduce)
-        rmsnorm_eps: Optional[cutlass.Float32] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
-        if cutlass.const_expr(rmsnorm_weight is not None and (self.reduce_topk_in_kernel or not self.combine_dedup)):
-            raise ValueError("the fused output RMSNorm runs in the separate dedup reduce only.")
         check_reduce_operand_alignment(output_activation=output_activation, shared_output=shared_output)
 
         helper_ready_bundle = (
@@ -1384,13 +1380,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             if cutlass.const_expr(self.combine_dedup):
                 # Weights are already folded (FC1 pre-multiply or FC2-epilogue multiply); sum the rank slots.
                 self._topk_reduce(
-                    pre_reduced_activation,
-                    dedup_valid_rank_mask,
-                    output_activation,
-                    stream,
-                    shared_term=reduce_shared,
-                    rmsnorm_weight=rmsnorm_weight,
-                    rmsnorm_eps=rmsnorm_eps,
+                    pre_reduced_activation, dedup_valid_rank_mask, output_activation, stream, shared_term=reduce_shared
                 )
             else:
                 reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
