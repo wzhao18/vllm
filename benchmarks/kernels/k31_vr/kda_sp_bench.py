@@ -109,7 +109,8 @@ def main():
     p.add_argument("--skip", default="", help="KdaFlow diagnostics: fold,store,verify,prep")
     p.add_argument("--hang", action="store_true", help="KdaFlow stuck-wait report")
     p.add_argument("--scalar", action="store_true", help="KdaFlow scalar FP32 pairs")
-    p.add_argument("--fence", action="store_true", help="KdaFlow fold chunk fence")
+    p.add_argument("--fence", type=int, default=0, help="KdaFlow fold fence interval")
+    p.add_argument("--noprefetch", action="store_true", help="KdaFlow no prefetch")
     a = p.parse_args()
     if a.trace:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
@@ -119,11 +120,12 @@ def main():
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.HANG = True
-    if a.scalar or a.fence:
+    if a.scalar or a.fence or a.noprefetch:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.PACKED = not a.scalar
-        flow.FOLD_FENCE = a.fence
+        flow.FOLD_FENCE = a.fence or flow.FOLD_FENCE
+        flow.PREFETCH = not a.noprefetch
     if a.skip:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 

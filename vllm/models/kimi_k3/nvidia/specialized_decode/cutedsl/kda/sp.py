@@ -168,7 +168,8 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
         budget = flow.smem_budget(device)
         stages = flow.max_stages(tokens, *streamed, conv_size, budget)
         if not stages:
-            raise Unsupported("kda", shape, "KdaFlow's shared memory does not fit")
+            cause = "KdaFlow needs a dim-first window and its shared memory"
+            raise Unsupported("kda", shape, cause)
         ctas = min(items, sms)
         if -(-items // ctas) > flow.max_items_per_cta(requests):
             raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
