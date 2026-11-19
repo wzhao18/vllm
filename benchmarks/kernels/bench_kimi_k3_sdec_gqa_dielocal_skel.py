@@ -270,8 +270,13 @@ def _module():
     return _mod
 
 
-def segments(n_req, n_blocks, rng):
-    """(address offset, bytes) of every (request, head) window per layer."""
+def segments(n_req, n_blocks, rng, packed=False):
+    """(address offset, bytes) of every (request, head) window per layer; ``packed``:
+    the windows back to back (calibration: one contiguous stream per layer)."""
+    if packed:
+        n = WINDOW * TOKEN
+        return [[(layer * (200 << 20) + s * n, n) for s in range(n_req * HEADS)]
+                for layer in range(LAYERS)]
     blocks = rng.sample(range(n_blocks), n_req)
     out = []
     for layer in range(LAYERS):
@@ -304,6 +309,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests", default="32,64,96")
     ap.add_argument("--replays", type=int, default=20)
+    ap.add_argument("--packed", action="store_true")
+    ap.add_argument("--arms", default="")
     ap.add_argument("--units", default="128,256,512")
     ap.add_argument("--forms", default="t2x32x3,t4x16x3,t4x24x2,b4x16x3")
     args = ap.parse_args()
@@ -335,6 +342,8 @@ def main():
         ("local-dyn", "local", 1, 0, 1, 0),
         ("striped-dyn", "striped", 0, 0, 0, 0),
     ]
+    if args.arms:
+        arms = [a for a in arms if a[0] in args.arms.split(",")]
     smids = list(range(sms))
     dies_of = [int(x) for x in table[:sms].tolist()]
     rank_match = torch.zeros(1024, dtype=torch.int32)
@@ -359,7 +368,7 @@ def main():
     rng = random.Random(1234)
     sink = torch.zeros(4, dtype=torch.int32, device=dev)
     for n_req in [int(x) for x in args.requests.split(",")]:
-        segs = segments(n_req, n_blocks, rng)
+        segs = segments(n_req, n_blocks, rng, args.packed)
         nseg = n_req * HEADS
         total = sum(n for _, n in segs[0])
         sol_us = total / SOL_TBS * 1e6
