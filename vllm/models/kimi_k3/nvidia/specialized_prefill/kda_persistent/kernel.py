@@ -143,6 +143,12 @@ MB_BRAW = 66
 MB_GRAM = 71
 
 
+def _flat2(t):
+    """A (1, 1, 2) global tile as a rank-1 (2,) tensor."""
+    return cute.make_tensor(t.iterator, cute.make_layout((2,)))
+
+
+@cute.jit
 def _exp2f(x):
     return cute.math.exp2(x, fastmath=True)
 
@@ -2081,7 +2087,7 @@ def _pkd(
                         fz_cw = cute.make_rmem_tensor((4, 2), cutlass.Float32)
                         for fz_ctap in cutlass.range_constexpr(4):
                             cute.autovec_copy(
-                                cute.local_tile(conv_wg, (1, 1, 2), (fz_cgrp, fz_ctap, fz_cpi)),
+                                _flat2(cute.local_tile(conv_wg, (1, 1, 2), (fz_cgrp, fz_ctap, fz_cpi))),
                                 fz_cw[(fz_ctap, None)],
                             )
                         fz_cwin = cute.make_rmem_tensor((3, 2), cutlass.Float32)
@@ -2091,19 +2097,19 @@ def _pkd(
                             if fz_ctok >= fz_cseq0:
                                 if fz_cpl == 0:
                                     cute.autovec_copy(
-                                        cute.local_tile(q, (1, 1, 2), (fz_ctok, hidx, fz_cc0 >> 1)), fz_c2
+                                        _flat2(cute.local_tile(q, (1, 1, 2), (fz_ctok, hidx, fz_cc0 >> 1))), fz_c2
                                     )
                                 else:
                                     cute.autovec_copy(
-                                        cute.local_tile(k, (1, 1, 2), (fz_ctok, hidx, fz_cc0 >> 1)), fz_c2
+                                        _flat2(cute.local_tile(k, (1, 1, 2), (fz_ctok, hidx, fz_cc0 >> 1))), fz_c2
                                     )
                             else:
                                 cute.autovec_copy(
-                                    cute.local_tile(
+                                    _flat2(cute.local_tile(
                                         conv_hist,
                                         (1, 1, 2),
                                         (seq_idx, 3 + fz_ctok - fz_cseq0, fz_cgrp * 4 + fz_cpi),
-                                    ),
+                                    )),
                                     fz_c2,
                                 )
                             fz_cwin[fz_cj, 0] = cutlass.Float32(fz_c2[0])
