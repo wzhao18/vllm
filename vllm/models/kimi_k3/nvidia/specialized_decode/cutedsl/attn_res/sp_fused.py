@@ -42,6 +42,7 @@ import torch
 from cutlass import Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
+from ..common import mx_rows
 from ..common.host import architecture, dynamic_fake, fake
 from ..common.mailbox import poll, rearm
 from ..common.primitives import at, launch, load_words, store_relaxed
@@ -60,11 +61,13 @@ class SpAttnResGather(ClusterAttnRes):
     [n, NB, 7168], norm, query, out_norm [7168], output (unused row view), eps,
     out_eps, the gather multicast address, rank, the local gather view [cap, 7168]."""
 
-    def __init__(self, nb, tp, *, has_delta, write, **options):
-        super().__init__(
-            nb, slots=0, has_delta=has_delta, write=write, out_mc=True, **options
-        )
-        self.tp = tp
+    def __init__(self, nb, tp, *, has_delta, write, mx=False, **options):
+        # ``mx``: publish the normed rows as MXFP8 into the MXFP8 box (``SpComm``
+        # gather data + scale regions; ``common.mx_rows``) for an MXFP8 in-projection;
+        # args 9.. are then (data mc, scale mc, rank, local data, local scales).
+        out = dict(out_mx="publish") if mx else dict(out_mc=True)
+        super().__init__(nb, slots=0, has_delta=has_delta, write=write, **out, **options)
+        self.tp, self.mx = tp, mx
 
     @cute.jit
     def __call__(self, *args):
@@ -73,7 +76,6 @@ class SpAttnResGather(ClusterAttnRes):
     @cute.kernel
     def kernel(self, args):
         delta, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
-        mc, rank, gather = args[9:12]
         part, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         n = prefix.shape[0]
@@ -83,11 +85,18 @@ class SpAttnResGather(ClusterAttnRes):
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (part, token, tid)
         self.pre(state, bufs, rows, eps, ids)
-        row0 = rank * n
-        self.post(state, bufs, delta, rows, (mc, row0), eps, out_eps, ids, ())
-        # Every rank's row of this token, these 1024 columns: published?
         col = (part * 128 + tid) * 8
-        poll(at(gather, token, col), n * 7168, self.tp)
+        if cutlass.const_expr(self.mx):
+            mc, smc, rank, data, scale = args[9:14]
+            out = (mc, rank * n, smc)
+            self.post(state, bufs, delta, rows, out, eps, out_eps, ids, ())
+            # Every rank's MXFP8 row of this token, these 1024 columns: published?
+            mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
+        else:
+            mc, rank, gather = args[9:12]
+            self.post(state, bufs, delta, rows, (mc, rank * n), eps, out_eps, ids, ())
+            # Every rank's row of this token, these 1024 columns: published?
+            poll(at(gather, token, col), n * 7168, self.tp)
         cute.arch.griddepcontrol_wait()
 
 
@@ -97,11 +106,17 @@ class SpReduceAttnRes(ClusterAttnRes):
     query, out_norm, output [n, 7168], eps, out_eps, partial [R, 7168] (read with
     ``push``), the owners' receive bases [TP] (int64), rank, the local gather view."""
 
-    def __init__(self, nb, tp, *, has_delta, push, **options):
+    def __init__(self, nb, tp, *, has_delta, push, gather_mx=False, out_mx=False,
+                 **options):  # fmt: skip
+        # ``gather_mx``: this layer's all-gather was MXFP8 (re-arm that layout; the
+        # last arg is then (local data, local scales)). ``out_mx``: also store the
+        # output row as MXFP8 for the MXFP8 projection that reads it (``output`` is
+        # then (out, data address, scale address)).
         super().__init__(
-            nb, slots=tp, has_delta=has_delta, write=-1, sanitize=True, **options
-        )
-        self.tp, self.push = tp, push
+            nb, slots=tp, has_delta=has_delta, write=-1, sanitize=True,
+            out_mx="store" if out_mx else None, **options,
+        )  # fmt: skip
+        self.tp, self.push, self.gather_mx = tp, push, gather_mx
 
     @cute.jit
     def __call__(self, *args):
@@ -110,7 +125,14 @@ class SpReduceAttnRes(ClusterAttnRes):
     @cute.kernel
     def kernel(self, args):
         ring, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
-        partial, peers, rank, gather = args[9:13]
+        partial, peers, rank = args[9:12]
+        rest = args[12:]
+        if cutlass.const_expr(self.gather_mx):
+            gather, rest = (rest[0], rest[1]), rest[2:]
+        else:
+            gather, rest = rest[0], rest[1:]
+        if cutlass.const_expr(self.out_mx is not None):
+            output = (output, rest[0], rest[1])
         part, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         n = prefix.shape[0]
@@ -130,8 +152,13 @@ class SpReduceAttnRes(ClusterAttnRes):
                 offset = Int64((rank * cap + token) * 7168 + col) * 2
                 store_relaxed(Int64(peers[o]) + offset, clean)
         self.post(state, bufs, ring, rows, output, eps, out_eps, ids, ())
-        for o in cutlass.range_constexpr(self.tp):
-            rearm(at(gather, o * n + token, col))
+        if cutlass.const_expr(self.gather_mx):
+            data, scale = gather
+            for o in cutlass.range_constexpr(self.tp):
+                mx_rows.rearm(data, scale, o * n + token, col, 7168)
+        else:
+            for o in cutlass.range_constexpr(self.tp):
+                rearm(at(gather, o * n + token, col))
         cute.arch.griddepcontrol_wait()
 
 
@@ -180,42 +207,50 @@ def _check_clusters(code, device, n_max, what):
 
 
 @cache
-def compile_gather(nb, has_delta, write, tp, cap, n_max, device):
-    """``SpAttnResGather`` for a layer key (nb, has_delta, write) at any n <= n_max."""
+def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False):
+    """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx) at any
+    n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpAttnResGather(
-            nb, tp, has_delta=has_delta, write=write, **_options(device)
+            nb, tp, has_delta=has_delta, write=write, mx=mx, **_options(device)
         )
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
         args = (row, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
-        args += (Int64(0), Int32(0), fake((cap, 7168)))
+        if mx:
+            args += (Int64(0), Int64(0), Int32(0), Int64(0), Int64(0))
+        else:
+            args += (Int64(0), Int32(0), fake((cap, 7168)))
         arch = architecture(torch.device("cuda", device))
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
         )
-        RESIDENCY["gather", nb] = _check_clusters(
+        RESIDENCY["gather", nb, mx] = _check_clusters(
             code, device, n_max, "SP AttnRes + all-gather"
         )
     return code
 
 
 @cache
-def compile_reduce(nb, has_delta, push, tp, cap, n_max, device):
+def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
+                   out_mx=False):  # fmt: skip
     """``SpReduceAttnRes`` for a layer key at any n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpReduceAttnRes(
-            nb, tp, has_delta=has_delta, push=push, **_options(device)
-        )
+            nb, tp, has_delta=has_delta, push=push, gather_mx=gather_mx,
+            out_mx=out_mx, **_options(device),
+        )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
         ring = fake((tp, cap // tp, 7168))
         args = (ring, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
         args += (dynamic_fake(2), fake((tp,), None, torch.int64), Int32(0))
-        args += (fake((cap, 7168)),)
+        args += (Int64(0), Int64(0)) if gather_mx else (fake((cap, 7168)),)
+        if out_mx:
+            args += (Int64(0), Int64(0))
         arch = architecture(torch.device("cuda", device))
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
         )
-        RESIDENCY["reduce", nb] = _check_clusters(
+        RESIDENCY["reduce", nb, gather_mx, out_mx] = _check_clusters(
             code, device, n_max, "SP reduce-scatter + AttnRes"
         )
     return code
@@ -227,42 +262,70 @@ class SpBoundary:
     ``_pre_attn_norm`` / ``_post_attn_norm``; ``nb`` the layer's prev_valid_blocks,
     ``write`` its block_write_idx (-1: not a block-write layer). Every kernel is
     compiled (and its co-residency checked) here, for shard rows up to ``n_max``;
-    ``first``: the step's first layer (its pre-AttnRes has no delta)."""
+    ``first``: the step's first layer (its pre-AttnRes has no delta).
 
-    def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False):
+    ``gather_mx``: the layer's in-projection is MXFP8: the all-gather carries the
+    MXFP8 rows (``SpComm.mx_view``; half the bytes, no quantization kernel).
+    ``out_mx``: an MXFP8 input scratch (``gemm.mxfp8.Mxfp8Input``) the post-AttnRes
+    output row is also written into, quantized (the MLP's MXFP8 shared gate_up)."""
+
+    def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False,
+                 gather_mx=False, out_mx=None):  # fmt: skip
         from ..common.host import to_cute
 
         self.comm, self.nb, self.write = comm, nb, write
+        self.gather_mx, self.out_mx = gather_mx, out_mx
         device = comm.device.index
         tp, cap = comm.tp, comm.rows_cap
         self.pre_w = tuple(to_cute(w.reshape(-1)) for w in pre[0])
         self.pre_eps = tuple(map(cutlass.Float32, pre[1]))
         self.post_w = tuple(to_cute(w.reshape(-1)) for w in post[0])
         self.post_eps = tuple(map(cutlass.Float32, post[1]))
+        self.out_args = ()
+        if out_mx is not None:
+            if out_mx.k != 7168 or out_mx.buf.rows < n_max:
+                from ...shapes import Unsupported
+
+                raise Unsupported(
+                    "sp_boundary", None, f"MXFP8 output scratch [{out_mx.buf.rows}, "
+                    f"{out_mx.k}] for {n_max} shard rows of 7168",
+                )  # fmt: skip
+            buf = out_mx.buf
+            buf.scale.zero_()  # padding rows of a tile: finite (never stored) rows
+            self.out_args = (Int64(buf.data.data_ptr()), Int64(buf.scale.data_ptr()))
         self.codes = {}
         # The step's first layer has no delta (the embedding is the prefix).
         self.codes[("pre", not first)] = compile_gather(
-            nb, not first, write, tp, cap, n_max, device
+            nb, not first, write, tp, cap, n_max, device, gather_mx
         )
         block = write >= 0
         for push in sorted({bool(p) for p in push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(
-                nb + int(block), not block, push, tp, cap, n_max, device
-            )
+                nb + int(block), not block, push, tp, cap, n_max, device,
+                gather_mx, out_mx is not None,
+            )  # fmt: skip
         self.push_rows = push_rows  # R -> the reduce kernel pushes the partial
 
     def gather(self, delta, prefix, blocks, parity):
         """The pre-AttnRes of ``delta`` (None: none) over this rank's shard, all-
-        gathered: returns gather[parity][:R] (complete when the kernel ends)."""
+        gathered: returns gather[parity][:R] (complete when the kernel ends), or its
+        MXFP8 form (``SpComm.mx_view``) with ``gather_mx``."""
         from ..common.host import dynamic_view, stream
 
         comm = self.comm
         n = prefix.shape[0]
-        gather, mc, _, _ = comm.views(parity)
         code = self.codes[("pre", delta is not None)]
         source = prefix if delta is None else delta
         rows = map(dynamic_view, (source, prefix, blocks, prefix))
         source_v, prefix_v, blocks_v, dummy = rows
+        if self.gather_mx:
+            mc, smc, data, scale = comm.mx_addresses(parity)
+            code(
+                source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
+                mc, smc, comm._rank, data, scale, stream(comm.device),
+            )  # fmt: skip
+            return comm.mx_view(parity, n * comm.tp)
+        gather, mc, _, _ = comm.views(parity)
         code(
             source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
             mc, comm._rank, gather, stream(comm.device),
@@ -271,13 +334,18 @@ class SpBoundary:
 
     def reduce(self, prefix, blocks, out, parity, partial=None):
         """The owner sum of this rank's TP receive slots (pushing ``partial`` [R, 7168]
-        first when given) + the post-AttnRes into ``out`` [n, 7168]; a block-write
-        layer stores the sum as the new prefix row (in ``prefix``)."""
+        first when given) + the post-AttnRes into ``out`` [n, 7168] (and, with
+        ``out_mx``, its MXFP8 form into that scratch); a block-write layer stores the
+        sum as the new prefix row (in ``prefix``)."""
         from ..common.host import dynamic_view, stream
 
         comm = self.comm
         n = prefix.shape[0]
         gather, _, recv, peers = comm.views(parity)
+        if self.gather_mx:
+            gather = comm.mx_addresses(parity)[2:]
+        else:
+            gather = (gather,)
         code = self.codes[("post", partial is not None)]
         if partial is None:
             partial = comm.partial[: n * comm.tp]
@@ -285,6 +353,7 @@ class SpBoundary:
         prefix_v, blocks_v, out_v, partial_v = views
         code(
             recv, prefix_v, blocks_v, *self.post_w, out_v, *self.post_eps,
-            partial_v, peers, comm._rank, gather, stream(comm.device),
+            partial_v, peers, comm._rank, *gather, *self.out_args,
+            stream(comm.device),
         )  # fmt: skip
         return out

@@ -18,7 +18,11 @@ D3-32):
 - the gathered rows and the post-AttnRes output are within two BF16 ulps of the row's
   largest magnitude of the stock op (the AttnRes summation order differs:
   ClusterAttnRes);
-- every mailbox is re-armed after each boundary pair.
+- every mailbox is re-armed after each boundary pair;
+- the MXFP8 forms (an MXFP8 in-projection's all-gather, ``gather_mx``; the MXFP8
+  shared gate_up input of the post-AttnRes, ``out_mx``) are ``mxfp8_act.quantize``
+  of the fused BF16 rows (FP8 values equal, scales bitwise), and MXFP8 GEMMs over the
+  gathered box equal those over the quantized reference.
 
 ``SpFinalGather`` returns stock ``sp_all_gather``'s rows (sanitized words) and
 re-arms its box.
@@ -92,7 +96,30 @@ def _close(a, b, ulps):
 def _armed(comm, parity, rows):
     g = comm.gather[parity, :rows].view(torch.int32)
     r = comm.recv[parity].view(torch.int32)
-    return bool((g == SENTINEL).all()) and bool((r == SENTINEL).all())
+    s = comm.box[parity, comm.rows_cap :].view(torch.int32)
+    ok = bool((g == SENTINEL).all()) and bool((r == SENTINEL).all())
+    return ok and bool((s == -1).all())
+
+
+def _scale_index(rows, device):
+    """F8_128x4 byte offsets of rows [0, rows) x 224 scale blocks (7168 / 32)."""
+    r = torch.arange(rows, device=device).view(-1, 1)
+    b = torch.arange(WIDTH // 32, device=device).view(1, -1)
+    off = (b & 3) + (b >> 2) * 512 + (r & 31) * 16 + ((r & 127) >> 5) * 4
+    return (off + (r >> 7) * 128 * (WIDTH // 32)).reshape(-1)
+
+
+def _quant(mxfp8_act, x):
+    out = mxfp8_act.Mxfp8Buffer(x.shape[0], x.shape[1], x.device)
+    mxfp8_act.quantize(x, out=out)
+    return out
+
+
+def _same_mx(got, want, rows):
+    """FP8 values equal (a -0 may be +0) and the rows' scale bytes bitwise."""
+    data = torch.equal(got.data[:rows].float(), want.data[:rows].float())
+    index = _scale_index(rows, want.scale.device)
+    return data and torch.equal(got.scale[index], want.scale[index])
 
 
 def _worker(env: dict[str, str]) -> None:
@@ -118,8 +145,18 @@ def _worker(env: dict[str, str]) -> None:
             enable_symm_mem_for_group(group.group_name)
         except (ImportError, AttributeError):
             pass
+        from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import mxfp8
+
         comm = sp_comm.SpComm(group, device, world, rank, rows_cap=CAP)
         eps = (1e-6, 1e-6)
+        scratch = mxfp8.Mxfp8Input(max(SHARDS), WIDTH, device)
+        # An MXFP8 weight [256, 7168] for the GEMM check (F8_128x4 scales).
+        wq = mxfp8_act.quantize(_rand((256, WIDTH), ("w",), device))
+        gemm = mxfp8.Mxfp8Projection(
+            (wq.data, wq.scale), [n * world for n in SHARDS], family="kda_in",
+            tactics={n * world: "scaled_mm" for n in SHARDS},
+        )  # fmt: skip
         worst = {}
         for n in SHARDS:
             rows = n * world
@@ -174,8 +211,35 @@ def _worker(env: dict[str, str]) -> None:
                     torch.accelerator.synchronize(device)
                     assert _armed(comm, parity, rows), (mode, rows, layer)
                     res[mode] = [t.float() for t in (g, y, prefix, blocks)]
+                    if mode == "fused":
+                        res["fused_bf16"] = (g, y)
                 if rank == 0:
                     print(f"R{rows} L{layer} done", flush=True)
+                # The MXFP8 forms of the same boundaries.
+                mx = sp_fused.SpBoundary(
+                    comm, (pre_w, eps), (post_w, eps), prev,
+                    layer // BLOCK if write else -1, max(SHARDS), {rows: True},
+                    first=layer == 0, gather_mx=True, out_mx=scratch,
+                )  # fmt: skip
+                prefix, blocks = prefix0.clone(), blocks0.clone()
+                dist.barrier()
+                gv = mx.gather(d, prefix, blocks, parity)
+                torch.accelerator.synchronize(device)
+                ref = _quant(mxfp8_act, res["fused_bf16"][0])
+                assert gv.rows == rows and _same_mx(gv, ref, rows), ("mx gather", rows)
+                for kind in ("scaled_mm", "fi_cute"):
+                    a = torch.empty((rows, 256), dtype=torch.bfloat16, device=device)
+                    b = torch.empty_like(a)
+                    gemm.kinds[rows] = kind
+                    gemm.run(gv, a)
+                    gemm.run(ref, b)
+                    assert torch.equal(a, b), ("mx gemm", kind, rows)
+                y = mx.reduce(prefix, blocks, out, parity, partial).clone()
+                torch.accelerator.synchronize(device)
+                assert _armed(comm, parity, rows), ("mx", rows, layer)
+                assert torch.equal(y, res["fused_bf16"][1]), ("mx post", rows, layer)
+                ref = _quant(mxfp8_act, y)
+                assert _same_mx(scratch.view(n), ref, n), ("mx out", rows, layer)
                 s, f = res["stock"], res["fused"]
                 assert torch.equal(s[2], f[2]), ("prefix", rows, layer)
                 assert torch.equal(s[3], f[3]), ("blocks", rows, layer)

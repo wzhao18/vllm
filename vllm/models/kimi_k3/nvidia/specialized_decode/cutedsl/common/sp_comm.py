@@ -59,6 +59,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ...shapes import Choice, Path, Unsupported
 from ...symm import multicast_rendezvous, peer_rendezvous
+from . import mx_rows
 from .host import check_residency, fake, stream, to_cute
 from .mailbox import rearm
 from .primitives import (
@@ -322,11 +323,16 @@ class SpComm:
         self.rows_cap, self.parities = rows_cap, parities
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         bf16 = dict(dtype=torch.bfloat16, device=self.device)
-        self.gather = symm_mem.empty((parities, rows_cap, width), **bf16)
+        # Each parity's box: rows_cap BF16 rows, then the E8M0 scale region of the
+        # MXFP8 form of the same all-gather (``mx_view``: an MXFP8 in-projection's
+        # input, FP8 rows over the box's first bytes; ``common.mx_rows``).
+        self.mx_scale_bytes = mx_rows.scale_bytes(rows_cap, width)
+        extra = -(-self.mx_scale_bytes // (2 * width))
+        box = symm_mem.empty((parities, rows_cap + extra, width), **bf16)
+        self.box = box
+        self.gather = box[:, :rows_cap]
         self.recv = symm_mem.empty((parities, tp, rows_cap // tp, width), **bf16)
-        _, self.gather_mc = multicast_rendezvous(
-            self.gather, group, "Kimi K3 SP all-gather"
-        )
+        _, self.gather_mc = multicast_rendezvous(box, group, "Kimi K3 SP all-gather")
         if not self.gather_mc:  # the all-gather stores through it: no fallback
             raise Unsupported("sp_comm", None, "no NVLink multicast")
         handle = peer_rendezvous(self.recv, group)
@@ -335,24 +341,70 @@ class SpComm:
         bases = [[int(b) + p * size for b in ptrs] for p in range(parities)]
         self.peers = torch.tensor(bases, dtype=torch.int64, device=self.device)
         self.partial = torch.empty((rows_cap, width), **bf16)
-        for t in (self.gather, self.recv):
+        for t in (self.box, self.recv):
             t.view(torch.int32).fill_(SENTINEL)
+        # The MXFP8 scale regions have their own sentinel (E8M0 0xFF is never a
+        # scale; 0x80000000 may be four).
+        self.box[:, rows_cap:].view(torch.int32).fill_(mx_rows.SCALE_SENTINEL - 2**32)
         torch.accelerator.synchronize(self.device)
         torch.distributed.barrier(group=group)
         # cute views per parity: local gather, its multicast address, local recv, peers
+        pitch = box[0].numel() * 2  # bytes per parity
+        scales = rows_cap * width * 2  # the scale region's byte offset in a box
         self._views = [
             (
                 to_cute(self.gather[p]),
-                Int64(self.gather_mc + p * self.gather[0].numel() * 2),
+                Int64(self.gather_mc + p * pitch),
                 to_cute(self.recv[p]),
                 to_cute(self.peers[p]),
             )
             for p in range(parities)
         ]
+        # MXFP8 views per parity: (data mc, scale mc, local data, local scales)
+        self._mx = [
+            tuple(
+                Int64(base + p * pitch + offset)
+                for base, offset in (
+                    (self.gather_mc, 0), (self.gather_mc, scales),
+                    (box.data_ptr(), 0), (box.data_ptr(), scales),
+                )
+            )
+            for p in range(parities)
+        ]  # fmt: skip
+        self._mx_views: dict = {}
         self._rank = Int32(rank)
 
     def nbytes(self) -> int:
-        return sum(t.numel() * 2 for t in (self.gather, self.recv, self.partial))
+        return sum(t.numel() * 2 for t in (self.box, self.recv, self.partial))
+
+    def mx_addresses(self, parity: int):
+        """(data multicast, scale multicast, local data, local scales) addresses of
+        the MXFP8 form of ``parity``'s box (kernel arguments)."""
+        return self._mx[parity]
+
+    def mx_view(self, parity: int, rows: int):
+        """The MXFP8 all-gather of ``rows`` rows in ``parity``'s box as an
+        ``ops.mxfp8_act.Mxfp8Buffer`` (FP8 [rows, width] over the box's first bytes,
+        F8_128x4 scales of whole 128-row tiles; padding rows are never read into
+        stored outputs). Read plainly once its gather kernel ended."""
+        key = parity, rows
+        view = self._mx_views.get(key)
+        if view is None:
+            from ....ops import mxfp8_act
+
+            self.shard(rows)
+            flat = self.box[parity].view(torch.uint8).reshape(-1)
+            view = object.__new__(mxfp8_act.Mxfp8Buffer)
+            view.rows, view.k = rows, self.width
+            view.padded_cols = self.width // mx_rows.BLOCK
+            view.data = flat[: rows * self.width].view(torch.float8_e4m3fn).view(
+                rows, self.width
+            )
+            start = self.rows_cap * self.width * 2
+            view.scale = flat[start : start + mx_rows.scale_bytes(rows, self.width)]
+            view.orig_dtype = torch.bfloat16
+            self._mx_views[key] = view
+        return view
 
     def shard(self, rows: int) -> int:
         """The shard rows n = rows / TP; Unsupported for rows this box cannot carry."""

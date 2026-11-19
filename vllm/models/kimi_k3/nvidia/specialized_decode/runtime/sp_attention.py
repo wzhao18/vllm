@@ -121,9 +121,12 @@ def sp_layer(decoder, step):
         )  # fmt: skip
 
 
-def sp_boundary(decoder, comm, block, rows):
+def sp_boundary(decoder, comm, block, rows, mlp=None):
     """The layer's fused SP boundaries (``attn_res.sp_fused.SpBoundary``): the stock
-    ``_pre_attn_norm`` / ``_post_attn_norm`` weights, block pattern and epsilons."""
+    ``_pre_attn_norm`` / ``_post_attn_norm`` weights, block pattern and epsilons. An
+    MXFP8 in-projection (the NVFP4 checkpoint's KDA layers) takes the all-gather as
+    MXFP8; an ``SpMlp`` with an MXFP8 shared expert (``mlp``) takes its gate_up input
+    quantized by the post-AttnRes."""
     pre = (
         (
             decoder.self_attention_res_norm.weight,
@@ -150,9 +153,12 @@ def sp_boundary(decoder, comm, block, rows):
     pushes = {r: block.oproj.pushes(r) for r in rows}
     n_max = rows[-1] // comm.tp
     first = decoder.layer_idx == 0
+    gather_mx = isinstance(block.projection, Mxfp8Projection)
+    out_mx = None if mlp is None else mlp.mx_input()
     return SpBoundary(
-        comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first
-    )
+        comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first,
+        gather_mx=gather_mx, out_mx=out_mx,
+    )  # fmt: skip
 
 
 class SpAttentionBlock:
@@ -227,7 +233,7 @@ class SpAttentionBlock:
         (``attn_res.sp_fused.SpAttnResGather`` filled them), then the o-projection
         half (``SpOproj.produce``): returns this rank's partial to push, or None when
         the o-projection pushed it."""
-        rows = gathered.shape[0]
+        rows = gathered.shape[0] if isinstance(gathered, torch.Tensor) else gathered.rows
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
         attn_out = self.attn_out[:rows]
@@ -392,12 +398,6 @@ class SpStep:
             d.layer_idx: SpAttentionBlock(d, self, ordinal)
             for ordinal, d in enumerate(layers)
         }
-        # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
-        # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
-        self.bounds = {
-            d.layer_idx: sp_boundary(d, self.comm, self.blocks[d.layer_idx], rows)
-            for d in layers
-        }
         self.dense = any(not d.is_moe_layer for d in layers)
         self.moe = any(d.is_moe_layer for d in layers)
         # The MegaMoE layers' dense BF16 GEMMs on this rank's shard rows (sp_mlp).
@@ -406,6 +406,15 @@ class SpStep:
             d.layer_idx: SpMlp(d.mlp, shards, ctx, d.layer_idx)
             for d in layers
             if d.is_moe_layer
+        }
+        # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
+        # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
+        self.bounds = {
+            d.layer_idx: sp_boundary(
+                d, self.comm, self.blocks[d.layer_idx], rows,
+                self.mlps.get(d.layer_idx),
+            )  # fmt: skip
+            for d in layers
         }
         self.table = self.plan_coverage()
         self.table.assert_complete(rows)
@@ -576,7 +585,10 @@ class SpStep:
             out = prefix_sum.new_empty(prefix_sum.shape)
             hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
-            hidden = layer.mlp(hidden) if mlp is None else mlp.run(hidden)
+            if mlp is None:
+                hidden = layer.mlp(hidden)
+            else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
+                hidden = mlp.run(hidden, prequantized=bound.out_mx is not None)
             if index + 1 in self.aux_layers:
                 aux.append(
                     backbone._capture_aux_hidden_stream(

@@ -107,8 +107,9 @@ class Fakes:
             def prepare(self, rows):
                 self.prepared.append(rows)
 
-        def boundary(decoder, comm, block, rows):
+        def boundary(decoder, comm, block, rows, mlp=None):
             assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
+            assert (mlp is None) == (decoder.layer_idx == 0), decoder.layer_idx
             fakes.events.add("SpBoundary", decoder.layer_idx, block.parity)
             return SimpleNamespace(layer=decoder.layer_idx, comm=comm)
 
@@ -398,11 +399,13 @@ def test_collective_build_order_and_parities(fakes):
     assert dsa == [i % 2 for i in range(len(dsa))]
     # Per block: in-projection, core, o_proj (none built ahead of its layer); then
     # each MegaMoE layer's SpMlp (no collective) in layer order.
+    # then each layer's fused boundaries (they take the SpMlp's MXFP8 input).
     mlps = [e for e in events if e[0] == "SpMlp"]
     assert mlps == [("SpMlp", i) for i in range(1, len(KINDS))]
-    assert names[-len(mlps) :] == ["SpMlp"] * len(mlps)
     bounds = [e for e in events if e[0] == "SpBoundary"]
     assert bounds == [("SpBoundary", i, i % 2) for i in range(len(KINDS))]
+    tail = len(mlps) + len(bounds)
+    assert names[-tail:] == ["SpMlp"] * len(mlps) + ["SpBoundary"] * len(bounds)
     assert sorted(step.bounds) == list(range(len(KINDS)))
     per_block = [e[0] for e in events[5:] if e[0] not in ("SpMlp", "SpBoundary")]
     expected = list(
