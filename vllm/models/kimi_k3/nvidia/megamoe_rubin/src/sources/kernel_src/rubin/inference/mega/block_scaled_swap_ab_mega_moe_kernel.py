@@ -246,7 +246,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count, batch_invariant=bool(problem_desc.get("batch_invariant", False)))
+            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count, batch_invariant=bool(problem_desc.get("batch_invariant", False)), group_experts_per_rank=(self.local_expert_count if self.token_back_mode == "group_combine" else None))
         )
 
     def _validate_geometry(self) -> None:
@@ -1153,7 +1153,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             finalize_barrier.arrive_unaligned()
 
         if warp_idx >= Int32(self.transfer_warp_idx_start):
-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
+            if cutlass.const_expr(self.token_back_mode == "group_combine"):
+                # S4: the group combine keeps 7 x 16 B chunks of fp32 sums and loads in flight per lane.
+                cute.arch.warpgroup_reg_dealloc(self.token_comm.group_combine_register_count)
+            else:
+                cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             if warp_idx < Int32(self.token_in_end_warp_idx):
                 iket.range_push("mega.token_in")
                 self.token_comm.token_in(self._smem_workspace, smem_base)
