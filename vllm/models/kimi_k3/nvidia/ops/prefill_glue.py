@@ -411,20 +411,29 @@ __device__ __forceinline__ uint16_t gate_sigmoid_bf16(float gv) {
 
 __device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
     uint4 a, uint4 g, const uint16_t* __restrict__ lut) {
-  const uint16_t* ah = reinterpret_cast<const uint16_t*>(&a);
   const uint16_t* gh = reinterpret_cast<const uint16_t*>(&g);
+  const uint32_t* aw = reinterpret_cast<const uint32_t*>(&a);
   uint4 o;
-  uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
+  uint32_t* ow = reinterpret_cast<uint32_t*>(&o);
+  uint32_t s[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     const uint32_t b = gh[j];
     const uint32_t e = ((b >> 7) & 0xffu) - (uint32_t)GATE_LUT_E0;
-    const uint16_t sbits =
-        e < (uint32_t)GATE_LUT_NE
-            ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
-            : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
-    oh[j] = c10::BFloat16(bf16_bits_to_float(ah[j]) *
-                          bf16_bits_to_float(sbits)).x;
+    s[j] = e < (uint32_t)GATE_LUT_NE
+               ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
+               : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
+  }
+  // BF16 x BF16 products, rounded by cvt.rn.bf16x2 (RNE, as c10::BFloat16 for
+  // every non-NaN value) on packed pairs.
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    const float2 av = make_float2(__uint_as_float(aw[p] << 16),
+                                  __uint_as_float(aw[p] & 0xffff0000u));
+    const float2 sv = make_float2(__uint_as_float(s[2 * p] << 16),
+                                  __uint_as_float(s[2 * p + 1] << 16));
+    const __nv_bfloat162 r = __floats2bfloat162_rn(av.x * sv.x, av.y * sv.y);
+    ow[p] = *reinterpret_cast<const uint32_t*>(&r);
   }
   return o;
 }
@@ -534,16 +543,23 @@ void router_topk(torch::Tensor& topk_values, torch::Tensor& topk_indices,
                                        dev) == cudaSuccess);
     return v;
   }();
-  // Up to 8 resident 256-thread blocks per SM (register bound at VPL 28-32).
-  const dim3 grid((unsigned)std::min<int64_t>((n + kWarps - 1) / kWarps,
-                                              (int64_t)sms * 8)),
-      block(kWarps * 32);
+  const dim3 block(kWarps * 32);
+  // One resident wave of blocks (grid-stride over the tokens), from the
+  // occupancy of the instantiation (register bound at VPL 28-32).
 #define K3_TOPK_LAUNCH(V)                                                   \
+  {                                                                         \
+    static int occ_##V = 0;                                                 \
+    if (occ_##V == 0)                                                       \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(                        \
+          &occ_##V, router_topk_kernel<V, kWarps>, kWarps * 32, 0);         \
+    const dim3 grid((unsigned)std::min<int64_t>(                            \
+        (n + kWarps - 1) / kWarps, (int64_t)sms * std::max(occ_##V, 1)));   \
   router_topk_kernel<V, kWarps><<<grid, block, 0, stream>>>(                \
       scores.data_ptr<float>(), scores.stride(0), bias.data_ptr<float>(),   \
       topk_values.data_ptr<float>(), topk_indices.data_ptr<int32_t>(),      \
       (int32_t)n, (int32_t)e, (int32_t)k, renormalize,                      \
-      (float)routed_scaling_factor)
+      (float)routed_scaling_factor);                                       \
+  }
   if (vpl <= 8) {
     K3_TOPK_LAUNCH(8);
   } else if (vpl <= 16) {
@@ -630,11 +646,19 @@ void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                          attn.get_device());
-  const int64_t max_blocks = (int64_t)sms * 4;
-  const int blocks =
-      (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   const bool contig = attn.stride(0) == d && gate.stride(0) == d &&
                       out.stride(0) == d;
+  // One resident wave of CTAs (grid-stride loop).
+  static int occ[2] = {0, 0};
+  if (occ[contig] == 0) {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ[contig],
+        contig ? gate_sigmoid_mul_kernel<true> : gate_sigmoid_mul_kernel<false>,
+        threads, 0);
+  }
+  const int64_t max_blocks = (int64_t)sms * std::max(occ[contig], 1);
+  const int blocks =
+      (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   auto stream = c10::cuda::getCurrentCUDAStream();
   auto* op = reinterpret_cast<uint16_t*>(out.data_ptr());
   auto* ap = reinterpret_cast<const uint16_t*>(attn.data_ptr());
