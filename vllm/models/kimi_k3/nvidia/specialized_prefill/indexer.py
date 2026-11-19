@@ -295,26 +295,26 @@ def ge_bf16x2(r, thr):
 
 
 def _publish_code(half: str, sel: str) -> str:
-    # $0 is tied to $1 (same register): unchanged unless the key is kept
+    # $0 (the lane column's kept count) is tied to $1: unchanged unless kept
     return (
-        "{ .reg .pred a, b, c; .reg .b32 v; setp.ge.bf16x2 a|b, $2, $3; "
-        f"setp.lt.and.u64 c, $1, $5, {half}; prmt.b32 v, $2, $4, {sel}; "
-        "@c st.global.b32 [$1], v; @c add.u64 $0, $1, 512; }"
+        "{ .reg .pred a, b, c; .reg .b32 v; .reg .b64 ad; setp.ge.bf16x2 a|b, $2, $3; "
+        f"setp.lt.and.u32 c, $1, {SLOTS}, {half}; prmt.b32 v, $2, $4, {sel}; "
+        "mad.wide.u32 ad, $1, 512, $5; @c st.global.b32 [ad], v; @c add.u32 $0, $1, 1; }"
     )
 
 
-@asm(Int64)
-def publish_lo(ptr, r, thr, tw, lim):
-    """Low BF16 of r >= low of thr (and ptr < lim): store (tw | low) at ptr and
-    advance it one 128-word slot."""
-    return _publish_code("a", "0x7610"), "=l,0,r,r,r,l,~{memory}", (
-        Int64(ptr), Uint32(r), Uint32(thr), Uint32(tw), Int64(lim))
+@asm(Uint32)
+def publish_lo(count, r, thr, tw, slot0):
+    """Low BF16 of r >= low of thr (and the column not full): store (tw | low) at
+    slot ``count`` of the lane column starting at ``slot0`` and count it."""
+    return _publish_code("a", "0x7610"), "=r,0,r,r,r,l,~{memory}", (
+        Uint32(count), Uint32(r), Uint32(thr), Uint32(tw), Int64(slot0))
 
 
-@asm(Int64)
-def publish_hi(ptr, r, thr, tw, lim):
-    return _publish_code("b", "0x7632"), "=l,0,r,r,r,l,~{memory}", (
-        Int64(ptr), Uint32(r), Uint32(thr), Uint32(tw), Int64(lim))
+@asm(Uint32)
+def publish_hi(count, r, thr, tw, slot0):
+    return _publish_code("b", "0x7632"), "=r,0,r,r,r,l,~{memory}", (
+        Uint32(count), Uint32(r), Uint32(thr), Uint32(tw), Int64(slot0))
 
 
 @cute.jit
@@ -789,8 +789,8 @@ class IndexerScore:
             thr = Uint32(0)
             cand0 = ptr0
             cand1 = ptr1
-            p0 = ptr0
-            p1 = ptr1
+            p0 = Uint32(0)
+            p1 = Uint32(0)
             lim0 = ptr0
             lim1 = ptr1
             if cutlass.const_expr(self.mode >= PUBLISH):
@@ -803,10 +803,9 @@ class IndexerScore:
                 # the count, then one word per kept key (tile << 16 | BF16)
                 cand0 = out_a + row_base[row0] * 2 + lt * 4
                 cand1 = out_a + row_base[row1] * 2 + lt * 4
-                p0 = cand0 + TILE * 4
-                p1 = cand1 + TILE * 4
-                lim0 = cand0 + REGION * 4
-                lim1 = cand1 + REGION * 4
+                # kept counts and the first slot of each lane column
+                lim0 = cand0 + TILE * 4
+                lim1 = cand1 + TILE * 4
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
             # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
@@ -842,8 +841,8 @@ class IndexerScore:
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # this thread's candidate counts of both rows
                 # (a full column counts as overflowed: the row is recomputed)
-                st_global_u32(cand0, Uint32((p0 - cand0) // (TILE * 4) - 1))
-                st_global_u32(cand1, Uint32((p1 - cand1) // (TILE * 4) - 1))
+                st_global_u32(cand0, p0)
+                st_global_u32(cand1, p1)
             elif cutlass.const_expr(self.mode == 0):
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
