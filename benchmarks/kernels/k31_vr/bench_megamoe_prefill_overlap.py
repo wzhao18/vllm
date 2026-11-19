@@ -59,6 +59,9 @@ def parse_args():
     )
     p.add_argument("--modes", default="moe,shared,serial,overlap")
     p.add_argument(
+        "--variant", choices=("inference", "inference_dedup"), default="inference"
+    )
+    p.add_argument(
         "--routing", choices=("random", "local"), default="random",
         help="local: every route to this rank's own experts (no NVLink payload; "
         "the compute-only floor of the layer)",
@@ -185,7 +188,7 @@ def main():
     rows = []
     for cap in caps:
         bucket = RubinBucket(
-            "inference", C,
+            args.variant, C,
             knobs if cap is None else RubinKnobs.from_dict(
                 {**knobs.as_dict(), "fallback_cluster_shape_mn": None}
             ),
@@ -259,7 +262,8 @@ def main():
             if group is not None:
                 dist.barrier(group)
             row = {
-                "mode": mode, "grid_cap": cap, "sms": sms, "tokens": T, "capacity": C,
+                "mode": mode, "variant": args.variant, "grid_cap": cap, "sms": sms,
+                "tokens": T, "capacity": C,
                 "subcalls": nsub, "world": world, "routing": args.routing,
                 "num_experts": problem.num_experts,
                 "out_abs_sum": fp if mode != "shared" else None, **res,

@@ -388,7 +388,7 @@ class RubinMegaMoE:
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
-        unfused_norm = rmsnorm if session.cfg.kernel_variant == "genphase" else None
+        unfused_norm = rmsnorm if session.cfg.kernel_variant != "inference" else None
         if unfused_norm is not None:
             rmsnorm = None
         if n == 0:
@@ -429,7 +429,7 @@ class RubinMegaMoE:
         ensure_not_capturing("RubinMegaMoE fused RMSNorm compile")
         for b in self.buckets:
             session = self.sessions[b]
-            if session.cfg.kernel_variant == "genphase":
+            if session.cfg.kernel_variant != "inference":
                 continue  # stock rms_norm after the launch (forward)
             for use_s2 in sorted(session.kernels):
                 session.prepare(weights, session.empty_output, use_s2, (norm_weight, eps))
