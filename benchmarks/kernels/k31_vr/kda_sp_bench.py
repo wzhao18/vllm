@@ -188,6 +188,8 @@ def main():
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--json", default="")
     p.add_argument("--trace", action="store_true", help="KdaFlow cycle trace")
+    p.add_argument("--groups", type=int, default=0, help="KdaRow item groups per CTA")
+    p.add_argument("--ring", type=int, default=0, help="KdaRow box slots per warp")
     p.add_argument("--skip", default="", help="KdaFlow diagnostics: fold,store,verify,prep")
     p.add_argument("--hang", action="store_true", help="KdaFlow stuck-wait report")
     p.add_argument("--scalar", action="store_true", help="KdaFlow scalar FP32 pairs")
@@ -228,6 +230,17 @@ def main():
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.SKIP = tuple(a.skip.split(","))
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import row
+
+    row.TRACE, row.HANG = a.trace, a.hang
+    if a.skip:
+        row.SKIP = tuple(a.skip.split(","))
+    if a.groups:
+        row.GROUPS = a.groups
+        row.THREADS = row.GROUPS * row.GROUP_THREADS
+        row.WARPS = row.THREADS // 32
+    if a.ring:
+        row.RING = a.ring
     props = torch.cuda.get_device_properties(0)
     print(f"device {props.name} sms {props.multi_processor_count}", flush=True)
     results = []

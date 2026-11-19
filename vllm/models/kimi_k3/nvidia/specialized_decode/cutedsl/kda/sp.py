@@ -65,7 +65,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ...shapes import Choice, Path, Shape, Unsupported
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
-from . import flow, fused_ws, specialized
+from . import flow, fused_ws, row, specialized
 from .fused import KdaFused
 from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
@@ -85,10 +85,10 @@ SP_SPEC_SCHEDULE = {24: ""}
 REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
-KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow")
+KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "row")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide", "flow")
+FOLDS = ("fused", "fused_ws", "wide", "flow", "row")
 MODES = ("deferred", "triton", "none")
 
 
@@ -169,18 +169,21 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFusedWS's shared memory does not fit")
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
-    if kind == "flow":
+    if kind in ("flow", "row"):
+        core = flow if kind == "flow" else row
         if not record or not 2 <= tokens <= 4:
             cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
             raise Unsupported("kda", shape, cause)
-        budget = flow.smem_budget(device)
-        stages = flow.max_stages(tokens, *streamed, conv_size, budget)
+        budget = core.smem_budget(device)
+        stages = core.max_stages(tokens, *streamed, conv_size, budget)
         if not stages:
             cause = "KdaFlow needs a dim-first window and its shared memory"
             raise Unsupported("kda", shape, cause)
         ctas = min(items, sms)
-        if -(-items // ctas) > flow.max_items_per_cta(requests):
+        if -(-items // ctas) > core.max_items_per_cta(requests):
             raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
+        if kind == "row":
+            return row.KdaRow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
         return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
