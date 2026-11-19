@@ -33,8 +33,8 @@ def pg():
     return prefill_glue
 
 
-@pytest.mark.parametrize("rows", [1, 7, 300, 4350])
-@pytest.mark.parametrize("kind", ["rand", "ties", "nonfinite", "zeros"])
+@pytest.mark.parametrize("rows", [1, 7, 300, 4350, 16384])
+@pytest.mark.parametrize("kind", ["rand", "ties", "nonfinite", "zeros", "ep_bias"])
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_router_topk_matches_grouped_topk(pg, rows, kind, renormalize):
     from vllm import _custom_ops as ops
@@ -50,6 +50,9 @@ def test_router_topk_matches_grouped_topk(pg, rows, kind, renormalize):
         x[::7, ::13] = float("inf")
         x[::5, ::11] = float("nan")
         x[1::9, 5::17] = -float("inf")
+    elif kind == "ep_bias":
+        # The step bench's EP16 emulation: 56 of every 224 experts active.
+        bias[torch.arange(experts, device="cuda") % 224 >= 56] = -100.0
     elif kind == "zeros":
         x.zero_()
         bias.zero_()

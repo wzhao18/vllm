@@ -61,6 +61,7 @@ from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
 from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
     KDARecoverSSMRecords,
@@ -982,14 +983,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: "torch.Tensor | QuantizedActivation",
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
+        # A QuantizedActivation is in_proj's MXFP8 input written by the
+        # prefill AttnRes (specialized_prefill.attn_res_mxfp8).
+        qa = hidden_states if isinstance(hidden_states, QuantizedActivation) else None
+        act_dtype = qa.orig_dtype if qa is not None else hidden_states.dtype
+        act_device = qa.data.device if qa is not None else hidden_states.device
+        num_tokens = qa.data.size(0) if qa is not None else hidden_states.size(0)
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
         if (
-            0 < num_tokens <= self._projection_overlap_max_tokens
+            qa is None
+            and 0 < num_tokens <= self._projection_overlap_max_tokens
             and hidden_states.stride() == (self.hidden_size, 1)
             and projection_events is not None
             and projection_aux_stream is not None
@@ -1029,8 +1036,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            dtype=act_dtype,
+            device=act_device,
         )
         # Online-MXFP8 o_proj: the output gate norm writes o_proj's MXFP8 input
         # (preallocated here: _forward breaks the CUDA graph capture).
@@ -1039,8 +1046,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             o_mxfp8 = Mxfp8Buffer(
                 num_tokens,
                 self.local_num_heads * self.head_dim,
-                hidden_states.device,
-                hidden_states.dtype,
+                act_device,
+                act_dtype,
             )
         self._forward(
             mixed_qkv=mixed_qkv,
