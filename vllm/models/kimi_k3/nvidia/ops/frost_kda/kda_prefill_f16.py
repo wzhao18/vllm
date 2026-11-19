@@ -3706,9 +3706,10 @@ def build_cfg(
         cfg.vconv_stages = 3
         cfg.conv_warp_ids = (16, 17, 18, 19)
         cfg.threads_per_cta = 20 * cfg.threads_per_warp
-        # 64K registers: CG0 144 x 256, CG1 136 x 128, other 48 x 128, conv 40 x 128
+        # 5 warps per SM sub-partition: their setmaxnreg values may sum to at most 504 on
+        # sm_107 (512 hangs the CTA): CG0 144 + 144, CG1 128, other 48, conv 40
         cfg.num_regs_compute_group_0 = 144
-        cfg.num_regs_compute_group_1 = 136
+        cfg.num_regs_compute_group_1 = 128
         cfg.num_regs_other = 48
         cfg.vconv_cosize = cfg.vconv_stages * cfg.d_v * cfg.b_t
         cfg.conv_w_cosize = 3 * 4 * cfg.d_k
