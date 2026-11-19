@@ -199,6 +199,7 @@ def frost_prefill_in_place_o_norm(
     each group normalized into its head window of ``out``."""
     assert _frost_fn and 0 < split < q.shape[2]
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
+    state_indices = state_indices.contiguous()
     row = state_pool[0].numel()
     block = 4096
     _zero_new_state_rows[(state_indices.numel(), triton.cdiv(row, block))](
