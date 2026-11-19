@@ -56,6 +56,49 @@ def test_frost_prefill_matches_flashkda(lens, heads):
     assert _rel_rms(state, fs) < 2e-2
 
 
+@pytest.mark.parametrize(
+    "lens,heads", [([37], 8), ([300, 1, 1029], 8), ([2051, 777, 64], 96), ([5461] * 3, 96)]
+)
+def test_persistent_prefill_matches_flashkda(lens, heads):
+    """The persistent core (LPT chain pieces with FP32 state handoffs; the
+    3 x 5461 x 96-head shape splits chains across CTAs) against FlashKDA."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    if not sp_kda.persistent_supported(torch.device("cuda")):
+        pytest.skip("CuTe DSL not installed")
+    import vllm._flashkda_C  # noqa: F401
+
+    torch.manual_seed(0)
+    T, N, H = sum(lens), len(lens), heads
+    bf = torch.bfloat16
+    offs = [0, *torch.tensor(lens).cumsum(0).tolist()]
+    cu_cpu = torch.tensor(offs, dtype=torch.int32)
+    cu = cu_cpu.cuda()
+    q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
+    v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+    beta = torch.randn(T, H + 7, device="cuda").to(bf)[:, :H].unsqueeze(0)  # strided
+    A_log = torch.randn(H, device="cuda") * 0.5
+    dt_bias = torch.randn(H * D, device="cuda") * 0.1
+    h0 = torch.randn(N, H, D, D, device="cuda") * 0.1
+    out = torch.empty(1, T, H, D, dtype=bf, device="cuda")
+    fs = torch.empty_like(h0)
+    ws = torch.empty(torch.ops._flashkda_C.get_workspace_size(T, H, N), dtype=torch.uint8, device="cuda")
+    torch.ops._flashkda_C.fwd(
+        q, k, v, g, beta.contiguous(), D**-0.5, out, ws, A_log, dt_bias.view(H, D),
+        -5.0, h0, fs, cu, None, None,
+    )
+    h0_ref = h0.clone()
+    o, state = sp_kda.persistent_prefill(
+        q, k, v, g, beta, A_log, dt_bias, -5.0, h0, cu, cu_cpu
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(h0, h0_ref)
+    assert o.shape == out.shape and state.shape == fs.shape
+    assert not torch.isnan(o).any()
+    assert _rel_rms(o, out) < 2e-2
+    assert _rel_rms(state, fs) < 2e-2
+
+
 def test_frost_strided_beta():
     """frost_prefill passes beta as a row-strided view of the projection:
     FROST must read it exactly like a contiguous copy."""
