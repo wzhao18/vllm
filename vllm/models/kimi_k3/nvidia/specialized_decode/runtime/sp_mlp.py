@@ -209,7 +209,15 @@ class SpMlp:
                 routed, router_output, topk_ids, output_rmsnorm=fused_norm
             )
 
-        if mlp._shared_overlap:
+        # The GenPhase bucket's persistent grid needs every CTA resident: no side
+        # stream beside it (the shared expert runs before it on the main stream).
+        serial = _rubin_megamoe(mlp.experts) and (
+            mlp.experts.select_bucket(n).variant == "genphase"
+        )
+        if serial:
+            shared_out = self._shared(h, prequantized)
+            final = experts()
+        elif mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
                 experts,
                 lambda: self._shared(h, prequantized),
