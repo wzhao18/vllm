@@ -335,9 +335,11 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
 // Kimi-K3: gated o_norm + MXFP8 o_proj input (smxx/o_norm_mx.cu).
 void launch_o_norm_mx(const void* x, int64_t tokens, int heads,
                       NormMxArgs const& a, int num_sms, cudaStream_t stream);
+void launch_o_norm_mx_ldg(const void* x, int64_t tokens, int heads,
+                          NormMxArgs const& a, int num_sms, cudaStream_t stream);
 
-void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
-                  double eps, const Tensor& q, const Tensor& sf) {
+static void o_norm_mxfp8_impl(const Tensor& x, const Tensor& g, const Tensor& weight,
+                              double eps, const Tensor& q, const Tensor& sf, bool staged) {
   STD_TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() >= 2 &&
                       x.size(x.dim() - 1) == 128 &&
                       x.scalar_type() == ScalarType::BFloat16,
@@ -375,8 +377,19 @@ void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
   void* stream_ptr = nullptr;
   TORCH_ERROR_CODE_CHECK(
       aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream_ptr));
-  launch_o_norm_mx(x.const_data_ptr(), T, int(H), a, num_sms,
-                   static_cast<cudaStream_t>(stream_ptr));
+  (staged ? launch_o_norm_mx : launch_o_norm_mx_ldg)(
+      x.const_data_ptr(), T, int(H), a, num_sms, static_cast<cudaStream_t>(stream_ptr));
+}
+
+void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
+                  double eps, const Tensor& q, const Tensor& sf) {
+  o_norm_mxfp8_impl(x, g, weight, eps, q, sf, true);
+}
+
+// The direct-load kernel: the parity reference of o_norm_mxfp8 in tests.
+void o_norm_mxfp8_ref(const Tensor& x, const Tensor& g, const Tensor& weight,
+                      double eps, const Tensor& q, const Tensor& sf) {
+  o_norm_mxfp8_impl(x, g, weight, eps, q, sf, false);
 }
 
 void launch_k64_tc(void const* kdq, void const* kr, void const* inv, void const* mqk, float const* gt, void const* beta, void const* v,

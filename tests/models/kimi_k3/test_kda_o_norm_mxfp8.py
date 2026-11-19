@@ -46,3 +46,28 @@ def test_o_norm_mxfp8(tokens, heads):
     b = ref.data.view(torch.uint8).to(torch.int16)
     assert ((a - b).abs() > 1).float().mean().item() <= 1e-4
     assert (a != b).float().mean().item() <= 2e-3
+
+
+@pytest.mark.parametrize("tokens,heads", [(1, 4), (300, 96), (2051, 96)])
+def test_o_norm_mxfp8_staged_matches_direct(tokens, heads):
+    """The staged (bulk-copy) kernel is bit for bit the direct-load one, including
+    gates whose sigmoid needs the full-range division (1 + e > 2^126)."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_segscan
+    from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
+
+    kda_segscan.load_extension()
+    torch.manual_seed(1)
+    T, P = tokens, heads * D
+    x = (torch.randn(1, T, heads, D, device="cuda") * 3).to(torch.bfloat16)
+    gate = (torch.randn(T, P + 64, device="cuda") * 2).to(torch.bfloat16)[:, :P]
+    gate[0, :D] = -100.0  # 1 + e beyond 2^126
+    w = (torch.rand(D, device="cuda") + 0.5).contiguous()
+    outs = []
+    for op in (torch.ops.k3_flashkda_split.o_norm_mxfp8, torch.ops.k3_flashkda_split.o_norm_mxfp8_ref):
+        out = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
+        out.scale.zero_()  # the scale tile pads rows to 128
+        op(x, gate, w, 1e-6, out.data, out.scale)
+        outs.append(out)
+    torch.accelerator.synchronize()
+    assert torch.equal(outs[0].data.view(torch.uint8), outs[1].data.view(torch.uint8))
+    assert torch.equal(outs[0].scale, outs[1].scale)

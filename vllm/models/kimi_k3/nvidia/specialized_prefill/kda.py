@@ -14,12 +14,14 @@ o_norm:
 
 Stock (ops/kda_norm.py ``rmsnorm_gated_mxfp8``, Triton) runs the 96-head DEP16
 prefill at ~5 TB/s (204 us per layer at 16K tokens on VR200). This kernel
-(ops/flashkda_split/csrc/smxx/o_norm_mx.cu) gives each (token, head) row 8
-lanes x 16 columns, keeps two 4-row steps of loads in flight and does 32-bit
-row arithmetic. Per element it is the Triton kernel's expressions and
-instructions (approximate sqrt, full-range division, ex2 sigmoid, BF16 round,
-UE8M0 per 32, RN-satfinite E4M3); the row sum of squares runs as a lane
-butterfly, another order than Triton's tl.sum (stock tolerance).
+(ops/flashkda_split/csrc/smxx/o_norm_mx.cu) stages each token's H x 128 output
+and gate rows in shared memory with bulk async copies (4-deep ring, one producer
+lane) and normalizes them with 24 consumer warps, 8 lanes x 16 columns per row:
+116 us per layer at 16K tokens (139 us with direct loads). Per element it is the
+Triton kernel's expressions and instructions (approximate sqrt, full-range
+division, ex2 sigmoid, BF16 round, UE8M0 per 32, RN-satfinite E4M3; the sigmoid's
+reciprocal is rcp.approx where that equals the division); the row sum of squares
+runs as a lane butterfly, another order than Triton's tl.sum (stock tolerance).
 """
 
 from __future__ import annotations
