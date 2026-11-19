@@ -130,7 +130,7 @@ A_EXP, DT = 15, 16
 def group_bytes(tokens, window, conv_size):
     """One group's operand block, staging and store buffers (bytes)."""
     block = 6 * tokens * K * 4 + K * 4 + tokens * K * 2 + SUMS * 16  # x v w u, D
-    staging = 4 * tokens * K * 2 + 3 * K * window * conv_size + tokens * K * 8
+    staging = 4 * tokens * K * 2 + 6 * K * window * conv_size + tokens * K * 8
     stores = tokens * 2 * K * 2 + tokens * K * 4 + tokens * K * 2
     return block + staging + stores + 16 * 4 * 4 + 2 * 8 * 4 * 4
 
@@ -314,11 +314,14 @@ class KdaFlow(KdaWS):
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
 
     @cute.jit
-    def stage_item(self, args, table, j, buffers, barrier):
-        """Bulk-copy table item j's inputs (one thread): q / k / v and output gate
-        rows, the convolution window and, with a pending commit, its records."""
+    def stage_item(self, args, table, j, buffers, barrier, parity, c):
+        """Bulk-copy table item j's inputs (group thread c; lane 0 of the group's
+        warps 0-3 issue one share each): q / k / v and output gate rows, the
+        convolution window (buffer ``parity``) and, with a pending commit, its
+        records."""
         x, conv_state, gate = args[0], args[3], args[11]
-        convs, xs, gs, kgs, uss = buffers
+        convs_all, xs, gs, kgs, uss = buffers
+        convs = convs_all[parity, None, None]
         T: cutlass.Constexpr = self.tokens
         H: cutlass.Constexpr = self.heads
         dim: cutlass.Constexpr = H * K
@@ -333,25 +336,33 @@ class KdaFlow(KdaWS):
             total = Int32(rows)
             if pending > 0:
                 total = total + records
-            cute.arch.mbarrier_arrive_and_expect_tx(barrier, total)
             token = table[j, REQUEST] * T
-            for t in cutlass.range_constexpr(T):
-                for part in cutlass.range_constexpr(3):
-                    copy_g2s(at(xs, t, part, 0), at(x, token + t, part * dim + head * K),
-                             K * 2, barrier)  # fmt: skip
-                copy_g2s(at(gs, t, 0), at(gate, token + t, head * K), K * 2, barrier)
-            page = conv_state[Int64(table[j, CONV_SLOT]), None, None]
+            if c == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(barrier, total)
+                for t in cutlass.range_constexpr(T):
+                    copy_g2s(at(gs, t, 0), at(gate, token + t, head * K), K * 2, barrier)
             for part in cutlass.range_constexpr(3):
-                copy_g2s(at(convs, part, 0), at(page, part * dim + head * K, 0),
-                         part_bytes, barrier)  # fmt: skip
+                if c == 32 * (part + 1):
+                    for t in cutlass.range_constexpr(T):
+                        copy_g2s(at(xs, t, part, 0),
+                                 at(x, token + t, part * dim + head * K), K * 2,
+                                 barrier)  # fmt: skip
+            if c == 32:
+                page = conv_state[Int64(table[j, CONV_SLOT]), None, None]
+                for part in cutlass.range_constexpr(3):
+                    copy_g2s(at(convs, part, 0), at(page, part * dim + head * K, 0),
+                             part_bytes, barrier)  # fmt: skip
             if pending > 0:
                 rec = table[j, RECORD]
-                copy_g2s(at(kgs, 0, 0), at(args[19], rec, head, 0, 0), T * 2 * K * 2,
-                         barrier)  # fmt: skip
-                copy_g2s(at(uss, 0, 0), at(args[18], rec, head, 0, 0), T * K * 4,
-                         barrier)  # fmt: skip
+                if c == 64:
+                    copy_g2s(at(kgs, 0, 0), at(args[19], rec, head, 0, 0),
+                             T * 2 * K * 2, barrier)  # fmt: skip
+                if c == 96:
+                    copy_g2s(at(uss, 0, 0), at(args[18], rec, head, 0, 0), T * K * 4,
+                             barrier)  # fmt: skip
         else:
-            cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
+            if c == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
 
     # ----------------------------------------------------------------- kernel
     @cute.kernel
@@ -394,7 +405,7 @@ class KdaFlow(KdaWS):
         fd_s = alloc(smem, Float32, (GROUPS, K))  # D_n
         ce_s = alloc(smem, Float32, (GROUPS, T * T))  # the scan's token couplings
         g_s = alloc(smem, BFloat16, (GROUPS, T, K))
-        convs = alloc(smem, conv_type, (GROUPS, 3, K * self.window), align=128)
+        convs = alloc(smem, conv_type, (GROUPS, 2, 3, K * self.window), align=128)
         xs = alloc(smem, BFloat16, (GROUPS, T, 3, K), align=128)
         gs = alloc(smem, BFloat16, (GROUPS, T, K), align=128)
         kgs = alloc(smem, BFloat16, (GROUPS, T, 2 * K), align=128)
@@ -478,12 +489,11 @@ class KdaFlow(KdaWS):
         g = tid // GROUP_THREADS
         c = tid % GROUP_THREADS
         buffers = (
-            convs[g, None, None], xs[g, None, None, None], gs[g, None, None],
+            convs[g, None, None, None], xs[g, None, None, None], gs[g, None, None],
             kgs[g, None, None], uss[g, None, None],
         )  # fmt: skip
-        if c == 0:  # the group's first item's inputs
-            if g < count:
-                self.stage_item(args, table, g, buffers, stage_full + g)
+        if g < count:  # the group's first item's inputs
+            self.stage_item(args, table, g, buffers, stage_full + g, 0, c)
         cute.arch.sync_warp()
         self.bwait(fb_full, 0, "fb_full")
         self.bwait(fa_full, 0, "fa_full")
@@ -600,9 +610,10 @@ class KdaFlow(KdaWS):
             if cutlass.const_expr(self.trace):
                 tw = clock64()
                 tr[6] = tr[6] + (tw - ta)
+            item_buffers = (buffers[0][jj % 2, None, None], *buffers[1:])
             if cutlass.const_expr("prep" not in self.skip):
                 self.prep_item(args, g, c, j, slot, pending, table[j, CONV_OFFSET],
-                               raw, hcs[head - h0, None, None], buffers, ops,
+                               raw, hcs[head - h0, None, None], item_buffers, ops,
                                sums_g, kgo)  # fmt: skip
             if cutlass.const_expr(self.trace):
                 tp = clock64()
@@ -613,7 +624,7 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr("recst" in self.skip):
                     recst = slot < 0
                 if recst:  # the new key / gate records and convolution window
-                    convs = buffers[0]
+                    convs = item_buffers[0]
                     part_bytes: cutlass.Constexpr = (
                         K * self.window * convs.element_type.width // 8
                     )
@@ -623,11 +634,10 @@ class KdaFlow(KdaWS):
                     for part in cutlass.range_constexpr(3):
                         store_bulk(at(page, part * dim + head * K, 0),
                                    at(convs, part, 0), part_bytes)  # fmt: skip
-                    bulk_commit()
-                    if cutlass.const_expr("recwait" not in self.skip):
-                        wait_bulk_reads()  # the staging buffers are free
-                if jj + 1 < mine:  # the group's next item's inputs
-                    self.stage_item(args, table, j + GROUPS, buffers, stage_full)
+                    bulk_commit()  # read by the next item's start (window: 2 buffers)
+            if jj + 1 < mine:  # the group's next item's inputs
+                self.stage_item(args, table, j + GROUPS, buffers, stage_full,
+                                (jj + 1) % 2, c)  # fmt: skip
             cute.arch.sync_warp()
             if cutlass.const_expr(self.trace):
                 tb = clock64()
@@ -985,15 +995,18 @@ class KdaFlow(KdaWS):
             for h in cutlass.range_constexpr(NV // 4):
                 pos = (((chunk * 4 + e) * (NV // 4) + h) * LANES + lane_in) * 4
                 store_shared_f32x4(at(xv, blk, pos), [vec[4 * h + i] for i in range(4)])
-            # The couplings, normalized (thread i: coupling i).
+            # The couplings, normalized (thread i: coupling i; one select chain, no
+            # per-lane branches).
+            norm = Float32(0)
             for i in cutlass.range_constexpr(len(index)):
                 key = list(index)[i]
                 kind, t, s = key
-                if c == i:
-                    norm = mul_rn(fk[s], fk[t])
-                    if cutlass.const_expr(kind == "e"):
-                        norm = mul_rn(fk[s], mul_rn(fq[t], scale))
-                    ce_s[blk, i] = mul_rn(self.quad_sum(sums[NV + i, None]), norm)
+                norm_i = mul_rn(fk[s], fk[t])
+                if cutlass.const_expr(kind == "e"):
+                    norm_i = mul_rn(fk[s], mul_rn(fq[t], scale))
+                norm = Float32(cutlass.select_(c == i, norm_i, norm))
+            if c < len(index):
+                ce_s[blk, c] = mul_rn(self.quad_sum(sums[NV + c, None]), norm)
             # The commit's reverse token loop over this key: w_t = kn_t P_t (P_t:
             # the final_decay token t's update is scaled by) and D_n; tokens t >= n
             # are zeros.
