@@ -51,6 +51,7 @@ def images(p, v, lens, H):
     x = dict(w=w, u=u, qd=p["qd"], kr=p["kr"], mqk=p["mqk"], gt=p["gt"], C=C)
     x["wq_img"] = (torch.cat([w, p["qd"]], 2).view(H, C, 2 * C64, 16, 8).permute(0, 1, 3, 2, 4).contiguous())
     x["u_img"] = u.contiguous()
+    x["wq_img3"] = (torch.cat([p["qd"], w], 2).view(H, C, 2 * C64, 16, 8).permute(0, 1, 3, 2, 4).contiguous())
     x["u_img3"] = u.view(H, C, 8, 8, D).permute(0, 1, 2, 4, 3).contiguous()
     x["kr_img"] = p["kr"].transpose(-1, -2).reshape(H, C, D, 8, 8).permute(0, 1, 3, 2, 4).contiguous()
     x["mqk_img"] = p["mqk"].view(H, C, C64, 8, 8).permute(0, 1, 3, 2, 4).contiguous()
@@ -85,7 +86,7 @@ def run(x, s0, cu, T, H, flags=0, dbg=None, out=None, fin=None):
     dbg = torch.zeros(1024 + 4 * H * N + 64, dtype=torch.int64, device="cuda") if dbg is None else dbg
     if V3:
         flags |= 16
-    torch.ops.k3_flashkda_split.kc64_rec(x["wq_img"], x["u_img3" if V3 else "u_img"], x["kr_img"], x["mqk_img"], x["gt"],
+    torch.ops.k3_flashkda_split.kc64_rec(x["wq_img3" if V3 else "wq_img"], x["u_img3" if V3 else "u_img"], x["kr_img"], x["mqk_img"], x["gt"],
                                          s0, fin, out, cu, flags, dbg)
     return out, fin, dbg
 
@@ -122,7 +123,7 @@ def check(lens, H):
 def rand_images(lens, H, dev="cuda"):
     C = sum((n + C64 - 1) // C64 for n in lens)
     r = lambda *s: (torch.randn(*s, device=dev) * 0.05).to(bf)  # noqa: E731
-    return dict(wq_img=r(H, C, 16, 128, 8), u_img=r(H, C, 64, 128), u_img3=r(H, C, 8, 128, 8), kr_img=r(H, C, 8, 128, 8),
+    return dict(wq_img=r(H, C, 16, 128, 8), wq_img3=r(H, C, 16, 128, 8), u_img=r(H, C, 64, 128), u_img3=r(H, C, 8, 128, 8), kr_img=r(H, C, 8, 128, 8),
                 mqk_img=r(H, C, 8, 64, 8), gt=torch.rand(H, C, D, device=dev) * 0.5 + 0.5, C=C)
 
 
@@ -199,9 +200,10 @@ def stamps3(lens, H, flags=1):
     n = min(80, (lens[-1] + 63) // 64 - 1)
     step = sum((st[c + 1, 0] - st[c, 0]).item() for c in range(4, n)) / (n - 4)
     seg = lambda a, b: sum((st[c, b] - st[c, a]).item() for c in range(4, n)) / (n - 4)  # noqa: E731
-    print(f"v3 stamps CTA0: chain step {step:.0f} clk; P bf16 image+sync {seg(0, 1):.0f}, MMA W+Oq issue {seg(1, 2):.0f}, "
-          f"decay st {seg(2, 3):.0f}, wait W {seg(3, 4):.0f}, vnew+sync {seg(4, 5):.0f}, MMA S+O issue {seg(5, 6):.0f}, "
-          f"wait S {seg(6, 7):.0f}", flush=True)
+    wait_s = sum((st[c + 1, 0] - st[c, 7]).item() for c in range(4, n)) / (n - 4)
+    print(f"v3 stamps CTA0: chain step {step:.0f} clk; P: LDTM {seg(0, 1):.0f}, cvt+STTM+wait {seg(1, 2):.0f}, "
+          f"bar.sync {seg(2, 3):.0f}, MMA1 issue {seg(3, 4):.0f}; decay+wait W {seg(4, 5):.0f}, vnew+sync {seg(5, 6):.0f}, "
+          f"MMA2 issue {seg(6, 7):.0f}, wait S {wait_s:.0f}", flush=True)
 
 
 def main():
