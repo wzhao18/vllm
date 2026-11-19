@@ -106,6 +106,20 @@ def quantize8(values):
     return positive_zero32(w0), positive_zero32(w1), word
 
 
+@cute.jit
+def quantize1(value):
+    """One BF16-exact FP32 ``value`` per lane, the warp's 32 lanes one 32-wide
+    MXFP8 block -> (this lane's E4M3 byte, the block's E8M0 scale), as
+    ``quantize8``. Warp-collective."""
+    amax = max_abs(Float32(0), value)
+    for i in cutlass.range_constexpr(5):
+        amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 16 >> i))
+    e = ue8m0(amax * bits_float(Uint32(INV_448)))
+    inv = bits_float(inverse_scale_bits(e))
+    zero = Float32(0)
+    return pack_fp8((value * inv, zero, zero, zero)) & Uint32(0xFF), e
+
+
 def scale_offset(row, block, padded_cols: cutlass.Constexpr[int]):
     """Byte offset of scale ``block`` (32-column index) of ``row`` in the F8_128x4
     layout with ``padded_cols`` scale columns (``ops.mxfp8_act.swizzled_sf_offset``)."""

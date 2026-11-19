@@ -150,6 +150,9 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
     props = torch.cuda.get_device_properties(device)
     sms, limit = props.multi_processor_count, smem_limit(device)
     shape = Shape(requests * tokens, tokens)
+    mx = specs[10][2] == torch.uint8  # MXFP8 output bytes (+ scales operand)
+    if mx and kind != "flow":
+        raise Unsupported("kda", shape, f"{kind}: no MXFP8 output (KdaFlow only)")
     if kind == "split":
         table = batch_table(SP_SPEC_SCHEDULE.get(heads, ""))
         schedule = table.get(requests, (0, 0, 0))
@@ -181,7 +184,9 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
         ctas = min(items, sms)
         if -(-items // ctas) > flow.max_items_per_cta(requests):
             raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
-        return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
+        return flow.KdaFlow(
+            heads, tokens, mode, has_bias, *streamed, ctas, stages, mx=mx
+        )
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
         if size > min(specialized.SMEM_LIMIT, limit):
@@ -220,7 +225,7 @@ class SpKdaCore:
     ``shapes.Unsupported`` at build (``__init__`` / ``prepare_caches``), never a stock
     fallback."""
 
-    def __init__(self, attention, rows, *, records, ctx):
+    def __init__(self, attention, rows, *, records, ctx, mx_out=False):
         if records not in MODES:
             raise Unsupported("kda", None, f"RecoverSSM records mode {records!r}")
         if not ctx.sequence_parallel:
@@ -266,6 +271,10 @@ class SpKdaCore:
 
         self.conv_dim_first = is_conv_state_dim_first()
         self.kinds, self.kernels, self.specs = {}, {}, {}
+        # Rows whose core writes the online-MXFP8 o_proj's input itself (``mx_out``:
+        # E4M3 bytes + F8_128x4 scales, ``ops.mxfp8_act.quantize`` of its BF16
+        # output) instead of BF16 for a standalone quantization: KdaFlow's rows.
+        self.mx_rows: frozenset = frozenset()
         self.plain = None
         if records == "none":
             if getattr(attention, "recoverssm_records", None) is not None:
@@ -299,6 +308,12 @@ class SpKdaCore:
             if kind is None:
                 raise Unsupported("kda", shape, f"no record core at {heads} heads")
             self.kinds[r] = kind
+        if mx_out:
+            self.mx_rows = frozenset(r for r in self.rows if self.kinds[r] == "flow")
+
+    def writes_mxfp8(self, rows) -> bool:
+        """Whether ``run`` at ``rows`` takes an MXFP8 ``out`` (``mx_out``)."""
+        return rows in self.mx_rows
 
     @torch.no_grad()
     def process_weights_after_loading(self):
@@ -310,10 +325,11 @@ class SpKdaCore:
         conv_w.copy_(decode_conv_weight(self.layer.conv1d.weight))
         norm.copy_(self.layer.o_norm.weight)
 
-    def _operands(self, caches, projected, slots, out, accepted, deferred=()):
+    def _operands(self, caches, projected, slots, out, accepted, deferred=(),
+                  scale=None):  # fmt: skip
         """Kernel tensors in launch order (upstream ``PreparedKda._operands``): 13
-        before the scalars, then F_B, the accepted counts, the records and (deferred)
-        the record rows and pending counts."""
+        before the scalars, then F_B, the accepted counts, the records, (deferred)
+        the record rows and pending counts and (MXFP8 ``out``) its scales."""
         conv, state = caches[:2]
         conv = conv if self.conv_dim_first else conv.transpose(-1, -2)
         w, bias, fb, a_log, dt, norm = self.weights
@@ -321,6 +337,7 @@ class SpKdaCore:
         p = lambda start, width: projected[:, start : start + width]
         ops = (p(0, 3 * d), w, bias, conv, p(4 * d, K), p(4 * d + K, h), a_log, dt)
         tail = (fb, accepted, *self.records, *deferred)
+        tail += () if scale is None else (scale,)
         return ops + (slots, state, out, p(3 * d, d), norm) + tail
 
     def prepare_caches(self, caches):
@@ -339,7 +356,14 @@ class SpKdaCore:
         for r in self.rows:
             n, kind = r // self.q, self.kinds[r]
             projected = torch.empty((r, self.pitch), dtype=torch.bfloat16, **meta)
-            out = torch.empty((r, self.dim), dtype=torch.bfloat16, **meta)
+            mx = r in self.mx_rows
+            dtype = torch.uint8 if mx else torch.bfloat16
+            out = torch.empty((r, self.dim), dtype=dtype, **meta)
+            scale = None
+            if mx:
+                scale = torch.empty(
+                    -(-r // 128) * 128 * (self.dim // 32), dtype=torch.uint8, **meta
+                )
             accepted = torch.empty(n, dtype=torch.int32, **meta)
             slots = torch.empty((n, 1), dtype=torch.int32, **meta)  # the checkpoints
             deferred: tuple = ()
@@ -347,7 +371,9 @@ class SpKdaCore:
                 count = self.records[0].shape[0]  # one pending count per record slot
                 pending = torch.empty(count, dtype=torch.int32, **meta)
                 deferred = (torch.empty(n, dtype=torch.int32, **meta), pending)
-            operands = self._operands(caches, projected, slots, out, accepted, deferred)
+            operands = self._operands(
+                caches, projected, slots, out, accepted, deferred, scale
+            )
             specs = tuple(map(layout, operands))
             if kind == "fused_ws" and not fits_fused_ws(specs, self.q, self.device):
                 self.kinds[r] = kind = "fused"  # KdaFused: no persistent page staging
@@ -358,7 +384,8 @@ class SpKdaCore:
 
     def run(self, projected, out, *, caches, metadata):
         """``projected`` [R, pitch] BF16 (stride (pitch, 1)); ``out`` [R, 3072] BF16
-        (o_norm-gated, the o_proj input); reads ``metadata.spec_state_indices_tensor``
+        (o_norm-gated, the o_proj input), or at ``mx_rows`` the o_proj's MXFP8
+        input (an ``ops.mxfp8_act.Mxfp8Buffer`` view of R rows); reads ``metadata.spec_state_indices_tensor``
         [>= R / q, 1] (q without records), ``num_accepted_tokens`` and, deferred,
         ``recoverssm_deferred``."""
         rows = projected.shape[0]
@@ -387,7 +414,16 @@ class SpKdaCore:
         slots = slots[:n]
         if slots.stride() != (slots.shape[1], 1):  # e.g. an eager block-table slice
             slots = slots.contiguous()
-        tensors = self._operands(caches, projected, slots, out, accepted[:n], extra)
+        scale = None
+        target = out
+        if rows in self.mx_rows:
+            if getattr(out, "rows", None) != rows or out.k != self.dim:
+                cause = f"an MXFP8 [{rows}, {self.dim}] output, got {type(out)}"
+                raise Unsupported("kda", Shape(rows, self.q), cause)
+            target, scale = out.data.view(torch.uint8), out.scale
+        tensors = self._operands(
+            caches, projected, slots, target, accepted[:n], extra, scale
+        )
         specs = tuple(map(layout, tensors))
         if specs != self.specs[rows]:  # CuTe takes a mismatched layout silently
             pairs = enumerate(zip(specs, self.specs[rows]))

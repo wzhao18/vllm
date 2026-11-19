@@ -62,8 +62,9 @@ state; only the FP32 reduction order of the recurrence's dot products differs.
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 
+from ..common import mx_rows
 from ..common.primitives import (
     alloc,
     asm,
@@ -250,12 +251,16 @@ class KdaFlow(KdaWS):
         window,
         ctas,
         stages=1,
+        mx=False,
     ):
         assert 2 <= tokens <= 4 and stages == 1 and conv_dim_first
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
+        # MXFP8 output (the online-MXFP8 o_proj's input): args[10] holds the E4M3
+        # bytes [R, D] and one more operand after the others the F8_128x4 scales.
+        self.mx = mx
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
         self.fold_fence = FOLD_FENCE
         self.skip = tuple(SKIP)
@@ -263,6 +268,27 @@ class KdaFlow(KdaWS):
     @cute.jit
     def __call__(self, *args):
         launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1)
+
+    def folds(self, args):
+        """Whether the deferred operands (record rows, pending counts) follow."""
+        return len(args) - (1 if self.mx else 0) > 20
+
+    @cute.jit
+    def store_output(self, args, row, col, value):
+        """Output ``value`` (BF16-rounded) of channel ``col`` of ``row``: BF16, or
+        (``mx``) quantized to MXFP8 as ``ops.mxfp8_act.quantize`` quantizes the BF16
+        output (each warp's 32 lanes hold one 32-wide block). Warp-collective."""
+        output = args[10]
+        if cutlass.const_expr(self.mx):
+            byte, e = mx_rows.quantize1(Float32(value))
+            output[row, col] = Uint8(byte)
+            if cute.arch.lane_idx() == 0:
+                width: cutlass.Constexpr = self.heads * K
+                where = mx_rows.scale_offset(row, col // mx_rows.BLOCK,
+                                             width // mx_rows.BLOCK)  # fmt: skip
+                args[len(args) - 1][where] = Uint8(e)
+        else:
+            output[row, col] = value
 
     # ---------------------------------------------------------------- helpers
     @cute.jit
@@ -311,7 +337,7 @@ class KdaFlow(KdaWS):
         head, request, slot, conv_slot, offset = self.item_slots(args, item)
         pending = Int32(0)
         rec = Int32(request)
-        if cutlass.const_expr(len(args) > 20):
+        if cutlass.const_expr(self.folds(args)):
             rec = Int32(args[20][request])
             pending = Int32(0)
             if rec >= 0:
@@ -669,7 +695,7 @@ class KdaFlow(KdaWS):
                     buffers, ops, outs, sums_g, state_full, stage_full, k0):  # fmt: skip
         xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
         (kgo,) = outs
-        state, output = args[9], args[10]
+        state = args[9]
         T: cutlass.Constexpr = self.tokens
         NV: cutlass.Constexpr = 2 * T
         H: cutlass.Constexpr = self.heads
@@ -788,7 +814,7 @@ class KdaFlow(KdaWS):
             else:
                 self.release_slot(args, c, j, count, pages, table, state_full, False)
                 for t in cutlass.range_constexpr(T):
-                    output[token + t, head * K + c] = BFloat16(0)
+                    self.store_output(args, token + t, head * K + c, BFloat16(0))
         if pm[0] != 0:  # the group's last item
             self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
@@ -930,7 +956,7 @@ class KdaFlow(KdaWS):
         """Gated RMSNorm of the group's previous item (thread c: channel c of every
         token) from its squares' block sums sums[at_sum + t] (synced by the caller);
         the outputs leave from registers."""
-        eps, output = args[15], args[10]
+        eps = args[15]
         T: cutlass.Constexpr = self.tokens
         token, head = pm[1], pm[2]
         for t in cutlass.range_constexpr(T):
@@ -939,7 +965,7 @@ class KdaFlow(KdaWS):
             rstd = reciprocal(sqrt_approx(variance))
             sigmoid_gate = triton_sigmoid(pg[t])
             result = po[t] * rstd * nw * sigmoid_gate
-            output[token + t, head * K + c] = BFloat16(result)
+            self.store_output(args, token + t, head * K + c, BFloat16(result))
 
     @cute.jit
     def finish_alone(self, args, g, c, sums, po, pg, pm, nw):
@@ -998,7 +1024,7 @@ class KdaFlow(KdaWS):
         (sums,) = sums_g
         T: cutlass.Constexpr = self.tokens
         NV: cutlass.Constexpr = 2 * T
-        FOLD: cutlass.Constexpr = len(args) > 20
+        FOLD: cutlass.Constexpr = self.folds(args)
         blk = g
         conv_type: cutlass.Constexpr = convs.element_type
         consts = hc[None, c]

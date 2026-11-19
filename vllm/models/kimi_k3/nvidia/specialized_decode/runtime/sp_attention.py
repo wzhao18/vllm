@@ -213,7 +213,12 @@ class SpAttentionBlock:
             self.slots = attention.mla_attn.mla_attn.layer_name  # (as run_dsa)
             self.index_prefix = attention.dsa_indexer.k_cache.prefix
         else:
-            self.core = SpKdaCore(attention, rows, records=step.records, ctx=ctx)
+            # The MXFP8 o_proj's input written by the KDA core itself where it can
+            # (``SpKdaCore.mx_rows``), not by a standalone quantization of attn_out.
+            self.core = SpKdaCore(
+                attention, rows, records=step.records, ctx=ctx, mx_out=mx_out
+            )
+        self.mx_input = output.input if mx_out else None
         if self.core.pitch != pitch:
             raise Unsupported(
                 kind, None,
@@ -236,7 +241,7 @@ class SpAttentionBlock:
         rows = gathered.shape[0] if isinstance(gathered, torch.Tensor) else gathered.rows
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
-        attn_out = self.attn_out[:rows]
+        attn_out = self.core_output(rows)
         if self.kind == "dsa":
             indexer = get_forward_context().attn_metadata[self.index_prefix]
             self.core.run(
@@ -258,7 +263,7 @@ class SpAttentionBlock:
         gathered = comm.all_gather(x_shard, self.parity)
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
-        attn_out = self.attn_out[:rows]
+        attn_out = self.core_output(rows)
         if self.kind == "dsa":
             # The packed indexer's write slots come from its own metadata
             # (``providers.Attention.run_dsa``).
@@ -272,6 +277,13 @@ class SpAttentionBlock:
             self.core.run(projected, attn_out, caches=caches, metadata=metadata)
         shard = x_shard.new_empty((n, WIDTH))
         return self.oproj.run(attn_out, shard, self.parity)
+
+    def core_output(self, rows):
+        """The core's output at ``rows``: BF16 ``attn_out``, or the MXFP8 o_proj's
+        input view where the KDA core writes it (``SpKdaCore.writes_mxfp8``)."""
+        if self.kind == "kda" and self.core.writes_mxfp8(rows):
+            return self.mx_input.view(rows)
+        return self.attn_out[:rows]
 
     @property
     def comm(self) -> SpComm:
