@@ -170,8 +170,9 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
     if kind == "flow":
-        if not record or tokens < 2:
-            raise Unsupported("kda", shape, "KdaFlow runs RecoverSSM record steps only")
+        if not record or not 2 <= tokens <= 4:
+            cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
+            raise Unsupported("kda", shape, cause)
         budget = flow.smem_budget(device)
         stages = flow.max_stages(tokens, *streamed, conv_size, budget)
         if not stages:
