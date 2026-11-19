@@ -32,6 +32,17 @@ def applicable(
     has_candidate_blocks: bool,
     chunk,
 ) -> bool:
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "Kimi K3.1 sm_107 prefill indexer hook: fp4=%s topk=%d q_scale=%s heads=%d "
+        "dcp=%d shardq=%s cand=%s pcp=%s rows=%d cap=%s capturing=%s",
+        use_fp4_cache, topk_tokens, q_scale is not None, q_quant.shape[1],
+        dcp_world_size, has_shardq, has_candidate_blocks,
+        chunk.pcp_deinterleave_idx is not None, chunk.token_end - chunk.token_start,
+        current_platform.get_device_capability(),
+        torch.cuda.is_current_stream_capturing(),
+    )
     return (
         use_fp4_cache
         and topk_tokens == 2048

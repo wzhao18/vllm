@@ -1030,7 +1030,7 @@ def sparse_attn_indexer(
         if prefill_chunk_iter is None:
             prefill_chunk_iter = ((chunk, prefill_kv_cache) for chunk in prefill_chunks)
         for chunk, prefill_kv_cache in prefill_chunk_iter:
-            if use_fp4_cache and current_platform.is_device_capability((10, 7)):
+            if use_fp4_cache and current_platform.is_device_capability_family(100):
                 # Kimi K3.1 sm_107 selective prefill indexer (exact; a chunk with
                 # rows it cannot settle continues on the stock path below)
                 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
