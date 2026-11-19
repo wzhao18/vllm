@@ -29,8 +29,10 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_MXFP4,
+    MEGA_MOE_NVFP4,
     DeepGemmMegaMoEExperts,
     MegaMoEActivation,
+    MegaMoEWeightFormat,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
@@ -59,6 +61,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import (
     compressed_tensors,
+)
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -122,6 +128,9 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_mxfp8 as prefill_attn_res_mxfp8,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -582,15 +591,55 @@ class KimiRoutedOutputTransform(nn.Module):
         return hidden_states
 
 
+def kimi_k3_mega_moe_weight_format(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> MegaMoEWeightFormat:
+    """Routed-expert checkpoint format of the MoE block at prefix.
+
+    ModelOpt checkpoints name it per layer (MIXED_PRECISION quantized_layers
+    entry of {prefix}.experts, or a whole-model NVFP4 export): NVFP4 runs the
+    native NVFP4 MegaMoE path. Every other checkpoint is the canonical MXFP4 one.
+    Raises for ModelOpt expert formats MegaMoE cannot load.
+    """
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        algo = quant_config._resolve_quant_algo(f"{prefix}.experts")
+    elif isinstance(quant_config, ModelOptNvFp4Config):
+        algo = quant_config.quant_method.upper()
+    else:
+        return MEGA_MOE_MXFP4
+    if algo == "NVFP4":
+        return MEGA_MOE_NVFP4
+    raise NotImplementedError(
+        f"{prefix}.experts: MegaMoE has no path for ModelOpt {algo} experts."
+    )
+
+
+# Checkpoint suffix -> parameter suffix of the MegaMoE experts, per format.
+_MEGA_MOE_EXPERT_SUFFIXES = {
+    MEGA_MOE_MXFP4.name: (("weight_packed", "weight"), ("weight_scale", "weight_scale")),
+    MEGA_MOE_NVFP4.name: (
+        ("weight_scale_2", "weight_scale_2"),
+        ("weight_scale", "weight_scale"),
+        ("input_scale", "input_scale"),
+        ("weight", "weight"),
+    ),
+}
+
+
 def make_kimi_k3_mega_moe_expert_params_mapping(
     num_experts: int,
+    weight_format: MegaMoEWeightFormat = MEGA_MOE_MXFP4,
 ) -> list[tuple[str, str, int, str]]:
+    suffixes = _MEGA_MOE_EXPERT_SUFFIXES.get(weight_format.name)
+    if suffixes is None:
+        raise NotImplementedError(
+            f"No Kimi K3 MegaMoE expert mapping for {weight_format.name!r} weights."
+        )
     mapping = []
     for expert_id in range(num_experts):
         for shard_id in ("w1", "w2", "w3"):
             param_prefix = "w13" if shard_id in ("w1", "w3") else "w2"
-            for suffix in ("weight_packed", "weight_scale"):
-                param_suffix = "weight" if suffix == "weight_packed" else suffix
+            for suffix, param_suffix in suffixes:
                 mapping.append(
                     (
                         f"experts.{param_prefix}_{param_suffix}",
@@ -648,6 +697,9 @@ class KimiMoE(nn.Module):
         # Routed MoE on 1/TP token shards over a replicated stream (prefill
         # workers); exclusive with sequence parallelism.
         self.moe_token_shard = self.use_mega_moe and use_moe_token_shard(vllm_config)
+        # Prefill-worker MegaMoE policy (specialized_prefill.moe); None: stock.
+        self._prefill_moe = None
+        self._prefill_subcalls = None
         assert not (self.moe_token_shard and use_sequence_parallel)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -795,12 +847,26 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
+            max_num_tokens = mega_moe_max_num_tokens(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                self.tp_size,
+                token_sharded=use_sequence_parallel or self.moe_token_shard,
+            )
+            from .specialized_prefill.moe import prefill_moe_policy
+
+            self._prefill_moe = prefill_moe_policy(
+                vllm_config,
+                tp_size=self.tp_size,
+                sequence_parallel=use_sequence_parallel,
+                token_shard=self.moe_token_shard,
+                max_num_tokens=max_num_tokens,
+            )
             self.experts = mega_moe_experts_cls(vllm_config)(
                 vllm_config,
-                max_num_tokens=mega_moe_max_num_tokens(
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    self.tp_size,
-                    token_sharded=use_sequence_parallel or self.moe_token_shard,
+                max_num_tokens=(
+                    max_num_tokens
+                    if self._prefill_moe is None
+                    else self._prefill_moe.capacity
                 ),
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
@@ -813,7 +879,7 @@ class KimiMoE(nn.Module):
                     alpha=activation_situ_beta or 1.0,
                     beta=activation_situ_linear_beta or 0.0,
                 ),
-                weight_format=MEGA_MOE_MXFP4,
+                weight_format=kimi_k3_mega_moe_weight_format(quant_config, prefix),
                 prefix=f"{prefix}.experts",
             )
         else:
@@ -860,6 +926,14 @@ class KimiMoE(nn.Module):
             self.experts.reserve_sms_for_shared_expert()
             self._shared_stream = aux_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
+        if self._prefill_moe is not None and self._prefill_moe.subcalls:
+            from .specialized_prefill.moe import PrefillSubcallExperts
+
+            self._prefill_subcalls = PrefillSubcallExperts(
+                self.experts,
+                self._prefill_moe.capacity,
+                vllm_config.parallel_config.data_parallel_size,
+            )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -975,6 +1049,19 @@ class KimiMoE(nn.Module):
             return router_logits, None
         return self._grouped_topk(hidden_states, router_logits)
 
+    def _routed_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """MegaMoE routed experts; prefill workers split the batch into
+        EP-uniform capacity sub-calls (specialized_prefill.moe)."""
+        subcalls = self._prefill_subcalls
+        if subcalls is None:
+            return self.experts(hidden_states, topk_weights, topk_ids)
+        return subcalls(hidden_states, topk_weights, topk_ids)
+
     def _packed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE layer on the packed GEMMs of pack_projections()."""
         pack_n, pack_k, latent, inter = self._packed_moe
@@ -995,7 +1082,7 @@ class KimiMoE(nn.Module):
             num_tokens, inter + latent, hidden_states.device, hidden_states.dtype
         )
         self.shared_experts.act_mxfp8_into(y[:, latent:], act, 0)
-        routed = self.experts(y[:, :latent], router_output, topk_ids)
+        routed = self._routed_experts(y[:, :latent], router_output, topk_ids)
         norm = self.routed_output_transform.norm
         mxfp8_act.rms_norm_quantize(
             routed, norm.weight, norm.variance_epsilon, out=act, col=inter
@@ -1118,7 +1205,25 @@ class KimiMoE(nn.Module):
             )
         return tensor_model_parallel_all_reduce(output)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def takes_shared_mxfp8_input(self) -> bool:
+        """forward() can take the shared experts' gate_up input as MXFP8
+        from the producer of the layer input (``shared_mxfp8_input``): the
+        MegaMoE path with online-MXFP8 shared experts that quantizes nothing
+        else from the layer input (BF16 router and latent down_proj)."""
+        return (
+            not self.moe_token_shard
+            and self.use_mega_moe
+            and getattr(self, "_packed_moe", None) is None
+            and isinstance(self.shared_experts, KimiMLP)
+            and self.shared_experts.mxfp8_input()
+            and not self._shared_mxfp8_input()
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_mxfp8_input: QuantizedActivation | None = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.moe_token_shard:
@@ -1132,6 +1237,8 @@ class KimiMoE(nn.Module):
         mxfp8_input = (
             mxfp8_act.quantize(hidden_states) if self._shared_mxfp8_input() else None
         )
+        if shared_mxfp8_input is not None:
+            assert mxfp8_input is None and self.use_mega_moe
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
@@ -1143,17 +1250,25 @@ class KimiMoE(nn.Module):
             assert topk_ids is not None
             # The shared expert reads the un-projected hidden states, so it
             # stays outside the latent-space MegaMoE launch.
-            shared_input = hidden_states if mxfp8_input is None else mxfp8_input
+            shared_input = (
+                shared_mxfp8_input
+                if shared_mxfp8_input is not None
+                else hidden_states
+                if mxfp8_input is None
+                else mxfp8_input
+            )
             if self._shared_overlap:
                 final_hidden_states, shared_output = maybe_execute_in_parallel(
-                    lambda: self.experts(routed_hidden_states, router_output, topk_ids),
+                    lambda: self._routed_experts(
+                        routed_hidden_states, router_output, topk_ids
+                    ),
                     lambda: self.shared_experts(shared_input),
                     self._shared_events[0],
                     self._shared_events[1],
                     self._shared_stream,
                 )
             else:
-                final_hidden_states = self.experts(
+                final_hidden_states = self._routed_experts(
                     routed_hidden_states, router_output, topk_ids
                 )
                 shared_output = (
@@ -1456,9 +1571,17 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        hidden_states, prefix_sum, residual = self._pre_attn_norm(
-            hidden_states, residual, prefix_sum
-        )
+        pre_mxfp8, post_mxfp8 = self._attn_res_mxfp8_consumers(prefix_sum)
+        if pre_mxfp8:
+            # Prefill: the AttnRes writes the KDA in_proj's MXFP8 input (its
+            # only consumer) instead of BF16.
+            hidden_states = self._attn_res_mxfp8(
+                prefix_sum, hidden_states, residual, pre=True
+            )[1]
+        else:
+            hidden_states, prefix_sum, residual = self._pre_attn_norm(
+                hidden_states, residual, prefix_sum
+            )
         assert hidden_states is not None
 
         M = None
@@ -1476,6 +1599,19 @@ class KimiDecoderLayer(nn.Module):
             # Add SP padding if needed, and then perform reduce scatter.
             hidden_states = sp_reduce_scatter(hidden_states)
 
+        if post_mxfp8:
+            # Prefill: the AttnRes also writes the shared experts' MXFP8
+            # gate_up input (the router / latent down_proj read the BF16).
+            if self.is_block_write_layer:
+                if _gemm_ar_owns(hidden_states):
+                    hidden_states = hidden_states.clone()
+                prefix_sum = hidden_states
+            hidden_states, shared_mxfp8 = self._attn_res_mxfp8(
+                prefix_sum, hidden_states, residual, pre=False
+            )
+            hidden_states = self.mlp(hidden_states, shared_mxfp8_input=shared_mxfp8)
+            return hidden_states, prefix_sum, residual
+
         hidden_states, prefix_sum, residual = self._post_attn_norm(
             hidden_states, residual, prefix_sum
         )
@@ -1483,6 +1619,79 @@ class KimiDecoderLayer(nn.Module):
         # MoE/MLP.
         hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
+
+    def _attn_res_mxfp8_capabilities(self) -> tuple[bool, bool]:
+        """(pre, post): the pre-attention / post-attention AttnRes output feeds
+        an online-MXFP8 projection that can take it as MXFP8 from the AttnRes
+        epilogue (specialized_prefill ``attn_res_mxfp8``): the KDA in_proj (the
+        pre-attention AttnRes' only consumer) and the MegaMoE shared experts'
+        gate_up."""
+        caps = getattr(self, "_attn_res_mxfp8_caps", None)
+        if caps is None:
+            base = self.use_attn_res and not self.use_sequence_parallel
+            pre = (
+                base
+                and isinstance(self.self_attn, KimiK3DeltaAttention)
+                and takes_mxfp8_activation(self.self_attn.in_proj_qkvgfab)
+            )
+            post = (
+                base
+                and isinstance(self.mlp, KimiMoE)
+                and self.mlp.takes_shared_mxfp8_input()
+            )
+            caps = self._attn_res_mxfp8_caps = (pre, post)
+        return caps
+
+    def _attn_res_mxfp8_consumers(
+        self, prefix_sum: torch.Tensor | None
+    ) -> tuple[bool, bool]:
+        """The capabilities, for this step's shape (prefill chunks only)."""
+        caps = self._attn_res_mxfp8_capabilities()
+        if not (caps[0] or caps[1]) or prefix_sum is None:
+            return False, False
+        if not prefill_attn_res_mxfp8.use_for(prefix_sum):
+            return False, False
+        return caps
+
+    def _attn_res_mxfp8(
+        self,
+        prefix_sum: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        residual: torch.Tensor,
+        pre: bool,
+    ):
+        """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
+        the MXFP8 output (BF16 output only after attention)."""
+        if pre:
+            return prefill_attn_res_mxfp8.attn_res_mxfp8(
+                prefix_sum,
+                hidden_states,
+                residual,
+                self.self_attention_res_norm.weight,
+                self.self_attention_res_proj.weight.squeeze(0),
+                self.input_layernorm.weight,
+                num_blocks=self.prev_valid_blocks,
+                block_write_idx=(
+                    self.block_write_idx if self.is_block_write_layer else -1
+                ),
+                eps=self.self_attention_res_norm.variance_epsilon,
+                output_norm_eps=self.input_layernorm.variance_epsilon,
+                bf16_out=False,
+            )
+        prefix_delta = None if self.is_block_write_layer else hidden_states
+        return prefill_attn_res_mxfp8.attn_res_mxfp8(
+            prefix_sum,
+            prefix_delta,
+            residual,
+            self.mlp_res_norm.weight,
+            self.mlp_res_proj.weight.squeeze(0),
+            self.post_attention_layernorm.weight,
+            num_blocks=self.prev_valid_blocks + self.is_block_write_layer,
+            block_write_idx=-1,
+            eps=self.mlp_res_norm.variance_epsilon,
+            output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            bf16_out=True,
+        )
 
 
 # (param_name, shard_name, shard_id) for the merged DSA wkv_index.
@@ -1924,14 +2133,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 ]
         if self.config.dsa_config is not None:
             stacked_params_mapping += _DSA_STACKED_PARAMS_MAPPING
-        use_mega_moe = any(
-            module.use_mega_moe
+        mega_moe_formats = {
+            module.experts.weight_format
             for module in self.modules()
-            if isinstance(module, KimiMoE)
-        )
+            if isinstance(module, KimiMoE) and module.use_mega_moe
+        }
+        use_mega_moe = bool(mega_moe_formats)
+        if len(mega_moe_formats) > 1:
+            raise NotImplementedError(
+                "Kimi K3 MegaMoE layers with different expert formats: "
+                f"{sorted(f.name for f in mega_moe_formats)}."
+            )
         if self.config.is_moe and use_mega_moe:
             expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
+                self.config.num_experts, next(iter(mega_moe_formats))
             )
         elif self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -2046,6 +2261,32 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         return loaded_params
 
 
+def log_kimi_k3_quant_kinds(model: nn.Module) -> dict[str, int]:
+    """Log (once) and return how many linears / MoE blocks run each precision:
+    the checkpoint's per-layer quantization as this process built it."""
+    kinds: dict[str, int] = {}
+    for module in model.modules():
+        if isinstance(module, KimiMoE) and module.use_mega_moe:
+            experts = module.experts
+            kind = f"MegaMoE {experts.weight_format.name} experts"
+            if hasattr(experts, "quant_kind"):
+                kind += f" ({experts.quant_kind} kernel)"
+        elif isinstance(module, LinearBase):
+            method = module.quant_method
+            spec = getattr(method, "spec", None)
+            kind = type(method).__name__
+            if spec is not None:
+                kind += f"[{spec.weight}]"
+        else:
+            continue
+        kinds[kind] = kinds.get(kind, 0) + 1
+    logger.info_once(
+        "Kimi K3 quantization: %s",
+        "; ".join(f"{n} x {k}" for k, n in sorted(kinds.items())),
+    )
+    return kinds
+
+
 class KimiLinearForCausalLM(
     nn.Module,
     HasInnerState,
@@ -2074,6 +2315,7 @@ class KimiLinearForCausalLM(
             )
         else:
             self.lm_head = PPMissingLayer()
+        log_kimi_k3_quant_kinds(self)
         enable_kimi_k3_low_latency_gemm(self, self.model_config.dtype)
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(
@@ -2107,6 +2349,12 @@ class KimiLinearForCausalLM(
         ):
             # Build the fused MXFP8 activation producers at load, not mid-step.
             mxfp8_act.warmup()
+            if any(
+                any(layer._attn_res_mxfp8_capabilities())
+                for layer in self.modules()
+                if isinstance(layer, KimiDecoderLayer)
+            ):
+                prefill_attn_res_mxfp8.warmup()
             logger.info_once(
                 "Kimi K3: online-MXFP8 projections take fused MXFP8 activations."
             )

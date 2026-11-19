@@ -40,7 +40,11 @@ from .config import RouteIdError, RubinBucket, RubinMoeConfig, RubinMoeProblem
 from .session import RubinMegaMoeSession, layout_tag
 from .staging import PREFILL_STAGE_MIN_TOKENS, stage_inputs
 from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
-from .weights import RubinMoeWeights, prepare_weights
+from .weights import (
+    RubinMoeWeights,
+    prepare_nvfp4_checkpoint_weights,
+    prepare_weights,
+)
 
 logger = init_logger(__name__)
 
@@ -166,6 +170,42 @@ class RubinMegaMoE:
             fc1_norm_const=p.fc1_norm_const,
             layer_id=layer_id,
             expert_offset=self.rank * self.experts_per_rank,
+        )
+
+    def prepare_nvfp4_checkpoint_weights(
+        self,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w13_global: torch.Tensor,
+        w2_global: torch.Tensor,
+    ) -> RubinMoeWeights:
+        """Native NVFP4 local-expert weights (E4M3 block-16 scales + per-expert
+        ``weight_scale_2``) -> kernel layout, as stored (no conversion)."""
+        p = self.problem
+        if p.quant_kind != "nvfp4":
+            raise ValueError(
+                f"NVFP4 checkpoint weights need the nvfp4 kernel, not {p.quant_kind!r}."
+            )
+        if p.input_norm_const != 1.0 or p.fc1_norm_const != 1.0:
+            raise ValueError(
+                "NVFP4 checkpoint alphas assume unit activation norm constants."
+            )
+        if w13.shape[0] != self.experts_per_rank:
+            raise ValueError(
+                f"expected {self.experts_per_rank} local experts (linear EP "
+                f"placement), got {w13.shape[0]}."
+            )
+        return prepare_nvfp4_checkpoint_weights(
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            w13_global,
+            w2_global,
+            hidden=p.hidden,
+            intermediate=p.intermediate,
         )
 
     # -- route-id errors ------------------------------------------------------------

@@ -19,10 +19,14 @@ STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
       "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None, "
       "Tensor(d!)? checkpoint_state=None, "
       "Tensor? checkpoint_offsets=None, int mode=3) -> ()");
+  m.def(
+      "o_norm_mxfp8(Tensor x, Tensor g, Tensor weight, float eps, Tensor(a!) q, "
+      "Tensor(b!) sf) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CUDA, m) {
   m.impl("fwd", TORCH_BOX(&fwd));
+  m.impl("o_norm_mxfp8", TORCH_BOX(&o_norm_mxfp8));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CompositeExplicitAutograd, m) {

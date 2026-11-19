@@ -5,9 +5,9 @@ MegaMoE, q4; ``runtime.sp_attention``): the startup of the real ``SpStep`` (and 
 ``SpecializedDecode`` under ``sequence_parallel``) over stand-in providers, for every
 captured R = 4..512 (n = 1..128 requests per DP group, 0.25..32 per GPU):
 
-* the coverage table: every R has the seven specialized families (ag, dsa_in, dsa,
+* the coverage table: every R has the nine specialized families (ag, dsa_in, dsa,
   kda_in, kda, oproj_rs, moe_dense: the MegaMoE layers' dense GEMMs on the n = R / 4
-  shard rows), every other family is a declared stock module, no R is missing or
+  shard rows, sp_boundary: the fused AttnRes + SP AG / RS, final_gather), every other family is a declared stock module, no R is missing or
   stock, one log line per R;
 * the collective build order (SpComm, the DSA DcpBox and scratch, RecoverSSM, then
   the blocks in layer order) and the mailbox parities (SP blocks by ordinal, DSA
@@ -48,7 +48,8 @@ KDA_PITCH = 4 * HEADS * 128 + 128 + HEADS + 8  # [q | k | v | g | f_a | beta | p
 # an odd count of SP blocks (the step's last and next step's first share a parity).
 KINDS = ("kda", "kda", "dsa", "kda", "dsa", "kda", "kda")
 SPECIALIZED = {"ag", "dsa_in", "dsa", "kda_in", "kda", "oproj_rs", "moe_dense"}
-DECLARED = {"embed", "attn_res", "moe", "dense", "final_gather", "lm_head"}
+SPECIALIZED |= {"sp_boundary", "final_gather"}  # fused AttnRes + SP AG / RS, final AG
+DECLARED = {"embed", "attn_res", "moe", "dense", "lm_head"}
 DECLARED |= {"sampler", "drafter", "verify"}
 
 
@@ -97,6 +98,20 @@ class Fakes:
 
             def nbytes(self):
                 return 3 * self.gather[0].numel() * 2
+
+        class FinalGather:
+            def __init__(self, group, device, tp, rank, *, width, rows_cap):
+                fakes.events.add("SpFinalGather", tp, rank, width, rows_cap)
+                self.width, self.rows_cap, self.prepared = width, rows_cap, []
+
+            def prepare(self, rows):
+                self.prepared.append(rows)
+
+        def boundary(decoder, comm, block, rows, mlp=None):
+            assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
+            assert (mlp is None) == (decoder.layer_idx == 0), decoder.layer_idx
+            fakes.events.add("SpBoundary", decoder.layer_idx, block.parity)
+            return SimpleNamespace(layer=decoder.layer_idx, comm=comm)
 
         class Projection(Provider):
             def __init__(self, weight, rows, tactics, *, family):
@@ -196,6 +211,8 @@ class Fakes:
 
         self.patch = dict(
             SpComm=Comm,
+            SpFinalGather=FinalGather,
+            sp_boundary=boundary,
             DecodeProjection=Projection,
             SpDsaCore=DsaCore,
             SpKdaCore=KdaCore,
@@ -361,26 +378,36 @@ def test_every_block_serves_every_row(fakes):
 
 
 def test_collective_build_order_and_parities(fakes):
-    """Collective allocations in the same order on every rank: SpComm, the DSA box
-    and scratch, RecoverSSM (deferred), then each layer's block in
-    layer order. SP mailbox parity by block ordinal, DSA box parity by DSA ordinal."""
+    """Collective allocations in the same order on every rank: SpComm, the final
+    all-gather box ([hidden | 2 aux] rows), the DSA box and scratch, RecoverSSM
+    (deferred), then each layer's block in layer order, then each layer's fused
+    boundaries. SP mailbox parity by block ordinal, DSA box parity by DSA ordinal."""
     _, events = fakes()
     step = sp_attention.SpStep(runtime())
     names = [e[0] for e in events]
-    assert names[:4] == ["SpComm", "sp_dsa_box", "sp_dsa_scratch", "prepare_recoverssm"]
+    assert names[:5] == [
+        "SpComm", "SpFinalGather", "sp_dsa_box", "sp_dsa_scratch", "prepare_recoverssm"
+    ]
     assert events[0] == ("SpComm", TP, 0, WIDTH, 512)
-    assert events[1] == ("sp_dsa_box", HEADS, 512, 1)
-    assert events[3] == ("prepare_recoverssm", True)  # deferred (the cores fold)
+    assert events[1] == ("SpFinalGather", TP, 0, 3 * WIDTH, 512)
+    assert step.final_gather.prepared == list(ROWS)
+    assert events[2] == ("sp_dsa_box", HEADS, 512, 1)
+    assert events[4] == ("prepare_recoverssm", True)  # deferred (the cores fold)
     cores = [e for e in events if e[0] in ("SpDsaCore", "SpKdaCore")]
     assert [e[1] for e in cores] == list(range(len(KINDS)))
     dsa = [e[2] for e in cores if e[0] == "SpDsaCore"]
     assert dsa == [i % 2 for i in range(len(dsa))]
     # Per block: in-projection, core, o_proj (none built ahead of its layer); then
     # each MegaMoE layer's SpMlp (no collective) in layer order.
+    # then each layer's fused boundaries (they take the SpMlp's MXFP8 input).
     mlps = [e for e in events if e[0] == "SpMlp"]
     assert mlps == [("SpMlp", i) for i in range(1, len(KINDS))]
-    assert names[-len(mlps) :] == ["SpMlp"] * len(mlps)
-    per_block = [e[0] for e in events[4:] if e[0] != "SpMlp"]
+    bounds = [e for e in events if e[0] == "SpBoundary"]
+    assert bounds == [("SpBoundary", i, i % 2) for i in range(len(KINDS))]
+    tail = len(mlps) + len(bounds)
+    assert names[-tail:] == ["SpMlp"] * len(mlps) + ["SpBoundary"] * len(bounds)
+    assert sorted(step.bounds) == list(range(len(KINDS)))
+    per_block = [e[0] for e in events[5:] if e[0] not in ("SpMlp", "SpBoundary")]
     expected = list(
         itertools.chain.from_iterable(
             ("DecodeProjection", "SpDsaCore" if k == "dsa" else "SpKdaCore", "SpOproj")
@@ -656,6 +683,7 @@ def test_specialized_decode_builds_only_the_sp_step(sp_decode):
     assert built.coverage is built.sp.coverage()
     built.coverage.assert_complete(ROWS)
     assert events[0][:3] == ("SpComm", TP, 1)
+    assert events[1][:3] == ("SpFinalGather", TP, 1)
     for name in ("attention", "feed_forward", "prefetch", "moe_batches"):
         assert not hasattr(built, name), name
     with pytest.raises(RuntimeError, match="TP providers built under SP"):
