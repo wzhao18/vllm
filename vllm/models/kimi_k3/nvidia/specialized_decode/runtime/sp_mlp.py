@@ -144,6 +144,13 @@ class SpMlp:
             self.inter2 = weights["shared_gu"].shape[0]
             self.hidden = weights["shared_down"].shape[0]
         self.threshold = _stock_threshold()
+        # The side-stream shared expert forks at the block entry (its input is
+        # ready there) on a stream of its own, so it runs under the latency-bound
+        # router chain and the routed latent down instead of only beside MegaMoE.
+        self.early = None
+        if side:
+            device = weights["latent_down"].device.index
+            self.early = (_early_stream(device), (torch.cuda.Event(), torch.cuda.Event()))
 
     def choices(self, n):
         """The four GEMM families' choices at ``n`` shard rows."""
@@ -181,28 +188,43 @@ class SpMlp:
         def down():
             return gemms["latent_down"].run(h, h.new_empty((n, self.latent)))
 
-        (router_output, topk_ids), routed = maybe_execute_in_parallel(
-            lambda: mlp._router(h),
-            down,
-            mlp._down_proj_events[0],
-            mlp._down_proj_events[1],
-            mlp._down_proj_stream if n <= self.threshold else None,
-        )
-        if mlp._shared_overlap:
+        def routed_experts():
+            (router_output, topk_ids), routed = maybe_execute_in_parallel(
+                lambda: mlp._router(h),
+                down,
+                mlp._down_proj_events[0],
+                mlp._down_proj_events[1],
+                mlp._down_proj_stream if n <= self.threshold else None,
+            )
+            return mlp.experts(routed, router_output, topk_ids)
+
+        if self.early is not None:
+            stream, events = self.early
             final, shared_out = maybe_execute_in_parallel(
-                lambda: mlp.experts(routed, router_output, topk_ids),
+                routed_experts,
                 lambda: self._shared(h, prequantized),
-                mlp._shared_events[0],
-                mlp._shared_events[1],
-                mlp._shared_stream,
+                events[0],
+                events[1],
+                stream,
             )
         else:
-            final = mlp.experts(routed, router_output, topk_ids)
+            final = routed_experts()
             shared_out = self._shared(h, prequantized)
         norm = mlp.routed_output_transform.norm
         if norm is not None:
             final = norm(final)
         return gemms["latent_up"].run(final, residual=shared_out)
+
+
+_EARLY_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _early_stream(device: int) -> torch.cuda.Stream:
+    """The early shared-expert stream of ``device`` (one per process and device,
+    distinct from the stock aux stream that carries the latent down)."""
+    if device not in _EARLY_STREAMS:
+        _EARLY_STREAMS[device] = torch.cuda.Stream(device=device)
+    return _EARLY_STREAMS[device]
 
 
 def moe_choice(mlps, n):
