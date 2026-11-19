@@ -116,7 +116,7 @@ def _use_dispatch_kernel() -> bool:
 
 
 def enable_kimi_k3_mxfp8_dispatch(model: nn.Module) -> int:
-    """On SM107, switch every online-MXFP8 linear on the CuTe DSL kernel to
+    """On SM107, switch every MXFP8 linear on the CuTe DSL kernel to
     :class:`KimiK3Mxfp8Kernel` (same weights). Returns the number switched.
 
     Called from the post-load hook of both the K3 target and the K3 DSpark
@@ -125,7 +125,7 @@ def enable_kimi_k3_mxfp8_dispatch(model: nn.Module) -> int:
         return 0
     switched = 0
     for module in model.modules():
-        if not is_online_mxfp8(module):
+        if not is_mxfp8_linear(module):
             continue
         method = module.quant_method
         if type(method.kernel) is FlashInferCutedslMxfp8LinearKernel:
@@ -166,18 +166,41 @@ def _kernel_layout(linear: nn.Module) -> str | None:
     return None
 
 
-def is_online_mxfp8(linear: nn.Module) -> bool:
+def is_mxfp8_linear(linear: nn.Module) -> bool:
+    """An MXFP8 linear: online-quantized (``Mxfp8OnlineLinearMethod``) or an MXFP8
+    checkpoint layer (ModelOpt MIXED_PRECISION ``MXFP8``, e.g. the K3.1 NVFP4
+    export's shared experts and KDA projections). Both hold E4M3 rows + per-32
+    E8M0 scales on a kernel from ``init_mxfp8_linear_kernel`` with dynamic MXFP8
+    activations, so the fast paths here (per-shape kernel dispatch, row packing,
+    producer-fused activation quantization) are the same math for either."""
+    from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+        Mxfp8LinearKernel,
+    )
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+    )
     from vllm.model_executor.layers.quantization.online.mxfp8 import (
         Mxfp8OnlineLinearMethod,
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Static,
+    )
 
-    return isinstance(getattr(linear, "quant_method", None), Mxfp8OnlineLinearMethod)
+    method = getattr(linear, "quant_method", None)
+    if isinstance(method, Mxfp8OnlineLinearMethod):
+        return True
+    return (
+        isinstance(method, ModelOptLinearMethod)
+        and method.spec.weight == kMxfp8Static
+        and isinstance(method.kernel, Mxfp8LinearKernel)
+        and not getattr(linear, "is_bmm", False)
+    )
 
 
 def can_pack_mxfp8(linears, along_k: bool = False) -> bool:
     """The linears can share one MXFP8 GEMM: same K (stacked along N), or with
     ``along_k`` the same N and every K a multiple of 128 (stacked along K)."""
-    if not all(is_online_mxfp8(linear) for linear in linears):
+    if not all(is_mxfp8_linear(linear) for linear in linears):
         return False
     if any(_kernel_layout(linear) is None for linear in linears):
         return False
@@ -286,7 +309,7 @@ def takes_mxfp8_activation(*linears: nn.Module | None) -> bool:
     )
 
     for linear in linears:
-        if linear is None or not is_online_mxfp8(linear):
+        if linear is None or not is_mxfp8_linear(linear):
             return False
         kernel = getattr(linear.quant_method, "kernel", None)
         if kernel is None or kernel.input_quant_key() != kMxfp8Dynamic:

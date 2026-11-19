@@ -47,6 +47,7 @@ INTERLEAVE_CUR = [INTERLEAVE]  # interleave of the case being generated
 WORLD = [1]
 GROUP = [None]  # the DCP group under test (None: the whole world)
 SEED_OFF = [0]  # per-group data offset (DCPg x DP: groups see different data)
+V2_STATS = [None]  # topk_v2 row counters (main)
 W_LATE_SKEW_RANK = 1  # the O exchange's late peer (rank 0 is late for the top-k)
 
 
@@ -178,6 +179,16 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
         if not (torch.equal(o2[:, :K], out[:, :K]) and torch.equal(c2, cnt)):
             nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
             errs.append(f"nondeterministic: call {j} differs in {nd} rows")
+    # topk_v2 (one CTA per row): bitwise the same output
+    for _ in range(2):
+        o2 = torch.full((T, K + 64), -7, dtype=torch.int32, device=dev)
+        c2 = torch.full((T,), -7, dtype=torch.int32, device=dev)
+        ex.topk_v2(local, Lr, G, o2, c2, stats=V2_STATS[0], interleave=il)
+        torch.cuda.synchronize()
+        ex.check()
+        if not (torch.equal(o2[:, :K], out[:, :K]) and torch.equal(c2, cnt)):
+            nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
+            errs.append(f"topk_v2 differs from topk_merge in {nd} rows")
 
     # ---- reference: K largest keys, ties by ascending global id
     fk = keys_of(full)
@@ -579,6 +590,7 @@ def main():
     if rank == 0:
         print(f"DCP groups of {g} ranks x {world // g}", flush=True)
     stats = torch.zeros(8, dtype=torch.int32, device=dev)
+    V2_STATS[0] = torch.zeros(8, dtype=torch.int32, device=dev)
     failures = []
     cases = [
         ("normal", 1, 8, 200_000),
@@ -700,7 +712,10 @@ def main():
             if rank == 0:
                 print(("FAIL " if errs else "ok   ") + f"o_exchange T{T} D{D}", flush=True)
     dist.all_reduce(stats)
+    dist.all_reduce(V2_STATS[0])
     if rank == 0:
+        print("topk_v2 stats (rows: exchanged, one round, tie round, radix, select all, "
+              "full-pass message): " + str(V2_STATS[0].tolist()[:6]), flush=True)
         from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange.ops import STAT_NAMES
 
         print("stats (rows, summed over ranks): "

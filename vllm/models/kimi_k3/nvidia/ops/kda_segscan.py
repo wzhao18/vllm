@@ -172,6 +172,7 @@ def load_extension() -> None:
                 os.path.join(csrc, "binding.cpp"),
                 os.path.join(csrc, "flash_kda.cpp"),
                 os.path.join(csrc, "smxx", "fwd_launch.cu"),
+                os.path.join(csrc, "smxx", "o_norm_mx.cu"),
             ],
             extra_include_paths=[csrc, cutlass],
             extra_cflags=flags,

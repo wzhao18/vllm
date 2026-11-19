@@ -101,16 +101,24 @@ def _load_ext():
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     import hashlib
 
-    digest = hashlib.sha1(src.read_bytes()).hexdigest()[:10]
+    h = hashlib.sha1()
+    for f in sorted(src.parent.iterdir()):  # the .cu and the headers it includes
+        if f.suffix in (".cu", ".cuh"):
+            h.update(f.read_bytes())
+    digest = h.hexdigest()[:10]
     # (infrastructure: where torch keeps the extension build; default its cache)
     build = os.environ.get("K31_DCPX_BUILD_DIR")
     if build:
         build = str(Path(build) / digest)
         Path(build).mkdir(parents=True, exist_ok=True)
+    # (infrastructure: extra nvcc flags for debug builds, e.g. -DK31_DCPX_DEBUG_PRINT)
+    extra = os.environ.get("K31_DCPX_EXTRA_CFLAGS", "").split()
+    if extra:
+        digest += "_" + hashlib.sha1(" ".join(extra).encode()).hexdigest()[:6]
     _EXT = load(
         name=f"k31_dcp_exchange_sm{arch}_{digest}",
         sources=[str(src)],
-        extra_cuda_cflags=[
+        extra_cuda_cflags=extra + [
             "-O3",
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
             "--use_fast_math",
@@ -199,6 +207,18 @@ class DcpExchange:
         self.tk_pp = torch.zeros(
             int(self.ext.topk_pp_words(cap)), dtype=torch.int32, device=device
         )
+
+        # ---- top-k v2 mailboxes (csrc/topk_v2.cuh): round 1, tie round, radix rounds
+        lay = self.ext.topk_v2_layout(cap, W)
+        self.v2_box = symm_mem.empty(int(lay[3]), dtype=torch.int32, device=device)
+        self.v2_box.fill_(-1)
+        hv = symm_mem.rendezvous(self.v2_box, group)
+        self.v2_peers = torch.tensor(
+            [int(x) for x in hv.buffer_ptrs], dtype=torch.int64, device=device
+        )
+        self.v2_mc = int(getattr(hv, "multicast_ptr", 0) or 0)
+        self.v2_epoch = torch.zeros(cap, dtype=torch.int32, device=device)
+        self.mailbox_bytes += 4 * int(lay[3])
 
         # ---- O mailboxes, one per head dim
         self.ox = {}
@@ -335,6 +355,37 @@ class DcpExchange:
             self.tk_pp if pre else None,
             pp_min,
         )
+
+    def topk_v2(
+        self,
+        logits: torch.Tensor,
+        local_len: torch.Tensor,
+        global_len: torch.Tensor,
+        out: torch.Tensor,
+        out_count: torch.Tensor,
+        *,
+        block_table: torch.Tensor | None = None,
+        block_size: int = 1,
+        block_stride: int = 0,
+        next_n: int = 1,
+        req_of_row: torch.Tensor | None = None,
+        stats: torch.Tensor | None = None,
+        dbg: torch.Tensor | None = None,
+        interleave: int | None = None,
+    ) -> None:
+        """Exact global top-K, one CTA per row (csrc/topk_v2.cuh): the same selection and
+        output as topk_merge (ties at the K-th key by ascending global id; this rank's
+        tokens above it in position order, then its selected ties in position order).
+        stats: optional int32[8] row counters (0 exchanged, 1 one round, 2 tie round,
+        3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
+        [rows * 64] per-row phase stamps. Launches must stay stream-ordered."""
+        self.ext.topk_v2(
+            logits, local_len, global_len, out, out_count, block_table, block_size,
+            block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,
+            self.v2_peers, self.W, self.rank, self.K, self.cap,
+            self.interleave if interleave is None else interleave,
+            self.v2_epoch, self.err, stats, dbg,
+        )  # fmt: skip
 
     def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:
         """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each; ``pre``:
