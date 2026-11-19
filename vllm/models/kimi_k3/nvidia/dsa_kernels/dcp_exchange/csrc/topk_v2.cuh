@@ -230,7 +230,7 @@ struct V2Sm {
 // message, which every rank reads as tier 3; any tier other than 1 returns 1 and the
 // redo kernel runs the row again with the complete body at the next epoch, on
 // every rank alike (the tier comes from the exchanged words).
-template <bool kFast, int T>
+template <bool kFast, int T, bool kDbg>
 // ep_in < 0: the row's epoch is read here (after the copy is issued). Returns 0, or
 // 1 + the epoch used when the complete body must run the row.
 __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const int row, const int ep_in,
@@ -280,6 +280,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
   // dbg stamps: clock64 into SMEM (no global store on the row's chain); globaltimer only
   // at the row's start / end; flushed to global at the end
 #define V2DBG(i)                                                                     \
+  if constexpr (kDbg)                                                                \
   if (p.dbg && tid == 0) {                                                           \
     if ((i) == 0) {                                                                  \
       for (int z = 1; z < 30; ++z) s_dbg[z] = 0;                                     \
@@ -1510,11 +1511,13 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 // to topk_v2_redo_kernel, launched right after: a call into the complete body from here
 // (out of line) cost ~2 us per call (stack frame, CTA start), the complete body inline
 // ~8 us in-step (instruction fetch).
-template <int T>
+// kDbg: the phase-stamp instance (launched only with a dbg buffer); the production
+// instance carries no stamp code.
+template <int T, bool kDbg>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE(T)
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
-    const int r = v2_row<true, T>(p, sm, row, -1, bar_phase);
+    const int r = v2_row<true, T, kDbg>(p, sm, row, -1, bar_phase);
     if (threadIdx.x == 0) p.redo[row] = r;
   }
 }
@@ -1530,7 +1533,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
   if (!__syncthreads_or(any)) return;
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = p.redo[row];
-    if (r) v2_row<false, kV2T>(p, sm, row, r == 510 ? 0 : r, bar_phase);
+    if (r) v2_row<false, kV2T, true>(p, sm, row, r == 510 ? 0 : r, bar_phase);
   }
 }
 
