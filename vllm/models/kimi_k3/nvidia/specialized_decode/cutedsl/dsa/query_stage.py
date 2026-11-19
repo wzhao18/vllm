@@ -103,25 +103,14 @@ def compile_query(
 
 
 @cache
-def compile_norm(batch, heads, pitch, kv=None):
-    """QueryNorm of one batch of rows (shared by every DSA layer: no state);
-    ``kv``: the per-tensor FP8 MLA cache's (shape, stride) for its KV insert."""
-    insert: tuple = ()
-    if kv is not None:
-        insert = (
-            fake((512,), (1,)),
-            fake(*kv, torch.uint8),
-            fake((batch,), (1,), torch.int64, 8),
-            fake((1,), (1,), torch.float32, 4),
-            cutlass.Float32(1e-6),
-        )
+def compile_norm(batch, heads, pitch):
+    """QueryNorm of one batch of rows (shared by every DSA layer: no state)."""
     return cute.compile(
-        QueryNorm(heads, batch, insert=kv is not None),
+        QueryNorm(heads, batch),
         fake((batch, pitch), (pitch, 1)),
         fake((1536,), (1,)),
         fake((batch, 1536), (1536, 1)),
         cutlass.Float32(1e-6),
-        *insert,
         make_fake_stream(),
     )
 
@@ -233,7 +222,6 @@ class QueryStage:
         self.weights += (layer.W_UV,)
         self.device = device = layer.W_UK_T.device
         self.eps = cutlass.Float32(wrapper.q_a_layernorm.variance_epsilon)
-        self.kv_eps = cutlass.Float32(wrapper.kv_a_layernorm.variance_epsilon)
         knorm = self.indexer.k_index_norm
         self.key_eps = cutlass.Float32(knorm.eps)
         self.key_norm = to_cute(knorm.weight, 4), to_cute(knorm.bias, 4)
@@ -272,19 +260,11 @@ class QueryStage:
         query, qc = to_cute(self.query[:batch]), to_cute(self.qc[:batch])
         kernel(*q_args, query, qc, *publish, s)
 
-    def run_norm(self, kernel, projected, cache=None, slots=None):
-        """QueryNorm: the q_c rows of ``projected`` (query overlap); with ``cache``
-        (a QueryNorm compiled with its KV insert) this rank's KV rows at ``slots``."""
+    def run_norm(self, kernel, projected):
+        """QueryNorm: the q_c rows of ``projected`` (query overlap)."""
         batch, s = projected.shape[0], stream(self.device)
         qnorm = self.views[0]
-        insert: tuple = ()
-        if cache is not None:
-            kv = to_cute(cache.view(torch.uint8))
-            k_scale = to_cute(self.scales[1], 4)
-            insert = (self.views[1], kv, to_cute(slots[:batch], 8), k_scale)
-            insert += (self.kv_eps,)
-        qc = to_cute(self.qc[:batch])
-        kernel(to_cute(projected), qnorm, qc, self.eps, *insert, s)
+        kernel(to_cute(projected), qnorm, to_cute(self.qc[:batch]), self.eps, s)
 
     def run_front(self, kernel, projected, index_slots, normalized=False):
         """The fused index front: the FP8 indexer query and head weights straight

@@ -460,7 +460,7 @@ class PreparedDsa:
             )
             if overlap != "serial" or batch <= FUSED_INDEX:
                 self.overlap_kernels[batch, q] = self.compile_overlap(
-                    batch, q, specs[6], specs[5]
+                    batch, q, specs[6]
                 )
             if self.dsac is not None and partials == "bf16":
                 self.prepare_core(batch, q, specs[4], sms)
@@ -677,15 +677,13 @@ class PreparedDsa:
             return self.fi.run(query, cache, topk[:batch], metadata)[0]
         return flashmla_core(self.impl, query, cache, topk[:batch], metadata)
 
-    def compile_overlap(self, batch, q, index_spec, kv_spec=None):
+    def compile_overlap(self, batch, q, index_spec):
         """The overlap kernels of a batch: (front, wait, norm). ``front``: the fused
         index front (IndexFront / IndexFrontMma from the packed rows under front /
         late_front, IndexFrontMma from q_c under serial up to FUSED_INDEX
         rows) or None; ``wait``: QueryWait under DCP (else None); ``norm``:
-        QueryNorm under fork / late (else None), at local query rows with this
-        rank's KV insert into the per-tensor FP8 cache of ``kv_spec``. Each kernel
-        is compiled once per key and shared by every DSA layer (query_stage
-        memoizes them)."""
+        QueryNorm under fork / late (else None). Each kernel is compiled once per
+        key and shared by every DSA layer (query_stage memoizes them)."""
         mode, pitch, device = self.overlaps[batch, q], self.pitches[batch], self.device
         first = wait = None
         with torch.accelerator.device_index(device.index):
@@ -694,10 +692,7 @@ class PreparedDsa:
                 wait = compile_wait(*args, self.box.cap)
             norm = None
             if mode in NORM:
-                kv = None
-                if self.inserts_in_norm(batch) and kv_spec is not None:
-                    kv = tuple(kv_spec[:2])
-                norm = compile_norm(batch, self.heads, pitch, kv)
+                norm = compile_norm(batch, self.heads, pitch)
             fused = mode == "serial" and batch <= FUSED_INDEX
             if mode in FRONT or fused:
                 weight = self.query_stage.index_projection.weight
@@ -711,28 +706,17 @@ class PreparedDsa:
         """Whether batch rows run local_query's query of every gathered head."""
         return self.local is not None and batch in self.local.rows
 
-    def inserts_in_norm(self, batch):
-        """Whether QueryNorm does local query's KV insert at ``batch`` rows (the
-        per-tensor FP8 cache LocalQuery's stock insert writes)."""
-        return self.is_local(batch) and self.fp8 and not self.nvfp4
-
     def run_local(self, projected, cache, slots, q):
-        """local_query: QueryNorm's q_c rows and this rank's KV insert on the
-        compute stream (the indexer reads the q_c rows), then on the query side
-        stream every gathered head's FP8 query. Returns what makes the sparse core
-        wait for it."""
+        """local_query: QueryNorm's q_c rows on the compute stream (the indexer
+        reads them), then on the query side stream every gathered head's FP8 query
+        and this rank's KV insert. Returns what makes the sparse core wait for it."""
         stage, batch = self.query_stage, projected.shape[0]
-        insert = self.inserts_in_norm(batch)
-        norm = self.overlap_kernels[batch, q][2]
-        if insert:
-            stage.run_norm(norm, projected, cache, slots)
-        else:
-            stage.run_norm(norm, projected)
+        stage.run_norm(self.overlap_kernels[batch, q][2], projected)
         main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
         side.wait_stream(main)
         with torch.cuda.stream(side):
-            self.local.run(stage.qc[:batch], projected, cache, slots, insert=not insert)
+            self.local.run(stage.qc[:batch], projected, cache, slots)
         return lambda: torch.cuda.current_stream(self.device).wait_stream(side)
 
     def run_query(self, projected, cache, slots, q, publish=(), poll=True):

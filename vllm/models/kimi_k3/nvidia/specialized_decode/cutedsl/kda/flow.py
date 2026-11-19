@@ -288,25 +288,31 @@ class KdaFlow(KdaWS):
         T: cutlass.Constexpr = self.tokens
         width: cutlass.Constexpr = self.heads * K
         units: cutlass.Constexpr = T * (K // 8)  # 8-column lane units per item
+        rounds: cutlass.Constexpr = -(-MAX_ITEMS * units // THREADS)
         lanes = count * units
-        for it in cutlass.range((lanes + THREADS - 1) // THREADS, unroll=1):
+        # Every round's loads first (one L2 round trip), then the quantization.
+        held = cute.make_rmem_tensor((rounds, 8), Float32)
+        rows = cute.make_rmem_tensor(rounds, Int32)
+        cols = cute.make_rmem_tensor(rounds, Int32)
+        for it in cutlass.range_constexpr(rounds):
             unit = it * THREADS + tid
-            live = unit < lanes
             j = unit // units
             if unit >= lanes:
                 j = Int32(0)
             within = unit % units
-            row = table[j, REQUEST] * T + within // (K // 8)
-            col = table[j, HEAD] * K + (within % (K // 8)) * 8
-            values = cute.make_rmem_tensor(8, Float32)
+            rows[it] = table[j, REQUEST] * T + within // (K // 8)
+            cols[it] = table[j, HEAD] * K + (within % (K // 8)) * 8
             for i in cutlass.range_constexpr(8):
-                values[i] = Float32(0)
-            if live:
-                loaded = load_bf16x8(at(output, row, col), mutable=True)
+                held[it, i] = Float32(0)
+            if unit < lanes:
+                loaded = load_bf16x8(at(output, rows[it], cols[it]), mutable=True)
                 for i in cutlass.range_constexpr(8):
-                    values[i] = loaded[i]
+                    held[it, i] = loaded[i]
+        for it in cutlass.range_constexpr(rounds):
+            values = [held[it, i] for i in range(8)]
             w0, w1, e = mx_rows.quantize8_plain(values)
-            if live:
+            if it * THREADS + tid < lanes:
+                row, col = rows[it], cols[it]
                 store_words(at(data, row, col), (w0, w1))
                 if tid % 4 == 0:
                     where = mx_rows.scale_offset(row, col // mx_rows.BLOCK,
