@@ -10,6 +10,11 @@ CASES = {
     "short1": ([1] * 4, 1),
     "zero": ([0, 2048, 0, 5], 1),
     "mixed_small": ([2048, 1, 2047, 129, 0, 2048, 64, 1000] * 4, 1),
+    "full_short": ([2048, 1] * 148, 1),
+    "short_full": ([1, 2048] * 148, 1),
+    "zero_full": ([0, 2048] * 148, 1),
+    "full3": ([2048] * 444, 1),
+    "short3": ([1] * 444, 1),
     "mixed_many": ([2048, 1, 2047, 129, 0, 2048, 64, 1000] * 40, 1),
     "mixed_many_bs32": ([2048, 1, 2047, 129, 0, 2048, 64, 1000] * 40, 0),
 }
@@ -62,13 +67,19 @@ def run(case):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        import time
+        t0 = time.time()
         run(sys.argv[1])
+        print(sys.argv[1], "secs", round(time.time() - t0), flush=True)
     else:
         for c in CASES:
             try:
-                r = subprocess.run([sys.executable, __file__, c], timeout=150,
+                r = subprocess.run([sys.executable, __file__, c], timeout=240,
                                    capture_output=True, text=True)
-                tail = (r.stdout + r.stderr).strip().splitlines()[-2:]
+                tail = [ln for ln in (r.stdout + r.stderr).strip().splitlines()
+                        if c in ln or "Error" in ln][-3:]
                 print(c, "rc", r.returncode, "|", " / ".join(tail)[-300:], flush=True)
-            except subprocess.TimeoutExpired:
-                print(c, "TIMEOUT (hang)", flush=True)
+            except subprocess.TimeoutExpired as e:
+                out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+                print(c, "TIMEOUT (hang)", [ln for ln in out.splitlines() if c in ln][-1:],
+                      flush=True)

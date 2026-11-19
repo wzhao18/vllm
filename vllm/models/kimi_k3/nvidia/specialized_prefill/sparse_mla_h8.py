@@ -327,7 +327,7 @@ class SparseMlaPrefillH8:
         # the Q warp counts each token's valid entries (``lengths`` is unused).
         self.logical = topk > 0
         self.topk = topk
-        assert topk % 64 == 0 and 128 <= topk <= 2048, topk  # one warp lane per chunk
+        assert topk == 0 or (topk % 64 == 0 and 128 <= topk <= 2048), topk  # lane per chunk
         # diagnostics (timing only): no_store (no TMA stores), no_gather (stages are
         # signalled without gathers: stale data), no_math (softmax warps skip all math),
         # no_mma (MMA warps only commit), sstamp (CTA 0 shared-memory clock stamps)
@@ -343,10 +343,15 @@ class SparseMlaPrefillH8:
         # QK(u + 1) keys 0-31 only wait for the softmax load of S(u) keys 0-31
         # lglob (logical mode, timing only): every role reads token counts from
         # ``lengths`` instead of the producer's shared-memory ring
-        knobs = tuple(knobs) + (0,) * (13 - len(knobs))
+        # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
+        # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
+        # gated by B_KVEMPTY
+        knobs = tuple(knobs) + (0,) * (14 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob) = knobs[:13]
+         self.qkh, self.lglob, self.xphys) = knobs[:14]
+        if self.xphys:
+            self.lglob = 1
         if not self.parts:
             self.parts = GATHER_PARTS
         if self.sstamp and not self.ssmask:
@@ -447,7 +452,7 @@ class SparseMlaPrefillH8:
                 self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
                             tensormap.map_address(qr), tensormap.map_address(kvm),
                             tensormap.map_address(kvr), unit_rows, slots, slot_stride,
-                            lengths, kvp, req_ids, btab, bt_stride, bt_cols, bs_shift)
+                            lengths, kvp, req_ids, btab, bt_stride, bt_cols, bs_shift, stamp)
             cute.arch.warpgroup_reg_alloc(REG_LAUNCH)
         tc_fence_before()
         cute.arch.sync_threads()
@@ -485,7 +490,7 @@ class SparseMlaPrefillH8:
     @cute.jit
     def loader(self, base, pw, lane, cta, n_mine, tm_qn, tm_qr, tm_kv, tm_kr, unit_rows,
                slots, slot_stride, lengths, kvp, req_ids, btab, bt_stride, bt_cols,
-               bs_shift):
+               bs_shift, stamp):
         quads = (16 - pw + NLD - 1) // NLD
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
@@ -523,7 +528,9 @@ class SparseMlaPrefillH8:
             act = lane < quads * npart
             if not act:
                 q = pw  # idle lanes read a valid slot of the stage (unused)
-            if cutlass.const_expr(self.logical):
+            if cutlass.const_expr(self.xphys):
+                slots = stamp
+            if cutlass.const_expr(self.logical and not self.xphys):
                 self.gather_logical(base, pw, lane, cta, n_mine, q, act, part, tm_kv, tm_kr,
                                     lens)
             else:
@@ -748,7 +755,10 @@ class SparseMlaPrefillH8:
                     i1a, i1b = ld_global_v2_s32(nsrow + Int64((t + 2 - subs) * 256))
                 compiler_fence()
                 if lane == 0:
-                    mbar_wait(_bar(base, B_SLEMPTY + s), Uint32(((g // NSL) & 1) ^ 1))
+                    if cutlass.const_expr(self.xphys):
+                        mbar_wait(_bar(base, B_KVEMPTY + g % NS), Uint32(((g // NS) & 1) ^ 1))
+                    else:
+                        mbar_wait(_bar(base, B_SLEMPTY + s), Uint32(((g // NSL) & 1) ^ 1))
                 cute.arch.sync_warp()
                 st_shared_v2(base + Uint32(OFF_SLOT) + Uint32(s) * Uint32(256) + Uint32(8 * lane),
                              p0, p1)
@@ -779,9 +789,9 @@ class SparseMlaPrefillH8:
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 full = _bar(base, B_KVFULL + s)
                 sl = g % NSL
+                mbar_wait(_bar(base, B_SLFULL + sl), Uint32((g // NSL) & 1))  # every lane
                 if lane == 0:
                     mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                    mbar_wait(_bar(base, B_SLFULL + sl), Uint32((g // NSL) & 1))
                     if pw == 0:
                         self.ss(base, cta, lane, g, 22, 8)
                         if cutlass.const_expr(self.no_gather):
@@ -1253,7 +1263,8 @@ def sparse_mla_prefill_h8_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
                                   block_table: torch.Tensor, block_size: int,
                                   block_stride_rows: int, scale: float, out_scale: float,
                                   out: torch.Tensor | None = None, knobs: tuple = (),
-                                  lengths: torch.Tensor | None = None) -> torch.Tensor:
+                                  lengths: torch.Tensor | None = None,
+                                  phys_dbg: torch.Tensor | None = None) -> torch.Tensor:
     """``sparse_mla_prefill_h8`` on the indexer's request-relative top-k, with the
     index remap (``triton_convert_req_index_to_global_index``) fused into the gather:
     topk_indices [T, K] int32 (K % 64 == 0, 128 <= K <= 2048, < 0 invalid, valid
@@ -1289,7 +1300,8 @@ def sparse_mla_prefill_h8_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
        Int64(topk_indices.data_ptr()), Int32(topk_indices.stride(0)),
        Int64(0 if lengths is None else lengths.data_ptr()),  # lglob diagnostic only
        Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale),
-       Int32(kv_rows.shape[0]), Int64(0), Int64(req_ids.data_ptr()),
+       Int32(kv_rows.shape[0]), Int64(0 if phys_dbg is None else phys_dbg.data_ptr()),
+       Int64(req_ids.data_ptr()),
        Int64(block_table.data_ptr()), Int32(block_table.stride(0)),
        Int32(block_table.shape[1]), Int32(block_size.bit_length() - 1), stream)
     return out

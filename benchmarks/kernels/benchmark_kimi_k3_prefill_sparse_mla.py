@@ -329,7 +329,7 @@ def main():
                 lidx, rq, btab = idx.logical
                 sparse_mla_prefill_h8_logical(qf3, kv.view(-1, 576), lidx, rq, btab, 64, 64,
                                               0.0722, 1.0, out=vr_out, knobs=knobs,
-                                              lengths=seq)
+                                              lengths=seq, phys_dbg=idx)
 
             def vremap(i):
                 kv, idx = layers[i % len(layers)]
