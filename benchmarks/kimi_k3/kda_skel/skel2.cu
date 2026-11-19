@@ -73,8 +73,9 @@ __device__ __forceinline__ void mma_ts_tf32(uint32_t d, uint32_t a, uint64_t b, 
 #define ST8(addr, r) asm volatile("tcgen05.st.sync.aligned.32x32b.x8.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};" \
   :: "r"(addr), "r"(r[0]),"r"(r[1]),"r"(r[2]),"r"(r[3]),"r"(r[4]),"r"(r[5]),"r"(r[6]),"r"(r[7]) : "memory")
 
-struct Args { int nch, steps, mode, flags; unsigned id_f16_n32, id_tf32_n128, id_tf32_n32; unsigned* ctr; long long* stamps; };
-// flags: 1 = no HBM loads (prep reuses resident raw), 2 = no out stores, 4 = no state pass, 8 = no MMAs (chain = pass only)
+struct Args { int nch, steps, mode, flags; unsigned id_f16_n32, id_tf32_n128, id_tf32_n32, id_f16_n64; unsigned* ctr; long long* stamps; };
+// flags: 1 = no HBM loads (prep reuses resident raw), 2 = no out stores, 4 = no state pass, 8 = no MMAs (chain = pass only),
+//        16 = no prep image copy (ideal prep: handoff barriers only), 32 = fused N64 MMA1+OUT-inter leg, FIN right after MMA4
 
 template <int PW>
 __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps maps, Args A) {
@@ -125,6 +126,7 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
     const uint32_t cb = tbase + c * 256;          // S 0..127 | INP 128..191 | U 192..223 | OUT 224..255
     const uint32_t lane_off = (uint32_t)((warp & 3) * 32) << 16;
     const int steps = A.steps;
+    if (PW == 2) { if (w < 8) asm volatile("setmaxnreg.inc.sync.aligned.u32 72;"); else if (w < 12) asm volatile("setmaxnreg.dec.sync.aligned.u32 48;"); }
     if (w < 4 * PW) {
       // ---------------- chain group ----------------
       long long ph[4] = {0, 0, 0, 0};
@@ -164,7 +166,17 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
         nbar(1 + c, 128 * PW);
         asm volatile("tcgen05.fence::after_thread_sync;");
         long long c2 = clock64();
-        if (w == 0 && !(A.flags & 8)) {
+        if (w == 0 && !(A.flags & 8) && (A.flags & 32)) {
+          // fused: [U | OUT] += INP [W^T | Qd] (one N64 TS f16 leg, W^T and Qd adjacent), MMA4, FIN; then OUT intra
+          uint64_t dWQ = sdesc(im), dKd = sdesc(im + 16384);
+          if (t > 0) mwait(MB(8), (t - 1) & 1);                   // OFREE(t-1): epilogue read + zeroed OUT
+          for (int kk = 0; kk < 8; ++kk) mma_ts_f16(cb + 192, cb + 128 + kk * 8, dWQ + kk * 2, A.id_f16_n64, 1);
+          for (int kk = 0; kk < 4; ++kk) mma_ts_tf32(cb, cb + 192 + kk * 8, dKd + kk * 2, A.id_tf32_n128, 1);
+          commit_el(MB(6));
+          for (int kk = 0; kk < 4; ++kk) mma_ts_tf32(cb + 224, cb + 192 + kk * 8, dKd + kk * 2, A.id_tf32_n32, 1);
+          commit_el(MB(7));
+          commit_el(MB(4 + s));
+        } else if (w == 0 && !(A.flags & 8)) {
           uint64_t dW = sdesc(im), dKd = sdesc(im + 8192), dQ = sdesc(im + 24576);
           // MMA1: U += INP W^T (TS f16, A=INP 64 cols bf16 = K128)
           for (int kk = 0; kk < 8; ++kk) mma_ts_f16(cb + 192, cb + 128 + kk * 8, dW + kk * 2, A.id_f16_n32, 1);
@@ -215,7 +227,7 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
         mwait(MB(4 + s), sp ^ 1);                         // IMG_FREE[s]
         const uint32_t rs = raw + s * RAW_B, is = img + s * IMG_B;
 #pragma unroll 3
-        for (int i = 0; i < IMG_B / 16 / 128; ++i) {
+        for (int i = 0; i < ((A.flags & 16) ? 0 : IMG_B / 16 / 128); ++i) {
           const int idx = pt + 128 * i;
           uint32_t a, b, cc, d;
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(a), "=r"(b), "=r"(cc), "=r"(d) : "r"(rs + (idx & 2047) * 16));
@@ -235,6 +247,13 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
         uint32_t r[32];
         if (!(A.flags & 8)) { LD32(r, cb + lane_off + 224); asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory"); }
         else for (int e = 0; e < 32; ++e) r[e] = e;
+        if ((A.flags & 40) == 32) {                       // fused leg accumulates: zero OUT for the next step
+          uint32_t z[16];
+#pragma unroll
+          for (int e = 0; e < 16; ++e) z[e] = 0;
+          ST16(cb + lane_off + 224, z); ST16(cb + lane_off + 240, z);
+          asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+        }
         asm volatile("tcgen05.fence::before_thread_sync;");
         arrive(MB(8));                                    // OFREE(t)
         if (!(A.flags & 2)) {
@@ -315,12 +334,11 @@ int main(int argc, char** argv) {
   size_t smem = (size_t)2 * CH_SMEM + 128;
   printf("SMs %d maxsmem %d need %zu\n", nsm, maxsm, smem);
   Args A; A.nch = nch; A.steps = steps; A.mode = mode; A.flags = flags;
-  A.id_f16_n32 = mk(1, 1, 1, 32, 128); A.id_tf32_n128 = mk(1, 2, 2, 128, 128); A.id_tf32_n32 = mk(1, 2, 2, 32, 128);
+  A.id_f16_n32 = mk(1, 1, 1, 32, 128); A.id_tf32_n128 = mk(1, 2, 2, 128, 128); A.id_tf32_n32 = mk(1, 2, 2, 32, 128); A.id_f16_n64 = mk(1, 1, 1, 64, 128);
   CK(cudaMalloc(&A.ctr, 8)); CK(cudaMalloc(&A.stamps, (size_t)nsm * 16 * 8));
   auto kern = pw == 1 ? skel<1> : skel<2>;
   CUfunction cf; CK(cudaGetFuncBySymbol((cudaFunction_t*)&cf, (const void*)kern));
   CU(cuFuncSetAttribute(cf, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
-  CU(cuFuncSetAttribute(cf, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)smem));
   cudaLaunchConfig_t lc = {}; cudaLaunchAttribute la[1];
   la[0].id = cudaLaunchAttributeSharedMemoryMode; la[0].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
   lc.gridDim = dim3(nsm); lc.blockDim = dim3(1024); lc.dynamicSmemBytes = smem; lc.attrs = la; lc.numAttrs = 1;
