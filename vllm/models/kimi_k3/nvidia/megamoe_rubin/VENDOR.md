@@ -284,9 +284,6 @@ p50 (682 vs 731 us).
   ``src`` SiTU core (one reciprocal per element, ex2/rcp only) instead of FlashInfer main's
   ``situ_pair_tanh_approx`` (two ``tanh.approx.f32`` per element, ~2^-11 relative error, lower precision than
   the a368c5f66 sigmoid form). ``use_tanh_sigmoid`` and SwiGLU keep the upstream code.
-- **S6** (vLLM-local, as on ``src``): ``sources/communication/nvlink_domain/token_comm_dedup.py`` static
-  token_in (``token_in_flag_batch`` 1) keeps ``token_in_ring_depth`` = 4 remote row pulls in flight per
-  transfer warp (``_token_in_ring``, ported from ``src``); same rows, order, stores, scale copies and flags.
 - **inference_dedup** (``config.Variant``): the refreshed inference kernel ``RubinInferenceMegaMoE`` with
   ``combine_dedup`` (owner-side FP32 pre-reduce of a token's local expert rows, one BF16 row per (source
   rank, token), ``TopkReduceDedup`` sums the rank rows in ascending rank order; routing weights at FC1). The
