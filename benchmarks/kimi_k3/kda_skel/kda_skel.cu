@@ -28,7 +28,7 @@ constexpr int OUT_TILE = C * D;                        // MXFP8 32 x 128 B
 constexpr int STATE_HALF = 32768;                      // FP32 state 64 KiB as two halves
 constexpr int NWARP_SLOT = 5;
 
-struct Maps { CUtensorMap qkv, g, og, beta, out; };
+struct Maps { CUtensorMap qkv, g, og, beta, out, qkv_h, g_h, og_h, beta_h, out_h, qd, kd, vd, gd, ogd, outd; };
 
 __device__ __forceinline__ unsigned sa(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mb_wait(unsigned b, unsigned ph) {
@@ -54,7 +54,9 @@ __device__ __forceinline__ void bulk_st(void* dst, unsigned src, int n) {
 __device__ __forceinline__ void named_bar(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 
 struct Args {
-  int nseq, seqlen, nchunk, nchain, mode, S_total, iss6, fma, mufu, onorm;
+  int nseq, seqlen, nchunk, nchain, mode, S_total, iss6, fma, mufu, onorm, hm, noout, T;
+  int dl, Tpad, nd0, nd1;    // die-local: heads [0,48) homed on die 0, [48,96) on die 1; chains die-matched
+  const int* sm_die; const int* sm_rank;
   const float* w;          // [H*128] o_norm weight
   float* state;            // [nchain][128*128] f32
   unsigned char* scales;   // [T][H*4]
@@ -69,10 +71,18 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
   const int slot = warp / NWARP_SLOT, role = warp % NWARP_SLOT;   // role 0 producer, 1-4 consumers
   // which chains / items this slot owns
   int chain = -1, nslots_used = 2;
-  if (a.mode == 0) {
+  unsigned smid_; asm volatile("mov.u32 %0, %%smid;" : "=r"(smid_));
+  const int die = a.dl ? a.sm_die[smid_ & 1023] : 0, drank = a.dl ? a.sm_rank[smid_ & 1023] : 0;
+  const int nd = die ? a.nd1 : a.nd0, cpd = a.nchain / 2;   // chains per die
+  auto dchain = [&](int cl) { return (cl / (H / 2)) * H + die * (H / 2) + cl % (H / 2); };
+  if (a.mode == 0 && !a.dl) {
     chain = blockIdx.x + slot * gridDim.x;
     if (blockIdx.x + gridDim.x >= a.nchain) nslots_used = 1;
     if (chain >= a.nchain) chain = -1;
+  } else if (a.mode == 0) {
+    int cl = drank + slot * nd;
+    if (drank + nd >= cpd) nslots_used = 1;
+    chain = cl < cpd ? dchain(cl) : -1;
   }
   const int S = a.S_total / nslots_used;
   unsigned char* ring = sm + (size_t)slot * S * STAGE;
@@ -90,10 +100,12 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
   // item enumeration
   long long n_items, it0 = 0, it_step = 1;
   if (a.mode == 0) n_items = 2 + a.nchunk;
-  else { it0 = blockIdx.x * 2 + slot; it_step = 2 * gridDim.x; n_items = (long long)a.nchain * a.nchunk; }
+  else if (!a.dl) { it0 = blockIdx.x * 2 + slot; it_step = 2 * gridDim.x; n_items = (long long)a.nchain * a.nchunk; }
+  else { it0 = drank * 2 + slot; it_step = 2 * nd; n_items = (long long)cpd * a.nchunk; }
   auto decode = [&](long long j, int& ch, int& k) {
     if (a.mode == 0) { ch = chain; k = (int)j - 2; }
-    else { ch = (int)(j / a.nchunk); k = (int)(j % a.nchunk); }
+    else if (!a.dl) { ch = (int)(j / a.nchunk); k = (int)(j % a.nchunk); }
+    else { ch = dchain((int)(j / a.nchunk)); k = (int)(j % a.nchunk); }
   };
   if (role == 0) {
     long long i = 0;
@@ -113,13 +125,22 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
       }
       int seq = ch / H, head = ch % H, tok = seq * a.seqlen + k * C;
       if (lane == 0)
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(fb), "r"(5 * TILE + BETA_BYTES) : "memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(fb), "r"(5 * TILE + (a.hm | a.dl ? C * 2 : BETA_BYTES)) : "memory");
       __syncwarp();
       int who = a.iss6 ? lane : 0;
       if (a.iss6 ? lane < 6 : lane == 0) {
         for (int t = (a.iss6 ? lane : 0); t < (a.iss6 ? lane + 1 : 6); ++t) {
           unsigned d = dst + t * TILE;
-          if (t < 3) tma2(d, &M.qkv, t * P + head * D, tok, fb);
+          if (a.dl) {   // die-local head-major, rows head * Tpad + tok
+            const CUtensorMap* mm = t == 0 ? &M.qd : t == 1 ? &M.kd : t == 2 ? &M.vd : t == 3 ? &M.gd : &M.ogd;
+            if (t < 5) tma2(d, mm, 0, head * a.Tpad + tok, fb);
+            else tma2(d, &M.beta_h, tok, head, fb);
+          } else if (a.hm) {   // head-major [tensor][H][T][128]: every tile is one contiguous 8 KiB block
+            if (t < 3) tma2(d, &M.qkv_h, 0, (t * H + head) * a.T + tok, fb);
+            else if (t == 3) tma2(d, &M.g_h, 0, head * a.T + tok, fb);
+            else if (t == 4) tma2(d, &M.og_h, 0, head * a.T + tok, fb);
+            else tma2(d, &M.beta_h, tok, head, fb);
+          } else if (t < 3) tma2(d, &M.qkv, t * P + head * D, tok, fb);
           else if (t == 3) tma2(d, &M.g, head * D, tok, fb);
           else if (t == 4) tma2(d, &M.og, head * D, tok, fb);
           else tma2(d, &M.beta, (head / 8) * 8, tok, fb);
@@ -226,9 +247,10 @@ __global__ void __launch_bounds__(2 * NWARP_SLOT * 32, 1) skel_k(const __grid_co
       }
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       named_bar(bar_id, 128);
-      if (ctid == 0) {
+      if (ctid == 0 && !a.noout) {
         asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];"
-                     :: "l"(&M.out), "r"(head * D), "r"(tok), "r"(sa(o)) : "memory");
+                     :: "l"(a.dl ? &M.outd : a.hm ? &M.out_h : &M.out), "r"(a.hm | a.dl ? 0 : head * D),
+                        "r"(a.dl ? head * a.Tpad + tok : a.hm ? head * a.T + tok : tok), "r"(sa(o)) : "memory");
         asm volatile("cp.async.bulk.commit_group;" ::: "memory");
       }
       if (!a.onorm && ctid < C && tok + ctid < (seq + 1) * a.seqlen)
@@ -256,6 +278,38 @@ static void enc(CUtensorMap* m, CUtensorMapDataType dt, int esz, void* p, uint64
                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 }
 
+// smid -> die by cold-miss latency: each CTA chases fresh lines in a die-0 and a die-1 buffer
+__global__ void die_probe_k(const unsigned* b0, const unsigned* b1, long long* out) {
+  if (threadIdx.x) return;
+  unsigned s; asm volatile("mov.u32 %0, %%smid;" : "=r"(s));
+  long long t[2];
+  for (int d = 0; d < 2; ++d) {
+    const unsigned* b = (d ? b1 : b0) + (size_t)blockIdx.x * 65536;   // 256 KiB fresh region per CTA
+    unsigned idx = 0, acc = 0;
+    long long c0 = clock64();
+    for (int i = 0; i < 24; ++i) { unsigned v; asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(b + idx + i * 2048)); acc += v; idx = acc & 1; }
+    t[d] = clock64() - c0 + (acc == 0xdeadbeef);
+  }
+  out[blockIdx.x * 3] = s; out[blockIdx.x * 3 + 1] = t[0]; out[blockIdx.x * 3 + 2] = t[1];
+}
+
+static void* die_alloc_split(size_t half, int dev) {   // [half on die 0 | half on die 1], half % 2 MiB == 0
+  CUmemAllocationProp p = {};
+  p.type = CU_MEM_ALLOCATION_TYPE_PINNED; p.location.type = CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN;
+  p.location.localized.deviceId = dev;
+  size_t g; CK(cuMemGetAllocationGranularity(&g, &p, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+  if (half % g) { printf("half %zu not a multiple of %zu\n", half, g); exit(1); }
+  CUdeviceptr va; CK(cuMemAddressReserve(&va, 2 * half, g, 0, 0));
+  for (int d = 0; d < 2; ++d) {
+    p.location.localized.localityDomainId = d;
+    CUmemGenericAllocationHandle h; CK(cuMemCreate(&h, half, &p, 0));
+    CK(cuMemMap(va + d * half, half, 0, h, 0));
+  }
+  CUmemAccessDesc ad = {}; ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ad.location.id = dev;
+  ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE; CK(cuMemSetAccess(va, 2 * half, &ad, 1));
+  return (void*)va;
+}
+
 int main(int argc, char** argv) {
   int nseq = argc > 1 ? atoi(argv[1]) : 3, seqlen = argc > 2 ? atoi(argv[2]) : 5461, iters = argc > 3 ? atoi(argv[3]) : 20;
   const long long T = (long long)nseq * seqlen;
@@ -265,7 +319,7 @@ int main(int argc, char** argv) {
   printf("T=%lld nseq=%d seqlen=%d chunks/chain=%d chains=%d SMs=%d\n", T, nseq, seqlen, nchunk, nchain, nsm);
   void *qkv, *g, *og, *beta, *out; float* state; unsigned char* scales; unsigned long long* sink;
   CR(cudaMalloc(&qkv, T * 3 * P * 2)); CR(cudaMalloc(&g, T * P * 2)); CR(cudaMalloc(&og, T * P * 2));
-  CR(cudaMalloc(&beta, T * H * 2)); CR(cudaMalloc(&out, T * P)); CR(cudaMalloc(&scales, T * H * 4));
+  CR(cudaMalloc(&beta, (T + 8) * H * 2)); CR(cudaMalloc(&out, T * P)); CR(cudaMalloc(&scales, T * H * 4));
   CR(cudaMalloc(&state, (size_t)nchain * 65536)); float* wgt; CR(cudaMalloc(&wgt, H * D * 4)); CR(cudaMemset(wgt, 0, H * D * 4)); CR(cudaMalloc(&sink, 64));
   CR(cudaMemset(qkv, 1, T * 3 * P * 2)); CR(cudaMemset(g, 1, T * P * 2)); CR(cudaMemset(og, 1, T * P * 2));
   void* flush; size_t FL = 512ull << 20; CR(cudaMalloc(&flush, FL));
@@ -275,23 +329,62 @@ int main(int argc, char** argv) {
   enc(&M.og, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, og, P, T, P * 2, D, C);
   enc(&M.beta, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, beta, H, T, H * 2, 8, C);
   enc(&M.out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, out, P, T, P, D, C);
+  enc(&M.qkv_h, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, qkv, D, 3 * H * T, D * 2, D, C);
+  enc(&M.g_h, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, g, D, H * T, D * 2, D, C);
+  enc(&M.og_h, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, og, D, H * T, D * 2, D, C);
+  enc(&M.beta_h, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, beta, T, H, (T + 7) / 8 * 16, C, 1);
+  enc(&M.out_h, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, out, D, H * T, D, D, C);
+  // die-local head-major tensors: rows per head Tpad (48 x Tpad x 256 B is a multiple of 2 MiB)
+  CR(cudaFree(0));
+  const long long Tpad = (T + 511) / 512 * 512;
+  const size_t half_bf = (size_t)(H / 2) * Tpad * D * 2, half_u8 = (size_t)(H / 2) * Tpad * D;
+  void* dq = die_alloc_split(half_bf, 0); void* dk = die_alloc_split(half_bf, 0); void* dv = die_alloc_split(half_bf, 0);
+  void* dg = die_alloc_split(half_bf, 0); void* dog = die_alloc_split(half_bf, 0); void* dout = die_alloc_split(half_u8, 0);
+  for (void* x : {dq, dk, dv, dg, dog}) CR(cudaMemset(x, 1, 2 * half_bf));
+  enc(&M.qd, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dq, D, H * Tpad, D * 2, D, C);
+  enc(&M.kd, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dk, D, H * Tpad, D * 2, D, C);
+  enc(&M.vd, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dv, D, H * Tpad, D * 2, D, C);
+  enc(&M.gd, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dg, D, H * Tpad, D * 2, D, C);
+  enc(&M.ogd, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, dog, D, H * Tpad, D * 2, D, C);
+  enc(&M.outd, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, dout, D, H * Tpad, D, D, C);
+  // smid -> die map (probe on two fresh die-local buffers)
+  size_t pb = (size_t)nsm * 65536 * 4 * 2;   // 2 x ... rounded below
+  pb = (pb + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+  unsigned* probe = (unsigned*)die_alloc_split(pb, 0);
+
+  long long* pr; CR(cudaMalloc(&pr, nsm * 3 * 8));
+  die_probe_k<<<nsm, 32>>>(probe, probe + pb / 4, pr); CR(cudaDeviceSynchronize());
+  std::vector<long long> hp(nsm * 3); CR(cudaMemcpy(hp.data(), pr, nsm * 24, cudaMemcpyDeviceToHost));
+  std::vector<int> hdie(1024, 0), hrank(1024, 0); int nd[2] = {0, 0}; int amb = 0;
+  std::vector<int> order(nsm); for (int i = 0; i < nsm; ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](int x, int y) { return hp[x * 3] < hp[y * 3]; });
+  for (int i : order) {
+    int s = (int)hp[i * 3]; long long t0 = hp[i * 3 + 1], t1 = hp[i * 3 + 2];
+    int d = t1 < t0 ? 1 : 0; if (std::min(t0, t1) * 1.15 > std::max(t0, t1)) ++amb;
+    hdie[s & 1023] = d; hrank[s & 1023] = nd[d]++;
+  }
+  int pair_ok = 0; for (int i = 0; i < nsm; ++i) { int s = (int)hp[i * 3]; pair_ok += hdie[s] == ((s >> 1) & 1); }
+  printf("die map: %d / %d SMs, ambiguous %d, matches (smid>>1)&1 for %d\n", nd[0], nd[1], amb, pair_ok);
+  int *dsm_die, *dsm_rank; CR(cudaMalloc(&dsm_die, 4096)); CR(cudaMalloc(&dsm_rank, 4096));
+  CR(cudaMemcpy(dsm_die, hdie.data(), 4096, cudaMemcpyHostToDevice)); CR(cudaMemcpy(dsm_rank, hrank.data(), 4096, cudaMemcpyHostToDevice));
   // SOL bytes (exact tensors, no over-fetch)
   double bytes = (double)T * (5.0 * P * 2 + H * 2 + P + H * 4) + (double)nchain * 65536 * 2;
   printf("SOL bytes %.3f GB -> %.1f us @19.4 TB/s, %.1f us @17.7 TB/s\n", bytes / 1e9, bytes / 19.4e12 * 1e6, bytes / 17.7e12 * 1e6);
-  struct V { const char* name; int mode, S_total, iss6, fma, mufu, onorm; };
+  struct V { const char* name; int mode, S_total, iss6, fma, mufu, onorm, hm, noout, dl; };
   std::vector<V> vs = {
-      {"chain  S=4 (2x2)  iss1", 0, 4, 0}, {"chain  S=4 (2x2)  iss6", 0, 4, 1}, {"chain  S=6 (2x3)  iss6", 0, 6, 1},
-      {"chain  S=7 (2x3)  iss1", 0, 7, 0}, {"chain  S=7 (2x3)  iss6", 0, 7, 1}, {"rrbal  S=4 (2x2)  iss6", 1, 4, 1},
-      {"rrbal  S=6 (2x3)  iss6", 1, 6, 1}, {"rrbal  S=7 (2x3)  iss6", 1, 7, 1},
-      {"chain  S=7 iss6 +FMA1056", 0, 7, 1, 1056, 0}, {"chain  S=7 iss6 +MUFU320", 0, 7, 1, 0, 320},
-      {"chain  S=7 iss6 +both", 0, 7, 1, 1056, 320}, {"rrbal  S=7 iss6 +both", 1, 7, 1, 1056, 320},
-      {"chain  S=7 iss6 +onorm", 0, 7, 1, 0, 0, 1}, {"chain  S=4 iss6 +onorm", 0, 4, 1, 0, 0, 1}};
+      {"TM chain S=6", 0, 6, 1}, {"HM chain S=6", 0, 6, 1, 0, 0, 0, 1}, {"HM rrbal S=6", 1, 6, 1, 0, 0, 0, 1},
+      {"DL chain S=4", 0, 4, 1, 0, 0, 0, 0, 0, 1}, {"DL chain S=6", 0, 6, 1, 0, 0, 0, 0, 0, 1},
+      {"DL chain S=7", 0, 7, 1, 0, 0, 0, 0, 0, 1}, {"DL rrbal S=4", 1, 4, 1, 0, 0, 0, 0, 0, 1},
+      {"DL rrbal S=6", 1, 6, 1, 0, 0, 0, 0, 0, 1}, {"DL rrbal S=7", 1, 7, 1, 0, 0, 0, 0, 0, 1},
+      {"DL chain S=6 noout", 0, 6, 1, 0, 0, 0, 0, 1, 1}, {"DL chain S=6 iss1", 0, 6, 0, 0, 0, 0, 0, 0, 1},
+      {"DL chain S=6 +onorm", 0, 6, 1, 0, 0, 1, 0, 0, 1}};
   cudaEvent_t e0, e1; CR(cudaEventCreate(&e0)); CR(cudaEventCreate(&e1));
   printf("attr maxdyn: %s\n", cudaGetErrorString(cudaFuncSetAttribute(skel_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448)));
   printf("attr oversized: %s\n", cudaGetErrorString(cudaFuncSetAttribute(skel_k, cudaFuncAttributeSharedMemoryMode, cudaSharedMemoryModeAllowOversizedSharedMemory)));
   cudaGetLastError();
   for (auto& v : vs) {
-    Args a{nseq, seqlen, nchunk, nchain, v.mode, v.S_total, v.iss6, v.fma, v.mufu, v.onorm, wgt, state, scales, sink};
+    Args a{nseq, seqlen, nchunk, nchain, v.mode, v.S_total, v.iss6, v.fma, v.mufu, v.onorm, v.hm, v.noout, (int)T,
+           v.dl, (int)Tpad, nd[0], nd[1], dsm_die, dsm_rank, wgt, state, scales, sink};
     size_t smem = (size_t)v.S_total * STAGE + 4 * OUT_TILE;
     std::vector<float> ts;
     for (int it = 0; it < iters + 3; ++it) {
