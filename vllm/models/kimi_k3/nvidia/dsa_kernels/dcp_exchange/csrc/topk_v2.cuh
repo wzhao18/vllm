@@ -188,7 +188,6 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
   __shared__ uint32_t warp_sums[64];  // two scan buffers (V2WS alternates)
   uint32_t ws_par = 0;
 #define V2WS (warp_sums + 32 * (ws_par ^= 1u))
-  __shared__ uint32_t s_wt[kV2Warps];  // candidates per warp range
   __shared__ int s_i[16];
   __shared__ uint32_t s_u[16];
   __shared__ unsigned long long s_pref;
@@ -375,82 +374,63 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
     {
       uint32_t nv = 0;
       if (regp) {
-        // candidates in POSITION order: warp w owns the contiguous groups [w GW, (w+1) GW),
-        // lane l of it the groups w GW + 32 i + l (i < kV2NR); position order is (i, lane).
-        // Pass 1 counts per (i, lane) (packed 10-bit fields, one warp scan), pass 2 writes
-        // only the groups that hold candidates. The per-key work is out of line (short hot
-        // code: the chain is bound by instruction fetch, not by the keys).
-        const int warp = tid >> 5, lane = tid & 31;
-        const int GW = (((ng + kV2Warps - 1) / kV2Warps) + 31) & ~31;  // <= kV2NR x 32
-        const int gw0 = min(ng, warp * GW), gw1 = min(ng, gw0 + GW);
-        uint32_t pk[3] = {0u, 0u, 0u}, hitm = 0;
+        // candidates in POSITION order: thread t owns the contiguous groups [kV2NR t, +kV2NR)
+        // (16-byte SMEM reads at a 144-byte pitch: conflict free), so one CTA scan of the
+        // per-thread counts places every candidate. The 9 group tests are independent.
+        const int tg0 = tid * kV2NR;
         const uint32_t t2 = v2_th_bf16(th);
         const bool kx = th == 0x8000;
+        uint32_t mk[3] = {0u, 0u, 0u};  // 8-bit key masks of the groups, 4 per word
+        uint32_t cnt = 0;
 #pragma unroll
         for (int i = 0; i < kV2NR; ++i) {
-          const int g = gw0 + i * 32 + lane;
-          if (g < gw1) {
+          const int g = tg0 + i;
+          if (g < ng) {
             const uint4 r = sgroup(g);
             const uint32_t mx = v2_max_nan(r);
-            uint32_t c = 0;
-            if (v2_is_nan2(mx)) {
-              nv += v2_nvalid(r);
-              c = v2_cnt_ge(r, (uint32_t)th, t2, kx);
+            nv += v2_is_nan2(mx) ? v2_nvalid(r) : 8u;
+            uint32_t m8;
+            if (!kx) {
+              const uint32_t u = (v2_ge2(r.x, t2) & 0x00010001u) | ((v2_ge2(r.y, t2) & 0x00010001u) << 1) |
+                                 ((v2_ge2(r.z, t2) & 0x00010001u) << 2) | ((v2_ge2(r.w, t2) & 0x00010001u) << 3);
+              uint32_t lo4 = u & 0xFu, hi4 = (u >> 16) & 0xFu;  // keys 2w / 2w + 1 -> bit j = key j
+              lo4 = (lo4 ^ (lo4 << 2)) & 0x33u;
+              lo4 = (lo4 ^ (lo4 << 1)) & 0x55u;
+              hi4 = (hi4 ^ (hi4 << 2)) & 0x33u;
+              hi4 = (hi4 ^ (hi4 << 1)) & 0x55u;
+              m8 = lo4 | (hi4 << 1);
             } else {
-              nv += 8;
-              if (v2_ge2(mx, t2) || kx) c = v2_cnt_ge(r, (uint32_t)th, t2, kx);
+              const Keys8 k8(r);
+              m8 = 0;
+#pragma unroll
+              for (int j = 0; j < 8; ++j)
+                m8 |= (k8.key(j) >= (uint32_t)th ? 1u : 0u) << j;
             }
-            if (c) {
-              hitm |= 1u << i;
-              pk[i / 3] += c << (10 * (i % 3));
-            }
+            cnt += __popc(m8);
+            mk[i / 4] |= m8 << (8 * (i % 4));
           }
-        }
-        uint32_t inc[3] = {pk[0], pk[1], pk[2]};
-#pragma unroll
-        for (int o = 1; o < 32; o <<= 1) {
-#pragma unroll
-          for (int w = 0; w < 3; ++w) {
-            const uint32_t y = __shfl_up_sync(0xffffffffu, inc[w], o);
-            if (lane >= o) inc[w] += y;
-          }
-        }
-        uint32_t tw[3];
-#pragma unroll
-        for (int w = 0; w < 3; ++w) tw[w] = __shfl_sync(0xffffffffu, inc[w], 31);
-        if (lane == 0) {
-          uint32_t t = 0;
-#pragma unroll
-          for (int i = 0; i < kV2NR; ++i) t += (tw[i / 3] >> (10 * (i % 3))) & 0x3FFu;
-          s_wt[warp] = t;
         }
         V2DBG(24);
-        __syncthreads();
+        uint32_t ctot;
+        int c = (int)v2_scan(cnt, V2WS, &ctot);
         V2DBG(25);
-        const uint32_t w0 = lane < kV2Warps ? s_wt[lane] : 0u;
-        uint32_t t = w0;
+        if (tid == 0) s_cnt = (int)ctot;
+        const uint16_t* srow16 = reinterpret_cast<const uint16_t*>(srow);
 #pragma unroll
-        for (int o = 1; o < kV2Warps; o <<= 1) {
-          const uint32_t y = __shfl_up_sync(0xffffffffu, t, o);
-          if (lane >= o) t += y;
-        }
-        const int wbase = (int)__shfl_sync(0xffffffffu, t - w0, warp);
-        const int ctot = (int)__shfl_sync(0xffffffffu, t, kV2Warps - 1);
-        if (tid == 0) s_cnt = ctot;
-        while (hitm) {
-          const int i = __ffs(hitm) - 1;
-          hitm &= hitm - 1;
-          int ib = 0;  // the warp's candidates in steps before i
-          for (int i2 = 0; i2 < i; ++i2) {
-            const uint32_t tv = i2 < 3 ? tw[0] : i2 < 6 ? tw[1] : tw[2];
-            ib += (int)((tv >> (10 * (i2 % 3))) & 0x3FFu);
+        for (int w = 0; w < 3; ++w) {
+          uint32_t m = mk[w];
+          while (m) {
+            const int b = __ffs(m) - 1;
+            m &= m - 1;
+            const int i = 4 * w + (b >> 3), j = b & 7;
+            const int g = tg0 + i;
+            if (c < kV2Cand) {
+              const uint32_t raw = srow16[8 * g + j];
+              cpos[c] = (uint32_t)(8 * g - sh + j);
+              ckey[c] = (uint16_t)(keys2(raw) & 0xFFFFu);
+            }
+            ++c;
           }
-          const uint32_t sw = 10 * (i % 3);
-          const uint32_t iv = i < 3 ? inc[0] : i < 6 ? inc[1] : inc[2];
-          const uint32_t pv = i < 3 ? pk[0] : i < 6 ? pk[1] : pk[2];
-          const int ex = (int)(((iv >> sw) & 0x3FFu) - ((pv >> sw) & 0x3FFu));
-          const int g = gw0 + i * 32 + lane;
-          v2_emit(sgroup(g), (uint32_t)th, t2, kx, 8 * g - sh, wbase + ib + ex, cpos, ckey);
         }
         V2DBG(26);
       }
@@ -536,7 +516,13 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
     bool fast = nc <= kV2Cand && (uint32_t)nc >= q;
     for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
     for (int b = tid; b < kV2Win; b += kV2T) win[b] = 0;
+    if (tid == 0) s_e = -1;
     __syncthreads();
+    // fast path: one suffix scan of the fine histogram gives e, the window, the count above
+    // it and the window prefix P, so the band pick needs no further scan
+    bool pdone = false;
+    int ew = -1;
+    uint32_t wtot = 0;
     if (fast) {
       uint32_t bey = 0;
       for (int c = tid; c < nc; c += kV2T) {
@@ -548,36 +534,37 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       if ((tid & 31) == 0 && bey) atomicAdd(&s_beyond, bey);
       __syncthreads();
       V2DBG(12);
-      // thread t owns fine keys [8 (255 - t), + 8): suffix counts from the top
+      // thread t owns fine keys [4 (511 - t), + 4); Sx[b]: candidates with fine key >= b
+      // (beyond included); the row buffer is free until the round
+      uint32_t* Sx = reinterpret_cast<uint32_t*>(cslot);
       const int f0 = (kV2T - 1 - tid) * 4;
-      uint32_t v = 0;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) v += hist[f0 + i];
+      const uint4 h4 = *reinterpret_cast<const uint4*>(hist + f0);
+      const uint32_t hv[4] = {h4.x, h4.y, h4.z, h4.w};
       uint32_t tot;
-      const uint32_t ab = v2_scan(v, V2WS, &tot) + s_beyond;
-      if (tid == 0) s_e = -1;
-      __syncthreads();
-      if (ab < q && ab + v >= q) {
-        uint32_t run = ab;
-        for (int i = 3; i >= 0; --i) {
-          run += hist[f0 + i];
-          if (run >= q) { s_e = th + f0 + i; break; }
-        }
+      uint32_t run = v2_scan(h4.x + h4.y + h4.z + h4.w, V2WS, &tot) + s_beyond;
+#pragma unroll
+      for (int i = 3; i >= 0; --i) {
+        run += hv[i];
+        Sx[f0 + i] = run;
+        if (run >= q && run - hv[i] < q) s_e = th + f0 + i;
       }
+      if (tid == 0) Sx[kV2Fine] = s_beyond;
       __syncthreads();
       V2DBG(13);
       fast = s_e >= 0;
       if (fast) {
         const int e = s_e;
         const int lo = min(max(th, e - kV2Win / 2), th + kV2Fine - kV2Win);
-        // window counts and keys at or above lo + 256 (fine keys above it + beyond)
-        if (tid < kV2Win) win[tid] = hist[lo - th + tid];
-        uint32_t a = 0;
-        for (int u = lo - th + kV2Win + tid; u < kV2Fine; u += kV2T) a += hist[u];
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-        if (tid == 0) { s_above = s_beyond; s_lo = lo; }
-        __syncthreads();
-        if ((tid & 31) == 0 && a) atomicAdd(&s_above, a);
+        const int b0 = lo - th;
+        const uint32_t sa = Sx[b0 + kV2Win];
+        if (tid < kV2Win) {
+          win[tid] = hist[b0 + tid];
+          hist[kV2Fine + tid] = Sx[b0] - Sx[b0 + tid];  // P[u]: window keys below u
+        }
+        if (tid == 0) { s_above = sa; s_lo = lo; }
+        pdone = true;
+        ew = e - lo;
+        wtot = Sx[b0] - sa;
       }
     }
     if (!fast) {
@@ -634,19 +621,27 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
     const int lo = s_lo;
     // band around the exact local q-th key: [bl, bh] (window-relative), <= kV2Band keys
     {
-      const int u = kV2Win - 1 - tid;  // thread t < 256 <-> window key 255 - t
-      const uint32_t c = u >= 0 ? win[u] : 0u;
-      if (c > kCountMax) atomicOr(&s_sat, 1u);
+      int e;
       uint32_t tot;
-      const uint32_t ab = v2_scan(c, V2WS, &tot) + s_above;
-      if (tid == 0) { s_e = -1; s_bl = 1; s_bh = 0; s_n = 0; }
-      __syncthreads();
-      if (ab < q && ab + c >= q) s_e = u;
-      if (u >= 0) hist[kV2Fine + u] = tot - (ab - s_above) - c;  // P[u]: window keys below u
-      __syncthreads();
+      if (pdone) {  // e, P and the window total from the suffix scan
+        if (tid < kV2Win && win[tid] > kCountMax) atomicOr(&s_sat, 1u);
+        if (tid == 0) { s_bl = 1; s_bh = 0; s_n = 0; }
+        e = ew;
+        tot = wtot;
+      } else {
+        const int u = kV2Win - 1 - tid;  // thread t < 256 <-> window key 255 - t
+        const uint32_t c = u >= 0 ? win[u] : 0u;
+        if (c > kCountMax) atomicOr(&s_sat, 1u);
+        const uint32_t ab = v2_scan(c, V2WS, &tot) + s_above;
+        if (tid == 0) { s_e = -1; s_bl = 1; s_bh = 0; s_n = 0; }
+        __syncthreads();
+        if (ab < q && ab + c >= q) s_e = u;
+        if (u >= 0) hist[kV2Fine + u] = tot - (ab - s_above) - c;  // P[u]: window keys below u
+        __syncthreads();
+        e = s_e;
+      }
       // widest symmetric band around e with <= kV2Band keys: the test is monotone in the
       // half-width h, so the count of passing h in [0, 256) gives it (one barrier)
-      const int e = s_e;
       const bool bcand = e >= 0 && win[e] <= (uint32_t)kV2Band;
       const uint32_t* P = hist + kV2Fine;
       auto Pf = [&](int x) -> uint32_t { return x >= kV2Win ? tot : P[x]; };
@@ -714,8 +709,9 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       msg[6] = tagw(tag, 0u);
       msg[7] = tagw(tag, 0u);
     }
-    const int words = (kV2Fix + nb + 3) & ~3;
-    if (kV2Fix + nb + tid < words) msg[kV2Fix + nb + tid] = tagw(tag, 0u);
+    // the whole slot goes out (unused band words tagged), so one poll pass reads it
+    const int words = kV2Msg;
+    for (int j = kV2Fix + nb + tid; j < kV2Msg; j += kV2T) msg[j] = tagw(tag, 0u);
     __syncthreads();
     V2DBG(3);
     // ---- 4. round 1: send, then poll every rank's fixed part and band
@@ -744,15 +740,9 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
     // in the round's shadow: the KV slot of every (position-sorted) candidate
     if (fast && regp)
       for (int c = tid; c < nc; c += kV2T) cslot[c] = slot_of((int)cpos[c]);
-    for (int i = tid; i < W * (kV2Fix / 4); i += kV2T) {
-      const int r = i / (kV2Fix / 4), j = (i % (kV2Fix / 4)) * 4;
+    for (int i = tid; i < W * (kV2Msg / 4); i += kV2T) {
+      const int r = i / (kV2Msg / 4), j = (i % (kV2Msg / 4)) * 4;
       poll_words(p.box + r1row + (int64_t)r * kV2Msg + j, rx + r * kV2Msg + j, 31);
-    }
-    __syncthreads();
-    for (int i = tid; i < W * (kV2Band / 4); i += kV2T) {
-      const int r = i / (kV2Band / 4), j = kV2Fix + (i % (kV2Band / 4)) * 4;
-      const int nbr = (int)(rx[r * kV2Msg + 3] & 0xFFFFFFu);
-      if (j < kV2Fix + nbr) poll_words(p.box + r1row + (int64_t)r * kV2Msg + j, rx + r * kV2Msg + j, 32);
     }
     __syncthreads();
     V2DBG(4);
@@ -845,26 +835,27 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
         else if (band_ok) rt = 5;
         else rt = fit ? 2 : 3;
         if (rt == 5) {
-          // the need-th smallest global id over every rank's tie group (ids distinct,
-          // groups unsorted): thread i owns tie i (rank-major) and counts the ids below
-          // it; this rank's ties ranked below `need` are its quota (s_q, zeroed before
-          // the round)
-          for (int i = tid; i < tot_t; i += kV2T) {
-            int r = 0, j = i;
-            while (j >= s_tc[r]) { j -= s_tc[r]; ++r; }
-            const uint32_t x = rx[r * kV2Msg + kV2Fix + s_toff[r] + j] & 0xFFFFFFu;
-            int rk = 0;
-            for (int r2 = 0; r2 < W; ++r2) {
-              const uint32_t* g = rx + r2 * kV2Msg + kV2Fix + s_toff[r2];
-              for (int j2 = 0; j2 < s_tc[r2]; ++j2) rk += (g[j2] & 0xFFFFFFu) < x;
-            }
-            if (rk == need - 1) s_gs = (int)x;
-            if (r == p.rank && rk < need) atomicAdd(&s_q, 1);
+          // this rank's quota: its ties whose global id ranks below `need` among every
+          // rank's ties (ids distinct, groups unsorted). Item (i, r2): how many of rank r2's
+          // ties lie below this rank's tie i; only this rank's ties are ranked.
+          const int m = s_tc[p.rank];
+          int* rk = reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win);
+          if (tid < m) rk[tid] = 0;
+          __syncthreads();
+          const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
+          for (int it = tid; it < m * W; it += kV2T) {
+            const int i = it / W, r2 = it - i * W;
+            const uint32_t x = my[i] & 0xFFFFFFu;
+            const uint32_t* g = rx + r2 * kV2Msg + kV2Fix + s_toff[r2];
+            const int n2 = s_tc[r2];
+            int c = 0;
+#pragma unroll 4
+            for (int j = 0; j < n2; ++j) c += (g[j] & 0xFFFFFFu) < x;
+            if (c) atomicAdd(&rk[i], c);
           }
           __syncthreads();
-          if (tid == 0 && s_gs < 0) spin_fail(p.err, 33);
           rt = 1;
-          qv = -1;  // s_q holds it
+          qv = __syncthreads_count(tid < m && rk[tid] < need);
         }
       }
       if (tid == 0) {
