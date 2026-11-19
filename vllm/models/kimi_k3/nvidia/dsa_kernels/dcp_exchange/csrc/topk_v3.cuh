@@ -184,10 +184,11 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
   V3DBG(10);
   {
     // from the sample's suffix counts: theta, the bottom of the coarse bin where they reach
-    // the share of q + 256 keys (as topk_v2: the candidate count stays near q + 256 on
-    // dense rows), and the coarse bin of the q-th key's estimate e
+    // the share of 2q + 256 keys (the candidates hold every key >= tau unless the sample
+    // overestimates by > 2x: ~1 row in 400 failed in-step with topk_v2's q + 256, each a
+    // complete-body redo), and the coarse bin of the q-th key's estimate e
     const uint32_t want_e = max(1u, q / kV2SampleStride);
-    const uint32_t want_t = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+    const uint32_t want_t = (2u * q + 256u + kV2SampleStride - 1) / kV2SampleStride;
     const int bb = T - 1 - tid;
     uint32_t hv[kPB];
     uint32_t v = 0;
