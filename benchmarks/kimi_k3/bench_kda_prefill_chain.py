@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--row-stride", type=int, default=49376)
     ap.add_argument("--json", default="")
-    ap.add_argument("--impl", default="stock", choices=["stock", "split", "onorm"])
+    ap.add_argument("--impl", default="stock", choices=["stock", "split", "onorm", "tc", "fla", "frost"])
     args = ap.parse_args()
 
     import vllm._flashkda_C  # noqa: F401
@@ -151,7 +151,66 @@ def main():
         )
         o_norm_mxfp8(out, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
 
+    def step_tc():
+        q, k, v = kda_conv.qkv_conv(
+            mixed_qkv, conv_w, conv_state, cu, sidx, has_init, P
+        ).unbind(0)
+        q, k, v = (x.view(1, T, H, D) for x in (q, k, v))
+        torch.ops.k3_flashkda_split.fwd(
+            q,
+            k,
+            v,
+            g1,
+            beta,
+            D**-0.5,
+            out,
+            ws,
+            A_log,
+            dt_bias.view(H, D),
+            lower_bound,
+            init_state,
+            final_state,
+            cu,
+            None,
+            None,
+            3 | 32,
+        )
+        o_norm_mxfp8(out, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
+
+    def step_fla():
+        # vLLM's FLA chunk_kda (chunk 64, sub-chunk 16 intra, Triton): the
+        # chunk-64 recurrence as a measured reference for the chain latency.
+        from vllm.models.kimi_k3.nvidia.ops.third_party.kda.chunk import (
+            chunk_kda_with_fused_gate,
+        )
+
+        q, k, v = kda_conv.qkv_conv(
+            mixed_qkv, conv_w, conv_state, cu, sidx, has_init, P
+        ).unbind(0)
+        q, k, v = (x.view(1, T, H, D) for x in (q, k, v))
+        chunk_kda_with_fused_gate(
+            q, k, v, g1, beta.contiguous(), A_log, dt_bias, D**-0.5,
+            init_state, True, lower_bound, True, cu, out,
+        )
+        o_norm_mxfp8(out, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
+
+    def step_frost():
+        from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+        assert sp_kda.frost_supported(dev)
+        q, k, v = kda_conv.qkv_conv(
+            mixed_qkv, conv_w, conv_state, cu, sidx, has_init, P
+        ).unbind(0)
+        q, k, v = (x.view(1, T, H, D) for x in (q, k, v))
+        o, _ = sp_kda.frost_prefill(
+            q, k, v, g1, beta, A_log, dt_bias, lower_bound, init_state, cu
+        )
+        o_norm_mxfp8(o, proj[:, 3 * P : 4 * P], norm_w, 1e-6, mx)
+
     step = {
+        "frost": step_frost,
+        "fla": step_fla,
+        "tc": step_tc,
         "stock": step_stock,
         "split": step_split,
         "onorm": step_onorm,

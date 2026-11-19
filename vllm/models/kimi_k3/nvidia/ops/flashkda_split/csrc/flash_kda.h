@@ -28,3 +28,14 @@ void fwd(const torch::stable::Tensor& q, const torch::stable::Tensor& k,
 void o_norm_mxfp8(const torch::stable::Tensor& x, const torch::stable::Tensor& g,
                   const torch::stable::Tensor& weight, double eps,
                   const torch::stable::Tensor& q, const torch::stable::Tensor& sf);
+// Kimi-K3 (dev): chunk-64 tcgen05 KDA recurrence on prepared chunk-64 images
+// (smxx/k64_tc.cu); flags bit 0: clock stamps into dbg, bit 1: every chunk
+// reads chunk 0's images (compute-only timing).
+void k64_rec(const torch::stable::Tensor& kdq, const torch::stable::Tensor& kr, const torch::stable::Tensor& inv,
+             const torch::stable::Tensor& mqk, const torch::stable::Tensor& gt,
+             const torch::stable::Tensor& beta, const torch::stable::Tensor& v,
+             const torch::stable::Tensor& init_state,
+             const torch::stable::Tensor& final_state,
+             const torch::stable::Tensor& out,
+             const torch::stable::Tensor& cu_seqlens, int64_t flags,
+             const torch::stable::Tensor& dbg);

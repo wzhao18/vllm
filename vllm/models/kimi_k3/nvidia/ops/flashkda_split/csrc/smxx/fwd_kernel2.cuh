@@ -85,7 +85,8 @@ struct K2Layouts {
       prepend(FP32StateSmemLayout{}.layout_b())));
 };
 
-template <class Layouts, int InputStages, int OutputStages>
+template <class Layouts, int InputStages, int OutputStages,
+          bool ExactState = true>
 struct SharedStorageK2 {
   using BF16 = cutlass::bfloat16_t;
   using VOLayout = typename Layouts::VOLayout;
@@ -98,9 +99,10 @@ struct SharedStorageK2 {
   alignas(
       128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_acc;
   // Kimi-K3: low 16 bits of the fp32 state (ExactState I/O), state_acc then
-  // holds the high 16 bits.
-  alignas(
-      128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_lo;
+  // holds the high 16 bits. Without ExactState it is a stub, so the
+  // full-width K2 keeps FlashKDA's shared-memory footprint (two blocks per SM).
+  alignas(128) cute::ArrayEngine<
+      BF16, ExactState ? cute::cosize_v<StateSmemLayout> : 64> state_lo;
 
   struct InputStorage {
     alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<VOLayout>> v;
@@ -267,7 +269,8 @@ __global__ void __launch_bounds__(
         SeqlenT const* cu_seqlens, int total_tiles,
         cutlass::bfloat16_t const* ws_kd, cutlass::bfloat16_t const* ws_qd,
         cutlass::bfloat16_t const* ws_kr, float const* ws_gt,
-        cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk) {
+        cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk,
+        unsigned const* tile_flags) {
   using BF16 = cutlass::bfloat16_t;
   using StateT = std::conditional_t<StateFP32, float, BF16>;
   // Kimi-K3: fp32 state I/O without the bf16 staging (segment partials only).
@@ -296,7 +299,8 @@ __global__ void __launch_bounds__(
   using TMAVOLayout = typename Layouts::TMAVOLayout;
   using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
   using TMAStateSmemLayout = typename Layouts::TMAStateSmemLayout;
-  using SharedStorageT = SharedStorageK2<Layouts, InputStages, OutputStages>;
+  using SharedStorageT =
+      SharedStorageK2<Layouts, InputStages, OutputStages, kExactState>;
 
   // --- shared memory
   extern __shared__ __align__(128) unsigned char shared_mem[];
@@ -524,6 +528,7 @@ __global__ void __launch_bounds__(
           load_pipeline.producer_get_barrier(load_write);
       int stage = load_write.index();
       int ws_idx = head_idx * total_tiles + tile_base + t;
+      if (tile_flags != nullptr) k3_acquire_tile(tile_flags + ws_idx);
 
       // TMA load v
       if constexpr (!ZeroV) {
