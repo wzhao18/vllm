@@ -7,6 +7,7 @@ the hit alignment) inside the chunk."""
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import window_context_rows
 
@@ -66,3 +67,24 @@ def test_window_context_rows_f16k():
         _qsl([5461, 5461, 5462]), np.array([83821, 83821, 83822]), SPAN, None
     )
     assert rows.size == 3 * SPAN
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("n", [0, 1, 6156])
+def test_gather_aux_rows_matches_index_and_is_adjacent(n):
+    from vllm.models.kimi_k3.nvidia.dspark_mla import _aux_rows
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import gather_aux_rows
+
+    torch.manual_seed(n)
+    aux = [
+        torch.randn(16384, 7168 + 64, device="cuda").bfloat16()[:, :7168]
+        for _ in range(5)
+    ]
+    index = torch.randperm(16384, device="cuda")[:n].sort().values
+    kept = gather_aux_rows(aux, index)
+    for h, k in zip(aux, kept):
+        assert torch.equal(k, h[index])
+    if n:
+        packed = _aux_rows(kept, 0, n)
+        assert packed.data_ptr() == kept[0].data_ptr()
+        assert torch.equal(packed, torch.cat([h[index] for h in aux], dim=-1))
