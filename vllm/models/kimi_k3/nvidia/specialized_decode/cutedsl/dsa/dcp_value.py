@@ -332,6 +332,7 @@ class DcpValue:
                 self.mtiles = -(-batch // 128)
                 self.units = size * heads * self.mtiles
                 self.grid = (heads, max(1, sms // heads), 1)
+                self.merge_tiles = -(-tiles // self.grid[1])
                 return
             merge = min(tiles, max(1, (sms - size * heads) // heads))
             self.grid = (heads, size + merge, 1)
@@ -495,7 +496,7 @@ class DcpValue:
         DH: cutlass.Constexpr = D * H
         cap = box.shape[2]
         smem = cutlass.utils.SmemAllocator()
-        scales = alloc(smem, Float32, (16, D))
+        scales = alloc(smem, Float32, (16 * self.merge_tiles, D))
         ring = Uint32(smem.allocate_array(
             Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128, byte_alignment=1024
         ).toint())
@@ -627,8 +628,88 @@ class DcpValue:
             _tmem_free256(taddr)
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
-        for t in range(y, self.tiles, self.grid[1]):
-            self.merge_projected(args, scales, tid, t)
+        self.merge_rows(args, scales, tid, y)
+
+    @cute.jit
+    def merge_rows(self, args, scales, tid, y):
+        """merge_projected over every row of tiles y, y + grid[1], .. at once (one
+        LSE poll round, one value poll round per 512 row chunks instead of a
+        dependent chain per 16-row tile): slot r = 16 j + i is row 16 (y + j
+        grid[1]) + i. Same arithmetic: the source weights exp2(lse - max) times
+        the IEEE reciprocal of their butterfly sum, the FP32 merge in source order,
+        one BF16 rounding, the gate."""
+        lbox, gate, totals, output = args[4], args[9], args[10], args[11]
+        box = args[3]
+        D, B = self.size, self.batch
+        head, _, _ = cute.arch.block_idx()
+        R: cutlass.Constexpr = 16 * self.merge_tiles
+        step: cutlass.Constexpr = self.grid[1]
+        for i in range(tid, R * D, 512):  # LSE polls (re-armed as read)
+            r, s = i // D, i % D
+            t = (y + (r // 16) * step) * 16 + r % 16
+            lse = Float32(EMPTY_LSE)
+            if t < B:
+                source = at(lbox, s, head, t)
+                word = load_volatile(source)[0]
+                while word == Uint32(LSE_SENT):
+                    word = load_volatile(source)[0]
+                store_words(source, (Uint32(LSE_SENT),))
+                lse = bits_float(word)
+            scales[r, s] = lse
+        cute.arch.sync_threads()
+        if tid < R:
+            lses = [scales[tid, s] for s in range(D)]
+            top = lses[0]
+            for s in cutlass.range_constexpr(1, D):
+                top = max(top, lses[s])
+            top = max(top, Float32(EMPTY_LSE))  # (warp lanes past DCP)
+            weights = []
+            for s in cutlass.range_constexpr(D):
+                w = Float32(0)
+                if lses[s] > Float32(EMPTY_LSE):
+                    w = cute.math.exp2(lses[s] - top, fastmath=True)
+                weights.append(w)
+            sums = weights + [Float32(0)] * ((1 << (D - 1).bit_length()) - D)
+            for _ in cutlass.range_constexpr((len(sums) - 1).bit_length()):
+                # warp_sum's butterfly order (lane 0)
+                half = len(sums) // 2
+                sums = [sums[k] + sums[k + half] for k in range(half)]
+            total = sums[0]
+            inverse = Float32(0)
+            if total > 0:
+                inverse = div_rn(Float32(1), total)
+            for s in cutlass.range_constexpr(D):
+                scale = weights[s] * inverse
+                if lses[s] <= Float32(EMPTY_LSE):
+                    scale = Float32(-1)  # no value row: neither polled nor re-armed
+                scales[tid, s] = scale
+        cute.arch.sync_threads()
+        for i in range(tid, R * 16, 512):
+            r, chunk = i // 16, i % 16
+            t = (y + (r // 16) * step) * 16 + r % 16
+            if t < B:
+                merged = zeros(8, Float32)
+                swz = chunk ^ (t % 8)
+                sources = [at(box, s, head, t, 8 * swz) for s in range(D)]
+                loads = [load_volatile(source, count=4) for source in sources]
+                for k in cutlass.range_constexpr(D):
+                    w = scales[r, k]
+                    if w >= Float32(0):
+                        self.poll_pair(sources[k], loads[k], w, merged)
+                col = head * 128 + 8 * chunk
+                gates = load_words(at(gate, t, col), count=4, mutable=True)
+                words = []
+                for e in cutlass.range_constexpr(4):
+                    # Padded rows may hold a NaN gate; keep inactive rows zero.
+                    lo, hi = Float32(0), Float32(0)
+                    if totals[t // self.q] > 0:
+                        g = unpack_bf16(gates[e])
+                        lo, hi = (
+                            Float32(BFloat16(merged[2 * e + k])) * sigmoid(g[k], False)
+                            for k in range(2)
+                        )
+                    words.append(bf16x2(lo, hi))
+                store_words(at(output, t, col), tuple(words))
 
     @cute.jit
     def push_values(self, args, gh, tid):
