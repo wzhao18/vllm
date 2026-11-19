@@ -458,6 +458,11 @@ class RubinMoeConfig:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
             if not self.fc2_use_bulk:
                 raise ValueError("GenPhase requires fc2_use_bulk=True.")
+            if tiler[1] == 64 and self.world_size > 1 and mode == "phase_interleave":
+                raise ValueError(
+                    "GenPhase N64 with world_size > 1 requires grouped or decode "
+                    "scheduling; multirank phase_interleave is not qualified."
+                )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
                     f"GenPhase {self.quant_kind} requires tile K {2 * instruction_k}."

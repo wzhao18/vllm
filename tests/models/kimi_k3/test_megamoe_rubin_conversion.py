@@ -793,7 +793,7 @@ def test_cache_keys_and_layout_tag():
         max_tokens_per_rank=128,
     )
     base = S.compile_cache_key(cfg, "kname", "4.8.0", 0)
-    assert base == ("kname", "4.8.0", "nvfp4", 4.0, 25.0, 0, None)
+    assert base == ("kname", "4.8.0", "nvfp4", 4.0, 25.0, 0, None, "genphase", None)
     for change in (
         dict(die_sm_mask32=(1, 2)),
         dict(situ_beta=2.0),

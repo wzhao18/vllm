@@ -944,7 +944,10 @@ def test_wide_ep_decode_bucket_has_its_own_record(world):
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(2048))
     buckets, notes = X.select_rubin_buckets(problem, world, 2048, prefill_worker=False)
     assert [b.max_tokens for b in buckets] == [X.RUBIN_WIDE_EP_DECODE_TOKENS, 2048]
-    assert all(b.variant == "inference" for b in buckets)
+    # EP32: the decode bucket runs the refreshed GenPhase kernel (decode scheduler);
+    # EP28 keeps the inference kernel's N128 record.
+    decode_variant = "genphase" if world in X.RUBIN_GENPHASE_DECODE_EP_SIZES else "inference"
+    assert [b.variant for b in buckets] == [decode_variant, "inference"]
     assert tuple(buckets[0].knobs.mma_tiler_mnk)[1] == 128
     assert any("its own record" in n for n in notes)
     prefill, _ = X.select_rubin_buckets(problem, world, 2048, prefill_worker=True)
@@ -962,6 +965,7 @@ def test_knob_world_size_emulates_wide_ep_on_a_slice():
     )
     assert emulated == ep32
     assert emulated[0].max_tokens == X.RUBIN_WIDE_EP_DECODE_TOKENS
-    assert tuple(emulated[0].knobs.schedule_policy)[0] == "phase_interleave"
+    assert emulated[0].variant == "genphase"
+    assert tuple(emulated[0].knobs.schedule_policy)[0] == "decode"
     native, _ = X.select_rubin_buckets(problem, 4, 2048, prefill_worker=False)
     assert native != ep32
