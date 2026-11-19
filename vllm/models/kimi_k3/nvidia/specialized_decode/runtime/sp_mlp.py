@@ -288,10 +288,12 @@ class SpMlp:
             )
 
             def experts(shared=None):
-                return mlp.experts(
-                    routed, router_output, topk_ids, output_rmsnorm=fused_norm,
-                    **({} if shared is None else {"fused_shared": shared}),
-                )  # fmt: skip
+                kwargs = {}
+                if fused_norm is not None:  # backends without the fused norm take no kwarg
+                    kwargs["output_rmsnorm"] = fused_norm
+                if shared is not None:
+                    kwargs["fused_shared"] = shared
+                return mlp.experts(routed, router_output, topk_ids, **kwargs)
 
         if self.fused_shared is not None and mlp.experts.fused_shared(n):
             if not prequantized:
