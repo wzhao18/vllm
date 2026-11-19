@@ -183,6 +183,73 @@ def perf(args):
     return res
 
 
+def lane_counts(cand, t):
+    return cand.view(-1, pidx.SLOTS + 1, pidx.TILE)[:t, 0, :].sum(1)
+
+
+def sel_plan(d):
+    return pidx.SelectivePlan([r for r, _ in d["reqs"]], [kv for _, kv in d["reqs"]],
+                              d["bases"], "cuda")
+
+
+def run_sel(d, sp):
+    return pidx.selective_topk(sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"],
+                               d["out"])
+
+
+def check_sel(reqs, zero=None, seed=1):
+    """Selective path vs the exact top-k of the stock (DeepGEMM) logits, ties to
+    the lowest key index; flagged rows (recomputed by the full path) counted."""
+    d = make(reqs, seed=seed, zero_rows=zero)
+    sp = sel_plan(d)
+    row_bin, cand = run_sel(d, sp)
+    torch.cuda.synchronize()
+    flag = row_bin[1:3 * sp.t:3]
+    cnt = lane_counts(cand, sp.t)
+    res = {"rows": sp.t, "flagged": int((flag != 0).sum()), "bad_rows": 0,
+           "cand_mean": float(cnt.float().mean()), "cand_max": int(cnt.max())}
+    t0 = 0
+    for r, (rows, kv) in enumerate(reqs):
+        sl = order16(stock_logits(d, r).view(torch.int16)).to(torch.int64)
+        for c in range(0, rows, 256):
+            n = min(256, rows - c)
+            ke = kv - rows + 1 + c + torch.arange(n, device="cuda")
+            idx = torch.arange(kv, device="cuda")
+            comp = torch.where(idx[None, :] < ke[:, None],
+                               sl[c:c + n] * (1 << 20) + ((1 << 20) - 1 - idx), -1)
+            kk = min(2048, kv)
+            tv = torch.topk(comp, kk, dim=1)
+            ref = torch.sort(torch.where(tv.values >= 0, tv.indices, 1 << 40),
+                             dim=1).values
+            got = d["out"][t0 + c:t0 + c + n].to(torch.int64)
+            got = torch.sort(torch.where(got >= 0, got, 1 << 40), dim=1).values[:, :kk]
+            ok = (got == ref).all(1) | (flag[t0 + c:t0 + c + n] != 0)
+            res["bad_rows"] += int((~ok).sum())
+        t0 += rows
+    print("check_sel", json.dumps(res), flush=True)
+    return res
+
+
+def perf_sel(args):
+    d = make([(5461, 78360), (5461, 78360), (5462, 78360)], seed=0)
+    sp = sel_plan(d)
+    res = {"total": timed(lambda: run_sel(d, sp), args.iters)}
+    row_bin, cand = run_sel(d, sp)
+    torch.cuda.synchronize()
+    res["flagged"] = int((row_bin[1:3 * sp.t:3] != 0).sum())
+    res["cand_mean"] = float(lane_counts(cand, sp.t).float().mean())
+    rb0 = row_bin.clone()
+    res["publish"] = timed(lambda: pidx.score(
+        d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
+        sp.cand_base, cand.view(torch.bfloat16), rb0, mode=pidx.PUBLISH), args.iters)
+    k3 = pidx._cand_select_kernel(2048)
+    st = torch.cuda.current_stream().cuda_stream
+    res["cand_select"] = timed(lambda: k3(cand, sp.row_len, rb0, d["out"].view(-1), st),
+                               args.iters)
+    print("perf_sel", json.dumps(res), flush=True)
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
@@ -194,10 +261,14 @@ def main():
     ap.add_argument("--unrolls", type=int, nargs="+", default=[8])
     ap.add_argument("--smodes", type=int, nargs="+", default=[0])
     ap.add_argument("--json", default="")
+    ap.add_argument("--sel", action="store_true")
     a = ap.parse_args()
     out = {}
     if a.check:
         out["check"] = check(a)
+    if a.sel:
+        out["check_sel"] = [check_sel([(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000), (3, 140000)], zero=list(range(337, 346))), check_sel([(700, 78360)], seed=3)]
+        out["perf_sel"] = perf_sel(a)
     if a.perf:
         out["perf"] = perf(a)
     if a.json:

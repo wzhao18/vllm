@@ -277,6 +277,22 @@ def order16(bits: Uint32) -> Uint32:
     return b ^ flip
 
 
+PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
+SLOTS = 64  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
+REGION = (SLOTS + 1) * TILE  # words per row: lane counts, then SLOTS words per lane
+CAP = SLOTS * TILE
+
+
+@asm(Uint32, pure=True)
+def ge_bf16x2(r, thr):
+    """bit 0: low BF16 of r >= low of thr, bit 1: high halves (NaN: false)."""
+    code = (
+        "{ .reg .pred p, q; .reg .u32 a, b; setp.ge.bf16x2 p|q, $1, $2; "
+        "selp.u32 a, 1, 0, p; selp.u32 b, 2, 0, q; or.b32 $0, a, b; }"
+    )
+    return code, "=r,r,r", (Uint32(r), Uint32(thr))
+
+
 @cute.jit
 def wg_sync(wg):
     cute.arch.barrier(barrier_id=2 + wg, number_of_threads=128)
@@ -744,6 +760,18 @@ class IndexerScore:
             first = Int64((ntp - 1) * TILE + lt) * 2
             ptr0 = out_a + row_base[row0] * 2 + first
             ptr1 = out_a + row_base[row1] * 2 + first
+            if cutlass.const_expr(self.mode == PUBLISH):
+                # BF16 thresholds of both rows (row_bin[3 r], the dummy row's is NaN)
+                # and their candidate lists (row_base in 16-bit units)
+                thr = (Uint32(row_bin[3 * row1]) << Uint32(16)) | (
+                    Uint32(row_bin[3 * row0]) & Uint32(0xFFFF)
+                )
+                # this thread's column of each row's candidate region: word 0
+                # the count, then one word per kept key (tile << 16 | BF16)
+                cand0 = out_a + row_base[row0] * 2 + lt * 4
+                cand1 = out_a + row_base[row1] * 2 + lt * 4
+                c0 = Uint32(0)
+                c1 = Uint32(0)
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
             # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
@@ -772,7 +800,25 @@ class IndexerScore:
                     if lane == 0:
                         cute.arch.mbarrier_arrive(acc_empty + st)
                     r = self.reduce2((fa, fb), w[0], w[1])
-                    if t_hi >= full_tiles:
+                    if cutlass.const_expr(self.mode == PUBLISH):
+                        kidx = t * TILE + key_in_tile
+                        if t_hi >= full_tiles:
+                            # causal edge, and the repeated tile of an odd count
+                            if kidx >= end0 or t >= ntiles:
+                                r = r | Uint32(0xFFFF)
+                            if kidx >= end1 or t >= ntiles:
+                                r = r | Uint32(0xFFFF0000)
+                        m = ge_bf16x2(r, thr)
+                        tw = Uint32(t) << Uint32(16)
+                        if (m & Uint32(1)) != Uint32(0):
+                            if c0 < Uint32(SLOTS):
+                                st_global_u32(cand0 + Int64(c0 + 1) * (TILE * 4), tw | (r & Uint32(0xFFFF)))
+                            c0 += Uint32(1)
+                        if (m & Uint32(2)) != Uint32(0):
+                            if c1 < Uint32(SLOTS):
+                                st_global_u32(cand1 + Int64(c1 + 1) * (TILE * 4), tw | (r >> Uint32(16)))
+                            c1 += Uint32(1)
+                    elif t_hi >= full_tiles:
                         # causal edge (and the repeated tile of an odd count)
                         kidx = t * TILE + key_in_tile
                         if kidx >= end0:
@@ -785,20 +831,26 @@ class IndexerScore:
                     else:
                         st_global_u16_off(ptr0, r, -st * TILE * 2)
                         st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
-                    # histogram of the raw top 11 bits (masked keys land in bin 2047,
-                    # the lowest rank)
-                    red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
-                    red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
+                    if cutlass.const_expr(self.mode != PUBLISH):
+                        # histogram of the raw top 11 bits (masked keys land in bin
+                        # 2047, the lowest rank)
+                        red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
+                        red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
                 ptr0 = ptr0 - 2 * TILE * 2
                 ptr1 = ptr1 - 2 * TILE * 2
                 ph = ph ^ 1
-            # per row: bound bin rank and the count above it, then clear
-            wg_sync(wg)
-            self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-            self.row_bound(hist1, end1, row1, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
-            for i in cutlass.range_constexpr(2 * S_BINS // 128):
-                st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
-            wg_sync(wg)
+            if cutlass.const_expr(self.mode == PUBLISH):
+                # this thread's candidate counts of both rows
+                st_global_u32(cand0, c0)
+                st_global_u32(cand1, c1)
+            else:
+                # per row: bound bin rank and the count above it, then clear
+                wg_sync(wg)
+                self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
+                self.row_bound(hist1, end1, row1, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
+                for i in cutlass.range_constexpr(2 * S_BINS // 128):
+                    st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
+                wg_sync(wg)
             jq += 1
 
     @cute.jit
@@ -1385,6 +1437,338 @@ class PrefillFinish:
 # --------------------------------------------------------------------------
 # Host side
 # --------------------------------------------------------------------------
+CS_THREADS = 256
+
+
+@cute.jit
+def _top_bin(hist_a, need, lane, info_a):
+    """Warp 0: the highest bin b of a 256-bin histogram with count(bins >= b) >=
+    need; info = (b, count above b, count of b)."""
+    s = Uint32(0)
+    for j in cutlass.range_constexpr(8):
+        s += ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4)
+    incl = warp_inclusive(s, lane)
+    hit = ballot(incl >= need)
+    first = Int32(popc((hit & (Uint32(0) - hit)) - Uint32(1)))
+    if lane == first:
+        run = incl - s
+        found = Int32(0)
+        for j in cutlass.range_constexpr(8):
+            c = ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4)
+            if found == 0 and run + c >= need:
+                st_shared_u32(info_a, Uint32(255 - 8 * lane - j))
+                st_shared_u32(info_a + 4, run)
+                st_shared_u32(info_a + 8, c)
+                found = Int32(1)
+            run += c
+
+
+class CandSelect:
+    """Exact top-k of each row from its PUBLISH candidates (one CTA per row). The
+    row's region holds, per key lane j (0..127, key 4 (j % 32) + j // 32 of a
+    tile), its count and then SLOTS words (tile << 16 | BF16). Two 8-bit radix
+    passes over the order-preserving 16-bit keys find the k-th value t; keys
+    above t are emitted, ties at t by lowest key index. Rows whose candidates are
+    fewer than min(k, row length) or overflowed a lane are flagged in
+    row_bin[3 r + 1] (recomputed by the caller). Output order is unspecified."""
+
+    def __init__(self, topk: int):
+        self.topk = topk
+
+    @cute.jit
+    def __call__(self, cand, row_len, row_bin, out, s):
+        self.kernel(cand, row_len, row_bin, out).launch(
+            grid=(row_len.shape[0], 1, 1), block=(CS_THREADS, 1, 1), stream=s,
+            use_pdl=True,
+        )
+
+    @cute.jit
+    def entry(self, cand, base, cnt_a, idx):
+        """(valid, key index, order16 key) of candidate idx = slot * TILE + lane."""
+        j = idx % TILE
+        s = idx // TILE
+        ok = Int32(0)
+        pos = Int32(0)
+        key = Uint32(0)
+        if Uint32(s) < ld_shared_u32(cnt_a + j * 4):
+            wd = Uint32(cand[base + (s + 1) * TILE + j])
+            ok = Int32(1)
+            pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
+            key = order16(wd & Uint32(0xFFFF))
+        return ok, pos, key
+
+    @cute.kernel
+    def kernel(self, cand, row_len, row_bin, out):
+        K = self.topk
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        w = cute.arch.make_warp_uniform(tid // 32)
+        lane = tid % 32
+        smem = utils.SmemAllocator()
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(256 + 8 + TILE), 16)
+        hist_a = hist.iterator.toint()
+        # b, above, count of b, out slot, tie slot, total, overflow
+        info_a = hist_a + 256 * 4
+        cnt_a = info_a + 8 * 4
+        ties = smem.allocate_tensor(Int32, cute.make_layout(CAP), 16)
+        ties_a = ties.iterator.toint()
+        cute.arch.griddepcontrol_wait()
+        n = row_len[row]
+        kk = cutlass.min(n, Int32(K))
+        base = Int64(row) * REGION
+        orow = Int64(row) * K
+        for i in cutlass.range_constexpr((256 + 8) // CS_THREADS + 1):
+            if i * CS_THREADS + tid < 256 + 8:
+                st_shared_u32(hist_a + (i * CS_THREADS + tid) * 4, Uint32(0))
+        cute.arch.sync_threads()
+        if tid < TILE:
+            c = Uint32(cand[base + tid])
+            if c > Uint32(SLOTS):
+                st_shared_u32(info_a + 24, Uint32(1))
+                c = Uint32(SLOTS)
+            st_shared_u32(cnt_a + tid * 4, c)
+            red_shared(info_a + 20, c)
+        cute.arch.sync_threads()
+        total = Int32(ld_shared_u32(info_a + 20))
+        bad = Int32(ld_shared_u32(info_a + 24))
+        if total < kk:
+            bad = Int32(1)
+        if tid == 0:
+            row_bin[3 * row + 1] = bad
+        if bad == 0:
+            if total <= Int32(K):
+                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
+                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
+                    if ok != 0:
+                        slot = atom_add_shared(info_a + 12, Uint32(1))
+                        out[orow + Int32(slot)] = pos
+                for i in cutlass.range(total + tid, K, CS_THREADS, unroll=1):
+                    out[orow + i] = Int32(-1)
+            else:
+                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
+                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
+                    if ok != 0:
+                        red_shared(hist_a + ((key >> Uint32(8)) << Uint32(2)), 1)
+                cute.arch.sync_threads()
+                if w == 0:
+                    _top_bin(hist_a, Uint32(K), lane, info_a)
+                cute.arch.sync_threads()
+                b1 = ld_shared_u32(info_a)
+                above1 = ld_shared_u32(info_a + 4)
+                cute.arch.sync_threads()
+                st_shared_u32(hist_a + tid * 4, Uint32(0))
+                cute.arch.sync_threads()
+                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
+                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
+                    if ok != 0:
+                        if (key >> Uint32(8)) == b1:
+                            red_shared(hist_a + ((key & Uint32(0xFF)) << Uint32(2)), 1)
+                cute.arch.sync_threads()
+                if w == 0:
+                    _top_bin(hist_a, Uint32(K) - above1, lane, info_a)
+                cute.arch.sync_threads()
+                t = (b1 << Uint32(8)) | ld_shared_u32(info_a)
+                above = above1 + ld_shared_u32(info_a + 4)
+                m = ld_shared_u32(info_a + 8)
+                need = Uint32(K) - above
+                for idx in cutlass.range(tid, CAP, CS_THREADS, unroll=2):
+                    ok, pos, key = self.entry(cand, base, cnt_a, idx)
+                    if ok != 0:
+                        if key > t:
+                            slot = atom_add_shared(info_a + 12, Uint32(1))
+                            out[orow + Int32(slot)] = pos
+                        elif key == t:
+                            if m == need:
+                                slot = atom_add_shared(info_a + 12, Uint32(1))
+                                out[orow + Int32(slot)] = pos
+                            else:
+                                j = atom_add_shared(info_a + 16, Uint32(1))
+                                st_shared_u32(ties_a + j * 4, Uint32(pos))
+                cute.arch.sync_threads()
+                if m != need:
+                    for j in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
+                        p = ld_shared_u32(ties_a + j * 4)
+                        rank = Uint32(0)
+                        for x in cutlass.range(Int32(m), unroll=4):
+                            if ld_shared_u32(ties_a + x * 4) < p:
+                                rank += Uint32(1)
+                        if rank < need:
+                            out[orow + Int32(above + rank)] = Int32(p)
+
+
+@functools.cache
+def _cand_select_kernel(topk):
+    from cutlass.cute.runtime import make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
+
+    t = cute.sym_int()
+    args = (
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((t,), dtype=cutlass.Int32),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        make_fake_stream(),
+    )
+    return cute.compile(CandSelect(topk), *args, options="--enable-tvm-ffi")
+
+
+SAMPLES = 1024  # keys per request sampled for the PUBLISH thresholds
+MARGIN = 2.0  # expected candidates per row = MARGIN * topk
+
+
+TS_THREADS = 128
+
+
+class ThrSelect:
+    """PUBLISH threshold of each row (one CTA per row): the BF16 value of rank
+    rank[r] (0 = largest) among the row's SAMPLES sampled logits, by two 8-bit
+    radix passes; rank -1 keeps every key (-inf). Also clears the row's flag."""
+
+    @cute.jit
+    def __call__(self, s_logits, rank, row_bin, s):
+        self.kernel(s_logits, rank, row_bin).launch(
+            grid=(rank.shape[0], 1, 1), block=(TS_THREADS, 1, 1), stream=s,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(self, s_logits, rank, row_bin):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        w = cute.arch.make_warp_uniform(tid // 32)
+        lane = tid % 32
+        smem = utils.SmemAllocator()
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(256 + 8), 16)
+        hist_a = hist.iterator.toint()
+        info_a = hist_a + 256 * 4
+        cute.arch.griddepcontrol_wait()
+        rk = rank[row]
+        if rk < 0:
+            if tid == 0:
+                row_bin[3 * row] = Int32(0xFF80)
+                row_bin[3 * row + 1] = Int32(0)
+        else:
+            per = SAMPLES // TS_THREADS
+            keys = []
+            for i in cutlass.range_constexpr(per):
+                v = Uint32(s_logits[Int64(row) * SAMPLES + i * TS_THREADS + tid])
+                keys.append(order16(v & Uint32(0xFFFF)))
+            for i in cutlass.range_constexpr(2):
+                st_shared_u32(hist_a + (i * TS_THREADS + tid) * 4, Uint32(0))
+            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(per):
+                red_shared(hist_a + ((keys[i] >> Uint32(8)) << Uint32(2)), 1)
+            cute.arch.sync_threads()
+            need = Uint32(rk + 1)
+            if w == 0:
+                _top_bin(hist_a, need, lane, info_a)
+            cute.arch.sync_threads()
+            b1 = ld_shared_u32(info_a)
+            above1 = ld_shared_u32(info_a + 4)
+            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(2):
+                st_shared_u32(hist_a + (i * TS_THREADS + tid) * 4, Uint32(0))
+            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(per):
+                if (keys[i] >> Uint32(8)) == b1:
+                    red_shared(hist_a + ((keys[i] & Uint32(0xFF)) << Uint32(2)), 1)
+            cute.arch.sync_threads()
+            if w == 0:
+                _top_bin(hist_a, need - above1, lane, info_a)
+            cute.arch.sync_threads()
+            if tid == 0:
+                t = (b1 << Uint32(8)) | ld_shared_u32(info_a)
+                flip = Uint32(0xFFFF)
+                if (t & Uint32(0x8000)) != Uint32(0):
+                    flip = Uint32(0x8000)
+                row_bin[3 * row] = Int32(t ^ flip)
+                row_bin[3 * row + 1] = Int32(0)
+
+
+@functools.cache
+def _thr_select_kernel():
+    from cutlass.cute.runtime import make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
+
+    args = (
+        fake((cute.sym_int(),), dtype=cutlass.Int16),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        fake((cute.sym_int(),), dtype=cutlass.Int32),
+        make_fake_stream(),
+    )
+    return cute.compile(ThrSelect(), *args, options="--enable-tvm-ffi")
+
+
+class SelectivePlan:
+    """Per-step layout of the selective path (sampled thresholds -> PUBLISH ->
+    CandSelect) for requests r with ``row_counts[r]`` rows whose last row sees
+    ``row_lens_last[r]`` keys starting at ``key_bases[r]`` (128-aligned)."""
+
+    def __init__(self, row_counts, row_lens_last, key_bases, device, topk=2048):
+        self.topk = topk
+        self.items, self.row_len, _, _ = plan(row_counts, row_lens_last, key_bases, device)
+        t = sum(row_counts)
+        self.t = t
+        # candidate regions: row r at r * REGION words (int16 units here), dummy row t
+        self.cand_base = torch.arange(t + 1, dtype=torch.int64, device=device) * (REGION * 2)
+        # sampled keys of each request, all of a request's rows see all of them
+        sidx, s_items, rank = [], [], []
+        token = 0
+        for r, (rows, last, kb) in enumerate(zip(row_counts, row_lens_last, key_bases)):
+            first = last - rows + 1
+            lens = torch.arange(first, last + 1)
+            span = max(first, CAP + 1)
+            if last > CAP:
+                pos = ((torch.arange(SAMPLES) + 0.5) * span / SAMPLES).long()
+                sidx.append(kb + pos)
+                need = int(MARGIN * topk * SAMPLES / span + 0.999)
+                rk = torch.full((rows,), min(max(need, 1), SAMPLES) - 1)
+            else:
+                sidx.append(torch.full((SAMPLES,), kb))
+                rk = torch.zeros(rows, dtype=torch.int64)
+            # rows that see at most CAP keys keep every key (rank -1: -inf)
+            rank.append(torch.where(lens <= CAP, -1, rk))
+            sb = r * SAMPLES
+            for o in range(0, rows, BQ):
+                s_items.append((token + o, min(BQ, rows - o), sb, SAMPLES // TILE))
+            token += rows
+        self.sample_idx = torch.cat(sidx).to(device)
+        self.s_items = torch.tensor(s_items, dtype=torch.int32, device=device).view(-1, 4)
+        self.s_row_len = torch.full((t,), SAMPLES, dtype=torch.int32, device=device)
+        self.s_row_base = torch.arange(t + 1, dtype=torch.int64, device=device) * SAMPLES
+        self.rank = torch.cat(rank).to(torch.int32).to(device)
+        # per row: threshold, flag, -; the dummy row t keeps nothing (NaN)
+        self.row_bin = torch.zeros(3 * (t + 1), dtype=torch.int32, device=device)
+        self.row_bin[3 * t] = 0x7FC0
+        self.s_bin = torch.zeros(3 * (t + 1), dtype=torch.int32, device=device)
+
+
+def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None):
+    """Exact top-k of every row of ``sp`` into ``out`` (Int32 [T, topk], unordered,
+    -1 padded). Returns the number of rows recomputed by the full path."""
+    dev = q.device
+    t = sp.t
+    # 1) thresholds: score the sampled keys, the rank-th largest per row
+    sk = keys[sp.sample_idx].contiguous()
+    ssf = key_scale.reshape(-1)[sp.sample_idx].contiguous()
+    s_logits = torch.empty((t + 1) * SAMPLES, dtype=torch.bfloat16, device=dev)
+    stream = torch.cuda.current_stream(dev).cuda_stream
+    score(q, q_scale, sk, ssf, weights_bf16, sp.s_row_len, sp.s_items, sp.s_row_base,
+          s_logits, sp.s_bin, ctas=ctas)
+    _thr_select_kernel()(s_logits.view(torch.int16), sp.rank, sp.row_bin, stream)
+    # 2) scores, keeping the keys at or above the threshold
+    cand = torch.empty((t + 1) * REGION, dtype=torch.int32, device=dev)
+    score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items, sp.cand_base,
+          cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=PUBLISH)
+    # 3) exact top-k from the candidates
+    _cand_select_kernel(out.shape[1])(
+        cand, sp.row_len, sp.row_bin, out.view(-1), stream
+    )
+    return sp.row_bin, cand
+
+
 def plan(row_counts, row_lens_last, key_bases, device):
     """Work items and the logits scratch layout of the step's prefill requests.
 
