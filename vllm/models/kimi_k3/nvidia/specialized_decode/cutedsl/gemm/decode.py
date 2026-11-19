@@ -50,9 +50,6 @@ from .warp_splitk import (
     smem_limits,
 )
 
-# Families whose GEMM is stock's beta-add (``residual.addmm_``): the ltpin plan is the
-# in-place beta = 1 GEMM.
-BETA_FAMILIES = frozenset({"latent_up"})
 WARP_ROWS = 16  # warp split-K up to here
 SPLIT_K_ROWS = 64  # cluster split-K up to here; cuBLAS past it
 
@@ -62,13 +59,9 @@ ProjectionTactic = tuple[str, Any]
 # "cublas": torch.mm, the stock linear's GEMM; "lt": the same torch.mm with torch's
 # cuBLASLt preference (``blas_library``), whose heuristic picks another nvjet kernel at
 # some SP shapes (no split-K reduce launch there). Both sum K in FP32 and round once.
-# "ltpin": cuBLASLt on the algorithm pinned per (weight shape, rows) (``ltpin``).
-KINDS = ("warp", "split_k", "cublas", "lt", "ltpin")
+KINDS = ("warp", "split_k", "cublas", "lt")
 # The torch matmul kinds (no compiled code; ``check_operands`` needs no alignment).
 TORCH_KINDS = ("cublas", "lt")
-# The library kinds: no CuTe code, any packed operands (ltpin: 16 B aligned), the
-# beta-add residual epilogue.
-LIB_KINDS = TORCH_KINDS + ("ltpin",)
 
 
 @contextlib.contextmanager
@@ -192,16 +185,7 @@ class DecodeProjection:
         # Compiled before capture; codes are shared by (N, K, tactic) across layers.
         self.warp = PreparedWarpSplitK(weight, warp) if warp else None
         self.split = PreparedProjection(weight, split).prepare() if split else None
-        pinned = [r for r, kind in self.kinds.items() if kind == "ltpin"]
-        self.ltpin = None
-        if pinned:
-            from .ltpin import LtPin
-
-            self.ltpin = LtPin(
-                family, n, k, pinned, beta=family in BETA_FAMILIES,
-                device=weight.device,
-            )  # fmt: skip
-        prepared = {"warp": self.warp, "split_k": self.split, "ltpin": self}
+        prepared = {"warp": self.warp, "split_k": self.split}
         prepared |= dict.fromkeys(TORCH_KINDS, self)
         self.engines = {r: prepared[kind] for r, kind in self.kinds.items()}
 
@@ -252,7 +236,7 @@ class DecodeProjection:
         if rows not in self.kinds and rows < self.rows[-1]:
             problems.append(f"{rows} rows: neither prepared nor >= {self.rows[-1]}")
         kinds = set(self.kinds.values())
-        align = 32 if "warp" in kinds else 16 if kinds & {"split_k", "ltpin"} else 0
+        align = 32 if "warp" in kinds else 16 if "split_k" in kinds else 0  # torch: 0
         for name, t in (("x", x), ("out", out)):
             if align and t.data_ptr() % align:
                 problems.append(f"{name} at 0x{t.data_ptr():x}: {align} B aligned")
@@ -279,19 +263,7 @@ class DecodeProjection:
         if engine is None:
             raise Unsupported(self.family, rows, f"not prepared ({self.prepared()})")
         if engine is self:
-            kind = self.kinds[rows]
-            if kind == "ltpin":
-                if (residual is not None) != self.ltpin.beta:
-                    raise Unsupported(
-                        self.family, rows, "ltpin: prepared with beta-add "
-                        f"{self.ltpin.beta}, called with residual {residual is not None}",
-                    )  # fmt: skip
-                if residual is not None:
-                    return self.ltpin.run(self.weight, x, residual)
-                if out is None:
-                    out = x.new_empty((rows, self.weight.shape[0]))
-                return self.ltpin.run(self.weight, x, out)
-            library = "cublaslt" if kind == "lt" else None
+            library = "cublaslt" if self.kinds[rows] == "lt" else None
             return self.cublas(x, out, library, residual)
         if residual is not None:
             raise Unsupported(

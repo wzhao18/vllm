@@ -67,7 +67,7 @@ from ..common.primitives import (
     thread,
 )
 from ..common.sp_comm import SpComm, positive_zero32
-from ..gemm.decode import LIB_KINDS, DecodeProjection
+from ..gemm.decode import TORCH_KINDS, DecodeProjection
 from ..gemm.mxfp8 import Mxfp8Projection
 from ..gemm.sp_policy import SP_TP, sp_projection_tactics
 
@@ -262,7 +262,7 @@ class SpOproj:
                 tactics = sp_projection_tactics("o_proj", WIDTH, k, gemm_rows, ctx)
             else:  # (the table is TP4's: stock's GEMM, its bits, at other TPs)
                 tactics = dict.fromkeys(gemm_rows, ("cublas", None))
-            bad = {r: t for r, t in tactics.items() if t[0] not in LIB_KINDS}
+            bad = {r: t for r, t in tactics.items() if t[0] not in TORCH_KINDS}
             if bad:  # (the partial slots' alignment is the torch kinds' only)
                 raise Unsupported(
                     "oproj_rs", min(bad), f"partial GEMM tactics {bad} (torch kinds)"

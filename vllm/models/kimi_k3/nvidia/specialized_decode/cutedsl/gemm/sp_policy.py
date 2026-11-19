@@ -38,8 +38,8 @@ import torch
 
 from ...shapes import Context, Shape, Unsupported, rows_policy
 from .decode import (
-    LIB_KINDS,
     SPLIT_K_ROWS,
+    TORCH_KINDS,
     WARP_ROWS,
     ProjectionTactic,
     split_k_problem,
@@ -110,31 +110,18 @@ GENERIC_SPLIT = {"*": f"{WARP_ROWS + 1}-32:64.32.2.8,33-{SPLIT_K_ROWS}:64.64.2.6
 #   shared_down n4 11.1 -> 9.4 / n8 11.2 -> 9.4 (64.8.1.12), n16 11.5 -> 9.5
 #            (64.16.1.11), n32 12.3 -> 9.8 (64.32.1.9), n50 13.3 -> 10.9 / n64 13.5
 #            -> 11.0 (64.64.1.7), n80 11.5 / n96 11.3 cublas
-# ltpin (GEMMLIB/cublaslt p1, 2026-11-19: cuBLASLt 13.8 pinned algorithm, cold us per
-# call vs the heuristic default) at R128 / R256 / R384 or n32 / n64 / n96, each band
-# +-12.5% around a measured point (latent_up: n25-104 on the nearest pin):
-#   dsa_in   R128 10.09 vs 10.34 (R256 keeps lt, R384 cuBLAS)
-#   q_b      3.62 / 3.95 / 4.80 vs 3.76 / 4.24 / 5.26
-#   wq_b     3.51 / 3.86 / 4.31 vs 3.80 / 4.40 / 4.37
-#   o_proj   6.16 / 7.89 / 9.11 vs 7.30 / 9.28 / 9.50
-#   latent_down n96 9.22 vs 9.55 (n32 / n64 keep split-K)
-#   latent_up (beta-add in place) 6.28 / 6.36 / 6.79 vs 7.37 / 10.00 / 7.73
 # Bands split midway between measured points; rows past the last band keep the
 # family's GENERIC rule. ``TUNED_WARP`` is empty: "warp" rows take ``warp_tactic``
 # (the tactic measured). Every kind sums K in FP32 and rounds once to BF16.
 TUNED_KIND: dict[tuple[int, int], dict] = {
     (12448, 7168): {"*": "1-16:cublas,17-164:lt,165-228:lt,229-288:cublas,"
                          "289-352:lt,353-:cublas"},
-    (5344, 7168): {"*": "65-112:cublas,113-144:ltpin,145-164:cublas,165-352:lt,"
+    (5344, 7168): {"*": "65-164:cublas,165-352:lt,353-:cublas"},
+    (4096, 1536): {"*": "1-64:split_k,65-228:lt,229-288:cublas,289-352:lt,"
                         "353-:cublas"},
-    (4608, 1536): {"*": "113-144:ltpin,225-288:ltpin,353-416:ltpin"},
-    (4096, 1536): {"*": "1-64:split_k,65-112:lt,113-144:ltpin,145-224:lt,"
-                        "225-288:ltpin,289-352:lt,353-416:ltpin,417-:cublas"},
-    (7168, 3072): {"*": "65-112:cublas,113-144:ltpin,145-224:cublas,225-288:ltpin,"
-                        "289-352:lt,353-416:ltpin,417-:cublas"},
-    (3584, 7168): {"*": "1-16:warp,17-80:split_k,81-88:cublas,89-104:ltpin,"
-                        "105-:cublas"},
-    (7168, 3584): {"*": "1-12:cublas,13-24:lt,25-104:ltpin,105-:cublas"},
+    (7168, 3072): {"*": "65-228:cublas,229-352:lt,353-:cublas"},
+    (3584, 7168): {"*": "1-16:warp,17-80:split_k,81-:cublas"},
+    (7168, 3584): {"*": "1-12:cublas,13-24:lt,25-40:cublas,41-72:lt,73-:cublas"},
     (12288, 7168): {"*": "1-12:split_k,13-24:cublas,25-64:lt,65-96:split_k,"
                          "97-:cublas"},
     (7168, 6144): {"*": "1-64:split_k,65-:cublas"},
@@ -172,7 +159,7 @@ def _tuned(n, k, shape, sms=None, sm_bytes=None, table=None):
     if kind == "split_k":
         fields = rows_policy(TUNED_SPLIT.get((n, k), ""), shape, default=None)
         return None if fields is None else ("split_k", fields)
-    return (kind, None) if kind in LIB_KINDS else None
+    return (kind, None) if kind in TORCH_KINDS else None
 
 
 def measured(
@@ -243,7 +230,7 @@ def sp_projection_tactics(
             problem = split_k_problem(tactic[1], k)
             if problem is not None:
                 raise Unsupported(kind, shape, f"TUNED {problem}")
-        if tactic is not None and kind in TORCH_ONLY and tactic[0] not in LIB_KINDS:
-            raise Unsupported(kind, shape, f"{tactic[0]}: library kinds only")
+        if tactic is not None and kind in TORCH_ONLY and tactic[0] not in TORCH_KINDS:
+            raise Unsupported(kind, shape, f"{tactic[0]}: torch kinds only")
         tactics[r] = tactic or _generic(kind, n, k, shape, ctx, sm_bytes)
     return tactics

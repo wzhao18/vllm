@@ -176,8 +176,7 @@ def test_measured_tactics_match_reference(overlap):
     mlp = layer(overlap, seed=1)
     spm = sp_mlp.SpMlp(mlp, ROWS, context(), 1)
     kinds = {c.tactic[0] for n in ROWS for c in spm.choices(n).values()}
-    assert {"warp", "split_k", "cublas"} <= kinds, kinds
-    assert kinds <= {"warp", "split_k", "cublas", "lt", "ltpin"}, kinds
+    assert kinds == {"warp", "split_k", "cublas", "lt"}, kinds
     if overlap:  # the side-stream shared expert: torch kinds only
         shared = {
             c.tactic[0]
@@ -185,7 +184,7 @@ def test_measured_tactics_match_reference(overlap):
             for f, c in spm.choices(n).items()
             if f.startswith("shared")
         }
-        assert shared <= {"cublas", "lt", "ltpin"}, shared
+        assert shared <= {"cublas", "lt"}, shared
     g = torch.Generator(device=DEVICE).manual_seed(6)
     h = torch.randn(max(ROWS), HIDDEN, device=DEVICE, generator=g).bfloat16()
     for n in ROWS:

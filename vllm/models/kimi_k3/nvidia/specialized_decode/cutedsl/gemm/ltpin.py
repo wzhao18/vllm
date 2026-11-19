@@ -119,7 +119,6 @@ std::vector<int64_t> lt_plan(int64_t n, int64_t k, int64_t rows, bool mx, bool o
 void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::Tensor& out,
             const c10::optional<torch::Tensor>& ws, const c10::optional<torch::Tensor>& wsf,
             const c10::optional<torch::Tensor>& xsf);
-void lt_split(const torch::Tensor& y, int64_t head, torch::Tensor& logits, torch::Tensor& rest);
 """
 
 _CUDA_SRC = r"""
@@ -256,40 +255,6 @@ void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::T
                          x.data_ptr(), p.b, &beta, out.data_ptr(), p.d, out.data_ptr(), p.d,
                          &p.algo, wsp, p.ws, c10::cuda::getCurrentCUDAStream()));
 }
-
-// y [R, W] FP32 -> logits [R, head] FP32 (copy) + rest [R, W - head] BF16 (RN).
-__global__ void split_kernel(const float* __restrict__ y, int64_t rows, int64_t width, int64_t head,
-                             float* __restrict__ logits, __nv_bfloat16* __restrict__ rest) {
-  int64_t r = blockIdx.y;
-  const float4* src = reinterpret_cast<const float4*>(y + r * width);
-  for (int64_t c4 = blockIdx.x * blockDim.x + threadIdx.x; c4 < width / 4;
-       c4 += (int64_t)gridDim.x * blockDim.x) {
-    float4 v = src[c4];
-    int64_t c = c4 * 4;
-    if (c < head) {
-      reinterpret_cast<float4*>(logits + r * head)[c4] = v;
-    } else {
-      __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
-      __nv_bfloat162* d = reinterpret_cast<__nv_bfloat162*>(rest + r * (width - head) + (c - head));
-      d[0] = lo; d[1] = hi;
-    }
-  }
-}
-
-void lt_split(const torch::Tensor& y, int64_t head, torch::Tensor& logits, torch::Tensor& rest) {
-  int64_t rows = y.size(0), width = y.size(1);
-  TORCH_CHECK(y.scalar_type() == at::kFloat && y.is_contiguous() && width % 4 == 0 && head % 4 == 0,
-              "ltpin: split input");
-  check_packed(logits, rows, head, "logits");
-  check_packed(rest, rows, width - head, "rest");
-  if (rows == 0) return;
-  const c10::cuda::CUDAGuard guard(y.device());
-  dim3 grid((unsigned)((width / 4 + 255) / 256), (unsigned)rows);
-  split_kernel<<<grid, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
-      y.data_ptr<float>(), rows, width, head, logits.data_ptr<float>(),
-      reinterpret_cast<__nv_bfloat16*>(rest.data_ptr()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
 """
 
 _lock = threading.Lock()
@@ -315,7 +280,7 @@ def _module():
                 name=f"k3_ltpin_{tag}",
                 cpp_sources=_CPP_SRC,
                 cuda_sources=_CUDA_SRC,
-                functions=["lt_version", "lt_plan", "lt_run", "lt_split"],
+                functions=["lt_version", "lt_plan", "lt_run"],
                 extra_cuda_cflags=["-O3"],
                 extra_ldflags=["-lcublasLt"],
                 build_directory=build,
@@ -396,12 +361,6 @@ class LtPin:
         pid, ws = plan
         _module().lt_run(pid, w, x, out, ws, w_scale, x_scale)
         return out
-
-
-def split_head(y: torch.Tensor, head: int, logits: torch.Tensor, rest: torch.Tensor):
-    """``y`` FP32 [R, W] -> ``logits`` = y[:, :head] (FP32, packed) and ``rest`` =
-    bf16_rn(y[:, head:]) in one kernel (the concatenated router | latent down)."""
-    _module().lt_split(y, head, logits, rest)
 
 
 def warmup() -> None:
