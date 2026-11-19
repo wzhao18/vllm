@@ -1068,6 +1068,18 @@ def key_index(p: Int32) -> Int32:
 
 
 @cute.jit
+def key_rank(p: Uint32) -> Uint32:
+    """Logits position -> key index, unsigned (ties rank by key index)."""
+    return (p & Uint32(0xFFFFFF80)) | ((p & Uint32(31)) << Uint32(2)) | ((p >> Uint32(5)) & Uint32(3))
+
+
+@cute.jit
+def position_of(k: Int32) -> Int32:
+    """Key index -> logits position (inverse of key_index)."""
+    return (k & Int32(-TILE)) | ((k & Int32(3)) << 5) | ((k & Int32(TILE - 1)) >> 2)
+
+
+@cute.jit
 def key_of(words, e: int) -> Uint32:
     return (keys16x2(words[e // 2]) >> Uint32(16 * (e % 2))) & Uint32(0xFFFF)
 
@@ -1340,29 +1352,25 @@ class PrefillFinish:
                         if mk != Uint32(0):
                             red_or_global(brow + (v >> 2) * 4, mk << Uint32((v & 3) * 8))
                     if not all_ties:
-                        # ties in position order: the warp walks the row's vectors in order
+                        # ties by lowest key index (the stock rule): the warp walks
+                        # the keys in key order until it has taken ``take`` of them
                         left = take
-                        for v0 in cutlass.range(0, vectors, 32, unroll=1):
-                            v = v0 + lane
-                            mk = Uint32(0)
-                            if v < vectors:
-                                wd = ldg_v4(address + Int64(v) * 16)
-                                for e in cutlass.range_constexpr(8):
-                                    key = key_of(wd, e)
+                        for k0 in cutlass.range(0, positions, 32, unroll=1):
+                            if left > Uint32(0):
+                                k = k0 + lane
+                                p = Uint32(position_of(k))
+                                hit = Uint32(0)
+                                if k < length:
+                                    wd = ld_global_u32(address + Int64(p >> Uint32(1)) * 4)
+                                    key = (keys16x2(wd) >> ((p & Uint32(1)) * Uint32(16))) & Uint32(0xFFFF)
                                     if key >= low and key < high and (key & Uint32(31)) == d:
-                                        mk = mk | Uint32(1 << e)
-                            n = popc(mk)
-                            before = warp_inclusive(n, lane) - n
-                            keep = Uint32(0)
-                            if left > before:
-                                keep = cutlass.min(left - before, n)
-                            while n > keep:
-                                mk = mk ^ (Uint32(0x80000000) >> clz(mk))
-                                n -= Uint32(1)
-                            if mk != Uint32(0):
-                                red_or_global(brow + (v >> 2) * 4, mk << Uint32((v & 3) * 8))
-                            total = cute.arch.shuffle_sync(warp_inclusive(popc(mk), lane), 31)
-                            left = left - cutlass.min(left, total)
+                                        hit = Uint32(1)
+                                b = ballot(hit)
+                                if hit != Uint32(0) and popc(b & lanemask_lt()) < left:
+                                    red_or_global(
+                                        brow + (p >> Uint32(5)) * 4, Uint32(1) << (p & Uint32(31))
+                                    )
+                                left = left - cutlass.min(left, popc(b))
                 else:
                     # keys above the threshold (and all ties when all are taken) into the
                     # bitmap; otherwise the ties' positions into a warp buffer
@@ -1400,7 +1408,7 @@ class PrefillFinish:
                             rank = Uint32(0)
                             if nt <= Uint32(TIE_BUF):
                                 for j in cutlass.range(Int32(0), Int32(nt), unroll=1):
-                                    if ld_shared_u32(tie_buf_a + j * 4) < p:
+                                    if key_rank(ld_shared_u32(tie_buf_a + j * 4)) < key_rank(p):
                                         rank += Uint32(1)
                             if rank < take and nt <= Uint32(TIE_BUF):
                                 red_or_global(
@@ -1415,7 +1423,7 @@ class PrefillFinish:
                                     rank = Uint32(0)
                                     for c2 in cutlass.range(Int32(0), Int32(n_cand), unroll=1):
                                         y = ld_global_u32(crow + c2 * 4)
-                                        if (y & Uint32(31)) == d and (y >> Uint32(5)) < p:
+                                        if (y & Uint32(31)) == d and key_rank(y >> Uint32(5)) < key_rank(p):
                                             rank += Uint32(1)
                                     if rank < take:
                                         red_or_global(
