@@ -145,6 +145,136 @@ def add_bf16_into_f32_ptx(term: cute.Tensor, acc: cute.Tensor, n: int) -> None:
         acc[i] = Float32(llvm.extractvalue(T.f32(), res, [i]))
 
 
+@cute.jit
+def reduce_row_rmsnorm_threads(
+    combine_output: cute.Tensor,  # (token, topk, hidden) bf16, self-validating (bit-inverted) cells
+    topk_indices: cute.Tensor,  # (token, topk)
+    reduced_output: cute.Tensor,  # (token, hidden)
+    rmsnorm_weight: cute.Tensor,  # (hidden,)
+    rmsnorm_eps: Float32,
+    token_idx: Int32,
+    tid: Int32,
+    partial: cute.Tensor,  # smem f32, one per warp of the thread group
+    hidden: cutlass.Constexpr[int],
+    num_topk: cutlass.Constexpr[int],
+    num_experts: cutlass.Constexpr[int],
+    threads: cutlass.Constexpr[int],
+    barrier_id: cutlass.Constexpr[int],
+) -> None:
+    """vLLM-local E2b: ``TopkReduce._reduce_bf16_ll_rmsnorm`` of one token row (unit routing weights: the
+    weight is applied at FC1), run by ``threads`` threads of a resident CTA (the MegaMoE epilogue warps after
+    their last tile) instead of a separate launch. Same poll, top-k order and FP32 FMA form per 8-wide hidden
+    tile, same cell reset, stock ``rms_norm`` of the BF16-rounded row; a thread owns several hidden tiles, so
+    only the order of the sum-of-squares partials differs."""
+    hidden_per_thread: cutlass.Constexpr[int] = 8
+    hidden_tiles: cutlass.Constexpr[int] = hidden // hidden_per_thread
+    cols: cutlass.Constexpr[int] = (hidden_tiles + threads - 1) // threads
+    warps: cutlass.Constexpr[int] = threads // 32
+    lane_idx = cute.arch.lane_idx()
+    warp_idx = tid // Int32(32)
+
+    lane_valid = cutlass.Boolean(False)
+    if lane_idx < Int32(num_topk):
+        index = topk_indices[token_idx, lane_idx]
+        if cutlass.const_expr(topk_indices.element_type is cutlass.Int32):
+            lane_valid = cutlass.Uint32(index) < cutlass.Uint32(num_experts)
+        else:
+            lane_valid = cutlass.Uint64(index) < cutlass.Uint64(num_experts)
+    valid_slots = Int32(cute.arch.vote_ballot_sync(lane_valid))
+
+    tiles_view = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))
+    x = cute.make_rmem_tensor((cols * hidden_per_thread,), cutlass.BFloat16)
+    weight = cute.make_rmem_tensor((cols * hidden_per_thread,), rmsnorm_weight.element_type)
+    load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+    cell_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+    sumsq = Float32(0)
+    for c in cutlass.range_constexpr(cols):
+        tile = tid + Int32(c * threads)
+        if tile < Int32(hidden_tiles):
+            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (tile,)]
+            wdst = cute.make_tensor(weight.iterator + c * hidden_per_thread, cute.make_layout((hidden_per_thread,)))
+            cute.copy(load_atom, mark_alignment(wsrc, 16), wdst)
+    for c in cutlass.range_constexpr(cols):
+        tile = tid + Int32(c * threads)
+        if tile < Int32(hidden_tiles):
+            terms = tiles_view[(None, None), (0, tile)]
+            words = cute.make_rmem_tensor((num_topk * 2,), Int64)
+            for k in cutlass.range_constexpr(num_topk):
+                low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
+                words[2 * k] = low
+                words[2 * k + 1] = high
+            for k in cutlass.range_constexpr(num_topk):
+                if (valid_slots >> Int32(k)) & Int32(1) == Int32(0):
+                    words[2 * k] = Int64(-1)
+                    words[2 * k + 1] = Int64(-1)
+            stale = Int64(0)
+            for k in cutlass.range_constexpr(num_topk):
+                stale = stale | _zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])
+            while stale != Int64(0):
+                nanosleep(32)
+                for k in cutlass.range_constexpr(num_topk):
+                    if (_zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])) != Int64(0):
+                        low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
+                        words[2 * k] = low
+                        words[2 * k + 1] = high
+                stale = Int64(0)
+                for k in cutlass.range_constexpr(num_topk):
+                    stale = stale | _zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])
+            for i in cutlass.range_constexpr(num_topk * 2):
+                words[i] = words[i] ^ Int64(-1)
+            values = cute.recast_tensor(words, cutlass.BFloat16)
+            acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            for k in cutlass.range_constexpr(num_topk):
+                score = Float32(1)
+                if (valid_slots >> Int32(k)) & Int32(1) == Int32(0):
+                    score = Float32(0)
+                score_pair = (score, score)
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    value_pair = (
+                        Float32(values[k * hidden_per_thread + i]),
+                        Float32(values[k * hidden_per_thread + i + 1]),
+                    )
+                    if cutlass.const_expr(k != 0):
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, score_pair, (acc[i], acc[i + 1]))
+                    else:
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                            value_pair, score_pair, (Float32(0.0), Float32(0.0))
+                        )
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                xb = cutlass.BFloat16(acc[i])
+                x[c * hidden_per_thread + i] = xb
+                xf = Float32(xb)
+                sumsq = sumsq + xf * xf
+            cleared = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+            cleared.fill(0.0)
+            for k in cutlass.range_constexpr(num_topk):
+                if (valid_slots >> Int32(k)) & Int32(1) != Int32(0):
+                    cute.copy(cell_store, cleared, mark_alignment(terms[k, None], hidden_per_thread * 2))
+
+    for shift in cutlass.range_constexpr(5):
+        sumsq = sumsq + cute.arch.shuffle_sync_bfly(sumsq, 16 >> shift)
+    if lane_idx == Int32(0):
+        partial[warp_idx] = sumsq
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
+    total = Float32(0)
+    for w in cutlass.range_constexpr(warps):
+        total = total + partial[w]
+    # Every thread has read the partials before any group reuses them (the next row of this group).
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
+    scale = cute.math.rsqrt(total / Float32(hidden) + rmsnorm_eps, fastmath=True)
+    out_dtype = reduced_output.element_type
+    for c in cutlass.range_constexpr(cols):
+        tile = tid + Int32(c * threads)
+        if tile < Int32(hidden_tiles):
+            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                out[i] = out_dtype(
+                    Float32(x[c * hidden_per_thread + i]) * scale * Float32(weight[c * hidden_per_thread + i])
+                )
+            dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (tile,)]
+            cute.copy(cell_store, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
+
+
 class TopkReduce:
     """Combine reduce for a fixed ``(hidden, num_topk, combine_format)``.
 
