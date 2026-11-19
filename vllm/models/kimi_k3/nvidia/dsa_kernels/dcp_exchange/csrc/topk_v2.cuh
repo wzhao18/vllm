@@ -76,12 +76,15 @@ struct V2Params {
   long long* dbg;
 };
 
-// Whether any of 8 bf16 values is NaN (max.NaN propagates it; the other keys are valid).
-__device__ __forceinline__ bool v2_has_nan(const uint4& r) {
+// Pairwise NaN-propagating max of 8 bf16 values (two halves; a NaN anywhere shows up).
+__device__ __forceinline__ uint32_t v2_max_nan(const uint4& r) {
   uint32_t a, b, m;
   asm("max.NaN.bf16x2 %0, %1, %2;" : "=r"(a) : "r"(r.x), "r"(r.y));
   asm("max.NaN.bf16x2 %0, %1, %2;" : "=r"(b) : "r"(r.z), "r"(r.w));
   asm("max.NaN.bf16x2 %0, %1, %2;" : "=r"(m) : "r"(a), "r"(b));
+  return m;
+}
+__device__ __forceinline__ bool v2_is_nan2(uint32_t m) {
   return (((m & 0x7FFF7FFFu) + 0x007F007Fu) & 0x80008000u) != 0u;
 }
 
@@ -247,8 +250,8 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
     V2DBG(10);
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
-      // its share of 2q + 256 keys (thread 0 owns the top 16 bins)
-      const uint32_t want = (2u * q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+      // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
+      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -296,14 +299,22 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
         uint32_t cnt = 0, hit = 0;  // hit: groups holding a key >= theta
 #pragma unroll
         for (int u = 0; u < kV2RegG; ++u) {
-          if (v2_has_nan(rb[u])) {
+          // one NaN-propagating max: no NaN -> it is the group's max (its key bounds the
+          // group); a NaN (rare) -> count the valid keys, bound from the full test
+          const uint32_t mx = v2_max_nan(rb[u]);
+          bool any;
+          if (v2_is_nan2(mx)) {
             const Keys8 k8(rb[u]);
 #pragma unroll
             for (int j = 0; j < 8; ++j) nv += k8.key(j) != 0u;
+            any = (int)max_key_bound(rb[u]) >= th;
           } else {
             nv += 8;
+            const uint32_t km = keys2(mx);
+            // +1: max() may return -0 over +0 (equal as floats; keys 0x7FFF < 0x8000)
+            any = (int)::max(km & 0xFFFFu, km >> 16) + 1 >= th;
           }
-          if ((int)max_key_bound(rb[u]) > th) {
+          if (any) {
             hit |= 1u << u;
             const Keys8 k8(rb[u]);
 #pragma unroll
