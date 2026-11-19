@@ -2062,11 +2062,11 @@ class VocabParallelMarkov:
         lo = rank * self.vocab_rank
         self.w2 = w2.detach()[lo : lo + self.vocab_rank]
         self.device = w2.device
-        if gather is None:
+        if gather is None and group is None:
             from vllm.distributed import get_tp_group
 
-            group = get_tp_group()
-            gather = lambda x: group.all_gather(x, dim=0)  # noqa: E731
+            coordinator = get_tp_group()
+            gather = lambda x: coordinator.all_gather(x, dim=0)  # noqa: E731
         self.gather = gather
         self.batches: set[tuple[int, bool]] = set()
         self.buffers: dict[int, tuple] = {}
