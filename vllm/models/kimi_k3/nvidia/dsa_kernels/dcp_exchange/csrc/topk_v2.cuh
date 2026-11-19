@@ -1073,7 +1073,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 
     // ---- resolve. tier: 1 resolved (quota s_q), 2 tie round, 3 radix (id cut s_gs),
     // 4 every valid key, 5 cut from the bands. Every thread derives the tier from the
-    // exchanged words; three barriers in the common case.
+    // exchanged words; three barriers in the common case. (r_*: every thread's own copy:
+    // the hot body needs no publish barrier)
+    int r_tier = 0, r_tau = -1, r_q = 0;
     {
       __shared__ int s_tc[kV2MaxW], s_toff[kV2MaxW], s_tok[kV2MaxW];
       int mx = 0, mn = 1 << 30, sat = 0;
@@ -1200,15 +1202,18 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           }
         }
       }
+      r_tier = rt;
+      r_tau = tau;
+      r_q = qv;
       if (tid == 0) {
         s_tier = rt;
         if (rt != 3 || tau >= 0) { s_tau = tau; s_need = need; }
         if (qv >= 0) s_q = qv;
       }
     }
-    __syncthreads();
+    if constexpr (!kFast) __syncthreads();
     V2DBG(5);
-    int tier = s_tier;
+    int tier = kFast ? r_tier : s_tier;
     if constexpr (kFast) {
       if (tier != 1) {  // the same on every rank: the complete body takes the row
         __syncthreads();
@@ -1357,8 +1362,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // selected positions go to SMEM (cpos reused when the candidates are not read), then
     // all threads map them to slots.
     {
-      const int tau = tier == 4 ? 0 : s_tau;
-      const int qq = s_q, gs = s_gs;
+      const int tau = kFast ? r_tau : (tier == 4 ? 0 : s_tau);
+      const int qq = kFast ? r_q : s_q, gs = s_gs;
       const bool from_cand = fast && tier == 1 && tau >= th;
       // kFast: tier 1 from the round puts tau in every window, above every rank's theta
       if (kFast && tid == 0 && !(from_cand && regp)) spin_fail(p.err, 41);
