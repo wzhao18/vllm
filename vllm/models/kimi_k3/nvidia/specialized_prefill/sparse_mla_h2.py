@@ -83,12 +83,12 @@ OFF_QN = 0  # Q latent staging: 4 x [96 x 128 B] SW128 (copied into TMEM per tok
 OFF_QR = OFF_QN + 4 * H * 128  # Q RoPE: [128 rows x 64 B] SW64 (A of the SS RoPE MMA)
 OFF_P = OFF_QR + 128 * 64  # 2 x P [96 heads x 64 keys] E4M3, K-major SW64
 P_BYTES = H * 64
-OFF_AL = OFF_P + 2 * P_BYTES  # [2 parity][128] alpha of the subtile (slow path)
+OFF_AL = OFF_P + 3 * P_BYTES  # [2 parity][128] alpha of the subtile (slow path)
 OFF_MX = OFF_AL + 2 * 128 * 4  # [2 parity][2 WG][128] partial row max; l at +2048
 OFF_INV = OFF_MX + 3 * 1024  # [2 token parity][96] out_scale / l
 OFF_FLAG = OFF_INV + 2 * H * 4  # [2 parity] u32 slow flags
 OFF_BAR = OFF_FLAG + 16
-OFF_TMEM = OFF_BAR + 32 * 8
+OFF_TMEM = OFF_BAR + 40 * 8
 OFF_IDX = (OFF_TMEM + 16 + 1023) // 1024 * 1024  # 2 x slot rows (bulk-copied per token)
 # the epilogue stores straight from registers (no BF16 staging)
 OFF_KV = OFF_IDX + 2 * IDX_BYTES
@@ -98,6 +98,8 @@ SMEM_BYTES = OFF_KV + NS * STAGE64
  B_INV) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12)
 B_IDXFULL, B_IDXEMPTY = 14, 30  # per token parity (14, 15) and (30, 31)
 B_KVFULL, B_KVEMPTY = 16, 24
+B_PEMPTY = 32  # 3 P buffers (lag-2 order): released by the PV that read them
+B_PFULL3 = 35  # lag 2: P full per buffer (a single barrier could run a phase ahead)
 C_Q, C_S, C_O = 0, 128, 192
 
 # instruction descriptors (dense kind::f8f6f4, E4M3 x E4M3 -> FP32, Rubin K64 bit 29)
@@ -160,10 +162,18 @@ class SparseMlaPrefillH2:
         self.grid, self.stamps = grid, stamps
         # diagnostics: no_store (epilogue skips staging stores + TMA stores),
         # no_mma (MMA warp only commits its barriers)
-        knobs = tuple(knobs) + (0,) * (3 - len(knobs))
+        knobs = tuple(knobs) + (0,) * (6 - len(knobs))
         # mode: 0 full; 1 gather only (MMA warp releases stages, softmax and
-        # epilogue idle); 2 gather + QK/PV MMAs without softmax dependencies
-        self.no_store, self.no_mma, self.mode = knobs
+        # epilogue idle); 2 gather + QK/PV MMAs without softmax dependencies;
+        # 3 full pipeline with a no-op softmax (S read, P published unchanged)
+        # no_gather: KV stages are signalled without any gather (stale data; timing only)
+        # mma_hi: MMA warp on sub-partition 3 (warp 23, next to the padding softmax
+        # warps); lag2: QK(u) is issued ahead of PV(u-2), so the MMA warp never waits
+        # for the end of a softmax before issuing the next QK (3 P buffers)
+        (self.no_store, self.no_mma, self.mode, self.no_gather, self.mma_hi,
+         self.lag2) = knobs
+        self.w_mma, self.w_ld = (23, 12) if self.mma_hi else (W_MMA, W_LD)
+        self.np = 3 if self.lag2 else 2
 
     @cute.jit
     def __call__(self, q8: Int64, rows: Int32, kv: Int64, unit_rows: Int32, slots: Int64,
@@ -207,7 +217,9 @@ class SparseMlaPrefillH2:
                            (B_OFREE, 4), (B_OFREE + 1, 4), (B_OFREE + 2, 4),
                            (B_OFREE + 3, 4), (B_INV, 8), (B_INV + 1, 8),
                            (B_IDXFULL, 1), (B_IDXFULL + 1, 1),
-                           (B_IDXEMPTY, LOADERS), (B_IDXEMPTY + 1, LOADERS)):
+                           (B_IDXEMPTY, LOADERS), (B_IDXEMPTY + 1, LOADERS),
+                           (B_PEMPTY, 1), (B_PEMPTY + 1, 1), (B_PEMPTY + 2, 1),
+                           (B_PFULL3, 8), (B_PFULL3 + 1, 8), (B_PFULL3 + 2, 8)):
                 mbar_init(_bar(base, i), Uint32(cnt))
             for s in cutlass.range_constexpr(NS):
                 mbar_init(_bar(base, B_KVFULL + s), Uint32(1))
@@ -223,21 +235,21 @@ class SparseMlaPrefillH2:
         xv = cute.make_rmem_tensor((32,), Float32)
         if warp < W_EPI:
             cute.arch.warpgroup_reg_alloc(REG_SOFTMAX)
-            if cutlass.const_expr(self.mode == 0):
+            if cutlass.const_expr(self.mode == 0 or self.mode == 3):
                 self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta,
                              scale_log2, out_scale, xv, stamp)
-        elif warp < W_MMA:
-            if cutlass.const_expr(self.mode == 0):
-                    self.epilogue(base, tid, warp, lane, taddr, n_mine, cta, out, stamp)
+        elif warp < W_EPI + 4:
+            if cutlass.const_expr(self.mode == 0 or self.mode == 3):
+                self.epilogue(base, tid, warp, lane, taddr, n_mine, cta, out, stamp)
         else:
             cute.arch.warpgroup_reg_dealloc(REG_LOAD)
-            if warp == W_MMA:
-                if cutlass.const_expr(self.mode == 0):
+            if warp == self.w_mma:
+                if cutlass.const_expr(self.mode == 0 or self.mode == 3):
                     self.mma(base, lane, taddr, n_mine, lengths, cta, stamp)
                 else:
                     self.mma_diag(base, lane, taddr, n_mine, lengths, cta, stamp)
             else:
-                self.loader(base, warp - W_LD, lane, cta, n_mine,
+                self.loader(base, warp - self.w_ld, lane, cta, n_mine,
                             tensormap.map_address(qn), tensormap.map_address(qr),
                             tensormap.map_address(kvm), tensormap.map_address(kvr),
                             unit_rows, slots, slot_stride, lengths, stamp)
@@ -251,6 +263,16 @@ class SparseMlaPrefillH2:
     def stamp(self, ptr, cta, g, ev: cutlass.Constexpr):
         if cta < STAMP_CTAS and g < STAMP_TILES:
             stamp_clock(ptr + Int64(((cta * STAMP_TILES + g) * STAMP_EV + ev) * 8))
+
+    @cute.jit
+    def wstamp(self, ptr, cta, u, w, k: cutlass.Constexpr):
+        """Per-warp softmax stamps of CTA 0 (after the CTA stamp block): k 0 S loaded,
+        1 first barrier passed, 2 P published, 3 slow path taken; w 8 = MMA warp (0 at the
+        KV wait, 1 QK issued, 2 PV issued), w 9-11 = gather warp pw (k = pw % 4) done."""
+        if cutlass.const_expr(self.stamps):
+            if cta == 0 and u < STAMP_TILES:
+                stamp_clock(ptr + Int64((STAMP_CTAS * STAMP_TILES * STAMP_EV
+                                         + (u * 12 + w) * 4 + k) * 8))
 
     # ------------------------------------------------------------------ gather
     @cute.jit
@@ -299,31 +321,37 @@ class SparseMlaPrefillH2:
                     if lane == 0:
                         mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
                         if pw == 0:
-                            mbar_arrive_tx(full, Uint32(STAGE64))
+                            if cutlass.const_expr(self.no_gather):
+                                mbar_arrive(full)
+                            else:
+                                mbar_arrive_tx(full, Uint32(STAGE64))
                             if cutlass.const_expr(self.stamps):
                                 self.stamp(stamp, cta, g, 0)
                     cute.arch.sync_warp()
-                    if lane < quads:
-                        r0 = (r[0] >> 6) * unit_rows + (r[0] & 63)
-                        r1 = (r[1] >> 6) * unit_rows + (r[1] & 63)
-                        r2 = (r[2] >> 6) * unit_rows + (r[2] & 63)
-                        r3 = (r[3] >> 6) * unit_rows + (r[3] & 63)
-                        if r[0] < 0 or key >= n:
-                            r0 = Int32(-1)
-                        if r[1] < 0 or key + 1 >= n:
-                            r1 = Int32(-1)
-                        if r[2] < 0 or key + 2 >= n:
-                            r2 = Int32(-1)
-                        if r[3] < 0 or key + 3 >= n:
-                            r3 = Int32(-1)
-                        for a in cutlass.range_constexpr(4):
-                            gather4(st + Uint32(a * 8192) + Uint32(q) * Uint32(512), tm_kv,
-                                    full, 128 * a, r0, r1, r2, r3)
-                        gather4(st + Uint32(4 * 8192) + Uint32(q) * Uint32(256), tm_kr,
-                                full, D_NOPE, r0, r1, r2, r3)
+                    if cutlass.const_expr(not self.no_gather):
+                        if lane < quads:
+                            r0 = (r[0] >> 6) * unit_rows + (r[0] & 63)
+                            r1 = (r[1] >> 6) * unit_rows + (r[1] & 63)
+                            r2 = (r[2] >> 6) * unit_rows + (r[2] & 63)
+                            r3 = (r[3] >> 6) * unit_rows + (r[3] & 63)
+                            if r[0] < 0 or key >= n:
+                                r0 = Int32(-1)
+                            if r[1] < 0 or key + 1 >= n:
+                                r1 = Int32(-1)
+                            if r[2] < 0 or key + 2 >= n:
+                                r2 = Int32(-1)
+                            if r[3] < 0 or key + 3 >= n:
+                                r3 = Int32(-1)
+                            for a in cutlass.range_constexpr(4):
+                                gather4(st + Uint32(a * 8192) + Uint32(q) * Uint32(512), tm_kv,
+                                        full, 128 * a, r0, r1, r2, r3)
+                            gather4(st + Uint32(4 * 8192) + Uint32(q) * Uint32(256), tm_kr,
+                                    full, D_NOPE, r0, r1, r2, r3)
                     if cutlass.const_expr(self.stamps):
                         if pw == 0 and lane == 0:
                             self.stamp(stamp, cta, g, 7)
+                        if lane == 0:
+                            self.wstamp(stamp, cta, g, 9 + pw // 4, pw % 4)
                     g = g + 1
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -345,12 +373,16 @@ class SparseMlaPrefillH2:
     # ------------------------------------------------------------------ MMA
     @cute.jit
     def mma(self, base, lane, taddr, n_mine, lengths, cta, stamp):
-        """Global 64-key subtile counter u (two per KV stage). Per subtile: wait
-        S read (SFREE u-1), QK(u); then PV(u-1) once its P is ready, so QK(u)
-        overlaps softmax(u-1)."""
+        """Global 64-key subtile counter u. Per subtile: wait S read (SFREE u-1),
+        QK(u); then the oldest pending PV: lag 1 = PV(u-1) once its P is ready
+        (waits for the end of softmax(u-1)); lag 2 = PV(u-2), whose P is complete
+        before softmax(u-1) started, so QK(u+1) is never held behind a softmax."""
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
         u = Int32(0)
+        # pending PVs (lag 2): a = older, b = newer; (u, i, last, qi), u < 0 = none
+        au, ai, al, aq = Int32(-1), Int32(0), Int32(0), Int32(0)
+        bu, bi, bl, bq = Int32(-1), Int32(0), Int32(0), Int32(0)
         for qi in range(n_mine):
             row = cta + qi * self.grid
             subs = _subs(lens[row])
@@ -361,10 +393,25 @@ class SparseMlaPrefillH2:
                     mbar_wait(_bar(base, B_SFREE), Uint32((u - 1) & 1))
                     tc_fence_after()
                 self.qk(base, lane, taddr, u, i == subs - 1, cta, stamp)
-                if i > 0:
-                    self.pv(base, lane, taddr, u - 1, i - 1, False, qi, cta, stamp)
+                if cutlass.const_expr(self.lag2):
+                    if au >= 0:
+                        self.pv(base, lane, taddr, au, ai, al != 0, aq, cta, stamp)
+                    au, ai, al, aq = bu, bi, bl, bq
+                    bu, bi, bq = u, i, qi
+                    bl = Int32(0)
+                    if i == subs - 1:
+                        bl = Int32(1)
+                else:
+                    if i > 0:
+                        self.pv(base, lane, taddr, u - 1, i - 1, False, qi, cta, stamp)
                 u = u + 1
-            self.pv(base, lane, taddr, u - 1, subs - 1, True, qi, cta, stamp)
+            if cutlass.const_expr(not self.lag2):
+                self.pv(base, lane, taddr, u - 1, subs - 1, True, qi, cta, stamp)
+        if cutlass.const_expr(self.lag2):
+            if au >= 0:
+                self.pv(base, lane, taddr, au, ai, al != 0, aq, cta, stamp)
+            if bu >= 0:
+                self.pv(base, lane, taddr, bu, bi, bl != 0, bq, cta, stamp)
 
     @cute.jit
     def mma_diag(self, base, lane, taddr, n_mine, lengths, cta, stamp):
@@ -409,6 +456,8 @@ class SparseMlaPrefillH2:
     def qk(self, base, lane, taddr, u, last, cta, stamp):
         s = u % NS
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+        if lane == 0:
+            self.wstamp(stamp, cta, u, 8, 0)
         mbar_wait(_bar(base, B_KVFULL + s), Uint32((u // NS) & 1))
         if cutlass.const_expr(self.stamps):
             if lane == 0:
@@ -428,6 +477,7 @@ class SparseMlaPrefillH2:
             bd = Uint64(SDESC_SW64) | Uint64((st + Uint32(4 * 8192)) >> Uint32(4))
             if cutlass.const_expr(not self.no_mma):
                 tc_mma(taddr + Uint32(C_S), ad, bd, Uint32(IDESC_QK), Uint32(1))
+            self.wstamp(stamp, cta, u, 8, 1)
             tc_commit(_bar(base, B_SFULL))
             if last:
                 tc_commit(_bar(base, B_QEMPTY))
@@ -439,12 +489,15 @@ class SparseMlaPrefillH2:
         into the B collector for the 4 O^T blocks."""
         s = u % NS
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
-        mbar_wait(_bar(base, B_PFULL), Uint32(u & 1))
+        if cutlass.const_expr(self.lag2):
+            mbar_wait(_bar(base, B_PFULL3 + u % 3), Uint32((u // 3) & 1))
+        else:
+            mbar_wait(_bar(base, B_PFULL), Uint32(u & 1))
         if cutlass.const_expr(self.stamps):
             if lane == 0:
                 self.stamp(stamp, cta, u, 4)
         tc_fence_after()
-        pbuf = base + Uint32(OFF_P) + Uint32(u % 2) * Uint32(P_BYTES)
+        pbuf = base + Uint32(OFF_P) + Uint32(u % self.np) * Uint32(P_BYTES)
         if lane == 0:
             bd = Uint64(SDESC_SW64) | Uint64(pbuf >> Uint32(4))
             for b in cutlass.range_constexpr(4):
@@ -459,8 +512,11 @@ class SparseMlaPrefillH2:
                 if cutlass.const_expr(not self.no_mma):
                     tc_mma_cb(taddr + Uint32(C_O + 96 * b), ad, bd, Uint32(IDESC_PV), acc,
                               op)
+            self.wstamp(stamp, cta, u, 8, 2)
             tc_commit(_bar(base, B_KVEMPTY + s))
             tc_commit(_bar(base, B_PVDONE))
+            if cutlass.const_expr(self.lag2):
+                tc_commit(_bar(base, B_PEMPTY + u % 3))
             if last:
                 tc_commit(_bar(base, B_OFULL))
         cute.arch.sync_warp()
@@ -516,93 +572,102 @@ class SparseMlaPrefillH2:
                 cute.arch.sync_warp()
                 if lane == 0:
                     mbar_arrive(_bar(base, B_SFREE))
-                key0 = 64 * i + 32 * wg
-                for k in cutlass.range_constexpr(32):
-                    xv[k] = sa[k] * scale_log2 - mp
-                if key0 + 32 > n:
+                    self.wstamp(stamp, cta, u, warp, 0)
+                if cutlass.const_expr(self.mode != 3):
+                    key0 = 64 * i + 32 * wg
                     for k in cutlass.range_constexpr(32):
-                        if key0 + k >= n:
-                            xv[k] = Float32(-math.inf)
-                m8 = [cute.arch.fmax(cute.arch.fmax(xv[4 * q], xv[4 * q + 1]),
-                                     cute.arch.fmax(xv[4 * q + 2], xv[4 * q + 3]))
-                      for q in range(8)]
-                m2 = [cute.arch.fmax(cute.arch.fmax(m8[4 * q], m8[4 * q + 1]),
-                                     cute.arch.fmax(m8[4 * q + 2], m8[4 * q + 3]))
-                      for q in range(2)]
-                xm = cute.arch.fmax(m2[0], m2[1])
-                # fast path: no head's partial max exceeds the stale max by THR (one
-                # barrier); subtile 0 of the token and any growth take the slow path
-                fl = base + Uint32(OFF_FLAG + (u % 2) * 4)
-                need = Int32(0)
-                if real:
-                    if xm > lim:
-                        need = Int32(1)
-                if i == 0:
-                    need = Int32(1)
-                if cute.arch.vote_any_sync(need != 0) and lane == 0:
-                    st_shared_u32(fl, Uint32(u + 1))
-                named_bar(1, 256)
-                if ld_shared_u32(fl) == Uint32(u + 1):
-                    mxb = base + Uint32(OFF_MX) + Uint32(u % 2) * Uint32(1024)
-                    st_shared_f32(mxb + Uint32((wg * 128 + h) * 4), xm)
-                    named_bar(1, 256)
-                    xm = cute.arch.fmax(
-                        xm, ld_shared_f32(mxb + Uint32(((1 - wg) * 128 + h) * 4)))
-                    grow = Int32(0)
-                    d = Float32(0.0)
-                    if real:
-                        if i == 0:
-                            if xm > Float32(-1e30):
-                                d = xm - Float32(P_PRE)
-                        elif xm > lim:
-                            grow = Int32(1)
-                            d = xm - Float32(P_PRE)
-                    if d != Float32(0.0):
-                        mp = mp + d
+                        xv[k] = sa[k] * scale_log2 - mp
+                    if key0 + 32 > n:
                         for k in cutlass.range_constexpr(32):
-                            xv[k] = xv[k] - d
-                    if i > 0:
-                        alpha = Float32(1.0)
-                        if grow != 0:
-                            alpha = ex2(-d)
-                            lsum = lsum * alpha
-                        # O^T rescale (all 8 warps: lanes = dims; WG wg blocks 2 wg,
-                        # 2 wg + 1), after PV(u - 1)
-                        alb = base + Uint32(OFF_AL) + Uint32(u % 2) * Uint32(512)
-                        if wg == 0:
-                            st_shared_f32(alb + Uint32(h * 4), alpha)
+                            if key0 + k >= n:
+                                xv[k] = Float32(-math.inf)
+                    m8 = [cute.arch.fmax(cute.arch.fmax(xv[4 * q], xv[4 * q + 1]),
+                                         cute.arch.fmax(xv[4 * q + 2], xv[4 * q + 3]))
+                          for q in range(8)]
+                    m2 = [cute.arch.fmax(cute.arch.fmax(m8[4 * q], m8[4 * q + 1]),
+                                         cute.arch.fmax(m8[4 * q + 2], m8[4 * q + 3]))
+                          for q in range(2)]
+                    xm = cute.arch.fmax(m2[0], m2[1])
+                    # fast path: no head's partial max exceeds the stale max by THR (one
+                    # barrier); subtile 0 of the token and any growth take the slow path
+                    fl = base + Uint32(OFF_FLAG + (u % 2) * 4)
+                    need = Int32(0)
+                    if real:
+                        if xm > lim:
+                            need = Int32(1)
+                    if i == 0:
+                        need = Int32(1)
+                    if cute.arch.vote_any_sync(need != 0) and lane == 0:
+                        st_shared_u32(fl, Uint32(u + 1))
+                    named_bar(1, 256)
+                    if lane == 0:
+                        self.wstamp(stamp, cta, u, warp, 1)
+                    if ld_shared_u32(fl) == Uint32(u + 1):
+                        if lane == 0:
+                            self.wstamp(stamp, cta, u, warp, 3)
+                        mxb = base + Uint32(OFF_MX) + Uint32(u % 2) * Uint32(1024)
+                        st_shared_f32(mxb + Uint32((wg * 128 + h) * 4), xm)
                         named_bar(1, 256)
-                        mbar_wait(_bar(base, B_PVDONE), Uint32((u - 1) & 1))
-                        tc_fence_after()
-                        for bb in cutlass.range_constexpr(2):
-                            b = 2 * wg + bb
-                            for c in cutlass.range_constexpr(6):
-                                col = lane_addr + Uint32(C_O + 16 * c) + Uint32(96) * Uint32(b)
-                                oa = tmem_ld(col, 16)
-                                a4s = [ld_shared_v4f(alb + Uint32(64 * c + 16 * q))
-                                       for q in range(4)]
-                                tmem_st(col, [oa[k] * a4s[k // 4][k % 4] for k in range(16)])
-                        tc_fence_before()
-                # P row h, keys 32 wg .. +31 (E4M3) -> P buffer u % 2 (K-major SW64);
-                # l sums the FP32 P (same accuracy as summing the E4M3 P, run13/14)
-                if real:
-                    pbuf = base + Uint32(OFF_P) + Uint32(u % 2) * Uint32(P_BYTES)
-                    for cc in cutlass.range_constexpr(2):
-                        c = 2 * wg + cc
-                        w = []
-                        ps = []
-                        for q in cutlass.range_constexpr(4):
-                            k = 16 * cc + 4 * q
-                            p0 = ex2(xv[k])
-                            p1 = ex2(xv[k + 1])
-                            p2 = ex2(xv[k + 2])
-                            p3 = ex2(xv[k + 3])
-                            ps.append((p0 + p1) + (p2 + p3))
-                            w.append(cvt_e4m3x2(p0, p1) | (cvt_e4m3x2(p2, p3) << Uint32(16)))
-                        lsum = lsum + ((ps[0] + ps[1]) + (ps[2] + ps[3]))
-                        st_shared_v4(pbuf + Uint32(h * 64) + (
-                            (Uint32(c) ^ ((Uint32(h) >> Uint32(1)) & Uint32(3))) << Uint32(4)),
-                            w[0], w[1], w[2], w[3])
+                        xm = cute.arch.fmax(
+                            xm, ld_shared_f32(mxb + Uint32(((1 - wg) * 128 + h) * 4)))
+                        grow = Int32(0)
+                        d = Float32(0.0)
+                        if real:
+                            if i == 0:
+                                if xm > Float32(-1e30):
+                                    d = xm - Float32(P_PRE)
+                            elif xm > lim:
+                                grow = Int32(1)
+                                d = xm - Float32(P_PRE)
+                        if d != Float32(0.0):
+                            mp = mp + d
+                            for k in cutlass.range_constexpr(32):
+                                xv[k] = xv[k] - d
+                        if i > 0:
+                            alpha = Float32(1.0)
+                            if grow != 0:
+                                alpha = ex2(-d)
+                                lsum = lsum * alpha
+                            # O^T rescale (all 8 warps: lanes = dims; WG wg blocks 2 wg,
+                            # 2 wg + 1), after PV(u - 1)
+                            alb = base + Uint32(OFF_AL) + Uint32(u % 2) * Uint32(512)
+                            if wg == 0:
+                                st_shared_f32(alb + Uint32(h * 4), alpha)
+                            named_bar(1, 256)
+                            mbar_wait(_bar(base, B_PVDONE), Uint32((u - 1) & 1))
+                            tc_fence_after()
+                            for bb in cutlass.range_constexpr(2):
+                                b = 2 * wg + bb
+                                for c in cutlass.range_constexpr(6):
+                                    col = lane_addr + Uint32(C_O + 16 * c) + Uint32(96) * Uint32(b)
+                                    oa = tmem_ld(col, 16)
+                                    a4s = [ld_shared_v4f(alb + Uint32(64 * c + 16 * q))
+                                           for q in range(4)]
+                                    tmem_st(col, [oa[k] * a4s[k // 4][k % 4] for k in range(16)])
+                            tc_fence_before()
+                    # P row h, keys 32 wg .. +31 (E4M3) -> P buffer u % 2 (K-major SW64);
+                    # l sums the FP32 P (same accuracy as summing the E4M3 P, run13/14)
+                    if cutlass.const_expr(self.lag2):
+                        if u >= 3:
+                            mbar_wait(_bar(base, B_PEMPTY + u % 3), Uint32((u // 3 - 1) & 1))
+                    if real:
+                        pbuf = base + Uint32(OFF_P) + Uint32(u % self.np) * Uint32(P_BYTES)
+                        for cc in cutlass.range_constexpr(2):
+                            c = 2 * wg + cc
+                            w = []
+                            ps = []
+                            for q in cutlass.range_constexpr(4):
+                                k = 16 * cc + 4 * q
+                                p0 = ex2(xv[k])
+                                p1 = ex2(xv[k + 1])
+                                p2 = ex2(xv[k + 2])
+                                p3 = ex2(xv[k + 3])
+                                ps.append((p0 + p1) + (p2 + p3))
+                                w.append(cvt_e4m3x2(p0, p1) | (cvt_e4m3x2(p2, p3) << Uint32(16)))
+                            lsum = lsum + ((ps[0] + ps[1]) + (ps[2] + ps[3]))
+                            st_shared_v4(pbuf + Uint32(h * 64) + (
+                                (Uint32(c) ^ ((Uint32(h) >> Uint32(1)) & Uint32(3))) << Uint32(4)),
+                                w[0], w[1], w[2], w[3])
                 fence_async_smem()
                 tc_fence_before()
                 cute.arch.sync_warp()
@@ -610,7 +675,11 @@ class SparseMlaPrefillH2:
                     if tid == 0:
                         self.stamp(stamp, cta, u, 3)
                 if lane == 0:
-                    mbar_arrive(_bar(base, B_PFULL))
+                    self.wstamp(stamp, cta, u, warp, 2)
+                    if cutlass.const_expr(self.lag2):
+                        mbar_arrive(_bar(base, B_PFULL3 + u % 3))
+                    else:
+                        mbar_arrive(_bar(base, B_PFULL))
                 u = u + 1
             # ---- token end: l = both halves; 1/l for the epilogue
             lsb = base + Uint32(OFF_MX)

@@ -77,10 +77,19 @@ def stamp_report(vr, dev):
     """Median clock deltas per tile from the kernel's clock64 stamps (8 CTAs, 64 tiles):
     ev 0 loader issue start, 1 KV landed (MMA warp), 2 S ready (softmax), 3 P ready,
     4 PV issue, 5 O ready (epilogue start, last tile of a row), 6 O drained."""
-    stamps = torch.zeros(8 * 64 * 8, dtype=torch.int64, device=dev)
+    stamps = torch.zeros(8 * 64 * 8 + 64 * 12 * 4, dtype=torch.int64, device=dev)
     vr(0, stamps=stamps)
     torch.cuda.synchronize()
-    x = stamps.view(8, 64, 8).cpu().double()
+    w = stamps[8 * 64 * 8:].view(64, 12, 4).cpu()
+    if bool((w != 0).any()):
+        ref = w[:, 0, 0:1].clone()
+        rel = (w - ref[:, None, :]).masked_fill(w == 0, -999999)
+        # per tile u, relative to softmax warp 0 S loaded: warps 0-7 [S loaded, barrier,
+        # P published, slow]; 8 MMA [at KV wait, QK issued, PV issued]; 9-11 gather warps done
+        print("warps", {u: rel[u].tolist() for u in range(4, 10)}, flush=True)
+        print("slow_path_tiles", [u for u in range(64) if bool((w[u, :8, 3] != 0).any())],
+              flush=True)
+    x = stamps[:8 * 64 * 8].view(8, 64, 8).cpu().double()
     rep = {}
 
     def med(d):
@@ -117,6 +126,10 @@ def main():
     ap.add_argument("--loaders", default="3,5")
     ap.add_argument("--qmag", type=float, default=1.0)
     ap.add_argument("--h2-knobs", default="", help="no_store:no_mma list")
+    ap.add_argument("--kernels", default="sol,h2",
+                    help="specialized kernels to time (sol, h2, h4, h5)")
+    ap.add_argument("--h4-knobs", default="",
+                    help="h4/h5 knob list no_store:no_gather:epi_tma:hint:no_math:no_mma")
     ap.add_argument("--sol-knobs", default="",
                     help="comma list of gather_warps:no_gather:no_store diagnostics")
     ap.add_argument("--stamps", action="store_true",
@@ -233,57 +246,101 @@ def main():
             sparse_mla_prefill_sol,
         )
 
-        def vs(i, stamps=None):
-            kv, idx = layers[i % len(layers)]
-            sparse_mla_prefill_sol(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
-                                   out=vr_out, stamps=stamps)
+        kernels = a.kernels.split(",")
+        if "sol" in kernels:
+            def vs(i, stamps=None):
+                kv, idx = layers[i % len(layers)]
+                sparse_mla_prefill_sol(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                                       out=vr_out, stamps=stamps)
 
-        vs(0)
-        attn(0)
-        torch.cuda.synchronize()
-        d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
-        res["sol_rel_vs_trtllm"] = (
-            d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
-        st["attn_sol"] = time_stage(vs, a.iters)
-        print("sol", res["sol_rel_vs_trtllm"], st["attn_sol"], flush=True)
-        if a.stamps:
-            res["stamps_sol"] = stamp_report(vs, dev)
-            print("sol", res["stamps_sol"], flush=True)
-        from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (
-            sparse_mla_prefill_h2,
-        )
+            vs(0)
+            attn(0)
+            torch.cuda.synchronize()
+            d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
+            res["sol_rel_vs_trtllm"] = (
+                d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+            st["attn_sol"] = time_stage(vs, a.iters)
+            print("sol", res["sol_rel_vs_trtllm"], st["attn_sol"], flush=True)
+            if a.stamps:
+                res["stamps_sol"] = stamp_report(vs, dev)
+                print("sol", res["stamps_sol"], flush=True)
+        if "h2" in kernels:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (
+                sparse_mla_prefill_h2,
+            )
 
-        def vh(i, stamps=None):
-            kv, idx = layers[i % len(layers)]
-            sparse_mla_prefill_h2(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
-                                  out=vr_out, stamps=stamps)
-
-        vh(0)
-        attn(0)
-        torch.cuda.synchronize()
-        d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
-        res["h2_rel_vs_trtllm"] = (
-            d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
-        st["attn_h2"] = time_stage(vh, a.iters)
-        print("h2", res["h2_rel_vs_trtllm"], st["attn_h2"], flush=True)
-        if a.stamps:
-            res["stamps_h2"] = stamp_report(vh, dev)
-            print("h2", res["stamps_h2"], flush=True)
-        for kn in [k for k in a.h2_knobs.split(",") if k]:
-            knobs = tuple(int(v) for v in kn.split(":"))
-
-            def vhk(i, stamps=None, knobs=knobs):
+            def vh(i, stamps=None):
                 kv, idx = layers[i % len(layers)]
                 sparse_mla_prefill_h2(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
-                                      out=vr_out, stamps=stamps, knobs=knobs)
+                                      out=vr_out, stamps=stamps)
 
-            vhk(0)
-            st[f"attn_h2_k{kn}"] = time_stage(vhk, a.iters)
-            print("h2 knobs", kn, st[f"attn_h2_k{kn}"], flush=True)
+            vh(0)
+            attn(0)
+            torch.cuda.synchronize()
+            d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
+            res["h2_rel_vs_trtllm"] = (
+                d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+            st["attn_h2"] = time_stage(vh, a.iters)
+            print("h2", res["h2_rel_vs_trtllm"], st["attn_h2"], flush=True)
             if a.stamps:
-                r = stamp_report(vhk, dev)
-                print("h2 knobs", kn, {k: v for k, v in r.items() if k != "cta0_tiles_0_20"},
-                      flush=True)
+                res["stamps_h2"] = stamp_report(vh, dev)
+                print("h2", res["stamps_h2"], flush=True)
+            for kn in [k for k in a.h2_knobs.split(",") if k]:
+                knobs = tuple(int(v) for v in kn.split(":"))
+
+                def vhk(i, stamps=None, knobs=knobs):
+                    kv, idx = layers[i % len(layers)]
+                    sparse_mla_prefill_h2(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                                          out=vr_out, stamps=stamps, knobs=knobs)
+
+                vhk(0)
+                st[f"attn_h2_k{kn}"] = time_stage(vhk, a.iters)
+                print("h2 knobs", kn, st[f"attn_h2_k{kn}"], flush=True)
+                if a.stamps:
+                    r = stamp_report(vhk, dev)
+                    print("h2 knobs", kn, {k: v for k, v in r.items() if k != "cta0_tiles_0_20"},
+                          flush=True)
+        import importlib
+
+        for kname in [k for k in ("h4", "h5") if k in kernels]:
+            kfn = getattr(importlib.import_module(
+                f"vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_{kname}"),
+                f"sparse_mla_prefill_{kname}")
+
+            for kn in ["base"] + [k for k in a.h4_knobs.split(",") if k]:
+                knobs = () if kn == "base" else tuple(int(v) for v in kn.split(":"))
+
+                def v4(i, stamps=None, knobs=knobs, kfn=kfn):
+                    kv, idx = layers[i % len(layers)]
+                    kfn(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                        out=vr_out, stamps=stamps, knobs=knobs)
+
+                v4(0)
+                attn(0)
+                torch.cuda.synchronize()
+                d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
+                res[f"{kname}_{kn}_rel_vs_trtllm"] = (
+                    d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+                st[f"attn_{kname}_{kn}"] = time_stage(v4, a.iters)
+                print(kname, kn, res[f"{kname}_{kn}_rel_vs_trtllm"],
+                      st[f"attn_{kname}_{kn}"], flush=True)
+                if a.stamps:
+                    res[f"stamps_{kname}_{kn}"] = stamp_report(v4, dev)
+                    print(kname, kn, res[f"stamps_{kname}_{kn}"], flush=True)
+                if len(knobs) > 8 and knobs[8]:
+                    sb = torch.zeros(256, dtype=torch.int32, device=dev)
+                    v4(0, stamps=sb)
+                    torch.cuda.synchronize()
+                    x = sb.view(16, 2, 8).cpu().long()
+                    x = (x - x[:, :, :1]) & 0xFFFFFFFF  # per subtile, relative to the S wait
+                    med = x.median(dim=0).values.tolist()
+                    per = (sb.view(16, 2, 8)[1:, 0, 1].long()
+                           - sb.view(16, 2, 8)[:-1, 0, 1].long()) & 0xFFFFFFFF
+                    res[f"sstamp_{kname}_{kn}"] = {"median_by_warp_event": med,
+                                                   "period_med": float(per.median())}
+                    print(kname, kn, "sstamp events (0 wait start, 1 S ready, 2 S loaded,"
+                          " 3 max stored, 4 max exchanged, 5 P buffer free, 6 P written,"
+                          " 7 fenced)", med, "period", float(per.median()), flush=True)
         for kn in [k for k in a.sol_knobs.split(",") if k]:
             knobs = tuple(int(v) for v in kn.split(":"))
 
