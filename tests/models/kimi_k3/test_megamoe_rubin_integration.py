@@ -948,3 +948,19 @@ def test_wide_ep_decode_bucket_has_its_own_record(world):
     assert any("its own record" in n for n in notes)
     prefill, _ = X.select_rubin_buckets(problem, world, 2048, prefill_worker=True)
     assert [b.max_tokens for b in prefill] == [2048]
+
+
+def test_knob_world_size_emulates_wide_ep_on_a_slice():
+    """A 1-node EP4 slice emulating EP32 per-GPU work selects the EP32 buckets and
+    records (bench hook); without the hook EP4 keeps its own (prefill) records."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(2048))
+    ep32, _ = X.select_rubin_buckets(problem, 32, 2048, prefill_worker=False)
+    emulated, _ = X.select_rubin_buckets(
+        problem, 4, 2048, prefill_worker=False, knob_world_size=32
+    )
+    assert emulated == ep32
+    assert emulated[0].max_tokens == X.RUBIN_WIDE_EP_DECODE_TOKENS
+    assert tuple(emulated[0].knobs.schedule_policy)[0] == "phase_interleave"
+    native, _ = X.select_rubin_buckets(problem, 4, 2048, prefill_worker=False)
+    assert native != ep32

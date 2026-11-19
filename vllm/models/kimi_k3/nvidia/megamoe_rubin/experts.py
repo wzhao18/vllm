@@ -211,12 +211,21 @@ def select_rubin_buckets(
     max_tokens: int,
     *,
     prefill_worker: bool,
+    knob_world_size: int | None = None,
 ) -> tuple[tuple[RubinBucket, ...], tuple[str, ...]]:
     """Every compiled bucket of a server, ascending (:func:`rubin_bucket_capacities`):
     the main bucket of :func:`select_rubin_bucket`, and below it the decode bucket,
     which keeps the main bucket's variant and knob record (only the capacity
     differs). Raises (``ValueError``) when the kernel's admission rules refuse that
-    record at the decode capacity."""
+    record at the decode capacity.
+
+    ``knob_world_size`` (benches only; servers leave it None): pick capacities and
+    records as at that EP size while the kernel runs at ``world_size``. A 1-node
+    slice that emulates EP32 per-GPU work (28 active experts per rank) passes 32 so
+    its MegaMoE runs the EP32 configuration (128-token decode bucket on its own
+    record, phase-interleaved, die-local) instead of the EP4 prefill records."""
+    if knob_world_size is not None:
+        world_size = knob_world_size
     main, notes = select_rubin_bucket(problem, world_size, max_tokens)
     caps = rubin_bucket_capacities(
         max_tokens, problem.top_k, prefill_worker=prefill_worker, world_size=world_size
