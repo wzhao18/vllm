@@ -65,6 +65,7 @@ def test_o_norm_mxfp8_staged_matches_direct(tokens, heads):
     outs = []
     for op in (torch.ops.k3_flashkda_split.o_norm_mxfp8, torch.ops.k3_flashkda_split.o_norm_mxfp8_ref):
         out = Mxfp8Buffer(T, P, "cuda", torch.bfloat16)
+        out.scale.zero_()  # the scale tile pads rows to 128
         op(x, gate, w, 1e-6, out.data, out.scale)
         outs.append(out)
     torch.accelerator.synchronize()

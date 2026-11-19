@@ -123,13 +123,13 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
 // One CTA per SM walks tokens t = blockIdx.x, + gridDim.x, ... A producer lane copies the
 // token's H x 128 o rows and its H x 128 gate columns (two contiguous rows of the inputs)
 // into a kOStages-deep shared-memory ring with one transaction barrier per stage; 8
-// consumer warps normalize the H rows from shared memory with the v1 lane map and
+// consumer warps (one 4-row step each at H = 96) normalize the H rows from shared memory with the v1 lane map and
 // arithmetic, except: the products x * rstd * w * sigmoid and the E4M3 scaling run as
 // packed f32x2 multiplies (same per-lane rounding), and sigmoid's 1 / (1 + e) is
 // rcp.approx (equal to div.full for 1 + e <= 2^126; a row with a larger 1 + e is redone
 // with div.full). Bit for bit the v1 output.
 constexpr int kOStages = 4;
-constexpr int kOConsumerWarps = 8;
+constexpr int kOConsumerWarps = 24;
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
