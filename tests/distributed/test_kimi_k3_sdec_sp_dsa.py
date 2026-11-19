@@ -181,7 +181,9 @@ def _case(box, size, rank, batch, parity, skew):
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream(dev)
     stream.wait_stream(torch.cuda.current_stream(dev))
-    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+    with torch.cuda.stream(stream), torch.cuda.graph(
+        graph, stream=stream, capture_error_mode="thread_local"
+    ):
         run_value(*args, totals, None, projected, out, w_uv_gathered)
     dist.barrier()
     for _ in range(2):
