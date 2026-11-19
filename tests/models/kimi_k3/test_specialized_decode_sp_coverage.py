@@ -103,9 +103,15 @@ class Fakes:
             def __init__(self, group, device, tp, rank, *, width, rows_cap):
                 fakes.events.add("SpFinalGather", tp, rank, width, rows_cap)
                 self.width, self.rows_cap, self.prepared = width, rows_cap, []
+                self.pushes = []
 
-            def prepare(self, rows):
-                self.prepared.append(rows)
+            def prepare(self, rows, cols=(0,), widths=None):
+                if cols == (0,):
+                    self.prepared.append(rows)
+
+            def prepare_push(self, rows, col, width):
+                assert 0 < col < self.width and width < self.width, (col, width)
+                self.pushes.append((rows, col))
 
         def boundary(decoder, comm, block, rows, mlp=None):
             assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
@@ -316,6 +322,8 @@ def fakes(monkeypatch):
         monkeypatch.setattr(
             torch.accelerator, "device_index", lambda index: contextlib.nullcontext()
         )
+        # the early aux gather's side stream (meta device: no CUDA stream)
+        monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: SimpleNamespace())
         return made, events
 
     return install
@@ -393,6 +401,10 @@ def test_collective_build_order_and_parities(fakes):
     assert events[0] == ("SpComm", TP, 0, WIDTH, 512)
     assert events[1] == ("SpFinalGather", TP, 0, 3 * WIDTH, 512)
     assert step.final_gather.prepared == list(ROWS)
+    # prefix-only capture: aux layers 2 and 5 push their columns early, per row
+    assert sorted(step.final_gather.pushes) == sorted(
+        (r, WIDTH * (1 + k)) for r in ROWS for k in range(2)
+    )
     assert events[2] == ("sp_dsa_box", HEADS, 512, 1)
     assert events[4] == ("prepare_recoverssm", True)  # deferred (the cores fold)
     cores = [e for e in events if e[0] in ("SpDsaCore", "SpKdaCore")]
