@@ -213,7 +213,7 @@ def make_bars(cfg) -> KdaPrefillBars:
             stages=cfg.smem_raw_stages,
             # fused conv: + the conv warpgroup, after the NEXT chunk's conv read this
             # stage's last 3 raw rows as its history
-            init_count=(CG0_GROUP_WARPS + CG1_WARPS + len(cfg.conv_warp_ids)) * cfg.threads_per_warp,
+            init_count=(CG0_GROUP_WARPS + CG1_WARPS + (len(cfg.conv_warp_ids) if (cfg.conv_dbg & 4) == 0 else 0)) * cfg.threads_per_warp,
             producer=Producer.THREAD,
         ),
         mb_vconv_ready=MBarrier(
@@ -302,7 +302,7 @@ def make_bars(cfg) -> KdaPrefillBars:
             alloc(cfg.scheduler_stages),
             spin=True,
             stages=cfg.scheduler_stages,
-            init_count=(15 + len(cfg.conv_warp_ids)) * cfg.threads_per_warp,
+            init_count=(15 + (len(cfg.conv_warp_ids) if (cfg.conv_dbg & 8) == 0 else 0)) * cfg.threads_per_warp,
             producer=Producer.THREAD,
         ),
     )
@@ -1221,6 +1221,8 @@ def conv_warp_group(
     K pairs and V rows 8-15), off the recurrence, ``vconv_stages`` chunks ahead of CG0's
     row loads and CG1's V reads; releases the previous raw stage's history rows."""
     nvvm.setmaxregister(cfg.num_regs_conv, nvvm.SetMaxRegisterAction.DECREASE)
+    if cutlass.const_expr(cfg.conv_dbg & 8):
+        return
     elect_one = nvvm.elect_sync()
     tid = (warp_idx - cfg.conv_warp_ids[0]) * cfg.threads_per_warp + lane_idx
     nthreads = len(cfg.conv_warp_ids) * cfg.threads_per_warp
@@ -1247,44 +1249,45 @@ def conv_warp_group(
         ch_q = head_o * cutlass.Int32(cfg.d_k)
         ch_k = ch_q + part_dim
         ch_v = ch_k + part_dim
-        for local_chunk_idx in cutlass.range(num_chunks_tile, unroll=1):
-            chunk_idx = compute_start + local_chunk_idx
-            cum = cum_chunk_base + local_chunk_idx
-            count = cutlass.Uint32(cum)
-            raw_stage = cutlass.Int32(count % cfg.smem_raw_stages)
-            prev_stage = cutlass.Int32((count + cutlass.Uint32(cfg.smem_raw_stages - 1)) % cfg.smem_raw_stages)
-            bars.mb_raw_ready[cutlass.Int32(count % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((count // cfg.smem_raw_bar_stages) % 2))
-            vc = cutlass.Int32(count % cfg.vconv_stages)
-            bars.mb_vconv_done[vc].wait(cutlass.Int32(((count // cfg.vconv_stages) + 1) % 2))
-            conv_args = (
-                tid,
-                raw_stage,
-                prev_stage,
-                chunk_idx * cfg.b_t,
-                batch_seqlen,
-                slot,
-                sQ_raw.data_ptr(),
-                sK_raw.data_ptr(),
-                sV_raw.data_ptr(),
-                sQc_raw.data_ptr() + vc * (cfg.d_k * cfg.b_t),
-                sKc_raw.data_ptr() + vc * (cfg.d_k * cfg.b_t),
-                sVc_raw.data_ptr() + vc * (cfg.d_v * cfg.b_t),
-                sConvW.data_ptr(),
-                mConvState,
-                ch_q,
-                ch_k,
-                ch_v,
-            )
-            if cutlass.const_expr((cfg.conv_dbg & 1) == 0):
-                if chunk_idx == cutlass.Int32(0):
-                    conv_chunk(cfg, 1, *conv_args)
-                else:
-                    prev = count - cutlass.Uint32(1)
-                    bars.mb_raw_ready[cutlass.Int32(prev % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((prev // cfg.smem_raw_bar_stages) % 2))
-                    conv_chunk(cfg, 0, *conv_args)
-            bars.mb_vconv_ready[vc].arrive()
-            if cum > cutlass.Int32(0):
-                bars.mb_raw_done[prev_stage].arrive()
+        if cutlass.const_expr((cfg.conv_dbg & 4) == 0):
+            for local_chunk_idx in cutlass.range(num_chunks_tile, unroll=1):
+                chunk_idx = compute_start + local_chunk_idx
+                cum = cum_chunk_base + local_chunk_idx
+                count = cutlass.Uint32(cum)
+                raw_stage = cutlass.Int32(count % cfg.smem_raw_stages)
+                prev_stage = cutlass.Int32((count + cutlass.Uint32(cfg.smem_raw_stages - 1)) % cfg.smem_raw_stages)
+                bars.mb_raw_ready[cutlass.Int32(count % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((count // cfg.smem_raw_bar_stages) % 2))
+                vc = cutlass.Int32(count % cfg.vconv_stages)
+                bars.mb_vconv_done[vc].wait(cutlass.Int32(((count // cfg.vconv_stages) + 1) % 2))
+                conv_args = (
+                    tid,
+                    raw_stage,
+                    prev_stage,
+                    chunk_idx * cfg.b_t,
+                    batch_seqlen,
+                    slot,
+                    sQ_raw.data_ptr(),
+                    sK_raw.data_ptr(),
+                    sV_raw.data_ptr(),
+                    sQc_raw.data_ptr() + vc * (cfg.d_k * cfg.b_t),
+                    sKc_raw.data_ptr() + vc * (cfg.d_k * cfg.b_t),
+                    sVc_raw.data_ptr() + vc * (cfg.d_v * cfg.b_t),
+                    sConvW.data_ptr(),
+                    mConvState,
+                    ch_q,
+                    ch_k,
+                    ch_v,
+                )
+                if cutlass.const_expr((cfg.conv_dbg & 1) == 0):
+                    if chunk_idx == cutlass.Int32(0):
+                        conv_chunk(cfg, 1, *conv_args)
+                    else:
+                        prev = count - cutlass.Uint32(1)
+                        bars.mb_raw_ready[cutlass.Int32(prev % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((prev // cfg.smem_raw_bar_stages) % 2))
+                        conv_chunk(cfg, 0, *conv_args)
+                bars.mb_vconv_ready[vc].arrive()
+                if cum > cutlass.Int32(0):
+                    bars.mb_raw_done[prev_stage].arrive()
         cum_chunk_base += num_chunks_tile
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
@@ -1446,7 +1449,7 @@ def compute0_warp_group(
             lane_row_group = lane_idx // 8
             lane_in_row_group = lane_idx - lane_row_group * 8
             decay_row = row_group_start + lane_row_group
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                 conv_vc = cutlass.Int32(chunk_count % cfg.vconv_stages)
                 conv_sQc = sQc_raw.data_ptr() + conv_vc * (cfg.d_k * cfg.b_t)
                 conv_sKc = sKc_raw.data_ptr() + conv_vc * (cfg.d_k * cfg.b_t)
@@ -1546,7 +1549,7 @@ def compute0_warp_group(
                 f16_segment = dim_base // 64
                 f16_segment_dim = dim_base - f16_segment * 64
                 raw_f16_idx = f16_segment * (cfg.b_t * 64) + decay_row * 64 + swizzle_xor_128b(decay_row, f16_segment_dim, elem_bytes=2)
-                if cutlass.const_expr(cfg.fused_conv):
+                if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                     if cutlass.const_expr(dim_half == 0):
                         bars.mb_vconv_ready[conv_vc].wait(cutlass.Int32((chunk_count // cfg.vconv_stages) % 2))
                     raw_q_frag = (conv_sQc + raw_f16_idx).load(count=8, alignment=16)
@@ -1568,7 +1571,7 @@ def compute0_warp_group(
                         q_sq_even, q_sq_odd = ffma2(q_val0, q_val1, q_val0, q_val1, q_sq_even, q_sq_odd)
                         k_sq_even, k_sq_odd = ffma2(k_val0, k_val1, k_val0, k_val1, k_sq_even, k_sq_odd)
 
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                 bars.mb_vconv_done[conv_vc].arrive()
             q_inv_norm = opaque_one
             k_inv_norm = opaque_one
@@ -2200,7 +2203,7 @@ def compute1_warp_group(
 
             # ---- Y stage: Y = Beta * (V - k state) -----------------------------------
             bars.mb_raw_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                 vc_stage = cutlass.Int32(cum_chunk_base % cfg.vconv_stages)
                 sV_ptr = sVc_raw.data_ptr() + vc_stage * (cfg.d_v * cfg.b_t)
                 bars.mb_vconv_ready[vc_stage].wait(cutlass.Int32((cum_chunk_base // cfg.vconv_stages) % 2))
@@ -2215,7 +2218,7 @@ def compute1_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                 bars.mb_vconv_done[vc_stage].arrive()
             bars.mb_beta_ready[raw_bar_index.idx].wait(raw_bar_index.phase)
             beta_fp32 = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
@@ -2526,7 +2529,7 @@ def compute1_warp_group(
             bars.mb_o_tmastg_ready[drain_o_stage].arrive()
 
             # ---- Y stage: Y = Beta * (V - k state) -----------------------------------
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                 vc_stage = cutlass.Int32(cum_chunk % cfg.vconv_stages)
                 sV_ptr = sVc_raw.data_ptr() + vc_stage * (cfg.d_v * cfg.b_t)
                 bars.mb_vconv_ready[vc_stage].wait(cutlass.Int32((cum_chunk // cfg.vconv_stages) % 2))
@@ -2541,7 +2544,7 @@ def compute1_warp_group(
                     4,
                     nvvm.MMALayout.COL,
                 )
-            if cutlass.const_expr(cfg.fused_conv):
+            if cutlass.const_expr(cfg.fused_conv and (cfg.conv_dbg & 4) == 0):
                 bars.mb_vconv_done[vc_stage].arrive()
             bars.mb_state_k_acc_ready.wait(state_k_acc_index.phase)
 
