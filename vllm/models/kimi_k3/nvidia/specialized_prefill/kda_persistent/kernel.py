@@ -2071,70 +2071,80 @@ def _pkd(
                         # (rows -3..-1: raw global rows of the sequence, else
                         # the sequence's conv history) and no other thread
                         # reads what it overwrites.
-                        cpl = ptl >> 6
-                        cc0 = (ptl & 63) * 2
-                        cpi = (cc0 & 7) >> 1
-                        cs8 = (cc0 >> 3) & 7
-                        cbk = cc0 >> 6
-                        cgrp = cpl * (H_ * D // 8) + hidx * (D // 8) + (cc0 >> 3)
-                        cseq0 = cutlass.Int32(cu[seq_idx])
-                        cw = cute.make_rmem_tensor((4, 2), cutlass.Float32)
-                        for ctap in cutlass.range_constexpr(4):
+                        fz_cpl = ptl >> 6
+                        fz_cc0 = (ptl & 63) * 2
+                        fz_cpi = (fz_cc0 & 7) >> 1
+                        fz_cs8 = (fz_cc0 >> 3) & 7
+                        fz_cbk = fz_cc0 >> 6
+                        fz_cgrp = fz_cpl * (H_ * D // 8) + hidx * (D // 8) + (fz_cc0 >> 3)
+                        fz_cseq0 = cutlass.Int32(cu[seq_idx])
+                        fz_cw = cute.make_rmem_tensor((4, 2), cutlass.Float32)
+                        for fz_ctap in cutlass.range_constexpr(4):
                             cute.autovec_copy(
-                                cute.local_tile(conv_wg, (1, 1, 2), (cgrp, ctap, cpi)),
-                                cw[(ctap, None)],
+                                cute.local_tile(conv_wg, (1, 1, 2), (fz_cgrp, fz_ctap, fz_cpi)),
+                                fz_cw[(fz_ctap, None)],
                             )
-                        cwin = cute.make_rmem_tensor((3, 2), cutlass.Float32)
-                        c2 = cute.make_rmem_tensor((2,), cutlass.BFloat16)
-                        for cj in cutlass.range_constexpr(3):
-                            ctok = r0 - 3 + cj
-                            if ctok >= cseq0:
-                                if cpl == 0:
+                        fz_cwin = cute.make_rmem_tensor((3, 2), cutlass.Float32)
+                        fz_c2 = cute.make_rmem_tensor((2,), cutlass.BFloat16)
+                        for fz_cj in cutlass.range_constexpr(3):
+                            fz_ctok = r0 - 3 + fz_cj
+                            if fz_ctok >= fz_cseq0:
+                                if fz_cpl == 0:
                                     cute.autovec_copy(
-                                        cute.local_tile(q, (1, 1, 2), (ctok, hidx, cc0 >> 1)), c2
+                                        cute.local_tile(q, (1, 1, 2), (fz_ctok, hidx, fz_cc0 >> 1)), fz_c2
                                     )
                                 else:
                                     cute.autovec_copy(
-                                        cute.local_tile(k, (1, 1, 2), (ctok, hidx, cc0 >> 1)), c2
+                                        cute.local_tile(k, (1, 1, 2), (fz_ctok, hidx, fz_cc0 >> 1)), fz_c2
                                     )
                             else:
                                 cute.autovec_copy(
                                     cute.local_tile(
                                         conv_hist,
                                         (1, 1, 2),
-                                        (seq_idx, 3 + ctok - cseq0, cgrp * 4 + cpi),
+                                        (seq_idx, 3 + fz_ctok - fz_cseq0, fz_cgrp * 4 + fz_cpi),
                                     ),
-                                    c2,
+                                    fz_c2,
                                 )
-                            cwin[cj, 0] = cutlass.Float32(c2[0])
-                            cwin[cj, 1] = cutlass.Float32(c2[1])
-                        for crr in cutlass.range_constexpr(C):
-                            if cpl == 0:
-                                csl = v_ki2[(crr, None, cpi, cs8, cbk, inst)]
+                            fz_cwin[fz_cj, 0] = cutlass.Float32(fz_c2[0])
+                            fz_cwin[fz_cj, 1] = cutlass.Float32(fz_c2[1])
+                        for fz_crr in cutlass.range_constexpr(C):
+                            if fz_cpl == 0:
+                                cute.autovec_copy(
+                                    v_ki2[(fz_crr, None, fz_cpi, fz_cs8, fz_cbk, inst)], fz_c2
+                                )
                             else:
-                                csl = v_kd2[(crr, None, cpi, cs8, cbk, inst)]
-                            cute.autovec_copy(csl, c2)
-                            cx0 = cutlass.Float32(c2[0])
-                            cx1 = cutlass.Float32(c2[1])
-                            ca0 = cwin[0, 0] * cw[0, 0]
-                            ca1 = cwin[0, 1] * cw[0, 1]
-                            ca0 = cwin[1, 0] * cw[1, 0] + ca0
-                            ca1 = cwin[1, 1] * cw[1, 1] + ca1
-                            ca0 = cwin[2, 0] * cw[2, 0] + ca0
-                            ca1 = cwin[2, 1] * cw[2, 1] + ca1
-                            ca0 = cx0 * cw[3, 0] + ca0
-                            ca1 = cx1 * cw[3, 1] + ca1
-                            cd0 = _exp2f(ca0 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
-                            cd1 = _exp2f(ca1 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
-                            c2[0] = cutlass.BFloat16(ca0 * cute.math.rcp(cd0, approx=True, ftz=True))
-                            c2[1] = cutlass.BFloat16(ca1 * cute.math.rcp(cd1, approx=True, ftz=True))
-                            cute.autovec_copy(c2, csl)
-                            cwin[0, 0] = cwin[1, 0]
-                            cwin[0, 1] = cwin[1, 1]
-                            cwin[1, 0] = cwin[2, 0]
-                            cwin[1, 1] = cwin[2, 1]
-                            cwin[2, 0] = cx0
-                            cwin[2, 1] = cx1
+                                cute.autovec_copy(
+                                    v_kd2[(fz_crr, None, fz_cpi, fz_cs8, fz_cbk, inst)], fz_c2
+                                )
+                            fz_cx0 = cutlass.Float32(fz_c2[0])
+                            fz_cx1 = cutlass.Float32(fz_c2[1])
+                            fz_ca0 = fz_cwin[0, 0] * fz_cw[0, 0]
+                            fz_ca1 = fz_cwin[0, 1] * fz_cw[0, 1]
+                            fz_ca0 = fz_cwin[1, 0] * fz_cw[1, 0] + fz_ca0
+                            fz_ca1 = fz_cwin[1, 1] * fz_cw[1, 1] + fz_ca1
+                            fz_ca0 = fz_cwin[2, 0] * fz_cw[2, 0] + fz_ca0
+                            fz_ca1 = fz_cwin[2, 1] * fz_cw[2, 1] + fz_ca1
+                            fz_ca0 = fz_cx0 * fz_cw[3, 0] + fz_ca0
+                            fz_ca1 = fz_cx1 * fz_cw[3, 1] + fz_ca1
+                            fz_cd0 = _exp2f(fz_ca0 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
+                            fz_cd1 = _exp2f(fz_ca1 * cutlass.Float32(-1.4426950408889634)) + cutlass.Float32(1.0)
+                            fz_c2[0] = cutlass.BFloat16(fz_ca0 * cute.math.rcp(fz_cd0, approx=True, ftz=True))
+                            fz_c2[1] = cutlass.BFloat16(fz_ca1 * cute.math.rcp(fz_cd1, approx=True, ftz=True))
+                            if fz_cpl == 0:
+                                cute.autovec_copy(
+                                    fz_c2, v_ki2[(fz_crr, None, fz_cpi, fz_cs8, fz_cbk, inst)]
+                                )
+                            else:
+                                cute.autovec_copy(
+                                    fz_c2, v_kd2[(fz_crr, None, fz_cpi, fz_cs8, fz_cbk, inst)]
+                                )
+                            fz_cwin[0, 0] = fz_cwin[1, 0]
+                            fz_cwin[0, 1] = fz_cwin[1, 1]
+                            fz_cwin[1, 0] = fz_cwin[2, 0]
+                            fz_cwin[1, 1] = fz_cwin[2, 1]
+                            fz_cwin[2, 0] = fz_cx0
+                            fz_cwin[2, 1] = fz_cx1
                         ibar.arrive_and_wait()
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
