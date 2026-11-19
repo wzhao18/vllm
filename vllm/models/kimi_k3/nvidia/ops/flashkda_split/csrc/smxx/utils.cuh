@@ -37,6 +37,30 @@
   #define BLOCK_LEVEL_K2 1
 #endif
 
+// Kimi-K3: K1 -> K2 per-(head, tile) ready flags for the overlapped prepare /
+// recurrence (fwd_launch.cu mode bit 9). K1 publishes after its bulk stores
+// have completed; K2's loader acquires before its bulk loads.
+__device__ __forceinline__ void k3_publish_tile(unsigned* flag) {
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+  asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(flag), "r"(1u)
+               : "memory");
+}
+__device__ __forceinline__ void k3_acquire_tile(unsigned const* flag) {
+  unsigned v;
+  long long spins = 0;
+  do {
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(flag)
+                 : "memory");
+    if (++spins == (1ll << 27)) {
+      printf("k3_flashkda_split: tile flag %p never published (block %d %d)\n",
+             flag, int(blockIdx.x), int(blockIdx.y));
+      __trap();
+    }
+  } while (v == 0);
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 __device__ __forceinline__ float ex2_approx_ftz_f32(float x) {
   float result;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));

@@ -34,7 +34,7 @@ G, HEAD, WINDOW, LAYERS = 6, 64, 2048, 5
 EPS = 1e-5
 MAX_POS = 1 << 20
 TP_HEADS = {16: 1, 8: 2, 4: 4}
-BATCHES = (1, 2, 3, 4, 7, 8, 12, 16, 28, 38, 50, 64, 128)
+BATCHES = (1, 2, 3, 4, 7, 8, 12, 16, 28, 38, 50, 64, 96, 128)
 # keys before the query rows: inside, at and past the window, at block / stage edges
 CONTEXTS = (
     1, 5, 31, 32, 33, 100, 1023, 1024, 2016, 2040, 2041, 2047, 2048, 2049, 2050,
@@ -587,6 +587,31 @@ def test_window_matches_stock(tp, q, layout):
         print(f"  B{B:4d}  {eo:.2e}  {es:.2e}  {rel:.2e}")
 
 
+def test_window_umma_redo(monkeypatch):
+    """GqaWindowUmma's moved-metadata path (its speculated first loads drained and
+    reissued, those ring slots' phases offset; forced on unmoved metadata): the
+    same cache bytes and rows as stock (TP4 q3, B96 on the GqaWindowUmma shape)."""
+    import functools
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_attention as ga,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_window_umma as gu,
+    )
+
+    compile_redo = functools.partial(gu.compile_window_umma.__wrapped__, redo=True)
+    monkeypatch.setattr(ga, "compile_window_umma", compile_redo)
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(96)
+    layers = make_layers(4, gen)
+    assert ga.window_shape(4, 3, 96)[1] == 0  # (the GqaWindowUmma shape)
+    state = install(layers, 3, (96,))
+    ours, stock, exact, lengths, differ = run_case(state, layers, "slots", 96, 3, gen)
+    assert differ == 0
+    check_rows(ours, stock, exact, 96, 3, "umma redo")
+
+
 @pytest.mark.parametrize("layout", ["rows", "slots"])
 def test_window_ignores_stale_nan(layout):
     """Never-zeroed blocks: NaN in every cache byte outside the requests' written keys
@@ -664,7 +689,8 @@ PADDED = ((1, 7), (1, 3), (4, 3), (4, 7))
 
 def padded_graphs(kv_heads, q):
     """(graph batch, real requests) pairs: every GQA_WINDOW bin whose launch shape
-    spreads a request over a cluster (16 splits at the small batches), its largest
+    spreads a request over a cluster (16 splits at the small batches) or runs
+    GqaWindowUmma, its largest
     batch (the open bin: twice the previous) padded by one request up to 16
     requests, by half above."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.gqa_attention import (  # noqa: E501
@@ -675,7 +701,7 @@ def padded_graphs(kv_heads, q):
     for top, shape in GQA_WINDOW[(kv_heads, q)]:
         graph = top or 2 * previous
         previous = top
-        if shape[0] > 1:
+        if shape[0] > 1 or shape[1] == 0:  # (cluster or GqaWindowUmma shapes)
             cases.append((graph, graph - 1 if graph <= 16 else graph // 2))
     return cases
 

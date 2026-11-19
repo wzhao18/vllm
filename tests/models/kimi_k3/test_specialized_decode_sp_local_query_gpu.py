@@ -4,8 +4,9 @@
 rank (dsa.local_query.LocalQuery, 96 heads, one GPU, no collective) against the stock
 decode's arithmetic: q_b (BF16 linear), the W_UK bmm, the stock decode query
 quantization (flashinfer_mla_sparse.decode_query_quant_pad) and the stock KV insert
-(RMSNorm + concat_and_cache_mla). Bitwise where the q_b tactic is the stock GEMM
-(cuBLAS), the stock tolerance on the split-K rows; the KV rows bitwise, unowned slots
+(RMSNorm + concat_and_cache_mla). The fused W_UK + pack (dsa.query_uk) sums the
+128-term dot products in another order: an FP8 ulp on rare bytes (q_pe bitwise where
+the q_b tactic is the stock GEMM); the KV rows bitwise, unowned slots
 untouched, the padded heads zero. The 4-rank SP DSA layer:
 tests/distributed/test_kimi_k3_sdec_sp_dsa.py."""
 
@@ -87,14 +88,16 @@ def test_local_query_matches_stock():
         assert ref is not None
         ours = query.view(torch.uint8)
         assert (ours[:, GATHERED:] == 0).all()  # padded heads
-        if local.projection.kinds[rows] in ("cublas", "lt"):
-            assert torch.equal(ours, ref.view(torch.uint8)), rows
-        else:  # split-K q_b: the K order differs (stock tolerance: an FP8 ulp)
-            exact = torch.cat([latent, q[..., 128:]], -1).float() / layer._q_scale
-            torch.testing.assert_close(
-                query[:, :GATHERED].float(), exact, atol=3e-2, rtol=7e-2
-            )
-            assert (ours != ref.view(torch.uint8)).float().mean() < 1e-3, rows
+        # The W_UK K order (and split-K q_b's) differs: an FP8 ulp at most, rarely
+        exact = torch.cat([latent, q[..., 128:]], -1).float() / layer._q_scale
+        torch.testing.assert_close(
+            query[:, :GATHERED].float(), exact, atol=3e-2, rtol=7e-2
+        )
+        differ = (ours != ref.view(torch.uint8)).float().mean()
+        print(f"rows {rows} ({local.projection.kinds[rows]}): {float(differ):.2e} differ")
+        assert differ < 1e-3, rows
+        if local.projection.kinds[rows] in ("cublas", "lt"):  # q_pe: bitwise
+            assert torch.equal(ours[:, :GATHERED, 512:], ref.view(torch.uint8)[:, :GATHERED, 512:])
 
         stock = torch.zeros_like(cache)
         kv = torch.empty(rows, 512, dtype=bf, device=dev)

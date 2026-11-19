@@ -25,7 +25,8 @@ is one ``ClusterAttnRes`` (one 7-CTA cluster per shard row, 1024 columns per CTA
 Each CTA only touches its own 1024 columns of its token's rows, so no grid-wide
 striding; every CTA polls rows that other ranks' CTAs of the same (column, token) store
 in the same kernel, so the whole grid must be co-resident on every rank (checked at
-build: 7 n CTAs within the per-SM occupancy).
+build: 7 n CTAs within the per-SM occupancy, held by a launch bound sized
+for n_max: ``_co_resident``).
 
 Precision: the AttnRes is ``ClusterAttnRes``'s (stock precision: FP32 statistics, the
 softmax over the saved blocks and the prefix, one BF16 rounding of the normed output;
@@ -50,9 +51,33 @@ from ..common.sp_comm import positive_zero32
 from .kernel import ClusterAttnRes
 
 CLUSTER = 7  # CTAs per row (1024 columns each)
-# (kind, nb) -> (CTAs per SM, SMs, cuOccupancyMaxActiveClusters) of the compiled codes
+# (kind, nb) -> (CTAs per SM, SMs, registers, smem allowance) of the compiled codes
 RESIDENCY: dict = {}
 THREADS = 128
+
+
+def _launch(kernel, args):
+    """One 7-CTA cluster per shard row. ``kernel.min_blocks`` (``_co_resident``): the
+    launch bound that keeps the whole grid co-resident at n_max rows."""
+    grid = (CLUSTER, args[1].shape[0], 1)
+    if cutlass.const_expr(kernel.min_blocks > 0):
+        launch(
+            kernel.kernel, args, grid, THREADS, CLUSTER,
+            min_blocks_per_mp=kernel.min_blocks,
+        )  # fmt: skip
+    else:
+        launch(kernel.kernel, args, grid, THREADS, CLUSTER)
+
+
+def _co_resident(n_max, device):
+    """CTAs per SM the grid of n_max 7-CTA clusters needs to be co-resident (every CTA
+    polls rows other ranks' CTAs store in the same kernel). The launch bound caps the
+    registers per thread at 64 K / (128 x bound): the 93-layer AttnRes (8 saved
+    blocks) compiles to 104 registers = 4 CTAs per SM, 848 < 896 CTAs at n_max 128 on
+    212 SMs; bound 5 (<= 102 registers) fits. Same instructions (register allocation
+    only), so the same numerics; ``_check_clusters`` still verifies the result."""
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return -(-CLUSTER * n_max // sms)
 
 
 class SpAttnResGather(ClusterAttnRes):
@@ -71,7 +96,7 @@ class SpAttnResGather(ClusterAttnRes):
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, (CLUSTER, args[1].shape[0], 1), THREADS, CLUSTER)
+        _launch(self, args)
 
     @cute.kernel
     def kernel(self, args):
@@ -120,7 +145,7 @@ class SpReduceAttnRes(ClusterAttnRes):
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, (CLUSTER, args[1].shape[0], 1), THREADS, CLUSTER)
+        _launch(self, args)
 
     @cute.kernel
     def kernel(self, args):
@@ -212,8 +237,9 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False):
     n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpAttnResGather(
-            nb, tp, has_delta=has_delta, write=write, mx=mx, **_options(device)
-        )
+            nb, tp, has_delta=has_delta, write=write, mx=mx,
+            min_blocks=_co_resident(n_max, device), **_options(device),
+        )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
         args = (row, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
         if mx:
@@ -237,7 +263,8 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
     with torch.accelerator.device_index(device):
         kernel = SpReduceAttnRes(
             nb, tp, has_delta=has_delta, push=push, gather_mx=gather_mx,
-            out_mx=out_mx, **_options(device),
+            out_mx=out_mx, min_blocks=_co_resident(n_max, device),
+            **_options(device),
         )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
         ring = fake((tp, cap // tp, 7168))

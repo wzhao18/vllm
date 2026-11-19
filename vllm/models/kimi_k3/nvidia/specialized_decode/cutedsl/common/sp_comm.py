@@ -84,6 +84,8 @@ THREADS = 256
 CHUNKS_PER_THREAD = 2
 # The poll's pending mask is one Uint32: at most this many chunks per thread.
 MAX_ROUNDS = 32
+# SpGatherCopy: 16-byte chunks per thread in flight per batch.
+GATHER_BATCH = 8
 
 
 @asm(Uint32, pure=True)
@@ -536,16 +538,51 @@ class SpGatherCopy:
         g = cta * THREADS + tid
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
-        for c in range(g, n * per, total):
-            row, column = c // per, c % per * 8
-            words = sanitized(load_vector(at(x, row, column)))
-            offset = Int64(rank * n + row) * width + column
-            multicast_words(mc + offset * 2, words)
-        for c in range(g, R * per, total):
-            row, column = c // per, c % per * 8
-            words = poll_chunk(at(box, row, column))
-            store_words(at(out, row, column), words)
-            rearm(at(box, row, column))
+        # GATHER_BATCH chunks per thread in flight: all loads, then all stores (a
+        # load -> store chain per chunk leaves the push and the poll latency bound).
+        U: cutlass.Constexpr = GATHER_BATCH
+        held = cute.make_rmem_tensor(4 * U, Uint32)
+        for base in range(g, n * per, total * U):
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < n * per:
+                    words = load_vector(at(x, c // per, c % per * 8))
+                    for j in cutlass.range_constexpr(4):
+                        held[4 * i + j] = words[j]
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < n * per:
+                    row, column = c // per, c % per * 8
+                    words = sanitized(tuple(held[4 * i + j] for j in range(4)))
+                    offset = Int64(rank * n + row) * width + column
+                    multicast_words(mc + offset * 2, words)
+        for base in range(g, R * per, total * U):
+            pending = Uint32(0)
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < R * per:
+                    pending |= Uint32(1 << i)
+            while pending != 0:
+                again = Uint32(0)
+                for i in cutlass.range_constexpr(U):
+                    if (pending >> i) & 1:
+                        c = base + i * total
+                        words = load_vector(
+                            at(box, c // per, c % per * 8), cache="volatile"
+                        )
+                        for j in cutlass.range_constexpr(4):
+                            held[4 * i + j] = words[j]
+                        if not published(words):
+                            again |= Uint32(1 << i)
+                pending = again
+            for i in cutlass.range_constexpr(U):
+                c = base + i * total
+                if c < R * per:
+                    row, column = c // per, c % per * 8
+                    store_words(
+                        at(out, row, column), tuple(held[4 * i + j] for j in range(4))
+                    )
+                    rearm(at(box, row, column))
 
 
 @cache
@@ -563,7 +600,9 @@ def compile_gather_copy(n, tp, cap, width, grid, device):
 
 class SpFinalGather:
     """The final all-gather's multicast box [rows_cap, width] (Lamport-armed; the
-    kernel re-arms what it reads). Collective to build."""
+    kernel re-arms what it reads). Collective to build. One box: a rank may start
+    the next gather only once every rank has read this one (a decode step's
+    collectives separate two final gathers)."""
 
     def __init__(self, group, device, tp, rank, *, width, rows_cap):
         if rows_cap % tp or width % 8:
