@@ -543,16 +543,23 @@ void router_topk(torch::Tensor& topk_values, torch::Tensor& topk_indices,
                                        dev) == cudaSuccess);
     return v;
   }();
-  // Up to 8 resident 256-thread blocks per SM (register bound at VPL 28-32).
-  const dim3 grid((unsigned)std::min<int64_t>((n + kWarps - 1) / kWarps,
-                                              (int64_t)sms * 8)),
-      block(kWarps * 32);
+  const dim3 block(kWarps * 32);
+  // One resident wave of blocks (grid-stride over the tokens), from the
+  // occupancy of the instantiation (register bound at VPL 28-32).
 #define K3_TOPK_LAUNCH(V)                                                   \
+  {                                                                         \
+    static int occ_##V = 0;                                                 \
+    if (occ_##V == 0)                                                       \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(                        \
+          &occ_##V, router_topk_kernel<V, kWarps>, kWarps * 32, 0);         \
+    const dim3 grid((unsigned)std::min<int64_t>(                            \
+        (n + kWarps - 1) / kWarps, (int64_t)sms * std::max(occ_##V, 1)));   \
   router_topk_kernel<V, kWarps><<<grid, block, 0, stream>>>(                \
       scores.data_ptr<float>(), scores.stride(0), bias.data_ptr<float>(),   \
       topk_values.data_ptr<float>(), topk_indices.data_ptr<int32_t>(),      \
       (int32_t)n, (int32_t)e, (int32_t)k, renormalize,                      \
-      (float)routed_scaling_factor)
+      (float)routed_scaling_factor);                                       \
+  }
   if (vpl <= 8) {
     K3_TOPK_LAUNCH(8);
   } else if (vpl <= 16) {
