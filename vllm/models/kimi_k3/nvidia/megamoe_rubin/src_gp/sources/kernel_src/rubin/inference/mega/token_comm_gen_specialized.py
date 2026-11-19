@@ -2246,6 +2246,8 @@ class GenphaseTokenComm(KernelComponent):
         route_rounds = ceil_div(self.routes_per_rank, self.threads_per_cta)
         buckets = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)
         offsets = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)
+        # Routing weights: they depend only on arrival, so they are pulled before the prefix wait too.
+        score_values = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)
 
         # Indexed with the (token, slot) pair rather than a flat route number. A
         # single integer coordinate into a rank-2 layout walks it leftmost-mode
@@ -2292,6 +2294,25 @@ class GenphaseTokenComm(KernelComponent):
                             sem="relaxed",
                             scope="cta",
                         )
+        if cutlass.const_expr(self.apply_topk_at_fc1):
+            # The scores travel right behind their route words; load each chunk's together, as for the routes.
+            score_slab_address = (
+                device_workspace.tensor(self.topk_score_inbox_region)[parity, source_rank, None].iterator.toint()
+            )
+            present_zero = Int64(call_tag) << Int64(32)
+            for chunk_begin in cutlass.range_constexpr(0, route_rounds, self.sort_poll_chunk):
+                chunk_rounds = min(self.sort_poll_chunk, route_rounds - chunk_begin)
+                score_words = cute.make_rmem_tensor((chunk_rounds,), Int64)
+                score_addresses = cute.make_rmem_tensor((chunk_rounds,), Int64)
+                for j in cutlass.range_constexpr(chunk_rounds):
+                    route = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
+                    score_addresses[j] = score_slab_address + Int64(route) * Int64(8)
+                    score_words[j] = present_zero
+                    if buckets[chunk_begin + j] != Int32(self.trash_bucket_index):
+                        score_words[j] = load_ll_word(score_addresses[j])
+                poll_ll_words(score_words, score_addresses, chunk_rounds, call_tag)
+                for j in cutlass.range_constexpr(chunk_rounds):
+                    score_values[chunk_begin + j] = Int32(score_words[j] & Int64(0xFFFFFFFF))
         iket.range_pop()
 
         if cutlass.const_expr(not self.sf_plain_transport):
@@ -2329,27 +2350,10 @@ class GenphaseTokenComm(KernelComponent):
         gather_index = device_workspace.tensor(self.gather_index_region)
         token_metadata = device_workspace.tensor(self.token_src_metadata_region)
         routed_scores = self.fc1_topk_scores_tensor(device_workspace)
-        if cutlass.const_expr(self.apply_topk_at_fc1):
-            score_slab_address = (
-                device_workspace.tensor(self.topk_score_inbox_region)[parity, source_rank, None].iterator.toint()
-            )
         dense_row_begin = source_rank * Int32(self.max_tokens_per_rank)
 
-        present_zero = Int64(call_tag) << Int64(32)
         for chunk_begin in cutlass.range_constexpr(0, route_rounds, self.sort_poll_chunk):
             chunk_rounds = min(self.sort_poll_chunk, route_rounds - chunk_begin)
-            if cutlass.const_expr(self.apply_topk_at_fc1):
-                # The scores travel right behind their route words; load the chunk's
-                # together, as for the routes.
-                score_words = cute.make_rmem_tensor((chunk_rounds,), Int64)
-                score_addresses = cute.make_rmem_tensor((chunk_rounds,), Int64)
-                for j in cutlass.range_constexpr(chunk_rounds):
-                    route = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
-                    score_addresses[j] = score_slab_address + Int64(route) * Int64(8)
-                    score_words[j] = present_zero
-                    if buckets[chunk_begin + j] != Int32(self.trash_bucket_index):
-                        score_words[j] = load_ll_word(score_addresses[j])
-                poll_ll_words(score_words, score_addresses, chunk_rounds, call_tag)
             for j in cutlass.range_constexpr(chunk_rounds):
                 route_round = chunk_begin + j
                 route = Int32(route_round * self.threads_per_cta) + thread_idx
@@ -2362,7 +2366,7 @@ class GenphaseTokenComm(KernelComponent):
                         src_rank=source_rank, src_token=source_token, src_topk=source_slot
                     ).pack()
                     if cutlass.const_expr(self.apply_topk_at_fc1):
-                        routed_scores[pool_row] = _int32_bits_to_float32(Int32(score_words[j] & Int64(0xFFFFFFFF)))
+                        routed_scores[pool_row] = _int32_bits_to_float32(score_values[route_round])
 
         if cutlass.const_expr(not self.sf_plain_transport):
             self._store_source_sf_rows(device_workspace, smem_base, thread_idx)
@@ -2542,36 +2546,43 @@ class GenphaseTokenComm(KernelComponent):
         loads_in_scan_order = self._smem_workspace.tensor(self.helper_totals_by_slot_region, smem_base)
         scan_order_experts = self._smem_workspace.tensor(self.helper_slot_to_expert_region, smem_base)
 
-        for padding_block, region_name in (
-            (self.token_padding_block, self.data_expert_base_region),
-            (self.sf_padding_block, self.sf_expert_base_region),
-        ):
-            self._publish_padded_prefix(
-                device_workspace,
-                loads_in_scan_order,
-                scan_order_experts,
-                scan_input,
-                prefix,
-                warp_totals,
-                padding_block,
-                region_name,
-                thread_idx,
-                lane_idx,
-                warp_idx,
-            )
-        if cutlass.const_expr(self.sf_plain_transport):
-            self._publish_refine_block_prefix(
-                device_workspace,
-                loads_in_scan_order,
-                scan_order_experts,
-                scan_input,
-                prefix,
-                warp_totals,
-                thread_idx,
-                lane_idx,
-                warp_idx,
-            )
-        self._publish_source_segment_bases(device_workspace, count_matrix, local_rank, thread_idx)
+        if cutlass.const_expr(not self.sf_plain_transport and self.ranks_experts_in_warp):
+            # Sort workers wait on this: one warp, one lane per slot, no CTA barrier and no global re-read.
+            if warp_idx == Int32(0):
+                self._publish_prefixes_in_warp(
+                    device_workspace, loads_in_scan_order, scan_order_experts, count_matrix, local_rank, lane_idx
+                )
+        else:
+            for padding_block, region_name in (
+                (self.token_padding_block, self.data_expert_base_region),
+                (self.sf_padding_block, self.sf_expert_base_region),
+            ):
+                self._publish_padded_prefix(
+                    device_workspace,
+                    loads_in_scan_order,
+                    scan_order_experts,
+                    scan_input,
+                    prefix,
+                    warp_totals,
+                    padding_block,
+                    region_name,
+                    thread_idx,
+                    lane_idx,
+                    warp_idx,
+                )
+            if cutlass.const_expr(self.sf_plain_transport):
+                self._publish_refine_block_prefix(
+                    device_workspace,
+                    loads_in_scan_order,
+                    scan_order_experts,
+                    scan_input,
+                    prefix,
+                    warp_totals,
+                    thread_idx,
+                    lane_idx,
+                    warp_idx,
+                )
+            self._publish_source_segment_bases(device_workspace, count_matrix, local_rank, thread_idx)
 
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
@@ -2826,6 +2837,50 @@ class GenphaseTokenComm(KernelComponent):
         if thread_idx == Int32(0):
             device_workspace.tensor(self.refine_block_total_region)[0] = block_total
         cute.arch.sync_threads()
+
+    @cute.jit
+    def _publish_prefixes_in_warp(
+        self,
+        device_workspace: DeviceWorkspace,
+        loads_in_scan_order: cute.Tensor,
+        scan_order_experts: cute.Tensor,
+        count_matrix: cute.Tensor,
+        local_rank: Int32,
+        lane_idx: Int32,
+    ) -> None:
+        """``_publish_padded_prefix`` (both row spaces) + ``_publish_source_segment_bases`` in one warp.
+
+        Same values: exclusive prefixes of the padded per-slot loads in slot order, stored keyed by expert, and
+        the per-(source, expert) segment starts in ring order from this rank. Valid when every bucket has a lane.
+        """
+        slot = lane_idx
+        live = slot < Int32(self.local_expert_bucket_count)
+        load = Int32(0)
+        expert = Int32(0)
+        if live:
+            load = loads_in_scan_order[slot]
+            expert = scan_order_experts[slot]
+        data_rows = padded_expert_rows(load, self.token_padding_block)
+        sf_rows = padded_expert_rows(load, self.sf_padding_block)
+        data_inclusive = data_rows
+        sf_inclusive = sf_rows
+        for step_log in cutlass.range_constexpr(5):
+            step = Int32(1 << step_log)
+            data_previous = Int32(cute.arch.shuffle_sync(data_inclusive, lane_idx - step))
+            sf_previous = Int32(cute.arch.shuffle_sync(sf_inclusive, lane_idx - step))
+            if lane_idx >= step:
+                data_inclusive = data_inclusive + data_previous
+                sf_inclusive = sf_inclusive + sf_previous
+        if live:
+            data_base = data_inclusive - data_rows
+            device_workspace.tensor(self.data_expert_base_region)[expert] = data_base
+            device_workspace.tensor(self.sf_expert_base_region)[expert] = sf_inclusive - sf_rows
+            source_expert_base = device_workspace.tensor(self.source_expert_base_region)
+            segment_begin = data_base
+            for ring_position in cutlass.range_constexpr(self.world_size):
+                source_rank = (local_rank + Int32(ring_position)) % Int32(self.world_size)
+                source_expert_base[source_rank, expert] = segment_begin
+                segment_begin = segment_begin + count_matrix[source_rank, expert]
 
     @cute.jit
     def _publish_source_segment_bases(
