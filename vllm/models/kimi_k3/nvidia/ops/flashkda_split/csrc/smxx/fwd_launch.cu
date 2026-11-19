@@ -176,8 +176,7 @@ void launch_fwd(
   if (mode & 2) {
     // Kimi-K3: bit 5 runs the recurrence on the tcgen05 tensor cores
     // (k2_tc.cuh; fp32 state, varlen, no checkpoint). Bit 8 dumps dev clock
-    // stamps over CTA (0, 0)'s final state; bit 7 splits the math over two
-    // warpgroups.
+    // stamps over CTA (0, 0)'s final state.
     if (mode & 32) {
       if constexpr (StateFP32 && !HasCheckpoint && IsVarlen &&
                     std::is_same_v<SeqlenT, int32_t>) {
@@ -191,13 +190,7 @@ void launch_fwd(
               cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
               ws_mqk, int((mode >> 8) & 1));
         };
-        if (mode & 128) {
-          launch(k2tc::k2_tc_kernel<HasStateIn, HasStateOut, 2>,
-                 k2tc::threads<2>());
-        } else {
-          launch(k2tc::k2_tc_kernel<HasStateIn, HasStateOut, 1>,
-                 k2tc::threads<1>());
-        }
+        launch(k2tc::k2_tc_kernel<HasStateIn, HasStateOut>, k2tc::kThreads);
         return;
       } else {
         throw std::runtime_error(

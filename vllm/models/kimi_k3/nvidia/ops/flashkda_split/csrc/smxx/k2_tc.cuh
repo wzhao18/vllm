@@ -47,16 +47,16 @@ constexpr int kOffGt = 17408;    // float[128]
 constexpr int kOffBeta = 17920;  // bf16[16]: bf16(sigmoid(beta))
 constexpr int kStageBytes = 18048;
 constexpr int kBarOff = kStages * kStageBytes;
-// barriers: full[S], empty[S], d1, d2, d3, d4, s_ready, u_ready, U_ready
-constexpr int kNumBars = 2 * kStages + 7;
+// barriers: full[S], empty[S], d1, d2, d3, d4
+constexpr int kNumBars = 2 * kStages + 4;
 constexpr int kDbgOff = kBarOff + 8 * kNumBars + 16;
 constexpr int kDbgChunk0 = 100, kDbgChunks = 32, kDbgSlots = 8;
 constexpr int kSmemBytes = kDbgOff + 8 * kDbgChunks * kDbgSlots;
 
 // Tensor-memory columns (one 256-column allocation per CTA).
 constexpr uint32_t kColP = 0;     // kr^T @ U, fp32 [128 v][128 k]
-constexpr uint32_t kColW = 128;   // kd @ S, fp32 [v][16 t]
-constexpr uint32_t kColOq = 144;  // qd @ S (same MMA, N = 32)
+constexpr uint32_t kColW = 128;   // kd @ S | qd @ S over k < 64 (N = 32)
+constexpr uint32_t kColW2 = 0;    // the k >= 64 half (P's columns, free then)
 constexpr uint32_t kColU = 160;   // INV @ u, then Mqk @ U (after U is read)
 constexpr uint32_t kColAu = 176;  // A operand u^T, bf16 [v][16 t]
 constexpr uint32_t kColAU = 184;  // A operand U^T
@@ -230,26 +230,21 @@ __device__ __forceinline__ void ffma2(float& d0, float& d1, float a0, float a1,
       : "f"(a0), "f"(a1), "f"(b0), "f"(b1), "f"(c0), "f"(c1));
 }
 
-template <int kWG>
-constexpr int threads() {
-  return 128 * kWG + 128;
-}
-// Registers per thread: launch budget (2 CTAs per SM), math warpgroups after
-// setmaxnreg.inc, the load/MMA warpgroup after setmaxnreg.dec.
-template <int kWG>
-constexpr int math_regs() {
-  return kWG == 1 ? 216 : 104;
-}
-template <int kWG>
-constexpr int aux_regs() {
-  return kWG == 1 ? 40 : 24;
+constexpr int kThreads = 256;
+
+__device__ __forceinline__ void math_sync() {
+  asm volatile("bar.sync 1, 128;" ::: "memory");
 }
 
-// kWG math warpgroups: warpgroup g owns state columns [g * 128 / kWG, ...) and
-// tokens [g * 16 / kWG, ...) of the per-chunk u / U / out work. Thread v of a
-// warpgroup is value row v (tensor-memory lane v).
-template <bool HasStateIn, bool HasStateOut, int kWG>
-__global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
+// Warps 0-3: math (thread v = value row v = tensor-memory lane v; thread 0
+// also issues every MMA, so a tensor-core hand-off costs one named barrier);
+// warp 4: loader; warp 5: tensor-memory owner; 6-7 idle. Per chunk c:
+//   MMA1(c)  W | Oq over two independent K halves (overlaps the state update
+//            of chunk c - 1: K-steps issue as each 32-column state batch lands)
+//   u -> MMA2 (U = INV @ u) -> U -> MMA3 (kr^T @ U; Mqk @ U)
+//   state update batches -> MMA1(c + 1) K-steps; then out(c).
+template <bool HasStateIn, bool HasStateOut>
+__global__ void __launch_bounds__(kThreads, 2) k2_tc_kernel(
     cutlass::bfloat16_t const* __restrict__ v_ptr,      // [T, H, 128]
     cutlass::bfloat16_t const* __restrict__ beta_t,     // [H, T] raw
     float const* __restrict__ init_state,               // [N, H, 128 v, 128 k]
@@ -263,9 +258,6 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
     cutlass::bfloat16_t const* __restrict__ ws_inv,
     cutlass::bfloat16_t const* __restrict__ ws_mqk, int flags) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-  constexpr int kCols = kD / kWG;     // state columns per warpgroup
-  constexpr int kT = kChunk / kWG;    // tokens per warpgroup
-  constexpr int kMathWarps = 4 * kWG;
   extern __shared__ __align__(1024) unsigned char smem[];
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -280,26 +272,20 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
   const uint32_t d2_bar = bar0 + 8 * (2 * kStages + 1);
   const uint32_t d3_bar = bar0 + 8 * (2 * kStages + 2);
   const uint32_t d4_bar = bar0 + 8 * (2 * kStages + 3);
-  const uint32_t s_ready = bar0 + 8 * (2 * kStages + 4);
-  const uint32_t u_ready = bar0 + 8 * (2 * kStages + 5);
-  const uint32_t U_ready = bar0 + 8 * (2 * kStages + 6);
   uint32_t* tmem_slot = reinterpret_cast<uint32_t*>(smem + kBarOff + 8 * kNumBars);
 
   if (threadIdx.x == 0) {
     for (int s = 0; s < kStages; ++s) {
       mbar_init(full_bar(s), 1);
-      mbar_init(empty_bar(s), kMathWarps);
+      mbar_init(empty_bar(s), 4);
     }
     mbar_init(d1_bar, 1);
     mbar_init(d2_bar, 1);
     mbar_init(d3_bar, 1);
     mbar_init(d4_bar, 1);
-    mbar_init(s_ready, kMathWarps);
-    mbar_init(u_ready, kMathWarps);
-    mbar_init(U_ready, kMathWarps);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (warp == kMathWarps + 1) {
+  if (warp == 5) {
     asm volatile(
         "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;" ::
             "r"(smem_u32(tmem_slot))
@@ -312,14 +298,14 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
   __syncthreads();
   tc_fence_after();
   const uint32_t tmem = *tmem_slot;
-  // Dev clock stamps (flags bit 0): CTA (0, 0), chunks kDbgChunk0.., slots
-  // 0-5 math thread 0, 6-7 the MMA thread; dumped over its final state.
+  // Dev clock stamps (flags bit 0): CTA (0, 0), chunks kDbgChunk0.., thread
+  // 0; dumped over its final state.
   long long* dbg = reinterpret_cast<long long*>(smem + kDbgOff);
   const bool dbg_cta = (flags & 1) && blockIdx.x == 0 && blockIdx.y == 0;
-  auto stamp = [&](int c, int slot) {
-    if (dbg_cta && c >= kDbgChunk0 && c < kDbgChunk0 + kDbgChunks)
-      dbg[(c - kDbgChunk0) * kDbgSlots + slot] = clock64();
-  };
+#define K2TC_STAMP(c, slot)                                                  \
+  if (dbg_cta && threadIdx.x == 0 && (c) >= kDbgChunk0 &&                     \
+      (c) < kDbgChunk0 + kDbgChunks)                                          \
+    dbg[((c) - kDbgChunk0) * kDbgSlots + (slot)] = clock64();
 
   const int bos = cu_seqlens[seq];
   const int eos = cu_seqlens[seq + 1];
@@ -331,22 +317,33 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
   const int n_chunks = (seq_len + kChunk - 1) / kChunk;
   const int64_t ws_head = int64_t(head) * total_tiles + tile_base;
 
-  if (warp < kMathWarps) {
-    // ---------------- math warps ----------------
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(math_regs<kWG>()));
-    const int g = warp >> 2;            // warpgroup: columns / tokens slice
-    const int v = threadIdx.x & 127;    // value row = tensor-memory lane
-    const int k0 = g * kCols;
-    const int t0 = g * kT;
-    const uint32_t trow = tmem + (uint32_t((warp & 3) * 32) << 16);
-    const bool st0 = (threadIdx.x == 0);
-    float S[kCols];
-    const int64_t state_off =
-        (int64_t(seq) * H + head) * kD * kD + int64_t(v) * kD + k0;
+  constexpr uint32_t kI16 = idesc_bf16(16, 0);
+  constexpr uint32_t kI32 = idesc_bf16(32, 0);
+  constexpr uint32_t kI128MN = idesc_bf16(128, 1);
+
+  if (warp < 4) {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 216;");
+    const int v = threadIdx.x;
+    const bool issuer = (threadIdx.x == 0);
+    const uint32_t trow = tmem + (uint32_t(warp * 32) << 16);
+    // MMA1 K-steps 2q, 2q + 1 of chunk c (state batch q of 32 columns):
+    // K half 0 accumulates at kColW, half 1 at kColW2.
+    auto mma1_steps = [&](int c, int q) {
+      const uint32_t sst = sbase + (c % kStages) * kStageBytes;
+#pragma unroll
+      for (int jj = 0; jj < 2; ++jj) {
+        const int j = 2 * q + jj;
+        const uint32_t d = tmem + (j < 4 ? kColW : kColW2);
+        mma_ts(d, tmem + kColAS + 8 * j, sdesc(sst + kOffKdq + 1024 * j, 512, 128),
+               kI32, (j & 3) != 0);
+      }
+    };
+    float S[kD];
+    const int64_t state_off = (int64_t(seq) * H + head) * kD * kD + int64_t(v) * kD;
     if constexpr (HasStateIn) {
       float4 const* src = reinterpret_cast<float4 const*>(init_state + state_off);
 #pragma unroll
-      for (int i = 0; i < kCols / 4; ++i) {
+      for (int i = 0; i < kD / 4; ++i) {
         float4 x = src[i];
         S[4 * i + 0] = bf16_round(x.x);
         S[4 * i + 1] = bf16_round(x.y);
@@ -355,19 +352,25 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
       }
     } else {
 #pragma unroll
-      for (int i = 0; i < kCols; ++i) S[i] = 0.0f;
+      for (int i = 0; i < kD; ++i) S[i] = 0.0f;
     }
 #pragma unroll
-    for (int q = 0; q < kCols / 32; ++q) {
+    for (int q = 0; q < 4; ++q) {
       uint32_t a[16];
 #pragma unroll
       for (int i = 0; i < 16; ++i) a[i] = pack_bf16(S[32 * q + 2 * i], S[32 * q + 2 * i + 1]);
-      K2TC_ST16(trow + kColAS + k0 / 2 + 16 * q, a);
+      K2TC_ST16(trow + kColAS + 16 * q, a);
     }
     tc_wait_st();
     tc_fence_before();
-    __syncwarp();
-    if (lane == 0) mbar_arrive(s_ready);
+    math_sync();
+    if (issuer && n_chunks > 0) {
+      mbar_wait(full_bar(0), 0);
+      tc_fence_after();
+#pragma unroll
+      for (int q = 0; q < 4; ++q) mma1_steps(0, q);
+      tc_commit(d1_bar);
+    }
 
     for (int c = 0; c < n_chunks; ++c) {
       const int stage = c % kStages;
@@ -376,89 +379,92 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
       unsigned char const* st = smem + stage * kStageBytes;
       const int valid = min(kChunk, seq_len - c * kChunk);
       mbar_wait(full_bar(stage), ph);
-      if (st0) stamp(c, 0);
+      K2TC_STAMP(c, 0);
 
-      // ---- u = bf16(bf16(v - bf16(W)) * beta) ----
+      // ---- u = bf16(bf16(v - bf16(W)) * beta), W = both K halves ----
       mbar_wait(d1_bar, cp);
       tc_fence_after();
-      if (st0) stamp(c, 1);
-      uint32_t w[kT], oq[kT];
-      if constexpr (kT == 16) {
-        K2TC_LD16(trow + kColW, w);
-        K2TC_LD16(trow + kColOq, oq);
-      } else {
-        K2TC_LD8(trow + kColW + t0, w);
-        K2TC_LD8(trow + kColOq + t0, oq);
-      }
-      tc_wait_ld();
-      cutlass::bfloat16_t const* vs =
-          reinterpret_cast<cutlass::bfloat16_t const*>(st + kOffV);
-      cutlass::bfloat16_t const* bs =
-          reinterpret_cast<cutlass::bfloat16_t const*>(st + kOffBeta);
-      uint32_t au[kT / 2];
+      K2TC_STAMP(c, 1);
+      uint32_t oqb[8];
+      {
+        uint32_t wa[16], wb[16];
+        K2TC_LD16(trow + kColW, wa);
+        K2TC_LD16(trow + kColW2, wb);
+        tc_wait_ld();
+        cutlass::bfloat16_t const* vs =
+            reinterpret_cast<cutlass::bfloat16_t const*>(st + kOffV);
+        cutlass::bfloat16_t const* bs =
+            reinterpret_cast<cutlass::bfloat16_t const*>(st + kOffBeta);
+        uint32_t au[8];
 #pragma unroll
-      for (int i = 0; i < kT / 2; ++i) {
-        float uu[2];
+        for (int i = 0; i < 8; ++i) {
+          float uu[2];
 #pragma unroll
-        for (int e = 0; e < 2; ++e) {
-          const int t = t0 + 2 * i + e;
-          cutlass::bfloat16_t vv =
-              t < valid ? vs[t * kD + v] : cutlass::bfloat16_t(0.0f);
-          cutlass::bfloat16_t wb(__uint_as_float(w[2 * i + e]));
-          cutlass::bfloat16_t x = (vv - wb) * bs[t];
-          uu[e] = float(x);
+          for (int e = 0; e < 2; ++e) {
+            const int t = 2 * i + e;
+            cutlass::bfloat16_t vv =
+                t < valid ? vs[t * kD + v] : cutlass::bfloat16_t(0.0f);
+            cutlass::bfloat16_t wbf(__uint_as_float(wa[t]) + __uint_as_float(wb[t]));
+            cutlass::bfloat16_t x = (vv - wbf) * bs[t];
+            uu[e] = float(x);
+          }
+          au[i] = pack_bf16(uu[0], uu[1]);
         }
-        au[i] = pack_bf16(uu[0], uu[1]);
-      }
-      if constexpr (kT == 16) {
         K2TC_ST8(trow + kColAu, au);
-      } else {
-        K2TC_ST4(trow + kColAu + t0 / 2, au);
-      }
-      tc_wait_st();
-      tc_fence_before();
-      __syncwarp();
-      if (lane == 0) mbar_arrive(u_ready);
-      uint32_t oqb[kT / 2];
+        tc_wait_st();
+        tc_fence_before();
+        math_sync();
+        if (issuer) {
+          tc_fence_after();
+          mma_ts(tmem + kColU, tmem + kColAu,
+                 sdesc(sbase + stage * kStageBytes + kOffInv, 256, 128), kI16, 0);
+          tc_commit(d2_bar);
+        }
+        K2TC_LD16(trow + kColW + 16, wa);
+        K2TC_LD16(trow + kColW2 + 16, wb);
+        tc_wait_ld();
 #pragma unroll
-      for (int i = 0; i < kT / 2; ++i)
-        oqb[i] = pack_bf16(__uint_as_float(oq[2 * i]), __uint_as_float(oq[2 * i + 1]));
+        for (int i = 0; i < 8; ++i)
+          oqb[i] = pack_bf16(__uint_as_float(wa[2 * i]) + __uint_as_float(wb[2 * i]),
+                             __uint_as_float(wa[2 * i + 1]) + __uint_as_float(wb[2 * i + 1]));
+      }
 
       // ---- U = bf16(INV @ u) ----
       mbar_wait(d2_bar, cp);
       tc_fence_after();
       {
-        uint32_t uacc[kT], aU[kT / 2];
-        if constexpr (kT == 16) {
-          K2TC_LD16(trow + kColU, uacc);
-        } else {
-          K2TC_LD8(trow + kColU + t0, uacc);
-        }
+        uint32_t uacc[16], aU[8];
+        K2TC_LD16(trow + kColU, uacc);
         tc_wait_ld();
 #pragma unroll
-        for (int i = 0; i < kT / 2; ++i)
+        for (int i = 0; i < 8; ++i)
           aU[i] = pack_bf16(__uint_as_float(uacc[2 * i]), __uint_as_float(uacc[2 * i + 1]));
-        if constexpr (kT == 16) {
-          K2TC_ST8(trow + kColAU, aU);
-        } else {
-          K2TC_ST4(trow + kColAU + t0 / 2, aU);
-        }
+        K2TC_ST8(trow + kColAU, aU);
       }
       tc_wait_st();
       tc_fence_before();
-      __syncwarp();
-      if (lane == 0) mbar_arrive(U_ready);
-      if (st0) stamp(c, 2);
+      math_sync();
+      if (issuer) {
+        tc_fence_after();
+        const uint32_t sst = sbase + stage * kStageBytes;
+        mma_ts(tmem + kColP, tmem + kColAU, sdesc(sst + kOffKr, 128, 256), kI128MN, 0);
+        tc_commit(d3_bar);
+        mma_ts(tmem + kColU, tmem + kColAU, sdesc(sst + kOffMqk, 256, 128), kI16, 0);
+        tc_commit(d4_bar);
+      }
+      K2TC_STAMP(c, 2);
 
-      // ---- S = fma(S, g_total, kr^T @ U); bf16(S^T) -> A operand ----
+      // ---- S = fma(S, g_total, kr^T @ U) per 32-column batch; each batch's
+      // bf16(S^T) feeds MMA1(c + 1) as soon as it lands ----
       mbar_wait(d3_bar, cp);
       tc_fence_after();
-      if (st0) stamp(c, 3);
-      float const* gt = reinterpret_cast<float const*>(st + kOffGt) + k0;
+      K2TC_STAMP(c, 3);
+      const bool more = c + 1 < n_chunks;
+      float const* gt = reinterpret_cast<float const*>(st + kOffGt);
 #pragma unroll
-      for (int q = 0; q < kCols / 32; ++q) {
+      for (int q = 0; q < 4; ++q) {
         uint32_t p[32];
-        K2TC_LD32(trow + kColP + k0 + 32 * q, p);
+        K2TC_LD32(trow + kColP + 32 * q, p);
         tc_wait_ld();
         uint32_t a[16];
 #pragma unroll
@@ -472,55 +478,57 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
           a[i / 2] = pack_bf16(s4[0], s4[1]);
           a[i / 2 + 1] = pack_bf16(s4[2], s4[3]);
         }
-        K2TC_ST16(trow + kColAS + k0 / 2 + 16 * q, a);
+        K2TC_ST16(trow + kColAS + 16 * q, a);
+        if (more) {
+          tc_wait_st();
+          tc_fence_before();
+          math_sync();
+          if (issuer) {
+            if (q == 0) mbar_wait(full_bar((c + 1) % kStages), uint32_t((c + 1) / kStages) & 1u);
+            tc_fence_after();
+            mma1_steps(c + 1, q);
+            if (q == 3) tc_commit(d1_bar);
+          }
+        }
       }
-      tc_wait_st();
-      tc_fence_before();
-      __syncwarp();
-      if (lane == 0) mbar_arrive(s_ready);
-      if (st0) stamp(c, 4);
+      K2TC_STAMP(c, 4);
 
-      // ---- out = bf16(bf16(Oq) + bf16(Mqk @ U)) (off the state chain) ----
+      // ---- out(c) = bf16(bf16(Oq) + bf16(Mqk @ U)), under MMA1(c + 1) ----
       mbar_wait(d4_bar, cp);
       tc_fence_after();
       {
-        uint32_t o2[kT];
-        if constexpr (kT == 16) {
-          K2TC_LD16(trow + kColU, o2);
-        } else {
-          K2TC_LD8(trow + kColU + t0, o2);
-        }
+        uint32_t o2[16];
+        K2TC_LD16(trow + kColU, o2);
         tc_wait_ld();
-        cutlass::bfloat16_t* dst = out_ptr +
-                                   (int64_t(bos) + c * kChunk + t0) * H * kD +
+        cutlass::bfloat16_t* dst = out_ptr + (int64_t(bos) + c * kChunk) * H * kD +
                                    int64_t(head) * kD + v;
 #pragma unroll
-        for (int i = 0; i < kT / 2; ++i) {
+        for (int i = 0; i < 8; ++i) {
 #pragma unroll
           for (int e = 0; e < 2; ++e) {
             const int t = 2 * i + e;
             float a = e ? bf16_hi(oqb[i]) : bf16_lo(oqb[i]);
             float b = bf16_round(__uint_as_float(o2[t]));
-            if (t0 + t < valid) dst[int64_t(t) * H * kD] = cutlass::bfloat16_t(a + b);
+            if (t < valid) dst[int64_t(t) * H * kD] = cutlass::bfloat16_t(a + b);
           }
         }
       }
       tc_fence_before();
       __syncwarp();
-      if (st0) stamp(c, 5);
+      K2TC_STAMP(c, 5);
       if (lane == 0) mbar_arrive(empty_bar(stage));
     }
     if constexpr (HasStateOut) {
       float4* dst = reinterpret_cast<float4*>(final_state + state_off);
 #pragma unroll
-      for (int i = 0; i < kCols / 4; ++i) {
+      for (int i = 0; i < kD / 4; ++i) {
         dst[i] = make_float4(bf16_round(S[4 * i]), bf16_round(S[4 * i + 1]),
                              bf16_round(S[4 * i + 2]), bf16_round(S[4 * i + 3]));
       }
     }
   } else {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(aux_regs<kWG>()));
-    if (warp == kMathWarps) {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+    if (warp == 4) {
       // ---------------- loader ----------------
       for (int c = 0; c < n_chunks; ++c) {
         const int stage = c % kStages;
@@ -545,7 +553,6 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
           mbar_expect_tx(fb, 3 * 4096 + 3 * 512 + uint32_t(valid) * 256);
         }
         __syncwarp();
-        // kd / qd 8-wide K groups (256 B each) interleaved into kd|qd.
         {
           const int gk = lane & 15;
           cutlass::bfloat16_t const* src =
@@ -562,50 +569,16 @@ __global__ void __launch_bounds__(threads<kWG>(), 2) k2_tc_kernel(
         if (lane == 19) bulk_g2s(sst + kOffGt, ws_gt + wi * kD, 512, fb);
         __syncwarp();
       }
-    } else if (warp == kMathWarps + 1) {
-      // ---------------- MMA issuer ----------------
-      if (lane == 0) {
-        constexpr uint32_t kI16 = idesc_bf16(16, 0);
-        constexpr uint32_t kI32 = idesc_bf16(32, 0);
-        constexpr uint32_t kI128MN = idesc_bf16(128, 1);
-        for (int c = 0; c < n_chunks; ++c) {
-          const int stage = c % kStages;
-          const uint32_t ph = uint32_t(c / kStages) & 1u;
-          const uint32_t cp = uint32_t(c) & 1u;
-          const uint32_t sst = sbase + stage * kStageBytes;
-          mbar_wait(full_bar(stage), ph);
-          mbar_wait(s_ready, cp);
-          tc_fence_after();
-          stamp(c, 6);
-#pragma unroll
-          for (int j = 0; j < kD / 16; ++j) {
-            mma_ts(tmem + kColW, tmem + kColAS + 8 * j,
-                   sdesc(sst + kOffKdq + 1024 * j, 512, 128), kI32, j > 0);
-          }
-          tc_commit(d1_bar);
-          stamp(c, 7);
-          mbar_wait(u_ready, cp);
-          tc_fence_after();
-          mma_ts(tmem + kColU, tmem + kColAu, sdesc(sst + kOffInv, 256, 128), kI16, 0);
-          tc_commit(d2_bar);
-          mbar_wait(U_ready, cp);
-          tc_fence_after();
-          mma_ts(tmem + kColP, tmem + kColAU, sdesc(sst + kOffKr, 128, 256), kI128MN, 0);
-          tc_commit(d3_bar);
-          mma_ts(tmem + kColU, tmem + kColAU, sdesc(sst + kOffMqk, 256, 128), kI16, 0);
-          tc_commit(d4_bar);
-        }
-      }
-      __syncwarp();
     }
   }
+#undef K2TC_STAMP
   tc_fence_before();
   __syncthreads();
   if (dbg_cta && HasStateOut && threadIdx.x < kDbgChunks * kDbgSlots) {
     reinterpret_cast<long long*>(final_state + (int64_t(seq) * H + head) * kD * kD)
         [threadIdx.x] = dbg[threadIdx.x];
   }
-  if (warp == kMathWarps + 1) {
+  if (warp == 5) {
     tc_fence_after();
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;" ::"r"(tmem)
                  : "memory");
