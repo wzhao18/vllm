@@ -169,27 +169,110 @@ __device__ __forceinline__ float rcp_approx(float x) {
   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
-__device__ __forceinline__ float situ_activation_fast(float g, float u,
-                                                      float k_a, float k_b,
-                                                      float k_c, float bb,
-                                                      int a_pow, bool clamp_up) {
-  const float eb = fminf(ex2_approx(g * k_b), 1.0e9f);
-  float ea;
-  if (a_pow > 0) {
+struct Situ4Consts {
+  float2 k_a, k_b, k_c, bb;  // per-element constants, duplicated for f32x2
+  int a_pow;                 // A = B^a_pow when beta/2 is 1..4, else 0
+  bool clamp_up;
+};
+
+__device__ __forceinline__ float2 f2mul(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fmul2_rn(a, b);
+#else
+  return make_float2(a.x * b.x, a.y * b.y);
+#endif
+}
+__device__ __forceinline__ float2 f2fma(float2 a, float2 b, float2 c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __ffma2_rn(a, b, c);
+#else
+  return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+__device__ __forceinline__ float2 f2add(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fadd2_rn(a, b);
+#else
+  return make_float2(a.x + b.x, a.y + b.y);
+#endif
+}
+__device__ __forceinline__ float2 bf16x2_to_f2(uint32_t w) {
+  return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
+// SiTU of two (gate, up) BF16 pairs, rounded to BF16 (the stock activation
+// output dtype), returned as packed bf16x2.
+__device__ __forceinline__ __nv_bfloat162 situ4_pair(uint32_t gw, uint32_t uw,
+                                                     const Situ4Consts& c) {
+  const float2 one = make_float2(1.0f, 1.0f);
+  const float2 neg_one = make_float2(-1.0f, -1.0f);
+  const float2 g = bf16x2_to_f2(gw), u = bf16x2_to_f2(uw);
+  const float2 xb = f2mul(g, c.k_b);
+  float2 eb = make_float2(fminf(ex2_approx(xb.x), 1.0e9f),
+                          fminf(ex2_approx(xb.y), 1.0e9f));
+  float2 ea;
+  if (c.a_pow > 0) {
     ea = eb;
-    for (int i = 1; i < a_pow; ++i) ea *= eb;
+    for (int i = 1; i < c.a_pow; ++i) ea = f2mul(ea, eb);
   } else {
-    ea = ex2_approx(g * k_a);
+    const float2 xa = f2mul(g, c.k_a);
+    ea = make_float2(ex2_approx(xa.x), ex2_approx(xa.y));
   }
-  if (clamp_up) {
-    const float ec = fminf(ex2_approx(u * k_c), 1.0e9f);
-    const float num = (fmaf(eb, -1.0f, 1.0f) * fmaf(ec, -1.0f, 1.0f)) * bb;
-    const float den = ((ea + 1.0f) * (eb + 1.0f)) * (ec + 1.0f);
-    return num * rcp_approx(den);
+  float2 num, den;
+  if (c.clamp_up) {
+    const float2 xc = f2mul(u, c.k_c);
+    const float2 ec = make_float2(fminf(ex2_approx(xc.x), 1.0e9f),
+                                  fminf(ex2_approx(xc.y), 1.0e9f));
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), f2fma(ec, neg_one, one)), c.bb);
+    den = f2mul(f2mul(f2add(ea, one), f2add(eb, one)), f2add(ec, one));
+  } else {
+    num = f2mul(f2mul(f2fma(eb, neg_one, one), c.bb), u);
+    den = f2mul(f2add(ea, one), f2add(eb, one));
   }
-  const float num = fmaf(eb, -1.0f, 1.0f) * bb;
-  const float den = (ea + 1.0f) * (eb + 1.0f);
-  return (num * rcp_approx(den)) * u;
+  const float2 r = f2mul(num, make_float2(rcp_approx(den.x), rcp_approx(den.y)));
+  return __float22bfloat162_rn(r);
+}
+
+// SiTU + MXFP8 quant of one 8-column vector (a: gate, b: up): the same E8M0 /
+// E4M3 steps as quant8_store, on packed operands.
+__device__ __forceinline__ void situ4_quant_store(
+    const uint4& a, const uint4& b, const Situ4Consts& c,
+    uint8_t* __restrict__ q, uint8_t* __restrict__ sf, int64_t row, int col8,
+    int sf_col_base, int padded_cols, bool real) {
+  __nv_bfloat162 h[4];
+  if (real) {
+    h[0] = situ4_pair(a.x, b.x, c);
+    h[1] = situ4_pair(a.y, b.y, c);
+    h[2] = situ4_pair(a.z, b.z, c);
+    h[3] = situ4_pair(a.w, b.w, c);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = __float2bfloat162_rn(0.0f);
+  }
+  // amax on the BF16 values (exact).
+  __nv_bfloat162 m = __hmax2(__habs2(h[0]), __habs2(h[1]));
+  m = __hmax2(m, __hmax2(__habs2(h[2]), __habs2(h[3])));
+  float amax = fmaxf(__low2float(m), __high2float(m));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+  const uint32_t e = float_to_ue8m0(amax * (1.0f / 448.0f));
+  const float inv = ue8m0_to_inv_scale(e);
+  if (!real) return;
+  const float2 inv2 = make_float2(inv, inv);
+  uint32_t w[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 v = f2mul(__bfloat1622float2(h[i]), inv2);
+    w[i] = (uint32_t)fp8x2(v.x, v.y);
+  }
+  uint2 packed;
+  packed.x = w[0] | (w[1] << 16);
+  packed.y = w[2] | (w[3] << 16);
+  *reinterpret_cast<uint2*>(q) = packed;
+  if ((threadIdx.x & 3) == 0) {
+    sf[swizzled_sf_offset(row, sf_col_base + (col8 >> 2), padded_cols)] =
+        (uint8_t)e;
+  }
 }
 
 // Vectors (8 columns) per thread per trip: their loads are all issued before
@@ -224,25 +307,6 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
     const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&a);
 #pragma unroll
     for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
-  } else if (MODE == 4) {
-    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
-    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
-    // inv_beta / inv_linear_beta carry beta / linear_beta here (see kernel).
-    const float bt = inv_beta, lbt = inv_linear_beta;
-    const float log2e = 1.4426950408889634f;
-    const float k_a = -log2e, k_b = -2.0f * log2e / bt;
-    const float k_c = clamp_up ? -2.0f * log2e / lbt : 0.0f;
-    const float bb = clamp_up ? bt * lbt : bt;
-    const float half = 0.5f * bt;
-    const int a_pow =
-        (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float r = situ_activation_fast(bf16_bits_to_float(g16[i]),
-                                           bf16_bits_to_float(u16[i]), k_a,
-                                           k_b, k_c, bb, a_pow, clamp_up);
-      out[i] = bf16_bits_to_float(float_to_bf16_bits(r));
-    }
   } else if (MODE == 1 || MODE == 2) {
     const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
     const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
@@ -293,10 +357,22 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   const int vecs_per_row = d / 8;
   const int64_t total = rows_pad * vecs_per_row;
   const bool clamp_up = linear_beta > 0.0f;
-  // MODE 4 takes beta / linear_beta themselves (its constants derive from them).
-  const float inv_beta = MODE == 1 ? 1.0f / beta : (MODE == 4 ? beta : 0.f);
-  const float inv_linear_beta =
-      clamp_up ? (MODE == 4 ? linear_beta : 1.0f / linear_beta) : 0.0f;
+  const float inv_beta = MODE == 1 ? 1.0f / beta : 0.f;
+  const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+  Situ4Consts c4;
+  if (MODE == 4) {
+    const float log2e = 1.4426950408889634f;
+    const float kb = -2.0f * log2e / beta;
+    const float kc = clamp_up ? -2.0f * log2e / linear_beta : 0.0f;
+    const float bb = clamp_up ? beta * linear_beta : beta;
+    const float half = 0.5f * beta;
+    c4.k_a = make_float2(-log2e, -log2e);
+    c4.k_b = make_float2(kb, kb);
+    c4.k_c = make_float2(kc, kc);
+    c4.bb = make_float2(bb, bb);
+    c4.a_pow = (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+    c4.clamp_up = clamp_up;
+  }
   // Every lane runs the same trip count (total is a multiple of 4 vectors,
   // blockDim a multiple of 32), so the block-amax shuffles are uniform; the
   // 4 lanes of an MXFP8 block hold consecutive vectors in every sub-trip.
@@ -344,6 +420,14 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
       const int64_t row = live ? rows_u[u] : 0;
       const int col = live ? cols_u[u] * 8 : 0;
       const bool real = live && row < rows;
+      if (MODE == 4) {
+        situ4_quant_store(a[u], b[u], c4, q + row * q_stride + col, sf, row,
+                          col / 8, sf_col_base, padded_cols, real);
+        if (live && !real && (threadIdx.x & 3) == 0) {
+          sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+        }
+        continue;
+      }
       float out[8];
       if (real) {
         act_compute<MODE>(a[u], b[u], out, beta, linear_beta, clamp_up,
