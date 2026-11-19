@@ -1601,12 +1601,12 @@ class CandSelect:
                                 slot = atom_add_shared(info_a + 12, Uint32(1))
                                 out[orow + Int32(slot)] = pos
                             else:
-                                j = atom_add_shared(info_a + 16, Uint32(1))
-                                st_shared_u32(ties_a + j * 4, Uint32(pos))
+                                jt = atom_add_shared(info_a + 16, Uint32(1))
+                                st_shared_u32(ties_a + jt * 4, Uint32(pos))
                 cute.arch.sync_threads()
                 if m != need:
-                    for j in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
-                        p = ld_shared_u32(ties_a + j * 4)
+                    for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
+                        p = ld_shared_u32(ties_a + jt * 4)
                         rank = Uint32(0)
                         for x in cutlass.range(Int32(m), unroll=4):
                             if ld_shared_u32(ties_a + x * 4) < p:
