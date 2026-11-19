@@ -130,7 +130,7 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
 // with div.full). Bit for bit the v1 output.
 constexpr int kOStages = 4;
 #ifndef K3_ONORM_WARPS
-#define K3_ONORM_WARPS 8
+#define K3_ONORM_WARPS 6
 #endif
 constexpr int kOConsumerWarps = K3_ONORM_WARPS;
 constexpr int kOSteps = (96 + 4 * kOConsumerWarps - 1) / (4 * kOConsumerWarps);  // 4-row steps per warp at H = 96
