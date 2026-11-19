@@ -96,7 +96,7 @@ P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M
 NS = 6  # 64-key KV stages
 NP = 3  # P buffers
 NLD = 9  # gather warps
-GATHER_PARTS = 2  # issuing lanes per quad
+GATHER_PARTS = 1  # issuing lanes per quad (P-MLA run95)
 STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
 # warps: 0-3 / 4-7 softmax warpgroups (thread = head; warps 3 and 7 hold padding rows
 # 96-127 and only take part in barriers, rescales, Q copies and epilogues), 8 PV,
@@ -199,6 +199,11 @@ def mma_cb_e(d, a, b, idesc, acc, op: str):
             f"@e tcgen05.mma.cta_group::1.kind::f8f6f4.collector::b::{op} [$0], $1, $2, $3, p; }}")
     return code, "r,l,l,r,r,~{memory}", (Uint32(d), Uint64(a), Uint64(b), Uint32(idesc),
                                           Uint32(acc))
+
+
+@asm()
+def bulk_wait_read2():
+    return "cp.async.bulk.wait_group.read 2;", "~{memory}", ()
 
 
 @asm()
@@ -830,9 +835,11 @@ class SparseMlaPrefillH8:
         mk = lane // 8  # matrix this lane addresses in stmatrix.x4
         inv_base = base + Uint32(OFF_INV)
         for b in cutlass.range_constexpr(4):
-            if cutlass.const_expr(b >= 1):
+            # staging halves alternate between Q atoms 0-1 and 2-3 (block b % 2): block
+            # b reuses block b - 2's buffer once its two stores have read it
+            if cutlass.const_expr(b >= 2):
                 if sp == 0 and lane == 0:
-                    bulk_wait_read0()
+                    bulk_wait_read2()
                 named_bar(bid, 128)
             for hh in cutlass.range_constexpr(2):
                 d0 = 32 * sp + 16 * hh  # first dim (lane) of this 16-lane half
@@ -853,7 +860,8 @@ class SparseMlaPrefillH8:
                         g = 2 * sx + mk // 2
                         dd = d0 + 8 * (mk % 2)  # first dim of the matrix (0-127)
                         hrow = 32 * c + 8 * g + j  # stored row = head
-                        half = base + Uint32(OFF_QN) + Uint32(dd // 64) * Uint32(H * 128)
+                        half = base + Uint32(OFF_QN + (b % 2) * 2 * ATOM) + Uint32(
+                            dd // 64) * Uint32(H * 128)
                         addr = half + Uint32(hrow * 128) + (
                             ((Uint32((dd % 64) // 8)) ^ (Uint32(hrow) & Uint32(7))) << Uint32(4))
                         stmatrix_t4(addr, frag[4 * sx], frag[4 * sx + 1], frag[4 * sx + 2],
@@ -863,7 +871,7 @@ class SparseMlaPrefillH8:
             if sp == 0 and lane == 0:
                 if cutlass.const_expr(not self.no_store):
                     for hf in cutlass.range_constexpr(2):
-                        tma_store2d(tm_o, base + Uint32(OFF_QN + hf * H * 128),
+                        tma_store2d(tm_o, base + Uint32(OFF_QN + (b % 2) * 2 * ATOM + hf * H * 128),
                                     Int32(128 * b + 64 * hf), row * H)
         if sp == 0 and lane == 0:
             bulk_wait_read0()
