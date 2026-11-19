@@ -38,7 +38,7 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
-             7: "radix", 17: "gtt", 18: "write scan", 8: "end"}
+             7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
 STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
 
 
@@ -74,6 +74,14 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--spin", type=float, default=5.0, help="peer spin limit (s; ncu: long)")
     ap.add_argument("--warm", type=int, default=0, help="8K^3 bf16 matmuls before each replay")
+    ap.add_argument("--evict-mb", type=int, default=0,
+                    help="in-step emulation: stream this many MB through L2 before each call (other "
+                         "kernels' code and data evict the top-k code), then re-touch the logits")
+    ap.add_argument("--evict-touch", type=int, default=0,
+                    help="after --evict-mb, re-read the top-k's small data (mailboxes, block table, "
+                         "lengths, epochs, outputs) so only code stays evicted")
+    ap.add_argument("--skew-us", type=float, default=0.0,
+                    help="the last rank sleeps this long before each call (in-step rank skew)")
     ap.add_argument("--impl", default="merge", choices=["merge", "v2"])
     ap.add_argument("--check", type=int, default=1, help="v2: compare with topk_merge")
     ap.add_argument("--k", type=int, default=2048, help="top-k (1-GPU ncu emulation: K / DCP)")
@@ -138,7 +146,18 @@ def main():
 
             segcap = 0
 
+            ev = (torch.empty(a.evict_mb << 18, dtype=torch.int32, device=dev) if a.evict_mb else None)
+            ev2 = torch.empty_like(ev) if ev is not None else None
+
             def call(dbg=None, stats=None):
+                if ev is not None:
+                    ev2.copy_(ev)
+                    torch.amax(logits, dim=1)
+                    if a.evict_touch:
+                        for t_ in (ex.v2_box, bt, L, G, req_of_row, ex.v2_epoch, out, cnt):
+                            torch.amax(t_)
+                if a.skew_us > 0 and rank == W - 1:
+                    torch.cuda._sleep(int(a.skew_us * 2400))
                 if a.impl == "v2":
                     ex.topk_v2(logits, L, G, out, cnt, block_table=bt,
                                block_size=bs, block_stride=bs, req_of_row=req_of_row,
@@ -177,7 +196,21 @@ def main():
             dist.barrier()
             for _ in range(a.warm):
                 torch.matmul(wa, wa, out=wb)
-            call(dbg=dbg, stats=stats)
+            call(stats=stats)
+            torch.cuda.synchronize()
+            # stamps of the last of a.calls back-to-back graph calls: the exchange aligns the
+            # ranks after the first call, so no eager launch skew between processes
+            gd = torch.cuda.CUDAGraph()
+            sd = torch.cuda.Stream()
+            sd.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(sd):
+                call(dbg=dbg)
+                with torch.cuda.graph(gd, stream=sd):
+                    for _ in range(a.calls):
+                        call(dbg=dbg)
+            torch.cuda.synchronize()
+            dist.barrier()
+            gd.replay()
             torch.cuda.synchronize()
             d = dbg.view(T, 64).cpu()
             t0 = int(d[:, 0][d[:, 0] > 0].min()) if (d[:, 0] > 0).any() else 0
@@ -197,7 +230,7 @@ def main():
                 # per-row clock64 deltas from the row start (globaltimer is too coarse)
                 for i, name in phmap.items():
                     v = d[:, 32 + i].double()
-                    ok_i = (v > 0) & (d[:, i] > 0)
+                    ok_i = v > 0
                     if ok_i.any() and i:
                         rel = (v - c0)[ok_i] / ghz / 1e3
                         phases[f"c{i}:{name}"] = (round(float(rel.median()), 2), round(float(rel.max()), 2), int(ok_i.sum()))
