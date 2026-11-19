@@ -159,14 +159,6 @@ def test_polled_fused_reduce_rmsnorm_matches_polled_reduce_then_stock_norm(n, hi
     torch.cuda.synchronize()
 
     assert not fused_plane.view(torch.int16).any(), "landed cells must be cleared"
-    _check_polled_fused(values, fused_out, reduced, weight, eps)
-
-
-def _check_polled_fused(values, fused_out, reduced, weight, eps):
-    """``reduced`` is the plain sum of the landed top-k terms; ``fused_out`` equals the stock
-    ``rms_norm`` of it to at most one BF16 ulp on a small fraction of elements."""
-    from vllm import _custom_ops as ops
-
     expect = values[:, : TOPK - 3].float()
     acc = expect[:, 0].clone()
     for k in range(1, TOPK - 3):
@@ -179,79 +171,3 @@ def _check_polled_fused(values, fused_out, reduced, weight, eps):
     assert torch.isfinite(fused_out.float()).all()
     assert int(ulp.max()) <= 1, f"max {int(ulp.max())} BF16 ulp vs stock rms_norm"
     assert float((ulp > 0).float().mean()) < 0.01
-
-
-def _e2b(hidden):
-    """reduce_row_rmsnorm_threads in a stand-in kernel: one row per CTA, 128 threads (the
-    MegaMoE epilogue warps' shape), partials in a global scratch as in the main kernel."""
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-
-    from vllm.models.kimi_k3.nvidia.megamoe_rubin.src_gp.sources.helpers.topk_reduce import (  # noqa: E501
-        reduce_row_rmsnorm_threads,
-    )
-
-    class _Row:
-        @cute.kernel
-        def kernel(self, plane, ids, out, w, eps, partial):
-            tid, _, _ = cute.arch.thread_idx()
-            row = cute.arch.block_idx()[0]
-            p = cute.make_tensor(partial.iterator + row * 4, cute.make_layout((4,)))
-            reduce_row_rmsnorm_threads(
-                plane, ids, out, w, eps, row, tid, p, hidden, TOPK, E, 128, 8
-            )
-
-        @cute.jit
-        def __call__(self, plane, ids, out, w, eps, partial, stream):
-            plane = cute.make_tensor(
-                plane.iterator,
-                cute.make_layout((plane.shape[0], TOPK, hidden), stride=plane.stride),
-            )
-            out = cute.make_tensor(
-                out.iterator, cute.make_layout((out.shape[0], hidden), stride=out.stride)
-            )
-            w = cute.make_tensor(w.iterator, cute.make_layout((hidden,)))
-            self.kernel(plane, ids, out, w, eps, partial).launch(
-                grid=[out.shape[0], 1, 1], block=[128, 1, 1], stream=stream
-            )
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    op = _Row()
-
-    def run(plane, ids, out, w, eps):
-        partial = torch.empty(out.shape[0] * 4, dtype=torch.float32, device=out.device)
-        args = [_cute(plane), _cute(ids), _cute(out), _cute(w), cutlass.Float32(eps)]
-        args.append(_cute(partial))
-        fn = cute.compile(op, *args, stream)
-        fn(*args, stream)
-
-    return run
-
-
-@pytest.mark.parametrize(("n", "hidden"), [(1, 3584), (96, 3584), (128, 3584)])
-def test_in_kernel_row_reduce_rmsnorm_matches_polled_reduce_then_stock_norm(n, hidden):
-    """vLLM-local E2b: the MegaMoE-tail row reduce (several 8-wide tiles per thread)
-    equals the polled reduce + stock rms_norm and clears the landed cells."""
-    dev = torch.device("cuda")
-    g = torch.Generator(device=dev).manual_seed(n * 13 + hidden)
-    values = (torch.randn((n, TOPK, hidden), device=dev, generator=g) * 0.5).to(
-        torch.bfloat16
-    )
-    ids = torch.randint(0, E, (n, TOPK), device=dev, generator=g, dtype=torch.int32)
-    ids[:, -3:] = -1
-    plane = (~values.view(torch.int16)).view(torch.bfloat16)
-    plane[:, -3:] = 0
-    weight = (1 + 0.1 * torch.randn(hidden, device=dev, generator=g)).to(torch.bfloat16)
-    eps = 1e-6
-
-    reduced = torch.empty((n, hidden), dtype=torch.bfloat16, device=dev)
-    kw = dict(combine_quant=plane.clone(), reduced_output=reduced, topk_indices=ids)
-    _compile(hidden, True, **kw)(**kw)
-    row_plane = plane.clone()
-    row_out = torch.empty_like(reduced)
-    _e2b(hidden)(row_plane, ids, row_out, weight, eps)
-    torch.cuda.synchronize()
-
-    assert not row_plane.view(torch.int16).any(), "landed cells must be cleared"
-    _check_polled_fused(values, row_out, reduced, weight, eps)

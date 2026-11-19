@@ -687,17 +687,6 @@ def main():
         )
         torch.cuda.synchronize()
         moe.check_route_errors()
-        rms_check = None
-        if rms is not None:
-            # The fused-norm call vs the plain call + the stock rms_norm math on its BF16 output.
-            plain = torch.empty_like(out)
-            moe.forward(hidden, ids, wts, weights, bucket=bucket, out=plain, shared=fused)
-            torch.cuda.synchronize()
-            xf = plain[:n].float()
-            want = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + rms[1]) * rms[0].float()).to(torch.bfloat16)
-            diff = (out[:n].float() - want.float()).norm() / want.float().norm().clamp_min(1e-30)
-            rms_check = (float(diff), int((out[:n] != want).sum()), n * problem.hidden)
-            print(f"[rmsnorm check] rel_l2 {rms_check[0]:.3e} mismatched {rms_check[1]}/{rms_check[2]}", flush=True)
 
         # staging A/B vs the torch stager (live rows)
         rx, rsf, ridx, rw = R.stage_inputs_torch(

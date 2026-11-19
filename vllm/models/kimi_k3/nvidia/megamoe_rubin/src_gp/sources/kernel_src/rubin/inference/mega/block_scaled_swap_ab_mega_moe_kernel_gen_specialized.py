@@ -92,7 +92,7 @@ from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
 )
-from ......common.ptx_helpers import barrier_sync_unaligned, nanosleep, read_smid
+from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -100,7 +100,7 @@ from .....helpers.dsl_helpers import ReadyFlag, wait_ready, spin_wait
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
-from .....helpers.topk_reduce import TopkReduce, check_reduce_operand_alignment, reduce_row_rmsnorm_threads
+from .....helpers.topk_reduce import TopkReduce, check_reduce_operand_alignment
 from ......common.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
@@ -134,10 +134,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     shared_fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_done_counter"
     # vLLM-local: per-CTA "stores drained" arrivals that the standalone reduce acquires (VENDOR.md).
     producer_done_region: ClassVar[str] = "rubin.genphase_moe.producer_done"
-    # vLLM-local E2b: per-CTA, per-epilogue-warp sum-of-squares partials of the in-kernel norm reduce.
-    e2b_partial_region: ClassVar[str] = "rubin.genphase_moe.e2b_partial"
-    e2b_count_region: ClassVar[str] = "rubin.genphase_moe.e2b_count"
-    e2b_gen_region: ClassVar[str] = "rubin.genphase_moe.e2b_gen"
 
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
@@ -449,18 +445,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         )
 
     @property
-    def in_kernel_norm_reduce(self) -> bool:
-        """vLLM-local E2b: a fused-RMSNorm reduce call folds into this kernel's tail (one token row per CTA)."""
-        return (
-            not self.reduce_topk_in_kernel
-            and self.epilogue.combine_ll_encoded
-            and self.apply_topk_at_fc1
-            and not self.reduce_shared_output
-            and self.hidden_size % 8 == 0
-            and self.max_tokens_per_rank <= self.promised_launchable_sm_count
-        )
-
-    @property
     def reduce_acquires_producer_done(self) -> bool:
         """The fused shared output is the one output the standalone reduce does not poll; its completion is
         ordered through per-CTA arrivals instead of the reduce waiting for this grid's completion."""
@@ -689,18 +673,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 byte_alignment=128,
                 reset="zero_on_first_allocate",
             )
-        if self.in_kernel_norm_reduce:
-            device_workspace.register(
-                self.e2b_partial_region,
-                cutlass.Float32,
-                (self.promised_launchable_sm_count * len(self.epilogue_warp_ids),),
-                buffer_space="local",
-                byte_alignment=16,
-            )
-            for region in (self.e2b_count_region, self.e2b_gen_region):
-                device_workspace.register(
-                    region, cutlass.Int32, (1,), buffer_space="local", byte_alignment=16, reset="zero_on_first_allocate"
-                )
         if self.reduce_acquires_producer_done:
             device_workspace.register(
                 self.producer_done_region,
@@ -1231,20 +1203,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if cutlass.const_expr(self.reduce_acquires_producer_done):
             producer_done = self._device_workspace.tensor(self.producer_done_region)
         self._device_workspace.remove_device_members()
-        # vLLM-local E2b: the fused-RMSNorm top-k reduce runs in this kernel's tail (one token row per CTA,
-        # epilogue warps after their last tile) instead of a separate launch that waits for SMs and the grid.
-        e2b = cutlass.const_expr(rmsnorm_weight is not None and self.in_kernel_norm_reduce)
-        e2b_args = (None, None, None, None)
-        if cutlass.const_expr(e2b):
-            e2b_args = (
-                topk_indices,
-                cute.make_tensor(
-                    output_activation.iterator,
-                    cute.make_layout((output_activation.shape[0], self.hidden_size), stride=output_activation.stride),
-                ),
-                cute.make_tensor(rmsnorm_weight.iterator, cute.make_layout((self.hidden_size,))),
-                rmsnorm_eps,
-            )
         self._kernel(
             fc1_tma_a_tensor,
             fc1_tma_a_atom,
@@ -1283,7 +1241,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             shared_fc2_output_tma_atom,
             shared_fc2_output_tma_tensor,
             shared_fc2_output,
-            *e2b_args,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1292,7 +1249,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             min_blocks_per_mp=self.occupancy,
             use_pdl=True,
         )
-        if cutlass.const_expr(not self.reduce_topk_in_kernel and not e2b):
+        if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
             self._topk_reduce(
                 pre_reduced_activation,
@@ -1306,7 +1263,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 rmsnorm_eps=rmsnorm_eps,
                 producer_done=producer_done,
             )
-        elif cutlass.const_expr(rmsnorm_weight is not None and not e2b):
+        elif cutlass.const_expr(rmsnorm_weight is not None):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
 
     @property
@@ -1513,11 +1470,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         shared_fc2_output_tma_atom: Optional[cute.CopyAtom],
         shared_fc2_output_tma_tensor: Optional[cute.Tensor],
         shared_fc2_output: Optional[cute.Tensor],
-        # vLLM-local E2b (all None unless the fused-RMSNorm top-k reduce runs in this kernel's tail).
-        e2b_topk_indices: Optional[cute.Tensor] = None,
-        e2b_output: Optional[cute.Tensor] = None,
-        e2b_norm_weight: Optional[cute.Tensor] = None,
-        e2b_norm_eps: Optional[Float32] = None,
     ):
         """Compose scheduler, mainloop, epilogue, and the workspace tail reset."""
         self._mainloop.materialize_codegen_members()
@@ -1853,50 +1805,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             )
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
-            if cutlass.const_expr(e2b_output is not None):
-                # E2b: this CTA's epilogue warps have stored their last tile; reduce + normalize token row
-                # linear_cta_idx (rows <= CTAs, host-checked). The row CTAs first wait until every CTA of this
-                # grid is through its tiles (sense-reversing arrival: count + generation), so their polling of
-                # the combine plane never competes with this rank's remaining weight stream. Every CTA arrives
-                # without waiting, and the waiters are row CTAs only; the grid fits the SMs (one CTA per SM).
-                epi_threads = 32 * len(self.epilogue_warp_ids)
-                cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epi_threads)
-                if thread_idx == Int32(0):
-                    gen_ptr = self._device_workspace.ptr(self.e2b_gen_region)
-                    count_ptr = self._device_workspace.ptr(self.e2b_count_region)
-                    gen0 = cute.arch.load(gen_ptr, Int32, sem="acquire", scope="gpu")
-                    old = cute.arch.atomic_add(count_ptr, Int32(1), sem="acq_rel", scope="gpu")
-                    if old == Int32(self.promised_launchable_sm_count - 1):
-                        cute.arch.store(count_ptr, Int32(0), sem="relaxed", scope="gpu")
-                        cute.arch.fence_acq_rel_gpu()
-                        cute.arch.store(gen_ptr, gen0 + Int32(1), sem="relaxed", scope="gpu")
-                    elif linear_cta_idx < Int32(e2b_output.shape[0]):
-                        while cute.arch.load(gen_ptr, Int32, sem="acquire", scope="gpu") == gen0:
-                            nanosleep(256)
-                cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epi_threads)
-                if linear_cta_idx < Int32(e2b_output.shape[0]):
-                    iket.range_push("epilogue.e2b_reduce")
-                    warps = len(self.epilogue_warp_ids)
-                    partial = cute.make_tensor(
-                        self._device_workspace.ptr(self.e2b_partial_region) + linear_cta_idx * Int32(warps),
-                        cute.make_layout((warps,)),
-                    )
-                    reduce_row_rmsnorm_threads(
-                        fc2_output,
-                        e2b_topk_indices,
-                        e2b_output,
-                        e2b_norm_weight,
-                        e2b_norm_eps,
-                        linear_cta_idx,
-                        thread_idx,
-                        partial,
-                        self.hidden_size,
-                        self.topk,
-                        self.expert_count,
-                        32 * warps,
-                        self.tail_barrier_id,
-                    )
-                    iket.range_pop()
 
             iket.range_pop()
 
@@ -1976,7 +1884,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 lane_idx = cute.arch.lane_idx()
                 is_last = Int32(0)
                 if lane_idx == Int32(0):
-                    if cutlass.const_expr(self.reduce_acquires_producer_done and e2b_output is None):
+                    if cutlass.const_expr(self.reduce_acquires_producer_done):
                         # The reduce's completion orders the shared output through this arrival.
                         cute.arch.atomic_add(
                             self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="acq_rel", scope="gpu"
