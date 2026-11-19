@@ -111,16 +111,16 @@ def test_policy_covers_captured(kind):
     tactics = sp_projection_tactics(kind, n, k, captured, context())
     assert set(tactics) == set(captured)
     kinds = {r: t[0] for r, t in tactics.items()}
-    assert set(kinds.values()) <= {"warp", "split_k", "cublas", "lt"}
-    if kind == "latent_up" or kind.endswith("_side"):  # torch kinds only
-        assert set(kinds.values()) <= {"cublas", "lt"}
-    if kind == "q_b":  # no table: the GENERIC rule
+    assert set(kinds.values()) <= {"warp", "split_k", "cublas", "lt", "ltpin"}
+    if kind == "latent_up" or kind.endswith("_side"):  # library kinds only
+        assert set(kinds.values()) <= {"cublas", "lt", "ltpin"}
+    if kind == "q_b":  # the GENERIC rule but for the pinned bands
         assert {kinds[r] for r in captured if r <= 16} == {"warp"}
-        assert {kinds[r] for r in captured if r > 64} == {"cublas"}
+        assert {kinds[r] for r in captured if r > 64} <= {"cublas", "ltpin"}
     if kind == "kda_in":  # warp loses to cuBLAS on the 178 MB weight (28.9 vs 15.5 us)
         assert kinds[16] == "cublas" and kinds[32] == "lt"
     if kind == "wq_b":  # no 64-column split-K tiles above 64 rows
-        assert {kinds[r] for r in captured if r > 64} <= {"cublas", "lt"}
+        assert {kinds[r] for r in captured if r > 64} <= {"cublas", "lt", "ltpin"}
 
 
 def test_measured_is_per_family():
@@ -168,8 +168,15 @@ def test_projection_matches_reference(kind):
             want = residual.clone()
             with blas_library("cublaslt" if kind_r == "lt" else None):
                 want.addmm_(x[:r], w.t())
+            ref = residual.float() + x[:r].float() @ w.float().t()
             got = projection.run(x[:r], residual=residual)
-            assert got is residual and torch.equal(got, want), r
+            if kind_r == "ltpin":  # the pinned algorithm: FP32 order differs; no
+                # worse than stock's beta-add against the FP32 reference
+                err = (got.float() - ref).abs().max()
+                stock_err = (want.float() - ref).abs().max()
+                assert got is residual and err <= 1.5 * stock_err + 2**-12, r
+            else:
+                assert got is residual and torch.equal(got, want), r
             continue
         out.fill_(float("nan"))
         projection.run(x[:r], out[:r])

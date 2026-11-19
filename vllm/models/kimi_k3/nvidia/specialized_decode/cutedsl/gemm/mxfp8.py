@@ -18,6 +18,8 @@ Kinds (every kind sums K in FP32 and rounds once to BF16; the order differs):
   "fi_cute"     FlashInfer CuTe DSL MXFP8 GEMM (stock's choice at <= 16 rows)
   "fi_cutlass"  FlashInfer CUTLASS MXFP8 GEMM
   "scaled_mm"   cuBLASLt ``torch._scaled_mm`` (stock's choice above 16 rows)
+  "ltpin"       the same cuBLASLt GEMM on a pinned algorithm per (shape, rows)
+                (``ltpin``)
 
 The per-R kind is GENERIC = stock's own per-call rule (``nvidia.mxfp8.use_cute_dsl``:
 the same kernel as the stock linear, so the stock bits) unless ``MX_TUNED`` names a
@@ -29,7 +31,7 @@ import torch
 
 from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 
-MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm")
+MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "ltpin")
 BLOCK = 32  # MXFP8 block along K
 
 # TUNED (VR200, D3-32 per-GPU shapes, 2026-11-18 D-GEMM bench1: 1 GPU, a CUDA graph of
@@ -44,10 +46,14 @@ BLOCK = 32  # MXFP8 block along K
 #                            n96 8.44 / 7.75
 #   o_proj 7168 x 3072  R16 4.92 / 4.95, R128 5.84 / 5.13, R256 6.33 / 6.03, R384
 #                       7.54 / 6.26 (= stock's rule: no entry)
+# ltpin (GEMMLIB/cublaslt p1, 2026-11-19, pinned cuBLASLt 13.8 vs fi_cute / scaled_mm):
+#   kda_in R128 9.98 vs 10.96 / 12.56; shared_gu n32 / n64 / n96 9.58 / 9.67 / 9.73 vs
+#   10.01 / 10.12 / 12.23 (best in-tree); shared_down 7.36 / 7.46 / 7.51 vs 7.64 / 7.75 /
+#   7.75. kda_in R256 / R384 and o_proj: no gain (keep).
 MX_TUNED: dict[tuple[int, int], dict] = {
-    (12448, 7168): {"*": "1-320:fi_cute,321-:scaled_mm"},
-    (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
-    (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
+    (12448, 7168): {"*": "1-112:fi_cute,113-144:ltpin,145-320:fi_cute,321-:scaled_mm"},
+    (12288, 7168): {"*": "1-24:fi_cute,25-128:ltpin,129-:scaled_mm"},
+    (7168, 6144): {"*": "1-24:fi_cute,25-128:ltpin,129-:scaled_mm"},
 }  # fmt: skip
 
 
@@ -194,10 +200,18 @@ class Mxfp8Projection:
                 raise Unsupported(family, r, f"MXFP8 kind {kind!r} (kinds {MX_KINDS})")
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
+        pinned = [r for r in self.rows if self.kinds[r] == "ltpin"]
+        self.ltpin = None
+        if pinned:
+            from .ltpin import LtPin
+
+            self.ltpin = LtPin(family, n, k, pinned, dtype="mxfp8", device=weight.device)
 
     def _gemm(self, kind, xq, xs, out):
         import flashinfer
 
+        if kind == "ltpin":
+            return self.ltpin.run(self.weight, xq, out, self.scale, xs)
         if kind == "scaled_mm":
             return torch._scaled_mm(
                 xq, self.weight.t(), scale_a=xs.view(torch.float8_e8m0fnu),
