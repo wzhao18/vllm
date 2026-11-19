@@ -111,6 +111,27 @@ STAMP_CTAS, STAMP_TILES, STAMP_EV = 8, 64, 8
 
 
 @asm()
+def tc_mma_cb(d, a, b, idesc, acc, op: str):
+    """tcgen05.mma with the Rubin B collector: op fill / use / lastuse keeps the B
+    operand in the tensor core across MMAs (no shared-memory re-fetch)."""
+    code = ("{ .reg .pred p; setp.ne.b32 p, $4, 0; "
+            f"tcgen05.mma.cta_group::1.kind::f8f6f4.collector::b::{op} [$0], $1, $2, $3, p; }}")
+    return code, "r,l,l,r,r,~{memory}", (Uint32(d), Uint64(a), Uint64(b), Uint32(idesc),
+                                          Uint32(acc))
+
+
+@asm(Float32, pure=True)
+def shfl_xor1(v):
+    return "shfl.sync.bfly.b32 $0, $1, 1, 31, -1;", "=f,f", (Float32(v),)
+
+
+@asm()
+def st_shared_bf16x2(addr, lo, hi):
+    return ("{ .reg .b32 t; cvt.rn.bf16x2.f32 t, $2, $1; st.shared.b32 [$0], t; }",
+            "r,f,f,~{memory}", (Uint32(addr), Float32(lo), Float32(hi)))
+
+
+@asm()
 def tma_store2d(tmap, src, col, row):
     code = ("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [$0, {$2, $3}], [$1];"
             " cp.async.bulk.commit_group;")
@@ -148,14 +169,16 @@ def _tiles(n):
 class SparseMlaPrefillSol:
     """Persistent: ``grid`` CTAs (one per SM), CTA c takes tokens c, c + grid, ..."""
 
-    def __init__(self, grid: int, stamps: bool = False, knobs: tuple = (LOADERS, 0, 0)):
+    def __init__(self, grid: int, stamps: bool = False, knobs: tuple = (LOADERS, 0, 0)):  # noqa: E501
         self.grid, self.stamps = grid, stamps
         # diagnostics: (gather warps, no_gather (stale stage, arrive only),
         # no_store (epilogue reads TMEM, skips BF16 staging and TMA stores))
         # 4th knob mma_mode: 0 full kernel; 1 tensor only (QK + PV, no softmax /
         # epilogue dependencies), 2 QK only, 3 PV only
-        knobs = tuple(knobs) + (0,) * (4 - len(knobs))
-        self.nl, self.no_gather, self.no_store, self.mma_mode = knobs
+        # 5th: collector (1 = P^T from the B collector in PV); 6th: packed epilogue
+        knobs = tuple(knobs) + (0, 0, 0, 1, 1)[len(knobs) - 1:]
+        (self.nl, self.no_gather, self.no_store, self.mma_mode, self.collector,
+         self.packed) = knobs
 
     @cute.jit
     def __call__(self, q8: Int64, rows: Int32, kv: Int64, unit_rows: Int32, slots: Int64,
@@ -382,19 +405,26 @@ class SparseMlaPrefillSol:
         pbuf = base + Uint32(OFF_P) + Uint32(g % 2) * Uint32(H * 128)
         if lane == 0:
             bd0 = Uint64(P_DESC) | Uint64(pbuf >> Uint32(4))
-            for b in cutlass.range_constexpr(4):
-                if cutlass.const_expr(self.mma_mode == 0):
-                    if t == 0:
-                        mbar_wait(_bar(base, B_OFREE + b), Uint32((qi & 1) ^ 1))
-                        tc_fence_after()
-                ad0 = Uint64(SDESC_SW128) | Uint64((st + Uint32(b * 16384)) >> Uint32(4))
-                for kk in cutlass.range_constexpr(2):
+            # K step outer, O^T block inner: one P^T slice feeds the 4 blocks from
+            # the B collector (fetched once instead of 4 times)
+            for kk in cutlass.range_constexpr(2):
+                for b in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(self.mma_mode == 0 and kk == 0):
+                        if t == 0:
+                            mbar_wait(_bar(base, B_OFREE + b), Uint32((qi & 1) ^ 1))
+                            tc_fence_after()
+                    ad0 = Uint64(SDESC_SW128) | Uint64((st + Uint32(b * 16384)) >> Uint32(4))
                     acc = Uint32(1)
                     if t == 0 and kk == 0:
                         acc = Uint32(0)
+                    op = "fill" if b == 0 else ("lastuse" if b == 3 else "use")
                     if cutlass.const_expr(self.mma_mode != 2):
-                        tc_mma(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(kk * 512),
-                               bd0 + Uint64(kk * 64), Uint32(IDESC_PV), acc)
+                        if cutlass.const_expr(self.collector):
+                            tc_mma_cb(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(kk * 512),
+                                      bd0 + Uint64(kk * 64), Uint32(IDESC_PV), acc, op)
+                        else:
+                            tc_mma(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(kk * 512),
+                                   bd0 + Uint64(kk * 64), Uint32(IDESC_PV), acc)
             tc_commit(_bar(base, B_KVEMPTY + s))
             tc_commit(_bar(base, B_PVDONE))
             if t == tiles - 1:
@@ -590,16 +620,36 @@ class SparseMlaPrefillSol:
                 if e == 0:
                     bulk_wait_read0()
                 named_bar(3, 128)
+                odd = e % 2
                 for c in cutlass.range_constexpr(3):
                     o = tmem_ld(lane_addr + Uint32(C_O + 96 * b + 32 * c), 32)
                     for k8 in cutlass.range_constexpr(8):
                         iv = ld_shared_v4f(inv_base + Uint32((32 * c + 4 * k8) * 4))
-                        for u in cutlass.range_constexpr(4):
-                            h = 32 * c + 4 * k8 + u
-                            if cutlass.const_expr(not self.no_store):
-                                st_shared_bf16(
-                                    base + Uint32(OFF_STG) + Uint32((h * 128 + e) * 2),
-                                    o[4 * k8 + u] * iv[u])
+                        if cutlass.const_expr(self.packed):
+                            # heads (h, h + 1): the even lane stores dims (e, e + 1) of
+                            # head h, the odd lane dims (e - 1, e) of head h + 1
+                            for u in cutlass.range_constexpr(0, 4, 2):
+                                h = 32 * c + 4 * k8 + u
+                                v0 = o[4 * k8 + u] * iv[u]
+                                v1 = o[4 * k8 + u + 1] * iv[u + 1]
+                                send = v1
+                                if odd != 0:
+                                    send = v0
+                                x = shfl_xor1(send)
+                                lo, hi, hh = v0, x, Int32(h)
+                                if odd != 0:
+                                    lo, hi, hh = x, v1, Int32(h + 1)
+                                if cutlass.const_expr(not self.no_store):
+                                    st_shared_bf16x2(
+                                        base + Uint32(OFF_STG)
+                                        + Uint32((hh * 128 + e - odd) * 2), lo, hi)
+                        else:
+                            for u in cutlass.range_constexpr(4):
+                                h = 32 * c + 4 * k8 + u
+                                if cutlass.const_expr(not self.no_store):
+                                    st_shared_bf16(
+                                        base + Uint32(OFF_STG) + Uint32((h * 128 + e) * 2),
+                                        o[4 * k8 + u] * iv[u])
                 tc_fence_before()
                 cute.arch.sync_warp()
                 if lane == 0:

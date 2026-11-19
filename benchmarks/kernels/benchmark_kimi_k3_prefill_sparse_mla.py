@@ -89,6 +89,8 @@ def stamp_report(vr, dev):
 
     sl = slice(2, 64)
     rep["land_minus_issue"] = med(x[:, sl, 1] - x[:, sl, 0])
+    rep["issued_minus_issue"] = med(x[:, sl, 7] - x[:, sl, 0])
+    rep["land_minus_issued"] = med(x[:, sl, 1] - x[:, sl, 7])
     rep["qk_S_ready_minus_land"] = med(x[:, sl, 2] - x[:, sl, 1])
     rep["softmax"] = med(x[:, sl, 3] - x[:, sl, 2])
     rep["pv_issue_minus_P"] = med(x[:, sl, 4] - x[:, sl, 3])
@@ -114,6 +116,7 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--loaders", default="3,5")
     ap.add_argument("--qmag", type=float, default=1.0)
+    ap.add_argument("--h2-knobs", default="", help="no_store:no_mma list")
     ap.add_argument("--sol-knobs", default="",
                     help="comma list of gather_warps:no_gather:no_store diagnostics")
     ap.add_argument("--stamps", action="store_true",
@@ -246,6 +249,41 @@ def main():
         if a.stamps:
             res["stamps_sol"] = stamp_report(vs, dev)
             print("sol", res["stamps_sol"], flush=True)
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (
+            sparse_mla_prefill_h2,
+        )
+
+        def vh(i, stamps=None):
+            kv, idx = layers[i % len(layers)]
+            sparse_mla_prefill_h2(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                                  out=vr_out, stamps=stamps)
+
+        vh(0)
+        attn(0)
+        torch.cuda.synchronize()
+        d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
+        res["h2_rel_vs_trtllm"] = (
+            d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+        st["attn_h2"] = time_stage(vh, a.iters)
+        print("h2", res["h2_rel_vs_trtllm"], st["attn_h2"], flush=True)
+        if a.stamps:
+            res["stamps_h2"] = stamp_report(vh, dev)
+            print("h2", res["stamps_h2"], flush=True)
+        for kn in [k for k in a.h2_knobs.split(",") if k]:
+            knobs = tuple(int(v) for v in kn.split(":"))
+
+            def vhk(i, stamps=None, knobs=knobs):
+                kv, idx = layers[i % len(layers)]
+                sparse_mla_prefill_h2(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                                      out=vr_out, stamps=stamps, knobs=knobs)
+
+            vhk(0)
+            st[f"attn_h2_k{kn}"] = time_stage(vhk, a.iters)
+            print("h2 knobs", kn, st[f"attn_h2_k{kn}"], flush=True)
+            if a.stamps:
+                r = stamp_report(vhk, dev)
+                print("h2 knobs", kn, {k: v for k, v in r.items() if k != "cta0_tiles_0_20"},
+                      flush=True)
         for kn in [k for k in a.sol_knobs.split(",") if k]:
             knobs = tuple(int(v) for v in kn.split(":"))
 

@@ -17,6 +17,9 @@ if not (current_platform.is_cuda() and current_platform.has_device_capability(10
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (  # noqa: E402
     sparse_mla_prefill,
 )
+from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (  # noqa: E402
+    sparse_mla_prefill_h2,
+)
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (  # noqa: E402
     sparse_mla_prefill_sol,
 )
@@ -85,6 +88,7 @@ def test_matches_stock_trtllm_kernel():
     scale, out_scale = 192**-0.5, 1.0
     out = sparse_mla_prefill(q8, kv, 64, slots, lens, scale, out_scale)
     sol = sparse_mla_prefill_sol(q8, kv, slots, lens, scale, out_scale)
+    h2 = sparse_mla_prefill_h2(q8, kv, slots, lens, scale, out_scale)
     t = q8.shape[0]
     qp = torch.zeros(t, 128, ROW, dtype=E4M3, device="cuda")
     qp[:, :H] = q8
@@ -109,16 +113,20 @@ def test_matches_stock_trtllm_kernel():
     assert not math.isnan(ours) and not math.isnan(ours_sol)
     assert ours <= 1.25 * stock + 1e-3, (ours, stock)
     assert ours_sol <= 1.25 * stock + 1e-3, (ours_sol, stock)
+    ours_h2 = err(h2)
+    assert ours_h2 <= 1.25 * stock + 1e-3, (ours_h2, stock)
 
 
+@pytest.mark.parametrize("kernel", ["sol", "h2"])
 @pytest.mark.parametrize("scale_mul", [0.7, 3.0])
-def test_sol_matches_fp32_reference(scale_mul):
+def test_sol_matches_fp32_reference(scale_mul, kernel):
     """Gather-floor kernel; scale_mul 3 drives the lazy-max slow path often."""
     lengths = [1, 2, 127, 128, 129, 300, 1000, 2047, 2048, 2048, 64, 255, 256, 2000, 0]
     lengths = lengths * 23  # more rows than SMs: persistent CTAs take several
     q8, kv, slots, lens = _problem(lengths, pool_pages=600, width=2048, seed=0)
     scale, out_scale = 192**-0.5 * scale_mul, 1.3
-    out = sparse_mla_prefill_sol(q8, kv, slots, lens, scale, out_scale)
+    fn = sparse_mla_prefill_sol if kernel == "sol" else sparse_mla_prefill_h2
+    out = fn(q8, kv, slots, lens, scale, out_scale)
     torch.cuda.synchronize()
     ref = _reference(q8, kv, slots, lens, scale, out_scale)
     err = (out.float() - ref).abs()
