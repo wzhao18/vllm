@@ -90,10 +90,10 @@ def position(idx):
 
 
 def ref_topk(bits_row, n, k):
-    """Exact top-k; ties to the lowest logits position."""
+    """Exact top-k; ties to the lowest key index (the stock rule)."""
     key = order16(bits_row[:n]).to(torch.int64)
     idx = torch.arange(n, device=bits_row.device, dtype=torch.int64)
-    comp = key * (1 << 20) + ((1 << 20) - 1 - position(idx))
+    comp = key * (1 << 20) + ((1 << 20) - 1 - idx)
     return torch.sort(idx[torch.topk(comp, min(k, n)).indices]).values
 
 

@@ -1494,6 +1494,7 @@ class PrefillFinish:
 # --------------------------------------------------------------------------
 CS_THREADS = 256
 CS_BATCH = 8  # candidate loads in flight per thread (CandSelect staging)
+CS_TIES = 1024  # threshold ties ranked per row (more: the row takes the full path)
 
 
 @asm()
@@ -1535,7 +1536,8 @@ class CandSelect:
     tile), its count and then SLOTS words (tile << 16 | BF16). Two 8-bit radix
     passes over the order-preserving 16-bit keys find the k-th value t; keys
     above t are emitted, ties at t by lowest key index. Rows whose candidates are
-    fewer than min(k, row length) or overflowed a lane are flagged in
+    fewer than min(k, row length), overflowed a lane or hold more than CS_TIES
+    threshold ties are flagged in
     row_bin[3 r + 1] (recomputed by the caller). Output order is unspecified."""
 
     def __init__(self, topk: int):
@@ -1580,7 +1582,7 @@ class CandSelect:
         # b, above, count of b, out slot, tie slot, total, overflow, key min / max
         info_a = hist_a + 256 * 4
         cnt_a = info_a + 8 * 4
-        ties = smem.allocate_tensor(Int32, cute.make_layout(CAP), 16)
+        ties = smem.allocate_tensor(Int32, cute.make_layout(CS_TIES), 16)
         ties_a = ties.iterator.toint()
         cbuf = smem.allocate_tensor(Uint32, cute.make_layout(CAP), 16)
         cbuf_a = cbuf.iterator.toint()
@@ -1710,9 +1712,14 @@ class CandSelect:
                     self.emit(take, pos, info_a + 12, out, orow, lane)
                     if tie != Uint32(0):
                         jt = atom_add_shared(info_a + 16, Uint32(1))
-                        st_shared_u32(ties_a + jt * 4, Uint32(pos))
+                        if jt < Uint32(CS_TIES):
+                            st_shared_u32(ties_a + jt * 4, Uint32(pos))
                 cute.arch.sync_threads()
-                if m != need:
+                if m != need and m > Uint32(CS_TIES):
+                    # more threshold ties than the tie buffer: the full path
+                    if tid == 0:
+                        row_bin[3 * row + 1] = Int32(1)
+                elif m != need:
                     for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
                         p = ld_shared_u32(ties_a + jt * 4)
                         rank = Uint32(0)
