@@ -125,7 +125,7 @@ def test_sol_matches_fp32_reference(scale_mul, kernel):
     lengths = lengths * 23  # more rows than SMs: persistent CTAs take several
     q8, kv, slots, lens = _problem(lengths, pool_pages=600, width=2048, seed=0)
     scale, out_scale = 192**-0.5 * scale_mul, 1.3
-    fn = sparse_mla_prefill_sol if kernel == "sol" else sparse_mla_prefill_h2
+    fn = {"sol": sparse_mla_prefill_sol, "h2": sparse_mla_prefill_h2}[kernel]
     out = fn(q8, kv, slots, lens, scale, out_scale)
     torch.cuda.synchronize()
     ref = _reference(q8, kv, slots, lens, scale, out_scale)

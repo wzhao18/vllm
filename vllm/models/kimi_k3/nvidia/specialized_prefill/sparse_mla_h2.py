@@ -66,18 +66,17 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import tc_mma_cb
 
 P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
-LOADERS = 16  # gather warps, one 4-row quad each per 64-key stage (gather4 issue
-# costs ~200 clk per instruction per warp under load, so the quads are spread)
+LOADERS = 10  # gather warps (16 one-quad warps in 32-warp CTAs measured slower: run25)
 NS = 6  # 64-key KV stages (one per subtile: released after its PV)
 IDX_BYTES = 2048 * 4  # one token's slot row (top-k <= 2048), double-buffered in smem
 STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
 # warps: 0-7 softmax (2 WG x 32 columns, thread = head; lanes 96-127 = padding rows),
-# 8-11 epilogue, 12 MMA, 13-28 gather, 29 Q + slot rows, 30-31 idle
+# 8-11 epilogue, 12 MMA, 13-22 gather, 23 Q + slot rows
 W_EPI, W_MMA, W_LD = 8, 12, 13
-THREADS = 32 * 32
-REG_LAUNCH = 65536 // THREADS // 8 * 8  # 64
-REG_SOFTMAX, REG_LOAD = 144, 32
-assert 256 * REG_SOFTMAX + 128 * REG_LAUNCH + 640 * REG_LOAD <= THREADS * REG_LAUNCH
+THREADS = 32 * 24
+REG_LAUNCH = 65536 // THREADS // 8 * 8  # 80
+REG_SOFTMAX, REG_LOAD = 136, 40
+assert 256 * REG_SOFTMAX + 128 * REG_LAUNCH + 384 * REG_LOAD <= THREADS * REG_LAUNCH
 
 # shared memory (bytes)
 OFF_QN = 0  # Q latent staging: 4 x [96 x 128 B] SW128 (copied into TMEM per token)
