@@ -277,6 +277,7 @@ def order16(bits: Uint32) -> Uint32:
     return b ^ flip
 
 
+STORE = 1  # IndexerScore mode: the logits only (no histograms / row bounds)
 PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
 SLOTS = 96  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
 REGION = (SLOTS + 1) * TILE  # words per row: lane counts, then SLOTS words per lane
@@ -344,8 +345,8 @@ class IndexerScore:
     def __init__(
         self, ctas: int, mode: int = 0, topk: int = 2048,
     ):
-        """mode (bench only): 0 full; 2 MMA + accumulator reads, no reduction;
-        3 no logits stores; 5 no accumulator reads (reduction of stale registers)."""
+        """mode: 0 logits + per-row top-k bound (row_bin); STORE logits only;
+        PUBLISH candidates at or above the row thresholds (row_bin), no logits."""
         self.mode = mode
         self.ctas = ctas
         self.topk = topk
@@ -843,7 +844,7 @@ class IndexerScore:
                 # (a full column counts as overflowed: the row is recomputed)
                 st_global_u32(cand0, Uint32((p0 - cand0) // (TILE * 4) - 1))
                 st_global_u32(cand1, Uint32((p1 - cand1) // (TILE * 4) - 1))
-            else:
+            elif cutlass.const_expr(self.mode == 0):
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
                 self.row_bound(hist0, end0, row0, n_rows, row_bin, wscan_a + wg * 16, wg, lt, wq, lane)
@@ -892,7 +893,7 @@ class IndexerScore:
             else:
                 st_global_u16_off(ptr0, r, -st * TILE * 2)
                 st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
-            if cutlass.const_expr(self.mode < PUBLISH):
+            if cutlass.const_expr(self.mode == 0):
                 # histogram of the raw top 11 bits (masked keys land in bin 2047,
                 # the lowest rank)
                 red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
@@ -1500,9 +1501,7 @@ class PrefillFinish:
 CS_THREADS = 256
 CS_BATCH = 8  # candidate loads in flight per thread (CandSelect staging)
 CS_TIES = 1024  # threshold ties ranked per row (more: the row takes the full path)
-CS_BIN_BITS = 10
 RP_THREADS = 1024  # RecPlan threads (one CTA)
-CS_BINS = 1 << CS_BIN_BITS  # CandSelect histogram bins
 
 
 @asm()
@@ -1516,23 +1515,22 @@ def atom_max_shared(address, value):
 
 
 @cute.jit
-def _top_bin(hist_a, need, lane, info_a, nb: cutlass.Constexpr = 256):
-    """Warp 0: the highest bin b of an nb-bin histogram with count(bins >= b) >=
+def _top_bin(hist_a, need, lane, info_a):
+    """Warp 0: the highest bin b of a 256-bin histogram with count(bins >= b) >=
     need; info = (b, count above b, count of b)."""
-    per = nb // 32
     s = Uint32(0)
-    for j in cutlass.range_constexpr(per):
-        s += ld_shared_u32(hist_a + (nb - 1 - per * lane - j) * 4)
+    for j in cutlass.range_constexpr(8):
+        s += ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4)
     incl = warp_inclusive(s, lane)
     hit = ballot(incl >= need)
     first = Int32(popc((hit & (Uint32(0) - hit)) - Uint32(1)))
     if lane == first:
         run = incl - s
         found = Int32(0)
-        for j in cutlass.range_constexpr(per):
-            c = ld_shared_u32(hist_a + (nb - 1 - per * lane - j) * 4)
+        for j in cutlass.range_constexpr(8):
+            c = ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4)
             if found == 0 and run + c >= need:
-                st_shared_u32(info_a, Uint32(nb - 1 - per * lane - j))
+                st_shared_u32(info_a, Uint32(255 - 8 * lane - j))
                 st_shared_u32(info_a + 4, run)
                 st_shared_u32(info_a + 8, c)
                 found = Int32(1)
@@ -1561,11 +1559,10 @@ class CandSelect:
 
     @cute.jit
     def entry(self, cbuf_a, j, s):
-        """(key index, order16 key) of lane j's candidate s, staged in shared memory
-        as order16 key << 16 | tile."""
+        """(key index, order16 key) of lane j's candidate s (staged in shared memory)."""
         wd = ld_shared_u32(cbuf_a + (s * TILE + j) * 4)
-        pos = Int32(wd & Uint32(0xFFFF)) * TILE + 4 * (j % 32) + j // 32
-        return pos, wd >> Uint32(16)
+        pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
+        return pos, order16(wd & Uint32(0xFFFF))
 
     @cute.jit
     def emit(self, flag, pos, slot_a, out, orow, lane):
@@ -1587,10 +1584,10 @@ class CandSelect:
         w = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         smem = utils.SmemAllocator()
-        hist = smem.allocate_tensor(Uint32, cute.make_layout(CS_BINS + 8 + TILE), 16)
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(256 + 8 + TILE), 16)
         hist_a = hist.iterator.toint()
-        # b, above, count of b, out slot, tie slot, total, overflow
-        info_a = hist_a + CS_BINS * 4
+        # b, above, count of b, out slot, tie slot, total, overflow, key min / max
+        info_a = hist_a + 256 * 4
         cnt_a = info_a + 8 * 4
         ties = smem.allocate_tensor(Int32, cute.make_layout(CS_TIES), 16)
         ties_a = ties.iterator.toint()
@@ -1603,8 +1600,8 @@ class CandSelect:
         kk = cutlass.min(n, Int32(K))
         base = Int64(row) * REGION
         orow = Int64(row) * K
-        for i in cutlass.range_constexpr((CS_BINS + 8) // CS_THREADS + 1):
-            if i * CS_THREADS + tid < CS_BINS + 8:
+        for i in cutlass.range_constexpr((256 + 8) // CS_THREADS + 1):
+            if i * CS_THREADS + tid < 256 + 8:
                 st_shared_u32(hist_a + (i * CS_THREADS + tid) * 4, Uint32(0))
         if tid == 0:
             st_shared_u32(lim_a, Uint32(0xFFFF))  # key min
@@ -1645,11 +1642,8 @@ class CandSelect:
                     ws.append(v)
                 for k in cutlass.range_constexpr(CS_BATCH):
                     if s0 + 2 * k < cj:
+                        st_shared_u32(cbuf_a + ((s0 + 2 * k) * TILE + j) * 4, ws[k])
                         key = order16(ws[k] & Uint32(0xFFFF))
-                        st_shared_u32(
-                            cbuf_a + ((s0 + 2 * k) * TILE + j) * 4,
-                            (key << Uint32(16)) | (ws[k] >> Uint32(16)),
-                        )
                         kmin = cutlass.min(kmin, key)
                         kmax = cutlass.max(kmax, key)
             for i in cutlass.range_constexpr(5):
@@ -1672,20 +1666,19 @@ class CandSelect:
                     out[orow + i] = Int32(-1)
             else:
                 # value-relative radix: bins of 2^shift keys above the row's lowest
-                # candidate (the candidates span a few hundred BF16 values: one
-                # exact pass over CS_BINS bins, no hot-bin atomics), then the low
-                # bits when the span is wider
+                # candidate (the candidates span a few hundred BF16 values: spread
+                # over the 256 bins, no hot-bin atomics), then the low bits
                 k0 = ld_shared_u32(lim_a)
                 span = ld_shared_u32(lim_a + 4) - k0
                 shift = Uint32(0)
-                if span >= Uint32(CS_BINS):
-                    shift = Uint32(32 - CS_BIN_BITS) - clz(span)
+                if span > Uint32(255):
+                    shift = Uint32(24) - clz(span)
                 for s in cutlass.range(half, cj, 2, unroll=2):
                     pos, key = self.entry(cbuf_a, j, s)
                     red_shared(hist_a + (((key - k0) >> shift) << Uint32(2)), 1)
                 cute.arch.sync_threads()
                 if w == 0:
-                    _top_bin(hist_a, Uint32(K), lane, info_a, CS_BINS)
+                    _top_bin(hist_a, Uint32(K), lane, info_a)
                 cute.arch.sync_threads()
                 b1 = ld_shared_u32(info_a)
                 above = ld_shared_u32(info_a + 4)
@@ -1693,8 +1686,7 @@ class CandSelect:
                 t = k0 + (b1 << shift)
                 if shift != Uint32(0):
                     cute.arch.sync_threads()
-                    for i in cutlass.range_constexpr(CS_BINS // CS_THREADS):
-                        st_shared_u32(hist_a + (i * CS_THREADS + tid) * 4, Uint32(0))
+                    st_shared_u32(hist_a + tid * 4, Uint32(0))
                     cute.arch.sync_threads()
                     for s in cutlass.range(half, cj, 2, unroll=2):
                         pos, key = self.entry(cbuf_a, j, s)
@@ -1704,7 +1696,7 @@ class CandSelect:
                             )
                     cute.arch.sync_threads()
                     if w == 0:
-                        _top_bin(hist_a, Uint32(K) - above, lane, info_a, CS_BINS)
+                        _top_bin(hist_a, Uint32(K) - above, lane, info_a)
                     cute.arch.sync_threads()
                     t = t + ld_shared_u32(info_a)
                     above = above + ld_shared_u32(info_a + 4)
@@ -2004,7 +1996,7 @@ def thresholds(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None):
     ssf = key_scale.reshape(-1)[sp.sample_idx].contiguous()
     s_logits = torch.empty((sp.t + 1) * SAMPLES, dtype=torch.bfloat16, device=dev)
     score(q, q_scale, sk, ssf, weights_bf16, sp.s_row_len, sp.s_items, sp.s_row_base,
-          s_logits, sp.s_bin, ctas=ctas, n_items=sp.n_s_items)
+          s_logits, sp.s_bin, ctas=ctas, mode=STORE, n_items=sp.n_s_items)
     _thr_select_kernel()(
         s_logits.view(torch.int16), sp.rank, sp.row_bin,
         torch.cuda.current_stream(dev).cuda_stream,

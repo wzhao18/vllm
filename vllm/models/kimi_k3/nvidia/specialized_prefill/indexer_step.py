@@ -62,25 +62,30 @@ def applicable(
 
 
 class _Group:
-    """Consecutive rows [r0, r1) of the layer: their segments (chunk, request
-    index in the chunk, key count), key bases and the SelectivePlan."""
+    """Consecutive rows [r0, r1) of the layer: their segments (one request's rows
+    in one chunk), the key gathers (one per request: a request split over chunks
+    shares its keys) and the SelectivePlan."""
 
     def __init__(self, segs, r0, r1, device):
         self.r0, self.r1 = r0, r1
-        bases, nk = [], 0
-        for _, _, _, _, n in segs:
-            bases.append(nk)
+        # segs: (chunk, request in chunk, rows, last row's keys, key count, request)
+        widest = {}
+        for c, b, _, _, n, req in segs:
+            if req not in widest or n > widest[req][2]:
+                widest[req] = (c, b, n)
+        base_of, self.gathers, nk = {}, [], 0
+        for req, (c, b, n) in widest.items():
+            base_of[req] = nk
+            self.gathers.append(
+                (c, b, n, nk, torch.tensor([0, n], dtype=torch.int32, device=device))
+            )
             nk += (n + pidx.TILE - 1) // pidx.TILE * pidx.TILE
-        self.segs = [(c, b, n) for c, b, _, _, n in segs]
-        self.bases = bases
         self.nk = max(nk, pidx.TILE)
         self.sp = pidx.SelectivePlan(
-            [s[2] for s in segs], [s[3] for s in segs], bases, device
+            [s[2] for s in segs], [s[3] for s in segs], [base_of[s[5]] for s in segs],
+            device,
         )
         assert self.sp.t == r1 - r0
-        self.cu_one = [
-            torch.tensor([0, s[4]], dtype=torch.int32, device=device) for s in segs
-        ]
 
 
 def _layout(chunks, device):
@@ -96,13 +101,14 @@ def _layout(chunks, device):
             c.cu_seqlen_ks.to("cpu", non_blocking=True),
             c.cu_seqlen_ke.to("cpu", non_blocking=True),
             c.local_cu_seq_lens.to("cpu", non_blocking=True),
+            c.block_table.to("cpu", non_blocking=True),
         )
         for c in chunks
     ]
     torch.cuda.current_stream(device).synchronize()
     groups, segs, r0 = [], [], chunks[0].token_start
     next_row = r0
-    for ci, (c, (ks, ke, cu)) in enumerate(zip(chunks, host)):
+    for ci, (c, (ks, ke, cu, bt)) in enumerate(zip(chunks, host)):
         ks, ke, cu = ks.tolist(), ke.tolist(), cu.tolist()
         assert c.token_start == next_row and len(ks) == c.token_end - c.token_start, (
             "prefill chunks must cover consecutive rows"
@@ -115,7 +121,11 @@ def _layout(chunks, device):
             while j + 1 < len(ks) and ks[j + 1] == ks[i]:
                 j += 1
             b = starts[ks[i]]
-            segs.append((ci, b, j - i + 1, ke[j] - ks[i], cu[b + 1] - cu[b]))
+            n = cu[b + 1] - cu[b]
+            # the request's identity: its blocks (a request split over chunks has
+            # the same block table row in each)
+            req = bt[b].numpy().tobytes()
+            segs.append((ci, b, j - i + 1, ke[j] - ks[i], n, req))
             i = j + 1
         rows = sum(s[2] for s in segs)
         if rows >= GROUP_ROWS or ci == len(chunks) - 1:
@@ -140,7 +150,7 @@ def layer_topk(
         sp = g.sp
         keys = torch.empty((g.nk, 64), dtype=torch.uint8, device=dev)
         scales = torch.empty((g.nk, 4), dtype=torch.uint8, device=dev)
-        for (ci, b, n), base, cu in zip(g.segs, g.bases, g.cu_one):
+        for ci, b, n, base, cu in g.gathers:
             ops.cp_gather_indexer_k_quant_cache(
                 kv_cache,
                 keys[base : base + n],
