@@ -1300,7 +1300,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 rmsnorm_eps=rmsnorm_eps,
                 producer_done=producer_done,
             )
-        elif cutlass.const_expr(rmsnorm_weight is not None):
+        elif cutlass.const_expr(rmsnorm_weight is not None and not e2b):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
 
     @property
