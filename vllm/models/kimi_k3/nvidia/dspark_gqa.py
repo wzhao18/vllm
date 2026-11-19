@@ -59,17 +59,29 @@ from vllm.models.kimi_k3.nvidia.ops import prefill_glue
 logger = init_logger(__name__)
 
 
+def _head_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Per-head RMSNorm ``norm(x)`` of [tokens, heads, head_dim]; long context
+    steps take the bitwise-equal prefill replay of the stock kernel (whose
+    8-thread blocks run ~20x over the byte floor)."""
+    weight = norm.weight.data
+    if x.dim() == 3 and prefill_glue.use_head_rms_norm(x, weight):
+        return prefill_glue.rms_norm(x, weight, norm.variance_epsilon)
+    return norm(x)
+
+
 def stock_attention_core(attn: nn.Module, qkv: torch.Tensor, positions: torch.Tensor):
     """``DFlashQwen3Attention.forward`` between its qkv and o_proj GEMMs: the
     per-head q / k RMSNorm, RoPE, the value scale and the attention (with the K/V
     insert of the query block); [rows, q_size]."""
     q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
     q_shape, k_shape = q.shape, k.shape
-    q = attn.q_norm(
-        q.view(*q_shape[:-1], q_shape[-1] // attn.head_dim, attn.head_dim)
+    q = _head_norm(
+        attn.q_norm,
+        q.view(*q_shape[:-1], q_shape[-1] // attn.head_dim, attn.head_dim),
     ).view(q_shape)
-    k = attn.k_norm(
-        k.view(*k_shape[:-1], k_shape[-1] // attn.head_dim, attn.head_dim)
+    k = _head_norm(
+        attn.k_norm,
+        k.view(*k_shape[:-1], k_shape[-1] // attn.head_dim, attn.head_dim),
     ).view(k_shape)
     q, k = attn.rotary_emb(positions, q, k)
     if attn.v_scale is not None:
@@ -231,6 +243,22 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
         super().precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
+        """The stock grouped per-layer K RMSNorm ([L, ctx, kv_heads, head_dim],
+        weight [L, head_dim]); long context steps replay it per layer
+        bitwise (the stock 8-thread blocks run ~20x over the byte floor)."""
+        weights = self._k_norm_weights
+        if all_k.dim() != 4 or not prefill_glue.use_head_rms_norm(
+            all_k[0], weights[0]
+        ):
+            return super()._normalize_context_k(all_k)
+        out = torch.empty_like(all_k)
+        for layer in range(all_k.shape[0]):
+            prefill_glue.rms_norm(
+                all_k[layer], weights[layer], self._rms_norm_eps, out=out[layer]
+            )
+        return out
 
     def _fused_context_kv(self, states, positions, slot_mapping) -> bool:
         fast = self._fast_context_kv
