@@ -267,6 +267,12 @@ p50 (682 vs 731 us).
   SM -> die mask (impl field ``die_sm_mask32``, ``die_local.current_die_sm_mask32``) when the CuTe
   DSL build has no ``cute.arch.locality_domain_id`` (DSL 4.8.0). ``common/ptx_helpers.read_smid``,
   ``BlockScaledSwapAbGenphaseMoeKernel._die_from_mask``.
+- **S-SH** (vLLM-local): the decode scheduler (``GenphaseDecodeFc12Scheduler``) carries the fused
+  shared expert's tile stream (``SharedExpertStreamMixin`` from ``fc12_scheduler``) ahead of its
+  routed sources, so the die-aware decode form takes the fused shared expert (upstream refuses
+  shared under ``("decode", L)``). Without a lead only. Shared FC1 is claimed before the
+  expert-sizes gate (it streams under the dispatch); the scheduler warp's explicit decode sizes
+  wait is skipped when the shared stream owns the gate.
 - **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
   (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
   own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing

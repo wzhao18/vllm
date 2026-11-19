@@ -213,8 +213,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         )
         schedule_policy = impl_desc["schedule_policy"]
         decode = len(schedule_policy) == 2 and schedule_policy[0] == "decode"
-        if decode and problem_desc.get("shared_expert", False):
-            raise ValueError("The shared expert runs under the grouped or phase_interleave scheduler, not decode.")
+        if decode and problem_desc.get("shared_expert", False) and schedule_policy[1] is not None:
+            # vLLM-local (VENDOR.md S-SH): the decode scheduler carries the shared tile stream without a lead.
+            raise ValueError("The shared expert runs under the decode scheduler without a lead only.")
         if decode:
             supplied_cluster_shape_mn = impl_desc.get("cluster_shape_mn")
             self.cluster_shape_mn = (
@@ -1599,8 +1600,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.scheduler_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.scheduler")
-            if cutlass.const_expr(self.schedule_mode == "decode"):
-                # The decode scheduler has no expert-sizes gate of its own: wait for the published sizes here.
+            if cutlass.const_expr(self.schedule_mode == "decode" and not self.shared_expert):
+                # The decode scheduler has no expert-sizes gate of its own: wait for the published sizes here
+                # (with the fused shared expert its stream takes the gate after the shared FC1 claims).
                 iket.range_push("scheduler.wait_sizes_ready")
                 spin_wait(
                     self._device_workspace.ptr(self.token_comm.sizes_ready_region),

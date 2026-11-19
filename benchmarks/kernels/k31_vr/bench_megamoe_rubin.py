@@ -170,6 +170,12 @@ def parse_args():
         "(Kimi K3.1: 7168,6144) into the GenPhase kernel; reports its rel-L2 vs "
         "the stock MXFP8 chain (FP32 GEMMs, SiTU, MXFP8 requant)",
     )
+    p.add_argument(
+        "--shared-l2-position",
+        choices=("early", "tail"),
+        default=None,
+        help="fused shared FC2 placement (default: the session's)",
+    )
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int32")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50, help="timed samples per metric")
@@ -570,6 +576,10 @@ def main():
         import dataclasses
 
         shared_shape = tuple(int(v) for v in args.shared.split(","))
+        if args.shared_l2_position is not None:
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as rubin_session
+
+            rubin_session.RUBIN_FUSED_SHARED_L2_POSITION = args.shared_l2_position
         buckets = [dataclasses.replace(b, shared=shared_shape) for b in buckets]
     bucket_of = {b.max_tokens: b for b in buckets}
     if rank == 0:

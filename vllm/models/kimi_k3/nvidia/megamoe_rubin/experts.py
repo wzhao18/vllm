@@ -144,22 +144,10 @@ RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     reduce_topk_in_kernel=False,
 )
 
-# The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): FlashInfer
-# main's fused shared expert runs under the grouped / phase-interleaved schedulers only
-# (not the die-aware decode scheduler), so this bucket streams the experts die-oblivious.
-RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RubinKnobs(
-    mma_tiler_mnk=(256, 128, 256),
-    cluster_shape_mn=(4, 1),
-    fallback_cluster_shape_mn=None,
-    schedule_policy=("phase_interleave", None),
-    work_id_mode="atomic_counter",
-    fc2_use_bulk=True,
-    fc2_tma_stages=2,
-    epi_flag_batches=(1, 4),
-    token_in_flag_batch=1,
-    token_back_mode="epi_warps",
-    reduce_topk_in_kernel=False,
-)
+# The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): the decode
+# scheduler (die-aware on decode servers) with the shared tile stream ahead of the routed
+# sources (VENDOR.md S-SH): shared FC1 streams under the dispatch.
+RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RUBIN_GENPHASE_DECODE_KNOBS
 
 
 def rubin_bucket_capacities(
@@ -753,7 +741,6 @@ class KimiK3MegaMoEExperts(nn.Module):
                     variant="genphase",
                     knobs=RUBIN_GENPHASE_FUSED_SHARED_KNOBS,
                     max_sm_count=None,
-                    die_sm_mask32=None,
                     shared=(hidden, intermediate),
                 )
                 switched = True
