@@ -34,7 +34,7 @@ PHASES = {
     12: "bitmap", 24: "offsets", 15: "enumerated", 11: "ties", 9: "s9", 10: "s10",
     14: "s14", 25: "s25", 26: "s26", 27: "s27", 28: "s28", 8: "row end",
 }
-PHASES_V2 = {0: "start", 9: "loads issued", 10: "sampled", 1: "theta",
+PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "loads issued", 10: "sampled", 1: "theta",
              2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
