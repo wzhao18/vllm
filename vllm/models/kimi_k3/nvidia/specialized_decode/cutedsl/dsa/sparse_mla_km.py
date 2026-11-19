@@ -89,6 +89,7 @@ LOADERS = 1 + 16
 # the RoPE bytes by cp.async (16 B, LSU path) from every loader thread: the per-SM TMA
 # op rate alone (~50 gather4 per us, 512 B each) held a 72 KB tile to ~2.5 us.
 CPA_THREADS = 32 * LOADERS
+LOAD_BAR = 8  # named barrier of the loader warps
 NSOFT = 4 * NG  # softmax warps
 MAX_ROWS = 16  # rows per CTA
 QBLK = H * 128  # one 128 B column block of the query rows [96 x 128 B]
@@ -316,7 +317,7 @@ class SparseMlaDecodeKM:
         self.kernel(kvm, kvr, qn, qr, kv, q, q_heads, rows, slots, slot_stride, valid, out,
                     out_stride, lse, lse_stride, scale_log2, out_scale, stamp).launch(
             grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=self.smem,
-            stream=stream)
+            stream=stream, use_pdl=True)
 
     @cute.kernel
     def kernel(self, kvm: tensormap.GridMap, kvr: tensormap.GridMap,
@@ -351,6 +352,9 @@ class SparseMlaDecodeKM:
                           Uint32(1 + CPA_THREADS if self.cpa else 1))
                 mbar_init(self.bar(base, B_KVEMPTY + s), Uint32(1))
             fence_mbar_init()
+        # Under PDL: the launch and barrier setup overlap the previous kernel; the
+        # row counts, slots and queries (and TMEM: its CTAs may still hold it) after.
+        cute.arch.griddepcontrol_wait()
         if warp == 0:
             tmem_alloc_exclusive(base + Uint32(self.off_tmem))
         n_mine = (rows - cta + self.grid - 1) // self.grid
@@ -363,6 +367,8 @@ class SparseMlaDecodeKM:
         tc_fence_after()
         if tid == 0:
             self.mark(stamp, cta, 1)
+        # Every CTA is resident: the next kernel (DcpValue) may launch and wait.
+        cute.arch.griddepcontrol_launch_dependents()
         taddr = ld_shared_u32(base + Uint32(self.off_tmem))
         if (warp >= SOFT0) & (warp < NW):
             cute.arch.warpgroup_reg_alloc(SOFT_REGS)
@@ -388,7 +394,7 @@ class SparseMlaDecodeKM:
             if (warp == 3) | (warp >= NW):
                 lw = cutlass.select_(warp >= NW, warp - NW + 1, 0)
                 self.loader(base, lw, lane, cta, n_mine, tensormap.map_address(kvm),
-                            tensormap.map_address(kvr), kv, qp, q_heads)
+                            tensormap.map_address(kvr), kv, qp, q_heads, stamp)
         tc_fence_before()
         cute.arch.sync_threads()
         if warp == 0:
@@ -435,7 +441,8 @@ class SparseMlaDecodeKM:
                 prefetch_l2(a + Int64(128 * j))
 
     @cute.jit
-    def loader(self, base, lw, lane, cta, n_mine, tm_kv, tm_kr, kv, qp, q_heads):
+    def loader(self, base, lw, lane, cta, n_mine, tm_kv, tm_kr, kv, qp, q_heads,
+               stamp):
         """Loader warp lw, lane m: 4-row quad lw + L m of every tile; warp 0 arms.
         With ``prefetch``: a row's tiles 1.. and the next row's keys are prefetched
         into L2 once their slot lists are in SMEM."""
@@ -462,6 +469,8 @@ class SparseMlaDecodeKM:
                     if lane == 0:
                         mbar_wait(self.bar(base, B_KVEMPTY + s),
                                   ((g // self.stages) & 1) ^ 1)
+                        if (lw == 0) & (i == 0) & (t < 8):
+                            self.mark(stamp, cta, 38 + t)
                         if lw == 0:
                             if cutlass.const_expr(self.cpa):
                                 mbar_arrive_tx(full, Uint32(self.tb * TN * 128))
@@ -533,6 +542,10 @@ class SparseMlaDecodeKM:
                                 self.prefetch_keys(
                                     base + Uint32(self.off_idx) + Uint32(b1)
                                     * Uint32(IDXB), n1, (ahead - tiles) * TN, me, kv)
+                    # Tile by tile: no loader issues the next tile's gathers before
+                    # every loader issued this one's (the TMA unit serves them in
+                    # issue order, so a tile lands whole instead of interleaved).
+                    named_bar(Uint32(LOAD_BAR), Uint32(32 * LOADERS))
                     g = g + 1
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -645,6 +658,43 @@ class SparseMlaDecodeKM:
 
     # ------------------------------------------------------------------ softmax
     @cute.jit
+    def epilogue(self, base, lane, quarter, k, taddr, lanes, out, out_stride, row, gl):
+        """Group k's 32 heads of the latent of a row (its last tile gl)."""
+        h0 = k * HW
+        lfin = base + Uint32(self.off_l)
+        # This group's 32 heads of the latent once the row's last PV is
+        # complete: O / (448 l) x out_scale -> BF16, thread = dim 32 quarter +
+        # lane of every 128-dim block (O^T released after its last read).
+        # Lane pairs swap one value so each lane stores two adjacent dims of
+        # one head (BF16x2): even lanes head h, odd lanes head h + 1.
+        mbar_wait(self.bar(base, B_PVDONE + (gl & 1)), (gl >> 1) & 1)
+        tc_fence_after()
+        odd = lane & 1
+        dst = out + (Int64(row) * Int64(out_stride)
+                     + Int64(quarter * 32 + lane - odd)) * Int64(2)
+        fin = lfin + Uint32(4 * h0)
+        for blk in cutlass.range_constexpr(4):
+            ov = tmem_ld32(taddr + lanes + Uint32(C_O + 96 * blk + HW * k))
+            if blk == 3:
+                tc_fence_before()
+                cute.arch.sync_warp()
+                if lane == 0:
+                    mbar_arrive(self.bar(base, B_OEMPTY))
+            for e in cutlass.range_constexpr(8):
+                i4 = ld_shared_v4f(fin + Uint32(16 * e))
+                for f in cutlass.range_constexpr(2):
+                    h = 4 * e + 2 * f
+                    a = ov[h] * i4[2 * f]
+                    b2 = ov[h + 1] * i4[2 * f + 1]
+                    x = shfl_xor(cutlass.select_(odd == 1, a, b2), 1)
+                    lo = cutlass.select_(odd == 1, x, a)
+                    hi = cutlass.select_(odd == 1, b2, x)
+                    if cutlass.const_expr(self.epi_store):
+                        st_global_bf16x2(
+                            dst + Int64(((h0 + h + odd) * D_NOPE + 128 * blk)
+                                        * 2), lo, hi)
+
+    @cute.jit
     def softmax(self, base, warp, lane, taddr, cta, n_mine, out, out_stride, lse,
                 lse_stride, scale_log2, out_scale, stamp):
         """Group k (warps 2 + 4k ..) owns heads 32k .. 32k + 31; its warp of TMEM lane
@@ -671,6 +721,8 @@ class SparseMlaDecodeKM:
         log2_448 = Float32(8.807354922057604)
         g = Int32(0)
         ro = Int32(0)
+        pend = Int32(-1)  # the row whose latent is still to be written
+        pg = Int32(0)  # its last tile
         for i in range(n_mine):
             n = self.nrow(base, i)
             if n > 0:
@@ -752,28 +804,39 @@ class SparseMlaDecodeKM:
                     cute.arch.sync_warp()
                     if lane == 0:
                         mbar_arrive(self.bar(base, B_PFULL + b))
+                    if t == 0:
+                        if pend >= 0:
+                            self.epilogue(base, lane, quarter, k, taddr, lanes, out,
+                                          out_stride, pend, pg)
+                            pend = Int32(-1)
                     if t > 0:
                         # O^T rescale of this group's 32 head columns (thread = dim
                         # 32 quarter + lane of every block) where a head's max grew,
                         # block by block after the previous tile's PV of the block;
                         # the three groups run in parallel beside the tensor pipe.
+                        # Blocks in pairs: one TMEM load and one store wait per pair
+                        # (the commits are in order: block 2p + 1's covers 2p).
                         grew = ld_shared_u32(flag_s) != Uint32(0)
-                        for blk in cutlass.range_constexpr(4):
-                            mbar_wait(self.bar(base, B_PVBLK + blk), (g - 1) & 1)
+                        for pr in cutlass.range_constexpr(2):
+                            mbar_wait(self.bar(base, B_PVBLK + 2 * pr + 1), (g - 1) & 1)
                             if grew:
                                 tc_fence_after()
-                                col = taddr + lanes + Uint32(C_O + 96 * blk + HW * k)
-                                ov = tmem_ld32(col)
-                                vals = []
+                                col = taddr + lanes + Uint32(C_O + 192 * pr + HW * k)
+                                ov = tmem_ld32x2(col, col + Uint32(96))
+                                v0 = []
+                                v1 = []
                                 for c in cutlass.range_constexpr(HW // 4):
                                     a4 = ld_shared_v4f(alpha_s + Uint32(16 * c))
-                                    vals.extend([ov[4 * c + e] * a4[e] for e in range(4)])
-                                tmem_st32_nw(col, vals)
+                                    v0.extend([ov[4 * c + e] * a4[e] for e in range(4)])
+                                    v1.extend([ov[HW + 4 * c + e] * a4[e] for e in range(4)])
+                                tmem_st32_nw(col, v0)
+                                tmem_st32_nw(col + Uint32(96), v1)
                                 tmem_wait_st()
                             tc_fence_before()
                             cute.arch.sync_warp()
                             if lane == 0:
-                                mbar_arrive(self.bar(base, B_OREADY + blk))
+                                mbar_arrive(self.bar(base, B_OREADY + 2 * pr))
+                                mbar_arrive(self.bar(base, B_OREADY + 2 * pr + 1))
                     g = g + 1
                 # Epilogue: the row sums (a transposing warp reduction: lane = head,
                 # then the 4 key quarters), LSE and 1 / (448 l) for the correction
@@ -806,38 +869,10 @@ class SparseMlaDecodeKM:
                 named_bar(Uint32(1) + Uint32(k), Uint32(128))  # the sums are read
                 if ep:
                     self.mark(stamp, cta, 16)
-                # This group's 32 heads of the latent once the row's last PV is
-                # complete: O / (448 l) x out_scale -> BF16, thread = dim 32 quarter +
-                # lane of every 128-dim block (O^T released after its last read).
-                # Lane pairs swap one value so each lane stores two adjacent dims of
-                # one head (BF16x2): even lanes head h, odd lanes head h + 1.
-                gl = g - 1
-                mbar_wait(self.bar(base, B_PVDONE + (gl & 1)), (gl >> 1) & 1)
-                tc_fence_after()
-                odd = lane & 1
-                dst = out + (Int64(row) * Int64(out_stride)
-                             + Int64(quarter * 32 + lane - odd)) * Int64(2)
-                fin = lfin + Uint32(4 * h0)
-                for blk in cutlass.range_constexpr(4):
-                    ov = tmem_ld32(taddr + lanes + Uint32(C_O + 96 * blk + HW * k))
-                    if blk == 3:
-                        tc_fence_before()
-                        cute.arch.sync_warp()
-                        if lane == 0:
-                            mbar_arrive(self.bar(base, B_OEMPTY))
-                    for e in cutlass.range_constexpr(8):
-                        i4 = ld_shared_v4f(fin + Uint32(16 * e))
-                        for f in cutlass.range_constexpr(2):
-                            h = 4 * e + 2 * f
-                            a = ov[h] * i4[2 * f]
-                            b2 = ov[h + 1] * i4[2 * f + 1]
-                            x = shfl_xor(cutlass.select_(odd == 1, a, b2), 1)
-                            lo = cutlass.select_(odd == 1, x, a)
-                            hi = cutlass.select_(odd == 1, b2, x)
-                            if cutlass.const_expr(self.epi_store):
-                                st_global_bf16x2(
-                                    dst + Int64(((h0 + h + odd) * D_NOPE + 128 * blk)
-                                                * 2), lo, hi)
+                # The latent is written once the next row's first P is out (the
+                # last PV's tail and the stores overlap that row's first QK/softmax).
+                pend = row
+                pg = g - 1
                 if (warp == SOFT0) & (lane == 0) & (ro < 2):
                     self.mark(stamp, cta, 14 + 16 * ro)
                 ro = ro + 1
@@ -852,6 +887,9 @@ class SparseMlaDecodeKM:
                     for h in cutlass.range_constexpr(HW):
                         st_global_bf16(dst + Int64((h * D_NOPE + 128 * blk) * 2),
                                        Float32(0.0))
+        if pend >= 0:
+            self.epilogue(base, lane, quarter, k, taddr, lanes, out, out_stride, pend,
+                          pg)
 
 
 @asm(Float32, pure=True)
@@ -884,6 +922,17 @@ def tmem_st32(addr, vals):
             "tcgen05.wait::st.sync.aligned;")
     return code, "r" + ",f" * 32 + ",~{memory}", (
         Uint32(addr), *[Float32(v) for v in vals])
+
+
+@asm()
+def tmem_ld32x2(addr0, addr1):
+    r0 = ",".join(f"${i}" for i in range(32))
+    r1 = ",".join(f"${i}" for i in range(32, 64))
+    code = (f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{r0}}}, [$64]; "
+            f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{r1}}}, [$65]; "
+            "tcgen05.wait::ld.sync.aligned;")
+    return code, ",".join(["=f"] * 64 + ["r", "r", "~{memory}"]), (
+        Uint32(addr0), Uint32(addr1)), (Float32,) * 64
 
 
 @asm()

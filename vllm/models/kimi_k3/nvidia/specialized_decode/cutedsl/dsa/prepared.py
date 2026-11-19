@@ -257,6 +257,9 @@ class PreparedDsa:
 
         wrapper = attention.mla_attn
         self.layer = layer = wrapper.mla_attn
+        # The o-projection weight DcpValue reads into L2 for the GEMM after it (the
+        # SP decode sets it; dcp_value.WARM_CHUNK).
+        self.warm = None
         self.impl, self.indexer = layer.impl, attention.dsa_indexer
         # The KV format: fp8_ds_mla (FlashMLA sparse), else FlashInfer
         # sparse's per-tensor FP8 query over a per-tensor FP8 cache (trtllm-gen or
@@ -874,7 +877,7 @@ class PreparedDsa:
         if box.mailbox(batch).format == PROJECTED:
             uv, w_uv = self.uv_gathered[1], self.uv_gathered[0]
         args = value, box, p, publish, self.heads, core, lengths[:reqs], uv
-        return run_value(*args, projected, out, w_uv)
+        return run_value(*args, projected, out, w_uv, self.warm)
 
     def run(self, projected, out, *, cache, slots, index_slots, metadata, q=1):
         """``projected``: the packed projection rows; ``out`` [B, H * 128] gets the
