@@ -217,14 +217,18 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
     uint32_t mk[kMW];
 #pragma unroll
     for (int w = 0; w < kMW; ++w) mk[w] = 0u;
-    uint32_t cnt = 0, nv = 0;
+    uint32_t cnt = 0, nv = 0, nacc = 0u;
     if (regp) {
 #pragma unroll
       for (int i = 0; i < kNR; ++i) {
         const int g = tg0 + i;
         if (g < ng) {
           const uint4 r = srow[g];
-          nv += v2_is_nan2(v2_max_nan(r)) ? v2_nvalid(r) : 8u;
+          {
+            const uint32_t m = v2_max_nan(r);
+            asm("max.NaN.bf16x2 %0, %1, %2;" : "=r"(nacc) : "r"(nacc), "r"(m));
+          }
+          nv += 8u;
           uint32_t m8;
           if (!kx) {
             const uint32_t l4 = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
@@ -240,6 +244,12 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
           mk[i / 4] |= m8 << (8 * (i % 4));
         }
       }
+    }
+    if (K31_RARE(v2_is_nan2(nacc))) {  // NaN keys (or the masked partial groups): exact count
+      nv = 0;
+#pragma unroll 1
+      for (int i = 0; i < kNR; ++i)
+        if (tg0 + i < ng) nv += v2_nvalid(srow[tg0 + i]);
     }
     V3DBG(24);
     uint32_t ctot;
@@ -356,8 +366,12 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
     }
   }
   if (tid == 0) { s_tau = -1; s_need = 0; s_q = 0; s_tier = 0; }
-  if (ok)
+  if (ok) {
     for (int c = tid; c < nc; c += T) cslot[c] = slot_of((int)cpos[c]);
+    // the whole output row -1 (the WRITE overwrites its head) and the tie-rank scratch
+    for (int i = tid; i < K; i += T) orow[i] = -1;
+  }
+  if (tid < kV2Win) bcur[tid] = 0u;
   V3DBG(28);
   for (int i = tid; i < W * (kV2Msg / 4); i += T) {
     const int r = i / (kV2Msg / 4), j = (i % (kV2Msg / 4)) * 4;
@@ -456,9 +470,7 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
         // this rank's quota: its ties whose global id ranks below `need` among every
         // rank's ties (ids distinct, groups unsorted)
         const int m = mine;
-        int* rk = reinterpret_cast<int*>(bcur);
-        if (tid < m) rk[tid] = 0;
-        __syncthreads();
+        int* rk = reinterpret_cast<int*>(bcur);  // zeroed in the round's shadow
         const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
         for (int it = tid; it < m * W; it += T) {
           const int i = it / W, r2 = it - i * W;
@@ -508,7 +520,6 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
     }
     const int count = min(K, gtt + qq);
     if (tid == 0 && (gtt + qq > K || nties < qq)) spin_fail(p.err, 40);
-    for (int i = count + tid; i < K; i += T) orow[i] = -1;
     if (tid == 0) {
       p.out_count[row] = count;
       p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
