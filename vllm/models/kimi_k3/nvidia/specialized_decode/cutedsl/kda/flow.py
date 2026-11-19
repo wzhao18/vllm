@@ -20,15 +20,17 @@ Per item (group g):
    convolution window, the pending commit's records) were bulk-copied one item
    ahead; its outputs (the new key / raw-gate records, the convolution window) leave
    by bulk stores.
-2. **scan** (thread c: rows c // 2 and c // 2 + 64, keys of half h = c % 2; register
-   chunk j holds the half's 4-key chunk j ^ (c % 8), so every shared-memory access
-   of a warp hits 8 distinct 16-byte bank groups): the item's FP32 state page goes
-   from its slot of the CTA's page ring to registers, the pending commit is folded
-   in (the stock Triton commit's math), the committed checkpoint goes back into the
-   slot and out by one bulk store (L2 evict-first), the q tokens are verified (each
-   row's dot products: two per-thread partials summed over the lane pair, one
-   shuffle), the outputs RMS-normed and gated; corrections and outputs leave by
-   bulk stores.
+2. **scan** (thread (b, l), b = c // 8, l = c % 8: rows 8 b + [0, 8), keys
+   4 (l + 8 j) + [0, 4), j < 4): the item's FP32 state page goes from its slot of
+   the CTA's page ring to registers, the pending commit is folded in (the stock
+   Triton commit's math), the committed checkpoint goes back into the slot and out
+   by one bulk store (L2 evict-first), the q tokens are verified and the outputs
+   RMS-normed and gated; corrections and outputs leave by bulk stores. Each loaded
+   4-key vector chunk feeds 8 rows: the shared-memory data path (128 B per clock,
+   whatever the broadcast) carries ~3K cycles per item, not the ~7K of a 2-row
+   layout. A row's dot product: KdaWS's per-thread partials and 8-lane transposed
+   butterfly (lane l ends with row 8 b + l); its correction goes to the store
+   buffer, from which the lane group reads its 8 rows' corrections back.
 
 State stream: a ring of three page slots per CTA; item j uses slot j % 3, and once
 item j's checkpoint store has read its slot, the slot is refilled with item j + 3.
@@ -95,8 +97,9 @@ K = 128
 GROUPS = 2
 GROUP_THREADS = 128
 THREADS = GROUPS * GROUP_THREADS
-ROWS = 2  # state rows per scan thread: c // 2 and c // 2 + 64
-CHUNKS = 16  # 4-key chunks per thread: half c % 2 of the keys
+ROWS = 8  # state rows per scan thread: 8 (c // 8) + [0, 8)
+LANES = 8  # scan threads per row
+CHUNKS = 4  # 4-key chunks per thread and row: keys 4 (c % 8 + 8 j)
 SLOTS = 3  # the CTA's state page ring
 MAX_ITEMS = 16  # items per CTA (tables, raw gates)
 # Rubin's oversized shared memory mode (327 KiB per CTA; budget 320 KiB). Elsewhere
@@ -115,7 +118,7 @@ PACKED = True
 # hoists the independent chunks' loads into spills); verify passes load the next
 # chunk's vectors before using the current ones (PREFETCH).
 FOLD_FENCE = 1
-PREFETCH = True
+PREFETCH = False
 # Item table columns.
 SLOT, HEAD, REQUEST, CONV_SLOT, CONV_OFFSET, PENDING, RECORD = range(7)
 META = 8
@@ -556,9 +559,7 @@ class KdaFlow(KdaWS):
         T: cutlass.Constexpr = self.tokens
         H: cutlass.Constexpr = self.heads
         dim: cutlass.Constexpr = H * K
-        half, x = c % 2, c % 8  # key half; register chunk j holds chunk j ^ x
-        rows = (c // 2, c // 2 + 64)
-        own_row = rows[0] + 64 * half
+        lane_in, base = c % LANES, (c // LANES) * ROWS  # rows base + [0, 8)
         nw = args[12][c]
         mine = (count - g + 1) // 2  # this group's items: g, g + 2, ...
         tr = zeros(6, Int64)  # TRACE: total, prep, state wait, fold, verify, epi
@@ -612,12 +613,12 @@ class KdaFlow(KdaWS):
                 for rr in cutlass.range_constexpr(ROWS):
                     for ch in cutlass.range_constexpr(CHUNKS):
                         values = load_shared_f32x4(
-                            at(pages, s, rows[rr] * K + 64 * half + 4 * (x ^ ch))
+                            at(pages, s, (base + rr) * K + 4 * (lane_in + LANES * ch))
                         )
                         for e in cutlass.range_constexpr(4):
                             hist[rr, ch, e] = values[e]
                 if cutlass.const_expr("fold" not in self.skip):
-                    self.fold(hist, g, pending, half, x, rows, fk_s, fp_s, fu_s, fd_s)
+                    self.fold(hist, g, pending, lane_in, base, fk_s, fp_s, fu_s, fd_s)
                 stored = pending > 0
                 if cutlass.const_expr("store" in self.skip):
                     stored = pending < 0
@@ -625,9 +626,10 @@ class KdaFlow(KdaWS):
                     for rr in cutlass.range_constexpr(ROWS):
                         for ch in cutlass.range_constexpr(CHUNKS):
                             store_shared_f32x4(
-                                at(pages, s, rows[rr] * K + 64 * half + 4 * (x ^ ch)),
+                                at(pages, s,
+                                   (base + rr) * K + 4 * (lane_in + LANES * ch)),
                                 [hist[rr, ch, e] for e in range(4)],
-                            )
+                            )  # fmt: skip
                     fence_async_shared()
                 self.group_sync(g)  # the slot is read (and rewritten) by every thread
                 if c == 0:
@@ -647,8 +649,8 @@ class KdaFlow(KdaWS):
                     tr[3] = tr[3] + (td - tc)
                 for t in cutlass.range_constexpr(T):
                     if cutlass.const_expr("verify" not in self.skip):
-                        self.verify_token(hist, t, g, betas[j, t], half, x, rows,
-                                          own_row, q_s, k_s, v_s, d_s, uo)  # fmt: skip
+                        self.verify_token(hist, t, g, betas[j, t], lane_in, base,
+                                          q_s, k_s, v_s, d_s, uo)  # fmt: skip
                     if cutlass.const_expr(t == min(1, T - 1)):
                         self.release_slot(args, c, j, count, pages, table, state_full,
                                           stored)  # fmt: skip
@@ -702,65 +704,85 @@ class KdaFlow(KdaWS):
         return (fma(a[0], b[0], c[0]), fma(a[1], b[1], c[1]))
 
     @cute.jit
-    def fold(self, hist, b, pending, half, x, rows, keys, suffix, old, decay):
+    def fold(self, hist, b, pending, lane_in, base, keys, suffix, old, decay):
         """The stock commit of the pending tokens into this thread's state elements:
         fc = fma(u_t * kn_t, P_t, fc) over t = q - 1 .. 0 (tokens t >= n are zeros),
-        then S = fma(S_0, D_n, fc)."""
+        then S = fma(S_0, D_n, fc); four rows at a time (registers)."""
         T: cutlass.Constexpr = self.tokens
+        HALF: cutlass.Constexpr = ROWS // 2
         start = Float32(0)
         if pending == 0:
             start = Float32(-0.0)  # S + (-0) == S for every S, -0 included
-        us = cute.make_rmem_tensor((ROWS, T), Float32)
-        for rr in cutlass.range_constexpr(ROWS):
-            for t in cutlass.range_constexpr(T):
-                us[rr, t] = old[b, t, rows[rr]]
-        for ch in cutlass.range_constexpr(CHUNKS):
-            key = 64 * half + 4 * (x ^ ch)
-            d4 = load_shared_f32x4(at(decay, b, key))
-            fc = cute.make_rmem_tensor((ROWS, 4), Float32)
-            for rr in cutlass.range_constexpr(ROWS):
-                for e in cutlass.range_constexpr(4):
-                    fc[rr, e] = start
-            for i in cutlass.range_constexpr(T):
-                t = T - 1 - i
-                k4 = load_shared_f32x4(at(keys, b, t, key))
-                p4 = load_shared_f32x4(at(suffix, b, t, key))
-                for rr in cutlass.range_constexpr(ROWS):
-                    u = us[rr, t]
+        for half in cutlass.range_constexpr(2):
+            us = cute.make_rmem_tensor((HALF, T), Float32)
+            for rr in cutlass.range_constexpr(HALF):
+                for t in cutlass.range_constexpr(T):
+                    us[rr, t] = old[b, t, base + HALF * half + rr]
+            for ch in cutlass.range_constexpr(CHUNKS):
+                key = 4 * (lane_in + LANES * ch)
+                d4 = load_shared_f32x4(at(decay, b, key))
+                fc = cute.make_rmem_tensor((HALF, 4), Float32)
+                for rr in cutlass.range_constexpr(HALF):
+                    for e in cutlass.range_constexpr(4):
+                        fc[rr, e] = start
+                for i in cutlass.range_constexpr(T):
+                    t = T - 1 - i
+                    k4 = load_shared_f32x4(at(keys, b, t, key))
+                    p4 = load_shared_f32x4(at(suffix, b, t, key))
+                    for rr in cutlass.range_constexpr(HALF):
+                        u = us[rr, t]
+                        for p in cutlass.range_constexpr(2):
+                            update = self.pmul((u, u), (k4[2 * p], k4[2 * p + 1]))
+                            acc = (fc[rr, 2 * p], fc[rr, 2 * p + 1])
+                            acc = self.pfma(update, (p4[2 * p], p4[2 * p + 1]), acc)
+                            fc[rr, 2 * p], fc[rr, 2 * p + 1] = acc
+                for rr in cutlass.range_constexpr(HALF):
+                    r = HALF * half + rr
                     for p in cutlass.range_constexpr(2):
-                        update = self.pmul((u, u), (k4[2 * p], k4[2 * p + 1]))
-                        acc = (fc[rr, 2 * p], fc[rr, 2 * p + 1])
-                        acc = self.pfma(update, (p4[2 * p], p4[2 * p + 1]), acc)
-                        fc[rr, 2 * p], fc[rr, 2 * p + 1] = acc
-            for rr in cutlass.range_constexpr(ROWS):
-                for p in cutlass.range_constexpr(2):
-                    pair = (hist[rr, ch, 2 * p], hist[rr, ch, 2 * p + 1])
-                    pair = self.pfma(pair, (d4[2 * p], d4[2 * p + 1]),
-                                     (fc[rr, 2 * p], fc[rr, 2 * p + 1]))  # fmt: skip
-                    hist[rr, ch, 2 * p], hist[rr, ch, 2 * p + 1] = pair
-            if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
-                cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
+                        pair = (hist[r, ch, 2 * p], hist[r, ch, 2 * p + 1])
+                        pair = self.pfma(pair, (d4[2 * p], d4[2 * p + 1]),
+                                         (fc[rr, 2 * p], fc[rr, 2 * p + 1]))  # fmt: skip
+                        hist[r, ch, 2 * p], hist[r, ch, 2 * p + 1] = pair
+                if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
+                    cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
 
     @cute.jit
-    def verify_token(self, hist, t, b, beta_t, half, x, rows, own_row, q_s, k_s,
-                     v_s, d_s, uo):  # fmt: skip
+    def row_sum8(self, partials, lane_in):
+        """The eight rows' partials of 8 lanes -> the full sum of row ``lane_in``
+        (KdaWS.row_sum's tree: lanes ^4, then ^2, then ^1)."""
+        upper = (lane_in & 4) != 0
+        a = [Float32(0) for _ in range(4)]
+        for i in cutlass.range_constexpr(4):
+            send = partials[i] if upper else partials[i + 4]
+            keep = partials[i + 4] if upper else partials[i]
+            a[i] = keep + cute.arch.shuffle_sync_bfly(send, 4)
+        upper = (lane_in & 2) != 0
+        bb = [Float32(0) for _ in range(2)]
+        for i in cutlass.range_constexpr(2):
+            send = a[i] if upper else a[i + 2]
+            keep = a[i + 2] if upper else a[i]
+            bb[i] = keep + cute.arch.shuffle_sync_bfly(send, 2)
+        upper = (lane_in & 1) != 0
+        send = bb[0] if upper else bb[1]
+        keep = bb[1] if upper else bb[0]
+        return keep + cute.arch.shuffle_sync_bfly(send, 1)
+
+    @cute.jit
+    def verify_token(self, hist, t, b, beta_t, lane_in, base, q_s, k_s, v_s, d_s,
+                     uo):  # fmt: skip
         """Verify token t from the state in registers: the decay pass (S *= d_t,
-        dot = S k_t), the corrections of both rows, the update pass (S += k_t u,
-        out = S q_t); the correction and BF16 out_t (into v_s) of row ``own_row``."""
+        dot = S k_t), lane l's correction of row base + l (into the store buffer,
+        whence the lane group reads its rows' corrections), the update pass
+        (S += k_t u, out = S q_t), lane l's BF16 out_t (into v_s)."""
         o_s = v_s
+        own = base + lane_in
 
         def chunk_of(buffer, ch):
-            return load_shared_f32x4(at(buffer, b, t, 64 * half + 4 * (x ^ ch)))
+            return load_shared_f32x4(at(buffer, b, t, 4 * (lane_in + LANES * ch)))
 
         dots = zeros((ROWS, 2, 2), Float32)
-        ahead = (chunk_of(d_s, 0), chunk_of(k_s, 0))
         for ch in cutlass.range_constexpr(CHUNKS):
-            if cutlass.const_expr(self.prefetch):
-                d4, k4 = ahead
-                if cutlass.const_expr(ch + 1 < CHUNKS):
-                    ahead = (chunk_of(d_s, ch + 1), chunk_of(k_s, ch + 1))
-            else:
-                d4, k4 = chunk_of(d_s, ch), chunk_of(k_s, ch)
+            d4, k4 = chunk_of(d_s, ch), chunk_of(k_s, ch)
             for rr in cutlass.range_constexpr(ROWS):
                 for pp in cutlass.range_constexpr(2):
                     pair = (hist[rr, ch, 2 * pp], hist[rr, ch, 2 * pp + 1])
@@ -769,22 +791,21 @@ class KdaFlow(KdaWS):
                     acc = (dots[rr, pp, 0], dots[rr, pp, 1])
                     acc = self.pfma(pair, (k4[2 * pp], k4[2 * pp + 1]), acc)
                     dots[rr, pp, 0], dots[rr, pp, 1] = acc
-        u = [Float32(0) for _ in range(ROWS)]
-        for rr in cutlass.range_constexpr(ROWS):
-            part = pair_total(dots[rr, None, None])
-            if cutlass.const_expr("reduce" not in self.skip):
-                part = part + cute.arch.shuffle_sync_bfly(part, 1)
-            u[rr] = (v_s[b, t, rows[rr]] - part) * beta_t
-        uo[t, own_row] = u[1] if half != 0 else u[0]
+        partials = [pair_total(dots[rr, None, None]) for rr in range(ROWS)]
+        if cutlass.const_expr("reduce" in self.skip):  # keeps every row live
+            dot = partials[0]
+            for rr in cutlass.range_constexpr(1, ROWS):
+                dot = dot + partials[rr]
+        else:
+            dot = self.row_sum8(partials, lane_in)
+        uo[t, own] = (v_s[b, t, own] - dot) * beta_t
+        cute.arch.sync_warp()  # the lane group's corrections are in uo
+        u_lo = load_shared_f32x4(at(uo, t, base))
+        u_hi = load_shared_f32x4(at(uo, t, base + 4))
+        u = [u_lo[0], u_lo[1], u_lo[2], u_lo[3], u_hi[0], u_hi[1], u_hi[2], u_hi[3]]
         outs = zeros((ROWS, 2, 2), Float32)
-        ahead = (chunk_of(k_s, 0), chunk_of(q_s, 0))
         for ch in cutlass.range_constexpr(CHUNKS):
-            if cutlass.const_expr(self.prefetch):
-                k4, q4 = ahead
-                if cutlass.const_expr(ch + 1 < CHUNKS):
-                    ahead = (chunk_of(k_s, ch + 1), chunk_of(q_s, ch + 1))
-            else:
-                k4, q4 = chunk_of(k_s, ch), chunk_of(q_s, ch)
+            k4, q4 = chunk_of(k_s, ch), chunk_of(q_s, ch)
             for rr in cutlass.range_constexpr(ROWS):
                 for pp in cutlass.range_constexpr(2):
                     pair = (hist[rr, ch, 2 * pp], hist[rr, ch, 2 * pp + 1])
@@ -794,14 +815,14 @@ class KdaFlow(KdaWS):
                     acc = (outs[rr, pp, 0], outs[rr, pp, 1])
                     acc = self.pfma(pair, (q4[2 * pp], q4[2 * pp + 1]), acc)
                     outs[rr, pp, 0], outs[rr, pp, 1] = acc
-        p0 = pair_total(outs[0, None, None])
-        p1 = pair_total(outs[1, None, None])
-        send = p0 if half != 0 else p1
-        keep = p1 if half != 0 else p0
-        o = keep
-        if cutlass.const_expr("reduce" not in self.skip):
-            o = keep + cute.arch.shuffle_sync_bfly(send, 1)
-        o_s[b, t, own_row] = Float32(BFloat16(o))
+        partials = [pair_total(outs[rr, None, None]) for rr in range(ROWS)]
+        if cutlass.const_expr("reduce" in self.skip):
+            o = partials[0]
+            for rr in cutlass.range_constexpr(1, ROWS):
+                o = o + partials[rr]
+        else:
+            o = self.row_sum8(partials, lane_in)
+        o_s[b, t, own] = Float32(BFloat16(o))
 
     @cute.jit
     def epilogue(self, args, g, c, o_s, g_s, out_sums, nw, oo):
