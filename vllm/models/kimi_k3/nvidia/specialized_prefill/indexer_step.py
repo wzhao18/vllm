@@ -43,6 +43,8 @@ def applicable(
         and chunk.pcp_deinterleave_idx is None
         and chunk.token_end > chunk.token_start
         and current_platform.is_device_capability((10, 7))
+        # the step layout and the flagged-row check read row bounds on the host
+        and not torch.cuda.is_current_stream_capturing()
     )
 
 

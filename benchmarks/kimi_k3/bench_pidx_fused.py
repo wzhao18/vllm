@@ -271,10 +271,18 @@ def main():
     ap.add_argument("--smodes", type=int, nargs="+", default=[0])
     ap.add_argument("--json", default="")
     ap.add_argument("--sel", action="store_true")
+    ap.add_argument("--ncu", action="store_true")
     a = ap.parse_args()
     out = {}
     if a.check:
         out["check"] = check(a)
+    if a.ncu:  # two selective layers: compile + warm, then the profiled one
+        d = make([(5461, 78360), (5461, 78360), (5462, 78360)], seed=0)
+        sp = sel_plan(d)
+        for _ in range(2):
+            run_sel(d, sp)
+        torch.cuda.synchronize()
+        return
     if a.sel:
         out["check_sel"] = [check_sel([(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000), (3, 140000)], zero=list(range(337, 346))), check_sel([(700, 78360)], seed=3)]
         out["perf_sel"] = perf_sel(a)
