@@ -19,7 +19,7 @@
 
 ## Local differences
 
-The R1 import rewrite (below), S3 and E2a (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
+The R1 import rewrite (below), S3, E2a and E4a (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
 - **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
   epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
@@ -61,6 +61,21 @@ The R1 import rewrite (below), S3 and E2a (below). Dropped relative to the previ
     PDL launch with `griddepcontrol.wait`. Only the BF16, non-batch-invariant reduce.
   - When: callers pass `rmsnorm=(weight, eps)` (`RubinMegaMoE.forward`; the sdec SP MegaMoE layer
     for its latent norm). Absent: the stock reduce, unchanged.
+
+- **E4a** (vLLM-local, not upstream): slim decode size exchange in
+  `sources/communication/nvlink_domain/token_comm.py` (FlashInfer original sha256
+  8736c9dd051ee56496c1c55b064d9e73a45dcaa247ee4cadabc197edd767c449).
+  - Why: at decode (`decode_landing`) the single router CTA bulk-copied its full size row, its full
+    source-prefix row and a full reduce-add of the totals (3 x `expert_count_padded` x 4 B) to every peer:
+    3 x 3.5 KiB x 32 = 344 KiB out of one SM per layer at EP32. Measured on 8 nodes (real EP32, NVFP4,
+    T96, globaltimer stamps): router 13 us (prefix_and_rows 4.3 us + publish_sizes 5.4 us, the latter
+    mostly `cp.async.bulk.wait_group 0`) vs 3 us on one GPU.
+  - What: a destination reads only its own `experts_per_rank` columns of `sizes_by_rank`,
+    `src_prefix_by_rank` and `sizes` (`token_in`, `_land_route_metadata`, `local_expert_sizes`), so the
+    source sends each peer just that slice (same column positions, same values): 112 B per row at EP32
+    (32x fewer bytes). The router histogram smem region is 16 B aligned (bulk source). Gate
+    `slim_size_rows` = `decode_landing` and `experts_per_rank % 4 == 0` (16 B slices); otherwise the full
+    rows as before. Bit-identical results (same counts, prefixes and totals at every address read).
 
 ## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
 
@@ -136,7 +151,7 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
-8736c9dd051ee56496c1c55b064d9e73a45dcaa247ee4cadabc197edd767c449  sources/communication/nvlink_domain/token_comm.py
+2c61f81041d4226349956bb9899ee0942f8fe34aed9dc6047d89bbfa951ba66a  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
