@@ -1559,10 +1559,11 @@ class CandSelect:
 
     @cute.jit
     def entry(self, cbuf_a, j, s):
-        """(key index, order16 key) of lane j's candidate s (staged in shared memory)."""
+        """(key index, order16 key) of lane j's candidate s, staged in shared memory
+        as order16 key << 16 | tile."""
         wd = ld_shared_u32(cbuf_a + (s * TILE + j) * 4)
-        pos = Int32(wd >> Uint32(16)) * TILE + 4 * (j % 32) + j // 32
-        return pos, order16(wd & Uint32(0xFFFF))
+        pos = Int32(wd & Uint32(0xFFFF)) * TILE + 4 * (j % 32) + j // 32
+        return pos, wd >> Uint32(16)
 
     @cute.jit
     def emit(self, flag, pos, slot_a, out, orow, lane):
@@ -1642,8 +1643,11 @@ class CandSelect:
                     ws.append(v)
                 for k in cutlass.range_constexpr(CS_BATCH):
                     if s0 + 2 * k < cj:
-                        st_shared_u32(cbuf_a + ((s0 + 2 * k) * TILE + j) * 4, ws[k])
                         key = order16(ws[k] & Uint32(0xFFFF))
+                        st_shared_u32(
+                            cbuf_a + ((s0 + 2 * k) * TILE + j) * 4,
+                            (key << Uint32(16)) | (ws[k] >> Uint32(16)),
+                        )
                         kmin = cutlass.min(kmin, key)
                         kmax = cutlass.max(kmax, key)
             for i in cutlass.range_constexpr(5):
