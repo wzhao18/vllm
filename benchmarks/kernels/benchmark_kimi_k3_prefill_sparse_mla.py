@@ -118,6 +118,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=16384)
     ap.add_argument("--ctx", type=int, default=72900)
+    ap.add_argument("--h8-ns", type=int, default=0, help="h8 KV stages (diagnostic, <= 6)")
     ap.add_argument("--reqs", type=int, default=3)
     ap.add_argument("--layers", type=int, default=3)
     ap.add_argument("--iters", type=int, default=9)
@@ -136,6 +137,10 @@ def main():
     ap.add_argument("--stamps", action="store_true",
                     help="also run each specialized variant once with clock64 stamps")
     a = ap.parse_args()
+    if a.h8_ns:
+        import vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 as _h8
+
+        _h8.NS = a.h8_ns
     dev = torch.device("cuda")
     torch.manual_seed(0)
     F = a.tokens
@@ -344,7 +349,7 @@ def main():
                     print(kname, kn, "sstamp slots rel. to softmax w0 wait start: "
                           "0-7 sm w0 (wait, S ready, S loaded, max stored, max exch, Pbuf "
                           "free, P written, fenced), 8-15 sm w4, 16 QK at KV wait, 17 QK "
-                          "issued, 18 PV OREADY passed, 19 PV issued, 20 out PFULL passed, "
+                          "issued, 18 PV OREADY passed, 19 PV issued, 20 QK KVFULL passed (h8) / out PFULL passed, "
                           "21 out OREADY arrived, 22 gather KVEMPTY passed, 23 gather "
                           "issued, 24 QK SFREE passed, 25 QK at SFREE wait, 26 PV at "
                           "OREADY wait", med, "period", per, flush=True)
