@@ -303,7 +303,7 @@ def main():
                           flush=True)
         import importlib
 
-        for kname in [k for k in ("h4", "h5", "h6") if k in kernels]:
+        for kname in [k for k in ("h4", "h5", "h6", "h7") if k in kernels]:
             kfn = getattr(importlib.import_module(
                 f"vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_{kname}"),
                 f"sparse_mla_prefill_{kname}")

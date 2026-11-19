@@ -57,10 +57,8 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     st_shared_f32,
     st_shared_u32,
     st_shared_v4,
-    tc_commit,
     tc_fence_after,
     tc_fence_before,
-    tc_mma,
     tma_tile2d,
     tmem_alloc_exclusive,
     tmem_free_exclusive,
@@ -68,7 +66,6 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (
     ld_shared_v4u,
-    tc_mma_ts,
     tmem_st_u32,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h5 import (
@@ -85,7 +82,6 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h5 import (
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
     bulk_wait_read0,
-    tc_mma_cb,
     tma_store2d,
 )
 
@@ -167,6 +163,43 @@ def bar_red_or(bid, n, pred):
     return code, "=r,r,r,r,~{memory}", (Uint32(bid), Uint32(n), Uint32(pred))
 
 
+# MMA issue by the whole warp with one elected thread: the operands stay warp-uniform
+# (uniform registers) instead of an ELECT + R2UR.BROADCAST waterfall per MMA under a
+# lane-0 branch (~100 clk per MMA issue, P-MLA run83 stamps)
+_ELECT = "elect.sync _|e, 0xffffffff; "
+
+
+@asm()
+def mma_ts_e(d, a_tmem, b, idesc, acc):
+    code = ("{ .reg .pred p, e; " + _ELECT + "setp.ne.b32 p, $4, 0; "
+            "@e tcgen05.mma.cta_group::1.kind::f8f6f4 [$0], [$1], $2, $3, p; }")
+    return code, "r,r,l,r,r,~{memory}", (Uint32(d), Uint32(a_tmem), Uint64(b),
+                                          Uint32(idesc), Uint32(acc))
+
+
+@asm()
+def mma_ss_e(d, a, b, idesc, acc):
+    code = ("{ .reg .pred p, e; " + _ELECT + "setp.ne.b32 p, $4, 0; "
+            "@e tcgen05.mma.cta_group::1.kind::f8f6f4 [$0], $1, $2, $3, p; }")
+    return code, "r,l,l,r,r,~{memory}", (Uint32(d), Uint64(a), Uint64(b), Uint32(idesc),
+                                          Uint32(acc))
+
+
+@asm()
+def mma_cb_e(d, a, b, idesc, acc, op: str):
+    code = ("{ .reg .pred p, e; " + _ELECT + "setp.ne.b32 p, $4, 0; "
+            f"@e tcgen05.mma.cta_group::1.kind::f8f6f4.collector::b::{op} [$0], $1, $2, $3, p; }}")
+    return code, "r,l,l,r,r,~{memory}", (Uint32(d), Uint64(a), Uint64(b), Uint32(idesc),
+                                          Uint32(acc))
+
+
+@asm()
+def commit_e(bar):
+    code = ("{ .reg .pred e; " + _ELECT + "@e tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+            ".shared::cluster.b64 [$0]; }")
+    return code, "r,~{memory}", (Uint32(bar),)
+
+
 @asm(Uint32)
 def ballot(pred):
     code = "{ .reg .pred p; setp.ne.u32 p, $1, 0; vote.sync.ballot.b32 $0, p, 0xffffffff; }"
@@ -239,6 +272,7 @@ class SparseMlaPrefillH6:
         if self.sstamp and not self.ssmask:
             self.ssmask = 15
         self.smem = SMEM_BYTES + (1024 if self.sstamp or self.pad else 0)
+        self.sm_arrivals = 4  # S-free / O-ready arrivals per subtile (one per softmax warp)
 
     @cute.jit
     def __call__(self, q8: Int64, rows: Int32, kv: Int64, unit_rows: Int32, slots: Int64,
@@ -281,13 +315,13 @@ class SparseMlaPrefillH6:
                 mbar_init(_bar(base, i), Uint32(cnt))
             for j in cutlass.range_constexpr(2):
                 mbar_init(_bar(base, B_SFULL + j), Uint32(1))
-                mbar_init(_bar(base, B_SFREE + j), Uint32(4))
+                mbar_init(_bar(base, B_SFREE + j), Uint32(self.sm_arrivals))
                 mbar_init(_bar(base, B_QFULL + j), Uint32(1))
                 mbar_init(_bar(base, B_QREMPTY + j), Uint32(1))
             for j in cutlass.range_constexpr(4):
                 mbar_init(_bar(base, B_OFREE + j), Uint32(4))
             for j in cutlass.range_constexpr(NP):
-                mbar_init(_bar(base, B_OREADY + j), Uint32(4))
+                mbar_init(_bar(base, B_OREADY + j), Uint32(self.sm_arrivals))
                 mbar_init(_bar(base, B_PEMPTY + j), Uint32(1))
             for s in cutlass.range_constexpr(NS):
                 mbar_init(_bar(base, B_KVFULL + s), Uint32(1))
@@ -307,6 +341,7 @@ class SparseMlaPrefillH6:
             cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
         else:
             cute.arch.warpgroup_reg_dealloc(REG_LOW)
+            taddr = Uint32(cute.arch.make_warp_uniform(taddr))
             if warp == W_PV:
                 self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
             elif warp == W_QK:
@@ -466,29 +501,27 @@ class SparseMlaPrefillH6:
         qs = base + Uint32(OFF_QS) + Uint32(qi % 2) * Uint32(QS_BYTES)
         bd0 = Uint64(SDESC_SW128) | Uint64(st >> Uint32(4))
         ad0 = Uint64(SDESC_SW128) | Uint64(qs >> Uint32(4))
-        if lane == 0:
-            for j in cutlass.range_constexpr(4):
-                bd = bd0 + Uint64(j * 512)
-                if cutlass.const_expr(j >= 2):
-                    ad = ad0 + Uint64((j - 2) * ATOM // 16)
-                for k2 in cutlass.range_constexpr(2):
-                    if cutlass.const_expr(not self.no_mma):
-                        if cutlass.const_expr(j < 2):
-                            tc_mma_ts(sc, taddr + Uint32(C_Q + 32 * j + 16 * k2),
-                                      bd + Uint64(k2 * 4), Uint32(IDESC_QK),
-                                      Uint32(1 if (j + k2) > 0 else 0))
-                        else:
-                            tc_mma(sc, ad + Uint64(k2 * 4), bd + Uint64(k2 * 4),
-                                   Uint32(IDESC_QK), Uint32(1))
-            ad = (ad0 + Uint64(2 * ATOM // 16)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
-            bd = (bd0 + Uint64(4 * 512)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
-            if cutlass.const_expr(not self.no_mma):
-                tc_mma(sc, ad, bd, Uint32(IDESC_QK), Uint32(1))
-            self.ss(base, cta, lane, u, 17, 2)
-            tc_commit(_bar(base, B_SFULL + u % 2))
-            if last:
-                tc_commit(_bar(base, B_QREMPTY + qi % 2))
-        cute.arch.sync_warp()
+        for j in cutlass.range_constexpr(4):
+            bd = bd0 + Uint64(j * 512)
+            if cutlass.const_expr(j >= 2):
+                ad = ad0 + Uint64((j - 2) * ATOM // 16)
+            for k2 in cutlass.range_constexpr(2):
+                if cutlass.const_expr(not self.no_mma):
+                    if cutlass.const_expr(j < 2):
+                        mma_ts_e(sc, taddr + Uint32(C_Q + 32 * j + 16 * k2),
+                                 bd + Uint64(k2 * 4), Uint32(IDESC_QK),
+                                 Uint32(1 if (j + k2) > 0 else 0))
+                    else:
+                        mma_ss_e(sc, ad + Uint64(k2 * 4), bd + Uint64(k2 * 4),
+                                 Uint32(IDESC_QK), Uint32(1))
+        ad = (ad0 + Uint64(2 * ATOM // 16)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
+        bd = (bd0 + Uint64(4 * 512)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
+        if cutlass.const_expr(not self.no_mma):
+            mma_ss_e(sc, ad, bd, Uint32(IDESC_QK), Uint32(1))
+        self.ss(base, cta, lane, u, 17, 2)
+        commit_e(_bar(base, B_SFULL + u % 2))
+        if last:
+            commit_e(_bar(base, B_QREMPTY + qi % 2))
 
     @cute.jit
     def pv_loop(self, base, lane, taddr, n_mine, lengths, cta):
@@ -508,24 +541,22 @@ class SparseMlaPrefillH6:
                 pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
                 bd = Uint64(SDESC_SW64) | Uint64(pbuf >> Uint32(4))
                 ad0 = Uint64(SDESC_SW128) | Uint64(st >> Uint32(4))
-                if lane == 0:
-                    for b in cutlass.range_constexpr(4):
-                        if i == 0:
-                            mbar_wait(_bar(base, B_OFREE + b), Uint32((qi & 1) ^ 1))
-                            tc_fence_after()
-                        acc = Uint32(1)
-                        if i == 0:
-                            acc = Uint32(0)
-                        op = "fill" if b == 0 else ("lastuse" if b == 3 else "use")
-                        if cutlass.const_expr(not self.no_mma):
-                            tc_mma_cb(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(b * 512), bd,
-                                      Uint32(IDESC_PV), acc, op)
-                    self.ss(base, cta, lane, u, 19, 4)
-                    tc_commit(_bar(base, B_KVEMPTY + s))
-                    tc_commit(_bar(base, B_PEMPTY + u % NP))
-                    if i == subs - 1:
-                        tc_commit(_bar(base, B_OFULL))
-                cute.arch.sync_warp()
+                for b in cutlass.range_constexpr(4):
+                    if i == 0:
+                        mbar_wait(_bar(base, B_OFREE + b), Uint32((qi & 1) ^ 1))
+                        tc_fence_after()
+                    acc = Uint32(1)
+                    if i == 0:
+                        acc = Uint32(0)
+                    op = "fill" if b == 0 else ("lastuse" if b == 3 else "use")
+                    if cutlass.const_expr(not self.no_mma):
+                        mma_cb_e(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(b * 512), bd,
+                                 Uint32(IDESC_PV), acc, op)
+                self.ss(base, cta, lane, u, 19, 4)
+                commit_e(_bar(base, B_KVEMPTY + s))
+                commit_e(_bar(base, B_PEMPTY + u % NP))
+                if i == subs - 1:
+                    commit_e(_bar(base, B_OFULL))
                 u = u + 1
 
     # ------------------------------------------------------------------ softmax
