@@ -244,12 +244,16 @@ class SparseMlaDecodeKM:
 
     def __init__(self, grid: int, stages: int = 3, loaders: int = 6,
                  stamps: bool = False, cpa: int = 0, prefetch: int = 3,
-                 gather_only: bool = False, epi_store: bool = True):
+                 gather_only: bool = False, epi_store: bool = True,
+                 no_gather: bool = False):
         assert 2 <= stages <= 8 and loaders == LOADERS
         self.grid, self.stages, self.loaders, self.stamps = grid, stages, loaders, stamps
         # cpa > 0: latent blocks 0 .. cpa - 1 by TMA, the rest of the row by cp.async
         self.cpa, self.prefetch = cpa, prefetch
         self.gather_only = gather_only
+        # bench knob: KV stages complete without loading (the MMA / softmax chain on
+        # stale stage bytes: the attention time if the gather were free)
+        self.no_gather = no_gather
         self.epi_store = epi_store  # bench knob: False drops the epilogue's stores
         self.tb = cpa if cpa else 4
         self.cpa_chunks = (4 - self.tb) * 8 + 4  # 16 B chunks per row by cp.async
@@ -462,14 +466,18 @@ class SparseMlaDecodeKM:
                     if lane == 0:
                         mbar_wait(self.bar(base, B_KVEMPTY + s),
                                   ((g // self.stages) & 1) ^ 1)
-                        if lw == 0:
-                            if cutlass.const_expr(self.cpa):
-                                mbar_arrive_tx(full, Uint32(self.tb * TN * 128))
-                            else:
-                                mbar_arrive_tx(full, Uint32(STAGE))
+                        if cutlass.const_expr(self.no_gather):
+                            if lw == 0:
+                                mbar_arrive(full)
+                        else:
+                            if lw == 0:
+                                if cutlass.const_expr(self.cpa):
+                                    mbar_arrive_tx(full, Uint32(self.tb * TN * 128))
+                                else:
+                                    mbar_arrive_tx(full, Uint32(STAGE))
                     cute.arch.sync_warp()
                     quad = lw + self.loaders * lane
-                    if (lane < per) & (quad < 32):
+                    if (lane < per) & (quad < (0 if self.no_gather else 32)):
                         key = t * TN + 4 * quad
                         r = ld_shared_v4(srow + Uint32(key) * Uint32(4))
                         r0, r1, r2, r3 = Int32(r[0]), Int32(r[1]), Int32(r[2]), Int32(r[3])
@@ -922,9 +930,10 @@ def ld_global_s32(ptr):
 
 @cache
 def _compiled(grid: int, stages: int, loaders: int, stamps: bool, cpa: int = 0,
-              prefetch: int = 3, gather_only: bool = False, epi_store: bool = True):
+              prefetch: int = 3, gather_only: bool = False, epi_store: bool = True,
+              no_gather: bool = False):
     kernel = SparseMlaDecodeKM(grid, stages, loaders, stamps, cpa, prefetch, gather_only,
-                               epi_store)
+                               epi_store, no_gather)
     args = (Int64(0), Int32(128), Int32(1), Int64(0), Int32(64), Int64(0), Int32(128),
             Int64(0), Int64(0), Int32(1), Int64(0), Int32(1), Float32(1.0), Float32(1.0),
             Int64(0), cuda.CUstream(0))
@@ -934,7 +943,8 @@ def _compiled(grid: int, stages: int, loaders: int, stamps: bool, cpa: int = 0,
 
 def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_scale,
                          grid=None, stages=3, loaders=LOADERS, stamps=None, cpa=0,
-                         prefetch=3, gather_only=False, epi_store=True):
+                         prefetch=3, gather_only=False, epi_store=True,
+                         no_gather=False):
     """As ``sparse_mla.sparse_mla_decode`` (``query`` [R, Hq, 576] contiguous)."""
     rows, q_heads = query.shape[0], query.shape[1]
     assert query.shape[2] == ROW and query.is_contiguous() and q_heads >= H
@@ -950,7 +960,7 @@ def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_s
     if rows > MAX_ROWS * grid:
         raise ValueError(f"sparse_mla_decode_km: {rows} rows exceed {MAX_ROWS} per CTA")
     fn = _compiled(grid, stages, loaders, stamps is not None, cpa, prefetch, gather_only,
-                   epi_store)
+                   epi_store, no_gather)
     stream = cuda.CUstream(torch.cuda.current_stream(query.device).cuda_stream)
     fn(Int64(query.data_ptr()), Int32(q_heads), Int32(rows), Int64(kv_rows.data_ptr()),
        Int32(kv_rows.shape[0]), Int64(slots.data_ptr()), Int32(slots.stride(0)),
