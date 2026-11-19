@@ -447,15 +447,15 @@ class KdaFlow(KdaWS):
         heads = h1 - h0 + 1
         # Before the PDL wait: the first pages (this layer's state), the F_B rows
         # and channel weights of the CTA's heads.
-        if tid == 0:
-            for s in cutlass.range_constexpr(SLOTS - 1):
-                if s < count:
-                    self.load_page(args, pages, s, table, s, state_full)
+        if tid == 0:  # F_B first (L2-resident): the gate projection waits on it
             cute.arch.mbarrier_arrive_and_expect_tx(fb_full, heads * K * K * 2)
             for h in cutlass.range_constexpr(2):
                 if h < heads:
                     copy_g2s(at(fbs, h, 0, 0), at(f_b, (h0 + h) * K, 0), K * K * 2,
                              fb_full)  # fmt: skip
+            for s in cutlass.range_constexpr(SLOTS - 1):
+                if s < count:
+                    self.load_page(args, pages, s, table, s, state_full)
         cute.arch.sync_warp()
         hslot = tid // K
         if hslot < heads:
@@ -581,7 +581,7 @@ class KdaFlow(KdaWS):
         quarter: cutlass.Constexpr = COPY_BYTES // (K * 4)  # rows per warp
         nw = args[12][c]
         mine = (count - g + 1) // 2  # this group's items: g, g + 2, ...
-        tr = zeros(6, Int64)  # TRACE: total, prep, state wait, scan, solve, epi
+        tr = zeros(9, Int64)  # TRACE: total, prep, state wait, scan, solve, epi, waits, compute, issue
         t0 = Int64(0)
         ta, tb, tc, td, te = (Int64(0) for _ in range(5))
         if cutlass.const_expr(self.trace):
@@ -597,10 +597,16 @@ class KdaFlow(KdaWS):
             if c == 0:  # the previous item's bulk stores have read their buffers
                 wait_bulk_reads()
             cute.arch.sync_warp()
+            if cutlass.const_expr(self.trace):
+                tw = clock64()
+                tr[6] = tr[6] + (tw - ta)
             if cutlass.const_expr("prep" not in self.skip):
                 self.prep_item(args, g, c, j, slot, pending, table[j, CONV_OFFSET],
                                raw, hcs[head - h0, None, None], buffers, ops,
                                sums_g, kgo)  # fmt: skip
+            if cutlass.const_expr(self.trace):
+                tp = clock64()
+                tr[7] = tr[7] + (tp - tw)
             self.group_sync(g)  # the block is complete; the staging buffers are read
             if c == 0:
                 recst = slot > 0
@@ -690,7 +696,7 @@ class KdaFlow(KdaWS):
             if c == 0:
                 cta, _, _ = cute.arch.block_idx()
                 if cta % 53 == 0:
-                    cute.printf("TRACE cta {} g {} items {} prologue {} total {} prep {} wstate {} scan {} solve {} epi {}", cta, g, mine, t0 - k0, clock64() - t0, tr[1], tr[2], tr[3], tr[4], tr[5])  # noqa: E501
+                    cute.printf("TRACE cta {} g {} items {} prologue {} total {} prep {} (waits {} compute {}) wstate {} scan {} solve {} epi {}", cta, g, mine, t0 - k0, clock64() - t0, tr[1], tr[6], tr[7], tr[2], tr[3], tr[4], tr[5])  # noqa: E501
 
     @cute.jit
     def release_slot(self, args, c, j, count, pages, table, state_full, stored):
