@@ -73,7 +73,21 @@ __device__ __forceinline__ void mma_ts_tf32(uint32_t d, uint32_t a, uint64_t b, 
 #define ST8(addr, r) asm volatile("tcgen05.st.sync.aligned.32x32b.x8.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};" \
   :: "r"(addr), "r"(r[0]),"r"(r[1]),"r"(r[2]),"r"(r[3]),"r"(r[4]),"r"(r[5]),"r"(r[6]),"r"(r[7]) : "memory")
 
-struct Args { int nch, steps, mode, flags; unsigned id_f16_n32, id_tf32_n128, id_tf32_n32, id_f16_n64; unsigned* ctr; long long* stamps; };
+struct Args { int nch, steps, mode, flags, pfill, efill, bgfill; unsigned id_f16_n32, id_tf32_n128, id_tf32_n32, id_f16_n64; unsigned* ctr; long long* stamps; };
+// math fill (calibration): n iterations x 32 independent-chain FFMA (+~2 loop instr) per warp per step, result kept live
+__device__ __forceinline__ float mfill(int n, float x) {
+  float a[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) a[j] = x + j;
+#pragma unroll 1
+  for (int i = 0; i < n; ++i) {
+#pragma unroll
+    for (int u = 0; u < 4; ++u)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) a[j] = fmaf(a[j], 1.0001f, 0.5f);
+  }
+  return ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
+}
 // flags: 1 = no HBM loads (prep reuses resident raw), 2 = no out stores, 4 = no state pass, 8 = no MMAs (chain = pass only),
 //        16 = no prep image copy (ideal prep: handoff barriers only), 32 = fused N64 MMA1+OUT-inter leg, FIN right after MMA4
 
@@ -111,7 +125,7 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
   const uint32_t tbase = tmem_base;
   // warp roles: chain c uses warps [c*16, c*16+16): 0..4*PW-1 chain group, 8..11 prep, 12..15 epilogue
   const int c = warp >> 4, w = warp & 15;
-  if (c >= A.nch) goto done;
+  if (c >= A.nch) { if (A.bgfill) { float f = mfill(A.bgfill * A.steps, (float)threadIdx.x); if (f == 1234.5f) A.stamps[0] = 1; } goto done; }
   {
     const int k = s_rank * A.nch + c;
     const int hl = k % 48, seq = (k / 48) % 3;
@@ -233,6 +247,7 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(a), "=r"(b), "=r"(cc), "=r"(d) : "r"(rs + (idx & 2047) * 16));
           asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(is + idx * 16), "r"(a), "r"(b), "r"(cc), "r"(d) : "memory");
         }
+        if (A.pfill) { float f = mfill(A.pfill, (float)pt); if (f == 1234.5f) asm volatile("st.shared.f32 [%0], %1;" :: "r"(is), "f"(f) : "memory"); }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         arrive(MB(2 + s));                                // IMG_FULL[s]
         nbar(5 + c, 128);                                 // all prep threads done reading raw[s]
@@ -256,6 +271,7 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
         }
         asm volatile("tcgen05.fence::before_thread_sync;");
         arrive(MB(8));                                    // OFREE(t)
+        if (A.efill) { float f = mfill(A.efill, __uint_as_float(r[0])); r[1] = __float_as_uint(__uint_as_float(r[1]) + f); }
         if (!(A.flags & 2)) {
           if (et == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
           nbar(3 + c, 128);
@@ -334,6 +350,7 @@ int main(int argc, char** argv) {
   size_t smem = (size_t)2 * CH_SMEM + 128;
   printf("SMs %d maxsmem %d need %zu\n", nsm, maxsm, smem);
   Args A; A.nch = nch; A.steps = steps; A.mode = mode; A.flags = flags;
+  A.pfill = argc > 7 ? atoi(argv[7]) : 0; A.efill = argc > 8 ? atoi(argv[8]) : 0; A.bgfill = argc > 9 ? atoi(argv[9]) : 0;
   A.id_f16_n32 = mk(1, 1, 1, 32, 128); A.id_tf32_n128 = mk(1, 2, 2, 128, 128); A.id_tf32_n32 = mk(1, 2, 2, 32, 128); A.id_f16_n64 = mk(1, 1, 1, 64, 128);
   CK(cudaMalloc(&A.ctr, 8)); CK(cudaMalloc(&A.stamps, (size_t)nsm * 16 * 8));
   auto kern = pw == 1 ? skel<1> : skel<2>;
@@ -358,8 +375,8 @@ int main(int argc, char** argv) {
   for (int b = 0; b < nsm; ++b) for (int c = 0; c < nch; ++c) { long long* o = &st[(b * 2 + c) * 8]; fin += o[0]; pass += o[1]; iss += o[2]; ++n; if (c == 0) nd[o[3] & 1]++; }
   double tot = (fin + pass + iss) / n / steps;
   double bytes = (double)nsm * nch * steps * (RAW_B + OUT_B);
-  printf("RESULT mode %d nch %d pw %d steps %d flags %d: kernel p50 %.1f us min %.1f | per step clk: waitFIN %.0f pass %.0f issue %.0f total %.0f | HBM %.2f GB %.2f TB/s | dies %d/%d\n",
-         mode, nch, pw, steps, flags, ts[ts.size() / 2], ts[0], fin / n / steps, pass / n / steps, iss / n / steps, tot,
+  printf("RESULT mode %d nch %d pw %d steps %d flags %d pfill %d efill %d: kernel p50 %.1f us min %.1f | per step clk: waitFIN %.0f pass %.0f issue %.0f total %.0f | HBM %.2f GB %.2f TB/s | dies %d/%d\n",
+         mode, nch, pw, steps, flags, A.pfill, A.efill, ts[ts.size() / 2], ts[0], fin / n / steps, pass / n / steps, iss / n / steps, tot,
          bytes / 1e9, bytes / (ts[ts.size() / 2] * 1e-6) / 1e12, nd[0], nd[1]);
   return 0;
 }
