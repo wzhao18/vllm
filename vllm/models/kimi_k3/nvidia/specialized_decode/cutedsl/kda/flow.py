@@ -601,7 +601,8 @@ class KdaFlow(KdaWS):
                         store_bulk(at(page, part * dim + head * K, 0),
                                    at(convs, part, 0), part_bytes)  # fmt: skip
                     bulk_commit()
-                    wait_bulk_reads()  # the staging buffers are free
+                    if cutlass.const_expr("recwait" not in self.skip):
+                        wait_bulk_reads()  # the staging buffers are free
                 if jj + 1 < mine:  # the group's next item's inputs
                     self.stage_item(args, table, j + GROUPS, buffers, stage_full)
             cute.arch.sync_warp()
@@ -635,10 +636,12 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr(self.trace):
                     td = clock64()
                     tr[3] = tr[3] + (td - tc)
-                values = self.rows_reduce(acc, lane_in)
-                self.solve(values, g, betas, j, own, v_s, uo, ce_s)
+                if cutlass.const_expr("solve" not in self.skip):
+                    values = self.rows_reduce(acc, lane_in)
+                    self.solve(values, g, betas, j, own, v_s, uo, ce_s)
                 if lane == 0:  # the warp's quarter is read: the slot can refill
-                    wait_bulk_reads()
+                    if cutlass.const_expr("pagewait" not in self.skip):
+                        wait_bulk_reads()
                 cute.arch.sync_warp()
                 self.group_sync(g)  # every quarter is read; every row's outputs
                 if c == 0:
