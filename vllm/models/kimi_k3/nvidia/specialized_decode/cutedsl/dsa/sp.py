@@ -89,7 +89,11 @@ SP_PARTIALS = PROJECTED
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
 SP_LOCAL_QUERY = "65-:local"
-SP_KERNELS = ("trtllm",)  # the FlashInfer sparse MLA kernel at every row
+# The sparse MLA kernel per row count ("rows:kernel" table or a kernel tuple): FlashInfer
+# trtllm-gen at every row. The Rubin keys-on-M kernel ("km", dsa.sparse_mla_km) is
+# wired but not selected: it is KV-gather bound (~25-30 GB/s per SM on random 576 B
+# rows) and not yet faster than trtllm-gen at R384 (runs/D-ATTN/sp km10-km13).
+SP_KERNELS = ("trtllm",)
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 

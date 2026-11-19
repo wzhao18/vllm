@@ -85,6 +85,13 @@ CORR0 = NW + 4  # first correction warp
 LEAN_REGS, SOFT_REGS, CORR_REGS = 40, 96, 56
 GATHER2 = CORR0 + 4  # warps 24..31: more KV gather warps (TMA issue rate per warp)
 LOADERS = 2 + 4 + 8
+# Per KV row: latent blocks 0-1 by TMA gather4 (4 rows per op); latent blocks 2-3 and
+# the RoPE bytes by cp.async (16 B, LSU path) from every loader thread: the per-SM TMA
+# op rate alone (~50 gather4 per us, 512 B each) held a 72 KB tile to ~2.5 us.
+TMA_BLOCKS = 2
+CPA_CHUNKS = 2 * 8 + 4  # 16 B chunks per row by cp.async
+CPA_THREADS = 32 * LOADERS
+CPA_PER = (TN * CPA_CHUNKS + CPA_THREADS - 1) // CPA_THREADS
 NSOFT = 4 * NG  # softmax warps
 MAX_ROWS = 16  # rows per CTA
 QBLK = H * 128  # one 128 B column block of the query rows [96 x 128 B]
@@ -207,6 +214,18 @@ def st_global_bf16(ptr, v):
 
 
 @asm()
+def cp_async16(dst, src, nbytes):
+    return ("cp.async.cg.shared.global [$0], [$1], 16, $2;", "r,l,r,~{memory}",
+            (Uint32(dst), Int64(src), Uint32(nbytes)))
+
+
+@asm()
+def cp_async_arrive(bar):
+    return ("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [$0];", "r,~{memory}",
+            (Uint32(bar),))
+
+
+@asm()
 def fence_async_smem():
     return "fence.proxy.async.shared::cta;", "~{memory}", ()
 
@@ -278,14 +297,14 @@ class SparseMlaDecodeKM:
         qr = tensormap.encode_map(
             q + D_NOPE, u8, (64, rows * q_heads), (ROW,), (64, H),
             sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
-        self.kernel(kvm, kvr, qn, qr, q_heads, rows, slots, slot_stride, valid, out,
+        self.kernel(kvm, kvr, qn, qr, kv, q_heads, rows, slots, slot_stride, valid, out,
                     out_stride, lse, lse_stride, scale_log2, out_scale, stamp).launch(
             grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=self.smem,
             stream=stream)
 
     @cute.kernel
     def kernel(self, kvm: tensormap.GridMap, kvr: tensormap.GridMap,
-               qn: tensormap.GridMap, qr: tensormap.GridMap, q_heads: Int32,
+               qn: tensormap.GridMap, qr: tensormap.GridMap, kv: Int64, q_heads: Int32,
                rows: Int32, slots: Int64, slot_stride: Int32, valid: Int64, out: Int64,
                out_stride: Int32, lse: Int64, lse_stride: Int32, scale_log2: Float32,
                out_scale: Float32, stamp: Int64):
@@ -311,7 +330,7 @@ class SparseMlaDecodeKM:
                 mbar_init(self.bar(base, B_IDXFULL + b), Uint32(1))
                 mbar_init(self.bar(base, B_IDXEMPTY + b), Uint32(self.loaders))
             for s in cutlass.range_constexpr(self.stages):
-                mbar_init(self.bar(base, B_KVFULL + s), Uint32(1))
+                mbar_init(self.bar(base, B_KVFULL + s), Uint32(1 + CPA_THREADS))
                 mbar_init(self.bar(base, B_KVEMPTY + s), Uint32(1))
             fence_mbar_init()
         if warp == 0:
@@ -346,8 +365,7 @@ class SparseMlaDecodeKM:
             if (warp == 2) | (warp == 3) | (warp >= NW):
                 lw = cutlass.select_(warp >= GATHER2, warp - GATHER2 + 6,
                                      cutlass.select_(warp >= NW, warp - NW + 2, warp - 2))
-                self.loader(base, lw, lane, cta, n_mine, tensormap.map_address(kvm),
-                            tensormap.map_address(kvr))
+                self.loader(base, lw, lane, cta, n_mine, tensormap.map_address(kvm), kv)
         tc_fence_before()
         cute.arch.sync_threads()
         if warp == 0:
@@ -383,7 +401,7 @@ class SparseMlaDecodeKM:
                 rq = rq + 1
 
     @cute.jit
-    def loader(self, base, lw, lane, cta, n_mine, tm_kv, tm_kr):
+    def loader(self, base, lw, lane, cta, n_mine, tm_kv, kv):
         """Loader warp lw, lane m: 4-row quad lw + L m of every tile; warp 0 arms."""
         per: cutlass.Constexpr = (32 + self.loaders - 1) // self.loaders
         g = Int32(0)
@@ -403,7 +421,7 @@ class SparseMlaDecodeKM:
                         mbar_wait(self.bar(base, B_KVEMPTY + s),
                                   ((g // self.stages) & 1) ^ 1)
                         if lw == 0:
-                            mbar_arrive_tx(full, Uint32(STAGE))
+                            mbar_arrive_tx(full, Uint32(TMA_BLOCKS * TN * 128))
                     cute.arch.sync_warp()
                     quad = lw + self.loaders * lane
                     if (lane < per) & (quad < 32):
@@ -418,11 +436,32 @@ class SparseMlaDecodeKM:
                             r2 = Int32(-1)
                         if key + 3 >= n:
                             r3 = Int32(-1)
-                        for a in cutlass.range_constexpr(4):
+                        for a in cutlass.range_constexpr(TMA_BLOCKS):
                             gather4(st + Uint32(a * TN * 128) + Uint32(quad) * 512, tm_kv,
                                     full, 128 * a, r0, r1, r2, r3)
-                        gather4(st + Uint32(4 * TN * 128) + Uint32(quad) * 256, tm_kr,
-                                full, D_NOPE, r0, r1, r2, r3)
+                    # The rest of each row by cp.async into the same swizzled layout
+                    # (SW128 latent blocks: 16 B chunk c of row r at c ^ (r % 8); SW64
+                    # RoPE: chunk p at p ^ ((r / 2) % 4)); keys past n zero-filled.
+                    me = lw * 32 + lane
+                    for j in cutlass.range_constexpr(CPA_PER):
+                        idx = me + j * CPA_THREADS
+                        if idx < TN * CPA_CHUNKS:
+                            r = idx // CPA_CHUNKS
+                            c = idx - r * CPA_CHUNKS
+                            key = t * TN + r
+                            ok = key < n
+                            slot = Int32(ld_shared_u32(srow + Uint32(key) * Uint32(4)))
+                            slot = cutlass.select_(ok, slot, Int32(0))
+                            nb = cutlass.select_(ok, Uint32(16), Uint32(0))
+                            blk = TMA_BLOCKS + (c >> 3)
+                            dst = st + Uint32(blk * TN * 128 + r * 128 + (((c & 7) ^ (r & 7)) << 4))
+                            off = TMA_BLOCKS * 128 + c * 16
+                            if c >= 16:
+                                p = c - 16
+                                dst = st + Uint32(4 * TN * 128 + r * 64 + ((p ^ ((r >> 1) & 3)) << 4))
+                                off = D_NOPE + p * 16
+                            cp_async16(dst, kv + Int64(slot) * Int64(ROW) + Int64(off), nb)
+                    cp_async_arrive(full)
                     g = g + 1
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -436,6 +475,7 @@ class SparseMlaDecodeKM:
         st = base + Uint32(self.off_kv) + Uint32(s) * Uint32(STAGE)
         b = g & 1
         mbar_wait(self.bar(base, B_KVFULL + s), (g // self.stages) & 1)
+        fence_async_smem()  # cp.async (generic proxy) writes -> tcgen05.mma reads
         if mark < 8:
             self.mark(stamp, cta, 48 + mark)
         mbar_wait(self.bar(base, B_SEMPTY + b), ((g >> 1) & 1) ^ 1)
@@ -699,6 +739,17 @@ class SparseMlaDecodeKM:
                 if (warp == SOFT0) & (lane == 0) & (ro < 2):
                     self.mark(stamp, cta, 14 + 16 * ro)
                 ro = ro + 1
+            else:  # no keys: LSE -inf and a zero latent (as trtllm-gen)
+                row = cta + i * self.grid
+                if combiner:
+                    st_global_f32(lse + (Int64(row) * Int64(lse_stride) + Int64(h0 + lane))
+                                  * Int64(4), neg)
+                dst = out + (Int64(row) * Int64(out_stride) + Int64(h0) * Int64(D_NOPE)
+                             + Int64(key)) * Int64(2)
+                for blk in cutlass.range_constexpr(4):
+                    for h in cutlass.range_constexpr(HW):
+                        st_global_bf16(dst + Int64((h * D_NOPE + 128 * blk) * 2),
+                                       Float32(0.0))
 
 
 @asm(Float32, pure=True)
@@ -775,9 +826,8 @@ def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_s
     assert latent.shape[2] == D_NOPE and latent.stride(1) == D_NOPE
     if rows == 0:
         return latent, lse
-    if grid is None:
-        grid = min(torch.cuda.get_device_properties(query.device).multi_processor_count,
-                   rows)
+    if grid is None:  # one compile for every row count: CTAs past the rows exit
+        grid = torch.cuda.get_device_properties(query.device).multi_processor_count
     if rows > MAX_ROWS * grid:
         raise ValueError(f"sparse_mla_decode_km: {rows} rows exceed {MAX_ROWS} per CTA")
     fn = _compiled(grid, stages, loaders, stamps is not None)
