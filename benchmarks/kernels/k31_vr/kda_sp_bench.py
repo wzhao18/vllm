@@ -27,6 +27,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import sp  # noqa
 Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
 
 
+GAP = 0  # see neighbour(); negative: time the neighbours alone
 PENDING = 0  # pending replay tokens per request; 0: uniform 1..Q
 
 
@@ -133,9 +134,30 @@ def bench(n, kind, layers, iters, seed=0):
         sp.RECORD_KINDS.update(saved)
         flow.max_stages = real_stages
 
+    pad = torch.zeros(1, device=kda.DEVICE)
+    act = torch.randn(rows, 3072, device=kda.DEVICE).bfloat16()
+    wgt = torch.randn(3072, 12544, device=kda.DEVICE).bfloat16()
+    prod = torch.empty(rows, 12544, device=kda.DEVICE, dtype=torch.bfloat16)
+
+    def neighbour():  # a non-PDL predecessor per layer (GAP 1: tiny, 2: in_proj-like GEMM)
+        if GAP == 1:
+            pad.add_(1.0)
+        elif GAP == 2:
+            torch.matmul(act, wgt, out=prod)
+
     def run():
         for core, metadata in calls:
+            if GAP < 0:
+                neighbour_only()
+                continue
+            neighbour()
             core.run(projected, out, caches=kv, metadata=metadata)
+
+    def neighbour_only():
+        global GAP
+        GAP = -GAP
+        neighbour()
+        GAP = -GAP
 
     run()
     torch.cuda.synchronize()
@@ -172,11 +194,14 @@ def main():
     p.add_argument("--fence", type=int, default=0, help="KdaFlow fold fence interval")
     p.add_argument("--noprefetch", action="store_true", help="KdaFlow no prefetch")
     p.add_argument("--slots", type=int, default=0, help="KdaFlow page slots")
+    p.add_argument("--gap", type=int, default=0, help="non-PDL neighbour per layer (<0: alone)")
     p.add_argument("--pending", type=int, default=0, help="pending tokens (0: 1..Q)")
     p.add_argument("--unfused", action="store_true", help="KdaFlow two verify passes")
     a = p.parse_args()
     global PENDING
     PENDING = a.pending
+    global GAP
+    GAP = a.gap
     if a.trace:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
