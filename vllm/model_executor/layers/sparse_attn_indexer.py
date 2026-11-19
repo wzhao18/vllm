@@ -1027,6 +1027,23 @@ def sparse_attn_indexer(
             if mqa_logits_use_mx_scales() and not current_platform.is_xpu()
             else weights
         )
+        if (
+            prefill_chunk_iter is None
+            and use_fp4_cache
+            and current_platform.is_device_capability_family(100)
+        ):
+            # Kimi K3.1 sm_107 selective prefill indexer (exact): the whole layer
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer_step
+
+            if indexer_step.applicable(
+                use_fp4_cache, topk_tokens, q_quant, q_scale, dcp_world_size,
+                shardq is not None, candidate_blocks is not None, prefill_chunks,
+            ):
+                indexer_step.layer_topk(
+                    prefill_chunks, prefill_kv_cache, q_quant, q_scale,
+                    prefill_weights, topk_indices_buffer,
+                )
+                prefill_chunks = ()
         if prefill_chunk_iter is None:
             prefill_chunk_iter = ((chunk, prefill_kv_cache) for chunk in prefill_chunks)
         for chunk, prefill_kv_cache in prefill_chunk_iter:
