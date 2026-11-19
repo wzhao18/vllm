@@ -49,8 +49,7 @@ SOFTMAX_WARPS = 8
 OFF_QN = 0  # Q latent: 4 x [96 rows x 128 B] SW128 (B operand of QK, K-major)
 OFF_QR = OFF_QN + 4 * H * 128  # Q RoPE: [96 x 64 B] SW64
 STAGE = 4 * 128 * 128 + 128 * 64  # KV tile: latent SW128 atoms + RoPE SW64
-OFF_KV = OFF_QR + H * 64  # 2 stages (55296 = 54 x 1024)
-OFF_P = OFF_KV + 2 * STAGE  # 2 x P^T [128 keys x 96 heads] MN-major, no swizzle
+OFF_P = OFF_QR + H * 64  # 2 x P^T [128 keys x 96 heads] MN-major, no swizzle
 OFF_RED = OFF_P + 2 * H * 128
 OFF_MT = OFF_RED + 2 * 4 * HW * 4
 OFF_L = OFF_MT + 2 * HW * 4
@@ -58,12 +57,16 @@ OFF_M = OFF_L + 2 * 4 * HW * 4  # [2 WG][48] running max (log2 units)
 OFF_AL = OFF_M + 2 * HW * 4  # [2 parity][2 WG][48] alpha of this tile
 OFF_FLAG = OFF_AL + 2 * 2 * HW * 4
 OFF_BAR = OFF_FLAG + 16
-OFF_TMEM = OFF_BAR + 16 * 8
-SMEM_BYTES = OFF_TMEM + 16
+OFF_TMEM = OFF_BAR + 32 * 8
+OFF_KV = (OFF_TMEM + 16 + 1023) // 1024 * 1024  # NS stages of STAGE bytes
+
+
+def smem_bytes(stages: int) -> int:
+    return OFF_KV + stages * STAGE
 
 B_QFULL, B_QEMPTY, B_KVFULL, B_KVEMPTY, B_SFULL, B_PFULL, B_OFULL, B_OFREE = (
-    0, 1, 2, 4, 6, 7, 8, 9,
-)
+    0, 1, 16, 24, 6, 7, 8, 9,
+)  # KV full / empty: one barrier per stage (up to 8 stages)
 # pipelined: second S^T / P^T buffers' barriers and the per-tile PV completion
 B_SFULL2, B_PFULL2, B_PVDONE = 10, 11, 12
 C_S = 0  # TMEM columns: S^T 96 (pipelined: two S^T buffers, 0 and 96)
@@ -293,6 +296,15 @@ def tmem_free_exclusive(taddr):
             "r,~{memory}", (Uint32(taddr),))
 
 
+@asm()
+def stamp_clock(ptr):
+    return ("{ .reg .b64 c; mov.u64 c, %clock64; st.global.u64 [$0], c; }", "l,~{memory}",
+            (Int64(ptr),))
+
+
+STAMP_CTAS, STAMP_TILES, STAMP_EV = 8, 64, 8
+
+
 def _bar(base, i):
     return base + Uint32(OFF_BAR + 8 * i)
 
@@ -310,8 +322,13 @@ class SparseMlaPrefill:
 
     def __init__(self, loaders: int, grid: int, pipelined: bool = False,
                  tma: bool = False, regs: tuple = (),
-                 softmax_shift: tuple = (P_PRE, THR)):
+                 softmax_shift: tuple = (P_PRE, THR), stages: int = 2,
+                 stamps: bool = False):
         self.loaders, self.grid, self.pipelined = loaders, grid, pipelined
+        # stages: KV ring depth (3 needs the oversized shared-memory carveout);
+        # stamps: record clock64 phase stamps of the first CTAs (diagnostics)
+        self.stages, self.stamps = stages, stamps
+        self.smem = smem_bytes(stages)
         # tma: loaders issue TMA tile::gather4 (one lane per 4-row quad) instead of
         # cp.async rows; regs: (softmax, other) setmaxnreg counts per warpgroup
         self.tma, self.regs = tma, regs
@@ -325,7 +342,8 @@ class SparseMlaPrefill:
     @cute.jit
     def __call__(self, q8: Int64, rows: Int32, kv: Int64, unit_rows: Int32, slots: Int64,
                  slot_stride: Int32, lengths: Int64, out: Int64, scale_log2: Float32,
-                 out_scale: Float32, kv_count: Int32, stream: cuda.CUstream):
+                 out_scale: Float32, kv_count: Int32, stamp: Int64,
+                 stream: cuda.CUstream):
         u8 = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
         l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         sw = cuda.CUtensorMapSwizzle
@@ -338,27 +356,28 @@ class SparseMlaPrefill:
         kvr = tensormap.encode_map(kv, u8, (ROW, kv_count), (ROW,), (64, 1),
                                    sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
         self.kernel(qn, qr, kvm, kvr, rows, kv, unit_rows, slots, slot_stride, lengths,
-                    out, scale_log2, out_scale).launch(
-            grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=SMEM_BYTES,
+                    out, scale_log2, out_scale, stamp).launch(
+            grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=self.smem,
             stream=stream)
 
     @cute.kernel
     def kernel(self, qn: tensormap.GridMap, qr: tensormap.GridMap, kvm: tensormap.GridMap,
                kvr: tensormap.GridMap, rows: Int32, kv: Int64,
                unit_rows: Int32, slots: Int64, slot_stride: Int32, lengths: Int64,
-               out: Int64, scale_log2: Float32, out_scale: Float32):
+               out: Int64, scale_log2: Float32, out_scale: Float32, stamp: Int64):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         smem = cutlass.utils.SmemAllocator()
-        raw = smem.allocate_array(Uint8, SMEM_BYTES, byte_alignment=1024)
+        raw = smem.allocate_array(Uint8, self.smem, byte_alignment=1024)
         base = Uint32(raw.toint())
         if tid == 0:
             kvf = 1 if cutlass.const_expr(self.tma) else 32 * self.loaders
-            for i, cnt in ((B_QFULL, 1), (B_QEMPTY, 1), (B_KVFULL, kvf),
-                           (B_KVFULL + 1, kvf), (B_KVEMPTY, 1),
-                           (B_KVEMPTY + 1, 1), (B_SFULL, 1), (B_PFULL, SOFTMAX_WARPS),
+            for st in cutlass.range_constexpr(self.stages):
+                mbar_init(_bar(base, B_KVFULL + st), Uint32(kvf))
+                mbar_init(_bar(base, B_KVEMPTY + st), Uint32(1))
+            for i, cnt in ((B_QFULL, 1), (B_QEMPTY, 1), (B_SFULL, 1), (B_PFULL, SOFTMAX_WARPS),
                            (B_OFULL, 1), (B_OFREE, SOFTMAX_WARPS), (B_SFULL2, 1),
                            (B_PFULL2, SOFTMAX_WARPS), (B_PVDONE, 1)):
                 mbar_init(_bar(base, i), Uint32(cnt))
@@ -392,16 +411,16 @@ class SparseMlaPrefill:
                     self.loader_tma(base, pw, lane, cta, n_mine,
                                     tensormap.map_address(qn), tensormap.map_address(qr),
                                     tensormap.map_address(kvm), tensormap.map_address(kvr),
-                                    slots, slot_stride, lengths)
+                                    slots, slot_stride, lengths, stamp)
                 else:
                     self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
                                 tensormap.map_address(qr), kv, unit_rows, slots,
                                 slot_stride, lengths)
         if warp == SOFTMAX_WARPS:
-            self.mma(base, lane, taddr, n_mine, lengths, cta)
+            self.mma(base, lane, taddr, n_mine, lengths, cta, stamp)
         if warp < SOFTMAX_WARPS:
             self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, out,
-                         scale_log2, out_scale, regs)
+                         scale_log2, out_scale, regs, stamp)
         tc_fence_before()
         cute.arch.sync_threads()
         if warp == 0:
@@ -411,6 +430,12 @@ class SparseMlaPrefill:
             else:
                 cute.arch.dealloc_tmem(
                     cute.make_ptr(Float32, taddr, cute.AddressSpace.tmem), 512)
+
+    @cute.jit
+    def stamp(self, ptr, cta, g, ev: cutlass.Constexpr):
+        """clock64 of event ``ev`` for tile ``g`` of CTA ``cta`` (first CTAs/tiles)."""
+        if cta < STAMP_CTAS and g < STAMP_TILES:
+            stamp_clock(ptr + Int64(((cta * STAMP_TILES + g) * STAMP_EV + ev) * 8))
 
     # ------------------------------------------------------------------ loaders
     @cute.jit
@@ -437,9 +462,9 @@ class SparseMlaPrefill:
                                Int32(0), row * H)
             srow = slots + Int64(row) * Int64(slot_stride) * Int64(4)
             for t in range(tiles):
-                s = g % 2
+                s = g % self.stages
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
-                mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // 2) & 1) ^ 1))
+                mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // self.stages) & 1) ^ 1))
                 # warp pw copies tile rows pw + nl * m (m < per): one row per warp
                 # instruction (lane = 16-B latent chunk; lanes 0-3 the RoPE chunks).
                 j = lane // 8
@@ -477,7 +502,7 @@ class SparseMlaPrefill:
 
     @cute.jit
     def loader_tma(self, base, pw: cutlass.Constexpr, lane, cta, n_mine, tm_qn, tm_qr,
-                   tm_kv, tm_kr, slots, slot_stride, lengths):
+                   tm_kv, tm_kr, slots, slot_stride, lengths, stamp):
         """Lane m of loader warp pw gathers 4-row quad pw + nl * m of each tile: four
         128 B latent boxes (SW128) and the 64 B RoPE box (SW64) by tile::gather4;
         rows past the valid count read row -1 (TMA zero fill)."""
@@ -501,11 +526,13 @@ class SparseMlaPrefill:
                                Int32(0), row * H)
             srow = slots + Int64(row) * Int64(slot_stride) * Int64(4)
             for t in range(tiles):
-                s = g % 2
+                s = g % self.stages
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
                 full = _bar(base, B_KVFULL + s)
                 if lane == 0:
-                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // 2) & 1) ^ 1))
+                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // self.stages) & 1) ^ 1))
+                    if cutlass.const_expr(self.stamps and pw == 0):
+                        self.stamp(stamp, cta, g, 0)
                     if cutlass.const_expr(pw == 0):
                         mbar_arrive_tx(full, Uint32(STAGE))
                 cute.arch.sync_warp()
@@ -531,7 +558,7 @@ class SparseMlaPrefill:
 
     # ------------------------------------------------------------------ MMA
     @cute.jit
-    def mma(self, base, lane, taddr, n_mine, lengths, cta):
+    def mma(self, base, lane, taddr, n_mine, lengths, cta, stamp):
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
         g = Int32(0)
@@ -543,24 +570,27 @@ class SparseMlaPrefill:
             tc_fence_after()
             if cutlass.const_expr(self.pipelined):
                 # QK(0), then QK(t + 1) before PV(t): softmax(t + 1) overlaps PV(t)
-                self.qk(base, lane, taddr, g, 0, tiles)
+                self.qk(base, lane, taddr, g, 0, tiles, cta, stamp)
                 for t in range(tiles):
                     if t + 1 < tiles:
-                        self.qk(base, lane, taddr, g + 1, t + 1, tiles)
-                    self.pv(base, lane, taddr, g, t, tiles, qi)
+                        self.qk(base, lane, taddr, g + 1, t + 1, tiles, cta, stamp)
+                    self.pv(base, lane, taddr, g, t, tiles, qi, cta, stamp)
                     g = g + 1
             else:
                 for t in range(tiles):
-                    self.qk(base, lane, taddr, g, t, tiles)
-                    self.pv(base, lane, taddr, g, t, tiles, qi)
+                    self.qk(base, lane, taddr, g, t, tiles, cta, stamp)
+                    self.pv(base, lane, taddr, g, t, tiles, qi, cta, stamp)
                     g = g + 1
 
     @cute.jit
-    def qk(self, base, lane, taddr, g, t, tiles):
+    def qk(self, base, lane, taddr, g, t, tiles, cta, stamp):
         """S^T(tile g) = K Q^T into its S^T buffer; frees Q after the row's last."""
-        s = g % 2
+        s = g % self.stages
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
-        mbar_wait(_bar(base, B_KVFULL + s), Uint32((g // 2) & 1))
+        mbar_wait(_bar(base, B_KVFULL + s), Uint32((g // self.stages) & 1))
+        if cutlass.const_expr(self.stamps):
+            if lane == 0:
+                self.stamp(stamp, cta, g, 1)
         fence_async_smem()
         tc_fence_after()
         cs = Uint32(C_S)
@@ -586,9 +616,9 @@ class SparseMlaPrefill:
         cute.arch.sync_warp()
 
     @cute.jit
-    def pv(self, base, lane, taddr, g, t, tiles, qi):
+    def pv(self, base, lane, taddr, g, t, tiles, qi, cta, stamp):
         """O^T += V^T P^T(tile g); frees the KV stage (and P^T buffer)."""
-        s = g % 2
+        s = g % self.stages
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE)
         if t == 0:
             mbar_wait(_bar(base, B_OFREE), Uint32((qi & 1) ^ 1))
@@ -603,6 +633,9 @@ class SparseMlaPrefill:
         else:
             mbar_wait(pfull, Uint32(g & 1))
         tc_fence_after()
+        if cutlass.const_expr(self.stamps):
+            if lane == 0:
+                self.stamp(stamp, cta, g, 4)
         if lane == 0:
             bd0 = Uint64(P_DESC) | Uint64(pbuf >> Uint32(4))
             for b in cutlass.range_constexpr(4):
@@ -625,7 +658,7 @@ class SparseMlaPrefill:
     # ------------------------------------------------------------------ softmax
     @cute.jit
     def softmax(self, base, tid, warp, lane, taddr, n_mine, lengths, cta, out,
-                scale_log2, out_scale, regs):
+                scale_log2, out_scale, regs, stamp):
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
         wg = warp // 4
@@ -657,6 +690,9 @@ class SparseMlaPrefill:
                     mbar_wait(sfull, Uint32((g // 2) & 1))
                 else:
                     mbar_wait(_bar(base, B_SFULL), Uint32(g & 1))
+                if cutlass.const_expr(self.stamps):
+                    if tid == 0:
+                        self.stamp(stamp, cta, g, 2)
                 tc_fence_after()
                 a = tmem_ld(lane_addr + cs, 32)
                 b16 = tmem_ld(lane_addr + cs + Uint32(32), 16)
@@ -737,6 +773,9 @@ class SparseMlaPrefill:
                 fence_async_smem()
                 tc_fence_before()
                 cute.arch.sync_warp()
+                if cutlass.const_expr(self.stamps):
+                    if tid == 0:
+                        self.stamp(stamp, cta, g, 3)
                 if lane == 0:
                     mbar_arrive(pfull)
                 g = g + 1
@@ -758,6 +797,9 @@ class SparseMlaPrefill:
                 st_shared_f32(base + Uint32(OFF_MT + (wg * HW + r) * 4), iv)
             named_bar(1 + wg, 128)
             mbar_wait(_bar(base, B_OFULL), Uint32(qi & 1))
+            if cutlass.const_expr(self.stamps):
+                if tid == 0:
+                    self.stamp(stamp, cta, g - 1, 5)
             tc_fence_after()
             for k4 in cutlass.range_constexpr(HW // 4):
                 v4 = ld_shared_v4f(base + Uint32(OFF_MT + (wg * HW + 4 * k4) * 4))
@@ -773,6 +815,9 @@ class SparseMlaPrefill:
                                   v * inv[k])
             tc_fence_before()
             cute.arch.sync_warp()
+            if cutlass.const_expr(self.stamps):
+                if tid == 0:
+                    self.stamp(stamp, cta, g - 1, 6)
             if lane == 0:
                 mbar_arrive(_bar(base, B_OFREE))
 
@@ -808,10 +853,10 @@ def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: 
 
 @cache
 def _compiled(loaders: int, grid: int, pipelined: bool, tma: bool, regs: tuple,
-              shift: tuple):
-    kernel = SparseMlaPrefill(loaders, grid, pipelined, tma, regs, shift)
+              shift: tuple, stages: int, stamps: bool):
+    kernel = SparseMlaPrefill(loaders, grid, pipelined, tma, regs, shift, stages, stamps)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0),
-            Int64(0), Float32(1.0), Float32(1.0), Int32(64), cuda.CUstream(0))
+            Int64(0), Float32(1.0), Float32(1.0), Int32(64), Int64(0), cuda.CUstream(0))
     opts = f"--ptxas-options -maxrregcount={min(255, 65536 // kernel.threads // 8 * 8)}"
     return cute.compile(kernel, *args, options=opts)
 
@@ -821,7 +866,8 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        out_scale: float, out: torch.Tensor | None = None,
                        loaders: int = LOADERS, pipelined: bool = PIPELINED,
                        tma: bool = TMA, regs: tuple = REGS,
-                       shift: tuple = (P_PRE, THR)) -> torch.Tensor:
+                       shift: tuple = (P_PRE, THR), stages: int = 2,
+                       stamps: torch.Tensor | None = None) -> torch.Tensor:
     """q8 [T, 96, 576] E4M3 (contiguous); kv_rows: the cache as uint8/E4M3 rows of
     576 B; slots [T, W] int32 physical slots (block * 64 + offset, -1 holes past the
     valid prefix), lengths [T] int32 valid counts; ``scale`` = softmax scale x q
@@ -835,9 +881,11 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
         return out
     sms = torch.cuda.get_device_properties(q8.device).multi_processor_count
     grid = min(sms, t)
-    fn = _compiled(loaders, grid, pipelined, tma, tuple(regs), tuple(shift))
+    fn = _compiled(loaders, grid, pipelined, tma, tuple(regs), tuple(shift), stages,
+                   stamps is not None)
     stream = cuda.CUstream(torch.cuda.current_stream(q8.device).cuda_stream)
     fn(Int64(q8.data_ptr()), Int32(t), Int64(kv_rows.data_ptr()), Int32(unit_rows),
        Int64(slots.data_ptr()), Int32(slots.stride(0)), Int64(lengths.data_ptr()),
-       Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale), Int32(kv_rows.shape[0]), stream)
+       Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale), Int32(kv_rows.shape[0]),
+       Int64(0 if stamps is None else stamps.data_ptr()), stream)
     return out

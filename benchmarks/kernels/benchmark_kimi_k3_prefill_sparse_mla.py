@@ -73,6 +73,36 @@ def time_stage(fn, iters):
     return statistics.median(a.elapsed_time(b) * 1e3 for a, b in zip(s, e))
 
 
+def stamp_report(vr, dev):
+    """Median clock deltas per tile from the kernel's clock64 stamps (8 CTAs, 64 tiles):
+    ev 0 loader issue start, 1 KV landed (MMA warp), 2 S ready (softmax), 3 P ready,
+    4 PV issue, 5 O ready (epilogue start, last tile of a row), 6 O drained."""
+    stamps = torch.zeros(8 * 64 * 8, dtype=torch.int64, device=dev)
+    vr(0, stamps=stamps)
+    torch.cuda.synchronize()
+    x = stamps.view(8, 64, 8).cpu().double()
+    rep = {}
+
+    def med(d):
+        d = d[torch.isfinite(d) & (d > 0)]
+        return round(float(d.median()), 0) if d.numel() else None
+
+    sl = slice(2, 64)
+    rep["land_minus_issue"] = med(x[:, sl, 1] - x[:, sl, 0])
+    rep["qk_S_ready_minus_land"] = med(x[:, sl, 2] - x[:, sl, 1])
+    rep["softmax"] = med(x[:, sl, 3] - x[:, sl, 2])
+    rep["pv_issue_minus_P"] = med(x[:, sl, 4] - x[:, sl, 3])
+    rep["tile_period_land"] = med(x[:, 3:64, 1] - x[:, 2:63, 1])
+    rep["tile_period_S"] = med(x[:, 3:64, 2] - x[:, 2:63, 2])
+    rep["issue_period"] = med(x[:, 3:64, 0] - x[:, 2:63, 0])
+    rep["S_ready_minus_prevP"] = med(x[:, 3:64, 2] - x[:, 2:63, 3])
+    e5 = x[:, :, 5]
+    e6 = x[:, :, 6]
+    rep["epilogue"] = med(e6[e5 > 0] - e5[e5 > 0])
+    rep["cta0_tiles_0_20"] = x[0, :20, :5].sub(x[0, 0, 0]).long().tolist()
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=16384)
@@ -84,6 +114,10 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--loaders", default="3,5")
     ap.add_argument("--qmag", type=float, default=1.0)
+    ap.add_argument("--sol-knobs", default="",
+                    help="comma list of gather_warps:no_gather:no_store diagnostics")
+    ap.add_argument("--stamps", action="store_true",
+                    help="also run each specialized variant once with clock64 stamps")
     a = ap.parse_args()
     dev = torch.device("cuda")
     torch.manual_seed(0)
@@ -192,17 +226,55 @@ def main():
         )
 
         vr_out = torch.empty(F, H, L, device=dev, dtype=torch.bfloat16)
-        for var in a.loaders.split(","):
-            nl, pp, tm, rg, sh = (int(v) for v in (var.split(":") + ["0"] * 4)[:5])
-            tag = f"l{nl}p{pp}t{tm}r{rg}s{sh}"
-            regs = (184, 72) if rg else ()
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
+            sparse_mla_prefill_sol,
+        )
+
+        def vs(i, stamps=None):
+            kv, idx = layers[i % len(layers)]
+            sparse_mla_prefill_sol(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                                   out=vr_out, stamps=stamps)
+
+        vs(0)
+        attn(0)
+        torch.cuda.synchronize()
+        d = (vr_out.float() - out[:, :H].float()).norm(dim=-1)
+        res["sol_rel_vs_trtllm"] = (
+            d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+        st["attn_sol"] = time_stage(vs, a.iters)
+        print("sol", res["sol_rel_vs_trtllm"], st["attn_sol"], flush=True)
+        if a.stamps:
+            res["stamps_sol"] = stamp_report(vs, dev)
+            print("sol", res["stamps_sol"], flush=True)
+        for kn in [k for k in a.sol_knobs.split(",") if k]:
+            knobs = tuple(int(v) for v in kn.split(":"))
+
+            def vk(i, stamps=None, knobs=knobs):
+                kv, idx = layers[i % len(layers)]
+                sparse_mla_prefill_sol(qf3, kv.view(-1, 576), idx, seq, 0.0722, 1.0,
+                                       out=vr_out, stamps=stamps, knobs=knobs)
+
+            vk(0)
+            st[f"attn_sol_k{kn}"] = time_stage(vk, a.iters)
+            print("sol knobs", kn, st[f"attn_sol_k{kn}"], flush=True)
+            if a.stamps:
+                res[f"stamps_sol_k{kn}"] = stamp_report(vk, dev)
+                print("sol knobs", kn, {k: v for k, v in res[f"stamps_sol_k{kn}"].items()
+                                        if k != "cta0_tiles_0_20"}, flush=True)
+        for var in [v for v in a.loaders.split(",") if v]:
+            f6 = (var.split(":") + ["0"] * 5)[:6]
+            nl, pp, tm, rg, sh, ns = (int(v) for v in f6)
+            ns = ns or 2
+            tag = f"l{nl}p{pp}t{tm}r{rg}s{sh}n{ns}"
+            regs = (((184, 72) if nl <= 7 else (168, 40)) if rg else ())
             shift = ((7, 1.0), (4, 4.5), (0, 8.0))[sh]
 
-            def vr(i, nl=nl, pp=pp, tm=tm, regs=regs, shift=shift):
+            def vr(i, nl=nl, pp=pp, tm=tm, regs=regs, shift=shift, ns=ns, stamps=None):
                 kv, idx = layers[i % len(layers)]
                 sparse_mla_prefill(qf3, kv.view(-1, 576), 64, idx, seq, 0.0722, 1.0,
                                    out=vr_out, loaders=nl, pipelined=bool(pp),
-                                   tma=bool(tm), regs=regs, shift=shift)
+                                   tma=bool(tm), regs=regs, shift=shift, stages=ns,
+                                   stamps=stamps)
 
             vr(0)
             attn(0)  # the stock output of the same layer
@@ -211,6 +283,9 @@ def main():
             rel = (d / out[:, :H].float().norm(dim=-1).clamp(min=1e-6)).mean().item()
             res[f"vr_{tag}_rel_vs_trtllm"] = rel
             st[f"attn_vr_{tag}"] = time_stage(vr, a.iters)
+            if a.stamps:
+                res[f"stamps_{tag}"] = stamp_report(vr, dev)
+                print(tag, res[f"stamps_{tag}"], flush=True)
     except Exception as e:  # noqa: BLE001
         import traceback
 
