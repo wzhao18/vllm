@@ -25,7 +25,12 @@ import torch
 from .weights import MX_BLOCK, NV_BLOCK, fp4_storage_dtype, is_power_of_two
 
 QuantKind = Literal["mxfp4_mxfp8", "nvfp4"]
-Variant = Literal["inference", "genphase"]
+Variant = Literal["inference", "genphase", "inference_dedup"]
+# "inference_dedup": the refreshed inference kernel (src_gp, FlashInfer main) with the
+# deduplicated combine: the owner rank pre-reduces a token's local expert rows (FP32,
+# one BF16 rounding) and returns one row per (source rank, token); the separate reduce
+# sums the rank rows in ascending rank order (TopkReduceDedup).
+VARIANTS = ("inference", "genphase", "inference_dedup")
 
 # (act data dtype or None = packed fp4, act/weight SF dtype, sf_vec_size,
 #  2x-mode instr K)
@@ -159,16 +164,21 @@ class RubinBucket:
     die_sm_mask32: die-local expert streams (die_local): bit s of the
     32-bit words set when SM s is on die 1; the layer's local experts
     [0, E/2) are homed on die 0 and [E/2, E) on die 1. None: die-oblivious.
-    Also a server policy (the device's die map), same tiles and math."""
+    Also a server policy (the device's die map), same tiles and math.
+
+    shared: ``(hidden, intermediate)`` of an MXFP8 E4M3 shared expert run inside the
+    GenPhase kernel (its tiles overlap the dispatch; its BF16 output lands in its own
+    tensor), or None."""
 
     variant: Variant
     max_tokens: int
     knobs: RubinKnobs
     max_sm_count: int | None = None
     die_sm_mask32: tuple[int, ...] | None = None
+    shared: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
-        if self.variant not in ("inference", "genphase"):
+        if self.variant not in VARIANTS:
             raise ValueError(f"unknown variant {self.variant!r}.")
         if type(self.max_tokens) is not int or self.max_tokens <= 0:
             raise ValueError("max_tokens must be a positive int.")
@@ -213,6 +223,7 @@ class RubinMoeConfig:
     gate_up_clamp: float | None = None
     max_sm_count: int | None = None
     die_sm_mask32: tuple[int, ...] | None = None
+    shared: tuple[int, int] | None = None
 
     @classmethod
     def make(
@@ -253,13 +264,16 @@ class RubinMoeConfig:
             reduce_topk_in_kernel=k.reduce_topk_in_kernel,
             max_sm_count=bucket.max_sm_count,
             die_sm_mask32=bucket.die_sm_mask32,
+            shared=bucket.shared,
         )
 
     def __post_init__(self) -> None:  # noqa: C901 - verbatim rule list
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
-        if self.kernel_variant not in ("inference", "genphase"):
+        if self.kernel_variant not in VARIANTS:
             raise ValueError(f"unsupported kernel_variant {self.kernel_variant!r}.")
+        if self.shared is not None and self.kernel_variant != "genphase":
+            raise ValueError("the fused shared expert runs on the GenPhase kernel only.")
         if self.combine_dtype != "bf16":
             raise ValueError("this backend runs BF16 combine only.")
         if self.reduce_topk_in_kernel:
@@ -383,7 +397,10 @@ class RubinMoeConfig:
         if len(self.schedule_policy) != 2:
             raise ValueError("schedule_policy requires (mode, hint).")
         mode, hint = self.schedule_policy
-        if mode not in ("grouped", "phase_interleave"):
+        modes = ("grouped", "phase_interleave") + (
+            ("decode",) if self.kernel_variant == "genphase" else ()
+        )
+        if mode not in modes:
             raise ValueError(f"unknown schedule mode {mode!r}.")
         if hint is not None and (type(hint) is not int or hint <= 0):
             raise ValueError("schedule hint must be a positive Python integer or None.")
@@ -413,14 +430,18 @@ class RubinMoeConfig:
         ):
             raise ValueError("max_sm_count must accommodate at least one cluster.")
         if self.die_sm_mask32 is not None:
+            # GenPhase: the decode scheduler's expert_half form (each die claims the
+            # tiles of its homed experts, the die from %locality_domain_id).
+            schedule = "decode" if self.kernel_variant == "genphase" else (
+                "phase_interleave"
+            )
             if (
-                self.kernel_variant != "inference"
-                or tuple(self.schedule_policy)[0] != "phase_interleave"
+                tuple(self.schedule_policy)[0] != schedule
                 or self.fallback_cluster_shape_mn is not None
             ):
                 raise ValueError(
-                    "die-local expert streams need the inference kernel's "
-                    "phase-interleaved schedule with one cluster shape."
+                    f"die-local expert streams need the {self.kernel_variant} "
+                    f"kernel's {schedule} schedule with one cluster shape."
                 )
             if not self.die_sm_mask32 or not all(
                 type(w) is int and 0 <= w < (1 << 32) for w in self.die_sm_mask32
@@ -436,31 +457,16 @@ class RubinMoeConfig:
             )
 
         if self.kernel_variant == "genphase":
+            # The refreshed GenPhase kernel (src_gp) validates its cluster, tile and
+            # schedule geometry itself (decode scheduler, die-aware forms).
             if self.padded_tokens_per_rank > 1024:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
-            n64_decode = (
-                tuple(self.cluster_shape_mn) == (4, 1)
-                and tuple(tiler) == (256, 64, 128)
-                and self.quant_kind == "mxfp4_mxfp8"
-            )
-            if (
-                tuple(self.cluster_shape_mn) != (4, 1) and not n64_decode
-            ) or self.fallback_cluster_shape_mn is not None:
-                raise ValueError(
-                    "GenPhase requires uniform cluster (4, 1), or an admitted N64 "
-                    "decode geometry."
-                )
             if not self.fc2_use_bulk:
                 raise ValueError("GenPhase requires fc2_use_bulk=True.")
-            if tiler[1] not in (128, 256) and not n64_decode:
+            if tiler[1] == 64 and self.world_size > 1 and mode == "phase_interleave":
                 raise ValueError(
-                    "GenPhase requires tile N 128 or 256, or an admitted N64 decode "
-                    "geometry."
-                )
-            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
-                raise ValueError(
-                    "GenPhase N64 with world_size > 1 requires grouped scheduling; "
-                    "multirank phase_interleave is not qualified."
+                    "GenPhase N64 with world_size > 1 requires grouped or decode "
+                    "scheduling; multirank phase_interleave is not qualified."
                 )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
@@ -474,6 +480,19 @@ class RubinMoeConfig:
                 raise ValueError(
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
+
+        if self.kernel_variant == "inference_dedup":
+            if self.token_back_mode == "epi_warps":
+                raise ValueError(
+                    "the dedup combine pushes rank rows from the combine warps "
+                    "(standalone_warps or reuse_dispatch_warps)."
+                )
+            if not self.fc2_use_bulk:
+                raise ValueError("the dedup combine requires fc2_use_bulk=True.")
+            if self.die_sm_mask32 is not None:
+                raise ValueError("the dedup inference kernel has no die-split schedule.")
+            if self.world_size > 32:
+                raise ValueError("the dedup combine supports at most 32 ranks.")
 
     # -- derived ----------------------------------------------------------------------
 

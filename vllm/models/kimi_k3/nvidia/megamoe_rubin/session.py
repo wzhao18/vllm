@@ -24,7 +24,7 @@ number of times in the same order (the barrier state persists across launches).
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -68,6 +68,8 @@ def compile_cache_key(
         float(cfg.situ_linear_beta),
         int(device),
         getattr(cfg, "die_sm_mask32", None),
+        cfg.kernel_variant,
+        getattr(cfg, "shared", None),
     )
 
 
@@ -105,6 +107,22 @@ def _max_active_clusters(cluster_size: int) -> int:
     return cached
 
 
+def _src(cfg: RubinMoeConfig):
+    """The vendored source tree of ``cfg``'s kernel: the refreshed FlashInfer main
+    export (``src_gp``, VENDOR.md) for GenPhase, the a368c5f66 drop (``src``) for
+    the inference kernel."""
+    import importlib
+
+    name = "src" if cfg.kernel_variant == "inference" else "src_gp"
+    pkg = importlib.import_module(f"{__package__}.{name}")
+    importlib.import_module(f"{__package__}.{name}.sources.api")
+    importlib.import_module(f"{__package__}.{name}.sources.quant_def")
+    importlib.import_module(
+        f"{__package__}.{name}.sources.communication.nvlink_domain.symmetric_buffer"
+    )
+    return pkg
+
+
 def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     """FlashInfer ``Sm107BlockScaledSymmBuffer._build_kernel`` (BF16 combine, SiTU).
 
@@ -113,9 +131,9 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     import cutlass
     from cutlass.cute.nvgpu import OperandMajorMode
 
-    from .src.sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
-    from .src.sources.api import ImplDesc, ProblemDesc
-    from .src.sources.quant_def import CombineFormat
+    src = _src(cfg)
+    ImplDesc, ProblemDesc = src.sources.api.ImplDesc, src.sources.api.ProblemDesc
+    CombineFormat = src.sources.quant_def.CombineFormat
 
     tiler = tuple(cfg.mma_tiler_mnk)
     cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
@@ -168,6 +186,18 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
             "topk_index_dtype": cutlass.Int32,
             "max_tokens_per_rank": cfg.padded_tokens_per_rank,
             "apply_topk_at_fc1": True,
+            **(
+                dict(
+                    shared_expert=True,
+                    shared_quant_kind="mxfp8_e4m3",
+                    shared_hidden_size=cfg.shared[0],
+                    shared_intermediate_gateup_size=2 * cfg.shared[1],
+                    shared_output_size=cfg.shared[0],
+                    reduce_shared_output=False,
+                )
+                if cfg.shared is not None
+                else {}
+            ),
         }
     )
     impl_fields: dict[str, Any] = {
@@ -193,24 +223,34 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         # FlashInfer a368c5f66 kernels have one epilogue warpgroup (the vLLM-local
         # S2 of the 0.7.3.dev20261031 drop is not carried over; VENDOR.md).
         raise ValueError(f"unsupported epilogue_warpgroups={epilogue_warpgroups}.")
-    if cfg.die_sm_mask32 is not None:
+    if cfg.die_sm_mask32 is not None and cfg.kernel_variant == "genphase":
+        # Die-local expert streams on the refreshed GenPhase decode scheduler: each
+        # die claims the tiles of the experts homed on it (die_local.place_experts:
+        # [0, E/2) on die 0), reading its die from %locality_domain_id.
+        impl_fields["die_aware"] = "expert_half"
+        impl_fields["die_sm_mask32"] = tuple(cfg.die_sm_mask32)
+    elif cfg.die_sm_mask32 is not None:
         # Die-local expert streams: FlashInfer's two-ended expert claim over the
         # die-homed weights (die_local.place_experts); the kernel reads the die of
         # each SM from the ``sm_locality_domain`` launch argument.
-        if cfg.kernel_variant == "genphase" or tuple(cfg.schedule_policy)[0] != (
-            "phase_interleave"
-        ):
+        if tuple(cfg.schedule_policy)[0] != "phase_interleave":
             raise ValueError("die-local streams need the phase-interleaved schedule.")
         impl_fields["die_split"] = True
     if cfg.fallback_cluster_shape_mn is not None:
         impl_fields["fallback_cluster_shape_mn"] = tuple(cfg.fallback_cluster_shape_mn)
         impl_fields["preferred_cluster_count"] = preferred_count
         impl_fields["fallback_cluster_count"] = fallback_count
-    kernel_cls = (
-        RubinInferenceGenphaseMegaMoE
-        if cfg.kernel_variant == "genphase"
-        else RubinInferenceMegaMoE
-    )
+    if cfg.kernel_variant == "genphase":
+        for name in ("token_in_flag_batch", "token_back_mode"):
+            impl_fields.pop(name)
+    if cfg.kernel_variant == "inference_dedup":
+        impl_fields["combine_dedup"] = True
+        impl_fields["token_back_ready_granularity"] = "expert"
+    kernel_cls = {  # src_gp exports at the package root
+        "genphase": lambda: src.RubinInferenceGenphaseMegaMoE,
+        "inference_dedup": lambda: src.RubinInferenceMegaMoE,
+        "inference": lambda: src.sources.RubinInferenceMegaMoE,
+    }[cfg.kernel_variant]()
     return kernel_cls(problem_desc, ImplDesc(impl_fields))
 
 
@@ -265,6 +305,18 @@ def _cu_stream(stream: torch.cuda.Stream):
     return cuda.CUstream(stream.cuda_stream)
 
 
+class FusedSharedArgs(NamedTuple):
+    """One launch's fused MXFP8 shared expert: ``x`` FP8 E4M3 [rows, hidden] and
+    ``x_sf`` its F8_128x4 E8M0 scales (a capacity buffer, rows >= the bucket's);
+    ``fc1`` / ``fc2`` the kernel-layout (weight, scale) pairs
+    (``weights.prepare_mxfp8_shared_weights``)."""
+
+    x: torch.Tensor
+    x_sf: torch.Tensor
+    fc1: tuple[torch.Tensor, torch.Tensor]
+    fc2: tuple[torch.Tensor, torch.Tensor]
+
+
 class RubinMegaMoeSession:
     """Kernel object + its carved workspace + bound launch arguments."""
 
@@ -278,6 +330,7 @@ class RubinMegaMoeSession:
         self.kernel = self.kernels.get(False, self.kernels.get(True))
         if not all(
             getattr(k, "masks_invalid_combine_slots", False)
+            or getattr(k, "combine_dedup", False)
             for k in self.kernels.values()
         ):
             raise RuntimeError(
@@ -310,6 +363,7 @@ class RubinMegaMoeSession:
         self._norm_bound: OrderedDict[tuple, dict] = OrderedDict()
         self._bound: OrderedDict[tuple, tuple[dict, RubinMoeWeights]] = OrderedDict()
         self._out_bound: OrderedDict[tuple, Any] = OrderedDict()
+        self._shared_bound: OrderedDict[tuple, dict] = OrderedDict()
 
     # -- sizing / carving --------------------------------------------------------------
 
@@ -337,6 +391,25 @@ class RubinMegaMoeSession:
         self.local_workspace = torch.zeros(
             (max(self.local_bytes, 1),), dtype=torch.uint8, device=self.device
         )
+        # Per-launch scratch of the refreshed inference kernel (src_gp; any content
+        # at launch, nothing survives it). The caching allocator aligns to 512 B.
+        self.tmp_buffer = (
+            torch.empty(
+                (max(int(self.kernel.get_tmp_buffer_bytes()), 1),),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if getattr(self.kernel, "separate_tmp_buffer", False)
+            else None
+        )
+        # The fused shared expert's BF16 output rows (local; read after the launch).
+        self.shared_output = (
+            torch.empty(
+                (tokens, cfg.shared[0]), dtype=torch.bfloat16, device=self.device
+            )
+            if cfg.shared is not None
+            else None
+        )
         # Output for launches with no live row (every rank must launch, R1).
         self.empty_output = torch.zeros(
             (1, cfg.hidden), dtype=torch.bfloat16, device=self.device
@@ -347,10 +420,9 @@ class RubinMegaMoeSession:
             or self.shared_workspace.data_ptr() % ALIGN
         ):
             raise RuntimeError("Rubin MegaMoE workspace alignment violated.")
-        from .src.sources.communication.nvlink_domain.symmetric_buffer import (
-            SymmetricBufferHost,
-        )
-
+        SymmetricBufferHost = _src(
+            cfg
+        ).sources.communication.nvlink_domain.symmetric_buffer.SymmetricBufferHost
         self.peer_mapper = SymmetricBufferHost(
             base_address=self.shared_workspace.data_ptr(),
             offsets=tuple(arena.offsets),
@@ -374,13 +446,18 @@ class RubinMegaMoeSession:
             "fc2_weight_sf": _to_cute(w.fc2[1]),
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
+            **(
+                {"tmp_buffer": _to_cute_ptr(self.tmp_buffer)}
+                if self.tmp_buffer is not None
+                else {}
+            ),
             "peer_rank_ptr_mapper_host": self.peer_mapper,
             "stream": _cu_stream(torch.cuda.current_stream()),
         }
         if self.cfg.quant_kind == "nvfp4":
             for name in _SCALAR_NAMES:
                 kwargs[name] = _to_cute(getattr(w, name), assumed_align=4)
-        if self.cfg.die_sm_mask32 is not None:
+        if self.cfg.die_sm_mask32 is not None and self.cfg.kernel_variant != "genphase":
             kwargs["sm_locality_domain"] = _to_cute(self._sm_locality_domain())
         return kwargs
 
@@ -425,6 +502,7 @@ class RubinMegaMoeSession:
         output: torch.Tensor,
         use_s2: bool | None = None,
         rmsnorm: tuple[torch.Tensor, float] | None = None,
+        shared: "FusedSharedArgs | None" = None,
     ) -> dict:
         """Compile on first use (never during capture), bind (host-only; legal during
         capture for an already compiled session) and cache the launch arguments.
@@ -484,9 +562,15 @@ class RubinMegaMoeSession:
         else:
             self._out_bound.move_to_end(okey)
         kwargs = {**base, "output_activation": out_cute}
+        if (shared is None) != (self.cfg.shared is None):
+            raise ValueError("a fused-shared session launches with its shared arguments.")
+        if shared is not None:
+            kwargs.update(self._shared_kwargs(shared))
         if use_s2 is None:
             use_s2 = self.use_s2(None)
         variant = (use_s2, rmsnorm is not None)
+        if rmsnorm is not None and self.cfg.kernel_variant == "inference_dedup":
+            raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
         if rmsnorm is not None:
             kwargs.update(self._rmsnorm_kwargs(*rmsnorm))
         if variant not in self.compiled:
@@ -505,6 +589,45 @@ class RubinMegaMoeSession:
                 _COMPILED[ckey] = compiled
             self.compiled[variant] = compiled
         return kwargs
+
+    def _shared_kwargs(self, shared: "FusedSharedArgs") -> dict:
+        """The fused shared expert's launch arguments (cached by pointers): the MXFP8
+        input as the caller's capacity buffer (rows >= the bucket's, F8_128x4 scales),
+        the kernel-layout weights and this session's BF16 output rows."""
+        key = (
+            shared.x.data_ptr(), shared.x_sf.data_ptr(),
+            *(t.data_ptr() for t in (*shared.fc1, *shared.fc2)),
+        )  # fmt: skip
+        hit = self._shared_bound.get(key)
+        if hit is None:
+            tokens, (hidden, inter) = self.cfg.padded_tokens_per_rank, self.cfg.shared
+            sf_numel = -(-tokens // 128) * 128 * (-(-(hidden // 32) // 4) * 4)
+            if (
+                shared.x.dtype != torch.float8_e4m3fn
+                or shared.x.shape[0] < tokens
+                or shared.x.shape[1] != hidden
+                or shared.x_sf.numel() < sf_numel
+            ):
+                raise ValueError(
+                    f"shared input must be MXFP8 E4M3 (>= {tokens}, {hidden}) with "
+                    f">= {sf_numel} F8_128x4 scales."
+                )
+            sf = shared.x_sf.view(torch.float8_e8m0fnu).reshape(-1)[:sf_numel]
+            hit = {
+                "shared_activation": _to_cute(shared.x[:tokens]),
+                "shared_activation_sf": _to_cute(sf),
+                "shared_fc1_weight": _to_cute(shared.fc1[0]),
+                "shared_fc1_weight_sf": _to_cute(shared.fc1[1]),
+                "shared_fc2_weight": _to_cute(shared.fc2[0]),
+                "shared_fc2_weight_sf": _to_cute(shared.fc2[1]),
+                "shared_output": _to_cute(self.shared_output, assumed_align=32),
+            }
+            self._shared_bound[key] = hit
+            if len(self._shared_bound) > _BIND_CACHE_LIMIT:
+                self._shared_bound.popitem(last=False)
+        else:
+            self._shared_bound.move_to_end(key)
+        return hit
 
     def _rmsnorm_kwargs(self, weight: torch.Tensor, eps: float) -> dict:
         if (
@@ -540,12 +663,13 @@ class RubinMegaMoeSession:
         output: torch.Tensor,
         ep_tokens: int | None = None,
         rmsnorm: tuple[torch.Tensor, float] | None = None,
+        shared: "FusedSharedArgs | None" = None,
     ) -> None:
         """One launch; ``ep_tokens`` (EP-uniform live tokens per rank, None = the
         capacity) picks the epilogue variant (:meth:`use_s2`); ``rmsnorm`` as in
         :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
-        kwargs = self.prepare(w, output, use_s2, rmsnorm)
+        kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
     def release(self) -> None:
@@ -555,4 +679,7 @@ class RubinMegaMoeSession:
         self._carved = False
         for name, _, _ in self.symmetric_plan:
             setattr(self, name, None)
+        self._shared_bound.clear()
         self.topk_idx = self.local_workspace = self.empty_output = None
+        self.tmp_buffer = None
+        self.shared_output = None

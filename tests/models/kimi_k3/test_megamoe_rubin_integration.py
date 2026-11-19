@@ -15,6 +15,7 @@
 - the S1 token_comm drop is recorded in VENDOR.md.
 """
 
+import dataclasses
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -216,15 +217,17 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
         problem, world, tokens, prefill_worker=False
     )
     main, _ = X.select_rubin_bucket(problem, world, tokens)
+    nv = problem.quant_kind == "nvfp4"
     assert [b.max_tokens for b in buckets] == [256, tokens]
-    assert buckets[-1] == main
-    assert all(b.variant == "inference" and b.knobs == main.knobs for b in buckets)
+    # prefill-sized NVFP4 buckets run the dedup combine (same tile knobs)
+    assert buckets[-1] == (X._prefill_dedup(main) if nv else main)
+    assert buckets[0].variant == "inference" and buckets[0].knobs == main.knobs
     assert any("decode bucket" in n for n in notes)
     for b in buckets:  # every admission rule holds at both capacities
         C.RubinMoeConfig.make(problem, b, rank=0, world_size=world)
     # a P/D prefill worker keeps its one bucket
     assert X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)[0] == (
-        main,
+        X._prefill_dedup(main) if nv else main,
     )
     # a genphase server keeps its one bucket
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(512))
@@ -282,8 +285,9 @@ def test_deployment_buckets_per_role(
     monkeypatch, ep, role, world, mnbt, tp, token_sharded, caps
 ):
     """The experts module's buckets at the deployed roles' capacities: the P/D
-    prefill workers (both kimi_k3_mega_moe) keep one bucket on the shipped record,
-    the decode role adds the 256 decode bucket on the same record."""
+    prefill workers (both kimi_k3_mega_moe) keep one bucket on the shipped record
+    (prefill-sized NVFP4: dedup combine), the decode role adds the 256 decode bucket
+    on the same record."""
     ep.world_size = world
     tokens = kimi_model.mega_moe_max_num_tokens(mnbt, tp, token_sharded)
     config = _vllm_config(mnbt=mnbt, dp=4)
@@ -295,8 +299,10 @@ def test_deployment_buckets_per_role(
         module = _experts(config, ep=ep, max_num_tokens=tokens, **K31)
     assert tuple(b.max_tokens for b in module.buckets) == caps
     main, _ = X.select_rubin_bucket(module.problem, world, tokens)
-    assert module.bucket == main
-    assert all(b.knobs == main.knobs for b in module.buckets)
+    # prefill-sized NVFP4 buckets: the dedup combine on the same tile knobs
+    want = X._prefill_dedup(main) if module.problem.quant_kind == "nvfp4" else main
+    assert module.bucket == want
+    assert all(b.knobs in (main.knobs, want.knobs) for b in module.buckets)
     for b in module.buckets:
         C.RubinMoeConfig.make(module.problem, b, rank=0, world_size=world)
 
@@ -944,7 +950,10 @@ def test_wide_ep_decode_bucket_has_its_own_record(world):
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(2048))
     buckets, notes = X.select_rubin_buckets(problem, world, 2048, prefill_worker=False)
     assert [b.max_tokens for b in buckets] == [X.RUBIN_WIDE_EP_DECODE_TOKENS, 2048]
-    assert all(b.variant == "inference" for b in buckets)
+    # EP32: the decode bucket runs the refreshed GenPhase kernel (decode scheduler);
+    # EP28 keeps the inference kernel's N128 record.
+    decode_variant = "genphase" if world in X.RUBIN_GENPHASE_DECODE_EP_SIZES else "inference"
+    assert [b.variant for b in buckets] == [decode_variant, "inference"]
     assert tuple(buckets[0].knobs.mma_tiler_mnk)[1] == 128
     assert any("its own record" in n for n in notes)
     prefill, _ = X.select_rubin_buckets(problem, world, 2048, prefill_worker=True)
@@ -962,6 +971,33 @@ def test_knob_world_size_emulates_wide_ep_on_a_slice():
     )
     assert emulated == ep32
     assert emulated[0].max_tokens == X.RUBIN_WIDE_EP_DECODE_TOKENS
-    assert tuple(emulated[0].knobs.schedule_policy)[0] == "phase_interleave"
+    assert emulated[0].variant == "genphase"
+    assert tuple(emulated[0].knobs.schedule_policy)[0] == "decode"
     native, _ = X.select_rubin_buckets(problem, 4, 2048, prefill_worker=False)
     assert native != ep32
+
+
+@pytest.mark.parametrize("world", [4, 16])
+def test_prefill_worker_nvfp4_runs_dedup_combine(world):
+    """Prefill-sized NVFP4 buckets run the refreshed dedup-combine kernel with the
+    same tile knobs and standalone-warp token back; the decode bucket keeps its kernel."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+    main, _ = X.select_rubin_bucket(problem, world, 8192)
+    (bucket,), _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=True)
+    assert bucket.variant == "inference_dedup"
+    assert bucket.knobs.token_back_mode == X.RUBIN_DEDUP_TOKEN_BACK_MODE
+    assert dataclasses.replace(bucket.knobs, token_back_mode="epi_warps") == (
+        dataclasses.replace(main.knobs, token_back_mode="epi_warps")
+    )
+    C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=world)
+    decode, _ = X.select_rubin_buckets(problem, world, 8192, prefill_worker=False)
+    assert [b.variant for b in decode] == ["inference", "inference_dedup"]
+    assert decode[0].max_tokens < X.RUBIN_DEDUP_MIN_TOKENS
+    with pytest.raises(ValueError, match="combine warps"):
+        C.RubinMoeConfig.make(
+            problem,
+            dataclasses.replace(bucket, knobs=main.knobs),
+            rank=0,
+            world_size=world,
+        )
