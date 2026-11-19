@@ -47,7 +47,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from ..common.primitives import asm
+from ..common.primitives import asm, copy_bulk, wait
 
 SF_VEC = 32
 MMA_N = 128  # tokens per MMA (64 per CTA of the pair)
@@ -113,6 +113,16 @@ def ld_global_f32(address):
 def st_global_bf16(address, value):
     code = "{ .reg .b16 t; cvt.rn.bf16.f32 t, $1; st.global.b16 [$0], t; }"
     return code, "l,f,~{memory}", (Int64(address), Float32(value))
+
+
+@asm()
+def fence_proxy_async_global():
+    return "fence.proxy.async.global;", "~{memory}", ()
+
+
+@asm(Float32)
+def ld_shared_f32(address):
+    return "ld.shared.f32 $0, [$1];", "=f,r,~{memory}", (Int32(address),)
 
 
 @asm()
@@ -247,6 +257,7 @@ class DenseMx8:
             tmem_dealloc: cutlass.Int64
             tmem_hold: cutlass.Int32
             ticket: cutlass.Int32
+            xbar: cute.struct.MemRange[cutlass.Int64, 2]
             sA: cute.struct.Align[cute.struct.MemRange[fp8, cute.cosize(a_layout.outer)], 1024]
             sB: cute.struct.Align[cute.struct.MemRange[fp8, cute.cosize(b_layout.outer)], 1024]
             sSFA: cute.struct.Align[cute.struct.MemRange[sf_t, cute.cosize(sfa_layout)], 128]
@@ -482,6 +493,7 @@ class DenseMx8:
             if cutlass.const_expr(not self.debug & 1):
                 self._epilogue(
                     acc_ptr, out_ptr, part_ptr, ticket_ptr, st.ticket.ptr.toint(), mb, v,
+                    st.sA.data_ptr().toint(), st.sB.data_ptr().toint(), st.xbar.data_ptr(),
                     warp, lane, tidx,
                 )  # fmt: skip
             if cutlass.const_expr(not self.debug & 32):
@@ -513,8 +525,8 @@ class DenseMx8:
         return tiled, src, dst
 
     @cute.jit
-    def _epilogue(self, acc_ptr, out_ptr, part_ptr, ticket_ptr, ticket_s, mb, v, warp, lane,
-                  tidx):  # fmt: skip
+    def _epilogue(self, acc_ptr, out_ptr, part_ptr, ticket_ptr, ticket_s, mb, v, sa_s, sb_s,
+                  xbar, warp, lane, tidx):  # fmt: skip
         """Thread (warp w, lane l) owns weight row 128 v + 32 w + l of row block mb
         (TMEM lane 32 w + l) and all token columns."""
         cols = MMA_N * self.nb
@@ -551,17 +563,41 @@ class DenseMx8:
                 if tidx == 0:
                     st_release_gpu(flag_a, gen)
             else:  # second: add the other half's partial, round once, store
+                # The partial (cols x 128 FP32, column-major) arrives by bulk copies of
+                # 128-column chunks (64 KB) into the drained operand ring (sA, sB): one
+                # async copy at the per-SM rate instead of latency-bound scalar loads.
+                chunk = 128 * 128 * 4
+                nch = self.nb
+                src0 = part_ptr.toint() + Int64(slot * cols * 128) * 4
                 if tidx == 0:
+                    cute.arch.mbarrier_init(xbar, 1)
+                    cute.arch.mbarrier_init(xbar + 1, 1)
+                    cute.arch.mbarrier_init_fence()
                     while ld_acquire_gpu(flag_a) < gen:
                         pass
+                    fence_proxy_async_global()
+                    cute.arch.mbarrier_arrive_and_expect_tx(xbar, chunk)
+                    copy_bulk(sa_s, src0, xbar.toint(), chunk)
+                    if cutlass.const_expr(nch > 1):
+                        cute.arch.mbarrier_arrive_and_expect_tx(xbar + 1, chunk)
+                        copy_bulk(sb_s, src0 + chunk, (xbar + 1).toint(), chunk)
                 bar_sync(EPI_BAR, 32 * EPI_WARPS)
-                fence_gpu()
-                for c0 in cutlass.range_constexpr(0, cols, 16):
-                    p = [part[base + (c0 + i) * 128] for i in range(16)]
-                    vals = tmem_wait_n(*tmem_ld16(taddr + c0))
-                    for i in cutlass.range_constexpr(16):
-                        if cutlass.const_expr(c0 + i < self.rows):
-                            if live:
-                                out[(c0 + i) * self.ldo + n] = (vals[i] + p[i]).to(
-                                    cutlass.BFloat16
-                                )
+                for j in cutlass.range_constexpr(nch):
+                    sbase = sa_s if j % 2 == 0 else sb_s
+                    wait((xbar + (j % 2)).toint(), (j // 2) % 2, scope="cta")
+                    for c0 in cutlass.range_constexpr(0, 128, 16):
+                        cc = 128 * j + c0
+                        vals = tmem_wait_n(*tmem_ld16(taddr + cc))
+                        p = [ld_shared_f32(sbase + ((c0 + i) * 128 + r) * 4) for i in range(16)]
+                        for i in cutlass.range_constexpr(16):
+                            if cutlass.const_expr(cc + i < self.rows):
+                                if live:
+                                    out[(cc + i) * self.ldo + n] = (vals[i] + p[i]).to(
+                                        cutlass.BFloat16
+                                    )
+                    if cutlass.const_expr(j + 2 < nch):
+                        bar_sync(EPI_BAR, 32 * EPI_WARPS)  # chunk j's buffer is free again
+                        if tidx == 0:
+                            cute.arch.mbarrier_arrive_and_expect_tx(xbar + (j % 2), chunk)
+                            copy_bulk(sbase, src0 + (j + 2) * chunk, (xbar + (j % 2)).toint(),
+                                      chunk)  # fmt: skip

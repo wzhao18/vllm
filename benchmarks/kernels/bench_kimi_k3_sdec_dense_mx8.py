@@ -110,12 +110,13 @@ def main():
         print(f"R{rows} scaled_mm {t_stock:.2f} us/call (graph, {len(ws)} weight copies)",
               flush=True)  # fmt: skip
         for var in args.variants.split(","):
-            f = dict(re.findall(r"([a-z])(\d+)", var))  # c<col>s<stages>k<ksplit>[m<mc>][d<debug>]
+            f = dict(re.findall(r"([a-z])(\d+)", var))  # c<col>s<stages>k<ksplit>[m<mc>][d<debug>][t<kt>]
             col, stg, ks = int(f["c"]), int(f["s"]), int(f["k"])
             mc, dbg = int(f.get("m", 1)), int(f.get("d", 0))
+            kt = int(f.get("t", 128))
             try:
                 g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
-                             debug=dbg)
+                             debug=dbg, kt=kt)
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
