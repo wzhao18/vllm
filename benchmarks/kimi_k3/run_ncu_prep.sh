@@ -7,4 +7,6 @@ ncu --set full -k regex:$KR -s $SKIP -c 1 -f -o $OUT/r python3 -u $OV/benchmarks
 ncu -i $OUT/r.ncu-repz --page details --section WarpStateStats --section SchedulerStats \
   --section SpeedOfLight --section Occupancy --section LaunchStats 2>&1 | grep -vE '^\s*$|----' | head -80
 ncu -i $OUT/r.ncu-repz --page source --csv --print-source sass > $OUT/sass.csv 2>/dev/null
+ncu -i $OUT/r.ncu-repz --page source --csv --print-source cuda > $OUT/cuda.csv 2>/dev/null
 python3 $OV/benchmarks/kimi_k3/ncu_top.py $OUT/sass.csv
+python3 $OV/benchmarks/kimi_k3/ncu_lines.py $OUT/cuda.csv
