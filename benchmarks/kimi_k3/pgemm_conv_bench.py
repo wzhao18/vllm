@@ -139,6 +139,12 @@ SKEL_TACTICS = [
     ((512, 256), (4, 1), 256, 8, "n", 1),
     ((512, 256), (2, 1), 256, 8, "n", 1),
     ((512, 256), (2, 2), 256, 8, "n", 1),
+    # swap-AB (A = W, tokens on the MMA N side, C column-major): the KDA conv
+    # epilogue layout (one feature channel per TMEM lane).
+    ((256, 256), (2, 1), 256, 8, "n", 1, 1),
+    ((256, 256), (2, 1), 256, 8, "m", 1, 1),
+    ((512, 256), (4, 1), 256, 8, "n", 1, 1),
+    ((512, 256), (4, 1), 256, 8, "n", 0, 1),
 ]
 
 
@@ -157,7 +163,9 @@ def mode_skel(args):
         print(json.dumps({"m": m, "sol_us": sol, "cublaslt": t_cub, "x_sol": round(t_cub / sol, 3)}), flush=True)
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
         for tac in SKEL_TACTICS:
-            name = f"{tac[0][0]}x{tac[0][1]}_c{tac[1][0]}x{tac[1][1]}_{tac[4]}_p{1 + tac[5]}"
+            if args.swap_only and len(tac) < 7:
+                continue
+            name = f"{tac[0][0]}x{tac[0][1]}_c{tac[1][0]}x{tac[1][1]}_{tac[4]}_p{1 + tac[5]}" + ("_swap" if len(tac) > 6 else "")
             try:
                 g = PlainGemm(wq, ws, tac)
                 out.zero_()
@@ -322,6 +330,7 @@ def main():
     ap.add_argument("--tactic", type=json.loads, default=None)
     ap.add_argument("--nodrain", action="store_true")
     ap.add_argument("--ms", default="16384,8192")
+    ap.add_argument("--swap-only", dest="swap_only", action="store_true")
     ap.add_argument("--sol-us", dest="sol_us", type=float, default=748.0)
     args = ap.parse_args()
     {"base": mode_base, "skel": mode_skel, "b3": mode_b3, "conv": mode_conv, "ncu": mode_ncu}[args.mode](args)

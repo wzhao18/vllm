@@ -107,6 +107,15 @@ class PlainGemm:
         args, problem, tail = _common_args(
             x, x_scale, self.weight, self.scale, out, self.n
         )
+        swap = len(self.tactic) > 6 and bool(self.tactic[6])
+        if swap:
+            # C^T = W @ x^T: tokens on the MMA N side, C column-major (the same
+            # row-major [m, n] bytes).
+            a, b, sa, sb, c = args
+            args = (b, a, sb, sa, c)
+            m = x.shape[0]
+            problem = (cutlass.Int32(self.n), cutlass.Int32(m), cutlass.Int32(self.k), 1)
+            tail = (tail[0], tail[1], tail[2], cutlass.Int64(self.weight.stride(0)), *tail[4:])
         args = (*args, from_dlpack(self.alpha))
         if self._compiled is None:
             key = ("plain", self.tactic, x.device.index, self.n, self.k)
@@ -118,7 +127,9 @@ class PlainGemm:
                 layouts = (
                     OperandMajorMode.K,
                     OperandMajorMode.K,
-                    cutlass_utils.LayoutEnum.ROW_MAJOR,
+                    cutlass_utils.LayoutEnum.COL_MAJOR
+                    if swap
+                    else cutlass_utils.LayoutEnum.ROW_MAJOR,
                 )
                 self._compiled = cute.compile(
                     gemm, *args, layouts, problem, mac, stream, lambda v: v,
