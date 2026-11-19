@@ -227,10 +227,13 @@ def main():
         time_it(F16K, a.heads)
         time_it(F16K, a.heads, flags=2)
         time_it([5461], 96)
+        if V3:
+            time_it(F16K, a.heads, flags=32)
     if a.stamps:
         if V3:
             stamps3(F16K, a.heads)
             stamps3(F16K, a.heads, 3)
+            stamps3(F16K, a.heads, 33)
         else:
             stamps(F16K, a.heads)
             stamps(F16K, a.heads, 3)

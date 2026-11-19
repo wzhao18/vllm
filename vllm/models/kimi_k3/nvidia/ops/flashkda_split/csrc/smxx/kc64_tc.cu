@@ -469,10 +469,12 @@ constexpr int kThreads = 32 * (kLoadWarps + kChainWarps + kOutWarps);  // 736
 constexpr int kStageWq = 0, kStageKrm = 32768, kStageU = 57344, kStageGt = 73728;
 constexpr int kStageTx = 32768 + 16384 + 8192 + 16384 + 512;
 constexpr int kStageBytes = 74752;
-constexpr int kStages = 3;
-constexpr int kOffBar = kStages * kStageBytes;
-// barriers: full[3], empty[3], w_rdy, s_rdy, o_empty
-constexpr int kNumBars = 9;
+constexpr int kStages = 2;
+// out staging: 2 x [64 t][128 v] bf16 rows, stored by bulk row copies
+constexpr int kOffOut = kStages * kStageBytes;
+constexpr int kOffBar = kOffOut + 2 * 16384;
+// barriers: full[2], empty[2], w_rdy, s_rdy, o_empty
+constexpr int kNumBars = 7;
 constexpr int kSmemBytes = kOffBar + 8 * kNumBars + 16;
 
 // S^T | O^T | W^T contiguous: MMA1 = O|W (N 128), MMA2 = S|O (N 192).
@@ -499,9 +501,9 @@ __global__ void __launch_bounds__(kThreads, 1) kc3_kernel(
   const uint32_t sbase = smem_u32(smem);
   const uint32_t bar0 = sbase + kOffBar;
   auto full = [&](int s) { return bar0 + 8 * uint32_t(s); };
-  auto empty = [&](int s) { return bar0 + 24 + 8 * uint32_t(s); };
-  const uint32_t w_rdy = bar0 + 48, s_rdy = bar0 + 56;
-  const uint32_t o_empty = bar0 + 64;
+  auto empty = [&](int s) { return bar0 + 16 + 8 * uint32_t(s); };
+  const uint32_t w_rdy = bar0 + 32, s_rdy = bar0 + 40;
+  const uint32_t o_empty = bar0 + 48;
   uint32_t* tmem_slot = reinterpret_cast<uint32_t*>(smem + kOffBar + 8 * kNumBars);
 
   if (threadIdx.x == 0) {
@@ -642,10 +644,12 @@ __global__ void __launch_bounds__(kThreads, 1) kc3_kernel(
         tc_commit(w_rdy);
       }
       // S^T *= g_total(c) under the MMAs.
+      if (!(flags & 32)) {  // flags bit 5: no decay (dev timing only)
 #pragma unroll
-      for (int i = 0; i < 32; ++i) sv[i] = __float_as_uint(__uint_as_float(sv[i]) * g[i]);
-      K2TC_ST16(trow + kColS + 32 * qc, sv);
-      K2TC_ST16(trow + kColS + 32 * qc + 16, (sv + 16));
+        for (int i = 0; i < 32; ++i) sv[i] = __float_as_uint(__uint_as_float(sv[i]) * g[i]);
+        K2TC_ST16(trow + kColS + 32 * qc, sv);
+        K2TC_ST16(trow + kColS + 32 * qc + 16, (sv + 16));
+      }
       // vnew^T = bf16(u - W) for t in [16 qc, 16 qc + 16).
       uint4 const* us = reinterpret_cast<uint4 const*>(sp + kStageU);
       const uint4 u0 = us[(2 * qc) * 128 + r];
@@ -707,13 +711,30 @@ __global__ void __launch_bounds__(kThreads, 1) kc3_kernel(
       tc_fence_before();
       __syncwarp();
       if (lane == 0) mbar_arrive(o_empty);
-      const int t0 = c * kC;
-      __nv_bfloat16* dst = out_ptr + (int64_t(bos) + t0) * H * kD + int64_t(head) * kD + r;
+      // Stage out rows [t][v] in shared memory, then bulk row stores.
+      const bool ost = warp == kOut0 && lane == 0;
+      if (ost) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
+      asm volatile("bar.sync 2, %0;" ::"n"(32 * kOutWarps) : "memory");
+      __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(smem + kOffOut + (c & 1) * 16384);
 #pragma unroll
-      for (int i = 0; i < 64; ++i)
-        if (t0 + i < seq_len) dst[int64_t(i) * H * kD] = __float2bfloat16_rn(__uint_as_float(o[i]));
+      for (int i = 0; i < 64; ++i) ob[i * kD + r] = __float2bfloat16_rn(__uint_as_float(o[i]));
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      asm volatile("bar.sync 2, %0;" ::"n"(32 * kOutWarps) : "memory");
+      if (ost) {
+        const int t0 = c * kC;
+        const int nv = min(kC, seq_len - t0);
+        __nv_bfloat16* dst = out_ptr + (int64_t(bos) + t0) * H * kD + int64_t(head) * kD;
+        const uint32_t src = sbase + kOffOut + (c & 1) * 16384;
+        for (int i = 0; i < nv; ++i)
+          asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], 256;" ::"l"(
+                           dst + int64_t(i) * H * kD),
+                       "r"(src + 256 * i)
+                       : "memory");
+        asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+      }
     }
   }
+  if (warp == kOut0 && lane == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
   tc_fence_before();
   __syncthreads();
   if (warp == 1) {
