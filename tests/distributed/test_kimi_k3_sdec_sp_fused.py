@@ -147,6 +147,9 @@ def _worker(env: dict[str, str]) -> None:
                             eps=eps[0], output_norm_eps=eps[1],
                         )  # fmt: skip
                         g = comm.all_gather(x, parity).clone()
+                        if os.environ.get("SP_FUSED_TRACE"):
+                            torch.accelerator.synchronize(device)
+                            print(f"rank{rank} stock gathered", flush=True)
                         h = comm.reduce_scatter(out, parity, rows, partial)
                         if write:
                             prefix, pd = h.clone(), None
@@ -159,6 +162,9 @@ def _worker(env: dict[str, str]) -> None:
                         )  # fmt: skip
                     else:
                         g = bound.gather(d, prefix, blocks, parity).clone()
+                        if os.environ.get("SP_FUSED_TRACE"):
+                            torch.accelerator.synchronize(device)
+                            print(f"rank{rank} gathered", flush=True)
                         y = bound.reduce(prefix, blocks, out, parity, partial).clone()
                     torch.accelerator.synchronize(device)
                     assert _armed(comm, parity, rows), (mode, rows, layer)
