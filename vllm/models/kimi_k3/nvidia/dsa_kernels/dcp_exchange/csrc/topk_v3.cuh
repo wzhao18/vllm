@@ -7,7 +7,8 @@
 // topk_v2_redo_kernel (the complete body) exactly as there.
 //
 // Per row (one CTA): the sampled q-th key places the 256-key window BEFORE the candidate
-// pass (lo = sampled q-th key - kV3Below), so
+// pass (lo = the sample's theta for ~q + 256 candidates, at most kV3Below below the
+// sampled q-th key), so
 //  1. sample (1/8 of the row's groups) -> lo;
 //  2. one pass over the SMEM row: every key >= lo with its position (position order);
 //  3. the window histogram over the candidates (keys above the window counted), one
@@ -22,7 +23,7 @@
 
 namespace k31dcpx {
 
-constexpr int kV3Below = 16;  // window keys below the sampled q-th key (~9% in value)
+constexpr int kV3Below = 120;  // the window's lowest start below the sampled q-th key
 
 struct V3Sm {
   uint32_t* hist;  // sample histogram (kCoarseBins), then the exchanged words
@@ -71,7 +72,6 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
   int& s_q = s_i[3];
   int& s_cnt = s_i[5];
   int& s_e = s_i[6];
-  int& s_lo = s_i[7];
   uint32_t& s_valid = s_u[0];
   uint32_t& s_above = s_u[1];
   uint32_t& s_sat = s_u[5];
@@ -142,7 +142,7 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
   // ---- 1. sample -> lo
   for (int b = tid; b < kCoarseBins / 4; b += T) reinterpret_cast<uint4*>(hist)[b] = make_uint4(0u, 0u, 0u, 0u);
   if (tid < kV2Win) { win[tid] = 0u; bcur[tid] = 0u; }
-  if (tid == 0) { s_valid = 0; s_above = 0; s_sat = 0; s_cnt = 0; s_lo = 1; s_e = -1; }
+  if (tid == 0) { s_valid = 0; s_above = 0; s_sat = 0; s_cnt = 0; s_e = -1; s_i[8] = -1; s_i[9] = 0; }
   const int head = min(L, head0);
   const int sh = (8 - head) & 7;
   const int ng = (L + sh + 7) >> 3;
@@ -183,8 +183,11 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
   __syncthreads();
   V3DBG(10);
   {
-    // the coarse bin where the sample's suffix count reaches q / 8: the q-th key's estimate
-    const uint32_t want = max(1u, q / kV2SampleStride);
+    // from the sample's suffix counts: theta, the bottom of the coarse bin where they reach
+    // the share of q + 256 keys (as topk_v2: the candidate count stays near q + 256 on
+    // dense rows), and the coarse bin of the q-th key's estimate e
+    const uint32_t want_e = max(1u, q / kV2SampleStride);
+    const uint32_t want_t = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
     const int bb = T - 1 - tid;
     uint32_t hv[kPB];
     uint32_t v = 0;
@@ -192,20 +195,24 @@ __device__ __forceinline__ int v3_row(const V2Params& p, const V3Sm& sm, const i
     for (int i = 0; i < kPB; ++i) { hv[i] = hist[bb * kPB + i]; v += hv[i]; }
     uint32_t tot;
     const uint32_t ab = v2_scan<T>(v, V3WS, &tot);
-    if (ab < want && ab + v >= want) {
+    if (ab < want_t && ab + v >= want_e) {
       uint32_t run = ab;
-      int e16 = bb * kPB;
 #pragma unroll
       for (int i = kPB - 1; i >= 0; --i) {
         const uint32_t nx = run;
         run += hv[i];
-        if (run >= want && nx < want) e16 = bb * kPB + i;
+        if (run >= want_e && nx < want_e) s_i[8] = bb * kPB + i;
+        if (run >= want_t && nx < want_t) s_i[9] = bb * kPB + i;
       }
-      s_lo = min(max(1, e16 * 16 + 8 - kV3Below), 0x10000 - kV2Win);
     }
   }
   __syncthreads();
-  const int lo = s_lo;
+  // lo = theta, raised to kV3Below below e on wide rows (the window keeps e inside)
+  const int lo = [&] {
+    const int th = s_i[9] > 0 ? s_i[9] * 16 : 1;
+    const int lo0 = s_i[8] >= 0 ? max(th, s_i[8] * 16 + 8 - kV3Below) : th;
+    return min(max(1, lo0), 0x10000 - kV2Win);
+  }();
   V3DBG(1);
 
   // ---- 2. candidates: every key >= lo with its position, in position order
