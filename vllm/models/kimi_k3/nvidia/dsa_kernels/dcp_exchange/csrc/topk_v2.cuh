@@ -138,6 +138,13 @@ __device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* ws, uint32_t* 
   return before + x - v;
 }
 
+// h[bin] += 1 for every lane with `valid`, one atomic per distinct bin of the warp (bf16
+// logits tie a lot: same-bin atomics of a warp serialize). Every lane of the warp calls it.
+__device__ __forceinline__ void v2_hist_add(uint32_t* h, uint32_t bin, bool valid) {
+  const uint32_t m = __match_any_sync(0xFFFFFFFFu, valid ? bin : 0xFFFFFFFFu);
+  if (valid && (int)(threadIdx.x & 31) == __ffs(m) - 1) atomicAdd(&h[bin], (uint32_t)__popc(m));
+}
+
 // kV2FB consecutive (16-byte aligned) histogram words -> v; returns their sum
 template <int FB>
 __device__ __forceinline__ uint32_t v2_ldbins(const uint32_t* h, uint32_t (&v)[FB]) {
@@ -389,12 +396,13 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (K31_LIKELY(regp)) {
       // sample: one group in kV2SampleStride (spread over the 8 residues)
 #pragma unroll 1
-      for (int g = tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride) {
-        const Keys8 k8(sgroup(g));
+      for (int g0 = 0; g0 < ng; g0 += kV2T * kV2SampleStride) {  // warp-uniform trip count
+        const int g = g0 + tid * kV2SampleStride + (tid & 7);
+        const Keys8 k8(g < ng ? sgroup(g) : make_uint4(~0u, ~0u, ~0u, ~0u));
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const uint32_t k = k8.key(j);
-          if (k) atomicAdd(&hist[k >> 4], 1u);
+          v2_hist_add(hist, k >> 4, k != 0u);
         }
       }
     } else if constexpr (!kFast) {
@@ -675,10 +683,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       const int f0 = (kV2T - 1 - tid) * kV2FB;
       for (int pass = 0; pass < 2; ++pass) {
         uint32_t bey = 0;
-        for (int c = tid; c < nc; c += kV2T) {
-          const int u = (int)ckey[c] - fb;
+        for (int c0 = 0; c0 < nc; c0 += kV2T) {  // warp-uniform trip count
+          const int c = c0 + tid;
+          const int u = c < nc ? (int)ckey[c] - fb : -1;
           if (u >= kV2Fine) ++bey;
-          else if (u >= 0) atomicAdd(&hist[u], 1u);
+          v2_hist_add(hist, (uint32_t)u, u >= 0 && u < kV2Fine);
         }
         for (int o = 16; o > 0; o >>= 1) bey += __shfl_xor_sync(0xffffffffu, bey, o);
         if ((tid & 31) == 0 && bey) atomicAdd(&s_beyond, bey);
