@@ -1188,6 +1188,46 @@ def conv_chunk(cfg, hist: cutlass.Constexpr, tid, raw_stage, prev_stage, chunk_s
 
 
 @cute.jit
+def cg0_conv(cfg, hist: cutlass.Constexpr, cum, chunk_start, tid, group_id, seqlen, slot, bars, sQ_raw, sK_raw, sV_raw, sQc_raw, sKc_raw, sVc_raw, sConvW, mConvState, ch_q, ch_k, ch_v):
+    """A CG0 group's conv of ring chunk ``cum`` (tile chunk at token ``chunk_start``)
+    into the group's conv'd Q / K tiles and the V conv ring; then releases the
+    previous stage's history rows (the extra raw_done arrival)."""
+    count = cutlass.Uint32(cum)
+    raw_stage = cutlass.Int32(count % cfg.smem_raw_stages)
+    prev_stage = cutlass.Int32((count + cutlass.Uint32(cfg.smem_raw_stages - 1)) % cfg.smem_raw_stages)
+    bars.mb_raw_ready[cutlass.Int32(count % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((count // cfg.smem_raw_bar_stages) % 2))
+    if cutlass.const_expr(hist == 0):
+        prev = count - cutlass.Uint32(1)
+        bars.mb_raw_ready[cutlass.Int32(prev % cfg.smem_raw_bar_stages)].wait(cutlass.Int32((prev // cfg.smem_raw_bar_stages) % 2))
+    vc = cutlass.Int32(count % cfg.vconv_stages)
+    bars.mb_vconv_done[vc].wait(cutlass.Int32(((count // cfg.vconv_stages) + 1) % 2))
+    conv_chunk(
+        cfg,
+        hist,
+        tid,
+        raw_stage,
+        prev_stage,
+        chunk_start,
+        seqlen,
+        slot,
+        sQ_raw.data_ptr(),
+        sK_raw.data_ptr(),
+        sV_raw.data_ptr(),
+        sQc_raw.data_ptr() + group_id * (cfg.d_k * cfg.b_t),
+        sKc_raw.data_ptr() + group_id * (cfg.d_k * cfg.b_t),
+        sVc_raw.data_ptr() + vc * (cfg.d_v * cfg.b_t),
+        sConvW.data_ptr(),
+        mConvState,
+        ch_q,
+        ch_k,
+        ch_v,
+    )
+    bars.mb_vconv_ready[vc].arrive()
+    if cum > cutlass.Int32(0):
+        bars.mb_raw_done[prev_stage].arrive()
+
+
+@cute.jit
 def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
     """Map raw gate to the log2-domain decay increment used by KDA."""
 
@@ -1356,45 +1396,37 @@ def compute0_warp_group(
             lane_in_row_group = lane_idx - lane_row_group * 8
             decay_row = row_group_start + lane_row_group
             if cutlass.const_expr(cfg.fused_conv):
-                # history rows before the chunk: the previous ring stage (same tile, held by
-                # the extra raw_done arrival below), or at token 0 the conv state
-                conv_prev_stage = cutlass.Int32((chunk_count + cutlass.Uint32(cfg.smem_raw_stages - 1)) % cfg.smem_raw_stages)
+                # The group convolves its next chunk while it waits for the state
+                # update (software pipelining, below); its first chunk of a tile here.
                 conv_slot = cutlass.Int32(mConvSlot[batch_idx])
-                conv_vc_stage = cutlass.Int32(chunk_count % cfg.vconv_stages)
                 conv_ch_q = head_o * cutlass.Int32(cfg.d_k)
                 conv_ch_k = conv_ch_q + cutlass.Int32(mConvW.shape[0] // 3)
                 conv_ch_v = conv_ch_k + cutlass.Int32(mConvW.shape[0] // 3)
                 conv_sQc = sQc_raw.data_ptr() + cg0_group_id * (cfg.d_k * cfg.b_t)
                 conv_sKc = sKc_raw.data_ptr() + cg0_group_id * (cfg.d_k * cfg.b_t)
-                conv_args = (
+                conv_common = (
                     cg0_local_warp * cfg.threads_per_warp + lane_idx,
-                    raw_stage,
-                    conv_prev_stage,
-                    chunk_start,
+                    cg0_group_id,
                     batch_seqlen,
                     conv_slot,
-                    sQ_raw.data_ptr(),
-                    sK_raw.data_ptr(),
-                    sV_raw.data_ptr(),
-                    conv_sQc,
-                    conv_sKc,
-                    sVc_raw.data_ptr() + conv_vc_stage * (cfg.d_v * cfg.b_t),
-                    sConvW.data_ptr(),
+                    bars,
+                    sQ_raw,
+                    sK_raw,
+                    sV_raw,
+                    sQc_raw,
+                    sKc_raw,
+                    sVc_raw,
+                    sConvW,
                     mConvState,
                     conv_ch_q,
                     conv_ch_k,
                     conv_ch_v,
                 )
-                # the previous chunk's row loads of this group's conv tiles are done
-                nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
-                bars.mb_vconv_done[conv_vc_stage].wait(cutlass.Int32(((chunk_count // cfg.vconv_stages) + 1) % 2))
-                if chunk_idx == cutlass.Int32(0):
-                    conv_chunk(cfg, 1, *conv_args)
-                else:
-                    conv_chunk(cfg, 0, *conv_args)
-                bars.mb_vconv_ready[conv_vc_stage].arrive()
-                if cum_chunk > 0:
-                    bars.mb_raw_done[conv_prev_stage].arrive()
+                if local_chunk_idx < cutlass.Int32(cfg.cg0_group_count):
+                    if chunk_idx == cutlass.Int32(0):
+                        cg0_conv(cfg, 1, cum_chunk, chunk_start, *conv_common)
+                    else:
+                        cg0_conv(cfg, 0, cum_chunk, chunk_start, *conv_common)
                 nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
 
             # ---- Gate prefix scan ----------------------------------------------------
@@ -1720,6 +1752,18 @@ def compute0_warp_group(
                 nvvm.bar_warp_sync(cute.arch.FULL_MASK)
             bars.mb_qk_scale_ready[qk_scale_ready_stage].arrive()
 
+            if cutlass.const_expr(cfg.fused_conv):
+                # the group's next chunk, ahead of the state update wait; its conv'd
+                # Q / K tile is free once every thread did this chunk's row loads
+                nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
+                if local_chunk_idx + cutlass.Int32(cfg.cg0_group_count) < num_chunks_tile:
+                    cg0_conv(
+                        cfg,
+                        0,
+                        cum_chunk + cutlass.Int32(cfg.cg0_group_count),
+                        chunk_start + cutlass.Int32(cfg.cg0_group_count * cfg.b_t),
+                        *conv_common,
+                    )
             # ---- state stage, left key half: pack, publish, fp32 decay ---------------
             if cum_chunk > 0:
                 update_count = chunk_count - cutlass.Uint32(1)
@@ -3569,7 +3613,7 @@ def build_cfg(
         cfg.smem_raw_stages = 5
         cfg.smem_checkpoint_stages = 1 if cfg.checkpoint_dtype.width == 32 else 2
     if fused_conv:
-        cfg.smem_raw_stages -= 1
+        cfg.smem_raw_stages -= 2
     cfg.smem_raw_bar_stages = cfg.smem_raw_stages + (cfg.smem_raw_stages % 2)
     cfg.threads_per_cta = 16 * cfg.threads_per_warp
     cfg.cg0_threads_per_group = cfg.cg0_warps_per_group * cfg.threads_per_warp
@@ -3620,7 +3664,7 @@ def build_cfg(
         if steep or cfg.d_v != 128 or cfg.d_k != 128 or tiles_per_head != 1:
             raise ValueError(f"fused conv needs steep off, d_k = d_v = 128 and one tile per head (steep {cfg.steep_mode}, d_v {cfg.d_v})")
         cfg.fused_conv = True
-        cfg.vconv_stages = 2
+        cfg.vconv_stages = 4
         cfg.vconv_cosize = cfg.vconv_stages * cfg.d_v * cfg.b_t
         cfg.conv_w_cosize = 3 * 4 * cfg.d_k
         cfg.qkconv_cosize = cfg.cg0_group_count * cfg.d_k * cfg.b_t
