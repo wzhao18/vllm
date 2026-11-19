@@ -223,7 +223,7 @@ def check_sel(reqs, zero=None, seed=1):
                              dim=1).values
             got = d["out"][t0 + c:t0 + c + n].to(torch.int64)
             got = torch.sort(torch.where(got >= 0, got, 1 << 40), dim=1).values[:, :kk]
-            ok = (got == ref).all(1) | (flag[t0 + c:t0 + c + n] != 0)
+            ok = (got == ref).all(1)  # flagged rows too (device recovery)
             res["bad_rows"] += int((~ok).sum())
         t0 += rows
     print("check_sel", json.dumps(res), flush=True)
@@ -251,6 +251,9 @@ def perf_sel(args):
         sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
         mode=pidx.PUBLISH_STAGGER), args.iters)
     res["score_store"] = timed(lambda: run_score(d), args.iters)
+    res["total_recover_all"] = timed(lambda: pidx.selective_topk(
+        sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
+        recover_all=True), args.iters)
     k3 = pidx._cand_select_kernel(2048)
     st = torch.cuda.current_stream().cuda_stream
     res["cand_select"] = timed(lambda: k3(cand, sp.row_len, rb0, d["out"].view(-1), st),

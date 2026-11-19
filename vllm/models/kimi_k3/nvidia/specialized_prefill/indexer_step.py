@@ -5,12 +5,11 @@ selective path of ``indexer`` (sampled thresholds, candidate-publishing MXFP4
 score, exact candidate select), called from the stock sparse_attn_indexer prefill
 loop for single-rank (no DCP / PCP / ShardQ) MXFP4 chunks.
 
-Per step (cached on ``chunk.logits_inputs``): one host read of the chunk's row
-bounds -> requests, their 128-aligned key layout and the SelectivePlan. Per layer:
-each request's keys gathered to its aligned base, the selective top-k, and one
-host read of the flagged-row count; a chunk with flagged rows (threshold missed:
-fewer candidates than k, or more than CAP) returns False and the caller runs the
-stock path for it, which is exact.
+Per step (cached on ``chunk.logits_inputs`` by the step's first DSA layer, outside
+graph capture): one host read of the chunk's row bounds -> requests, their
+128-aligned key layout and the SelectivePlan. Per layer, with no host reads:
+each request's keys gathered to its aligned base and the selective top-k (rows
+whose threshold missed are recomputed on device by the full path).
 """
 
 import torch
@@ -34,16 +33,7 @@ def applicable(
 ) -> bool:
     from vllm.logger import init_logger
 
-    init_logger(__name__).info_once(
-        "Kimi K3.1 sm_107 prefill indexer hook: fp4=%s topk=%d q_scale=%s heads=%d "
-        "dcp=%d shardq=%s cand=%s pcp=%s rows=%d cap=%s capturing=%s",
-        use_fp4_cache, topk_tokens, q_scale is not None, q_quant.shape[1],
-        dcp_world_size, has_shardq, has_candidate_blocks,
-        chunk.pcp_deinterleave_idx is not None, chunk.token_end - chunk.token_start,
-        current_platform.get_device_capability(),
-        torch.cuda.is_current_stream_capturing(),
-    )
-    return (
+    ok = (
         use_fp4_cache
         and topk_tokens == 2048
         and q_scale is not None
@@ -54,9 +44,19 @@ def applicable(
         and chunk.pcp_deinterleave_idx is None
         and chunk.token_end > chunk.token_start
         and current_platform.is_device_capability((10, 7))
-        # the step layout and the flagged-row check read row bounds on the host
-        and not torch.cuda.is_current_stream_capturing()
+        # the step layout reads row bounds on the host (once per step, eager)
+        and (
+            _KEY in chunk.logits_inputs
+            or not torch.cuda.is_current_stream_capturing()
+        )
     )
+    init_logger(__name__).info_once(
+        "Kimi K3.1 sm_107 selective prefill indexer: %s (fp4=%s topk=%d heads=%d "
+        "dcp=%d shardq=%s pcp=%s)", "on" if ok else "off", use_fp4_cache,
+        topk_tokens, q_quant.shape[1], dcp_world_size, has_shardq,
+        chunk.pcp_deinterleave_idx is not None,
+    )
+    return ok
 
 
 def _step_layout(chunk, device):
@@ -100,9 +100,9 @@ def chunk_topk(
     q_scale: torch.Tensor,
     weights_bf16: torch.Tensor,
     topk_out: torch.Tensor,
-) -> bool:
+) -> None:
     """Exact top-k of the chunk's rows into ``topk_out`` (request-local key
-    indices, unordered, -1 padded). False: rows were flagged, run the stock path."""
+    indices, unordered, -1 padded)."""
     dev = q_quant.device
     reqs, bases, nk, sp, cu_one = _step_layout(chunk, dev)
     keys = torch.empty((nk, 64), dtype=torch.uint8, device=dev)
@@ -118,7 +118,7 @@ def chunk_topk(
     rows = slice(chunk.token_start, chunk.token_end)
     q = q_quant[rows].contiguous().view(torch.uint8)
     out = torch.empty((sp.t, 2048), dtype=torch.int32, device=dev)
-    row_bin, _ = pidx.selective_topk(
+    pidx.selective_topk(
         sp,
         q,
         q_scale[rows].contiguous(),
@@ -127,7 +127,4 @@ def chunk_topk(
         weights_bf16.contiguous(),
         out,
     )
-    if int(row_bin[1 : 3 * sp.t : 3].count_nonzero()) != 0:
-        return False
     topk_out.copy_(out)
-    return True

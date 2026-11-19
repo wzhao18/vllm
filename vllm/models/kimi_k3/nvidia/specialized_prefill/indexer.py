@@ -1765,9 +1765,21 @@ class SelectivePlan:
 
     def __init__(self, row_counts, row_lens_last, key_bases, device, topk=2048):
         self.topk = topk
-        self.items, self.row_len, _, _ = plan(row_counts, row_lens_last, key_bases, device)
+        self.items, self.row_len, self.row_base, self.scratch = plan(
+            row_counts, row_lens_last, key_bases, device
+        )
         t = sum(row_counts)
         self.t = t
+        # recovery (full path for flagged rows): each item's rows, the bitmap stride
+        self.item_rows = self.items[:, :1] + torch.arange(BQ, device=device)
+        self.item_valid = torch.arange(BQ, device=device) < self.items[:, 1:2]
+        self.item_rows.clamp_(max=max(t - 1, 0))
+        self.idle_items = self.items.clone()
+        self.idle_items[:, 1] = 0  # no rows: every token writes the dummy row
+        self.idle_items[:, 3] = 1  # one (masked) tile pair
+        self.words = max(
+            ((last + TILE - 1) // TILE * TILE for last in row_lens_last), default=TILE
+        ) // 32
         # candidate regions: row r at r * REGION words (int16 units here), dummy row t
         self.cand_base = torch.arange(t + 1, dtype=torch.int64, device=device) * (REGION * 2)
         # sampled keys of each request, all of a request's rows see all of them
@@ -1803,9 +1815,11 @@ class SelectivePlan:
 
 
 def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
-                   mode=PUBLISH):
+                   mode=PUBLISH, recover_all=False):
     """Exact top-k of every row of ``sp`` into ``out`` (Int32 [T, topk], unordered,
-    -1 padded). Returns the number of rows recomputed by the full path."""
+    -1 padded), without host reads. Returns (row_bin, candidates): row r was
+    recomputed by the full path iff row_bin[3 r + 1] != 0 (``recover_all``: every
+    row, for tests)."""
     dev = q.device
     t = sp.t
     # 1) thresholds: score the sampled keys, the rank-th largest per row
@@ -1824,6 +1838,24 @@ def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None
     _cand_select_kernel(out.shape[1])(
         cand, sp.row_len, sp.row_bin, out.view(-1), stream
     )
+    # 4) flagged rows (threshold missed or a lane overflowed) through the full
+    # path, without a host read (graph-safe): items holding no flagged row run one
+    # masked tile pair, unflagged rows keep the candidate result
+    flag = sp.row_bin[1 : 3 * t : 3] != 0
+    if recover_all:
+        flag = torch.ones_like(flag)
+    active = (flag[sp.item_rows] & sp.item_valid).any(dim=1, keepdim=True)
+    items = torch.where(active, sp.items, sp.idle_items)
+    logits = torch.empty(sp.scratch, dtype=torch.bfloat16, device=dev)
+    rec_bin = torch.empty(3 * (t + 1), dtype=torch.int32, device=dev)
+    score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, items, sp.row_base,
+          logits, rec_bin, ctas=ctas)
+    rec_len = torch.where(flag, sp.row_len, 0)
+    bitmap = torch.empty(t * sp.words, dtype=torch.int32, device=dev)
+    rec_cand = torch.empty(t * CAND, dtype=torch.int32, device=dev)
+    rec_out = torch.empty_like(out)
+    select(logits, sp.row_base, rec_len, rec_bin, bitmap, rec_cand, rec_out, ctas=ctas)
+    out.copy_(torch.where(flag[:, None], rec_out, out))
     return sp.row_bin, cand
 
 

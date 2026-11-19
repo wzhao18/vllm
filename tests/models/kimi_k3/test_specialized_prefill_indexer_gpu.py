@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3.1 sm_107 selective prefill indexer: the top-2048 keys of every row
 equal the exact top-k of the stock (DeepGEMM) MXFP4 logits, ties to the lowest
-key index; rows the thresholds cannot settle are flagged, never wrong."""
+key index, also for the rows the thresholds cannot settle (recomputed on device
+by the full path)."""
 
 import pytest
 import torch
@@ -68,28 +69,34 @@ def _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base):
 
 
 @pytest.mark.parametrize(
-    "reqs,zero_rows",
+    "reqs,zero_rows,recover_all",
     [
         # short rows (all keys kept), rows across the CAP boundary, long rows
-        ([(37, 1000), (300, 9000), (9, 2100), (40, 40000), (3, 140000)], ()),
-        # all-tied rows (zero head weights): flagged for the exact stock path
-        ([(64, 20000)], tuple(range(10, 20))),
+        ([(37, 1000), (300, 9000), (9, 2100), (40, 40000), (3, 140000)], (), False),
+        # all-tied rows (zero head weights): flagged, recomputed by the full path
+        ([(64, 20000)], tuple(range(10, 20)), False),
+        # every row through the full path
+        ([(37, 1000), (21, 9000), (40, 40000)], (), True),
     ],
 )
-def test_selective_topk_matches_stock(reqs, zero_rows):
+def test_selective_topk_matches_stock(reqs, zero_rows, recover_all):
     q, q_scale, w16, k8, k_sf, bases = _inputs(reqs, zero_rows)
     sp = pidx.SelectivePlan(
         [r for r, _ in reqs], [kv for _, kv in reqs], bases, "cuda"
     )
     out = torch.empty(sp.t, K, dtype=torch.int32, device="cuda")
-    row_bin, _ = pidx.selective_topk(sp, q, q_scale, k8, k_sf, w16, out)
+    row_bin, _ = pidx.selective_topk(
+        sp, q, q_scale, k8, k_sf, w16, out, recover_all=recover_all
+    )
     flagged = row_bin[1 : 3 * sp.t : 3] != 0
     assert not flagged[[i for i in range(sp.t) if i not in zero_rows]].any()
+    if zero_rows:
+        assert flagged[list(zero_rows)].all()
     t0 = 0
     for (rows, kv), base in zip(reqs, bases):
         ref = _stock_topk(q, q_scale, w16, k8, k_sf, t0, rows, kv, base)
         got = out[t0 : t0 + rows].to(torch.int64)
         got = torch.where(got >= 0, got, 1 << 40).sort(dim=1).values[:, : ref.shape[1]]
-        ok = (got == ref).all(1) | flagged[t0 : t0 + rows]
+        ok = (got == ref).all(1)
         assert ok.all(), f"request ({rows}, {kv}): {int((~ok).sum())} rows differ"
         t0 += rows
