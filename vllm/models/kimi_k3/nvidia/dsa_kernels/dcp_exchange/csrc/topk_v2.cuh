@@ -56,6 +56,7 @@ constexpr int kV2NR = 9;        // SMEM row: rows of <= kV2NR x kV2T groups (36,
 constexpr int kV2PB = kCoarseBins / kV2T;  // coarse bins per thread in scans
 constexpr int kV2FB = kV2Fine / kV2T;      // fine bins per thread in scans
 static_assert(kV2T >= kV2Win && kV2PB * kV2T == kCoarseBins && kV2FB * kV2T == kV2Fine && kV2FB % 4 == 0);
+constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
 constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
 // stats (rows): 0 exchanged, 1 resolved in round 1, 2 tie round, 3 radix, 4 select all
@@ -1353,8 +1354,13 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
 
 // The rows topk_v2_kernel left (the same rows on every rank: the tier comes from the
 // exchanged words), with the complete body at the next epoch; CTAs without one exit.
+// A small grid (kV2RedoCtas): row r goes to CTA r % grid on every rank, so a CTA's rows
+// run in the same order everywhere; the flags of a CTA's rows are read at once.
 __global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE
+  int any = 0;
+  for (int row = blockIdx.x + threadIdx.x * gridDim.x; row < p.T; row += kV2T * gridDim.x) any |= p.redo[row];
+  if (!__syncthreads_or(any)) return;
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = p.redo[row];
     if (r) v2_row<false>(p, sm, row, r == 510 ? 0 : r, bar_phase);

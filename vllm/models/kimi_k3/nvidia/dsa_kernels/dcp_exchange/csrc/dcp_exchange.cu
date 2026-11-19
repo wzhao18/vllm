@@ -3301,6 +3301,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   cfg.numAttrs = 1;
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel, p));
   // the rows that need the complete body (rare; most CTAs exit after the PDL wait)
+  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
 
