@@ -201,8 +201,8 @@ def stamps3(lens, H, flags=1):
     step = sum((st[c + 1, 0] - st[c, 0]).item() for c in range(4, n)) / (n - 4)
     seg = lambda a, b: sum((st[c, b] - st[c, a]).item() for c in range(4, n)) / (n - 4)  # noqa: E731
     wait_s = sum((st[c + 1, 0] - st[c, 7]).item() for c in range(4, n)) / (n - 4)
-    print(f"v3 stamps CTA0: chain step {step:.0f} clk; P: LDTM {seg(0, 1):.0f}, cvt+STTM+wait {seg(1, 2):.0f}, "
-          f"bar.sync {seg(2, 3):.0f}, MMA1 issue {seg(3, 4):.0f}; decay+wait W {seg(4, 5):.0f}, vnew+sync {seg(5, 6):.0f}, "
+    print(f"v3 stamps CTA0: chain step {step:.0f} clk; P: stage wait {seg(0, 1):.0f}, LDTM+cvt+STTM+wait {seg(1, 2):.0f}, "
+          f"bar.sync {seg(2, 3):.0f}, o_empty wait {seg(3, 4):.0f}; MMA1 issue+decay+wait W {seg(4, 5):.0f}, vnew+sync {seg(5, 6):.0f}, "
           f"MMA2 issue {seg(6, 7):.0f}, wait S {wait_s:.0f}", flush=True)
 
 
