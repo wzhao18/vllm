@@ -530,36 +530,38 @@ __global__ void __launch_bounds__(128)
 // ---------------------------------------------------------------------------
 
 
-// BF16(sigmoid(g)) by table: g is BF16, so the rounded sigmoid takes at most
-// 2^16 values. Each CTA builds the entries of |g| in [2^-16, 2^16) (both
-// signs, 16 KiB of BF16 bits) with the exact expression of
-// gate_sigmoid_mul_vec8; zeros, subnormals, huge values, Inf and NaN take the
-// expression directly. Bitwise equal; the precise expf + IEEE division per
-// element (2 MUFU ops) become one shared-memory load.
-constexpr int GATE_LUT_E0 = 111;
-constexpr int GATE_LUT_NE = 32;
-constexpr int GATE_LUT_N = 2 * GATE_LUT_NE * 128;
-
 __device__ __forceinline__ uint16_t gate_sigmoid_bf16(float gv) {
   float const sig = 1.0f / (1.0f + ::expf(-gv));
   return c10::BFloat16(sig).x;
 }
 
-__device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
-    uint4 a, uint4 g, const uint16_t* __restrict__ lut) {
+// BF16(sigmoid(g)) of a BF16 g: ex2.approx / rcp.approx (2 MUFU ops, relative
+// error < 2^-17 including the rounding of the exponent argument for |g| <= 64),
+// rounded to BF16 unless the FP32 value lies within 256 FP32 ulps of a BF16
+// rounding midpoint, where the stock expression (precise expf + IEEE division,
+// as ATen's sigmoid) decides; |g| > 64, Inf and NaN take the stock expression.
+// Bitwise equal to the stock BF16 sigmoid for every BF16 g (all 2^16 values
+// tested).
+__device__ __forceinline__ uint32_t gate_sigmoid_bits(uint32_t b) {
+  const float g = __uint_as_float(b << 16);
+  if (!(fabsf(g) <= 64.0f)) return gate_sigmoid_bf16(g);
+  float t, s;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(t) : "f"(g * -1.4426950408889634f));
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(s) : "f"(1.0f + t));
+  const uint32_t u = __float_as_uint(s);
+  const uint32_t rem = u & 0xffffu;
+  if (rem - 0x7f00u <= 0x200u) return gate_sigmoid_bf16(g);
+  return (u + 0x8000u) >> 16;
+}
+
+__device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_fast(uint4 a, uint4 g) {
   const uint16_t* gh = reinterpret_cast<const uint16_t*>(&g);
   const uint32_t* aw = reinterpret_cast<const uint32_t*>(&a);
   uint4 o;
   uint32_t* ow = reinterpret_cast<uint32_t*>(&o);
   uint32_t s[8];
 #pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    const uint32_t b = gh[j];
-    const uint32_t e = ((b >> 7) & 0xffu) - (uint32_t)GATE_LUT_E0;
-    s[j] = e < (uint32_t)GATE_LUT_NE
-               ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
-               : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
-  }
+  for (int j = 0; j < 8; ++j) s[j] = gate_sigmoid_bits(gh[j]);
   // BF16 x BF16 products, rounded by cvt.rn.bf16x2 (RNE, as c10::BFloat16 for
   // every non-NaN value) on packed pairs.
 #pragma unroll
@@ -584,15 +586,6 @@ __global__ void __launch_bounds__(512) gate_sigmoid_mul_kernel(uint16_t* __restr
                                         int64_t gate_stride,
                                         int64_t out_stride) {
   constexpr int U = 4;  // loads in flight per thread
-  __shared__ uint16_t lut[GATE_LUT_N];
-  for (int i = threadIdx.x; i < GATE_LUT_N; i += blockDim.x) {
-    const uint32_t bits = ((uint32_t)(i >> 12) << 15) |
-                          ((uint32_t)(((i >> 7) & (GATE_LUT_NE - 1)) +
-                                      GATE_LUT_E0) << 7) |
-                          (uint32_t)(i & 0x7f);
-    lut[i] = gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)bits));
-  }
-  __syncthreads();
   int32_t const stride = gridDim.x * blockDim.x;
   for (int32_t v0 = blockIdx.x * blockDim.x + threadIdx.x; v0 < total_vecs;
        v0 += stride * U) {
@@ -620,7 +613,7 @@ __global__ void __launch_bounds__(512) gate_sigmoid_mul_kernel(uint16_t* __restr
     for (int u = 0; u < U; ++u) {
       if (v0 + u * stride < total_vecs) {
         *reinterpret_cast<uint4*>(out + oo[u]) =
-            gate_sigmoid_mul_vec8_lut(a[u], g[u], lut);
+            gate_sigmoid_mul_vec8_fast(a[u], g[u]);
       }
     }
   }
@@ -649,6 +642,62 @@ __global__ void scatter_rows_kernel(uint4* __restrict__ dst,
   for (int64_t v = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; v < row_vecs;
        v += (int64_t)gridDim.x * blockDim.x) {
     d[v] = s[v];
+  }
+}
+
+// RoPE (NeoX, rot_dim == head_dim) on a normed context K row and the K/V cache
+// insert of that row (reshape_and_cache_flash, BF16 "auto" cache): one 64-thread
+// row group per context row. The RoPE arithmetic is the stock
+// apply_token_rotary_embedding expression (FP32 from BF16 inputs, one rounding).
+__global__ void rope_store_kv_kernel(
+    const __nv_bfloat16* __restrict__ k, int64_t k_stride,
+    const __nv_bfloat16* __restrict__ v, int64_t v_stride,
+    const int64_t* __restrict__ positions,
+    const __nv_bfloat16* __restrict__ cos_sin, int64_t cs_stride,
+    const int64_t* __restrict__ slots, __nv_bfloat16* __restrict__ kc,
+    __nv_bfloat16* __restrict__ vc, int64_t kbs, int64_t kps, int64_t khs,
+    int64_t vbs, int64_t vps, int64_t vhs, int64_t block_size, int rows,
+    int heads, int head_dim) {
+  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  if (row >= rows) return;
+  const int64_t slot = slots[row];
+  if (slot < 0) return;
+  const int64_t blk = slot / block_size, off = slot % block_size;
+  const int half = head_dim / 2, chunks = half / 8, vchunks = head_dim / 8;
+  const __nv_bfloat16* cs = cos_sin + positions[row] * cs_stride;
+  const __nv_bfloat16* kr = k + row * k_stride;
+  __nv_bfloat16* kd = kc + blk * kbs + off * kps;
+  for (int u = threadIdx.x; u < heads * chunks; u += blockDim.x) {
+    const int h = u / chunks, c = (u % chunks) * 8;
+    uint4 xv = *reinterpret_cast<const uint4*>(kr + h * head_dim + c);
+    uint4 yv = *reinterpret_cast<const uint4*>(kr + h * head_dim + half + c);
+    uint4 cv = *reinterpret_cast<const uint4*>(cs + c);
+    uint4 sv = *reinterpret_cast<const uint4*>(cs + half + c);
+    const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+    const __nv_bfloat16* yb = reinterpret_cast<const __nv_bfloat16*>(&yv);
+    const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
+    const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
+    uint4 xo, yo;
+    c10::BFloat16* xob = reinterpret_cast<c10::BFloat16*>(&xo);
+    c10::BFloat16* yob = reinterpret_cast<c10::BFloat16*>(&yo);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float cos_f = __bfloat162float(cb[i]);
+      const float sin_f = __bfloat162float(sb[i]);
+      const float x_f = __bfloat162float(xb[i]);
+      const float y_f = __bfloat162float(yb[i]);
+      xob[i] = static_cast<c10::BFloat16>(x_f * cos_f - y_f * sin_f);
+      yob[i] = static_cast<c10::BFloat16>(y_f * cos_f + x_f * sin_f);
+    }
+    *reinterpret_cast<uint4*>(kd + h * khs + c) = xo;
+    *reinterpret_cast<uint4*>(kd + h * khs + half + c) = yo;
+  }
+  const __nv_bfloat16* vr = v + row * v_stride;
+  __nv_bfloat16* vd = vc + blk * vbs + off * vps;
+  for (int u = threadIdx.x; u < heads * vchunks; u += blockDim.x) {
+    const int h = u / vchunks, c = (u % vchunks) * 8;
+    *reinterpret_cast<uint4*>(vd + h * vhs + c) =
+        *reinterpret_cast<const uint4*>(vr + h * head_dim + c);
   }
 }
 
@@ -873,6 +922,29 @@ void scatter_rows(torch::Tensor& dst, const torch::Tensor& index,
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+void rope_store_kv(const torch::Tensor& k, const torch::Tensor& v,
+                   const torch::Tensor& positions, const torch::Tensor& cos_sin,
+                   const torch::Tensor& slots, torch::Tensor& key_cache,
+                   torch::Tensor& value_cache) {
+  const int rows = slots.size(0), heads = k.size(1), head_dim = k.size(2);
+  if (rows == 0) return;
+  const dim3 threads(64, 4);
+  const dim3 grid((rows + 3) / 4);
+  auto stream = c10::cuda::getCurrentCUDAStream();
+  rope_store_kv_kernel<<<grid, threads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()), k.stride(0),
+      reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()), v.stride(0),
+      positions.data_ptr<int64_t>(),
+      reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr()),
+      cos_sin.stride(0), slots.data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16*>(key_cache.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(value_cache.data_ptr()),
+      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+      key_cache.size(1), rows, heads, head_dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 """
 
 _CPP_SRC = """
@@ -886,6 +958,10 @@ void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
                       const torch::Tensor& gate);
 void scatter_rows(torch::Tensor& dst, const torch::Tensor& index,
                   const torch::Tensor& src);
+void rope_store_kv(const torch::Tensor& k, const torch::Tensor& v,
+                   const torch::Tensor& positions, const torch::Tensor& cos_sin,
+                   const torch::Tensor& slots, torch::Tensor& key_cache,
+                   torch::Tensor& value_cache);
 """
 
 _lock = threading.Lock()
@@ -918,6 +994,7 @@ def _module():
                     "rms_norm_rows",
                     "gate_sigmoid_mul",
                     "scatter_rows",
+                    "rope_store_kv",
                 ],
                 extra_cuda_cflags=["-O3"],
                 build_directory=build,
@@ -1106,6 +1183,69 @@ def write_state_rows(
         _module().scatter_rows(dst, index, src)
         return
     dst[index] = src.to(dst.dtype)
+
+
+def _aligned(t: torch.Tensor, strides) -> bool:
+    return t.data_ptr() % 16 == 0 and all(s % 8 == 0 for s in strides)
+
+
+def use_rope_store_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    slots: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> bool:
+    """Whether :func:`rope_store_kv` covers this context-K/V insert: BF16 rows
+    ``[rows, heads, head_dim]`` (heads x head_dim dense per row), NeoX RoPE over
+    the whole head (``cos_sin`` ``[max_pos, head_dim]`` BF16), int64 positions and
+    slots, BF16 caches ``[blocks, block_size, heads, head_dim]`` dense in the head."""
+    if k.dim() != 3 or v.shape != k.shape or key_cache.dim() != 4:
+        return False
+    rows, heads, head_dim = k.shape
+    return (
+        k.dtype == v.dtype == cos_sin.dtype == torch.bfloat16
+        and key_cache.dtype == value_cache.dtype == torch.bfloat16
+        and k.is_cuda
+        and positions.dtype == slots.dtype == torch.int64
+        and positions.dim() == slots.dim() == 1
+        and positions.is_contiguous()
+        and slots.is_contiguous()
+        and positions.numel() >= slots.numel() == rows
+        and rows < 2**31
+        and head_dim % 16 == 0
+        and cos_sin.dim() == 2
+        and cos_sin.shape[1] == head_dim
+        and cos_sin.stride(1) == 1
+        and value_cache.shape == key_cache.shape
+        and tuple(key_cache.shape[2:]) == (heads, head_dim)
+        and k.stride(2) == v.stride(2) == 1
+        and k.stride(1) == v.stride(1) == head_dim
+        and key_cache.stride(3) == value_cache.stride(3) == 1
+        and _aligned(k, (k.stride(0),))
+        and _aligned(v, (v.stride(0),))
+        and _aligned(cos_sin, (cos_sin.stride(0),))
+        and _aligned(key_cache, key_cache.stride()[:3])
+        and _aligned(value_cache, value_cache.stride()[:3])
+    )
+
+
+def rope_store_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    slots: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> None:
+    """NeoX ``ops.rotary_embedding`` of ``k`` (out of place) followed by
+    ``reshape_and_cache_flash(k_roped, v, key_cache, value_cache, slots, "auto")``
+    in one pass (slots < 0 skipped): bitwise the two stock kernels. Callers check
+    :func:`use_rope_store_kv`."""
+    _module().rope_store_kv(k, v, positions, cos_sin, slots, key_cache, value_cache)
 
 
 def warmup() -> None:
