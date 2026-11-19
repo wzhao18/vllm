@@ -43,8 +43,9 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
          std::optional<Tensor> checkpoint_offsets, int64_t mode) {
   // mode: bit 0 K1 prepare, bit 1 K2 recurrence, bit 2 exact fp32 state I/O,
   // bit 3 K2 without outputs, bit 4 K2 with v = 0 (bits 2-4 need bit 1).
-  STD_TORCH_CHECK((mode & ~int64_t(31)) == 0 && (mode & 3) != 0 &&
-                      ((mode & 28) == 0 || (mode & 2) != 0),
+  // Kimi-K3: bit 5 tcgen05 recurrence (bit 6: its kr descriptor variant).
+  STD_TORCH_CHECK((mode & ~int64_t(127)) == 0 && (mode & 3) != 0 &&
+                      ((mode & 124) == 0 || (mode & 2) != 0),
                   "k3_flashkda_split: invalid mode ", mode);
   STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() &&
                       beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),

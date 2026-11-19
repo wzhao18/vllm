@@ -13,6 +13,7 @@
 #include "fwd.h"
 #include "fwd_kernel1.cuh"
 #include "fwd_kernel2.cuh"
+#include "k2_tc.cuh"
 
 // ==================== launch_fwd ====================
 template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32,
@@ -173,6 +174,27 @@ void launch_fwd(
   // ===== Launch Kernel 2 (recurrence) =====
 #if BLOCK_LEVEL_K2 >= 0
   if (mode & 2) {
+    // Kimi-K3: bit 5 runs the recurrence on the tcgen05 tensor cores
+    // (k2_tc.cuh; fp32 state, varlen, no checkpoint). Bit 6 is a development
+    // switch of the kr descriptor offsets.
+    if (mode & 32) {
+      if constexpr (StateFP32 && !HasCheckpoint && IsVarlen &&
+                    std::is_same_v<SeqlenT, int32_t>) {
+        auto kernel = k2tc::k2_tc_kernel<HasStateIn, HasStateOut>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             k2tc::kSmemBytes);
+        kernel<<<dim3(H, N), dim3(k2tc::kThreads), k2tc::kSmemBytes, stream>>>(
+            v_ptr, beta_ptr, static_cast<float const*>(initial_state_ptr),
+            static_cast<float*>(final_state_ptr), out_ptr, T_total, H, N,
+            cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
+            ws_mqk, int((mode >> 6) & 1));
+        return;
+      } else {
+        throw std::runtime_error(
+            "k3_flashkda_split: the tcgen05 recurrence needs an fp32 state, "
+            "varlen int32 and no checkpoint");
+      }
+    }
     // Full width: one math warpgroup plus one load/store warpgroup, for
     // register reallocation. V-split: one math warp per 16 value columns
     // (four for VD=64) plus load/store warps. The gated delta rule updates
