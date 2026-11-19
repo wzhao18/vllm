@@ -460,14 +460,16 @@ class DcpValue:
                 mbar_init(bars + Uint32(8 * (TC_STAGES + st)), Uint32(1))
             mbar_init(done, Uint32(1))
             fence_mbar_init()
+        tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
+        # Allocate TMEM only once the predecessor grid is complete: under PDL its
+        # CTAs may still be resident here and allocate TMEM after this CTA would.
+        cute.arch.griddepcontrol_wait()
         if warp == 0:
             _tmem_alloc128(slot_addr)
         tc_fence_before()
         cute.arch.sync_threads()
         tc_fence_after()
         taddr = ld_shared_u32(slot_addr)
-        tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
-        cute.arch.griddepcontrol_wait()
         kc = Int32(0)
         uc = Int32(0)
         for u in range(c, self.units, G):
