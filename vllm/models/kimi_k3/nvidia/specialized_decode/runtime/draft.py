@@ -1190,44 +1190,6 @@ def gqa_projection_tactic(shape, tp, rows):
     return table.get(shape)
 
 
-# TP4 drafter linears at the query rows of r8 / r16 / r24 (96 / 192 / 288): the
-# token-wide 2-CTA split-K GEMM (cutedsl.gemm.wide; split CTA pairs per 256 weight
-# rows, one wave), gate_up with silu_and_mul in its epilogue. (N, K) -> rows -> split.
-GQA_WIDE = {
-    4: {
-        (2048, 7168): {96: 12, 192: 12, 288: 12},
-        (7168, 1536): {96: 3, 192: 3, 288: 3},
-        (7168, 7168): {96: 3, 192: 3, 288: 3},
-        (7168, 3584): {96: 3, 192: 3, 288: 3},
-    },
-}
-
-
-def gqa_wide(weight, tp, rows, silu=False):
-    """The prepared WideGemm of weight for the tabled rows (or None)."""
-    table = GQA_WIDE.get(tp, {}).get(tuple(weight.shape), {})
-    policies = {r: table[r] for r in rows if r in table}
-    if not policies:
-        return None
-    from ..cutedsl.gemm.wide import PreparedWide
-
-    return PreparedWide(weight, policies, silu=silu).prepare()
-
-
-def mlp_forward(mlp, x):
-    """mlp(x), with gate_up + silu_and_mul as one WideGemm where prepared."""
-    silu = getattr(mlp, "_wide_silu", None)
-    if (
-        silu is not None
-        and x.shape[0] in silu.kernels
-        and x.is_contiguous()
-        and torch.cuda.is_current_stream_capturing()
-    ):
-        act = silu.run(x, x.new_empty((x.shape[0], silu.n // 2)))
-        return mlp.down_proj(act)[0]
-    return mlp(x)
-
-
 def gqa_projection(weight, tp, rows):
     """The prepared split-K projection of ``weight`` for ``rows`` (or None)."""
     from ..lt_pin import with_pins
@@ -1242,12 +1204,6 @@ def gqa_projection(weight, tp, rows):
         from ..cutedsl.gemm.projection import PreparedProjection
 
         prepared = PreparedProjection(weight, policies).prepare()
-    served = set(prepared.kernels) if prepared is not None else set()
-    wide = gqa_wide(weight, tp, [r for r in rows if r not in served])
-    if wide is not None:
-        from ..lt_pin import WithPins
-
-        prepared = wide if prepared is None else WithPins(prepared, wide)
     # Rows above the split-K bins: pinned cuBLASLt algorithms where the heuristic
     # pick is slow (lt_pin.PINS; e.g. TP4 gate_up at 288 rows 30.1 -> 17.1 us).
     return with_pins(prepared, weight, rows)
@@ -1263,11 +1219,7 @@ def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
     for layer in inner.layers:
         attn, mlp = layer.self_attn, layer.mlp
         linears += [(attn.qkv_proj, query_rows), (attn.o_proj, query_rows)]
-        mlp._wide_silu = gqa_wide(mlp.gate_up_proj.weight, tp, query_rows, silu=True)
-        gate_up_rows = [
-            r for r in query_rows if mlp._wide_silu is None or r not in mlp._wide_silu.kernels
-        ]
-        linears += [(mlp.gate_up_proj, gate_up_rows), (mlp.down_proj, query_rows)]
+        linears += [(mlp.gate_up_proj, query_rows), (mlp.down_proj, query_rows)]
     installed = 0
     stock: dict[tuple, set[int]] = {}
     for linear, rows in linears:
@@ -1483,7 +1435,7 @@ class GqaSites:
             norm = layer.post_attention_layernorm
             ar.site(ar.reduce[rows], attn, residual, norm, normed, site % 2)
             residual, site = attn, site + 1
-            hidden = mlp_forward(layer.mlp, normed)
+            hidden = layer.mlp(normed)
         out = empty()
         ar.site(ar.reduce[rows], hidden, residual, model.norm, out, site % 2)
         return out
