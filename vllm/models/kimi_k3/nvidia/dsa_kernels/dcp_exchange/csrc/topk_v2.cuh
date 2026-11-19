@@ -85,7 +85,7 @@ struct V2Params {
   uint64_t mc;
   const uint64_t* peers;
   int W, rank, K, T, cap, interleave;
-  int64_t off_r1, off_tie, off_rad;
+  int64_t off_r1, off_tie, off_rad, off_r2;
   int* epoch;
   int* redo;  // per row: 0, or the epoch the complete body runs the row at (+1)
   int* err;

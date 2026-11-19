@@ -3218,8 +3218,10 @@ int64_t max_coresident_ox(int64_t D) {
 // u32 words of the v2 mailboxes: round 1, tie round, radix rounds (2 parities each).
 std::vector<int64_t> topk_v2_layout(int64_t cap, int64_t W) {
   const int64_t r1 = 2 * cap * W * kV2Msg, tie = 2 * cap * W * kV2Tie,
-                rad = 2 * cap * kV2RadR * W * 256;
-  return {0, r1, r1 + tie, r1 + tie + rad};
+                rad = 2 * cap * kV2RadR * W * 256,
+                r2 = 2 * std::min<int64_t>(cap, kR2Rows) * W * kR2W;
+  // {round 1, tie round, radix rounds, total words, topk_v3's R2 round}
+  return {0, r1, r1 + tie, r1 + tie + rad + r2, r1 + tie + rad};
 }
 
 static constexpr size_t kV2Dyn = 0;
@@ -3285,7 +3287,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
   p.interleave = (int)interleave;
   const auto lay = topk_v2_layout(cap, W);
-  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
+  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2]; p.off_r2 = lay[4];
   p.epoch = epoch.data_ptr<int>();
   p.redo = p.epoch + cap;  // the epoch buffer's second half
   p.err = err.data_ptr<int>();
@@ -3343,7 +3345,7 @@ void topk_skel(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glob
   p.peers = reinterpret_cast<const uint64_t*>(peers.data_ptr<int64_t>());
   p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
   const auto lay = topk_v2_layout(cap, W);
-  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
+  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2]; p.off_r2 = lay[4];
   p.epoch = epoch.data_ptr<int>();
   p.redo = p.epoch + cap;
   p.err = err.data_ptr<int>();
