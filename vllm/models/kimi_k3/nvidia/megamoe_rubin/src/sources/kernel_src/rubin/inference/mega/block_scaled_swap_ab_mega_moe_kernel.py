@@ -11,7 +11,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Float32, Int32
 
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
@@ -632,6 +632,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
         sm_locality_domain: Optional[cute.Tensor] = None,  # (1024,) uint8 die of each %smid (die_split only)
+        rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a, output = RMSNorm(reduce)
+        rmsnorm_eps: Optional[Float32] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
@@ -889,8 +891,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             reduce_indices = topk_indices if cutlass.const_expr(self.masks_invalid_combine_slots) else None
             self._topk_reduce(
                 pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream,
-                topk_indices=reduce_indices,
+                topk_indices=reduce_indices, rmsnorm_weight=rmsnorm_weight, rmsnorm_eps=rmsnorm_eps,
             )
+        elif cutlass.const_expr(rmsnorm_weight is not None):
+            raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
 
     @cute.kernel
     def _kernel(
