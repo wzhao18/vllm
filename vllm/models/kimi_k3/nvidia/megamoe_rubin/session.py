@@ -28,7 +28,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from .config import RubinMoeConfig
+from .config import DEDUP_VARIANTS, RubinMoeConfig
 from .symm_arena import ALIGN, SymmetricArena, aligned, ensure_not_capturing
 from .weights import RubinMoeWeights, validate_kernel_weights
 
@@ -50,6 +50,11 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
         raise ValueError("need sp_size >= 1 and at least one DP rank.")
     shards = (num_tokens_across_dp.to(torch.int64) + sp_size - 1) // sp_size
     return -(-int(shards.sum()) // shards.numel())
+
+
+# Fused shared expert: shared FC2 after the routed work ("tail") or right after shared
+# FC1, under the dispatch ("early").
+RUBIN_FUSED_SHARED_L2_POSITION = "early"
 
 
 def compile_cache_key(
@@ -223,6 +228,8 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         # FlashInfer a368c5f66 kernels have one epilogue warpgroup (the vLLM-local
         # S2 of the 0.7.3.dev20261031 drop is not carried over; VENDOR.md).
         raise ValueError(f"unsupported epilogue_warpgroups={epilogue_warpgroups}.")
+    if getattr(cfg, "shared", None) is not None:
+        impl_fields["shared_l2_position"] = RUBIN_FUSED_SHARED_L2_POSITION
     if cfg.die_sm_mask32 is not None and cfg.kernel_variant == "genphase":
         # Die-local expert streams on the refreshed GenPhase decode scheduler: each
         # die claims the tiles of the experts homed on it (die_local.place_experts:
@@ -245,7 +252,7 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
             impl_fields.pop(name)
     if cfg.kernel_variant == "inference_dedup_wg2":
         impl_fields["epilogue_warpgroups"] = 2
-    if cfg.kernel_variant in ("inference_dedup", "inference_dedup_wg2"):
+    if cfg.kernel_variant in DEDUP_VARIANTS:
         impl_fields["combine_dedup"] = True
         impl_fields["token_back_ready_granularity"] = "expert"
     kernel_cls = {  # src_gp exports at the package root
@@ -572,7 +579,7 @@ class RubinMegaMoeSession:
         if use_s2 is None:
             use_s2 = self.use_s2(None)
         variant = (use_s2, rmsnorm is not None)
-        if rmsnorm is not None and self.cfg.kernel_variant.startswith("inference_dedup"):
+        if rmsnorm is not None and self.cfg.kernel_variant in DEDUP_VARIANTS:
             raise ValueError("the dedup reduce has no fused RMSNorm (E2a).")
         if rmsnorm is not None:
             kwargs.update(self._rmsnorm_kwargs(*rmsnorm))

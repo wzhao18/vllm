@@ -438,7 +438,8 @@ class PreparedDsa:
             if self.box is not None:
                 args += (self.dcp, self.box.q_heads, sms)
                 partials = self.box.mailbox(batch).format
-            lse_base_e = self.cores[batch, q] != "trtllm"  # trtllm-gen: base 2
+            # trtllm-gen and the Rubin keys-on-M kernel (km): base 2
+            lse_base_e = self.cores[batch, q] not in ("trtllm", "km")
             overlap = self.overlaps[batch, q]
             cap = self.box.cap if self.box is not None else 64
             if self.is_local(batch) and overlap != "fork":

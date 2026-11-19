@@ -61,6 +61,7 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from .config import (
+    DEDUP_VARIANTS,
     SHIPPED_KNOBS,
     QuantKind,
     RubinBucket,
@@ -155,22 +156,10 @@ RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     reduce_topk_in_kernel=False,
 )
 
-# The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): FlashInfer
-# main's fused shared expert runs under the grouped / phase-interleaved schedulers only
-# (not the die-aware decode scheduler), so this bucket streams the experts die-oblivious.
-RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RubinKnobs(
-    mma_tiler_mnk=(256, 128, 256),
-    cluster_shape_mn=(4, 1),
-    fallback_cluster_shape_mn=None,
-    schedule_policy=("phase_interleave", None),
-    work_id_mode="atomic_counter",
-    fc2_use_bulk=True,
-    fc2_tma_stages=2,
-    epi_flag_batches=(1, 4),
-    token_in_flag_batch=1,
-    token_back_mode="epi_warps",
-    reduce_topk_in_kernel=False,
-)
+# The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): the decode
+# scheduler (die-aware on decode servers) with the shared tile stream ahead of the routed
+# sources (VENDOR.md S-SH): shared FC1 streams under the dispatch.
+RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RUBIN_GENPHASE_DECODE_KNOBS
 
 
 def rubin_bucket_capacities(
@@ -740,25 +729,29 @@ class KimiK3MegaMoEExperts(nn.Module):
         # die-local 148.3 / 158.6 / 158.9, full-grid die-local 140.8 / 149.8 / 150.5
         # (bitwise equal). Capped, each die's stream gets the clusters the side
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
+        # The prefill-sized dedup buckets have no die-split schedule: they keep the
+        # die-oblivious form and leave the decode buckets' die-local choice alone.
         die_mask = None
         if die_local and not self.prefill_worker and all(
             tuple(bucket.knobs.schedule_policy)[0]
             == ("decode" if bucket.variant == "genphase" else "phase_interleave")
-            and not bucket.variant.startswith("inference_dedup")  # no die-split schedule
             for bucket in self.buckets
+            if bucket.variant not in DEDUP_VARIANTS
         ):
             from . import die_local
 
             die_mask = die_local.current_die_sm_mask32()
-        self.buckets = tuple(
-            dataclasses.replace(
+
+        def _placed(bucket: RubinBucket) -> RubinBucket:
+            mask = None if bucket.variant in DEDUP_VARIANTS else die_mask
+            return dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
-                max_sm_count=max_sm_count if die_mask is None else None,
-                die_sm_mask32=die_mask,
+                max_sm_count=max_sm_count if mask is None else None,
+                die_sm_mask32=mask,
             )
-            for bucket in self.buckets
-        )
+
+        self.buckets = tuple(_placed(bucket) for bucket in self.buckets)
         self.bucket = self.buckets[-1]
         # The overlap runs under sequence parallelism: each TP rank holds a 1/TP
         # shard of its DP batch (sequence_parallel_chunk).
@@ -786,7 +779,6 @@ class KimiK3MegaMoEExperts(nn.Module):
                     variant="genphase",
                     knobs=RUBIN_GENPHASE_FUSED_SHARED_KNOBS,
                     max_sm_count=None,
-                    die_sm_mask32=None,
                     shared=(hidden, intermediate),
                 )
                 switched = True
@@ -800,12 +792,23 @@ class KimiK3MegaMoEExperts(nn.Module):
         takes ``fused_shared=``)."""
         return self.select_bucket(num_tokens).shared is not None
 
-    def warmup_fused_shared(self, shared) -> None:
+    def warmup_fused_shared(self, shared):
         """Collective: build, compile and warm the fused-shared runtime with one
-        layer's ``session.FusedSharedArgs``."""
+        layer's ``session.FusedSharedArgs``; returns the arguments to launch with
+        (FC1 homed per die on die-local buckets)."""
         if self.kernel_weights is None:
             raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
+        if self.bucket.die_sm_mask32 is not None:
+            from .die_local import place_halves
+
+            # FC1 [1, K, N] is a K-major view of the striped [1, N, K] copy: home its
+            # feature halves per die (the decode scheduler claims them die-local).
+            w = shared.fc1[0]
+            placed = place_halves(w.permute(0, 2, 1)).permute(0, 2, 1)
+            shared = shared._replace(fc1=(placed, shared.fc1[1]))
         self.get_runtime().warmup(self.kernel_weights, shared=shared)
+        self._warm_fused_shared = shared
+        return shared
 
     # -- runtime / kernel layout -----------------------------------------------------
 
@@ -1056,12 +1059,19 @@ class KimiK3MegaMoEExperts(nn.Module):
             if shared_experts is not None:
                 raise ValueError("output_rmsnorm with an unfused shared expert is not supported.")
             extra["rmsnorm"] = _rmsnorm_args(output_rmsnorm)
+        drop_shared = False
         if fused_shared is not None:
             if shared_experts is not None or bucket.shared is None:
                 raise ValueError(f"{self.prefix}: no fused shared expert at {num_tokens} tokens.")
             extra["shared"] = fused_shared
         elif bucket.shared is not None:
-            raise ValueError(f"{self.prefix}: the {bucket.max_tokens} bucket fuses the shared expert.")
+            # A caller outside the specialized decoder (the stock forward, e.g. a
+            # bench's context prefill) runs its own shared expert: the fused bucket's
+            # shared tiles run on the warmed operands and their output is dropped.
+            extra["shared"] = getattr(self, "_warm_fused_shared", None)
+            if extra["shared"] is None:
+                raise ValueError(f"{self.prefix}: the {bucket.max_tokens} bucket fuses the shared expert.")
+            drop_shared = True
         y = self.get_runtime().forward(
             hidden_states,
             topk_ids,
@@ -1074,6 +1084,8 @@ class KimiK3MegaMoEExperts(nn.Module):
             ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
             **extra,
         )
+        if drop_shared:
+            y = y[0]
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y

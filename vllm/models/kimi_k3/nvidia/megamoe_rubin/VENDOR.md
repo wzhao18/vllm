@@ -283,7 +283,8 @@ p50 (682 vs 731 us).
 - **S3** (vLLM-local, as on ``src``): ``block_scaled_swap_ab_fc12_epilogue.py`` gated activation keeps the
   ``src`` SiTU core (one reciprocal per element, ex2/rcp only) instead of FlashInfer main's
   ``situ_pair_tanh_approx`` (two ``tanh.approx.f32`` per element, ~2^-11 relative error, lower precision than
-  the a368c5f66 sigmoid form). ``use_tanh_sigmoid`` and SwiGLU keep the upstream code.
+  the a368c5f66 sigmoid form). ``use_tanh_sigmoid`` and SwiGLU keep the upstream code. Prefill dedup epilogue
+  only (``SwapABGatedActEpilogueDedup.situ_core_s3``); the GenPhase decode epilogue keeps the upstream core.
 - **W2 / W2S** (vLLM-local): two epilogue warpgroups on the dedup combine. Upstream allows
   ``epilogue_warpgroups=2`` only with ``epi_warps`` token back (no dedup).
   ``block_scaled_swap_ab_fc12_epilogue_dedup.py``: each warpgroup stages and pushes its own token half of every
@@ -298,6 +299,16 @@ p50 (682 vs 731 us).
   rank, token), ``TopkReduceDedup`` sums the rank rows in ascending rank order; routing weights at FC1). The
   session allocates its per-launch ``tmp_buffer``. Used by prefill-sized NVFP4 inference buckets
   (``experts.RUBIN_DEDUP_MIN_TOKENS``).
+- **S-SH** (vLLM-local): the decode scheduler (``GenphaseDecodeFc12Scheduler``) carries the fused
+  shared expert's tile stream (``SharedExpertStreamMixin`` from ``fc12_scheduler``) ahead of its
+  routed sources, so the die-aware decode form takes the fused shared expert (upstream refuses
+  shared under ``("decode", L)``). Without a lead only. Shared FC1 is claimed before the
+  expert-sizes gate (it streams under the dispatch); the scheduler warp's explicit decode sizes
+  wait is skipped when the shared stream owns the gate.
+- **E2a** (vLLM-local, as for ``src``): ``TopkReduce._reduce_bf16_ll_rmsnorm``: the polled BF16 reduce
+  of one token row per CTA followed by the consumer's stock RMSNorm (``rmsnorm_weight`` /
+  ``rmsnorm_eps`` through the GenPhase kernel's ``__call__``), replacing the separate
+  ``rms_norm`` launch after the GenPhase bucket.
 - **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
   (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
   own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing

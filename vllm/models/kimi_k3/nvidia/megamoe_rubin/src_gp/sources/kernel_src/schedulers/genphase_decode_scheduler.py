@@ -146,6 +146,11 @@ from .fc12_mapping import (
     map_phase_interleaved_fc12_work_id,
     reset_phase_interleaved_cursors_for_owner,
 )
+from .fc12_scheduler import (
+    SharedExpertStreamMixin,
+    shared_expert_impl_requirements,
+    shared_expert_problem_requirements,
+)
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
 
 # The policy: (side, phase) per source; side 0 = this CTA's die (die-blind: the one stream), 1 = the other die;
@@ -242,8 +247,13 @@ def _count_stream_token_blocks(mapping) -> Tuple[Int32, Int32]:
     return blocks0, blocks1
 
 
-class GenphaseDecodeFc12Scheduler(SchedulerBase):
-    """Static per-form source list over per-(die, phase) atomic counters; see the module docstring."""
+class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
+    """Static per-form source list over per-(die, phase) atomic counters; see the module docstring.
+
+    vLLM-local (VENDOR.md S-SH): the fused shared expert's tiles (``SharedExpertStreamMixin``) come before the routed
+    sources: shared FC1 needs no routing, so it streams under the dispatch; the expert-sizes gate is then taken by the
+    mixin before the first routed claim. Shared FC1 tiles never wait, shared FC2 waits only on shared FC1 tiles that were
+    all claimed before it, so the argument below is unchanged for the routed sources."""
 
     pipeline_mbarriers_region = "fc12.genphase_decode.scheduler.pipeline_mbarriers"
     work_tiles_region = "fc12.genphase_decode.scheduler.work_tiles"
@@ -254,7 +264,12 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
-        return {"expert_count": int, "intermediate_gateup_size": int, "hidden_size": int}
+        return {
+            "expert_count": int,
+            "intermediate_gateup_size": int,
+            "hidden_size": int,
+            **shared_expert_problem_requirements(),
+        }
 
     @classmethod
     def impl_desc_require(cls) -> dict[str, type]:
@@ -271,6 +286,7 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
             "fallback_cluster_shape_mn": OptionalRequirement(Optional[tuple]),
             "die_aware": OptionalRequirement(str),
             "decode_lead": OptionalRequirement(Optional[int]),
+            **shared_expert_impl_requirements(),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -301,16 +317,33 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
         cta_tile_m = self.mma_tiler_mnk[0] // (2 if self.use_2cta_instrs else 1)
         self.mapping_cta_tile_shape_mnk = (self.mma_tiler_mnk[1], cta_tile_m, self.mma_tiler_mnk[2])
         self.mapping_cluster_shape_mn = (self.cluster_shape_mn[1], self.cluster_shape_mn[0])
+        self.non_clc_mixed_cga_config = NonClcMixedCgaConfig(
+            preferred_cluster_shape=self.cluster_shape_mn,
+            fallback_cluster_shape=None,
+            launch_cluster_count=self.launch_cluster_count,
+            preferred_cluster_count=None,
+            fallback_cluster_count=None,
+        )
+        self.compute_cluster_count = self.launch_cluster_count
+        shared = bool(problem_desc.get("shared_expert", False)) and bool(impl_desc.get("shared_expert_stream", False))
+        if shared and self.decode_lead is not None:
+            raise ValueError("The fused shared expert runs on the decode scheduler without a lead only.")
+        # Without the shared stream the kernel's scheduler warp takes the expert-sizes gate itself (W3), so the mixin
+        # gets no ready region and the routed claims are emitted exactly as before.
+        shared_impl_desc = impl_desc if shared else ImplDesc(
+            {k: v for k, v in impl_desc.items() if not k.startswith("expert_sizes_ready_")}
+        )
+        self._bind_shared_expert_stream(
+            problem_desc,
+            shared_impl_desc,
+            cta_tile_m=cta_tile_m,
+            cta_tile_n=self.mma_tiler_mnk[1],
+            routed_stream_count=2 * self.die_count,
+        )
         self._work_id_worker = NonClcMixedCgaSchedulerWorker(
-            config=NonClcMixedCgaConfig(
-                preferred_cluster_shape=self.cluster_shape_mn,
-                fallback_cluster_shape=None,
-                launch_cluster_count=self.launch_cluster_count,
-                preferred_cluster_count=None,
-                fallback_cluster_count=None,
-            ),
+            config=self.non_clc_mixed_cga_config,
             work_id_mode="atomic_counter",
-            stream_count=2 * self.die_count,
+            stream_count=2 * self.die_count + self.shared_stream_count,
         )
         self._mapping = None
         self._source = None
@@ -428,8 +461,10 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
             owner_count=self.die_count,
             expert_half=self.expert_half,
             expert_remap=expert_remap if self.expert_half else None,
+            sizes_load_sorted=True,  # the GenPhase communication grid ranks slots by descending load
         )
         self._source = Int32(0)
+        self._assign_shared_expert_stream(block_idx, device_workspace)
         if cutlass.const_expr(self.decode_lead is not None):
             # placeholder: K per owner comes from the scheduler warp's compute_stream_token_blocks (mandatory)
             self._lead_k_per_owner = (Int32(0), Int32(0)) if self.expert_half else (Int32(0),)
@@ -443,13 +478,60 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
             blocks0, blocks1 = _count_stream_token_blocks(self._mapping)
             self._lead_k_per_owner = (blocks0, blocks1) if self.expert_half else (blocks0,)
 
+    @property
+    def shared_stream_count(self) -> int:
+        """Die-aware: one shared FC1 counter per die (its home half of the FC1 feature blocks) plus the FC2
+        counter; die-blind: the mixin's FC1 + FC2 counters."""
+        count = SharedExpertStreamMixin.shared_stream_count.fget(self)
+        return count + (1 if count and self.die_count == 2 else 0)
+
+    @cute.jit
+    def _claim_die_half(self, work_id_worker, side: Int32):
+        """Claim from the shared FC1 counter of die ``side`` (its feature blocks [base, base + count), every token
+        block). Returns (cluster-level shared FC1 id or -1 past the end, worker)."""
+        feature_blocks = self._shared_feature_blocks[0]
+        half = feature_blocks // 2
+        count = Int32(half) + Int32(feature_blocks - 2 * half) * side
+        base = Int32(half) * side
+        local_id = work_id_worker.claim_next_work(self._shared_stream_index + side)
+        shared_id = Int32(-1)
+        if local_id < count * Int32(self.shared_token_blocks):
+            token_block = local_id // count
+            shared_id = token_block * Int32(feature_blocks) + base + (local_id - token_block * count)
+        return shared_id, work_id_worker
+
+    @cute.jit
+    def _claim_shared_tile(self, work_id_worker, stage: Int32, next_id: Int32, fc2: int):
+        """Die-aware (vLLM-local S-SH): shared FC1 tiles of this die's home half first (the die-local FC1 copy,
+        ``weights.prepare_mxfp8_shared_weights``), then the other die's; FC2 from its own counter. Die-blind: the
+        mixin's single FC1 / FC2 counters."""
+        if cutlass.const_expr(self.die_count == 1):
+            return SharedExpertStreamMixin._claim_shared_tile(self, work_id_worker, stage, next_id, fc2)
+        work_tile = make_fc12_done_tile(True)
+        if cutlass.const_expr(fc2 == 1):
+            local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2)
+            if local_id < Int32(self._shared_phase_tiles[1]):
+                work_tile = self._decode_shared_tile(local_id, 1)
+            else:
+                stage = stage + Int32(1)
+        else:
+            own = Int32(self._mapping.owner_index)
+            shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
+            if shared_id < Int32(0):
+                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
+            if shared_id >= Int32(0):
+                work_tile = self._decode_shared_tile(shared_id, 0)
+            else:
+                stage = stage + Int32(1)
+        return work_tile, stage, next_id, work_id_worker
+
     @cute.jit
     def finish_claim_channel(self) -> None:
         """Scheduler warp, once after the last claim (last-arriver tail): see the worker's docstring."""
         self._work_id_worker.finish_claim_channel()
 
     @cute.jit
-    def gen_next_work(self) -> SchedulerWorkTileBase:
+    def _gen_next_routed_work(self) -> SchedulerWorkTileBase:
         """Claim from the current source until an id maps to a tile; past-the-end moves to the next source, past the
         last source returns Done. Never waits (module docstring). Lead builds: only after
         ``compute_stream_token_blocks`` (the exact layout's K)."""
@@ -504,6 +586,7 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
         values = super().__extract_mlir_values__()
         for name in self._device_fields:
             values.extend(extract_mlir_values(getattr(self, name)))
+        values.extend(self._extract_shared_stream_values())
         return values
 
     def __new_from_mlir_values__(self, values: list) -> "GenphaseDecodeFc12Scheduler":
@@ -517,6 +600,15 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
             count = len(extract_mlir_values(state))
             setattr(result, name, new_from_mlir_values(state, values[index : index + count]))
             index += count
+
+        def rebuild(state):
+            nonlocal index
+            count = len(extract_mlir_values(state))
+            rebuilt = new_from_mlir_values(state, values[index : index + count])
+            index += count
+            return rebuilt
+
+        self._rebuild_shared_stream(result, rebuild)
         if index != len(values):
             raise ValueError(f"GenphaseDecodeFc12Scheduler MLIR value count mismatch: {index} vs {len(values)}.")
         return result

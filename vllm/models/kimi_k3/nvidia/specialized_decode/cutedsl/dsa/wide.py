@@ -340,10 +340,13 @@ def check_value_residency(compiled, heads, dcp, batch, q, sms, device):
 def check_proj_residency(compiled, heads, dcp, batch, sms, device):
     """Raise unless the device holds the "proj" DcpValue's whole grid at once (its
     merging CTAs poll the value rows every rank's projecting CTAs push); returns the
-    grid. dsa.dcp_value's schedule on the real SM count: DCP x H projecting CTAs,
-    then H x min(tiles, (SMs - DCP x H) // H) merging ones; DCP16, 6 heads, Rubin:
-    96 + 6 x 19 = 210 CTAs from 304 rows, against one 512-thread CTA per SM."""
-    grid = dcp_value.DcpValue(heads, dcp, batch, sms, partials=PROJECTED).grid
+    grid. dsa.dcp_value's schedule on the real SM count: above PROJ_ROWS rows
+    H x (SMs // H) CTAs that project on tcgen05 and then merge, else DCP x H
+    projecting CTAs and H x min(tiles, (SMs - DCP x H) // H) merging ones; one
+    512-thread CTA per SM."""
+    grid = dcp_value.DcpValue(
+        heads, dcp, batch, sms, per_row=True, partials=PROJECTED
+    ).grid
     what = f"Kimi K3.1 DSA wide rows: DcpValue proj (batch {batch})"
     check_residency(compiled, device, grid[0] * grid[1] * grid[2], 512, what)
     return grid

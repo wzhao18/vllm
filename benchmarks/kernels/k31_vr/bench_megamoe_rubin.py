@@ -166,6 +166,14 @@ def parse_args():
     )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
     p.add_argument(
+        "--active-experts",
+        type=int,
+        default=None,
+        help="random routing over A active experts per rank, split over the two die "
+        "halves of the local experts (the step slice's EP-size emulation: 896 experts "
+        "at EP4 with A=28 is 224 local slots, 28 active)",
+    )
+    p.add_argument(
         "--die-local",
         action="store_true",
         help="decode-server placement: die_split schedule + experts homed per die half "
@@ -177,6 +185,12 @@ def parse_args():
         help="HIDDEN,INTER: fuse a random MXFP8 E4M3 shared expert of that shape "
         "(Kimi K3.1: 7168,6144) into the GenPhase kernel; reports its rel-L2 vs "
         "the stock MXFP8 chain (FP32 GEMMs, SiTU, MXFP8 requant)",
+    )
+    p.add_argument(
+        "--shared-l2-position",
+        choices=("early", "tail"),
+        default=None,
+        help="fused shared FC2 placement (default: the session's)",
     )
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int32")
     p.add_argument("--warmup", type=int, default=10)
@@ -363,11 +377,18 @@ def make_shared(W, shape, rows, seed, device):
     return args, ref
 
 
-def make_routes(n, num_experts, topk, world, rank, kind, seed, device, ids_dtype):
+def make_routes(
+    n, num_experts, topk, world, rank, kind, seed, device, ids_dtype, active=None
+):
     g = torch.Generator(device=device)
     g.manual_seed(seed * 7919 + rank)
     if kind == "random":
         scores = torch.rand((n, num_experts), generator=g, device=device)
+        if active is not None:
+            local = torch.arange(num_experts, device=device) % (num_experts // world)
+            half = num_experts // world // 2
+            on = (local < active // 2) | ((local >= half) & (local < half + active // 2))
+            scores = scores.masked_fill(~on, -1.0)
         ids = scores.topk(topk, dim=1).indices
     else:
         # balanced: token t's j-th route goes to rank (t + j) % W, distinct local
@@ -600,6 +621,10 @@ def main():
         import dataclasses
 
         shared_shape = tuple(int(v) for v in args.shared.split(","))
+        if args.shared_l2_position is not None:
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as rubin_session
+
+            rubin_session.RUBIN_FUSED_SHARED_L2_POSITION = args.shared_l2_position
         buckets = [dataclasses.replace(b, shared=shared_shape) for b in buckets]
     bucket_of = {b.max_tokens: b for b in buckets}
     if rank == 0:
@@ -638,6 +663,9 @@ def main():
     fused = None
     if shared_shape is not None:
         fused, shared_ref = make_shared(W, shared_shape, max(caps), args.seed + rank, device)
+        if args.die_local:
+            fc1 = die_local.place_halves(fused.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
+            fused = fused._replace(fc1=(fc1, fused.fc1[1]))
     moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),), shared=fused)
     ident = env_identity(os.path.dirname(mr.__file__))
     cycles_per_us = sleep_cycles_per_us()
@@ -666,7 +694,7 @@ def main():
         ).to(torch.bfloat16)
         ids, wts = make_routes(
             n, problem.num_experts, problem.top_k, world, rank, args.routing,
-            args.seed + n, device, args.ids_dtype,
+            args.seed + n, device, args.ids_dtype, args.active_experts,
         )
         check_routes(ids, problem.num_experts)
         out = torch.empty(

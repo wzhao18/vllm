@@ -303,6 +303,8 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
 class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
     """``SwapABGatedActEpilogue`` whose FC2 half is ``SwapABFc2EpilogueDedup`` (bulk stores routed by metadata)."""
 
+    situ_core_s3 = True
+
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
         return {**super().problem_desc_require(), "apply_topk_at_fc1": bool}

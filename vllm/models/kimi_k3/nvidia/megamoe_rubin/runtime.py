@@ -37,7 +37,13 @@ import torch.distributed as dist
 from vllm.logger import init_logger
 
 from .arch import require_sm107
-from .config import RouteIdError, RubinBucket, RubinMoeConfig, RubinMoeProblem
+from .config import (
+    DEDUP_VARIANTS,
+    RouteIdError,
+    RubinBucket,
+    RubinMoeConfig,
+    RubinMoeProblem,
+)
 from .session import RubinMegaMoeSession, layout_tag
 from .staging import PREFILL_STAGE_MIN_TOKENS, stage_inputs
 from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
@@ -337,6 +343,8 @@ class RubinMegaMoE:
                     empty, ids, wts, weights, bucket=b, ep_tokens=ep_tokens,
                     shared=fused,
                 )  # fmt: skip
+        if shared is not None:
+            self._warm_shared = shared  # prepare_rmsnorm binds the fused-shared buckets with it
         group_barrier(self.group)
         self.check_route_errors()
 
@@ -372,8 +380,7 @@ class RubinMegaMoE:
         epilogue variant (None: the capacity); same value on every EP rank.
         ``rmsnorm``: ``(weight, eps)`` of the output's consumer RMSNorm, applied in
         the reduce (``out[:n] = rms_norm(sum ...)``, stock vLLM ``rms_norm`` numerics;
-        :meth:`prepare_rmsnorm` compiles it before CUDA graph capture). GenPhase
-        buckets run the stock ``rms_norm`` kernel on the reduced rows instead.
+        :meth:`prepare_rmsnorm` compiles it before CUDA graph capture).
         ``shared``: ``session.FusedSharedArgs`` of a fused-shared bucket (required
         there, refused elsewhere); the result is then ``(routed, shared_out)`` with
         ``shared_out`` the shared expert's BF16 [n, hidden] rows (session-owned,
@@ -388,7 +395,7 @@ class RubinMegaMoE:
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
-        unfused_norm = rmsnorm if session.cfg.kernel_variant != "inference" else None
+        unfused_norm = rmsnorm if session.cfg.kernel_variant in DEDUP_VARIANTS else None
         if unfused_norm is not None:
             rmsnorm = None
         if n == 0:
@@ -429,10 +436,17 @@ class RubinMegaMoE:
         ensure_not_capturing("RubinMegaMoE fused RMSNorm compile")
         for b in self.buckets:
             session = self.sessions[b]
-            if session.cfg.kernel_variant != "inference":
+            if session.cfg.kernel_variant in DEDUP_VARIANTS:
                 continue  # stock rms_norm after the launch (forward)
+            shared = None
+            if session.cfg.shared is not None:
+                shared = getattr(self, "_warm_shared", None)
+                if shared is None:
+                    raise RuntimeError(f"bucket {b}: warmup with the shared expert first.")
             for use_s2 in sorted(session.kernels):
-                session.prepare(weights, session.empty_output, use_s2, (norm_weight, eps))
+                session.prepare(
+                    weights, session.empty_output, use_s2, (norm_weight, eps), shared
+                )
 
     def destroy(self) -> None:
         ensure_not_capturing("RubinMegaMoE teardown")

@@ -25,12 +25,13 @@ import torch
 from .weights import MX_BLOCK, NV_BLOCK, fp4_storage_dtype, is_power_of_two
 
 QuantKind = Literal["mxfp4_mxfp8", "nvfp4"]
-Variant = Literal["inference", "genphase", "inference_dedup"]
+Variant = Literal["inference", "genphase", "inference_dedup", "inference_dedup_wg2"]
 # "inference_dedup": the refreshed inference kernel (src_gp, FlashInfer main) with the
 # deduplicated combine: the owner rank pre-reduces a token's local expert rows (FP32,
 # one BF16 rounding) and returns one row per (source rank, token); the separate reduce
 # sums the rank rows in ascending rank order (TopkReduceDedup).
 VARIANTS = ("inference", "genphase", "inference_dedup", "inference_dedup_wg2")
+DEDUP_VARIANTS = ("inference_dedup", "inference_dedup_wg2")  # prefill only
 
 # (act data dtype or None = packed fp4, act/weight SF dtype, sf_vec_size,
 #  2x-mode instr K)
@@ -481,7 +482,7 @@ class RubinMoeConfig:
                     "GenPhase does not use token-back or token-in flag knobs."
                 )
 
-        if self.kernel_variant in ("inference_dedup", "inference_dedup_wg2"):
+        if self.kernel_variant in DEDUP_VARIANTS:
             if self.token_back_mode == "epi_warps":
                 raise ValueError(
                     "the dedup combine pushes rank rows from the combine warps "

@@ -984,6 +984,8 @@ class SwapABGatedActEpilogue(KernelComponent):
     two_epilogue_warpgroups = False
     fc1_splits_token_halves = False
     use_tanh_sigmoid = False
+    # vLLM-local S3 SiTU core (VENDOR.md): the prefill dedup epilogue only; GenPhase decode keeps upstream.
+    situ_core_s3 = False
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -2390,7 +2392,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 )
 
             # 3) gated activation on the dequanted (and clamped) real values; sigmoid(gate) is shared by both cores.
-            if cutlass.const_expr(self.situ_beta is not None and not self.use_tanh_sigmoid):
+            if cutlass.const_expr(self.situ_core_s3 and self.situ_beta is not None and not self.use_tanh_sigmoid):
                 # vLLM-local S3 (VENDOR.md): one reciprocal per element instead of three.
                 # With A = e^-g, B = e^(-2g/beta), C = e^(-2u/linear_beta):
                 #     sigmoid(g) = 1/(1+A),  tanh(g/beta) = (1-B)/(1+B),  tanh(u/lbeta) = (1-C)/(1+C)
