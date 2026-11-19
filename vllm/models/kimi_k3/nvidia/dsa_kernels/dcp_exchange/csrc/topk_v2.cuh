@@ -33,6 +33,9 @@
 
 namespace k31dcpx {
 
+#define K31_RARE(c) __builtin_expect(!!(c), 0)
+#define K31_LIKELY(c) __builtin_expect(!!(c), 1)
+
 constexpr int kV2Win = 256;                  // window keys
 constexpr int kV2Hdr = 8;                    // header words
 constexpr int kV2Fix = kV2Hdr + kV2Win / 2;  // header + window count pairs
@@ -44,17 +47,25 @@ constexpr int kV2RadR = 5;      // radix rounds (40-bit composite, 8 bits each)
 constexpr int kV2Cand = 3072;   // candidate list
 constexpr int kV2Fine = 2048;   // fine histogram keys above theta
 constexpr int kV2Chunk = 65536; // WRITE positions per bitmap chunk (2048 words)
-constexpr int kV2T = 512;       // threads per CTA (one CTA per row, 2 CTAs per SM)
+constexpr int kV2T = 512;  // threads per CTA (one CTA per row, 2 CTAs per SM; 256 measured slower)
 constexpr int kV2Warps = kV2T / 32;
 constexpr int kV2RegG = 4;      // 8-key groups per thread per candidate batch (16384 keys)
 constexpr int kV2Dbg = 64;      // dbg stamps per row
 constexpr int kV2SampleStride = 8;  // sample: one 8-key group in 8
+constexpr int kV2NR = 9;        // SMEM row: rows of <= kV2NR x kV2T groups (36,864 keys), odd pitch
+constexpr int kV2PB = kCoarseBins / kV2T;  // coarse bins per thread in scans
+constexpr int kV2FB = kV2Fine / kV2T;      // fine bins per thread in scans
+static_assert(kV2T >= kV2Win && kV2PB * kV2T == kCoarseBins && kV2FB * kV2T == kV2Fine && kV2FB % 4 == 0);
+constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
+constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
 // stats (rows): 0 exchanged, 1 resolved in round 1, 2 tie round, 3 radix, 4 select all
-// valid, 5 full-pass message (sample bound failed)
+// valid, 5 full-pass message, 6 sample bound failed (re-thresholded from the SMEM row),
+// 7 fine range rebased (the q-th key far above theta)
 
 struct V2Params {
   const uint16_t* logits;
   int64_t lstride;
+  int lcols;  // logits columns: every row's [0, lcols) is readable
   const int* local_len;
   const int* global_len;
   int* out;
@@ -93,8 +104,10 @@ __device__ __forceinline__ uint32_t v2_cnt(const uint32_t* slot, int u) {
   return (u & 1) ? (v & 0xFFFu) : ((v >> 12) & 0xFFFu);
 }
 
-// Exclusive prefix over the kV2T-thread block; the total in *total.
-__device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* warp_sums, uint32_t* total) {
+// Exclusive prefix over the kV2T-thread block; the total in *total. One barrier: every
+// warp scans the warp totals itself. `ws` (>= kV2Warps words) must not be the buffer of
+// the previous scan (callers alternate two buffers, V2WS), so no barrier protects reuse.
+__device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* ws, uint32_t* total) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   uint32_t x = v;
 #pragma unroll
@@ -102,42 +115,131 @@ __device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* warp_sums, uin
     const uint32_t y = __shfl_up_sync(0xffffffffu, x, o);
     if (lane >= o) x += y;
   }
+  if (lane == 31) ws[warp] = x;
   __syncthreads();
-  if (lane == 31) warp_sums[warp] = x;
-  __syncthreads();
-  if (warp == 0) {
-    const uint32_t sv = lane < kV2Warps ? warp_sums[lane] : 0u;
-    uint32_t t = sv;
+  const uint32_t w0 = lane < kV2Warps ? ws[lane] : 0u;
+  uint32_t t = w0;
 #pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-      const uint32_t y = __shfl_up_sync(0xffffffffu, t, o);
-      if (lane >= o) t += y;
-    }
-    if (lane < kV2Warps) warp_sums[lane] = t - sv;
-    if (lane == kV2Warps - 1) warp_sums[kV2Warps] = t;
+  for (int o = 1; o < kV2Warps; o <<= 1) {
+    const uint32_t y = __shfl_up_sync(0xffffffffu, t, o);
+    if (lane >= o) t += y;
   }
-  __syncthreads();
-  const uint32_t r = warp_sums[warp] + x - v;
-  *total = warp_sums[kV2Warps];
-  __syncthreads();
-  return r;
+  const uint32_t before = __shfl_sync(0xffffffffu, t - w0, warp);
+  *total = __shfl_sync(0xffffffffu, t, kV2Warps - 1);
+  return before + x - v;
 }
 
-__global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
-  __shared__ __align__(16) uint32_t hist[kCoarseBins];  // histograms; later bitmaps / scratch
-  __shared__ __align__(16) uint32_t cpos[kV2Cand];
-  __shared__ __align__(16) uint16_t ckey[kV2Cand];
-  __shared__ __align__(16) uint32_t rx[kV2MaxW * kV2Msg];
-  __shared__ __align__(16) uint32_t win[kV2Win];
-  __shared__ __align__(16) uint32_t msg[kV2Msg];
-  __shared__ uint32_t warp_sums[kV2Warps + 1];
-  __shared__ int s_i[16];
-  __shared__ uint32_t s_u[16];
-  __shared__ unsigned long long s_pref;
+// kV2FB consecutive (16-byte aligned) histogram words -> v; returns their sum
+__device__ __forceinline__ uint32_t v2_ldbins(const uint32_t* h, uint32_t (&v)[kV2FB]) {
+  uint32_t s = 0;
+#pragma unroll
+  for (int i = 0; i < kV2FB; i += 4) {
+    const uint4 x = *reinterpret_cast<const uint4*>(h + i);
+    v[i] = x.x; v[i + 1] = x.y; v[i + 2] = x.z; v[i + 3] = x.w;
+    s += x.x + x.y + x.z + x.w;
+  }
+  return s;
+}
+
+// Candidate-pass helpers. Against a key threshold th the test runs on the raw bf16
+// values (one packed compare per 2 keys, no key conversion): key(x) >= th <=> x >= t
+// as floats for every non-NaN x, with t = v2_th_bf16(th), except th = key(+0) (-0 would
+// pass): that threshold takes the key path (kx). NaN fails every ordered compare (key 0).
+__device__ __forceinline__ uint32_t v2_th_bf16(int th) {
+  const uint32_t t = th < 0x7F ? 0xFF80u : th < 0x8000 ? ((uint32_t)th ^ 0xFFFFu) : ((uint32_t)th ^ 0x8000u);
+  return t | (t << 16);
+}
+__device__ __forceinline__ uint32_t v2_ge2(uint32_t w, uint32_t t2) {
+  __nv_bfloat162 a, b;
+  memcpy(&a, &w, 4);
+  memcpy(&b, &t2, 4);
+  return __hge2_mask(a, b);
+}
+// keys >= th among 8 raw bf16 values
+__device__ __forceinline__ uint32_t v2_cnt_ge(const uint4& r, uint32_t th, uint32_t t2, bool kx) {
+  if (!kx)
+    return (__popc(v2_ge2(r.x, t2)) + __popc(v2_ge2(r.y, t2)) + __popc(v2_ge2(r.z, t2)) +
+            __popc(v2_ge2(r.w, t2))) >> 4;
+  const Keys8 k8(r);
+  uint32_t c = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) c += k8.key(j) >= th;
+  return c;
+}
+__device__ __noinline__ uint32_t v2_nvalid(uint4 r) {
+  const Keys8 k8(r);
+  uint32_t n = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) n += k8.key(j) != 0u;
+  return n;
+}
+// keys >= th of the group at positions [p0, p0 + 8) -> candidates cc, cc + 1, ...
+__device__ __forceinline__ void v2_emit(const uint4& r, uint32_t th, uint32_t t2, bool kx, int p0,
+                                        int cc, uint32_t* cpos, uint16_t* ckey) {
+  const uint32_t w4[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t kw = keys2(w4[j]);
+    const uint32_t m = kx ? (((kw & 0xFFFFu) >= th ? 0xFFFFu : 0u) | ((kw >> 16) >= th ? 0xFFFF0000u : 0u))
+                          : v2_ge2(w4[j], t2);
+    if (m & 1u) {
+      if (cc < kV2Cand) { cpos[cc] = (uint32_t)(p0 + 2 * j); ckey[cc] = (uint16_t)(kw & 0xFFFFu); }
+      ++cc;
+    }
+    if (m >> 31) {
+      if (cc < kV2Cand) { cpos[cc] = (uint32_t)(p0 + 2 * j + 1); ckey[cc] = (uint16_t)(kw >> 16); }
+      ++cc;
+    }
+  }
+}
+
+// SMEM shared by the hot (kFast) and the complete instance of the row body
+struct V2Sm {
+  uint32_t* hist;
+  uint32_t* cpos;
+  uint16_t* ckey;
+  uint4* srow;
+  uint64_t* bar;
+  uint32_t* warp_sums;
+  int* s_i;
+  uint32_t* s_u;
+  unsigned long long* pref;
+  long long* dbg;
+};
+
+// One row. kFast: the common case only, compact code (in-step every call fetches the
+// executed code cold from L2; the rare paths inline made the hot path 2x slower there):
+// a rank whose candidates or window fall outside the fast path sends a saturated
+// message, which every rank reads as tier 3; any tier other than 1 returns 1 and the
+// caller runs the row again with the complete body (out of line) at the next epoch, on
+// every rank alike (the tier comes from the exchanged words).
+template <bool kFast>
+// ep_in < 0: the row's epoch is read here (after the copy is issued). Returns 0, or
+// 1 + the epoch used when the complete body must run the row.
+__device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const int row, const int ep_in,
+                                      uint32_t& bar_phase) {
+  uint32_t* const hist = sm.hist;
+  uint32_t* const cpos = sm.cpos;
+  uint16_t* const ckey = sm.ckey;
+  uint4* const srow = sm.srow;
+  uint64_t& s_bar = *sm.bar;
+  uint32_t* const rx = reinterpret_cast<uint32_t*>(srow);  // kV2MaxW * kV2Msg words
+  int* const cslot = reinterpret_cast<int*>(srow) + kV2RxW;  // kV2Cand
+  uint32_t* const msg = reinterpret_cast<uint32_t*>(srow) + kV2RxW + kV2Cand;  // kV2Msg
+  uint32_t* const win = msg + kV2Msg;  // kV2Win
+  uint32_t* const warp_sums = sm.warp_sums;
+  uint32_t ws_par = 0;
+#define V2WS (warp_sums + 32 * (ws_par ^= 1u))
+  int* const s_i = sm.s_i;
+  uint32_t* const s_u = sm.s_u;
+  unsigned long long& s_pref = *sm.pref;
+  long long* const s_dbg = sm.dbg;
   const int tid = threadIdx.x;
-  // PDL: the prologue above overlaps the logits kernel's tail; every global read follows
-  asm volatile("griddepcontrol.wait;" ::: "memory");
   const int W = p.W, K = p.K, IL = p.interleave;
+  auto log2_or = [](int x) -> int { return (x > 0 && (x & (x - 1)) == 0) ? __ffs(x) - 1 : -1; };
+  const int bs_sh = log2_or(p.block_size), il_sh = log2_or(IL), w_sh = log2_or(W);
+  // gid = ((pos / IL) * W + rank) * IL + pos % IL = (pos / IL) << (w_sh + il_sh) | rank << il_sh | pos % IL
+  const int gid_sh = (il_sh >= 0 && w_sh >= 0) ? il_sh + w_sh : -1;
   // scalar slots
   int& s_tier = s_i[0];
   int& s_tau = s_i[1];
@@ -151,64 +253,96 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
   int& s_bh = s_i[9];
   int& s_n = s_i[10];
   int& s_th = s_i[11];
-  int& s_fast = s_i[12];
   uint32_t& s_valid = s_u[0];
   uint32_t& s_above = s_u[1];
   uint32_t& s_beyond = s_u[2];
-  uint32_t& s_atop = s_u[3];
   uint32_t& s_gt = s_u[4];
   uint32_t& s_sat = s_u[5];
-#define V2DBG(i)                                                    \
-  if (p.dbg && tid == 0) {                                          \
-    p.dbg[(int64_t)row * kV2Dbg + (i)] = now_ns();                  \
-    p.dbg[(int64_t)row * kV2Dbg + 32 + (i)] = (long long)clock64(); \
+  // dbg stamps: clock64 into SMEM (no global store on the row's chain); globaltimer only
+  // at the row's start / end; flushed to global at the end
+#define V2DBG(i)                                                                     \
+  if (p.dbg && tid == 0) {                                                           \
+    if ((i) == 0) {                                                                  \
+      for (int z = 1; z < 30; ++z) s_dbg[z] = 0;                                     \
+      p.dbg[(int64_t)row * kV2Dbg] = now_ns();                                       \
+    }                                                                                \
+    /* BAR.SYNC defers blocking to the next memory access: read SMEM and branch on */ \
+    /* it first, so the stamp follows the barrier's completion */                    \
+    if (*reinterpret_cast<volatile int*>(&s_i[15]) == 0x7FFFFFF1) __trap();         \
+    s_dbg[i] = (long long)clock64();                                                 \
+    if ((i) == 8) {                                                                  \
+      p.dbg[(int64_t)row * kV2Dbg + 8] = now_ns();                                   \
+      for (int z = 0; z < 30; ++z) p.dbg[(int64_t)row * kV2Dbg + 32 + z] = s_dbg[z]; \
+    }                                                                                \
   }
 #define V2STAT(i) \
   if (p.stats && tid == 0) atomicAdd(&p.stats[i], 1);
 
-  for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
+  {
     V2DBG(0);
+    // SMEM front end: the row's groups (group g = positions [8g - sh0, +8), 16-byte
+    // aligned) are bulk-copied into srow[g] before the row's lengths are known, by
+    // kV2Cp warps at once; partial groups (head, tail, past lcols) are read key by key.
+    const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
+    const uintptr_t la = reinterpret_cast<uintptr_t>(lrow);
+    const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
+    const int sh0 = (8 - head0) & 7;
+    const int gs_lo = sh0 ? 1 : 0, gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
+    if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+      // the previous row's generic SMEM writes before the async-proxy copy
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      const int n = max(0, gs_hi - gs_lo), c = tid >> 5;
+      const int a = gs_lo + (int)((int64_t)n * c / kV2Cp), b = gs_lo + (int)((int64_t)n * (c + 1) / kV2Cp);
+      const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
+      if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
+      else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+    }
     const int L = p.local_len[row];
     const int Gl = p.global_len[row];
     int* orow = p.out + (int64_t)row * p.ostride;
     const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
     const int* btrow = p.block_table != nullptr ? p.block_table + (int64_t)req * p.bt_stride : nullptr;
+    // power-of-two block size / interleave / world (the deployed shapes): shifts, no divides
     auto slot_of = [&](int pos) -> int {
       if (btrow == nullptr) return pos;
+      if (bs_sh >= 0) return btrow[pos >> bs_sh] * p.block_stride + (pos & (p.block_size - 1));
       return btrow[pos / p.block_size] * p.block_stride + pos % p.block_size;
     };
     auto gid_of = [&](int pos) -> uint32_t {
+      if (gid_sh >= 0)
+        return (uint32_t)((((pos >> il_sh) << gid_sh) | (p.rank << il_sh)) | (pos & (IL - 1)));
       return (uint32_t)(((pos / IL) * W + p.rank) * IL + pos % IL);
     };
-    if (Gl <= K) {  // the whole context (every rank sees the same global length)
+    if (K31_RARE(Gl <= K)) {  // the whole context (every rank sees the same global length)
+      mbar_wait(&s_bar, bar_phase);
+      bar_phase ^= 1u;
       for (int i = tid; i < L; i += kV2T) orow[i] = slot_of(i);
       for (int i = L + tid; i < K; i += kV2T) orow[i] = -1;
       if (tid == 0) p.out_count[row] = L;
-      continue;
+      __syncthreads();
+      return 0;
     }
     if (Gl >= (1 << 24) && tid == 0) spin_fail(p.err, 13);
-    const int ep = p.epoch[row];
+    const int ep = ep_in >= 0 ? ep_in : p.epoch[row];
     const uint32_t tag = (uint32_t)(ep % 255);
     const int par = ep & 1;
     V2STAT(0);
-    const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
-    const uint32_t q = (uint32_t)max(1LL, ((long long)K * L + Gl - 1) / Gl);
+    const unsigned long long kl = (unsigned long long)K * (unsigned)L + (unsigned)(Gl - 1);
+    const uint32_t q = max(1u, kl <= 0xFFFFFFFFull ? (uint32_t)kl / (uint32_t)Gl : (uint32_t)(kl / (unsigned)Gl));
 
     // ---- 1-2. keys -> sample bound theta -> candidates (every key >= theta with its
-    // position), valid keys. Group g holds positions [8g - sh, 8g - sh + 8), 16-byte aligned
-    // in global memory; positions outside [0, L) read as NaN (key 0). Rows of at most
-    // kV2RegG x 256 groups are loaded into registers at once (one memory latency); longer
-    // rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
+    // position), valid keys. Positions outside [0, L) read as NaN (key 0). Rows of at
+    // most kV2NR x kV2T groups are read from the SMEM copy (fast path: short loops);
+    // longer rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
     for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
     if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; }
-    const uintptr_t la = reinterpret_cast<uintptr_t>(lrow);
-    const int head = min(L, (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1));
-    const int sh = (8 - head) & 7;
+    const int head = min(L, head0);
+    const int sh = (8 - head) & 7;  // == sh0 when L >= 8
     const int ng = (L + sh + 7) >> 3;
     const int g_lo = sh ? 1 : 0, g_hi = (L + sh) >> 3;  // full groups [g_lo, g_hi)
-    const uint4* gbase = reinterpret_cast<const uint4*>(lrow - sh);
+    const bool regp = L >= 8 && ng <= kV2NR * kV2T;  // the SMEM path (same group layout)
     auto load_group = [&](int g) -> uint4 {
-      if (g >= g_lo && g < g_hi) return __ldg(gbase + g);
+      if (g >= g_lo && g < g_hi) return __ldg(reinterpret_cast<const uint4*>(lrow - sh) + g);
       if (g < 0 || g >= ng) return make_uint4(~0u, ~0u, ~0u, ~0u);
       uint32_t w[4];
 #pragma unroll
@@ -220,15 +354,38 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       }
       return make_uint4(w[0], w[1], w[2], w[3]);
     };
+    // group g of the SMEM path (g < ng; the partial head / tail groups are patched in below)
+    auto sgroup = [&](int g) -> uint4 { return srow[g]; };
     // visit groups [ga, gb): fn(position of the group's first key, its 8 raw bf16 values);
     // every thread must call it (it ends with a CTA barrier)
     auto for_keys = [&](int ga, int gb, auto&& fn) {
       for (int g = ga + tid; g < gb; g += kV2T) fn(8 * g - sh, load_group(g));
       __syncthreads();
     };
-    __syncthreads();  // histogram zeroed
+    // partial head / tail groups (masked, key by key), loaded while the copy lands
+    const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
+    uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
+    if (tid == 0 && phead) pg = load_group(0);
+    if (tid == 32 && ptail) pg = load_group(g_hi);
+    // (sampling from global memory while the copy lands measured slower: r24 20.0 vs 18.5 us)
+    mbar_wait(&s_bar, bar_phase);
+    bar_phase ^= 1u;
+    if (tid == 0 && phead) srow[0] = pg;
+    if (tid == 32 && ptail) srow[g_hi] = pg;
+    __syncthreads();  // histogram zeroed, partial groups in place
     V2DBG(9);
-    {
+    if (K31_LIKELY(regp)) {
+      // sample: one group in kV2SampleStride (spread over the 8 residues)
+#pragma unroll 1
+      for (int g = tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride) {
+        const Keys8 k8(sgroup(g));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = k8.key(j);
+          if (k) atomicAdd(&hist[k >> 4], 1u);
+        }
+      }
+    } else if constexpr (!kFast) {
       // sample: one 8-key group in kV2SampleStride, all loads in flight before any use
       const int step = kV2T * kV2SampleStride;
       for (int g0 = tid * kV2SampleStride; g0 < ng; g0 += 4 * step) {
@@ -238,7 +395,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
           const Keys8 k8(s4[i]);
-#pragma unroll
+#pragma unroll 1
           for (int j = 0; j < 8; ++j) {
             const uint32_t k = k8.key(j);
             if (k) atomicAdd(&hist[k >> 4], 1u);
@@ -255,31 +412,95 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) v += hist[bb * 8 + i];
+      for (int i = 0; i < kV2PB; ++i) v += hist[bb * kV2PB + i];
       uint32_t tot;
-      const uint32_t ab = v2_scan(v, warp_sums, &tot);
+      const uint32_t ab = v2_scan(v, V2WS, &tot);
       if (ab < want && ab + v >= want) {
         uint32_t run = ab;
-        for (int i = 7; i >= 0; --i) {
-          run += hist[bb * 8 + i];
-          if (run >= want) { s_th = (bb * 8 + i) * 16; break; }
+        for (int i = kV2PB - 1; i >= 0; --i) {
+          run += hist[bb * kV2PB + i];
+          if (run >= want) { s_th = (bb * kV2PB + i) * 16; break; }
         }
       }
       __syncthreads();
       if (tid == 0 && s_th == 0) s_th = 1;  // short / sparse sample: every valid key
       __syncthreads();
     }
-    const int th = s_th;
+    int th = s_th;
     V2DBG(1);
-    {
-      // candidates: batches of kV2RegG groups per thread (loads in flight together); per
-      // thread its keys >= theta, one warp scan, one atomic per warp
-      // full groups [g_lo, g_hi) in the batches (one predicated 16-byte load each), then the
-      // <= 2 partial groups (head / tail) as one more batch of a single group
+    // the SMEM path's candidate pass: every key >= thv with its position, in position
+    // order; returns this thread's valid-key count
+    auto cand_regp = [&](int thv) -> uint32_t {
+      // candidates in POSITION order: thread t owns the contiguous groups [kV2NR t, +kV2NR)
+      // (16-byte SMEM reads at an odd 16-byte pitch: conflict free), so one CTA scan of the
+      // per-thread counts places every candidate. The group tests are independent.
+      const int tg0 = tid * kV2NR;
+      const uint32_t t2 = v2_th_bf16(thv);
+      const bool kx = thv == 0x8000;
+      constexpr int kMW = (kV2NR + 3) / 4;
+      uint32_t mk[kMW];  // 8-bit key masks of the groups, 4 per word
+#pragma unroll
+      for (int w = 0; w < kMW; ++w) mk[w] = 0u;
+      uint32_t cnt = 0;
       uint32_t nv = 0;
-      const int nfull = g_hi - g_lo;
-      const int npart = ng - max(0, nfull);
-      for (int b0 = 0; b0 < max(0, nfull) + (npart > 0 ? kV2RegG * kV2T : 0); b0 += kV2RegG * kV2T) {
+#pragma unroll
+      for (int i = 0; i < kV2NR; ++i) {
+        const int g = tg0 + i;
+        if (g < ng) {
+          const uint4 r = sgroup(g);
+          // (one NaN accumulator per thread + a recount measured no faster: the partial
+          // groups' threads recount on the scan's critical path)
+          nv += v2_is_nan2(v2_max_nan(r)) ? v2_nvalid(r) : 8u;
+          uint32_t m8;
+          if (!kx) {
+            // 0xFFFF / 0 per key -> one byte per key (prmt) -> one bit per key (mask, mul)
+            const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);  // keys 0-3
+            const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);  // keys 4-7
+            m8 = (((lo & 0x08040201u) * 0x01010101u) >> 24) | ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
+          } else {
+            const Keys8 k8(r);
+            m8 = 0;
+#pragma unroll 1
+            for (int j = 0; j < 8; ++j)
+              m8 |= (k8.key(j) >= (uint32_t)thv ? 1u : 0u) << j;
+          }
+          cnt += __popc(m8);
+          mk[i / 4] |= m8 << (8 * (i % 4));
+        }
+      }
+      V2DBG(24);
+      uint32_t ctot;
+      int c = (int)v2_scan(cnt, V2WS, &ctot);
+      V2DBG(25);
+      if (tid == 0) s_cnt = (int)ctot;
+      const uint16_t* srow16 = reinterpret_cast<const uint16_t*>(srow);
+      // (the fine histogram counted here instead of in its own pass measured slower:
+      // same-bin atomics serialize the emit loop; r24 21.2 vs 18.3 us)
+#pragma unroll
+      for (int w = 0; w < kMW; ++w) {
+        uint32_t m = mk[w];
+        while (m) {
+          const int b = __ffs(m) - 1;
+          m &= m - 1;
+          const int i = 4 * w + (b >> 3), j = b & 7;
+          const int g = tg0 + i;
+          if (c < kV2Cand) {
+            const uint32_t raw = srow16[8 * g + j];
+            cpos[c] = (uint32_t)(8 * g - sh + j);
+            ckey[c] = (uint16_t)(keys2(raw) & 0xFFFFu);
+          }
+          ++c;
+        }
+      }
+      V2DBG(26);
+      return nv;
+    };
+    {
+      uint32_t nv = 0;
+      if (regp) nv += cand_regp(th);
+      const int nfull = regp ? 0 : g_hi - g_lo;
+      const int npart = regp ? 0 : ng - max(0, nfull);
+      for (int b0 = 0; !kFast && K31_RARE(!regp) && b0 < max(0, nfull) + (npart > 0 ? kV2RegG * kV2T : 0); b0 += kV2RegG * kV2T) {
         const bool part = b0 >= max(0, nfull);
         const int g0 = part ? 0 : g_lo + b0;
         uint4 rb[kV2RegG];
@@ -287,7 +508,8 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
 #pragma unroll
           for (int u = 0; u < kV2RegG; ++u) {
             const int g = g0 + u * kV2T + tid;
-            rb[u] = g < g_hi ? __ldg(gbase + g) : make_uint4(~0u, ~0u, ~0u, ~0u);
+            rb[u] = g < g_hi ? __ldg(reinterpret_cast<const uint4*>(lrow - sh) + g)
+                             : make_uint4(~0u, ~0u, ~0u, ~0u);
           }
         } else {
           // partial groups: group 0 (head, sh > 0) and group g_hi (tail) by threads 0 / 1
@@ -305,7 +527,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
           bool any;
           if (v2_is_nan2(mx)) {
             const Keys8 k8(rb[u]);
-#pragma unroll
+#pragma unroll 1
             for (int j = 0; j < 8; ++j) nv += k8.key(j) != 0u;
             any = (int)max_key_bound(rb[u]) >= th;
           } else {
@@ -317,7 +539,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
           if (any) {
             hit |= 1u << u;
             const Keys8 k8(rb[u]);
-#pragma unroll
+#pragma unroll 1
             for (int j = 0; j < 8; ++j) cnt += k8.key(j) >= (uint32_t)th;
           }
         }
@@ -336,7 +558,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
             if (!((hit >> u) & 1u)) continue;
             const Keys8 k8(rb[u]);
             const int p0 = part ? 8 * (tid == 0 ? 0 : g_hi) - sh : 8 * (g0 + u * kV2T + tid) - sh;
-#pragma unroll
+#pragma unroll 1
             for (int j = 0; j < 8; ++j) {
               const uint32_t k = k8.key(j);
               if (k >= (uint32_t)th) {
@@ -351,58 +573,149 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       if ((tid & 31) == 0 && nv) atomicAdd(&s_valid, nv);
     }
     __syncthreads();
-    const int nc = s_cnt;
+    int nc = s_cnt;
+    if (!kFast && K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
+      // the sample bound failed (tie-heavy or skewed rows): exact counts per key over
+      // 2048-key ranges of the SMEM row (from theta up on overflow, down otherwise) give a
+      // threshold admitting about q + 256 keys (at least q, at most kV2Cand); then a second
+      // candidate pass. Ranges that cannot hold it leave the row to the full passes.
+      V2STAT(6);
+      const uint32_t want = q + 256u;
+      int base = nc > kV2Cand ? th : max(1, th - kV2Fine);
+      int th2 = -1;
+      for (int it = 0; it < 4 && th2 < 0 && base >= 1 && base < 65536; ++it) {
+        for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
+        if (tid == 0) { s_beyond = 0; s_i[12] = -1; s_i[13] = -1; }
+        __syncthreads();
+        uint32_t bey = 0;
+        for (int g = tid; g < ng; g += kV2T) {
+          const Keys8 k8(srow[g]);
+#pragma unroll 1
+          for (int j = 0; j < 8; ++j) {
+            const int u = (int)k8.key(j) - base;
+            if (u >= kV2Fine) ++bey;
+            else if (u >= 0 && k8.key(j)) atomicAdd(&hist[u], 1u);
+          }
+        }
+        for (int o = 16; o > 0; o >>= 1) bey += __shfl_xor_sync(0xffffffffu, bey, o);
+        if ((tid & 31) == 0 && bey) atomicAdd(&s_beyond, bey);
+        __syncthreads();
+        const int f0 = (kV2T - 1 - tid) * kV2FB;
+        uint32_t hv[kV2FB];
+        const uint32_t hs = v2_ldbins(hist + f0, hv);
+        uint32_t tot;
+        const uint32_t sb = s_beyond;
+        uint32_t run = v2_scan(hs, V2WS, &tot) + sb;
+#pragma unroll
+        for (int i = kV2FB - 1; i >= 0; --i) {  // run: keys >= base + f0 + i
+          const uint32_t nx = run;
+          run += hv[i];
+          if (run >= want && nx < want) { s_i[12] = base + f0 + i; s_u[8] = run; }
+          if (run >= q && nx < q) { s_i[13] = base + f0 + i; s_u[9] = run; }
+        }
+        __syncthreads();
+        const uint32_t s_all = tot + sb;  // keys >= base
+        if (s_i[12] >= 0 && s_u[8] <= (uint32_t)kV2Cand) th2 = s_i[12];
+        else if (s_i[13] >= 0 && s_u[9] <= (uint32_t)kV2Cand) th2 = s_i[13];
+        else if (s_i[13] < 0 && sb >= q) base += kV2Fine;      // the q-th key lies above
+        else if (s_all < q) base = base > 1 ? max(1, base - kV2Fine) : 0;  // below
+        else break;                                            // a tie wider than kV2Cand
+        __syncthreads();
+      }
+      if (tid == 0) s_beyond = 0;  // the fine histogram's count again
+      if (th2 >= 1) {
+        th = th2;
+        cand_regp(th);
+        __syncthreads();
+        nc = s_cnt;
+      }
+    }
     V2DBG(2);
     if (p.dbg && tid == 0) p.dbg[(int64_t)row * kV2Dbg + 31] = nc;
     // ---- 3. fine histogram above theta from the candidates -> e, window, band
     bool fast = nc <= kV2Cand && (uint32_t)nc >= q;
     for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
     for (int b = tid; b < kV2Win; b += kV2T) win[b] = 0;
+    if (tid == 0) s_e = -1;
     __syncthreads();
+    // fast path: one suffix scan of the fine histogram gives e, the window, the count above
+    // it and the window prefix P, so the band pick needs no further scan
+    bool pdone = false;
+    int ew = -1;
+    uint32_t wtot = 0;
+    int fb = th;  // the fine histogram's base key
     if (fast) {
-      uint32_t bey = 0;
-      for (int c = tid; c < nc; c += kV2T) {
-        const int u = (int)ckey[c] - th;
-        if (u < kV2Fine) atomicAdd(&hist[u], 1u);
-        else ++bey;
-      }
-      for (int o = 16; o > 0; o >>= 1) bey += __shfl_xor_sync(0xffffffffu, bey, o);
-      if ((tid & 31) == 0 && bey) atomicAdd(&s_beyond, bey);
-      __syncthreads();
-      V2DBG(12);
-      // thread t owns fine keys [8 (255 - t), + 8): suffix counts from the top
-      const int f0 = (kV2T - 1 - tid) * 4;
-      uint32_t v = 0;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) v += hist[f0 + i];
-      uint32_t tot;
-      const uint32_t ab = v2_scan(v, warp_sums, &tot) + s_beyond;
-      if (tid == 0) s_e = -1;
-      __syncthreads();
-      if (ab < q && ab + v >= q) {
-        uint32_t run = ab;
-        for (int i = 3; i >= 0; --i) {
-          run += hist[f0 + i];
-          if (run >= q) { s_e = th + f0 + i; break; }
+      // thread t owns fine keys [kV2FB (kV2T - 1 - t), + kV2FB); Sx[b]: candidates with
+      // fine key >= b (beyond included); the row buffer is free until the round
+      uint32_t* Sx = reinterpret_cast<uint32_t*>(cslot);
+      const int f0 = (kV2T - 1 - tid) * kV2FB;
+      for (int pass = 0; pass < 2; ++pass) {
+        uint32_t bey = 0;
+        for (int c = tid; c < nc; c += kV2T) {
+          const int u = (int)ckey[c] - fb;
+          if (u >= kV2Fine) ++bey;
+          else if (u >= 0) atomicAdd(&hist[u], 1u);
         }
+        for (int o = 16; o > 0; o >>= 1) bey += __shfl_xor_sync(0xffffffffu, bey, o);
+        if ((tid & 31) == 0 && bey) atomicAdd(&s_beyond, bey);
+        __syncthreads();
+        V2DBG(12);
+        uint32_t hv[kV2FB];
+        const uint32_t hs = v2_ldbins(hist + f0, hv);
+        uint32_t tot;
+        uint32_t run = v2_scan(hs, V2WS, &tot) + s_beyond;
+#pragma unroll
+        for (int i = kV2FB - 1; i >= 0; --i) {
+          run += hv[i];
+          Sx[f0 + i] = run;
+          if (run >= q && run - hv[i] < q) s_e = fb + f0 + i;
+        }
+        if (tid == 0) Sx[kV2Fine] = s_beyond;
+        __syncthreads();
+        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
+        // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
+        // candidates (32 keys per bin, the whole key range) locate it; rebase there
+        V2STAT(7);
+        for (int x = tid; x < kV2Fine; x += kV2T) hist[x] = 0;
+        if (tid == 0) s_i[12] = -1;
+        __syncthreads();
+        if (tid == 0) s_beyond = 0;
+        for (int c = tid; c < nc; c += kV2T) atomicAdd(&hist[ckey[c] >> 5], 1u);
+        __syncthreads();
+        uint32_t gv[kV2FB];
+        const uint32_t gs = v2_ldbins(hist + f0, gv);
+        uint32_t crun = v2_scan(gs, V2WS, &tot);
+#pragma unroll
+        for (int i = kV2FB - 1; i >= 0; --i) {
+          crun += gv[i];
+          if (crun >= q && crun - gv[i] < q) s_i[12] = (f0 + i) * 32;
+        }
+        __syncthreads();
+        fb = max(th, s_i[12] - kV2Fine / 2);  // room for the window below the q-th key
+        for (int x = tid; x < kV2Fine; x += kV2T) hist[x] = 0;
+        __syncthreads();
       }
-      __syncthreads();
       V2DBG(13);
       fast = s_e >= 0;
       if (fast) {
         const int e = s_e;
-        const int lo = min(max(th, e - kV2Win / 2), th + kV2Fine - kV2Win);
-        // window counts and keys at or above lo + 256 (fine keys above it + beyond)
-        if (tid < kV2Win) win[tid] = hist[lo - th + tid];
-        uint32_t a = 0;
-        for (int u = lo - th + kV2Win + tid; u < kV2Fine; u += kV2T) a += hist[u];
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-        if (tid == 0) { s_above = s_beyond; s_lo = lo; }
-        __syncthreads();
-        if ((tid & 31) == 0 && a) atomicAdd(&s_above, a);
+        const int lo = min(max(fb, e - kV2Win / 2), fb + kV2Fine - kV2Win);
+        const int b0 = lo - fb;
+        const uint32_t sa = Sx[b0 + kV2Win];
+        if (tid < kV2Win) {
+          win[tid] = hist[b0 + tid];
+          hist[kV2Fine + tid] = Sx[b0] - Sx[b0 + tid];  // P[u]: window keys below u
+        }
+        if (tid == 0) { s_above = sa; s_lo = lo; }
+        pdone = true;
+        ew = e - lo;
+        wtot = Sx[b0] - sa;
       }
     }
-    if (!fast) {
+    if (K31_RARE(!fast)) {
+      if constexpr (kFast) {  // tier 3 on every rank, then the complete body
+        if (tid == 0) { s_sat = 1u; s_above = 0u; s_lo = 0; }
+      } else {
       V2STAT(5);
       // the same message from passes over every key: coarse histogram, the coarse bin of
       // the q-th key, the window around it
@@ -411,7 +724,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       for_keys(0, ng, [&](int, const uint4& r) {
           const uint32_t valid = 0xFFu;
         const Keys8 k8(r);
-#pragma unroll
+#pragma unroll 1
         for (int j = 0; j < 8; ++j) {
           const uint32_t k = k8.key(j);
           if (((valid >> j) & 1u) && k) atomicAdd(&hist[k >> 4], 1u);
@@ -420,16 +733,16 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) v += hist[bb * 8 + i];
+      for (int i = 0; i < kV2PB; ++i) v += hist[bb * kV2PB + i];
       uint32_t tot;
-      const uint32_t ab = v2_scan(v, warp_sums, &tot);
+      const uint32_t ab = v2_scan(v, V2WS, &tot);
       if (tid == 0) s_e = 0;
       __syncthreads();
       if (ab < q && ab + v >= q) {
         uint32_t run = ab;
-        for (int i = 7; i >= 0; --i) {
-          run += hist[bb * 8 + i];
-          if (run >= q) { s_e = (bb * 8 + i) * 16; break; }
+        for (int i = kV2PB - 1; i >= 0; --i) {
+          run += hist[bb * kV2PB + i];
+          if (run >= q) { s_e = (bb * kV2PB + i) * 16; break; }
         }
       }
       __syncthreads();
@@ -444,38 +757,50 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
           const uint32_t valid = 0xFFu;
         if ((int)max_key_bound(r) < lo) return;
         const Keys8 k8(r);
-#pragma unroll
+#pragma unroll 1
         for (int j = 0; j < 8; ++j) {
           const uint32_t k = k8.key(j), u = k - (uint32_t)lo;
           if (((valid >> j) & 1u) && k && u < (uint32_t)kV2Win) atomicAdd(&win[u], 1u);
         }
       });
+      }
     }
     __syncthreads();
     V2DBG(14);
     const int lo = s_lo;
     // band around the exact local q-th key: [bl, bh] (window-relative), <= kV2Band keys
     {
-      const int u = kV2Win - 1 - tid;  // thread t < 256 <-> window key 255 - t
-      const uint32_t c = u >= 0 ? win[u] : 0u;
-      if (c > kCountMax) atomicOr(&s_sat, 1u);
+      int e;
       uint32_t tot;
-      const uint32_t ab = v2_scan(c, warp_sums, &tot) + s_above;
-      if (tid == 0) { s_e = -1; s_bl = 1; s_bh = 0; s_n = 0; }
-      __syncthreads();
-      if (ab < q && ab + c >= q) s_e = u;
-      if (u >= 0) hist[kV2Fine + u] = tot - (ab - s_above) - c;  // P[u]: window keys below u
-      __syncthreads();
-      if (tid == 0 && s_e >= 0 && win[s_e] <= (uint32_t)kV2Band) {
-        const uint32_t* P = hist + kV2Fine;
-        auto Pf = [&](int x) -> uint32_t { return x >= kV2Win ? tot : P[x]; };
-        const int e = s_e;
-        int lo_h = 0, hi_h = kV2Win;
-        while (hi_h - lo_h > 1) {
-          const int h = (lo_h + hi_h) >> 1;
-          const int a = max(0, e - h), b = min(kV2Win - 1, e + h);
-          if (Pf(b + 1) - Pf(a) <= (uint32_t)kV2Band) lo_h = h; else hi_h = h;
-        }
+      if (pdone) {  // e, P and the window total from the suffix scan
+        if (tid < kV2Win && win[tid] > kCountMax) atomicOr(&s_sat, 1u);
+        if (tid == 0) { s_bl = 1; s_bh = 0; s_n = 0; }
+        e = ew;
+        tot = wtot;
+      } else {
+        const int u = kV2Win - 1 - tid;  // thread t < 256 <-> window key 255 - t
+        const uint32_t c = u >= 0 ? win[u] : 0u;
+        if (c > kCountMax) atomicOr(&s_sat, 1u);
+        const uint32_t ab = v2_scan(c, V2WS, &tot) + s_above;
+        if (tid == 0) { s_e = -1; s_bl = 1; s_bh = 0; s_n = 0; }
+        __syncthreads();
+        if (ab < q && ab + c >= q) s_e = u;
+        if (u >= 0) hist[kV2Fine + u] = tot - (ab - s_above) - c;  // P[u]: window keys below u
+        __syncthreads();
+        e = s_e;
+      }
+      // widest symmetric band around e with <= kV2Band keys: the test is monotone in the
+      // half-width h, so the count of passing h in [0, 256) gives it (one barrier)
+      const bool bcand = e >= 0 && win[e] <= (uint32_t)kV2Band;
+      const uint32_t* P = hist + kV2Fine;
+      auto Pf = [&](int x) -> uint32_t { return x >= kV2Win ? tot : P[x]; };
+      bool bok = false;
+      if (bcand && tid < kV2Win) {
+        const int a = max(0, e - tid), b = min(kV2Win - 1, e + tid);
+        bok = Pf(b + 1) - Pf(a) <= (uint32_t)kV2Band;
+      }
+      const int lo_h = __syncthreads_count(bok) - 1;
+      if (tid == 0 && bcand) {
         int a = max(0, e - lo_h), b = min(kV2Win - 1, e + lo_h);
         for (int it = 0; it < 4 && b + 1 < kV2Win && Pf(b + 2) - Pf(a) <= (uint32_t)kV2Band; ++it) ++b;
         for (int it = 0; it < 4 && a > 0 && Pf(b + 1) - Pf(a - 1) <= (uint32_t)kV2Band; ++it) --a;
@@ -512,7 +837,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
           const uint32_t valid = 0xFFu;
           if ((int)max_key_bound(r) < k0) return;
           const Keys8 k8(r);
-#pragma unroll
+#pragma unroll 1
           for (int j = 0; j < 8; ++j) {
             const int k = (int)k8.key(j);
             if (((valid >> j) & 1u) && k && k >= k0 && k <= k1) add(k, i0 + j);
@@ -533,8 +858,9 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       msg[6] = tagw(tag, 0u);
       msg[7] = tagw(tag, 0u);
     }
-    const int words = (kV2Fix + nb + 3) & ~3;
-    if (kV2Fix + nb + tid < words) msg[kV2Fix + nb + tid] = tagw(tag, 0u);
+    // the whole slot goes out (unused band words tagged), so one poll pass reads it
+    const int words = kV2Msg;
+    for (int j = kV2Fix + nb + tid; j < kV2Msg; j += kV2T) msg[j] = tagw(tag, 0u);
     __syncthreads();
     V2DBG(3);
     // ---- 4. round 1: send, then poll every rank's fixed part and band
@@ -553,176 +879,158 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       uint4 v = ld_sys_v4(src);
       while (!tagged(v, tag)) {
         if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, code); break; }
+        __nanosleep(128);  // spinning warps steal issue slots / L2 from co-resident rows
         v = ld_sys_v4(src);
       }
       *reinterpret_cast<uint4*>(dst) = v;
     };
     send(msg, words, r1row + (int64_t)p.rank * kV2Msg);
-    for (int i = tid; i < W * (kV2Fix / 4); i += kV2T) {
-      const int r = i / (kV2Fix / 4), j = (i % (kV2Fix / 4)) * 4;
+    if (tid == 0) { s_tau = -1; s_need = 0; s_q = 0; s_gs = -1; s_tier = 0; }
+    // in the round's shadow: the KV slot of every (position-sorted) candidate
+    if (fast && regp)
+      for (int c = tid; c < nc; c += kV2T) cslot[c] = slot_of((int)cpos[c]);
+    V2DBG(28);
+    for (int i = tid; i < W * (kV2Msg / 4); i += kV2T) {
+      const int r = i / (kV2Msg / 4), j = (i % (kV2Msg / 4)) * 4;
       poll_words(p.box + r1row + (int64_t)r * kV2Msg + j, rx + r * kV2Msg + j, 31);
-    }
-    __syncthreads();
-    for (int i = tid; i < W * (kV2Band / 4); i += kV2T) {
-      const int r = i / (kV2Band / 4), j = kV2Fix + (i % (kV2Band / 4)) * 4;
-      const int nbr = (int)(rx[r * kV2Msg + 3] & 0xFFFFFFu);
-      if (j < kV2Fix + nbr) poll_words(p.box + r1row + (int64_t)r * kV2Msg + j, rx + r * kV2Msg + j, 32);
     }
     __syncthreads();
     V2DBG(4);
     if (p.dbg && tid == 0) p.dbg[(int64_t)row * kV2Dbg + 30] = nb;
+    V2DBG(27);
 
     // ---- resolve. tier: 1 resolved (quota s_q), 2 tie round, 3 radix (id cut s_gs),
-    // 4 every valid key, 5 cut from the bands
-    if (tid == 0) { s_tier = 0; s_atop = 0; s_tau = -1; s_need = 0; s_q = 0; s_gs = -1; }
-    __syncthreads();
+    // 4 every valid key, 5 cut from the bands. Every thread derives the tier from the
+    // exchanged words; three barriers in the common case.
     {
-      int& s_maxlo = s_i[13];
-      int& s_minhi = s_i[14];
-      if (tid == 0) {
-        int mx = 0, mn = 1 << 30, sat = 0;
-        uint32_t tv = 0;
-        for (int r = 0; r < W; ++r) {
-          const uint32_t* s = rx + r * kV2Msg;
-          const int lr = (int)(s[0] & 0xFFFFu);
-          sat |= (int)((s[0] >> 16) & 1u);
-          mx = max(mx, lr);
-          mn = min(mn, lr + kV2Win);
-          tv += s[4] & 0xFFFFFFu;
-        }
-        s_maxlo = mx;
-        s_minhi = mn;
-        if (tv <= (uint32_t)K) s_tier = 4;
-        else if (sat || mx >= mn) s_tier = 3;
+      __shared__ int s_tc[kV2MaxW], s_toff[kV2MaxW], s_tok[kV2MaxW];
+      int mx = 0, mn = 1 << 30, sat = 0;
+      uint32_t tv = 0;
+      for (int r = 0; r < W; ++r) {
+        const uint32_t* s = rx + r * kV2Msg;
+        const int lr = (int)(s[0] & 0xFFFFu);
+        sat |= (int)((s[0] >> 16) & 1u);
+        mx = max(mx, lr);
+        mn = min(mn, lr + kV2Win);
+        tv += s[4] & 0xFFFFFFu;
       }
-      __syncthreads();
+      int rt = tv <= (uint32_t)K ? 4 : (sat || mx >= mn) ? 3 : 0;
+      int tau = -1, need = 0, qv = 0;
       V2DBG(19);
-      if (s_tier == 0) {
-        const int mx = s_maxlo, mn = s_minhi, n = mn - mx;
-        uint32_t a = 0;
+      if (rt == 0) {
+        // thread t < 256: a = the keys above the common range [mx, mn) at window offset t
+        // (thread 0 also the counts above every window), b = the common key mn - 1 - t;
+        // in the order (all a, then b from the top) the thread where the prefix crosses K
+        // holds tau
+        // (kV2T >= 512: thread t >= 256 carries b of t - 256, one scan)
+        constexpr bool kOne = kV2T >= 2 * kV2Win;
+        const int tb = kOne ? tid - kV2Win : tid;  // this thread's b slot
+        uint32_t a = 0, v = 0;
         for (int r = 0; r < W; ++r) {
           const uint32_t* s = rx + r * kV2Msg;
           const int lr = (int)(s[0] & 0xFFFFu);
-          if (tid < kV2Win && lr + tid >= mn) a += v2_cnt(s, tid);
-          if (tid == 0) a += s[1] & 0xFFFFFFu;
-        }
-        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-        if ((tid & 31) == 0 && a) atomicAdd(&s_atop, a);
-        const int u = n - 1 - tid;  // thread 0: the top key of the common range
-        uint32_t gu = 0;
-        if (u >= 0)
-          for (int r = 0; r < W; ++r) {
-            const uint32_t* s = rx + r * kV2Msg;
-            gu += v2_cnt(s, mx + u - (int)(s[0] & 0xFFFFu));
+          if (tid < kV2Win) {
+            if (lr + tid >= mn) a += v2_cnt(s, tid);
+            if (tid == 0) a += s[1] & 0xFFFFFFu;
           }
-        uint32_t tot;
-        const uint32_t ex = v2_scan(gu, warp_sums, &tot);
-        const uint32_t atop = s_atop;
-        if (atop >= (uint32_t)K || atop + tot < (uint32_t)K) {
-          if (tid == 0) s_tier = 3;
-        } else if (u >= 0 && atop + ex < (uint32_t)K && atop + ex + gu >= (uint32_t)K) {
-          s_tau = mx + u;
-          s_need = K - (int)(atop + ex);
+          if (tb >= 0 && tb < kV2Win && mn - 1 - tb >= mx) v += v2_cnt(s, mn - 1 - tb - lr);
+        }
+        uint32_t tot, tota = 0, ex;
+        if constexpr (kOne) {
+          ex = v2_scan(a + v, V2WS, &tot);  // a and v live on disjoint threads
+        } else {
+          v2_scan(a, V2WS, &tota);
+          ex = v2_scan(v, V2WS, &tot) + tota;
+        }
+        if (tb >= 0 && tb < kV2Win && ex < (uint32_t)K && ex + v >= (uint32_t)K) {
+          s_tau = mn - 1 - tb;
+          s_need = K - (int)ex;
         }
         __syncthreads();
+        tau = s_tau;
+        need = s_need;
+        if (tau < 0) rt = 3;  // the K-th key lies above or below the common range
         V2DBG(20);
       }
-      if (s_tier == 0) {
-        const int tau = s_tau, need = s_need;
-        // per rank: its tie count at tau, whether its band holds them, its group offset
-        __shared__ int s_tc[kV2MaxW], s_toff[kV2MaxW], s_tok[kV2MaxW];
-        if (tid < W) {
-          const uint32_t* s = rx + tid * kV2Msg;
+      if (rt == 0) {
+        // warp r < W: rank r's tie count at tau, whether its band holds them, and their
+        // offset in its band (its band keys in [bl_r, tau))
+        const int warp = tid >> 5, lane = tid & 31;
+        if (warp < W) {
+          const uint32_t* s = rx + warp * kV2Msg;
           const int lr = (int)(s[0] & 0xFFFFu);
           const uint32_t bw = s[2] & 0xFFFFFFu;
           const int blr = (int)(bw & 0xFFu), bhr = (int)((bw >> 8) & 0xFFu);
-          s_tc[tid] = (int)v2_cnt(s, tau - lr);
-          s_tok[tid] = ((bw >> 16) & 1u) && tau - lr >= blr && tau - lr <= bhr;
-          s_toff[tid] = 0;
-        }
-        __syncthreads();
-        // group offset: rank r's band keys in [bl_r, tau)
-        for (int r = 0; r < W; ++r) {
-          const uint32_t* s = rx + r * kV2Msg;
-          const int lr = (int)(s[0] & 0xFFFFu);
-          const int blr = (int)((s[2] & 0xFFFFFFu) & 0xFFu);
-          uint32_t c = (tid >= blr && tid < tau - lr && s_tok[r]) ? v2_cnt(s, tid) : 0u;
+          const int tok = ((bw >> 16) & 1u) && tau - lr >= blr && tau - lr <= bhr;
+          uint32_t c = 0;
+          if (tok)
+            for (int u = blr + lane; u < tau - lr; u += 32) c += v2_cnt(s, u);
           for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
-          if ((tid & 31) == 0 && c) atomicAdd(&s_toff[r], (int)c);
+          if (lane == 0) {
+            s_tc[warp] = (int)v2_cnt(s, tau - lr);
+            s_tok[warp] = tok;
+            s_toff[warp] = (int)c;
+          }
         }
         __syncthreads();
         V2DBG(21);
-        if (tid == 0) {
-          int tot_t = 0, nr = 0;
-          bool band_ok = true, fit = true;
-          for (int r = 0; r < W; ++r) {
-            tot_t += s_tc[r];
-            nr += s_tc[r] > 0;
-            if (s_tc[r] > 0 && !s_tok[r]) band_ok = false;
-            fit = fit && s_tc[r] <= kV2Tie;
-          }
-          const int mine = s_tc[p.rank];
-          if (tot_t == need) { s_tier = 1; s_q = mine; }
-          else if (nr == 1) { s_tier = 1; s_q = mine > 0 ? need : 0; }
-          else if (band_ok) s_tier = 5;
-          else s_tier = fit ? 2 : 3;
+        int tot_t = 0, nr = 0;
+        bool band_ok = true, fit = true;
+        for (int r = 0; r < W; ++r) {
+          tot_t += s_tc[r];
+          nr += s_tc[r] > 0;
+          if (s_tc[r] > 0 && !s_tok[r]) band_ok = false;
+          fit = fit && s_tc[r] <= kV2Tie;
         }
-        __syncthreads();
-        V2DBG(22);
-        if (s_tier == 5) {
-          // the need-th smallest id over every rank's tie group (ids distinct; groups in
-          // no particular order): gather them into U (hist), rank by counting
-          uint32_t* U = hist;
-          __shared__ int s_uo[kV2MaxW + 1];
-          if (tid == 0) {
-            int o = 0;
-            for (int r = 0; r < W; ++r) { s_uo[r] = o; o += s_tc[r]; }
-            s_uo[W] = o;
-            s_gs = -1;
-            s_q = 0;
-          }
+        const int mine = s_tc[p.rank];
+        if (tot_t == need) { rt = 1; qv = mine; }
+        else if (nr == 1) { rt = 1; qv = mine > 0 ? need : 0; }
+        else if (band_ok) rt = 5;
+        else rt = fit ? 2 : 3;
+        if (rt == 5) {
+          // this rank's quota: its ties whose global id ranks below `need` among every
+          // rank's ties (ids distinct, groups unsorted). Item (i, r2): how many of rank r2's
+          // ties lie below this rank's tie i; only this rank's ties are ranked.
+          const int m = s_tc[p.rank];
+          int* rk = reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win);
+          if (tid < m) rk[tid] = 0;
           __syncthreads();
-          for (int r = 0; r < W; ++r)
-            for (int j = tid; j < s_tc[r]; j += kV2T)
-              U[s_uo[r] + j] = rx[r * kV2Msg + kV2Fix + s_toff[r] + j] & 0xFFFFFFu;
-          const int nu = s_uo[W];
-          for (int j = nu + tid; j < ((nu + 3) & ~3); j += kV2T) U[j] = 0xFFFFFFFFu;
-          __syncthreads();
-          const uint4* U4 = reinterpret_cast<const uint4*>(U);
-          for (int i = tid; i < nu; i += kV2T) {
-            const uint32_t x = U[i];
-            int rk = 0;
-            for (int j = 0; j < (nu + 3) >> 2; ++j) {
-              const uint4 w4 = U4[j];
-              rk += (w4.x < x) + (w4.y < x) + (w4.z < x) + (w4.w < x);
-            }
-            if (rk == need - 1) s_gs = (int)x;
-          }
-          __syncthreads();
-          {
-            const int o = s_uo[p.rank], n = s_tc[p.rank];
+          const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
+          for (int it = tid; it < m * W; it += kV2T) {
+            const int i = it / W, r2 = it - i * W;
+            const uint32_t x = my[i] & 0xFFFFFFu;
+            const uint32_t* g = rx + r2 * kV2Msg + kV2Fix + s_toff[r2];
+            const int n2 = s_tc[r2];
             int c = 0;
-            for (int j = tid; j < n; j += kV2T) c += (int)(U[o + j] <= (uint32_t)s_gs);
-            for (int o2 = 16; o2 > 0; o2 >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o2);
-            if ((tid & 31) == 0 && c) atomicAdd(&s_q, c);
+#pragma unroll 4
+            for (int j = 0; j < n2; ++j) c += (g[j] & 0xFFFFFFu) < x;
+            if (c) atomicAdd(&rk[i], c);
           }
           __syncthreads();
-          if (tid == 0) {
-            if (s_gs < 0) spin_fail(p.err, 33);
-            s_tier = 1;
-          }
-          __syncthreads();
+          rt = 1;
+          qv = __syncthreads_count(tid < m && rk[tid] < need);
         }
+      }
+      if (tid == 0) {
+        s_tier = rt;
+        if (rt != 3 || tau >= 0) { s_tau = tau; s_need = need; }
+        if (qv >= 0) s_q = qv;
       }
     }
     __syncthreads();
     V2DBG(5);
     int tier = s_tier;
+    if constexpr (kFast) {
+      if (tier != 1) {  // the same on every rank: the complete body takes the row
+        __syncthreads();
+        return 1 + ep;
+      }
+    }
     if (tier == 1) V2STAT(1);
     if (tier == 4) V2STAT(4);
 
     // ---- T2: tie round (complete sorted tie lists at tau, <= kV2Tie each)
-    if (tier == 2) {
+    if (!kFast && K31_RARE(tier == 2)) {
       V2STAT(2);
       const int tau = s_tau, need = s_need;
       __shared__ int s_tn[kV2MaxW];
@@ -743,7 +1051,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
           const uint32_t valid = 0xFFu;
           if ((int)max_key_bound(r) < tau) return;
           const Keys8 k8(r);
-#pragma unroll
+#pragma unroll 1
           for (int j = 0; j < 8; ++j)
             if (((valid >> j) & 1u) && (int)k8.key(j) == tau) {
               const int i = atomicAdd(&s_cnt, 1);
@@ -796,7 +1104,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
     }
 
     // ---- T3: radix select of the K-th largest composite (key << 24 | 0xFFFFFF - gid)
-    if (tier == 3) {
+    if (!kFast && K31_RARE(tier == 3)) {
       V2STAT(3);
       if (tid == 0) { s_pref = 0ull; s_cnt = K; }
       __syncthreads();
@@ -808,7 +1116,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
         for_keys(0, ng, [&](int i0, const uint4& r) {
           const uint32_t valid = 0xFFu;
           const Keys8 k8(r);
-#pragma unroll
+#pragma unroll 1
           for (int j = 0; j < 8; ++j) {
             const uint32_t k = k8.key(j);
             if (!((valid >> j) & 1u) || !k) continue;
@@ -834,7 +1142,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
         if (tid < 256)
           for (int r = 0; r < W; ++r) hb += rx[r * 256 + (255 - tid)] & 0xFFFFFFu;
         uint32_t tot;
-        const uint32_t ex = v2_scan(hb, warp_sums, &tot);
+        const uint32_t ex = v2_scan(hb, V2WS, &tot);
         const uint32_t want = (uint32_t)s_cnt;
         if (tid == 0) s_n = 0;
         __syncthreads();
@@ -863,6 +1171,42 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
       const int tau = tier == 4 ? 0 : s_tau;
       const int qq = s_q, gs = s_gs;
       const bool from_cand = fast && tier == 1 && tau >= th;
+      // kFast: tier 1 from the round puts tau in every window, above every rank's theta
+      if (kFast && tid == 0 && !(from_cand && regp)) spin_fail(p.err, 41);
+      if (kFast || K31_LIKELY(from_cand && regp)) {
+        // candidates sorted by position, their slots ready: one scan of (above tau,
+        // ties at tau) over contiguous candidate chunks, then scatter
+        const int cpt = (nc + kV2T - 1) / kV2T;
+        const int c0 = min(nc, tid * cpt), c1 = min(nc, c0 + cpt);
+        uint32_t ca = 0, ct = 0;
+        for (int c = c0; c < c1; ++c) {
+          const int k = ckey[c];
+          ca += k > tau;
+          ct += k == tau;
+        }
+        uint32_t tot;
+        const uint32_t pre = v2_scan(ca | (ct << 16), V2WS, &tot);
+        const int gtt = (int)(tot & 0xFFFFu), nties = (int)(tot >> 16);
+        int a = (int)(pre & 0xFFFFu), t = (int)(pre >> 16);
+        for (int c = c0; c < c1; ++c) {
+          const int k = ckey[c];
+          if (k > tau) {
+            if (a < K) orow[a] = cslot[c];
+            ++a;
+          } else if (k == tau) {
+            if (t < qq && gtt + t < K) orow[gtt + t] = cslot[c];
+            ++t;
+          }
+        }
+        const int count = min(K, gtt + qq);
+        if (tid == 0 && (gtt + qq > K || nties < qq)) spin_fail(p.err, 40);
+        for (int i = count + tid; i < K; i += kV2T) orow[i] = -1;
+        if (tid == 0) {
+          p.out_count[row] = count;
+          p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
+        }
+        V2DBG(18);
+      } else {
       if (tid == 0) s_gt = 0;
       __syncthreads();
       if (tier == 1) {
@@ -876,7 +1220,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
           const uint32_t valid = 0xFFu;
           if ((int)max_key_bound(r) <= tau) return;
           const Keys8 k8(r);
-#pragma unroll
+#pragma unroll 1
           for (int j = 0; j < 8; ++j) c += ((valid >> j) & 1u) && (int)k8.key(j) > tau;
         });
         for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
@@ -908,7 +1252,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
             const int i0 = pg - c0;  // chunk-relative position of the group's first key
             const Keys8 k8(r);
             uint32_t mg = 0, me = 0;
-#pragma unroll
+#pragma unroll 1
             for (int j = 0; j < 8; ++j) {
               if (i0 + j < 0 || i0 + j >= n) continue;
               const int k = (int)k8.key(j);
@@ -934,7 +1278,7 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
         uint32_t cg = 0, ce = 0;
         for (int w = w0; w < w1; ++w) { cg += __popc(bmg[w]); ce += __popc(bme[w]); }
         uint32_t tot;
-        const uint32_t pre = v2_scan(cg | (ce << 16), warp_sums, &tot);
+        const uint32_t pre = v2_scan(cg | (ce << 16), V2WS, &tot);
         int gp = run_g + (int)(pre & 0xFFFFu), epi = run_e + (int)(pre >> 16);
         for (int w = w0; w < w1; ++w) {
           uint32_t m = bmg[w];
@@ -966,12 +1310,46 @@ __global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
         p.out_count[row] = count;
         p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
       }
+      }
     }
     V2DBG(8);
     __syncthreads();  // SMEM reused by the next row
   }
+  return 0;
 #undef V2DBG
+#undef V2WS
 #undef V2STAT
+}
+
+__device__ __noinline__ int v2_row_full(const V2Params& p, const V2Sm& sm, int row, int ep, uint32_t& bar_phase) {
+  return v2_row<false>(p, sm, row, ep, bar_phase);
+}
+
+__global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
+  __shared__ __align__(16) uint32_t hist[kCoarseBins];  // histograms; later bitmaps / scratch
+  __shared__ __align__(16) uint32_t cpos[kV2Cand];
+  __shared__ __align__(16) uint16_t ckey[kV2Cand];
+  // the row's keys (fast path); after the candidate pass the exchange buffers live there
+  __shared__ __align__(128) uint4 srow[kV2NR * kV2T];
+  __shared__ __align__(8) uint64_t s_bar;
+  __shared__ uint32_t warp_sums[64];  // two scan buffers (V2WS alternates)
+  __shared__ int s_i[16];
+  __shared__ uint32_t s_u[16];
+  __shared__ unsigned long long s_pref;
+  __shared__ long long s_dbg[32];
+  const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};
+  if (threadIdx.x == 0) {
+    mbar_init(&s_bar, kV2Cp);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  uint32_t bar_phase = 0;
+  // PDL: the prologue above overlaps the logits kernel's tail; every global read follows
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
+    const int r = v2_row<true>(p, sm, row, -1, bar_phase);
+    if (r) v2_row_full(p, sm, row, r == 510 ? 0 : r, bar_phase);  // epoch r - 1 + 1
+  }
 }
 
 }  // namespace k31dcpx

@@ -46,6 +46,13 @@ n96 45.7 against 49.5). KdaStream wins nowhere. The cores differ from each other
 in FP32 reduction order (not bit for bit; each one's error against the stock verify is
 the same, the chain test's bound). REPLAY (KdaFused / KdaFusedWS) in "deferred" mode
 once its precision is accepted.
+
+"deferred" (the serving mode: every request has 1..q pending tokens to fold), the same
+graph with the pending commits, us per layer (KdaWS without its flush, which adds a
+full state pass): n8 KdaWide 8.6 (KdaFlow 10.5); n16 KdaWide 13.3 (KdaFlow 14.0);
+from n24 KdaFlow, which folds in its own single state pass: n24 20.2 (KdaWide 24.5),
+n32 21.8 (26.1), n48 29.8 (39.2), n64 38.9 (51.7), n71 44.2 (56.7; KdaWS 41.3 + flush),
+n96 53.6 (74.3; KdaWS 48.7 + flush), n128 71.0 (95.2; KdaWS 62.6 + flush).
 """
 
 from functools import cache
@@ -58,7 +65,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ...shapes import Choice, Path, Shape, Unsupported
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
-from . import fused_ws, specialized
+from . import flow, fused_ws, specialized
 from .fused import KdaFused
 from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
@@ -68,7 +75,7 @@ from .wide import KdaWide
 
 K = 128
 # Record core per request count n, by heads per rank (items = heads x n, see above).
-RECORD_KINDS = {24: "1-2:split,3-70:wide,71-:ws"}
+RECORD_KINDS = {24: "1-2:split,3-20:wide,21-:flow"}
 # Record KdaSplit geometry ("early.lanes.occupancy.cluster", as prepared.SPEC_SCHEDULE)
 # by n; empty: the batch defaults (eight-CTA clusters at n1, then four; 16 lanes).
 SP_SPEC_SCHEDULE = {24: ""}
@@ -78,10 +85,10 @@ SP_SPEC_SCHEDULE = {24: ""}
 REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
-KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws")
+KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide")
+FOLDS = ("fused", "fused_ws", "wide", "flow")
 MODES = ("deferred", "triton", "none")
 
 
@@ -162,6 +169,19 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFusedWS's shared memory does not fit")
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
+    if kind == "flow":
+        if not record or not 2 <= tokens <= 4:
+            cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
+            raise Unsupported("kda", shape, cause)
+        budget = flow.smem_budget(device)
+        stages = flow.max_stages(tokens, *streamed, conv_size, budget)
+        if not stages:
+            cause = "KdaFlow needs a dim-first window and its shared memory"
+            raise Unsupported("kda", shape, cause)
+        ctas = min(items, sms)
+        if -(-items // ctas) > flow.max_items_per_cta(requests):
+            raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
+        return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
         if size > min(specialized.SMEM_LIMIT, limit):

@@ -19,7 +19,7 @@
 
 ## Local differences
 
-The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
+The R1 import rewrite (below), S3, E2a and E4a (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
 - **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
   epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
@@ -47,6 +47,35 @@ The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (
   - Accuracy: rel-L2 vs the fp32 oracle 1.73e-3 (stock) vs 1.83e-3. Not bit-identical to the
     stock core (different rounding order of the same approximations).
   - When: every non-batch-invariant launch whose problem carries SiTU betas (no knob/env).
+
+- **E2a** (vLLM-local, not upstream): the latent RMSNorm folded into the BF16 top-k reduce.
+  `topk_reduce.py` gains `_reduce_bf16_rmsnorm` and `TopkReduce.__call__(rmsnorm_weight=,
+  rmsnorm_eps=)`; `block_scaled_swap_ab_mega_moe_kernel.py` `__call__` passes the two optional
+  arguments to its separate reduce (and imports `Float32`).
+  - Why: on the decode critical path the reduce (~4 us) is followed by the stock `rms_norm`
+    kernel (~2.6 us) over the same [n, latent] rows; the norm is the reduce output's only consumer.
+  - What: one CTA per token row, thread = one 8-wide hidden tile; the same FP32 per-element top-k
+    order and invalid-route masking as `_reduce_bf16` (reduce part bit-identical), BF16 rounding,
+    then stock vLLM `rms_norm`: FP32 sum of squares of the BF16 row (another order),
+    `s = rsqrt(sum / hidden + eps)` (approximate rsqrt, as `rsqrtf`), `out = bf16(x * s * w)`.
+    PDL launch with `griddepcontrol.wait`. Only the BF16, non-batch-invariant reduce.
+  - When: callers pass `rmsnorm=(weight, eps)` (`RubinMegaMoE.forward`; the sdec SP MegaMoE layer
+    for its latent norm). Absent: the stock reduce, unchanged.
+
+- **E4a** (vLLM-local, not upstream): slim decode size exchange in
+  `sources/communication/nvlink_domain/token_comm.py` (FlashInfer original sha256
+  8736c9dd051ee56496c1c55b064d9e73a45dcaa247ee4cadabc197edd767c449).
+  - Why: at decode (`decode_landing`) the single router CTA bulk-copied its full size row, its full
+    source-prefix row and a full reduce-add of the totals (3 x `expert_count_padded` x 4 B) to every peer:
+    3 x 3.5 KiB x 32 = 344 KiB out of one SM per layer at EP32. Measured on 8 nodes (real EP32, NVFP4,
+    T96, globaltimer stamps): router 13 us (prefix_and_rows 4.3 us + publish_sizes 5.4 us, the latter
+    mostly `cp.async.bulk.wait_group 0`) vs 3 us on one GPU.
+  - What: a destination reads only its own `experts_per_rank` columns of `sizes_by_rank`,
+    `src_prefix_by_rank` and `sizes` (`token_in`, `_land_route_metadata`, `local_expert_sizes`), so the
+    source sends each peer just that slice (same column positions, same values): 112 B per row at EP32
+    (32x fewer bytes). The router histogram smem region is 16 B aligned (bulk source). Gate
+    `slim_size_rows` = `decode_landing` and `experts_per_rank % 4 == 0` (16 B slices); otherwise the full
+    rows as before. Bit-identical results (same counts, prefixes and totals at every address read).
 
 ## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
 
@@ -77,7 +106,7 @@ fi_numerics/moe_ep_batch_invariant/stage_partition.py | flashinfer/moe_ep/batch_
 fi_numerics/moe_ep_batch_invariant/wire_device.py | flashinfer/moe_ep/batch_invariant/wire_device.py | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f
 fi_numerics/moe_ep_batch_invariant/wire_spec.py | flashinfer/moe_ep/batch_invariant/wire_spec.py | f21445052dc0d7579df6f425ba53fc4891b5b9cebfe22e9791fcd218613ad6bf | b9ae9960f9bfee084f2c61fb32bd2a27d40e7c5f9a99c32a77dce3f964f40aab
 sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py | (R1 | rewrite) | c6ec37d63026c83e85a69eb14c0234c8e74f34a999882739a241f611dd751560 | e3ab102c3ac93e5cb6a81eec0707d078b02f9295674f24122bb5fae64d43dabb (R1 only; + S3: 2f3661c14a197f52ce66235010aeb78a0eb02ed34534d0f5d3f0de66dfd65ad8)
-sources/kernel_src/rubin/inference/mega/topk_reduce.py | (R1 | rewrite) | 44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358 | f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f
+sources/kernel_src/rubin/inference/mega/topk_reduce.py | (R1 | rewrite) | 44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358 | f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f (R1 only; + E2a: 1b5580b85ab4471a9126f5913568f8c41e8bce6fa916ea3eebde70550ac45d89)
 ```
 
 ## Rewrite rule
@@ -122,7 +151,7 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
-8736c9dd051ee56496c1c55b064d9e73a45dcaa247ee4cadabc197edd767c449  sources/communication/nvlink_domain/token_comm.py
+2c61f81041d4226349956bb9899ee0942f8fe34aed9dc6047d89bbfa951ba66a  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
@@ -145,12 +174,12 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 850caf943d137eeeeb99e997a6debce7aea14d3db2cd1e1992601b4e3b711af2  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 60963f01d755f52d5f7b6e1e7c76242bc583b4d2e26192e3639f5aaee9caa22c  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-413acdb503943619a72e5decbfc2fadd99981c1bb9684808b9420141886c71e5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+beb008ac37d9b424f2787fdc7fe5f50babc24138d7711dd21c48680d09e204ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 9179cb6a1f53f55fb6a0f03a269f3a1702567cdf9e2798ec33c50834259e6e42  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
 f8640f21703099acbf74064368d2d1a6d410760e358bb4341a8b26402b0a8a1f  sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
-f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f  sources/kernel_src/rubin/inference/mega/topk_reduce.py
+1b5580b85ab4471a9126f5913568f8c41e8bce6fa916ea3eebde70550ac45d89  sources/kernel_src/rubin/inference/mega/topk_reduce.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/schedulers/__init__.py
 22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04  sources/kernel_src/schedulers/base.py
 c853ecafc65add0d5aac0e52b65bec89966c6d52d568afa32e58e46d73fdb8fa  sources/kernel_src/schedulers/fc12_mapping.py
@@ -225,3 +254,30 @@ beats the N=128 record at every measured point (4350 tok: 729 vs 810 us on the 1
 shared-overlap grid, 693 vs 781 us full grid). The i8192 record is the C512 prefill bucket,
 which fell back to the i4096 record before. The i4096 record wins the equal-capacity tie on
 p50 (682 vs 731 us).
+
+## src_gp: refreshed GenPhase kernel (FlashInfer main)
+
+- **Source**: FlashInfer main `855eece4e9b5b796a46148664a3e27da571cd98b` (2026-11-18, includes
+  #9426 "refresh SM107 MegaMoE sources"), `flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src`
+  (69 files; provider source revision `70a6878de7852ed837d6a4dfc1572728226fbbc4`). Used for the
+  GenPhase kernel only (``session._src``); the inference kernel stays on ``src`` (a368c5f66).
+- **R1** (as for ``src``): ``flashinfer.moe_ep.batch_invariant`` imports rewritten to
+  ``src.fi_numerics.moe_ep_batch_invariant`` (byte-identical to FlashInfer main's copies).
+- **S-DIE** (vLLM-local): ``die_aware`` reads the die of each SM from ``%smid`` and the trusted
+  SM -> die mask (impl field ``die_sm_mask32``, ``die_local.current_die_sm_mask32``) when the CuTe
+  DSL build has no ``cute.arch.locality_domain_id`` (DSL 4.8.0). ``common/ptx_helpers.read_smid``,
+  ``BlockScaledSwapAbGenphaseMoeKernel._die_from_mask``.
+- **S-SH** (vLLM-local): the decode scheduler (``GenphaseDecodeFc12Scheduler``) carries the fused
+  shared expert's tile stream (``SharedExpertStreamMixin`` from ``fc12_scheduler``) ahead of its
+  routed sources, so the die-aware decode form takes the fused shared expert (upstream refuses
+  shared under ``("decode", L)``). Without a lead only. Shared FC1 is claimed before the
+  expert-sizes gate (it streams under the dispatch); the scheduler warp's explicit decode sizes
+  wait is skipped when the shared stream owns the gate.
+- **E2a** (vLLM-local, as for ``src``): ``TopkReduce._reduce_bf16_ll_rmsnorm``: the polled BF16 reduce
+  of one token row per CTA followed by the consumer's stock RMSNorm (``rmsnorm_weight`` /
+  ``rmsnorm_eps`` through the GenPhase kernel's ``__call__``), replacing the separate
+  ``rms_norm`` launch after the GenPhase bucket.
+- **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
+  (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
+  own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing
+  weights applied at FC1 (``apply_topk_at_fc1``, the deployed math) with the separate reduce.

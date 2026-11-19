@@ -46,7 +46,9 @@ CAP = 512
 BLOCK = 12
 NBLOCKS = 8
 SENTINEL = -0x80000000
-SHARDS = (4, 32, 96)  # n rows per rank: r1 / r8 / r24 of D3-32
+# n rows per rank: r1 / r8 / r24 of D3-32 and the rows_cap (n_max: the full grid of
+# 7-CTA clusters co-resident at the 93-layer 8-block AttnRes)
+SHARDS = (4, 32, 96, 128)
 # first, plain, block write, after one, 8 blocks
 LAYERS = tuple(
     int(x) for x in os.environ.get("SP_FUSED_LAYERS", "0,1,12,13,92").split(",")
@@ -264,7 +266,11 @@ def _worker(env: dict[str, str]) -> None:
                               for r in range(world)])
             want.view(torch.int32)[:, 7::101] = 0
             assert torch.equal(got.view(torch.int32), want.view(torch.int32)), rows
+            # Every rank done with this gather before the re-arm check, and checked
+            # before any rank multicasts the next one into the boxes.
+            dist.barrier()
             assert bool((final.box.view(torch.int32) == SENTINEL).all()), rows
+            dist.barrier()
         if rank == 0:
             print("worst ulp ratios", worst)
         dist.barrier()
@@ -291,9 +297,13 @@ def _run(world):
         p = ctx.Process(target=_worker, args=(env,))
         p.start()
         procs.append(p)
+    # A failed rank exits at once (os._exit); its peers may spin on device waits
+    # for it, so stop them as soon as any rank fails (or at the deadline).
     deadline = time.monotonic() + 600
-    for p in procs:
-        p.join(timeout=max(0.0, deadline - time.monotonic()))
+    while time.monotonic() < deadline and any(p.is_alive() for p in procs):
+        if any(p.exitcode not in (None, 0) for p in procs):
+            break
+        time.sleep(0.5)
     for p in procs:
         if p.is_alive():
             p.kill()

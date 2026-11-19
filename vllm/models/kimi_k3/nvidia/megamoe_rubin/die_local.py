@@ -125,6 +125,17 @@ def _place(storage: torch.Tensor, split: int) -> torch.Tensor | None:
     return copy
 
 
+def place_halves(t: torch.Tensor) -> torch.Tensor:
+    """A copy of the contiguous t with its first half of bytes homed on die 0 and
+    the second on die 1 (the fused shared expert's FC1 feature halves, claimed
+    per die by the GenPhase decode scheduler); t itself when the homes cannot
+    be confirmed."""
+    if not t.is_contiguous() or t.numel() % 2:
+        raise ValueError("place_halves needs a contiguous tensor of even size.")
+    placed = _place(t.view(2, -1), 1)
+    return t if placed is None else placed.view(t.shape)
+
+
 def place_experts(weights: RubinMoeWeights) -> RubinMoeWeights:
     """``weights`` with every expert-major tensor (FC1/FC2 codes and scales) homed
     per die half (``expert_split``); per-expert scalars stay where they are. The
