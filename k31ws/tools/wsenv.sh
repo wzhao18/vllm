@@ -30,12 +30,6 @@ export CUTE_DSL_CACHE_DIR=$K/cache/jit/cutedsl TORCHINDUCTOR_CACHE_DIR=$K/cache/
 SHV=$K/cache/jit/vllm; VLLM_CACHE_ROOT=$K/cache/vroot/$WS_OV; mkdir -p $VLLM_CACHE_ROOT/modelinfos 2>/dev/null
 for e in $SHV/*; do n=${e##*/}; [ "$n" = modelinfos ] || [ -e $VLLM_CACHE_ROOT/$n ] || ln -s $e $VLLM_CACHE_ROOT/$n 2>/dev/null; done
 export VLLM_CACHE_ROOT
-# Bytecode cache (FAST 17:35): the overlay's own __pycache__ was not reused (CPU profile: ~680 source compiles per
-# start). PYTHONPYCACHEPREFIX per overlay (its sources are immutable; /k31ov paths are shared by all overlays, so the
-# tree must not be); the image trees (/usr, /opt) link to one shared tree (same image for every run).
-PYC=$K/cache/pyc/$WS_OV; mkdir -p $PYC $K/cache/pyc/_image/usr $K/cache/pyc/_image/opt 2>/dev/null
-for d in usr opt; do [ -e $PYC/$d ] || ln -s $K/cache/pyc/_image/$d $PYC/$d 2>/dev/null; done
-export PYTHONPYCACHEPREFIX=$PYC
 export DG_JIT_CACHE_DIR=$K/cache/jit/deepgemm FLASHINFER_WORKSPACE_BASE=$K/cache/fi
 if [ -n "$WS_PYTHONPATH" ]; then
   export FLASHINFER_WORKSPACE_BASE=$K/cache/fi-ws/$(echo "$WS_PYTHONPATH" | md5sum | cut -c1-12)

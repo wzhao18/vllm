@@ -48,7 +48,7 @@ GROUPS = {
     "MOE.router+latent_down": ["MOE.router", "MOE.latent_down"],
     "MOE.topk": ["MOE.topk"],
     "MOE.latent_norm": ["MOE.latent_norm"],
-    "MOE.megamoe": ["MOE.dispatch", "MOE.fc1", "MOE.act", "MOE.fc2", "MOE.combine", "COMM.P11.moe", "COMM.P12.moe"],
+    "MOE.megamoe": ["MOE.megamoe_fused"],  # fused layer (model_sum: rows' "megamoe"; additive sum on old rows)
     "MOE.prepare": [],
     "MOE.shared_gate_up": ["MOE.shared_gate_up"],
     "MOE.shared_act": ["MOE.shared_act"],
@@ -249,8 +249,18 @@ def analyze(trace):
     return res
 
 
+MEGA_ADDITIVE = ["MOE.dispatch", "MOE.fc1", "MOE.act", "MOE.fc2", "MOE.combine", "COMM.P11.moe", "COMM.P12.moe"]
+
+
 def model_sum(mrow, ids):
     s = a = 0.0
+    if "MOE.megamoe_fused" in ids:
+        ids = [i for i in ids if i != "MOE.megamoe_fused"]
+        m = mrow.get("megamoe")
+        if m:  # the model's fused MegaMoE layer (mk_model_rows.py, INFRA 2026-11-18)
+            s += m["t_sol_us"]; a += m["t_ach_us"]
+        else:  # rows made before the fused row existed: the additive sum (double counts the overlap)
+            ids = ids + MEGA_ADDITIVE
     for i in ids:
         if i.startswith("COMM."):
             c = mrow["comm"].get(i)
@@ -301,8 +311,8 @@ def main():
         out[case] = dict(B=B, step_median_us=meds.get(case), span_med_us=statistics.median(p["span"] for p in per),
                          union_med_us=statistics.median(p["union"] for p in per), seg_types=per[0]["seg_types"],
                          model_key="B%d_L%dK" % (B, Lk),
-                         model_t_sol_us=mrow["t_sol_ms"] * 1e3 if mrow else None,
-                         model_t_ach_us=mrow["t_ach_ms"] * 1e3 if mrow else None,
+                         model_t_sol_us=mrow.get("t_sol_ms_fused", mrow["t_sol_ms"]) * 1e3 if mrow else None,
+                         model_t_ach_us=mrow.get("t_ach_ms_fused", mrow["t_ach_ms"]) * 1e3 if mrow else None,
                          model_not_in_bench_ach_us=nib[1], model_launch_ach_us=(mrow["fam_ach"].get("launch", 0) * 1e3
                                                                                if mrow else None),
                          ranks=len(per), rows=rows)

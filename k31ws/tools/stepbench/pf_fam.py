@@ -41,7 +41,7 @@ GROUPS = {
     "MOE.router": ["MOE.router"],
     "MOE.topk": ["MOE.topk"],
     "MOE.latent_down": ["MOE.latent_down"],
-    "MOE.megamoe": ["MOE.dispatch", "MOE.fc1", "MOE.act", "MOE.fc2", "MOE.combine", "COMM.P11.moe", "COMM.P12.moe"],
+    "MOE.megamoe": ["MOE.megamoe_fused"],  # fused layer (gap_parse.model_sum; INFRA 2026-11-18)
     "MOE.prepare": [],
     "MOE.shared_gate_up": ["MOE.shared_gate_up"],
     "MOE.shared_act": ["MOE.shared_act"],
@@ -196,11 +196,11 @@ def main():
         out[case] = dict(step_median_us=meds.get(case), span_med_us=statistics.median(p["span"] for p in per),
                          union_med_us=statistics.median(p["union"] for p in per), seg_types=per[0]["seg_types"],
                          model_key=case, F=mrow["F"], L=mrow["L"], f_req=mrow["f_req"],
-                         model_t_sol_us=mrow["t_sol_ms"] * 1e3, model_t_ach_us=mrow["t_ach_ms"] * 1e3,
+                         model_t_sol_us=mrow.get("t_sol_ms_fused", mrow["t_sol_ms"]) * 1e3, model_t_ach_us=mrow.get("t_ach_ms_fused", mrow["t_ach_ms"]) * 1e3,
                          model_not_in_bench_ach_us=nib[1], ranks=len(per), rows=rows)
         print("== %s step %.0f us (span %.0f) | model ach %.0f sol %.0f | x%.2f ach" % (
-            case, meds.get(case, 0), out[case]["span_med_us"], mrow["t_ach_ms"] * 1e3, mrow["t_sol_ms"] * 1e3,
-            meds.get(case, 0) / (mrow["t_ach_ms"] * 1e3)))
+            case, meds.get(case, 0), out[case]["span_med_us"], mrow.get("t_ach_ms_fused", mrow["t_ach_ms"]) * 1e3, mrow.get("t_sol_ms_fused", mrow["t_sol_ms"]) * 1e3,
+            meds.get(case, 0) / (mrow.get("t_ach_ms_fused", mrow["t_ach_ms"]) * 1e3)))
         print("   %-24s %9s %9s %9s %9s %7s %9s  %s" % ("group", "busy_us", "expo_us", "ach_us", "sol_us", "derate",
                                                      "expo-ach", "calls"))
         for r in rows:

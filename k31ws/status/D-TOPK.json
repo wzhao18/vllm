@@ -3,8 +3,8 @@
  "title": "Decode: DSA exact top-k + DCP merge",
  "side": "decode",
  "owner": "D-TOPK agent",
- "state": "landed",
- "updated": "2026-11-18T16:40-08:00",
+ "state": "implementing",
+ "updated": "2026-11-18T17:50-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.636,
  "current_ms": 0.294,
@@ -12,7 +12,7 @@
  "target_ms": 0.066,
  "step_ms": 10.89,
  "basis": "MEASURED in-step (INFRA step_d recipe run in the D-TOPK runner, 1-node D3-32 slice, 6 DSA layers, u132k, rows 128/384, profile): top-k family busy 57 -> 37 us/layer (r8), 106 -> 49 us/layer (r24); current_ms = 49 us x 24 DSA layers. Microbench (4-GPU DCP4, CUDA graph): r1/r8/r24 27/27/35 us per layer (in-tree 30/45/86). achievable = rhea1n model_rows B96: DSA.topk 1.9 + P8 7.5 us/layer (0.227 ms/step); r8 0.64 + 6.4; r1 0.08 + 5.9",
- "gap_analysis": "v2 (3d340bcf5e) removed the pre-pass kernels, the max_model_len-bound launch shape and the tie round (the band of global ids resolves ties straddling ranks in round 1 on 100% of bench rows). Remaining per-row chain (clock64 phase stamps, r1 / r24 us): sample 1.4/2.2, theta 0.6/0.7, candidate pass 8.5-9.5/10.4, fine window + band + msg 3.5/3.9, NVLink round 2.8-6/3-6 (includes rank skew), resolve 5/6.5, WRITE 3.5/4.5. A standalone probe of the same candidate loop runs 2.9 us (r1) / 3.3 us (r24) and a CTA pulls a 67.5 KB row into registers in 0.8-1.0 us, so the in-kernel loop runs ~3x slower than the probe (no spills: 62 regs, 0 local; cause under investigation); the other phases are chains of small dependent steps (syncs, single-thread loops). Model gap: the model prices one L2 pass + one NVLink round (~9.4 us at r24); the floor from hwdb measurements is ~1 us load + ~3 us round + local merge.",
+ "gap_analysis": "SOL design (per row, r24 one wave of 384 one-CTA rows): bound = one read of the row's 68 KB of bf16 logits (L2-resident after the logits kernel; all bytes in flight at once) + ONE dependent NVLink round + a short local merge; floor ~ load latency + round + ~2 us. Measured v2 chain at r24 (microbench, clock stamps): sample 2.2 + theta 0.7 + candidate pass 10.8 (3-4 serial memory latencies: batches of 4 groups/thread) + message build 3.7 (~12 synced steps, single-thread band search) + round 4.3 + resolve 7.0 + WRITE 4.0 = 34.7 us vs model 9.4. In-step 49 us: the kernel starts right at the logits kernel's end (no hidden PDL overlap), so the extra ~14 us over the microbench is in-kernel (diagnosing with in-step stats/stamps). Redesign: (1) register-resident row: the row's groups are loaded speculatively before its lengths are known (one latency for both), sample/theta/candidates from registers; (2) candidates compacted in POSITION order by a (slot, warp, lane) scan (no bitmap pass later); (3) KV-slot gather of every candidate in the round's shadow; post-round = resolve + one packed scan + scatter; (4) pollers back off (spinning warps steal issue slots and L2 from co-resident rows); (5) message build and resolve collapsed to ~3 synced steps each, no single-thread loops. Projection r24 microbench ~1.5 load + 1 sample/theta/cand + 1.5 message + 3-4 round + 2.5 resolve/write = ~10-11 us (target 11 in-step).",
  "inefficiencies": [
   "FIXED: tie round through the leader state machine with an extra key pass (ebc6916ed5)",
   "FIXED: launch shape bounded by max_model_len -> pre-pass kernels 41-46 us at r24 (v2 has none)",
@@ -29,11 +29,12 @@
   "TMA bulk loads of logits tiles"
  ],
  "plan": [
-  "DONE 1-4: measure; in-place tie round; topk_v2 exact (ALL PASS); decode wiring on v2",
-  "5. close the candidate-pass gap (in-kernel 3x slower than probe), then cut per-key instructions (NaN-propagating max as the bound, tighter theta)",
-  "6. collapse resolve/WRITE into fewer synced steps; remove single-thread loops",
-  "7. cluster split of the key pass for r1/r8 (DSMEM candidate merge into the leader)",
-  "8. distributed integration test (tests/distributed/test_kimi_k3_sdec_sp_layers.py exchange) + INFRA step_d A/B at rows 128/384, then landed-ready"
+  "DONE 1-4: measure; in-place tie round; topk_v2 exact; decode wiring on v2 (landed in int @ 9d3cb2b0c2)",
+  "5. register-resident front end + speculative row load (r1 overlay, testing)",
+  "6. position-ordered candidates + slot gather in the round shadow + one-scan WRITE + poll backoff (r2 overlay, queued)",
+  "7. collapse message build (parallel band pick via barrier count, suffix array) and resolve (~3 synced steps)",
+  "8. in-step diag (stats + stamps in the step slice) to explain in-step vs microbench; then cluster split for r1/r8",
+  "9. tests (test_k31_dcp_exchange, distributed sdec DSA) + step_d A/B on int content, landed-ready"
  ],
  "work": [
   {
@@ -105,9 +106,14 @@
    "t": "20:01",
    "what": "INFRA: merged b162ec54a6 into wzhao/k31ws-int @ 9d3cb2b0c2",
    "result": "int tests pass (dcp_exchange_policy 32, sdec DSA block vs stock 4); NVFP4 decode slice r8/r16/r24 6.67/8.86/10.78 -> 6.59/8.66/10.47 ms (with EN, test-only); pushed"
+  },
+  {
+   "t": "17:50",
+   "what": "resumed (new agent): read in-step trace: topk_v2 starts at the logits kernel's end on every layer (no PDL overlap hiding), 38-61 us/call in-step vs 34.7 microbench; implemented register-resident front end (r1) and position-ordered candidates + slot gather in the round shadow + one-scan WRITE + poll backoff (r2)",
+   "result": "queued on the D-TOPK runner (j27 r1 bench+test, j28 in-step diag, j29 r2 bench+test)"
   }
  ],
- "next": "landed-ready for INFRA merge (wzhao/k31ws-d-topk @ b162ec54a6). Next optimisation round, in order of measured size: (1) per-row chain after the candidate pass (~15 us: fine window/band 3.5, resolve 5, WRITE 3.5): ~35 __syncthreads with 16 warps; merge resolve steps into ~3 synced steps (every thread derives maxlo/minhi/tiers redundantly from rx; one scan for tau), parallelise band pick, WRITE with fewer barriers; (2) candidate pass 8.7 us in-kernel vs 2.9 us for the identical loop in benchmarks/kernels/probe_k31_cand_loop.py (not candidate count, not spills: 62 regs, 0 local) - diff SASS (cuobjdump -sass on the .so in $K31_DCPX_BUILD_DIR) / try the loop as a __noinline__ device function; (3) r1/r8 cluster split of the key pass (16/128 rows use 16/128 of 212 SMs); (4) NVLink round 2.8-6 us includes rank skew: consider issuing the round-1 send before the band pass (two messages). How to run: stage overlay (bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-topk d-topk-<sha>-<n>), start runs/D-TOPK/runner.sh via wsgpu.sh -g 4 (IDLE/MAXMIN env), drop job scripts into runs/D-TOPK/q/ (templates: session scratchpad dtopk_j21.sh bench, dtopk_j24.sh step A/B, test via torchrun tests/models/kimi_k3/test_k31_dcp_exchange.py).",
+ "next": "results of j27/j29 (microbench phases + ALL PASS), then j28 in-step stats/stamps; next collapse message build + resolve",
  "blockers": "",
  "branch": "wzhao/k31ws-d-topk @ b162ec54a6",
  "evidence": [

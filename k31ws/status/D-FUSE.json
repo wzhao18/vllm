@@ -3,8 +3,8 @@
  "title": "Decode: small-op fusion, SP collectives, drafter tail",
  "side": "decode",
  "owner": "D-FUSE workflow agent",
- "state": "landed-ready",
- "updated": "2026-11-18T17:15-08:00",
+ "state": "measuring",
+ "updated": "2026-11-18T17:45-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.98,
  "current_ms": 0.79,
@@ -12,7 +12,7 @@
  "target_ms": 0.407,
  "step_ms": 10.89,
  "basis": "MEASURED in-step NVFP4 baseline (INFRA 18:52 EST, measured/20261118-1900-nvfp4-decode.json); achievable = nvfp4_modelopt at the same slice",
- "gap_analysis": "SP boundaries now fused (2 kernels/layer instead of 4): in-step r24 AttnRes+AG+RS = 1.14x model (chain bench 1.07x); the remaining excess is the Lamport collectives themselves (bare AG+RS 16.1 us/layer at n=96 vs model 13.7) -- the RS push (4.1 MB at ~1.1 TB/s per GPU) is serial after the o-proj GEMM; moving it into the GEMM epilogue (D-GEMM) would hide it. Router top-k / prepare move into the FI MegaMoE front with D-MOE's kimi_k3_mega_moe switch; SiTU goes beside MegaMoE on the side stream (and fused with the MXFP8 quant in D-GEMM's B4). Remaining D-FUSE items: latent RMSNorm (proposed into FI's combine-reduce, D-MOE), drafter tail (needs a drafter-on profile; INFRA's drafter emulation currently fails).",
+ "gap_analysis": "Measured r24 in-step chain (trial4, one KDA+MoE layer = 217 us): the D-FUSE family on the critical path is SpAttnResGather 9.6 us + act_quant(kda_in) 4.0 + act_quant(o_proj) 2.8 + SpReduceAttnRes (ends 10.6 us after the o-proj) + latent rms_norm 2.6 (+ router top-k 4.4, D-MOE); the shared expert's act_quant 2.8 + SiTU-quant 7.1 run on the side stream inside the MegaMoE window (D-MOE measured that overlap costs MegaMoE ~30 us/layer of contention). SOL design for the family: (1) no standalone quantization: every MXFP8 operand is written by its producer (kda_in input by the AG kernel, shared_gu by the RS kernel [done, b435317d85]; o_proj input by KdaWS's o_norm epilogue [D-KDA]; shared down by the SiTU epilogue [D-GEMM]); (2) one fused kernel per layer boundary (done) at the collective floor: AG = multicast of the shard (MXFP8 halves it on KDA layers) + one latency, RS = 4.1 MB unicast push + one latency (NVLS in-switch reduce rejected: same egress bytes plus a flag round); (3) latent RMSNorm into the MegaMoE reduce (D-MOE E2), top-k into the MegaMoE front (D-MOE). Projected family at r24 with (1)-(3): ~0.40-0.45 ms vs achievable 0.37.",
  "inefficiencies": [
   "SP boundary collectives at ~1.10-1.17x model after fusion: RS push (4.1 MB/GPU at n=96) runs serially after the o-proj GEMM; a GEMM-epilogue push (D-GEMM) would overlap it (measured: next GEMM PDL-launches ~9 us before each fused kernel ends)",
   "Latent RMSNorm standalone (2.9 us x 92 calls; proposed into the FI MegaMoE combine-reduce, D-MOE)",
@@ -88,11 +88,21 @@
    "t": "17:05",
    "what": "drafter-on NVFP4 A/B r24 (preview MLA drafter in the L24 slice)",
    "result": "step 10847 -> 10635 us (-2.0%); TAIL 4.04 ms dominated by the preview drafter full-context MLA attention (2.23 ms) -- not the release GQA window drafter; drafter context AG still NCCL ring 190 us/step (model ~6 us). runs/D-FUSE/step_d/nvd-{int,fused14}-r384"
+  },
+  {
+   "t": "17:35",
+   "what": "fixed INFRA's merge blocker: test_specialized_decode_sp_coverage.py builds the SP step on the meta device; added stand-ins for the fused boundaries (sp_boundary) and SpFinalGather, counted sp_boundary/final_gather as specialized families, checked their build order; merged int 9d3cb2b0c2",
+   "result": "on overlay d-fuse-bd341a3a-9 (+fix): coverage + sp_mlp_gpu + sp_mxfp8_gpu 57 passed (84 s); tests/distributed/test_kimi_k3_sdec_sp_fused.py 2 passed (39 s). LANDED-READY wzhao/k31ws-d-fuse @ 07d32c2d24 (runs/D-FUSE/t9.log, t9b.log)"
+  },
+  {
+   "t": "17:42",
+   "what": "MXFP8 SP boundaries (b435317d85): SpAttnResGather(mx) publishes the KDA layers' all-gather as MXFP8 (FP8 data over the box + F8_128x4 E8M0 scale region with its own Lamport sentinel; the MXFP8 kda_in reads SpComm.mx_view: no act_quant kernel, half the AG bytes); SpReduceAttnRes(out_mx) also stores the post-AttnRes row as MXFP8 into the shared gate_up input scratch (no act_quant for shared_gu)",
+   "result": "TP4 test 1 passed (224 s): MXFP8 rows/scales == mxfp8_act.quantize of the fused BF16 rows (R16/128/384, layers 0/1/13), scaled_mm + fi_cute GEMMs over the box == over the reference, boxes re-armed (runs/D-FUSE/t10.log). In-step A/B queued: nvA-bd341 (D-FUSE landed) vs nvB-mx11 (+MX), step_d -q nvfp4 -x 128,256,384 profiled"
   }
  ],
- "next": "HANDOFF: (1) INFRA merges wzhao/k31ws-d-fuse @ 6758683397 (landed-ready; merge-clean with k31ws-int b31121cf56). (2) release GQA drafter tail: needs a slice with the release GQA DSpark drafter (preview MLA drafter in the L24 slice spends 2.2 ms in full-context attention and an NCCL context AG that the release drafter does not have); then profile TAIL with step_d.sh and fuse ArNorm/GQA-window/GEMM tail per kernel list. (3) with D-GEMM: o-proj GEMM epilogue push to owner slots (positive_zero32 words into recv[parity][rank][row][col]) then build SpBoundary with push_rows[R]=False (SpReduceAttnRes push=False) for those R: hides the 4.1 MB/GPU RS push at r24 (~3 us/layer). (4) D-MOE: latent RMSNorm into the FI combine-reduce epilogue.",
- "blockers": "Drafter tail needs a release-GQA-drafter slice (INFRA); the L24 slice uses the preview MLA drafter.",
- "branch": "wzhao/k31ws-d-fuse @ 6758683397 (merged wzhao/k31ws-int b31121cf56)",
+ "next": "INFRA: merge wzhao/k31ws-d-fuse @ 07d32c2d24. D-FUSE now: MXFP8 fusion into the SP boundaries (KDA in-proj all-gather as MXFP8 = no act_quant kernel + half the AG bytes on 18/24 layers; shared gate_up MXFP8 input written by SpReduceAttnRes), then NVLS reduce for the RS.",
+ "blockers": "",
+ "branch": "wzhao/k31ws-d-fuse @ 07d32c2d24 (merged wzhao/k31ws-int 9d3cb2b0c2)",
  "evidence": [
   "rhea runs/D-FUSE/run5/chain.json (TP4 chain bench)",
   "rhea runs/D-FUSE/step_d/{base-x,fused5x}-r128_384 (BF16/MXFP4 A/B)",

@@ -8,6 +8,16 @@
    "t_ach_ms": 9.554991368278962,
    "t_sol_ms_93": 6.0896830339102515,
    "t_ach_ms_93": 8.630928900651952,
+   "t_sol_ms_fused": 6.089683033910258,
+   "t_ach_ms_fused": 8.452468923132933,
+   "megamoe": {
+    "t_sol_us": 2501.365839626082,
+    "t_ach_us": 3239.8944852977447,
+    "t_ach_us_93": 3239.8944852977447,
+    "additive_sol_us": 3252.11527954541,
+    "additive_ach_us": 4342.416930443773,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -705,6 +715,16 @@
    "t_ach_ms": 11.523092410119617,
    "t_sol_ms_93": 7.162471627940197,
    "t_ach_ms_93": 10.149511823368595,
+   "t_sol_ms_fused": 7.162471627940194,
+   "t_ach_ms_fused": 10.039327519553579,
+   "megamoe": {
+    "t_sol_us": 2564.126327848724,
+    "t_ach_us": 3320.2789277878164,
+    "t_ach_us_93": 3320.2789277878164,
+    "additive_sol_us": 3539.3852078487243,
+    "additive_ach_us": 4804.0438183538545,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -1402,6 +1422,16 @@
    "t_ach_ms": 13.575591058004585,
    "t_sol_ms_93": 8.32770761756119,
    "t_ach_ms_93": 11.770874842050713,
+   "t_sol_ms_fused": 8.3277076175612,
+   "t_ach_ms_fused": 11.71058372215553,
+   "megamoe": {
+    "t_sol_us": 2626.886795045814,
+    "t_ach_us": 3400.6633432606736,
+    "t_ach_us_93": 3400.6633432606736,
+    "additive_sol_us": 3826.6551150458135,
+    "additive_ach_us": 5265.6706791097295,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -2093,5 +2123,5 @@
   }
  },
  "_ckpt": "nvfp4_modelopt",
- "_view": "L93 (full model)"
+ "_view": "L93"
 }

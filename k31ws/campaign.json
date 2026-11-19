@@ -244,6 +244,22 @@
   {
    "t": "11-18 18:10",
    "text": "P-MLA: hybrid-orientation sparse MLA kernel (QK heads-on-M with Q in TMEM, PV keys-on-M, 576 TMEM cols) is correct; timing in progress."
+  },
+  {
+   "t": "11-18 17:25",
+   "text": "FAST before/after (whole pool): model init median 864 s -> 0.3-2.4 s (cache thrash fixed); failed GPU-minutes 41% -> 15% (CPU pre-check); engine init 51-62 s -> 6-10 s; warm step bench 247 -> 85 s."
+  },
+  {
+   "t": "11-18 17:55",
+   "text": "Release drafter: config-only view is enough for dummy-weight benches, but the release DSpark checkpoint (e4e6e626) is only on Hecate; until it is copied, decode is judged on target-only numbers (preview drafter tail ~4 ms is an artifact)."
+  },
+  {
+   "t": "11-18 19:20",
+   "text": "P-MLA: random KV-row gather reaches 20.6 TB/s with 16 gather4 warps and hoisted slot loads (new floor 0.94 ms/layer at F16K); concurrent tensor-core operand reads slow it, which shapes the sparse MLA prefill design."
+  },
+  {
+   "t": "11-18 20:40",
+   "text": "P-GEMM attribution: prefill MOE glue per layer = shared SiTU + MXFP8 act quant 160 us + FI quant 40 us + latent RMSNorm 29 us; router top-k 65 us (latency-bound, 1 token per 128 threads)."
   }
  ]
 }

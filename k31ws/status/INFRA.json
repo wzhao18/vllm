@@ -4,7 +4,7 @@
  "side": "infra",
  "owner": "INFRA agent (workflow)",
  "state": "measuring",
- "updated": "2026-11-18T20:18-05:00",
+ "updated": "2026-11-18T17:55-08:00",
  "shape": "NVFP4 checkpoint. Real D3-32 (8 nodes) r8/r16/r24 at L132K and real P3-16 DEP16 (4 nodes) F16K/F8K at L78K; 1-node slices (D3-32 DP rank, DEP4) for A/B",
  "basis": "MEASURED NVFP4 on wzhao/k31ws-int 5718ef2d89: 8-node d8 runs/INFRA/step_multi/d8-int5718ef2-nv-prof, 4-node p16 runs/INFRA/step_multi/p16-int5718ef2-nv-prof; slices runs/INFRA/step_d|step_p/*",
  "gap_analysis": "Real deployed topology, NVFP4, int 5718ef2d89. Decode D3-32 (8 nodes, real EP32): r8/r16/r24 19.10/24.86/29.75 ms vs nvfp4 achievable 9.50/11.46/13.50 (x2.01/2.17/2.20); r24 exposed vs achievable: GEMMs 5.74 vs 2.93, DSA top-k 2.55 vs 0.23, small elementwise 2.02 vs 0.15, DSA q/MLA/DCP 2.68 vs 1.00, KDA core 3.43 vs 1.81, MegaMoE 6.55 vs 5.27, SP comm 1.76 vs 1.28, indexer 0.94 vs 0.43, preview-drafter tail 4.09 vs 0.28. Prefill P3-16 (4 nodes, real DEP16): F16K 790.3 ms = 20.7K tok/s/GPU, F8K 401.4 ms = 20.4K, vs additive achievable 628.2 / 320.4 (x1.26) and model step 532.8 (30.7K); biggest: KDA core 79.8 vs 17.4, router/latent/top-k/norm 80.5 vs 48.0, sparse MLA 49.2 vs 15.4, indexer + top-k 61.6 vs 33.8; MegaMoE 261.5 vs 293.3 (below the model: model pessimistic). Slices calibrated against these: decode target-only x93/24 within 2%, MegaMoE per layer +7%; prefill step x93/24 -2.5%, MegaMoE per layer -13%. Harness root cause fixed early: sdec reads moe.gate.weight in its fused MoE front, so the routing fixture never reached the sdec graph; bench-only expert-count emulation.",
@@ -100,11 +100,26 @@
    "t": "20:18",
    "what": "D-ATTN 72fdf53350 trial (trial6): distributed DSA-block stock-parity test fails at R68 -> sent back",
    "result": "decode A/B with it 6.53/8.36/10.15 ms (int 6.59/8.66/10.47)"
+  },
+  {
+   "t": "17:35",
+   "what": "trial7 wzhao/k31ws-int-dmoe2-trial c8a403aa7f = int 9d3cb2b0c2 + D-MOE 4b58015c31 + P-MOE S3 ported onto the re-vendored a368c5f66 epilogue (41869ff62e; VENDOR.md S3 + manifest) + 055b80ab3d recorded -s ours; overlay trial7-c8a403a-1",
+   "result": "int_tests4, NVFP4 step_d/step_p (trial7 + int reference), 8-node d8+p16 on the idle hold8 74730 launched"
+  },
+  {
+   "t": "17:35",
+   "what": "stepbench: adopted D-MOE emulation (die-split active experts, EP32 MegaMoE records via knob_world_size) into tools/stepbench/nq_step.py (Rhea, atomic, backup nq_step.py.bak-pre-infra-diesplit)",
+   "result": "decode A/B references re-measured on the new emulation (ref9d3-ds-nv-prof)"
+  },
+  {
+   "t": "17:50",
+   "what": "perf-model MegaMoE row fix: step-bench family tables summed MegaMoE dispatch/fc/combine + P11/P12 additively; the model prices one fused kernel (cost.megamoe_time). Rows now carry the fused layer; gap_parse/pf_fam use it",
+   "result": "nvfp4 93L: prefill F16K MegaMoE ach 293.3 -> 197.9 ms (measured real EP16 261.5 = x1.32, not below the model); decode r24 5.27 -> 3.40 ms (measured 6.55 exposed = x1.93); additive step with fused MoE = model step (prefill 532.8, decode r24 11.71 vs 11.77)"
   }
  ],
- "next": "HANDOFF: (1) scan k31ws/status/*.json for state landed-ready; for each: in /Users/weizha/k31vr-spgemm git worktree add /Users/weizha/k31ws-wt/trialN -b wzhao/k31ws-int-<x>-trial wzhao/k31ws-int; merge --no-ff the sha; add its tests to k31ws/tools/int_tests.sh (1 GPU) or int_tests4.sh (multi-GPU); bash k31ws/tools/mkov.sh <wt> trialN-<sha7>-1; on Rhea: wsgpu.sh -g 4 -m 45 -o <tag> -n INFRA -- bash $K/tools/int_tests4.sh and step_d.sh -n INFRA -q nvfp4 <tag> 128,256,384 0 (decode) / step_p.sh -n INFRA -q nvfp4 <tag> 0 (prefill); compare with int reference (decode 6.59/8.66/10.47 ms on int 9d3cb2b0c2, prefill 198.9/101.0 ms); then in /Users/weizha/k31ws-wt/int git merge --ff-only the trial branch, git push wzhao18 wzhao/k31ws-int, set the owner state landed + work line. (2) 8-node: MULTI_WAIT=1200 setsid nohup bash $K/tools/step_multi.sh -n INFRA -q nvfp4 -t <tag> d8 <ov> 128,256,384 1 (and p16 <ov> - 1); parse: gap_parse.py decode <dir> stepbench/model_rows_L93_nvfp4_modelopt.json gap.json --L 135 (link x.log->agentx.log, prof-x->prof-agentx); pf_fam.py <dir>/prof-x stepbench/pf_model_rows_L93.json nvfp4 (link x.log->pf.log). (3) poll Rhea at most once per 3 min, one ssh per poll.",
+ "next": "Poll Rhea (<=1 ssh / 3 min): runs/INFRA/launch/{t7-tests4,t7-d,ref-d,t7-p,ref-p,t7-multi}.log; when tests pass + slice A/B ok: ff int to c8a403aa7f, push, mark D-MOE 4b58015c31 + P-MOE 055b80ab3d landed; parse d8/p16 (gap_parse/pf_fam with the fused MegaMoE rows) into measured/; post new int references (die-split emulation) in findings.",
  "blockers": "",
- "branch": "wzhao/k31ws-int @ 9d3cb2b0c2 (pushed)",
+ "branch": "wzhao/k31ws-int @ 9d3cb2b0c2 (pushed); trial wzhao/k31ws-int-dmoe2-trial @ c8a403aa7f (int + D-MOE 4b58015c31 + P-MOE S3 port) in test",
  "evidence": [
   "k31ws/measured/20261118-2010-nvfp4-decode-8node.json",
   "k31ws/measured/20261118-2015-nvfp4-prefill-4node.json",

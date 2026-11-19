@@ -242,8 +242,8 @@ def patch_expert_emulation(emulate_ep):
     moe.gate.weight; front.py ranks sigmoid(logit) + e_score_correction_bias), so the bench's --routing fixture never
     reaches its graph. Instead, after the dummy weights are drawn, the selection bias of every expert outside the
     active set is set to -100 (sigmoid scores lie in (0, 1), so top-16 always picks from the active set; the routing
-    weights come from the sigmoid scores, not the bias). Active set: global ids e with e % (E / ep) < E / emulate_ep,
-    i.e. E / emulate_ep experts on every EP rank under both linear and round-robin placement (E / ep a multiple of
+    weights come from the sigmoid scores, not the bias). Active set: E / emulate_ep local experts per EP rank, half
+    from the bottom of each die half (local ids [0, a/2) and [L/2, L/2 + a/2)), i.e. E / emulate_ep experts on every EP rank under both linear and round-robin placement (E / ep a multiple of
     ep). Token-expert pairs per GPU are unchanged (rows x top_k / ep per DP rank = the deployed rows x dp x top_k /
     EP), so each GPU runs the deployed expert count at the deployed tokens per expert. Production code is untouched;
     the stock arm and the eager reference see the same biased routing."""
@@ -251,6 +251,21 @@ def patch_expert_emulation(emulate_ep):
         return
     import torch
     from vllm.model_executor.model_loader import dummy_loader
+
+    # D-MOE 2026-11-18: the slice MegaMoE runs the emulated EP size's buckets/records (megamoe_rubin knob_world_size
+    # hook). Without it EP4 picks the EP4 prefill records (grouped, die-oblivious, 148-SM cap) instead of the EP32
+    # 128-token decode record (phase_interleave, die-local, full grid). Decode only: prefill workers keep their own.
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import experts as MX
+    if "knob_world_size" in MX.select_rubin_buckets.__code__.co_varnames:
+        _sel = MX.select_rubin_buckets
+
+        def select_rubin_buckets(*a, **k):
+            if not k.get("prefill_worker"):
+                k.setdefault("knob_world_size", emulate_ep)
+            return _sel(*a, **k)
+
+        MX.select_rubin_buckets = select_rubin_buckets
+        log(f"expert emulation: MegaMoE buckets/records of EP{emulate_ep}")
 
     orig = dummy_loader.DummyModelLoader.load_weights
 
@@ -270,7 +285,12 @@ def patch_expert_emulation(emulate_ep):
             ids = torch.arange(E, device=p.device)
             with torch.no_grad():
                 p.data.zero_()
-                p.data[ids % local >= active] = -100.0
+                # active set split over the two die halves of each rank: under die-local placement the deployed
+                # EP rank streams E/emulate_ep/2 experts from each die (D-MOE 2026-11-18)
+                li = ids % local
+                h = active // 2
+                keep = (li < h) | ((li >= local // 2) & (li < local // 2 + active - h))
+                p.data[~keep] = -100.0
             n += 1
         if n == 0:  # the drafter (no MoE) loads through the same loader
             log(f"expert emulation: {type(model).__name__} has no MoE router bias (drafter): unchanged")
@@ -291,7 +311,10 @@ def patch_expert_emulation(emulate_ep):
     def balanced_topk_ids(num_tokens, num_experts, top_k, ep_size, rng):
         active = num_experts // emulate_ep
         ids = orig_ids(num_tokens, active * ep_size, top_k, ep_size, rng)
-        return (ids // active) * (num_experts // ep_size) + ids % active
+        la = ids % active
+        h = active // 2
+        local = num_experts // ep_size
+        return (ids // active) * local + (la < h) * la + (la >= h) * (local // 2 + la - h)
 
     R.balanced_topk_ids = balanced_topk_ids
     orig_init = R.RoutingFixture.__init__

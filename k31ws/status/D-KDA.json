@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent (resumed)",
  "state": "implementing",
- "updated": "2026-11-18T17:03-08:00",
+ "updated": "2026-11-18T18:05-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
@@ -92,9 +92,24 @@
    "t": "17:00",
    "what": "run11 attribution at n96 (us/layer): full 96.4, no verify 71.3, no fold 58.0, neither 39.3; register split 200/104 .. 232/40 changes nothing; ptxas 168 regs + 180 B spills",
    "result": "(1) the single prep warpgroup (starved of issue by the scan warps) bounds at 39 us alone; (2) fold costs +32 us for ~9 FP32 ops per element: spills under the 168-register compile budget + data-dependent branches around the state. Redesign v4: no prep warpgroup and no setmaxnreg (256 threads, 255-register budget): each scan group preps its own next item (latency hidden by the other group FP passes), branch-free fold (masked tokens are exact zeros / identity), item table in smem"
+  },
+  {
+   "t": "17:15",
+   "what": "run12-14 v4 (groups prep their own items, 256 threads, 255-register budget)",
+   "result": "bitwise n33 OK; ptxas 255 regs + 520 B spills; n96 156 us; per-section spills: fold-only build spills 296 B, verify-only 0"
+  },
+  {
+   "t": "17:35",
+   "what": "run15/16 attribution (n96 us/layer, 24 layers): fold chunk fence removes all spills (154 -> 100.9); scalar FFMA pairs no better than f32x2; prep+page+epilogue alone 50.5, + verify 89.1, + fold 100.9. Cycle trace per group item: prep ~7.5K, LDS+release+store ~5.4K, verify ~8-13K, epilogue ~1.5K; skip-all variant spends 24 us in the item loops but 72 us per layer",
+   "result": "next: globaltimer per-CTA timeline (suspect CTA waves / prologue), FP passes without shuffles"
+  },
+  {
+   "t": "17:55",
+   "what": "run17/18 isolation at n96 (us/layer): page reads alone 15.3-15.8 (9.6 TB/s), + checkpoint STG from registers 36.2 (+20.5), + prep 50.5, + verify FP passes w/o shuffles ~+12, + row-reduction/broadcast shuffles (8 lanes/row: 22 SHFL per token) +24, + fold +12 -> 100.9; SM clock 2.4 GHz (not throttled)",
+   "result": "dominant costs: register-path checkpoint stores and cross-lane reductions. v5: pair layout (2 rows x 64 keys per thread, register chunk j = key chunk j ^ (c%8): conflict-free smem, 1 SHFL per dot), checkpoint written back into its smem slot + one async bulk store (evict-first), CTA 3-slot page ring, F_B fragments from L2 (smem for the ring). Reduction order changes vs KdaWS: flow test now checks checkpoints/corrections at FP32 tolerance, outputs at BF16 tolerance, conv/keys/gates bitwise"
   }
  ],
- "next": "run12: v4 bitwise test + microbench n8..128 + attribution + trace",
+ "next": "run19: v5 test + microbench + attribution",
  "blockers": "No nvdisasm / ncu / nsys in the K3.1 image (ptxas, cuobjdump only): SASS and stall reasons of the KdaFlow scan cannot be inspected; asked for in this status. Pool queue waits 10-60 min per 1-GPU job.",
  "branch": "wzhao/k31ws-d-kda @ 3de6741dcc",
  "evidence": [

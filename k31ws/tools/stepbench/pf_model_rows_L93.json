@@ -4,10 +4,21 @@
    "ckpt": "mxfp4_release",
    "F": 16384,
    "L": 78356.2831992676,
+   "tok_s_gpu_ach_93": 19867.323095749805,
    "t_sol_ms": 776.7809857116437,
    "t_ach_ms": 991.7679255172661,
    "t_sol_ms_93": 667.541958105816,
    "t_ach_ms_93": 824.6707380273597,
+   "t_sol_ms_fused": 667.5419581058153,
+   "t_ach_ms_fused": 824.6692141584724,
+   "megamoe": {
+    "t_sol_us": 138703.14440495445,
+    "t_ach_us": 235065.914723619,
+    "t_ach_us_93": 235065.914723619,
+    "additive_sol_us": 247942.17201078282,
+    "additive_ach_us": 402164.6260824128,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -495,10 +506,21 @@
    "ckpt": "mxfp4_release",
    "F": 8192,
    "L": 78356.2831992676,
+   "tok_s_gpu_ach_93": 19581.610154776517,
    "t_sol_ms": 394.60327573638955,
    "t_ach_ms": 502.20814937030127,
    "t_sol_ms_93": 339.720641933475,
    "t_ach_ms_93": 418.3517052606491,
+   "t_sol_ms_fused": 339.72064193347535,
+   "t_ach_ms_fused": 418.35016435757103,
+   "megamoe": {
+    "t_sol_us": 69483.13220247724,
+    "t_ach_us": 117687.27202847616,
+    "t_ach_us_93": 117687.27202847616,
+    "additive_sol_us": 124365.76600539143,
+    "additive_ach_us": 201545.25704120638,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -986,10 +1008,21 @@
    "ckpt": "nvfp4_modelopt",
    "F": 16384,
    "L": 78356.2831992676,
+   "tok_s_gpu_ach_93": 30748.74530329317,
    "t_sol_ms": 438.7655893747613,
    "t_ach_ms": 628.2088892532992,
    "t_sol_ms_93": 376.04228351975394,
    "t_ach_ms_93": 532.8347494635915,
+   "t_sol_ms_fused": 376.0422835197535,
+   "t_ach_ms_fused": 532.8332255947035,
+   "megamoe": {
+    "t_sol_us": 116754.81200948499,
+    "t_ach_us": 197927.26912220893,
+    "t_ach_us_93": 197927.26912220893,
+    "additive_sol_us": 179478.11786449281,
+    "additive_ach_us": 293302.9327808046,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -1477,10 +1510,21 @@
    "ckpt": "nvfp4_modelopt",
    "F": 8192,
    "L": 78356.2831992676,
+   "tok_s_gpu_ach_93": 30069.700150428733,
    "t_sol_ms": 225.59557756794842,
    "t_ach_ms": 320.42863123831773,
    "t_sol_ms_93": 193.9708046404445,
    "t_ach_ms_93": 272.43371097876405,
+   "t_sol_ms_fused": 193.97080464044453,
+   "t_ach_ms_fused": 272.4321700756866,
+   "megamoe": {
+    "t_sol_us": 58508.9660047425,
+    "t_ach_us": 99117.94922777113,
+    "t_ach_us_93": 99117.94922777113,
+    "additive_sol_us": 90133.7389322464,
+    "additive_ach_us": 147114.41039040228,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",

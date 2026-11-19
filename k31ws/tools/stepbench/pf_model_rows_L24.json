@@ -9,6 +9,16 @@
    "t_ach_ms": 257.32977534706936,
    "t_sol_ms_93": 667.541958105816,
    "t_ach_ms_93": 824.6707380273597,
+   "t_sol_ms_fused": 175.3436210698176,
+   "t_ach_ms_fused": 215.55509750737093,
+   "megamoe": {
+    "t_sol_us": 34675.78610123861,
+    "t_ach_us": 58766.47868090475,
+    "t_ach_us_93": 235065.914723619,
+    "additive_sol_us": 61985.543002695704,
+    "additive_ach_us": 100541.1565206032,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -501,6 +511,16 @@
    "t_ach_ms": 130.3736633451804,
    "t_sol_ms_93": 339.720641933475,
    "t_ach_ms_93": 418.3517052606491,
+   "t_sol_ms_fused": 89.26283056537429,
+   "t_ach_ms_fused": 109.40916709199784,
+   "megamoe": {
+    "t_sol_us": 17370.78305061931,
+    "t_ach_us": 29421.81800711904,
+    "t_ach_us_93": 117687.27202847616,
+    "additive_sol_us": 31091.441501347857,
+    "additive_ach_us": 50386.314260301595,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -993,6 +1013,16 @@
    "t_ach_ms": 164.46049793031352,
    "t_sol_ms_93": 376.04228351975394,
    "t_ach_ms_93": 532.8347494635915,
+   "t_sol_ms_fused": 100.37373817226856,
+   "t_ach_ms_fused": 140.61658201566462,
+   "megamoe": {
+    "t_sol_us": 29188.703002371247,
+    "t_ach_us": 49481.81728055223,
+    "t_ach_us_93": 197927.26912220893,
+    "additive_sol_us": 44869.529466123204,
+    "additive_ach_us": 73325.73319520114,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
@@ -1485,6 +1515,16 @@
    "t_ach_ms": 83.93902463680244,
    "t_sol_ms_93": 193.9708046404445,
    "t_ach_ms_93": 272.43371097876405,
+   "t_sol_ms_fused": 51.77788911659977,
+   "t_ach_ms_fused": 71.93990934614466,
+   "megamoe": {
+    "t_sol_us": 14627.241501185625,
+    "t_ach_us": 24779.48730694278,
+    "t_ach_us_93": 99117.94922777113,
+    "additive_sol_us": 22533.4347330616,
+    "additive_ach_us": 36778.60259760057,
+    "note": "fused MegaMoE layer (perf-model cost.megamoe_time) x MoE layers of this view"
+   },
    "ops": {
     "G.embed": {
      "fam": "embed",
