@@ -206,6 +206,20 @@ class DcpValue:
         if self.projected:
             # Rows each projecting step stages and pushes (16-row MMA blocks).
             self.prows = min(PROJ_ROWS, tiles * 16)
+            # The projection (legacy BF16 MMA, ~1/4 of the tcgen05 rate) is the bound
+            # above a few dozen rows: split each gathered head's rows over ``split``
+            # CTAs ((DCP * H) x split <= SMs), which then merge as well.
+            self.split = 1
+            if not self.preprojected:
+                steps = -(-batch // self.prows)
+                self.split = max(1, min(sms // (size * heads), steps))
+            if self.split > 1:
+                per = -(-steps // self.split)
+                self.part = per * self.prows
+                self.split = -(-batch // self.part)
+                self.grid = (heads, size * self.split, 1)
+                assert heads * size * self.split <= sms, (self.grid, sms)
+                return
             merge = min(tiles, max(1, (sms - size * heads) // heads))
             self.grid = (heads, size + merge, 1)
             # One CTA per SM at most (the progress argument above).
@@ -306,7 +320,28 @@ class DcpValue:
         group, quarter = lane // 4, lane % 4
         threads: cutlass.Constexpr = H * self.grid[1] * 512
         me = (y * H + head) * 512 + tid
-        if y < D:
+        if cutlass.const_expr(self.split > 1):
+            # CTA (head, y): rows part(y) of gathered head (y % DCP) H + head, then
+            # merge tiles y, y + grid[1], .. of head ``head`` (all CTAs project
+            # first and never wait before that: see the class docstring).
+            gh = (y % D) * H + head
+            t_lo = (y // D) * self.part
+            t_hi = cutlass.min(t_lo + self.part, self.batch)
+            v = 32 * (warp // 4) + 8 * (warp % 4) + group
+            wb = [
+                load_words(at(w_uv, gh, 32 * c + 8 * quarter, v), count=4)
+                for c in range(16)
+            ]
+            cute.arch.griddepcontrol_wait()
+            ahead = self.load_tile(args, gh, t_lo, tid, t_hi)
+            for t0 in range(t_lo, t_hi, R):
+                ahead = self.project(args, latent, values, wb, gh, t0, tid, ahead,
+                                     t_hi)
+            self.rearm(mailbox, me, threads)
+            cute.arch.griddepcontrol_launch_dependents()
+            for t in range(y, self.tiles, self.grid[1]):
+                self.merge_projected(args, scales, tid, t)
+        elif y < D:
             gh = y * H + head
             if cutlass.const_expr(self.preprojected):
                 cute.arch.griddepcontrol_wait()
@@ -369,24 +404,26 @@ class DcpValue:
                         store_relaxed(address, (float_bits(lse),))
 
     @cute.jit
-    def load_tile(self, args, gh, t0, tid):
+    def load_tile(self, args, gh, t0, tid, end=None):
         """This thread's 16 B chunks of the BF16 latent rows t0.. t0 + prows - 1 of
         gathered head ``gh`` (chunk tid + 512 j: row // 64, 8 (chunk % 64)); zeros
         beyond the batch), led by the LSEs of the rows it pushes ((tid + 512 j)
         // 16; sent_lse, EMPTY_LSE beyond the batch)."""
         rows, rows_lse, lens = args[0:3]
         R = self.prows
+        if cutlass.const_expr(end is None):
+            end = self.batch
         chunks = []
         for j in cutlass.range_constexpr((16 * R + 511) // 512):  # pushed rows
             lse = Float32(EMPTY_LSE)
             row = (tid + 512 * j) // 16
-            if (row < R) & (t0 + row < self.batch):
+            if (row < R) & (t0 + row < end):
                 lse = self.sent_lse(rows_lse, lens, t0 + row, gh)
             chunks.append(lse)
         for j in cutlass.range_constexpr(R // 8):
             r, k = (tid + 512 * j) // 64, (tid + 512 * j) % 64
             words = (Uint32(0),) * 4
-            if t0 + r < self.batch:
+            if t0 + r < end:
                 words = load_words(
                     at(rows, t0 + r, 0, gh, 8 * k), count=4, mutable=True
                 )
@@ -394,7 +431,7 @@ class DcpValue:
         return tuple(chunks)
 
     @cute.jit
-    def project(self, args, latent, values, wb, gh, t0, tid, tile):
+    def project(self, args, latent, values, wb, gh, t0, tid, tile, end=None):
         """Rows t0.. t0 + prows - 1 of gathered head ``gh`` (``tile``: this
         thread's latent chunks and LSE of them, load_tile): stage the BF16 latents,
         issue the next step's loads, W_UV (BF16 MMA, FP32 accumulation, rounded to
@@ -404,6 +441,8 @@ class DcpValue:
         box, _, peers, lpeers = args[3:7]
         parity, rank = args[12], args[13]
         H, D, B, R = self.heads, self.size, self.batch, self.prows
+        if cutlass.const_expr(end is not None):
+            B = end
         cap = box.shape[1]
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
@@ -413,7 +452,7 @@ class DcpValue:
             r, k = (tid + 512 * j) // 64, (tid + 512 * j) % 64
             store_shared_words(latent.iterator + r * 544 + 8 * k, tile[pushes + j])
         cute.arch.sync_threads()
-        ahead = self.load_tile(args, gh, t0 + R, tid)
+        ahead = self.load_tile(args, gh, t0 + R, tid, end)
         col = 32 * (warp // 4) + 8 * (warp % 4) + 2 * quarter
         for g in cutlass.range_constexpr(R // 16):
             parts = zeros((2, 4), Float32)  # two accumulation chains
