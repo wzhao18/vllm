@@ -150,6 +150,16 @@ def _bar(base, i):
     return base + Uint32(OFF_BAR + 8 * i)
 
 
+@asm()
+def clock_read():
+    return "{ .reg .b32 c; mov.u32 c, %clock; }", "~{memory}", ()
+
+
+@asm()
+def compiler_fence():
+    return "", "~{memory}", ()
+
+
 @asm(Uint32, pure=False)
 def bar_red_or(bid, n, pred):
     """bar.red.or over the threads of a named barrier: 1 if any thread passed pred != 0."""
@@ -174,9 +184,14 @@ class SparseMlaPrefillH6:
         # signalled without gathers: stale data), no_math (softmax warps skip all math),
         # no_mma (MMA warps only commit), sstamp (CTA 0 shared-memory clock stamps)
         # pad: 1 KiB of extra dynamic shared memory (no stamps)
-        knobs = tuple(knobs) + (0,) * (6 - len(knobs))
+        # ssmask: roles whose sstamp sites are compiled (1 softmax, 2 QK, 4 PV, 8 gather)
+        # pin: loader code-layout experiment (1: clock read only at the two gather stamp
+        # sites, 2: the guarded stamp store to a scratch word)
+        knobs = tuple(knobs) + (0,) * (8 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
-         self.pad) = knobs[:6]
+         self.pad, self.ssmask, self.pin) = knobs[:8]
+        if self.sstamp and not self.ssmask:
+            self.ssmask = 15
         self.smem = SMEM_BYTES + (1024 if self.sstamp or self.pad else 0)
 
     @cute.jit
@@ -272,12 +287,20 @@ class SparseMlaPrefillH6:
             tmem_free_exclusive(taddr)
 
     @cute.jit
-    def ss(self, base, cta, lane, u, slot):
+    def ss(self, base, cta, lane, u, slot, role: cutlass.Constexpr = 15):
         """sstamp: CTA 0, subtiles 16-23, [8][32] u32 clock slots (lane 0 of the caller)."""
-        if cutlass.const_expr(self.sstamp):
+        if cutlass.const_expr(self.sstamp and (self.ssmask & role)):
             if cta == 0 and lane == 0 and u >= 16 and u < 24:
                 sstamp_clock(base + Uint32(SMEM_BYTES)
                              + Uint32(((u - 16) * 32 + Int32(slot)) * 4))
+
+    @cute.jit
+    def lpin(self, base, cta, lane, g):
+        if cutlass.const_expr(self.pin == 1):
+            clock_read()
+        if cutlass.const_expr(self.pin == 2):
+            if cta == 0 and lane == 0 and g >= 16 and g < 24:
+                sstamp_clock(base + Uint32(OFF_FLAG + 12))
 
     # ------------------------------------------------------------------ gather
     @cute.jit
@@ -328,10 +351,15 @@ class SparseMlaPrefillH6:
                     r = (c0, c1, c2, c3)
                     if t + 1 < subs:
                         c0, c1, c2, c3 = ld_global_v4_s32(srow + Int64((t + 1) * 256))
+                    # keep the prefetch here (issued before the stage-free wait): without
+                    # a barrier the compiler sinks it to its use, exposing an L2 round trip
+                    # per stage (2.0 vs 3.6 ms, P-MLA run66)
+                    compiler_fence()
                     if lane == 0:
                         mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
                         if pw == 0:
-                            self.ss(base, cta, lane, g, 22)
+                            self.ss(base, cta, lane, g, 22, 8)
+                            self.lpin(base, cta, lane, g)
                             if cutlass.const_expr(self.no_gather):
                                 mbar_arrive(full)
                             else:
@@ -357,7 +385,8 @@ class SparseMlaPrefillH6:
                             gather4(st + Uint32(4 * 8192) + Uint32(q) * Uint32(256), tm_kr,
                                     full, D_NOPE, r0, r1, r2, r3)
                     if pw == 0:
-                        self.ss(base, cta, lane, g, 23)
+                        self.ss(base, cta, lane, g, 23, 8)
+                        self.lpin(base, cta, lane, g)
                     g = g + 1
 
     # ------------------------------------------------------------------ MMA
@@ -382,7 +411,7 @@ class SparseMlaPrefillH6:
     def qk(self, base, lane, taddr, u, qi, last, cta):
         s = u % NS
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
-        self.ss(base, cta, lane, u, 16)
+        self.ss(base, cta, lane, u, 16, 2)
         mbar_wait(_bar(base, B_KVFULL + s), Uint32((u // NS) & 1))
         tc_fence_after()
         sc = taddr + Uint32(C_S) + Uint32(64) * Uint32(u % 2)
@@ -407,7 +436,7 @@ class SparseMlaPrefillH6:
             bd = (bd0 + Uint64(4 * 512)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
             if cutlass.const_expr(not self.no_mma):
                 tc_mma(sc, ad, bd, Uint32(IDESC_QK), Uint32(1))
-            self.ss(base, cta, lane, u, 17)
+            self.ss(base, cta, lane, u, 17, 2)
             tc_commit(_bar(base, B_SFULL + u % 2))
             if last:
                 tc_commit(_bar(base, B_QREMPTY + qi % 2))
@@ -426,7 +455,7 @@ class SparseMlaPrefillH6:
                 s = u % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 mbar_wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
-                self.ss(base, cta, lane, u, 18)
+                self.ss(base, cta, lane, u, 18, 4)
                 tc_fence_after()
                 pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
                 bd = Uint64(SDESC_SW64) | Uint64(pbuf >> Uint32(4))
@@ -443,7 +472,7 @@ class SparseMlaPrefillH6:
                         if cutlass.const_expr(not self.no_mma):
                             tc_mma_cb(taddr + Uint32(C_O + 96 * b), ad0 + Uint64(b * 512), bd,
                                       Uint32(IDESC_PV), acc, op)
-                    self.ss(base, cta, lane, u, 19)
+                    self.ss(base, cta, lane, u, 19, 4)
                     tc_commit(_bar(base, B_KVEMPTY + s))
                     tc_commit(_bar(base, B_PEMPTY + u % NP))
                     if i == subs - 1:
@@ -519,9 +548,9 @@ class SparseMlaPrefillH6:
     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
             total, mp_last, lw, cta, masked: cutlass.Constexpr):
         """Subtile u (subtile i of its token) on WG u % 2. Returns (m, l) of this WG."""
-        self.ss(base, cta, lane, u, 8 * wg + 0)
+        self.ss(base, cta, lane, u, 8 * wg + 0, 1)
         mbar_wait(_bar(base, B_SFULL + u % 2), Uint32((u // 2) & 1))
-        self.ss(base, cta, lane, u, 8 * wg + 1)
+        self.ss(base, cta, lane, u, 8 * wg + 1, 1)
         tc_fence_after()
         sa = tmem_ld(lane_addr + Uint32(C_S) + Uint32(64) * Uint32(u % 2), 64)
         for k in cutlass.range_constexpr(64):
@@ -530,7 +559,7 @@ class SparseMlaPrefillH6:
         cute.arch.sync_warp()
         if lane == 0:
             mbar_arrive(_bar(base, B_SFREE + u % 2))
-        self.ss(base, cta, lane, u, 8 * wg + 2)
+        self.ss(base, cta, lane, u, 8 * wg + 2, 1)
         mbx = base + Uint32(OFF_MBOX)
         grow = Int32(0)
         alpha = Float32(1.0)
@@ -560,10 +589,10 @@ class SparseMlaPrefillH6:
             if mp != mp_last:
                 lw = lw * ex2(mp_last - mp)
                 mp_last = mp
-        self.ss(base, cta, lane, u, 8 * wg + 3)
+        self.ss(base, cta, lane, u, 8 * wg + 3, 1)
         if u >= NP:
             mbar_wait(_bar(base, B_PEMPTY + u % NP), Uint32((u // NP - 1) & 1))
-        self.ss(base, cta, lane, u, 8 * wg + 4)
+        self.ss(base, cta, lane, u, 8 * wg + 4, 1)
         if real_m:
             pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
             a0, a1 = Float32(0.0), Float32(0.0)
@@ -590,7 +619,7 @@ class SparseMlaPrefillH6:
             lw = lw + (a0 + a1)
             st_shared_f32(base + Uint32(OFF_AL) + Uint32(u % NP) * Uint32(H * 4)
                           + Uint32(h * 4), alpha)
-        self.ss(base, cta, lane, u, 8 * wg + 5)
+        self.ss(base, cta, lane, u, 8 * wg + 5, 1)
         # any head of this subtile grew: rescale O^T after PV(u - 1), before PV(u)
         if bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow)) != Uint32(0):
             mbar_wait(_bar(base, B_PEMPTY + (u - 1) % NP), Uint32(((u - 1) // NP) & 1))
@@ -608,7 +637,7 @@ class SparseMlaPrefillH6:
             tc_fence_before()
         fence_async_smem()
         cute.arch.sync_warp()
-        self.ss(base, cta, lane, u, 8 * wg + 6)
+        self.ss(base, cta, lane, u, 8 * wg + 6, 1)
         if lane == 0:
             mbar_arrive(_bar(base, B_OREADY + u % NP))
         return mp_last, lw
