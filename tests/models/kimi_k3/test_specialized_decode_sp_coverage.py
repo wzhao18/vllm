@@ -146,7 +146,7 @@ class Fakes:
         class KdaCore(Provider):
             family = "kda"
 
-            def __init__(self, attention, rows, *, records, ctx):
+            def __init__(self, attention, rows, *, records, ctx, mx_out=False):
                 if "kda" in fakes.raises:
                     raise fakes.raises["kda"]
                 super().__init__(rows, fakes.gaps.get("kda", ()))
