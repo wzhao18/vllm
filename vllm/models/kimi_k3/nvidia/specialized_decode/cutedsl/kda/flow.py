@@ -352,6 +352,14 @@ class KdaFlow(KdaWS):
     # ----------------------------------------------------------------- kernel
     @cute.kernel
     def kernel(self, args):
+        if cutlass.const_expr("noop" not in self.skip):
+            self.body(args)
+
+    @cute.jit
+    def body(self, args):
+        k0 = Int64(0)
+        if cutlass.const_expr(self.trace):
+            k0 = clock64()
         conv_state, output = args[3], args[10]
         f_a, beta, f_b = args[4], args[5], args[16]
         T: cutlass.Constexpr = self.tokens
@@ -415,11 +423,19 @@ class KdaFlow(KdaWS):
             cute.arch.mbarrier_init(fb_full, 1)
             cute.arch.mbarrier_init(fa_full, 1)
             cute.arch.mbarrier_init_fence()
-        # The page sources (the host's slot table: no predecessor output).
+        # The item table: host-staged step metadata (slot table, accepted counts,
+        # record rows, pending counts), no predecessor output.
         if tid < count:
-            head, _, slot, _, _ = self.item_slots(args, first + tid)
+            head, request, slot, conv_slot, conv_offset, pending, rec = self.item_info(
+                args, first + tid
+            )
             table[tid, SLOT] = slot
             table[tid, HEAD] = head
+            table[tid, REQUEST] = request
+            table[tid, CONV_SLOT] = conv_slot
+            table[tid, CONV_OFFSET] = conv_offset
+            table[tid, PENDING] = pending
+            table[tid, RECORD] = rec
         cute.arch.sync_warp()
         cute.arch.barrier()
         h0 = first // requests
@@ -442,22 +458,19 @@ class KdaFlow(KdaWS):
             self.head_constants(hcs[hslot, None, None], args, h0 + hslot, tid % K)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
-        if tid < count:
-            _, request, _, conv_slot, conv_offset, pending, rec = self.item_info(
-                args, first + tid
-            )
-            table[tid, REQUEST] = request
-            table[tid, CONV_SLOT] = conv_slot
-            table[tid, CONV_OFFSET] = conv_offset
-            table[tid, PENDING] = pending
-            table[tid, RECORD] = rec
-            head_t = table[tid, HEAD]
-            for t in cutlass.range_constexpr(T):
-                betas[tid, t] = triton_sigmoid(Float32(beta[request * T + t, head_t]))
         if tid == 0:
             cute.arch.mbarrier_arrive_and_expect_tx(fa_full, count * T * K * 2)
         cute.arch.sync_warp()
-        cute.arch.barrier()  # the table; fa_full's byte count
+        cute.arch.barrier()  # fa_full's byte count
+        if tid < count * T:  # F_A rows first: the gate projection waits on them
+            item, t = tid // T, tid % T
+            row = table[item, REQUEST] * T + t
+            copy_g2s(at(fas, item, t, 0), at(f_a, row, 0), K * 2, fa_full)
+        cute.arch.sync_warp()
+        if tid < count:
+            request, head_t = table[tid, REQUEST], table[tid, HEAD]
+            for t in cutlass.range_constexpr(T):
+                betas[tid, t] = triton_sigmoid(Float32(beta[request * T + t, head_t]))
         g = tid // GROUP_THREADS
         c = tid % GROUP_THREADS
         buffers = (
@@ -468,14 +481,10 @@ class KdaFlow(KdaWS):
             if g < count:
                 self.stage_item(args, table, g, buffers, stage_full + g)
         cute.arch.sync_warp()
-        if tid < count * T:
-            item, t = tid // T, tid % T
-            row = table[item, REQUEST] * T + t
-            copy_g2s(at(fas, item, t, 0), at(f_a, row, 0), K * 2, fa_full)
-        cute.arch.sync_warp()
         self.bwait(fb_full, 0, "fb_full")
         self.bwait(fa_full, 0, "fa_full")
-        self.gate_projection(tid, count, h0, table, fbs, fas, raw)
+        if cutlass.const_expr("gate" not in self.skip):
+            self.gate_projection(tid, count, h0, table, fbs, fas, raw)
         cute.arch.sync_warp()
         cute.arch.barrier()  # raw gates; the last page slot and the blocks are free
         if tid == 0:
@@ -485,9 +494,10 @@ class KdaFlow(KdaWS):
         ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
         outs = (kgo[g, None, None], uo[g, None, None], oo[g, None, None])
         sums_g = (sums[g, None, None], out_sums[g, None, None])
-        self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
-                         buffers, ops, outs, sums_g, state_full,
-                         stage_full + g)  # fmt: skip
+        if cutlass.const_expr("loop" not in self.skip):
+            self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
+                             buffers, ops, outs, sums_g, state_full,
+                             stage_full + g, k0)  # fmt: skip
 
     @cute.jit
     def gate_projection(self, tid, count, h0, table, fbs, fas, raw):
@@ -553,7 +563,7 @@ class KdaFlow(KdaWS):
     # ------------------------------------------------------------- group loop
     @cute.jit
     def group_items(self, args, g, c, count, h0, pages, table, betas, raw, hcs,
-                    buffers, ops, outs, sums_g, state_full, stage_full):  # fmt: skip
+                    buffers, ops, outs, sums_g, state_full, stage_full, k0):  # fmt: skip
         xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
         kgo, uo, oo = outs
         state, output = args[9], args[10]
@@ -671,7 +681,7 @@ class KdaFlow(KdaWS):
             if c == 0:
                 cta, _, _ = cute.arch.block_idx()
                 if cta % 53 == 0:
-                    cute.printf("TRACE cta {} g {} items {} total {} prep {} wstate {} scan {} solve {} epi {}", cta, g, mine, clock64() - t0, tr[1], tr[2], tr[3], tr[4], tr[5])  # noqa: E501
+                    cute.printf("TRACE cta {} g {} items {} prologue {} total {} prep {} wstate {} scan {} solve {} epi {}", cta, g, mine, t0 - k0, clock64() - t0, tr[1], tr[2], tr[3], tr[4], tr[5])  # noqa: E501
 
     @cute.jit
     def release_slot(self, args, c, j, count, pages, table, state_full, stored):
