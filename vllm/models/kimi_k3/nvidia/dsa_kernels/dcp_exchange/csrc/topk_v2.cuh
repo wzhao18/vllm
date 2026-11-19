@@ -402,11 +402,20 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
     if constexpr (kFast) {
       // groups outside the full ones: the partial head / tail key by key, the rest NaN
+      // (one load_group instance each: the hot code stays small)
       if (regp) {
 #pragma unroll
-        for (int j = 0; j < kRg; ++j) {
-          const int g = gw0 + 32 * j;
-          if (K31_RARE(g < g_lo || g >= g_hi)) rg[j] = load_group(g);
+        for (int j = 0; j < kRg; ++j)
+          if (gw0 + 32 * j >= g_hi) rg[j] = make_uint4(~0u, ~0u, ~0u, ~0u);
+        if (sh > 0 && tid == 0) rg[0] = load_group(0);  // group 0: tid 0, vector 0
+        if (g_hi < ng) {
+          const int jt = (g_hi >> 5) % kRg;  // its owner: warp g_hi / (32 kNR), lane g_hi % 32
+          if (tid == ((g_hi / (32 * kRg)) << 5) + (g_hi & 31)) {
+            const uint4 v = load_group(g_hi);
+#pragma unroll
+            for (int j = 0; j < kRg; ++j)
+              if (j == jt) rg[j] = v;
+          }
         }
       }
       __syncthreads();  // histogram zeroed
@@ -509,6 +518,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
     int th = max(1, s_th);  // short / sparse sample: every valid key
+    // hot body: theta = key(+0) would admit -0 through the packed float compare; key(-0)
+    // admits both zeros (a lower bound only adds candidates)
+    if (kFast && th == 0x8000) th = 0x7FFF;
     V2DBG(1);
     // the SMEM path's candidate pass: every key >= thv with its position, in position
     // order; returns this thread's valid-key count
@@ -582,7 +594,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // scan (3 vectors per word, 10-bit fields), warp bases from one CTA scan
     auto cand_rf = [&](int thv) -> uint32_t {
       const uint32_t t2 = v2_th_bf16(thv);
-      const bool kx = thv == 0x8000;
       const int lane = tid & 31;
       constexpr int kPW = (kRg + 2) / 3;
       constexpr int kMW = (kRg + 3) / 4;
@@ -597,17 +608,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       for (int j = 0; j < kRg; ++j) {
         const uint4 r = rg[j];
         nv += v2_is_nan2(v2_max_nan(r)) ? v2_nvalid(r) : 8u;
-        uint32_t m8;
-        if (!kx) {
-          const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
-          const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);
-          m8 = (((lo & 0x08040201u) * 0x01010101u) >> 24) | ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
-        } else {
-          const Keys8 k8(r);
-          m8 = 0;
-#pragma unroll 1
-          for (int b = 0; b < 8; ++b) m8 |= (k8.key(b) >= (uint32_t)thv ? 1u : 0u) << b;
-        }
+        // (thv != key(+0) in the hot body: the packed float compare is exact)
+        const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
+        const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);
+        const uint32_t m8 =
+            (((lo & 0x08040201u) * 0x01010101u) >> 24) | ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
         mk[j / 4] |= m8 << (8 * (j % 4));
         pk[j / 3] += (uint32_t)__popc(m8) << (10 * (j % 3));
       }
