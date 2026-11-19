@@ -23,15 +23,17 @@
 //
 // The state chain per chunk is W -> x -> MMA2 -> U -> MMA3 -> S: Oq (qd half
 // of MMA1) and Mqk @ U (MMA4) run behind it, out(c) is read after the state
-// update while W(c + 1) runs. Tensor-memory reads go in 32-column batches
+// update while W(c + 1) runs.
+// out(c) is read under MMA2(c + 1), then Oq(c + 1) is issued. Tensor-memory reads go in 32-column batches
 // (the fp32 state row takes 128 of the math threads' 216 registers).
 //
 // Shared memory ~146 KB (two CTAs per SM in the sm_107 oversized mode).
 // Tensor memory (256 columns, two CTAs per SM):
 //   [0, 64)    W(c); x^T then U^T (bf16) in [0, 32)
 //   [64, 128)  Oq(c), += Mqk @ U
-//   [128, 256) U(c) in the first 64, then kr^T @ U (N = 128); the state update
-//              writes bf16 S^T for chunk c + 1 into [128, 192) behind its reads
+//   [128, 192) bf16 S^T (A of W and Oq), then the low half of kr^T @ U
+//   [192, 256) U(c), then the high half of kr^T @ U (N = 128); the state
+//              update writes bf16 S^T for chunk c + 1 behind its reads
 //
 // Warps: 0-3 math (thread 0 issues the MMAs), 4 loader kd|qd (3-slot
 // ring), 5 loader v + beta and INV, 6 loader kr^T + Mqk + g_total (g_total
@@ -70,7 +72,8 @@ constexpr int kSmemBytes = kOffBar + 8 * kNumBars + 16;
 
 constexpr uint32_t kColW = 0;    // W; x^T, U^T bf16 at [0, 32)
 constexpr uint32_t kColO = 64;   // Oq
-constexpr uint32_t kColP = 128;  // U, then kr^T @ U; bf16 S^T at [128, 192)
+constexpr uint32_t kColP = 128;  // kr^T @ U; bf16 S^T at [128, 192)
+constexpr uint32_t kColU = 192;  // U (S^T must survive MMA2 for Oq)
 
 constexpr int kDbgSlots = 16;
 
@@ -262,6 +265,29 @@ __global__ void __launch_bounds__(256, 2) k64_tc_kernel(
       for (int j = 0; j < 8; ++j) mma1o(0, j);
     }
 
+    // out(c) = bf16(Oq + Mqk @ U) -> shared [t][v] (chunk c's kd|qd slot)
+    // -> bulk stores by warp 7. Runs under MMA2(c + 1), before Oq(c + 1).
+    auto stage_out = [&](int c) {
+      wait_wd(d4_bar, uint32_t(c) & 1u, 9, c, dbg);
+      tc_fence_after();
+      uint16_t* os = reinterpret_cast<uint16_t*>(smem + kdq_off(c)) + v;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint32_t o[32];
+        K2TC_LD32(trow + kColO + 32 * h, o);
+        tc_wait_ld();
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          const uint32_t pk = pack_bf16(__uint_as_float(o[2 * i]), __uint_as_float(o[2 * i + 1]));
+          os[(32 * h + 2 * i) * kD] = uint16_t(pk & 0xFFFFu);
+          os[(32 * h + 2 * i + 1) * kD] = uint16_t(pk >> 16);
+        }
+      }
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      __syncwarp();
+      if (lane == 0) mbar_arrive(ring(out_full0, c));
+    };
+
     for (int c = 0; c < n_chunks; ++c) {
       const uint32_t cp = uint32_t(c) & 1u;
       const bool more = c + 1 < n_chunks;
@@ -306,12 +332,23 @@ __global__ void __launch_bounds__(256, 2) k64_tc_kernel(
         tc_fence_after();
 #pragma unroll
         for (int j = 0; j < 4; ++j)
-          mma_ts(tmem + kColP, tmem + kColW + 8 * j, sdesc(sbase + kOffInv + 2048 * j, 1024, 128),
+          mma_ts(tmem + kColU, tmem + kColW + 8 * j, sdesc(sbase + kOffInv + 2048 * j, 1024, 128),
                  kI64, j != 0);
         tc_commit(d2_bar);
         tc_commit(empty_inv);
       }
       stamp(c, 2);
+      if (c > 0) {
+        stage_out(c - 1);
+        tc_fence_before();
+        named_sync();
+        if (issuer) {
+          tc_fence_after();
+#pragma unroll
+          for (int j = 0; j < 8; ++j) mma1o(c, j);
+        }
+        stamp(c, 6);
+      }
 
       // ---- U = bf16(INV @ x) -> U^T at [0, 32); MMA3 (kr^T @ U, N = 128),
       // then MMA4 (Oq += Mqk @ U) behind it ----
@@ -321,7 +358,7 @@ __global__ void __launch_bounds__(256, 2) k64_tc_kernel(
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         uint32_t u[32], au[16];
-        K2TC_LD32(trow + kColP + 32 * h, u);
+        K2TC_LD32(trow + kColU + 32 * h, u);
         tc_wait_ld();
 #pragma unroll
         for (int i = 0; i < 16; ++i)
@@ -390,39 +427,8 @@ __global__ void __launch_bounds__(256, 2) k64_tc_kernel(
       }
       stamp(c, 5);
 
-      // ---- out(c) = bf16(Oq + Mqk @ U) -> shared [t][v] (chunk c's kd|qd
-      // buffer) -> bulk stores by warp 7; then Oq(c + 1) ----
-      wait_wd(d4_bar, cp, 9, c, dbg);
-      tc_fence_after();
-      {
-        uint16_t* os = reinterpret_cast<uint16_t*>(smem + kdq_off(c)) + v;
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          uint32_t o[32];
-          K2TC_LD32(trow + kColO + 32 * h, o);
-          tc_wait_ld();
-#pragma unroll
-          for (int i = 0; i < 16; ++i) {
-            const uint32_t pk = pack_bf16(__uint_as_float(o[2 * i]), __uint_as_float(o[2 * i + 1]));
-            os[(32 * h + 2 * i) * kD] = uint16_t(pk & 0xFFFFu);
-            os[(32 * h + 2 * i + 1) * kD] = uint16_t(pk >> 16);
-          }
-        }
-      }
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      __syncwarp();
-      if (lane == 0) mbar_arrive(ring(out_full0, c));
-      if (more) {
-        tc_fence_before();
-        named_sync();
-        if (issuer) {
-          tc_fence_after();
-#pragma unroll
-          for (int j = 0; j < 8; ++j) mma1o(c + 1, j);
-        }
-      }
-      stamp(c, 6);
     }
+    if (n_chunks > 0) stage_out(n_chunks - 1);
     {
       float4* dst = reinterpret_cast<float4*>(final_state + state_off);
 #pragma unroll

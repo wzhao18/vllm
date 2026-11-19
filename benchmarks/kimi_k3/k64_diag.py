@@ -276,7 +276,7 @@ def main():
             per = [(d[c + 1, 0] - d[c, 0]).item() for c in range(20, 60)]
             print(f"chunk period clk: median {sorted(per)[len(per) // 2]} min {min(per)} max {max(per)}")
             names = ["start", "W ready", "x->MMA2", "U ready", "MMA3/4 issued", "state done",
-                     "out staged + Oq(c+1)", "state half 0", "d3+gt ready", "S LD0 back", "S round0 done"]
+                     "out(c-1) staged + Oq(c)", "state half 0", "d3+gt ready", "S LD0 back", "S round0 done"]
             for c in (40, 41):
                 print(f"chunk {c}: " + ", ".join(
                     f"{names[i]} +{(d[c, i] - d[c, 0]).item()}" for i in (1, 2, 3, 4, 8, 9, 10, 7, 5, 6)))
