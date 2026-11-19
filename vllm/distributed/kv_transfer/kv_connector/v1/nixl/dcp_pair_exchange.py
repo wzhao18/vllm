@@ -200,6 +200,34 @@ def stage_units(
     ]
 
 
+def expand_sub_block_ids(
+    block_ids: Sequence[int],
+    sub_blocks: int,
+    num_tokens: int,
+    sub_block_tokens: int,
+) -> list[int]:
+    """A prefiller's block list as ``sub_blocks`` sub-blocks per block, flat
+    id ``sub_blocks * b + q``, ending at the sub-block of the last computed
+    token.
+
+    The list ends at the block holding token ``num_tokens - 1`` (P clips
+    lookahead blocks, and a sliding window keeps only its tail), so the
+    sub-blocks past that token are dropped from the end.
+
+    Args:
+        block_ids: P's blocks of one group.
+        sub_blocks: ``X``, P's per-rank block over D's.
+        num_tokens: Tokens P computed.
+        sub_block_tokens: Tokens per sub-block: D's per-rank block times P's
+            DCP size for a DCP-sharded group, else D's block.
+    """
+    num_blocks = cdiv(num_tokens, sub_block_tokens * sub_blocks)
+    block_ids = list(block_ids)[:num_blocks]
+    expanded = [sub_blocks * b + q for b in block_ids for q in range(sub_blocks)]
+    past_end = sub_blocks * num_blocks - cdiv(num_tokens, sub_block_tokens)
+    return expanded[: len(expanded) - past_end]
+
+
 def check_pair_coverage(
     num_tokens: int,
     remote_num_tokens: int | None,

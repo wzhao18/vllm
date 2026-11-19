@@ -12,12 +12,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
     NixlPairModeError,
     check_pair_coverage,
+    expand_sub_block_ids,
     pair_units,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     KVFingerprintReq,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_representative_spec_type,
+)
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -172,6 +177,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         )
                         for group in blocks.blocks
                     )
+                    if self._pair_mode and params.get("do_remote_prefill"):
+                        self._expand_sub_blocks(params)
                     if (
                         self._pair_mode
                         and params.get("do_remote_prefill")
@@ -207,6 +214,44 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
             params["_remote_blocks_processed"] = True
+
+    def _expand_sub_blocks(self, params: dict[str, Any]) -> None:
+        """DCP pair mode: view a prefiller's per-rank blocks, ``X`` times the
+        local ones (a packed hybrid block scales with the per-rank KDA state, so
+        a TP1 prefiller has 4x the tokens per block of a TP4 decoder), as ``X``
+        local-sized sub-blocks each, so the read map and the exchange plan
+        work at the local block. The worker reads sub-block ``q`` of block
+        ``b`` as flat id ``X b + q`` (``_sub_block_remote_meta``)."""
+        remote_block_size = params.get("block_size")
+        if (
+            params.get("remote_sub_blocks") is not None
+            or remote_block_size is None
+            or remote_block_size <= self.block_size
+            or remote_block_size % self.block_size
+        ):
+            return
+        remote_num_tokens = params.get("remote_num_tokens")
+        if remote_num_tokens is None:
+            # The tail cannot be trimmed: leave the ids unexpanded, so the
+            # worker fails the request on the sub-block skew.
+            return
+        sub_blocks = remote_block_size // self.block_size
+        remote_dcp_size = params.get("dcp_size") or 1
+        groups = self.kv_cache_config.transfer_groups
+        params["remote_block_ids"] = [
+            ids
+            if get_representative_spec_type(group.kv_cache_spec)
+            in (MambaSpec, CircularBufferSpec)
+            else expand_sub_block_ids(
+                ids,
+                sub_blocks,
+                remote_num_tokens,
+                self.block_size
+                * (remote_dcp_size if group.kv_cache_spec.dcp_sharded else 1),
+            )
+            for ids, group in zip(params["remote_block_ids"], groups, strict=True)
+        ]
+        params["remote_sub_blocks"] = sub_blocks
 
     def _plan_pair_exchange(
         self,
@@ -396,6 +441,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_port=self.side_channel_port,
             tp_size=self.transfer_tp_size,
             dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
+            # Per-rank tokens per block, for a pair-mode decoder with smaller
+            # blocks (_expand_sub_blocks).
+            block_size=self.block_size,
             pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
             remote_num_tokens=remote_num_tokens,
             remote_blocks_expiry_time=blocks_expiry_time,

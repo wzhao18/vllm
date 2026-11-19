@@ -1219,6 +1219,22 @@ class NixlBaseConnectorWorker:
         self._dram_src_handles_by_tp_ratio: dict[tuple[int, int], list[int | None]] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
+        # Sub-block peers (DCP pair mode, remote per-rank block = X x local):
+        # engine_id -> X. Their attention blocks are read as X sub-blocks each
+        # (see _sub_block_remote_meta); the scheduler expands the block ids.
+        self._remote_sub_blocks: dict[EngineId, int] = {}
+        # Head-sharded draft KV from a sub-block peer: one dlist per local draft
+        # head, engine_id -> remote rank -> [handle per head], plus the local
+        # dlists (one per head) and per-region desc offsets of both sides.
+        self._draft_head_dst_handles = defaultdict[EngineId, dict[int, list[int]]](
+            dict
+        )
+        self._draft_head_src_handles: list[int] = []
+        self._draft_head_region_offsets: list[int] = []
+        self._draft_head_dst_region_offsets: dict[EngineId, list[int]] = {}
+        # Sub-block peers: engine_id -> (per-region page lengths, block size)
+        # as advertised, before the sub-block view.
+        self._remote_sub_block_pages: dict[EngineId, tuple[list[int], int]] = {}
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -2990,10 +3006,29 @@ class NixlBaseConnectorWorker:
         block_strides = nixl_agent_meta.block_strides
         strided_descs: list[tuple[int, int, int, int, int]] = []
         use_layer_name_routing = bool(self._transfer_layer_region_indices)
+        sub_blocks = self._remote_sub_blocks.get(nixl_agent_meta.engine_id, 1)
+        ssm_regions = set(self._ssm_region_indices)
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             local_region = (
                 self._transfer_layer_region_indices[i] if use_layer_name_routing else i
             )
+            if sub_blocks > 1 and local_region not in ssm_regions:
+                # Sub-block q of remote block b is the q-th local-block-sized
+                # run of its page (flat id X b + q). A head-sharded draft's
+                # descs here are never read: its heads are not contiguous in a
+                # sub-block, so it is read through _draft_head_dlists.
+                strided_descs.extend(
+                    tuple(row)
+                    for row in self._block_strided_descs(
+                        base_addr,
+                        self.block_len_per_layer[local_region],
+                        block_strides[i],
+                        region_num_blocks[i] // sub_blocks,
+                        sub_blocks,
+                        device_id,
+                    ).tolist()
+                )
+                continue
             replicated = self._is_region_replicated(local_region)
             # Read our whole local region size from remote..
             local_block_len = self.block_len_per_layer[local_region]
@@ -3110,6 +3145,73 @@ class NixlBaseConnectorWorker:
             "NIXL_INIT_AGENT", blocks_data, mem_type=self.region_mem_types[0]
         )
         return handle, blocks_data
+
+    def _sub_block_remote_meta(
+        self, meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> int:
+        """View a DCP pair-mode peer's larger per-rank blocks as sub-blocks of
+        the local per-rank block; returns ``X`` (1: unchanged).
+
+        A packed Kimi K3 hybrid block scales with the per-rank KDA state page,
+        so a TP1 prefiller (DEP16) has X = 4 times the tokens per block of a
+        TP4/DCP4 decoder. Every attention page is token-major in 64-token
+        kernel pages, so sub-block q of remote block b is the contiguous q-th
+        1/X of each attention page: the remote then looks like a peer with the
+        local per-rank block and X times the blocks (flat id X b + q), and the
+        pair-mode read map and staged exchange apply unchanged. The scheduler
+        expands P's block ids the same way (``expand_sub_block_ids``). KDA
+        state regions are untouched: they pair by state, sliced by head.
+        """
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = meta.block_size * meta.physical_blocks_per_logical_kv_block
+        ratio = self.dcp_size // max(remote_dcp_size, 1)
+        if not (
+            self._TRANSFER_MODE == "pull"
+            and self._dcp_pair_exchange is True
+            and remote_block > local_block
+            and remote_block % local_block == 0
+            and self.dcp_size % remote_dcp_size == 0
+            and _is_pow2_ratio(ratio)
+            and self._physical_blocks_per_logical_kv_block == 1
+            and meta.physical_blocks_per_logical_kv_block == 1
+            and self.pcp_size == meta.pcp_size == 1
+            and self.vllm_config.parallel_config.cp_kv_cache_interleave_size == 1
+            and (remote_dcp_size == 1 or meta.cp_kv_cache_interleave_size == 1)
+            and not self._transfer_layer_region_indices
+            and not self.use_host_buffer
+            and not self._mixed_mem_types
+            and meta.region_names is not None
+            and meta.region_names == self.region_names
+            and len(meta.block_lens) == len(self.block_len_per_layer)
+        ):
+            return 1
+        sub_blocks = remote_block // local_block
+        ssm = set(self._ssm_region_indices)
+        attention = [i for i in range(len(meta.block_lens)) if i not in ssm]
+        if any(meta.block_lens[i] % sub_blocks for i in attention):
+            return 1
+        region_num_blocks = meta.region_num_blocks or [meta.num_blocks] * len(
+            meta.block_lens
+        )
+        meta.block_size //= sub_blocks
+        meta.block_lens = [
+            n // sub_blocks if i not in ssm else n
+            for i, n in enumerate(meta.block_lens)
+        ]
+        meta.region_num_blocks = [
+            n * sub_blocks if i not in ssm else n
+            for i, n in enumerate(region_num_blocks)
+        ]
+        logger.info_once(
+            "NIXL: reading remote %d-token blocks as %d sub-blocks of the local "
+            "%d-token block (DCP %d -> %d pair mode).",
+            remote_block,
+            sub_blocks,
+            local_block,
+            remote_dcp_size,
+            self.dcp_size,
+        )
+        return sub_blocks
 
     def _split_remote_blocks(self, meta: NixlAgentMetadata) -> None:
         """View remote blocks as gcd-sized kernel blocks when the local block
@@ -3275,6 +3377,16 @@ class NixlBaseConnectorWorker:
                 nixl_agent_meta.region_dcp_sharded = nixl_agent_meta.region_dcp_sharded[
                     start:end
                 ]
+        # Original per-region page lengths: draft head reads address P's pages.
+        remote_page_lens = list(nixl_agent_meta.block_lens)
+        remote_block_size = nixl_agent_meta.block_size
+        sub_blocks = self._sub_block_remote_meta(nixl_agent_meta, remote_dcp_size)
+        if sub_blocks > 1:
+            self._remote_sub_blocks[engine_id] = sub_blocks
+            self._remote_sub_block_pages[engine_id] = (
+                remote_page_lens,
+                remote_block_size,
+            )
         # The push WRITE path is not validated with split remote blocks.
         if self._has_mamba and self.use_mla and self._TRANSFER_MODE == "pull":
             self._split_remote_blocks(nixl_agent_meta)
@@ -3480,13 +3592,144 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "NIXL pull does not yet support a mixed-memory producer"
             )
+        remote_mem_type = remote_mem_types.pop()
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(
-                remote_agent_name, blocks_data, mem_type=remote_mem_types.pop()
+                remote_agent_name, blocks_data, mem_type=remote_mem_type
             )
         )
+        if engine_id in self._remote_sub_blocks and self._head_sharded_draft_regions:
+            self._register_draft_head_dlists(
+                nixl_agent_meta,
+                remote_agent_name,
+                remote_tp_rank,
+                remote_tp_size,
+                remote_mem_type,
+            )
 
         return remote_agent_name
+
+    def _draft_head_dlists(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]] | None:
+        """Per local draft head ``j``, the local and remote Nx5 descs of a
+        sub-block peer's head-sharded draft regions; None when
+        ``remote_tp_rank`` does not hold this rank's draft heads.
+
+        A draft page is ``[heads, tokens, bytes per token-head]``, so a local
+        head's tokens of one remote sub-block are a contiguous run: remote
+        block ``b`` of head ``h`` holds tokens ``[q T_D, (q + 1) T_D)`` at
+        ``(h T_P + q T_D) c``. Local block ``i`` of head ``j`` is the
+        ``j``-th ``T_D c`` run of its page. Desc ``k`` of region ``r`` sits
+        at the region's offset plus the block id (remote: ``X b + q``).
+        """
+        engine_id = nixl_agent_meta.engine_id
+        assert self.transfer_topo is not None
+        total_heads = self._head_sharded_draft_kv_heads
+        tp_size = self.transfer_topo.tp_size
+        assert total_heads is not None
+        if total_heads % tp_size or total_heads % remote_tp_size:
+            raise NotImplementedError(
+                "NIXL sub-block draft reads need the draft KV heads "
+                f"({total_heads}) divisible by both TP sizes (local {tp_size}, "
+                f"remote {remote_tp_size})"
+            )
+        local_heads = total_heads // tp_size
+        remote_heads = total_heads // remote_tp_size
+        first = self.tp_rank * local_heads - remote_tp_rank * remote_heads
+        if not 0 <= first <= remote_heads - local_heads:
+            return None
+        sub_blocks = self._remote_sub_blocks[engine_id]
+        page_lens, remote_block = self._remote_sub_block_pages[engine_id]
+        local_block = self.block_size
+        assert remote_block == sub_blocks * local_block
+        region_num_blocks = nixl_agent_meta.region_num_blocks
+        assert region_num_blocks is not None
+        local_bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        local: list[list[np.ndarray]] = [[] for _ in range(local_heads)]
+        remote: list[list[np.ndarray]] = [[] for _ in range(local_heads)]
+        for r in sorted(self._head_sharded_draft_regions):
+            chunk = self.block_len_per_layer[r] // local_heads
+            # Bytes per token-head: P's page over its heads and tokens.
+            token_head, rest = divmod(page_lens[r], remote_heads * remote_block)
+            if rest or chunk * local_heads != self.block_len_per_layer[r] or (
+                chunk != local_block * token_head
+            ):
+                raise NotImplementedError(
+                    f"NIXL sub-block draft reads: region {r} pages do not split "
+                    f"by head (local page {self.block_len_per_layer[r]} for "
+                    f"{local_heads} heads x {local_block} tokens, remote page "
+                    f"{page_lens[r]} for {remote_heads} heads x {remote_block})"
+                )
+            for j in range(local_heads):
+                local[j].append(
+                    self._pack_strided_descs(
+                        [
+                            (
+                                local_bases[r] + j * chunk,
+                                chunk,
+                                self.device_id,
+                                self.block_stride_per_layer[r],
+                                self.region_num_blocks[r],
+                            )
+                        ]
+                    )
+                )
+                remote[j].append(
+                    self._block_strided_descs(
+                        nixl_agent_meta.kv_caches_base_addr[r]
+                        + (first + j) * remote_block * token_head,
+                        chunk,
+                        nixl_agent_meta.block_strides[r],
+                        region_num_blocks[r] // sub_blocks,
+                        sub_blocks,
+                        nixl_agent_meta.device_id,
+                    )
+                )
+        return [np.concatenate(d) for d in local], [np.concatenate(d) for d in remote]
+
+    def _register_draft_head_dlists(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_agent_name: str,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        remote_mem_type: str,
+    ) -> None:
+        """Prepare the per-head draft dlists of a sub-block peer's rank (see
+        ``_draft_head_dlists``), and the local ones once."""
+        dlists = self._draft_head_dlists(
+            nixl_agent_meta, remote_tp_rank, remote_tp_size
+        )
+        if dlists is None:
+            return
+        local, remote = dlists
+        engine_id = nixl_agent_meta.engine_id
+        regions = sorted(self._head_sharded_draft_regions)
+        region_num_blocks = nixl_agent_meta.region_num_blocks
+        assert region_num_blocks is not None
+        if not self._draft_head_src_handles:
+            self._draft_head_region_offsets = np.cumsum(
+                [0] + [self.region_num_blocks[r] for r in regions[:-1]]
+            ).tolist()
+            self._draft_head_src_handles = [
+                self.nixl_wrapper.prep_xfer_dlist(
+                    "NIXL_INIT_AGENT", descs, mem_type=self.nixl_memory_type
+                )
+                for descs in local
+            ]
+        self._draft_head_dst_region_offsets[engine_id] = np.cumsum(
+            [0] + [region_num_blocks[r] for r in regions[:-1]]
+        ).tolist()
+        self._draft_head_dst_handles[engine_id][remote_tp_rank] = [
+            self.nixl_wrapper.prep_xfer_dlist(
+                remote_agent_name, descs, mem_type=remote_mem_type
+            )
+            for descs in remote
+        ]
 
     @staticmethod
     def _select_ucx_net_devices(spec: str | None, gpu: int | None = None) -> None:
@@ -3601,7 +3844,12 @@ class NixlBaseConnectorWorker:
         return (
             self._dcp_pair_exchange is True
             and self._TRANSFER_MODE == "pull"
-            and local_interleave == nixl_agent_meta.cp_kv_cache_interleave_size == 1
+            and local_interleave == 1
+            # A DCP-1 peer never shards by its interleave.
+            and (
+                remote_dcp_size == 1
+                or nixl_agent_meta.cp_kv_cache_interleave_size == 1
+            )
             and self.dcp_size % remote_dcp_size == 0
             and _is_pow2_ratio(self.dcp_size // remote_dcp_size)
             and local_block == remote_block
@@ -5666,6 +5914,12 @@ class NixlBaseConnectorWorker:
         # Notif-only engines (push-mode D side) have no descriptor state.
         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             self.nixl_wrapper.release_dlist_handle(handle)
+        for handles in self._draft_head_dst_handles.pop(engine_id, {}).values():
+            for handle in handles:
+                self.nixl_wrapper.release_dlist_handle(handle)
+        self._draft_head_dst_region_offsets.pop(engine_id, None)
+        self._remote_sub_blocks.pop(engine_id, None)
+        self._remote_sub_block_pages.pop(engine_id, None)
         # Pop under the handshake lock; NIXL teardown stays outside it.
         with self._handshake_lock:
             agents = self._remote_agents.pop(engine_id)

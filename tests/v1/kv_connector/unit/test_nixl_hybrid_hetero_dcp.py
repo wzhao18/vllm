@@ -250,18 +250,23 @@ def _kda_spec(tp: int, heads: int = 96, head_dim: int = 128, num_spec: int = 7):
     )
 
 
-@pytest.mark.parametrize("d_rank", range(16))
-def test_kda_state_slices_tp8_to_tp16(ds_conv_layout, d_rank):
+@pytest.mark.parametrize(
+    "p_tp,d_tp,d_rank",
+    [(8, 16, r) for r in range(16)] + [(1, 4, r) for r in range(4)],
+)
+def test_kda_state_slices_hetero_tp(ds_conv_layout, p_tp, d_tp, d_rank):
     """The decoder rank's conv sub-projections ([Q|K|V], DS layout) and recurrent
     heads, read as byte ranges from the prefiller rank owning its heads, equal
     the state the decoder rank itself would hold (Kimi K3: 96 heads x 128, conv
-    width 4, 7 speculative columns)."""
+    width 4, 7 speculative columns). TP8 -> TP16, and DEP16 (TP1) -> D3-32
+    (TP4)."""
     from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
         derive_mamba_conv_split,
     )
 
     heads, hd, rows = 96, 128, 10
-    p_rank, j = d_rank // 2, d_rank % 2
+    tp_ratio = d_tp // p_tp
+    p_rank, j = d_rank // tp_ratio, d_rank % tp_ratio
 
     def conv_ids(tp, rank):  # (proj, global channel, column) ids, DS layout
         n = heads * hd // tp
@@ -277,22 +282,22 @@ def test_kda_state_slices_tp8_to_tp16(ds_conv_layout, d_rank):
         n = heads // tp
         return np.arange(rank * n * hd * hd, (rank + 1) * n * hd * hd)
 
-    d_split = derive_mamba_conv_split(_kda_spec(16), local_tp=16)
-    p_split = derive_mamba_conv_split(_kda_spec(8), local_tp=8)
-    assert d_split.local_proj_dims == (768, 768, 768)
-    assert p_split.local_proj_dims == (1536, 1536, 1536)
+    d_split = derive_mamba_conv_split(_kda_spec(d_tp), local_tp=d_tp)
+    p_split = derive_mamba_conv_split(_kda_spec(p_tp), local_tp=p_tp)
+    assert d_split.local_proj_dims == (heads * hd // d_tp,) * 3
+    assert p_split.local_proj_dims == (heads * hd // p_tp,) * 3
 
     # One P page: conv state, then the recurrent state (element = 2 bytes).
-    p_page = np.concatenate([conv_ids(8, p_rank), ssm_ids(8, p_rank)])
+    p_page = np.concatenate([conv_ids(p_tp, p_rank), ssm_ids(p_tp, p_rank)])
     got = [
         p_page[off // 2 : (off + size) // 2]
-        for off, size in d_split.remote_conv_offsets(j, tp_ratio=2)
+        for off, size in d_split.remote_conv_offsets(j, tp_ratio=tp_ratio)
     ]
     conv_size_remote, ssm_read = p_split.ssm_sizes[0], d_split.ssm_sizes[1]
     start = (conv_size_remote + j * ssm_read) // 2
     got.append(p_page[start : start + ssm_read // 2])
-    assert np.array_equal(np.concatenate(got[:-1]), conv_ids(16, d_rank))
-    assert np.array_equal(got[-1], ssm_ids(16, d_rank))
+    assert np.array_equal(np.concatenate(got[:-1]), conv_ids(d_tp, d_rank))
+    assert np.array_equal(got[-1], ssm_ids(d_tp, d_rank))
 
 
 def _worker_stub(

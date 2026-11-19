@@ -384,6 +384,8 @@ def _mla_pull_worker(dcp_rank: int, block_size: int, num_d: int, num_p: int):
     w._recving_transfers = {}
     w._invalid_remote_engines = set()
     w._remote_registration_generations = {}
+    w._remote_sub_blocks = {}
+    w._draft_head_dst_handles = {}
     w._transfer_layer_group_ids = ()
     spec = MLAAttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.uint8
