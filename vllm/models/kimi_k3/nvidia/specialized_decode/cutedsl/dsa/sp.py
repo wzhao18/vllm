@@ -317,7 +317,8 @@ class SpDsaCore:
             shape = Shape(r, q)
             core, mode = prepared.cores[r, q], prepared.overlaps[r, q]
             fmt = self.box.mailbox(r).format
-            if (core, mode, fmt) != ("trtllm", self.modes[r], SP_PARTIALS):
+            kernel = kernel_for(r, True, SP_KERNELS)
+            if (core, mode, fmt) != (kernel, self.modes[r], SP_PARTIALS):
                 raise Unsupported("dsa", shape, f"resolved {core} / {mode} / {fmt}")
         if prepared.dsac is not None:  # (sp_unsupported refused it)
             raise Unsupported("dsa", None, "the DSA sparse core")
