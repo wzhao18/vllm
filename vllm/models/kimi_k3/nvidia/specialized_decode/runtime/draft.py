@@ -458,6 +458,9 @@ class DraftFastPath:
         self.lm_logits = None
         self.wide_batches = rows(WIDE_LM_HEAD) & self.batches
         self.lm_wide = None
+        # The stock LM-head GEMM's rows on pinned cuBLASLt algorithms (lt_pin), for
+        # the batches no fast LM head serves: prepared with the LM head.
+        self.lm_pins = None
         self.overlap_batches = rows(CONTEXT_OVERLAP)
         # NQ-NOFALLBACK: eager drafter calls (no captured graph) on the stock Markov
         # loop, counted per cause.
@@ -847,6 +850,7 @@ class DraftFastPath:
         sampled = sampling is not None
         if not torch.cuda.is_current_stream_capturing():
             self.prepare_lm_head(model)
+            self.prepare_lm_pins(model)
             # An eager drafter call (no captured graph: warmup, a step above the
             # captured sizes): the stock Markov loop, a run-time property counted
             # per cause (NQ-NOFALLBACK).
@@ -894,6 +898,11 @@ class DraftFastPath:
                 "its fast LM-head kernel is not prepared or does not take the rows",
                 Shape(batch * self.steps, self.steps),
             )
+        elif self.lm_pins is not None and self.lm_pins.takes(hidden):
+            # The stock LM-head GEMM (this rank's vocabulary shard of the base
+            # logits) on a pinned cuBLASLt algorithm: the same FP32 accumulation.
+            base = hidden.new_empty((hidden.shape[0], self.lm_pins.weight.shape[0]))
+            self.lm_pins.run(hidden, base)
         else:
             # The stock LM-head GEMM of the drafter, without its all-gather: this
             # rank's vocabulary shard of the base logits, bitwise as stock.
@@ -914,6 +923,30 @@ class DraftFastPath:
         slots = slots.long()
         own = cache[slots, :, lo : lo + markov.vocab_rank].contiguous()
         cache[slots] = get_tp_group().all_gather(own, dim=-1)
+
+    def prepare_lm_pins(self, model):
+        """Pinned cuBLASLt algorithms for the stock LM-head GEMM's rows (the batches
+        without a fast LM head), once the (shared) LM head is there."""
+        if self.lm_pins is not None or self.markov is None:
+            return
+        weight = getattr(getattr(model, "lm_head", None), "weight", None)
+        vocab_rank = getattr(self.markov, "vocab_rank", None)
+        if (
+            weight is None
+            or weight.dim() != 2
+            or weight.shape[0] != vocab_rank
+            or weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or getattr(model.lm_head, "bias", None) is not None
+            or model.logits_processor.scale != 1.0
+            or model.logits_processor.soft_cap is not None
+        ):
+            return
+        from ..lt_pin import pinned
+
+        fast = self.lm_batches | self.wide_batches
+        rows = [b * self.steps for b in sorted(self.batches - fast)]
+        self.lm_pins = pinned(weight, rows)
 
     def prepare_lm_head(self, model):
         """The LM-head GEMV of FAST_LM_HEAD batches (it reads the shard in place),
@@ -1159,16 +1192,21 @@ def gqa_projection_tactic(shape, tp, rows):
 
 def gqa_projection(weight, tp, rows):
     """The prepared split-K projection of ``weight`` for ``rows`` (or None)."""
+    from ..lt_pin import with_pins
+
     policies = {}
     for r in rows:
         tactic = gqa_projection_tactic(weight.shape, tp, r)
         if tactic is not None:
             policies[r] = tactic
-    if not policies:
-        return None
-    from ..cutedsl.gemm.projection import PreparedProjection
+    prepared = None
+    if policies:
+        from ..cutedsl.gemm.projection import PreparedProjection
 
-    return PreparedProjection(weight, policies).prepare()
+        prepared = PreparedProjection(weight, policies).prepare()
+    # Rows above the split-K bins: pinned cuBLASLt algorithms where the heuristic
+    # pick is slow (lt_pin.PINS; e.g. TP4 gate_up at 288 rows 30.1 -> 17.1 us).
+    return with_pins(prepared, weight, rows)
 
 
 def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
@@ -1236,6 +1274,9 @@ def gqa_context_projection(prepared, tp):
     ring = {r: t for r, t in tactics.items() if len(t) == 4 and t[1] <= 16}
     current = prepared.projection.policies if prepared.projection is not None else {}
     if not tactics or (tactics == current and set(ring) == set(prepared.polled)):
+        from ..lt_pin import with_pins
+
+        prepared.projection = with_pins(prepared.projection, shard, prepared.rows)
         return sorted(current), sorted(prepared.polled)
     index = prepared.device.index
     prepared.projection = PreparedProjection(shard, tactics).prepare()
