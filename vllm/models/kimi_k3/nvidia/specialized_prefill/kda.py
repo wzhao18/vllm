@@ -29,6 +29,7 @@ from __future__ import annotations
 import torch
 
 from vllm.models.kimi_k3.nvidia.ops import kda_segscan
+from vllm.triton_utils import tl, triton
 
 _FROST_MIN_VERSION = (1, 33)
 _frost_fn = None
@@ -101,6 +102,63 @@ def frost_prefill(
         plan_name="kda_frost",
     )[:2]
     return o.view(1, T, H, D), final_state
+
+
+@triton.jit
+def _zero_new_state_rows(state_ptr, idx_ptr, has_init_ptr, row_stride, ROW: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0)
+    if tl.load(has_init_ptr + i):
+        return
+    row = tl.load(idx_ptr + i).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(state_ptr + row * row_stride + offs, tl.zeros([BLOCK], state_ptr.dtype.element_ty), mask=offs < ROW)
+
+
+def frost_prefill_in_place(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """``frost_prefill`` seeded from and writing back to the recurrent state pool:
+    sequence i starts from ``state_pool[state_indices[i]]`` (zero without an
+    initial state) and its final state replaces that row, so no gather / scatter
+    copies run. Returns the output (1, T, H, 128)."""
+    assert _frost_fn
+    T, H, D = q.shape[1], q.shape[2], q.shape[3]
+    row = state_pool[0].numel()
+    block = 4096
+    _zero_new_state_rows[(state_indices.numel(), triton.cdiv(row, block))](
+        state_pool, state_indices, has_initial_state, state_pool.stride(0), ROW=row, BLOCK=block
+    )
+    o = _frost_fn(
+        q.reshape(T, H, D).contiguous(),
+        k.reshape(T, H, D).contiguous(),
+        v.reshape(T, H, D).contiguous(),
+        g.reshape(T, H, D).contiguous(),
+        beta.reshape(T, H),
+        cu_seqlens,
+        scale=D**-0.5,
+        initial_state=state_pool,
+        state_indices=state_indices,
+        final_state_out=state_pool,
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        gate_lower_bound=lower_bound,
+        a_log=A_log,
+        dt_bias=dt_bias.view(H, D),
+        plan_name="kda_frost",
+    )[0]
+    return o.view(1, T, H, D)
 
 
 def o_norm_mxfp8(

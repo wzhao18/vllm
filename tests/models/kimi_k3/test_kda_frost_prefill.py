@@ -87,3 +87,34 @@ def test_frost_requires_cudnn_frontend_133(monkeypatch):
     monkeypatch.setattr(cudnn, "__version__", "1.32.1")
     with pytest.raises(RuntimeError, match="older than 1.33"):
         sp_kda.frost_supported(torch.device("cuda"))
+
+
+def test_frost_prefill_in_place_matches_gathered():
+    """frost_prefill_in_place (seeded from / written back to the state pool) is
+    frost_prefill on the gathered rows: same output, same final rows, zero seed
+    for a sequence without an initial state, other pool rows untouched."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    assert sp_kda.frost_supported(torch.device("cuda"))
+    torch.manual_seed(0)
+    lens, H = [300, 1, 1029], 8
+    T, N = sum(lens), len(lens)
+    bf = torch.bfloat16
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
+    v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+    beta = torch.randn(1, T, H, device="cuda").to(bf)
+    A_log = torch.randn(H, device="cuda") * 0.5
+    dt_bias = torch.randn(H * D, device="cuda") * 0.1
+    pool = torch.randn(7, H, D, D, device="cuda") * 0.1
+    idx = torch.tensor([5, 2, 3], dtype=torch.int32, device="cuda")
+    has_init = torch.tensor([True, False, True], device="cuda")
+    h0 = pool[idx.long()].clone()
+    h0[~has_init] = 0
+    o_ref, fs_ref = sp_kda.frost_prefill(q, k, v, g, beta, A_log, dt_bias, -5.0, h0, cu)
+    expect = pool.clone()
+    expect[idx.long()] = fs_ref
+    o = sp_kda.frost_prefill_in_place(q, k, v, g, beta, A_log, dt_bias, -5.0, pool, idx, has_init, cu)
+    torch.accelerator.synchronize()
+    assert torch.equal(o, o_ref)
+    assert torch.equal(pool, expect)

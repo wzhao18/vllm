@@ -1509,10 +1509,37 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
-                initial_state = gather_initial_states(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    has_initial_state,
+                # The segment plan (flashkda backend) decides the core: FROST runs
+                # where it is None and no checkpoint is exported, and then reads and
+                # writes the recurrent state pool in place (no gather / scatter).
+                seg_plan_any = (
+                    kda_segscan.make_plan(
+                        m.non_spec_query_start_loc_cpu,
+                        self.local_num_heads,
+                        q_ns.device,
+                        checkpoint.offsets if checkpoint is not None else None,
+                        sms=self._segscan_bufs.sms,
+                        max_parts=self._segscan_bufs.n,
+                    )
+                    if self.kda_prefill_backend == "flashkda"
+                    and self._segscan_bufs is not None
+                    and m.non_spec_query_start_loc_cpu is not None
+                    else None
+                )
+                frost_in_place = (
+                    self.kda_prefill_backend == "flashkda"
+                    and self._frost
+                    and checkpoint is None
+                    and seg_plan_any is None
+                )
+                initial_state = (
+                    None
+                    if frost_in_place
+                    else gather_initial_states(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
+                    )
                 )
                 if self.kda_prefill_backend == "flashkda":
                     assert self.gate_lower_bound is not None
@@ -1527,20 +1554,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     )[:, : q_ns.shape[1]]
                     if non_spec_out is not None:
                         flashkda_out = non_spec_out
-                    seg_plan = (
-                        kda_segscan.make_plan(
-                            m.non_spec_query_start_loc_cpu,
-                            self.local_num_heads,
-                            q_ns.device,
-                            checkpoint.offsets if checkpoint is not None else None,
-                            sms=self._segscan_bufs.sms,
-                            max_parts=self._segscan_bufs.n,
-                        )
-                        if self._segscan_bufs is not None
-                        and m.non_spec_query_start_loc_cpu is not None
-                        and flashkda_out.is_contiguous()
-                        else None
-                    )
+                    seg_plan = seg_plan_any if flashkda_out.is_contiguous() else None
                     if (
                         seg_plan is not None
                         and seg_plan.num_seqs == initial_state.shape[0]
@@ -1614,6 +1628,29 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             recurrent_state=recurrent_state,
                             cu_seqlens=non_spec_query_start_loc,
                         )
+                    elif frost_in_place:
+                        frost_out = specialized_prefill_kda.frost_prefill_in_place(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            g=g1_ns,
+                            beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            state_pool=recurrent_state,
+                            state_indices=non_spec_state_indices_tensor,
+                            has_initial_state=has_initial_state,
+                            cu_seqlens=non_spec_query_start_loc,
+                        )
+                        if (
+                            flashkda_out.data_ptr() == core_attn_out.data_ptr()
+                            and frost_out.shape[1] == core_attn_out.shape[1]
+                        ):
+                            prefill_core_out = frost_out
+                        else:
+                            flashkda_out.copy_(frost_out)
+                        core_attn_out_non_spec = flashkda_out
                     elif self._frost:
                         frost_out, last_recurrent_state = (
                             specialized_prefill_kda.frost_prefill(
@@ -1708,11 +1745,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         out=non_spec_out,
                     )
                 # One row-copy launch (same result as the index_put_).
-                prefill_glue.write_state_rows(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    last_recurrent_state,
-                )
+                if not frost_in_place:
+                    prefill_glue.write_state_rows(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        last_recurrent_state,
+                    )
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None
