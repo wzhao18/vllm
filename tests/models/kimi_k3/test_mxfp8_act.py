@@ -100,7 +100,7 @@ def test_quantize_strided_rows():
     _assert_same_quant(mxfp8_act.quantize(x), x.contiguous())
 
 
-@pytest.mark.parametrize("rows", ROWS + [1031])  # >= 1024 rows: the SiTU table form
+@pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("d", [6144, 1536, 768])
 @pytest.mark.parametrize("linear_beta", [None, 10.0])
 def test_situ_and_mul_quantize_matches_unfused(rows, d, linear_beta):
@@ -112,31 +112,6 @@ def test_situ_and_mul_quantize_matches_unfused(rows, d, linear_beta):
     torch.ops._C.situ_and_mul(ref, x, 1.0, -1.0 if linear_beta is None else linear_beta)
     qa = mxfp8_act.situ_and_mul_quantize(x, 1.0, linear_beta)
     _assert_same_quant(qa, ref)
-
-
-@pytest.mark.parametrize("mode", [4, 5])
-@pytest.mark.parametrize("beta,linear_beta", [(1.0, None), (4.0, 25.0), (3.0, 7.0)])
-def test_situ_table_form_bitwise_all_bf16_inputs(mode, beta, linear_beta):
-    """The SiTU table form (>= 1024 rows) equals the per-element form (< 1024
-    rows) bit for bit on every BF16 gate and up value, incl. zeros, subnormals,
-    huge values, Inf and NaN (the table's out-of-window fallback)."""
-    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
-
-    rows, d, part = 2048, 768, 512
-    bits = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16)
-    g = bits.repeat(rows * d // (1 << 16)).view(torch.bfloat16).view(rows, d)
-    perm = torch.randperm(rows * d, generator=torch.Generator().manual_seed(0))
-    u = g.reshape(-1)[perm].view(rows, d)
-    x = torch.cat([g, u], dim=1).cuda()
-    whole = mxfp8_act._act_quant(mode, x, d, beta=beta, linear_beta=linear_beta)
-    sf_part = part * d // 32
-    for r0 in range(0, rows, part):
-        piece = mxfp8_act.situ_and_mul_quantize(x[r0 : r0 + part], beta, linear_beta)
-        assert torch.equal(
-            whole.data[r0 : r0 + part].view(torch.uint8), piece.data.view(torch.uint8)
-        )
-        sf0 = r0 * d // 32
-        assert torch.equal(whole.scale[sf0 : sf0 + sf_part], piece.scale[:sf_part])
 
 
 @pytest.mark.parametrize("rows", ROWS)

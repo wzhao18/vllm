@@ -431,7 +431,7 @@ __device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
 
 // CONTIG: all three tensors are dense (rows x d), indexed as one vector.
 template <bool CONTIG>
-__global__ void gate_sigmoid_mul_kernel(uint16_t* __restrict__ out,
+__global__ void __launch_bounds__(512) gate_sigmoid_mul_kernel(uint16_t* __restrict__ out,
                                         const uint16_t* __restrict__ attn,
                                         const uint16_t* __restrict__ gate,
                                         int32_t total_vecs, int32_t vecs_per_row,
@@ -623,14 +623,14 @@ void gate_sigmoid_mul(torch::Tensor& out, const torch::Tensor& attn,
               reinterpret_cast<uintptr_t>(gate.data_ptr()) % 16 == 0 &&
               reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0);
   if (rows == 0) return;
-  // 1024-thread CTAs, 2 per SM: each CTA's table build is ~3% of its work.
-  const int threads = 1024;
+  // 512-thread CTAs, 4 per SM: each CTA's table build is ~3% of its work.
+  const int threads = 512;
   const int64_t total = rows * (d / 8);
   TORCH_CHECK(total < (int64_t{1} << 31));
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                          attn.get_device());
-  const int64_t max_blocks = (int64_t)sms * 2;
+  const int64_t max_blocks = (int64_t)sms * 4;
   const int blocks =
       (int)std::min<int64_t>((total + threads - 1) / threads, max_blocks);
   const bool contig = attn.stride(0) == d && gate.stride(0) == d &&

@@ -46,10 +46,6 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
 MXFP8_BLOCK = 32
-# SiTU by table (act_quant modes 4: gate + up tables, 5: gate table) from this
-# many rows on: below it the per-CTA table build outweighs the tanhf it saves.
-SITU_TABLE_MIN_ROWS = 1024
-SITU_TABLE_MODE = 5
 
 _CUDA_SRC = r"""
 #include <torch/extension.h>
@@ -156,51 +152,6 @@ __device__ __forceinline__ float situ_activation(float g, float u, float beta,
   const float up_out = clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
   return gate_out * up_out;
 }
-
-// ---- SiTU by table (mode 4, large row counts). The SiTU inputs are BF16, so
-// gate_out(g) and up_out(u) of situ_activation take at most 2^16 values each;
-// a per-CTA shared-memory table of both, built with the exact expressions of
-// situ_activation, turns 3 precise tanhf per element (MUFU-bound) into 2 LDS.
-// Covered: |x| in [2^(E0-127), 2^(E0-127+NE)) of either sign; zeros,
-// subnormals, huge values, Inf and NaN take situ_activation directly. The
-// result gate_out * up_out is the same FP32 product, so mode 4 is bitwise
-// equal to mode 1.
-constexpr int SITU_LUT_E0 = 111;  // |x| >= 2^-16
-constexpr int SITU_LUT_NE = 32;   // |x| <  2^16
-constexpr int SITU_LUT_N = 2 * SITU_LUT_NE * 128;
-
-__device__ __forceinline__ int situ_lut_index(uint32_t b) {
-  const uint32_t t = (b & 0x7fffu) - (uint32_t)(SITU_LUT_E0 * 128);
-  return t < (uint32_t)(SITU_LUT_NE * 128) ? (int)(t | ((b & 0x8000u) >> 3))
-                                           : -1;
-}
-
-// c10::BFloat16(r) as a float, by the hardware RNE conversion: equal to the
-// software rounding for every input except the NaN payload (c10: 0x7FC0).
-__device__ __forceinline__ float bf16_round(float r) {
-  const float f = __bfloat162float(__float2bfloat16_rn(r));
-  return r != r ? __uint_as_float(0x7FC00000u) : f;
-}
-
-__device__ __forceinline__ uint16_t situ_lut_bits(int i) {
-  return (uint16_t)(((i >> 12) << 15) |
-                    ((((i >> 7) & (SITU_LUT_NE - 1)) + SITU_LUT_E0) << 7) |
-                    (i & 0x7f));
-}
-
-// lut[0, N): gate_out, lut[N, 2N): up_out, exactly as situ_activation forms them.
-__device__ __forceinline__ void situ_lut_build(float* lut, float beta,
-                                               float linear_beta, bool clamp_up,
-                                               float inv_beta,
-                                               float inv_linear_beta) {
-  for (int i = threadIdx.x; i < SITU_LUT_N; i += blockDim.x) {
-    const float x = __uint_as_float(((uint32_t)situ_lut_bits(i)) << 16);
-    lut[i] = (0.5f * beta) * tanhf(x * inv_beta) * (1.0f + tanhf(x * 0.5f));
-    lut[SITU_LUT_N + i] =
-        clamp_up ? linear_beta * tanhf(x * inv_linear_beta) : x;
-  }
-  __syncthreads();
-}
 // Vectors (8 columns) per thread per trip: their loads are all issued before
 // any is used, so each SM keeps enough bytes in flight to stream HBM.
 constexpr int ACT_QUANT_UNROLL = 4;
@@ -213,7 +164,7 @@ __device__ __forceinline__ void act_load(const uint16_t* __restrict__ x,
                                          uint4& a, uint4& b) {
   if (MODE == 0) {
     a = __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-  } else if (MODE == 1 || MODE == 2 || MODE == 4 || MODE == 5) {
+  } else if (MODE == 1 || MODE == 2) {
     const uint16_t* gp = x + row * x_stride + col;
     a = __ldg(reinterpret_cast<const uint4*>(gp));
     b = __ldg(reinterpret_cast<const uint4*>(gp + d));
@@ -228,44 +179,11 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
                                             float (&out)[8], float beta,
                                             float linear_beta, bool clamp_up,
                                             float inv_beta,
-                                            float inv_linear_beta,
-                                            const float* __restrict__ lut) {
+                                            float inv_linear_beta) {
   if (MODE == 0) {
     const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&a);
 #pragma unroll
     for (int i = 0; i < 8; ++i) out[i] = bf16_bits_to_float(r16[i]);
-  } else if (MODE == 4 || MODE == 5) {
-    // 4: gate_out and up_out by table; 5: gate_out by table, up_out direct
-    // (one tanhf, usually its polynomial branch at the model's linear_beta).
-    const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
-    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int ig = situ_lut_index(g16[i]);
-      const float uv = bf16_bits_to_float(u16[i]);
-      float r;
-      if (MODE == 4) {
-        const int iu = situ_lut_index(u16[i]);
-        if (ig >= 0 && iu >= 0) {
-          r = lut[ig] * lut[SITU_LUT_N + iu];
-        } else {
-          r = situ_activation(bf16_bits_to_float(g16[i]), uv, beta,
-                              linear_beta, clamp_up, inv_beta,
-                              inv_linear_beta);
-        }
-      } else {
-        const float up_out =
-            clamp_up ? linear_beta * tanhf(uv * inv_linear_beta) : uv;
-        if (ig >= 0) {
-          r = lut[ig] * up_out;
-        } else {
-          r = situ_activation(bf16_bits_to_float(g16[i]), uv, beta,
-                              linear_beta, clamp_up, inv_beta,
-                              inv_linear_beta);
-        }
-      }
-      out[i] = bf16_round(r);
-    }
   } else if (MODE == 1 || MODE == 2) {
     const uint16_t* g16 = reinterpret_cast<const uint16_t*>(&a);
     const uint16_t* u16 = reinterpret_cast<const uint16_t*>(&b);
@@ -301,8 +219,7 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
 }
 
 // mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 2 silu-and-mul,
-//       3 x * sigmoid(g)  (two inputs, both [rows, d]), 4 = 1 by table
-//       (dynamic shared memory: 2 * SITU_LUT_N floats)
+//       3 x * sigmoid(g)  (two inputs, both [rows, d])
 template <int MODE>
 __global__ void act_quant_kernel(uint8_t* __restrict__ q,
                                  uint8_t* __restrict__ sf,
@@ -316,12 +233,8 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   const int vecs_per_row = d / 8;
   const int64_t total = rows_pad * vecs_per_row;
   const bool clamp_up = linear_beta > 0.0f;
-  const float inv_beta = (MODE == 1 || MODE == 4 || MODE == 5) ? 1.0f / beta : 0.f;
+  const float inv_beta = MODE == 1 ? 1.0f / beta : 0.f;
   const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
-  extern __shared__ float lut[];
-  if (MODE == 4 || MODE == 5) {
-    situ_lut_build(lut, beta, linear_beta, clamp_up, inv_beta, inv_linear_beta);
-  }
   // Every lane runs the same trip count (total is a multiple of 4 vectors,
   // blockDim a multiple of 32), so the block-amax shuffles are uniform; the
   // 4 lanes of an MXFP8 block hold consecutive vectors in every sub-trip.
@@ -372,7 +285,7 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
       float out[8];
       if (real) {
         act_compute<MODE>(a[u], b[u], out, beta, linear_beta, clamp_up,
-                          inv_beta, inv_linear_beta, lut);
+                          inv_beta, inv_linear_beta);
       } else {
 #pragma unroll
         for (int i = 0; i < 8; ++i) out[i] = 0.f;
@@ -484,40 +397,11 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
     g_stride = g->stride(0);
   }
   if (rows == 0) return;
-  auto stream = c10::cuda::getCurrentCUDAStream();
-  // SiTU by table (modes 4 / 5): a grid of resident CTAs, so each table is
-  // built once per CTA.
-  if (mode == 4 || mode == 5) {
-    const int threads = 512;
-    const size_t smem = 2 * SITU_LUT_N * sizeof(float);
-    auto kern = mode == 4 ? act_quant_kernel<4> : act_quant_kernel<5>;
-    static int sms = 0;
-    static int per_sm[2] = {0, 0};
-    int& ps = per_sm[mode - 4];
-    if (ps == 0) {
-      TORCH_CHECK(cudaFuncSetAttribute(kern,
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                       (int)smem) == cudaSuccess);
-      int dev = 0;
-      TORCH_CHECK(cudaGetDevice(&dev) == cudaSuccess);
-      TORCH_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
-                                         dev) == cudaSuccess);
-      TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                      &ps, kern, threads, smem) == cudaSuccess && ps > 0);
-    }
-    kern<<<ps * sms, threads, smem, stream>>>(
-        reinterpret_cast<uint8_t*>(q.data_ptr()),
-        reinterpret_cast<uint8_t*>(sf.data_ptr()),
-        reinterpret_cast<const uint16_t*>(x.data_ptr()), gp, rows, rows_pad,
-        (int)d, x.stride(0), g_stride, q.stride(0), (int)sf_col_base,
-        (int)padded_cols, (float)beta, (float)linear_beta);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
-  }
   const int threads = 256;
   const int64_t total = rows_pad * (d / 8);
   const int64_t per_block = (int64_t)threads * ACT_QUANT_UNROLL;
   const int blocks = (int)std::min<int64_t>((total + per_block - 1) / per_block, 2048);
+  auto stream = c10::cuda::getCurrentCUDAStream();
 #define LAUNCH(M)                                                              \
   act_quant_kernel<M><<<blocks, threads, 0, stream>>>(                         \
       reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
@@ -693,10 +577,8 @@ def situ_and_mul_quantize(
     col: int = 0,
 ):
     """``situ_and_mul(x)`` ([rows, 2d] -> [rows, d]) as MXFP8."""
-    rows = x.numel() // max(x.shape[-1], 1)
-    mode = SITU_TABLE_MODE if rows >= SITU_TABLE_MIN_ROWS else 1
     return _act_quant(
-        mode, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
+        1, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
     )
 
 
