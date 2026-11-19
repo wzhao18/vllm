@@ -527,13 +527,15 @@ class DcpValue:
                 tc_fence_before()
             cute.arch.sync_threads()  # TMEM is read: the next unit may overwrite it
             uc = uc + 1
+        # Free TMEM before the dependents launch: a dependent CTA placed on this SM
+        # while the merge spins may require TMEM column 0 (exclusive allocators).
+        if warp == 0:
+            tc_fence_after()
+            _tmem_free128(taddr)
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
         for t in range(y, self.tiles, self.grid[1]):
             self.merge_projected(args, scales, tid, t)
-        cute.arch.sync_threads()
-        if warp == 0:
-            _tmem_free128(taddr)
 
     @cute.jit
     def push_values(self, args, gh, tid):
