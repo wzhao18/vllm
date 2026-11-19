@@ -81,6 +81,7 @@ from .recover import (
 )
 from .specialized import (
     COPY_BYTES,
+    PAGE_BYTES,
     KdaWS,
     fence_async_shared,
     load_shared_f32x4,
@@ -93,14 +94,11 @@ from .wide import rsqrt_ftz
 K = 128
 GROUPS = 2
 GROUP_THREADS = 128
-CONSUMERS = GROUPS * GROUP_THREADS
-THREADS = CONSUMERS + 32  # + the state producer warp
+THREADS = GROUPS * GROUP_THREADS
 ROWS = 8  # state rows per scan thread: 8 (c // 8) + [0, 8)
 LANES = 8  # scan threads per row
 CHUNKS = 4  # 4-key chunks per thread and row: keys 4 (c % 8 + 8 j)
-QROWS = 32  # state rows per quarter page (one warp's rows)
-QSLOTS = 12  # the CTA's quarter-page ring
-FB_SLOTS = 4  # the last 4 quarter slots hold the F_B rows in the prologue
+SLOTS = 3  # the CTA's state page ring
 MAX_ITEMS = 16  # items per CTA (tables, raw gates)
 # Rubin's oversized shared memory mode (327 KiB per CTA; budget 320 KiB). Elsewhere
 # the opt-in limit.
@@ -136,7 +134,7 @@ def group_bytes(tokens, window, conv_size):
 
 
 def shared_bytes(tokens, conv_dim_first, window, conv_size, stages=1):
-    pages = QSLOTS * QROWS * K * 4
+    pages = SLOTS * PAGE_BYTES
     heads = 2 * CONSTS * K * 4
     gates = MAX_ITEMS * tokens * K * 2
     tables = MAX_ITEMS * (META + 8) * 4
@@ -294,29 +292,24 @@ class KdaFlow(KdaWS):
         return head, request, slot, conv_slot, conv_offset, pending, rec
 
     @cute.jit
-    def load_quarter(self, args, pages, k, table, full):
-        """Bulk-copy quarter k % 4 of table item k // 4's state page into quarter
-        slot k % QSLOTS (or complete the phase of a padded row)."""
-        j, w, q = k // 4, k % 4, k % QSLOTS
+    def load_page(self, args, pages, s, table, j, state_full):
+        """Bulk-copy table item j's state page into page slot ``s`` (or complete the
+        phase of a padded row)."""
         slot, head = table[j, SLOT], table[j, HEAD]
-        barrier = full + q
+        barrier = state_full + s
         if slot > 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(barrier, QROWS * K * 4)
+            cute.arch.mbarrier_arrive_and_expect_tx(barrier, PAGE_BYTES)
             source = args[9][Int64(slot), None, None, None]
-            copy_g2s(at(pages, q, 0), at(source, head, w * QROWS, 0), QROWS * K * 4,
-                     barrier)  # fmt: skip
+            for i in cutlass.range_constexpr(PAGE_BYTES // COPY_BYTES):
+                rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
+                copy_g2s(
+                    at(pages, s, i * rows * K),
+                    at(source, head, i * rows, 0),
+                    COPY_BYTES,
+                    barrier,
+                )
         else:
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
-
-    @cute.jit
-    def produce(self, args, pages, table, count, start, full, empty):
-        """The state producer (one thread): quarters start .. 4 count - 1, each
-        into its ring slot once the slot's previous quarter is released."""
-        for k in cutlass.range(start, 4 * count, unroll=1):
-            if k >= QSLOTS:
-                q = k % QSLOTS
-                self.bwait(empty + q, (k // QSLOTS - 1) % 2, "empty")
-            self.load_quarter(args, pages, k, table, full)
 
     @cute.jit
     def stage_item(self, args, table, j, buffers, barrier):
@@ -372,7 +365,7 @@ class KdaFlow(KdaWS):
         conv_type: cutlass.Constexpr = conv_state.element_type
 
         smem = cutlass.utils.SmemAllocator()
-        pages = alloc(smem, Float32, (QSLOTS, QROWS * K), align=1024)
+        pages = alloc(smem, Float32, (SLOTS, K * K), align=1024)
         hcs = alloc(smem, Float32, (2, CONSTS, K))  # per head slot, channel
         raw = alloc(smem, BFloat16, (MAX_ITEMS, T, K), align=16)  # raw gates
         table = alloc(smem, Int32, (MAX_ITEMS, META))
@@ -399,15 +392,14 @@ class KdaFlow(KdaWS):
         oo = alloc(smem, BFloat16, (GROUPS, T, K), align=128)  # outputs
         sums = alloc(smem, Float32, (GROUPS, SUMS, 4))
         out_sums = alloc(smem, Float32, (GROUPS, 8, 4))
-        bars = smem.allocate(cutlass.Uint64, 2 * QSLOTS + GROUPS + 2)
-        full, empty, stage_full = bars, bars + QSLOTS, bars + 2 * QSLOTS
-        fb_full = bars + 2 * QSLOTS + GROUPS
-        fa_full = fb_full + 1
+        bars = smem.allocate(cutlass.Uint64, SLOTS + GROUPS + 2)
+        state_full, stage_full = bars, bars + SLOTS
+        fb_full, fa_full = bars + SLOTS + GROUPS, bars + SLOTS + GROUPS + 1
         # Prologue scratch: the F_B rows of the CTA's heads in the last page slot (its
         # page is loaded after the gate projection), the F_A rows of its items over
         # the q / k / v / decay blocks (unused until the first prep).
         fbs = cute.make_tensor(
-            cute.recast_ptr(at(pages, QSLOTS - FB_SLOTS, 0), dtype=BFloat16),
+            cute.recast_ptr(at(pages, SLOTS - 1, 0), dtype=BFloat16),
             cute.make_layout((2, K, K), stride=(K * K, K, 1)),
         )
         fas = cute.make_tensor(
@@ -416,9 +408,8 @@ class KdaFlow(KdaWS):
         )
 
         if tid == 0:
-            for q in cutlass.range_constexpr(QSLOTS):
-                cute.arch.mbarrier_init(full + q, 1)
-                cute.arch.mbarrier_init(empty + q, 1)
+            for s in cutlass.range_constexpr(SLOTS):
+                cute.arch.mbarrier_init(state_full + s, 1)
             for g in cutlass.range_constexpr(GROUPS):
                 cute.arch.mbarrier_init(stage_full + g, 1)
             cute.arch.mbarrier_init(fb_full, 1)
@@ -436,13 +427,10 @@ class KdaFlow(KdaWS):
         heads = h1 - h0 + 1
         # Before the PDL wait: the first pages (this layer's state), the F_B rows
         # and channel weights of the CTA's heads.
-        early = Int32(QSLOTS - FB_SLOTS)
-        if 4 * count < early:
-            early = 4 * count
-        if tid == CONSUMERS:
-            for k in cutlass.range(early, unroll=1):
-                self.load_quarter(args, pages, k, table, full)
         if tid == 0:
+            for s in cutlass.range_constexpr(SLOTS - 1):
+                if s < count:
+                    self.load_page(args, pages, s, table, s, state_full)
             cute.arch.mbarrier_arrive_and_expect_tx(fb_full, heads * K * K * 2)
             for h in cutlass.range_constexpr(2):
                 if h < heads:
@@ -472,14 +460,13 @@ class KdaFlow(KdaWS):
         cute.arch.barrier()  # the table; fa_full's byte count
         g = tid // GROUP_THREADS
         c = tid % GROUP_THREADS
-        if tid < CONSUMERS:  # noqa: SIM102
-            if c == 0:  # the group's first item's inputs
-                if g < count:
-                    buffers = (
-                        convs[g, None, None], xs[g, None, None, None],
-                        gs[g, None, None], kgs[g, None, None], uss[g, None, None],
-                    )  # fmt: skip
-                    self.stage_item(args, table, g, buffers, stage_full + g)
+        buffers = (
+            convs[g, None, None], xs[g, None, None, None], gs[g, None, None],
+            kgs[g, None, None], uss[g, None, None],
+        )  # fmt: skip
+        if c == 0:  # the group's first item's inputs
+            if g < count:
+                self.stage_item(args, table, g, buffers, stage_full + g)
         cute.arch.sync_warp()
         if tid < count * T:
             item, t = tid // T, tid % T
@@ -488,25 +475,19 @@ class KdaFlow(KdaWS):
         cute.arch.sync_warp()
         self.bwait(fb_full, 0, "fb_full")
         self.bwait(fa_full, 0, "fa_full")
-        projected = count
-        if tid >= CONSUMERS:
-            projected = Int32(0)
-        self.gate_projection(tid, projected, h0, table, fbs, fas, raw)
+        self.gate_projection(tid, count, h0, table, fbs, fas, raw)
         cute.arch.sync_warp()
-        cute.arch.barrier()  # raw gates; the F_B quarter slots and the blocks are free
-        if tid < CONSUMERS:
-            buffers = (
-                convs[g, None, None], xs[g, None, None, None], gs[g, None, None],
-                kgs[g, None, None], uss[g, None, None],
-            )  # fmt: skip
-            ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
-            outs = (kgo[g, None, None], uo[g, None, None], oo[g, None, None])
-            sums_g = (sums[g, None, None], out_sums[g, None, None])
-            self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
-                             buffers, ops, outs, sums_g, (full, empty),
-                             stage_full + g)  # fmt: skip
-        elif tid == CONSUMERS:
-            self.produce(args, pages, table, count, early, full, empty)
+        cute.arch.barrier()  # raw gates; the last page slot and the blocks are free
+        if tid == 0:
+            if SLOTS - 1 < count:
+                self.load_page(args, pages, SLOTS - 1, table, SLOTS - 1, state_full)
+        cute.arch.sync_warp()
+        ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
+        outs = (kgo[g, None, None], uo[g, None, None], oo[g, None, None])
+        sums_g = (sums[g, None, None], out_sums[g, None, None])
+        self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
+                         buffers, ops, outs, sums_g, state_full,
+                         stage_full + g)  # fmt: skip
 
     @cute.jit
     def gate_projection(self, tid, count, h0, table, fbs, fas, raw):
@@ -572,10 +553,9 @@ class KdaFlow(KdaWS):
     # ------------------------------------------------------------- group loop
     @cute.jit
     def group_items(self, args, g, c, count, h0, pages, table, betas, raw, hcs,
-                    buffers, ops, outs, sums_g, ring, stage_full):  # fmt: skip
+                    buffers, ops, outs, sums_g, state_full, stage_full):  # fmt: skip
         xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
         kgo, uo, oo = outs
-        full, empty = ring
         state, output = args[9], args[10]
         T: cutlass.Constexpr = self.tokens
         NV: cutlass.Constexpr = 2 * T
@@ -628,9 +608,8 @@ class KdaFlow(KdaWS):
             if cutlass.const_expr(self.trace):
                 tb = clock64()
                 tr[1] = tr[1] + (tb - ta)
-            k = 4 * j + warp
-            s = k % QSLOTS  # this warp's quarter slot
-            self.bwait(full + s, (k // QSLOTS) % 2, "full")
+            s = j % SLOTS
+            self.bwait(state_full + s, (j // SLOTS) % 2, "state_full")
             if cutlass.const_expr(self.trace):
                 tc = clock64()
                 tr[2] = tr[2] + (tc - tb)
@@ -639,8 +618,8 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr("store" in self.skip):
                     stored = pending < 0
                 acc = cute.make_rmem_tensor((ROWS, NV), Float32)
-                self.scan(acc, g, s, pages, pending, lane_in, base - warp * quarter,
-                          xv, fw_s, fu_s, fd_s, base)  # fmt: skip
+                self.scan(acc, g, s, pages, pending, lane_in, base, xv, fw_s, fu_s,
+                          fd_s)  # fmt: skip
                 fence_async_shared()  # the warp's committed rows leave by bulk store
                 cute.arch.sync_warp()
                 if stored:
@@ -648,7 +627,7 @@ class KdaFlow(KdaWS):
                         destination = state[Int64(slot), None, None, None]
                         store_bulk_evict(
                             at(destination, head, warp * quarter, 0),
-                            at(pages, s, 0),
+                            at(pages, s, warp * quarter * K),
                             COPY_BYTES,
                         )
                         bulk_commit()
@@ -658,11 +637,14 @@ class KdaFlow(KdaWS):
                     tr[3] = tr[3] + (td - tc)
                 values = self.rows_reduce(acc, lane_in)
                 self.solve(values, g, betas, j, own, v_s, uo, ce_s)
-                if lane == 0:  # the warp's quarter is read: release its slot
+                if lane == 0:  # the warp's quarter is read: the slot can refill
                     wait_bulk_reads()
-                    cute.arch.mbarrier_arrive(empty + s)
                 cute.arch.sync_warp()
-                self.group_sync(g)  # every row's outputs
+                self.group_sync(g)  # every quarter is read; every row's outputs
+                if c == 0:
+                    if j + SLOTS < count:
+                        self.load_page(args, pages, s, table, j + SLOTS, state_full)
+                cute.arch.sync_warp()
                 if cutlass.const_expr(self.trace):
                     te = clock64()
                     tr[4] = tr[4] + (te - td)
@@ -679,9 +661,7 @@ class KdaFlow(KdaWS):
                 if cutlass.const_expr(self.trace):
                     tr[5] = tr[5] + (clock64() - te)
             else:
-                if lane == 0:
-                    cute.arch.mbarrier_arrive(empty + s)
-                cute.arch.sync_warp()
+                self.release_slot(args, c, j, count, pages, table, state_full, False)
                 for t in cutlass.range_constexpr(T):
                     output[token + t, head * K + c] = BFloat16(0)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
@@ -689,6 +669,17 @@ class KdaFlow(KdaWS):
                 cta, _, _ = cute.arch.block_idx()
                 if cta % 53 == 0:
                     cute.printf("TRACE cta {} g {} items {} total {} prep {} wstate {} scan {} solve {} epi {}", cta, g, mine, clock64() - t0, tr[1], tr[2], tr[3], tr[4], tr[5])  # noqa: E501
+
+    @cute.jit
+    def release_slot(self, args, c, j, count, pages, table, state_full, stored):
+        """Item j's slot is free once its checkpoint store has read it: thread 0
+        refills it with item j + SLOTS's page."""
+        if c == 0:
+            if stored:
+                wait_bulk_reads()
+            if j + SLOTS < count:
+                self.load_page(args, pages, j % SLOTS, table, j + SLOTS, state_full)
+        cute.arch.sync_warp()
 
     # ------------------------------------------------------------------- scan
     def pfma(self, a, b, c):
@@ -698,8 +689,7 @@ class KdaFlow(KdaWS):
         return (fma(a[0], b[0], c[0]), fma(a[1], b[1], c[1]))
 
     @cute.jit
-    def scan(self, acc, b, s, pages, pending, lane_in, local, xv, fw_s, fu_s, fd_s,
-             base):  # fmt: skip
+    def scan(self, acc, b, s, pages, pending, lane_in, base, xv, fw_s, fu_s, fd_s):
         """One pass over this thread's state elements (rows base + [0, 8), keys
         4 (lane_in + 8 j) + [0, 4)): the pending commit is folded in,
         S = fma(S_0, D_n, fc), fc = sum_t fma(u_t, w_t, fc) over t = q - 1 .. 0
@@ -737,7 +727,7 @@ class KdaFlow(KdaWS):
                     for m in cutlass.range_constexpr(NV):
                         acc[0, m] = acc[0, m] + xs[e, m] + w4[0][e] + d4[e]
             for rr in cutlass.range_constexpr(ROWS):
-                address = at(pages, s, (local + rr) * K + key)
+                address = at(pages, s, (base + rr) * K + key)
                 sv = load_shared_f32x4(address)
                 new = [Float32(0) for _ in range(4)]
                 if cutlass.const_expr("scan" in self.skip):
