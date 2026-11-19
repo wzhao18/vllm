@@ -135,8 +135,8 @@ def local_arm(rows_list, flush):
         slots[torch.arange(rows, device=dev) % 4 != 0] = -1
         cache = torch.zeros(blocks, UNIT, FP8_ROW, dtype=torch.uint8, device=dev)
         from vllm import _custom_ops as ops
-        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.local_query import (  # noqa: E501
-            pack_query,
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_uk import (  # noqa: E501
+            query_uk,
         )
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.decode import (  # noqa: E501
             blas_library,
@@ -144,8 +144,6 @@ def local_arm(rows_list, flush):
 
         b = local.buffers
         q = b.q[:rows]
-        lat = b.flat[: 96 * rows * 512].view(96, rows, 512)
-        nope = q.view(rows, 96, 192)[..., :128].transpose(0, 1)
         kv = b.kv[:rows]
 
         def lt():
@@ -156,8 +154,7 @@ def local_arm(rows_list, flush):
             "all": lambda: local.run(q_c, projected, cache, slots),
             "qb": lambda: local.projection.run(q_c, q),
             "qb_lt": lt,
-            "uk": lambda: torch.bmm(nope, local.uk, out=lat),
-            "pack": lambda: pack_query(lat, q, local.q_scale, b.query[:rows]),
+            "uk_pack": lambda: query_uk(q, local.uk_t, local.q_scale, b.query[:rows]),
             "kvnorm": lambda: ops.rms_norm(
                 kv, projected[:, 1536:2048], local.kv_norm, 1e-6
             ),
