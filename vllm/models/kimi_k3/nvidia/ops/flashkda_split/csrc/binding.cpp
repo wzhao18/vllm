@@ -27,12 +27,18 @@ STABLE_TORCH_LIBRARY(k3_flashkda_split, m) {
       "Tensor gt, Tensor beta, Tensor v, Tensor init_state, "
       "Tensor(a!) final_state, Tensor(b!) out, Tensor cu_seqlens, int flags, "
       "Tensor(c!) dbg) -> ()");
+  m.def(
+      "prep64(Tensor q, Tensor k, Tensor g, Tensor beta, Tensor a_log, "
+      "Tensor dt_bias, float lower_bound, float scale, Tensor cu_seqlens, "
+      "Tensor(a!) kdq, Tensor(b!) kr, Tensor(c!) inv, Tensor(d!) mqk, "
+      "Tensor(e!) gt, Tensor(f!) beta_out) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CUDA, m) {
   m.impl("fwd", TORCH_BOX(&fwd));
   m.impl("o_norm_mxfp8", TORCH_BOX(&o_norm_mxfp8));
   m.impl("k64_rec", TORCH_BOX(&k64_rec));
+  m.impl("prep64", TORCH_BOX(&prep64));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(k3_flashkda_split, CompositeExplicitAutograd, m) {

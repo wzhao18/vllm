@@ -174,6 +174,7 @@ def load_extension() -> None:
                 os.path.join(csrc, "smxx", "fwd_launch.cu"),
                 os.path.join(csrc, "smxx", "o_norm_mx.cu"),
                 os.path.join(csrc, "smxx", "k64_tc.cu"),
+                os.path.join(csrc, "smxx", "prep64.cu"),
             ],
             extra_include_paths=[csrc, cutlass],
             extra_cflags=flags,

@@ -204,6 +204,77 @@ def e2e(lens, H):
           f"state {err(s, fin_ref)}", flush=True)
 
 
+def prep_kernel(q, k, g, beta, A_log, dt_bias, lb, lens, scale, cu):
+    """k3_flashkda_split.prep64 (chunk-64 images from post-conv q / k, raw g, beta)."""
+    _, T, H, _ = q.shape
+    C = sum((n + C64 - 1) // C64 for n in lens)
+    bf, dev = torch.bfloat16, q.device
+    o = dict(kdq_img=torch.empty(H, C, 16, 2 * C64, 8, dtype=bf, device=dev),
+             kr_img=torch.empty(H, C, 8, D, 8, dtype=bf, device=dev),
+             inv_img=torch.empty(H, C, 8, C64, 8, dtype=bf, device=dev),
+             mqk_img=torch.empty(H, C, 8, C64, 8, dtype=bf, device=dev),
+             gt=torch.empty(H, C, D, device=dev),
+             beta=torch.empty(H, T, dtype=bf, device=dev))
+    torch.ops.k3_flashkda_split.prep64(
+        q[0], k[0], g[0], beta[0], A_log, dt_bias, lb, scale, cu,
+        o["kdq_img"], o["kr_img"], o["inv_img"], o["mqk_img"], o["gt"], o["beta"])
+    return o
+
+
+def prep_check(lens, H):
+    """prep64 kernel images vs the torch prep64, and k64_rec on them vs FlashKDA."""
+    torch.manual_seed(5)
+    T, dev, bf = sum(lens), "cuda", torch.bfloat16
+    q, k, v, g = (torch.randn(1, T, H, D, dtype=bf, device=dev) for _ in range(4))
+    beta = torch.randn(1, T, H, dtype=bf, device=dev)
+    A_log = torch.randn(H, device=dev) * 0.5
+    dt_bias = torch.randn(H, D, device=dev) * 0.1
+    lb, scale = -5.0, D ** -0.5
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=dev)
+    o = prep_kernel(q, k, g, beta, A_log, dt_bias, lb, lens, scale, cu)
+    p = prep64(q, k, g, beta, A_log, dt_bias, lb, lens, scale)
+    C = p["C"]
+    want = dict(
+        kdq_img=torch.cat([p["kd"], p["qd"]], 2).view(H, C, 2 * C64, 16, 8).permute(0, 1, 3, 2, 4),
+        kr_img=p["kr"].transpose(-1, -2).reshape(H, C, D, 8, 8).permute(0, 1, 3, 2, 4),
+        inv_img=p["inv"].view(H, C, C64, 8, 8).permute(0, 1, 3, 2, 4),
+        mqk_img=p["mqk"].view(H, C, C64, 8, 8).permute(0, 1, 3, 2, 4),
+        gt=p["gt"], beta=p["beta"])
+    torch.cuda.synchronize()
+    print(f"prep lens={lens} H={H}: " + " | ".join(
+        f"{n} {err(o[n], want[n].contiguous())}" for n in want), flush=True)
+    N = len(lens)
+    s0 = (torch.randn(N, H, D, D, device=dev) * 0.1).to(bf).float()
+    out_ref, fin_ref = torch.zeros_like(v), torch.zeros_like(s0)
+    ws = torch.empty(torch.ops.k3_flashkda_split.get_workspace_size(T, H, N), dtype=torch.uint8, device=dev)
+    torch.ops.k3_flashkda_split.fwd(q, k, v, g, beta, scale, out_ref, ws, A_log, dt_bias,
+                                    lb, s0, fin_ref, cu, None, None, 3)
+    x = dict(o, v_img=v_image(v[0].contiguous(), lens, H), s0=s0, cu=cu, T=T, H=H, N=N)
+    out, fin = run(x)
+    torch.cuda.synchronize()
+    print(f"  prep64 kernel + k64_rec vs FlashKDA: out {err(out, out_ref[0])} | state {err(fin, fin_ref)}",
+          flush=True)
+
+
+def prep_time():
+    lens, H = [5461, 5461, 5461], 96
+    T, dev, bf = sum(lens), "cuda", torch.bfloat16
+    q, k, g = (torch.randn(1, T, H, D, dtype=bf, device=dev) for _ in range(3))
+    beta = torch.randn(1, T, H, dtype=bf, device=dev)
+    A_log, dt_bias = torch.zeros(H, device=dev), torch.zeros(H, D, device=dev)
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=dev)
+    for _ in range(2):
+        prep_kernel(q, k, g, beta, A_log, dt_bias, -5.0, lens, D ** -0.5, cu)
+    torch.cuda.synchronize()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(5):
+        prep_kernel(q, k, g, beta, A_log, dt_bias, -5.0, lens, D ** -0.5, cu)
+    e1.record()
+    torch.cuda.synchronize()
+    print(f"F16K prep64 kernel (SIMT dev stage): {e0.elapsed_time(e1) / 5 * 1000:.1f} us", flush=True)
+
+
 def err(a, b):
     a, b = a.float(), b.float()
     return f"max|d| {(a - b).abs().max().item():.3e} (max|ref| {b.abs().max().item():.3e}, " \
@@ -216,6 +287,7 @@ def main():
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--stamps", action="store_true")
     ap.add_argument("--e2e", action="store_true")
+    ap.add_argument("--prep", action="store_true")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
@@ -228,6 +300,10 @@ def main():
             torch.cuda.synchronize()
             ro, rs = ref(x)
             print(f"check lens={lens} H={H}: out {err(o, ro)} | state {err(s, rs)}", flush=True)
+    if a.prep:
+        for lens, H in (([64], 1), ([300, 17, 129], 4), ([1000, 777], 8)):
+            prep_check(lens, H)
+        prep_time()
     if a.e2e:
         for lens, H in (([300, 17, 129], 4), ([1000, 777], 8)):
             e2e(lens, H)

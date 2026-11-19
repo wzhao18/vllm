@@ -434,3 +434,45 @@ void k64_rec(const Tensor& kdq, const Tensor& kr, const Tensor& inv,
                 int(N), int(C), int(flags), reinterpret_cast<long long*>(dbg.mutable_data_ptr()),
                 static_cast<cudaStream_t>(stream_ptr));
 }
+
+void launch_prep64(void const* q, void const* k, void const* g, void const* beta,
+                   int64_t row_stride_qk, int64_t row_stride_g, int64_t row_stride_beta,
+                   float const* a_log, float const* dt_bias, float lower_bound, float scale,
+                   int const* cu_seqlens, int N, int H, int T_total, int C_total,
+                   void* kdq, void* kr, void* inv, void* mqk, float* gt, void* beta_out,
+                   cudaStream_t stream);
+
+// q, k: (T, H, 128) bf16 with a row stride (post-conv); g: (T, H, 128) bf16 raw
+// gate with a row stride; beta: (T, H) bf16 raw logits with a row stride.
+void prep64(const Tensor& q, const Tensor& k, const Tensor& g, const Tensor& beta,
+            const Tensor& a_log, const Tensor& dt_bias, double lower_bound, double scale,
+            const Tensor& cu_seqlens, const Tensor& kdq, const Tensor& kr, const Tensor& inv,
+            const Tensor& mqk, const Tensor& gt, const Tensor& beta_out) {
+  STD_TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.stride(2) == 1 && q.stride(1) == 128 &&
+                      k.stride(0) == q.stride(0) && k.stride(1) == 128 && k.stride(2) == 1 &&
+                      q.scalar_type() == ScalarType::BFloat16 &&
+                      k.scalar_type() == ScalarType::BFloat16,
+                  "prep64: q / k must be bf16 (T, H, 128) with dense heads and one row stride");
+  STD_TORCH_CHECK(g.dim() == 3 && g.stride(1) == 128 && g.stride(2) == 1 &&
+                      g.scalar_type() == ScalarType::BFloat16 && beta.dim() == 2 &&
+                      beta.stride(1) == 1 && beta.scalar_type() == ScalarType::BFloat16,
+                  "prep64: g (T, H, 128) / beta (T, H) bf16 with dense heads");
+  const int64_t T = q.size(0), H = q.size(1), N = cu_seqlens.numel() - 1;
+  const int64_t C = gt.size(1);
+  STD_TORCH_CHECK(gt.dim() == 3 && gt.size(0) == H && gt.is_contiguous() &&
+                      kdq.numel() == H * C * 128 * 128 && kr.numel() == H * C * 64 * 128 &&
+                      inv.numel() == H * C * 64 * 64 && mqk.numel() == H * C * 64 * 64 &&
+                      beta_out.numel() == H * T,
+                  "prep64: image shapes");
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(q.get_device_index(), &stream_ptr));
+  launch_prep64(q.const_data_ptr(), k.const_data_ptr(), g.const_data_ptr(), beta.const_data_ptr(),
+                q.stride(0), g.stride(0), beta.stride(0),
+                reinterpret_cast<const float*>(a_log.const_data_ptr()),
+                reinterpret_cast<const float*>(dt_bias.const_data_ptr()), float(lower_bound),
+                float(scale), reinterpret_cast<const int*>(cu_seqlens.const_data_ptr()), int(N),
+                int(H), int(T), int(C), kdq.mutable_data_ptr(), kr.mutable_data_ptr(),
+                inv.mutable_data_ptr(), mqk.mutable_data_ptr(),
+                reinterpret_cast<float*>(gt.mutable_data_ptr()), beta_out.mutable_data_ptr(),
+                static_cast<cudaStream_t>(stream_ptr));
+}
