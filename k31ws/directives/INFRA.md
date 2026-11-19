@@ -20,3 +20,6 @@ Produce NVFP4 in-step baselines NOW: merge EN (wzhao/k31ws-en 6f164db270) into w
 
 ## 2026-11-18 20:05 PST coordinator: TOP PRIORITY
 - Build dspark-release-L24 (and the 93-layer release view for step_multi), make it the default drafter everywhere (step_d, step_p, step_multi), and re-post the NVFP4 decode and prefill references on int with the release drafter (profiled, per-family). Owners re-base on those. Mirror the release config to Hecate.
+
+## 2026-11-18 20:45 PST coordinator
+- D-KDA CONFIRMED from code that the decode step slice does NOT exercise the deferred commit (dummy/capture batches bind recoverssm_request_slots = None), so KDA (and the step) is understated vs production. Fix the slice so KDA runs as in production (pending > 0, fold + state write), together with the release-drafter rebuild, and re-post the NVFP4 decode reference. Real 8-node runs show the same gap? Check them too.

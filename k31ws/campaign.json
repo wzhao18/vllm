@@ -327,6 +327,26 @@
   {
    "t": "11-18 20:05",
    "text": "Rule (user): only the release DSpark drafter counts. All references are being re-measured with it; preview-drafter numbers are void. The release drafter tail is a real decode family (D-FUSE)."
+  },
+  {
+   "t": "11-18 20:40",
+   "text": "Measurement-scope bug: the decode step slice does not exercise the KDA deferred commit (no fold, no state write), so KDA and the step are understated vs production. INFRA fixing the slice together with the release drafter before re-posting references."
+  },
+  {
+   "t": "11-18 19:45",
+   "text": "Real-topology MoE differs from the 1-node emulation: at real EP32 the decode MegaMoE router kernel is 15.5 us (3.4 on 1 GPU) with ~12 us arrival skew across 32 ranks; at real EP16 the prefill main kernel is 1341-1421 us per 8K sub-call vs ~960 on the slice and the router 199-279 us (36 on the slice). MoE work must be judged at the real EP size."
+  },
+  {
+   "t": "11-18 19:50",
+   "text": "P-KDA correction: the prefill KDA recurrence (FlashKDA K2) is SM-throughput bound, not chain-latency bound (a lone 16-token step is 0.52 us); the earlier ~290 us latency-floor model note is withdrawn."
+  },
+  {
+   "t": "11-18 19:25",
+   "text": "D-TOPK topk_v2 64ac45710c: 21.0/21.9/27.3 us/layer at r1/r8/r24 (from 30/45/86 originally, model 6/7/9.4); exact."
+  },
+  {
+   "t": "11-18",
+   "text": "HW: cluster multicast TMA loads deliver at the plain-load rate; the slowness seen earlier was the per-stage cross-CTA slot-release handshake."
   }
  ]
 }

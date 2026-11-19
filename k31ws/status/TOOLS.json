@@ -1,0 +1,19 @@
+{
+ "id": "TOOLS",
+ "title": "Profilers on VR200: Nsight Compute, Nsight Systems, nvdisasm on both clusters",
+ "side": "infra",
+ "owner": "TOOLS workflow agent",
+ "state": "implementing",
+ "updated": "2026-11-18T20:15-08:00",
+ "basis": "-",
+ "shape": "-",
+ "gap_analysis": "Root-causing has relied on custom probes (clock stamps, ptxas -v) because the K3.1 image ships no ncu/nsys/nvdisasm. Installing working VR200-capable profilers into the run environment on both clusters.",
+ "plan": [
+  "find a VR200-capable build (NGC PyTorch/CUDA container, CUDA 13.x sbsa installers, internal builds)",
+  "install on Rhea + Hecate Lustre, wire into wsenv.sh",
+  "validate ncu --set full / nsys / nvdisasm on VR200",
+  "PROFILING.md + directive"
+ ],
+ "work": [],
+ "next": "find a build that knows sm_107"
+}
