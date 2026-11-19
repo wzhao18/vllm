@@ -1984,7 +1984,12 @@ def _vp_markov_keys(
         value, index = tl.max(values, axis=0, return_indices=True)
     token = (lo + block * BLOCK + index).to(tl.int64)
     key = (_vp_ordered(value).to(tl.int64) << 31) | (0x7FFFFFFF - token)
-    tl.atomic_max(keys_ptr + req, key)
+    if PUBLISH:
+        # (relaxed: the count's acq_rel below orders it before the last program's
+        # read; one fence per program)
+        tl.atomic_max(keys_ptr + req, key, sem="relaxed", scope="gpu")
+    else:
+        tl.atomic_max(keys_ptr + req, key)
     if PUBLISH:
         # The request's last program on this rank publishes the rank's key (never 0)
         # into slot ``box_offset + req`` of every rank's mailbox and re-arms. A key
