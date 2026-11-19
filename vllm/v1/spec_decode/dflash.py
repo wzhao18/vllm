@@ -4,7 +4,6 @@
 from dataclasses import replace
 from typing import Any
 
-import numpy as np
 import torch
 from typing_extensions import override
 
@@ -36,10 +35,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
-        # Draft sliding window (None: full attention); resolved on first use.
-        self._context_window_cache: int | None | bool = False
-        # Pinned / device staging of the kept context rows (trim_context).
-        self._context_stage: tuple | None = None
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
@@ -112,161 +107,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def _warn_if_multimodal(self):
         # Override to allow multimodal inputs since DFlash supports Qwen3.5 models
         pass
-
-    def _context_window(self) -> int | None:
-        """The widest sliding window of the draft attention layers, or None
-        when any draft layer attends to its full context."""
-        if self._context_window_cache is not False:
-            return self._context_window_cache
-        from vllm.config import get_layers_from_vllm_config
-        from vllm.model_executor.layers.attention_layer_base import (
-            AttentionLayerBase,
-        )
-
-        layers = get_layers_from_vllm_config(
-            self.vllm_config,
-            AttentionLayerBase,  # type: ignore[type-abstract]
-        )
-        windows = [
-            getattr(layers[name], "sliding_window", None)
-            for name in self._draft_attn_layer_names
-            if name in layers
-        ]
-        window = (
-            max(windows)
-            if windows and all(isinstance(w, int) and w > 0 for w in windows)
-            else None
-        )
-        self._context_window_cache = window
-        return window
-
-    def _context_hit_alignment(self) -> int | None:
-        """Token granularity at which a later request can resume from this
-        request's cached KV (prefix caching or a KV connector), or None."""
-        cache = self.vllm_config.cache_config
-        if not cache.enable_prefix_caching and (
-            self.vllm_config.kv_transfer_config is None
-        ):
-            return None
-        units = [
-            u
-            for u in (
-                getattr(cache, "cache_hit_alignment_tokens", None),
-                getattr(cache, "hash_block_size", None),
-                getattr(cache, "prefix_match_unit", None),
-                cache.block_size,
-            )
-            if isinstance(u, int) and u > 0
-        ]
-        return min(units) if units else 1
-
-    def _window_rows(self, cad: CommonAttentionMetadata) -> np.ndarray | None:
-        """Context rows whose draft K/V can ever be read, when that is a strict
-        subset of the step's rows; else None.
-
-        Draft queries sit past the context and attend through a sliding window
-        of W positions, so a request continuing from this step reads only the
-        K/V of its last W context positions, and a later request resuming from
-        a prefix-cache hit at position h reads only [h - W, h); hits land on
-        multiples of the hit alignment. Keep, per request, the rows within
-        W + num_speculative_tokens + 1 of its chunk end and of every hit point
-        inside its chunk; the other rows' K/V is never read, so skipping their
-        fc / K/V projection does not change any draft."""
-        window = self._context_window()
-        if window is None or cad.seq_lens_cpu_upper_bound is None:
-            return None
-        span = window + self.num_speculative_tokens + 1
-        qsl = cad.query_start_loc_cpu[: cad.num_reqs + 1].numpy()
-        qlen = np.diff(qsl)
-        if qlen.size == 0 or int(qlen.max()) <= span:
-            return None
-        align = self._context_hit_alignment()
-        if align is not None and align <= span:
-            return None
-        seq_ends = cad.seq_lens_cpu_upper_bound[: cad.num_reqs].numpy()
-        pieces = []
-        for r in range(cad.num_reqs):
-            lo, hi = int(qsl[r]), int(qsl[r + 1])
-            if hi - lo <= span:
-                pieces.append(np.arange(lo, hi, dtype=np.int64))
-                continue
-            # A long chunk is a prefill chunk: no draft tokens, so its rows'
-            # positions are end - n .. end - 1 exactly.
-            end_pos = int(seq_ends[r])
-            start_pos = end_pos - (hi - lo)
-            keep = np.zeros(hi - lo, dtype=bool)
-            keep[-span:] = True
-            if align is not None:
-                first = (start_pos // align + 1) * align
-                for h in range(first, end_pos, align):
-                    keep[max(0, h - span - start_pos) : h - start_pos] = True
-            pieces.append(lo + np.flatnonzero(keep))
-        rows = np.concatenate(pieces)
-        if rows.size == int(qsl[cad.num_reqs]):
-            return None
-        return rows
-
-    def context_rows(self, cad: CommonAttentionMetadata) -> np.ndarray | None:
-        """Rows of the step's draft context to keep (see ``_window_rows``),
-        or None to keep all."""
-        rows = self._window_rows(cad)
-        if rows is not None:
-            logger.info_once(
-                "DFlash: context rows outside the draft window skipped "
-                "(window %d, hit alignment %s): %d of %d rows kept",
-                self._context_window(),
-                self._context_hit_alignment(),
-                rows.size,
-                int(cad.query_start_loc_cpu[cad.num_reqs]),
-            )
-        return rows
-
-    def trim_context(
-        self, cad: CommonAttentionMetadata, rows: np.ndarray
-    ) -> tuple[torch.Tensor, CommonAttentionMetadata]:
-        """The kept rows on device and ``cad`` restricted to them.
-
-        Host values reach the device through persistent pinned staging
-        buffers (stable addresses, so the copies may also sit in a captured
-        graph), reused only after the previous step's copies completed."""
-        qsl = cad.query_start_loc_cpu[: cad.num_reqs + 1]
-        counts = np.diff(np.searchsorted(rows, qsl.numpy()))
-        n, nq = int(rows.size), cad.num_reqs + 1
-        stage = self._context_stage
-        if stage is None or stage[0].shape[0] < n or stage[2].shape[0] < nq:
-            rows_cap = max(n, int(qsl[-1]))
-            stage = (
-                torch.empty(rows_cap, dtype=torch.int64, pin_memory=True),
-                torch.empty(rows_cap, dtype=torch.int64, device=self.device),
-                torch.empty(max(nq, 2), dtype=torch.int32, pin_memory=True),
-                torch.empty(max(nq, 2), dtype=torch.int32, device=self.device),
-                torch.cuda.Event(),
-            )
-            self._context_stage = stage
-        capturing = torch.cuda.is_current_stream_capturing()
-        if stage is not None and not capturing:
-            stage[4].synchronize()
-        rows_h, rows_d, qsl_h, qsl_d, done = stage
-        rows_h[:n].numpy()[:] = rows
-        qsl_h[0] = 0
-        qsl_h[1:nq].numpy()[:] = np.cumsum(counts)
-        index = rows_d[:n]
-        index.copy_(rows_h[:n], non_blocking=True)
-        qsl_d[:nq].copy_(qsl_h[:nq], non_blocking=True)
-        if not capturing:
-            done.record()
-        total = int(qsl[-1])
-        trimmed = replace(
-            cad,
-            query_start_loc=qsl_d[:nq],
-            query_start_loc_cpu=qsl_h[:nq].clone(),
-            num_actual_tokens=n,
-            max_query_len=int(counts.max()),
-            slot_mapping=cad.slot_mapping[index]
-            if cad.slot_mapping.shape[0] >= total
-            else cad.slot_mapping,
-        )
-        return index, trimmed
 
     @override
     def set_inputs_first_pass(

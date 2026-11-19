@@ -4890,17 +4890,8 @@ class GPUModelRunner(
                 target_positions = self._get_positions(num_scheduled_tokens)
                 if self.use_aux_hidden_state_outputs:
                     assert aux_hidden_states is not None
-                    (
-                        target_token_ids,
-                        target_positions,
-                        target_hidden_states,
-                        common_attn_metadata,
-                    ) = self._drafter_context(
-                        aux_hidden_states,
-                        num_scheduled_tokens,
-                        target_token_ids,
-                        target_positions,
-                        common_attn_metadata,
+                    target_hidden_states = torch.cat(
+                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
                     )
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
@@ -4937,17 +4928,8 @@ class GPUModelRunner(
                     target_positions = self._get_positions(total_num_tokens)
                     if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
-                        (
-                            target_token_ids,
-                            target_positions,
-                            target_hidden_states,
-                            common_attn_metadata,
-                        ) = self._drafter_context(
-                            aux_hidden_states,
-                            total_num_tokens,
-                            target_token_ids,
-                            target_positions,
-                            common_attn_metadata,
+                        target_hidden_states = torch.cat(
+                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
                         )
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
@@ -4980,26 +4962,6 @@ class GPUModelRunner(
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
 
         return draft_token_ids
-
-    def _drafter_context(
-        self,
-        aux_hidden_states: list[torch.Tensor],
-        num_tokens: int,
-        target_token_ids: torch.Tensor,
-        target_positions: torch.Tensor,
-        cad: CommonAttentionMetadata,
-    ):
-        """The drafter's context inputs: all ``num_tokens`` rows, or only the
-        rows the drafter can ever read (``context_rows``, e.g. a sliding-window
-        DFlash drafter on long prefill chunks), gathered before the aux concat."""
-        context_rows = getattr(self.drafter, "context_rows", None)
-        rows = context_rows(cad) if context_rows is not None else None
-        if rows is None:
-            hidden = torch.cat([h[:num_tokens] for h in aux_hidden_states], dim=-1)
-            return target_token_ids, target_positions, hidden, cad
-        index, cad = self.drafter.trim_context(cad, rows)
-        hidden = torch.cat([h[index] for h in aux_hidden_states], dim=-1)
-        return target_token_ids[index], target_positions[..., index], hidden, cad
 
     @instrument(span_name="Loading (GPU)")
     def load_model(

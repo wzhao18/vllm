@@ -411,20 +411,29 @@ __device__ __forceinline__ uint16_t gate_sigmoid_bf16(float gv) {
 
 __device__ __forceinline__ uint4 gate_sigmoid_mul_vec8_lut(
     uint4 a, uint4 g, const uint16_t* __restrict__ lut) {
-  const uint16_t* ah = reinterpret_cast<const uint16_t*>(&a);
   const uint16_t* gh = reinterpret_cast<const uint16_t*>(&g);
+  const uint32_t* aw = reinterpret_cast<const uint32_t*>(&a);
   uint4 o;
-  uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
+  uint32_t* ow = reinterpret_cast<uint32_t*>(&o);
+  uint32_t s[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     const uint32_t b = gh[j];
     const uint32_t e = ((b >> 7) & 0xffu) - (uint32_t)GATE_LUT_E0;
-    const uint16_t sbits =
-        e < (uint32_t)GATE_LUT_NE
-            ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
-            : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
-    oh[j] = c10::BFloat16(bf16_bits_to_float(ah[j]) *
-                          bf16_bits_to_float(sbits)).x;
+    s[j] = e < (uint32_t)GATE_LUT_NE
+               ? lut[((b >> 15) << 12) | (e << 7) | (b & 0x7fu)]
+               : gate_sigmoid_bf16(bf16_bits_to_float((uint16_t)b));
+  }
+  // BF16 x BF16 products, rounded by cvt.rn.bf16x2 (RNE, as c10::BFloat16 for
+  // every non-NaN value) on packed pairs.
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    const float2 av = make_float2(__uint_as_float(aw[p] << 16),
+                                  __uint_as_float(aw[p] & 0xffff0000u));
+    const float2 sv = make_float2(__uint_as_float(s[2 * p] << 16),
+                                  __uint_as_float(s[2 * p + 1] << 16));
+    const __nv_bfloat162 r = __floats2bfloat162_rn(av.x * sv.x, av.y * sv.y);
+    ow[p] = *reinterpret_cast<const uint32_t*>(&r);
   }
   return o;
 }

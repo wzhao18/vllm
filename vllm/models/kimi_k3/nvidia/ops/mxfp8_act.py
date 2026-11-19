@@ -103,7 +103,8 @@ __device__ __forceinline__ float bf16_bits_to_float(uint16_t b) {
 }
 
 __device__ __forceinline__ uint16_t float_to_bf16_bits(float f) {
-  return c10::BFloat16(f).x;
+  // cvt.rn.bf16.f32: RNE as c10::BFloat16 for every non-NaN value.
+  return __bfloat16_as_ushort(__float2bfloat16_rn(f));
 }
 
 // Byte offset of scale block `col` of `row` in the F8_128x4 swizzled layout
