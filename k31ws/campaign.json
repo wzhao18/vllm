@@ -306,6 +306,18 @@
   {
    "t": "11-18 19:25",
    "text": "INT 4071a79bdd = + P-GEMM (router top-k fused path, MXFP8 quant passes removed); tests pass. Landed-ready queue: D-ATTN, D-KDA, P-KDA."
+  },
+  {
+   "t": "11-18 19:45",
+   "text": "Hecate is back (24 idle xdr nodes; cserve FairShare 0.74). New XC workstream: extend the pool to Rhea + Hecate (same image/overlays on both, Hecate holds daemon, Mac-side wsrun.sh dispatcher). Release DSpark drafter config copied to Rhea; INFRA builds the L24 view to remove the preview-drafter artifact (~4 ms at r24)."
+  },
+  {
+   "t": "11-18 19:40",
+   "text": "D-ATTN: LocalQuery measured in-step on NVFP4: decode slice r24 10.89 -> 10.40 ms; DSA attention family 0.91 -> 0.62 ms (52% of the gap). Native keys-on-M sparse MLA decode now beats trtllm-gen (38.1 vs 40.7 us at R384), still ~3.5x the target."
+  },
+  {
+   "t": "11-18 19:40",
+   "text": "D-GEMM: a dependent small-M GEMM has a measured floor of ~6-9 us per call on VR200 (post-dependency MMA, cross-SM reduce, kernel end) even with weights pre-streamed, so the decode GEMM model number is only reachable via cross-op overlap/fusion; the new design targets that."
   }
  ]
 }

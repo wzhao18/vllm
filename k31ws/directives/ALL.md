@@ -33,3 +33,5 @@
 - 2026-11-18 14:00 user: shorten iteration time everywhere. Silicon measurement is small; queue wait, startup and compiles are overhead. Use kernel-level microbench (seconds) for the inner loop and the 1-node step slice only to confirm in-step. Never wait idle on a queued run: prepare the next experiment meanwhile. FAST owns the iteration-speed tooling (queue fairness, faster step bench, persistent bench service).
 
 - 2026-11-18 14:20 PST INCIDENT: the Mac lost its multiplexed ssh master to Rhea and the login node now closes new connections at key exchange (connection-rate limiting from many polling loops). Until the user re-authenticates: STOP all ssh polling loops; poll at most once per 3 min per agent, one ssh per poll (combine commands), never parallel ssh bursts. All ssh traffic must go through the shared master once it is back. Work locally (code, tests, analysis) meanwhile.
+
+- 2026-11-18 19:40 PST: release drafter config is on Rhea (/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/models/dspark-release); INFRA builds the L24 view. Decode owners: switch to the release drafter once INFRA posts it.

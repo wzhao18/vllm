@@ -14,3 +14,6 @@ Produce NVFP4 in-step baselines NOW: merge EN (wzhao/k31ws-en 6f164db270) into w
 
 ## 2026-11-18 18:55 PST coordinator
 - Check D-KDA hypothesis: does the decode step slice exercise production deferred-commit mode (pending > 0, RecoverSSM fold, state write) or run with pending = 0? If not representative, fix the slice so KDA is measured as in production, and re-post the decode reference.
+
+## 2026-11-18 19:40 PST coordinator
+- Release DSpark drafter config (e4e6e626: config.json, config.py, README, no weights) copied from Hecate to Rhea at /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/models/dspark-release. Build dspark-release-L24 (aux layer ids remapped to the L24 target like dspark-preview-L24) and make it the default drafter of step_d/step_multi; re-post the NVFP4 decode reference with the release drafter (the ~4 ms preview tail goes away).

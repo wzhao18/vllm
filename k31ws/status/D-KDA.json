@@ -4,7 +4,7 @@
  "side": "decode",
  "owner": "D-KDA agent (resumed)",
  "state": "landed-ready",
- "updated": "2026-11-18T19:05-08:00",
+ "updated": "2026-11-18T19:58-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.9,
  "current_ms": 0.9,
@@ -27,7 +27,7 @@
  ],
  "plan": [
   "DONE: KdaFlow v8 (one state pass: fold + verify + o_norm; bulk-copy I/O; prologue F_B gate projection; 3-slot page ring) dispatched from n21",
-  "NEXT 1: fuse token t update pass with token t+1 decay pass (both accumulator sets live: 255 regs allow it) to halve the per-token dependency junctions in verify",
+  "DONE (87c9de2e01): fused verify passes (+2-5%)",
   "NEXT 2: overlap prep(j+1) with verify(j) inside each group (software pipelining across tokens); needs double-buffered operand blocks: free ~32 KB smem (raw gates as decays computed per item from smem are 16 KB; MAX_ITEMS 16 -> 12 at n<=105; hcs 17 KB)",
   "NEXT 3: fix the bench flush kind (KdaCommitF32 dt_bias operand ndim) to quote KdaWS+flush at n71+ exactly; ask INFRA to run the step slice with pending > 0",
   "NEXT 4: in-step A/B on the int overlay (step_d.sh r8/r16/r24) once INFRA merges cb9821adf6"
@@ -157,11 +157,16 @@
    "t": "19:05",
    "what": "landing: RECORD_KINDS[24] 1-2 split, 3-20 wide, 21+ flow (KdaFlow v8); SP KDA test files on 1 Rubin GPU: sp_kda 9/9, fold 8/8, deferred_path 23/23, recoverssm 10/10, flow 8/8 (flow graph cases warm up eagerly before capture; n128 capture failed with module load inside capture); commit cb9821adf6 pushed",
    "result": "landed-ready for INFRA: wzhao/k31ws-d-kda @ cb9821adf6 (merges flow.py, sp.py, bench, flow test; base 4fbaa15189 lineage). Microbench deferred-mode gains: r6 -18%, r8 -17%, r16 -25% vs KdaWide; r18+ replaces KdaWS + separate flush pass"
+  },
+  {
+   "t": "19:55",
+   "what": "run31 fused verify passes (token t update + t+1 decay in one state pass), commit 87c9de2e01",
+   "result": "flow test 8/8, 255 regs, 0 spills; n32/64/96/128 = 21.6/37.3/51.9/67.7 us/layer (x69 n96 = 3.58 ms) vs two passes 21.6/38.9/52.9/71.0. landed-ready sha updated"
   }
  ],
- "next": "HANDOFF. Branch wzhao/k31ws-d-kda @ cb9821adf6 (landed-ready). Code: vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/flow.py (KdaFlow v8), sp.py (dispatch), tests/models/kimi_k3/test_specialized_decode_sp_kda_flow_gpu.py, benchmarks/kernels/k31_vr/kda_sp_bench.py (--kinds flow wide ws flush, --skip prep,fold,verify,store,epi,reduce, --trace, --fence N, --noprefetch, --scalar). Commands: stage: bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-kda <tag>; run (Rhea): cd $K/runs/D-KDA; setsid nohup $K/tools/wsgpu.sh -g 1 -m 45 -o <tag> -n D-KDA -- bash $K/runs/D-KDA/runNN.sh > runNN.log 2>&1 &; templates run25.sh (test+bench+attribution+trace), run27.sh (dispatch table), run29b.sh (SP KDA test files). SASS histogram tool: ~/.cache/k31ws-ptxas/dkda/sassop.py (compile kernel PTX with the image ptxas in colima, classify opcodes). Next design steps: plan NEXT 1-4. Dead ends (measured): 2-row layouts (smem return path), half-row 4-group layout, warp-specialized prep WG with setmaxnreg, per-warp quarter refills, register-path checkpoint stores, synchronous global accesses in the item loop.",
+ "next": "HANDOFF. Branch wzhao/k31ws-d-kda @ 87c9de2e01 (landed-ready; dispatch commit cb9821adf6 + fused verify 87c9de2e01). Code: vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/flow.py (KdaFlow v8), sp.py (dispatch), tests/models/kimi_k3/test_specialized_decode_sp_kda_flow_gpu.py, benchmarks/kernels/k31_vr/kda_sp_bench.py (--kinds flow wide ws flush, --skip prep,fold,verify,store,epi,reduce, --trace, --fence N, --noprefetch, --scalar). Commands: stage: bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/d-kda <tag>; run (Rhea): cd $K/runs/D-KDA; setsid nohup $K/tools/wsgpu.sh -g 1 -m 45 -o <tag> -n D-KDA -- bash $K/runs/D-KDA/runNN.sh > runNN.log 2>&1 &; templates run25.sh (test+bench+attribution+trace), run27.sh (dispatch table), run29b.sh (SP KDA test files). SASS histogram tool: ~/.cache/k31ws-ptxas/dkda/sassop.py (compile kernel PTX with the image ptxas in colima, classify opcodes). Next design steps: plan NEXT 2-4 (prep/verify overlap inside a group is the largest remaining lever: prep ~5K of the ~18K cycles per group-item). Dead ends (measured): 2-row layouts (smem return path), half-row 4-group layout, warp-specialized prep WG with setmaxnreg, per-warp quarter refills, register-path checkpoint stores, synchronous global accesses in the item loop.",
  "blockers": "None hard. In-step A/B waits on INFRA merging cb9821adf6 into wzhao/k31ws-int; the step slice probably runs with pending = 0 (no fold), which understates KDA cost for every core.",
- "branch": "wzhao/k31ws-d-kda @ cb9821adf6",
+ "branch": "wzhao/k31ws-d-kda @ 87c9de2e01",
  "evidence": [
   "runs/D-KDA/run19.log .. run30b.log (Rhea Lustre k31ws/runs/D-KDA)",
   "runs/D-KDA/ptx14, ptx22, ptx23 (PTX per variant)",

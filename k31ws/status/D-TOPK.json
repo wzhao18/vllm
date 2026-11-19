@@ -3,8 +3,8 @@
  "title": "Decode: DSA exact top-k + DCP merge",
  "side": "decode",
  "owner": "D-TOPK agent",
- "state": "implementing",
- "updated": "2026-11-18T18:05-08:00",
+ "state": "measuring",
+ "updated": "2026-11-18T19:30-08:00",
  "shape": "NVFP4 1-node D3-32 DP-rank slice (L24 view), r24 (384 verify rows), u132k, k=3; ms per decode step",
  "baseline_ms": 0.636,
  "current_ms": 0.294,
@@ -119,12 +119,30 @@
    "t": "17:55",
    "what": "cuobjdump -elf of the built extension",
    "result": "topk_v2_kernel .text = 280 KB (~18K SASS instructions); the per-row chain executes long straight-line code once per CTA (cold instruction fetch): the unrolled 9-slot register compaction alone ~1K instructions -> hypothesis: the chain is instruction-fetch bound, not memory or sync bound"
+  },
+  {
+   "t": "18:50",
+   "what": "r4-r6 SMEM row (8-warp bulk copy before the length reads, exchange buffers aliased into the row buffer, 2 CTAs/SM via carveout) + rolled loops; fixed a divergent full-mask shuffle hang (r4)",
+   "result": "ALL PASS, resident 424; candidate pass still ~10 us; ptxas 64 regs 0 spill"
+  },
+  {
+   "t": "19:20",
+   "what": "probe_k31_icache.py (Rhea, 512 thr): cold straight-line code 9.5-10 clk/op vs warm 7.3 (IMAD 4 warps/SMSP); __syncthreads 46-66 clk; write+barrier+read 87-99 clk; same-address SMEM atomic 50-65 clk",
+   "result": "instruction fetch and barriers are NOT the bound (hypothesis rejected); per-iteration cost inside topk_v2 remains ~8x the issue estimate (open)"
+  },
+  {
+   "t": "19:25",
+   "what": "r8/r9: candidates in position order from per-warp ranges with packed per-step counts (one warp scan), pass 2 only on groups with candidates, threshold test on raw bf16 pairs (packed compare, no key conversion)",
+   "result": "ALL PASS; r1/r8/r24 21.0/21.9/27.3 us/layer (v2 landed 26.8/27.0/34.7; -21%); committed 64ac45710c"
   }
  ],
- "next": "r4 (SMEM row via 8 bulk copies, rolled sample/compaction loops, exchange buffers aliased into the row buffer, carveout for 2 CTAs/SM) bench+test queued (j37); in-step diag j36 running",
+ "next": "j50 queued: distributed sdec DSA + policy tests and NVFP4 step_d A/B (trial5-9d3cb2b-1 vs d-topk-64ac45710-1, rows 128/384); then landed-ready. Open: why each loop iteration in topk_v2 costs ~500-800 clk/warp (probe of the identical loop standalone was 3x faster)",
  "blockers": "",
- "branch": "wzhao/k31ws-d-topk @ b162ec54a6",
+ "branch": "wzhao/k31ws-d-topk @ 64ac45710c (int 9d3cb2b0c2 + topk_v2 SMEM front end)",
  "evidence": [
+  "runs/D-TOPK/q/done/j27..j48 logs (bench phases per revision)",
+  "runs/D-TOPK/q/done/j47.log, j49.log (icache/barrier probe)",
+  "runs/D-TOPK/q/done/j32_elf.txt (kernel text 280 KB)",
   "runs/D-TOPK/step_d/base-4fbaa15-r128_384-1518/fam.txt vs runs/D-TOPK/step_d/d-topk-3d340bcf5-1-r128_384-1549/fam.txt (in-step A/B)",
   "runs/D-TOPK/q/done/j25.log (distributed sdec DSA + policy tests), j26.log (ALL PASS + bench of df636ba746)",
   "runs/D-TOPK/base1.log (baseline microbench), q/done/j13.log + j19.log (row-load / candidate-loop probes)",

@@ -3,8 +3,8 @@
  "title": "Prefill: sparse MLA + prologue",
  "side": "prefill",
  "owner": "P-MLA workflow agent (resumed 16:00)",
- "state": "measuring",
- "updated": "2026-11-18T20:05-08:00",
+ "state": "implementing",
+ "updated": "2026-11-18T22:50-08:00",
  "shape": "NVFP4 1-node DEP16 slice (L24 view: 18 KDA + 6 DSA + 23 MoE layers), F16K at L78K, ms per forward",
  "step_ms": 218.7,
  "baseline_ms": 12.24,
@@ -12,12 +12,12 @@
  "achievable_ms": 3.86,
  "target_ms": 4.25,
  "basis": "MEASURED in-step NVFP4 baseline (INFRA 17:48, wzhao/k31ws-int b31121cf56, runs/INFRA/step_p/int-b31121c-nv-f16f8-prof; measured/20261118-1805-nvfp4-prefill.json); achievable = nvfp4_modelopt model at the same slice",
- "gap_analysis": "Per F16K layer (1 GPU, run1): trtllm-gen sparse MLA 2129.5 us (3.29 PF on the 96 real heads; model 643), quant 204.1 + head pad 173.4 + KV insert 42.0 (model prologue 10.9), gate_mul 128.8 (model 7.7). Hardware probes (run2/run3): tcgen05 FP8 2x-K MMA reaches the full rate only with A in TMEM; every SMEM operand byte costs 1/128 clk (128 B/clk/SM operand fetch, measured flat across N and majorness), so both-operands-in-SMEM forms (keys-on-M / transposed) cap at 43% (N=96). TMA writes into SMEM at about 55 B/clk do not slow a full-rate TS MMA (no read/write contention measured). TMA tile::gather4 is issue-bound at about 56 clk per instruction per issuing warp: 1/2/4 warps reach 4.1/7.0/10.9 TB/s of 576 B row gathers; plain LDG gathers reach 18.2 TB/s (1064 us per F16K layer). The per-token gather (2048 rows x 576 B = 19.3 GB per F16K layer, L2->SM) is not in the model (kv_B counts 135 MB of unique KV), and neither is the SMEM operand traffic (36.5 GB per layer at 128 B/clk/SM = 565 us). The stock kernel's 2-CTA HVPerCta256 layout most likely re-gathers V (about 1.9x the minimum gather bytes; inferred from its name and FlashMLA's documented equivalent, ncu is not in the image), which at the measured gather rates explains its 2.1 ms. Measured gather floor (run4): ~18 TB/s for random 576 B rows -> sparse_mla cannot go below ~1.07 ms/layer (25.7 ms/step at F16K) with one gather per token-row; the model (643 us/layer) misses this term. Proposed corrected achievable for the family: 24 x (1.07 + 0.019) = ~26 ms/step (model fix pending owner review).",
+ "gap_analysis": "Family = the sparse MLA kernel only (in-step 12.24 ms = 6 DSA layers x 2.04 ms; quant/pad are counted elsewhere). Hardware floor measured on VR200 (runs/P-MLA/run4,5,10,22): every top-k KV row must be delivered into an SM once per token (19.3 GB per F16K layer); random 576 B row gather tops out at ~18-20.6 TB/s of DELIVERED bytes (TMA gather4 16 warps, 3 stages; LDG the same; multicast to a CTA pair delivers 18.7 TB/s total = 9.3 unique, aligned pitch no change, die-local KV no change). So any design that places a row in two SMs (stock 2-CTA V split) pays ~2x; one SM per token with all 96 heads and all 512 V dims is the SOL form, and TMEM (576 cols) forces the keys-on-M PV (O^T 4x96 cols). Gather alone in that structure: 0.94-1.01 ms/layer; gather + all QK/PV MMAs: 1.07-1.25 ms (no smem contention: run22). The model's 0.643 ms/layer omits the gather term (proposed model fix: sparse_mla achievable = max(MMA, F x 2048 x 576 B / 20 TB/s) = ~0.97 ms/layer at F16K -> ~5.8-6.4 ms per 6-layer slice, target ~6.4-7.0 ms; pending coordinator review). Current best kernel (h2: QK heads-on-M with Q in TMEM .ts, row-per-thread softmax over 2 WGs, PV keys-on-M with P^T in the Rubin B collector, 64-key KV stages, slot rows bulk-copied to smem, direct-store epilogue) is 2.59 ms/layer: the softmax chain (single S buffer, cross-WG barriers, P-dependent MMA issue) costs ~1.4-1.6 ms above the gather+MMA floor.",
  "inefficiencies": [
-  "Stock trtllm-gen: 2-CTA V split delivers each KV row into two SMs (~2x the delivered-bytes gather floor) and runs half-rate (sm_100f) MMAs: 2.04 ms/layer in-step",
-  "Perf model omits the per-token KV row gather (19.3 GB/layer at F16K, measured delivered-bytes cap ~18 TB/s even with multicast): floor 1.07 ms/layer vs model 0.643",
-  "Keys-on-M SS MMAs read ~238 KB smem per 128-key tile (Q^T and P^T re-fetched per instruction); with the 72 KB of gather writes this shares the SM's shared-memory bandwidth: tensor+gather alone 1.58 ms/layer",
-  "Shared-memory starvation of LSU traffic (softmax P^T stores, epilogue staging) under a saturated tensor core: softmax 2.9K clk/tile, epilogue 16K clk/token"
+  "Stock trtllm-gen: 2-CTA V split delivers each KV row into two SMs (~2x the delivered-bytes floor) and runs sm_100f-form (half-rate) MMAs: 2.04 ms/layer in-step",
+  "Perf model omits the per-token KV row gather (19.3 GB/layer at F16K, measured delivered-bytes cap ~20 TB/s): floor ~0.94-1.07 ms/layer vs model 0.643",
+  "h2/h3 softmax chain: with one S buffer QK(u+1) waits for S(u) to be read; both WGs barrier per subtile; PFULL waits the slowest warp; the MMA warp issues QK behind PV's wait for P (measured: P(u)->S(u+2) 2.8K clk, softmax 1.1-2.3K clk per 64-key subtile vs ~0.5K of instructions)",
+  "Split QK/PV issue warps (h3 run30/31) hang: unresolved; needed to take MMA issue off the softmax critical path"
  ],
  "rubin_features": [
   "tcgen05 FP8 kind::f8f6f4 with the Rubin 2x-K instruction descriptor",
@@ -29,13 +29,11 @@
   "PDL between prologue, attention and w_uv"
  ],
  "plan": [
-  "1. DONE stock chain, operand-fetch, gather floors (LDG, gather4 1-16 warps, multicast pairs, aligned pitch)",
-  "2. DONE model fix evidence: delivered-bytes cap ~18 TB/s -> F16K floor 1.07 ms/layer for one gather per token-row; corrected achievable for the slice = 6 x (1.07 + 0.019) = 6.53 ms (target 7.2)",
-  "3. Keys-on-M kernel to the floor: phase trace (run11) -> 3-stage ring + many TMA gather warps + pipelined MMA order + cheap softmax; target ~1.12-1.2 ms/layer",
-  "4. Dispatch on (DISPATCH=True when it beats trtllm-gen at F8K/F16K): removes the head-pad pass (174 us/layer)",
-  "5. Prologue: Q FP8 quant fused (into the attention kernel's Q load or the w_uk epilogue, stock rounding)",
-  "6. gate_mul into the w_uv epilogue",
-  "7. tests vs stock, microbench F8K/F16K, step_p A/B on an int-based overlay, landed-ready"
+  "1. DONE floors: gather (LDG, gather4 1-16 warps, multicast pairs, aligned pitch, die-local), MMA operand fetch, gather + concurrent MMA operand reads",
+  "2. DONE model-fix evidence (sparse_mla achievable must include the delivered-bytes gather term; ~0.97 ms/layer at F16K)",
+  "3. Kernel to ~1.1 ms/layer: debug the split QK/PV issue warps in h3 (run30/31 hang), then cut the softmax per subtile (P math+stores 0.9K clk: FFMA2/ex2 emulation share, fewer cvt; publish barrier 0.4K) so the period approaches the gather (~1.0-1.1K clk per 64-key stage)",
+  "4. Dispatch (sparse_mla.supported/DISPATCH wiring exists for the old kernel; point it at the winner) once < 2.04 ms/layer at F8K and F16K; removes the 96->128 head-pad pass too",
+  "5. step_p A/B on an int-based overlay, landed-ready"
  ],
  "work": [
   {
@@ -137,16 +135,27 @@
    "t": "20:00",
    "what": "run23-24: h2 with one-barrier softmax fast path, direct global epilogue, 7 then 6 stages + per-token slot-row bulk copy into smem",
    "result": "2.80 -> 2.59 ms (stock 2.08); stamps: gather issue paced at ~2.3K clk per 64-key stage even with free stages: gather4 issue costs ~200 clk per instruction per warp under load and the busiest warps issued 10 per stage. run25: 32 warps, 16 gather warps x 1 quad."
+  },
+  {
+   "t": "22:30",
+   "what": "run27-31: h3 (S double-buffered, warpgroup per subtile; Q latent half TMEM / half SS) + softmax sub-step stamps; split QK/PV issue warps",
+   "result": "h3 correct with one MMA warp but 4.2 ms (softmax 2.3K clk/subtile incl. 1.1K waiting for the other WG's max shift; MMA issue of QK(u+2) serialised behind PV(u)'s wait for P(u): 2.8K clk gap). Split QK/PV warps hang (run30/31, not yet root-caused). Best: h2 2.59 ms/layer standalone vs trtllm-gen 2.08; not dispatched."
+  },
+  {
+   "t": "22:45",
+   "what": "run32: verify branch head 3c0ec57976 (h2 restored to its best config, h3 excluded)",
+   "result": "5/5 tests pass (FP32 reference incl. lazy-max slow path and empty rows; no worse than trtllm-gen vs FP32); F16K standalone: trtllm-gen 2086.5 us, h2 2594.5, sol 3105.6 per layer"
   }
  ],
- "next": "run25 -> if issue-paced still: fewer instructions per row (rope box merged / LDG path) or more warps; then softmax (1.1K/subtile) is next; dispatch when < 2.08 ms.",
- "blockers": "ncu/nsys not in the image (phase timing must come from in-kernel clock64 stamps); pool contended (1-GPU runs waited 30-60 min)",
- "branch": "wzhao/k31ws-p-mla @ 66942c3358 (+ uncommitted h2 iterations)",
+ "next": "HANDOFF (see findings 22:30): (1) run32 done: h2 2.59 ms, tests pass; (2) debug h3 split QK/PV warps hang: add a watchdog stamp per barrier wait (clock + barrier id into the stamps buffer) and run tests on 1 GPU (bash benchmarks/kernels/pmla_run31.sh pattern); suspects: tcgen05.mma issued from two warps without tcgen05 fences between them, PVDONE[w] wait before P stores, copier/EPIDONE ordering at short tokens; (3) then softmax cost per subtile. Commands: stage with bash k31ws/tools/mkov.sh /Users/weizha/k31ws-wt/p-mla p-mla-<sha>-<n>; run with ssh rhea 'cd $K && setsid nohup bash tools/wsgpu.sh -g 1 -m 25 -o <ov> -n P-MLA -- bash benchmarks/kernels/pmla_runNN.sh > $K/runs/P-MLA/runNN/wsgpu.log 2>&1 < /dev/null &'; bench: benchmark_kimi_k3_prefill_sparse_mla.py --tokens 16384 --qmag 0.15 --stamps --loaders \"\" [--h2-knobs no_store:no_mma:mode]; tests: pytest --noconftest -q tests/models/kimi_k3/test_specialized_prefill_sparse_mla.py -k 'sol or stock'.",
+ "blockers": "ncu/nsys not in the image (in-kernel clock64 stamps used); h3 split-warp hang unresolved",
+ "branch": "wzhao/k31ws-p-mla @ 3c0ec57976 (pushed to wzhao18)",
  "evidence": [
   "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1 (stock chain per kernel)",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run2, run3 (tcgen05 operand fetch, SMEM write contention, gather4 1-4 warps)",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run4, run5 (gather4 8/16 warps; die-local vs striped)",
-  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run8, run9 (specialized kernel tests + F16K bench)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run4, run5, run10, run22 (gather floors: warps, die-local, multicast pairs, aligned pitch, concurrent MMA operand reads)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run11-16 (keys-on-M phase stamps, knob decomposition, B collector)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run17-26 (h2 hybrid kernel iterations, diag modes)",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run27-31 (h3, softmax sub-step stamps, split-warp hang)",
   "k31ws/findings/P-MLA.md"
  ],
  "ckpt": "nvfp4"
