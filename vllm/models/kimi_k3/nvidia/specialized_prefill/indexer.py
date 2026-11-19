@@ -49,13 +49,33 @@ from cutlass.experimental import primitives as nvvm
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
     asm,
 )
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import indexer as _sdec
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
+    BINS,
+    CANDIDATES,
+    FINE,
+    HOT,
+    LOW,
+    SELECT_THREADS,
+    SELECT_WARPS,
+    block_exclusive,
+    fine_bin_of,
+    half,
+    load_16b,
+    low_digit,
+    shared_add,
+    store_shared_words,
+    topdown,
+    vector_keys,
+    vector_max,
+)
 
 HEADS = 32
 DIM = 128
 TILE = 128  # keys per MMA tile (M)
 BQ = 8  # query tokens per work item
 N = BQ * HEADS  # MMA N
-KV_STAGES = 4
+KV_STAGES = 6
 Q_STAGES = 2
 ACC_STAGES = 2
 EPI_WG = 4  # epilogue warpgroups
@@ -63,14 +83,11 @@ TOK_WG = BQ // EPI_WG  # tokens per epilogue warpgroup
 PRODUCER = 4 * EPI_WG
 MMA_WARP = PRODUCER + 1
 THREADS = 32 * (MMA_WARP + 1)
-CAP = 3072  # candidate buffer per token
-CHECK = 4  # tiles between buffer checks
-TRIGGER = CAP - CHECK * TILE  # compact when a buffer holds more
+TOK_PROC = BQ * ACC_STAGES // EPI_WG  # tokens per warpgroup and processed tile
+OUT_BUFS = 3  # staging buffers per warpgroup (one per processed tile in flight)
 TMEM_COLS = 576  # exclusive allocation: 2 x N accumulators + scale factors
 SF_WORDS_A = TILE  # one 32-bit word (four UE8M0) per key
 SF_WORDS_B = N
-HIST = 256
-KEY_BITS = 17  # key indices < 2^17 (max_model_len 131072)
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +116,27 @@ def bulk_g2s(dst, src, barrier, size):
     return code, "r,l,r,r,~{memory}", (Int32(dst), Int64(src), barrier, Int32(size))
 
 
+@asm()
+def bulk_s2g(dst, src, size):
+    code = "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    return code, "l,r,r,~{memory}", (Int64(dst), Int32(src), Int32(size))
+
+
+@asm()
+def bulk_commit():
+    return "cp.async.bulk.commit_group;", "~{memory}", ()
+
+
+@asm()
+def bulk_wait_read1():
+    return "cp.async.bulk.wait_group.read 1;", "~{memory}", ()
+
+
+@asm()
+def bulk_wait_all():
+    return "cp.async.bulk.wait_group 0;", "~{memory}", ()
+
+
 @asm(Uint32)
 def ld_global_u32(address):
     return "ld.global.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
@@ -113,6 +151,13 @@ def st_global_u32(address, value):
 def st_global_u16(address, value):
     code = "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.b16 [$0], t; }"
     return code, "l,r,~{memory}", (Int64(address), Uint32(value))
+
+
+@asm()
+def lds_v4(address):
+    """Four shared words (16-byte aligned)."""
+    code = "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];"
+    return code, "=r,=r,=r,=r,r,~{memory}", (Int32(address),), (Uint32,) * 4
 
 
 @asm(Uint32)
@@ -152,6 +197,21 @@ def st_shared_v4(address, a, b, c, d):
 def atom_add_shared(address, value):
     code = "atom.shared.add.u32 $0, [$1], $2;"
     return code, "=r,r,r,~{memory}", (Int32(address), Uint32(value))
+
+
+@asm()
+def red_add_u64(address, value):
+    return "red.global.add.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
+
+
+@asm(Int64)
+def clock64():
+    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
+
+
+@asm(Int64)
+def globaltimer():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
 
 
 @asm(Uint32, pure=True)
@@ -207,15 +267,19 @@ def sf_word(row: int) -> int:
     return 128 * (row // 128) + 4 * (row % 32) + (row % 128) // 32
 
 
-class IndexerScoreSelect:
+class IndexerScore:
     """Exact top-``topk`` key indices of every query row of the step's prefill
     requests (see the module docstring)."""
 
-    def __init__(self, ctas: int, topk: int = 2048, debug_logits: bool = False):
-        assert topk <= TRIGGER - TILE
+    def __init__(
+        self, ctas: int, mode: int = 0,
+    ):
+        """mode (bench only): 0 full, 1 logits without selection, 2 MMA +
+        pipeline only (the epilogue releases the accumulators unread)."""
+        self.no_store = mode == 3
+        self.prof = mode == 4
+        self.mode = 0 if mode in (3, 4) else mode
         self.ctas = ctas
-        self.topk = topk
-        self.debug_logits = debug_logits
         self.tiler = (TILE, N, DIM)
 
     @cute.jit
@@ -228,9 +292,9 @@ class IndexerScoreSelect:
         weights: cute.Tensor,  # Int32 [T, 16]: BF16x2 head weights
         row_len: cute.Tensor,  # Int32 [T]: valid keys of each row
         items: cute.Tensor,  # Int32 [n_items, 4]: token0, ntok, key0, ntiles
-        out_idx: cute.Tensor,  # Int32 [T, topk]: selected key indices (unordered)
-        out_cnt: cute.Tensor,  # Int32 [T]: selected count (min(topk, row_len))
-        logits: cute.Tensor,  # Int16 [T, pitch] (debug_logits) else [1, 1]
+        row_base: cute.Tensor,  # Int64 [T]: row t's first element in logits
+        logits: cute.Tensor,  # Int16 [*]: BF16 logits scratch
+        tops: cute.Tensor,  # Int16 [*]: each 8 logits' largest order-preserving key
         s,
     ):
         fp4 = cutlass.Float4E2M1FN
@@ -322,203 +386,15 @@ class IndexerScoreSelect:
             weights,
             row_len,
             items,
-            out_idx,
-            out_cnt,
+            row_base,
             logits,
+            tops,
         ).launch(
             grid=[self.ctas, 1, 1],
             block=[THREADS, 1, 1],
             stream=s,
             use_pdl=True,
         )
-
-    # ------------------------------------------------------------------
-    # Selection helpers (one epilogue warpgroup, 128 threads)
-    # ------------------------------------------------------------------
-    @cute.jit
-    def insert(self, tok, key, kbits, valid, tau, bufs, lane):
-        """Append (key, kbits) to token ``tok``'s buffer if valid and kbits >= tau."""
-        buf_i, buf_k, cnt_a = bufs
-        ok = cutlass.Boolean(False)
-        if valid:
-            if kbits >= tau:
-                ok = cutlass.Boolean(True)
-        m = cute.arch.vote_ballot_sync(ok)
-        if m != Uint32(0):
-            base = Uint32(0)
-            if lane == 0:
-                base = atom_add_shared(cnt_a + tok * 4, popc(m))
-            base = cute.arch.shuffle_sync(base, 0)
-            if ok:
-                pos = base + popc(m & lanemask_lt())
-                st_shared_u32(buf_i + (tok * CAP + pos) * 4, key)
-                st_shared_u16(buf_k + (tok * CAP + pos) * 2, kbits)
-
-    @cute.jit
-    def topdown(self, hist_a, need, lane):
-        """Warp-level: the bin b (scanning from the top) where the running count
-        reaches ``need``; returns (b, count of keys in bins above b)."""
-        # lane l owns bins 255 - 8l - j, j < 8 (descending)
-        counts = [ld_shared_u32(hist_a + (255 - 8 * lane - j) * 4) for j in range(8)]
-        total = Uint32(0)
-        for j in cutlass.range_constexpr(8):
-            total += counts[j]
-        incl = total
-        for i in cutlass.range_constexpr(5):
-            up = cute.arch.shuffle_sync_up(incl, offset=1 << i, mask_and_clamp=0)
-            if lane >= Int32(1 << i):
-                incl += up
-        excl = incl - total
-        hit = cutlass.Boolean(False)
-        if excl < need:
-            if incl >= need:
-                hit = cutlass.Boolean(True)
-        m = cute.arch.vote_ballot_sync(hit)
-        src = Int32(31)
-        if m != Uint32(0):
-            src = Int32(31) - Int32(clz(m))
-        b = Uint32(0)
-        above = Uint32(0)
-        if hit:
-            run = excl
-            found = Int32(0)
-            for j in cutlass.range_constexpr(8):
-                if found == 0:
-                    if run + counts[j] >= need:
-                        b = Uint32(255 - 8 * lane - j)
-                        above = run
-                        found = Int32(1)
-                    else:
-                        run += counts[j]
-        b = cute.arch.shuffle_sync(b, src)
-        above = cute.arch.shuffle_sync(above, src)
-        return b, above
-
-    @cute.jit
-    def compact(self, tok, n, need, keep_ties, sm, lt, wg, lane):
-        """Keep the top ``need`` of token ``tok``'s ``n`` buffered keys (ties to the
-        lowest key index; with ``keep_ties`` every key equal to the threshold is
-        kept when they fit). Returns (kept, threshold key)."""
-        buf_i, buf_k, cnt_a, hist_a, sel_a = sm
-        warp_in = lt // 32
-        # pass 1: high byte histogram
-        st_shared_u32(hist_a + lt * 4, Uint32(0))
-        st_shared_u32(hist_a + (lt + 128) * 4, Uint32(0))
-        wg_sync(wg)
-        for i in cutlass.range(lt, Int32(n), 128, unroll=1):
-            k = ld_shared_u16(buf_k + (tok * CAP + i) * 2)
-            atom_add_shared(hist_a + (k >> Uint32(8)) * 4, Uint32(1))
-        wg_sync(wg)
-        if warp_in == 0:
-            b, above = self.topdown(hist_a, need, lane)
-            if lane == 0:
-                st_shared_u32(sel_a, b)
-                st_shared_u32(sel_a + 4, above)
-        wg_sync(wg)
-        b = ld_shared_u32(sel_a)
-        above = ld_shared_u32(sel_a + 4)
-        st_shared_u32(hist_a + lt * 4, Uint32(0))
-        st_shared_u32(hist_a + (lt + 128) * 4, Uint32(0))
-        wg_sync(wg)
-        for i in cutlass.range(lt, Int32(n), 128, unroll=1):
-            k = ld_shared_u16(buf_k + (tok * CAP + i) * 2)
-            if (k >> Uint32(8)) == b:
-                atom_add_shared(hist_a + (k & Uint32(0xFF)) * 4, Uint32(1))
-        wg_sync(wg)
-        if warp_in == 0:
-            lo, above2 = self.topdown(hist_a, need - above, lane)
-            if lane == 0:
-                eq = ld_shared_u32(hist_a + lo * 4)
-                st_shared_u32(sel_a + 8, (b << Uint32(8)) | lo)
-                st_shared_u32(sel_a + 12, above + above2)
-                st_shared_u32(sel_a + 16, eq)
-        wg_sync(wg)
-        thr = ld_shared_u32(sel_a + 8)
-        gt = ld_shared_u32(sel_a + 12)
-        eq = ld_shared_u32(sel_a + 16)
-        # Ties: keep all of them if allowed and they fit, else the lowest indices.
-        cut = Uint32(0xFFFFFFFF)  # keep ties with key index < cut
-        cut_ties = cutlass.Boolean(True)
-        if cutlass.const_expr(keep_ties):
-            if gt + eq <= Uint32(TRIGGER):
-                cut_ties = cutlass.Boolean(False)
-        if cut_ties:
-            want = need - gt
-            if eq > want:
-                lo_i = Uint32(0)
-                hi_i = Uint32(1 << KEY_BITS)
-                while hi_i - lo_i > Uint32(1):
-                    mid = (lo_i + hi_i) >> Uint32(1)
-                    if lt == 0:
-                        st_shared_u32(sel_a + 20, Uint32(0))
-                    wg_sync(wg)
-                    c = Uint32(0)
-                    for i in cutlass.range(lt, Int32(n), 128, unroll=1):
-                        k = ld_shared_u16(buf_k + (tok * CAP + i) * 2)
-                        if k == thr:
-                            if ld_shared_u32(buf_i + (tok * CAP + i) * 4) < mid:
-                                c += Uint32(1)
-                    for o in cutlass.range_constexpr(5):
-                        c += cute.arch.shuffle_sync_bfly(c, offset=1 << o)
-                    if lane == 0:
-                        atom_add_shared(sel_a + 20, c)
-                    wg_sync(wg)
-                    total = ld_shared_u32(sel_a + 20)
-                    wg_sync(wg)
-                    if total <= want:
-                        lo_i = mid
-                    else:
-                        hi_i = mid
-                cut = lo_i
-        # compaction: strided elements into registers, scan, write back
-        ks = []
-        ids = []
-        keep = []
-        mine = Uint32(0)
-        for j in cutlass.range_constexpr(CAP // 128):
-            i = lt + 128 * j
-            k = Uint32(0)
-            idx = Uint32(0)
-            if i < n:
-                k = ld_shared_u16(buf_k + (tok * CAP + i) * 2)
-                idx = ld_shared_u32(buf_i + (tok * CAP + i) * 4)
-            kp = cutlass.Boolean(False)
-            if i < n:
-                if k > thr:
-                    kp = cutlass.Boolean(True)
-                elif k == thr:
-                    if idx < cut:
-                        kp = cutlass.Boolean(True)
-            if kp:
-                mine += Uint32(1)
-            ks.append(k)
-            ids.append(idx)
-            keep.append(kp)
-        incl = mine
-        for i in cutlass.range_constexpr(5):
-            up = cute.arch.shuffle_sync_up(incl, offset=1 << i, mask_and_clamp=0)
-            if lane >= Int32(1 << i):
-                incl += up
-        if lane == 31:
-            st_shared_u32(sel_a + 32 + warp_in * 4, incl)
-        wg_sync(wg)
-        wsum = Uint32(0)
-        total = Uint32(0)
-        for w in cutlass.range_constexpr(4):
-            v = ld_shared_u32(sel_a + 32 + w * 4)
-            if Int32(w) < warp_in:
-                wsum += v
-            total += v
-        pos = wsum + incl - mine
-        for j in cutlass.range_constexpr(CAP // 128):
-            if keep[j]:
-                st_shared_u32(buf_i + (tok * CAP + pos) * 4, ids[j])
-                st_shared_u16(buf_k + (tok * CAP + pos) * 2, ks[j])
-                pos += Uint32(1)
-        if lt == 0:
-            st_shared_u32(cnt_a + tok * 4, total)
-        wg_sync(wg)
-        return total, thr
 
     # ------------------------------------------------------------------
     @cute.kernel
@@ -540,9 +416,9 @@ class IndexerScoreSelect:
         weights: cute.Tensor,
         row_len: cute.Tensor,
         items: cute.Tensor,
-        out_idx: cute.Tensor,
-        out_cnt: cute.Tensor,
+        row_base: cute.Tensor,
         logits: cute.Tensor,
+        tops: cute.Tensor,
     ):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -559,11 +435,11 @@ class IndexerScoreSelect:
             q_empty: cute.struct.MemRange[cutlass.Int64, Q_STAGES]
             acc_full: cute.struct.MemRange[cutlass.Int64, ACC_STAGES]
             acc_empty: cute.struct.MemRange[cutlass.Int64, ACC_STAGES]
+            stage_out: cute.struct.Align[
+                cute.struct.MemRange[Uint32, EPI_WG * OUT_BUFS * TOK_PROC * 72], 16
+            ]
             tmem_hold: Int32
             row_end: cute.struct.MemRange[Int32, Q_STAGES * BQ]
-            cnt: cute.struct.MemRange[Uint32, BQ]
-            sel: cute.struct.MemRange[Uint32, EPI_WG * 16]
-            hist: cute.struct.Align[cute.struct.MemRange[Uint32, EPI_WG * HIST], 16]
             w: cute.struct.Align[cute.struct.MemRange[Uint32, Q_STAGES * BQ * 16], 16]
 
         smem = utils.SmemAllocator()
@@ -576,8 +452,6 @@ class IndexerScoreSelect:
         )
         sSFA = smem.allocate_tensor(sf_t, sfa_layout, 128)
         sSFB = smem.allocate_tensor(sf_t, sfb_layout, 128)
-        sBufI = smem.allocate_tensor(Uint32, cute.make_layout((BQ * CAP,)), 16)
-        sBufK = smem.allocate_tensor(cutlass.Uint16, cute.make_layout((BQ * CAP,)), 16)
 
         kv_full = st.kv_full.data_ptr()
         kv_empty = st.kv_empty.data_ptr()
@@ -586,12 +460,9 @@ class IndexerScoreSelect:
         acc_full = st.acc_full.data_ptr()
         acc_empty = st.acc_empty.data_ptr()
         end_a = st.row_end.data_ptr().toint()
-        cnt_a = st.cnt.data_ptr().toint()
         w_a = st.w.data_ptr().toint()
         sfa_a = sSFA.iterator.toint()
         sfb_a = sSFB.iterator.toint()
-        buf_i = sBufI.iterator.toint()
-        buf_k = sBufK.iterator.toint()
         if tidx == 0:
             for i in cutlass.range_constexpr(KV_STAGES):
                 cute.arch.mbarrier_init(kv_full + i, 1)
@@ -601,10 +472,8 @@ class IndexerScoreSelect:
                 cute.arch.mbarrier_init(q_empty + i, 1 + 4 * EPI_WG)
             for i in cutlass.range_constexpr(ACC_STAGES):
                 cute.arch.mbarrier_init(acc_full + i, 1)
-                cute.arch.mbarrier_init(acc_empty + i, 4 * EPI_WG)
+                cute.arch.mbarrier_init(acc_empty + i, 4 * EPI_WG // ACC_STAGES)
             cute.arch.mbarrier_init_fence()
-        if tidx < BQ:
-            st_shared_u32(cnt_a + tidx * 4, Uint32(0))
         if warp == PRODUCER:
             cpasync.prefetch_descriptor(tma_k)
             cpasync.prefetch_descriptor(tma_q)
@@ -751,8 +620,9 @@ class IndexerScoreSelect:
                 jq += 1
         else:
             self.epilogue(
-                tAcc, acc_full, acc_empty, q_full, q_empty, items, out_idx, out_cnt,
-                logits, (end_a, w_a, cnt_a, buf_i, buf_k, st), warp, tidx, bid, lane,
+                tAcc, acc_full, acc_empty, q_full, q_empty, items, row_base, logits,
+                tops, (end_a, w_a, st.stage_out.data_ptr().toint()), warp, tidx, bid,
+                lane,
             )
 
         cute.arch.sync_threads()
@@ -789,140 +659,391 @@ class IndexerScoreSelect:
 
     @cute.jit
     def epilogue(
-        self, tAcc, acc_full, acc_empty, q_full, q_empty, items, out_idx, out_cnt,
-        logits, sm, warp, tidx, bid, lane,
+        self, tAcc, acc_full, acc_empty, q_full, q_empty, items, row_base, logits,
+        tops, sm, warp, tidx, bid, lane,
     ):
-        end_a, w_a, cnt_a, buf_i, buf_k, st = sm
+        """Warpgroup pair p = wg // 2 owns accumulator stage p (every other tile);
+        warpgroup wg takes tokens 4 * (wg % 2) .. + 4 of it, so the pairs' TMEM
+        reads and math interleave. Per tile: BF16 logits at stock precision in
+        MMA-row (position) order and their 8-position maxima, staged in shared
+        memory, then bulk stores (row t's scratch at row_base[t])."""
+        end_a, w_a, stage_a = sm
         wg = warp // 4
+        pair = wg // 2
+        tok0 = (wg % 2) * TOK_PROC
         lt = tidx % 128
-        hist_a = st.hist.data_ptr().toint() + wg * HIST * 4
-        sel_a = st.sel.data_ptr().toint() + wg * 64
-        csm = (buf_i, buf_k, cnt_a, hist_a, sel_a)
+        out_s = stage_a + wg * OUT_BUFS * TOK_PROC * 288
+        gq = Int32(0)
         n_items = items.shape[0]
-        ld_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(HEADS)), Float32)
+        ld_atom = cute.make_copy_atom(
+            tcgen05.Ld32x32bOp(tcgen05.Repetition(HEADS)), Float32
+        )
         acc_cols = cute.flat_divide(_mn_layout(tAcc), (TILE, HEADS))
         t2r = tcgen05.make_tmem_copy(ld_atom, acc_cols[(None, None, 0, 0, 0)])
         thr = t2r.get_slice(lt)
         tAll = thr.partition_S(acc_cols)
         cD = thr.partition_D(cute.make_identity_tensor((TILE, HEADS)))
+        out_a = logits.iterator.toint()
+        tops_a = tops.iterator.toint()
         acc_it = Int32(0)
         jq = Int32(0)
-        topk = Uint32(self.topk)
+        pw_acc = Int64(0)
+        pw_math = Int64(0)
+        pw_stage = Int64(0)
+        pw_bar = Int64(0)
+        pw_n = Int64(0)
         for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
             token0 = items[item, 0]
             ntok = items[item, 1]
             ntiles = items[item, 3]
             qs = jq % Q_STAGES
             cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
-            tau0 = Uint32(0)
-            tau1 = Uint32(0)
-            ends = [
-                Int32(ld_shared_u32(end_a + (qs * BQ + wg * TOK_WG + j) * 4))
-                for j in range(TOK_WG)
-            ]
-            wregs = [
-                [
-                    ld_shared_u32(w_a + (qs * BQ * 16 + (wg * TOK_WG + j) * 16 + i) * 4)
-                    for i in range(16)
-                ]
-                for j in range(TOK_WG)
-            ]
+            ends = []
+            bases = []
+            tbases = []
+            for j in cutlass.range_constexpr(TOK_PROC):
+                tok = tok0 + j
+                ends.append(Int32(ld_shared_u32(end_a + (qs * BQ + tok) * 4)))
+                rb = Int64(0)
+                if tok < ntok:
+                    rb = row_base[token0 + tok]
+                bases.append(out_a + rb * 2)
+                tbases.append(tops_a + (rb >> 3) * 2)
+            wbase = w_a + (qs * BQ * 16 + tok0 * 16) * 4
             for tt in cutlass.range(ntiles, unroll=1):
                 t = ntiles - 1 - tt
                 a = acc_it % ACC_STAGES
-                cute.arch.mbarrier_wait(acc_full + a, (acc_it // ACC_STAGES) & 1)
-                key = t * TILE + 4 * (lt % 32) + lt // 32
-                bits = []
-                for j in cutlass.range_constexpr(TOK_WG):
-                    tok = wg * TOK_WG + j
-                    frag = cute.make_fragment_like(cD, Float32)
-                    cute.copy(t2r, tAll[(None, None, None, 0, tok, a)], frag)
-                    s0 = Uint32(0)
-                    s1 = Uint32(0)
-                    wr = wregs[j]
-                    for h in cutlass.range_constexpr(0, HEADS, 4):
-                        s0 = fma_bf16x2(relu_bf16x2(frag[h], frag[h + 1]), wr[h // 2], s0)
-                        s1 = fma_bf16x2(
-                            relu_bf16x2(frag[h + 2], frag[h + 3]), wr[h // 2 + 1], s1
-                        )
-                    pair = add_bf16x2(s0, s1)
-                    total = add_bf16x2(pair, pair >> Uint32(16)) & Uint32(0xFFFF)
-                    bits.append(total)
-                cute.arch.fence_view_async_tmem_load()
-                cute.arch.sync_warp()
-                if lane == 0:
-                    cute.arch.mbarrier_arrive(acc_empty + a)
-                for j in cutlass.range_constexpr(TOK_WG):
-                    tok = wg * TOK_WG + j
-                    valid = key < ends[j]
-                    if cutlass.const_expr(self.debug_logits):
-                        if valid:
-                            row = Int64(token0 + tok) * Int64(logits.shape[1])
-                            st_global_u16(
-                                logits.iterator.toint() + (row + Int64(key)) * 2, bits[j]
+                if a == pair:
+                    c0 = clock64()
+                    cute.arch.mbarrier_wait(acc_full + a, (acc_it // ACC_STAGES) & 1)
+                    c1 = clock64()
+                    bits = []
+                    for bt in cutlass.range_constexpr(TOK_PROC // 2):
+                        frags = []
+                        for j in cutlass.range_constexpr(2):
+                            frag = cute.make_fragment_like(cD, Float32)
+                            cute.copy(
+                                t2r,
+                                tAll[(None, None, None, 0, tok0 + 2 * bt + j, a)],
+                                frag,
                             )
-                    self.insert(
-                        Uint32(tok), Uint32(key), order16(bits[j]), valid,
-                        tau0 if j == 0 else tau1,
-                        (buf_i, buf_k, cnt_a), lane,
-                    )
+                            frags.append(frag)
+                        cute.arch.fence_view_async_tmem_load()
+                        if cutlass.const_expr(bt == TOK_PROC // 2 - 1):
+                            cute.arch.sync_warp()
+                            if lane == 0:
+                                cute.arch.mbarrier_arrive(acc_empty + a)
+                        if cutlass.const_expr(self.mode < 2):
+                            ss = [[Uint32(0), Uint32(0)] for _ in range(2)]
+                            for h in cutlass.range_constexpr(0, HEADS, 8):
+                                for j in cutlass.range_constexpr(2):
+                                    fr = frags[j]
+                                    wr = lds_v4(wbase + ((2 * bt + j) * 16 + h // 2) * 4)
+                                    for g in cutlass.range_constexpr(2):
+                                        hh = h + 4 * g
+                                        ss[j][0] = fma_bf16x2(
+                                            relu_bf16x2(fr[hh], fr[hh + 1]), wr[2 * g], ss[j][0]
+                                        )
+                                        ss[j][1] = fma_bf16x2(
+                                            relu_bf16x2(fr[hh + 2], fr[hh + 3]),
+                                            wr[2 * g + 1],
+                                            ss[j][1],
+                                        )
+                            for j in cutlass.range_constexpr(2):
+                                pr = add_bf16x2(ss[j][0], ss[j][1])
+                                bits.append(add_bf16x2(pr, pr >> Uint32(16)) & Uint32(0xFFFF))
+                    c2 = clock64()
+                    if cutlass.const_expr(self.mode == 0):
+                        kidx = t * TILE + 4 * (lt % 32) + lt // 32
+                        ob = out_s + (gq % OUT_BUFS) * TOK_PROC * 288
+                        for j in cutlass.range_constexpr(TOK_PROC):
+                            v = Uint32(0xFFFF)
+                            if kidx < ends[j]:
+                                v = bits[j]
+                            st_shared_u16(ob + j * 288 + lt * 2, v)
+                        fence_async_shared()
+                        c3 = clock64()
+                        wg_sync(wg)
+                        c4 = clock64()
+                        if cutlass.const_expr(self.prof):
+                            pw_acc += c1 - c0
+                            pw_math += c2 - c1
+                            pw_stage += c3 - c2
+                            pw_bar += c4 - c3
+                            pw_n += Int64(1)
+                        if cutlass.const_expr(not self.no_store):
+                            if lt == 0:
+                                for j in cutlass.range_constexpr(TOK_PROC):
+                                    if ends[j] > 0:
+                                        bulk_s2g(
+                                            bases[j] + Int64(t * TILE) * 2, ob + j * 288, 256
+                                        )
+                                bulk_commit()
+                                bulk_wait_read1()
+                        gq += 1
                 acc_it += 1
-                if tt % CHECK == CHECK - 1:
-                    wg_sync(wg)
-                    for j in cutlass.range_constexpr(TOK_WG):
-                        tok = wg * TOK_WG + j
-                        c = ld_shared_u32(cnt_a + tok * 4)
-                        if c > Uint32(TRIGGER):
-                            _kept, thr_k = self.compact(
-                                Uint32(tok), c, topk, True, csm, lt, wg, lane
-                            )
-                            if cutlass.const_expr(j == 0):
-                                tau0 = thr_k
-                            else:
-                                tau1 = thr_k
-            # item end: exact top-k of each own token, written out
-            wg_sync(wg)
-            for j in cutlass.range_constexpr(TOK_WG):
-                tok = wg * TOK_WG + j
-                if tok < ntok:
-                    c = ld_shared_u32(cnt_a + tok * 4)
-                    kept = c
-                    if c > topk:
-                        kept, _thr = self.compact(Uint32(tok), c, topk, False, csm, lt, wg, lane)
-                    row = token0 + tok
-                    for i in cutlass.range(lt, Int32(kept), 128, unroll=1):
-                        st_global_u32(
-                            out_idx.iterator.toint() + (Int64(row) * Int64(self.topk) + Int64(i)) * 4,
-                            ld_shared_u32(buf_i + (tok * CAP + i) * 4),
-                        )
-                    if lt == 0:
-                        out_cnt[row] = Int32(kept)
-                wg_sync(wg)
-                if lt == 0:
-                    st_shared_u32(cnt_a + tok * 4, Uint32(0))
-            wg_sync(wg)
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(q_empty + qs)
             jq += 1
+        if lt == 0:
+            bulk_wait_all()
+        if cutlass.const_expr(self.prof):
+            if lane == 0:
+                pa = tops_a + Int64(tops.shape[0]) * 2 - 64
+                red_add_u64(pa, pw_acc)
+                red_add_u64(pa + 8, pw_math)
+                red_add_u64(pa + 16, pw_stage)
+                red_add_u64(pa + 24, pw_bar)
+                red_add_u64(pa + 32, pw_n)
+
+
+# --------------------------------------------------------------------------
+# Exact top-k over the logits scratch (one CTA per row)
+# --------------------------------------------------------------------------
+SEL_TOPS = 16384  # vector maxima per row in shared memory (rows <= 131072 keys)
+SEL_UNROLL = 8  # 16-byte logits loads in flight per thread
+
+
+class PrefillSelect(_sdec.IndexerSelect):
+    """sdec IndexerSelect (exact top-k, ties to the lowest key index, output in key
+    order) for prefill rows: row r's BF16 logits at logits[row_base[r] + key] for
+    key < row_len[r]; pass 1 reads the logits themselves (the vector maxima are
+    computed here, not by the scorer). Writes the key indices, -1 padded."""
+
+    def __init__(self, topk: int = 2048):
+        assert topk % SELECT_THREADS == 0
+        self.topk = topk
+        self.q = 1
+        self.rows = 0
+        self.logical = False
+        self.release = True
+        self.page_shift = 6
+
+    @cute.jit
+    def __call__(self, logits, tops, row_base, row_len, out, s):
+        self.kernel((logits, tops, row_base, row_len, out)).launch(
+            grid=(row_len.shape[0], 1, 1),
+            block=(SELECT_THREADS, 1, 1),
+            stream=s,
+            use_pdl=True,
+        )
+
+    @cute.jit
+    def emit(self, out, ids, table, request, row, pos, key, block_rows):
+        # logits position -> key index (rows of a tile in SF-atom order)
+        p = Int32(key)
+        out[row, pos] = (p & Int32(-TILE)) | ((p & Int32(31)) << 2) | ((p >> 5) & Int32(3))
+
+    @cute.jit
+    def vector_top(self, tops_s, tops_address, v):
+        return Uint32(tops_s[v])
+
+    @cute.kernel
+    def kernel(self, args):
+        logits, tops, row_base, row_ends, out = args
+        K = self.topk
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(tid // 32)
+        lane = tid % 32
+        smem = utils.SmemAllocator()
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(BINS), 16)
+        whist = smem.allocate_tensor(Uint32, cute.make_layout((LOW, SELECT_WARPS)), 16)
+        wabove = smem.allocate_tensor(Uint32, cute.make_layout(SELECT_WARPS), 16)
+        wpre = smem.allocate_tensor(Uint32, cute.make_layout((2, SELECT_WARPS)), 16)
+        pub = smem.allocate_tensor(Uint32, cute.make_layout(LOW + 1), 16)
+        scan = smem.allocate_tensor(Uint32, cute.make_layout(SELECT_WARPS), 16)
+        info = smem.allocate_tensor(Int32, cute.make_layout(8), 16)
+        fine_hist = smem.allocate_tensor(Uint32, cute.make_layout(FINE), 16)
+        cand_index = smem.allocate_tensor(Int32, cute.make_layout(CANDIDATES), 16)
+        hot_list = smem.allocate_tensor(Int32, cute.make_layout(HOT), 16)
+        cand_key = smem.allocate_tensor(Uint32, cute.make_layout(CANDIDATES), 16)
+        tops_s = smem.allocate_tensor(cutlass.Uint16, cute.make_layout(SEL_TOPS), 16)
+        for b in cutlass.range(tid, BINS, SELECT_THREADS, unroll=1):
+            hist[b] = Uint32(0)
+        whist[lane, warp] = Uint32(0)
+        if tid < FINE:
+            fine_hist[tid] = Uint32(0)
+        cute.arch.sync_threads()
+        self.pdl()
+        length = row_ends[row]
+        emit_args = out, out, Int32(0), Int32(0), row, Int32(0)
+        if length <= K:
+            n = cutlass.max(length, Int32(0))
+            for e in cutlass.range(tid, K, SELECT_THREADS, unroll=1):
+                if e < n:
+                    out[row, e] = e
+                else:
+                    out[row, e] = Int32(-1)
+        else:
+            # positions (MMA-row order) of whole tiles; padding keys hold 0xFFFF
+            length = (length + TILE - 1) // TILE * TILE
+            address = logits.iterator.toint() + row_base[row] * 2
+            vectors = (length + 7) // 8
+            dense = vectors < 2 * K
+            run = (vectors + SELECT_THREADS - 1) // SELECT_THREADS
+            run = run + 1 - run % 2
+            l0 = cutlass.min(tid * run, vectors)
+            l1 = cutlass.min(l0 + run, vectors)
+            # Pass 1: histogram of the scorer's vector maxima, kept in shared
+            # memory (dense rows: of the keys, maxima computed here).
+            step = SELECT_THREADS * SEL_UNROLL
+            for base in cutlass.range(0, vectors, step, unroll=1):
+                batch = []
+                for u in cutlass.range_constexpr(SEL_UNROLL):
+                    v = base + u * SELECT_THREADS + tid
+                    words = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    if v < vectors:
+                        words = self.vector(address, v)
+                    batch.append(words)
+                for u in cutlass.range_constexpr(SEL_UNROLL):
+                    v = base + u * SELECT_THREADS + tid
+                    if v < vectors:
+                        keys = vector_keys(batch[u], v, length)
+                        top = vector_max(keys)
+                        tops_s[v] = cutlass.Uint16(top)
+                        if dense:
+                            for e in cutlass.range_constexpr(8):
+                                if v * 8 + e < length:
+                                    shared_add(hist.iterator + (half(keys, e) >> Uint32(5)), 1)
+                        else:
+                            shared_add(hist.iterator + (top >> Uint32(5)), 1)
+            cute.arch.sync_threads()
+            topdown(hist, BINS, Uint32(K), info, 2, scan, tid, warp, lane)
+            b0 = Uint32(info[2])
+            low = b0 << Uint32(5)
+            if not dense:
+                for v in cutlass.range(l0, l1, unroll=1):
+                    top = Uint32(tops_s[v])
+                    if (top >> Uint32(5)) == b0:
+                        shared_add(fine_hist.iterator + (top & Uint32(31)), 1)
+                cute.arch.sync_threads()
+                if warp == 0:
+                    need = Uint32(K) - Uint32(info[3])
+                    digit, _ = low_digit(fine_hist[lane], need, lane)
+                    if lane == 0:
+                        info[4] = Int32(low | digit)
+                cute.arch.sync_threads()
+                if tid < LOW:
+                    fine_hist[tid] = Uint32(0)
+                cute.arch.sync_threads()
+                low = Uint32(info[4])
+            count = Uint32(0)
+            for v in cutlass.range(l0, l1, unroll=1):
+                if Uint32(tops_s[v]) >= low:
+                    count += Uint32(1)
+            slot, hot = block_exclusive(count, scan, warp, lane)
+            if hot <= Uint32(HOT):
+                for v in cutlass.range(l0, l1, unroll=1):
+                    if Uint32(tops_s[v]) >= low:
+                        hot_list[slot] = v
+                        slot += Uint32(1)
+            cute.arch.sync_threads()
+            listed = Uint32(CANDIDATES + 1)
+            if hot <= Uint32(HOT):
+                per = (hot + SELECT_THREADS - 1) // SELECT_THREADS
+                h0 = cutlass.min(Uint32(tid) * per, hot)
+                h1 = cutlass.min(h0 + per, hot)
+                batch = []
+                for u in cutlass.range_constexpr(HOT // SELECT_THREADS):
+                    words = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    v = Int32(0)
+                    if h0 + u < h1:
+                        v = hot_list[h0 + u]
+                        words = self.vector(address, v)
+                    batch.append((v, words))
+                count = Uint32(0)
+                for u in cutlass.range_constexpr(HOT // SELECT_THREADS):
+                    v, words = batch[u]
+                    if h0 + u < h1:
+                        keys = vector_keys(words, v, length)
+                        count += self.count_at_least(keys, v, length, low)
+                slot, listed = block_exclusive(count, scan, warp, lane)
+                if listed <= Uint32(CANDIDATES):
+                    for u in cutlass.range_constexpr(HOT // SELECT_THREADS):
+                        v, words = batch[u]
+                        if h0 + u < h1:
+                            keys = vector_keys(words, v, length)
+                            for e in cutlass.range_constexpr(8):
+                                key = half(keys, e)
+                                if key >= low and v * 8 + e < length:
+                                    cand_index[slot] = v * 8 + e
+                                    cand_key[slot] = key
+                                    fine = fine_bin_of(key, b0)
+                                    shared_add(fine_hist.iterator + fine, 1)
+                                    slot += Uint32(1)
+            if tid == 0:
+                info[2] = Int32(FINE - 1)
+                info[3] = Int32(0)
+            cute.arch.sync_threads()
+            topdown(fine_hist, FINE, Uint32(K), info, 2, scan, tid, warp, lane)
+            fine_bin = Uint32(info[2])
+            above_fine = Uint32(info[3])
+            sm = hist, whist, wabove, wpre, pub, scan, info
+            if listed > Uint32(CANDIDATES) or fine_bin == Uint32(FINE - 1):
+                self.exact(sm, address, length, emit_args, tid, warp, lane)
+            else:
+                share = (listed + SELECT_WARPS - 1) // SELECT_WARPS
+                first = cutlass.min(warp * share, listed)
+                last = cutlass.min(first + share, listed)
+                above = Uint32(0)
+                for i in cutlass.range(first + lane, last, 32, unroll=1):
+                    key = cand_key[i]
+                    fine = fine_bin_of(key, b0)
+                    if fine > fine_bin:
+                        above += Uint32(1)
+                    elif fine == fine_bin:
+                        shared_add(whist.iterator + warp * LOW + (key & Uint32(31)), 1)
+                for i in cutlass.range_constexpr(5):
+                    above += cute.arch.shuffle_sync_bfly(above, 1 << i)
+                if lane == 0:
+                    wabove[warp] = above
+                cute.arch.sync_threads()
+                self.publish(whist, wabove, pub, tid)
+                self.resolve(pub, info, whist, wabove, wpre, above_fine, warp, lane)
+                threshold = ((b0 + fine_bin) << Uint32(5)) | Uint32(info[4])
+                take = Uint32(info[5])
+                carry_a = wpre[0, warp]
+                carry_t = wpre[1, warp]
+                for start in cutlass.range(first, last, 32, unroll=1):
+                    i = start + lane
+                    key = Uint32(0)
+                    index = Int32(0)
+                    n = Uint32(0)
+                    if i < last:
+                        key = cand_key[i]
+                        index = cand_index[i]
+                        n = Uint32(1)
+                    carry_a, carry_t = self.write_selected(
+                        key, index, n, threshold, take, carry_a, carry_t, lane, emit_args
+                    )
 
 
 # --------------------------------------------------------------------------
 # Host side
 # --------------------------------------------------------------------------
-def plan_items(row_counts, row_lens_last, key_bases, device):
-    """Work items for requests with ``row_counts[r]`` query rows whose last row sees
-    ``row_lens_last[r]`` keys (row i of request r sees row_lens_last[r] -
-    row_counts[r] + 1 + i keys), keys of request r starting at ``key_bases[r]``.
-    Returns (items Int32 [n, 4], row_len Int32 [T]); items are ordered by
-    decreasing tile count (longest first)."""
-    items = []
-    lens = []
+def plan(row_counts, row_lens_last, key_bases, device):
+    """Work items and the logits scratch layout of the step's prefill requests.
+
+    Request r has ``row_counts[r]`` query rows; its last row sees
+    ``row_lens_last[r]`` keys (row i sees row_lens_last[r] - row_counts[r] + 1 + i),
+    its keys start at ``key_bases[r]`` (128-aligned) of the key tensor.
+
+    Returns (items Int32 [n, 4] longest first, row_len Int32 [T], row_base
+    Int64 [T], scratch elements): a request's rows are rows of
+    round_up(row_lens_last, 128) logits in the scratch.
+    """
+    items, lens, bases = [], [], []
     token = 0
+    scratch = 0
     for rows, last, kb in zip(row_counts, row_lens_last, key_bases):
         assert kb % TILE == 0, "request key bases must be 128-aligned"
         first = last - rows + 1
+        pitch = (last + TILE - 1) // TILE * TILE
         lens.extend(range(first, last + 1))
+        bases.extend(scratch + i * pitch for i in range(rows))
+        scratch += rows * pitch
         for o in range(0, rows, BQ):
             n = min(BQ, rows - o)
             hi = first + o + n - 1
@@ -931,19 +1052,17 @@ def plan_items(row_counts, row_lens_last, key_bases, device):
     items.sort(key=lambda it: -it[3])
     it = torch.tensor(items, dtype=torch.int32, device=device).view(-1, 4)
     ln = torch.tensor(lens, dtype=torch.int32, device=device)
-    return it, ln
+    rb = torch.tensor(bases, dtype=torch.int64, device=device)
+    return it, ln, rb, scratch
 
 
 @functools.cache
-def _compiled(ctas, topk, debug_logits):
+def _score_kernel(ctas, mode=0):
     from cutlass.cute.runtime import make_fake_stream
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
 
-    kernel = IndexerScoreSelect(ctas, topk, debug_logits)
-    t, nk, ni = cute.sym_int(), cute.sym_int(), cute.sym_int()
-    pitch = cute.sym_int() if debug_logits else 1
-    lt = cute.sym_int() if debug_logits else 1
+    t, nk = cute.sym_int(), cute.sym_int()
     args = (
         fake((cute.sym_int(), 64), dtype=cutlass.Uint8),
         fake((cute.sym_int(),), dtype=cutlass.Int32),
@@ -951,29 +1070,41 @@ def _compiled(ctas, topk, debug_logits):
         fake((nk,), dtype=cutlass.Int32),
         fake((t, 16), dtype=cutlass.Int32),
         fake((t,), dtype=cutlass.Int32),
-        fake((ni, 4), dtype=cutlass.Int32),
-        fake((t, topk), dtype=cutlass.Int32),
-        fake((t,), dtype=cutlass.Int32),
-        fake((lt, pitch), (pitch, 1), dtype=cutlass.Int16) if debug_logits else fake((1, 1), dtype=cutlass.Int16),
+        fake((cute.sym_int(), 4), dtype=cutlass.Int32),
+        fake((t,), dtype=cutlass.Int64),
+        fake((cute.sym_int(),), dtype=cutlass.Int16),
+        fake((cute.sym_int(),), dtype=cutlass.Int16),
         make_fake_stream(),
     )
-    return cute.compile(kernel, *args, options="--enable-tvm-ffi")
+    return cute.compile(IndexerScore(ctas, mode), *args, options="--enable-tvm-ffi")
 
 
-def score_select(q, q_scale, keys, key_scale, weights_bf16, row_len, items,
-                 topk=2048, logits=None, ctas=None):
-    """Launch IndexerScoreSelect; returns (out_idx [T, topk] unordered, out_cnt [T])."""
+@functools.cache
+def _select_kernel(topk):
+    from cutlass.cute.runtime import make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
+
+    t = cute.sym_int()
+    args = (
+        fake((cute.sym_int(),), dtype=cutlass.Int16),
+        fake((cute.sym_int(),), dtype=cutlass.Int16),
+        fake((t,), dtype=cutlass.Int64),
+        fake((t,), dtype=cutlass.Int32),
+        fake((t, topk), dtype=cutlass.Int32),
+        make_fake_stream(),
+    )
+    return cute.compile(PrefillSelect(topk), *args, options="--enable-tvm-ffi")
+
+
+def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
+          logits, tops, ctas=None, mode=0):
+    """BF16 logits of every prefill row into ``logits`` (see ``plan``)."""
     dev = q.device
     t = q.shape[0]
     assert keys.shape[0] % TILE == 0
     ctas = ctas or torch.cuda.get_device_properties(dev).multi_processor_count
-    out_idx = torch.empty(t, topk, dtype=torch.int32, device=dev)
-    out_cnt = torch.empty(t, dtype=torch.int32, device=dev)
-    dbg = logits is not None
-    fn = _compiled(ctas, topk, dbg)
-    if logits is None:
-        logits = torch.empty(1, 1, dtype=torch.int16, device=dev)
-    fn(
+    _score_kernel(ctas, mode)(
         q.view(t * HEADS, DIM // 2),
         q_scale.reshape(-1),
         keys,
@@ -981,9 +1112,20 @@ def score_select(q, q_scale, keys, key_scale, weights_bf16, row_len, items,
         weights_bf16.contiguous().view(torch.int32).view(t, HEADS // 2),
         row_len,
         items,
-        out_idx,
-        out_cnt,
-        logits,
+        row_base,
+        logits.view(torch.int16),
+        tops.view(torch.int16),
         torch.cuda.current_stream(dev).cuda_stream,
     )
-    return out_idx, out_cnt
+
+
+def select(logits, tops, row_base, row_len, out):
+    """Exact top-k key indices of every row (key order, -1 padded) into ``out``."""
+    _select_kernel(out.shape[1])(
+        logits.view(torch.int16),
+        tops.view(torch.int16),
+        row_base,
+        row_len,
+        out,
+        torch.cuda.current_stream(out.device).cuda_stream,
+    )

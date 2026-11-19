@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused sm_107 prefill indexer (specialized_prefill.indexer) vs stock.
+"""sm_107 prefill indexer (specialized_prefill.indexer: IndexerScore + PrefillSelect)
+vs stock.
 
---check: small shapes; logits vs DeepGEMM (bitwise share, ulp histogram) and the
-exact top-k (ties to the lowest key index) vs a torch reference on the fused
-kernel's own logits, plus the overlap with the stock trtllm_gvr2 selection.
+--check: small shapes; logits vs DeepGEMM (bitwise share, ulp) and the exact top-k
+(ties to the lowest key index) vs a torch reference on the kernel's own logits.
 --perf: P3-16 per-GPU shape (3 x 5461 rows at 78360 keys) per DSA layer.
 """
 
 import argparse
 import json
-import time
 
 import torch
 
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer_mxfp4 import mxfp4_q_quant
-from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer as fused
+from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer as pidx
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     get_mqa_logits_metadata,
@@ -23,40 +22,49 @@ from vllm.utils.deep_gemm import (
 )
 
 
-def make(reqs, seed=0, dev="cuda", key_lo=122, key_hi=130):
-    """reqs: list of (rows, kv_len). Returns a dict of inputs."""
+def make(reqs, seed=0, dev="cuda"):
+    """reqs: list of (rows, kv_len)."""
     g = torch.Generator(device=dev).manual_seed(seed)
     t = sum(r for r, _ in reqs)
     index_q = torch.randn(t, 32, 128, device=dev, dtype=torch.bfloat16, generator=g)
     index_w = torch.randn(t, 32, device=dev, dtype=torch.float32, generator=g)
     q, q_scale, w = mxfp4_q_quant(index_q, index_w, (128**-0.5) * (32**-0.5), 32)
     _, w_bf16 = mqa_logits_mx_inputs(q.view(torch.int8), q_scale, w)
-    nk = sum((kv + 127) // 128 * 128 for _, kv in reqs)
+    pads = [(kv + 127) // 128 * 128 for _, kv in reqs]
+    nk = sum(pads)
     k8 = torch.randint(0, 256, (nk, 64), device=dev, dtype=torch.uint8, generator=g)
-    ks = torch.randint(key_lo, key_hi, (nk, 4), device=dev, dtype=torch.uint8, generator=g)
+    ks = torch.randint(122, 130, (nk, 4), device=dev, dtype=torch.uint8, generator=g)
     k_sf = ks.view(torch.int32).view(nk)
-    bases, b = [], 0
-    for _, kv in reqs:
-        bases.append(b)
-        b += (kv + 127) // 128 * 128
-    items, row_len = fused.plan_items(
+    bases = [sum(pads[:i]) for i in range(len(reqs))]
+    items, row_len, row_base, scratch = pidx.plan(
         [r for r, _ in reqs], [kv for _, kv in reqs], bases, dev
     )
+    logits = torch.empty(scratch, dtype=torch.bfloat16, device=dev)
+    tops = torch.empty(scratch // 8 + 64, dtype=torch.int16, device=dev)
+    out = torch.empty(t, 2048, dtype=torch.int32, device=dev)
     return dict(reqs=reqs, q=q, q_scale=q_scale, w=w_bf16, k8=k8, k_sf=k_sf,
-                bases=bases, items=items, row_len=row_len)
+                bases=bases, items=items, row_len=row_len, row_base=row_base,
+                logits=logits, tops=tops, out=out)
+
+
+def run_score(d, mode=0):
+    pidx.score(d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["row_len"],
+               d["items"], d["row_base"], d["logits"], d["tops"], mode=mode)
+
+
+def run_select(d):
+    pidx.select(d["logits"], d["tops"], d["row_base"], d["row_len"], d["out"])
 
 
 def stock_logits(d, r):
-    """DeepGEMM BF16 logits of request r: [rows, kv] (columns >= row_len garbage)."""
     rows, kv = d["reqs"][r]
     t0 = sum(x for x, _ in d["reqs"][:r])
     b = d["bases"][r]
     ks = torch.zeros(rows, dtype=torch.int32, device="cuda")
     ke = d["row_len"][t0:t0 + rows].contiguous()
     meta = get_mqa_logits_metadata(ks, ke, kv, 32)
-    q = d["q"][t0:t0 + rows].view(torch.int8)
     logits = fp8_fp4_mqa_logits(
-        (q, d["q_scale"][t0:t0 + rows]),
+        (d["q"][t0:t0 + rows].view(torch.int8), d["q_scale"][t0:t0 + rows]),
         (d["k8"][b:b + kv].view(torch.int8), d["k_sf"][b:b + kv]),
         d["w"][t0:t0 + rows], ks, ke, kv, schedule_meta=meta,
     )
@@ -69,79 +77,91 @@ def order16(bits):
     return torch.where(b & 0x8000 != 0, b ^ 0xFFFF, b ^ 0x8000)
 
 
+def position(idx):
+    """Logits position of key idx (tile rows in SF-atom order)."""
+    return (idx & ~127) + 32 * (idx & 3) + ((idx & 127) >> 2)
+
+
 def ref_topk(bits_row, n, k):
-    """Exact top-k key indices (ties to the lowest index) of the first n keys."""
+    """Exact top-k; ties to the lowest logits position."""
     key = order16(bits_row[:n]).to(torch.int64)
     idx = torch.arange(n, device=bits_row.device, dtype=torch.int64)
-    comp = key * (1 << 20) + ((1 << 20) - 1 - idx)
-    m = min(k, n)
-    return torch.sort(idx[torch.topk(comp, m).indices]).values
+    comp = key * (1 << 20) + ((1 << 20) - 1 - position(idx))
+    return torch.sort(idx[torch.topk(comp, min(k, n)).indices]).values
 
 
 def check(args):
-    reqs = [(37, 1000), (300, 5000), (9, 2100), (513, 9000)]
+    reqs = [(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000)]
     d = make(reqs, seed=1)
-    t = d["q"].shape[0]
-    pitch = ((max(kv for _, kv in reqs) + 63) // 64) * 64
-    lg = torch.full((t, pitch), 0x7FC0, dtype=torch.int16, device="cuda")
-    out_idx, out_cnt = fused.score_select(
-        d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["row_len"], d["items"],
-        logits=lg,
-    )
+    run_score(d)
+    run_select(d)
     torch.cuda.synchronize()
-    res = {"rows": t, "bad_rows": 0, "bitwise": [], "max_ulp": 0}
+    lg = d["logits"].view(torch.int16)
+    res = {"rows": d["q"].shape[0], "bad_rows": 0, "bitwise": [], "max_ulp": 0}
     t0 = 0
     for r, (rows, kv) in enumerate(reqs):
-        sl = stock_logits(d, r)
-        mine = lg[t0:t0 + rows, :kv]
+        sl = stock_logits(d, r).view(torch.int16)
+        pitch = (kv + 127) // 128 * 128
+        base = int(d["row_base"][t0])
+        pos = position(torch.arange(kv, device="cuda"))
+        mine = lg[base:base + rows * pitch].view(rows, pitch)[:, pos]
         rl = d["row_len"][t0:t0 + rows]
         mask = torch.arange(kv, device="cuda")[None, :] < rl[:, None]
-        sb = sl.view(torch.int16)
-        eq = (sb == mine) | ~mask
-        res["bitwise"].append(float(eq.float().mean()))
-        ulp = (order16(sb).to(torch.int64) - order16(mine).to(torch.int64)).abs()
-        ulp = torch.where(mask, ulp, torch.zeros_like(ulp))
-        res["max_ulp"] = max(res["max_ulp"], int(ulp.max()))
+        res["bitwise"].append(float(((sl == mine) | ~mask).float().mean()))
+        ulp = (order16(sl).to(torch.int64) - order16(mine).to(torch.int64)).abs()
+        res["max_ulp"] = max(res["max_ulp"], int(torch.where(mask, ulp, 0).max()))
         for i in range(rows):
             n = int(rl[i])
             ref = ref_topk(mine[i], n, 2048)
-            c = int(out_cnt[t0 + i])
-            got = torch.sort(out_idx[t0 + i, :c].to(torch.int64)).values
-            if c != ref.numel() or not torch.equal(got, ref):
+            got = d["out"][t0 + i]
+            got = torch.sort(got[got >= 0].to(torch.int64)).values
+            if got.numel() != ref.numel() or not torch.equal(got, ref):
                 res["bad_rows"] += 1
                 if res["bad_rows"] <= 3:
-                    print(f"row {t0+i} n={n} cnt={c} ref={ref.numel()} "
+                    print(f"row {t0 + i} n={n} got={got.numel()} ref={ref.numel()} "
                           f"miss={len(set(ref.tolist()) - set(got.tolist()))}")
         t0 += rows
-    print(json.dumps(res))
+    print(json.dumps(res), flush=True)
     return res
 
 
-def perf(args):
-    reqs = [(5461, 78360), (5461, 78360), (5462, 78360)]
-    d = make(reqs, seed=0)
-
-    def run():
-        return fused.score_select(
-            d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["row_len"], d["items"]
-        )
-
-    t = time.time()
-    run()
-    torch.cuda.synchronize()
-    print(f"first call (compile) {time.time() - t:.1f} s", flush=True)
+def timed(fn, iters):
     for _ in range(2):
-        run()
+        fn()
     torch.cuda.synchronize()
     s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     s.record()
-    for _ in range(args.iters):
-        run()
+    for _ in range(iters):
+        fn()
     e.record()
     torch.cuda.synchronize()
-    ms = s.elapsed_time(e) / args.iters
-    print(f"fused score+select per layer {ms:.3f} ms (items {d['items'].shape[0]})")
-    return {"fused_ms": ms}
+    return s.elapsed_time(e) / iters
+
+
+def perf(args):
+    d = make([(5461, 78360), (5461, 78360), (5462, 78360)], seed=0)
+    res = {}
+    for rep in range(args.reps):
+        for mode in args.modes:
+            res[f"score_mode{mode}"] = timed(lambda: run_score(d, mode), args.iters)
+            print(f"score mode {mode}: {res[f'score_mode{mode}']:.3f} ms", flush=True)
+    d["tops"][-32:].zero_()
+    run_score(d, 4)
+    torch.cuda.synchronize()
+    pv = d["tops"][-32:].view(torch.int64)[:5].tolist()
+    n = max(pv[4], 1)
+    res["prof"] = dict(acc_wait=pv[0] / n, ld_math=pv[1] / n, stage=pv[2] / n,
+                       barrier=pv[3] / n, tiles_per_warp=n)
+    print("epilogue clk per processed tile:", res["prof"], flush=True)
+    res["fill"] = timed(lambda: d["logits"].fill_(0), args.iters)
+    print(f"torch fill of the scratch: {res['fill']:.3f} ms", flush=True)
+    run_score(d)
+    res["select"] = timed(lambda: run_select(d), args.iters)
+    res["score+select"] = timed(lambda: (run_score(d), run_select(d)), args.iters)
+    print(f"select {res['select']:.3f} ms; score+select {res['score+select']:.3f} ms "
+          f"per layer (items {d['items'].shape[0]}, scratch "
+          f"{d['logits'].numel() * 2 / 2**30:.2f} GiB)", flush=True)
+    return res
 
 
 def main():
@@ -149,6 +169,8 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--perf", action="store_true")
     ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--modes", type=int, nargs="+", default=[0])
+    ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     out = {}
