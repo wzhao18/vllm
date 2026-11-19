@@ -222,9 +222,6 @@ class SpAttentionBlock:
         # heads x 128 (the o_proj input)
         self.width = output.k if isinstance(output, Mxfp8Projection) else output.shape[1]
         self.oproj = SpOproj(output, step.comm, rows, ctx)
-        if mx_out and set(self.oproj.tactics.values()) == {"mxfp8"}:
-            # KdaFlow writes the MXFP8 o_proj input itself (no act_quant kernel).
-            self.core.mx_input = output.input
         cap = rows[-1]
         self.projected = step.scratch(f"{kind}.projected", (cap, pitch))
         self.attn_out = step.scratch(f"attn_out.{self.width}", (cap, self.width))
