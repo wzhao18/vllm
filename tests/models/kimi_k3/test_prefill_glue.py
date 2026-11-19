@@ -229,3 +229,40 @@ def test_write_state_rows_strided_index(pg, idx_dtype, cols, rows):
     out = dst0.clone()
     pg.write_state_rows(out, idx, src)
     assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("rows", [2048, 6156])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_rope_store_kv_matches_rotary_and_cache(pg, rows, block_size):
+    """RoPE + K/V cache insert == ops.rotary_embedding (NeoX, in place) followed
+    by reshape_and_cache_flash ("auto" BF16 cache), the DSpark context step's
+    layout: K / V row views of a token-major [rows, L, 2, nkv, hd] projection,
+    skipped (-1) slots."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(rows + block_size)
+    layers, nkv, hd, max_pos = 5, 16, 64, 1 << 17
+    kv = torch.randn(rows, layers, 2, nkv, hd, device="cuda", dtype=torch.bfloat16)
+    kv[0, 2, 0, :, :4] = 3.0e38
+    k = kv[:, 2, 0].contiguous()
+    v = kv[:, 2, 1]
+    positions = torch.randint(0, max_pos, (rows,), device="cuda", dtype=torch.int64)
+    inv = 1.0 / (50000.0 ** (torch.arange(0, hd, 2, device="cuda").float() / hd))
+    freqs = torch.arange(max_pos, device="cuda").float()[:, None] * inv[None]
+    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.bfloat16)
+    blocks = rows // block_size + 8
+    slots = torch.randperm(blocks * block_size, device="cuda")[:rows]
+    slots[::7] = -1
+    # FlashAttention's cache [blocks, nkv, block_size, 2 * hd] viewed as its
+    # do_kv_cache_update does.
+    ref = torch.randn(blocks, nkv, block_size, 2 * hd, device="cuda").to(torch.bfloat16)
+    out = ref.clone()
+    rk, rv = ref.transpose(1, 2).split(hd, dim=-1)
+    ok, ov = out.transpose(1, 2).split(hd, dim=-1)
+    ref_k = k.clone()
+    ops.rotary_embedding(positions, ref_k.view(rows, nkv * hd), None, hd, cos_sin, True)
+    scale = torch.ones((), device="cuda")
+    ops.reshape_and_cache_flash(ref_k, v, rk, rv, slots, "auto", scale, scale)
+    assert pg.use_rope_store_kv(k, v, positions, cos_sin, slots, ok, ov)
+    pg.rope_store_kv(k, v, positions, cos_sin, slots, ok, ov)
+    assert torch.equal(_bits(out), _bits(ref))

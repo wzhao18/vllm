@@ -156,6 +156,14 @@ def parse_args():
         default=896,
         help="global experts (EP-size emulation: 224 on EP4 = 56 experts/rank like EP16)",
     )
+    p.add_argument(
+        "--dedup",
+        default=None,
+        choices=("standalone_warps", "reuse_dispatch_warps", "wg2", "wg2s"),
+        help="run the inference record on the refreshed dedup-combine kernel "
+        "(variant inference_dedup) with this token-back transport; wg2: two epilogue "
+        "warpgroups (inference_dedup_wg2, reuse_dispatch_warps)",
+    )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
     p.add_argument(
         "--active-experts",
@@ -586,6 +594,28 @@ def main():
             )
             for b in buckets
         ]
+    if args.dedup:
+        import dataclasses
+
+        buckets = [
+            dataclasses.replace(
+                b,
+                variant=(
+                    "inference_dedup_wg2"
+                    if args.dedup in ("wg2", "wg2s")
+                    else "inference_dedup"
+                ),
+                knobs=dataclasses.replace(
+                    b.knobs,
+                    token_back_mode=(
+                        {"wg2": "reuse_dispatch_warps", "wg2s": "standalone_warps"}.get(
+                            args.dedup, args.dedup
+                        )
+                    ),
+                ),
+            )
+            for b in buckets
+        ]
     shared_shape = None
     if args.shared:
         import dataclasses
@@ -813,7 +843,7 @@ def main():
             dist.all_reduce(diff, op=dist.ReduceOp.MAX, group=group)
         line = {
             "quant_kind": problem.quant_kind,
-            "variant": variant,
+            "variant": bucket_of[cap].variant,
             "world_size": world,
             "tokens_per_rank": n,
             "max_tokens": cap,

@@ -984,6 +984,8 @@ class SwapABGatedActEpilogue(KernelComponent):
     two_epilogue_warpgroups = False
     fc1_splits_token_halves = False
     use_tanh_sigmoid = False
+    # vLLM-local S3 SiTU core (VENDOR.md): the prefill dedup epilogue only; GenPhase decode keeps upstream.
+    situ_core_s3 = False
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -2390,23 +2392,86 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 )
 
             # 3) gated activation on the dequanted (and clamped) real values; sigmoid(gate) is shared by both cores.
-            if cutlass.const_expr(self.use_tanh_sigmoid):
-                sigmoid_pair = sigmoid_pair_tanh_approx((g0, g1))
-            else:
-                neg = cute.arch.mul_packed_f32x2((g0, g1), neg_log2e_pair)
-                e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
-                d = cute.arch.add_packed_f32x2(e, one_pair)
-                sigmoid_pair = (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+            if cutlass.const_expr(self.situ_core_s3 and self.situ_beta is not None and not self.use_tanh_sigmoid):
+                # vLLM-local S3 (VENDOR.md): one reciprocal per element instead of three.
+                # With A = e^-g, B = e^(-2g/beta), C = e^(-2u/linear_beta):
+                #     sigmoid(g) = 1/(1+A),  tanh(g/beta) = (1-B)/(1+B),  tanh(u/lbeta) = (1-C)/(1+C)
+                #     out = beta*lbeta * (1-B)(1-C) / ((1+A)(1+B)(1+C))
+                # Same MUFU primitives as the three-sigmoid form (ex2.approx, rcp.approx), in another
+                # order: 3 ex2 + 1 rcp, and when beta/2 is a small integer n, A = B^n on the FMA pipe
+                # (Kimi K3: beta 4 -> 2 ex2 + 1 rcp; the stock form issues 3 ex2 + 3 rcp). B and C
+                # are clamped at 1e9 so the denominator stays finite (|g| > 41 or |u|/lbeta > 10 are
+                # already saturated: sigmoid(g) < 1e-18, tanh = -1 in fp32).
+                beta_f = float(self.situ_beta)
+                k_b = cutlass.Float32(-2.0 * log2_e / beta_f)
+                k_c = cutlass.Float32(-2.0 * log2_e / float(self.situ_linear_beta))
+                bb = cutlass.Float32(beta_f * float(self.situ_linear_beta))
+                sat = cutlass.Float32(1.0e9)
+                neg_one_pair = (cutlass.Float32(-1.0), cutlass.Float32(-1.0))
 
-            if cutlass.const_expr(self.situ_beta is None):
-                # SwiGLU: out = up * gate * sigmoid(gate)
-                ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
-                out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
-            else:
-                # SiTU (Kimi K3), matching HF ``modeling_kimi.py``; its two tanh on MUFU.TANH.
-                out_pair = situ_pair_tanh_approx(
-                    (g0, g1), (u0, u1), self.situ_beta, self.situ_linear_beta, sigmoid_pair
+                def _min_sat(v):
+                    return cutlass.Float32(
+                        llvm.inline_asm(
+                            cutlass.Float32.mlir_type,
+                            [v.ir_value(), sat.ir_value()],
+                            "min.f32 $0, $1, $2;",
+                            "=f,f,f",
+                            has_side_effects=False,
+                            is_align_stack=False,
+                            asm_dialect=llvm.AsmDialect.AD_ATT,
+                        )
+                    )
+
+                def _exp2_sat(p0, p1, k):
+                    x = cute.arch.mul_packed_f32x2((p0, p1), (k, k))
+                    return (
+                        _min_sat(cute.math.exp2(x[0], fastmath=True)),
+                        _min_sat(cute.math.exp2(x[1], fastmath=True)),
+                    )
+
+                eb = _exp2_sat(g0, g1, k_b)
+                ec = _exp2_sat(u0, u1, k_c)
+                a_pow = beta_f / 2.0
+                if cutlass.const_expr(a_pow == int(a_pow) and 1 <= a_pow <= 4):
+                    ea = eb
+                    for _ in cutlass.range_constexpr(int(a_pow) - 1):
+                        ea = cute.arch.mul_packed_f32x2(ea, eb)
+                else:
+                    ka = cutlass.Float32(-log2_e)
+                    xa = cute.arch.mul_packed_f32x2((g0, g1), (ka, ka))
+                    ea = (cute.math.exp2(xa[0], fastmath=True), cute.math.exp2(xa[1], fastmath=True))
+                num = cute.arch.mul_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(
+                        cute.arch.fma_packed_f32x2(eb, neg_one_pair, one_pair),
+                        cute.arch.fma_packed_f32x2(ec, neg_one_pair, one_pair),
+                    ),
+                    (bb, bb),
                 )
+                den = cute.arch.mul_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(
+                        cute.arch.add_packed_f32x2(ea, one_pair), cute.arch.add_packed_f32x2(eb, one_pair)
+                    ),
+                    cute.arch.add_packed_f32x2(ec, one_pair),
+                )
+                out_pair = cute.arch.mul_packed_f32x2(num, (cute.arch.rcp_approx(den[0]), cute.arch.rcp_approx(den[1])))
+            else:
+                if cutlass.const_expr(self.use_tanh_sigmoid):
+                    sigmoid_pair = sigmoid_pair_tanh_approx((g0, g1))
+                else:
+                    neg = cute.arch.mul_packed_f32x2((g0, g1), neg_log2e_pair)
+                    e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
+                    d = cute.arch.add_packed_f32x2(e, one_pair)
+                    sigmoid_pair = (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+                if cutlass.const_expr(self.situ_beta is None):
+                    # SwiGLU: out = up * gate * sigmoid(gate)
+                    ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
+                    out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+                else:
+                    # SiTU (Kimi K3), matching HF ``modeling_kimi.py``; its two tanh on MUFU.TANH.
+                    out_pair = situ_pair_tanh_approx(
+                        (g0, g1), (u0, u1), self.situ_beta, self.situ_linear_beta, sigmoid_pair
+                    )
 
             out[i] = out_pair[0]
             out[i + 1] = out_pair[1]

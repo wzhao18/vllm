@@ -895,9 +895,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     torch.device("cuda", torch.accelerator.current_device_index()),
                     N,
                 )
-            # cuDNN FROST chunked core where available (per-shape policy:
-            # every checkpoint-free, segment-plan-free prefill).
-            self._frost = specialized_prefill_kda.frost_supported(
+            # cuDNN FROST chunked core on SM10x (per-shape policy: every
+            # checkpoint-free, segment-plan-free prefill); decode-only instances
+            # never run it, so they do not need the cuDNN frontend.
+            self._frost = kda_segscan.wanted(
+                vllm_config
+            ) and specialized_prefill_kda.frost_supported(
                 torch.device("cuda", torch.accelerator.current_device_index())
             )
         elif self.kda_prefill_backend == "flashinfer":
