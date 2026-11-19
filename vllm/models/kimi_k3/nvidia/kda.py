@@ -1644,7 +1644,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         )
                     ):
                         # Pure prefill over more (sequence, head) items than one
-                        # wave: o_norm of the first head group overlaps the tail.
+                        # wave: one wave of whole items, then the rest of the heads.
                         specialized_prefill_kda.frost_prefill_in_place_o_norm(
                             q=q_ns,
                             k=k_ns,

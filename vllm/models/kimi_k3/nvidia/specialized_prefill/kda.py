@@ -162,16 +162,13 @@ def frost_prefill_in_place(
 
 
 def frost_head_split(num_seqs: int, heads: int, device: torch.device) -> int:
-    """Head split for FROST + o_norm overlap: 0 when the (sequence, head) items
+    """Head split for FROST: 0 when the (sequence, head) items
     fit one wave of SMs, else the largest head count whose items fit one wave."""
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     if num_seqs * heads <= sms:
         return 0
     split = sms // num_seqs
     return split if 0 < split < heads else 0
-
-
-_side_stream: dict = {}
 
 
 def frost_prefill_in_place_o_norm(
@@ -194,9 +191,9 @@ def frost_prefill_in_place_o_norm(
     split: int,
 ) -> None:
     """``frost_prefill_in_place`` + ``o_norm_mxfp8`` as two head groups: heads
-    [0, split) fill one wave of SMs with whole (sequence, head) items, then the
-    remaining heads run (FROST's prep + d_v-half launches leave SMs idle) on a
-    side stream while the o_norm of the first group fills those SMs."""
+    [0, split) fill one wave of SMs with whole (sequence, head) items, then FROST
+    plans the remaining heads on their own (its d_v-half tail over fewer items),
+    each group normalized into its head window of ``out``."""
     assert _frost_fn and 0 < split < q.shape[2]
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
     row = state_pool[0].numel()
@@ -231,17 +228,8 @@ def frost_prefill_in_place_o_norm(
             plan_name="kda_frost",
         )[0]
 
-    side = _side_stream.get(q.device)
-    if side is None:
-        side = _side_stream[q.device] = torch.cuda.Stream(q.device, priority=-1)
-    main = torch.cuda.current_stream(q.device)
-    o_a = core(0, split)
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        o_b = core(split, H)
-        torch.ops.k3_flashkda_split.o_norm_mxfp8(o_b, g2, w, eps, out.data, out.scale, split)
-    torch.ops.k3_flashkda_split.o_norm_mxfp8(o_a, g2, w, eps, out.data, out.scale, 0)
-    main.wait_stream(side)
+    for lo, hi in ((0, split), (split, H)):
+        torch.ops.k3_flashkda_split.o_norm_mxfp8(core(lo, hi), g2, w, eps, out.data, out.scale, lo)
 
 
 def o_norm_mxfp8(

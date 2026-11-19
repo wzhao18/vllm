@@ -121,8 +121,8 @@ def test_frost_prefill_in_place_matches_gathered():
 
 
 def test_frost_prefill_in_place_o_norm_head_split():
-    """frost_prefill_in_place_o_norm (two head groups, the second on a side
-    stream, o_norm into head windows of one MXFP8 buffer) equals
+    """frost_prefill_in_place_o_norm (two head groups,
+    o_norm into head windows of one MXFP8 buffer) equals
     frost_prefill_in_place + o_norm_mxfp8 over all heads."""
     from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
     from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
