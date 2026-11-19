@@ -2,101 +2,83 @@
 
 ## Upstream
 
-- **Source**: FlashInfer `0.7.3.dev20261031`,
-  `flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources` (41 files): the
-  upstream Rubin CuTe DSL MegaMoE export, `cutedsl_megamoe` commit
-  `1667b47a3c911ecade464ab524baf192a0bf5962`, plus the FlashInfer-local device
-  patches recorded in that drop's VENDOR.md ("Local differences": PR #6447 and the
-  `fc12_scheduler.py` phase-interleave claim fix). These patches are part of the bytes
-  below; a re-export from upstream must re-apply them.
+- **Source**: FlashInfer tag `wzhao/kimi-k3-megamoe-sm107-ep32-20261118` (merge commit
+  `a368c5f66d2976abec8c9beb652fb681098ba416` on github `wzhao18/flashinfer`
+  `wzhao/kimi-k3-megamoe-sm107-rebase`: the SM107 MegaMoE SOL work 6e438852b plus EP 4 / 28 / 32
+  support 89fafd77e), `flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources`
+  (41 files): the upstream Rubin CuTe DSL MegaMoE export (`cutedsl_megamoe` commit
+  `1667b47a3c911ecade464ab524baf192a0bf5962`) plus that FlashInfer branch's device patches
+  (S0/S1 decode landing and dynamic token_in claim, die_split two-ended expert claim,
+  NVFP4 decode weight-stream L2 prefetch + evict-first hints, EP28/EP32 geometry). Copied byte
+  for byte except the R1 import rewrite of two files (section "FlashInfer numerics helpers").
 - **Entry points**: `RubinInferenceMegaMoE` (`BlockScaledSwapAbMegaMoeKernel`) and
   `RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`).
-- **Check**: apart from the files listed under "Local differences" below, every file
-  is byte-identical to the installed `fi-0.7.3.dev20261031` tree on Hecate
-  (`$W/env/fi-0.7.3.dev20261031`, `W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr`).
-  The CPU unit test `tests/models/kimi_k3/test_megamoe_rubin_conversion.py` recomputes
-  every per-file hash below.
+- **Check**: every file is byte-identical to the tag (`git show a368c5f66:<path>`). The CPU unit
+  test `tests/models/kimi_k3/test_megamoe_rubin_conversion.py` recomputes every per-file hash
+  below.
 
 ## Local differences
 
-- **S1 (with S0)** in `sources/communication/nvlink_domain/token_comm.py`
-  (FlashInfer 0.7.3.dev20261031 sha256
-  `4731d31ad1871b24e6a22c1d6fad3bee33794a54ae0ec192632dc13d6f8d4134`, local sha256 in
-  the manifest below). Source: FlashInfer commit `3a47d4d53` on github
-  `wzhao18/flashinfer`, branch `wzhao/kimi-k3-megamoe-sm107`; copied byte for byte.
-  - S0: token_in claims tokens dynamically (`token_in_dynamic_claim`) instead of static
-    striping when `max_tokens_per_rank * topk <= 4096`.
-  - S1: decode-gated metadata-with-sizes. When `max_tokens_per_rank * topk <= 4096`,
-    `world_size <= 32` and one router data CTA (trace-time `decode_landing`, no env
-    var), the router is one CTA: it publishes sizes, its expert-major source prefix
-    and every route's `TokenSrcMetadata` (and score) straight into the destination's
-    landing rows in the sizes round, so token_in waits on `sizes_ready` only (no sort,
-    no push CTAs, no `metadata_ready`; scheduler poll 200 instead of 1000 cycles).
-    Otherwise (prefill) the stock router, regions and expert walks are traced
-    verbatim.
-  - Outputs are bit-identical to stock (the GEMMs, SiTU and the top-k reduction order
-    are unchanged); measured -9..-12 us per launch at decode buckets on VR.
-  - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged by S1 (S2 and DL1 below change it); it uses
-    only `token_comm` entry points whose signatures S1 keeps.
+The R1 import rewrite (below) and S3 (below). Dropped relative to the previous (0.7.3.dev20261031) drop:
 
-- **S2** (vLLM-local, not upstream) in `sources/kernel_src/rubin/inference/mega/`
-  `block_scaled_swap_ab_mega_moe_kernel.py`, `block_scaled_swap_ab_fc12_epilogue.py` and
-  `block_scaled_swap_ab_fc12_mainloop.py` (FlashInfer 0.7.3.dev20261031 sha256, in that order:
-  `a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0`,
-  `b4e8bf2729618064678aa11cc5c38476626f13cd97d40f675a9fbe3ced71dd02`,
-  `601a5a53da27d04f6dd98cbe9eb408159bce8b0a5f26f8611b1d39339c22cf24`;
-  local sha256 in the manifest below): a second epilogue warpgroup.
-  - Why: at the C512 prefill shape (EP16 per-rank load, 8192-token bucket) the epilogue
-    (SiTU + NVFP4 requant for FC1, BF16 token-back for FC2) issues from one warp per SM
-    sub-partition and took ~3.5x the MMA time per tile (ncu: tensor pipe 26% active,
-    epilogue warps busy the whole kernel at CPI ~3.7-4.9, XU 23%, L2 67%).
-  - What: warps 12-15 become a second epilogue warpgroup. Work tile k (one accumulator
-    stage) goes to warpgroup k % 2; each warpgroup consumes every scheduler tile, waits on
-    and releases only its own accumulator stages, and has its own SMEM scratch and named
-    barriers (sync 3, subtiles 8/11/14/15; the TMEM-allocation barrier 2 is reused for the
-    end-of-epilogue rendezvous before TMEM is freed). Done flags are published per tile
-    (epi_flag_batches forced to (1, 1): a warpgroup must not hold a flag while it waits for a
-    later stage that the other warpgroup's flags gate). Registers: epilogue 184, others
-    64/72 (512 threads).
-  - Eligible launches: inference kernel, epi_warps token-back, 2CTA, tile N 128 or 256,
-    and `max_tokens_per_rank * topk > 2048 * 16` (`s2_eligible()`). Every other launch
-    (decode buckets, C256 2048 bucket, genphase) traces the stock code; the kernel name
-    gains `_epiwg{1,2}`. The optional impl field `epilogue_warpgroups` (1 or 2; absent =
-    2 where eligible) lets the caller trace the stock epilogue on an eligible launch.
-  - When (automatic, no knob/env; `session.py` `build_kernels` / `use_s2`): S2 only on a
-    capped grid (`max_sm_count`, the SP shared-expert overlap) and only up to
-    `S2_MAX_TOKENS_PER_RANK` EP-mean live tokens per rank; above it, and on every uncapped
-    grid, the stock epilogue. A capped session whose capacity exceeds the crossover
-    compiles both variants of the same config; they share the carved workspace (layout
-    asserted equal), the cross-rank protocol and the per-tile math, so a launch may pick
-    either. Measured at real EP16: S2 is slower on the full grid at every point and slower
-    on the capped grid above the crossover (see `session.py`).
-  - Outputs are bit-identical (same per-tile math and top-k reduction order; checked by an
-    output fingerprint on every A/B point in `$W/hti/p2/megamoe-prefill`).
+- **S2** (second epilogue warpgroup, vLLM-local): not carried over; the a368c5f66 kernel has one
+  epilogue warpgroup and no `epilogue_warpgroups` impl field. `session.build_kernels` builds one
+  kernel per session.
+- **DL1 / DL2** (vLLM-local die-split scheduler `die_split_fc12_scheduler.py`, impl field
+  `die_sm_mask32`): replaced by FlashInfer's `die_split` (`PhaseInterleavedFc12Scheduler`, same
+  idea: die 0 claims from the lowest local expert up, die 1 from the highest down, weights homed
+  per expert half by `die_local.place_experts`). The host maps the trusted die-1 SM mask to the
+  kernel's `sm_locality_domain` launch argument (uint8 per `%smid`, FlashInfer layout).
 
-- **DL (die-local expert streams)** (vLLM-local, not upstream), two parts. Independent of
-  S2: the scheduler (DL) and the epilogue (S2) are separate compile-time impl fields, and
-  either, both or neither may be set; the per-tile math is the same in every combination.
-  - **DL1** in `sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py`
-    (FlashInfer 0.7.3.dev20261031 sha256
-    `a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0`; this file also
-    carries S2, local sha256 in the manifest below): optional impl field `die_sm_mask32`
-    (bound; `name()` gains `diesplit_` / `dienone_`, rank-uniform because it tags the
-    arena layout; the per-GPU mask itself keys `session.compile_cache_key`); with it the
-    phase-interleaved schedule uses `DieSplitPhaseInterleavedFc12Scheduler` (DL2).
-    Without it the scheduler is the FlashInfer one.
-  - **DL2** new file `sources/kernel_src/schedulers/die_split_fc12_scheduler.py` (ours,
-    no upstream): die-local expert streams for the phase-interleaved FC12 scheduler (4
-    atomic streams, FC1/FC2 x die; per-die expert ranges in the stock order; cross-die
-    stealing). Producer side only (the consumer count, and so S2's second epilogue
-    warpgroup, comes from the base scheduler unchanged). Same tiles and accumulation order
-    (bitwise-identical output). Host side: `die_local.py`.
-  - When (automatic, no knob/env; `experts.py` `reserve_sms_for_shared_expert`): decode
-    servers only (P/D prefill workers keep the capped die-oblivious grid, so S2 still
-    applies to their capped prefill buckets), every bucket phase-interleaved, and a
-    trusted SM -> die map; then the buckets drop the shared-overlap SM cap (uncapped:
-    `session.build_kernels` traces the stock epilogue, and no decode bucket is
-    S2-eligible anyway). Without a trusted die map: warning, capped die-oblivious path.
+- **S3** (vLLM-local, not upstream) in `sources/kernel_src/rubin/inference/mega/`
+  `block_scaled_swap_ab_fc12_epilogue.py` (on top of R1; sha256 in the manifest below):
+  the FC1 SiTU core with one reciprocal per element (ported from wzhao/k31ws-p-moe 055b80ab3d,
+  where it sat on the previous drop; the SiTU core block is unchanged between the drops).
+  - Why: the stock core evaluates three sigmoids (3 ex2 + 3 rcp MUFU ops per output element);
+    at the EP16 prefill shape (8192 tokens/rank, 56 experts/GPU, i6144) that is ~2.4G MUFU ops per
+    launch. Measured on VR200 (EP4 standing in for EP16, one 8192 launch, NVFP4, previous drop):
+    main kernel all-local 1054 -> 941 us, random routing 1059 -> 1006 us (= the no-activation
+    probe).
+  - What: with A = e^-g, B = e^(-2g/beta), C = e^(-2u/linear_beta),
+    out = beta*linear_beta*(1-B)(1-C) / ((1+A)(1+B)(1+C)); the same primitives (ex2.approx,
+    rcp.approx) in another order, and A = B^(beta/2) by multiplies when beta/2 is an integer
+    1..4 (Kimi K3 beta 4: 2 ex2 + 1 rcp). B, C are clamped at 1e9 so the denominator stays
+    finite (saturated region only). The SwiGLU core and the batch-invariant branch are unchanged.
+  - Accuracy: rel-L2 vs the fp32 oracle 1.73e-3 (stock) vs 1.83e-3. Not bit-identical to the
+    stock core (different rounding order of the same approximations).
+  - When: every non-batch-invariant launch whose problem carries SiTU betas (no knob/env).
+
+## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
+
+The a368c5f66 epilogue and top-k reduce import FlashInfer's batch-invariant numerics helpers
+(`flashinfer.moe_ep.batch_invariant`, which imports `flashinfer.batch_invariant.fp_interface.term`). They are
+vendored under `src/fi_numerics` (`moe_ep_batch_invariant/`: the 16 non-Lean modules; `fp_interface/term.py`),
+with one rewrite: `from ...batch_invariant.fp_interface.term import` -> `from ..fp_interface.term import`. The two
+`src/sources` files that import them get rule R1 (absolute `flashinfer.moe_ep.batch_invariant.` ->
+`vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.`); nothing else changes.
+
+```
+vendored path | FlashInfer source | original sha256 | vendored sha256
+fi_numerics/fp_interface/term.py | flashinfer/batch_invariant/fp_interface/term.py | 28552340a68b34d0e3fe6f3ca17e04e71b6bfaa0801faaa9565d8c4f7e57186c | 28552340a68b34d0e3fe6f3ca17e04e71b6bfaa0801faaa9565d8c4f7e57186c
+fi_numerics/moe_ep_batch_invariant/__init__.py | flashinfer/moe_ep/batch_invariant/__init__.py | 08e7f00cff876a51408741a2439c59764f5995b1cfff17f3dd406a2c85f43165 | 08e7f00cff876a51408741a2439c59764f5995b1cfff17f3dd406a2c85f43165
+fi_numerics/moe_ep_batch_invariant/spec.py | flashinfer/moe_ep/batch_invariant/spec.py | 989928d2153aed69e0fad8105d5ae82d6d3a6e1e8b30f044dc2ce71b61ee8d99 | 0bd1797527a53ae5c829c5bc2daa9af1ec2dd2d69f50fbfec97bb08c0c4e4e4d
+fi_numerics/moe_ep_batch_invariant/a16_spec.py | flashinfer/moe_ep/batch_invariant/a16_spec.py | ba11db083b4cd5bf3d8565b9bc2abe22ca30105d45c6410942880b24a44d0a7b | b7e81a1336ddc4f5619005242726250a1a1ca7257e1763c6d6aa650282504e99
+fi_numerics/moe_ep_batch_invariant/activation_variants.py | flashinfer/moe_ep/batch_invariant/activation_variants.py | 90343dc1ee1adc0f0eb903ec1c9486dec605c38eb4ae6a866aed7cda9223c281 | 90343dc1ee1adc0f0eb903ec1c9486dec605c38eb4ae6a866aed7cda9223c281
+fi_numerics/moe_ep_batch_invariant/device.py | flashinfer/moe_ep/batch_invariant/device.py | 955c082f1852d195873d1f9fe181e94116821008373fe5e3cfba5dff439c327b | 955c082f1852d195873d1f9fe181e94116821008373fe5e3cfba5dff439c327b
+fi_numerics/moe_ep_batch_invariant/mxfp4_device.py | flashinfer/moe_ep/batch_invariant/mxfp4_device.py | 7dc5b7f268d400fd3fa83e88a978eafd0954ca12c9efb276111944382947889f | 7dc5b7f268d400fd3fa83e88a978eafd0954ca12c9efb276111944382947889f
+fi_numerics/moe_ep_batch_invariant/mxfp4_spec.py | flashinfer/moe_ep/batch_invariant/mxfp4_spec.py | be8fc4187c944f2a09bfd73ff4125b91a6b0893b0782d70012c6d4c368196aa2 | 46e4768347059907423c35638a201ff658742e94be0387a2f8d3c03e9b80287b
+fi_numerics/moe_ep_batch_invariant/mxfp8_device.py | flashinfer/moe_ep/batch_invariant/mxfp8_device.py | c0bdc14d04e3ead57a67552b819166d4aeb720d64d4481fb908f83c189fad22f | c0bdc14d04e3ead57a67552b819166d4aeb720d64d4481fb908f83c189fad22f
+fi_numerics/moe_ep_batch_invariant/mxfp8_spec.py | flashinfer/moe_ep/batch_invariant/mxfp8_spec.py | 64742d9c52594df60b702c18c6d0e0abcd2e76125b529422fc15703071d2cb18 | 460b761b2818f36dd9d3032ec2cf8ef025dd2522ecd800572b57f423d959dbbf
+fi_numerics/moe_ep_batch_invariant/numerical_variants.py | flashinfer/moe_ep/batch_invariant/numerical_variants.py | 29b5035ae0071bef0e737fd14a7f68e7e860cb1ae520a8f5dd134d0ccc183b0b | 29b5035ae0071bef0e737fd14a7f68e7e860cb1ae520a8f5dd134d0ccc183b0b
+fi_numerics/moe_ep_batch_invariant/nvfp4_device.py | flashinfer/moe_ep/batch_invariant/nvfp4_device.py | 48c6af6d43f2ce265074cd2250bd1ab30577e5f9b2b1783741f41417158c6292 | 48c6af6d43f2ce265074cd2250bd1ab30577e5f9b2b1783741f41417158c6292
+fi_numerics/moe_ep_batch_invariant/nvfp4_spec.py | flashinfer/moe_ep/batch_invariant/nvfp4_spec.py | e7517ea9afb780268847d1f3f922b6ee8f6441a76da96957c8c94afb66fcadc4 | e879d71a40a7162c8a4753657ee92f4ea473f0e24122df069afd839f0dcd479d
+fi_numerics/moe_ep_batch_invariant/quantized_combine_device.py | flashinfer/moe_ep/batch_invariant/quantized_combine_device.py | 69642a57331ea9c400a7b49c2da61ccbddce106d20363015040275b50f72a586 | 69642a57331ea9c400a7b49c2da61ccbddce106d20363015040275b50f72a586
+fi_numerics/moe_ep_batch_invariant/stage_partition.py | flashinfer/moe_ep/batch_invariant/stage_partition.py | 7f81538ed96c5618c0bb9e775ec23bffb07c76dbb216c786d576f25ab691cfef | 7f81538ed96c5618c0bb9e775ec23bffb07c76dbb216c786d576f25ab691cfef
+fi_numerics/moe_ep_batch_invariant/wire_device.py | flashinfer/moe_ep/batch_invariant/wire_device.py | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f | d12079dd9473da6dab22651f3f5931d0813b33c61cfeddb9df07071ed2fa012f
+fi_numerics/moe_ep_batch_invariant/wire_spec.py | flashinfer/moe_ep/batch_invariant/wire_spec.py | f21445052dc0d7579df6f425ba53fc4891b5b9cebfe22e9791fcd218613ad6bf | b9ae9960f9bfee084f2c61fb32bd2a27d40e7c5f9a99c32a77dce3f964f40aab
+sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py | (R1 | rewrite) | c6ec37d63026c83e85a69eb14c0234c8e74f34a999882739a241f611dd751560 | e3ab102c3ac93e5cb6a81eec0707d078b02f9295674f24122bb5fae64d43dabb (R1 only; + S3: 2f3661c14a197f52ce66235010aeb78a0eb02ed34534d0f5d3f0de66dfd65ad8)
+sources/kernel_src/rubin/inference/mega/topk_reduce.py | (R1 | rewrite) | 44316f7e872fe1ca7ba3d233ea3505069aececfd18a6423c151c77b1916d6358 | f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f
+```
 
 ## Rewrite rule
 
@@ -140,16 +122,16 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
-725b855edb022d5e3a3ee7c077342012d3aa9eb9c0169e8c9753b3df2dde0b81  sources/communication/nvlink_domain/token_comm.py
+8736c9dd051ee56496c1c55b064d9e73a45dcaa247ee4cadabc197edd767c449  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
 868871ef468436bcfbfb638c4b8778805f05d6772ee2dea0ba9a5c9b4901d6cc  sources/helpers/cute_py_helpers.py
-d92c61b501a7544e15c06de94d66177ebd060ee31194d3b8ba3dab4d73433aa0  sources/helpers/device_workspace.py
+8e60cb15729e91245dcafb8a9a9c17466884e6b68983307a2b9c213b71ef047a  sources/helpers/device_workspace.py
 d531c11140576dcb22d3b53624b216bbcc8f090283259bcad74d6a0544a24581  sources/helpers/dsl_helpers.py
 c9c129755b57ec5bb105e58b301c0a9ece44142b59fabb69613e41aecf076ca3  sources/helpers/flag_batch.py
 4b8a3c3e231793f87d6b1bcd5dffee8b5c19c384c3a719fbb4ed895d9929ba29  sources/helpers/iket_compat.py
-11bd36ff08a6ee6fa8ad3379c616b5ef7e223f6d967486c7e0af0000e06ef28b  sources/helpers/ptx_helpers.py
+215675b7f0def6526bb3c75b385cf12ccf0a5a35e8816c68bffbda03eaeabd9c  sources/helpers/ptx_helpers.py
 91478bee142314688ec56aec5129e46c392597a24fa88cb4d1031b612a031d7c  sources/helpers/smem_workspace.py
 f12c4a4df541d4e80346e4cb256f788fc825283696ed69670df13c72c2811525  sources/helpers/software_sync.py
 39a95432034901e309c9da1b815153ba85eeaa0b17c3e0386a66067f41ee6b22  sources/helpers/utils.py
@@ -159,23 +141,22 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 fbea697f91fe5c5f1623568cb3ed45951905c2428bf2a49f330943ed910df4bc  sources/kernel_src/rubin/custom_mix_cga_helpers.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/mega/__init__.py
-61b09a92891324247afc6eaf2de67ae2750e14401e16ad9b0b063a100cef07d3  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+2f3661c14a197f52ce66235010aeb78a0eb02ed34534d0f5d3f0de66dfd65ad8  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
-ed192f39cce199441a3116869898f0c1c275aeb0ac5218d809b8d3f0b68be7ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
-e7f3aa713f90170f3f2c4b616af7a338ee4cb3cdef34621cb21e6ad8a90aabf6  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-14a181fec57aa9004a6bb154fcac3abd8db025ba2177a677508ce4b3414862b1  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
-292cd6c6d62b9d6cb7a15e0f43363756941124a645c34be6947b5542282c3ee5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+850caf943d137eeeeb99e997a6debce7aea14d3db2cd1e1992601b4e3b711af2  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+60963f01d755f52d5f7b6e1e7c76242bc583b4d2e26192e3639f5aaee9caa22c  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
+413acdb503943619a72e5decbfc2fadd99981c1bb9684808b9420141886c71e5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+9179cb6a1f53f55fb6a0f03a269f3a1702567cdf9e2798ec33c50834259e6e42  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
 f8640f21703099acbf74064368d2d1a6d410760e358bb4341a8b26402b0a8a1f  sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
-56efd874b9859abfcafb2e0cdc39c2690404a274b07590f5c1630f57f57e3f9b  sources/kernel_src/rubin/inference/mega/topk_reduce.py
+f63a32f0379fea7d3c88cb88f3e26bdb875bdb24745416185ed9b7f76c1de66f  sources/kernel_src/rubin/inference/mega/topk_reduce.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/schedulers/__init__.py
 22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04  sources/kernel_src/schedulers/base.py
-f4569f517f8cdaac72b920b893f426c5b41a676ebac0f6432ffa8903a91d22be  sources/kernel_src/schedulers/die_split_fc12_scheduler.py
-bf754355af676f767eca31dee76dade21bd9e440a755c159861c943ab45b57c6  sources/kernel_src/schedulers/fc12_mapping.py
-ce86b6234fe181b31dc6bbfafe0ed9093a39a600a8e0d3f4dae25983a8f72f97  sources/kernel_src/schedulers/fc12_scheduler.py
-c43fc6e1b0858191776e82e702b2f1c373d3984b14f58a8d5011764d20ce7f47  sources/kernel_src/schedulers/non_clc_mixed_cga.py
-7b116a8adfecd85197f90e81f14d16d55704210fa3e583ba9f71d80c96b2af79  sources/kernel_src/schedulers/work_id_claim.py
+c853ecafc65add0d5aac0e52b65bec89966c6d52d568afa32e58e46d73fdb8fa  sources/kernel_src/schedulers/fc12_mapping.py
+5f59fb9d47bd67e829351d2de9e65f289ec13201844539948db7688e1dce917e  sources/kernel_src/schedulers/fc12_scheduler.py
+d6f380b805ea4c432cea09a6d81ea2156e645f7fed0af1b575de2d2145feedd3  sources/kernel_src/schedulers/non_clc_mixed_cga.py
+88ca9f947ab88ab703c0f2b1375e5aef6bec890967c34aae0fde7c27845e1af6  sources/kernel_src/schedulers/work_id_claim.py
 b88290f0cc90713b16e0fd8c60d12d5168027e42497b629251cd47c05ceecfe5  sources/quant_def.py
 ```
 
