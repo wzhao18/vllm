@@ -70,11 +70,15 @@ struct Args {
   float* partial;         // [nseg * MAXJ][PART]
   float* out;             // [nseg][PART]
   const int* sm_die;      // [1024]
-  int match, swap, steal, P, S, SB;
+  int match, swap, steal, P, S, SB, statik;
+  const int* sm_rank;     // [1024] rank of the SM among its die (match) or all SMs
+  int n_on0, n_on1;       // SMs per die (match) or all SMs in n_on0
+  unsigned long long* stamps;  // [grid * 4][3]: producer start, producer end, consumer end
   unsigned* sink;
 };
 
 __device__ __forceinline__ unsigned smid() { unsigned r; asm volatile("mov.u32 %0, %%smid;" : "=r"(r)); return r; }
+__device__ __forceinline__ unsigned long long gtime() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
 __device__ __forceinline__ unsigned sa(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void wait_par(unsigned b, unsigned ph) {
   asm volatile("{.reg .pred P; W: mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1; @!P bra W;}" :: "r"(b), "r"(ph) : "memory");
@@ -103,8 +107,12 @@ __global__ void __launch_bounds__(256) skel(Args a) {
   int w = threadIdx.x / 32, lane = threadIdx.x % 32;
   int iss = w >> 1;
   bool producer = !(w & 1);
-  int die = 0;
-  if (a.match) { die = a.sm_die[smid() & 1023] & 1; if (a.swap) die ^= 1; }
+  int die = 0, rdie = 0;
+  unsigned sm = smid() & 1023;
+  if (a.match) { rdie = a.sm_die[sm] & 1; die = rdie ^ (a.swap & 1); }
+  const int G = (rdie ? a.n_on1 : a.n_on0) * a.P;
+  const int gi = a.sm_rank[sm] * a.P + iss;
+  unsigned long long* st = a.stamps + ((size_t)blockIdx.x * 4 + iss) * 3;
   if (producer && lane == 0 && iss < a.P) for (int i = 0; i < a.S; ++i) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&full[iss * a.S + i])));
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&empty[iss * a.S + i])));
@@ -121,13 +129,20 @@ __global__ void __launch_bounds__(256) skel(Args a) {
     if (lane != 0) return;
     int list = a.match ? die : 0;
     long long i = 0;
-    int it = claim(a, list, die);
+    int k = 0;
+    st[0] = gtime();
+    int it;
+    if (a.statik) { it = gi < a.nitems[list] ? list * a.cap + gi : -1; ++k; } else it = claim(a, list, die);
     while (true) {
-      int nxt = it >= 0 ? claim(a, list, die) : -1;
+      int nxt = -1;
+      if (it >= 0) {
+        if (a.statik) { int idx = gi + k * G; ++k; nxt = idx < a.nitems[list] ? list * a.cap + idx : -1; }
+        else nxt = claim(a, list, die);
+      }
       unsigned bytes = 0; const unsigned char* src = nullptr;
       if (it >= 0) { Item I = a.items[it]; bytes = I.bytes; src = (const unsigned char*)I.addr; }
       int nst = it >= 0 ? (int)((bytes + a.SB - 1) / a.SB) : 1;
-      for (int k = 0; k < nst; ++k, ++i) {
+      for (int q = 0; q < nst; ++q, ++i) {
         int sl = (int)(i % a.S); long long round = i / a.S;
         if (round > 0) wait_par(sa(&myempty[sl]), (unsigned)((round - 1) & 1));
         unsigned b = sa(&myfull[sl]);
@@ -135,15 +150,16 @@ __global__ void __launch_bounds__(256) skel(Args a) {
           mymeta[sl] = -1;
           asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(b) : "memory");
         } else {
-          unsigned n = min((unsigned)a.SB, bytes - (unsigned)k * a.SB);
-          mymeta[sl] = it * 2 + (k == nst - 1);
+          unsigned n = min((unsigned)a.SB, bytes - (unsigned)q * a.SB);
+          mymeta[sl] = it * 2 + (q == nst - 1);
           asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(b), "r"(n) : "memory");
-          bulk(sa(myring + (size_t)sl * a.SB), src + (size_t)k * a.SB, n, b);
+          bulk(sa(myring + (size_t)sl * a.SB), src + (size_t)q * a.SB, n, b);
         }
       }
       if (it < 0) break;
       it = nxt;
     }
+    st[1] = gtime();
   } else {
     unsigned acc = 0;
     long long i = 0;
@@ -178,19 +194,23 @@ __global__ void __launch_bounds__(256) skel(Args a) {
         }
       }
     }
+    if (lane == 0) st[2] = gtime();
     if (acc == 0x12345678u) a.sink[0] = acc;
   }
 }
 
 void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg_ctr, int64_t seg_nj,
             int64_t partial, int64_t out, int64_t sm_die, int64_t match, int64_t swap, int64_t steal,
-            int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink) {
+            int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink,
+            int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps) {
   Args a;
   a.items = (const Item*)items; a.nitems = (const int*)nitems; a.cap = (int)cap;
   a.ctr = (int*)ctr; a.seg_ctr = (int*)seg_ctr; a.seg_nj = (const int*)seg_nj;
   a.partial = (float*)partial; a.out = (float*)out; a.sm_die = (const int*)sm_die;
   a.match = (int)match; a.swap = (int)swap; a.steal = (int)steal;
   a.P = (int)P; a.S = (int)S; a.SB = (int)SB; a.sink = (unsigned*)sink;
+  a.statik = (int)statik; a.sm_rank = (const int*)sm_rank; a.n_on0 = (int)n_on0; a.n_on1 = (int)n_on1;
+  a.stamps = (unsigned long long*)stamps;
   static bool init = false;
   if (!init) { cudaFuncSetAttribute(skel, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024); init = true; }
   cudaLaunchConfig_t cfg = {};
@@ -209,7 +229,8 @@ _CPP_SRC = r"""
 #include <torch/extension.h>
 void launch(int64_t items, int64_t nitems, int64_t cap, int64_t ctr, int64_t seg_ctr, int64_t seg_nj,
             int64_t partial, int64_t out, int64_t sm_die, int64_t match, int64_t swap, int64_t steal,
-            int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink);
+            int64_t P, int64_t S, int64_t SB, int64_t grid, int64_t smem, int64_t sink,
+            int64_t statik, int64_t sm_rank, int64_t n_on0, int64_t n_on1, int64_t stamps);
 """
 
 _mod = None
@@ -269,8 +290,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests", default="32,64,96")
     ap.add_argument("--replays", type=int, default=20)
-    ap.add_argument("--units", default="64,128,512")
-    ap.add_argument("--forms", default="1x32x6,2x32x3,4x16x3,2x16x6,1x64x3")
+    ap.add_argument("--units", default="128,256,512")
+    ap.add_argument("--forms", default="1x64x3,2x32x3,4x16x3,2x48x2")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     torch.cuda.set_device(dev)
@@ -293,13 +314,23 @@ def main():
     for b in bufs.values():
         b.random_(0, 255)
     assert bufs["local"].data_ptr() % CHUNK == 0
-    arms = [  # name, buffer, match, swap, steal
-        ("striped", "striped", 0, 0, 0),
-        ("local", "local", 1, 0, 1),
-        ("local-nosteal", "local", 1, 0, 0),
-        ("swapped", "local", 1, 1, 1),
-        ("local-unmatched", "local", 0, 0, 0),
+    arms = [  # name, buffer, match, swap, steal, static (rank-in-die schedule, no atomics)
+        ("striped-static", "striped", 0, 0, 0, 1),
+        ("local-static", "local", 1, 0, 0, 1),
+        ("swapped-static", "local", 1, 1, 0, 1),
+        ("local-dyn", "local", 1, 0, 1, 0),
+        ("striped-dyn", "striped", 0, 0, 0, 0),
     ]
+    smids = list(range(sms))
+    dies_of = [int(x) for x in table[:sms].tolist()]
+    rank_match = torch.zeros(1024, dtype=torch.int32)
+    seen = [0, 0]
+    for s in smids:
+        rank_match[s] = seen[dies_of[s]]
+        seen[dies_of[s]] += 1
+    rank_match = rank_match.to(dev)
+    rank_all = torch.arange(1024, dtype=torch.int32, device=dev)
+    stamps = torch.zeros(sms * 4 * 3, dtype=torch.int64, device=dev)
     rng = random.Random(1234)
     sink = torch.zeros(4, dtype=torch.int32, device=dev)
     for n_req in [int(x) for x in args.requests.split(",")]:
@@ -311,7 +342,7 @@ def main():
         out = torch.zeros(nseg * PART, dtype=torch.float32, device=dev)
         best = {}
         for unit_k in [int(x) for x in args.units.split(",")]:
-            for arm, bname, match, swap, steal in arms:
+            for arm, bname, match, swap, steal, statik in arms:
                 base = bufs[bname].data_ptr()
                 per_layer = [items_for(s, base, unit_k << 10, match) for s in segs]
                 cap = max(max(len(l[0][0]), len(l[0][1])) for l in per_layer)
@@ -341,7 +372,10 @@ def main():
                                 ctrs[LAYERS * 2 + li * nseg:].data_ptr(),
                                 njs[li].data_ptr(), partial.data_ptr(), out.data_ptr(),
                                 sm_die.data_ptr(), match, swap, steal, P, S, SB, sms, smem,
-                                sink.data_ptr())
+                                sink.data_ptr(), statik,
+                                (rank_match if match else rank_all).data_ptr(),
+                                seen[0] if match else sms, seen[1] if match else 0,
+                                stamps.data_ptr())
 
                     out.zero_()
                     chain()
@@ -368,9 +402,18 @@ def main():
                     key = arm
                     if key not in best or t < best[key][0]:
                         best[key] = (t, f"U{unit_k}K P{P} SB{sbk}K S{S}")
+                    sv = stamps.view(sms, 4, 3)[:, :P].reshape(-1, 3).cpu()
+                    sv = sv[sv[:, 0] > 0]
+                    t0 = int(sv[:, 0].min())
+                    dur = ((sv[:, 2] - sv[:, 0]).float() / 1e3).sort().values
+                    stamps.zero_()
                     print(f"N{n_req} R{n_req * 4} {arm} U{unit_k}K P{P} SB{sbk}K S{S}: "
                           f"{t:.2f} us/layer {tbs:.1f} TB/s imb {imbalance:.3f} "
-                          f"{'ok' if ok else 'FAIL'}", flush=True)
+                          f"{'ok' if ok else 'FAIL'} | last layer: span "
+                          f"{(int(sv[:, 2].max()) - t0) / 1e3:.2f} start-spread "
+                          f"{(int(sv[:, 0].max()) - t0) / 1e3:.2f} issuer p50 "
+                          f"{float(dur[len(dur) // 2]):.2f} max {float(dur[-1]):.2f} us",
+                          flush=True)
         gate = GATE_US.get(n_req)
         for arm, (t, cfg) in best.items():
             print(f"BEST N{n_req} R{n_req * 4} {arm}: {t:.2f} us/layer ({cfg}) "
