@@ -26,6 +26,9 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h4 import (  # no
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h5 import (  # noqa: E402
     sparse_mla_prefill_h5,
 )
+from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h6 import (  # noqa: E402
+    sparse_mla_prefill_h6,
+)
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (  # noqa: E402
     sparse_mla_prefill_sol,
 )
@@ -125,9 +128,11 @@ def test_matches_stock_trtllm_kernel():
     assert ours_h4 <= 1.25 * stock + 1e-3, (ours_h4, stock)
     ours_h5 = err(sparse_mla_prefill_h5(q8, kv, slots, lens, scale, out_scale))
     assert ours_h5 <= 1.25 * stock + 1e-3, (ours_h5, stock)
+    ours_h6 = err(sparse_mla_prefill_h6(q8, kv, slots, lens, scale, out_scale))
+    assert ours_h6 <= 1.25 * stock + 1e-3, (ours_h6, stock)
 
 
-@pytest.mark.parametrize("kernel", ["sol", "h2", "h4", "h4_tma", "h5", "h5_tma", "h5_split", "h5_stm", "h5_pp"])
+@pytest.mark.parametrize("kernel", ["sol", "h2", "h4", "h4_tma", "h5", "h5_tma", "h5_split", "h5_stm", "h5_pp", "h6"])
 @pytest.mark.parametrize("scale_mul", [0.7, 3.0])
 def test_sol_matches_fp32_reference(scale_mul, kernel):
     """Gather-floor kernel; scale_mul 3 drives the lazy-max slow path often."""
@@ -136,9 +141,11 @@ def test_sol_matches_fp32_reference(scale_mul, kernel):
     q8, kv, slots, lens = _problem(lengths, pool_pages=600, width=2048, seed=0)
     scale, out_scale = 192**-0.5 * scale_mul, 1.3
     fn = {"sol": sparse_mla_prefill_sol, "h2": sparse_mla_prefill_h2,
-          "h4": sparse_mla_prefill_h4, "h5": sparse_mla_prefill_h5}[kernel.split("_")[0]]
+          "h4": sparse_mla_prefill_h4, "h5": sparse_mla_prefill_h5,
+          "h6": sparse_mla_prefill_h6}[kernel.split("_")[0]]
     knobs = {"tma": (0, 0, 1, 1), "split": (0, 0, 0, 0, 0, 0, 1),
-             "stm": (0, 0, 2, 0, 0, 0, 1), "pp": (0, 0, 2, 0, 0, 0, 1, 1)}.get(
+             "stm": (0, 0, 2, 0, 0, 0, 1), "pp": (0, 0, 2, 0, 0, 0, 1, 1),
+             "pp2": (0, 0, 2, 0, 0, 0, 1, 1, 0, 1)}.get(
         kernel.split("_")[-1], ())
     out = (fn(q8, kv, slots, lens, scale, out_scale, knobs=knobs) if knobs
            else fn(q8, kv, slots, lens, scale, out_scale))

@@ -81,6 +81,8 @@ STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
 W_OUT, W_MMA, W_LD = 8, 12, 13
 THREADS = 32 * 24
 REG_LAUNCH = 65536 // THREADS // 8 * 8  # 80
+REG_SM2, REG_LD2 = 136, 40  # pp2: softmax WGs / loader + MMA WGs (output WG stays 80)
+assert 256 * REG_SM2 + 128 * REG_LAUNCH + 384 * REG_LD2 <= THREADS * REG_LAUNCH
 
 # shared memory (bytes). SS A tiles have M = 128 rows; only 96 are loaded and rows
 # 96-127 read whatever follows (valid shared memory, padding rows of S only).
@@ -124,6 +126,17 @@ IDESC_QK = (1 << 4) | (64 >> 3 << 17) | (128 >> 4 << 24) | (1 << 29)  # M128 N64
 IDESC_PV = (1 << 4) | (H >> 3 << 17) | (128 >> 4 << 24) | (1 << 29) | (1 << 15)  # A MN
 
 STAMP_CTAS, STAMP_TILES, STAMP_EV = 8, 64, 8
+
+
+def _tree_max(vals):
+    """Max of a list of traced values as a 4-ary tree (trace-time Python)."""
+    vals = list(vals)
+    while len(vals) > 1:
+        vals = [cute.arch.fmax(cute.arch.fmax(vals[q], vals[q + 1]),
+                               cute.arch.fmax(vals[q + 2], vals[q + 3]))
+                if q + 3 < len(vals) else cute.arch.fmax(vals[q], vals[q + 1])
+                for q in range(0, len(vals), 4)]
+    return vals[0]
 
 
 def _bar(base, i):
@@ -225,9 +238,13 @@ class SparseMlaPrefillH5:
         # sstamp: CTA 0 records clock stamps of softmax warps 0 and 4 for 16 subtiles
         # into the last 1 KiB of shared memory (no global stores in the loop) and copies
         # them to the stamp buffer at the end (int32 [16 subtiles][2 warps][8 events])
-        knobs = tuple(knobs) + (0,) * (9 - len(knobs))
+        # pp2: ping-pong softmax with the 64-key row in registers (one S load, S released
+        # at once; softmax WGs setmaxnreg 136, loader/MMA WGs 40; no -maxrregcount)
+        knobs = tuple(knobs) + (0,) * (10 - len(knobs))
         (self.no_store, self.no_gather, self.epi_tma, self.hint, self.no_math,
-         self.no_mma, self.split, self.pp, self.sstamp) = knobs[:9]
+         self.no_mma, self.split, self.pp, self.sstamp, self.pp2) = knobs[:10]
+        if self.pp2:
+            self.pp = 1
         self.smem = SMEM_BYTES + (1024 if self.sstamp else 0)
         self.nld = LOADERS - 1 if self.split else LOADERS
 
@@ -257,7 +274,7 @@ class SparseMlaPrefillH5:
         self.kernel(qn, qr, kvm, kvr, om, out, rows, unit_rows, slots, slot_stride,
                     lengths, scale_log2, out_scale, stamp).launch(
             grid=(self.grid, 1, 1), block=(THREADS, 1, 1), smem=self.smem,
-            stream=stream)
+            stream=stream, min_blocks_per_mp=1)
 
     @cute.kernel
     def kernel(self, qn: tensormap.GridMap, qr: tensormap.GridMap,
@@ -299,7 +316,12 @@ class SparseMlaPrefillH5:
         tc_fence_after()
         taddr = ld_shared_u32(base + Uint32(OFF_TMEM))
         n_mine = (rows - cta + self.grid - 1) // self.grid
+        if cutlass.const_expr(self.pp2):
+            if warp >= W_MMA:
+                cute.arch.warpgroup_reg_dealloc(REG_LD2)
         if warp < W_OUT:
+            if cutlass.const_expr(self.pp2):
+                cute.arch.warpgroup_reg_alloc(REG_SM2)
             if cutlass.const_expr(self.pp):
                 self.softmax_pp(base, tid, warp, lane, taddr, n_mine, lengths, cta,
                                 scale_log2, out_scale, stamp)
@@ -333,10 +355,17 @@ class SparseMlaPrefillH5:
                             tensormap.map_address(qn), tensormap.map_address(qr),
                             tensormap.map_address(kvm), tensormap.map_address(kvr),
                             unit_rows, slots, slot_stride, lengths, stamp)
+        if cutlass.const_expr(self.pp2):
+            # every warpgroup back at the launch count before the common tail, so ptxas
+            # sees one register count where the role paths merge
+            if warp < W_OUT:
+                cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
+            elif warp >= W_MMA:
+                cute.arch.warpgroup_reg_alloc(REG_LAUNCH)
         tc_fence_before()
         cute.arch.sync_threads()
         if cutlass.const_expr(self.sstamp):
-            if cta == 0 and tid < 256:
+            if cta == 0 and tid < 256 and stamp != Int64(0):
                 v = ld_shared_u32(base + Uint32(SMEM_BYTES + 4 * tid))
                 st_global_u32(stamp + Int64(4 * tid), v)
         if warp == 0:
@@ -352,12 +381,19 @@ class SparseMlaPrefillH5:
 
     @cute.jit
     def ss(self, base, cta, warp, lane, u, ev: cutlass.Constexpr):
-        """sstamp: shared-memory clock stamp of softmax warps 0 and 4 (CTA 0), subtiles
-        16-31 (steady state of the first token)."""
+        """sstamp: shared-memory clock stamp (CTA 0, subtiles 16-23, lane 0) into
+        [8 subtiles][32 slots]: slots 0-7 softmax warp 0 events, 8-15 softmax warp 4
+        (ev + 8 passed by the caller as warp 4), 16+ the other roles' events."""
         if cutlass.const_expr(self.sstamp):
-            if cta == 0 and lane == 0 and warp % 4 == 0 and u >= 16 and u < 32:
-                sstamp_clock(base + Uint32(SMEM_BYTES) + Uint32(
-                    (((u - 16) * 2 + warp // 4) * 8 + ev) * 4))
+            if cta == 0 and lane == 0 and u >= 16 and u < 24:
+                slot = Int32(ev)
+                if cutlass.const_expr(ev < 8):
+                    slot = Int32(ev) + Int32(8) * (warp // 4)
+                    if warp % 4 == 0:
+                        sstamp_clock(base + Uint32(SMEM_BYTES) + Uint32(
+                            ((u - 16) * 32 + slot) * 4))
+                else:
+                    sstamp_clock(base + Uint32(SMEM_BYTES) + Uint32(((u - 16) * 32 + slot) * 4))
 
     @cute.jit
     def stamp(self, ptr, cta, g, ev: cutlass.Constexpr):
@@ -431,6 +467,7 @@ class SparseMlaPrefillH5:
                     if lane == 0:
                         self.wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
                         if pw == 0:
+                            self.ss(base, cta, Int32(0), lane, g, 22)
                             if cutlass.const_expr(self.no_gather):
                                 mbar_arrive(full)
                             else:
@@ -456,6 +493,8 @@ class SparseMlaPrefillH5:
                                         full, 128 * a, r0, r1, r2, r3)
                             gather4(st + Uint32(4 * 8192) + Uint32(q) * Uint32(256), tm_kr,
                                     full, D_NOPE, r0, r1, r2, r3)
+                    if pw == 0:
+                        self.ss(base, cta, Int32(0), lane, g, 23)
                     if cutlass.const_expr(self.stamps):
                         if pw == 0 and lane == 0:
                             self.stamp(stamp, cta, g, 7)
@@ -508,9 +547,11 @@ class SparseMlaPrefillH5:
             self.wait(_bar(base, B_QTM), Uint32(qi & 1))
             tc_fence_after()
             for i in range(subs):
+                self.ss(base, cta, Int32(0), lane, u, 25)
                 if u >= 2:
                     self.wait(_bar(base, B_SFREE + u % 2), Uint32((u // 2 - 1) & 1))
                     tc_fence_after()
+                self.ss(base, cta, Int32(0), lane, u, 24)
                 self.qk(base, lane, taddr, u, qi, i == subs - 1, cta, stamp)
                 u = u + 1
 
@@ -535,6 +576,7 @@ class SparseMlaPrefillH5:
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
         if lane == 0:
             self.wstamp(stamp, cta, u, 8, 0)
+        self.ss(base, cta, Int32(0), lane, u, 16)
         self.wait(_bar(base, B_KVFULL + s), Uint32((u // NS) & 1))
         if lane == 0:
             self.stamp(stamp, cta, u, 1)
@@ -565,6 +607,7 @@ class SparseMlaPrefillH5:
             if cutlass.const_expr(not self.no_mma):
                 tc_mma(sc, ad, bd, Uint32(IDESC_QK), Uint32(1))
             self.wstamp(stamp, cta, u, 8, 1)
+            self.ss(base, cta, Int32(0), lane, u, 17)
             tc_commit(_bar(base, B_SFULL + u % 2))
             if last:
                 tc_commit(_bar(base, B_QREMPTY + qi % 2))
@@ -576,7 +619,9 @@ class SparseMlaPrefillH5:
         P(u) (and applied its rescale); P^T is fetched once into the B collector."""
         s = u % NS
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+        self.ss(base, cta, Int32(0), lane, u, 26)
         self.wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
+        self.ss(base, cta, Int32(0), lane, u, 18)
         if lane == 0:
             self.stamp(stamp, cta, u, 4)
             self.wstamp(stamp, cta, u, 8, 3)
@@ -598,6 +643,7 @@ class SparseMlaPrefillH5:
                     tc_mma_cb(taddr + Uint32(C_O + 96 * b), ad, bd, Uint32(IDESC_PV), acc,
                               op)
             self.wstamp(stamp, cta, u, 8, 2)
+            self.ss(base, cta, Int32(0), lane, u, 19)
             tc_commit(_bar(base, B_KVEMPTY + s))
             tc_commit(_bar(base, B_PEMPTY + u % NP))
             if last != 0:
@@ -771,7 +817,7 @@ class SparseMlaPrefillH5:
         lane_addr = taddr + (Uint32(sp * 32) << Uint32(16))
         real = h < H
         real_m = h < (0 if self.no_math else H)
-        xv = cute.make_rmem_tensor((32,), Float32)
+        xv = cute.make_rmem_tensor((64 if self.pp2 else 32,), Float32)
         total = Int32(0)
         for qi in range(n_mine):
             total = total + _subs(lens[cta + qi * self.grid])
@@ -826,13 +872,29 @@ class SparseMlaPrefillH5:
         grow = Int32(0)
         alpha = Float32(1.0)
         mp = Float32(0.0)
+        if cutlass.const_expr(self.pp2):
+            # the whole 64-key row into registers; S buffer released at once
+            sa = tmem_ld(scol, 64)
+            for k in cutlass.range_constexpr(64):
+                xv[k] = sa[k]
+            tc_fence_before()
+            cute.arch.sync_warp()
+            if lane == 0:
+                mbar_arrive(_bar(base, B_SFREE + u % 2))
+            if cutlass.const_expr(masked):
+                for k in cutlass.range_constexpr(64):
+                    if 64 * i + k >= n:
+                        xv[k] = Float32(-math.inf)
         if real_m:
             # pass 1: row max of the raw scores (scale > 0 commutes with max)
             sm = Float32(-math.inf)
-            for c in cutlass.range_constexpr(2):
-                sa = tmem_ld(scol + Uint32(32 * c), 32)
-                vals = sa
-                if cutlass.const_expr(masked):
+            for c in cutlass.range_constexpr(1 if self.pp2 else 2):
+                if cutlass.const_expr(self.pp2):
+                    vals = [xv[k] for k in range(64)]
+                else:
+                    sa = tmem_ld(scol + Uint32(32 * c), 32)
+                    vals = sa
+                if cutlass.const_expr(masked and not self.pp2):
                     for k in cutlass.range_constexpr(32):
                         xv[k] = sa[k]
                     if 64 * i + 32 * c + 32 > n:
@@ -840,13 +902,7 @@ class SparseMlaPrefillH5:
                             if 64 * i + 32 * c + k >= n:
                                 xv[k] = Float32(-math.inf)
                     vals = [xv[k] for k in range(32)]
-                m8 = [cute.arch.fmax(cute.arch.fmax(vals[4 * q], vals[4 * q + 1]),
-                                     cute.arch.fmax(vals[4 * q + 2], vals[4 * q + 3]))
-                      for q in range(8)]
-                m2 = [cute.arch.fmax(cute.arch.fmax(m8[4 * q], m8[4 * q + 1]),
-                                     cute.arch.fmax(m8[4 * q + 2], m8[4 * q + 3]))
-                      for q in range(2)]
-                sm = cute.arch.fmax(sm, cute.arch.fmax(m2[0], m2[1]))
+                sm = cute.arch.fmax(sm, _tree_max(vals))
             # lazy-max decision after the previous subtile's (other WG) decision
             if u >= 1:
                 named_bar(Uint32(1 + sp + 3 * (1 - wg)), 64)
@@ -877,11 +933,18 @@ class SparseMlaPrefillH5:
             b0, b1 = Float32(0.0), Float32(0.0)
             nmp = Float32(0.0) - mp
             for c in cutlass.range_constexpr(2):
-                sa = tmem_ld(scol + Uint32(32 * c), 32)
-                for k in cutlass.range_constexpr(16):
-                    xv[2 * k], xv[2 * k + 1] = ffma2(sa[2 * k], sa[2 * k + 1], scale_log2,
-                                                     scale_log2, nmp, nmp)
-                if cutlass.const_expr(masked):
+                if cutlass.const_expr(self.pp2):
+                    # xv holds the row (masked keys -inf); x = s scale - m in place
+                    for k in cutlass.range_constexpr(16):
+                        xv[32 * c + 2 * k], xv[32 * c + 2 * k + 1] = ffma2(
+                            xv[32 * c + 2 * k], xv[32 * c + 2 * k + 1], scale_log2,
+                            scale_log2, nmp, nmp)
+                else:
+                    sa = tmem_ld(scol + Uint32(32 * c), 32)
+                    for k in cutlass.range_constexpr(16):
+                        xv[2 * k], xv[2 * k + 1] = ffma2(sa[2 * k], sa[2 * k + 1],
+                                                         scale_log2, scale_log2, nmp, nmp)
+                if cutlass.const_expr(masked and not self.pp2):
                     if 64 * i + 32 * c + 32 > n:
                         for k in cutlass.range_constexpr(32):
                             if 64 * i + 32 * c + k >= n:
@@ -889,7 +952,7 @@ class SparseMlaPrefillH5:
                 for cc in cutlass.range_constexpr(2):
                     w = []
                     for q in cutlass.range_constexpr(4):
-                        k = 16 * cc + 4 * q
+                        k = 16 * cc + 4 * q + (32 * c if self.pp2 else 0)
                         p0 = ex2(xv[k])
                         p1 = ex2(xv[k + 1])
                         p2 = ex2(xv[k + 2])
@@ -905,10 +968,11 @@ class SparseMlaPrefillH5:
             lw = lw + (a0 + a1)
             st_shared_f32(base + Uint32(OFF_AL) + Uint32(u % NP) * Uint32(H * 4)
                           + Uint32(h * 4), alpha)
-        tc_fence_before()
-        cute.arch.sync_warp()
-        if lane == 0:
-            mbar_arrive(_bar(base, B_SFREE + u % 2))
+        if cutlass.const_expr(not self.pp2):
+            tc_fence_before()
+            cute.arch.sync_warp()
+            if lane == 0:
+                mbar_arrive(_bar(base, B_SFREE + u % 2))
         if cute.arch.vote_any_sync(grow != 0) and lane == 0:
             st_shared_u32(base + Uint32(OFF_FLAG) + Uint32(u % NP) * Uint32(4),
                           Uint32(u + 1))
@@ -944,6 +1008,8 @@ class SparseMlaPrefillH5:
                     if qi + 1 < n_mine:
                         self.q_copy(base, e, lane, lane_addr, qi + 1)
                 self.wait(_bar(base, B_PFULL + u % NP), Uint32((u // NP) & 1))
+                if wq == 0:
+                    self.ss(base, cta, Int32(0), lane, u, 20)
                 if wq == 0 and lane == 0:
                     self.wstamp(stamp, cta, u, 10, 0)
                 if ld_shared_u32(base + Uint32(OFF_FLAG) + Uint32(u % NP) * Uint32(4)) == Uint32(u + 1):
@@ -968,6 +1034,8 @@ class SparseMlaPrefillH5:
                     mbar_arrive(_bar(base, B_OREADY + u % NP))
                     if wq == 0:
                         self.wstamp(stamp, cta, u, 10, 1)
+                if wq == 0:
+                    self.ss(base, cta, Int32(0), lane, u, 21)
                 u = u + 1
             if cutlass.const_expr(self.epi_tma == 2):
                 self.epilogue_stm(base, e, wq, lane, lane_addr, qi, cta, tm_o, stamp)
@@ -1140,6 +1208,9 @@ def _compiled(grid: int, stamps: bool, knobs: tuple = ()):
     kernel = SparseMlaPrefillH5(grid, stamps, knobs)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0), Int64(0),
             Float32(1.0), Float32(1.0), Int32(64), Int64(0), cuda.CUstream(0))
+    if kernel.pp2:
+        # per-warpgroup budgets come from setmaxnreg; .reqntid caps the launch at 80
+        return cute.compile(kernel, *args)
     return cute.compile(kernel, *args, options=f"--ptxas-options -maxrregcount={REG_LAUNCH}")
 
 

@@ -15,7 +15,7 @@ import importlib  # noqa: E402
 name = sys.argv[3] if len(sys.argv) > 3 else "h2"
 mod = importlib.import_module(f"vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_{name}")
 knobs = tuple(int(v) for v in sys.argv[4].split(":")) if len(sys.argv) > 4 else ()
-fn = mod._compiled(212, False, knobs)
+fn = mod._compiled(212, knobs) if name == "h6" else mod._compiled(212, False, knobs)
 for a in dir(fn):
     if "ptx" in a.lower() or "cubin" in a.lower() or "sass" in a.lower():
         print("attr", a, flush=True)

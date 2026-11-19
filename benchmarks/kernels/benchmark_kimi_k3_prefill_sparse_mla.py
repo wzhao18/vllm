@@ -128,6 +128,7 @@ def main():
     ap.add_argument("--h2-knobs", default="", help="no_store:no_mma list")
     ap.add_argument("--kernels", default="sol,h2",
                     help="specialized kernels to time (sol, h2, h4, h5)")
+    ap.add_argument("--no-base", action="store_true", help="skip the h4/h5 default knobs")
     ap.add_argument("--h4-knobs", default="",
                     help="h4/h5 knob list no_store:no_gather:epi_tma:hint:no_math:no_mma")
     ap.add_argument("--sol-knobs", default="",
@@ -302,12 +303,12 @@ def main():
                           flush=True)
         import importlib
 
-        for kname in [k for k in ("h4", "h5") if k in kernels]:
+        for kname in [k for k in ("h4", "h5", "h6") if k in kernels]:
             kfn = getattr(importlib.import_module(
                 f"vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_{kname}"),
                 f"sparse_mla_prefill_{kname}")
 
-            for kn in ["base"] + [k for k in a.h4_knobs.split(",") if k]:
+            for kn in ([] if a.no_base else ["base"]) + [k for k in a.h4_knobs.split(",") if k]:
                 knobs = () if kn == "base" else tuple(int(v) for v in kn.split(":"))
 
                 def v4(i, stamps=None, knobs=knobs, kfn=kfn):
@@ -327,20 +328,26 @@ def main():
                 if a.stamps:
                     res[f"stamps_{kname}_{kn}"] = stamp_report(v4, dev)
                     print(kname, kn, res[f"stamps_{kname}_{kn}"], flush=True)
-                if len(knobs) > 8 and knobs[8]:
+                if (len(knobs) > 8 and knobs[8]) or (kname == "h6" and len(knobs) > 4
+                                                       and knobs[4]):
                     sb = torch.zeros(256, dtype=torch.int32, device=dev)
                     v4(0, stamps=sb)
                     torch.cuda.synchronize()
-                    x = sb.view(16, 2, 8).cpu().long()
-                    x = (x - x[:, :, :1]) & 0xFFFFFFFF  # per subtile, relative to the S wait
-                    med = x.median(dim=0).values.tolist()
-                    per = (sb.view(16, 2, 8)[1:, 0, 1].long()
-                           - sb.view(16, 2, 8)[:-1, 0, 1].long()) & 0xFFFFFFFF
-                    res[f"sstamp_{kname}_{kn}"] = {"median_by_warp_event": med,
-                                                   "period_med": float(per.median())}
-                    print(kname, kn, "sstamp events (0 wait start, 1 S ready, 2 S loaded,"
-                          " 3 max stored, 4 max exchanged, 5 P buffer free, 6 P written,"
-                          " 7 fenced)", med, "period", float(per.median()), flush=True)
+                    x = sb.view(8, 32).cpu().long()
+                    rel = ((x - x[:, :1]) & 0xFFFFFFFF)
+                    rel = torch.where(rel > 0x7FFFFFFF, rel - (1 << 32), rel)
+                    rel = rel.masked_fill(x == 0, -999999)
+                    med = rel.median(dim=0).values.tolist()
+                    per = ((x[1:, 0] - x[:-1, 0]) & 0xFFFFFFFF).median().item()
+                    res[f"sstamp_{kname}_{kn}"] = {"median_rel_slot": med, "period": per,
+                                                   "raw": x.tolist()}
+                    print(kname, kn, "sstamp slots rel. to softmax w0 wait start: "
+                          "0-7 sm w0 (wait, S ready, S loaded, max stored, max exch, Pbuf "
+                          "free, P written, fenced), 8-15 sm w4, 16 QK at KV wait, 17 QK "
+                          "issued, 18 PV OREADY passed, 19 PV issued, 20 out PFULL passed, "
+                          "21 out OREADY arrived, 22 gather KVEMPTY passed, 23 gather "
+                          "issued, 24 QK SFREE passed, 25 QK at SFREE wait, 26 PV at "
+                          "OREADY wait", med, "period", per, flush=True)
         for kn in [k for k in a.sol_knobs.split(",") if k]:
             knobs = tuple(int(v) for v in kn.split(":"))
 
