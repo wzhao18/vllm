@@ -43,3 +43,8 @@ void k64_rec(const torch::stable::Tensor& kdq, const torch::stable::Tensor& kr, 
 void prep64(const torch::stable::Tensor& q, const torch::stable::Tensor& k, const torch::stable::Tensor& g, const torch::stable::Tensor& beta, const torch::stable::Tensor& a_log, const torch::stable::Tensor& dt_bias,
             double lower_bound, double scale, const torch::stable::Tensor& cu_seqlens, const torch::stable::Tensor& kdq, const torch::stable::Tensor& kr,
             const torch::stable::Tensor& inv, const torch::stable::Tensor& mqk, const torch::stable::Tensor& gt, const torch::stable::Tensor& beta_out);
+
+void prep64_tc(const torch::stable::Tensor& x, const torch::stable::Tensor& conv_w, const torch::stable::Tensor& conv_state, const torch::stable::Tensor& cache_indices, const torch::stable::Tensor& has_init,
+               int64_t null_block_id, const torch::stable::Tensor& g, const torch::stable::Tensor& beta, const torch::stable::Tensor& a_log, const torch::stable::Tensor& dt_bias, double lower_bound,
+               double scale, const torch::stable::Tensor& cu_seqlens, const torch::stable::Tensor& kdq, const torch::stable::Tensor& kr, const torch::stable::Tensor& inv, const torch::stable::Tensor& mqk, const torch::stable::Tensor& gt,
+               const torch::stable::Tensor& v_img, const torch::stable::Tensor& beta_out, const torch::stable::Tensor& dbg);

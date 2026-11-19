@@ -476,3 +476,60 @@ void prep64(const Tensor& q, const Tensor& k, const Tensor& g, const Tensor& bet
                 reinterpret_cast<float*>(gt.mutable_data_ptr()), beta_out.mutable_data_ptr(),
                 static_cast<cudaStream_t>(stream_ptr));
 }
+
+void launch_prep64_tc(void const* x, int64_t ldx, float const* conv_w, float* conv_state,
+                      int64_t st_s0, int64_t st_s1, int64_t st_s2, int32_t const* cache_indices,
+                      int64_t ci_s0, bool const* has_init, int null_block_id, void const* g,
+                      int64_t ldg, void const* beta, int64_t ldb, float const* a_log,
+                      float const* dt_bias, float lower_bound, float scale, int const* cu_seqlens,
+                      int N, int H, int T, int C_total, void* kdq, void* kr, void* inv, void* mqk,
+                      float* gt, void* v_img, void* beta_out, long long* dbg, cudaStream_t stream);
+
+// Chunk-64 prepare on the raw in_proj rows with the short conv fused.
+// x: (T, 3 H 128) bf16 raw q|k|v rows; conv_w (3 H 128, 4) FP32; conv_state
+// (lines, 3 H 128, >= 3) FP32 (updated in place for each sequence);
+// g: (T, H, 128) bf16 raw gate; beta: (T, H) bf16 raw logits (row strides).
+void prep64_tc(const Tensor& x, const Tensor& conv_w, const Tensor& conv_state,
+               const Tensor& cache_indices, const Tensor& has_init, int64_t null_block_id,
+               const Tensor& g, const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
+               double lower_bound, double scale, const Tensor& cu_seqlens, const Tensor& kdq,
+               const Tensor& kr, const Tensor& inv, const Tensor& mqk, const Tensor& gt,
+               const Tensor& v_img, const Tensor& beta_out, const Tensor& dbg) {
+  const int64_t T = x.size(0), H = g.size(1), N = cu_seqlens.numel() - 1;
+  STD_TORCH_CHECK(x.dim() == 2 && x.size(1) == 3 * H * 128 && x.stride(1) == 1 &&
+                      x.stride(0) % 8 == 0 && x.scalar_type() == ScalarType::BFloat16,
+                  "prep64_tc: x must be bf16 (T, 3 H 128) with 16 B aligned rows");
+  STD_TORCH_CHECK(conv_w.scalar_type() == ScalarType::Float && conv_w.is_contiguous() &&
+                      conv_w.size(0) == 3 * H * 128 && conv_w.size(1) == 4,
+                  "prep64_tc: conv weight (3 H 128, 4) FP32");
+  STD_TORCH_CHECK(conv_state.scalar_type() == ScalarType::Float && conv_state.dim() == 3 &&
+                      conv_state.size(1) == 3 * H * 128 && conv_state.size(2) >= 3,
+                  "prep64_tc: conv state (lines, 3 H 128, >= 3) FP32");
+  STD_TORCH_CHECK(g.dim() == 3 && g.size(0) == T && g.stride(1) == 128 && g.stride(2) == 1 &&
+                      g.scalar_type() == ScalarType::BFloat16 && beta.dim() == 2 &&
+                      beta.stride(1) == 1 && beta.scalar_type() == ScalarType::BFloat16,
+                  "prep64_tc: g (T, H, 128) / beta (T, H) bf16 with dense heads");
+  const int64_t C = gt.size(1);
+  STD_TORCH_CHECK(gt.dim() == 3 && gt.size(0) == H && gt.is_contiguous() &&
+                      kdq.numel() == H * C * 128 * 128 && kr.numel() == H * C * 64 * 128 &&
+                      inv.numel() == H * C * 64 * 64 && mqk.numel() == H * C * 64 * 64 &&
+                      v_img.numel() == H * C * 64 * 128 && beta_out.numel() == H * T,
+                  "prep64_tc: image shapes");
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream_ptr));
+  launch_prep64_tc(
+      x.const_data_ptr(), x.stride(0), reinterpret_cast<const float*>(conv_w.const_data_ptr()),
+      reinterpret_cast<float*>(conv_state.mutable_data_ptr()), conv_state.stride(0),
+      conv_state.stride(1), conv_state.stride(2),
+      reinterpret_cast<const int32_t*>(cache_indices.const_data_ptr()), cache_indices.stride(0),
+      reinterpret_cast<const bool*>(has_init.const_data_ptr()), int(null_block_id),
+      g.const_data_ptr(), g.stride(0), beta.const_data_ptr(), beta.stride(0),
+      reinterpret_cast<const float*>(a_log.const_data_ptr()),
+      reinterpret_cast<const float*>(dt_bias.const_data_ptr()), float(lower_bound), float(scale),
+      reinterpret_cast<const int*>(cu_seqlens.const_data_ptr()), int(N), int(H), int(T), int(C),
+      kdq.mutable_data_ptr(), kr.mutable_data_ptr(), inv.mutable_data_ptr(),
+      mqk.mutable_data_ptr(), reinterpret_cast<float*>(gt.mutable_data_ptr()),
+      v_img.mutable_data_ptr(), beta_out.mutable_data_ptr(),
+      dbg.numel() >= 2 * C * 16 ? reinterpret_cast<long long*>(dbg.mutable_data_ptr()) : nullptr,
+      static_cast<cudaStream_t>(stream_ptr));
+}

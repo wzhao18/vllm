@@ -275,6 +275,128 @@ def prep_time():
     print(f"F16K prep64 kernel (SIMT dev stage): {e0.elapsed_time(e1) / 5 * 1000:.1f} us", flush=True)
 
 
+def preptc_inputs(lens, H, seed=7, dev="cuda"):
+    torch.manual_seed(seed)
+    T, N, bf = sum(lens), len(lens), torch.bfloat16
+    C3 = 3 * H * D
+    x = torch.randn(T, C3, dtype=bf, device=dev)
+    w = torch.randn(C3, 4, device=dev) * 0.5
+    st = torch.randn(N + 1, C3, 3, device=dev)  # line 0 unused
+    ci = torch.arange(1, N + 1, dtype=torch.int32, device=dev)
+    hi = torch.tensor([i % 2 == 0 for i in range(N)], device=dev)
+    g = torch.randn(T, H, D, dtype=bf, device=dev)
+    beta = torch.randn(T, H, dtype=bf, device=dev)
+    A_log = torch.randn(H, device=dev) * 0.5
+    dt_bias = torch.randn(H, D, device=dev) * 0.1
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=dev)
+    return dict(x=x, w=w, st=st, ci=ci, hi=hi, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
+                cu=cu, T=T, N=N, H=H, lb=-5.0, scale=D ** -0.5)
+
+
+def preptc_run(a, st, lens, out=None, dbg=None):
+    H, T = a["H"], a["T"]
+    C = sum((n + C64 - 1) // C64 for n in lens)
+    bf, dev = torch.bfloat16, a["x"].device
+    o = out or dict(kdq_img=torch.empty(H, C, 16, 2 * C64, 8, dtype=bf, device=dev),
+                    kr_img=torch.empty(H, C, 8, D, 8, dtype=bf, device=dev),
+                    inv_img=torch.empty(H, C, 8, C64, 8, dtype=bf, device=dev),
+                    mqk_img=torch.empty(H, C, 8, C64, 8, dtype=bf, device=dev),
+                    gt=torch.empty(H, C, D, device=dev),
+                    v_img=torch.empty(H, C, 8, D, 8, dtype=bf, device=dev),
+                    beta=torch.empty(H, T, dtype=bf, device=dev))
+    torch.ops.k3_flashkda_split.prep64_tc(
+        a["x"], a["w"], st, a["ci"], a["hi"], -1, a["g"], a["beta"], a["A_log"], a["dt_bias"],
+        a["lb"], a["scale"], a["cu"], o["kdq_img"], o["kr_img"], o["inv_img"], o["mqk_img"],
+        o["gt"], o["v_img"], o["beta"],
+        dbg if dbg is not None else torch.zeros(1, dtype=torch.int64, device=dev))
+    return o
+
+
+def preptc_check(lens, H):
+    """prep64_tc (conv fused) vs stock qkv_conv + torch prep64; k64_rec on its
+    images vs FlashKDA on the stock conv output."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_conv
+    a = preptc_inputs(lens, H)
+    T, N = a["T"], a["N"]
+    st_ref, st_tc = a["st"].clone(), a["st"].clone()
+    qkv = kda_conv.qkv_conv(a["x"], a["w"], st_ref, a["cu"], a["ci"], a["hi"], H * D)
+    q, k, v = (t.view(1, T, H, D) for t in qkv.unbind(0))
+    o = preptc_run(a, st_tc, lens)
+    p = prep64(q, k, a["g"][None], a["beta"][None], a["A_log"], a["dt_bias"], a["lb"], lens, a["scale"])
+    C = p["C"]
+    want = dict(
+        kdq_img=torch.cat([p["kd"], p["qd"]], 2).view(H, C, 2 * C64, 16, 8).permute(0, 1, 3, 2, 4),
+        kr_img=p["kr"].transpose(-1, -2).reshape(H, C, D, 8, 8).permute(0, 1, 3, 2, 4),
+        inv_img=p["inv"].view(H, C, C64, 8, 8).permute(0, 1, 3, 2, 4),
+        mqk_img=p["mqk"].view(H, C, C64, 8, 8).permute(0, 1, 3, 2, 4),
+        gt=p["gt"], beta=p["beta"])
+    torch.cuda.synchronize()
+    vb = (o["v_img"] == v_image(v[0].contiguous(), lens, H)).all().item()
+    sb = (st_tc == st_ref).all().item()
+    print(f"preptc lens={lens} H={H}: v bitwise {vb} conv-state bitwise {sb} | " + " | ".join(
+        f"{n} {err(o[n], want[n].contiguous())}" for n in want), flush=True)
+    s0 = (torch.randn(N, H, D, D, device="cuda") * 0.1).to(torch.bfloat16).float()
+    out_ref, fin_ref = torch.zeros_like(v), torch.zeros_like(s0)
+    ws = torch.empty(torch.ops.k3_flashkda_split.get_workspace_size(T, H, N), dtype=torch.uint8,
+                     device="cuda")
+    torch.ops.k3_flashkda_split.fwd(q, k, v, a["g"][None], a["beta"][None], a["scale"], out_ref, ws,
+                                    a["A_log"], a["dt_bias"], a["lb"], s0, fin_ref, a["cu"], None,
+                                    None, 3)
+    x = dict(o, s0=s0, cu=a["cu"], T=T, H=H, N=N)
+    out, fin = run(x)
+    torch.cuda.synchronize()
+    print(f"  prep64_tc + k64_rec vs qkv_conv + FlashKDA: out {err(out, out_ref[0])} | "
+          f"state {err(fin, fin_ref)}", flush=True)
+
+
+def preptc_time():
+    """F16K: prep64_tc (conv fused), k64_rec, and the stock conv for reference."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_conv
+    lens, H = [5461, 5461, 5461], 96
+    a = preptc_inputs(lens, H)
+    st = a["st"].clone()
+    o = preptc_run(a, st, lens)
+    N = a["N"]
+    s0 = torch.zeros(N, H, D, D, device="cuda")
+    x = dict(o, s0=s0, cu=a["cu"], T=a["T"], H=H, N=N)
+    bufs = (torch.zeros(a["T"], H, D, dtype=torch.bfloat16, device="cuda"), torch.zeros_like(s0))
+    dbg = torch.zeros(1, dtype=torch.int64, device="cuda")
+
+    def t(fn, n=10):
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(n):
+            fn()
+        e1.record()
+        torch.cuda.synchronize()
+        return e0.elapsed_time(e1) / n * 1000
+
+    tp = t(lambda: preptc_run(a, st, lens, o))
+    tr = t(lambda: run(x, 0, dbg, bufs))
+    tc = t(lambda: kda_conv.qkv_conv(a["x"], a["w"], st, a["cu"], a["ci"], a["hi"], H * D))
+    tb = t(lambda: (preptc_run(a, st, lens, o), run(x, 0, dbg, bufs)))
+    C = o["gt"].shape[1]
+    dbg = torch.zeros(2 * C * 16, dtype=torch.int64, device="cuda")
+    preptc_run(a, st, lens, o, dbg)
+    torch.cuda.synchronize()
+    d = dbg.view(2 * C, 16).cpu()
+    span = (d[:, 14].max() - d[:, 0].min()).item() / 1000
+    names = {15: "tma", 1: "conv+norm", 2: "gate", 3: "scan", 4: "images", 5: "mma", 6: "inv-diag",
+             12: "inv-blocks", 14: "out"}
+    prev, parts = 0, []
+    for k in (15, 1, 2, 3, 4, 5, 6, 12, 14):
+        parts.append(f"{names[k]} {(d[:, k] - d[:, prev]).float().median().item() / 1000:.2f}")
+        prev = k
+    dur = (d[:, 14] - d[:, 0]).float() / 1000
+    print(f"prep64_tc CTA phases (median us, heads 0-1): " + ", ".join(parts) +
+          f"; CTA dur med {dur.median().item():.2f} max {dur.max().item():.2f}; span {span:.1f}", flush=True)
+    print(f"F16K 3x5461 H=96: prep64_tc {tp:.1f} us | k64_rec {tr:.1f} | prep64_tc + k64_rec {tb:.1f} "
+          f"| stock qkv_conv alone {tc:.1f}", flush=True)
+
+
 def err(a, b):
     a, b = a.float(), b.float()
     return f"max|d| {(a - b).abs().max().item():.3e} (max|ref| {b.abs().max().item():.3e}, " \
@@ -288,6 +410,7 @@ def main():
     ap.add_argument("--stamps", action="store_true")
     ap.add_argument("--e2e", action="store_true")
     ap.add_argument("--prep", action="store_true")
+    ap.add_argument("--preptc", action="store_true")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
@@ -304,6 +427,10 @@ def main():
         for lens, H in (([64], 1), ([300, 17, 129], 4), ([1000, 777], 8)):
             prep_check(lens, H)
         prep_time()
+    if a.preptc:
+        for lens, H in (([64], 2), ([2], 2), ([300, 17, 129], 4), ([1000, 777, 5], 8)):
+            preptc_check(lens, H)
+        preptc_time()
     if a.e2e:
         for lens, H in (([300, 17, 129], 4), ([1000, 777], 8)):
             e2e(lens, H)
