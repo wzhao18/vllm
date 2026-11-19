@@ -102,9 +102,14 @@ class FrostConvKda:
             ),
         )
         plan = CompiledKda(node, kda_prefill_f16)
-        self.supported = not (
-            plan.chain or plan.dv_split or plan.prep or plan.tail is not None
+        self.supported = (
+            not plan.chain
+            and (plan.prep or not plan.dv_split)
+            and (plan.tail is None or (plan.tail.dv_split and plan.tail_prep))
         )
+        # The prep kernel convolves V into this (T, H, D) plane for the prep-fed
+        # prefill (prep path or its d_v split tail).
+        self.v_plane = plan.prep or plan.tail is not None
         if not self.supported:
             return
         # Ragged pieces split long sequences into chain pieces at run time; those
@@ -148,7 +153,10 @@ class FrostConvKda:
         q, k, v = (qkv[:, i * H * D : (i + 1) * H * D].view(T, H, D) for i in range(3))
         o = torch.empty(T, H, D, dtype=qkv.dtype, device=qkv.device)
         final_state = torch.empty(N, H, D, D, dtype=torch.float32, device=qkv.device)
-        self._conv = dict(conv_w=conv_weight, conv_state=conv_state, conv_slot=conv_slot)
+        v_out = torch.empty_like(o) if self.v_plane else o
+        self._conv = dict(
+            conv_w=conv_weight, conv_state=conv_state, conv_slot=conv_slot, conv_v_out=v_out
+        )
         views = [
             q,
             k,

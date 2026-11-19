@@ -34,9 +34,9 @@ from cudnn.frost.compiled_cache import compile_cached
 from cudnn.linear_attention.frost.common.host import get_dtype
 from cudnn.linear_attention.frost.common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, dtype_name, launch_state_chain
 from cudnn.linear_attention.frost.common.state_snapshot import snapshot_states
-from cudnn.linear_attention.frost.kernel import kda_chain_forward_f16, kda_prep_f16, kda_prep_prefill_f16, kda_prep_summary_f16, kda_recompute_f16, kda_summary_f16
+from cudnn.linear_attention.frost.kernel import kda_chain_forward_f16, kda_prep_prefill_f16, kda_prep_summary_f16, kda_recompute_f16, kda_summary_f16
 
-from . import kda_prefill_f16
+from . import kda_prefill_f16, kda_prep_f16
 
 TAIL_BUFFERS = (
     "cu_pieces",
@@ -119,6 +119,7 @@ def uncut_forward_host(
     conv_w: Optional[cute.Tensor],
     conv_state: Optional[cute.Tensor],
     conv_slot: Optional[cute.Tensor],
+    conv_v_out: Optional[cute.Tensor],
     stream: cuda.CUstream,
     item_limit_word: Optional[cute.Tensor] = None,
     tail_enable: Optional[cute.Tensor] = None,
@@ -224,6 +225,9 @@ def uncut_forward_host(
         # The prefill's final state overwrites the seeds its exact twin would reread: seed both from a copy.
         snapshot_states(state_in, state_snapshot, seed_indices, stream)
         seed_state, seed_rows = state_snapshot, None
+    v_core = v
+    if cutlass.const_expr(conv_w is not None and prep):
+        v_core = conv_v_out
     if cutlass.const_expr(prep):
         kda_prep_prefill_f16.prologue(
             io_dtype,
@@ -231,7 +235,7 @@ def uncut_forward_host(
             num_sms,
             q,
             k,
-            v,
+            v_core,
             gate,
             o,
             checkpoints,
@@ -282,6 +286,13 @@ def uncut_forward_host(
             prep_row_count,
             scheduler,
             stream,
+            q,
+            k,
+            v,
+            conv_w,
+            conv_state,
+            conv_slot,
+            conv_v_out,
         )
     else:
         kda_prefill_f16.prologue(
@@ -317,7 +328,7 @@ def uncut_forward_host(
             prefill_cfg,
             q,
             k,
-            v,
+            v_core,
             gate,
             a_log,
             dt_bias,
@@ -463,9 +474,10 @@ def uncut_forward_host(
             tail_prep_rows,
             tail_prep_row_count,
             None if cutlass.const_expr(tail_prep_cfg is not None) else state_snapshot,
-            None,
-            None,
-            None,
+            conv_w,
+            conv_state,
+            conv_slot,
+            conv_v_out,
             stream,
             None,
             item_limit_word,
@@ -546,8 +558,7 @@ def build_configs(
     **flags,
 ):
     prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
-    if fused_conv:
-        flags = dict(flags, fused_conv=True)
+    prefill_flags = dict(flags, fused_conv=True) if fused_conv and not prep else flags
     prefill_cfg = prefill_module.build_cfg(
         io_dtype,
         state_dtype,
@@ -560,7 +571,7 @@ def build_configs(
         checkpoint_dtype=checkpoint_dtype,
         checkpoint_after_block=checkpoint_after_block,
         tiles_per_head=tiles_per_head,
-        **dict(flags, d_v=flags["d_v"] // tiles_per_head),
+        **dict(prefill_flags, d_v=flags["d_v"] // tiles_per_head),
     )
     prep_cfg = None
     if prep:
@@ -568,6 +579,7 @@ def build_configs(
             io_dtype,
             gate_dtype,
             num_sm=flags["max_active_clusters"],
+            fused_conv=fused_conv,
             **{name: value for name, value in flags.items() if name not in ("max_active_clusters", "d_v")},
         )
     return prefill_cfg, prep_cfg
@@ -634,6 +646,7 @@ def build_uncut_forward(
     conv_w=None,
     conv_state=None,
     conv_slot=None,
+    conv_v_out=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the d_v split, state and checkpoint
     presence, device) the uncut forward launch over the buffers of one plan.  The placeholders repeat the marks of the
@@ -651,8 +664,15 @@ def build_uncut_forward(
     state_dtype = get_dtype(state_src.dtype) if state_src is not None else cutlass.Float32
     fold_rows = chain_rows_per_cta(DV, DK, 1, gate.shape[1], num_sm) if fold_buffers[0] is not None else 0
     fused_conv = conv_w is not None
-    if fused_conv and (prep or tail is not None or ragged_pieces or int(tiles_per_head) != 1 or int(checkpoint_every_n_tokens) > 0 or composed is not None):
-        raise ValueError("fused conv: the uncut single-tile-per-head launch only (no prep, tail, ragged pieces, checkpoints or composed state)")
+    if fused_conv and (
+        (int(tiles_per_head) != 1 and not prep)
+        or (tail is not None and not (tail.dv_split and tail_prep))
+        or ragged_pieces
+        or int(checkpoint_every_n_tokens) > 0
+        or composed is not None
+        or conv_v_out is None
+    ):
+        raise ValueError("fused conv: uncut or prep-fed launches (and a prep-fed d_v split tail) only, no ragged pieces, checkpoints or composed state")
     key = (
         str(q.dtype),
         str(gate.dtype),
@@ -755,6 +775,7 @@ def build_uncut_forward(
                     state_table=state_in is not None,
                     tiles_per_head=DV_SPLIT_TILES,
                     prep=tail_prep,
+                    fused_conv=fused_conv,
                     **tail_flags,
                 )
                 if tail_prep:
@@ -927,6 +948,7 @@ def build_uncut_forward(
             from_dlpack(conv_w, assumed_align=16).mark_layout_dynamic(leading_dim=1) if fused_conv else None,
             from_dlpack(conv_state, assumed_align=4).mark_layout_dynamic(leading_dim=conv_state.stride().index(1)) if fused_conv else None,
             from_dlpack(conv_slot, assumed_align=4).mark_layout_dynamic() if fused_conv else None,
+            from_dlpack(conv_v_out, assumed_align=16).mark_layout_dynamic(leading_dim=2) if fused_conv else None,
             cuda.CUstream(int(stream)),
             from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
             from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
@@ -989,6 +1011,7 @@ def run_uncut_forward(
     conv_w=None,
     conv_state=None,
     conv_slot=None,
+    conv_v_out=None,
 ) -> None:
     """Replay the uncut forward: one crossing into the DSL for the prologue and prefill launches.  The plan validated the
     contract at build, so nothing here raises."""
@@ -1030,6 +1053,7 @@ def run_uncut_forward(
         conv_w,
         conv_state,
         conv_slot,
+        conv_v_out,
         cuda.CUstream(int(stream)),
         item_limit_word,
         tail_enable,
