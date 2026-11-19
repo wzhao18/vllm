@@ -764,3 +764,58 @@ def barrier_sync_unaligned(barrier_id, num_threads, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def two_ended_claim_u64(counter_pointer, claim_from_top, total: Int32, *, loc=None, ip=None) -> Int32:
+    """Claim one ID of a two-ended work stream held in one 64-bit counter (low word: claims from the bottom,
+    high word: claims from the top).
+
+    A bottom claim gets ``low``; a top claim gets ``total - 1 - high``. A claim is valid when ``low + high <
+    total`` in the value it replaced, which hands every ID in ``[0, total)`` to exactly one claimer however the two
+    ends interleave. Invalid claims return ``0x7FFFFFFF`` (beyond every stream end).
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                counter_pointer.toint(loc=loc, ip=ip).ir_value(),
+                Int32(claim_from_top).ir_value(loc=loc, ip=ip),
+                Int32(total).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n"
+            ".reg .u64 %inc, %old;\n"
+            ".reg .u32 %lo, %hi, %sum, %dn, %id;\n"
+            ".reg .pred %pd, %pv;\n"
+            "setp.ne.u32 %pd, $2, 0;\n"
+            "selp.u64 %inc, 4294967296, 1, %pd;\n"
+            "atom.relaxed.gpu.global.add.u64 %old, [$1], %inc;\n"
+            "cvt.u32.u64 %lo, %old;\n"
+            "shr.u64 %old, %old, 32;\n"
+            "cvt.u32.u64 %hi, %old;\n"
+            "add.u32 %sum, %lo, %hi;\n"
+            "setp.lt.u32 %pv, %sum, $3;\n"
+            "sub.u32 %dn, $3, 1;\n"
+            "sub.u32 %dn, %dn, %hi;\n"
+            "selp.u32 %id, %dn, %lo, %pd;\n"
+            "selp.u32 $0, %id, 2147483647, %pv;\n"
+            "}",
+            "=r,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def read_smid(*, loc=None, ip=None) -> Int32:
+    """%smid of the calling thread's SM."""
+    return Int32(
+        llvm.inline_asm(T.i32(), [], "mov.u32 $0, %smid;", "=r", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
+    )
+
+
+__all__ += ["read_smid", "two_ended_claim_u64"]

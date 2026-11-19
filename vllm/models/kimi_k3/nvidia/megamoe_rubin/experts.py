@@ -116,7 +116,7 @@ RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 
 
 def rubin_bucket_capacities(
-    max_tokens_per_rank: int, top_k: int, *, prefill_worker: bool
+    max_tokens_per_rank: int, top_k: int, *, prefill_worker: bool, world_size: int = 16
 ) -> tuple[int, ...]:
     """Ascending token capacities per rank of a server's compiled buckets
     (automatic, no flag): ``max_tokens_per_rank``, preceded by the decode bucket
@@ -127,7 +127,7 @@ def rubin_bucket_capacities(
     decode = RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k
     if (
         not prefill_worker
-        and rubin_kernel_variant(max_tokens_per_rank) == "inference"
+        and rubin_kernel_variant(max_tokens_per_rank, world_size) == "inference"
         and 0 < decode < max_tokens_per_rank
     ):
         return (decode, max_tokens_per_rank)
@@ -163,9 +163,17 @@ def rubin_quant_kind(
     return "nvfp4"
 
 
-def rubin_kernel_variant(max_tokens_per_rank: int) -> Variant:
+# EP sizes whose shipped records are the inference kernel only (FlashInfer a368c5f66
+# default knobs measured at EP28 / EP32, moe_ep32): the generation-phase kernel has no
+# record there, so these servers run the inference kernel at every capacity.
+RUBIN_INFERENCE_ONLY_EP_SIZES = (28, 32)
+
+
+def rubin_kernel_variant(max_tokens_per_rank: int, world_size: int = 16) -> Variant:
     if max_tokens_per_rank <= 0:
         raise ValueError(f"max_tokens_per_rank must be positive: {max_tokens_per_rank}")
+    if world_size in RUBIN_INFERENCE_ONLY_EP_SIZES:
+        return "inference"
     if max_tokens_per_rank <= RUBIN_GENPHASE_MAX_TOKENS_PER_RANK:
         return "genphase"
     return "inference"
@@ -183,7 +191,7 @@ def select_rubin_bucket(
         SHIPPED_KNOBS,
         problem=problem,
         world_size=world_size,
-        points=[(rubin_kernel_variant(max_tokens), max_tokens, None)],
+        points=[(rubin_kernel_variant(max_tokens, world_size), max_tokens, None)],
     )
     return buckets[0], tuple(notes)
 
@@ -202,7 +210,7 @@ def select_rubin_buckets(
     record at the decode capacity."""
     main, notes = select_rubin_bucket(problem, world_size, max_tokens)
     caps = rubin_bucket_capacities(
-        max_tokens, problem.top_k, prefill_worker=prefill_worker
+        max_tokens, problem.top_k, prefill_worker=prefill_worker, world_size=world_size
     )
     buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
     for bucket in buckets:
@@ -594,9 +602,17 @@ class KimiK3MegaMoEExperts(nn.Module):
                 )
         return ws13[:, 0].clone(), self.w2_weight_scale_2.data.clone()
 
-    def reserve_sms_for_shared_expert(self) -> None:
-        """Cap this layer's persistent grid at :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`
-        so a shared expert the caller runs on another stream gets the remaining SMs.
+    def reserve_sms_for_shared_expert(
+        self,
+        max_sm_count: int = RUBIN_SHARED_OVERLAP_MAX_SMS,
+        *,
+        die_local: bool = True,
+    ) -> None:
+        """Cap this layer's persistent grid at ``max_sm_count`` (default
+        :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`, the decode SP measurement) so a shared
+        expert the caller runs on another stream gets the remaining SMs.
+        ``die_local=False`` keeps the cap where the decode die-local policy would
+        take the full grid (the prefill-sized wide-EP layers).
         Every layer of the EP group must make the same call (the bucket keys the
         shared runtime); it must come before the runtime is built."""
         if self.kernel_weights is not None:
@@ -619,7 +635,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         # (bitwise equal). Capped, each die's stream gets the clusters the side
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
         die_mask = None
-        if not self.prefill_worker and all(
+        if die_local and not self.prefill_worker and all(
             bucket.variant == "inference"
             and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
             for bucket in self.buckets
@@ -631,9 +647,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
-                max_sm_count=(
-                    RUBIN_SHARED_OVERLAP_MAX_SMS if die_mask is None else None
-                ),
+                max_sm_count=max_sm_count if die_mask is None else None,
                 die_sm_mask32=die_mask,
             )
             for bucket in self.buckets
@@ -823,6 +837,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         topk_ids: torch.Tensor,
         shared_experts: nn.Module | None = None,
         is_padding: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        ep_tokens: int | None = None,
     ) -> torch.Tensor:
         """Run the routed experts (and an unfused ``shared_experts``) on this rank's
         tokens; arguments and result as :meth:`DeepGemmMegaMoEExperts.forward`.
@@ -831,6 +847,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         or the forward context's under ``VLLM_MOE_SKIP_PADDING``) are masked to -1.
         Every EP rank must call each layer the same number of times (the kernel
         synchronizes the group), as with DeepGEMM MegaMoE.
+        ``out``: optional output rows; ``ep_tokens``: EP-uniform live tokens per
+        rank of this launch (default: from the forward's DP batch sizes), set by
+        callers that split a batch into several launches.
         """
         weights = self.kernel_weights
         if weights is None:
@@ -882,9 +901,10 @@ class KimiK3MegaMoEExperts(nn.Module):
             topk_weights,
             weights,
             bucket=bucket,
+            out=out,
             is_padding=is_padding,
             owner=self.prefix,
-            ep_tokens=self.ep_tokens(num_tokens),
+            ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)

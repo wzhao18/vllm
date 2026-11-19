@@ -136,7 +136,18 @@ class NonClcMixedCgaSchedulerWorker:
     fallback_registration_counter_region = "non_clc_mixed_cga.fallback_registration_counter"
     fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"
 
-    def __init__(self, *, config: NonClcMixedCgaConfig, work_id_mode: WorkIdAcquisitionMode, stream_count: int) -> None:
+    def __init__(
+        self,
+        *,
+        config: NonClcMixedCgaConfig,
+        work_id_mode: WorkIdAcquisitionMode,
+        stream_count: int,
+        two_ended: bool = False,
+    ) -> None:
+        """``two_ended``: every stream is one 64-bit two-ended counter (see ``two_ended_claim_u64``)."""
+        if two_ended and work_id_mode != "atomic_counter":
+            raise ValueError("two-ended work streams require atomic_counter work IDs.")
+        self.two_ended = two_ended
         if work_id_mode not in ("grid_stride", "atomic_counter"):
             raise ValueError("Non-CLC mixed-CGA scheduling supports grid_stride or atomic_counter work IDs.")
         if isinstance(stream_count, bool) or not isinstance(stream_count, int) or stream_count <= 0:
@@ -156,7 +167,7 @@ class NonClcMixedCgaSchedulerWorker:
         if self.work_id_mode == "atomic_counter":
             device_workspace.register(
                 self.work_id_counter_region,
-                cutlass.Int32,
+                cutlass.Int64 if self.two_ended else cutlass.Int32,
                 (self.stream_count,),
                 buffer_space="local",
                 reset="tail_reset",
@@ -300,9 +311,17 @@ class NonClcMixedCgaSchedulerWorker:
         return work_id_state.counter_pointer + stream_index
 
     @cute.jit
-    def claim_next_work(self, stream_index=0) -> Int32:
-        """Claim the next canonical work ID and update the preferred CTA coordinate."""
-        claimed_work_id, self._work_id_state = claim_work_id(self._work_id_state, atomic_counter_index=stream_index)
+    def claim_next_work(self, stream_index=0, two_ended=None) -> Int32:
+        """Claim the next canonical work ID and update the preferred CTA coordinate.
+
+        ``two_ended`` (``TwoEndedFc12Claim``, two-ended workers only): the leader may claim the other stream;
+        ``claimed_stream_index`` reports the stream actually claimed.
+        """
+        if cutlass.const_expr((two_ended is not None) != self.two_ended):
+            raise ValueError("two_ended claim arguments must be given exactly for two-ended work streams.")
+        claimed_work_id, self._work_id_state = claim_work_id(
+            self._work_id_state, atomic_counter_index=stream_index, two_ended=two_ended
+        )
         canonical_work_id = claimed_work_id
         if cutlass.const_expr(self.config.is_mixed and self.work_id_mode == "atomic_counter"):
             cta_coord_in_preferred_cluster = self._cta_coord_in_active_cluster
@@ -312,6 +331,9 @@ class NonClcMixedCgaSchedulerWorker:
                 )
             self.cta_coord_in_preferred_cluster = cta_coord_in_preferred_cluster
             self.claimed_stream_index = self._work_id_state.claimed_counter_index
+        elif cutlass.const_expr(two_ended is not None):
+            canonical_work_id = claimed_work_id & Int32(0x7FFFFFFF)
+            self.claimed_stream_index = (claimed_work_id >> Int32(31)) & Int32(1)
         else:
             self.claimed_stream_index = Int32(stream_index)
         return canonical_work_id
@@ -335,6 +357,8 @@ class NonClcMixedCgaSchedulerWorker:
             raise ValueError(
                 "cluster_uniform_counter_ready requires atomic-counter work IDs."
             )
+        if cutlass.const_expr(self.two_ended):
+            raise NotImplementedError("cluster-uniform readiness polling does not support two-ended streams.")
         if cutlass.const_expr(self.config.is_mixed):
             raise NotImplementedError(
                 "cluster-uniform readiness polling does not yet support fixed "
@@ -362,6 +386,8 @@ class NonClcMixedCgaSchedulerWorker:
                 "cluster_uniform_counter_ready_or_claim requires "
                 "atomic-counter work IDs."
             )
+        if cutlass.const_expr(self.two_ended):
+            raise NotImplementedError("fused readiness/claim does not support two-ended streams.")
         if cutlass.const_expr(self.config.is_mixed):
             raise NotImplementedError(
                 "fused cluster readiness/claim does not support fixed "
@@ -398,7 +424,12 @@ class NonClcMixedCgaSchedulerWorker:
             value_index += field_value_count
             return result
 
-        result = type(self)(config=self.config, work_id_mode=self.work_id_mode, stream_count=self.stream_count)
+        result = type(self)(
+            config=self.config,
+            work_id_mode=self.work_id_mode,
+            stream_count=self.stream_count,
+            two_ended=self.two_ended,
+        )
         result._work_id_state = rebuild(self._work_id_state)
         result.cta_coord_in_preferred_cluster = rebuild(self.cta_coord_in_preferred_cluster)
         result.claimed_stream_index = rebuild(self.claimed_stream_index)

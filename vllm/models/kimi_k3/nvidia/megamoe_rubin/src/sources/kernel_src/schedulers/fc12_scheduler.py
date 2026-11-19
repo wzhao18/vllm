@@ -10,6 +10,7 @@ from cutlass.cutlass_dsl import Boolean, Int32, Integer, extract_mlir_values, ne
 from ...api import ImplDesc, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.dsl_helpers import spin_peek, spin_wait
+from ...helpers.ptx_helpers import read_smid
 from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div
 from .base import SchedulerBase, SchedulerWorkTileBase, WorkIdAcquisitionMode
@@ -22,9 +23,12 @@ from .fc12_mapping import (
     make_fc12_done_tile,
     map_fc12_linear_work_id,
     map_phase_interleaved_fc12_work_id,
+    phase_stream_totals,
+    place_phase_cursor_at_end,
     resolve_phase_interleaved_fc1_claim_target,
 )
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
+from .work_id_claim import TWO_ENDED_EXHAUSTED_ID, TWO_ENDED_HELD_BIT, TwoEndedFc12Claim
 
 
 def _make_non_clc_mixed_cga_config(impl_desc: ImplDesc) -> NonClcMixedCgaConfig:
@@ -391,6 +395,37 @@ class _PhaseInterleaveControlState:
         return type(self)(*rebuilt_fields)
 
 
+class _DieSplitState:
+    """Two-ended (die-split) stream state of one CTA: its claim end, the per-phase stream lengths, and the FC2 ID it
+    holds until the FC1 tiles of that token block are all claimed (-1: none)."""
+
+    def __init__(self, claim_from_top: Int32, total_fc1: Int32, total_fc2: Int32, held_fc2: Int32) -> None:
+        self.claim_from_top = claim_from_top
+        self.total_fc1 = total_fc1
+        self.total_fc2 = total_fc2
+        self.held_fc2 = held_fc2
+
+    def _fields(self) -> Tuple:
+        return (self.claim_from_top, self.total_fc1, self.total_fc2, self.held_fc2)
+
+    def __extract_mlir_values__(self) -> list:
+        values = []
+        for field in self._fields():
+            values.extend(extract_mlir_values(field))
+        return values
+
+    def __new_from_mlir_values__(self, values: list) -> "_DieSplitState":
+        value_index = 0
+        rebuilt_fields = []
+        for field in self._fields():
+            field_value_count = len(extract_mlir_values(field))
+            rebuilt_fields.append(new_from_mlir_values(field, values[value_index : value_index + field_value_count]))
+            value_index += field_value_count
+        if value_index != len(values):
+            raise ValueError(f"_DieSplitState MLIR value count mismatch: consumed {value_index}, got {len(values)}.")
+        return type(self)(*rebuilt_fields)
+
+
 class PhaseInterleavedFc12Scheduler(SchedulerBase):
     """Schedule independent FC1 and FC2 streams with per-phase atomic counters."""
 
@@ -416,12 +451,19 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "dfc1_m_group": OptionalRequirement(int),
             "defer_consumer_until_full_ready": OptionalRequirement(bool),
             "fuse_ready_probe_and_linear1_claim": OptionalRequirement(bool),
+            "die_split": OptionalRequirement(bool),
             **_mixed_cga_impl_requirements(),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         super().__init__(problem_desc, impl_desc)
 
+        # die_split: the expert weights are die-local (lower half of the experts on locality domain 0, upper half
+        # on domain 1; shim/die_local.py). Each phase is one two-ended stream in the expert-ordered work-ID space:
+        # clusters on die 0 claim from the lowest ID upward, clusters on die 1 from the highest ID downward, so
+        # each die streams its own experts' weights at the die-local HBM rate and the two ends meet wherever the
+        # work balances. Every tile is still computed exactly once, by one cluster, as before.
+        self.die_split = impl_desc.get("die_split", False)
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.hidden_size = problem_desc["hidden_size"]
@@ -463,7 +505,10 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             self.mapping_cta_tile_shape_mnk = launch_cta_tile_shape_mnk
             self.mapping_cluster_shape_mn = self.cluster_shape_mn
         self._work_id_worker = NonClcMixedCgaSchedulerWorker(
-            config=self.non_clc_mixed_cga_config, work_id_mode=self.work_id_mode, stream_count=2
+            config=self.non_clc_mixed_cga_config,
+            work_id_mode=self.work_id_mode,
+            stream_count=2,
+            two_ended=self.die_split,
         )
 
         mapping_cluster_tile_n = self.mapping_cta_tile_shape_mnk[1] * self.mapping_cluster_shape_mn[1]
@@ -559,6 +604,10 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                     "fuse_ready_probe_and_linear1_claim requires "
                     "defer_consumer_until_full_ready=True."
                 )
+        if not isinstance(self.die_split, bool):
+            raise TypeError("die_split must be a bool.")
+        if self.die_split and (self.defer_consumer_until_full_ready or self.fuse_ready_probe_and_linear1_claim):
+            raise ValueError("die_split does not support deferred full-readiness consumers.")
         if self.fc1_prologue_tiles == 0 and not self.defer_consumer_until_full_ready:
             raise ValueError("fc1_prologue_tiles=0 requires deferred full-readiness.")
         if self.token_padding_block <= 0:
@@ -649,7 +698,12 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
             dfc1_m_group=self.dfc1_m_group,
+            bidirectional=self.die_split,
         )
+        if cutlass.const_expr(self.die_split):
+            self._die_state = _DieSplitState(
+                claim_from_top=Int32(0), total_fc1=Int32(0), total_fc2=Int32(0), held_fc2=Int32(-1)
+            )
         self._control_state = _PhaseInterleaveControlState(
             prologue_remaining=Int32(self.fc1_prologue_tiles),
             # Stagger the steady-state cadence by physical cluster.  Starting
@@ -665,6 +719,42 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                 self.defer_consumer_until_full_ready
             ),
         )
+
+    @cute.jit
+    def probe_die(self, sm_locality_domain: cute.Tensor) -> None:
+        """die_split: claim from the top of the streams on die 1 (scheduler warp, before the sizes wait).
+
+        ``sm_locality_domain[smid]`` is the die of each SM (``shim/die_local.sm_locality_domain_map``). Only the
+        cluster leader's end decides claims; every CTA of a cluster sits on one die (one GPC).
+        """
+        if cutlass.const_expr(self.die_split):
+            die_state = self._die_state
+            die_state.claim_from_top = Int32(sm_locality_domain[read_smid() & Int32(1023)])
+            self._die_state = die_state
+
+    @cute.jit
+    def prepare_streams(self) -> None:
+        """die_split: size both two-ended streams once the expert sizes are visible (whole scheduler warp)."""
+        if cutlass.const_expr(self.die_split):
+            task_mapping_state = self._task_mapping_state
+            die_state = self._die_state
+            total_token_blocks, total_data_rows, total_sf_rows = phase_stream_totals(task_mapping_state)
+            die_state.total_fc1 = total_token_blocks * Int32(self.blocks_fc1)
+            die_state.total_fc2 = total_token_blocks * Int32(self.fc2_claims_per_token_block)
+            # Only local variables are rebound inside the runtime branch (the DSL yields those).
+            fc1_cursor = task_mapping_state.fc1_cursor
+            fc2_cursor = task_mapping_state.fc2_cursor
+            if die_state.claim_from_top != Int32(0):
+                fc1_cursor = place_phase_cursor_at_end(
+                    fc1_cursor.clone(), task_mapping_state, total_token_blocks, total_data_rows, total_sf_rows
+                )
+                fc2_cursor = place_phase_cursor_at_end(
+                    fc2_cursor.clone(), task_mapping_state, total_token_blocks, total_data_rows, total_sf_rows
+                )
+            task_mapping_state.fc1_cursor = fc1_cursor
+            task_mapping_state.fc2_cursor = fc2_cursor
+            self._task_mapping_state = task_mapping_state
+            self._die_state = die_state
 
     @cute.jit
     def cluster_uniform_counter_ready(
@@ -826,6 +916,8 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
     @cute.jit
     def gen_next_work(self) -> SchedulerWorkTileBase:
         """Claim until one stream yields valid work or both streams terminate."""
+        if cutlass.const_expr(self.die_split):
+            return self._gen_next_work_die_split()
         work_tile = make_fc12_done_tile(self.is_swap_ab)
         work_id_worker = self._work_id_worker
         task_mapping_state = self._task_mapping_state
@@ -901,9 +993,111 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         self._control_state = control_state
         return work_tile
 
+    @cute.jit
+    def _gen_next_work_die_split(self) -> SchedulerWorkTileBase:
+        """gen_next_work for two-ended (die_split) streams: same FC1/FC2 cadence, claims from this die's end.
+
+        Dependencies are enforced per claim instead of by the FC1 prologue watermark: an FC2 ID whose token block
+        still has unclaimed FC1 tiles is held (not published) while the cluster claims FC1 tiles from its end, and
+        published once the block is covered (``_two_ended_leader_claim``).
+        """
+        work_tile = make_fc12_done_tile(self.is_swap_ab)
+        work_id_worker = self._work_id_worker
+        task_mapping_state = self._task_mapping_state
+        control_state = self._control_state
+        die_state = self._die_state
+        prologue_remaining = control_state.prologue_remaining
+        cycle_position = control_state.cycle_position
+        fc1_exhausted = control_state.fc1_exhausted
+        fc2_exhausted = control_state.fc2_exhausted
+        held_fc2 = die_state.held_fc2
+        stream_has_work = Boolean(False)
+        resolved = Boolean(False)
+
+        while not resolved:
+            if fc1_exhausted and fc2_exhausted and (held_fc2 < Int32(0)):
+                work_tile = make_fc12_done_tile(self.is_swap_ab)
+                resolved = Boolean(True)
+
+            if not resolved:
+                want_fc1 = Boolean(True)
+                if prologue_remaining <= Int32(0):
+                    is_fc2_slot = (cycle_position * Int32(self.interleave_fc2_slots)) % Int32(
+                        self.interleave_cycle_length
+                    ) < Int32(self.interleave_fc2_slots)
+                    want_fc1 = not is_fc2_slot
+                if want_fc1 and fc1_exhausted:
+                    want_fc1 = Boolean(False)
+                if (not want_fc1) and fc2_exhausted:
+                    want_fc1 = Boolean(True)
+                atomic_counter_index = Int32(1)
+                if want_fc1:
+                    atomic_counter_index = Int32(0)
+                was_holding = held_fc2 >= Int32(0)
+                payload = work_id_worker.claim_next_work(
+                    atomic_counter_index,
+                    two_ended=TwoEndedFc12Claim(
+                        claim_from_top=die_state.claim_from_top,
+                        total_fc1=die_state.total_fc1,
+                        total_fc2=die_state.total_fc2,
+                        held_fc2=held_fc2,
+                        fc1_per_block=self.blocks_fc1,
+                        fc2_per_block=self.fc2_claims_per_token_block,
+                    ),
+                )
+                claimed_fc2 = work_id_worker.claimed_stream_index != Int32(0)
+                linear_work_id = payload & Int32(TWO_ENDED_EXHAUSTED_ID)
+                if ((payload >> Int32(TWO_ENDED_HELD_BIT)) & Int32(1)) != Int32(0):
+                    held_fc2 = linear_work_id
+                else:
+                    cta_id_in_mapping_cluster = _to_fc12_mapping_cta_coord(
+                        work_id_worker.cta_coord_in_preferred_cluster, self.is_swap_ab
+                    )
+                    phase = Int32(BlockPhase.Linear1)
+                    if claimed_fc2:
+                        phase = Int32(BlockPhase.Linear2)
+                    stream_has_work = Boolean(False)
+                    # An exhausted stream is known from the ID itself; skip the cursor walk to the stream end.
+                    if linear_work_id != Int32(TWO_ENDED_EXHAUSTED_ID):
+                        work_tile, stream_has_work, task_mapping_state = map_phase_interleaved_fc12_work_id(
+                            linear_work_id, phase, cta_id_in_mapping_cluster, task_mapping_state
+                        )
+                    if stream_has_work:
+                        if claimed_fc2 and was_holding:
+                            held_fc2 = Int32(-1)
+                        # A corrective FC1 claim while holding stays outside the rolling cadence.
+                        if (not was_holding) | claimed_fc2:
+                            if prologue_remaining > Int32(0):
+                                prologue_remaining = prologue_remaining - Int32(1)
+                            else:
+                                cycle_position = (cycle_position + Int32(1)) % Int32(self.interleave_cycle_length)
+                        resolved = Boolean(True)
+                    else:
+                        if claimed_fc2:
+                            fc2_exhausted = Boolean(True)
+                        else:
+                            fc1_exhausted = Boolean(True)
+
+        control_state.prologue_remaining = prologue_remaining
+        control_state.cycle_position = cycle_position
+        control_state.fc1_exhausted = fc1_exhausted
+        control_state.fc2_exhausted = fc2_exhausted
+        die_state.held_fc2 = held_fc2
+        self._work_id_worker = work_id_worker
+        self._task_mapping_state = task_mapping_state
+        self._control_state = control_state
+        self._die_state = die_state
+        return work_tile
+
+    def _runtime_states(self) -> tuple:
+        states = (self._work_id_worker, self._task_mapping_state, self._control_state)
+        if self.die_split:
+            states = states + (self._die_state,)
+        return states
+
     def __extract_mlir_values__(self) -> list:
         values = super().__extract_mlir_values__()
-        for state in (self._work_id_worker, self._task_mapping_state, self._control_state):
+        for state in self._runtime_states():
             values.extend(extract_mlir_values(state))
         return values
 
@@ -927,6 +1121,8 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         result._work_id_worker = rebuild(self._work_id_worker)
         result._task_mapping_state = rebuild(self._task_mapping_state)
         result._control_state = rebuild(self._control_state)
+        if self.die_split:
+            result._die_state = rebuild(self._die_state)
         if value_index != len(values):
             raise ValueError(
                 f"PhaseInterleavedFc12Scheduler MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -955,6 +1151,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "defer_consumer_until_full_ready",
             "fuse_ready_probe_and_linear1_claim",
             "fc2_claims_per_token_block",
+            "die_split",
             "interleave_fc2_slots",
             "interleave_cycle_length",
             "minimum_global_fc1_claims",

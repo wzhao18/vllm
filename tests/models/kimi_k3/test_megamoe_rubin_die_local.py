@@ -173,10 +173,10 @@ def test_kernel_name_and_cache_key_of_the_die_mask():
             pytest.skip(f"kernel construction unavailable: {exc!r}")
         names.add(kernel.name())
         keys.add(compile_cache_key(cfg, kernel.name(), "v", 0))
-        is_die = type(kernel.scheduler).__name__ == "DieSplitPhaseInterleavedFc12Scheduler"
-        assert is_die == (mask is not None)
-        assert ("_diesplit_" in kernel.name()) == (mask is not None)
-    assert len(names) == 2 and len(keys) == 3
+        # FlashInfer a368c5f66 die_split (two-ended expert claim); not in the name,
+        # so the compile key carries the per-GPU mask explicitly.
+        assert bool(getattr(kernel.scheduler, "die_split", False)) == (mask is not None)
+    assert len(names) == 1 and len(keys) == 3
 
 
 @pytest.mark.parametrize(
@@ -215,10 +215,12 @@ def _kernel_or_skip(cfg, epilogue_warpgroups=None):
         pytest.skip(f"kernel construction unavailable: {exc!r}")
 
 
-def test_scheduler_and_epilogue_are_independent():
-    """The die-split scheduler (die_sm_mask32) and the S2 epilogue
-    (epilogue_warpgroups) are independent compile-time choices: every combination
-    builds on an S2-eligible bucket (the C512 prefill shard), with its own name."""
+def test_die_split_on_the_c512_prefill_shard_and_no_s2():
+    """FlashInfer a368c5f66: the die split (die_sm_mask32 -> die_split) builds on the
+    C512 prefill shard's capped bucket; there is one epilogue warpgroup, so
+    build_kernel refuses epilogue_warpgroups=2 (the old S2)."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.session import build_kernel
+
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(8192))
     main, _ = X.select_rubin_bucket(problem, 16, 8192)
@@ -227,22 +229,15 @@ def test_scheduler_and_epilogue_are_independent():
         knobs=dataclasses.replace(main.knobs, fallback_cluster_shape_mn=None),
         max_sm_count=X.RUBIN_SHARED_OVERLAP_MAX_SMS,
     )
-    names = set()
     for mask in (None, (0x0F0F0F0F,) * 7):
         cfg = C.RubinMoeConfig.make(
             problem, dataclasses.replace(capped, die_sm_mask32=mask), rank=0,
             world_size=16,
         )
-        for wg in (1, 2):
-            kernel = _kernel_or_skip(cfg, wg)
-            assert kernel.epilogue_warpgroups == wg
-            is_die = (
-                type(kernel.scheduler).__name__
-                == "DieSplitPhaseInterleavedFc12Scheduler"
-            )
-            assert is_die == (mask is not None)
-            names.add(kernel.name())
-    assert len(names) == 4
+        kernel = _kernel_or_skip(cfg, 1)
+        assert bool(getattr(kernel.scheduler, "die_split", False)) == (mask is not None)
+        with pytest.raises(ValueError, match="epilogue_warpgroups"):
+            build_kernel(cfg, 2)
 
 
 def test_die_local_decode_sessions_trace_the_stock_epilogue():
@@ -263,7 +258,7 @@ def test_die_local_decode_sessions_trace_the_stock_epilogue():
         _kernel_or_skip(cfg)
         kernels = S.build_kernels(cfg)
         assert set(kernels) == {False}
-        assert kernels[False].epilogue_warpgroups == 1
+        assert bool(getattr(kernels[False].scheduler, "die_split", False))
 
 
 def _two_die_gpu():
