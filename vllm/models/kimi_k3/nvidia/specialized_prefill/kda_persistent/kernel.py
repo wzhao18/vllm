@@ -148,7 +148,6 @@ def _flat2(t):
     return cute.make_tensor(t.iterator, cute.make_layout((2,)))
 
 
-@cute.jit
 def _exp2f(x):
     return cute.math.exp2(x, fastmath=True)
 

@@ -99,6 +99,52 @@ def test_persistent_prefill_matches_flashkda(lens, heads):
     assert _rel_rms(state, fs) < 2e-2
 
 
+@pytest.mark.parametrize("lens,heads", [([37, 2], 8), ([300, 1, 1029], 8), ([5461] * 3, 96)])
+def test_persistent_fused_qk_conv_matches_qkv_conv(lens, heads):
+    """persistent_conv_inputs + persistent_prefill(conv=...) (Q|K conv in the
+    kernel's prep, V through qkv_conv) against qkv_conv + persistent_prefill:
+    same conv state, same V, output and final state within FMA rounding."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_conv
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    if not sp_kda.persistent_supported(torch.device("cuda")):
+        pytest.skip("CuTe DSL not installed")
+    torch.manual_seed(0)
+    T, N, H = sum(lens), len(lens), heads
+    P = H * D
+    bf = torch.bfloat16
+    offs = [0, *torch.tensor(lens).cumsum(0).tolist()]
+    cu_cpu = torch.tensor(offs, dtype=torch.int32)
+    cu = cu_cpu.cuda()
+    x = torch.randn(T, 3 * P + 64, device="cuda").to(bf)[:, : 3 * P]
+    w = torch.randn(3 * P, 4, device="cuda") * 0.5
+    state0 = torch.randn(N + 2, 3 * P, 3, device="cuda") * 0.5
+    idx = torch.arange(1, N + 1, dtype=torch.int32, device="cuda")
+    has_init = torch.tensor([i % 2 == 0 for i in range(N)], device="cuda")
+    g = torch.randn(1, T, H, D, device="cuda").to(bf)
+    beta = torch.randn(1, T, H, device="cuda").to(bf)
+    A_log = torch.randn(H, device="cuda") * 0.5
+    dt_bias = torch.randn(H * D, device="cuda") * 0.1
+    h0 = torch.randn(N, H, D, D, device="cuda") * 0.1
+    st_ref = state0.clone()
+    q, k, v = kda_conv.qkv_conv(x, w, st_ref, cu, idx, has_init, P).unbind(0)
+    o_ref, s_ref = sp_kda.persistent_prefill(
+        *(t.reshape(1, T, H, D) for t in (q, k, v)), g, beta, A_log, dt_bias, -5.0, h0, cu, cu_cpu
+    )
+    st = state0.clone()
+    qr, kr, vf, conv = sp_kda.persistent_conv_inputs(x, w, st, cu, idx, has_init, H)
+    o, s = sp_kda.persistent_prefill(
+        *(t.reshape(1, T, H, D) for t in (qr, kr, vf)), g, beta, A_log, dt_bias, -5.0, h0, cu, cu_cpu,
+        conv=conv,
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(st, st_ref)
+    assert torch.equal(vf, v)
+    assert not torch.isnan(o).any()
+    assert _rel_rms(o, o_ref) < 1e-3
+    assert _rel_rms(s, s_ref) < 1e-3
+
+
 def test_frost_strided_beta():
     """frost_prefill passes beta as a row-strided view of the projection:
     FROST must read it exactly like a contiguous copy."""

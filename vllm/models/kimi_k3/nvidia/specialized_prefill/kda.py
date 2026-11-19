@@ -116,6 +116,7 @@ def persistent_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
+    conv: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
@@ -134,8 +135,8 @@ def persistent_prefill(
     out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
     final_state = torch.empty_like(initial_state)
     kp.fwd(
-        q.contiguous(),
-        k.contiguous(),
+        q if conv is not None else q.contiguous(),
+        k if conv is not None else k.contiguous(),
         v.contiguous(),
         g.contiguous(),
         beta.reshape(1, T, H).contiguous(),
@@ -148,8 +149,55 @@ def persistent_prefill(
         final_state=final_state,
         cu_seqlens=cu_seqlens,
         plan=plan,
+        conv=conv,
     )
     return out, final_state
+
+
+_conv_groups: dict = {}
+
+
+def persistent_conv_inputs(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    heads: int,
+):
+    """Inputs of ``persistent_prefill`` with the Q|K conv fused into the kernel:
+    raw Q and K column views of ``mixed_qkv`` (tokens, 3 H 128), V through the
+    width-4 conv (ops/kda_qkv_conv on the V channels), and ``conv`` = (weight
+    groups, per-sequence Q|K history); the Q|K conv state is updated here as
+    qkv_conv does. Returns (q, k, v, conv) with q/k/v (tokens, H 128)."""
+    from vllm.models.kimi_k3.nvidia.ops import kda_conv
+
+    from .kda_persistent import forward as kp
+
+    T = mixed_qkv.shape[0]
+    P = heads * 128
+    key = (conv_weights.data_ptr(), heads)
+    wg = _conv_groups.get(key)
+    if wg is None:
+        wg = _conv_groups[key] = kp.conv_weight_groups(conv_weights, heads)
+    hist = kp.conv_qk_history(
+        mixed_qkv, conv_state, cache_indices, has_initial_state, query_start_loc, heads
+    )
+    v = torch.empty(T, P, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    kda_conv._load_qkv_conv()
+    torch.ops.k3_kda_conv.qkv_conv(
+        mixed_qkv[:, 2 * P : 3 * P],
+        conv_weights[2 * P : 3 * P],
+        conv_state[:, 2 * P : 3 * P],
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        v.as_strided((3, T, P // 3), (P // 3, P, 1)),
+        kda_conv.NULL_BLOCK_ID if kda_conv.NULL_BLOCK_ID is not None else -1,
+        kda_conv._qkv_conv_warps(P, T),
+    )
+    return mixed_qkv[:, :P], mixed_qkv[:, P : 2 * P], v, (wg, hist)
 
 
 def o_norm_mxfp8(

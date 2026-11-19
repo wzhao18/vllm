@@ -1465,7 +1465,39 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     and non_spec_query_start_loc is not None
                     and non_spec_state_indices_tensor is not None
                 )
-                if have_meta and kda_conv.qkv_conv_supported(
+                fused_qk_conv = None
+                if (
+                    have_meta
+                    and self.kda_prefill_backend == "flashkda"
+                    and self._kda_persistent
+                    and checkpoint is None
+                    and self._segscan_bufs is None
+                    and m.non_spec_query_start_loc_cpu is not None
+                    and non_spec_out is None
+                    and kda_conv.qkv_conv_supported(
+                        mixed_qkv_ns,
+                        conv_weights,
+                        conv_state,
+                        self.local_projection_size,
+                    )
+                ):
+                    # The persistent core convolves the raw Q|K planes in its
+                    # prep phase: only the V channels take the conv pass.
+                    assert has_initial_state is not None
+                    assert non_spec_query_start_loc is not None
+                    assert non_spec_state_indices_tensor is not None
+                    q_ns, k_ns, v_ns, fused_qk_conv = (
+                        specialized_prefill_kda.persistent_conv_inputs(
+                            mixed_qkv_ns,
+                            conv_weights,
+                            conv_state,
+                            non_spec_query_start_loc,
+                            non_spec_state_indices_tensor,
+                            has_initial_state,
+                            self.local_num_heads,
+                        )
+                    )
+                elif have_meta and kda_conv.qkv_conv_supported(
                     mixed_qkv_ns,
                     conv_weights,
                     conv_state,
@@ -1640,6 +1672,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     initial_state=initial_state,
                                     cu_seqlens=non_spec_query_start_loc,
                                     cu_seqlens_cpu=m.non_spec_query_start_loc_cpu,
+                                    conv=fused_qk_conv,
                                 )
                             )
                         else:
