@@ -48,6 +48,7 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
   __shared__ __align__(8) unsigned long long full[256], empty[256];
   __shared__ unsigned qctr;
   __shared__ unsigned long long T0;
+  __shared__ volatile int rel[256];
   uint4* sq = (uint4*)smem;
   unsigned char* ring = smem + qoff;  // 1024-aligned
   const int q0 = off[blockIdx.x], nq = off[blockIdx.x + 1] - q0, NL = Wg * L;
@@ -55,6 +56,7 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
   for (int i = threadIdx.x; i < nq; i += blockDim.x) sq[i] = quads[q0 + i];
   if (threadIdx.x == 0) {
     qctr = 0; T0 = gt();
+    for (int i = 0; i < 256; ++i) rel[i] = 0;
     for (int i = 0; i < NL * S; ++i) {
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&full[i])));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&empty[i])));
@@ -88,6 +90,7 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
         int sl = t % S;
         if (t >= S) {
           if (mode & 64) { wait_par(sa(&full[it * S + sl]), ((t / S) - 1) & 1); acc += myring[(size_t)sl * OPB + 16]; }
+          else if (mode & 256) { while (rel[it * S + sl] < t / S) { } }
           else if (mode & 128) {
             unsigned p = 0;
             while (!p) asm volatile("{.reg .pred P; mbarrier.test_wait.parity.shared::cta.b64 P, [%1], %2; selp.u32 %0, 1, 0, P;}"
@@ -128,7 +131,8 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
         if (!__all_sync(0xffffffffu, ok)) continue;
         if (lane < CG && NL * t + it < nq) {
           acc += ring[((size_t)it * S + t % S) * OPB + 16];
-          asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[it * S + t % S])) : "memory");
+          if (mode & 256) rel[it * S + t % S] = t / S + 1;
+          else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[it * S + t % S])) : "memory");
         }
         if ((mode & 16) && blockIdx.x == 0 && lane == 0 && ev < 120) tspan[2 + ev++] = ((unsigned long long)(gt() - tb) << 16) | (c << 8) | t;
         if (++nt[c] >= ntile) --left;
@@ -143,7 +147,7 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
           if (NL * t + it < nq) { wait_par(sa(&full[it * S + sl]), (t / S) & 1); acc += ring[((size_t)it * S + sl) * OPB + 16]; }
         __syncwarp();
         for (int it = c0 + lane; it < c0 + CG; it += 32)
-          if (NL * t + it < nq) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[it * S + sl])) : "memory");
+          if (NL * t + it < nq) { if (mode & 256) rel[it * S + sl] = t / S + 1; else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[it * S + sl])) : "memory"); }
       }
     }
   }
