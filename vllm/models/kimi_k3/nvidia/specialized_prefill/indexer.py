@@ -278,6 +278,7 @@ def order16(bits: Uint32) -> Uint32:
 
 
 PUBLISH = 6  # IndexerScore mode: keep only the keys at or above a row threshold
+PUBLISH_STAGGER = 7  # PUBLISH, odd warpgroups read the accumulator stages in reverse
 SLOTS = 64  # PUBLISH keys kept per (row, key lane): more and the row is recomputed
 REGION = (SLOTS + 1) * TILE  # words per row: lane counts, then SLOTS words per lane
 CAP = SLOTS * TILE
@@ -760,7 +761,7 @@ class IndexerScore:
             first = Int64((ntp - 1) * TILE + lt) * 2
             ptr0 = out_a + row_base[row0] * 2 + first
             ptr1 = out_a + row_base[row1] * 2 + first
-            if cutlass.const_expr(self.mode == PUBLISH):
+            if cutlass.const_expr(self.mode >= PUBLISH):
                 # BF16 thresholds of both rows (row_bin[3 r], the dummy row's is NaN)
                 # and their candidate lists (row_base in 16-bit units)
                 thr = (Uint32(row_bin[3 * row1]) << Uint32(16)) | (
@@ -788,7 +789,12 @@ class IndexerScore:
                 cute.arch.mbarrier_arrive(q_empty + qs)
             for pp in cutlass.range(ntp // 2, unroll=1):
                 t_hi = ntp - 1 - 2 * pp
-                for st in cutlass.range_constexpr(ACC_STAGES):
+                for st0 in cutlass.range_constexpr(ACC_STAGES):
+                    st = st0
+                    if cutlass.const_expr(self.mode == PUBLISH_STAGGER):
+                        # odd warpgroups take the pair's stages in the other order,
+                        # so half the warps read TMEM while the others reduce
+                        st = Int32(st0) ^ (wg & 1)
                     t = t_hi - st
                     cute.arch.mbarrier_wait(acc_full + st, ph)
                     col = tmem_q + st * N
@@ -800,7 +806,7 @@ class IndexerScore:
                     if lane == 0:
                         cute.arch.mbarrier_arrive(acc_empty + st)
                     r = self.reduce2((fa, fb), w[0], w[1])
-                    if cutlass.const_expr(self.mode == PUBLISH):
+                    if cutlass.const_expr(self.mode >= PUBLISH):
                         kidx = t * TILE + key_in_tile
                         if t_hi >= full_tiles:
                             # causal edge, and the repeated tile of an odd count
@@ -831,7 +837,7 @@ class IndexerScore:
                     else:
                         st_global_u16_off(ptr0, r, -st * TILE * 2)
                         st_global_u16_off(ptr1, r >> Uint32(16), -st * TILE * 2)
-                    if cutlass.const_expr(self.mode != PUBLISH):
+                    if cutlass.const_expr(self.mode < PUBLISH):
                         # histogram of the raw top 11 bits (masked keys land in bin
                         # 2047, the lowest rank)
                         red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
@@ -839,7 +845,7 @@ class IndexerScore:
                 ptr0 = ptr0 - 2 * TILE * 2
                 ptr1 = ptr1 - 2 * TILE * 2
                 ph = ph ^ 1
-            if cutlass.const_expr(self.mode == PUBLISH):
+            if cutlass.const_expr(self.mode >= PUBLISH):
                 # this thread's candidate counts of both rows
                 st_global_u32(cand0, c0)
                 st_global_u32(cand1, c1)
@@ -1745,7 +1751,8 @@ class SelectivePlan:
         self.s_bin = torch.zeros(3 * (t + 1), dtype=torch.int32, device=device)
 
 
-def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None):
+def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
+                   mode=PUBLISH):
     """Exact top-k of every row of ``sp`` into ``out`` (Int32 [T, topk], unordered,
     -1 padded). Returns the number of rows recomputed by the full path."""
     dev = q.device
@@ -1761,7 +1768,7 @@ def selective_topk(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None
     # 2) scores, keeping the keys at or above the threshold
     cand = torch.empty((t + 1) * REGION, dtype=torch.int32, device=dev)
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items, sp.cand_base,
-          cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=PUBLISH)
+          cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode)
     # 3) exact top-k from the candidates
     _cand_select_kernel(out.shape[1])(
         cand, sp.row_len, sp.row_bin, out.view(-1), stream
