@@ -33,6 +33,7 @@ from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
+from ..cutedsl.moe.moe_front import MoeFront, config_for
 from ..cutedsl.moe.route_stage import RouteStage, route_stage_cause
 from ..shapes import Choice, Path, Shape, Unsupported, rows_policy
 from .providers import bf16_weight
@@ -148,6 +149,17 @@ class SpMlp:
                 mlp.gate.weight.shape[0],
             )  # fmt: skip
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
+        # The whole front (router | latent down GEMM + top-k + staging) as one
+        # kernel (moe.moe_front) at the shard rows it has a launch shape for.
+        self.front, self.front_rows = None, frozenset()
+        front_rows = tuple(r for r in self.rows if config_for(r) is not None)
+        if (
+            front_rows
+            and router_concat_cause(mlp) is None
+            and route_stage_cause(mlp) is None
+        ):
+            self.front = MoeFront(mlp, front_rows, pack_router_latent(mlp))
+            self.front_rows = frozenset(front_rows)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -198,7 +210,11 @@ class SpMlp:
         """The four GEMM families' choices at ``n`` shard rows."""
         out = {f: self.gemms[f].choice(n) for f in FAMILIES}
         concat = self.router_latent
-        if concat is not None and n in concat[1].plans:
+        if n in self.front_rows:
+            out["latent_down"] = Choice(
+                Path.TUNED, tactic=("moe_front", None), note="router|latent_down+top-k+stage"
+            )
+        elif concat is not None and n in concat[1].plans:
             out["latent_down"] = Choice(
                 Path.TUNED, tactic=("ltpin", None), note="router|latent_down ltpin"
             )
@@ -237,8 +253,16 @@ class SpMlp:
             return gemms["latent_down"].run(h, h.new_empty((n, self.latent)))
 
         fused_norm = self.fused_norm
-        route = self.route_stage
-        if route is not None and route.ready(n):
+        route, front = self.route_stage, self.front
+        if n in self.front_rows and front.ready(h):
+            # GEMM + top-k + staging in one kernel; staged before the shared expert
+            # forks, as route_stage.
+            staged = front.stage(h)
+
+            def experts():
+                return front.launch(staged, fused_norm)
+
+        elif route is not None and route.ready(n):
             # Router | latent down as one FP32 GEMM, then one kernel stages its
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent
