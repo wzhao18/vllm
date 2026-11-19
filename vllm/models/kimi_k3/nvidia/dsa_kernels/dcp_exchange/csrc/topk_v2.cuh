@@ -446,10 +446,13 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
       __syncthreads();
-      if (tid == 0 && s_th == 0) s_th = 1;  // short / sparse sample: every valid key
-      __syncthreads();
+      if constexpr (kFast) {
+        for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
+        if (tid < kV2Win) { hist[kV2Fine + kV2Win + tid] = 0; win[tid] = 0; }
+        if (tid == 0) s_e = -1;
+      }
     }
-    int th = s_th;
+    int th = max(1, s_th);  // short / sparse sample: every valid key
     V2DBG(1);
     // the SMEM path's candidate pass: every key >= thv with its position, in position
     // order; returns this thread's valid-key count
@@ -657,10 +660,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (p.dbg && tid == 0) p.dbg[(int64_t)row * kV2Dbg + 31] = nc;
     // ---- 3. fine histogram above theta from the candidates -> e, window, band
     bool fast = nc <= kV2Cand && (uint32_t)nc >= q;
-    for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
-    for (int b = tid; b < kV2Win; b += kV2T) win[b] = 0;
-    if (tid == 0) s_e = -1;
-    __syncthreads();
+    if constexpr (!kFast) {
+      for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
+      for (int b = tid; b < kV2Win; b += kV2T) win[b] = 0;
+      if (tid == 0) s_e = -1;
+      __syncthreads();
+    }
     // fast path: one suffix scan of the fine histogram gives e, the window, the count above
     // it and the window prefix P, so the band pick needs no further scan
     bool pdone = false;
@@ -793,6 +798,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     V2DBG(14);
     const int lo = s_lo;
     // band around the exact local q-th key: [bl, bh] (window-relative), <= kV2Band keys
+    int bl_ = 1, bh_ = 0, bn_ = 0;
     {
       int e;
       uint32_t tot;
@@ -824,24 +830,25 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         bok = Pf(b + 1) - Pf(a) <= (uint32_t)kV2Band;
       }
       const int lo_h = __syncthreads_count(bok) - 1;
-      if (tid == 0 && bcand) {
+      if (bcand) {  // every thread alike (no publish barrier)
         int a = max(0, e - lo_h), b = min(kV2Win - 1, e + lo_h);
         for (int it = 0; it < 4 && b + 1 < kV2Win && Pf(b + 2) - Pf(a) <= (uint32_t)kV2Band; ++it) ++b;
         for (int it = 0; it < 4 && a > 0 && Pf(b + 1) - Pf(a - 1) <= (uint32_t)kV2Band; ++it) --a;
-        s_bl = a;
-        s_bh = b;
-        s_n = (int)(Pf(b + 1) - Pf(a));
+        bl_ = a;
+        bh_ = b;
+        bn_ = (int)(Pf(b + 1) - Pf(a));
       }
-      __syncthreads();
     }
     V2DBG(15);
-    const int bl = s_bl, bh = s_bh;
-    const int nb = bl <= bh ? s_n : 0;
+    const int bl = bl_, bh = bh_;
+    const int nb = bl <= bh ? bn_ : 0;
     // band ids grouped by key in key order (ids of one key in no particular order):
     // msg[kV2Fix + (band keys below k) + i]
     uint32_t* bcur = hist + kV2Fine + kV2Win;
-    if (tid < kV2Win) bcur[tid] = 0;
-    __syncthreads();
+    if constexpr (!kFast) {  // (the hot body zeroed them after theta)
+      if (tid < kV2Win) bcur[tid] = 0;
+      __syncthreads();
+    }
     if (nb > 0) {
       const uint32_t* P = hist + kV2Fine;
       const int k0 = lo + bl, k1 = lo + bh;
@@ -869,7 +876,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         });
       }
     }
-    __syncthreads();
     V2DBG(16);
     if (tid < kV2Win / 2) msg[kV2Hdr + tid] = pack2(tag, win[2 * tid], win[2 * tid + 1]);
     if (tid == 0) {
@@ -1016,10 +1022,26 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           // rank's ties (ids distinct, groups unsorted). Item (i, r2): how many of rank r2's
           // ties lie below this rank's tie i; only this rank's ties are ranked.
           const int m = s_tc[p.rank];
+          const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
+          if (w_sh >= 0 && m * W <= kV2T) {
+            // one item (i, r2) per thread, the W items of tie i on adjacent lanes (W a
+            // power of two): their sum by shuffles, no SMEM ranks, one barrier
+            const int i = tid >> w_sh, r2 = tid & (W - 1);
+            int c = 0;
+            if (i < m) {
+              const uint32_t x = my[i] & 0xFFFFFFu;
+              const uint32_t* g = rx + r2 * kV2Msg + kV2Fix + s_toff[r2];
+              const int n2 = s_tc[r2];
+#pragma unroll 4
+              for (int j = 0; j < n2; ++j) c += (g[j] & 0xFFFFFFu) < x;
+            }
+            for (int o = 1; o < W; o <<= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+            rt = 1;
+            qv = __syncthreads_count(i < m && r2 == 0 && c < need);
+          } else {
           int* rk = reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win);
           if (tid < m) rk[tid] = 0;
           __syncthreads();
-          const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
           for (int it = tid; it < m * W; it += kV2T) {
             const int i = it / W, r2 = it - i * W;
             const uint32_t x = my[i] & 0xFFFFFFu;
@@ -1033,6 +1055,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           __syncthreads();
           rt = 1;
           qv = __syncthreads_count(tid < m && rk[tid] < need);
+          }
         }
       }
       if (tid == 0) {
