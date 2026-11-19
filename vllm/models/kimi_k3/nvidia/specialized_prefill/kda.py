@@ -149,7 +149,7 @@ def frost_prefill_in_place(
         scale=D**-0.5,
         initial_state=state_pool,
         state_indices=state_indices,
-        final_state_out=state_pool,
+        output_final_state=True,
         use_qk_l2norm_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         safe_gate=True,
