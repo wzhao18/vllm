@@ -6,7 +6,9 @@ One ``DcpxDecode`` per model (one set of symmetric mailboxes, every DSA layer in
 turn; the device epochs make CUDA graph replays carry no host state). On pure-decode
 steps of at most ``cap`` rows it replaces the stock local top-k + generic all-gather
 merge + ``triton_filter_and_convert_dcp_index`` (or the #63 one-round DCP top-k
-merge) by ``DcpExchange.topk_merge`` on the bf16 indexer logits. Its output is
+merge) by ``DcpExchange.topk_v2`` (csrc/topk_v2.cuh: one CTA per row, one NVLink
+round whose message also carries the tie band; exact tiers otherwise; the same
+selection and output as ``topk_merge``) on the bf16 indexer logits. Its output is
 already this rank's KV slots (through the MLA block table, as
 ``triton_filter_and_convert_dcp_index`` maps them) and their count, so it is
 independent of the interleave. Hooks: the indexer op's decode branch
@@ -268,23 +270,16 @@ class DcpxDecode:
         md = get_forward_context().attn_metadata[layer.layer_name]
         _, stride = flat_kv_row_view(layer.kv_cache, md.block_size)
         max_local = min(self.max_local_len, logits.shape[1])
-        cluster, segmax = self.launch_params(rows, max_local)
-        self.ex.topk_merge(
+        self.ex.topk_v2(
             logits,
             local,
             glob,
             out,
             self.counts[:rows],
-            max_local_len=max_local,
-            cluster=cluster,
-            segmax=segmax,
             block_table=md.block_table,
             block_size=md.block_size,
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
-            one_round=self.ex.cap1 > 0,
-            window="center",
-            small_ctx=self.small_ctx,
         )
         return True
 
@@ -377,20 +372,13 @@ class DcpxDecode:
             )
 
     def warm(self) -> None:
-        """Configure the top-k kernel and its occupancy per launch shape outside any
-        capture: one select-all row per (cluster, shared keys) the decode can use
-        (every rank alike, so the row-0 token exchanges match)."""
+        """Build the top-k kernel and set its SMEM attribute and residency outside any
+        capture (one select-all row: no exchange)."""
         dev = self.counts.device
         logits = torch.zeros((1, 64), dtype=torch.bfloat16, device=dev)
         lens = torch.ones(1, dtype=torch.int32, device=dev)
         out = torch.empty((1, self.K), dtype=torch.int32, device=dev)
-        rows = range(1, self.topk_cap + 1)
-        shapes = {self.launch_params(r, self.max_local_len) for r in rows}
-        for cluster, segmax in sorted(shapes):
-            self.ex.topk_merge(
-                logits, lens, lens, out, self.counts[:1], max_local_len=64,
-                cluster=cluster, segmax=segmax,
-            )  # fmt: skip
+        self.ex.topk_v2(logits, lens, lens, out, self.counts[:1])
         torch.cuda.synchronize(dev)
         self.ex.check()
 
