@@ -1,0 +1,88 @@
+diff --git a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h6.py b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h6.py
+index 0aa40ba9ba..2b9270f29a 100644
+--- a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h6.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h6.py
+@@ -193,6 +193,15 @@ def mma_cb_e(d, a, b, idesc, acc, op: str):
+                                           Uint32(acc))
+ 
+ 
++@asm()
++def mma_ss_ca_e(d, a, b, idesc, acc, op: str):
++    """SS MMA with the A collector (fill: keep A for the next MMA; lastuse: reuse it)."""
++    code = ("{ .reg .pred p, e; " + _ELECT + "setp.ne.b32 p, $4, 0; "
++            f"@e tcgen05.mma.cta_group::1.kind::f8f6f4.collector::a::{op} [$0], $1, $2, $3, p; }}")
++    return code, "r,l,l,r,r,~{memory}", (Uint32(d), Uint64(a), Uint64(b), Uint32(idesc),
++                                          Uint32(acc))
++
++
+ @asm()
+ def commit_e(bar):
+     code = ("{ .reg .pred e; " + _ELECT + "@e tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+@@ -483,11 +492,21 @@ class SparseMlaPrefillH6:
+             subs = _subs(lens[cta + qi * self.grid])
+             mbar_wait(_bar(base, B_QTM), Uint32(qi & 1))
+             tc_fence_after()
+-            for i in range(subs):
++            # subtiles in pairs: the SS A operand (Q dims 256-511, RoPE) is fetched
++            # once per pair through the A collector
++            for p in cutlass.range(subs // 2, unroll=1):
++                if u >= 2:
++                    mbar_wait(_bar(base, B_SFREE + u % 2), Uint32((u // 2 - 1) & 1))
++                if u >= 1:
++                    mbar_wait(_bar(base, B_SFREE + (u + 1) % 2), Uint32(((u + 1) // 2 - 1) & 1))
++                tc_fence_after()
++                self.qk_pair(base, taddr, u, qi, 2 * p + 2 == subs)
++                u = u + 2
++            if subs % 2 == 1:
+                 if u >= 2:
+                     mbar_wait(_bar(base, B_SFREE + u % 2), Uint32((u // 2 - 1) & 1))
+                     tc_fence_after()
+-                self.qk(base, lane, taddr, u, qi, i == subs - 1, cta)
++                self.qk(base, lane, taddr, u, qi, True, cta)
+                 u = u + 1
+ 
+     @cute.jit
+@@ -523,6 +542,43 @@ class SparseMlaPrefillH6:
+         if last:
+             commit_e(_bar(base, B_QREMPTY + qi % 2))
+ 
++    @cute.jit
++    def qk_pair(self, base, taddr, u, qi, last):
++        mbar_wait(_bar(base, B_KVFULL + u % NS), Uint32((u // NS) & 1))
++        mbar_wait(_bar(base, B_KVFULL + (u + 1) % NS), Uint32(((u + 1) // NS) & 1))
++        tc_fence_after()
++        qs = base + Uint32(OFF_QS) + Uint32(qi % 2) * Uint32(QS_BYTES)
++        ad0 = Uint64(SDESC_SW128) | Uint64(qs >> Uint32(4))
++        scs = []
++        bds = []
++        for t in cutlass.range_constexpr(2):
++            st = base + Uint32(OFF_KV) + Uint32((u + t) % NS) * Uint32(STAGE64)
++            scs.append(taddr + Uint32(C_S) + Uint32(64) * Uint32((u + t) % 2))
++            bds.append(Uint64(SDESC_SW128) | Uint64(st >> Uint32(4)))
++        if cutlass.const_expr(not self.no_mma):
++            for t in cutlass.range_constexpr(2):
++                for j in cutlass.range_constexpr(2):
++                    for k2 in cutlass.range_constexpr(2):
++                        mma_ts_e(scs[t], taddr + Uint32(C_Q + 32 * j + 16 * k2),
++                                 bds[t] + Uint64(j * 512 + k2 * 4), Uint32(IDESC_QK),
++                                 Uint32(1 if (j + k2) > 0 else 0))
++            for j in cutlass.range_constexpr(2, 4):
++                for k2 in cutlass.range_constexpr(2):
++                    ad = ad0 + Uint64((j - 2) * ATOM // 16 + k2 * 4)
++                    mma_ss_ca_e(scs[0], ad, bds[0] + Uint64(j * 512 + k2 * 4),
++                                Uint32(IDESC_QK), Uint32(1), "fill")
++                    mma_ss_ca_e(scs[1], ad, bds[1] + Uint64(j * 512 + k2 * 4),
++                                Uint32(IDESC_QK), Uint32(1), "lastuse")
++            ad = (ad0 + Uint64(2 * ATOM // 16)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
++            for t in cutlass.range_constexpr(2):
++                bd = (bds[t] + Uint64(4 * 512)) ^ Uint64(SDESC_SW128 ^ SDESC_SW64)
++                mma_ss_ca_e(scs[t], ad, bd, Uint32(IDESC_QK), Uint32(1),
++                            "fill" if t == 0 else "lastuse")
++        commit_e(_bar(base, B_SFULL + u % 2))
++        commit_e(_bar(base, B_SFULL + (u + 1) % 2))
++        if last:
++            commit_e(_bar(base, B_QREMPTY + qi % 2))
++
+     @cute.jit
+     def pv_loop(self, base, lane, taddr, n_mine, lengths, cta):
+         """PV(u) once the owning softmax warpgroup released it (P written, O^T

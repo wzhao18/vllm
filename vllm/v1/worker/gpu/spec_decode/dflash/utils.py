@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import numpy as np
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
@@ -73,3 +74,56 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         dflash_model.lm_head = target_lm_head
 
     return dflash_model
+
+
+def window_context_rows(
+    query_start_loc: np.ndarray,
+    seq_ends: np.ndarray,
+    span: int,
+    hit_alignment: int | None,
+) -> np.ndarray | None:
+    """Context rows whose draft K/V a sliding-window drafter can ever read,
+    when that is a strict subset of the step's rows; else None.
+
+    Draft queries sit past the context and attend through a window of W
+    positions, so a request continuing from this step reads only the K/V of
+    its last W context positions, and a later request resuming from a cached
+    prefix at position h reads only [h - W, h); such hits land on multiples of
+    ``hit_alignment`` (None: no prefix reuse). Per request, keep the rows
+    within ``span`` (>= W + draft tokens) of its chunk end and of every hit
+    point inside its chunk. Requests of at most ``span`` rows are kept whole,
+    so verify rows (whose positions ``seq_ends`` may overstate) never trim.
+
+    Args:
+        query_start_loc: [num_reqs + 1] row offsets of the requests.
+        seq_ends: [num_reqs] sequence length after this step's rows.
+        span: rows kept before each read point.
+        hit_alignment: prefix-cache hit granularity in tokens, or None.
+
+    Returns:
+        Sorted kept row indices, or None when every row is kept.
+    """
+    qlen = np.diff(query_start_loc)
+    if qlen.size == 0 or int(qlen.max()) <= span:
+        return None
+    if hit_alignment is not None and hit_alignment <= span:
+        return None
+    pieces = []
+    for r in range(qlen.size):
+        lo, hi = int(query_start_loc[r]), int(query_start_loc[r + 1])
+        if hi - lo <= span:
+            pieces.append(np.arange(lo, hi, dtype=np.int64))
+            continue
+        end_pos = int(seq_ends[r])
+        start_pos = end_pos - (hi - lo)
+        keep = np.zeros(hi - lo, dtype=bool)
+        keep[-span:] = True
+        if hit_alignment is not None:
+            first = (start_pos // hit_alignment + 1) * hit_alignment
+            for h in range(first, end_pos, hit_alignment):
+                keep[max(0, h - span - start_pos) : h - start_pos] = True
+        pieces.append(lo + np.flatnonzero(keep))
+    rows = np.concatenate(pieces)
+    if rows.size == int(query_start_loc[-1]) - int(query_start_loc[0]):
+        return None
+    return rows

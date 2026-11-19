@@ -449,104 +449,114 @@ def _vp_markov_main(rank, world, device, group):
         torch.distributed.all_gather_into_tensor(out, x, group=group)
         return out
 
-    markov = draft.VocabParallelMarkov(w1, w2, world, rank, steps, gather)
-    lo, width = rank * markov.vocab_rank, markov.vocab_rank
+    # The NCCL all-gather of the keys (explicit gather) and the peer mailbox.
+    variants = (
+        ("gather", draft.VocabParallelMarkov(w1, w2, world, rank, steps, gather)),
+        (
+            "mailbox",
+            draft.VocabParallelMarkov(
+                w1, w2, world, rank, steps, group=group, cap=128
+            ),
+        ),
+    )
     failures = 0
-    for batch in (2, 7, 50, 128):
-        for sampled in (False, True):
-            markov.prepare(batch, steps, steps, sampled)
-            base = torch.randn((batch, steps, vocab), generator=gen, device=device)
-            base = base.bfloat16()
-            anchors = torch.randint(
-                0, vocab, (batch,), generator=gen, device=device, dtype=torch.int32
-            )
-            max_reqs = batch + 3
-            temperature = torch.rand((max_reqs,), generator=gen, device=device) + 0.5
-            temperature[::5] = 0.0
-            seeds = torch.randint(
-                0, 1 << 62, (max_reqs,), generator=gen, device=device,
-                dtype=torch.int64,
-            )  # fmt: skip
-            slots = torch.randperm(max_reqs, generator=gen, device=device)[:batch]
-            slots = slots.repeat_interleave(steps).contiguous()
-            start = torch.randint(
-                1, 1 << 20, (batch,), generator=gen, device=device, dtype=torch.int64
-            )
-            positions = start[:, None] + torch.arange(steps, device=device)
-            positions = positions.reshape(-1).contiguous()
-            expected_cache = sampling = expected_sampling = None
-            if sampled:
-                cache = torch.zeros(
-                    (max_reqs, steps, vocab), dtype=torch.bfloat16, device=device
+    for variant, markov in variants:
+        lo, width = rank * markov.vocab_rank, markov.vocab_rank
+        for batch in (2, 7, 50, 128):
+            for sampled in (False, True):
+                markov.prepare(batch, steps, steps, sampled)
+                base = torch.randn((batch, steps, vocab), generator=gen, device=device)
+                base = base.bfloat16()
+                anchors = torch.randint(
+                    0, vocab, (batch,), generator=gen, device=device, dtype=torch.int32
                 )
-                expected_cache = cache.clone()
-                sampling = (temperature, seeds, slots, positions, cache)
-                expected_sampling = (
-                    temperature,
-                    seeds,
-                    slots,
-                    positions,
-                    expected_cache,
+                max_reqs = batch + 3
+                temperature = torch.rand((max_reqs,), generator=gen, device=device) + 0.5
+                temperature[::5] = 0.0
+                seeds = torch.randint(
+                    0, 1 << 62, (max_reqs,), generator=gen, device=device,
+                    dtype=torch.int64,
+                )  # fmt: skip
+                slots = torch.randperm(max_reqs, generator=gen, device=device)[:batch]
+                slots = slots.repeat_interleave(steps).contiguous()
+                start = torch.randint(
+                    1, 1 << 20, (batch,), generator=gen, device=device, dtype=torch.int64
                 )
-            # The stock math with each rank's bias columns as its shard GEMM gives
-            # them (bitwise target), and the stock full-vocabulary GEMM (the drafts
-            # may differ only through cuBLAS's per-shape accumulation order: logged).
-            expected = _stock_markov(
-                w1, w2, base, anchors, steps, expected_sampling, shards=world
-            )
-            stock_cache = None if not sampled else torch.zeros_like(expected_cache)
-            stock_sampling = None if not sampled else (
-                temperature, seeds, slots, positions, stock_cache
-            )  # fmt: skip
-            stock = _stock_markov(w1, w2, base, anchors, steps, stock_sampling)
-            if rank == 0:
-                n = (stock != expected).sum().item()
-                print(
-                    f"B{batch} sampled={sampled}: per-shard vs full-vocabulary bias "
-                    f"GEMM drafts differ at {n} of {stock.numel()}",
-                    flush=True,
-                )
-            local = base[:, :, lo : lo + width].reshape(batch * steps, width)
-            local = local.contiguous()
-            for mode in ("eager", "graph"):
-                draft_out = torch.zeros(
-                    (batch, steps), dtype=torch.int64, device=device
-                )
+                positions = start[:, None] + torch.arange(steps, device=device)
+                positions = positions.reshape(-1).contiguous()
+                expected_cache = sampling = expected_sampling = None
                 if sampled:
-                    sampling[4].zero_()
-                torch.distributed.barrier()
-                if mode == "eager":
-                    markov.run(local, anchors, draft_out, sampling)
-                else:
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        markov.run(local, anchors, draft_out, sampling)
-                    torch.accelerator.synchronize(device)
-                    torch.distributed.barrier()
-                    graph.replay()
-                torch.accelerator.synchronize(device)
-                label = f"B{batch} {'sampled' if sampled else 'greedy'} {mode}"
-                if not torch.equal(draft_out, expected):
-                    n = (draft_out != expected).sum().item()
-                    print(f"rank {rank}: {label}: {n} drafts differ", flush=True)
-                    failures += 1
-                if sampled:
-                    cache, live = sampling[4], slots[::steps]
-                    cols = slice(lo, lo + width)
-                    if not torch.equal(
-                        cache[live, :, cols], expected_cache[live, :, cols]
-                    ):
-                        print(f"rank {rank}: {label}: cached logits differ", flush=True)
-                        failures += 1
-                    rest = cache.clone()
-                    rest[live, :, cols] = 0
-                    if rest.any():
-                        print(
-                            f"rank {rank}: {label}: cache written elsewhere", flush=True
-                        )
-                        failures += 1
+                    cache = torch.zeros(
+                        (max_reqs, steps, vocab), dtype=torch.bfloat16, device=device
+                    )
+                    expected_cache = cache.clone()
+                    sampling = (temperature, seeds, slots, positions, cache)
+                    expected_sampling = (
+                        temperature,
+                        seeds,
+                        slots,
+                        positions,
+                        expected_cache,
+                    )
+                # The stock math with each rank's bias columns as its shard GEMM gives
+                # them (bitwise target), and the stock full-vocabulary GEMM (the drafts
+                # may differ only through cuBLAS's per-shape accumulation order: logged).
+                expected = _stock_markov(
+                    w1, w2, base, anchors, steps, expected_sampling, shards=world
+                )
+                stock_cache = None if not sampled else torch.zeros_like(expected_cache)
+                stock_sampling = None if not sampled else (
+                    temperature, seeds, slots, positions, stock_cache
+                )  # fmt: skip
+                stock = _stock_markov(w1, w2, base, anchors, steps, stock_sampling)
                 if rank == 0:
-                    print(f"VocabParallelMarkov {label}: checked", flush=True)
+                    n = (stock != expected).sum().item()
+                    print(
+                        f"B{batch} sampled={sampled}: per-shard vs full-vocabulary bias "
+                        f"GEMM drafts differ at {n} of {stock.numel()}",
+                        flush=True,
+                    )
+                local = base[:, :, lo : lo + width].reshape(batch * steps, width)
+                local = local.contiguous()
+                for mode in ("eager", "graph"):
+                    draft_out = torch.zeros(
+                        (batch, steps), dtype=torch.int64, device=device
+                    )
+                    if sampled:
+                        sampling[4].zero_()
+                    torch.distributed.barrier()
+                    if mode == "eager":
+                        markov.run(local, anchors, draft_out, sampling)
+                    else:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            markov.run(local, anchors, draft_out, sampling)
+                        torch.accelerator.synchronize(device)
+                        torch.distributed.barrier()
+                        graph.replay()
+                    torch.accelerator.synchronize(device)
+                    label = f"B{batch} {'sampled' if sampled else 'greedy'} {mode}"
+                    if not torch.equal(draft_out, expected):
+                        n = (draft_out != expected).sum().item()
+                        print(f"rank {rank}: {label}: {n} drafts differ", flush=True)
+                        failures += 1
+                    if sampled:
+                        cache, live = sampling[4], slots[::steps]
+                        cols = slice(lo, lo + width)
+                        if not torch.equal(
+                            cache[live, :, cols], expected_cache[live, :, cols]
+                        ):
+                            print(f"rank {rank}: {label}: cached logits differ", flush=True)
+                            failures += 1
+                        rest = cache.clone()
+                        rest[live, :, cols] = 0
+                        if rest.any():
+                            print(
+                                f"rank {rank}: {label}: cache written elsewhere", flush=True
+                            )
+                            failures += 1
+                    if rank == 0:
+                        print(f"VocabParallelMarkov {variant} {label}: checked", flush=True)
     return failures
 
 
