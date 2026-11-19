@@ -20,6 +20,8 @@ host.  Every kernel, its host and the tensor placeholder each host was compiled 
 host only sequences the launches, so the kernels' SASS is unchanged and the Python side crosses into the DSL once per call
 instead of twice; the prologue and prefill mark the same buffers as the standalone prefill wrapper does."""
 
+import hashlib
+import os
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -72,6 +74,11 @@ TAIL_BUFFERS = (
 RAGGED_BUFFERS = TAIL_BUFFERS[:20]
 
 uncut_forward_cache = {}
+# The persistent compiled cache keys on this string: the vendored kernels' source digest
+# keeps an artifact of an earlier revision from being reused.
+_SOURCE_DIGEST = hashlib.sha256(
+    b"".join(open(os.path.join(os.path.dirname(__file__), name), "rb").read() for name in ("kda_prefill_f16.py", "kda_uncut_forward_f16.py"))
+).hexdigest()[:16]
 
 
 @cute.jit
@@ -959,7 +966,7 @@ def build_uncut_forward(
             *tail_constexprs,
             *tail_placeholders,
             *ragged_placeholders,
-            cache_key=repr((__name__, key)),
+            cache_key=repr((__name__, _SOURCE_DIGEST, key)),
             symbol="frost_la_kda_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
