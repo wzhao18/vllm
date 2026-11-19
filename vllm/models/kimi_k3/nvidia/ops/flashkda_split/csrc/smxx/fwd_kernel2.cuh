@@ -267,7 +267,8 @@ __global__ void __launch_bounds__(
         SeqlenT const* cu_seqlens, int total_tiles,
         cutlass::bfloat16_t const* ws_kd, cutlass::bfloat16_t const* ws_qd,
         cutlass::bfloat16_t const* ws_kr, float const* ws_gt,
-        cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk) {
+        cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk,
+        unsigned const* tile_flags) {
   using BF16 = cutlass::bfloat16_t;
   using StateT = std::conditional_t<StateFP32, float, BF16>;
   // Kimi-K3: fp32 state I/O without the bf16 staging (segment partials only).
@@ -524,6 +525,7 @@ __global__ void __launch_bounds__(
           load_pipeline.producer_get_barrier(load_write);
       int stage = load_write.index();
       int ws_idx = head_idx * total_tiles + tile_base + t;
+      if (tile_flags != nullptr) k3_acquire_tile(tile_flags + ws_idx);
 
       // TMA load v
       if constexpr (!ZeroV) {

@@ -37,7 +37,7 @@ def inputs(lens, H, seed=7, slow_decay=False):
     )
 
 
-def run(x, mode, ws=None):
+def run(x, mode, ws=None, sync=True):
     _, T, H, D = x["q"].shape
     N = x["initial_state"].shape[0]
     out = torch.zeros_like(x["v"])
@@ -49,7 +49,8 @@ def run(x, mode, ws=None):
         x["q"], x["k"], x["v"], x["g"], x["beta"], D**-0.5, out, ws,
         x["A_log"], x["dt_bias"], x["lower_bound"], x["initial_state"], final,
         x["cu_seqlens"], None, None, mode)
-    torch.cuda.synchronize()
+    if sync:
+        torch.cuda.synchronize()
     return out, final
 
 
@@ -70,6 +71,7 @@ def main():
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--stamps", default="")
+    ap.add_argument("--wall", default="", help="modes to time end to end")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 
@@ -86,6 +88,43 @@ def main():
             ok1 = stats(f"mode {m} out  ", ref_o, o)
             ok2 = stats(f"mode {m} state", ref_s, s)
             print(f"    mode {m}: {'OK' if ok1 and ok2 else 'MISMATCH'}")
+    for m in [int(x) for x in args.wall.split(",") if x]:
+        lens = [5461, 5461, 5462]
+        x = inputs(lens, 96)
+        T = sum(lens)
+        mc = max((n + 15) // 16 for n in lens)
+        mm = m | (mc << 16) if m & 512 else m
+        ws = torch.zeros(torch.ops.k3_flashkda_split.get_workspace_size(T, 96, 3),
+                         dtype=torch.uint8, device="cuda")
+        if m == 0:
+            def f():
+                out = torch.empty_like(x["v"])
+                fin = torch.empty_like(x["initial_state"])
+                torch.ops._flashkda_C.fwd(
+                    x["q"], x["k"], x["v"], x["g"], x["beta"], 128**-0.5, out, ws,
+                    x["A_log"], x["dt_bias"], x["lower_bound"], x["initial_state"],
+                    fin, x["cu_seqlens"], None, None)
+        else:
+            def f():
+                run(x, mm, ws, sync=False)
+        ref_o, ref_s = run(x, 3)
+        if m:
+            o, s_ = run(x, mm, ws)
+            ok = stats(f"wall mode {m} out", ref_o, o) and stats(
+                f"wall mode {m} state", ref_s, s_)
+            print(f"    wall mode {m}: {'OK' if ok else 'MISMATCH'}")
+        import vllm._flashkda_C  # noqa: F401
+        for _ in range(3):
+            f()
+        torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+        e0.record()
+        for _ in range(args.iters):
+            f()
+        e1.record()
+        torch.cuda.synchronize()
+        print(f"WALL mode {m} ({'stock _flashkda_C' if m == 0 else mm}): "
+              f"{e0.elapsed_time(e1) * 1000 / args.iters:.1f} us per K1+K2 call")
     for m in [int(x) for x in args.stamps.split(",") if x]:
         x = inputs([5461, 5461, 5462], 96)
         run(x, m)

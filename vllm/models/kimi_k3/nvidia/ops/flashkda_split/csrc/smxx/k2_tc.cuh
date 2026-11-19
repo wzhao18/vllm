@@ -256,7 +256,8 @@ __global__ void __launch_bounds__(kThreads, 2) k2_tc_kernel(
     cutlass::bfloat16_t const* __restrict__ ws_kr,
     float const* __restrict__ ws_gt,
     cutlass::bfloat16_t const* __restrict__ ws_inv,
-    cutlass::bfloat16_t const* __restrict__ ws_mqk, int flags) {
+    cutlass::bfloat16_t const* __restrict__ ws_mqk, int flags,
+    unsigned const* __restrict__ tile_flags) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   extern __shared__ __align__(1024) unsigned char smem[];
   const int warp = threadIdx.x >> 5;
@@ -539,6 +540,10 @@ __global__ void __launch_bounds__(kThreads, 2) k2_tc_kernel(
         const uint32_t fb = full_bar(stage);
         const uint32_t sst = sbase + stage * kStageBytes;
         const int64_t wi = ws_head + c;
+        if (tile_flags != nullptr) {
+          if (lane == 0) k3_acquire_tile(tile_flags + wi);
+          __syncwarp();
+        }
         if (lane < kChunk) {
           float b = 0.0f;
           if (lane < valid) {

@@ -91,7 +91,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int T_total, int H, int N, SeqlenT const* cu_seqlens, int total_tiles,
     float const* A_log_ptr, float gate_scale, cutlass::bfloat16_t* ws_kd,
     cutlass::bfloat16_t* ws_qd, cutlass::bfloat16_t* ws_kr, float* ws_gt,
-    cutlass::bfloat16_t* ws_inv, cutlass::bfloat16_t* ws_mqk) {
+    cutlass::bfloat16_t* ws_inv, cutlass::bfloat16_t* ws_mqk,
+    int max_chunks, unsigned* tile_flags) {
   // --- constants
   using BF16 = cutlass::bfloat16_t;
   using Layouts = K1Layouts<D, CHUNK>;
@@ -122,6 +123,24 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
   // --- per-CTA tile info
   int global_tile_idx = blockIdx.x;
   int head_idx = blockIdx.y;
+  // Kimi-K3: chunk-major order (max_chunks > 0): a 1D grid of max_chunks x N
+  // x H CTAs, head fastest, so the tiles every recurrence needs next are
+  // prepared first (overlapped prepare / recurrence).
+  if constexpr (IsVarlen) {
+    if (max_chunks > 0) {
+      const int lin = int(blockIdx.x);
+      head_idx = lin % H;
+      const int s = (lin / H) % N;
+      const int c = lin / (H * N);
+      int before = 0;
+      for (int i = 0; i < s; i++) {
+        before += (int(cu_seqlens[i + 1] - cu_seqlens[i]) + CHUNK - 1) / CHUNK;
+      }
+      const int n_s = (int(cu_seqlens[s + 1] - cu_seqlens[s]) + CHUNK - 1) / CHUNK;
+      if (c >= n_s) return;
+      global_tile_idx = before + c;
+    }
+  }
   int seq_idx, tiles_before, local_t;
   int64_t bos, eos;
   int seq_len, t_tiles_this_seq;
@@ -568,5 +587,6 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                                    int32_t(CHUNK * CHUNK * sizeof(BF16)));
     tma_store_arrive();
     tma_store_wait<0>();
+    if (tile_flags != nullptr) k3_publish_tile(tile_flags + ws_idx);
   }
 }

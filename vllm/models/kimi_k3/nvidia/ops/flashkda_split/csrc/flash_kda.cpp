@@ -31,7 +31,8 @@ int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N) {
 
   int64_t per_tile_bytes = 3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
 
-  return H * total_tiles * per_tile_bytes;
+  // Kimi-K3: + one ready flag per (head, tile) for the overlapped K1 / K2.
+  return H * total_tiles * (per_tile_bytes + 4);
 }
 
 void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -44,8 +45,13 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
   // mode: bit 0 K1 prepare, bit 1 K2 recurrence, bit 2 exact fp32 state I/O,
   // bit 3 K2 without outputs, bit 4 K2 with v = 0 (bits 2-4 need bit 1).
   // Kimi-K3: bit 5 tcgen05 recurrence (bit 6: its kr descriptor variant).
-  STD_TORCH_CHECK((mode & ~int64_t(511)) == 0 && (mode & 3) != 0 &&
-                      ((mode & 508) == 0 || (mode & 2) != 0),
+  // Kimi-K3: bit 9 overlaps K1 with K2 (needs bits 0 and 1 and this build's
+  // workspace size); bits 16-30 carry the longest sequence's chunk count.
+  const int64_t mode_lo = mode & 0xFFFF;
+  STD_TORCH_CHECK(mode >= 0 && mode < (int64_t(1) << 31) &&
+                      (mode_lo & ~int64_t(1023)) == 0 && (mode_lo & 3) != 0 &&
+                      ((mode_lo & 1020) == 0 || (mode_lo & 2) != 0) &&
+                      ((mode_lo & 512) == 0 || (mode_lo & 3) == 3),
                   "k3_flashkda_split: invalid mode ", mode);
   STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() &&
                       beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
@@ -269,6 +275,13 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
   } else {
     total_tiles =
         int(N_val * ((T_seq + CHUNK - 1) / CHUNK));  // exact for batched
+  }
+  if (mode & 512) {
+    STD_TORCH_CHECK(is_varlen && workspace.scalar_type() == ScalarType::Byte &&
+                        workspace.numel() >= get_workspace_size(T_total, H, N_val),
+                    "k3_flashkda_split: the overlapped K1 / K2 (mode bit 9) "
+                    "needs varlen and k3_flashkda_split.get_workspace_size "
+                    "bytes of workspace");
   }
 
   auto dispatch = [&](auto typed_cu_seqlens) {

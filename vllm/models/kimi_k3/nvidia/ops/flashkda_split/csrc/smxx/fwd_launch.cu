@@ -6,6 +6,7 @@
 // picks a V slicing (16, 32, 64 columns or the full tile) per launch shape,
 // see the policy below.
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -85,6 +86,15 @@ void launch_fwd(
       ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored +
                    WS::kGTotal + WS::kINV));
 
+  unsigned* tile_flags =
+      (mode & 512) && (mode & 3) == 3
+          ? reinterpret_cast<unsigned*>(
+                ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored +
+                             WS::kGTotal + WS::kINV + WS::kMqk))
+          : nullptr;
+  const int k1_max_chunks =
+      tile_flags ? std::max(1, std::min(total_tiles, mode >> 16)) : 0;
+
   // --- TMA descriptors for Kernel 1 inputs
   auto tma_load_q = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
   auto tma_load_k = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
@@ -147,7 +157,7 @@ void launch_fwd(
       make_state_tma(TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
   // ===== Launch Kernel 1 (prepare) =====
 #if BLOCK_LEVEL_K1 >= 0
-  if (mode & 1) {
+  auto launch_k1 = [&](cudaStream_t k1_stream) {
     constexpr int kK1Threads = 128;
     using SharedStorageK1T = SharedStorageK1<K1L>;
     int smem_size_k1 = sizeof(SharedStorageK1T);
@@ -161,13 +171,57 @@ void launch_fwd(
     cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem_size_k1);
 
-    dim3 grid_k1(total_tiles, H);
+    dim3 grid_k1 = k1_max_chunks > 0 ? dim3(k1_max_chunks * N * H, 1)
+                                     : dim3(total_tiles, H);
     dim3 block_k1(kK1Threads);
 
-    kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+    kernel1<<<grid_k1, block_k1, smem_size_k1, k1_stream>>>(
         tma_load_q, tma_load_k, tma_load_beta, tma_load_g, tma_load_dt_bias,
         scale, T_total, H, N, cu_seqlens_ptr, total_tiles, A_log_ptr,
-        gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+        gate_scale, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, k1_max_chunks,
+        tile_flags);
+  };
+  // Kimi-K3: bit 9 overlaps K1 with K2: K2 runs on a high-priority side
+  // stream and takes each tile when K1 publishes it (per-(head, tile) flags
+  // after the workspace; K1 in chunk-major order, max chunks per sequence in
+  // mode bits 16-31).
+  const bool overlap = (mode & 512) && (mode & 3) == 3;
+  struct Tail {
+    std::function<void()> f;
+    ~Tail() {
+      if (f) f();
+    }
+  } tail;
+  cudaStream_t k2_stream = stream;
+  if (overlap) {
+    static cudaStream_t side = [] {
+      int lo, hi;
+      cudaDeviceGetStreamPriorityRange(&lo, &hi);
+      cudaStream_t st;
+      cudaStreamCreateWithPriority(&st, cudaStreamNonBlocking, hi);
+      return st;
+    }();
+    static cudaEvent_t ev_fork = [] {
+      cudaEvent_t e;
+      cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+      return e;
+    }();
+    static cudaEvent_t ev_join = [] {
+      cudaEvent_t e;
+      cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+      return e;
+    }();
+    cudaMemsetAsync(tile_flags, 0, size_t(n_ht) * sizeof(unsigned), stream);
+    cudaEventRecord(ev_fork, stream);
+    cudaStreamWaitEvent(side, ev_fork, 0);
+    k2_stream = side;
+    tail.f = [&, side_stream = side] {
+      launch_k1(stream);
+      cudaEventRecord(ev_join, side_stream);
+      cudaStreamWaitEvent(stream, ev_join, 0);
+    };
+  } else if (mode & 1) {
+    launch_k1(stream);
   }
 #endif
 
@@ -184,11 +238,11 @@ void launch_fwd(
           cudaFuncSetAttribute(kernel,
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
                                k2tc::kSmemBytes);
-          kernel<<<dim3(H, N), dim3(threads), k2tc::kSmemBytes, stream>>>(
+          kernel<<<dim3(H, N), dim3(threads), k2tc::kSmemBytes, k2_stream>>>(
               v_ptr, beta_ptr, static_cast<float const*>(initial_state_ptr),
               static_cast<float*>(final_state_ptr), out_ptr, T_total, H, N,
               cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
-              ws_mqk, int((mode >> 8) & 1));
+              ws_mqk, int((mode >> 8) & 1), tile_flags);
         };
         launch(k2tc::k2_tc_kernel<HasStateIn, HasStateOut>, k2tc::kThreads);
         return;
@@ -262,12 +316,12 @@ void launch_fwd(
         return false;
       }
       dim3 grid_k2(H * (D / kVD), N);
-      kernel2<<<grid_k2, dim3(kThreads), smem_size_k2, stream>>>(
+      kernel2<<<grid_k2, dim3(kThreads), smem_size_k2, k2_stream>>>(
           tma_load_v_vsplit, tma_load_beta2, tma_load_initial_state_vsplit,
           tma_store_final_state_vsplit, tma_store_out_vsplit, out_ptr,
           checkpoint_state_ptr, checkpoint_offsets_ptr, T_total, H, N,
           cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
-          ws_mqk);
+          ws_mqk, tile_flags);
       return true;
     };
     using I16 = std::integral_constant<int, 16>;
@@ -337,11 +391,11 @@ void launch_fwd(
       // Varlen reverses y in-kernel to process vLLM's trailing prefills first.
       dim3 grid_k2(H, N);
 
-      kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
+      kernel2<<<grid_k2, block_k2, smem_size_k2, k2_stream>>>(
           tma_load_v, tma_load_beta2, tma_load_initial_state,
           tma_store_final_state, tma_store_out, out_ptr, checkpoint_state_ptr,
           checkpoint_offsets_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
-          ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+          ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, tile_flags);
     };
     if constexpr (StateFP32) {
       if (exact_state) {
