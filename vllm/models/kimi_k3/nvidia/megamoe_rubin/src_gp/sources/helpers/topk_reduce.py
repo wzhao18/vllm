@@ -227,7 +227,6 @@ class TopkReduce:
         producer_arrivals: Optional[int] = None,
         batch_invariant: bool = False,
         norm_split: int = 1,
-        early_gate: bool = False,
     ) -> None:
         """``internode = (experts_per_rank, ranks_per_node, remote_node_slots)`` enables the ordered reduce
         with one BF16 node partial per remote node (design invariant I11): a token's local top-k cells
@@ -239,21 +238,13 @@ class TopkReduce:
         its stores are drained) and re-arms it, so the reduce does not wait out the producer's tail.
         ``norm_split`` (fused-RMSNorm reduce only): a token row is spread over a cluster of that many CTAs
         that exchange their sum-of-squares partials through distributed shared memory. Small CTAs fit
-        beside the producer's resident CTAs, so the reduce runs on every SM instead of waiting for whole SMs.
-        ``early_gate`` (with ``norm_split`` > 1 and ``producer_arrivals``): for a producer that releases this
-        launch at its entry. Cluster rank 0 of each row waits for the full ``producer_done`` count before the
-        cluster touches the plane (the resident CTAs neither poll the plane nor load the routing during the
-        producer's stream); the last cluster through re-arms the count and the consumed count beside it.
-        ``producer_done`` then holds two int32 (arrivals, consumed clusters)."""
+        beside the producer's resident CTAs, so the reduce runs on every SM instead of waiting for whole SMs."""
         self.norm_split = int(norm_split)
-        self.early_gate = bool(early_gate)
         if self.norm_split not in (1, 2, 4, 8):
             raise ValueError(f"norm_split must be 1, 2, 4 or 8, got {norm_split}.")
         self.producer_arrivals = None if producer_arrivals is None else int(producer_arrivals)
         if self.producer_arrivals is not None and not outlive_producer:
             raise ValueError("producer_arrivals refines outlive_producer.")
-        if self.early_gate and (self.producer_arrivals is None or self.norm_split == 1):
-            raise ValueError("early_gate needs producer_arrivals and norm_split > 1.")
         self.batch_invariant = bool(batch_invariant)
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
@@ -1024,22 +1015,6 @@ class TopkReduce:
         x = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
         tile_bytes = hidden_per_thread * cutlass.BFloat16.width // 8
 
-        if cutlass.const_expr(self.early_gate):
-            # Resident since the producer's entry: wait (one thread per row) until every producer CTA is through.
-            if (part == Int32(0)) & (thread_idx == Int32(0)):
-                counter = producer_done.iterator
-                while cute.arch.load(counter, Int32, sem="acquire", scope="gpu") < Int32(self.producer_arrivals):
-                    nanosleep(256)
-                consumed = producer_done.iterator + 1
-                old = cute.arch.atomic_add(consumed, Int32(1), sem="acq_rel", scope="gpu")
-                if old == cute.arch.grid_dim()[0] // Int32(split) - Int32(1):
-                    # Every row's gate has passed: re-arm both counts for the next call's producer.
-                    cute.arch.store(counter, Int32(0), sem="relaxed", scope="gpu")
-                    cute.arch.store(consumed, Int32(0), sem="relaxed", scope="gpu")
-                    cute.arch.fence_acq_rel_gpu()
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-
         # Every load that does not depend on another issues first: the routing (slot validity), the norm weight
         # and the first poll of every cell; only then the ballot waits for the routing. One load latency, not two.
         index_lane = lane_idx
@@ -1159,7 +1134,7 @@ class TopkReduce:
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
             store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
             cute.copy(store_atom, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
-        if cutlass.const_expr(self.outlive_producer and shared_term is None and not self.early_gate):
+        if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):
                 self._wait_producer(producer_done)
 
