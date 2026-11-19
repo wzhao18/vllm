@@ -1987,7 +1987,9 @@ def _vp_markov_keys(
     tl.atomic_max(keys_ptr + req, key)
     if PUBLISH:
         # The request's last program on this rank publishes the rank's key (never 0)
-        # into slot ``box_offset + req`` of every rank's mailbox and re-arms.
+        # into slot ``box_offset + req`` of every rank's mailbox and re-arms. A key
+        # is its own flag (nothing else is read through the mailbox): relaxed stores,
+        # no system-scope fence per peer.
         done = tl.atomic_add(count_ptr + req, 1, sem="acq_rel", scope="gpu")
         if done == programs - 1:
             final = tl.atomic_xchg(keys_ptr + req, 0, sem="acq_rel", scope="gpu")
@@ -1995,16 +1997,19 @@ def _vp_markov_keys(
             for r in tl.static_range(TP):
                 peer = tl.load(peers_ptr + r) + (box_offset + req) * 8
                 tl.atomic_xchg(
-                    peer.to(tl.pointer_type(tl.int64)), final, sem="release", scope="sys"
+                    peer.to(tl.pointer_type(tl.int64)),
+                    final,
+                    sem="relaxed",
+                    scope="sys",
                 )
 
 
 @triton.jit
 def _vp_take(slot):
     """A mailbox slot's key once a rank published it (never 0); re-arms the slot."""
-    got = tl.atomic_add(slot, 0, sem="acquire", scope="sys")
+    got = tl.atomic_add(slot, 0, sem="relaxed", scope="sys")
     while got == 0:
-        got = tl.atomic_add(slot, 0, sem="acquire", scope="sys")
+        got = tl.atomic_add(slot, 0, sem="relaxed", scope="sys")
     tl.atomic_xchg(slot, 0, sem="relaxed", scope="gpu")
     return got
 
@@ -2025,7 +2030,7 @@ def _vp_markov_select(
 ):
     req = tl.program_id(0)
     if POLL:
-        # This parity's mailbox [TP, num_reqs] (``gathered_ptr``): wait for every
+        # This position's mailbox [TP, num_reqs] (``gathered_ptr``): wait for every
         # rank's published key, then re-arm the slots (the keys re-armed already).
         best = _vp_take(gathered_ptr + req)
         for r in tl.static_range(1, TP):
@@ -2071,8 +2076,12 @@ class VocabParallelMarkov:
         self.batches: set[tuple[int, bool]] = set()
         self.buffers: dict[int, tuple] = {}
         # ``group`` (a process group, with ``cap`` = the largest batch): the keys'
-        # all-gather becomes peer stores into a mailbox [parity, TP, cap] polled by
-        # the select (one parity per draft position; no collective launch).
+        # all-gather becomes peer stores into a mailbox [steps, TP, cap] polled by
+        # the select (no collective launch). One mailbox per draft position: a peer
+        # reuses position k's slots only after its select of position k + 1 (or of
+        # the next run's first position), which waits for this rank's keys of that
+        # position, published after this rank consumed (re-armed) position k. Two
+        # parities would race at odd ``steps`` (position steps - 1, then 0 again).
         self.cap, self.box, self.peers = cap, None, None
         self.count = None
         if group is not None and tp > 1:
@@ -2081,13 +2090,16 @@ class VocabParallelMarkov:
 
             if cap <= 0:
                 raise ValueError("Markov drafting: a mailbox needs the largest batch")
-            box = symm_mem.empty((2, tp, cap), dtype=torch.int64, device=self.device)
+            slots = max(steps, 2)
+            box = symm_mem.empty(
+                (slots, tp, cap), dtype=torch.int64, device=self.device
+            )
             box.zero_()
             handle = peer_rendezvous(box, group)
             size = box[0].numel() * 8
             self.box = box
             self.peers = torch.tensor(
-                [[int(b) + p * size for b in handle.buffer_ptrs] for p in range(2)],
+                [[int(b) + p * size for b in handle.buffer_ptrs] for p in range(slots)],
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -2194,7 +2206,7 @@ class VocabParallelMarkov:
                 lo,
                 self.vocab_rank,
                 self.count if poll else keys,
-                self.peers[step % 2] if poll else keys,
+                self.peers[step] if poll else keys,
                 self.rank * self.cap,
                 grid[1],
                 SAMPLED=sampled,
@@ -2203,7 +2215,7 @@ class VocabParallelMarkov:
                 PUBLISH=poll,
             )
             _vp_markov_select[(batch,)](
-                self.box[step % 2] if poll else self.gather(keys),
+                self.box[step] if poll else self.gather(keys),
                 keys,
                 draft,
                 draft.stride(0),
