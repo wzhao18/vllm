@@ -10,6 +10,7 @@ gather (``--pred-us``: 672 128-thread CTAs that trigger PDL at entry and spin).
 """
 
 import argparse
+import re
 import sys
 import time
 import traceback
@@ -109,10 +110,12 @@ def main():
         print(f"R{rows} scaled_mm {t_stock:.2f} us/call (graph, {len(ws)} weight copies)",
               flush=True)  # fmt: skip
         for var in args.variants.split(","):
-            col, stg, ks = int(var[1]), int(var[3]), int(var[5])
-            dbg = int(var[7:]) if len(var) > 7 else 0
+            f = dict(re.findall(r"([a-z])(\d+)", var))  # c<col>s<stages>k<ksplit>[m<mc>][d<debug>]
+            col, stg, ks = int(f["c"]), int(f["s"]), int(f["k"])
+            mc, dbg = int(f.get("m", 1)), int(f.get("d", 0))
             try:
-                g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), debug=dbg)
+                g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
+                             debug=dbg)
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
