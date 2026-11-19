@@ -65,7 +65,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ...shapes import Choice, Path, Shape, Unsupported
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
-from . import flow, fused_ws, specialized
+from . import chain, flow, fused_ws, specialized
 from .fused import KdaFused
 from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
@@ -85,10 +85,10 @@ SP_SPEC_SCHEDULE = {24: ""}
 REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
-KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow")
+KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "chain")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide", "flow")
+FOLDS = ("fused", "fused_ws", "wide", "flow", "chain")
 MODES = ("deferred", "triton", "none")
 
 
@@ -169,7 +169,7 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFusedWS's shared memory does not fit")
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
-    if kind == "flow":
+    if kind in ("flow", "chain"):
         if not record or not 2 <= tokens <= 4:
             cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
             raise Unsupported("kda", shape, cause)
@@ -181,6 +181,12 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
         ctas = min(items, sms)
         if -(-items // ctas) > flow.max_items_per_cta(requests):
             raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
+        if kind == "chain":
+            if len(specs) != 20:  # with the record rows, pending counts, scratch
+                raise Unsupported("kda", shape, "KdaChain runs deferred records only")
+            return chain.KdaChain(
+                heads, tokens, mode, has_bias, *streamed, ctas, items, stages
+            )
         return flow.KdaFlow(heads, tokens, mode, has_bias, *streamed, ctas, stages)
     if kind == "ws":
         size = specialized.shared_bytes(tokens, *streamed, conv_size)
@@ -192,6 +198,24 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
         ctas = persistent_ctas(items, 2 * sms, 1)
         return KdaStream(heads, tokens, record, mode, has_bias, *streamed, ctas)
     raise Unsupported("kda", shape, f"unknown KDA core {kind!r}")
+
+
+_CHAIN_SCRATCH: dict = {}
+_CHAIN_RETIRED: list = []
+
+
+def chain_scratch(device, items, grow=True):
+    """KdaChain's operand-block scratch rows for items items: one buffer per
+    device shared by every layer (the layers run in stream order), sized at build."""
+    buffer = _CHAIN_SCRATCH.get(device)
+    if buffer is None or buffer.shape[0] < items:
+        if not grow:
+            raise Unsupported("kda", None, f"KdaChain scratch for {items} items")
+        shape = chain.scratch_shape(items)
+        buffer = torch.empty(shape, dtype=torch.float32, device=device)
+        _CHAIN_SCRATCH[device] = buffer  # (graphs captured on a smaller one keep it)
+        _CHAIN_RETIRED.append(buffer)
+    return buffer[:items]
 
 
 @cache
@@ -347,6 +371,11 @@ class SpKdaCore:
                 count = self.records[0].shape[0]  # one pending count per record slot
                 pending = torch.empty(count, dtype=torch.int32, **meta)
                 deferred = (torch.empty(n, dtype=torch.int32, **meta), pending)
+            if kind == "chain":
+                items = self.heads * n
+                chain_scratch(self.device, items)  # allocated before any capture
+                scratch = torch.empty(chain.scratch_shape(items), **meta)
+                deferred = (*deferred, scratch)
             operands = self._operands(caches, projected, slots, out, accepted, deferred)
             specs = tuple(map(layout, operands))
             if kind == "fused_ws" and not fits_fused_ws(specs, self.q, self.device):
@@ -384,6 +413,8 @@ class SpKdaCore:
             if self.kinds[rows] not in FOLDS:
                 deferred.flush()  # this core verifies from committed checkpoints
             extra = (deferred.record_rows[:n], deferred.pending)
+            if self.kinds[rows] == "chain":
+                extra = (*extra, chain_scratch(self.device, self.heads * n, grow=False))
         slots = slots[:n]
         if slots.stride() != (slots.shape[1], 1):  # e.g. an eager block-table slice
             slots = slots.contiguous()

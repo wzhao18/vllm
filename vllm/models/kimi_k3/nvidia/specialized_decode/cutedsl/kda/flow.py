@@ -762,13 +762,7 @@ class KdaFlow(KdaWS):
                           fd_s, destination, stored)  # fmt: skip
                 # The checkpoint left from registers: the warp's quarter of the slot
                 # (its own rows, read) is free for the next page at once.
-                fence_async_shared()
-                cute.arch.sync_warp()
-                if lane == 0:
-                    if j + SLOTS < count:
-                        self.load_quarter(args, pages, s, table, j + SLOTS,
-                                          state_full, warp)  # fmt: skip
-                cute.arch.sync_warp()
+                self.store_quarter(pages, s, destination, stored, warp, lane)
                 if cutlass.const_expr(self.trace):
                     td = clock64()
                     tr[3] = tr[3] + (td - tc)
@@ -777,6 +771,8 @@ class KdaFlow(KdaWS):
                     self.solve(values, g, betas, j, own, v_s, ce_s,
                                args[18][rec, head, None, None], po)  # fmt: skip
                     pm[0], pm[1], pm[2] = Int32(1), token, head
+                self.refill_quarter(args, pages, s, table, j, count, state_full, stored,
+                                    warp, lane)  # fmt: skip
                 # Each warp refills its own quarter of the slot once that quarter's
                 # checkpoint store has read it (no group barrier: thread c owns row
                 # c's outputs, which its epilogue thread reads).
@@ -809,6 +805,36 @@ class KdaFlow(KdaWS):
         cute.arch.sync_warp()
 
     # ------------------------------------------------------------------- scan
+    @cute.jit
+    def store_quarter(self, pages, s, destination, stored, warp, lane):
+        """The warp's committed rows (written in place by its scan) to the state
+        cache: one 16 KiB bulk store."""
+        rows: cutlass.Constexpr = COPY_BYTES // (K * 4)
+        fence_async_shared()
+        cute.arch.sync_warp()
+        if lane == 0:
+            if stored:
+                store_bulk_evict(at(destination, warp * rows, 0),
+                                 at(pages, s, warp * rows * K), COPY_BYTES)  # fmt: skip
+                bulk_commit()
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def refill_quarter(self, args, pages, s, table, j, count, state_full, stored,
+                       warp, lane):  # fmt: skip
+        """The warp's quarter of slot s gets item j + SLOTS's rows once its bulk
+        store has read them."""
+        if lane == 0:
+            if stored:
+                wait_bulk_reads()
+            if j + SLOTS < count:
+                self.load_quarter(args, pages, s, table, j + SLOTS, state_full, warp)
+        cute.arch.sync_warp()
+
+    def store_vec(self, pointer, values):
+        """The prep's 4-key scan vector chunk into its operand block."""
+        store_shared_f32x4(pointer, values)
+
     def pfma(self, a, b, c):
         """Lanewise a * b + c of FP32 pairs (packed, or two FFMAs: the same bits)."""
         if self.packed:
@@ -877,8 +903,8 @@ class KdaFlow(KdaWS):
                                              (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
                             acc[rr, 2 * p], acc[rr, 2 * p + 1] = pair
                 if cutlass.const_expr("store" not in self.skip):  # noqa: SIM102
-                    if stored:
-                        store_global_f32x4(at(destination, base + rr, key), new)
+                    if stored:  # in place: the warp's quarter leaves by one bulk store
+                        store_shared_f32x4(address, new)
             if cutlass.const_expr(ch % self.fold_fence == self.fold_fence - 1):
                 cute.arch.sync_warp()  # bounds ptxas's load hoisting (spills)
 
@@ -1116,7 +1142,7 @@ class KdaFlow(KdaWS):
             chunk, lane_in, e = c // (4 * LANES), (c // 4) % LANES, c % 4
             for h in cutlass.range_constexpr(NV // 4):
                 pos = (((chunk * 4 + e) * (NV // 4) + h) * LANES + lane_in) * 4
-                store_shared_f32x4(at(xv, blk, pos), [vec[4 * h + i] for i in range(4)])
+                self.store_vec(at(xv, blk, pos), [vec[4 * h + i] for i in range(4)])
             if cutlass.const_expr(self.trace):
                 q5 = clock64()
             # The couplings, normalized (thread i: coupling i; one select chain, no

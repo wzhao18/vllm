@@ -40,10 +40,11 @@ def core_of(kind, attention, rows, records, caches):
     return core
 
 
+@pytest.mark.parametrize("kind", ["flow", "chain"])
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("n", [3, 33, 96, 128])
-def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
+def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, kind, monkeypatch):
     monkeypatch.setattr(flow, "max_stages", lambda *args: stages)
     sp.executable.cache_clear()
     rows, slots = Q * n, 2 * n + 2
@@ -68,7 +69,7 @@ def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
         ),
     )
     ref_core = core_of("ws", stock, rows, "triton", ref_kv)
-    core = core_of("flow", ours, rows, "deferred", kv)
+    core = core_of(kind, ours, rows, "deferred", kv)
     projected = torch.empty(rows, kda.PITCH, dtype=torch.bfloat16, device=kda.DEVICE)
     out, ref_out = (
         torch.empty(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE)
