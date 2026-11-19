@@ -879,3 +879,26 @@ def qkv_conv(
         _qkv_conv_warps(dim, num_tokens),
     )
     return out
+
+
+def qkv_conv_state(
+    x: torch.Tensor,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    null_block_id: int | None = NULL_BLOCK_ID,
+) -> None:
+    """The conv state update of qkv_conv alone (same state, bit for bit), for a
+    prefill whose core convolves the raw Q|K|V columns itself and reads the old state
+    there (ops/frost_kda): run it after that core."""
+    _load_qkv_conv()
+    torch.ops.k3_kda_conv.qkv_conv_state(
+        x,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        conv_states.size(1),
+        null_block_id if null_block_id is not None else -1,
+    )

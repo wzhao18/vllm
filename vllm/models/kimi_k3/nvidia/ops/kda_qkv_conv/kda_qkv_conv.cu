@@ -578,12 +578,70 @@ void qkv_conv(torch::Tensor const& x, torch::Tensor const& weight, torch::Tensor
   return dispatch<__nv_bfloat16, false>(p, tokens, static_cast<int>(warps), stream);
 }
 
+// Conv state update alone, for the fused FROST prefill (vendored frost_kda) that convolves in its q/k/v
+// load path and reads the old state there: the same state as qkv_conv writes, run after that kernel.
+// One thread per (sequence, 8 channels).
+template <typename StateT>
+__global__ void qkv_conv_state_kernel(const Params p, int dim) {
+  const int seq = blockIdx.y;
+  const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * kVec;
+  if (c0 >= dim) return;
+  const int line = p.cache_indices[seq * p.ci_s0];
+  if (p.has_null_block && line == p.null_block_id) return;
+  const int seq_start = p.qsl[seq];
+  const int seqlen = p.qsl[seq + 1] - seq_start;
+  if (seqlen <= 0) return;
+  float hist[3][kVec];
+  begin_seq<StateT>(p.x + c0, p.ldx, static_cast<StateT*>(p.state) + line * p.st_s0 + c0 * p.st_s1, p.st_s1, p.st_s2,
+                    p.has_initial_state[seq], seq_start, seqlen, hist);
+}
+
+void qkv_conv_state(torch::Tensor const& x, torch::Tensor& conv_states, torch::Tensor const& query_start_loc,
+                    torch::Tensor const& cache_indices, torch::Tensor const& has_initial_state, int64_t dim,
+                    int64_t null_block_id) {
+  const int num_seqs = query_start_loc.size(0) - 1;
+  if (x.size(0) == 0 || num_seqs == 0) return;
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && dim % kVec == 0, "k3 qkv conv state: x");
+  TORCH_CHECK(query_start_loc.scalar_type() == at::kInt && cache_indices.scalar_type() == at::kInt &&
+                  has_initial_state.scalar_type() == at::kBool,
+              "k3 qkv conv state: metadata dtypes");
+  Params p{};
+  p.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+  p.state = conv_states.data_ptr();
+  p.cache_indices = cache_indices.data_ptr<int32_t>();
+  p.has_initial_state = has_initial_state.data_ptr<bool>();
+  p.qsl = query_start_loc.data_ptr<int32_t>();
+  p.ldx = x.stride(0);
+  p.st_s0 = conv_states.stride(0);
+  p.st_s1 = conv_states.stride(1);
+  p.st_s2 = conv_states.stride(2);
+  p.ci_s0 = cache_indices.stride(0);
+  p.num_seqs = num_seqs;
+  p.null_block_id = static_cast<int>(null_block_id);
+  p.has_null_block = null_block_id >= 0;
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
+  const dim3 grid(static_cast<unsigned>((dim / kVec + 127) / 128), static_cast<unsigned>(num_seqs));
+  if (conv_states.scalar_type() == at::kFloat) {
+    qkv_conv_state_kernel<float><<<grid, 128, 0, stream>>>(p, static_cast<int>(dim));
+  } else {
+    TORCH_CHECK(conv_states.scalar_type() == at::kBFloat16, "k3 qkv conv state: state dtype");
+    qkv_conv_state_kernel<__nv_bfloat16><<<grid, 128, 0, stream>>>(p, static_cast<int>(dim));
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace k3conv
 
 TORCH_LIBRARY_FRAGMENT(k3_kda_conv, m) {
   m.def(
       "qkv_conv(Tensor x, Tensor weight, Tensor(a!) conv_states, Tensor query_start_loc, Tensor cache_indices, "
       "Tensor has_initial_state, Tensor(b!) out, int null_block_id, int warps) -> ()");
+  m.def(
+      "qkv_conv_state(Tensor x, Tensor(a!) conv_states, Tensor query_start_loc, Tensor cache_indices, "
+      "Tensor has_initial_state, int dim, int null_block_id) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(k3_kda_conv, CUDA, m) { m.impl("qkv_conv", &k3conv::qkv_conv); }
+TORCH_LIBRARY_IMPL(k3_kda_conv, CUDA, m) {
+  m.impl("qkv_conv", &k3conv::qkv_conv);
+  m.impl("qkv_conv_state", &k3conv::qkv_conv_state);
+}
