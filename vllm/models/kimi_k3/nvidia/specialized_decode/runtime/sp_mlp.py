@@ -13,7 +13,9 @@ call:
   shared gate_up -> SiTU -> down                   shared_gu [12288, 7168] -> the stock
                                                    act -> shared_down [7168, 6144]
   latent RMSNorm, up with the shared beta-add      the stock norm -> latent_up
-                                                   (``residual.addmm_``, torch kinds)
+                                                   (``residual.addmm_``, torch kinds);
+                                                   on the Rubin MegaMoE the norm runs in
+                                                   its top-k reduce (stock rms_norm math)
 
 Same streams and events as stock, the same operands, FP32 accumulation and one BF16
 rounding per GEMM (the beta-add adds the BF16 shared output in FP32 before its one
@@ -144,6 +146,16 @@ class SpMlp:
             self.inter2 = weights["shared_gu"].shape[0]
             self.hidden = weights["shared_down"].shape[0]
         self.threshold = _stock_threshold()
+        # Rubin MegaMoE: the latent RMSNorm folds into the kernel's top-k reduce (one
+        # kernel and one [n, latent] round trip fewer per layer); compiled here, before
+        # capture. Other MegaMoE backends keep the separate stock norm.
+        self.fused_norm = None
+        norm = transform.norm
+        if norm is not None and _rubin_megamoe(mlp.experts):
+            from ...megamoe_rubin.experts import prepare_output_rmsnorm
+
+            prepare_output_rmsnorm(mlp.experts, norm)
+            self.fused_norm = norm
 
     def choices(self, n):
         """The four GEMM families' choices at ``n`` shard rows."""
@@ -178,21 +190,36 @@ class SpMlp:
             mlp._down_proj_events[1],
             mlp._down_proj_stream if n <= self.threshold else None,
         )
+        fused_norm = self.fused_norm
+
+        def experts():
+            if fused_norm is None:
+                return mlp.experts(routed, router_output, topk_ids)
+            return mlp.experts(
+                routed, router_output, topk_ids, output_rmsnorm=fused_norm
+            )
+
         if mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
-                lambda: mlp.experts(routed, router_output, topk_ids),
+                experts,
                 lambda: self._shared(h),
                 mlp._shared_events[0],
                 mlp._shared_events[1],
                 mlp._shared_stream,
             )
         else:
-            final = mlp.experts(routed, router_output, topk_ids)
+            final = experts()
             shared_out = self._shared(h)
         norm = mlp.routed_output_transform.norm
-        if norm is not None:
+        if norm is not None and fused_norm is None:
             final = norm(final)
         return gemms["latent_up"].run(final, residual=shared_out)
+
+
+def _rubin_megamoe(experts) -> bool:
+    from ...megamoe_rubin.experts import KimiK3MegaMoEExperts
+
+    return isinstance(experts, KimiK3MegaMoEExperts)
 
 
 def moe_choice(mlps, n):

@@ -197,6 +197,8 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
         topk_indices: Optional[cute.Tensor] = None,
+        rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a (VENDOR.md)
+        rmsnorm_eps: Optional[Float32] = None,
     ):
         if cutlass.const_expr(topk_indices is not None):
             if cutlass.const_expr(self.num_experts is None):
@@ -219,6 +221,18 @@ class TopkReduce:
                 topk_score.iterator, cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride)
             )
 
+        if cutlass.const_expr(rmsnorm_weight is not None):
+            # vLLM-local E2a: reduce + the consumer's RMSNorm in one kernel (one CTA per token row).
+            if cutlass.const_expr(self.combine_format.is_quantized or self.batch_invariant):
+                raise ValueError("the fused RMSNorm reduce takes the BF16 combine (not batch-invariant) only.")
+            norm_threads = (self.hidden_tiles + 31) // 32 * 32
+            if cutlass.const_expr(norm_threads > 1024):
+                raise ValueError(f"fused RMSNorm reduce: hidden {self.hidden} needs more than 1024 threads.")
+            rmsnorm_weight = cute.make_tensor(rmsnorm_weight.iterator, cute.make_layout((self.hidden,)))
+            self._reduce_bf16_rmsnorm(
+                combine_quant, topk_score, reduced_output, rmsnorm_weight, rmsnorm_eps, topk_indices
+            ).launch(grid=[reduced_output.shape[0], 1, 1], block=[norm_threads, 1, 1], stream=stream, use_pdl=True)
+            return
         if cutlass.const_expr(not self.combine_format.is_quantized):
             self._reduce_bf16(combine_quant, topk_score, reduced_output, topk_indices).launch(grid=grid, block=block, stream=stream)
             return
@@ -370,6 +384,106 @@ class TopkReduce:
                 out,
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
+
+    @cute.kernel
+    def _reduce_bf16_rmsnorm(
+        self,
+        combine_output: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        rmsnorm_weight: cute.Tensor,
+        rmsnorm_eps: Float32,
+        topk_indices: Optional[cute.Tensor] = None,
+    ):
+        """vLLM-local E2a: ``_reduce_bf16`` of one token row per CTA (thread = one 8-wide hidden tile, the same
+        per-element FP32 top-k order), then the stock vLLM ``rms_norm`` of the BF16-rounded row: FP32 sum of
+        squares of the BF16 values, ``s = rsqrt(sum / hidden + eps)``, ``out = bf16(x * s * w)``. Writes only the
+        normalized row (its sole consumer). PDL-launched behind the MegaMoE kernel."""
+        hidden_per_thread = self.hidden_per_thread
+        num_topk: cutlass.Constexpr[int] = self.num_topk
+        prefetch = self.prefetch
+        out_dtype = reduced_output.element_type
+        warps: cutlass.Constexpr[int] = (self.hidden_tiles + 31) // 32
+
+        token_idx = cute.arch.block_idx()[0]
+        thread_idx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.make_warp_uniform(thread_idx // Int32(32))
+        lane_idx = thread_idx % Int32(32)
+        hidden_tile_idx = thread_idx
+        active = thread_idx < Int32(self.hidden_tiles)
+
+        smem = cutlass.utils.SmemAllocator()
+        partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
+
+        score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
+        score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+        acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+        acc.fill(0)
+        x = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+        load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
+        tile_bytes = hidden_per_thread * cutlass.BFloat16.width // 8
+
+        cute.arch.griddepcontrol_wait()
+        sumsq = Float32(0)
+        if active:
+            terms = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))[
+                (None, None), (0, hidden_tile_idx)
+            ]
+            if cutlass.const_expr(topk_score is not None):
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
+            else:
+                for k in cutlass.range_constexpr(num_topk):
+                    score_reg[k] = score_dtype(1)
+            for k in cutlass.range_constexpr(0, num_topk, 1):
+                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                if cutlass.const_expr(topk_indices is not None):
+                    expert = topk_indices[token_idx, Int32(k)]
+                    valid_route = (expert >= 0) & (expert < self.num_experts)
+                    term.fill(0)
+                    if valid_route:
+                        cute.copy(load_atom, mark_alignment(terms[k, None], tile_bytes), term)
+                else:
+                    cute.copy(load_atom, mark_alignment(terms[k, None], tile_bytes), term)
+                if cutlass.const_expr(topk_score is not None and not prefetch):
+                    score_reg[k] = topk_score[token_idx, Int32(k)]
+                if cutlass.const_expr(topk_indices is not None):
+                    if not valid_route:
+                        score_reg[k] = score_dtype(0)
+                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                    if cutlass.const_expr(k != 0):
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, score_pair, (acc[i], acc[i + 1]))
+                    else:
+                        if cutlass.const_expr(topk_score is not None):
+                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(value_pair, score_pair)
+                        else:
+                            acc[i] = value_pair[0]
+                            acc[i + 1] = value_pair[1]
+            x.store(acc.load().to(out_dtype))
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                xf = Float32(x[i])
+                sumsq = sumsq + xf * xf
+        for shift in cutlass.range_constexpr(5):
+            sumsq = sumsq + cute.arch.shuffle_sync_bfly(sumsq, 16 >> shift)
+        if lane_idx == Int32(0):
+            partial[warp_idx] = sumsq
+        cute.arch.sync_threads()
+        total = Float32(0)
+        for w in cutlass.range_constexpr(warps):
+            total = total + partial[w]
+        scale = cute.math.rsqrt(total / Float32(self.hidden) + rmsnorm_eps, fastmath=True)
+        if active:
+            weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
+            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+            cute.copy(load_atom, mark_alignment(wsrc, tile_bytes), weight)
+            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                out[i] = out_dtype(Float32(x[i]) * scale * Float32(weight[i]))
+            dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+            cute.copy(store_atom, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
 
     @cute.kernel
     def _reduce_mxfp8(

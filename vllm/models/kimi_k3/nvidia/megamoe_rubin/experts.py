@@ -851,9 +851,14 @@ class KimiK3MegaMoEExperts(nn.Module):
         topk_ids: torch.Tensor,
         shared_experts: nn.Module | None = None,
         is_padding: torch.Tensor | None = None,
+        output_rmsnorm: nn.Module | None = None,
     ) -> torch.Tensor:
         """Run the routed experts (and an unfused ``shared_experts``) on this rank's
         tokens; arguments and result as :meth:`DeepGemmMegaMoEExperts.forward`.
+
+        ``output_rmsnorm``: the routed output's consumer RMSNorm (the latent norm), applied
+        inside the kernel's top-k reduce (result = ``output_rmsnorm(routed output)``,
+        stock ``rms_norm`` numerics); :meth:`prepare_output_rmsnorm` it before capture.
 
         ``topk_weights`` carry ``routed_scaling_factor``; padding rows (``is_padding``
         or the forward context's under ``VLLM_MOE_SKIP_PADDING``) are masked to -1.
@@ -904,6 +909,11 @@ class KimiK3MegaMoEExperts(nn.Module):
             )
 
         # Without EPLB the padding mask is folded into the stager launch.
+        rmsnorm = None
+        if output_rmsnorm is not None:
+            if shared_experts is not None:
+                raise ValueError("output_rmsnorm with an unfused shared expert is not supported.")
+            rmsnorm = _rmsnorm_args(output_rmsnorm)
         y = self.get_runtime().forward(
             hidden_states,
             topk_ids,
@@ -913,10 +923,34 @@ class KimiK3MegaMoEExperts(nn.Module):
             is_padding=is_padding,
             owner=self.prefix,
             ep_tokens=self.ep_tokens(num_tokens),
+            rmsnorm=rmsnorm,
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y
+
+
+def _rmsnorm_args(norm: nn.Module) -> tuple[torch.Tensor, float]:
+    """``(weight, eps)`` of a plain weighted vLLM ``RMSNorm`` (no residual, no variance
+    override) for the fused reduce; anything else raises (never a silent fallback)."""
+    weight = getattr(norm, "weight", None)
+    if (
+        weight is None
+        or not getattr(norm, "has_weight", True)
+        or getattr(norm, "variance_size_override", None) is not None
+        or weight.dtype != torch.bfloat16
+        or weight.dim() != 1
+    ):
+        raise ValueError(f"cannot fuse {type(norm).__name__} into the MegaMoE reduce.")
+    return weight.data, float(norm.variance_epsilon)
+
+
+def prepare_output_rmsnorm(experts: nn.Module, norm: nn.Module) -> None:
+    """Compile ``experts``' fused-RMSNorm reduce for ``norm`` (before CUDA graph capture)."""
+    weights = experts.kernel_weights
+    if weights is None:
+        raise RuntimeError(f"{experts.prefix}: prepare_output_rmsnorm before weight preparation.")
+    experts.get_runtime().prepare_rmsnorm(weights, *_rmsnorm_args(norm))
 
 
 KimiK3MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
