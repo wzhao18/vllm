@@ -64,6 +64,7 @@ from .config import (
     SHIPPED_KNOBS,
     QuantKind,
     RubinBucket,
+    RubinKnobs,
     RubinMoeConfig,
     RubinMoeProblem,
     Variant,
@@ -120,6 +121,23 @@ RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 # FlashInfer a368c5f66, hint 64, CUDA graph): capacity 128 / N128 at 32 / 96 / 128
 # live tokens 44.9 / 47.8 / 50.7 us vs capacity 256 / N256 51.0 / 52.8 / 55.9 us.
 RUBIN_WIDE_EP_DECODE_TOKENS = 128
+
+# The wide-EP decode bucket with the fused MXFP8 shared expert (enable_fused_shared):
+# the refreshed GenPhase kernel (src_gp) on its decode scheduler; die_aware expert_half
+# when the bucket is die-local.
+RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RubinKnobs(
+    mma_tiler_mnk=(256, 128, 256),
+    cluster_shape_mn=(4, 1),
+    fallback_cluster_shape_mn=None,
+    schedule_policy=("decode", None),
+    work_id_mode="atomic_counter",
+    fc2_use_bulk=True,
+    fc2_tma_stages=2,
+    epi_flag_batches=(1, 4),
+    token_in_flag_batch=1,
+    token_back_mode="epi_warps",
+    reduce_topk_in_kernel=False,
+)
 
 
 def rubin_bucket_capacities(
@@ -677,6 +695,49 @@ class KimiK3MegaMoEExperts(nn.Module):
         # shard of its DP batch (sequence_parallel_chunk).
         self.sequence_parallel = True
 
+    def enable_fused_shared(self, hidden: int, intermediate: int) -> bool:
+        """Switch this layer's wide-EP decode bucket (``RUBIN_WIDE_EP_DECODE_TOKENS``
+        tokens per rank, the D3-32 SP shard) to the refreshed GenPhase kernel with an
+        MXFP8 E4M3 shared expert of ``(hidden, intermediate)`` fused in (its FC1 tiles
+        run under the dispatch; the side-stream shared expert then has nothing left
+        to overlap). Per-shape: larger buckets keep their kernel. Returns whether a
+        bucket switched. Same call on every layer of the EP group (the buckets key
+        the runtime); then :meth:`warmup_fused_shared` before CUDA graph capture."""
+        if self.prefill_worker:
+            return False
+        switched = False
+        buckets = []
+        for bucket in self.buckets:
+            if (
+                bucket.variant == "inference"
+                and bucket.max_tokens <= RUBIN_WIDE_EP_DECODE_TOKENS
+                and self.problem.quant_kind == "nvfp4"
+            ):
+                bucket = dataclasses.replace(
+                    bucket,
+                    variant="genphase",
+                    knobs=RUBIN_GENPHASE_FUSED_SHARED_KNOBS,
+                    max_sm_count=None,
+                    shared=(hidden, intermediate),
+                )
+                switched = True
+            buckets.append(bucket)
+        self.buckets = tuple(buckets)
+        self.bucket = self.buckets[-1]
+        return switched
+
+    def fused_shared(self, num_tokens: int) -> bool:
+        """Whether a forward of ``num_tokens`` runs the fused shared expert (it then
+        takes ``fused_shared=``)."""
+        return self.select_bucket(num_tokens).shared is not None
+
+    def warmup_fused_shared(self, shared) -> None:
+        """Collective: build, compile and warm the fused-shared runtime with one
+        layer's ``session.FusedSharedArgs``."""
+        if self.kernel_weights is None:
+            raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
+        self.get_runtime().warmup(self.kernel_weights, shared=shared)
+
     # -- runtime / kernel layout -----------------------------------------------------
 
     def get_runtime(self) -> RubinMegaMoE:
@@ -860,7 +921,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         out: torch.Tensor | None = None,
         ep_tokens: int | None = None,
         output_rmsnorm: nn.Module | None = None,
-    ) -> torch.Tensor:
+        fused_shared=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the routed experts (and an unfused ``shared_experts``) on this rank's
         tokens; arguments and result as :meth:`DeepGemmMegaMoEExperts.forward`.
 
@@ -925,6 +987,12 @@ class KimiK3MegaMoEExperts(nn.Module):
             if shared_experts is not None:
                 raise ValueError("output_rmsnorm with an unfused shared expert is not supported.")
             extra["rmsnorm"] = _rmsnorm_args(output_rmsnorm)
+        if fused_shared is not None:
+            if shared_experts is not None or bucket.shared is None:
+                raise ValueError(f"{self.prefix}: no fused shared expert at {num_tokens} tokens.")
+            extra["shared"] = fused_shared
+        elif bucket.shared is not None:
+            raise ValueError(f"{self.prefix}: the {bucket.max_tokens} bucket fuses the shared expert.")
         y = self.get_runtime().forward(
             hidden_states,
             topk_ids,
