@@ -449,7 +449,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       __syncthreads();
       if constexpr (kFast) {
         for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
-        if (tid < kV2Win) { hist[kV2Fine + kV2Win + tid] = 0; win[tid] = 0; }
+        // (window counts: assigned whole by the fast path; win aliases the SMEM row here)
+        if (tid < kV2Win) hist[kV2Fine + kV2Win + tid] = 0;
         if (tid == 0) s_e = -1;
       }
     }
@@ -745,6 +746,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (K31_RARE(!fast)) {
       if constexpr (kFast) {  // tier 3 on every rank, then the complete body
         if (tid == 0) { s_sat = 1u; s_above = 0u; s_lo = 0; }
+        for (int b = tid; b < kV2Win; b += kV2T) win[b] = 0;  // (not zeroed after theta)
       } else {
       V2STAT(5);
       // the same message from passes over every key: coarse histogram, the coarse bin of
