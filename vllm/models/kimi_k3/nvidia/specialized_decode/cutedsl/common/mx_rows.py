@@ -107,17 +107,24 @@ def quantize8(values):
 
 
 @cute.jit
-def quantize1(value):
-    """One BF16-exact FP32 ``value`` per lane, the warp's 32 lanes one 32-wide
-    MXFP8 block -> (this lane's E4M3 byte, the block's E8M0 scale), as
-    ``quantize8``. Warp-collective."""
-    amax = max_abs(Float32(0), value)
-    for i in cutlass.range_constexpr(5):
-        amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 16 >> i))
+def quantize8_plain(values):
+    """``quantize8`` for plain (non-Lamport) stores: (data word 0, data word 1, this
+    lane's block scale) with ``ops.mxfp8_act``'s quant8_store bits (-0 bytes kept).
+    Every lane of 4 adjacent ones holds the scale; lane & 3 == 0 stores it.
+    Warp-collective."""
+    amax = Float32(0)
+    for i in cutlass.range_constexpr(8):
+        amax = max_abs(amax, values[i])
+    amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 1))
+    amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 2))
     e = ue8m0(amax * bits_float(Uint32(INV_448)))
     inv = bits_float(inverse_scale_bits(e))
-    zero = Float32(0)
-    return pack_fp8((value * inv, zero, zero, zero)) & Uint32(0xFF), e
+    q = cute.make_rmem_tensor(8, Float32)
+    for i in cutlass.range_constexpr(8):
+        q[i] = values[i] * inv
+    w0 = pack_fp8((q[0], q[1], q[2], q[3]))
+    w1 = pack_fp8((q[4], q[5], q[6], q[7]))
+    return w0, w1, e
 
 
 def scale_offset(row, block, padded_cols: cutlass.Constexpr[int]):

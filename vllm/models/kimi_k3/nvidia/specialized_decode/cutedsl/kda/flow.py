@@ -65,6 +65,7 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 
 from ..common import mx_rows
+
 from ..common.primitives import (
     alloc,
     asm,
@@ -73,7 +74,9 @@ from ..common.primitives import (
     fma,
     fma2,
     launch,
+    load_bf16x8,
     mma_into,
+    store_words,
     try_wait,
     wait,
     warp_sum,
@@ -258,8 +261,9 @@ class KdaFlow(KdaWS):
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
-        # MXFP8 output (the online-MXFP8 o_proj's input): args[10] holds the E4M3
-        # bytes [R, D] and one more operand after the others the F8_128x4 scales.
+        # MXFP8 output (``quantize_outputs``): two more operands after the others,
+        # the E4M3 bytes [R, D] and the F8_128x4 scales of the online-MXFP8
+        # o_proj's input.
         self.mx = mx
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
         self.fold_fence = FOLD_FENCE
@@ -271,24 +275,43 @@ class KdaFlow(KdaWS):
 
     def folds(self, args):
         """Whether the deferred operands (record rows, pending counts) follow."""
-        return len(args) - (1 if self.mx else 0) > 20
+        return len(args) - (2 if self.mx else 0) > 20
 
     @cute.jit
-    def store_output(self, args, row, col, value):
-        """Output ``value`` (BF16-rounded) of channel ``col`` of ``row``: BF16, or
-        (``mx``) quantized to MXFP8 as ``ops.mxfp8_act.quantize`` quantizes the BF16
-        output (each warp's 32 lanes hold one 32-wide block). Warp-collective."""
-        output = args[10]
-        if cutlass.const_expr(self.mx):
-            byte, e = mx_rows.quantize1(Float32(value))
-            output[row, col] = Uint8(byte)
-            if cute.arch.lane_idx() == 0:
-                width: cutlass.Constexpr = self.heads * K
-                where = mx_rows.scale_offset(row, col // mx_rows.BLOCK,
-                                             width // mx_rows.BLOCK)  # fmt: skip
-                args[len(args) - 1][where] = Uint8(e)
-        else:
-            output[row, col] = value
+    def quantize_outputs(self, args, tid, count, table):
+        """``mx``: after both groups stored their items' BF16 outputs (the caller's
+        CTA barrier makes them visible), the CTA quantizes its items' output rows
+        into the MXFP8 o_proj input, ``ops.mxfp8_act.quantize`` bit for bit (4
+        lanes per 32-wide block, 8 columns each: its quant8_store). Off the item
+        chains: the scan loop is unchanged."""
+        output, data, scale = args[10], args[len(args) - 2], args[len(args) - 1]
+        T: cutlass.Constexpr = self.tokens
+        width: cutlass.Constexpr = self.heads * K
+        units: cutlass.Constexpr = T * (K // 8)  # 8-column lane units per item
+        lanes = count * units
+        for it in cutlass.range((lanes + THREADS - 1) // THREADS, unroll=1):
+            unit = it * THREADS + tid
+            live = unit < lanes
+            j = unit // units
+            if unit >= lanes:
+                j = Int32(0)
+            within = unit % units
+            row = table[j, REQUEST] * T + within // (K // 8)
+            col = table[j, HEAD] * K + (within % (K // 8)) * 8
+            values = cute.make_rmem_tensor(8, Float32)
+            for i in cutlass.range_constexpr(8):
+                values[i] = Float32(0)
+            if live:
+                loaded = load_bf16x8(at(output, row, col), mutable=True)
+                for i in cutlass.range_constexpr(8):
+                    values[i] = loaded[i]
+            w0, w1, e = mx_rows.quantize8_plain(values)
+            if live:
+                store_words(at(data, row, col), (w0, w1))
+                if tid % 4 == 0:
+                    where = mx_rows.scale_offset(row, col // mx_rows.BLOCK,
+                                                 width // mx_rows.BLOCK)  # fmt: skip
+                    scale[where] = Uint8(e)
 
     # ---------------------------------------------------------------- helpers
     @cute.jit
@@ -627,6 +650,9 @@ class KdaFlow(KdaWS):
             self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
                              buffers, ops, outs, sums_g, state_full,
                              stage_full + g, k0)  # fmt: skip
+        if cutlass.const_expr(self.mx):
+            cute.arch.barrier()  # both groups' outputs stored
+            self.quantize_outputs(args, tid, count, table)
 
     @cute.jit
     def gate_projection(self, tid, count, h0, table, fbs, fas, raw):
@@ -695,7 +721,7 @@ class KdaFlow(KdaWS):
                     buffers, ops, outs, sums_g, state_full, stage_full, k0):  # fmt: skip
         xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
         (kgo,) = outs
-        state = args[9]
+        state, output = args[9], args[10]
         T: cutlass.Constexpr = self.tokens
         NV: cutlass.Constexpr = 2 * T
         H: cutlass.Constexpr = self.heads
@@ -814,7 +840,7 @@ class KdaFlow(KdaWS):
             else:
                 self.release_slot(args, c, j, count, pages, table, state_full, False)
                 for t in cutlass.range_constexpr(T):
-                    self.store_output(args, token + t, head * K + c, BFloat16(0))
+                    output[token + t, head * K + c] = BFloat16(0)
         if pm[0] != 0:  # the group's last item
             self.finish_alone(args, g, c, sums_g[0], po, pg, pm, nw)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
@@ -956,7 +982,7 @@ class KdaFlow(KdaWS):
         """Gated RMSNorm of the group's previous item (thread c: channel c of every
         token) from its squares' block sums sums[at_sum + t] (synced by the caller);
         the outputs leave from registers."""
-        eps = args[15]
+        eps, output = args[15], args[10]
         T: cutlass.Constexpr = self.tokens
         token, head = pm[1], pm[2]
         for t in cutlass.range_constexpr(T):
@@ -965,7 +991,7 @@ class KdaFlow(KdaWS):
             rstd = reciprocal(sqrt_approx(variance))
             sigmoid_gate = triton_sigmoid(pg[t])
             result = po[t] * rstd * nw * sigmoid_gate
-            self.store_output(args, token + t, head * K + c, BFloat16(result))
+            output[token + t, head * K + c] = BFloat16(result)
 
     @cute.jit
     def finish_alone(self, args, g, c, sums, po, pg, pm, nw):

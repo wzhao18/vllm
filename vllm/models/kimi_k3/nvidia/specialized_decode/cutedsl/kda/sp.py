@@ -142,7 +142,7 @@ def fits_fused_ws(specs, tokens, device):
     return size <= min(fused_ws.SMEM_LIMIT, smem_limit(device))
 
 
-def make_core(kind, specs, heads, tokens, record, has_bias, device):
+def make_core(kind, specs, heads, tokens, record, has_bias, device, mx=False):
     """The kernel object of ``kind`` for a step's operand layouts ``specs`` (no GPU
     work); raises ``Unsupported`` where the kind cannot run them."""
     requests = specs[0][0][0] // tokens
@@ -150,7 +150,6 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
     props = torch.cuda.get_device_properties(device)
     sms, limit = props.multi_processor_count, smem_limit(device)
     shape = Shape(requests * tokens, tokens)
-    mx = specs[10][2] == torch.uint8  # MXFP8 output bytes (+ scales operand)
     if mx and kind != "flow":
         raise Unsupported("kda", shape, f"{kind}: no MXFP8 output (KdaFlow only)")
     if kind == "split":
@@ -200,9 +199,9 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
 
 
 @cache
-def executable(specs, kind, heads, tokens, record, has_bias, device):
+def executable(specs, kind, heads, tokens, record, has_bias, device, mx=False):
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
-    kernel = make_core(kind, specs, heads, tokens, record, has_bias, device)
+    kernel = make_core(kind, specs, heads, tokens, record, has_bias, device, mx)
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
         return cute.compile(
@@ -271,10 +270,12 @@ class SpKdaCore:
 
         self.conv_dim_first = is_conv_state_dim_first()
         self.kinds, self.kernels, self.specs = {}, {}, {}
-        # Rows whose core writes the online-MXFP8 o_proj's input itself (``mx_out``:
+        # Rows whose core also writes the online-MXFP8 o_proj's input (``mx_out``:
         # E4M3 bytes + F8_128x4 scales, ``ops.mxfp8_act.quantize`` of its BF16
-        # output) instead of BF16 for a standalone quantization: KdaFlow's rows.
+        # output, KdaFlow.quantize_outputs) instead of a standalone quantization
+        # kernel: KdaFlow's rows. Their BF16 output goes to ``self.staged``.
         self.mx_rows: frozenset = frozenset()
+        self.staged = None
         self.plain = None
         if records == "none":
             if getattr(attention, "recoverssm_records", None) is not None:
@@ -310,6 +311,10 @@ class SpKdaCore:
             self.kinds[r] = kind
         if mx_out:
             self.mx_rows = frozenset(r for r in self.rows if self.kinds[r] == "flow")
+        if self.mx_rows:
+            self.staged = torch.empty(
+                (max(self.mx_rows), self.dim), dtype=torch.bfloat16, device=dt
+            )
 
     def writes_mxfp8(self, rows) -> bool:
         """Whether ``run`` at ``rows`` takes an MXFP8 ``out`` (``mx_out``)."""
@@ -326,10 +331,11 @@ class SpKdaCore:
         norm.copy_(self.layer.o_norm.weight)
 
     def _operands(self, caches, projected, slots, out, accepted, deferred=(),
-                  scale=None):  # fmt: skip
+                  mx=()):  # fmt: skip
         """Kernel tensors in launch order (upstream ``PreparedKda._operands``): 13
         before the scalars, then F_B, the accepted counts, the records, (deferred)
-        the record rows and pending counts and (MXFP8 ``out``) its scales."""
+        the record rows and pending counts and (``mx``) the MXFP8 output's bytes
+        and scales."""
         conv, state = caches[:2]
         conv = conv if self.conv_dim_first else conv.transpose(-1, -2)
         w, bias, fb, a_log, dt, norm = self.weights
@@ -337,7 +343,7 @@ class SpKdaCore:
         p = lambda start, width: projected[:, start : start + width]
         ops = (p(0, 3 * d), w, bias, conv, p(4 * d, K), p(4 * d + K, h), a_log, dt)
         tail = (fb, accepted, *self.records, *deferred)
-        tail += () if scale is None else (scale,)
+        tail += tuple(mx)
         return ops + (slots, state, out, p(3 * d, d), norm) + tail
 
     def prepare_caches(self, caches):
@@ -356,14 +362,16 @@ class SpKdaCore:
         for r in self.rows:
             n, kind = r // self.q, self.kinds[r]
             projected = torch.empty((r, self.pitch), dtype=torch.bfloat16, **meta)
-            mx = r in self.mx_rows
-            dtype = torch.uint8 if mx else torch.bfloat16
-            out = torch.empty((r, self.dim), dtype=dtype, **meta)
-            scale = None
-            if mx:
-                scale = torch.empty(
-                    -(-r // 128) * 128 * (self.dim // 32), dtype=torch.uint8, **meta
-                )
+            out = torch.empty((r, self.dim), dtype=torch.bfloat16, **meta)
+            mx: tuple = ()
+            if r in self.mx_rows:
+                mx = (
+                    torch.empty((r, self.dim), dtype=torch.uint8, **meta),
+                    torch.empty(
+                        -(-r // 128) * 128 * (self.dim // 32), dtype=torch.uint8,
+                        **meta,
+                    ),
+                )  # fmt: skip
             accepted = torch.empty(n, dtype=torch.int32, **meta)
             slots = torch.empty((n, 1), dtype=torch.int32, **meta)  # the checkpoints
             deferred: tuple = ()
@@ -372,13 +380,13 @@ class SpKdaCore:
                 pending = torch.empty(count, dtype=torch.int32, **meta)
                 deferred = (torch.empty(n, dtype=torch.int32, **meta), pending)
             operands = self._operands(
-                caches, projected, slots, out, accepted, deferred, scale
+                caches, projected, slots, out, accepted, deferred, mx
             )
             specs = tuple(map(layout, operands))
             if kind == "fused_ws" and not fits_fused_ws(specs, self.q, self.device):
                 self.kinds[r] = kind = "fused"  # KdaFused: no persistent page staging
             options = (self.heads, self.q, True, self.has_bias, self.device.index)
-            self.kernels[r] = executable(specs, kind, *options)
+            self.kernels[r] = executable(specs, kind, *options, bool(mx))
             self.specs[r] = specs
         return self
 
@@ -414,15 +422,15 @@ class SpKdaCore:
         slots = slots[:n]
         if slots.stride() != (slots.shape[1], 1):  # e.g. an eager block-table slice
             slots = slots.contiguous()
-        scale = None
+        mx: tuple = ()
         target = out
         if rows in self.mx_rows:
             if getattr(out, "rows", None) != rows or out.k != self.dim:
                 cause = f"an MXFP8 [{rows}, {self.dim}] output, got {type(out)}"
                 raise Unsupported("kda", Shape(rows, self.q), cause)
-            target, scale = out.data.view(torch.uint8), out.scale
+            target, mx = self.staged[:rows], (out.data.view(torch.uint8), out.scale)
         tensors = self._operands(
-            caches, projected, slots, target, accepted[:n], extra, scale
+            caches, projected, slots, target, accepted[:n], extra, mx
         )
         specs = tuple(map(layout, tensors))
         if specs != self.specs[rows]:  # CuTe takes a mismatched layout silently

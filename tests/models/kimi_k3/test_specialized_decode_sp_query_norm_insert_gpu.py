@@ -72,4 +72,4 @@ def test_query_norm_kv_insert_matches_stock(rows):
     steps = (got.view(torch.int8).int() - want.view(torch.int8).int()).abs()
     print(f"rows {rows}: {int(differ.sum())} of {differ.numel()} kv_c bytes differ")
     assert float(differ.float().mean()) < 2e-3
-    assert int(steps[differ].max(initial=0)) <= 1
+    assert not differ.any() or int(steps[differ].max()) <= 1
