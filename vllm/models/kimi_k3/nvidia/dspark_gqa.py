@@ -244,6 +244,22 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
             context_states, context_positions, context_slot_mapping
         )
 
+    def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
+        """The stock grouped per-layer K RMSNorm ([L, ctx, kv_heads, head_dim],
+        weight [L, head_dim]); long context steps replay it per layer
+        bitwise (the stock 8-thread blocks run ~20x over the byte floor)."""
+        weights = self._k_norm_weights
+        if all_k.dim() != 4 or not prefill_glue.use_head_rms_norm(
+            all_k[0], weights[0]
+        ):
+            return super()._normalize_context_k(all_k)
+        out = torch.empty_like(all_k)
+        for layer in range(all_k.shape[0]):
+            prefill_glue.rms_norm(
+                all_k[layer], weights[layer], self._rms_norm_eps, out=out[layer]
+            )
+        return out
+
     def _fused_context_kv(self, states, positions, slot_mapping) -> bool:
         fast = self._fast_context_kv
         if (

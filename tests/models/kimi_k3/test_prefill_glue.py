@@ -105,6 +105,23 @@ def test_head_rms_norm_matches_vllm_c(pg, tokens, heads, head_dim, extra):
     assert torch.equal(_bits(pg.rms_norm(x, w, 1e-6)), _bits(ref))
 
 
+def test_grouped_head_rms_norm_matches_vllm_c(pg):
+    """The DSpark context K norm: [L, ctx, kv_heads, 64] with per-layer weights
+    [L, 64] in one stock call, replayed per layer."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(5)
+    x = torch.randn(5, 3000, 16, 64, device="cuda", dtype=torch.bfloat16) * 3
+    w = (torch.rand(5, 64, device="cuda") + 0.5).to(torch.bfloat16)
+    ref = torch.empty_like(x)
+    ops.rms_norm(ref, x, w, 1e-6)
+    out = torch.empty_like(x)
+    for layer in range(5):
+        assert pg.use_head_rms_norm(x[layer], w[layer])
+        pg.rms_norm(x[layer], w[layer], 1e-6, out=out[layer])
+    assert torch.equal(_bits(out), _bits(ref))
+
+
 def test_rows_rms_norm_module(pg):
     from vllm.config import VllmConfig, set_current_vllm_config
 

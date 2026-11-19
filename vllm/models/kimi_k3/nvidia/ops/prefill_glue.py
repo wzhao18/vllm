@@ -939,10 +939,16 @@ def use_head_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> bool:
     return block in (8, 16) and x.shape[2] == block * 8
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``_C.rms_norm`` of a 2-D BF16 ``x`` (row stride allowed), bitwise equal;
     the caller checks :func:`use_rms_norm`."""
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     block = stock_rms_norm_block_size(x.numel() // x.shape[-1], x.shape[-1])
     _module().rms_norm_rows(out, x, weight, float(eps), block)
     return out
