@@ -1,0 +1,136 @@
+diff --git a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+index bb7fcb4950..02fa708d21 100644
+--- a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+@@ -95,8 +95,8 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
+ P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
+ NS = 6  # 64-key KV stages
+ NP = 3  # P buffers
+-NLD = 9  # gather warps
+-GATHER_PARTS = 2  # issuing lanes per quad
++NLD = 10  # gather warps (9, 10, 12-19)
++GATHER_PARTS = 1  # issuing lanes per quad (P-MLA run95)
+ STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
+ # warps: 0-3 / 4-7 softmax warpgroups (thread = head; warps 3 and 7 hold padding rows
+ # 96-127 and only take part in barriers, rescales, Q copies and epilogues), 8 PV,
+@@ -366,7 +366,8 @@ class SparseMlaPrefillH8:
+         if warp < W_SM:
+             cute.arch.warpgroup_reg_alloc(REG_SM)
+             self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
+-                         out_scale, tensormap.map_address(om))
++                         out_scale, tensormap.map_address(om), tensormap.map_address(qn),
++                         tensormap.map_address(qr))
+             cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
+         else:
+             cute.arch.warpgroup_reg_dealloc(REG_LOW)
+@@ -374,13 +375,12 @@ class SparseMlaPrefillH8:
+             if warp == W_PV:
+                 self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
+             elif warp == W_QK:
+-                self.qk_loop(base, lane, taddr, n_mine, lengths, cta)
++                self.qk_loop(base, lane, taddr, n_mine, lengths, cta,
++                             tensormap.map_address(qn), tensormap.map_address(qr))
+             else:
+-                pw = warp - (W_Q + 1)  # gather 10 -> 0, 12-19 -> 1-8; Q warp 9 -> NLD
+-                if warp == W_Q:
+-                    pw = Int32(NLD)
+-                elif warp > W_QK:
+-                    pw = warp - (W_Q + 2)
++                pw = warp - W_Q  # gather 9, 10 -> 0, 1; 12-19 -> 2-9
++                if warp > W_QK:
++                    pw = warp - (W_Q + 1)
+                 self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
+                             tensormap.map_address(qr), tensormap.map_address(kvm),
+                             tensormap.map_address(kvr), unit_rows, slots, slot_stride,
+@@ -418,6 +418,19 @@ class SparseMlaPrefillH8:
+             if cta == 0 and lane == 0 and g >= 16 and g < 24:
+                 sstamp_clock(base + Uint32(OFF_FLAG + 12))
+ 
++    @cute.jit
++    def q_load(self, base, cta, qi, tm_qn, tm_qr):
++        """Token qi's Q (latent atoms -> staging, RoPE -> QS buffer qi % 2); one thread.
++        Q(0) and Q(1) come from the QK warp, Q(qi + 2) from the end of token qi's
++        epilogue (staging stored, Q(qi + 1) copied to TMEM, token qi's QKs done)."""
++        row = cta + qi * self.grid
++        full = _bar(base, B_QFULL + qi % 2)
++        qs = base + Uint32(OFF_QS) + Uint32(qi % 2) * Uint32(QS_BYTES)
++        mbar_arrive_tx(full, Uint32(4 * H * 128 + H * 64))
++        for j in cutlass.range_constexpr(4):
++            tma_tile2d(base + Uint32(OFF_QN + j * ATOM), tm_qn, full, Int32(128 * j), row * H)
++        tma_tile2d(qs, tm_qr, full, Int32(0), row * H)
++
+     # ------------------------------------------------------------------ gather
+     @cute.jit
+     def loader(self, base, pw, lane, cta, n_mine, tm_qn, tm_qr, tm_kv, tm_kr, unit_rows,
+@@ -425,26 +438,7 @@ class SparseMlaPrefillH8:
+         quads = (16 - pw + NLD - 1) // NLD
+         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+-        if pw == NLD:
+-            # Q warp: atoms 0-1 staging (single) is free once token qi - 1's Q is in TMEM
+-            # and token qi - 2's epilogue has stored its staging; SS buffer qi % 2 once
+-            # token qi - 2's last QK is done
+-            if lane == 0:
+-                for qi in range(n_mine):
+-                    row = cta + qi * self.grid
+-                    if qi >= 1:
+-                        mbar_wait(_bar(base, B_QLFREE), Uint32((qi - 1) & 1))
+-                    if qi >= 2:
+-                        mbar_wait(_bar(base, B_QREMPTY + qi % 2), Uint32((qi // 2 - 1) & 1))
+-                        mbar_wait(_bar(base, B_EPIDONE), Uint32((qi - 2) & 1))
+-                    full = _bar(base, B_QFULL + qi % 2)
+-                    qs = base + Uint32(OFF_QS) + Uint32(qi % 2) * Uint32(QS_BYTES)
+-                    mbar_arrive_tx(full, Uint32(4 * H * 128 + H * 64))
+-                    for j in cutlass.range_constexpr(4):
+-                        tma_tile2d(base + Uint32(OFF_QN + j * ATOM), tm_qn, full,
+-                                   Int32(128 * j), row * H)
+-                    tma_tile2d(qs, tm_qr, full, Int32(0), row * H)
+-        else:
++        if True:
+             # lanes P j .. P j + P - 1 gather quad q = pw + NLD j of every 64-key stage
+             # (P = parts; lane part p issues ops p, p + P, ... of the quad's 4 latent atoms
+             # + RoPE): TMA gather4 throughput scales with issuing threads, not warps
+@@ -540,11 +534,13 @@ class SparseMlaPrefillH8:
+ 
+     # ------------------------------------------------------------------ MMA
+     @cute.jit
+-    def qk_loop(self, base, lane, taddr, n_mine, lengths, cta):
++    def qk_loop(self, base, lane, taddr, n_mine, lengths, cta, tm_qn, tm_qr):
+         """QK(u) as soon as S(u - 1) has been loaded and stage u has landed."""
+         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+         u = Int32(0)
++        if lane == 0 and n_mine > 0:
++            self.q_load(base, cta, Int32(0), tm_qn, tm_qr)
+         for qi in range(n_mine):
+             subs = _subs(lens[cta + qi * self.grid])
+             # the next token's latent Q: staging -> TMEM by tcgen05.cp from this warp, once
+@@ -566,6 +562,10 @@ class SparseMlaPrefillH8:
+                     tc_fence_after()
+                 self.ss(base, cta, lane, u, 24, 2)
+                 self.qk(base, lane, taddr, u, qi, i == subs - 1, cta)
++                if qi == 0 and i == 0 and n_mine > 1:
++                    if lane == 0:
++                        mbar_wait(_bar(base, B_QLFREE), Uint32(0))
++                        self.q_load(base, cta, Int32(1), tm_qn, tm_qr)
+                 u = u + 1
+ 
+     @cute.jit
+@@ -636,7 +636,7 @@ class SparseMlaPrefillH8:
+     # ------------------------------------------------------------------ softmax
+     @cute.jit
+     def softmax(self, base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
+-                out_scale, tm_o):
++                out_scale, tm_o, tm_qn, tm_qr):
+         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+         wg = warp // 4
+@@ -695,6 +695,8 @@ class SparseMlaPrefillH8:
+                 if qi + 1 < n_mine:
+                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
+                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
++                if sp == 0 and lane == 0 and qi + 2 < n_mine:
++                    self.q_load(base, cta, qi + 2, tm_qn, tm_qr)
+ 
+     @cute.jit
+     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
