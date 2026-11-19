@@ -1,7 +1,10 @@
 """P-MLA debug: h8 logical mode on small cases, one subprocess per case with a timeout
 (finds hangs). Usage: python3 pmla_dbg_logical.py [case]"""
+import os
 import subprocess
 import sys
+
+PHYS_ONLY = bool(os.environ.get("PMLA_PHYS_ONLY"))  # debug script only
 
 CASES = {
     "one_full": ([2048], 1),
@@ -25,7 +28,6 @@ def run(case):
 
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
         sparse_mla_prefill_h8,
-        sparse_mla_prefill_h8_logical,
     )
 
     lengths, bs64 = CASES[case]
@@ -59,6 +61,11 @@ def run(case):
     ref = sparse_mla_prefill_h8(q8, kv, slots.to(torch.int32), lens, 0.2, 1.3)
     torch.cuda.synchronize()
     print(case, "physical ok", flush=True)
+    if PHYS_ONLY:
+        return
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+        sparse_mla_prefill_h8_logical,
+    )
     out = sparse_mla_prefill_h8_logical(q8, kv, topk, req_ids, bt, block_size, stride, 0.2,
                                         1.3)
     torch.cuda.synchronize()
