@@ -345,10 +345,12 @@ def make_shared(W, shape, rows, seed, device):
     args = FusedSharedArgs(dx, W.to_blocked(sx), fc1, fc2)
     w13f, w2f, xf = dq(d13, s13), dq(d2, s2), dq(dx, sx)
 
-    def ref(n):
+    def ref(n, exact_act=False):
         gu = xf[:n] @ w13f.t()
         act = _situ(gu[:, :inter], gu[:, inter:], 4.0, 25.0).float()
-        return (dq(*q(act.to(torch.bfloat16))) @ w2f.t()).to(torch.bfloat16).float()
+        if not exact_act:  # stock: BF16 SiTU output requantized to MXFP8
+            act = dq(*q(act.to(torch.bfloat16)))
+        return (act @ w2f.t()).to(torch.bfloat16).float()
 
     return args, ref
 
@@ -709,9 +711,15 @@ def main():
         if fused is not None and n:
             got = res[1].float()
             want = shared_ref(n)
-            result["shared_rel_l2"] = float(
-                (got - want).norm() / want.norm().clamp_min(1e-30)
-            )
+            exact = shared_ref(n, exact_act=True)
+
+            def rel(a, b):
+                return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+            result["shared_rel_l2"] = rel(got, want)
+            # noise floor: the stock chain and the kernel vs an unquantized activation
+            result["shared_rel_l2_stock_vs_exact_act"] = rel(want, exact)
+            result["shared_rel_l2_kernel_vs_exact_act"] = rel(got, exact)
 
         def launch():
             session.launch(weights, target, shared=fused)

@@ -122,14 +122,36 @@ RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 # live tokens 44.9 / 47.8 / 50.7 us vs capacity 256 / N256 51.0 / 52.8 / 55.9 us.
 RUBIN_WIDE_EP_DECODE_TOKENS = 128
 
-# The wide-EP decode bucket with the fused MXFP8 shared expert (enable_fused_shared):
-# the refreshed GenPhase kernel (src_gp) on its decode scheduler; die_aware expert_half
-# when the bucket is die-local.
-RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RubinKnobs(
+# EP32 decode: the <=128-token bucket runs the refreshed GenPhase kernel (src_gp) on its
+# decode scheduler, die-aware (expert_half) on decode servers. Measured at real EP32
+# (8 nodes x 4 VR200, 896 experts, NVFP4, 128-token capacity, random routing, CUDA graph
+# of the kernel, p50 of the slowest rank, die-local weights; D-MOE runs/D-MOE/out/ep32
+# g32inf / g32gpa): inference kernel 67.8 / 70.5 / 68.7 us vs GenPhase 62.7 / 63.8 /
+# 65.6 us at 32 / 96 / 128 tokens per rank (rel-L2 vs the bf16 reference 0.166 both).
+# EP28 keeps the inference kernel (not measured).
+RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
+RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     mma_tiler_mnk=(256, 128, 256),
     cluster_shape_mn=(4, 1),
     fallback_cluster_shape_mn=None,
     schedule_policy=("decode", None),
+    work_id_mode="atomic_counter",
+    fc2_use_bulk=True,
+    fc2_tma_stages=2,
+    epi_flag_batches=(1, 4),
+    token_in_flag_batch=1,
+    token_back_mode="epi_warps",
+    reduce_topk_in_kernel=False,
+)
+
+# The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): FlashInfer
+# main's fused shared expert runs under the grouped / phase-interleaved schedulers only
+# (not the die-aware decode scheduler), so this bucket streams the experts die-oblivious.
+RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RubinKnobs(
+    mma_tiler_mnk=(256, 128, 256),
+    cluster_shape_mn=(4, 1),
+    fallback_cluster_shape_mn=None,
+    schedule_policy=("phase_interleave", None),
     work_id_mode="atomic_counter",
     fc2_use_bulk=True,
     fc2_tma_stages=2,
@@ -255,10 +277,24 @@ def select_rubin_buckets(
     else:
         buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
         own = f"knobs of the {main.max_tokens} bucket"
-    for bucket in buckets:
+    if world_size in RUBIN_GENPHASE_DECODE_EP_SIZES and problem.quant_kind == "nvfp4":
+        buckets = [_genphase_decode(b) for b in buckets]
+        main = _genphase_decode(main)
+    for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
     return (*buckets, main), notes + extra
+
+
+def _genphase_decode(bucket: RubinBucket) -> RubinBucket:
+    """A wide-EP bucket of at most :data:`RUBIN_WIDE_EP_DECODE_TOKENS` tokens per rank
+    on the refreshed GenPhase kernel (src_gp, decode scheduler; die-aware
+    ``expert_half`` once the bucket is die-local); larger buckets unchanged."""
+    if bucket.variant != "inference" or bucket.max_tokens > RUBIN_WIDE_EP_DECODE_TOKENS:
+        return bucket
+    return dataclasses.replace(
+        bucket, variant="genphase", knobs=RUBIN_GENPHASE_DECODE_KNOBS
+    )
 
 
 # The forward's DPMetadata (held, so its id is never reused) and whether its DP batch
@@ -674,8 +710,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
         die_mask = None
         if die_local and not self.prefill_worker and all(
-            bucket.variant == "inference"
-            and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
+            tuple(bucket.knobs.schedule_policy)[0]
+            == ("decode" if bucket.variant == "genphase" else "phase_interleave")
             for bucket in self.buckets
         ):
             from . import die_local
@@ -709,8 +745,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         buckets = []
         for bucket in self.buckets:
             if (
-                bucket.variant == "inference"
-                and bucket.max_tokens <= RUBIN_WIDE_EP_DECODE_TOKENS
+                bucket.max_tokens <= RUBIN_WIDE_EP_DECODE_TOKENS
                 and self.problem.quant_kind == "nvfp4"
             ):
                 bucket = dataclasses.replace(
@@ -718,6 +753,7 @@ class KimiK3MegaMoEExperts(nn.Module):
                     variant="genphase",
                     knobs=RUBIN_GENPHASE_FUSED_SHARED_KNOBS,
                     max_sm_count=None,
+                    die_sm_mask32=None,
                     shared=(hidden, intermediate),
                 )
                 switched = True
