@@ -502,14 +502,15 @@ def _pkd(
             )
         )
         p_f32 = cute.recast_ptr(s_f32.iterator, lay_f32.inner, dtype=cutlass.Float32)
+        p_t32 = cute.recast_ptr(s_f32.iterator, lay_f32.inner, dtype=cutlass.TFloat32)
         t_bfta32 = cute.make_tensor(
-            p_f32,
+            p_t32,
             cute.make_layout(
                 (((32, 4), 8), 1, 4, STAGES), stride=(((1, 1024), 32), 0, 256, 5120)
             ),
         )
         t_bftb32 = cute.make_tensor(
-            p_f32 + 4096,
+            p_t32 + 4096,
             cute.make_layout(((32, 8), 1, 4, STAGES), stride=((1, 32), 0, 256, 5120)),
         )
         b_fta32 = mma_4a32.make_fragment_B(t_bfta32)
@@ -606,13 +607,13 @@ def _pkd(
             mma_4a32.partition_shape_A((BM, C))
         )
         t_ua4a = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + 224, dtype=cutlass.Float32), ua4a_base.layout
+            cute.recast_ptr(tmem_ptr + 224, dtype=cutlass.TFloat32), ua4a_base.layout
         )
         ua4b_base = mma_4b32.get_slice(0).make_fragment_A(
             mma_4b32.partition_shape_A((BM, C))
         )
         t_ua4b = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + 224, dtype=cutlass.Float32), ua4b_base.layout
+            cute.recast_ptr(tmem_ptr + 224, dtype=cutlass.TFloat32), ua4b_base.layout
         )
     # bf16 window template for INP stores ([128,32] bf16 = 16 words)
     w32b_base = thr1.make_fragment_A(mma_1.partition_shape_A((BM, 32)))

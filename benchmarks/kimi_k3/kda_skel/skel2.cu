@@ -68,6 +68,11 @@ __device__ __forceinline__ void mma_ts_tf32(uint32_t d, uint32_t a, uint64_t b, 
 #define ST16(addr, r) asm volatile("tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};" \
   :: "r"(addr), "r"(r[0]),"r"(r[1]),"r"(r[2]),"r"(r[3]),"r"(r[4]),"r"(r[5]),"r"(r[6]),"r"(r[7]),"r"(r[8]),"r"(r[9]),"r"(r[10]),"r"(r[11]),"r"(r[12]),"r"(r[13]),"r"(r[14]),"r"(r[15]) : "memory")
 
+#define LD16(r, addr) asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];" \
+  : "=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]),"=r"(r[4]),"=r"(r[5]),"=r"(r[6]),"=r"(r[7]),"=r"(r[8]),"=r"(r[9]),"=r"(r[10]),"=r"(r[11]),"=r"(r[12]),"=r"(r[13]),"=r"(r[14]),"=r"(r[15]) : "r"(addr) : "memory")
+#define ST8(addr, r) asm volatile("tcgen05.st.sync.aligned.32x32b.x8.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};" \
+  :: "r"(addr), "r"(r[0]),"r"(r[1]),"r"(r[2]),"r"(r[3]),"r"(r[4]),"r"(r[5]),"r"(r[6]),"r"(r[7]) : "memory")
+
 struct Args { int nch, steps, mode, flags; unsigned id_f16_n32, id_tf32_n128, id_tf32_n32; unsigned* ctr; long long* stamps; };
 // flags: 1 = no HBM loads (prep reuses resident raw), 2 = no out stores, 4 = no state pass, 8 = no MMAs (chain = pass only)
 
@@ -78,7 +83,7 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
   __shared__ int s_rank;
   __shared__ __align__(8) uint64_t mbar[2][16];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  uint32_t s0 = ((uint32_t)__cvta_generic_to_shared(smem) + 1023) & ~1023u;
+  uint32_t s0 = ((uint32_t)__cvta_generic_to_shared(smem) + 127) & ~127u;
   unsigned smid; asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
   const int die = (smid >> 1) & 1;
   if (threadIdx.x == 0) s_rank = atomicAdd(&A.ctr[die], 1);
@@ -112,8 +117,10 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
     const int head = A.mode == 1 ? hl : die * 48 + hl;
     const int mdie = A.mode == 1 ? die : 0;
     auto tok0 = [&](int t) { return seq * 5461 + (t * BT) % 5440; };
-    const uint32_t chs = s0 + c * CH_SMEM;
-    const uint32_t raw = chs, img = chs + NST * RAW_B, osm = chs + NST * RAW_B + NST * IMG_B;
+    // UMMA smem descriptors carry a 14-bit address: every MMA operand (the images) sits in the low 256 KiB;
+    // TMA-only buffers (raw ring, out tile) go above.
+    const uint32_t img = s0 + c * NST * IMG_B, raw = s0 + 2 * NST * IMG_B + c * NST * RAW_B;
+    const uint32_t osm = s0 + 2 * NST * (IMG_B + RAW_B) + c * OUT_B;
     auto MB = [&](int i) { return (uint32_t)__cvta_generic_to_shared(&mbar[c][i]); };
     const uint32_t cb = tbase + c * 256;          // S 0..127 | INP 128..191 | U 192..223 | OUT 224..255
     const uint32_t lane_off = (uint32_t)((warp & 3) * 32) << 16;
@@ -137,18 +144,19 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
         }
         long long c1 = clock64();
         if (!(A.flags & 4)) {
-          for (int j = 0; j < ncol; j += 32) {
-            uint32_t r[32], p[16];
+#pragma unroll 1
+          for (int j = 0; j < ncol; j += 16) {
+            uint32_t r[16], p[8];
             const uint32_t col = part * ncol + j;
-            LD32(r, cb + lane_off + col);
+            LD16(r, cb + lane_off + col);
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 #pragma unroll
-            for (int e = 0; e < 16; ++e)
+            for (int e = 0; e < 8; ++e)
               asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(p[e]) : "f"(__uint_as_float(r[2 * e + 1])), "f"(__uint_as_float(r[2 * e])));
-            ST16(cb + lane_off + 128 + col / 2, p);
+            ST8(cb + lane_off + 128 + col / 2, p);
 #pragma unroll
-            for (int e = 0; e < 32; ++e) r[e] = __float_as_uint(__uint_as_float(r[e]) * 0.99f);
-            ST32(cb + lane_off + col, r);
+            for (int e = 0; e < 16; ++e) r[e] = __float_as_uint(__uint_as_float(r[e]) * 0.99f);
+            ST16(cb + lane_off + col, r);
           }
           asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
         }
@@ -162,9 +170,10 @@ __global__ void __launch_bounds__(1024, 1) skel(const __grid_constant__ Maps map
           for (int kk = 0; kk < 8; ++kk) mma_ts_f16(cb + 192, cb + 128 + kk * 8, dW + kk * 2, A.id_f16_n32, 1);
           // MMA4: S += vnew^T Kd (TS tf32, A = U fp32 K32, N128)
           for (int kk = 0; kk < 4; ++kk) mma_ts_tf32(cb, cb + 192 + kk * 8, dKd + kk * 2, A.id_tf32_n128, 1);
-          commit_el(MB(6));
+          // OUT inter leg reads INP: it must finish before the next pass overwrites INP -> FIN covers it
           if (t > 0) mwait(MB(8), (t - 1) & 1);                   // OFREE(t-1)
           for (int kk = 0; kk < 8; ++kk) mma_ts_f16(cb + 224, cb + 128 + kk * 8, dQ + kk * 2, A.id_f16_n32, kk);
+          commit_el(MB(6));
           for (int kk = 0; kk < 4; ++kk) mma_ts_tf32(cb + 224, cb + 192 + kk * 8, dKd + kk * 2, A.id_tf32_n32, 1);
           commit_el(MB(7));
           commit_el(MB(4 + s));
@@ -286,7 +295,7 @@ int main(int argc, char** argv) {
   int iters = argc > 6 ? atoi(argv[6]) : 5;
   CK(cudaSetDevice(0)); CK(cudaFree(0));
   int dev = 0, nsm, maxsm; CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
-  CK(cudaDeviceGetAttribute(&maxsm, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  CK(cudaDeviceGetAttribute(&maxsm, cudaDevAttrOversizedSharedMemoryPerBlock, dev));
   static Maps maps;
   std::vector<void*> bufs;
   size_t full = (size_t)T_TOK * 96 * HD * 2, half = full / 2;
@@ -303,19 +312,24 @@ int main(int argc, char** argv) {
       }
     }
   }
-  size_t smem = (size_t)2 * CH_SMEM + 1024;
+  size_t smem = (size_t)2 * CH_SMEM + 128;
   printf("SMs %d maxsmem %d need %zu\n", nsm, maxsm, smem);
   Args A; A.nch = nch; A.steps = steps; A.mode = mode; A.flags = flags;
   A.id_f16_n32 = mk(1, 1, 1, 32, 128); A.id_tf32_n128 = mk(1, 2, 2, 128, 128); A.id_tf32_n32 = mk(1, 2, 2, 32, 128);
   CK(cudaMalloc(&A.ctr, 8)); CK(cudaMalloc(&A.stamps, (size_t)nsm * 16 * 8));
   auto kern = pw == 1 ? skel<1> : skel<2>;
-  CK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+  CUfunction cf; CK(cudaGetFuncBySymbol((cudaFunction_t*)&cf, (const void*)kern));
+  CU(cuFuncSetAttribute(cf, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+  CU(cuFuncSetAttribute(cf, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)smem));
+  cudaLaunchConfig_t lc = {}; cudaLaunchAttribute la[1];
+  la[0].id = cudaLaunchAttributeSharedMemoryMode; la[0].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
+  lc.gridDim = dim3(nsm); lc.blockDim = dim3(1024); lc.dynamicSmemBytes = smem; lc.attrs = la; lc.numAttrs = 1;
   cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
   std::vector<float> ts;
   for (int it = 0; it < iters + 1; ++it) {
     CK(cudaMemset(A.ctr, 0, 8));
     CK(cudaEventRecord(e0));
-    kern<<<nsm, 1024, smem>>>(maps, A);
+    CK(cudaLaunchKernelEx(&lc, kern, maps, A));
     CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
     float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (it) ts.push_back(ms * 1000.f);
   }

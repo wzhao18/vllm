@@ -11,7 +11,7 @@ if [ "$3" = quick ]; then
 fi
 for mode in 0 1; do
   for cfg in "1 1 232" "1 2 232" "2 1 116" "2 2 116"; do
-    timeout 60 $B $mode $cfg 0 5 | grep -E "RESULT|alloc|TIMEOUT|CUDA|CU " | tail -3
+    timeout 60 $B $mode $cfg 0 5 | grep -E "RESULT|SMs|TIMEOUT|CUDA|CU " | tail -3
   done
 done
 # attribution at the dual-chain config, die-local: 1 no HBM loads, 2 no out stores, 4 no state pass, 8 no MMAs
