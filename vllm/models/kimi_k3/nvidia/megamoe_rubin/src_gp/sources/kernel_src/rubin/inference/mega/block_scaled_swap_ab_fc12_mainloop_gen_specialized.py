@@ -1467,6 +1467,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         fc1_sf_ready_pointer: cute.Pointer,
         expert_sizes: cute.Tensor,
         fc1_sf_parts_per_block: int = 1,
+        fc1_sf_ready_counts_rows: bool = False,
         shared_fc1_tma_b_tensor: Optional[cute.Tensor] = None,
         shared_fc1_tma_b_atom: Optional[cute.CopyAtom] = None,
         shared_fc1_tma_sfb_tensor: Optional[cute.Tensor] = None,
@@ -1543,13 +1544,17 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             else:
                 iket.range_push("tma_token_fc2_wait")
             if is_fc1:
-                # Refined scale factors are counted per expert; the peek bit tracks token readiness, not this pool.
+                # Canonical scale factors are counted per expert; the peek bit tracks token readiness, not this pool.
                 expert_idx = work_tile.expert_idx
-                # The refine publishes one count per column part of each block.
-                expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
-                    fc1_sf_parts_per_block
-                )
-                spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
+                if cutlass.const_expr(fc1_sf_ready_counts_rows):
+                    # LL transport: every source's sort worker adds the rows it stored.
+                    expert_sf_target = expert_sizes[expert_idx]
+                else:
+                    # Plain transport: the refine publishes one count per column part of each block.
+                    expert_sf_target = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
+                        fc1_sf_parts_per_block
+                    )
+                spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_target, scope="gpu")
             else:
                 # FC2 waits for its token block's FC1 tiles, shared FC2 for the shared ones; shared FC1 has no wait.
                 if cutlass.const_expr(not self.shared_enabled):

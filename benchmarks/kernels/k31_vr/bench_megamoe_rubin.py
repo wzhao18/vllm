@@ -229,6 +229,12 @@ def parse_args():
         help="NVFP4 FC1->FC2 requantization norm constant (power of two)",
     )
     p.add_argument(
+        "--dump-out",
+        default=None,
+        help="save each point's first eager output (live rows, CPU) to <prefix>.T<n>.r<rank>.pt "
+        "for bitwise A/B of two builds",
+    )
+    p.add_argument(
         "--sweep-fc1-norm",
         action="store_true",
         help="NVFP4: report rel-L2 vs the full-precision reference for "
@@ -687,6 +693,8 @@ def main():
         )
         torch.cuda.synchronize()
         moe.check_route_errors()
+        if args.dump_out:
+            torch.save(out[:n].cpu(), f"{args.dump_out}.T{n}.r{rank}.pt")
 
         # staging A/B vs the torch stager (live rows)
         rx, rsf, ridx, rw = R.stage_inputs_torch(

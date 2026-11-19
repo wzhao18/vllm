@@ -1729,6 +1729,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 fc1_sf_ready_pointer=self._device_workspace.ptr(self.token_comm.fc1_sf_ready_region),
                 expert_sizes=self._device_workspace.tensor(self.token_comm.expert_sizes_region),
                 fc1_sf_parts_per_block=self.token_comm.refine_parts_per_block,
+                fc1_sf_ready_counts_rows=not self.token_comm.sf_plain_transport,
                 shared_fc1_tma_b_tensor=shared_fc1_tma_b_tensor,
                 shared_fc1_tma_b_atom=shared_fc1_tma_b_atom,
                 shared_fc1_tma_sfb_tensor=shared_fc1_tma_sfb_tensor,

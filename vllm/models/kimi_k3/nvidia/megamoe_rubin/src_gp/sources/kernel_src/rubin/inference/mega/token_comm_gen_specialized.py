@@ -103,6 +103,26 @@ def st_relaxed_sys_b64(address: Int64, value: Int64) -> None:
 
 
 @cute.jit
+def st_global_b32(address: Int64, value: Int32) -> None:
+    """Plain 4-byte global store (one canonical scale-factor word: four SF bytes of one row and atom)."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+
+
+@cute.jit
+def fence_proxy_async_global() -> None:
+    """Order this thread's generic-proxy global stores before later async-proxy (TMA) reads of them."""
+    llvm.inline_asm(None, [], "fence.proxy.async.global;", "", has_side_effects=True, is_align_stack=False, asm_dialect=0)
+
+
+@cute.jit
 def st_relaxed_gpu_b64(address: Int64, value: Int64) -> None:
     """Single-copy-atomic local 8-byte store of one LL word."""
     llvm.inline_asm(
@@ -311,6 +331,12 @@ class GenphaseTokenComm(KernelComponent):
     sort_histogram_region: ClassVar[str] = "genphase.token_comm.smem.sort_histogram"
     sort_prefix_region: ClassVar[str] = "genphase.token_comm.smem.sort_prefix"
     sort_warp_totals_region: ClassVar[str] = "genphase.token_comm.smem.sort_warp_totals"
+    # LL transport: the sort worker builds this source's rows of the canonical SF pool itself (no refine pass).
+    sort_sf_rows_region: ClassVar[str] = "genphase.token_comm.smem.sort_sf_rows"
+    sort_row_token_region: ClassVar[str] = "genphase.token_comm.smem.sort_row_token"
+    sort_token_needed_region: ClassVar[str] = "genphase.token_comm.smem.sort_token_needed"
+    sort_data_base_region: ClassVar[str] = "genphase.token_comm.smem.sort_data_base"
+    sort_sf_base_region: ClassVar[str] = "genphase.token_comm.smem.sort_sf_base"
     exchange_histogram_region: ClassVar[str] = "genphase.token_comm.smem.exchange_histogram"
     # Route words carry (local expert << 16 | offset in the source segment); this
     # marker, above any packed word, is a route the destination does not own.
@@ -1030,6 +1056,28 @@ class GenphaseTokenComm(KernelComponent):
         sort.register_tensor(
             self.sort_warp_totals_region, cutlass.Int32, (self.threads_per_cta // 32,), byte_alignment=16
         )
+        if not self.sf_plain_transport:
+            # This source's received scale-factor rows (value halves of its LL words), the token behind each
+            # (expert, offset in this source's segment), and the per-expert row-space bases of the scatter.
+            sort.register_tensor(
+                self.sort_sf_rows_region,
+                cutlass.Int32,
+                (self.max_tokens_per_rank, self.sf_ll_live_words),
+                stride=(self.sf_ll_live_words, 1),
+                byte_alignment=16,
+            )
+            sort.register_tensor(
+                self.sort_row_token_region,
+                cutlass.Int32,
+                (self.local_expert_bucket_count, self.max_tokens_per_rank),
+                stride=(self.max_tokens_per_rank, 1),
+                byte_alignment=16,
+            )
+            sort.register_tensor(
+                self.sort_token_needed_region, cutlass.Int32, (self.max_tokens_per_rank,), byte_alignment=16
+            )
+            for region_name in (self.sort_data_base_region, self.sort_sf_base_region):
+                sort.register_tensor(region_name, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16)
 
         helper = overlay.add_lifetime("helper")
         helper.register_tensor(
@@ -1406,7 +1454,9 @@ class GenphaseTokenComm(KernelComponent):
                 thread_idx,
             )
 
-        self._run_refine(device_workspace, smem_base, thread_idx)
+        if cutlass.const_expr(self.sf_plain_transport):
+            # LL transport: the sort workers store the canonical SF rows themselves (``_store_source_sf_rows``).
+            self._run_refine(device_workspace, smem_base, thread_idx)
         self._leave(device_workspace, thread_idx)
 
         device_workspace.remove_device_members()
@@ -2180,6 +2230,13 @@ class GenphaseTokenComm(KernelComponent):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.histogram_bucket_count):
                 histogram[bucket] = Int32(0)
+        if cutlass.const_expr(not self.sf_plain_transport):
+            token_needed = self._smem_workspace.tensor(self.sort_token_needed_region, smem_base)
+            row_token = self._smem_workspace.tensor(self.sort_row_token_region, smem_base)
+            for token_round in cutlass.range_constexpr(ceil_div(self.max_tokens_per_rank, self.threads_per_cta)):
+                token = Int32(token_round * self.threads_per_cta) + thread_idx
+                if token < Int32(self.max_tokens_per_rank):
+                    token_needed[token] = Int32(0)
 
         # The histogram is zeroed by other threads than the ones that count into it.
         cute.arch.sync_threads()
@@ -2224,7 +2281,27 @@ class GenphaseTokenComm(KernelComponent):
                 if route_word != Int32(self.route_word_invalid):
                     buckets[chunk_begin + j] = route_word >> Int32(16)
                     offsets[chunk_begin + j] = route_word & Int32(0xFFFF)
+                    if cutlass.const_expr(not self.sf_plain_transport):
+                        route = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
+                        source_token = route // Int32(self.topk)
+                        token_needed[source_token] = Int32(1)
+                        row_token[buckets[chunk_begin + j], offsets[chunk_begin + j]] = source_token
+                        cute.arch.atomic_add(
+                            histogram.iterator + buckets[chunk_begin + j],
+                            Int32(1),
+                            sem="relaxed",
+                            scope="cta",
+                        )
         iket.range_pop()
+
+        if cutlass.const_expr(not self.sf_plain_transport):
+            # Everything the canonical SF rows need except their position is local once the
+            # routes are in: pull this source's needed scale-factor rows into SMEM now, while
+            # the helper is still folding the counts, so the scatter only stores.
+            cute.arch.sync_threads()
+            iket.range_push("sort.sf_rows")
+            self._stage_source_sf_rows(device_workspace, smem_base, source_rank, call_tag, thread_idx)
+            iket.range_pop()
 
         iket.range_push("sort.wait_prefix")
         if thread_idx == Int32(0):
@@ -2240,11 +2317,16 @@ class GenphaseTokenComm(KernelComponent):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
                 base_row[bucket] = source_expert_base[source_rank, bucket]
+                if cutlass.const_expr(not self.sf_plain_transport):
+                    self._smem_workspace.tensor(self.sort_data_base_region, smem_base)[bucket] = (
+                        device_workspace.tensor(self.data_expert_base_region)[bucket]
+                    )
+                    self._smem_workspace.tensor(self.sort_sf_base_region, smem_base)[bucket] = (
+                        device_workspace.tensor(self.sf_expert_base_region)[bucket]
+                    )
         cute.arch.sync_threads()
 
         gather_index = device_workspace.tensor(self.gather_index_region)
-        if cutlass.const_expr(not self.sf_plain_transport):
-            row_source_ll_address = self._ll_half_address(device_workspace, self.refine_row_source_ll_region, call_tag)
         token_metadata = device_workspace.tensor(self.token_src_metadata_region)
         routed_scores = self.fc1_topk_scores_tensor(device_workspace)
         if cutlass.const_expr(self.apply_topk_at_fc1):
@@ -2276,21 +2358,111 @@ class GenphaseTokenComm(KernelComponent):
                     source_slot = route % Int32(self.topk)
                     pool_row = base_row[buckets[route_round]] + offsets[route_round]
                     gather_index[pool_row] = dense_row_begin + source_token
-                    if cutlass.const_expr(not self.sf_plain_transport):
-                        st_relaxed_gpu_b64(
-                            row_source_ll_address + Int64(pool_row) * Int64(8),
-                            (Int64(call_tag) << Int64(32)) | Int64(dense_row_begin + source_token),
-                        )
                     token_metadata[pool_row] = TokenSrcMetadata(
                         src_rank=source_rank, src_token=source_token, src_topk=source_slot
                     ).pack()
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         routed_scores[pool_row] = _int32_bits_to_float32(Int32(score_words[j] & Int64(0xFFFFFFFF)))
 
+        if cutlass.const_expr(not self.sf_plain_transport):
+            self._store_source_sf_rows(device_workspace, smem_base, thread_idx)
+            # The canonical pool is read by TMA (async proxy) after the release below.
+            fence_proxy_async_global()
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(device_workspace.ptr(self.metadata_ready_region), Int32(1))
+        if cutlass.const_expr(not self.sf_plain_transport):
+            # fc1_sf_ready counts canonical rows: an expert opens once every source has stored its rows.
+            fc1_sf_ready = device_workspace.ptr(self.fc1_sf_ready_region)
+            for bucket_round in cutlass.range_constexpr(ceil_div(self.experts_per_rank, self.threads_per_cta)):
+                bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
+                if bucket < Int32(self.experts_per_rank):
+                    rows = histogram[bucket]
+                    if rows > Int32(0):
+                        red_async_add_release_gpu_s32(fc1_sf_ready + bucket, rows)
         iket.range_pop()
+
+    @cute.jit
+    def _stage_source_sf_rows(
+        self,
+        device_workspace: DeviceWorkspace,
+        smem_base: cute.Pointer,
+        source_rank: Int32,
+        call_tag: Int32,
+        thread_idx: Int32,
+    ) -> None:
+        """Pull the value halves of this source's LL scale-factor words into SMEM, for the tokens it routed here.
+
+        (token, word) items are spread over the CTA so a warp reads contiguous words of a row; every word of a
+        chunk is loaded before any tag is tested, and only stale ones are re-polled (as the route words).
+        """
+        token_needed = self._smem_workspace.tensor(self.sort_token_needed_region, smem_base)
+        sf_rows = self._smem_workspace.tensor(self.sort_sf_rows_region, smem_base)
+        ll_sf = self.dense_sf_ll_tensor(device_workspace, call_tag)
+        dense_row_begin = source_rank * Int32(self.max_tokens_per_rank)
+        row_words = self.sf_ll_live_words
+        items = self.max_tokens_per_rank * row_words
+        item_rounds = ceil_div(items, self.threads_per_cta)
+        present = Int64(call_tag) << Int64(32)
+        for chunk_begin in cutlass.range_constexpr(0, item_rounds, self.sort_poll_chunk):
+            chunk_rounds = min(self.sort_poll_chunk, item_rounds - chunk_begin)
+            words = cute.make_rmem_tensor((chunk_rounds,), Int64)
+            addresses = cute.make_rmem_tensor((chunk_rounds,), Int64)
+            needed = cute.make_rmem_tensor((chunk_rounds,), Int32)
+            for j in cutlass.range_constexpr(chunk_rounds):
+                item = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
+                token = item // Int32(row_words)
+                word = item % Int32(row_words)
+                words[j] = present
+                addresses[j] = Int64(0)
+                needed[j] = Int32(0)
+                if item < Int32(items):
+                    needed[j] = token_needed[token]
+                    if needed[j] != Int32(0):
+                        addresses[j] = ll_sf[dense_row_begin + token, None].iterator.toint() + Int64(word) * Int64(8)
+                        words[j] = load_ll_word(addresses[j])
+            poll_ll_words(words, addresses, chunk_rounds, call_tag)
+            for j in cutlass.range_constexpr(chunk_rounds):
+                if needed[j] != Int32(0):
+                    item = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
+                    sf_rows[item // Int32(row_words), item % Int32(row_words)] = Int32(words[j] & Int64(0xFFFFFFFF))
+
+    @cute.jit
+    def _store_source_sf_rows(self, device_workspace: DeviceWorkspace, smem_base: cute.Pointer, thread_idx: Int32) -> None:
+        """Store this source's rows of the canonical (atom-major) SF pool the block-scaled MMA reads.
+
+        A row's LL word ``a`` is exactly its four scale factors of atom ``a``, i.e. one 4-byte word of the atom.
+        One warp per expert, one lane per row of this source's contiguous segment of the expert: consecutive rows
+        sit 16 bytes apart inside an atom, so a warp's store spans one 512-byte atom. The bytes and positions are
+        the ones the refine pass wrote; rows past an expert's live count are not written (the MMA reads them only
+        in N columns its dynamic instruction extent excludes).
+        """
+        histogram = self._smem_workspace.tensor(self.sort_histogram_region, smem_base)
+        base_row = self._smem_workspace.tensor(self.sort_prefix_region, smem_base)
+        data_base = self._smem_workspace.tensor(self.sort_data_base_region, smem_base)
+        sf_base = self._smem_workspace.tensor(self.sort_sf_base_region, smem_base)
+        row_token = self._smem_workspace.tensor(self.sort_row_token_region, smem_base)
+        sf_rows = self._smem_workspace.tensor(self.sort_sf_rows_region, smem_base)
+        canonical = self.canonical_activation_sf_tensor(device_workspace)
+        columns_per_atom = 4 * self.quant_kind.sf_vec_size
+        warp_count = self.threads_per_cta // 32
+        lane = thread_idx % Int32(32)
+        warp = cute.arch.make_warp_uniform(thread_idx // Int32(32))
+        for bucket_round in cutlass.range_constexpr(ceil_div(self.experts_per_rank, warp_count)):
+            bucket = Int32(bucket_round * warp_count) + warp
+            if bucket < Int32(self.experts_per_rank):
+                rows = histogram[bucket]
+                sf_row_begin = sf_base[bucket] + base_row[bucket] - data_base[bucket]
+                for row_chunk in cutlass.range(0, rows, 32, unroll=1):
+                    row = row_chunk + lane
+                    if row < rows:
+                        token = row_token[bucket, row]
+                        sf_row = sf_row_begin + row
+                        for atom in cutlass.range_constexpr(self.sf_ll_live_words):
+                            address = cute.domain_offset(
+                                (sf_row, Int32(atom * columns_per_atom)), canonical
+                            ).iterator.toint()
+                            st_global_b32(address, sf_rows[token, atom])
 
     @cute.jit
     def _run_helper(
@@ -2387,17 +2559,18 @@ class GenphaseTokenComm(KernelComponent):
                 lane_idx,
                 warp_idx,
             )
-        self._publish_refine_block_prefix(
-            device_workspace,
-            loads_in_scan_order,
-            scan_order_experts,
-            scan_input,
-            prefix,
-            warp_totals,
-            thread_idx,
-            lane_idx,
-            warp_idx,
-        )
+        if cutlass.const_expr(self.sf_plain_transport):
+            self._publish_refine_block_prefix(
+                device_workspace,
+                loads_in_scan_order,
+                scan_order_experts,
+                scan_input,
+                prefix,
+                warp_totals,
+                thread_idx,
+                lane_idx,
+                warp_idx,
+            )
         self._publish_source_segment_bases(device_workspace, count_matrix, local_rank, thread_idx)
 
         cute.arch.sync_threads()
