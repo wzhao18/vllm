@@ -822,10 +822,9 @@ class SparseMlaPrefill:
                 mbar_arrive(_bar(base, B_OFREE))
 
 
-# Per-shape dispatch: calls of at least MIN_ROWS rows (prefill chunks) run this
+# Per-shape dispatch: calls of at least MIN_ROWS rows (prefill chunks) run the h6
 # persistent kernel; smaller ones (decode, short chunks) keep the stock kernel.
 MIN_ROWS = 1024
-DISPATCH = False
 LOADERS = 3
 PIPELINED = False
 TMA = False
@@ -838,10 +837,6 @@ def supported(num_heads: int, kv_cache_dtype: str, kv_lora_rank: int, rope_dim: 
     Rubin (sm_107)."""
     from vllm.platforms import current_platform
 
-    # Not dispatched yet: at F16K it is still slower than trtllm-gen (2.8x with
-    # the current loaders, P-MLA run7/run8); enable once it wins at the shape.
-    if not DISPATCH:
-        return False
     return (
         num_heads == H
         and kv_cache_dtype in ("fp8", "fp8_e4m3")
@@ -863,6 +858,19 @@ def _compiled(loaders: int, grid: int, pipelined: bool, tma: bool, regs: tuple,
 
 def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
+                       out_scale: float, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Prefill-sized DSA sparse MLA on Rubin (the dispatched kernel, see
+    sparse_mla_h6). Same contract as sparse_mla_prefill_v1."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h6 import (
+        sparse_mla_prefill_h6,
+    )
+
+    return sparse_mla_prefill_h6(q8, kv_rows, slots, lengths, scale, out_scale,
+                                 unit_rows=unit_rows, out=out)
+
+
+def sparse_mla_prefill_v1(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
+                       slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None,
                        loaders: int = LOADERS, pipelined: bool = PIPELINED,
                        tma: bool = TMA, regs: tuple = REGS,
@@ -874,7 +882,7 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
     scale x k scale; ``out_scale`` = k scale. Returns BF16 [T, 96, 512]."""
     t = q8.shape[0]
     if q8.shape[1:] != (H, ROW) or not q8.is_contiguous():
-        raise ValueError(f"sparse_mla_prefill: q8 must be contiguous [T, {H}, {ROW}]")
+        raise ValueError(f"sparse_mla_prefill_v1: q8 must be contiguous [T, {H}, {ROW}]")
     if out is None:
         out = torch.empty((t, H, D_NOPE), dtype=torch.bfloat16, device=q8.device)
     if t == 0:

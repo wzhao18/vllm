@@ -16,6 +16,7 @@ if not (current_platform.is_cuda() and current_platform.has_device_capability(10
 
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (  # noqa: E402
     sparse_mla_prefill,
+    sparse_mla_prefill_v1,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (  # noqa: E402
     sparse_mla_prefill_h2,
@@ -76,7 +77,7 @@ def test_matches_fp32_reference(loaders, pipelined, tma, regs, stages):
     lengths = lengths * 23  # more rows than SMs: persistent CTAs take several
     q8, kv, slots, lens = _problem(lengths, pool_pages=600, width=2048, seed=0)
     scale, out_scale = 192**-0.5 * 0.7, 1.3
-    out = sparse_mla_prefill(q8, kv, 64, slots, lens, scale, out_scale,
+    out = sparse_mla_prefill_v1(q8, kv, 64, slots, lens, scale, out_scale,
                              loaders=loaders, pipelined=pipelined, tma=tma,
                              regs=regs, stages=stages)
     torch.cuda.synchronize()

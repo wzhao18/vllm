@@ -239,7 +239,7 @@ def main():
     # specialized_prefill sparse MLA (sm_107, native 96 heads, no padded query)
     try:
         from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
-            sparse_mla_prefill,
+            sparse_mla_prefill_v1 as sparse_mla_prefill,
         )
 
         vr_out = torch.empty(F, H, L, device=dev, dtype=torch.bfloat16)
