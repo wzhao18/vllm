@@ -1182,13 +1182,16 @@ def conv_pair(cfg, hist: cutlass.Constexpr, row0: cutlass.Constexpr, nrows: cutl
 
 @cute.jit
 def conv_chunk(cfg, hist: cutlass.Constexpr, tid, raw_stage, prev_stage, chunk_start, seqlen, slot, sQ, sK, sV, sQc, sKc, sVc, sW, mConvState, ch_q, ch_k, ch_v):
-    """The conv warps' conv of a chunk, column-owner: lane l of the 64 conv threads
-    slides the Q, K and V channel pair 2 l .. 2 l + 1 down the chunk's rows."""
-    pc = tid * 2
+    """One CG0 group's conv of a chunk, column-owner: warps 0-1 own the Q channel pairs
+    and V rows 0-7, warps 2-3 the K pairs and V rows 8-15 (lane l: pair l % 64)."""
+    pc = (tid % 64) * 2
     common = (raw_stage, prev_stage, chunk_start, seqlen, slot)
-    conv_pair(cfg, hist, 0, cfg.b_t, *common, sQ, sQc, sW, pc, mConvState, ch_q + pc)
-    conv_pair(cfg, hist, 0, cfg.b_t, *common, sK, sKc, sW + 4 * cfg.d_k, pc, mConvState, ch_k + pc)
-    conv_pair(cfg, hist, 0, cfg.b_t, *common, sV, sVc, sW + 8 * cfg.d_k, pc, mConvState, ch_v + pc)
+    if tid < 64:
+        conv_pair(cfg, hist, 0, cfg.b_t, *common, sQ, sQc, sW, pc, mConvState, ch_q + pc)
+        conv_pair(cfg, hist, 0, cfg.b_t // 2, *common, sV, sVc, sW + 8 * cfg.d_k, pc, mConvState, ch_v + pc)
+    else:
+        conv_pair(cfg, hist, 0, cfg.b_t, *common, sK, sKc, sW + 4 * cfg.d_k, pc, mConvState, ch_k + pc)
+        conv_pair(cfg, hist, cfg.b_t // 2, cfg.b_t // 2, *common, sV, sVc, sW + 8 * cfg.d_k, pc, mConvState, ch_v + pc)
 
 
 @cute.jit
@@ -1217,6 +1220,9 @@ def conv_warp_group(
     tiles into the conv ring (column-owner: warps 0-1 Q pairs and V rows 0-7, warps 2-3
     K pairs and V rows 8-15), off the recurrence, ``vconv_stages`` chunks ahead of CG0's
     row loads and CG1's V reads; releases the previous raw stage's history rows."""
+    nvvm.setmaxregister(cfg.num_regs_conv, nvvm.SetMaxRegisterAction.DECREASE)
+    if cutlass.const_expr(cfg.conv_dbg & 8):
+        return
     elect_one = nvvm.elect_sync()
     tid = (warp_idx - cfg.conv_warp_ids[0]) * cfg.threads_per_warp + lane_idx
     nthreads = len(cfg.conv_warp_ids) * cfg.threads_per_warp
@@ -3703,13 +3709,12 @@ def build_cfg(
             raise ValueError(f"fused conv needs steep off, d_k = d_v = 128 and one tile per head (steep {cfg.steep_mode}, d_v {cfg.d_v})")
         cfg.fused_conv = True
         cfg.vconv_stages = 3
-        cfg.conv_warp_ids = (16, 17)
-        cfg.threads_per_cta = 18 * cfg.threads_per_warp
-        # setmaxnreg only moves the CTA's launch registers (576 x 112): the two conv
-        # warps keep 112, the warpgroups share 576 x 112 - 64 x 112 = 256 x 136 +
-        # 128 x 128 + 128 x 48
+        cfg.conv_warp_ids = (16, 17, 18, 19)
+        cfg.threads_per_cta = 20 * cfg.threads_per_warp
+        # setmaxnreg only redistributes the CTA's launch registers, 640 x 96 (96 =
+        # 65536 / 640 rounded down to 32): 256 x 136 + 128 x 120 + 128 x 48 + 128 x 40
         cfg.num_regs_compute_group_0 = 136
-        cfg.num_regs_compute_group_1 = 128
+        cfg.num_regs_compute_group_1 = 120
         cfg.num_regs_other = 48
         import os
 
