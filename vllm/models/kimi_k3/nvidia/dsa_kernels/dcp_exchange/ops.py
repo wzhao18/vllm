@@ -397,6 +397,13 @@ class DcpExchange:
             threads,
         )  # fmt: skip
 
+    def topk_fskel(self, logits, local_len, out, out_count, hist, arr, mode: int, C: int) -> None:
+        """Benchmark only: fused logits-epilogue top-k skeleton (csrc/topk_skel.cuh)."""
+        self.ext.topk_fskel(
+            logits, local_len, out, out_count, hist, arr, self.v2_box.data_ptr(), self.v2_mc,
+            self.v2_peers, self.W, self.rank, self.K, self.cap, self.v2_epoch, self.err, mode, C,
+        )  # fmt: skip
+
     def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:
         """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each; ``pre``:
         a pre-pass launch, ``topk_prepass``) that fit on the GPU at once; a launch

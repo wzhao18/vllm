@@ -3366,9 +3366,51 @@ void topk_skel(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glob
   else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_skel_kernel<kV2T>, p, (int)mode));
 }
 
+// Benchmark only: the fused (a) skeleton (topk_fskel_kernel), rows x C CTAs, PDL.
+void topk_fskel(torch::Tensor logits, torch::Tensor local_len, torch::Tensor out, torch::Tensor out_count,
+                torch::Tensor hist, torch::Tensor arr, int64_t box, int64_t mc, torch::Tensor peers,
+                int64_t W, int64_t rank, int64_t K, int64_t cap, torch::Tensor epoch, torch::Tensor err,
+                int64_t mode, int64_t C) {
+  TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1 && logits.stride(0) % 8 == 0);
+  TORCH_CHECK(hist.numel() >= logits.size(0) * 256 && arr.numel() >= logits.size(0) && C >= 1);
+  const int T = (int)logits.size(0);
+  if (T == 0) return;
+  TORCH_CHECK(T <= cap && W <= kV2MaxW && K <= kMaxK);
+  const c10::cuda::CUDAGuard guard(logits.device());
+  V2Params p{};
+  p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  p.lstride = logits.stride(0);
+  p.lcols = (int)logits.size(1);
+  p.local_len = local_len.data_ptr<int>();
+  p.out = out.data_ptr<int>();
+  p.ostride = out.stride(0);
+  p.out_count = out_count.data_ptr<int>();
+  p.box = reinterpret_cast<uint32_t*>(box);
+  p.mc = (uint64_t)mc;
+  p.peers = reinterpret_cast<const uint64_t*>(peers.data_ptr<int64_t>());
+  p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
+  const auto lay = topk_v2_layout(cap, W);
+  p.off_r1 = lay[0];
+  p.epoch = epoch.data_ptr<int>();
+  p.err = err.data_ptr<int>();
+  p.spin_ns = g_spin_ns;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)(T * C), 1, 1);
+  cfg.blockDim = dim3(kFsT, 1, 1);
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_fskel_kernel, p, reinterpret_cast<uint32_t*>(hist.data_ptr<int>()),
+                                    arr.data_ptr<int>(), (int)C, (int)mode));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_v2", &topk_v2);
   m.def("topk_skel", &topk_skel);
+  m.def("topk_fskel", &topk_fskel);
   m.def("topk_v2_layout", &topk_v2_layout);
   m.def("topk_v2_resident", &topk_v2_resident);
   m.def("topk_merge", &topk_merge);
