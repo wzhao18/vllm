@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import traceback
+import types
 
 import torch
 
@@ -162,16 +163,22 @@ def main():
                 g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
                              kred=bool(int(f.get("r", 0))), pair=bool(int(f.get("p", 1))),
                              iw=int(f.get("w", 1)), ix=int(f.get("x", 1)),
-                             debug=dbg, kt=kt, pre_ns=int(f.get("e", 0)) * 1000)
+                             debug=dbg, kt=kt, pre_ns=int(f.get("e", 0)) * 1000,
+                             xcopies=int(f.get("y", 1)))
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
                 t0 = time.time()
-                args0 = ptrs(ws[0], x, outs[0], part, tick)
+                xv = x
+                if int(f.get("y", 1)) > 1:  # private activation copy per row block
+                    yc = int(f["y"])
+                    xv = types.SimpleNamespace(data=x.data.repeat(yc, 1).contiguous(),
+                                               scale=x.scale.reshape(-1).repeat(yc))
+                args0 = ptrs(ws[0], xv, outs[0], part, tick)
                 fn = cute.compile(g, *args0, stream(dev))
                 print(f"  {var}: compiled in {time.time() - t0:.1f}s grid {g.grid} "
                       f"sfa/sfb cols {g.sfa_cols}/{g.sfb_cols}", flush=True)  # fmt: skip
-                all_args = [ptrs(w, x, o, part, tick) for w, o in zip(ws, outs)]
+                all_args = [ptrs(w, xv, o, part, tick) for w, o in zip(ws, outs)]
                 fn(*all_args[0], stream(dev))
                 torch.cuda.synchronize()
                 d = (outs[0].float() - ref.float())

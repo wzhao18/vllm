@@ -161,7 +161,7 @@ class DenseMx8:
     def __init__(self, n: int, k: int, rows: int, ldo: int, *, ksplit: int = 2,
                  kt: int = 128, stages: int = 4, collector: bool = True,
                  mc: int = 1, kred: bool = False, pair: bool = True,
-                 iw: int = 1, ix: int = 1, debug: int = 0, pre_ns: int = 0):  # fmt: skip
+                 iw: int = 1, ix: int = 1, debug: int = 0, pre_ns: int = 0, xcopies: int = 1):  # fmt: skip
         assert rows <= 384 and k % (kt * ksplit) == 0 and ksplit in (1, 2)
         # iw / ix TMA issuer warps for the weights / the activation, each issuing every
         # iw-th / ix-th K tile: one issuer completes one bulk op at a time (~0.3 us
@@ -192,6 +192,7 @@ class DenseMx8:
         # bench-only: the activation warps spin pre_ns after the weight prologue, before
         # griddepcontrol.wait (a preceding op of the same resident CTA: in-grid form)
         self.pre_ns = pre_ns
+        self.xcopies = xcopies
         # mc pairs per cluster share one K half and the x tiles: x is TMA-multicast
         # to the mc pairs (L2 reads of x / mc)
         self.mc = mc
@@ -230,7 +231,10 @@ class DenseMx8:
         n, k, rows = self.n, self.k, self.rows
         fp8, sf_t = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         a = cute.make_tensor(w_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)))
-        b = cute.make_tensor(x_ptr, cute.make_ordered_layout((rows, k, 1), order=(1, 0, 2)))
+        # bench-only xcopies > 1: row block mb reads private activation copy mb % xcopies
+        b = cute.make_tensor(
+            x_ptr, cute.make_ordered_layout((rows, k, self.xcopies), order=(1, 0, 2))
+        )
         sfa = cute.make_tensor(sfw_ptr, blockscaled_utils.tile_atom_to_shape_SF(a.shape, SF_VEC))
         sfb = cute.make_tensor(sfx_ptr, blockscaled_utils.tile_atom_to_shape_SF(b.shape, SF_VEC))
 
@@ -486,7 +490,7 @@ class DenseMx8:
         if (warp >= self.x_warp and warp < self.x_warp + self.ix
                 and not cutlass.const_expr(self.debug & 32)):  # fmt: skip
             ix = warp - self.x_warp
-            gB_s = tBgB[(None, 0, None, 0)]
+            gB_s = tBgB[(None, 0, None, mb % self.xcopies)]
             xs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
             for _ in cutlass.range(ix, unroll=1):
                 xs.advance()
@@ -504,7 +508,7 @@ class DenseMx8:
                 if cutlass.const_expr(not self.debug & 64):
                     for j in cutlass.range_constexpr(self.nb):
                         self._tma(
-                            tma_sfb, tBgSFB[(None, j, kk, 0)], tBsSFBs[j][(None, xs.index)],
+                            tma_sfb, tBgSFB[(None, j, kk, mb % self.xcopies)], tBsSFBs[j][(None, xs.index)],
                             bar, sfb_mask,
                         )  # fmt: skip
                 for _ in cutlass.range_constexpr(self.ix):
