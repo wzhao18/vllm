@@ -391,12 +391,10 @@ class SparseMlaPrefillH8:
         # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
-        # osm (A/B only): the pre-M11 softmax order (lazy-max exchange and the warpgroup
-        # grow OR before the P math)
-        knobs = tuple(knobs) + (0,) * (15 - len(knobs))
+        knobs = tuple(knobs) + (0,) * (14 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys, self.osm) = knobs[:15]
+         self.qkh, self.lglob, self.xphys) = knobs[:14]
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -1455,151 +1453,6 @@ class SparseMlaPrefillH8:
             if lane == 0:
                 mbar_arrive(_bar(base, B_SFREE + u % 2))
         self.ss(base, cta, lane, u, 8 * wg + 2, 1)
-        if cutlass.const_expr(self.osm):
-            return self.tail_osm(base, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2,
-                                 u, i, n, more, mp_last, lw, cta, smax, masked)
-        return self.tail(base, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
-                         more, mp_last, lw, cta, smax, masked)
-
-    @cute.jit
-    def mx(self, mbx, wg, sp, h, u, i, xm, more):
-        """Lazy-max decision of subtile u after the previous subtile's (other WG); the
-        decision is published to the other WG. Returns (m, grow, alpha)."""
-        grow = Int32(0)
-        alpha = Float32(1.0)
-        mp = Float32(0.0)
-        if u >= 1:
-            named_bar(Uint32(1 + sp + 3 * (1 - wg)), 64)
-        mprev = ld_shared_f32(mbx + Uint32(((u + 1) % 2) * H * 4 + h * 4))
-        if i == 0:
-            if xm > Float32(-1e30):
-                mp = xm - Float32(P_PRE)
-        else:
-            mp = mprev
-            if xm - mprev > Float32(P_PRE + THR):
-                grow = Int32(1)
-                mp = xm - Float32(P_PRE)
-                alpha = ex2(mprev - mp)
-        st_shared_f32(mbx + Uint32((u % 2) * H * 4 + h * 4), mp)
-        if more != 0:  # a subtile follows (this token's or the next token's)
-            named_bar_arrive(Uint32(1 + sp + 3 * wg), 64)
-        return mp, grow, alpha
-
-    @cute.jit
-    def pmath(self, xv, scale_log2, m, wv):
-        """P = 2^(s scale - m + ...) of the 64 keys as E4M3 words wv[16] (xv kept);
-        returns the row sum (same operations and order as the in-place form)."""
-        a0, a1 = Float32(0.0), Float32(0.0)
-        b0, b1 = Float32(0.0), Float32(0.0)
-        nm = Float32(0.0) - m
-        for ch in cutlass.range_constexpr(4):
-            for q in cutlass.range_constexpr(4):
-                k = 16 * ch + 4 * q
-                t0, t1 = ffma2(xv[k], xv[k + 1], scale_log2, scale_log2, nm, nm)
-                t2, t3 = ffma2(xv[k + 2], xv[k + 3], scale_log2, scale_log2, nm, nm)
-                p0 = ex2(t0)
-                p1 = ex2(t1)
-                p2 = ex2(t2)
-                p3 = ex2(t3)
-                a0, a1 = fadd2(a0, a1, p0, p1)
-                b0, b1 = fadd2(b0, b1, p2, p3)
-                wv[4 * ch + q] = cvt_e4m3x2(p0, p1) | (cvt_e4m3x2(p2, p3) << Uint32(16))
-        a0, a1 = fadd2(a0, a1, b0, b1)
-        return a0 + a1
-
-    @cute.jit
-    def tail(self, base, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n, more,
-             mp_last, lw, cta, smax, masked: cutlass.Constexpr):
-        """Softmax of subtile u after the S load (M11). From the third subtile of a token
-        on, P is computed with this WG's last m (the lazy max rarely moves) before the
-        exchange with the other WG and recomputed only if the decided m differs (same
-        operations on the same m: bitwise equal); the warpgroup grow OR runs after the P
-        stores, where every warp has to be done anyway for O-ready."""
-        mbx = base + Uint32(OFF_MBOX)
-        grow = Int32(0)
-        alpha = Float32(1.0)
-        mp = Float32(0.0)
-        psum = Float32(0.0)
-        wv = cute.make_rmem_tensor((16,), Uint32)
-        if real_m:
-            if cutlass.const_expr(masked):
-                for k in cutlass.range_constexpr(64):
-                    if 64 * i + k >= n:
-                        xv[k] = Float32(-math.inf)
-                xm = _tree_max([xv[k] for k in range(64)]) * scale_log2
-            else:
-                xm = smax * scale_log2
-            mu = mp_last
-            if i < 2:
-                mp, grow, alpha = self.mx(mbx, wg, sp, h, u, i, xm, more)
-                mu = mp
-            need = Int32(1)
-            for att in cutlass.range(2, unroll=1):
-                if need != 0:
-                    psum = self.pmath(xv, scale_log2, mu, wv)
-                    need = Int32(0)
-                    if i >= 2:
-                        if att == 0:
-                            mp, grow, alpha = self.mx(mbx, wg, sp, h, u, i, xm, more)
-                            if mp != mu:
-                                mu = mp
-                                need = Int32(1)
-            if mp != mp_last:
-                lw = lw * ex2(mp_last - mp)
-                mp_last = mp
-            lw = lw + psum
-        par = Uint32(wg * 2) + Uint32((u // 2) % 2)
-        gm = base + Uint32(OFF_GMASK) + par * Uint32(16)
-        alb = base + Uint32(OFF_AL) + par * Uint32(H * 4)
-        gw = ballot(Uint32(grow))
-        if lane == 0 and sp < 3:
-            st_shared_u32(gm + Uint32(4 * sp), gw)
-        if grow != 0:
-            st_shared_f32(alb + Uint32(h * 4), alpha)
-        self.ss(base, cta, lane, u, 8 * wg + 7, 1)
-        if u >= NP:
-            mbar_wait(_bar(base, B_PEMPTY + u % NP), Uint32((u // NP - 1) & 1))
-        self.ss(base, cta, lane, u, 8 * wg + 4, 1)
-        if real_m:
-            pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
-            for ch in cutlass.range_constexpr(4):
-                st_shared_v4(pbuf + Uint32(h * 64) + (
-                    (Uint32(ch) ^ ((Uint32(h) >> Uint32(1)) & Uint32(3))) << Uint32(4)),
-                    wv[4 * ch], wv[4 * ch + 1], wv[4 * ch + 2], wv[4 * ch + 3])
-        self.ss(base, cta, lane, u, 8 * wg + 5, 1)
-        anyg = bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow))
-        self.ss(base, cta, lane, u, 8 * wg + 3, 1)
-        self.rescale(base, lane_addr, u, gm, alb, anyg)
-        fence_async_smem()
-        cute.arch.sync_warp()
-        self.ss(base, cta, lane, u, 8 * wg + 6, 1)
-        if lane == 0:
-            mbar_arrive(_bar(base, B_OREADY + u % NP))
-        return mp_last, lw
-
-    @cute.jit
-    def rescale(self, base, lane_addr, u, gm, alb, anyg):
-        """Heads of subtile u that grew: rescale their O^T columns (one per block) after
-        PV(u - 1), before PV(u); every other column has alpha = 1."""
-        if anyg != Uint32(0):
-            mbar_wait(_bar(base, B_PEMPTY + (u - 1) % NP), Uint32(((u - 1) // NP) & 1))
-            tc_fence_after()
-            for w in cutlass.range_constexpr(3):
-                m = ld_shared_u32(gm + Uint32(4 * w))
-                while m != Uint32(0):
-                    j = bfind(m)
-                    m = m ^ (Uint32(1) << j)
-                    hh = Uint32(32 * w) + j
-                    al = ld_shared_f32(alb + hh * Uint32(4))
-                    col = lane_addr + Uint32(C_O) + hh
-                    o0, o1, o2, o3 = tmem_ld_o4(col)
-                    tmem_st_o4(col, o0 * al, o1 * al, o2 * al, o3 * al)
-            tc_fence_before()
-
-    @cute.jit
-    def tail_osm(self, base, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
-                 more, mp_last, lw, cta, smax, masked: cutlass.Constexpr):
-        """The pre-M11 order (A/B knob osm)."""
         mbx = base + Uint32(OFF_MBOX)
         grow = Int32(0)
         alpha = Float32(1.0)
