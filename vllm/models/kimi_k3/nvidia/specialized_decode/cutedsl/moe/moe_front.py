@@ -582,7 +582,11 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("tcgen05.fence::before_thread_sync;");
   __syncthreads();
-  if (warp == 1) {
+  // A top-k CTA holds its TMEM to its end: a dependent CTA waiting for TMEM on this
+  // SM (launched at our entry trigger) would otherwise start beside the top-k (in-step
+  // stamps: route_block 3-7x slower there). The others free it now.
+  const int row = smid < kMaxSmid ? p.smid_row[smid] : kMaxSmid;
+  if (warp == 1 && row >= n) {
     asm volatile("tcgen05.fence::after_thread_sync;");
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
   }
@@ -635,7 +639,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
          i += int64_t{gridDim.x} * kThreads)
       a.idx[i] = -1;
   }
-  const int row = smid < kMaxSmid ? p.smid_row[smid] : kMaxSmid;
   if (row < n) {
     // Every router tile's partials stored: sum this row's logits in rank order
     // (bitwise the tile sum) from the partials, one counter round trip fewer.
@@ -676,6 +679,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     }
     route_block(a, row, lg, s_bias, s_unb, s_cand,  // warps 1.. return inside
                 p.stamps ? p.stamps + blockIdx.x * kStampStride + 58 : nullptr);
+    if (warp == 1) {
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
+    }
   }
   if (threadIdx.x == 0) {
     STAMP(5);
