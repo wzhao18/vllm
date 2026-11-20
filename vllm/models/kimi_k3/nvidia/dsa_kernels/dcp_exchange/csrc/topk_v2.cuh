@@ -600,7 +600,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     __syncthreads();
     int nc = s_cnt;
-    if (!kFast && K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
+    if (K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
+      // (the hot instance too: a group's row that leaves the hot CTA costs every rank of
+      // the DCP group tier 3 plus the complete body, ~120-170 us, and at EP32 every rank of
+      // every group waits for it at the next MoE)
       // the sample bound failed (tie-heavy or skewed rows): exact counts per key over
       // 2048-key ranges of the SMEM row (from theta up on overflow, down otherwise) give a
       // threshold admitting about q + 256 keys (at least q, at most kV2Cand); then a second
