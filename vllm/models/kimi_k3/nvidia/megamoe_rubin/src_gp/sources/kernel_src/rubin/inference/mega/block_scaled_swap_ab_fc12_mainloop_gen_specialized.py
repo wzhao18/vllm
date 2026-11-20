@@ -28,6 +28,7 @@ on its own expert.
 
 from typing import ClassVar, Optional, Tuple
 
+import dataclasses
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -70,6 +71,7 @@ def _bind_tma_issue(exec_atom: cute.CopyAtom, tma_barrier: cute.Pointer, mcast_m
         mcast_mask = None
     return bind_executable_tma_load_fields(exec_atom, tma_bar_ptr=tma_barrier, tma_desc_ptr=None, mcast_mask=mcast_mask)
 
+@dataclasses.dataclass(frozen=True)
 class PairedStagePipeline:
     """A TMA-to-UMMA pipeline whose barriers each cover two consecutive SMEM stages.
 
@@ -79,8 +81,8 @@ class PairedStagePipeline:
     completes once both stages' bytes have landed and frees once both stages are consumed.
     """
 
-    def __init__(self, inner):
-        self.inner = inner
+    # A dataclass, so CuTe DSL can carry it through dynamic loops like the pipeline it wraps.
+    inner: object
 
     @staticmethod
     def _barrier_state(state: pipeline.PipelineState) -> pipeline.PipelineState:
