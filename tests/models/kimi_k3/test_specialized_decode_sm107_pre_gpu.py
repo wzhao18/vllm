@@ -50,23 +50,18 @@ def scaled_mm(xq, xs, wq, sw):
     )  # fmt: skip
 
 
-@pytest.mark.parametrize(
-    "n,k,rows",
-    [(N, K, ROWS), (12288, 7168, (96,)), (7168, 6144, (64, 96))],
-    ids=["kda_in", "shared_gu", "shared_down"],
-)
-def test_pre_bitwise(n, k, rows):
+def test_pre_bitwise_kda_in():
     torch.cuda.set_device(DEVICE)
-    wq, sw = mx_weight(n, k, 1)
-    proj = Mxfp8Projection((wq, sw), rows, family="t_pre", tactics=dict.fromkeys(rows, "pre"))
-    for r in rows:
-        x = torch.randn(r, k, device=DEVICE).bfloat16()
+    wq, sw = mx_weight(N, K, 1)
+    proj = Mxfp8Projection((wq, sw), ROWS, family="t_pre", tactics=dict.fromkeys(ROWS, "pre"))
+    for r in ROWS:
+        x = torch.randn(r, K, device=DEVICE).bfloat16()
         xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
-        out = torch.empty(r, n, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(r, N, device=DEVICE, dtype=torch.bfloat16)
         proj.run(x, out)
         assert torch.equal(out, scaled_mm(xq, xs, wq, sw)), r
-        tactic, _, _ = pre_tactic(n, k, r)
-        plain = Mxfp8PreGemm(n, k, r, tactic, use_pdl=False, prewait=0, device=DEVICE)
+        tactic, _, _ = pre_tactic(N, K, r)
+        plain = Mxfp8PreGemm(N, K, r, tactic, use_pdl=False, prewait=0, device=DEVICE)
         again = torch.empty_like(out)
         plain(xq, xs, wq, sw, again)
         assert torch.equal(again, out), r

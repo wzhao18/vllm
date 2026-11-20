@@ -60,12 +60,6 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
         (257, 512, ((128, 128), (1, 1), False, 128), 4),
     ),
-    # MoE shared expert gate_up / down (MX_TUNED rows 81-128 / 49-128): GEMM-EX1 r29/r30
-    # (us/call fi_cute / scaled_mm / pre 128x64 P8): gate_up n64 10.76 / 12.10 / 10.61,
-    # n96 11.99 / 12.17 / 10.80; down n64 8.44 / 8.90 / 7.87, n96 9.00 / 8.13 / 7.95
-    # (n32: pre 11.87 / 7.85 vs fi_cute 10.26 / 7.95; FlashInfer's n32 / n64 pick is swap_ab)
-    (12288, 7168): ((1, 128, ((128, 64), (1, 1), False, 128), 8),),
-    (7168, 6144): ((1, 128, ((128, 64), (1, 1), False, 128), 8),),
 }
 
 
@@ -92,8 +86,8 @@ BLOCK = 32  # MXFP8 block along K
 MX_TUNED: dict[tuple[int, int], dict] = {
     (12448, 7168): {"*": "1-384:pre,385-:scaled_mm"},
     (7168, 3072): {"*": "1-16:fi_cute,17-384:pre,385-:scaled_mm"},
-    (12288, 7168): {"*": "1-80:fi_cute,81-128:pre,129-:scaled_mm"},
-    (7168, 6144): {"*": "1-48:fi_cute,49-128:pre,129-:scaled_mm"},
+    (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
+    (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
 }  # fmt: skip
 
 
