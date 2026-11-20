@@ -132,6 +132,9 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_dielocal as prefill_attn_res_dielocal,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_lp as prefill_attn_res_lp,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_mxfp8 as prefill_attn_res_mxfp8,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -161,15 +164,18 @@ if TYPE_CHECKING:
 
 def _attn_res(
     prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor,
-    *args, **kwargs
+    *args, call: int | None = None, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """AttnRes with a BF16 output -> (output, updated prefix): the specialized
-    prefill kernel on prefill chunks (bit-identical to the native kernel; the
-    prefix moves to the die-local prefix buffer), the native one otherwise."""
-    if prefill_attn_res_mxfp8.use_for(prefix):
+    """AttnRes with a BF16 output -> (output, updated prefix): on a prefill
+    forward planned by ``attn_res_lp.begin`` the precomputed-logit kernel
+    (AttnRes call index ``call``; the prefix moves to the die-local prefix
+    buffer), the native one otherwise."""
+    if call is not None and prefill_attn_res_lp.active(blocks, prefix):
         prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
-        out = prefill_attn_res_mxfp8.attn_res_bf16(
-            prefix, delta, blocks, *args, prefix_out=prefix_out, **kwargs
+        out, _ = prefill_attn_res_lp.attn_res(
+            prefix, delta, blocks, call, kwargs["num_blocks"],
+            kwargs["block_write_idx"], args[2], kwargs["output_norm_eps"],
+            bf16_out=True, quant_out=False, prefix_out=prefix_out,
         )
         return out, prefix if prefix_out is None else prefix_out
     return attn_res(prefix, delta, blocks, *args, **kwargs), prefix
@@ -1590,6 +1596,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
+            call=2 * self.layer_idx,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1627,6 +1634,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=-1,
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            call=2 * self.layer_idx + 1,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1729,8 +1737,25 @@ class KimiDecoderLayer(nn.Module):
     ):
         """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
         the MXFP8 output (BF16 output only after attention)."""
-        prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
-        new_prefix = prefix_sum if prefix_out is None else prefix_out
+        if prefill_attn_res_lp.active(residual, prefix_sum):
+            prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
+            new_prefix = prefix_sum if prefix_out is None else prefix_out
+            if pre:
+                delta = hidden_states
+                num_blocks = self.prev_valid_blocks
+                widx = self.block_write_idx if self.is_block_write_layer else -1
+                onw = self.input_layernorm
+            else:
+                delta = None if self.is_block_write_layer else hidden_states
+                num_blocks = self.prev_valid_blocks + self.is_block_write_layer
+                widx = -1
+                onw = self.post_attention_layernorm
+            out, qa = prefill_attn_res_lp.attn_res(
+                prefix_sum, delta, residual, 2 * self.layer_idx + (not pre),
+                num_blocks, widx, onw.weight, onw.variance_epsilon,
+                bf16_out=not pre, quant_out=True, prefix_out=prefix_out,
+            )
+            return out, qa, new_prefix
         if pre:
             out, qa = prefill_attn_res_mxfp8.attn_res_mxfp8(
                 prefix_sum,
@@ -1746,9 +1771,8 @@ class KimiDecoderLayer(nn.Module):
                 eps=self.self_attention_res_norm.variance_epsilon,
                 output_norm_eps=self.input_layernorm.variance_epsilon,
                 bf16_out=False,
-                prefix_out=prefix_out,
             )
-            return out, qa, new_prefix
+            return out, qa, prefix_sum
         prefix_delta = None if self.is_block_write_layer else hidden_states
         out, qa = prefill_attn_res_mxfp8.attn_res_mxfp8(
             prefix_sum,
@@ -1762,9 +1786,8 @@ class KimiDecoderLayer(nn.Module):
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
             bf16_out=True,
-            prefix_out=prefix_out,
         )
-        return out, qa, new_prefix
+        return out, qa, prefix_sum
 
 
 # (param_name, shard_name, shard_id) for the merged DSA wkv_index.
@@ -1927,6 +1950,26 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             "num_attention_heads must be divisible by world_size"
         )
 
+    def _attn_res_lp_plan(self) -> "prefill_attn_res_lp.Plan":
+        """Per-call AttnRes queries of the whole forward (layer l: 2 l
+        pre-attention, 2 l + 1 post-attention; the final AttnRes last), built
+        once from the loaded weights."""
+        plan = getattr(self, "_attn_res_lp_plan_cache", None)
+        if plan is None:
+            norms = []
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                norms.append((layer.self_attention_res_norm, layer.self_attention_res_proj))
+                norms.append((layer.mlp_res_norm, layer.mlp_res_proj))
+            norms.append((self.output_attn_res_norm, self.output_attn_res_proj))
+            assert self.attn_res_block_size is not None
+            plan = self._attn_res_lp_plan_cache = prefill_attn_res_lp.Plan(
+                [(nm.weight, pj.weight.squeeze(0)) for nm, pj in norms],
+                [nm.variance_epsilon for nm, _ in norms],
+                self.attn_res_block_size,
+                self.num_attn_res_blocks,
+            )
+        return plan
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -2085,6 +2128,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 )
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
+            elif (
+                prefill_attn_res_lp.use_for(hidden_states)
+                and self.start_layer == 0
+                and get_pp_group().is_last_rank
+            ):
+                # Prefill: block logits precomputed per block write.
+                prefill_attn_res_lp.begin(self._attn_res_lp_plan(), block_residual)
             prefix_sum = hidden_states
             hidden_states = None
             residual = block_residual
@@ -2141,6 +2191,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
+                call=2 * self.end_layer,
             )
         else:
             hidden_states = hidden_states + residual

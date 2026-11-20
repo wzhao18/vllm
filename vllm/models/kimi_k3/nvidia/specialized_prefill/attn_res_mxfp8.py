@@ -28,8 +28,6 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform
 
-from . import attn_res_dielocal
-
 HIDDEN = 7168
 MXFP8_BLOCK = 32
 _SRC = os.path.join(os.path.dirname(__file__), "attn_res_mxfp8.cu")
@@ -81,52 +79,6 @@ def _module(chunk_depth: int = 2):
     return mod
 
 
-_PF_SRC = os.path.join(os.path.dirname(__file__), "attn_res_pf.cu")
-_pf_mod: list[object] = []
-
-
-def _pf_module():
-    """The two-tokens-in-flight AttnRes (attn_res_pf.cu), the production
-    kernel of :func:`attn_res_mxfp8`."""
-    if _pf_mod:
-        return _pf_mod[0]
-    with _lock:
-        if not _pf_mod:
-            from torch.utils.cpp_extension import load
-
-            import vllm.envs as envs
-
-            h = hashlib.sha256()
-            with open(_PF_SRC, "rb") as fh:
-                h.update(fh.read())
-            h.update(f"{torch.__version__} {torch.version.cuda}".encode())
-            tag = h.hexdigest()[:16]
-            build = os.path.join(envs.VLLM_CACHE_ROOT, "k31pf_attn_res_pf", tag)
-            os.makedirs(build, exist_ok=True)
-            _pf_mod.append(
-                load(
-                    name=f"k31pf_attn_res_pf_{tag}",
-                    sources=[_PF_SRC],
-                    extra_cflags=["-O3"],
-                    extra_cuda_cflags=[
-                        "-O3",
-                        "--use_fast_math",
-                        "--expt-relaxed-constexpr",
-                        "--expt-extended-lambda",
-                        "-U__CUDA_NO_HALF_OPERATORS__",
-                        "-U__CUDA_NO_HALF_CONVERSIONS__",
-                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                        "-U__CUDA_NO_HALF2_OPERATORS__",
-                        "-gencode",
-                        "arch=compute_100f,code=sm_100f",
-                    ],
-                    build_directory=build,
-                    verbose=False,
-                )
-            )
-    return _pf_mod[0]
-
-
 def supported(prefix: torch.Tensor, num_blocks: int, has_output_norm: bool) -> bool:
     """Capability of :func:`attn_res_mxfp8` (the native AttnRes contract)."""
     return (
@@ -157,7 +109,8 @@ def ring_depth(num_blocks: int) -> int:
 
 
 def warmup() -> None:
-    _pf_module()
+    _module(2)
+    _module(3)
 
 
 def attn_res_mxfp8(
@@ -173,7 +126,6 @@ def attn_res_mxfp8(
     output_norm_eps: float,
     bf16_out: bool,
     chunk_depth: int | None = None,
-    prefix_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, QuantizedActivation]:
     """``kimi_k3_attn_res`` (output RMSNorm applied) as MXFP8, and as BF16
     when ``bf16_out``. Returns ``(bf16 or None, QuantizedActivation)``."""
@@ -187,32 +139,7 @@ def attn_res_mxfp8(
     )
     out = torch.empty_like(prefix) if bf16_out else None
     if chunk_depth is None:
-        _pf_module().attn_res_pf(
-            prefix,
-            delta,
-            blocks,
-            norm_weight,
-            qk_weight,
-            output_norm_weight,
-            out,
-            q.view(torch.uint8),
-            sf,
-            num_blocks,
-            block_write_idx,
-            float(eps),
-            float(output_norm_eps),
-            *attn_res_dielocal.kernel_args(blocks),
-            prefix_out,
-        )
-        return out, QuantizedActivation(
-            data=q,
-            scale=sf,
-            orig_dtype=prefix.dtype,
-            orig_shape=torch.Size((rows, HIDDEN)),
-            quant_key=kMxfp8Dynamic,
-        )
-    # Explicit ring depth: the previous one-token-per-SM kernel (bench / test
-    # reference only).
+        chunk_depth = ring_depth(num_blocks)
     _module(chunk_depth).attn_res_mxfp8(
         prefix,
         delta,
@@ -236,40 +163,3 @@ def attn_res_mxfp8(
         quant_key=kMxfp8Dynamic,
     )
     return out, qa
-
-
-def attn_res_bf16(
-    prefix: torch.Tensor,
-    delta: torch.Tensor | None,
-    blocks: torch.Tensor,
-    norm_weight: torch.Tensor,
-    qk_weight: torch.Tensor,
-    output_norm_weight: torch.Tensor | None,
-    num_blocks: int,
-    block_write_idx: int,
-    eps: float,
-    output_norm_eps: float,
-    prefix_out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """The native kimi_k3_attn_res contract (BF16 output, optional output
-    RMSNorm) on the prefill kernel: bit-identical results; die-local block
-    reads when blocks is the die-local buffer."""
-    out = torch.empty_like(prefix)
-    _pf_module().attn_res_pf(
-        prefix,
-        delta,
-        blocks,
-        norm_weight,
-        qk_weight,
-        output_norm_weight,
-        out,
-        None,
-        None,
-        num_blocks,
-        block_write_idx,
-        float(eps),
-        float(output_norm_eps),
-        *attn_res_dielocal.kernel_args(blocks),
-        prefix_out,
-    )
-    return out

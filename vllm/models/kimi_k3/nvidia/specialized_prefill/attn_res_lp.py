@@ -167,6 +167,16 @@ def begin(plan: Plan, blocks: torch.Tensor) -> None:
     _state[0] = _Forward(plan, blocks)
 
 
+def active(blocks: torch.Tensor, prefix: torch.Tensor) -> bool:
+    """A planned prefill forward owns this AttnRes call's block buffer."""
+    st = _state[0]
+    return (
+        st is not None
+        and st.ptr == blocks.data_ptr()
+        and st.tokens == prefix.shape[0]
+    )
+
+
 def _forward_for(blocks: torch.Tensor, rows: int) -> _Forward:
     st = _state[0]
     if st is None or st.ptr != blocks.data_ptr() or st.tokens != rows:
@@ -240,7 +250,10 @@ def attn_res(
         *_schedule_args(blocks),
         _stamps,
     )
-    if block_write_idx >= 0 and plan.calls_after(block_write_idx) > 0:
+    if call == plan.num_calls - 1:
+        # The final AttnRes is the forward's last reader of the plan state.
+        _state[0] = None
+    elif block_write_idx >= 0 and plan.calls_after(block_write_idx) > 0:
         # v_b . w_c for every later call c: [2 * calls_after, rows] FP32
         # (hi rows, then lo rows).
         st.logits[block_write_idx] = torch.mm(
