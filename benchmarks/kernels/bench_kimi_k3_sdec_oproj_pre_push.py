@@ -100,9 +100,10 @@ def main():
             f"R{rows} tactic {tactic}: pushed words bitwise {same * 100:.3f}%  "
             f"pre {t_local:.2f} us  pre_push {t_push:.2f} us/call"
         )
-        if args.ks:
-            line += "  " + ks_push(rows, n, cap, x, copies, recv, peers, words)
         print(line, flush=True)
+        if args.ks:
+            print(f"R{rows} " + ks_push(rows, n, cap, x, copies, recv, peers, words),
+                  flush=True)  # fmt: skip
 
 
 def ks_push(rows, n, cap, x, copies, recv, peers, words):
