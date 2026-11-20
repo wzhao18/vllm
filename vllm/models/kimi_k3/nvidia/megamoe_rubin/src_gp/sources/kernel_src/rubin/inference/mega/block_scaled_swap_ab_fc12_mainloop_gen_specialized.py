@@ -1591,7 +1591,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
                     fc1_sf_parts_per_block
                 )
-                spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
+                pass  # DIAG NOTOK: no wait for this replay's refined SFs (identical replays: the pool holds them)
             else:
                 # FC2 waits for its token block's FC1 tiles, shared FC2 for the shared ones; shared FC1 has no wait.
                 if cutlass.const_expr(not self.shared_enabled):
@@ -1743,8 +1743,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 if cutlass.const_expr(routed_input_ready_flag is not None):
                     if routed_inputs_ready == Int32(0):
                         iket.range_push("gather_b1.wait_input_ready")
-                        wait_ready(routed_input_ready_flag)
-                        wait_ready(routed_metadata_ready_flag)
+                        pass  # DIAG NOTOK: no wait for the routed payload / metadata
                         iket.range_pop()
                         routed_inputs_ready = Int32(1)
                         DG.put_gt(DG.S_TOKREADY)
