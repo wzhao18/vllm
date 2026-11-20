@@ -163,9 +163,9 @@ def perf(args):
         d["row_bin"][2::3].zero_()  # the scorer zeroes the candidate counts
         run_select(d)
     res["select"] = timed(sel_only, args.iters)
-    words = d["bitmap"].numel() // d["row_len"].shape[0]
+
     ctas = torch.cuda.get_device_properties(0).multi_processor_count
-    mark, fin = pidx._select_kernels(ctas * 4, 2048, words)
+    mark, fin = pidx._select_kernels(ctas * 4, 2048)
     st = torch.cuda.current_stream().cuda_stream
     a = (d["logits"].view(torch.int16), d["row_base"], d["row_len"], d["row_bin"],
          d["bitmap"], d["cand"])
