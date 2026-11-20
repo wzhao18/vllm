@@ -16,7 +16,7 @@ from ......common.ptx_helpers import read_globaltimer_ns, read_smid
 ON = True
 REGION = "genphase.diag.stamps_ring"
 RING = 64
-SLOTS = 96
+SLOTS = 128
 MAX_SM = 256
 ENTRY_BYTES = MAX_SM * SLOTS * 8
 
@@ -40,6 +40,13 @@ S_TAU0, S_TAPH0 = 64, 80
 S_DIE = 7  # die + 1 of this CTA (die-aware builds)  # TMA-A unit k start time / phase, k < 16
 # comm grid (token_comm) CTAs: entry, previous-tail wait passed, role work done, refine done, exit, role, epoch tag
 C_ENTRY, C_EPOK, C_ROLE, C_REFINE, C_EXIT, C_ROLEID, C_EPOCH = 12, 13, 14, 15, 18, 20, 21
+# per-stage producer/consumer clock64 sums (D-MOE-TAPE psd): block base X_SH1 (shared FC1) / X_FC1 (routed FC1), offsets:
+X_SH1, X_FC1 = 96, 112
+XA_WAIT, XA_ISSUE, XA_TOTAL, XA_STAGES = 0, 1, 2, 3
+XB_WAIT, XB_ISSUE, XB_TOTAL, XB_STAGES = 4, 5, 6, 7
+XM_WAIT, XM_ISSUE, XM_TOTAL, XM_STAGES = 8, 9, 10, 11
+XM_ACCWAIT, XA_UNITS = 12, 13
+X_CLK_ENTRY, X_CLK_EXIT = 96 + 14, 96 + 15  # clock64 at entry / exit (globaltimer in S_ENTRY / S_EXIT)
 
 
 class _Bound:
@@ -103,6 +110,40 @@ def put_gt_dyn(slot, pred=None) -> None:
 def put_val_dyn(slot, value, pred=None) -> None:
     if cutlass.const_expr(ON):
         _st(_addr_dyn(slot), Int64(value), lane0() if pred is None else Int32(pred))
+
+
+@dsl_user_op
+def _acc(address: Int64, value: Int64, predicate: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value(), predicate.ir_value()],
+        "{\n\t.reg .pred p;\n\t.reg .u64 t;\n\tsetp.ne.s32 p, $2, 0;\n\t@p ld.volatile.global.u64 t, [$0];"
+        "\n\t@p add.u64 t, t, $1;\n\t@p st.global.u64 [$0], t;\n\t}",
+        "l,l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def acc_dyn(slot, value, pred) -> None:
+    """slot += value when pred != 0 (plain load + store: each slot has a single writer lane per SM)."""
+    if cutlass.const_expr(ON):
+        _acc(_addr_dyn(slot), Int64(value), Int32(pred))
+
+
+def x_rec(phase):
+    """(record?, slot base): shared FC1 -> X_SH1, routed FC1 -> X_FC1; other phases are not recorded."""
+    is_fc1 = Int32(phase == Int32(1))
+    is_sh1 = Int32(phase == Int32(3))
+    return lane0() * (is_fc1 + is_sh1), Int32(X_SH1) + Int32(X_FC1 - X_SH1) * is_fc1
+
+
+def zero_ext(pred) -> None:
+    if cutlass.const_expr(ON):
+        for j in cutlass.range_constexpr(96, SLOTS):
+            _st(_addr(j), Int64(0), Int32(pred))
 
 
 def unit_code(tile):

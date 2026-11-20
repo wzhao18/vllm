@@ -92,7 +92,7 @@ from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
 )
-from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
+from ......common.ptx_helpers import barrier_sync_unaligned, read_clock64, read_smid
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -1491,6 +1491,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         DG.put_gt(DG.S_ENTRY, Int32(cute.arch.thread_idx()[0] == Int32(0)))
         DG.put_val(DG.S_EPOCH, Int64(_dms_epoch) + Int64(1), Int32(cute.arch.thread_idx()[0] == Int32(0)))
         DG.put_val(DG.S_BLOCK, Int64(cute.arch.block_idx()[0]), Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.zero_ext(Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.put_val(DG.X_CLK_ENTRY, read_clock64(), Int32(cute.arch.thread_idx()[0] == Int32(0)))
 
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
@@ -1972,6 +1974,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         DG.put_gt(DG.S_EXIT, Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.put_val(DG.X_CLK_EXIT, read_clock64(), Int32(cute.arch.thread_idx()[0] == Int32(0)))
         self._device_workspace.remove_device_members()
 
 
