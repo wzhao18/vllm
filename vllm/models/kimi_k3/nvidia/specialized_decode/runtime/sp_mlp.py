@@ -69,9 +69,9 @@ ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
 # Rows whose latent up (stock's beta-add ``shared_out.addmm_(final, W^T)``) runs the
 # token-wide 2-CTA GEMM (``gemm.wide``, ``partials``) with K split over the given
 # number of CTA pairs and leaves FP32 split partials: the next layer's SP all-gather
-# boundary forms the output (partials summed in split order + the residual, rounded
-# once: ``attn_res.sp_fused.SplitDelta``), so there is no split exchange and no
-# separate sum. Weights are requested before the PDL wait; the MegaMoE top-k reduce
+# boundary forms the output as stock's cuBLAS beta-add does (bf16(bf16(partials
+# summed in split order) + residual), ``attn_res.sp_fused.SplitDelta``), so there
+# is no split exchange and no separate sum. Weights are requested before the PDL wait; the MegaMoE top-k reduce
 # releases its dependents at entry (its completion follows the shared expert's
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.

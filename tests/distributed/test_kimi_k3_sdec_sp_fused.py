@@ -244,11 +244,12 @@ def _worker(env: dict[str, str]) -> None:
                 assert _same_mx(scratch.view(n), ref, n), ("mx out", rows, layer)
                 if d is not None:
                     # A beta-add GEMM's FP32 split partials + residual (SplitDelta, the
-                    # latent up's form): bitwise the gather of the BF16 delta its own
-                    # epilogue would form (split order, one rounding).
+                    # latent up's form): bitwise the gather of the BF16 delta stock's
+                    # beta-add forms (split order; BF16 GEMM output, then + residual).
                     pv = _rand((3, n, WIDTH), ("q", rows, rank), device, 0.05).float()
                     resid = _rand((n, WIDTH), ("r", rows, rank), device, 0.1)
-                    want = (((pv[0] + pv[1]) + pv[2]) + resid.float()).bfloat16()
+                    gemm = ((pv[0] + pv[1]) + pv[2]).bfloat16().float()
+                    want = (gemm + resid.float()).bfloat16()
                     pb = sp_fused.SpBoundary(
                         comm, (pre_w, eps), (post_w, eps), prev,
                         layer // BLOCK if write else -1, max(SHARDS), {rows: True},

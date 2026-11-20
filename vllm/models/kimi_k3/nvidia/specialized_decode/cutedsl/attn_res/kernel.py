@@ -96,8 +96,10 @@ class ClusterAttnRes:
     ):  # fmt: skip
         # ``delta_parts`` (slots 0): the delta is the beta-add GEMM's output left as
         # FP32 split-K partials: ``post`` takes (partials [parts * n, 7168] FP32,
-        # residual [n, 7168] BF16) and forms the delta as that GEMM's epilogue would,
-        # the partials summed in split order plus the residual, rounded once to BF16.
+        # residual [n, 7168] BF16) and forms the delta as stock's cuBLAS beta-add does
+        # on Rubin (a BF16 output reduce-added into the residual: two roundings,
+        # measured bitwise on every element): bf16(bf16(partials summed in split
+        # order) + residual).
         assert not (delta_parts and slots), (delta_parts, slots)
         self.delta_parts = delta_parts
         # ``out_mc`` (row-sharded AttnRes, M >= 256, ``attn_res.sharded``): the output
@@ -261,7 +263,8 @@ class ClusterAttnRes:
 
     @cute.jit
     def sum_parts(self, delta, token, col, cur):
-        """cur[0, :8] = bf16(partials summed in split order + residual) at (token, col)."""
+        """cur[0, :8] = bf16(bf16(partials summed in split order) + residual) at
+        (token, col)."""
         parts, residual = delta
         n = residual.shape[0]
         for p in cutlass.range_constexpr(self.delta_parts):
@@ -274,11 +277,13 @@ class ClusterAttnRes:
                         cur[0, 4 * h + i] = bits_float(words[i])
                     else:
                         cur[0, 4 * h + i] = cur[0, 4 * h + i] + bits_float(words[i])
+        for j in cutlass.range_constexpr(4):  # the GEMM's BF16 output
+            round_pair(cur, 0, j)
         res = cute.make_rmem_tensor((1, 8), Float32)
         unpack(load_words(at(residual, token, col), count=4, mutable=True), res, 0)
         for i in cutlass.range_constexpr(8):
             cur[0, i] = cur[0, i] + res[0, i]
-        for j in cutlass.range_constexpr(4):
+        for j in cutlass.range_constexpr(4):  # + the residual, rounded again
             round_pair(cur, 0, j)
 
     @cute.jit

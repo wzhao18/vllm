@@ -297,8 +297,8 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
 class SplitDelta:
     """A beta-add GEMM's output left for the next boundary to form: FP32 split-K
     ``partials`` [parts * n, 7168] (split s in rows [s n, (s + 1) n)) and the BF16
-    ``residual`` [n, 7168]; the delta is bf16(sum of the partials in split order +
-    residual), the GEMM's own epilogue (``ClusterAttnRes.sum_parts``)."""
+    ``residual`` [n, 7168]; the delta is bf16(bf16(sum of the partials in split
+    order) + residual), stock's beta-add arithmetic (``ClusterAttnRes.sum_parts``)."""
 
     def __init__(self, partials, residual, parts):
         rows = residual.shape[0]
