@@ -40,7 +40,7 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
              7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
 STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
-PHASES_SP = {0: "start", 9: "landed+max", 10: "sampled", 1: "theta", 2: "pass", 13: "e", 14: "msg built",
+PHASES_SP = {0: "start", 9: "landed+max", 10: "sampled", 1: "theta", 11: "mask+scan", 12: "compacted", 2: "pass", 13: "e", 14: "msg built",
              15: "band", 3: "sent", 4: "polled", 16: "r:suffix", 17: "r:tau", 18: "r:ties", 5: "resolved", 6: "radix",
              7: "selected", 8: "end"}
 STATS_SP = ("rows", "one_round", "id_radix", "key_radix", "select_all", "-", "-", "-")

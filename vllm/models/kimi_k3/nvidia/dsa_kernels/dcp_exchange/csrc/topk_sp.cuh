@@ -36,11 +36,15 @@ template <int T>
 struct SpCfg {
   static constexpr int kWarps = T / 32;
   // SMEM row: the first kCapG 8-key groups (longer rows stream the rest from global
-  // memory and select in chunks of kCapG groups)
-  static constexpr int kCapG = T >= 1024 ? 10240 : 4608;
+  // memory and select in chunks of kCapG groups); the candidate pass gives thread t the
+  // kNR contiguous groups [kNR t, kNR t + kNR) (odd 16-byte pitch: conflict-free reads)
+  static constexpr int kNR = 9;
+  static constexpr int kCapG = kNR * T;
   static constexpr int kBmW = kCapG / 4;  // bitmap words per chunk (slot 8g + j)
+  static constexpr int kCand = 2 * kBmW;  // candidate list (aliases the bitmaps)
   static constexpr int kFB = kSpFine / T;
   static_assert(kFB * T == kSpFine && kV2MaxW * kSpRs <= kSpFine + 64, "SMEM aliasing");
+  static_assert(kCapG * 8 < (1 << 20), "candidate positions take 20 bits");
 };
 
 struct SpTh {
@@ -261,8 +265,81 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     __syncthreads();
     SPDBG(1);
     const int theta = s_i[0], e_est = s_i[1];
-    // ---- 2. keys >= theta: fine histogram, valid keys
-    {
+    // ---- 2. keys >= theta. Rows in SMEM: thread t tests its kNR contiguous groups (masks
+    // in registers, no atomics), one scan places every candidate in position order
+    // (cand[i] = position << 12 | min(key - theta, 4095)), then the fine histogram from
+    // the list; the band and the selection read the list, not the row. Longer rows,
+    // theta = key(+0) and lists over kCand take the full passes.
+    uint32_t* const cand = bm;  // the selection bitmaps are unused on the list path
+    int nc = 0;
+    bool ovf = ng > CG || theta == 0x8000;
+    if (!ovf) {
+      constexpr int NR = C::kNR, kMW = (NR + 3) / 4;
+      const int tg0 = tid * NR;
+      const uint32_t t2 = v2_th_bf16(theta);
+      uint32_t mk[kMW];
+#pragma unroll
+      for (int w = 0; w < kMW; ++w) mk[w] = 0u;
+      uint32_t cnt = 0, nv = 0;
+#pragma unroll
+      for (int i = 0; i < NR; ++i) {
+        const int g = tg0 + i;
+        if (g < ng) {
+          uint4 r = srow[g];
+          const int nvk = L - 8 * g;
+          if (K31_RARE(nvk < 8)) {  // positions >= L read as NaN
+            r.x |= (nvk > 0 ? 0u : 0xFFFFu) | (nvk > 1 ? 0u : 0xFFFF0000u);
+            r.y |= (nvk > 2 ? 0u : 0xFFFFu) | (nvk > 3 ? 0u : 0xFFFF0000u);
+            r.z |= (nvk > 4 ? 0u : 0xFFFFu) | (nvk > 5 ? 0u : 0xFFFF0000u);
+            r.w |= (nvk > 6 ? 0u : 0xFFFFu) | (nvk > 7 ? 0u : 0xFFFF0000u);
+          }
+          nv += K31_RARE(v2_is_nan2(v2_max_nan(r))) ? sp_nvalid(r) : 8u;
+          // 0xFFFF / 0 per key -> one byte per key (prmt) -> one bit per key (mask, mul)
+          const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
+          const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);
+          const uint32_t m8 = (((lo & 0x08040201u) * 0x01010101u) >> 24) |
+                              ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
+          cnt += __popc(m8);
+          mk[i / 4] |= m8 << (8 * (i % 4));
+        }
+      }
+      uint32_t tot;
+      int c = (int)(v2_scan<T>(cnt | (nv << 16), SPWS, &tot) & 0xFFFFu);
+      nc = (int)(tot & 0xFFFFu);
+      SPDBG(11);
+      ovf = nc > C::kCand;
+      if (!ovf) {
+        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(srow);
+#pragma unroll
+        for (int w = 0; w < kMW; ++w) {
+          uint32_t m = mk[w];
+          while (m) {
+            const int b = __ffs(m) - 1;
+            m &= m - 1;
+            const int pos = 8 * (tg0 + 4 * w + (b >> 3)) + (b & 7);
+            const uint32_t d = (keys2(s16[pos]) & 0xFFFFu) - (uint32_t)theta;
+            cand[c++] = ((uint32_t)pos << 12) | ::min(d, 4095u);
+          }
+        }
+        if (tid == 0) {
+          s_u[1] = (uint32_t)nc;
+          s_u[3] = tot >> 16;
+        }
+      }
+      __syncthreads();
+      SPDBG(12);
+      if (!ovf) {
+        uint32_t bey = 0;
+        for (int i = tid; i < nc; i += T) {
+          const uint32_t d = cand[i] & 0xFFFu;
+          if (d < (uint32_t)kSpFine) atomicAdd(&fine[d], 1u);
+          else ++bey;
+        }
+        bey = __reduce_add_sync(0xffffffffu, bey);
+        if (lane == 0 && bey) atomicAdd(&s_u[2], bey);
+      }
+    }
+    if (ovf) {
       const SpTh tt = sp_th(theta);
       uint32_t cnt = 0, bey = 0, nv = 0;
       auto visit = [&](int g, const uint4& r) {
@@ -355,7 +432,16 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     }
     __syncthreads();
     const int bl = s_i[4], bh = s_i[5];
-    if (s_i[9] >= 0) {  // the band's keys (<= kSpBand by the counts) with their positions
+    if (s_i[9] >= 0 && !ovf) {  // the band's keys from the list (bl >= theta)
+      for (int i = tid; i < nc; i += T) {
+        const uint32_t x = cand[i];
+        const int k = theta + (int)(x & 0xFFFu);
+        if (k >= bl && k <= bh) {
+          const uint32_t s = atomicAdd(&s_u[5], 1u);
+          if (s < kSpBand) bnd[s] = make_uint2(x >> 12, (uint32_t)k);
+        }
+      }
+    } else if (s_i[9] >= 0) {  // the band's keys (<= kSpBand by the counts) with their positions
       const SpTh tl = sp_th(bl), th1 = sp_th(bh + 1);
       auto visit = [&](int g, const uint4& r) {
         if (g >= ng) return;
@@ -630,8 +716,42 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       };
       const int nch = (ng + CG - 1) / CG;
       int gall = 0, cnt = 0;
+      // list path: every selected key is a candidate (tau >= lo >= theta); thread t
+      // owns the contiguous list range [cp t, cp t + cp) (position order)
+      const bool lsel = !ovf && lev0 < 0 && vtot > (uint32_t)K && tau >= theta;
+      if (lsel) {
+        const int cp = (nc + T - 1) / T, i0 = ::min(nc, tid * cp), i1 = ::min(nc, i0 + cp);
+        const uint32_t dt = (uint32_t)(tau - theta);
+        auto pick = [&](uint32_t x) -> int {  // 1 above tau, 2 selected tie, 0 neither
+          const uint32_t d = x & 0xFFFu;
+          if (d > dt) return 1;
+          return d == dt && (gstar == 0xFFFFFFFFu || gid_of((int)(x >> 12), p.rank) <= gstar) ? 2 : 0;
+        };
+        uint32_t cg = 0, ce = 0;
+        for (int i = i0; i < i1; ++i) {
+          const int s = pick(cand[i]);
+          cg += s == 1;
+          ce += s == 2;
+        }
+        uint32_t tot;
+        const uint32_t pre = v2_scan<T>(cg | (ce << 16), SPWS, &tot);
+        int gp = (int)(pre & 0xFFFFu), epi = (int)(tot & 0xFFFFu) + (int)(pre >> 16);
+        for (int i = i0; i < i1; ++i) {
+          const uint32_t x = cand[i];
+          const int s = pick(x);
+          if (s == 1) {
+            if (gp < K) orow[gp] = slot((int)(x >> 12));
+            ++gp;
+          } else if (s == 2) {
+            if (epi < K) orow[epi] = slot((int)(x >> 12));
+            ++epi;
+          }
+        }
+        cnt = (int)(tot & 0xFFFFu) + (int)(tot >> 16);
+        SPDBG(7);
+      }
 #pragma unroll 1
-      for (int sweep = nch > 1 ? 0 : 1; sweep < 2; ++sweep) {
+      for (int sweep = lsel ? 2 : nch > 1 ? 0 : 1; sweep < 2; ++sweep) {
         int grun = 0, erun = 0;
 #pragma unroll 1
         for (int c = 0; c < nch; ++c) {
