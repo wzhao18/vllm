@@ -600,25 +600,29 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // the SMEM path's candidate pass: every key >= thv with its position, in position
     // order; returns this thread's valid-key count
     auto cand_regp = [&](int thv, int gb, int ngc, int cbase) -> uint32_t {
-      // candidates in POSITION order: thread t owns the contiguous groups [kV2NR t, +kV2NR)
-      // (16-byte SMEM reads at an odd 16-byte pitch: conflict free), so one CTA scan of the
-      // per-thread counts places every candidate. The group tests are independent.
-      const int tg0 = tid * kV2NR;
+      // candidates in POSITION order with thread t on the groups t + T i (i < kV2NR) of the
+      // chunk: adjacent groups sit on adjacent threads (16-byte SMEM reads of consecutive
+      // groups: conflict free), so a cluster of candidates spreads over a warp's lanes (the
+      // thread-contiguous layout ran one thread's emit loop up to 64 keys deep). Per-block
+      // counts (16-bit fields) are scanned per warp; one barrier publishes the warps' block
+      // totals; each thread then appends its keys at block base + warp prefix + lane prefix.
       const uint32_t t2 = v2_th_bf16(thv);
       const bool kx = thv == 0x8000;
       constexpr int kMW = (kV2NR + 3) / 4;
+      constexpr int kPW = (kV2NR + 1) / 2;
+      const int lane = tid & 31, wid = tid >> 5;
       uint32_t mk[kMW];  // 8-bit key masks of the groups, 4 per word
+      uint32_t pk[kPW];  // per-block counts, 2 per word
 #pragma unroll
       for (int w = 0; w < kMW; ++w) mk[w] = 0u;
-      uint32_t cnt = 0;
+#pragma unroll
+      for (int w = 0; w < kPW; ++w) pk[w] = 0u;
       uint32_t nv = 0;
 #pragma unroll
       for (int i = 0; i < kV2NR; ++i) {
-        const int g = tg0 + i;
+        const int g = tid + kV2T * i;
         if (g < ngc) {
           const uint4 r = sgroup(g);
-          // (one NaN accumulator per thread + a recount measured no faster: the partial
-          // groups' threads recount on the scan's critical path)
           nv += v2_is_nan2(v2_max_nan(r)) ? v2_nvalid(r) : 8u;
           uint32_t m8;
           if (!kx) {
@@ -633,32 +637,65 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             for (int j = 0; j < 8; ++j)
               m8 |= (k8.key(j) >= (uint32_t)thv ? 1u : 0u) << j;
           }
-          cnt += __popc(m8);
           mk[i / 4] |= m8 << (8 * (i % 4));
+          pk[i >> 1] += (uint32_t)__popc(m8) << (16 * (i & 1));
         }
       }
       V2DBG(24);
-      uint32_t ctot;
-      int c = cbase + (int)v2_scan<T>(cnt, V2WS, &ctot);
-      V2DBG(25);
-      if (tid == 0) s_cnt = cbase + (int)ctot;
-      const uint16_t* srow16 = reinterpret_cast<const uint16_t*>(srow);
-      // (the fine histogram counted here instead of in its own pass measured slower:
-      // same-bin atomics serialize the emit loop; r24 21.2 vs 18.3 us)
 #pragma unroll
-      for (int w = 0; w < kMW; ++w) {
-        uint32_t m = mk[w];
-        while (m) {
-          const int b = __ffs(m) - 1;
-          m &= m - 1;
-          const int i = 4 * w + (b >> 3), j = b & 7;
-          const int g = tg0 + i;
-          if (c < kV2Cand) {
-            const uint32_t raw = srow16[8 * g + j];
-            cpos[c] = (uint32_t)(8 * (gb + g) - sh + j);
-            ckey[c] = (uint16_t)(keys2(raw) & 0xFFFFu);
+      for (int w = 0; w < kPW; ++w) {
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+          const uint32_t y = __shfl_up_sync(0xffffffffu, pk[w], o);
+          if (lane >= o) pk[w] += y;
+        }
+      }
+      // the warps' block totals in the sample histogram's first words (theta is known; the
+      // fine histogram re-zeroes it)
+      uint32_t* const wt = hist;
+      if (lane == 31) {
+#pragma unroll
+        for (int i = 0; i < kV2NR; ++i) wt[wid * kV2NR + i] = (pk[i >> 1] >> (16 * (i & 1))) & 0xFFFFu;
+      }
+      __syncthreads();
+      // lane i < kV2NR: block i's total over all warps, and over the warps before this one
+      uint32_t bt = 0, pre = 0;
+      if (lane < kV2NR) {
+#pragma unroll 4
+        for (int w2 = 0; w2 < kV2Warps; ++w2) {
+          const uint32_t v = wt[w2 * kV2NR + lane];
+          bt += v;
+          pre += w2 < wid ? v : 0u;
+        }
+      }
+      uint32_t xb = bt;
+#pragma unroll
+      for (int o = 1; o < 16; o <<= 1) {
+        const uint32_t y = __shfl_up_sync(0xffffffffu, xb, o);
+        if (lane >= o) xb += y;
+      }
+      const uint32_t ctot = __shfl_sync(0xffffffffu, xb, kV2NR - 1);
+      const uint32_t offl = xb - bt + pre;  // lane i: block i's first slot for this warp
+      if (tid == 0) s_cnt = cbase + (int)ctot;
+      V2DBG(25);
+      const uint16_t* srow16 = reinterpret_cast<const uint16_t*>(srow);
+#pragma unroll
+      for (int i = 0; i < kV2NR; ++i) {
+        const uint32_t base = __shfl_sync(0xffffffffu, offl, i);
+        uint32_t m = (mk[i / 4] >> (8 * (i % 4))) & 0xFFu;
+        if (m) {
+          const int g = tid + kV2T * i;
+          int c = cbase + (int)(base + ((pk[i >> 1] >> (16 * (i & 1))) & 0xFFFFu)) - __popc(m);
+          while (m) {
+            const int j = __ffs(m) - 1;
+            m &= m - 1;
+            if (c < kV2Cand) {
+              const uint32_t raw = srow16[8 * g + j];
+              cpos[c] = (uint32_t)(8 * (gb + g) - sh + j);
+              ckey[c] = (uint16_t)(keys2(raw) & 0xFFFFu);
+            }
+            ++c;
           }
-          ++c;
         }
       }
       V2DBG(26);
