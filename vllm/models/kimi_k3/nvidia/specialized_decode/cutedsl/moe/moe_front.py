@@ -304,9 +304,9 @@ template <bool kStamp>
 __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool mma, int lane) {
   const int xg = p.xg, xs = p.xs;
   // TMEM readiness is confirmed 4 weight blocks at a time (one wait + one fence: the
-  // fill commits each block, in order); MMAs are issued per batch = the rest of the
-  // current token group, all in TMEM or all in shared memory and inside the confirmed
-  // blocks, as soon as its tokens land (16 MMAs under one elect for a 4-block batch).
+  // fill commits each block, in order), so the MMAs run behind the fill. A whole
+  // 4-block token group inside the confirmed blocks issues its 16 MMAs under one
+  // elect; otherwise one block (4 MMAs) at a time, as soon as its tokens land.
   uint32_t a_tm = m.a_tm, xph = 0;
   uint64_t a_ss = m.a_ss, xb = m.x0 + p.xslot[0] * (kSlot >> 4);
   int jx = 0, gs = 0, g = 0, ready = 0;
@@ -322,59 +322,42 @@ __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool
     } else if (j == m.nt) {
       mbar_wait(m.res_bar, 0);
     }
-    const int jend = min(j + (xg - jx), tm ? ready : m.nk);
-    uint64_t b[4];
-    uint32_t rel = 0;  // token slots this batch frees (after its MMAs)
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      b[q] = 0;
-      if (j + q < jend) {
-        if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
-        b[q] = xb + static_cast<uint64_t>(jx) * m.xstep;
-        if (++jx == xg || j + q == m.nk - 1) {
-          if ((g + xs) * xg < m.nk) rel |= 1u << gs;
-          jx = 0;
-          ++g;
-          if (++gs == xs) {
-            gs = 0;
-            xph ^= 1;
-          }
-          xb = m.x0 + p.xslot[gs] * (kSlot >> 4);
-        }
-      }
-    }
+    if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
     if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
+    const int nb = xg == 4 && jx == 0 && j + 4 <= (tm ? ready : m.nk) ? 4 : 1;
     if (mma) {
-      if (jend - j == 4) {
+      if (nb == 4) {
         if (tm) {
-          mma16_ts(m.d_tm, a_tm, b[0], b[1], b[2], b[3], m.idesc, j);
+          mma16_ts(m.d_tm, a_tm, xb, xb + m.xstep, xb + 2 * m.xstep, xb + 3 * m.xstep, m.idesc, j);
         } else {
-          mma16_ss(m.d_tm, a_ss, b[0], b[1], b[2], b[3], m.idesc, j);
+          mma16_ss(m.d_tm, a_ss, xb, xb + m.xstep, xb + 2 * m.xstep, xb + 3 * m.xstep, m.idesc, j);
         }
+      } else if (tm) {
+        mma4_ts(m.d_tm, a_tm, xb + static_cast<uint64_t>(jx) * m.xstep, m.idesc, j);
       } else {
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-          if (j + q < jend) {
-            if (tm) {
-              mma4_ts(m.d_tm, a_tm + 32 * q, b[q], m.idesc, j + q);
-            } else {
-              mma4_ss(m.d_tm, a_ss + (kSlot >> 4) * q, b[q], m.idesc, j + q);
-            }
-          }
-        }
+        mma4_ss(m.d_tm, a_ss, xb + static_cast<uint64_t>(jx) * m.xstep, m.idesc, j);
       }
     }
-    while (rel != 0) {
-      commit_el(m.xempty0 + 8 * (__ffs(rel) - 1));
-      rel &= rel - 1;
-    }
-    if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
     if (tm) {
-      a_tm += 32 * (jend - j);
+      a_tm += 32 * nb;
     } else {
-      a_ss += (kSlot >> 4) * (jend - j);
+      a_ss += (kSlot >> 4) * nb;
     }
-    j = jend;
+    j += nb;
+    jx += nb;
+    if (jx == xg || j == m.nk) {
+      if ((g + xs) * xg < m.nk) commit_el(m.xempty0 + 8 * gs);
+      jx = 0;
+      ++g;
+      if (++gs == xs) {
+        gs = 0;
+        xph ^= 1;
+      }
+      xb = m.x0 + p.xslot[gs] * (kSlot >> 4);
+    }
+    if (kStamp && lane == 0 && j - nb < 19) {
+      p.stamps[blockIdx.x * kStampStride + 8 + j - nb] = clock64();
+    }
   }
 }
 
