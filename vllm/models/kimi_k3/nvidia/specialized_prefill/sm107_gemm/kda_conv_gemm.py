@@ -48,8 +48,13 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         # Drain skeletons (microbench only): 1 = drain + release, 2 = + math.
         self.epi_x2 = "x2" in flags
         self.epi_tanh = "tanh" in flags
+        self.epi_roll = 2 if "roll2" in flags else 1 if "roll" in flags else 0
+        self.epi_store = (
+            3 if "nost" in flags else 2 if "nosf" in flags else 1 if "st8" in flags else 0
+        )
         self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else 0
-        self.epi_drain_skel = next((i for i in (1, 2, 3, 4, 5, 6) if f"dskel{i}" in flags), 0)
+        self.ab_stage_cap = next((s for s in (3, 4, 5) if f"ab{s}" in flags), 0)
+        self.epi_drain_skel = next((i for i in (11, 10, 9, 1, 2, 3, 4, 5, 6, 7) if f"dskel{i}" in flags), 0)
         # Column-wise conv epilogue skeletons (microbench only, see
         # conv_epilogue.epilogue_kda_conv_t).
         self.conv_skel = next((i for i in (1, 2, 3, 4) if f"cskel{i}" in flags), 0)
@@ -62,7 +67,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
-            (tm, tn, 128),
+            (tm, tn, 256 if "k256" in flags else 128),
             cluster,
             prefetch_dist=0,
             swizzle_size=swz,

@@ -62,6 +62,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     NixlPullConnectorScheduler,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.metrics import iterlog
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
@@ -556,6 +557,18 @@ def test_p_scheduler_keeps_the_lease_while_the_send_is_held(kvfp_dir):
 # ----------------------------------------------------------------------------
 
 
+def _state_slots(engine, table) -> dict[int, int]:
+    """The running-state slot of each KDA group: its last block before the
+    speculative scratch slots."""
+    slots = {}
+    for g, group in enumerate(engine.scheduler.kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec) and table[g]:
+            scratch = min(spec.num_speculative_blocks, len(table[g]) - 1)
+            slots[g] = table[g][-1 - scratch]
+    return slots
+
+
 @pytest.mark.parametrize("kda_group", [None, 0], ids=["attention", "kda+attention"])
 def test_d_scheduler_sends_each_pull_with_its_plan(kvfp_dir, kda_group):
     """Two turns, the second hitting the m = 2 D blocks the first cached. Each
@@ -576,11 +589,13 @@ def test_d_scheduler_sends_each_pull_with_its_plan(kvfp_dir, kda_group):
     engine.step(finished={turn1.request_id})
     output = engine.step()
     meta = output.kv_connector_metadata
+    table1 = engine.scheduler.kv_cache_manager.get_block_ids(turn1.request_id)
     assert meta.fingerprint_pulls == {
         turn1.request_id: KVFingerprintReq(
             "prefill-1",
             engine.scheduler.kv_cache_manager.get_block_ids(turn1.request_id),
             m * d_block + 5,
+            state_blocks=_state_slots(engine, table1),
         )
     }
     assert meta.reqs_to_pair_exchange.keys() == {turn1.request_id}
@@ -596,7 +611,11 @@ def test_d_scheduler_sends_each_pull_with_its_plan(kvfp_dir, kda_group):
     meta = engine.step().kv_connector_metadata
     assert meta.fingerprint_pulls == {
         turn2.request_id: KVFingerprintReq(
-            "prefill-2", table, 4 * d_block + 3, first_block=m
+            "prefill-2",
+            table,
+            4 * d_block + 3,
+            first_block=m,
+            state_blocks=_state_slots(engine, table),
         )
     }
     # D logs table[attn][m:]: the blocks the plan exchanges, found without it.

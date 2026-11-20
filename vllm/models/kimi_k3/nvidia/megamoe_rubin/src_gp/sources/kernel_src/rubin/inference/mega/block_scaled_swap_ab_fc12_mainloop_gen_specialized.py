@@ -230,7 +230,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         # N64 / N128 geometries and register their exact completion bytes per stage.
         self.dynamic_gather = (
             self.mma_tiler_mnk in (self.n64_decode_tile, self.n128_decode_tile)
-            and self.cluster_shape_mn == (4, 1)
+            and self.cluster_shape_mn in ((4, 1), (2, 1))
             and self.use_2cta_instrs
             and not self.uses_asymmetric_ab_stages
         )

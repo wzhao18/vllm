@@ -270,6 +270,9 @@ class RemoteMeta:
     # whether P answers lease queries on its side channel.
     lease_deadline: float | None = None
     lease_check: bool = False
+    # Sub-blocks per remote block the scheduler expanded ``block_ids`` into
+    # (DCP pair mode with a larger remote per-rank block); 1 when unexpanded.
+    sub_blocks: int = 1
 
 
 @dataclass
@@ -322,6 +325,9 @@ class KVFingerprintReq:
     # without cells, so the comparator reports the request's cells missing on
     # D rather than listing it as P only.
     exchanged: bool = True
+    # Per SSM (KDA) group: the running-state slot a transfer moves
+    # (clip_ssm_state_blocks of the request's own blocks).
+    state_blocks: dict[int, int] = field(default_factory=dict)
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -413,5 +419,6 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             ),
             lease_deadline=kv_transfer_params.get("remote_lease_deadline"),
             lease_check=kv_transfer_params.get("remote_lease_check") is True,
+            sub_blocks=kv_transfer_params.get("remote_sub_blocks", 1),
         )
         self.reqs_to_recv[request_id] = req
