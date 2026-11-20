@@ -45,7 +45,13 @@ from cutlass.cute.nvgpu import tcgen05
 from vllm.logger import init_logger
 
 from ..attn_res.kernel import BESIDE_SMEM
-from ..common.host import architecture, layout, stream, to_cute
+from ..common.host import (
+    architecture,
+    layout,
+    prepare_shared_carveout,
+    stream,
+    to_cute,
+)
 from ..common.policy import batch_table
 from ..common.primitives import (
     asm,
@@ -1736,6 +1742,15 @@ class PreparedKdaHead:
                         self.core.heads, bf16_state, self.core.has_bias, specs, arch,
                         b // q, self.weight.shape[1], b in self.polled, tokens=q,
                     )  # fmt: skip
+            # SignalGemm runs on the side stream next to the head kernels: every one
+            # asks for the full shared-memory carveout, so whichever lands first on an
+            # idle SM leaves room for the other (a default carveout locks the SM's
+            # config and pushes the co-running CTA into a second wave).
+            codes = [self.fa_code, *self.kernels.values(), *self.polled_kernels.values()]
+            codes += [compile_signal(t, arch) for t in set(FA_TACTIC_ROWS.values())]
+            codes += list(self.verify_kernels.values())
+            for code in codes:
+                prepare_shared_carveout(code, self.device.index, 100)
         return self
 
     def run_verify(self, x, out, *, caches, slots, accepted, rearm=None):
