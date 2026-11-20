@@ -186,6 +186,31 @@ class PlainGemm:
         self._compiled(*args, problem, stream, *tail)
 
 
+def shape_tactic(n: int, tactic):
+    """``tactic`` fitted to an ``n``-column problem, or ValueError.
+
+    The conv epilogue stores with raw global addresses (no column bound), so
+    every N tile the persistent scheduler hands out must lie inside ``n``:
+    whole cluster columns (``n`` a multiple of tile N x cluster N), and with the
+    "m" raster a swizzle that divides the number of cluster columns (the
+    scheduler pads that count up to a multiple of the swizzle; the padded
+    clusters would run tiles past column ``n`` and write past the Q|K|V planes
+    and side rows). The swizzle drops to its largest divisor of the cluster
+    column count; it only orders tiles, the result is bit for bit the same.
+    The "n" raster pads M instead, whose rows the epilogue bounds."""
+    (_, tn), (_, cn), _, swz, raster = tactic[:5]
+    if n % (tn * cn):
+        raise ValueError(
+            f"KDA conv GEMM: N {n} is not a multiple of tile N x cluster N {tn}x{cn}"
+        )
+    if raster == "m":
+        ncl = n // (tn * cn)
+        fit = max(d for d in range(1, swz + 1) if ncl % d == 0)
+        if fit != swz:
+            tactic = (*tactic[:3], fit, *tactic[4:])
+    return tactic
+
+
 def side_rows(m: int, nseq: int) -> int:
     return 6 * ((m + 127) // 128) + 6 * nseq
 
@@ -207,7 +232,7 @@ class KdaConvGemm:
             raise ValueError(f"KDA conv GEMM: unsupported N/K {self.n}/{self.k}")
         if tuple(conv_w.shape) != (self.n, 4) or conv_w.dtype != torch.float32:
             raise ValueError(f"KDA conv GEMM: conv weight {tuple(conv_w.shape)}")
-        self.tactic = tactic or DEFAULT_TACTIC
+        self.tactic = shape_tactic(self.n, tactic or DEFAULT_TACTIC)
         self.drain = drain and self.tactic[0][0] == 2 * self.tactic[2]
         # Column-pair weight layout for the branch-free column pass:
         # [col pair][tap][col, col + 1] (aligned f32x2 operands).
