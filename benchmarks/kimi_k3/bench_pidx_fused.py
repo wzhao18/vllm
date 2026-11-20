@@ -272,7 +272,7 @@ def perf_ref(args):
     import importlib.util
     import os
     spec = importlib.util.spec_from_file_location(
-        "pidx_ref", os.path.join(os.path.dirname(__file__), "pidx_ref_9eca.py"))
+        "pidx_ref", os.path.join(os.path.dirname(__file__), args.refmod))
     ref = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ref)
     d = make([(5461, 78360), (5461, 78360), (5462, 78360)], seed=0)
@@ -304,6 +304,7 @@ def main():
     ap.add_argument("--ncu", action="store_true")
     ap.add_argument("--samples", type=int, default=0)
     ap.add_argument("--margin", type=float, default=0.0)
+    ap.add_argument("--refmod", default="pidx_ref_9eca.py")
     a = ap.parse_args()
     if a.samples:
         pidx.SAMPLES = a.samples
