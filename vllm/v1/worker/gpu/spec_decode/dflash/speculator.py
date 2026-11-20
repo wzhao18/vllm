@@ -601,7 +601,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
         index = self._stage_context_rows(rows)
         n = int(rows.size)
-        kept = gather_aux_rows(aux_hidden_states, index)
+        # The draft model may gather the rows itself (same contract).
+        gather = getattr(self.model, "gather_aux_rows", None) or gather_aux_rows
+        kept = gather(aux_hidden_states, index)
         combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
         if combine_aux_rows is not None:
             combine_aux_rows(kept, 0, n, self.hidden_states[:n])
