@@ -1520,10 +1520,23 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
-                initial_state = gather_initial_states(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    has_initial_state,
+                # The persistent prefill kernel reads and writes the state
+                # cache rows in place (no gather / row-scatter launches).
+                inplace_state = (
+                    self.kda_prefill_backend == "flashkda"
+                    and self._frost
+                    and self._kda_persistent
+                    and checkpoint is None
+                    and m.non_spec_query_start_loc_cpu is not None
+                )
+                initial_state = (
+                    None
+                    if inplace_state
+                    else gather_initial_states(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
+                    )
                 )
                 if self.kda_prefill_backend == "flashkda":
                     assert self.gate_lower_bound is not None
@@ -1552,6 +1565,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         and flashkda_out.is_contiguous()
                         else None
                     )
+                    if inplace_state and seg_plan is not None:
+                        # Segment-parallel route: it takes gathered states.
+                        inplace_state = False
+                        initial_state = gather_initial_states(
+                            recurrent_state,
+                            non_spec_state_indices_tensor,
+                            has_initial_state,
+                        )
                     if (
                         seg_plan is not None
                         and seg_plan.num_seqs == initial_state.shape[0]
@@ -1643,6 +1664,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     initial_state=initial_state,
                                     cu_seqlens=non_spec_query_start_loc,
                                     cu_seqlens_cpu=m.non_spec_query_start_loc_cpu,
+                                    state_cache=(
+                                        recurrent_state if inplace_state else None
+                                    ),
+                                    state_indices=non_spec_state_indices_tensor,
+                                    has_initial_state=has_initial_state,
                                 )
                             )
                         else:
@@ -1738,12 +1764,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
                     )
-                # One row-copy launch (same result as the index_put_).
-                prefill_glue.write_state_rows(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    last_recurrent_state,
-                )
+                # One row-copy launch (same result as the index_put_);
+                # in-place prefill already wrote the cache rows.
+                if last_recurrent_state is not None:
+                    prefill_glue.write_state_rows(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        last_recurrent_state,
+                    )
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None

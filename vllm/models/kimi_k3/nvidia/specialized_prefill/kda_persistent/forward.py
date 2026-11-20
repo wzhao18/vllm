@@ -68,8 +68,10 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    state_rows: bool = False,
 ):
     key = (
+        state_rows,
         dev.index,
         torch.cuda.get_device_capability(dev),
         H,
@@ -133,6 +135,7 @@ def _get_compiled(
         sptn = torch.full((G,), T // 2, dtype=torch.int32, device=dev)
         ssrc = torch.full((G,), -1, dtype=torch.int32, device=dev)
         sdst = torch.full((G,), -1, dtype=torch.int32, device=dev)
+        srow_d = torch.zeros(2 * G, dtype=torch.int32, device=dev)
         mid = torch.empty(
             2, D, D, dtype=torch.bfloat16 if mid_bf16 else torch.float32, device=dev
         )
@@ -156,6 +159,7 @@ def _get_compiled(
                 from_dlpack(dtb, assumed_align=16),
                 mk(st),
                 mk(ns),
+                mk(srow_d, 4),
                 mk(out),
                 mk(cu_t, 4),
                 mk(soff, 4),
@@ -199,6 +203,7 @@ def _get_compiled(
                 FULL_CHUNKS_=1 if full_chunks else 0,
                 LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
                 CLUSTER_=int(cluster_size),
+                SROW_=1 if state_rows else 0,
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
@@ -238,6 +243,42 @@ def _dummy_mid(dev: torch.device):
         )
         _DUMMY_MID[key] = tensors
     return tensors
+
+
+_DUMMY_SROW: dict = {}
+
+
+def _dummy_srow(dev: torch.device):
+    tensor = _DUMMY_SROW.get(dev.index)
+    if tensor is None:
+        tensor = torch.zeros(2, dtype=torch.int32, device=dev)
+        _DUMMY_SROW[dev.index] = tensor
+    return tensor
+
+
+def state_cache_rows(cache, indices, has_initial_state, H: int):
+    """In-place state I/O on the recurrent-state cache ``cache`` [slots, H, D, D]
+    (FP32, each slot dense; slot stride a multiple of D*D elements).
+
+    Returns ``(rows, srow)``: ``rows`` is a flat (R, D, D) view of the cache
+    storage and ``srow`` the int32 [2 * N * H] chain->row table (load row, or
+    -1 for a zero initial state; then store row) for ``fwd(..., srow=srow)``.
+    Same result as gather_initial_states + fwd + write_state_rows.
+    """
+    assert cache.dtype == torch.float32 and cache.shape[1:] == (H, D, D)
+    assert cache.stride()[1:] == (D * D, D, 1)
+    rs, rem = divmod(cache.stride(0), D * D)
+    if rem:
+        raise ValueError(f"state slot stride {cache.stride(0)} is not a multiple of {D * D}")
+    nrows = rs * (cache.shape[0] - 1) + H
+    rows = cache.as_strided((nrows, D, D), (D * D, D, 1))
+    n = indices.numel()
+    base = indices.to(torch.int32).view(n, 1) * rs + torch.arange(
+        H, dtype=torch.int32, device=cache.device
+    )
+    load = torch.where(has_initial_state[:n].view(n, 1).bool(), base, -1)
+    srow = torch.cat((load.reshape(-1), base.reshape(-1))).to(torch.int32)
+    return rows, srow
 
 
 def _tprobe_buf(G: int, dev: torch.device):
@@ -288,6 +329,7 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    srow=None,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -310,6 +352,11 @@ def _launch_forward(
     if final_state is None:
         final_state = torch.empty(nseqs, H, D, D, dtype=torch.float32, device=dev)
     have_state = 1 if initial_state is not None else 0
+    if srow is not None:
+        # initial_state / final_state are the same flat (rows, D, D) view of
+        # the recurrent-state cache; srow maps chains to its rows.
+        assert initial_state is not None and final_state is not None
+        assert srow.numel() == 2 * nseqs * H and srow.dtype == torch.int32
     st = initial_state if initial_state is not None else final_state
     if st.dtype != torch.float32:
         st = st.float()
@@ -358,6 +405,7 @@ def _launch_forward(
         prep_peel=prep_peel,
         cluster_size=cluster_size,
         gate_roll=gate_roll,
+        state_rows=srow is not None,
         partial_tma=partial_tma,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
@@ -369,8 +417,11 @@ def _launch_forward(
         bf_,
         A_log,
         dt_bias.view(H, D),
-        st.view(nseqs * H, D, D),
-        final_state.view(nseqs * H, D, D),
+        st.view(-1, D, D) if srow is not None else st.view(nseqs * H, D, D),
+        final_state.view(-1, D, D)
+        if srow is not None
+        else final_state.view(nseqs * H, D, D),
+        srow if srow is not None else _dummy_srow(dev),
         of,
         cu_t,
         soff,
@@ -623,6 +674,7 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     plan=None,
+    srow=None,
 ):
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
@@ -675,4 +727,5 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
+        srow=srow,
     )

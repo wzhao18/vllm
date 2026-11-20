@@ -147,6 +147,23 @@ def _exp2f(x):
     return cute.math.exp2(x, fastmath=True)
 
 
+@dsl_user_op
+def _clock64(*, loc=None, ip=None):
+    """SM cycle counter (dev wait-anatomy probe, TPROBE_ == 2 only)."""
+    value = llvm.inline_asm(
+        T.i64(),
+        [],
+        "mov.u64 $0, %clock64;",
+        "=l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int64(value)
+
+
 def _tanhf(x):
     return cute.math.tanh(x, fastmath=True)
 
@@ -187,6 +204,7 @@ def _pkd(
     out_raw: cute.Tensor,
     state0: cute.Tensor,
     stateT: cute.Tensor,
+    srow: cute.Tensor,
     cu: cute.Tensor,
     soff: cute.Tensor,
     schain: cute.Tensor,
@@ -232,6 +250,7 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    SROW_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -636,8 +655,20 @@ def _pkd(
         # Previous chunk's MB_OFIN; a parity-1 wait on a fresh barrier passes.
         ofin_stage = cutlass.Int32(STAGES - 1)
         ofin_phase = cutlass.Int32(1)
+        cwQ = cutlass.Int64(0)
+        cwV = cutlass.Int64(0)
+        cwO = cutlass.Int64(0)
+        cwU = cutlass.Int64(0)
+        cwF = cutlass.Int64(0)
         for kx in cutlass.range(k1 - k0):
             chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+            crow_i = chain
+            crow_o = chain
+            if cutlass.const_expr(SROW_ == 1):
+                crow_i = cute.arch.make_warp_uniform(srow[chain])
+                crow_o = cute.arch.make_warp_uniform(
+                    srow[srow.shape[0] // 2 + chain]
+                )
             seq_idx = chain // H_
             hidx = chain % H_
             # piece-of-chain descriptor (v96 split): token window + state
@@ -706,9 +737,16 @@ def _pkd(
                                     g8i = cute.local_tile(
                                         state0,
                                         (1, 1, 8),
-                                        (chain, vv0, win * 4 + jj),
+                                        (crow_i, vv0, win * 4 + jj),
                                     )
-                                    _load_state_f32x8(g8i, r8i)
+                                    if cutlass.const_expr(SROW_ == 1):
+                                        if crow_i >= 0:
+                                            _load_state_f32x8(g8i, r8i)
+                                        else:
+                                            for ez in cutlass.range_constexpr(8):
+                                                r8i[ez] = cutlass.Float32(0.0)
+                                    else:
+                                        _load_state_f32x8(g8i, r8i)
                             else:
                                 for e in cutlass.range_constexpr(cute.size(r_mst)):
                                     r_mst[e] = cutlass.Float32(0.0)
@@ -723,16 +761,28 @@ def _pkd(
                                 r_mst.iterator + 8 * jj, cute.make_layout((8,))
                             )
                             g8i = cute.local_tile(
-                                state0, (1, 1, 8), (chain, vv0, win * 4 + jj)
+                                state0, (1, 1, 8), (crow_i, vv0, win * 4 + jj)
                             )
-                            _load_state_f32x8(g8i, r8i)
+                            if cutlass.const_expr(SROW_ == 1):
+                                if crow_i >= 0:
+                                    _load_state_f32x8(g8i, r8i)
+                                else:
+                                    for ez in cutlass.range_constexpr(8):
+                                        r8i[ez] = cutlass.Float32(0.0)
+                            else:
+                                _load_state_f32x8(g8i, r8i)
                     else:
                         for e in cutlass.range_constexpr(cute.size(r_mst)):
                             r_mst[e] = cutlass.Float32(0.0)
                 cute.copy(mst_st, r_mst, mst_sthr.partition_D(msth))
             cute.arch.fence_view_async_tmem_store()
             for t in cutlass.range(t_tiles):  # noqa: B007
-                cute.arch.mbarrier_wait(mb + MB_QK + csc, p_qk)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    ccQ = _clock64()
+                    cute.arch.mbarrier_wait(mb + MB_QK + csc, p_qk)
+                    cwQ += _clock64() - ccQ
+                else:
+                    cute.arch.mbarrier_wait(mb + MB_QK + csc, p_qk)
                 m0 = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + 64, dtype=cutlass.Float32),
                     mst_base.layout,
@@ -798,8 +848,18 @@ def _pkd(
                                 r_bt_f_old.iterator + 8 * gv2, cute.make_layout((8,))
                             )
                             cute.autovec_copy(v_bt8[(gv2, None, csc)], b8d)
-                cute.arch.mbarrier_wait(mb + MB_VFULL + csc, p_vf)
-                cute.arch.mbarrier_wait(mb + MB_OOUT + csc, p_oo)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    ccV = _clock64()
+                    cute.arch.mbarrier_wait(mb + MB_VFULL + csc, p_vf)
+                    cwV += _clock64() - ccV
+                else:
+                    cute.arch.mbarrier_wait(mb + MB_VFULL + csc, p_vf)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    ccO = _clock64()
+                    cute.arch.mbarrier_wait(mb + MB_OOUT + csc, p_oo)
+                    cwO += _clock64() - ccO
+                else:
+                    cute.arch.mbarrier_wait(mb + MB_OOUT + csc, p_oo)
                 twri = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + ri4_col, dtype=cutlass.BFloat16),
                     w32b_base.layout,
@@ -880,7 +940,12 @@ def _pkd(
                     cute.arch.mbarrier_arrive(mb + MB_VFREE + csc)
                 u_inp_bar.arrive()
 
-                cute.arch.mbarrier_wait(mb + MB_U2ACC + csc, p_u2a)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    ccU = _clock64()
+                    cute.arch.mbarrier_wait(mb + MB_U2ACC + csc, p_u2a)
+                    cwU += _clock64() - ccU
+                else:
+                    cute.arch.mbarrier_wait(mb + MB_U2ACC + csc, p_u2a)
                 if cutlass.const_expr(GATE2_ == 1):
                     for half in cutlass.range_constexpr(2):
                         t_vst_h = cute.make_tensor(
@@ -913,7 +978,12 @@ def _pkd(
                     cute.arch.fence_view_async_tmem_store()
                     u2_inp_bar.arrive()
 
-                cute.arch.mbarrier_wait(mb + MB_FIN + csc, p_fin)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    ccF = _clock64()
+                    cute.arch.mbarrier_wait(mb + MB_FIN + csc, p_fin)
+                    cwF += _clock64() - ccF
+                else:
+                    cute.arch.mbarrier_wait(mb + MB_FIN + csc, p_fin)
                 ofin_stage = csc
                 ofin_phase = p_fin
                 csc += 1
@@ -960,7 +1030,7 @@ def _pkd(
                                         g8o = cute.local_tile(
                                             stateT,
                                             (1, 1, 8),
-                                            (chain, vv2, win * 4 + jj),
+                                            (crow_o, vv2, win * 4 + jj),
                                         )
                                         _store_final_f32x8(g8o, r8o)
                         else:
@@ -969,12 +1039,12 @@ def _pkd(
                                     g8o = cute.local_tile(
                                         stateT,
                                         (1, 1, 8),
-                                        (chain, vv2, win * 4 + jj),
+                                        (crow_o, vv2, win * 4 + jj),
                                     )
                                     _store_final_f32x8(g8o, r8o)
                             else:
                                 g8o = cute.local_tile(
-                                    stateT, (1, 1, 8), (chain, vv2, win * 4 + jj)
+                                    stateT, (1, 1, 8), (crow_o, vv2, win * 4 + jj)
                                 )
                                 _store_final_f32x8(g8o, r8o)
             if cutlass.const_expr(SPLIT_ == 1):
@@ -989,6 +1059,14 @@ def _pkd(
                 if warp == 0:
                     with cute.arch.elect_one():
                         tprobe[slot * 64 + kx * 2 + 1] = cute.arch.globaltimer()
+        if cutlass.const_expr(TPROBE_ == 2):
+            if warp == 0:
+                with cute.arch.elect_one():
+                    tprobe[slot * 64 + 8] = cwQ
+                    tprobe[slot * 64 + 9] = cwV
+                    tprobe[slot * 64 + 10] = cwO
+                    tprobe[slot * 64 + 11] = cwU
+                    tprobe[slot * 64 + 12] = cwF
 
     # =====================================================================
     # EPILOGUE warpgroup (warps 4-7)
@@ -1069,6 +1147,13 @@ def _pkd(
         pqn = cutlass.Int32(0)
         for kx in cutlass.range(k1 - k0):
             chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+            crow_i = chain
+            crow_o = chain
+            if cutlass.const_expr(SROW_ == 1):
+                crow_i = cute.arch.make_warp_uniform(srow[chain])
+                crow_o = cute.arch.make_warp_uniform(
+                    srow[srow.shape[0] // 2 + chain]
+                )
             seq_idx = chain // H_
             hidx = chain % H_
             bos = cutlass.Int32(cu[seq_idx]) + cute.arch.make_warp_uniform(
@@ -1131,9 +1216,16 @@ def _pkd(
                                     g8i = cute.local_tile(
                                         state0,
                                         (1, 1, 8),
-                                        (chain, vv0, 8 + hh * 2 + jj),
+                                        (crow_i, vv0, 8 + hh * 2 + jj),
                                     )
-                                    _load_state_f32x8(g8i, r8i)
+                                    if cutlass.const_expr(SROW_ == 1):
+                                        if crow_i >= 0:
+                                            _load_state_f32x8(g8i, r8i)
+                                        else:
+                                            for ez in cutlass.range_constexpr(8):
+                                                r8i[ez] = cutlass.Float32(0.0)
+                                    else:
+                                        _load_state_f32x8(g8i, r8i)
                             else:
                                 for e in cutlass.range_constexpr(cute.size(r_e1)):
                                     r_e1[e] = cutlass.Float32(0.0)
@@ -1148,9 +1240,16 @@ def _pkd(
                                 r_e1.iterator + 8 * jj, cute.make_layout((8,))
                             )
                             g8i = cute.local_tile(
-                                state0, (1, 1, 8), (chain, vv0, 8 + hh * 2 + jj)
+                                state0, (1, 1, 8), (crow_i, vv0, 8 + hh * 2 + jj)
                             )
-                            _load_state_f32x8(g8i, r8i)
+                            if cutlass.const_expr(SROW_ == 1):
+                                if crow_i >= 0:
+                                    _load_state_f32x8(g8i, r8i)
+                                else:
+                                    for ez in cutlass.range_constexpr(8):
+                                        r8i[ez] = cutlass.Float32(0.0)
+                            else:
+                                _load_state_f32x8(g8i, r8i)
                     else:
                         for e in cutlass.range_constexpr(cute.size(r_e1)):
                             r_e1[e] = cutlass.Float32(0.0)
@@ -1380,7 +1479,7 @@ def _pkd(
                                         g8o = cute.local_tile(
                                             stateT,
                                             (1, 1, 8),
-                                            (chain, vv2e, 8 + hh * 2 + jj),
+                                            (crow_o, vv2e, 8 + hh * 2 + jj),
                                         )
                                         _store_final_f32x8(g8o, r8o)
                         else:
@@ -1389,12 +1488,12 @@ def _pkd(
                                     g8o = cute.local_tile(
                                         stateT,
                                         (1, 1, 8),
-                                        (chain, vv2e, 8 + hh * 2 + jj),
+                                        (crow_o, vv2e, 8 + hh * 2 + jj),
                                     )
                                     _store_final_f32x8(g8o, r8o)
                             else:
                                 g8o = cute.local_tile(
-                                    stateT, (1, 1, 8), (chain, vv2e, 8 + hh * 2 + jj)
+                                    stateT, (1, 1, 8), (crow_o, vv2e, 8 + hh * 2 + jj)
                                 )
                                 _store_final_f32x8(g8o, r8o)
             if cutlass.const_expr(SPLIT_ == 1):
@@ -1464,13 +1563,27 @@ def _pkd(
             if cutlass.const_expr(True):
                 csm = cutlass.Int32(0)
                 pm_oe = cutlass.Int32(1)
+                sw0 = cutlass.Int64(0)
+                sw1 = cutlass.Int64(0)
+                sw2 = cutlass.Int64(0)
+                sw3 = cutlass.Int64(0)
+                swn = cutlass.Int64(0)
+                swt = cutlass.Int64(0)
+                if cutlass.const_expr(TPROBE_ == 2):
+                    swt = _clock64()
                 for kx in cutlass.range(k1 - k0):
                     chain = cute.arch.make_warp_uniform(schain[k0 + kx])
                     seq_idx = chain // H_
                     seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
                     t_tiles = (seq_len + C - 1) // C
                     for _t in cutlass.range(t_tiles):
-                        state_inp_bar.arrive_and_wait()
+                        if cutlass.const_expr(TPROBE_ == 2):
+                            sc0 = _clock64()
+                            state_inp_bar.arrive_and_wait()
+                            sw0 += _clock64() - sc0
+                            swn += 1
+                        else:
+                            state_inp_bar.arrive_and_wait()
                         mma_1.set(tcgen05.Field.ACCUMULATE, False)
                         for kb in cutlass.range_constexpr(D // 16):
                             cute.gemm(
@@ -1483,7 +1596,12 @@ def _pkd(
                             mma_1.set(tcgen05.Field.ACCUMULATE, True)
                         with cute.arch.elect_one():
                             tcgen05.commit(mb + MB_OOUT + csm)
-                        cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
+                        if cutlass.const_expr(TPROBE_ == 2):
+                            sc1 = _clock64()
+                            cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
+                            sw1 += _clock64() - sc1
+                        else:
+                            cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
                         mma_1.set(tcgen05.Field.ACCUMULATE, False)
                         for kb in cutlass.range_constexpr(D // 16):
                             cute.gemm(
@@ -1497,7 +1615,12 @@ def _pkd(
                         with cute.arch.elect_one():
                             tcgen05.commit(mb + MB_RFREE + csm)
 
-                        u_inp_bar.arrive_and_wait()
+                        if cutlass.const_expr(TPROBE_ == 2):
+                            sc2 = _clock64()
+                            u_inp_bar.arrive_and_wait()
+                            sw2 += _clock64() - sc2
+                        else:
+                            u_inp_bar.arrive_and_wait()
                         mma_3.set(tcgen05.Field.ACCUMULATE, False)
                         for kb in cutlass.range_constexpr(C // 16):
                             cute.gemm(
@@ -1530,7 +1653,12 @@ def _pkd(
                                 t_d4a,
                             )
                         else:
-                            u2_inp_bar.arrive_and_wait()
+                            if cutlass.const_expr(TPROBE_ == 2):
+                                sc3 = _clock64()
+                                u2_inp_bar.arrive_and_wait()
+                                sw3 += _clock64() - sc3
+                            else:
+                                u2_inp_bar.arrive_and_wait()
                             for kb in cutlass.range_constexpr(C // 16):
                                 cute.gemm(
                                     mma_4a,
@@ -1557,6 +1685,14 @@ def _pkd(
                         if csm == STAGES:
                             csm = 0
                         pm_oe ^= 1
+                if cutlass.const_expr(TPROBE_ == 2):
+                    with cute.arch.elect_one():
+                        tprobe[slot * 64 + 0] = _clock64() - swt
+                        tprobe[slot * 64 + 1] = swn
+                        tprobe[slot * 64 + 2] = sw0
+                        tprobe[slot * 64 + 3] = sw1
+                        tprobe[slot * 64 + 4] = sw2
+                        tprobe[slot * 64 + 5] = sw3
         if warp == 10:
             csl = cutlass.Int32(0)
             pl_vfree = cutlass.Int32(1)
@@ -2389,6 +2525,7 @@ def _launch_pkd(
     dt_bias: cute.Tensor,
     state0: cute.Tensor,
     stateT: cute.Tensor,
+    srow: cute.Tensor,
     out: cute.Tensor,
     cu: cute.Tensor,
     soff: cute.Tensor,
@@ -2435,6 +2572,7 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    SROW_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2614,6 +2752,7 @@ def _launch_pkd(
         out,
         state0,
         stateT,
+        srow,
         cu,
         soff,
         schain,
@@ -2659,6 +2798,7 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        SROW_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
