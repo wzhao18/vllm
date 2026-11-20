@@ -101,7 +101,10 @@ _SHARED_FC1, _SHARED_FC2, _SHARED_DONE = 0, 1, 2
 
 
 class SharedExpertStreamMixin:
-    """Places the shared FC1/FC2 tiles around the routed work (FC2 first when ``early``, last when ``tail``)."""
+    """Places the shared FC1/FC2 tiles around the routed work (FC2 first when ``early``, last when ``tail``; when
+    ``ready``, FC2 is claimed only once every shared FC1 tile is done, routed work meanwhile: no cluster parks on
+    shared FC2 behind shared FC1). ``ready`` needs a scheduler that binds the shared FC1-done gate
+    (``_shared_fc2_ready``)."""
 
     def _bind_shared_expert_stream(
         self,
@@ -154,8 +157,10 @@ class SharedExpertStreamMixin:
         if position is None or position == "auto":
             # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its tiles.
             position = "early" if self._shared_phase_tiles[1] <= self.compute_cluster_count else "tail"
-        if position not in ("early", "tail"):
-            raise ValueError(f"shared_l2_position must be 'auto', 'early' or 'tail', got {position!r}.")
+        if position not in ("early", "tail", "ready"):
+            raise ValueError(f"shared_l2_position must be 'auto', 'early', 'tail' or 'ready', got {position!r}.")
+        if position == "ready" and not getattr(self, "shared_fc2_ready_gate", False):
+            raise ValueError(f"shared_l2_position 'ready' is not supported by {type(self).__name__}.")
         self.shared_fc2_position = position
         swizzle = int(impl_desc.get("shared_fc1_swizzle") or 0)
         if swizzle < 0:
@@ -255,7 +260,9 @@ class SharedExpertStreamMixin:
 
     @cute.jit
     def gen_next_work(self) -> SchedulerWorkTileBase:
-        """Shared FC1, early shared FC2, routed work past the expert-sizes gate, tail shared FC2, then DONE."""
+        """Shared FC1, early shared FC2, routed work past the expert-sizes gate, tail shared FC2, then DONE. ``ready``:
+        after shared FC1, each claim first asks (cluster-uniform) whether every shared FC1 tile is done and claims
+        shared FC2 if so, routed work otherwise; once the routed sources are exhausted, the remaining shared FC2."""
         if cutlass.const_expr(self.shared_fc2_position is None):
             if cutlass.const_expr(self._expert_sizes_ready_pointer is not None):
                 self._expert_sizes_ready = self._wait_expert_sizes_ready(self._expert_sizes_ready)
@@ -271,6 +278,15 @@ class SharedExpertStreamMixin:
         if cutlass.const_expr(self.shared_fc2_position == "early"):
             if stage == Int32(_SHARED_FC2):
                 work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
+        if cutlass.const_expr(self.shared_fc2_position == "ready"):
+            if stage == Int32(_SHARED_FC2):
+                if not routed_done:
+                    # stage FC2 here means this call's FC1 claim (if any) came back past the end: no valid tile yet
+                    ready, work_id_worker = self._shared_fc2_ready(work_id_worker)
+                    if ready:
+                        work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
+                            work_id_worker, stage, next_id, 1
+                        )
         if not work_tile.is_valid_tile:
             if not routed_done:
                 # Stores on ``self`` make the DSL carry the state touched by the routed call out of this branch.
@@ -281,7 +297,7 @@ class SharedExpertStreamMixin:
                 work_id_worker = self._work_id_worker
                 if not work_tile.is_valid_tile:
                     routed_done = Boolean(True)
-            if cutlass.const_expr(self.shared_fc2_position == "tail"):
+            if cutlass.const_expr(self.shared_fc2_position in ("tail", "ready")):
                 if routed_done & (stage == Int32(_SHARED_FC2)):
                     work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
                         work_id_worker, stage, next_id, 1
