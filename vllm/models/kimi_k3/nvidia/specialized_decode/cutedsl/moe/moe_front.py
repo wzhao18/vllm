@@ -1068,7 +1068,10 @@ def _front_plan(device: int, items: int, item_slots: tuple, router_items: int) -
 
     table = dies.sm_domains(device)
     by_die = [[s for s, d in enumerate(table) if d == die] for die in (0, 1)]
-    split = min(len(by_die[0]), items)
+    # Spare SMs (no item) on die 0, beside the top-k rows of the router items: they warm
+    # the tail's code into the L2 those rows fetch it from.
+    spare = max(0, sum(len(b) for b in by_die) - items)
+    split = min(len(by_die[0]) - min(spare, len(by_die[0])), items)
     if items - split > len(by_die[1]) or len(table) > _MAX_SMID:
         raise Unsupported("moe", None, f"moe_front: {items} items on {len(table)} SMs")
     plan = torch.full((2 * _MAX_SMID + 3,), -1, dtype=torch.int32)
