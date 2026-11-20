@@ -1545,6 +1545,17 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
                 extra = f" attn {_ulps(att, ref[2])}"
             print(f"DBG5 {where} {tag}: out vs eager3 {_d(out, ref[1])} attn vs eager3 "
                   f"{_d(att, ref[2])}{extra} decode-in {tdiff} decode-out {odiff}")
+            if ts and ref[3] and not torch.equal(ts[0], ref[3][0]):
+                a, b = ts[0].view(torch.uint8), ref[3][0].view(torch.uint8)
+                idx = (a != b).nonzero()
+                rows = torch.unique(idx[:, 0]).tolist()
+                heads = torch.unique(idx[:, 1]).tolist() if idx.shape[1] > 1 else []
+                vals = [(tuple(i.tolist()), int(a[tuple(i)]), int(b[tuple(i)])) for i in idx[:6]]
+                odd_ff = int((a[a != b] == 0xFF).sum())
+                ref_ff = int((b[a != b] == 0xFF).sum())
+                print(f"DBG6 {where} {tag}: query shape {tuple(a.shape)} rows {rows[:12]} "
+                      f"({len(rows)}) heads {heads[:12]} ({len(heads)}) samples {vals} "
+                      f"0xFF odd {odd_ff} ref {ref_ff}")
         _barrier()
 
     if refusals:
