@@ -83,11 +83,10 @@ PREWAIT_ROWS = (64, 96)
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
-# The split latent up's (weight stages, activation stages) per row count, in Rubin's oversized shared memory
-# (cutedsl.gemm.wide OVERSIZED_BUDGET): 16-17 of a split's 18-19 weight stages land before the inputs are ready,
-# and the activation ring is deep enough that the rows stream in at the L2 rate (the opt-in limit left 4-6
-# activation stages: the rows' TMA reads paced the MMA after the wait). Rows not listed keep the default rings.
-LATENT_UP_RINGS = {32: (17, 16), 64: (16, 15), 96: (16, 10)}
+# The split latent up's (weight stages, activation stages) per row count within the opt-in shared memory: the
+# activation ring deep enough that the rows stream in at the L2 rate after the wait (the default rings left 4-6
+# activation stages at 64 / 96 rows: the rows' TMA reads paced the MMA). Rows not listed keep the default rings.
+LATENT_UP_RINGS = {32: (11, 16), 64: (10, 14), 96: (9, 12)}
 
 
 class SplitKFront:
