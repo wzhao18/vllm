@@ -41,6 +41,7 @@ from .weights import RubinMoeWeights, validate_kernel_weights
 _DMS_OUT = _dms_os.environ.get("DMS_STAMPS_OUT", "")
 _DMS_SESSIONS: list = []
 _DMS_SIG: dict = {}
+_DMS_T: dict = {}
 _DMS_N = [0]
 
 
@@ -49,9 +50,12 @@ def _dms_dump(current) -> None:
         _DMS_SESSIONS.append(current)
     if not _DMS_OUT or torch.cuda.is_current_stream_capturing():
         return
+    now = _dms_time.time()
     for s in _DMS_SESSIONS:
         lw = getattr(s, "local_workspace", None)
-        if lw is None or s is current:
+        # one dump per eager pass: graph replays run no Python, so the first eager launch after a gap of
+        # >= 1 s sees the ring of the previous case's replays (the last 32 launches)
+        if lw is None or now - _DMS_T.get(id(s), 0.0) < 1.0:
             continue
         ws = s.kernel._device_workspace
         name = "genphase.diag.stamps_ring"
@@ -62,6 +66,7 @@ def _dms_dump(current) -> None:
         ring = lw[off:off + nb].view(torch.int64).view(32, 256, 64)
         sig = int(ring[:, :, 63].sum()) + int(ring[:, :, 1].sum() % 1000003)
         key = id(s)
+        _DMS_T[key] = now
         if sig == 0 or _DMS_SIG.get(key) == sig:
             continue
         _DMS_SIG[key] = sig
