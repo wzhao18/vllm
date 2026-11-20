@@ -47,6 +47,31 @@ def reserved_bytes() -> int:
     return SCRATCH_BUDGET
 
 
+def writes_full_rows(
+    use_fp4_cache: bool,
+    topk_tokens: int,
+    num_heads: int,
+    dcp_world_size: int,
+    has_shardq: bool,
+    has_candidate_blocks: bool,
+    has_pcp: bool,
+) -> bool:
+    """The layer-invariant part of ``applicable``: the selective prefill indexer
+    runs and writes every prefill row's top-k in full (every column, -1 padded) iff
+    this holds and the step has prefill chunks. The fused key insert uses it to skip
+    the -1 fill of those rows."""
+    return (
+        use_fp4_cache
+        and topk_tokens == 2048
+        and num_heads == pidx.HEADS
+        and dcp_world_size == 1
+        and not has_shardq
+        and not has_candidate_blocks
+        and not has_pcp
+        and current_platform.is_device_capability((10, 7))
+    )
+
+
 def applicable(
     use_fp4_cache: bool,
     topk_tokens: int,
@@ -60,16 +85,12 @@ def applicable(
     from vllm.logger import init_logger
 
     ok = (
-        use_fp4_cache
-        and topk_tokens == 2048
+        writes_full_rows(
+            use_fp4_cache, topk_tokens, q_quant.shape[1], dcp_world_size, has_shardq,
+            has_candidate_blocks, any(c.pcp_deinterleave_idx is not None for c in chunks),
+        )
         and q_scale is not None
-        and q_quant.shape[1] == pidx.HEADS
-        and dcp_world_size == 1
-        and not has_shardq
-        and not has_candidate_blocks
         and len(chunks) > 0
-        and all(c.pcp_deinterleave_idx is None for c in chunks)
-        and current_platform.is_device_capability((10, 7))
     )
     init_logger(__name__).info_once(
         "Kimi K3.1 sm_107 selective prefill indexer: %s (fp4=%s topk=%d heads=%d "

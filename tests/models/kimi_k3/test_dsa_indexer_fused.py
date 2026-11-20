@@ -413,6 +413,29 @@ def test_k_norm_quant_insert_mxfp4(packed: bool, num_tokens: int):
     assert torch.all(topk[num_tokens:] == 7)
 
 
+@pytest.mark.parametrize("skip", [(0, 33), (2, 30), (5, 40)])
+@torch.inference_mode()
+def test_k_norm_quant_insert_mxfp4_fill_skip(skip):
+    """fill_skip = (lo, hi): rows the caller's top-k writes in full keep their
+    contents; every other row of [:num_tokens] is -1 filled; the cache insert is
+    unchanged."""
+    num_tokens = 33
+    torch.manual_seed(0)
+    num_blocks, k, weight, bias, eps, slots = _index_k_inputs(num_tokens)
+    ref_k = F.layer_norm(k.float(), (HEAD_DIM,), weight, bias, eps).to(k.dtype)
+    ref_raw, ref_view = _ref_mxfp4_cache(False, num_blocks, ref_k[: slots.shape[0]], slots)
+    out_raw, out_view = _make_cache(False, num_blocks, MXFP4_ENTRY)
+    topk = torch.full((num_tokens + 5, TOPK), 7, dtype=torch.int32, device="cuda")
+    mxfp4_k_norm_quant_insert(
+        k, weight, bias, eps, slots, out_view, topk, num_tokens, fill_skip=skip
+    )
+    _assert_mxfp4_cache_close(out_raw, out_view, ref_raw, ref_view)
+    rows = torch.arange(num_tokens + 5, device="cuda")
+    kept = (rows >= num_tokens) | ((rows >= skip[0]) & (rows < skip[1]))
+    assert torch.all(topk[kept] == 7)
+    assert torch.all(topk[~kept] == -1)
+
+
 @pytest.mark.parametrize("num_heads", [NUM_HEADS, 20])
 @pytest.mark.parametrize("num_tokens", [1, 33, 1100])
 @torch.inference_mode()
