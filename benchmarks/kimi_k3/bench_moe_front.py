@@ -120,6 +120,7 @@ def main():
     ap.add_argument("--busy-us", type=float, default=6.0)
     ap.add_argument("--cfg", action="append", default=[], help="ks,ns")
     ap.add_argument("--no-base", action="store_true")
+    ap.add_argument("--stamp-modes", default="0,1", help="debug bits per stamped pass")
     ap.add_argument("--carveout", type=int, default=-1, help="producer preferred smem carveout (-1 default)")
     args = ap.parse_args()
     dev = torch.device("cuda")
@@ -201,7 +202,7 @@ def main():
         print(line, flush=True)
         # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]
-        for skel_mode in (0, 1):
+        for skel_mode in [int(v) for v in args.stamp_modes.split(",")]:
             grid = 35 * c[0]
             st = torch.zeros(grid * 64 + skel_mode, dtype=torch.int64, device=dev)
             end = torch.zeros(1, dtype=torch.int64, device=dev)
@@ -230,7 +231,7 @@ def main():
                 v = s[:, i][sv[:, i] != 0]
                 if v.numel():
                     parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
-            print(f"  stamps{' SKELETON' if skel_mode else ''} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
+            print(f"  stamps dbg{skel_mode} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
                   flush=True)
             for cta in (0, grid // 2, grid - 1):
                 c0 = int(sv[cta, 32])

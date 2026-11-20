@@ -74,7 +74,8 @@ struct Params {
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
   int kb, rtiles, ks, ns, xs, xg, na, nt_max, nr_max, yfull;
   int dcol, acol;  // TMEM columns of D [n] and of the first weight K block  // xs: token op slots of xg blocks
-  int debug;  // microbench only (0 in production): bit 0 skips the MMAs
+  int debug;  // microbench only (0 in production): bit 0 skips the MMAs, bit 1 one
+              // accumulator poller, bit 2 no per-K-block stamps
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -339,7 +340,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         mbar_wait(res_bar, 0);
       }
       if (j == 0 && lane == 0) STAMP(6);
-      if (lane == 0 && j < 24 && p.stamps) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
+      if (lane == 0 && j < 24 && p.stamps && !(p.debug & 4)) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
       const uint64_t b0 = smem_desc(ring_s + xs * n * 128);
       if (p.debug & 1) {
       } else if (j < nt) {
@@ -353,13 +354,19 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       }
       if ((j % p.xg == p.xg - 1 || j == nk - 1) && (g + p.xs) * p.xg < nk)
         commit_el(xempty0 + 8 * gs);
-      if (lane == 0 && j < 24 && p.stamps) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
+      if (lane == 0 && j < 24 && p.stamps && !(p.debug & 4)) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
     }
     commit_el(acc_bar);
   } else if (warp >= 4) {
     // D (TMEM lane = weight row, column = token) -> this CTA's FP32 partial.
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    mbar_wait_sleep(acc_bar, 0);
+    if (p.debug & 2) {
+      if (threadIdx.x == 128) mbar_wait_sleep(acc_bar, 0);
+      asm volatile("bar.sync 1, 128;" ::: "memory");
+      mbar_wait(acc_bar, 0);  // completed: acquire for every thread
+    } else {
+      mbar_wait_sleep(acc_bar, 0);
+    }
     if (threadIdx.x == 128) STAMP(7);
     asm volatile("tcgen05.fence::after_thread_sync;");
     const int q = warp & 3, row = q * 32 + lane;
