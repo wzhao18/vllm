@@ -133,6 +133,20 @@ def st_relaxed_sys_v2_b64(address: Int64, low: Int64, high: Int64) -> None:
 
 
 @cute.jit
+def st_global_b32(address: Int64, value: Int32) -> None:
+    """Plain 4-byte global store: one canonical SF word (four SF bytes of one row)."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+
+
+@cute.jit
 def _int32_bits_to_float32(bits: Int32) -> cutlass.Float32:
     return cutlass.Float32(llvm.bitcast(T.f32(), bits.ir_value()))
 
@@ -1422,7 +1436,8 @@ class GenphaseTokenComm(KernelComponent):
             DG.put_gt(DG.C_ROLE, _dms_t0)
             DG.put_val(DG.C_ROLEID, Int64(3), _dms_t0)
 
-        self._run_refine(device_workspace, smem_base, thread_idx)
+        if cutlass.const_expr(self.sf_plain_transport):
+            self._run_refine(device_workspace, smem_base, thread_idx)
         DG.put_gt(DG.C_REFINE, _dms_t0)
         self._leave(device_workspace, thread_idx)
         DG.put_gt(DG.C_EXIT, _dms_t0)
@@ -2261,7 +2276,15 @@ class GenphaseTokenComm(KernelComponent):
 
         gather_index = device_workspace.tensor(self.gather_index_region)
         if cutlass.const_expr(not self.sf_plain_transport):
-            row_source_ll_address = self._ll_half_address(device_workspace, self.refine_row_source_ll_region, call_tag)
+            # The scatter places each route's scale factors straight into the canonical
+            # pool (there is no refine pass on the LL transport): word w of the source
+            # token's LL row holds the four SF bytes of atom column w, which are
+            # contiguous for one row inside the 32x4x4 atom.
+            ll_sf = self.dense_sf_ll_tensor(device_workspace, call_tag)
+            canonical = self.canonical_activation_sf_tensor(device_workspace)
+            data_expert_base = device_workspace.tensor(self.data_expert_base_region)
+            sf_expert_base = device_workspace.tensor(self.sf_expert_base_region)
+            sf_vec_size = self.quant_kind.sf_vec_size
         token_metadata = device_workspace.tensor(self.token_src_metadata_region)
         routed_scores = self.fc1_topk_scores_tensor(device_workspace)
         if cutlass.const_expr(self.apply_topk_at_fc1):
@@ -2294,16 +2317,27 @@ class GenphaseTokenComm(KernelComponent):
                     pool_row = base_row[buckets[route_round]] + offsets[route_round]
                     gather_index[pool_row] = dense_row_begin + source_token
                     if cutlass.const_expr(not self.sf_plain_transport):
-                        st_relaxed_gpu_b64(
-                            row_source_ll_address + Int64(pool_row) * Int64(8),
-                            (Int64(call_tag) << Int64(32)) | Int64(dense_row_begin + source_token),
-                        )
+                        bucket = buckets[route_round]
+                        sf_row = sf_expert_base[bucket] + (pool_row - data_expert_base[bucket])
+                        source_words = ll_sf[dense_row_begin + source_token, None].iterator.toint()
+                        sf_words = cute.make_rmem_tensor((self.sf_ll_live_words,), Int64)
+                        for w in cutlass.range_constexpr(self.sf_ll_live_words):
+                            sf_words[w] = load_ll_word(source_words + Int64(w * 8))
+                        for w in cutlass.range_constexpr(self.sf_ll_live_words):
+                            value = Int32(sf_words[w] & Int64(0xFFFFFFFF))
+                            if Int32(sf_words[w] >> Int64(32)) != call_tag:
+                                value = poll_ll_word(source_words + Int64(w * 8), call_tag)
+                            destination = cute.domain_offset((sf_row, Int32(w * 4 * sf_vec_size)), canonical)
+                            st_global_b32(destination.iterator.toint(), value)
                     token_metadata[pool_row] = TokenSrcMetadata(
                         src_rank=source_rank, src_token=source_token, src_topk=source_slot
                     ).pack()
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         routed_scores[pool_row] = _int32_bits_to_float32(Int32(score_words[j] & Int64(0xFFFFFFFF)))
 
+        if cutlass.const_expr(not self.sf_plain_transport):
+            # The canonical SF words left through the generic proxy; the MMA's SFB loads are TMA.
+            cute.arch.fence_proxy("async.global")
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(device_workspace.ptr(self.metadata_ready_region), Int32(1))

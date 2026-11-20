@@ -1506,6 +1506,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         fc1_sf_ready_pointer: cute.Pointer,
         expert_sizes: cute.Tensor,
         fc1_sf_parts_per_block: int = 1,
+        fc1_sf_ready_target: Optional[int] = None,
         shared_fc1_tma_b_tensor: Optional[cute.Tensor] = None,
         shared_fc1_tma_b_atom: Optional[cute.CopyAtom] = None,
         shared_fc1_tma_sfb_tensor: Optional[cute.Tensor] = None,
@@ -1591,7 +1592,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
                     fc1_sf_parts_per_block
                 )
-                spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
+                if cutlass.const_expr(fc1_sf_ready_target is not None):
+                    # The sort scatter wrote the canonical SF pool before it released the metadata.
+                    spin_wait(fc1_sf_ready_pointer, lambda value: value == Int32(fc1_sf_ready_target), scope="gpu")
+                    cute.arch.fence_proxy("async.global")
+                else:
+                    spin_wait(
+                        fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu"
+                    )
             else:
                 # FC2 waits for its token block's FC1 tiles, shared FC2 for the shared ones; shared FC1 has no wait.
                 if cutlass.const_expr(not self.shared_enabled):
