@@ -32,7 +32,8 @@ PAGE = 64  # indexer page tokens
 @triton.jit
 def _prep_kernel(lens_ptr, sl_ptr, sched_ptr, hw_ptr, w_ptr, reqs, n_w,
                  Q: tl.constexpr, NUM_SMS: tl.constexpr, SPLIT: tl.constexpr,
-                 BLOCK_B: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_W: tl.constexpr):
+                 BLOCK_B: tl.constexpr, BLOCK_C: tl.constexpr, CHUNK_C: tl.constexpr,
+                 BLOCK_W: tl.constexpr):
     """Program 0: per-request length (max of its Q row lengths) and the kernel's CTA
     schedule (FlashInfer/DeepGEMM PagedMQALogitsScheduler: the requests' SPLIT-token
     splits dealt evenly over NUM_SMS CTAs; row i = (request, split) where CTA i
@@ -50,15 +51,16 @@ def _prep_kernel(lens_ptr, sl_ptr, sched_ptr, hw_ptr, w_ptr, reqs, n_w,
         total = tl.sum(splits, 0)
         q_div = total // NUM_SMS
         r_mod = total % NUM_SMS
-        i = tl.arange(0, BLOCK_C)
-        tgt = i * q_div + tl.minimum(i, r_mod)
-        seq = tl.sum(((cum[None, :] <= tgt[:, None]) & m[None, :]).to(tl.int32), 1)
-        before = tl.sum(tl.where((b[None, :] < seq[:, None]) & m[None, :],
-                                 splits[None, :], 0), 1)
-        done = seq >= reqs
-        mi = i <= NUM_SMS
-        tl.store(sched_ptr + 2 * i, tl.where(done, reqs, seq), mask=mi)
-        tl.store(sched_ptr + 2 * i + 1, tl.where(done, 0, tgt - before), mask=mi)
+        for c0 in tl.static_range(0, BLOCK_C, CHUNK_C):  # [CHUNK_C, BLOCK_B] tiles
+            i = c0 + tl.arange(0, CHUNK_C)
+            tgt = i * q_div + tl.minimum(i, r_mod)
+            seq = tl.sum(((cum[None, :] <= tgt[:, None]) & m[None, :]).to(tl.int32), 1)
+            before = tl.sum(tl.where((b[None, :] < seq[:, None]) & m[None, :],
+                                     splits[None, :], 0), 1)
+            done = seq >= reqs
+            mi = i <= NUM_SMS
+            tl.store(sched_ptr + 2 * i, tl.where(done, reqs, seq), mask=mi)
+            tl.store(sched_ptr + 2 * i + 1, tl.where(done, 0, tgt - before), mask=mi)
     else:
         o = (pid - 1) * BLOCK_W + tl.arange(0, BLOCK_W)
         mw = o < n_w
@@ -156,7 +158,8 @@ class Fp4IndexLogits:
             lens, self.seq_lens, self.schedule, head_w[:rows].contiguous(), w, reqs, n_w,
             Q=q, NUM_SMS=self.num_sms, SPLIT=SPLIT_KV,
             BLOCK_B=max(16, triton.next_power_of_2(reqs)),
-            BLOCK_C=triton.next_power_of_2(self.num_sms + 1), BLOCK_W=block_w)
+            BLOCK_C=triton.next_power_of_2(self.num_sms + 1), CHUNK_C=32,
+            BLOCK_W=block_w, num_warps=4)
 
     def launch(self, query, q_scale, kv_cache, block_table, max_len, rows, reqs):
         q, w = self.q, self.weights[:rows]
