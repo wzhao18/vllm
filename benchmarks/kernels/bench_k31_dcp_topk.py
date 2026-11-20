@@ -63,6 +63,15 @@ def make_logits(case, T, width, Lloc, gen, dev, rank=0):
                 x[rare, 1:10001:2] = 6.0
         else:
             x[rare] = torch.relu(x[rare] - 7.0)
+    elif case in ("hotrank", "hotrank2"):
+        # relu rows; one row in 128 is rank-skewed: DCP rank 0 holds 600 (hotrank) or 1500
+        # (hotrank2) keys two-plus binades above every other key, so the round-1 windows
+        # (each centered on its rank's q-th key) are disjoint (K = 2048); tau lies above
+        # (hotrank: CG round) or below (hotrank2: R2) rank 0's theta
+        x = torch.relu(x + 0.3) * 2.0
+        if rank == 0:
+            rare = torch.arange(T, device=dev) % 128 == 7
+            x[rare, 0:(1200 if case == "hotrank" else 3000):2] += 40.0
     elif case == "hot_recent":  # recent tokens score much higher (local position ~ L)
         pos = torch.arange(width, device=dev)[None, :]
         hot = (pos >= (Lloc[:, None] - 512)) & (pos < Lloc[:, None])
@@ -80,6 +89,8 @@ def main():
     ap.add_argument("--q", type=int, default=4)
     ap.add_argument("--ctx", type=int, default=135000)
     ap.add_argument("--spread", type=float, default=0.0, help="ctx uniform in ctx*(1 +- spread)")
+    ap.add_argument("--long-ctx", type=int, default=0, help="every --long-every-th request gets this context")
+    ap.add_argument("--long-every", type=int, default=32)
     ap.add_argument("--cases", default="normal,relu,hot_recent")
     ap.add_argument("--max-model-len", type=int, default=1 << 20)
     ap.add_argument("--max-local", type=int, default=0, help="override the launch bound")
@@ -135,6 +146,8 @@ def main():
             Greq = (a.ctx * (1 + a.spread * u)).to(torch.int32)
         else:
             Greq = torch.full((B,), a.ctx, dtype=torch.int32, device=dev)
+        if a.long_ctx:
+            Greq[:: a.long_every] = a.long_ctx
         j = torch.arange(a.q, device=dev, dtype=torch.int32)
         G = (Greq[:, None] - (a.q - 1 - j)[None, :]).reshape(-1).contiguous()
         L = local_len_of(G, rank, W, 1).to(torch.int32).contiguous()

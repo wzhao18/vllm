@@ -89,6 +89,11 @@ The R1 import rewrite (below), S3, S6, E2a and E4a (below). Dropped relative to 
     (32x fewer bytes). The router histogram smem region is 16 B aligned (bulk source). Gate
     `slim_size_rows` = `decode_landing` and `experts_per_rank % 4 == 0` (16 B slices); otherwise the full
     rows as before. Bit-identical results (same counts, prefixes and totals at every address read).
+- **CC1** (vLLM-local, not upstream) in `sources/communication/nvlink_domain/symmetric_buffer.py`
+  (sha256 in the manifest below): `SymmetricBuffer.__cute_cache_key__` returns
+  `(max_ranks, len(offsets))`, so the Kimi K3 CuTe cache (`cute_cache.py`) keys the compiled MegaMoE
+  kernels on the rank count only (base address, offsets and rank are runtime launch values). No
+  kernel or numerics change.
 
 ## FlashInfer numerics helpers: `src/fi_numerics` and the R1 rewrite
 
@@ -163,7 +168,7 @@ d4c180fe55b9a054811c189f118f536b040ce5c3cd424587ab68deea3491aeb5  sources/__init
 dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
-315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
+1a7715c127c74c61187ddfd0d63c171e9acc229e644f180641c74f5107dda589  sources/communication/nvlink_domain/symmetric_buffer.py
 15c482cc351a9c3a9674d26067c736f24a71e0f781cf4fba9a7e4914e758f016  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py

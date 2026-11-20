@@ -40,11 +40,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
+    DraftView,
     FingerprintGrid,
     KVFingerprintLog,
     LayerView,
+    StateView,
+    byte_pages,
+    draft_fingerprint,
     fingerprint_dir,
     layer_views,
+    state_fingerprint,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
@@ -330,6 +335,9 @@ class NixlBaseConnectorWorker:
     # fingerprinted layers per KV cache group. Set by register_kv_caches.
     _fingerprint_log: KVFingerprintLog | None = None
     _fingerprint_views: tuple[tuple[int, tuple[LayerView, ...]], ...] = ()
+    # Per KV cache group: KDA state pages and head-sharded GQA drafter pages.
+    _fingerprint_states: tuple[tuple[int, tuple[StateView, ...]], ...] = ()
+    _fingerprint_drafts: tuple[tuple[int, tuple[DraftView, ...]], ...] = ()
     # P: requests whose send this rank was told about, so whose fingerprint is
     # written, and requests D read before that, whose send is held back.
     _fingerprint_decided: set[ReqId]
@@ -993,6 +1001,13 @@ class NixlBaseConnectorWorker:
                 "ucx_net_devices_by_gpu", None
             )
         )
+        # Without GPUDirect RDMA (no nvidia_peermem, e.g. in containers) UCX
+        # stages GPU memory through host fragments. Its error-handling pipeline
+        # protocol for that moves ~14 GB/s per GPU; the fragmented copy-in /
+        # copy-out protocol reaches the NIC line rate (98 GB/s of 2 x 400 Gb/s,
+        # VR200 nodes). GPUDirect transfers use neither. Set before the UCX
+        # backend is created; an explicit setting wins.
+        os.environ.setdefault("UCX_RNDV_PIPELINE_ERROR_HANDLING", "n")
         if nixl_agent_config is None:
             config = None
         else:
@@ -2505,15 +2520,92 @@ class NixlBaseConnectorWorker:
         if side == "P":
             self._fingerprint_decided = set()
             self._fingerprint_held = set()
+        states: dict[int, tuple[StateView, ...]] = {}
+        drafts: dict[int, tuple[DraftView, ...]] = {}
+        try:
+            states, drafts = self._fingerprint_state_draft_views(kv_caches, group_of)
+        except Exception:
+            # Debug runs only: keep the DSA fingerprints; the comparator then
+            # finds no state / draft fields.
+            logger.exception("NIXL KV fingerprint: no KDA state / draft views.")
+        self._fingerprint_states = tuple(sorted(states.items()))
+        self._fingerprint_drafts = tuple(sorted(drafts.items()))
         logger.info(
             "NIXL KV fingerprint: %s DCP rank %d logs %d layers (%d of the "
-            "drafter) of KV cache groups %s to %s.",
+            "drafter) of KV cache groups %s, %d KDA state layers of groups %s "
+            "and %d head-sharded draft layers of groups %s to %s.",
             side,
             self.dcp_rank,
             len(views),
             sum(view.draft for view in views),
             sorted(by_group),
+            sum(len(v) for v in states.values()),
+            sorted(states),
+            sum(len(v) for v in drafts.values()),
+            sorted(drafts),
             self._fingerprint_log.path,
+        )
+
+    def _fingerprint_state_draft_views(
+        self, kv_caches: dict[str, torch.Tensor], group_of: dict[str, int]
+    ) -> tuple[dict[int, tuple[StateView, ...]], dict[int, tuple[DraftView, ...]]]:
+        """The KDA state and head-sharded drafter pages of each KV cache group,
+        through the NIXL regions the transfers read and write."""
+        bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        states: dict[int, list[StateView]] = defaultdict(list)
+        drafts: dict[int, list[DraftView]] = defaultdict(list)
+        if self._has_mamba and self._conv_decomp is not None:
+            conv_size, ssm_size = self._mamba_ssm_size
+            segments = (*self._conv_decomp.local_conv_offsets, (conv_size, ssm_size))
+            region_at = {bases[r]: r for r in self._ssm_region_indices}
+            ratio = self._physical_blocks_per_logical_kv_block
+            for g, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                for name in group.layer_names:
+                    spec = self._layer_specs.get(name)
+                    if not isinstance(spec, MambaSpec) or spec.tp_replicated:
+                        continue
+                    r = region_at.get(kv_caches[name].data_ptr())
+                    if r is None:
+                        raise ValueError(f"{name}: no NIXL SSM region at its cache")
+                    pages = byte_pages(
+                        kv_caches[name],
+                        bases[r],
+                        conv_size + ssm_size,
+                        self.block_stride_per_layer[r] * ratio,
+                        self._logical_num_blocks,
+                    )
+                    states[g].append(
+                        StateView(
+                            name, pages, tuple(segments), self.world_size, self.tp_rank
+                        )
+                    )
+        heads = self._head_sharded_draft_kv_heads
+        for r in sorted(self._head_sharded_draft_regions):
+            assert heads is not None
+            name = self.region_names[r]
+            local_heads = heads // self.world_size
+            token_head, rest = divmod(
+                self.block_len_per_layer[r], local_heads * self.block_size
+            )
+            if rest or token_head % 4:
+                raise ValueError(
+                    f"{name}: draft page {self.block_len_per_layer[r]} B is not "
+                    f"{local_heads} heads x {self.block_size} tokens"
+                )
+            pages = byte_pages(
+                kv_caches[name],
+                bases[r],
+                self.block_len_per_layer[r],
+                self.block_stride_per_layer[r],
+                self.region_num_blocks[r],
+            ).view(-1, local_heads, self.block_size, token_head)
+            window = getattr(self._layer_specs[name], "sliding_window", None)
+            drafts[group_of[name]].append(
+                DraftView(name, pages, self.tp_rank * local_heads, heads, window)
+            )
+        return (
+            {g: tuple(v) for g, v in states.items()},
+            {g: tuple(v) for g, v in drafts.items()},
         )
 
     def _draft_layer_names(self) -> set[str]:
@@ -4879,6 +4971,41 @@ class NixlBaseConnectorWorker:
                             req.block_ids[group][req.first_block :],
                             req.num_tokens,
                             first_block=req.first_block,
+                            extra={"group": group, "local_req": local_id},
+                        )
+                    for group, states in self._fingerprint_states:
+                        if (block := req.state_blocks.get(group)) is None:
+                            continue
+                        log.log_values(
+                            req.req_id,
+                            "state",
+                            [
+                                (v.name, "state", False, state_fingerprint(v, block))
+                                for v in states
+                            ],
+                            req.num_tokens,
+                            extra={
+                                "group": group,
+                                "local_req": local_id,
+                                "block": block,
+                            },
+                        )
+                    for group, drafts in self._fingerprint_drafts:
+                        log.log_values(
+                            req.req_id,
+                            "draft",
+                            [
+                                (
+                                    v.name,
+                                    "draft_h",
+                                    True,
+                                    draft_fingerprint(
+                                        v, req.block_ids[group], req.num_tokens
+                                    ),
+                                )
+                                for v in drafts
+                            ],
+                            req.num_tokens,
                             extra={"group": group, "local_req": local_id},
                         )
                 except Exception:
