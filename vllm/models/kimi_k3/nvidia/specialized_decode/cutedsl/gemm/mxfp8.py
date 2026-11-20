@@ -213,11 +213,12 @@ class Mxfp8Projection:
     """``out[R, N] = x @ W^T`` for an MXFP8 weight (module docstring) for each
     prepared R with its kind. ``run(x, out)``: ``x`` BF16 [R, K] (quantized into the
     scratch) or an ``mxfp8_act.Mxfp8Buffer`` view of R rows; ``out`` BF16 [R, N]
-    packed rows."""
+    packed rows. ``gated``: the "pre" GEMMs are gated (``gated_rows``): there ``x``
+    may be a signalled all-gather (``sp_comm.GatedMx``) read as its chunks land."""
 
     def __init__(self, linear_or_weight, rows, *, family: str, tactics=None,
-                 cap: int | None = None):  # fmt: skip
-        self.family = family
+                 cap: int | None = None, gated: bool = False):  # fmt: skip
+        self.family, self.gated = family, gated
         if isinstance(linear_or_weight, tuple):
             weight, scale = linear_or_weight
         else:
@@ -244,16 +245,20 @@ class Mxfp8Projection:
 
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
-                    max_stages=found[2], device=weight.device,
+                    max_stages=found[2], gate=gated, device=weight.device,
                 )  # fmt: skip
+        self.gated_rows = frozenset(self.pre) if gated else frozenset()
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
 
-    def _gemm(self, kind, xq, xs, out):
+    def _gemm(self, kind, xq, xs, out, gate=None):
         import flashinfer
 
         if kind == "pre":
-            return self.pre[xq.shape[0]](xq, xs, self.weight, self.scale, out)
+            gemm = self.pre[xq.shape[0]]
+            if self.gated:
+                return gemm(xq, xs, self.weight, self.scale, out, gate=gate)
+            return gemm(xq, xs, self.weight, self.scale, out)
         if kind == "scaled_mm":
             return torch._scaled_mm(
                 xq, self.weight.t(), scale_a=xs.view(torch.float8_e8m0fnu),
@@ -273,7 +278,10 @@ class Mxfp8Projection:
         q = self.input.quantize(x) if isinstance(x, torch.Tensor) else x
         if q.rows != rows or q.k != self.k:
             raise Unsupported(self.family, rows, f"MXFP8 input [{q.rows}, {q.k}]")
-        result = self._gemm(kind, q.data, q.scale, out)
+        gate = getattr(q, "gate", None)
+        if gate is not None and rows not in self.gated_rows:  # rows still in flight
+            raise Unsupported(self.family, rows, f"signalled input, ungated {kind}")
+        result = self._gemm(kind, q.data, q.scale, out, gate)
         if result.data_ptr() != out.data_ptr():  # (never: both kinds take out=)
             raise Unsupported(self.family, rows, f"{kind} did not write out=")
         return out

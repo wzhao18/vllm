@@ -17,6 +17,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream, make_ptr
 
+from ...common.mx_rows import READY_COLUMNS
 from .dense_blockscaled_gemm_sm107 import Sm107BlockScaledPersistentDenseGemmKernel
 
 SF_VEC = 32
@@ -41,9 +42,24 @@ def _alpha_one(device):
 
 
 @cache
+def gate_args(address, target: int, device) -> torch.Tensor:
+    """A gated GEMM's aux buffer (it also carries alpha = 1): float32 [8], int32
+    word 2 the target, int64 word 2 the address of the per-chunk counters (int32,
+    one per ``READY_COLUMNS`` columns of K). ``address`` None: an ungated call (target
+    0; the counters are this buffer's zero word 6)."""
+    args = torch.zeros(8, dtype=torch.float32, device=device)
+    args[0] = 1.0
+    args.view(torch.int32)[2] = target
+    args.view(torch.int64)[2] = args.data_ptr() + 24 if address is None else address
+    return args
+
+
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
-             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False):
+             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False,
+             gate=False):
     tile, cluster, swap_ab, inst_m = tactic
+    if gate and READY_COLUMNS % tile_k:
+        raise ValueError(f"gate: tile_k {tile_k} does not divide {READY_COLUMNS}")
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
         (inst_m, tile[1], INST_K),
@@ -57,6 +73,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         producers=producers,
         die_claim=die_claim,
         push=push,
+        gate_tiles=READY_COLUMNS // tile_k if gate else 0,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
     gemm.max_ab_stages = max_stages
@@ -75,8 +92,9 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (cute.sym_int() if die_claim or push else 1,), assumed_align=8
-    )
+        cutlass.Float32, (cute.sym_int() if die_claim or push or gate else 1,),
+        assumed_align=8,
+    )  # fmt: skip
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
     with torch.accelerator.device_index(device_index):
@@ -96,7 +114,11 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 push=False, device=None):
+                 push=False, gate=False, device=None):
+        # ``gate``: compiled with the activation gate (``gate_args``); every call
+        # passes ``gate=`` (a buffer, or None for an ungated call); the gated form
+        # issues the weight operand of its whole smem ring before griddepcontrol.wait
+        # (``prewait`` is the ring depth).
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
@@ -114,17 +136,22 @@ class Mxfp8PreGemm:
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
             if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
                 raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
+        if gate and (push or die_split is not None or not use_pdl):
+            raise ValueError("gate: a PDL GEMM without push / die split")
         # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
-        self.push = int(push)
+        self.push, self.gate = int(push), bool(gate)
+        if gate:  # the whole ring (the kernel caps it at its stage count)
+            prewait = k // tile_k
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), self.push,
+            int(max_stages), self.push, self.gate,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
-        if prewait and self.stages is not None and prewait > self.stages:
+        if prewait and self.stages is not None and prewait > self.stages and not gate:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
+        self.ungated = gate_args(None, 0, device) if gate else None
         self.aux, self.calls = None, 0
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
@@ -133,9 +160,10 @@ class Mxfp8PreGemm:
         km, kn = (n, rows) if self.swap_ab else (rows, n)
         self.sf = ((km + 127) // 128, (kn + 127) // 128, (k // SF_VEC + 3) // 4)
 
-    def __call__(self, xq, xs, w, ws, out, push_args=None):
+    def __call__(self, xq, xs, w, ws, out, push_args=None, gate=None):
         """``push_args`` (push GEMMs only): the float32 [push_epilogue.ARGS] buffer of
-        ``push_args``; ``out`` is then an unused [R, N] BF16 view (the C descriptor)."""
+        ``push_args``; ``out`` is then an unused [R, N] BF16 view (the C descriptor).
+        ``gate`` (gated GEMMs only): ``gate_args``' buffer; None = ungated."""
         if self.swap_ab:
             # The kernel stores C [N, R] column-major (only C's pointer is used, leading
             # dim N) = out [R, N] row-major; the strided view only matches the compiled
@@ -150,6 +178,10 @@ class Mxfp8PreGemm:
             raise ValueError(f"Mxfp8PreGemm(push={self.push}) push_args {push_args!r}")
         if push_args is not None:
             alpha = push_args
+        if gate is not None and not self.gate:
+            raise ValueError("Mxfp8PreGemm: a gate for an ungated GEMM")
+        if self.gate:
+            alpha = self.ungated if gate is None else gate
         if self.aux is not None:  # two counter sets, alternated per call
             alpha = self.aux[self.calls % 2]
             self.calls += 1

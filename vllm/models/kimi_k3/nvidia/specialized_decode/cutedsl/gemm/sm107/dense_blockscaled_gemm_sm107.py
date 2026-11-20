@@ -146,6 +146,16 @@ def _smid():
     return "mov.u32 $0, %smid;", "=r", ()
 
 
+@asm(cutlass.Int32)
+def _load_acquire(address):
+    return "ld.acquire.sys.global.u32 $0, [$1];", "=r,l,~{memory}", (address,)
+
+
+@asm()
+def _fence_proxy_async_global():
+    return "fence.proxy.async.global;", "~{memory}", ()
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -223,8 +233,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         producers: int = 1,
         die_claim: bool = False,
         push: bool = False,
+        gate_tiles: int = 0,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
+        # gate_tiles > 0 (``prewait.gate_args`` in the aux buffer that also carries
+        # alpha): the activation operand of k-block k is issued only once the counter
+        # word k // gate_tiles at the gate address reaches the gate target
+        # (acquire, then a generic -> async proxy fence): the signalled SP all-gather
+        # (``SpComm.mx_gated_view``) counts its rows per gate_tiles k-blocks.
+        self.gate_tiles = gate_tiles
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
         # ``weight_is_a``, else B) and its scale factors of the first
         # ``prewait_stages`` k-blocks of its first tile BEFORE griddepcontrol.wait,
@@ -1645,6 +1662,20 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
+            # gate: chunks [0, gate_ready] seen complete (prewait.gate_args layout:
+            # int32 word 2 the target, int64 word 2 the counters' address)
+            gate_ready = cutlass.Int32(-1)
+            gate_target = cutlass.Int32(0)
+            gate_base = cutlass.Int64(0)
+            if cutlass.const_expr(self.gate_tiles > 0):
+                gate_i32 = cute.make_tensor(
+                    cute.recast_ptr(alpha.iterator, dtype=cutlass.Int32), cute.make_layout(8)
+                )
+                gate_i64 = cute.make_tensor(
+                    cute.recast_ptr(alpha.iterator, dtype=cutlass.Int64), cute.make_layout(4)
+                )
+                gate_target = gate_i32[2]
+                gate_base = gate_i64[2]
             pre_left = cutlass.Int32(0)
             if cutlass.const_expr(self.prewait_stages > 0):
                 if work_tile.is_valid_tile:
@@ -1787,6 +1818,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                     mcast_mask=sfb_full_mcast_mask,
                                 )
+                        if cutlass.const_expr(self.gate_tiles > 0):
+                            chunk = ab_producer_state.count // self.gate_tiles
+                            if chunk > gate_ready:
+                                address = gate_base + cutlass.Int64(chunk) * 4
+                                seen = _load_acquire(address)
+                                while seen < gate_target:
+                                    seen = _load_acquire(address)
+                                _fence_proxy_async_global()
+                                gate_ready = chunk
                         if cutlass.const_expr(self.weight_is_a):
                             cute.copy(
                                 tma_atom_b,

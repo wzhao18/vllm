@@ -90,6 +90,17 @@ GATHER_BATCH = 8
 # per 7168-wide row.
 PUSH_CTAS = 32
 WIDTH_CHUNK = 7168 // 8
+READY_COLUMNS, READY_WORDS = mx_rows.READY_COLUMNS, mx_rows.READY_WORDS
+
+
+class GatedMx:
+    """An MXFP8 all-gather view (``mx_view``) with its in-projection gate: ``rows``,
+    ``k``, ``data``, ``scale`` as the view's; ``gate`` the GEMM's gate arguments."""
+
+    def __init__(self, view, gate):
+        self.view, self.gate = view, gate
+        self.rows, self.k = view.rows, view.k
+        self.data, self.scale = view.data, view.scale
 
 
 @asm(Uint32, pure=True)
@@ -414,7 +425,10 @@ class SpComm:
         # MXFP8 form of the same all-gather (``mx_view``: an MXFP8 in-projection's
         # input, FP8 rows over the box's first bytes; ``common.mx_rows``).
         self.mx_scale_bytes = mx_rows.scale_bytes(rows_cap, width)
-        extra = -(-self.mx_scale_bytes // (2 * width))
+        # + one row whose first READY_WORDS int32 words count the MXFP8 rows published
+        # per 1024-column chunk (``ready_addresses``: the signalled all-gather).
+        extra = -(-self.mx_scale_bytes // (2 * width)) + 1
+        self.ready_offset = (rows_cap + extra - 1) * width * 2
         box = symm_mem.empty((parities, rows_cap + extra, width), **bf16)
         self.box = box
         self.gather = box[:, :rows_cap]
@@ -433,6 +447,7 @@ class SpComm:
         # The MXFP8 scale regions have their own sentinel (E8M0 0xFF is never a
         # scale; 0x80000000 may be four).
         self.box[:, rows_cap:].view(torch.int32).fill_(mx_rows.SCALE_SENTINEL - 2**32)
+        self.box[:, -1].view(torch.int32).zero_()
         torch.accelerator.synchronize(self.device)
         torch.distributed.barrier(group=group)
         # cute views per parity: local gather, its multicast address, local recv, peers
@@ -459,10 +474,35 @@ class SpComm:
             for p in range(parities)
         ]  # fmt: skip
         self._mx_views: dict = {}
+        self._gates: dict = {}
         self._rank = Int32(rank)
 
     def nbytes(self) -> int:
         return sum(t.numel() * 2 for t in (self.box, self.recv, self.partial))
+
+    def ready_addresses(self, parity: int):
+        """(multicast, local) addresses of ``parity``'s READY_WORDS chunk counters:
+        word c counts the MXFP8 rows whose 1024 columns [c 1024, (c + 1) 1024) were
+        published (``SpAttnResGather(signal=True)``) into every rank's box; the
+        in-projection's activation loads wait for R per chunk; the same parity's
+        ``SpReduceAttnRes`` zeroes them after the in-projection."""
+        pitch = self.box[0].numel() * 2
+        offset = parity * pitch + self.ready_offset
+        return Int64(self.gather_mc + offset), Int64(self.box.data_ptr() + offset)
+
+    def mx_gated_view(self, parity: int, rows: int):
+        """``mx_view`` whose ``gate`` (``sm107.prewait.gate_args``) makes the MXFP8
+        in-projection wait for each chunk's R published rows instead of for the
+        all-gather kernel's end."""
+        from ..gemm.sm107.prewait import gate_args
+
+        view = self.mx_view(parity, rows)
+        gates = self._gates.get((parity, rows))
+        if gates is None:
+            local = int(self.ready_addresses(parity)[1])
+            gates = gate_args(local, rows, self.device)
+            self._gates[(parity, rows)] = gates
+        return GatedMx(view, gates)
 
     def mx_addresses(self, parity: int):
         """(data multicast, scale multicast, local data, local scales) addresses of

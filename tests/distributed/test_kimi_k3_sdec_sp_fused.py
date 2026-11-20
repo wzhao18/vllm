@@ -22,7 +22,10 @@ D3-32):
 - the MXFP8 forms (an MXFP8 in-projection's all-gather, ``gather_mx``; the MXFP8
   shared gate_up input of the post-AttnRes, ``out_mx``) are ``mxfp8_act.quantize``
   of the fused BF16 rows (FP8 values equal, scales bitwise), and MXFP8 GEMMs over the
-  gathered box equal those over the quantized reference.
+  gathered box equal those over the quantized reference;
+- the signalled MXFP8 all-gather (``signal_rows``: no poll, per-chunk row counters)
+  into a scribbled box, read by a gated pre GEMM with no host sync, equals the same
+  GEMM ungated over the reference; the counters hold R and the reduce zeroes them.
 
 ``SpFinalGather`` returns stock ``sp_all_gather``'s rows (sanitized words) and
 re-arms its box.
@@ -98,9 +101,10 @@ def _close(a, b, ulps):
 def _armed(comm, parity, rows):
     g = comm.gather[parity, :rows].view(torch.int32)
     r = comm.recv[parity].view(torch.int32)
-    s = comm.box[parity, comm.rows_cap :].view(torch.int32)
+    s = comm.box[parity, comm.rows_cap : -1].view(torch.int32)
+    ready = comm.box[parity, -1].view(torch.int32)  # the signalled chunk counters
     ok = bool((g == SENTINEL).all()) and bool((r == SENTINEL).all())
-    return ok and bool((s == -1).all())
+    return ok and bool((s == -1).all()) and bool((ready == 0).all())
 
 
 def _scale_index(rows, device):
@@ -158,6 +162,11 @@ def _worker(env: dict[str, str]) -> None:
         gemm = mxfp8.Mxfp8Projection(
             (wq.data, wq.scale), [n * world for n in SHARDS], family="kda_in",
             tactics={n * world: "scaled_mm" for n in SHARDS},
+        )  # fmt: skip
+        # The gated pre GEMM of a signalled all-gather (``signal_rows``).
+        gated = mxfp8.Mxfp8Projection(
+            (wq.data, wq.scale), [n * world for n in SHARDS], family="kda_in",
+            tactics={n * world: "pre" for n in SHARDS}, gated=True,
         )  # fmt: skip
         worst = {}
         for n in SHARDS:
@@ -223,6 +232,12 @@ def _worker(env: dict[str, str]) -> None:
                     layer // BLOCK if write else -1, max(SHARDS), {rows: True},
                     first=layer == 0, gather_mx=True, out_mx=scratch,
                 )  # fmt: skip
+                signalled = sp_fused.SpBoundary(
+                    comm, (pre_w, eps), (post_w, eps), prev,
+                    layer // BLOCK if write else -1, max(SHARDS), {rows: True},
+                    first=layer == 0, gather_mx=True, out_mx=scratch,
+                    signal_rows={rows},
+                )  # fmt: skip
                 prefix, blocks = prefix0.clone(), blocks0.clone()
                 dist.barrier()
                 gv = mx.gather(d, prefix, blocks, parity)
@@ -236,6 +251,23 @@ def _worker(env: dict[str, str]) -> None:
                     gemm.run(gv, a)
                     gemm.run(ref, b)
                     assert torch.equal(a, b), ("mx gemm", kind, rows)
+                # The signalled form (gated in-projection, ``signal_rows``): the box
+                # scribbled first, so a GEMM that did not wait would read sentinels.
+                comm.gather[parity, :rows].view(torch.int32).fill_(SENTINEL)
+                comm.box[parity, comm.rows_cap : -1].view(torch.int32).fill_(-1)
+                prefix, blocks = prefix0.clone(), blocks0.clone()
+                torch.accelerator.synchronize(device)
+                dist.barrier()
+                gs = signalled.gather(d, prefix, blocks, parity)
+                a = torch.empty((rows, 256), dtype=torch.bfloat16, device=device)
+                gated.run(gs, a)  # waits per chunk, no host sync in between
+                b = torch.empty_like(a)
+                gated.run(ref, b)  # the same GEMM, ungated, on the reference
+                torch.accelerator.synchronize(device)
+                assert _same_mx(gs.view, ref, rows), ("signalled gather", rows)
+                assert torch.equal(a, b), ("gated gemm", rows, layer)
+                ready = comm.box[parity, -1].view(torch.int32)[:7]
+                assert bool((ready == rows).all()), ("ready counts", rows, ready)
                 y = mx.reduce(prefix, blocks, out, parity, partial).clone()
                 torch.accelerator.synchronize(device)
                 assert _armed(comm, parity, rows), ("mx", rows, layer)

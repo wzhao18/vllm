@@ -28,6 +28,10 @@ from .primitives import asm, bits_float, multicast_words, pack_fp8, store_words
 
 BLOCK = 32
 SCALE_SENTINEL = 0xFFFFFFFF
+# The signalled all-gather (``SpComm.ready_addresses``): one published-row counter
+# per READY_COLUMNS columns (one SpAttnResGather CTA's columns).
+READY_COLUMNS = 1024
+READY_WORDS = 8
 INV_448 = 0x3B124925  # fp32(1 / 448), round to nearest
 
 
