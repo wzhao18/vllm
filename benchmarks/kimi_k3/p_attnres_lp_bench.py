@@ -59,6 +59,10 @@ def main():
                    "c (pre-summed die-local prefix: no delta read, no write-back)")
     p.add_argument("--probe", default="0", help="kernel probe builds (128: data-movement skeleton)")
     p.add_argument("--producer", type=int, default=0, help="time mm vs addmm (+prefix) at [rows, 7168]")
+    p.add_argument("--psim", default="0", help="window-partial projection: calls with >= N blocks "
+                   "stream 2 block rows (= one FP32 partial row) and each such window first writes "
+                   "2 x calls FP32-row bytes + reads its blocks (0: off)")
+    p.add_argument("--allk", type=int, default=0, help="totals over every kernel of the arm")
     args = p.parse_args()
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -119,8 +123,23 @@ def main():
     # attention-output rows homed per die like the block rows; c = the producer
     # writes prefix + delta into the die-local prefix buffer (no delta read, no
     # prefix write-back here). probe: kernel probe build (128 = skeleton).
-    mode = {"resid": "a", "probe": 0}
+    mode = {"resid": "a", "probe": 0, "psim": 0}
     dl_rows = {}
+    # psim: calls per block count (a window = the calls that see the same blocks).
+    win_calls = {}
+    for c in calls:
+        win_calls[c["nb"]] = win_calls.get(c["nb"], 0) + 1
+    psim_buf = {}
+
+    def psim_window(st, nb):
+        # The window precompute's bytes: read its nb block rows once and write
+        # one FP32 partial row (2 BF16 rows) per call of the window.
+        buf = psim_buf.get("w")
+        if buf is None:
+            buf = psim_buf["w"] = torch.empty(
+                (max(win_calls.values()), T, H), dtype=torch.float32, device="cuda")
+        buf[:win_calls[nb]].fill_(1.0)
+        psim_buf["r"] = st.blocks[:, :nb].amax()
 
     def dielocal_copy(x, key):
         if key not in dl_rows:
@@ -153,7 +172,13 @@ def main():
                 st.c_prefix = attn_res_dielocal.prefix_out(prefix0, st.blocks)
                 st.c_prefix.copy_(prefix0)
             pi, d, po = st.c_prefix, None, None
-        r = attn_res_lp.attn_res(pi, d, st.blocks, c["c"], c["nb"], c["widx"],
+        nb = c["nb"]
+        if mode["psim"] and nb >= mode["psim"]:
+            if getattr(st, "psim_nb", -1) != nb:
+                psim_window(st, nb)
+            st.psim_nb = nb
+            nb = 2
+        r = attn_res_lp.attn_res(pi, d, st.blocks, c["c"], nb, c["widx"],
                                  onw if c["out_norm"] else None, EPS, bf, qu,
                                  prefix_out=po, _probe=mode["probe"])
         if po is not None and c["kind"] != "final":
@@ -279,12 +304,12 @@ def main():
             print(json.dumps({"depth": pd, "call": k, "n": n, "us": round(us / n, 1),
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
 
-    def lp_arm(qa, pdl, qdeep, resid="a", probe=0):
+    def lp_arm(qa, pdl, qdeep, resid="a", probe=0, psim=0):
         def fn(st, c):
             attn_res_lp.CLAIM_AHEAD = qa
             attn_res_lp.PDL = pdl
             attn_res_lp.RING_DEPTH_Q_DEEP = qdeep
-            mode["resid"], mode["probe"] = resid, probe
+            mode["resid"], mode["probe"], mode["psim"] = resid, probe, psim
             return run_lp(st, c)
         return fn
 
@@ -300,8 +325,9 @@ def main():
                 for qd in [int(x) for x in args.qdeep.split(",")]:
                     for rs in args.resid.split(","):
                         for pb in [int(x) for x in args.probe.split(",")]:
-                            arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}qd{qd}r{rs}pb{pb}",
-                                         lp_arm(qa, pdl, qd, rs, pb)))
+                            for ps in [int(x) for x in args.psim.split(",")]:
+                                arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}qd{qd}r{rs}pb{pb}ps{ps}",
+                                             lp_arm(qa, pdl, qd, rs, pb, ps)))
         order = arms + arms[::-1]
         for name, fn in order:
             r = timed(fn, bool(args.dielocal) and name != "old")
@@ -315,7 +341,8 @@ def main():
                     b = k[len(pre):]
                     if b.startswith("clip:"):
                         continue
-                    if b in ("lp", "attnres_old") or "nvjet" in b or "gemm" in b.lower():
+                    if args.allk or b in ("lp", "attnres_old") or "nvjet" in b \
+                            or "gemm" in b.lower():
                         tot += v
                 return round(tot, 3)
             r["total_ms"] = fam("")
