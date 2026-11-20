@@ -1,0 +1,268 @@
+diff --git a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+index bb7fcb4950..e17c6cb5e5 100644
+--- a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+@@ -95,8 +95,9 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
+ P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
+ NS = 6  # 64-key KV stages
+ NP = 3  # P buffers
+-NLD = 9  # gather warps
+-GATHER_PARTS = 2  # issuing lanes per quad
++NLD = 5  # gather warps (10, 16-19)
++W_EG = 12  # epilogue warps 12-15 (TMEM lane quarters 0-3)
++QPW = (16 + NLD - 1) // NLD  # quads per gather warp and stage
+ STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
+ # warps: 0-3 / 4-7 softmax warpgroups (thread = head; warps 3 and 7 hold padding rows
+ # 96-127 and only take part in barriers, rescales, Q copies and epilogues), 8 PV,
+@@ -117,8 +118,8 @@ OFF_QS = OFF_QN + 4 * ATOM  # 2 x QS_BYTES (token parity): A of the RoPE QK MMA
+ OFF_P = OFF_QS + 2 * QS_BYTES  # 3 x P [96 heads x 64 keys] E4M3, K-major SW64
+ OFF_AL = OFF_P + NP * P_BYTES  # [2 WG][2 (u // 2 parity)][96] alpha (lazy-max rescale)
+ OFF_FLAG = OFF_AL + 4 * H * 4  # [3] u32 (unused slots kept for alignment)
+-OFF_INV = OFF_FLAG + 16  # [96] out_scale / l of the token in its epilogue
+-OFF_TOK0 = OFF_INV + H * 4  # token parity 0: [2 WG][2 (l, m)][96]
++OFF_INV = OFF_FLAG + 16  # [4 (token % 4)][96] out_scale / l for the epilogue warps
++OFF_TOK0 = OFF_INV + 4 * H * 4  # token parity 0: [2 WG][2 (l, m)][96]
+ OFF_BAR = OFF_TOK0 + 4 * H * 4
+ OFF_TMEM = OFF_BAR + 40 * 8
+ OFF_GMASK = OFF_TMEM + 16  # [2 WG][2 (u // 2 parity)][4] u32: heads that grew (ballots)
+@@ -139,7 +140,8 @@ B_QFULL, B_QREMPTY = 8, 10  # x2 (token parity)
+ B_OFREE = 12  # x4 (O^T block)
+ B_OREADY, B_PEMPTY = 16, 19  # x3 (P buffer u % 3)
+ B_KVFULL, B_KVEMPTY = 22, 28  # x NS
+-assert B_KVEMPTY + NS <= 40
++B_INV = 34  # x4 (token % 4): 1/l written by the owning softmax warpgroup
++assert B_KVEMPTY + NS <= B_INV and B_INV + 4 <= 40
+ # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
+ # 7-9 token-end l/m exchange (per sub-partition), 10 + wg warpgroup-wide
+ C_Q, C_S, C_O = 0, 128, 192  # Q latent dims 0-511; S; O^T
+@@ -201,6 +203,16 @@ def mma_cb_e(d, a, b, idesc, acc, op: str):
+                                           Uint32(acc))
+ 
+ 
++@asm()
++def gather4_e(dst, desc, bar, col, r0, r1, r2, r3):
++    """TMA tile::gather4 issued by one elected lane (warp-uniform operands)."""
++    code = ("{ .reg .pred e; " + _ELECT + "@e cp.async.bulk.tensor.2d.shared::cta.global"
++            ".tile::gather4.mbarrier::complete_tx::bytes [$0],[$1,{$3,$4,$5,$6,$7}],[$2]; }")
++    ops = (Uint32(dst), Int64(desc), Uint32(bar), Int32(col), Int32(r0), Int32(r1),
++           Int32(r2), Int32(r3))
++    return code, "r,l,r,r,r,r,r,r,~{memory}", ops
++
++
+ @asm()
+ def cp16(dst, src, n):
+     """16 bytes global -> shared (cp.async; n = 0 zero-fills)."""
+@@ -295,8 +307,7 @@ class SparseMlaPrefillH8:
+         knobs = tuple(knobs) + (0,) * (11 - len(knobs))
+         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
+          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa) = knobs[:11]
+-        if not self.parts:
+-            self.parts = GATHER_PARTS
++        assert not self.cpa and not self.parts, "cpa / parts: removed (P-MLA runs 95, 99)"
+         if self.sstamp and not self.ssmask:
+             self.ssmask = 15
+         self.smem = SMEM_BYTES + (1024 if self.sstamp or self.pad else 0)
+@@ -355,6 +366,8 @@ class SparseMlaPrefillH8:
+             for s in cutlass.range_constexpr(NS):
+                 mbar_init(_bar(base, B_KVFULL + s), Uint32(1 + (256 if self.cpa else 0)))
+                 mbar_init(_bar(base, B_KVEMPTY + s), Uint32(1))
++            for j in cutlass.range_constexpr(4):
++                mbar_init(_bar(base, B_INV + j), Uint32(4))
+             cute.arch.mbarrier_init_fence()
+         if warp == 0:
+             tmem_alloc_exclusive(base + Uint32(OFF_TMEM))
+@@ -375,12 +388,15 @@ class SparseMlaPrefillH8:
+                 self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
+             elif warp == W_QK:
+                 self.qk_loop(base, lane, taddr, n_mine, lengths, cta)
++            elif warp >= W_EG and warp < W_EG + 4:
++                self.epi_loop(base, warp, lane, taddr, n_mine, cta,
++                              tensormap.map_address(om))
+             else:
+-                pw = warp - (W_Q + 1)  # gather 10 -> 0, 12-19 -> 1-8; Q warp 9 -> NLD
++                pw = warp - (W_Q + 1)  # gather 10 -> 0, 16-19 -> 1-4; Q warp 9 -> NLD
+                 if warp == W_Q:
+                     pw = Int32(NLD)
+                 elif warp > W_QK:
+-                    pw = warp - (W_Q + 2)
++                    pw = warp - (W_EG + 3)
+                 self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
+                             tensormap.map_address(qr), tensormap.map_address(kvm),
+                             tensormap.map_address(kvr), unit_rows, slots, slot_stride,
+@@ -445,43 +461,42 @@ class SparseMlaPrefillH8:
+                                    Int32(128 * j), row * H)
+                     tma_tile2d(qs, tm_qr, full, Int32(0), row * H)
+         else:
+-            # lanes P j .. P j + P - 1 gather quad q = pw + NLD j of every 64-key stage
+-            # (P = parts; lane part p issues ops p, p + P, ... of the quad's 4 latent atoms
+-            # + RoPE): TMA gather4 throughput scales with issuing threads, not warps
+-            # (hwdb 17: ~32 issuers per SM); the 4 slot indices are loaded one stage ahead
+-            npart = self.parts
+-            part = lane % npart
+-            q = pw + NLD * (lane // npart)
+-            act = lane < quads * npart
+-            if not act:
+-                q = pw  # idle lanes read a valid slot of the stage (unused)
++            # Warp-uniform gather issue: warp pw gathers quads q = pw + NLD j (j < QPW) of
++            # every 64-key stage, one quad at a time; the quad's slot indices are made
++            # warp-uniform and one elected lane issues its 5 gather4 ops. Per-lane
++            # operands compiled to an ELECT + R2UR waterfall per op (~110 clk per op per
++            # warp, the kernel's bound: 9 -> 5 gather warps 1.24 -> 1.69 ms, P-MLA run101).
++            sl = cute.make_rmem_tensor((4 * QPW,), Int32)
+             g = Int32(0)
+             for qi in range(n_mine):
+                 row = cta + qi * self.grid
+                 n = lens[row]
+                 subs = _subs(n)
+-                srow = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(16 * q)
+-                c0, c1, c2, c3 = ld_global_v4_s32(srow)
+-                # cpa: lane id = 32 pw + lane < 256 copies RoPE chunk id % 4 of row id // 4
+-                rid = pw * 32 + lane
+-                rrow = rid // 4
+-                rch = rid % 4
+-                rop = rid < (256 if self.cpa else 0)
+-                rsl = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(4 * rrow)
+-                cr = ld_global_s32_pred(rsl, Int32(rop))
++                sb = slots + Int64(row) * Int64(slot_stride) * Int64(4)
++                for j in cutlass.range_constexpr(QPW):
++                    qj = pw + NLD * j
++                    if qj >= 16:
++                        qj = pw
++                    c0, c1, c2, c3 = ld_global_v4_s32(sb + Int64(16 * qj))
++                    sl[4 * j], sl[4 * j + 1], sl[4 * j + 2], sl[4 * j + 3] = c0, c1, c2, c3
+                 # unroll=1: the 2x LLVM unroll (register stage addresses, BRA.DIV gather
+                 # blocks) ran the kernel at 3.63 vs 2.02 ms/layer (P-MLA runs 64-71)
+                 for t in cutlass.range(subs, unroll=1):
+                     s = g % NS
+                     st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                     full = _bar(base, B_KVFULL + s)
+-                    key = t * 64 + 4 * q
+-                    r = (c0, c1, c2, c3)
+-                    rc = cr
++                    cur = cute.make_rmem_tensor((4 * QPW,), Int32)
++                    for k in cutlass.range_constexpr(4 * QPW):
++                        cur[k] = sl[k]
+                     if t + 1 < subs:
+-                        c0, c1, c2, c3 = ld_global_v4_s32(srow + Int64((t + 1) * 256))
+-                        if cutlass.const_expr(self.cpa):
+-                            cr = ld_global_s32_pred(rsl + Int64((t + 1) * 256), Int32(rop))
++                        for j in cutlass.range_constexpr(QPW):
++                            qj = pw + NLD * j
++                            if qj >= 16:
++                                qj = pw
++                            c0, c1, c2, c3 = ld_global_v4_s32(
++                                sb + Int64((t + 1) * 256) + Int64(16 * qj))
++                            sl[4 * j], sl[4 * j + 1] = c0, c1
++                            sl[4 * j + 2], sl[4 * j + 3] = c2, c3
+                     # keep the prefetch here (issued before the stage-free wait): without
+                     # a barrier the compiler sinks it to its use, exposing an L2 round trip
+                     # per stage (2.0 vs 3.6 ms, P-MLA run66)
+@@ -496,43 +511,25 @@ class SparseMlaPrefillH8:
+                             else:
+                                 mbar_arrive_tx(full, Uint32(STAGE64 - self._skipped()))
+                     cute.arch.sync_warp()
+-                    if cutlass.const_expr(self.cpa and not self.no_gather):
+-                        if rop:
+-                            src = kvp
+-                            nb = Uint32(0)
+-                            if rc >= 0 and t * 64 + rrow < n:
+-                                src = kvp + Int64((rc >> 6) * unit_rows + (rc & 63)) * Int64(
+-                                    ROW) + Int64(D_NOPE + 16 * rch)
+-                                nb = Uint32(16)
+-                            cp16(st + Uint32(4 * 8192) + Uint32(rrow * 64) + (
+-                                (Uint32(rch) ^ ((Uint32(rrow) >> Uint32(1)) & Uint32(3)))
+-                                << Uint32(4)), src, nb)
+-                            cp_async_arrive(full)
+                     if cutlass.const_expr(not self.no_gather):
+-                        if act:
+-                            r0 = (r[0] >> 6) * unit_rows + (r[0] & 63)
+-                            r1 = (r[1] >> 6) * unit_rows + (r[1] & 63)
+-                            r2 = (r[2] >> 6) * unit_rows + (r[2] & 63)
+-                            r3 = (r[3] >> 6) * unit_rows + (r[3] & 63)
+-                            if r[0] < 0 or key >= n:
+-                                r0 = Int32(-1)
+-                            if r[1] < 0 or key + 1 >= n:
+-                                r1 = Int32(-1)
+-                            if r[2] < 0 or key + 2 >= n:
+-                                r2 = Int32(-1)
+-                            if r[3] < 0 or key + 3 >= n:
+-                                r3 = Int32(-1)
+-                            for k in cutlass.range_constexpr((5 + npart - 1) // npart):
+-                                a = part + npart * k
+-                                if a < self._tma_ops():
+-                                    dst = st + Uint32(a * 8192) + Uint32(q) * Uint32(512)
+-                                    desc = tm_kv
+-                                    col = 128 * a
+-                                    if a == 4:
+-                                        dst = st + Uint32(4 * 8192) + Uint32(q) * Uint32(256)
+-                                        desc = tm_kr
+-                                        col = Int32(D_NOPE)
+-                                    gather4(dst, desc, full, col, r0, r1, r2, r3)
++                        for j in cutlass.range_constexpr(QPW):
++                            q = pw + NLD * j
++                            if q < 16:
++                                key = t * 64 + 4 * q
++                                rr = []
++                                for e in cutlass.range_constexpr(4):
++                                    c = Int32(cute.arch.make_warp_uniform(cur[4 * j + e]))
++                                    rv = (c >> 6) * unit_rows + (c & 63)
++                                    if c < 0 or key + e >= n:
++                                        rv = Int32(-1)
++                                    rr.append(rv)
++                                for a in cutlass.range_constexpr(self._tma_ops()):
++                                    if cutlass.const_expr(a < 4):
++                                        gather4_e(st + Uint32(a * 8192) + Uint32(q) * Uint32(512),
++                                                  tm_kv, full, Int32(128 * a), *rr)
++                                    else:
++                                        gather4_e(st + Uint32(4 * 8192) + Uint32(q) * Uint32(256),
++                                                  tm_kr, full, Int32(D_NOPE), *rr)
+                     if pw == 0:
+                         self.ss(base, cta, lane, g, 23, 8)
+                         self.lpin(base, cta, lane, g)
+@@ -688,13 +685,13 @@ class SparseMlaPrefillH8:
+                     iv = Float32(0.0)
+                     if lt > Float32(0.0):
+                         iv = out_scale / lt
+-                    st_shared_f32(base + Uint32(OFF_INV + h * 4), iv)
++                    st_shared_f32(base + Uint32(OFF_INV) + Uint32((qi % 4) * H * 4 + h * 4), iv)
+                 else:
+                     named_bar_arrive(Uint32(7 + sp), 64)
+             if owner:
+-                if qi + 1 < n_mine:
+-                    mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
+-                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
++                cute.arch.sync_warp()
++                if lane == 0:
++                    mbar_arrive(_bar(base, B_INV + qi % 4))
+ 
+     @cute.jit
+     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
+@@ -813,6 +810,19 @@ class SparseMlaPrefillH8:
+             mbar_arrive(_bar(base, B_OREADY + u % NP))
+         return mp_last, lw
+ 
++    @cute.jit
++    def epi_loop(self, base, warp, lane, taddr, n_mine, cta, tm_o):
++        """Epilogue warps: token qi once its owner warpgroup has written 1/l and (for
++        the Q staging reuse) the next token's Q is in TMEM; the softmax warpgroups go
++        on with the next token meanwhile."""
++        sp = warp % 4
++        lane_addr = taddr + (Uint32(sp * 32) << Uint32(16))
++        for qi in range(n_mine):
++            mbar_wait(_bar(base, B_INV + qi % 4), Uint32((qi // 4) & 1))
++            if qi + 1 < n_mine:
++                mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
++            self.epilogue(base, 2, sp, lane, lane_addr, qi, cta, tm_o)
++
+     @cute.jit
+     def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o):
+         """O^T block b (lanes = dims, columns = heads) -> BF16 [heads x dims]: 16x256b
+@@ -828,7 +838,7 @@ class SparseMlaPrefillH8:
+         t4 = lane % 4
+         j = lane % 8
+         mk = lane // 8  # matrix this lane addresses in stmatrix.x4
+-        inv_base = base + Uint32(OFF_INV)
++        inv_base = base + Uint32(OFF_INV) + Uint32((qi % 4) * H * 4)
+         for b in cutlass.range_constexpr(4):
+             if cutlass.const_expr(b >= 1):
+                 if sp == 0 and lane == 0:

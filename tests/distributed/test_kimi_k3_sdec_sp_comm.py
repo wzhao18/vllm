@@ -231,6 +231,61 @@ def _worker(env: dict[str, str]) -> None:
         dist.destroy_process_group()
 
 
+VOCAB_SHARD, VOCAB_PAD = 640, 40  # rows per rank; the last rank's padding rows
+
+
+def _embed_worker(env: dict[str, str]) -> None:
+    """SpEmbedScatter: this rank's shard of table[ids] (zeros for ids >= vocab),
+    sanitized as the stock all-reduce's x + 0 (-0 -> +0), bit for bit; re-armed."""
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(backend="nccl")
+    try:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            sp_comm,
+        )
+
+        rank, world = dist.get_rank(), dist.get_world_size()
+        group = dist.group.WORLD
+        try:
+            from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+
+            enable_symm_mem_for_group(group.group_name)
+        except (ImportError, AttributeError):
+            pass
+        comm = sp_comm.SpComm(group, device, world, rank, rows_cap=CAP)
+        vocab = world * VOCAB_SHARD - VOCAB_PAD
+        table = torch.randn(world * VOCAB_SHARD, WIDTH, generator=_generator("e"))
+        table = table.bfloat16()
+        words = table.view(torch.int32)
+        words[:, 7::101] = SENTINEL  # (+0, -0) pairs
+        words[:, 9::83] = 0x8000  # (-0, +0) pairs
+        table = table.to(device)
+        weight = table[rank * VOCAB_SHARD : (rank + 1) * VOCAB_SHARD].contiguous()
+        for step, rows in enumerate((8, 128, 384, 4, 512)):
+            gen = _generator("ids", step)
+            ids = torch.randint(0, world * VOCAB_SHARD, (rows,), generator=gen)
+            ids[:4] = torch.tensor([0, vocab - 1, vocab, world * VOCAB_SHARD - 1])
+            ids = ids.to(torch.int32 if step % 2 else torch.int64).to(device)
+            n = rows // world
+            out = torch.full((n, WIDTH), 7.0, dtype=torch.bfloat16, device=device)
+            dist.barrier()
+            comm.embed_scatter(ids, weight, rank * VOCAB_SHARD, vocab, out, 1)
+            torch.accelerator.synchronize(device)
+            mine = ids[rank * n : (rank + 1) * n].long()
+            want = torch.where(
+                (mine < vocab)[:, None], table[mine], torch.zeros_like(table[mine])
+            )
+            want = (want.float() + 0.0).bfloat16()  # -0 + 0 = +0
+            assert torch.equal(out.view(torch.int16), want.view(torch.int16)), rows
+            _check_armed(comm, 1, rows)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def _distributed_run(fn, world_size: int) -> None:
     port = str(get_open_port())
     ctx = mp.get_context("spawn")
@@ -270,3 +325,16 @@ def test_sp_comm_and_oproj_rs():
     pytest.importorskip("cutlass")
     world = 4 if torch.accelerator.device_count() >= 4 else 2
     _distributed_run(_worker, world_size=world)
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2 or not _has_multicast_support(),
+    reason="Need 2 GPUs with symmetric-memory multicast.",
+)
+def test_sp_embed_scatter():
+    """SpComm.embed_scatter (the SP decode's input embedding as the reduce-scatter
+    of the vocab-parallel gather) on 4 ranks (else 2): bitwise table rows, zeros past
+    the vocabulary, -0 as +0, the mailboxes re-armed."""
+    pytest.importorskip("cutlass")
+    world = 4 if torch.accelerator.device_count() >= 4 else 2
+    _distributed_run(_embed_worker, world_size=world)

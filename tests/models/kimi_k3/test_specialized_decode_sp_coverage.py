@@ -152,7 +152,7 @@ class Fakes:
         class KdaCore(Provider):
             family = "kda"
 
-            def __init__(self, attention, rows, *, records, ctx):
+            def __init__(self, attention, rows, *, records, ctx, mx_out=False):
                 if "kda" in fakes.raises:
                     raise fakes.raises["kda"]
                 super().__init__(rows, fakes.gaps.get("kda", ()))
@@ -334,6 +334,7 @@ def runtime(layers=None, rows=ROWS, ctx=None, **backbone):
         use_sequence_parallel=True,
         use_attn_res=True,
         aux_hidden_state_layers=(2, 5),
+        embed_tokens=None,  # no vocab shard: SpEmbedScatter declines (stock embedding)
         _aux_attn_res_stream=False,
         start_layer=0,
     )
@@ -674,6 +675,7 @@ def sp_decode(fakes, monkeypatch):
         layers=layers, start_layer=0, end_layer=len(layers),
         aux_hidden_state_layers=(2, 5), config=SimpleNamespace(num_attention_heads=96),
         use_sequence_parallel=True, use_attn_res=True, _aux_attn_res_stream=False,
+        embed_tokens=None,
     )  # fmt: skip
     config = DecodeConfig(
         max_context=1 << 20, mla_core="auto", dsa_core="auto", dcp=TP, q=Q,

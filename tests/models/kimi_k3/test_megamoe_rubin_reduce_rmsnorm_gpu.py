@@ -28,7 +28,7 @@ def _cute(t, align=16):
     )
 
 
-def _compile(hidden, polled=False, **kw):
+def _compile(hidden, polled=False, norm_split=1, **kw):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -42,7 +42,12 @@ def _compile(hidden, polled=False, **kw):
         )
 
         op = TopkReduce(
-            hidden, TOPK, CombineFormat.parse("bf16"), num_experts=E, ll_encoded=True
+            hidden,
+            TOPK,
+            CombineFormat.parse("bf16"),
+            num_experts=E,
+            ll_encoded=True,
+            norm_split=norm_split,
         )
     else:
         from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.sources.kernel_src.rubin.inference.mega.topk_reduce import (  # noqa: E501
@@ -123,11 +128,15 @@ def test_fused_reduce_rmsnorm_matches_reduce_then_stock_norm(n, hidden):
     assert float((ulp > 0).float().mean()) < 0.01
 
 
+@pytest.mark.parametrize("split", [1, 2, 4])
 @pytest.mark.parametrize(("n", "hidden"), [(1, 3584), (96, 3584), (128, 3584)])
-def test_polled_fused_reduce_rmsnorm_matches_polled_reduce_then_stock_norm(n, hidden):
+def test_polled_fused_reduce_rmsnorm_matches_polled_reduce_then_stock_norm(
+    n, hidden, split
+):
     """GenPhase (src_gp) polled plane: cells hold ~bf16 bits (0 = not landed) and
     dropped routes never land. The fused kernel equals the polled reduce + stock
-    rms_norm, and clears the landed cells as the polled reduce does."""
+    rms_norm, and clears the landed cells as the polled reduce does, also with a
+    token row spread over a cluster of ``split`` CTAs."""
     from vllm import _custom_ops as ops
 
     dev = torch.device("cuda")
@@ -155,7 +164,7 @@ def test_polled_fused_reduce_rmsnorm_matches_polled_reduce_then_stock_norm(n, hi
         rmsnorm_weight=weight,
         rmsnorm_eps=eps,
     )
-    _compile(hidden, True, **kw)(**kw)
+    _compile(hidden, True, norm_split=split, **kw)(**kw)
     torch.cuda.synchronize()
 
     assert not fused_plane.view(torch.int16).any(), "landed cells must be cleared"
