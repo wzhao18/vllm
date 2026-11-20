@@ -56,7 +56,7 @@ from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
 
 # DIAG ONLY (D-MOE-LADDER R6-1): "" = production; "2i" = the TMA-B warp issues the odd shared-FC1 A
 # stages; "nob" = shared FC1 skips the token B/SFB loads after the first ring pass; "2inob" = both.
-_DML_SH_MODE = "nob"
+_DML_SH_MODE = ""
 from .....helpers.smem_workspace import SmemWorkspace
 from ......common.utils import ceil_div, round_up
 from .....quant_def import QuantKind
@@ -1196,7 +1196,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         weight_policy = make_l2_evict_first_policy()
         # DIAG R6-1 (2i / 2inob): the TMA-B warp issues the odd shared-FC1 A stages.
         _dml_odd_mask = Int32(0)
-        if cutlass.const_expr(_DML_SH_MODE in ("2i", "2inob")):
+        if cutlass.const_expr(_DML_SH_MODE in ("2i", "2inob") and self.shared_enabled and self.heterogeneous_shared):
             _dml_odd_mask = Int32(work_tile.phase == Int32(BlockPhase.SharedLinear1))
         _dms_c00 = read_clock64()
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
@@ -1735,7 +1735,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         dml_a_cta_layout = None
         dml_a_exec = None
         dml_sfa_exec = None
-        if cutlass.const_expr(_DML_SH_MODE != ""):
+        dml_on = _DML_SH_MODE != "" and self.shared_enabled and self.heterogeneous_shared
+        if cutlass.const_expr(dml_on):
             if cutlass.const_expr(self.is_a_mcast or self.use_2cta_instrs):
                 dml_a_mcast = tma_multicast_mask(
                     self.cluster_shape_mn, None, self.cta_coord_in_cluster, None, self.use_2cta_instrs, "a"
@@ -1813,7 +1814,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         self.shared_sfb_smem_tensor,
                         shared_kernel_extension,
                     )
-                    if cutlass.const_expr(_DML_SH_MODE != ""):
+                    if cutlass.const_expr(dml_on):
                         if phase == Int32(BlockPhase.SharedLinear1):
                             dml_a_kind = (
                                 self.shared_tiled_mma,
