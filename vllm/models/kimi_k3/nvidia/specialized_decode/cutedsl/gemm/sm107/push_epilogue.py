@@ -27,8 +27,8 @@ from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
 )
 
-from ..common.primitives import bf16x2, load_words, store_relaxed, store_words
-from ..common.sp_comm import positive_zero32
+from ...common.primitives import bf16x2, load_words, store_relaxed, store_words
+from ...common.sp_comm import positive_zero32
 
 ARGS = 16  # float32 words of the alpha / push-argument buffer
 WIDTH = 7168  # output features (the hidden size): the receive slot's row pitch
