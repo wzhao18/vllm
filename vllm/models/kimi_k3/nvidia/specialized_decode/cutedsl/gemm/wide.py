@@ -290,7 +290,7 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False):  # fmt: skip
+                 partials=False, rows_sync=0):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
@@ -303,6 +303,13 @@ class WideGemm:
         # partial in rows [s T, (s + 1) T) (the consumer sums them in split order).
         self.partials = partials
         assert not (partials and (silu or direct)), (partials, silu, direct)
+        # ``rows_sync`` > 0 (S1-F, the MegaMoE latent up): the activation warps acquire that many arrivals on the
+        # fused-norm reduce's [rows done, passed] pair instead of the PDL wait (which returns only once the whole
+        # chain of primaries, the MegaMoE kernel's serial tail included, has completed); the last act warp through
+        # re-arms the pair. The epilogue still takes the PDL wait before its first store (nothing it writes may race
+        # a predecessor; by then the chain has completed).
+        self.rows_sync = int(rows_sync)
+        assert self.rows_sync == 0 or partials, "rows_sync is the partials (latent up) form only"
         self.weight_warps = tuple(sorted(weight_warps))
         assert self.weight_warps[:2] == (0, 3) and set(weight_warps) <= set(WEIGHT_WARPS)
         assert not set(self.weight_warps) & set(self.act_warps), (weight_warps, act_warps)
@@ -320,7 +327,7 @@ class WideGemm:
     @cute.jit
     def __call__(
         self, w: cute.Tensor, x: cute.Tensor, y: cute.Tensor, ws: cute.Tensor,
-        flags: cute.Tensor, stream: _cuda.CUstream,
+        flags: cute.Tensor, sync: cute.Tensor, stream: _cuda.CUstream,
     ):  # fmt: skip
         """w (N, K, 1) and x (T, K, 1) K-major; y [T, N or N / 2] row-major BF16;
         ws [split, N, T] FP32; flags [2 * N / 128] int32 (zeroed once)."""
@@ -372,7 +379,7 @@ class WideGemm:
         self.storage = Storage
         self.kernel(
             tiled_mma, tma_a, tma_w, tma_b, tma_x, cluster_vmnk, a_layout, b_layout,
-            y, ws, flags,
+            y, ws, flags, sync,
         ).launch(  # fmt: skip
             grid=(2 * (self.n_pad // 256), self.split, 1),
             block=[self.threads, 1, 1],
@@ -386,7 +393,7 @@ class WideGemm:
         self, tiled_mma: cute.TiledMma, tma_a: cute.CopyAtom, mW: cute.Tensor,
         tma_b: cute.CopyAtom, mX: cute.Tensor, cluster_vmnk: cute.Layout,
         a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
-        mY: cute.Tensor, mWs: cute.Tensor, mFlags: cute.Tensor,
+        mY: cute.Tensor, mWs: cute.Tensor, mFlags: cute.Tensor, mSync: cute.Tensor,
     ):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
@@ -477,7 +484,7 @@ class WideGemm:
             self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty, a_mask,
                          leader, k0, k_count, rot, Int32(1), n_w)  # fmt: skip
         elif warp == 1:  # activations: after it
-            cute.arch.griddepcontrol_wait()
+            self.wait_inputs(mSync, lane)
             if lane == 0:
                 _st_u64(stamp + 48, _now())
             self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0, k_count,
@@ -532,7 +539,7 @@ class WideGemm:
                                  a_mask, leader, k0, k_count, rot, Int32(i), n_w)  # fmt: skip
             for i in cutlass.range_constexpr(1, n_act):
                 if warp == self.act_warps[i]:
-                    cute.arch.griddepcontrol_wait()
+                    self.wait_inputs(mSync, lane)
                     self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0,
                               k_count, rot, Int32(i), n_act)  # fmt: skip
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
@@ -580,6 +587,27 @@ class WideGemm:
             kt = (t + rot) % k_count
             cute.copy(tma_a, tAgW_tile[(None, k0 + kt)], tAsA[(None, s)],
                       tma_bar_ptr=full + s, mcast_mask=a_mask)  # fmt: skip
+
+    @cute.jit
+    def wait_inputs(self, mSync: cute.Tensor, lane: Int32):
+        """An activation warp's input wait: the PDL wait, or (``rows_sync``) one lane acquires the reduce's
+        ``rows_sync`` arrivals on mSync[0]; the act warp whose pass completes the grid's count re-arms the pair
+        (rows done -= rows_sync, passed = 0): every act warp of the grid has observed the count by then."""
+        if cutlass.const_expr(self.rows_sync == 0):
+            cute.arch.griddepcontrol_wait()
+        else:
+            counter = mSync.iterator.toint()
+            expected = Int32(self.rows_sync)
+            passes = Int32(2 * (self.n_pad // 256) * self.split * len(self.act_warps))
+            if lane == Int32(0):
+                while _ld_acquire(counter) < expected:
+                    _nanosleep()
+                if _atom_add(counter + 4, Int32(1)) == passes - Int32(1):
+                    _atom_add(counter, -expected)
+                    _st_relaxed(counter + 4, Int32(0))
+            cute.arch.sync_warp()
+            # The rows were written through the generic proxy on other SMs; x is read by TMA (async proxy).
+            _fence_proxy_global()
 
     @cute.jit
     def acts(self, tma_b, tBgX, tBsB, full, empty, b_mask, leader, k0, k_count, rot, first,
@@ -712,6 +740,9 @@ class WideGemm:
         if r == 0:
             _st_u64(stamp + 0, _now())
         cute.arch.mbarrier_wait(acc_full, 0)
+        if cutlass.const_expr(self.rows_sync > 0):
+            # Inputs were ordered by the reduce's arrivals; y may still alias memory a predecessor of the chain uses.
+            cute.arch.griddepcontrol_wait()
         if r == 0:
             _st_u64(stamp + 8, _now())
         cute.arch.griddepcontrol_launch_dependents()
@@ -870,8 +901,10 @@ class PreparedWide:
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
     [T, N / 2] with ``silu``)."""
 
-    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False):
+    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False, rows_sync=None):
         self.silu, self.out_f32, self.partials = silu, out_f32 or partials, partials
+        # rows -> (int32 [rows done, passed] pair, expected arrivals) of the producer (S1-F), or None: PDL wait.
+        self.rows_sync = dict(rows_sync or {})
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
@@ -888,9 +921,10 @@ class PreparedWide:
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
+            pair, expected = self.rows_sync.get(rows, (None, 0))
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials,
+                w_warps, direct, rotate, self.partials, expected,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -909,14 +943,16 @@ class PreparedWide:
                 dtype=torch.int32,
                 device=dev,
             )
-            args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
-            key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
+            if pair is None:  # the PDL-wait form never reads it
+                pair = torch.zeros(4, dtype=torch.int32, device=dev)
+            args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags), self._ws(pair))
+            key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials, expected)
             key += self.policies[rows]
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
             self.kernels[rows] = _COMPILED[key]
-            self.state[rows] = (ws, flags, self._ws(ws), self._ws(flags))
+            self.state[rows] = (ws, flags, self._ws(ws), self._ws(flags), pair, self._ws(pair))
         self.w = w
         return self
 
@@ -936,8 +972,8 @@ class PreparedWide:
 
     def run(self, x, out):
         rows = x.shape[0]
-        _, _, ws, flags = self.state[rows]
+        _, _, ws, flags, _, sync = self.state[rows]
         stream = _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         y = out.view(-1, out.shape[-1])  # partials: [split, T, N] -> [split * T, N]
-        self.kernels[rows](self.w, self._x(x), self._y(y), ws, flags, stream)
+        self.kernels[rows](self.w, self._x(x), self._y(y), ws, flags, sync, stream)
         return out

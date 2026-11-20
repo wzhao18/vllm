@@ -257,9 +257,10 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
+                # Prepared below, once the fused-norm reduce's rows-done pairs exist.
                 self.latent_up_parts = PreparedWide(
                     weights["latent_up"], self.parts, partials=True
-                ).prepare()
+                )
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n
@@ -292,6 +293,32 @@ class SpMlp:
 
             prepare_output_rmsnorm(mlp.experts, norm)
             self.fused_norm = norm
+        if self.latent_up_parts is not None:
+            with torch.accelerator.device_index(weights["latent_down"].device.index):
+                self._prepare_latent_up_parts(mlp, index)
+
+    def _prepare_latent_up_parts(self, mlp, index) -> None:
+        """S1-F: the latent up on rows whose MegaMoE forward ends with the fused-norm
+        reduce acquires that reduce's rows-done arrivals instead of the PDL wait, which
+        returns only after the MegaMoE kernel's serial tail (gemm.wide rows_sync).
+        Every such reduce launch must be consumed (the consumer re-arms the pair), so a
+        reduce row count without the split latent up raises here."""
+        sync = {}
+        if self.fused_norm is not None:
+            for n in self.rows:
+                found = mlp.experts.reduce_rows_done(n)
+                if found is None:
+                    continue
+                if n not in self.parts:
+                    raise Unsupported(
+                        "moe", n, f"layer {index}: the fused-norm reduce counts rows for "
+                        "the split latent up, which these rows do not run",
+                    )  # fmt: skip
+                sync[n] = found
+        self.latent_up_parts.rows_sync = sync
+        self.latent_up_parts.prepare()
+        if sync:
+            mlp.experts.rearm_reduce_rows_done()
 
     def choices(self, n):
         """The four GEMM families' choices at ``n`` shard rows."""

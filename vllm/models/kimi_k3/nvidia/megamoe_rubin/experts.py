@@ -790,6 +790,22 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.bucket = self.buckets[-1]
         return switched
 
+    def reduce_rows_done(self, num_tokens: int):
+        """``(pair, reduce CTAs)`` of the fused-norm reduce that a forward of
+        ``num_tokens`` launches (``session.RubinMegaMoeSession.reduce_rows_done``), or
+        None when that bucket's reduce keeps no pair."""
+        session = self.get_runtime().sessions[self.select_bucket(num_tokens)]
+        pair = session.reduce_rows_done() if session._carved else None
+        return None if pair is None else (pair, session.reduce_ctas(num_tokens))
+
+    def rearm_reduce_rows_done(self) -> None:
+        """Zero every session's pair: launches before a consumer existed (warmup) leave
+        arrivals no consumer took."""
+        for session in self.get_runtime().sessions.values():
+            pair = session.reduce_rows_done() if session._carved else None
+            if pair is not None:
+                pair.zero_()
+
     def fused_shared(self, num_tokens: int) -> bool:
         """Whether a forward of ``num_tokens`` runs the fused shared expert (it then
         takes ``fused_shared=``)."""

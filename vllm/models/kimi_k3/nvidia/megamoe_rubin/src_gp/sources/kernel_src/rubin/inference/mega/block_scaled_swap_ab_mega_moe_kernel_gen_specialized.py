@@ -134,6 +134,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     shared_fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_done_counter"
     # vLLM-local: per-CTA "stores drained" arrivals that the standalone reduce acquires (VENDOR.md).
     producer_done_region: ClassVar[str] = "rubin.genphase_moe.producer_done"
+    # vLLM-local S1-F: [rows done, consumer warps passed] of the fused-norm reduce: each reduce CTA release-adds 1 once
+    # its row slice is stored; the sdec latent_up acquires the full count instead of the grid chain's completion and
+    # its last act warp re-arms the pair (specialized_decode ``gemm.wide``).
+    reduce_rows_done_region: ClassVar[str] = "rubin.genphase_moe.reduce_rows_done"
 
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
@@ -688,6 +692,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 byte_alignment=16,
                 reset="zero_on_first_allocate",
             )
+            device_workspace.register(
+                self.reduce_rows_done_region,
+                cutlass.Int32,
+                (2,),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="zero_on_first_allocate",
+            )
         self.scheduler.register_device_workspace(device_workspace)
         self.tail.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
@@ -1208,6 +1220,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         producer_done = None
         if cutlass.const_expr(self.reduce_acquires_producer_done):
             producer_done = self._device_workspace.tensor(self.producer_done_region)
+        rows_done = None
+        if cutlass.const_expr(self.reduce_acquires_producer_done and rmsnorm_weight is not None):
+            rows_done = self._device_workspace.tensor(self.reduce_rows_done_region)
         self._device_workspace.remove_device_members()
         self._kernel(
             fc1_tma_a_tensor,
@@ -1268,6 +1283,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 rmsnorm_weight=rmsnorm_weight,
                 rmsnorm_eps=rmsnorm_eps,
                 producer_done=producer_done,
+                rows_done=rows_done,
             )
         elif cutlass.const_expr(rmsnorm_weight is not None):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")

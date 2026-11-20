@@ -682,6 +682,25 @@ class RubinMegaMoeSession:
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
+    def reduce_rows_done(self) -> torch.Tensor | None:
+        """The fused-norm reduce's ``[rows done, consumer warps passed]`` int32 pair (a
+        view of the local workspace), or None when this session's reduce keeps none.
+        Every reduce CTA of a launch release-adds 1 to rows done once its rows are
+        stored; the sdec latent_up acquires the full count (``reduce_ctas``) instead of
+        the PDL chain and its last act warp re-arms both (``specialized_decode`` S1-F)."""
+        name = getattr(self.kernel, "reduce_rows_done_region", None)
+        workspace = self.kernel._device_workspace
+        if name is None or name not in {r.name for r in workspace.regions("local")}:
+            return None
+        if not self._carved:
+            raise RuntimeError("reduce_rows_done before the session is carved.")
+        offset = workspace.offset(name)
+        return self.local_workspace[offset : offset + 8].view(torch.int32)
+
+    def reduce_ctas(self, rows: int) -> int:
+        """CTAs of the fused-norm reduce launch for ``rows`` output rows."""
+        return rows * self.kernel.reduce_norm_split
+
     def release(self) -> None:
         self._bound.clear()
         self._out_bound.clear()
