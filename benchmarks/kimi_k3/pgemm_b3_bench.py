@@ -117,6 +117,22 @@ PLAIN = [
 ]
 
 
+_DIE_ROWS = {}
+
+
+def _die_rows(w, tactic):
+    """``w`` for the tactic: a copy with its row halves homed on die 0 / die 1
+    for the die-split scheduler (``die`` flag), else ``w`` itself."""
+    if "die" not in str(tactic[7]).split("+"):
+        return w
+    key = (w.data_ptr(), tuple(w.shape))
+    if key not in _DIE_ROWS:
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import die_sched
+
+        _DIE_ROWS[key] = die_sched.localize_rows(w)
+    return _DIE_ROWS[key]
+
+
 def tname(t):
     s = f"_s{t[5]}" if len(t) > 5 and t[5] else ""
     return f"{t[0][0]}x{t[0][1]}_c{t[1][0]}x{t[1][1]}_{t[4]}{t[3]}{s}" + (f"_{t[7]}" if t[7] else "")
@@ -190,7 +206,7 @@ def main():
             act = mxfp8_act.Mxfp8Buffer(m, inter, dev)
             for tac in fused:
                 try:
-                    g = ssg.SharedSituGemm(wi, swi, beta, lbeta, tactic=tac)
+                    g = ssg.SharedSituGemm(_die_rows(wi, tac), swi, beta, lbeta, tactic=tac)
                     act.data.view(torch.uint8).fill_(0x7F)
                     act.scale.zero_()
                     g(x, sx, act)

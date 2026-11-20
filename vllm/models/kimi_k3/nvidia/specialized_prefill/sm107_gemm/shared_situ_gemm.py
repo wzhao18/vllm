@@ -75,6 +75,23 @@ class SharedSituGemm:
         self.situ_k = k_host.to(weight_nk.device)
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = None
+        self.die = "die" in str(tactic[7]).split("+")
+        self._sched = ()
+        if self.die:
+            # die_sched: weight rows [0, n/2) homed on die 0, [n/2, n) on die 1
+            # (die_sched.localize_rows) and an even count of N cluster tiles.
+            cols = tactic[0][1] * tactic[1][1]
+            if n % (2 * cols):
+                raise ValueError(f"die-split SiTU GEMM: N {n} is not 2 x k x {cols}")
+            from . import die_sched
+
+            self._ctr = torch.zeros(4, dtype=torch.int32, device=weight_nk.device)
+            self._die_map = die_sched.die_map(weight_nk.device)
+            conv = (cutlass.Int64(0),) * 5 + (cutlass.Int32(0),) * 3
+            self._sched = conv + (
+                cutlass.Int64(self._ctr.data_ptr()),
+                cutlass.Int64(self._die_map.data_ptr()),
+            )
 
     def __call__(self, x: torch.Tensor, x_scale: torch.Tensor, act) -> None:
         m = x.shape[0]
@@ -124,7 +141,7 @@ class SharedSituGemm:
                 )
                 self._compiled = cute.compile(
                     gemm, *args, layouts, problem, mac, stream, lambda v: v,
-                    tail[0], None, *tail[1:], True, *situ,
+                    tail[0], None, *tail[1:], True, *situ, *self._sched,
                 )  # fmt: skip
                 _COMPILED[key] = self._compiled
-        self._compiled(*args, problem, stream, *tail, *situ)
+        self._compiled(*args, problem, stream, *tail, *situ, *self._sched)
