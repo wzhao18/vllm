@@ -18,6 +18,7 @@ p.add_argument("--probes", default="0")
 p.add_argument("--vec", type=int, default=8)
 p.add_argument("--groups", type=int, default=4)
 p.add_argument("--dielocal", type=int, default=0)
+p.add_argument("--nodelta", type=int, default=0, help="dataflow C call (prefix pre-summed, no delta)")
 args = p.parse_args()
 from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_lp
 
@@ -52,7 +53,7 @@ stamps = torch.zeros(1024 * 16 * 8, dtype=torch.int64, device="cuda")
 for probe in [int(x) for x in args.probes.split(",")]:
   for i in range(args.iters):
     ev[0].record()
-    attn_res_lp.attn_res(prefix, delta, blocks, call, args.nb, -1, onw, 1e-6,
+    attn_res_lp.attn_res(prefix, None if args.nodelta else delta, blocks, call, args.nb, -1, onw, 1e-6,
                          args.variant == "bq", True, _probe=probe, _vec=args.vec, _groups=args.groups,
                          _stamps=stamps if probe & 112 else None)
     ev[1].record()
