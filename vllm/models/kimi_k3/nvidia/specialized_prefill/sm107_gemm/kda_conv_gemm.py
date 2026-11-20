@@ -62,7 +62,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
         self.conv_scalar_silu = "sc" in flags
         self.conv_math_smsp23 = "c23" in flags
-        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 3 if "flp" in flags else 4 if "l2p" in flags else 0
+        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 3 if "flp" in flags else 4 if "l2p" in flags else 5 if "ets" in flags else 0
         self.conv_stamp = "stamp" in flags
         self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
         super().__init__(
@@ -218,6 +218,40 @@ class KdaConvGemm:
         self._stamp = "stamp" in flags
         self.stamps = None
         self._compiled = {}
+        # Probe "ets": the column pass stores through smem + one 3D TMA store
+        # per 128x32 subtile; the tensor map rides in an extra side row.
+        self._ets = "ets" in flags
+        self._tmaps = {}
+        self._ets_side = {}
+
+    def _tmap(self, out):
+        """CUtensorMap (128 B, host uint8) of ``out`` (3, M, P) BF16 as a 3D
+        {P, M, 3} tiled map with a {32, 128, 1} box, no swizzle."""
+        import ctypes
+
+        key = (out.data_ptr(), tuple(out.shape))
+        t = self._tmaps.get(key)
+        if t is None:
+            _, m, p = out.shape
+            res, tm = cuda.cuTensorMapEncodeTiled(
+                cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                cuda.cuuint32_t(3),
+                out.data_ptr(),
+                [cuda.cuuint64_t(v) for v in (p, m, 3)],
+                [cuda.cuuint64_t(v) for v in (p * 2, m * p * 2)],
+                [cuda.cuuint32_t(v) for v in (32, 128, 1)],
+                [cuda.cuuint32_t(1)] * 3,
+                cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+                cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
+                cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+            )
+            if res != cuda.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuTensorMapEncodeTiled: {res}")
+            raw = bytes((ctypes.c_char * 128).from_address(tm.getPtr()))
+            t = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+            self._tmaps[key] = t
+        return t
 
     def _stamp_buf(self, dev):
         if self.stamps is None:
@@ -259,7 +293,19 @@ class KdaConvGemm:
         nseq = qsl.numel() - 1
         dev = x.device
         out = torch.empty(3, m, self.p, dtype=torch.bfloat16, device=dev)
-        side = torch.empty(side_rows(m, nseq), self.n, dtype=torch.bfloat16, device=dev)
+        if self._ets:
+            # Probe only: a cached side buffer whose extra row holds the tensor
+            # map of ``out`` (rewritten only when ``out`` moves).
+            sk = (m, nseq)
+            side, wkey = self._ets_side.get(sk, (None, None))
+            if side is None:
+                side = torch.empty(side_rows(m, nseq) + 1, self.n, dtype=torch.bfloat16, device=dev)
+            okey = (out.data_ptr(), m)
+            if wkey != okey:
+                side[-1].view(torch.uint8)[:128].copy_(self._tmap(out))
+            self._ets_side[sk] = (side, okey)
+        else:
+            side = torch.empty(side_rows(m, nseq), self.n, dtype=torch.bfloat16, device=dev)
         norms = (
             torch.empty(2, m, self.p // 128, dtype=torch.float32, device=dev)
             if with_norms

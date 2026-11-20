@@ -733,6 +733,63 @@ def stg_u32(addr: Int64, pred: Int32, v: Uint32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def sts_u32(addr: Int32, v: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int32, loc, ip), _v(v, Uint32, loc, ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def fence_async_smem(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [], "fence.proxy.async.shared::cta;", "",
+        has_side_effects=True, loc=loc, ip=ip, **_ASM,
+    )  # fmt: skip
+
+
+@dsl_user_op
+def tmap_acquire(tmap: Int64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [_v(tmap, Int64, loc, ip)],
+        "fence.proxy.tensormap::generic.acquire.gpu [$0], 128;", "l",
+        has_side_effects=True, loc=loc, ip=ip, **_ASM,
+    )  # fmt: skip
+
+
+@dsl_user_op
+def tma_store_3d(
+    tmap: Int64, c0: Int32, c1: Int32, c2: Int32, smem: Int32, *, loc=None, ip=None
+) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(tmap, Int64, loc, ip), _v(c0, Int32, loc, ip), _v(c1, Int32, loc, ip),
+         _v(c2, Int32, loc, ip), _v(smem, Int32, loc, ip)],
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [$0, {$1, $2, $3}], [$4];"
+        " cp.async.bulk.commit_group;",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )  # fmt: skip
+
+
+@dsl_user_op
+def bulk_wait_read0(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [], "cp.async.bulk.wait_group.read 0;", "",
+        has_side_effects=True, loc=loc, ip=ip, **_ASM,
+    )  # fmt: skip
+
+
+@dsl_user_op
 def shfl_xor_f32(v: Float32, d: int, *, loc=None, ip=None) -> Float32:
     return Float32(
         llvm.inline_asm(
@@ -1258,6 +1315,7 @@ def _t2_chunk(
     p_dim: cutlass.Constexpr,
     scalar: cutlass.Constexpr,
     probe: cutlass.Constexpr = 0,
+    ets=None,
 ):
     """Conv + SiLU of rows r0 .. r0 + 15 (chunk rc of the staged subtile) for
     one column pair: loads, 16 branch-free chains, stores; the exact path
@@ -1300,6 +1358,32 @@ def _t2_chunk(
         pb = out_addr + tl * 131072 + line * 128 + Int64(rcl % 2) * 64 + ((gcol % 32) // 2) * 4
         for fi in cutlass.range_constexpr(16):
             stg_u32_all(pb + fi * 128, ys[fi])
+    elif cutlass.const_expr(probe == 5):
+        # Probe "ets": rows to the (now free) transposition buffer as dense
+        # 64 B rows, then one 3D TMA store of the 128x32 subtile.
+        tmap, bar, gt = ets
+        cp = cq * 4 + cr // 4
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        lr0 = gbase + rc * (16 * 64) + cp * 4
+        if b2i(gm <= _D_EXACT) != 0:
+            for fi in cutlass.range_constexpr(16):
+                sts_u32(lr0 + fi * 64, ys[fi])
+        else:
+            wv = []
+            for wj in wp:
+                wv.extend(split_b64(wj))
+            hx = [unpack_bf16x2(v) for v in hr]
+            for xi in cutlass.range_constexpr(16):
+                y2, s2 = conv_row(
+                    (hx[0][0], hx[0][1], hx[1][0], hx[1][1], hx[2][0], hx[2][1]),
+                    xr[xi], wv, Float32(0.0),
+                )  # fmt: skip
+                sts_u32(lr0 + xi * 64, y2)
+                hx = [hx[1], hx[2], unpack_bf16x2(xr[xi])]
+        fence_async_smem()
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        if gt == 0:
+            tma_store_3d(tmap, cc - 2 * cp, r0 - rc * 16, part, gbase)
     elif cutlass.const_expr(probe == 4):
         # Microbench probe: same stores folded into a 16 MiB L2-resident window
         # (same NoC bytes, no HBM write traffic).
@@ -1492,6 +1576,11 @@ def epilogue_kda_conv_t2(
     wrow = gbase + (trow % 128) * (_PITCH * 4)
     cq = cp // 4
     cr = (cp % 4) * 4
+    probe = getattr(gemm_kernel, "conv_probe", 0)
+    tmap = side_addr + Int64(n_blk * 6 + nseq * 6) * Int64(n_cols) * 2
+    if cutlass.const_expr(probe == 5):
+        if gt == 0:
+            tmap_acquire(tmap)
     nl2 = Int64(_NL2)
     one2 = Int64(_ONE2)
     # Conv weights in column-pair layout (KdaConvGemm.conv_w_pairs): 32 B per
@@ -1507,6 +1596,9 @@ def epilogue_kda_conv_t2(
             col_n = tTR_cC[(None, None, None, g, ni + 1)][0][1] + 2 * cp
             wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
             wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
+        if cutlass.const_expr(probe == 5):
+            if gt == 0:
+                bulk_wait_read0()
         cute.arch.barrier(barrier_id=bar, number_of_threads=128)
         for q in cutlass.range_constexpr(4):
             sts_v4(wrow + (((trow % 4) ^ q) * 16), Int32(1), *xs[4 * q : 4 * q + 4])
@@ -1525,8 +1617,13 @@ def epilogue_kda_conv_t2(
             if gt >= 64:
                 _t2_chunk(rc, r0, *args)
                 _t2_chunk(rc - 4, r0 - 64, *args)
+        elif cutlass.const_expr(probe == 5):
+            _t2_chunk(rc, r0, *args, ets=(tmap, bar, gt))
         else:
             _t2_chunk(rc, r0, *args)
+    if cutlass.const_expr(probe == 5):
+        if gt == 0:
+            bulk_wait_read0()
     if cutlass.const_expr(stp):
         stamp_clk(stamp_slot(norm_addr, st_tile, 6), st_pred)
     return acc_consumer_state
