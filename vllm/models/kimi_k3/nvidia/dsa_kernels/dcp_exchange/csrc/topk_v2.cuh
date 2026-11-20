@@ -549,7 +549,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     bool fast = false, recand = true;
 #pragma unroll 1
     for (int rnd = 0; rnd < (kFast ? 3 : 1); ++rnd) {
-    if (rnd > 0) {
+    if (K31_RARE(rnd > 0)) {
       // the row geometry again: recomputed (from an opaque copy of row) rather than kept
       // live through round 1, whose registers are tight
       {
@@ -996,7 +996,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       const int r = i / (kV2Msg / 4), j = (i % (kV2Msg / 4)) * 4;
       uint32_t* const src = p.box + r1row + (int64_t)r * rstr + j;
       poll_words(src, rx + r * kV2Msg + j, 31);
-      if (rnd > 0) st_v4(src, make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu));
+      if (K31_RARE(rnd > 0)) st_v4(src, make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu));
     }
     __syncthreads();
     V2DBG(4);
@@ -1125,7 +1125,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     V2DBG(5);
     tier = s_tier;
     if constexpr (kFast) {
-      if (rnd < 2 && (tier == 2 || tier == 3) && row < kR2Rows) {
+      if (K31_RARE(rnd < 2 && (tier == 2 || tier == 3) && row < kR2Rows)) {
         // the round-2 base. Rank r: S_r[i] = its keys >= lr_r + i (i <= kV2Win; exact, a
         // lower bound when saturated). Global count of keys >= x: at least sum_r
         // S_r[clamp(x - lr_r)] (0 above the window); at most the same inside the window,
