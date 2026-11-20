@@ -37,7 +37,7 @@ def test_prewait_gemm_matches_torch(t, n, out_dtype):
     assert torch.equal(out, out2)
 
 
-@pytest.mark.parametrize("t,ns", [(32, 8), (64, 7), (96, 5)])
+@pytest.mark.parametrize("t,ns", [(32, 8), (64, 7), (96, 6)])
 @pytest.mark.parametrize("pace", [0, 1440])
 def test_prewait_gemm_coresident_bitwise(t, ns, pace):
     """The co-resident form (8 warps, <= 64 registers) with burst or paced pre-wait weight
