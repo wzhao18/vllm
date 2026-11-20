@@ -303,27 +303,26 @@ struct MmaLoop {
 template <bool kStamp>
 __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool mma, int lane) {
   const int xg = p.xg, xs = p.xs;
-  // Batches of one token group (<= 4 weight blocks), all in TMEM or all in shared
-  // memory: a batch's MMAs start as soon as its tokens land, and its token slot is
-  // released right after them.
-  const int bmax = max(1, min(4, xg));
+  // TMEM readiness is confirmed 4 weight blocks at a time (one wait + one fence: the
+  // fill commits each block, in order); MMAs are issued per batch = the rest of the
+  // current token group, all in TMEM or all in shared memory and inside the confirmed
+  // blocks, as soon as its tokens land (16 MMAs under one elect for a 4-block batch).
   uint32_t a_tm = m.a_tm, xph = 0;
   uint64_t a_ss = m.a_ss, xb = m.x0 + p.xslot[0] * (kSlot >> 4);
-  int jx = 0, gs = 0, g = 0;
+  int jx = 0, gs = 0, g = 0, ready = 0;
   for (int j = 0; j < m.nk;) {
     const bool tm = j < m.nt;
-    const int jend = min(j + bmax, tm ? m.nt : m.nk);
-    if (tm) {
-      // Weight blocks j..jend-1 in TMEM: the fill commits each block, in order, so one
-      // wait and one fence cover the batch; the MMAs run behind the fill.
-      mbar_wait(m.trdy0 + 8 * (jend - 1), 0);
+    if (tm && j >= ready) {
+      ready = min(j + 4, m.nt);
+      mbar_wait(m.trdy0 + 8 * (ready - 1), 0);
       asm volatile("tcgen05.fence::after_thread_sync;");
-      if (kStamp && jend == m.nt && lane == 0) {
+      if (kStamp && ready == m.nt && lane == 0) {
         p.stamps[blockIdx.x * kStampStride + 56] = globaltimer();
       }
     } else if (j == m.nt) {
       mbar_wait(m.res_bar, 0);
     }
+    const int jend = min(j + (xg - jx), tm ? ready : m.nk);
     uint64_t b[4];
     uint32_t rel = 0;  // token slots this batch frees (after its MMAs)
 #pragma unroll
