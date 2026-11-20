@@ -412,10 +412,19 @@ def _check_core_replay(name, replay, record, impl, cache):
     its split-KV per launch from the launch's rows, so a short tail chunk (R208 =
     191 + 17) reduces the same keys in another order: latent per (row, head) up to
     ~3e-2 apart from stock (each ~2e-2 from FP64; hti/p2/sparse-mla-r208), while
-    stock's own single launch over all R is bitwise ours. So: one stock launch ->
-    within 1e-3 of stock (the same call); always, both against FP64 attention over
-    the same FP8 codes (``_core_reference``) within 1.5x of each other either way;
-    the LSE within 1e-3 of stock's (chunking moves it ~1e-6)."""
+    stock's own single launch over all R is bitwise ours. At the rows where ours runs
+    the keys-on-M kernel (``sp.SP_KERNELS``) the reduction order is that kernel's
+    (~5e-3 apart from trtllm-gen, as far from FP64). So: one stock launch and
+    trtllm-gen ours -> within 1e-3 of stock (the same call); always, both against
+    FP64 attention over the same FP8 codes (``_core_reference``) within 1.5x of each
+    other either way; the LSE within 1e-3 of stock's (chunking moves it ~1e-6)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.attn_fi import (
+        kernel_for,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sp import (
+        SP_KERNELS,
+    )
+
     keyed = record["counts"] > 0
     latent, lse = replay[0][keyed], replay[1][keyed]
     want, want_lse = record["latent"][keyed], record["lse"][keyed]
@@ -425,17 +434,18 @@ def _check_core_replay(name, replay, record, impl, cache):
     shift = float((lse[live] - want_lse[live]).abs().max()) if live.any() else 0.0
     rows, heads = record["q"].shape[:2]
     launches = _stock_core_launches(impl, rows, heads)
+    kernel = kernel_for(rows, True, SP_KERNELS)
     ref = _core_reference(impl, record, cache, keyed)[:, : want.shape[1]]
     total = lambda x: float((x.double() - ref).norm() / ref.norm())  # noqa: E731
     ours_total, stock_total = total(latent), total(want)
     print(
         f"{name} core replay (stock's query, rows, counts; stock {launches} "
-        f"launch(es)): bitwise {bitwise}, latent per (row, head) max "
+        f"launch(es), ours {kernel}): bitwise {bitwise}, latent per (row, head) max "
         f"{errors.max():.2e}, LSE max {shift:.2e}; vs FP64 ours {ours_total:.2e} "
         f"stock {stock_total:.2e} (ratio {ours_total / max(stock_total, 1e-30):.3f})"
     )
     assert shift <= 1e-3, (name, shift)
-    if launches == 1:
+    if launches == 1 and kernel == "trtllm":
         assert float(errors.max()) <= 1e-3, (name, errors.max())
     assert ours_total <= 1.5 * stock_total + 1e-6, (name, ours_total, stock_total)
     assert ours_total >= stock_total / 1.5 - 1e-6, (name, ours_total, stock_total)
