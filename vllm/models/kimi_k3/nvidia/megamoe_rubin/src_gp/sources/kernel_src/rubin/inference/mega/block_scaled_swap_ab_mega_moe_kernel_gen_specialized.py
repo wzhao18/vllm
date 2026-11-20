@@ -1829,10 +1829,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                         lambda value: value == Int32(1),
                         scope="gpu",
                     )
-                    # Held until the metadata is ready: the weight stream then fills the idle
-                    # window before the first MMA instead of slowing the dispatch's
-                    # latency-bound memory round trips.
-                    wait_ready(self._metadata_ready_flag())
+                    # Issued as soon as the sizes fix the first claim waves: the weight loads run
+                    # evict_first, so the token-side lines the dispatch re-reads stay in L2 while
+                    # the prefetch fills the window before the tokens land.
                     self._prefetch_first_waves(linear_cta_idx, weight_bases)
                     iket.range_pop()
                 # Lazy-wait builds take the payload / metadata waits on the first routed FC1 tile instead.
