@@ -233,6 +233,8 @@ class GqaAttentionState:
         slots = unit_slots(WINDOW, self.q)
         for b in batches:
             units = b * self.kv_heads
+            if self.shapes[b][3] == 1 and self.shapes[b][0] == 1:
+                continue  # (die split, one unit per CTA: no pieces to merge)
             ctas = grid_ctas(units, slots, sms, self.shapes[b][0])
             per_cta, per_unit = piece_bounds(units, slots, ctas)
             if per_cta > MAXP:

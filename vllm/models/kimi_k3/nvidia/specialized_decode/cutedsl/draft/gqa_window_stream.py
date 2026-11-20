@@ -194,7 +194,9 @@ class GqaWindowStream:
         # die d stream the units whose KV head die d homes (runtime head -> die mask)
         self.die_sms = die_sms
         if die_sms is not None:
-            assert cap in (0, 2 * sms) and sum(die_sms) == sms, (cap, die_sms, sms)
+            assert cap in (0, 1, 2 * sms) and sum(die_sms) == sms, (cap, die_sms, sms)
+        # (die split, cap 1: one unit per CTA of its die, the die's other CTAs idle)
+        self.unit_per_cta = die_sms is not None and cap == 1
         self.rows = group * q
         self.slots = unit_slots(window, q)
         # blocks one piece's stages touch (held one per producer lane)
@@ -236,7 +238,7 @@ class GqaWindowStream:
         a = c * total // ctas  # (units x slots x CTAs < 2^31: 32-bit math)
         b = (c + 1) * total // ctas
         j = a // HS + piece
-        valid = j * HS < b
+        valid = (j * HS < b) & (a < total)
         u_base = j * HS
         j0 = max(a, u_base) - u_base
         j1 = min(b, u_base + HS) - u_base
@@ -370,6 +372,8 @@ class GqaWindowStream:
                 if ((mask >> h) & 1) == die:
                     heads = heads + 1
             total = (out.shape[0] // Q) * heads * HS
+            if cutlass.const_expr(self.unit_per_cta):
+                ctas = min(ctas, (out.shape[0] // Q) * heads)
 
         # ---- the plan from the metadata as it stands (before the PDL wait)
         pieces0 = [self.plan(seq_lens, c, ctas, total, p, die, heads, mask, lane)
