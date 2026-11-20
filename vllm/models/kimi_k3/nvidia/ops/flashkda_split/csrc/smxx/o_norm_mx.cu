@@ -36,7 +36,9 @@ __device__ __forceinline__ int div_heads(int r, uint32_t m, int s) {
   return int((uint64_t(uint32_t(r)) * m) >> s);
 }
 
-__global__ void __launch_bounds__(256) o_norm_mx_kernel(
+// 4 CTAs (32 warps) per SM, 64 registers: occupancy-bound on VR200 (F16K 122 -> 115.7 us;
+// 3/5/6/8 CTAs per SM or more rows per warp step are slower).
+__global__ void __launch_bounds__(256, 4) o_norm_mx_kernel(
     const __nv_bfloat16* __restrict__ x, int rows, int heads, uint32_t hmul, int hshift,
     NormMxArgs const a) {
   const int lane = threadIdx.x % 32;

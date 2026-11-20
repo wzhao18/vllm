@@ -3,7 +3,9 @@
 """Router top-k + MegaMoE staging in one launch (SP decode MoE front).
 
 Input: the router | latent down GEMM's FP32 rows ``y [n, E + latent]``
-(``runtime.sp_mlp``: router logits in columns ``0:E``, the latent in ``E:``).
+(``runtime.sp_mlp``: router logits in columns ``0:E``, the latent in ``E:``), or a
+split-K GEMM's FP32 partials ``[splits, n, E + latent]`` summed here in split order
+(the GEMM's own deterministic FP32 sum, one kernel boundary and exchange fewer).
 One block per row:
 
 * all 8 warps: stock's sigmoid + correction-bias single-group top-k on the
@@ -96,6 +98,8 @@ __device__ __forceinline__ uint64_t warp_max_u64(uint64_t v) {
 struct Args {
   const float* y;
   int64_t ldy;
+  int32_t splits;        // y holds this many split-K partials, summed in order
+  int64_t split_stride;
   int32_t num_logits;
   const float* bias;
   uint8_t* x;
@@ -107,6 +111,14 @@ struct Args {
   float* sw;
   int64_t* err;
   const bool* pad;
+  // EPLB (stock ``eplb_map_to_physical_and_record``), all null without it.
+  const int64_t* l2p;
+  const int64_t* replicas;
+  int32_t* load;
+  const bool* record;
+  const int32_t* unpadded;
+  int32_t map_slots;
+  int32_t load_size;
   int32_t n;
   int32_t capacity;
   int32_t num_experts;
@@ -225,6 +237,21 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
     // megamoe_rubin.staging._stage_kernel route rules.
     int64_t id = lane_expert;
     if (a.pad != nullptr && a.pad[row]) id = -1;
+    if (a.l2p != nullptr) {
+      // Logical -> physical, the stock replica choice (Knuth hash of the row);
+      // masked / out-of-range logical ids map to -1. Load recorded per route.
+      int64_t phys = -1;
+      if (id >= 0 && id < num_experts) {
+        int64_t const reps = max(a.replicas[id], int64_t{1});
+        int64_t const hashed = (int64_t{row} * 2654435769LL) & 0xFFFFFFFFLL;
+        phys = a.l2p[id * a.map_slots + hashed % reps];
+      }
+      id = phys;
+      if (*a.record && (a.unpadded == nullptr || row < *a.unpadded) &&
+          phys >= 0 && phys < a.load_size) {
+        atomicAdd(a.load + phys, 1);
+      }
+    }
     bool const valid = id >= 0 && id < a.num_experts;
     if (id != -1 && !valid) {
       a.err[0] = 1;
@@ -365,6 +392,8 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
   }
   // Every load of the row in flight at once: this thread's logits and its
   // quantization block (one per thread: hidden / vec <= 256, host-checked).
+  // A split-K GEMM's partials (splits > 1) are summed here in split order
+  // ((p0 + p1) + p2 ...): the FP32 accumulator the GEMM would have stored.
   const float* yrow = a.y + int64_t{row} * a.ldy;
   float lg[kPer];
 #pragma unroll
@@ -380,6 +409,26 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
         yrow + a.num_logits + int64_t{threadIdx.x} * vec);
 #pragma unroll
     for (int q = 0; q < vec / 4; ++q) in[q] = src[q];
+  }
+  for (int s = 1; s < a.splits; ++s) {
+    const float* ys = yrow + int64_t{s} * a.split_stride;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      int32_t const e = j * (kWarps * 32) + threadIdx.x;
+      if (e < a.num_logits) lg[j] += ys[e];
+    }
+    if (quant) {
+      const float4* src = reinterpret_cast<const float4*>(
+          ys + a.num_logits + int64_t{threadIdx.x} * vec);
+#pragma unroll
+      for (int q = 0; q < vec / 4; ++q) {
+        float4 const p = src[q];
+        in[q].x += p.x;
+        in[q].y += p.y;
+        in[q].z += p.z;
+        in[q].w += p.w;
+      }
+    }
   }
   __syncthreads();  // s_bias
   if (quant) {
@@ -399,9 +448,16 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                  torch::Tensor& idx, torch::Tensor& sw, torch::Tensor& err,
                  const c10::optional<torch::Tensor>& pad, int64_t num_experts,
                  bool renormalize, double routed_scaling_factor, bool nvfp4,
-                 double norm_const) {
-  TORCH_CHECK(y.scalar_type() == at::kFloat && y.dim() == 2 &&
-                  y.stride(1) == 1 && y.stride(0) % 4 == 0 &&
+                 double norm_const, const c10::optional<torch::Tensor>& l2p,
+                 const c10::optional<torch::Tensor>& replicas,
+                 const c10::optional<torch::Tensor>& load,
+                 const c10::optional<torch::Tensor>& record,
+                 const c10::optional<torch::Tensor>& unpadded) {
+  // y: FP32 rows [n, E + hidden], or split-K partials [splits, n, E + hidden].
+  const int64_t d = y.dim();
+  TORCH_CHECK(y.scalar_type() == at::kFloat && (d == 2 || d == 3) &&
+                  y.stride(d - 1) == 1 && y.stride(d - 2) % 4 == 0 &&
+                  (d == 2 || y.stride(0) % 4 == 0) &&
                   y.data_ptr<float>() != nullptr &&
                   reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
               "route_stage: y must be FP32 rows, 16-byte aligned");
@@ -414,8 +470,8 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                   sw.scalar_type() == at::kFloat && sw.is_contiguous() &&
                   err.scalar_type() == at::kLong && err.numel() == 2,
               "route_stage: session buffers");
-  const int64_t n = y.size(0);
-  const int64_t hidden = y.size(1) - num_logits;
+  const int64_t n = y.size(d - 2);
+  const int64_t hidden = y.size(d - 1) - num_logits;
   const int64_t capacity = idx.size(0), topk = idx.size(1);
   const int64_t vec = nvfp4 ? 16 : 32;
   TORCH_CHECK(num_logits % 4 == 0 && num_logits <= 1024 && topk <= 32 &&
@@ -436,8 +492,39 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
     pad_ptr = pad->data_ptr<bool>();
   }
   Args a;
+  a.l2p = nullptr;
+  a.replicas = nullptr;
+  a.load = nullptr;
+  a.record = nullptr;
+  a.unpadded = nullptr;
+  a.map_slots = 0;
+  a.load_size = 0;
+  if (l2p.has_value()) {
+    TORCH_CHECK(replicas.has_value() && load.has_value() && record.has_value(),
+                "route_stage: EPLB needs the map, replica count, load and record tensors");
+    TORCH_CHECK(l2p->scalar_type() == at::kLong && l2p->dim() == 2 &&
+                    l2p->is_contiguous() && l2p->size(0) == num_logits &&
+                    replicas->scalar_type() == at::kLong &&
+                    replicas->is_contiguous() && replicas->numel() == num_logits &&
+                    load->scalar_type() == at::kInt && load->is_contiguous() &&
+                    record->scalar_type() == at::kBool && record->numel() == 1,
+                "route_stage: EPLB tensors");
+    a.l2p = l2p->data_ptr<int64_t>();
+    a.replicas = replicas->data_ptr<int64_t>();
+    a.load = load->data_ptr<int32_t>();
+    a.record = record->data_ptr<bool>();
+    a.map_slots = (int32_t)l2p->size(1);
+    a.load_size = (int32_t)load->numel();
+    if (unpadded.has_value()) {
+      TORCH_CHECK(unpadded->scalar_type() == at::kInt && unpadded->numel() == 1,
+                  "route_stage: EPLB unpadded token count");
+      a.unpadded = unpadded->data_ptr<int32_t>();
+    }
+  }
   a.y = y.data_ptr<float>();
-  a.ldy = y.stride(0);
+  a.ldy = y.stride(d - 2);
+  a.splits = d == 3 ? (int32_t)y.size(0) : 1;
+  a.split_stride = d == 3 ? y.stride(0) : 0;
   a.num_logits = (int32_t)num_logits;
   a.bias = bias.data_ptr<float>();
   a.x = x.data_ptr<uint8_t>();
@@ -486,7 +573,11 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                  torch::Tensor& idx, torch::Tensor& sw, torch::Tensor& err,
                  const c10::optional<torch::Tensor>& pad, int64_t num_experts,
                  bool renormalize, double routed_scaling_factor, bool nvfp4,
-                 double norm_const);
+                 double norm_const, const c10::optional<torch::Tensor>& l2p,
+                 const c10::optional<torch::Tensor>& replicas,
+                 const c10::optional<torch::Tensor>& load,
+                 const c10::optional<torch::Tensor>& record,
+                 const c10::optional<torch::Tensor>& unpadded);
 """
 
 _lock = threading.Lock()
@@ -568,15 +659,10 @@ class RouteStage:
         _module()
 
     def ready(self, n: int) -> bool:
-        """``n`` is planned and the layer stages plain routes: no EPLB
-        logical-to-physical map and no routing capture (both act on the top-k
-        ids between router and stager; those layers keep the stock path)."""
-        experts = self.mlp.experts
-        return (
-            n in self.rows
-            and experts.eplb_state.logical_to_physical_map is None
-            and experts.capture_fn is None
-        )
+        """``n`` is planned and the layer has no routing capture (it reads the
+        logical ids between router and stager; such layers keep the stock path).
+        An EPLB logical-to-physical map is applied in the kernel."""
+        return n in self.rows and self.mlp.experts.capture_fn is None
 
     def stage(self, y: torch.Tensor):
         """Stage ``y``'s routes and quantized latent into the MegaMoE session of
@@ -585,12 +671,12 @@ class RouteStage:
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
         experts = self.mlp.experts
-        n = y.shape[0]
+        n = y.shape[-2]  # y [n, E + latent] or split-K partials [splits, n, E + latent]
         bucket = experts.select_bucket(n)
         rt = experts.get_runtime()
         session = rt.sessions[bucket]
         p = rt.problem
-        if y.shape[1] - self.num_logits != p.hidden or session.topk_idx.shape[1] != experts.top_k:
+        if y.shape[-1] - self.num_logits != p.hidden or session.topk_idx.shape[1] != experts.top_k:
             raise Unsupported("moe", n, "route_stage: MegaMoE problem shape")
         pad = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -612,8 +698,28 @@ class RouteStage:
             self.scale,
             p.quant_kind == "nvfp4",
             float(p.input_norm_const),
+            *self._eplb_args(),
         )
         return rt, session, n
+
+    def _eplb_args(self):
+        """The layer's EPLB tensors for the in-kernel stock mapping and load
+        record (``eplb_map_to_physical_and_record``), or Nones without EPLB."""
+        st = self.mlp.experts.eplb_state
+        if st.logical_to_physical_map is None:
+            return None, None, None, None, None
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        unpadded = None
+        if st.num_unpadded_tokens_tensors is not None:
+            unpadded = st.num_unpadded_tokens_tensors[dbo_current_ubatch_id()]
+        return (
+            st.logical_to_physical_map,
+            st.logical_replica_count,
+            st.expert_load_view,
+            st.should_record_tensor,
+            unpadded,
+        )
 
     def launch(self, staged, output_rmsnorm=None, shared=None):
         """MegaMoE on a :meth:`stage`-d session: its BF16 ``[n, latent]`` output

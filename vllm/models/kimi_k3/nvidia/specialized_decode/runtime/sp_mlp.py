@@ -30,6 +30,7 @@ import torch
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from ...mxfp8 import is_mxfp8_linear
+from .. import prewait_gemm
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
@@ -62,8 +63,25 @@ SHARED = ("shared_gu", "shared_down")
 # producer); in-step D3-32 NVFP4 slice r8 (fastab ABBA x2, same node) 3967.5 ->
 # 3902.8 us per 24-layer step (-65 us). n64 (64.64.2.6; 1 GPU 10.11 vs 9.74, but the
 # weights stream during the reduce in-step): r16 4639.5 -> 4605.8 (-34), r8 with both
-# -68.5 (another node), r24 unchanged.
-ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6"}
+# -68.5 (another node), r24 unchanged. n96 (64.96.2.5; 1 GPU 11.58 us vs ~9.9 for the
+# router || latent down pair, but in-step the concat also moves r24 onto route_stage):
+# r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
+ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
+# PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
+# slice, split-K front vs prewait (fastab xy1/xy2, Rhea): n32 split-K faster
+# (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step).
+PREWAIT_ROWS = (64,)
+# Rows whose latent up (stock's beta-add ``shared_out.addmm_(final, W^T)``) runs the
+# token-wide 2-CTA GEMM (``gemm.wide``, ``partials``) with K split over the given
+# number of CTA pairs and leaves FP32 split partials: the next layer's SP all-gather
+# boundary forms the output as stock's cuBLAS beta-add does (bf16(bf16(partials
+# summed in split order) + residual), ``attn_res.sp_fused.SplitDelta``), so there
+# is no split exchange and no separate sum. Weights are requested before the PDL wait; the MegaMoE top-k reduce
+# releases its dependents at entry (its completion follows the shared expert's
+# stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
+# badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
+LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
 
 
 class SplitKFront:
@@ -165,6 +183,7 @@ class SpMlp:
                  for r in self.rows}  # fmt: skip
         concat_rows = tuple(r for r, v in front.items() if v is not None)
         self.router_latent = self.route_stage = None
+        self.prewait_router_latent = None
         if (
             concat_rows
             and router_concat_cause(mlp) is None
@@ -184,6 +203,12 @@ class SpMlp:
                 gemms.append(SplitKFront(packed, split))
             self.router_latent = (packed, FrontGemms(gemms), mlp.gate.weight.shape[0])
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
+            # Pre-wait weight-streaming GEMM at the token counts it serves (its own
+            # tile-image copy: the stock linears stay views of the row-major concat).
+            if any(
+                r in PREWAIT_ROWS and prewait_gemm.supported(r, k) for r in concat_rows
+            ):
+                self.prewait_router_latent = prewait_gemm.pack_weight(packed)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -224,6 +249,16 @@ class SpMlp:
                 self.gemms[family] = DecodeProjection(
                     weight, self.rows, tactics, family=table
                 )
+            parts = {r: rows_policy(LATENT_UP_PARTS, Shape(r, 1), default=None)
+                     for r in self.rows}  # fmt: skip
+            self.parts = {r: s for r, s in parts.items() if s is not None}
+            self.latent_up_parts = None
+            if self.parts:
+                from ..cutedsl.gemm.wide import PreparedWide
+
+                self.latent_up_parts = PreparedWide(
+                    weights["latent_up"], self.parts, partials=True
+                ).prepare()
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n
@@ -286,9 +321,11 @@ class SpMlp:
         act = shared.act_fn(gate_up)
         return gemms["shared_down"].run(act, h.new_empty((n, self.hidden)))
 
-    def run(self, h: torch.Tensor, prequantized: bool = False) -> torch.Tensor:
+    def run(self, h: torch.Tensor, prequantized: bool = False, parts: bool = False):
         """``prequantized``: the shared gate_up's MXFP8 input scratch already holds
-        ``h`` quantized (``mx_input``; the post-AttnRes wrote it)."""
+        ``h`` quantized (``mx_input``; the post-AttnRes wrote it). ``parts``: the
+        caller hands the output to an SP all-gather boundary compiled for this layer's
+        latent up splits, so rows in ``self.parts`` return a ``SplitDelta``."""
         if prequantized and not self.mxfp8:
             raise Unsupported("moe", h.shape[0], "an MXFP8 input for a BF16 shared")
         mlp, gemms = self.mlp, self.gemms
@@ -306,7 +343,15 @@ class SpMlp:
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent
             y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
-            gemm.run(packed, h, y)
+            pw = self.prewait_router_latent
+            if (
+                pw is not None
+                and n in PREWAIT_ROWS
+                and prewait_gemm.supported(n, packed.shape[1])
+            ):
+                prewait_gemm.gemm(y, h, pw, packed.shape[0])
+            else:
+                gemm.run(packed, h, y)
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
             staged = route.stage(y)
@@ -349,6 +394,13 @@ class SpMlp:
         norm = mlp.routed_output_transform.norm
         if norm is not None and fused_norm is None:
             final = norm(final)
+        if parts and n in self.parts:
+            from ..cutedsl.attn_res.sp_fused import SplitDelta
+
+            split = self.parts[n]
+            partials = final.new_empty((split * n, self.hidden), dtype=torch.float32)
+            self.latent_up_parts.run(final.contiguous(), partials)
+            return SplitDelta(partials, shared_out, split)
         return gemms["latent_up"].run(final, residual=shared_out)
 
 
