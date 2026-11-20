@@ -119,6 +119,7 @@ def test_plan_builds_from_the_real_checkpoint():
     """Every AttnRes query of hf-1d82032 (187 calls), from the safetensors and
     from the parameters vLLM loads them into (RMSNorm weight, BF16 [1, H] proj
     weight through the default weight loader), is an exact BF16 term sum."""
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.layernorm import RMSNorm
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_lp
@@ -127,12 +128,15 @@ def test_plan_builds_from_the_real_checkpoint():
     assert len(real) == 187
     plans = [attn_res_lp.Plan(real, [EPS] * len(real), 12, 8)]
     loaded = []
-    for nw, qk in real:
-        norm = RMSNorm(H, eps=EPS, dtype=torch.bfloat16)
-        default_weight_loader(norm.weight, nw)
-        proj = torch.nn.Parameter(torch.empty(1, H, dtype=torch.bfloat16), requires_grad=False)
-        default_weight_loader(proj, qk.reshape(1, H))
-        loaded.append((norm.weight.data, proj.data.squeeze(0)))
+    with set_current_vllm_config(VllmConfig()):
+        for nw, qk in real:
+            norm = RMSNorm(H, eps=EPS, dtype=torch.bfloat16)
+            default_weight_loader(norm.weight, nw)
+            proj = torch.nn.Parameter(
+                torch.empty(1, H, dtype=torch.bfloat16), requires_grad=False
+            )
+            default_weight_loader(proj, qk.reshape(1, H))
+            loaded.append((norm.weight.data, proj.data.squeeze(0)))
     plans.append(attn_res_lp.Plan(loaded, [EPS] * len(loaded), 12, 8))
     for plan in plans:
         assert len(plan.terms) == 2
