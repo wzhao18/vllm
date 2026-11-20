@@ -15,6 +15,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import SubBlo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
     expand_sub_block_ids,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+    NixlPullConnectorWorker,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 
@@ -254,3 +257,31 @@ def test_draft_head_dlists_geometry():
         )
     # A P rank that does not hold this rank's heads has no draft dlists.
     assert w._draft_head_dlists(meta, remote_tp_rank=0, remote_tp_size=2) is None
+
+
+@pytest.mark.parametrize(
+    "remote_sub_blocks,peer_sub_blocks,local_block_ids,skewed",
+    [
+        # Notify-only: aborted before it was scheduled, ids never expanded.
+        (1, 4, [], False),
+        (1, 4, [[], []], False),
+        # A read whose expansion matches the handshake.
+        (4, 4, [[3, 4], []], False),
+        # A read with unexpanded ids from a sub-block peer would scramble KV.
+        (1, 4, [[3, 4], []], True),
+        # Expanded ids, but the handshake found an equal-block peer.
+        (4, 1, [[3]], True),
+    ],
+)
+def test_sub_block_skew_only_fails_reads(
+    remote_sub_blocks, peer_sub_blocks, local_block_ids, skewed
+):
+    """A request aborted before it was scheduled carries P's unexpanded block
+    ids and no local blocks: it only frees P's blocks and must not fail on
+    the sub-block skew (DP8 P/D gate, 2026-11-20: such cleanups logged
+    sub_block_mismatch and never notified P)."""
+    meta = SimpleNamespace(
+        remote=SimpleNamespace(sub_blocks=remote_sub_blocks),
+        local_block_ids=local_block_ids,
+    )
+    assert NixlPullConnectorWorker._sub_block_skew(meta, peer_sub_blocks) == skewed

@@ -55,6 +55,14 @@ def main():
     p.add_argument("--qa", default="2", help="claim run-ahead builds")
     p.add_argument("--pdl", default="1", help="PDL builds (1 production, 0 plain)")
     p.add_argument("--qdeep", default="3", help="ring depth of MXFP8-only calls with >= 5 blocks")
+    p.add_argument("--resid", default="a", help="residual-stream modes a (today), b (die-local delta), "
+                   "c (pre-summed die-local prefix: no delta read, no write-back)")
+    p.add_argument("--probe", default="0", help="kernel probe builds (128: data-movement skeleton)")
+    p.add_argument("--producer", type=int, default=0, help="time mm vs addmm (+prefix) at [rows, 7168]")
+    p.add_argument("--psim", default="0", help="window-partial projection: calls with >= N blocks "
+                   "stream 2 block rows (= one FP32 partial row) and each such window first writes "
+                   "2 x calls FP32-row bytes + reads its blocks (0: off)")
+    p.add_argument("--allk", type=int, default=0, help="totals over every kernel of the arm")
     args = p.parse_args()
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -111,6 +119,41 @@ def main():
                                  bf16_out=c["impl"] == "mx_bq", chunk_depth=3)
         return out, qa
 
+    # Residual-stream modes (SOL audit 05:32 item 3): a = today; b = the delta /
+    # attention-output rows homed per die like the block rows; c = the producer
+    # writes prefix + delta into the die-local prefix buffer (no delta read, no
+    # prefix write-back here). probe: kernel probe build (128 = skeleton).
+    mode = {"resid": "a", "probe": 0, "psim": 0}
+    dl_rows = {}
+    # psim: calls per block count (a window = the calls that see the same blocks).
+    win_calls = {}
+    for c in calls:
+        win_calls[c["nb"]] = win_calls.get(c["nb"], 0) + 1
+    psim_buf = {}
+
+    def psim_window(st, nb):
+        # The window precompute's bytes: read its nb block rows once and write
+        # one FP32 partial row (2 BF16 rows) per call of the window.
+        buf = psim_buf.get("w")
+        if buf is None:
+            buf = psim_buf["w"] = torch.empty(
+                (max(win_calls.values()), T, H), dtype=torch.float32, device="cuda")
+        buf[:win_calls[nb]].fill_(1.0)
+        psim_buf["r"] = st.blocks[:, :nb].amax()
+
+    def dielocal_copy(x, key):
+        if key not in dl_rows:
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+            sup = attn_res_dielocal.SUPER_TOKENS
+            tok = -(-T // sup) * sup
+            per = sup * H * 2 // attn_res_dielocal.CHUNK
+            nbytes = tok * H * 2
+            raw = dies.localized_empty(nbytes, [(c // per) & 1 for c in range(nbytes // attn_res_dielocal.CHUNK)],
+                                       torch.cuda.current_device())
+            dl_rows[key] = raw[:nbytes].view(torch.bfloat16).view(tok, H)[:T]
+            dl_rows[key].copy_(x)
+        return dl_rows[key]
+
     def run_lp(st, c, force_bf16=False):
         if c["c"] == 0:
             attn_res_lp.begin(plan, st.blocks)
@@ -119,9 +162,25 @@ def main():
         bf = c["impl"] != "mx_q" or force_bf16
         qu = c["impl"] != "native"
         po = attn_res_dielocal.prefix_out(pi, st.blocks) if st.dl else None
-        r = attn_res_lp.attn_res(pi, d, st.blocks, c["c"], c["nb"], c["widx"],
+        if mode["resid"] == "b" and st.dl:
+            if d is not None:
+                d = dielocal_copy(delta, "delta")
+            if c["kind"] == "post" and not c["delta"]:  # the attention output as prefix
+                pi = dielocal_copy(attn_out, "attn_out")
+        if mode["resid"] == "c" and st.dl:
+            if getattr(st, "c_prefix", None) is None:
+                st.c_prefix = attn_res_dielocal.prefix_out(prefix0, st.blocks)
+                st.c_prefix.copy_(prefix0)
+            pi, d, po = st.c_prefix, None, None
+        nb = c["nb"]
+        if mode["psim"] and nb >= mode["psim"]:
+            if getattr(st, "psim_nb", -1) != nb:
+                psim_window(st, nb)
+            st.psim_nb = nb
+            nb = 2
+        r = attn_res_lp.attn_res(pi, d, st.blocks, c["c"], nb, c["widx"],
                                  onw if c["out_norm"] else None, EPS, bf, qu,
-                                 prefix_out=po)
+                                 prefix_out=po, _probe=mode["probe"])
         if po is not None and c["kind"] != "final":
             st.prefix = po
         return r
@@ -218,38 +277,49 @@ def main():
             tot["clip:" + k] = tot.get("clip:" + k, 0.0) + (s1 - c0) / args.iters
         return {k: round(v / 1e3, 3) for k, v in sorted(tot.items())}
 
-    for pd in [int(x) for x in args.depths.split(",")] if args.percall else []:
+    pc_modes = [(rs, int(pb)) for rs in args.resid.split(",") for pb in args.probe.split(",")]
+    for pd, (rs, pb) in [(int(x), m) for x in args.depths.split(",") for m in pc_modes] \
+            if args.percall else []:
         attn_res_lp.RING_DEPTH = pd
         attn_res_lp.RING_DEPTH_Q_DEEP = pd
+        mode["resid"], mode["probe"], mode["psim"] = rs, pb, 0
         st = State(bool(args.dielocal))
         for c in calls:
             run_lp(st, c)
         torch.cuda.synchronize()
         groups = {}
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            st = State(bool(args.dielocal))
-            for c in calls:
-                run_lp(st, c)
+            for _ in range(args.iters):
+                for c in calls:
+                    run_lp(st, c)
             torch.cuda.synchronize()
         evs = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
                and "attn_res_lp" in e.name]
         evs.sort(key=lambda e: e.time_range.start)
-        for c, e in zip(calls, evs):
-            rows = c["nb"] + 1 + int(c["delta"]) + 1 + (c["widx"] >= 0) \
+        for i, e in enumerate(evs):
+            c = calls[i % len(calls)]
+            dlt = c["delta"] and rs != "c"
+            wb = (dlt or (c["kind"] == "post" and not c["delta"])) and args.dielocal and rs != "c"
+            rows = c["nb"] + 1 + int(dlt) + int(wb) + (c["widx"] >= 0) \
                 + (1 if c["impl"] != "mx_q" else 0) + (0.5 if c["impl"] != "native" else 0)
             k = f"{c['kind']}.{c['impl']}.nb{c['nb']}.d{int(c['delta'])}"
             g = groups.setdefault(k, [0, 0.0, rows])
             g[0] += 1
             g[1] += e.time_range.elapsed_us()
+        tot = 0.0
         for k, (n, us, rows) in sorted(groups.items()):
-            print(json.dumps({"depth": pd, "call": k, "n": n, "us": round(us / n, 1),
+            tot += us / args.iters
+            print(json.dumps({"pc": f"d{pd}r{rs}pb{pb}", "call": k, "n": n // args.iters,
+                              "us": round(us / n, 1), "rows": rows,
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
+        print(json.dumps({"pc": f"d{pd}r{rs}pb{pb}", "sum_ms": round(tot / 1e3, 3)}))
 
-    def lp_arm(qa, pdl, qdeep):
+    def lp_arm(qa, pdl, qdeep, resid="a", probe=0, psim=0):
         def fn(st, c):
             attn_res_lp.CLAIM_AHEAD = qa
             attn_res_lp.PDL = pdl
             attn_res_lp.RING_DEPTH_Q_DEEP = qdeep
+            mode["resid"], mode["probe"], mode["psim"] = resid, probe, psim
             return run_lp(st, c)
         return fn
 
@@ -263,8 +333,11 @@ def main():
         for qa in [int(x) for x in args.qa.split(",")]:
             for pdl in [int(x) for x in args.pdl.split(",")]:
                 for qd in [int(x) for x in args.qdeep.split(",")]:
-                    arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}qd{qd}",
-                                 lp_arm(qa, pdl, qd)))
+                    for rs in args.resid.split(","):
+                        for pb in [int(x) for x in args.probe.split(",")]:
+                            for ps in [int(x) for x in args.psim.split(",")]:
+                                arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}qd{qd}r{rs}pb{pb}ps{ps}",
+                                             lp_arm(qa, pdl, qd, rs, pb, ps)))
         order = arms + arms[::-1]
         for name, fn in order:
             r = timed(fn, bool(args.dielocal) and name != "old")
@@ -278,7 +351,8 @@ def main():
                     b = k[len(pre):]
                     if b.startswith("clip:"):
                         continue
-                    if b in ("lp", "attnres_old") or "nvjet" in b or "gemm" in b.lower():
+                    if args.allk or b in ("lp", "attnres_old") or "nvjet" in b \
+                            or "gemm" in b.lower():
                         tot += v
                 return round(tot, 3)
             r["total_ms"] = fam("")
@@ -287,6 +361,29 @@ def main():
                  if k in ("arm", "total_ms", "clip_ms", "lp", "attnres_old", "clip:lp")}
             print(json.dumps(r))
             res.append(r)
+
+    if args.producer:
+        # Producer price of the fused residual (item 3): the o_proj-shaped GEMM
+        # writing y vs reading prefix and writing prefix + y (cuBLAS beta = 1).
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+        for kdim in (4096, 8192):
+            x = torch.randn(T, kdim, device="cuda").bfloat16()
+            w = torch.randn(kdim, H, device="cuda").bfloat16() * kdim**-0.5
+            pre = torch.randn(T, H, device="cuda").bfloat16()
+            out = {}
+            for name in ("mm", "addmm", "addmm", "mm"):
+                fn = (lambda: torch.mm(x, w)) if name == "mm" else (lambda: torch.addmm(pre, x, w))
+                for _ in range(3):
+                    fn()
+                ev[0].record()
+                for _ in range(20):
+                    fn()
+                ev[1].record()
+                torch.cuda.synchronize()
+                out.setdefault(name, []).append(ev[0].elapsed_time(ev[1]) * 1e3 / 20)
+            print(json.dumps({"producer_k": kdim, "rows": T,
+                              "mm_us": round(sum(out["mm"]) / 2, 1),
+                              "addmm_us": round(sum(out["addmm"]) / 2, 1)}))
 
 
 if __name__ == "__main__":

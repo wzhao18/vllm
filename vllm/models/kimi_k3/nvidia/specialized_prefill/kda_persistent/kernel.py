@@ -611,12 +611,13 @@ def _pkd(
     u_wide_st = tcgen05.make_tmem_copy(stwb_atom, u2b)
     v_vt = cute.make_tensor(p_v_wide, lay_v.outer)
     state_inp_bar = pipeline.NamedBarrier(barrier_id=3, num_threads=288)
+    # Dev-only (TABW_ == 1): epilogue master-decay handoff to the MMA warp.
+    mst_epi_bar = pipeline.NamedBarrier(barrier_id=13, num_threads=160)
+    if cutlass.const_expr(TABW_ == 1):
+        raise ValueError("TABW_ == 1 needs the image-first state pass")
     u_inp_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=160)
     u2_inp_bar = pipeline.NamedBarrier(barrier_id=5, num_threads=160)
     u2_inp_lo_bar = pipeline.NamedBarrier(barrier_id=12, num_threads=160)
-    # Epilogue warps -> MMA warp: the epilogue's master-half decay (now done
-    # after the state image is published) is in TMEM before MMA4a reads it.
-    mst_epi_bar = pipeline.NamedBarrier(barrier_id=13, num_threads=160)
     # half-window ([128,16] channels) bf16 INP store template for wg2
     w8b_base = thr1.make_fragment_A(mma_1.partition_shape_A((BM, 16)))
     stwb8_atom = cute.make_copy_atom(
@@ -896,48 +897,20 @@ def _pkd(
                             mst_base.layout,
                         )
                         cute.copy(mst_ld, mst_thr.partition_S(mnxt), rnxt)
-                    mv = rcur.load()
-                    rb32f.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
-                    if cutlass.const_expr(GATE2_ == 1 and win == 0):
-                        _mbw(mb + MB_OFIN + ofin_stage, ofin_phase)
-                    cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
-                # Publish the BF16 state image first: MMA1 (U, out-inter)
-                # reads only the image, so the master decay below runs off
-                # the recurrence's critical path (MMA4a, which accumulates
-                # into the master, starts only after the later u2 handoff,
-                # whose tcgen05.wait::st also covers these master stores).
-                cute.arch.fence_view_async_tmem_store()
-                state_inp_bar.arrive()
-                if cutlass.const_expr(TLINE_ == 1):
-                    if (slot == 0) & (kx == 0) & (t < 48) & (warp == 0):
-                        with cute.arch.elect_one():
-                            tprobe[t * 32 + 1] = _clock64()
-                if cutlass.const_expr(TABW_ == 1):
-                    if cutlass.const_expr(TPROBE_ == 2):
-                        ccQ = _clock64()
-                        _mbw(mb + MB_TAB + csc, p_qk)
-                        cwQ += _clock64() - ccQ
-                    else:
-                        _mbw(mb + MB_TAB + csc, p_qk)
-                for win in cutlass.range_constexpr(2):
-                    rcur = r_mst if win % 2 == 0 else r_mst2
-                    msth = cute.make_tensor(
-                        cute.recast_ptr(
-                            tmem_ptr + 64 + win * 32, dtype=cutlass.Float32
-                        ),
-                        mst_base.layout,
-                    )
                     for gv in cutlass.range_constexpr(4):
                         g8d = cute.make_tensor(
                             r_gt.iterator + 8 * gv, cute.make_layout((8,))
                         )
                         cute.autovec_copy(v_gt8[(win * 4 + gv, None, csc)], g8d)
-                    rcur.store(rcur.load() * r_gt.load())
+                    mv = rcur.load()
+                    rb32f.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
+                    rcur.store(mv * r_gt.load())
+                    if cutlass.const_expr(GATE2_ == 1 and win == 0):
+                        cute.arch.mbarrier_wait(mb + MB_OFIN + ofin_stage, ofin_phase)
+                    cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
                     cute.copy(mst_st, rcur, mst_sthr.partition_D(msth))
-                if cutlass.const_expr(TLINE_ == 1):
-                    if (slot == 0) & (kx == 0) & (t < 48) & (warp == 0):
-                        with cute.arch.elect_one():
-                            tprobe[t * 32 + 2] = _clock64()
+                cute.arch.fence_view_async_tmem_store()
+                state_inp_bar.arrive()
                 p_oe ^= 1
                 p_inp ^= 1
 
@@ -1567,11 +1540,19 @@ def _pkd(
                                         h16_base.layout,
                                     )
                                     cute.copy(h_ld, h_thr.partition_S(hnxt), rnxt)
+                                for gv in cutlass.range_constexpr(2):
+                                    g8d = cute.make_tensor(
+                                        gt16.iterator + 8 * gv, cute.make_layout((8,))
+                                    )
+                                    cute.autovec_copy(
+                                        v_gt8[(8 + hh * 2 + gv, None, csn)], g8d
+                                    )
                                 mv = rcur.load()
                                 rbh.store(
                                     mv.to(cutlass.BFloat16)
                                     * cutlass.BFloat16(INP_SCALE)
                                 )
+                                rcur.store(mv * gt16.load())
                                 tw8 = cute.make_tensor(
                                     cute.recast_ptr(
                                         tmem_ptr + 32 + hh * 8,
@@ -1580,53 +1561,9 @@ def _pkd(
                                     w8b_base.layout,
                                 )
                                 cute.copy(w8b_st, rbh, w8b_thr.partition_D(tw8))
-                            # Image first (see the compute pass): publish it,
-                            # then decay this master half off the critical
-                            # path, re-reading it from TMEM.
-                            cute.arch.fence_view_async_tmem_store()
-                            state_inp_bar.arrive()
-                            if cutlass.const_expr(TLINE_ == 1):
-                                if (slot == 0) & (kx == 0) & (t < 48) & (warp == 4):
-                                    with cute.arch.elect_one():
-                                        tprobe[t * 32 + 10] = _clock64()
-                            if cutlass.const_expr(TABW_ == 1):
-                                _mbw(mb + MB_TAB + csn, pqn)
-                            cute.copy(h_ld, h_thr.partition_S(h0q), r_e1)
-                            for hh in cutlass.range_constexpr(4):
-                                rcur = r_e1 if hh % 2 == 0 else r_e2
-                                rnxt = r_e2 if hh % 2 == 0 else r_e1
-                                hmst = cute.make_tensor(
-                                    cute.recast_ptr(
-                                        tmem_ptr + 128 + hh * 16,
-                                        dtype=cutlass.Float32,
-                                    ),
-                                    h16_base.layout,
-                                )
-                                cute.arch.fence_view_async_tmem_load()
-                                if cutlass.const_expr(hh < 3):
-                                    hnxt = cute.make_tensor(
-                                        cute.recast_ptr(
-                                            tmem_ptr + 128 + (hh + 1) * 16,
-                                            dtype=cutlass.Float32,
-                                        ),
-                                        h16_base.layout,
-                                    )
-                                    cute.copy(h_ld, h_thr.partition_S(hnxt), rnxt)
-                                for gv in cutlass.range_constexpr(2):
-                                    g8d = cute.make_tensor(
-                                        gt16.iterator + 8 * gv, cute.make_layout((8,))
-                                    )
-                                    cute.autovec_copy(
-                                        v_gt8[(8 + hh * 2 + gv, None, csn)], g8d
-                                    )
-                                rcur.store(rcur.load() * gt16.load())
                                 cute.copy(h_st, rcur, h_sthr.partition_D(hmst))
                             cute.arch.fence_view_async_tmem_store()
-                            mst_epi_bar.arrive()
-                            if cutlass.const_expr(TLINE_ == 1):
-                                if (slot == 0) & (kx == 0) & (t < 48) & (warp == 4):
-                                    with cute.arch.elect_one():
-                                        tprobe[t * 32 + 11] = _clock64()
+                            state_inp_bar.arrive()
                             csn += 1
                             if csn == STAGES:
                                 csn = 0
@@ -1911,15 +1848,6 @@ def _pkd(
                             with cute.arch.elect_one():
                                 tcgen05.commit(mb + MB_U2ACC + csm)
 
-                        if cutlass.const_expr(TABW_ == 1):
-                            mst_epi_bar.arrive_and_wait()
-                        else:
-                            if _t > 0:
-                                mst_epi_bar.arrive_and_wait()
-                        if cutlass.const_expr(TLINE_ == 1):
-                            if (slot == 0) & (kx == 0) & (_t < 48):
-                                with cute.arch.elect_one():
-                                    tprobe[_t * 32 + 14] = _clock64()
                         mma_4a.set(tcgen05.Field.ACCUMULATE, True)
                         if cutlass.const_expr(GATE2_ == 1):
                             u2_inp_lo_bar.arrive_and_wait()
@@ -2555,20 +2483,86 @@ def _pkd(
                         if (slot == 0) & (kx == 0) & (ci < 48) & (plw == 0):
                             with cute.arch.elect_one():
                                 tprobe[ci * 32 + 17] = _clock64()
+                    # Swizzle-resolved SW128 byte addresses of this thread's
+                    # [row, 8-element] slot at wp = 0; +8 rows is +1024 B (the
+                    # XOR source bits 7-9 do not change), so each iteration
+                    # steps one base per access instead of re-deriving it.
+                    # packed varlen GATE2 route only (measured: the fixed
+                    # routes keep more live registers and lose)
+                    HOIST_QK = GATE2_ == 1 and QK_ROWPAIR_ == 8
+                    if cutlass.const_expr(HOIST_QK):
+                        rwb = (ptl >> 5) + ((ptl >> 2) & 4)
+                        sgx = ptl & 15
+                        a_q = (
+                            cutlass.Int32(ar0.toint())
+                            + OFF_QD
+                            + 2 * (rwb * 64 + 8 * (sgx & 7) + 4096 * (sgx >> 3))
+                            + 2 * STAGE_ELTS * inst
+                        )
+                        a_f = (
+                            cutlass.Int32(ar0.toint())
+                            + OFF_FT
+                            + 2 * (rwb * 64 + 8 * (sgx & 7) + 2048 * (sgx >> 3))
+                            + 2 * STAGE_ELTS * inst
+                        )
+                        a_k = a_q + 4096
+                        a_q = a_q ^ (((a_q >> 7) & 7) << 4)
+                        a_k = a_k ^ (((a_k >> 7) & 7) << 4)
+                        a_f = a_f ^ (((a_f >> 7) & 7) << 4)
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
                         # four-row half-warp pairing. QK_ROWPAIR_ only selects
                         # the surrounding gate pipeline now.
-                        rw2 = wp * 8 + (ptl >> 5) + ((ptl >> 2) & 4)
-                        sg2 = ptl & 15
+                        if cutlass.const_expr(HOIST_QK):
+                            rw2 = wp * 8 + rwb
+                            sg2 = sgx
+                            o8 = wp * 1024
+                            s_q8 = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    a_q + o8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                            s_k8 = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    a_k + o8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                            s_f8 = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    a_f + o8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                        else:
+                            rw2 = wp * 8 + (ptl >> 5) + ((ptl >> 2) & 4)
+                            sg2 = ptl & 15
                         if tma:
-                            q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                            q8s = (
+                                s_f8
+                                if cutlass.const_expr(HOIST_QK)
+                                else v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                            )
                             if cutlass.const_expr((PROBE_ & 8) == 0):
                                 cute.autovec_copy(q8s, qr)
                             if cutlass.const_expr(RAWG_ == 1):
                                 k8s = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                             else:
-                                k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                                k8s = (
+                                    s_k8
+                                    if cutlass.const_expr(HOIST_QK)
+                                    else v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                                )
                             cute.autovec_copy(k8s, kr)
                             if cutlass.const_expr(may_be_partial):
                                 if rw2 >= cc:
@@ -2640,13 +2634,25 @@ def _pkd(
                             idecv = cute.math.rcp(decv, approx=True, ftz=True)
                         else:
                             idecv = cute.math.exp2(anch - gv8, fastmath=True)
-                        dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        dq8 = (
+                            s_q8
+                            if cutlass.const_expr(HOIST_QK)
+                            else v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        )
                         if cutlass.const_expr((PROBE_ & 8) == 0):
                             cute.autovec_copy(qr, dq8)
-                        dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        dk8 = (
+                            s_k8
+                            if cutlass.const_expr(HOIST_QK)
+                            else v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        )
                         cute.autovec_copy(kr, dk8)
                         kr.store((khv * idecv).to(cutlass.BFloat16))
-                        di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        di8 = (
+                            s_f8
+                            if cutlass.const_expr(HOIST_QK)
+                            else v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        )
                         cute.autovec_copy(kr, di8)
                     # gt/rf (dedicated buffers; gcs row 31 stable since the
                     # post-walker barrier -> rides the decoration phase)
