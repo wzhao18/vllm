@@ -381,22 +381,37 @@ __device__ __forceinline__ uint32_t situ4_pair_ct(uint32_t gw, uint32_t uw,
   return *reinterpret_cast<const uint32_t*>(&h);
 }
 
-// SiTU + MXFP8 quant of one 32-column block of one row (thread blk of the
-// row): gate a[0..3], up b[0..3] (8 BF16 each). The block amax stays in
-// registers. Bytes equal act_quant_kernel<4> (same SiTU and quantization
-// steps).
+// Mode 4 for d % 1024 == 0, d <= 32768, 16-byte aligned rows: one CTA per
+// (padded) row and one thread per 32-column MXFP8 block, so the block amax
+// stays in registers and the indexing is two integer ops. Bytes equal
+// act_quant_kernel<4> (same SiTU and quantization steps).
 template <int A_POW, bool CLAMP>
-__device__ __forceinline__ void situ4_block_store(
-    const uint4 (&a)[4], const uint4 (&b)[4], uint8_t* __restrict__ q,
-    uint8_t* __restrict__ sf, const int64_t row, const int blk,
-    const int64_t q_stride, const int sf_col_base, const int padded_cols,
-    const float beta, const float linear_beta) {
+__global__ void __launch_bounds__(1024) situ4_row_kernel(
+    uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
+    const uint16_t* __restrict__ x, const int64_t rows, const int d,
+    const int64_t x_stride, const int64_t q_stride, const int sf_col_base,
+    const int padded_cols, const float beta, const float linear_beta) {
   const float log2e = 1.4426950408889634f;
   const float kb = -2.0f * log2e / beta;
   const float kc = CLAMP ? -2.0f * log2e / linear_beta : 0.0f;
   const float bbs = CLAMP ? beta * linear_beta : beta;
   const float2 k_a = make_float2(-log2e, -log2e), k_b = make_float2(kb, kb);
   const float2 k_c = make_float2(kc, kc), bb = make_float2(bbs, bbs);
+  const int64_t row = blockIdx.x;
+  const int blk = threadIdx.x;
+  const int64_t sf_off = swizzled_sf_offset(row, sf_col_base + blk, padded_cols);
+  if (row >= rows) {
+    sf[sf_off] = 0;
+    return;
+  }
+  const uint4* gp =
+      reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
+  const uint4* up = reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
+  uint4 a[4], b[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) a[i] = __ldg(gp + i);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) b[i] = __ldg(up + i);
   uint32_t h[16];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -427,64 +442,7 @@ __device__ __forceinline__ void situ4_block_store(
   uint4* qp = reinterpret_cast<uint4*>(q + row * q_stride + blk * 32);
   qp[0] = make_uint4(w[0], w[1], w[2], w[3]);
   qp[1] = make_uint4(w[4], w[5], w[6], w[7]);
-  sf[swizzled_sf_offset(row, sf_col_base + blk, padded_cols)] = (uint8_t)e;
-}
-
-__device__ __forceinline__ void situ4_block_load(const uint16_t* __restrict__ x,
-                                                 const int64_t row,
-                                                 const int64_t x_stride,
-                                                 const int d, const int blk,
-                                                 uint4 (&a)[4], uint4 (&b)[4]) {
-  const uint4* gp =
-      reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
-  const uint4* up =
-      reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) a[i] = __ldg(gp + i);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) b[i] = __ldg(up + i);
-}
-
-// Mode 4 for d % 1024 == 0, d <= 32768, 16-byte aligned rows: one thread per
-// 32-column MXFP8 block of a row (d / 32 threads per CTA). Persistent grid
-// (resident CTAs only) striding over the (padded) rows; the next row's
-// operands are loaded before the current row is computed, so every thread
-// keeps two rows' loads in flight and no CTA launch gap stalls the stream.
-template <int A_POW, bool CLAMP>
-__global__ void __launch_bounds__(1024) situ4_row_kernel(
-    uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
-    const uint16_t* __restrict__ x, const int64_t rows, const int64_t rows_pad,
-    const int d, const int64_t x_stride, const int64_t q_stride,
-    const int sf_col_base, const int padded_cols, const float beta,
-    const float linear_beta) {
-  const int blk = threadIdx.x;
-  const int64_t stride = gridDim.x;
-  int64_t row = blockIdx.x;
-  uint4 a0[4], b0[4], a1[4], b1[4];
-  if (row < rows) situ4_block_load(x, row, x_stride, d, blk, a0, b0);
-  while (row < rows_pad) {
-    int64_t nxt = row + stride;
-    if (nxt < rows) situ4_block_load(x, nxt, x_stride, d, blk, a1, b1);
-    if (row < rows) {
-      situ4_block_store<A_POW, CLAMP>(a0, b0, q, sf, row, blk, q_stride,
-                                      sf_col_base, padded_cols, beta,
-                                      linear_beta);
-    } else {
-      sf[swizzled_sf_offset(row, sf_col_base + blk, padded_cols)] = 0;
-    }
-    row = nxt;
-    if (row >= rows_pad) break;
-    nxt = row + stride;
-    if (nxt < rows) situ4_block_load(x, nxt, x_stride, d, blk, a0, b0);
-    if (row < rows) {
-      situ4_block_store<A_POW, CLAMP>(a1, b1, q, sf, row, blk, q_stride,
-                                      sf_col_base, padded_cols, beta,
-                                      linear_beta);
-    } else {
-      sf[swizzled_sf_offset(row, sf_col_base + blk, padded_cols)] = 0;
-    }
-    row = nxt;
-  }
+  sf[sf_off] = (uint8_t)e;
 }
 
 // mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 4 the same with the
@@ -696,28 +654,13 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
     const int a_pow =
         (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
     auto stream = c10::cuda::getCurrentCUDAStream();
-    int dev = 0;
-    C10_CUDA_CHECK(cudaGetDevice(&dev));
-    int sms = 0;
-    C10_CUDA_CHECK(
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 #define ROW_LAUNCH(P, C)                                                       \
-  do {                                                                         \
-    static int occ = 0;                                                        \
-    static int occ_threads = 0;                                                \
-    if (occ_threads != (int)(d / 32)) {                                        \
-      C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(            \
-          &occ, situ4_row_kernel<P, C>, (int)(d / 32), 0));                    \
-      occ_threads = (int)(d / 32);                                             \
-    }                                                                          \
-    const int64_t grid = std::min<int64_t>(rows_pad, (int64_t)occ * sms);      \
-    situ4_row_kernel<P, C><<<(unsigned)grid, (unsigned)(d / 32), 0, stream>>>( \
-        reinterpret_cast<uint8_t*>(q.data_ptr()),                              \
-        reinterpret_cast<uint8_t*>(sf.data_ptr()),                             \
-        reinterpret_cast<const uint16_t*>(x.data_ptr()), rows, rows_pad,       \
-        (int)d, x.stride(0), q.stride(0), (int)sf_col_base,                    \
-        (int)padded_cols, (float)beta, (float)linear_beta);                    \
-  } while (0)
+  situ4_row_kernel<P, C><<<(unsigned)rows_pad, (unsigned)(d / 32), 0, stream>>>( \
+      reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
+      reinterpret_cast<uint8_t*>(sf.data_ptr()),                               \
+      reinterpret_cast<const uint16_t*>(x.data_ptr()), rows, (int)d,           \
+      x.stride(0), q.stride(0), (int)sf_col_base, (int)padded_cols,            \
+      (float)beta, (float)linear_beta)
     switch (a_pow * 2 + (clamp ? 1 : 0)) {
       case 0: ROW_LAUNCH(0, false); break;
       case 1: ROW_LAUNCH(0, true); break;
