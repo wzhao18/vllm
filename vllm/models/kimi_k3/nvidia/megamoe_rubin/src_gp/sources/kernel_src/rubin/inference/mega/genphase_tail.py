@@ -119,7 +119,7 @@ class GenphaseTail:
         cute.arch.fence_acq_rel_gpu()
         cute.arch.store(workspace.ptr(self.epoch_region), epoch + Int32(1), sem="relaxed", scope="gpu")
         DG.put_gt(DG.S_L_EPOCH, Int32(1))
-        cute.arch.fence_acq_rel_sys()
+        # DIAG (timing bound only, never lands): no system fence in front of the peer signals.
         DG.put_gt(DG.S_L_FSYS, Int32(1))
         signal_address = workspace.ptr(self.signal_region).toint()
         for destination_rank in cutlass.range_constexpr(self.world_size):
