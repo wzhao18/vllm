@@ -43,6 +43,65 @@ def _compare(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     }
 
 
+class _NanProbe:
+    """DCP8FIX diagnostic: per-module finiteness + checksum of eager passes."""
+
+    def __init__(self, model):
+        import os
+        self.passes: list[list] = []
+        self.handles = []
+        if not os.environ.get("DCP8FIX_PROBE"):
+            return
+        for name, mod in model.named_modules():
+            self.handles.append(mod.register_forward_hook(self._hook(name)))
+
+    def _hook(self, name):
+        def hook(mod, inp, out):
+            if not self.passes or torch.cuda.is_current_stream_capturing():
+                return
+            ts = []
+            stack = [out]
+            while stack:
+                o = stack.pop()
+                if isinstance(o, torch.Tensor):
+                    ts.append(o)
+                elif isinstance(o, (tuple, list)):
+                    stack.extend(o)
+            for i, t in enumerate(ts):
+                if not t.is_floating_point() or t.numel() == 0:
+                    continue
+                f = t.float()
+                fin = bool(f.isfinite().all())
+                cs = float(f.nan_to_num(0.0, 0.0, 0.0).double().abs().sum())
+                nbad = int((~f.isfinite()).sum()) if not fin else 0
+                self.passes[-1].append((name, i, tuple(t.shape), fin, cs, nbad))
+        return hook
+
+    def start(self):
+        if self.handles:
+            self.passes.append([])
+
+    def report(self, tag):
+        if not self.handles:
+            return
+        for h in self.handles:
+            h.remove()
+        rank = get_world_group().rank_in_group
+        for k, recs in enumerate(self.passes):
+            bad = [r for r in recs if not r[3]]
+            print(f"[probe] {tag} r{rank} pass{k}: {len(recs)} recs, "
+                  f"{len(bad)} nonfinite; first: {bad[:4]}", flush=True)
+        if len(self.passes) >= 2:
+            a, b = self.passes[0], self.passes[1]
+            diffs = [
+                (x[0], x[1], x[2], x[4], y[4])
+                for x, y in zip(a, b)
+                if x[0] == y[0] and abs(x[4] - y[4]) > 1e-6 * max(abs(x[4]), 1.0)
+            ]
+            print(f"[probe] {tag} r{rank} pass0 vs pass1: {len(diffs)} differ; "
+                  f"first: {diffs[:6]}", flush=True)
+
+
 def write_input_ids(
     batch: BenchBatch, input_batch: InputBatch, input_ids: torch.Tensor | None
 ) -> None:
@@ -219,9 +278,14 @@ class ForwardBench:
         with graph_capture(self.device) as capture_context:
             stream = capture_context.stream
             # Some kernels set up per-stream state on first use, outside capture.
+            probe = _NanProbe(self.runner.model)
+            probe.start()
             eager = _first_tensor(self._run_model()).clone()
             restore()
+            probe.start()
             reference = _first_tensor(self._run_model()).clone()
+            torch.accelerator.synchronize()
+            probe.report(self.name)
             draft_reference = self.drafter.tokens.clone() if self.drafter else None
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
