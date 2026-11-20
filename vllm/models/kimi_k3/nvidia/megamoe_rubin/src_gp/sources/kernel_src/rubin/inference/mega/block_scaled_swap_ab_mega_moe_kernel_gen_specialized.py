@@ -461,6 +461,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             and not self.reduce_shared_output
         )
 
+    @property
+    def tail_parity(self) -> bool:
+        """The polled-combine tail only signals the peers: each call works in the tail-reset copy of its epoch's
+        parity and zeroes the previous call's copy at entry, so the last arriver has no reset in front of the
+        signal (and of this grid's completion)."""
+        return self.epilogue.combine_ll_encoded
+
     # ------------------------------------------------------------------
     # Construction-time validation
     # ------------------------------------------------------------------
@@ -640,6 +647,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         counter_slot_count = self.token_comm.worst_case_padded_rows(self.cta_tile_n) // self.cta_tile_n
 
         device_workspace = DeviceWorkspace()
+        if self.tail_parity:
+            device_workspace.enable_tail_parity()
         device_workspace.register(
             self.fc1_output_region,
             self.epilogue.fc1_output_dtype,
@@ -1293,6 +1302,33 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             "gpu",
         )
 
+    @cute.jit
+    def _reset_previous_tail_copy(self, lane_idx: Int32) -> None:
+        """One warp of one CTA, at entry: zero the tail-reset copy the previous call worked in; the next
+        call works in it. Peers add into it only after this rank's done signal for this call, which the
+        last arriver sends after acquiring this CTA's arrival, so the zeroes are ordered before them.
+        Shared builds can finish a call without waiting on its comm flags: drain the previous call's flags
+        first, as the non-parity tail does before its reset. The first call has no previous one."""
+        if cutlass.const_expr(self.lazy_comm_waits):
+            if self.tail.read_epoch(self._device_workspace) != Int32(0):
+                wait_ready(
+                    ReadyFlag(
+                        self._device_workspace.ptr(self.token_comm.token_data_ready_region, other_parity=True),
+                        self.token_comm.payload_ready_target,
+                        "sys",
+                    )
+                )
+                wait_ready(
+                    ReadyFlag(
+                        self._device_workspace.ptr(self.token_comm.metadata_ready_region, other_parity=True),
+                        self.token_comm.metadata_ready_target,
+                        "gpu",
+                    )
+                )
+        self._device_workspace.reset_tail_space("shared", lane_idx, 32, other_parity=True)
+        self._device_workspace.reset_tail_space("local", lane_idx, 32, other_parity=True)
+        cute.arch.sync_warp()
+
     # ------------------------------------------------------------------
     # Weight prefetch
     # ------------------------------------------------------------------
@@ -1484,6 +1520,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        if cutlass.const_expr(self.tail_parity):
+            # The epoch only advances once every CTA of this grid has arrived at the tail. The previous
+            # call's main kernel (which advanced it) completed before this call's comm kernel started.
+            self._device_workspace.bind_tail_parity(self.tail.read_epoch(self._device_workspace) & Int32(1))
 
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
@@ -1774,6 +1814,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx < len(self.epilogue_warp_ids):
             cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
             iket.range_push("genphase.epilogue")
+            if cutlass.const_expr(self.tail_parity):
+                if (linear_cta_idx == Int32(0)) & (warp_idx == Int32(self.epilogue_warp_ids[0])):
+                    iket.range_push("epilogue.reset_previous_tail")
+                    self._reset_previous_tail_copy(cute.arch.lane_idx())
+                    iket.range_pop()
             # Lazy-wait builds acquire metadata_ready on the first routed tile instead.
             epilogue_ready_kwargs = {}
             if cutlass.const_expr(self.lazy_comm_waits):
@@ -1899,18 +1944,21 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
                 if is_last != Int32(0):
-                    # The last arriver has acquired every other CTA's arrival, so nothing on
-                    # this rank reads the tail span any more: reset it, then meet the peers.
-                    if cutlass.const_expr(self.lazy_comm_waits):
-                        # No CTA may have waited on the comm flags yet: drain them before the reset clears them.
-                        iket.range_push("tail.wait_comm_complete")
-                        wait_ready(self._payload_ready_flag())
-                        wait_ready(self._metadata_ready_flag())
+                    if cutlass.const_expr(not self.tail_parity):
+                        # The last arriver has acquired every other CTA's arrival, so nothing on
+                        # this rank reads the tail span any more: reset it, then meet the peers.
+                        if cutlass.const_expr(self.lazy_comm_waits):
+                            # No CTA may have waited on the comm flags yet: drain them before the reset clears them.
+                            iket.range_push("tail.wait_comm_complete")
+                            wait_ready(self._payload_ready_flag())
+                            wait_ready(self._metadata_ready_flag())
+                            iket.range_pop()
+                        iket.range_push("tail.reset_workspace")
+                        self.tail.reset_tail_space(self._device_workspace, lane_idx, 32)
+                        cute.arch.sync_warp()
                         iket.range_pop()
-                    iket.range_push("tail.reset_workspace")
-                    self.tail.reset_tail_space(self._device_workspace, lane_idx, 32)
-                    cute.arch.sync_warp()
-                    iket.range_pop()
+                    # With tail parity the copy the next call works in was zeroed at this call's entry
+                    # (_reset_previous_tail_copy, ordered before this point by that CTA's arrival).
                     iket.range_push("tail.nvlink_barrier")
                     if lane_idx == Int32(0):
                         epoch = self.tail.read_epoch(self._device_workspace)

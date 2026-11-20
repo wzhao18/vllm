@@ -124,6 +124,8 @@ class DeviceWorkspace:
         self._zero_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0, "tmp": 0}
         self._tail_leading: Dict[BufferSpace, int] = {"local": 0, "shared": 0, "tmp": 0}
         self._base: Dict[BufferSpace, Any] = {"local": None, "shared": None, "tmp": None}
+        self._tail_parity = False
+        self._tail_shift: Dict[BufferSpace, Any] = {"local": None, "shared": None, "tmp": None}
         self._finalized = False
 
     def __extract_mlir_values__(self) -> list:
@@ -135,6 +137,23 @@ class DeviceWorkspace:
     @property
     def finalized(self) -> bool:
         return self._finalized
+
+    @property
+    def tail_parity(self) -> bool:
+        """True when the tail-reset span has two copies selected by the call epoch's parity."""
+        return self._tail_parity
+
+    def enable_tail_parity(self) -> None:
+        """Keep two copies of every space's tail-reset span, used by alternate calls.
+
+        A call works in the copy of its epoch's parity (``bind_tail_parity``) and resets the other
+        copy, which the previous call used, early in the call (``reset_tail_space(other_parity=True)``).
+        The last arriver of a call then only has to signal the peers: the span the next call works
+        in was already zeroed by this call.
+        """
+        if self._finalized:
+            raise RuntimeError("enable_tail_parity() must precede finalize().")
+        self._tail_parity = True
 
     @property
     def separate_tmp(self) -> bool:
@@ -227,6 +246,10 @@ class DeviceWorkspace:
                     self._zero_leading[buffer_space] = cursor
                 if is_last_tail_reset_region:
                     self._tail_leading[buffer_space] = cursor
+                    if self._tail_parity:
+                        # The second copy sits right behind the first (the span starts at 0).
+                        cursor += cursor
+                        self._zero_leading[buffer_space] = cursor
             self._total[buffer_space] = round_up(cursor, 16)
         self._finalized = True
 
@@ -310,12 +333,34 @@ class DeviceWorkspace:
 
     def remove_device_members(self) -> None:
         self._base = {"local": None, "shared": None, "tmp": None}
+        self._tail_shift = {"local": None, "shared": None, "tmp": None}
 
     @cute.jit
-    def ptr(self, name: str) -> cute.Pointer:
+    def bind_tail_parity(self, parity: Int32) -> None:
+        """Select the tail-reset copy of this call (``parity`` = epoch & 1) for every ``ptr()``."""
+        if cutlass.const_expr(not self._tail_parity):
+            raise RuntimeError("bind_tail_parity() needs enable_tail_parity().")
+        for buffer_space in ("local", "shared"):
+            self._tail_shift[buffer_space] = Int64(parity) * Int64(self._tail_leading[buffer_space])
+
+    @cute.jit
+    def _tail_copy_shift(self, buffer_space: BufferSpace, other_parity: bool):
+        shift = self._tail_shift[buffer_space]
+        if cutlass.const_expr(shift is None):
+            raise RuntimeError("Tail-parity workspace used before bind_tail_parity().")
+        if cutlass.const_expr(other_parity):
+            shift = Int64(self._tail_leading[buffer_space]) - shift
+        return shift
+
+    @cute.jit
+    def ptr(self, name: str, other_parity: cutlass.Constexpr[bool] = False) -> cute.Pointer:
         region = self._region_by_name[name]
         base = self._base[region.buffer_space]
         address = base.toint() + Int64(self._offset[name])
+        if cutlass.const_expr(self._tail_parity and region.reset == "tail_reset"):
+            address = address + self._tail_copy_shift(region.buffer_space, other_parity)
+        elif cutlass.const_expr(other_parity):
+            raise ValueError(f"Region {name!r} has no parity copies.")
         return cute.make_ptr(region.dtype, address, AddressSpace.gmem, assumed_align=self._byte_alignment[name])
 
     @cute.jit
@@ -329,11 +374,17 @@ class DeviceWorkspace:
         self.reset_tail_space("shared", tid, total_threads)
 
     @cute.jit
-    def reset_tail_space(self, buffer_space: BufferSpace, tid: Int32, total_threads: int) -> None:
+    def reset_tail_space(
+        self, buffer_space: BufferSpace, tid: Int32, total_threads: int, other_parity: cutlass.Constexpr[bool] = False
+    ) -> None:
+        """Zero the tail-reset span; with tail parity, the copy of this call or (``other_parity``) the other one."""
         num_vectors = self._tail_leading[buffer_space] // 16
         if cutlass.const_expr(num_vectors > 0):
+            start = self._base[buffer_space].toint()
+            if cutlass.const_expr(self._tail_parity):
+                start = start + self._tail_copy_shift(buffer_space, other_parity)
             vectors = cute.make_tensor(
-                cute.make_ptr(Int32, self._base[buffer_space].toint(), AddressSpace.gmem, assumed_align=16),
+                cute.make_ptr(Int32, start, AddressSpace.gmem, assumed_align=16),
                 cute.make_layout((num_vectors, 4), stride=(4, 1)),
             )
             zero = cute.make_rmem_tensor((4,), Int32)
