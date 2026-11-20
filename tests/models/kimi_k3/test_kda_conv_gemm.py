@@ -196,7 +196,7 @@ def test_fused_in_proj_never_captured(monkeypatch):
 
 
 def _run_checkpoint(
-    seqlens, offsets, m, tactic=None, seed=0, host_offsets=True, part=PART
+    seqlens, offsets, m, tactic=None, seed=0, host_offsets=True, part=PART, k=K
 ):
     """Prefix-hit-shaped prefill steps exporting checkpoints: the fused GEMM's
     halo rows + the stock exporter store bit for bit the conv state the stock
@@ -213,7 +213,7 @@ def _run_checkpoint(
 
     dev = torch.device("cuda")
     n = 3 * part
-    xq, xs, wq, ws = _operands(m, n, K, dev, seed)
+    xq, xs, wq, ws = _operands(m, n, k, dev, seed)
     proj = torch._scaled_mm(
         xq, wq.t(),
         scale_a=xs.view(torch.float8_e8m0fnu), scale_b=ws.view(torch.float8_e8m0fnu),
@@ -289,8 +289,9 @@ def test_kda_conv_gemm_checkpoint_device_offsets():
 
 
 def test_kda_conv_gemm_checkpoint_prod_tactic():
-    # The deployed fused in_proj tactic (2x4 cluster, MIN_ROWS and up).
+    # The deployed fused in_proj tactic (512x256 tile, 2x4 cluster) at the
+    # deployed K3.1 plane and K sizes, an F16K prefix-hit step.
     from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
 
     _run_checkpoint([2000, 1000, 5000, 192, 8000], [1984, 1000, 4096, 176, 7680],
-                    16384, tactic=TACTIC, seed=7, part=1024)  # fmt: skip
+                    16384, tactic=TACTIC, seed=7, part=12288, k=7168)  # fmt: skip

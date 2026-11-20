@@ -300,6 +300,9 @@ class KdaConvGemm:
             cutlass.Int32(nseq),
             cutlass.Int32(top),
             cutlass.Int32(nsteps),
+            # sched_ctr, sched_die_map (unused), then the checkpoint halo.
+            cutlass.Int64(0),
+            cutlass.Int64(0),
             cutlass.Int64(ckpt_ptr),
             cutlass.Int64(halo_ptr),
         )
