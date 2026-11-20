@@ -29,16 +29,19 @@ import threading
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
 from . import attn_res_dielocal, attn_res_mxfp8
 
+logger = init_logger(__name__)
+
 HIDDEN = 7168
 MAX_BLOCKS = 8
 MXFP8_BLOCK = 32
-# Row ring depth per CTA (rows of 14 KiB): depth 4 = 56 KiB, 3 CTAs per SM.
-RING_DEPTH = 2
+# Per-warp row ring depth (measured 93-layer F16K die-local: d2 27.76, d3 27.49, d4 28.02 ms).
+RING_DEPTH = 3
 # Token groups per CTA of the kernel build.
 GROUPS = 3
 _SRC = os.path.join(os.path.dirname(__file__), "attn_res_lp.cu")
@@ -165,6 +168,12 @@ def _schedule_args(blocks: torch.Tensor):
 def begin(plan: Plan, blocks: torch.Tensor) -> None:
     """Start a prefill forward whose AttnRes block buffer is ``blocks``."""
     _state[0] = _Forward(plan, blocks)
+    logger.info_once(
+        "Kimi K3.1 prefill AttnRes: precomputed block logits (attn_res_lp, "
+        "%d calls, %d blocks, die-aware claims: %s)",
+        plan.num_calls, plan.num_blocks,
+        attn_res_dielocal.kernel_args(blocks)[0] is not None,
+    )
 
 
 def active(blocks: torch.Tensor, prefix: torch.Tensor) -> bool:
@@ -230,6 +239,10 @@ def attn_res(
             dtype=torch.uint8,
             device=prefix.device,
         )
+        if rows % 128:
+            # Scale rows past `rows` (last 128-row tile) are zero, as
+            # mxfp8_quantize writes them; the kernel fills the real rows.
+            sf.view(-1, 128 * (HIDDEN // MXFP8_BLOCK))[-1].zero_()
     _module(_probe, _vec, GROUPS if _groups is None else _groups).attn_res_lp(
         prefix,
         prefix_out,

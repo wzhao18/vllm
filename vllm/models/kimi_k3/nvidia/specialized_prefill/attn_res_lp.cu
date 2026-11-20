@@ -188,7 +188,7 @@ constexpr uint32_t SEG_BYTES = SEG * 2;
 #endif
 // Token claim queue: positions claimed QA ahead of the consumer (>= the
 // producer's run-ahead of D rows), QN entries.
-constexpr int QA = 4;
+constexpr int QA = 5;
 constexpr int QN = 8;
 constexpr int G = K31LP_G;
 constexpr int CTA_THREADS = NT * G;
@@ -686,9 +686,10 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   const bool hd = delta.has_value(), no = onw.has_value();
   const bool wb = out.has_value(), qu = q.has_value();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
+  if (depth == 4) return k31lp::dispatch<4>(a, hd, no, wb, qu, st);
   if (depth == 3) return k31lp::dispatch<3>(a, hd, no, wb, qu, st);
   if (depth == 2) return k31lp::dispatch<2>(a, hd, no, wb, qu, st);
-  TORCH_CHECK(false, "attn_res_lp: depth must be 2 or 3");
+  TORCH_CHECK(false, "attn_res_lp: depth must be 2, 3 or 4");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
