@@ -159,9 +159,9 @@ __device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
 // Block-parallel top-k of one row (the stock selection order: largest
 // (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
 // write_outputs (verbatim) and the stager's route rules on warp 0.
-// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
-// warp 0 selects the top-k of the 8 sorted warp lists (exact:
-// the global top-k is inside the union of the per-warp top-k).
+// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2 ranks
+// the 8 sorted warp lists against each other (exact: the global top-k is inside
+// the union of the per-warp top-k).
 // clk (microbench only, null otherwise): thread 0 records clock64 at the phase ends
 // [entry, keys sorted, pass 1, block barrier, pass 2, outputs].
 __device__ __forceinline__ void route_block(const Args& a, int32_t row,
@@ -195,12 +195,26 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
   s_cand[wid * 32 + lane] = w;
   __syncthreads();
   RB_CLK(3);
-  if (wid != 0) return;
-  // Lane l: warp l / 4's ranks (l % 4) * 8 .. + 8 (already descending).
-  uint64_t k2[8];
+  // Pass 2: the global rank of every per-warp candidate (keys are unique): its rank
+  // in its own warp list plus the larger keys of the other 7 lists (each descending,
+  // zero past topk: a 5-step binary search counts them). Ranks < topk are the
+  // selection, in order.
+  __shared__ uint64_t s_top[32];
+  if (lane < topk) {
+    int32_t rank = lane;
 #pragma unroll
-  for (int j = 0; j < 8; ++j) k2[j] = s_cand[(lane >> 2) * 32 + (lane & 3) * 8 + j];
-  uint64_t const lane_packed = warp_select<8>(k2, lane, topk);
+    for (int v = 1; v < kWarps; ++v) {
+      const uint64_t* list = s_cand + ((wid + v) % kWarps) * 32;
+      int32_t i = 0;
+#pragma unroll
+      for (int step = 16; step >= 1; step >>= 1) i += list[i + step - 1] > w ? step : 0;
+      rank += i;
+    }
+    if (rank < topk) s_top[rank] = w;
+  }
+  __syncthreads();
+  if (wid != 0) return;
+  uint64_t const lane_packed = lane < topk ? s_top[lane] : 0;
   RB_CLK(4);
 
   auto warp = cg::tiled_partition<32>(cg::this_thread_block());
