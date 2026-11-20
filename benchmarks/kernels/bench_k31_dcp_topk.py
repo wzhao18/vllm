@@ -38,16 +38,31 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
-             7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
+             7: "radix", 11: "r2:polled", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
 STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
 
 
-def make_logits(case, T, width, Lloc, gen, dev):
+def make_logits(case, T, width, Lloc, gen, dev, rank=0):
     x = torch.randn(T, width, generator=gen, device=dev)
     if case == "normal":
         pass
+    elif case in ("skew1", "skew2"):  # relu rows, ranks shifted apart (round-1 windows miss)
+        x = torch.relu(x + 0.3) * 2.0 + (0.12 if case == "skew1" else 0.3) * rank
     elif case == "relu":  # indexer-like: sum of ReLU scores, many small, heavy right tail
         x = torch.relu(x + 0.3) * 2.0
+    elif case in ("r2row", "satrow", "zerorow"):
+        # relu rows; one row in 128 is a rare in-step tail row: ranks shifted apart (r2row),
+        # 5000 equal high keys on rank 0 (satrow: saturated window, R2 overflow), or fewer
+        # than K positive keys (zerorow: tau = +0 with every zero key tied)
+        x = torch.relu(x + 0.3) * 2.0
+        rare = torch.arange(T, device=dev) % 128 == 7
+        if case == "r2row":
+            x[rare] += 0.12 * rank
+        elif case == "satrow":
+            if rank == 0:
+                x[rare, 1:10001:2] = 6.0
+        else:
+            x[rare] = torch.relu(x[rare] - 7.0)
     elif case == "hot_recent":  # recent tokens score much higher (local position ~ L)
         pos = torch.arange(width, device=dev)[None, :]
         hot = (pos >= (Lloc[:, None] - 512)) & (pos < Lloc[:, None])
@@ -65,6 +80,8 @@ def main():
     ap.add_argument("--q", type=int, default=4)
     ap.add_argument("--ctx", type=int, default=135000)
     ap.add_argument("--spread", type=float, default=0.0, help="ctx uniform in ctx*(1 +- spread)")
+    ap.add_argument("--long-ctx", type=int, default=0, help="every --long-every-th request gets this context")
+    ap.add_argument("--long-every", type=int, default=32)
     ap.add_argument("--cases", default="normal,relu,hot_recent")
     ap.add_argument("--max-model-len", type=int, default=1 << 20)
     ap.add_argument("--max-local", type=int, default=0, help="override the launch bound")
@@ -120,6 +137,8 @@ def main():
             Greq = (a.ctx * (1 + a.spread * u)).to(torch.int32)
         else:
             Greq = torch.full((B,), a.ctx, dtype=torch.int32, device=dev)
+        if a.long_ctx:
+            Greq[:: a.long_every] = a.long_ctx
         j = torch.arange(a.q, device=dev, dtype=torch.int32)
         G = (Greq[:, None] - (a.q - 1 - j)[None, :]).reshape(-1).contiguous()
         L = local_len_of(G, rank, W, 1).to(torch.int32).contiguous()
@@ -142,7 +161,7 @@ def main():
                 if rank == 0:
                     print("dump stats", dmp["stats"].tolist(), "L", int(L.min()), int(L.max()), flush=True)
             else:
-                logits = make_logits(case, T, width, L, g2, dev)
+                logits = make_logits(case, T, width, L, g2, dev, rank)
 
             segcap = 0
 

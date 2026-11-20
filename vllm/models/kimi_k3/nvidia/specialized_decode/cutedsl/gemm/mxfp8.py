@@ -18,9 +18,10 @@ Kinds (every kind sums K in FP32 and rounds once to BF16; the order differs):
   "fi_cute"     FlashInfer CuTe DSL MXFP8 GEMM (stock's choice at <= 16 rows)
   "fi_cutlass"  FlashInfer CUTLASS MXFP8 GEMM
   "scaled_mm"   cuBLASLt ``torch._scaled_mm`` (stock's choice above 16 rows)
-  "dense_mx8"   ``dense_mx8.DenseMx8``: all R tokens per CTA, K split in two inside a
-                2-CTA cluster (FP32 partial reduced over DSMEM), weights loaded before
-                the PDL wait (form per R: ``DENSE_FORMS``)
+  "pre"         the vendored FlashInfer sm_107 CuTe DSL kernel (``sm107.prewait``) on a
+                per-R tactic (``PRE_TACTICS``), launched with PDL; it issues the first
+                weight k-blocks before griddepcontrol.wait (bitwise fi_cute at the
+                same tactic)
 
 The per-R kind is GENERIC = stock's own per-call rule (``nvidia.mxfp8.use_cute_dsl``:
 the same kernel as the stock linear, so the stock bits) unless ``MX_TUNED`` names a
@@ -32,10 +33,43 @@ import torch
 
 from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 
-MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "dense_mx8")
+MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "pre")
+
+# "pre" tactics: (first R, last R, (tile_mn, cluster_mn, swap_ab, inst_m), weight k-blocks
+# issued before griddepcontrol.wait), per weight [N, K] (``PRE_TACTICS``) else by R
+# (``PRE_DEFAULT``: FlashInfer's untuned sm_107 picks at 128 / 256 / 512 rows, without
+# swap_ab). VR200 GEMM-EX1 r2/r3 (1 GPU, CUDA-graph chain of 16 calls on cold weight
+# copies, us per call; scaled_mm / fi_cute / pre): kda_in R128 12.9 / 11.2 / 10.15
+# (ltpin 10.12), R256 15.0 / 13.0 / 10.9, R384 15.2 / 17.3 / 14.8. In-step (fastab ex1a,
+# NVFP4 D3-32 slice, ABBA vs int15): r8 -1.62%, r16 -1.21%, r24 -0.13% per step.
+PRE_DEFAULT = (
+    (1, 128, ((128, 64), (1, 1), False, 128), 4),
+    (129, 256, ((256, 128), (2, 1), False, 256), 4),
+    (257, 512, ((256, 256), (2, 1), False, 256), 4),
+)
+PRE_TACTICS: dict[tuple[int, int], tuple] = {
+    (12448, 7168): (
+        (1, 128, ((128, 64), (1, 1), False, 128), 8),
+        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (257, 512, ((256, 256), (2, 1), False, 256), 8),
+    ),
+    # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
+    # 6.38, R384 6.75 / 6.69
+    (7168, 3072): (
+        (1, 128, ((128, 64), (1, 1), False, 128), 4),
+        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (257, 512, ((128, 128), (1, 1), False, 128), 4),
+    ),
+}
+
+
+def pre_tactic(n: int, k: int, rows: int):
+    """(tactic, prewait k-blocks, smem stage cap or 0) for an R-row call, or None."""
+    for lo, hi, tactic, prewait, *cap in PRE_TACTICS.get((n, k), PRE_DEFAULT):
+        if lo <= rows <= hi:
+            return tactic, prewait, (cap or [0])[0]
+    return None
 BLOCK = 32  # MXFP8 block along K
-DENSE_MAX_ROWS = 384  # dense_mx8: three 128-token MMA blocks in tensor memory
-TMA_MIN_ROWS = 2  # dense_mx8: activation rows its TMA atoms span (a 1-row map faults)
 
 # TUNED (VR200, D3-32 per-GPU shapes, 2026-11-18 D-GEMM bench1: 1 GPU, a CUDA graph of
 # 8-64 back-to-back calls each on its own cold weight copy, pre-quantized input; us per
@@ -50,20 +84,11 @@ TMA_MIN_ROWS = 2  # dense_mx8: activation rows its TMA atoms span (a 1-row map f
 #   o_proj 7168 x 3072  R16 4.92 / 4.95, R128 5.84 / 5.13, R256 6.33 / 6.03, R384
 #                       7.54 / 6.26 (= stock's rule: no entry)
 MX_TUNED: dict[tuple[int, int], dict] = {
-    (12448, 7168): {"*": "1-320:fi_cute,321-:scaled_mm"},
+    (12448, 7168): {"*": "1-384:pre,385-:scaled_mm"},
+    (7168, 3072): {"*": "1-16:fi_cute,17-384:pre,385-:scaled_mm"},
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
 }  # fmt: skip
-
-# dense_mx8 form per R: cta_group::1 M128 row blocks with the two K halves in one
-# 2-CTA cluster (98 co-resident clusters at N 12448; the cta_group::2 form needs
-# 4-CTA clusters, only 46 of which fit) and the deepest ring that fits shared memory.
-DENSE_FORMS = "1-128:6,129-256:4,257-384:3"
-
-
-def dense_form(rows: int) -> dict:
-    stages = rows_policy(DENSE_FORMS, Shape(rows, 1), name="DENSE_FORMS")
-    return dict(ksplit=2, stages=stages, pair=False, kred=True)
 
 
 def stock_kind(n: int, k: int, rows: int) -> str:
@@ -203,36 +228,29 @@ class Mxfp8Projection:
         self.kinds = dict(tactics) if tactics is not None else mxfp8_tactics(
             n, k, self.rows
         )
+        self.pre = {}
         for r in self.rows:
             kind = self.kinds.get(r)
             if kind not in MX_KINDS:
                 raise Unsupported(family, r, f"MXFP8 kind {kind!r} (kinds {MX_KINDS})")
+            if kind == "pre":
+                found = pre_tactic(n, k, r)
+                if found is None:
+                    raise Unsupported(family, r, f"pre: no tactic for [{n}, {k}]")
+                from .sm107.prewait import Mxfp8PreGemm
+
+                self.pre[r] = Mxfp8PreGemm(
+                    n, k, r, found[0], use_pdl=True, prewait=found[1],
+                    max_stages=found[2], device=weight.device,
+                )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
-        cap = cap or self.rows[-1]
-        if any(self.kinds[r] == "dense_mx8" for r in self.rows):
-            cap = max(cap, TMA_MIN_ROWS)  # dense_mx8's activation TMA spans >= 2 rows
-        self.input = shared_input(family, cap, k, weight.device)
-        for r in self.rows:
-            if self.kinds[r] == "dense_mx8" and (r > DENSE_MAX_ROWS or k % 256):
-                raise Unsupported(family, r, f"dense_mx8 needs R <= {DENSE_MAX_ROWS}, K % 256")
-        self._dense = {
-            r: _dense_engine(n, k, r, weight.device)
-            for r in self.rows if self.kinds[r] == "dense_mx8"
-        }  # fmt: skip
+        self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
 
     def _gemm(self, kind, xq, xs, out):
         import flashinfer
 
-        if kind == "dense_mx8":
-            rows = xq.shape[0]
-            size = xq.element_size()
-            span = xq.untyped_storage().nbytes() - xq.storage_offset() * size
-            if rows < TMA_MIN_ROWS and span < TMA_MIN_ROWS * xq.stride(0) * size:
-                raise Unsupported(
-                    self.family, rows, f"dense_mx8 reads {TMA_MIN_ROWS} activation rows"
-                )
-            self._dense[rows].run(self.weight, self.scale, xq, xs, out)
-            return out
+        if kind == "pre":
+            return self.pre[xq.shape[0]](xq, xs, self.weight, self.scale, out)
         if kind == "scaled_mm":
             return torch._scaled_mm(
                 xq, self.weight.t(), scale_a=xs.view(torch.float8_e8m0fnu),
@@ -285,55 +303,3 @@ class Mxfp8Projection:
                             default=None) == kind  # fmt: skip
         path = Path.TUNED if tuned else Path.GENERIC
         return Choice(path, tactic=("mxfp8", kind), note=f"mxfp8 {kind} {self.n}x{self.k}")
-
-
-class _DenseEngine:
-    """One compiled ``DenseMx8`` shape and its split-K scratch (shared by every
-    projection of the same shape on the device: layers run one after another)."""
-
-    def __init__(self, n, k, rows, device):
-        from ..common.host import stream
-        from .dense_mx8 import DenseMx8
-
-        self.gemm = DenseMx8(n, k, rows, n, **dense_form(rows))
-        words, tickets = self.gemm.scratch_words()
-        self.part = torch.empty(words, dtype=torch.float32, device=device)
-        self.tickets = torch.zeros(tickets, dtype=torch.int32, device=device)
-        self.device = device
-        self._stream = stream
-        import cutlass.cute as cute
-
-        any_ = self.part  # compile-time only: the pointers' types, not their values
-        args = self._ptrs(any_, any_, any_, any_, any_)
-        self.fn = cute.compile(self.gemm, *args, stream(device))
-
-    def _ptrs(self, w, ws, xq, xs, out):
-        import cutlass
-        import cutlass.cute as cute
-        from cutlass.cute.runtime import make_ptr
-
-        g = cute.AddressSpace.gmem
-        f8, e8 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
-        return (
-            make_ptr(f8, w.data_ptr(), g, assumed_align=16),
-            make_ptr(e8, ws.data_ptr(), g, assumed_align=16),
-            make_ptr(f8, xq.data_ptr(), g, assumed_align=16),
-            make_ptr(e8, xs.data_ptr(), g, assumed_align=16),
-            make_ptr(cutlass.BFloat16, out.data_ptr(), g, assumed_align=16),
-            make_ptr(cutlass.Float32, self.part.data_ptr(), g, assumed_align=16),
-            make_ptr(cutlass.Int32, self.tickets.data_ptr(), g, assumed_align=16),
-        )
-
-    def run(self, w, ws, xq, xs, out):
-        self.fn(*self._ptrs(w, ws, xq, xs, out), self._stream(self.device))
-
-
-_ENGINES: dict[tuple, _DenseEngine] = {}
-
-
-def _dense_engine(n, k, rows, device) -> _DenseEngine:
-    key = (n, k, rows, torch.device(device))
-    engine = _ENGINES.get(key)
-    if engine is None:
-        engine = _ENGINES[key] = _DenseEngine(n, k, rows, device)
-    return engine
