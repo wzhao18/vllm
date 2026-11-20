@@ -693,7 +693,10 @@ class PreparedDsa:
             norm = None
             if mode in NORM:
                 norm = compile_norm(batch, self.heads, pitch)
-            fused = mode == "serial" and batch <= FUSED_INDEX
+            # local query rows (fork: QueryNorm writes q_c on the compute stream)
+            # take the fused index front from q_c too: wq_b and DsaIndex in one
+            # kernel (no MlaQuery mailbox poll to wait on, unlike DCP8 wait).
+            fused = (mode == "serial" and batch <= FUSED_INDEX) or self.is_local(batch)
             if mode in FRONT or fused:
                 weight = self.query_stage.index_projection.weight
                 specs = layout(weight), index_spec
@@ -757,7 +760,7 @@ class PreparedDsa:
 
     def run_index(self, kernel, projected, index_slots, q):
         """The indexer inputs: wq_b and DsaIndex (``kernel``), or the fused index
-        front (from the packed rows, or under serial from q_c)."""
+        front (from the packed rows, or under serial / local query from q_c)."""
         shape = projected.shape[0], q
         mode, stage = self.overlaps[shape], self.query_stage
         front = self.overlap_kernels.get(shape, (None,))[0]

@@ -161,7 +161,7 @@ def test_fp4_indexer_inputs(batch, gap):
     assert torch.equal(fp4_pages(index), fp4_pages(stock))
 
 
-FRONT_BATCHES = [1, 5, 16, 40, 64, 80, 144, 320]
+FRONT_BATCHES = [1, 5, 16, 40, 64, 80, 144, 320, 384]
 
 
 @SM100
