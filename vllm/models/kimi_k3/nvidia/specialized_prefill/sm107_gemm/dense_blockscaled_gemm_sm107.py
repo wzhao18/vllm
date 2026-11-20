@@ -1058,6 +1058,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         b_tensor = cute.make_tensor(b_ptr, b_layout)
         c_tensor = cute.make_tensor(c_ptr, c_out_layout)
         sched_tensor = c_tensor
+        # vLLM: the BF16 drain-and-release epilogue stores through the real C
+        # tensor (the TMA C tensor is a coordinate tensor).
+        drain_c_tensor = None
+        if cutlass.const_expr(getattr(self, "epi_drain", False) and situ_q_ptr is None):
+            drain_c_tensor = c_tensor
         situ_q_tensor = None
         situ_sf_tensor = None
         if cutlass.const_expr(situ_q_ptr is not None):
@@ -1372,6 +1377,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             conv_nseq,
             conv_top,
             conv_nsteps,
+            drain_c_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1428,6 +1434,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
+        mCg_mnl: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
@@ -1604,7 +1611,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
         tCcC = None
-        if cutlass.const_expr(getattr(self, "conv_mode", False)):
+        if cutlass.const_expr(getattr(self, "conv_mode", False) or getattr(self, "epi_drain", False)):
             tCcC = thr_mma.partition_C(
                 cute.local_tile(
                     cute.make_identity_tensor(mC_mnl.shape),
@@ -1619,6 +1626,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 mSFC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
             )
             tCgSFC = thr_mma.partition_C(gSFC_mnl)
+        tCgCg = None
+        if cutlass.const_expr(mCg_mnl is not None):
+            tCgCg = thr_mma.partition_C(
+                cute.local_tile(mCg_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
+            )
         tCgQ = None
         tCgQSF = None
         tCcQ = None
@@ -2364,8 +2376,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     )
                 elif cutlass.const_expr(getattr(self, "epi_drain", False)):
                     acc_consumer_state = epilogue_drain_store(
-                        self, tidx, tCtAcc, tCgC, epi_tile, alpha_value,
-                        mma_tile_coord_mnl, acc_consumer_state, acc_pipeline,
+                        self, tidx, tCtAcc, tCgCg, tCcC, epi_tile, alpha_value,
+                        mma_tile_coord_mnl, mC_mnl.shape[0], mC_mnl.shape[1],
+                        acc_consumer_state, acc_pipeline,
                     )  # fmt: skip
                 elif cutlass.const_expr(getattr(self, "epi_staged", False)):
                     acc_consumer_state = epilogue_tma_store_staged(
@@ -2447,6 +2460,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
+        mCg_mnl: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2495,6 +2509,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             conv_nseq,
             conv_top,
             conv_nsteps,
+            mCg_mnl,
         )
 
     @staticmethod
