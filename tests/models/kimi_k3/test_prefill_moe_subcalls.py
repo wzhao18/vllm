@@ -36,8 +36,12 @@ def test_policy_applies_to_tp1_prefill_batches_only():
     p = _policy()
     assert p == P.PrefillMoEPolicy(capacity=C, max_num_tokens=2 * C) and p.subcalls
     assert _policy(mnbt=4 * C).capacity == C
+    # One launch at the sub-call size; the policy still exists.
+    one = _policy(mnbt=C)
+    assert one.capacity == C and not one.subcalls
     for kw in (
-        dict(mnbt=C), dict(tp=4), dict(sp=True), dict(shard=True),
+        dict(mnbt=P.PREFILL_MOE_POLICY_MIN_TOKENS),
+        dict(tp=4), dict(sp=True), dict(shard=True),
         dict(backend="deep_gemm_mega_moe"),
     ):  # fmt: skip
         assert _policy(**kw) is None, kw

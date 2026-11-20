@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 # 16384 tokens/rank, bitwise identical outputs): 2 x 8192 1777-1799 us vs 1 x 16384
 # 1662-1720 us; 3 x 8192 2825 vs 1 x 24576 2540 us.
 PREFILL_MOE_SUBCALL_TOKENS = 16384
+# Batches above this many rows per rank get a policy: the prefill worker's MoE layers
+# (sub-calls above PREFILL_MOE_SUBCALL_TOKENS rows; the prefill shared-expert SiTU
+# fusion is keyed on the policy too).
+PREFILL_MOE_POLICY_MIN_TOKENS = 8192
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,10 +74,10 @@ def prefill_moe_policy(
 ) -> PrefillMoEPolicy | None:
     """The policy of a routed-MoE layer that runs the Rubin MegaMoE on whole DP
     batches (TP1 wide-EP, no sequence parallelism or token shard) with prefill-sized
-    batches (more than one sub-call of rows), else None (stock path)."""
+    batches (above PREFILL_MOE_POLICY_MIN_TOKENS rows), else None (stock path)."""
     if (
         vllm_config.kernel_config.moe_backend != KIMI_K3_MEGA_MOE
-        or max_num_tokens <= PREFILL_MOE_SUBCALL_TOKENS
+        or max_num_tokens <= PREFILL_MOE_POLICY_MIN_TOKENS
         or tp_size != 1
         or sequence_parallel
         or token_shard
