@@ -476,6 +476,9 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
+    # specialized_prefill.shared_situ.PrefillSharedSitu (prefill workers only).
+    _prefill_situ = None
+
     def mxfp8_input(self) -> bool:
         """gate_up_proj takes an MXFP8 activation (QuantizedActivation)."""
         return not self.shard_sequence_parallel and takes_mxfp8_activation(
@@ -522,7 +525,16 @@ class KimiMLP(nn.Module):
             # compute this rank's partial for all of them, then reduce-scatter,
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
+        situ = self._prefill_situ
+        if situ is not None:
+            # Prefill shared expert: the gate_up GEMM writes the MXFP8 SiTU
+            # (specialized_prefill.shared_situ) at prefill-sized batches.
+            qa = situ.fused(x)
+            if qa is not None:
+                return self.down_proj(qa)[0]
         gate_up, _ = self.gate_up_proj(x)
+        if situ is not None:
+            gate_up = situ.deinterleave(gate_up)
         # Online-MXFP8 down_proj: the activation kernel writes its MXFP8 input.
         qa = self._act_mxfp8(gate_up)
         if qa is not None:
@@ -2425,6 +2437,29 @@ class KimiLinearForCausalLM(
             logger.info_once(
                 "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
                 packed_moe,
+            )
+        # Prefill workers: shared gate_up GEMM with the SiTU + MXFP8 epilogue.
+        from .specialized_prefill import shared_situ
+
+        fused_situ = 0
+        for module in self.model.modules():
+            if (
+                isinstance(module, KimiMoE)
+                and getattr(module, "_prefill_moe", None) is not None
+                and getattr(module, "_packed_moe", None) is None
+                and isinstance(module.shared_experts, KimiMLP)
+                and not module.shared_experts.shard_sequence_parallel
+                and shared_situ.supported(module.shared_experts)
+            ):
+                situ = shared_situ.PrefillSharedSitu(module.shared_experts)
+                situ.prepare()
+                module.shared_experts._prefill_situ = situ
+                fused_situ += 1
+        if fused_situ:
+            logger.info_once(
+                "Kimi K3: %d prefill shared experts run the gate_up GEMM with the "
+                "SiTU + MXFP8 epilogue (sm_107).",
+                fused_situ,
             )
         # K3.1 DSA decode under DCP: the NCCL-free top-k exchange (on by policy).
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx

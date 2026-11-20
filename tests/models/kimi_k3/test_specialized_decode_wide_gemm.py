@@ -61,3 +61,42 @@ def test_wide_gemm(rows, n, k, split, silu):
         torch.cuda.synchronize()
         assert not out.isnan().any()
         assert _ulps(out, ref) <= bound
+
+
+@pytest.mark.parametrize(
+    "rows,n,k,split,partials",
+    [
+        (96, 3584, 7168, 7, False),  # latent_down at r24: uneven token regions
+        (96, 4480, 7168, 5, True),  # router | latent_down: n % 256 != 0, partials
+    ],
+)
+def test_wide_gemm_decode_front(rows, n, k, split, partials):
+    """The SP decode MoE front shapes with staggered K order (``rotate``); with
+    ``partials`` the split-K FP32 partials summed in split order (route_stage's
+    sum) must match the FP32 reference to FP32-reorder accuracy."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.wide import (
+        PreparedWide,
+    )
+
+    torch.manual_seed(rows + n + split)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    policy = {rows: (split, (1,), None, (0, 3), False, True)}
+    gemm = PreparedWide(w, policy, partials=partials).prepare()
+    full = x.float() @ w.float().t()
+    if partials:
+        out = torch.empty(split, rows, n, device="cuda", dtype=torch.float32)
+    else:
+        out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        gemm.run(x, out)
+        torch.cuda.synchronize()
+        assert not out.isnan().any()
+        if partials:
+            got = out[0].clone()
+            for s in range(1, split):
+                got += out[s]
+            assert (got - full).abs().max() <= 1e-5 * full.abs().max()
+        else:
+            assert _ulps(out, full.bfloat16()) <= 1
