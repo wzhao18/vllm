@@ -40,6 +40,9 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              22: "r:class", 29: "r:tie0", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
              7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
 STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
+PHASES_SP = {0: "start", 9: "landed+max", 10: "sampled", 1: "theta", 2: "pass", 13: "e", 14: "msg built",
+             3: "sent", 4: "polled", 5: "resolved", 6: "radix", 7: "selected", 8: "end"}
+STATS_SP = ("rows", "one_round", "id_radix", "key_radix", "select_all", "-", "-", "-")
 
 
 def make_logits(case, T, width, Lloc, gen, dev):
@@ -85,7 +88,7 @@ def main():
                          "differently shaped matmuls (other kernels' code) before each call")
     ap.add_argument("--skew-us", type=float, default=0.0,
                     help="the last rank sleeps this long before each call (in-step rank skew)")
-    ap.add_argument("--impl", default="merge", choices=["merge", "v2"])
+    ap.add_argument("--impl", default="merge", choices=["merge", "v2", "sp"])
     ap.add_argument("--check", type=int, default=1, help="v2: compare with topk_merge")
     ap.add_argument("--k", type=int, default=2048, help="top-k (1-GPU ncu emulation: K / DCP)")
     a = ap.parse_args()
@@ -167,10 +170,10 @@ def main():
                             torch.amax(t_)
                 if a.skew_us > 0 and rank == W - 1:
                     torch.cuda._sleep(int(a.skew_us * 2400))
-                if a.impl == "v2":
+                if a.impl in ("v2", "sp"):
                     ex.topk_v2(logits, L, G, out, cnt, block_table=bt,
                                block_size=bs, block_stride=bs, req_of_row=req_of_row,
-                               stats=stats, dbg=dbg)
+                               stats=stats, dbg=dbg, single_path=a.impl == "sp")
                     return
                 ex.topk_merge(logits, L, G, out, cnt, max_local_len=max_local,
                               cluster=cluster, segmax=segmax, block_table=bt,
@@ -186,7 +189,7 @@ def main():
             dist.all_reduce(tot)
             ok_count = int(tot) == T * K
             mism = -1
-            if a.impl == "v2" and a.check:
+            if a.impl in ("v2", "sp") and a.check:
                 o2, c2 = out.clone(), cnt.clone()
                 ex.topk_merge(logits, L, G, out, cnt, max_local_len=max_local,
                               cluster=cluster, segmax=segmax, block_table=bt,
@@ -201,7 +204,7 @@ def main():
             # path counters + phase stamps (eager, one call)
             stats = torch.zeros(8, dtype=torch.int32, device=dev)
             dbg = torch.zeros(T * 64, dtype=torch.int64, device=dev)
-            phmap = PHASES_V2 if a.impl == "v2" else PHASES
+            phmap = PHASES_SP if a.impl == "sp" else PHASES_V2 if a.impl == "v2" else PHASES
             dist.barrier()
             for _ in range(a.warm):
                 torch.matmul(wa, wa, out=wb)
@@ -224,7 +227,7 @@ def main():
             d = dbg.view(T, 64).cpu()
             t0 = int(d[:, 0][d[:, 0] > 0].min()) if (d[:, 0] > 0).any() else 0
             phases = {}
-            if a.impl == "v2":  # SM clock from (clock64, globaltimer) at row start / end
+            if a.impl in ("v2", "sp"):  # SM clock from (clock64, globaltimer) at row start / end
                 c0, c1, t0n, t1n = d[:, 32].double(), d[:, 40].double(), d[:, 0].double(), d[:, 8].double()
                 okr = t1n > t0n
                 phases["ncand"] = (float(d[:, 31].double().median()), 0, 0)
@@ -296,7 +299,7 @@ def main():
             r = dict(B=B, T=T, case=case, cluster=cluster, segmax=segmax, max_local=max_local,
                      us_per_call=round(float(med), 2), ok_count=ok_count, impl=a.impl,
                      segcap=segcap, mismatch_rows=mism,
-                     stats=dict(zip(STATS_V2 if a.impl == "v2" else STAT_NAMES, st.tolist())), phases=phases, kernels=kern,
+                     stats=dict(zip(STATS_SP if a.impl == "sp" else STATS_V2 if a.impl == "v2" else STAT_NAMES, st.tolist())), phases=phases, kernels=kern,
                      Lmean=float(L.float().mean()))
             results.append(r)
             if rank == 0:

@@ -2948,6 +2948,7 @@ __global__ void __launch_bounds__(256) o_exchange_kernel(OxParams p) {
 }  // namespace k31dcpx
 
 #include "topk_v2.cuh"
+#include "topk_sp.cuh"
 
 // ------------------------------------------------------------------ host side
 using namespace k31dcpx;
@@ -3247,6 +3248,30 @@ int64_t topk_v2_resident_of(int* wide) {
   if (wide) *wide = w;
   return v;
 }
+
+// Co-resident topk_sp CTAs: 512-thread variant (two per SM); *wide: 1024-thread variant.
+static int64_t topk_sp_resident_of(int* wide) {
+  static int v = 0, w = 0;
+  if (!v) {
+    int dev, sms, occ = 0, occw = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_sp_kernel<kV2T>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_sp_kernel<1024>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_sp_kernel<kV2T>, kV2T, 0));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occw, topk_sp_kernel<1024>, 1024, 0));
+    v = sms * occ;
+    w = sms * occw;
+  }
+  if (wide) *wide = w;
+  return v;
+}
+
+// Longest local row (positions) the single-path kernel holds: rows of this many
+// positions or fewer may use impl 1.
+int64_t topk_sp_max_local() {
+  return std::min<int64_t>((int64_t)SpCfg<kV2T>::kNR * kV2T * 8 - 8, (int64_t)SpCfg<1024>::kNR * 1024 * 8 - 8);
+}
 int64_t topk_v2_resident() { return topk_v2_resident_of(nullptr); }
 
 void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
@@ -3255,7 +3280,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
              c10::optional<torch::Tensor> req_of_row, int64_t box, int64_t mc, torch::Tensor peers,
              int64_t W, int64_t rank, int64_t K, int64_t cap, int64_t interleave,
              torch::Tensor epoch, torch::Tensor err,
-             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg) {
+             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg, int64_t impl) {
   TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
   TORCH_CHECK(W >= 1 && W <= kV2MaxW, "topk_v2: DCP size must be in [1, 8]");
   TORCH_CHECK(K >= 1 && K <= kMaxK, "topk_v2: K must be in [1, 2048]");
@@ -3294,6 +3319,23 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   TORCH_CHECK(!dbg.has_value() || dbg->numel() >= (int64_t)kV2Dbg * T, "topk_v2: dbg too small");
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
   int nwide = 0;
+  if (impl == 1) {  // single path (csrc/topk_sp.cuh): one kernel, no redo launch
+    const int nres1 = (int)topk_sp_resident_of(&nwide);
+    TORCH_CHECK(nres1 >= 1, "topk_sp: no resident CTA");
+    const bool wide1 = T <= nwide;
+    cudaLaunchConfig_t c1 = {};
+    c1.gridDim = dim3((unsigned)std::min(T, wide1 ? nwide : nres1), 1, 1);
+    c1.blockDim = dim3(wide1 ? 1024 : kV2T, 1, 1);
+    c1.stream = c10::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute a1[1];
+    a1[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    a1[0].val.programmaticStreamSerializationAllowed = 1;
+    c1.attrs = a1;
+    c1.numAttrs = 1;
+    if (wide1) C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, topk_sp_kernel<1024>, p));
+    else C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, topk_sp_kernel<kV2T>, p));
+    return;
+  }
   const int nres = (int)topk_v2_resident_of(&nwide);
   TORCH_CHECK(nres >= 1, "topk_v2: no resident CTA");
   // per shape: 1024 threads per row when every row gets an SM of its own (r1/r8:
@@ -3323,6 +3365,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_v2", &topk_v2);
   m.def("topk_v2_layout", &topk_v2_layout);
   m.def("topk_v2_resident", &topk_v2_resident);
+  m.def("topk_sp_max_local", &topk_sp_max_local);
   m.def("topk_merge", &topk_merge);
   m.def("o_exchange", &o_exchange);
   m.def("max_coresident_ox", &max_coresident_ox);

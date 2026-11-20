@@ -373,20 +373,28 @@ class DcpExchange:
         stats: torch.Tensor | None = None,
         dbg: torch.Tensor | None = None,
         interleave: int | None = None,
+        single_path: bool = False,
     ) -> None:
         """Exact global top-K, one CTA per row (csrc/topk_v2.cuh): the same selection and
         output as topk_merge (ties at the K-th key by ascending global id; this rank's
         tokens above it in position order, then its selected ties in position order).
         stats: optional int32[8] row counters (0 exchanged, 1 one round, 2 tie round,
         3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
-        [rows * 64] per-row phase stamps. Launches must stay stream-ordered."""
+        [rows * 64] per-row phase stamps. Launches must stay stream-ordered.
+        single_path: csrc/topk_sp.cuh (rows of at most ``sp_max_local`` positions; the
+        same output, one kernel; stats 1 one round, 2 id radix, 3 key radix)."""
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,
             self.v2_peers, self.W, self.rank, self.K, self.cap,
             self.interleave if interleave is None else interleave,
-            self.v2_epoch, self.err, stats, dbg,
+            self.v2_epoch, self.err, stats, dbg, 1 if single_path else 0,
         )  # fmt: skip
+
+    @property
+    def sp_max_local(self) -> int:
+        """Longest local row (positions) the single-path top-k holds."""
+        return int(self.ext.topk_sp_max_local())
 
     def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:
         """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each; ``pre``:
