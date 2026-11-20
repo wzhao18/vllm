@@ -43,6 +43,9 @@ SPLIT = 3  # 56 tiles x 3 = 168 CTAs: one wave at one CTA per SM
 # ~6.5 us after the wait, ~5 round trips). The kernel runs alone behind the
 # reduce, so it may take most of Rubin's ~328 KB per SM.
 MAX_SMEM = 300 * 1024
+# stamps (benchmarks only): the CTAs' stamp slots start this many bytes into the
+# sync tensor (past the pair); 128 B per CTA, see SplitKTmemGemm64.stamp.
+STAMP_OFFSET = 64
 
 
 @asm()
@@ -86,9 +89,12 @@ class LatentUpTmem(SplitKTmemGemm64):
     is causally after that acquire (x warp -> x barriers -> MMA warp -> epilogue)."""
 
     def __init__(
-        self, *, tactic: SplitKTactic, k: int, reduce_split: int, tmem_tiles=None
-    ):
-        super().__init__(tactic=tactic, k=k, owners=OWNERS, max_smem=MAX_SMEM)
+        self, *, tactic: SplitKTactic, k: int, reduce_split: int, tmem_tiles=None,
+        stamps: bool = False,
+    ):  # fmt: skip
+        super().__init__(
+            tactic=tactic, k=k, owners=OWNERS, max_smem=MAX_SMEM, stamps=stamps
+        )
         self.reduce_split = reduce_split
         if tmem_tiles is not None and tmem_tiles != self.tmem_tiles:
             # Fewer A tiles staged through tcgen05.cp, more in shared memory.
@@ -110,7 +116,11 @@ class LatentUpTmem(SplitKTmemGemm64):
         in place); ``mS``: the reduce's int32 ``[rows done, passed]`` pair."""
         self.sync = mS
         self.rows = mB.layout.shape[0]
-        self.body(mA, mB, mS, a_map, (mC,))
+        stamps = mS
+        if cutlass.const_expr(self.stamps):
+            # Benchmarks only: per-CTA %globaltimer slots (128 B each) past the pair.
+            stamps = cute.make_tensor(mS.iterator + STAMP_OFFSET // 4, mS.layout)
+        self.body(mA, mB, stamps, a_map, (mC,))
 
     @cute.experimental.jit
     def wait_rows(self):
@@ -201,7 +211,7 @@ def tactic_for(rows):
 
 
 @cache
-def compile_latent_up(tactic, k, reduce_split, arch):
+def compile_latent_up(tactic, k, reduce_split, arch, stamps=False):
     """Code-only cache; weights, descriptors and activation pointers stay private."""
 
     def fake(leading, dtype=cutlass.BFloat16):
@@ -212,10 +222,10 @@ def compile_latent_up(tactic, k, reduce_split, arch):
     assert tactic[1] in N_TILES
     kernel = LatentUpTmem(
         tactic=SplitKTactic(*tactic[:4]), k=k, reduce_split=reduce_split,
-        tmem_tiles=tactic[4],
+        tmem_tiles=tactic[4], stamps=stamps,
     )
     y = fake(0)
-    sync = make_fake_tensor(cutlass.Int32, (2,), (1,), assumed_align=8)
+    sync = make_fake_tensor(cutlass.Int32, (cute.sym_int(),), (1,), assumed_align=16)
     args = (fake(1), fake(1), y, sync, cutlass.Int64(0), make_fake_stream())
     return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
 
@@ -225,7 +235,9 @@ class PreparedLatentUp:
     returns ``residual``), for the prepared row counts; ``reduce_split``: the
     reduce's CTAs per row (its arrivals per row on the ``sync`` pair)."""
 
-    def __init__(self, weight: torch.Tensor, rows, reduce_split: int, tactics=None):
+    def __init__(
+        self, weight: torch.Tensor, rows, reduce_split: int, tactics=None, stamps=False
+    ):
         if weight.dtype != torch.bfloat16 or weight.dim() != 2:
             raise ValueError(f"latent_up weight {tuple(weight.shape)} {weight.dtype}")
         n, k = weight.shape
@@ -238,6 +250,7 @@ class PreparedLatentUp:
         if missing:
             raise ValueError(f"latent_up rows without a tactic: {missing}")
         self.weight, self.rows, self.reduce_split = weight, tuple(rows), reduce_split
+        self.stamps = stamps
         self.tactics = {r: tactic_for(r) for r in self.rows} | dict(tactics or {})
         self.weight_view = matrix_view(weight)
         self.kernels, self.map = {}, None
@@ -250,7 +263,9 @@ class PreparedLatentUp:
         arch, k = architecture(self.weight.device), self.weight.shape[1]
         with torch.accelerator.device_index(self.weight.device.index):
             for tactic in set(self.tactics.values()):
-                self.kernels[tactic] = compile_latent_up(tactic, k, self.reduce_split, arch)
+                self.kernels[tactic] = compile_latent_up(
+                    tactic, k, self.reduce_split, arch, self.stamps
+                )
             self.map = weight_map(self.weight, 128)
         return self
 
@@ -263,12 +278,16 @@ class PreparedLatentUp:
             raise ValueError(f"latent_up input {tuple(x.shape)}: prepared {self.rows}")
         if residual.shape != (rows, self.weight.shape[0]) or residual.stride(1) != 1:
             raise ValueError(f"latent_up residual {tuple(residual.shape)}")
-        if sync is None or sync.dtype != torch.int32 or sync.shape != (2,) or sync.data_ptr() % 8:
+        need = STAMP_OFFSET // 4 + 168 * 32 if self.stamps else 2
+        if (
+            sync is None or sync.dtype != torch.int32 or sync.dim() != 1
+            or sync.numel() < need or sync.data_ptr() % 16
+        ):  # fmt: skip
             raise ValueError("latent_up sync: the reduce's int32 [rows done, passed]")
         y = matrix_view(residual, output=True)
         stream = current_stream(self.weight.device)
         a_map = cutlass.Int64(self.map.data_ptr())
-        pair = from_dlpack(sync, assumed_align=8)
+        pair = from_dlpack(sync, assumed_align=16)
         code(self.weight_view, matrix_view(x), y, pair, a_map, stream)
         return residual
 

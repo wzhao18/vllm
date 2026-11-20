@@ -101,6 +101,7 @@ def main():
         "--variants", default="",
         help="extra tactics n:slots:tmem_tiles (comma list), timed beside the default",
     )
+    p.add_argument("--stamps", action="store_true", help="per-phase CTA stamps (default tactic)")
     a = p.parse_args()
     dev = torch.device("cuda")
     n, k = 7168, 3584
@@ -165,6 +166,24 @@ def main():
             total = graph_time(body(op, a.window > 0), a.reps)
             row[op + "_us"] = round((total - base) / a.iters, 3)
         row["spin_us"] = round(base / a.iters, 3) if a.window else 0.0
+        if a.stamps:
+            up_s = PreparedLatentUp(ws[0], (t,), reduce_split=4, stamps=True).prepare()
+            big = torch.zeros(16 + 168 * 32, device=dev, dtype=torch.int32)
+            meds = []
+            for rep_i in range(6):
+                big.zero_()
+                spin_once(big[:2], 4 * t)
+                up_s.run(x, res[0], big)
+                torch.cuda.synchronize()
+                st = big[16:].view(torch.int64).view(168, 16).cpu().double()
+                if rep_i:
+                    t0 = st[:, 0].min()
+                    meds.append([((st[:, j] - t0) / 1000.0).median().item() for j in range(12)])
+            names = ("entry", "A_req", "drained", "rows", "x0", "mma_last", "mma_done",
+                     "cl_bar", "partials", "stored", "cp_first", "cp_last")
+            row["stamps_med_us"] = {
+                nm: round(sum(m[j] for m in meds) / len(meds), 2) for j, nm in enumerate(names)
+            }
         print(json.dumps(row), flush=True)
         results.append(row)
     if a.json:
