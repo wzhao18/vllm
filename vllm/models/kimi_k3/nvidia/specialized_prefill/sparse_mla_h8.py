@@ -394,10 +394,12 @@ class SparseMlaPrefillH8:
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
         # fpad (A/B): the padding softmax warps also run the P proxy fence (pre-M14)
-        knobs = tuple(knobs) + (0,) * (15 - len(knobs))
+        # park (timing only): softmax / QK / Q warps idle, the PV warp frees each stage as
+        # soon as it lands: the KV gather with a minimal consumer
+        knobs = tuple(knobs) + (0,) * (16 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys, self.fpad) = knobs[:15]
+         self.qkh, self.lglob, self.xphys, self.fpad, self.park) = knobs[:16]
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -496,16 +498,21 @@ class SparseMlaPrefillH8:
         n_mine = (rows - cta + self.grid - 1) // self.grid
         if warp < W_SM:
             cute.arch.warpgroup_reg_alloc(REG_SM)
-            self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
-                         out_scale, tensormap.map_address(om))
+            if cutlass.const_expr(not self.park):
+                self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta,
+                             scale_log2, out_scale, tensormap.map_address(om))
             cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
         else:
             cute.arch.warpgroup_reg_dealloc(REG_LOW)
             taddr = Uint32(cute.arch.make_warp_uniform(taddr))
             if warp == W_PV:
-                self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
+                if cutlass.const_expr(self.park):
+                    self.pv_park(base, lane, n_mine, lengths, cta)
+                else:
+                    self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
             elif warp == W_QK:
-                self.qk_loop(base, lane, taddr, n_mine, lengths, cta)
+                if cutlass.const_expr(not self.park):
+                    self.qk_loop(base, lane, taddr, n_mine, lengths, cta)
             else:
                 pw = warp - (W_Q + 1)  # gather 10 -> 0, 12-19 -> 1-8; Q warp 9 -> NLD
                 if warp == W_Q:
@@ -569,7 +576,7 @@ class SparseMlaPrefillH8:
             elif cutlass.const_expr(self.logical):
                 self.slot_producer(base, lane, cta, n_mine, tm_qn, tm_qr, unit_rows, slots,
                                    slot_stride, req_ids, btab, bt_stride, bt_cols, bs_shift)
-            for qi in range(0 if self.logical else n_mine):
+            for qi in range(0 if self.logical or self.park else n_mine):
                 row = cta + qi * self.grid
                 if lane == 0:
                     if qi >= 1:
@@ -1364,6 +1371,21 @@ class SparseMlaPrefillH8:
             commit_e(_bar(base, (B_SFULL if hf == 0 else B_SFULL1) + u % 2))
         if last:
             commit_e(_bar(base, B_QREMPTY + qi % 2))
+
+    @cute.jit
+    def pv_park(self, base, lane, n_mine, lengths, cta):
+        """park: free every stage as soon as it has landed (no MMA, no softmax)."""
+        lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+        lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+        u = Int32(0)
+        for qi in range(n_mine):
+            subs = _subs(self.ntok(base, lens, cta + qi * self.grid, qi))
+            for i in range(subs):
+                s = u % NS
+                mbar_wait(_bar(base, B_KVFULL + s), Uint32((u // NS) & 1))
+                if lane == 0:
+                    mbar_arrive(_bar(base, B_KVEMPTY + s))
+                u = u + 1
 
     @cute.jit
     def pv_loop(self, base, lane, taddr, n_mine, lengths, cta):
