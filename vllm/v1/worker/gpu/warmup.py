@@ -574,6 +574,41 @@ def _serving_step_shapes(
     return num_decodes, first, second, hit_context, hit_new
 
 
+def _serving_ladder_shapes(
+    model_runner: GPUModelRunner,
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Step sets for the token counts between decode batches and the
+    budget-filling sets: serving steps of 2^k + 1 and 3 * 2^(k - 1) tokens
+    (65 up to the token budget), three counts per set: a single-sequence
+    prefill of the decode request's prompt (step 1), one spec-decode row + a
+    prompt chunk (step 2), one spec-decode row + the next chunk + a one-token
+    cache hit (step 3). Kernels that pick a tile, a split or a specialization
+    by token or sequence count compile here, not in the first small mixed
+    serving step (what P/D decode and prefill servers mostly run). Shapes are
+    the same on every rank; see ``run_serving_shape_warmup`` for the tuple.
+    """
+    budget = model_runner.scheduler_config.max_num_batched_tokens
+    query_len = model_runner.decode_query_len
+    longest = (
+        model_runner.max_model_len - model_runner.vllm_config.num_lookahead_tokens - 1
+    )
+    counts = sorted(
+        {
+            c
+            for k in range(6, budget.bit_length())
+            for c in (2**k + 1, 3 << (k - 1))
+            if query_len + 2 <= c <= budget
+        }
+    )
+    sets = []
+    for i in range(0, len(counts), 3):
+        t1, t2, t3 = (counts[i : i + 3] + counts[-1:] * 2)[:3]
+        first, second = t2 - query_len, t3 - query_len - 1
+        if min(first, second) >= 1 and first + second <= longest:
+            sets.append((1, first, second, first, 1, t1))
+    return sets
+
+
 def _serving_step_blocks(
     model_runner: GPUModelRunner, shapes: tuple[int, int, int, int, int]
 ) -> tuple[int, int]:
@@ -637,6 +672,7 @@ def run_serving_shape_warmup(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
     variant: int,
+    ladder: tuple[int, int, int, int, int, int] | None = None,
 ) -> bool:
     """Run one serving-shape step set (see ``_serving_step_shapes``).
 
@@ -645,6 +681,9 @@ def run_serving_shape_warmup(
     over the first one + a new request with a long cached context and a few
     new tokens. Returns False when the token budget or max_model_len leaves no
     room for the shapes; the decode batch is sized to the KV blocks.
+    ``ladder``: explicit (decode requests, first chunk, second chunk, cache-hit
+    context, cache-hit new tokens, decode prompt length) of a
+    ``_serving_ladder_shapes`` set instead of the variant's shapes.
     """
     if (
         model_runner.is_pooling_model
@@ -652,9 +691,15 @@ def run_serving_shape_warmup(
         or model_runner.is_encoder_decoder
     ):
         return False
-    shapes = _serving_step_shapes(
-        model_runner, variant, _serving_decode_cap(model_runner)
-    )
+    query_len = model_runner.decode_query_len
+    prompt_len = query_len + 1
+    if ladder is not None:
+        num_decodes, first, second, hit_context, hit_new, prompt_len = ladder
+        shapes = ladder[:5]
+    else:
+        shapes = _serving_step_shapes(
+            model_runner, variant, _serving_decode_cap(model_runner)
+        )
     if shapes is None:
         logger.warning(
             "Skipping serving-shape warmup %d: the token budget (%d) or "
@@ -666,8 +711,6 @@ def run_serving_shape_warmup(
         return False
     num_decodes, first, second, hit_context, hit_new = shapes
     num_spec = model_runner.num_speculative_steps
-    query_len = model_runner.decode_query_len
-    prompt_len = query_len + 1
     decode_len = prompt_len + 2 * query_len
     long_len = first + second
     hit_len = hit_context + hit_new
@@ -886,6 +929,15 @@ def serving_shape_warmup(
     for variant in range(NUM_SERVING_WARMUP_VARIANTS):
         run_serving_shape_warmup(
             model_runner, worker_execute_model, worker_sample_tokens, variant
+        )
+    ladder = _serving_ladder_shapes(model_runner)
+    for i, shapes in enumerate(ladder):
+        run_serving_shape_warmup(
+            model_runner,
+            worker_execute_model,
+            worker_sample_tokens,
+            NUM_SERVING_WARMUP_VARIANTS + 1 + i,
+            ladder=shapes,
         )
     with jit_monitor.record_jit_events() as events:
         verified = run_serving_shape_warmup(
