@@ -304,7 +304,6 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
     """``SwapABGatedActEpilogue`` whose FC2 half is ``SwapABFc2EpilogueDedup`` (bulk stores routed by metadata)."""
 
     situ_core_s3 = True
-    fc1_wg1_phase_shift = True
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
