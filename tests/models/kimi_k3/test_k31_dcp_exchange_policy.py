@@ -204,3 +204,29 @@ def test_exchange_attaches_to_impls_that_read_counts():
 
     assert decode._reads_counts(object.__new__(FlashInferMLASparseImpl))
     assert not decode._reads_counts(object.__new__(FlashMLASparseImpl))
+
+
+def test_stable_sources_copy_once(tmp_path):
+    """The shared digest-named build compiles a copy written once: a checkout whose
+    unchanged source is newer than the last build must not trigger a rebuild."""
+    import os
+
+    from vllm.models.kimi_k3.nvidia.dsa_kernels import stable_sources
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "k.cu").write_text('#include "k.cuh"\n')
+    (checkout / "k.cuh").write_text("// header\n")
+    (checkout / "notes.txt").write_text("not a source\n")
+    build = tmp_path / "build" / "0123456789-s"
+    build.mkdir(parents=True)
+
+    first = stable_sources(str(build), [checkout / "k.cu"])
+    assert first == [str(build / "src" / "k.cu")]
+    assert sorted(os.listdir(build / "src")) == ["k.cu", "k.cuh"]
+    mtime = os.stat(first[0]).st_mtime_ns
+
+    os.utime(checkout / "k.cu", ns=(mtime + 10**12, mtime + 10**12))  # newer checkout
+    assert stable_sources(str(build), [checkout / "k.cu"]) == first
+    assert os.stat(first[0]).st_mtime_ns == mtime
+    assert [p.name for p in build.iterdir()] == ["src"]  # no temp dirs left

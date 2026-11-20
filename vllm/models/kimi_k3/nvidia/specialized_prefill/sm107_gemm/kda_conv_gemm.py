@@ -45,6 +45,11 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.skel_hot = "hot" in flags
         self.sf_tmem_slots = 2 if "sf2" in flags else 1
         self.epi_drain = "drain" in flags
+        self.l2_store_evict_first = "sef" in flags
+        # die_sched: clusters claim N tiles of their die's weight half
+        # (die-split weights, extra scheduler warp 10).
+        self.die_sched = any(f.startswith("die") for f in flags)
+        self.die_group = next((int(f[3:]) for f in flags if f.startswith("die") and f[3:].isdigit()), 0)
         # Drain skeletons (microbench only): 1 = drain + release, 2 = + math.
         self.epi_x2 = "x2" in flags
         self.epi_tanh = "tanh" in flags
@@ -82,6 +87,9 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             self.mma_warp_id = 8
             self.tma_warp_id = 9
             self.threads_per_cta = 32 * 10
+            if self.die_sched:
+                self.sched_warp_id = 10
+                self.threads_per_cta = 32 * 11
             self.epilog_sync_barrier = pipeline.NamedBarrier(
                 barrier_id=self.epilog_sync_bar_id, num_threads=256
             )

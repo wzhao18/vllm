@@ -48,6 +48,22 @@ def make_l2_evict_first_policy() -> Int64:
 
 
 @cute.jit
+def make_l2_evict_last_policy() -> Int64:
+    """``createpolicy`` L2 evict_last (fraction 1.0) for operands many units re-read in one launch."""
+    return Int64(
+        llvm.inline_asm(
+            Int64.mlir_type,
+            [],
+            "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
 def make_executable_tma_atom(atom: cute.CopyAtom) -> cute.CopyAtom:
     """Materialize a bare executable TMA atom without per-issue fields."""
     if cutlass.const_expr(isinstance(atom._trait, CopyBulkTensorTileG2SMulticastNonExecTrait)):
