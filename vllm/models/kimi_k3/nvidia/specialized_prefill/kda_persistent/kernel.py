@@ -569,7 +569,8 @@ def _pkd(
     )
     mst_base = acc32_base  # [128,32] column-window template
     # PHANTOM_ 1: lockstep second lane (chain SIMT + MMA); 2: MMAs only
-    NLANE = 2 if PHANTOM_ == 1 else 1
+    NLANE = 2 if PHANTOM_ in (1, 3) else 1
+    PH2 = PHANTOM_ in (1, 3)
     t_inp_b = cute.make_tensor(
         cute.recast_ptr(tmem_ptr + LANE_COLS, dtype=cutlass.BFloat16), inp_base.layout
     )
@@ -879,49 +880,94 @@ def _pkd(
                     cwQ += _clock64() - ccQ
                 else:
                     cute.arch.mbarrier_wait(mb + MB_QK + csc, p_qk)
-                for L in cutlass.range_constexpr(NLANE):
-                    tl = tmem_ptr + LANE_COLS * L
-                    m0 = cute.make_tensor(
-                        cute.recast_ptr(tl + 64, dtype=cutlass.Float32),
-                        mst_base.layout,
-                    )
-                    cute.copy(mst_ld, mst_thr.partition_S(m0), r_mst)
+                if cutlass.const_expr(PHANTOM_ == 3):
+                    # both lanes' windows in flight before one wait
                     for win in cutlass.range_constexpr(2):
-                        rcur = r_mst if win % 2 == 0 else r_mst2
-                        rnxt = r_mst2 if win % 2 == 0 else r_mst
-                        msth = cute.make_tensor(
-                            cute.recast_ptr(
-                                tl + 64 + win * 32, dtype=cutlass.Float32
-                            ),
-                            mst_base.layout,
-                        )
-                        twin = cute.make_tensor(
-                            cute.recast_ptr(tl + win * 16, dtype=cutlass.BFloat16),
-                            w32b_base.layout,
-                        )
-                        cute.arch.fence_view_async_tmem_load()
-                        if cutlass.const_expr(win < 1):
-                            mnxt = cute.make_tensor(
-                                cute.recast_ptr(
-                                    tl + 64 + (win + 1) * 32, dtype=cutlass.Float32
-                                ),
-                                mst_base.layout,
-                            )
-                            cute.copy(mst_ld, mst_thr.partition_S(mnxt), rnxt)
                         for gv in cutlass.range_constexpr(4):
                             g8d = cute.make_tensor(
                                 r_gt.iterator + 8 * gv, cute.make_layout((8,))
                             )
                             cute.autovec_copy(v_gt8[(win * 4 + gv, None, csc)], g8d)
-                        mv = rcur.load()
-                        rb32f.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
-                        rcur.store(mv * r_gt.load())
+                        for L in cutlass.range_constexpr(2):
+                            mwl = cute.make_tensor(
+                                cute.recast_ptr(
+                                    tmem_ptr + LANE_COLS * L + 64 + win * 32,
+                                    dtype=cutlass.Float32,
+                                ),
+                                mst_base.layout,
+                            )
+                            cute.copy(mst_ld, mst_thr.partition_S(mwl), [r_mst, r_mst2][L])
+                        cute.arch.fence_view_async_tmem_load()
                         if cutlass.const_expr(GATE2_ == 1 and win == 0):
                             cute.arch.mbarrier_wait(mb + MB_OFIN + ofin_stage, ofin_phase)
-                        cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
-                        cute.copy(mst_st, rcur, mst_sthr.partition_D(msth))
+                        for L in cutlass.range_constexpr(2):
+                            rcur = [r_mst, r_mst2][L]
+                            mwl = cute.make_tensor(
+                                cute.recast_ptr(
+                                    tmem_ptr + LANE_COLS * L + 64 + win * 32,
+                                    dtype=cutlass.Float32,
+                                ),
+                                mst_base.layout,
+                            )
+                            twin = cute.make_tensor(
+                                cute.recast_ptr(
+                                    tmem_ptr + LANE_COLS * L + win * 16,
+                                    dtype=cutlass.BFloat16,
+                                ),
+                                w32b_base.layout,
+                            )
+                            mv = rcur.load()
+                            rb32f.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
+                            rcur.store(mv * r_gt.load())
+                            cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
+                            cute.copy(mst_st, rcur, mst_sthr.partition_D(mwl))
                     cute.arch.fence_view_async_tmem_store()
-                    inp_bars[L].arrive()
+                    inp_bars[0].arrive()
+                    inp_bars[1].arrive()
+                else:
+                    for L in cutlass.range_constexpr(NLANE):
+                        tl = tmem_ptr + LANE_COLS * L
+                        m0 = cute.make_tensor(
+                            cute.recast_ptr(tl + 64, dtype=cutlass.Float32),
+                            mst_base.layout,
+                        )
+                        cute.copy(mst_ld, mst_thr.partition_S(m0), r_mst)
+                        for win in cutlass.range_constexpr(2):
+                            rcur = r_mst if win % 2 == 0 else r_mst2
+                            rnxt = r_mst2 if win % 2 == 0 else r_mst
+                            msth = cute.make_tensor(
+                                cute.recast_ptr(
+                                    tl + 64 + win * 32, dtype=cutlass.Float32
+                                ),
+                                mst_base.layout,
+                            )
+                            twin = cute.make_tensor(
+                                cute.recast_ptr(tl + win * 16, dtype=cutlass.BFloat16),
+                                w32b_base.layout,
+                            )
+                            cute.arch.fence_view_async_tmem_load()
+                            if cutlass.const_expr(win < 1):
+                                mnxt = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        tl + 64 + (win + 1) * 32, dtype=cutlass.Float32
+                                    ),
+                                    mst_base.layout,
+                                )
+                                cute.copy(mst_ld, mst_thr.partition_S(mnxt), rnxt)
+                            for gv in cutlass.range_constexpr(4):
+                                g8d = cute.make_tensor(
+                                    r_gt.iterator + 8 * gv, cute.make_layout((8,))
+                                )
+                                cute.autovec_copy(v_gt8[(win * 4 + gv, None, csc)], g8d)
+                            mv = rcur.load()
+                            rb32f.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
+                            rcur.store(mv * r_gt.load())
+                            if cutlass.const_expr(GATE2_ == 1 and win == 0):
+                                cute.arch.mbarrier_wait(mb + MB_OFIN + ofin_stage, ofin_phase)
+                            cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
+                            cute.copy(mst_st, rcur, mst_sthr.partition_D(msth))
+                        cute.arch.fence_view_async_tmem_store()
+                        inp_bars[L].arrive()
                 p_oe ^= 1
                 p_inp ^= 1
 
@@ -1095,7 +1141,7 @@ def _pkd(
                     cwF += _clock64() - ccF
                 else:
                     cute.arch.mbarrier_wait(mb + MB_FIN + csc, p_fin)
-                if cutlass.const_expr(PHANTOM_ == 1):
+                if cutlass.const_expr(PH2):
                     cute.arch.mbarrier_wait(mb + MB_FIN_B + csc, p_fin)
                 ofin_stage = csc
                 ofin_phase = p_fin
@@ -1434,7 +1480,7 @@ def _pkd(
                     cc_t = seq_len - t * C
                     if cutlass.const_expr(GATE2_ == 0):
                         cute.arch.mbarrier_wait(mb + MB_OFIN + cse, pe_fin)
-                        if cutlass.const_expr(PHANTOM_ == 1):
+                        if cutlass.const_expr(PH2):
                             cute.arch.mbarrier_wait(mb + MB_OFIN_B + cse, pe_fin)
                     if cutlass.const_expr(True):
                         if t + 1 < t_tiles:
@@ -1498,7 +1544,7 @@ def _pkd(
                                 pqn ^= 1
                     if cutlass.const_expr(GATE2_ == 1):
                         cute.arch.mbarrier_wait(mb + MB_OFIN + cse, pe_fin)
-                    if cutlass.const_expr(PHANTOM_ == 1):
+                    if cutlass.const_expr(PH2):
                         cute.copy(o16_cp, out_thr.partition_S(t_out_b), r_o)
                         cute.arch.fence_view_async_tmem_load()
                         with cute.arch.elect_one():
@@ -1711,7 +1757,7 @@ def _pkd(
                     for _t in cutlass.range(t_tiles):
                         if cutlass.const_expr(PHANTOM_ >= 1):
                             for L in cutlass.range_constexpr(2):
-                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                if cutlass.const_expr(L == 0 or PH2):
                                     inp_bars[L].arrive_and_wait()
                                 mma_1.set(tcgen05.Field.ACCUMULATE, False)
                                 for kb in cutlass.range_constexpr(D // 16):
@@ -1726,7 +1772,7 @@ def _pkd(
                                 with cute.arch.elect_one():
                                     tcgen05.commit(mb + [MB_OOUT, MB_OOUT_B][L] + csm)
                             for L in cutlass.range_constexpr(2):
-                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                if cutlass.const_expr(L == 0 or PH2):
                                     cute.arch.mbarrier_wait(mb + [MB_OEMPTY, MB_OEMPTY_B][L], pm_oe)
                                 mma_1.set(tcgen05.Field.ACCUMULATE, False)
                                 for kb in cutlass.range_constexpr(D // 16):
@@ -1741,7 +1787,7 @@ def _pkd(
                             with cute.arch.elect_one():
                                 tcgen05.commit(mb + MB_RFREE + csm)
                             for L in cutlass.range_constexpr(2):
-                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                if cutlass.const_expr(L == 0 or PH2):
                                     u_bars[L].arrive_and_wait()
                                 mma_3.set(tcgen05.Field.ACCUMULATE, False)
                                 for kb in cutlass.range_constexpr(C // 16):
@@ -1756,7 +1802,7 @@ def _pkd(
                                 with cute.arch.elect_one():
                                     tcgen05.commit(mb + [MB_U2ACC, MB_U2ACC_B][L] + csm)
                             for L in cutlass.range_constexpr(2):
-                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                if cutlass.const_expr(L == 0 or PH2):
                                     u2_bars[L].arrive_and_wait()
                                 mma_4a.set(tcgen05.Field.ACCUMULATE, True)
                                 for kb in cutlass.range_constexpr(C // 16):
