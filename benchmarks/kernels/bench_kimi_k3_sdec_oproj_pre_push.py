@@ -160,7 +160,8 @@ def ks_push(rows, n, cap, x, copies, recv, peers, words, dbg=0):
         st = st.view(-1, ks_push.STAMPS)[: 2 * 28 * ks_push.KS].double()
         t0 = st[:, 0].min()
         names = ("start", "A", "B0", "B1", "B2", "M0", "M1", "M2", "E0", "E1", "E2",
-                 "P0", "P1", "P2", "end", "Xw")  # fmt: skip
+                 "P0", "P1", "P2", "end", "Xw", "S0", "-", "S1", "-", "S2", "-", "G0w",
+                 "G1w", "G2w", "G0s", "G1s", "G2s", "-", "-", "-", "-")  # fmt: skip
         cols = [i for i in range(ks_push.STAMPS) if (st[:, i] > 0).any()]
         med = {names[i]: ((st[:, i][st[:, i] > 0] - t0).median() / 1e3).item() for i in cols}
         line += " | stamps us: " + " ".join(f"{k} {v:.2f}" for k, v in med.items())

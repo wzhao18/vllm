@@ -69,7 +69,7 @@ GATHER_BAR = 3
 DONE_BAR = 4  # both groups, before the TMEM is freed
 WRITERS = 2 * 32 * EPI_WARPS  # counter target: both writer CTAs' scatter threads
 MAX_BLOCKS = 4  # R <= 512
-STAMPS = 16  # bench probe (dbg & 32): int64 globaltimer stamps per CTA after the scratch
+STAMPS = 32  # bench probe (dbg & 32): int64 globaltimer stamps per CTA after the scratch
 STAMP_FLOATS = 2 * STAMPS * 2 * (WIDTH // FEATURES) * KS
 
 
@@ -418,6 +418,7 @@ class OprojKsPush:
         stamps = scratch.iterator.toint() + Int64(
             (scratch_floats() - STAMP_FLOATS + 2 * STAMPS * bidx) * 4
         )
+        self._stamps = stamps
         if warp == W_WARP:
             if cutlass.const_expr(self.dbg & 32):
                 if cute.arch.lane_idx() == 0:
@@ -607,6 +608,9 @@ class OprojKsPush:
                     for q in cutlass.range_constexpr(len(vals) // 4 if not self.dbg & 2 else 0):
                         quad = (t0 + 4 * q) // 4  # token quad: 128 x 16 B apart
                         st_f32x4(base + quad * 2048, *vals[4 * q : 4 * q + 4])
+                if cutlass.const_expr(self.dbg & 32):
+                    if tidx == 0:
+                        st_i64(self._stamps + (16 + 2 * blk) * 8, globaltimer())
                 where = (fv * MAX_BLOCKS + blk) * KS + c
                 red_release_add(counters.iterator.toint() + Int64(where) * 4, 1)
 
@@ -632,6 +636,9 @@ class OprojKsPush:
                     pass
             st_relaxed_gpu(where, 0)  # (the next call's writers start after this one)
         bar_sync(GATHER_BAR, 32 * EPI_WARPS)
+        if cutlass.const_expr(self.dbg & 32):
+            if gid == 0:
+                st_i64(self._stamps + (22 + blk) * 8, globaltimer())
         base0 = self._slot_base(scratch, fv, blk, ks, 0, feature)
         base1 = self._slot_base(scratch, fv, blk, ks, 1, feature)
         # every slab load of the chunk (2 slots x 12 token quads) in flight before any
@@ -656,6 +663,9 @@ class OprojKsPush:
                             st_shared_u32(stage + ((t0 + 4 * q + e) * 128 + feature) * 2, word)
         fence_proxy_async_smem()
         bar_sync(GATHER_BAR, 32 * EPI_WARPS)
+        if cutlass.const_expr(self.dbg & 32):
+            if gid == 0:
+                st_i64(self._stamps + (25 + blk) * 8, globaltimer())
         n = rows // self.tp
         token = order[blk] * TB + start + gid
         if (gid < size) & (token < rows):
