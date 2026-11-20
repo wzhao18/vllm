@@ -35,7 +35,7 @@ if args.dielocal:
     dl.copy_(blocks)
     blocks = dl
 attn_res_lp.begin(plan, blocks)
-st = attn_res_lp._state[0]
+st = attn_res_lp._states[blocks.data_ptr()]
 st.rstd.uniform_(0.5, 1.5)
 for b in range(NB):
     st.logits[b] = torch.randn(2 * plan.calls_after(b), T, device="cuda")

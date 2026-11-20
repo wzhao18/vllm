@@ -150,7 +150,9 @@ class _Forward:
         self.logits: list[torch.Tensor | None] = [None] * plan.num_blocks
 
 
-_state: list[_Forward | None] = [None]
+# Planned forwards in flight, keyed by their block buffer (one per forward;
+# a forward is released by its final AttnRes call).
+_states: dict[int, _Forward] = {}
 _claims: dict[int, torch.Tensor] = {}
 
 
@@ -169,7 +171,9 @@ def _schedule_args(blocks: torch.Tensor):
 
 def begin(plan: Plan, blocks: torch.Tensor) -> None:
     """Start a prefill forward whose AttnRes block buffer is ``blocks``."""
-    _state[0] = _Forward(plan, blocks)
+    while len(_states) >= 2:  # forwards that never reached their final call
+        del _states[next(iter(_states))]
+    _states[blocks.data_ptr()] = _Forward(plan, blocks)
     logger.info_once(
         "Kimi K3.1 prefill AttnRes: precomputed block logits (attn_res_lp, "
         "%d calls, %d blocks, die-aware claims: %s)",
@@ -180,17 +184,13 @@ def begin(plan: Plan, blocks: torch.Tensor) -> None:
 
 def active(blocks: torch.Tensor, prefix: torch.Tensor) -> bool:
     """A planned prefill forward owns this AttnRes call's block buffer."""
-    st = _state[0]
-    return (
-        st is not None
-        and st.ptr == blocks.data_ptr()
-        and st.tokens == prefix.shape[0]
-    )
+    st = _states.get(blocks.data_ptr())
+    return st is not None and st.tokens == prefix.shape[0]
 
 
 def _forward_for(blocks: torch.Tensor, rows: int) -> _Forward:
-    st = _state[0]
-    if st is None or st.ptr != blocks.data_ptr() or st.tokens != rows:
+    st = _states.get(blocks.data_ptr())
+    if st is None or st.tokens != rows:
         raise RuntimeError(
             "attn_res_lp: AttnRes call outside the prefill forward it was "
             "planned for (begin() not called with this block buffer)"
@@ -281,7 +281,7 @@ def attn_res(
     )
     if call == plan.num_calls - 1:
         # The final AttnRes is the forward's last reader of the plan state.
-        _state[0] = None
+        del _states[st.ptr]
     elif block_write_idx >= 0 and plan.calls_after(block_write_idx) > 0:
         # v_b . w_c for every later call c: [2 * calls_after, rows] FP32
         # (hi rows, then lo rows).

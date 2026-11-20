@@ -47,7 +47,7 @@ def main():
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--check", type=int, default=1)
     p.add_argument("--old", type=int, default=1)
-    p.add_argument("--depths", default="4")
+    p.add_argument("--depths", default="2")
     p.add_argument("--percall", type=int, default=1)
     p.add_argument("--dielocal", type=int, default=0)
     p.add_argument("--groups", default="4")

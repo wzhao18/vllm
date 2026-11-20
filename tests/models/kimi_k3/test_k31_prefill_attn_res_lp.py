@@ -102,4 +102,4 @@ def test_attn_res_lp_sequence(rows):
             rq = mxfp8_act.quantize(out)
             assert torch.equal(rq.data.view(torch.uint8), qa.data.view(torch.uint8))
             assert torch.equal(rq.scale.view(torch.uint8), qa.scale.view(torch.uint8))
-    assert attn_res_lp._state[0] is None  # released by the final call
+    assert lp_blocks.data_ptr() not in attn_res_lp._states  # released by the final call
