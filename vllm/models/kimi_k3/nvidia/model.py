@@ -183,6 +183,45 @@ def _attn_res(
 
 logger = init_logger(__name__)
 
+
+_NANPROBE = {"fwd": 0}
+
+
+def _nanprobe_t(t):
+    if t is None:
+        return -1
+    return int(t.isnan().sum().item())
+
+
+def _nanprobe_begin(x):
+    if torch.cuda.is_current_stream_capturing() or _NANPROBE["fwd"] >= 8:
+        return None
+    _NANPROBE["fwd"] += 1
+    meta = "?"
+    try:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+        if is_forward_context_available():
+            meta = "none" if get_forward_context().attn_metadata is None else "set"
+    except Exception as e:  # noqa
+        meta = "err"
+    return {"i": _NANPROBE["fwd"], "rows": x.shape[0], "meta": meta, "emb": _nanprobe_t(x), "numel": x.numel(), "L": []}
+
+
+def _nanprobe_layer(st, idx, layer, prefix, hidden, residual):
+    if st is None:
+        return
+    st["L"].append((idx, type(layer.self_attn).__name__[:12], _nanprobe_t(prefix), _nanprobe_t(hidden), _nanprobe_t(residual)))
+
+
+def _nanprobe_end(st):
+    if st is None:
+        return
+    import os
+    first = next((l for l in st["L"] if max(l[2], l[3]) > 0), None)
+    logger.warning("NANPROBE rank %s fwd %d rows %d meta %s emb_nan %d/%d first_nan_layer %s layers %s",
+                   os.environ.get("RANK", os.environ.get("LOCAL_RANK", "?")), st["i"], st["rows"], st["meta"],
+                   st["emb"], st["numel"], first, st["L"])
+
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
 # down projection on a separate CUDA stream (latent MoE). At or below this many
 # tokens the launch-bound decode path benefits from multi-stream overlap; above
@@ -2167,6 +2206,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = None
             residual = block_residual
 
+        _np = _nanprobe_begin(prefix_sum if prefix_sum is not None else hidden_states)
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
@@ -2177,6 +2217,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 prefix_sum=prefix_sum,
                 residual=residual,
             )
+            _nanprobe_layer(_np, layer_idx, layer, prefix_sum, hidden_states, residual)
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if self.use_attn_res:
                     assert prefix_sum is not None
@@ -2190,6 +2231,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
                 aux_hidden_states.append(aux_hidden_state)
 
+        _nanprobe_end(_np)
         assert hidden_states is not None
         assert residual is not None
         if not get_pp_group().is_last_rank:
