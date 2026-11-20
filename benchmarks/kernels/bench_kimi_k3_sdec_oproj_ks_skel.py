@@ -86,7 +86,13 @@ __global__ void __cluster_dims__(KS, 1, 1) __launch_bounds__(128, 1) skel(Prm p)
   asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory");
   if (tid == 0) {
     const unsigned long long tg = gt();
-    while (*p.flag == 0 && gt() - tg < 2000000000ull) {}
+    volatile unsigned long long* dflag = (volatile unsigned long long*)(p.ts + 5);
+    if (blockIdx.x == 0 && blockIdx.y == 0) {  // one host poller per GPU, the rest poll L2
+      while (*p.flag == 0 && gt() - tg < 2000000000ull) {}
+      __threadfence(); *dflag = 1ull; __threadfence();
+    } else {
+      while (*dflag == 0ull && gt() - tg < 2000000000ull) {}
+    }
     expect(bars + 0, WB);
     for (int c = 0; c * XCH < WB; ++c) {
       int bytes = (WB - c * XCH) < XCH ? (WB - c * XCH) : XCH;
@@ -204,7 +210,7 @@ def main():
             ws.append(torch.randint(0, 255, (56 * 3 * 128 * 1024,), dtype=torch.uint8, device=d))
             xs.append(torch.randint(0, 255, (4 * 3 * 96 * 1024,), dtype=torch.uint8, device=d))
             recv.append(torch.zeros(4 * n * 7168, dtype=torch.bfloat16, device=d))
-            ts.append(torch.zeros(4, dtype=torch.int64, device=d))
+            ts.append(torch.zeros(6, dtype=torch.int64, device=d))
             st.append(torch.cuda.Stream(device=d))
         peers = [r.data_ptr() for r in recv]
         flag = torch.zeros(1, dtype=torch.int32).pin_memory()
@@ -216,7 +222,7 @@ def main():
                 for g in range(ng):
                     with torch.cuda.device(g):
                         ts[g][0] = (1 << 62)
-                        ts[g][1] = 0; ts[g][2] = 0; ts[g][3] = (1 << 62)
+                        ts[g][1:] = torch.tensor([0, 0, 1 << 62, 0, 0])
                 for g in range(ng):
                     torch.cuda.synchronize(g)
                 for g in range(ng):
