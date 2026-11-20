@@ -149,7 +149,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
 
     # Reserve resident capacity for the communication grid beside compute clusters.
     pusher_cta_count: ClassVar[int] = 27
-    refine_participant_groups: ClassVar[int] = 2
+    refine_participant_groups: ClassVar[int] = 4
     refine_output_stages: ClassVar[int] = 4
 
     # Cluster N carries no tokens under swap-AB, so only cluster M varies. A cluster tile is

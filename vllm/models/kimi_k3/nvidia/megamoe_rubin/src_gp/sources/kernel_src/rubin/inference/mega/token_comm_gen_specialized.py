@@ -231,7 +231,7 @@ class GenphaseTokenComm(KernelComponent):
     be co-resident, which the host must budget SMs for.
     """
 
-    threads_per_cta: ClassVar[int] = 256
+    threads_per_cta: ClassVar[int] = 512
     # Route rounds whose LL words one sort thread loads before testing any tag
     # (bounds the registers the batched poll holds for very large route planes).
     sort_poll_chunk: ClassVar[int] = 8
