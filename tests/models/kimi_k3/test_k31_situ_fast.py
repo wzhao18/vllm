@@ -89,3 +89,48 @@ def test_situ_auto_dispatch_by_rows():
         want = fn(x, 4.0, 25.0)
         assert torch.equal(got.data.view(torch.uint8), want.data.view(torch.uint8))
         assert torch.equal(got.scale, want.scale)
+
+
+def _ulp_dist(a, b):
+    """BF16 ulp distance (+0 and -0 coincide)."""
+
+    def ordered(t):
+        i = t.view(torch.int16).int()
+        return torch.where(i < 0, -(i & 0x7FFF), i)
+
+    return (ordered(a) - ordered(b)).abs()
+
+
+@pytest.mark.parametrize("beta,linear_beta", BETAS)
+@pytest.mark.parametrize("rows,d", [(4096, 1536), (257, 18432), (130, 33792)])
+def test_situ_fast_bf16_is_mode4_values(beta, linear_beta, rows, d):
+    """The BF16 fast form (prefill dense SiTU MLP) returns exactly the BF16
+    values mode 4 quantizes, within BF16 noise of the precise form."""
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+    from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
+
+    torch.manual_seed(rows + d)
+    x = (torch.randn(rows, 2 * d, device="cuda") * 4.0).to(torch.bfloat16)
+    x[0, :64] = torch.linspace(-80, 80, 64, device="cuda").to(torch.bfloat16)
+    x[0, d : d + 64] = torch.linspace(-300, 300, 64, device="cuda").to(torch.bfloat16)
+    x[1] = 0
+    fast = mxfp8_act.situ_and_mul_fast_bf16(x, beta, linear_beta)
+    precise = situ_and_mul(x, beta, linear_beta)
+    assert torch.isfinite(fast.float()).all()
+    # BF16 noise at the scale of each 32-column block (the MXFP8 block of the
+    # shared-expert form): the MUFU-light form loses relative precision only
+    # where the activation is far below its block's magnitude.
+    diff = (fast.float() - precise.float()).abs().reshape(rows, -1, 32)
+    amax = precise.float().abs().reshape(rows, -1, 32).amax(-1, keepdim=True)
+    ulp = torch.exp2(torch.floor(torch.log2(amax.clamp_min(2.0**-126))) - 7)
+    err = (diff / ulp).max().item()
+    frac = (_ulp_dist(fast, precise) > 0).float().mean().item()
+    print(f"beta={beta} lbeta={linear_beta} rows={rows} d={d}: max err {err:.3f} "
+          f"block-max BF16 ulp, {frac:.2e} of elements differ")
+    assert err <= 1.0
+    assert frac < 2e-2
+    want = mxfp8_act.situ_and_mul_quantize_fast(x, beta, linear_beta)
+    got = mxfp8_act.quantize(fast)
+    assert torch.equal(got.data.view(torch.uint8), want.data.view(torch.uint8))
+    assert torch.equal(got.scale, want.scale)
+

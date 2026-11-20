@@ -80,6 +80,8 @@ def main():
     ap.add_argument("--q", type=int, default=4)
     ap.add_argument("--ctx", type=int, default=135000)
     ap.add_argument("--spread", type=float, default=0.0, help="ctx uniform in ctx*(1 +- spread)")
+    ap.add_argument("--long-ctx", type=int, default=0, help="every --long-every-th request gets this context")
+    ap.add_argument("--long-every", type=int, default=32)
     ap.add_argument("--cases", default="normal,relu,hot_recent")
     ap.add_argument("--max-model-len", type=int, default=1 << 20)
     ap.add_argument("--max-local", type=int, default=0, help="override the launch bound")
@@ -135,6 +137,8 @@ def main():
             Greq = (a.ctx * (1 + a.spread * u)).to(torch.int32)
         else:
             Greq = torch.full((B,), a.ctx, dtype=torch.int32, device=dev)
+        if a.long_ctx:
+            Greq[:: a.long_every] = a.long_ctx
         j = torch.arange(a.q, device=dev, dtype=torch.int32)
         G = (Greq[:, None] - (a.q - 1 - j)[None, :]).reshape(-1).contiguous()
         L = local_len_of(G, rank, W, 1).to(torch.int32).contiguous()

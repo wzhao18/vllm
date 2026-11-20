@@ -1372,7 +1372,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=getattr(self, "use_pdl", False),
         )
         return
 
@@ -1517,7 +1516,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
         conv_smem = None
-        situ_smem = storage.sC.data_ptr().toint()
         if cutlass.const_expr(getattr(self, "conv_mode", False)):
             conv_smem = storage.sC.data_ptr().toint()
             if cutlass.const_expr(
@@ -1706,9 +1704,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
-        # vLLM: programmatic dependent launch (setup overlaps the producer).
-        if cutlass.const_expr(getattr(self, "use_pdl", False)):
-            cute.arch.griddepcontrol_wait()
 
         #
         # Construct the scheduler
@@ -2243,6 +2238,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 ):
                     # vLLM S2: dense shared gate_up (no latent tiles), 8-warp
                     # drain-and-release SiTU + MXFP8 epilogue.
+                    # A swizzled raster pads the cluster grid to a multiple of
+                    # the swizzle: the padded N tiles are computed from
+                    # zero-filled operands and must not store (row-major Q
+                    # would wrap them into the next rows); 0 rows = no stores.
+                    q_rows = mQ_mnl.shape[0]
+                    if mma_tile_coord_mnl[1] >= cute.size(mQ_mnl, mode=[1]) // 256:
+                        q_rows = cutlass.Int32(0)
                     acc_consumer_state = epilogue_situ_mxfp8_drain(
                         self,
                         tidx,
@@ -2255,7 +2257,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         self.situ_a_pow,
                         self.situ_clamp_up,
                         mma_tile_coord_mnl,
-                        mQ_mnl.shape[0],
+                        q_rows,
                         acc_consumer_state,
                         acc_pipeline,
                         getattr(self, "epi_drain_skel", 0),
@@ -2264,8 +2266,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         getattr(self, "epi_tanh", False),
                         getattr(self, "epi_roll", 0),
                         getattr(self, "epi_store", 0),
-                        situ_smem,
-                        mQ_mnl.layout.stride[0],
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
@@ -2367,8 +2367,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
-        if cutlass.const_expr(getattr(self, "use_pdl", False)):
-            cute.arch.griddepcontrol_launch_dependents()
 
     # GPU device kernel
     @cute.kernel
