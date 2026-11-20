@@ -11,25 +11,23 @@ Roles (one persistent CTA per SM, a static head-major item range each):
   warps 1-16  consumers, thread (warp w, lane 8 a + b) = rows 8 w + 2 a + {0, 1} x keys
               4 b + 32 j + [0, 4) (j < 4): the page slot is released as soon as the
               rows are in registers; fold S = S D + sum_t u_t w_t and the 8 scan dots
-              (FFMA2) read their per-key operands from tensor memory; an 8-lane
-              butterfly, a 4-lane gather of each row's 8 dots, the token solve, the
-              records, the BF16 outputs + sums of squares to a 2-deep finish ring,
-              the folded rows back to the cache (128-bit stores);
-  warp 17     copier: the per-key part of the operand blocks (2 slots)
-              and the per-key part to tensor memory, 32 tcgen05.cp.128x256b with a
-              zero stride-dimension offset (lane L receives key group L % 8),
-              double-buffered;
-  warps 18-19 finishers (tokens 0-1 / 2-3): gated RMSNorm from the warps' sums of
-              squares, then KdaFlow's BF16 or MXFP8 store_output (warp-collective per
-              32 channels); warp 19 also loads the rest of each block (v, u, gates,
-              couplings, betas; 3 slots, freed once the consumers and finishers read it).
+              (FFMA2) read their per-key operands from tensor memory; the folded rows
+              back to the cache (128-bit stores); an 8-lane butterfly; each lane's 2
+              dots to a 2-slot dots ring;
+  warp 17     copier: the per-key part of each operand block (2 slots) to tensor memory,
+              26 tcgen05.cp.128x256b with a zero stride-dimension offset (lane L
+              receives key group L % 8), double-buffered;
+  warps 18-19 finishers (thread = rows 64 f + lane, + 32): the token solve on the
+              dots, the records, the gated RMSNorm (2-warp sums of squares) and the
+              outputs (BF16, or MXFP8 with KdaFlow's store_output numerics, batched);
+              warp 19 also loads the rest of each block (3 slots).
 
-Operand block (``OPB_FLOATS`` FP32 words per item, head-major item rows): the per-key
-part [32 copies][2 halves][8 key groups][4] (key pair q of key group b = 32 columns
-[x_0..7 of key k0 | x_0..7 of key k1 | D_k0 D_k1 | w_t(k0) w_t(k1) for t < 4 | 6
-unused], k0 = 4 b + 32 (q // 2) + 2 (q % 2)), then v [T][K], the pending corrections
-u [T][K], the output gates (BF16 [T][K]), the 16 token couplings and the T betas.
-``from_core`` builds it from KdaCore's block.
+Operand block (OPB_FLOATS 4-byte words per item, head-major item rows): the per-key
+part, 26 copy blocks [2 halves][8 key groups][4] holding tensor-memory columns 16 q (x_0..7
+of keys k0, k1 of pair q), 128 + 8 q (D(k0), D(k1), w_t(k0), w_t(k1) for t < 3) and
+192 + 2 q (w_3(k0), w_3(k1)) of key group b (k0 = 4 b + 32 (q // 2) + 2 (q % 2)); then the
+pending corrections u [T][K] FP32, v [T][K] BF16, the output gates [T][K] BF16, the 16
+token couplings and the T betas. from_core builds it from KdaCore's block.
 
 Math: KdaCore's (fold, dots, solve, gated norm, store_output) with another FP32
 reduction order of the dot products and of the norm's sum of squares."""
@@ -43,12 +41,13 @@ import torch
 from . import core
 
 T, K = 4, 128
-OPB_X = 2048
-OPB_V, OPB_U = OPB_X, OPB_X + T * K
-OPB_G = OPB_U + T * K
+X_FLOATS = 26 * 64  # the per-key part (TMEM-ready)
+OPB_U = X_FLOATS  # FP32 [T][K]
+OPB_V = OPB_U + T * K  # BF16 [T][K] (T * K / 2 words)
+OPB_G = OPB_V + T * K // 2  # BF16 [T][K]
 OPB_CE = OPB_G + T * K // 2
 OPB_BETA = OPB_CE + 16
-OPB_FLOATS = OPB_BETA + T  # 3348 (13392 bytes, a multiple of 16)
+OPB_FLOATS = OPB_BETA + T  # 2708 (10832 bytes, a multiple of 16)
 
 _CUDA_SRC = r"""
 #include <torch/extension.h>
@@ -58,18 +57,19 @@ _CUDA_SRC = r"""
 
 namespace {
 constexpr int T = 4, K = 128, PG = K * K * 4;
-constexpr int OPB_FLOATS = 3348, OPB_BYTES = OPB_FLOATS * 4;
-constexpr int OPB_V = 2048, OPB_U = OPB_V + T * K, OPB_G = OPB_U + T * K;
-constexpr int OPB_CE = OPB_G + T * K / 2, OPB_BETA = OPB_CE + 16;
 constexpr int S = 3, NX = 2, NR = 3, NCW = 16, NC = NCW * 32;
-constexpr int THREADS = 32 + NC + 96;
-constexpr int X_BYTES = 8192, R_BYTES = OPB_BYTES - X_BYTES;  // per-key part / the rest
-constexpr int RV = OPB_V - 2048, RU = OPB_U - 2048, RG = OPB_G - 2048, RCE = OPB_CE - 2048;
-constexpr int RBETA = OPB_BETA - 2048;
-constexpr int FIN_BYTES = T * K * 2 + NCW * T * 4;  // BF16 outputs + per-warp sums of squares
-constexpr int MAX_ITEMS = 32;  // items per CTA (static head-major ranges)
-constexpr int X_AT = S * PG, R_AT = X_AT + NX * X_BYTES, FIN_AT = R_AT + NR * R_BYTES;
-constexpr int SMEM = FIN_AT + 2 * FIN_BYTES;
+constexpr int THREADS = 32 + NC + 96;  // producer, consumers, copier, finishers A / B
+// Operand block (bytes): the per-key part (26 copy blocks of 256 B: TMEM columns 16 q (x of
+// key pair q), 128 + 8 q (D, w0..w2), 192 + 2 q (w3)), then the rest: u FP32 [T][K],
+// v BF16 [T][K], gates BF16 [T][K], couplings FP32 [16], betas FP32 [T].
+constexpr int NCP = 26, TCOLS = 8 * NCP;  // copies / TMEM columns per item
+constexpr int X_BYTES = NCP * 256, R_BYTES = 4176, OPB_BYTES = X_BYTES + R_BYTES;
+constexpr int OPB_FLOATS = OPB_BYTES / 4;
+constexpr int RU = 0, RV = 2048, RG = 3072, RCE = 4096, RBETA = 4160;  // bytes in the rest
+constexpr int DOT_BYTES = K * 8 * 4;  // the consumers' dots of an item: [row][8]
+constexpr int MAX_ITEMS = 32;  // items per CTA
+constexpr int X_AT = S * PG, R_AT = X_AT + NX * X_BYTES, D_AT = R_AT + NR * R_BYTES;
+constexpr int FS_AT = D_AT + 2 * DOT_BYTES, SMEM = FS_AT + 2 * 2 * T * 4;
 
 struct Params {
   float* state; long long slot_stride;  // FP32 words
@@ -197,7 +197,7 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
   const long long total = (long long)p.heads * p.requests;
   int first = (int)(total * blockIdx.x / gridDim.x);
   int count = (int)(total * (blockIdx.x + 1) / gridDim.x) - first;  // <= MAX_ITEMS
-  if (p.order) {  // this SM's share of its die's items (one CTA per SM)
+  if (p.order) {  // this SM's share of its die's items (one CTA per SM; benchmarks)
     unsigned sm;
     asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
     const int e = p.smdie[sm], d = e & 1, r = e >> 1;
@@ -249,52 +249,100 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     return;
   }
   if (tid >= 32 + NC + 32) {  // ------------------------------------- finishers A, B
-    // Finisher A: tokens 0, 1; B: tokens 2, 3 and the R parts (item i + NR once every
-    // reader of item i's slot is done). Per (token, 32-channel block): the gated RMSNorm
-    // from the consumers' sums of squares, then KdaFlow's store_output (warp-collective).
+    // thread (fw, lane) = rows rA = 64 fw + lane, rB = rA + 32 of each item: the token
+    // solve on the consumers' dots, the records, the gated RMSNorm (2-warp sums of
+    // squares) and the outputs (8 per lane, batched: KdaFlow's store_output numerics).
+    // Finisher B also loads the R parts (item i + NR once every reader of i is done).
     asm volatile("griddepcontrol.wait;" ::: "memory");
     const int fw = (tid - 32 - NC - 32) >> 5, lane = tid & 31;
+    const int rA = 64 * fw + lane;
     auto load_r = [&](int jj) {
       if (lane == 0)
         expect_load(sa(smem + R_AT + (size_t)(jj % NR) * R_BYTES),
-                    p.opb + (long long)s_items[jj].item * OPB_FLOATS + 2048, R_BYTES, sa(&rfull[jj % NR]));
+                    (const char*)(p.opb + (long long)s_items[jj].item * OPB_FLOATS) + X_BYTES, R_BYTES,
+                    sa(&rfull[jj % NR]));
     };
     if (fw == 1)
       for (int jj = 0; jj < NR && jj < count; ++jj) load_r(jj);
-    float nw[4];
-#pragma unroll
-    for (int blk = 0; blk < 4; ++blk) nw[blk] = p.norm[32 * blk + lane];
+    const float nwA = p.norm[rA], nwB = p.norm[rA + 32];
+    float* fsum = (float*)(smem + FS_AT);
     for (int i = 0; i < count; ++i) {
       const int fi = i & 1, ri = i % NR;
       const Item fit = s_items[i];
       wait_par(sa(&ffull[fi]), (i >> 1) & 1);
       wait_par(sa(&rfull[ri]), (i / NR) & 1);
-      const unsigned char* fb = smem + FIN_AT + fi * FIN_BYTES;
-      const float* sums = (const float*)(fb + T * K * 2);
-      const __nv_bfloat16* gates = (const __nv_bfloat16*)((const float*)(smem + R_AT + (size_t)ri * R_BYTES) + RG);
-      // 8 independent (token, 32-channel block) outputs per lane, batched stage by stage
-      // (KdaFlow store_output numerics; the batches give the chains ILP 8).
-      float x[8];
+      const unsigned char* rb = smem + R_AT + (size_t)ri * R_BYTES;
+      const float* dots = (const float*)(smem + D_AT + fi * DOT_BYTES);
+      float ce[16], beta[T];
 #pragma unroll
-      for (int tt = 0; tt < 2; ++tt) {
-        const int t = 2 * fw + tt;
-        float sumsq = 0.f;
+      for (int k = 0; k < 4; ++k) {
+        const float4 c4 = ((const float4*)(rb + RCE))[k];
+        ce[4 * k] = c4.x; ce[4 * k + 1] = c4.y; ce[4 * k + 2] = c4.z; ce[4 * k + 3] = c4.w;
+      }
+      {
+        const float4 b4 = *(const float4*)(rb + RBETA);
+        beta[0] = b4.x; beta[1] = b4.y; beta[2] = b4.z; beta[3] = b4.w;
+      }
+      float po[2][T];
 #pragma unroll
-        for (int w = 0; w < NCW; ++w) sumsq += sums[w * T + t];
-        const float rstd = rcp_approx(sqrt_approx(sumsq * (1.0f / 128) + p.eps));
+      for (int h = 0; h < 2; ++h) {
+        const int row = rA + 32 * h;
+        const float4 d0 = ((const float4*)(dots + row * 8))[0], d1 = ((const float4*)(dots + row * 8))[1];
+        const float D[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
+        float u[T];
+        int at = 0;
 #pragma unroll
-        for (int blk = 0; blk < 4; ++blk) {
-          const int c = 32 * blk + lane;
-          const float pg = __bfloat162float(gates[t * K + c]);
-          const float sig = div_full(1.0f, 1.0f + triton_exp(-pg));
-          const float result = __bfloat162float(((const __nv_bfloat16*)fb)[t * K + c]) * rstd * nw[blk] * sig;
-          x[tt * 4 + blk] = __bfloat162float(__float2bfloat16_rn(fit.slot > 0 ? result : 0.f));
+        for (int t = 0; t < T; ++t) {
+          float dot = D[t];
+#pragma unroll
+          for (int s2 = 0; s2 < t; ++s2) dot = fmaf(ce[at + s2], u[s2], dot);
+          const float vt = __bfloat162float(((const __nv_bfloat16*)(rb + RV))[t * K + row]);
+          u[t] = (vt - dot) * beta[t];
+          at += 2 * t + 1;
         }
+        at = 0;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+          float o2 = D[T + t];
+#pragma unroll
+          for (int s2 = 0; s2 <= t; ++s2) o2 = fmaf(ce[at + t + s2], u[s2], o2);
+          po[h][t] = bf16_round(o2);
+          at += 2 * t + 1;
+        }
+        if (fit.slot > 0 && fit.rec >= 0) {
+          float* rec = p.records + (long long)fit.rec * p.rec_stride + (long long)fit.head * p.head_stride + row;
+#pragma unroll
+          for (int t = 0; t < T; ++t) rec[t * K] = u[t];
+        }
+      }
+      float rstd[T];
+#pragma unroll
+      for (int t = 0; t < T; ++t) {
+        float sq = po[0][t] * po[0][t] + po[1][t] * po[1][t];
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, off);
+        if (lane == 0) fsum[(fi * 2 + fw) * T + t] = sq;
+      }
+      asm volatile("bar.sync 2, 64;" ::: "memory");
+#pragma unroll
+      for (int t = 0; t < T; ++t) {
+        const float sumsq = fsum[(fi * 2) * T + t] + fsum[(fi * 2 + 1) * T + t];
+        rstd[t] = rcp_approx(sqrt_approx(sumsq * (1.0f / 128) + p.eps));
+      }
+      const __nv_bfloat16* gates = (const __nv_bfloat16*)(rb + RG);
+      float x[8];  // k = 2 t + h: token t, row rA + 32 h
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const int t = k >> 1, h = k & 1, row = rA + 32 * h;
+        const float pg = __bfloat162float(gates[t * K + row]);
+        const float sig = div_full(1.0f, 1.0f + triton_exp(-pg));
+        const float result = po[h][t] * rstd[t] * (h ? nwB : nwA) * sig;
+        x[k] = __bfloat162float(__float2bfloat16_rn(fit.slot > 0 ? result : 0.f));
       }
       if (!p.mx) {
 #pragma unroll
         for (int k = 0; k < 8; ++k)
-          p.out[(long long)(fit.request * T + 2 * fw + (k >> 2)) * p.out_stride + fit.head * K + 32 * (k & 3) + lane] =
+          p.out[(long long)(fit.request * T + (k >> 1)) * p.out_stride + fit.head * K + rA + 32 * (k & 1)] =
               __float2bfloat16_rn(x[k]);
       } else {
         unsigned amax[8], e[8];
@@ -314,7 +362,7 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
         }
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
-          const int row = fit.request * T + 2 * fw + (k >> 2), column = fit.head * K + 32 * (k & 3) + lane;
+          const int row = fit.request * T + (k >> 1), column = fit.head * K + rA + 32 * (k & 1);
           unsigned word = pack_fp8(q[k], q1[k], q2[k], q3[k]);
           if (word == 0x80000000u) word = 0;
           if ((lane & 3) == 0) *(unsigned*)(p.mx_data + (long long)row * p.mx_stride + column) = word;
@@ -357,16 +405,17 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
       wait_par(sa(&xfull[x]), (j / NX) & 1);
       if (j >= 2) wait_par(sa(&oempty[b]), ((j >> 1) - 1) & 1);
       tm_fence_after();
-      const unsigned src = sa(smem + X_AT + (size_t)x * X_BYTES), dst = 256u * b;
+      // TMEM base 0 (this CTA owns all 512 columns): every copy operand is warp-uniform.
+      const unsigned src = sa(smem + X_AT + (size_t)x * X_BYTES), dst = TCOLS * b;
 #pragma unroll
-      for (int k = 0; k < 32; ++k) tm_cp(dst + 8 * k, cp_desc(src + 256 * k));
+      for (int k = 0; k < NCP; ++k) tm_cp(dst + 8 * k, cp_desc(src + 256 * k));
       tm_commit(sa(&ofull[b]));
       tm_commit(sa(&xdone[x]));
     }
     return;
   }
   // ------------------------------------------------------------------------ consumers
-  asm volatile("griddepcontrol.wait;" ::: "memory");  // records: the prep reads the old ones
+  asm volatile("griddepcontrol.wait;" ::: "memory");  // the state stores after the prep
   const int c = tid - 32, cw = c >> 5, l = c & 31, b = l & 7, q4 = b & 3, hh = (b >> 2) & 1;
   const int r0 = 8 * cw + 2 * (l >> 3);
   const unsigned tq = (32u * ((tid >> 5) & 3)) << 16;
@@ -394,26 +443,28 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     if (l == 0) arrive(sa(&empty[s]));
     STAMP(1)
     wait_par(sa(&rfull[rs]), (j / NR) & 1);
-    const float* ob = (const float*)(smem + R_AT + (size_t)rs * R_BYTES);
     float ut[2][4];
 #pragma unroll
     for (int t = 0; t < T; ++t) {
-      const float2 u = *(const float2*)(ob + RU + t * K + r0);
+      const float2 u = *(const float2*)((const float*)(smem + R_AT + (size_t)rs * R_BYTES + RU) + t * K + r0);
       ut[0][t] = u.x; ut[1][t] = u.y;
     }
+    __syncwarp();
+    if (l == 0) arrive(sa(&rfree[rs]));
     STAMP(2)
     wait_par(sa(&ofull[bq]), (j >> 1) & 1);
-    STAMP(3)
     tm_fence_after();
-    const unsigned tb = tq + 256u * bq;
+    STAMP(3)
+    const unsigned tb = tq + TCOLS * bq;
     float2 acc[2][4];
 #pragma unroll
     for (int h = 0; h < 2; ++h)
 #pragma unroll
       for (int m = 0; m < 4; ++m) acc[h][m] = make_float2(0.f, 0.f);
+    // key pair q: x of both keys at columns 16 q, [D w0 w1 w2] at 128 + 8 q, w3 at 192 + 2 q
     float A[10], B[16];
-    tm_ld8(tb + 16, A);
-    tm_ld2(tb + 24, A + 8);
+    tm_ld8(tb + 128, A);
+    tm_ld2(tb + 192, A + 8);
     tm_wait_ld();
     tm_ld16(tb, B);
 #pragma unroll
@@ -432,8 +483,8 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
       }
       tm_wait_ld();  // B of pair q
       if (q < 7) {
-        tm_ld8(tb + 32 * (q + 1) + 16, A);
-        tm_ld2(tb + 32 * (q + 1) + 24, A + 8);
+        tm_ld8(tb + 128 + 8 * (q + 1), A);
+        tm_ld2(tb + 192 + 2 * (q + 1), A + 8);
       }
 #pragma unroll
       for (int h = 0; h < 2; ++h)
@@ -445,7 +496,7 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
             acc[h][m] = ffma2(make_float2(nv, nv), make_float2(B[8 * kk + 2 * m], B[8 * kk + 2 * m + 1]), acc[h][m]);
         }
       tm_wait_ld();  // A of pair q + 1
-      if (q < 7) tm_ld16(tb + 32 * (q + 1), B);
+      if (q < 7) tm_ld16(tb + 16 * (q + 1), B);
     }
     tm_fence_before();
     __syncwarp();
@@ -457,19 +508,6 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) *(float4*)(g + (r0 + h) * K + q * 32 + b * 4) = v[h][q];
     }
-    const int row = r0 + hh;
-    float ce[16], vt[T], beta[T];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float4 c4 = *(const float4*)(ob + RCE + 4 * i);
-      ce[4 * i] = c4.x; ce[4 * i + 1] = c4.y; ce[4 * i + 2] = c4.z; ce[4 * i + 3] = c4.w;
-    }
-    {
-      const float4 b4 = *(const float4*)(ob + RBETA);
-      beta[0] = b4.x; beta[1] = b4.y; beta[2] = b4.z; beta[3] = b4.w;
-    }
-#pragma unroll
-    for (int t = 0; t < T; ++t) vt[t] = ob[RV + t * K + row];
     STAMP(4)
     // 8-lane transposed butterfly: lane b keeps dots 2 q4 + {0, 1} of row r0 + hh
     float vals[16];
@@ -492,57 +530,11 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
       }
       nn = half;
     }
-    // the row's 8 dots on all 4 lanes of the row
-    const float e0 = __shfl_xor_sync(0xffffffffu, vals[0], 1), e1 = __shfl_xor_sync(0xffffffffu, vals[1], 1);
-    const bool odd = (q4 & 1) != 0, hi = (q4 & 2) != 0;
-    const float f0 = odd ? e0 : vals[0], f1 = odd ? e1 : vals[1], f2 = odd ? vals[0] : e0, f3 = odd ? vals[1] : e1;
-    const float g0 = __shfl_xor_sync(0xffffffffu, f0, 2), g1 = __shfl_xor_sync(0xffffffffu, f1, 2);
-    const float g2 = __shfl_xor_sync(0xffffffffu, f2, 2), g3 = __shfl_xor_sync(0xffffffffu, f3, 2);
-    const float D[8] = {hi ? g0 : f0, hi ? g1 : f1, hi ? g2 : f2, hi ? g3 : f3,
-                        hi ? f0 : g0, hi ? f1 : g1, hi ? f2 : g2, hi ? f3 : g3};
-    // the token solve (KdaFlow.solve): dot_t = A_t + sum_s<t c_ts u_s, u_t = (v_t - dot_t) beta_t,
-    // out_t = B_t + sum_s<=t e_ts u_s (BF16-rounded)
-    float u[T], po[T];
-    int at = 0;
-#pragma unroll
-    for (int t = 0; t < T; ++t) {
-      float dot = D[t];
-#pragma unroll
-      for (int s2 = 0; s2 < t; ++s2) dot = fmaf(ce[at + s2], u[s2], dot);
-      u[t] = (vt[t] - dot) * beta[t];
-      at += t + (t + 1);
-    }
-    at = 0;
-#pragma unroll
-    for (int t = 0; t < T; ++t) {
-      float o2 = D[T + t];
-#pragma unroll
-      for (int s2 = 0; s2 <= t; ++s2) o2 = fmaf(ce[at + t + s2], u[s2], o2);
-      po[t] = bf16_round(o2);
-      at += t + (t + 1);
-    }
-    float mine_u = u[0], mine_o = po[0];
-#pragma unroll
-    for (int t = 1; t < T; ++t) {
-      mine_u = q4 == t ? u[t] : mine_u;
-      mine_o = q4 == t ? po[t] : mine_o;
-    }
-    if (it.slot > 0 && it.rec >= 0)
-      p.records[(long long)it.rec * p.rec_stride + (long long)it.head * p.head_stride + q4 * K + row] = mine_u;
     STAMP(5)
     if (j >= 2) wait_par(sa(&ffree[f]), ((j >> 1) - 1) & 1);
-    unsigned char* fb = smem + FIN_AT + f * FIN_BYTES;
-    ((__nv_bfloat16*)fb)[q4 * K + row] = __float2bfloat16_rn(mine_o);
-    float sq = mine_o * mine_o;
-    sq += __shfl_xor_sync(0xffffffffu, sq, 4);
-    sq += __shfl_xor_sync(0xffffffffu, sq, 8);
-    sq += __shfl_xor_sync(0xffffffffu, sq, 16);
-    if (l < 4) ((float*)(fb + T * K * 2))[cw * T + q4] = sq;
+    *(float2*)((float*)(smem + D_AT + f * DOT_BYTES) + (r0 + hh) * 8 + 2 * q4) = make_float2(vals[0], vals[1]);
     __syncwarp();
-    if (l == 0) {
-      arrive(sa(&ffull[f]));
-      arrive(sa(&rfree[rs]));
-    }
+    if (l == 0) arrive(sa(&ffull[f]));
     STAMP(6)
 #undef STAMP
   }
@@ -638,26 +630,31 @@ def _module():
 
 
 def _core_index():
-    """For each relay block word, the KdaCore block word it copies (unused words: 0)."""
+    """For each relay block word, the KdaCore block word it copies (unused words and
+    the BF16 v words, written by ``from_core`` separately: 0)."""
     index = torch.zeros(OPB_FLOATS, dtype=torch.long)
     for b in range(8):
-        for q in range(8):
-            k0 = 4 * b + 32 * (q // 2) + 2 * (q % 2)
-            cols = [0] * 32
-            for kk in range(2):
-                key = k0 + kk
+        for col in range(26 * 8):
+            if col < 128:
+                q, i = divmod(col, 16)
+                kk, xi = divmod(i, 8)
+            elif col < 192:
+                q, i = divmod(col - 128, 8)
+                kk = i % 2 if i < 2 else (i - 2) % 2
+            else:
+                q, kk = divmod(col - 192, 2)
+            key = 4 * b + 32 * (q // 2) + 2 * (q % 2) + kk
+            if col < 128:
                 chunk, lane_in, e = key // 32, (key // 4) % 8, key % 4
-                for h in range(2):
-                    for i in range(4):
-                        pos = (((chunk * 4 + e) * 2 + h) * 8 + lane_in) * 4 + i
-                        cols[8 * kk + 4 * h + i] = core.X_AT + pos
-                cols[16 + kk] = core.D_AT + key
-                for t in range(T):
-                    cols[18 + 2 * t + kk] = core.W_AT + t * K + key
-            for col in range(26):
-                cp, rem = divmod(32 * q + col, 8)
-                index[cp * 64 + (rem // 4) * 32 + b * 4 + rem % 4] = cols[col]
-    index[OPB_V : OPB_V + T * K] = torch.arange(core.V_AT, core.V_AT + T * K)
+                h, j = divmod(xi, 4)
+                src = core.X_AT + (((chunk * 4 + e) * 2 + h) * 8 + lane_in) * 4 + j
+            elif col < 192 and i < 2:
+                src = core.D_AT + key
+            else:
+                t = (i - 2) // 2 if col < 192 else 3
+                src = core.W_AT + t * K + key
+            cp, rem = divmod(col, 8)
+            index[cp * 64 + (rem // 4) * 32 + b * 4 + rem % 4] = src
     index[OPB_U : OPB_U + T * K] = torch.arange(core.U_AT, core.U_AT + T * K)
     index[OPB_G : OPB_G + T * K // 2] = torch.arange(core.G_AT, core.G_AT + T * K // 2)
     index[OPB_CE : OPB_CE + 16] = torch.arange(core.CE_AT, core.CE_AT + 16)
@@ -674,6 +671,8 @@ def from_core(core_blocks, out):
     if device not in _INDEX:
         _INDEX[device] = _core_index().to(device)
     torch.index_select(core_blocks, 1, _INDEX[device], out=out)
+    v = core_blocks[:, core.V_AT : core.V_AT + T * K].to(torch.bfloat16)  # BF16-exact
+    out.view(torch.bfloat16)[:, 2 * OPB_V : 2 * OPB_V + T * K].copy_(v)
     return out
 
 
