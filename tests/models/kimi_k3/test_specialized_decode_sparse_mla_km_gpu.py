@@ -86,3 +86,27 @@ def test_keys_on_m_matches_trtllm_gen(rows):
                                rtol=0)  # fmt: skip
     assert bool(torch.isneginf(lse_k[empty, :REAL]).all())
     assert bool((lat_k[empty, :REAL] == 0).all())
+
+
+def test_keys_on_m_publish_is_bitwise():
+    """publish (DcpValue's km overlap: dependents triggered at entry, a row's LSE
+    stored after its latent) changes no output bit, rows of two waves included."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_km import (  # noqa: E501
+        sparse_mla_decode_km,
+    )
+
+    rows = 384
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    query, kv, slots, valid = _case(rows, gen)
+    outs = []
+    for publish in (False, True):
+        lat = torch.full((rows, HEADS, 512), 7.0, dtype=torch.bfloat16, device="cuda")
+        lse = torch.full((rows, HEADS), 7.0, dtype=torch.float32, device="cuda")
+        sparse_mla_decode_km(
+            query.view(torch.uint8), kv.view(torch.uint8), slots, valid, lat, lse,
+            BMM1, BMM2, publish=publish,
+        )  # fmt: skip
+        outs.append((lat, lse))
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0][0], outs[1][0])
+    assert torch.equal(outs[0][1], outs[1][1])
