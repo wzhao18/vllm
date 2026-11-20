@@ -1768,6 +1768,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_kernel_extension=shared_kernel_extension,
                 shared_fc1_done_counter_pointer=shared_fc1_done_counter_pointer,
                 shared_fc2_spin_threshold=shared_fc2_spin_threshold,
+                dml_shared_fc1_tma_a_tensor=shared_fc1_tma_a_tensor,
+                dml_shared_fc1_tma_a_atom=shared_fc1_tma_a_atom,
+                dml_shared_fc1_tma_sfa_tensor=shared_fc1_tma_sfa_tensor,
+                dml_shared_fc1_tma_sfa_atom=shared_fc1_tma_sfa_atom,
             )
             DG.put_gt(DG.S_TB1)
             iket.range_pop()

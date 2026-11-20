@@ -53,6 +53,10 @@ from ......common.dsl_helpers import mark_alignment
 from .....helpers.dsl_helpers import ReadyFlag, wait_ready, spin_wait, tma_multicast_mask
 from .....helpers.iket_compat import iket
 from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
+
+# DIAG ONLY (D-MOE-LADDER R6-1): "" = production; "2i" = the TMA-B warp issues the odd shared-FC1 A
+# stages; "nob" = shared FC1 skips the token B/SFB loads after the first ring pass; "2inob" = both.
+_DML_SH_MODE = "2inob"
 from .....helpers.smem_workspace import SmemWorkspace
 from ......common.utils import ceil_div, round_up
 from .....quant_def import QuantKind
@@ -1190,6 +1194,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         # Every weight byte is read once per launch: evict_first keeps the weight stream from
         # evicting the token payload, scale factors and FC1 outputs that later units re-read.
         weight_policy = make_l2_evict_first_policy()
+        # DIAG R6-1 (2i / 2inob): the TMA-B warp issues the odd shared-FC1 A stages.
+        _dml_odd_mask = Int32(0)
+        if cutlass.const_expr(_DML_SH_MODE in ("2i", "2inob")):
+            _dml_odd_mask = Int32(work_tile.phase == Int32(BlockPhase.SharedLinear1))
         _dms_c00 = read_clock64()
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         _dms_w = read_clock64() - _dms_c00
@@ -1204,16 +1212,17 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 _dms_c1 = read_clock64()
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
-            cute.copy(
-                _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask, weight_policy),
-                global_a_slice[(None, k_tile_idx)],
-                partitioned_smem_a[(None, stage_index)],
-            )
-            cute.copy(
-                _bind_tma_issue(sfa_exec_atom, tma_barrier, multicast_mask, weight_policy),
-                global_sfa_slice[(None, k_tile_idx)],
-                partitioned_smem_sfa[(None, stage_index)],
-            )
+            if (_dml_odd_mask & k_tile_idx) == Int32(0):
+                cute.copy(
+                    _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask, weight_policy),
+                    global_a_slice[(None, k_tile_idx)],
+                    partitioned_smem_a[(None, stage_index)],
+                )
+                cute.copy(
+                    _bind_tma_issue(sfa_exec_atom, tma_barrier, multicast_mask, weight_policy),
+                    global_sfa_slice[(None, k_tile_idx)],
+                    partitioned_smem_sfa[(None, stage_index)],
+                )
         DG.put_val_dyn(
             Int32(DG.S_TAW0) + (dms_u & Int32(15)),
             ((read_clock64() - _dms_c00) << Int64(32)) | _dms_w,
@@ -1488,6 +1497,158 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         return ab_pipeline_state
 
     @cute.jit
+    def _dml_issue_sh1_b(
+        self,
+        kind: tuple,
+        b_exec_atom: cute.CopyAtom,
+        sfb_exec_atom: cute.CopyAtom,
+        b_cta_layout: cute.Layout,
+        sfb_cta_layout: cute.Layout,
+        b_multicast_mask,
+        sfb_multicast_mask,
+        a_kind: tuple,
+        a_exec_atom,
+        sfa_exec_atom,
+        a_cta_layout,
+        a_multicast_mask,
+        work_tile,
+        k_tile_count: Int32,
+        ab_pipeline: pipeline.PipelineAsync,
+        ab_pipeline_state: pipeline.PipelineState,
+        token_tx: Int32,
+        dml_n: Int32,
+    ):
+        """DIAG R6-1: the TMA-B warp on a shared-FC1 unit (mode 2i / nob / 2inob)."""
+        (
+            tiled_mma,
+            tiled_mma_sfb,
+            mma_tiler_mnk,
+            mma_tiler_sfb,
+            template_b_tensor,
+            template_b_atom,
+            template_sfb_tensor,
+            template_sfb_atom,
+            b_smem_tensor,
+            sfb_smem_tensor,
+            kernel_extension,
+        ) = kind
+        thread_mma = tiled_mma.get_slice(self.mma_cta_index)
+        thread_mma_sfb = tiled_mma_sfb.get_slice(self.mma_cta_index)
+        real_b, _ = kernel_extension.get_gmem_tensor("b", template_b_tensor, work_tile)
+        real_sfb, _ = kernel_extension.get_gmem_tensor("sfb", template_sfb_tensor, work_tile)
+        if cutlass.const_expr(self.use_2cta_instrs and not self.batch_invariant):
+            if not self.is_leader_cta:
+                load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
+                    valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                )
+                real_b = cute.domain_offset((load_shift, 0, 0), real_b)
+        global_b = cute.local_tile(real_b, cute.slice_(mma_tiler_mnk, (0, None, None)), (None, None, None))
+        global_sfb = cute.local_tile(real_sfb, cute.slice_(mma_tiler_sfb, (0, None, None)), (None, None, None))
+        partitioned_global_b = thread_mma.partition_B(global_b)
+        partitioned_global_sfb = thread_mma_sfb.partition_B(global_sfb)
+        partitioned_smem_b, partitioned_global_b = cpasync.tma_partition(
+            template_b_atom,
+            self.main_vmnk_coord[1],
+            b_cta_layout,
+            cute.group_modes(b_smem_tensor, 0, 3),
+            cute.group_modes(partitioned_global_b, 0, 3),
+        )
+        partitioned_smem_sfb, partitioned_global_sfb = cpasync.tma_partition(
+            template_sfb_atom,
+            self.sfb_vmnk_coord[1],
+            sfb_cta_layout,
+            cute.group_modes(sfb_smem_tensor, 0, 3),
+            cute.group_modes(partitioned_global_sfb, 0, 3),
+        )
+        partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
+        partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
+        global_b_slice = partitioned_global_b[(None, work_tile.tile_n_idx, None, 0)]
+        sfb_tile_n_index = work_tile.tile_n_idx
+        if cutlass.const_expr(mma_tiler_mnk[1] == 64):
+            sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
+        global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
+
+        (
+            a_tiled_mma,
+            a_mma_tiler_mnk,
+            template_a_tensor,
+            template_a_atom,
+            template_sfa_tensor,
+            template_sfa_atom,
+            a_smem_tensor,
+            sfa_smem_tensor,
+            a_kernel_extension,
+        ) = a_kind
+        a_thread_mma = a_tiled_mma.get_slice(self.mma_cta_index)
+        real_a, _ = a_kernel_extension.get_gmem_tensor("a", template_a_tensor, work_tile)
+        real_sfa, _ = a_kernel_extension.get_gmem_tensor("sfa", template_sfa_tensor, work_tile)
+        global_a = cute.local_tile(real_a, cute.slice_(a_mma_tiler_mnk, (None, 0, None)), (None, None, None))
+        global_sfa = cute.local_tile(real_sfa, cute.slice_(a_mma_tiler_mnk, (None, 0, None)), (None, None, None))
+        partitioned_global_a = a_thread_mma.partition_A(global_a)
+        partitioned_global_sfa = a_thread_mma.partition_A(global_sfa)
+        partitioned_smem_a, partitioned_global_a = cpasync.tma_partition(
+            template_a_atom,
+            self.main_vmnk_coord[2],
+            a_cta_layout,
+            cute.group_modes(a_smem_tensor, 0, 3),
+            cute.group_modes(partitioned_global_a, 0, 3),
+        )
+        partitioned_smem_sfa, partitioned_global_sfa = cpasync.tma_partition(
+            template_sfa_atom,
+            self.main_vmnk_coord[2],
+            a_cta_layout,
+            cute.group_modes(sfa_smem_tensor, 0, 3),
+            cute.group_modes(partitioned_global_sfa, 0, 3),
+        )
+        partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
+        partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
+        mma_tile_m = a_kernel_extension.local_tile_m(work_tile) // self.mma_cta_count
+        global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
+        global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
+
+        token_policy = make_l2_evict_last_policy()
+        weight_policy = make_l2_evict_first_policy()
+        empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
+        for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+            # nob: after the first ring pass every slot holds real (stale) token data: skip B/SFB.
+            skip_b = Int32(0)
+            if cutlass.const_expr(_DML_SH_MODE in ("nob", "2inob")):
+                skip_b = Int32(dml_n >= Int32(self.num_ab_pipeline_stages))
+            ab_pipeline.producer_acquire(
+                ab_pipeline_state, empty_status, expected_tx=token_tx * (Int32(1) - skip_b)
+            )
+            tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
+            stage_index = ab_pipeline_state.index
+            ab_pipeline_state.advance()
+            if k_tile_idx + 1 < k_tile_count:
+                empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
+            if skip_b == Int32(0):
+                cute.copy(
+                    _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask, token_policy),
+                    global_b_slice[(None, k_tile_idx)],
+                    partitioned_smem_b[(None, stage_index)],
+                )
+                cute.copy(
+                    _bind_tma_issue(sfb_exec_atom, tma_barrier, sfb_multicast_mask, token_policy),
+                    global_sfb_slice[(None, k_tile_idx)],
+                    partitioned_smem_sfb[(None, stage_index)],
+                )
+            if cutlass.const_expr(_DML_SH_MODE in ("2i", "2inob")):
+                if (k_tile_idx & Int32(1)) == Int32(1):
+                    cute.copy(
+                        _bind_tma_issue(a_exec_atom, tma_barrier, a_multicast_mask, weight_policy),
+                        global_a_slice[(None, k_tile_idx)],
+                        partitioned_smem_a[(None, stage_index)],
+                    )
+                    cute.copy(
+                        _bind_tma_issue(sfa_exec_atom, tma_barrier, a_multicast_mask, weight_policy),
+                        global_sfa_slice[(None, k_tile_idx)],
+                        partitioned_smem_sfa[(None, stage_index)],
+                    )
+            dml_n = dml_n + Int32(1)
+        return ab_pipeline_state, dml_n
+
+    @cute.jit
     def run_tma_b(
         self,
         *,
@@ -1515,6 +1676,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         shared_fc1_done_counter_pointer: Optional[cute.Pointer] = None,
         shared_fc2_spin_threshold: Optional[Int32] = None,
         shared_kernel_extension: Optional[BlockScaledSwapAbFc12Extension] = None,
+        dml_shared_fc1_tma_a_tensor: Optional[cute.Tensor] = None,
+        dml_shared_fc1_tma_a_atom: Optional[cute.CopyAtom] = None,
+        dml_shared_fc1_tma_sfa_tensor: Optional[cute.Tensor] = None,
+        dml_shared_fc1_tma_sfa_atom: Optional[cute.CopyAtom] = None,
     ) -> None:
         """Run the TMA-B warp: token data and scale factors for every phase, structured like ``run_tma_a``."""
         self._check_phase_tma_types("B", (fc2_tma_b_atom,), (shared_fc1_tma_b_atom, shared_fc2_tma_b_atom))
@@ -1566,9 +1731,22 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         routed_shared_b2 = None if self.heterogeneous_shared else shared_fc2_b_exec_atom
         routed_shared_sfb = None if self.heterogeneous_shared else shared_fc1_sfb_exec_atom
         routed_shared_sfb2 = None if self.heterogeneous_shared else shared_fc2_sfb_exec_atom
+        dml_a_mcast = None
+        dml_a_cta_layout = None
+        dml_a_exec = None
+        dml_sfa_exec = None
+        if cutlass.const_expr(_DML_SH_MODE != ""):
+            if cutlass.const_expr(self.is_a_mcast or self.use_2cta_instrs):
+                dml_a_mcast = tma_multicast_mask(
+                    self.cluster_shape_mn, None, self.cta_coord_in_cluster, None, self.use_2cta_instrs, "a"
+                )
+            dml_a_cta_layout = cute.make_layout(cute.slice_(self.cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            dml_a_exec = make_executable_tma_atom_or_pair(dml_shared_fc1_tma_a_atom)
+            dml_sfa_exec = make_executable_tma_atom_or_pair(dml_shared_fc1_tma_sfa_atom)
 
         work_tile = sched_consumer.consume_work()
         _dms_ub = Int32(0)
+        _dml_n = Int32(0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
             is_fc1 = phase == Int32(BlockPhase.Linear1)
@@ -1635,21 +1813,71 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         self.shared_sfb_smem_tensor,
                         shared_kernel_extension,
                     )
-                    ab_pipeline_state = self._issue_tma_b_tile(
-                        shared_kind,
-                        self._select_shared_phase(phase, shared_fc1_b_exec_atom, shared_fc2_b_exec_atom),
-                        self._select_shared_phase(phase, shared_fc1_sfb_exec_atom, shared_fc2_sfb_exec_atom),
-                        b_cta_layout,
-                        sfb_cta_layout,
-                        b_multicast_mask,
-                        sfb_multicast_mask,
-                        work_tile,
-                        k_tile_count,
-                        ab_pipeline,
-                        ab_pipeline_state,
-                        None,
-                        Int32(self.shared_token_tx_count),
-                    )
+                    if cutlass.const_expr(_DML_SH_MODE != ""):
+                        if phase == Int32(BlockPhase.SharedLinear1):
+                            dml_a_kind = (
+                                self.shared_tiled_mma,
+                                self.shared_mma_tiler_mnk,
+                                dml_shared_fc1_tma_a_tensor,
+                                dml_shared_fc1_tma_a_atom,
+                                dml_shared_fc1_tma_sfa_tensor,
+                                dml_shared_fc1_tma_sfa_atom,
+                                self.shared_a_smem_tensor,
+                                self.shared_sfa_smem_tensor,
+                                shared_kernel_extension,
+                            )
+                            ab_pipeline_state, _dml_n = self._dml_issue_sh1_b(
+                                shared_kind,
+                                shared_fc1_b_exec_atom,
+                                shared_fc1_sfb_exec_atom,
+                                b_cta_layout,
+                                sfb_cta_layout,
+                                b_multicast_mask,
+                                sfb_multicast_mask,
+                                dml_a_kind,
+                                dml_a_exec,
+                                dml_sfa_exec,
+                                dml_a_cta_layout,
+                                dml_a_mcast,
+                                work_tile,
+                                k_tile_count,
+                                ab_pipeline,
+                                ab_pipeline_state,
+                                Int32(self.shared_token_tx_count),
+                                _dml_n,
+                            )
+                        else:
+                            ab_pipeline_state = self._issue_tma_b_tile(
+                                shared_kind,
+                                shared_fc2_b_exec_atom,
+                                shared_fc2_sfb_exec_atom,
+                                b_cta_layout,
+                                sfb_cta_layout,
+                                b_multicast_mask,
+                                sfb_multicast_mask,
+                                work_tile,
+                                k_tile_count,
+                                ab_pipeline,
+                                ab_pipeline_state,
+                                None,
+                                Int32(self.shared_token_tx_count),
+                            )
+                    else:
+                        ab_pipeline_state = self._issue_tma_b_tile(
+                            shared_kind,
+                            self._select_shared_phase(phase, shared_fc1_b_exec_atom, shared_fc2_b_exec_atom),
+                            self._select_shared_phase(phase, shared_fc1_sfb_exec_atom, shared_fc2_sfb_exec_atom),
+                            b_cta_layout,
+                            sfb_cta_layout,
+                            b_multicast_mask,
+                            sfb_multicast_mask,
+                            work_tile,
+                            k_tile_count,
+                            ab_pipeline,
+                            ab_pipeline_state,
+                            None,
+                            Int32(self.shared_token_tx_count),
+                        )
                 else:
                     ab_pipeline_state = self._issue_tma_b_tile(
                         routed_kind,
