@@ -254,6 +254,24 @@ def test_stale_ir_value_on_a_kernel_is_keyed_by_type():
     assert _key(k) != _key(_Kernel(1.0))
 
 
+class _PeerMapper:
+    """A launch argument with runtime addresses that declares its trace key."""
+
+    def __init__(self, base, ranks):
+        self.base_address, self.offsets, self.max_ranks = base, tuple(range(ranks)), ranks
+
+    def __cute_cache_key__(self):
+        return self.max_ranks, len(self.offsets)
+
+
+def test_declared_cute_cache_key_replaces_the_attributes():
+    """The MegaMoE peer mapper's workspace address differs per process: keyed by
+    what it declares, two processes share the entry; the rank count still keys."""
+    four = _key(_Kernel(1.0), _PeerMapper(0x7F00, 4))
+    assert four == _key(_Kernel(1.0), _PeerMapper(0x9F00, 4))
+    assert four != _key(_Kernel(1.0), _PeerMapper(0x7F00, 8))
+
+
 def test_fingerprint_functions_closures_cycles():
     def make(n):
         def inner():

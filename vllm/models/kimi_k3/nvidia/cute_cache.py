@@ -320,6 +320,12 @@ class _Fingerprint:
             if " at 0x" in ck:  # an object without a value repr: not a stable description
                 raise _Uncacheable(f"{_qual(t)} cache key {ck[:160]}")
             w(f"DSLArg:{_qual(t)}:{ck}")
+        elif callable(getattr(t, "__cute_cache_key__", None)):
+            # A launch argument that declares its trace-relevant part (e.g. the
+            # MegaMoE SymmetricBufferHost: addresses are runtime fields).
+            w(f"CCK:{_qual(t)}")
+            self._classes(t)
+            self.add(o.__cute_cache_key__())
         elif _qual(t).startswith("cutlass._mlir.") and t.__name__ in _IR_VALUES:
             # An IR value an earlier trace left on a kernel object: it belongs to
             # that trace's finished module and a new trace recomputes it.
