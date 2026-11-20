@@ -50,7 +50,8 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.l2_store_evict_first = "sef" in flags
         # die_sched: clusters claim N tiles of their die's weight half
         # (die-split weights, extra scheduler warp 10).
-        self.die_sched = "die" in flags
+        self.die_sched = any(f.startswith("die") for f in flags)
+        self.die_group = next((int(f[3:]) for f in flags if f.startswith("die") and f[3:].isdigit()), 0)
         # Drain skeletons (microbench only): 1 = drain + release, 2 = + math.
         self.epi_x2 = "x2" in flags
         self.epi_tanh = "tanh" in flags

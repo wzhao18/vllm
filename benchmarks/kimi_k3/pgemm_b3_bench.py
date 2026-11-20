@@ -123,7 +123,7 @@ _DIE_ROWS = {}
 def _die_rows(w, tactic):
     """``w`` for the tactic: a copy with its row halves homed on die 0 / die 1
     for the die-split scheduler (``die`` flag), else ``w`` itself."""
-    if "die" not in str(tactic[7]).split("+"):
+    if not any(f.startswith("die") for f in str(tactic[7]).split("+")):
         return w
     key = (w.data_ptr(), tuple(w.shape))
     if key not in _DIE_ROWS:

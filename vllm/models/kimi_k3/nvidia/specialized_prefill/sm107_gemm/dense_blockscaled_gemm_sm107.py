@@ -1745,6 +1745,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 cluster_shape_mn[1],
                 bidx % cluster_shape_mn[0],
                 bidy % cluster_shape_mn[1],
+                getattr(self, "die_group", 0),
             )
             if warp_idx == self.sched_warp_id:
                 if cta_rank_in_cluster == 0:

@@ -78,7 +78,20 @@ class PrefillSharedSitu:
 
         w, s = self._weight_rows()
         ssg.interleave_gate_up_rows(w, s)
-        self._gemm = ssg.SharedSituGemm(w, s, self.beta, self.linear_beta)
+        tactic = ssg.die_tactic(w)
+        if tactic is not None:
+            # Rows [0, N/2) homed on die 0, [N/2, N) on die 1: each die's
+            # clusters stream their own half (sm107_gemm.die_sched).
+            from .sm107_gemm import die_sched
+
+            lin = self.mlp.gate_up_proj
+            lin.weight.data = die_sched.localize_rows(lin.weight.data)
+            w, s = self._weight_rows()
+            self._gemm = ssg.SharedSituGemm(
+                w, s, self.beta, self.linear_beta, tactic=tactic
+            )
+        else:
+            self._gemm = ssg.SharedSituGemm(w, s, self.beta, self.linear_beta)
         rows = mxfp8_act.SITU_FAST_MIN_ROWS
         x = torch.zeros((rows, w.shape[1]), dtype=torch.float8_e4m3fn, device=w.device)
         sx = torch.full(

@@ -193,8 +193,13 @@ def consume(
     cluster_n: cutlass.Constexpr,
     cta_m: Int32,
     cta_n: Int32,
+    group: cutlass.Constexpr = 0,
 ):
-    """Next claim of this warp: (WorkTileInfo in CTA-tile units, state)."""
+    """Next claim of this warp: (WorkTileInfo in CTA-tile units, state).
+
+    ``group`` N cluster tiles of a die's half are walked per M sweep (0: the
+    whole half): a smaller group keeps less of the die's weight half in its L2
+    at the cost of reading the A rows once per group."""
     sched_pipeline.consumer_wait(cs)
     slots = cute.make_tensor(slot_ptr, cute.make_layout((STAGES * 4,)))
     entry = slots[cs.index * 4]
@@ -212,8 +217,15 @@ def consume(
     if e >= half:
         j = e - half
         n_off = n_half
-    mt = j // n_half
-    nt = n_off + j % n_half
+    if cutlass.const_expr(group == 0):
+        mt = j // n_half
+        nt = n_off + j % n_half
+    else:
+        per_group = (n_tiles // (2 * n_half)) * group
+        grp = j // per_group
+        r = j - grp * per_group
+        mt = r // group
+        nt = n_off + grp * group + r % group
     coord = (mt * cluster_m + cta_m, nt * cluster_n + cta_n, Int32(0))
     return _WorkTileInfo(coord, valid), cs
 
