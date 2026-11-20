@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 # capacity with tuned VR knob records (EP16 NVFP4 i8192 phase-interleave N256), and
 # the FlashInfer SM107 MegaMoE per-token optimum (EP16 NVFP4: 1254 us at 8192 vs
 # 2649 us at 16384 per call).
-PREFILL_MOE_SUBCALL_TOKENS = 8192
+PREFILL_MOE_SUBCALL_TOKENS = 4096
 
 
 @dataclasses.dataclass(frozen=True)
