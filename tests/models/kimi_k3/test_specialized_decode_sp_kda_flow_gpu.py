@@ -193,9 +193,9 @@ def test_flow_mxfp8_output_is_act_quant_of_bf16():
 @pytest.mark.parametrize("mx", [False, True], ids=["bf16", "mxfp8"])
 @pytest.mark.parametrize("n", [3, 33, 96])
 def test_ring_is_bitwise_flow(n, mx):
-    """KdaRing (prep kernel + 512-thread page ring) computes KdaFlow's operations in
-    KdaFlow's order: outputs, checkpoints, conv windows and records bit for bit,
-    over steps that fold pending commits."""
+    """KdaRing (register page stream, prep / tail warps) computes KdaFlow's
+    operations in KdaFlow's order: outputs, checkpoints, conv windows and records
+    bit for bit, over steps that fold pending commits."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (
         Mxfp8Input,
     )
@@ -228,6 +228,9 @@ def test_ring_is_bitwise_flow(n, mx):
         assert core.kinds[rows] == kind
         if mx:
             core.mx_input = Mxfp8Input(rows, DIM, kda.DEVICE)
+            view = core.mx_input.view(rows)  # (padding rows' scales: never written)
+            view.data.zero_()
+            view.scale.zero_()
         core.prepare_caches(caches)
         out = torch.zeros(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE)
         runs.append((layer, core, caches, out))

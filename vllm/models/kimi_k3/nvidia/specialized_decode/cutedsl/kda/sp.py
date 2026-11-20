@@ -185,11 +185,11 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
         if -(-items // ctas) > flow.max_items_per_cta(requests):
             raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
         if kind == "ring":
-            if len(specs) < 23:  # the deferred operands and the operand blocks
-                raise Unsupported("kda", shape, f"KdaRing runs deferred records only ({len(specs)} operands)")
-            if ring.shared_bytes(tokens) > budget:
+            if len(specs) < 19:  # the deferred operands
+                raise Unsupported("kda", shape, "KdaRing runs deferred records only")
+            if ring.shared_bytes(tokens, streamed[1], conv_size) > budget:
                 raise Unsupported("kda", shape, "KdaRing's shared memory does not fit")
-            return ring.KdaRing(heads, tokens, mode, has_bias, *streamed, ctas, items,
+            return ring.KdaRing(heads, tokens, mode, has_bias, *streamed, ctas,
                                 dies="dies" in options, mx="mx" in options)  # fmt: skip
         if kind == "chain":
             if len(specs) != 20:  # with the record rows, pending counts, scratch
@@ -225,24 +225,6 @@ def chain_scratch(device, items, grow=True):
         shape = chain.scratch_shape(items)
         buffer = torch.empty(shape, dtype=torch.float32, device=device)
         _CHAIN_SCRATCH[device] = buffer  # (graphs captured on a smaller one keep it)
-        _CHAIN_RETIRED.append(buffer)
-    return buffer[:items]
-
-
-_RING_SCRATCH: dict = {}
-
-
-def ring_scratch(device, items, tokens, grow=True):
-    """KdaRing's operand blocks for items items: one buffer per device shared by
-    every layer (each layer's prep kernel fills it right before its ring), sized
-    at build."""
-    buffer = _RING_SCRATCH.get(device)
-    shape = ring.scratch_shape(items, tokens)
-    if buffer is None or buffer.shape[0] < items or buffer.shape[1] != shape[1]:
-        if not grow:
-            raise Unsupported("kda", None, f"KdaRing scratch for {items} items")
-        buffer = torch.empty(shape, dtype=torch.float32, device=device)
-        _RING_SCRATCH[device] = buffer  # (graphs captured on a smaller one keep it)
         _CHAIN_RETIRED.append(buffer)
     return buffer[:items]
 
@@ -423,11 +405,6 @@ class SpKdaCore:
                 chain_scratch(self.device, items)  # allocated before any capture
                 scratch = torch.empty(chain.scratch_shape(items), **meta)
                 deferred = (*deferred, scratch)
-            if kind == "ring" and self.mode == "deferred":
-                items = self.heads * n
-                ring_scratch(self.device, items, self.q)  # allocated before any capture
-                scratch = torch.empty(ring.scratch_shape(items, self.q), **meta)
-                deferred = (*deferred, scratch)
             operands = self._operands(caches, projected, slots, out, accepted, deferred)
             specs = tuple(map(layout, operands))
             if kind == "fused_ws" and not fits_fused_ws(specs, self.q, self.device):
@@ -474,9 +451,6 @@ class SpKdaCore:
                 extra = (*extra, mx_out.data.view(torch.uint8), mx_out.scale)
             if self.kinds[rows] == "chain":
                 extra = (*extra, chain_scratch(self.device, self.heads * n, grow=False))
-            if self.kinds[rows] == "ring":
-                scratch = ring_scratch(self.device, self.heads * n, self.q, grow=False)
-                extra = (*extra, scratch)
         slots = slots[:n]
         if slots.stride() != (slots.shape[1], 1):  # e.g. an eager block-table slice
             slots = slots.contiguous()
