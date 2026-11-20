@@ -92,7 +92,7 @@ MX_BLOCK = 128  # OprojPushMx token rows per CTA pair
 
 @cache
 def compile_push_mx(rows_max, k, tp, cap, device):
-    """One OprojPushMx per 128-row token-block count (R is a runtime argument)."""
+    """One ``OprojPushMx`` per 128-row token-block count (R is a runtime argument)."""
     kernel = OprojPushMx(k, rows_max, tp, cap)
     g, f8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN
     e8 = cutlass.Float8E8M0FNU

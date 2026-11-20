@@ -89,14 +89,15 @@ def bar_sync(barrier_id: int, count: int):
 
 
 class OprojPushMx:
-    """One compiled token-block count: K (heads x 128), up to rows_max token rows
-    (R = TP x n, a runtime argument >= TMA_MIN_ROWS), tp row owners, cap rows
-    per sender slot of recv (SpComm.rows_cap / TP). stages K tiles of
-    kt in the operand ring (8 x 24 KB: the mainloop is bound by bytes in flight);
-    iw / ix TMA issuer warps for the weights / the activation."""
+    """One compiled token-block count: K (heads x 128), up to ``rows_max`` token rows
+    (R = TP x n, a runtime argument >= TMA_MIN_ROWS), ``tp`` row owners, ``cap`` rows
+    per sender slot of ``recv`` (``SpComm.rows_cap / TP``). ``stages`` K tiles of
+    ``kt`` in the operand ring (4 x 48 KB: a TMA issuing thread completes at most one
+    ring stage per ~250 ns whatever its bytes, so K tiles of 256 halve the stages);
+    ``iw`` / ``ix`` TMA issuer warps for the weights / the activation."""
 
-    def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 128,
-                 stages: int = 8, iw: int = 1, ix: int = 1):  # fmt: skip
+    def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 256,
+                 stages: int = 4, iw: int = 1, ix: int = 1):  # fmt: skip
         ktiles = k // kt
         tblocks = -(-rows_max // MMA_N)
         if k % kt or ktiles % stages or rows_max > min(512, tp * cap):
@@ -460,3 +461,213 @@ class OprojPushMx:
                 owner = token // n
                 offset = (rank * self.cap + token - owner * n) * WIDTH + column + chunk * 8
                 store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
+
+
+class OprojPushBf16(OprojPushMx):
+    """``OprojPushMx`` for a BF16 o-projection (the DSA layers): the same 2-CTA M256
+    swap-AB tiling and push epilogue with ``kind::f16`` MMAs (FP32 accumulation, one
+    BF16 rounding), no scale factors. ``kt`` is in elements (128 = 256 B per row:
+    48 KB stages, 4 deep)."""
+
+    def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 128,
+                 stages: int = 4, iw: int = 1, ix: int = 1):  # fmt: skip
+        super().__init__(k, rows_max, tp, cap, kt=kt, stages=stages, iw=iw, ix=ix)
+
+    def _mma(self):
+        return sm100_utils.make_trivial_tiled_mma(
+            cutlass.BFloat16, cutlass.BFloat16, OperandMajorMode.K, OperandMajorMode.K,
+            Float32, tcgen05.CtaGroup.TWO, (FEATURES, MMA_N),
+        )  # fmt: skip
+
+    @cute.jit
+    def __call__(self, w_ptr: cute.Pointer, x_ptr: cute.Pointer, peers: cute.Tensor,
+                 rank: Int32, rows: Int32, stream: cuda.CUstream):  # fmt: skip
+        k = self.k
+        bf16 = cutlass.BFloat16
+        a = cute.make_tensor(w_ptr, cute.make_ordered_layout((WIDTH, k, 1), order=(1, 0, 2)))
+        b = cute.make_tensor(x_ptr, cute.make_ordered_layout((rows, k, 1), order=(1, 0, 2)))
+        mma = self._mma()
+        pair_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (mma.thr_id.shape,))
+        a_layout = sm100_utils.make_smem_layout_a(mma, self.tiler, bf16, self.stages)
+        b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, bf16, self.stages)
+        a_one = cute.slice_(a_layout, (None, None, None, 0))
+        b_one = cute.slice_(b_layout, (None, None, None, 0))
+        cs = (2, 1)
+        tma_a, ta = cute.nvgpu.make_tiled_tma_atom_A(
+            sm100_utils.cluster_shape_to_tma_atom_A(cs, mma.thr_id), a, a_one,
+            self.tiler, mma, pair_vmnk.shape,
+        )  # fmt: skip
+        tma_b, tb = cute.nvgpu.make_tiled_tma_atom_B(
+            sm100_utils.cluster_shape_to_tma_atom_B(cs, mma.thr_id), b, b_one,
+            self.tiler, mma, pair_vmnk.shape,
+        )  # fmt: skip
+        self.tx_bytes = 2 * (cute.size_in_bytes(bf16, a_one) + cute.size_in_bytes(bf16, b_one))
+
+        @cute.struct
+        class Storage:
+            full: cute.struct.MemRange[cutlass.Int64, self.stages]
+            empty: cute.struct.MemRange[cutlass.Int64, self.stages]
+            acc_full: cute.struct.MemRange[cutlass.Int64, 1]
+            acc_empty: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_dealloc: cutlass.Int64
+            tmem_hold: cutlass.Int32
+            sA: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(a_layout.outer)], 1024]
+            sB: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(b_layout.outer)], 1024]
+
+        self.storage = Storage
+        self.kernel_bf16(
+            mma, tma_a, ta, tma_b, tb, pair_vmnk, a_layout, b_layout, peers, rank, rows,
+        ).launch(
+            grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[2, 1, 1],
+            stream=stream, use_pdl=True,
+        )  # fmt: skip
+
+    @cute.kernel
+    def kernel_bf16(self, mma: cute.TiledMma, tma_a: cute.CopyAtom, mA: cute.Tensor,
+                    tma_b: cute.CopyAtom, mB: cute.Tensor, pair_vmnk: cute.Layout,
+                    a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
+                    peers: cute.Tensor, rank: Int32, rows: Int32):  # fmt: skip
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        if warp == TMA_WARP:
+            cpasync.prefetch_descriptor(tma_a)
+            cpasync.prefetch_descriptor(tma_b)
+        v = bidx % 2
+        is_leader = v == 0
+        crank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        coord = pair_vmnk.get_flat_coord(crank)
+        pair = bidx // 2
+        mb = pair % self.mblocks
+        tb = pair // self.mblocks
+
+        smem = utils.SmemAllocator()
+        st = smem.allocate(self.storage)
+        ab = pipeline.PipelineTmaUmma.create(
+            barrier_storage=st.full.data_ptr(), num_stages=self.stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=self.tx_bytes, cta_layout_vmnk=pair_vmnk, defer_sync=True,
+        )  # fmt: skip
+        accp = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=st.acc_full.data_ptr(), num_stages=1,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2 * EPI_WARPS),
+            cta_layout_vmnk=pair_vmnk, defer_sync=True,
+        )  # fmt: skip
+        tmem = utils.TmemAllocator(
+            st.tmem_hold.ptr,
+            barrier_for_retrieve=pipeline.NamedBarrier(
+                barrier_id=TMEM_BAR, num_threads=32 * (EPI_WARPS + 1)
+            ),
+            allocator_warp_id=0, is_two_cta=True,
+            two_cta_tmem_dealloc_mbar_ptr=st.tmem_dealloc.ptr, arch="sm_107",
+        )  # fmt: skip
+        pipeline_init_arrive(cluster_shape_mn=(2, 1), is_relaxed=True)
+
+        sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+        sB = st.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
+        a_mask = cpasync.create_tma_multicast_mask(pair_vmnk, coord, mcast_mode=2)
+        b_mask = cpasync.create_tma_multicast_mask(pair_vmnk, coord, mcast_mode=1)
+        gA = cute.local_tile(mA, cute.slice_(self.tiler, (None, 0, None)), (None, None, None))
+        gB = cute.local_tile(mB, cute.slice_(self.tiler, (0, None, None)), (None, None, None))
+        thr = mma.get_slice(v)
+        tCgA = thr.partition_A(gA)
+        tCgB = thr.partition_B(gB)
+        a_cta = cute.make_layout(cute.slice_(pair_vmnk, (0, 0, None, 0)).shape)
+        b_cta = cute.make_layout(cute.slice_(pair_vmnk, (0, None, 0, 0)).shape)
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_a, coord[2], a_cta, cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3)
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_b, coord[1], b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3)
+        )
+        tCrA = mma.make_fragment_A(sA)
+        tCrB = mma.make_fragment_B(sB)
+        acc_shape = mma.partition_shape_C(self.tiler[:2])
+        acc_fake = mma.make_fragment_C(cute.append(acc_shape, 1))
+        pipeline_init_wait(cluster_shape_mn=(2, 1))
+        cute.arch.griddepcontrol_launch_dependents()
+
+        rot = (mb * 7) % self.ktiles
+        if warp >= TMA_WARP and warp < self.x_warp:
+            iw = warp - TMA_WARP
+            gA_s = tAgA[(None, mb, None, 0)]
+            prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
+            for _ in cutlass.range(iw, unroll=1):
+                prod.advance()
+            for t in cutlass.range(iw, self.ktiles, self.iw, unroll=1):
+                kk = (t + rot) % self.ktiles
+                ab.producer_acquire(prod)
+                bar = ab.producer_get_barrier(prod)
+                cute.copy(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)],
+                          tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
+                for _ in cutlass.range_constexpr(self.iw):
+                    prod.advance()
+            if iw == 0:
+                tail = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.stages
+                )
+                for _ in cutlass.range(self.ktiles, unroll=1):
+                    tail.advance()
+                ab.producer_tail(tail)
+
+        if warp >= self.x_warp and warp < self.x_warp + self.ix:
+            ix = warp - self.x_warp
+            gB_s = tBgB[(None, tb, None, 0)]
+            xs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
+            for _ in cutlass.range(ix, unroll=1):
+                xs.advance()
+            cute.arch.griddepcontrol_wait()
+            for t in cutlass.range(ix, self.ktiles, self.ix, unroll=1):
+                kk = (t + rot) % self.ktiles
+                ab.sync_object_empty.wait(xs.index, xs.phase)
+                bar = ab.producer_get_barrier(xs)
+                cute.copy(tma_b, gB_s[(None, kk)], tBsB[(None, xs.index)],
+                          tma_bar_ptr=bar, mcast_mask=b_mask)  # fmt: skip
+                for _ in cutlass.range_constexpr(self.ix):
+                    xs.advance()
+
+        if warp == MMA_WARP:
+            tmem.wait_for_alloc()
+            acc_ptr = tmem.retrieve_ptr(Float32)
+            tAcc = cute.make_tensor(acc_ptr, acc_fake.layout)
+            cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stages)
+            accs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+            if is_leader:
+                accp.producer_acquire(accs)
+            rounds = self.ktiles // self.stages
+            nkb = cute.size(tCrA, mode=[2])
+            for tt in cutlass.range(rounds, unroll=1):
+                for s in cutlass.range_constexpr(self.stages):
+                    if is_leader:
+                        ab.consumer_wait(cons)
+                        for kb in cutlass.range_constexpr(nkb):
+                            if cutlass.const_expr(s == 0 and kb == 0):
+                                mma.set(tcgen05.Field.ACCUMULATE, tt != 0)
+                            else:
+                                mma.set(tcgen05.Field.ACCUMULATE, True)
+                            cute.gemm(
+                                mma, tAcc[(None, 0, 0, 0)], tCrA[(None, 0, kb, s)],
+                                tCrB[(None, 0, kb, s)], tAcc[(None, 0, 0, 0)],
+                            )  # fmt: skip
+                        ab.consumer_release(cons)
+                    cons.advance()
+            if is_leader:
+                accp.producer_commit(accs)
+            accs.advance()
+            accp.producer_tail(accs)
+
+        if warp < EPI_WARPS:
+            tmem.allocate(TMEM_COLS)
+            tmem.wait_for_alloc()
+            acc_ptr = tmem.retrieve_ptr(Float32)
+            cute.arch.griddepcontrol_wait()  # (owner slots written after the producers)
+            accc = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+            accp.consumer_wait(accc)
+            self._push(acc_ptr, peers, rank, rows, mb, tb, v, st.sA.data_ptr().toint(), warp,
+                       tidx)  # fmt: skip
+            with cute.arch.elect_one():
+                accp.consumer_release(accc)
+            tmem.relinquish_alloc_permit()
+            tmem.free(acc_ptr)

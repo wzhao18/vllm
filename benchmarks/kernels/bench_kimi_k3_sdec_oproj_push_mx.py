@@ -60,10 +60,13 @@ def sanitize(t):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", default="128,256,384")
-    ap.add_argument("--variants", default="s8i1x1")
+    ap.add_argument("--variants", default="s4i1x1")
     ap.add_argument("--copies", type=int, default=12, help="weight copies (> L2)")
     ap.add_argument("--rank", type=int, default=1)
+    ap.add_argument("--bf16", action="store_true", help="OprojPushBf16 vs torch.mm")
     args = ap.parse_args()
+    if args.bf16:
+        return main_bf16(args)
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
@@ -112,10 +115,11 @@ def main():
         print(f"R{rows} scaled_mm {t_stock:.2f} us/call ({len(ws)} weight copies)",
               flush=True)  # fmt: skip
         for var in args.variants.split(","):
-            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)", var)
-            stages, iw, ix = (int(g) for g in m.groups())
+            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)(t\d+)?", var)
+            stages, iw, ix = (int(g) for g in m.groups()[:3])
+            kt = int(m.group(4)[1:]) if m.group(4) else 256
             try:
-                kern = OprojPushMx(K, rows, TP, CAP, stages=stages, iw=iw, ix=ix)
+                kern = OprojPushMx(K, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix)
 
                 def ptrs(w):
                     return (
@@ -152,6 +156,83 @@ def main():
                 print(f"  {var}: {t:.2f} us/call (scaled_mm {t_stock:.2f})", flush=True)
             except Exception as e:  # report and go on with the next variant
                 print(f"  {var}: FAILED {type(e).__name__}: {str(e)[:300]}", flush=True)
+
+
+def main_bf16(args):
+    """OprojPushBf16 (the BF16 DSA o-projection) vs torch.mm (stock's cuBLAS)."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj.push_mx import (
+        OprojPushBf16,
+    )
+
+    dev = torch.device("cuda", 0)
+    torch.manual_seed(0)
+    ws = [torch.randn(WIDTH, K, device=dev, dtype=torch.bfloat16) * 0.05
+          for _ in range(max(1, args.copies // 2))]  # fmt: skip
+    g = cute.AddressSpace.gmem
+    bf = cutlass.BFloat16
+    recv = torch.empty(TP, TP, CAP, WIDTH, device=dev, dtype=torch.bfloat16)
+    peers = torch.tensor([recv[o].data_ptr() for o in range(TP)], dtype=torch.int64,
+                         device=dev)  # fmt: skip
+    peers_c = to_cute(peers)
+    rank = args.rank
+    for rows in [int(r) for r in args.rows.split(",")]:
+        n = rows // TP
+        x = torch.randn(rows, K, device=dev, dtype=torch.bfloat16)
+        ref = torch.mm(x, ws[0].t())
+        outs = [torch.empty(rows, WIDTH, device=dev, dtype=torch.bfloat16) for _ in ws]
+
+        def stock(i=[0]):
+            j = i[0] % len(ws)
+            i[0] += 1
+            torch.mm(x, ws[j].t(), out=outs[j])
+
+        t_stock = graph_time(stock)
+        print(f"BF16 R{rows} torch.mm {t_stock:.2f} us/call ({len(ws)} weight copies)",
+              flush=True)  # fmt: skip
+        for var in args.variants.split(","):
+            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)(t\d+)?", var)
+            stages, iw, ix = (int(g) for g in m.groups()[:3])
+            kt = int(m.group(4)[1:]) if m.group(4) else 128
+            try:
+                kern = OprojPushBf16(K, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix)
+                ri = cutlass.Int32(rows)
+
+                def ptrs(w):
+                    return (make_ptr(bf, w.data_ptr(), g, assumed_align=16),
+                            make_ptr(bf, x.data_ptr(), g, assumed_align=16))  # fmt: skip
+
+                fn = cute.compile(kern, *ptrs(ws[0]), peers_c, cutlass.Int32(rank), ri,
+                                  stream(dev))  # fmt: skip
+                recv.view(torch.int32).fill_(-0x80000000)
+                fn(*ptrs(ws[0]), peers_c, cutlass.Int32(rank), ri, stream(dev))
+                torch.cuda.synchronize()
+                got = torch.stack([recv[o, rank, :n] for o in range(TP)]).view(rows, WIDTH)
+                want = sanitize(ref)
+                same = (got.view(torch.int16) == want.view(torch.int16)).float().mean().item()
+                err = ((got.float() - ref.float()).abs().max()
+                       / ref.float().abs().max()).item()  # fmt: skip
+                print(f"  bf16 {var}: bitwise-equal {same * 100:.3f}% max rel err "
+                      f"{err:.2e}", flush=True)  # fmt: skip
+                cargs = [ptrs(w) for w in ws]
+
+                def mine(i=[0]):
+                    j = i[0] % len(ws)
+                    i[0] += 1
+                    fn(*cargs[j], peers_c, cutlass.Int32(rank), ri, stream(dev))
+
+                t = graph_time(mine)
+                print(f"  bf16 {var}: {t:.2f} us/call (torch.mm {t_stock:.2f})", flush=True)
+            except Exception as e:  # report and go on with the next variant
+                print(f"  bf16 {var}: FAILED {type(e).__name__}: {str(e)[:300]}",
+                      flush=True)  # fmt: skip
 
 
 if __name__ == "__main__":
