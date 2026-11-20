@@ -42,7 +42,9 @@ def core_of(kind, attention, rows, records, caches):
 
 
 @pytest.mark.parametrize(
-    "kind", ["flow", "chain", "flow-local"], ids=["flow", "chain", "flow_die_local"]
+    "kind",
+    ["flow", "chain", "flow-local", "ring", "ring-local"],
+    ids=["flow", "chain", "flow_die_local", "ring", "ring_die_local"],
 )
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
@@ -186,3 +188,78 @@ def test_flow_mxfp8_output_is_act_quant_of_bf16():
     where = where + (r >> 7) * (128 * (DIM // 32))
     mismatch = (got.scale[where] != want.scale[where]).sum().item()
     assert mismatch == 0, f"{mismatch} scale bytes differ"
+
+
+@pytest.mark.parametrize("mx", [False, True], ids=["bf16", "mxfp8"])
+@pytest.mark.parametrize("n", [3, 33, 96])
+def test_ring_is_bitwise_flow(n, mx):
+    """KdaRing (prep kernel + 512-thread page ring) computes KdaFlow's operations in
+    KdaFlow's order: outputs, checkpoints, conv windows and records bit for bit,
+    over steps that fold pending commits."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (
+        Mxfp8Input,
+    )
+
+    sp.executable.cache_clear()
+    rows, slots = Q * n, 2 * n + 2
+    kv = kda.caches(slots)
+    _, metadata = kda.step(n, slots)
+    record_rows = torch.randperm(MAX_REQS, generator=torch.Generator().manual_seed(4))
+    record_rows = record_rows[:n].to(torch.int32).to(kda.DEVICE)
+    pending = torch.zeros(MAX_REQS, dtype=torch.int32, device=kda.DEVICE)
+    deferred = kda.Module(
+        **vars(metadata),
+        recoverssm_deferred=kda.Module(
+            record_rows=record_rows, pending=pending, flush=None
+        ),
+    )
+    runs = []
+    for kind in ("flow", "ring"):
+        layer = kda.layer()  # the same weights, their own records
+        layer.deferred_recoverssm = True
+        caches = [t.clone() for t in kv]
+        saved = dict(sp.RECORD_KINDS)
+        sp.RECORD_KINDS[HEADS] = f"1-:{kind}"
+        try:
+            core = sp.SpKdaCore(layer, (rows,), records="deferred", ctx=kda.context())
+        finally:
+            sp.RECORD_KINDS.clear()
+            sp.RECORD_KINDS.update(saved)
+        assert core.kinds[rows] == kind
+        if mx:
+            core.mx_input = Mxfp8Input(rows, DIM, kda.DEVICE)
+        core.prepare_caches(caches)
+        out = torch.zeros(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE)
+        runs.append((layer, core, caches, out))
+    index = record_rows.long()
+    for step in range(STEPS):
+        projected = kda.step(n, slots, seed=100 + step)[0]
+        got = []
+        for layer, core, caches, out in runs:
+            result = core.run(projected, out, caches=caches, metadata=deferred)
+            if mx:
+                got.append(
+                    (
+                        result.data.view(torch.int32).clone(),
+                        result.scale.to(torch.int32),
+                    )
+                )
+            else:
+                got.append((result.clone(),))
+        torch.cuda.synchronize()
+        where = f"step {step}"
+        (fl, _, fc, _), (rl, _, rc, _) = runs
+        for k, (r, f) in enumerate(zip(got[1], got[0])):
+            kda.assert_bitwise(f"{where} output {k}", r, f)
+        kda.assert_bitwise(f"{where} checkpoints", rc[1], fc[1])
+        kda.assert_bitwise(f"{where} conv window", rc[0], fc[0])
+        kda.assert_bitwise(f"{where} corrections",
+                           rl.recoverssm_records.correction[index],
+                           fl.recoverssm_records.correction[index])  # fmt: skip
+        kda.assert_bitwise(f"{where} key / gate",
+                           rl.recoverssm_records.key_gate[index],
+                           fl.recoverssm_records.key_gate[index])  # fmt: skip
+        accepted = accepted_counts(n, step)
+        pending.zero_()
+        pending[index] = accepted
+    sp.executable.cache_clear()
