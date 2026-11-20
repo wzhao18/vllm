@@ -72,7 +72,8 @@ struct Params {
   float* part;       // [grid][n][128] FP32 split-K partials
   unsigned* cnt;     // [2 kLine] CTAs finished, [kTileCnt + kLine t] partials stored of tile t
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
-  int kb, rtiles, ks, ns, xs, xg, na, nt_max, nr_max, yfull;  // xs: token op slots of xg blocks
+  int kb, rtiles, ks, ns, xs, xg, na, nt_max, nr_max, yfull;
+  int dcol, acol;  // TMEM columns of D [n] and of the first weight K block  // xs: token op slots of xg blocks
   int debug;  // microbench only (0 in production): bit 0 skips the MMAs
 };
 
@@ -317,7 +318,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       if (lane == 0 && i < 32) STAMP(32 + i);
       const uint64_t src = smem_desc(ring_s + slot * kSlot);
 #pragma unroll
-      for (int kk = 0; kk < 4; ++kk) cp_el(tmem + p.na + 32 * i + 8 * kk, src + 2 * kk);
+      for (int kk = 0; kk < 4; ++kk) cp_el(tmem + p.acol + 32 * i + 8 * kk, src + 2 * kk);
       // tcgen05.commit stalls the issuing thread's tensor pipe (measured ~0.25 us per
       // K block with a commit each): commit only where a consumer needs it.
       if (i + p.ns < nt) commit_el(empty0 + 8 * slot);
@@ -342,11 +343,11 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       } else if (j < nt) {
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk)
-          mma_ts(tmem, tmem + p.na + 32 * j + 8 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
+          mma_ts(tmem + p.dcol, tmem + p.acol + 32 * j + 8 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
       } else {
         const uint64_t a0 = smem_desc(res_s + (j - nt) * kSlot);
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) mma_ss(tmem, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
+        for (int kk = 0; kk < 4; ++kk) mma_ss(tmem + p.dcol, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
       }
       if ((j % p.xg == p.xg - 1 || j == nk - 1) && (g + p.xs) * p.xg < nk)
         commit_el(xempty0 + 8 * gs);
@@ -360,7 +361,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     if (threadIdx.x == 128) STAMP(7);
     asm volatile("tcgen05.fence::after_thread_sync;");
     const int q = warp & 3, row = q * 32 + lane;
-    const uint32_t ta = tmem + (static_cast<uint32_t>(q * 32) << 16);
+    const uint32_t ta = tmem + p.dcol + (static_cast<uint32_t>(q * 32) << 16);
     float* dst = p.part + int64_t{blockIdx.x} * n * 128 + row;
     for (int c = 0; c < n; c += 16) {
       float v[16];
@@ -577,7 +578,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                   sf.size(1) >= hidden / vec && x.stride(0) % 16 == 0 &&
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
               "moe_front: session shapes");
-  const Plan pl = plan_for((int)n, (int)kb, (int)ks, (int)ns);
+  const Plan pl = plan_for((int)n, (int)kb, (int)ks, (int)(ns & 255));
   int dev = h.get_device(), sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   TORCH_CHECK(ks >= 1 && ks <= kMaxKs && ks <= kb && grid >= n && grid <= sms && pl.nr_max <= kMaxR &&
@@ -628,6 +629,10 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.ks = (int)ks;
   p.ns = pl.ns;
   p.na = pl.na;
+  // ns bits 8+: TMEM layout (0: D in the first columns, 1: D in the last columns).
+  const bool dtop = (ns >> 8) & 1;
+  p.dcol = dtop ? 512 - pl.na : 0;
+  p.acol = dtop ? 0 : pl.na;
   p.nt_max = pl.nt_max;
   p.nr_max = pl.nr_max;
   p.xs = pl.xs;
@@ -659,7 +664,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
 
 // (ring slots, shared-memory weight K blocks, dynamic smem bytes) at this shape.
 std::vector<int64_t> moe_front_plan(int64_t n, int64_t k, int64_t ks, int64_t ns) {
-  const k3front::Plan pl = k3front::plan_for((int)n, (int)(k / 64), (int)ks, (int)ns);
+  const k3front::Plan pl = k3front::plan_for((int)n, (int)(k / 64), (int)ks, (int)(ns & 255));
   return {pl.ns, pl.nr_max, pl.smem, pl.xs};
 }
 
