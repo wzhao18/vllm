@@ -123,3 +123,62 @@ def test_contiguous_rows_bytes():
         y = contiguous_rows(x)
         assert y.is_contiguous() and y.dtype == x.dtype and y.shape == x.shape
         assert torch.equal(y.view(torch.int16), x.contiguous().view(torch.int16))
+
+
+
+def test_fused_in_proj_never_captured(monkeypatch):
+    """The fused in_proj + conv reads this step's KDA metadata (sequence count,
+    has_initial_state, conv state rows), so it must not be baked into a CUDA
+    graph: for a prefill-only batch of MIN_ROWS rows (the largest piecewise
+    capture size) under stream capture, fused() leaves the batch to the stock
+    in_proj (whose conv runs in the eager KDA break) and launches nothing;
+    outside capture the same batch takes the fused GEMM, unless the step
+    exports a prefill checkpoint (its conv state = raw q|k|v rows)."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_conv_in_proj
+
+    calls = []
+
+    def _gemm(*args, **kwargs):
+        calls.append(torch.cuda.is_current_stream_capturing())
+        raise StopIteration
+
+    dev = "cuda"
+    md = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=0,
+        num_spec_decodes=0,
+        non_spec_query_start_loc=torch.tensor([0, 2048], dtype=torch.int32, device=dev),
+        non_spec_state_indices_tensor=torch.ones(1, dtype=torch.int32, device=dev),
+        has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
+        checkpoint=None,
+    )
+    monkeypatch.setattr(
+        kda_conv_in_proj,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"kda": md}),
+    )
+    fused = kda_conv_in_proj.PrefillKdaConvInProj.__new__(
+        kda_conv_in_proj.PrefillKdaConvInProj
+    )
+    fused._gemm = _gemm
+    fused.layer = SimpleNamespace(
+        prefix="kda", kv_cache=[torch.zeros(2, 3, 768, device=dev)]
+    )
+    rows = kda_conv_in_proj.MIN_ROWS
+    qa = SimpleNamespace(
+        data=torch.zeros(rows, 128, device=dev).to(torch.float8_e4m3fn),
+        scale=torch.zeros(rows * 4, dtype=torch.uint8, device=dev),
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert fused.fused(qa) is None
+    assert calls == []
+    with pytest.raises(StopIteration):
+        fused.fused(qa)
+    assert calls == [False]
+    # A step that exports a prefill checkpoint needs the raw q|k|v rows (stock).
+    md.checkpoint = object()
+    assert fused.fused(qa) is None
+    assert calls == [False]

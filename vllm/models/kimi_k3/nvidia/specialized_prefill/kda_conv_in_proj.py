@@ -92,12 +92,20 @@ class PrefillKdaConvInProj:
         self._gemm(x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID)
 
     def fused(self, qa):
-        """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta)`` for a
-        prefill-only batch of at least ``MIN_ROWS`` rows, else None."""
+        """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta)`` for an
+        eager prefill-only batch of at least ``MIN_ROWS`` rows that exports no
+        prefill checkpoint, else None (stock in_proj + conv)."""
         gemm = self._gemm
         assert gemm is not None, "PrefillKdaConvInProj.prepare() not run"
         rows = qa.data.shape[0]
-        if rows < MIN_ROWS:
+        if rows < MIN_ROWS or torch.cuda.is_current_stream_capturing():
+            # Not inside a CUDA graph: the GEMM's sequence count (grid and
+            # epilogue scan), the has_initial_state tensor and the conv state
+            # rows come from this step's metadata, which a graph would freeze
+            # at capture (a piecewise graph replayed for a later prefill read
+            # and wrote conv state rows of the capture batch: illegal address
+            # on the first prefix-hit prefill). The stock in_proj is captured
+            # instead and the conv runs in the eager KDA break (_forward).
             return None
         md = get_forward_context().attn_metadata
         if not isinstance(md, dict):
@@ -108,6 +116,11 @@ class PrefillKdaConvInProj:
             or m.num_prefills == 0
             or m.num_decodes != 0
             or m.num_spec_decodes != 0
+            # A prefill checkpoint (prefix-cache snapshot) stores the raw
+            # q|k|v inputs before its offset as the conv state; the fused GEMM
+            # never materializes them (the checkpoint exporter would read the
+            # convolved planes as raw rows: wrong state, out-of-bounds rows).
+            or m.checkpoint is not None
         ):
             return None
         from vllm.model_executor.layers.mamba.mamba_utils import (
