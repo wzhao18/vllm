@@ -178,6 +178,19 @@ def _multicast_bulk(dst, src, size):
 
 
 @asm()
+def bulk_put(dst, src, size):
+    """Shared -> one (peer) global address bulk copy (TMA-class NVLink writes; open
+    bulk group: ``bulk_commit`` after the last one)."""
+    code = "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    return code, "l,r,r,~{memory}", (Int64(dst), src, Int32(size))
+
+
+@asm()
+def bulk_commit():
+    return "cp.async.bulk.commit_group;", "~{memory}", ()
+
+
+@asm()
 def _bulk_commit():
     return "cp.async.bulk.commit_group;", "~{memory}", ()
 

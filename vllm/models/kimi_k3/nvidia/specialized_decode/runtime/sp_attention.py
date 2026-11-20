@@ -479,11 +479,6 @@ class SpStep:
             )  # fmt: skip
             for d in layers
         }
-        # Each reduce also computes the next layer's gather statistics (pre) under
-        # its NVLink hop (``SpBoundary.link``; state scratch slots alternate).
-        order = [d.layer_idx for d in layers]
-        for i, (a, b) in enumerate(zip(order, order[1:])):
-            self.bounds[a].link(self.bounds[b], (i + 1) % 2)
         self.table = self.plan_coverage()
         self.table.assert_complete(rows)
         if ctx.rank == 0:

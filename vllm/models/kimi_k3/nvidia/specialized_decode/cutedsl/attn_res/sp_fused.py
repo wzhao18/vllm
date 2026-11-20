@@ -46,7 +46,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ..common import mx_rows
 from ..common.host import architecture, dynamic_fake, fake
 from ..common.mailbox import poll, rearm
-from ..common.primitives import at, launch, load_words, store_relaxed
+from ..common.primitives import alloc, at, launch, load_words, store_relaxed
 from ..common.sp_comm import positive_zero32
 from .kernel import ClusterAttnRes
 
@@ -160,7 +160,11 @@ class SpReduceAttnRes(ClusterAttnRes):
     ``push``), the owners' receive bases [TP] (int64), rank, the local gather view."""
 
     def __init__(self, nb, tp, *, has_delta, push, gather_mx=False, out_mx=False,
-                 stamps=False, next_nb=-1, **options):  # fmt: skip
+                 stamps=False, next_nb=-1, bulk=False, **options):  # fmt: skip
+        # ``bulk`` (with ``push``): the CTA's 2 KB partial chunk per owner is staged
+        # in shared memory and sent by ONE bulk copy per owner (TMA-class NVLink
+        # writes) instead of one 16-byte store per lane and owner.
+        self.bulk_push = bulk and push
         # ``gather_mx``: this layer's all-gather was MXFP8 (re-arm that layout; the
         # last arg is then (local data, local scales)). ``out_mx``: also store the
         # output row as MXFP8 for the MXFP8 projection that reads it (``output`` is
@@ -208,12 +212,33 @@ class SpReduceAttnRes(ClusterAttnRes):
         tid, _, _ = cute.arch.thread_idx()
         n = prefix.shape[0]
         col = (part * 128 + tid) * 8
-        bufs = self.setup(cutlass.utils.SmemAllocator())
+        smem = cutlass.utils.SmemAllocator()
+        bufs = self.setup(smem)
+        if cutlass.const_expr(self.bulk_push):
+            staging = alloc(smem, cutlass.Uint32, (self.tp, 512), align=128)
         cute.arch.cluster_arrive_relaxed()
         cute.arch.griddepcontrol_launch_dependents()
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (part, token, tid)
-        if cutlass.const_expr(self.push):
+        if cutlass.const_expr(self.bulk_push):
+            cute.arch.griddepcontrol_wait()  # the o-projection partial is complete
+            self.mark(2)
+            cap = ring.shape[1]
+            for o in cutlass.range_constexpr(self.tp):
+                words = load_words(at(partial, o * n + token, col), count=4)
+                for k in cutlass.range_constexpr(4):
+                    staging[o, tid * 4 + k] = positive_zero32(words[k])
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier(barrier_id=1, number_of_threads=THREADS)
+            if tid == 0:
+                for o in cutlass.range_constexpr(self.tp):
+                    offset = Int64((rank * cap + token) * 7168 + part * 1024) * 2
+                    mx_rows.bulk_put(
+                        Int64(peers[o]) + offset, staging.iterator + o * 512, 2048
+                    )
+                mx_rows.bulk_commit()
+            self.mark(3)
+        elif cutlass.const_expr(self.push):
             # Push this rank's o-projection partial rows first and run the saved-block
             # statistics (pre) while they are in flight: pre only reads rows complete at
             # launch, so it hides under the NVLink hop instead of delaying the push.
@@ -245,6 +270,9 @@ class SpReduceAttnRes(ClusterAttnRes):
             for o in cutlass.range_constexpr(self.tp):
                 rearm(at(gather, o * n + token, col))
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.bulk_push):
+            if tid == 0:  # the staging shared memory outlives the bulk reads
+                mx_rows.bulk_wait_read()
         self.mark(6)
 
 
@@ -326,12 +354,12 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, stamp
 
 @cache
 def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
-                   out_mx=False, stamps=False, next_nb=-1):  # fmt: skip
+                   out_mx=False, stamps=False, next_nb=-1, bulk=False):  # fmt: skip
     """``SpReduceAttnRes`` for a layer key at any n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpReduceAttnRes(
             nb, tp, has_delta=has_delta, push=push, gather_mx=gather_mx,
-            out_mx=out_mx, stamps=stamps, next_nb=next_nb,
+            out_mx=out_mx, stamps=stamps, next_nb=next_nb, bulk=bulk,
             min_blocks=_co_resident(n_max, device),
             **_options(device),
         )  # fmt: skip
@@ -372,7 +400,7 @@ class SpBoundary:
 
     def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False,
                  gather_mx=False, out_mx=None, stamps=False, unicast=False,
-                 bulk=False):  # fmt: skip
+                 bulk=True):  # fmt: skip
         from ..common.host import to_cute
 
         self.comm, self.nb, self.write = comm, nb, write
@@ -409,7 +437,7 @@ class SpBoundary:
         for push in sorted({bool(p) for p in push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(
                 nb + int(block), not block, push, tp, cap, n_max, device,
-                gather_mx, out_mx is not None, stamps,
+                gather_mx, out_mx is not None, stamps, bulk=bulk,
             )  # fmt: skip
         self.push_rows = push_rows  # R -> the reduce kernel pushes the partial
         self.n_max, self.first = n_max, first
@@ -439,7 +467,7 @@ class SpBoundary:
         for push in sorted({bool(p) for p in self.push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(
                 nb, not block, push, tp, cap, self.n_max, device, self.gather_mx,
-                self.out_mx is not None, self.stamps, nb,
+                self.out_mx is not None, self.stamps, nb, bulk=self.bulk,
             )  # fmt: skip
         self.next_args = (*nxt.pre_w[:2], nxt.pre_eps[0], view)
         nxt.codes[("pre", True)] = compile_gather(
