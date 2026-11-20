@@ -28,7 +28,7 @@ def test_proj_rows_scaled_mm_bitwise(tokens):
     if not _two_dies():
         pytest.skip("single-die device")
     dev = torch.device("cuda")
-    k, n = 1024, 1568
+    k, n = 1024, 1664
     g = torch.Generator(device=dev).manual_seed(0)
     x = torch.randint(-3, 4, (tokens, k), device=dev, generator=g).float()
     w = torch.randint(-3, 4, (n, k), device=dev, generator=g).float()
