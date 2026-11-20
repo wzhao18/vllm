@@ -53,6 +53,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    LEASE_HEARTBEAT_MSG,
+    LEASE_PIN_FLAG,
     LEASE_QUERY_MSG,
     KVFingerprintReq,
     NixlAgentMetadata,
@@ -217,6 +219,24 @@ def query_remote_leases(
     if not isinstance(held, list) or len(held) != len(req_ids):
         raise ValueError(f"malformed lease answer from {path}: {held!r}")
     return [h is True for h in held]
+
+
+def send_lease_pin(
+    host: str, port: int, req_ids: list[str], timeout_s: float
+) -> list[bool]:
+    """Tell a P engine's side channel that the READs of ``req_ids`` (P request
+    ids) are posted, so P keeps their leases until D releases the blocks."""
+    path = make_zmq_path("tcp", host, port)
+    with zmq_ctx(zmq.REQ, path) as sock:
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, max(1, int(timeout_s * 1000)))
+        msg = (LEASE_HEARTBEAT_MSG, req_ids, LEASE_PIN_FLAG)
+        sock.send(msgspec.msgpack.encode(msg))
+        try:
+            reply = sock.recv()
+        except zmq.Again as e:
+            raise TimeoutError(f"no pin answer from {path}") from e
+    return [r is True for r in msgspec.msgpack.decode(reply)]
 
 
 class _PairExchangeTimes:
@@ -1297,6 +1317,10 @@ class NixlBaseConnectorWorker:
         self._lease_checks: dict[ReqId, tuple[Future[bool], float]] = {}
         self._lease_check_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="vllm-nixl-lease-check"
+        )
+        # P side: how long a pull pin keeps a lease without D's notification.
+        self._lease_pin_s = float(
+            self.kv_transfer_config.get_from_extra_config("kv_lease_pin_s", 600.0)
         )
 
         # Handshake metadata of this worker for NIXL transfers.
@@ -4806,7 +4830,12 @@ class NixlBaseConnectorWorker:
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
-                self._pending_recv_notifs.pop(req_id, None)
+                if self._lease_pinned(meta):
+                    # Nothing of ours reads P any more: release the pinned
+                    # blocks now instead of after kv_lease_pin_s.
+                    self._send_pending_recv_notifs(req_id)
+                else:
+                    self._pending_recv_notifs.pop(req_id, None)
                 # Every page may be partly written or not written at all. The
                 # scheduler recomputes them; zero them so no stale byte
                 # survives into a block it keeps or reallocates for a load.
@@ -5159,6 +5188,37 @@ class NixlBaseConnectorWorker:
 
         return self._lease_check_executor.submit(_query)
 
+    def _lease_pinned(self, meta: ReqMeta | None) -> bool:
+        """D side: whether this pull pins P's lease (see _pin_remote_lease)."""
+        return bool(
+            getattr(self, "_lease_check_enabled", False)
+            and meta is not None
+            and meta.awaiting_kvs
+            and meta.remote is not None
+            and meta.remote.lease_check is True
+        )
+
+    def _pin_remote_lease(self, meta: ReqMeta) -> None:
+        """D side: the READs of ``meta`` are being posted. Pin P's lease so a
+        slow read (queued transport, stalled heartbeats) cannot outlive it;
+        D's completion notifications (sent on failure too) release the blocks.
+        Fire and forget: a lost pin leaves the heartbeats and the post-read
+        lease check in charge. One message per request (TP rank 0)."""
+        if not self._lease_pinned(meta) or self.tp_rank != 0:
+            return
+        remote = meta.remote
+        assert remote is not None
+        try:
+            self._lease_check_executor.submit(
+                send_lease_pin,
+                remote.host,
+                remote.port,
+                [remote.request_id],
+                self._lease_check_timeout_s,
+            )
+        except RuntimeError:  # executor shut down
+            pass
+
     def _gate_on_remote_lease(
         self, done_recving: set[ReqId], failed_recv_reqs: set[ReqId]
     ) -> None:
@@ -5226,6 +5286,8 @@ class NixlBaseConnectorWorker:
             if reason != "released":
                 # P may still hold the blocks: release them now, not at expiry.
                 self._send_pending_recv_notifs(req_id)
+            else:
+                self._pending_recv_notifs.pop(req_id, None)
             failed_recv_reqs.add(req_id)
 
     def _reap_expired_send_leases(self, done_sending: set[str]) -> None:
@@ -5276,6 +5338,16 @@ class NixlBaseConnectorWorker:
                     self._lease_extension,
                     old,
                     new_expiry,
+                )
+
+    def _handle_lease_pins(self, req_ids: set[str]) -> None:
+        """P side: D posted the READs of ``req_ids``; keep their leases until
+        D's notification releases them, or ``kv_lease_pin_s`` (D died)."""
+        pinned_until = time.perf_counter() + self._lease_pin_s
+        for req_id in req_ids:
+            if req_id in self._reqs_to_send:
+                self._reqs_to_send[req_id] = max(
+                    self._reqs_to_send[req_id], pinned_until
                 )
 
     def _pop_done_transfers(

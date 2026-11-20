@@ -31,6 +31,11 @@ LEASE_QUERY_MSG = b"lease_query_msg"
 # (LEASE_HEARTBEAT_MSG, [req_ids]) -> [renewed]. Sent from a background
 # thread, independent of D's step loop and of the NIXL/UCX data path.
 LEASE_HEARTBEAT_MSG = b"lease_heartbeat_msg"
+# Pull pin, D worker -> P scheduler when D posts the READs of a request:
+# (LEASE_HEARTBEAT_MSG, [req_ids], LEASE_PIN_FLAG) -> [held]. P keeps the lease
+# until D's completion or abort notification releases the blocks, or for
+# kv_lease_pin_s at most (D died). A P without pins reads a heartbeat.
+LEASE_PIN_FLAG = "pin"
 
 # Push-mode (WRITE-based) registration notification.
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
@@ -347,6 +352,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
         # P side: requests whose lease a D renewed over the side channel.
         self.lease_renewals: set[ReqId] = set()
+        # P side: requests whose READs a D posted (pinned until released).
+        self.lease_pins: set[ReqId] = set()
         # Push mode (D side): registration data the D worker should send to
         # P workers via NIXL notification on this step.
         self.push_registrations: dict[ReqId, dict[str, Any]] = {}
