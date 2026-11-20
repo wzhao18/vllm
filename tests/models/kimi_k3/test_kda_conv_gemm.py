@@ -224,7 +224,9 @@ def _run_checkpoint(
     qsl = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32,
                        device=dev)  # fmt: skip
     nseq = len(seqlens)
+    # Cache rows other than the null block (sequence lines must be real rows).
     slots = torch.randperm(3 * nseq + 2, device=dev, generator=g).to(torch.int32)
+    slots = slots[slots != NULL_BLOCK_ID]
     lines, ck_slots = slots[:nseq], slots[nseq : 2 * nseq].clone()
     ck_slots[nseq // 2] = NULL_BLOCK_ID  # a checkpoint without a cache block
     # Prefix hits (resumed state) mixed with fresh sequences.
