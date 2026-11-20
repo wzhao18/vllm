@@ -181,6 +181,7 @@ def _pkd(
     mma_4a: cute.TiledMma,
     mma_4b: cute.TiledMma,
     mma_g: cute.TiledMma,
+    mma_1w: cute.TiledMma,
     tma_q: cute.CopyAtom,
     mQ: cute.Tensor,
     tma_k: cute.CopyAtom,
@@ -251,6 +252,7 @@ def _pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     SROW_: cutlass.Constexpr[int] = 0,
+    MMA1W_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -351,6 +353,9 @@ def _pkd(
         ),
     )
     a_qk = mma_g.make_fragment_A(t_aqk)
+    # fused MMA1+OUT: B = qd||kd as one N64 operand -> D cols 192-223 = out
+    # (qd rows), 224-255 = U (kd rows).
+    b_qkw = mma_1w.make_fragment_B(t_aqk)
     b_inv = mma_3.make_fragment_B(t_binv)
     b_fta = mma_4a.make_fragment_B(t_bfta)
     b_ftb = mma_4b.make_fragment_B(t_bftb)
@@ -502,6 +507,12 @@ def _pkd(
         cute.recast_ptr(tmem_ptr + ri4_col, dtype=cutlass.BFloat16), ri4_base.layout
     )
     acc32_base = thr1.make_fragment_C(mma_1.partition_shape_C((BM, C)))
+    acc64_base = mma_1w.get_slice(0).make_fragment_C(
+        mma_1w.partition_shape_C((BM, 2 * C))
+    )
+    t_ou = cute.make_tensor(
+        cute.recast_ptr(tmem_ptr + 192, dtype=cutlass.Float32), acc64_base.layout
+    )
     t_vst = cute.make_tensor(
         cute.recast_ptr(tmem_ptr + 32, dtype=cutlass.Float32), acc32_base.layout
     )
@@ -1584,36 +1595,54 @@ def _pkd(
                             swn += 1
                         else:
                             state_inp_bar.arrive_and_wait()
-                        mma_1.set(tcgen05.Field.ACCUMULATE, False)
-                        for kb in cutlass.range_constexpr(D // 16):
-                            cute.gemm(
-                                mma_1,
-                                t_u,
-                                t_inp[None, None, kb],
-                                b_kd[None, None, kb, csm],
-                                t_u,
-                            )
-                            mma_1.set(tcgen05.Field.ACCUMULATE, True)
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_OOUT + csm)
-                        if cutlass.const_expr(TPROBE_ == 2):
-                            sc1 = _clock64()
+                        if cutlass.const_expr(MMA1W_ == 1):
+                            # One N64 MMA writes out (cols 192-223) and U (224-255):
+                            # the out buffer must be drained first.
                             cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
-                            sw1 += _clock64() - sc1
+                            mma_1w.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(D // 16):
+                                cute.gemm(
+                                    mma_1w,
+                                    t_ou,
+                                    t_inp[None, None, kb],
+                                    b_qkw[None, None, kb, csm],
+                                    t_ou,
+                                )
+                                mma_1w.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_OOUT + csm)
+                                tcgen05.commit(mb + MB_RFREE + csm)
                         else:
-                            cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
-                        mma_1.set(tcgen05.Field.ACCUMULATE, False)
-                        for kb in cutlass.range_constexpr(D // 16):
-                            cute.gemm(
-                                mma_1,
-                                t_out,
-                                t_inp[None, None, kb],
-                                b_qd[None, None, kb, csm],
-                                t_out,
-                            )
-                            mma_1.set(tcgen05.Field.ACCUMULATE, True)
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_RFREE + csm)
+                            mma_1.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(D // 16):
+                                cute.gemm(
+                                    mma_1,
+                                    t_u,
+                                    t_inp[None, None, kb],
+                                    b_kd[None, None, kb, csm],
+                                    t_u,
+                                )
+                                mma_1.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_OOUT + csm)
+                            if cutlass.const_expr(TPROBE_ == 2):
+                                sc1 = _clock64()
+                                cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
+                                sw1 += _clock64() - sc1
+                            else:
+                                cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
+                            mma_1.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(D // 16):
+                                cute.gemm(
+                                    mma_1,
+                                    t_out,
+                                    t_inp[None, None, kb],
+                                    b_qd[None, None, kb, csm],
+                                    t_out,
+                                )
+                                mma_1.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_RFREE + csm)
 
                         if cutlass.const_expr(TPROBE_ == 2):
                             sc2 = _clock64()
@@ -2573,7 +2602,19 @@ def _launch_pkd(
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
     SROW_: cutlass.Constexpr[int] = 0,
+    MMA1W_: cutlass.Constexpr[int] = 0,
 ):
+    mma_1w = cute.make_tiled_mma(
+        tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            (BM, 2 * C, 16),
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.TMEM,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+        )
+    )
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
             cutlass.BFloat16,
@@ -2729,6 +2770,7 @@ def _launch_pkd(
         mma_4a,
         mma_4b,
         mma_g,
+        mma_1w,
         tma_q,
         mQ,
         tma_k,
@@ -2799,6 +2841,7 @@ def _launch_pkd(
         PARTIAL_TMA_,
         GATE_ROLL_,
         SROW_,
+        MMA1W_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),

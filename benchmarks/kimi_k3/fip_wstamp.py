@@ -72,10 +72,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lens", default="5461,5461,5462")
     ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--mma1w", type=int, default=1)
+    ap.add_argument("--ab", action="store_true", help="ABAB time MMA1W 0 vs 1, no stamps")
     args = ap.parse_args()
     dev = torch.device("cuda")
     lens = [int(s) for s in args.lens.split(",")]
     x = make_inputs(lens, dev)
+    if args.ab:
+        outs = {}
+        for rep_i in range(2):
+            for m in (0, 1):
+                kp._MMA1W = m
+                t = timeit(x, args.iters)
+                outs.setdefault(m, x[9].clone())
+                print(f"lens={args.lens} AB rep{rep_i} MMA1W={m} prod_us={t:.1f}")
+        print(f"MMA1W out bitequal={torch.equal(outs[0], outs[1])} "
+              f"maxdiff={(outs[0].float() - outs[1].float()).abs().max().item():.3e}")
+        return
+    kp._MMA1W = args.mma1w
     t0 = timeit(x, args.iters)
     ref = x[9].clone()
     kp._TPROBE = 2
