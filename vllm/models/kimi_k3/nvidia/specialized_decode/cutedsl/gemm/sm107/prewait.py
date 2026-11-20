@@ -124,6 +124,14 @@ class Mxfp8PreGemm:
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
             if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
                 raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
+        if m128x2:
+            # SFA is preloaded once per CTA for one 128-row activation tile; the weight
+            # scales must carry their half-swapped copy (``m128x2_weight_scales``)
+            if swap_ab_m := self.swap_ab:
+                raise ValueError(f"m128x2: swap_ab {swap_ab_m} not supported")
+            if rows > 128 or k // tile_k > 64 or tile_k != TILER_K:
+                raise ValueError(f"m128x2: R {rows} K {k} K-tile {tile_k} (R <= 128, K <= 8192)")
+        self.m128x2 = bool(m128x2)
         # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
         self.push = int(push)
         self.compiled, self.gemm = _compile(
@@ -202,6 +210,17 @@ class Mxfp8PreGemm:
         ints[:, 12] = m_tiles
         ints[:, 16 : 16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=device)
         return aux
+
+
+def m128x2_weight_scales(ws: torch.Tensor) -> torch.Tensor:
+    """F8_128x4 weight scales + the same atoms with the two 8 B halves of every 16 B lane
+    row swapped (rows 64-127 of each 128-row atom first): the m128x2 tactic loads SFB rows
+    32-63 from the copy with an aligned TMA box (a box starting at byte 8 traps on VR200)."""
+    flat = ws.contiguous().view(torch.uint8).reshape(-1)
+    if flat.numel() % 512:
+        raise ValueError(f"weight scales {tuple(ws.shape)}: not whole 512 B atoms")
+    swapped = flat.view(-1, 2, 8).flip(1).reshape(-1)
+    return torch.cat([flat, swapped])
 
 
 def die_weight(w: torch.Tensor, tile_n: int, device=None):
