@@ -75,7 +75,7 @@ from ..common.sp_comm import SpComm, positive_zero32
 from ..gemm.decode import TORCH_KINDS, DecodeProjection
 from ..gemm.mxfp8 import Mxfp8Projection
 from ..gemm.sp_policy import SP_TP, sp_projection_tactics
-from .push_mx import OprojPushMx
+from .push_mx import OprojPushBf16, OprojPushMx
 
 WIDTH = 7168  # output features (the hidden size)
 SPLITS = 8  # CTAs per cluster: K slices
@@ -98,6 +98,18 @@ def compile_push_mx(rows_max, k, tp, cap, device):
     e8 = cutlass.Float8E8M0FNU
     with torch.accelerator.device_index(device):
         ptrs = tuple(make_ptr(t, 16, g, assumed_align=16) for t in (f8, e8, f8, e8))
+        peers = fake((tp,), None, torch.int64)
+        args = (*ptrs, peers, Int32(0), Int32(rows_max))
+        return cute.compile(kernel, *args, make_fake_stream())
+
+
+@cache
+def compile_push_bf16(rows_max, k, tp, cap, device):
+    """One ``OprojPushBf16`` per 128-row token-block count (R is a runtime argument)."""
+    kernel = OprojPushBf16(k, rows_max, tp, cap)
+    g, bf = cute.AddressSpace.gmem, cutlass.BFloat16
+    with torch.accelerator.device_index(device):
+        ptrs = tuple(make_ptr(bf, 16, g, assumed_align=16) for _ in range(2))
         peers = fake((tp,), None, torch.int64)
         args = (*ptrs, peers, Int32(0), Int32(rows_max))
         return cute.compile(kernel, *args, make_fake_stream())
@@ -308,10 +320,15 @@ class SpOproj:
                         f"K % {32 * SPLITS} == 0 (K {k})",
                     )  # fmt: skip
                 self.codes[r] = compile_warp(r, k, comm.tp, comm.rows_cap, index)
+            elif tactic == "push":
+                bucket = -(-r // MX_BLOCK) * MX_BLOCK
+                self.codes[r] = compile_push_bf16(
+                    bucket, k, comm.tp, comm.rows_cap // comm.tp, index
+                )
             elif tactic not in ("cublas", "gemm"):
                 raise Unsupported("oproj_rs", shape, f"unknown tactic {tactic!r}")
             # the owner half of either tactic and the all-gather (residency-checked)
-            comm.reduce_scatter_code(r, push=tactic != "warp")
+            comm.reduce_scatter_code(r, push=tactic not in ("warp", "push"))
             comm.prepare(r)
             self.tactics[r] = tactic
 
@@ -375,24 +392,32 @@ class SpOproj:
         """Whether the owner kernel must push this rank's partial at ``rows`` (the
         GEMM tactics stage it in ``comm.partial``; "warp" and "mx_push" push from the
         GEMM)."""
-        return self.tactics[rows] not in ("warp", "mx_push")
+        return self.tactics[rows] not in ("warp", "mx_push", "push")
 
-    def _push_mx(self, attn_out, parity):
-        """``OprojPushMx`` over the MXFP8 ``attn_out`` into ``parity``'s owner slots."""
-        g, f8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN
-        e8 = cutlass.Float8E8M0FNU
-        w = self.gemm
-        ptrs = (
-            make_ptr(f8, w.weight.data_ptr(), g, assumed_align=16),
-            make_ptr(e8, w.scale.data_ptr(), g, assumed_align=16),
-            make_ptr(f8, attn_out.data.data_ptr(), g, assumed_align=16),
-            make_ptr(e8, attn_out.scale.data_ptr(), g, assumed_align=16),
-        )
+    def _push_from_gemm(self, attn_out, parity):
+        """``OprojPushMx`` (MXFP8 ``attn_out``, "mx_push") or ``OprojPushBf16`` (BF16
+        ``attn_out``, "push") into ``parity``'s owner slots."""
+        g = cute.AddressSpace.gmem
+        if isinstance(attn_out, torch.Tensor):
+            rows, weight = attn_out.shape[0], self.weight
+            bf = cutlass.BFloat16
+            ptrs = (
+                make_ptr(bf, weight.data_ptr(), g, assumed_align=16),
+                make_ptr(bf, attn_out.data_ptr(), g, assumed_align=16),
+            )
+        else:
+            rows, weight = attn_out.rows, self.gemm.weight
+            f8, e8 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+            ptrs = (
+                make_ptr(f8, weight.data_ptr(), g, assumed_align=16),
+                make_ptr(e8, self.gemm.scale.data_ptr(), g, assumed_align=16),
+                make_ptr(f8, attn_out.data.data_ptr(), g, assumed_align=16),
+                make_ptr(e8, attn_out.scale.data_ptr(), g, assumed_align=16),
+            )
         _, _, _, peers = self.comm.views(parity)
-        self.codes[attn_out.rows](
-            *ptrs, peers, Int32(self.comm.rank), Int32(attn_out.rows),
-            stream(w.weight.device),
-        )  # fmt: skip
+        self.codes[rows](
+            *ptrs, peers, Int32(self.comm.rank), Int32(rows), stream(weight.device)
+        )
 
     def produce(self, attn_out: torch.Tensor, parity: int):
         """The o-projection half only, for an owner kernel that follows
@@ -411,8 +436,8 @@ class SpOproj:
             partial = comm.partial[:rows]
             self.gemm.run(attn_out, partial)
             return partial
-        if tactic == "mx_push":
-            self._push_mx(attn_out, parity)
+        if tactic in ("mx_push", "push"):
+            self._push_from_gemm(attn_out, parity)
             return None
         _, _, recv, peers = comm.views(parity)
         self.codes[rows](
@@ -462,8 +487,8 @@ class SpOproj:
             partial = comm.partial[:rows]
             self.gemm.run(attn_out, partial)
             return comm.reduce_scatter(out_shard, parity, rows, partial)
-        if tactic == "mx_push":
-            self._push_mx(attn_out, parity)
+        if tactic in ("mx_push", "push"):
+            self._push_from_gemm(attn_out, parity)
             return comm.reduce_scatter(out_shard, parity, rows)
         _, _, recv, peers = comm.views(parity)
         self.codes[rows](

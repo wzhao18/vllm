@@ -171,6 +171,7 @@ def _worker(env: dict[str, str]) -> None:
         tables = {
             "cublas": "1-:cublas",
             "warp": f"1-{sp.WARP_ROWS}:warp",
+            "push": "1-:push",
             "default": sp.SP_OPROJ[4],
         }
         out = torch.empty((CAP // world, WIDTH), dtype=torch.bfloat16, device=device)
@@ -442,7 +443,7 @@ def _distributed_run(fn, world_size: int) -> None:
     reason="Need 2 GPUs with symmetric-memory multicast.",
 )
 def test_sp_comm_and_oproj_rs():
-    """SpComm.all_gather and SpOproj (cublas, warp, default table) on 4 ranks when
+    """SpComm.all_gather and SpOproj (cublas, warp, push, default table) on 4 ranks when
     there are 4 GPUs (the C512 TP group), else 2: bitwise all-gather, stock-exact
     cublas reduce-scatter, FP64-bounded warp and cuBLASLt partials, re-arming across
     parities and row counts (4..512), and a captured two-block step replayed."""
