@@ -435,6 +435,7 @@ class FP4MQALogitsKernel:
         num_sms: int = 148,
         num_epi_subtiles: int = 1,
         num_umma_stages: int = 1,
+        epi_math: bool = True,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         remove_online_sf_transpose: bool = False,
@@ -561,6 +562,8 @@ class FP4MQALogitsKernel:
         # This parameter could be tuned when needed.
         # self.num_umma_stages = 2 if next_n == 1 else 1
         self.num_umma_stages = num_umma_stages
+        # Benchmarks only (False): skip the ReLU + weighted head sum (data path timing).
+        self.epi_math = epi_math
         # KV pipeline depth
         self.num_kv_stages = 6
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
@@ -2482,7 +2485,7 @@ class FP4MQALogitsKernel:
                                 reg_h_end = min(
                                     subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                 )
-                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                for h in cutlass.range_constexpr(0, reg_h_end if self.epi_math else 0, 4):
                                     n0 = h
                                     h_g = i * subtile_n + h
                                     # Step 5.9: packed path catches fp16 & bf16
@@ -2555,7 +2558,7 @@ class FP4MQALogitsKernel:
                                 # SMEM-path: weights from shared mem
                                 smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
                                 for h in cutlass.range_constexpr(
-                                    smem_h_start, subtile_n, 4
+                                    smem_h_start, subtile_n if self.epi_math else smem_h_start, 4
                                 ):
                                     n0 = h
                                     h_g = i * subtile_n + h
@@ -2937,7 +2940,7 @@ class FP4MQALogitsKernel:
                                 reg_h_end = min(
                                     subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                 )
-                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                for h in cutlass.range_constexpr(0, reg_h_end if self.epi_math else 0, 4):
                                     n0 = h
                                     h_g = i * subtile_n + h
                                     # Step 5.9: packed (fp16/bf16) vs fp32
@@ -3010,7 +3013,7 @@ class FP4MQALogitsKernel:
                                 # SMEM-path
                                 smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
                                 for h in cutlass.range_constexpr(
-                                    smem_h_start, subtile_n, 4
+                                    smem_h_start, subtile_n if self.epi_math else smem_h_start, 4
                                 ):
                                     n0 = h
                                     h_g = i * subtile_n + h

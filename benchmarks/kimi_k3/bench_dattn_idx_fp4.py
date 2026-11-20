@@ -80,10 +80,16 @@ def main():
         t_launch = graph_time(lambda: op.launch(args["query"], args["q_scale"],
                                                 args["kv_cache"], args["block_table"],
                                                 args["max_len"], rows, reqs))
+        op.epi_math = False  # data path only (no ReLU / head sum)
+        t_nomath = graph_time(lambda: op.launch(args["query"], args["q_scale"],
+                                                args["kv_cache"], args["block_table"],
+                                                args["max_len"], rows, reqs))
+        op.epi_math = True
         mb = float(lens.view(reqs, q).amax(1).sum()) * 68 / 1e6
         print(f"R{rows} keys {mb:6.1f} MB: stock DG {t_dg:6.2f} us | fp4_index_logits "
               f"{t_new:6.2f} us ({t_dg / t_new:4.2f}x, {mb / t_new:5.2f} TB/s) = prep "
-              f"{t_prep:5.2f} + kernel {t_launch:6.2f} ({mb / t_launch:5.2f} TB/s) check ok",
+              f"{t_prep:5.2f} + kernel {t_launch:6.2f} ({mb / t_launch:5.2f} TB/s); no-math kernel "
+              f"{t_nomath:6.2f} check ok",
               flush=True)
 
 

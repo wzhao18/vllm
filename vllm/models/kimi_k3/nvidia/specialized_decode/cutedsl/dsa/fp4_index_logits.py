@@ -81,7 +81,7 @@ def _arch(device) -> str:
 
 
 @cache
-def _compiled(q: int, num_sms: int, arch: str):
+def _compiled(q: int, num_sms: int, arch: str, epi_math: bool = True):
     import cutlass
     import cutlass.cute as cute
 
@@ -98,6 +98,7 @@ def _compiled(q: int, num_sms: int, arch: str):
         num_sms=num_sms,
         num_epi_subtiles=1,
         num_umma_stages=2,
+        epi_math=epi_math,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.BFloat16,
         remove_online_sf_transpose=False,
@@ -137,6 +138,7 @@ class Fp4IndexLogits:
         self.schedule = torch.zeros(self.num_sms + 1, 2, dtype=torch.int32, device=device)
         self.weights = torch.zeros(max_rows, HEADS, dtype=torch.float32, device=device)
         self.arch = _arch(device)
+        self.epi_math = True  # benchmarks only: False skips the head-sum math
 
     def warm(self):
         _compiled(self.q, self.num_sms, self.arch)
@@ -179,7 +181,7 @@ class Fp4IndexLogits:
         pages = kv_cache.shape[0]
         kv = torch.as_strided(kv_cache, (pages, PAGE * (HALF_D + 4)), (kv_cache.stride(0), 1))
         n = q * HEADS
-        fn = _compiled(q, self.num_sms, self.arch)
+        fn = _compiled(q, self.num_sms, self.arch, self.epi_math)
         fn(kv, query.view(reqs, n, HALF_D).permute(1, 2, 0),
            q_scale.view(reqs, n).permute(1, 0), w.view(reqs, n).permute(1, 0), logits,
            block_table[::q][:reqs], self.seq_lens[:reqs], self.schedule, pages, reqs)
