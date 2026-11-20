@@ -395,13 +395,26 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (K31_LIKELY(regp)) {
       // sample: one group in kV2SampleStride (spread over the 8 residues)
 #pragma unroll 1
-      for (int g = tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride) {
-        const Keys8 k8(K31_LIKELY(g < kCap) ? sgroup(g) : load_group(g));
+      for (int g = tid * kV2SampleStride + (tid & 7); g < min(ng, kCap); g += kV2T * kV2SampleStride) {
+        const Keys8 k8(sgroup(g));
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const uint32_t k = k8.key(j);
           if (k) atomicAdd(&hist[k >> 4], 1u);
         }
+      }
+      if constexpr (kFast) {
+        // a row longer than the SMEM row: its later chunks are sampled from global memory
+        if (K31_RARE(ng > kCap))
+#pragma unroll 1
+          for (int g = kCap + tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride) {
+            const Keys8 k8(load_group(g));
+#pragma unroll 1
+            for (int j = 0; j < 8; ++j) {
+              const uint32_t k = k8.key(j);
+              if (k) atomicAdd(&hist[k >> 4], 1u);
+            }
+          }
       }
     } else if constexpr (!kFast) {
       // sample: one 8-key group in kV2SampleStride, all loads in flight before any use
