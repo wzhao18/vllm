@@ -2183,6 +2183,16 @@ def test_nixl_prom_metrics_group_handshake_with_transfer_failures():
     assert counter_value("vllm:nixl_num_kv_expired_reqs_total") == 1.0
     assert counter_value("vllm:nixl_num_notifications_after_expiry_total") == 1.0
 
+    # Request-level transfer time (first transfer start -> last end per rank):
+    # the per-request P->D handoff time that multi-node DP servers expose only
+    # through /metrics.
+    stats = NixlKVConnectorStats()
+    stats.record_request_xfer_wall(0.017)
+    stats.record_request_xfer_wall(0.024)
+    prom.observe(stats.data, engine_idx=0)
+    assert counter_value("vllm:nixl_request_xfer_time_seconds_count") == 2.0
+    assert abs(counter_value("vllm:nixl_request_xfer_time_seconds_sum") - 0.041) < 1e-9
+
 
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
