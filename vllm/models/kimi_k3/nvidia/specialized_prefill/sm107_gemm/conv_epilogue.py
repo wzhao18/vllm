@@ -1197,6 +1197,138 @@ _D_EXACT = 0x7E800000
 
 
 @cute.jit
+def _t2_chunk(
+    rc: Int32,
+    r0: Int32,
+    gbase: Int32,
+    cq: Int32,
+    cr: Int32,
+    w0: Int64,
+    w1: Int64,
+    w2: Int64,
+    w3: Int64,
+    nl2: Int64,
+    one2: Int64,
+    out_addr: Int64,
+    part: Int32,
+    m_rows: Int32,
+    cc: Int32,
+    row_end: Int32,
+    p_dim: cutlass.Constexpr,
+    scalar: cutlass.Constexpr,
+    probe: cutlass.Constexpr = 0,
+):
+    """Conv + SiLU of rows r0 .. r0 + 15 (chunk rc of the staged subtile) for
+    one column pair: loads, 16 branch-free chains, stores; the exact path
+    when some d > 2^126 or the chunk crosses ``row_end``."""
+    wp = [w0, w1, w2, w3]
+    # Row rc * 16 + i: lb[i % 4] + 64 i (rc * 16 % 4 == 0, XOR swizzle by row).
+    lb = [gbase + rc * (16 * _PITCH * 4) + ((cq ^ j) * 16) + cr for j in range(4)]
+    hr = []
+    for j in cutlass.range_constexpr(3):
+        rr = rc * 16 - 3 + j
+        rr = rr + 3 * b2i(rc == 0)
+        hr.append(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr))
+    xr = [lds_u32(lb[i % 4] + i * (_PITCH * 4)) for i in range(16)]
+    if cutlass.const_expr(probe == 1):
+        # Microbench probe: no shared-memory reads (register stand-ins).
+        hr = [Uint32(cr * (j + 3) + rc) for j in range(3)]
+        xr = [Uint32(cr * (i + 7) + rc) for i in range(16)]
+    hp = [unpack_b64(v) for v in hr]
+    ys = []
+    gm = Int32(0)
+    for i in cutlass.range_constexpr(16):
+        xp = unpack_b64(xr[i])
+        y, gm = conv_fast2(hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2, scalar)
+        ys.append(y)
+        hp = [hp[1], hp[2], xp]
+    obase = out_addr + (
+        (Int64(part) * Int64(m_rows) + Int64(r0)) * Int64(p_dim) + Int64(cc)
+    ) * 2
+    if cutlass.const_expr(probe == 2):
+        # Microbench probe: stores issued but predicated off (no memory).
+        for fi in cutlass.range_constexpr(16):
+            stg_u32(obase + fi * p_dim * 2, b2i(r0 < 0), ys[fi])
+    elif b2i(gm <= _D_EXACT) * b2i(r0 + 16 <= row_end) != 0:
+        for fi in cutlass.range_constexpr(16):
+            stg_u32_all(obase + fi * p_dim * 2, ys[fi])
+    else:
+        wv = []
+        for wj in wp:
+            wv.extend(split_b64(wj))
+        hx = [unpack_bf16x2(v) for v in hr]
+        for xi in cutlass.range_constexpr(16):
+            y2, s2 = conv_row(
+                (hx[0][0], hx[0][1], hx[1][0], hx[1][1], hx[2][0], hx[2][1]),
+                xr[xi], wv, Float32(0.0),
+            )  # fmt: skip
+            stg_u32(obase + Int64(xi) * Int64(p_dim) * 2, b2i(r0 + xi < row_end), y2)
+            hx = [hx[1], hx[2], unpack_bf16x2(xr[xi])]
+
+
+@cute.jit
+def _t2_chunk_loop(
+    rc: Int32,
+    r0: Int32,
+    gbase: Int32,
+    cq: Int32,
+    cr: Int32,
+    w0: Int64,
+    w1: Int64,
+    w2: Int64,
+    w3: Int64,
+    nl2: Int64,
+    one2: Int64,
+    out_addr: Int64,
+    part: Int32,
+    m_rows: Int32,
+    cc: Int32,
+    row_end: Int32,
+    p_dim: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+):
+    """``_t2_chunk`` as a rolled row loop (small hot code: the SM-wide fast
+    I-cache holds ~8-16 KiB). Rows are stored as computed; a chunk with some
+    d > 2^126 is recomputed on the exact path and overwritten."""
+    wp = [w0, w1, w2, w3]
+    rbase = gbase + rc * (16 * _PITCH * 4) + cr
+    rr0 = rc * 16 - 3 + 3 * b2i(rc == 0)
+    h0 = unpack_b64(lds_u32(gbase + rr0 * (_PITCH * 4) + ((cq ^ (rr0 % 4)) * 16) + cr))
+    rr1 = rr0 + 1
+    h1 = unpack_b64(lds_u32(gbase + rr1 * (_PITCH * 4) + ((cq ^ (rr1 % 4)) * 16) + cr))
+    rr2 = rr0 + 2
+    h2 = unpack_b64(lds_u32(gbase + rr2 * (_PITCH * 4) + ((cq ^ (rr2 % 4)) * 16) + cr))
+    obase = out_addr + (
+        (Int64(part) * Int64(m_rows) + Int64(r0)) * Int64(p_dim) + Int64(cc)
+    ) * 2
+    gm = Int32(0)
+    for i in cutlass.range(16, unroll=unroll):
+        x = lds_u32(rbase + i * (_PITCH * 4) + ((cq ^ (i % 4)) * 16))
+        xp = unpack_b64(x)
+        y, gm = conv_fast2(h0, h1, h2, xp, wp, gm, nl2, one2, False)
+        stg_u32(obase + Int64(i) * (p_dim * 2), b2i(r0 + i < row_end), y)
+        h0 = h1
+        h1 = h2
+        h2 = xp
+    if gm > _D_EXACT:
+        wv = []
+        for wj in wp:
+            wv.extend(split_b64(wj))
+        hx = []
+        for j in cutlass.range_constexpr(3):
+            rr = rr0 + j
+            hx.append(unpack_bf16x2(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr)))
+        for xi in cutlass.range_constexpr(16):
+            xv = lds_u32(rbase + xi * (_PITCH * 4) + ((cq ^ (xi % 4)) * 16))
+            y2, s2 = conv_row(
+                (hx[0][0], hx[0][1], hx[1][0], hx[1][1], hx[2][0], hx[2][1]),
+                xv, wv, Float32(0.0),
+            )  # fmt: skip
+            stg_u32(obase + Int64(xi) * Int64(p_dim) * 2, b2i(r0 + xi < row_end), y2)
+            hx = [hx[1], hx[2], unpack_bf16x2(xv)]
+
+
+@cute.jit
 def epilogue_kda_conv_t2(
     gemm_kernel,
     tidx: Int32,
@@ -1249,7 +1381,7 @@ def epilogue_kda_conv_t2(
     r0 = blk0 + rc * 16
     total_end = ldg_s32(qsl_addr + Int64(nseq) * 4)
     row_end = total_end - (total_end - m_rows) * b2i(m_rows < total_end)
-    chunk_ok = b2i(r0 + 16 <= row_end)
+
     # This drain row's sequence (side rows for the fix-up / conv state).
     s_t = find_seq(qsl_addr, nseq, top, nsteps, trow)
     st0 = ldg_s32(qsl_addr + Int64(s_t) * 4)
@@ -1293,8 +1425,6 @@ def epilogue_kda_conv_t2(
     wrow = gbase + (trow % 128) * (_PITCH * 4)
     cq = cp // 4
     cr = (cp % 4) * 4
-    # Row rc * 16 + i of the staged subtile: lb[i % 4] + 64 i (rc * 16 % 4 == 0).
-    lb = [gbase + rc * (16 * _PITCH * 4) + ((cq ^ j) * 16) + cr for j in range(4)]
     nl2 = Int64(_NL2)
     one2 = Int64(_ONE2)
     # Conv weights in column-pair layout (KdaConvGemm.conv_w_pairs): 32 B per
@@ -1317,39 +1447,17 @@ def epilogue_kda_conv_t2(
         col = col0 + 2 * cp
         part = col0 // p_dim
         cc = col - part * p_dim
-        hr = []
-        for j in cutlass.range_constexpr(3):
-            rr = rc * 16 - 3 + j
-            rr = rr + 3 * b2i(rc == 0)
-            hr.append(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr))
-        xr = [lds_u32(lb[i % 4] + i * (_PITCH * 4)) for i in range(16)]
-        hp = [unpack_b64(v) for v in hr]
-        ys = []
-        gm = Int32(0)
-        for i in cutlass.range_constexpr(16):
-            xp = unpack_b64(xr[i])
-            y, gm = conv_fast2(
-                hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2,
+        args = (gbase, cq, cr, wp[0], wp[1], wp[2], wp[3], nl2, one2, out_addr,
+                part, m_rows, cc, row_end, p_dim,
                 getattr(gemm_kernel, "conv_scalar_silu", False),
-            )  # fmt: skip
-            ys.append(y)
-            hp = [hp[1], hp[2], xp]
-        obase = out_addr + (
-            (Int64(part) * Int64(m_rows) + Int64(r0)) * Int64(p_dim) + Int64(cc)
-        ) * 2
-        if b2i(gm <= _D_EXACT) * chunk_ok != 0:
-            for fi in cutlass.range_constexpr(16):
-                stg_u32_all(obase + fi * p_dim * 2, ys[fi])
+                getattr(gemm_kernel, "conv_probe", 0))  # fmt: skip
+        if cutlass.const_expr(getattr(gemm_kernel, "conv_loop_unroll", 0) > 0):
+            _t2_chunk_loop(rc, r0, *args[:15], gemm_kernel.conv_loop_unroll)
+        elif cutlass.const_expr(getattr(gemm_kernel, "conv_math_smsp23", False)):
+            # Microbench: column pass only on the SMSP 2/3 warps (two chunks).
+            if gt >= 64:
+                _t2_chunk(rc, r0, *args)
+                _t2_chunk(rc - 4, r0 - 64, *args)
         else:
-            wv = []
-            for wj in wp:
-                wv.extend(split_b64(wj))
-            hx = [unpack_bf16x2(v) for v in hr]
-            for xi in cutlass.range_constexpr(16):
-                y2, s2 = conv_row(
-                    (hx[0][0], hx[0][1], hx[1][0], hx[1][1], hx[2][0], hx[2][1]),
-                    xr[xi], wv, Float32(0.0),
-                )  # fmt: skip
-                stg_u32(obase + Int64(xi) * Int64(p_dim) * 2, b2i(r0 + xi < row_end), y2)
-                hx = [hx[1], hx[2], unpack_bf16x2(xr[xi])]
+            _t2_chunk(rc, r0, *args)
     return acc_consumer_state

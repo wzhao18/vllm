@@ -33,6 +33,12 @@ ARMS = [
     ("e", ""),
     ("en", "nrs"),
     ("es", "sc"),
+    ("e23", "c23"),
+    ("enl", "nolds"),
+    ("ens", "nost"),
+    ("l1", "lp1"),
+    ("l2", "lp2"),
+    ("l4", "lp4"),
 ]
 #: cluster -> (swizzle, raster) as in the B3 tactics.
 RASTER = {(2, 1): (8, "n"), (4, 1): (8, "n"), (2, 4): (4, "m"), (2, 2): (8, "n")}
@@ -144,7 +150,7 @@ def main():
                     y, _ = g(xq, xs, st, qsl, lines, has_init)
                     torch.cuda.synchronize()
                     row["first_call_s"] = round(time.perf_counter() - t0, 1)
-                    if arm in ("d1", "e", "en", "es"):
+                    if arm in ("d1", "e", "en", "es", "e23", "l1", "l2", "l4"):
                         row["bitwise_out"] = bool(torch.equal(y, ref))
                         row["bitwise_state"] = bool(torch.equal(st, st_ref))
                         if not row["bitwise_out"]:

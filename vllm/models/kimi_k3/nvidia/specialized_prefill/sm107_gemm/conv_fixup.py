@@ -167,6 +167,12 @@ def _conv_fixup_blocks_kernel(
                      part, c0, b0 + 2, M, P, WITH_NORMS, BLOCK)  # fmt: skip
 
 
+#: Columns per program and 128-row blocks per block program (measured on
+#: VR200: 512 x 8 for >= 96 blocks, 512 x 4 below).
+FIXUP_BLOCK = 512
+FIXUP_BG = None
+
+
 def conv_fixup(
     out: torch.Tensor,
     side: torch.Tensor,
@@ -183,11 +189,11 @@ def conv_fixup(
     n = 3 * p
     nb = (m + 127) // 128
     nseq = qsl.numel() - 1
-    block = 1024 if p % 1024 == 0 else 256
+    block = FIXUP_BLOCK if p % FIXUP_BLOCK == 0 else 256
     # FP32 or BF16 conv state (stock: bf16 inputs shifted in, exact either way).
     assert p % block == 0 and conv_state.dtype in (torch.float32, torch.bfloat16)
     sp2 = triton.next_power_of_2(nseq + 1)
-    bg = 8
+    bg = FIXUP_BG or (8 if nb >= 96 else 4)
     _conv_fixup_blocks_kernel[((nb + bg - 1) // bg, n // block)](
         out, side, norms if norms is not None else out, conv_w, qsl, m, n, p, nb, nseq,
         WITH_NORMS=norms is not None, BLOCK=block, BG=bg, SP2=sp2, num_warps=4,

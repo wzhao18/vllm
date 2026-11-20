@@ -56,6 +56,9 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         # Branch-free column pass (epilogue_kda_conv_t2) unless "ct1".
         self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
         self.conv_scalar_silu = "sc" in flags
+        self.conv_math_smsp23 = "c23" in flags
+        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 0
+        self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
