@@ -207,6 +207,41 @@ def st_global_v8_b32(addr, vals, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def st_global_v8_b32_ef(addr, vals, *, loc=None, ip=None) -> None:
+    """``st_global_v8_b32`` with an L2 evict_first cache policy."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [Uint32(v).ir_value(loc=loc, ip=ip) for v in vals],
+        "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+        "st.global.L2::cache_hint.v8.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8}, pol; }",
+        "l,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_global_b32_ef(addr, val, *, loc=None, ip=None) -> None:
+    """``st_global_b32`` with an L2 evict_first cache policy."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(val).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+        "st.global.L2::cache_hint.b32 [$0], $1, pol; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_global_b32(addr, val, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -743,6 +778,7 @@ def epilogue_situ_mxfp8_drain(
     tanh: Constexpr = False,
     roll: Constexpr = 0,
     store: Constexpr = 0,
+    l2_store_evict_first: Constexpr = False,
 ) -> pipeline.PipelineState:
     """Drain-and-release form of ``epilogue_situ_mxfp8`` for the 1-stage
     B-reuse tile (8 epilogue warps; warp group g owns M block g): every thread
@@ -901,17 +937,26 @@ def epilogue_situ_mxfp8_drain(
                         xs[0] = xs[0] ^ rQ32[q]
                 elif cutlass.const_expr(packed):
                     if row < m_rows:
-                        st_global_v8_b32(
-                            tTR_gQ[(None, None, None, g, ni)].iterator.toint(),
-                            [rQ32[q] for q in range(8)],
-                        )
+                        if cutlass.const_expr(l2_store_evict_first):
+                            st_global_v8_b32_ef(
+                                tTR_gQ[(None, None, None, g, ni)].iterator.toint(),
+                                [rQ32[q] for q in range(8)],
+                            )
+                        else:
+                            st_global_v8_b32(
+                                tTR_gQ[(None, None, None, g, ni)].iterator.toint(),
+                                [rQ32[q] for q in range(8)],
+                            )
                 elif row < m_rows:
                     cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, ni)])
             for i in cutlass.range_constexpr(2 * half * per - shift):
                 buf[i] = buf[i + shift]
         if cutlass.const_expr(packed and store == 1):
             if row0 < (m_rows + 127) // 128 * 128:
-                st_global_b32(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
+                if cutlass.const_expr(l2_store_evict_first):
+                    st_global_b32_ef(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
+                else:
+                    st_global_b32(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
         if cutlass.const_expr(packed and (store == 2 or store == 3)):
             if (xs[0] ^ sw[0]) == Uint32(0x12345677):
                 st_global_b32(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
