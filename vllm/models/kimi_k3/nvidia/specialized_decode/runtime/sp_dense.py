@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The layer-0 dense MLP on this rank's SP shard (replicated weights, ``KimiMLP``
-under sequence parallel) through ``gemm.dense_stream.DenseStream``: the stock
-gate_up GEMM + SituAndMul fused into one die-local weight stream, then the down
-GEMM. Every rank streams the whole 1.45 GB weight a step for its few shard rows,
-so the layer is bound by the per-die HBM read rate: the weights are re-homed per
-die in place (``place_rows``: same bytes and layout, so the stock module, which
-eager / profiling / warmup steps still run, reads the same values) and each SM
-streams only rows homed on its die.
+under sequence parallel) through ``gemm.dense_flow.DenseFlow``: the stock
+gate_up GEMM + SituAndMul + down GEMM in ONE die-local weight stream. Every rank
+streams the whole 1.45 GB weight a step for its few shard rows, so the layer is
+bound by the per-die HBM read rate: the weights are re-homed per die in place
+(``place_rows``: same bytes and layout, so the stock module, which eager /
+profiling / warmup steps still run, reads the same values), half the weight
+blocks on each die, and each SM streams only rows homed on its die.
 
 Numerics: FP32 accumulation and one BF16 rounding per GEMM, SiTU on the
 BF16-rounded gate / up as the stock op (only the FP32 summation order differs);
@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 
 from ..cutedsl.common import dies
 from ..cutedsl.common.host import stream as cute_stream
+from ..cutedsl.gemm import dense_flow as dfl
 from ..cutedsl.gemm import dense_stream as dsm
 from ..shapes import Choice, Path, Unsupported
 
@@ -26,12 +27,6 @@ logger = init_logger(__name__)
 
 PLACE_SAMPLES, PLACE_PASSES = 8, 5
 MAX_ROWS = 128
-# The most shard rows whose gate_up stream applies SiTU in its epilogue. In-step
-# (fastab dd-ds1, D3-32 slice): fused at 32 rows -10.9 us/step, at 64 / 96 +15.6 /
-# +15.7 (gate_up 111-119 us in-step vs 90-98 standalone: the end-of-stream SiTU on
-# 12 warps); standalone at 96 rows the unfused form (gate_up 2 I + stock SiTU) is
-# 84.5 us vs fused 95.4 (stock 101.7), at 64 a tie, at 32 fused 70.8 vs 79.3.
-FUSED_ROWS = 32
 
 
 def dense_cause(mlp):
@@ -60,28 +55,27 @@ def dense_cause(mlp):
 
 
 def die_map(device):
-    """(int32 [1024] die of each %smid, SMs of die 0, SMs of die 1); one die (every
-    SM on die 0) without a trusted two-die map."""
+    """(die of each %smid (-1: none), SMs of die 0, SMs of die 1); one die (every SM
+    on die 0) without a trusted two-die map."""
     index = torch.device(device).index
     if index is None:
         index = torch.cuda.current_device()
     sms = torch.cuda.get_device_properties(index).multi_processor_count
-    table = torch.zeros(1024, dtype=torch.int32, device=device)
+    one = ((0,) * sms, sms, 0)
     if dies.domain_count(index) < 2:
-        return table, sms, 0
+        return one
     try:
         domains = tuple(dies.sm_domains(index))
     except RuntimeError as exc:
         logger.warning_once("Kimi K3 dense MLP: no trusted SM -> die map (%s)", exc)
-        return table, sms, 0
+        return one
     wrong = dies.stream_check(index)
     if wrong:
         logger.warning_once(
             "Kimi K3 dense MLP: die map and streaming disagree on SMs %s", wrong
         )
-        return table, sms, 0
-    table[: len(domains)] = torch.tensor(domains, dtype=torch.int32, device=device)
-    return table, domains.count(0), domains.count(1)
+        return one
+    return domains, domains.count(0), domains.count(1)
 
 
 def place_rows(weight, die_of_row):
@@ -114,11 +108,10 @@ def place_rows(weight, die_of_row):
 
 
 class SpDenseMlp:
-    """``run(h [n, H])`` -> [n, H] BF16 (stock ``mlp(h)``, the GEMMs' FP32 summation
-    order aside) for every captured shard row count ``n`` in ``rows``: at most
-    ``FUSED_ROWS`` rows the gate_up stream applies SiTU in its epilogue; above, it
-    writes the stock [n, 2 I] gate_up output and the stock SituAndMul follows (its
-    full-occupancy kernel beats the stream's end-of-stream SiTU there)."""
+    """``run(h [n, H])`` -> [n, H] BF16 (stock ``mlp(h)``, the down GEMM's FP32
+    summation order aside: gate_up sums in K order, h bitwise == stock) for every
+    captured shard row count ``n`` in ``rows``: one ``dense_flow.DenseFlow`` launch
+    (gate_up + SiTU + down in one die-local weight stream)."""
 
     def __init__(self, mlp, rows, device, index):
         cause = dense_cause(mlp)
@@ -133,61 +126,45 @@ class SpDenseMlp:
         self.rows = tuple(sorted(set(rows)))
         if not self.rows or self.rows[-1] > MAX_ROWS:
             raise Unsupported("dense", None, f"layer {index}: shard rows {self.rows}")
-        self.table, self.s0, self.s1 = die_map(device)
+        if not all(dfl.supports(n, hidden, inter) for n in self.rows):
+            raise Unsupported("dense", None, f"layer {index}: {hidden} x {inter}")
+        self.domains, self.s0, self.s1 = die_map(device)
         two = self.s1 > 0
-        nb0_gu = dsm.split_blocks(inter // 128, self.s0, self.s1)
-        nb0_d = dsm.split_blocks(hidden // 128, self.s0, self.s1)
-        if two:  # gate block b and its up block on one die (fused and unfused alike)
-            half_gu, half_d = nb0_gu * 128, nb0_d * 128
-            placed = place_rows(gate_up, lambda row: int(row % inter >= half_gu))
-            placed &= place_rows(down, lambda row: int(row >= half_d))
+        nbA0 = dfl.die_blocks(inter // 64, self.s1)
+        nbB0 = dfl.die_blocks(hidden // 128, self.s1)
+        if two:  # a gate_up block's gate and up rows (64 each) and its down rows per die
+            placed = place_rows(gate_up, lambda row: int((row % inter) // 64 >= nbA0))
+            placed &= place_rows(down, lambda row: int(row // 128 >= nbB0))
             if not placed:
                 logger.warning_once(
                     "Kimi K3 dense MLP: die-local weight chunks not confirmed"
                 )
-        slots = self.s0 + self.s1
         top = self.rows[-1]
         self.h = torch.empty(top, inter, dtype=torch.bfloat16, device=device)
         self.y = torch.empty(top, hidden, dtype=torch.bfloat16, device=device)
-        self.gu = None
-        if top > FUSED_ROWS:
-            self.gu = torch.empty(top, 2 * inter, dtype=torch.bfloat16, device=device)
-        self.sync_gu = torch.zeros(dsm.SYNC_WORDS, dtype=torch.int32, device=device)
-        self.sync_d = torch.zeros(dsm.SYNC_WORDS, dtype=torch.int32, device=device)
-        ops, ws_bytes = {}, 0
-        for bucket in sorted({-(-n // 16) * 16 for n in self.rows}):
-            if bucket <= FUSED_ROWS:
-                op_gu = dsm.DenseStream(bucket, inter, hidden, situ_mode=True, beta=beta,
-                                        linear_beta=linear, two_dies=two, nb0=nb0_gu)  # fmt: skip
-            else:
-                op_gu = dsm.DenseStream(bucket, 2 * inter, hidden, two_dies=two,
-                                        nb0=nb0_gu, pairs=inter // 128)  # fmt: skip
-            op_d = dsm.DenseStream(bucket, hidden, inter, two_dies=two, nb0=nb0_d)
-            ws_bytes = max(ws_bytes, op_gu.ws_bytes(slots), op_d.ws_bytes(slots))
-            ops[bucket] = (op_gu, op_d)
-        self.ws = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
+        self.sync = torch.zeros(dfl.SYNC_WORDS, dtype=torch.int32, device=device)
         self.weights = (gate_up, down)
-        self.kernels = {}
-        for bucket, (op_gu, op_d) in ops.items():
+        self.kernels, ws_bytes = {}, 0
+        for bucket in sorted({-(-n // 16) * 16 for n in self.rows}):
+            op = dfl.DenseFlow(bucket, hidden, inter, beta, linear, nbA0=nbA0, nbB0=nbB0,
+                               two_dies=two)  # fmt: skip
+            ws_bytes = max(ws_bytes, op.ws_bytes(self.s0 + self.s1))
+            self.kernels[bucket] = (op, dfl.flow_tables(op, self.domains, None, device,
+                                                        whole=True))
+        self.ws = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
+        for bucket, (op, tables) in list(self.kernels.items()):
             x = torch.zeros(bucket, hidden, dtype=torch.bfloat16, device=device)
-            out = self.h if bucket <= FUSED_ROWS else self.gu
-            self.kernels[bucket] = (
-                self._compile(op_gu, gate_up, x, out[:bucket], self.sync_gu),
-                self._compile(op_d, down, self.h[:bucket], self.y[:bucket], self.sync_d),
-            )
+            fn, _ = dfl.compile_dense_flow(op, gate_up, x, down, self.h, self.y[:bucket],
+                                           self.ws, self.sync, *tables, self.s0, self.s1,
+                                           cute_stream(device))  # fmt: skip
+            self.kernels[bucket] = (fn, tables)
         logger.info_once(
-            "Kimi K3 dense MLP (layer %d): DenseStream gate_up (+SiTU up to %d rows) / "
-            "down, %s, shard rows %d-%d (%d kernels)", index, FUSED_ROWS,
+            "Kimi K3 dense MLP (layer %d): DenseFlow gate_up + SiTU + down in one grid, "
+            "%s, shard rows %d-%d (%d kernels)", index,
             f"die-local ({self.s0} + {self.s1} SMs)" if two else "one die",
-            self.rows[0], self.rows[-1], 2 * len(self.kernels),
+            self.rows[0], self.rows[-1], len(self.kernels),
             scope="local",
         )  # fmt: skip
-
-    def _compile(self, op, w, x, y, sync):
-        dev = w.device
-        fn, _ = dsm.compile_dense_stream(op, w, x, y, self.ws, sync, self.table,
-                                         self.s0, self.s1, cute_stream(dev))  # fmt: skip
-        return fn
 
     def serves(self, n):
         return n in self.rows
@@ -195,23 +172,16 @@ class SpDenseMlp:
     def choice(self, n):
         if n not in self.rows:
             raise Unsupported("dense", n, "shard rows not prepared")
-        form = "gate_up+SiTU" if n <= FUSED_ROWS else "gate_up, stock SiTU"
-        return Choice(Path.GENERIC, "stream", note=f"DenseStream die-local {form} (sp_dense)")
+        return Choice(Path.GENERIC, "flow", note="DenseFlow die-local one-grid MLP (sp_dense)")
 
     def run(self, x):
         n = x.shape[0]
-        fn_gu, fn_d = self.kernels[-(-n // 16) * 16]
+        fn, tables = self.kernels[-(-n // 16) * 16]
         gate_up, down = self.weights
         y = self.y[:n]
-        stream = cute_stream(x.device)
-        launch = (dsm.as_cute(self.table), *(dsm.Int32(v) for v in (self.s0, self.s1, n)),
-                  stream)  # fmt: skip
-        ws = dsm.as_cute(self.ws)
-        fused = n <= FUSED_ROWS
-        out = self.h[:n] if fused else self.gu[:n]
-        fn_gu(dsm.as_cute(gate_up, k_major=True), dsm.as_cute(x, k_major=True),
-              dsm.as_cute(out, rows=True), ws, dsm.as_cute(self.sync_gu), *launch)  # fmt: skip
-        h = out if fused else self.act(out)  # the stock SituAndMul above FUSED_ROWS
-        fn_d(dsm.as_cute(down, k_major=True), dsm.as_cute(h, k_major=True),
-             dsm.as_cute(y, rows=True), ws, dsm.as_cute(self.sync_d), *launch)  # fmt: skip
+        fn(dfl.ds.as_cute(gate_up, k_major=True), dfl.ds.as_cute(x, k_major=True),
+           dfl.ds.as_cute(down, k_major=True), dfl.ds.as_cute(self.h, k_major=True),
+           dfl.ds.as_cute(y, rows=True), dfl.ds.as_cute(self.ws), dfl.ds.as_cute(self.sync),
+           *(dfl.ds.as_cute(t) for t in tables),
+           *(dfl.Int32(v) for v in (self.s0, self.s1, n)), cute_stream(x.device))  # fmt: skip
         return y
