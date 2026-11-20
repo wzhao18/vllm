@@ -89,6 +89,19 @@ FAST_LM_HEAD = {16: "1-7:1"}
 # 14.23-14.30 us vs cuBLAS 14.55-14.60 (-2%, an FP32 K-order reorder: no K split): a
 # drafter LM head on that projection tactic is not wired.
 WIDE_LM_HEAD = {16: "17-32:1"}
+# Query rows whose LM-head shard GEMM is the die-local persistent stream-K token-wide
+# GEMM (cutedsl.gemm.wide_sk: the shard's two halves homed on the two dies, one CTA
+# pair per SM pair, all rows on the MMA's N), per TP, for the release drafter
+# (GqaDraftFastPath; the SP decode declares the preview drafter's LM head stock,
+# sp_attention.SP_DRAFTER_TABLES). TP4 (D3-32, [40960, 7168]
+# shard), VR200 1 GPU, cold weights, us, wide_sk (two TMEM accumulators) vs the
+# pinned cuBLASLt algorithm: 96 rows 39.3 vs 47.0, 192 rows 46.2 vs 49.9, 288 rows
+# 65.3 vs 66.8 (bench_kimi_k3_sdec_wide_sk.py).
+GQA_SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
+# Batches whose Markov bias GEMM ([B, 512] x [vocab / TP, 512]^T, three per step) is
+# that kernel too, per TP. TP4 [40960, 512] shard, VR200 1 GPU, cold weights, us,
+# wide_sk vs F.linear: B32 6.4 vs 11.8 (B64 7.0 vs 7.1, B96 7.5 vs 7.0: cuBLAS).
+GQA_SK_MARKOV = {4: (32,)}
 # Query rows whose context step (sharded projection + row gather, context-KV GEMM
 # and insert) the caller may run on a side stream, joined by the first MLA layer
 # right before its attention core (cutedsl.draft.attention ``join_context``): the
@@ -458,6 +471,10 @@ class DraftFastPath:
         self.lm_logits = None
         self.wide_batches = rows(WIDE_LM_HEAD) & self.batches
         self.lm_wide = None
+        # The die-local stream-K GEMM's rows (the release drafter's GQA_SK_LM_HEAD),
+        # prepared with the LM head.
+        self.sk_batches = frozenset()
+        self.lm_sk = None
         # The stock LM-head GEMM's rows on pinned cuBLASLt algorithms (lt_pin), for
         # the batches no fast LM head serves: prepared with the LM head.
         self.lm_pins = None
@@ -823,15 +840,17 @@ class DraftFastPath:
         fast = cls(markov, batches, steps, tp, all_batches, sampled, strict, rank)
         lm = sorted(b * steps for b in fast.lm_batches)
         wide_lm = sorted(b * steps for b in fast.wide_batches)
+        sk_lm = sorted(b * steps for b in fast.sk_batches)
         stock_lm = sorted(
             b * steps
             for b in batches
-            if b not in fast.lm_batches and b not in fast.wide_batches
+            if b not in fast.lm_batches | fast.wide_batches | fast.sk_batches
         )
         log_coverage(
             rank,
             "draft LM head",
-            f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, stock cuBLAS shard "
+            f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, die-local stream-K "
+            f"GEMM rows {sk_lm}, stock cuBLAS shard "
             f"GEMM rows {stock_lm} (policy WIDE_LM_HEAD: cuBLAS is measured faster "
             "than the evict-first GEMM at 9-16 rows (1.016-1.021x) and 33-64 rows "
             "(1.099-1.115x, no K split there); the evict-first GEMM only at 17-32 "
@@ -850,6 +869,7 @@ class DraftFastPath:
         sampled = sampling is not None
         if not torch.cuda.is_current_stream_capturing():
             self.prepare_lm_head(model)
+            self.prepare_lm_sk(model)
             self.prepare_lm_pins(model)
             # An eager drafter call (no captured graph: warmup, a step above the
             # captured sizes): the stock Markov loop, a run-time property counted
@@ -898,6 +918,18 @@ class DraftFastPath:
                 "its fast LM-head kernel is not prepared or does not take the rows",
                 Shape(batch * self.steps, self.steps),
             )
+        elif batch in self.sk_batches and self.lm_sk is not None and self.lm_sk.takes(rows):
+            # The stock LM-head GEMM on the die-local stream-K kernel: FP32
+            # accumulation (K order may differ), one BF16 rounding.
+            base = rows.new_empty((rows.shape[0], self.lm_sk.n))
+            self.lm_sk.run(rows, base)
+        elif self.strict and batch in self.sk_batches:
+            # NQ-NOFALLBACK: a GQA_SK_LM_HEAD batch whose kernel is not prepared.
+            refuse(
+                "DSpark drafter LM head",
+                "its die-local stream-K kernel is not prepared or does not take the rows",
+                Shape(batch * self.steps, self.steps),
+            )
         elif self.lm_pins is not None and self.lm_pins.takes(hidden):
             # The stock LM-head GEMM (this rank's vocabulary shard of the base
             # logits) on a pinned cuBLASLt algorithm: the same FP32 accumulation.
@@ -944,9 +976,47 @@ class DraftFastPath:
             return
         from ..lt_pin import pinned
 
-        fast = self.lm_batches | self.wide_batches
+        fast = self.lm_batches | self.wide_batches | self.sk_batches
         rows = [b * self.steps for b in sorted(self.batches - fast)]
         self.lm_pins = pinned(weight, rows)
+
+    def prepare_lm_sk(self, model):
+        """The die-local stream-K LM-head GEMM of GQA_SK_LM_HEAD batches, once the
+        (shared) LM head is there; outside graph captures (it compiles and places the
+        shard)."""
+        if self.lm_sk is not None or self.markov is None or not self.sk_batches:
+            return
+        weight = getattr(getattr(model, "lm_head", None), "weight", None)
+        vocab_rank = getattr(self.markov, "vocab_rank", None)
+        from ..cutedsl.gemm import wide_sk
+
+        rows = sorted(b * self.steps for b in self.sk_batches)
+        ok = (
+            weight is not None
+            and weight.dim() == 2
+            and weight.shape[0] >= vocab_rank
+            and weight.dtype == torch.bfloat16
+            and getattr(model.lm_head, "bias", None) is None
+            and model.logits_processor.scale == 1.0
+            and model.logits_processor.soft_cap is None
+        )
+        if ok:
+            _, pairs = wide_sk.die_pairs(weight.device)
+            ok = all(wide_sk.supports(r, vocab_rank, weight.shape[1], pairs) for r in rows)
+        if not ok:  # NQ-NOFALLBACK
+            if self.strict:
+                refuse(
+                    "DSpark drafter LM head",
+                    "the shard is not the BF16 [vocab / TP, H] shard (no bias, scale 1, "
+                    "no soft cap) at rows the die-local stream-K kernel takes",
+                )
+            self.sk_batches = frozenset()
+            return
+        self.lm_sk = wide_sk.PreparedWideSK(weight[:vocab_rank], rows).prepare()
+        logger.info_once(
+            "Kimi K3 DSpark drafter: die-local stream-K LM-head GEMM for draft rows %s",
+            tuple(rows),
+        )
 
     def prepare_lm_head(self, model):
         """The LM-head GEMV of FAST_LM_HEAD batches (it reads the shard in place),
@@ -1536,6 +1606,9 @@ class GqaDraftFastPath(DraftFastPath):
         )
         self.lm_batches = rows(GQA_FAST_LM_HEAD) & self.batches
         self.wide_batches = rows(GQA_WIDE_LM_HEAD) & self.batches
+        self.sk_batches = (
+            rows(GQA_SK_LM_HEAD) & self.batches - self.lm_batches - self.wide_batches
+        )
         self.overlap_batches = rows(GQA_CONTEXT_OVERLAP)
         self.attention = attention
 
@@ -1747,15 +1820,17 @@ class GqaDraftFastPath(DraftFastPath):
         )
         lm = sorted(b * steps for b in fast.lm_batches)
         wide_lm = sorted(b * steps for b in fast.wide_batches)
+        sk_lm = sorted(b * steps for b in fast.sk_batches)
         stock_lm = sorted(
             b * steps
             for b in batches
-            if b not in fast.lm_batches and b not in fast.wide_batches
+            if b not in fast.lm_batches | fast.wide_batches | fast.sk_batches
         )
         log_coverage(
             rank,
             "draft LM head",
-            f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, stock cuBLAS shard "
+            f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, die-local stream-K "
+            f"GEMM rows {sk_lm}, stock cuBLAS shard "
             f"GEMM rows {stock_lm} (GQA_WIDE_LM_HEAD: measured choices, as the "
             "preview drafter's)",
         )
@@ -2076,6 +2151,7 @@ class VocabParallelMarkov:
         self.gather = gather
         self.batches: set[tuple[int, bool]] = set()
         self.buffers: dict[int, tuple] = {}
+        self.sk = None  # the die-local stream-K bias GEMM (GQA_SK_MARKOV batches)
         # ``group`` (a process group, with ``cap`` = the largest batch): the keys'
         # all-gather becomes peer stores into a mailbox [steps, TP, cap] polled by
         # the select (no collective launch). One mailbox per draft position: a peer
@@ -2124,9 +2200,31 @@ class VocabParallelMarkov:
             )
         return self.buffers[batch]
 
+    def prepare_sk(self):
+        """The GQA_SK_MARKOV batches' bias GEMM on the die-local stream-K kernel (on its
+        die-homed copy of the shard); compiled here, outside CUDA graph captures."""
+        if self.sk is not None:
+            return
+        from ..cutedsl.gemm import wide_sk
+
+        rows = GQA_SK_MARKOV.get(self.tp, ())
+        if not rows or self.w2.dtype != torch.bfloat16:
+            return
+        _, pairs = wide_sk.die_pairs(self.device)
+        n, k = self.w2.shape
+        rows = [r for r in rows if wide_sk.supports(r, n, k, pairs)]
+        if rows:
+            self.sk = wide_sk.PreparedWideSK(self.w2, rows).prepare()
+            logger.info_once(
+                "Kimi K3.1 DSpark drafter: die-local stream-K Markov bias GEMM for "
+                "batches %s",
+                tuple(rows),
+            )
+
     def prepare(self, batch, anchor_stride, draft_stride, sampled=False):
         """Compile and run once (every rank together: the keys are all-gathered),
         so nothing compiles during CUDA graph capture."""
+        self.prepare_sk()
         rows = batch * self.steps
         base = torch.zeros(
             (rows, self.vocab_rank), dtype=torch.bfloat16, device=self.device
@@ -2188,8 +2286,12 @@ class VocabParallelMarkov:
         poll = self.box is not None
         if poll and batch > self.cap:
             raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
+        sk = self.sk if self.sk is not None and self.sk.takes(emb) else None
         for step in range(self.steps):
-            bias = torch.nn.functional.linear(emb, self.w2)
+            if sk is not None:
+                bias = sk.run(emb, emb.new_empty((batch, self.vocab_rank)))
+            else:
+                bias = torch.nn.functional.linear(emb, self.w2)
             _vp_markov_keys[grid](
                 keys,
                 base,

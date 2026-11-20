@@ -90,6 +90,31 @@ def make_logits(case: str, T: int, G: torch.Tensor, gen: torch.Generator, device
         u = torch.rand(T, Gmax, generator=gen, device=device)
         hi = torch.exp2(u * 60 - 30) if case == "skew_a" else torch.exp2(u * 40 - 5)
         x = torch.where(owner[None, :], hi, torch.exp2(u * 10 - 70))
+    elif case in ("hot_rank", "hot_rank2"):
+        # rank-skewed rows (topk_v2 CG rounds): DCP rank 0 holds 600 (1500) keys two-plus
+        # octaves above the rest; the round-1 windows are disjoint; tau lies among the other
+        # keys above (hot_rank2: below) rank 0's theta
+        pos = torch.arange(Gmax, device=device)
+        owner = ((pos // INTERLEAVE_CUR[0]) % WORLD[0]) == 0
+        hot = owner & (torch.cumsum(owner.int(), 0) <= (600 if case == "hot_rank" else 1500))
+        x = torch.relu(x + 0.3) * 2.0 + hot[None, :] * 40.0
+    elif case == "sample_high":
+        # topk_v2's 1/8 sample (local 8-key group g with g % 8 == (g // 8) % 8) holds ~80
+        # huge keys per rank, then small ones: its q-th-key estimate lies octaves above
+        # the true q-th key (~1500 mid keys outside the sample), theta far below it. The
+        # fine range centred under the estimate misses the q-th key from above; the hot
+        # path must rebase down to it (one rebase, no radix tier, no complete body).
+        pos = torch.arange(Gmax, device=device)
+        il, w = INTERLEAVE_CUR[0], WORLD[0]
+        lpos = (pos // (il * w)) * il + pos % il
+        g = lpos // 8
+        sampled = (g % 8) == ((g // 8) % 8)
+        u = torch.rand(T, Gmax, generator=gen, device=device)
+        hi = sampled & (lpos < 640)  # ~80 sampled keys per rank
+        mid = ~sampled & (u < 1500.0 * w / max(Gmax, 1))
+        x = torch.where(sampled[None, :], torch.exp2(u - 4), torch.exp2(u - 20))
+        x = torch.where(mid, 16.0 * (1 + u), x)
+        x = torch.where(hi[None, :], torch.exp2(20 + u), x)
     elif case == "neg":
         x = -torch.abs(x) * 100
     else:
@@ -180,6 +205,7 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
             nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
             errs.append(f"nondeterministic: call {j} differs in {nd} rows")
     # topk_v2 (one CTA per row): bitwise the same output
+    v2_before = V2_STATS[0].clone()
     for _ in range(2):
         o2 = torch.full((T, K + 64), -7, dtype=torch.int32, device=dev)
         c2 = torch.full((T,), -7, dtype=torch.int32, device=dev)
@@ -189,6 +215,11 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
         if not (torch.equal(o2[:, :K], out[:, :K]) and torch.equal(c2, cnt)):
             nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
             errs.append(f"topk_v2 differs from topk_merge in {nd} rows")
+    if case == "sample_high":
+        d = (V2_STATS[0] - v2_before).tolist()
+        # the hot path rebases (7) and stays on round 1: no radix (3), no full-pass message (5)
+        if d[7] == 0 or d[3] or d[5]:
+            errs.append(f"topk_v2 sample_high: rebase {d[7]} radix {d[3]} full-pass {d[5]}")
 
     # ---- reference: K largest keys, ties by ascending global id
     fk = keys_of(full)
@@ -601,6 +632,7 @@ def main():
         ("sink", 2, 4, 80_000),
         ("ties", 4, 4, 50_000),
         ("neg", 2, 8, 30_000),
+        ("sample_high", 1, 4, 24_000),  # topk_v2 fine range rebased down (hot path)
         ("short", 8, 4, 4000),
         ("edge", 4, 4, 4000),
         ("normal", 64, 4, 190_000),
@@ -610,6 +642,10 @@ def main():
         ("hot_recent", 192, 8, 150_000),  # T = 1536
         ("short", 192, 8, 4000),        # T = 1536, select-all rows
         ("flat_rank0", 2, 4, 60_000),   # one rank holds > kTieStore ties to select
+        ("hot_rank", 4, 4, 120_000),    # rank-skewed rows: topk_v2 CG round (one)
+        ("hot_rank2", 4, 4, 120_000),   # rank-skewed, tau below the hot rank's theta: R2
+        ("skew_a", 4, 4, 60_000),       # tau octaves wide: CG rounds (two)
+        ("skew_b", 2, 4, 90_000),
         # K < context < W * 896 at IL 896: ranks without keys, tau low in the context
         ("normal", 1, 8, 2600),
         ("relu", 1, 8, 3000),

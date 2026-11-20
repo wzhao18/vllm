@@ -238,6 +238,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         sub_blocks = remote_block_size // self.block_size
         remote_dcp_size = params.get("dcp_size") or 1
         groups = self.kv_cache_config.transfer_groups
+        if (num_remote := len(params["remote_block_ids"])) != len(groups):
+            # Packed hybrid caches split the KDA states into a TP-dependent
+            # number of groups: P/D configuration skew.
+            raise NixlPairModeError(
+                f"DCP pair exchange: the prefiller sent {num_remote} KV cache "
+                f"groups, this decoder has {len(groups)}; set the same "
+                "VLLM_PACKED_KV_STATE_GROUPS on both"
+            )
         params["remote_block_ids"] = [
             ids
             if get_representative_spec_type(group.kv_cache_spec)
@@ -314,6 +322,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._fingerprint_pulls[request.request_id] = KVFingerprintReq(
                 req_id=params["remote_request_id"],
                 block_ids=blocks.get_block_ids(),
+                state_blocks=self.fingerprint_state_blocks(blocks.get_block_ids()),
                 num_tokens=num_tokens,
                 first_block=(num_tokens - num_external_tokens)
                 // (self.block_size * dcp_size),
@@ -421,6 +430,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         req_id=request.request_id,
                         block_ids=tuple(list(group) for group in block_ids),
                         num_tokens=request.num_computed_tokens,
+                        state_blocks=self.fingerprint_state_blocks(block_ids),
                     )
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty

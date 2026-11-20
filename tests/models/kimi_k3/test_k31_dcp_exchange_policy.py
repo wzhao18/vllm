@@ -190,3 +190,66 @@ def test_topk_prepass_policy():
     assert ops.topk_prepass_min(1, 512, 848) == 16384
     assert ops.topk_prepass_min(2, 512, 424) == 2 * 32768
     assert ops.topk_prepass_min(1, 1024, 848) == 32768
+
+
+def test_exchange_attaches_to_impls_that_read_counts():
+    """DcpExchange stays on for the FlashInfer sparse MLA impl, whose forward_mqa
+    override sends every DCP decode call to the shared counts-reading path, and
+    off for FlashMLA sparse, which filters the DCP ids itself (an override that
+    silently turned the exchange off cost 0.5-0.7 ms per 24-layer decode slice)."""
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        FlashInferMLASparseImpl,
+    )
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+
+    assert decode._reads_counts(object.__new__(FlashInferMLASparseImpl))
+    assert not decode._reads_counts(object.__new__(FlashMLASparseImpl))
+
+
+def test_attach_raises_for_impls_that_skip_counts():
+    """No silent stock fallback: wiring the exchange to a DSA layer whose sparse MLA
+    impl does not read the DCP counts raises at load (it used to warn and keep the
+    stock top-k); a two-level candidate layer keeps the stock top-k by design."""
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+
+    def attention(candidate_blocks):
+        indexer = SimpleNamespace(
+            k_cache=SimpleNamespace(prefix="model.layers.3.self_attn"),
+            candidate_blocks=candidate_blocks,
+        )
+        layer = SimpleNamespace(impl=object.__new__(FlashMLASparseImpl))
+        return SimpleNamespace(
+            dsa_indexer=indexer, mla_attn=SimpleNamespace(mla_attn=layer)
+        )
+
+    dcpx = SimpleNamespace(layers={}, indexers={})
+    with pytest.raises(RuntimeError, match="does not read dcp_local_topk_counts"):
+        decode.DcpxDecode.attach(dcpx, attention(None))
+    decode.DcpxDecode.attach(dcpx, attention(4))
+    assert dcpx.layers == {} and dcpx.indexers == {}
+
+
+def test_stable_sources_copy_once(tmp_path):
+    """The shared digest-named build compiles a copy written once: a checkout whose
+    unchanged source is newer than the last build must not trigger a rebuild."""
+    import os
+
+    from vllm.models.kimi_k3.nvidia.dsa_kernels import stable_sources
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "k.cu").write_text('#include "k.cuh"\n')
+    (checkout / "k.cuh").write_text("// header\n")
+    (checkout / "notes.txt").write_text("not a source\n")
+    build = tmp_path / "build" / "0123456789-s"
+    build.mkdir(parents=True)
+
+    first = stable_sources(str(build), [checkout / "k.cu"])
+    assert first == [str(build / "src" / "k.cu")]
+    assert sorted(os.listdir(build / "src")) == ["k.cu", "k.cuh"]
+    mtime = os.stat(first[0]).st_mtime_ns
+
+    os.utime(checkout / "k.cu", ns=(mtime + 10**12, mtime + 10**12))  # newer checkout
+    assert stable_sources(str(build), [checkout / "k.cu"]) == first
+    assert os.stat(first[0]).st_mtime_ns == mtime
+    assert [p.name for p in build.iterdir()] == ["src"]  # no temp dirs left
