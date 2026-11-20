@@ -34,6 +34,7 @@ from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "dense_mx8")
 BLOCK = 32  # MXFP8 block along K
 DENSE_MAX_ROWS = 384  # dense_mx8: three 128-token MMA blocks in tensor memory
+TMA_MIN_ROWS = 2  # dense_mx8: activation rows its TMA atoms span (a 1-row map faults)
 
 # TUNED (VR200, D3-32 per-GPU shapes, 2026-11-18 D-GEMM bench1: 1 GPU, a CUDA graph of
 # 8-64 back-to-back calls each on its own cold weight copy, pre-quantized input; us per
@@ -196,7 +197,10 @@ class Mxfp8Projection:
             if kind not in MX_KINDS:
                 raise Unsupported(family, r, f"MXFP8 kind {kind!r} (kinds {MX_KINDS})")
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
-        self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
+        cap = cap or self.rows[-1]
+        if any(self.kinds[r] == "dense_mx8" for r in self.rows):
+            cap = max(cap, TMA_MIN_ROWS)  # dense_mx8's activation TMA spans >= 2 rows
+        self.input = shared_input(family, cap, k, weight.device)
         for r in self.rows:
             if self.kinds[r] == "dense_mx8" and (r > DENSE_MAX_ROWS or k % 256):
                 raise Unsupported(family, r, f"dense_mx8 needs R <= {DENSE_MAX_ROWS}, K % 256")
@@ -209,7 +213,14 @@ class Mxfp8Projection:
         import flashinfer
 
         if kind == "dense_mx8":
-            self._dense[xq.shape[0]].run(self.weight, self.scale, xq, xs, out)
+            rows = xq.shape[0]
+            size = xq.element_size()
+            span = xq.untyped_storage().nbytes() - xq.storage_offset() * size
+            if rows < TMA_MIN_ROWS and span < TMA_MIN_ROWS * xq.stride(0) * size:
+                raise Unsupported(
+                    self.family, rows, f"dense_mx8 reads {TMA_MIN_ROWS} activation rows"
+                )
+            self._dense[rows].run(self.weight, self.scale, xq, xs, out)
             return out
         if kind == "scaled_mm":
             return torch._scaled_mm(

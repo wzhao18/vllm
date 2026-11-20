@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--rows", default="288")  # query rows (B x k3); context rows = B x 4
     ap.add_argument("--only", default="")
     ap.add_argument("--fi", default=",".join(FI_BACKENDS))
+    ap.add_argument("--wide", default="")  # WideGemm K splits to time, e.g. 1,2,3
     args = ap.parse_args()
     torch.manual_seed(0)
     dev = torch.device("cuda")
@@ -96,7 +97,15 @@ def main():
                 pls = [lt_pin.pinned(w, [m]) for w in ws]
                 if all(p is not None for p in pls):
                     run("lt_pin", lambda i: pls[i].run(x, out))
-            if mm_bf16 is not None:
+            if args.wide:
+                from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide
+
+                for sp in [int(v) for v in args.wide.split(",")]:
+                    if wide.supports(m, n, k, sp):
+                        pws = [wide.PreparedWide(w, {m: sp}).prepare() for w in ws]
+                        run(f"wide{sp}", lambda i, pws=pws: pws[i].run(x, out))
+                        del pws
+            if mm_bf16 is not None and args.fi:
                 for be in args.fi.split(","):
                     run("fi:" + be, lambda i, be=be: mm_bf16(x, ws[i].t(), out=out, backend=be))
             base = res["F.linear"][0]

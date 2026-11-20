@@ -48,6 +48,7 @@ from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ..common.primitives import asm, copy_bulk, push_float, wait
+from .mxfp8 import TMA_MIN_ROWS
 
 SF_VEC = 32
 MMA_N = 128  # tokens per MMA (64 per CTA of the pair)
@@ -177,6 +178,11 @@ class DenseMx8:
         self.v = 2 if pair else 1
         self.clus = (4 if kred else 2 * mc) if pair else (2 if kred else 1)
         self.n, self.k, self.rows, self.ldo = n, k, rows, ldo
+        # The activation TMA atoms span >= 2 token rows: over a 1-row tensor the
+        # degenerate row mode builds a tensor map whose load faults with
+        # CUDA_ERROR_ILLEGAL_INSTRUCTION on VR200. The caller's activation buffer
+        # holds >= 2 rows (``TMA_MIN_ROWS``); rows past ``rows`` are never stored.
+        self.tma_rows = max(rows, TMA_MIN_ROWS)
         self.ksplit, self.kt, self.stages = ksplit, kt, stages
         self.collector = collector
         # bench-only isolation: 1 no epilogue stores, 2 no MMA, 4 no TMA (barriers
@@ -220,7 +226,9 @@ class DenseMx8:
         n, k, rows = self.n, self.k, self.rows
         fp8, sf_t = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         a = cute.make_tensor(w_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)))
-        b = cute.make_tensor(x_ptr, cute.make_ordered_layout((rows, k, 1), order=(1, 0, 2)))
+        b = cute.make_tensor(
+            x_ptr, cute.make_ordered_layout((self.tma_rows, k, 1), order=(1, 0, 2))
+        )
         sfa = cute.make_tensor(sfw_ptr, blockscaled_utils.tile_atom_to_shape_SF(a.shape, SF_VEC))
         sfb = cute.make_tensor(sfx_ptr, blockscaled_utils.tile_atom_to_shape_SF(b.shape, SF_VEC))
 
