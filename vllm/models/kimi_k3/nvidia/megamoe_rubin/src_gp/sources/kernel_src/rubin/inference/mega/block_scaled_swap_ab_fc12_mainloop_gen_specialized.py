@@ -38,7 +38,7 @@ import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.cpasync.copy import CopyBulkTensorTileG2SMulticastTrait
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32
+from cutlass.cutlass_dsl import Int32, Int64
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from ......common.ptx_helpers import barrier_sync_unaligned, read_clock64
