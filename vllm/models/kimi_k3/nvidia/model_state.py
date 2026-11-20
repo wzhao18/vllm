@@ -15,9 +15,15 @@ from . import cute_cache
 logger = init_logger(__name__)
 
 # PIECEWISE (prefill) steps up to this many tokens always pad every DP rank to
-# the capture size (KimiK3ModelState.pad_dp_for_piecewise): measured per-size
-# prefix-hit sweep, graphs vs eager, one prefilling rank of DP4.
-_PIECEWISE_PAD_ALWAYS_MAX_TOKENS = 0
+# the capture size (KimiK3ModelState.pad_dp_for_piecewise). Measured (int53,
+# Rhea DEP4 L24 NVFP4 P server, one prefix-hit request in flight per rank over
+# 122,880 cached tokens, client p50 latency padded graph / eager): 256 fresh
+# 56.8 / 78.5 ms, 512 66.0 / 79.0, 768 73.6 / 79.0, 1024 79.3 / 79.4, 1536
+# 92.5 / 79.9, 2048 108.1 / 84.7. An eager step is host-bound (~25-30 ms of
+# launches on every rank, the idle ranks' dummies included); a padded graph
+# step costs every rank the GPU time of the capture size, which passes the
+# eager launch time at ~1K tokens.
+_PIECEWISE_PAD_ALWAYS_MAX_TOKENS = 768
 
 
 class KimiK3ModelState(MambaHybridModelState):
@@ -72,8 +78,10 @@ class KimiK3ModelState(MambaHybridModelState):
         2/3 of their GPU time on padding and a new request on any rank queued
         behind those dummy forwards: 2048-token prefix-hit request latency
         0.11 s padded vs 0.08 s eager (int53, Rhea DEP4 L24). The graph only
-        pays where the ranks are near-balanced or the step is small enough
-        that its launch savings exceed the padded work."""
+        pays where the step is small enough that its launch savings exceed the
+        padded work (``_PIECEWISE_PAD_ALWAYS_MAX_TOKENS``) or every rank has at
+        least half the capture size of real tokens (the padding at most doubles
+        any rank's work)."""
         if padded <= _PIECEWISE_PAD_ALWAYS_MAX_TOKENS:
             return True
         return 2 * int(num_tokens_across_dp.min()) >= padded
