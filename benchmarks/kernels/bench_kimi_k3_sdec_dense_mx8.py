@@ -45,6 +45,23 @@ def ptrs(w, x, out, part, tick):
     )
 
 
+def die_copies(w, dev):
+    """W (FP8 rows + swizzled scales) as [2] copies, copy d homed on die d (2 MiB
+    chunks; a straddling chunk goes to its majority die)."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.die_local import chunk_domains
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+    out = []
+    for t in (w.data, w.scale):
+        nb = t.numel() * t.element_size()
+        raw = dies.localized_empty(2 * nb, chunk_domains(2 * nb, nb), dev)
+        two = raw.view(t.dtype).view(2, *t.shape)
+        two[0].copy_(t)
+        two[1].copy_(t)
+        out.append(two)
+    return types.SimpleNamespace(data=out[0], scale=out[1])
+
+
 def make_pred(ctas, dev):
     """A co-residable PDL predecessor: ``ctas`` 128-thread CTAs without shared memory
     that wait for their own predecessor, trigger their dependents and spin ``ns``.
@@ -121,6 +138,7 @@ def main():
           for _ in range(args.copies)]  # fmt: skip
     print(f"VR200 {torch.cuda.get_device_name(0)} sms "
           f"{torch.cuda.get_device_properties(0).multi_processor_count}", flush=True)  # fmt: skip
+    wcopies = None  # die-local double buffers of ws (variant key l1), built once
     for rows in args.rows:
         x = mx(torch.randn(rows, k, device=dev, dtype=torch.bfloat16))
         ref = torch._scaled_mm(
@@ -160,11 +178,22 @@ def main():
             mc, dbg = int(f.get("m", 1)), int(f.get("d", 0))
             kt = int(f.get("t", 128))
             try:
+                wdie = ()
+                if int(f.get("l", 0)):  # die-local W: each CTA streams its die's copy
+                    from vllm.models.kimi_k3.nvidia.megamoe_rubin.die_local import (
+                        die_sm_mask32,
+                    )
+
+                    wdie = die_sm_mask32(0)
+                    assert wdie, "no trusted SM -> die map"
+                    if wcopies is None:
+                        wcopies = [die_copies(w, dev) for w in ws]
                 g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
                              kred=bool(int(f.get("r", 0))), pair=bool(int(f.get("p", 1))),
                              iw=int(f.get("w", 1)), ix=int(f.get("x", 1)),
                              debug=dbg, kt=kt, pre_ns=int(f.get("e", 0)) * 1000,
-                             xcopies=int(f.get("y", 1)))
+                             xcopies=int(f.get("y", 1)), wdie=wdie,
+                             sym=bool(int(f.get("g", 0))))
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
@@ -174,11 +203,12 @@ def main():
                     yc = int(f["y"])
                     xv = types.SimpleNamespace(data=x.data.repeat(yc, 1).contiguous(),
                                                scale=x.scale.reshape(-1).repeat(yc))
-                args0 = ptrs(ws[0], xv, outs[0], part, tick)
+                wv = wcopies if wdie else ws
+                args0 = ptrs(wv[0], xv, outs[0], part, tick)
                 fn = cute.compile(g, *args0, stream(dev))
                 print(f"  {var}: compiled in {time.time() - t0:.1f}s grid {g.grid} "
                       f"sfa/sfb cols {g.sfa_cols}/{g.sfb_cols}", flush=True)  # fmt: skip
-                all_args = [ptrs(w, xv, o, part, tick) for w, o in zip(ws, outs)]
+                all_args = [ptrs(w, xv, o, part, tick) for w, o in zip(wv, outs)]
                 fn(*all_args[0], stream(dev))
                 torch.cuda.synchronize()
                 d = (outs[0].float() - ref.float())
@@ -199,6 +229,26 @@ def main():
 
                 t = graph_time(ours)
                 print(f"  {var}: {t:.2f} us/call  ({t_stock / t:.2f}x scaled_mm)", flush=True)
+                if dbg & 16384:  # globaltimer stamps of the last call (DenseMx8 STAMP)
+                    base = pw - 16 * g.grid
+                    st = part[base:].view(torch.int64).view(g.grid, 8).double().cpu()
+                    t0 = st[:, 0].min()
+                    rel = (st - t0) / 1e3
+                    names = ["entry", "accfull", "publish", "peer", "landed", "end",
+                             "xwait", "lastmma"]  # fmt: skip
+                    line = " ".join(
+                        f"{nm} {rel[:, i].min():.2f}/{rel[:, i].median():.2f}/"
+                        f"{rel[:, i].max():.2f}" for i, nm in enumerate(names)
+                    )
+                    print(f"  {var}: stamps min/med/max us: {line}", flush=True)
+                    d = {
+                        "acc-xwait": rel[:, 1] - rel[:, 6], "pub": rel[:, 2] - rel[:, 1],
+                        "wait": rel[:, 3] - rel[:, 2], "copy": rel[:, 4] - rel[:, 3],
+                        "sum+st": rel[:, 5] - rel[:, 4], "epi": rel[:, 5] - rel[:, 1],
+                    }  # fmt: skip
+                    print(f"  {var}: phases med/max us: " + " ".join(
+                        f"{k_} {v_.median():.2f}/{v_.max():.2f}" for k_, v_ in d.items()
+                    ), flush=True)  # fmt: skip
                 if int(f.get("e", 0)):
                     print(f"  {var}: in-kernel pre-wait spin {f['e']} us: exposed "
                           f"{t - int(f['e']):.2f} us", flush=True)  # fmt: skip

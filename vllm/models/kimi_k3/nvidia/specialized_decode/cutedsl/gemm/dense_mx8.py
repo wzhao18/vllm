@@ -47,6 +47,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from ..common.dies import global_time, smid
 from ..common.primitives import asm, copy_bulk, push_float, wait
 from ..mla.qvalid import spin_ns
 from .mxfp8 import TMA_MIN_ROWS
@@ -58,6 +59,10 @@ EPI_WARPS = 4
 MMA_WARP = 4
 TMA_WARP = 5  # weights (A, SFA): issued before the PDL wait
 TMEM_COLS = 512
+# bench-only debug bit: per-CTA %globaltimer stamps after the partial scratch: 0 entry,
+# 1 accumulator full (epilogue), 2 partial published, 3 peer observed, 4 peer partial
+# landed, 5 epilogue end, 6 activation warp past the PDL wait, 7 last stage landed
+STAMP, STAMPS = 16384, 8
 TMEM_BAR = 1  # named barrier ids (0 = __syncthreads)
 EPI_BAR = 2
 
@@ -116,6 +121,23 @@ def st_global_bf16(address, value):
 
 
 @asm()
+def st_global_v4f32(address, a, b, c, d):
+    return "st.global.v4.f32 [$0], {$1,$2,$3,$4};", "l,f,f,f,f,~{memory}", (
+        Int64(address), Float32(a), Float32(b), Float32(c), Float32(d))
+
+
+@asm((Float32,) * 4)
+def ld_global_cg_v4f32(address):
+    code = "ld.global.cg.v4.f32 {$0,$1,$2,$3}, [$4];"
+    return code, "=f,=f,=f,=f,l,~{memory}", (Int64(address),)
+
+
+@asm()
+def st_global_s64(address, value):
+    return "st.global.b64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
+
+
+@asm()
 def fence_proxy_async_global():
     return "fence.proxy.async.global;", "~{memory}", ()
 
@@ -162,7 +184,8 @@ class DenseMx8:
     def __init__(self, n: int, k: int, rows: int, ldo: int, *, ksplit: int = 2,
                  kt: int = 128, stages: int = 4, collector: bool = True,
                  mc: int = 1, kred: bool = False, pair: bool = True,
-                 iw: int = 1, ix: int = 1, debug: int = 0, pre_ns: int = 0, xcopies: int = 1):  # fmt: skip
+                 iw: int = 1, ix: int = 1, debug: int = 0, pre_ns: int = 0, xcopies: int = 1,
+                 wdie: tuple = (), sym: bool = False):  # fmt: skip
         assert rows <= 384 and k % (kt * ksplit) == 0 and ksplit in (1, 2)
         # iw / ix TMA issuer warps for the weights / the activation, each issuing every
         # iw-th / ix-th K tile: one issuer completes one bulk op at a time (~0.3 us
@@ -199,6 +222,16 @@ class DenseMx8:
         # griddepcontrol.wait (a preceding op of the same resident CTA: in-grid form)
         self.pre_ns = pre_ns
         self.xcopies = xcopies
+        # wdie (die-1 SM mask words, ``die_local.die_sm_mask32``): W and its scales are
+        # [2] copies, copy d homed on die d; each CTA streams its own die's copy.
+        self.wdie = tuple(wdie)
+        # sym: the global K-half exchange is a symmetric reduce-scatter (each CTA
+        # publishes the peer's token half of its FP32 partial, then adds the peer's
+        # half of its own); default: the ticket scheme (first publishes all, second
+        # sums all). sym waits for its K-half peer: the grid must be co-resident.
+        self.sym = sym
+        assert not sym or (ksplit == 2 and not kred)
+        self.wcopies = 2 if self.wdie else 1
         # mc pairs per cluster share one K half and the x tiles: x is TMA-multicast
         # to the mc pairs (L2 reads of x / mc)
         self.mc = mc
@@ -214,12 +247,17 @@ class DenseMx8:
         # kred receives half the FP32 partial (128 rows x cols/2) into sA..sB (contiguous)
         b_rows = MMA_N * self.nb // self.v
         assert not kred or (MMA_N * self.nb // 2) * 128 * 4 <= stages * kt * (128 + b_rows)
+        # sym receives the peer's 128 x cols/2 FP32 partial into the drained B ring
+        assert not sym or (MMA_N * self.nb // 2) * 128 * 4 <= stages * kt * b_rows
 
     def scratch_words(self) -> Tuple[int, int]:
         """(FP32 partial words, int32 ticket words) the caller allocates (zeroed
         tickets, persistent across calls)."""
         slots = self.v * self.mblocks
-        return slots * 128 * MMA_N * self.nb, 2 * slots
+        words = slots * 128 * MMA_N * self.nb
+        if self.debug & STAMP:  # bench: STAMPS int64 globaltimer stamps per CTA after it
+            words += 2 * STAMPS * self.grid
+        return words, (3 if self.sym else 2) * slots
 
     def _mma(self, collector):
         group = tcgen05.CtaGroup.TWO if self.pair else tcgen05.CtaGroup.ONE
@@ -236,7 +274,9 @@ class DenseMx8:
                  ticket_ptr: cute.Pointer, stream: cuda.CUstream):  # fmt: skip
         n, k, rows = self.n, self.k, self.rows
         fp8, sf_t = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
-        a = cute.make_tensor(w_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)))
+        a = cute.make_tensor(
+            w_ptr, cute.make_ordered_layout((n, k, self.wcopies), order=(1, 0, 2))
+        )
         # bench-only xcopies > 1: row block mb reads private activation copy mb % xcopies
         b = cute.make_tensor(
             x_ptr, cute.make_ordered_layout((self.tma_rows, k, self.xcopies), order=(1, 0, 2))
@@ -248,6 +288,10 @@ class DenseMx8:
         mma_fill = self._mma(CollectorOp.FILL)
         mma_use = self._mma(CollectorOp.USE)
         mma_last = self._mma(CollectorOp.LASTUSE)
+        # the same four with ACCUMULATE off: K tile 0's first MMAs (no ACCUMULATE
+        # mutation inside the stage-unrolled MMA loop's branches)
+        mma0 = (self._mma(CollectorOp.DISCARD), self._mma(CollectorOp.FILL),
+                self._mma(CollectorOp.USE), self._mma(CollectorOp.LASTUSE))  # fmt: skip
         mma_sfb = sm107_utils.make_blockscaled_trivial_tiled_mma(
             fp8, fp8, OperandMajorMode.K, OperandMajorMode.K, sf_t, SF_VEC,
             tcgen05.CtaGroup.ONE, (128, MMA_N, MMA_K),
@@ -328,7 +372,7 @@ class DenseMx8:
 
         self.storage = Storage
         self.kernel(
-            mma, mma_fill, mma_use, mma_last, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa,
+            mma, mma_fill, mma_use, mma_last, *mma0, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa,
             tsfa, tma_sfb, tsfb, cluster_vmnk, cluster_sfb_vmnk, pipe_vmnk, a_layout, b_layout,
             sfa_layout, sfb_layout, tsfa_layout, tsfb_layout, out_ptr, part_ptr,
             ticket_ptr,
@@ -339,7 +383,9 @@ class DenseMx8:
 
     @cute.kernel
     def kernel(self, mma: cute.TiledMma, mma_fill: cute.TiledMma, mma_use: cute.TiledMma,
-               mma_last: cute.TiledMma, mma_sfb: cute.TiledMma, tma_a: cute.CopyAtom,
+               mma_last: cute.TiledMma, mma_z: cute.TiledMma, mma_fill_z: cute.TiledMma,
+               mma_use_z: cute.TiledMma, mma_last_z: cute.TiledMma,
+               mma_sfb: cute.TiledMma, tma_a: cute.CopyAtom,
                mA: cute.Tensor, tma_b: cute.CopyAtom, mB: cute.Tensor,
                tma_sfa: cute.CopyAtom, mSFA: cute.Tensor, tma_sfb: cute.CopyAtom,
                mSFB: cute.Tensor, cluster_vmnk: cute.Layout, cluster_sfb_vmnk: cute.Layout,
@@ -353,6 +399,8 @@ class DenseMx8:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         sf_t = cutlass.Float8E8M0FNU
+        if tidx == 0:
+            self._stamp(part_ptr, bidx, 0)
         if warp == TMA_WARP:
             cpasync.prefetch_descriptor(tma_a)
             cpasync.prefetch_descriptor(tma_b)
@@ -460,8 +508,9 @@ class DenseMx8:
         if (warp >= TMA_WARP and warp < self.x_warp
                 and not cutlass.const_expr(self.debug & 32)):  # fmt: skip
             iw = warp - TMA_WARP
-            gA_s = tAgA[(None, mb, None, 0)]
-            gSFA_s = tAgSFA[(None, mb, None, 0)]
+            wl = self._die() if cutlass.const_expr(self.wcopies > 1) else Int32(0)
+            gA_s = tAgA[(None, mb, None, wl)]
+            gSFA_s = tAgSFA[(None, mb, None, wl)]
             prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
             for _ in cutlass.range(iw, unroll=1):
                 prod.advance()
@@ -503,6 +552,9 @@ class DenseMx8:
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.pre_ns > 0):
                 spin_ns(Int64(self.pre_ns))
+            if ix == 0:
+                if lane == 0:
+                    self._stamp(part_ptr, bidx, 6)
             for t in cutlass.range(ix, self.ktiles, self.ix, unroll=1):
                 kk = k0 + (t + rot) % self.ktiles
                 # same slot as the weight warp; only the weight warp arrives (expect_tx)
@@ -541,33 +593,46 @@ class DenseMx8:
             accs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
             if is_leader:
                 accp.producer_acquire(accs)
-            for t in cutlass.range(self.ktiles, unroll=1):
-                if is_leader:
-                    ab.consumer_wait(cons)
-                    s = cons.index
-                    cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, s)], s2t_a[2])
-                    for j in cutlass.range_constexpr(self.nb):
-                        s2t_b = s2t_bs[j]
-                        cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, s)], s2t_b[2])
-                    for kb in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
-                        for j in cutlass.range_constexpr(0 if self.debug & 2 else self.nb):
-                            m = mma
-                            if cutlass.const_expr(self.collector and self.nb > 1):
-                                if cutlass.const_expr(j == 0):
-                                    m = mma_fill
-                                elif cutlass.const_expr(j == self.nb - 1):
-                                    m = mma_last
-                                else:
-                                    m = mma_use
-                            m.set(tcgen05.Field.ACCUMULATE, t != 0 or kb != 0)
-                            cute.gemm(
-                                m, tAcc[(None, 0, j, 0)],
-                                [tCrA[(None, 0, kb, s)], tSFA[(None, 0, kb)]],
-                                [tCrB[(None, j, kb, s)], tSFBs[j][(None, 0, kb)]],
-                                tAcc[(None, 0, j, 0)],
-                            )  # fmt: skip
-                    ab.consumer_release(cons)
+            # Stage-unrolled: the ring slot of K tile t is t % stages, a compile-time
+            # constant per unrolled step, so every MMA / S2T descriptor is a constant
+            # offset (a runtime slot costs uniform-register conversions per MMA, which
+            # left the tensor pipe idle between issues: mainloop 11.5 -> 9.2 us at R384
+            # with a warp-uniform slot alone). ACCUMULATE is preset per atom outside the
+            # loop: setting it inside the unrolled branches chains each atom's staged
+            # value across sibling regions (IR dominance error).
+            rounds = self.ktiles // self.stages
+            nmma = 1 if self.debug & 65536 else self.nb  # bench: one N block only
+            nkb = cute.size(tCrA, mode=[2])
+            for m_ in (mma, mma_fill, mma_use, mma_last):
+                m_.set(tcgen05.Field.ACCUMULATE, True)
+            for m_ in (mma_z, mma_fill_z, mma_use_z, mma_last_z):
+                m_.set(tcgen05.Field.ACCUMULATE, False)
+            ops = (ab, s2t_a, s2t_bs, tAcc, tCrA, tCrB, tSFA, tSFBs, is_leader)
+            acc_on = (mma, mma_fill, mma_use, mma_last)
+            acc_off = (mma_z, mma_fill_z, mma_use_z, mma_last_z)
+            rem = self.ktiles - rounds * self.stages
+            # K tile 0 (ACCUMULATE off) is in the first unrolled round, else in the tail
+            if cutlass.const_expr(rounds > 0):
+                for _ in cutlass.range(1, unroll=1):
+                    for s in cutlass.range_constexpr(self.stages):
+                        z = acc_on
+                        if cutlass.const_expr(s == 0):
+                            z = acc_off
+                        self._mma_stage(ops, cons, s, z, acc_on, nmma, nkb)
+                        cons.advance()
+            if cutlass.const_expr(rounds > 1):
+                for _ in cutlass.range(rounds - 1, unroll=1):
+                    for s in cutlass.range_constexpr(self.stages):
+                        self._mma_stage(ops, cons, s, acc_on, acc_on, nmma, nkb)
+                        cons.advance()
+            for s in cutlass.range_constexpr(rem):  # the last ktiles % stages tiles
+                z = acc_on
+                if cutlass.const_expr(rounds == 0 and s == 0):
+                    z = acc_off
+                self._mma_stage(ops, cons, s, z, acc_on, nmma, nkb)
                 cons.advance()
+            if lane == 0:
+                self._stamp(part_ptr, bidx, 7)
             if is_leader:
                 accp.producer_commit(accs)
             accs.advance()
@@ -581,17 +646,78 @@ class DenseMx8:
             accc = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             if cutlass.const_expr(not self.debug & 32):
                 accp.consumer_wait(accc)
+            if tidx == 0:
+                self._stamp(part_ptr, bidx, 1)
             if cutlass.const_expr(not self.debug & 1):
                 self._epilogue(
                     acc_ptr, out_ptr, part_ptr, ticket_ptr, st.ticket.ptr.toint(), mb, v,
                     st.sA.data_ptr().toint(), st.sB.data_ptr().toint(), st.xbar.data_ptr(),
-                    warp, lane, tidx, rank,
+                    warp, lane, tidx, rank, kh, bidx,
                 )  # fmt: skip
+            if tidx == 0:
+                self._stamp(part_ptr, bidx, 5)
             if cutlass.const_expr(not self.debug & 32):
                 with cute.arch.elect_one():
                     accp.consumer_release(accc)
             tmem.relinquish_alloc_permit()
             tmem.free(acc_ptr)
+
+    @cute.jit
+    def _mma_stage(self, ops, cons, s, ms0, ms1, nmma, nkb):
+        """One ring slot (compile-time ``s``) on the leader: wait, scale factors to
+        tensor memory, the K64 x N-block MMAs with preset atoms (plain, fill, use,
+        lastuse): ``ms0`` for the first K64 step (ACCUMULATE off in K tile 0), ``ms1``
+        for the others, release."""
+        ab, s2t_a, s2t_bs, tAcc, tCrA, tCrB, tSFA, tSFBs, is_leader = ops
+        if is_leader:
+            ab.consumer_wait(cons)
+            if cutlass.const_expr(not self.debug & 32768):  # bench: no SF S2T
+                cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, s)], s2t_a[2])
+                for j in cutlass.range_constexpr(self.nb):
+                    s2t_b = s2t_bs[j]
+                    cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, s)], s2t_b[2])
+            for kb in cutlass.range_constexpr(nkb):
+                for j in cutlass.range_constexpr(0 if self.debug & 2 else nmma):
+                    ms = ms1
+                    if cutlass.const_expr(kb == 0):
+                        ms = ms0
+                    m = ms[0]
+                    if cutlass.const_expr(self.collector and self.nb > 1):
+                        if cutlass.const_expr(j == 0):
+                            m = ms[1]
+                        elif cutlass.const_expr(j == self.nb - 1):
+                            m = ms[3]
+                        else:
+                            m = ms[2]
+                    cute.gemm(
+                        m, tAcc[(None, 0, j, 0)],
+                        [tCrA[(None, 0, kb, s)], tSFA[(None, 0, kb)]],
+                        [tCrB[(None, j, kb, s)], tSFBs[j][(None, 0, kb)]],
+                        tAcc[(None, 0, j, 0)],
+                    )  # fmt: skip
+            ab.consumer_release(cons)
+
+    @cute.jit
+    def _stamp(self, part_ptr, bidx, i):
+        if cutlass.const_expr(self.debug & STAMP):
+            words = self.v * self.mblocks * 128 * MMA_N * self.nb
+            st_global_s64(
+                part_ptr.toint() + Int64(words) * 4 + Int64(bidx * STAMPS + i) * 8,
+                global_time(),
+            )  # fmt: skip
+
+    @cute.jit
+    def _die(self) -> Int32:
+        """Die of this SM from the die-1 SM mask (``wdie``)."""
+        s = smid()
+        word = s >> 5
+        bit = s & 31
+        die = Int32(0)
+        for w in cutlass.range_constexpr(len(self.wdie)):
+            if cutlass.const_expr(self.wdie[w] != 0):
+                if word == w:
+                    die = Int32((Uint32(self.wdie[w]) >> bit) & Uint32(1))
+        return die
 
     @cute.jit
     def _tma(self, atom, src, dst, bar, mask):
@@ -625,7 +751,7 @@ class DenseMx8:
 
     @cute.jit
     def _epilogue(self, acc_ptr, out_ptr, part_ptr, ticket_ptr, ticket_s, mb, v, sa_s, sb_s,
-                  xbar, warp, lane, tidx, rank):  # fmt: skip
+                  xbar, warp, lane, tidx, rank, kh, bidx):  # fmt: skip
         """Thread (warp w, lane l) owns weight row 128 v + 32 w + l of row block mb
         (TMEM lane 32 w + l) and all token columns."""
         cols = MMA_N * self.nb
@@ -680,6 +806,82 @@ class DenseMx8:
                                     out[c * self.ldo + n] = (vals[4 * qq + i] + p[i]).to(
                                         cutlass.BFloat16
                                     )
+        elif cutlass.const_expr(self.sym):
+            # Symmetric reduce-scatter with the other K half (same rows, same slot):
+            # this CTA owns token columns [o0, o0 + half); it publishes its partial of
+            # the peer's columns (row-major [r][half], 16 B stores), raises its flag,
+            # waits for the peer's, then adds the peer's partial of its own columns. The
+            # partial is quad-major [half / 4][128 rows][4]: a warp's 16 B per thread
+            # accesses are 512 contiguous bytes.
+            half = cols // 2
+            slot = mb * self.v + v
+            o0 = kh * half
+            p0 = half - o0
+            words = 128 * half
+            pbase = part_ptr.toint() + Int64((slot * 2 + kh) * words + 4 * r) * 4
+            qbase = part_ptr.toint() + Int64((slot * 2 + 1 - kh) * words + 4 * r) * 4
+            tick_a = ticket_ptr.toint() + Int64(slot) * 4
+            mine = ticket_ptr.toint() + Int64(self.v * self.mblocks + 2 * slot + kh) * 4
+            peer = ticket_ptr.toint() + Int64(self.v * self.mblocks + 2 * slot + 1 - kh) * 4
+            if tidx == 0:
+                st_shared_s32(ticket_s, atom_add_gpu(tick_a, 1))
+            if cutlass.const_expr(not self.debug & 1024):
+                # software-pipelined: the next TMEM load is in flight during the stores
+                vals = tmem_wait_n(*tmem_ld16(taddr + p0))
+                for c0 in cutlass.range_constexpr(0, half, 16):
+                    if cutlass.const_expr(c0 + 16 < half):
+                        nxt = tmem_ld16(taddr + p0 + c0 + 16)
+                    for qq in cutlass.range_constexpr(4):
+                        st_global_v4f32(pbase + (c0 // 4 + qq) * 2048, *vals[4 * qq:4 * qq + 4])
+                    if cutlass.const_expr(c0 + 16 < half):
+                        vals = tmem_wait_n(*nxt)
+            fence_gpu()
+            bar_sync(EPI_BAR, 32 * EPI_WARPS)
+            if tidx == 0:
+                self._stamp(part_ptr, bidx, 2)
+            gen = ld_shared_s32(ticket_s) // 2 + 1
+            # The peer's partial of this CTA's columns arrives by two bulk copies into
+            # the drained B ring (async, at the per-SM load rate), not by dependent
+            # global loads per quad (one L2 round trip each).
+            hb = words * 2  # bytes per copy: half of the 128 x half FP32 region
+            qreg = part_ptr.toint() + Int64((slot * 2 + 1 - kh) * words) * 4
+            if tidx == 0:
+                cute.arch.mbarrier_init(xbar, 1)
+                cute.arch.mbarrier_init(xbar + 1, 1)
+                cute.arch.mbarrier_init_fence()
+                st_release_gpu(mine, gen)
+                if cutlass.const_expr(not self.debug & 2048):
+                    while ld_acquire_gpu(peer) < gen:
+                        pass
+                self._stamp(part_ptr, bidx, 3)
+                fence_proxy_async_global()
+                for j in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_arrive_and_expect_tx(xbar + j, hb)
+                    copy_bulk(sb_s + j * hb, qreg + j * hb, (xbar + j).toint(), hb)
+            bar_sync(EPI_BAR, 32 * EPI_WARPS)
+            # software-pipelined like the publish: TMEM load c0 + 16 in flight while
+            # the 16 columns at c0 are summed and stored
+            vals = tmem_wait_n(*tmem_ld16(taddr + o0))
+            for c0 in cutlass.range_constexpr(0, half, 16):
+                if cutlass.const_expr(c0 % (half // 2) == 0):
+                    wait((xbar + (2 * c0 // half)).toint(), 0, scope="cta")
+                    if cutlass.const_expr(c0 == 0):
+                        if tidx == 0:
+                            self._stamp(part_ptr, bidx, 4)
+                if cutlass.const_expr(c0 + 16 < half):
+                    nxt = tmem_ld16(taddr + o0 + c0 + 16)
+                ps = [ld_shared_v4(sb_s + ((c0 // 4 + qq) * 128 + r) * 16) for qq in range(4)]
+                for qq in cutlass.range_constexpr(4):
+                    for i in cutlass.range_constexpr(4):
+                        c = o0 + c0 + 4 * qq + i
+                        if cutlass.const_expr(not self.debug & 8192):
+                            if live:
+                                if c < self.rows:
+                                    out[c * self.ldo + n] = (vals[4 * qq + i] + ps[qq][i]).to(
+                                        cutlass.BFloat16
+                                    )
+                if cutlass.const_expr(c0 + 16 < half):
+                    vals = tmem_wait_n(*nxt)
         else:
             slot = mb * self.v + v
             part = cute.make_tensor(part_ptr, cute.make_layout(2 * self.mblocks * cols * 128))
