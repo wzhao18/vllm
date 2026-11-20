@@ -56,10 +56,10 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 # FC1, under the dispatch ("early").
 RUBIN_FUSED_SHARED_L2_POSITION = "early"
 
-# GenPhase fused shared expert: K parts per shared FC1 / FC2 tile. Whole-K tiles give 96 FC1 units of
-# 917 KB on 96 SMs (~12 us) while the early shared-FC2 SMs wait for all of them; 2 / 4 parts give 192 FC1
-# units and 224 FC2 units (~0.2-0.46 MB each), so every SM streams the shared expert at the kernel start.
-RUBIN_GENPHASE_SHARED_K_SPLITS = (2, 4)
+# GenPhase fused shared expert: K parts per shared FC1 / FC2 tile. Whole-K tiles (1, 1): split tiles measured
+# slower on EP1 (+2..+9 us per layer at 96 tokens before the fixup; extra shared FC2 units park behind all of
+# shared FC1), see the D-MOE-TAPE W-series.
+RUBIN_GENPHASE_SHARED_K_SPLITS = (1, 1)
 
 
 def compile_cache_key(
