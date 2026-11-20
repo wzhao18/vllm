@@ -13,8 +13,6 @@ passes (the GEMM's FP32 accumulation order is the tensor-core order, as for any
 GEMM backend). F16K (16383 rows x 96 heads): 178 vs 473 us per layer (1 GPU).
 """
 
-import weakref
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -234,9 +232,9 @@ def reference(q, w_uk_t, q_scale, out_dtype=torch.float8_e4m3fn):
 
 _KERNEL = UkQueryFp8()
 _UNIT_KERNEL = UkQueryFp8(unit_scale=True)
-# q_scale tensor -> (1 / q_scale, q_scale == 1); weak keys: a freed scale tensor's
-# address can be reused by another one.
-_SCALES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+# id(q_scale) -> (q_scale, 1 / q_scale, q_scale == 1). The entry holds the scale
+# tensor (a layer constant) so its id cannot be reused; no tensor equality (a sync).
+_SCALES: dict = {}
 
 
 def fused_query(
@@ -258,13 +256,13 @@ def fused_query(
         or q_scale.numel() != 1
     ):
         return None
-    ent = _SCALES.get(q_scale)
-    if ent is None:
+    ent = _SCALES.get(id(q_scale))
+    if ent is None or ent[0] is not q_scale:
         inv = q_scale.detach().float().reciprocal().reshape(1)
         # q_scale is a fixed per-layer constant: read once (outside capture).
         unit = not torch.cuda.is_current_stream_capturing() and bool(q_scale == 1)
-        ent = _SCALES[q_scale] = (inv, unit)
-    inv, unit = ent
+        ent = _SCALES[id(q_scale)] = (q_scale, inv, unit)
+    _, inv, unit = ent
     logger.info_once("Kimi K3.1 prefill: fused W_UK / RoPE / FP8 query (uk_query) active")
     out = torch.empty(
         (t, h, w_uk_t.shape[2] + d - w_uk_t.shape[1]),
