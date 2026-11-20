@@ -924,6 +924,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         for (int i = nc + tid; i < K; i += kV2T) orow[i] = -1;
     }
     V2DBG(28);
+#pragma unroll 1
     for (int i = tid; i < W * (kV2Msg / 4); i += kV2T) {
       const int r = i / (kV2Msg / 4), j = (i % (kV2Msg / 4)) * 4;
       poll_words(p.box + r1row + (int64_t)r * kV2Msg + j, rx + r * kV2Msg + j, 31);
@@ -941,6 +942,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       __shared__ int s_tc[kV2MaxW], s_toff[kV2MaxW], s_tok[kV2MaxW];
       int mx = 0, mn = 1 << 30, sat = 0;
       uint32_t tv = 0;
+#pragma unroll 1
       for (int r = 0; r < W; ++r) {
         const uint32_t* s = rx + r * kV2Msg;
         const int lr = (int)(s[0] & 0xFFFFu);
@@ -961,6 +963,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         constexpr bool kOne = kV2T >= 2 * kV2Win;
         const int tb = kOne ? tid - kV2Win : tid;  // this thread's b slot
         uint32_t a = 0, v = 0;
+#pragma unroll 1
         for (int r = 0; r < W; ++r) {
           const uint32_t* s = rx + r * kV2Msg;
           const int lr = (int)(s[0] & 0xFFFFu);
@@ -999,7 +1002,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           const int tok = ((bw >> 16) & 1u) && tau - lr >= blr && tau - lr <= bhr;
           uint32_t c = 0;
           if (tok)
+#pragma unroll 1
             for (int u = blr + lane; u < tau - lr; u += 32) c += v2_cnt(s, u);
+#pragma unroll 1
           for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
           if (lane == 0) {
             s_tc[warp] = (int)v2_cnt(s, tau - lr);
@@ -1011,6 +1016,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         V2DBG(21);
         int tot_t = 0, nr = 0;
         bool band_ok = true, fit = true;
+#pragma unroll 1
         for (int r = 0; r < W; ++r) {
           tot_t += s_tc[r];
           nr += s_tc[r] > 0;
@@ -1034,6 +1040,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           }
           V2DBG(29);
           const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
+#pragma unroll 1
           for (int it = tid; it < m * W; it += kV2T) {
             const int i = it / W, r2 = it - i * W;
             const uint32_t x = my[i] & 0xFFFFFFu;
@@ -1070,6 +1077,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         const int cpt = (nc + kV2T - 1) / kV2T;
         const int c0 = min(nc, tid * cpt), c1 = min(nc, c0 + cpt);
         uint32_t ca = 0, ct = 0;
+#pragma unroll 1
         for (int c = c0; c < c1; ++c) {
           const int k = ckey[c];
           ca += k > tau;
@@ -1079,6 +1087,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         const uint32_t pre = v2_scan<T>(ca | (ct << 16), V2WS, &tot);
         const int gtt = (int)(tot & 0xFFFFu), nties = (int)(tot >> 16);
         int a = (int)(pre & 0xFFFFu), t = (int)(pre >> 16);
+#pragma unroll 1
         for (int c = c0; c < c1; ++c) {
           const int k = ckey[c];
           if (k > tau) {
@@ -1091,6 +1100,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         const int count = min(K, gtt + qq);
         if (tid == 0 && (gtt + qq > K || nties < qq)) spin_fail(p.err, 40);
+#pragma unroll 1
         for (int i = count + tid; i < min(K, nc); i += kV2T) orow[i] = -1;  // past nc: padded in the round's shadow
         if (tid == 0) {
           p.out_count[row] = count;
