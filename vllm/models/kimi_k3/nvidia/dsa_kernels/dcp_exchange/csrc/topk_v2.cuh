@@ -346,6 +346,194 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
   return false;  // unreachable: the second round has width 1
 }
 
+// R2L: ONE more NVLink round of explicit (key, global id) lists for every row round 1 leaves
+// unresolved whose bracket keys are candidates on every rank. tau known (tier 2: a band missed
+// its ties; tier 3: ties beyond the tie list): lo = hi = tau, the lists are the ties. tau
+// unknown (rank-skewed rows): v2_cg's bracket, lo = the largest theta (every rank's keys >= lo
+// are candidates), hi = the largest exact q-th key (tau <= hi). Each rank sends its candidates
+// in [lo, hi] (R2 slot, unordered) and its count above hi; every rank derives tau (K-th
+// largest of the union, keys above hi counted), need and its quota of ties (ascending global
+// id, the stock rule) from the same words; the row then takes the tier-1 WRITE from its
+// candidates. Returns 0 (not eligible, nothing sent: the caller keeps R2), 1 (resolved:
+// s_tier = 1, s_tau, s_need, s_q) or 2 (a list overflowed, or tau < lo: the complete body).
+// The same result on every rank. z: >= (W + 1) x RW free SMEM words (16-byte aligned).
+template <int T>
+__device__ __noinline__ int v2_r2l(const V2Params p, const uint32_t* rx, uint32_t* hist, uint32_t* z,
+                                   int zwords, const uint16_t* ckey, const uint32_t* cpos, int nc,
+                                   uint32_t tag, int par, int row, uint32_t* warp_sums, int* s_i) {
+  __shared__ int s_l[4];  // 0 lo (-1: not eligible), 1 hi, 2 list length, 3 ties
+  __shared__ int s_rn[kV2MaxW];
+  __shared__ uint32_t s_ra[kV2MaxW + 1];
+  const int tid = threadIdx.x, lane = tid & 31, W = p.W, K = p.K, IL = p.interleave;
+  uint32_t ws_par = 0;
+  const int cap = min(min(kR2Cap, kCoarseBins / W), (zwords / (W + 1) - 8) / 2);  // tie ids fit hist
+  const int RW = (4 + 2 * cap + 3) & ~3;
+  uint32_t* const snd = z;
+  uint32_t* const rcv = z + RW;
+  if (tid == 0) {
+    int lo = -1, hi = -1;
+    if (s_i[1] >= 0) {
+      lo = hi = s_i[1];
+    } else {
+      bool ok = true;
+      lo = 0;
+      for (int r = 0; r < W; ++r) {
+        const uint32_t* s = rx + r * kV2Msg;
+        const uint32_t w5 = s[5] & 0xFFFFFFu;
+        ok = ok && !((s[0] >> 16) & 1u) && ((w5 >> 16) & 1u);
+        hi = max(hi, (int)(w5 & 0xFFFFu));
+        lo = max(lo, (int)(s[6] & 0xFFFFu));
+      }
+      if (!ok || lo < 1 || hi < lo || hi - lo >= kCoarseBins) lo = -1;
+    }
+    s_l[0] = (row < kR2Rows && cap >= 256) ? lo : -1;
+    s_l[1] = hi;
+    s_l[2] = 0;
+    s_ra[kV2MaxW] = 0u;
+  }
+  __syncthreads();
+  const int lo = s_l[0], hi = s_l[1];
+  if (lo < 0) return 0;
+  {  // this rank's candidates in [lo, hi] (warp-aggregated append) and its count above hi
+    uint32_t above = 0;
+    for (int c0 = 0; c0 < nc; c0 += T) {
+      const int c = c0 + tid;
+      const int k = c < nc ? (int)ckey[c] : -1;
+      above += k > hi;
+      const bool in = k >= lo && k <= hi;
+      const unsigned m = __ballot_sync(0xffffffffu, in);
+      int b = 0;
+      if (lane == 0 && m) b = atomicAdd(&s_l[2], __popc(m));
+      b = __shfl_sync(0xffffffffu, b, 0) + __popc(m & ((1u << lane) - 1u));
+      if (in && b < cap) {
+        const int pos = (int)cpos[c];
+        snd[4 + 2 * b] = tagw(tag, (uint32_t)k);
+        snd[5 + 2 * b] = tagw(tag, (uint32_t)(((pos / IL) * W + p.rank) * IL + pos % IL));
+      }
+    }
+    above = __reduce_add_sync(0xffffffffu, above);
+    if (lane == 0 && above) atomicAdd(&s_ra[kV2MaxW], above);
+  }
+  __syncthreads();
+  const int n = s_l[2];
+  const bool over = n > cap;
+  const int ne = over ? 0 : n;
+  const int nv = (4 + 2 * ne + 3) >> 2;
+  if (tid < 4)
+    snd[tid] = tagw(tag, tid == 0 ? (over ? 0x800000u : (uint32_t)ne)
+                         : tid == 1 ? min(s_ra[kV2MaxW], 0x7FFFFFu) : tid == 2 ? (uint32_t)lo : 0u);
+  if (tid < 4 && 4 + 2 * ne + tid < 4 * nv) snd[4 + 2 * ne + tid] = tagw(tag, 0u);
+  __syncthreads();
+  const int64_t r2row = p.off_r2 + ((int64_t)(par * min(p.cap, kR2Rows) + row) * W) * kR2W;
+  {
+    const int64_t base = r2row + (int64_t)p.rank * kR2W;
+    for (int j = tid; j < nv; j += T) {
+      const uint4 v = *reinterpret_cast<const uint4*>(snd + 4 * j);
+      if (p.mc) mc_st_v4(p.mc + (base + 4 * j) * 4, v);
+      else
+        for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + base + 4 * j, v);
+    }
+  }
+  const uint4 dead = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+  auto poll = [&](int r, int j) -> uint4 {  // vector j of rank r's slot, then re-armed
+    uint32_t* src = p.box + r2row + (int64_t)r * kR2W + 4 * j;
+    const long long t0 = now_ns();
+    uint4 v = ld_sys_v4(src);
+    while (!tagged(v, tag)) {
+      if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 43); break; }
+      v = ld_sys_v4(src);
+    }
+    st_v4(src, dead);
+    return v;
+  };
+  if (tid < W) {
+    const uint4 v = poll(tid, 0);
+    s_rn[tid] = (v.x & 0x800000u) ? -1 : (int)(v.x & 0x7FFFFFu);
+    s_ra[tid] = v.y & 0xFFFFFFu;
+  }
+  __syncthreads();
+  for (int r = 0; r < W; ++r) {
+    const int nvr = (4 + 2 * max(s_rn[r], 0) + 3) >> 2;
+    for (int j = 1 + tid; j < nvr; j += T) *reinterpret_cast<uint4*>(rcv + r * RW + 4 * j) = poll(r, j);
+  }
+  __syncthreads();
+  int A = 0, M = 0;
+  bool bad = false;
+  for (int r = 0; r < W; ++r) {
+    bad = bad || s_rn[r] < 0;
+    A += (int)s_ra[r];
+    M += max(s_rn[r], 0);
+  }
+  if (bad || A >= K || A + M < K) return 2;
+  // tau: the bracket's histogram, scanned from the top (thread t: bins w - 1 - [t per, +per))
+  const int w = hi - lo + 1;
+  if (tid == 0 && w == 1) { s_i[1] = lo; s_i[2] = K - A; }
+  if (w > 1) {
+    for (int b = tid; b < w; b += T) hist[b] = 0u;
+    if (tid == 0) s_i[1] = -1;
+    __syncthreads();
+    for (int r = 0; r < W; ++r) {
+      const uint32_t* e = rcv + r * RW + 4;
+      for (int i = tid; i < s_rn[r]; i += T) atomicAdd(&hist[(int)(e[2 * i] & 0xFFFFu) - lo], 1u);
+    }
+    __syncthreads();
+    const int per = (w + T - 1) / T;
+    uint32_t sum = 0;
+    for (int j = 0; j < per; ++j) {
+      const int b = w - 1 - (tid * per + j);
+      if (b >= 0) sum += hist[b];
+    }
+    uint32_t tot;
+    uint32_t run = v2_scan<T>(sum, warp_sums + 32 * (ws_par ^= 1u), &tot) + (uint32_t)A;
+    for (int j = 0; j < per; ++j) {
+      const int b = w - 1 - (tid * per + j);
+      if (b < 0) break;
+      const uint32_t c = hist[b];
+      if (run < (uint32_t)K && run + c >= (uint32_t)K) { s_i[1] = lo + b; s_i[2] = K - (int)run; }
+      run += c;
+    }
+  }
+  if (tid == 0) { s_l[3] = 0; s_i[3] = 0; }
+  __syncthreads();
+  const int tau = s_i[1], need = s_i[2];
+  if (tau < lo) return 2;
+  // ties at tau: every rank's global ids, then this rank's quota (its ties ranked below need)
+  uint32_t* const tg = hist;  // <= W x cap ids
+  uint32_t mine = 0;
+  for (int r = 0; r < W; ++r) {
+    const uint32_t* e = rcv + r * RW + 4;
+    for (int i = tid; i < s_rn[r]; i += T)
+      if ((int)(e[2 * i] & 0xFFFFu) == tau) {
+        tg[atomicAdd(&s_l[3], 1)] = e[2 * i + 1] & 0xFFFFFFu;
+        mine += r == p.rank;
+      }
+  }
+  __syncthreads();
+  const int nt = s_l[3];
+  if (nt < need) return 2;
+  uint32_t sel = 0;
+  if (nt == need) {
+    sel = mine;
+  } else {
+    const uint32_t* me = rcv + p.rank * RW + 4;
+    for (int i = tid; i < s_rn[p.rank]; i += T)
+      if ((int)(me[2 * i] & 0xFFFFu) == tau) {
+        const uint32_t g = me[2 * i + 1] & 0xFFFFFFu;
+        int c = 0;
+        for (int j = 0; j < nt; ++j) c += tg[j] < g;
+        sel += c < need;
+      }
+  }
+  sel = __reduce_add_sync(0xffffffffu, sel);
+  if (lane == 0 && sel) atomicAdd(&s_i[3], (int)sel);
+  if (tid == 0) {
+    s_i[0] = 1;
+    if (p.stats) atomicAdd(&p.stats[w == 1 ? 2 : 3], 1);
+  }
+  __syncthreads();
+  return 1;
+}
+
 // One row. kFast: the common case only, compact code (in-step every call fetches the
 // executed code cold from L2; the rare paths inline made the hot path 2x slower there):
 // a rank whose candidates or window fall outside the fast path sends a saturated
@@ -1238,13 +1426,17 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // missed its ties) takes the tie round below instead: tau lies in every window, so every
       // rank's ties are in its candidates.
       //
-      // ---- CG first (rank-skewed rows), out of line (v2_cg); rows it cannot take keep R2
-      bool cg = false;
-      if (K31_RARE(tier == 3) && s_tau < 0) {
-        cg = v2_cg<T>(p, rx, hist, msg, ckey, nc, tag, par, row, warp_sums, s_i);
-        if (cg) tier = s_tier;
+      // ---- R2L first (tie-band misses, ties beyond the tie list, rank-skewed rows): one
+      // round of explicit lists, out of line (v2_r2l); rows it cannot take keep R2, rows it
+      // fails after its round (list overflow, tau below its bracket) take the complete body
+      int rl = 0;
+      if (K31_RARE(tier == 2 || tier == 3)) {
+        constexpr int kZ = kV2RxW + kV2Cand + kV2Msg + kV2Win;  // after win (16-byte aligned)
+        rl = v2_r2l<T>(p, rx, hist, reinterpret_cast<uint32_t*>(srow) + kZ, kV2NR * T * 4 - kZ,
+                       ckey, cpos, nc, tag, par, row, warp_sums, s_i);
+        tier = rl == 1 ? 1 : rl == 2 ? 6 : tier;
       }
-      if (tier == 3 && !cg) {
+      if (tier == 3) {
         // saturated windows / failed fast paths take R2 too: every window is a lower bound
         if (row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
