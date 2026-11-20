@@ -41,10 +41,15 @@ def make_layer(F, ctx, nreq, dev, seed):
         torch.float8_e4m3fn
     )
     idx = torch.empty(F, TOPK, dtype=torch.int32, device=dev)
+    lidx = torch.empty(F, TOPK, dtype=torch.int32, device=dev)
+    req_ids = torch.empty(F, dtype=torch.int32, device=dev)
+    btab = torch.zeros(nreq, max(pages), dtype=torch.int32, device=dev)
     row = 0
     base = 0
     for r in range(nreq):
         bt = perm[base : base + pages[r]].to(torch.int64)
+        btab[r, : pages[r]] = bt.to(torch.int32)
+        req_ids[row : row + fresh[r]] = r
         base += pages[r]
         n = fresh[r]
         pos = ctx + torch.arange(n, device=dev)  # causal: key <= pos
@@ -58,7 +63,9 @@ def make_layer(F, ctx, nreq, dev, seed):
             logical = keys.topk(TOPK, dim=1).indices.sort(dim=1).values
             phys = bt[logical // page] * page + logical % page
             idx[row + c0 : row + c1] = phys.to(torch.int32)
+            lidx[row + c0 : row + c1] = logical.to(torch.int32)
         row += n
+    idx.logical = (lidx, req_ids, btab)  # request-relative top-k for h8L / remap
     return kv, idx
 
 
@@ -120,6 +127,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=72900)
     ap.add_argument("--h8-ns", type=int, default=0, help="h8 KV stages (diagnostic, <= 6)")
     ap.add_argument("--reqs", type=int, default=3)
+    ap.add_argument("--h8l-knobs", default="", help="h8 logical-mode knob lists")
     ap.add_argument("--layers", type=int, default=3)
     ap.add_argument("--iters", type=int, default=9)
     ap.add_argument("--json", default=None)
@@ -307,6 +315,47 @@ def main():
                     print("h2 knobs", kn, {k: v for k, v in r.items() if k != "cta0_tiles_0_20"},
                           flush=True)
         import importlib
+
+        if "h8L" in kernels or "remap" in kernels:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+                sparse_mla_prefill_h8_logical,
+            )
+            from vllm.v1.attention.backends.mla.sparse_utils import (
+                triton_convert_req_index_to_global_index,
+            )
+
+            def vl(i, knobs=()):
+                kv, idx = layers[i % len(layers)]
+                lidx, rq, btab = idx.logical
+                sparse_mla_prefill_h8_logical(qf3, kv.view(-1, 576), lidx, rq, btab, 64, 64,
+                                              0.0722, 1.0, out=vr_out, knobs=knobs,
+                                              lengths=seq, phys_dbg=idx)
+
+            def vremap(i):
+                kv, idx = layers[i % len(layers)]
+                lidx, rq, btab = idx.logical
+                triton_convert_req_index_to_global_index(
+                    rq, btab, lidx, BLOCK_SIZE=64, BLOCK_STRIDE_ROWS=64, NUM_TOPK_TOKENS=TOPK,
+                    return_valid_counts=True)
+
+            if "h8L" in kernels:
+                from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+                    sparse_mla_prefill_h8,
+                )
+                kv0, idx0 = layers[0]
+                ref8 = sparse_mla_prefill_h8(qf3, kv0.view(-1, 576), idx0, seq, 0.0722, 1.0)
+                vl(0)
+                torch.cuda.synchronize()
+                res["h8L_equal_h8"] = bool(torch.equal(vr_out, ref8))
+                st["attn_h8L"] = time_stage(vl, a.iters)
+                print("h8L equal", res["h8L_equal_h8"], st["attn_h8L"], flush=True)
+                for kn in [k for k in a.h8l_knobs.split(",") if k]:
+                    knobs = tuple(int(v) for v in kn.split(":"))
+                    st[f"attn_h8L_{kn}"] = time_stage(lambda i, k=knobs: vl(i, k), a.iters)
+                    print("h8L", kn, st[f"attn_h8L_{kn}"], flush=True)
+            if "remap" in kernels:
+                st["remap"] = time_stage(vremap, a.iters)
+                print("remap", st["remap"], flush=True)
 
         for kname in [k for k in ("h4", "h5", "h6", "h7", "h8") if k in kernels]:
             kfn = getattr(importlib.import_module(
