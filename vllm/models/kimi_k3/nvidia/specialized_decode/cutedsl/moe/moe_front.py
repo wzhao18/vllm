@@ -404,7 +404,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const int n = a.n;
 
   if (threadIdx.x == 0) {
-    asm volatile("griddepcontrol.launch_dependents;");
     STAMP(0);
     for (int s = 0; s < p.ns; ++s) {
       mbar_init(full0 + 8 * s, 1);
@@ -685,6 +684,9 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     }
   }
   if (threadIdx.x == 0) {
+    // EXPERIMENT: dependents launch only as this grid ends (no co-resident dependent
+    // beside the tail).
+    asm volatile("griddepcontrol.launch_dependents;");
     STAMP(5);
     // The last CTA of the grid (every CTA is past its waits) resets the counters.
     if (atomicAdd(p.cnt + 2 * kLine, 1u) == gridDim.x - 1) {
