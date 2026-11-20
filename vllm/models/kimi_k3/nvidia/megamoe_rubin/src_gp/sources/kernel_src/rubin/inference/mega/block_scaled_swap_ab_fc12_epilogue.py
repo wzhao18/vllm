@@ -49,6 +49,7 @@ from .....helpers.dsl_helpers import ReadyFlag, wait_ready
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
 from ......common.ptx_helpers import (
+    nanosleep,
     read_clock64,
     read_globaltimer_ns,
     cp_async_bulk_s2g,
@@ -65,6 +66,10 @@ from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
 from ....schedulers.base import SchedulerConsumer
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 
+# Timing probe (pmoe_probe3.py PMOE_FC1X; wrong outputs): 1 SiTU -> gate*up, 2 no amax/scale (plain cvt),
+# 3 no FC1 global stores (SF STG + TMA store), 4 no TMEM transposes, 5 epilogue-free (acc released at once).
+_PROBE_FC1 = 0
+_PROBE_FC1_DELAY_NS = 0  # 6: warpgroup 1 sleeps this long after each FC1 accumulator wait (stagger probe)
 
 @dataclasses.dataclass(frozen=True)
 class QuantImpl:
@@ -1826,6 +1831,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state)
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        if cutlass.const_expr(_PROBE_FC1 == 5):
+            valid_tokens = cutlass.Int32(0)
+        if cutlass.const_expr(_PROBE_FC1 == 6):
+            if self.warpgroup_idx == cutlass.Int32(1):
+                nanosleep(_PROBE_FC1_DELAY_NS)
 
         for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
             if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
@@ -1869,10 +1879,23 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     ):
         """Activate, quantize and store one 64-token subtile; a shared tile of another kind stores through the shared
         target."""
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            ps0 = read_clock64()
         topk_scores = self._preload_topk_scores(work_tile_info, subtile_idx, is_shared)
         two_token = self._subtile_activation(tmem_subtile_tensor, alpha_val)
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            ps_act = two_token[2]
+            two_token = (two_token[0], two_token[1])
+            ps1 = read_clock64()
         if cutlass.const_expr(same_kind):
-            self._subtile_store(work_tile_info, subtile_idx, two_token, topk_scores, norm_const, is_shared)
+            ps_q = self._subtile_store(work_tile_info, subtile_idx, two_token, topk_scores, norm_const, is_shared)
+            if cutlass.const_expr(_PROBE_FC1 == 7):
+                ps2 = read_clock64()
+                if (cute.arch.block_idx()[0] == cutlass.Int32(0)) & (self.tidx == cutlass.Int32(0)):
+                    cute.printf(
+                        "PF1 {} {} {} {} {} {}",
+                        subtile_idx, ps_act[0] - ps0, ps_act[1] - ps0, ps_act[2] - ps0, ps_q - ps0, ps2 - ps0,
+                    )
         else:
             if is_shared:
                 self.shared_target._subtile_store(work_tile_info, subtile_idx, two_token, None, None)
@@ -1982,8 +2005,28 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             wrap_into_copy_standard_layout(up_token_32_64),
         )
 
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            pa0 = read_clock64()
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(gate_token_0_32, up_token_0_32, alpha_val)
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            pa1c = read_clock64()
+        if cutlass.const_expr(_PROBE_FC1 == 4):
+            token_0_32_pre_quant = token_0_32_pre_quant_pre_trans
+            token_32_64_pre_quant = self.alpha_swiglu_clamp(gate_token_32_64, up_token_32_64, alpha_val)
+        else:
+            token_0_32_pre_quant, token_32_64_pre_quant = self._activation_transposed(
+                tmem_subtile_tensor, token_0_32_pre_quant_pre_trans, gate_token_32_64, up_token_32_64, alpha_val
+            )
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            pa2 = read_clock64()
+            return (token_0_32_pre_quant, token_32_64_pre_quant, (pa0, pa1c, pa2))
+        return (token_0_32_pre_quant, token_32_64_pre_quant)
+
+    @cute.jit
+    def _activation_transposed(
+        self, tmem_subtile_tensor, token_0_32_pre_quant_pre_trans, gate_token_32_64, up_token_32_64, alpha_val
+    ):
 
         # gate_token_32_64 / up_token_32_64 are already in the transpose input
         # distribution documented by TmemTranspose16x32.
@@ -2050,6 +2093,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             is_shared=is_shared,
         )
 
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            pq = read_clock64()
         # Step 3: TMASTG
         subtile_bar_id = subtile_idx + cutlass.Int32(SwapABGatedActEpilogue._EpilogueAsyncBarIdBase)
         tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
@@ -2059,7 +2104,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         if self.warp_idx == subtile_idx:
             tma_ready_to_read_smem_named_barrier.arrive_and_wait()
             with cute.arch.elect_one():
-                if cutlass.const_expr(is_shared is None):
+                if cutlass.const_expr(_PROBE_FC1 == 3):
+                    pass
+                elif cutlass.const_expr(is_shared is None):
                     self._issue_fc1_tma(work_tile_info, subtile_idx, fc1_output)
                 else:
                     if is_shared:
@@ -2069,6 +2116,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 cute.arch.cp_async_bulk_commit_group()
         else:
             tma_ready_to_read_smem_named_barrier.arrive()
+        if cutlass.const_expr(_PROBE_FC1 == 7):
+            return pq
 
     @cute.jit
     def _issue_fc1_tma(self, work_tile_info: SwapAbFc12WorkTileInfo, subtile_idx: cutlass.Int32, fc1_output):
@@ -2295,7 +2344,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         alpha_val: Optional[cutlass.Float32],
     ) -> cute.Tensor:
         # The BI branch executes the same ordered scalar chain for every tile.
-        if cutlass.const_expr(self.batch_invariant):
+        if cutlass.const_expr(_PROBE_FC1 == 1):
+            out = cute.make_rmem_tensor((cute.size(gate_rmem),), cutlass.Float32)
+            for i in cutlass.range_constexpr(cute.size(gate_rmem)):
+                out[i] = gate_rmem[i] * up_rmem[i]
+        elif cutlass.const_expr(self.batch_invariant):
             out = cute.make_rmem_tensor((cute.size(gate_rmem),), cutlass.Float32)
             alpha_pair = None
             if cutlass.const_expr(alpha_val is not None):
@@ -2628,7 +2681,18 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         # 2) Core block quant. One scale factor per token either way; the paired direction spends
         #    its exchange barrier inside this call.
-        data_regs, sf_regs = quant(weighted, norm_const=norm_const, smem_intermediate=amax_exchange)
+        if cutlass.const_expr(_PROBE_FC1 == 2):
+            data_regs = cute.make_rmem_tensor((2 * values_per_token,), cutlass.Float4E2M1FN)
+            sf_regs = cute.make_rmem_tensor((2,), cutlass.Float8E4M3FN)
+            w_blocks = cute.zipped_divide(weighted, (values_per_token,))
+            probe_blocks = []
+            for half in cutlass.range_constexpr(2):
+                probe_blocks.append(w_blocks[None, half].load().to(cutlass.Float4E2M1FN))
+            quant._store_packed_blocks(data_regs, probe_blocks)
+            probe_sf = weighted[0].to(cutlass.Float8E4M3FN)
+            sf_regs.store(quant._values_to_ssa([probe_sf, probe_sf], cutlass.Float8E4M3FN))
+        else:
+            data_regs, sf_regs = quant(weighted, norm_const=norm_const, smem_intermediate=amax_exchange)
         data_by_token = cute.zipped_divide(data_regs, (values_per_token,))
 
         # Retire the exchange: its slots are this stage's own bytes, so no thread may start
@@ -2637,6 +2701,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # flight (the e8m0 path alone goes through MUFU).
         if cutlass.const_expr(self.needs_pair_amax_exchange):
             self._warpgroup_sync_barrier(self.warpgroup_idx).arrive_and_wait()
+        if cutlass.const_expr(_PROBE_FC1 == 3):
+            stores_scale_factor = self.lane_idx > cutlass.Int32(64)
 
         for half in cutlass.range_constexpr(2):
             # 3) scale-factor store (predicate const-elided when statically in-bound, mirroring
