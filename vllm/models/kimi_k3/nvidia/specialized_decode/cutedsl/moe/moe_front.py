@@ -3,37 +3,40 @@
 """The SP decode MoE front as ONE kernel: router | latent down GEMM, stock router
 top-k and the MegaMoE input staging (``moe_front``).
 
-Replaces router|latent GEMM -> (cuBLASLt split-K reduce) -> ``route_stage``: the
-chain from the AttnRes output ``h [n, 7168]`` to a staged MegaMoE session is one
-launch, so the per-boundary grid drain + memory flush and the separate one-row
-top-k grid leave the critical path.
+Replaces router|latent GEMM -> (split-K reduce) -> ``route_stage``: the chain from
+the AttnRes output ``h [n, 7168]`` to a staged MegaMoE session is one launch.
 
-Kernel (Rubin, tcgen05, one CTA of 256 threads per SM slot):
+Kernel (Rubin, tcgen05, one CTA of 256 threads per SM, the whole grid co-resident):
 
 * GEMM ``y = h @ W^T`` with ``W = [router (E) | latent down (L)] [E + L, K]`` BF16
   (``sp_mlp.pack_router_latent``), FP32 accumulation. Swap-AB: a 128-row weight
-  tile is the MMA M operand, the n <= 256 tokens the N operand. One cluster of C
-  CTAs per weight tile; CTA rank r streams K blocks [r kb / C, (r + 1) kb / C).
-* PDL: the kernel launches with programmatic stream serialization; the weight ring
-  is issued before ``griddepcontrol.wait`` (weights never depend on the
-  predecessor), the tokens after it. The predecessor (AttnRes reduce) triggers its
-  dependents at entry and uses ~2 KB of shared memory per CTA, so this grid's CTAs
-  can sit beside it and stream weights while it runs.
-* Split-K reduce: every CTA leaves its FP32 partial in its own shared memory; after
-  a cluster barrier rank r sums the token rows [r n / C, (r + 1) n / C) over ranks
-  0..C-1 in rank order (deterministic) from DSMEM.
-  - router tiles store the FP32 logits rows (``y``) and then count themselves done
-    (release, one global counter);
-  - latent tiles round to BF16 (as the stock BF16 latent down output) and run the
-    MegaMoE stager's quantization (NVFP4 block16 / MXFP8 block32, ``route_stage``'s
-    ``quant_*``: bitwise ``megamoe_rubin.staging._stage_kernel``) straight into the
-    session's ``x`` / ``x_sf``.
-* Top-k: CTA b < n waits (acquire) until every router CTA is done and runs stock's
-  sigmoid + bias single-group top-k on row b with ``route_stage``'s ``route_block``
-  (bitwise ``_moe_C`` ``single_group_topk``: same keys, same exact selection, same
-  ``write_outputs`` math, the stager's route rules). Router tiles are claimed first,
-  by clusters that are already running, so the wait cannot deadlock.
-* Dead rows ``[n, capacity)`` get ``topk_idx = -1`` as ``route_stage``.
+  tile is the MMA M operand, the n <= 96 tokens the N operand. Work item = (tile,
+  K split): 35 tiles x 6 splits on 210 SMs; the host plan gives every SM the items
+  whose weights its die homes (``front_image``: die-local weight image).
+* Weights before the dependency: the item's first K blocks go to TMEM (tcgen05.cp
+  through a shared-memory ring, A operand of the TS MMA), the rest stay in shared
+  memory (SS MMA). The predecessor (AttnRes reduce) uses little shared memory, so
+  this grid's CTAs enter early and the weights are on chip by griddepcontrol.wait
+  (r8/r16; at r24 the fill ends shortly after it).
+* Tokens after the dependency: 3-D TMA ops of up to 16 KiB per ring slot (several
+  issuing warps), recycled through the ring when they do not all fit.
+* MMA issue: one warp (warp 1), 4 MMAs per K block, a 4-block token group under
+  one elect at n32. Its per-iteration issue latency, not the tensor pipe, bounds
+  the MMA phase (drain bench: ~425 clk per iteration with no waits).
+* Split-K exchange: every CTA stores its FP32 partial [n][128] and signals its tile
+  (one release add). Latent CTAs wait for their tile, sum its partials in rank
+  order (deterministic), round to BF16 (the stock latent down output) and run the
+  MegaMoE stager's quantization (NVFP4 block16 / MXFP8 block32, ``route_stage``'s
+  ``quant_*``) straight into the session's ``x`` / ``x_sf``.
+* Top-k: the SM of row b (router items first, then latent items) waits for every
+  router tile, sums the row's logits from the partials in rank order and runs
+  stock's sigmoid + bias single-group top-k with ``route_stage``'s ``route_block``
+  (bitwise ``_moe_C`` ``single_group_topk`` keys, exact selection, write_outputs
+  math, the stager's route rules). Dead rows ``[n, capacity)`` get ``topk_idx =
+  -1`` as ``route_stage``.
+* Cold code: the tail is long straight-line code that the step's other kernels
+  evict from L2 between layers; the spare SMs (no item) run it dry before the
+  dependency so the real pass finds it in L2.
 
 Numerics vs stock: router logits FP32 with a different summation order than
 cuBLAS (same inputs, FP32 accumulation); the latent the BF16 round of an FP32 sum
