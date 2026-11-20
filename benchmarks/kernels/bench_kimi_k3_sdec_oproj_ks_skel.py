@@ -41,7 +41,7 @@ _CU = r"""
 #define XB (XCH * XNCH)
 #define PART (16 * 1024)
 #define STG (8 * 1024)
-#define SMEM (WB + XB + 2 * 2 * PART + STG + 1024)
+#define SMEM (WB + 2 * XCH + 2 * 2 * PART + STG + 1024)
 struct Prm { const char* w; const char* x; char* peers[4]; int rank, n, mode; unsigned long long* ts;
              const volatile int* flag; };
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -72,13 +72,15 @@ __device__ __forceinline__ unsigned cl_rank() { unsigned r; asm volatile("mov.u3
 // mode bits: 1 x stream, 2 DSMEM reduce-scatter, 4 NVLink pushes
 __global__ void __cluster_dims__(KS, 1, 1) __launch_bounds__(128, 1) skel(Prm p) {
   extern __shared__ __align__(1024) char sm[];
-  char* W = sm; char* X = W + WB; char* R = X + XB;  // R: 2 slots x 2 peers x 16 KB
+  char* W = sm; char* X = W + WB; char* R = X + 2 * XCH;  // X: 2-slot ring of 12 KB; R: 2 slots x 2 peers x 16 KB
   char* S = R + 4 * PART;
-  uint64_t* bars = (uint64_t*)(S + STG);  // 0 w, 1 x, 2-3 recv slot, 4-5 credit slot
+  uint64_t* bars = (uint64_t*)(S + STG);  // 0 w, 1-2 x slots, 3-4 recv slot, 5-6 credit slot
+  volatile int* landed = (volatile int*)(bars + 8);
   const int s = (int)cl_rank(), f = blockIdx.y, n = p.n;
   const int tid = threadIdx.x;
   if (tid == 0) {
-    for (int i = 0; i < 6; ++i) bar_init(bars + i, i >= 4 ? KS - 1 : 1);
+    for (int i = 0; i < 7; ++i) bar_init(bars + i, i >= 5 ? KS - 1 : 1);
+    *landed = (p.mode & 1) ? 0 : 4;
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -86,7 +88,7 @@ __global__ void __cluster_dims__(KS, 1, 1) __launch_bounds__(128, 1) skel(Prm p)
     const unsigned long long tg = gt();
     while (*p.flag == 0 && gt() - tg < 2000000000ull) {}
     expect(bars + 0, WB);
-    for (int c = 0; c < WB / XCH + 1 && c * XCH < WB; ++c) {
+    for (int c = 0; c * XCH < WB; ++c) {
       int bytes = (WB - c * XCH) < XCH ? (WB - c * XCH) : XCH;
       gload(W + c * XCH, p.w + ((size_t)(f * KS + s)) * WB + c * XCH, bytes, bars + 0);
     }
@@ -94,31 +96,37 @@ __global__ void __cluster_dims__(KS, 1, 1) __launch_bounds__(128, 1) skel(Prm p)
   }
   __syncthreads();
   unsigned long long t0 = gt();
-  if (tid == 0) {
-    const int nb = 4;
-    uint32_t xph = 0;
-    int order[4];
-    for (int i = 0; i < 4; ++i) order[i] = (p.rank + 1 + i) & 3;  // remote owners first, own last
-    if (p.mode & 1) { expect(bars + 1, XB);
-      for (int c = 0; c < XNCH; ++c) gload(X + c * XCH, p.x + ((size_t)(order[0] * KS + s)) * XB + c * XCH, XCH, bars + 1); }
-    for (int b = 0; b < nb; ++b) {
+  int order[4];
+  for (int i = 0; i < 4; ++i) order[i] = (p.rank + 1 + i) & 3;  // remote owners first, own last
+  if (tid == 0 && (p.mode & 1)) {  // x producer: 32 chunks of 12 KB through 2 slots
+    for (int k = 0; k < 4 * XNCH; ++k) {
+      const int slot = k & 1, b = k / XNCH, c = k % XNCH;
+      if (k >= 2) bwait(bars + 1 + slot, ((k - 2) >> 1) & 1);
+      if (k >= 2 && ((k - 2) % XNCH) == XNCH - 1) *landed = (k - 2) / XNCH + 1;
+      expect(bars + 1 + slot, XCH);
+      gload(X + slot * XCH, p.x + ((size_t)(order[b] * KS + s)) * XB + c * XCH, XCH, bars + 1 + slot);
+    }
+    for (int k = 4 * XNCH; k < 4 * XNCH + 2; ++k) {
+      const int slot = k & 1;
+      bwait(bars + 1 + slot, ((k - 2) >> 1) & 1);
+      if (((k - 2) % XNCH) == XNCH - 1) *landed = (k - 2) / XNCH + 1;
+    }
+  }
+  if (tid == 32) {  // reduce-scatter + push of each finished owner block
+    for (int b = 0; b < 4; ++b) {
       const int o = order[b], slot = b & 1;
-      if (p.mode & 1) {
-        bwait(bars + 1, xph); xph ^= 1;
-        if (b + 1 < nb) { expect(bars + 1, XB);
-          for (int c = 0; c < XNCH; ++c) gload(X + c * XCH, p.x + ((size_t)(order[b + 1] * KS + s)) * XB + c * XCH, XCH, bars + 1); }
-      }
+      while (*landed < b + 1) {}
       if (p.mode & 2) {
-        if (b >= 2) bwait(bars + 4 + slot, ((b - 2) >> 1) & 1);  // peers freed my slot in their buffers
-        expect(bars + 2 + slot, 2 * PART);
+        if (b >= 2) bwait(bars + 5 + slot, ((b - 2) >> 1) & 1);
+        expect(bars + 3 + slot, 2 * PART);
         for (int d = 1; d < KS; ++d) {
-          const int peer = (s + d) % KS, idx = (s - peer + KS) % KS - 1;  // my index in the peer's slot
+          const int peer = (s + d) % KS, idx = (s - peer + KS) % KS - 1;
           uint32_t dst = mapa(sa(R + (slot * 2 + idx) * PART), peer);
-          uint32_t pb = mapa(sa(bars + 2 + slot), peer);
-          dsm_copy(dst, X + d * PART, PART, pb);
+          uint32_t pb = mapa(sa(bars + 3 + slot), peer);
+          dsm_copy(dst, W + d * PART, PART, pb);
         }
-        bwait(bars + 2 + slot, (b >> 1) & 1);
-        for (int d = 1; d < KS; ++d) remote_arrive(mapa(sa(bars + 4 + slot), (s + d) % KS));
+        bwait(bars + 3 + slot, (b >> 1) & 1);
+        for (int d = 1; d < KS; ++d) remote_arrive(mapa(sa(bars + 5 + slot), (s + d) % KS));
       }
       if (p.mode & 4) {
         asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
@@ -142,10 +150,11 @@ void setup_peers(int64_t ngpu) {
   for (int g = 0; g < ngpu; ++g) { cudaSetDevice(g);
     for (int q = 0; q < ngpu; ++q) if (q != g) { cudaError_t e = cudaDeviceEnablePeerAccess(q, 0);
       if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) TORCH_CHECK(false, cudaGetErrorString(e)); }
-    cudaFuncSetAttribute(skel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-    cudaFuncSetAttribute(skel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    int optin = 0; cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, g);
+    cudaError_t e = cudaFuncSetAttribute(skel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    if (g == 0) printf("smem optin %d need %d set %s\n", optin, (int)SMEM, cudaGetErrorString(e));
+    TORCH_CHECK(e == cudaSuccess, cudaGetErrorString(e));
   }
-  cudaGetLastError();
 }
 
 void launch(int64_t dev, int64_t w, int64_t x, std::vector<int64_t> peers, int64_t rank, int64_t n,
