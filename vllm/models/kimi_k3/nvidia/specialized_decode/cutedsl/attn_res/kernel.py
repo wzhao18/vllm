@@ -16,6 +16,7 @@ from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
     add_rn,
     alloc,
+    asm,
     at,
     bf16,
     bf16x2,
@@ -85,6 +86,27 @@ SMEM_BYTES = 64 * 4 + 3 * 112 * 4 + 3 * 16 * 4 + 3 * 8
 BESIDE_SMEM = (228 * 1024 - 2 * 1024 - SMEM_BYTES) // 1024 * 1024
 
 
+
+# DIAG (chain bench): chunk-staggered MXFP8 publish, nanosleep-paced
+PUBLISH_STAGGER_NS = 0
+
+
+@asm(Int64)
+def _globaltimer():
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@asm()
+def _nanosleep(ns):
+    return "nanosleep.u32 $0;", "r", (Int32(ns),)
+
+
+@cute.jit
+def _stagger(part, ns: cutlass.Constexpr[int]):
+    target = _globaltimer() + Int64(part) * ns
+    while _globaltimer() < target:
+        _nanosleep(64)
+
 class ClusterAttnRes:
     """``sanitize``: multi-slot sums map -0 to +0 after rounding, as the framework
     all-reduce they replace does (the Rubin dense ring)."""
@@ -114,6 +136,8 @@ class ClusterAttnRes:
         # ``output`` and also its MXFP8 row token locally (output = (tensor, data
         # address, scale address)).
         self.out_mx = out_mx
+        # DIAG (chain bench): the publish of chunk CTA c waits c x stagger_ns
+        self.stagger_ns = PUBLISH_STAGGER_NS
         # ``poll_warp`` (Rubin): the delta's Lamport poll exits by a warp vote
         # (``common.mailbox.poll_warp``), so the exchange's shuffles that follow do not
         # wait for per-lane poll loops to reconverge. Same words.
@@ -396,6 +420,8 @@ class ClusterAttnRes:
             values = tuple(rounded[0, i] for i in range(8))
             if cutlass.const_expr(self.out_mx == "publish"):
                 mc, row0, smc = output
+                if cutlass.const_expr(self.stagger_ns > 0):
+                    _stagger(ids[0], self.stagger_ns)
                 mx_rows.publish(values, mc, smc, row0 + token, col, 7168)
             else:
                 out, data, scale = output

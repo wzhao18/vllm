@@ -67,6 +67,42 @@ def test_pre_bitwise_kda_in():
         assert torch.equal(again, out), r
 
 
+def test_pre_check_x_patches_every_word():
+    """``check_x``: activation stages loaded as sentinels (a publish-only SP all-gather
+    box before its rows land) are re-read word by word from the check arguments'
+    addresses: bitwise the unchecked GEMM, for the 1-CTA and 2-CTA activation
+    tactics; rows >= R are not checked."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (
+        check_args,
+    )
+
+    torch.cuda.set_device(DEVICE)
+    n = 1024
+    wq, sw = mx_weight(n, K, 2)
+    cases = (
+        (120, ((128, 64), (1, 1), False, 128)),
+        (128, ((128, 64), (1, 1), False, 128)),
+        (256, ((256, 128), (2, 1), False, 256)),
+        (384, ((256, 256), (2, 1), False, 256)),
+    )
+    for r, tactic in cases:
+        x = torch.randn(r, K, device=DEVICE).bfloat16()
+        xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+        words = xq.view(torch.int32)
+        words[words == -0x80000000] = 0  # published words are never the sentinel
+        gemm = Mxfp8PreGemm(n, K, r, tactic, check=True, device=DEVICE)
+        want = torch.empty(r, n, device=DEVICE, dtype=torch.bfloat16)
+        gemm(xq, xs, wq, sw, want)
+        assert torch.equal(want, scaled_mm(xq, xs, wq, sw)), r
+        sq = torch.empty_like(xq)
+        sq.view(torch.int32).fill_(-0x80000000)
+        ss = torch.full_like(xs.view(torch.uint8), 0xFF)
+        got = torch.zeros_like(want)
+        check = check_args(xq.data_ptr(), xs.data_ptr(), r, K, DEVICE)
+        gemm(sq, ss, wq, sw, got, check=check)
+        assert torch.equal(got, want), r
+
+
 def test_pre_graph_chain():
     torch.cuda.set_device(DEVICE)
     weights = [mx_weight(N, K, s) for s in (2, 3)]

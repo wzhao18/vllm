@@ -46,7 +46,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ..common import mx_rows
 from ..common.host import architecture, dynamic_fake, fake
 from ..common.mailbox import poll, rearm
-from ..common.primitives import at, launch, load_words, store_relaxed
+from ..common.primitives import asm, at, launch, load_words, store_relaxed
 from ..common.sp_comm import positive_zero32
 from .kernel import ClusterAttnRes
 
@@ -54,6 +54,21 @@ CLUSTER = 7  # CTAs per row (1024 columns each)
 # (kind, nb) -> (CTAs per SM, SMs, registers, smem allowance) of the compiled codes
 RESIDENCY: dict = {}
 THREADS = 128
+
+
+# DIAG (chain bench): per-CTA globaltimer stamps of the publish-only gather, int64
+# [CTAs, 2] (start, end) at ``SpBoundary.stamp_ptr``; None = not compiled in.
+GATHER_STAMPS = False
+
+
+@asm(Int64)
+def _globaltimer():
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@asm()
+def _store_stamp(address, value):
+    return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
 
 
 def _launch(kernel, args):
@@ -86,10 +101,14 @@ class SpAttnResGather(ClusterAttnRes):
     [n, NB, 7168], norm, query, out_norm [7168], output (unused row view), eps,
     out_eps, the gather multicast address, rank, the local gather view [cap, 7168]."""
 
-    def __init__(self, nb, tp, *, has_delta, write, mx=False, parts=0, **options):
+    def __init__(self, nb, tp, *, has_delta, write, mx=False, parts=0,
+                 publish_only=False, **options):  # fmt: skip
         # ``mx``: publish the normed rows as MXFP8 into the MXFP8 box (``SpComm``
         # gather data + scale regions; ``common.mx_rows``) for an MXFP8 in-projection;
         # args 9.. are then (data mc, scale mc, rank, local data, local scales).
+        # ``publish_only`` (with ``mx``): no poll; each CTA exits after its row chunk
+        # is stored on every rank; the in-projection checks the box words itself
+        # (``SpComm.mx_checked_view``, ``gemm.sm107.check_x``).
         # ``parts``: the delta is a beta-add GEMM's FP32 split-K partials (arg 0,
         # [parts * n, 7168]) and its BF16 residual (the last arg, [n, 7168]); see
         # ``ClusterAttnRes.sum_parts``.
@@ -98,7 +117,10 @@ class SpAttnResGather(ClusterAttnRes):
             nb, slots=0, has_delta=has_delta, write=write, delta_parts=parts, **out,
             **options,
         )  # fmt: skip
-        self.tp, self.mx = tp, mx
+        if publish_only and not mx:
+            raise ValueError("SpAttnResGather: publish_only needs the MXFP8 all-gather")
+        self.tp, self.mx, self.publish_only = tp, mx, publish_only
+        self.stamps = publish_only and GATHER_STAMPS
 
     @cute.jit
     def __call__(self, *args):
@@ -113,6 +135,9 @@ class SpAttnResGather(ClusterAttnRes):
         tid, _, _ = cute.arch.thread_idx()
         n = prefix.shape[0]
         bufs = self.setup(cutlass.utils.SmemAllocator())
+        if cutlass.const_expr(self.stamps):
+            if tid == 0:
+                _store_stamp(args[14] + Int64((token * 7 + part) * 16), _globaltimer())
         cute.arch.cluster_arrive_relaxed()
         cute.arch.griddepcontrol_launch_dependents()
         state = self.state()
@@ -123,8 +148,14 @@ class SpAttnResGather(ClusterAttnRes):
             mc, smc, rank, data, scale = args[9:14]
             out = (mc, rank * n, smc)
             self.post(state, bufs, delta, rows, out, eps, out_eps, ids, ())
-            # Every rank's MXFP8 row of this token, these 1024 columns: published?
-            mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
+            if cutlass.const_expr(not self.publish_only):
+                # Every rank's MXFP8 row of this token, these 1024 columns: published?
+                mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
+            if cutlass.const_expr(self.stamps):
+                cute.arch.sync_threads()
+                if tid == 0:
+                    end = args[14] + Int64((token * 7 + part) * 16 + 8)
+                    _store_stamp(end, _globaltimer())
         else:
             mc, rank, gather = args[9:12]
             self.post(state, bufs, delta, rows, (mc, rank * n), eps, out_eps, ids, ())
@@ -240,19 +271,23 @@ def _check_clusters(code, device, n_max, what):
 
 
 @cache
-def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts=0):
-    """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx, parts) at any
-    n <= n_max."""
+def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts=0,
+                   publish_only=False):  # fmt: skip
+    """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx, parts,
+    publish_only) at any n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpAttnResGather(
             nb, tp, has_delta=has_delta, write=write, mx=mx, parts=parts,
-            min_blocks=_co_resident(n_max, device), **_options(device),
+            publish_only=publish_only, min_blocks=_co_resident(n_max, device),
+            **_options(device),
         )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
         delta = dynamic_fake(2, torch.float32) if parts else row
         args = (delta, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
         if mx:
             args += (Int64(0), Int64(0), Int32(0), Int64(0), Int64(0))
+            if kernel.stamps:
+                args += (Int64(0),)
         else:
             args += (Int64(0), Int32(0), fake((cap, 7168)))
         if parts:
@@ -261,9 +296,9 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
         )
-        RESIDENCY[("gather", nb, mx) + ((parts,) if parts else ())] = _check_clusters(
-            code, device, n_max, "SP AttnRes + all-gather"
-        )
+        key = ("gather", nb, mx) + ((parts,) if parts else ())
+        key += ("publish_only",) * publish_only
+        RESIDENCY[key] = _check_clusters(code, device, n_max, "SP AttnRes + all-gather")
     return code
 
 
@@ -324,14 +359,22 @@ class SpBoundary:
     ``gather_mx``: the layer's in-projection is MXFP8: the all-gather carries the
     MXFP8 rows (``SpComm.mx_view``; half the bytes, no quantization kernel).
     ``out_mx``: an MXFP8 input scratch (``gemm.mxfp8.Mxfp8Input``) the post-AttnRes
-    output row is also written into, quantized (the MLP's MXFP8 shared gate_up)."""
+    output row is also written into, quantized (the MLP's MXFP8 shared gate_up).
+    ``checked_rows`` (with ``gather_mx``): the R whose in-projection checks the box
+    words itself (``Mxfp8Projection.checked_rows``, ``gemm.sm107.check_x``): there the
+    all-gather publishes without polling and ``gather`` returns
+    ``SpComm.mx_checked_view``, read by the GEMM as its rows land."""
 
     def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False,
-                 gather_mx=False, out_mx=None, delta_parts=()):  # fmt: skip
+                 gather_mx=False, out_mx=None, delta_parts=(), checked_rows=()):  # fmt: skip
         from ..common.host import to_cute
 
+        if checked_rows and not gather_mx:
+            raise ValueError("SpBoundary: checked rows need the MXFP8 all-gather")
         self.comm, self.nb, self.write = comm, nb, write
         self.gather_mx, self.out_mx = gather_mx, out_mx
+        self.checked_rows = frozenset(checked_rows)
+        self.stamp_ptr = 0  # DIAG (GATHER_STAMPS): this layer's gather stamps
         device = comm.device.index
         tp, cap = comm.tp, comm.rows_cap
         self.pre_w = tuple(to_cute(w.reshape(-1)) for w in pre[0])
@@ -351,16 +394,17 @@ class SpBoundary:
             buf.scale.zero_()  # padding rows of a tile: finite (never stored) rows
             self.out_args = (Int64(buf.data.data_ptr()), Int64(buf.scale.data_ptr()))
         self.codes = {}
-        # The step's first layer has no delta (the embedding is the prefix).
-        self.codes[("pre", not first)] = compile_gather(
-            nb, not first, write, tp, cap, n_max, device, gather_mx
-        )
-        # ``delta_parts``: split counts of a previous layer's beta-add GEMM that leaves
-        # its output as FP32 partials (``SplitDelta``); summed here.
-        for parts in sorted(set(delta_parts)):
-            self.codes[("pre", True, parts)] = compile_gather(
-                nb, True, write, tp, cap, n_max, device, gather_mx, parts
+        for unpolled in sorted({False, bool(self.checked_rows)}):
+            # The step's first layer has no delta (the embedding is the prefix).
+            self.codes[("pre", not first, 0, unpolled)] = compile_gather(
+                nb, not first, write, tp, cap, n_max, device, gather_mx, 0, unpolled
             )
+            # ``delta_parts``: split counts of a previous layer's beta-add GEMM that
+            # leaves its output as FP32 partials (``SplitDelta``); summed here.
+            for parts in sorted(set(delta_parts)):
+                self.codes[("pre", True, parts, unpolled)] = compile_gather(
+                    nb, True, write, tp, cap, n_max, device, gather_mx, parts, unpolled
+                )
         block = write >= 0
         for push in sorted({bool(p) for p in push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(
@@ -377,22 +421,26 @@ class SpBoundary:
 
         comm = self.comm
         n = prefix.shape[0]
+        unpolled = n * comm.tp in self.checked_rows
         tail = ()
         if isinstance(delta, SplitDelta):
-            code = self.codes[("pre", True, delta.parts)]
+            code = self.codes[("pre", True, delta.parts, unpolled)]
             source = delta.partials
             tail = (dynamic_view(delta.residual),)
         else:
-            code = self.codes[("pre", delta is not None)]
+            code = self.codes[("pre", delta is not None, 0, unpolled)]
             source = prefix if delta is None else delta
         rows = map(dynamic_view, (source, prefix, blocks, prefix))
         source_v, prefix_v, blocks_v, dummy = rows
         if self.gather_mx:
             mc, smc, data, scale = comm.mx_addresses(parity)
+            stamps = (Int64(self.stamp_ptr),) if unpolled and GATHER_STAMPS else ()
             code(
                 source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
-                mc, smc, comm._rank, data, scale, *tail, stream(comm.device),
+                mc, smc, comm._rank, data, scale, *stamps, *tail, stream(comm.device),
             )  # fmt: skip
+            if unpolled:
+                return comm.mx_checked_view(parity, n * comm.tp)
             return comm.mx_view(parity, n * comm.tp)
         gather, mc, _, _ = comm.views(parity)
         code(

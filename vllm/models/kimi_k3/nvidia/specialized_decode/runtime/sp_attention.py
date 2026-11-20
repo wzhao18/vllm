@@ -156,9 +156,12 @@ def sp_boundary(decoder, comm, block, rows, mlp=None, delta_parts=()):
     first = decoder.layer_idx == 0
     gather_mx = isinstance(block.projection, Mxfp8Projection)
     out_mx = None if mlp is None else mlp.mx_input()
+    # Where the in-projection checks its activation, the all-gather does not poll.
+    checked_rows = block.projection.checked_rows if gather_mx else ()
     return SpBoundary(
         comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first,
         gather_mx=gather_mx, out_mx=out_mx, delta_parts=delta_parts,
+        checked_rows=checked_rows,
     )  # fmt: skip
 
 
@@ -190,9 +193,11 @@ class SpAttentionBlock:
             raise Unsupported(kind, None, f"{where}: {error}") from error
         with torch.accelerator.device_index(step.device.index):
             if mx_in:
+                # checked: reads the publish-only SP all-gather as its rows land
                 self.projection = Mxfp8Projection(
-                    attention.in_proj_qkvgfab, rows, family=family, cap=rows[-1]
-                )
+                    attention.in_proj_qkvgfab, rows, family=family, cap=rows[-1],
+                    checked=True,
+                )  # fmt: skip
                 pitch = self.projection.n
             else:
                 pitch, k = weight.shape

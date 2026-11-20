@@ -49,6 +49,7 @@ from .epilogue_utils import (
     epilogue_tma_store_mxfp8,
     epilogue_tma_store_with_alpha,
 )
+from . import check_x
 from .push_epilogue import epilogue_push, staging_bytes
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
@@ -223,8 +224,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         producers: int = 1,
         die_claim: bool = False,
         push: bool = False,
+        check_x: bool = False,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
+        # check_x: the activation operand may be a publish-only SP all-gather box
+        # (``check_x``): the epilogue warps check each landed activation stage for
+        # unpublished words (re-read until published) before the MMA warp uses it;
+        # ``alpha`` is then ``prewait.check_args``' aux buffer.
+        self.check_x = check_x
+        self.num_check_stage = 1
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
         # ``weight_is_a``, else B) and its scale factors of the first
         # ``prewait_stages`` k-blocks of its first tile BEFORE griddepcontrol.wait,
@@ -1012,6 +1020,25 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
+        if cutlass.const_expr(self.check_x):
+            # check_x.check_stage's layout: the activation is A with 128 rows x one
+            # 128-column K block per CTA stage, its scales one 512-byte atom
+            self.num_check_stage = self.num_ab_stage
+            a_stage = cute.cosize(self.a_smem_layout_staged.outer) // self.num_ab_stage
+            sfa_stage = cute.cosize(self.sfa_smem_layout_staged) // self.num_ab_stage
+            bad = (
+                self.weight_is_a
+                or self.cta_tile_shape_mnk[0] != 128
+                or self.mma_tiler[2] != 128
+                or a_stage != 128 * 128
+                or sfa_stage != 512
+                or len(self.epilog_warp_id) != 4
+            )
+            if cutlass.const_expr(bad):
+                raise NotImplementedError(
+                    f"check_x: tile {self.mma_tiler} A stage {a_stage} SFA stage "
+                    f"{sfa_stage} epilogue warps {len(self.epilog_warp_id)}"
+                )
 
         a_layout = cute.make_ordered_layout((m, cute.assume(k, 32), l), order=(0, 1, 2))
         if cutlass.const_expr(self.a_major_mode == OperandMajorMode.K):
@@ -1250,6 +1277,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            # check_x: stage checked (MMA waits), stage landed (2-CTA peer checker)
+            check_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_check_stage]
+            landed_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_check_stage]
             claim_tile: cute.struct.MemRange[cutlass.Int32, 1]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
@@ -1442,6 +1472,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
             arch=self.arch,
         )
+
+        if cutlass.const_expr(self.check_x):
+            if tidx == 0:
+                checkers = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+                for s in cutlass.range_constexpr(self.num_ab_stage):
+                    check_x.mbar_init(storage.check_mbar_ptr.data_ptr() + s, checkers)
+                    check_x.mbar_init(storage.landed_mbar_ptr.data_ptr() + s, 1)
+                check_x.mbar_init_fence()
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cluster_shape_mn, is_relaxed=True)
@@ -1964,6 +2002,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        if cutlass.const_expr(self.check_x):
+                            # the epilogue warps checked this activation stage
+                            check_x.mbar_wait(
+                                storage.check_mbar_ptr.data_ptr() + ab_consumer_state.index,
+                                ab_consumer_state.phase,
+                                cluster=use_2cta_instrs,
+                            )
 
                         if cutlass.const_expr(
                             not self._is_interleaved_utccp() and not self.dbg_skip_mma
@@ -2126,6 +2171,19 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             work_tile = tile_sched.initial_work_tile_info()
 
+            if cutlass.const_expr(self.check_x):
+                check_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                )
+                check_i32 = cute.make_tensor(
+                    cute.recast_ptr(alpha.iterator, dtype=cutlass.Int32), cute.make_layout(8)
+                )
+                check_i64 = cute.make_tensor(
+                    cute.recast_ptr(alpha.iterator, dtype=cutlass.Int64), cute.make_layout(4)
+                )
+                x_stage_bytes = self.cta_tile_shape_mnk[0] * 128
+                x_smem = cutlass.Int32(storage.sA.data_ptr().toint())
+                sf_smem = cutlass.Int32(storage.sSFA.data_ptr().toint())
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
@@ -2135,6 +2193,70 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
+                if cutlass.const_expr(self.check_x):
+                    # Lamport check of this tile's activation (A) stages (``check_x``)
+                    check_rows = check_i32[check_x.ROWS_WORD]
+                    pitch = check_i32[check_x.K_WORD]
+                    first = (
+                        mma_tile_coord_mnl[0] * self.mma_tiler[0]
+                        + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                    )
+                    row_ok = first + tidx < check_rows
+                    sf_ok = first + (tidx % 4) * 32 + tidx // 4 < check_rows
+                    data_row = check_i64[check_x.DATA_WORD64] + cutlass.Int64(
+                        first + tidx
+                    ) * cutlass.Int64(pitch)
+                    sf_word = (
+                        check_i64[check_x.SCALE_WORD64]
+                        + cutlass.Int64(first // 128) * cutlass.Int64(pitch * 4)
+                        + cutlass.Int64(tidx * 4)
+                    )
+                    for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                        s = check_state.index
+                        if cutlass.const_expr(use_2cta_instrs):
+                            if is_leader_cta:
+                                check_x.mbar_wait(
+                                    storage.ab_full_mbar_ptr.data_ptr() + s, check_state.phase
+                                )
+                                if tidx == 0:
+                                    check_x.mbar_arrive_peer(
+                                        storage.landed_mbar_ptr.data_ptr() + s,
+                                        cta_rank_in_cluster ^ 1,
+                                    )
+                            else:
+                                check_x.mbar_wait(
+                                    storage.landed_mbar_ptr.data_ptr() + s,
+                                    check_state.phase,
+                                    cluster=True,
+                                )
+                        else:
+                            check_x.mbar_wait(
+                                storage.ab_full_mbar_ptr.data_ptr() + s, check_state.phase
+                            )
+                        wrote = check_x.check_stage(
+                            x_smem + s * x_stage_bytes,
+                            sf_smem + s * 512,
+                            tidx,
+                            row_ok,
+                            data_row + cutlass.Int64(k_tile * 128),
+                            sf_ok,
+                            sf_word + cutlass.Int64(k_tile * 512),
+                        )
+                        if wrote != 0:
+                            check_x.fence_proxy_async_smem()
+                        cute.arch.sync_warp()
+                        if cute.arch.lane_idx() == 0:
+                            if cutlass.const_expr(use_2cta_instrs):
+                                if is_leader_cta:
+                                    check_x.mbar_arrive(storage.check_mbar_ptr.data_ptr() + s)
+                                else:
+                                    check_x.mbar_arrive_peer(
+                                        storage.check_mbar_ptr.data_ptr() + s,
+                                        cta_rank_in_cluster ^ 1,
+                                    )
+                            else:
+                                check_x.mbar_arrive(storage.check_mbar_ptr.data_ptr() + s)
+                        check_state.advance()
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()

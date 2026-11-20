@@ -41,9 +41,24 @@ def _alpha_one(device):
 
 
 @cache
+def check_args(data: int, scale: int, rows: int, k: int, device) -> torch.Tensor:
+    """A ``check_x`` GEMM's aux buffer (it also carries alpha = 1): float32 [8]; int32
+    word 2 the activation rows to check (0: none), word 3 the activation row pitch K;
+    int64 words 2 / 3 the global addresses of the activation's MXFP8 data [R, K] and
+    its F8_128x4 scales (``check_x``)."""
+    args = torch.zeros(8, dtype=torch.float32)
+    args[0] = 1.0
+    args.view(torch.int32)[2:4] = torch.tensor([rows, k], dtype=torch.int32)
+    args.view(torch.int64)[2:4] = torch.tensor([data, scale], dtype=torch.int64)
+    return args.to(device)
+
+
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
-             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False):
+             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False,
+             check=False):
     tile, cluster, swap_ab, inst_m = tactic
+    if check and tile_k != 128:
+        raise ValueError(f"check_x: tile_k {tile_k} (one 128-column K block per stage)")
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
         (inst_m, tile[1], INST_K),
@@ -57,6 +72,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         producers=producers,
         die_claim=die_claim,
         push=push,
+        check_x=check,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
     gemm.max_ab_stages = max_stages
@@ -75,8 +91,9 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (cute.sym_int() if die_claim or push else 1,), assumed_align=8
-    )
+        cutlass.Float32, (cute.sym_int() if die_claim or push or check else 1,),
+        assumed_align=8,
+    )  # fmt: skip
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
     with torch.accelerator.device_index(device_index):
@@ -96,7 +113,11 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 push=False, device=None):
+                 push=False, check=False, device=None):
+        # ``check``: compiled with the activation check (``check_x``); every call
+        # passes ``check=`` (``check_args``' buffer, or None: nothing to check); the
+        # checked form issues the weight operand of its whole smem ring before
+        # griddepcontrol.wait (``prewait`` is the ring depth).
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
@@ -114,17 +135,22 @@ class Mxfp8PreGemm:
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
             if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
                 raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
+        if check and (push or die_split is not None or not use_pdl or self.swap_ab):
+            raise ValueError("check: a PDL GEMM without push / die split / swap_ab")
         # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
-        self.push = int(push)
+        self.push, self.check = int(push), bool(check)
+        if check:  # the whole ring (the kernel caps it at its stage count)
+            prewait = k // tile_k
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), self.push,
+            int(max_stages), self.push, self.check,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
-        if prewait and self.stages is not None and prewait > self.stages:
+        if prewait and self.stages is not None and prewait > self.stages and not check:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
+        self.unchecked = check_args(0, 0, 0, k, device) if check else None
         self.aux, self.calls = None, 0
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
@@ -133,9 +159,11 @@ class Mxfp8PreGemm:
         km, kn = (n, rows) if self.swap_ab else (rows, n)
         self.sf = ((km + 127) // 128, (kn + 127) // 128, (k // SF_VEC + 3) // 4)
 
-    def __call__(self, xq, xs, w, ws, out, push_args=None):
+    def __call__(self, xq, xs, w, ws, out, push_args=None, check=None):
         """``push_args`` (push GEMMs only): the float32 [push_epilogue.ARGS] buffer of
-        ``push_args``; ``out`` is then an unused [R, N] BF16 view (the C descriptor)."""
+        ``push_args``; ``out`` is then an unused [R, N] BF16 view (the C descriptor).
+        ``check`` (checked GEMMs only): ``check_args``' buffer of ``xq`` / ``xs``; None:
+        ``xq`` is complete (nothing to check)."""
         if self.swap_ab:
             # The kernel stores C [N, R] column-major (only C's pointer is used, leading
             # dim N) = out [R, N] row-major; the strided view only matches the compiled
@@ -150,6 +178,10 @@ class Mxfp8PreGemm:
             raise ValueError(f"Mxfp8PreGemm(push={self.push}) push_args {push_args!r}")
         if push_args is not None:
             alpha = push_args
+        if check is not None and not self.check:
+            raise ValueError("Mxfp8PreGemm: check arguments for an unchecked GEMM")
+        if self.check:
+            alpha = self.unchecked if check is None else check
         if self.aux is not None:  # two counter sets, alternated per call
             alpha = self.aux[self.calls % 2]
             self.calls += 1

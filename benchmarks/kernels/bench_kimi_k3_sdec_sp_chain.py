@@ -31,6 +31,124 @@ BLOCK = 12
 SENTINEL = -0x80000000
 
 
+_STANDIN_CPP = "void standin(torch::Tensor d, torch::Tensor s, int64_t R, int64_t T, " \
+    "int64_t NT, int64_t K, int64_t G, torch::Tensor st);\n" \
+    "void probe(torch::Tensor d, int64_t n, int64_t K, torch::Tensor out);"
+_STANDIN_CU = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <stdint.h>
+__device__ __forceinline__ unsigned long long gtime() {
+  unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
+__device__ __forceinline__ uint4 ldv4(const void* p) {
+  uint4 v; asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory"); return v; }
+__device__ __forceinline__ uint32_t ldv1(const void* p) {
+  uint32_t v; asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(p)
+  : "memory"); return v; }
+__device__ __forceinline__ bool pend4(uint4 v) {
+  const uint32_t S = 0x80000000u;
+  return v.x == S || v.y == S || v.z == S || v.w == S; }
+// One CTA per in-projection CTA: rows [r0, r0 + T) of row group b % NT; per K tile
+// (128 columns) poll its data words (16 B chunks, all in flight) and the rows' scale
+// words until published; stamp the time the tile is complete.
+__global__ void __launch_bounds__(128) standin_k(const uint8_t* data,
+    const uint8_t* scale, int R, int T, int NT, int K, unsigned long long* st) {
+  const int b = blockIdx.x, t = threadIdx.x, kts = K / 128;
+  const int r0 = (b % NT) * T;
+  const int rows = min(T, R - r0);
+  const int chunks = rows * 8;
+  unsigned long long* out = st + (size_t)b * (kts + 1);
+  if (t == 0) out[0] = gtime();
+  for (int kt = 0; kt < kts; ++kt) {
+    uint4 v[8];
+    uint32_t pend = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      int j = t + i * 128;
+      if (j < chunks) v[i] = ldv4(data + (size_t)(r0 + j / 8) * K + kt * 128 + (j % 8) * 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      if (t + i * 128 < chunks && pend4(v[i])) pend |= 1u << i;
+    size_t so = 0;
+    if (t < rows) {
+      int row = r0 + t;
+      so = (size_t)kt * 512 + (row & 31) * 16 + ((row & 127) >> 5) * 4
+           + (size_t)(row >> 7) * 128 * (K / 32);
+      if (ldv1(scale + so) == 0xFFFFFFFFu) pend |= 1u << 8;
+    }
+    while (pend) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        int j = t + i * 128;
+        if ((pend >> i) & 1)
+          v[i] = ldv4(data + (size_t)(r0 + j / 8) * K + kt * 128 + (j % 8) * 16);
+      }
+      uint32_t again = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        if (((pend >> i) & 1) && pend4(v[i])) again |= 1u << i;
+      if (((pend >> 8) & 1) && ldv1(scale + so) == 0xFFFFFFFFu) again |= 1u << 8;
+      pend = again;
+    }
+    __syncthreads();
+    if (t == 0) out[1 + kt] = gtime();
+  }
+}
+// Arrival probe (PDL-launched behind the gather, so it polls from the gather's start):
+// thread i polls one 16-byte word group of source rank s = i / 42, column chunk
+// p = (i % 42) / 6, row {0, n / 2, n - 1} of that source's rows, first or last 16 B of
+// the chunk; stamps when it lands.
+__global__ void probe_k(const uint8_t* data, int n, int K, unsigned long long* out) {
+  const int i = threadIdx.x;
+  if (i >= 168) return;
+  const int s = i / 42, rem = i % 42, p = rem / 6, rr = (rem % 6) / 2, side = rem % 2;
+  const int row = s * n + (rr == 0 ? 0 : (rr == 1 ? n / 2 : n - 1));
+  const uint8_t* a = data + (size_t)row * K + p * 1024 + side * (1024 - 16);
+  while (pend4(ldv4(a))) {}
+  out[i] = gtime();
+}
+void probe(torch::Tensor d, int64_t n, int64_t K, torch::Tensor out) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(1); cfg.blockDim = dim3(192); cfg.dynamicSmemBytes = 0;
+  cfg.stream = c10::cuda::getCurrentCUDAStream().stream();
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr; cfg.numAttrs = 1;
+  cudaLaunchKernelEx(&cfg, probe_k, (const uint8_t*)d.data_ptr(), (int)n, (int)K,
+                     (unsigned long long*)out.data_ptr());
+}
+void standin(torch::Tensor d, torch::Tensor s, int64_t R, int64_t T, int64_t NT,
+             int64_t K, int64_t G, torch::Tensor st) {
+  standin_k<<<G, 128, 0, c10::cuda::getCurrentCUDAStream().stream()>>>(
+      (const uint8_t*)d.data_ptr(), (const uint8_t*)s.data_ptr(), (int)R, (int)T,
+      (int)NT, (int)K, (unsigned long long*)st.data_ptr());
+}
+"""
+
+
+def _standin_module():
+    import hashlib
+
+    from torch.utils.cpp_extension import load_inline
+
+    tag = hashlib.sha256((_STANDIN_CPP + _STANDIN_CU).encode()).hexdigest()[:16]
+    root = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+    build = os.path.join(root, "k3_sp_standin", tag)
+    os.makedirs(build, exist_ok=True)
+    return load_inline(
+        name=f"k3_sp_standin_{tag}", cpp_sources=_STANDIN_CPP, cuda_sources=_STANDIN_CU,
+        functions=["standin", "probe"], build_directory=build,
+        extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
+    )
+
+
+# in-projection CTA layout per R (kda_in "pre" tactics): (CTAs, rows per CTA)
+STANDIN = {128: (195, 128), 256: (196, 128), 384: (196, 96)}
+
+
 def cdiv(a, b):
     return -(-a // b)
 
@@ -91,6 +209,91 @@ class Chain:
                 ))
             setattr(self, key, bounds)
         return getattr(self, key)
+
+    def pub_boundaries(self, ns):
+        """Publish-only MXFP8 all-gather (no poll; ``checked_rows``), chunk CTA c
+        publishing at c x ``ns`` (DIAG stagger), with per-CTA gather stamps."""
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
+            kernel,
+            sp_fused,
+        )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import mxfp8
+
+        key = f"_bpub{ns}"
+        if getattr(self, key, None) is None:
+            kernel.PUBLISH_STAGGER_NS = ns
+            sp_fused.GATHER_STAMPS = True
+            sp_fused.compile_gather.cache_clear()
+            bounds = []
+            scratch = mxfp8.Mxfp8Input(self.n, WIDTH, self.comm.device)
+            for layer in range(self.layers):
+                prev = cdiv(layer, BLOCK)
+                write = layer // BLOCK if layer % BLOCK == 0 else -1
+                eps = (1e-6, 1e-6)
+                bounds.append(sp_fused.SpBoundary(
+                    self.comm, (self.w[layer][0], eps), (self.w[layer][1], eps),
+                    prev, write, self.n, {self.rows: True}, layer == 0,
+                    gather_mx=True, out_mx=scratch, checked_rows=(self.rows,),
+                ))
+            kernel.PUBLISH_STAGGER_NS = 0
+            setattr(self, key, bounds)
+        return getattr(self, key)
+
+    def run_pub(self, ns):
+        bounds = self.pub_boundaries(ns)
+        mod = _standin_module()
+        ctas, per = STANDIN[self.rows]
+        kts = WIDTH // 128
+        if getattr(self, "gst", None) is None:
+            self.gst = torch.zeros((self.layers, 7 * self.n, 2), dtype=torch.int64,
+                                   device=self.comm.device)  # fmt: skip
+            self.sst = torch.zeros((self.layers, ctas, kts + 1), dtype=torch.int64,
+                                   device=self.comm.device)  # fmt: skip
+            self.pst = torch.zeros((self.layers, 168), dtype=torch.int64,
+                                   device=self.comm.device)  # fmt: skip
+        hidden = None
+        for layer in range(self.layers):
+            parity = layer % 2
+            b = bounds[layer]
+            b.stamp_ptr = self.gst[layer].data_ptr()
+            q = b.gather(hidden, self.prefix, self.blocks, parity)
+            mod.probe(q.data, self.n, WIDTH, self.pst[layer])
+            mod.standin(q.data, q.scale, self.rows, per, cdiv(self.rows, per), WIDTH,
+                        ctas, self.sst[layer])  # fmt: skip
+            b.reduce(self.prefix, self.blocks, self.rs_out[parity], parity,
+                     self.partial)
+            hidden = self.delta
+
+    def pub_stats(self):
+        """us vs the first gather CTA's publish end (this rank), layers 1..: stage k
+        complete (median / max over stand-in CTAs), gather span, stand-in start."""
+        g = self.gst[1:].double() / 1e3
+        st = self.sst[1:].double() / 1e3
+        pub = g[:, :, 1].min(1).values[:, None]
+        ready = st[:, :, 1:] - pub[:, :, None]
+        med = ready.median(1).values.mean(0)
+        mx = ready.max(1).values.mean(0)
+        k = torch.arange(med.numel(), dtype=torch.float64, device=med.device)
+        lag = (med - med[0] - 0.22 * k).max().item()
+        # probe: arrival of chunk p (max over 3 rows x 2 ends), median over sources
+        arr = (self.pst[1:].double() / 1e3).view(-1, 4, 7, 6).amax(3) - pub[:, :, None]
+        chunk_arr = arr.median(1).values.mean(0)
+        chunk_arr_max = arr.amax(1).mean(0)
+        # gather publish end per chunk CTA p (median over rows)
+        gp = g[:, :, 1].view(g.shape[0], -1, 7) - pub[:, :, None]
+        chunk_pub = gp.median(1).values.mean(0)
+        return dict(
+            chunk_pub=[round(x, 2) for x in chunk_pub.tolist()],
+            chunk_arr=[round(x, 2) for x in chunk_arr.tolist()],
+            chunk_arr_max=[round(x, 2) for x in chunk_arr_max.tolist()],
+            stage0_med=med[0].item(), stage0_max=mx[0].item(),
+            stage55_med=med[-1].item(), stage55_max=mx[-1].item(),
+            stage_med=[round(x, 2) for x in med[::8].tolist()],
+            lag_vs_022k=lag,
+            gath_span=(g[:, :, 1].max(1).values - g[:, :, 0].min(1).values).mean().item(),
+            pub_spread=(g[:, :, 1].max(1).values - pub[:, 0]).mean().item(),
+            standin_start=(st[:, :, 0].min(1).values - pub[:, 0]).mean().item(),
+        )
 
     def run_fused(self, mx=False):
         bounds = self.boundaries(mx)
@@ -162,6 +365,8 @@ class Chain:
 
         if variant in ("fused", "fused_mx"):
             return self.run_fused(variant == "fused_mx")
+        if variant.startswith("pub:"):
+            return self.run_pub(int(variant[4:]))
 
         comm, n = self.comm, self.n
         prefix = self.prefix
@@ -278,6 +483,16 @@ def main():
             if rank == 0:
                 print(f"{key:>20}: graph {t.item():9.1f} us  "
                       f"{t.item() / args.layers:7.2f} us/layer", flush=True)
+            if variant.startswith("pub:"):
+                stats = chain.pub_stats()
+                allst = [None] * world
+                dist.all_gather_object(allst, stats)
+                if rank == 0:
+                    for r_, st_ in enumerate(allst):
+                        print(f"{key:>20} rank{r_}: " + " ".join(
+                            f"{k_} {v_:.2f}" if isinstance(v_, float) else f"{k_} {v_}"
+                            for k_, v_ in st_.items()), flush=True)
+                results[key]["pub"] = allst
             if args.profile and variant in ("full", "fused", "fused_mx"):
                 from torch.profiler import ProfilerActivity, profile
 

@@ -213,10 +213,12 @@ class Mxfp8Projection:
     """``out[R, N] = x @ W^T`` for an MXFP8 weight (module docstring) for each
     prepared R with its kind. ``run(x, out)``: ``x`` BF16 [R, K] (quantized into the
     scratch) or an ``mxfp8_act.Mxfp8Buffer`` view of R rows; ``out`` BF16 [R, N]
-    packed rows."""
+    packed rows. ``checked``: the non-swap "pre" GEMMs check their activation
+    (``checked_rows``, ``sm107.check_x``): there ``x`` may be a publish-only all-gather
+    (``sp_comm.CheckedMx``) read as its rows land."""
 
     def __init__(self, linear_or_weight, rows, *, family: str, tactics=None,
-                 cap: int | None = None):  # fmt: skip
+                 cap: int | None = None, checked: bool = False):  # fmt: skip
         self.family = family
         if isinstance(linear_or_weight, tuple):
             weight, scale = linear_or_weight
@@ -245,15 +247,20 @@ class Mxfp8Projection:
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
                     max_stages=found[2], device=weight.device,
+                    check=checked and not found[0][2],
                 )  # fmt: skip
+        self.checked_rows = frozenset(r for r, g in self.pre.items() if g.check)
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
 
-    def _gemm(self, kind, xq, xs, out):
+    def _gemm(self, kind, xq, xs, out, check=None):
         import flashinfer
 
         if kind == "pre":
-            return self.pre[xq.shape[0]](xq, xs, self.weight, self.scale, out)
+            gemm = self.pre[xq.shape[0]]
+            if gemm.check:
+                return gemm(xq, xs, self.weight, self.scale, out, check=check)
+            return gemm(xq, xs, self.weight, self.scale, out)
         if kind == "scaled_mm":
             return torch._scaled_mm(
                 xq, self.weight.t(), scale_a=xs.view(torch.float8_e8m0fnu),
@@ -273,7 +280,10 @@ class Mxfp8Projection:
         q = self.input.quantize(x) if isinstance(x, torch.Tensor) else x
         if q.rows != rows or q.k != self.k:
             raise Unsupported(self.family, rows, f"MXFP8 input [{q.rows}, {q.k}]")
-        result = self._gemm(kind, q.data, q.scale, out)
+        check = getattr(q, "check", None)
+        if check is not None and rows not in self.checked_rows:  # rows still in flight
+            raise Unsupported(self.family, rows, f"publish-only input, unchecked {kind}")
+        result = self._gemm(kind, q.data, q.scale, out, check)
         if result.data_ptr() != out.data_ptr():  # (never: both kinds take out=)
             raise Unsupported(self.family, rows, f"{kind} did not write out=")
         return out

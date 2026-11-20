@@ -390,6 +390,17 @@ def compile_embed_scatter(rows, tp, cap, width, grid, shard, ids_dtype, device):
     return compiled
 
 
+class CheckedMx:
+    """An MXFP8 all-gather view (``SpComm.mx_view``) whose rows may still be in
+    flight: ``rows``, ``k``, ``data``, ``scale`` as the view's; ``check`` the
+    in-projection's check arguments."""
+
+    def __init__(self, view, check):
+        self.view, self.check = view, check
+        self.rows, self.k = view.rows, view.k
+        self.data, self.scale = view.data, view.scale
+
+
 class SpComm:
     """The TP group's SP mailboxes (module docstring): ``gather`` [parities,
     rows_cap, width] (multicast), ``recv`` [parities, TP, rows_cap / TP, width]
@@ -492,6 +503,19 @@ class SpComm:
             view.orig_dtype = torch.bfloat16
             self._mx_views[key] = view
         return view
+
+    def mx_checked_view(self, parity: int, rows: int):
+        """``mx_view`` of a publish-only all-gather (``SpAttnResGather``
+        ``publish_only``): its rows may still be in flight; ``check``
+        (``gemm.sm107.prewait.check_args``) makes the MXFP8 in-projection check every
+        box word of its rows < R itself (``gemm.sm107.check_x``)."""
+        from ..gemm.sm107.prewait import check_args
+
+        view = self.mx_view(parity, rows)
+        check = check_args(
+            view.data.data_ptr(), view.scale.data_ptr(), rows, view.k, self.device
+        )
+        return CheckedMx(view, check)
 
     def shard(self, rows: int) -> int:
         """The shard rows n = rows / TP; Unsupported for rows this box cannot carry."""

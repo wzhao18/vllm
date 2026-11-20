@@ -22,7 +22,10 @@ D3-32):
 - the MXFP8 forms (an MXFP8 in-projection's all-gather, ``gather_mx``; the MXFP8
   shared gate_up input of the post-AttnRes, ``out_mx``) are ``mxfp8_act.quantize``
   of the fused BF16 rows (FP8 values equal, scales bitwise), and MXFP8 GEMMs over the
-  gathered box equal those over the quantized reference.
+  gathered box equal those over the quantized reference;
+- the publish-only MXFP8 all-gather (``checked_rows``: no poll) into a scribbled
+  box, read by a checked pre GEMM (``check_x``) with no host sync, equals the same
+  GEMM unchecked over the reference.
 
 ``SpFinalGather`` returns stock ``sp_all_gather``'s rows (sanitized words) and
 re-arms its box.
@@ -159,6 +162,11 @@ def _worker(env: dict[str, str]) -> None:
             (wq.data, wq.scale), [n * world for n in SHARDS], family="kda_in",
             tactics={n * world: "scaled_mm" for n in SHARDS},
         )  # fmt: skip
+        # The checked pre GEMM of a publish-only all-gather (``checked_rows``).
+        checked = mxfp8.Mxfp8Projection(
+            (wq.data, wq.scale), [n * world for n in SHARDS], family="kda_in",
+            tactics={n * world: "pre" for n in SHARDS}, checked=True,
+        )  # fmt: skip
         worst = {}
         for n in SHARDS:
             rows = n * world
@@ -223,6 +231,12 @@ def _worker(env: dict[str, str]) -> None:
                     layer // BLOCK if write else -1, max(SHARDS), {rows: True},
                     first=layer == 0, gather_mx=True, out_mx=scratch,
                 )  # fmt: skip
+                unpolled = sp_fused.SpBoundary(
+                    comm, (pre_w, eps), (post_w, eps), prev,
+                    layer // BLOCK if write else -1, max(SHARDS), {rows: True},
+                    first=layer == 0, gather_mx=True, out_mx=scratch,
+                    checked_rows=checked.checked_rows & {rows},
+                )  # fmt: skip
                 prefix, blocks = prefix0.clone(), blocks0.clone()
                 dist.barrier()
                 gv = mx.gather(d, prefix, blocks, parity)
@@ -236,6 +250,22 @@ def _worker(env: dict[str, str]) -> None:
                     gemm.run(gv, a)
                     gemm.run(ref, b)
                     assert torch.equal(a, b), ("mx gemm", kind, rows)
+                # The publish-only form (checked in-projection, ``checked_rows``):
+                # the box re-armed first, so a GEMM that did not check would read
+                # sentinels.
+                comm.gather[parity, :rows].view(torch.int32).fill_(SENTINEL)
+                comm.box[parity, comm.rows_cap :].view(torch.int32).fill_(-1)
+                prefix, blocks = prefix0.clone(), blocks0.clone()
+                torch.accelerator.synchronize(device)
+                dist.barrier()
+                gs = unpolled.gather(d, prefix, blocks, parity)
+                a = torch.empty((rows, 256), dtype=torch.bfloat16, device=device)
+                checked.run(gs, a)  # checks the box words, no host sync in between
+                b = torch.empty_like(a)
+                checked.run(ref, b)  # the same GEMM, nothing to check, on the reference
+                torch.accelerator.synchronize(device)
+                assert _same_mx(getattr(gs, "view", gs), ref, rows), ("publish-only gather", rows)
+                assert torch.equal(a, b), ("checked gemm", rows, layer)
                 y = mx.reduce(prefix, blocks, out, parity, partial).clone()
                 torch.accelerator.synchronize(device)
                 assert _armed(comm, parity, rows), ("mx", rows, layer)
