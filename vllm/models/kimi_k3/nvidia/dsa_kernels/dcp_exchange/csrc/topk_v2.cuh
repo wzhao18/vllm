@@ -396,9 +396,10 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     if (capL > 0) {
       // every rank's list (all of it: each word is re-armed after its poll, so no stale
       // word of this epoch's tag is left in a slot a later round polls)
-      for (int r = 0; r < W; ++r) {
-        const int n = (int)(cgrx[r * kCgMsg + 2] & 0xFFFFFFu) - 1;
-        for (int j = tid * 4; j < n; j += T * 4)
+      // one flat (rank, vector) loop: the polls of different ranks overlap
+      for (int i = tid; i < W * (1024 / 4); i += T) {
+        const int r = i >> 8, j = (i & 255) * 4;
+        if (j < (int)(cgrx[r * kCgMsg + 2] & 0xFFFFFFu) - 1)
           poll4(p.box + slot_base(it + 1 + j / kCgMsg) + (int64_t)r * kCgMsg + j % kCgMsg, lrx + r * 1024 + j);
       }
       __syncthreads();
@@ -455,20 +456,26 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     const bool lcut = tot_t != need && nr > 1 && lists && tot_t <= kCgTieMax;
     if (lcut) {
       // the cut: the need-th smallest global id among every rank's ties (ids are distinct)
-      auto tie_gid = [&](int i) -> uint32_t {
-        int r = 0;
-        while (i >= s_cgt2[r]) i -= s_cgt2[r++];
-        return lrx[r * 1024 + s_cgs2[r] + i] & 0xFFFFFFu;
-      };
+      // every rank's ties at tau, concatenated by rank (the offsets are dead after the scatter)
+      uint32_t* const tg = loff;
+      int omine = 0;
+      for (int r = 0; r < p.rank; ++r) omine += s_cgt2[r];
       if (tid < tot_t) {
-        const uint32_t x = tie_gid(tid);
+        int r = 0, i = tid;
+        while (i >= s_cgt2[r]) i -= s_cgt2[r++];
+        tg[tid] = lrx[r * 1024 + s_cgs2[r] + i] & 0xFFFFFFu;
+      }
+      __syncthreads();
+      if (tid < tot_t) {
+        const uint32_t x = tg[tid];
         int rk = 0;
-        for (int i = 0; i < tot_t; ++i) rk += tie_gid(i) < x;
+#pragma unroll 4
+        for (int i = 0; i < tot_t; ++i) rk += tg[i] < x;
         if (rk == need - 1) s_cgcut = (int)x;
       }
       __syncthreads();
       const uint32_t cut = (uint32_t)s_cgcut;
-      const bool own = tid < mine && (lrx[p.rank * 1024 + s_cgs2[p.rank] + tid] & 0xFFFFFFu) <= cut;
+      const bool own = tid < mine && tg[omine + tid] <= cut;
       const int quota = __syncthreads_count(own);
       if (tid == 0) {
         if (s_cgcut < 0) spin_fail(p.err, 39);
