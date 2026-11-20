@@ -202,6 +202,11 @@ def compiler_fence():
 
 
 @asm()
+def nanosleep(ns):
+    return "nanosleep.u32 $0;", "r,~{memory}", (Uint32(ns),)
+
+
+@asm()
 def ld_global_v2_s32(ptr):
     return "ld.global.nc.v2.b32 {$0,$1}, [$2];", "=r,=r,l", (Int64(ptr),), (Int32,) * 2
 
@@ -416,11 +421,14 @@ class SparseMlaPrefillH8:
         # msk: a token's last subtile takes the masked softmax path only when it is
         # partial (n % 64 != 0); a full one keeps the tcgen05.ld.red max (exact either
         # way) (production: knob 0; 9 = always masked)
-        knobs = tuple(knobs) + (0,) * (20 - len(knobs))
+        # pws (gather stage wait, P-MLA r7): 0 lane 0 waits KVEMPTY + cap, warp sync per
+        # stage (production); 1 every lane waits, no warp sync; 2 lane 0 waits two
+        # stages at even g, one warp sync per two stages; + 4: no cap wait
+        knobs = tuple(knobs) + (0,) * (21 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
-         self.epb, self.epw, self.msk) = knobs[:20]
+         self.epb, self.epw, self.msk, self.pws) = knobs[:21]
         self.msk = self.msk != 9
         self.ssu = self.ssu or 16
         self.epb = self.epb != 9
@@ -814,10 +822,7 @@ class SparseMlaPrefillH8:
                     c2 = ld_global_s32_pred(rsl + Int64((t + 2) * 256),
                                             Int32(t + 2 < subs and (t + 2) * 64 + r < n))
                     compiler_fence()
-                    if lane == 0:
-                        mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                        self.cp_cap(base, g)
-                    cute.arch.sync_warp()
+                    self.cp_stage_wait(base, pw, lane, g, s)
                     src = kvp
                     nb = Uint32(0)
                     if rc >= 0:
@@ -838,6 +843,33 @@ class SparseMlaPrefillH8:
                 cp16(st + Uint32(a * 8192) + d0, src + Int64(128 * a), nb)
                 cp16(st + Uint32(a * 8192) + d1, src + Int64(128 * a + 64), nb)
             cp16(st + dr, src + Int64(D_NOPE), nb)
+
+    @cute.jit
+    def cp_stage_wait(self, base, pw, lane, g, s):
+        """Ring slot s free (KVEMPTY) and the cp.async cap before stage g's copies."""
+        cap = cutlass.const_expr(self.pws % 8 < 4)
+        if cutlass.const_expr(self.pws % 4 == 1):
+            mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+            if cutlass.const_expr(cap):
+                self.cp_cap(base, g)
+        elif cutlass.const_expr(self.pws % 4 == 2):
+            if g % 2 == 0:
+                if lane == 0:
+                    for k in cutlass.range_constexpr(2):
+                        mbar_wait(_bar(base, B_KVEMPTY + (g + k) % NS),
+                                  Uint32((((g + k) // NS) & 1) ^ 1))
+                        if cutlass.const_expr(cap):
+                            self.cp_cap(base, g + k)
+                cute.arch.sync_warp()
+        else:
+            if lane == 0:
+                mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+                if cutlass.const_expr(cap):
+                    self.cp_cap(base, g)
+            cute.arch.sync_warp()
+        if cutlass.const_expr(self.pws >= 8):
+            # stagger: gather warp pw starts its stage pw x (pws // 8) x 8 ns later
+            nanosleep(Uint32(pw) * Uint32(8 * (self.pws // 8)))
 
     @cute.jit
     def cp_cap(self, base, g):
@@ -1144,10 +1176,7 @@ class SparseMlaPrefillH8:
                 s = g % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 rc = Int32(ld_shared_u32(buf + Uint32(256) * Uint32(t)))
-                if lane == 0:
-                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                    self.cp_cap(base, g)
-                cute.arch.sync_warp()
+                self.cp_stage_wait(base, pw, lane, g, s)
                 src = kvp
                 nb = Uint32(0)
                 if rc >= 0:
