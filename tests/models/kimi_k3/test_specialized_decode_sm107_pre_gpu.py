@@ -95,6 +95,6 @@ def test_pre_graph_chain():
 
 def test_pre_rejects():
     with pytest.raises(ValueError):
-        Mxfp8PreGemm(N, K, 128, ((256, 192), (2, 1), True, 256), device=DEVICE)
+        Mxfp8PreGemm(N, K, 128, ((256, 96), (2, 1), True, 256), device=DEVICE)
     with pytest.raises(ValueError):
         Mxfp8PreGemm(N, 256, 128, ((128, 64), (1, 1), False, 128), prewait=8, device=DEVICE)
