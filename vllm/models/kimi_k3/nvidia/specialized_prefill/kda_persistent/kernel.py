@@ -26,6 +26,8 @@ smem-free barrier: gate scan, decorations, Gram/solve, restored operands,
 then V staging. FP32 gate-prefix storage is retained on every route.
 """
 
+import sys
+
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -141,10 +143,18 @@ MB_FIN = 60
 MB_OEMPTY = 65
 MB_BRAW = 66
 MB_GRAM = 71
+MB_GREADY = 76
 # Probe only (benchmarks set it on a module copy): 1 idles the compute,
 # epilogue and V-load roles and lets the MMA warp free every stage as soon
 # as prep publishes it, so the kernel time is the prep throughput floor.
 PREP_ONLY = 0
+# Data-parallel preparation for the packed gate-roll routes (see the DP block).
+DP_PREP = 0
+# Solver warps of the data-parallel preparation (28 .. 28 + DP_NS - 1).
+DP_NS = 2
+# The DSL's AST pass recurses once per nested statement; _pkd is deeper than
+# Python's default limit.
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
 
 
 def _exp2f(x):
@@ -157,8 +167,1036 @@ def _tanhf(x):
 
 @cute.struct
 class PkdStorage:
-    mbar: cute.struct.MemRange[cutlass.Int64, 76]
+    mbar: cute.struct.MemRange[cutlass.Int64, 81]
     tmem_holding: cutlass.Int32
+
+
+@cute.jit
+def _dp_prep(
+    warp,
+    lane,
+    tmem_ptr,
+    mb,
+    ar0,
+    k0,
+    k1,
+    schain,
+    sptn,
+    ssrc,
+    spt0,
+    cu,
+    a_log,
+    dt_bias,
+    mma_g,
+    a_qk,
+    b_ki,
+    t_sgram,
+    v_graw,
+    v_gcs,
+    v_gcs8,
+    v_rf,
+    v_gt,
+    v_rf8,
+    v_bt,
+    v_btb,
+    v_braw,
+    s_car,
+    v_ki8,
+    v_kd8,
+    v_qd8,
+    v_lw_diag,
+    v_inv,
+    v_gram,
+    tma_g,
+    mG,
+    tma_k,
+    mK,
+    tma_q,
+    mQ,
+    tma_b,
+    mB,
+    lay_qd,
+    failure_addr,
+    fepoch,
+    scale,
+    lb2,
+    H_: cutlass.Constexpr[int],
+    FULL_CHUNKS_: cutlass.Constexpr[int],
+    LOWER_BOUND_M5_: cutlass.Constexpr[int],
+    BETA_BF16_: cutlass.Constexpr[int],
+    DPV_: cutlass.Constexpr[int],
+):
+    cute.arch.warpgroup_reg_dealloc(48)
+    ew = warp - 12
+    lower_bound_log2 = lb2
+    if cutlass.const_expr(LOWER_BOUND_M5_ == 1):
+        lower_bound_log2 = -7.213475204444817
+    lb2h = lower_bound_log2 * 0.5
+    anch = lower_bound_log2 * 16.0
+    konst2 = _exp2f(anch)
+    inv_konst2 = _exp2f(-anch)
+    g_scale = inv_konst2 * INP_SCALE
+    qr = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
+    kr = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
+    g8 = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.Float32)
+    rf8 = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.Float32)
+    if cutlass.const_expr(DPV_ == 1):
+        if warp < 28:
+            et = ew * 32 + lane
+            thr_gm = mma_g.get_slice(0)
+            gm_base = thr_gm.make_fragment_C(mma_g.partition_shape_C((2 * C, C)))
+            p_g64 = cute.recast_ptr(tmem_ptr + GRAM_COL, dtype=cutlass.Float64)
+            t_gram0 = cute.make_tensor(
+                cute.recast_ptr(p_g64, dtype=cutlass.Float32), gm_base.layout
+            )
+            gram_atom = cute.make_copy_atom(
+                tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), cutlass.Float32
+            )
+            gram_ld = tcgen05.make_tmem_copy(gram_atom, t_gram0)
+            gm_thr = gram_ld.get_slice(et & 127)
+            gram_id = gm_thr.partition_D(
+                thr_gm.partition_C(cute.make_identity_tensor((2 * C, C)))
+            )
+            r_gram = cute.make_rmem_tensor(gram_id.shape, cutlass.Float32)
+            gram_st_atom = sm100_utils.get_smem_store_op(
+                utils.LayoutEnum.COL_MAJOR, cutlass.BFloat16, cutlass.Float32, gram_ld
+            )
+            gram_st = cute.make_tiled_copy_D(gram_st_atom, gram_ld)
+            gm_st_thr = gram_st.get_slice(et & 127)
+            r_gram_st = gram_st.retile(r_gram)
+            r_gram_b = cute.make_rmem_tensor(r_gram_st.shape, cutlass.BFloat16)
+            # decoration ownership = instance warp (ew & 3), iteration ew >> 2
+            rw2 = (ew >> 2) * 8 + (ew & 3) + ((lane >> 2) & 4)
+            sg2 = lane & 15
+            ebar = pipeline.NamedBarrier(barrier_id=7, num_threads=512)
+            pos = cutlass.Int32(0)
+            for kx in cutlass.range(k1 - k0):
+                chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+                seq_idx = chain // H_
+                hidx = chain % H_
+                seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+                simp = cute.arch.make_warp_uniform(ssrc[k0 + kx])
+                t_tiles = (seq_len + C - 1) // C
+                ea = cute.math.exp(a_log[hidx], fastmath=True)
+                ea2c = 0.5 * ea
+                dtbc = cutlass.Float32(0.0)
+                if ew < 4:
+                    dtbc = ea2c * cutlass.Float32(dt_bias[hidx, et])
+                for ci in cutlass.range(t_tiles):
+                    s = pos % STAGES
+                    par = (pos // STAGES) & 1
+                    cc = cutlass.min(cutlass.Int32(C), seq_len - ci * C)
+                    rqn = cutlass.Float32(0.0)
+                    rkn = cutlass.Float32(0.0)
+                    if ew < 4:
+                        # gate scan: one channel per thread, running sum
+                        cute.arch.mbarrier_wait(mb + MB_SFREE + s, par ^ 1)
+                        cute.arch.mbarrier_wait(mb + MB_GRAW + s, par)
+                        accg = cutlass.Float32(0.0)
+                        for rp in cutlass.range(C // 8):
+                            rw0 = rp * 8
+                            for u in cutlass.range_constexpr(8):
+                                g8[u] = cutlass.Float32(v_graw[rw0 + u, et, s])
+                            g8.store(g8.load() * ea2c + dtbc)
+                            for u in cutlass.range_constexpr(8):
+                                g8[u] = _tanhf(g8[u])
+                            g8.store(g8.load() * lb2h + lb2h)
+                            if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                                if cc < C:
+                                    for u in cutlass.range_constexpr(8):
+                                        if rw0 + u >= cc:
+                                            g8[u] = cutlass.Float32(0.0)
+                            for u in cutlass.range_constexpr(8):
+                                accg += g8[u]
+                                v_gcs[rw0 + u, et, s] = accg
+                        if (ci == 0) & (simp < -1) & (accg >= -50.0):
+                            failure_ptr = cute.make_ptr(
+                                cutlass.Int32,
+                                failure_addr,
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            )
+                            cute.arch.store(
+                                failure_ptr,
+                                fepoch,
+                                sem="release",
+                                scope="sys",
+                            )
+                        # accg is this channel's last-row prefix
+                        rfv = _exp2f(accg - anch)
+                        v_rf[et, s] = rfv
+                        v_gt[et, s] = rfv * konst2
+                        if et == 0:
+                            v_rf[D, s] = _exp2f(anch)
+                    if ew == 4:
+                        cute.arch.mbarrier_wait(mb + MB_SFREE + s, par ^ 1)
+                        cute.arch.mbarrier_wait(mb + MB_BRAW + s, par)
+                        btv = cutlass.Float32(0.0)
+                        if lane < cc:
+                            bx = cutlass.Float32(v_braw[lane, hidx & 7, s])
+                            btv = 0.5 + 0.5 * _tanhf(0.5 * bx)
+                        v_bt[lane, s] = btv
+                        if cutlass.const_expr(BETA_BF16_ == 1):
+                            v_btb[lane, s] = btv.to(cutlass.BFloat16)
+                    if ew >= 4:
+                        cute.arch.mbarrier_wait(mb + MB_QKRAW + s, par)
+                        q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                        cute.autovec_copy(q8s, qr)
+                        k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                        cute.autovec_copy(k8s, kr)
+                        if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                            if rw2 >= cc:
+                                for u in cutlass.range_constexpr(8):
+                                    qr[u] = cutlass.BFloat16(0.0)
+                                    kr[u] = cutlass.BFloat16(0.0)
+                        sq = cutlass.Float32(0.0)
+                        sk = cutlass.Float32(0.0)
+                        for u in cutlass.range_constexpr(8):
+                            fq = cutlass.Float32(qr[u])
+                            fk = cutlass.Float32(kr[u])
+                            sq += fq * fq
+                            sk += fk * fk
+                        for off in [1, 2, 4, 8]:
+                            sq += cute.arch.shuffle_sync_bfly(sq, off)
+                            sk += cute.arch.shuffle_sync_bfly(sk, off)
+                        rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                        rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                    ebar.arrive_and_wait()
+                    if ew < 4:
+                        cute.arch.mbarrier_wait(mb + MB_QKRAW + s, par)
+                        q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                        cute.autovec_copy(q8s, qr)
+                        k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                        cute.autovec_copy(k8s, kr)
+                        if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                            if rw2 >= cc:
+                                for u in cutlass.range_constexpr(8):
+                                    qr[u] = cutlass.BFloat16(0.0)
+                                    kr[u] = cutlass.BFloat16(0.0)
+                        sq = cutlass.Float32(0.0)
+                        sk = cutlass.Float32(0.0)
+                        for u in cutlass.range_constexpr(8):
+                            fq = cutlass.Float32(qr[u])
+                            fk = cutlass.Float32(kr[u])
+                            sq += fq * fq
+                            sk += fk * fk
+                        for off in [1, 2, 4, 8]:
+                            sq += cute.arch.shuffle_sync_bfly(sq, off)
+                            sk += cute.arch.shuffle_sync_bfly(sk, off)
+                        rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                        rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                    g8s = v_gcs8[(rw2, None, sg2, s)]
+                    cute.autovec_copy(g8s, g8)
+                    gv8 = g8.load()
+                    decv = cute.math.exp2(gv8 - anch, fastmath=True)
+                    qhv = qr.load().to(cutlass.Float32) * rqn
+                    khv = kr.load().to(cutlass.Float32) * rkn
+                    qr.store((qhv * decv).to(cutlass.BFloat16))
+                    kr.store((khv * decv).to(cutlass.BFloat16))
+                    idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                    dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(qr, dq8)
+                    dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(kr, dk8)
+                    kr.store((khv * idecv).to(cutlass.BFloat16))
+                    di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(kr, di8)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    ebar.arrive_and_wait()
+                    t_gram_s = cute.make_tensor(
+                        cute.recast_ptr(p_g64 + s * (C // 2), dtype=cutlass.Float32),
+                        gm_base.layout,
+                    )
+                    if ew == 2:
+                        mma_g.set(tcgen05.Field.ACCUMULATE, False)
+                        for kb in cutlass.range_constexpr(D // 16):
+                            cute.gemm(
+                                mma_g,
+                                t_gram_s,
+                                a_qk[None, None, kb, s],
+                                b_ki[None, None, kb, s],
+                                t_gram_s,
+                            )
+                            mma_g.set(tcgen05.Field.ACCUMULATE, True)
+                        with cute.arch.elect_one():
+                            tcgen05.commit(mb + MB_GRAM + s)
+                    cute.arch.mbarrier_wait(mb + MB_GRAM + s, par)
+                    if ew < 4:
+                        cute.copy(gram_ld, gm_thr.partition_S(t_gram_s), r_gram)
+                        cute.arch.fence_view_async_tmem_load()
+                        if ew < 2:
+                            for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                crd = gram_id[e]
+                                mv = cutlass.Float32(0.0)
+                                if crd[1] <= crd[0]:
+                                    mv = r_gram[e] * g_scale
+                                r_gram[e] = mv
+                        else:
+                            for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                crd = gram_id[e]
+                                gi = crd[0] - C
+                                lv = cutlass.Float32(0.0)
+                                if crd[1] < gi:
+                                    lv = r_gram[e] * v_bt[gi, s]
+                                r_gram[e] = lv
+                        r_gram_b.store(r_gram_st.load().to(cutlass.BFloat16))
+                        s_gram_st = gm_st_thr.partition_D(t_sgram[None, None, None, s])
+                        cute.copy(gram_st, r_gram_b, s_gram_st)
+                    else:
+                        cute.autovec_copy(v_rf8[(sg2, None, s)], rf8)
+                        for rr in cutlass.range_constexpr(2):
+                            item = et - 128 + rr * 384
+                            if item < C * 16:
+                                rw3 = item >> 4
+                                si8 = v_ki8[(rw3, None, sg2 & 7, sg2 >> 3, s)]
+                                cute.autovec_copy(si8, kr)
+                                kr.store(kr.load() * rf8.load().to(cutlass.BFloat16))
+                                cute.autovec_copy(kr, si8)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    ebar.arrive_and_wait()
+                    if ew == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mb + MB_TAB + s)
+                    pos += 1
+    if cutlass.const_expr(DPV_ == 3):
+        # E (warps 12-27), software-pipelined: per chunk, own-item Q/K norms,
+        # the gate on all 16 warps (warp = channel block x token quarter,
+        # running sum carried quarter to quarter in program order, so every
+        # prefix is the same FP32 sum as the one-thread scan), decorations
+        # and the Gram issue; then the readout/restore of the PREVIOUS chunk
+        # while this chunk's Gram runs.
+        if warp < 28:
+            et = ew * 32 + lane
+            thr_gm = mma_g.get_slice(0)
+            gm_base = thr_gm.make_fragment_C(mma_g.partition_shape_C((2 * C, C)))
+            p_g64 = cute.recast_ptr(tmem_ptr + GRAM_COL, dtype=cutlass.Float64)
+            t_gram0 = cute.make_tensor(
+                cute.recast_ptr(p_g64, dtype=cutlass.Float32), gm_base.layout
+            )
+            gram_atom = cute.make_copy_atom(
+                tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), cutlass.Float32
+            )
+            gram_ld = tcgen05.make_tmem_copy(gram_atom, t_gram0)
+            gm_thr = gram_ld.get_slice(et & 127)
+            gram_id = gm_thr.partition_D(
+                thr_gm.partition_C(cute.make_identity_tensor((2 * C, C)))
+            )
+            r_gram = cute.make_rmem_tensor(gram_id.shape, cutlass.Float32)
+            gram_st_atom = sm100_utils.get_smem_store_op(
+                utils.LayoutEnum.COL_MAJOR, cutlass.BFloat16, cutlass.Float32, gram_ld
+            )
+            gram_st = cute.make_tiled_copy_D(gram_st_atom, gram_ld)
+            gm_st_thr = gram_st.get_slice(et & 127)
+            r_gram_st = gram_st.retile(r_gram)
+            r_gram_b = cute.make_rmem_tensor(r_gram_st.shape, cutlass.BFloat16)
+            rw2 = (ew >> 2) * 8 + (ew & 3) + ((lane >> 2) & 4)
+            sg2 = lane & 15
+            gq = ew >> 2
+            gch = (ew & 3) * 32 + lane
+            cbar = pipeline.NamedBarrier(barrier_id=8 + (ew & 3), num_threads=128)
+            ebar = pipeline.NamedBarrier(barrier_id=7, num_threads=512)
+            pos = cutlass.Int32(0)
+            for kx in cutlass.range(k1 - k0):
+                chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+                hidx = chain % H_
+                seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+                simp = cute.arch.make_warp_uniform(ssrc[k0 + kx])
+                t_tiles = (seq_len + C - 1) // C
+                ea = cute.math.exp(a_log[hidx], fastmath=True)
+                ea2c = 0.5 * ea
+                dtbc = ea2c * cutlass.Float32(dt_bias[hidx, gch])
+                for ci in cutlass.range(t_tiles):
+                    s = pos % STAGES
+                    par = (pos // STAGES) & 1
+                    cc = cutlass.min(cutlass.Int32(C), seq_len - ci * C)
+                    cute.arch.mbarrier_wait(mb + MB_QKRAW + s, par)
+                    q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(q8s, qr)
+                    k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(k8s, kr)
+                    if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                        if rw2 >= cc:
+                            for u in cutlass.range_constexpr(8):
+                                qr[u] = cutlass.BFloat16(0.0)
+                                kr[u] = cutlass.BFloat16(0.0)
+                    sq = cutlass.Float32(0.0)
+                    sk = cutlass.Float32(0.0)
+                    for u in cutlass.range_constexpr(8):
+                        fq = cutlass.Float32(qr[u])
+                        fk = cutlass.Float32(kr[u])
+                        sq += fq * fq
+                        sk += fk * fk
+                    for off in [1, 2, 4, 8]:
+                        sq += cute.arch.shuffle_sync_bfly(sq, off)
+                        sk += cute.arch.shuffle_sync_bfly(sk, off)
+                    rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                    rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                    # the stage's gate-prefix storage is free after MMA4(ci-5)
+                    cute.arch.mbarrier_wait(mb + MB_SFREE + s, par ^ 1)
+                    cute.arch.mbarrier_wait(mb + MB_GRAW + s, par)
+                    for u in cutlass.range_constexpr(8):
+                        g8[u] = cutlass.Float32(v_graw[gq * 8 + u, gch, s])
+                    g8.store(g8.load() * ea2c + dtbc)
+                    for u in cutlass.range_constexpr(8):
+                        g8[u] = _tanhf(g8[u])
+                    g8.store(g8.load() * lb2h + lb2h)
+                    if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                        if cc < C:
+                            for u in cutlass.range_constexpr(8):
+                                if gq * 8 + u >= cc:
+                                    g8[u] = cutlass.Float32(0.0)
+                    accg = cutlass.Float32(0.0)
+                    for r in cutlass.range_constexpr(4):
+                        if gq == r:
+                            if cutlass.const_expr(r > 0):
+                                accg = s_car[(r - 1) * D + gch]
+                            for u in cutlass.range_constexpr(8):
+                                accg += g8[u]
+                                v_gcs[r * 8 + u, gch, s] = accg
+                            if cutlass.const_expr(r < 3):
+                                s_car[r * D + gch] = accg
+                        if cutlass.const_expr(r < 3):
+                            cbar.arrive_and_wait()
+                    if gq == 3:
+                        if (ci == 0) & (simp < -1) & (accg >= -50.0):
+                            failure_ptr = cute.make_ptr(
+                                cutlass.Int32,
+                                failure_addr,
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            )
+                            cute.arch.store(
+                                failure_ptr,
+                                fepoch,
+                                sem="release",
+                                scope="sys",
+                            )
+                        rfv = _exp2f(accg - anch)
+                        v_rf[gch, s] = rfv
+                        v_gt[gch, s] = rfv * konst2
+                        if gch == 0:
+                            v_rf[D, s] = _exp2f(anch)
+                    if ew == 4:
+                        cute.arch.mbarrier_wait(mb + MB_BRAW + s, par)
+                        btv = cutlass.Float32(0.0)
+                        if lane < cc:
+                            bx = cutlass.Float32(v_braw[lane, hidx & 7, s])
+                            btv = 0.5 + 0.5 * _tanhf(0.5 * bx)
+                        v_bt[lane, s] = btv
+                        if cutlass.const_expr(BETA_BF16_ == 1):
+                            v_btb[lane, s] = btv.to(cutlass.BFloat16)
+                    ebar.arrive_and_wait()
+                    g8s = v_gcs8[(rw2, None, sg2, s)]
+                    cute.autovec_copy(g8s, g8)
+                    gv8 = g8.load()
+                    decv = cute.math.exp2(gv8 - anch, fastmath=True)
+                    qhv = qr.load().to(cutlass.Float32) * rqn
+                    khv = kr.load().to(cutlass.Float32) * rkn
+                    qr.store((qhv * decv).to(cutlass.BFloat16))
+                    kr.store((khv * decv).to(cutlass.BFloat16))
+                    idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                    dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(qr, dq8)
+                    dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(kr, dk8)
+                    kr.store((khv * idecv).to(cutlass.BFloat16))
+                    di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                    cute.autovec_copy(kr, di8)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    ebar.arrive_and_wait()
+                    if ew == 2:
+                        t_gram_s = cute.make_tensor(
+                            cute.recast_ptr(p_g64 + s * (C // 2), dtype=cutlass.Float32),
+                            gm_base.layout,
+                        )
+                        mma_g.set(tcgen05.Field.ACCUMULATE, False)
+                        for kb in cutlass.range_constexpr(D // 16):
+                            cute.gemm(
+                                mma_g,
+                                t_gram_s,
+                                a_qk[None, None, kb, s],
+                                b_ki[None, None, kb, s],
+                                t_gram_s,
+                            )
+                            mma_g.set(tcgen05.Field.ACCUMULATE, True)
+                        with cute.arch.elect_one():
+                            tcgen05.commit(mb + MB_GRAM + s)
+                    if pos > 0:
+                        sp = (pos - 1) % STAGES
+                        pp = ((pos - 1) // STAGES) & 1
+                        cute.arch.mbarrier_wait(mb + MB_GRAM + sp, pp)
+                        if ew < 4:
+                            t_gram_p = cute.make_tensor(
+                                cute.recast_ptr(p_g64 + sp * (C // 2), dtype=cutlass.Float32),
+                                gm_base.layout,
+                            )
+                            cute.copy(gram_ld, gm_thr.partition_S(t_gram_p), r_gram)
+                            cute.arch.fence_view_async_tmem_load()
+                            if ew < 2:
+                                for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                    crd = gram_id[e]
+                                    mv = cutlass.Float32(0.0)
+                                    if crd[1] <= crd[0]:
+                                        mv = r_gram[e] * g_scale
+                                    r_gram[e] = mv
+                            else:
+                                for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                    crd = gram_id[e]
+                                    gi = crd[0] - C
+                                    lv = cutlass.Float32(0.0)
+                                    if crd[1] < gi:
+                                        lv = r_gram[e] * v_bt[gi, sp]
+                                    r_gram[e] = lv
+                            r_gram_b.store(r_gram_st.load().to(cutlass.BFloat16))
+                            s_gram_st = gm_st_thr.partition_D(t_sgram[None, None, None, sp])
+                            cute.copy(gram_st, r_gram_b, s_gram_st)
+                        else:
+                            cute.autovec_copy(v_rf8[(sg2, None, sp)], rf8)
+                            for rr in cutlass.range_constexpr(2):
+                                item = et - 128 + rr * 384
+                                if item < C * 16:
+                                    rw3 = item >> 4
+                                    si8 = v_ki8[(rw3, None, sg2 & 7, sg2 >> 3, sp)]
+                                    cute.autovec_copy(si8, kr)
+                                    kr.store(kr.load() * rf8.load().to(cutlass.BFloat16))
+                                    cute.autovec_copy(kr, si8)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        ebar.arrive_and_wait()
+                        if ew == 0:
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive(mb + MB_TAB + sp)
+                    pos += 1
+            if pos > 0:
+                sp = (pos - 1) % STAGES
+                pp = ((pos - 1) // STAGES) & 1
+                cute.arch.mbarrier_wait(mb + MB_GRAM + sp, pp)
+                if ew < 4:
+                    t_gram_p = cute.make_tensor(
+                        cute.recast_ptr(p_g64 + sp * (C // 2), dtype=cutlass.Float32),
+                        gm_base.layout,
+                    )
+                    cute.copy(gram_ld, gm_thr.partition_S(t_gram_p), r_gram)
+                    cute.arch.fence_view_async_tmem_load()
+                    if ew < 2:
+                        for e in cutlass.range_constexpr(cute.size(r_gram)):
+                            crd = gram_id[e]
+                            mv = cutlass.Float32(0.0)
+                            if crd[1] <= crd[0]:
+                                mv = r_gram[e] * g_scale
+                            r_gram[e] = mv
+                    else:
+                        for e in cutlass.range_constexpr(cute.size(r_gram)):
+                            crd = gram_id[e]
+                            gi = crd[0] - C
+                            lv = cutlass.Float32(0.0)
+                            if crd[1] < gi:
+                                lv = r_gram[e] * v_bt[gi, sp]
+                            r_gram[e] = lv
+                    r_gram_b.store(r_gram_st.load().to(cutlass.BFloat16))
+                    s_gram_st = gm_st_thr.partition_D(t_sgram[None, None, None, sp])
+                    cute.copy(gram_st, r_gram_b, s_gram_st)
+                else:
+                    cute.autovec_copy(v_rf8[(sg2, None, sp)], rf8)
+                    for rr in cutlass.range_constexpr(2):
+                        item = et - 128 + rr * 384
+                        if item < C * 16:
+                            rw3 = item >> 4
+                            si8 = v_ki8[(rw3, None, sg2 & 7, sg2 >> 3, sp)]
+                            cute.autovec_copy(si8, kr)
+                            kr.store(kr.load() * rf8.load().to(cutlass.BFloat16))
+                            cute.autovec_copy(kr, si8)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                ebar.arrive_and_wait()
+                if ew == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(mb + MB_TAB + sp)
+    if cutlass.const_expr(DPV_ == 2):
+        # G (E warps 0-3) runs the gate scan one or more chunks ahead and
+        # publishes it per stage on MB_GREADY; D (E warps 4-15) runs norms,
+        # decorations, the Gram MMA, its readout (warps 4-7) and the Ki
+        # restore (warps 8-15).
+        if warp < 16:
+            gbar = pipeline.NamedBarrier(barrier_id=8, num_threads=128)
+            et = ew * 32 + lane
+            pos = cutlass.Int32(0)
+            for kx in cutlass.range(k1 - k0):
+                chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+                hidx = chain % H_
+                seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+                simp = cute.arch.make_warp_uniform(ssrc[k0 + kx])
+                t_tiles = (seq_len + C - 1) // C
+                ea = cute.math.exp(a_log[hidx], fastmath=True)
+                ea2c = 0.5 * ea
+                dtbc = ea2c * cutlass.Float32(dt_bias[hidx, et])
+                for ci in cutlass.range(t_tiles):
+                    s = pos % STAGES
+                    par = (pos // STAGES) & 1
+                    cc = cutlass.min(cutlass.Int32(C), seq_len - ci * C)
+                    cute.arch.mbarrier_wait(mb + MB_SFREE + s, par ^ 1)
+                    cute.arch.mbarrier_wait(mb + MB_GRAW + s, par)
+                    accg = cutlass.Float32(0.0)
+                    for rp in cutlass.range(C // 8):
+                        rw0 = rp * 8
+                        for u in cutlass.range_constexpr(8):
+                            g8[u] = cutlass.Float32(v_graw[rw0 + u, et, s])
+                        g8.store(g8.load() * ea2c + dtbc)
+                        for u in cutlass.range_constexpr(8):
+                            g8[u] = _tanhf(g8[u])
+                        g8.store(g8.load() * lb2h + lb2h)
+                        if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                            if cc < C:
+                                for u in cutlass.range_constexpr(8):
+                                    if rw0 + u >= cc:
+                                        g8[u] = cutlass.Float32(0.0)
+                        for u in cutlass.range_constexpr(8):
+                            accg += g8[u]
+                            v_gcs[rw0 + u, et, s] = accg
+                    if (ci == 0) & (simp < -1) & (accg >= -50.0):
+                        failure_ptr = cute.make_ptr(
+                            cutlass.Int32,
+                            failure_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        cute.arch.store(
+                            failure_ptr,
+                            fepoch,
+                            sem="release",
+                            scope="sys",
+                        )
+                    rfv = _exp2f(accg - anch)
+                    v_rf[et, s] = rfv
+                    v_gt[et, s] = rfv * konst2
+                    if et == 0:
+                        v_rf[D, s] = _exp2f(anch)
+                    gbar.arrive_and_wait()
+                    if ew == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mb + MB_GREADY + s)
+                    pos += 1
+        if (warp >= 16) & (warp < 28):
+            dw = ew - 4
+            dt = dw * 32 + lane
+            thr_gm = mma_g.get_slice(0)
+            gm_base = thr_gm.make_fragment_C(mma_g.partition_shape_C((2 * C, C)))
+            p_g64 = cute.recast_ptr(tmem_ptr + GRAM_COL, dtype=cutlass.Float64)
+            t_gram0 = cute.make_tensor(
+                cute.recast_ptr(p_g64, dtype=cutlass.Float32), gm_base.layout
+            )
+            gram_atom = cute.make_copy_atom(
+                tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), cutlass.Float32
+            )
+            gram_ld = tcgen05.make_tmem_copy(gram_atom, t_gram0)
+            gm_thr = gram_ld.get_slice(dt & 127)
+            gram_id = gm_thr.partition_D(
+                thr_gm.partition_C(cute.make_identity_tensor((2 * C, C)))
+            )
+            r_gram = cute.make_rmem_tensor(gram_id.shape, cutlass.Float32)
+            gram_st_atom = sm100_utils.get_smem_store_op(
+                utils.LayoutEnum.COL_MAJOR, cutlass.BFloat16, cutlass.Float32, gram_ld
+            )
+            gram_st = cute.make_tiled_copy_D(gram_st_atom, gram_ld)
+            gm_st_thr = gram_st.get_slice(dt & 127)
+            r_gram_st = gram_st.retile(r_gram)
+            r_gram_b = cute.make_rmem_tensor(r_gram_st.shape, cutlass.BFloat16)
+            sg2 = lane & 15
+            dbar = pipeline.NamedBarrier(barrier_id=7, num_threads=384)
+            pos = cutlass.Int32(0)
+            for kx in cutlass.range(k1 - k0):
+                chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+                hidx = chain % H_
+                seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+                t_tiles = (seq_len + C - 1) // C
+                for ci in cutlass.range(t_tiles):
+                    s = pos % STAGES
+                    par = (pos // STAGES) & 1
+                    cc = cutlass.min(cutlass.Int32(C), seq_len - ci * C)
+                    if dw == 0:
+                        cute.arch.mbarrier_wait(mb + MB_SFREE + s, par ^ 1)
+                        cute.arch.mbarrier_wait(mb + MB_BRAW + s, par)
+                        btv = cutlass.Float32(0.0)
+                        if lane < cc:
+                            bx = cutlass.Float32(v_braw[lane, hidx & 7, s])
+                            btv = 0.5 + 0.5 * _tanhf(0.5 * bx)
+                        v_bt[lane, s] = btv
+                        if cutlass.const_expr(BETA_BF16_ == 1):
+                            v_btb[lane, s] = btv.to(cutlass.BFloat16)
+                    cute.arch.mbarrier_wait(mb + MB_QKRAW + s, par)
+                    for rnd in cutlass.range_constexpr(2):
+                        vw = dw + rnd * 12
+                        if vw < 16:
+                            rw2 = (vw >> 2) * 8 + (vw & 3) + ((lane >> 2) & 4)
+                            q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                            cute.autovec_copy(q8s, qr)
+                            k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                            cute.autovec_copy(k8s, kr)
+                            if cutlass.const_expr(FULL_CHUNKS_ == 0):
+                                if rw2 >= cc:
+                                    for u in cutlass.range_constexpr(8):
+                                        qr[u] = cutlass.BFloat16(0.0)
+                                        kr[u] = cutlass.BFloat16(0.0)
+                            sq = cutlass.Float32(0.0)
+                            sk = cutlass.Float32(0.0)
+                            for u in cutlass.range_constexpr(8):
+                                fq = cutlass.Float32(qr[u])
+                                fk = cutlass.Float32(kr[u])
+                                sq += fq * fq
+                                sk += fk * fk
+                            for off in [1, 2, 4, 8]:
+                                sq += cute.arch.shuffle_sync_bfly(sq, off)
+                                sk += cute.arch.shuffle_sync_bfly(sk, off)
+                            rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                            rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                            if cutlass.const_expr(rnd == 0):
+                                cute.arch.mbarrier_wait(mb + MB_GREADY + s, par)
+                            g8s = v_gcs8[(rw2, None, sg2, s)]
+                            cute.autovec_copy(g8s, g8)
+                            gv8 = g8.load()
+                            decv = cute.math.exp2(gv8 - anch, fastmath=True)
+                            qhv = qr.load().to(cutlass.Float32) * rqn
+                            khv = kr.load().to(cutlass.Float32) * rkn
+                            qr.store((qhv * decv).to(cutlass.BFloat16))
+                            kr.store((khv * decv).to(cutlass.BFloat16))
+                            idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                            dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                            cute.autovec_copy(qr, dq8)
+                            dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                            cute.autovec_copy(kr, dk8)
+                            kr.store((khv * idecv).to(cutlass.BFloat16))
+                            di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, s)]
+                            cute.autovec_copy(kr, di8)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    dbar.arrive_and_wait()
+                    t_gram_s = cute.make_tensor(
+                        cute.recast_ptr(p_g64 + s * (C // 2), dtype=cutlass.Float32),
+                        gm_base.layout,
+                    )
+                    if dw == 2:
+                        mma_g.set(tcgen05.Field.ACCUMULATE, False)
+                        for kb in cutlass.range_constexpr(D // 16):
+                            cute.gemm(
+                                mma_g,
+                                t_gram_s,
+                                a_qk[None, None, kb, s],
+                                b_ki[None, None, kb, s],
+                                t_gram_s,
+                            )
+                            mma_g.set(tcgen05.Field.ACCUMULATE, True)
+                        with cute.arch.elect_one():
+                            tcgen05.commit(mb + MB_GRAM + s)
+                    cute.arch.mbarrier_wait(mb + MB_GRAM + s, par)
+                    if dw < 4:
+                        cute.copy(gram_ld, gm_thr.partition_S(t_gram_s), r_gram)
+                        cute.arch.fence_view_async_tmem_load()
+                        if dw < 2:
+                            for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                crd = gram_id[e]
+                                mv = cutlass.Float32(0.0)
+                                if crd[1] <= crd[0]:
+                                    mv = r_gram[e] * g_scale
+                                r_gram[e] = mv
+                        else:
+                            for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                crd = gram_id[e]
+                                gi = crd[0] - C
+                                lv = cutlass.Float32(0.0)
+                                if crd[1] < gi:
+                                    lv = r_gram[e] * v_bt[gi, s]
+                                r_gram[e] = lv
+                        r_gram_b.store(r_gram_st.load().to(cutlass.BFloat16))
+                        s_gram_st = gm_st_thr.partition_D(t_sgram[None, None, None, s])
+                        cute.copy(gram_st, r_gram_b, s_gram_st)
+                    else:
+                        cute.autovec_copy(v_rf8[(sg2, None, s)], rf8)
+                        for rr in cutlass.range_constexpr(2):
+                            item = dt - 128 + rr * 256
+                            rw3 = item >> 4
+                            si8 = v_ki8[(rw3, None, sg2 & 7, sg2 >> 3, s)]
+                            cute.autovec_copy(si8, kr)
+                            kr.store(kr.load() * rf8.load().to(cutlass.BFloat16))
+                            cute.autovec_copy(kr, si8)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    dbar.arrive_and_wait()
+                    if dw == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mb + MB_TAB + s)
+                    pos += 1
+    if (warp >= 28) & (warp < 28 + DP_NS):
+        sw = warp - 28
+        mma_a = cute.make_tiled_mma(
+            cute.nvgpu.warp.MmaF16BF16Op(
+                cutlass.BFloat16, cutlass.Float32, (16, 8, 16)
+            ),
+            cute.make_layout((1, 1, 1)),
+        )
+        thr_a = mma_a.get_slice(lane)
+        tIdA = thr_a.partition_C(cute.make_identity_tensor((16, 16)))
+        tIdA16 = thr_a.partition_A(cute.make_identity_tensor((16, 16)))
+        tIdB16 = thr_a.partition_B(cute.make_identity_tensor((16, 16)))
+        pos = cutlass.Int32(0)
+        for kx in cutlass.range(k1 - k0):
+            seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+            t_tiles = (seq_len + C - 1) // C
+            for ci in cutlass.range(t_tiles):
+                if (pos % DP_NS) == sw:
+                    s = pos % STAGES
+                    par = (pos // STAGES) & 1
+                    cute.arch.mbarrier_wait(mb + MB_TAB + s, par)
+                    dgb = lane >> 3
+                    lid = lane & 7
+                    b8 = dgb * 8
+                    cute.autovec_copy(v_lw_diag[(dgb, lid, None, s)], qr)
+                    for c8 in cutlass.range_constexpr(8):
+                        lv8 = cutlass.Float32(0.0)
+                        if c8 < lid:
+                            lv8 = cutlass.Float32(qr[c8])
+                        if c8 == lid:
+                            lv8 = cutlass.Float32(1.0)
+                        g8[c8] = lv8
+                    for sr in cutlass.range_constexpr(7):
+                        rs8 = cutlass.Float32(0.0) - g8[sr]
+                        for pc in cutlass.range_constexpr(7):
+                            if cutlass.const_expr(pc < sr):
+                                pv8 = cute.arch.shuffle_sync(g8[pc], b8 + sr)
+                                if lid > sr:
+                                    g8[pc] = rs8 * pv8 + g8[pc]
+                        if lid > sr:
+                            g8[sr] = rs8
+                    qr.store(g8.load().to(cutlass.BFloat16))
+                    cute.autovec_copy(qr, v_inv[(b8 + lid, None, dgb, s)])
+                    # zero the upper-right 8x8 of each 16-block and the
+                    # 32-level upper-right [0:16,16:32)
+                    qr.fill(cutlass.BFloat16(0.0))
+                    if dgb == 0:
+                        cute.autovec_copy(qr, v_inv[(lid, None, 1, s)])
+                    if dgb == 2:
+                        cute.autovec_copy(qr, v_inv[(16 + lid, None, 3, s)])
+                    halfl = lane >> 4
+                    coll = lane & 15
+                    if halfl == 0:
+                        cute.autovec_copy(qr, v_inv[(coll, None, 2, s)])
+                        cute.autovec_copy(qr, v_inv[(coll, None, 3, s)])
+                    cute.arch.sync_warp()
+                    # level 2: Y = diag(A1inv,B1inv) @ diag(C_A,C_B)
+                    Cy2 = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                    Cy2.fill(0.0)
+                    fa2 = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                    fb2 = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                    for e in cutlass.range_constexpr(cute.size(fa2)):
+                        ac = tIdA16[e]
+                        va2 = cutlass.BFloat16(0.0)
+                        if (ac[0] >> 3) == (ac[1] >> 3):
+                            va2 = v_inv[
+                                8 + 16 * (ac[0] >> 3) + (ac[0] & 7),
+                                ac[1] & 7,
+                                1 + 2 * (ac[0] >> 3),
+                                s,
+                            ]
+                        fa2[e] = va2
+                    for e in cutlass.range_constexpr(cute.size(fb2)):
+                        bc = tIdB16[e]
+                        vb2 = cutlass.BFloat16(0.0)
+                        if (bc[1] >> 3) == (bc[0] >> 3):
+                            vb2 = v_gram[
+                                C + 8 + 16 * (bc[1] >> 3) + (bc[1] & 7),
+                                16 * (bc[1] >> 3) + (bc[0] & 7),
+                                s,
+                            ]
+                        fb2[e] = vb2
+                    cute.gemm(mma_a, Cy2, fa2, fb2, Cy2)
+                    yA2 = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                    for e in cutlass.range_constexpr(cute.size(Cy2)):
+                        yA2[e] = cutlass.BFloat16(Cy2[e])
+                    fbt2 = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                    for e in cutlass.range_constexpr(cute.size(fbt2)):
+                        bc2 = tIdB16[e]
+                        vt2 = cutlass.BFloat16(0.0)
+                        if (bc2[1] >> 3) == (bc2[0] >> 3):
+                            vt2 = v_inv[
+                                16 * (bc2[1] >> 3) + (bc2[1] & 7),
+                                bc2[0] & 7,
+                                2 * (bc2[1] >> 3),
+                                s,
+                            ]
+                        fbt2[e] = vt2
+                    Cc2 = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                    Cc2.fill(0.0)
+                    cute.gemm(mma_a, Cc2, yA2, fbt2, Cc2)
+                    for e in cutlass.range_constexpr(cute.size(Cc2)):
+                        crd = tIdA[e]
+                        if (crd[0] >> 3) == (crd[1] >> 3):
+                            v_inv[
+                                8 + 16 * (crd[0] >> 3) + (crd[0] & 7),
+                                crd[1] & 7,
+                                2 * (crd[0] >> 3),
+                                s,
+                            ] = cutlass.BFloat16(0.0 - Cc2[e])
+                    cute.arch.sync_warp()
+                    Cy = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                    Cy.fill(0.0)
+                    fat = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                    fbl = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                    for e in cutlass.range_constexpr(cute.size(fat)):
+                        ac = tIdA16[e]
+                        fat[e] = v_inv[
+                            16 + ac[0], ac[1] & 7, 2 + (ac[1] >> 3), s
+                        ]
+                    for e in cutlass.range_constexpr(cute.size(fbl)):
+                        bc = tIdB16[e]
+                        fbl[e] = v_gram[C + 16 + bc[1], bc[0], s]
+                    cute.gemm(mma_a, Cy, fat, fbl, Cy)
+                    yA = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                    for e in cutlass.range_constexpr(cute.size(Cy)):
+                        yA[e] = cutlass.BFloat16(Cy[e])
+                    fbt = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                    for e in cutlass.range_constexpr(cute.size(fbt)):
+                        bc2 = tIdB16[e]
+                        fbt[e] = v_inv[bc2[1], bc2[0] & 7, bc2[0] >> 3, s]
+                    Cc = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                    Cc.fill(0.0)
+                    cute.gemm(mma_a, Cc, yA, fbt, Cc)
+                    for pair in cutlass.range_constexpr(4):
+                        e = 2 * pair
+                        crd = tIdA[e]
+                        c2 = cute.make_rmem_tensor(
+                            cute.make_layout((2,)), cutlass.BFloat16
+                        )
+                        c2[0] = cutlass.BFloat16(0.0 - Cc[e])
+                        c2[1] = cutlass.BFloat16(0.0 - Cc[e + 1])
+                        d2 = cute.local_tile(
+                            v_inv,
+                            (1, 2, 1, 1),
+                            (
+                                16 + crd[0],
+                                (crd[1] & 7) >> 1,
+                                crd[1] >> 3,
+                                s,
+                            ),
+                        )
+                        cute.autovec_copy(c2, d2)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(mb + MB_QK + s)
+                pos += 1
+    if warp >= 30:
+        pos = cutlass.Int32(0)
+        for kx in cutlass.range(k1 - k0):
+            chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+            seq_idx = chain // H_
+            hidx = chain % H_
+            bos = cutlass.Int32(cu[seq_idx]) + cute.arch.make_warp_uniform(
+                spt0[k0 + kx]
+            )
+            seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+            t_tiles = (seq_len + C - 1) // C
+            gQ = cute.flat_divide(cute.domain_offset((bos, 0, 0), mQ), (C, 1, D))
+            gK = cute.flat_divide(cute.domain_offset((bos, 0, 0), mK), (C, 1, D))
+            gG = cute.flat_divide(cute.domain_offset((bos, 0, 0), mG), (C, 1, D))
+            gB = cute.flat_divide(cute.domain_offset((bos, 0), mB), (C, 8))
+            for ci in cutlass.range(t_tiles):
+                s = pos % STAGES
+                par = (pos // STAGES) & 1
+                if warp == 30:
+                    cute.arch.mbarrier_wait(mb + MB_RFREE + s, par ^ 1)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mb + MB_GRAW + s, C * D * 2
+                        )
+                    f_g = cute.make_tensor(
+                        cute.recast_ptr(
+                            ar0 + (OFF_QD + s * STAGE_BYTES),
+                            dtype=cutlass.BFloat16,
+                        ),
+                        cute.make_layout(
+                            (C, 1, (64, 2)), stride=(64, 0, (1, 4096))
+                        ),
+                    )
+                    g_d, g_s = cpasync.tma_partition(
+                        tma_g,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(f_g, 0, 3),
+                        cute.group_modes(gG, 0, 3),
+                    )
+                    cute.copy(
+                        tma_g,
+                        g_s[(None, ci, hidx, 0)],
+                        g_d,
+                        tma_bar_ptr=mb + MB_GRAW + s,
+                    )
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mb + MB_QKRAW + s, 2 * C * D * 2
+                        )
+                    f_k = cute.make_tensor(
+                        cute.recast_ptr(
+                            ar0 + (OFF_QD + 4096 + s * STAGE_BYTES),
+                            lay_qd.inner,
+                            dtype=cutlass.BFloat16,
+                        ),
+                        cute.make_layout(
+                            (C, 1, (16, 4, 2)), stride=(64, 0, (1, 16, 4096))
+                        ),
+                    )
+                    k_d, k_s = cpasync.tma_partition(
+                        tma_k,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(f_k, 0, 3),
+                        cute.group_modes(gK, 0, 3),
+                    )
+                    cute.copy(
+                        tma_k,
+                        k_s[(None, ci, hidx, 0)],
+                        k_d,
+                        tma_bar_ptr=mb + MB_QKRAW + s,
+                    )
+                if warp == 31:
+                    cute.arch.mbarrier_wait(mb + MB_RFREE + s, par ^ 1)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mb + MB_BRAW + s, C * 8 * 2
+                        )
+                    f_b = v_braw[None, None, s]
+                    b_d, b_s = cpasync.tma_partition(
+                        tma_b,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(f_b, 0, 2),
+                        cute.group_modes(gB, 0, 2),
+                    )
+                    cute.copy(
+                        tma_b,
+                        b_s[(None, ci, hidx >> 3)],
+                        b_d,
+                        tma_bar_ptr=mb + MB_BRAW + s,
+                    )
+                    cute.arch.mbarrier_wait(mb + MB_SFREE + s, par ^ 1)
+                    f_qr = cute.make_tensor(
+                        cute.recast_ptr(
+                            ar0 + (OFF_FT + s * STAGE_BYTES),
+                            lay_qd.inner,
+                            dtype=cutlass.BFloat16,
+                        ),
+                        cute.make_layout(
+                            (C, 1, (16, 4, 2)), stride=(64, 0, (1, 16, 2048))
+                        ),
+                    )
+                    q_d, q_s = cpasync.tma_partition(
+                        tma_q,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(f_qr, 0, 3),
+                        cute.group_modes(gQ, 0, 3),
+                    )
+                    cute.copy(
+                        tma_q,
+                        q_s[(None, ci, hidx, 0)],
+                        q_d,
+                        tma_bar_ptr=mb + MB_QKRAW + s,
+                    )
+                pos += 1
 
 
 @cute.kernel
@@ -236,6 +1274,7 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    DP_PREP_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -274,6 +1313,7 @@ def _pkd(
     s_btb5 = smem.allocate_tensor(
         cutlass.BFloat16, cute.make_layout((C, STAGES), stride=(1, C)), 16
     )
+    s_car = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4 * D,)), 16)
 
     ar0 = arena.iterator
 
@@ -451,6 +1491,7 @@ def _pkd(
                 cute.arch.mbarrier_init(mb + MB_FIN + i, 1)
                 cute.arch.mbarrier_init(mb + MB_BRAW + i, 1)
                 cute.arch.mbarrier_init(mb + MB_GRAM + i, 1)
+                cute.arch.mbarrier_init(mb + MB_GREADY + i, 1)
             cute.arch.mbarrier_init(mb + MB_INP, 8)
             cute.arch.mbarrier_init(mb + MB_OEMPTY, 4)
         cute.arch.mbarrier_init_fence()
@@ -1687,7 +2728,7 @@ def _pkd(
     # =====================================================================
     # PREP (warps 12-31): 5 instances x 4 warps; instance == stage
     # =====================================================================
-    if warp >= 12:
+    if warp >= 12 + 52 * DP_PREP_:
         cute.arch.warpgroup_reg_dealloc(48)
         inst = (warp - 12) >> 2
         plw = (warp - 12) & 3
@@ -2399,6 +3440,76 @@ def _pkd(
                         pp_graw ^= 1
                         pp_qkraw ^= 1
 
+    # =====================================================================
+    # DATA-PARALLEL PREPARATION (warps 12-31; packed gate-roll routes)
+    # The five four-warp instances run five different code paths at once,
+    # which caps instruction fetch (VR200: <= 5 concurrent straight-line
+    # streams issue at ~0.9/SMSP, 8 or more at ~0.66).  Here one 16-warp
+    # group E prepares one chunk at a time: the gate scan (E warps 0-3, one
+    # channel per thread) overlaps the Q/K norms of E warps 4-15, then all
+    # 16 warps decorate, issue the Gram MMA, read and mask it (warps 0-3)
+    # and restore Ki (warps 4-15).  S (warps 28-29) solves and combines
+    # alternate chunks and publishes the stage; L (warps 30-31) issues the
+    # raw TMAs as soon as the chain frees the stage.  Every value comes from
+    # the same per-thread code as the instance preparation.
+    # =====================================================================
+    if cutlass.const_expr(DP_PREP_ >= 1):
+        if warp >= 12:
+            _dp_prep(
+                warp,
+                lane,
+                tmem_ptr,
+                mb,
+                ar0,
+                k0,
+                k1,
+                schain,
+                sptn,
+                ssrc,
+                spt0,
+                cu,
+                a_log,
+                dt_bias,
+                mma_g,
+                a_qk,
+                b_ki,
+                t_sgram,
+                v_graw,
+                v_gcs,
+                v_gcs8,
+                v_rf,
+                v_gt,
+                v_rf8,
+                v_bt,
+                v_btb,
+                v_braw,
+                s_car,
+                v_ki8,
+                v_kd8,
+                v_qd8,
+                v_lw_diag,
+                v_inv,
+                v_gram,
+                tma_g,
+                mG,
+                tma_k,
+                mK,
+                tma_q,
+                mQ,
+                tma_b,
+                mB,
+                lay_qd,
+                failure_addr,
+                fepoch,
+                scale,
+                lb2,
+                H_,
+                FULL_CHUNKS_,
+                LOWER_BOUND_M5_,
+                BETA_BF16_,
+                DP_PREP_,
+            )
+
     cute.arch.sync_threads()
     tmem.free(tmem_ptr)
 
@@ -2460,6 +3571,7 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    DP_PREP_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2684,6 +3796,7 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        DP_PREP_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),

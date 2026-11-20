@@ -5,6 +5,7 @@
 """Persistent KDA scheduling and compilation, with exact FP32 state handoffs."""
 
 import heapq
+import sys
 import hashlib
 from pathlib import Path
 
@@ -145,6 +146,16 @@ def _get_compiled(
         stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
 
         def compile_kernel():
+            # The DSL's AST pass recurses once per nested node and _pkd is
+            # deeper than Python's default limit.
+            limit = sys.getrecursionlimit()
+            sys.setrecursionlimit(max(limit, 20000))
+            try:
+                return _compile()
+            finally:
+                sys.setrecursionlimit(limit)
+
+        def _compile():
             return cute.compile(
                 _k._launch_pkd,
                 qkv_fake(),
@@ -202,6 +213,16 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                DP_PREP_=_k.DP_PREP
+                if (
+                    beta_tma
+                    and partial_tma
+                    and gate_roll
+                    and rcp_decor
+                    and not prep_peel
+                    and gram_w9 == 0
+                )
+                else 0,
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
