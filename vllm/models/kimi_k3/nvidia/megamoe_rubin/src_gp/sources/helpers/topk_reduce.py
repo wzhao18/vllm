@@ -1146,9 +1146,9 @@ class TopkReduce:
             # vLLM-local S1-F: one release arrival per CTA as soon as its row slice is stored, BEFORE the producer-done
             # acquire: the sdec latent_up acquires the full count instead of this grid's completion (its only input is
             # the normalized rows; the shared output stays ordered by the PDL chain into the next layer).
+            # The barrier orders the CTA's row stores before thread 0's gpu-scope release (cumulative): no extra fence.
             cute.arch.sync_threads()
             if thread_idx == Int32(0):
-                cute.arch.fence_acq_rel_gpu()
                 red_add_release_gpu_s32(rows_done.iterator, Int32(1))
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):

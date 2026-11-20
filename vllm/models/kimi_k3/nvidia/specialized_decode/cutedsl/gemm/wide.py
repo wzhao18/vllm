@@ -491,6 +491,7 @@ class WideGemm:
                       rot, Int32(0), n_act)  # fmt: skip
             if lane == 0:
                 _st_u64(stamp + 56, _now())
+            self.count_pass(mSync, lane)
         elif warp == 2:
             cute.arch.barrier(barrier_id=1, number_of_threads=32 * 5)
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
@@ -542,6 +543,7 @@ class WideGemm:
                     self.wait_inputs(mSync, lane)
                     self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0,
                               k_count, rot, Int32(i), n_act)  # fmt: skip
+                    self.count_pass(mSync, lane)
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
                                                    ptr_to_buffer_holding_addr=tmem_holder)  # fmt: skip
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
@@ -591,23 +593,34 @@ class WideGemm:
     @cute.jit
     def wait_inputs(self, mSync: cute.Tensor, lane: Int32):
         """An activation warp's input wait: the PDL wait, or (``rows_sync``) one lane acquires the reduce's
-        ``rows_sync`` arrivals on mSync[0]; the act warp whose pass completes the grid's count re-arms the pair
-        (rows done -= rows_sync, passed = 0): every act warp of the grid has observed the count by then."""
+        ``rows_sync`` arrivals on mSync[0]. The pair is re-armed by ``count_pass`` once this warp's activation
+        stages are issued, off the critical path: every act warp of the grid passing at once would otherwise
+        serialize on one same-address returning atomic right before its first activation load."""
         if cutlass.const_expr(self.rows_sync == 0):
             cute.arch.griddepcontrol_wait()
         else:
             counter = mSync.iterator.toint()
             expected = Int32(self.rows_sync)
-            passes = Int32(2 * (self.n_pad // 256) * self.split * len(self.act_warps))
             if lane == Int32(0):
                 while _ld_acquire(counter) < expected:
                     _nanosleep()
-                if _atom_add(counter + 4, Int32(1)) == passes - Int32(1):
-                    _atom_add(counter, -expected)
-                    _st_relaxed(counter + 4, Int32(0))
             cute.arch.sync_warp()
             # The rows were written through the generic proxy on other SMs; x is read by TMA (async proxy).
             _fence_proxy_global()
+
+    @cute.jit
+    def count_pass(self, mSync: cute.Tensor, lane: Int32):
+        """(``rows_sync``) After an act warp has issued its activation stages: count its pass on mSync[1]; the
+        pass that completes the grid's count re-arms the pair (rows done -= rows_sync, passed = 0), by which time
+        every act warp of the grid has observed the full count."""
+        if cutlass.const_expr(self.rows_sync > 0):
+            counter = mSync.iterator.toint()
+            expected = Int32(self.rows_sync)
+            passes = Int32(2 * (self.n_pad // 256) * self.split * len(self.act_warps))
+            if lane == Int32(0):
+                if _atom_add(counter + 4, Int32(1)) == passes - Int32(1):
+                    _atom_add(counter, -expected)
+                    _st_relaxed(counter + 4, Int32(0))
 
     @cute.jit
     def acts(self, tma_b, tBgX, tBsB, full, empty, b_mask, leader, k0, k_count, rot, first,
