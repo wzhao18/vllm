@@ -61,9 +61,9 @@ EPI_WG = 4  # epilogue warpgroups (2 tokens per thread)
 TOK_WG = BQ // EPI_WG  # tokens per epilogue warpgroup
 PRODUCER = 4 * EPI_WG
 MMA_WARP = PRODUCER + 1  # two MMA warps: MMA_WARP + g issues token half g
-GROUPS = 2  # token halves (N = 128 MMAs): epilogue warpgroups 2 g, 2 g + 1
-NH = N // GROUPS
-THREADS = 32 * (MMA_WARP + GROUPS)
+SPLITS = 2  # token halves (N = 128 MMAs): epilogue warpgroups 2 g, 2 g + 1
+NH = N // SPLITS
+THREADS = 32 * (MMA_WARP + SPLITS)
 TMEM_COLS = 576  # exclusive allocation: 2 x N accumulators + scale factors
 SF_WORDS_A = TILE  # one 32-bit word (four UE8M0) per key
 SF_WORDS_B = N
@@ -411,12 +411,12 @@ class IndexerScore:
         )
         vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (mma.thr_id.shape,))
         a_layout = sm100_utils.make_smem_layout_a(mma, self.tiler, fp4, KV_STAGES)
-        b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, fp4, GROUPS * Q_STAGES)
+        b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, fp4, SPLITS * Q_STAGES)
         sfa_layout = blockscaled_utils.make_smem_layout_sfa(
             mma, self.tiler, 32, KV_STAGES
         )
         sfb_layout = blockscaled_utils.make_smem_layout_sfb(
-            mma, self.tiler, 32, GROUPS * Q_STAGES
+            mma, self.tiler, 32, SPLITS * Q_STAGES
         )
         sfa_one = cute.slice_(sfa_layout, (None, None, None, 0))
         sfb_one = cute.slice_(sfb_layout, (None, None, None, 0))
@@ -432,7 +432,7 @@ class IndexerScore:
         self.sfb_cols = (
             cute.cosize(cute.recast_layout(32, sf_t.width, tsfb_layout)) & 0xFFFF
         )
-        assert ACC_STAGES * N + GROUPS * (self.sfa_cols + self.sfb_cols) <= TMEM_COLS, (
+        assert ACC_STAGES * N + SPLITS * (self.sfa_cols + self.sfb_cols) <= TMEM_COLS, (
             self.sfa_cols, self.sfb_cols)
         a_one = cute.slice_(a_layout, (None, None, None, 0))
         b_one = cute.slice_(b_layout, (None, None, None, 0))
@@ -519,8 +519,8 @@ class IndexerScore:
             kv_empty: cute.struct.MemRange[cutlass.Int64, KV_STAGES]
             q_full: cute.struct.MemRange[cutlass.Int64, Q_STAGES]
             q_empty: cute.struct.MemRange[cutlass.Int64, Q_STAGES]
-            acc_full: cute.struct.MemRange[cutlass.Int64, GROUPS * ACC_STAGES]
-            acc_empty: cute.struct.MemRange[cutlass.Int64, GROUPS * ACC_STAGES]
+            acc_full: cute.struct.MemRange[cutlass.Int64, SPLITS * ACC_STAGES]
+            acc_empty: cute.struct.MemRange[cutlass.Int64, SPLITS * ACC_STAGES]
             tmem_hold: Int32
             row_end: cute.struct.MemRange[Int32, Q_STAGES * BQ]
             w: cute.struct.Align[cute.struct.MemRange[Uint32, Q_STAGES * BQ * 16], 16]
@@ -551,15 +551,15 @@ class IndexerScore:
         if tidx == 0:
             for i in cutlass.range_constexpr(KV_STAGES):
                 cute.arch.mbarrier_init(kv_full + i, 1)
-                cute.arch.mbarrier_init(kv_empty + i, GROUPS)
+                cute.arch.mbarrier_init(kv_empty + i, SPLITS)
             for i in cutlass.range_constexpr(Q_STAGES):
                 cute.arch.mbarrier_init(q_full + i, 1)
-                cute.arch.mbarrier_init(q_empty + i, GROUPS + 4 * EPI_WG)
-            # accumulator stage a of group g: barrier GROUPS * a + g, TMEM columns
+                cute.arch.mbarrier_init(q_empty + i, SPLITS + 4 * EPI_WG)
+            # accumulator stage a of group g: barrier SPLITS * a + g, TMEM columns
             # a * N + g * NH (tokens 4 g .. 4 g + 3 of the stage)
-            for i in cutlass.range_constexpr(GROUPS * ACC_STAGES):
+            for i in cutlass.range_constexpr(SPLITS * ACC_STAGES):
                 cute.arch.mbarrier_init(acc_full + i, 1)
-                cute.arch.mbarrier_init(acc_empty + i, 4 * EPI_WG // GROUPS)
+                cute.arch.mbarrier_init(acc_empty + i, 4 * EPI_WG // SPLITS)
             cute.arch.mbarrier_init_fence()
         if warp == PRODUCER:
             cpasync.prefetch_descriptor(tma_k)
@@ -575,7 +575,7 @@ class IndexerScore:
         cute.arch.sync_threads()
         tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, 16, st.tmem_hold.ptr)
         acc_shape = mma.partition_shape_C(self.tiler[:2])
-        acc_fake = mma.make_fragment_C(cute.append(acc_shape, GROUPS * ACC_STAGES))
+        acc_fake = mma.make_fragment_C(cute.append(acc_shape, SPLITS * ACC_STAGES))
         tAcc = cute.make_tensor(tmem_ptr, acc_fake.layout)
         cute.arch.griddepcontrol_wait()
         n_items = n_items_t[0]
@@ -628,7 +628,7 @@ class IndexerScore:
                 fence_async_shared()
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(q_full + qs, GROUPS * self.q_bytes)
+                    cute.arch.mbarrier_arrive_and_expect_tx(q_full + qs, SPLITS * self.q_bytes)
                 gQ = cute.local_tile(
                     cute.domain_offset((token0 * HEADS, 0, 0), mQ),
                     cute.slice_(self.tiler, (0, None, None)),
@@ -641,11 +641,11 @@ class IndexerScore:
                     cute.group_modes(sB, 0, 3),
                     cute.group_modes(thr_mma.partition_B(gQ), 0, 3),
                 )
-                for g in cutlass.range_constexpr(GROUPS):
+                for g in cutlass.range_constexpr(SPLITS):
                     cute.copy(
                         tma_q,
                         tQg[(None, g, 0, 0)],
-                        tQs[(None, GROUPS * qs + g)],
+                        tQs[(None, SPLITS * qs + g)],
                         tma_bar_ptr=q_full + qs,
                     )
                 jq += 1
@@ -694,10 +694,10 @@ class IndexerScore:
                 ntiles = items[item, 3]
                 qs = jq % Q_STAGES
                 cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
-                cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, GROUPS * qs + g)], s2t_b[2])
+                cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, SPLITS * qs + g)], s2t_b[2])
                 for _t in cutlass.range(ntiles + (ntiles & 1), unroll=1):
                     stage = kv_it % KV_STAGES
-                    a = GROUPS * (acc_it % ACC_STAGES) + g
+                    a = SPLITS * (acc_it % ACC_STAGES) + g
                     cute.arch.mbarrier_wait(acc_empty + a, ((acc_it // ACC_STAGES) & 1) ^ 1)
                     cute.arch.mbarrier_wait(kv_full + stage, (kv_it // KV_STAGES) & 1)
                     cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, stage)], s2t_a[2])
@@ -709,7 +709,7 @@ class IndexerScore:
                             mma,
                             tAcc[(None, None, None, a)],
                             [tCrA[(None, None, kb, stage)], tCtSFA[(None, None, kb)]],
-                            [tCrB[(None, None, kb, GROUPS * qs + g)], tCtSFB[(None, None, kb)]],
+                            [tCrB[(None, None, kb, SPLITS * qs + g)], tCtSFB[(None, None, kb)]],
                             tAcc[(None, None, None, a)],
                         )
                         mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -788,8 +788,8 @@ class IndexerScore:
         key_in_tile = 4 * (lt % 32) + lt // 32
         tok_a = 2 * wg
         # this warpgroup's token half: its own accumulator barriers
-        acc_full = acc_full + wg // 2
-        acc_empty = acc_empty + wg // 2
+        acc_full = acc_full + wg // (EPI_WG // SPLITS)
+        acc_empty = acc_empty + wg // (EPI_WG // SPLITS)
         # this warp's TMEM lane quarter, column 0 of accumulator stage 0
         tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * HEADS
         hist0 = hist_a + tok_a * (S_BINS * 4)
@@ -903,10 +903,10 @@ class IndexerScore:
             p1 = cutlass.min(p1, lim1)
         if cutlass.const_expr(self.epi == 3):
             for st in cutlass.range_constexpr(ACC_STAGES):
-                cute.arch.mbarrier_wait(acc_full + GROUPS * st, ph)
+                cute.arch.mbarrier_wait(acc_full + SPLITS * st, ph)
                 cute.arch.sync_warp()
                 if lane == 0:
-                    cute.arch.mbarrier_arrive(acc_empty + GROUPS * st)
+                    cute.arch.mbarrier_arrive(acc_empty + SPLITS * st)
             return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
         mbar_wait(acc_full, ph)
         h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
@@ -922,9 +922,9 @@ class IndexerScore:
             h1 = tmem_wait_n(*h1)
             cute.arch.sync_warp()
             if lane == 0:
-                cute.arch.mbarrier_arrive(acc_empty + GROUPS * st)
+                cute.arch.mbarrier_arrive(acc_empty + SPLITS * st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
-                mbar_wait(acc_full + GROUPS * (st + 1), ph)
+                mbar_wait(acc_full + SPLITS * (st + 1), ph)
                 h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
             if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
