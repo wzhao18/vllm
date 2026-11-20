@@ -57,6 +57,7 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
     tmem_deallocation_mbarrier_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_deallocation_mbarrier"
     tmem_allocation_barrier_id: ClassVar[int] = 2
     _probe_sf_mode: ClassVar[str] = "stage"
+    _probe_half_a: ClassVar[int] = 0
     _probe_stamps: ClassVar[bool] = False
 
     @classmethod
@@ -321,6 +322,9 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             + stage_one_regions[2].nbytes
             + stage_one_regions[3].nbytes
         )
+        self._probe_b_pair_tx = (
+            packed_bytes(stage_one_regions[1], self.b_dtype) + stage_one_regions[3].nbytes
+        ) * self.mma_cta_count
         if self.heterogeneous_shared:
             shared_stage_one_regions = self._fit_shared_stage(stage_one_regions)
             shared_stage_operand_tma_bytes = (
@@ -917,6 +921,18 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         partitioned_tmem = thread_copy.partition_D(compact_tmem_tensor)
         return tiled_copy, partitioned_smem, partitioned_tmem
 
+    def _probe_skip_k(self, k_tile_count):
+        return k_tile_count if self._probe_half_a == 2 else k_tile_count // 2
+
+    def _probe_skip_tx(self, expected_tx):
+        # Only the leader arrives; routed stages split the pair bytes evenly between the A and B
+        # producers, so a skipped A stage must still expect the B pair bytes above that half.
+        if expected_tx is not None:
+            return Int32(0)
+        extra = self._probe_b_pair_tx - self.num_tma_load_bytes // 2
+        assert extra >= 0, (self._probe_b_pair_tx, self.num_tma_load_bytes)
+        return Int32(extra)
+
     @cute.jit
     def _issue_tma_a_tile(
         self,
@@ -970,28 +986,37 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
 
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
-            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            if cutlass.const_expr(self._probe_half_a != 0):
+                if k_tile_idx < self._probe_skip_k(k_tile_count):
+                    ab_pipeline.producer_acquire(
+                        ab_pipeline_state, empty_status, expected_tx=self._probe_skip_tx(expected_tx)
+                    )
+                else:
+                    ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            else:
+                ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
             if k_tile_idx + 1 < k_tile_count:
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-            cute.copy(
-                a_atom,
-                global_a_slice[(None, k_tile_idx)],
-                partitioned_smem_a[(None, stage_index)],
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=a_descriptor_ptr,
-                mcast_mask=multicast_mask,
-            )
-            cute.copy(
-                sfa_atom,
-                global_sfa_slice[(None, k_tile_idx)],
-                partitioned_smem_sfa[(None, stage_index)],
-                tma_bar_ptr=tma_barrier,
-                tma_desc_ptr=sfa_descriptor_ptr,
-                mcast_mask=multicast_mask,
-            )
+            if k_tile_idx >= (self._probe_skip_k(k_tile_count) if cutlass.const_expr(self._probe_half_a != 0) else 0):
+                cute.copy(
+                    a_atom,
+                    global_a_slice[(None, k_tile_idx)],
+                    partitioned_smem_a[(None, stage_index)],
+                    tma_bar_ptr=tma_barrier,
+                    tma_desc_ptr=a_descriptor_ptr,
+                    mcast_mask=multicast_mask,
+                )
+                cute.copy(
+                    sfa_atom,
+                    global_sfa_slice[(None, k_tile_idx)],
+                    partitioned_smem_sfa[(None, stage_index)],
+                    tma_bar_ptr=tma_barrier,
+                    tma_desc_ptr=sfa_descriptor_ptr,
+                    mcast_mask=multicast_mask,
+                )
         return ab_pipeline_state
 
     @cute.jit

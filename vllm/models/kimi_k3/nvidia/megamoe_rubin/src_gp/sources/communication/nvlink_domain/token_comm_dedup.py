@@ -1369,12 +1369,16 @@ class TokenCommDedup(KernelComponent):
 
     transfer_warp_count: ClassVar[int] = 4
     transfer_thread_count: ClassVar[int] = transfer_warp_count * 32
+    # Dispatch pulls in flight per transfer warp (one SMEM stage + mbarrier each). One pull per warp leaves the
+    # dispatch latency-bound: every row waits a full NVLink round trip before the next is issued.
+    token_in_pull_depth: ClassVar[int] = 1
     _probe_stamps: ClassVar[bool] = False
     _probe_tb_token_wait: ClassVar[bool] = False
     _probe_acquire_poll: ClassVar[bool] = False
     _probe_fc2_stg: ClassVar[bool] = False
     _probe_tb_ef: ClassVar[bool] = False
     _probe_order_window: ClassVar[int] = 0
+    _probe_tb_own_smem: ClassVar[bool] = False
     standalone_chunk_bytes: ClassVar[int] = 2048
     reduction_round_group: ClassVar[int] = 4
     # Last-copy reduce: two copies per 1-D TMA through three buffers (two fills in flight), per-warp SMEM 3 x 2 x chunk.
@@ -1389,6 +1393,8 @@ class TokenCommDedup(KernelComponent):
     grid_sync_barrier_id: ClassVar[int] = 10
     standalone_size_barrier_id: ClassVar[int] = 11
     token_in_size_barrier_id: ClassVar[int] = 12
+    # standalone_warps: the combine warps reuse the dispatch ring's SMEM once every dispatch warp is done.
+    token_in_done_barrier_id: ClassVar[int] = 14
 
     fc1_ready_region = "nvlink.token_comm_dedup.fc1_ready"
     fc1_activation_region = "nvlink.token_comm_dedup.fc1_activation"
@@ -1509,6 +1515,8 @@ class TokenCommDedup(KernelComponent):
             )
         if not 1 <= self.token_in_flag_batch <= 32:
             raise ValueError(f"token_in_flag_batch must be in [1, 32], got {self.token_in_flag_batch}.")
+        if self.token_in_pull_depth not in (1, 2, 4, 8, 16):
+            raise ValueError(f"token_in_pull_depth must be a power of two <= 16, got {self.token_in_pull_depth}.")
         if self.tokens_per_fc1_ready_slot % self.token_padding_block != 0:
             raise ValueError("tokens_per_fc1_ready_slot must be divisible by token_padding_block.")
         if self.token_back_enabled and self.fc2_done_signals_per_token_tile <= 0:
@@ -1836,7 +1844,8 @@ class TokenCommDedup(KernelComponent):
             )
 
     def register_smem_regions(self, workspace: SmemWorkspace) -> None:
-        workspace.register_mbarrier(self.token_in_mbarrier_region, self.transfer_warp_count)
+        token_in_stages = self.transfer_warp_count * self.token_in_pull_depth
+        workspace.register_mbarrier(self.token_in_mbarrier_region, token_in_stages)
         if self.token_back_enabled:
             workspace.register_mbarrier(
                 self.token_back_mbarrier_region,
@@ -1850,20 +1859,23 @@ class TokenCommDedup(KernelComponent):
         token_in_lifetime.register_tensor(
             self.token_in_activation_smem_region,
             self.activation_dtype,
-            (self.transfer_warp_count, self.hidden_size),
+            (token_in_stages, self.hidden_size),
             byte_alignment=16,
         )
         token_in_lifetime.register_tensor(
             self.token_in_sf_smem_region,
             self.activation_sf_dtype,
-            (self.transfer_warp_count, (self.activation_sf_vector_size, self.activation_sf_hidden_padded)),
+            (token_in_stages, (self.activation_sf_vector_size, self.activation_sf_hidden_padded)),
             stride=(self.activation_sf_hidden_padded, (0, 1)),
             byte_alignment=16,
         )
         if not self.token_back_enabled:
             return
 
-        if self.token_back_mode in ("standalone_warps", "hybrid_warps"):
+        if self.token_back_mode == "standalone_warps" and not self._probe_tb_own_smem:
+            # Time-disjoint with the dispatch ring: the combine warps wait on token_in_done_barrier_id first.
+            token_back_lifetime = transfer_overlay.add_lifetime("token_back")
+        elif self.token_back_mode in ("standalone_warps", "hybrid_warps"):
             token_back_lifetime = workspace.create_overlay(
                 "nvlink.token_comm_dedup.main_smem.standalone_token_back"
             ).add_lifetime("token_back")
@@ -2027,11 +2039,14 @@ class TokenCommDedup(KernelComponent):
         token_in_mbarriers = smem_workspace.ptr(self.token_in_mbarrier_region, smem_base)
         token_in_activation = smem_workspace.tensor(self.token_in_activation_smem_region, smem_base)
         token_in_sf = smem_workspace.tensor(self.token_in_sf_smem_region, smem_base)
-        warp_mbarrier = token_in_mbarriers + transfer_warp_idx
-        warp_activation_stage = token_in_activation[transfer_warp_idx, None]
-        warp_sf_stage = token_in_sf[transfer_warp_idx, (None, None)]
+        pull_depth: cutlass.Constexpr[int] = self.token_in_pull_depth
+        stage_base = transfer_warp_idx * Int32(pull_depth)
+        warp_mbarrier = token_in_mbarriers + stage_base
+        warp_activation_stage = token_in_activation[stage_base, None]
+        warp_sf_stage = token_in_sf[stage_base, (None, None)]
         if lane_idx == Int32(0):
-            cute.arch.mbarrier_init(warp_mbarrier, 1)
+            for init_stage in cutlass.range_constexpr(pull_depth):
+                cute.arch.mbarrier_init(warp_mbarrier + Int32(init_stage), 1)
         cute.arch.sync_warp()
 
         fc1_activation_pointer = self._device_workspace.ptr(self.fc1_activation_region)
@@ -2058,6 +2073,28 @@ class TokenCommDedup(KernelComponent):
         )
 
         local_expert = Int32(0)
+        if cutlass.const_expr(pull_depth > 1):
+            flag_tracker, pr_pulls = self._token_in_pull_pipelined(
+                owned_sizes,
+                pool_expert_bases,
+                token_metadata_pointer,
+                token_in_activation,
+                token_in_sf,
+                warp_mbarrier,
+                stage_base,
+                fc1_activation_pointer,
+                fc1_activation_sf,
+                fc1_ready_counter,
+                Int32(activation_bytes),
+                Int32(activation_sf_bytes),
+                sf_copy_atom,
+                global_warp_idx,
+                global_warp_count,
+                lane_idx,
+                flag_tracker,
+                pr_pulls,
+            )
+            local_expert = Int32(self.experts_per_rank)
         while local_expert < Int32(self.experts_per_rank):
             expert_token_count = owned_sizes[local_expert]
             expert_valid_end = expert_valid_begin + expert_token_count
@@ -2165,6 +2202,15 @@ class TokenCommDedup(KernelComponent):
             cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
+        if cutlass.const_expr(
+            self.token_back_enabled and self.token_back_mode == "standalone_warps" and not self._probe_tb_own_smem
+        ):
+            # Every pull has landed and every bulk store has read its stage: hand the ring to the combine warps.
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.sync_warp()
+            pipeline.NamedBarrier(
+                barrier_id=self.token_in_done_barrier_id, num_threads=2 * self.transfer_thread_count
+            ).arrive()
         iket.range_pop()
         if cutlass.const_expr(self._probe_stamps):
             if (lane_idx == Int32(0)) and (self._linear_cta_idx % Int32(53) == Int32(0)):
@@ -2181,6 +2227,156 @@ class TokenCommDedup(KernelComponent):
             )
             transfer_lifetime_barrier.arrive_and_wait()
             iket.range_pop()
+
+    @cute.jit
+    def _token_in_pull_pipelined(
+        self,
+        owned_sizes: cute.Tensor,
+        pool_expert_bases: cute.Tensor,
+        token_metadata_pointer: cute.Pointer,
+        token_in_activation: cute.Tensor,
+        token_in_sf: cute.Tensor,
+        warp_mbarrier: cute.Pointer,
+        stage_base: Int32,
+        fc1_activation_pointer: cute.Pointer,
+        fc1_activation_sf: cute.Tensor,
+        fc1_ready_counter: cute.Pointer,
+        activation_bytes: Int32,
+        activation_sf_bytes: Int32,
+        sf_copy_atom: cute.CopyAtom,
+        global_warp_idx: Int32,
+        global_warp_count: Int32,
+        lane_idx: Int32,
+        flag_tracker,
+        pr_pulls: Int32,
+    ):
+        """Dispatch pulls with ``token_in_pull_depth`` rows in flight per warp. The warp walks the same rows in the
+        same order as the one-deep loop (dense rows ``global_warp_idx + k * global_warp_count`` over the experts'
+        concatenated pools) and publishes each row's ready flag in that order; only the remote reads overlap."""
+        depth: cutlass.Constexpr[int] = self.token_in_pull_depth
+        sf_copy_elements = 4
+        total_rows = Int32(0)
+        for count_expert in cutlass.range(Int32(self.experts_per_rank), unroll=1):
+            total_rows = total_rows + owned_sizes[count_expert]
+
+        issue_row = global_warp_idx
+        issued = Int32(0)
+        issue_expert = Int32(0)
+        issue_expert_begin = Int32(0)
+        done_row = global_warp_idx
+        done_count = Int32(0)
+        done_expert = Int32(0)
+        done_expert_begin = Int32(0)
+        done_sf_begin = Int32(0)
+        done_ready_slot_begin = Int32(0)
+        pull_phase_mask = Int32(0)
+        while done_row < total_rows:
+            while (issued - done_count < Int32(depth)) and (issue_row < total_rows):
+                while issue_row >= issue_expert_begin + owned_sizes[issue_expert]:
+                    issue_expert_begin = issue_expert_begin + owned_sizes[issue_expert]
+                    issue_expert = issue_expert + Int32(1)
+                issue_slot = issued & Int32(depth - 1)
+                issue_pool_token = pool_expert_bases[issue_expert] + (issue_row - issue_expert_begin)
+                metadata = TokenSrcMetadata.load(
+                    token_metadata_pointer.toint() + Int64(issue_pool_token) * Int64(TokenSrcMetadata.nbytes)
+                )
+                peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+                remote_activation_address = (
+                    self._token_comm_args.activation.iterator.toint()
+                    + peer_offset
+                    + Int64(metadata.src_token) * Int64(self.bytes_per_token)
+                )
+                remote_sf = cute.make_tensor(
+                    cute.make_ptr(
+                        self._token_comm_args.activation_sf.dtype,
+                        self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
+                        AddressSpace.gmem,
+                        assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
+                    ),
+                    self._token_comm_args.activation_sf.layout,
+                )
+                remote_sf_row = remote_sf[Int64(metadata.src_token), None]
+                issue_barrier = warp_mbarrier + issue_slot
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(issue_barrier, activation_bytes + activation_sf_bytes)
+                    tma_load_1d(
+                        token_in_activation[stage_base + issue_slot, None].iterator,
+                        Int64(remote_activation_address),
+                        issue_barrier,
+                        activation_bytes,
+                    )
+                    tma_load_1d(
+                        token_in_sf[stage_base + issue_slot, (None, None)].iterator,
+                        remote_sf_row.iterator,
+                        issue_barrier,
+                        activation_sf_bytes,
+                    )
+                cute.arch.sync_warp()
+                issue_row = issue_row + global_warp_count
+                issued = issued + Int32(1)
+
+            while done_row >= done_expert_begin + owned_sizes[done_expert]:
+                expert_token_count = owned_sizes[done_expert]
+                done_expert_begin = done_expert_begin + expert_token_count
+                done_sf_begin = done_sf_begin + (
+                    (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                ) * Int32(self.sf_padding_block)
+                done_ready_slot_begin = done_ready_slot_begin + (
+                    (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                    // Int32(self.tokens_per_fc1_ready_slot)
+                )
+                done_expert = done_expert + Int32(1)
+            done_slot = done_count & Int32(depth - 1)
+            token_in_expert = done_row - done_expert_begin
+            pool_token_idx = pool_expert_bases[done_expert] + token_in_expert
+            sf_token_idx = done_sf_begin + token_in_expert
+            ready_slot_idx = done_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+            cute.arch.mbarrier_wait(warp_mbarrier + done_slot, (pull_phase_mask >> done_slot) & Int32(1))
+            pull_phase_mask = pull_phase_mask ^ (Int32(1) << done_slot)
+
+            destination_activation = cute.make_ptr(
+                self.activation_dtype,
+                fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                AddressSpace.gmem,
+                assumed_align=16,
+            )
+            with cute.arch.elect_one():
+                cp_async_bulk_s2g(
+                    destination_activation, token_in_activation[stage_base + done_slot, None].iterator, activation_bytes
+                )
+            cute.arch.sync_warp()
+            cute.arch.cp_async_bulk_commit_group()
+
+            stage_sf_values = cute.slice_(token_in_sf[stage_base + done_slot, (None, None)], (0, None))
+            stage_sf_vectors = cute.zipped_divide(stage_sf_values, (sf_copy_elements,))
+            destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
+            destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
+            destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
+            destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
+            sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
+            for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
+                sf_vector_idx = Int32(sf_round * 32) + lane_idx
+                if sf_vector_idx < Int32(sf_vector_count):
+                    cute.copy(
+                        sf_copy_atom,
+                        stage_sf_vectors[None, sf_vector_idx],
+                        destination_sf_vectors[None, sf_vector_idx],
+                    )
+
+            # Same publication rule as the one-deep loop: a publishing row waits for its stores to complete.
+            if flag_tracker.publishes_on_accumulate(Int32(0), self.token_in_flag_batch):
+                cute.arch.cp_async_bulk_wait_group(0)
+            else:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.sync_warp()
+            ready_address = (fc1_ready_counter + ready_slot_idx).toint()
+            flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
+            cute.arch.sync_warp()
+            done_row = done_row + global_warp_count
+            done_count = done_count + Int32(1)
+            if cutlass.const_expr(self._probe_stamps):
+                pr_pulls = pr_pulls + Int32(1)
+        return flag_tracker, pr_pulls
 
     @cute.jit
     def token_back(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
@@ -2221,6 +2417,11 @@ class TokenCommDedup(KernelComponent):
                     barrier_id=self.standalone_size_barrier_id, num_threads=2 * self.transfer_thread_count
                 )
                 sizes_ready_barrier.arrive_and_wait()
+        if cutlass.const_expr(self.token_back_mode == "standalone_warps" and not self._probe_tb_own_smem):
+            # The stage ring overlays the dispatch ring (register_smem_regions).
+            pipeline.NamedBarrier(
+                barrier_id=self.token_in_done_barrier_id, num_threads=2 * self.transfer_thread_count
+            ).arrive_and_wait()
 
         pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)

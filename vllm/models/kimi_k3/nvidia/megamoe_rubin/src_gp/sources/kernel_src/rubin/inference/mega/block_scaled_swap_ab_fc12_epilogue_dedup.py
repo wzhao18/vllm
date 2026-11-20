@@ -42,6 +42,8 @@ _PROBE_FC2_STG = False
 _PROBE_FC2_EF = False  # L2 evict-first FC2 bulk stores
 _PROBE_ORDER_WINDOW = 0  # timing probe: block % N
 _PROBE_FC2_STG_SKIP = False  # timing/debug: no STG
+_PROBE_FC2_SKIP = False  # timing probe: no FC2 bulk stores at all
+_PROBE_FC2_SKIP_KIND = ""  # timing probe: 'remote' (single-copy peer pushes) | 'local' (order buffer)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +105,8 @@ class Fc2DedupBulkRouter:
                     ).iterator.toint()
                     dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.map(local_row, md.src_rank)
                     valid[iter_idx] = Int32(2) if cutlass.const_expr(self.reduce_topk_in_kernel) else Int32(1)
+                    if cutlass.const_expr(_PROBE_FC2_SKIP_KIND == "remote"):
+                        valid[iter_idx] = Int32(0)
                 else:
                     block_index = Int64(md.src_token) * Int64(self.world_size) + Int64(md.src_rank)
                     if cutlass.const_expr(_PROBE_ORDER_WINDOW > 0):
@@ -112,6 +116,8 @@ class Fc2DedupBulkRouter:
                     )
                     dst_ptrs[iter_idx] = self.order_base + slot_index * Int64(self.chunk_bytes) + byte_in_chunk
                     valid[iter_idx] = Int32(1)
+                    if cutlass.const_expr(_PROBE_FC2_SKIP_KIND == "local"):
+                        valid[iter_idx] = Int32(0)
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid, copy_iters=copy_iters)
 
     @cute.jit
@@ -242,7 +248,7 @@ def fc2_dedup_bulk_store_function(
     else:
         cute.arch.fence_proxy("async.shared", space="cta")
         smem_read_write_bar.arrive_and_wait()
-        for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
+        for ublk_iter_idx in cutlass.range_constexpr(0 if _PROBE_FC2_SKIP else copy_iters):
             if cutlass.const_expr(epi.two_epilogue_warpgroups):
                 owned_subtile = lane_idx // Int32(8)
             else:
