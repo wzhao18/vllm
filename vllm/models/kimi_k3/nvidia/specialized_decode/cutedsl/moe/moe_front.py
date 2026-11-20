@@ -457,8 +457,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   // TMA issue: lane 0 of warps 0, 3 and 4-7 (the epilogue warps idle until the
   // accumulator is done). Bulk ops from one issuing warp complete about one at a
   // time (hwdb hw51), so each ring slot is owned by one issuer and the issuers run
-  // in parallel. Weights never depend on the predecessor: the shared-memory-resident
-  // blocks and the TMEM fill stream start at entry, beside the AttnRes reduce.
+  // in parallel. Weights never depend on the predecessor: the TMEM fill stream starts
+  // at entry, beside the AttnRes reduce, and the shared-memory-resident blocks follow.
   // Ring items run in rounds of ns slots (tokens: xs slots); issuer u owns the slots
   // s = u (mod kIssuers) and visits them in item order, counters advance without a
   // division.
@@ -466,9 +466,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     constexpr int kIssuers = 6;
     const int u = warp == 0 ? 0 : warp - 2;
     const int ns = p.ns;
-    // res_bar's expect_tx is set before the CTA barrier above (thread 0).
-    for (int r = u; r < nr; r += kIssuers)
-      bulk_g2s(res_s + r * kSlot, wblk + (nt + r) * kSlot, kSlot, res_bar);
     uint32_t ph = 0;
     for (int i0 = 0; i0 < nt; i0 += ns, ph ^= 1) {
       for (int slot = u; slot < ns && i0 + slot < nt; slot += kIssuers) {
@@ -477,6 +474,12 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         bulk_g2s(ring_s + slot * kSlot, wblk + (i0 + slot) * kSlot, kSlot, full0 + 8 * slot);
       }
     }
+    // The shared-memory-resident blocks (the MMAs' last K blocks) follow the TMEM
+    // fill stream instead of opening it: issued at entry they were a 13-20 MB burst
+    // on top of the ring's first round beside the AttnRes reduce (in-step: +1.1 us
+    // on the reduce). res_bar's expect_tx is set before the CTA barrier (thread 0).
+    for (int r = u; r < nr; r += kIssuers)
+      bulk_g2s(res_s + r * kSlot, wblk + (nt + r) * kSlot, kSlot, res_bar);
     // Token slot gs takes over W ring slot xslot[gs] as soon as that slot's last
     // weight block is in TMEM (its empty barrier), so the tokens follow the fill and
     // the MMAs run behind it, not after the whole fill.
