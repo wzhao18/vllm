@@ -27,6 +27,7 @@ the cache (``fi_kernels``)."""
 
 import bisect
 import math
+from functools import cache
 
 import torch
 
@@ -183,6 +184,16 @@ def _offsets(capacity, rows, device):
 PLANS = _Plans()
 
 
+@cache
+def km_lse(device, numel):
+    """The keys-on-M sparse MLA's LSE [numel] (FP32) of a device under DCP, shared
+    by its DSA layers: LSE_SENT words km publishes into after each row's latent and
+    the km-overlap DcpValue re-arms after reading (dcp_value.DcpValue km_grid)."""
+    return torch.full((numel,), -1, dtype=torch.int32, device=device).view(
+        torch.float32
+    )
+
+
 class FlashInferCore:
     """One layer's FlashInfer sparse core. ``impl`` / ``layer``: its
     FlashInferMLASparseImpl and attention layer; ``heads``: the query heads per
@@ -290,6 +301,9 @@ class FlashInferCore:
         if self.kernels[rows] == "prims_ts":
             self.prims_ts(query, kv, slots, valid, latent, lse)
         elif self.kernels[rows] == "km":
+            if lse is not None:  # (published for DcpValue's km overlap)
+                lse = km_lse(self.device, self.lse.numel())[: rows * heads]
+                lse = lse.view(rows, heads)
             self.keys_on_m(query, kv, slots, valid, latent, lse)
         else:
             self.trtllm(query, kv, stride_rows, slots, valid, latent, lse, block_size)
@@ -317,6 +331,7 @@ class FlashInferCore:
             lse,
             impl.bmm1_scale,
             impl.bmm2_scale,
+            publish=True,
         )
 
     def prims_ts(self, query, kv, slots, valid, latent, lse):

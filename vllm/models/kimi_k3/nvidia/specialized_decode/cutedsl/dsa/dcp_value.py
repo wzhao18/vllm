@@ -57,6 +57,7 @@ from .sparse_mla import (
     mbar_init,
     mbar_wait,
     st_global_u64,
+    st_shared_u32,
     tc_commit,
     tc_fence_after,
     tc_fence_before,
@@ -90,6 +91,10 @@ TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
 # A unit's BF16 value rows [128 x 128], staged for its one bulk push (two buffers:
 # a unit's push is in flight while the next one's epilogue writes).
 TC_OUT = 128 * 128 * 2
+# After km (km_grid): claimed unit ids in flight from the TMA warp to the MMA and
+# epilogue warps (the TMA warp runs at most a few units ahead: stage ring + 2 TMEM
+# accumulators).
+UNIT_RING = 8
 # Its epilogue warps (warp % 4 = TMEM lane quadrant), clear of the TMA and MMA
 # issuers (warps 0 and 1), which run ahead into the next unit.
 TC_EPI = 4
@@ -159,6 +164,25 @@ def _bulk_wait0():
 @asm()
 def _fence_async_shared():
     return "fence.proxy.async.shared::cta;", "~{memory}", ()
+
+
+@asm()
+def _fence_async_global():
+    return "fence.proxy.async.global;", "~{memory}", ()
+
+
+@asm(Uint32, pure=False)
+def _claim_next(pointer):
+    """Relaxed GPU-scope ``atom.add.u32`` of 1: the count before."""
+    return "atom.relaxed.gpu.global.add.u32 $0,[$1],1;", "=r,l,~{memory}", (
+        Int64(pointer),)
+
+
+@cache
+def claim_counters(device_index):
+    """The km-overlap DcpValue's unit claim and CTA done counters of a device
+    (u32 [2], zero; the last CTA of every call resets them)."""
+    return torch.zeros(4, dtype=torch.int32, device=f"cuda:{device_index}")
 
 
 @asm()
@@ -302,6 +326,8 @@ class DcpValue:
         partials="bf16",
         preprojected=False,
         rearm=True,
+        km_grid=0,
+        claim_addr=0,
     ):
         """``rearm`` False: no reader polls this parity's q mailbox (the query of
         every gathered head is computed on each rank, dsa.local_query), so it is
@@ -310,9 +336,17 @@ class DcpValue:
         base 2 (LOG2E for a natural-log LSE). ``preprojected`` ("proj" only): the
         W_UV argument holds the value rows [DCP * H, B, 128] BF16 a batched GEMM
         already projected (the stock W_UV bmm over the gathered heads), so the
-        projecting CTAs only push them."""
+        projecting CTAs only push them.
+
+        ``km_grid`` > 0 ("proj" on tcgen05 after the keys-on-M sparse MLA of that
+        many persistent CTAs, which triggers its dependents at entry and publishes
+        a row's LSE only after the row's latent): no griddepcontrol_wait; units of
+        (gathered head, rows of one km wave tile) in the order km completes them,
+        claimed through the counters at ``claim_addr`` (claim_counters), each
+        loaded once its rows' LSE words left LSE_SENT; the epilogue re-arms them."""
         self.heads, self.size, self.batch = heads, size, batch
         self.stamp_addr = STAMP_ADDR
+        self.km_grid, self.claim_addr = km_grid, claim_addr
         assert partials in FORMATS, partials
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
@@ -338,6 +372,11 @@ class DcpValue:
             self.tc = not self.preprojected and per_row and projects_on_tc(batch)
             if self.tc:
                 self.mtiles = -(-batch // 128)
+                if km_grid:  # 128-row tiles within each km wave of km_grid rows
+                    assert claim_addr, "km overlap needs the claim counters"
+                    self.wave_tiles = -(-km_grid // 128)
+                    waves, last = divmod(batch, km_grid)
+                    self.mtiles = waves * self.wave_tiles + -(-last // 128)
                 self.units = size * heads * self.mtiles
                 self.grid = (heads, max(1, sms // heads), 1)
                 self.merge_tiles = -(-tiles // self.grid[1])
@@ -506,13 +545,18 @@ class DcpValue:
         smem = cutlass.utils.SmemAllocator()
         scales = alloc(smem, Float32, (16 * self.merge_tiles, D))
         ring = Uint32(smem.allocate_array(
-            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128, byte_alignment=1024
+            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 256, byte_alignment=1024
         ).toint())
         outs = ring + Uint32(TC_STAGES * TC_STAGE)
         bars = outs + Uint32(2 * TC_OUT)  # full[st], empty[st]
         acc_full = bars + Uint32(16 * TC_STAGES)  # [2]
         acc_free = acc_full + Uint32(16)  # [2]
         slot_addr = acc_free + Uint32(16)
+        # km overlap: the claimed units' ring (UNIT_RING ids + their full barriers)
+        # from the TMA warp to the MMA and epilogue warps, and the claim broadcast
+        uids = slot_addr + Uint32(8)
+        ufull = uids + Uint32(4 * UNIT_RING)
+        claimed = ufull + Uint32(8 * UNIT_RING)
         tid, _, _ = cute.arch.thread_idx()
         head, y, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -525,12 +569,17 @@ class DcpValue:
             for b in cutlass.range_constexpr(2):
                 mbar_init(acc_full + Uint32(8 * b), Uint32(1))
                 mbar_init(acc_free + Uint32(8 * b), Uint32(128))
+            for s in cutlass.range_constexpr(UNIT_RING):
+                mbar_init(ufull + Uint32(8 * s), Uint32(1))
             fence_mbar_init()
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
         self.mark(c, 0, tid)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
         # CTAs may still be resident here and allocate TMEM after this CTA would.
-        cute.arch.griddepcontrol_wait()
+        # After km (km_grid): every km CTA is resident before any CTA here (km
+        # triggers at entry, one CTA per SM), and its rows are polled per unit.
+        if cutlass.const_expr(self.km_grid == 0):
+            cute.arch.griddepcontrol_wait()
         if warp == 0:
             _tmem_alloc256(slot_addr)
         tc_fence_before()
@@ -539,11 +588,25 @@ class DcpValue:
         taddr = ld_shared_u32(slot_addr)
         self.mark(c, 1, tid)
         if warp == 0:
-            if lane == 0:
-                kc = Int32(0)
-                for u in range(c, self.units, G):
-                    gh = u % DH
-                    t0 = (u // DH) * 128
+            kc = Int32(0)
+            j = Int32(0)
+            u = self.claim(c, j, lane, claimed)
+            while u >= 0:
+                gh, t0, t1 = self.unit_rows(u)
+                if cutlass.const_expr(self.km_grid > 0):
+                    # km publishes a row's LSE after its latent (fence, then store)
+                    for t in range(t0 + lane, t1, 32):
+                        word = load_volatile(at(rows_lse, t, 0, gh))[0]
+                        while word == Uint32(LSE_SENT):
+                            word = load_volatile(at(rows_lse, t, 0, gh))[0]
+                    cute.arch.sync_warp()
+                if lane == 0:
+                    if cutlass.const_expr(self.km_grid > 0):
+                        cute.arch.fence_acq_rel_gpu()
+                        _fence_async_global()  # (the latent rows feed TMA loads)
+                        s = j % UNIT_RING
+                        st_shared_u32(uids + Uint32(4) * Uint32(s), Uint32(u))
+                        mbar_arrive(ufull + Uint32(8) * Uint32(s))
                     for k in cutlass.range_constexpr(8):
                         st = (kc + k) % TC_STAGES
                         ph = ((kc + k) // TC_STAGES) & 1
@@ -554,11 +617,19 @@ class DcpValue:
                         _tma3d(dst, tm_a, full, 64 * k, gh, t0)
                         _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k, 0, gh)
                     kc = kc + 8
+                j = j + 1
+                u = self.claim(c, j, lane, claimed)
+            if cutlass.const_expr(self.km_grid > 0):
+                if lane == 0:  # the end of this CTA's units
+                    s = j % UNIT_RING
+                    st_shared_u32(uids + Uint32(4) * Uint32(s), Uint32(0xFFFFFFFF))
+                    mbar_arrive(ufull + Uint32(8) * Uint32(s))
         if warp == 1:
             if lane == 0:
                 kc = Int32(0)
                 j = Int32(0)
-                for u in range(c, self.units, G):
+                u = self.unit_at(c, j, uids, ufull)
+                while u >= 0:
                     b = j & 1
                     mbar_wait(acc_free + Uint32(8) * Uint32(b), ((j >> 1) & 1) ^ 1)
                     tc_fence_after()
@@ -579,19 +650,22 @@ class DcpValue:
                     tc_commit(acc_full + Uint32(8) * Uint32(b))
                     kc = kc + 8
                     j = j + 1
+                    u = self.unit_at(c, j, uids, ufull)
         if (warp >= TC_EPI) & (warp < TC_EPI + 4):
             row = tid - 32 * TC_EPI
             quad = Uint32(32 * (warp - TC_EPI)) << Uint32(16)
             j = Int32(0)
-            for u in range(c, self.units, G):
+            u = self.unit_at(c, j, uids, ufull)
+            while u >= 0:
                 b = j & 1
-                gh = u % DH
-                t0 = (u // DH) * 128
+                gh, t0, t1 = self.unit_rows(u)
                 t = t0 + row
-                live = t < B
+                live = t < t1
                 lse = Float32(EMPTY_LSE)
                 if live:
                     lse = self.sent_lse(rows_lse, lens, t, gh)
+                    if cutlass.const_expr(self.km_grid > 0):  # re-arm km's LSE word
+                        store_words(at(rows_lse, t, 0, gh), (Uint32(LSE_SENT),))
                 send = live & (lse > Float32(EMPTY_LSE))
                 owner = gh // H
                 base = ((parity * D + rank) * H + gh % H) * cap
@@ -623,17 +697,19 @@ class DcpValue:
                 _fence_async_shared()
                 _epi_sync()
                 if row == 0:
-                    n = B - t0
-                    if n > 128:
-                        n = 128
                     _bulk_push(peers[owner] + Int64(base + t0) * 256,
-                               outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
+                               outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * (t1 - t0)))
                 self.mark(c, 3 + 2 * j, row)
                 j = j + 1
+                u = self.unit_at(c, j, uids, ufull)
             if row == 0:
                 _bulk_wait0()
             self.mark(c, 8, row)
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.km_grid > 0):
+            if tid == 0:  # the last CTA past its claims re-zeroes the counters
+                if _claim_next(Int64(self.claim_addr) + 4) == Uint32(G - 1):
+                    store_relaxed(Int64(self.claim_addr), (Uint32(0), Uint32(0)))
         # Free TMEM before the dependents launch: a dependent CTA placed on this SM
         # while the merge spins may require TMEM column 0 (exclusive allocators).
         if warp == 0:
@@ -652,6 +728,56 @@ class DcpValue:
             if (who == 0) & (slot < 16):
                 at_ = Int64(self.stamp_addr) + (Int64(c) * 16 + Int64(slot)) * 8
                 st_global_u64(at_, globaltimer())
+
+    @cute.jit
+    def claim(self, c, j, lane, claimed):
+        """The TMA warp's unit ``j`` (-1: none left): c + j G, or after km the next
+        unit of the shared claim counter (lane 0 claims, the warp reads it back)."""
+        u = Int32(-1)
+        if cutlass.const_expr(self.km_grid == 0):
+            u = c + j * (self.heads * self.grid[1])
+        else:
+            if lane == 0:
+                st_shared_u32(claimed, _claim_next(Int64(self.claim_addr)))
+            cute.arch.sync_warp()
+            u = Int32(ld_shared_u32(claimed))
+            cute.arch.sync_warp()
+        if u >= self.units:
+            u = Int32(-1)
+        return u
+
+    @cute.jit
+    def unit_at(self, c, j, uids, ufull):
+        """Unit ``j`` of this CTA for the MMA and epilogue warps (-1: none left): as
+        ``claim``, after km read from the TMA warp's ring."""
+        u = Int32(-1)
+        if cutlass.const_expr(self.km_grid == 0):
+            u = c + j * (self.heads * self.grid[1])
+            if u >= self.units:
+                u = Int32(-1)
+        else:
+            s = j % UNIT_RING
+            mbar_wait(ufull + Uint32(8) * Uint32(s), (j // UNIT_RING) & 1)
+            u = Int32(ld_shared_u32(uids + Uint32(4) * Uint32(s)))
+        return u
+
+    @cute.jit
+    def unit_rows(self, u):
+        """(gathered head, first row, row end) of unit ``u``: 128-row tiles, after km
+        within each wave of km_grid rows (km's CTA k owns rows k, k + km_grid, ..)."""
+        DH = self.size * self.heads
+        ti, gh = u // DH, u % DH
+        t0 = ti * 128
+        end = t0 + 128
+        if cutlass.const_expr(self.km_grid > 0):
+            wave = (ti // self.wave_tiles) * self.km_grid
+            t0 = wave + (ti % self.wave_tiles) * 128
+            end = t0 + 128
+            if end > wave + self.km_grid:
+                end = wave + self.km_grid
+        if end > self.batch:
+            end = Int32(self.batch)
+        return gh, t0, end
 
     @cute.jit
     def merge_rows(self, args, scales, tid, y):
@@ -931,7 +1057,12 @@ class DcpValue:
     def sent_lse(self, rows_lse, lens, b, gh):
         """The base-2 LSE row (b, gh) sends: EMPTY_LSE for an empty local shard or a
         NaN / infinite LSE (then its partial row is not sent)."""
-        value = rows_lse[b, 0, gh] * Float32(self.lse_scale)
+        raw = Float32(0)
+        if cutlass.const_expr(self.km_grid > 0):  # (km's LSE words are polled)
+            raw = bits_float(load_volatile(at(rows_lse, b, 0, gh))[0])
+        else:
+            raw = rows_lse[b, 0, gh]
+        value = raw * Float32(self.lse_scale)
         n = lens[b] if cutlass.const_expr(self.per_row) else lens[b // self.q]
         bad = (value != value) | (value <= Float32(EMPTY_LSE))  # NaN, -inf
         if (n <= 0) | bad | (value >= Float32(-EMPTY_LSE)):  # or +inf
@@ -1064,13 +1195,15 @@ def compile_value(
     partials="bf16",
     preprojected=False,
     rearm=True,
+    km_grid=0,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
     KV columns). ``dsa_heads``: DSA layout, its padded head count: q mailbox rows
     (BF16 for FlashMLA sparse, else FP8), rows / LSE as the sparse decode returns
     them (``lse_base_e``: natural-log, else base 2) and ``lens`` the sparse decode's
-    per-row valid counts. ``partials``: the format of its DcpMailbox."""
+    per-row valid counts. ``partials``: the format of its DcpMailbox. ``km_grid``:
+    the keys-on-M sparse MLA's CTAs ahead of it (DcpValue's km overlap), else 0."""
     f32, i32 = torch.float32, torch.int32
     w_uv, gate = fake(*uv), fake((batch, heads * 128), (pitch, 1))
     rows = fake((batch, 1, size * heads, 512))
@@ -1099,6 +1232,8 @@ def compile_value(
             partials,
             preprojected,
             rearm,
+            km_grid,
+            claim_counters(device).data_ptr() if km_grid else 0,
         )
     totals = fake((batch // q,), None, i32, 4)
     width = 512

@@ -54,10 +54,12 @@ def compile_dcp_value(
     partials,
     cap=64,
     rearm=True,
+    km_grid=0,
 ):
     """DcpValue of one batch (DSA layout over the ``q_heads``-padded mailbox of
     ``cap`` rows; ``partials``: the DcpBox's; ``rearm`` False: the q mailbox was
-    not published, local_query)."""
+    not published, local_query; ``km_grid``: the keys-on-M sparse MLA's CTAs it
+    overlaps, dcp_value.DcpValue)."""
     return compile_value(
         heads,
         dcp,
@@ -74,6 +76,7 @@ def compile_dcp_value(
         partials=partials,
         preprojected=partials == PROJECTED and not projects_on_tc(batch),
         rearm=rearm,
+        km_grid=km_grid,
     )
 
 

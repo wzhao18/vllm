@@ -59,7 +59,7 @@ from .dcp_stage import (
     run_core_value,
     run_value,
 )
-from .dcp_value import PROJECTED
+from .dcp_value import PROJECTED, projects_on_tc
 from .indexer import PAGE as INDEX_PAGE
 from .indexer import FusedIndexer
 from .indexer import reserve as reserve_fused_indexer
@@ -144,6 +144,7 @@ def compile_core(
     cap=64,
     release=True,
     rearm=True,
+    km_grid=0,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
@@ -182,7 +183,7 @@ def compile_core(
         if dcp:
             args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
             value_kernel = compile_dcp_value(
-                *args, fp8, lse_base_e, partials, cap, rearm
+                *args, fp8, lse_base_e, partials, cap, rearm, km_grid
             )
         else:
             latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
@@ -440,6 +441,8 @@ class PreparedDsa:
                 partials = self.box.mailbox(batch).format
             # trtllm-gen and the Rubin keys-on-M kernel (km): base 2
             lse_base_e = self.cores[batch, q] not in ("trtllm", "km")
+            # km publishes rows for the "proj" tcgen05 DcpValue (its km overlap)
+            dcp_proj_tc = partials == PROJECTED and projects_on_tc(batch)
             overlap = self.overlaps[batch, q]
             cap = self.box.cap if self.box is not None else 64
             if self.is_local(batch) and overlap != "fork":
@@ -457,6 +460,7 @@ class PreparedDsa:
                 cap=cap,
                 release=(batch, q) not in self.held(LATE),
                 rearm=not self.is_local(batch),
+                km_grid=sms if self.cores[batch, q] == "km" and dcp_proj_tc else 0,
             )
             if overlap != "serial" or batch <= FUSED_INDEX:
                 self.overlap_kernels[batch, q] = self.compile_overlap(

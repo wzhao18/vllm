@@ -245,8 +245,12 @@ class SparseMlaDecodeKM:
     def __init__(self, grid: int, stages: int = 3, loaders: int = 6,
                  stamps: bool = False, cpa: int = 0, prefetch: int = 3,
                  gather_only: bool = False, epi_store: bool = True,
-                 no_gather: bool = False):
+                 no_gather: bool = False, publish: bool = False):
         assert 2 <= stages <= 8 and loaders == LOADERS
+        # publish (DcpValue's km overlap, dcp_value.DcpValue km_grid): trigger the
+        # dependents at entry and store a row's LSE only after its latent is
+        # globally visible (the group's barrier, then a GPU-scope fence)
+        self.publish = publish
         self.grid, self.stages, self.loaders, self.stamps = grid, stages, loaders, stamps
         # cpa > 0: latent blocks 0 .. cpa - 1 by TMA, the rest of the row by cp.async
         self.cpa, self.prefetch = cpa, prefetch
@@ -365,6 +369,8 @@ class SparseMlaDecodeKM:
         tc_fence_before()
         cute.arch.sync_threads()
         tc_fence_after()
+        if cutlass.const_expr(self.publish):  # (every CTA holds its TMEM by now)
+            cute.arch.griddepcontrol_launch_dependents()
         if tid == 0:
             self.mark(stamp, cta, 1)
         taddr = ld_shared_u32(base + Uint32(self.off_tmem))
@@ -802,14 +808,17 @@ class SparseMlaDecodeKM:
                 named_bar(Uint32(1) + Uint32(k), Uint32(128))  # tile maxima all read
                 st_shared_f32(tbuf + Uint32(quarter * HW * 4) + Uint32(4) * Uint32(lane), v[0])
                 named_bar(Uint32(1) + Uint32(k), Uint32(128))
+                row_lse = Float32(0.0)
                 if combiner:
                     lt = ld_shared_f32(tbuf + Uint32(4) * Uint32(lane))
                     for qq in cutlass.range_constexpr(1, 4):
                         lt = lt + ld_shared_f32(tbuf + Uint32(qq * HW * 4)
                                                 + Uint32(4) * Uint32(lane))
                     # lt = 448 l: LSE = m + log2 l; O = O~ / (448 l) x out_scale
-                    st_global_f32(lse + (Int64(row) * Int64(lse_stride) + Int64(h0 + lane))
-                                  * Int64(4), m + lg2(lt) - log2_448)
+                    row_lse = m + lg2(lt) - log2_448
+                    if cutlass.const_expr(not self.publish):
+                        st_global_f32(lse + (Int64(row) * Int64(lse_stride)
+                                             + Int64(h0 + lane)) * Int64(4), row_lse)
                     st_shared_f32(lfin + Uint32(4) * Uint32(h0 + lane), out_scale / lt)
                 named_bar(Uint32(1) + Uint32(k), Uint32(128))  # the sums are read
                 if ep:
@@ -846,20 +855,33 @@ class SparseMlaDecodeKM:
                                 st_global_bf16x2(
                                     dst + Int64(((h0 + h + odd) * D_NOPE + 128 * blk)
                                                 * 2), lo, hi)
+                if cutlass.const_expr(self.publish):
+                    named_bar(Uint32(1) + Uint32(k), Uint32(128))  # latent stored
+                    if combiner:
+                        cute.arch.fence_acq_rel_gpu()
+                        st_global_f32(lse + (Int64(row) * Int64(lse_stride)
+                                             + Int64(h0 + lane)) * Int64(4), row_lse)
                 if (warp == SOFT0) & (lane == 0) & (ro < 2):
                     self.mark(stamp, cta, 14 + 16 * ro)
                 ro = ro + 1
             else:  # no keys: LSE -inf and a zero latent (as trtllm-gen)
                 row = cta + i * self.grid
-                if combiner:
-                    st_global_f32(lse + (Int64(row) * Int64(lse_stride) + Int64(h0 + lane))
-                                  * Int64(4), neg)
+                if cutlass.const_expr(not self.publish):
+                    if combiner:
+                        st_global_f32(lse + (Int64(row) * Int64(lse_stride)
+                                             + Int64(h0 + lane)) * Int64(4), neg)
                 dst = out + (Int64(row) * Int64(out_stride) + Int64(h0) * Int64(D_NOPE)
                              + Int64(key)) * Int64(2)
                 for blk in cutlass.range_constexpr(4):
                     for h in cutlass.range_constexpr(HW):
                         st_global_bf16(dst + Int64((h * D_NOPE + 128 * blk) * 2),
                                        Float32(0.0))
+                if cutlass.const_expr(self.publish):
+                    named_bar(Uint32(1) + Uint32(k), Uint32(128))  # zeros stored
+                    if combiner:
+                        cute.arch.fence_acq_rel_gpu()
+                        st_global_f32(lse + (Int64(row) * Int64(lse_stride)
+                                             + Int64(h0 + lane)) * Int64(4), neg)
 
 
 @asm(Float32, pure=True)
@@ -931,9 +953,9 @@ def ld_global_s32(ptr):
 @cache
 def _compiled(grid: int, stages: int, loaders: int, stamps: bool, cpa: int = 0,
               prefetch: int = 3, gather_only: bool = False, epi_store: bool = True,
-              no_gather: bool = False):
+              no_gather: bool = False, publish: bool = False):
     kernel = SparseMlaDecodeKM(grid, stages, loaders, stamps, cpa, prefetch, gather_only,
-                               epi_store, no_gather)
+                               epi_store, no_gather, publish)
     args = (Int64(0), Int32(128), Int32(1), Int64(0), Int32(64), Int64(0), Int32(128),
             Int64(0), Int64(0), Int32(1), Int64(0), Int32(1), Float32(1.0), Float32(1.0),
             Int64(0), cuda.CUstream(0))
@@ -944,8 +966,10 @@ def _compiled(grid: int, stages: int, loaders: int, stamps: bool, cpa: int = 0,
 def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_scale,
                          grid=None, stages=3, loaders=LOADERS, stamps=None, cpa=0,
                          prefetch=3, gather_only=False, epi_store=True,
-                         no_gather=False):
-    """As ``sparse_mla.sparse_mla_decode`` (``query`` [R, Hq, 576] contiguous)."""
+                         no_gather=False, publish=False):
+    """As ``sparse_mla.sparse_mla_decode`` (``query`` [R, Hq, 576] contiguous).
+    ``publish``: DcpValue's km overlap (``lse`` holds dcp_value.LSE_SENT words a
+    km-overlap DcpValue re-arms; SparseMlaDecodeKM)."""
     rows, q_heads = query.shape[0], query.shape[1]
     assert query.shape[2] == ROW and query.is_contiguous() and q_heads >= H
     assert kv_rows.shape[1] == ROW and kv_rows.stride(0) == ROW
@@ -960,7 +984,7 @@ def sparse_mla_decode_km(query, kv_rows, slots, valid, latent, lse, scale, out_s
     if rows > MAX_ROWS * grid:
         raise ValueError(f"sparse_mla_decode_km: {rows} rows exceed {MAX_ROWS} per CTA")
     fn = _compiled(grid, stages, loaders, stamps is not None, cpa, prefetch, gather_only,
-                   epi_store, no_gather)
+                   epi_store, no_gather, publish)
     stream = cuda.CUstream(torch.cuda.current_stream(query.device).cuda_stream)
     fn(Int64(query.data_ptr()), Int32(q_heads), Int32(rows), Int64(kv_rows.data_ptr()),
        Int32(kv_rows.shape[0]), Int64(slots.data_ptr()), Int32(slots.stride(0)),
