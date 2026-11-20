@@ -89,7 +89,11 @@ class SpAttnResGather(ClusterAttnRes):
     def __init__(self, nb, tp, *, has_delta, write, mx=False, parts=0, **options):
         # ``mx``: publish the normed rows as MXFP8 into the MXFP8 box (``SpComm``
         # gather data + scale regions; ``common.mx_rows``) for an MXFP8 in-projection;
-        # args 9.. are then (data mc, scale mc, rank, local data, local scales).
+        # args 9.. are then (data mc, scale mc, rank, local data, local scales,
+        # rows per poller). Compact poll: only the CTAs of tokens that are multiples
+        # of the last arg poll, that many tokens each; the others exit after their
+        # publish, so the in-projection's CTAs land and stream their weight ring
+        # (``gemm.mxfp8`` "pre", whole-ring prewait) while the rows travel.
         # ``parts``: the delta is a beta-add GEMM's FP32 split-K partials (arg 0,
         # [parts * n, 7168]) and its BF16 residual (the last arg, [n, 7168]); see
         # ``ClusterAttnRes.sum_parts``.
@@ -120,11 +124,15 @@ class SpAttnResGather(ClusterAttnRes):
         self.pre(state, bufs, rows, eps, ids)
         col = (part * 128 + tid) * 8
         if cutlass.const_expr(self.mx):
-            mc, smc, rank, data, scale = args[9:14]
+            mc, smc, rank, data, scale, every = args[9:15]
             out = (mc, rank * n, smc)
             self.post(state, bufs, delta, rows, out, eps, out_eps, ids, ())
-            # Every rank's MXFP8 row of this token, these 1024 columns: published?
-            mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
+            # Every rank's MXFP8 rows of tokens [token, token + every), these 1024
+            # columns: published? (one poller per ``every`` tokens)
+            if token % every == 0:
+                for j in cutlass.range(every, unroll=1):
+                    if token + j < n:
+                        mx_rows.poll(data, scale, token + j, n, self.tp, col, 7168)
         else:
             mc, rank, gather = args[9:12]
             self.post(state, bufs, delta, rows, (mc, rank * n), eps, out_eps, ids, ())
@@ -252,7 +260,7 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts
         delta = dynamic_fake(2, torch.float32) if parts else row
         args = (delta, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
         if mx:
-            args += (Int64(0), Int64(0), Int32(0), Int64(0), Int64(0))
+            args += (Int64(0), Int64(0), Int32(0), Int64(0), Int64(0), Int32(1))
         else:
             args += (Int64(0), Int32(0), fake((cap, 7168)))
         if parts:
@@ -389,9 +397,11 @@ class SpBoundary:
         source_v, prefix_v, blocks_v, dummy = rows
         if self.gather_mx:
             mc, smc, data, scale = comm.mx_addresses(parity)
+            # Compact poll: <= one polling CTA per SM (the rest exit after publish).
+            every = Int32(max(1, -(-CLUSTER * n // comm.sms)))
             code(
                 source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
-                mc, smc, comm._rank, data, scale, *tail, stream(comm.device),
+                mc, smc, comm._rank, data, scale, every, *tail, stream(comm.device),
             )  # fmt: skip
             return comm.mx_view(parity, n * comm.tp)
         gather, mc, _, _ = comm.views(parity)

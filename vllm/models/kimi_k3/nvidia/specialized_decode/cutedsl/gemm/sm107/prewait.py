@@ -103,7 +103,11 @@ class Mxfp8PreGemm:
         if self.swap_ab and tactic[0][1] % 64:  # (measured: N32 / N96 swap tiles store wrong rows)
             raise ValueError(f"Mxfp8PreGemm: swap_ab needs a token tile multiple of 64 ({tactic[0]})")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
-        if prewait and prewait > k // tile_k:
+        # prewait -1: the whole smem ring (the kernel issues min(prewait, stages))
+        ring = prewait == -1
+        if ring:
+            prewait = k // tile_k
+        if prewait < 0 or prewait > k // tile_k:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
         if push:
             # the push epilogue stages its tile in the drained A ring: one tile per CTA
@@ -122,7 +126,7 @@ class Mxfp8PreGemm:
             int(max_stages), self.push,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
-        if prewait and self.stages is not None and prewait > self.stages:
+        if prewait and self.stages is not None and prewait > self.stages and not ring:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
         self.aux, self.calls = None, 0

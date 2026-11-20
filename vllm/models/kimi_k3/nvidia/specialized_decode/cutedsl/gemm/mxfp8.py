@@ -48,13 +48,16 @@ PRE_DEFAULT = (
     (257, 512, ((256, 256), (2, 1), False, 256), 4),
 )
 PRE_TACTICS: dict[tuple[int, int], tuple] = {
+    # kda_in follows the compact-poll MXFP8 SP all-gather (``attn_res.sp_fused``):
+    # its CTAs land while the rows travel, so it issues its whole weight ring before
+    # griddepcontrol.wait (prewait -1).
     (12448, 7168): (
-        (1, 128, ((128, 64), (1, 1), False, 128), 8),
-        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (1, 128, ((128, 64), (1, 1), False, 128), -1),
+        (129, 256, ((256, 128), (2, 1), False, 256), -1),
         # R257-384: swap_ab 2-CTA M256 (W) x N192 (tokens), 6 smem stages: 315 vs 361 MB
         # SM-delivered at R384, cold chain 16.13 vs 16.83 us/call (D-GEMM R4-7)
-        (257, 384, ((256, 192), (2, 1), True, 256), 4, 6),
-        (385, 512, ((256, 256), (2, 1), False, 256), 8),
+        (257, 384, ((256, 192), (2, 1), True, 256), -1, 6),
+        (385, 512, ((256, 256), (2, 1), False, 256), -1),
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
