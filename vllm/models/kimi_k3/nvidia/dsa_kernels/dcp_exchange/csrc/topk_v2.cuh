@@ -1188,6 +1188,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         __syncthreads();
         V2DBG(6);
+        if (p.dbg && tid == 0) {  // EP32DIAG: R2 row geometry (window bases per rank, LB)
+          for (int r = 0; r < W && r < 4; ++r) p.dbg[(int64_t)row * kV2Dbg + 1 + r] = (long long)(rx[r * kV2Msg] & 0xFFFFu);
+          p.dbg[(int64_t)row * kV2Dbg + 6] = s_r2[0];
+        }
         const bool lbok = s_r2[0] >= 0;  // the same on every rank
         if (lbok) {
           const uint32_t LB = (uint32_t)max(s_r2[0], 1);
@@ -1357,6 +1361,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               if (lvl == 0) { b1 = got; above1 = gab; if (tid == 0) s_r2[2] = -1; __syncthreads(); }
             }
             V2DBG(13);
+            if (p.dbg && tid == 0) p.dbg[(int64_t)row * kV2Dbg + 7] = s_r2[2];  // EP32DIAG: R2 tau
             const int tau2 = s_r2[2], need2 = K - s_r2[3];
             if (tau2 < 0) bad = true;
             if (!bad) {
