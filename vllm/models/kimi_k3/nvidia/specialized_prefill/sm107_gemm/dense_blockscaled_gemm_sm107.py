@@ -51,6 +51,7 @@ from .conv_epilogue import (
     epilogue_kda_conv_t2,
     setmaxnreg,
 )
+from . import die_sched
 from .situ_epilogue import epilogue_situ_mxfp8, epilogue_situ_mxfp8_drain
 from .epilogue_utils import (
     epilogue_tma_store_mxfp8,
@@ -986,6 +987,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
+        sched_ctr: cutlass.Int64 = cutlass.Int64(0),
+        sched_die_map: cutlass.Int64 = cutlass.Int64(0),
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -1300,6 +1303,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            # vLLM B3: die-split tile claim ring (die_sched)
+            sched_mbar: cute.struct.MemRange[cutlass.Int64, 2 * die_sched.STAGES]
+            sched_slot: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 4 * die_sched.STAGES], 16
+            ]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -1372,6 +1380,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             conv_nseq,
             conv_top,
             conv_nsteps,
+            sched_ctr,
+            sched_die_map,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1428,6 +1438,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
+        sched_ctr: cutlass.Int64 = cutlass.Int64(0),
+        sched_die_map: cutlass.Int64 = cutlass.Int64(0),
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
@@ -1513,6 +1525,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             arch=self.arch,
         )
 
+        die = cutlass.const_expr(getattr(self, "die_sched", False))
+        sched_pipeline = None
+        if cutlass.const_expr(die):
+            sched_pipeline = die_sched.make_pipeline(
+                storage.sched_mbar.data_ptr(), cute.size(cluster_layout_vmnk)
+            )
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cluster_shape_mn, is_relaxed=True)
 
@@ -1718,6 +1736,35 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
         work_tile = tile_sched.initial_work_tile_info()
+        dsched_args = None
+        if cutlass.const_expr(die):
+            # die_sched claim decode: list of M tiles x N cluster tiles, die
+            # halves of the N cluster tiles (weights homed per die).
+            cl_rows = self.cta_tile_shape_mnk[0] * cluster_shape_mn[0]
+            cl_cols = self.cta_tile_shape_mnk[1] * cluster_shape_mn[1]
+            ncl_m = (mC_mnl.shape[0] + cl_rows - 1) // cl_rows
+            n_ct = mC_mnl.shape[1] // cl_cols
+            dsched_args = (
+                ncl_m * n_ct,
+                n_ct // 2,
+                cluster_shape_mn[0],
+                cluster_shape_mn[1],
+                bidx % cluster_shape_mn[0],
+                bidy % cluster_shape_mn[1],
+                getattr(self, "die_group", 0),
+            )
+            if warp_idx == self.sched_warp_id:
+                if cta_rank_in_cluster == 0:
+                    gx, gy, gz = cute.arch.grid_dim()
+                    die_sched.produce(
+                        sched_pipeline,
+                        storage.sched_slot.data_ptr(),
+                        sched_ctr,
+                        sched_die_map,
+                        ncl_m * n_ct,
+                        gx * gy * gz // cute.size(cluster_layout_vmnk),
+                        cute.size(cluster_layout_vmnk),
+                    )
 
         # Producer + MMA warps (warp_idx >= mma_warp_id) in one branch so a
         # register split (KDA conv GEMM, reg_split) covers exactly them.
@@ -1744,6 +1791,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 ab_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_ab_stage
                 )
+                if cutlass.const_expr(die):
+                    sched_cs = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, die_sched.STAGES
+                    )
+                    work_tile, sched_cs = die_sched.consume(
+                        sched_pipeline, storage.sched_slot.data_ptr(), sched_cs, *dsched_args
+                    )
 
                 while work_tile.is_valid_tile:
                     # Get tile coord from tile scheduler
@@ -1861,8 +1915,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     #
                     # Advance to next tile
                     #
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                    if cutlass.const_expr(die):
+                        work_tile, sched_cs = die_sched.consume(
+                            sched_pipeline, storage.sched_slot.data_ptr(), sched_cs, *dsched_args
+                        )
+                    else:
+                        tile_sched.advance_to_next_work()
+                        work_tile = tile_sched.get_current_work()
 
                 #
                 # Wait A/B buffer empty
@@ -1963,6 +2022,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 acc_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_acc_stage
                 )
+                if cutlass.const_expr(die):
+                    sched_cs = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, die_sched.STAGES
+                    )
+                    work_tile, sched_cs = die_sched.consume(
+                        sched_pipeline, storage.sched_slot.data_ptr(), sched_cs, *dsched_args
+                    )
 
                 while work_tile.is_valid_tile:
                     # Get tile coord from tile scheduler
@@ -2146,8 +2212,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     #
                     # Advance to next tile
                     #
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                    if cutlass.const_expr(die):
+                        work_tile, sched_cs = die_sched.consume(
+                            sched_pipeline, storage.sched_slot.data_ptr(), sched_cs, *dsched_args
+                        )
+                    else:
+                        tile_sched.advance_to_next_work()
+                        work_tile = tile_sched.get_current_work()
 
                 #
                 # Wait for accumulator buffer empty
@@ -2191,6 +2262,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             # Persistent tile scheduling loop
             #
             work_tile = tile_sched.initial_work_tile_info()
+            if cutlass.const_expr(die):
+                sched_cs = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, die_sched.STAGES
+                )
+                work_tile, sched_cs = die_sched.consume(
+                    sched_pipeline, storage.sched_slot.data_ptr(), sched_cs, *dsched_args
+                )
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -2200,8 +2278,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[2],
                 )
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(die):
+                    work_tile, sched_cs = die_sched.consume(
+                        sched_pipeline, storage.sched_slot.data_ptr(), sched_cs, *dsched_args
+                    )
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
                 # flashinfer local fix (b53cfd6a7, not in TRT-LLM): apply alpha in
                 # Float32 before the c_dtype conversion to avoid fp16 overflow.
@@ -2302,6 +2385,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         getattr(self, "epi_tanh", False),
                         getattr(self, "epi_roll", 0),
                         getattr(self, "epi_store", 0),
+                        l2_store_evict_first=getattr(self, "l2_store_evict_first", False),
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
@@ -2403,6 +2487,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
+        if cutlass.const_expr(die):
+            # Peers signal the leader's claim barriers until their last
+            # claim: no CTA of the cluster may exit before all are done.
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
     # GPU device kernel
     @cute.kernel
@@ -2447,6 +2536,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
+        sched_ctr: cutlass.Int64 = cutlass.Int64(0),
+        sched_die_map: cutlass.Int64 = cutlass.Int64(0),
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2495,6 +2586,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             conv_nseq,
             conv_top,
             conv_nsteps,
+            sched_ctr,
+            sched_die_map,
         )
 
     @staticmethod
