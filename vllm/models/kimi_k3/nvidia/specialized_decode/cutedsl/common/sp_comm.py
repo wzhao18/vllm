@@ -419,7 +419,9 @@ class SpComm:
         self.box = box
         self.gather = box[:, :rows_cap]
         self.recv = symm_mem.empty((parities, tp, rows_cap // tp, width), **bf16)
-        _, self.gather_mc = multicast_rendezvous(box, group, "Kimi K3 SP all-gather")
+        box_handle, self.gather_mc = multicast_rendezvous(
+            box, group, "Kimi K3 SP all-gather"
+        )
         if not self.gather_mc:  # the all-gather stores through it: no fallback
             raise Unsupported("sp_comm", None, "no NVLink multicast")
         handle = peer_rendezvous(self.recv, group)
@@ -459,6 +461,13 @@ class SpComm:
             for p in range(parities)
         ]  # fmt: skip
         self._mx_views: dict = {}
+        # Every rank's box base per parity ([parities, TP] int64): the all-gather's
+        # unicast publish (one store per rank, the own row local).
+        self.box_peers = torch.tensor(
+            [[int(b) + p * pitch for b in box_handle.buffer_ptrs] for p in range(parities)],
+            dtype=torch.int64, device=self.device,
+        )  # fmt: skip
+        self._box_peers = [to_cute(self.box_peers[p]) for p in range(parities)]
         self._rank = Int32(rank)
 
     def nbytes(self) -> int:
@@ -540,6 +549,10 @@ class SpComm:
         code(*args, recv, peers, to_cute(out_shard), gather, self._rank,
              stream(self.device))  # fmt: skip
         return out_shard
+
+    def box_peers_view(self, parity: int):
+        """[TP] int64 box bases of ``parity`` (unicast all-gather publish)."""
+        return self._box_peers[parity]
 
     def views(self, parity: int):
         """(local gather, its multicast address, local recv, peers) of ``parity``

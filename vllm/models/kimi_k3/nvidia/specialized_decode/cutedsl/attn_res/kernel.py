@@ -16,6 +16,7 @@ from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
     add_rn,
     alloc,
+    asm,
     at,
     bf16,
     bf16x2,
@@ -29,9 +30,20 @@ from ..common.primitives import (
     push_float,
     scatter_reduce,
     store_words,
+    view,
     wait,
     zeros,
 )
+
+
+@asm(Int64)
+def global_timer():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
+
+
+@asm()
+def store_i64(address, value):
+    return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
 
 
 @cute.jit
@@ -105,6 +117,14 @@ class ClusterAttnRes:
         # ``output`` and also its MXFP8 row token locally (output = (tensor, data
         # address, scale address)).
         self.out_mx = out_mx
+        # ``out_peers`` (TP > 0, with out_mc / out_mx "publish"): the output row goes
+        # to every rank's box by one relaxed system-scope store per rank (``output``
+        # carries the [TP] box bases instead of the multicast address; MXFP8 scales at
+        # byte ``out_scales`` of a box): no multicast loopback of the own row.
+        self.out_peers, self.out_scales = 0, 0
+        # ``out_bulk`` (out_mx "publish"): the CTA's FP8 data chunk goes out as one
+        # multicast bulk copy from shared memory (``mx_rows.publish_bulk``).
+        self.out_bulk = False
         # ``poll_warp`` (Rubin): the delta's Lamport poll exits by a warp vote
         # (``common.mailbox.poll_warp``), so the exchange's shuffles that follow do not
         # wait for per-lane poll loops to reconverge. Same words.
@@ -123,6 +143,18 @@ class ClusterAttnRes:
         self.npost = (2 if final else 4) if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
         self.kpost = 1 << max(self.npost - 1, 0).bit_length()
+        # Debug phase stamps (``mark``): a kernel built with stamps sets this to its
+        # trailing Int64 address while tracing; None compiles no stamp code.
+        self.stamp_address = None
+
+    @cute.jit
+    def mark(self, k: cutlass.Constexpr):
+        """Debug: thread 0 of the CTA stores globaltimer at slot ``k`` (8 per CTA)."""
+        if cutlass.const_expr(self.stamp_address is not None):
+            if cute.arch.thread_idx()[0] == 0:
+                part, token, _ = cute.arch.block_idx()
+                offset = Int64((token * 7 + part) * 8 + k) * 8
+                store_i64(self.stamp_address + offset, global_timer())
 
     @cute.jit
     def __call__(self, *args):
@@ -179,6 +211,27 @@ class ClusterAttnRes:
         self.post(state, bufs, delta, rows, output, eps, out_eps, ids, extra)
         cute.arch.griddepcontrol_wait()
 
+    def exchange_counts(self):
+        """FP32 values per CTA of exchange rounds 0 (pre), 1 (post), 2 (final)."""
+        return self.npre, self.npost, int(self.final)
+
+    @cute.jit
+    def save_state(self, state, scratch, index):
+        """Store pre()'s carried state (8 mixture columns, maximum, exp sum) of this
+        thread at row ``index`` of ``scratch`` [*, 10] FP32."""
+        mixture, scal = state
+        for i in cutlass.range_constexpr(8):
+            scratch[index, i] = mixture[0, i]
+        scratch[index, 8], scratch[index, 9] = scal[0], scal[1]
+
+    @cute.jit
+    def load_state(self, state, scratch, index):
+        """``save_state``'s inverse: pre()'s state computed by an earlier kernel."""
+        mixture, scal = state
+        for i in cutlass.range_constexpr(8):
+            mixture[0, i] = scratch[index, i]
+        scal[0], scal[1] = scratch[index, 8], scratch[index, 9]
+
     def state(self):
         """Carried from pre() to post(); the rest reloads so a GEMM can run between."""
         return cute.make_rmem_tensor((1, 8), Float32), cute.make_rmem_tensor(2, Float32)
@@ -189,12 +242,15 @@ class ClusterAttnRes:
         peer_buf = alloc(smem, Float32, (3, 112))
         total = alloc(smem, Float32, (3, 16))
         bars = alloc(smem, Uint64, 3, 8)
-        arm_exchanges(bars, (self.npre, self.npost, int(self.final)))
+        arm_exchanges(bars, self.exchange_counts())
         return warp_buf, peer_buf, total, bars
 
     @cute.jit
-    def pre(self, state, bufs, rows, eps: Float32, ids):
-        """Inputs complete at launch, then the saved-block statistics exchange."""
+    def pre(self, state, bufs, rows, eps: Float32, ids, round: cutlass.Constexpr = 0,
+            sync: cutlass.Constexpr = True):  # fmt: skip
+        """Inputs complete at launch, then the saved-block statistics exchange (in
+        exchange round ``round``; ``sync``: the kernel's one cluster_wait, paired
+        with its cluster_arrive_relaxed)."""
         prefix, blocks, norm, query, out_norm = rows
         rank, token, tid = ids
         warp_buf, peer_buf, total, bars = bufs
@@ -209,7 +265,8 @@ class ClusterAttnRes:
             )
             unpack(words, v, source)
         self.weights(v, norm, query, col)
-        cute.arch.cluster_wait()
+        if cutlass.const_expr(sync):
+            cute.arch.cluster_wait()
         maximum, exp_sum = Float32(0), Float32(0)
         mixture.fill(0)
         if cutlass.const_expr(self.nb > 0):
@@ -217,10 +274,10 @@ class ClusterAttnRes:
             for source in cutlass.range_constexpr(self.nb):
                 values[source] = dot8(v, source, v, source)
                 values[self.nb + source] = dot8(v, source, v, W)
-            self.exchange(values, self.npre, self.kpre, bufs, 0, ids)
+            self.exchange(values, self.npre, self.kpre, bufs, round, ids)
             logits = cute.make_rmem_tensor(self.nb, Float32)
             for b in cutlass.range_constexpr(self.nb):
-                logits[b] = total[0, self.nb + b] * rstd(total[0, b], eps)
+                logits[b] = total[round, self.nb + b] * rstd(total[round, b], eps)
             maximum = logits[0]
             for source in cutlass.range_constexpr(1, self.nb):
                 maximum = cute.arch.fmax(maximum, logits[source])
@@ -273,6 +330,7 @@ class ClusterAttnRes:
         cur = cute.make_rmem_tensor((1, 8), Float32)
         if cutlass.const_expr(self.slots == 0):
             cute.arch.griddepcontrol_wait()
+            self.mark(2)
             unpack(load_words(at(delta, token, col), count=4, mutable=True), cur, 0)
         else:
             cur.fill(0)
@@ -294,6 +352,8 @@ class ClusterAttnRes:
                 # No negative zero, as the framework all-reduce returns (-0 + 0 = +0).
                 for i in cutlass.range_constexpr(8):
                     cur[0, i] = add_rn(cur[0, i], Float32(0))
+        if cutlass.const_expr(self.slots > 0):
+            self.mark(4)
         words = cute.make_rmem_tensor(4, Uint32)
         for j in cutlass.range_constexpr(4):
             lo, hi = cur[0, 2 * j], cur[0, 2 * j + 1]
@@ -357,13 +417,31 @@ class ClusterAttnRes:
             rounded = cute.make_rmem_tensor((1, 8), Float32)
             unpack(words, rounded, 0)
             values = tuple(rounded[0, i] for i in range(8))
-            if cutlass.const_expr(self.out_mx == "publish"):
+            if cutlass.const_expr(self.out_mx == "publish" and self.out_peers > 0):
+                peers, row0, _ = output
+                mx_rows.publish_peers(
+                    values, peers, self.out_peers, self.out_scales, row0 + token, col, 7168
+                )  # fmt: skip
+            elif cutlass.const_expr(self.out_mx == "publish" and self.out_bulk):
+                # The exchanges are over: the peer buffer stages the 1 KB data chunk.
+                mc, row0, smc = output
+                staging = view(peer_buf.iterator, 0, Uint32, (256,))
+                mx_rows.publish_bulk(
+                    values, staging, mc, smc, row0 + token, col, 7168, tid, 1024
+                )  # fmt: skip
+            elif cutlass.const_expr(self.out_mx == "publish"):
                 mc, row0, smc = output
                 mx_rows.publish(values, mc, smc, row0 + token, col, 7168)
             else:
                 out, data, scale = output
                 store_words(at(out, token, col), tuple(words[j] for j in range(4)))
                 mx_rows.store(values, data, scale, token, col, 7168)
+        elif cutlass.const_expr(self.out_mc and self.out_peers > 0):
+            peers, row0 = output
+            offset = Int64((row0 + token) * 7168 + col) * 2
+            clean = tuple(no_neg_zero(words[j]) for j in range(4))
+            for o in cutlass.range_constexpr(self.out_peers):
+                store_words(Int64(peers[o]) + offset, clean, scope="sys")
         elif cutlass.const_expr(self.out_mc):
             mc, row0 = output
             offset = Int64((row0 + token) * 7168 + col) * 2

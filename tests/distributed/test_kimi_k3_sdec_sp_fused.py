@@ -249,6 +249,42 @@ def _worker(env: dict[str, str]) -> None:
                     ok, ratio = _close(s[i], f[i], 2)
                     worst[name] = max(worst.get(name, 0.0), ratio)
                     assert ok, (name, rows, layer, ratio)
+            # Linked layers (SpBoundary.link): layer L's reduce computes layer L + 1's
+            # gather statistics; that gather must equal the unlinked one bitwise.
+            for layer in (x for x in LAYERS if x + 1 in LAYERS):
+                def make(lay):
+                    write = lay % BLOCK == 0
+                    return sp_fused.SpBoundary(
+                        comm, (_weights(lay, 0, device), eps),
+                        (_weights(lay, 1, device), eps), _cdiv(lay, BLOCK),
+                        lay // BLOCK if write else -1, max(SHARDS), {rows: True},
+                        first=lay == 0, gather_mx=lay % 2 == 1,
+                    )  # fmt: skip
+
+                got = []
+                for linked in (False, True):
+                    a, b = make(layer), make(layer + 1)
+                    if linked:
+                        a.link(b, 1)
+                        assert b.stats_args, ("not linked", layer)
+                    prefix, blocks = prefix0.clone(), blocks0.clone()
+                    d = None if layer == 0 else delta
+                    dist.barrier()
+                    a.gather(d, prefix, blocks, layer % 2)
+                    a.reduce(prefix, blocks, out, layer % 2, partial)
+                    g = b.gather(out, prefix, blocks, (layer + 1) % 2)
+                    if layer % 2 == 0:  # (b's gather is MXFP8)
+                        g = (g.data[:rows].clone(), g.scale.clone())
+                    else:
+                        g = (g.clone(),)
+                    b.reduce(prefix, blocks, out, (layer + 1) % 2, partial)  # re-arms
+                    torch.accelerator.synchronize(device)
+                    assert _armed(comm, (layer + 1) % 2, rows), ("linked", rows, layer)
+                    got.append((*g, prefix, blocks))
+                for x, y in zip(*got):
+                    assert torch.equal(x.view(torch.uint8), y.view(torch.uint8)), (
+                        "linked", rows, layer,
+                    )  # fmt: skip
         if rank == 0:
             print("boundaries ok; final gather", flush=True)
         # The final multicast gather: stock rows (sanitized), box re-armed.

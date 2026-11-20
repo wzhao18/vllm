@@ -21,7 +21,7 @@ Every lane of a warp must call ``quantize8`` / ``publish`` / ``store`` together
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int64, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 
 from .mailbox import SENTINEL
 from .primitives import asm, bits_float, multicast_words, pack_fp8, store_words
@@ -156,6 +156,60 @@ def publish(values, data_mc, scale_mc, row, col, width: cutlass.Constexpr[int]):
 
 
 @cute.jit
+def publish_peers(values, peers, tp: cutlass.Constexpr[int], scales: cutlass.Constexpr[int],
+                  row, col, width: cutlass.Constexpr[int]):  # fmt: skip
+    """``publish`` with one relaxed system-scope store per rank's box (``peers``
+    [tp] box data bases; the scale region at byte ``scales`` of a box) instead of a
+    multicast store: the own row is a local store, not a loopback over NVLink."""
+    w0, w1, word = quantize8(values)
+    offset = Int64(row) * width + col
+    where = scale_offset(row, col // BLOCK, width // BLOCK)
+    for o in cutlass.range_constexpr(tp):
+        store_words(Int64(peers[o]) + offset, (w0, w1), scope="sys")
+        if lane_owns_scale():
+            store_words(Int64(peers[o]) + scales + where, (word,), scope="sys")
+
+
+@asm()
+def _multicast_bulk(dst, src, size):
+    """Shared -> every rank's global bulk copy (multicast; open bulk group)."""
+    code = "multimem.cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    return code, "l,r,r,~{memory}", (Int64(dst), src, Int32(size))
+
+
+@asm()
+def _bulk_commit():
+    return "cp.async.bulk.commit_group;", "~{memory}", ()
+
+
+@asm()
+def bulk_wait_read():
+    """The issuing thread's bulk copies have read their shared source."""
+    return "cp.async.bulk.wait_group.read 0;", "~{memory}", ()
+
+
+@cute.jit
+def publish_bulk(values, staging, data_mc, scale_mc, row, col, width: cutlass.Constexpr[int],
+                 tid, chunk: cutlass.Constexpr[int]):  # fmt: skip
+    """``publish`` of a CTA's ``chunk`` contiguous FP8 columns (128 lanes x 8, this
+    lane's at col): the data words go through ``staging`` (shared, >= chunk bytes,
+    Uint32) and ONE multicast bulk copy (TMA-class NVLink writes instead of one 8-byte
+    multicast store per lane); scale words as ``publish``. Every thread of the CTA
+    calls it; thread 0 must ``bulk_wait_read`` before the CTA exits."""
+    w0, w1, word = quantize8(values)
+    staging[2 * tid] = w0
+    staging[2 * tid + 1] = w1
+    if lane_owns_scale():
+        where = scale_offset(row, col // BLOCK, width // BLOCK)
+        multicast_words(scale_mc + where, (word,))
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.barrier(barrier_id=1, number_of_threads=128)
+    if tid == 0:
+        _multicast_bulk(data_mc + (Int64(row) * width + (col - tid * 8)), staging.iterator, chunk)
+        _bulk_commit()
+
+
+@cute.jit
 def store(values, data, scale, row, col, width: cutlass.Constexpr[int]):
     """``publish`` into this GPU's own buffers (plain stores, no Lamport box)."""
     w0, w1, word = quantize8(values)
@@ -190,17 +244,19 @@ def _landed(data, scale, row, col, width: cutlass.Constexpr[int]):
 def poll(data, scale, first, stride, count: cutlass.Constexpr[int], col,
          width: cutlass.Constexpr[int]):  # fmt: skip
     """Lamport-poll this lane's columns of rows first + i stride, i < count, of the
-    local MXFP8 box until all landed (data words and scale words)."""
+    local MXFP8 box until all landed (data words and scale words). The rows' loads
+    all issue before any check (no branch on a loaded word between them, as
+    ``mailbox.poll``), and only rows still dirty re-poll."""
     pending = Uint32(0)
     for i in cutlass.range_constexpr(count):
-        if not _landed(data, scale, first + i * stride, col, width):
-            pending = pending | Uint32(1 << i)
+        dirty = Uint32(not _landed(data, scale, first + i * stride, col, width))
+        pending = pending | (dirty << i)
     while pending != 0:
         again = Uint32(0)
         for i in cutlass.range_constexpr(count):
             if (pending >> i) & 1:
-                if not _landed(data, scale, first + i * stride, col, width):
-                    again = again | Uint32(1 << i)
+                dirty = Uint32(not _landed(data, scale, first + i * stride, col, width))
+                again = again | (dirty << i)
         pending = again
 
 

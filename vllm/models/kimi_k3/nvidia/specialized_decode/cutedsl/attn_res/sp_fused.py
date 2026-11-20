@@ -86,13 +86,24 @@ class SpAttnResGather(ClusterAttnRes):
     [n, NB, 7168], norm, query, out_norm [7168], output (unused row view), eps,
     out_eps, the gather multicast address, rank, the local gather view [cap, 7168]."""
 
-    def __init__(self, nb, tp, *, has_delta, write, mx=False, **options):
+    def __init__(self, nb, tp, *, has_delta, write, mx=False, stamps=False, scales=0,
+                 unicast=False, stats_in=False, bulk=False, **options):  # fmt: skip
         # ``mx``: publish the normed rows as MXFP8 into the MXFP8 box (``SpComm``
         # gather data + scale regions; ``common.mx_rows``) for an MXFP8 in-projection;
         # args 9.. are then (data mc, scale mc, rank, local data, local scales).
         out = dict(out_mx="publish") if mx else dict(out_mc=True)
         super().__init__(nb, slots=0, has_delta=has_delta, write=write, **out, **options)
-        self.tp, self.mx = tp, mx
+        self.tp, self.mx, self.stamps = tp, mx, stamps
+        # ``stats_in``: the saved-block statistics (pre) were computed by the previous
+        # layer's SpReduceAttnRes (``next_nb``) while its NVLink hop was in flight; the
+        # trailing arg (before stamps) is that state scratch [n * 7 * 128, 10] FP32.
+        self.stats_in = stats_in
+        self.out_bulk = bulk and mx  # (MXFP8 publish only: a 1 KB chunk per CTA)
+        # ``unicast``: publish by one store per rank's box (arg 9 = the [TP] box bases
+        # of this parity, ``SpComm.box_peers``) instead of the multicast address; the
+        # MXFP8 scales sit at byte ``scales`` of a box.
+        if unicast:
+            self.out_peers, self.out_scales = tp, scales
 
     @cute.jit
     def __call__(self, *args):
@@ -100,6 +111,11 @@ class SpAttnResGather(ClusterAttnRes):
 
     @cute.kernel
     def kernel(self, args):
+        if cutlass.const_expr(self.stamps):  # debug: trailing stamp address (mark)
+            self.stamp_address, args = args[-1], args[:-1]
+        self.mark(0)
+        if cutlass.const_expr(self.stats_in):
+            scratch, args = args[-1], args[:-1]
         delta, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
         part, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
@@ -109,20 +125,32 @@ class SpAttnResGather(ClusterAttnRes):
         cute.arch.griddepcontrol_launch_dependents()
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (part, token, tid)
-        self.pre(state, bufs, rows, eps, ids)
+        if cutlass.const_expr(self.stats_in):
+            self.load_state(state, scratch, (token * 7 + part) * 128 + tid)
+            cute.arch.cluster_wait()
+        else:
+            self.pre(state, bufs, rows, eps, ids)
+        self.mark(1)
         col = (part * 128 + tid) * 8
         if cutlass.const_expr(self.mx):
             mc, smc, rank, data, scale = args[9:14]
             out = (mc, rank * n, smc)
             self.post(state, bufs, delta, rows, out, eps, out_eps, ids, ())
+            self.mark(3)
             # Every rank's MXFP8 row of this token, these 1024 columns: published?
             mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
+            if cutlass.const_expr(self.out_bulk):
+                if tid == 0:  # the staging shared memory outlives the bulk read
+                    mx_rows.bulk_wait_read()
         else:
             mc, rank, gather = args[9:12]
             self.post(state, bufs, delta, rows, (mc, rank * n), eps, out_eps, ids, ())
+            self.mark(3)
             # Every rank's row of this token, these 1024 columns: published?
             poll(at(gather, token, col), n * 7168, self.tp)
+        self.mark(5)
         cute.arch.griddepcontrol_wait()
+        self.mark(6)
 
 
 class SpReduceAttnRes(ClusterAttnRes):
@@ -132,7 +160,7 @@ class SpReduceAttnRes(ClusterAttnRes):
     ``push``), the owners' receive bases [TP] (int64), rank, the local gather view."""
 
     def __init__(self, nb, tp, *, has_delta, push, gather_mx=False, out_mx=False,
-                 **options):  # fmt: skip
+                 stamps=False, next_nb=-1, **options):  # fmt: skip
         # ``gather_mx``: this layer's all-gather was MXFP8 (re-arm that layout; the
         # last arg is then (local data, local scales)). ``out_mx``: also store the
         # output row as MXFP8 for the MXFP8 projection that reads it (``output`` is
@@ -142,6 +170,19 @@ class SpReduceAttnRes(ClusterAttnRes):
             out_mx="store" if out_mx else None, **options,
         )  # fmt: skip
         self.tp, self.push, self.gather_mx = tp, push, gather_mx
+        self.stamps = stamps
+        # ``next_nb`` >= 0: also compute the next layer's SpAttnResGather pre() (its
+        # saved-block statistics over the same blocks, with its norm / query) in
+        # exchange round 2 while the partial rows are in flight, and store that state
+        # for it (``stats_in``); trailing args (before stamps): next norm, next query,
+        # next eps, the state scratch [n * 7 * 128, 10] FP32.
+        self.nxt = None
+        if next_nb >= 0:
+            self.nxt = ClusterAttnRes(next_nb, slots=0, **options)
+
+    def exchange_counts(self):
+        third = self.nxt.npre if self.nxt is not None else 0
+        return self.npre, self.npost, third
 
     @cute.jit
     def __call__(self, *args):
@@ -149,6 +190,11 @@ class SpReduceAttnRes(ClusterAttnRes):
 
     @cute.kernel
     def kernel(self, args):
+        if cutlass.const_expr(self.stamps):  # debug: trailing stamp address (mark)
+            self.stamp_address, args = args[-1], args[:-1]
+        self.mark(0)
+        if cutlass.const_expr(self.nxt is not None):
+            nxt_args, args = args[-4:], args[:-4]
         ring, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
         partial, peers, rank = args[9:12]
         rest = args[12:]
@@ -168,18 +214,29 @@ class SpReduceAttnRes(ClusterAttnRes):
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (part, token, tid)
         if cutlass.const_expr(self.push):
-            # Push this rank's o-projection partial rows first, then run the saved-block
+            # Push this rank's o-projection partial rows first and run the saved-block
             # statistics (pre) while they are in flight: pre only reads rows complete at
             # launch, so it hides under the NVLink hop instead of delaying the push.
             cute.arch.griddepcontrol_wait()  # the o-projection partial is complete
+            self.mark(2)
             cap = ring.shape[1]
             for o in cutlass.range_constexpr(self.tp):
                 words = load_words(at(partial, o * n + token, col), count=4)
                 clean = tuple(positive_zero32(w) for w in words)
                 offset = Int64((rank * cap + token) * 7168 + col) * 2
                 store_relaxed(Int64(peers[o]) + offset, clean)
+            self.mark(3)
         self.pre(state, bufs, rows, eps, ids)
+        self.mark(1)
+        if cutlass.const_expr(self.nxt is not None):
+            nnorm, nquery, neps, scratch = nxt_args
+            nstate = self.nxt.state()
+            nrows = (prefix, blocks, nnorm, nquery, out_norm)
+            self.nxt.pre(nstate, bufs, nrows, neps, ids, round=2, sync=False)
+            self.nxt.save_state(nstate, scratch, (token * 7 + part) * 128 + tid)
+            self.mark(7)
         self.post(state, bufs, ring, rows, output, eps, out_eps, ids, ())
+        self.mark(5)
         if cutlass.const_expr(self.gather_mx):
             data, scale = gather
             for o in cutlass.range_constexpr(self.tp):
@@ -188,6 +245,7 @@ class SpReduceAttnRes(ClusterAttnRes):
             for o in cutlass.range_constexpr(self.tp):
                 rearm(at(gather, o * n + token, col))
         cute.arch.griddepcontrol_wait()
+        self.mark(6)
 
 
 def _options(device):
@@ -235,20 +293,27 @@ def _check_clusters(code, device, n_max, what):
 
 
 @cache
-def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False):
+def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, stamps=False,
+                   unicast=False, stats_in=False, bulk=False):  # fmt: skip
     """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx) at any
     n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpAttnResGather(
-            nb, tp, has_delta=has_delta, write=write, mx=mx,
+            nb, tp, has_delta=has_delta, write=write, mx=mx, stamps=stamps,
+            scales=cap * 7168 * 2, unicast=unicast, stats_in=stats_in, bulk=bulk,
             min_blocks=_co_resident(n_max, device), **_options(device),
         )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
         args = (row, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
+        to = fake((tp,), None, torch.int64) if unicast else Int64(0)
         if mx:
-            args += (Int64(0), Int64(0), Int32(0), Int64(0), Int64(0))
+            args += (to, Int64(0), Int32(0), Int64(0), Int64(0))
         else:
-            args += (Int64(0), Int32(0), fake((cap, 7168)))
+            args += (to, Int32(0), fake((cap, 7168)))
+        if stats_in:
+            args += (fake((n_max * 7 * 128, 10), dtype=torch.float32),)
+        if stamps:
+            args += (Int64(0),)
         arch = architecture(torch.device("cuda", device))
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
@@ -261,12 +326,13 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False):
 
 @cache
 def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
-                   out_mx=False):  # fmt: skip
+                   out_mx=False, stamps=False, next_nb=-1):  # fmt: skip
     """``SpReduceAttnRes`` for a layer key at any n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpReduceAttnRes(
             nb, tp, has_delta=has_delta, push=push, gather_mx=gather_mx,
-            out_mx=out_mx, min_blocks=_co_resident(n_max, device),
+            out_mx=out_mx, stamps=stamps, next_nb=next_nb,
+            min_blocks=_co_resident(n_max, device),
             **_options(device),
         )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
@@ -276,6 +342,11 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
         args += (Int64(0), Int64(0)) if gather_mx else (fake((cap, 7168)),)
         if out_mx:
             args += (Int64(0), Int64(0))
+        if next_nb >= 0:
+            scratch = fake((n_max * 7 * 128, 10), dtype=torch.float32)
+            args += (weight, weight, eps, scratch)
+        if stamps:
+            args += (Int64(0),)
         arch = architecture(torch.device("cuda", device))
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
@@ -300,7 +371,8 @@ class SpBoundary:
     output row is also written into, quantized (the MLP's MXFP8 shared gate_up)."""
 
     def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False,
-                 gather_mx=False, out_mx=None):  # fmt: skip
+                 gather_mx=False, out_mx=None, stamps=False, unicast=False,
+                 bulk=False):  # fmt: skip
         from ..common.host import to_cute
 
         self.comm, self.nb, self.write = comm, nb, write
@@ -323,18 +395,58 @@ class SpBoundary:
             buf = out_mx.buf
             buf.scale.zero_()  # padding rows of a tile: finite (never stored) rows
             self.out_args = (Int64(buf.data.data_ptr()), Int64(buf.scale.data_ptr()))
+        # Debug: stamps kernels store globaltimer phase stamps (8 per CTA, slots
+        # in ClusterAttnRes.mark) at stamp_ptr (set by the caller per launch).
+        self.stamps, self.stamp_ptr = stamps, 0
+        self.unicast, self.bulk = unicast, bulk
         self.codes = {}
         # The step's first layer has no delta (the embedding is the prefix).
         self.codes[("pre", not first)] = compile_gather(
-            nb, not first, write, tp, cap, n_max, device, gather_mx
+            nb, not first, write, tp, cap, n_max, device, gather_mx, stamps, unicast,
+            bulk=bulk,
         )
         block = write >= 0
         for push in sorted({bool(p) for p in push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(
                 nb + int(block), not block, push, tp, cap, n_max, device,
-                gather_mx, out_mx is not None,
+                gather_mx, out_mx is not None, stamps,
             )  # fmt: skip
         self.push_rows = push_rows  # R -> the reduce kernel pushes the partial
+        self.n_max, self.first = n_max, first
+        self.next_args, self.stats_args = (), ()
+
+    def link(self, nxt, slot):
+        """``nxt``: the next layer's SpBoundary, whose SpAttnResGather follows this
+        layer's SpReduceAttnRes with no other writer of the saved blocks between: the
+        reduce computes that gather's pre() (exchange round 2, hidden under the
+        partial push) into the state scratch ``slot`` (0 / 1, alternating per layer)
+        and the gather loads it instead (same statistics, same order)."""
+        from ..common.host import to_cute
+
+        comm, device = self.comm, self.comm.device.index
+        nb = self.nb + int(self.write >= 0)  # the saved blocks after this layer
+        if nxt.first or nxt.nb != nb or nxt.n_max != self.n_max or nb > 8:
+            return  # (nb <= 8: round 2 holds 2 nb <= 16 values per CTA)
+        scratch = getattr(comm, "attnres_stats", None)
+        if scratch is None or scratch.shape[1] < self.n_max * 7 * 128:
+            scratch = torch.empty(
+                (2, self.n_max * 7 * 128, 10), dtype=torch.float32, device=comm.device
+            )  # fmt: skip
+            comm.attnres_stats = scratch
+        view = to_cute(scratch[slot])
+        tp, cap = comm.tp, comm.rows_cap
+        block = self.write >= 0
+        for push in sorted({bool(p) for p in self.push_rows.values()}):
+            self.codes[("post", push)] = compile_reduce(
+                nb, not block, push, tp, cap, self.n_max, device, self.gather_mx,
+                self.out_mx is not None, self.stamps, nb,
+            )  # fmt: skip
+        self.next_args = (*nxt.pre_w[:2], nxt.pre_eps[0], view)
+        nxt.codes[("pre", True)] = compile_gather(
+            nxt.nb, True, nxt.write, tp, cap, nxt.n_max, device, nxt.gather_mx,
+            nxt.stamps, nxt.unicast, True, nxt.bulk,
+        )  # fmt: skip
+        nxt.stats_args = (view,)
 
     def gather(self, delta, prefix, blocks, parity):
         """The pre-AttnRes of ``delta`` (None: none) over this rank's shard, all-
@@ -348,17 +460,23 @@ class SpBoundary:
         source = prefix if delta is None else delta
         rows = map(dynamic_view, (source, prefix, blocks, prefix))
         source_v, prefix_v, blocks_v, dummy = rows
+        tail = (Int64(self.stamp_ptr),) if self.stamps else ()
         if self.gather_mx:
             mc, smc, data, scale = comm.mx_addresses(parity)
+            if self.unicast:
+                mc = comm.box_peers_view(parity)
             code(
                 source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
-                mc, smc, comm._rank, data, scale, stream(comm.device),
+                mc, smc, comm._rank, data, scale, *self.stats_args, *tail,
+                stream(comm.device),
             )  # fmt: skip
             return comm.mx_view(parity, n * comm.tp)
         gather, mc, _, _ = comm.views(parity)
+        if self.unicast:
+            mc = comm.box_peers_view(parity)
         code(
             source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
-            mc, comm._rank, gather, stream(comm.device),
+            mc, comm._rank, gather, *self.stats_args, *tail, stream(comm.device),
         )  # fmt: skip
         return comm.gather[parity, : n * comm.tp]
 
@@ -383,7 +501,7 @@ class SpBoundary:
         prefix_v, blocks_v, out_v, partial_v = views
         code(
             recv, prefix_v, blocks_v, *self.post_w, out_v, *self.post_eps,
-            partial_v, peers, comm._rank, *gather, *self.out_args,
-            stream(comm.device),
+            partial_v, peers, comm._rank, *gather, *self.out_args, *self.next_args,
+            *((Int64(self.stamp_ptr),) if self.stamps else ()), stream(comm.device),
         )  # fmt: skip
         return out

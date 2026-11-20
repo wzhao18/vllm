@@ -117,7 +117,9 @@ class Fakes:
             assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
             assert (mlp is None) == (decoder.layer_idx == 0), decoder.layer_idx
             fakes.events.add("SpBoundary", decoder.layer_idx, block.parity)
-            return SimpleNamespace(layer=decoder.layer_idx, comm=comm)
+            return SimpleNamespace(
+                layer=decoder.layer_idx, comm=comm, link=lambda nxt, slot: None
+            )
 
         class Projection(Provider):
             def __init__(self, weight, rows, tactics, *, family):
