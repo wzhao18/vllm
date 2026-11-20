@@ -1795,7 +1795,7 @@ _DSA_RENAME_PARAMS_MAPPING = [
 # "serial": A.attn(l) B.attn(l) A.mlp(l) B.mlp(l) on one stream (control);
 # "tbo": B on a side stream; attention blocks and MLP blocks each form one
 # chain across the halves, so B.attn(l) || A.mlp(l) and A.attn(l+1) || B.mlp(l).
-_PA_EMU_MODE = "tbo"
+_PA_EMU_MODE = "serial"
 
 
 def _pa_layer_attn(layer, positions, hidden_states, residual, prefix_sum):
