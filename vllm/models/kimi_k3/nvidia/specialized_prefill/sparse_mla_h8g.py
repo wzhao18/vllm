@@ -29,7 +29,6 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     H,
     LOG2E,
     ROW,
-    cp_async_arrive,
     fence_async_smem,
     ld_global_s32_pred,
     mbar_arrive,
@@ -39,6 +38,8 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
     B_KVEMPTY,
     B_KVFULL,
+    B_NFULL,
+    NCR,
     NLD,
     NS,
     OFF_KV,
@@ -56,6 +57,11 @@ ROPE_OFF = 4 * 8192  # RoPE SW64 block of a stage (after the 4 latent SW128 atom
 @asm(Int32)
 def shfl_idx(v, src):
     return "shfl.sync.idx.b32 $0, $1, $2, 31, -1;", "=r,r,r", (Int32(v), Int32(src))
+
+
+@asm()
+def cp_async_arrive_inc(bar):
+    return "cp.async.mbarrier.arrive.shared::cta.b64 [$0];", "r,~{memory}", (Uint32(bar),)
 
 
 @asm()
@@ -85,18 +91,17 @@ def complete_tx_release(bar, nbytes):
 class SparseMlaPrefillH8G(SparseMlaPrefillH8):
     def __init__(self, grid: int, knobs: tuple = (), nlw: int = 4, lag: int = 3):
         super().__init__(grid, knobs)
-        if nlw not in (2, 4, 8) or not 0 <= lag < NS or (lag == 0 and nlw != 8):
+        if nlw not in (2, 4, 8) or not 0 <= lag < NS or (lag == 0 and nlw * NS > NCR):
             raise ValueError(
-                f"SparseMlaPrefillH8G: nlw 2|4|8, lag < {NS} (lag 0: nlw 8); got {nlw}, {lag}")
+                f"SparseMlaPrefillH8G: nlw 2|4|8, lag < {NS} (lag 0: nlw <= 4); got {nlw}, {lag}")
         if self.sstamp or self.cpa or self.gskip:
             raise ValueError("SparseMlaPrefillH8G: sstamp/cpa/gskip are h8 gather4 knobs")
         self.nlw = nlw
         self.lag = lag
-        if lag == 0:
-            # lag 0: every producer lane signals its own copies with
-            # cp.async.mbarrier.arrive.noinc (256) + warp 0's plain arrive = h8's cpa
-            # stage count (257); QK then fences the generic-proxy writes (h8 cpa path)
-            self.cpa = 1
+        # lag 0: per-warp stage barriers (the count-1 B_NFULL slots, unused in physical
+        # mode): every lane's cp.async.mbarrier.arrive (no .noinc: self-balancing) then
+        # one lane's arrive after __syncwarp; QK waits them, fences the generic-proxy
+        # writes and completes h8's KV-full barrier itself.
 
     @cute.jit
     def loader(self, base, pw, lane, cta, n_mine, tm_qn, tm_qr, tm_kv, tm_kr, unit_rows,
@@ -144,10 +149,8 @@ class SparseMlaPrefillH8G(SparseMlaPrefillH8):
                 compiler_fence()
                 if lane == 0:
                     mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                    if pw == 0:
-                        if cutlass.const_expr(lag == 0):
-                            mbar_arrive(_bar(base, B_KVFULL + s))
-                        else:
+                    if cutlass.const_expr(lag > 0):
+                        if pw == 0:
                             mbar_arrive_tx(_bar(base, B_KVFULL + s), Uint32(STAGE64))
                 cute.arch.sync_warp()
                 r0 = pw * rpw
@@ -179,7 +182,11 @@ class SparseMlaPrefillH8G(SparseMlaPrefillH8):
                          + ((c4 ^ ((r >> Uint32(1)) & Uint32(3))) << Uint32(4)),
                          src + Int64(D_NOPE) + Int64(c4 * Uint32(16)), nb)
                 if cutlass.const_expr(lag == 0):
-                    cp_async_arrive(_bar(base, B_KVFULL + s))
+                    wb = _bar(base, B_NFULL + s * self.nlw + pw)
+                    cp_async_arrive_inc(wb)
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        mbar_arrive(wb)
                 else:
                     cp_commit()
                     _WAITS[lag - 1]()
@@ -191,6 +198,19 @@ class SparseMlaPrefillH8G(SparseMlaPrefillH8):
                 g = g + 1
         if cutlass.const_expr(lag > 0):
             self.drain(base, lane, g)
+
+    @cute.jit
+    def qk(self, base, lane, taddr, u, qi, last, cta):
+        if cutlass.const_expr(self.lag == 0):
+            s = u % NS
+            for w in cutlass.range_constexpr(self.nlw):
+                mbar_wait(_bar(base, B_NFULL + s * self.nlw + w), Uint32((u // NS) & 1))
+            fence_async_smem()
+            cute.arch.sync_warp()
+            if lane == 0:
+                mbar_arrive(_bar(base, B_KVFULL + s))
+            cute.arch.sync_warp()
+        SparseMlaPrefillH8.qk(self, base, lane, taddr, u, qi, last, cta)
 
     @cute.jit
     def drain(self, base, lane, g):
