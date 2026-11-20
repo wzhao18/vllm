@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--variants", default="s4i1x1")
     ap.add_argument("--copies", type=int, default=12, help="weight copies (> L2)")
     ap.add_argument("--rank", type=int, default=1)
+    ap.add_argument("--k", type=int, default=K, help="K (calibration: slope over K)")
     ap.add_argument("--bf16", action="store_true", help="OprojPushBf16 vs torch.mm")
     args = ap.parse_args()
     if args.bf16:
@@ -81,7 +82,7 @@ def main():
 
     dev = torch.device("cuda", 0)
     torch.manual_seed(0)
-    ws = [mx(torch.randn(WIDTH, K, device=dev, dtype=torch.bfloat16) * 0.05)
+    ws = [mx(torch.randn(WIDTH, args.k, device=dev, dtype=torch.bfloat16) * 0.05)
           for _ in range(args.copies)]  # fmt: skip
     g8 = cute.AddressSpace.gmem
     f8, e8 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
@@ -95,7 +96,7 @@ def main():
           f"{torch.cuda.get_device_properties(0).multi_processor_count}", flush=True)  # fmt: skip
     for rows in [int(r) for r in args.rows.split(",")]:
         n = rows // TP
-        x = mx(torch.randn(rows, K, device=dev, dtype=torch.bfloat16))
+        x = mx(torch.randn(rows, args.k, device=dev, dtype=torch.bfloat16))
         ref = torch._scaled_mm(
             x.data, ws[0].data.t(), scale_a=x.scale.view(torch.float8_e8m0fnu),
             scale_b=ws[0].scale.view(torch.float8_e8m0fnu), out_dtype=torch.bfloat16,
@@ -119,7 +120,7 @@ def main():
             stages, iw, ix = (int(g) for g in m.groups()[:3])
             kt = int(m.group(4)[1:]) if m.group(4) else 256
             try:
-                kern = OprojPushMx(K, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix,
+                kern = OprojPushMx(args.k, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix,
                                    pair=not m.group(5))  # fmt: skip
 
                 def ptrs(w):
