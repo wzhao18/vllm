@@ -318,6 +318,95 @@ __device__ __forceinline__ unsigned lazy_verify(const unsigned char* slot, const
   return __float_as_uint(vals[0]) ^ __float_as_uint(vals[1]);
 }
 
+// MATH 4 (M1b): lazy-fold verify, KEY-SPANNING warps. Lane t of warp w owns keys 4 t + [0, 4)
+// of rows 8 w + [0, 8) (4 passes of 2 rows): every operand load is distinct per lane (no
+// broadcast replay over the 8-lane phases of a 128-bit shared load). Operands per lane:
+// X[t][key 4][m 8] (32 floats, 8 x LDS.128, rotated by lane: conflict-free) kept in
+// registers for all passes; dots as FFMA2 over vector pairs with the state value
+// broadcast (no pair collapse); ring term before the reduction: lane t adds record
+// e = t / 2 for vectors 4 (t % 2) + [0, 4): u_e[row] (ring [row pair][e][2]) x C[e][m].
+// Then a 32-lane transposed butterfly per pass (16 -> 1 value per lane pair).
+__device__ __forceinline__ unsigned lazy_verify_ks(const unsigned char* slot, const float* ops,
+                                                   const float* ring, int w, unsigned bar,
+                                                   char* wb) {
+  const int t = threadIdx.x & 31;
+  float st[8][4];  // [row 8 w + p][key 4 t + k]
+#pragma unroll
+  for (int p = 0; p < 8; ++p) {
+    const float4 q = *(const float4*)(slot + (size_t)(8 * w + p) * 512 + t * 16);
+    st[p][0] = q.x; st[p][1] = q.y; st[p][2] = q.z; st[p][3] = q.w;
+  }
+  __syncwarp();
+  if (t == 0) arrive(bar);
+  float2 x[4][4];  // [key][m pair]
+  const float4* X = (const float4*)ops + t * 8;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float4 v = X[(j + t) & 7];  // rotated: physical (j + t) % 8 holds logical j
+    x[j >> 1][(j & 1) * 2] = make_float2(v.x, v.y);
+    x[j >> 1][(j & 1) * 2 + 1] = make_float2(v.z, v.w);
+  }
+  const float4 cr = *((const float4*)(ops + 1024) + t);  // C[e = t / 2][4 (t % 2) + 0..3]
+  unsigned r = 0;
+#pragma unroll
+  for (int ps = 0; ps < 4; ++ps) {
+    float2 acc[2][4];
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) acc[h][q] = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float sv = st[2 * ps + h][k];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[h][q] = ffma2(make_float2(sv, sv), x[k][q], acc[h][q]);
+      }
+    float vals[16];
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) { vals[h * 8 + 2 * q] = acc[h][q].x; vals[h * 8 + 2 * q + 1] = acc[h][q].y; }
+    const float2 u = *((const float2*)ring + (4 * w + ps) * 16 + (t >> 1));  // rows 8w+2ps+{0,1}
+    const bool odd = (t & 1) != 0;  // static register indices only (no local memory)
+    const float crv[4] = {cr.x, cr.y, cr.z, cr.w};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float uh = h ? u.y : u.x, ue = odd ? 0.f : uh, uo = odd ? uh : 0.f;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        vals[h * 8 + k] = fmaf(ue, crv[k], vals[h * 8 + k]);
+        vals[h * 8 + 4 + k] = fmaf(uo, crv[k], vals[h * 8 + 4 + k]);
+      }
+    }
+    int n = 16;
+#pragma unroll
+    for (int off = 16; off >= 2; off >>= 1) {
+      const bool up = (t & off) != 0;
+      const int half = n / 2;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        if (i < half) {
+          float send = up ? vals[i] : vals[i + half];
+          float keep = up ? vals[i + half] : vals[i];
+          vals[i] = keep + __shfl_xor_sync(0xffffffffu, send, off);
+        }
+      }
+      n = half;
+    }
+    vals[0] += __shfl_xor_sync(0xffffffffu, vals[0], 1);
+    r ^= __float_as_uint(vals[0]);
+    if (wb) {  // fold step (every F-th): this pass's 2 rows back (skeleton: unchanged)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+        *(float4*)(wb + (size_t)(8 * w + 2 * ps + h) * 512 + t * 16) =
+            make_float4(st[2 * ps + h][0], st[2 * ps + h][1], st[2 * ps + h][2], st[2 * ps + h][3]);
+    }
+  }
+  return r;
+}
+
 // G alternating consumer groups of NC / G threads: group g takes items j = g (mod G); a
 // thread covers PG / (NC / G) bytes of the page in passes of 4 chunks (32 values), the
 // slot is released after the last pass's copy (math of one group overlaps the other's
@@ -389,7 +478,11 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
     for (int o = c * 16; o < SB; o += NG * 16) {
       uint4 r = *(const uint4*)(smem + (size_t)s * SL + PG + o); acc ^= r.x ^ r.w; }
     bool wr = a.wmod == 1 || (a.wmod > 0 && pg % a.wmod == a.step);
-    if constexpr (MATH == 3) {
+    if constexpr (MATH == 4) {
+      acc ^= lazy_verify_ks(smem + (size_t)s * SL, (const float*)(smem + (size_t)S * SL),
+                            (const float*)(smem + (size_t)s * SL + PG + a.sin_b), c >> 5,
+                            sa(&empty[s]), wr ? a.state + (size_t)pg * PG : nullptr);
+    } else if constexpr (MATH == 3) {
       constexpr int NPV = 128 / (2 * (NG / 8));  // row-pair passes per thread (G2: 2)
 #pragma unroll 1
       for (int ps = 0; ps < NPV; ++ps)
@@ -498,6 +591,7 @@ void launch(int64_t form, int64_t state, int64_t P, int64_t sin, int64_t sin_b,
     case 370531: go_tma<512, 3, 1, 3>(a, s); break;
     case 370541: go_tma<512, 4, 1, 3>(a, s); break;
     case 1370531: go_tma<512, 3, 1, 3, 2>(a, s); break;
+    case 470531: go_tma<512, 3, 1, 4>(a, s); break;
     default: TORCH_CHECK(false, "form");
   }
 }
@@ -516,6 +610,7 @@ std::vector<int64_t> attrs(int64_t form) {
     case 170541: cudaFuncGetAttributes(&f, tma_k<512, 4, 1, 1>); break;
     case 370531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 3>); break;
     case 1370531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 3, 2>); break;
+    case 470531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 4>); break;
     default: cudaFuncGetAttributes(&f, skel_k<256, 2>); break;
   }
   return {f.numRegs, (int64_t)f.localSizeBytes};
@@ -531,7 +626,7 @@ std::vector<int64_t> attrs(int64_t);
 
 def _module():
     return load_inline(
-        name="k31_kda_skel_v13",
+        name="k31_kda_skel_v16",
         cpp_sources=CPP,
         cuda_sources=CUDA,
         functions=["launch", "attrs"],
@@ -547,10 +642,10 @@ def parse_arm(arm):
             if form.startswith("t"):  # t<NC>s<S>o<OPS>[m|f][g]: TMA ring, NC consumers
                 grp = 1000000 if form.endswith("g") else 0  # g: 2 alternating groups
                 form = form.rstrip("g")
-                nc, ops = form[1:].rstrip("mfv").split("o")
+                nc, ops = form[1:].rstrip("mfvw").split("o")
                 nc, slots = (nc.split("s") + ["3"])[:2]
                 code = (5 if nc == "512" else 2) * 100 + 10 * int(slots) + int(ops)
-                return kind, grp + 70000 + code + {"m": 100000, "f": 200000, "v": 300000}.get(form[-1], 0)
+                return kind, grp + 70000 + code + {"m": 100000, "f": 200000, "v": 300000, "w": 400000}.get(form[-1], 0)
             nt, minb = form.split("x")
             return kind, int(nt) * 10 + int(minb)
     raise ValueError(arm)
