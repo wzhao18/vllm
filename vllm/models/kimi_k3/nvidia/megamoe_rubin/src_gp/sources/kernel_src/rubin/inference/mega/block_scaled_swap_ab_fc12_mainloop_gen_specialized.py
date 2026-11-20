@@ -234,7 +234,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
         self._configure_shared_kind()
 
-        self.uses_asymmetric_ab_stages = self.cta_tile_n == self.asymmetric_token_tile
+        # The decode N128 pair tile on cluster (2, 1) also runs the split plan: weight
+        # tiles stream from HBM and need the depth (bytes in flight per CTA), while the
+        # token side is L2-resident and keeps up with a short ring of its own.
+        self.uses_asymmetric_ab_stages = self.cta_tile_n == self.asymmetric_token_tile or (
+            self.mma_tiler_mnk == self.n128_decode_tile
+            and self.cluster_shape_mn == (2, 1)
+            and self.use_2cta_instrs
+        )
         # Decode MMA reads only a 16-row-aligned valid token window. Keep the
         # allocated layout, but omit padding-row B transfers in the qualified
         # N64 / N128 geometries and register their exact completion bytes per stage.
@@ -242,7 +249,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             self.mma_tiler_mnk in (self.n64_decode_tile, self.n128_decode_tile)
             and self.cluster_shape_mn in ((4, 1), (2, 1))
             and self.use_2cta_instrs
-            and not self.uses_asymmetric_ab_stages
         )
         self._select_ab_stage_plan()
         self.num_tma_load_bytes = self.ab_stage_tma_bytes * self.mma_cta_count
@@ -1433,7 +1439,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             # Weight/SFA and SFB transfers are unchanged. On routed FC1 tiles TMA-B
             # alone subtracts the B bytes Gather4 omits for padding rows, so the two
             # producer arrivals still register the exact combined transaction count.
-            expected_tx = Int32(self.ab_pipeline_tx_count_per_producer)
+            # On the split plan TMA-B is the token ring's only producer: it registers the whole token count.
+            expected_tx = Int32(
+                self.token_pipeline_tx_count if self.uses_asymmetric_ab_stages else self.ab_pipeline_tx_count_per_producer
+            )
             if is_fc1:
                 omitted_rows = Int32(self.cta_tile_n) - round_up(work_tile.valid_tokens_in_cta_tile, 16)
                 expected_tx = expected_tx - omitted_rows * Int32(self.mma_tile_k * int(self.b_dtype.width) // 8)
