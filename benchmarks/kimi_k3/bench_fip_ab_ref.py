@@ -12,6 +12,7 @@ import sys
 import torch
 
 import vllm.models.kimi_k3.nvidia.specialized_prefill.kda_persistent as pkg
+import vllm.models.kimi_k3.nvidia.specialized_prefill.kda_persistent.forward  # noqa: F401
 from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
 
 D = 128
