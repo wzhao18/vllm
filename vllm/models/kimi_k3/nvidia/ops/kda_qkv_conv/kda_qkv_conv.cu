@@ -225,23 +225,6 @@ __device__ __forceinline__ void state_st(StateT* p, float v) {
   }
 }
 
-// Stock l2norm_fwd of one 128-channel head row of the bf16 SiLU output: y = x * rsqrt(sum(x^2) + 1e-6)
-// in FP32, rounded to bf16. A warp's 256 columns are two heads (lanes 0-15 and 16-31, 8 channels
-// each); all 32 lanes call it together (warp-uniform plane and skip decisions).
-__device__ __forceinline__ uint4 l2norm_head8(uint4 y) {
-  float v[kVec];
-  unpack8(y, v);
-  float s = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kVec; ++i) s = fmaf(v[i], v[i], s);
-#pragma unroll
-  for (int off = 1; off < 16; off <<= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
-  const float r = rsqrtf(s + 1e-6f);
-#pragma unroll
-  for (int i = 0; i < kVec; ++i) v[i] *= r;
-  return make_uint4(pack2(v[0], v[1]), pack2(v[2], v[3]), pack2(v[4], v[5]), pack2(v[6], v[7]));
-}
-
 struct Params {
   const __nv_bfloat16* x;  // (tokens, >= 3C) row-strided
   const void* w;           // (3C, 4) contiguous: bf16 for a bf16 state, FP32 for an FP32 state
@@ -252,7 +235,6 @@ struct Params {
   __nv_bfloat16* out;  // (3, tokens, C)
   int64_t ldx, st_s0, st_s1, st_s2, ci_s0, out_s0, out_s1;
   int num_seqs, parts, num_col_blocks, part_dim, null_block_id, has_null_block;
-  int norm_qk;  // l2-normalize the q/k planes per (token, head) row
 };
 
 // Last sequence s with qsl[s] <= t (the non-empty sequence holding row t when qsl[0] <= t < qsl[num_seqs]).
@@ -370,8 +352,6 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
   const int c0 = col + lane * kVec;
   const __nv_bfloat16* xcol = p.x + col + lane * kVec;  // row 0 of x, this lane's channels
   __nv_bfloat16* ocol = p.out + (col / p.part_dim) * p.out_s0 + (col % p.part_dim) + lane * kVec;
-  const bool norm = p.norm_qk && (col / p.part_dim) < 2;  // q/k planes; warp-uniform
-  auto finish = [&](uint4 y) { return norm ? l2norm_head8(y) : y; };
 
   // Current sequence.
   int seq = find_seq(p, r_begin);
@@ -457,7 +437,7 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
         [&](uint4 raw, __nv_bfloat16* o) {
           float cur[kVec];
           unpack8(raw, cur);
-          st_global_cs_v4(o, finish(conv_row_fma(h[0], h[1], h[2], cur, w)));
+          st_global_cs_v4(o, conv_row_fma(h[0], h[1], h[2], cur, w));
           step(cur);
         },
         [&](int t, uint4 raw) {
@@ -467,7 +447,7 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
           }
           float cur[kVec];
           unpack8(raw, cur);
-          if (!skip) st_global_cs_v4(ocol + static_cast<int64_t>(t) * p.out_s1, finish(conv_row_fma(h[0], h[1], h[2], cur, w)));
+          if (!skip) st_global_cs_v4(ocol + static_cast<int64_t>(t) * p.out_s1, conv_row_fma(h[0], h[1], h[2], cur, w));
           step(cur);
         });
   } else {
@@ -508,7 +488,7 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
     }
     stream_rows(
         [&](uint4 cur, __nv_bfloat16* o) {
-          st_global_cs_v4(o, finish(conv_row_bf16(h[0], h[1], h[2], cur, w)));
+          st_global_cs_v4(o, conv_row_bf16(h[0], h[1], h[2], cur, w));
           h[0] = h[1];
           h[1] = h[2];
           h[2] = cur;
@@ -518,7 +498,7 @@ __global__ void __launch_bounds__((NC + 1) * 32, min_blocks<NC>()) qkv_conv_kern
             advance(t);
             if (!skip) seq_hist();
           }
-          if (!skip) st_global_cs_v4(ocol + static_cast<int64_t>(t) * p.out_s1, finish(conv_row_bf16(h[0], h[1], h[2], cur, w)));
+          if (!skip) st_global_cs_v4(ocol + static_cast<int64_t>(t) * p.out_s1, conv_row_bf16(h[0], h[1], h[2], cur, w));
           h[0] = h[1];
           h[1] = h[2];
           h[2] = cur;
@@ -558,8 +538,7 @@ void dispatch(const Params& p, int64_t tokens, int nc, cudaStream_t stream) {
 // out = conv(x) as (3, tokens, part_dim); conv_states updated in place.
 void qkv_conv(torch::Tensor const& x, torch::Tensor const& weight, torch::Tensor& conv_states,
               torch::Tensor const& query_start_loc, torch::Tensor const& cache_indices,
-              torch::Tensor const& has_initial_state, torch::Tensor& out, int64_t null_block_id, int64_t warps,
-              bool norm_qk) {
+              torch::Tensor const& has_initial_state, torch::Tensor& out, int64_t null_block_id, int64_t warps) {
   const int64_t tokens = x.size(0);
   const int64_t dim = 3 * out.size(2);
   const int num_seqs = query_start_loc.size(0) - 1;
@@ -586,8 +565,6 @@ void qkv_conv(torch::Tensor const& x, torch::Tensor const& weight, torch::Tensor
   p.num_col_blocks = static_cast<int>(dim / (warps * kWarpCols));
   p.null_block_id = static_cast<int>(null_block_id);
   p.has_null_block = null_block_id >= 0;
-  p.norm_qk = norm_qk ? 1 : 0;
-  TORCH_CHECK(!norm_qk || p.part_dim % kWarpCols == 0, "k3 qkv conv: q/k norm needs whole heads per warp");
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
   const bool st32 = conv_states.scalar_type() == at::kFloat;
   const bool w32 = weight.scalar_type() == at::kFloat;
@@ -606,7 +583,7 @@ void qkv_conv(torch::Tensor const& x, torch::Tensor const& weight, torch::Tensor
 TORCH_LIBRARY_FRAGMENT(k3_kda_conv, m) {
   m.def(
       "qkv_conv(Tensor x, Tensor weight, Tensor(a!) conv_states, Tensor query_start_loc, Tensor cache_indices, "
-      "Tensor has_initial_state, Tensor(b!) out, int null_block_id, int warps, bool norm_qk=False) -> ()");
+      "Tensor has_initial_state, Tensor(b!) out, int null_block_id, int warps) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(k3_kda_conv, CUDA, m) { m.impl("qkv_conv", &k3conv::qkv_conv); }

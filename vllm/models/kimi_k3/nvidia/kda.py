@@ -1463,7 +1463,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         metadata=m,
                     ).transpose(0, 1)
 
-                qk_normalized = False
                 have_meta = (
                     has_initial_state is not None
                     and non_spec_query_start_loc is not None
@@ -1480,28 +1479,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     assert has_initial_state is not None
                     assert non_spec_query_start_loc is not None
                     assert non_spec_state_indices_tensor is not None
-                    # The persistent KDA core takes q/k l2-normalized by this
-                    # conv (stock l2norm_fwd before the chunk kernels) when no
-                    # segment-parallel plan can claim the batch.
-                    qk_normalized = (
-                        self.kda_prefill_backend == "flashkda"
-                        and self._frost
-                        and self._kda_persistent
-                        and checkpoint is None
-                        and m.non_spec_query_start_loc_cpu is not None
-                        and (
-                            self._segscan_bufs is None
-                            or kda_segscan.make_plan(
-                                m.non_spec_query_start_loc_cpu,
-                                self.local_num_heads,
-                                mixed_qkv_ns.device,
-                                None,
-                                sms=self._segscan_bufs.sms,
-                                max_parts=self._segscan_bufs.n,
-                            )
-                            is None
-                        )
-                    )
                     q_ns, k_ns, v_ns = kda_conv.qkv_conv(
                         mixed_qkv_ns,
                         conv_weights,
@@ -1510,7 +1487,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         non_spec_state_indices_tensor,
                         has_initial_state,
                         self.local_projection_size,
-                        normalize_qk=qk_normalized,
                     ).unbind(0)
                 elif have_meta and packed_causal_conv1d_supported(
                     mixed_qkv_ns,
@@ -1693,11 +1669,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     ),
                                     state_indices=non_spec_state_indices_tensor,
                                     has_initial_state=has_initial_state,
-                                    qk_normalized=qk_normalized,
                                 )
                             )
                         else:
-                            assert not qk_normalized
                             frost_out, last_recurrent_state = (
                                 specialized_prefill_kda.frost_prefill(
                                     q=q_ns,

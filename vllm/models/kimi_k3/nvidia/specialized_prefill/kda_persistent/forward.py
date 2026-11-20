@@ -71,10 +71,8 @@ def _get_compiled(
     cluster_size: int = 1,
     partial_tma: bool = True,
     state_rows: bool = False,
-    qk_normalized: bool = False,
 ):
     key = (
-        qk_normalized,
         state_rows,
         dev.index,
         torch.cuda.get_device_capability(dev),
@@ -179,7 +177,6 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
-                QKN_=1 if qk_normalized else 0,
             )
             kw.update(_DEV)
             return cute.compile(
@@ -341,7 +338,6 @@ def _launch_forward(
     prep_peel=False,
     cluster_size=1,
     gate_roll=False,
-    qk_normalized=False,
     partial_tma=True,
     srow=None,
 ):
@@ -419,7 +415,6 @@ def _launch_forward(
         prep_peel=prep_peel,
         cluster_size=cluster_size,
         gate_roll=gate_roll,
-        qk_normalized=qk_normalized,
         state_rows=srow is not None,
         partial_tma=partial_tma,
     )
@@ -690,10 +685,7 @@ def fwd(
     cu_seqlens=None,
     plan=None,
     srow=None,
-    qk_normalized=False,
 ):
-    """qk_normalized: q/k are already l2-normalized per (token, head) row by the
-    producer (stock l2norm_fwd contract); the kernel then skips its own norm."""
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
         cu32,
@@ -745,6 +737,5 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
-        qk_normalized=qk_normalized,
         srow=srow,
     )
