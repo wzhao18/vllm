@@ -84,7 +84,10 @@ PREWAIT_ROWS = (64,)
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
 # WideGemm policy after the split (activation warps, weight stages, weight warps,
 # direct exchange, rotate, ring KiB, K per stage): die-static work, K128 stages.
-LATENT_UP_WIDE = ((1,), None, (0, 3), False, False, None, 128)
+LATENT_UP_WIDE = ((1,), None, (0, 3), False, False, None, 128, True)
+# Rows on LATENT_UP_WIDE (in-step fastab ex3lu2/ex3lu3, rhea -r 3: r8 -11.7 / -13.9 us
+# per step; at r16 +3.0 / +8.6, r24 -4.6 / +5.4, so 64 / 96 keep the striped K64 launch).
+LATENT_UP_DIE_ROWS = (32,)
 
 
 class SplitKFront:
@@ -267,7 +270,11 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
-                policies = {r: (s,) + LATENT_UP_WIDE for r, s in self.parts.items()}
+                striped = ((1,), None, (0, 3), False, False, None, 64, False)
+                policies = {
+                    r: (s,) + (LATENT_UP_WIDE if r in LATENT_UP_DIE_ROWS else striped)
+                    for r, s in self.parts.items()
+                }
                 self.latent_up_parts = PreparedWide(
                     weights["latent_up"], policies, partials=True, dies="placed"
                 ).prepare()

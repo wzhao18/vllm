@@ -1011,9 +1011,12 @@ class PreparedWide:
         self.policies = {}
         for r, v in dict(policies).items():
             v = (v,) if isinstance(v, int) else tuple(v)
-            v += ((1,), None, (0, 3), False, False, None, K_TILE)[len(v) - 1:]
+            # 9th field: die-static launch for this row (None: whenever ``dies``)
+            v += ((1,), None, (0, 3), False, False, None, K_TILE, None)[len(v) - 1:]
+            die = bool(dies) if v[8] is None else bool(v[8]) and bool(dies)
             self.policies[r] = (
-                v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), v[6], v[7]
+                v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), v[6], v[7],
+                die,
             )  # fmt: skip
         self.kernels, self.state = {}, {}
 
@@ -1028,10 +1031,10 @@ class PreparedWide:
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, policy in self.policies.items():
-            split, act_warps, wst, w_warps, direct, rotate, smem, ktile = policy
+            split, act_warps, wst, w_warps, direct, rotate, smem, ktile, die = policy
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials, len(tpc_die) if self.dies else 0,
+                w_warps, direct, rotate, self.partials, len(tpc_die) if die else 0,
                 smem, self.trace, self.xcopies, ktile,
             )  # fmt: skip
             n_pad = gemm.n_pad
@@ -1045,9 +1048,9 @@ class PreparedWide:
             ws = torch.full(
                 (max(split, 1), n_pad, rows), SENTINEL, dtype=torch.int32, device=dev
             ).view(torch.float32)
-            table = work_table(tpc_die, t0, n_pad // 256, split) if self.dies else []
+            table = work_table(tpc_die, t0, n_pad // 256, split) if die else []
             flags = torch.zeros(gemm.table_at + len(table), dtype=torch.int32, device=dev)
-            if self.dies:
+            if die:
                 flags[gemm.table_at :] = torch.tensor(table, dtype=torch.int32)
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
             key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
