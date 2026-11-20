@@ -66,6 +66,7 @@ from ...custom_mix_cga_helpers import (
     bind_executable_tma_load_fields,
     make_executable_tma_atom_or_pair,
     make_l2_evict_first_policy,
+    make_l2_evict_last_policy,
 )
 
 
@@ -1452,6 +1453,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 omitted_rows = Int32(self.cta_tile_n) - round_up(work_tile.valid_tokens_in_cta_tile, 16)
                 expected_tx = expected_tx - omitted_rows * Int32(self.mma_tile_k * int(self.b_dtype.width) // 8)
 
+        # Token-side operands (FC2 B = FC1 outputs, SFB) are re-read by every unit of their block.
+        token_policy = make_l2_evict_last_policy()
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
@@ -1466,19 +1469,19 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
             if cutlass.const_expr(is_fc1 is None):
                 cute.copy(
-                    _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask),
+                    _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask, token_policy),
                     global_b_slice[(None, k_tile_idx)],
                     partitioned_smem_b[(None, stage_index)],
                 )
             else:
                 if not is_fc1:
                     cute.copy(
-                        _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask),
+                        _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask, token_policy),
                         global_b_slice[(None, k_tile_idx)],
                         partitioned_smem_b[(None, stage_index)],
                     )
             cute.copy(
-                _bind_tma_issue(sfb_exec_atom, tma_barrier, sfb_multicast_mask),
+                _bind_tma_issue(sfb_exec_atom, tma_barrier, sfb_multicast_mask, token_policy),
                 global_sfb_slice[(None, k_tile_idx)],
                 partitioned_smem_sfb[(None, stage_index)],
             )
@@ -1802,6 +1805,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                                     group_in_run * self.gather4_width * self.mma_tile_k
                                 )
                                 row_start = local_run * self.gather_index_load_rows + group_in_run * self.gather4_width
+                                token_policy = make_l2_evict_last_policy()
                                 with cute.arch.elect_one():
                                     sm107_tma_gather4_load(
                                         fc1_tma_b_atom,
@@ -1814,6 +1818,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                                         row_ids[row_start + 3],
                                         use_cta_group_2=self.use_2cta_instrs,
                                         mcast_mask=gather_b_multicast_mask,
+                                        cache_policy=token_policy,
                                     )
                     ab_pipeline_state.advance()
                 iket.range_pop()
