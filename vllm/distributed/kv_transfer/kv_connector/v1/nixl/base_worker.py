@@ -2560,10 +2560,10 @@ class NixlBaseConnectorWorker:
             region_at = {bases[r]: r for r in self._ssm_region_indices}
             ratio = self._physical_blocks_per_logical_kv_block
             for g, group in enumerate(self.kv_cache_config.kv_cache_groups):
-                spec = group.kv_cache_spec
-                if not isinstance(spec, MambaSpec) or spec.tp_replicated:
-                    continue
                 for name in group.layer_names:
+                    spec = self._layer_specs.get(name)
+                    if not isinstance(spec, MambaSpec) or spec.tp_replicated:
+                        continue
                     r = region_at.get(kv_caches[name].data_ptr())
                     if r is None:
                         raise ValueError(f"{name}: no NIXL SSM region at its cache")

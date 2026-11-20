@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
+    iter_layer_specs,
 )
 
 if TYPE_CHECKING:
@@ -443,10 +444,14 @@ class NixlBaseConnectorScheduler:
         transfers pick it, for the KV fingerprints (kv_fingerprint.py)."""
         slots = {}
         for g, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            spec = group.kv_cache_spec
-            if isinstance(spec, MambaSpec) and not spec.tp_replicated and block_ids[g]:
+            specs = [
+                spec
+                for spec in iter_layer_specs(group.kv_cache_spec)
+                if isinstance(spec, MambaSpec) and not spec.tp_replicated
+            ]
+            if specs and block_ids[g]:
                 blocks = clip_ssm_state_blocks(
-                    list(block_ids[g]), spec.num_speculative_blocks
+                    list(block_ids[g]), specs[0].num_speculative_blocks
                 )
                 slots[g] = int(blocks[0])
         return slots
