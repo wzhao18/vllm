@@ -286,8 +286,8 @@ class SpMlp:
             # forks, as route_stage.
             staged = front.stage(h)
 
-            def experts():
-                return front.launch(staged, fused_norm)
+            def experts(shared=None):
+                return front.launch(staged, fused_norm, shared)
 
         elif route is not None and route.ready(n):
             # Router | latent down as one FP32 GEMM, then one kernel stages its

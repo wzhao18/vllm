@@ -745,5 +745,5 @@ class MoeFront:
         )  # fmt: skip
         return rt, session, n
 
-    def launch(self, staged, output_rmsnorm=None) -> torch.Tensor:
-        return self.route.launch(staged, output_rmsnorm)
+    def launch(self, staged, output_rmsnorm=None, shared=None):
+        return self.route.launch(staged, output_rmsnorm, shared)
