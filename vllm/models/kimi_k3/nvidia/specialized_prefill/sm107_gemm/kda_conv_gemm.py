@@ -45,6 +45,8 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.skel_hot = "hot" in flags
         self.sf_tmem_slots = 2 if "sf2" in flags else 1
         self.epi_drain = "drain" in flags
+        # Drain skeletons (microbench only): 1 = drain + release, 2 = + math.
+        self.epi_drain_skel = 1 if "dskel1" in flags else 2 if "dskel2" in flags else 0
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),

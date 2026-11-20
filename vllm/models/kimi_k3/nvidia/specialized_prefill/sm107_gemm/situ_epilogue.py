@@ -429,6 +429,7 @@ def epilogue_situ_mxfp8_drain(
     m_rows: cutlass.Int32,
     acc_consumer_state: pipeline.PipelineState,
     acc_pipeline: pipeline.PipelineAsync,
+    skel: Constexpr = 0,
 ) -> pipeline.PipelineState:
     """Drain-and-release form of ``epilogue_situ_mxfp8`` for the 1-stage
     B-reuse tile (8 epilogue warps; warp group g owns M block g): every thread
@@ -478,6 +479,17 @@ def epilogue_situ_mxfp8_drain(
     store_atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
     )
+    if cutlass.const_expr(skel == 1):
+        # Skeleton: keep the drained values live, no math, no stores.
+        acc = Uint32(0)
+        for f in frags:
+            for i in cutlass.range_constexpr(cute.size(f)):
+                acc = acc ^ f[i]
+        if m_rows < 0:
+            if acc == Uint32(0x12345677):
+                rQ32[0] = acc
+                cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, 0)])
+        return acc_consumer_state
     for ni in cutlass.range_constexpr(half):
         rG = frags[ni]
         rU = frags[ni + half]
@@ -501,6 +513,9 @@ def epilogue_situ_mxfp8_drain(
                 rQ32[vi * 8 + q] = e4m3x4_of_bf16x4(hs[2 * q], hs[2 * q + 1], inv)
             if row < (m_rows + 127) // 128 * 128:
                 sf_frg[0, vi] = e.to(cutlass.Uint8)
-        if row < m_rows:
+        if cutlass.const_expr(skel == 2):
+            if m_rows < 0:
+                cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, ni)])
+        elif row < m_rows:
             cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, ni)])
     return acc_consumer_state

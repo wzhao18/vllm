@@ -45,6 +45,37 @@ def kernel_times(fn, iters=20, warm=3):
     return round(med, 1), [(n, round(t / iters, 1)) for n, t in top]
 
 
+def clock_power(fn, iters=300):
+    """Mean SM clock (MHz) and board power (W) while ``fn`` runs back to back."""
+    import threading
+    import time
+
+    samples, stop = [], threading.Event()
+
+    def sample():
+        while not stop.is_set():
+            try:
+                samples.append((torch.cuda.clock_rate(), torch.cuda.power_draw() / 1000))
+            except Exception:  # noqa: BLE001
+                return
+            time.sleep(0.005)
+
+    th = threading.Thread(target=sample)
+    th.start()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    stop.set()
+    th.join()
+    if not samples:
+        return None, None
+    tail = samples[len(samples) // 4 :] or samples
+    return (
+        round(statistics.mean(c for c, _ in tail)),
+        round(statistics.mean(w for _, w in tail)),
+    )
+
+
 def scaled_mm(x, sx, w, sw):
     return torch._scaled_mm(
         x, w.t(),
@@ -135,8 +166,10 @@ def main():
             torch.cuda.synchronize()
             t_ref = kernel_times(ref_path)
             t_gemm = kernel_times(lambda: scaled_mm(x, sx, w, sw))[0]
+            mhz, watt = clock_power(ref_path)
             print(json.dumps({"m": m, "data": data, "ref_total": t_ref[0], "ref_gemm": t_gemm,
-                              "ref_act": round(t_ref[0] - t_gemm, 1), "ref_top": t_ref[1]}), flush=True)
+                              "ref_act": round(t_ref[0] - t_gemm, 1), "mhz": mhz, "w": watt,
+                              "ref_top": t_ref[1]}), flush=True)
             if data == "real" and not args.noplain:
                 out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
                 for tac in plain:
@@ -145,7 +178,8 @@ def main():
                         g(x, sx, out)
                         torch.cuda.synchronize()
                         t = kernel_times(lambda: g(x, sx, out))[0]
-                        print(json.dumps({"m": m, "plain": tname(tac), "us": t,
+                        mhz, watt = clock_power(lambda: g(x, sx, out))
+                        print(json.dumps({"m": m, "plain": tname(tac), "us": t, "mhz": mhz, "w": watt,
                                           "x_cublas": round(t / t_gemm, 3)}), flush=True)
                     except Exception as e:  # noqa: BLE001
                         print(json.dumps({"m": m, "plain": tname(tac), "error": repr(e)[:300]}), flush=True)
@@ -164,7 +198,8 @@ def main():
                     eq_q = int(dq.sum())
                     eq_s = int((act.scale != ref.scale).sum())
                     t = kernel_times(lambda: g(x, sx, act))[0]
-                    print(json.dumps({"m": m, "data": data, "fused": tname(tac), "us": t,
+                    mhz, watt = clock_power(lambda: g(x, sx, act))
+                    print(json.dumps({"m": m, "data": data, "fused": tname(tac), "us": t, "mhz": mhz, "w": watt,
                                       "x_ref_total": round(t / t_ref[0], 3), "save_us": round(t_ref[0] - t, 1),
                                       "q_mismatch": eq_q, "sf_mismatch": eq_s}), flush=True)
                 except Exception as e:  # noqa: BLE001

@@ -2249,6 +2249,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         mQ_mnl.shape[0],
                         acc_consumer_state,
                         acc_pipeline,
+                        getattr(self, "epi_drain_skel", 0),
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
