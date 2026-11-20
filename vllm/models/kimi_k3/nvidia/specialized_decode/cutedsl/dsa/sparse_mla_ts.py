@@ -408,6 +408,11 @@ class SparseMlaDecodeTS:
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.own) = knobs[:15]
         assert not (self.own and self.qkh), "own uses the qkh barrier slots"
+        # own 2: S(u0) kept in registers until the tile max is known (two QK per tile)
+        # (own 3: softmax 168 / others 48 registers; own 2: 152 / 56)
+        self.reg_sm, self.reg_low = {2: (152, 56), 3: (168, 48)}.get(self.own,
+                                                                     (REG_SM, REG_LOW))
+        assert 256 * self.reg_sm + 384 * self.reg_low <= THREADS * REG_LAUNCH
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -507,12 +512,12 @@ class SparseMlaDecodeTS:
             tc_fence_after()
             taddr = ld_shared_u32(base + Uint32(OFF_TMEM))
             if warp < W_SM:
-                cute.arch.warpgroup_reg_alloc(REG_SM)
+                cute.arch.warpgroup_reg_alloc(self.reg_sm)
                 self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
                              out_scale, tensormap.map_address(om), lse)
                 cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
             else:
-                cute.arch.warpgroup_reg_dealloc(REG_LOW)
+                cute.arch.warpgroup_reg_dealloc(self.reg_low)
                 taddr = Uint32(cute.arch.make_warp_uniform(taddr))
                 if warp == W_PV:
                     self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
@@ -1265,11 +1270,20 @@ class SparseMlaDecodeTS:
                 # per 128-key tile: S(u0) (its owner's max pass), S(u1), S(u0) again
                 for k in range((subs + 1) // 2):
                     u0 = u + 2 * k
-                    if 2 * k + 1 < subs:
-                        seq = self.qk_own(base, lane, taddr, u0, qi, False, cta, seq, tt)
-                        seq = self.qk_own(base, lane, taddr, u0 + 1, qi, False, cta, seq, tt)
-                    seq = self.qk_own(base, lane, taddr, u0, qi, 2 * k + 2 >= subs, cta, seq,
-                                      tt)
+                    if cutlass.const_expr(self.own >= 2):
+                        if 2 * k + 1 < subs:
+                            seq = self.qk_own(base, lane, taddr, u0, qi, False, cta, seq, tt)
+                            seq = self.qk_own(base, lane, taddr, u0 + 1, qi, 2 * k + 2 >= subs,
+                                              cta, seq, tt)
+                        else:
+                            seq = self.qk_own(base, lane, taddr, u0, qi, True, cta, seq, tt)
+                    else:
+                        if 2 * k + 1 < subs:
+                            seq = self.qk_own(base, lane, taddr, u0, qi, False, cta, seq, tt)
+                            seq = self.qk_own(base, lane, taddr, u0 + 1, qi, False, cta, seq,
+                                              tt)
+                        seq = self.qk_own(base, lane, taddr, u0, qi, 2 * k + 2 >= subs, cta,
+                                          seq, tt)
                     tt = tt + 1
                 u = u + subs
             else:
@@ -1406,6 +1420,7 @@ class SparseMlaDecodeTS:
         real = h < H
         real_m = h < (0 if self.no_math else H)
         xv = cute.make_rmem_tensor((64,), Float32)
+        xv0 = cute.make_rmem_tensor((64 if self.own >= 2 else 1,), Float32)
         u = Int32(0)
         tt = Int32(0)  # own knob: 128-key tiles so far (owner WG tt % 2)
         seq = Int32(0)  # own knob: S-buffer uses so far (3 per two-subtile tile)
@@ -1424,11 +1439,11 @@ class SparseMlaDecodeTS:
                     full = 2 * k + 1 < subs
                     if tt % 2 == wg:
                         mp_last, lw, cw = self.tile_own(base, warp, lane, wg, sp, h,
-                                                        lane_addr, real_m, xv, scale_log2,
-                                                        u + 2 * k, k, n, subs, seq, tt,
-                                                        mp_last, lw, cw)
+                                                        lane_addr, real_m, xv, xv0,
+                                                        scale_log2, u + 2 * k, k, n, subs,
+                                                        seq, tt, mp_last, lw, cw)
                     if full:
-                        seq = seq + 3
+                        seq = seq + (2 if self.own >= 2 else 3)
                     else:
                         seq = seq + 1
                     tt = tt + 1
@@ -1485,8 +1500,8 @@ class SparseMlaDecodeTS:
                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
 
     @cute.jit
-    def tile_own(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u0, k,
-                 n, subs, seq, tt, mp_last, lw, cw):
+    def tile_own(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, xv0, scale_log2,
+                 u0, k, n, subs, seq, tt, mp_last, lw, cw):
         """own knob: 128-key tile k of its token (subtiles u0 and u0 + 1, or u0 alone as
         the token's last tile) on WG tt % 2. S-buffer uses: seq = S(u0) max pass, seq + 1
         = S(u0 + 1), seq + 2 = S(u0) again (one-subtile tile: seq = S(u0)). The running
@@ -1507,6 +1522,9 @@ class SparseMlaDecodeTS:
             tc_fence_after()
             sm0 = tmem_ld_max64(s_addr)
             m0 = sm0[64]
+            if cutlass.const_expr(self.own >= 2):
+                for j in cutlass.range_constexpr(64):
+                    xv0[j] = sm0[j]
             tc_fence_before()
             cute.arch.sync_warp()
             if lane == 0:
@@ -1582,7 +1600,11 @@ class SparseMlaDecodeTS:
         anyg = bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow))
         lw = self.p_own(base, h, real_m, xv, scale_log2, mp, ux, lw)
         self.ss(base, cta, lane, u0, 8 * wg + 4, 1)  # P(u1) stored
-        if full:
+        if cutlass.const_expr(self.own >= 2):
+            if full:
+                lw = self.p_own(base, h, real_m, xv0, scale_log2, mp, u0, lw)
+        else:
+          if full:
             # S(u0) again right away: the S buffer goes to the next tile's WG before this
             # tile's P(u0) and O^T rescale
             sb = seq + 2
