@@ -240,6 +240,8 @@ CPP = "void topk_v2_launch(torch::Tensor& vals, torch::Tensor& ids, const torch:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=16384)
+    ap.add_argument("--clean", action="store_true", help="no NaN / -inf rows")
+    ap.add_argument("--only", default="", help="comma list of distributions")
     a = ap.parse_args()
     mod = load_inline("probe_router_topk_v2", CPP, SRC, functions=["topk_v2_launch"],
                       extra_cuda_cflags=["-O3"], verbose=False)
@@ -281,8 +283,11 @@ def main():
             bias[torch.arange(E, device=dev) % 224 < 56] = 0.0
         else:
             bias = torch.randn(E, device=dev) * bstd
-        sc[0, 5] = float("nan")
-        sc[1, :] = float("-inf")
+        if a.only and name not in a.only.split(","):
+            continue
+        if not a.clean:
+            sc[0, 5] = float("nan")
+            sc[1, :] = float("-inf")
         v0, i0 = prefill_glue.router_topk(sc, bias, 16, True, 2.5)
         v2 = torch.empty_like(v0)
         i2 = torch.empty_like(i0)
