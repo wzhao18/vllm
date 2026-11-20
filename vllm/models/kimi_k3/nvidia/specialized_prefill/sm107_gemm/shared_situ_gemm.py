@@ -29,7 +29,7 @@ from .packed_situ_gemm import interleave_shared_rows, situ_constants
 
 # (tile, cluster, inst_m, swizzle, raster, split producer, swap, flags)
 # c2x4 m-raster mis-stores at M=4096 (N 3072/6144); c2x1 is bitwise at every tested shape.
-DEFAULT_TACTIC = ((512, 256), (2, 1), 256, 8, "n", 0, 0, "drain")
+DEFAULT_TACTIC = ((512, 256), (2, 1), 256, 8, "n", 0, 0, "drain+roll+st8")
 _COMPILED: dict = {}
 
 
@@ -114,6 +114,11 @@ class SharedSituGemm:
                 gemm = _Kernel(self.tactic, self.a_pow, self.clamp_up)
                 cl = self.tactic[1]
                 mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
+                for f in str(self.tactic[7]).split("+"):
+                    if f.startswith("mac"):
+                        # Persistent grid cap (clusters): leaves SMs to the
+                        # kernels that run beside it in the prefill step.
+                        mac = min(mac, int(f[3:]))
                 layouts = (
                     OperandMajorMode.K,
                     OperandMajorMode.K,
