@@ -134,6 +134,11 @@ def _now():
     return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
 
 
+@asm(Int64)
+def _clk():
+    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
+
+
 @asm()
 def _st_u64(address, value):
     return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
@@ -463,7 +468,8 @@ class WideGemm:
         # +0 epilogue start, +8 acc_full, +16 TMEM staged, +24 all splits published,
         # +32 peers' partials landed, +40 stored, +48 PDL wait done (activations),
         # +56 activations issued, +64 first full stage, +72 last full stage,
-        # +80 weights issued; K tile 8: +88 MMA loop top, +96 stages full, +104 issued.
+        # +80 weights issued; K tile 8: +88 MMA loop top, +96 stages full, +104 issued;
+        # MMA warp clock64 totals: +112 waiting for stages, +120 issuing MMAs + commits.
         stamp = mFlags.iterator.toint() + self.n_pad // 16 + (
             Int64(split_rank) * (self.n_pad // 128) + bidx) * STAMP_BYTES  # fmt: skip
         n_act, n_w = len(self.act_warps), len(self.weight_warps)
@@ -491,7 +497,9 @@ class WideGemm:
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
             if leader:
                 kblocks = cute.size(tCrA, mode=[2])
+                waited, issued = Int64(0), Int64(0)
                 for t in cutlass.range(k_count, unroll=1):
+                    c0 = _clk()
                     s, sb = t % wst, t % ast
                     if t == 8:
                         if lane == 0:
@@ -504,6 +512,7 @@ class WideGemm:
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 96, _now())
+                    c1 = _clk()
                     for c in cutlass.range_constexpr(chunks):
                         acc_c = acc[(None, None, None, c)]
                         for kb in cutlass.range_constexpr(kblocks):
@@ -516,8 +525,13 @@ class WideGemm:
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 104, _now())
+                    c2 = _clk()
+                    waited = waited + (c1 - c0)
+                    issued = issued + (c2 - c1)
                 if lane == 0:
                     _st_u64(stamp + 72, _now())
+                    _st_u64(stamp + 112, waited)
+                    _st_u64(stamp + 120, issued)
                 with cute.arch.elect_one():
                     tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
         elif warp >= 4:
