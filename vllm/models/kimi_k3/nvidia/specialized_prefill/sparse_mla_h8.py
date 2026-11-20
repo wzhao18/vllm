@@ -1498,10 +1498,12 @@ class SparseMlaPrefillH8:
             for i in range(subs):
                 s = u % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                self.ss(base, cta, lane, u, 7, 4)
                 if cutlass.const_expr(self.pvd):
                     if i + self.pvd < subs:
                         v = u + self.pvd
                         mbar_wait(_bar(base, B_QKI + v % 8), Uint32((v // 8) & 1))
+                self.ss(base, cta, lane, u, 15, 4)
                 mbar_wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
                 self.ss(base, cta, lane, u, 18, 4)
                 if cutlass.const_expr(self.cpa in (2, 3, 6)):
