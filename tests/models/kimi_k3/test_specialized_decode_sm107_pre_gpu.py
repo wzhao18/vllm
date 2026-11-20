@@ -60,10 +60,15 @@ def test_pre_bitwise_kda_in():
         out = torch.empty(r, N, device=DEVICE, dtype=torch.bfloat16)
         proj.run(x, out)
         assert torch.equal(out, scaled_mm(xq, xs, wq, sw)), r
-        tactic, _, _ = pre_tactic(N, K, r)
+        tactic = pre_tactic(N, K, r)[0]
         plain = Mxfp8PreGemm(N, K, r, tactic, use_pdl=False, prewait=0, device=DEVICE)
         again = torch.empty_like(out)
         plain(xq, xs, wq, sw, again)
+        assert torch.equal(again, out), r
+        paced = Mxfp8PreGemm(N, K, r, tactic, use_pdl=True, prewait=4, max_stages=5,
+                             quiet=True, pace=1440, device=DEVICE)  # fmt: skip
+        again.fill_(float("nan"))
+        paced(xq, xs, wq, sw, again)
         assert torch.equal(again, out), r
 
 
