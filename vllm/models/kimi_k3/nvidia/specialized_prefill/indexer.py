@@ -339,7 +339,8 @@ class IndexerScore:
         # epilogue math (benchmark calibration only): 0 full; 1 skeleton (TMEM loads,
         # stage release and publish of a value tied to the loads, no math);
         # 2 heads 0-15 only (half the math, all loads); 3 no TMEM loads (MMA path
-        # alone); 4 skeleton epilogue with the MMAs skipped (TMEM loads alone)
+        # alone); 4 skeleton epilogue with the MMAs skipped (TMEM loads alone);
+        # 6 full epilogue math with the MMAs skipped (TMEM loads + math alone)
         self.epi = epi
         self.tiler = (TILE, N, DIM)
 
@@ -668,7 +669,7 @@ class IndexerScore:
                     cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, stage)], s2t_a[2])
                     mma.set(tcgen05.Field.ACCUMULATE, False)
                     for kb in cutlass.range_constexpr(
-                        cute.size(tCrA, mode=[2]) if self.epi != 4 else 0
+                        cute.size(tCrA, mode=[2]) if self.epi not in (4, 6) else 0
                     ):
                         cute.gemm(
                             mma,
@@ -888,7 +889,7 @@ class IndexerScore:
             if cutlass.const_expr(st + 1 < ACC_STAGES):
                 cute.arch.mbarrier_wait(acc_full + st + 1, ph)
                 h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
-            if cutlass.const_expr(self.epi == 0):
+            if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
                 r = self.combine2(ss)
             elif cutlass.const_expr(self.epi == 2):

@@ -242,7 +242,7 @@ def perf_sel(args):
     res["publish"] = timed(lambda: pidx.score(
         d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
         sp.cand_base, cand.view(torch.bfloat16), rb0, mode=pidx.PUBLISH), args.iters)
-    for epi, name in ((1, "publish_skeleton"), (2, "publish_half_math"), (3, "publish_mma_only"), (4, "publish_ld_only")):
+    for epi, name in ((1, "publish_skeleton"), (2, "publish_half_math"), (3, "publish_mma_only"), (4, "publish_ld_only"), (6, "publish_math_no_mma")):
         rb2, cand2 = row_bin.clone(), cand.clone()
         res[name] = timed(lambda: pidx.score(
             d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
