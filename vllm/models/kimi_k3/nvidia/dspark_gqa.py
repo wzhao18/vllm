@@ -582,27 +582,6 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         result = self.model.combine(hidden_states, out=out)
         return result.squeeze(0) if needs_squeeze else result
 
-    def gather_aux_rows(
-        self, aux_hidden_states: list[torch.Tensor], index: torch.Tensor
-    ) -> list[torch.Tensor]:
-        """The DFlash window context rows ``[h[index] for h in aux]`` as adjacent
-        column blocks of one row-major buffer (the stock ``gather_aux_rows``
-        contract: the fc reads them without a concat), every aux layer in one
-        launch (``prefill_glue.gather_rows_multi``)."""
-        if not prefill_glue.use_gather_rows_multi(aux_hidden_states, index):
-            from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
-                gather_aux_rows,
-            )
-
-            _uncovered(aux_hidden_states[0], "aux row gather layout")
-            return gather_aux_rows(aux_hidden_states, index)
-        packed = prefill_glue.gather_rows_multi(aux_hidden_states, index)
-        width = aux_hidden_states[0].shape[1]
-        return [
-            packed[:, i * width : (i + 1) * width]
-            for i in range(len(aux_hidden_states))
-        ]
-
     def combine_aux_rows(
         self,
         aux_hidden_states: list[torch.Tensor],

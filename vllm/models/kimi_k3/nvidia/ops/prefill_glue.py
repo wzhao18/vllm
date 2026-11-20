@@ -741,40 +741,6 @@ __global__ void rope_store_kv_kernel(
 // One CTA per context row walks the layers; a SEG-lane segment owns one head
 // (lane j holds elements 8j..8j+7; the RoPE partner of lane j is lane j ^ SEG/2).
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// gather_rows_multi: dst[r, s*W:(s+1)*W] = src_s[index[r], :] for every source
-// s in ONE launch (the drafter's window rows of the target aux hidden states,
-// packed as adjacent column blocks for the fc GEMM). One 128-thread CTA per
-// (destination row, source) pair; every thread issues all its 16-byte loads
-// (up to kGatherVecs, row_vecs <= 128 * kGatherVecs) before its stores.
-// ---------------------------------------------------------------------------
-constexpr int kGatherMaxSrc = 8;
-constexpr int kGatherVecs = 8;
-struct GatherSrcs {
-  const uint4* src[kGatherMaxSrc];
-  int64_t stride[kGatherMaxSrc];  // in uint4
-};
-
-__global__ void __launch_bounds__(128) gather_rows_multi_kernel(
-    uint4* __restrict__ dst, int64_t dst_stride, const int64_t* __restrict__ index,
-    const GatherSrcs s, int row_vecs) {
-  const int64_t r = blockIdx.x;
-  const int q = blockIdx.y;
-  const uint4* src = s.src[q] + index[r] * s.stride[q];
-  uint4* d = dst + r * dst_stride + (int64_t)q * row_vecs;
-  uint4 v[kGatherVecs];
-#pragma unroll
-  for (int u = 0; u < kGatherVecs; ++u) {
-    const int e = threadIdx.x + u * 128;
-    if (e < row_vecs) v[u] = __ldg(src + e);
-  }
-#pragma unroll
-  for (int u = 0; u < kGatherVecs; ++u) {
-    const int e = threadIdx.x + u * 128;
-    if (e < row_vecs) d[e] = v[u];
-  }
-}
-
 constexpr int kCtxKvMaxLayers = 8;
 struct CtxKvLayers {
   const uint16_t* knorm_w[kCtxKvMaxLayers];
@@ -1149,40 +1115,6 @@ void rope_store_kv(const torch::Tensor& k, const torch::Tensor& v,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void gather_rows_multi(torch::Tensor& dst, const torch::Tensor& index,
-                       const std::vector<torch::Tensor>& srcs) {
-  // dst [n, nsrc * W] (row stride dst.stride(0)), srcs nsrc x [T, W] (any row
-  // stride), index [n] int64 rows of the sources.
-  const int nsrc = (int)srcs.size();
-  TORCH_CHECK(nsrc > 0 && nsrc <= kGatherMaxSrc && index.dim() == 1 &&
-              index.scalar_type() == at::kLong && index.is_contiguous() &&
-              dst.dim() == 2 && dst.stride(1) == 1);
-  const int64_t n = index.numel();
-  TORCH_CHECK(dst.size(0) == n && n < (1LL << 31));
-  const int64_t es = dst.element_size();
-  const int64_t width = srcs[0].size(1);
-  TORCH_CHECK(dst.size(1) == width * nsrc && (width * es) % 16 == 0 &&
-              (dst.stride(0) * es) % 16 == 0 &&
-              reinterpret_cast<uintptr_t>(dst.data_ptr()) % 16 == 0);
-  GatherSrcs s{};
-  for (int q = 0; q < nsrc; ++q) {
-    const torch::Tensor& t = srcs[q];
-    TORCH_CHECK(t.dim() == 2 && t.size(1) == width && t.stride(1) == 1 &&
-                t.scalar_type() == dst.scalar_type() &&
-                (t.stride(0) * es) % 16 == 0 &&
-                reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0);
-    s.src[q] = reinterpret_cast<const uint4*>(t.data_ptr());
-    s.stride[q] = t.stride(0) * es / 16;
-  }
-  TORCH_CHECK(width * es / 16 <= 128 * kGatherVecs);
-  if (n == 0) return;
-  auto stream = c10::cuda::getCurrentCUDAStream();
-  gather_rows_multi_kernel<<<dim3((unsigned)n, (unsigned)nsrc), 128, 0, stream>>>(
-      reinterpret_cast<uint4*>(dst.data_ptr()), dst.stride(0) * es / 16,
-      index.data_ptr<int64_t>(), s, (int)(width * es / 16));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 void ctx_kv_insert(const torch::Tensor& kv, const std::vector<torch::Tensor>& knorm_w,
                    double epsilon, const torch::Tensor& positions,
                    const torch::Tensor& cos_sin,
@@ -1265,8 +1197,6 @@ void ctx_kv_insert(const torch::Tensor& kv, const std::vector<torch::Tensor>& kn
                    const std::vector<torch::Tensor>& slots,
                    const std::vector<torch::Tensor>& key_caches,
                    const std::vector<torch::Tensor>& value_caches);
-void gather_rows_multi(torch::Tensor& dst, const torch::Tensor& index,
-                       const std::vector<torch::Tensor>& srcs);
 """
 
 _lock = threading.Lock()
@@ -1301,7 +1231,6 @@ def _module():
                     "scatter_rows",
                     "rope_store_kv",
                     "ctx_kv_insert",
-                    "gather_rows_multi",
                 ],
                 extra_cuda_cflags=["-O3"],
                 build_directory=build,
@@ -1560,46 +1489,6 @@ def rope_store_kv(
 
 
 CTX_KV_MAX_LAYERS = 8
-GATHER_MAX_SOURCES = 8
-GATHER_MAX_ROW_VECS = 128 * 8  # kGatherVecs 16-byte vectors per thread
-
-
-def use_gather_rows_multi(srcs: list[torch.Tensor], index: torch.Tensor) -> bool:
-    """Whether :func:`gather_rows_multi` covers these sources: 2-D same-dtype
-    same-width tensors (any 16-byte aligned row stride) and an int64 index."""
-    if not srcs or len(srcs) > GATHER_MAX_SOURCES:
-        return False
-    h0 = srcs[0]
-    es = h0.element_size()
-    return (
-        index.dim() == 1
-        and index.dtype == torch.int64
-        and index.is_contiguous()
-        and index.is_cuda
-        and index.numel() < 2**31
-        and all(
-            h.dim() == 2
-            and h.dtype == h0.dtype
-            and h.device == index.device
-            and h.shape[1] == h0.shape[1]
-            and h.stride(1) == 1
-            and (h.stride(0) * es) % 16 == 0
-            and h.data_ptr() % 16 == 0
-            for h in srcs
-        )
-        and (h0.shape[1] * es) % 16 == 0
-        and h0.shape[1] * es // 16 <= GATHER_MAX_ROW_VECS
-    )
-
-
-def gather_rows_multi(srcs: list[torch.Tensor], index: torch.Tensor) -> torch.Tensor:
-    """``torch.cat([h[index] for h in srcs], dim=-1)`` in one launch (one
-    [len(index), len(srcs) * W] row-major buffer). Callers check
-    :func:`use_gather_rows_multi`."""
-    h0 = srcs[0]
-    out = h0.new_empty((index.numel(), len(srcs) * h0.shape[1]))
-    _module().gather_rows_multi(out, index, list(srcs))
-    return out
 
 
 def use_ctx_kv_insert(
