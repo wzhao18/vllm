@@ -3304,8 +3304,9 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   cfg.blockDim = dim3(wide ? 1024 : kV2T, 1, 1);
   cfg.dynamicSmemBytes = kV2Dyn;
   cfg.stream = c10::cuda::getCurrentCUDAStream();
-  // PDL: the prologue (barrier init) overlaps the logits kernel; the kernel never
-  // releases its dependents early (they start at its completion).
+  // PDL: the prologue (barrier init) overlaps the logits kernel; the kernel releases
+  // its one dependent, topk_v2_redo_kernel, at its start (the redo grid waits for its
+  // completion in griddepcontrol.wait).
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;

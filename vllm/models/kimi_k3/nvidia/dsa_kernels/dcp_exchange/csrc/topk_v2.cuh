@@ -1640,6 +1640,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 template <int T>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE(T)
+  // Release topk_v2_redo_kernel now: its small grid becomes resident on the SMs this
+  // grid leaves free and waits in its own griddepcontrol.wait (which returns only at
+  // this grid's completion with its writes visible), so its launch and prologue leave
+  // the step's critical path. The whole grid is co-resident (launch: grid <= resident).
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true, T>(p, sm, row, -1, bar_phase);
     if (threadIdx.x == 0) p.redo[row] = r;
