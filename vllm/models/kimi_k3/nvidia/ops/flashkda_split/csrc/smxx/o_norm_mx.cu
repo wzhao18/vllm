@@ -183,6 +183,19 @@ __device__ __forceinline__ float sumsq16(const uint32_t* w) {
   return s;
 }
 
+// sumsq16 on unpacked FP32 values (lo l[i], hi h[i] of word i): the same
+// FMA chain and order, so the consumer unpacks each O word once.
+__device__ __forceinline__ float sumsq16f(const float* l, const float* h) {
+  float s;
+  asm("{\n.reg .f32 s;\n"
+      "mul.rn.ftz.f32 s, %1, %1;\nfma.rn.ftz.f32 s, %9, %9, s;\nfma.rn.ftz.f32 s, %2, %2, s;\nfma.rn.ftz.f32 s, %10, %10, s;\nfma.rn.ftz.f32 s, %3, %3, s;\nfma.rn.ftz.f32 s, %11, %11, s;\nfma.rn.ftz.f32 s, %4, %4, s;\nfma.rn.ftz.f32 s, %12, %12, s;\nfma.rn.ftz.f32 s, %5, %5, s;\nfma.rn.ftz.f32 s, %13, %13, s;\nfma.rn.ftz.f32 s, %6, %6, s;\nfma.rn.ftz.f32 s, %14, %14, s;\nfma.rn.ftz.f32 s, %7, %7, s;\nfma.rn.ftz.f32 s, %15, %15, s;\nfma.rn.ftz.f32 s, %8, %8, s;\nfma.rn.ftz.f32 s, %16, %16, s;\n"
+      "mov.f32 %0, s;\n}"
+      : "=f"(s)
+      : "f"(l[0]), "f"(l[1]), "f"(l[2]), "f"(l[3]), "f"(l[4]), "f"(l[5]), "f"(l[6]), "f"(l[7]),
+        "f"(h[0]), "f"(h[1]), "f"(h[2]), "f"(h[3]), "f"(h[4]), "f"(h[5]), "f"(h[6]), "f"(h[7]));
+  return s;
+}
+
 __device__ __forceinline__ float ss_bfly(float a, float b) {
   float r;
   asm volatile(
@@ -249,6 +262,43 @@ __device__ __forceinline__ uint32_t pair(uint32_t x, uint32_t g, uint32_t& amax,
     asm(PAIR_HEAD PAIR_TAIL
         : "=r"(y), "=r"(am)
         : "r"(x), "r"(g), "r"(amax), "f"(rstd), "f"(w0), "f"(w1));
+  }
+  amax = am;
+  return y;
+}
+
+#define PAIRF_HEAD                                                             \
+  "{\n.reg .b32 gl, gh, yp, ya;\n"                                              \
+  ".reg .b64 X, G, E, Dd, V, W, S, R, CN, C1;\n"                                 \
+  ".reg .f32 t0, t1, e0, e1, d0, d1, r0, r1, v0, v1, dm, cn, c1;\n"              \
+  ".reg .pred p;\n"                                                              \
+  "mov.f32 cn, 0fBFB8AA3B;\nmov.f32 c1, 0f3F800000;\n"                          \
+  "mov.b64 CN, {cn, cn};\nmov.b64 C1, {c1, c1};\n"                              \
+  "shl.b32 gl, %3, 16;\nand.b32 gh, %3, -65536;\n"                              \
+  "mov.b64 G, {gl, gh};\nmul.rn.ftz.f32x2 G, G, CN;\nmov.b64 {t0, t1}, G;\n"   \
+  "ex2.approx.ftz.f32 e0, t0;\nex2.approx.ftz.f32 e1, t1;\n"                    \
+  "mov.b64 E, {e0, e1};\nadd.rn.ftz.f32x2 Dd, C1, E;\nmov.b64 {d0, d1}, Dd;\n" \
+  "rcp.approx.ftz.f32 r0, d0;\nrcp.approx.ftz.f32 r1, d1;\n"
+#define PAIRF_TAIL                                                             \
+  "mov.b64 X, {%2, %8};\nmov.b64 R, {%5, %5};\nmul.rn.ftz.f32x2 V, X, R;\n"    \
+  "mov.b64 W, {%6, %7};\nmul.rn.ftz.f32x2 V, V, W;\n"                           \
+  "mov.b64 S, {r0, r1};\nmul.rn.ftz.f32x2 V, V, S;\n"                           \
+  "mov.b64 {v0, v1}, V;\ncvt.rn.bf16x2.f32 yp, v1, v0;\n"                       \
+  "and.b32 ya, yp, 2147450879;\nmax.bf16x2 %1, %4, ya;\nmov.b32 %0, yp;\n}"
+
+// pair() with the O word already unpacked to FP32 (xl = lo, xh = hi).
+template <bool kSlow>
+__device__ __forceinline__ uint32_t pair_f(float xl, float xh, uint32_t g, uint32_t& amax,
+                                           float rstd, float w0, float w1) {
+  uint32_t y, am;
+  if constexpr (kSlow) {
+    asm(PAIRF_HEAD PAIR_SLOW PAIRF_TAIL
+        : "=r"(y), "=r"(am)
+        : "f"(xl), "r"(g), "r"(amax), "f"(rstd), "f"(w0), "f"(w1), "f"(xh));
+  } else {
+    asm(PAIRF_HEAD PAIRF_TAIL
+        : "=r"(y), "=r"(am)
+        : "f"(xl), "r"(g), "r"(amax), "f"(rstd), "f"(w0), "f"(w1), "f"(xh));
   }
   amax = am;
   return y;
@@ -393,7 +443,13 @@ __global__ void __launch_bounds__(32 * (kConsumerWarps + 1), 1) o_norm_tma_kerne
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(smem_u32(&empty[s]));
-    float sa = sumsq16(xw), sb = sumsq16(xw + 8);
+    float xl[16], xh[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      xl[k] = __uint_as_float(xw[k] << 16);
+      xh[k] = __uint_as_float(xw[k] & 0xffff0000u);
+    }
+    float sa = sumsq16f(xl, xh), sb = sumsq16f(xl + 8, xh + 8);
     float ss;
     asm volatile(
         "{\n.reg .f32 s, t;\nadd.rn.ftz.f32 s, %1, %2;\n"
@@ -406,13 +462,13 @@ __global__ void __launch_bounds__(32 * (kConsumerWarps + 1), 1) o_norm_tma_kerne
 #pragma unroll
       for (int k = 0; k < 16; ++k) {
         const float2 w2 = *reinterpret_cast<const float2*>(wq + 2 * k);
-        y[k] = pair<false>(xw[k], gw[k], amax, rstd, w2.x, w2.y);
+        y[k] = pair_f<false>(xl[k], xh[k], gw[k], amax, rstd, w2.x, w2.y);
       }
     } else {
 #pragma unroll
       for (int k = 0; k < 16; ++k) {
         const float2 w2 = *reinterpret_cast<const float2*>(wq + 2 * k);
-        y[k] = pair<true>(xw[k], gw[k], amax, rstd, w2.x, w2.y);
+        y[k] = pair_f<true>(xl[k], xh[k], gw[k], amax, rstd, w2.x, w2.y);
       }
     }
     float inv;
