@@ -1187,10 +1187,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
-            if k_tile_idx + 1 < k_tile_count:
-                _dms_c1 = read_clock64()
-                empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
-                _dms_w = _dms_w + (read_clock64() - _dms_c1)
             cute.copy(
                 _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask),
                 global_a_slice[(None, k_tile_idx)],
@@ -1201,6 +1197,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 global_sfa_slice[(None, k_tile_idx)],
                 partitioned_smem_sfa[(None, stage_index)],
             )
+            if k_tile_idx + 1 < k_tile_count:
+                _dms_c1 = read_clock64()
+                empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
+                _dms_w = _dms_w + (read_clock64() - _dms_c1)
         DG.put_val_dyn(
             Int32(DG.S_TAW0) + (self._dms_cur & Int32(15)),
             ((read_clock64() - _dms_c00) << Int64(32)) | _dms_w,
@@ -1448,8 +1448,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     # The stage is acquired and its expectation registered; now release the Gather-B warps.
                     barrier_sync_unaligned(self.fc1_gather_sync_barrier_id, 32 * (1 + self.num_gather_b_warps))
             ab_pipeline_state.advance()
-            if k_tile_idx + 1 < k_tile_count:
-                empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
             if cutlass.const_expr(is_fc1 is None):
                 cute.copy(
                     _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask),
@@ -1468,6 +1466,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 global_sfb_slice[(None, k_tile_idx)],
                 partitioned_smem_sfb[(None, stage_index)],
             )
+            if k_tile_idx + 1 < k_tile_count:
+                empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         return ab_pipeline_state
 
     @cute.jit
@@ -1872,8 +1872,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         use_n128_sfb_mapping = self._mma_use_n128_sfb_mapping(quant_kind, work_tile)
         valid_tokens_in_cta_tile = (Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile)
         if use_n128_sfb_mapping:
-            next_ab_pipeline_state = ab_pipeline_state.clone()
-            next_ab_pipeline_state.advance()
             full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
             _dms_w = Int64(0)
             for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -1883,10 +1881,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 if k_tile_idx == Int32(0):
                     DG.put_gt_dyn(Int32(DG.S_MMF0) + _dms_slot, _dms_p)
                 _dms_w = _dms_w + (_dms_c1 - _dms_c0) * Int64(Int32(k_tile_idx > Int32(0)))
-                next_full_status = cutlass.Boolean(1)
-                if k_tile_idx + 1 < k_tile_count:
-                    next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
-                _dms_w = _dms_w + (read_clock64() - _dms_c1)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
@@ -1925,12 +1919,12 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
-                next_ab_pipeline_state.advance()
-                full_status = next_full_status
+                if k_tile_idx + 1 < k_tile_count:
+                    _dms_c2 = read_clock64()
+                    full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
+                    _dms_w = _dms_w + (read_clock64() - _dms_c2)
             DG.put_val_dyn(Int32(DG.S_MMC0) + _dms_slot, ((read_clock64() - _dms_c00) << Int64(40)) | (_dms_w << Int64(20)), _dms_p)
         else:
-            next_ab_pipeline_state = ab_pipeline_state.clone()
-            next_ab_pipeline_state.advance()
             full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
             _dms_w = Int64(0)
             for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -1940,10 +1934,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 if k_tile_idx == Int32(0):
                     DG.put_gt_dyn(Int32(DG.S_MMF0) + _dms_slot, _dms_p)
                 _dms_w = _dms_w + (_dms_c1 - _dms_c0) * Int64(Int32(k_tile_idx > Int32(0)))
-                next_full_status = cutlass.Boolean(1)
-                if k_tile_idx + 1 < k_tile_count:
-                    next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
-                _dms_w = _dms_w + (read_clock64() - _dms_c1)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
@@ -1967,8 +1957,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
-                next_ab_pipeline_state.advance()
-                full_status = next_full_status
+                if k_tile_idx + 1 < k_tile_count:
+                    _dms_c2 = read_clock64()
+                    full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
+                    _dms_w = _dms_w + (read_clock64() - _dms_c2)
             DG.put_val_dyn(Int32(DG.S_MMC0) + _dms_slot, ((read_clock64() - _dms_c00) << Int64(40)) | (_dms_w << Int64(20)), _dms_p)
         return ab_pipeline_state, token_pipeline_state
 
