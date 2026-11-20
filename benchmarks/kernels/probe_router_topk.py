@@ -252,14 +252,22 @@ def main():
     def bench(fn, iters=50):
         for _ in range(5):
             fn()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(iters):
+                fn()
+        g.replay()
+        torch.cuda.synchronize()
         s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
-        s.record()
-        for _ in range(iters):
-            fn()
-        e.record()
-        torch.cuda.synchronize()
-        return s.elapsed_time(e) * 1e3 / iters
+        ts = []
+        for _ in range(5):
+            s.record()
+            g.replay()
+            e.record()
+            torch.cuda.synchronize()
+            ts.append(s.elapsed_time(e) * 1e3 / iters)
+        return sorted(ts)[2]
 
     torch.manual_seed(0)
     for name, std, bstd in [("n1", 1.0, 0.0), ("n3b", 3.0, 0.02), ("n12sat", 12.0, 0.0),
