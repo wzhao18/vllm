@@ -66,7 +66,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", default="128,256,384")
     ap.add_argument("--iters", type=int, default=30)
-    ap.add_argument("--splits", default="auto", help="row-tile splits, e.g. auto,1")
     ap.add_argument("--ncu", action="store_true", help="one call per R (for ncu)")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_uk import query_uk
@@ -75,16 +74,12 @@ def main():
     dev = torch.device("cuda")
     flush = torch.empty(1 << 30, dtype=torch.uint8, device=dev)
     res = {}
-    for rows, sp in [(int(r), x) for r in args.rows.split(",")
-                     for x in args.splits.split(",")]:
-        split = None if sp == "auto" else int(sp)
-        if split and -(-rows // 128) % split:
-            continue
+    for rows in [int(r) for r in args.rows.split(",")]:
         q = (torch.randn(rows, G * QK, device=dev) * 2).to(torch.bfloat16)
         uk_t = (torch.randn(G, LAT, NOPE, device=dev) * 0.1).to(torch.bfloat16)
         scale = torch.tensor([0.02], device=dev)
         out = torch.zeros((rows, P, ROW), dtype=torch.float8_e4m3fn, device=dev)
-        fn = lambda: query_uk(q, uk_t, scale, out, split)  # noqa: E731
+        fn = lambda: query_uk(q, uk_t, scale, out)  # noqa: E731
         fn()
         torch.cuda.synchronize()
         if args.ncu:
@@ -98,11 +93,11 @@ def main():
         big = (diff[:, :, :LAT] > 1).sum().item()
         pe_bad = bad[:, :, LAT:].sum().item()
         pad_bad = (a[:, G:] != 0).sum().item()
-        res[f"{rows}/{sp}"] = dict(cold_us=round(cold(fn, flush, args.iters), 2),
+        res[rows] = dict(cold_us=round(cold(fn, flush, args.iters), 2),
                          warm_us=round(warm(fn), 2), latent_mismatch=lat_bad,
                          latent_gt1code=big, qpe_mismatch=pe_bad, pad_nonzero=pad_bad,
                          n=rows * G * ROW)
-        print(rows, sp, json.dumps(res[f"{rows}/{sp}"]), flush=True)
+        print(rows, json.dumps(res[rows]), flush=True)
     print("RESULT", json.dumps(res))
 
 
