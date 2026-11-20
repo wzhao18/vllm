@@ -46,8 +46,10 @@ MXFP8_BLOCK = 32
 RING_DEPTH = 2
 GROUPS = 4
 VEC = 8  # BF16 per lane chunk (4 warps per token group; 4 -> 8 warps)
-# Tokens a group claims ahead of the one it processes (> ring depth in rows).
-CLAIM_AHEAD = 5
+# Tokens a group claims ahead of the one it processes (> ring depth in rows):
+# the shortest run-ahead balances the call's end best (93-layer F16K
+# die-local sequence: 3 -> 25.38 ms, 5 -> 25.63 ms).
+CLAIM_AHEAD = 3
 PDL = 1
 _SRC = os.path.join(os.path.dirname(__file__), "attn_res_lp.cu")
 _lock = threading.Lock()

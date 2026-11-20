@@ -52,7 +52,7 @@ def main():
     p.add_argument("--dielocal", type=int, default=0)
     p.add_argument("--groups", default="4")
     p.add_argument("--vecs", default="8")
-    p.add_argument("--qa", default="5", help="claim run-ahead builds")
+    p.add_argument("--qa", default="3", help="claim run-ahead builds")
     p.add_argument("--pdl", default="1", help="PDL builds (1 production, 0 plain)")
     args = p.parse_args()
     from vllm import _custom_ops as ops

@@ -192,7 +192,7 @@ constexpr uint32_t SEG_BYTES = SEG * 2;
 // Token claim queue: positions claimed QA ahead of the consumer (>= the
 // producer's run-ahead of D rows), QN entries.
 #ifndef K31LP_QA
-#define K31LP_QA 5
+#define K31LP_QA 3
 #endif
 constexpr int QA = K31LP_QA;
 constexpr int QN = 8;

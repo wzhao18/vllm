@@ -52,11 +52,18 @@ def _ref64(prefix, delta, blocks, nb, w, onw):
     return acc
 
 
-@pytest.mark.parametrize("rows", [1500, 77])
-def test_attn_res_lp_sequence(rows):
+@pytest.mark.parametrize(
+    "rows,dielocal", [(1500, False), (77, False), (5000, True), (77, True)]
+)
+def test_attn_res_lp_sequence(rows, dielocal):
+    """``dielocal``: the production prefill path (die-local block / prefix
+    buffers, die-aware token claims, rotating die-local output buffers)."""
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
-    from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_lp
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+        attn_res_dielocal,
+        attn_res_lp,
+    )
 
     nl, bs = 7, 2
     calls = _calls(nl, bs)
@@ -75,9 +82,17 @@ def test_attn_res_lp_sequence(rows):
     attn_out = rn(rows, H)
 
     ref_blocks = torch.zeros(rows, nbt, H, device="cuda", dtype=torch.bfloat16)
-    lp_blocks = ref_blocks.clone()
+    if dielocal:
+        lp_blocks = attn_res_dielocal.block_residual(prefix0, nbt)
+        if lp_blocks is None:
+            pytest.skip("single-die device")
+        assert attn_res_dielocal.kernel_args(lp_blocks)[0] is not None
+        lp_blocks.zero_()
+    else:
+        lp_blocks = ref_blocks.clone()
     ref_prefix, lp_prefix = prefix0.clone(), prefix0.clone()
     attn_res_lp.begin(plan, lp_blocks)
+    prev = None  # (output tensor, its value) of the previous call
     for c in calls:
         if c["post"] and not c["delta"]:
             ref_prefix, lp_prefix = attn_out.clone(), attn_out.clone()
@@ -87,9 +102,20 @@ def test_attn_res_lp_sequence(rows):
                      nw[c["c"]].double() * qk[c["c"]].double(), o)
         ref = ops.kimi_k3_attn_res(ref_prefix, d, ref_blocks, nw[c["c"]],
                                    qk[c["c"]], o, c["nb"], c["widx"], EPS, EPS)
+        po = attn_res_dielocal.prefix_out(lp_prefix, lp_blocks)
+        assert po is None or dielocal
+        assert po is not None or not dielocal or c["c"] > 0
         out, qa = attn_res_lp.attn_res(lp_prefix, d, lp_blocks, c["c"], c["nb"],
-                                       c["widx"], o, EPS, True, c["quant"])
+                                       c["widx"], o, EPS, True, c["quant"],
+                                       prefix_out=po)
+        if po is not None:
+            lp_prefix = po
         torch.accelerator.synchronize()
+        # Rotating output buffers: the previous call's output must survive
+        # this call (its consumers run before the next-but-one call).
+        if prev is not None:
+            assert torch.equal(prev[0], prev[1]), c
+        prev = (out, out.clone())
         assert torch.equal(lp_prefix, ref_prefix), c
         assert torch.equal(lp_blocks, ref_blocks), c
         rms = r64.pow(2).mean(-1, keepdim=True).sqrt()
