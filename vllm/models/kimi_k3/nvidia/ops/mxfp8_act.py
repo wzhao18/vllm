@@ -797,7 +797,7 @@ void rms_norm_quant(torch::Tensor& q, torch::Tensor& sf,
 }
 
 // out[rows, d] = situ_and_mul(x[rows, 2d]) in BF16, MUFU-light SiTU (mode 4's
-// BF16 values); d % 32 == 0, d <= 32768.
+// BF16 values); d % 32 == 0.
 void situ_fast_bf16(torch::Tensor& out, const torch::Tensor& x, double beta,
                     double linear_beta) {
   check_bf16_rows(x, "x");
@@ -805,14 +805,14 @@ void situ_fast_bf16(torch::Tensor& out, const torch::Tensor& x, double beta,
   const int64_t rows = x.size(0);
   const int64_t d = x.size(1) / 2;
   TORCH_CHECK(x.size(1) == 2 * d && out.size(0) == rows && out.size(1) == d);
-  TORCH_CHECK(d % 32 == 0 && d <= 32768, "situ_fast_bf16: d % 32 == 0, d <= 32768");
+  TORCH_CHECK(d % 32 == 0, "situ_fast_bf16: d % 32 == 0");
   if (rows == 0) return;
   const bool clamp = linear_beta > 0.0;
   const float half = 0.5f * (float)beta;
   const int a_pow =
       (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
-  // Column chunks of at most 256 threads (32 columns each): whole-row CTAs of
-  // the 18432-wide dense SiTU (576 threads) leave SMs under-occupied.
+  // Column chunks of at most 256 threads (32 columns each): whole-row CTAs
+  // (the dense SiTU is 33792 wide) leave SMs under-occupied or exceed 1024.
   int threads = (int)(d / 32);
   for (int t = 256; t >= 1; --t)
     if ((d / 32) % t == 0) { threads = t; break; }
@@ -1011,7 +1011,7 @@ def situ_and_mul_quantize_fast(
 
 
 def situ_fast_bf16_supported(d: int) -> bool:
-    return d % 32 == 0 and d <= 32768
+    return d % 32 == 0
 
 
 def situ_and_mul_fast_bf16(

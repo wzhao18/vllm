@@ -37,7 +37,7 @@ def main():
     lbeta = cfg.get("situ_linear_beta", 25.0)
     print(json.dumps({"dense_intermediate": dense, "beta": beta, "linear_beta": lbeta,
                       "cfg_keys": [k for k in cfg if "situ" in k or "beta" in k]}))
-    for rows, d in ((16384, dense), (8192, dense), (16384, 6144)):
+    for rows, d in ((16384, 33792), (8192, 33792), (16384, dense)):
         x = (torch.randn(rows, 2 * d, device="cuda") * 4.0).to(torch.bfloat16)
         t_vec = timed(lambda: situ_and_mul(x, beta, lbeta))
         t_fast = timed(lambda: mxfp8_act.situ_and_mul_fast_bf16(x, beta, lbeta))

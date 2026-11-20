@@ -370,7 +370,7 @@ class KimiVecSituAndMul(nn.Module):
     forward_native instead, the large inputs keep the CUDA op's bits (the same FP32
     math, one BF16 rounding).
 
-    Prefill chunks (from ``_FAST_MIN_ROWS`` rows; the dense layer is 16K x 18432
+    Prefill chunks (from ``_FAST_MIN_ROWS`` rows; the dense layer is 16K x 33792
     at F16K) use the routed experts' MUFU-light SiTU form, as the shared experts'
     MXFP8 SiTU does at prefill (``mxfp8_act.SITU_FAST_MIN_ROWS``): the
     precise-tanhf kernel is FMA-issue bound at ~5x its HBM floor there, and the

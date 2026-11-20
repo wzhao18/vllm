@@ -102,7 +102,7 @@ def _ulp_dist(a, b):
 
 
 @pytest.mark.parametrize("beta,linear_beta", BETAS)
-@pytest.mark.parametrize("rows,d", [(4096, 1536), (257, 18432)])
+@pytest.mark.parametrize("rows,d", [(4096, 1536), (257, 18432), (130, 33792)])
 def test_situ_fast_bf16_is_mode4_values(beta, linear_beta, rows, d):
     """The BF16 fast form (prefill dense SiTU MLP) returns exactly the BF16
     values mode 4 quantizes, within BF16 noise of the precise form."""
