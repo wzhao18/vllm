@@ -517,9 +517,10 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         work_tile = make_fc12_done_tile(True)
         own = self._die
         if cutlass.const_expr(fc2 == 1):
-            shared_id, work_id_worker = self._claim_die_half(work_id_worker, own, 1)
-            if shared_id < Int32(0):
-                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own, 1)
+            # DIAG V2: one GPU-wide FC2 counter (die-blind) with the per-die plumbing (8 counters, _die)
+            shared_id = work_id_worker.claim_next_work(self._shared_stream_index + 2)
+            if shared_id >= Int32(self._shared_phase_tiles[1]):
+                shared_id = Int32(-1)
             if shared_id >= Int32(0):
                 work_tile = self._decode_shared_tile(shared_id, 1)
             else:
