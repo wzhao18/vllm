@@ -364,11 +364,6 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   // every output belong to this call's dependency chain: wait for the
   // preceding grid before touching any of them.
   asm volatile("griddepcontrol.wait;\n" ::: "memory");
-  // Every CTA of this persistent grid is resident: let the next grid in the
-  // stream launch now. Its CTAs take the SMs this grid's CTAs leave during
-  // the end of the call (launch + prologue under the tail); its own
-  // griddepcontrol.wait still orders it after this grid's completion.
-  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
   if (tid == 0) {
     const int j = atomicAdd(&a.claim[die], qa);  // first qa positions at once
