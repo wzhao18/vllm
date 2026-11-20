@@ -198,6 +198,12 @@ def parse_args():
         default=None,
         help="fused shared FC2 placement (default: the session's)",
     )
+    p.add_argument(
+        "--shared-fc2-ksplit",
+        type=int,
+        default=None,
+        help="fused shared FC2 K slices per tile on the gen-phase kernel (default: the session's)",
+    )
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int32")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50, help="timed samples per metric")
@@ -631,6 +637,10 @@ def main():
             from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as rubin_session
 
             rubin_session.RUBIN_FUSED_SHARED_L2_POSITION = args.shared_l2_position
+        if args.shared_fc2_ksplit is not None:
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import session as rubin_session
+
+            rubin_session.RUBIN_FUSED_SHARED_FC2_KSPLIT = args.shared_fc2_ksplit
         buckets = [dataclasses.replace(b, shared=shared_shape) for b in buckets]
     bucket_of = {b.max_tokens: b for b in buckets}
     if rank == 0:

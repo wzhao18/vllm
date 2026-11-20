@@ -49,6 +49,9 @@ from .....helpers.dsl_helpers import ReadyFlag, wait_ready
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
 from ......common.ptx_helpers import (
+    atom_add_acq_rel_gpu_s32,
+    ldg_cg_v4_b32,
+    stg_v4_b32,
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cvt_f32_to_fp8_to_f32,
@@ -922,6 +925,31 @@ class GatedActEpilogueArgs:
 
 
 @dataclasses.dataclass(frozen=True)
+class SharedFc2SplitK:
+    """Split-K shared FC2 (``shared_fc2_ksplit``): every FC2 tile runs as ``ksplit`` K slices on different CTAs.
+
+    Each slice's epilogue warp stores its FP32 accumulator fragment (as loaded from TMEM, so no layout change)
+    into ``partials`` and counts itself in its (tile, warp) slot of ``counters``; the warp that completes the
+    count sums the ``ksplit`` fragments in slice order 0, 1, ... and stores the BF16 rows: FP32 accumulation and
+    one BF16 rounding as the unsplit tile, only the FP32 summation order differs. ``counters`` is tail-reset.
+    """
+
+    ksplit: int
+    m_tiles: int  # shared FC2 CTA tiles along the output features (the slot stride of a token block)
+    subtiles: int  # epilogue token subtiles per CTA tile
+    partials: cute.Tensor  # Int32 words, (slot, slice, subtile, warp, chunk 16, lane 32, word 4) flattened
+    counters: cute.Tensor  # Int32, (slot, warp) flattened
+
+    # 16 chunks of 4 words = the 64 FP32 accumulator registers of one warp's 32-hidden x 64-token subtile.
+    chunks: ClassVar[int] = 16
+    warps: ClassVar[int] = 4
+
+    @classmethod
+    def partial_words(cls, *, ksplit: int, slots: int, subtiles: int) -> int:
+        return slots * ksplit * subtiles * cls.warps * cls.chunks * 32 * 4
+
+
+@dataclasses.dataclass(frozen=True)
 class SharedEpilogueBindings:
     """The shared expert's epilogue: a second host instance (``base``) plus its device views and scalars."""
 
@@ -935,6 +963,7 @@ class SharedEpilogueBindings:
     epi_args: GatedActEpilogueArgs
     tma_atom_fc2_output: Optional[cute.CopyAtom] = None  # set when the shared FC2 takes the TMA store
     fc2_tma_output: Optional[cute.Tensor] = None  # token-major (token, N_s, 1) view for that store
+    fc2_split: Optional[SharedFc2SplitK] = None  # split-K shared FC2 (gen-phase decode)
 
     def __post_init__(self) -> None:
         if self.base.communication_enabled:
@@ -1486,6 +1515,7 @@ class SwapABGatedActEpilogue(KernelComponent):
                     None,
                     None,
                     shared.epi_args,
+                    split_k=shared.fc2_split,
                 )
             }
         fc1_epi = SwapABFc1Epilogue(
@@ -2654,9 +2684,12 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: GatedActEpilogueArgs,
         shared_target: Optional["SwapABFc2Epilogue"] = None,
+        split_k: Optional[SharedFc2SplitK] = None,
     ):
         self.base = base
         self.shared_target = shared_target
+        # Split-K shared FC2 target only (``_run_tile_split_k``).
+        self.split_k = split_k
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         # The epilogue warpgroup of this thread; a constant 0 with one warpgroup.
         self.warpgroup_idx = (
@@ -2793,11 +2826,108 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             self._run_tile(work_tile_info, tmem_acc_tensor, acc_pipeline, acc_consumer_state)
         else:
             if work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear2):
-                self.shared_target._run_tile(work_tile_info, tmem_acc_tensor, acc_pipeline, acc_consumer_state)
+                if cutlass.const_expr(self.shared_target.split_k is not None):
+                    self.shared_target._run_tile_split_k(
+                        work_tile_info, tmem_acc_tensor, acc_pipeline, acc_consumer_state
+                    )
+                else:
+                    self.shared_target._run_tile(work_tile_info, tmem_acc_tensor, acc_pipeline, acc_consumer_state)
             else:
                 self._run_tile(work_tile_info, tmem_acc_tensor, acc_pipeline, acc_consumer_state)
         cute.arch.fence_view_async_tmem_load()
         acc_pipeline.consumer_release(acc_consumer_state)
+
+    @cute.jit
+    def _run_tile_split_k(
+        self, work_tile_info: SwapAbFc12WorkTileInfo, tmem_acc_tensor: cute.Tensor, acc_pipeline, acc_consumer_state
+    ):
+        """One K slice of a split-K shared FC2 tile (``SharedFc2SplitK``). Every epilogue warp works on its own
+        32 hidden rows: it stores its FP32 fragments, counts itself in its (tile, warp) slot, and the warp that
+        completes the count sums the slices in slice order and stores the BF16 rows (no CTA barrier, no TMA)."""
+        split = self.split_k
+        acc_ready = False
+        if not work_tile_info.peek_ready:
+            acc_ready = True
+            acc_pipeline.consumer_wait(acc_consumer_state)
+        fc2_output_router = self._make_output_router(work_tile_info)
+        tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
+            tmem_acc_tensor, (self._EpilogueFc2HiddenTileSize, self._EpilogueTokenTileSize)
+        )[None, None, 0, None]
+        acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        lane = self.lane_idx
+        warp = self.warp_idx
+        slot = work_tile_info.tile_n_idx * cutlass.Int32(split.m_tiles) + work_tile_info.tile_m_idx
+        warp_words = SharedFc2SplitK.chunks * 32 * 4
+        lane_word = lane * cutlass.Int32(4)
+
+        # 1. This slice's FP32 fragments, chunk-major so a warp's 16-byte stores are contiguous.
+        own_slice = slot * cutlass.Int32(split.ksplit) + work_tile_info.k_slice
+        for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
+            if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
+                top, bottom = fc2_stg_tmem_acc_load(
+                    tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[None, None, subtile_idx]
+                )
+                frag = ((own_slice * cutlass.Int32(split.subtiles) + subtile_idx) * cutlass.Int32(4) + warp) * (
+                    cutlass.Int32(warp_words)
+                ) + lane_word
+                for chunk in cutlass.range_constexpr(SharedFc2SplitK.chunks):
+                    regs = top if chunk < SharedFc2SplitK.chunks // 2 else bottom
+                    first = (chunk % (SharedFc2SplitK.chunks // 2)) * 4
+                    words = cute.recast_tensor(regs, cutlass.Int32)
+                    stg_v4_b32(
+                        (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint(),
+                        words[first],
+                        words[first + 1],
+                        words[first + 2],
+                        words[first + 3],
+                    )
+
+        # 2. Count this warp's slice (release); the completing warp acquires the other slices' fragments.
+        cute.arch.sync_warp()
+        arrived = cutlass.Int32(0)
+        if lane == cutlass.Int32(0):
+            arrived = atom_add_acq_rel_gpu_s32(
+                (split.counters.iterator + slot * cutlass.Int32(4) + warp).toint(), cutlass.Int32(1)
+            )
+        arrived = cute.arch.shuffle_sync(arrived, 0)
+        cute.arch.sync_warp()
+
+        # 3. The completing warp: sum slices 0..ksplit-1 in order, one BF16 rounding, store its 32 hidden rows.
+        if arrived == cutlass.Int32(split.ksplit - 1):
+            for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
+                if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
+                    tmem_subtile = tmem_acc_tensor_tiled_by_epi_tile[None, None, subtile_idx]
+                    top = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    bottom = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    for k in cutlass.range_constexpr(split.ksplit):
+                        frag = (
+                            ((slot * cutlass.Int32(split.ksplit) + cutlass.Int32(k)) * cutlass.Int32(split.subtiles)
+                             + subtile_idx) * cutlass.Int32(4) + warp
+                        ) * cutlass.Int32(warp_words) + lane_word
+                        for chunk in cutlass.range_constexpr(SharedFc2SplitK.chunks):
+                            regs = top if chunk < SharedFc2SplitK.chunks // 2 else bottom
+                            first = (chunk % (SharedFc2SplitK.chunks // 2)) * 4
+                            words = ldg_cg_v4_b32(
+                                (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint()
+                            )
+                            loaded = cute.make_rmem_tensor((4,), cutlass.Int32)
+                            for i in cutlass.range_constexpr(4):
+                                loaded[i] = words[i]
+                            values = cute.recast_tensor(loaded, cutlass.Float32)
+                            for i in cutlass.range_constexpr(4):
+                                if cutlass.const_expr(k == 0):
+                                    regs[first + i] = values[i]
+                                else:
+                                    regs[first + i] = regs[first + i] + values[i]
+                    casted = fc2_f2fp(top, bottom, alpha_val=None, batch_invariant=self.batch_invariant)
+                    pre_store = fc2_stg_post_f2fp_reorder(casted=casted, tmem_subtile_view=tmem_subtile)
+                    fc2_stg_store_function(
+                        epi=self,
+                        subtile=pre_store,
+                        subtile_idx=subtile_idx,
+                        fc2_output_router=fc2_output_router,
+                    )
 
     @cute.jit
     def _run_tile(

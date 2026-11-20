@@ -3,7 +3,7 @@
 """Host-side shared-expert wiring common to the Rubin generation-phase and prefill MegaMoE kernels."""
 
 import dataclasses
-from typing import Optional, Tuple
+from typing import ClassVar, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -15,7 +15,12 @@ from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tme
 from .....helpers.device_workspace import DeviceWorkspace
 from ......common.utils import ceil_div, round_up
 from .....quant_def import SHARED_QUANT_KINDS, CombineFormat, QuantKind
-from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SharedEpilogueBindings, SwapABGatedActEpilogue
+from .block_scaled_swap_ab_fc12_epilogue import (
+    GatedActEpilogueArgs,
+    SharedEpilogueBindings,
+    SharedFc2SplitK,
+    SwapABGatedActEpilogue,
+)
 
 
 def shared_kernel_problem_requirements() -> dict:
@@ -42,6 +47,9 @@ def shared_kernel_impl_requirements() -> dict:
         # Shared FC1 L2 swizzle: walk the tiles G feature blocks at a time so fewer weight bytes are live (0: off,
         # unset: the kernel's default).
         "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        # Split-K shared FC2 (gen-phase decode): every FC2 tile runs as this many K slices whose FP32 partials the
+        # last-arriving slice sums in slice order (one BF16 rounding, as the unsplit tile).
+        "shared_fc2_ksplit": OptionalRequirement(Optional[int]),
     }
 
 
@@ -55,6 +63,12 @@ def _rank3_view(tensor: cute.Tensor, rows, cols, row_stride, col_stride) -> cute
 
 class SharedExpertKernelMixin:
     """Shared-expert binding for a MegaMoE kernel class that declares the three ``shared_*_region`` names."""
+
+    # Split-K shared FC2 (``shared_fc2_ksplit``): the FP32 slice fragments and the per-(tile, warp) slice counts.
+    shared_fc2_split_partial_region: ClassVar[str] = "rubin.shared_fc2_split.partials"
+    shared_fc2_split_counter_region: ClassVar[str] = "rubin.shared_fc2_split.counters"
+    # Kernels whose mainloop loads a K slice per shared FC2 tile (the gen-phase decode kernel) set this.
+    supports_shared_fc2_ksplit: ClassVar[bool] = False
 
     @staticmethod
     def check_shared_dims(shared: dict) -> None:
@@ -93,6 +107,7 @@ class SharedExpertKernelMixin:
         position = impl_desc.get("shared_l2_position")
         self.shared_work_id_mode = impl_desc.get("shared_work_id_mode")
         self.shared_fc1_swizzle = impl_desc.get("shared_fc1_swizzle")
+        self.shared_fc2_ksplit = int(impl_desc.get("shared_fc2_ksplit") or 1)
         self.reduce_shared_output = bool(problem_desc.get("reduce_shared_output", False))
         if not self.shared_expert:
             stray = [key for key, value in supplied.items() if value is not None]
@@ -104,6 +119,8 @@ class SharedExpertKernelMixin:
                 stray.append("shared_work_id_mode")
             if self.shared_fc1_swizzle is not None:
                 stray.append("shared_fc1_swizzle")
+            if self.shared_fc2_ksplit != 1:
+                stray.append("shared_fc2_ksplit")
             if stray:
                 raise ValueError(f"{', '.join(stray)} require shared_expert=True.")
             self.shared_quant_kind = None
@@ -213,6 +230,13 @@ class SharedExpertKernelMixin:
         )
         self.shared_epilogue = SwapABGatedActEpilogue(shared_epilogue_problem_desc, shared_epilogue_impl_desc)
         self.shared_fc2_spin_threshold = ceil_div(self.shared_intermediate_gateup_size, self.cta_tile_m)
+        if self.shared_fc2_ksplit > 1:
+            if not self.supports_shared_fc2_ksplit:
+                raise ValueError(f"{type(self).__name__} does not split the shared FC2 by K.")
+            if self.shared_epilogue.two_epilogue_warpgroups or self.shared_epilogue.fc2_use_ublk:
+                raise ValueError("A split-K shared FC2 needs one epilogue warpgroup and the 16dp256b FC2 loads.")
+            if self.shared_epilogue._EpilogueTokenTileSize != 64 or self.shared_epilogue._EpilogueFc2HiddenTileSize != 128:
+                raise ValueError("A split-K shared FC2 needs 128-hidden x 64-token epilogue subtiles.")
 
     def _check_shared_tile_k(self) -> None:
         if self.shared_expert and self.shared_tile_k % self._mainloop.shared_mma_tile_k != 0:
@@ -228,6 +252,7 @@ class SharedExpertKernelMixin:
             "shared_l2_position": position if position is not None else self._shared_l2_position_request,
             "shared_work_id_mode": self.shared_work_id_mode,
             "shared_fc1_swizzle": fc1_swizzle if fc1_swizzle is not None else self.shared_fc1_swizzle,
+            "shared_fc2_ksplit": self.shared_fc2_ksplit,
         }
 
     def _shared_smem_kwargs(self) -> dict:
@@ -270,6 +295,34 @@ class SharedExpertKernelMixin:
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.shared_fc2_ksplit > 1:
+            slots = self._shared_fc2_split_slots()
+            device_workspace.register(
+                self.shared_fc2_split_partial_region,
+                cutlass.Int32,
+                (
+                    SharedFc2SplitK.partial_words(
+                        ksplit=self.shared_fc2_ksplit, slots=slots, subtiles=self.shared_epilogue.subtile_cnt
+                    ),
+                ),
+                buffer_space="local",
+                byte_alignment=128,
+            )
+            device_workspace.register(
+                self.shared_fc2_split_counter_region,
+                cutlass.Int32,
+                (slots * SharedFc2SplitK.warps,),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="tail_reset",
+            )
+
+    def _shared_fc2_m_tiles(self) -> int:
+        return ceil_div(self.shared_output_size, self.cta_tile_m)
+
+    def _shared_fc2_split_slots(self) -> int:
+        """Shared FC2 CTA tiles: output feature tiles x token blocks."""
+        return self._shared_fc2_m_tiles() * self.scheduler.shared_token_blocks
 
     def _shared_name_suffix(self) -> str:
         if not self.shared_expert:
@@ -280,6 +333,7 @@ class SharedExpertKernelMixin:
             + ("" if self.shared_work_id_mode is None else f"_ids{self.shared_work_id_mode}")
             + f"_l2{self.shared_l2_position}"
             + (f"_fc1sw{self.scheduler._shared_fc1_swizzle}" if self.scheduler._shared_fc1_swizzle else "")
+            + (f"_fc2ks{self.shared_fc2_ksplit}" if self.shared_fc2_ksplit > 1 else "")
             + ("_reduced" if self.reduce_shared_output else "")
         )
 
@@ -506,6 +560,17 @@ class SharedExpertKernelMixin:
             fc2_tma_output=shared_fc2_output_tma_tensor,
             # mxfp8 carries its whole rescale in the e8m0 block scales: no alpha or norm constant.
             epi_args=GatedActEpilogueArgs(fc1_alpha=None, fc2_alpha=None, fc1_norm_const=None, topk_scores=None),
+            fc2_split=(
+                SharedFc2SplitK(
+                    ksplit=self.shared_fc2_ksplit,
+                    m_tiles=self._shared_fc2_m_tiles(),
+                    subtiles=self.shared_epilogue.subtile_cnt,
+                    partials=self._device_workspace.tensor(self.shared_fc2_split_partial_region),
+                    counters=self._device_workspace.tensor(self.shared_fc2_split_counter_region),
+                )
+                if self.shared_fc2_ksplit > 1
+                else None
+            ),
         )
         return shared_kernel_extension, bindings
 

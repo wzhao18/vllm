@@ -1105,3 +1105,37 @@ def cvt_e2m1_to_fp32_optimal_ptx(e2m1_reg: cute.Tensor, fp32_reg: cute.Tensor) -
         )
         for i in cutlass.range_constexpr(8):
             dst_words[w * 8 + i] = Int32(llvm.extractvalue(T.i32(), res, [i]))
+
+
+@dsl_user_op
+def ldg_cg_v4_b32(address: Int64, *, loc=None, ip=None):
+    """One 16-byte global load cached in L2 only (``ld.global.cg.v4.b32``): reads another SM's stores that an
+    acquire made visible without a stale L1 line; the four words are returned as ``Int32``."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [address.ir_value()],
+        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def atom_add_acq_rel_gpu_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> Int32:
+    """``atom.acq_rel.gpu.global.add.s32``: releases this thread's (and, after a warp or CTA barrier, its
+    peers') earlier stores and acquires the earlier releasers' stores; returns the old value."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [address.ir_value(), value.ir_value()],
+        "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
+        "=r,l,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)

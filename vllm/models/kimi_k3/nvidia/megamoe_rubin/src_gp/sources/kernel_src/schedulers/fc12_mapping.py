@@ -17,6 +17,8 @@ from .base import SchedulerWorkTileBase
 phase_bits = 16
 phase_mask = (1 << phase_bits) - 1
 peek_ready_bit = 1 << phase_bits
+# K slice of a split-K shared FC2 tile (``shared_fc2_ksplit``): the bits above the peek flag.
+k_slice_shift = phase_bits + 4
 
 
 
@@ -64,7 +66,12 @@ class SwapAbFc12WorkTileInfo(SchedulerWorkTileBase):
 
     @property
     def peek_ready(self):
-        return self.phase_and_flags >= Int32(peek_ready_bit)
+        return (self.phase_and_flags & Int32(peek_ready_bit)) != Int32(0)
+
+    @property
+    def k_slice(self) -> Int32:
+        """The K slice of a split-K shared FC2 tile (0 for every other tile)."""
+        return self.phase_and_flags >> Int32(k_slice_shift)
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -150,7 +157,12 @@ class NonSwapAbFc12WorkTileInfo(SchedulerWorkTileBase):
 
     @property
     def peek_ready(self):
-        return self.phase_and_flags >= Int32(peek_ready_bit)
+        return (self.phase_and_flags & Int32(peek_ready_bit)) != Int32(0)
+
+    @property
+    def k_slice(self) -> Int32:
+        """The K slice of a split-K shared FC2 tile (0 for every other tile)."""
+        return self.phase_and_flags >> Int32(k_slice_shift)
 
     @property
     def valid_tokens_in_cta_tile(self) -> Int32:

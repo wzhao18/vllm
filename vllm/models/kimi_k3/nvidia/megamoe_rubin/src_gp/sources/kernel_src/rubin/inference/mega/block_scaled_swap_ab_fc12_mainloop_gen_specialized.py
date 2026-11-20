@@ -148,6 +148,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self._parse_shared_problem(problem_desc)
+        # Split-K shared FC2: a tile's K slice (``work_tile.k_slice``) loads K tiles [s * n, (s + 1) * n).
+        self.shared_fc2_ksplit = int(impl_desc.get("shared_fc2_ksplit") or 1)
+        if self.shared_fc2_ksplit > 1 and not self.shared_enabled:
+            raise ValueError("shared_fc2_ksplit needs the fused shared expert.")
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
@@ -953,6 +957,11 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self.fc1_k_tile_count = ceil_div(bound_hidden_size, self.mma_tile_k)
         self.fc2_k_tile_count = ceil_div(bound_intermediate_gateup_size // 2, self.mma_tile_k)
         self._set_shared_k_tile_counts()
+        if self.shared_fc2_ksplit > 1 and self.shared_fc2_k_tile_count % self.shared_fc2_ksplit != 0:
+            raise ValueError(
+                f"shared_fc2_ksplit={self.shared_fc2_ksplit} must divide the shared FC2 K tiles "
+                f"({self.shared_fc2_k_tile_count})."
+            )
         self.sfb_vmnk_coord = (0, cta_coord_in_cluster[0], cta_coord_in_cluster[1], cta_coord_in_cluster[2])
 
     @cute.jit
@@ -1175,6 +1184,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         mma_tile_m = kernel_extension.local_tile_m(work_tile) // self.mma_cta_count
         global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
         global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
+        k_base = self._k_tile_base(work_tile, k_tile_count)
 
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -1186,12 +1196,12 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
             cute.copy(
                 _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask),
-                global_a_slice[(None, k_tile_idx)],
+                global_a_slice[(None, k_tile_idx + k_base)],
                 partitioned_smem_a[(None, stage_index)],
             )
             cute.copy(
                 _bind_tma_issue(sfa_exec_atom, tma_barrier, multicast_mask),
-                global_sfa_slice[(None, k_tile_idx)],
+                global_sfa_slice[(None, k_tile_idx + k_base)],
                 partitioned_smem_sfa[(None, stage_index)],
             )
         return ab_pipeline_state
@@ -1410,6 +1420,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         if cutlass.const_expr(mma_tiler_mnk[1] == 64):
             sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
         global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
+        k_base = self._k_tile_base(work_tile, k_tile_count)
 
         if cutlass.const_expr(self.dynamic_gather and is_fc1 is not None):
             # Weight/SFA and SFB transfers are unchanged. On routed FC1 tiles TMA-B
@@ -1435,19 +1446,19 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             if cutlass.const_expr(is_fc1 is None):
                 cute.copy(
                     _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask),
-                    global_b_slice[(None, k_tile_idx)],
+                    global_b_slice[(None, k_tile_idx + k_base)],
                     partitioned_smem_b[(None, stage_index)],
                 )
             else:
                 if not is_fc1:
                     cute.copy(
                         _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask),
-                        global_b_slice[(None, k_tile_idx)],
+                        global_b_slice[(None, k_tile_idx + k_base)],
                         partitioned_smem_b[(None, stage_index)],
                     )
             cute.copy(
                 _bind_tma_issue(sfb_exec_atom, tma_barrier, sfb_multicast_mask),
-                global_sfb_slice[(None, k_tile_idx)],
+                global_sfb_slice[(None, k_tile_idx + k_base)],
                 partitioned_smem_sfb[(None, stage_index)],
             )
         return ab_pipeline_state
@@ -1799,8 +1810,17 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             Int32(self.fc1_k_tile_count),
             Int32(self.fc2_k_tile_count),
             Int32(self.shared_fc1_k_tile_count) if shared else None,
-            Int32(self.shared_fc2_k_tile_count) if shared else None,
+            Int32(self.shared_fc2_k_tile_count // self.shared_fc2_ksplit) if shared else None,
         )
+
+    @cute.jit
+    def _k_tile_base(self, work_tile, k_tile_count: Int32) -> Int32:
+        """First K tile of a work tile: its slice's offset on a split-K shared FC2 tile, 0 otherwise."""
+        base = Int32(0)
+        if cutlass.const_expr(self.shared_fc2_ksplit > 1):
+            if work_tile.phase == Int32(BlockPhase.SharedLinear2):
+                base = work_tile.k_slice * k_tile_count
+        return base
 
     @cute.jit
     def _mma_use_n128_sfb_mapping(self, quant_kind: QuantKind, work_tile):

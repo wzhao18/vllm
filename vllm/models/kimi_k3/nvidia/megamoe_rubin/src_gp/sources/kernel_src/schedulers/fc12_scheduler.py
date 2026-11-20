@@ -20,6 +20,7 @@ from .fc12_mapping import (
     SwapAbFc12WorkTileInfo,
     create_fc12_task_mapping_state,
     create_phase_interleaved_fc12_mapping_state,
+    k_slice_shift,
     make_fc12_done_tile,
     map_fc12_linear_work_id,
     map_phase_interleaved_fc12_work_id,
@@ -90,6 +91,8 @@ def shared_expert_impl_requirements() -> dict:
         "shared_l2_position": OptionalRequirement(Optional[str]),
         "shared_work_id_mode": OptionalRequirement(Optional[str]),
         "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        # Split-K shared FC2: every FC2 tile runs as this many K slices (FP32 partials summed in slice order).
+        "shared_fc2_ksplit": OptionalRequirement(Optional[int]),
         "expert_sizes_ready_region": OptionalRequirement(str),
         "expert_sizes_ready_target": OptionalRequirement(int),
         "expert_sizes_ready_scope": OptionalRequirement(str),
@@ -127,6 +130,7 @@ class SharedExpertStreamMixin:
         self._routed_done = None
         self.shared_fc2_position = None
         self._shared_fc1_swizzle = 0
+        self.shared_fc2_ksplit = 1
         if not (impl_desc.get("shared_expert_stream", False) and problem_desc.get("shared_expert", False)):
             return
         if not self.is_swap_ab:
@@ -149,7 +153,15 @@ class SharedExpertStreamMixin:
         self._shared_token_count = tokens
         self.shared_token_blocks = ceil_div(tokens, cta_tile_n)
         self._shared_feature_blocks = (ceil_div(gateup, feature_tile), ceil_div(output, feature_tile))
-        self._shared_phase_tiles = tuple(blocks * self.shared_token_blocks for blocks in self._shared_feature_blocks)
+        ksplit = int(impl_desc.get("shared_fc2_ksplit") or 1)
+        if ksplit < 1 or ksplit >= (1 << 11):
+            raise ValueError(f"shared_fc2_ksplit must be a positive slice count, got {ksplit}.")
+        self.shared_fc2_ksplit = ksplit
+        # FC2 ids: K slice fastest, so the slices of one tile are claimed (and finish) together.
+        self._shared_phase_tiles = (
+            self._shared_feature_blocks[0] * self.shared_token_blocks,
+            self._shared_feature_blocks[1] * self.shared_token_blocks * ksplit,
+        )
         position = impl_desc.get("shared_l2_position")
         if position is None or position == "auto":
             # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its tiles.
@@ -203,7 +215,13 @@ class SharedExpertStreamMixin:
 
     @cute.jit
     def _decode_shared_tile(self, local_id: Int32, phase_offset: int) -> SwapAbFc12WorkTileInfo:
-        """Map a shared FC1 (``phase_offset`` 0) or FC2 (1) cluster work id to this CTA's tile, feature block fast."""
+        """Map a shared FC1 (``phase_offset`` 0) or FC2 (1) cluster work id to this CTA's tile, feature block fast
+        (a split-K FC2 id carries its K slice fastest)."""
+        k_slice_flags = Int32(0)
+        if cutlass.const_expr(phase_offset == 1 and self.shared_fc2_ksplit > 1):
+            k_slice = local_id % Int32(self.shared_fc2_ksplit)
+            local_id = local_id // Int32(self.shared_fc2_ksplit)
+            k_slice_flags = k_slice << Int32(k_slice_shift)
         feature_blocks = Int32(self._shared_feature_blocks[phase_offset])
         token_block = local_id // feature_blocks
         feature_block = local_id - token_block * feature_blocks
@@ -231,7 +249,8 @@ class SharedExpertStreamMixin:
             cumulative_sf_physical_row=Int32(0),
             cumulative_token_block_count=Int32(0),
             valid_tokens_in_cta_tile=valid_tokens,
-            phase_and_flags=Int32(int((BlockPhase.SharedLinear1, BlockPhase.SharedLinear2)[phase_offset])),
+            phase_and_flags=Int32(int((BlockPhase.SharedLinear1, BlockPhase.SharedLinear2)[phase_offset]))
+            | k_slice_flags,
         )
 
     @cute.jit

@@ -53,8 +53,12 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 
 
 # Fused shared expert: shared FC2 after the routed work ("tail") or right after shared
-# FC1, under the dispatch ("early").
-RUBIN_FUSED_SHARED_L2_POSITION = "early"
+# FC1, under the dispatch ("early"). The gen-phase decode kernel runs it last and split-K
+# (RUBIN_FUSED_SHARED_FC2_KSPLIT slices per tile, ~200 KB of weights each like a routed
+# tile): every CTA's last unit is a shared FC2 slice, so the routed combine cells cross
+# NVLink while the shared FC2 weights stream instead of after the main kernel's work.
+RUBIN_FUSED_SHARED_L2_POSITION = "tail"
+RUBIN_FUSED_SHARED_FC2_KSPLIT = 4
 
 
 def compile_cache_key(
@@ -230,6 +234,8 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         raise ValueError(f"unsupported epilogue_warpgroups={epilogue_warpgroups}.")
     if getattr(cfg, "shared", None) is not None:
         impl_fields["shared_l2_position"] = RUBIN_FUSED_SHARED_L2_POSITION
+        if cfg.kernel_variant == "genphase":
+            impl_fields["shared_fc2_ksplit"] = RUBIN_FUSED_SHARED_FC2_KSPLIT
     if cfg.die_sm_mask32 is not None and cfg.kernel_variant == "genphase":
         # Die-local expert streams on the refreshed GenPhase decode scheduler: each
         # die claims the tiles of the experts homed on it (die_local.place_experts:
