@@ -615,10 +615,13 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     }
     if (work && threadIdx.x == 0) {
       STAMP(2);
-      __threadfence();
-      atomicAdd(p.cnt + kTileCnt + kLine * tile, 1u);
-      while (ld_acquire(p.cnt + kTileCnt + kLine * tile) < static_cast<unsigned>(p.ks))
-        __nanosleep(32);
+      // Release (cumulative: the partial stores of the whole CTA precede it through the
+      // CTA barrier above), then only the latent CTAs wait for their tile: they stage it.
+      unsigned* const c = p.cnt + kTileCnt + kLine * tile;
+      asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(c) : "memory");
+      if (tile >= p.rtiles) {
+        while (ld_acquire(c) < static_cast<unsigned>(p.ks)) __nanosleep(32);
+      }
       STAMP(3);
     }
   }
