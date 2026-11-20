@@ -540,10 +540,18 @@ def _use_deep_select_prefill(
     topk_backend: str,
 ) -> bool:
     """Whether DeepSelect ranks these prefill logits: SM100's BF16 logits under
-    the "auto" and "deep_select" top-k backends, with or without DCP."""
+    the "auto" and "deep_select" top-k backends, with or without DCP.
+
+    "balanced" is a decode-only top-k, and "trtllm_gvr2" ranks decode rows
+    only: its 16-bit prefill engine resolves ties at the top-k cutoff to a
+    different column set and emits each row in a different order on every call
+    (its deterministic mode is FP32-only). BF16 logits tie at the cutoff on
+    almost every long-context row, and the sparse MLA is order-sensitive, so a
+    prefill step was not reproducible (TP8 + DCP8 96K prefix: rel. RMS 0.24
+    between identical passes, BUG-DCP8-2). DeepSelect selects the same exact
+    top-k deterministically (set and order), so their prefill follows "auto"."""
     return (
-        # "balanced" is a decode-only top-k; its prefill follows "auto".
-        topk_backend in ("auto", "deep_select", "balanced")
+        topk_backend in ("auto", "deep_select", "balanced", "trtllm_gvr2")
         and logits.dtype == torch.bfloat16
         and row_starts is None
         and is_deep_select_available(logits, topk_tokens)
