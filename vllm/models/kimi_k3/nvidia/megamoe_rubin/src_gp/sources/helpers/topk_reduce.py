@@ -1105,13 +1105,9 @@ class TopkReduce:
             for i in cutlass.range_constexpr(hidden_per_thread):
                 xf = Float32(x[i])
                 sumsq = sumsq + xf * xf
-
-            cleared = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
-            cleared.fill(0.0)
-            cell_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
-            for k in cutlass.range_constexpr(num_topk):
-                if (valid_slots >> Int32(k)) & Int32(1) != Int32(0):
-                    cute.copy(cell_store, cleared, mark_alignment(terms[k, None], hidden_per_thread * 2))
+            # vLLM-local: the consumed cells are reset only after the row is stored (below). Issued here, the resets
+            # sat in front of the cluster exchange's barrier.cluster.arrive (release at cluster scope), which waits
+            # for every prior global store of the thread to be acknowledged: ~1 us under the MoE tail's load.
 
         for shift in cutlass.range_constexpr(5):
             sumsq = sumsq + cute.arch.shuffle_sync_bfly(sumsq, 16 >> shift)
@@ -1139,6 +1135,13 @@ class TopkReduce:
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
             store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
             cute.copy(store_atom, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
+            # Reset the consumed cells for the next combine (it writes them only after this grid has completed).
+            cleared = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+            cleared.fill(0.0)
+            cell_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+            for k in cutlass.range_constexpr(num_topk):
+                if (valid_slots >> Int32(k)) & Int32(1) != Int32(0):
+                    cute.copy(cell_store, cleared, mark_alignment(terms[k, None], hidden_per_thread * 2))
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):
                 self._wait_producer(producer_done)
