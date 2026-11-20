@@ -897,6 +897,8 @@ class SparseMlaDecodeKM:
                 gl = g - 1
                 mbar_wait(self.bar(base, B_PVDONE + (gl & 1)), (gl >> 1) & 1)
                 tc_fence_after()
+                if (warp == CORR0) & (lane == 0) & (ro < 2):
+                    self.mark(stamp, cta, 38 + ro)
                 role = self.role(base, i)
                 me = Int64(quarter * 32 + lane - odd) * Int64(2)
                 dst = out + Int64(row) * Int64(out_stride) * Int64(2) + me
