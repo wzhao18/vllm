@@ -48,6 +48,7 @@ from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ..common.primitives import asm, copy_bulk, push_float, wait
+from ..mla.qvalid import spin_ns
 
 SF_VEC = 32
 MMA_N = 128  # tokens per MMA (64 per CTA of the pair)
@@ -160,7 +161,7 @@ class DenseMx8:
     def __init__(self, n: int, k: int, rows: int, ldo: int, *, ksplit: int = 2,
                  kt: int = 128, stages: int = 4, collector: bool = True,
                  mc: int = 1, kred: bool = False, pair: bool = True,
-                 iw: int = 1, ix: int = 1, debug: int = 0):  # fmt: skip
+                 iw: int = 1, ix: int = 1, debug: int = 0, pre_ns: int = 0):  # fmt: skip
         assert rows <= 384 and k % (kt * ksplit) == 0 and ksplit in (1, 2)
         # iw / ix TMA issuer warps for the weights / the activation, each issuing every
         # iw-th / ix-th K tile: one issuer completes one bulk op at a time (~0.3 us
@@ -188,6 +189,9 @@ class DenseMx8:
         # bench-only isolation: 1 no epilogue stores, 2 no MMA, 4 no TMA (barriers
         # still complete via plain arrives), 8 epilogue skips the accumulator wait
         self.debug = debug
+        # bench-only: the activation warps spin pre_ns after the weight prologue, before
+        # griddepcontrol.wait (a preceding op of the same resident CTA: in-grid form)
+        self.pre_ns = pre_ns
         # mc pairs per cluster share one K half and the x tiles: x is TMA-multicast
         # to the mc pairs (L2 reads of x / mc)
         self.mc = mc
@@ -451,6 +455,12 @@ class DenseMx8:
             prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
             for _ in cutlass.range(iw, unroll=1):
                 prod.advance()
+            if cutlass.const_expr(self.pre_ns > 0):
+                # bench in-grid emulation: the previous call is done before this one's
+                # weight prologue runs alongside the pre_ns predecessor-op spin
+                cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(self.debug & 4096):  # reference: no W pre-staging
+                    spin_ns(Int64(self.pre_ns))
             # Weights do not depend on the predecessor: the ring fills with them while
             # the SP gather that writes x is still running.
             for t in cutlass.range(iw, self.ktiles, self.iw, unroll=1):
@@ -481,6 +491,8 @@ class DenseMx8:
             for _ in cutlass.range(ix, unroll=1):
                 xs.advance()
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.pre_ns > 0):
+                spin_ns(Int64(self.pre_ns))
             for t in cutlass.range(ix, self.ktiles, self.ix, unroll=1):
                 kk = k0 + (t + rot) % self.ktiles
                 # same slot as the weight warp; only the weight warp arrives (expect_tx)

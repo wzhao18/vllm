@@ -44,6 +44,34 @@ def ptrs(w, x, out, part, tick):
     )
 
 
+def make_pred(ctas, dev):
+    """A co-residable PDL predecessor: ``ctas`` 128-thread CTAs without shared memory
+    that wait for their own predecessor, trigger their dependents and spin ``ns``.
+    Behind it a GEMM whose weight prologue runs before ``griddepcontrol.wait``
+    overlaps that prologue with the spin (the in-grid op's run-ahead)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import stream
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.qvalid import spin_ns
+
+    class Pred:
+        @cute.jit
+        def __call__(self, ns: cutlass.Int64, s):
+            self.kernel(ns).launch(grid=[ctas, 1, 1], block=[128, 1, 1], stream=s,
+                                   use_pdl=True)  # fmt: skip
+
+        @cute.kernel
+        def kernel(self, ns: cutlass.Int64):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+            spin_ns(ns)
+
+    p = Pred()
+    fn = cute.compile(p, cutlass.Int64(1000), stream(dev))
+    return lambda ns: fn(cutlass.Int64(ns), stream(dev))
+
+
 def graph_time(fn, reps=50, iters=5):
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
@@ -73,6 +101,9 @@ def main():
     ap.add_argument("--k", type=int, default=7168)
     ap.add_argument("--variants", default="c1s4k2,c0s4k2,c1s5k2,c1s4k1")
     ap.add_argument("--copies", type=int, default=4, help="weight copies (> L2)")
+    ap.add_argument("--pred-us", type=float, nargs="*", default=[],
+                    help="also time each kernel behind a co-resident PDL spin of these us; "
+                         "exposed = chain - spin-only chain")  # fmt: skip
     args = ap.parse_args()
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr  # noqa: F401
@@ -109,6 +140,19 @@ def main():
         t_stock = graph_time(stock)
         print(f"R{rows} scaled_mm {t_stock:.2f} us/call (graph, {len(ws)} weight copies)",
               flush=True)  # fmt: skip
+        pred = make_pred(torch.cuda.get_device_properties(0).multi_processor_count, dev)
+        spin = {}
+
+        def behind(name, fn):
+            for us in args.pred_us:
+                ns = int(us * 1000)
+                if us not in spin:
+                    spin[us] = graph_time(lambda: pred(ns))
+                t_ch = graph_time(lambda: (pred(ns), fn()))
+                print(f"  {name} behind spin {us:g} us: exposed {t_ch - spin[us]:.2f} us "
+                      f"(chain {t_ch:.2f}, spin-only {spin[us]:.2f})", flush=True)  # fmt: skip
+
+        behind("scaled_mm", stock)
         for var in args.variants.split(","):
             f = dict(re.findall(r"([a-z])(\d+)", var))  # c<col>s<stages>k<ksplit>[m<mc>][d<debug>][t<kt>]
             col, stg, ks = int(f["c"]), int(f["s"]), int(f["k"])
@@ -118,7 +162,7 @@ def main():
                 g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
                              kred=bool(int(f.get("r", 0))), pair=bool(int(f.get("p", 1))),
                              iw=int(f.get("w", 1)), ix=int(f.get("x", 1)),
-                             debug=dbg, kt=kt)
+                             debug=dbg, kt=kt, pre_ns=int(f.get("e", 0)) * 1000)
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
@@ -148,6 +192,10 @@ def main():
 
                 t = graph_time(ours)
                 print(f"  {var}: {t:.2f} us/call  ({t_stock / t:.2f}x scaled_mm)", flush=True)
+                if int(f.get("e", 0)):
+                    print(f"  {var}: in-kernel pre-wait spin {f['e']} us: exposed "
+                          f"{t - int(f['e']):.2f} us", flush=True)  # fmt: skip
+                behind(var, ours)
             except Exception as e:  # report and go on with the next variant
                 tb = traceback.format_exc().splitlines()
                 print(f"  {var}: FAILED {type(e).__name__}: {str(e)[:1500]}", flush=True)
