@@ -146,6 +146,19 @@ def _smid():
     return "mov.u32 $0, %smid;", "=r", ()
 
 
+# L2 eviction policies (fraction 1.0) for the TMA operand loads: runtime createpolicy
+# instructions, as the prefill kernel's (a constant policy makes ptxas emit an invalid
+# encoding on some toolchains)
+@asm(cutlass.Int64)
+def _l2_evict_first():
+    return "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;", "=l", ()
+
+
+@asm(cutlass.Int64)
+def _l2_evict_last():
+    return "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;", "=l", ()
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -1645,6 +1658,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
+            # L2 policy: the weight is streamed once per call (evict_first, so it does
+            # not flush the activations re-read by every CTA, the next kernels' rows
+            # or their code), the activation is re-read by every CTA (evict_last)
+            if cutlass.const_expr(self.weight_is_a):
+                l2_a = _l2_evict_first()
+                l2_b = _l2_evict_last()
+            else:
+                l2_a = _l2_evict_last()
+                l2_b = _l2_evict_first()
             pre_left = cutlass.Int32(0)
             if cutlass.const_expr(self.prewait_stages > 0):
                 if work_tile.is_valid_tile:
@@ -1672,6 +1694,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tAsA[(None, pre_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                     mcast_mask=a_full_mcast_mask,
+                                    cache_policy=l2_a,
                                 )
                                 cute.copy(
                                     tma_atom_sfa,
@@ -1679,6 +1702,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tAsSFA[(None, pre_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                     mcast_mask=sfa_full_mcast_mask,
+                                    cache_policy=l2_a,
                                 )
                             else:
                                 cute.copy(
@@ -1687,6 +1711,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tBsB[(None, pre_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                     mcast_mask=b_full_mcast_mask,
+                                    cache_policy=l2_b,
                                 )
                                 cute.copy(
                                     tma_atom_sfb,
@@ -1694,6 +1719,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tBsSFB[(None, pre_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                     mcast_mask=sfb_full_mcast_mask,
+                                    cache_policy=l2_b,
                                 )
                         pre_state.advance()
                     pre_left = cutlass.Int32(n_pre)
@@ -1764,6 +1790,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tAsA[(None, ab_producer_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                     mcast_mask=a_full_mcast_mask,
+                                    cache_policy=l2_a,
                                 )
                                 cute.copy(
                                     tma_atom_sfa,
@@ -1771,6 +1798,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tAsSFA[(None, ab_producer_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                     mcast_mask=sfa_full_mcast_mask,
+                                    cache_policy=l2_a,
                                 )
                             else:
                                 cute.copy(
@@ -1779,6 +1807,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tBsB[(None, ab_producer_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                     mcast_mask=b_full_mcast_mask,
+                                    cache_policy=l2_b,
                                 )
                                 cute.copy(
                                     tma_atom_sfb,
@@ -1786,6 +1815,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                     tBsSFB[(None, ab_producer_state.index)],
                                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                     mcast_mask=sfb_full_mcast_mask,
+                                    cache_policy=l2_b,
                                 )
                         if cutlass.const_expr(self.weight_is_a):
                             cute.copy(
@@ -1794,6 +1824,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 tBsB[(None, ab_producer_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                 mcast_mask=b_full_mcast_mask,
+                                cache_policy=l2_b,
                             )
                             cute.copy(
                                 tma_atom_sfb,
@@ -1801,6 +1832,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 tBsSFB[(None, ab_producer_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                 mcast_mask=sfb_full_mcast_mask,
+                                cache_policy=l2_b,
                             )
                         else:
                             cute.copy(
@@ -1809,6 +1841,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 tAsA[(None, ab_producer_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                 mcast_mask=a_full_mcast_mask,
+                                cache_policy=l2_a,
                             )
                             cute.copy(
                                 tma_atom_sfa,
@@ -1816,6 +1849,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 tAsSFA[(None, ab_producer_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                 mcast_mask=sfa_full_mcast_mask,
+                                cache_policy=l2_a,
                             )
 
                     # Prefetch: Rolling prefetch for next tiles
