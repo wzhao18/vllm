@@ -146,6 +146,26 @@ def _smid():
     return "mov.u32 $0, %smid;", "=r", ()
 
 
+@asm()
+def _red_add(address, value):
+    return "red.relaxed.gpu.global.add.s32 [$0], $1;", "l,r,~{memory}", (address, value)
+
+
+@asm(cutlass.Int32)
+def _ld_relaxed(address):
+    return "ld.relaxed.gpu.global.s32 $0, [$1];", "=r,l,~{memory}", (address,)
+
+
+@asm()
+def _nanosleep(ns):
+    return "nanosleep.u32 $0;", "r", (ns,)
+
+
+@asm(cutlass.Int32, pure=True)
+def _popc64(x):
+    return "popc.b64 $0, $1;", "=r,l", (cutlass.Int64(x),)
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -223,8 +243,17 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         producers: int = 1,
         die_claim: bool = False,
         push: bool = False,
+        die_static: Optional[Tuple[int, int, int, int]] = None,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
+        # die_static (split, weight tiles, activation tiles, clusters): claim-free die
+        # placement. The grid is one cluster per placement unit (TPC for 2-CTA clusters,
+        # SM for 1-CTA); a unit's die is (smid >> 1) & 1 (checked per device on the host)
+        # and its die-local index picks the work (weight tile, activation tile) from its
+        # own die's weight tiles: die 0 [0, split), die 1 [split, weight tiles). Every CTA
+        # counts itself landed and waits for the whole grid before exiting, so no unit
+        # hosts two clusters (the work of a unit is never lost).
+        self.die_static = die_static
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
         # ``weight_is_a``, else B) and its scale factors of the first
         # ``prewait_stages`` k-blocks of its first tile BEFORE griddepcontrol.wait,
@@ -1239,6 +1268,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.swizzle_size,
             self.raster_order,
         )
+        if cutlass.const_expr(self.die_static is not None):
+            # one cluster per placement unit (every TPC / SM); work comes from the
+            # die-static table, not the persistent scheduler
+            grid = (self.cluster_shape_mn[0] * self.die_static[3], self.cluster_shape_mn[1], 1)
 
         self.buffer_align_bytes = 1024
         if cutlass.const_expr(self.push):
@@ -1638,6 +1671,46 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
         work_tile = tile_sched.initial_work_tile_info()
+        if cutlass.const_expr(self.die_static is not None):
+            ds_split, ds_wt, ds_tt, _, ds_m1, ds_m0 = self.die_static
+            ds_aux = cute.make_tensor(
+                cute.recast_ptr(alpha.iterator, dtype=cutlass.Int32), cute.make_layout(272)
+            )
+            # placement unit (TPC = smid >> 1 for 2-CTA clusters, else the SM), its die
+            # and its index among its die's units, from the per-device unit bit masks
+            # (compile-time words: bit u of ds_m1 / ds_m0 = unit u on die 1 / die 0)
+            ds_u = _smid()
+            if cutlass.const_expr(cute.size(tiled_mma.thr_id.shape) == 2):
+                ds_u = ds_u >> 1
+            ds_wu = ds_u >> 6
+            ds_b = cutlass.Int64(ds_u & 63)
+            ds_w1 = cutlass.Int64(ds_m1[0])
+            ds_w0 = cutlass.Int64(ds_m0[0])
+            for ds_k in cutlass.range_constexpr(1, len(ds_m1)):
+                if ds_wu == ds_k:
+                    ds_w1 = cutlass.Int64(ds_m1[ds_k])
+                    ds_w0 = cutlass.Int64(ds_m0[ds_k])
+            ds_die = cutlass.Int32((ds_w1 >> ds_b) & cutlass.Int64(1))
+            ds_word = ds_w0
+            if ds_die == 1:
+                ds_word = ds_w1
+            ds_i = _popc64(ds_word & ((cutlass.Int64(1) << ds_b) - cutlass.Int64(1)))
+            for ds_k in cutlass.range_constexpr(len(ds_m1) - 1):
+                if ds_wu > ds_k:
+                    ds_i = ds_i + bin(ds_m0[ds_k] % (1 << 64)).count("1") * (1 - ds_die)
+                    ds_i = ds_i + bin(ds_m1[ds_k] % (1 << 64)).count("1") * ds_die
+            ds_w = ds_die * ds_split + ds_i // ds_tt
+            ds_t = ds_i % ds_tt
+            ds_valid = ds_i < (ds_split + ds_die * (ds_wt - 2 * ds_split)) * ds_tt
+            ds_thr = cute.size(tiled_mma.thr_id.shape)
+            if cutlass.const_expr(self.weight_is_a):
+                ds_coord = (ds_w * ds_thr, ds_t, cutlass.Int32(0))
+            else:
+                ds_coord = (ds_t * ds_thr, ds_w, cutlass.Int32(0))
+            work_tile = utils.WorkTileInfo(ds_coord, ds_valid)
+            if warp_idx == self.mma_warp_id:
+                if cute.arch.lane_idx() == 0:
+                    _red_add(ds_aux.iterator + 4, cutlass.Int32(1))
 
         #
         # Specialized TMA load warp
@@ -1929,6 +2002,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.die_static is not None):
+                    work_tile = utils.WorkTileInfo(ds_coord, cutlass.Boolean(False))
 
             #
             # Wait A/B buffer empty
@@ -2160,6 +2235,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.die_static is not None):
+                    work_tile = utils.WorkTileInfo(ds_coord, cutlass.Boolean(False))
 
             #
             # Wait for accumulator buffer empty
@@ -2175,6 +2252,20 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             tmem.allocate(self.num_tmem_alloc_cols)
             if cutlass.const_expr(self.use_pdl and self.quiet_wait):
                 cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.die_static is not None):
+                # landing gate, off the critical path (epilogue warps idle in the
+                # mainloop): this CTA exits only after every CTA of the grid has landed,
+                # so no placement unit hosts a second cluster; the last CTA through
+                # resets this aux set's counters (the host alternates two sets per call)
+                if warp_idx == self.epilog_warp_id[0]:
+                    if cute.arch.lane_idx() == 0:
+                        ds_g = cute.arch.grid_dim()[0] * cute.arch.grid_dim()[1]
+                        while _ld_relaxed(ds_aux.iterator + 4) < ds_g:
+                            _nanosleep(cutlass.Int32(100))
+                        ds_done = _atom_add(ds_aux.iterator + 6, cutlass.Int32(1))
+                        if ds_done == ds_g - 1:
+                            ds_aux[4] = cutlass.Int32(0)
+                            ds_aux[6] = cutlass.Int32(0)
 
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
@@ -2203,6 +2294,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             # Persistent tile scheduling loop
             #
             work_tile = tile_sched.initial_work_tile_info()
+            if cutlass.const_expr(self.die_static is not None):
+                work_tile = utils.WorkTileInfo(ds_coord, ds_valid)
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -2216,6 +2309,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.die_static is not None):
+                    work_tile = utils.WorkTileInfo(ds_coord, cutlass.Boolean(False))
 
                 # flashinfer local fix (b53cfd6a7, not in TRT-LLM): apply alpha in
                 # Float32 before the c_dtype conversion to avoid fp16 overflow.

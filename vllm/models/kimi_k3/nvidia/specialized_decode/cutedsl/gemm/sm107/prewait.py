@@ -42,7 +42,8 @@ def _alpha_one(device):
 
 @cache
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
-             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False):
+             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False,
+             die_static=None):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
@@ -57,6 +58,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         producers=producers,
         die_claim=die_claim,
         push=push,
+        die_static=die_static,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
     # experiment: operand-split producers (dbg bit 1, needs producers == 2)
@@ -79,7 +81,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (cute.sym_int() if die_claim or push else 1,), assumed_align=8
+        cutlass.Float32, (cute.sym_int() if die_claim or push or die_static else 1,), assumed_align=8
     )
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
@@ -100,8 +102,11 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 push=False, device=None):
+                 push=False, device=None, die_static=False):
         device = torch.device("cuda") if device is None else device
+        self.die_static = self._die_static(tactic, rows, n, device) if die_static else None
+        if self.die_static is not None and (die_split is not None or push):
+            raise ValueError("die_static excludes die_split / push")
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
         if self.swap_ab and tactic[0][1] % 64:  # (measured: N32 / N96 swap tiles store wrong rows)
@@ -123,7 +128,7 @@ class Mxfp8PreGemm:
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), self.push,
+            int(max_stages), self.push, self.die_static,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
@@ -132,6 +137,10 @@ class Mxfp8PreGemm:
         self.aux, self.calls = None, 0
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
+        if self.die_static is not None:
+            # alpha + landed / done counters ([4], [6]), two sets alternated per call
+            self.aux = torch.zeros(2, 272, dtype=torch.float32, device=device)
+            self.aux[:, 0] = 1.0
         self.out_layout = "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
@@ -175,6 +184,51 @@ class Mxfp8PreGemm:
         ints[1], ints[2], ints[3], ints[4] = rank, n, cap, rows
         args.view(torch.int64)[4 : 4 + tp].copy_(peers.to(torch.int64))
         return args
+
+    @staticmethod
+    def _die_static(tactic, rows, n, device):
+        """(split, weight tiles, activation tiles, clusters, die-1 unit mask words, die-0
+        unit mask words) of the claim-free die placement on a ``die_weight(w, weight
+        tile)`` copy: one cluster per placement unit (TPC = smid >> 1 for 2-CTA clusters,
+        else the SM) from this device's measured SM -> die map; die d computes the weight
+        tiles it homes, its units in smid order."""
+        from ...common.dies import sm_domains
+
+        tile, cluster, swap_ab = tactic[0], tactic[1], tactic[2]
+        cs = cluster[0] * cluster[1]
+        if cs not in (1, 2) or cluster[1] != 1:
+            raise ValueError(f"die_static: cluster {cluster} (1x1 or 2x1)")
+        table = list(sm_domains(device.index or 0))  # die per smid, -1 = no such SM
+        units = [-1] * (-(-len(table) // cs))
+        for s, d in enumerate(table):
+            if d < 0:
+                continue
+            u = s // cs
+            if units[u] not in (-1, d):
+                raise ValueError(f"die_static: unit {u} spans dies")
+            units[u] = d
+        sms = sum(1 for d in table if d >= 0)
+        count = [units.count(0), units.count(1)]
+        if cs == 2 and 2 * (count[0] + count[1]) != sms:
+            raise ValueError("die_static: a TPC has one SM")
+        if count[0] + count[1] != _max_active_clusters(cs):
+            raise ValueError(f"die_static: {count} units vs {_max_active_clusters(cs)} co-resident clusters")
+        tw, ta = (tile[0], tile[1]) if swap_ab else (tile[1], tile[0])
+        w_tiles, a_tiles = -(-n // tw), -(-rows // ta)
+        share = sum(1 for d in table if d == 0) / sms
+        split = round(w_tiles * share)  # = die_weight(w, tw)'s split
+        if split * a_tiles > count[0] or (w_tiles - split) * a_tiles > count[1]:
+            raise ValueError(f"die_static: {w_tiles} x {a_tiles} tiles, split {split}, units {count}")
+
+        def words(die):
+            bits = sum(1 << u for u, d in enumerate(units) if d == die)
+            out = []
+            for k in range(-(-len(units) // 64)):
+                w = (bits >> (64 * k)) & ((1 << 64) - 1)
+                out.append(w - (1 << 64) if w >= 1 << 63 else w)  # signed Int64
+            return tuple(out)
+
+        return (split, w_tiles, a_tiles, count[0] + count[1], words(1), words(0))
 
     @staticmethod
     def _die_aux(tactic, rows, n, die_split, device):
