@@ -1302,7 +1302,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     # ------------------------------------------------------------------
 
     # Total across all clusters, issued once the payload flag is seen (see profiles/NOTES.md).
-    l2_prefetch_budget_bytes: ClassVar[int] = 64 << 20
+    l2_prefetch_budget_bytes: ClassVar[int] = dms_diag.PFMB << 20
     l2_prefetch_chunk_bytes: ClassVar[int] = 16384
     # TMA-A arrives once per work tile it takes; the scheduler claims unit j only after
     # TMA-A has taken unit j - 1, so claims follow the order units start in.
@@ -1828,18 +1828,20 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             if warp_idx < Int32(self.gather_b_warp_ids[0] + self.active_gather_b_warp_count):
                 iket.range_push("genphase.gather_b1")
                 if warp_idx == Int32(self.gather_b_warp_ids[0]) and cutlass.const_expr(
-                    self.l2_prefetch_budget_bytes > 0 and not self.lazy_comm_waits
+                    self.l2_prefetch_budget_bytes > 0 and (not self.lazy_comm_waits or dms_diag.PFENTRY)
                 ):
                     iket.range_push("gather_b1.l2_prefetch")
-                    spin_wait(
-                        self._device_workspace.ptr(self.token_comm.sizes_ready_region),
-                        lambda value: value == Int32(1),
-                        scope="gpu",
-                    )
+                    if cutlass.const_expr(not dms_diag.PFENTRY):
+                      spin_wait(
+                          self._device_workspace.ptr(self.token_comm.sizes_ready_region),
+                          lambda value: value == Int32(1),
+                          scope="gpu",
+                      )
                     # Held until the metadata is ready: the weight stream then fills the idle
                     # window before the first MMA instead of slowing the dispatch's
                     # latency-bound memory round trips.
-                    wait_ready(self._metadata_ready_flag())
+                    if cutlass.const_expr(not dms_diag.PFENTRY):
+                        wait_ready(self._metadata_ready_flag())
                     self._prefetch_first_waves(linear_cta_idx, weight_bases)
                     iket.range_pop()
                 # Lazy-wait builds take the payload / metadata waits on the first routed FC1 tile instead.

@@ -21,6 +21,10 @@ TL_BUF = int(os.environ.get("DMS_TL_BUF", "0"))
 NOMMA = os.environ.get("DMS_NOMMA") == "1"
 NODEP = int(os.environ.get("DMS_NODEP", "0"))
 PLAN = os.environ.get("DMS_PLAN") == "1"
+# DMS_PFENTRY=1: the first-wave L2 weight prefetch starts at entry (no sizes/metadata wait; reads the previous call slot order);
+# DMS_PFMB: its budget in MiB (default 64 = production).
+PFENTRY = os.environ.get("DMS_PFENTRY") == "1"
+PFMB = int(os.environ.get("DMS_PFMB", "64"))
 TL_ROLES = 8
 TL_UNITS = 64
 
