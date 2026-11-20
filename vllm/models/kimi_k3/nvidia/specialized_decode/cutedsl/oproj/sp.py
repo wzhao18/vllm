@@ -76,7 +76,7 @@ SPLITS = 8  # CTAs per cluster: K slices
 FEATURES = 128  # output features per CTA (8 warps x 16)
 WARP_ROWS = 128  # rows whose x / partial tiles fit one CTA's shared memory
 # Tactic per TP on token rows (GENERIC, module docstring: NQ-TUNE).
-SP_OPROJ = {4: "4-64:warp,65-:gemm"}
+SP_OPROJ = {4: "4-128:warp,129-:gemm"}
 
 
 @asm((Float32,) * 4)
