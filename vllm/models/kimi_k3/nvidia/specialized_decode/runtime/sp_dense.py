@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The layer-0 dense MLP on this rank's SP shard (replicated weights, ``KimiMLP``
 under sequence parallel) through ``gemm.dense_flow.DenseFlow``: the stock
-gate_up GEMM + SituAndMul + down GEMM in ONE die-local weight stream. Every rank streams the whole 1.45 GB weight a step for its few shard rows,
-so the layer is bound by the per-die HBM read rate: the weights are re-homed per
-die in place (``place_rows``: same bytes and layout, so the stock module, which
-eager / profiling / warmup steps still run, reads the same values) and each SM
-streams only rows homed on its die.
+gate_up GEMM + SituAndMul + down GEMM in ONE die-local weight stream. Every rank
+streams the whole 1.45 GB weight a step for its few shard rows, so the layer is
+bound by the per-die HBM read rate: the weights are re-homed per die in place
+(``place_rows``: same bytes and layout, so the stock module, which eager /
+profiling / warmup steps still run, reads the same values), half the weight
+blocks on each die, and each SM streams only rows homed on its die.
 
 Numerics: FP32 accumulation and one BF16 rounding per GEMM, SiTU on the
 BF16-rounded gate / up as the stock op (only the FP32 summation order differs);

@@ -312,7 +312,9 @@ class DenseFlow:
             info: cute.struct.MemRange[cutlass.Int32, 8]
             bnd: cute.struct.MemRange[cutlass.Int32, 2 * (MAX_DIE + 1)]
             order: cute.struct.MemRange[cutlass.Int32, MAX_WIN]
-            hst: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, max(1, self.hst_bytes // 4)], 128]
+            hst: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, max(1, self.hst_bytes // 4)], 128
+            ]
             sA: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(a_layout.outer)], 1024
             ]
