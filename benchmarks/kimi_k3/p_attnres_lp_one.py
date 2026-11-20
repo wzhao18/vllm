@@ -54,7 +54,7 @@ for probe in [int(x) for x in args.probes.split(",")]:
     ev[0].record()
     attn_res_lp.attn_res(prefix, delta, blocks, call, args.nb, -1, onw, 1e-6,
                          args.variant == "bq", True, _probe=probe, _vec=args.vec, _groups=args.groups,
-                         _stamps=stamps if probe & 16 else None)
+                         _stamps=stamps if probe & 48 else None)
     ev[1].record()
     torch.cuda.synchronize()
     us = ev[0].elapsed_time(ev[1]) * 1e3
