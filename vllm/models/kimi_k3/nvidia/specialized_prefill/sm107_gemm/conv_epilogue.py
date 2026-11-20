@@ -1052,16 +1052,43 @@ mov.b32 i1, e1;
 max.s32 im, i0, i1;
 max.s32 $1, im, $10;
 }"""
+# Same arithmetic with scalar add / mul after the MUFU ops (no pair repacking).
+_CONV_FAST3 = """{
+.reg .b32 i0, i1;
+.reg .b64 A, E;
+.reg .f32 a0, a1, e0, e1, d0, d1, r0, r1;
+mov.b64 A, 0;
+fma.rn.f32x2 A, $2, $6, A;
+fma.rn.f32x2 A, $3, $7, A;
+fma.rn.f32x2 A, $4, $8, A;
+fma.rn.f32x2 A, $5, $9, A;
+mul.rn.f32x2 E, A, $11;
+mov.b64 {e0, e1}, E;
+mov.b64 {a0, a1}, A;
+ex2.approx.ftz.f32 e0, e0;
+ex2.approx.ftz.f32 e1, e1;
+add.f32 d0, e0, 0f3F800000;
+add.f32 d1, e1, 0f3F800000;
+rcp.approx.ftz.f32 r0, d0;
+rcp.approx.ftz.f32 r1, d1;
+mul.rn.f32 r0, a0, r0;
+mul.rn.f32 r1, a1, r1;
+cvt.rn.bf16x2.f32 $0, r1, r0;
+mov.b32 i0, d0;
+mov.b32 i1, d1;
+max.s32 i0, i0, i1;
+max.s32 $1, i0, $10;
+}"""
 
 
 @dsl_user_op
-def conv_fast2(x3, x2, x1, x0, w, gm, nl, one, *, loc=None, ip=None):
+def conv_fast2(x3, x2, x1, x0, w, gm, nl, one, scalar=False, *, loc=None, ip=None):
     res = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
         [_v(v, Int64, loc, ip) for v in (x3, x2, x1, x0)]
         + [_v(v, Int64, loc, ip) for v in w]
         + [_v(gm, Int32, loc, ip), _v(nl, Int64, loc, ip), _v(one, Int64, loc, ip)],
-        _CONV_FAST2,
+        _CONV_FAST3 if scalar else _CONV_FAST2,
         "=r,=r," + ",".join(["l"] * 8 + ["r", "l", "l"]),
         has_side_effects=False,
         loc=loc,
@@ -1262,7 +1289,10 @@ def epilogue_kda_conv_t2(
         gm = Int32(0)
         for i in cutlass.range_constexpr(16):
             xp = unpack_b64(xr[i])
-            y, gm = conv_fast2(hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2)
+            y, gm = conv_fast2(
+                hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2,
+                getattr(gemm_kernel, "conv_scalar_silu", False),
+            )  # fmt: skip
             ys.append(y)
             hp = [hp[1], hp[2], xp]
         obase = out_addr + (
