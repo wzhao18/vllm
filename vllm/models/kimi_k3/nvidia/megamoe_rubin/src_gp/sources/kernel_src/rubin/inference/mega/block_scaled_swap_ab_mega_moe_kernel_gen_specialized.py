@@ -92,7 +92,7 @@ from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
 )
-from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
+from ......common.ptx_helpers import barrier_sync_unaligned, read_globaltimer_ns, read_smid
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -1663,6 +1663,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 iket.range_push("scheduler.stream_token_blocks")
                 scheduler.compute_stream_token_blocks()
                 iket.range_pop()
+            # DIAG startup sensitivity: hold the first claim 1000 ns.
+            _dly0 = Int64(read_globaltimer_ns())
+            _dly = Int64(0)
+            while _dly < Int64(1000):
+                _dly = Int64(read_globaltimer_ns()) - _dly0
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
