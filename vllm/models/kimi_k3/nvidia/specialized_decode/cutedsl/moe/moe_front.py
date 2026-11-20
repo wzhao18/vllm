@@ -392,23 +392,16 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   // This SM's work item (weight tile, K split) from the host plan, which gives the SMs
   // of each die the items whose weights that die homes; -1: a spare SM (dead rows,
   // top-k rows and the grid counter only). One CTA per SM (grid = SMs, 1 CTA/SM).
+  // The plan entry (a parameter-bank miss) is loaded first and used only after the
+  // barrier init / TMEM allocation / CTA barrier below, which hide its latency.
   uint32_t smid;
   asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-  const int item = __shfl_sync(0xffffffffu, smid < kMaxSmid ? p.smid_item[smid] : -1, 0);
-  const bool work = item >= 0;
-  const int tile = work ? item / p.ks : 0, split = work ? item % p.ks : 0;
-  const int kb0 = split * p.kb / p.ks, nk = (split + 1) * p.kb / p.ks - kb0;
-  const int nt = min(nk, p.nt_max), nr = nk - nt;
-  const int n = a.n, wrow = tile * 128;
-  // The item's K blocks in the image: 16 KiB [128][64] SWIZZLE_128B tiles, items in
-  // order, die 1's items after a gap that starts them on their own 2 MiB chunk.
-  const uint8_t* wblk =
-      p.wimg + (int64_t{tile} * p.kb + kb0 + (item >= p.item_split ? p.item_pad : 0)) * kSlot;
+  const int plan_item = smid < kMaxSmid ? p.smid_item[smid] : -1;
+  const int n = a.n;
 
   if (threadIdx.x == 0) {
     asm volatile("griddepcontrol.launch_dependents;");
     STAMP(0);
-    if (p.stamps) p.stamps[blockIdx.x * kStampStride + 31] = item + 1;
     for (int s = 0; s < p.ns; ++s) {
       mbar_init(full0 + 8 * s, 1);
       mbar_init(empty0 + 8 * s, 1);
@@ -422,12 +415,11 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     mbar_init(res_bar, 1);
     mbar_init(acc_bar, 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    if (nr > 0) mbar_expect_tx(res_bar, nr * kSlot);
   }
   if (threadIdx.x == 32) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tx)) : "memory");
   }
-  if (work && warp == 1) {
+  if (warp == 1) {
     asm volatile(
         "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" ::"r"(
             smem_u32(&s_tmem)));
@@ -438,6 +430,21 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   asm volatile("tcgen05.fence::after_thread_sync;");
   // D: columns [dcol, dcol + n); weight K block j < nt: acol + 32 j. Warp-uniform.
   const uint32_t tmem = __shfl_sync(0xffffffffu, s_tmem, 0);
+  const int item = __shfl_sync(0xffffffffu, plan_item, 0);
+  const bool work = item >= 0;
+  const int tile = work ? item / p.ks : 0, split = work ? item % p.ks : 0;
+  const int kb0 = split * p.kb / p.ks, nk = (split + 1) * p.kb / p.ks - kb0;
+  const int nt = min(nk, p.nt_max), nr = nk - nt;
+  const int wrow = tile * 128;
+  // The item's K blocks in the image: 16 KiB [128][64] SWIZZLE_128B tiles, items in
+  // order, die 1's items after a gap that starts them on their own 2 MiB chunk.
+  const uint8_t* wblk =
+      p.wimg + (int64_t{tile} * p.kb + kb0 + (item >= p.item_split ? p.item_pad : 0)) * kSlot;
+  if (threadIdx.x == 0) {
+    if (p.stamps) p.stamps[blockIdx.x * kStampStride + 31] = item + 1;
+    // A bulk copy may complete before this expectation (the phase needs the arrive).
+    if (work && nr > 0) mbar_expect_tx(res_bar, nr * kSlot);
+  }
 
   // TMA issue: lane 0 of warps 0, 3 and 4-7 (the epilogue warps idle until the
   // accumulator is done). Bulk ops from one issuing warp complete about one at a
@@ -565,7 +572,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("tcgen05.fence::before_thread_sync;");
   __syncthreads();
-  if (work && warp == 1) {
+  if (warp == 1) {
     asm volatile("tcgen05.fence::after_thread_sync;");
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
   }
