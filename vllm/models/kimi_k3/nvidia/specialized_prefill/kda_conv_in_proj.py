@@ -97,7 +97,14 @@ class PrefillKdaConvInProj:
         gemm = self._gemm
         assert gemm is not None, "PrefillKdaConvInProj.prepare() not run"
         rows = qa.data.shape[0]
-        if rows < MIN_ROWS:
+        if rows < MIN_ROWS or torch.cuda.is_current_stream_capturing():
+            # Not inside a CUDA graph: the GEMM's sequence count (grid and
+            # epilogue scan), the has_initial_state tensor and the conv state
+            # rows come from this step's metadata, which a graph would freeze
+            # at capture (a piecewise graph replayed for a later prefill read
+            # and wrote conv state rows of the capture batch: illegal address
+            # on the first prefix-hit prefill). The stock in_proj is captured
+            # instead and the conv runs in the eager KDA break (_forward).
             return None
         md = get_forward_context().attn_metadata
         if not isinstance(md, dict):

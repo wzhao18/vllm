@@ -123,3 +123,26 @@ def test_contiguous_rows_bytes():
         y = contiguous_rows(x)
         assert y.is_contiguous() and y.dtype == x.dtype and y.shape == x.shape
         assert torch.equal(y.view(torch.int16), x.contiguous().view(torch.int16))
+
+
+def test_fused_in_proj_never_captured():
+    """The fused in_proj + conv reads this step's KDA metadata (sequence count,
+    has_initial_state, conv state rows), so it must not be baked into a CUDA
+    graph: under stream capture fused() leaves the batch to the stock in_proj
+    (whose conv runs in the eager KDA break) without launching anything."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        MIN_ROWS,
+        PrefillKdaConvInProj,
+    )
+
+    def _no_gemm(*args, **kwargs):
+        raise AssertionError("fused KDA conv GEMM launched under graph capture")
+
+    fused = PrefillKdaConvInProj.__new__(PrefillKdaConvInProj)
+    fused._gemm = _no_gemm
+    qa = SimpleNamespace(data=torch.empty(MIN_ROWS, 128, device="cuda"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert fused.fused(qa) is None
