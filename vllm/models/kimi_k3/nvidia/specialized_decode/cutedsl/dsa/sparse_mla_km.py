@@ -320,7 +320,7 @@ class SparseMlaDecodeKM:
         self.kernel(kvm, kvr, qn, qr, kv, q, q_heads, rows, slots, slot_stride, valid, out,
                     out_stride, lse, lse_stride, scale_log2, out_scale, stamp).launch(
             grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=self.smem,
-            stream=stream, use_pdl=True)
+            stream=stream)
 
     @cute.kernel
     def kernel(self, kvm: tensormap.GridMap, kvr: tensormap.GridMap,
@@ -357,9 +357,6 @@ class SparseMlaDecodeKM:
             fence_mbar_init()
         if warp == 0:
             tmem_alloc_exclusive(base + Uint32(self.off_tmem))
-        # PDL: barrier init and the TMEM allocation overlap the predecessor (the top-k's redo
-        # kernel); every read of its outputs (row counts, slots, queries, KV) follows the wait
-        cute.arch.griddepcontrol_wait()
         n_mine = (rows - cta + self.grid - 1) // self.grid
         if warp == 1:
             if lane < n_mine:
