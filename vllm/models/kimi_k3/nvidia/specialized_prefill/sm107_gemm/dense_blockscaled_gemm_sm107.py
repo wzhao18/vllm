@@ -1385,9 +1385,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             conv_nseq,
             conv_top,
             conv_nsteps,
-            drain_c_tensor,
             sched_ctr,
             sched_die_map,
+            drain_c_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1444,9 +1444,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
-        mCg_mnl: Optional[cute.Tensor] = None,
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
+        mCg_mnl: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
@@ -2549,9 +2549,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nseq: cutlass.Int32 = cutlass.Int32(0),
         conv_top: cutlass.Int32 = cutlass.Int32(0),
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
-        mCg_mnl: Optional[cute.Tensor] = None,
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
+        mCg_mnl: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2600,9 +2600,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             conv_nseq,
             conv_top,
             conv_nsteps,
-            mCg_mnl,
             sched_ctr,
             sched_die_map,
+            mCg_mnl,
         )
 
     @staticmethod
