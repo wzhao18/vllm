@@ -54,8 +54,43 @@ SHARED = ("shared_gu", "shared_down")
 # Shard rows on the pinned GEMM (``ltpin``). In-step (D3-32 NVFP4 slice, step
 # median vs the router || latent down pair): n32 / n64 -34..-39 / -52..-64 us per
 # 24-layer step; n96 +28..+54 (the GEMM at 96 rows is no faster than the pair), so
-# n96 keeps the stock pair:
-ROUTER_LATENT = {"*": "25-72:ltpin"}
+# n96 runs it as the pre-wait split-K wide GEMM (``cutedsl.gemm.wide``: weights
+# TMA'd before the PDL wait, FP32 partials that route_stage sums in split order):
+ROUTER_LATENT = {"*": "25-72:ltpin,96:wide"}
+# ``wide`` rows -> PreparedWide policy (split, activation warps, weight stages,
+# weight warps, direct exchange, staggered K): 36 tiles x 5 splits = 180 CTAs.
+WIDE_FRONT = {96: (5, (1,), None, (0, 3), False, True)}
+
+
+class RouterLatentGemm:
+    """The router | latent down GEMM over the packed weight per shard rows: pinned
+    cuBLASLt FP32 rows (``ltpin``) or the wide GEMM's FP32 split partials
+    (``wide``; route_stage sums them)."""
+
+    def __init__(self, packed, kinds):
+        from ..cutedsl.gemm.ltpin import LtPin
+        from ..cutedsl.gemm.wide import PreparedWide
+
+        n, k = packed.shape
+        lt = tuple(r for r, kind in kinds.items() if kind == "ltpin")
+        wide = {r: WIDE_FRONT[r] for r, kind in kinds.items() if kind == "wide"}
+        self.n = n
+        self.lt = None
+        if lt:
+            self.lt = LtPin("router_latent", n, k, lt, out32=True, device=packed.device)
+        self.wide = PreparedWide(packed, wide, partials=True).prepare() if wide else None
+        self.splits = {r: policy[0] for r, policy in wide.items()}
+        self.plans = frozenset(self.lt.plans if lt else ()) | frozenset(wide)
+
+    def output(self, h):
+        split = self.splits.get(h.shape[0])
+        shape = (h.shape[0], self.n) if split is None else (split, h.shape[0], self.n)
+        return h.new_empty(shape, dtype=torch.float32)
+
+    def run(self, packed, h, y):
+        if h.shape[0] in self.splits:
+            return self.wide.run(h, y)
+        return self.lt.run(packed, h, y)
 
 
 def _stock_threshold():
@@ -127,26 +162,21 @@ class SpMlp:
         self.mxfp8 = bool(shared_mxfp8(mlp))
         # Router | latent down concatenation (before any GEMM reads the weights:
         # the stock linears become views of the packed weight).
-        concat_rows = tuple(
-            r for r in self.rows
-            if rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) == "ltpin"
-        )  # fmt: skip
+        kinds = {
+            r: rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) for r in self.rows
+        }
+        kinds = {r: kind for r, kind in kinds.items() if kind in ("ltpin", "wide")}
+        concat_rows = tuple(kinds)
         self.router_latent = self.route_stage = None
         if (
             concat_rows
             and router_concat_cause(mlp) is None
             and route_stage_cause(mlp) is None
         ):
-            from ..cutedsl.gemm.ltpin import LtPin
-
             packed = pack_router_latent(mlp)
-            n, k = packed.shape
             self.router_latent = (
-                packed,
-                LtPin("router_latent", n, k, concat_rows, out32=True,
-                      device=packed.device),
-                mlp.gate.weight.shape[0],
-            )  # fmt: skip
+                packed, RouterLatentGemm(packed, kinds), mlp.gate.weight.shape[0]
+            )
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
         try:
             weights = {
@@ -226,8 +256,9 @@ class SpMlp:
         out = {f: self.gemms[f].choice(n) for f in FAMILIES}
         concat = self.router_latent
         if concat is not None and n in concat[1].plans:
+            kind = "wide" if n in concat[1].splits else "ltpin"
             out["latent_down"] = Choice(
-                Path.TUNED, tactic=("ltpin", None), note="router|latent_down ltpin"
+                Path.TUNED, tactic=(kind, None), note=f"router|latent_down {kind}"
             )
         return out
 
@@ -269,7 +300,7 @@ class SpMlp:
             # Router | latent down as one FP32 GEMM, then one kernel stages its
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent
-            y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
+            y = gemm.output(h)
             gemm.run(packed, h, y)
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
