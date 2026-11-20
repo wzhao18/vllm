@@ -168,6 +168,16 @@ def shfl_xor1(value):
 
 
 @asm()
+def st_shared_bf16_pz(address, value):
+    """BF16 (RN) of ``value``, -0 stored as +0, at shared ``address``."""
+    code = (
+        "{ .reg .b16 h; .reg .pred p; cvt.rn.bf16.f32 h,$1; setp.eq.b16 p,h,0x8000; "
+        "@p mov.b16 h,0; st.shared.b16 [$0],h; }"
+    )
+    return code, "r,f,~{memory}", (Int32(address), Float32(value))
+
+
+@asm()
 def st_shared_u32(address, word):
     return "st.shared.b32 [$0], $1;", "r,r,~{memory}", (Int32(address), Uint32(word))
 
@@ -589,6 +599,25 @@ class OprojKsPush:
         return scratch.iterator.toint() + Int64(index + feature * 4) * 4
 
     @cute.jit
+    def _stage_sums(self, own, s0, s1, where, size, stage, feature):
+        """FP32 P0 + P1 + P2 of this thread's feature for the chunk's tokens (``where``:
+        the K-slice positions of (own, slot 0, slot 1)), rounded once to BF16 (-0 made
+        +0: no pushed word is the Lamport sentinel; the owner's sum is unchanged) into
+        the token-major staging tile."""
+        for g in cutlass.range_constexpr(CMAX // 16):
+            t0 = 16 * g
+            if t0 < size:
+                for q in cutlass.range_constexpr(4):
+                    for e in cutlass.range_constexpr(4):
+                        parts = [None, None, None]
+                        parts[where[0]] = own[g][4 * q + e]
+                        parts[where[1]] = s0[4 * g + q][e]
+                        parts[where[2]] = s1[4 * g + q][e]
+                        total = (parts[0] + parts[1]) + parts[2]
+                        st_shared_bf16_pz(stage + ((t0 + 4 * q + e) * 128 + feature) * 2,
+                                          total)  # fmt: skip
+
+    @cute.jit
     def _scatter(self, taddr, scratch, counters, fv, blk, ks, tidx):
         """This K slice's FP32 partials of the two token chunks other slices own:
         thread = TMEM lane = feature, 32 tokens per TMEM wait, written as token quads
@@ -645,22 +674,14 @@ class OprojKsPush:
         # use: one L2 round trip per block (the quads past a 32-row chunk are unused)
         s0 = [ld_f32x4_cg(base0 + quad * 2048) for quad in range(CMAX // 4)]
         s1 = [ld_f32x4_cg(base1 + quad * 2048) for quad in range(CMAX // 4)]
-        for g in cutlass.range_constexpr(CMAX // 16):
-            t0 = 16 * g
-            if t0 < size:
-                for q in cutlass.range_constexpr(4):
-                    for e in cutlass.range_constexpr(4):
-                        mine = own[g][4 * q + e]
-                        a, b = s0[4 * g + q][e], s1[4 * g + q][e]
-                        # slice order: P0 + P1 + P2 (slot (k - ks - 1) mod 3 holds P_k)
-                        p0 = Float32(cutlass.select_(ks == 0, mine, cutlass.select_(ks == 1, b, a)))
-                        p1 = Float32(cutlass.select_(ks == 1, mine, cutlass.select_(ks == 0, a, b)))
-                        p2 = Float32(cutlass.select_(ks == 2, mine, cutlass.select_(ks == 0, b, a)))
-                        total = (p0 + p1) + p2
-                        pair = shfl_xor1(total)  # the neighbouring feature's sum
-                        if (feature & 1) == 0:
-                            word = positive_zero32(bf16x2(total, pair))
-                            st_shared_u32(stage + ((t0 + 4 * q + e) * 128 + feature) * 2, word)
+        # slice order P0 + P1 + P2 (slot (k - ks - 1) mod 3 holds P_k), one uniform
+        # branch per slice: (own, slot 0, slot 1) -> (P0, P1, P2) positions
+        if ks == 0:
+            self._stage_sums(own, s0, s1, (0, 1, 2), size, stage, feature)
+        elif ks == 1:
+            self._stage_sums(own, s0, s1, (1, 2, 0), size, stage, feature)
+        else:
+            self._stage_sums(own, s0, s1, (2, 0, 1), size, stage, feature)
         fence_proxy_async_smem()
         bar_sync(GATHER_BAR, 32 * EPI_WARPS)
         if cutlass.const_expr(self.dbg & 32):
