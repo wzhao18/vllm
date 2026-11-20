@@ -58,6 +58,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         die_claim=die_claim,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
+    gemm.dbg_stamps = bool(dbg & 2)
     gemm.max_ab_stages = max_stages
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
@@ -74,7 +75,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (cute.sym_int() if die_claim else 1,), assumed_align=4
+        cutlass.Float32, (cute.sym_int() if die_claim or dbg & 2 else 1,), assumed_align=4
     )
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
@@ -86,6 +87,80 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
             options=f"--opt-level 2 --gpu-arch={arch} --enable-tvm-ffi",
         )  # fmt: skip
     return compiled, gemm
+
+
+_STAMPED = []
+
+
+@cache
+def _stamp_dir():
+    """D-GEMM debug probe (WIP branch only): a marker file in the source tree turns on
+    per-CTA stamps for every Mxfp8PreGemm and names the directory of the exit dump."""
+    import atexit
+    import os
+
+    import vllm
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
+    marker = os.path.join(root, "benchmarks", "kimi_k3", "dg_stamps.on")
+    if not os.path.exists(marker):
+        return None
+    out = open(marker).read().strip()
+    if not out:
+        return None
+    os.makedirs(out, exist_ok=True)
+
+    def dump():
+        import json
+
+        rows = []
+        for g in list(_STAMPED):
+            torch.cuda.set_device(g.alpha.device)
+            s = torch.cuda.Stream(device=g.alpha.device)
+            with torch.cuda.stream(s):
+                h = g.alpha.view(torch.int32)[512:512 + 4096].to("cpu", non_blocking=True)
+            s.synchronize()
+            v = h.view(-1, 8).tolist()
+            rows.append(dict(n=g.n, k=g.k, rows=g.rows, tactic=repr(g.tactic), stages=g.stages,
+                             ctas=[r for r in v if r[0] != 0]))
+        path = os.path.join(out, f"stamps-{os.getpid()}.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(rows, f)
+        os.replace(path + ".tmp", path)
+
+    import threading
+
+    lock = threading.Lock()  # no dump while a CUDA graph is being captured (and vice versa)
+    cls = torch.cuda.CUDAGraph
+    begin, end = cls.capture_begin, cls.capture_end
+
+    def capture_begin(self, *a, **kw):
+        lock.acquire()
+        return begin(self, *a, **kw)
+
+    def capture_end(self, *a, **kw):
+        try:
+            return end(self, *a, **kw)
+        finally:
+            lock.release()
+
+    cls.capture_begin, cls.capture_end = capture_begin, capture_end
+
+    def loop():  # worker processes are killed, not exited: dump every 3 s
+        import time
+
+        while True:
+            time.sleep(3.0)
+            try:
+                if _STAMPED:
+                    with lock:
+                        dump()
+            except Exception:  # debug probe: keep trying
+                pass
+
+    threading.Thread(target=loop, daemon=True).start()
+    atexit.register(dump)
+    return out
 
 
 class Mxfp8PreGemm:
@@ -102,6 +177,8 @@ class Mxfp8PreGemm:
         if self.swap_ab and tactic[0][1] % 64:  # (measured: N32 / N96 swap tiles store wrong rows)
             raise ValueError(f"Mxfp8PreGemm: swap_ab needs a token tile multiple of 64 ({tactic[0]})")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
+        self.tactic = tactic
+        dbg = int(dbg) | (2 if _stamp_dir() else 0)
         if prewait and prewait > k // tile_k:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
         self.compiled, self.gemm = _compile(
@@ -114,6 +191,10 @@ class Mxfp8PreGemm:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
         self.aux, self.calls = None, 0
+        if dbg & 2:  # D-GEMM debug probe: per-CTA stamps into a large alpha buffer
+            self.alpha = torch.zeros(4608, dtype=torch.float32, device=device)
+            self.alpha[0] = 1.0
+            _STAMPED.append(self)
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
         self.out_layout = "rn"
