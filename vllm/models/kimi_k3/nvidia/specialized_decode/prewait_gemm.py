@@ -96,6 +96,13 @@ __device__ __forceinline__ void mma_e(uint32_t d, uint64_t a, uint64_t b, unsign
 __device__ __forceinline__ void commit_e(uint32_t mb) {
   asm volatile("{.reg .pred P; elect.sync _|P, 0xffffffff; @P tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];}" :: "r"(mb) : "memory");
 }
+__device__ __forceinline__ void ld8nw(uint32_t ta, float* v) {
+  uint32_t r[8];
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]) : "r"(ta));
+#pragma unroll
+  for (int i = 0; i < 8; ++i) v[i] = __uint_as_float(r[i]);
+}
 __device__ __forceinline__ unsigned crank() { unsigned r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
 __device__ __forceinline__ void cluster_sync() {
   asm volatile("barrier.cluster.arrive.release;\nbarrier.cluster.wait.acquire;" ::: "memory");
@@ -118,7 +125,7 @@ __device__ __forceinline__ void cl_wait() { asm volatile("barrier.cluster.wait.a
 
 // warps 0-3 epilogue (TMEM lanes 32w..), warp 4 MMA (+TMEM alloc), warps 5..5+XL-1 X producers, then NW W producers.
 // Template: T tokens (N of the MMA, split into NM = ceil(T/256) MMAs), KB 64-wide K blocks per stage.
-template <int T, int KB>
+template <int T, int KB, int CC>
 __global__ void __launch_bounds__(512, 1) wsg_k(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__ wp,
                                                 void* __restrict__ yv, const P p) {
   constexpr int NM = (T + 255) / 256, NR = T / NM;
@@ -128,7 +135,7 @@ __global__ void __launch_bounds__(512, 1) wsg_k(const __grid_constant__ CUtensor
   __shared__ __align__(8) uint64_t full[8], empty[8], accf;
   __shared__ uint32_t tbase;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const unsigned cx = p.C > 1 ? crank() : 0;
+  const unsigned cx = CC > 1 ? crank() : 0;
   const int rt = blockIdx.y;
   if (threadIdx.x == 0) {
     for (int s = 0; s < p.NS; ++s) { mb_init(sa(&full[s]), 2); mb_init(sa(&empty[s]), 1); }
@@ -136,8 +143,8 @@ __global__ void __launch_bounds__(512, 1) wsg_k(const __grid_constant__ CUtensor
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
-  if (p.C > 1) cl_arrive();  // peers' recv buffers are written only after every CTA of the cluster started
-  const int kb_per_cta = p.K / 64 / p.C;
+  if (CC > 1) cl_arrive();  // peers' recv buffers are written only after every CTA of the cluster started
+  const int kb_per_cta = p.K / 64 / CC;
   const int kb0 = cx * kb_per_cta;
   const int wx0 = 5, ww0 = 5 + p.xlanes;
   if (warp >= ww0) {  // W producers: never wait on the predecessor
@@ -185,7 +192,7 @@ __global__ void __launch_bounds__(512, 1) wsg_k(const __grid_constant__ CUtensor
   }
   // ---- epilogue ----
   float* recv = (float*)(sm + p.recv_off);  // [C src][rpr][T] (T fastest)
-  const int rpr = (128 + p.C - 1) / p.C;
+  constexpr int rpr = (128 + CC - 1) / CC;
   if (warp < 4) {
     asm volatile("bar.sync 1, 160;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -195,7 +202,7 @@ __global__ void __launch_bounds__(512, 1) wsg_k(const __grid_constant__ CUtensor
     if (p.pdl && threadIdx.x == 0) asm volatile("griddepcontrol.launch_dependents;");
     const int r = warp * 32 + lane;
     const uint32_t ta = tm + ((uint32_t)(warp * 32) << 16);
-    if (p.C == 1) {
+    if (CC == 1) {
       const int row = rt * 128 + r;
 #pragma unroll 4
       for (int c = 0; c < T; c += 8) {
@@ -212,30 +219,32 @@ __global__ void __launch_bounds__(512, 1) wsg_k(const __grid_constant__ CUtensor
       const uint32_t dst = sa(&recv[((size_t)cx * rpr + jr) * RS]);
       uint32_t rdst; asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rdst) : "r"(dst), "r"(d));
       const bool own = d == cx;
+      float v[T];
 #pragma unroll
-      for (int c = 0; c < T; c += 16) {
-        float v[16]; ld8(ta + c, v); ld8(ta + c + 8, v + 8);
+      for (int c = 0; c < T; c += 8) ld8nw(ta + c, v + c);
+      asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 #pragma unroll
-        for (int q = 0; q < 16; q += 4) {
-          if (own) *(float4*)&recv[((size_t)cx * rpr + jr) * RS + c + q] = make_float4(v[q], v[q + 1], v[q + 2], v[q + 3]);
-          else asm volatile("st.shared::cluster.v4.f32 [%0], {%1, %2, %3, %4};" :: "r"(rdst + (c + q) * 4), "f"(v[q]), "f"(v[q + 1]), "f"(v[q + 2]), "f"(v[q + 3]) : "memory");
-        }
+      for (int q = 0; q < T; q += 4) {
+        if (own) *(float4*)&recv[((size_t)cx * rpr + jr) * RS + q] = make_float4(v[q], v[q + 1], v[q + 2], v[q + 3]);
+        else asm volatile("st.shared::cluster.v4.f32 [%0], {%1, %2, %3, %4};" :: "r"(rdst + q * 4), "f"(v[q]), "f"(v[q + 1]), "f"(v[q + 2]), "f"(v[q + 3]) : "memory");
       }
     }
-  } else if (p.C > 1) {
+  } else if (CC > 1) {
     cl_wait();
   }
-  if (p.C > 1) {
+  if (CC > 1) {
     cluster_sync();
     if (warp < 4) {
       constexpr int G = T / 4;
       constexpr int RS = T + 4;
+#pragma unroll
       for (int e = threadIdx.x; e < rpr * G; e += 128) {
         const int jr = e % rpr, g = e / rpr;
         const int lr = cx * rpr + jr, row = rt * 128 + lr;
         if (lr >= 128) continue;
         float4 a = *(const float4*)&recv[(size_t)jr * RS + 4 * g];
-        for (int src = 1; src < p.C; ++src) {
+#pragma unroll
+        for (int src = 1; src < CC; ++src) {
           const float4 b = *(const float4*)&recv[((size_t)src * rpr + jr) * RS + 4 * g];
           a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
         }
@@ -269,8 +278,8 @@ EncodeFn encode_fn() {
   return f;
 }
 typedef void (*KF)(CUtensorMap, const uint8_t*, void*, P);
-KF pick(int T, int KB) {
-#define C_(t, kb) if (T == t && KB == kb) return wsg_k<t, kb>;
+KF pick(int T, int KB, int C) {
+#define C_(t, kb) if (T == t && KB == kb) return C == 1 ? wsg_k<t, kb, 1> : C == 2 ? wsg_k<t, kb, 2> : C == 4 ? wsg_k<t, kb, 4> : nullptr;
   C_(32, 1) C_(32, 2) C_(64, 1) C_(64, 2) C_(96, 1) C_(96, 2)
 #undef C_
   return nullptr;
@@ -288,7 +297,7 @@ void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tenso
   const int RT = (N + 127) / 128;
   TORCH_CHECK(wp.numel() * wp.element_size() == (int64_t)RT * 128 * K * 2, "prewait_gemm: packed weight size");
   TORCH_CHECK(K % (64 * C * KB) == 0 && NW <= NS && XL <= NS && NS <= 8, "prewait_gemm: config");
-  KF kf = pick(T, (int)KB);
+  KF kf = pick(T, (int)KB, (int)C);
   TORCH_CHECK(kf, "prewait_gemm: no kernel for T=", T, " KB=", KB);
   P p = {};
   p.N = N; p.K = K; p.T = T; p.C = (int)C; p.KB = (int)KB; p.NS = (int)NS; p.NW = (int)NW; p.RT = RT;
