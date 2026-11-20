@@ -46,14 +46,23 @@ MXFP8_BLOCK = 32
 RING_DEPTH = 2
 GROUPS = 4
 VEC = 8  # BF16 per lane chunk (4 warps per token group; 4 -> 8 warps)
+# Tokens a group claims ahead of the one it processes (> ring depth in rows).
+CLAIM_AHEAD = 5
+PDL = 1
 _SRC = os.path.join(os.path.dirname(__file__), "attn_res_lp.cu")
 _lock = threading.Lock()
 _mod: dict[tuple, object] = {}
 
 
-def _module(probe: int = 0, vec: int = 8, groups: int = 4):
-    """``probe`` != 0: a probe build of the kernel (bench only)."""
-    key = (probe, vec, groups)
+def _module(
+    probe: int = 0,
+    vec: int = VEC,
+    groups: int = GROUPS,
+    claim_ahead: int = CLAIM_AHEAD,
+    pdl: int = 1,
+):
+    """``probe`` != 0 or ``pdl`` == 0: a bench-only build of the kernel."""
+    key = (probe, vec, groups, claim_ahead, pdl)
     if key in _mod:
         return _mod[key]
     with _lock:
@@ -66,7 +75,7 @@ def _module(probe: int = 0, vec: int = 8, groups: int = 4):
             with open(_SRC, "rb") as fh:
                 h.update(fh.read())
             h.update(f"{torch.__version__} {torch.version.cuda}".encode())
-            h.update(f"{probe} {vec} {groups}".encode())
+            h.update(f"{probe} {vec} {groups} {claim_ahead} {pdl}".encode())
             tag = h.hexdigest()[:16]
             build = os.path.join(envs.VLLM_CACHE_ROOT, "k31pf_attn_res_lp", tag)
             os.makedirs(build, exist_ok=True)
@@ -80,6 +89,8 @@ def _module(probe: int = 0, vec: int = 8, groups: int = 4):
                         f"-DK31LP_PROBE={probe}",
                         f"-DK31LP_VEC={vec}",
                         f"-DK31LP_G={groups}",
+                        f"-DK31LP_QA={claim_ahead}",
+                        f"-DK31LP_PDL={pdl}",
                         "--use_fast_math",
                         "--expt-relaxed-constexpr",
                         "-U__CUDA_NO_HALF_OPERATORS__",
@@ -258,7 +269,11 @@ def attn_res(
             # mxfp8_quantize writes them; the kernel fills the real rows.
             sf.view(-1, 128 * (HIDDEN // MXFP8_BLOCK))[-1].zero_()
     _module(
-        _probe, VEC if _vec is None else _vec, GROUPS if _groups is None else _groups
+        _probe,
+        VEC if _vec is None else _vec,
+        GROUPS if _groups is None else _groups,
+        CLAIM_AHEAD,
+        PDL,
     ).attn_res_lp(
         prefix,
         prefix_out,

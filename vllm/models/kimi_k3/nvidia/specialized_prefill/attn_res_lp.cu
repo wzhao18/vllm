@@ -52,6 +52,9 @@ constexpr int NT = H / (7 * VEC);  // threads per token group (128 at VEC 8)
 constexpr int NCH = H / (NT * VEC);  // 7 chunks per thread
 constexpr int MAXB = 8;
 constexpr float LOG2_E = 1.4426950408889634f;
+#ifndef K31LP_PDL
+#define K31LP_PDL 1  // programmatic dependent launch (0: bench A/B builds only)
+#endif
 #ifndef K31LP_PROBE
 #define K31LP_PROBE 0  // probe builds only (bench): 1 no block math, 2 no epilogue,
                        // 4 no output stores, 8 no CTA barriers (wrong values)
@@ -188,8 +191,12 @@ constexpr uint32_t SEG_BYTES = SEG * 2;
 #endif
 // Token claim queue: positions claimed QA ahead of the consumer (>= the
 // producer's run-ahead of D rows), QN entries.
-constexpr int QA = 5;
+#ifndef K31LP_QA
+#define K31LP_QA 5
+#endif
+constexpr int QA = K31LP_QA;
 constexpr int QN = 8;
+static_assert(QA < QN && (QN & (QN - 1)) == 0);
 constexpr int G = K31LP_G;
 constexpr int CTA_THREADS = NT * G;
 // One lane's VEC BF16 values.
@@ -309,14 +316,6 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   auto start_claim = [&]() -> int {
     return own_done ? cnt_own : atomicAdd(&a.claim[die], 1);
   };
-  if (tid == 0) {
-    const int j = atomicAdd(&a.claim[die], QA);  // first QA positions at once
-#pragma unroll 1
-    for (int i = 0; i < QA; ++i) {
-      sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
-                                    : finish_claim(own_done ? 0 : cnt_own);
-    }
-  }
 
   if (lane == 0) {
 #pragma unroll
@@ -335,6 +334,21 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     reinterpret_cast<float4*>(sm.w)[i] = __ldg(reinterpret_cast<const float4*>(a.w) + i);
     if constexpr (NORM)
       reinterpret_cast<uint2*>(sm.onw)[i] = __ldg(reinterpret_cast<const uint2*>(a.onw) + i);
+  }
+#if K31LP_PDL
+  // Programmatic dependent launch: everything above reads only per-call
+  // constants. The prefix / delta rows, the logits, the claim counters and
+  // every output belong to this call's dependency chain: wait for the
+  // preceding grid before touching any of them.
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+  if (tid == 0) {
+    const int j = atomicAdd(&a.claim[die], QA);  // first QA positions at once
+#pragma unroll 1
+    for (int i = 0; i < QA; ++i) {
+      sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
+                                    : finish_claim(own_done ? 0 : cnt_own);
+    }
   }
   __syncthreads();
 
@@ -627,8 +641,19 @@ void launch_t(const Args& a, cudaStream_t st) {
   }
   const int grid = std::min((a.T + G - 1) / G, occ * sms);  // co-resident
   if (grid <= 0) return;
-  k<<<grid, CTA_THREADS, smem, st>>>(a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // PDL: the CTAs become resident as the preceding kernel's CTAs exit and
+  // load the per-call constants before griddepcontrol.wait.
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(grid);
+  cfg.blockDim = dim3(CTA_THREADS);
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = K31LP_PDL;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, a));
 }
 
 template <int D>
