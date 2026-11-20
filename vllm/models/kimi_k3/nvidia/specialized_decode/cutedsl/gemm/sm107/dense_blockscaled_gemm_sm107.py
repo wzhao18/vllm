@@ -719,6 +719,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         )
         if getattr(self, "max_ab_stages", 0):
             self.num_ab_stage = min(self.num_ab_stage, self.max_ab_stages)
+        # (prewait < 0: every smem stage; never more stages than the ring holds, or the
+        # producer would wait for a free slot before griddepcontrol.wait forever)
+        if self.prewait_stages < 0 or self.prewait_stages > self.num_ab_stage:
+            self.prewait_stages = self.num_ab_stage
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(

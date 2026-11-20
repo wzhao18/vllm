@@ -36,6 +36,8 @@ from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "pre")
 
 # "pre" tactics: (first R, last R, (tile_mn, cluster_mn, swap_ab, inst_m), weight k-blocks
+# (-1: every smem stage; D-GEMM R7-1: behind the gather at carve-out 100 a normal-mode
+# CTA is resident the whole gather window, so its ring fills before the dependency)
 # issued before griddepcontrol.wait), per weight [N, K] (``PRE_TACTICS``) else by R
 # (``PRE_DEFAULT``: FlashInfer's untuned sm_107 picks at 128 / 256 / 512 rows, without
 # swap_ab). VR200 GEMM-EX1 r2/r3 (1 GPU, CUDA-graph chain of 16 calls on cold weight
@@ -49,11 +51,11 @@ PRE_DEFAULT = (
 )
 PRE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
-        (1, 128, ((128, 64), (1, 1), False, 128), 8),
-        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (1, 128, ((128, 64), (1, 1), False, 128), -1),
+        (129, 256, ((256, 128), (2, 1), False, 256), -1),
         # R257-384: swap_ab 2-CTA M256 (W) x N192 (tokens), 6 smem stages: 315 vs 361 MB
         # SM-delivered at R384, cold chain 16.13 vs 16.83 us/call (D-GEMM R4-7)
-        (257, 384, ((256, 192), (2, 1), True, 256), 4, 6),
+        (257, 384, ((256, 192), (2, 1), True, 256), -1, 6),
         (385, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /

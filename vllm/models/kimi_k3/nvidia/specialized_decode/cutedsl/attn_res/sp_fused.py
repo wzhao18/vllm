@@ -44,13 +44,14 @@ from cutlass import Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common import mx_rows
-from ..common.host import architecture, dynamic_fake, fake
+from ..common.host import architecture, dynamic_fake, fake, prepare_shared_carveout
 from ..common.mailbox import poll, rearm
 from ..common.primitives import at, launch, load_words, store_relaxed
 from ..common.sp_comm import positive_zero32
 from .kernel import ClusterAttnRes
 
 CLUSTER = 7  # CTAs per row (1024 columns each)
+GATHER_CARVEOUT = 100  # preferred shared-memory carve-out (percent), compile_gather
 # (kind, nb) -> (CTAs per SM, SMs, registers, smem allowance) of the compiled codes
 RESIDENCY: dict = {}
 THREADS = 128
@@ -264,7 +265,11 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts
         RESIDENCY[("gather", nb, mx) + ((parts,) if parts else ())] = _check_clusters(
             code, device, n_max, "SP AttnRes + all-gather"
         )
-    return code
+        # The in-projection behind this kernel (PDL, released at entry) requests its
+        # weight tiles before griddepcontrol.wait: at the driver's default carve-out
+        # an SM hosting these CTAs keeps a small shared-memory configuration, so no
+        # GEMM CTA fits beside them until they exit.
+        return prepare_shared_carveout(code, device, GATHER_CARVEOUT)
 
 
 @cache
