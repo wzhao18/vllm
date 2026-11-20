@@ -41,7 +41,10 @@ ARMS = [
     ("l4", "lp4"),
 ]
 #: cluster -> (swizzle, raster) as in the B3 tactics.
-RASTER = {(2, 1): (8, "n"), (4, 1): (8, "n"), (2, 4): (4, "m"), (2, 2): (8, "n")}
+RASTER = {
+    (2, 1): (8, "n"), (4, 1): (8, "n"), (2, 4): (4, "m"), (2, 2): (8, "n"),
+    (2, 8): (4, "m"), (4, 4): (4, "m"),
+}
 
 
 def sustained(fn, seconds=1.5):
@@ -95,6 +98,7 @@ def main():
     ap.add_argument("--cool", type=float, default=2.0, help="idle s before bursts")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--ncu", action="store_true", help="one profiled call per arm")
+    ap.add_argument("--tn", default="256", help="N tile sizes to sweep (comma list)")
     args = ap.parse_args()
 
     from vllm.models.kimi_k3.nvidia.ops import kda_conv
@@ -139,10 +143,12 @@ def main():
             if name in sus:
                 res[name + "_sus"] = sustained(fn)
         print(json.dumps(res), flush=True)
-        for cl in clusters:
-            for arm, flag in arms:
-                tac = ((512, 256), cl, 256, *RASTER[cl], 0, 0, flag)
-                row = {"m": m, "cluster": "%dx%d" % cl, "arm": arm}
+        for cl, tn, (arm, flag) in [
+            (c, int(t), a) for c in clusters for t in args.tn.split(",") for a in arms
+        ]:
+            if True:
+                tac = ((512, tn), cl, 256, *RASTER[cl], 0, 0, flag)
+                row = {"m": m, "cluster": "%dx%d" % cl, "tn": tn, "arm": arm}
                 try:
                     g = KdaConvGemm(wq, ws, cw, p, tactic=tac)
                     st = state0.clone()

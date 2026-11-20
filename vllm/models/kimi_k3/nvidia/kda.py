@@ -75,6 +75,7 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     kda as specialized_prefill_kda,
 )
+from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_dielocal
 from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
     contiguous_rows,
 )
@@ -1671,6 +1672,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     initial_state=initial_state,
                                     cu_seqlens=non_spec_query_start_loc,
                                     cu_seqlens_cpu=m.non_spec_query_start_loc_cpu,
+                                    out=kda_dielocal.core_out(
+                                        q_ns.shape[1],
+                                        q_ns.shape[2],
+                                        q_ns.shape[3],
+                                        q_ns.device,
+                                    ),
                                 )
                             )
                         else:

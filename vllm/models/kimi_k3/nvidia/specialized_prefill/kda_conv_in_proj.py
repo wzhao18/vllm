@@ -16,6 +16,7 @@ smaller batches, keep the stock in_proj + conv.
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.models.kimi_k3.nvidia.specialized_prefill import kda_dielocal
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 MIN_ROWS = 2048
@@ -125,12 +126,18 @@ class PrefillKdaConvInProj:
             m.non_spec_state_indices_tensor, m.has_initial_state,
             null_block_id=NULL_BLOCK_ID,
         )  # fmt: skip
+        mm = {}
+        # Die-homed rows: the o_norm pass reads the gate columns of these rows.
+        rows_out = kda_dielocal.proj_rows(rows, self.w_rest.shape[0], qa.data.device)
+        if rows_out is not None:
+            mm["out"] = rows_out
         rest = torch._scaled_mm(
             qa.data,
             self.w_rest.t(),
             scale_a=qa.scale.view(torch.float8_e8m0fnu),
             scale_b=self.s_rest.view(torch.float8_e8m0fnu),
             out_dtype=torch.bfloat16,
+            **mm,
         )
         return planes, rest
 

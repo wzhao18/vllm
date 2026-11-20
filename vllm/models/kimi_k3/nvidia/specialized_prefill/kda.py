@@ -127,10 +127,12 @@ def persistent_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
-    (sequence, head) chain pieces once per batch)."""
+    (sequence, head) chain pieces once per batch). ``out``: optional
+    (1, T, H, D) output buffer (e.g. die-homed rows for the o_norm pass)."""
     from .kda_persistent import forward as kp
 
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
@@ -142,7 +144,8 @@ def persistent_prefill(
             _persistent_plans.clear()
         plan = kp.make_plan(list(offsets), H, q.device)
         _persistent_plans[key] = plan
-    out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
+    if out is None:
+        out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
     final_state = torch.empty_like(initial_state)
     kp.fwd(
         q.contiguous(),
