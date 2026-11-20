@@ -248,6 +248,10 @@ def main():
             for cta in last:
                 ph = " ".join(f"{nm}={s[cta, i].item():.2f}" for nm, i in cols.items() if sv[cta, i] != 0)
                 print(f"  late cta{cta} (tile {cta // ks}, split {cta % ks}): {ph}", flush=True)
+                if sv[cta, 27] != 0:
+                    rb = " ".join(str(int(sv[cta, 58 + i] - sv[cta, 27])) for i in range(6))
+                    print(f"  late cta{cta} route clk after topk-go (entry sorted pass1 barrier pass2 end): {rb}",
+                          flush=True)
             c0 = int(sv[0, 32])
             rd = [int(sv[0, 32 + j]) - c0 for j in range(24) if sv[0, 32 + j] != 0]
             print("  cta0 clk per K block: " + " ".join(str(b - a) for a, b in zip(rd, rd[1:])), flush=True)

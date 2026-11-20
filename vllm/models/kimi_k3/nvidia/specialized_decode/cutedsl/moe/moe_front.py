@@ -520,6 +520,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     }
     __syncthreads();
     if (threadIdx.x == 0) STAMP(4);
+    if (threadIdx.x == 0 && p.stamps) p.stamps[blockIdx.x * kStampStride + 27] = clock64();
     const int64_t stride = int64_t{n} * 128;
     float lg[kPer];
 #pragma unroll
@@ -542,7 +543,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       }
       lg[j] = acc;
     }
-    route_block(a, row, lg, s_bias, s_unb, s_cand);  // warps 1.. return inside
+    route_block(a, row, lg, s_bias, s_unb, s_cand,  // warps 1.. return inside
+                p.stamps ? p.stamps + blockIdx.x * kStampStride + 58 : nullptr);
   }
   if (threadIdx.x == 0) {
     STAMP(5);

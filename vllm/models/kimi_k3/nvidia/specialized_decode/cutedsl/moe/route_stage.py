@@ -162,10 +162,16 @@ __device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
 // Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
 // warp 0 selects the top-k of the 8 sorted warp lists (exact:
 // the global top-k is inside the union of the per-warp top-k).
+// clk (microbench only, null otherwise): thread 0 records clock64 at the phase ends
+// [entry, keys sorted, pass 1, block barrier, pass 2, outputs].
 __device__ __forceinline__ void route_block(const Args& a, int32_t row,
                                             const float (&lg)[kPer],
                                             const float* s_bias, float* s_unb,
-                                            uint64_t* s_cand) {
+                                            uint64_t* s_cand,
+                                            unsigned long long* clk = nullptr) {
+#define RB_CLK(i) \
+  if (clk != nullptr && threadIdx.x == 0) clk[i] = clock64()
+  RB_CLK(0);
   int32_t const lane = threadIdx.x & 31;
   int32_t const wid = threadIdx.x >> 5;
   int32_t const num_experts = a.num_logits;
@@ -183,15 +189,19 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
     }
   }
   sort_desc<kPer>(k1);
+  RB_CLK(1);
   uint64_t const w = warp_select<kPer>(k1, lane, topk);
+  RB_CLK(2);
   s_cand[wid * 32 + lane] = w;
   __syncthreads();
+  RB_CLK(3);
   if (wid != 0) return;
   // Lane l: warp l / 4's ranks (l % 4) * 8 .. + 8 (already descending).
   uint64_t k2[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) k2[j] = s_cand[(lane >> 2) * 32 + (lane & 3) * 8 + j];
   uint64_t const lane_packed = warp_select<8>(k2, lane, topk);
+  RB_CLK(4);
 
   auto warp = cg::tiled_partition<32>(cg::this_thread_block());
   float lane_score = -INFINITY;
@@ -238,6 +248,8 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
   for (int32_t c = a.hidden / vec + lane; c < a.sf_cols; c += 32) {
     a.sf[int64_t{row} * a.sf_stride + c] = 0;
   }
+  RB_CLK(5);
+#undef RB_CLK
 }
 
 __device__ __forceinline__ float bf16_rn(float v) {
