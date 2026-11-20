@@ -1,0 +1,1 @@
+{"label": "C512", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1118813-dsrel-c512-xdr-1117225524", "gpus": 32, "ok": 55887, "err": 10, "span_min": 60.5, "tput_per_gpu": 64045.4, "p90_itl_ms": 11.698, "p90_intvty": 85.48, "p90_e2e_norm_intvty": 8.5, "p90_e2el_s": 35.497, "p90_ttft_s": 16.212, "p50_ttft_s": 11.667}

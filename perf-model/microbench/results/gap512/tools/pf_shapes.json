@@ -1,0 +1,7 @@
+{"cases": [
+ {"name": "pf_q12k_L78k", "requests": [{"query_len": 12288, "kv_len": 78336, "num_draft_tokens": 0, "chunked": true}]},
+ {"name": "pf_q2x6k_L78k", "requests": [{"query_len": 6144, "kv_len": 78336, "num_draft_tokens": 0, "chunked": true, "count": 2}]},
+ {"name": "pf_q8k_L78k", "requests": [{"query_len": 8192, "kv_len": 78336, "num_draft_tokens": 0, "chunked": true}]},
+ {"name": "pf_q16k_L78k", "requests": [{"query_len": 16384, "kv_len": 78336, "num_draft_tokens": 0, "chunked": true}]},
+ {"name": "pf_q12k_fresh", "requests": [{"query_len": 12288, "kv_len": 12288, "num_draft_tokens": 0}]}
+]}

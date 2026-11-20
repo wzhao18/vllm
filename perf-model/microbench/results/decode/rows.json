@@ -1,0 +1,1457 @@
+[
+ {
+  "case": "d1k7hi2:q8_B64_M512_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24767.0,
+  "t_sol_us": 10500.0,
+  "t_ach_us": 16220.0,
+  "derate": 1.527,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1hi2/d1k7hi2.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7hi2:q8_B128_M1024_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 128,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 51171.4,
+  "t_sol_us": 14640.0,
+  "t_ach_us": 22860.0,
+  "derate": 2.238,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1hi2/d1k7hi2.log; KERNEL-DEBUG (derate > 2)",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3lo:q4_B1_M4_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.0625,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 5183.2,
+  "t_sol_us": 2205.0,
+  "t_ach_us": 3606.0,
+  "derate": 1.437,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k3/d1k3lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3lo:q4_B2_M8_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 2,
+  "r_per_gpu": 0.125,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 5108.0,
+  "t_sol_us": 2603.0,
+  "t_ach_us": 4206.0,
+  "derate": 1.214,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k3/d1k3lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3lo:q4_B4_M16_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 0.25,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 6832.1,
+  "t_sol_us": 3346.0,
+  "t_ach_us": 5320.0,
+  "derate": 1.284,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k3/d1k3lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3lo:q4_B16_M64_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 11076.4,
+  "t_sol_us": 5835.0,
+  "t_ach_us": 8951.0,
+  "derate": 1.237,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k3/d1k3lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3lo:q4_B64_M256_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 18277.2,
+  "t_sol_us": 8434.0,
+  "t_ach_us": 13080.0,
+  "derate": 1.397,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k3/d1k3lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3lo:q4_B128_M512_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 128,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 25093.4,
+  "t_sol_us": 10610.0,
+  "t_ach_us": 16500.0,
+  "derate": 1.521,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k3/d1k3lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7lo:q8_B1_M8_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.0625,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 4871.9,
+  "t_sol_us": 2614.0,
+  "t_ach_us": 4224.0,
+  "derate": 1.153,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k7/d1k7lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7lo:q8_B2_M16_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 2,
+  "r_per_gpu": 0.125,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 6659.1,
+  "t_sol_us": 3356.0,
+  "t_ach_us": 5339.0,
+  "derate": 1.247,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k7/d1k7lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7lo:q8_B4_M32_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 0.25,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 8745.2,
+  "t_sol_us": 4524.0,
+  "t_ach_us": 6996.0,
+  "derate": 1.25,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k7/d1k7lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7lo:q8_B16_M128_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 15022.2,
+  "t_sol_us": 7109.0,
+  "t_ach_us": 10970.0,
+  "derate": 1.369,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d1k7/d1k7lo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B1_M4_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.125,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 7318.5,
+  "t_sol_us": 3444.0,
+  "t_ach_us": 5092.0,
+  "derate": 1.437,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c3/d2k3c.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B2_M8_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 2,
+  "r_per_gpu": 0.25,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 10760.6,
+  "t_sol_us": 4043.0,
+  "t_ach_us": 6012.0,
+  "derate": 1.79,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c3/d2k3c.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B4_M16_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 0.5,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 11099.3,
+  "t_sol_us": 5132.0,
+  "t_ach_us": 7680.0,
+  "derate": 1.445,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c3/d2k3c.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B8_M32_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 8,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 15484.3,
+  "t_sol_us": 6943.0,
+  "t_ach_us": 10450.0,
+  "derate": 1.482,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c3/d2k3c.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B32_M128_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 33304.2,
+  "t_sol_us": 11750.0,
+  "t_ach_us": 17780.0,
+  "derate": 1.873,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c3/d2k3c.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B64_M256_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 38863.3,
+  "t_sol_us": 13670.0,
+  "t_ach_us": 20540.0,
+  "derate": 1.892,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c3/d2k3c.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k3c:q4_B72_M288_u132k",
+  "topology": "D2",
+  "k": 3,
+  "B_per_dp_rank": 72,
+  "r_per_gpu": 9.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 42663.7,
+  "t_sol_us": 14040.0,
+  "t_ach_us": 21060.0,
+  "derate": 2.026,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r8-12; log d2c3/d2k3c.log; KERNEL-DEBUG (derate > 2)",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7c40:q8_B40_M320_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 40,
+  "r_per_gpu": 5.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 47115.2,
+  "t_sol_us": 14260.0,
+  "t_ach_us": 21215.0,
+  "derate": 2.221,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r4-6; log d2c7/d2k7c40.log; KERNEL-DEBUG (derate > 2)",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7c48:q8_B48_M384_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 48,
+  "r_per_gpu": 6.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 49497.5,
+  "t_sol_us": 14970.0,
+  "t_ach_us": 22180.0,
+  "derate": 2.232,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2c7/d2k7c48.log; KERNEL-DEBUG (derate > 2)",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7tplo:q8_B1_M8_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.125,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 9367.5,
+  "t_sol_us": 4051.0,
+  "t_ach_us": 6028.0,
+  "derate": 1.554,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2k7tpb/d2k7tplo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7tplo:q8_B2_M16_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 2,
+  "r_per_gpu": 0.25,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 10937.8,
+  "t_sol_us": 5137.0,
+  "t_ach_us": 7696.0,
+  "derate": 1.421,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2k7tpb/d2k7tplo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7tplo:q8_B4_M32_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 0.5,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 15447.2,
+  "t_sol_us": 6940.0,
+  "t_ach_us": 10450.0,
+  "derate": 1.478,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2k7tpb/d2k7tplo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7tplo:q8_B8_M64_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 8,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 20964.0,
+  "t_sol_us": 9460.0,
+  "t_ach_us": 14160.0,
+  "derate": 1.481,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2k7tpb/d2k7tplo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d2k7tplo:q8_B32_M256_u132k",
+  "topology": "D2",
+  "k": 7,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 38506.7,
+  "t_sol_us": 13550.0,
+  "t_ach_us": 20250.0,
+  "derate": 1.902,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d2k7tpb/d2k7tplo.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3:q4_B1_M4_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.25,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 15567.1,
+  "t_sol_us": 5368.0,
+  "t_ach_us": 8158.0,
+  "derate": 1.908,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3/d3k3.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3:q4_B2_M8_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 2,
+  "r_per_gpu": 0.5,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 17573.5,
+  "t_sol_us": 6179.0,
+  "t_ach_us": 9410.0,
+  "derate": 1.868,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3/d3k3.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3:q4_B4_M16_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 21112.6,
+  "t_sol_us": 7271.0,
+  "t_ach_us": 11090.0,
+  "derate": 1.904,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3/d3k3.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3:q4_B8_M32_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 8,
+  "r_per_gpu": 2.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 22328.4,
+  "t_sol_us": 8319.0,
+  "t_ach_us": 12710.0,
+  "derate": 1.757,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3/d3k3.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3:q4_B16_M64_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24875.6,
+  "t_sol_us": 9007.0,
+  "t_ach_us": 13740.0,
+  "derate": 1.81,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3/d3k3.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3:q4_B32_M128_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24160.5,
+  "t_sol_us": 9688.0,
+  "t_ach_us": 14700.0,
+  "derate": 1.644,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3/d3k3.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3b48:q4_B48_M192_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 48,
+  "r_per_gpu": 12.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 27217.3,
+  "t_sol_us": 10340.0,
+  "t_ach_us": 15600.0,
+  "derate": 1.745,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3hi/d3k3b48.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3b64:q4_B64_M256_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 16.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 30304.4,
+  "t_sol_us": 11280.0,
+  "t_ach_us": 16510.0,
+  "derate": 1.836,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3hi/d3k3b64.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3b96:q4_B96_M384_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 96,
+  "r_per_gpu": 24.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 33340.4,
+  "t_sol_us": 13180.0,
+  "t_ach_us": 18840.0,
+  "derate": 1.77,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log d3hi/d3k3b96.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7p:q8_B1_M8_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.0625,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 4872.2,
+  "t_sol_us": 2614.0,
+  "t_ach_us": 4224.0,
+  "derate": 1.153,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof1/d1k7p/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7p:q8_B16_M128_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 15059.2,
+  "t_sol_us": 7109.0,
+  "t_ach_us": 10970.0,
+  "derate": 1.373,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof1/d1k7p/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7p:q8_B128_M1024_u132k",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 128,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 51654.3,
+  "t_sol_us": 14640.0,
+  "t_ach_us": 22860.0,
+  "derate": 2.26,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof1/d1k7p/agentx.log; KERNEL-DEBUG (derate > 2)",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3pb:q4_B16_M64_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 10679.3,
+  "t_sol_us": 5835.0,
+  "t_ach_us": 8951.0,
+  "derate": 1.193,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof1b/d1k3pb/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3pb:q4_B128_M512_u132k",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 128,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 25062.1,
+  "t_sol_us": 10610.0,
+  "t_ach_us": 16500.0,
+  "derate": 1.519,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof1b/d1k3pb/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3p:q4_B4_M16_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 21223.4,
+  "t_sol_us": 7271.0,
+  "t_ach_us": 11090.0,
+  "derate": 1.914,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof3/d3k3p/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3p:q4_B32_M128_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24283.1,
+  "t_sol_us": 9688.0,
+  "t_ach_us": 14700.0,
+  "derate": 1.652,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof3/d3k3p/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3p64:q4_B64_M256_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 16.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 30101.6,
+  "t_sol_us": 11280.0,
+  "t_ach_us": 16510.0,
+  "derate": 1.823,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": true,
+  "notes": "model exact; log prof3/d3k3p64/agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3-int5-c160-agentx:q4_B16_M64_agentx",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 10760.9,
+  "t_sol_us": 5835.0,
+  "t_ach_us": 8951.0,
+  "derate": 1.202,
+  "ctx_mean": 188992,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d1k3-int5-c160-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3-int5-c160-agentx:q4_B28_M112_agentx",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 28,
+  "r_per_gpu": 1.75,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 13916.7,
+  "t_sol_us": 6868.5,
+  "t_ach_us": 10600.0,
+  "derate": 1.313,
+  "ctx_mean": 189440,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r1.5-2; log reuse_int5/d1k3-int5-c160-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k3-int5-c160-agentx:q4_B38_M152_agentx",
+  "topology": "D1",
+  "k": 3,
+  "B_per_dp_rank": 38,
+  "r_per_gpu": 2.375,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 15290.4,
+  "t_sol_us": 7389.5,
+  "t_ach_us": 11472.5,
+  "derate": 1.333,
+  "ctx_mean": 189952,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r2-3; log reuse_int5/d1k3-int5-c160-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7-int5-c64-agentx:q8_B1_M8_agentx",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 1,
+  "r_per_gpu": 0.0625,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 4809.0,
+  "t_sol_us": 2614.0,
+  "t_ach_us": 4224.0,
+  "derate": 1.138,
+  "ctx_mean": 139264,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d1k7-int5-c64-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7-int5-c64-agentx:q8_B2_M16_agentx",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 2,
+  "r_per_gpu": 0.125,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 6432.8,
+  "t_sol_us": 3356.0,
+  "t_ach_us": 5339.0,
+  "derate": 1.205,
+  "ctx_mean": 159232,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d1k7-int5-c64-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7-int5-c64-agentx:q8_B6_M48_agentx",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 6,
+  "r_per_gpu": 0.375,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 10347.0,
+  "t_sol_us": 5177.5,
+  "t_ach_us": 7974.5,
+  "derate": 1.298,
+  "ctx_mean": 190122,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r0.25-0.5; log reuse_int5/d1k7-int5-c64-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d1k7-int5-c64-agentx:q8_B12_M96_agentx",
+  "topology": "D1",
+  "k": 7,
+  "B_per_dp_rank": 12,
+  "r_per_gpu": 0.75,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 13385.9,
+  "t_sol_us": 6470.0,
+  "t_ach_us": 9961.5,
+  "derate": 1.344,
+  "ctx_mean": 196010,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r0.5-1; log reuse_int5/d1k7-int5-c64-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3-int5-c512-agentx:q4_B4_M16_agentx",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 21192.7,
+  "t_sol_us": 7271.0,
+  "t_ach_us": 11090.0,
+  "derate": 1.911,
+  "ctx_mean": 174080,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d3k3-int5-c512-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3-int5-c512-agentx:q4_B16_M64_agentx",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24809.8,
+  "t_sol_us": 9007.0,
+  "t_ach_us": 13740.0,
+  "derate": 1.806,
+  "ctx_mean": 188992,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d3k3-int5-c512-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3-int5-c512-agentx:q4_B32_M128_agentx",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24831.6,
+  "t_sol_us": 9688.0,
+  "t_ach_us": 14700.0,
+  "derate": 1.689,
+  "ctx_mean": 189920,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d3k3-int5-c512-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3-int5-c512-agentx:q4_B50_M200_agentx",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 50,
+  "r_per_gpu": 12.5,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 29131.8,
+  "t_sol_us": 10457.5,
+  "t_ach_us": 15713.8,
+  "derate": 1.854,
+  "ctx_mean": 190033,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model interp r12-16; log reuse_int5/d3k3-int5-c512-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "d3k3-int5-c512-agentx:q4_B64_M256_agentx",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 16.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 31597.0,
+  "t_sol_us": 11280.0,
+  "t_ach_us": 16510.0,
+  "derate": 1.914,
+  "ctx_mean": 190048,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "model exact; log reuse_int5/d3k3-int5-c512-agentx.log",
+  "kind": "step"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): deep_gemm sm100_fp8_fp4_mega_moe_situ + prepare inputs (vendored megamoe_rubin / DeepGEMM)",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine"
+  ],
+  "measured_us": 10376,
+  "t_sol_us": 5225.9,
+  "t_ach_us": 7902.7,
+  "derate": 1.31,
+  "notes": "",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): nvjet splitK/2cta BF16 GEMMs (cuBLAS)",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "KDA.in_proj",
+   "KDA.f_b_proj",
+   "KDA.o_proj",
+   "DSA.qkv_a_packed",
+   "DSA.qb_wq_packed",
+   "DSA.g_proj",
+   "DSA.o_proj",
+   "MOE.latent_down",
+   "MOE.latent_up",
+   "MOE.shared_gate_up",
+   "MOE.shared_down",
+   "DENSE.*",
+   "L.attnres_*"
+  ],
+  "measured_us": 9580,
+  "t_sol_us": 2577.8,
+  "t_ach_us": 4078.9,
+  "derate": 2.35,
+  "notes": "mla_proj incl. W_UK/W_UV in the model; measured MlaQuery kernel counted under DSA below KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): sdec KdaWide",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "KDA.conv",
+   "KDA.gate_beta_norm",
+   "KDA.core_decode",
+   "KDA.o_norm"
+  ],
+  "measured_us": 1616,
+  "t_sol_us": 383.4,
+  "t_ach_us": 604.5,
+  "derate": 2.67,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): MlaQuery + trtllm-gen sparse FMHA + DsaIndex + QueryNorm (excl. QueryWait 526 us)",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv",
+   "DSA.gate_mul"
+  ],
+  "measured_us": 1785,
+  "t_sol_us": 49.7,
+  "t_ach_us": 78.7,
+  "derate": 22.68,
+  "notes": "model w_uk/w_uv live in mla_proj; MlaQuery alone 1174 us KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): deep_gemm paged_mqa_logits + top-k",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "DSA.idx_q_quant",
+   "DSA.idx_score",
+   "DSA.topk"
+  ],
+  "measured_us": 871,
+  "t_sol_us": 111.0,
+  "t_ach_us": 157.6,
+  "derate": 5.53,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): k31dcpx topk_merge + DCP value + topk_pp",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "P6",
+   "P7b",
+   "P8"
+  ],
+  "measured_us": 1726,
+  "t_sol_us": 385.1,
+  "t_ach_us": 440.6,
+  "derate": 3.92,
+  "notes": "topk_merge alone 1185 us vs P8 152 us KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B32 (r8): sdec SpAllGather + SpReduceScatter",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "P2",
+   "P3b"
+  ],
+  "measured_us": 1208,
+  "t_sol_us": 681.4,
+  "t_ach_us": 758.0,
+  "derate": 1.59,
+  "notes": "",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B4 (r1): mega_moe_situ (+prep)",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine"
+  ],
+  "measured_us": 8483,
+  "t_sol_us": 3642.7,
+  "t_ach_us": 5435.9,
+  "derate": 1.56,
+  "notes": "component median over ranks",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B4 (r1): nvjet BF16 GEMMs",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "KDA/DSA/MOE latent+shared/DENSE projections"
+  ],
+  "measured_us": 10460,
+  "t_sol_us": 2491.2,
+  "t_ach_us": 3943.6,
+  "derate": 2.65,
+  "notes": "component median; top kernel nvjet 128x8 splitK 1564 us KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B4 (r1): sdec KDA",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "KDA.core_decode",
+   "KDA.conv"
+  ],
+  "measured_us": 740,
+  "t_sol_us": 48.3,
+  "t_ach_us": 76.2,
+  "derate": 9.71,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B4 (r1): sparse mla core (MlaQuery + FMHA + index)",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv"
+  ],
+  "measured_us": 1113,
+  "t_sol_us": 6.2,
+  "t_ach_us": 9.8,
+  "derate": 113.57,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B4 (r1): DCP exchange/combine",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "P6",
+   "P7b",
+   "P8"
+  ],
+  "measured_us": 1218,
+  "t_sol_us": 288.4,
+  "t_ach_us": 301.3,
+  "derate": 4.04,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof3/d3k3p q4_B4 (r1): SP AG/RS",
+  "topology": "D3",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "P2",
+   "P3b"
+  ],
+  "measured_us": 1326,
+  "t_sol_us": 555.6,
+  "t_ach_us": 576.8,
+  "derate": 2.3,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): sdec MoE experts kernel (rubin) only; front/tail 4.8 ms more (fused comm)",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2"
+  ],
+  "measured_us": 8691,
+  "t_sol_us": 4696.9,
+  "t_ach_us": 7281.5,
+  "derate": 1.19,
+  "notes": "D1 streams overlap (busy sum 35.4 ms vs span 25.1 ms): per-kernel us include waits",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): sdec o-proj producer+consumer (o_proj GEMM + fused two-shot AR)",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "DSA.o_proj",
+   "KDA.o_proj",
+   "P1b"
+  ],
+  "measured_us": 5780,
+  "t_sol_us": 0,
+  "t_ach_us": 4602.0,
+  "derate": 1.26,
+  "notes": "model P1b AR only (o_proj GEMM share small)",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): sdec attn_res cluster kernel",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "measured_us": 1579,
+  "t_sol_us": 493.6,
+  "t_ach_us": 781.2,
+  "derate": 2.02,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): sdec KdaVerify feed",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "KDA.core_decode",
+   "KDA.conv",
+   "KDA.gate_beta_norm"
+  ],
+  "measured_us": 2077,
+  "t_sol_us": 383.1,
+  "t_ach_us": 603.9,
+  "derate": 3.44,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): sdec MlaQuery",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "DSA.qb_wq_packed",
+   "DSA.w_uk"
+  ],
+  "measured_us": 1941,
+  "t_sol_us": 305.5,
+  "t_ach_us": 377.6,
+  "derate": 5.14,
+  "notes": "mla_proj also holds q_a/kv_a/W_UV/o in the model KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): trtllm-gen sparse FMHA + DsaIndex + remap",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "DSA.sparse_mla"
+  ],
+  "measured_us": 866,
+  "t_sol_us": 53.3,
+  "t_ach_us": 84.3,
+  "derate": 10.27,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): paged_mqa_logits + topk_select",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "DSA.idx_score",
+   "DSA.topk"
+  ],
+  "measured_us": 735,
+  "t_sol_us": 112.1,
+  "t_ach_us": 158.7,
+  "derate": 4.63,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B128 (r8): DCP value + finish partials",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 8,
+  "op_ids": [
+   "P7b",
+   "P8"
+  ],
+  "measured_us": 874,
+  "t_sol_us": 523.0,
+  "t_ach_us": 698.0,
+  "derate": 1.25,
+  "notes": "",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B16 (r1): sdec KDA",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "KDA.core_decode"
+  ],
+  "measured_us": 864,
+  "t_sol_us": 48.0,
+  "t_ach_us": 75.6,
+  "derate": 11.43,
+  "notes": "component; MoE component spans 98% (overlapped persistent kernel) KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B16 (r1): sparse mla core",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv"
+  ],
+  "measured_us": 1300,
+  "t_sol_us": 110.2,
+  "t_ach_us": 174.3,
+  "derate": 7.46,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ },
+ {
+  "case": "prof1b/d1k3pb q4_B16 (r1): indexer + top-k",
+  "topology": "D1",
+  "k": 3,
+  "r_per_gpu": 1,
+  "op_ids": [
+   "DSA.idx_score",
+   "DSA.topk"
+  ],
+  "measured_us": 374,
+  "t_sol_us": 14.0,
+  "t_ach_us": 19.8,
+  "derate": 18.89,
+  "notes": "KERNEL-DEBUG",
+  "kind": "op"
+ }
+]

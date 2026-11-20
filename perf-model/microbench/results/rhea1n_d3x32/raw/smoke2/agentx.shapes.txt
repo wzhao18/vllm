@@ -1,0 +1,2 @@
+1 cases (group q4_C48_C160_C256): q4_B32_M128_u132k
+ctx q4_B32_M128_u132k: B 32 sum 4325376 min 135168 p50 135168 mean 135168 max 135168 scale 1.0

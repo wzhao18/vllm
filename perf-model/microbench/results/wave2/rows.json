@@ -1,0 +1,416 @@
+[
+ {
+  "case": "P2b pf16k_L78k MXFP8 [model P2b F16384]",
+  "topology": "P2b",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 212809.6,
+  "t_sol_us": 117600.0,
+  "t_ach_us": 158600.0,
+  "derate": 1.342,
+  "notes": "9624 tok/s/GPU measured vs model achievable 12913 (MXFP8 MoE); MegaMoE quant mxfp4_mxfp8 (pinned) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p2b/p2b_mx.log. DP2 x (TP8=DCP8) ShardQ (log: ShardQ prefill), EP16; torch profile in p2b_mx.prof",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P2b pf16k_L78k release MegaMoE policy (NVFP4) [model P2b F16384]",
+  "topology": "P2b",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 207930.0,
+  "t_sol_us": 117600.0,
+  "t_ach_us": 158600.0,
+  "derate": 1.311,
+  "notes": "9849 tok/s/GPU measured vs model achievable 12913 (MXFP8 MoE); NOT like-for-like (model is mxfp4_release / MXFP8 MoE); MegaMoE quant nvfp4 (release policy) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p2b/p2b_rel.log.",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P5-4 pf16k_L78k MXFP8 [model P5-4 F16384]",
+  "topology": "P5-4",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 421591.7,
+  "t_sol_us": 227200.0,
+  "t_ach_us": 287900.0,
+  "derate": 1.464,
+  "notes": "9716 tok/s/GPU measured vs model achievable 14227 (MXFP8 MoE); MegaMoE quant mxfp4_mxfp8 (pinned) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p5/p54_mx.log. TP4 x DP4, no DCP (replicated DSA KV), EP16; torch profile in p54_mx.prof",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P5-4 pf16k_L78k release MegaMoE policy (NVFP4) [model P5-4 F16384]",
+  "topology": "P5-4",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 386280.0,
+  "t_sol_us": 227200.0,
+  "t_ach_us": 287900.0,
+  "derate": 1.342,
+  "notes": "10604 tok/s/GPU measured vs model achievable 14227 (MXFP8 MoE); NOT like-for-like (model is mxfp4_release / MXFP8 MoE); MegaMoE quant nvfp4 (release policy) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p5/p54_rel.log.",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P5-8 pf16k_L78k MXFP8 [model P5-8 F16384]",
+  "topology": "P5-8",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 345103.4,
+  "t_sol_us": 171700.0,
+  "t_ach_us": 231700.0,
+  "derate": 1.489,
+  "notes": "5934 tok/s/GPU measured vs model achievable 8839 (MXFP8 MoE); MegaMoE quant mxfp4_mxfp8 (pinned) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p5/p58_mx.log. TP8, no DCP (replicated DSA KV), EP8, k=7 drafter as P1",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P5-8 pf16k_L78k release MegaMoE policy (NVFP4) [model P5-8 F16384]",
+  "topology": "P5-8",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 321030.2,
+  "t_sol_us": 171700.0,
+  "t_ach_us": 231700.0,
+  "derate": 1.386,
+  "notes": "6379 tok/s/GPU measured vs model achievable 8839 (MXFP8 MoE); NOT like-for-like (model is mxfp4_release / MXFP8 MoE); MegaMoE quant nvfp4 (release policy) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p5/p58_rel.log.",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) release MegaMoE policy (NVFP4) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 285614.8,
+  "t_sol_us": 188779.0,
+  "t_ach_us": 243534.5,
+  "derate": 1.173,
+  "notes": "14341 tok/s/GPU measured vs model achievable 16819 (MXFP8 MoE); NOT like-for-like (model is mxfp4_release / MXFP8 MoE); MegaMoE quant nvfp4 (release policy) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p4rel/p4_4_rel.log. PR #20 DSA-DP tree (log: DSA-DP outputs pushed)",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "P4-2 pf16k_L78k(4x4096) release MegaMoE policy (NVFP4) [model P4-2 F16384 f4096]",
+  "topology": "P4-2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 536312.0,
+  "t_sol_us": 348590.8,
+  "t_ach_us": 442766.8,
+  "derate": 1.211,
+  "notes": "15275 tok/s/GPU measured vs model achievable 18502 (MXFP8 MoE); NOT like-for-like (model is mxfp4_release / MXFP8 MoE); MegaMoE quant nvfp4 (release policy) (asserted in log); moe_kernel=vendored (vLLM megamoe_rubin); raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/w2p4rel/p4_2_rel.log. PR #20 DSA-DP tree",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d332lo:q4_B4_M16_u132k",
+  "topology": "D3-32",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 19274.7,
+  "t_sol_us": null,
+  "t_ach_us": null,
+  "derate": null,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "DP8 x (TP4=DCP4) SP, EP32 (moe-backend deep_gemm_mega_moe as wave-1 D3); MXFP8 MoE act; t_ach null: the model has no D3-32 topology (EP<=16 scope); moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d332/d332lo.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d332lo:q4_B16_M64_u132k",
+  "topology": "D3-32",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 20888.3,
+  "t_sol_us": null,
+  "t_ach_us": null,
+  "derate": null,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "DP8 x (TP4=DCP4) SP, EP32 (moe-backend deep_gemm_mega_moe as wave-1 D3); MXFP8 MoE act; t_ach null: the model has no D3-32 topology (EP<=16 scope); moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d332/d332lo.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d332lo:q4_B32_M128_u132k",
+  "topology": "D3-32",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 20918.1,
+  "t_sol_us": null,
+  "t_ach_us": null,
+  "derate": null,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "DP8 x (TP4=DCP4) SP, EP32 (moe-backend deep_gemm_mega_moe as wave-1 D3); MXFP8 MoE act; t_ach null: the model has no D3-32 topology (EP<=16 scope); moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d332/d332lo.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d332b64:q4_B64_M256_u132k",
+  "topology": "D3-32",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 16.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 26984.3,
+  "t_sol_us": null,
+  "t_ach_us": null,
+  "derate": null,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "DP8 x (TP4=DCP4) SP, EP32 (moe-backend deep_gemm_mega_moe as wave-1 D3); MXFP8 MoE act; t_ach null: the model has no D3-32 topology (EP<=16 scope); moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d332/d332b64.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d332b96:q4_B96_M384_u132k",
+  "topology": "D3-32",
+  "k": 3,
+  "B_per_dp_rank": 96,
+  "r_per_gpu": 24.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 30482.9,
+  "t_sol_us": null,
+  "t_ach_us": null,
+  "derate": null,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "DP8 x (TP4=DCP4) SP, EP32 (moe-backend deep_gemm_mega_moe as wave-1 D3); MXFP8 MoE act; t_ach null: the model has no D3-32 topology (EP<=16 scope); moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d332/d332b96.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3baselo:q4_B4_M16_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 21194.5,
+  "t_sol_us": 6712.4,
+  "t_ach_us": 11122.3,
+  "derate": 1.906,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "same-session control: exact wave-1 D3 EP16 config (point c512); model exact; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3base/d3baselo.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3baselo:q4_B16_M64_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24491.9,
+  "t_sol_us": 8350.2,
+  "t_ach_us": 13236.4,
+  "derate": 1.85,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "same-session control: exact wave-1 D3 EP16 config (point c512); model exact; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3base/d3baselo.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3baselo:q4_B32_M128_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 24366.7,
+  "t_sol_us": 8899.8,
+  "t_ach_us": 13864.7,
+  "derate": 1.757,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "same-session control: exact wave-1 D3 EP16 config (point c512); model exact; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3base/d3baselo.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3baseb64:q4_B64_M256_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 16.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 30365.4,
+  "t_sol_us": 10225.5,
+  "t_ach_us": 15278.0,
+  "derate": 1.988,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "same-session control: exact wave-1 D3 EP16 config (point c512); model exact; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3base/d3baseb64.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3rello:q4_B4_M16_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 4,
+  "r_per_gpu": 1.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 19773.7,
+  "t_sol_us": 6712.4,
+  "t_ach_us": 11122.3,
+  "derate": 1.778,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "release-MoE arm: moe-backend kimi_k3_mega_moe (release C512 decode role), MegaMoE NVFP4 W4A4 (log: 92 layers in the nvfp4 kernel layout); NOT like-for-like with the mxfp4_release model; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3rel/d3rello.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3rello:q4_B16_M64_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 16,
+  "r_per_gpu": 4.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 22178.3,
+  "t_sol_us": 8350.2,
+  "t_ach_us": 13236.4,
+  "derate": 1.676,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "release-MoE arm: moe-backend kimi_k3_mega_moe (release C512 decode role), MegaMoE NVFP4 W4A4 (log: 92 layers in the nvfp4 kernel layout); NOT like-for-like with the mxfp4_release model; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3rel/d3rello.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3rello:q4_B32_M128_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 32,
+  "r_per_gpu": 8.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 21756.8,
+  "t_sol_us": 8899.8,
+  "t_ach_us": 13864.7,
+  "derate": 1.569,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "release-MoE arm: moe-backend kimi_k3_mega_moe (release C512 decode role), MegaMoE NVFP4 W4A4 (log: 92 layers in the nvfp4 kernel layout); NOT like-for-like with the mxfp4_release model; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3rel/d3rello.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3relb64:q4_B64_M256_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 64,
+  "r_per_gpu": 16.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 27656.8,
+  "t_sol_us": 10225.5,
+  "t_ach_us": 15278.0,
+  "derate": 1.81,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "release-MoE arm: moe-backend kimi_k3_mega_moe (release C512 decode role), MegaMoE NVFP4 W4A4 (log: 92 layers in the nvfp4 kernel layout); NOT like-for-like with the mxfp4_release model; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3rel/d3relb64.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ },
+ {
+  "case": "d3relb96:q4_B96_M384_u132k",
+  "topology": "D3",
+  "k": 3,
+  "B_per_dp_rank": 96,
+  "r_per_gpu": 24.0,
+  "op_ids": [
+   "step (target verify 93 layers + DSpark k-step propose; bench scope)"
+  ],
+  "measured_us": 30194.0,
+  "t_sol_us": 11867.6,
+  "t_ach_us": 17370.8,
+  "derate": 1.738,
+  "ctx_mean": 135168,
+  "ctx_scale": 1.0,
+  "profiled": false,
+  "notes": "release-MoE arm: moe-backend kimi_k3_mega_moe (release C512 decode role), MegaMoE NVFP4 W4A4 (log: 92 layers in the nvfp4 kernel layout); NOT like-for-like with the mxfp4_release model; moe_kernel=vendored (vLLM megamoe_rubin); log /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/decode/results/w2d3rel/d3relb96.log",
+  "kind": "step",
+  "moe_kernel": "vendored",
+  "wave": 2
+ }
+]

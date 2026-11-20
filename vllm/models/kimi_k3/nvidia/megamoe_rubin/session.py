@@ -28,9 +28,55 @@ from typing import Any, NamedTuple
 
 import torch
 
+import os as _dms_os
+import time as _dms_time
+
 from .config import DEDUP_VARIANTS, RubinMoeConfig
 from .symm_arena import ALIGN, SymmetricArena, aligned, ensure_not_capturing
 from .weights import RubinMoeWeights, validate_kernel_weights
+
+# DIAGNOSTIC ONLY (D-MOE-LADDER in-step stamps, never lands): every eager (non-capturing) launch saves each live
+# session's GenPhase stamp ring (the last 32 main-kernel launches, src_gp mega/dms_diag.py) when it changed, to
+# $DMS_STAMPS_OUT/r<rank>-t<tokens>-<n>.pt. Graph replays fill the rings; the next case's eager pass dumps them.
+_DMS_OUT = _dms_os.environ.get("DMS_STAMPS_OUT", "")
+_DMS_SESSIONS: list = []
+_DMS_SIG: dict = {}
+_DMS_T: dict = {}
+_DMS_N = [0]
+
+
+def _dms_dump(current) -> None:
+    if current not in _DMS_SESSIONS:
+        _DMS_SESSIONS.append(current)
+    if not _DMS_OUT or torch.cuda.is_current_stream_capturing():
+        return
+    now = _dms_time.time()
+    for s in _DMS_SESSIONS:
+        lw = getattr(s, "local_workspace", None)
+        # one dump per eager pass: graph replays run no Python, so the first eager launch after a gap of
+        # >= 1 s sees the ring of the previous case's replays (the last 32 launches)
+        if lw is None or now - _DMS_T.get(id(s), 0.0) < 1.0:
+            continue
+        ws = s.kernel._device_workspace
+        name = "genphase.diag.stamps_ring"
+        try:
+            off, nb = ws.offset(name), ws.nbytes(name)
+        except Exception:
+            continue
+        ring = lw[off:off + nb].view(torch.int64).view(-1, 256, 304)
+        sig = int(ring[:, :, 63].sum()) + int(ring[:, :, 1].sum() % 1000003)
+        key = id(s)
+        _DMS_T[key] = now
+        if sig == 0 or _DMS_SIG.get(key) == sig:
+            continue
+        _DMS_SIG[key] = sig
+        _DMS_N[0] += 1
+        _dms_os.makedirs(_DMS_OUT, exist_ok=True)
+        torch.save(
+            {"ring": ring.cpu(), "rank": s.cfg.rank, "tokens": s.cfg.padded_tokens_per_rank,
+             "world": s.cfg.world_size, "t": _dms_time.time()},
+            f"{_DMS_OUT}/r{s.cfg.rank}-t{s.cfg.padded_tokens_per_rank}-{_DMS_N[0]:04d}.pt",
+        )
 
 _SCALAR_NAMES = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
 # FlashInfer ``die_local.SM_LOCALITY_MAP_SIZE`` (the kernel's die map extent).
@@ -680,6 +726,7 @@ class RubinMegaMoeSession:
         :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
+        _dms_dump(self)
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
     def release(self) -> None:

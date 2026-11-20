@@ -1,0 +1,55 @@
+== q4_B32_M128_agentx step 24539 us vs model ach 14706 (x1.67), sol 9733; gap 9833 us
+  BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)        busy    7915 expo    6918 ach    4053  x1.95   gap   2865
+  MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)                        busy   10250 expo   10250 ach    7903  x1.30   gap   2347
+  DSA DCP exact top-k (pp hist/window/win + DCP merge P8)                busy    1665 expo    1543 ach     173  x9.60   gap   1370
+  small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)    busy    1528 expo    1336 ach      52  x29.55  gap   1284
+  DSA q path + sparse MLA + DCP value (P6/P7b)                           busy    2185 expo    1479 ach     431  x5.07   gap   1048
+  KDA core (KdaWide: conv+gate+recurrence+o_norm)                        busy    1470 expo    1470 ach     604  x2.43   gap    866
+  drafter + final (DSpark k=3 propose)                                   busy     525 expo     525 ach     257  x2.04   gap    268
+  SP comm (AllGather / ReduceScatter push)                               busy     908 expo     908 ach     754  x1.20   gap    154
+  DSA indexer logits (paged_mqa_logits)                                  busy     568 expo     284 ach     200  x2.84   gap     84
+  spin wait (QueryWait)                                                  busy     181 expo       1 ach       0  x-      gap      1
+== q4_B50_M200_agentx step 28936 us vs model ach 15759 (x1.84), sol 10526; gap 13177 us
+  BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)        busy    9331 expo    8255 ach    4108  x2.27   gap   4147
+  MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)                        busy   10774 expo   10772 ach    8170  x1.32   gap   2602
+  DSA DCP exact top-k (pp hist/window/win + DCP merge P8)                busy    2603 expo    2041 ach     192  x13.57  gap   1849
+  DSA q path + sparse MLA + DCP value (P6/P7b)                           busy    3413 expo    2177 ach     565  x6.04   gap   1612
+  small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)    busy    1573 expo    1351 ach      80  x19.57  gap   1271
+  KDA core (KdaWide: conv+gate+recurrence+o_norm)                        busy    2081 expo    2081 ach     944  x2.20   gap   1137
+  drafter + final (DSpark k=3 propose)                                   busy     679 expo     679 ach     300  x2.27   gap    379
+  SP comm (AllGather / ReduceScatter push)                               busy    1180 expo    1180 ach     870  x1.36   gap    310
+  DSA indexer logits (paged_mqa_logits)                                  busy     693 expo     347 ach     312  x2.22   gap     35
+  spin wait (QueryWait)                                                  busy     314 expo       0 ach       0  x-      gap      0
+== q4_B64_M256_agentx step 30756 us vs model ach 16576 (x1.86), sol 11365; gap 14180 us
+  BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)        busy   10432 expo    8978 ach    4150  x2.51   gap   4828
+  MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)                        busy   10780 expo   10778 ach    8377  x1.29   gap   2401
+  DSA DCP exact top-k (pp hist/window/win + DCP merge P8)                busy    2174 expo    2172 ach     206  x10.54  gap   1965
+  KDA core (KdaWide: conv+gate+recurrence+o_norm)                        busy    2660 expo    2660 ach    1208  x2.20   gap   1452
+  small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)    busy    1583 expo    1365 ach     103  x15.42  gap   1262
+  DSA q path + sparse MLA + DCP value (P6/P7b)                           busy    2757 expo    1928 ach     669  x4.12   gap   1258
+  DSA indexer logits (paged_mqa_logits)                                  busy     938 expo     809 ach     399  x2.35   gap    410
+  SP comm (AllGather / ReduceScatter push)                               busy    1339 expo    1339 ach     960  x1.40   gap    379
+  drafter + final (DSpark k=3 propose)                                   busy     697 expo     697 ach     329  x2.12   gap    368
+  spin wait (QueryWait)                                                  busy     537 expo       0 ach       0  x-      gap      0
+== q4_B80_M320_agentx step 33017 us vs model ach 17700 (x1.87), sol 12341; gap 15317 us
+  BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)        busy   10623 expo    9137 ach    4391  x2.42   gap   4747
+  MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)                        busy   11458 expo   11455 ach    8614  x1.33   gap   2841
+  DSA DCP exact top-k (pp hist/window/win + DCP merge P8)                busy    2564 expo    2562 ach     223  x11.52  gap   2340
+  KDA core (KdaWide: conv+gate+recurrence+o_norm)                        busy    3115 expo    3115 ach    1510  x2.06   gap   1605
+  DSA q path + sparse MLA + DCP value (P6/P7b)                           busy    3277 expo    2288 ach     789  x4.15   gap   1499
+  small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)    busy    1556 expo    1299 ach     128  x12.14  gap   1171
+  drafter + final (DSpark k=3 propose)                                   busy     774 expo     774 ach     248  x3.12   gap    525
+  DSA indexer logits (paged_mqa_logits)                                  busy    1129 expo     989 ach     499  x2.26   gap    490
+  SP comm (AllGather / ReduceScatter push)                               busy    1529 expo    1529 ach    1063  x1.44   gap    466
+  spin wait (QueryWait)                                                  busy     676 expo       0 ach       0  x-      gap      0
+== q4_B92_M368_agentx step 32741 us vs model ach 18437 (x1.78), sol 12930; gap 14304 us
+  BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)        busy   10460 expo    8884 ach    4653  x2.25   gap   4232
+  MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)                        busy   11183 expo   11175 ach    8792  x1.27   gap   2384
+  DSA DCP exact top-k (pp hist/window/win + DCP merge P8)                busy    2261 expo    2258 ach     216  x10.48  gap   2042
+  DSA q path + sparse MLA + DCP value (P6/P7b)                           busy    3763 expo    2576 ach     885  x4.25   gap   1691
+  KDA core (KdaWide: conv+gate+recurrence+o_norm)                        busy    3359 expo    3359 ach    1736  x1.93   gap   1623
+  small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)    busy    1572 expo    1316 ach     147  x10.68  gap   1168
+  drafter + final (DSpark k=3 propose)                                   busy     891 expo     891 ach     264  x3.38   gap    627
+  SP comm (AllGather / ReduceScatter push)                               busy    1682 expo    1682 ach    1140  x1.48   gap    542
+  DSA indexer logits (paged_mqa_logits)                                  busy     872 expo     696 ach     393  x2.22   gap    304
+  spin wait (QueryWait)                                                  busy    1001 expo       6 ach       0  x-      gap      6

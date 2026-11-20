@@ -116,6 +116,7 @@ from .shared_expert_helper import (
 )
 from .token_comm_gen_specialized import GenphaseTokenComm, GenphaseTokenCommArgs
 from .genphase_tail import GenphaseTail
+from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER in-step stamps)
 from .weight_prefetch import prefetch_span
 
 
@@ -692,6 +693,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.tail.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         self._register_shared_workspace(device_workspace)
+        DG.register(device_workspace)
         device_workspace.finalize()
         return device_workspace
 
@@ -1484,6 +1486,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        _dms_epoch = self.tail.read_epoch(self._device_workspace)
+        DG.bind(self._device_workspace, _dms_epoch)
+        DG.put_gt(DG.S_ENTRY, Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.put_val(DG.S_EPOCH, Int64(_dms_epoch) + Int64(1), Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.put_val(DG.S_BLOCK, Int64(cute.arch.block_idx()[0]), Int32(cute.arch.thread_idx()[0] == Int32(0)))
 
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
@@ -1557,6 +1564,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     die = cute.arch.make_warp_uniform(self._die_from_mask())
                 else:
                     die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
+                DG.put_val(DG.S_DIE, Int64(die) + Int64(1), Int32(cute.arch.thread_idx()[0] == Int32(0)))
             self.scheduler.assign_device_members(
                 expert_token_sizes=scheduler_expert_sizes,
                 block_idx=block_idx,
@@ -1637,6 +1645,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.scheduler_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.scheduler")
+            DG.put_gt(DG.S_SCHED0)
             if cutlass.const_expr(self.schedule_mode == "decode" and not self.shared_expert):
                 # The decode scheduler has no expert-sizes gate of its own: wait for the published sizes here
                 # (with the fused shared expert its stream takes the gate after the shared FC1 claims).
@@ -1657,7 +1666,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
+            DG.put_gt(DG.S_SIZES)
             published = Int32(0)
+            _dms_first_routed = Int32(0)
             helper_ready_latched = Int32(0)
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
@@ -1667,6 +1678,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                         prepared_tile.expert_idx, helper_ready_latched
                     )
                 scheduler.publish_work(prepared_tile)
+                DG.put_gt_dyn(Int32(DG.S_PUB0) + published % Int32(4))
+                DG.put_val_dyn(Int32(DG.S_UNIT0) + published % Int32(4), DG.unit_code(prepared_tile))
+                if published < Int32(4):
+                    DG.put_gt_dyn(Int32(DG.S_FPUB0) + published)
+                    DG.put_val_dyn(Int32(DG.S_FUNIT0) + published, DG.unit_code(prepared_tile))
+                if (_dms_first_routed == Int32(0)) & ((prepared_tile.phase_and_flags & Int32(0xFF)) == Int32(1)):
+                    DG.put_gt(DG.S_FIRSTROUTED)
+                    _dms_first_routed = Int32(1)
                 published = published + Int32(1)
                 iket.range_pop()
                 # Unit j is claimed once TMA-A has taken unit j - 1 (waiting from unit 1 keeps the parity exact):
@@ -1677,6 +1696,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 iket.range_push("scheduler.gen_work")
                 work_tile = scheduler.gen_next_work()
                 iket.range_pop()
+            DG.put_gt(DG.S_SCHED1)
+            DG.put_val(DG.S_NPUB, Int64(published))
             iket.range_push("scheduler.publish_tail")
             scheduler.publish_work(work_tile)
             scheduler.produce_tail()
@@ -1689,6 +1710,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.tma_a_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.tma_a")
+            DG.put_gt(DG.S_TA0)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_a(
                 fc1_tma_a_tensor=fc1_tma_a_tensor,
@@ -1713,11 +1735,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_fc2_tma_sfa_atom=shared_fc2_tma_sfa_atom,
                 shared_kernel_extension=shared_kernel_extension,
             )
+            DG.put_gt(DG.S_TA1)
             iket.range_pop()
 
         if warp_idx == self.tma_b_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.tma_b")
+            DG.put_gt(DG.S_TB0)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_b(
                 fc1_tma_sfb_tensor=fc1_tma_sfb_tensor,
@@ -1745,11 +1769,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_fc1_done_counter_pointer=shared_fc1_done_counter_pointer,
                 shared_fc2_spin_threshold=shared_fc2_spin_threshold,
             )
+            DG.put_gt(DG.S_TB1)
             iket.range_pop()
 
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.mma")
+            DG.put_gt(DG.S_MMA0)
             sched_consumer = scheduler.make_consumer()
             if cutlass.const_expr(self._mainloop.uses_asymmetric_ab_stages):
                 self._mainloop.run_mma_asymmetric(
@@ -1769,6 +1795,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     acc_pipeline=acc_pipeline,
                     sched_consumer=sched_consumer,
                 )
+            DG.put_gt(DG.S_MMA1)
             iket.range_pop()
 
         if warp_idx < len(self.epilogue_warp_ids):
@@ -1786,6 +1813,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
+            DG.put_gt(DG.S_EPI0, Int32(warp_idx == Int32(self.epilogue_warp_ids[0])) * DG.lane0())
             self.epilogue.run(
                 self._smem_workspace,
                 smem_base,
@@ -1809,6 +1837,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared=shared_epilogue_bindings,
                 **epilogue_ready_kwargs,
             )
+            DG.put_gt(DG.S_EPI1, Int32(warp_idx == Int32(self.epilogue_warp_ids[0])) * DG.lane0())
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
 
@@ -1849,6 +1878,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     wait_ready(self._metadata_ready_flag())
                     iket.range_pop()
                 sched_consumer = scheduler.make_consumer()
+                DG.put_gt(DG.S_G0, Int32(warp_idx == Int32(self.gather_b_warp_ids[0])) * DG.lane0())
                 self._mainloop.run_tma_gather_b1(
                     fc1_tma_b_atom=fc1_tma_b_atom,
                     gather_index=gather_index,
@@ -1859,12 +1889,15 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
                     **gather_ready_kwargs,
                 )
+                DG.put_gt(DG.S_G1, Int32(warp_idx == Int32(self.gather_b_warp_ids[0])) * DG.lane0())
                 iket.range_pop()
 
         cute.arch.griddepcontrol_wait()
+        DG.put_gt(DG.S_GDW, Int32(cute.arch.thread_idx()[0] == Int32(0)))
         # CTAs with no work can finish the epilogue before gather warps pass
         # their readiness waits. Join every role before clearing those flags.
         cute.arch.sync_threads()
+        DG.put_gt(DG.S_SYNC, Int32(cute.arch.thread_idx()[0] == Int32(0)))
         # No CTA may leave while a cluster peer can still touch its shared memory: the
         # scheduler's work-id broadcast releases, the pipelines' consumer releases and the
         # multicast legs arrive on peer CTAs, and the last of them are issued after the
@@ -1876,6 +1909,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         # arrive could still land after this CTA's wait returns.
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
+        DG.put_gt(DG.S_CLB, Int32(cute.arch.thread_idx()[0] == Int32(0)))
         if warp_idx < len(self.epilogue_warp_ids):
             epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
 
@@ -1883,6 +1917,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             iket.range_push("tail.arrive")
             cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epilogue_thread_count)
             iket.range_pop()
+            DG.put_gt(DG.S_TAILBAR, Int32(warp_idx == Int32(self.epilogue_warp_ids[0])) * DG.lane0())
             # Release the top-k reduce launch: it is a programmatic dependent that waits
             # for this grid's completion itself, so it can be resident before the tail ends.
             cute.arch.griddepcontrol_launch_dependents()
@@ -1898,6 +1933,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
+                DG.put_gt(DG.S_ARRIVE)
+                DG.put_val(DG.S_ISLAST, Int64(is_last))
                 if is_last != Int32(0):
                     # The last arriver has acquired every other CTA's arrival, so nothing on
                     # this rank reads the tail span any more: reset it, then meet the peers.
@@ -1907,9 +1944,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                         wait_ready(self._payload_ready_flag())
                         wait_ready(self._metadata_ready_flag())
                         iket.range_pop()
+                    DG.put_gt(DG.S_L_COMM)
                     iket.range_push("tail.reset_workspace")
                     self.tail.reset_tail_space(self._device_workspace, lane_idx, 32)
                     cute.arch.sync_warp()
+                    DG.put_gt(DG.S_L_RESET)
                     iket.range_pop()
                     iket.range_push("tail.nvlink_barrier")
                     if lane_idx == Int32(0):
@@ -1932,6 +1971,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             # schedule; the grouped / phase_interleave tails only touch global memory.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
+        DG.put_gt(DG.S_EXIT, Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.unbind()
         self._device_workspace.remove_device_members()
 
 

@@ -1,0 +1,218 @@
+===== LEDGER DEP16 (P3-16) prefill, nvfp4_modelopt, F=16384 fresh tokens/GPU at L=78,356 (3 x
+ach 532.9 proj 847
+- MegaMoE NVFP4 W4A4 (dispatch+fc1+act+fc2+combine incl. P11/P12 NVLink), 92 layers | exc 94.1 | 11.1 % | gain: Wiring FI with 8K sub-calls: -48 to -73 ms (292 to ~231-244), i.e. -6 to -9%. Overlap fix toward the model's 197.9: a fu | eff: M for wiring (kernel exis
+- KDA chain: core_prefill (FlashKDA recurrence + prepare) + conv + gated o_norm, 69 lay | exc 62.3 | 7.4 % | gain: -40 to -50 ms (-5 to -6%): core to ~1.5-1.8x model (~20 ms), conv+o_norm to ~2-3 ms | eff: M-L: kernel templates exi
+- DSA sparse MLA + prologue (fp8 q quant, head pad, KV insert) + gate_mul, 24 layers | exc 51.5 | 6.1 % | gain: -30 to -40 ms (-3.5 to -4.7%): sparse_mla to ~1.5x model (~23 ms), prologue and gate_mul to ~2 ms | eff: L: new attention kernel (
+- DSA indexer: idx_score (deep_gemm sm100_mqa_logits) + exact top-k (trtllm GVR) + idx  | exc 28 | 3.3 % | gain: -12 to -18 ms (-1.5 to -2%) | eff: M
+- MoE router path: router BF16 GEMM + router top-k + latent_down/up BF16 GEMMs + latent | exc 20.4 | 2.4 % | gain: -10 to -14 ms (-1.2 to -1.7%) | eff: S-M
+- Shared experts MXFP8 (gate_up + SiLU-mul + down) and side-stream overlap with MegaMoE | exc 19 | 2.2 % | gain: Excess removal -15 to -20 ms, plus overlap hiding most of the remaining ~37-40 ms, which goes below the model's 532.9. T | eff: M: SM-budget knob on the 
+- KDA projections MXFP8 (in_proj 49376x7168 + o_proj), 69 layers | exc 18 | 2.1 % | gain: -8 to -25 ms (-1 to -3%), depending on where in-step lands | eff: S-M
+- AttnRes pre+post (attn_res_fwd_online_v2), 93 layers | exc 6.6 | 0.8 % | gain: -3 to -5 ms incl. removed quant kernels (~0.5%) | eff: S
+- DSA BF16 projections (qkv_a, qb_wq, g_proj, w_uk/w_uv, o_proj) + KDA f_b_proj + draft | exc 14.5 | 1.7 % | gain: -6 to -9 ms (~1%) | eff: S
+- Structural lever (not an excess): two-microbatch overlap O1, hiding MegaMoE NVLink un | exc 0 | 12 % | gain: -60 to -90 ms (-7 to -11%) at full achievement; best done after items 1, 6 and 7 | eff: L: scheduler and stream r
+UNKNOWNS:
+  * In-step nvfp4_modelopt P3-16 F16K L78K step with a torch-profiler trace (dummy weights, nvfp4_modelopt config view, vendored MegaMoE NVFP4 + MXFP8 KDA/shared). Nothing nvfp4 has run in-step; this replaces every UNMEASURED range. P
+  * MXFP8 KDA.in_proj in-step efficiency (16384x49376x7168): the largest unmeasured GEMM (model 73.4 ms; range 75-106). Standalone shows 1.16 (sweep) vs 1.40 (repeat median), and quant costs +40 us/call.
+  * Vendored megamoe_rubin NVFP4 in-step at P3-16 vs FI 6e438852b wired, at T=16384 (single call) vs 2x8192. Central 292 vs 244/231 ms is inferred, not measured.
+  * Whether MegaMoE (FI) slows when its persistent grid gets N-k SMs while shared-expert MXFP8 GEMMs run concurrently: decides items 6 and O1.
+  * KDA core at F16K in-step (3 seqs x 96 heads, FP32 state) and with a 96-head v-split build. The model's serial floor (11.5 ms flat in F) and the per-token measured cost disagree.
+  * Memory feasibility of F16K (and larger F) at TP1 with nvfp4 weights. The model says 168.9 GB weights, 199.4 GB need at F16K, 239.1 GB at F64K. The mxfp4 bench needed a pinned 14 GiB KV pool and max-num-seqs 4 at F16K.
+  * Real-weight routing skew for EP16 MegaMoE (all rows used random/balanced routing).
+===== LEDGER D3-32 decode: hybrid DCP4 x DP8, SP dense path, ShardQ DSA, MegaMoE EP32, k=3, L
+ach 8.631 proj 18.5
+- MegaMoE EP32 routed experts NVFP4 W4A4 (dispatch + fc1 + act + fc2 + combine, P11/P12 | exc 2.3 | 12.4 % | gain: r8: -1.6 ms (about 8.8%). r24: -2.0 ms (about 7.2%). The in-step wiring alone avoids the 1.1 ms of the x1.2 vendored upp | eff: L: kernel-internal pipeli
+- Shared experts MXFP8 W8A8 (shared_gate_up + shared_down, SP rows M=128/384) | exc 1.48 | 8 % | gain: r8: -0.84 to -1.29 ms (4.5-7%). r24: -1.2 to -1.85 ms (4.5-6.6%). | eff: M: shares the CuTe low-la
+- Small unfused elementwise ops (AttnRes mix, shared SiLU, latent RMSNorm, router top-k | exc 1.47 | 7.9 % | gain: r8: -1.2 ms (about 6.6%). r24: about -1.2 ms (about 4.4%). | eff: M: five separate epilogue
+- DSA DCP exact top-k (topk_pp_hist/window/win + k31dcpx topk_merge, P8) | exc 1.31 | 7.1 % | gain: r8: -1.1 ms (about 6%). r24: -1.9 ms (about 6.9%). | eff: M: self-contained in the 
+- BF16 SP-path dense GEMMs (router+latent_down, latent_up, DSA qkv_a/g_proj/o_proj/w_uv | exc 1.18 | 6.4 % | gain: r8: -0.9 ms (about 4.9%). r24: -1.7 ms (about 6.2%). | eff: M: kernel exists for D1; 
+- DSA attention path: MlaQuery q path + P6 publish, sparse MLA (trtllm-gen fmha), DCP v | exc 1.16 | 6.3 % | gain: r8: -0.85 ms (about 4.6%). r24: -1.5 ms (about 5.4%). | eff: L: new attention kernel p
+- KDA projections MXFP8 W8A8 (in_proj N=12440, o_proj, f_b_proj BF16) | exc 1 | 5.4 % | gain: r8: -0.54 to -0.88 ms (3-4.8%). r24: -0.8 to -1.26 ms (3-4.5%). | eff: M: reuses the shared-expe
+- KDA decode core (KdaWide: conv + gate + FP32 recurrence + o_norm) | exc 0.87 | 4.7 % | gain: r8: -0.7 ms (about 3.8%). r24: -1.24 ms (about 4.5%). r32: about -1.65 ms. | eff: M: single kernel in sdec.
+- Drafter + final tail (DSpark k=3 propose, final AG, P18/P1c/Markov comm) | exc 0.28 | 1.5 % | gain: r8: -0.2 ms (about 1%). r24: -0.75 ms (about 2.7%). | eff: M
+- SP comm: SpReduceScatter / SpAllGather (P3b, P2) at the Lamport floor | exc 0.16 | 0.9 % | gain: r8: about -0.1 ms (<1%). r24: about -0.5 ms (about 1.8%). | eff: M: coupled to the CuTe GE
+- Unbenched step terms: LM head, rejection, sharded verify P16, DP lock-step sync P19,  | exc 0 | 0 % | gain: unknown | eff: S: measurement only
+UNKNOWNS:
+  * NVFP4 W4A4 MegaMoE EP32 running inside the step on D3-32. This is the largest term (3.24 ach; bound 5.54 to 6.65 ms at r8) and it has never run in-step. The FI EP32 build has to be wired into specialized_decode first. The release 
+  * MXFP8 shared-expert and KDA-projection GEMMs in-step at M=128/384/512, including where the activation quant runs. Only standalone ops1 rows exist: gemm-168/183/195/236/357/372 plus separately timed quant. The bound is 1.27-1.61 ms
+  * A D3-32 per-family torch profile. Wave2 measured only step totals. Every non-MoE derate here is transferred from gap512 D3 EP16 at L190K (B32/B80/B92). The D3-32 measurement implies a non-MoE time of 13.56 ms at r8, against 14.29 
+  * A D3-32 nvfp4 step at r=8/16/24/32. r32 OOMs during the bench's graph capture (245 GiB allocated + 10.4 GiB reserved; a bench artifact). r48 is refused by the SP 512-verify-row cap (specialized_decode/runtime/__init__.py:53).
+  * Real nvfp4_modelopt weights: routing skew at EP32/DP8 (every run so far is dummy weights with balanced routing), plus AL under nvfp4. Golden AL 3.08 is assumed; measured mxfp4 tok/s/GPU implies 3.08.
+  * KV r_max for nvfp4 on D3-32. Projected about 49.8 from the measured mxfp4 pool (2329 blocks, 138 GiB) plus 15.4 GiB of freed weights.
+===== ENABLE
+- B1 (blocks prefill AND decode) - MegaMoE cannot load NVFP4 routed expe | missing | Choose the MegaMoE weight format from the checkpoint: the modelopt_mixed quantized_layers entry for '...experts' resolves to NVFP4 (_resolve_quant_algo, modelopt.py:1774-1845). Pass it into mega_moe_experts_cls. Extend the mapping with weight / weight_scale / weight_scale_2 / input_scale for w1/w2/w | S (0.5 day + CPU loader unit t
+- B1b - Rubin MegaMoE (vendored megamoe_rubin) has no native-NVFP4 load  | missing | Inside megamoe_rubin (kimi_k3 package): add a native NVFP4 parameter set: codes (E,2I,H/2) / (E,H,I/2) uint8; E4M3 scales (E,2I,H/16) / (E,H,I/16); per-expert w13/w2 weight_scale_2; input scales. In the loader, assert w1 weight_scale_2 == w3 weight_scale_2 and assert input_scale == 1.0, raising othe | M (1-2 days incl. tests)
+- B2 (bench harness) - nvfp4 model view + dummy-weight safety for vllm b | missing | Build an nvfp4 model view (config.json with the real quantized_layers; no weights). Make the native-NVFP4 Rubin path dummy-safe: derive alphas in process_weights_after_loading, not in the loader. In the bench, fill positive scales and finite E4M3 scale bytes. Assert the logged quant kind ('Rubin Meg | S
+- B3 (decode D3-32 only) - NVFP4 MegaMoE at EP32 | missing | Pick one: (a) tune EP32 nvfp4 knob records for the vendored kernel (genphase buckets 32..512 and the decode bucket; RUBIN_DECODE_BUCKET_MAX_ROUTES=4096 -> 256 tok/rank, experts.py:113) and check the vendored kernel at EP32 against EP16 bitwise. (b) Re-vendor a368c5f66 (EP28/32 changes + 6e438852b sp | M-L (b: 2-4 days incl. bitwise
+- B4 (decode D3-32 only) - specialized decode SP path refuses MXFP8 KDA  | missing | Inside specialized_decode: add an MXFP8 DecodeProjection (activation quant to MXFP8 F8_128x4 + MXFP8 GEMM). It serves gathered rows 4..512, the SP_MAX_ROWS cap at runtime/__init__.py:303. Add an MXFP8 SpOproj variant (MXFP8 GEMM + the SpComm reduce-scatter). Dispatch per shape between the FlashInfer | M (minimal: 1 day; specialized
+- MXFP8 linears on the stock path (shared experts, KDA in/o_proj): load  | works (functional) / partial (perf) | Functional: none expected. Verify the checkpoint's quantized_layers keys resolve for in_proj_qkvgfab: if ModelOpt lists fused_qkvg_proj / g_proj names, _resolve_quant_algo step 2 (modelopt.py:1790-1808) must not hit 'Mixed quant_algo within fused layer'; f_b_proj stays BF16. Perf: widen is_online_mx | S (detection) + verify against
+- MXFP8 GEMM performance at DEP16 prefill shapes (M=16384, TP1) - kernel | partial (measured standalone only) | First nvfp4 P3-16 step bench must profile these 4 rows in-step. The in_proj (1.40) is the largest MXFP8 excess; candidate is per-shape CuTe vs cuBLASLt plus fused input quant (same input as other KDA consumers). | bench only
+- MXFP8 GEMM performance at D3-32 decode SP shapes (M = 4..512 rows) | partial (measured standalone only; correctness hazard noted) | Pin the D3-32 TP4 shapes to kernels with a passing numerics check (N=12448 padded in_proj, 7168). Add a unit test of mm_mxfp8 vs dequant reference at every deployed (N,K). The o_proj K3072 small-M derate of about 3.5 is a latency floor; fusing it with the SP reduce-scatter (B4) is the fix path. | S (tests) + part of B4
+- specialized_prefill backend | missing (not present in this tree) | Nothing NVFP4-specific beyond B1/B1b/B2 for a first prefill step. Later prefill-only work (MXFP8 fusions, shared-expert side stream, ledger item 5) belongs in specialized_prefill per the rules. | -
+- KV / indexer / KDA state independence from the checkpoint | works, with one config caveat | Launch with explicit --kv-cache-dtype fp8 (never auto). Check whether the NVFP4 checkpoint ships k_scale/v_scale tensors or kv_cache_quant_algo. If yes, either confirm they are 1.0 or treat them as checkpoint precision and note that the KV numerics differ from the mxfp4 runs. | XS
+- Compile-pass side effect of an NVFP4 checkpoint | works (note) | Confirm the decode FULL graph / sdec path is unaffected. sdec refuses torch.compile (runtime/__init__.py:193-194). Check prefill piecewise graphs for an unexpected fusion that changes math. | XS
+- /Users/weizha/k3-flashinfer-nvfp4-audit.md relevance | not applicable to nvfp4_modelopt first step | None for this enablement. Relevant only to a later stream-B nvfp4_ds_mla KV-capacity config (sdec already gates it via nvfp4_unsupported, runtime/__init__.py:374-392). | -
+- Projection summary (PROJECTED = measured mxfp4/analog derate on the nv | unknown (nothing measured on nvfp4_modelopt) | Pre-register these projections. First nvfp4 step benches: P3-16 F8K/F16K with profile, then D3-32 r1/r4/r8/r16/r24. Update calibrated.json derates for kda_proj/shared (MXFP8) and experts (NVFP4 EP32) from in-step rows. | -
+NOTES I did not modify any files. Everything here comes from reading source and the existing microbench and model outputs in /Users/weizha/k31vr-dev. The repo had no checkout of nvidia/Kimi-K3.1-Pro-NVFP4 config.json, so I could not check the exact quantized_layers key names. That leaves two items unconfirmed: whether in_proj_qkvgfab resolves cleanly, and whether the checkpoint ships kv_cache_quant_algo or k/v scales.
+
+ORDER OF BLOCKERS before a first nvfp4 step bench:
+1. B1 + B1b: native NVFP4 loading in the vendored MegaMoE, plus the model.py wiring.
+   - model.py:816 hard-codes the MXFP4 format.
+   - The expert name mapping at model.py:585-602 has no ModelOpt names.
+   - megamoe_rubin refuses non-MXFP4 at experts.py:289 and :442. Its NVFP4 kind exists only as an exact MXFP4->NVFP4 conversion (weights.py:705-745), and its quant kind is chosen by tokens per rank (experts.py:87/145), not by th
+===== VERDICT
+Most of the ledger's numbers re-derive correctly from the cited files:
+- model ach per family from optables nvfp4_modelopt|D3-32|decode r8 (the items sum to 8.628 vs 8.631)
+- gap512 B32/B92 exposed values and the derate transfers for BF16, DSA, top-k, KDA core, TAIL and SP comm
+- the moe_ep32 FI rows and the calibrated.json values
+- r_max 44.8 -> 49.8
+- AL 3.08 implied by the measured tok/s/GPU
+
+The central r8 projection (about 18.5 ms) survives, but for different reasons than stated.
+
+Material errors:
+1. Shared experts run at SP M=32 (r8) and M=96 (r24), not 128/384. This overstates the r24 shared term by about 0.5-0.6 ms.
+2. Standalone cold timings are used as in-step without the about 0.88x factor seen on BF16.
+3. The 'calibrated 7.36 ms mxfp4 MoE' and '5% L190K bias' rest on an assumed x1.2. The same-session EP16 control instead implies vendored EP32 in-step of about 6.8 ms (1.11x FI standalone).
+4. The MegaMoE fix target is below the measured T1 fixed floor of 50.4 us/layer. Most of the MoE gain is FI-vs-vendored (it also applies to mxfp4); NVFP4 itself saves only about 0.6 ms/step at decode.
+5. Router top-k and prepare are double counted across two items, with conflicting fusion sites.
+6. The KdaWS switch at B80+ is ignored for r24.
+7. The SMEM-resident designs (sparse-MLA 
+ERRORS:
+  x Shared experts MXFP8 run at 'SP rows M=128/384'. The r8 projection uses ops1 gemm-168/236 (M=128), and the r24 => Use the M=32 rows: gemm-151 (fp8, 11.52 us) + gemm-213 (8.45 us), plus quant 2.43 + 2.40 us. Per step: 92 x 19.97 = 1.84 ms fused, 2.28 ms unfused. At r24 (M=96), interpolating to M=128: about 1.90 ms fused, 2.36 ms unfused. That replaces the ledger's 2.37-2.9
+  x MXFP8 shared and KDA projections are projected from standalone ops1 cupti-cold timings taken as in-step time. => Treat the standalone MXFP8 numbers as upper bounds. Using about 0.88x in-step gives shared about 1.6-2.0 ms and KDA projections about 1.11-1.41 ms at r8. The KDA MXFP8 gain over BF16 in-step (1.637 ms) stays near zero to 0.5 ms. Mark both as PROJECTED (transfe
+  x Calibrated mxfp4 in-step experts are 7.36 ms at r8. The D3-32 measurement implies non-MoE 13.56 ms vs 14.29 fr => At r8: non-MoE about 14.1 ms and in-step/FI-standalone about 1.1. At r24 the same method gives about 1.12-1.2: 30.48 - (33.34 - 11.18) = 8.3 ms, or 8.9 ms using gap512 B92. That gives an NVFP4 MegaMoE in-step projection of 5.54-6.15 ms at r8 and 6.07-7.28 ms a
+  x MegaMoE fix target is 1.2x ach, 3.9 ms at r8 (42 us/layer), via TMA weight prefetch, PDL, and folding prepare/ => Split the item into three parts:
+- (a) Wiring FI EP32 into sdec: gain = vendored in-step about 6.8 ms, minus FI NVFP4 5.54-6.15 ms, so about 0.7-1.3 ms at r8. MEASURED-standalone basis.
+- (b) NVFP4 vs MXFP8 kernel: about 0.6 ms (r8) and about 0.7 ms (r24, inte
+  x The release kimi_k3_mega_moe cannot run EP32 for decode (KnobLookupError at megamoe_rubin/config.py:659, wave2 => Say this is inferred for decode. State the real blocker: no decode MoE backend in any tree runs NVFP4 W4A4 at EP32 today. megamoe_rubin has no EP32 knobs, and deep_gemm_mega_moe is fp8_fp4 only. So the FI EP32 build, or new EP32 knob records, is a hard prerequ
+  x Router top-k (0.26 ms) and MegaMoE prepare (0.20 ms) are fixed in the MegaMoE item (fold into the dispatch pro => Book topk and prepare only in the small-ops item, as measured exposed 0.258 + 0.202 ms, and pick one fusion site. The router-GEMM epilogue is preferable, because the MegaMoE prologue is in FlashInfer. Remove them from the MegaMoE gain.
+  x DSA attention root cause: 'QueryWait spins add 0.18-1.0 ms'. => Drop this from the excess. The QueryWait time is overlap, not cost.
+  x KDA core fix: re-tile KdaWide. The r24 excess of 1.69 ms is attributed to KdaWide. => Scope the fix to both kernels, or one per-shape kernel covering B32-B128, and verify at B32 and B96/B128 separately.
+  x Sparse MLA fix: 'gather the union of their top-k rows once into SMEM'. => Make the gather a streamed, deduplicated tile pipeline. Give the top-k kernel a per-shape dispatch with an explicit multi-pass path for contexts over the SMEM limit; it must be selected by shape, not a silent fallback. Size it from max_model_len at load time.
+  x Shared-expert fix: the gate_up epilogue does SiLU-mul plus MXFP8 quant. AttnRes / SP-AG and o_norm epilogues e => The epilogues must reproduce stock rounding exactly: BF16 round of the GEMM output, then the SiTU activation in stock dtype and its BF16 round, then UE8M0 per-32 quant. Add a bitwise check against KimiK3Mxfp8Kernel plus situ_and_mul. The same applies to the At
+  x Step model ach is 8.631 ms vs projected/measured about 18.5-20.9 ms, presented as about 2.1x. => Compare the bench step against model ach minus 0.235 ms (8.40 ms at r8). Report the production step as bench + 0.235 ms (model) + CPU/launch (unmeasured). This is minor in size but changes the stated ratio.
+  x The small-op r24 excess is about 1.47 ms (exposed about 1.62 vs ach 0.15). => r24 small-op excess is about 1.37 ms (measured at contexts x0.686).
+  x The BF16 SP GEMM fix includes 'fix the SplitKGemm tile policy above 200 rows' for DSA.g_proj (r24 0.78 vs 0.11 => Identify the kernel first: kernel name and shape from the B92 trace, or the CuTe SplitKGemm call site. Until then, mark this sub-item's attribution as unverified.
+MISSING:
+  + The CuTe low-latency GEMM family should be one ranked item, not split across rows. BF16 SP (excess 1.18) + MXFP8 shared (about 0.7-1.37 at M=32) + MXFP8 KDA projection (about 0.5-1.0 at M=128) comes to about 2.4-3.5 ms at r8. That is the largest fixable lever 
+  + Separate the FI-wiring gain from the nvfp4 gain. FI EP32 MX at T32 is 66.64 us vs NV 60.2 us, so at decode the NVFP4 W4A4 MoE kernel saves only about 0.6 ms/step. Most of the MoE delta vs the measured mxfp4 step comes from vendored -> FI (about 74 -> 60-67 us/
+  + There is no NVFP4-W4A4-capable EP32 decode MoE backend in any tree (megamoe_rubin has no EP32 knobs; deep_gemm_mega_moe is fp8_fp4). Wiring it needs a FlashInfer version or image bump carrying the wzhao/kimi-k3-megamoe-sm107-ep32-20261118 build. That is a depe
+  + Decode indexer logits (RESULTS.md #13): each of a request's 4 verify rows re-streams the indexer keys. Measured in-step at 2.2-2.8x, with 0.28 ms exposed at B32 and 0.70 ms at B92. The DSA row folds it in, but no fix addresses it. Fix: score the 4 rows jointly
+  + KdaWS (B80+) is a separate kernel from KdaWide. The r24/r32 KDA-core term needs its own measurement and fix.
+  + Shared experts are not overlapped with MegaMoE in decode: gap512 MegaMoE exposed = measured = 10.25 ms, and the shared GEMMs are serial. Overlapping the shared MXFP8 GEMMs (about 1.6-2.3 ms) with the persistent MegaMoE, by SM partitioning or side-stream schedu
+  + Lifting the SP 512-verify-row cap (r <= 32) is a throughput lever in its own right. The model gives r48 at +17% tok/s/GPU, and nvfp4 KV r_max is about 49.8 projected. It requires sdec runtime changes plus graph-capture memory verification (the r32 bench OOM at
+  + Real-weight effects under nvfp4 are absent from all data: EP32 routing skew with DP8 lock-step, measured AL (3.08 is assumed), and a numeric correctness check of the decode step, which the step benches lack. An accuracy run (gsm8k informational) is needed befo
+  + No in-step measurement of the MXFP8 activation-quant placement exists. The ledger's fused-vs-unfused range (about 0.45 ms shared + 0.34 ms KDA per step at r8) assumes stock quant kernels, which are measured standalone only.
+  + r16 and r32 projections are absent, though wave2 measured r16 (26.98 ms). The r32 point is extrapolated in calibrated.json (tag 'extrapolated') and was never measured (bench OOM).
+RANK:
+   r8 (projected nvfp4 step about 18.6 ms; excess vs ach):
+   1. CuTe low-latency GEMM family (BF16 SP + MXFP8 shared at M=32 + MXFP8 KDA in/o_proj at M=128, with producer-fused quant at stock rounding): about 2.4-3.5 ms (13-19%). PROJECTED for the MXFP8 parts, MEASURED (gap512) fo
+   2. MegaMoE NVFP4 EP32: excess 2.30-2.91 ms (12-16%). Wiring FI EP32 into sdec is the prerequisite: about 0.7-1.3 ms vs vendored, of which only about 0.6 ms is nvfp4-specific. Cutting the fixed chain is speculative, about
+   3. Small unfused elementwise (AttnRes 0.49, SiTU 0.33, router top-k 0.26, latent norm 0.25, prepare 0.20, each counted once): 1.47 ms (8%). MEASURED in-step, kernel unchanged.
+   4. DSA DCP exact top-k (topk_merge + pp passes): 1.31 ms (7%). MEASURED, transfers.
+   5. DSA attention path (MlaQuery q path 0.47, sparse MLA 0.36, DCP value 0.23, indexer logits 0.06 exposed excess): 1.16 ms (6%). MEASURED, transfers. The indexer 4-row joint scoring belongs here.
+   6. KDA core (KdaWide at r8): 0.87 ms (5%). MEASURED.
+   7. Drafter + tail: 0.28 ms (1.5%). MEASURED.
+   8. SP comm RS/AG: 0.16 ms (<1%). MEASURED.
+   r24 (projected about 26-28 ms):
+   1. MegaMoE: excess 2.67-3.88 ms (in-step factor 1.0-1.2).
+   2. CuTe GEMM family: BF16 2.06 (including the g_proj/SplitKGemm collapse, identity unverified) + shared MXFP8 M=96 about 0.7-1.1 + KDA projection M=384 about 0.9-1.4, totalling about 3.7-4.6 ms.
+   3. DSA attention path: about 2.2 ms.
+   4. DCP top-k: about 2.0-2.15 ms.
+   5. KDA core (KdaWS): about 1.6-1.7 ms.
+   6. Small ops: about 1.37 ms.
+   7. Drafter: about 0.96 ms.
+   8. SP comm: about 0.61 ms.
+   Structural item outside both rankings: lifting the 512-verify-row cap (r up to about 45-48, model +17% tok/s/GPU) once r32 is efficient.
+===== VERDICT
+Most of the ledger's per-op numbers check out against out/optables.json, prefill/rows.json, ops1/rows.json and moe/README.md. These reproduce:
+- the model step (532.9 ms) and family shares;
+- the O1 numbers (443.2 ms, +20.2% at 16K, +23.5% at 64K);
+- the per-op derates and in-step kernel times;
+- the FI standalone 2649.3 / 1254.2 us and the 1.973 ms link floor;
+- the KDA, sparse-MLA and indexer standalone values;
+- the calibrated.json 719.4 ms / 22.77K.
+
+The ledger also correctly flags MegaMoE, the MXFP8 KDA projections and the MXFP8 shared GEMMs as new kernels under nvfp4, and treats all other components as unchanged-kernel transfers.
+
+Main problems:
+1. Bookkeeping. The item model values sum to 540.3 ms, not 532.9: the 75.1 ms bucket should be about 66.2 ms, and gate_mul is counted twice. The item projected values sum to 854.6 ms, not 847.
+2. The headline 847 ms over-projects. A better anchor is the MEASURED release NVFP4-MoE arm at F16K (1063.3 ms) with only the BF16 to MXFP8 GEMM families swapped. That gives about 824 ms (800-857), roughly 19.9K tok/s/GPU, and agrees with the ledger's own bias-corrected 825.
+3. The vendored MegaMoE estimate (292 ms) depends on which attribution is used: 207.31 ms excl in rows.json vs 233.93 ms in p3g.attr.txt. The honest range is 281-358 ms. T
+ERRORS:
+  x Item 9 (DSA BF16 projections + f_b_proj + drafter + dense): model_ach 75.1 ms, projected 89.6 ms => Model for this bucket is about 66.2 ms; projected is about 80 ms (66.2 + the listed excess of about 13.8; the sub-items sum to 13.8, not 14.5). The step projection of 532.9 + 314.4 excess = 847 ms still holds, because it was built from excesses. The per-item '
+  x Headline projected step is 847 ms (central), and pct_of_step is computed against 847 => Use about 825 ms (range 800-857), i.e. about 19.9K tok/s/GPU, as the projected step. It is PROJECTED: the measured release-arm step with only the MXFP8 GEMM families swapped. Recompute each pct_of_step against 825. The ledger's own bias-corrected 825 agrees, a
+  x MegaMoE vendored NVFP4 in-step central 292 ms (281-304), inferred from MX F8K MegaMoE excl 207.31 ms x1.92-2.0 => State the vendored NVFP4 in-step MegaMoE as 281-358 ms (inferred, not measured), with excess vs model 83-160 ms. The FI wiring gain vs vendored is then about 37-127 ms (FI 2x8K = 230.7 ms MEASURED standalone), not 48-73 ms. Only a profiled in-step nvfp4 run se
+  x Item 1 fix: 'use per-shape dispatch with 8,192-token sub-calls at T=16K' (an optimization choice worth 2649 to => Treat 2x8K as mandatory and fold it into the wiring item. Expected FI in-step is about 92 x 2.51 = 231 ms (+/-2%) at random routing.
+  x Item 3 fix: fuse fp8 q-quant into the qb_wq_packed GEMM epilogue; fuse sigmoid gate_mul into the sparse-MLA ep => Fuse the FP8 Q quant (plus the RoPE/concat) into the w_uk bmm epilogue. Fuse gate_mul into the w_uv bmm epilogue or the o_proj prologue; the sparse-MLA epilogue works only if w_uv is also fused there. Stock math either way.
+  x Item 3 basis: prologue+aux 6.55 ms at F8K = scaled_fp8_quant 2.60 + _pad_query_heads 2.06 + concat_and_cache_m => Keep 6.55 ms (x2 = 13.1 ms at F16K), but list the about 1.05 ms of unlisted kernel(s) as unidentified. Identifying the anonymous CuTe kernel is a prerequisite for the prologue fusion.
+  x Item 4 root cause: top-k over ~78K FP32 logits => Say the logits scratch is BF16 and the top-k cost is a hypothesis pending ncu. The fix (exact histogram + select with an exact graph-safe overflow fallback) is still valid under the exact top-k rule.
+  x Item 3 root cause stated as fact: HVPerCta256 makes each CTA recompute QK^T per V half; each Q64 tile re-gathe => Label the V-split recompute as a hypothesis. Run ncu before committing to the L-effort kernel.
+  x Item 7: KDA in_proj MXFP8 central 88.1 ms, high 105.6 ms (gemm-022 at N=49376) => Treat the unaligned standalone as an upper bound and expect in-step closer to the low end (75-85 ms). The item 7 excess is then likely 3-12 ms rather than 18. Re-measure gemm-022 at the padded N before choosing a tactic fix.
+  x Item 6: shared experts range 52.2-61.6 ms, central 56.4 => Range 51.2-61.6 ms. When netting the FI wiring gain, subtract about 31 ms at F8K (about 60 ms at F16K, scaled) of shared work that the staging currently hides, unless the SM-budget overlap (item 6) lands at the same time.
+  x Item 9 fix: 'Merge w_uk/w_uv bmm into the absorbed path' => Name the concrete action: fuse RoPE and the FP8 Q quant into the w_uk epilogue, and gate_mul into the w_uv epilogue (see the item 3 correction); pick bmm tactics per shape. Verify whether the drafter AllGather exists at P3-16 before proposing the symmetric-mem
+  x Item 1 basis: the vendored NVFP4 estimate uses the release arm, labelled 'MXFP4 weights' => Check the weight path of the vendored megamoe_rubin release policy, then label the release-arm-based numbers PROJECTED (same kernel, different weight source) rather than UNMEASURED.
+MISSING:
+  + The release NVFP4-MoE arm gives the same throughput at F8K and F16K: 15,401 vs 15,409 tok/s/GPU (prefill/rows.json full-step rows). Under NVFP4 MoE the measured F8K-to-F16K gain is about 0%, not +3.6% (that figure is for the MXFP8 arm). Combined with F16K not 
+  + Memory blocker under-weighted. The measured mxfp4 weights at TP1 are 225 GiB (about 242 GB) vs the model's 204.9 GB, an 18% underestimate (prefill README). F16K OOMed in the MXFP8 arm p3e-mx and in the sparse-MLA output. The nvfp4 figures (168.9 GB weights, 19
+  + DP-rank imbalance in DEP16 lock-step. Every bench row uses identical per-rank shapes (3 x 5,456 tokens at L=78K). In production, ranks have different context lengths and request mixes, so KDA, DSA and indexer time vary per rank and MegaMoE waits for the slowes
+  + Unidentified kernel time: about 1.05 ms per step at F8K in DSA.prologue+aux, not covered by the three named kernels (RESULTS item 8: an anonymous CuTe `Kernel`).
+  + O1 caveats not modelled: the model's O1 doubles the KDA core serial floor (kda_core 17.44 to 28.96 ms in prefill.json O1 ref), and the measured KDA recurrence already runs about 4x model with only nseq x heads CTAs. Splitting 3 requests into 2x8K straddles a s
+  + Netting the FI staging removal against the lost shared-expert overlap: the roughly 31 ms (F8K) of shared GEMMs that currently run under the vendored router_kernel become exposed.
+  + nvfp4_modelopt bring-up blockers before any timing: specialized_prefill/vendored MegaMoE loading of modelopt NVFP4 expert scales (E4M3 block-16 + global), and an MXFP8 linear path for KDA in/o_proj and shared experts on sm107. Neither has run in-step.
+  + Accuracy foundation: nvfp4_modelopt needs a real-rejection gsm8k check (project rule: accuracy before any perf claim). The ledger has no accuracy step.
+  + Item 6: the MXFP8 SiLU-mul output needs a quant (34.4 us per call standalone, gemm-076 'quant'). That is counted only in the high bound, so the down-proj input quant should be named explicitly as part of the SiLU-mul fusion.
+RANK:
+   1. MegaMoE vendored NVFP4 to FI 6e438852b (2x8K mandatory). Model 197.9 ms; vendored in-step INFERRED 281-358 ms; FI MEASURED standalone 230.7 ms (2x8K). Excess 83-160 ms (10-19% of a 825 ms step). FI wiring gain about 3
+   2. KDA chain (core + conv + gated o_norm), MEASURED mxfp4; kernel unchanged under nvfp4. Model 16.2 ms, projected 78.4 ms (core 48.3-55.3), excess 62.3 ms (7.6%). Highest-confidence large item.
+   3. DSA sparse MLA + prologue + gate_mul, MEASURED; unchanged kernel. Model 15.9 ms, projected 67.3 ms, excess 51.5 ms (6.2%). Fix targets corrected to the w_uk/w_uv epilogues; ncu first to confirm the V-split hypothesis.
+   4. Indexer logits + exact top-k, MEASURED; unchanged. Model 33.5 ms, projected 61.5 ms, excess 28 ms (3.4%).
+   5. Router / topk / latent GEMMs / latent norm, MEASURED BF16; unchanged. Model 48.1 ms, projected 68.3 ms, excess 20.4 ms (2.5%).
+   6. Shared experts MXFP8 + SiLU-mul + side-stream overlap. UNMEASURED new GEMM kernel; projected 51.2-61.6 ms, excess about 14-24 ms (about 2.3%). Pair with the FI wiring because of the staging-overlap interaction.
+   7. Small BF16 GEMMs + drafter + dense, MEASURED. Model 66.2 ms (not 75.1), excess about 13.8 ms (1.7%).
+   8. KDA in/o_proj MXFP8. UNMEASURED new kernel; the standalone high bound is a bench artifact of unaligned N. Likely excess 3-12 ms (0.4-1.5%), not 18.
+   9. AttnRes pre+post, MEASURED; unchanged. Excess 6.6 ms (0.8%).
+   Structural: O1 two-microbatch overlap. MODEL only: -89.7 ms at F16K (443.2 vs 532.9). Reassess against an F8K operating point, the KDA CTA halving and memory before investing.
+   Execution order: (0) nvfp4_modelopt bring-up + gsm8k + profiled in-step P3-16 baseline at F8K and F16K; (1) FI MegaMoE wiring together with the shared-expert SM-budget overlap; (2) KDA chain; (3) prefill-form sparse MLA 
+===== VERDICT
+The ledger is mostly accurate on code-level blockers. I re-read and confirmed the following:
+- model.py:816 hard-codes MEGA_MOE_MXFP4.
+- The expert mapping at model.py:585-602 covers only weight_packed and weight_scale. A '.weight_scale_2' name substring-matches and is rewritten to a param that does not exist.
+- Rubin MegaMoE refuses non-MXFP4 formats (experts.py:289) and rejects weight_scale_2 / input_scale (experts.py:442).
+- DeepGEMM MEGA_MOE_NVFP4 supports SwiGLU only (deep_gemm_mega_moe.py:164-172).
+- The knob table covers only world sizes 4/8/16 (62 entries).
+- sdec bf16_weight raises on quantized linears.
+- The ModelOpt mixed get_quant_method behaves as described.
+- The MXFP8 fast paths key on Mxfp8OnlineLinearMethod.
+
+The cited microbench and model numbers also re-derive correctly (prefill/rows.json, ops1 gemm ids, moe_ep32 derates, wave2 decode table, optables totals).
+
+The weak part is the projections.
+- **Decode, overstated about 2x.** The -2.9 ms for MXFP8 linears compares cold standalone MXFP8 against a family-wide in-step BF16 estimate. Against the BF16 standalone rows at the same shapes it is -1.3 ms; the KDA o_proj is slower in MXFP8; and shared-expert savings may be hidden by Rubin's side-stream overlap. The -1.5..-2.6 ms MoE figure transfers an EP16 delta that i
+ERRORS:
+  x D3-32 r8 MXFP8 linears save about -2.9 ms/step (3.9 ms MXFP8 replaces an estimated 6.8 ms BF16 = model 2.90 ms => PROJECTED D3-32 r8 MXFP8-linear delta: -0.2 ms (shared hidden by overlap, KDA only) to -1.3 ms (like-for-like standalone). It is not -2.9 ms. Measure in-step after B4.
+  x Decode MoE switch at EP32: assume -1.5..-2.6 ms, from the EP16 release Rubin NVFP4 vs DeepGEMM MX in-step delt => PROJECTED EP32 MoE delta: -0.6 ms (quant only, FI vs FI at T32) to -2.6 ms (if the whole EP16 kernel+overlap gain transfers). It must be measured. Report the model's sign disagreement as a model item (per-16 scale bytes vs the measured kernel).
+  x PROJECTED D3-32 r8 about 15.4-16.5 ms, about 1490-1600 tok/s/GPU. => 20.92 - (0.2..1.3) - (0.6..2.6) = 17.0-20.1 ms, which is about 1,225-1,450 tok/s/GPU PROJECTED (+4..+23% vs measured 1,178). MODEL achievable nvfp4 r8 is 2,855 (8.631 ms). This is a weak projection: no D3-32 profile exists and the MoE kernel at EP32 changes.
+  x rubin_quant_kind selects mxfp4_mxfp8 at <=512 tokens/rank; 'that is every D3-32 decode bucket'. => The fix stands (an NVFP4 checkpoint must force kind nvfp4 at every bucket; MX is impossible with no exact NVFP4->MXFP4 conversion), but the justification is wrong. Note the cost: MX was 'as fast or faster up to 256 tokens/rank' (experts.py:80-85), which remove
+  x B1b: assert input_scale == 1.0, so input_norm_const = 1.0 and fc1_norm_const = 1.0 satisfy the pow2 rule with  => Mark as UNVERIFIED and a possible kernel-side blocker. Read the real safetensors (w13/w2 input_scale per expert) before scoping B1b. If the values are not pow2, B1b grows: a non-pow2 norm const path, or the stock max(w2_input_scale) policy with an exact-math c
+  x PROJECTED P3-16 F16K about -219 ms -> about 844 ms, about 19.4K tok/s/GPU. => PROJECTED -219..-265 ms -> 798-844 ms/step, 19.4K-20.5K tok/s/GPU (+40..+48% vs measured 13,887; MODEL nvfp4 30.7K = 532.9 ms). Keep the 19.4K as the conservative end.
+  x B3 evidence: FlashInfer clone /Users/weizha/flashinfer-minimal-k3 has flashinfer/moe_ep/kernel_src/sm107/ep_si => Cite as `git show a368c5f66:flashinfer/moe_ep/kernel_src/sm107/ep_sizes.py` (SM107_MAX_EP_WORLD_SIZE = 32, line 31) and backends/mega/kernel/sm107/{kimi_k3,nvfp4_nvfp4_bf16_cutedsl}/config.py. Any re-vendor must check out the tag explicitly.
+  x Model nvfp4 decode gain is 'all linears + kernel efficiency'; MXFP8 linears measured derates are cited as tran => Say explicitly that at decode the MXFP8 benefit depends on fusing the activation quant (the ModelOpt fast paths are off: mxfp8.py:169-174 keys on Mxfp8OnlineLinearMethod only) and on a specialized small-M kernel. Keep BF16 vs MXFP8 per-shape dispatch where MXF
+MISSING:
+  + Weight memory changes under nvfp4 and is not in the ledger: the model's per-GPU weight bytes drop from 188.9 to 155.4 GiB at P3-16 and from 96.2 to 80.8 GiB at D3-32 (sum count x w_B, out/optables.json). P3-16 F16K was 'not bench-feasible at release memory set
+  + Real-weight validation is missing. Every measured step uses dummy weights, and B2 makes them dummy-safe, so nothing validates the ModelOpt loader (name mapping, per-expert weight_scale_2, w1==w3 scale_2 equality, input scales, KDA in_proj fused-shard key resol
+  + The ModelOpt expert tensor names are unverified. The ledger assumes experts.N.{w1,w2,w3}.weight; a ModelOpt export may use gate_proj/up_proj/down_proj. The B1 mapping must be derived from the real safetensors index, not assumed.
+  + Gap-ledger items that are independent of the checkpoint persist under nvfp4. They are larger per step than several nvfp4 items and belong in the plan: item 4 sparse MLA +45 ms on P3-16 (about 5% of the projected 844 ms step), item 7 KDA core +36.7 ms on P3-16,
+  + The MoE in the measured D3-32 decode is DeepGEMM fp8_fp4 (moe-backend deep_gemm_mega_moe, gap512/README.md:20-21). The wave2 header's 'every MoE is the vendored megamoe_rubin' applies to the Rubin arms, not to this one. Switching D3-32 to Rubin/FI also turns o
+  + The FI a368c5f66 EP32 prefill cliff (NVFP4 +30% at T16384 vs EP16, moe_ep32/README.md) is irrelevant to P3-16 (EP16) but should be noted if anyone extends DEP to 32.
+  + Activation range with global input_scale = 1.0: E4M3 per-16 activation scales then cover |x| up to 448 x 6 = 2688, with underflow below about 2^-9 x 6. This is checkpoint precision, so it is allowed, but an overflow/NaN check on real activations belongs in the
+  + The mxfp4 model-table drift is not mentioned. RESULTS.md and the prefill README use the older tables (P3-16 F16K model 960.4 ms); out/optables.json now gives 824.7 ms for mxfp4 (wave2 says 838.7 at its regeneration). Derates quoted from the two sources are not
+RANK:
+   1. B1 + B1b + B2: native ModelOpt NVFP4 load into the vendored Rubin MegaMoE, the model.py wiring/mapping, and a dummy-safe nvfp4 view. This unblocks the P3-16 step bench. The prefill payoff it enables is PROJECTED -219.
+   2. Real-checkpoint load + real-rejection gsm8k on P3-16/D3-32. This is the correctness gate for B1/B1b/B4 and the KV scales. No perf number counts without it.
+   3. MXFP8 KDA.in_proj at the DEP16 prefill shape: MEASURED standalone excess 69 x (1489.7-1064.0) = 29.4 ms plus unfused quant 69 x 40.4 = 2.8 ms, about 32 ms (about 3.8% of the projected 844 ms step), with +-15-25% varia
+   4. Checkpoint-independent prefill items that persist: sparse MLA +45 ms (about 5%), shared-expert side stream +40 ms at F8K, KDA core +36.7 ms (about 4%). These are larger than item 3.
+   5. B3: NVFP4 SiTU MegaMoE at EP32, preferably by re-vendoring FI a368c5f66 (also closes RESULTS item 2). This gates D3-32. PROJECTED MoE delta at r8 is -0.6..-2.6 ms (3-12% of 20.92 ms). Only -0.6 ms is measured like-for
+   6. B4: MXFP8 projections inside the specialized decode SP path. Required to run D3-32 at all. PROJECTED r8 gain only -0.2..-1.3 ms (1-6%); the o_proj at K3072 is slower in MXFP8 than BF16 (8.64 vs 7.58 us), so it needs a
+   7. Checkpoint-independent decode items: BF16 SP GEMMs for DSA/MLA/latent (gap item 1, 4.1-4.8 ms on D3 C512 for all BF16), DSA top-k + DCP merge 1.4-2.6 ms, and small unfused ops 1.55 ms. Together these exceed the nvfp4-
+   8. Low-risk config items: explicit --kv-cache-dtype fp8 plus a k/v scale check, and a check of the compile-pass side effect (enable_act_fusion) on prefill piecewise graphs.

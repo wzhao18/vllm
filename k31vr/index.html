@@ -1,0 +1,639 @@
+<title>K3.1 SOL Tracker</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root{--c-rel:#2a78d6;--c-frz:#7d8590;--c-gbv:#d9622b;--c-gbs:#8f4fc9;--bg:#fbfaf7;--surface:#ffffff;--ink:#1f1e1c;--ink2:#52514e;--muted:#898781;--line:#e4e2db;--accent:#2a78d6;
+--good:#2e7d4f;--goodbg:#e6f3ea;--warn:#9a6700;--warnbg:#fbf1d8;--bad:#b3261e;--badbg:#fbe4e2;--idle:#6b6a66;--idlebg:#eeede8}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--surface:#1f1f1d;--ink:#ecebe6;--ink2:#bdbbb4;--muted:#8d8b85;--line:#33322f;--accent:#6aa6f0;
+--good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;--c-rel:#6aa6f0;--c-frz:#9aa1aa;--c-gbv:#f0884f;--c-gbs:#b88ae8;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--surface:#1f1f1d;--ink:#ecebe6;--ink2:#bdbbb4;--muted:#8d8b85;--line:#33322f;--accent:#6aa6f0;
+--good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;--c-rel:#6aa6f0;--c-frz:#9aa1aa;--c-gbv:#f0884f;--c-gbs:#b88ae8;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+main{max-width:1120px;margin:0 auto;padding-block:28px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.card,.kpi,.tw{min-width:0}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:19px;margin:36px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+h3{font-size:15px;margin:18px 0 6px}
+.sub{color:var(--ink2);margin:0 0 18px}.muted{color:var(--muted)}
+.mission{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:14px 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:14px}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.kpi .v{font-size:22px;font-weight:650}.kpi .l{color:var(--ink2);font-size:13px}
+.tw{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--ink2);font-weight:600;font-size:13px;background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+.done{color:var(--good);background:var(--goodbg)}.run{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.wait{color:var(--warn);background:var(--warnbg)}.blocked{color:var(--bad);background:var(--badbg)}.paused{color:var(--idle);background:var(--idlebg)}
+.up{color:var(--good);font-weight:600}.down{color:var(--bad);font-weight:600}
+ul.rules{margin:6px 0 0;padding-left:20px}ul.rules li{margin:3px 0}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 16px}
+.card h3{margin-top:4px}
+code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--idlebg);padding:1px 5px;border-radius:4px}
+footer{margin-top:40px;color:var(--muted);font-size:13px}
+a{color:var(--accent)}
+.fn{font-size:13px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin:8px 0 10px;font-size:13px;color:var(--ink2)}
+.lg{display:inline-flex;align-items:center;gap:6px}
+.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:12px}
+.pfig{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px;min-width:0}
+.pchart{width:100%;height:auto;display:block}
+.pchart .grid{stroke:var(--line);stroke-width:1}
+.pchart .axis{stroke:var(--muted);stroke-width:1}
+.pchart .tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.pchart .axlab{fill:var(--ink2);font-size:11.5px}
+.fr{fill:none;stroke-width:2;stroke-linejoin:round}
+.pt>circle:not(.hit),.pt>rect,.pt>path{stroke:var(--surface);stroke-width:1.5}
+.pt .hit{fill:transparent;stroke:none}
+.pt:hover>circle:not(.hit),.pt:hover>rect,.pt:hover>path{stroke:var(--ink);stroke-width:2}
+.plab{font-size:9.5px;paint-order:stroke;stroke:var(--surface);stroke-width:3px}
+.s-rel{--c:var(--c-rel)}.s-frz{--c:var(--c-frz)}.s-gbv{--c:var(--c-gbv)}.s-gbs{--c:var(--c-gbs)}
+.fr.s-rel,.fr.s-frz,.fr.s-gbv,.fr.s-gbs{stroke:var(--c)}
+.pt.s-rel>*:not(.hit),.pt.s-frz>*:not(.hit),.pt.s-gbv>*:not(.hit),.pt.s-gbs>*:not(.hit){fill:var(--c)}
+.plab.s-rel,.plab.s-frz,.plab.s-gbv,.plab.s-gbs{fill:var(--ink2)}
+</style>
+<main>
+<h1>Kimi K3.1 AgentX: speed-of-light tracker</h1>
+<p class="sub">VR200 (Hecate), vLLM + Dynamo disaggregated serving. Branch <code>wzhao/k31-agentx-dev</code> (Inferact/nvidia-vllm-agentx). Last updated 2026-11-18 (SOL model calibration on perf-model 6aa93e9ef2).</p>
+
+<div class="mission">
+<strong>Mission.</strong> Push K3.1 performance to the absolute speed of light by all means necessary, with <strong>no numerical loss</strong>: FP8 KV cache, FP4 indexer cache, FP32 KDA states, and the other precision rules below.
+<strong>Current scope (user, 2026-11-17):</strong> finish the 8-point baseline sweep with the release draft model. No other sweeps and no performance exploration (microbenchmarks included) until the sweep is done. Workstreams W4-W7 and W9 are paused, and the decode step bench is parked.
+</div>
+
+<div class="grid">
+<div class="kpi"><div class="v">7 / 8</div><div class="l">Baseline points accepted (AgentX + gsm8k): C1, C64, C48, C128, C16, C72, C160. C512 measured but frontend-bound (64.0K); multi-frontend rerun owned by the Dynamo session.</div></div>
+<div class="kpi"><div class="v">73.7K</div><div class="l">Max throughput, tok/s/GPU at interactivity 80 (frozen C512). Release C512 measured 64.0K, limited by the single Dynamo frontend; rerun pending.</div></div>
+<div class="kpi"><div class="v">+15% to +29%</div><div class="l">Interactivity gain of the release draft at the measured points; throughput +1 to +4%.</div></div>
+<div class="kpi"><div class="v">0.978-0.980</div><div class="l">gsm8k strict, real rejection: C1 0.9795, C64 0.9803, C48 0.9788, C128 0.9788, C16 0.9780, C72 0.9788.</div></div>
+<div class="kpi"><div class="v">Waves 1 + 2</div><div class="l">SOL microbench done (W10): 12 measured paths (P1, P2, P2b, P3-16, P4-2, P4-4, P5-4, P5-8; D1, D2, D3, D3-32). Calibrated column = achievable x per-path derate. Scope ≤ 32 GPUs per instance.</div></div>
+<div class="kpi"><div class="v">13.9K</div><div class="l">Best prefill, calibrated and measured: P3 DEP16, fresh tok/s/GPU at F16K, L 78K (SOL 24.7K, achievable 19.9K). Calibrated, ≤ 32 GPUs: P6-32 13.91K ≈ P3-16 / P9 13.89K ≈ P3-32 13.88K (EP32 MegaMoE measured; 14.57K without its T16384 cliff). Measured next: P4-2 13.2K, P2 12.5K (F32K).</div></div>
+<div class="kpi"><div class="v">D1 → D3-32</div><div class="l">Decode winners, measured paths only: D1 up to r 4, D3-32 (EP32) from r 6 to 24. Calibrated incl. projected: D1 (r ≤ 1.5), D8-32 at r 2-6 (+10-12% at r 3-4, projected), D7-4-32 at r 12-24.</div></div>
+<div class="kpi"><div class="v">KERNEL-DEBUG #1</div><div class="l">Active kernel lane (in progress): SP-path BF16 dense GEMMs, derate 1.95-2.65, 4.1-4.8 ms (14-16%) of the D3 C512 step; applies to every SP layout.</div></div>
+</div>
+
+<h2>Rules</h2>
+<div class="cols">
+<div class="card"><h3>Numerics (no numerical loss)</h3>
+<ul class="rules">
+<li>FP8 MLA KV cache, FP4 (MXFP4) indexer cache, FP32 KDA state and conv.</li>
+<li>BF16 linears, shared expert, combine and all-reduce. MXFP4 MoE weights from the checkpoint. MXFP8 activations on the MXFP4 experts are within the w4a4 rule.</li>
+<li>Specialized paths are the stock math, optimized. Order and fusion may differ; precision may not be lower or higher at any stage.</li>
+<li>Exact algorithms only: exact DSA top-k over the computed logits and an exact DCP merge. No approximate or sampled top-k, and no truncated candidate sets.</li>
+<li>Draft model: release <code>Inferact/Kimi-K3.1-Pro-DSpark @ e4e6e626</code>. Target: real <code>moonshotai/Kimi-K3.1-Pro @ d9e99b07</code>.</li>
+</ul></div>
+<div class="card"><h3>Measurement</h3>
+<ul class="rules">
+<li>AgentX: 60-minute profiling phase. Synthetic acceptance at the release golden AL: k3 3.08, k5 3.81, k7 4.16.</li>
+<li>y = (input + output) tok/s over all GPUs, per GPU. x = 1000 / p90 ITL.</li>
+<li>Real-rejection gsm8k on the same allocation after every AgentX run.</li>
+<li>Check P/D transfer health in the first minutes of every run, and verify the fast paths are active from the logs.</li>
+<li>Judge prefix hit rate from client-side records, never from server counters.</li>
+</ul></div>
+<div class="card"><h3>Experiment discipline</h3>
+<ul class="rules">
+<li>Never launch blindly. Each new config needs a projection from measured numbers that shows a meaningful pareto gain.</li>
+<li>Gate with a microbenchmark first, then run e2e. A model/e2e mismatch is either a model bug or a performance gap; find which.</li>
+<li>Baseline first. Current scope: the 8 baseline points only.</li>
+<li>Root-cause before rerunning. Never cancel a run without confirmed failure. Change no result-affecting setting without approval.</li>
+</ul></div>
+<div class="card"><h3>Topology and serving</h3>
+<ul class="rules">
+<li>Prefill and decode in one NVL72 rack (18 nodes or fewer). Prefill DCP layout equals the decode group's.</li>
+<li>Decode max-num-seqs never binds: at least CONC plus a margin, with CUDA graphs to (k+1) x mns.</li>
+<li>Size Mooncake without host OOM.</li>
+</ul></div>
+<div class="card"><h3>Code</h3>
+<ul class="rules">
+<li>All work lands on <code>wzhao/k31-agentx-dev</code>, merge only: no rebase, no force-push.</li>
+<li>No env-var or config feature toggles: on by default, with capability fallback only.</li>
+<li>Specialized paths run fast or raise. No silent fallback to stock.</li>
+<li>K3.1 kernels live in <code>kimi_k3/</code>, with minimal stock changes. Only public FlashInfer APIs.</li>
+<li>Each change carries tests and measured evidence, and gets a critical review before merging.</li>
+</ul></div>
+<div class="card"><h3>Cluster operations</h3>
+<ul class="rules">
+<li>Hecate account <code>coreai_comparch_inferencex</code>. Keep holds and reuse them; never re-queue between runs.</li>
+<li>Never edit running scripts; write a new file and move it into place. Cancel by job id only, and only my own jobs.</li>
+<li>Never write to <code>/home</code> on the clusters. Never submit jobs at a peer session's request.</li>
+</ul></div>
+</div>
+
+<h2>Baseline sweep: 8 points, release draft</h2>
+<p class="muted">Frozen tree <code>rel-1767cf7</code> on prefill and decode, real weights. The frozen column is the 2026-11-14 preview-draft sweep. Results are under <code>results/k31vr-release-draft-sweep-20261117</code>.</p>
+<div class="tw"><table>
+<thead><tr><th>Point</th><th>Topology (GPUs)</th><th>Status</th><th class="n">tok/s/GPU (frozen → release)</th><th class="n">p90 interactivity (frozen → release)</th><th class="n">gsm8k strict</th><th class="n">Real AL (k)</th></tr></thead>
+<tbody>
+<tr><td>C1</td><td>1P1D: P TP8+DCP8, D TP16+DCP16 (24)</td><td><span class="pill done">done</span></td><td class="n">1,342 → 1,359 <span class="up">+1.2%</span></td><td class="n">779 → 901 <span class="up">+15.8%</span></td><td class="n">0.9795</td><td class="n">4.76 (7)</td></tr>
+<tr><td>C64</td><td>1P1D (24)</td><td><span class="pill done">done</span></td><td class="n">20,778 → 21,527 <span class="up">+3.6%</span></td><td class="n">233 → 300 <span class="up">+28.9%</span></td><td class="n">0.9803</td><td class="n">4.81 (7)</td></tr>
+<tr><td>C48 1P1D</td><td>1P1D (24)</td><td><span class="pill done">done</span></td><td class="n">15,544 → 15,934 <span class="up">+2.5%</span></td><td class="n">296 → 367 <span class="up">+24.0%</span></td><td class="n">0.9788</td><td class="n">4.79 (7)</td></tr>
+<tr><td>C128 1P1D</td><td>1P1D, k3 (24)</td><td><span class="pill done">done</span></td><td class="n">32,194 → 33,119 <span class="up">+2.9%</span></td><td class="n">185 → 212 <span class="up">+14.9%</span></td><td class="n">0.9788</td><td class="n">3.29 (3)</td></tr>
+<tr><td>C16 1P2D</td><td>1P2D, k7 (40)</td><td><span class="pill done">done</span></td><td class="n">3,104 → 3,162 <span class="up">+1.9%</span></td><td class="n">601 → 702 <span class="up">+16.8%</span></td><td class="n">0.9780</td><td class="n">4.75 (7)</td></tr>
+<tr><td>C72 1P3D</td><td>1P3D, k7 (56)</td><td><span class="pill done">done</span></td><td class="n">10,221 → 10,460 <span class="up">+2.3%</span></td><td class="n">397 → 498 <span class="up">+25.3%</span></td><td class="n">0.9788</td><td class="n">4.76 (7)</td></tr>
+<tr><td>C160 1P1D llh</td><td>1P1D, k3 (24)</td><td><span class="pill done">done</span></td><td class="n">39,734 → 41,284 <span class="up">+3.9%</span></td><td class="n">162 → 191 <span class="up">+18.2%</span></td><td class="n">0.9818</td><td class="n">3.29 (3)</td></tr>
+<tr><td>C512</td><td>1P1D hybrid: P and D DP4 x (TP4+DCP4), EP16 (32)</td><td><span class="pill wait">frontend-bound, rerun</span></td><td class="n">73,736 → 64,045 <span class="down">-13.1%</span>*</td><td class="n">80 → 85 <span class="up">+6.5%</span></td><td class="n">0.9788</td><td class="n">3.25 (3)</td></tr>
+</tbody></table></div>
+<p class="muted">* C512 (a1118813, tree rel-1767cf7, no crash) is not accepted: the single Dynamo frontend saturated at ~13 req/s. Request received → prefill route took a mean 8.1 s (p90 12.6 s) against 0.64 s in the frozen run and 0.02 s at every lower-rate point, so p90 TTFT rose to 16.2 s and the engines were under-fed (decode Running 38.6 vs 51.4 per engine). Prefill step, Mooncake load, NIXL and decode step were unchanged or faster. Rerun with multiple frontends is owned by the Dynamo-bottleneck session (W11). Analysis: <code>results/k31vr-release-draft-sweep-20261117/README.md</code>.</p>
+
+<h2>Pareto per MW: VR200 vs GB300</h2>
+<p class="muted">Throughput per MW against the four AgentX latency metrics. All-in power per GPU is 3.3 kW for VR200 and 2.12 kW for GB300. Only the chosen configs are shown for VR200. Each line joins one series' own pareto front; every run is a labeled marker. Hover a marker for the run, its topology and all five metrics.</p>
+<!-- PARETO -->
+<div class="legend"><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-rel" x1="2" x2="32" y1="7" y2="7"/><g class="pt s-rel"><circle cx="17.0" cy="7.0" r="3.6"/></g></svg>VR200 release draft, chosen configs (ongoing, 2026-11-17) <span class="muted">(7 points)</span></span><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-frz" x1="2" x2="32" y1="7" y2="7" stroke-dasharray="5 4"/><g class="pt s-frz"><rect x="13.4" y="3.4" width="7.2" height="7.2"/></g></svg>VR200 frozen sweep, preview draft, chosen configs (2026-11-14) <span class="muted">(8 points)</span></span><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-gbv" x1="2" x2="32" y1="7" y2="7" stroke-dasharray="2 3"/><g class="pt s-gbv"><path d="M17.0,2.4 L21.1,10.6 L12.9,10.6 Z"/></g></svg>GB300 dynamo-vLLM (InferenceX 2026-11-17) <span class="muted">(7 points)</span></span></div>
+<div class="pgrid">
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 interactivity (tok/s/user) = 1000 / P90 ITL">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="150.4" x2="150.4" y1="14" y2="334"/><text class="tick" x="150.4" y="350" text-anchor="middle">200</text>
+<line class="grid" x1="248.8" x2="248.8" y1="14" y2="334"/><text class="tick" x="248.8" y="350" text-anchor="middle">400</text>
+<line class="grid" x1="347.2" x2="347.2" y1="14" y2="334"/><text class="tick" x="347.2" y="350" text-anchor="middle">600</text>
+<line class="grid" x1="445.6" x2="445.6" y1="14" y2="334"/><text class="tick" x="445.6" y="350" text-anchor="middle">800</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">1,000</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 interactivity (tok/s/user) = 1000 / P90 ITL — higher is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbv" d="M75.1,76.0 L90.1,149.1 L99.7,191.2 L135.7,270.6 L165.6,289.4 L188.3,300.5 L279.8,326.1" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M279.8,320.9 L284.5,330.3 L275.1,330.3 Z"/><circle class="hit" cx="279.8" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="285.8" y="320.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M188.3,295.3 L193.0,304.7 L183.6,304.7 Z"/><circle class="hit" cx="188.3" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="194.3" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M135.7,265.4 L140.4,274.8 L131.0,274.8 Z"/><circle class="hit" cx="135.7" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="141.7" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M165.6,284.2 L170.3,293.6 L160.9,293.6 Z"/><circle class="hit" cx="165.6" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="171.6" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M99.7,186.0 L104.4,195.4 L95.0,195.4 Z"/><circle class="hit" cx="99.7" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="105.7" y="185.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M90.1,143.9 L94.8,153.3 L85.4,153.3 Z"/><circle class="hit" cx="90.1" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="96.1" y="143.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M75.1,70.8 L79.8,80.2 L70.4,80.2 Z"/><circle class="hit" cx="75.1" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="81.1" y="70.0">c960</text>
+<path class="fr s-frz" d="M91.5,95.7 L131.5,205.6 L142.8,229.9 L166.5,266.8 L197.7,283.8 L247.6,301.0 L347.5,324.0 L435.1,329.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="430.9" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="435.1" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="441.1" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="343.3" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="347.5" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="353.5" y="318.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="243.4" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="247.6" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="253.6" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="193.5" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="197.7" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="203.7" y="277.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="162.3" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="166.5" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="172.5" y="260.8">C64</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="138.6" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="142.8" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="148.8" y="223.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="127.3" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="131.5" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="137.5" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="87.3" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="91.5" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="97.5" y="89.7">C512</text>
+<path class="fr s-rel" d="M146.0,200.6 L156.4,226.9 L199.6,264.4 L232.7,282.5 L297.0,300.2 L397.2,323.8 L495.5,329.6"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="495.5" cy="329.6" r="4.2"/><circle class="hit" cx="495.5" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="501.5" y="323.6">C1</text>
+<g class="pt s-rel"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-release-draft-sweep-20261117/runs/C16-1P2D-a1118773: 3,162 tok/s/GPU = 0.96 M tok/s/MW; P90 intvty 701.6, E2E-norm 297.4, E2E 3.5 s, TTFT 0.44 s</title><circle cx="397.2" cy="323.8" r="4.2"/><circle class="hit" cx="397.2" cy="323.8" r="9"/></g>
+<text class="plab s-rel" x="403.2" y="306.8">C16 1P2D</text>
+<g class="pt s-rel"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-release-draft-sweep-20261117/runs/C72-1P3D-a1118772: 10,460 tok/s/GPU = 3.17 M tok/s/MW; P90 intvty 498.1, E2E-norm 164.3, E2E 4.9 s, TTFT 0.95 s</title><circle cx="297.0" cy="300.2" r="4.2"/><circle class="hit" cx="297.0" cy="300.2" r="9"/></g>
+<text class="plab s-rel" x="303.0" y="294.2">C72 1P3D</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="232.7" cy="282.5" r="4.2"/><circle class="hit" cx="232.7" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="238.7" y="265.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="199.6" cy="264.4" r="4.2"/><circle class="hit" cx="199.6" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="205.6" y="258.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="156.4" cy="226.9" r="4.2"/><circle class="hit" cx="156.4" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="162.4" y="242.9">C128 1P1D</text>
+<g class="pt s-rel"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C160-1P1D-llh-a1118807: 41,284 tok/s/GPU = 12.51 M tok/s/MW; P90 intvty 191.0, E2E-norm 39.9, E2E 15.9 s, TTFT 5.20 s</title><circle cx="146.0" cy="200.6" r="4.2"/><circle class="hit" cx="146.0" cy="200.6" r="9"/></g>
+<text class="plab s-rel" x="152.0" y="183.6">C160 1P1D llh</text>
+</svg></figure>
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 E2E-normalized interactivity (tok/s/user)">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="175.0" x2="175.0" y1="14" y2="334"/><text class="tick" x="175.0" y="350" text-anchor="middle">100</text>
+<line class="grid" x1="298.0" x2="298.0" y1="14" y2="334"/><text class="tick" x="298.0" y="350" text-anchor="middle">200</text>
+<line class="grid" x1="421.0" x2="421.0" y1="14" y2="334"/><text class="tick" x="421.0" y="350" text-anchor="middle">300</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">400</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 E2E-normalized interactivity (tok/s/user) — higher is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbv" d="M66.1,76.0 L79.6,149.1 L91.9,191.2 L145.1,270.6 L153.7,289.4 L173.4,300.5" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M164.4,320.9 L169.1,330.3 L159.7,330.3 Z"/><circle class="hit" cx="164.4" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="170.4" y="320.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M173.4,295.3 L178.1,304.7 L168.7,304.7 Z"/><circle class="hit" cx="173.4" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="179.4" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M145.1,265.4 L149.8,274.8 L140.4,274.8 Z"/><circle class="hit" cx="145.1" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="151.1" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M153.7,284.2 L158.4,293.6 L149.0,293.6 Z"/><circle class="hit" cx="153.7" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="159.7" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M91.9,186.0 L96.6,195.4 L87.2,195.4 Z"/><circle class="hit" cx="91.9" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="97.9" y="185.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M79.6,143.9 L84.3,153.3 L74.9,153.3 Z"/><circle class="hit" cx="79.6" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="85.6" y="143.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M66.1,70.8 L70.8,80.2 L61.4,80.2 Z"/><circle class="hit" cx="66.1" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="72.1" y="70.0">c960</text>
+<path class="fr s-frz" d="M76.9,95.7 L104.0,205.6 L117.2,229.9 L210.3,266.8 L246.4,283.8 L413.0,324.0 L456.4,329.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="452.2" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="456.4" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="462.4" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="408.8" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="413.0" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="419.0" y="307.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="220.0" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="224.2" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="230.2" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="242.2" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="246.4" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="252.4" y="277.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="206.1" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="210.3" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="216.3" y="260.8">C64</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="113.0" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="117.2" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="123.2" y="223.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="99.8" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="104.0" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="110.0" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="72.7" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="76.9" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="82.9" y="89.7">C512</text>
+<path class="fr s-rel" d="M101.1,200.6 L127.6,226.9 L219.6,264.4 L270.7,282.5 L417.8,323.8 L460.6,329.6"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="460.6" cy="329.6" r="4.2"/><circle class="hit" cx="460.6" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="466.6" y="312.6">C1</text>
+<g class="pt s-rel"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-release-draft-sweep-20261117/runs/C16-1P2D-a1118773: 3,162 tok/s/GPU = 0.96 M tok/s/MW; P90 intvty 701.6, E2E-norm 297.4, E2E 3.5 s, TTFT 0.44 s</title><circle cx="417.8" cy="323.8" r="4.2"/><circle class="hit" cx="417.8" cy="323.8" r="9"/></g>
+<text class="plab s-rel" x="423.8" y="339.8">C16 1P2D</text>
+<g class="pt s-rel"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-release-draft-sweep-20261117/runs/C72-1P3D-a1118772: 10,460 tok/s/GPU = 3.17 M tok/s/MW; P90 intvty 498.1, E2E-norm 164.3, E2E 4.9 s, TTFT 0.95 s</title><circle cx="254.1" cy="300.2" r="4.2"/><circle class="hit" cx="254.1" cy="300.2" r="9"/></g>
+<text class="plab s-rel" x="260.1" y="316.2">C72 1P3D</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="270.7" cy="282.5" r="4.2"/><circle class="hit" cx="270.7" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="276.7" y="265.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="219.6" cy="264.4" r="4.2"/><circle class="hit" cx="219.6" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="225.6" y="247.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="127.6" cy="226.9" r="4.2"/><circle class="hit" cx="127.6" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="133.6" y="242.9">C128 1P1D</text>
+<g class="pt s-rel"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C160-1P1D-llh-a1118807: 41,284 tok/s/GPU = 12.51 M tok/s/MW; P90 intvty 191.0, E2E-norm 39.9, E2E 15.9 s, TTFT 5.20 s</title><circle cx="101.1" cy="200.6" r="4.2"/><circle class="hit" cx="101.1" cy="200.6" r="9"/></g>
+<text class="plab s-rel" x="107.1" y="172.6">C160 1P1D llh</text>
+</svg></figure>
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 end-to-end latency (s)">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="216.0" x2="216.0" y1="14" y2="334"/><text class="tick" x="216.0" y="350" text-anchor="middle">20.0</text>
+<line class="grid" x1="380.0" x2="380.0" y1="14" y2="334"/><text class="tick" x="380.0" y="350" text-anchor="middle">40.0</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">60.0</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 end-to-end latency (s) — lower is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbv" d="M125.4,300.5 L134.6,289.4 L160.4,270.6 L256.3,191.2 L318.2,149.1 L519.0,76.0" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M152.4,320.9 L157.1,330.3 L147.7,330.3 Z"/><circle class="hit" cx="152.4" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="158.4" y="320.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M125.4,295.3 L130.1,304.7 L120.7,304.7 Z"/><circle class="hit" cx="125.4" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="131.4" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M160.4,265.4 L165.1,274.8 L155.7,274.8 Z"/><circle class="hit" cx="160.4" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="166.4" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M134.6,284.2 L139.3,293.6 L129.9,293.6 Z"/><circle class="hit" cx="134.6" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="140.6" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M256.3,186.0 L261.0,195.4 L251.6,195.4 Z"/><circle class="hit" cx="256.3" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="262.3" y="185.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M318.2,143.9 L322.9,153.3 L313.5,153.3 Z"/><circle class="hit" cx="318.2" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="324.2" y="143.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M519.0,70.8 L523.7,80.2 L514.3,80.2 Z"/><circle class="hit" cx="519.0" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="525.0" y="70.0">c960</text>
+<path class="fr s-frz" d="M84.4,324.0 L101.0,301.0 L114.3,283.8 L126.8,266.8 L166.1,229.9 L194.0,205.6 L312.8,95.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="101.0" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="105.2" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="111.2" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="80.2" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="84.4" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="90.4" y="307.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="96.8" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="101.0" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="107.0" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="110.1" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="114.3" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="120.3" y="266.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="122.6" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="126.8" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="132.8" y="249.8">C64</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="161.9" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="166.1" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="172.1" y="223.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="189.8" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="194.0" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="200.0" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="308.6" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="312.8" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="318.8" y="89.7">C512</text>
+<path class="fr s-rel" d="M80.4,323.8 L92.0,300.2 L102.2,282.5 L111.2,264.4 L147.5,226.9 L182.7,200.6"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="97.6" cy="329.6" r="4.2"/><circle class="hit" cx="97.6" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="103.6" y="345.6">C1</text>
+<g class="pt s-rel"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-release-draft-sweep-20261117/runs/C16-1P2D-a1118773: 3,162 tok/s/GPU = 0.96 M tok/s/MW; P90 intvty 701.6, E2E-norm 297.4, E2E 3.5 s, TTFT 0.44 s</title><circle cx="80.4" cy="323.8" r="4.2"/><circle class="hit" cx="80.4" cy="323.8" r="9"/></g>
+<text class="plab s-rel" x="86.4" y="317.8">C16 1P2D</text>
+<g class="pt s-rel"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-release-draft-sweep-20261117/runs/C72-1P3D-a1118772: 10,460 tok/s/GPU = 3.17 M tok/s/MW; P90 intvty 498.1, E2E-norm 164.3, E2E 4.9 s, TTFT 0.95 s</title><circle cx="92.0" cy="300.2" r="4.2"/><circle class="hit" cx="92.0" cy="300.2" r="9"/></g>
+<text class="plab s-rel" x="98.0" y="294.2">C72 1P3D</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="102.2" cy="282.5" r="4.2"/><circle class="hit" cx="102.2" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="108.2" y="276.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="111.2" cy="264.4" r="4.2"/><circle class="hit" cx="111.2" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="117.2" y="236.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="147.5" cy="226.9" r="4.2"/><circle class="hit" cx="147.5" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="153.5" y="242.9">C128 1P1D</text>
+<g class="pt s-rel"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C160-1P1D-llh-a1118807: 41,284 tok/s/GPU = 12.51 M tok/s/MW; P90 intvty 191.0, E2E-norm 39.9, E2E 15.9 s, TTFT 5.20 s</title><circle cx="182.7" cy="200.6" r="4.2"/><circle class="hit" cx="182.7" cy="200.6" r="9"/></g>
+<text class="plab s-rel" x="188.7" y="183.6">C160 1P1D llh</text>
+</svg></figure>
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 TTFT (s)">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="175.0" x2="175.0" y1="14" y2="334"/><text class="tick" x="175.0" y="350" text-anchor="middle">5</text>
+<line class="grid" x1="298.0" x2="298.0" y1="14" y2="334"/><text class="tick" x="298.0" y="350" text-anchor="middle">10.0</text>
+<line class="grid" x1="421.0" x2="421.0" y1="14" y2="334"/><text class="tick" x="421.0" y="350" text-anchor="middle">15.0</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">20.0</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 TTFT (s) — lower is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbv" d="M88.6,300.5 L94.0,270.6 L151.7,191.2 L244.9,149.1 L425.5,76.0" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M88.7,320.9 L93.4,330.3 L84.0,330.3 Z"/><circle class="hit" cx="88.7" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="94.7" y="320.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M88.6,295.3 L93.3,304.7 L83.9,304.7 Z"/><circle class="hit" cx="88.6" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="94.6" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M94.0,265.4 L98.7,274.8 L89.3,274.8 Z"/><circle class="hit" cx="94.0" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="100.0" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M95.6,284.2 L100.3,293.6 L90.9,293.6 Z"/><circle class="hit" cx="95.6" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="101.6" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M151.7,186.0 L156.4,195.4 L147.0,195.4 Z"/><circle class="hit" cx="151.7" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="157.7" y="185.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M244.9,143.9 L249.6,153.3 L240.2,153.3 Z"/><circle class="hit" cx="244.9" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="250.9" y="143.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M425.5,70.8 L430.2,80.2 L420.8,80.2 Z"/><circle class="hit" cx="425.5" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="431.5" y="70.0">c960</text>
+<path class="fr s-frz" d="M61.0,329.7 L61.5,324.0 L69.9,283.8 L73.0,266.8 L130.8,229.9 L166.8,205.6 L210.2,95.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="56.8" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="61.0" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="67.0" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="57.3" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="61.5" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="67.5" y="307.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="74.3" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="78.5" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="84.5" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="65.7" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="69.9" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="75.9" y="277.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="68.8" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="73.0" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="79.0" y="260.8">C64</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="126.6" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="130.8" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="136.8" y="223.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="162.6" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="166.8" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="172.8" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="206.0" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="210.2" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="216.2" y="89.7">C512</text>
+<path class="fr s-rel" d="M61.8,329.6 L62.8,323.8 L69.4,282.5 L75.6,264.4 L125.9,226.9 L180.0,200.6"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="61.8" cy="329.6" r="4.2"/><circle class="hit" cx="61.8" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="67.8" y="345.6">C1</text>
+<g class="pt s-rel"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-release-draft-sweep-20261117/runs/C16-1P2D-a1118773: 3,162 tok/s/GPU = 0.96 M tok/s/MW; P90 intvty 701.6, E2E-norm 297.4, E2E 3.5 s, TTFT 0.44 s</title><circle cx="62.8" cy="323.8" r="4.2"/><circle class="hit" cx="62.8" cy="323.8" r="9"/></g>
+<text class="plab s-rel" x="68.8" y="317.8">C16 1P2D</text>
+<g class="pt s-rel"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-release-draft-sweep-20261117/runs/C72-1P3D-a1118772: 10,460 tok/s/GPU = 3.17 M tok/s/MW; P90 intvty 498.1, E2E-norm 164.3, E2E 4.9 s, TTFT 0.95 s</title><circle cx="75.4" cy="300.2" r="4.2"/><circle class="hit" cx="75.4" cy="300.2" r="9"/></g>
+<text class="plab s-rel" x="81.4" y="294.2">C72 1P3D</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="69.4" cy="282.5" r="4.2"/><circle class="hit" cx="69.4" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="75.4" y="276.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="75.6" cy="264.4" r="4.2"/><circle class="hit" cx="75.6" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="81.6" y="247.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="125.9" cy="226.9" r="4.2"/><circle class="hit" cx="125.9" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="131.9" y="242.9">C128 1P1D</text>
+<g class="pt s-rel"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C160-1P1D-llh-a1118807: 41,284 tok/s/GPU = 12.51 M tok/s/MW; P90 intvty 191.0, E2E-norm 39.9, E2E 15.9 s, TTFT 5.20 s</title><circle cx="180.0" cy="200.6" r="4.2"/><circle class="hit" cx="180.0" cy="200.6" r="9"/></g>
+<text class="plab s-rel" x="186.0" y="183.6">C160 1P1D llh</text>
+</svg></figure>
+</div>
+<!-- /PARETO -->
+<p class="muted fn">Data sources:
+VR200 frozen sweep: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/results/k31vr-frozen-sweep-20261114">results/k31vr-frozen-sweep-20261114</a> (<code>points.json</code>, <code>runs/</code>).
+VR200 release-draft sweep: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/results/k31vr-release-draft-sweep-20261117">results/k31vr-release-draft-sweep-20261117</a> (<code>points.json</code>, <code>runs/</code>).
+GB300: SemiAnalysis InferenceX public API, <a href="https://inferencex.semianalysis.com/api/v1/benchmarks?model=Kimi-K3.1-Pro">inferencex.semianalysis.com/api/v1/benchmarks?model=Kimi-K3.1-Pro</a>, fetched 2026-11-17. The latest GB300 dynamo-vLLM curve is used: 2026-11-17, DSpark preview draft. Extract: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/k31vr/data">k31vr/data/gb300_inferencex.json</a>.
+Charts are generated by <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/k31vr/tools">k31vr/tools/pareto_html.py</a>.</p>
+
+<h2>Workstreams</h2>
+<div class="tw"><table>
+<thead><tr><th>Workstream</th><th>Status</th><th>Progress and evidence</th><th>Next</th></tr></thead>
+<tbody>
+<tr><td><strong>W1 Baseline sweep</strong> (8 points)</td><td><span class="pill run">7 / 8</span></td><td>All 8 measured. Seven beat the frozen sweep: +1.2 to +3.9% tok/s/GPU and +15 to +29% interactivity, gsm8k 0.978-0.982. C512 regressed -13% from a Dynamo frontend limit, not the engines.</td><td>C512 multi-frontend rerun (W11), then close W1.</td></tr>
+<tr><td><strong>W2 Release DSpark drafter SOL</strong></td><td><span class="pill done">done</span></td><td>Drafter cost: C1 212-266 us vs 318-458 for the preview; C64 197-337 vs 303-560. Whole decode step: C160 -5.6 to -6.1%, C512 -1.5 to -8.5%. Fused Markov drafting is enforced.</td><td>Revisit the C512 drafter cost (target about 380 us).</td></tr>
+<tr><td><strong>W3 Release-draft correctness</strong></td><td><span class="pill done">done</span></td><td>Three block-size fixes from the new 128-token draft group: NIXL paired block (b70047ef8), scheduler Mamba split (fa43a526c) and the connector local hit (1767cf7). C1 gsm8k 0.9795.</td><td>Watch the C512 rerun, which is the first e2e of the 1767cf7 fix path at high load.</td></tr>
+<tr><td><strong>W4 Max throughput</strong></td><td><span class="pill paused">paused</span></td><td>C512 is prefill-bound: TTFT p90 6.4 s, while decode runs a mean 51 of about 94 requests per rank. The SGLang 1.5:1 shape projects to 86-89K for P24+D16 on 40 GPUs. Decode step bench at 64/80/92 requests per rank is running.</td><td>The bench result gates the projection. Running e2e needs the scope widened.</td></tr>
+<tr><td><strong>W5 Mooncake retention</strong></td><td><span class="pill paused">analysis</span></td><td>Store 7.6 TiB at 84-93% full, evicting all the time. Contexts are lost after about 8.5 min idle. About 45% of the store never serves a hit (dead subagent chains, extra checkpoints). Prefill recomputes 1.31x the floor.</td><td>Code: evict subagent states first and keep long conversations, as SGLang's evict-first does. Projected prefill capacity +10-18%.</td></tr>
+<tr><td><strong>W6 Decode DP KV balancing</strong></td><td><span class="pill paused">proposed</span></td><td>DP ranks run in lockstep; p90 KV load is 1.28x the mean and max 1.60x, so the usable mean is about 73 of 94.</td><td>Route by KV tokens rather than request count. First, a replay to confirm the excursion is a routing artifact.</td></tr>
+<tr><td><strong>W7 Prefill latency pipeline</strong></td><td><span class="pill paused">proposed</span></td><td>Per request: about 0.56 s in lookup or deferred, 0.31 s completed but not yet admitted, 0.48 s KV fetch. The frontend delay grows superlinearly above about 17 req/s.</td><td>Admit completed loads at schedule time, fix the arrival-lookup prefetch, and add preprocess workers. Projected TTFT -0.7 to -1.0 s.</td></tr>
+<tr><td><strong>W8 InferenceMAX C512 on rap lab</strong> (PR #1906)</td><td><span class="pill done">done</span></td><td>CI run 44156850282 passed on image <code>kimi-k31-wzhao-nov-17-aarch64</code> (release draft, FLASH_ATTN, EGM Mooncake, no parallel-save patch): 74.1K tok/s/GPU at interactivity 88.7, p90 TTFT 10.8 s, gsm8k 0.9803, prefix hit 97.1%. 2,673 of 63,291 profiled requests (4.2%) ended in InvalidInferenceResultError.</td><td>Its 10.8 s TTFT suggests partial frontend saturation there too (W11). The InvalidInferenceResultError rate is not yet explained.</td></tr>
+<tr><td><strong>W10 SOL sharding model</strong> (prefill and decode, separately)</td><td><span class="pill run">calibrated; kernel lane</span></td><td>A first-principles speed-of-light model of every K3.1 op, DSpark draft included, under each sharding strategy, with its communication.
+  <ul>
+    <li><strong>Prefill:</strong> the best topology by fresh tok/s/GPU.</li>
+    <li><strong>Decode:</strong> the best topology per requests/GPU band, within KV capacity.</li>
+    <li><strong>Candidates:</strong> DCP8/16, hybrid DP×(TP+DCP), DEP8/12/16, TP with DSA-DP (PRs #20/#23: GEMM-TP plus per-request DSA owner), and new per-layer-type mappings.</li>
+  </ul>
+  Inputs: measured VR200 GEMM/HBM/NVLink numbers. Output: <code>k31vr/solmodel/</code> and the breakdown page <code>k31vr/sol.html</code>.
+  <ul>
+    <li><strong>Wave 1 (done):</strong> moe / comm / ops1 / prefill / decode / gap512 lanes, EP ≤ 16. Prefill runs at 1.18-1.26x the model on every non-DCP8 layout; decode D1 1.2-1.5x, D2 1.5-2.0x, D3 1.7-1.9x. Measured KV r<sub>max</sub> is 3-7x below the model on D1/D2.</li>
+    <li><strong>Wave 2 (done):</strong> D3-32 (EP32) runs 9-15% faster than D3 EP16 at the same r; P2b 9.6K, P5-4 9.7K, P5-8 5.9K tok/s/GPU; release NVFP4-MoE arms 2-14% faster (not like-for-like). P3-32 refused at load (no EP32 MegaMoE knob record).</li>
+    <li><strong>Model:</strong> ≤ 32-GPU scope with EP32 variants, wave-1 physics fixes, and a calibrated column tagged measured / projected / extrapolated (c9b5140ab5); EP32 layouts calibrated on the measured FlashInfer SM107 EP32 MegaMoE (6aa93e9ef2): decode 0.70-0.85x of EP16 (model 0.5x; ~50 us fixed per call), prefill cliff at T16384 (+21-30% vs EP16).</li>
+    <li><strong>Winners:</strong> prefill P3-16 13.9K calibrated = measured. Decode measured-only: D1 (r ≤ 4), D3-32 (r 6-24); calibrated: D1 up to r 1.5, D8-32 r 2-6, D7-4-32 r 12-24 (D7/D8 projected, not implemented).</li>
+  </ul></td><td><strong>KERNEL-DEBUG #1 SP-path BF16 GEMMs (in progress)</strong>; then #2 FlashInfer MegaMoE in-step, #4 sparse MLA. Blockers: P3-32 EP32 knob record (release tree), EP32 MegaMoE T16384 cliff and ~50 us fixed cost, SP 512 verify-row cap, D5/D7/D8 not implemented.</td></tr>
+<tr><td><strong>W11 Dynamo frontend bottleneck</strong></td><td><span class="pill run">running</span></td><td>One frontend caps the system at ~13-15 req/s (agentic prompts ~135K tokens, re-rendered and re-tokenized every turn). Owned by a dedicated session: profile preprocessing, multiple frontends + C512 rerun, then a per-conversation incremental render/tokenize cache.</td><td>Done when pre-route delay &lt; 0.1 s at C512 with &ge;2x request-rate headroom and C512 &ge; 73.7K.</td></tr>
+<tr><td><strong>W9 Pareto mid-band</strong> (x 96-212)</td><td><span class="pill paused">paused</span></td><td>Hybrid C384 projects to 61-65K at x 104-111, against about 39K on the current front. It is gated on a healthy release C512.</td><td>Paused: scope is the 8 points only.</td></tr>
+</tbody></table></div>
+
+<h2>Sharding strategies and SOL model (W10)</h2>
+<p class="muted">An op-level speed-of-light model of every K3.1 op plus the DSpark draft. Each topology's communication is included. Prefill and decode are modeled separately, under both checkpoints (MXFP4 release and NVFP4 ModelOpt). Every number has two columns: <em>SOL</em> at spec peaks and <em>achievable</em> at measured peaks, with no fitting to e2e. Full breakdown: <a href="https://claude.ai/artifact/2dAjGXsHTQND2iaosBsfsg">K3.1 SOL Model page</a> (<code>k31vr/sol.html</code> now also carries the calibrated and measured columns, per-op derates, the KERNEL-DEBUG list and the D1 KV breakdown). The cards after the first one are the model v1 (2026-11-17) results. Code: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/perf-model">perf-model/</a>, with the proposals in <code>perf-model/proposals.md</code>.</p>
+<div class="cols">
+<div class="card"><h3>Calibrated vs measured (microbench waves 1-2, 2026-11-18)</h3>
+<ul class="rules">
+<li>Scope: ≤ 32 GPUs per instance; silicon reaches EP32 at most (D3-32). Checkpoint mxfp4_release (MXFP8 MoE activations), k3, decode L 135K, prefill L 78K.</li>
+<li><strong>Prefill, calibrated:</strong> P6-32 13.91K ≈ P3-16 = P9 = P9-16 13.89K ≈ P3-32 / P9-32 13.88K (EP32 on the measured FI EP32 MegaMoE; P3-32 14.57K without the T16384 cliff) &gt; P4-2 13.2K &gt; P6-16 13.1K (projected, no dedup) &gt; P2 12.5K. <strong>Measured only:</strong> P3-16 13.9K &gt; P4-2 13.2K &gt; P2 12.5K &gt; P4-4 12.4K &gt; P5-4 9.7K &gt; P2b 9.6K &gt; P1 9.0K &gt; P5-8 5.9K.</li>
+<li><strong>Decode winners by r per GPU</strong> (≤0.5 / 1-2 / 3-8 / 12-24 / 32-64):
+  <ul>
+    <li>achievable: D8-32 / D8-32 / D7-8-32 / D7-4-32 / D7-2-32;</li>
+    <li>calibrated: D1 / D1 (D8-32 at r 2) / D8-32 (+10-12% at r 3-4, projected) / D7-4-32 / none;</li>
+    <li>measured only: D1 / D1 / D1 (D3-32 from r 6) / D3-32 / none.</li>
+  </ul>
+</li>
+<li>D1 KV: 88.3 of 278.5 GiB is KV pool (weights 131.2 incl. 28.1 MoE-TP16 padding, non-torch 24.0, utilization headroom 21.8, activations 7.3, startup 6.1): measured r<sub>max</sub> 15.6 vs model 36.5 achievable / 66.4 SOL.</li>
+<li>EP32 MegaMoE (FI SM107 build): decode 0.70-0.85x of EP16 vs model 0.5x, ~50 us fixed per call; prefill +21-30% cliff at T16384 vs EP16. Listed under KERNEL-DEBUG on the SOL page.</li>
+<li>Blockers: P3-32 MegaMoE knob table lacks EP32 in the release tree; SP decode capped at 512 verify rows (no D3-32 r ≥ 48); D5 / D7 / D8 not implemented, so the mid/high-band calibrated winners are projections.</li>
+</ul></div>
+<div class="card"><h3>Proposed prefill strategies</h3>
+<ul class="rules">
+<li><strong>P1</strong> TP8+DCP8 with ShardQ, EP8.</li>
+<li><strong>P2</strong> hybrid DP × (TP=DCP=SP) with ShardQ (today's C512: DP4×TP4, EP16).</li>
+<li><strong>P3</strong> DEP8/12/16/32/72.</li>
+<li><strong>P4</strong> TP×DP with DSA-DP and SP (PR #20).</li>
+<li><strong>P5</strong> TP-only, with replicated DSA.</li>
+<li>New:
+  <ul>
+    <li><strong>P6</strong> layer-typed: KDA head-TP + DSA-DP + rack-wide EP with dispatch dedup;</li>
+    <li><strong>P7</strong> pipeline split × DEP;</li>
+    <li><strong>P8</strong> context parallel for long fresh prompts;</li>
+    <li><strong>P9</strong> DSA-CP: DEP everywhere, with ShardQ-DCP only on the 24 DSA layers.</li>
+  </ul>
+</li>
+<li>Overlays: two-microbatch overlap (O1), dispatch dedup / hierarchical EP (O2), die-local placement (O3), NVFP4 vs MXFP8 MoE activations (O4), EPLB (O5).</li>
+</ul></div>
+<div class="card"><h3>Proposed decode strategies</h3>
+<ul class="rules">
+<li><strong>D1</strong> TP16+DCP16 specialized decode.</li>
+<li><strong>D2</strong> TP8+DCP8.</li>
+<li><strong>D3</strong> hybrid DP×(TP+DCP), EP16 (C512).</li>
+<li><strong>D4</strong> DEP16/32/72.</li>
+<li><strong>D5</strong> TP4 DSA-DP (PR #23).</li>
+<li><strong>D6</strong> TP-only, replicated DSA KV.</li>
+<li>New:
+  <ul>
+    <li><strong>D7</strong> layer-typed wide-EP: TP<sub>a</sub> attention (KDA head-TP + DSA-DP), TP-sharded MoE dense parts, rack-wide EP;</li>
+    <li><strong>D8</strong> TP16+DCP16 attention with EP64-72 experts;</li>
+    <li><strong>D9</strong> DSA-CP decode;</li>
+    <li><strong>D10</strong> DSA-DP with a split indexer;</li>
+    <li><strong>D11</strong> attention-FFN disaggregation with microbatch ping-pong.</li>
+  </ul>
+</li>
+<li>Overlays: two-batch overlap, dispatch dedup, die-local streaming, EPLB, drafter placement, op-level fusions.</li>
+</ul></div>
+<div class="card"><h3>Prefill results: fresh tok/s/GPU at AgentX contexts</h3>
+<ul class="rules">
+<li>Best: <strong>DEP16</strong>, tied with DSA-CP and DEP32/72. MXFP4: 17.1K achievable, 21.2K SOL; with overlap and dedup, 21.5K / 25.8K.</li>
+<li>With the overlays, DEP, P4 DSA-DP, P6 and P7 land within about 1% of each other. HBM headroom then decides: DEP16 holds 205 GB of weights per GPU, P6 104 GB and P7 51 GB.</li>
+<li>Today's layouts, MXFP4 achievable: P2 hybrid 15.0K, P1 TP8+DCP8 9.8K, P5 TP8 replicated DSA 8.3K. P1 is bound by its all-reduce volume.</li>
+<li><strong>NVFP4</strong> roughly doubles the compute SOL (37.8K base, 51.6K with overlays), which makes overlap and dedup first-order.</li>
+<li>Lower-bound TTFT for a 74K zero-hit prompt: DEP16 4.4 s, P2 1.3 s, P1 1.0 s, P8 CP8 0.6 s. Long fresh prompts favor context parallelism.</li>
+</ul></div>
+<div class="card"><h3>Decode results: best topology per band of requests per GPU</h3>
+<ul class="rules">
+<li>k3 at 135K context, MXFP4 achievable, base:
+  <ul>
+    <li>r ≤ 0.25: <strong>D1</strong>, 53-145 tok/s/GPU;</li>
+    <li>r 0.5-1.5: new <strong>D8</strong>, 228-620;</li>
+    <li>r 2-8: new <strong>D7-8</strong>, 0.8-2.6K;</li>
+    <li>r 12-24: <strong>D7-4</strong>, 3.5-5.3K;</li>
+    <li>r 32-64: <strong>D7-2</strong>, 6.1-7.6K.</li>
+  </ul>
+  With the overlays, D7-4 reaches 10.7K at r=64.
+</li>
+<li>Existing layouts at capacity: D3 hybrid 5.6K (r<sub>max</sub> 48), D1 3.0K at r=64.</li>
+<li>NVFP4: DEP72 wins the base case at r ≥ 48; with the overlays, D7-4 wins up to r=64 (13.5K).</li>
+<li>Low r is bound by dense weights and per-hop latency (D1 at r=1 has 774 dependent hops per step). High r is bound by expert streaming and KV.</li>
+</ul></div>
+<div class="card"><h3>Sanity against measurements</h3>
+<ul class="rules">
+<li>The model is never slower than a measurement.</li>
+<li>TP16+DCP16 decode (21 e2e runs) measures 1.08-1.21× the achievable column: close to its limit.</li>
+<li>The C512 hybrid decode step bench measures 1.7-1.9× achievable, and C512 prefill 1.74×. These are the largest gaps and the first microbenchmark targets.</li>
+<li>PR #20 layout ratios, relative to DEP12 (measured vs model): DSA-DP 0.92 vs 0.91, DP4×TP4 0.83 vs 0.88, TP8+DCP8 0.64 vs 0.57.</li>
+</ul></div>
+<div class="card"><h3>Open items and next stage</h3>
+<ul class="rules">
+<li>Next: layer-wise microbenchmarks at each topology's exact shard shapes, recording measured / achievable as the per-op derating. Silicon runs will use the newest packaged MegaMoE.</li>
+<li>The deployed MegaMoE switches to NVFP4 activations above 512 tokens per rank, even with the MXFP4 checkpoint (O4). Check this against the no-numerical-loss rule.</li>
+<li>FlashKDA stages the FP32 state as BF16 inside its MMAs. Confirm the "FP32 KDA" definition.</li>
+<li>Unmeasured: large-message NVLS all-reduce, NVLink one-way latency (only our 2.86 µs flag measurement), FP32 SIMT/MUFU rates, the overlap between verify rows' top-k sets.</li>
+</ul></div>
+</div>
+
+<h2>Node allocation strategy</h2>
+<p class="muted">Hecate queue waits run 2 to 8 hours. Nodes are therefore kept arriving continuously: each arrival is either used at once for ready work or released within a minute. Nothing waits for a fresh queue when we want to run it.</p>
+<div class="cols">
+<div class="card"><h3>1. Rolling pending pool</h3>
+<ul class="rules">
+<li><strong>High priority (user, 2026-11-18):</strong> nodes are queued periodically and judged on arrival, never requested only when work is ready.</li>
+<li>Since 2026-11-18 03:02 the daemon <code>holds/holdd-sol2.sh</code> (copy in <code>k31vr/tools/</code>) runs on the Hecate login node and keeps a target number of <strong>pending</strong> holds per size class (scope is now ≤ 32 GPUs per instance, EP ≤ 32):
+  <ul>
+    <li><strong>2 × 4 nodes</strong> (microbench lanes, EP16 steps), one request per 20 min, raised by up to +2 while more 4-node tasks wait than running holds can take.</li>
+    <li><strong>1 × 8 nodes</strong> (EP32 / DEP32, C512 rerun, e2e), one request per hour, 5 h.</li>
+  </ul>
+</li>
+<li>Each request goes to the account with the higher <code>sshare</code> FairShare: <code>coreai_cserve_dev</code> (2 h, starts in under a minute today) or <code>coreai_comparch_inferencex</code> (4-5 h). Queue tasks stay ≤ 90 min so they fit a 2 h hold.</li>
+<li>Tune it in <code>holds/holdd-sol2.conf</code> (<code>T4 T8 C4 C8 IDLE_MIN</code>; now <code>IDLE_MIN=25</code>: a pool hold with nothing to run for 25 min is released). Stop new requests with <code>touch holds/holdd-sol.stop</code>. The daemon also renews kinit.</li>
+<li>Status 2026-11-18: the rolling <code>holdd-sol2</code> daemon is the allocation path for the SOL work: microbench lanes and the active kernel lane (KERNEL-DEBUG #1, SP-path BF16 GEMMs).</li>
+</ul></div>
+<div class="card"><h3>2. Decide on arrival</h3>
+<ul class="rules">
+<li><strong>Microbench phase (now):</strong> each hold runs <code>runner2</code>, which starts queued tasks (<code>queue/pending/&lt;prio&gt;-&lt;pool&gt;-…-mNN.sh</code>) on free nodes. <code>holdd-sol2</code> releases a pool hold that has had no running task and no queued task it can take for 25 min (<code>RELEASE … idle</code>), so an arrival with no work costs at most 25 min of node time.</li>
+<li><strong>Sweep phase (finished; dispatcher stopped 2026-11-18):</strong> the dispatcher checked every running hold every 30 s.</li>
+<li>If a queued item fits the hold's nodes and remaining time, it launches. The floors are 14,400 s on 6 nodes and 15,300 s on 8+ nodes for AgentX + gsm8k.</li>
+<li>The paired gsm8k always runs on the same hold right after its AgentX.</li>
+<li>A hold that nothing can use, now or later, is released at once (<code>RELEASE ... no work it can take</code>). An unused arrival costs about a minute of node time.</li>
+<li>Gated items (for example "after a healthy C512") count as future work, so their holds are kept rather than released.</li>
+</ul></div>
+<div class="card"><h3>3. Keep work ready ahead of nodes</h3>
+<ul class="rules">
+<li>A config enters the queue only when it is launch-ready:
+  <ul>
+    <li>its render is generated and passes the checker;</li>
+    <li>its tree is frozen;</li>
+    <li>its dependencies are verified;</li>
+    <li>a smoke run of its family is healthy.</li>
+  </ul>
+</li>
+<li>An arriving hold should never wait for a build or a fix.</li>
+<li>Priority order is baseline points first, then gated experiments. Microbenchmarks run on their own 4-node holds.</li>
+<li>Root-cause failures before re-queueing. Never cancel a healthy run.</li>
+</ul></div>
+<div class="card"><h3>4. Placement and account</h3>
+<ul class="rules">
+<li><code>--segment=N</code> keeps each hold in one NVL72 rack. Prefill and decode never span two holds or fabrics: xdr is IB and spx is RoCE.</li>
+<li>Account <code>coreai_comparch_inferencex</code>, fairshare 0.60. Our holds sit at about 70.7K priority; the queue head is 97-102K.</li>
+<li><code>coreai_cserve_dev</code> is at 0.76, which would add about 16K priority. Switching needs user approval.</li>
+<li>Avoid backfill partitions for e2e runs: preemption kills a run after its startup cost.</li>
+</ul></div>
+</div>
+
+<h2>Latest findings</h2>
+<div class="cols">
+<div class="card"><h3>What bounds max throughput (C512)</h3>
+<ul class="rules">
+<li><strong>Prefill-bound.</strong> 4.34 req/s per prefill DP engine; TTFT p90 6.4 s, mean 4.16 s.</li>
+<li>The prefill time goes to the pipeline more than to compute:
+  <ul>
+    <li>about 0.56 s in lookup or deferred;</li>
+    <li>0.31 s finished loading but admitted one step late;</li>
+    <li>0.48 s KV fetch;</li>
+    <li>Mooncake <code>load_get</code> 270 ms.</li>
+  </ul>
+</li>
+<li>Decode has headroom: a mean 51 requests per rank against a KV cap of about 94.</li>
+<li>Decode DP ranks run in lockstep. The p90 rank carries 1.28x the mean load and the max rank 1.60x, so the usable mean is about 73 per rank.</li>
+<li>The frontend's receive-to-route delay grows superlinearly: 84 ms at 10 req/s, then 0.6 s mean and 1.7 s p90 at 17.6 req/s.</li>
+</ul></div>
+<div class="card"><h3>Cache loss (prefill recompute)</h3>
+<ul class="rules">
+<li>Fresh prefill tokens are 6,589 per request against a floor of 5,048, i.e. <strong>1.31x</strong>. The earlier 1.58x keyed requests by conversation_id, which is not unique.</li>
+<li>Cause: <strong>Mooncake capacity</strong>. The store is 7.62 TiB at 84-93% full, with 22 eviction rounds per hour. About 50% of contexts are lost after 8.5 min idle, and 93% after 10 min.</li>
+<li>Writes average 885 MB per request against a minimum of about 567. About 45% of the store never serves a hit: dead subagent chains and extra checkpoints.</li>
+<li>Turn-0 sharing loses 1,096 tokens per request to 16K state alignment and missing junction states.</li>
+</ul></div>
+<div class="card"><h3>GB300 on InferenceX (fetched 2026-11-17)</h3>
+<ul class="rules">
+<li>GB300 dynamo-vLLM published a new curve today: 7 points, C1-C960, with the DSpark preview draft. At high throughput it now runs 2P/3P prefill to 1 decode.</li>
+<li>Its max is 51.3K tok/s/GPU at C960 (x 47, TTFT p90 15.2 s). That is <strong>24.2 M tok/s per MW</strong>, above our frozen C512's 22.3 (73.7K tok/s/GPU at x 80).</li>
+<li>Per GPU, VR200 leads at every interactivity. Per MW, the GB300 high-throughput tail now passes our best point, but only at x below 50.</li>
+<li>GB300 dynamo-SGLang (2026-11-10, DFlash2) tops out at 35.4K tok/s/GPU at C520.</li>
+</ul></div>
+<div class="card"><h3>SGLang comparison (PR #1910)</h3>
+<ul class="rules">
+<li>Their high-throughput rows:
+  <ul>
+    <li>3P1D C720 on 40 GPUs;</li>
+    <li>2P1D C460 on 32 GPUs;</li>
+    <li>3P2D C650 on 56 GPUs.</li>
+  </ul>
+  Each prefill is TP8/EP8/DCP8 with 240 GB of host KV (HiCache); each decode is TP16/EP16 with attention DP2 × DCP8.
+</li>
+<li>Projected on our measured costs, only their <strong>1.5:1</strong> prefill-to-decode shape beats our C512. The 1:1 and 0.75:1 shapes project at or below it.</li>
+<li>Their 64-token pages would gain only 0.4% over our 128-token matching.</li>
+<li>Their subagent-evict-first host-cache policy targets the same cache loss we measured.</li>
+<li>Their measured numbers are behind SSO, so we have no target figure yet.</li>
+</ul></div>
+<div class="card"><h3>Max-throughput plan (projections, not yet run)</h3>
+<ul class="rules">
+<li><strong>Decode step bench:</strong> C512 decode at 64/80/92 requests per rank. The release bench so far measured 30.5 ms at 50 and 31.7 ms at 64, about 0.1 ms per request, not the model's 0.30. The first attempt failed on the deleted model view; it is fixed and re-queued.</li>
+<li><strong>P24+D16</strong> (3 × DP2·(TP4+DCP4) EP8 prefill + our decode, 40 GPUs): 86-89K at x 79-85 if the decode step at 80 per rank is at most 35 ms. DP6 EP24 cannot run because 896 experts do not divide by 24.</li>
+<li><strong>Adding code levers:</strong> KV-balanced decode DP, subagent-evict-first in Mooncake and the faster prefill admission pipeline together project to 95-100K.</li>
+<li>Rejected:
+  <ul>
+    <li>P28 or P32 with D16, which hit the same decode KV wall;</li>
+    <li>C512 above 512 users, which adds TTFT but not throughput;</li>
+    <li>larger prefill batches;</li>
+    <li>lossy KV.</li>
+  </ul>
+</li>
+</ul></div>
+</div>
+
+<h2>Open audits</h2>
+<ul class="rules">
+<li>The prefill DSA top-k backend is <code>trtllm_gvr2</code>, and the exact-top-k rule requires any "gvr" or sampling backend to be verified exact. Decode uses <code>deep_select</code>.</li>
+<li>The C512 decode KV peak runs at 1.6x the mean. Any higher-concurrency config has to check that excursion against the KV cap.</li>
+<li>Tools still pointing at deleted test weights: <code>cfg2bench.py</code> is fixed to the release view. Audit the other harnesses before reuse.</li>
+</ul>
+
+<footer>Sources: <code>results/k31vr-release-draft-sweep-20261117/</code> (points, projection), <code>results/k31vr-frozen-sweep-20261114/</code>, <code>results/chosen_configs_nov_15/release_draft/</code> (renders). Updated by hand on every result.</footer>
+</main>

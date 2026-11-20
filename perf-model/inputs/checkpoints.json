@@ -1,0 +1,23 @@
+{
+  "note": "Two serving checkpoints of Kimi K3.1-Pro. Model every topology under both; they may serve different parts of the pareto. KV/state precision is the same for both (FP8 MLA KV, MXFP4 indexer KV in our serving rules; the NVFP4 model card evaluates with FP8 KV/indexer and FP32 SSM state). Sources: release config.json (d9e99b07) quantization_config; https://huggingface.co/nvidia/Kimi-K3.1-Pro-NVFP4 config.json quantization_config (modelopt_mixed) + README 'Post Training Quantization', fetched 2026-11-17.",
+  "checkpoints": {
+    "mxfp4_release": {
+      "hf": "moonshotai/Kimi-K3.1-Pro @ d9e99b07 (compressed-tensors, mxfp4-pack-quantized)",
+      "routed_experts": {"weights": "MXFP4 (group 32, UE8M0 scales)", "activations": "MXFP8 (serving rule: moe.activation=mxfp8; W4A8)", "gemm_peak": "mxfp8 x mxfp4 -> use the MXFP8 tensor rate unless a W4A8 kernel runs at FP4 rate"},
+      "shared_experts": {"weights": "BF16", "activations": "BF16"},
+      "kda_projections": {"weights": "BF16", "activations": "BF16", "modules": ["fused_qkvg_proj / in_proj_qkvgfab", "q/k/v/g/b_proj", "f_a_proj (f_b_proj BF16)", "o_proj"]},
+      "mla_dsa_projections": {"weights": "BF16", "activations": "BF16", "modules": ["q_a/q_b/kv_a/kv_b(absorbed)/o_proj + output gate", "indexer q/k/weights projections"]},
+      "router_latent_dense": {"weights": "BF16", "modules": ["block_sparse_moe.gate (router)", "routed_expert_up_proj / routed_expert_down_proj (latent 7168<->3584)", "layer-0 dense mlp (33792)", "lm_head", "embeddings"]}
+    },
+    "nvfp4_modelopt": {
+      "hf": "nvidia/Kimi-K3.1-Pro-NVFP4 (modelopt 0.48.0, quant_method modelopt_mixed)",
+      "routed_experts": {"weights": "NVFP4 (group 16, FP8 E4M3 scales + global scale)", "activations": "NVFP4 (group 16, static input_scale=1.0)", "gemm_peak": "NVFP4 tensor rate (W4A4)"},
+      "shared_experts": {"weights": "MXFP8 (group 32)", "activations": "MXFP8 (group 32, dynamic)"},
+      "kda_projections": {"weights": "MXFP8 (group 32)", "activations": "MXFP8 (group 32, dynamic)", "modules": ["fused_qkvg_proj", "in_proj_qkvgfab", "q_proj", "k_proj", "v_proj", "g_proj", "b_proj", "f_a_proj", "o_proj"], "kept_bf16": ["q/k/v_conv1d", "f_b_proj", "o_norm"]},
+      "mla_dsa_projections": {"weights": "BF16", "activations": "BF16", "note": "MLA layers kept in BF16 for accuracy recovery (README)"},
+      "router_latent_dense": {"weights": "BF16", "modules": ["block_sparse_moe.gate", "routed_expert_up_proj / routed_expert_down_proj / routed_expert_norm", "*_res_proj / *_res_norm", "layer-0 dense mlp", "lm_head", "layernorms"]},
+      "accuracy": "README: GPQA-D 93.84 vs 93.97 (MXFP4), AA-LCR 82.06 vs 81.69, IFBench 73.40 vs 73.40, MMMU-Pro 81.79 vs 81.68, SciCode 59.47 vs 59.52, TB2.1 87.78 vs 88.20"
+    }
+  },
+  "precision_rule_note": "User rule 'no numerical loss' is defined relative to the chosen checkpoint: serve each checkpoint at its own stored precisions (no extra quantization beyond it); FP8 MLA KV, FP4 indexer KV, FP32 KDA state for both."
+}

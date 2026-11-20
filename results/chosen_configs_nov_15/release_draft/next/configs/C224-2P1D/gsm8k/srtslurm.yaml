@@ -1,0 +1,32 @@
+# srtslurm.yaml for the jh (colleague MR 9 bca26213da) reproduction: ours + model key hf:moonshotai/Kimi-K3 -> same K3.1 view.
+# (Dynamo view dir, model_type kimi_k3) mounted at /model and outputs under k31vr/e2e.
+cluster: hecate
+default_account: coreai_comparch_inferencex
+default_partition: batch-xdr
+default_time_limit: "04:00:00"
+gpus_per_node: 4
+default_gpu_type: vr200
+network_interface: ib_p1r1
+use_gpus_per_node_directive: false
+use_segment_sbatch_directive: true
+use_exclusive_sbatch_directive: true
+default_gpu_exporter: null
+srtctl_root: /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/srt-slurm
+output_dir: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs
+default_health_check:
+  max_attempts: 720
+  interval_seconds: 10
+model_paths:
+  "hf:moonshotai/Kimi-K3.1": /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-pro-k3type
+  "hf:moonshotai/Kimi-K3": /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-pro-k3type
+containers:
+  "k31vr/kmc:kmr-sweep-freeze-r1": /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+  "vllm/vllm-openai:cu134-nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2": /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/vllm-openai-cu134-nightly-3f1bcfd82b-aarch64.sqsh
+default_mounts:
+  /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr: /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr
+  /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-pro-k3type: /model:ro
+  /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/hf-hub: /hf_hub_cache
+  /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/aiperf-cache: /aiperf_mmap_cache
+default_sbatch_directives:
+  export: "ALL,HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1"
+preflight: true
