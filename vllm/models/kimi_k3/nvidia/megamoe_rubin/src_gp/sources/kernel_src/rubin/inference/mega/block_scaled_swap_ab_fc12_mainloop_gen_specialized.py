@@ -1273,8 +1273,13 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         if cutlass.const_expr(progress_mbarrier is not None):
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(progress_mbarrier)
+        _dms_u = Int32(0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
+            if _dms_u < Int32(16):
+                DG.put_gt_dyn(Int32(DG.S_TAU0) + _dms_u)
+                DG.put_val_dyn(Int32(DG.S_TAPH0) + _dms_u, cutlass.Int64(phase))
+            _dms_u = _dms_u + Int32(1)
             # The fixed FC1 / FC2 range names the iket summaries key on (shared tiles count with their GEMM).
             if self._is_fc1_gemm(phase):
                 iket.range_push("tma_weight_fc1")
