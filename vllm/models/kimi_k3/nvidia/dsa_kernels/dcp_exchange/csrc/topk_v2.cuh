@@ -1063,8 +1063,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // round-1 windows) reaches K, the same on every rank; every rank sends ALL its keys >= LB
       // with their positions (candidates, or one re-scan of its row when LB < lo); every rank
       // then derives tau, need and the tie cut by global id from the union (exact). Rows whose
-      // keys >= LB overflow the message keep the complete body.
-      if (tier == 2 || tier == 3) {
+      // keys >= LB overflow the message keep the complete body. Tier 2 (tau known, a band
+      // missed its ties) takes the tie round below instead: tau lies in every window, so every
+      // rank's ties are in its candidates.
+      if (tier == 3) {
         // saturated windows / failed fast paths take R2 too: every window is a lower bound
         if (row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
@@ -1336,7 +1338,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
     }
-      if (tier != 1) {  // the same on every rank: the complete body takes the row
+      if (tier != 1 && tier != 2) {  // the same on every rank: the complete body takes the row
         __syncthreads();
         return 1 + ep;
       }
@@ -1344,8 +1346,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (tier == 1) V2STAT(1);
     if (tier == 4) V2STAT(4);
 
-    // ---- T2: tie round (complete sorted tie lists at tau, <= kV2Tie each)
-    if (!kFast && K31_RARE(tier == 2)) {
+    // ---- T2: tie round (complete sorted tie lists at tau, <= kV2Tie each). In the hot
+    // instance tier 2 implies fast and tau >= th on every rank (tau lies in every window).
+    if (K31_RARE(tier == 2)) {
       V2STAT(2);
       const int tau = s_tau, need = s_need;
       __shared__ int s_tn[kV2MaxW];
@@ -1355,7 +1358,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
       if (tid == 0) s_cnt = 0;
       __syncthreads();
-      if (fast && tau >= th) {
+      if (kFast || (fast && tau >= th)) {
         for (int c = tid; c < nc; c += kV2T)
           if ((int)ckey[c] == tau) {
             const int i = atomicAdd(&s_cnt, 1);
