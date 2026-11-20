@@ -64,9 +64,9 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16)
     b = cute.runtime.make_fake_compact_tensor(f8, (sym_n, sym_k), stride_order=(1, 0), assumed_align=16)
-    if swap_ab:
+    if swap_ab:  # out [R, N] row-major; only its pointer reaches the kernel (C M-major)
         c = cute.runtime.make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_n, sym_m), stride_order=(0, 1), assumed_align=16
+            cutlass.BFloat16, (sym_n, sym_m), stride_order=(1, 0), assumed_align=16
         )
     else:
         c = cute.runtime.make_fake_compact_tensor(
@@ -91,17 +91,17 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
 
 class Mxfp8PreGemm:
     """One (N, K, R) MXFP8 GEMM on a fixed tactic ``(tile_mn, cluster_mn, swap_ab,
-    inst_m)`` (FlashInfer's sm_107 tactic tuple). ``out_layout``: "rn" = out [R, N]
-    row-major; "cn" = the swap_ab store (out viewed with strides (1, R))."""
+    inst_m)`` (FlashInfer's sm_107 tactic tuple); out is [R, N] row-major (``out_layout``
+    "rn") for every tactic."""
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
                  k_rotate=0, device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
+        # swap_ab: weights are operand A (M = N rows) and the kernel stores C M-major, i.e.
+        # straight into the row-major out [R, N].
         self.swap_ab = bool(tactic[2])
-        if self.swap_ab:  # the swap_ab store layout is not wired (out would be wrong)
-            raise ValueError("Mxfp8PreGemm: swap_ab tactics are not supported")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
         if prewait and prewait > k // tile_k:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
@@ -117,7 +117,7 @@ class Mxfp8PreGemm:
         self.aux, self.calls = None, 0
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
-        self.out_layout = "cn" if self.swap_ab else "rn"
+        self.out_layout = "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
         self.sf = ((km + 127) // 128, (kn + 127) // 128, (k // SF_VEC + 3) // 4)
@@ -125,7 +125,7 @@ class Mxfp8PreGemm:
     def __call__(self, xq, xs, w, ws, out):
         if self.swap_ab:
             a, b, asf, bsf = w, xq, ws, xs
-            c = out.as_strided(out.shape, (1, out.shape[0]))
+            c = out
         else:
             a, b, asf, bsf = xq, w, xs, ws
             c = out

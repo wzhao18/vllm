@@ -51,7 +51,10 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
         (1, 128, ((128, 64), (1, 1), False, 128), 8),
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
-        (257, 512, ((256, 256), (2, 1), False, 256), 8),
+        # swap_ab: W on the 2-CTA M=256 side, tokens N=192 (384 = 2 x 192, no padded
+        # token tile): GEMM-EX1 r32 R384 15.88 vs 256x256 16.83 (scaled_mm 16.32)
+        (257, 384, ((256, 192), (2, 1), True, 256), 8),
+        (385, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
