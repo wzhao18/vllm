@@ -436,7 +436,6 @@ class FP4MQALogitsKernel:
         num_epi_subtiles: int = 1,
         num_umma_stages: int = 1,
         epi_math: bool = True,
-        kv_issuers: int = 1,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         remove_online_sf_transpose: bool = False,
@@ -551,9 +550,8 @@ class FP4MQALogitsKernel:
         self.num_groups = 2
 
         self.num_math_threads = 256
-        self.num_specialized_threads = 128 * kv_issuers
-        self.threads_per_cta = 256 + self.num_specialized_threads
-        self.kv_issuers = kv_issuers
+        self.num_specialized_threads = 128
+        self.threads_per_cta = 384
         self.num_math_warps = 8
         self.tma_warp_base = 8
         self.umma_warp_base = 10
@@ -1085,7 +1083,6 @@ class FP4MQALogitsKernel:
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        KV_ISSUERS = self.kv_issuers
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1102,9 +1099,8 @@ class FP4MQALogitsKernel:
         # Warp roles
         warpgroup_idx = warp_idx // 4
         is_math_warp = warp_idx < 8
-        # second KV issuer per group (KV_ISSUERS 2): warps 12 / 13
-        is_tma_warp_0 = (warp_idx == 8) | (warp_idx == (12 if KV_ISSUERS == 2 else 8))
-        is_tma_warp_1 = (warp_idx == 9) | (warp_idx == (13 if KV_ISSUERS == 2 else 9))
+        is_tma_warp_0 = warp_idx == 8
+        is_tma_warp_1 = warp_idx == 9
         is_tma_warp = is_tma_warp_0 | is_tma_warp_1
         is_umma_warp_0 = warp_idx == 10
         is_umma_warp_1 = warp_idx == 11
@@ -1538,8 +1534,6 @@ class FP4MQALogitsKernel:
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             lane_idx = tidx % 32
-            kv_par = warp_idx // 12  # issuer of this KV group: 0 or 1
-            kv_iter = cutlass.Int32(0)
 
             # Block table prefetch: 32 lanes cache block indices,
             # distributed via shuffle. Each lane holds num_blocks_per_mma
@@ -1548,30 +1542,29 @@ class FP4MQALogitsKernel:
             kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
 
             # Prefetch first Q before loop
-            if kv_par == 0:  # Q: issuer 0 of group 0 only
-                q_pipeline.producer_acquire(q_prod_state)
-                q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-                cute.copy(
-                    tma_atom_b,
-                    tBgB[(None, 0, next_q_idx)],
-                    tBsB[(None, q_prod_state.index)],
-                    tma_bar_ptr=q_bar,
-                    mcast_mask=b_mcast_mask,
-                )
-                # Step 5.4: SF_Q TMA load — under same q_bar as Q + W.
-                cute.copy(
-                    tma_atom_sf_q,
-                    tSF_Q_gSF_Q[(None, next_q_idx)],
-                    tSF_Q_sSF_Q[(None, q_prod_state.index)],
-                    tma_bar_ptr=q_bar,
-                )
-                cute.copy(
-                    tma_atom_w,
-                    tWgW[(None, next_q_idx)],
-                    tWsW[(None, q_prod_state.index)],
-                    tma_bar_ptr=q_bar,
-                )
-                q_prod_state.advance()
+            q_pipeline.producer_acquire(q_prod_state)
+            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+            cute.copy(
+                tma_atom_b,
+                tBgB[(None, 0, next_q_idx)],
+                tBsB[(None, q_prod_state.index)],
+                tma_bar_ptr=q_bar,
+                mcast_mask=b_mcast_mask,
+            )
+            # Step 5.4: SF_Q TMA load — under same q_bar as Q + W.
+            cute.copy(
+                tma_atom_sf_q,
+                tSF_Q_gSF_Q[(None, next_q_idx)],
+                tSF_Q_sSF_Q[(None, q_prod_state.index)],
+                tma_bar_ptr=q_bar,
+            )
+            cute.copy(
+                tma_atom_w,
+                tWgW[(None, next_q_idx)],
+                tWsW[(None, q_prod_state.index)],
+                tma_bar_ptr=q_bar,
+            )
+            q_prod_state.advance()
 
             while has_work:
                 # fetch_next_task: commit next → current
@@ -1611,7 +1604,31 @@ class FP4MQALogitsKernel:
                         else:
                             peek_ctx = cutlass.Int32(1)
                     if prefetch_next < end_q_idx:
-                        if kv_par == 0:  # Q: issuer 0 of group 0 only
+                        q_pipeline.producer_acquire(q_prod_state)
+                        q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB[(None, 0, prefetch_next)],
+                            tBsB[(None, q_prod_state.index)],
+                            tma_bar_ptr=q_bar,
+                            mcast_mask=b_mcast_mask,
+                        )
+                        # Step 5.4: SF_Q TMA load — under same q_bar.
+                        cute.copy(
+                            tma_atom_sf_q,
+                            tSF_Q_gSF_Q[(None, prefetch_next)],
+                            tSF_Q_sSF_Q[(None, q_prod_state.index)],
+                            tma_bar_ptr=q_bar,
+                        )
+                        cute.copy(
+                            tma_atom_w,
+                            tWgW[(None, prefetch_next)],
+                            tWsW[(None, q_prod_state.index)],
+                            tma_bar_ptr=q_bar,
+                        )
+                        q_prod_state.advance()
+                    elif prefetch_next == end_q_idx:
+                        if end_kv_idx > 0:
                             q_pipeline.producer_acquire(q_prod_state)
                             q_bar = q_pipeline.producer_get_barrier(q_prod_state)
                             cute.copy(
@@ -1635,32 +1652,6 @@ class FP4MQALogitsKernel:
                                 tma_bar_ptr=q_bar,
                             )
                             q_prod_state.advance()
-                    elif prefetch_next == end_q_idx:
-                        if end_kv_idx > 0:
-                            if kv_par == 0:  # Q: issuer 0 of group 0 only
-                                q_pipeline.producer_acquire(q_prod_state)
-                                q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-                                cute.copy(
-                                    tma_atom_b,
-                                    tBgB[(None, 0, prefetch_next)],
-                                    tBsB[(None, q_prod_state.index)],
-                                    tma_bar_ptr=q_bar,
-                                    mcast_mask=b_mcast_mask,
-                                )
-                                # Step 5.4: SF_Q TMA load — under same q_bar.
-                                cute.copy(
-                                    tma_atom_sf_q,
-                                    tSF_Q_gSF_Q[(None, prefetch_next)],
-                                    tSF_Q_sSF_Q[(None, q_prod_state.index)],
-                                    tma_bar_ptr=q_bar,
-                                )
-                                cute.copy(
-                                    tma_atom_w,
-                                    tWgW[(None, prefetch_next)],
-                                    tWsW[(None, q_prod_state.index)],
-                                    tma_bar_ptr=q_bar,
-                                )
-                                q_prod_state.advance()
 
                 # Block table prefetch for group 0.
                 # Each lane loads num_blocks_per_mma physical block indices
@@ -1700,26 +1691,24 @@ class FP4MQALogitsKernel:
                 kv_blk_ptr = kv_blk_ptr + 1
 
                 # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
-                if (kv_iter % KV_ISSUERS) == kv_par:  # this issuer's stage
-                    kv_pipeline_0.producer_acquire(kv_prod_state_0)
-                    bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
-                    stage = kv_prod_state_0.index
-                    for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_0[(None, 0, 0, phys_blks[i])],
-                            tAsA_0[(None, i, stage)],
-                            tma_bar_ptr=bar,
-                            mcast_mask=a_mcast_mask,
-                        )
-                        cute.copy(
-                            tma_atom_sf_kv,
-                            tSgSF_KV_0[(None, 0, phys_blks[i])],
-                            tSsSF_KV_0[(None, i, stage)],
-                            tma_bar_ptr=bar,
-                        )
+                kv_pipeline_0.producer_acquire(kv_prod_state_0)
+                bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
+                stage = kv_prod_state_0.index
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_0[(None, 0, 0, phys_blks[i])],
+                        tAsA_0[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sf_kv,
+                        tSgSF_KV_0[(None, 0, phys_blks[i])],
+                        tSsSF_KV_0[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                    )
                 kv_prod_state_0.advance()
-                kv_iter = kv_iter + 1
 
                 # Advance: inline fetch_next_task
                 next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1766,8 +1755,6 @@ class FP4MQALogitsKernel:
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             lane_idx = tidx % 32
-            kv_par = warp_idx // 12  # issuer of this KV group: 0 or 1
-            kv_iter = cutlass.Int32(0)
 
             # Block table prefetch for group 1
             cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
@@ -1806,26 +1793,24 @@ class FP4MQALogitsKernel:
                 kv_blk_ptr = kv_blk_ptr + 1
 
                 # Load KV + Scale for group 1: num_blocks_per_mma TMAs per tile.
-                if (kv_iter % KV_ISSUERS) == kv_par:  # this issuer's stage
-                    kv_pipeline_1.producer_acquire(kv_prod_state_1)
-                    bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
-                    stage = kv_prod_state_1.index
-                    for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_1[(None, 0, 0, phys_blks[i])],
-                            tAsA_1[(None, i, stage)],
-                            tma_bar_ptr=bar,
-                            mcast_mask=a_mcast_mask,
-                        )
-                        cute.copy(
-                            tma_atom_sf_kv,
-                            tSgSF_KV_1[(None, 0, phys_blks[i])],
-                            tSsSF_KV_1[(None, i, stage)],
-                            tma_bar_ptr=bar,
-                        )
+                kv_pipeline_1.producer_acquire(kv_prod_state_1)
+                bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
+                stage = kv_prod_state_1.index
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_1[(None, 0, 0, phys_blks[i])],
+                        tAsA_1[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sf_kv,
+                        tSgSF_KV_1[(None, 0, phys_blks[i])],
+                        tSsSF_KV_1[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                    )
                 kv_prod_state_1.advance()
-                kv_iter = kv_iter + 1
 
                 # Advance: inline fetch_next_task
                 next_kv_idx = kv_idx + NUM_MATH_WG
@@ -2269,7 +2254,7 @@ class FP4MQALogitsKernel:
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_math_warp:
-            cute.arch.warpgroup_reg_alloc(240 if KV_ISSUERS == 1 else 232)
+            cute.arch.warpgroup_reg_alloc(240)
 
             # Per-role scheduler state (see comment above the branch chain).
             # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
