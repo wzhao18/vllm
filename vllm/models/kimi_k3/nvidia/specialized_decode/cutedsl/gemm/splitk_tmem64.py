@@ -203,6 +203,9 @@ class SplitKTmemGemm64(SplitKGemm):
     16 KB stages); ``k``: the reduction length. Arguments
     as ``SplitKGemm`` (``bias`` unused, or with ``stamps`` (benchmarks only) Int64
     [CTAs, 16] %globaltimer stamps)."""
+    # Release the dependents once every A tile is requested (False: the subclass
+    # releases them itself).
+    early_trigger = True
 
     def __init__(
         self, *, tactic: SplitKTactic, k: int, stamps: bool = False, alone: bool = True,
@@ -426,7 +429,8 @@ class SplitKTmemGemm64(SplitKGemm):
                             cute.arch.mbarrier_arrive_and_expect_tx(a_full + s, A_STAGE)
                             self.issue_a(dst, a_full + s, a_map, k_a, row0)
         self.stamp(1, cute.arch.lane_idx() == 0)
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.early_trigger):
+            cute.arch.griddepcontrol_launch_dependents()
         self.drain(bar_empty, empty_phase, self.tmem_tiles)
         self.stamp(2, cute.arch.lane_idx() == 0)
 

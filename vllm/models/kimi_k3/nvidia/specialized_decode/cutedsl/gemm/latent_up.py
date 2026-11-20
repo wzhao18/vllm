@@ -87,6 +87,7 @@ class LatentUpTmem(SplitKTmemGemm64):
     x warp acquires ``rows x reduce_split`` arrivals, and the last of this grid's
     CTAs to pass re-arms the pair for the next call. Everything the epilogue reads
     is causally after that acquire (x warp -> x barriers -> MMA warp -> epilogue)."""
+    early_trigger = False
 
     def __init__(
         self, *, tactic: SplitKTactic, k: int, reduce_split: int, tmem_tiles=None,
@@ -173,6 +174,9 @@ class LatentUpTmem(SplitKTmemGemm64):
         width g .. width g + width - 1) holds ``totals`` (FP32), staged through the
         FP32 ``tile`` [N tokens][share]; then 16-byte chunks (8 rows of one token):
         residual chunk (BF16) + the 8 FP32 sums, rounded once, stored in place."""
+        # The dependents start here, not at the weight requests: an early next
+        # kernel would take the SMs this grid's late CTAs still need.
+        cute.arch.griddepcontrol_launch_dependents()
         mC = out[0]
         share = self.share
         rr, g = epi_tid % share, epi_tid // share
