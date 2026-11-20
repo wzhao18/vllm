@@ -600,7 +600,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     __syncthreads();
     int nc = s_cnt;
-    if (!kFast && K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
+    if (K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
+      // (the hot instance too: a group's row that leaves the hot CTA costs every rank of
+      // the DCP group tier 3 plus the complete body, ~120-170 us, and at EP32 every rank of
+      // every group waits for it at the next MoE)
       // the sample bound failed (tie-heavy or skewed rows): exact counts per key over
       // 2048-key ranges of the SMEM row (from theta up on overflow, down otherwise) give a
       // threshold admitting about q + 256 keys (at least q, at most kV2Cand); then a second
@@ -699,9 +702,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) Sx[kV2Fine] = s_beyond;
         __syncthreads();
-        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
-        // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
-        // candidates (32 keys per bin, the whole key range) locate it; rebase there
+        if (K31_LIKELY(pass == 1 || s_e >= 0)) break;
+        // the q-th key lies outside the fine range: above it (a wide upper tail), or below
+        // it when the sample's estimate of the q-th key was high (the range starts kV2Fine / 2
+        // under that estimate, above theta). Every candidate is >= theta and nc >= q, so
+        // coarse counts of the candidates (32 keys per bin, the whole key range) locate it;
+        // rebase there (pass 1 then finds e in [fb, fb + kV2Fine))
         V2STAT(7);
         for (int x = tid; x < kV2Fine; x += kV2T) hist[x] = 0;
         if (tid == 0) s_i[12] = -1;
