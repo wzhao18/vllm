@@ -138,7 +138,7 @@ OFF_INV = OFF_FLAG + 16  # [96] out_scale / l of the token in its epilogue
 OFF_TOK0 = OFF_INV + H * 4  # token parity 0: [2 WG][2 (l, m)][96]
 NSL = 2 * NS  # logical mode: physical-row ring (the producer runs up to NSL stages ahead)
 NCR = 32  # logical mode: token-count ring (> NSL + NS: the producer's max token lead)
-NBAR = 104
+NBAR = 112
 OFF_BAR = OFF_TOK0 + 4 * H * 4
 OFF_TMEM = OFF_BAR + NBAR * 8
 OFF_GMASK = OFF_TMEM + 16  # [2 WG][2 (u // 2 parity)][4] u32: heads that grew (ballots)
@@ -172,7 +172,9 @@ B_SLEMPTY = B_SLFULL + NSL  # x NSL (... read by every gather warp)
 B_SFULL1, B_SFREE1 = B_SLEMPTY + NSL, B_SLEMPTY + NSL + 2  # x2: S keys 32-63 (qkh knob)
 B_TKI = B_SFREE1 + 2  # x2 (token parity): top-k row copy landed
 B_QKI = B_TKI + 2  # x8 (u % 8): QK(u) issued (pvd knob: PV(u - pvd) waits for it)
-assert B_QKI + 8 <= NBAR
+B_TKCONV, B_TKFREE = B_QKI + 8, B_QKI + 10  # x2 (token parity, tconv knob): top-k row
+# converted to physical rows (Q warp) / read by every copying gather warp
+assert B_TKFREE + 2 <= NBAR
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
 # 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
 # warpgroup-wide
@@ -392,10 +394,10 @@ class SparseMlaPrefillH8:
         # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
-        knobs = tuple(knobs) + (0,) * (15 - len(knobs))
+        knobs = tuple(knobs) + (0,) * (16 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys, self.pvd) = knobs[:15]
+         self.qkh, self.lglob, self.xphys, self.pvd, self.tconv) = knobs[:16]
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -419,6 +421,12 @@ class SparseMlaPrefillH8:
         # production pvd 2 (knob 0); 9 = off (diagnostic); qkh issues QK in halves: no pvd
         self.pvd = 0 if self.qkh or self.pvd == 9 else (self.pvd or 2)
         assert self.pvd in (0, 1, 2, 3), self.pvd
+        # tconv (logical mode, cp.async gather): the Q warp converts each token's top-k
+        # copy in shared memory into physical rows one token ahead (all of a batch's
+        # block-table loads in flight) and the gather warps read rows from it: no
+        # per-stage slot ring (its register-rotated loads cost ~1 L2 round trip/stage)
+        # (production: knob 0; 9 = the per-stage slot producer, diagnostic)
+        self.tconv = self.tconv != 9 and self.logical and self.cpa in (3, 4) and not self.xphys
         # KVFULL arrivals per stage: one noinc async arrive per copying lane (3, 4, 6), one
         # per gather warp (5, 2 + the expect-tx arrive), per-lane RoPE copies (1), TMA (0)
         self.kv_full_arrivals = (256 if self.ldgsts and self.cpa != 5 else 8 if self.cpa == 5
@@ -477,6 +485,9 @@ class SparseMlaPrefillH8:
                 mbar_init(_bar(base, B_TKI + j), Uint32(1))
             for j in cutlass.range_constexpr(8):
                 mbar_init(_bar(base, B_QKI + j), Uint32(1))
+            for j in cutlass.range_constexpr(2):
+                mbar_init(_bar(base, B_TKCONV + j), Uint32(1))
+                mbar_init(_bar(base, B_TKFREE + j), Uint32(8))
             for j in cutlass.range_constexpr(4):
                 mbar_init(_bar(base, B_OFREE + j), Uint32(4))
             for j in cutlass.range_constexpr(NP):
@@ -567,7 +578,10 @@ class SparseMlaPrefillH8:
             # Q warp: atoms 0-1 staging (single) is free once token qi - 1's Q is in TMEM
             # and token qi - 2's epilogue has stored its staging; SS buffer qi % 2 once
             # token qi - 2's last QK is done
-            if cutlass.const_expr(self.logical and self.prod2):
+            if cutlass.const_expr(self.tconv):
+                self.slot_producer3(base, lane, cta, n_mine, tm_qn, tm_qr, unit_rows, slots,
+                                    slot_stride, req_ids, btab, bt_stride, bt_cols, bs_shift)
+            elif cutlass.const_expr(self.logical and self.prod2):
                 self.slot_producer2(base, lane, cta, n_mine, tm_qn, tm_qr, unit_rows, slots,
                                     slot_stride, req_ids, btab, bt_stride, bt_cols, bs_shift)
             elif cutlass.const_expr(self.logical):
@@ -602,7 +616,10 @@ class SparseMlaPrefillH8:
                 q = pw  # idle lanes read a valid slot of the stage (unused)
             if cutlass.const_expr(self.xphys):
                 slots = stamp
-            if cutlass.const_expr(self.logical and not self.xphys and self.ldgsts):
+            if cutlass.const_expr(self.tconv):
+                if pw < 8:
+                    self.gather_cp_tconv(base, pw, lane, cta, n_mine, lens, kvp)
+            elif cutlass.const_expr(self.logical and not self.xphys and self.ldgsts):
                 self.gather_cp_logical(base, pw, lane, cta, n_mine, lens, kvp)
             elif cutlass.const_expr(self.logical and not self.xphys):
                 self.gather_logical(base, pw, lane, cta, n_mine, q, act, part, tm_kv, tm_kr,
@@ -1075,6 +1092,124 @@ class SparseMlaPrefillH8:
                 cute.arch.sync_warp()
             n = nn
             btr = btrn
+
+    @cute.jit
+    def gather_cp_tconv(self, base, pw, lane, cta, n_mine, lens, kvp):
+        """tconv: as gather_cp_logical, each stage's physical rows read straight from the
+        Q warp's converted top-k row (one barrier per token instead of a slot ring)."""
+        r = pw * 8 + lane // 4
+        ch = lane % 4
+        rx = (lane // 4) % 8
+        d0 = Uint32(r * 128) + (Uint32(ch ^ rx) << Uint32(4))
+        d1 = Uint32(r * 128) + (Uint32((ch + 4) ^ rx) << Uint32(4))
+        dr = Uint32(4 * 8192 + r * 64) + (Uint32(ch ^ ((r >> 1) & 3)) << Uint32(4))
+        g = Int32(0)
+        for qi in range(n_mine):
+            subs = _subs(self.ntok(base, lens, cta + qi * self.grid, qi))
+            buf = base + Uint32(OFF_TKI) + Uint32(qi % 2) * Uint32(TKB) + Uint32(4 * r)
+            mbar_wait(_bar(base, B_TKCONV + qi % 2), Uint32((qi // 2) & 1))
+            for t in cutlass.range(subs, unroll=1):
+                s = g % NS
+                st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                rc = Int32(ld_shared_u32(buf + Uint32(256) * Uint32(t)))
+                if lane == 0:
+                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+                    self.cp_cap(base, g)
+                cute.arch.sync_warp()
+                src = kvp
+                nb = Uint32(0)
+                if rc >= 0:
+                    src = kvp + Int64(rc) * Int64(ROW) + Int64(16 * ch)
+                    nb = Uint32(16)
+                self.cp_row(st, d0, d1, dr, src, nb)
+                self.cp_signal(base, lane, g, s)
+                g = g + 1
+            cute.arch.sync_warp()
+            if lane == 0:
+                mbar_arrive(_bar(base, B_TKFREE + qi % 2))
+        self.cp_drain(lane, base, g)
+
+    @cute.jit
+    def tconv_row(self, buf, lane, row, n, req_ids, btab, bt_stride, bt_cols, bs_shift,
+                  unit_rows):
+        """Q warp: token ``row``'s top-k copy in ``buf`` -> physical rows in place (-1 for
+        invalid entries), 4 stages (8 block-table loads per lane) in flight per batch."""
+        bmask = (Int32(1) << bs_shift) - Int32(1)
+        rq = ld_global_s32_pred(req_ids + Int64(row) * Int64(4), Int32(1))
+        btr = btab + Int64(rq) * Int64(bt_stride) * Int64(4)
+        lo = Uint32(8 * lane)
+        nst = _subs(n)
+        for t0 in cutlass.range(0, nst, 4, unroll=1):
+            ii = []
+            bb = []
+            for k in cutlass.range_constexpr(4):
+                pa = buf + Uint32(256) * Uint32(t0 + k) + lo
+                i0 = Int32(ld_shared_u32(pa))
+                i1 = Int32(ld_shared_u32(pa + Uint32(4)))
+                if t0 + k >= nst:
+                    i0 = Int32(-1)
+                    i1 = Int32(-1)
+                b0, b1 = self.bt2(btr, i0, i1, bt_cols, bs_shift)
+                ii.append((i0, i1))
+                bb.append((b0, b1))
+            for k in cutlass.range_constexpr(4):
+                i0, i1 = ii[k]
+                b0, b1 = bb[k]
+                key = (t0 + k) * 64 + 2 * lane
+                p0 = b0 * unit_rows + (i0 & bmask)
+                p1 = b1 * unit_rows + (i1 & bmask)
+                if b0 < 0 or key >= n:
+                    p0 = Int32(-1)
+                if b1 < 0 or key + 1 >= n:
+                    p1 = Int32(-1)
+                if t0 + k < nst:
+                    st_shared_v2(buf + Uint32(256) * Uint32(t0 + k) + lo, p0, p1)
+
+    @cute.jit
+    def slot_producer3(self, base, lane, cta, n_mine, tm_qn, tm_qr, unit_rows, slots,
+                       slot_stride, req_ids, btab, bt_stride, bt_cols, bs_shift):
+        """Q warp, tconv: each token's top-k row is bulk-copied into shared memory and
+        converted there into physical rows one token ahead; the copy of token qi + 2 reuses
+        token qi's buffer once every copying gather warp has read it (B_TKFREE)."""
+        sstride = Int64(slot_stride) * Int64(4)
+        tki = base + Uint32(OFF_TKI)
+        if lane == 0:
+            self.tki_issue(base, slots, sstride, cta, 0)
+            if n_mine > 1:
+                self.tki_issue(base, slots, sstride, cta + self.grid, 1)
+        cute.arch.sync_warp()
+        mbar_wait(_bar(base, B_TKI), Uint32(0))
+        n = self.tki_count(tki, lane, bt_cols, bs_shift)
+        self.publish_count(base, lane, 0, n)
+        if lane == 0:
+            self.q_issue(base, cta, Int32(0), tm_qn, tm_qr)
+        cute.arch.sync_warp()
+        self.tconv_row(tki, lane, cta, n, req_ids, btab, bt_stride, bt_cols, bs_shift,
+                       unit_rows)
+        cute.arch.sync_warp()
+        if lane == 0:
+            mbar_arrive(_bar(base, B_TKCONV))
+        for qi in range(n_mine):
+            row = cta + qi * self.grid
+            if qi + 1 < n_mine:
+                nbuf = tki + Uint32((qi + 1) % 2) * Uint32(TKB)
+                mbar_wait(_bar(base, B_TKI + (qi + 1) % 2), Uint32(((qi + 1) // 2) & 1))
+                nn = self.tki_count(nbuf, lane, bt_cols, bs_shift)
+                self.publish_count(base, lane, qi + 1, nn)
+                self.tconv_row(nbuf, lane, row + self.grid, nn, req_ids, btab, bt_stride,
+                               bt_cols, bs_shift, unit_rows)
+                cute.arch.sync_warp()
+                if lane == 0:
+                    mbar_arrive(_bar(base, B_TKCONV + (qi + 1) % 2))
+                    self.q_issue(base, row + self.grid, qi + 1, tm_qn, tm_qr)
+                cute.arch.sync_warp()
+            if qi + 2 < n_mine:
+                mbar_wait(_bar(base, B_TKFREE + qi % 2), Uint32((qi // 2) & 1))
+                fence_async_smem()  # gather warps' generic reads before the next bulk copy
+                cute.arch.sync_warp()
+                if lane == 0:
+                    self.tki_issue(base, slots, sstride, row + 2 * self.grid, qi % 2)
+                cute.arch.sync_warp()
 
     @cute.jit
     def publish_count(self, base, lane, qi, c):
