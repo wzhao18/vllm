@@ -82,10 +82,15 @@ class PrefillSharedSitu:
         if tactic is not None:
             # Rows [0, N/2) homed on die 0, [N/2, N) on die 1: each die's
             # clusters stream their own half (sm107_gemm.die_sched).
+            from vllm.models.kimi_k3.nvidia.mxfp8 import _kernel_layout
+
             from .sm107_gemm import die_sched
 
             lin = self.mlp.gate_up_proj
-            lin.weight.data = die_sched.localize_rows(lin.weight.data)
+            w_loc = die_sched.localize_rows(w)
+            # Keep the stored layout (the [N, K] rows may be the transpose of a
+            # "kn" parameter view).
+            lin.weight.data = w_loc.t() if _kernel_layout(lin) == "kn" else w_loc
             w, s = self._weight_rows()
             self._gemm = ssg.SharedSituGemm(
                 w, s, self.beta, self.linear_beta, tactic=tactic
