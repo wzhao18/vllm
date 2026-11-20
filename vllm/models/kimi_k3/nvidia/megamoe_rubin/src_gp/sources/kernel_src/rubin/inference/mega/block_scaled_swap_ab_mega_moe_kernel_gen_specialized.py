@@ -1965,7 +1965,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     if cutlass.const_expr(self.reduce_acquires_producer_done):
                         # The reduce's completion orders the shared output through this arrival.
                         cute.arch.atomic_add(
-                            self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="acq_rel", scope="gpu"
+                            self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="relaxed", scope="gpu"
                         )
                     if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
                         is_last = Int32(1)

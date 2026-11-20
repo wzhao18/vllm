@@ -66,7 +66,7 @@ class GenphaseTail:
     @cute.jit
     def arrive(self, workspace: DeviceWorkspace, cta_count: Int32) -> cutlass.Boolean:
         """One thread per CTA. Returns True on the CTA whose arrival completes the count."""
-        old = cute.arch.atomic_add(workspace.ptr(self.done_counter_region), Int32(1), sem="acq_rel", scope="gpu")
+        old = cute.arch.atomic_add(workspace.ptr(self.done_counter_region), Int32(1), sem="relaxed", scope="gpu")  # DIAG pmin: relaxed arrival
         return old == cta_count - Int32(1)
 
     @cute.jit
@@ -116,7 +116,7 @@ class GenphaseTail:
             signal_delta = Int32(-1)
         # The epoch first, behind a gpu-scope release: the standalone reduce's last CTA waits for it,
         # so it must not sit behind the system fence that the peer-facing signals need.
-        cute.arch.fence_acq_rel_gpu()
+        # DIAG pmin: no gpu fence before the epoch
         cute.arch.store(workspace.ptr(self.epoch_region), epoch + Int32(1), sem="relaxed", scope="gpu")
         DG.put_gt(DG.S_L_EPOCH, Int32(1))
         # DIAG (timing bound only, never lands): no system fence in front of the peer signals.
