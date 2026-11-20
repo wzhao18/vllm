@@ -381,6 +381,7 @@ def test_fingerprints_match_after_pull_and_exchange(num_tokens: int, m: int):
         rank.fill(content, p_ids, num_tokens)
     d_ranks = [PackedRank(W_D, r) for r in range(W_D)]
     worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
     for r, rank in enumerate(d_ranks):
         rank.raw.fill_(0x3C)
         dst, src = worker._apply_dcp_prefix_caching(
