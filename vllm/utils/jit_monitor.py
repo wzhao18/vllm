@@ -203,6 +203,24 @@ def _handle_jit_event(
     )
     detail_suffix = f" ({detail})" if detail else ""
     args = (backend, event, fn_name, detail_suffix)
+    # DIAGNOSTIC ONLY (INFRA-D jitdiag, never lands): where the post-warmup compile came from.
+    import traceback
+
+    frames = [
+        f
+        for f in traceback.extract_stack()[:-1]
+        if "/vllm/" in f.filename and "jit_monitor" not in f.filename
+    ]
+    logger.error(
+        "JIT_STACK %s %s%s :: %s",
+        backend,
+        fn_name,
+        detail_suffix,
+        " <- ".join(
+            f"{f.filename.split('/vllm/')[-1]}:{f.lineno}:{f.name}"
+            for f in reversed(frames[-8:])
+        ),
+    )
 
     if _mode == "error":
         raise RuntimeError(message % args)
@@ -392,7 +410,20 @@ class _MonitoredCuteCompile:
             kernel_name = (
                 kernel.__class__.__name__ if kernel is not None else "<unknown>"
             )
-        _log_cutedsl_jit_compile(kernel_name)
+        # DIAGNOSTIC ONLY (INFRA-D jitdiag): argument shapes / types of the compile.
+        shapes = []
+        for a in args[1:10]:
+            try:
+                s = getattr(a, "shape", None)
+                shapes.append(_safe_repr(s if s is not None else type(a).__name__, max_len=48))
+            except Exception:
+                shapes.append("?")
+        _handle_jit_event(
+            backend="CuTeDSL",
+            event="JIT compilation",
+            fn_name=kernel_name,
+            detail="args " + " | ".join(shapes),
+        )
         return self._inner(*args, **kwargs)
 
 
