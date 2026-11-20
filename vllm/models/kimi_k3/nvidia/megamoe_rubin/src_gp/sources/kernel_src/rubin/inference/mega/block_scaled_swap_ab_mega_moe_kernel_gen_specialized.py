@@ -93,6 +93,7 @@ from .....helpers.helper_weight_ready_gate import (
     make_helper_weight_ready_generation_gate,
 )
 from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
+from . import dms_diag as DG
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -692,6 +693,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.tail.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         self._register_shared_workspace(device_workspace)
+        DG.register(device_workspace)
         device_workspace.finalize()
         return device_workspace
 
@@ -1484,6 +1486,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        DG.bind(self._device_workspace)
+        DG.put_gt(DG.S_ENTRY, Int32(cute.arch.thread_idx()[0] == Int32(0)))
 
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
@@ -1648,6 +1652,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     sleep_cycles=150,
                 )
                 iket.range_pop()
+            DG.put_gt(DG.S_SIZES)
             if cutlass.const_expr(self.schedule_mode == "decode" and self.decode_lead is not None):
                 # Mandatory for a decode lead: the exact layout's K per stream (decode scheduler docstring), once,
                 # all lanes, before the first claim. Without a lead and for grouped / PI: no code.
@@ -1689,6 +1694,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.tma_a_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.tma_a")
+            DG.put_gt(DG.S_TA0)
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_a(
                 fc1_tma_a_tensor=fc1_tma_a_tensor,
@@ -1713,6 +1719,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_fc2_tma_sfa_atom=shared_fc2_tma_sfa_atom,
                 shared_kernel_extension=shared_kernel_extension,
             )
+            DG.put_gt(DG.S_TA1)
             iket.range_pop()
 
         if warp_idx == self.tma_b_warp_id:
@@ -1750,6 +1757,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.mma")
+            DG.put_gt(DG.S_MMA0)
             sched_consumer = scheduler.make_consumer()
             if cutlass.const_expr(self._mainloop.uses_asymmetric_ab_stages):
                 self._mainloop.run_mma_asymmetric(
@@ -1769,6 +1777,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     acc_pipeline=acc_pipeline,
                     sched_consumer=sched_consumer,
                 )
+            DG.put_gt(DG.S_MMA1)
             iket.range_pop()
 
         if warp_idx < len(self.epilogue_warp_ids):
@@ -1932,6 +1941,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             # schedule; the grouped / phase_interleave tails only touch global memory.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
+        DG.put_gt(DG.S_EXIT, Int32(cute.arch.thread_idx()[0] == Int32(0)))
         self._device_workspace.remove_device_members()
 
 

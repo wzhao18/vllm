@@ -817,6 +817,49 @@ def main():
         torch.cuda.synchronize()
         kernel = measure(g_kernel.replay, replays=args.graph_replays, **timing)
         staged = measure(g_forward.replay, replays=args.graph_replays, **timing)
+        if os.environ.get("LDPLAN") == "1":  # DIAGNOSTIC ONLY (D-MOE-LADDER): print the GenPhase stage plan
+            ml = getattr(session.kernel, "_mainloop", None)
+            print("LDPLAN T%d" % n, {k: getattr(ml, k, None) for k in (
+                "num_weight_ab_stages", "num_token_ab_stages", "ab_stage_tma_bytes", "shared_ab_stage_tma_bytes",
+                "a_stage_tma_bytes", "b_stage_tma_bytes", "sfa_stage_tma_bytes", "sfb_stage_tma_bytes",
+                "mainloop_smem_budget_bytes", "uses_asymmetric_ab_stages", "heterogeneous_shared", "cta_tile_n",
+                "cta_tile_m", "num_mma_instructions_per_ab_stage", "num_accumulator_pipeline_stages",
+                "fc1_k_tile_count", "active_gather_b_warp_count")}, flush=True)
+        if os.environ.get("DMS_STAMPS") == "1":  # DIAGNOSTIC ONLY (D-MOE-LADDER): per-SM role stamps of one replay
+            ws = session.kernel._device_workspace
+            off = ws.offset("genphase.diag.stamps")
+            nb = ws.nbytes("genphase.diag.stamps")
+            st = session.local_workspace[off:off + nb]
+            rows = []
+            for _rep in range(3):
+                torch.cuda.synchronize()
+                st.zero_()
+                torch.cuda.synchronize()
+                g_kernel.replay()
+                torch.cuda.synchronize()
+                rows.append(st.view(torch.int64).view(256, 64).cpu().clone())
+            v = rows[-1]
+            live = v[:, 0] > 0
+            e0 = int(v[live, 0].min())
+
+            def q(x, scale=1e-3):
+                x = sorted(float(t) * scale for t in x)
+                return "p10 %.1f p50 %.1f p90 %.1f max %.1f" % (
+                    x[len(x) // 10], x[len(x) // 2], x[(9 * len(x)) // 10], x[-1]) if x else "-"
+
+            def rel(slot):
+                m = live & (v[:, slot] > 0)
+                return q(v[m, slot] - e0)
+
+            def cyc(slot):
+                m = live & (v[:, slot] != 0)
+                return q(v[m, slot], 1.0 / 2400.0)
+
+            ta_n = v[live & (v[:, 8] > 0), 8]
+            print(f"LDSTAMP T{n} ctas {int(live.sum())} | entry {rel(0)} | sizes {rel(3)} | ta_claim {rel(9)} | "
+                  f"ta_end {rel(6)} | mma_end {rel(17)} | exit {rel(1)} | ta_empty_us {cyc(7)} | "
+                  f"mma_full_us {cyc(18)} | ta_claimw_us {cyc(33)} | ta_setup_us {cyc(35)} | ta_loop_us {cyc(36)} | ta_units p50 {int(v[live & (v[:, 34] > 0), 34].median()) if bool((live & (v[:, 34] > 0)).any()) else 0} | "
+                  f"ta_stages p50 {int(ta_n.median()) if len(ta_n) else 0}", flush=True)
         # CUDA graph safety: a replayed forward equals an eager one
         forward()
         torch.cuda.synchronize()

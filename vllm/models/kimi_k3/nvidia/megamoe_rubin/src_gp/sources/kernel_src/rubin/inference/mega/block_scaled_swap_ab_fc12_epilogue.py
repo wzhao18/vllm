@@ -10,6 +10,10 @@ evaluated at runtime to drive metadata lookup and destination pointer math.
 """
 
 import dataclasses
+import os as _dms_os
+
+# DIAGNOSTIC ONLY (D-MOE-LADDER, never lands): DMS_NOEPI=1 the FC1 epilogue processes no subtile (signals kept), 2 also FC2.
+_DMS_NOEPI = int(_dms_os.environ.get("DMS_NOEPI", "0"))
 import math
 from typing import Any, Callable, ClassVar, List, Literal, Optional, Tuple, Type, Union
 
@@ -1779,6 +1783,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state)
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        if cutlass.const_expr(_DMS_NOEPI >= 1):
+            valid_tokens = cutlass.Int32(0)
 
         for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
             if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
@@ -2821,6 +2827,8 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        if cutlass.const_expr(_DMS_NOEPI >= 2):
+            valid_tokens = cutlass.Int32(0)
 
         for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
             if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
