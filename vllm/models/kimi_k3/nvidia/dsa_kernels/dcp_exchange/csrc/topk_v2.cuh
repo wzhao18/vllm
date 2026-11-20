@@ -1137,6 +1137,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) { s_r2[0] = -1; s_r2[1] = 0; s_r2[2] = -1; s_r2[4] = 0; s_r2[5] = 0; }
         __syncthreads();
+        V2DBG(22);  // EP32DIAG: suffix scans done, LB search next
         {
           int xlo = 1 << 30, xhi = 0;
           for (int r = 0; r < W; ++r) {
@@ -1279,6 +1280,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             st_v4(src, dead);
             return v;
           };
+          V2DBG(29);  // EP32DIAG: sent, header poll next
           if (tid < W) {
             const uint4 v = poll(tid, 0);
             s_r2n[tid] = (v.x & 0x800000u) ? -1 : (int)(v.x & 0x7FFFFFu);
