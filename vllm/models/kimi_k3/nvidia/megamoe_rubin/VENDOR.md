@@ -309,7 +309,11 @@ p50 (682 vs 731 us).
   routed sources, so the die-aware decode form takes the fused shared expert (upstream refuses
   shared under ``("decode", L)``). Without a lead only. Shared FC1 is claimed before the
   expert-sizes gate (it streams under the dispatch); the scheduler warp's explicit decode sizes
-  wait is skipped when the shared stream owns the gate.
+  wait is skipped when the shared stream owns the gate. Die-aware forms claim shared FC1 and FC2 from
+  one counter per (die, phase) over that die's home half of the feature blocks
+  (``die_local.place_shared`` homes both weight halves): FC1 steals the other die's half, FC2 does
+  not, so each die streams exactly its FC2 half (one GPU-wide FC2 counter gave die 0 21 of the 28
+  FC2 pair tiles in-step, D-MOE-LADDER dmlt33).
 - **E2a** (vLLM-local, as for ``src``): ``TopkReduce._reduce_bf16_ll_rmsnorm``: the polled BF16 reduce
   of one token row per CTA followed by the consumer's stock RMSNorm (``rmsnorm_weight`` /
   ``rmsnorm_eps`` through the GenPhase kernel's ``__call__``), replacing the separate
