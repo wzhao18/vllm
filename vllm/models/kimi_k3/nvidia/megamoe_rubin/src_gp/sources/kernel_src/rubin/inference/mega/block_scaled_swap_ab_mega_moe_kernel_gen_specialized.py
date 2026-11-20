@@ -1935,13 +1935,26 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 lane_idx = cute.arch.lane_idx()
                 is_last = Int32(0)
                 if lane_idx == Int32(0):
-                    if cutlass.const_expr(self.reduce_acquires_producer_done):
-                        # The reduce's completion orders the shared output through this arrival.
-                        cute.arch.atomic_add(
+                    if cutlass.const_expr(self.reduce_acquires_producer_done and self.tail_parity):
+                        # One arrival serves both: the reduce acquires the full count (and re-arms it
+                        # before the next call can arrive), and with tail parity the last arriver only
+                        # needs to know it is last, not a counter it resets.
+                        old = cute.arch.atomic_add(
                             self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="acq_rel", scope="gpu"
                         )
-                    if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
-                        is_last = Int32(1)
+                        if old == Int32(self.promised_launchable_sm_count - 1):
+                            is_last = Int32(1)
+                    else:
+                        if cutlass.const_expr(self.reduce_acquires_producer_done):
+                            # The reduce's completion orders the shared output through this arrival.
+                            cute.arch.atomic_add(
+                                self._device_workspace.ptr(self.producer_done_region),
+                                Int32(1),
+                                sem="acq_rel",
+                                scope="gpu",
+                            )
+                        if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
+                            is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
                 if is_last != Int32(0):
                     if cutlass.const_expr(not self.tail_parity):
