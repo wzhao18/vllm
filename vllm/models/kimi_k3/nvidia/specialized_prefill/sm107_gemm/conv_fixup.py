@@ -184,7 +184,8 @@ def conv_fixup(
     nb = (m + 127) // 128
     nseq = qsl.numel() - 1
     block = 1024 if p % 1024 == 0 else 256
-    assert p % block == 0 and conv_state.dtype == torch.float32
+    # FP32 or BF16 conv state (stock: bf16 inputs shifted in, exact either way).
+    assert p % block == 0 and conv_state.dtype in (torch.float32, torch.bfloat16)
     sp2 = triton.next_power_of_2(nseq + 1)
     bg = 8
     _conv_fixup_blocks_kernel[((nb + bg - 1) // bg, n // block)](

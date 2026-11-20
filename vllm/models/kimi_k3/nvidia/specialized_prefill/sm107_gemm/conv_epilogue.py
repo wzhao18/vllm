@@ -1149,6 +1149,44 @@ def setmaxnreg(inc: bool, n: int, *, loc=None, ip=None) -> None:
     )
 
 
+@dsl_user_op
+def ldg_b64x2(addr: Int64, *, loc=None, ip=None):
+    """Two aligned f32x2 pairs (16 B, read-only path)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i64(), T.i64()]),
+        [_v(addr, Int64, loc, ip)],
+        "ld.global.nc.v2.b64 {$0, $1}, [$2];",
+        "=l,=l,l",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    return (
+        Int64(llvm.extractvalue(T.i64(), res, [0], loc=loc, ip=ip)),
+        Int64(llvm.extractvalue(T.i64(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def split_b64(v: Int64, *, loc=None, ip=None):
+    """f32x2 pair -> (lo, hi)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [_v(v, Int64, loc, ip)],
+        "mov.b64 {$0, $1}, $2;",
+        "=f,=f,l",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
 #: (-log2 e, -log2 e) and (1.0, 1.0) as f32x2 bit patterns (signed int64).
 _NL2 = 0xBFB8AA3BBFB8AA3B - (1 << 64)
 _ONE2 = 0x3F8000003F800000
@@ -1259,17 +1297,19 @@ def epilogue_kda_conv_t2(
     lb = [gbase + rc * (16 * _PITCH * 4) + ((cq ^ j) * 16) + cr for j in range(4)]
     nl2 = Int64(_NL2)
     one2 = Int64(_ONE2)
+    # Conv weights in column-pair layout (KdaConvGemm.conv_w_pairs): 32 B per
+    # column pair = taps 0..3 as (col, col + 1) f32x2 pairs.
     col_n = tTR_cC[(None, None, None, g, 0)][0][1] + 2 * cp
-    wa = ldg_f32x4(w_addr + Int64(col_n) * 16)
-    wb = ldg_f32x4(w_addr + Int64(col_n + 1) * 16)
+    wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
+    wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
     for ni in cutlass.range_constexpr(epi_n):
         xs = xs_all[ni]
-        wv = [wa[0], wb[0], wa[1], wb[1], wa[2], wb[2], wa[3], wb[3]]
+        wp = [wl[0], wl[1], wh[0], wh[1]]
         col0 = tTR_cC[(None, None, None, g, ni)][0][1]
         if cutlass.const_expr(ni + 1 < epi_n):
             col_n = tTR_cC[(None, None, None, g, ni + 1)][0][1] + 2 * cp
-            wa = ldg_f32x4(w_addr + Int64(col_n) * 16)
-            wb = ldg_f32x4(w_addr + Int64(col_n + 1) * 16)
+            wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
+            wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
         cute.arch.barrier(barrier_id=bar, number_of_threads=128)
         for q in cutlass.range_constexpr(4):
             sts_v4(wrow + (((trow % 4) ^ q) * 16), Int32(1), *xs[4 * q : 4 * q + 4])
@@ -1283,7 +1323,6 @@ def epilogue_kda_conv_t2(
             rr = rr + 3 * b2i(rc == 0)
             hr.append(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr))
         xr = [lds_u32(lb[i % 4] + i * (_PITCH * 4)) for i in range(16)]
-        wp = [pack_f32x2(wv[2 * j], wv[2 * j + 1]) for j in range(4)]
         hp = [unpack_b64(v) for v in hr]
         ys = []
         gm = Int32(0)
@@ -1302,6 +1341,9 @@ def epilogue_kda_conv_t2(
             for fi in cutlass.range_constexpr(16):
                 stg_u32_all(obase + fi * p_dim * 2, ys[fi])
         else:
+            wv = []
+            for wj in wp:
+                wv.extend(split_b64(wj))
             hx = [unpack_bf16x2(v) for v in hr]
             for xi in cutlass.range_constexpr(16):
                 y2, s2 = conv_row(

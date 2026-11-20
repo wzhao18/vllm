@@ -88,7 +88,7 @@ class PrefillKdaConvInProj:
         qsl = torch.tensor([0, rows], dtype=torch.int32, device=dev)
         lines = torch.zeros(1, dtype=torch.int32, device=dev)
         init = torch.zeros(1, dtype=torch.bool, device=dev)
-        st = torch.zeros((1, nq, 3), dtype=torch.float32, device=dev)
+        st = torch.zeros((1, nq, 3), dtype=torch.bfloat16, device=dev)
         self._gemm(x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID)
 
     def fused(self, qa):
@@ -117,10 +117,8 @@ class PrefillKdaConvInProj:
         conv_state = self.layer.kv_cache[0]
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
-        if conv_state.dtype != torch.float32:
-            raise ValueError(
-                f"KDA conv GEMM needs the FP32 conv state, got {conv_state.dtype}"
-            )
+        if conv_state.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(f"KDA conv GEMM: conv state dtype {conv_state.dtype}")
         x_scale = qa.scale.view(torch.uint8).reshape(-1)
         planes, _ = gemm(
             qa.data, x_scale, conv_state, m.non_spec_query_start_loc,

@@ -35,7 +35,7 @@ def _operands(m, n, k, dev, seed):
     return x.to(torch.float8_e4m3fn), sx, w.to(torch.float8_e4m3fn), sw
 
 
-def _run(seqlens, m, deep=False, tactic=None, seed=0):
+def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32):
     from vllm.models.kimi_k3.nvidia.ops import kda_conv
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
         KdaConvGemm,
@@ -61,7 +61,7 @@ def _run(seqlens, m, deep=False, tactic=None, seed=0):
     lines = torch.randperm(2 * nseq + 2, device=dev, generator=g)[:nseq].to(torch.int32)
     has_init = torch.arange(nseq, device=dev) % 2 == 1
     state0 = torch.randn(2 * nseq + 2, n, 4, device=dev, generator=g)
-    state0 = state0.to(torch.bfloat16).float()[:, :, :3]
+    state0 = state0.to(torch.bfloat16).to(state_dtype)[:, :, :3]
 
     st_ref = state0.clone()
     ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, PART)
@@ -93,6 +93,11 @@ def _run(seqlens, m, deep=False, tactic=None, seed=0):
 )
 def test_kda_conv_gemm_bitwise(seqlens, m):
     _run(seqlens, m)
+
+
+def test_kda_conv_gemm_bf16_state():
+    # The deployed KDA layer keeps a BF16 conv state with FP32 conv weights.
+    _run([1, 2, 3, 125, 128, 3, 256, 600, 5], 1300, state_dtype=torch.bfloat16)
 
 
 def test_kda_conv_gemm_exact_silu_path():
