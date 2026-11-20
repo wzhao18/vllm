@@ -39,6 +39,24 @@ def bench(fn, iters=50, warm=5):
     return sorted(ts)[len(ts) // 2]
 
 
+def bench_eager(fn, iters=50, warm=5):
+    """Event timing of back-to-back eager launches (CuTe calls bind their own
+    stream, so they are not graph-captured)."""
+    for _ in range(warm):
+        fn()
+    torch.cuda.synchronize()
+    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    ts = []
+    for _ in range(5):
+        s.record()
+        for _ in range(iters):
+            fn()
+        e.record()
+        torch.cuda.synchronize()
+        ts.append(s.elapsed_time(e) * 1e3 / iters)
+    return sorted(ts)[len(ts) // 2]
+
+
 def cfg():
     p = os.path.join(CKPT, "config.json")
     c = json.load(open(p)) if os.path.exists(p) else {}
@@ -132,12 +150,11 @@ def bench_dedup(T, hidden=3584, world=16):
     nk = dict(rmsnorm_weight=_cute(w), rmsnorm_eps=cutlass.Float32(1e-6))
     fused = cute.compile(op, *a, **nk)
     r = {}
-    r["dedup_reduce"] = bench(lambda: plain(*a))
-    r["dedup_reduce_rmsnorm"] = bench(lambda: fused(*a, **nk))
-    r["glue_rms_norm"] = bench(lambda: prefill_glue.rms_norm(out, w, 1e-6))
+    r["dedup_reduce"] = bench_eager(lambda: plain(*a))
+    r["dedup_reduce_rmsnorm"] = bench_eager(lambda: fused(*a, **nk))
+    r["glue_rms_norm"] = bench_eager(lambda: prefill_glue.rms_norm(out, w, 1e-6))
     print("dedup T=%d world=%d ranks/token=%.1f: reduce %.2f + rms_norm %.2f = %.2f us;"
-          " fused %.2f us" % (T, world, mask.bitwise_count().float().mean()
-          if hasattr(mask, "bitwise_count") else -1, r["dedup_reduce"],
+          " fused %.2f us" % (T, world, sum(((mask >> i) & 1).float().mean().item() for i in range(world)), r["dedup_reduce"],
           r["glue_rms_norm"], r["dedup_reduce"] + r["glue_rms_norm"],
           r["dedup_reduce_rmsnorm"]))
     return r
