@@ -2243,8 +2243,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 aux_dst = None
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if self._aux_from_next_attn_res(layer_idx, prefix_sum, residual):
+                    # Appended once the next AttnRes call has written it.
                     aux_dst = torch.empty_like(prefix_sum)
-                elif self.use_attn_res:
+                    continue
+                if self.use_attn_res:
                     assert prefix_sum is not None
                     assert residual is not None
                     aux_hidden_state = self._capture_aux_hidden_stream(
