@@ -291,6 +291,8 @@ class FlashInferCore:
             self.prims_ts(query, kv, slots, valid, latent, lse)
         elif self.kernels[rows] == "km":
             self.keys_on_m(query, kv, slots, valid, latent, lse)
+        elif self.kernels[rows] == "ts":
+            self.latent_q_tmem(query, kv, slots, valid, latent, lse)
         else:
             self.trtllm(query, kv, stride_rows, slots, valid, latent, lse, block_size)
         return latent, lse
@@ -309,6 +311,30 @@ class FlashInferCore:
             )
         impl._prepare_mqa_kernel(self.layer, query.device)
         sparse_mla_decode_km(
+            query.view(torch.uint8),
+            kv.view(torch.uint8),
+            slots,
+            valid,
+            latent,
+            lse,
+            impl.bmm1_scale,
+            impl.bmm2_scale,
+        )
+
+    def latent_q_tmem(self, query, kv, slots, valid, latent, lse):
+        """sparse_mla_ts: the Rubin latent-Q-in-TMEM sparse MLA over the 96 real heads
+        (the trtllm-gen arithmetic as ``km``: E4M3 P at 448 of the running max per
+        128-key tile, FP32 sums, one unsplit pass per row; base-2 LSE)."""
+        from .sparse_mla_ts import HS, sparse_mla_decode_ts
+
+        impl = self.impl
+        if lse is None or self.fmt != "native" or self.heads != HS:
+            raise ValueError(
+                f"Kimi K3.1 DSA latent-Q sparse MLA: DCP LSE, a per-tensor FP8 cache and "
+                f"{HS} mailbox heads (got heads {self.heads}, {self.fmt})"
+            )
+        impl._prepare_mqa_kernel(self.layer, query.device)
+        sparse_mla_decode_ts(
             query.view(torch.uint8),
             kv.view(torch.uint8),
             slots,

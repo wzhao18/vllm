@@ -73,7 +73,7 @@ def test_sp_policy_covers_every_row():
     assert "serial" not in sp.SP_MODES
     assert sp.SP_PARTIALS == "proj"
     kernels = {r: kernel_for(r, True, sp.SP_KERNELS) for r in ROWS}
-    assert set(kernels.values()) <= {"km", "trtllm"}, kernels
+    assert set(kernels.values()) <= {"km", "ts", "trtllm"}, kernels
 
 
 def test_query_geometry_24_heads():

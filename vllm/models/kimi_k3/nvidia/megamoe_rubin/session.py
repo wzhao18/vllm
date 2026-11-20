@@ -45,6 +45,19 @@ _DMS_T: dict = {}
 _DMS_N = [0]
 
 
+def _dms_fix_routing(session, kwargs, ep_tokens) -> None:
+    """DIAG ONLY (D-MOE-TAPE rungs): every launch of a case reads the routing the case's first (eager) MoE launch
+    produced, so values-wrong arms keep the baseline's per-expert loads. Frozen per ep_tokens, never inside a capture."""
+    fixed = getattr(session, "_dms_fixed_topk", None)
+    if fixed is None:
+        fixed = session._dms_fixed_topk = {}
+    if ep_tokens not in fixed:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        fixed[ep_tokens] = session.topk_idx.clone()
+    kwargs["topk_indices"] = _to_cute(fixed[ep_tokens])
+
+
 def _dms_dump(current) -> None:
     if current not in _DMS_SESSIONS:
         _DMS_SESSIONS.append(current)
@@ -726,6 +739,7 @@ class RubinMegaMoeSession:
         :meth:`prepare`."""
         use_s2 = self.use_s2(ep_tokens)
         kwargs = self.prepare(w, output, use_s2, rmsnorm, shared)
+        _dms_fix_routing(self, kwargs, ep_tokens)
         _dms_dump(self)
         self.compiled[(use_s2, rmsnorm is not None)](**kwargs)
 
