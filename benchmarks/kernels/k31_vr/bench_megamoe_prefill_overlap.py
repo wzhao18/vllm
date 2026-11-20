@@ -66,6 +66,11 @@ def parse_args():
         help="local: every route to this rank's own experts (no NVLink payload; "
         "the compute-only floor of the layer)",
     )
+    p.add_argument(
+        "--top-k", type=int, default=16,
+        help="routes per token (fewer routes x more tokens emulates the EP16 combine "
+        "pattern on EP4: same routes per GPU, ~1-2 copies per (token, rank))",
+    )
     p.add_argument("--hidden", type=int, default=7168)
     p.add_argument("--shared-inter", type=int, default=6144)
     p.add_argument("--samples", type=int, default=10)
@@ -125,7 +130,9 @@ def main():
     )
     from vllm.models.kimi_k3.nvidia.megamoe_rubin.runtime import RubinMegaMoE
 
-    problem = RubinMoeProblem(num_experts=args.num_experts, quant_kind="nvfp4")
+    problem = RubinMoeProblem(
+        num_experts=args.num_experts, quant_kind="nvfp4", top_k=args.top_k
+    )
     knobs = RubinKnobs.from_dict(json.loads(args.knobs))
     T, C = args.tokens, args.capacity
     nsub = -(-T // C)
