@@ -185,14 +185,15 @@ class Fakes:
                 assert mlp.use_mega_moe and ctx.sequence_parallel
                 assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
                 gaps = fakes.gaps.get("moe_dense", ())
-                self.parts = {}
+                self.providers = {}
                 for f in ("latent_down", "shared_gu", "shared_down", "latent_up"):
-                    self.parts[f] = Provider(rows, gaps)
-                    self.parts[f].family = f
+                    self.providers[f] = Provider(rows, gaps)
+                    self.providers[f].family = f
+                self.parts = {}  # SpMlp.parts: no latent up split-partial rows
                 fakes.events.add("SpMlp", index)
 
             def choices(self, n):
-                return {f: p.choice(n) for f, p in self.parts.items()}
+                return {f: p.choice(n) for f, p in self.providers.items()}
 
         def tactics(family, n, k, rows, ctx):
             assert ctx.sequence_parallel and ctx.tp == TP, ctx
