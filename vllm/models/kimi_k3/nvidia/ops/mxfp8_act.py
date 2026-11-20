@@ -342,6 +342,21 @@ __device__ __forceinline__ void act_compute(const uint4& a, const uint4& b,
   }
 }
 
+__device__ __forceinline__ void ldg_nc_256(const uint4* p, uint4& lo,
+                                           uint4& hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  asm volatile(
+      "ld.global.nc.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, "
+      "[%8];"
+      : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w), "=r"(hi.x),
+        "=r"(hi.y), "=r"(hi.z), "=r"(hi.w)
+      : "l"(p));
+#else
+  lo = __ldg(p);
+  hi = __ldg(p + 1);
+#endif
+}
+
 // situ4_pair with the SiTU form fixed at compile time (A_POW, CLAMP): the
 // same operations in the same order, without the runtime branches.
 template <int A_POW, bool CLAMP>
@@ -408,10 +423,12 @@ __global__ void __launch_bounds__(1024) situ4_row_kernel(
       reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
   const uint4* up = reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
   uint4 a[4], b[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) a[i] = __ldg(gp + i);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) b[i] = __ldg(up + i);
+  // 32-byte loads: each warp request covers whole sectors (16-byte loads of
+  // a 64-byte per-thread block fetch every sector twice through L1).
+  ldg_nc_256(gp, a[0], a[1]);
+  ldg_nc_256(gp + 2, a[2], a[3]);
+  ldg_nc_256(up, b[0], b[1]);
+  ldg_nc_256(up + 2, b[2], b[3]);
   uint32_t h[16];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
