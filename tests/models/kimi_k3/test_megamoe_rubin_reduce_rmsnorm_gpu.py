@@ -180,3 +180,70 @@ def test_polled_fused_reduce_rmsnorm_matches_polled_reduce_then_stock_norm(
     assert torch.isfinite(fused_out.float()).all()
     assert int(ulp.max()) <= 1, f"max {int(ulp.max())} BF16 ulp vs stock rms_norm"
     assert float((ulp > 0).float().mean()) < 0.01
+
+
+@pytest.mark.parametrize("world", [4, 16])
+@pytest.mark.parametrize(("n", "hidden"), [(1, 3584), (333, 3584), (64, 7168)])
+def test_dedup_fused_reduce_rmsnorm_matches_dedup_reduce_then_stock_norm(
+    n, hidden, world
+):
+    """Prefill dedup combine (rank slots + valid-rank mask): the fused reduce +
+    RMSNorm equals the dedup reduce (bit for bit, ascending ranks) followed by the
+    stock vLLM ``rms_norm`` to stock precision."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from vllm import _custom_ops as ops
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.src_gp.sources.kernel_src.rubin.inference.mega.topk_reduce_dedup import (  # noqa: E501
+        TopkReduceDedup,
+    )
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.src_gp.sources.quant_def import (
+        CombineFormat,
+    )
+
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(n * 13 + hidden + world)
+    slots = (torch.randn((n, world, hidden), device=dev, generator=g) * 0.5).to(
+        torch.bfloat16
+    )
+    mask = torch.randint(1, 1 << world, (n,), device=dev, generator=g, dtype=torch.int32)
+    valid = ((mask[:, None] >> torch.arange(world, device=dev)) & 1).bool()
+    slots[~valid] = float("nan")  # ranks outside the mask never wrote their slot
+    weight = (1 + 0.1 * torch.randn(hidden, device=dev, generator=g)).to(torch.bfloat16)
+    eps = 1e-6
+    op = TopkReduceDedup(hidden, world, CombineFormat.parse("bf16"))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    reduced = torch.empty((n, hidden), dtype=torch.bfloat16, device=dev)
+    fused_out = torch.empty_like(reduced)
+    plain = cute.compile(op, _cute(slots), _cute(mask), _cute(reduced), stream)
+    plain(_cute(slots), _cute(mask), _cute(reduced), stream)
+    fused = cute.compile(
+        op,
+        _cute(slots),
+        _cute(mask),
+        _cute(fused_out),
+        stream,
+        rmsnorm_weight=_cute(weight),
+        rmsnorm_eps=cutlass.Float32(eps),
+    )
+    fused(
+        _cute(slots),
+        _cute(mask),
+        _cute(fused_out),
+        stream,
+        rmsnorm_weight=_cute(weight),
+        rmsnorm_eps=cutlass.Float32(eps),
+    )
+    torch.cuda.synchronize()
+    acc = torch.zeros((n, hidden), dtype=torch.float32, device=dev)
+    for r in range(world):
+        acc = torch.where(valid[:, r : r + 1], acc + slots[:, r].float(), acc)
+    assert torch.equal(reduced, acc.to(torch.bfloat16))
+    stock = torch.empty_like(reduced)
+    ops.rms_norm(stock, reduced, weight, eps)
+    torch.cuda.synchronize()
+    ulp = (fused_out.view(torch.int16).int() - stock.view(torch.int16).int()).abs()
+    assert torch.isfinite(fused_out.float()).all()
+    assert int(ulp.max()) <= 1, f"max {int(ulp.max())} BF16 ulp vs stock rms_norm"
+    assert float((ulp > 0).float().mean()) < 0.01

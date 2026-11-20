@@ -130,17 +130,28 @@ class PrefillSubcallExperts:
         self._memo = (dp_metadata, num_tokens, plan)
         return plan
 
+    def fuses_output_rmsnorm(self) -> bool:
+        """Every bucket runs the dedup combine, whose reduce applies the routed
+        output's RMSNorm (``output_rmsnorm``) in the same kernel."""
+        from vllm.models.kimi_k3.nvidia.megamoe_rubin.config import DEDUP_VARIANTS
+
+        buckets = self.experts.buckets
+        return bool(buckets) and all(b.variant in DEDUP_VARIANTS for b in buckets)
+
     def __call__(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        output_rmsnorm: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         experts = self.experts
         n = hidden_states.shape[0]
         nsub, ep_rows = self._plan(n)
         if nsub == 1 and n <= self.capacity:
-            return experts(hidden_states, topk_weights, topk_ids)
+            return experts(
+                hidden_states, topk_weights, topk_ids, output_rmsnorm=output_rmsnorm
+            )
         if n > nsub * self.capacity:
             raise AssertionError(f"{n} rows exceed {nsub} sub-calls of {self.capacity}")
         is_padding = None
@@ -164,6 +175,7 @@ class PrefillSubcallExperts:
                     is_padding=None if is_padding is None else is_padding[lo:hi],
                     out=out[lo:hi],
                     ep_tokens=ep_rows[i],
+                    output_rmsnorm=output_rmsnorm,
                 )
         finally:
             experts.capture_fn = capture_fn

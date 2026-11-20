@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Combine reduce for the dedup path: sums the ``rank_slots[token][rank]`` rows named by ``valid_rank_mask`` in
 ascending rank order into ``reduced_output[token]``; top-k weights are already folded in. An optional ``shared_term``
-adds one more unweighted BF16 row after the rank fold."""
+adds one more unweighted BF16 row after the rank fold. With ``rmsnorm_weight`` the row is then normalized in the
+same kernel (vLLM-local E2a, one CTA per token): the stock vLLM ``rms_norm`` of the BF16-rounded row (FP32 sum of
+squares, ``s = rsqrt(sum / hidden + eps)``, ``out = bf16(x * s * w)``); only the normalized row is written."""
 
 from typing import ClassVar, Optional
 
@@ -10,6 +12,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 from cutlass.cutlass_dsl import Float32, Int32
 
 from ......common.dsl_helpers import mark_alignment
@@ -42,6 +45,8 @@ class TopkReduceDedup:
         reduced_output: cute.Tensor,  # (token, hidden)
         stream: cuda.CUstream,
         shared_term: Optional[cute.Tensor] = None,  # (token, hidden) BF16, added after the rank fold
+        rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: output = rms_norm(reduced row)
+        rmsnorm_eps: Optional[Float32] = None,
     ):
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
@@ -57,9 +62,18 @@ class TopkReduceDedup:
         )
         if cutlass.const_expr(shared_term is not None):
             shared_term = shared_term_view(shared_term, self.hidden)
-        self._reduce_bf16(rank_slots, valid_rank_mask, reduced_output, shared_term).launch(
-            grid=grid, block=block, stream=stream
-        )
+        if cutlass.const_expr(rmsnorm_weight is not None):
+            norm_threads = (self.hidden_tiles + 31) // 32 * 32
+            if cutlass.const_expr(norm_threads > 1024):
+                raise ValueError(f"fused RMSNorm reduce: hidden {self.hidden} needs more than 1024 threads.")
+            rmsnorm_weight = cute.make_tensor(rmsnorm_weight.iterator, cute.make_layout((self.hidden,)))
+            self._reduce_bf16_rmsnorm(
+                rank_slots, valid_rank_mask, reduced_output, shared_term, rmsnorm_weight, rmsnorm_eps
+            ).launch(grid=[reduced_output.shape[0], 1, 1], block=[norm_threads, 1, 1], stream=stream)
+        else:
+            self._reduce_bf16(rank_slots, valid_rank_mask, reduced_output, shared_term).launch(
+                grid=grid, block=block, stream=stream
+            )
 
     @cute.kernel
     def _reduce_bf16(
@@ -120,6 +134,87 @@ class TopkReduceDedup:
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
+            cute.copy(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128),
+                out,
+                mark_alignment(dst, 16),
+            )
+
+    @cute.kernel
+    def _reduce_bf16_rmsnorm(
+        self,
+        rank_slots: cute.Tensor,
+        valid_rank_mask: cute.Tensor,
+        reduced_output: cute.Tensor,
+        shared_term: Optional[cute.Tensor],
+        rmsnorm_weight: cute.Tensor,
+        rmsnorm_eps: Float32,
+    ):
+        """``_reduce_bf16`` of one token row per CTA (thread = one hidden tile; same loads, rank order and FP32 add
+        form), then the stock ``rms_norm`` of the BF16-rounded row."""
+        hidden_per_thread = self._hidden_per_thread
+        hidden_tiles = self.hidden_tiles
+        world_size: cutlass.Constexpr[int] = self.world_size
+        warps: cutlass.Constexpr[int] = (self.hidden_tiles + 31) // 32
+        out_dtype = reduced_output.element_type
+        thread_idx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.make_warp_uniform(thread_idx // Int32(32))
+        lane_idx = cute.arch.lane_idx()
+        token_idx = cute.arch.block_idx()[0]
+        hidden_tile_idx = thread_idx
+        active = thread_idx < Int32(hidden_tiles)
+
+        smem = cutlass_utils.SmemAllocator()
+        partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
+        tile_bits: cutlass.Constexpr[int] = hidden_per_thread * cutlass.BFloat16.width
+        load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=tile_bits)
+        x = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+        weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
+        sumsq = Float32(0)
+        if active:
+            slots = cute.zipped_divide(rank_slots[token_idx, None, None], (world_size, hidden_per_thread))[
+                (None, None), (0, hidden_tile_idx)
+            ]
+            rank_mask = valid_rank_mask[token_idx]
+            terms = [cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16) for _ in range(world_size)]
+            shared_reg = None
+            if cutlass.const_expr(shared_term is not None):
+                shared_reg = load_shared_term(shared_term, token_idx, hidden_tile_idx, hidden_per_thread)
+            for rank in cutlass.range_constexpr(world_size):
+                if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
+                    cute.copy(load_atom, mark_alignment(slots[rank, None], tile_bits // 8), terms[rank])
+            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+            w_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+            cute.copy(w_atom, mark_alignment(wsrc, 16), weight)
+            acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                acc[i] = Float32(0.0)
+            one_pair = (Float32(1.0), Float32(1.0))
+            for rank in cutlass.range_constexpr(world_size):
+                if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        value_pair = (Float32(terms[rank][i]), Float32(terms[rank][i + 1]))
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, one_pair, (acc[i], acc[i + 1]))
+            if cutlass.const_expr(shared_term is not None):
+                add_shared_term(acc, shared_reg, hidden_per_thread)
+            x.store(acc.load().to(out_dtype))
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                xf = Float32(x[i])
+                sumsq = sumsq + xf * xf
+        for shift in cutlass.range_constexpr(5):
+            sumsq = sumsq + cute.arch.shuffle_sync_bfly(sumsq, 16 >> shift)
+        if lane_idx == Int32(0):
+            partial[warp_idx] = sumsq
+        cute.arch.sync_threads()
+        total = Float32(0)
+        for w in cutlass.range_constexpr(warps):
+            total = total + partial[w]
+        scale = cute.math.rsqrt(total / Float32(self.hidden) + rmsnorm_eps, fastmath=True)
+        if active:
+            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                out[i] = out_dtype(Float32(x[i]) * scale * Float32(weight[i]))
+            dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
             cute.copy(
                 cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128),
                 out,

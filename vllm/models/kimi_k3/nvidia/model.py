@@ -566,6 +566,7 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        normed: bool = False,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
@@ -574,9 +575,11 @@ class KimiRoutedOutputTransform(nn.Module):
             residual: Optional tensor of the up-projection's output shape to
                 accumulate into. Unquantized projections fuse the addition
                 into the GEMM epilogue.
+            normed: The routed experts already applied norm (fused into
+                the MegaMoE combine reduce).
 
         """
-        if self.norm is not None:
+        if self.norm is not None and not normed:
             if self._norm_mxfp8():
                 # Online-MXFP8 up_proj: the latent norm writes its MXFP8 input.
                 qa = mxfp8_act.rms_norm_quantize(
@@ -1061,13 +1064,37 @@ class KimiMoE(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        output_rmsnorm: nn.Module | None = None,
     ) -> torch.Tensor:
         """MegaMoE routed experts; prefill workers split the batch into
         EP-uniform capacity sub-calls (specialized_prefill.moe)."""
         subcalls = self._prefill_subcalls
         if subcalls is None:
+            assert output_rmsnorm is None
             return self.experts(hidden_states, topk_weights, topk_ids)
-        return subcalls(hidden_states, topk_weights, topk_ids)
+        return subcalls(hidden_states, topk_weights, topk_ids, output_rmsnorm)
+
+    def _fused_latent_norm(self) -> nn.Module | None:
+        """The routed latent RMSNorm when the prefill MegaMoE reduce applies it
+        (dedup combine), else None."""
+        fused = getattr(self, "_latent_norm_in_reduce", None)
+        if fused is None:
+            transform = self.routed_output_transform
+            fused = (
+                self._prefill_subcalls is not None
+                and transform is not None
+                and transform.norm is not None
+                and not transform._norm_mxfp8()
+                and self._prefill_subcalls.fuses_output_rmsnorm()
+            )
+            if fused:
+                from vllm.models.kimi_k3.nvidia.megamoe_rubin.experts import (
+                    prepare_output_rmsnorm,
+                )
+
+                prepare_output_rmsnorm(self.experts, transform.norm)
+            self._latent_norm_in_reduce = fused
+        return self.routed_output_transform.norm if fused else None
 
     def _packed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE layer on the packed GEMMs of pack_projections()."""
@@ -1293,19 +1320,23 @@ class KimiMoE(nn.Module):
         if prefill_shared is not None:
             done.wait()
             assert self.routed_output_transform is not None
+            latent_norm = self._fused_latent_norm()
             final_hidden_states = self._routed_experts(
-                routed_hidden_states, router_output, topk_ids
+                routed_hidden_states, router_output, topk_ids, latent_norm
             )
             final_hidden_states = self.routed_output_transform(
-                final_hidden_states, residual=shared_output
+                final_hidden_states,
+                residual=shared_output,
+                normed=latent_norm is not None,
             )
         elif self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
+            latent_norm = self._fused_latent_norm()
             if self._shared_overlap:
                 final_hidden_states, shared_output = maybe_execute_in_parallel(
                     lambda: self._routed_experts(
-                        routed_hidden_states, router_output, topk_ids
+                        routed_hidden_states, router_output, topk_ids, latent_norm
                     ),
                     lambda: self.shared_experts(shared_input),
                     self._shared_events[0],
@@ -1314,7 +1345,7 @@ class KimiMoE(nn.Module):
                 )
             else:
                 final_hidden_states = self._routed_experts(
-                    routed_hidden_states, router_output, topk_ids
+                    routed_hidden_states, router_output, topk_ids, latent_norm
                 )
                 shared_output = (
                     self.shared_experts(shared_input)
@@ -1324,7 +1355,9 @@ class KimiMoE(nn.Module):
             # The shared output is folded into the up-projection GEMM's beta-add
             # epilogue, so combining the two branches costs no extra kernel.
             final_hidden_states = self.routed_output_transform(
-                final_hidden_states, residual=shared_output
+                final_hidden_states,
+                residual=shared_output,
+                normed=latent_norm is not None,
             )
         else:
             # Routed experts consume the down-projected latent; shared experts

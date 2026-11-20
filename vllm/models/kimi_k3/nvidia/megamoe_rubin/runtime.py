@@ -38,7 +38,6 @@ from vllm.logger import init_logger
 
 from .arch import require_sm107
 from .config import (
-    DEDUP_VARIANTS,
     RouteIdError,
     RubinBucket,
     RubinMoeConfig,
@@ -395,9 +394,6 @@ class RubinMegaMoE:
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
-        unfused_norm = rmsnorm if session.cfg.kernel_variant in DEDUP_VARIANTS else None
-        if unfused_norm is not None:
-            rmsnorm = None
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
             session.launch(weights, session.empty_output, ep_tokens, rmsnorm, shared)
@@ -413,12 +409,6 @@ class RubinMegaMoE:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
             session.launch(weights, result, ep_tokens, rmsnorm, shared)
-            if unfused_norm is not None:
-                from vllm import _custom_ops as ops
-
-                normed = torch.empty_like(result)
-                ops.rms_norm(normed, result, unfused_norm[0], unfused_norm[1])
-                result = normed
         if owner is None or self._poll_owner in (None, owner):
             if owner is not None:
                 self._poll_owner = owner
@@ -436,8 +426,6 @@ class RubinMegaMoE:
         ensure_not_capturing("RubinMegaMoE fused RMSNorm compile")
         for b in self.buckets:
             session = self.sessions[b]
-            if session.cfg.kernel_variant in DEDUP_VARIANTS:
-                continue  # stock rms_norm after the launch (forward)
             shared = None
             if session.cfg.shared is not None:
                 shared = getattr(self, "_warm_shared", None)
