@@ -55,7 +55,7 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 # Fused shared expert: shared FC2 after the routed work ("tail"), right after shared
 # FC1, under the dispatch ("early": its clusters park until every shared FC1 tile is
 # done), or claimed once every shared FC1 tile is done, routed work meanwhile ("ready").
-RUBIN_FUSED_SHARED_L2_POSITION = "ready"
+RUBIN_FUSED_SHARED_L2_POSITION = "early"
 
 
 def compile_cache_key(
