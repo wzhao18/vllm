@@ -244,7 +244,17 @@ __device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* 
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const float4* xp = (const float4*)X + (((kReuse ? 0 : e) + h) * 2) * 16 + l;
-        x[h][0] = xp[0]; x[h][1] = xp[16];
+        if constexpr (M == 9) {
+          float2 q[4];
+#pragma unroll
+          for (int i = 0; i < 4; ++i)
+            asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(q[i].x), "=f"(q[i].y)
+                         : "r"(sa((const float2*)(xp + 16 * (i >> 1)) + (i & 1))));
+          x[h][0] = make_float4(q[0].x, q[0].y, q[1].x, q[1].y);
+          x[h][1] = make_float4(q[2].x, q[2].y, q[3].x, q[3].y);
+        } else {
+          x[h][0] = xp[0]; x[h][1] = xp[16];
+        }
       }
     }
 #pragma unroll
@@ -588,7 +598,7 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
         __syncwarp();
         if ((c & 31) == 0) arrive(sa(&empty[s]));
       }
-      if (MATH == 1 || MATH == 2 || (MATH >= 5 && MATH <= 7)) acc ^= scan_math<NG, U, MATH>(v, (const float*)(smem + (size_t)S * SL), c);
+      if (MATH == 1 || MATH == 2 || (MATH >= 5 && MATH <= 7) || MATH == 9) acc ^= scan_math<NG, U, MATH>(v, (const float*)(smem + (size_t)S * SL), c);
       if constexpr (MATH == 8) {
         const unsigned col = (j & 1) * 128;
         const int hw = tid >> 5;
@@ -693,6 +703,7 @@ void launch(int64_t form, int64_t state, int64_t P, int64_t sin, int64_t sin_b,
     case 670531: go_tma<512, 3, 1, 6>(a, s); break;
     case 770531: go_tma<512, 3, 1, 7>(a, s); break;
     case 870531: go_tma<512, 3, 1, 8>(a, s); break;
+    case 970531: go_tma<512, 3, 1, 9>(a, s); break;
     case 570541: go_tma<512, 4, 1, 5>(a, s); break;
     default: TORCH_CHECK(false, "form");
   }
@@ -717,6 +728,7 @@ std::vector<int64_t> attrs(int64_t form) {
     case 670531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 6>); break;
     case 770531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 7>); break;
     case 870531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 8>); break;
+    case 970531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 9>); break;
     default: cudaFuncGetAttributes(&f, skel_k<256, 2>); break;
   }
   return {f.numRegs, (int64_t)f.localSizeBytes};
@@ -732,7 +744,7 @@ std::vector<int64_t> attrs(int64_t);
 
 def _module():
     return load_inline(
-        name="k31_kda_skel_v19",
+        name="k31_kda_skel_v20",
         cpp_sources=CPP,
         cuda_sources=CUDA,
         functions=["launch", "attrs"],
@@ -748,10 +760,10 @@ def parse_arm(arm):
             if form.startswith("t"):  # t<NC>s<S>o<OPS>[m|f][g]: TMA ring, NC consumers
                 grp = 1000000 if form.endswith("g") else 0  # g: 2 alternating groups
                 form = form.rstrip("g")
-                nc, ops = form[1:].rstrip("mfvwpbqt").split("o")
+                nc, ops = form[1:].rstrip("mfvwpbqtx").split("o")
                 nc, slots = (nc.split("s") + ["3"])[:2]
                 code = (5 if nc == "512" else 2) * 100 + 10 * int(slots) + int(ops)
-                return kind, grp + 70000 + code + {"m": 100000, "f": 200000, "v": 300000, "w": 400000, "p": 500000, "b": 600000, "q": 700000, "t": 800000}.get(form[-1], 0)
+                return kind, grp + 70000 + code + {"m": 100000, "f": 200000, "v": 300000, "w": 400000, "p": 500000, "b": 600000, "q": 700000, "t": 800000, "x": 900000}.get(form[-1], 0)
             nt, minb = form.split("x")
             return kind, int(nt) * 10 + int(minb)
     raise ValueError(arm)
