@@ -8,15 +8,15 @@
 // `need` keys equal to tau with the smallest global ids; this rank's tokens above tau in
 // position order, then its selected ties in position order (KV slots), -1 padding, count.
 //
-// One CTA per row; the row stays in registers (warp w holds the 8-key groups
-// [w * 32 * NRR, +32 * NRR), lane l the groups 32 i + l, plus one SMEM group per thread):
-//  1. CTA max -> 1/NR sample histogram of the keys within 4096 of it -> theta (sample's
-//     (q + 256)-th key, q = ceil(K * L / G)) and an estimate of the q-th key;
-//  2. one pass: keys >= theta -> fine histogram (2048 keys), valid keys, band staging;
+// One CTA per row; the row is bulk-copied to SMEM (its first kCapG 8-key groups; longer
+// rows read the rest from global memory) and every pass is one compact loop over it:
+//  1. a 1/8 group sample: its max, then a histogram of its keys within 8 octaves of the
+//     max -> theta (the sample's (q + 256)-th key, q = ceil(K * L / G)) and e_est;
+//  2. one pass: keys >= theta -> fine histogram (2048 keys), valid keys;
 //  3. e = the q-th key; message = header + exact counts of the 256 keys around e + the
 //     positions of every key in [e - d, e + d] (<= kSpBand, position order);
 //  4. one round (multicast tagged words): tau, need and the tie cut by global id;
-//  5. selection from registers into position bitmaps, one scan, the write.
+//  5. selection into position bitmaps (quads OR their words), one scan, the write.
 // The only other path (decided alike on every rank from the exchanged words): radix rounds
 // over the 40-bit composite (key << 24 | 0xFFFFFF - gid), 8 bits per round, from the key
 // digits, or from the id digits when round 1 fixed tau. No second kernel.
@@ -35,9 +35,10 @@ constexpr int kSpRs = 257;    // per-rank window suffix stride
 template <int T>
 struct SpCfg {
   static constexpr int kWarps = T / 32;
-  static constexpr int kNRR = T >= 1024 ? 4 : 8;  // register groups per thread
-  static constexpr int kNR = kNRR + 1;            // + one SMEM group
-  static constexpr int kBmW = kNR * T / 4;        // bitmap words (slot 8g + j)
+  // SMEM row: the first kCapG 8-key groups (longer rows stream the rest from global
+  // memory and select in chunks of kCapG groups)
+  static constexpr int kCapG = T >= 1024 ? 10240 : 4608;
+  static constexpr int kBmW = kCapG / 4;  // bitmap words per chunk (slot 8g + j)
   static constexpr int kFB = kSpFine / T;
   static_assert(kFB * T == kSpFine && kV2MaxW * kSpRs <= kSpFine + 64, "SMEM aliasing");
 };
@@ -87,8 +88,9 @@ __device__ __forceinline__ uint32_t sp_nvalid(const uint4& r) {
 template <int T>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params p) {
   using C = SpCfg<T>;
-  constexpr int NRR = C::kNRR, NR = C::kNR, FB = C::kFB;
-  __shared__ __align__(16) uint4 sgrp[T];
+  constexpr int CG = C::kCapG, FB = C::kFB;
+  __shared__ __align__(128) uint4 srow[CG];
+  __shared__ __align__(8) uint64_t s_bar;
   __shared__ __align__(16) uint32_t bm[2 * C::kBmW];
   __shared__ __align__(16) uint32_t fine[kSpFine + 64];  // later: window suffixes / radix rx
   __shared__ __align__(16) uint32_t coarse[256];         // later: radix histogram
@@ -110,13 +112,17 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
   // s_u: 0 max, 1 nc, 2 beyond, 3 valid, 4 nst, 5 nb, 6 sat, 7 gstar, 8 A, 9 bcnt, 10 rem
   // s_i: 0 theta, 1 e_est, 2 e, 3 lo, 4 bl, 5 bh, 6 hifail, 7 tau, 8 lev0, 9 dstar, 10 hd
   auto zero_row_smem = [&]() {
-    for (int i = tid; i < 2 * C::kBmW; i += T) bm[i] = 0;
     for (int i = tid; i < kSpFine + 64; i += T) fine[i] = 0;
     for (int i = tid; i < 256; i += T) coarse[i] = 0;
     if (tid < 16) { s_u[tid] = 0; s_i[tid] = 0; }
   };
   zero_row_smem();
+  if (tid == 0) {
+    mbar_init(&s_bar, kV2Cp);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
   __syncthreads();
+  uint32_t bar_phase = 0;
   asm volatile("griddepcontrol.wait;" ::: "memory");
   const int W = p.W, K = p.K, IL = p.interleave;
   auto log2_or = [](int x) -> int { return (x > 0 && (x & (x - 1)) == 0) ? __ffs(x) - 1 : -1; };
@@ -149,9 +155,24 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     const int Gl = p.global_len[row];
     const int ng = (L + 7) >> 3;
     // group g = positions [8g, 8g + 8) (16-byte aligned rows, lcols % 8 == 0: the host
-    // checks); positions >= L read as NaN
-    auto ld_group = [&](int g) -> uint4 {
-      uint4 r = __ldg(reinterpret_cast<const uint4*>(lrow) + g);
+    // checks); groups [0, CG) land in SMEM (bulk copies by kV2Cp warps), later groups are
+    // read from global memory; positions >= L read as NaN
+    const int nsm = ::min(ng, CG);
+    if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      const int c = tid >> 5, a = nsm * c / kV2Cp, b = nsm * (c + 1) / kV2Cp;
+      if (b > a) bulk_g2s(srow + a, reinterpret_cast<const uint4*>(lrow) + a, (uint32_t)(b - a) * 16u, &s_bar);
+      else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+    }
+    auto grp = [&](int g) -> uint4 {
+      uint4 r;
+      if (K31_LIKELY(g < CG)) {
+        r = srow[g];
+      } else {  // volatile: never speculated onto the SMEM path
+        asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                     : "l"(reinterpret_cast<const uint4*>(lrow) + g));
+      }
       const int nv = L - 8 * g;
       if (K31_RARE(nv < 8)) {
         r.x |= (nv > 0 ? 0u : 0xFFFFu) | (nv > 1 ? 0u : 0xFFFF0000u);
@@ -161,15 +182,6 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       }
       return r;
     };
-    const int gw0 = warp * 32 * NRR;
-    const int gsm = NRR * T + tid;  // this thread's SMEM group
-    uint4 rg[NRR];
-#pragma unroll
-    for (int i = 0; i < NRR; ++i) {
-      const int g = gw0 + 32 * i + lane;
-      rg[i] = g < ng ? ld_group(g) : make_uint4(~0u, ~0u, ~0u, ~0u);
-    }
-    const uint4 rs0 = gsm < ng ? ld_group(gsm) : make_uint4(~0u, ~0u, ~0u, ~0u);
     int* orow = p.out + (int64_t)row * p.ostride;
     const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
     const int* btrow = p.block_table != nullptr ? p.block_table + (int64_t)req * p.bt_stride : nullptr;
@@ -178,50 +190,45 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
         orow[i] = btrow == nullptr ? i : btrow[i / p.block_size] * p.block_stride + i % p.block_size;
       for (int i = L + tid; i < K; i += T) orow[i] = -1;
       if (tid == 0) p.out_count[row] = L;
+      mbar_wait(&s_bar, bar_phase);
+      bar_phase ^= 1u;
       __syncthreads();
       continue;
     }
-    if (tid == 0 && (ng > NR * T || L >= (1 << 18) || Gl >= (1 << 24))) spin_fail(p.err, 50);
+    if (tid == 0 && Gl >= (1 << 24)) spin_fail(p.err, 50);
     const int ep = p.epoch[row];
     const uint32_t tag = (uint32_t)(ep % 255);
     const int par = ep & 1;
     SPSTAT(0);
     const unsigned long long kl = (unsigned long long)K * (unsigned)L + (unsigned)(Gl - 1);
     const uint32_t q = max(1u, (uint32_t)(kl / (unsigned)Gl));
-    // ---- 1. CTA max key bound, then the sample histogram near it
+    mbar_wait(&s_bar, bar_phase);
+    bar_phase ^= 1u;
+    SPDBG(9);
+    // ---- 1. sample (one group in 8): its max, then its keys within 8 octaves of it
     {
-      sgrp[tid] = rs0;
-      uint32_t m = max_key_bound(rs0);
-#pragma unroll
-      for (int i = 0; i < NRR; ++i) m = ::max(m, max_key_bound(rg[i]));
+      uint32_t m = 1;
+#pragma unroll 1
+      for (int g = tid * 8 + (tid & 7); g < ng; g += T * 8) m = ::max(m, max_key_bound(grp(g)));
       m = __reduce_max_sync(0xffffffffu, m);
       if (lane == 0) atomicMax(&s_u[0], m);
     }
     __syncthreads();
-    SPDBG(9);
     const uint32_t mb = s_u[0];
-    // sample keys within 8 octaves of the max, 4 keys per bin
     const uint32_t base = mb > 1024u ? mb - 1024u : 1u;
-    {
-      const int is = (lane + warp) % NR;
-      uint4 r = sgrp[tid];
+#pragma unroll 1
+    for (int g = tid * 8 + (tid & 7); g < ng; g += T * 8) {
+      const uint4 kw = sp_keys(grp(g));
 #pragma unroll
-      for (int i = 0; i < NRR; ++i)
-        if (i == is) r = rg[i];
-      const int g = is < NRR ? gw0 + 32 * is + lane : gsm;
-      if (g < ng) {
-        const Keys8 k8(r);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const uint32_t k = k8.key(j);
-          if (k >= base) atomicAdd(&coarse[(k - base) >> 2], 1u);
-        }
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t k = sp_key_at(kw, j);
+        if (k >= base) atomicAdd(&coarse[(k - base) >> 2], 1u);
       }
     }
     __syncthreads();
     SPDBG(10);
     if (warp == 0) {  // theta: the sample's (q + 256)-th key's bin; e_est: its q-th key's bin
-      const uint32_t want = (q + 256u + NR - 1) / NR, want_e = max(1u, q / NR);
+      const uint32_t want = (q + 256u + 7) / 8, want_e = max(1u, q / 8);
       uint32_t c[8], s = 0;
 #pragma unroll
       for (int j = 0; j < 8; ++j) { c[j] = coarse[255 - 8 * lane - j]; s += c[j]; }
@@ -275,9 +282,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
           }
         }
       };
-#pragma unroll
-      for (int i = 0; i < NRR; ++i) visit(gw0 + 32 * i + lane, rg[i]);
-      visit(gsm, sgrp[tid]);
+#pragma unroll 1
+      for (int g = tid; g < ng; g += T) visit(g, grp(g));
       cnt = __reduce_add_sync(0xffffffffu, cnt);
       bey = __reduce_add_sync(0xffffffffu, bey);
       nv = __reduce_add_sync(0xffffffffu, nv);
@@ -319,6 +325,10 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       return c;
     };
     const int e = s_i[2];
+    if (p.dbg && tid == 0) {
+      long long* d = p.dbg + (int64_t)row * kV2Dbg;
+      d[31] = s_u[1]; d[29] = e - theta; d[28] = q; d[27] = bey; d[26] = (long long)theta; d[25] = mb;
+    }
     const int lo = e < 0 ? 0 : ::min(::max(theta, e - kSpWin / 2), theta + kSpFine - kSpWin);
     if (tid < kSpWin / 2) {
       const uint32_t c0 = e < 0 ? 0u : fine[lo - theta + 2 * tid], c1 = e < 0 ? 0u : fine[lo - theta + 2 * tid + 1];
@@ -327,7 +337,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     } else if (warp == C::kWarps - 1) {
       // band [e - d, e + d]: the largest d whose keys fit kSpBand
       const int d = lane;
-      bool ok = e >= 0 && e - d >= theta && e + d + 1 <= theta + kSpFine;
+      bool ok = e >= 0 && e - d >= theta && e + d + 1 <= theta + kSpFine && L < (1 << 18);
       uint32_t c = 0;
       if (ok) {
         c = cloc(e - d) - cloc(e + d + 1);
@@ -361,9 +371,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
           }
         }
       };
-#pragma unroll
-      for (int i = 0; i < NRR; ++i) visit(gw0 + 32 * i + lane, rg[i]);
-      visit(gsm, sgrp[tid]);
+#pragma unroll 1
+      for (int g = tid; g < ng; g += T) visit(g, grp(g));
     }
     __syncthreads();
     SPDBG(15);
@@ -567,9 +576,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
               ++run;
             }
           };
-#pragma unroll
-          for (int i = 0; i < NRR; ++i) visit(gw0 + 32 * i + lane, rg[i]);
-          visit(gsm, sgrp[tid]);
+#pragma unroll 1
+          for (int g = tid; g < ng; g += T) visit(g, grp(g));
           if (run) atomicAdd(&coarse[cur], run);
         }
         __syncthreads();
@@ -611,60 +619,86 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       }
       SPDBG(6);
     }
-    // ---- 6. selection -> position bitmaps -> write
+    // ---- 6. selection -> position bitmaps (chunks of CG groups) -> write; rows of more
+    // than one chunk count every chunk first (the ties follow all keys above tau)
     {
       const SpTh t1 = sp_th(tau + 1), t0 = sp_th(tau);
-      auto visit = [&](int g, const uint4& r) {
-        if (g >= ng) return;
-        const uint32_t mg = sp_mask(r, t1);
-        uint32_t me = sp_mask(r, t0) & ~mg;
-        if (K31_RARE(me && gstar != 0xFFFFFFFFu)) {
-          uint32_t m = me;
-#pragma unroll 1
-          while (m) {
-            const int j = __ffs(m) - 1;
-            m &= m - 1;
-            if (gid_of(8 * g + j, p.rank) > gstar) me &= ~(1u << j);
-          }
-        }
-        if (mg) atomicOr(&bmg[g >> 2], mg << (8 * (g & 3)));
-        if (me) atomicOr(&bme[g >> 2], me << (8 * (g & 3)));
-      };
-#pragma unroll
-      for (int i = 0; i < NRR; ++i) visit(gw0 + 32 * i + lane, rg[i]);
-      visit(gsm, sgrp[tid]);
-    }
-    __syncthreads();
-    SPDBG(7);
-    {
-      const int nw = (ng + 3) >> 2, wpt = (nw + T - 1) / T;
-      const int w0 = ::min(nw, tid * wpt), w1 = ::min(nw, w0 + wpt);
-      uint32_t cg = 0, ce = 0;
-      for (int w = w0; w < w1; ++w) { cg += __popc(bmg[w]); ce += __popc(bme[w]); }
-      uint32_t tot;
-      const uint32_t pre = v2_scan<T>(cg | (ce << 16), SPWS, &tot);
-      const int gtot = (int)(tot & 0xFFFFu), cnt = gtot + (int)(tot >> 16);
       auto slot = [&](int pos) -> int {
         if (btrow == nullptr) return pos;
         if (bt_sm) return btab[pos >> bs_sh] * p.block_stride + (pos & (p.block_size - 1));
         return btrow[pos / p.block_size] * p.block_stride + pos % p.block_size;
       };
-      int gp = (int)(pre & 0xFFFFu), epi = gtot + (int)(pre >> 16);
-      for (int w = w0; w < w1; ++w) {
-        uint32_t m = bmg[w];
-        while (m) {
-          const int b = __ffs(m) - 1;
-          m &= m - 1;
-          if (gp < K) orow[gp] = slot(32 * w + b);
-          ++gp;
+      const int nch = (ng + CG - 1) / CG;
+      int gall = 0, cnt = 0;
+#pragma unroll 1
+      for (int sweep = nch > 1 ? 0 : 1; sweep < 2; ++sweep) {
+        int grun = 0, erun = 0;
+#pragma unroll 1
+        for (int c = 0; c < nch; ++c) {
+          const int g0 = c * CG, g1 = ::min(ng, g0 + CG);
+#pragma unroll 1
+          for (int gb = g0; gb < g1; gb += T) {  // CTA-uniform trip count: quads OR their words
+            const int g = gb + tid;
+            uint32_t mg = 0, me = 0;
+            if (g < g1) {
+              const uint4 r = grp(g);
+              mg = sp_mask(r, t1);
+              me = sp_mask(r, t0) & ~mg;
+              if (K31_RARE(me && gstar != 0xFFFFFFFFu)) {
+                uint32_t m = me;
+#pragma unroll 1
+                while (m) {
+                  const int j = __ffs(m) - 1;
+                  m &= m - 1;
+                  if (gid_of(8 * g + j, p.rank) > gstar) me &= ~(1u << j);
+                }
+              }
+            }
+            mg <<= 8 * (tid & 3);
+            me <<= 8 * (tid & 3);
+            mg |= __shfl_xor_sync(0xffffffffu, mg, 1);
+            me |= __shfl_xor_sync(0xffffffffu, me, 1);
+            mg |= __shfl_xor_sync(0xffffffffu, mg, 2);
+            me |= __shfl_xor_sync(0xffffffffu, me, 2);
+            if ((tid & 3) == 0 && g < g1 + 3) {
+              bmg[(g - g0) >> 2] = mg;
+              bme[(g - g0) >> 2] = me;
+            }
+          }
+          __syncthreads();
+          SPDBG(7);
+          const int nw = (g1 - g0 + 3) >> 2, wpt = (nw + T - 1) / T;
+          const int w0 = ::min(nw, tid * wpt), w1 = ::min(nw, w0 + wpt);
+          uint32_t cg = 0, ce = 0;
+          for (int w = w0; w < w1; ++w) { cg += __popc(bmg[w]); ce += __popc(bme[w]); }
+          uint32_t tot;
+          const uint32_t pre = v2_scan<T>(cg | (ce << 16), SPWS, &tot);
+          if (sweep == 1) {
+            const int gt_all = nch > 1 ? gall : (int)(tot & 0xFFFFu);
+            int gp = grun + (int)(pre & 0xFFFFu), epi = gt_all + erun + (int)(pre >> 16);
+            for (int w = w0; w < w1; ++w) {
+              uint32_t m = bmg[w];
+              while (m) {
+                const int b = __ffs(m) - 1;
+                m &= m - 1;
+                if (gp < K) orow[gp] = slot(8 * g0 + 32 * w + b);
+                ++gp;
+              }
+              m = bme[w];
+              while (m) {
+                const int b = __ffs(m) - 1;
+                m &= m - 1;
+                if (epi < K) orow[epi] = slot(8 * g0 + 32 * w + b);
+                ++epi;
+              }
+            }
+          }
+          grun += (int)(tot & 0xFFFFu);
+          erun += (int)(tot >> 16);
+          __syncthreads();
         }
-        m = bme[w];
-        while (m) {
-          const int b = __ffs(m) - 1;
-          m &= m - 1;
-          if (epi < K) orow[epi] = slot(32 * w + b);
-          ++epi;
-        }
+        gall = grun;
+        cnt = grun + erun;
       }
       for (int i = cnt + tid; i < K; i += T) orow[i] = -1;
       if (tid == 0) {

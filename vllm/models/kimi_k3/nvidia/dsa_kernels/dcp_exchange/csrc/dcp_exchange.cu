@@ -3267,11 +3267,9 @@ static int64_t topk_sp_resident_of(int* wide) {
   return v;
 }
 
-// Longest local row (positions) the single-path kernel holds: rows of this many
-// positions or fewer may use impl 1.
-int64_t topk_sp_max_local() {
-  return std::min<int64_t>((int64_t)SpCfg<kV2T>::kNR * kV2T * 8 - 8, (int64_t)SpCfg<1024>::kNR * 1024 * 8 - 8);
-}
+// Longest local row (positions) of the single-path kernel's SMEM copy; longer rows read
+// the rest from global memory.
+int64_t topk_sp_max_local() { return (int64_t)SpCfg<kV2T>::kCapG * 8; }
 int64_t topk_v2_resident() { return topk_v2_resident_of(nullptr); }
 
 void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,

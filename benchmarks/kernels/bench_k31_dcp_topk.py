@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--evict-touch", type=int, default=0,
                     help="after --evict-mb, re-read the top-k's small data (mailboxes, block table, "
                          "lengths, epochs, outputs) so only code stays evicted")
+    ap.add_argument("--thrash", type=int, default=0,
+                    help="in-step emulation of a cold instruction cache: this many rounds of three "
+                         "differently shaped matmuls (other kernels' code) before each call")
     ap.add_argument("--skew-us", type=float, default=0.0,
                     help="the last rank sleeps this long before each call (in-step rank skew)")
     ap.add_argument("--impl", default="merge", choices=["merge", "v2", "sp"])
@@ -152,8 +155,14 @@ def main():
 
             ev = (torch.empty(a.evict_mb << 18, dtype=torch.int32, device=dev) if a.evict_mb else None)
             ev2 = torch.empty_like(ev) if ev is not None else None
+            th_mm = [(torch.randn(m, k, device=dev, dtype=dt), torch.randn(k, n, device=dev, dtype=dt))
+                     for m, k, n, dt in ((128, 2048, 2048, torch.bfloat16), (256, 256, 256, torch.float32),
+                                         (4096, 64, 64, torch.bfloat16))] if a.thrash else []
 
             def call(dbg=None, stats=None):
+                for _ in range(a.thrash):
+                    for x_, y_ in th_mm:
+                        torch.matmul(x_, y_)
                 if ev is not None:
                     ev2.copy_(ev)
                     torch.amax(logits, dim=1)
@@ -222,7 +231,10 @@ def main():
             if a.impl in ("v2", "sp"):  # SM clock from (clock64, globaltimer) at row start / end
                 c0, c1, t0n, t1n = d[:, 32].double(), d[:, 40].double(), d[:, 0].double(), d[:, 8].double()
                 okr = t1n > t0n
-                phases["ncand"] = (float(d[:, 31].double().median()), 0, 0)
+                phases["ncand"] = (float(d[:, 31].double().median()), float(d[:, 31].double().max()), 0)
+                if a.impl == "sp":
+                    for i_, n_ in ((29, "e-theta"), (28, "q"), (27, "beyond"), (26, "theta"), (25, "maxb")):
+                        phases[n_] = (float(d[:, i_].double().median()), float(d[:, i_].double().max()), 0)
                 for bi in range(3):  # candidate batches: this thread's loads landed (clock64)
                     v = d[:, 24 + bi].double()
                     okb = v > 0
