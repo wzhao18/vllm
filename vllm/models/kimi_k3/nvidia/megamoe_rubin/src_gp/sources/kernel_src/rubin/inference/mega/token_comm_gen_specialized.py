@@ -1367,6 +1367,8 @@ class GenphaseTokenComm(KernelComponent):
                 sleep_cycles=64,
             )
         cute.arch.sync_threads()
+        if cutlass.const_expr(device_workspace.tail_parity):
+            device_workspace.bind_tail_parity(self._tail.read_epoch(device_workspace) & Int32(1))
         if cutlass.const_expr(not self.sf_plain_transport):
             epoch = self._tail.read_epoch(device_workspace)
             if (epoch >= Int32(-1)) & (epoch <= Int32(1)):
