@@ -114,6 +114,11 @@ class SharedSituGemm:
                 gemm = _Kernel(self.tactic, self.a_pow, self.clamp_up)
                 cl = self.tactic[1]
                 mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
+                for f in str(self.tactic[7]).split("+"):
+                    if f.startswith("mac"):
+                        # Persistent grid cap (clusters): leaves SMs to the
+                        # kernels that run beside it in the prefill step.
+                        mac = min(mac, int(f[3:]))
                 layouts = (
                     OperandMajorMode.K,
                     OperandMajorMode.K,

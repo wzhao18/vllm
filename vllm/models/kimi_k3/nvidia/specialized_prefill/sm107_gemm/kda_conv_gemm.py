@@ -63,7 +63,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
-            (tm, tn, 128),
+            (tm, tn, 256 if "k256" in flags else 64 if "k64" in flags else 128),
             cluster,
             prefetch_dist=0,
             swizzle_size=swz,
