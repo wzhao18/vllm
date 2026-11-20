@@ -342,6 +342,9 @@ class SpMlp:
             def experts(shared=None):
                 return route.launch(staged, fused_norm, shared)
 
+            def rows_done():
+                return staged[1].reduce_rows_done()
+
         else:
             (router_output, topk_ids), routed = maybe_execute_in_parallel(
                 lambda: mlp._router(h),
@@ -358,6 +361,9 @@ class SpMlp:
                 if shared is not None:
                     kwargs["fused_shared"] = shared
                 return mlp.experts(routed, router_output, topk_ids, **kwargs)
+
+            def rows_done():
+                return mlp.experts.reduce_rows_done(n)
 
         tail = None
         if self.fused_shared is not None and mlp.experts.fused_shared(n):
@@ -381,7 +387,7 @@ class SpMlp:
         if norm is not None and fused_norm is None:
             final = norm(final)
         if tail is not None:
-            return tail.run(final, shared_out, mlp.experts.reduce_rows_done(n))
+            return tail.run(final, shared_out, rows_done())
         return gemms["latent_up"].run(final, residual=shared_out)
 
 
