@@ -59,17 +59,60 @@ def _case(reqs, q, ctx, dcp_rank, world=4, seed=0):
                 row_lens=ctx_rows, block_table=bt_rows, max_len=max_model), ref, lens
 
 
-def _check(got, ref, lens):
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _dequant(codes, scales):
+    """E2M1 bytes [..., 64] (low nibble first), UE8M0 bytes [..., 4] -> FP32 [..., 128]."""
+    table = torch.tensor(E2M1, device=codes.device)
+    table = torch.cat([table, -table])
+    nib = torch.stack([codes & 15, codes >> 4], -1).flatten(-2).long()
+    values = table[nib].unflatten(-1, (4, 32))
+    return (values * torch.exp2(scales.float() - 127).unsqueeze(-1)).flatten(-2)
+
+
+def _fp32_logits(args, lens, q):
+    """FP32 reference [rows, max_len]: sum_h w_h relu(q_h . k) of the dequantized
+    rows (page = [64 x 64 B E2M1 | 64 x 4 UE8M0])."""
+    cache, bt = args["kv_cache"], args["block_table"]
+    pages = torch.as_strided(cache, (cache.shape[0], PAGE * ROW), (cache.stride(0), 1))
+    rows = lens.shape[0]
+    out = torch.zeros(rows, args["max_len"], device=lens.device)
+    qd = _dequant(args["query"], args["q_scale"].view(torch.uint8).view(rows, HEADS, 4))
+    w = args["head_w"].float()
+    for b in range(rows // q):
+        n = int(lens[b * q: b * q + q].max())
+        if n == 0:
+            continue
+        pos = torch.arange(n, device=lens.device)
+        pg = pages[bt[b * q, pos // PAGE].long()]
+        off = (pos % PAGE).unsqueeze(1)
+        codes = pg.gather(1, off * 64 + torch.arange(64, device=lens.device))
+        sc = pg.gather(1, PAGE * 64 + off * 4 + torch.arange(4, device=lens.device))
+        k = _dequant(codes, sc)  # [n, 128]
+        s = torch.einsum("thd,nd->thn", qd[b * q: b * q + q], k).relu()
+        out[b * q: b * q + q, :n] = torch.einsum("thn,th->tn", s, w[b * q: b * q + q])
+    return out
+
+
+def _check(got, ref, lens, args, q):
+    """``got`` (ours) and ``ref`` (stock) against the FP32 reference on every row's
+    valid columns: ours no further from it than BF16 rounding of the FP32 value
+    allows the stock op (same max error bound, same mean)."""
     col = torch.arange(ref.shape[1], device=ref.device)
     valid = col[None, :] < lens[:, None]
     assert got.shape[0] == ref.shape[0] and got.shape[1] >= ref.shape[1]
     assert got.stride(1) == 1 and (got.stride(0) * 2) % 1024 == 0
-    g, r = got[:, : ref.shape[1]].float(), ref.float()
+    exact = _fp32_logits(args, lens, q)
+    g = got[:, : ref.shape[1]].float()
     assert bool(torch.isfinite(g[valid]).all())
-    # BF16 logits of FP32 head sums taken in another order: within 2 BF16 ulps.
-    tol = 2 * 2.0**-7 * r.abs().clamp(min=2.0**-20)
-    bad = ((g - r).abs() > tol) & valid
-    assert int(bad.sum()) <= int(valid.sum()) // 10000, int(bad.sum())
+    e_ours = (g - exact).abs()[valid]
+    e_stock = (ref.float() - exact).abs()[valid]
+    bound = 2.0**-8 * exact.abs()[valid] + 1e-6 * exact.abs().max()  # half a BF16 ulp
+    assert bool((e_ours <= bound * 1.01 + 1e-30).all()) or (
+        e_ours.max() <= 1.01 * e_stock.max() and e_ours.mean() <= 1.1 * e_stock.mean()
+    ), (e_ours.max().item(), e_stock.max().item(), e_ours.mean().item(),
+        e_stock.mean().item())
 
 
 @pytest.mark.parametrize("reqs,q,ctx,rank", [(32, 4, 9000, 0), (96, 4, 6000, 3), (8, 2, 700, 1)])
@@ -80,7 +123,7 @@ def test_fp4_index_logits_matches_stock(reqs, q, ctx, rank):
 
     args, ref, lens = _case(reqs, q, ctx, rank)
     op = Fp4IndexLogits(reqs * q, q, "cuda")
-    _check(op(**args), ref, lens)
+    _check(op(**args), ref, lens, args, q)
 
 
 def test_fp4_index_logits_graph_replay():
@@ -101,4 +144,4 @@ def test_fp4_index_logits_graph_replay():
     args["kv_cache"].copy_(args2["kv_cache"])
     graph.replay()
     torch.cuda.synchronize()
-    _check(out, ref2, lens2)
+    _check(out, ref2, lens2, args, 4)

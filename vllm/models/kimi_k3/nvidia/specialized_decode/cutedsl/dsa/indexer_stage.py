@@ -55,6 +55,8 @@ class IndexerStage:
             self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
         # The fused DCP indexer (PreparedDsa.prepare_cache; None: DeepGEMM).
         self.fused = None
+        # MXFP4 request-batched logits (fp4_index_logits) per rows-per-request q.
+        self.fp4_ops = {}
         # -----------------------------------------------------------------------
 
     def query(self, q_fp8, rows, batch):
@@ -173,7 +175,7 @@ class IndexerStage:
         decode = index_md.decode
         if source == "exchange":
             run = DCP_DECODE_TOPK_HOOKS[indexer.k_cache.prefix][1]
-            return self.exchange_rows(run, q_fp8, head_w, decode, rows, batch)
+            return self.exchange_rows(run, q_fp8, head_w, decode, rows, batch, q)
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
         ids = None if self.dcp_ids is None else self.dcp_ids[:rows, : self.topk]
         # As the stock hook: interleave 1 bounds the local lengths.
@@ -206,7 +208,7 @@ class IndexerStage:
                 slots[rows:].fill_(-1)
                 valid[rows:].zero_()
             return slots, valid
-        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch, q)
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
         assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
         reqs = decode.decode_lens.shape[0]
@@ -223,10 +225,14 @@ class IndexerStage:
             valid[rows:].zero_()
         return slots, valid
 
-    def decode_logits(self, q_fp8, head_w, decode, rows, batch):
+    def decode_logits(self, q_fp8, head_w, decode, rows, batch, q=1):
         """The bf16 paged MQA logits of the first ``rows`` rows of a ``batch``-row
         step, as the stock op's decode branch computes them (uniform rows; FP8 or
-        MXFP4 cache and query)."""
+        MXFP4 cache and query). MXFP4 with ``q`` > 1 rows per request: scored per
+        request (fp4_index_logits: one pass over a request's keys for its q rows,
+        the same math; the stock varlen form reads the keys once per row)."""
+        if self.fp4 and q > 1:
+            return self.fp4_logits(q_fp8, head_w, decode, rows, batch, q)
         from vllm.model_executor.layers.sparse_attn_indexer import (
             kv_cache_as_quant_view,
         )
@@ -253,12 +259,38 @@ class IndexerStage:
             indices=decode.indices,
         )
 
-    def exchange_rows(self, run, q_fp8, head_w, decode, rows, batch):
+    def fp4_logits(self, q_fp8, head_w, decode, rows, batch, q):
+        """``decode_logits`` of MXFP4 rows, ``q`` consecutive rows per request (row
+        ``b * q + t``: request b's t-th verify row; the varlen metadata's per-row
+        local lengths and block tables)."""
+        from .fp4_index_logits import Fp4IndexLogits
+
+        op = self.fp4_ops.get(q)
+        if op is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"IndexerStage: MXFP4 logits for q={q} first seen in graph capture "
+                    "(its buffers must exist before capture: run the step eagerly first)"
+                )
+            device = self.indexer.topk_indices_buffer.device
+            op = self.fp4_ops[q] = Fp4IndexLogits(max(batch, rows), q, device)
+        query, q_scale = self.query(q_fp8, rows, batch)
+        return op(
+            query,
+            q_scale,
+            head_w[:rows],
+            self.indexer.k_cache.kv_cache,
+            decode.seq_lens[:rows],
+            decode.block_table[:rows],
+            self.max_model_len,
+        )
+
+    def exchange_rows(self, run, q_fp8, head_w, decode, rows, batch, q=1):
         """``merge_rows`` of a DcpExchange step: ``run`` (its indexer hook) writes
         this rank's KV slots of the exact global top-k of the same logits and the
         MLA impl's ``dcp_local_topk_counts`` gives their counts."""
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
-        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch, q)
         run(logits, decode, slots[:rows])
         counts = self.impl.dcp_local_topk_counts(rows)
         assert counts is not None, "DcpExchange admitted a step it did not serve"

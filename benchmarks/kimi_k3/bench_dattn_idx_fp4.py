@@ -63,7 +63,7 @@ def main():
         args, ref, lens = _case(reqs, q, a.ctx, 0)
         op = Fp4IndexLogits(rows, q, "cuda")
         got = op(**args)
-        _check(got, ref, lens)
+        _check(got, ref, lens, args, q)
         kv = kv_cache_as_quant_view(args["kv_cache"], 128, True)
         ctx_rows = args["row_lens"]
         idx = torch.arange(rows, dtype=torch.int32, device="cuda")
