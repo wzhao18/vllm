@@ -946,13 +946,14 @@ class PersistentDenseGemmKernel:
                         for kblk_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblk_crd = (None, None, kblk_idx, handle.index)
 
-                            cute.gemm(
-                                tiled_mma,
-                                tCtAcc,
-                                tCrA[kblk_crd],
-                                tCrB[kblk_crd],
-                                tCtAcc,
-                            )
+                            if cutlass.const_expr(not self.skel_nomma):
+                                cute.gemm(
+                                    tiled_mma,
+                                    tCtAcc,
+                                    tCrA[kblk_crd],
+                                    tCrB[kblk_crd],
+                                    tCtAcc,
+                                )
                             # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
@@ -1027,6 +1028,26 @@ class PersistentDenseGemmKernel:
                 )
             # Per-tile side loads for the epilogue hooks, one tile ahead
             pf = self.epi_tile_alloc(ep_t1)
+            if cutlass.const_expr(self.aux_t2r and self.aux_tile_ahead):
+                # The whole tile's aux in registers, loaded one tile ahead
+                # (short-K GEMMs: the tile's mainloop cannot hide the load).
+                aux_t2r, _, _ = _gemm_sm100.epilogue_tmem_copy_and_partition(
+                    self,
+                    tidx,
+                    _gemm_sm100.transform_partitioned_tensor_layout(tCtAcc_base),
+                    _gemm_sm100.transform_partitioned_tensor_layout(tCgC),
+                    epi_tile,
+                    self.use_2cta_instrs,
+                )
+                aux_views = self._aux_tile_views(
+                    aux_t2r.get_slice(tidx), tCgAux, tCcC, epi_tile
+                )
+                pf = cute.make_rmem_tensor(
+                    self._aux_tile(aux_views[0], (0, 0, 0)).shape, ep_t1.element_type
+                )
+                self._aux_tile_load(
+                    aux_views, mC_mnl, work_tile.tile_idx, work_tile.is_valid_tile, pf
+                )
             self.epi_tile_prefetch(
                 tidx, work_tile.tile_idx, work_tile.is_valid_tile, ep_t1, pf
             )
@@ -1136,6 +1157,18 @@ class PersistentDenseGemmKernel:
         next_tile_coord,
         next_valid,
     ) -> pipeline.PipelineState:
+        if cutlass.const_expr(self.skel_noepi):
+            # energy ladder only: wait for the accumulator and release it
+            noepi_bar = pipeline.NamedBarrier(
+                barrier_id=self.epilog_sync_bar_id,
+                num_threads=32 * len(self.epilogue_warp_id),
+            )
+            acc_pipeline.consumer_wait(acc_consumer_state)
+            noepi_bar.arrive_and_wait()
+            with cute.arch.elect_one():
+                acc_pipeline.consumer_release(acc_consumer_state)
+            acc_consumer_state.advance()
+            return acc_consumer_state
         tCgC = _gemm_sm100.transform_partitioned_tensor_layout(tCgC_base)
         tCtAcc = _gemm_sm100.transform_partitioned_tensor_layout(tCtAcc_base)
         tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
@@ -1168,7 +1201,24 @@ class PersistentDenseGemmKernel:
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         num_prev_subtiles = num_tiles_executed * subtile_cnt
-        if cutlass.const_expr(self.aux_t2r):
+        if cutlass.const_expr(self.aux_t2r and self.aux_tile_ahead):
+            # This tile's aux is in pf (loaded one tile ahead); the next tile's
+            # loads are issued once the last subtile has read pf.
+            views = self._aux_tile_views(
+                tiled_copy_t2r.get_slice(epi_tidx), tCgAux, tCcC_base, epi_tile
+            )
+            for s in cutlass.range_constexpr(subtile_cnt):
+                cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+                self.epi_convert_regs_aux(
+                    tTR_rAcc, pf[(None, None, None, s)], tRS_rC, tiled_copy_r2s
+                )
+                if cutlass.const_expr(s + 1 == subtile_cnt):
+                    self._aux_tile_load(views, mC_mnl, next_tile_coord, next_valid, pf)
+                self._epi_store_subtile(
+                    s, num_prev_subtiles, tiled_copy_r2s, tRS_rC, tRS_sC,
+                    epilog_sync_barrier, warp_idx, tma_atom_c, bSG_sC, bSG_gC, c_pipeline,
+                )
+        elif cutlass.const_expr(self.aux_t2r):
             # aux in the TMEM-load (t2r) layout: one 16-byte load per 8 elements,
             # rows past M predicated off (as the direct-store epilogue)
             thr_t2r = tiled_copy_t2r.get_slice(epi_tidx)
@@ -1188,7 +1238,9 @@ class PersistentDenseGemmKernel:
             aux_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), ep_t1.element_type, num_bits_per_copy=128
             )
-        if cutlass.const_expr(self.aux_t2r):
+        if cutlass.const_expr(self.aux_t2r and self.aux_tile_ahead):
+            pass
+        elif cutlass.const_expr(self.aux_t2r):
             # aux double-buffered in registers, one subtile ahead (unrolled)
             bufs = (tTR_rAux, cute.make_rmem_tensor(tTR_rAcc.shape, ep_t1.element_type))
             self._aux_load(aux_atom, tTR_gAux, tTR_cAux, mC_mnl, 0, bufs[0])
@@ -1228,6 +1280,57 @@ class PersistentDenseGemmKernel:
         dst.store(self.epi_convert(src.load(), epilogue_op, ep_t0))
 
     aux_t2r = False  # subclasses: ep_t1 is an (M, N, L) aux operand read in the epilogue
+    # Energy-ladder microbench arms only (never in a production instance):
+    # skel_noepi = mainloop only (the epilogue releases TMEM, no C stores);
+    # skel_nomma = loads only (the MMA warp releases stages without tcgen05.mma).
+    skel_noepi = False
+    skel_nomma = False
+    # with aux_t2r: hold a whole tile's aux in registers, loaded one tile ahead
+    # (the next tile's loads fly during this tile's stores and the next mainloop)
+    aux_tile_ahead = False
+
+    def _aux_tile_views(self, thr_t2r, tCgAux, tCcC_base, epi_tile):
+        """aux and its coordinates in the t2r layout, all tiles (M, N, L modes last)."""
+        g = thr_t2r.partition_D(
+            cute.flat_divide(
+                _gemm_sm100.transform_partitioned_tensor_layout(tCgAux), epi_tile
+            )
+        )
+        c = thr_t2r.partition_D(
+            cute.flat_divide(
+                _gemm_sm100.transform_partitioned_tensor_layout(tCcC_base), epi_tile
+            )
+        )
+        return g, c
+
+    @staticmethod
+    def _aux_tile(view, coord):
+        """One MMA tile of an _aux_tile_views view: (frag..., subtiles)."""
+        v = view[(None, None, None, None, None, *coord)]
+        return cute.group_modes(v, 3, cute.rank(v))
+
+    def _aux_tile_load(self, views, mC_mnl, tile_coord, valid, dst):
+        """Predicated 16-byte loads of a whole tile's aux (scheduler tile coord;
+        nothing loaded past M or for an invalid tile) into dst."""
+        coord = (
+            tile_coord[0] // (2 if self.use_2cta_instrs else 1),
+            tile_coord[1],
+            tile_coord[2],
+        )
+        g = self._aux_tile(views[0], coord)
+        c = self._aux_tile(views[1], coord)
+        atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dst.element_type, num_bits_per_copy=128
+        )
+        for s in range(cute.size(g.shape, mode=[3])):  # static count (plain method)
+            c_sub = c[(None, None, None, s)]
+            pred = cute.make_rmem_tensor((1, *c_sub.shape[1:]), cutlass.Boolean)
+            for mi in range(c_sub.shape[1]):
+                for ni in range(c_sub.shape[2]):
+                    pred[(0, mi, ni)] = (
+                        cute.elem_less(c_sub[(0, mi, ni)], mC_mnl.shape) & valid
+                    )
+            cute.copy(atom, g[(None, None, None, s)], dst[(None, None, None, s)], pred=pred)
 
     def _aux_load(self, atom, tTR_gAux, tTR_cAux, mC_mnl, subtile, dst):
         """Predicated 16-byte loads of one aux subtile (t2r layout) into dst."""
