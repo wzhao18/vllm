@@ -172,6 +172,17 @@ def _attn_res(
     buffer), the native one otherwise."""
     if call is not None and prefill_attn_res_lp.active(blocks, prefix):
         prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
+        if call > 0:
+            # EXPERIMENT (timing only, wrong values): the producer-fused
+            # residual dataflow C: the prefix is read pre-summed from the
+            # die-local buffer, no delta read, no prefix write-back.
+            src = prefix if prefix_out is None else prefix_out
+            out, _ = prefill_attn_res_lp.attn_res(
+                src, None, blocks, call, kwargs["num_blocks"],
+                kwargs["block_write_idx"], args[2], kwargs["output_norm_eps"],
+                bf16_out=True, quant_out=False, prefix_out=None,
+            )
+            return out, src
         out, _ = prefill_attn_res_lp.attn_res(
             prefix, delta, blocks, call, kwargs["num_blocks"],
             kwargs["block_write_idx"], args[2], kwargs["output_norm_eps"],
@@ -1778,6 +1789,15 @@ class KimiDecoderLayer(nn.Module):
                 num_blocks = self.prev_valid_blocks + self.is_block_write_layer
                 widx = -1
                 onw = self.post_attention_layernorm
+            if 2 * self.layer_idx + (not pre) > 0:
+                # EXPERIMENT (timing only, wrong values): dataflow C, the
+                # prefix pre-summed in the die-local buffer by the producer.
+                out, qa = prefill_attn_res_lp.attn_res(
+                    new_prefix, None, residual, 2 * self.layer_idx + (not pre),
+                    num_blocks, widx, onw.weight, onw.variance_epsilon,
+                    bf16_out=not pre, quant_out=True, prefix_out=None,
+                )
+                return out, qa, new_prefix
             out, qa = prefill_attn_res_lp.attn_res(
                 prefix_sum, delta, residual, 2 * self.layer_idx + (not pre),
                 num_blocks, widx, onw.weight, onw.variance_epsilon,
