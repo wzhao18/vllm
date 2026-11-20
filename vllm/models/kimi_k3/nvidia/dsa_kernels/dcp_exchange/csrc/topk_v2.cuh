@@ -66,6 +66,7 @@ constexpr int kR2W = 2048;     // R2 slot words per (parity, row, rank)
 constexpr int kR2Cap = 1022;   // R2 entries (key, position) per rank
 constexpr int kCgBins = 496;   // CG round: bins of the bracket (12-bit counts, 2 per word)
 constexpr int kCgMsg = kV2Hdr + kCgBins / 2;  // CG slot words = one radix-round slot
+constexpr int kCgTieMax = 128;  // ties at tau cut from the CG lists (more: tie round)
 static_assert(kCgMsg == 256 && kV2RadR >= 2 && kV2Cand <= 4095);
 constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
@@ -236,8 +237,8 @@ struct V2Sm {
 // its theta lies above tau): the row keeps R2. Same decision on every rank (same words).
 template <int T>
 __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* hist, uint32_t* msg,
-                                   const uint16_t* ckey, int nc, uint32_t tag, int par, int row,
-                                   uint32_t* warp_sums, int* s_i) {
+                                   const uint16_t* ckey, const uint32_t* cpos, int nc, uint32_t tag,
+                                   int par, int row, uint32_t* warp_sums, int* s_i, uint32_t* lrx) {
   __shared__ int s_cg[4];  // 0 base (-1: not eligible), 1 width shift, 2 bin, 3 need
   __shared__ uint32_t s_cgab;
   const int tid = threadIdx.x, W = p.W, K = p.K;
@@ -328,19 +329,56 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     for (int o = 16; o > 0; o >>= 1) ab += __shfl_xor_sync(0xffffffffu, ab, o);
     if ((tid & 31) == 0 && ab) atomicAdd(&s_cgab, ab);
     __syncthreads();
+    // final round (width 1): the tie lists ride on the same round. This rank's candidates in
+    // the bracket, value-descending (bin offsets from one scan; order inside a value is free),
+    // as global ids in the next radix slots (it + 1 ...); header word 2 = count + 1 (0: no
+    // list, it would not fit). Every rank derives the tie cut at tau from the lists, so the
+    // separate tie round is left only to rows whose ties overflow kCgTieMax.
+    const int capL = sh == 0 ? (kV2RadR - 1 - it) * kCgMsg : 0;
+    uint32_t* const loff = hist + 1536;  // kCgBins list offsets
+    uint32_t* const lst = hist + 2048;   // staged list (<= 1024 words)
+    uint32_t nlist = 0;                  // header word 2
+    if (capL > 0) {
+      const int b = kCgBins - 1 - tid;
+      const uint32_t c = b >= 0 ? hist[b] : 0u;
+      uint32_t tot;
+      const uint32_t ex = v2_scan<T>(c, warp_sums + 32 * (ws_par ^= 1u), &tot);
+      if (b >= 0) loff[b] = ex;
+      __syncthreads();
+      if (tot <= (uint32_t)capL) {
+        nlist = tot + 1u;
+        const int IL = p.interleave;
+        for (int c2 = tid; c2 < nc; c2 += T) {
+          const int u = (int)ckey[c2] - lo2;
+          if (u >= 0 && u < kCgBins) {
+            const int pos = (int)cpos[c2];
+            const uint32_t gid = (uint32_t)(((pos / IL) * W + p.rank) * IL + pos % IL);
+            lst[atomicAdd(&loff[u], 1u)] = tagw(tag, gid);
+          }
+        }
+        const int tp = ((int)tot + 3) & ~3;
+        if ((int)tot + tid < tp) lst[tot + tid] = tagw(tag, 0u);
+      }
+    }
     if (tid < kCgBins / 2) msg[kV2Hdr + tid] = pack2(tag, hist[2 * tid], hist[2 * tid + 1]);
-    if (tid < kV2Hdr) msg[tid] = tagw(tag, tid == 0 ? (uint32_t)lo2 : tid == 1 ? s_cgab : 0u);
+    if (tid < kV2Hdr) msg[tid] = tagw(tag, tid == 0 ? (uint32_t)lo2 : tid == 1 ? s_cgab : tid == 2 ? nlist : 0u);
     __syncthreads();
-    const int64_t base = p.off_rad + (((int64_t)(par * p.cap + row) * kV2RadR + it) * W) * kCgMsg;
-    for (int j = tid * 4; j < kCgMsg; j += T * 4) {
-      const uint4 v = make_uint4(msg[j], msg[j + 1], msg[j + 2], msg[j + 3]);
-      const int64_t off = base + (int64_t)p.rank * kCgMsg + j;
+    auto slot_base = [&](int s) -> int64_t {
+      return p.off_rad + (((int64_t)(par * p.cap + row) * kV2RadR + s) * W) * kCgMsg;
+    };
+    const int64_t base = slot_base(it);
+    auto put4 = [&](int64_t off, const uint4& v) {
       if (p.mc) mc_st_v4(p.mc + off * 4, v);
       else
         for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
-    }
-    for (int i = tid; i < W * (kCgMsg / 4); i += T) {
-      uint32_t* const src = p.box + base + 4 * (int64_t)i;
+    };
+    for (int j = tid * 4; j < kCgMsg; j += T * 4)
+      put4(base + (int64_t)p.rank * kCgMsg + j, make_uint4(msg[j], msg[j + 1], msg[j + 2], msg[j + 3]));
+    if (nlist > 0u)
+      for (int j = tid * 4; j < (int)nlist - 1; j += T * 4)
+        put4(slot_base(it + 1 + j / kCgMsg) + (int64_t)p.rank * kCgMsg + j % kCgMsg,
+             make_uint4(lst[j], lst[j + 1], lst[j + 2], lst[j + 3]));
+    auto poll4 = [&](uint32_t* src, uint32_t* dst) {
       const long long t0 = now_ns();
       uint4 v = ld_sys_v4(src);
       while (!tagged(v, tag)) {
@@ -348,10 +386,21 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
         __nanosleep(128);
         v = ld_sys_v4(src);
       }
-      *reinterpret_cast<uint4*>(cgrx + 4 * i) = v;
+      *reinterpret_cast<uint4*>(dst) = v;
       st_v4(src, dead4);  // re-armed: radix slots are used only on rare rows
-    }
+    };
+    for (int i = tid; i < W * (kCgMsg / 4); i += T) poll4(p.box + base + 4 * (int64_t)i, cgrx + 4 * i);
     __syncthreads();
+    if (capL > 0) {
+      // every rank's list (all of it: each word is re-armed after its poll, so no stale
+      // word of this epoch's tag is left in a slot a later round polls)
+      for (int r = 0; r < W; ++r) {
+        const int n = (int)(cgrx[r * kCgMsg + 2] & 0xFFFFFFu) - 1;
+        for (int j = tid * 4; j < n; j += T * 4)
+          poll4(p.box + slot_base(it + 1 + j / kCgMsg) + (int64_t)r * kCgMsg + j % kCgMsg, lrx + r * 1024 + j);
+      }
+      __syncthreads();
+    }
     // tau's bin: thread t <-> bin kCgBins - 1 - t; keys above it from the scan
     const int b = kCgBins - 1 - tid;
     uint32_t g = 0, A = 0;
@@ -372,22 +421,61 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
       __syncthreads();
       continue;
     }
-    if (tid == 0) {  // tau exact: the tie counts at tau from the bins
-      const int need = s_cg[3];
-      int tot_t = 0, nr = 0, mine = 0;
-      bool fit = true;
-      for (int r = 0; r < W; ++r) {
-        const int t = (int)v2_cnt(cgrx + r * kCgMsg, bin);
-        tot_t += t;
-        nr += t > 0;
-        fit = fit && t <= kV2Tie;
-        if (r == p.rank) mine = t;
+    // tau exact: per rank the ties at tau and its in-bracket keys above tau (= where its ties
+    // start in its value-descending list), one warp per rank
+    __shared__ int s_cgt2[kV2MaxW], s_cgs2[kV2MaxW];
+    __shared__ int s_cgcut;
+    if ((tid >> 5) < W) {
+      const int r = tid >> 5, lane = tid & 31;
+      const uint32_t* s = cgrx + r * kCgMsg;
+      uint32_t a = 0;
+      for (int u = bin + 1 + lane; u < kCgBins; u += 32) a += v2_cnt(s, u);
+      for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+      if (lane == 0) { s_cgt2[r] = (int)v2_cnt(s, bin); s_cgs2[r] = (int)a; }
+    }
+    if (tid == 0) s_cgcut = -1;
+    __syncthreads();
+    const int need = s_cg[3];
+    int tot_t = 0, nr = 0;
+    bool fit = true, lists = capL > 0;
+    for (int r = 0; r < W; ++r) {
+      const int t = s_cgt2[r];
+      tot_t += t;
+      nr += t > 0;
+      fit = fit && t <= kV2Tie;
+      lists = lists && (t == 0 || (cgrx[r * kCgMsg + 2] & 0xFFFFFFu) != 0u);
+    }
+    const int mine = s_cgt2[p.rank];
+    const bool lcut = tot_t != need && nr > 1 && lists && tot_t <= kCgTieMax;
+    if (lcut) {
+      // the cut: the need-th smallest global id among every rank's ties (ids are distinct)
+      auto tie_gid = [&](int i) -> uint32_t {
+        int r = 0;
+        while (i >= s_cgt2[r]) i -= s_cgt2[r++];
+        return lrx[r * 1024 + s_cgs2[r] + i] & 0xFFFFFFu;
+      };
+      if (tid < tot_t) {
+        const uint32_t x = tie_gid(tid);
+        int rk = 0;
+        for (int i = 0; i < tot_t; ++i) rk += tie_gid(i) < x;
+        if (rk == need - 1) s_cgcut = (int)x;
       }
+      __syncthreads();
+      const uint32_t cut = (uint32_t)s_cgcut;
+      const bool own = tid < mine && (lrx[p.rank * 1024 + s_cgs2[p.rank] + tid] & 0xFFFFFFu) <= cut;
+      const int quota = __syncthreads_count(own);
+      if (tid == 0) {
+        if (s_cgcut < 0) spin_fail(p.err, 39);
+        s_i[0] = 1;
+        s_i[3] = quota;
+      }
+    }
+    if (tid == 0) {
       s_i[1] = lo2 + bin;  // s_tau
       s_i[2] = need;       // s_need
       if (tot_t == need) { s_i[0] = 1; s_i[3] = mine; }
       else if (nr == 1) { s_i[0] = 1; s_i[3] = mine > 0 ? need : 0; }
-      else s_i[0] = fit ? 2 : 3;
+      else if (!lcut) s_i[0] = fit ? 2 : 3;
     }
     for (int i = tid; i < W * kCgMsg; i += T) rx[(i / kCgMsg) * kV2Msg + i % kCgMsg] = cgrx[i];
     __syncthreads();
@@ -1292,7 +1380,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // ---- CG first (rank-skewed rows), out of line (v2_cg); rows it cannot take keep R2
       bool cg = false;
       if (K31_RARE(tier == 3) && s_tau < 0) {
-        cg = v2_cg<T>(p, rx, hist, msg, ckey, nc, tag, par, row, warp_sums, s_i);
+        // received CG lists: SMEM row words [7168, +W x 1024) (past rx, cslot, msg, win)
+        static_assert(kV2RxW + kV2Cand + kV2Msg + kV2Win <= 7168 &&
+                      7168 + kV2MaxW * 1024 <= V2Cfg<T>::kNR * T * 4);
+        cg = v2_cg<T>(p, rx, hist, msg, ckey, cpos, nc, tag, par, row, warp_sums, s_i,
+                      reinterpret_cast<uint32_t*>(srow) + 7168);
         if (cg) tier = s_tier;
       }
       if (tier == 3 && !cg) {
