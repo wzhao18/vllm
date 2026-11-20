@@ -876,18 +876,23 @@ def _diag_register(gemm, rows, n_pad, split, flags):
     prefix = os.environ.get("DMS_LU2_DUMP")
     if not prefix:
         return
-    if not _DIAG_PLANS:
-        import atexit
-
-        def dump():
-            out = []
-            for g, r, npad, sp, fl in _DIAG_PLANS:
-                out.append({"n": g.n, "k": g.k, "rows": r, "n_pad": npad, "split": sp, "flags": fl.cpu()})
-            rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
-            torch.save(out, f"{prefix}.r{rank}.pt")
-
-        atexit.register(dump)
     _DIAG_PLANS.append((gemm, rows, n_pad, split, flags))
+
+
+_DIAG_COUNT = [0]
+
+
+def _diag_dump():
+    """Eager (non-capturing) calls only: every plan's stamps hold its last graph replay."""
+    import os
+
+    out = []
+    for g, r, npad, sp, fl in _DIAG_PLANS:
+        out.append({"n": g.n, "k": g.k, "rows": r, "n_pad": npad, "split": sp, "flags": fl.cpu()})
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", str(torch.cuda.current_device())))
+    _DIAG_COUNT[0] += 1
+    if _DIAG_COUNT[0] % 23 == 1:  # once per eager pass (23 MoE layers)
+        torch.save(out, f"{os.environ['DMS_LU2_DUMP']}.r{rank}.c{_DIAG_COUNT[0]:05d}.pt")
 
 
 class PreparedWide:
@@ -962,6 +967,8 @@ class PreparedWide:
 
     def run(self, x, out):
         rows = x.shape[0]
+        if _DIAG_PLANS and not torch.cuda.is_current_stream_capturing():
+            _diag_dump()
         _, _, ws, flags = self.state[rows]
         stream = _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         y = out.view(-1, out.shape[-1])  # partials: [split, T, N] -> [split * T, N]
