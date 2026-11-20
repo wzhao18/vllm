@@ -112,6 +112,10 @@ class PrefillSharedSitu:
                         dtype=torch.bfloat16) * 0.5  # fmt: skip
         self._fake = mxfp8_e4m3_quantize(y, is_sf_swizzled_layout=True)
         del y
+        # SPIN (spin branch, never landed): B3's footprint without its work.
+        from . import b3spin
+
+        b3spin.spin_for_rows(rows)
 
     def fused(self, x):
         """down_proj's MXFP8 input for a prefill-sized batch, else None."""
@@ -139,6 +143,9 @@ class PrefillSharedSitu:
 
         fq, fs = self._fake
         assert rows <= fq.shape[0], rows
+        from . import b3spin
+
+        b3spin.spin_for_rows(rows)
         nsc = (rows + 127) // 128 * 128 * (self.inter // 32)
         return QuantizedActivation(
             data=fq[:rows],
