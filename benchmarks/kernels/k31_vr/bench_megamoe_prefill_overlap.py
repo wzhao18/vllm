@@ -78,6 +78,11 @@ def parse_args():
     p.add_argument("--profile-dir", default=None)
     p.add_argument("--json", default=None)
     p.add_argument(
+        "--placement", choices=("default", "no_fallback", "die_local"), default="default",
+        help="no_fallback: one cluster shape (no mixed-CGA fallback clusters); die_local: also stream each "
+        "die's experts from its own HBM (die_local.place_experts + the bucket's die_sm_mask32 schedule)",
+    )
+    p.add_argument(
         "--energy-seconds", type=float, default=0.0,
         help="after timing, replay back to back for ~this long (same count on every rank) and report "
         "NVML energy per replay (total and above the idle power measured just before), the SM clock "
@@ -281,8 +286,23 @@ def main():
             ),
             max_sm_count=cap,
         )
+        if args.placement != "default":
+            import dataclasses
+
+            from vllm.models.kimi_k3.nvidia.megamoe_rubin import die_local
+
+            mask = die_local.current_die_sm_mask32() if args.placement == "die_local" else None
+            if args.placement == "die_local" and mask is None:
+                raise RuntimeError("die_local placement needs a trusted die map on this device")
+            bucket = dataclasses.replace(
+                bucket,
+                knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
+                die_sm_mask32=mask,
+            )
         moe = RubinMegaMoE(problem, group, [bucket])
         weights = moe.prepare_weights(w13, s13, w2, s2, layer_id=0)
+        if args.placement == "die_local":
+            weights = die_local.place_experts(weights)
         moe.warmup(weights, ids_dtypes=(torch.int32,), weight_dtypes=(torch.float32,))
 
         def moe_calls():
@@ -356,7 +376,7 @@ def main():
             row = {
                 "mode": mode, "variant": args.variant, "grid_cap": cap, "sms": sms,
                 "tokens": T, "capacity": C,
-                "subcalls": nsub, "world": world, "routing": args.routing,
+                "subcalls": nsub, "world": world, "routing": args.routing, "placement": args.placement,
                 "num_experts": problem.num_experts,
                 "out_abs_sum": fp if mode != "shared" else None,
                 "out_pos_sum": pos if mode != "shared" else None, **res,
