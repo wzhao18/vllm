@@ -85,6 +85,15 @@ class PrefillSharedSitu:
             (rows * w.shape[1] // 32,), 127, dtype=torch.uint8, device=w.device
         )
         self._gemm(x, sx, mxfp8_act.Mxfp8Buffer(rows, self.inter, w.device))
+        # DIAGNOSTIC (measurement branch only, never landed): the step without
+        # the shared gate_up + SiTU family. The shared down_proj reads a fixed
+        # realistic MXFP8 activation (randn-scaled, no NaN codes) so its own
+        # energy and time stay as in the real step.
+        g = torch.Generator(device=w.device).manual_seed(0)
+        y = torch.randn((16384, self.inter), generator=g, device=w.device,
+                        dtype=torch.bfloat16) * 0.5  # fmt: skip
+        self._fake = mxfp8_e4m3_quantize(y, is_sf_swizzled_layout=True)
+        del y
 
     def fused(self, x):
         """down_proj's MXFP8 input for a prefill-sized batch, else None."""
@@ -101,9 +110,25 @@ class PrefillSharedSitu:
         rows = x_fp8.shape[0]
         if rows < mxfp8_act.SITU_FAST_MIN_ROWS:
             return None
-        out = mxfp8_act.Mxfp8Buffer(rows, self.inter, x_fp8.device)
-        gemm(x_fp8, x_scale.view(torch.uint8).reshape(-1), out)
-        return out.activation()
+        # DIAGNOSTIC: no gate_up GEMM / SiTU; the first `rows` rows of the
+        # fixed activation (128x4-swizzled scales: row blocks are contiguous).
+        from vllm.model_executor.layers.fusion.quant_activation import (
+            QuantizedActivation,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp8Dynamic,
+        )
+
+        fq, fs = self._fake
+        assert rows <= fq.shape[0], rows
+        nsc = (rows + 127) // 128 * 128 * (self.inter // 32)
+        return QuantizedActivation(
+            data=fq[:rows],
+            scale=fs.view(torch.uint8).reshape(-1)[:nsc],
+            orig_dtype=torch.bfloat16,
+            orig_shape=torch.Size((rows, self.inter)),
+            quant_key=kMxfp8Dynamic,
+        )
 
     def deinterleave(self, gate_up: torch.Tensor) -> torch.Tensor:
         """``[gate | up]`` of the cuBLASLt GEMM output on the interleaved rows."""
