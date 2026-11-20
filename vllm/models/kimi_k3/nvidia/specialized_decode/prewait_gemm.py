@@ -671,6 +671,162 @@ __global__ void __launch_bounds__(256, 4) wsf_k(const __grid_constant__ CUtensor
   if (warp == 4) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tbase), "r"(512) : "memory");
 }
 
+__device__ __forceinline__ uint32_t mapa_u32(uint32_t a, unsigned rank) {
+  uint32_t r; asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank)); return r;
+}
+__device__ __forceinline__ void tma3_2e(uint32_t dst, const CUtensorMap* m, int c0, int c1, int c2, uint32_t mbar_cl,
+                                        uint32_t mbar_local, unsigned tx) {  // completes on the pair leader's barrier
+  asm volatile("{.reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.and.b32 Q, %7, 0, P; "
+               "@Q mbarrier.arrive.expect_tx.shared::cta.b64 _, [%6], %7; "
+               "@P cp.async.bulk.tensor.3d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];}"
+               :: "r"(dst), "l"(m), "r"(c0), "r"(c1), "r"(c2), "r"(mbar_cl), "r"(mbar_local), "r"(tx) : "memory");
+}
+__device__ __forceinline__ void mma2_e(uint32_t d, uint64_t a, uint64_t b, unsigned id, unsigned acc) {
+  asm volatile("{.reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; @P tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, Q;}"
+               :: "r"(d), "l"(a), "l"(b), "r"(id), "r"(acc) : "memory");
+}
+__device__ __forceinline__ void commit2_e(uint32_t mb, unsigned short mask) {
+  asm volatile("{.reg .pred P; elect.sync _|P, 0xffffffff; @P tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;}"
+               :: "r"(mb), "h"(mask) : "memory");
+}
+
+// cta_group::2 pair form of the co-resident front: cluster 8 = 4 K-split CTAs x 2 pair members. A pair computes 256
+// weight rows (each CTA its own 128) x T tokens with M256 MMAs issued by the leader; each CTA loads HALF of the tokens'
+// activations (activation bytes per CTA halve vs the M128 form). A CTA's [128 rows x T] split-K partial is exchanged
+// with the 3 CTAs of the same pair rank (bulk DSMEM, owner sums in K-split order). Warps: 0-3 epilogue, 4 TMEM + MMA
+// (leader), 5 activations, 6-7 weights.
+template <int T>
+__global__ void __launch_bounds__(256, 4) wsp_k(const __grid_constant__ CUtensorMap xmap, const __grid_constant__ CUtensorMap wmap,
+                                                void* __restrict__ yv, const P p) {
+  constexpr int KS = 4, rpr = 32, RS = T + 4, TH = T / 2;
+  constexpr unsigned WB = 16384, XB = TH * 128, SB = WB + XB;
+  extern __shared__ __align__(1024) uint8_t smraw[];
+  uint8_t* sm = (uint8_t*)(((uintptr_t)smraw + 1023) & ~(uintptr_t)1023);
+  __shared__ __align__(8) uint64_t full[16], empty[16], accf, dep, rbar;
+  __shared__ uint32_t tbase;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const unsigned rank = crank(), pr = rank & 1u, ks = rank >> 1, lead = rank & ~1u;
+  const bool leader = pr == 0;
+  const unsigned short pmask = (unsigned short)(3u << lead);
+  const int rt = 2 * blockIdx.y + (int)pr;
+  const int kbt = p.K / 64, nst = kbt / KS, kb0 = (int)ks * nst;
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < p.NS; ++s) { mb_init(sa(&full[s]), 2); mb_init(sa(&empty[s]), 1); }
+    mb_init(sa(&accf), 1);
+    mb_init(sa(&dep), 1);
+    mb_init(sa(&rbar), 1);
+    mb_expect(sa(&rbar), (unsigned)((KS - 1) * rpr * RS * 4));
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  cluster_sync();  // the pair's loads complete on the leader's barriers; peers' bulk copies target rbar
+  const uint32_t full_cl = uni(mapa_u32(sa(&full[0]), lead)), full_l = uni(sa(&full[0]));
+  if (warp >= 6) {  // weights (never wait on the predecessor; paced until it ends)
+    const int wi = warp - 6;
+    const long long t0 = p.pace ? __shfl_sync(0xffffffffu, clk(), 0) : 0;
+    bool free_issue = p.pace == 0;
+    for (int i = wi; i < nst; i += 2) {
+      const int s = i % p.NS;
+      if (i >= p.NS) mb_wait(sa(&empty[s]), ((i / p.NS) - 1) & 1);
+      while (!free_issue) {
+        const unsigned d = mb_done(sa(&dep)) ? 1u : 0u;
+        const unsigned go = __shfl_sync(0xffffffffu, d | (clk() >= t0 + (long long)i * p.pace ? 2u : 0u), 0);
+        if (go) { free_issue = go & 1u; break; }
+        __nanosleep(64);
+      }
+      tma3_2e(uni(sa(sm + (size_t)s * SB)), &wmap, 0, 0, rt * kbt + kb0 + i, full_cl + 8 * s, full_l + 8 * s, leader ? 2 * WB : 0);
+    }
+  } else if (warp == 5) {  // this CTA's half of the tokens, after the dependency wait
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&dep)) : "memory");
+    for (int i = 0; i < nst; ++i) {
+      const int s = i % p.NS;
+      if (i >= p.NS) mb_wait(sa(&empty[s]), ((i / p.NS) - 1) & 1);
+      tma3_2e(uni(sa(sm + (size_t)s * SB + WB)), &xmap, 0, (int)pr * TH, kb0 + i, full_cl + 8 * s, full_l + 8 * s, leader ? 2 * XB : 0);
+    }
+  } else if (warp == 4) {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(sa(&tbase)), "r"(p.tcols) : "memory");
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+    asm volatile("tcgen05.fence::before_thread_sync;");
+    __syncwarp();
+    asm volatile("bar.arrive 1, 160;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    const uint32_t tm = uni(*(volatile uint32_t*)&tbase);
+    if (leader) {
+      for (int i = 0; i < nst; ++i) {
+        const int s = i % p.NS;
+        mb_wait(sa(&full[s]), (i / p.NS) & 1);
+        asm volatile("tcgen05.fence::after_thread_sync;");
+        const uint32_t ab = uni(sa(sm + (size_t)s * SB));
+        const uint64_t ad = sdesc(ab), bd = sdesc(ab + WB);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+          mma2_e(tm, ad + (uint64_t)((k * 32) >> 4), bd + (uint64_t)((k * 32) >> 4), p.idesc, (i > 0 || k > 0) ? 1u : 0u);
+        commit2_e(uni(sa(&empty[s])), pmask);
+      }
+      commit2_e(uni(sa(&accf)), pmask);
+    }
+  }
+  // ---- epilogue: this CTA's 128 rows; owner of rows [32 w, 32 w + 32) is K-split w of the same pair rank ----
+  float* recv = (float*)(sm + p.recv_off);  // [KS - 1 peers][rpr][RS]
+  float* stg = (float*)sm;                  // [KS owners][rpr][RS] (aliases the drained ring)
+  if (warp < 4) {
+    asm volatile("bar.sync 1, 160;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    const uint32_t tm = tbase;
+    mb_wait(sa(&accf), 0);
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    if (p.pdl && threadIdx.x == 0) asm volatile("griddepcontrol.launch_dependents;");
+    const int r = warp * 32 + lane;
+    const uint32_t ta = tm + ((uint32_t)(warp * 32) << 16);
+    float* mine = stg + ((size_t)warp * rpr + lane) * RS;
+#pragma unroll 1
+    for (int c0 = 0; c0 < T; c0 += 16) {
+      float v[16];
+      ld8nw(ta + c0, v); ld8nw(ta + c0 + 8, v + 8);
+      asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+#pragma unroll
+      for (int q = 0; q < 16; q += 4) *(float4*)&mine[c0 + q] = make_float4(v[q], v[q + 1], v[q + 2], v[q + 3]);
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncwarp();
+    if (warp != (int)ks && lane == 0) {
+      const unsigned idx = ks < (unsigned)warp ? ks : ks - 1;
+      const unsigned orank = 2u * warp + pr;
+      asm volatile("cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                   :: "r"(mapa_u32(sa(recv + (size_t)idx * rpr * RS), orank)), "r"(sa(stg + (size_t)warp * rpr * RS)),
+                      "r"((unsigned)(rpr * RS * 4)), "r"(mapa_u32(sa(&rbar), orank)) : "memory");
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+    asm volatile("bar.sync 2, 128;" ::: "memory");
+    mb_wait(sa(&rbar), 0);
+    constexpr int G = T / 4;
+    for (int e = threadIdx.x; e < rpr * G; e += 128) {
+      const int jr = e % rpr, g = e / rpr;
+      const int row = rt * 128 + (int)ks * rpr + jr;
+      float4 a;
+#pragma unroll
+      for (int src = 0; src < KS; ++src) {
+        const float* part = src == (int)ks ? stg + (size_t)ks * rpr * RS : recv + (size_t)(src < (int)ks ? src : src - 1) * rpr * RS;
+        const float4 b = *(const float4*)&part[(size_t)jr * RS + 4 * g];
+        if (src == 0) a = b;
+        else { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; }
+      }
+      if (row < p.N) {
+        stout(yv, (size_t)(4 * g) * p.N + row, a.x, p.out32);
+        stout(yv, (size_t)(4 * g + 1) * p.N + row, a.y, p.out32);
+        stout(yv, (size_t)(4 * g + 2) * p.N + row, a.z, p.out32);
+        stout(yv, (size_t)(4 * g + 3) * p.N + row, a.w, p.out32);
+      }
+    }
+    (void)r;
+    if (lane == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+  }
+  asm volatile("tcgen05.fence::before_thread_sync;");
+  __syncthreads();
+  if (warp == 4) asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tbase), "r"(p.tcols) : "memory");
+}
+
 
 namespace {
 typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
@@ -687,6 +843,7 @@ EncodeFn encode_fn() {
   return f;
 }
 typedef void (*KF)(CUtensorMap, const uint8_t*, void*, P);
+typedef void (*KF2)(CUtensorMap, CUtensorMap, void*, P);
 KF pick(int T, int KB, int C, int CR, int NT) {
   if (CR == 2) {  // full pre-wait weight residency, 6-CTA split-K cluster
     if (KB != 1 || C != 6) return nullptr;
@@ -722,7 +879,58 @@ void prewait_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tenso
   const bool o32 = out.scalar_type() == at::kFloat;
   TORCH_CHECK(o32 || out.scalar_type() == at::kBFloat16, "prewait_gemm: out bf16/fp32");
   const int RT = (N + 127) / 128;
-  TORCH_CHECK(wp.numel() * wp.element_size() == (int64_t)RT * 128 * K * 2, "prewait_gemm: packed weight size");
+  TORCH_CHECK(wp.numel() * wp.element_size() >= (int64_t)RT * 128 * K * 2, "prewait_gemm: packed weight size");
+  if (cr == 3) {  // cta_group::2 pair form (M256 per pair, half the tokens' activations per CTA)
+    TORCH_CHECK(C == 4 && KB == 1 && NW == 2 && XL == 1 && (T == 32 || T == 64 || T == 96) && K % 256 == 0 && NS <= 16,
+                "prewait_gemm: pair config");
+    const int RTp = (RT + 1) / 2 * 2;
+    TORCH_CHECK(wp.numel() * wp.element_size() >= (int64_t)RTp * 128 * K * 2, "prewait_gemm: pair form needs 256-row padding");
+    P p = {};
+    p.N = N; p.K = K; p.T = T; p.C = 4; p.KB = 1; p.NS = (int)NS; p.NW = 2; p.RT = RTp; p.pdl = 1; p.xlanes = 1;
+    p.out32 = o32; p.pace = pace;
+    const unsigned WB = 16384, XB = (unsigned)(T / 2) * 128, SB = WB + XB;
+    p.recv_off = (unsigned)NS * SB;
+    p.idesc = (1u << 4) | (1u << 7) | (1u << 10) | ((unsigned)(T >> 3) << 17) | ((unsigned)(256 >> 4) << 24);
+    unsigned tc = 32; while (tc < (unsigned)T) tc <<= 1; p.tcols = tc;
+    const size_t smem = (size_t)NS * SB + (size_t)3 * 32 * (T + 4) * 4 + 1024;
+    TORCH_CHECK((size_t)NS * SB >= (size_t)4 * 32 * (T + 4) * 4 && smem <= kCoresSmem, "prewait_gemm: pair smem ", smem);
+    KF2 kf = T == 96 ? wsp_k<96> : T == 64 ? wsp_k<64> : wsp_k<32>;
+    static thread_local KF2 seen2[4] = {};
+    bool ok = false;
+    for (KF2 f : seen2) ok |= f == kf;
+    if (!ok) {
+      int dev2; cudaGetDevice(&dev2);
+      int optin2; cudaDeviceGetAttribute(&optin2, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev2);
+      TORCH_CHECK(cudaFuncSetAttribute(kf, cudaFuncAttributeMaxDynamicSharedMemorySize, optin2 - 1024) == cudaSuccess, "attr");
+      cudaFuncAttributes fa;
+      TORCH_CHECK(cudaFuncGetAttributes(&fa, kf) == cudaSuccess && fa.numRegs <= kCoresRegs,
+                  "prewait_gemm: pair CTA registers ", fa.numRegs, " > ", kCoresRegs);
+      for (KF2& f : seen2) if (!f) { f = kf; break; }
+    }
+    CUtensorMap xm, wm;
+    {
+      cuuint64_t dims[3] = {64, (cuuint64_t)T, (cuuint64_t)K / 64}; cuuint64_t strides[2] = {(cuuint64_t)K * 2, 128};
+      cuuint32_t box[3] = {64, (cuuint32_t)(T / 2), 1}; cuuint32_t es[3] = {1, 1, 1};
+      TORCH_CHECK(encode_fn()(&xm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, (void*)x.data_ptr(), dims, strides, box, es,
+                              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS, "prewait_gemm: x map");
+      cuuint64_t wd[3] = {64, 128, (cuuint64_t)RTp * (K / 64)}; cuuint64_t wsd[2] = {128, 16384};
+      cuuint32_t wbox[3] = {64, 128, 1};
+      TORCH_CHECK(encode_fn()(&wm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, (void*)wp.data_ptr(), wd, wsd, wbox, es,
+                              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS, "prewait_gemm: w map");
+    }
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(8, RTp / 2); cfg.blockDim = dim3(256); cfg.dynamicSmemBytes = smem;
+    cfg.stream = c10::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute at[2];
+    at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = 8;
+    at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+    at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at; cfg.numAttrs = 2;
+    TORCH_CHECK(cudaLaunchKernelEx(&cfg, kf, xm, wm, out.data_ptr(), p) == cudaSuccess, "prewait_gemm: pair launch");
+    return;
+  }
   TORCH_CHECK((cr == 2 ? K % 64 == 0 && K / 64 / C > nt : K % (64 * C * KB) == 0) && NW <= NS && XL <= NS && NS <= (nt ? 16 : 8), "prewait_gemm: config");
   TORCH_CHECK(!nt || cr == 2 || (NW + XL == 3 && nsx >= 2 && nsx <= 16 && nt < K / 64 / C), "prewait_gemm: TMEM-staged config");
   KF kf = pick(T, (int)KB, (int)C, (int)cr, (int)nt);
@@ -806,6 +1014,9 @@ TMEM_CONFIGS = {32: (4, 1, 8, 2, 1, 960, 1, 15, 8), 64: (4, 1, 6, 2, 1, 960, 1, 
 # Full pre-wait weight residency (CR 2): 6-CTA split-K cluster (210 CTAs), NT K-blocks per CTA in TMEM, the rest in a
 # pool of NS 16 KiB slots that turns into the activation ring after the PDL wait.
 FULL_CONFIGS = {32: (6, 1, 12, 2, 1, 0, 2, 15, 0), 64: (6, 1, 11, 2, 1, 0, 2, 14, 0), 96: (6, 1, 10, 2, 1, 0, 2, 12, 0)}
+# cta_group::2 pair form (CR 3): 8-CTA clusters (2 pair members x 4 K-splits), NS ring stages of 16 KiB weights + half
+# the tokens' activations.
+PAIR_CONFIGS = {32: (4, 1, 11, 2, 1, 1440, 3, 0, 0), 64: (4, 1, 9, 2, 1, 1440, 3, 0, 0), 96: (4, 1, 8, 2, 1, 1440, 3, 0, 0)}
 
 
 def _module():
@@ -852,7 +1063,7 @@ def pack_weight(w: torch.Tensor) -> torch.Tensor:
     128-byte swizzle (16-byte chunk c of row r stored at chunk c ^ (r % 8)); rows >= N are zero."""
     n, k = w.shape
     assert w.dtype == torch.bfloat16 and k % 64 == 0
-    rt = (n + 127) // 128
+    rt = (n + 255) // 256 * 2  # whole 256-row pairs (the pair form reads both tiles of a pair)
     if rt * 128 != n:
         w = torch.cat([w, w.new_zeros(rt * 128 - n, k)])
     t = w.reshape(rt, 128, k // 64, 8, 8).permute(0, 2, 1, 3, 4)  # [rt, kb, r, c, e]
