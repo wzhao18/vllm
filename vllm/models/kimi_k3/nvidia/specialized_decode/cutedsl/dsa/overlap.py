@@ -92,7 +92,7 @@ QUERY_OVERLAP_UNFUSED = "1:front,2-9:serial,10:front,11-320:fork"
 # CUDA-graph step vs none, ms): 128 rows -0.22, 208 rows -0.21; at 256 rows the
 # QueryWait end is the join (1-node SP DSA block, chain: -19..+0.3 us/layer; step,
 # wq_b through the logits only on the stream: +0.20 ms), so 209- runs without it.
-INDEX_PRIORITY = {"sp": "17-208:chain"}
+INDEX_PRIORITY = {"sp": "17-:chain"}
 MODES = ("serial", "fork", "wait", "front", "late", "late_front")
 LATE = ("late", "late_front")  # TP with the fused indexer only (else: fork, front)
 NORM = ("fork", "late")  # QueryNorm writes the q_c rows
