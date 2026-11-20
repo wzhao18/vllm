@@ -250,7 +250,7 @@ class GenphaseTokenComm(KernelComponent):
     # the first is being read out of SMEM, which matters because the wire is the
     # long pole; the slot index and mbarrier phase stay compile-time constants
     # because the token loop is fully unrolled.
-    pusher_pipeline_depth: ClassVar[int] = 2
+    pusher_pipeline_depth: ClassVar[int] = 4
     # Named barrier ids the refine groups synchronize on. Barrier 0 belongs to the
     # block-wide `sync_threads`, so the groups start at 1.
     refine_barrier_base: ClassVar[int] = 1

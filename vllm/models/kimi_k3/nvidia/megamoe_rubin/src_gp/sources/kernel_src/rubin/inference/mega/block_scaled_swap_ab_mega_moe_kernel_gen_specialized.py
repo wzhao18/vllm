@@ -151,7 +151,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     largest_die_sm_count: ClassVar[int] = 112  # upper bound on the SM count of one die
 
     # Reserve resident capacity for the communication grid beside compute clusters.
-    pusher_cta_count: ClassVar[int] = 27
+    pusher_cta_count: ClassVar[int] = 43
     refine_participant_groups: ClassVar[int] = 2
     refine_output_stages: ClassVar[int] = 4
 
