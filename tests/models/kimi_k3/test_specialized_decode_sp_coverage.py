@@ -103,9 +103,15 @@ class Fakes:
             def __init__(self, group, device, tp, rank, *, width, rows_cap):
                 fakes.events.add("SpFinalGather", tp, rank, width, rows_cap)
                 self.width, self.rows_cap, self.prepared = width, rows_cap, []
+                self.pushes = []
 
-            def prepare(self, rows):
-                self.prepared.append(rows)
+            def prepare(self, rows, cols=(0,), widths=None):
+                if widths is None:
+                    self.prepared.append(rows)
+
+            def prepare_push(self, rows, col, width):
+                assert 0 < col < self.width and width < self.width, (col, width)
+                self.pushes.append((rows, col))
 
         def boundary(decoder, comm, block, rows, mlp=None):
             assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
@@ -146,7 +152,7 @@ class Fakes:
         class KdaCore(Provider):
             family = "kda"
 
-            def __init__(self, attention, rows, *, records, ctx):
+            def __init__(self, attention, rows, *, records, ctx, mx_out=False):
                 if "kda" in fakes.raises:
                     raise fakes.raises["kda"]
                 super().__init__(rows, fakes.gaps.get("kda", ()))
@@ -316,6 +322,8 @@ def fakes(monkeypatch):
         monkeypatch.setattr(
             torch.accelerator, "device_index", lambda index: contextlib.nullcontext()
         )
+        # the early aux gather's side stream (meta device: no CUDA stream)
+        monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: SimpleNamespace())
         return made, events
 
     return install
@@ -326,6 +334,9 @@ def runtime(layers=None, rows=ROWS, ctx=None, **backbone):
         use_sequence_parallel=True,
         use_attn_res=True,
         aux_hidden_state_layers=(2, 5),
+        embed_tokens=None,  # no vocab shard: SpEmbedScatter declines (stock embedding)
+        _aux_attn_res_stream=False,
+        start_layer=0,
     )
     stock.update(backbone)
     if layers is None:
@@ -391,6 +402,10 @@ def test_collective_build_order_and_parities(fakes):
     assert events[0] == ("SpComm", TP, 0, WIDTH, 512)
     assert events[1] == ("SpFinalGather", TP, 0, 3 * WIDTH, 512)
     assert step.final_gather.prepared == list(ROWS)
+    # prefix-only capture: aux layers 2 and 5 push their columns early, per row
+    assert sorted(step.final_gather.pushes) == sorted(
+        (r, WIDTH * (1 + k)) for r in ROWS for k in range(2)
+    )
     assert events[2] == ("sp_dsa_box", HEADS, 512, 1)
     assert events[4] == ("prepare_recoverssm", True)  # deferred (the cores fold)
     cores = [e for e in events if e[0] in ("SpDsaCore", "SpKdaCore")]
@@ -659,7 +674,8 @@ def sp_decode(fakes, monkeypatch):
     backbone = SimpleNamespace(
         layers=layers, start_layer=0, end_layer=len(layers),
         aux_hidden_state_layers=(2, 5), config=SimpleNamespace(num_attention_heads=96),
-        use_sequence_parallel=True, use_attn_res=True,
+        use_sequence_parallel=True, use_attn_res=True, _aux_attn_res_stream=False,
+        embed_tokens=None,
     )  # fmt: skip
     config = DecodeConfig(
         max_context=1 << 20, mla_core="auto", dsa_core="auto", dcp=TP, q=Q,
