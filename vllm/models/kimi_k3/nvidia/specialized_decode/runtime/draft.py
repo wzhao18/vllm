@@ -325,6 +325,21 @@ class DraftProjectionMethod:
         return getattr(self.base, name)
 
 
+def check_draft_formats(model):
+    """The drafter weights the specialized drafter reads raw: the Markov head's two
+    BF16 tables (the fused Markov kernels). (Its split-K projections refuse non-BF16
+    weights in ``PreparedProjection``; the context projection in ``PreparedContext``.)
+    Refuses at build instead of programming other bytes as BF16."""
+    head = getattr(model.model, "markov_head", None)
+    for name in ("markov_w1", "markov_w2"):
+        table = getattr(getattr(head, name, None), "weight", None)
+        if table is not None and table.dtype != torch.bfloat16:
+            raise ValueError(
+                f"Kimi K3 specialized drafter needs a BF16 Markov head, got {name} "
+                f"{table.dtype}"
+            )
+
+
 def tabled_shapes(tp):
     """Every (N, K) some split-K table of ``tp`` lists (any row bin)."""
     shapes = set(PROJECTIONS.get(tp, {}))
@@ -516,6 +531,7 @@ class DraftFastPath:
             return None
         from vllm.distributed import get_tp_group
 
+        check_draft_formats(model)
         group = get_tp_group()
         tp, rank = group.world_size, group.rank_in_group
         steps = spec.num_speculative_tokens
@@ -1643,6 +1659,7 @@ class GqaDraftFastPath(DraftFastPath):
 
         from . import sp_topology
 
+        check_draft_formats(model)
         group = get_tp_group()
         tp, rank = group.world_size, group.rank_in_group
         steps = spec.num_speculative_tokens

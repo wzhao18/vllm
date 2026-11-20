@@ -381,7 +381,10 @@ class PreparedContext:
         # NQ-NOFALLBACK: set by runtime.draft on the target topology: a captured
         # context step of a served row runs these kernels or raises.
         self.strict = False
-        weight = model.context_proj.weight
+        from ...runtime.providers import bf16_weight
+
+        # (refuses a quantized context projection: these kernels read BF16 rows)
+        weight = bf16_weight(model.context_proj)
         shard = weight.shape[0] // tp
         self.shard = weight.detach()[rank * shard : (rank + 1) * shard]
         self.gamma = model.context_norm.weight.detach()
