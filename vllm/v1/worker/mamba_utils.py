@@ -49,6 +49,36 @@ def _align_temporal_tiles(num_reqs: int, num_states: int) -> int:
     return tiles
 
 
+# (kernel, num_states, constexpr flags) whose TEMPORAL_TILES variants are compiled.
+_ALIGN_TILE_VARIANTS: set[tuple] = set()
+
+
+def _launch_align_kernel(
+    kernel, num_reqs: int, num_states: int, args: tuple, kwargs: dict
+) -> None:
+    """Launch a V2 align kernel on a (num_reqs, num_states, tiles) grid.
+
+    TEMPORAL_TILES depends on num_reqs (_align_temporal_tiles), so warmup steps
+    with large batches would leave the few-request variants to the first serving
+    step. The first launch of each specialization therefore compiles every
+    variant a batch of 1..N requests can pick.
+    """
+    flags = tuple(
+        sorted((k, v) for k, v in kwargs.items() if isinstance(v, (bool, int, str)))
+    )
+    key = (id(kernel), num_states, flags)
+    if key not in _ALIGN_TILE_VARIANTS:
+        _ALIGN_TILE_VARIANTS.add(key)
+        tiles = _align_temporal_tiles(1, num_states)
+        while tiles >= 1:
+            kernel.warmup(
+                *args, grid=(1, num_states, tiles), TEMPORAL_TILES=tiles, **kwargs
+            )
+            tiles //= 2
+    tiles = _align_temporal_tiles(num_reqs, num_states)
+    kernel[(num_reqs, num_states, tiles)](*args, TEMPORAL_TILES=tiles, **kwargs)
+
+
 @triton.jit(do_not_specialize=["num_requests"])
 def get_aligned_state_indices_multi_group_kernel(
     block_table_ptrs_ptr,
@@ -1268,29 +1298,33 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_states
-        tiles = _align_temporal_tiles(num_reqs, total_states)
-        grid = (num_reqs, total_states, tiles)
-        precopy_mamba_align_fused_kernel[grid](
-            state_idx_gpu,
-            src_col_gpu,
-            token_bias_gpu,
-            self.block_table_ptrs,
-            self.block_table_stride_req,
-            self.state_base_addrs,
-            self.state_block_strides,
-            self.state_elem_sizes,
-            self.state_inner_sizes,
-            self.state_conv_widths,
-            self.state_group_indices,
-            self.state_dim_row_count,
-            self.state_dim_row_stride,
-            idx_mapping,
+        _launch_align_kernel(
+            precopy_mamba_align_fused_kernel,
             num_reqs,
-            COPY_BLOCK_SIZE=1024,
-            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
-            HAS_IDX_MAPPING=idx_mapping is not None,
-            TEMPORAL_TILES=tiles,
-            launch_pdl=current_platform.is_arch_support_pdl(),
+            total_states,
+            (
+                state_idx_gpu,
+                src_col_gpu,
+                token_bias_gpu,
+                self.block_table_ptrs,
+                self.block_table_stride_req,
+                self.state_base_addrs,
+                self.state_block_strides,
+                self.state_elem_sizes,
+                self.state_inner_sizes,
+                self.state_conv_widths,
+                self.state_group_indices,
+                self.state_dim_row_count,
+                self.state_dim_row_stride,
+                idx_mapping,
+                num_reqs,
+            ),
+            dict(
+                COPY_BLOCK_SIZE=1024,
+                CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+                HAS_IDX_MAPPING=idx_mapping is not None,
+                launch_pdl=current_platform.is_arch_support_pdl(),
+            ),
         )
 
     def run_fused_postprocess_align(
@@ -1325,36 +1359,40 @@ class MambaSpecDecodeGPUContext:
             num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
         total_states = self.num_states
-        tiles = _align_temporal_tiles(num_reqs, total_states)
-        grid = (num_reqs, total_states, tiles)
-        postprocess_mamba_fused_kernel[grid](
-            num_accepted_tokens_snapshot,
-            state_idx_gpu,
-            None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
-            new_num_computed_tokens_gpu,
-            None,  # num_draft: unused under PRECOMPUTED_NEW_COMPUTED
-            self.block_table_ptrs,
-            self.block_table_stride_req,
-            self.state_base_addrs,
-            self.state_block_strides,
-            self.state_elem_sizes,
-            self.state_inner_sizes,
-            self.state_conv_widths,
-            self.state_group_indices,
-            self.state_dim_row_count,
-            self.state_dim_row_stride,
-            num_accepted_tokens_gpu,
-            idx_mapping,
+        _launch_align_kernel(
+            postprocess_mamba_fused_kernel,
             num_reqs,
-            block_size=self.block_size,
-            COPY_BLOCK_SIZE=1024,
-            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
-            HAS_IDX_MAPPING=True,
-            PRECOMPUTED_NEW_COMPUTED=True,
-            TEMPORAL_TILES=tiles,
-            launch_pdl=current_platform.is_arch_support_pdl(),
-            num_sampled_ptr=num_sampled,
-            FROM_NUM_SAMPLED=num_sampled is not None,
+            total_states,
+            (
+                num_accepted_tokens_snapshot,
+                state_idx_gpu,
+                None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
+                new_num_computed_tokens_gpu,
+                None,  # num_draft: unused under PRECOMPUTED_NEW_COMPUTED
+                self.block_table_ptrs,
+                self.block_table_stride_req,
+                self.state_base_addrs,
+                self.state_block_strides,
+                self.state_elem_sizes,
+                self.state_inner_sizes,
+                self.state_conv_widths,
+                self.state_group_indices,
+                self.state_dim_row_count,
+                self.state_dim_row_stride,
+                num_accepted_tokens_gpu,
+                idx_mapping,
+                num_reqs,
+            ),
+            dict(
+                block_size=self.block_size,
+                COPY_BLOCK_SIZE=1024,
+                CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+                HAS_IDX_MAPPING=True,
+                PRECOMPUTED_NEW_COMPUTED=True,
+                launch_pdl=current_platform.is_arch_support_pdl(),
+                num_sampled_ptr=num_sampled,
+                FROM_NUM_SAMPLED=num_sampled is not None,
+            ),
         )
 
 
