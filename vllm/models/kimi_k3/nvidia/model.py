@@ -129,9 +129,14 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_dielocal as prefill_attn_res_dielocal,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_mxfp8 as prefill_attn_res_mxfp8,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+
+
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -152,6 +157,23 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
 
     from .specialized_decode.runtime.decode import SpecializedDecode
+
+
+def _attn_res(
+    prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor,
+    *args, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AttnRes with a BF16 output -> (output, updated prefix): the specialized
+    prefill kernel on prefill chunks (bit-identical to the native kernel; the
+    prefix moves to the die-local prefix buffer), the native one otherwise."""
+    if prefill_attn_res_mxfp8.use_for(prefix):
+        prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
+        out = prefill_attn_res_mxfp8.attn_res_bf16(
+            prefix, delta, blocks, *args, prefix_out=prefix_out, **kwargs
+        )
+        return out, prefix if prefix_out is None else prefix_out
+    return attn_res(prefix, delta, blocks, *args, **kwargs), prefix
+
 
 logger = init_logger(__name__)
 
@@ -1557,7 +1579,7 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         assert residual is not None
-        hidden_states = attn_res(
+        hidden_states, prefix_sum = _attn_res(
             prefix_sum,
             hidden_states,
             residual,
@@ -1594,7 +1616,7 @@ class KimiDecoderLayer(nn.Module):
         else:
             prefix_delta = hidden_states
         mlp_valid_blocks = self.prev_valid_blocks + self.is_block_write_layer
-        hidden_states = attn_res(
+        hidden_states, prefix_sum = _attn_res(
             prefix_sum,
             prefix_delta,
             residual,
@@ -1620,9 +1642,9 @@ class KimiDecoderLayer(nn.Module):
         if pre_mxfp8:
             # Prefill: the AttnRes writes the KDA in_proj's MXFP8 input (its
             # only consumer) instead of BF16.
-            hidden_states = self._attn_res_mxfp8(
+            _, hidden_states, prefix_sum = self._attn_res_mxfp8(
                 prefix_sum, hidden_states, residual, pre=True
-            )[1]
+            )
         else:
             hidden_states, prefix_sum, residual = self._pre_attn_norm(
                 hidden_states, residual, prefix_sum
@@ -1651,7 +1673,7 @@ class KimiDecoderLayer(nn.Module):
                 if _gemm_ar_owns(hidden_states):
                     hidden_states = hidden_states.clone()
                 prefix_sum = hidden_states
-            hidden_states, shared_mxfp8 = self._attn_res_mxfp8(
+            hidden_states, shared_mxfp8, prefix_sum = self._attn_res_mxfp8(
                 prefix_sum, hidden_states, residual, pre=False
             )
             hidden_states = self.mlp(hidden_states, shared_mxfp8_input=shared_mxfp8)
@@ -1707,8 +1729,10 @@ class KimiDecoderLayer(nn.Module):
     ):
         """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
         the MXFP8 output (BF16 output only after attention)."""
+        prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
+        new_prefix = prefix_sum if prefix_out is None else prefix_out
         if pre:
-            return prefill_attn_res_mxfp8.attn_res_mxfp8(
+            out, qa = prefill_attn_res_mxfp8.attn_res_mxfp8(
                 prefix_sum,
                 hidden_states,
                 residual,
@@ -1722,9 +1746,11 @@ class KimiDecoderLayer(nn.Module):
                 eps=self.self_attention_res_norm.variance_epsilon,
                 output_norm_eps=self.input_layernorm.variance_epsilon,
                 bf16_out=False,
+                prefix_out=prefix_out,
             )
+            return out, qa, new_prefix
         prefix_delta = None if self.is_block_write_layer else hidden_states
-        return prefill_attn_res_mxfp8.attn_res_mxfp8(
+        out, qa = prefill_attn_res_mxfp8.attn_res_mxfp8(
             prefix_sum,
             prefix_delta,
             residual,
@@ -1736,7 +1762,9 @@ class KimiDecoderLayer(nn.Module):
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
             bf16_out=True,
+            prefix_out=prefix_out,
         )
+        return out, qa, new_prefix
 
 
 # (param_name, shard_name, shard_id) for the merged DSA wkv_index.
@@ -2043,11 +2071,18 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         prefix_sum = None
         if self.use_attn_res:
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.num_attn_res_blocks,
-                hidden_states.size(1),
-            )
+            block_residual = None
+            if residual is None and prefill_attn_res_mxfp8.use_for(hidden_states):
+                # Prefill: block rows homed per die for die-local AttnRes reads.
+                block_residual = prefill_attn_res_dielocal.block_residual(
+                    hidden_states, self.num_attn_res_blocks
+                )
+            if block_residual is None:
+                block_residual = hidden_states.new_empty(
+                    hidden_states.size(0),
+                    self.num_attn_res_blocks,
+                    hidden_states.size(1),
+                )
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
             prefix_sum = hidden_states
@@ -2095,7 +2130,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         if self.use_attn_res:
             assert prefix_sum is not None
-            hidden_states = attn_res(
+            hidden_states, _ = _attn_res(
                 prefix_sum,
                 hidden_states,
                 residual,
