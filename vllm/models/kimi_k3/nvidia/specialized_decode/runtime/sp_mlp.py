@@ -257,8 +257,9 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
+                # The weight bytes past each CTA's ring are prefetched into L2 at entry (prefetch_rest).
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], self.parts, partials=True
+                    weights["latent_up"], self.parts, partials=True, prefetch_rest=True
                 ).prepare()
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:

@@ -32,7 +32,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from ..common.primitives import asm, div_rn
+from ..common.primitives import asm, div_rn, prefetch_bytes
 
 CHUNK = 16  # token columns per exchange chunk (one tcgen05.ld 32x32b.x16)
 K_TILE = 64  # K per ring stage (one 128-byte swizzle atom)
@@ -290,7 +290,7 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False):  # fmt: skip
+                 partials=False, prefetch_rest=False):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
@@ -303,6 +303,10 @@ class WideGemm:
         # partial in rows [s T, (s + 1) T) (the consumer sums them in split order).
         self.partials = partials
         assert not (partials and (silu or direct)), (partials, silu, direct)
+        # ``prefetch_rest``: an idle epilogue warp bulk-prefetches into L2, at entry, the weight bytes of this CTA's
+        # split that do not fit the ring (they are otherwise read from HBM only once the MMA frees ring stages after
+        # the PDL wait: the last stage then lands ~1.75 us after its issue, the latent up's post-wait body).
+        self.prefetch_rest = bool(prefetch_rest) and not rotate
         self.weight_warps = tuple(sorted(weight_warps))
         assert self.weight_warps[:2] == (0, 3) and set(weight_warps) <= set(WEIGHT_WARPS)
         assert not set(self.weight_warps) & set(self.act_warps), (weight_warps, act_warps)
@@ -372,7 +376,7 @@ class WideGemm:
         self.storage = Storage
         self.kernel(
             tiled_mma, tma_a, tma_w, tma_b, tma_x, cluster_vmnk, a_layout, b_layout,
-            y, ws, flags,
+            y, ws, flags, w.iterator.toint(),
         ).launch(  # fmt: skip
             grid=(2 * (self.n_pad // 256), self.split, 1),
             block=[self.threads, 1, 1],
@@ -386,7 +390,7 @@ class WideGemm:
         self, tiled_mma: cute.TiledMma, tma_a: cute.CopyAtom, mW: cute.Tensor,
         tma_b: cute.CopyAtom, mX: cute.Tensor, cluster_vmnk: cute.Layout,
         a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
-        mY: cute.Tensor, mWs: cute.Tensor, mFlags: cute.Tensor,
+        mY: cute.Tensor, mWs: cute.Tensor, mFlags: cute.Tensor, w_addr: Int64,
     ):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
@@ -521,6 +525,16 @@ class WideGemm:
                 with cute.arch.elect_one():
                     tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
         elif warp >= 4:
+            if cutlass.const_expr(self.prefetch_rest):
+                if warp == 5:
+                    # This CTA's 128 weight rows (its half of the pair's 256), the K tiles past the ring.
+                    rest = (k_count - Int32(self.wstages)) * Int32(K_TILE * 2)
+                    if rest > Int32(0):
+                        col = Int64(k0 + Int32(self.wstages)) * Int64(K_TILE * 2)
+                        for i in cutlass.range_constexpr(4):
+                            row = pair * Int32(256) + v * Int32(128) + lane + Int32(32 * i)
+                            if row < Int32(self.n):
+                                prefetch_bytes(w_addr + Int64(row) * Int64(self.k * 2) + col, rest)
             if warp == 4:
                 cute.arch.alloc_tmem(self.tmem_cols, tmem_holder, is_two_cta=True)
             cute.arch.barrier(barrier_id=1, number_of_threads=32 * 5)
@@ -870,8 +884,9 @@ class PreparedWide:
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
     [T, N / 2] with ``silu``)."""
 
-    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False):
+    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False, prefetch_rest=False):
         self.silu, self.out_f32, self.partials = silu, out_f32 or partials, partials
+        self.prefetch_rest = bool(prefetch_rest)  # see ``WideGemm``
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
@@ -890,7 +905,7 @@ class PreparedWide:
         for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials,
+                w_warps, direct, rotate, self.partials, self.prefetch_rest,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -910,7 +925,7 @@ class PreparedWide:
                 device=dev,
             )
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
-            key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
+            key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials, self.prefetch_rest)
             key += self.policies[rows]
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
