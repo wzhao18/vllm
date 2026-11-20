@@ -37,6 +37,10 @@ def _bits(t):
         (4096, 768),
         (2048, 6144),  # hybrid-SP replicated shared expert
         (16384, 384),
+        (192, 1536),  # narrow decode rows: still the stock module
+        (128, 2048),  # wide rows: the vectorized kernel at decode sizes too
+        (128, 8448),  # dense layer, TP4 rank, r8
+        (32, 16896),
     ],
 )
 def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
@@ -49,9 +53,11 @@ def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
     x = torch.randn(rows, 2 * cols, generator=g, device="cuda") * 6
     x[0, :8] = torch.tensor([0.0, -0.0, 1e-30, -1e-30, 60.0, -60.0, 3e4, -3e4])
     x = x.to(torch.bfloat16)
-    small = rows * cols < KimiVecSituAndMul._VEC_MIN_OUT_ELEMS
     with set_current_vllm_config(VllmConfig()):
         module = KimiVecSituAndMul(beta=beta, linear_beta=linear_beta)
+    wide = cols >= KimiVecSituAndMul._VEC_MIN_COLS and module._small_is_cuda_op
+    small = not wide and rows * cols < KimiVecSituAndMul._VEC_MIN_OUT_ELEMS
+    with set_current_vllm_config(VllmConfig()):
         ours = module(x)
         stock = SituAndMul(beta=beta, linear_beta=linear_beta)
         dispatched, cuda_op = stock(x), stock.forward_cuda(x)

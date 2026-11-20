@@ -368,9 +368,18 @@ class KimiVecSituAndMul(nn.Module):
     SituAndMul module itself, through its own dispatch; the vectorized kernel is
     bitwise its CUDA op (forward_cuda). Where the custom op dispatches to
     forward_native instead, the large inputs keep the CUDA op's bits (the same FP32
-    math, one BF16 rounding)."""
+    math, one BF16 rounding).
+
+    Wide rows (>= _VEC_MIN_COLS output columns: the dense layer's 8448 columns
+    per TP4 rank) take the vectorized kernel at every row count whenever the
+    stock module dispatches to the CUDA op, so the bits stay the stock module's
+    (VR200 1 GPU, CUDA graph, us stock -> vectorized: 128 x 8448 4.11 -> 2.99,
+    32 x 16896 6.10 -> 2.29; at 768 columns the CUDA op stays ahead up to 192
+    rows, 1.74 vs 2.08). In-step the dense layer's r8 call was 14.6 us on the
+    CUDA op (int12 slice profile) vs 5.1 / 6.8 us vectorized at r16 / r24."""
 
     _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
+    _VEC_MIN_COLS = 2048
 
     def __init__(self, beta: float, linear_beta: float | None):
         super().__init__()
@@ -380,9 +389,14 @@ class KimiVecSituAndMul(nn.Module):
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import warmup
 
         warmup()  # build / load the JIT extension at model init, not mid-step
+        # Bound-method equality: the stock module runs its CUDA op (the bits the
+        # vectorized kernel reproduces) rather than forward_native.
+        self._small_is_cuda_op = self.small._forward_method == self.small.forward_cuda
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.numel() // 2 < self._VEC_MIN_OUT_ELEMS:
+        cols = x.shape[-1] // 2
+        wide = cols >= self._VEC_MIN_COLS and self._small_is_cuda_op
+        if not wide and x.numel() // 2 < self._VEC_MIN_OUT_ELEMS:
             return self.small(x)
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
 
