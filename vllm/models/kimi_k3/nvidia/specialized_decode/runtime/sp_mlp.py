@@ -66,12 +66,12 @@ SHARED = ("shared_gu", "shared_down")
 # -68.5 (another node), r24 unchanged. n96 (64.96.2.5; 1 GPU 11.58 us vs ~9.9 for the
 # router || latent down pair, but in-step the concat also moves r24 onto route_stage):
 # r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
-ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-95:64.96.2.5,96:wide"}
-# ``wide`` rows run the token-wide 2-CTA GEMM (``gemm.wide``; weights requested
-# before the PDL wait, staggered K walk per CTA pair) and leave FP32 split partials
-# [split, n, N] that route_stage sums in split order. WideGemm policy per rows:
-# (split, activation warps, weight stages, weight warps, direct exchange, rotate);
-# n96: 18 tiles x 2 CTAs x 5 splits = 180 CTAs.
+ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# ``wide`` rows (none by default) run the token-wide 2-CTA GEMM (``gemm.wide``;
+# weights requested before the PDL wait) and leave FP32 split partials [split, n, N]
+# that route_stage sums in split order. In-step at n96 (r24, fastab ex3wf1) it ties
+# the split-K kernel (-2.9 us per step, CI 33). WideGemm policy per rows: (split,
+# activation warps, weight stages, weight warps, direct exchange, rotate).
 WIDE_FRONT = {96: (5, (1,), None, (0, 3), False, True)}
 # Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
 # PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
@@ -88,6 +88,10 @@ PREWAIT_ROWS = (64,)
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
+# WideGemm policy after the split (activation warps, weight stages, weight warps,
+# direct exchange, rotate, ring KiB, K per stage). 1 GPU after a 4 us predecessor
+# (us per call, striped K64 -> die-static K128): n32 4.84 -> 4.15, n96 5.80 -> 5.55.
+LATENT_UP_WIDE = ((1,), None, (0, 3), False, False, None, 128)
 
 
 class SplitKFront:
@@ -288,9 +292,13 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
+                # Die-static work on die-placed weights, two TMA boxes (K 128) per
+                # ring stage (LATENT_UP_WIDE); the stock up_proj reads the placed copy.
+                policies = {r: (s,) + LATENT_UP_WIDE for r, s in self.parts.items()}
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], self.parts, partials=True
+                    weights["latent_up"], policies, partials=True, dies=True
                 ).prepare()
+                transform.up_proj.weight.data = self.latent_up_parts.weight
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n
