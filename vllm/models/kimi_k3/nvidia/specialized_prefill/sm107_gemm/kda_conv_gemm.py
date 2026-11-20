@@ -64,6 +64,15 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.conv_math_smsp23 = "c23" in flags
         self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 0
         self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
+        # Block-boundary conv rows in the epilogue (flags + side rows); the
+        # microbench column-pass variants keep the block fix-up.
+        self.conv_halo = (
+            self.conv_t2
+            and not norms
+            and self.conv_loop_unroll == 0
+            and not self.conv_math_smsp23
+            and self.conv_probe == 0
+        )
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
@@ -208,6 +217,12 @@ class KdaConvGemm:
         self._t2 = self.drain and "ct1" not in flags and not any(
             f.startswith("cskel") for f in flags
         )
+        self._halo = self._t2 and not any(
+            f.startswith("lp") or f in ("c23", "nolds", "nost") for f in flags
+        )
+        # Per-(128-row block, N tile) halo flags; self-cleaning (each set flag
+        # has one reader, which clears it), so they are zeroed only here.
+        self._flags = torch.zeros(0, dtype=torch.int32, device=weight_nk.device)
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = {}
 
@@ -268,6 +283,12 @@ class KdaConvGemm:
             cutlass.Int32(top),
             cutlass.Int32(nsteps),
         )
+        halo = self._halo and not with_norms
+        if halo:
+            need = ((m + 127) // 128) * (self.n // self.tactic[0][1])
+            if self._flags.numel() < need:
+                self._flags = torch.zeros(need, dtype=torch.int32, device=dev)
+        conv = (*conv, cutlass.Int64(self._flags.data_ptr() if halo else 0))
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)
         args = (*args, from_dlpack(self.alpha))
@@ -275,7 +296,7 @@ class KdaConvGemm:
         fn(*args, problem, stream, *tail, cutlass.Int64(0), cutlass.Int64(0), *conv)
         conv_fixup(
             out, side, norms, self.conv_w, conv_state, qsl, lines, has_init,
-            self.p, null_block_id,
+            self.p, null_block_id, blocks=not halo,
         )  # fmt: skip
         return out, norms
 

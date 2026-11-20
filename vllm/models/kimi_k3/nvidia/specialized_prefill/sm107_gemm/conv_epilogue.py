@@ -1196,6 +1196,59 @@ _ONE2 = 0x3F8000003F800000
 _D_EXACT = 0x7E800000
 
 
+@dsl_user_op
+def red_release_add1(addr: Int64, pred: Int32, *, loc=None, ip=None) -> None:
+    """``pred``: GPU-scope release increment of the u32 flag at ``addr``."""
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip)],
+        "{ .reg .pred p; setp.ne.s32 p, $1, 0; "
+        "@p red.release.gpu.global.add.u32 [$0], 1; }",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def wait_flag3(addr: Int64, pred: Int32, reset: Int32, *, loc=None, ip=None) -> None:
+    """``pred``: spin (GPU-scope acquire) until the u32 flag at ``addr`` is 3;
+    ``reset`` then clears it for the next launch (one reader per flag)."""
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip), _v(reset, Int32, loc, ip)],
+        "{ .reg .pred p, q; .reg .b32 v; setp.ne.s32 p, $1, 0; @!p bra FL_DONE; "
+        "FL_WAIT: ld.acquire.gpu.global.b32 v, [$0]; setp.eq.s32 q, v, 3; "
+        "@q bra FL_OK; nanosleep.u32 64; bra FL_WAIT; "
+        "FL_OK: setp.ne.s32 q, $2, 0; @q st.relaxed.gpu.global.b32 [$0], 0; FL_DONE: }",
+        "l,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def ldg_cg_u32(addr: Int64, pred: Int32, *, loc=None, ip=None) -> Uint32:
+    """``pred ? *addr : 0`` through L2 only (data another SM released)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip)],
+            "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.b32 $0, 0; "
+            "@p ld.global.cg.b32 $0, [$1]; }",
+            "=r,l,r",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
 @cute.jit
 def _t2_chunk(
     rc: Int32,
@@ -1217,10 +1270,12 @@ def _t2_chunk(
     p_dim: cutlass.Constexpr,
     scalar: cutlass.Constexpr,
     probe: cutlass.Constexpr = 0,
+    hal=None,
 ):
     """Conv + SiLU of rows r0 .. r0 + 15 (chunk rc of the staged subtile) for
     one column pair: loads, 16 branch-free chains, stores; the exact path
-    when some d > 2^126 or the chunk crosses ``row_end``."""
+    when some d > 2^126 or the chunk crosses ``row_end``. ``hal``: rows
+    -3..-1 of the block (the block before's rows 125-127) for chunk 0."""
     wp = [w0, w1, w2, w3]
     # Row rc * 16 + i: lb[i % 4] + 64 i (rc * 16 % 4 == 0, XOR swizzle by row).
     lb = [gbase + rc * (16 * _PITCH * 4) + ((cq ^ j) * 16) + cr for j in range(4)]
@@ -1228,7 +1283,10 @@ def _t2_chunk(
     for j in cutlass.range_constexpr(3):
         rr = rc * 16 - 3 + j
         rr = rr + 3 * b2i(rc == 0)
-        hr.append(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr))
+        hv = lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr)
+        if cutlass.const_expr(hal is not None):
+            hv = sel(b2i(rc == 0), hal[j], hv)
+        hr.append(hv)
     xr = [lds_u32(lb[i % 4] + i * (_PITCH * 4)) for i in range(16)]
     if cutlass.const_expr(probe == 1):
         # Microbench probe: no shared-memory reads (register stand-ins).
@@ -1348,9 +1406,15 @@ def epilogue_kda_conv_t2(
     chunk: the drain thread saves its pre-conv row when it is a block or
     sequence edge row; the column pass loads all 19 rows, runs the 16 conv +
     SiLU chains, and stores them unpredicated unless the chunk crosses the
-    end of the rows or some d > 2^126 (then the exact per-row path). Rows
-    0-2 of blocks and sequences are stored too and rewritten by the fix-up."""
-    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv
+    end of the rows or some d > 2^126 (then the exact per-row path).
+
+    Block halo (``conv_halo``): rows 125-127 of block b publish their saved
+    pre-conv rows to block b + 1 through a per-(block, N tile) flag; block
+    b's chunk-0 lanes wait for block b - 1's flag and take rows -3..-1 from
+    the side buffer, so only sequence starts are left to the fix-up.
+    Otherwise rows 0-2 of blocks are stored too and rewritten by the fix-up."""
+    out_addr, w_addr, side_addr, qsl_addr, norm_addr, nseq, top, nsteps = conv[:8]
+    halo = getattr(gemm_kernel, "conv_halo", False)
     g = tidx // 128
     gt = tidx % 128
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
@@ -1400,6 +1464,8 @@ def epilogue_kda_conv_t2(
     acc_consumer_state.advance()
 
     pb0 = b2i(rb < 3)
+    if cutlass.const_expr(halo):
+        pb0 = Int32(0)
     pb1 = b2i(rb >= 125)
     ps0 = b2i(pos < 3)
     ps1 = b2i(pos >= sln - 3)
@@ -1421,6 +1487,30 @@ def epilogue_kda_conv_t2(
                 for sq in cutlass.range_constexpr(4):
                     stg_v4(sbase + sq * 16, prd[sd], *sxs[4 * sq : 4 * sq + 4])
 
+    hal_args = None
+    if cutlass.const_expr(halo):
+        flag_addr = conv[8]
+        tile_n = epi_n * 32
+        n_tn = n_cols // tile_n
+        nt = tTR_cC[(None, None, None, g, 0)][0][1] // tile_n
+        blk = trow // 128
+        red_release_add1(
+            flag_addr + (Int64(blk) * Int64(n_tn) + Int64(nt)) * 4,
+            pb1 * b2i(blk < n_blk - 1),
+        )
+        hpred = b2i(blk >= 1) * b2i(blk < n_blk)
+        wait_flag3(
+            flag_addr + (Int64(blk - 1) * Int64(n_tn) + Int64(nt)) * 4,
+            b2i(gt < 32) * hpred,
+            b2i(gt == 0),
+        )
+        # Rows 125-127 of block b - 1 (side rows 6 (b - 1) + 3 + j).
+        hal_args = (
+            side_addr + (Int64(6 * blk - 3) * Int64(n_cols) + Int64(2 * cp)) * 2,
+            Int64(n_cols) * 2,
+            b2i(gt < 16) * hpred,
+        )
+
     gbase = smem_x + g * (128 * _PITCH * 4)
     wrow = gbase + (trow % 128) * (_PITCH * 4)
     cq = cp // 4
@@ -1432,14 +1522,24 @@ def epilogue_kda_conv_t2(
     col_n = tTR_cC[(None, None, None, g, 0)][0][1] + 2 * cp
     wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
     wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
+    hal_n = None
+    if cutlass.const_expr(halo):
+        # Halo of subtile ni + 1 loads while subtile ni runs (L2, 3 rows).
+        hb, hs, hp = hal_args
+        c0 = tTR_cC[(None, None, None, g, 0)][0][1]
+        hal_n = [ldg_cg_u32(hb + Int64(c0) * 2 + hs * j, hp) for j in range(3)]
     for ni in cutlass.range_constexpr(epi_n):
         xs = xs_all[ni]
         wp = [wl[0], wl[1], wh[0], wh[1]]
+        hal = hal_n
         col0 = tTR_cC[(None, None, None, g, ni)][0][1]
         if cutlass.const_expr(ni + 1 < epi_n):
             col_n = tTR_cC[(None, None, None, g, ni + 1)][0][1] + 2 * cp
             wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
             wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
+            if cutlass.const_expr(halo):
+                c1 = tTR_cC[(None, None, None, g, ni + 1)][0][1]
+                hal_n = [ldg_cg_u32(hb + Int64(c1) * 2 + hs * j, hp) for j in range(3)]
         cute.arch.barrier(barrier_id=bar, number_of_threads=128)
         for q in cutlass.range_constexpr(4):
             sts_v4(wrow + (((trow % 4) ^ q) * 16), Int32(1), *xs[4 * q : 4 * q + 4])
@@ -1459,5 +1559,5 @@ def epilogue_kda_conv_t2(
                 _t2_chunk(rc, r0, *args)
                 _t2_chunk(rc - 4, r0 - 64, *args)
         else:
-            _t2_chunk(rc, r0, *args)
+            _t2_chunk(rc, r0, *args, hal=hal)
     return acc_consumer_state

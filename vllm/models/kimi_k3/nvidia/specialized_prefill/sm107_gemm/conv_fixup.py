@@ -205,7 +205,10 @@ def conv_fixup(
     has_init: torch.Tensor,
     part_dim: int,
     null_block_id: int | None,
+    blocks: bool = True,
 ) -> None:
+    """``blocks=False``: the conv epilogue already wrote rows 0-2 of every
+    128-row block (block halo), so only sequence starts and the conv state."""
     _, m, p = out.shape
     n = 3 * p
     nb = (m + 127) // 128
@@ -215,7 +218,7 @@ def conv_fixup(
     assert p % block == 0 and conv_state.dtype in (torch.float32, torch.bfloat16)
     sp2 = triton.next_power_of_2(nseq + 1)
     bg = FIXUP_BG or (8 if nb >= 96 else 4)
-    nbg = (nb + bg - 1) // bg
+    nbg = (nb + bg - 1) // bg if blocks else 0
     _conv_fixup_all_kernel[(nbg + nseq, n // block)](
         out, side, norms if norms is not None else out, conv_w, conv_state, qsl,
         lines, has_init, m, n, p, nb, nseq, nbg,
