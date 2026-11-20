@@ -540,9 +540,11 @@ class OprojKsPush:
 
     @cute.jit
     def _slot_base(self, scratch, fv, blk, chunk, slot, feature):
-        """Address of [fv][blk][chunk][slot][feature][0] in the FP32 scratch."""
-        index = (((fv * MAX_BLOCKS + blk) * KS + chunk) * 2 + slot) * 128 + feature
-        return scratch.iterator.toint() + Int64(index * CMAX) * 4
+        """Address of feature ``feature``'s first token quad in the [fv][blk][chunk][slot]
+        slab of the FP32 scratch: [token / 4][128 features][4 tokens], so the 32 lanes
+        of a warp (32 features) move 512 contiguous bytes per v4 access."""
+        index = (((fv * MAX_BLOCKS + blk) * KS + chunk) * 2 + slot) * 128 * CMAX
+        return scratch.iterator.toint() + Int64(index + feature * 4) * 4
 
     @cute.jit
     def _scatter(self, taddr, scratch, counters, fv, blk, ks, tidx):
@@ -556,7 +558,8 @@ class OprojKsPush:
                 for t0 in cutlass.range_constexpr(0, CHUNK[c], 16):
                     vals = tmem_wait_n(*tmem_ld16(taddr + START[c] + t0))
                     for q in cutlass.range_constexpr(4 if not self.dbg & 2 else 0):
-                        st_f32x4(base + (t0 + 4 * q) * 4, *vals[4 * q : 4 * q + 4])
+                        quad = (t0 + 4 * q) // 4  # token quad: 128 x 16 B apart
+                        st_f32x4(base + quad * 2048, *vals[4 * q : 4 * q + 4])
         cute.arch.fence_acq_rel_gpu()
         bar_sync(EPI_BAR, 32 * EPI_WARPS)
         if tidx == 0:
@@ -584,12 +587,13 @@ class OprojKsPush:
         base1 = self._slot_base(scratch, fv, blk, ks, 1, tidx)
         for t0 in cutlass.range_constexpr(0, CMAX, 16):
             if t0 < size:
+                # all eight slab loads of the 16 tokens in flight before any use
+                s0 = [ld_f32x4_cg(base0 + ((t0 + 4 * q) // 4) * 2048) for q in range(4)]
+                s1 = [ld_f32x4_cg(base1 + ((t0 + 4 * q) // 4) * 2048) for q in range(4)]
                 own = tmem_wait_n(*tmem_ld16(taddr + start + t0))
                 for q in cutlass.range_constexpr(4):
-                    s0 = ld_f32x4_cg(base0 + (t0 + 4 * q) * 4)
-                    s1 = ld_f32x4_cg(base1 + (t0 + 4 * q) * 4)
                     for e in cutlass.range_constexpr(4):
-                        mine, a, b = own[4 * q + e], s0[e], s1[e]
+                        mine, a, b = own[4 * q + e], s0[q][e], s1[q][e]
                         # slice order: P0 + P1 + P2 (slot (k - ks - 1) mod 3 holds P_k)
                         p0 = Float32(cutlass.select_(ks == 0, mine, cutlass.select_(ks == 1, b, a)))
                         p1 = Float32(cutlass.select_(ks == 1, mine, cutlass.select_(ks == 0, a, b)))
