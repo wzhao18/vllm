@@ -20,8 +20,8 @@ import torch.nn.functional as F
 
 H, I = 7168, 3584
 NAMES = ("entry", "slot", "gu acc0", "gu pub", "gu cnt0", "gu red", "dn acc0", "dn pub",
-         "dn cnt0", "dn red", "dn x0", "gu mma", "-", "-", "-", "end", "gu sum0", "gu st0",
-         "dn sum0", "dn st0", "-", "-", "-", "-")  # fmt: skip
+         "dn cnt0", "dn red", "dn x0", "gu mma", "gu W0", "-", "dn mma", "end", "gu sum0",
+         "gu st0", "dn sum0", "dn st0", "dn act0", "dn W0", "-", "-")  # fmt: skip
 
 
 def time_graph(fn, ncopy, reps=10, rounds=5):
@@ -49,7 +49,7 @@ def time_graph(fn, ncopy, reps=10, rounds=5):
     return statistics.median(ts)
 
 
-def stamp_line(st):
+def stamp_line(st, wbytes=None):
     """Per stamp: median / max over CTAs (us after the earliest entry)."""
     st = st.cpu().double() / 1e3
     t0 = st[:, 0].min()
@@ -62,6 +62,12 @@ def stamp_line(st):
         if len(col):
             col = col - t0
             out.append(f"{name} {col.median().item():.2f}/{col.max().item():.2f}")
+    if wbytes:  # aggregate weight rate of each phase (first W landed -> last MMA issued)
+        for name, a, b, nb in (("gu", 12, 11, wbytes[0]), ("dn", 21, 14, wbytes[1])):
+            ca, cb = st[:, a][st[:, a] > 0], st[:, b][st[:, b] > 0]
+            if len(ca) and len(cb):
+                span = (cb.max() - ca.min()).item()
+                out.append(f"{name} W {nb / span / 1e6:.1f} TB/s over {span:.2f} us")
     return " | ".join(out)
 
 
@@ -74,6 +80,7 @@ def main():
     ap.add_argument("--ncopy", type=int, default=0)
     ap.add_argument("--ahead", default="2")
     ap.add_argument("--debugs", default="", help="extra skeleton arms: debug bits, e.g. 3,5,7")
+    ap.add_argument("--dump", default="", help="save raw stamps to <dump>_<tag>_R<rows>.pt")
     args = ap.parse_args()
     torch.manual_seed(0)
     dev = torch.device("cuda")
@@ -160,7 +167,10 @@ def main():
                     if dbg & 8:
                         pk[0].run(x, out)
                         torch.cuda.synchronize()
-                        print(f"R{m} {tag}: " + stamp_line(pk[0].stamps(m)), flush=True)
+                        print(f"R{m} {tag}: " + stamp_line(pk[0].stamps(m), (2 * I * H * 2, H * I * 2)),
+                              flush=True)
+                        if args.dump:
+                            torch.save(pk[0].stamps(m).cpu(), f"{args.dump}_{tag}_R{m}.pt")
                     del pk
                 except Exception as e:  # noqa: BLE001
                     res[tag] = (float("nan"), repr(e)[:300])

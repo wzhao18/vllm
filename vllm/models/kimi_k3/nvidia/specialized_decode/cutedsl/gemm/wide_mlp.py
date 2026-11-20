@@ -476,7 +476,16 @@ class WideMlp:
                             s = step % sw
                             q = step % sx
                             cute.arch.mbarrier_wait(w_full + s, (step // sw) & 1)
+                            if cutlass.const_expr(self.debug & 8):  # first W landed: 12 / 21
+                                if lane == 0:
+                                    if step == base_step:
+                                        _st_u64(stamp + (12 if ph == 0 else 21) * 8, _now())
                             cute.arch.mbarrier_wait(x_full + q, (step // sx) & 1)
+                            if cutlass.const_expr(self.debug & 8):  # first act landed: 20
+                                if cutlass.const_expr(ph == 1):
+                                    if lane == 0:
+                                        if step == base_step:
+                                            _st_u64(stamp + 20 * 8, _now())
                             if cutlass.const_expr((self.debug & 1) == 0):
                                 for c in cutlass.range_constexpr(chunks):
                                     acc_c = acc[(None, None, None, c)]
@@ -494,10 +503,9 @@ class WideMlp:
                         with cute.arch.elect_one():
                             tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
                         sg = sg + 1
-                    if cutlass.const_expr(self.debug & 8):
-                        if cutlass.const_expr(ph == 0):
-                            if lane == 0:
-                                _st_u64(stamp + 11 * 8, _now())
+                    if cutlass.const_expr(self.debug & 8):  # last MMA issued: 11 / 14
+                        if lane == 0:
+                            _st_u64(stamp + (11 if ph == 0 else 14) * 8, _now())
         elif warp < 8:
             if warp == 0:
                 cute.arch.alloc_tmem(self.tmem_cols, tmem_holder, is_two_cta=True)

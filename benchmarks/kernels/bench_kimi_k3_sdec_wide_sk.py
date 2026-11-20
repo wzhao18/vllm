@@ -87,6 +87,11 @@ def stamp_summary(st, ks, total, pairs):
             + f' | tmem-release seg0 med {(st[:, 12] - st[:, 2]).median():.2f}')
 
 
+def _with_pairs(pk, pairs):
+    pk.pairs = pairs
+    return pk
+
+
 def spread_arms(args, arms, m, n, k, x, ws, pairs, ncopy, res, run, configs):
     """``spread`` arms: sp (BF16 out), spst (+ stamps), spsilu (gate/up + silu_and_mul vs
     F.linear + vLLM silu_and_mul)."""
@@ -101,9 +106,9 @@ def spread_arms(args, arms, m, n, k, x, ws, pairs, ncopy, res, run, configs):
             if arm not in arms:
                 continue
             tag = f"{arm}{nw}{nx}x{xs}"
-            pk = [wide_sk.PreparedWideSK(w, [m], w_issuers=nw, x_issuers=nx, debug=dbg,
+            pk = [_with_pairs(wide_sk.PreparedWideSK(w, [m], w_issuers=nw, x_issuers=nx, debug=dbg,
                                          x_stages=xs, spread=True, silu=silu,
-                                         **args.extra).prepare()
+                                         **args.extra), pairs).prepare()
                   for w in ws]  # fmt: skip
             if silu:
                 h = torch.empty(m, n, device=x.device, dtype=torch.bfloat16)
@@ -164,6 +169,7 @@ def main():
     ap.add_argument("--keep-w", type=int, default=0)
     ap.add_argument("--warm", type=int, default=0, help="one weight copy (L2-warm)")
     ap.add_argument("--nocopy", type=int, default=1, help="two TMEM accumulators (0: copy form)")
+    ap.add_argument("--pairs", default="", help="p0,p1 CTA pairs per die (default: all)")
     args = ap.parse_args()
     args.extra = dict(smem=args.smem * 1024 or None, packed=bool(args.packed),
                       keep_w=bool(args.keep_w), nocopy=bool(args.nocopy))
@@ -178,6 +184,8 @@ def main():
     configs = [tuple(int(v) for v in c.split(":")) for c in args.issuers.split(",")]
     arms = args.arms.split(",")
     _, pairs = wide_sk.die_pairs(dev)
+    if args.pairs:  # a subset of the SM pairs per die (static SM-split calibration)
+        pairs = tuple(int(v) for v in args.pairs.split(","))
     print(f"shape {args.shape} N{n} K{k} pairs/die {pairs} configs {configs}", flush=True)
     ncopy = 1 if args.warm else max(2, min(16, int(1.2e9 // (n * k * 2)) + 1))
     ws = [torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.02 for _ in range(ncopy)]
@@ -240,8 +248,8 @@ def main():
                 res[arm] = (float("nan"), "unsupported")
                 continue
             pk = [
-                wide_sk.PreparedWideSK(w, [m], place=place, w_issuers=nw, x_issuers=nx,
-                                       debug=dbg, x_stages=xs, **args.extra).prepare()
+                _with_pairs(wide_sk.PreparedWideSK(w, [m], place=place, w_issuers=nw, x_issuers=nx,
+                                       debug=dbg, x_stages=xs, **args.extra), pairs).prepare()
                 for w in ws
             ]  # fmt: skip
             if arm.startswith("xl"):  # activations copied per die
