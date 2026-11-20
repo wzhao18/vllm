@@ -45,7 +45,7 @@ def _case(rows, gen):
     return query, kv, slots, valid
 
 
-@pytest.mark.parametrize("rows", [68, 256])
+@pytest.mark.parametrize("rows", [68, 256, 384])
 def test_keys_on_m_matches_trtllm_gen(rows):
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 

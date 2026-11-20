@@ -297,8 +297,8 @@ class FlashInferCore:
 
     def keys_on_m(self, query, kv, slots, valid, latent, lse):
         """sparse_mla_km: the Rubin keys-on-M sparse MLA over the 96 real heads (the
-        trtllm-gen arithmetic: E4M3 P at 448 of the running max, FP32 sums, one
-        unsplit pass per row as trtllm-gen at these row counts; base-2 LSE)."""
+        trtllm-gen arithmetic: E4M3 P at 448 of the running max, FP32 sums; rows
+        split over CTAs merge as DCP does (BF16 partials, FP32 weights); base-2 LSE)."""
         from .sparse_mla_km import H, sparse_mla_decode_km
 
         impl = self.impl
