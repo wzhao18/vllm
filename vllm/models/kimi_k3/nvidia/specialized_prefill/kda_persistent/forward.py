@@ -27,6 +27,7 @@ LOG2E = 1.4426950408889634
 # Device compilation controls and caches.
 _TPROBE = 0
 _WYPROBE = 0  # dev timing probe (numerically wrong), see kernel WYPROBE_
+_PREPABL = 0  # dev timing probe (numerically wrong), see kernel PREP_ABL_
 _COMPILED: dict = {}
 _DUMMY_EXP: dict = {}
 _DUMMY_MID: dict = {}
@@ -102,6 +103,7 @@ def _get_compiled(
         partial_tma,
         _WYPROBE,
         _TPROBE,
+        _PREPABL,
         wy,
         tf4,
     )
@@ -191,6 +193,7 @@ def _get_compiled(
                 stream=stream,
                 TPROBE_=_TPROBE,
                 WYPROBE_=_WYPROBE,
+                PREP_ABL_=_PREPABL,
                 WY_=1 if wy else 0,
                 TF4_=1 if tf4 else 0,
                 GATE2_=gate2,

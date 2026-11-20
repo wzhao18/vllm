@@ -245,6 +245,7 @@ def _pkd(
     WYPROBE_: cutlass.Constexpr[int] = 0,
     WY_: cutlass.Constexpr[int] = 0,
     TF4_: cutlass.Constexpr[int] = 0,
+    PREP_ABL_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -2325,42 +2326,47 @@ def _pkd(
                                 for u in cutlass.range_constexpr(8):
                                     qr[u] = cutlass.BFloat16(0.0)
                                     kr[u] = cutlass.BFloat16(0.0)
-                        sq = cutlass.Float32(0.0)
-                        sk = cutlass.Float32(0.0)
-                        for u in cutlass.range_constexpr(8):
-                            fq = cutlass.Float32(qr[u])
-                            fk = cutlass.Float32(kr[u])
-                            sq += fq * fq
-                            sk += fk * fk
-                        for off in [1, 2, 4, 8]:
-                            sq += cute.arch.shuffle_sync_bfly(sq, off)
-                            sk += cute.arch.shuffle_sync_bfly(sk, off)
-                        # scale folded into rqn: one FMUL replaces 8 per slice
-                        rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
-                        rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
-                        g8s = v_gcs8[(rw2, None, sg2, inst)]
-                        cute.autovec_copy(g8s, g8)
-                        gv8 = g8.load()
-                        decv = cute.math.exp2(gv8 - anch, fastmath=True)
-                        qhv = qr.load().to(cutlass.Float32) * rqn
-                        khv = kr.load().to(cutlass.Float32) * rkn
-                        qr.store((qhv * decv).to(cutlass.BFloat16))
-                        kr.store((khv * decv).to(cutlass.BFloat16))
-                        if cutlass.const_expr(RCP_DECOR_ == 1):
-                            # The inverse decoration is exactly reciprocal to the
-                            # forward decay.  Its consumer is rounded to BF16, so
-                            # a native approximate reciprocal avoids a second
-                            # vector exp2 while retaining more precision than
-                            # that store.  The exp2 control remains for matched
-                            # profiling.
-                            idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                        if cutlass.const_expr((PREP_ABL_ & 1) == 0):
+                            sq = cutlass.Float32(0.0)
+                            sk = cutlass.Float32(0.0)
+                            for u in cutlass.range_constexpr(8):
+                                fq = cutlass.Float32(qr[u])
+                                fk = cutlass.Float32(kr[u])
+                                sq += fq * fq
+                                sk += fk * fk
+                            for off in [1, 2, 4, 8]:
+                                sq += cute.arch.shuffle_sync_bfly(sq, off)
+                                sk += cute.arch.shuffle_sync_bfly(sk, off)
+                            # scale folded into rqn: one FMUL replaces 8 per slice
+                            rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                            rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                            g8s = v_gcs8[(rw2, None, sg2, inst)]
+                            cute.autovec_copy(g8s, g8)
+                            gv8 = g8.load()
+                            decv = cute.math.exp2(gv8 - anch, fastmath=True)
+                            qhv = qr.load().to(cutlass.Float32) * rqn
+                            khv = kr.load().to(cutlass.Float32) * rkn
+                            qr.store((qhv * decv).to(cutlass.BFloat16))
+                            kr.store((khv * decv).to(cutlass.BFloat16))
+                            if cutlass.const_expr(RCP_DECOR_ == 1):
+                                # The inverse decoration is exactly reciprocal to the
+                                # forward decay.  Its consumer is rounded to BF16, so
+                                # a native approximate reciprocal avoids a second
+                                # vector exp2 while retaining more precision than
+                                # that store.  The exp2 control remains for matched
+                                # profiling.
+                                idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                            else:
+                                idecv = cute.math.exp2(anch - gv8, fastmath=True)
                         else:
-                            idecv = cute.math.exp2(anch - gv8, fastmath=True)
+                            g8s = v_gcs8[(rw2, None, sg2, inst)]
+                            cute.autovec_copy(g8s, g8)
                         dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                         cute.autovec_copy(qr, dq8)
                         dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                         cute.autovec_copy(kr, dk8)
-                        kr.store((khv * idecv).to(cutlass.BFloat16))
+                        if cutlass.const_expr((PREP_ABL_ & 1) == 0):
+                            kr.store((khv * idecv).to(cutlass.BFloat16))
                         di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                         cute.autovec_copy(kr, di8)
                     # gt/rf (dedicated buffers; gcs row 31 stable since the
@@ -2399,21 +2405,22 @@ def _pkd(
                     cute.arch.mbarrier_wait(mb + MB_GRAM + inst, pp_gram)
                     cute.copy(gram_ld, gm_thr.partition_S(t_gram), r_gram)
                     cute.arch.fence_view_async_tmem_load()
-                    if plw < 2:
-                        for e in cutlass.range_constexpr(cute.size(r_gram)):
-                            crd = gram_id[e]
-                            mv = cutlass.Float32(0.0)
-                            if crd[1] <= crd[0]:
-                                mv = r_gram[e] * g_scale
-                            r_gram[e] = mv
-                    else:
-                        for e in cutlass.range_constexpr(cute.size(r_gram)):
-                            crd = gram_id[e]
-                            gi = crd[0] - C
-                            lv = cutlass.Float32(0.0)
-                            if crd[1] < gi:
-                                lv = r_gram[e] * v_bt[gi, inst]
-                            r_gram[e] = lv
+                    if cutlass.const_expr((PREP_ABL_ & 2) == 0):
+                        if plw < 2:
+                            for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                crd = gram_id[e]
+                                mv = cutlass.Float32(0.0)
+                                if crd[1] <= crd[0]:
+                                    mv = r_gram[e] * g_scale
+                                r_gram[e] = mv
+                        else:
+                            for e in cutlass.range_constexpr(cute.size(r_gram)):
+                                crd = gram_id[e]
+                                gi = crd[0] - C
+                                lv = cutlass.Float32(0.0)
+                                if crd[1] < gi:
+                                    lv = r_gram[e] * v_bt[gi, inst]
+                                r_gram[e] = lv
                     if cutlass.const_expr(TF4_ == 1):
                         if plw < 2:
                             for e in cutlass.range_constexpr(cute.size(r_gram)):
@@ -2429,183 +2436,185 @@ def _pkd(
                     # elimination (zero LDS on the elimination chain);
                     # level 2: both 16-blocks' -B^-1 C A^-1 combines batched
                     # as block-diagonal [16,16] warp-MMAs. --
-                    if plw == 0:
-                        dgb = lane >> 3
-                        lid = lane & 7
-                        b8 = dgb * 8
-                        cute.autovec_copy(v_lw_diag[(dgb, lid, None, inst)], qr)
-                        for c8 in cutlass.range_constexpr(8):
-                            lv8 = cutlass.Float32(0.0)
-                            if c8 < lid:
-                                lv8 = cutlass.Float32(qr[c8])
-                            if c8 == lid:
-                                lv8 = cutlass.Float32(1.0)
-                            g8[c8] = lv8
-                        for sr in cutlass.range_constexpr(7):
-                            rs8 = cutlass.Float32(0.0) - g8[sr]
-                            for pc in cutlass.range_constexpr(7):
-                                if cutlass.const_expr(pc < sr):
-                                    pv8 = cute.arch.shuffle_sync(g8[pc], b8 + sr)
-                                    if lid > sr:
-                                        g8[pc] = rs8 * pv8 + g8[pc]
-                            if lid > sr:
-                                g8[sr] = rs8
-                        qr.store(g8.load().to(cutlass.BFloat16))
-                        cute.autovec_copy(qr, v_inv[(b8 + lid, None, dgb, inst)])
-                        # zero the upper-right 8x8 of each 16-block and the
-                        # 32-level upper-right [0:16,16:32)
-                        qr.fill(cutlass.BFloat16(0.0))
-                        if dgb == 0:
-                            cute.autovec_copy(qr, v_inv[(lid, None, 1, inst)])
-                        if dgb == 2:
-                            cute.autovec_copy(qr, v_inv[(16 + lid, None, 3, inst)])
-                        halfl = lane >> 4
-                        coll = lane & 15
-                        if halfl == 0:
-                            cute.autovec_copy(qr, v_inv[(coll, None, 2, inst)])
-                            cute.autovec_copy(qr, v_inv[(coll, None, 3, inst)])
-                        cute.arch.sync_warp()
-                        # level 2: Y = diag(A1inv,B1inv) @ diag(C_A,C_B)
-                        Cy2 = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
-                        Cy2.fill(0.0)
-                        fa2 = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
-                        fb2 = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
-                        for e in cutlass.range_constexpr(cute.size(fa2)):
-                            ac = tIdA16[e]
-                            va2 = cutlass.BFloat16(0.0)
-                            if (ac[0] >> 3) == (ac[1] >> 3):
-                                va2 = v_inv[
-                                    8 + 16 * (ac[0] >> 3) + (ac[0] & 7),
-                                    ac[1] & 7,
-                                    1 + 2 * (ac[0] >> 3),
-                                    inst,
-                                ]
-                            fa2[e] = va2
-                        for e in cutlass.range_constexpr(cute.size(fb2)):
-                            bc = tIdB16[e]
-                            vb2 = cutlass.BFloat16(0.0)
-                            if (bc[1] >> 3) == (bc[0] >> 3):
-                                vb2 = v_gram[
-                                    C + 8 + 16 * (bc[1] >> 3) + (bc[1] & 7),
-                                    16 * (bc[1] >> 3) + (bc[0] & 7),
-                                    inst,
-                                ]
-                            fb2[e] = vb2
-                        cute.gemm(mma_a, Cy2, fa2, fb2, Cy2)
-                        yA2 = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
-                        for e in cutlass.range_constexpr(cute.size(Cy2)):
-                            yA2[e] = cutlass.BFloat16(Cy2[e])
-                        fbt2 = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
-                        for e in cutlass.range_constexpr(cute.size(fbt2)):
-                            bc2 = tIdB16[e]
-                            vt2 = cutlass.BFloat16(0.0)
-                            if (bc2[1] >> 3) == (bc2[0] >> 3):
-                                vt2 = v_inv[
-                                    16 * (bc2[1] >> 3) + (bc2[1] & 7),
-                                    bc2[0] & 7,
-                                    2 * (bc2[1] >> 3),
-                                    inst,
-                                ]
-                            fbt2[e] = vt2
-                        Cc2 = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
-                        Cc2.fill(0.0)
-                        cute.gemm(mma_a, Cc2, yA2, fbt2, Cc2)
-                        for e in cutlass.range_constexpr(cute.size(Cc2)):
-                            crd = tIdA[e]
-                            if (crd[0] >> 3) == (crd[1] >> 3):
-                                v_inv[
-                                    8 + 16 * (crd[0] >> 3) + (crd[0] & 7),
-                                    crd[1] & 7,
-                                    2 * (crd[0] >> 3),
-                                    inst,
-                                ] = cutlass.BFloat16(0.0 - Cc2[e])
-                        cute.arch.sync_warp()
-                    # (no barrier: the combine is warp 0's own program order; the
-                    #  restore reads only pre-gram-barrier data)
+                    if cutlass.const_expr((PREP_ABL_ & 4) == 0):
+                        if plw == 0:
+                            dgb = lane >> 3
+                            lid = lane & 7
+                            b8 = dgb * 8
+                            cute.autovec_copy(v_lw_diag[(dgb, lid, None, inst)], qr)
+                            for c8 in cutlass.range_constexpr(8):
+                                lv8 = cutlass.Float32(0.0)
+                                if c8 < lid:
+                                    lv8 = cutlass.Float32(qr[c8])
+                                if c8 == lid:
+                                    lv8 = cutlass.Float32(1.0)
+                                g8[c8] = lv8
+                            for sr in cutlass.range_constexpr(7):
+                                rs8 = cutlass.Float32(0.0) - g8[sr]
+                                for pc in cutlass.range_constexpr(7):
+                                    if cutlass.const_expr(pc < sr):
+                                        pv8 = cute.arch.shuffle_sync(g8[pc], b8 + sr)
+                                        if lid > sr:
+                                            g8[pc] = rs8 * pv8 + g8[pc]
+                                if lid > sr:
+                                    g8[sr] = rs8
+                            qr.store(g8.load().to(cutlass.BFloat16))
+                            cute.autovec_copy(qr, v_inv[(b8 + lid, None, dgb, inst)])
+                            # zero the upper-right 8x8 of each 16-block and the
+                            # 32-level upper-right [0:16,16:32)
+                            qr.fill(cutlass.BFloat16(0.0))
+                            if dgb == 0:
+                                cute.autovec_copy(qr, v_inv[(lid, None, 1, inst)])
+                            if dgb == 2:
+                                cute.autovec_copy(qr, v_inv[(16 + lid, None, 3, inst)])
+                            halfl = lane >> 4
+                            coll = lane & 15
+                            if halfl == 0:
+                                cute.autovec_copy(qr, v_inv[(coll, None, 2, inst)])
+                                cute.autovec_copy(qr, v_inv[(coll, None, 3, inst)])
+                            cute.arch.sync_warp()
+                            # level 2: Y = diag(A1inv,B1inv) @ diag(C_A,C_B)
+                            Cy2 = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                            Cy2.fill(0.0)
+                            fa2 = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                            fb2 = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                            for e in cutlass.range_constexpr(cute.size(fa2)):
+                                ac = tIdA16[e]
+                                va2 = cutlass.BFloat16(0.0)
+                                if (ac[0] >> 3) == (ac[1] >> 3):
+                                    va2 = v_inv[
+                                        8 + 16 * (ac[0] >> 3) + (ac[0] & 7),
+                                        ac[1] & 7,
+                                        1 + 2 * (ac[0] >> 3),
+                                        inst,
+                                    ]
+                                fa2[e] = va2
+                            for e in cutlass.range_constexpr(cute.size(fb2)):
+                                bc = tIdB16[e]
+                                vb2 = cutlass.BFloat16(0.0)
+                                if (bc[1] >> 3) == (bc[0] >> 3):
+                                    vb2 = v_gram[
+                                        C + 8 + 16 * (bc[1] >> 3) + (bc[1] & 7),
+                                        16 * (bc[1] >> 3) + (bc[0] & 7),
+                                        inst,
+                                    ]
+                                fb2[e] = vb2
+                            cute.gemm(mma_a, Cy2, fa2, fb2, Cy2)
+                            yA2 = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                            for e in cutlass.range_constexpr(cute.size(Cy2)):
+                                yA2[e] = cutlass.BFloat16(Cy2[e])
+                            fbt2 = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                            for e in cutlass.range_constexpr(cute.size(fbt2)):
+                                bc2 = tIdB16[e]
+                                vt2 = cutlass.BFloat16(0.0)
+                                if (bc2[1] >> 3) == (bc2[0] >> 3):
+                                    vt2 = v_inv[
+                                        16 * (bc2[1] >> 3) + (bc2[1] & 7),
+                                        bc2[0] & 7,
+                                        2 * (bc2[1] >> 3),
+                                        inst,
+                                    ]
+                                fbt2[e] = vt2
+                            Cc2 = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                            Cc2.fill(0.0)
+                            cute.gemm(mma_a, Cc2, yA2, fbt2, Cc2)
+                            for e in cutlass.range_constexpr(cute.size(Cc2)):
+                                crd = tIdA[e]
+                                if (crd[0] >> 3) == (crd[1] >> 3):
+                                    v_inv[
+                                        8 + 16 * (crd[0] >> 3) + (crd[0] & 7),
+                                        crd[1] & 7,
+                                        2 * (crd[0] >> 3),
+                                        inst,
+                                    ] = cutlass.BFloat16(0.0 - Cc2[e])
+                            cute.arch.sync_warp()
+                        # (no barrier: the combine is warp 0's own program order; the
+                        #  restore reads only pre-gram-barrier data)
 
-                    # -- phase 7: off-diag combine (warp 0) || restore (warps 1-3) --
-                    # INV[16:,:16] = -(Tb @ Lc) @ Ta; fragments loaded elementwise
-                    # by identity coords (transposed dynamic-offset views reject
-                    # autovec: provenance law).
-                    if plw == 0:
-                        Cy = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
-                        Cy.fill(0.0)
-                        fat = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
-                        fbl = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
-                        for e in cutlass.range_constexpr(cute.size(fat)):
-                            ac = tIdA16[e]
-                            fat[e] = v_inv[
-                                16 + ac[0], ac[1] & 7, 2 + (ac[1] >> 3), inst
-                            ]
-                        for e in cutlass.range_constexpr(cute.size(fbl)):
-                            bc = tIdB16[e]
-                            fbl[e] = v_gram[C + 16 + bc[1], bc[0], inst]
-                        cute.gemm(mma_a, Cy, fat, fbl, Cy)
-                        yA = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
-                        for e in cutlass.range_constexpr(cute.size(Cy)):
-                            yA[e] = cutlass.BFloat16(Cy[e])
-                        fbt = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
-                        for e in cutlass.range_constexpr(cute.size(fbt)):
-                            bc2 = tIdB16[e]
-                            fbt[e] = v_inv[bc2[1], bc2[0] & 7, bc2[0] >> 3, inst]
-                        Cc = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
-                        Cc.fill(0.0)
-                        cute.gemm(mma_a, Cc, yA, fbt, Cc)
-                        for pair in cutlass.range_constexpr(4):
-                            e = 2 * pair
-                            crd = tIdA[e]
-                            c2 = cute.make_rmem_tensor(
-                                cute.make_layout((2,)), cutlass.BFloat16
+                        # -- phase 7: off-diag combine (warp 0) || restore (warps 1-3) --
+                        # INV[16:,:16] = -(Tb @ Lc) @ Ta; fragments loaded elementwise
+                        # by identity coords (transposed dynamic-offset views reject
+                        # autovec: provenance law).
+                    if cutlass.const_expr((PREP_ABL_ & 8) == 0):
+                        if plw == 0:
+                            Cy = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                            Cy.fill(0.0)
+                            fat = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                            fbl = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                            for e in cutlass.range_constexpr(cute.size(fat)):
+                                ac = tIdA16[e]
+                                fat[e] = v_inv[
+                                    16 + ac[0], ac[1] & 7, 2 + (ac[1] >> 3), inst
+                                ]
+                            for e in cutlass.range_constexpr(cute.size(fbl)):
+                                bc = tIdB16[e]
+                                fbl[e] = v_gram[C + 16 + bc[1], bc[0], inst]
+                            cute.gemm(mma_a, Cy, fat, fbl, Cy)
+                            yA = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
+                            for e in cutlass.range_constexpr(cute.size(Cy)):
+                                yA[e] = cutlass.BFloat16(Cy[e])
+                            fbt = thr_a.make_fragment_B(mma_a.partition_shape_B((16, 16)))
+                            for e in cutlass.range_constexpr(cute.size(fbt)):
+                                bc2 = tIdB16[e]
+                                fbt[e] = v_inv[bc2[1], bc2[0] & 7, bc2[0] >> 3, inst]
+                            Cc = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
+                            Cc.fill(0.0)
+                            cute.gemm(mma_a, Cc, yA, fbt, Cc)
+                            for pair in cutlass.range_constexpr(4):
+                                e = 2 * pair
+                                crd = tIdA[e]
+                                c2 = cute.make_rmem_tensor(
+                                    cute.make_layout((2,)), cutlass.BFloat16
+                                )
+                                c2[0] = cutlass.BFloat16(0.0 - Cc[e])
+                                c2[1] = cutlass.BFloat16(0.0 - Cc[e + 1])
+                                d2 = cute.local_tile(
+                                    v_inv,
+                                    (1, 2, 1, 1),
+                                    (
+                                        16 + crd[0],
+                                        (crd[1] & 7) >> 1,
+                                        crd[1] >> 3,
+                                        inst,
+                                    ),
+                                )
+                                cute.autovec_copy(c2, d2)
+                        else:
+                            # ``96`` restore workers advance by a whole multiple of
+                            # the 16 RF segments, so each thread's segment is
+                            # invariant across all six row-work iterations.  Load
+                            # that shared factor vector once instead of 5--6 times.
+                            if cutlass.const_expr(RF_HOIST_ == 1):
+                                sg_restore = lane & 15
+                                cute.autovec_copy(v_rf8[(sg_restore, None, inst)], rf8)
+                            restore_iters = (
+                                5 if cutlass.const_expr(RESTORE_TAIL_ == 1) else 6
                             )
-                            c2[0] = cutlass.BFloat16(0.0 - Cc[e])
-                            c2[1] = cutlass.BFloat16(0.0 - Cc[e + 1])
-                            d2 = cute.local_tile(
-                                v_inv,
-                                (1, 2, 1, 1),
-                                (
-                                    16 + crd[0],
-                                    (crd[1] & 7) >> 1,
-                                    crd[1] >> 3,
-                                    inst,
-                                ),
-                            )
-                            cute.autovec_copy(c2, d2)
-                    else:
-                        # ``96`` restore workers advance by a whole multiple of
-                        # the 16 RF segments, so each thread's segment is
-                        # invariant across all six row-work iterations.  Load
-                        # that shared factor vector once instead of 5--6 times.
-                        if cutlass.const_expr(RF_HOIST_ == 1):
-                            sg_restore = lane & 15
-                            cute.autovec_copy(v_rf8[(sg_restore, None, inst)], rf8)
-                        restore_iters = (
-                            5 if cutlass.const_expr(RESTORE_TAIL_ == 1) else 6
-                        )
-                        for wp in cutlass.range(restore_iters):
-                            item = wp * 96 + (ptl - 32)
-                            if item < C * 16:
-                                rw3 = item >> 4
-                                sg3 = item & 15
-                                si8 = v_ki8[(rw3, None, sg3 & 7, sg3 >> 3, inst)]
-                                cute.autovec_copy(si8, kr)
-                                if cutlass.const_expr(RF_HOIST_ == 0):
-                                    cute.autovec_copy(v_rf8[(sg3, None, inst)], rf8)
-                                if cutlass.const_expr(TF4_ == 1):
-                                    for ee in cutlass.range_constexpr(8):
-                                        v_fta32[
-                                            rw3, (sg3 & 3) * 8 + ee, sg3 >> 2, inst
-                                        ] = cutlass.Float32(kr[ee]) * rf8[ee]
-                                else:
-                                    kr.store(
-                                        kr.load() * rf8.load().to(cutlass.BFloat16)
-                                    )
-                                    cute.autovec_copy(kr, si8)
-                    # Warps 1--3 restore the first 480 independent row-segments
-                    # in five balanced rounds.  Once its triangular solve is
-                    # complete, warp 0 restores the 32-segment tail that
-                    # previously made one third of the restore workers take a
-                    # sixth round.  The shared stage is not published until the
-                    # existing four-warp barrier below.
+                            for wp in cutlass.range(restore_iters):
+                                item = wp * 96 + (ptl - 32)
+                                if item < C * 16:
+                                    rw3 = item >> 4
+                                    sg3 = item & 15
+                                    si8 = v_ki8[(rw3, None, sg3 & 7, sg3 >> 3, inst)]
+                                    cute.autovec_copy(si8, kr)
+                                    if cutlass.const_expr(RF_HOIST_ == 0):
+                                        cute.autovec_copy(v_rf8[(sg3, None, inst)], rf8)
+                                    if cutlass.const_expr(TF4_ == 1):
+                                        for ee in cutlass.range_constexpr(8):
+                                            v_fta32[
+                                                rw3, (sg3 & 3) * 8 + ee, sg3 >> 2, inst
+                                            ] = cutlass.Float32(kr[ee]) * rf8[ee]
+                                    else:
+                                        kr.store(
+                                            kr.load() * rf8.load().to(cutlass.BFloat16)
+                                        )
+                                        cute.autovec_copy(kr, si8)
+                        # Warps 1--3 restore the first 480 independent row-segments
+                        # in five balanced rounds.  Once its triangular solve is
+                        # complete, warp 0 restores the 32-segment tail that
+                        # previously made one third of the restore workers take a
+                        # sixth round.  The shared stage is not published until the
+                        # existing four-warp barrier below.
                     if cutlass.const_expr(RESTORE_TAIL_ == 1):
                         if plw == 0:
                             item = 480 + lane
@@ -2746,6 +2755,7 @@ def _launch_pkd(
     WYPROBE_: cutlass.Constexpr[int] = 0,
     WY_: cutlass.Constexpr[int] = 0,
     TF4_: cutlass.Constexpr[int] = 0,
+    PREP_ABL_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2988,6 +2998,7 @@ def _launch_pkd(
         WYPROBE_,
         WY_,
         TF4_,
+        PREP_ABL_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
