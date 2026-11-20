@@ -2474,6 +2474,8 @@ class KimiLinearForCausalLM(
                 and isinstance(module.shared_experts, KimiMLP)
                 and not module.shared_experts.shard_sequence_parallel
                 and shared_situ.supported(module.shared_experts)
+                # DIAGNOSTIC (never land): stock shared gate_up + situ4 path.
+                and False
             ):
                 situ = shared_situ.PrefillSharedSitu(module.shared_experts)
                 situ.prepare()
