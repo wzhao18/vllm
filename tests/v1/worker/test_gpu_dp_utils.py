@@ -64,3 +64,70 @@ def test_dispatch_dp1_returns_no_sync():
         allow_skip_drafts=True,
     )
     assert sync is None
+
+
+def _run_piecewise_sync(counts, pad_policy):
+    """sync_cudagraph_and_dp_padding as DP rank 0 of len(counts) ranks whose
+    batches all dispatch to a PIECEWISE graph of the largest count rounded up
+    to 256, with the given ModelState.pad_dp_for_piecewise hook."""
+    dp = len(counts)
+    padded = -(-max(counts) // 256) * 256
+
+    def fake_all_reduce(tensor):
+        for r in range(1, dp):
+            tensor[0][r] = counts[r]
+            tensor[1][r] = CUDAGraphMode.PIECEWISE.value
+            tensor[2][r] = 0
+            tensor[3][r] = -1
+            tensor[4][r] = 0
+            tensor[5][r] = 1
+            tensor[6][r] = 0
+
+    manager = mock.Mock()
+    manager.dispatch.return_value = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=padded, num_reqs=None
+    )
+    manager.pad_dp_for_piecewise = pad_policy
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=padded, num_reqs=None
+    )
+    with mock.patch.object(dp_utils, "get_dp_group") as mock_group:
+        mock_group.return_value.cpu_all_reduce_ = fake_all_reduce
+        return dp_utils.sync_cudagraph_and_dp_padding(
+            cudagraph_manager=manager,
+            desired_batch_desc=desc,
+            num_tokens=counts[0],
+            num_reqs=1,
+            uniform_token_count=None,
+            dp_size=dp,
+            dp_rank=0,
+        )
+
+
+def test_piecewise_pads_every_rank_without_policy():
+    desc, sync = _run_piecewise_sync([2000, 4, 4, 4], None)
+    assert desc.cg_mode == CUDAGraphMode.PIECEWISE and desc.num_tokens == 2048
+    assert sync is not None and not sync.eager
+    assert sync.num_tokens_across_dp.tolist() == [2048] * 4
+
+
+def test_piecewise_policy_declines_padding_runs_eager_unpadded():
+    seen = []
+
+    def policy(counts, padded):
+        seen.append((counts.tolist(), padded))
+        return False
+
+    desc, sync = _run_piecewise_sync([2000, 4, 4, 4], policy)
+    assert seen == [([2000, 4, 4, 4], 2048)]
+    assert desc.cg_mode == CUDAGraphMode.NONE and desc.num_tokens == 2000
+    assert sync is not None and sync.eager
+    # Every rank keeps its own count (no graph padding).
+    assert sync.num_tokens_across_dp.tolist() == [2000, 4, 4, 4]
+
+
+def test_piecewise_policy_accepts_padding():
+    desc, sync = _run_piecewise_sync([2000, 1900, 2048, 1800], lambda c, p: True)
+    assert desc.cg_mode == CUDAGraphMode.PIECEWISE and desc.num_tokens == 2048
+    assert sync is not None and not sync.eager
+    assert sync.num_tokens_across_dp.tolist() == [2048] * 4

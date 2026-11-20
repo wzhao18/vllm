@@ -14,6 +14,11 @@ from . import cute_cache
 
 logger = init_logger(__name__)
 
+# PIECEWISE (prefill) steps up to this many tokens always pad every DP rank to
+# the capture size (KimiK3ModelState.pad_dp_for_piecewise): measured per-size
+# prefix-hit sweep, graphs vs eager, one prefilling rank of DP4.
+_PIECEWISE_PAD_ALWAYS_MAX_TOKENS = 0
+
 
 class KimiK3ModelState(MambaHybridModelState):
     """Builds the specialized decode once the weights are loaded and the aux layers
@@ -52,6 +57,26 @@ class KimiK3ModelState(MambaHybridModelState):
         # The runner's (InputBuffers, RequestState), seen at any step: the fused step
         # prep compiles against them as soon as it is built (_compile_step_prep).
         self._io = None
+
+    def pad_dp_for_piecewise(
+        self, num_tokens_across_dp: torch.Tensor, padded: int
+    ) -> bool:
+        """Whether a PIECEWISE step (a batch with a prefill) pads every DP rank
+        to the capture size ``padded``; False runs it eager, each rank on its
+        own tokens (identical inputs on every rank, so every rank agrees).
+
+        Padding makes each rank replay the whole ``padded``-token graph: an
+        idle rank's 4-token dummy becomes a full ``padded``-token forward (the
+        MegaMoE needs one EP-uniform bucket, so ranks cannot replay different
+        sizes). With one rank prefilling 2048 tokens the other DP4 ranks spent
+        2/3 of their GPU time on padding and a new request on any rank queued
+        behind those dummy forwards: 2048-token prefix-hit request latency
+        0.11 s padded vs 0.08 s eager (int53, Rhea DEP4 L24). The graph only
+        pays where the ranks are near-balanced or the step is small enough
+        that its launch savings exceed the padded work."""
+        if padded <= _PIECEWISE_PAD_ALWAYS_MAX_TOKENS:
+            return True
+        return 2 * int(num_tokens_across_dp.min()) >= padded
 
     def initialize_kv_cache(self, kv_cache_config, block_tables):
         super().initialize_kv_cache(kv_cache_config, block_tables)

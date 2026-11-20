@@ -840,6 +840,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
         )
+        self.cudagraph_manager.pad_dp_for_piecewise = getattr(
+            self.model_state, "pad_dp_for_piecewise", None
+        )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
                 self.cudagraph_manager, self.max_num_tokens

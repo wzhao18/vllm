@@ -199,6 +199,31 @@ def sync_cudagraph_and_dp_padding(
         max_query_len=synced_max_query_len,
     )
 
+    # A PIECEWISE step pads every rank to one capture size: the model may run
+    # it eager and unpadded instead (same inputs on every rank, same answer).
+    pad_policy = cudagraph_manager.pad_dp_for_piecewise
+    if (
+        synced_desc.cg_mode == CUDAGraphMode.PIECEWISE
+        and pad_policy is not None
+        and not pad_policy(num_tokens_across_dp, synced_desc.num_tokens)
+    ):
+        return (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=desired_batch_desc.num_active_loras,
+            ),
+            DPSyncState(
+                num_tokens_across_dp=num_tokens_across_dp,
+                uniform_token_count=synced_uniform_token_count,
+                max_query_len=synced_max_query_len,
+                eager=True,
+                num_reqs=int(num_reqs_across_dp.max()),
+                skip_drafts=skip_drafts,
+            ),
+        )
+
     # Update num_tokens_across_dp to reflect padded size.
     num_tokens_across_dp[:] = synced_desc.num_tokens
 

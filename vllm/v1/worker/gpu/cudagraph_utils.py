@@ -185,6 +185,12 @@ class CudaGraphManager:
 
         self._graphs_captured = False
 
+        # Optional model hook (ModelState.pad_dp_for_piecewise): given the DP
+        # ranks' token counts and the PIECEWISE capture size they would all be
+        # padded to, whether that padded graph step beats an unpadded eager one.
+        # None: always pad (the stock behaviour).
+        self.pad_dp_for_piecewise: Callable[[torch.Tensor, int], bool] | None = None
+
         # Profiling hooks, set only by profile_cudagraph_memory() below: cap
         # FULL-mode capture at the N largest descriptors and record each
         # captured FULL graph's memory delta for extrapolation.
