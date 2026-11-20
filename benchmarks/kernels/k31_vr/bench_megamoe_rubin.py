@@ -156,6 +156,14 @@ def parse_args():
         default=896,
         help="global experts (EP-size emulation: 224 on EP4 = 56 experts/rank like EP16)",
     )
+    p.add_argument(
+        "--dedup",
+        default=None,
+        choices=("standalone_warps", "reuse_dispatch_warps", "wg2", "wg2s"),
+        help="run the inference record on the refreshed dedup-combine kernel "
+        "(variant inference_dedup) with this token-back transport; wg2: two epilogue "
+        "warpgroups (inference_dedup_wg2, reuse_dispatch_warps)",
+    )
     p.add_argument("--routing", choices=("random", "balanced"), default="random")
     p.add_argument(
         "--active-experts",
@@ -177,6 +185,12 @@ def parse_args():
         help="HIDDEN,INTER: fuse a random MXFP8 E4M3 shared expert of that shape "
         "(Kimi K3.1: 7168,6144) into the GenPhase kernel; reports its rel-L2 vs "
         "the stock MXFP8 chain (FP32 GEMMs, SiTU, MXFP8 requant)",
+    )
+    p.add_argument(
+        "--rmsnorm",
+        action="store_true",
+        help="fuse the consumer RMSNorm (random BF16 weight, Kimi K3.1 latent norm) "
+        "into the top-k reduce, as the decode path deploys it",
     )
     p.add_argument(
         "--shared-l2-position",
@@ -586,6 +600,28 @@ def main():
             )
             for b in buckets
         ]
+    if args.dedup:
+        import dataclasses
+
+        buckets = [
+            dataclasses.replace(
+                b,
+                variant=(
+                    "inference_dedup_wg2"
+                    if args.dedup in ("wg2", "wg2s")
+                    else "inference_dedup"
+                ),
+                knobs=dataclasses.replace(
+                    b.knobs,
+                    token_back_mode=(
+                        {"wg2": "reuse_dispatch_warps", "wg2s": "standalone_warps"}.get(
+                            args.dedup, args.dedup
+                        )
+                    ),
+                ),
+            )
+            for b in buckets
+        ]
     shared_shape = None
     if args.shared:
         import dataclasses
@@ -637,6 +673,12 @@ def main():
             fc1 = die_local.place_halves(fused.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
             fused = fused._replace(fc1=(fc1, fused.fc1[1]))
     moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),), shared=fused)
+    rms = None
+    if args.rmsnorm:
+        gen = torch.Generator(device=device).manual_seed(args.seed + 7)
+        norm_w = (1 + 0.1 * torch.randn(problem.hidden, generator=gen, device=device)).to(torch.bfloat16)
+        rms = (norm_w, 1e-6)
+        moe.prepare_rmsnorm(weights, *rms)
     ident = env_identity(os.path.dirname(mr.__file__))
     cycles_per_us = sleep_cycles_per_us()
     delay_cycles = int(args.delay_us * cycles_per_us)
@@ -670,7 +712,9 @@ def main():
         out = torch.empty(
             (max(n, 1), problem.hidden), dtype=torch.bfloat16, device=device
         )
-        res = moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused)
+        res = moe.forward(
+            hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms
+        )
         torch.cuda.synchronize()
         moe.check_route_errors()
 
@@ -750,10 +794,12 @@ def main():
             result["shared_rel_l2_kernel_vs_exact_act"] = rel(got, exact)
 
         def launch():
-            session.launch(weights, target, shared=fused)
+            session.launch(weights, target, rmsnorm=rms, shared=fused)
 
         def forward():
-            moe.forward(hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused)
+            moe.forward(
+                hidden, ids, wts, weights, bucket=bucket, out=out, shared=fused, rmsnorm=rms
+            )
 
         # eager (FlashInfer tuner protocol of the knob records), then CUDA graphs
         for _ in range(args.warmup):
@@ -813,7 +859,7 @@ def main():
             dist.all_reduce(diff, op=dist.ReduceOp.MAX, group=group)
         line = {
             "quant_kind": problem.quant_kind,
-            "variant": variant,
+            "variant": bucket_of[cap].variant,
             "world_size": world,
             "tokens_per_rank": n,
             "max_tokens": cap,

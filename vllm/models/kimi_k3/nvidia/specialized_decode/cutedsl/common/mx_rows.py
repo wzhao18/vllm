@@ -106,6 +106,27 @@ def quantize8(values):
     return positive_zero32(w0), positive_zero32(w1), word
 
 
+@cute.jit
+def quantize8_plain(values):
+    """``quantize8`` for plain (non-Lamport) stores: (data word 0, data word 1, this
+    lane's block scale) with ``ops.mxfp8_act``'s quant8_store bits (-0 bytes kept).
+    Every lane of 4 adjacent ones holds the scale; lane & 3 == 0 stores it.
+    Warp-collective."""
+    amax = Float32(0)
+    for i in cutlass.range_constexpr(8):
+        amax = max_abs(amax, values[i])
+    amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 1))
+    amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, 2))
+    e = ue8m0(amax * bits_float(Uint32(INV_448)))
+    inv = bits_float(inverse_scale_bits(e))
+    q = cute.make_rmem_tensor(8, Float32)
+    for i in cutlass.range_constexpr(8):
+        q[i] = values[i] * inv
+    w0 = pack_fp8((q[0], q[1], q[2], q[3]))
+    w1 = pack_fp8((q[4], q[5], q[6], q[7]))
+    return w0, w1, e
+
+
 def scale_offset(row, block, padded_cols: cutlass.Constexpr[int]):
     """Byte offset of scale ``block`` (32-column index) of ``row`` in the F8_128x4
     layout with ``padded_cols`` scale columns (``ops.mxfp8_act.swizzled_sf_offset``)."""

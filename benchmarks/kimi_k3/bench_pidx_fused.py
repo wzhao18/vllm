@@ -184,7 +184,7 @@ def perf(args):
 
 
 def lane_counts(cand, t):
-    return cand.view(-1, pidx.SLOTS + 1, pidx.TILE)[:t, 0, :].sum(1)
+    return cand.view(-1, pidx.REGION // pidx.TILE, pidx.TILE)[:t, 0, :].sum(1)
 
 
 def sel_plan(d):
@@ -242,6 +242,12 @@ def perf_sel(args):
     res["publish"] = timed(lambda: pidx.score(
         d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
         sp.cand_base, cand.view(torch.bfloat16), rb0, mode=pidx.PUBLISH), args.iters)
+    for epi, name in ((1, "publish_skeleton"), (2, "publish_half_math"), (3, "publish_mma_only"), (4, "publish_ld_only")):
+        rb2, cand2 = row_bin.clone(), cand.clone()
+        res[name] = timed(lambda: pidx.score(
+            d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
+            sp.cand_base, cand2.view(torch.bfloat16), rb2, mode=pidx.PUBLISH, epi=epi),
+            args.iters)
     res["score_store"] = timed(lambda: run_score(d), args.iters)
     args5 = (sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"])
     res["thresholds"] = timed(lambda: pidx.thresholds(*args5), args.iters)
@@ -249,11 +255,36 @@ def perf_sel(args):
     res["total_recover_all"] = timed(lambda: pidx.selective_topk(
         sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], d["out"],
         recover_all=True), args.iters)
-    k3 = pidx._cand_select_kernel(2048)
     st = torch.cuda.current_stream().cuda_stream
-    res["cand_select"] = timed(lambda: k3(cand, sp.row_len, rb0, d["out"].view(-1), st),
-                               args.iters)
+    ctas = pidx.CS2_CTAS_PER_SM * torch.cuda.get_device_properties(0).multi_processor_count
+    for name, sk in (("cand_select", False), ("cand_select_skeleton", True)):
+        k4 = pidx._cand_select2_kernel(2048, ctas, sk)
+        rb1 = rb0.clone()
+        res[name] = timed(lambda: k4(cand, sp.row_len, rb1, d["out"].view(-1), st),
+                          args.iters)
     print("perf_sel", json.dumps(res), flush=True)
+    return res
+
+
+def perf_ref(args):
+    """Same-process A/B: the selective path of benchmarks/kimi_k3/pidx_ref_9eca.py
+    (the landed kernels) vs this tree, PUBLISH and total, interleaved."""
+    import importlib.util
+    import os
+    spec = importlib.util.spec_from_file_location(
+        "pidx_ref", os.path.join(os.path.dirname(__file__), "pidx_ref_9eca.py"))
+    ref = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ref)
+    d = make([(5461, 78360), (5461, 78360), (5462, 78360)], seed=0)
+    res = {}
+    for name, mod in (("ref", ref), ("new", pidx), ("ref2", ref), ("new2", pidx)):
+        sp = mod.SelectivePlan([r for r, _ in d["reqs"]], [kv for _, kv in d["reqs"]],
+                               d["bases"], "cuda")
+        a = (sp, d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"])
+        res[name + "_total"] = timed(lambda: mod.selective_topk(*a, d["out"]), args.iters)
+        mod.thresholds(*a)
+        res[name + "_publish"] = timed(lambda: mod.publish(*a), args.iters)
+    print("perf_ref", json.dumps(res), flush=True)
     return res
 
 
@@ -269,8 +300,15 @@ def main():
     ap.add_argument("--smodes", type=int, nargs="+", default=[0])
     ap.add_argument("--json", default="")
     ap.add_argument("--sel", action="store_true")
+    ap.add_argument("--ref", action="store_true")
     ap.add_argument("--ncu", action="store_true")
+    ap.add_argument("--samples", type=int, default=0)
+    ap.add_argument("--margin", type=float, default=0.0)
     a = ap.parse_args()
+    if a.samples:
+        pidx.SAMPLES = a.samples
+    if a.margin:
+        pidx.MARGIN = a.margin
     out = {}
     if a.check:
         out["check"] = check(a)
@@ -284,6 +322,8 @@ def main():
     if a.sel:
         out["check_sel"] = [check_sel([(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000), (3, 140000)], zero=list(range(337, 346))), check_sel([(700, 78360)], seed=3)]
         out["perf_sel"] = perf_sel(a)
+    if a.ref:
+        out["perf_ref"] = perf_ref(a)
     if a.perf:
         out["perf"] = perf(a)
     if a.json:

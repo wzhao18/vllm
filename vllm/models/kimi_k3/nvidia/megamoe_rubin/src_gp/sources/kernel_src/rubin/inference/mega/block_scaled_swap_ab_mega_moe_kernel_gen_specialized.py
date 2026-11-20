@@ -132,6 +132,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     shared_fc1_output_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_output"
     shared_fc1_output_sf_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_output_sf"
     shared_fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_done_counter"
+    # vLLM-local: per-CTA "stores drained" arrivals that the standalone reduce acquires (VENDOR.md).
+    producer_done_region: ClassVar[str] = "rubin.genphase_moe.producer_done"
 
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
@@ -322,16 +324,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self._resolve_shared_expert(problem_desc, impl_desc)
 
         if self.die_aware != "off" and self.promised_launchable_sm_count <= self.largest_die_sm_count:
-            # Requiring more CTAs than one die can hold guarantees both dies only under K6's full-residency premise.
-            # n_split needs this for liveness; expert_half imposes the same guard for locality.
-            needs = (
-                "n_split needs more than {count} resident CTAs (K6: a cluster on each die)"
-                if self.n_split
-                else "expert_half is only supported with more than {count} resident CTAs (a cluster on each die; "
-                "liveness does not need it, the die-aware placement does)"
-            )
+            # Requiring more CTAs than one die can hold guarantees both dies only under K6's full-residency premise,
+            # which both die-aware forms need for liveness (no cluster steals the other die's FC1).
+            needs = "{form} needs more than {count} resident CTAs (K6: a cluster on each die)"
             raise ValueError(
-                f"{needs.format(count=self.largest_die_sm_count)}, got {self.launch_cluster_count} x "
+                f"{needs.format(form=self.die_aware, count=self.largest_die_sm_count)}, "
+                f"got {self.launch_cluster_count} x "
                 f"{self.cluster_size}."
             )
 
@@ -440,7 +438,27 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 batch_invariant=bool(problem_desc.get("batch_invariant", False)),
                 shared_term=self.reduce_shared_output,
                 outlive_producer=self.shared_expert and self.epilogue.combine_ll_encoded,
+                producer_arrivals=(
+                    self.promised_launchable_sm_count if self.reduce_acquires_producer_done else None
+                ),
+                norm_split=self.reduce_norm_split,
             )
+        )
+
+    # vLLM-local: CTAs per token row of the fused-RMSNorm reduce (TopkReduce ``norm_split``). One whole-row CTA
+    # (448 threads x 128 registers at hidden 3584) needs an empty SM, so it waits for this grid's CTAs to exit;
+    # quarter-row CTAs fit beside them and the reduce spreads over every SM.
+    reduce_norm_split: ClassVar[int] = 4
+
+    @property
+    def reduce_acquires_producer_done(self) -> bool:
+        """The fused shared output is the one output the standalone reduce does not poll; its completion is
+        ordered through per-CTA arrivals instead of the reduce waiting for this grid's completion."""
+        return (
+            self.shared_expert
+            and not self.reduce_topk_in_kernel
+            and self.epilogue.combine_ll_encoded
+            and not self.reduce_shared_output
         )
 
     # ------------------------------------------------------------------
@@ -659,6 +677,15 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 buffer_space="shared",
                 mem_order=(2, 1, 0),
                 byte_alignment=128,
+                reset="zero_on_first_allocate",
+            )
+        if self.reduce_acquires_producer_done:
+            device_workspace.register(
+                self.producer_done_region,
+                cutlass.Int32,
+                (1,),
+                buffer_space="local",
+                byte_alignment=16,
                 reset="zero_on_first_allocate",
             )
         self.scheduler.register_device_workspace(device_workspace)
@@ -1178,6 +1205,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 f"promised_launchable_sm_count, got grid {grid} ({grid_cta_count} CTAs), "
                 f"{self.launch_cluster_count} x {self.cluster_size}, {self.promised_launchable_sm_count}."
             )
+        producer_done = None
+        if cutlass.const_expr(self.reduce_acquires_producer_done):
+            producer_done = self._device_workspace.tensor(self.producer_done_region)
         self._device_workspace.remove_device_members()
         self._kernel(
             fc1_tma_a_tensor,
@@ -1237,6 +1267,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 shared_term=shared_output if cutlass.const_expr(self.reduce_shared_output) else None,
                 rmsnorm_weight=rmsnorm_weight,
                 rmsnorm_eps=rmsnorm_eps,
+                producer_done=producer_done,
             )
         elif cutlass.const_expr(rmsnorm_weight is not None):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
@@ -1859,6 +1890,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 lane_idx = cute.arch.lane_idx()
                 is_last = Int32(0)
                 if lane_idx == Int32(0):
+                    if cutlass.const_expr(self.reduce_acquires_producer_done):
+                        # The reduce's completion orders the shared output through this arrival.
+                        cute.arch.atomic_add(
+                            self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="acq_rel", scope="gpu"
+                        )
                     if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))

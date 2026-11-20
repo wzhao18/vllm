@@ -822,7 +822,7 @@ class SparseMlaPrefill:
                 mbar_arrive(_bar(base, B_OFREE))
 
 
-# Per-shape dispatch: calls of at least MIN_ROWS rows (prefill chunks) run the h6
+# Per-shape dispatch: calls of at least MIN_ROWS rows (prefill chunks) run the h8
 # persistent kernel; smaller ones (decode, short chunks) keep the stock kernel.
 MIN_ROWS = 1024
 LOADERS = 3
@@ -860,12 +860,12 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None) -> torch.Tensor:
     """Prefill-sized DSA sparse MLA on Rubin (the dispatched kernel, see
-    sparse_mla_h6). Same contract as sparse_mla_prefill_v1."""
-    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h6 import (
-        sparse_mla_prefill_h6,
+    sparse_mla_h8). Same contract as sparse_mla_prefill_v1."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+        sparse_mla_prefill_h8,
     )
 
-    return sparse_mla_prefill_h6(q8, kv_rows, slots, lengths, scale, out_scale,
+    return sparse_mla_prefill_h8(q8, kv_rows, slots, lengths, scale, out_scale,
                                  unit_rows=unit_rows, out=out)
 
 
