@@ -135,7 +135,7 @@ def _get_compiled(
         sptn = torch.full((G,), T // 2, dtype=torch.int32, device=dev)
         ssrc = torch.full((G,), -1, dtype=torch.int32, device=dev)
         sdst = torch.full((G,), -1, dtype=torch.int32, device=dev)
-        srow_d = torch.zeros(2 * G, dtype=torch.int32, device=dev)
+        srow_d = torch.zeros(2 * G, dtype=torch.int64, device=dev)
         mid = torch.empty(
             2, D, D, dtype=torch.bfloat16 if mid_bf16 else torch.float32, device=dev
         )
@@ -159,7 +159,7 @@ def _get_compiled(
                 from_dlpack(dtb, assumed_align=16),
                 mk(st),
                 mk(ns),
-                mk(srow_d, 4),
+                mk(srow_d, 8),
                 mk(out),
                 mk(cu_t, 4),
                 mk(soff, 4),
@@ -251,33 +251,32 @@ _DUMMY_SROW: dict = {}
 def _dummy_srow(dev: torch.device):
     tensor = _DUMMY_SROW.get(dev.index)
     if tensor is None:
-        tensor = torch.zeros(2, dtype=torch.int32, device=dev)
+        tensor = torch.zeros(2, dtype=torch.int64, device=dev)
         _DUMMY_SROW[dev.index] = tensor
     return tensor
 
 
 def state_cache_rows(cache, indices, has_initial_state, H: int):
     """In-place state I/O on the recurrent-state cache ``cache`` [slots, H, D, D]
-    (FP32, each slot dense; slot stride a multiple of D*D elements).
+    (FP32; each (D, D) block dense, any slot stride, e.g. the hybrid cache's
+    shared per-slot page).
 
-    Returns ``(rows, srow)``: ``rows`` is a flat (R, D, D) view of the cache
-    storage and ``srow`` the int32 [2 * N * H] chain->row table (load row, or
-    -1 for a zero initial state; then store row) for ``fwd(..., srow=srow)``.
-    Same result as gather_initial_states + fwd + write_state_rows.
+    Returns ``(rows, srow)``: ``rows`` is a (1, D, D) view at the cache storage
+    base and ``srow`` the int64 [2 * N * H] chain -> element offset table (load
+    offset, or -1 for a zero initial state; then store offset) for
+    ``fwd(..., srow=srow)``. Same result as gather_initial_states + fwd +
+    write_state_rows.
     """
     assert cache.dtype == torch.float32 and cache.shape[1:] == (H, D, D)
     assert cache.stride()[1:] == (D * D, D, 1)
-    rs, rem = divmod(cache.stride(0), D * D)
-    if rem:
-        raise ValueError(f"state slot stride {cache.stride(0)} is not a multiple of {D * D}")
-    nrows = rs * (cache.shape[0] - 1) + H
-    rows = cache.as_strided((nrows, D, D), (D * D, D, 1))
+    assert cache.stride(0) % 8 == 0, "state slots must be 32-byte aligned"
+    rows = cache.as_strided((1, D, D), (D * D, D, 1))
     n = indices.numel()
-    base = indices.to(torch.int32).view(n, 1) * rs + torch.arange(
-        H, dtype=torch.int32, device=cache.device
-    )
+    base = indices.to(torch.int64).view(n, 1) * cache.stride(0) + torch.arange(
+        H, dtype=torch.int64, device=cache.device
+    ) * (D * D)
     load = torch.where(has_initial_state[:n].view(n, 1).bool(), base, -1)
-    srow = torch.cat((load.reshape(-1), base.reshape(-1))).to(torch.int32)
+    srow = torch.cat((load.reshape(-1), base.reshape(-1)))
     return rows, srow
 
 
@@ -356,7 +355,7 @@ def _launch_forward(
         # initial_state / final_state are the same flat (rows, D, D) view of
         # the recurrent-state cache; srow maps chains to its rows.
         assert initial_state is not None and final_state is not None
-        assert srow.numel() == 2 * nseqs * H and srow.dtype == torch.int32
+        assert srow.numel() == 2 * nseqs * H and srow.dtype == torch.int64
     st = initial_state if initial_state is not None else final_state
     if st.dtype != torch.float32:
         st = st.float()

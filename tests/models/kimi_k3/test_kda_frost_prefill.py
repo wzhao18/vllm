@@ -118,10 +118,16 @@ def test_persistent_prefill_state_in_place(lens, heads):
     beta = torch.randn(1, T, H, device="cuda").to(bf)
     A_log = torch.randn(H, device="cuda") * 0.5
     dt_bias = torch.randn(H * D, device="cuda") * 0.1
-    slots = N + 5
-    raw = torch.randn(slots, H + 1, D, D, device="cuda") * 0.1
-    cache = raw[:, :H]  # slot stride (H + 1) * D * D
-    idx = torch.randperm(slots, device="cuda")[:N].to(torch.int32)
+    # Production layout: the hybrid cache's per-slot page stride (83897856
+    # elements) is not a multiple of D * D, and slot offsets pass 2**31
+    # elements, so the kernel needs 64-bit, non-block-aligned slot offsets.
+    sstride = 83897856
+    slots = 2 * N + 1 + (2**31 // sstride)
+    flat = torch.empty(slots * sstride, device="cuda")
+    cache = flat.as_strided((slots, H, D, D), (sstride, D * D, D, 1))
+    idx = torch.randperm(slots - 1, device="cuda")[: N - 1].to(torch.int32)
+    idx = torch.cat((idx, torch.tensor([slots - 1], device="cuda", dtype=torch.int32)))
+    cache[idx.long()] = torch.randn(N, H, D, D, device="cuda") * 0.1
     has = torch.ones(N, dtype=torch.bool, device="cuda")
     has[N // 2] = False
     h0 = cache[idx.long()].clone()
@@ -129,8 +135,8 @@ def test_persistent_prefill_state_in_place(lens, heads):
     o_ref, fs_ref = sp_kda.persistent_prefill(
         q, k, v, g, beta, A_log, dt_bias, -5.0, h0, cu, cu_cpu
     )
-    expect = raw.clone()
-    expect[idx.long(), :H] = fs_ref
+    pages = flat.view(slots, sstride)
+    pages[idx.long(), H * D * D :] = 7.0  # the rest of each touched page
     o, fs = sp_kda.persistent_prefill(
         q, k, v, g, beta, A_log, dt_bias, -5.0, None, cu, cu_cpu,
         state_cache=cache, state_indices=idx, has_initial_state=has,
@@ -138,7 +144,8 @@ def test_persistent_prefill_state_in_place(lens, heads):
     torch.accelerator.synchronize()
     assert fs is None
     assert torch.equal(o, o_ref)
-    assert torch.equal(raw, expect)
+    assert torch.equal(cache[idx.long()], fs_ref)
+    assert bool((pages[idx.long(), H * D * D :] == 7.0).all())
 
 
 def test_frost_strided_beta():

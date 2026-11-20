@@ -664,11 +664,19 @@ def _pkd(
             chain = cute.arch.make_warp_uniform(schain[k0 + kx])
             crow_i = chain
             crow_o = chain
+            st_i = state0
+            st_o = stateT
             if cutlass.const_expr(SROW_ == 1):
-                crow_i = cute.arch.make_warp_uniform(srow[chain])
-                crow_o = cute.arch.make_warp_uniform(
-                    srow[srow.shape[0] // 2 + chain]
-                )
+                # srow holds 64-bit element offsets of the (D, D) state blocks in
+                # the cache storage (-1 load = zero initial state); rebase the
+                # state tensors per chain so all in-block indexing stays 32-bit.
+                off_i = cutlass.Int64(srow[chain])
+                off_o = cutlass.Int64(srow[srow.shape[0] // 2 + chain])
+                neg_i = off_i >> 63
+                crow_i = cutlass.Int32(neg_i)
+                crow_o = cutlass.Int32(0)
+                st_i = cute.make_tensor(state0.iterator + (off_i & ~neg_i), state0.layout)
+                st_o = cute.make_tensor(stateT.iterator + off_o, stateT.layout)
             seq_idx = chain // H_
             hidx = chain % H_
             # piece-of-chain descriptor (v96 split): token window + state
@@ -735,7 +743,7 @@ def _pkd(
                                         r_mst.iterator + 8 * jj, cute.make_layout((8,))
                                     )
                                     g8i = cute.local_tile(
-                                        state0,
+                                        st_i,
                                         (1, 1, 8),
                                         (crow_i, vv0, win * 4 + jj),
                                     )
@@ -761,7 +769,7 @@ def _pkd(
                                 r_mst.iterator + 8 * jj, cute.make_layout((8,))
                             )
                             g8i = cute.local_tile(
-                                state0, (1, 1, 8), (crow_i, vv0, win * 4 + jj)
+                                st_i, (1, 1, 8), (crow_i, vv0, win * 4 + jj)
                             )
                             if cutlass.const_expr(SROW_ == 1):
                                 if crow_i >= 0:
@@ -1028,7 +1036,7 @@ def _pkd(
                                 if cutlass.const_expr(FINAL_ == 1):
                                     if sexp == -1:
                                         g8o = cute.local_tile(
-                                            stateT,
+                                            st_o,
                                             (1, 1, 8),
                                             (crow_o, vv2, win * 4 + jj),
                                         )
@@ -1037,14 +1045,14 @@ def _pkd(
                             if cutlass.const_expr(WARM_SPLIT_ == 1):
                                 if sexp == -1:
                                     g8o = cute.local_tile(
-                                        stateT,
+                                        st_o,
                                         (1, 1, 8),
                                         (crow_o, vv2, win * 4 + jj),
                                     )
                                     _store_final_f32x8(g8o, r8o)
                             else:
                                 g8o = cute.local_tile(
-                                    stateT, (1, 1, 8), (crow_o, vv2, win * 4 + jj)
+                                    st_o, (1, 1, 8), (crow_o, vv2, win * 4 + jj)
                                 )
                                 _store_final_f32x8(g8o, r8o)
             if cutlass.const_expr(SPLIT_ == 1):
@@ -1149,11 +1157,19 @@ def _pkd(
             chain = cute.arch.make_warp_uniform(schain[k0 + kx])
             crow_i = chain
             crow_o = chain
+            st_i = state0
+            st_o = stateT
             if cutlass.const_expr(SROW_ == 1):
-                crow_i = cute.arch.make_warp_uniform(srow[chain])
-                crow_o = cute.arch.make_warp_uniform(
-                    srow[srow.shape[0] // 2 + chain]
-                )
+                # srow holds 64-bit element offsets of the (D, D) state blocks in
+                # the cache storage (-1 load = zero initial state); rebase the
+                # state tensors per chain so all in-block indexing stays 32-bit.
+                off_i = cutlass.Int64(srow[chain])
+                off_o = cutlass.Int64(srow[srow.shape[0] // 2 + chain])
+                neg_i = off_i >> 63
+                crow_i = cutlass.Int32(neg_i)
+                crow_o = cutlass.Int32(0)
+                st_i = cute.make_tensor(state0.iterator + (off_i & ~neg_i), state0.layout)
+                st_o = cute.make_tensor(stateT.iterator + off_o, stateT.layout)
             seq_idx = chain // H_
             hidx = chain % H_
             bos = cutlass.Int32(cu[seq_idx]) + cute.arch.make_warp_uniform(
@@ -1214,7 +1230,7 @@ def _pkd(
                                         cute.make_layout((8,)),
                                     )
                                     g8i = cute.local_tile(
-                                        state0,
+                                        st_i,
                                         (1, 1, 8),
                                         (crow_i, vv0, 8 + hh * 2 + jj),
                                     )
@@ -1240,7 +1256,7 @@ def _pkd(
                                 r_e1.iterator + 8 * jj, cute.make_layout((8,))
                             )
                             g8i = cute.local_tile(
-                                state0, (1, 1, 8), (crow_i, vv0, 8 + hh * 2 + jj)
+                                st_i, (1, 1, 8), (crow_i, vv0, 8 + hh * 2 + jj)
                             )
                             if cutlass.const_expr(SROW_ == 1):
                                 if crow_i >= 0:
@@ -1477,7 +1493,7 @@ def _pkd(
                                 if cutlass.const_expr(FINAL_ == 1):
                                     if sexp == -1:
                                         g8o = cute.local_tile(
-                                            stateT,
+                                            st_o,
                                             (1, 1, 8),
                                             (crow_o, vv2e, 8 + hh * 2 + jj),
                                         )
@@ -1486,14 +1502,14 @@ def _pkd(
                             if cutlass.const_expr(WARM_SPLIT_ == 1):
                                 if sexp == -1:
                                     g8o = cute.local_tile(
-                                        stateT,
+                                        st_o,
                                         (1, 1, 8),
                                         (crow_o, vv2e, 8 + hh * 2 + jj),
                                     )
                                     _store_final_f32x8(g8o, r8o)
                             else:
                                 g8o = cute.local_tile(
-                                    stateT, (1, 1, 8), (crow_o, vv2e, 8 + hh * 2 + jj)
+                                    st_o, (1, 1, 8), (crow_o, vv2e, 8 + hh * 2 + jj)
                                 )
                                 _store_final_f32x8(g8o, r8o)
             if cutlass.const_expr(SPLIT_ == 1):
