@@ -170,17 +170,16 @@ _claims: dict[int, torch.Tensor] = {}
 
 
 def _schedule_args(blocks: torch.Tensor):
-    """(sm_die, SMs of die 0, SMs of die 1, claim): balanced die-aware token
-    claims when ``blocks`` is the die-local block buffer, else plain claims
-    (sm_die None)."""
+    """(sm_die, claim): die-aware token claims when ``blocks`` is the
+    die-local block buffer, else plain claims (sm_die None)."""
     sm_die, claim = attn_res_dielocal.kernel_args(blocks)
     if claim is not None:
-        return (sm_die, *attn_res_dielocal.die_sm_counts(blocks.device.index), claim)
+        return sm_die, claim
     dev = blocks.device.index
     claim = _claims.get(dev)
     if claim is None:
         claim = _claims[dev] = torch.zeros(4, dtype=torch.int32, device=blocks.device)
-    return None, 0, 0, claim
+    return None, claim
 
 
 def begin(plan: Plan, blocks: torch.Tensor) -> None:
