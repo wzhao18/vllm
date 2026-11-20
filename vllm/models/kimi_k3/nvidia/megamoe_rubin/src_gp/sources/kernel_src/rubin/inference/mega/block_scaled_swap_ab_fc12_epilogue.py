@@ -52,6 +52,7 @@ from ......common.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cvt_f32_to_fp8_to_f32,
+    fence_proxy_async_release_sys,
     movmatrix_b16,
     red_add_relaxed_sys_v2_bf16x2,
     sigmoid_pair_tanh_approx,
@@ -1618,8 +1619,12 @@ class SwapABGatedActEpilogue(KernelComponent):
         # Tail flush
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
-            # The FC2 tiles above drained only their reads; leave with every write landed.
+            # The FC2 tiles above drained only their reads; leave with every write landed,
+            # and push them out to the peers now (async proxy -> generic, system scope):
+            # the polled reduce of every rank waits for its cells, which are otherwise
+            # only flushed when this grid ends.
             cute.arch.cp_async_bulk_wait_group(0)
+            fence_proxy_async_release_sys()
 
 
 @cute.jit

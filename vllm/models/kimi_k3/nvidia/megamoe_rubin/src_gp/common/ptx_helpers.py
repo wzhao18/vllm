@@ -490,6 +490,22 @@ def red_add_relaxed_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) 
 
 
 @dsl_user_op
+def fence_proxy_async_release_sys(*, loc=None, ip=None) -> None:
+    """Order this thread's completed async-proxy (TMA) global writes before its later generic
+    operations, then release everything it wrote at system scope (peer GPUs)."""
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;\n\tfence.acq_rel.sys;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_f32(
     address, value: Float32, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
 ) -> None:
