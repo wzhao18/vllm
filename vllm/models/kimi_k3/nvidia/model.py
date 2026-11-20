@@ -368,22 +368,38 @@ class KimiVecSituAndMul(nn.Module):
     SituAndMul module itself, through its own dispatch; the vectorized kernel is
     bitwise its CUDA op (forward_cuda). Where the custom op dispatches to
     forward_native instead, the large inputs keep the CUDA op's bits (the same FP32
-    math, one BF16 rounding)."""
+    math, one BF16 rounding).
+
+    Prefill chunks (from ``_FAST_MIN_ROWS`` rows; the dense layer is 16K x 18432
+    at F16K) use the routed experts' MUFU-light SiTU form, as the shared experts'
+    MXFP8 SiTU does at prefill (``mxfp8_act.SITU_FAST_MIN_ROWS``): the
+    precise-tanhf kernel is FMA-issue bound at ~5x its HBM floor there, and the
+    fast form stays within one BF16 ulp of it."""
 
     _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
+    _FAST_MIN_ROWS = 4096
 
     def __init__(self, beta: float, linear_beta: float | None):
         super().__init__()
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
         self.small = SituAndMul(beta=self.beta, linear_beta=self.linear_beta)
+        from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import warmup
 
-        warmup()  # build / load the JIT extension at model init, not mid-step
+        warmup()  # build / load the JIT extensions at model init, not mid-step
+        mxfp8_act.warmup()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() // 2 < self._VEC_MIN_OUT_ELEMS:
             return self.small(x)
+        if x.numel() // x.shape[-1] >= self._FAST_MIN_ROWS:
+            from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+            if mxfp8_act.situ_fast_bf16_supported(x.shape[-1] // 2):
+                return mxfp8_act.situ_and_mul_fast_bf16(
+                    x, self.beta, self.linear_beta
+                )
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
 
         return situ_and_mul(x, self.beta, self.linear_beta)

@@ -89,3 +89,37 @@ def test_situ_auto_dispatch_by_rows():
         want = fn(x, 4.0, 25.0)
         assert torch.equal(got.data.view(torch.uint8), want.data.view(torch.uint8))
         assert torch.equal(got.scale, want.scale)
+
+
+def _ulp_dist(a, b):
+    """BF16 ulp distance (+0 and -0 coincide)."""
+
+    def ordered(t):
+        i = t.view(torch.int16).int()
+        return torch.where(i < 0, -(i & 0x7FFF), i)
+
+    return (ordered(a) - ordered(b)).abs()
+
+
+@pytest.mark.parametrize("beta,linear_beta", BETAS)
+@pytest.mark.parametrize("rows,d", [(4096, 1536), (257, 18432)])
+def test_situ_fast_bf16_is_mode4_values(beta, linear_beta, rows, d):
+    """The BF16 fast form (prefill dense SiTU MLP) returns exactly the BF16
+    values mode 4 quantizes, within one BF16 ulp of the precise form."""
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+    from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
+
+    torch.manual_seed(rows + d)
+    x = (torch.randn(rows, 2 * d, device="cuda") * 4.0).to(torch.bfloat16)
+    x[0, :64] = torch.linspace(-80, 80, 64, device="cuda").to(torch.bfloat16)
+    x[0, d : d + 64] = torch.linspace(-300, 300, 64, device="cuda").to(torch.bfloat16)
+    x[1] = 0
+    fast = mxfp8_act.situ_and_mul_fast_bf16(x, beta, linear_beta)
+    precise = situ_and_mul(x, beta, linear_beta)
+    assert torch.isfinite(fast.float()).all()
+    assert _ulp_dist(fast, precise).max().item() <= 1
+    want = mxfp8_act.situ_and_mul_quantize_fast(x, beta, linear_beta)
+    got = mxfp8_act.quantize(fast)
+    assert torch.equal(got.data.view(torch.uint8), want.data.view(torch.uint8))
+    assert torch.equal(got.scale, want.scale)
+
