@@ -280,6 +280,37 @@ class SharedExpertKernelMixin:
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.shared_k_splits != (1, 1):
+            # Split shared tiles: one FP32 accumulator image per (CTA tile, K part), column-major so a warp's
+            # 32 rows of one token column are one 128-byte line; one arrival counter per CTA tile.
+            slots = self._shared_split_slot_counts()
+            device_workspace.register(
+                self.shared_split_partials_region,
+                cutlass.Float32,
+                ((slots[0] * self.shared_k_splits[0] + slots[1] * self.shared_k_splits[1])
+                 * self.cta_tile_m * self.cta_tile_n,),
+                buffer_space="local",
+                byte_alignment=128,
+            )
+            device_workspace.register(
+                self.shared_split_counter_region,
+                cutlass.Int32,
+                (slots[0] + slots[1],),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="tail_reset",
+            )
+
+    def _shared_split_tile_rows(self) -> Tuple[int, int]:
+        """CTA tiles per shared token block of the shared FC1 / FC2 (feature rows / CTA tile M)."""
+        return (
+            ceil_div(self.shared_intermediate_gateup_size, self.cta_tile_m),
+            ceil_div(self.shared_output_size, self.cta_tile_m),
+        )
+
+    def _shared_split_slot_counts(self) -> Tuple[int, int]:
+        rows = self._shared_split_tile_rows()
+        return (rows[0] * self.scheduler.shared_token_blocks, rows[1] * self.scheduler.shared_token_blocks)
 
     def _shared_name_suffix(self) -> str:
         if not self.shared_expert:
@@ -510,6 +541,15 @@ class SharedExpertKernelMixin:
             shared_kernel_extension = dataclasses.replace(
                 kernel_extension, sf_vec_size=self.shared_quant_kind.sf_vec_size, shared_k_part_elems=part_elems
             )
+        split_kwargs = {}
+        if self.shared_k_splits != (1, 1):
+            split_kwargs = dict(
+                k_splits=self.shared_k_splits,
+                split_tile_rows=self._shared_split_tile_rows(),
+                split_slot_counts=self._shared_split_slot_counts(),
+                split_partials=self._device_workspace.tensor(self.shared_split_partials_region),
+                split_counters=self._device_workspace.tensor(self.shared_split_counter_region),
+            )
         bindings = SharedEpilogueBindings(
             base=self.shared_epilogue,
             kernel_extension=shared_kernel_extension,
@@ -522,6 +562,7 @@ class SharedExpertKernelMixin:
             fc2_tma_output=shared_fc2_output_tma_tensor,
             # mxfp8 carries its whole rescale in the e8m0 block scales: no alpha or norm constant.
             epi_args=GatedActEpilogueArgs(fc1_alpha=None, fc2_alpha=None, fc1_norm_const=None, topk_scores=None),
+            **split_kwargs,
         )
         return shared_kernel_extension, bindings
 

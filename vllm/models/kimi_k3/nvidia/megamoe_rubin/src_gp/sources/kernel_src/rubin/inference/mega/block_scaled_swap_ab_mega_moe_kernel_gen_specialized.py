@@ -132,6 +132,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     shared_fc1_output_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_output"
     shared_fc1_output_sf_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_output_sf"
     shared_fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.shared_fc1_done_counter"
+    shared_split_partials_region: ClassVar[str] = "rubin.genphase_moe.shared_split_partials"
+    shared_split_counter_region: ClassVar[str] = "rubin.genphase_moe.shared_split_counter"
     # vLLM-local: per-CTA "stores drained" arrivals that the standalone reduce acquires (VENDOR.md).
     producer_done_region: ClassVar[str] = "rubin.genphase_moe.producer_done"
 
