@@ -63,9 +63,11 @@ from .flow import (
     SUMS,
     K,
     KdaFlow,
+    bulk_commit,
     clock64,
     couplings,
     load_global_u32x4,
+    store_bulk,
     store_shared_f32x4,
     store_shared_u32x4,
 )
@@ -77,22 +79,23 @@ from .specialized import (
     load_shared_u32x2,
     set_max_registers,
     sync_threads,
+    wait_bulk_reads,
 )
 from .wide import rsqrt_ftz
 
-PAIR_THREADS = 128  # a prep / tail warpgroup (two: items g, g + 2, ...)
+PREP_THREADS = TAIL_THREADS = 128
 SCAN_THREADS = 256
-SCAN_BASE = 2 * PAIR_THREADS  # the first scan thread
+SCAN_BASE = PREP_THREADS + TAIL_THREADS  # the first scan thread
 THREADS = SCAN_BASE + SCAN_THREADS
 SCAN_WARPS = SCAN_THREADS // 32
 QROWS = 4  # state rows per scan thread: 4 (c // 8) + [0, 4)
 EIGHTH = PAGE_BYTES // SCAN_WARPS  # a scan warp's rows 16 w + [0, 16) of a page
 SLOTS = 2  # the CTA's state page ring (item j: slot j % SLOTS)
-NOPS = 4  # operand blocks (item j: block j % NOPS; reused by the same pair)
-NSTAGE = 4  # prep input staging buffers (item j: buffer j % NSTAGE)
-PAIR_BAR = 1  # named barriers 1 + g of the pair warpgroups (0: the CTA's)
-# setmaxnreg per warpgroup: (96 + 96 + 160 + 160) x 128 = 128 x 512.
-PAIR_REGISTERS, SCAN_REGISTERS = 96, 160
+NOPS = 3  # operand blocks (item j: block j % NOPS): prep j + 1, scan j, tail j - 1
+NSTAGE = 3  # prep input staging buffers (item j: buffer j % NSTAGE)
+PREP_BAR, TAIL_BAR = 1, 2  # named barriers (0: the CTA's)
+# setmaxnreg per warpgroup: 104 x 128 + 88 x 128 + 160 x 256 = 128 x 512.
+PREP_REGISTERS, TAIL_REGISTERS, SCAN_REGISTERS = 104, 88, 160
 
 
 def shared_bytes(tokens, window, conv_size):
@@ -102,8 +105,9 @@ def shared_bytes(tokens, window, conv_size):
     tables = MAX_ITEMS * (tokens * K * 2 + (META + 8) * 4)  # raw gates, table, betas
     block = 5 * tokens * K * 4 + K * 4 + tokens * tokens * 4 + tokens * K * 2
     staging = 3 * K * window * conv_size + tokens * K * (3 * 2 + 2 + 4 + 4)
-    sums = 2 * SUMS * 16 + 2 * 64 + 2 * K * 2 * tokens * 4
-    return pages + heads + tables + NOPS * block + NSTAGE * staging + sums + 4096
+    sums = SUMS * 16 + 2 * 64 + 2 * K * 2 * tokens * 4
+    store = PAGE_BYTES  # the committed checkpoint buffer
+    return pages + heads + tables + NOPS * block + NSTAGE * staging + sums + store + 4096
 
 
 @asm()
@@ -177,16 +181,16 @@ class KdaRing(KdaFlow):
         gs = alloc(smem, BFloat16, (NSTAGE, T, K), align=128)
         kgs = alloc(smem, BFloat16, (NSTAGE, T, 2 * K), align=128)
         uss = alloc(smem, Float32, (NSTAGE, T, K), align=128)
-        psums = alloc(smem, Float32, (2, SUMS, 4))  # pair, sum, warp
-        psum2 = alloc(smem, Float32, (2, 4, 4))  # pair, token, warp
+        psums = alloc(smem, Float32, (SUMS, 4))
+        psum2 = alloc(smem, Float32, (2, 4, 4))  # parity, token, warp
         rsum = alloc(smem, Float32, (2, K, 2 * T), align=16)  # parity, row, 2q sums
-        bars = smem.allocate(cutlass.Uint64, SLOTS + 2 * NOPS + 4 + NSTAGE + 2)
+        sbuf = alloc(smem, Float32, (K, K), align=1024)  # the committed checkpoint
+        bars = smem.allocate(cutlass.Uint64, SLOTS + 2 * NOPS + 4 + NSTAGE + 1)
         state_full, ops_full, ops_empty = bars, bars + SLOTS, bars + SLOTS + NOPS
         dots_full = bars + SLOTS + 2 * NOPS
         dots_empty = dots_full + 2
         stage_full = dots_full + 4
         fb_full = stage_full + NSTAGE
-        gates_ready = fb_full + 1  # every warp's gate projection (F_B, F_A read)
         # Prologue scratch: the F_B rows of the CTA's heads in the last page slot
         # (its page loads after the gate projection), the items' F_A rows over the
         # operand blocks (unused until the first prep).
@@ -195,7 +199,7 @@ class KdaRing(KdaFlow):
             cute.make_layout(2 * K * K),
         )
         fas = cute.make_tensor(
-            cute.recast_ptr(at(qkvd, 2, 0, 0, 0), dtype=BFloat16),
+            cute.recast_ptr(at(qkvd, 0, 0, 0, 0), dtype=BFloat16),
             cute.make_layout((MAX_ITEMS, T, K), stride=(T * K, K, 1)),
         )
 
@@ -211,7 +215,6 @@ class KdaRing(KdaFlow):
             for i in cutlass.range_constexpr(NSTAGE):
                 cute.arch.mbarrier_init(stage_full + i, 1)
             cute.arch.mbarrier_init(fb_full, 1)
-            cute.arch.mbarrier_init(gates_ready, THREADS // 32)
             cute.arch.mbarrier_init_fence()
         h0 = first // requests
         h1 = (first + count - 1) // requests
@@ -257,7 +260,8 @@ class KdaRing(KdaFlow):
                              fb_full)  # fmt: skip
                 if lane == 12:
                     copy_g2s(at(rows, DT, 0), at(args[7], (h0 + (h1 - h0) * hw) * K), K * 4, fb_full)
-
+        elif hslot < heads:
+            self.head_constants(hcs[hslot, None, None], args, h0 + (h1 - h0) * hslot, tid % K)
         if tid == 0:
             hc_bytes = 0
             if cutlass.const_expr(BULK_HC):
@@ -300,9 +304,6 @@ class KdaRing(KdaFlow):
             item, t = tid // T, tid % T
             row = table[item, REQUEST] * T + t
             betas[item, t] = triton_sigmoid(Float32(beta[row, table[item, HEAD]]))
-        if cutlass.const_expr(not BULK_HC):  # (synchronous loads under the F_A ones)
-            if hslot < heads:
-                self.head_constants(hcs[hslot, None, None], args, h0 + (h1 - h0) * hslot, tid % K)
         if cutlass.const_expr(BULK_HC):  # noqa: SIM102
             if hslot < heads:
                 hcs[hslot, A_EXP, tid % K] = triton_exp(Float32(args[6][h0 + (h1 - h0) * hslot]))
@@ -321,7 +322,7 @@ class KdaRing(KdaFlow):
                 where = (hsel * K + row) * K + 8 * (chunk ^ (row % 8))
                 store_shared_u32x4(fbs.iterator + where, [fbv[k, e] for e in range(4)])
         staging = (convs, xs, gs, kgs, uss)
-        if tid < 128 * NSTAGE:  # the first items' prep inputs (warpgroup i: item i)
+        if tid < 128 * (NSTAGE - 1):  # the first items' prep inputs (warpgroup i: item i)
             i = tid // 128
             if i < count:
                 self.stage(args, table, i, staging, stage_full + i, i, tid % 128)
@@ -341,44 +342,35 @@ class KdaRing(KdaFlow):
                     self.load_eighth(args, pages, lane, table, lane, state_full,
                                      warp - SCAN_BASE // 32)  # fmt: skip
         cute.arch.sync_warp()
-        cute.arch.barrier()  # F_A, F_B, betas, head constants
+        cute.arch.barrier()  # F_A
+        self.gate_projection3(tid, count, table, fbs, fas, raw)
+        cute.arch.sync_warp()
+        cute.arch.barrier()  # raw gates; the last page slot and the blocks are free
+        fence_async_shared()
+        if warp >= SCAN_BASE // 32:  # noqa: SIM102
+            if lane == SLOTS - 1:  # noqa: SIM102
+                if lane < count:
+                    self.load_eighth(args, pages, lane, table, lane, state_full,
+                                     warp - SCAN_BASE // 32)  # fmt: skip
+        cute.arch.sync_warp()
         if cutlass.const_expr(self.trace):
             ks[4] = clock64() - k0
         if cutlass.const_expr(self.trace):
             k0 = clock64() - k0  # the prologue's cycles (printed by the prep trace)
         ops = (xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s)
-        barriers = (state_full, ops_full, ops_empty, dots_full, dots_empty, stage_full,
-                    gates_ready)
-        if tid < SCAN_BASE:
-            g = tid // PAIR_THREADS  # the pair's first item's gates, then its loop
-            self.gate_items(lane, warp % 4, g, 1, 1, count, table, fbs, fas, raw)
-            cute.arch.sync_warp()
-            if lane == 0:
-                cute.arch.mbarrier_arrive(gates_ready)
-            set_max_registers(PAIR_REGISTERS, increase=False)
-            self.pair_sync(g)  # item g's raw gates (all four warps)
-            self.pair_side(args, tid // PAIR_THREADS, tid % PAIR_THREADS, count, table,
-                           raw, hcs, betas, staging, ops, psums, psum2, rsum, barriers,
-                           k0, ks)  # fmt: skip
+        barriers = (state_full, ops_full, ops_empty, dots_full, dots_empty, stage_full)
+        if tid < PREP_THREADS:
+            set_max_registers(PREP_REGISTERS, increase=False)
+            self.prep_items(args, tid, count, table, raw, hcs, staging, ops, psums,
+                            barriers)  # fmt: skip
+        elif tid < SCAN_BASE:
+            set_max_registers(TAIL_REGISTERS, increase=False)
+            self.tail_items(args, tid - PREP_THREADS, count, table, betas, ops, psum2,
+                            rsum, barriers, k0, ks)  # fmt: skip
         else:
-            part = (warp - SCAN_BASE // 32) // 4  # the other items' gates, then page
-            # slot SLOTS - 1 (F_B) once every warp's projection has read F_B
-            PER: cutlass.Constexpr = -(-(MAX_ITEMS - 2) // 2)
-            self.gate_items(lane, warp % 4, 2 + part, 2, PER, count, table, fbs, fas,
-                            raw)  # fmt: skip
-            cute.arch.sync_warp()
-            if lane == 0:
-                cute.arch.mbarrier_arrive(gates_ready)
             set_max_registers(SCAN_REGISTERS, increase=True)
-            self.bwait(gates_ready, 0, "gates_ready")
-            fence_async_shared()
-            if lane == SLOTS - 1:  # noqa: SIM102
-                if lane < count:
-                    self.load_eighth(args, pages, lane, table, lane, state_full,
-                                     warp - SCAN_BASE // 32)  # fmt: skip
-            cute.arch.sync_warp()
             self.scan_side(args, tid - SCAN_BASE, count, pages, table, ops, rsum,
-                           barriers)  # fmt: skip
+                           sbuf, barriers)  # fmt: skip
 
     @cute.jit
     def load_eighth(self, args, pages, s, table, j, state_full, w):
@@ -397,17 +389,22 @@ class KdaRing(KdaFlow):
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
 
     @cute.jit
-    def gate_items(self, lane, wq, first, step, per: cutlass.Constexpr, count, table,
-                   fbs, fas, raw):  # fmt: skip
-        """raw[j, t, f] = BF16(F_B[head_j] @ F_A[j, t]) for items j = first + step i
-        (i < per), features 32 wq + [0, 32) (this warp; KdaFlow's MMA chain per item,
-        F_B fragments from the swizzled stage)."""
+    def gate_projection3(self, tid, count, table, fbs, fas, raw):
+        """raw[j, t, f] = BF16(F_B[head_j] @ F_A[j, t]) for the CTA's items (warp w:
+        features 32 (w % 4) + [0, 32), items w // 4 + 4 i; KdaFlow's MMA chain per
+        item). Results are held until every warp has read F_A (which overlays the
+        operand blocks)."""
         T: cutlass.Constexpr = self.tokens
+        lane, warp = tid % 32, tid // 32
         group_id, quarter = lane >> 2, lane & 3
+        wq, third = warp % 4, warp // 4
+        PARTS: cutlass.Constexpr = THREADS // 128
+        PER: cutlass.Constexpr = -(-MAX_ITEMS // PARTS)
+        acc = cute.make_rmem_tensor((PER, 2, 4), Float32)
         wr = cute.make_rmem_tensor((2, 8, 4), Uint32)
         cached = Int32(-1)
-        for i in cutlass.range_constexpr(per):
-            j = first + step * i
+        for i in cutlass.range_constexpr(PER):
+            j = third + PARTS * i
             if j < count:
                 head = table[j, HEAD]
                 if head != cached:
@@ -418,9 +415,7 @@ class KdaRing(KdaFlow):
                             col = 16 * chunk + 4 * quarter
                             sw = (col % 8) + 8 * ((col // 8) ^ (feature % 8))
                             low = load_shared_u32x2(fbs.iterator + (hb + feature * K + sw))
-                            high = load_shared_u32x2(
-                                fbs.iterator + (hb + (feature + 8) * K + sw)
-                            )
+                            high = load_shared_u32x2(fbs.iterator + (hb + (feature + 8) * K + sw))
                             wr[m, chunk, 0], wr[m, chunk, 2] = low
                             wr[m, chunk, 1], wr[m, chunk, 3] = high
                     cached = head
@@ -443,16 +438,24 @@ class KdaRing(KdaFlow):
                             value = Float32(0) + (
                                 ((value + part[1, e]) + part[2, e]) + part[3, e]
                             )
+                        acc[i, m, e] = value
+        cute.arch.sync_warp()
+        cute.arch.barrier()  # every warp has read F_A
+        for i in cutlass.range_constexpr(PER):
+            j = third + PARTS * i
+            if j < count:
+                for m in cutlass.range_constexpr(2):
+                    for e in cutlass.range_constexpr(4):
                         t = 2 * quarter + e % 2
                         feature = 32 * wq + 16 * m + group_id + 8 * (e // 2)
                         if t < T:
-                            raw[j, t, feature] = BFloat16(value)
+                            raw[j, t, feature] = BFloat16(acc[i, m, e])
 
     # ------------------------------------------------------------------- prep
     @cute.jit
-    def pair_sync(self, g):
+    def prep_sync(self):
         cute.arch.sync_warp()  # converged before the aligned barrier
-        sync_threads(PAIR_BAR + g, PAIR_THREADS)
+        sync_threads(PREP_BAR, PREP_THREADS)
 
     @cute.jit
     def stage(self, args, table, j, staging, barrier, st, r):
@@ -505,85 +508,80 @@ class KdaRing(KdaFlow):
                 cute.arch.mbarrier_arrive_and_expect_tx(barrier, 0)
 
     @cute.jit
-    def pair_side(self, args, g, c, count, table, raw, hcs, betas, staging, ops, psums,
-                  psum2, rsum, barriers, prologue, ks):  # fmt: skip
-        """Pair warpgroup g (thread c = channel / row c) runs items g, g + 2, ...: the
-        prep one of its items ahead of the tail; each prep stages the pair's item two
-        ahead (its buffer's last reader is this pair's own earlier prep)."""
-        _, ops_full, ops_empty, _, _, stage_full, _ = barriers
+    def prep_items(self, args, c, count, table, raw, hcs, staging, ops, psums,
+                   barriers):  # fmt: skip
+        """The CTA's items in order: inputs staged NSTAGE - 1 items ahead, then the
+        operand block once the tail has released it."""
+        _, ops_full, ops_empty, _, _, stage_full = barriers
         pt = zeros(8, Int64)  # TRACE: stage issue, stage wait, block wait, conv..terms,
-        # block sums, sync, post, start
-        tr = zeros(3, Int64)  # TRACE: row-sum wait, tail, prep
+        # block sums, sync, post, total
         if cutlass.const_expr(self.trace):
             pt[7] = clock64()
-        mine = (count - g + 1) // 2
-        if mine > 0:
-            self.prep_one(args, g, c, g, count, table, raw, hcs, staging, ops, psums,
-                          barriers, pt)  # fmt: skip
-        for n in cutlass.range(mine, unroll=1):
-            j = g + 2 * n
+        for j in cutlass.range(count, unroll=1):
+            st, b = j % NSTAGE, j % NOPS
+            ahead = j + NSTAGE - 1
+            q0 = Int64(0)
+            if cutlass.const_expr(self.trace):
+                q0 = clock64()
+            if ahead < count:  # (its buffer's last reader, item j - 1, is done)
+                self.stage(args, table, ahead, staging, stage_full + ahead % NSTAGE,
+                           ahead % NSTAGE, c)  # fmt: skip
+            cute.arch.sync_warp()
+            if cutlass.const_expr(self.trace):
+                q1 = clock64()
+                pt[0] = pt[0] + (q1 - q0)
+                q0 = q1
+            self.bwait(stage_full + st, (j // NSTAGE) % 2, "stage_full")
+            if cutlass.const_expr(self.trace):
+                q1 = clock64()
+                pt[1] = pt[1] + (q1 - q0)
+                q0 = q1
+            if j >= NOPS:
+                self.bwait(ops_empty + b, (j // NOPS - 1) % 2, "ops_empty")
+            if cutlass.const_expr(self.trace):
+                pt[2] = pt[2] + (clock64() - q0)
+            if cutlass.const_expr("prep" not in self.skip):  # noqa: SIM102
+                if table[j, SLOT] > 0:
+                    self.prep_ops(args, c, j, b, st, table, raw,
+                                  hcs[table[j, HSEL], None, None], staging, ops,
+                                  psums, pt)  # fmt: skip
+            self.prep_sync()  # the block is complete
+            if c == 0:
+                cute.arch.mbarrier_arrive(ops_full + b)
+        if cutlass.const_expr(self.trace):  # noqa: SIM102
+            if c == 0:
+                cta, _, _ = cute.arch.block_idx()
+                if cta % 53 == 0:
+                    cute.printf("RTRACE prep cta {} items {} total {} | stage-issue {} stage-wait {} block-wait {} conv..terms {} bsum {} sync {} post {}", cta, count, clock64() - pt[7], pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], pt[6])  # noqa: E501
+
+    @cute.jit
+    def tail_sync(self):
+        cute.arch.sync_warp()  # converged before the aligned barrier
+        sync_threads(TAIL_BAR, TAIL_THREADS)
+
+    @cute.jit
+    def tail_items(self, args, c, count, table, betas, ops, psum2, rsum, barriers,
+                   prologue, ks):  # fmt: skip
+        """Each item's solve, gated RMSNorm and outputs once its row sums are in."""
+        tr = zeros(3, Int64)  # TRACE: row-sum wait, work, start
+        if cutlass.const_expr(self.trace):
+            tr[2] = clock64()
+        for k in cutlass.range(count, unroll=1):
             t0 = Int64(0)
             if cutlass.const_expr(self.trace):
                 t0 = clock64()
-            if n + 1 < mine:
-                self.prep_one(args, g, c, j + 2, count, table, raw, hcs, staging, ops,
-                              psums, barriers, pt)  # fmt: skip
-            if cutlass.const_expr(self.trace):
-                t1 = clock64()
-                tr[2] = tr[2] + (t1 - t0)
-                t0 = t1
-            self.tail(args, g, c, j, table, betas, ops, psum2, rsum, barriers, tr)
+            self.tail(args, c, k, table, betas, ops, psum2, rsum, barriers, tr)
             if cutlass.const_expr(self.trace):
                 tr[1] = tr[1] + (clock64() - t0)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
             if c == 0:
                 cta, _, _ = cute.arch.block_idx()
                 if cta % 53 == 0:
-                    if g == 0:
-                        cute.printf("RTRACE pro cta {} table {} hc-issue {} pdl {} fa+stage {} fb {} gate {} total {}", cta, ks[0], ks[5], ks[1], ks[2], ks[3], ks[4], prologue)  # noqa: E501
-                    cute.printf("RTRACE prep cta {} pair {} items {} total {} | prep {} tail {} dots-wait {} | stage-issue {} stage-wait {} block-wait {} conv..terms {} bsum {} sync {} post {}", cta, g, mine, clock64() - pt[7], tr[2], tr[1], tr[0], pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], pt[6])  # noqa: E501
+                    cute.printf("RTRACE pro cta {} table {} hc-issue {} pdl {} fa+stage {} fb {} gate {} total {}", cta, ks[0], ks[5], ks[1], ks[2], ks[3], ks[4], prologue)  # noqa: E501
+                    cute.printf("RTRACE tail cta {} items {} total {} | dots-wait {} all {}", cta, count, clock64() - tr[2], tr[0], tr[1])  # noqa: E501
 
     @cute.jit
-    def prep_one(self, args, g, c, j, count, table, raw, hcs, staging, ops, psums,
-                 barriers, pt):  # fmt: skip
-        """Stage the pair's item j + 4, then item j's operand block."""
-        _, ops_full, ops_empty, _, _, stage_full, gates_ready = barriers
-        st, b = j % NSTAGE, j % NOPS
-        ahead = j + NSTAGE  # (the pair's item two ahead: its buffer was item j's)
-        q0 = Int64(0)
-        if cutlass.const_expr(self.trace):
-            q0 = clock64()
-        self.bwait(stage_full + st, (j // NSTAGE) % 2, "stage_full")
-        if cutlass.const_expr(self.trace):
-            q1 = clock64()
-            pt[1] = pt[1] + (q1 - q0)
-            q0 = q1
-        if j >= 2:
-            self.bwait(gates_ready, 0, "gates_ready")
-        if j >= NOPS:
-            self.bwait(ops_empty + b, (j // NOPS - 1) % 2, "ops_empty")
-        if cutlass.const_expr(self.trace):
-            pt[2] = pt[2] + (clock64() - q0)
-        if cutlass.const_expr("prep" not in self.skip):  # noqa: SIM102
-            if table[j, SLOT] > 0:
-                self.prep_ops(args, g, c, j, b, st, table, raw,
-                              hcs[table[j, HSEL], None, None], staging, ops,
-                              psums[g, None, None], pt)  # fmt: skip
-        self.pair_sync(g)  # the block is complete; staging buffer st is read
-        if c == 0:
-            cute.arch.mbarrier_arrive(ops_full + b)
-        if cutlass.const_expr(self.trace):
-            q0 = clock64()
-        if ahead < count:
-            self.stage(args, table, ahead, staging, stage_full + ahead % NSTAGE,
-                       ahead % NSTAGE, c)  # fmt: skip
-        cute.arch.sync_warp()
-        if cutlass.const_expr(self.trace):
-            pt[0] = pt[0] + (clock64() - q0)
-
-    @cute.jit
-    def prep_ops(self, args, g, c, j, b, st, table, raw, hc, staging, ops, psums,
-                 pt):  # fmt: skip
+    def prep_ops(self, args, c, j, b, st, table, raw, hc, staging, ops, psums, pt):
         """KdaFlow.prep_item for item j (thread c = channel / key c) from staging
         buffer ``st`` into operand block ``b``; the new key / raw-gate records and the
         rolled window are stored straight to global memory."""
@@ -683,7 +681,7 @@ class KdaRing(KdaFlow):
             q1 = clock64()
             pt[4] = pt[4] + (q1 - q0)
             q0 = q1
-        self.pair_sync(g)  # the partial sums
+        self.prep_sync()  # the partial sums
         if cutlass.const_expr(self.trace):
             q1 = clock64()
             pt[5] = pt[5] + (q1 - q0)
@@ -730,10 +728,10 @@ class KdaRing(KdaFlow):
             pt[6] = pt[6] + (clock64() - q0)
 
     @cute.jit
-    def tail(self, args, g, c, k, table, betas, ops, psum2, rsum, barriers, tr):
+    def tail(self, args, c, k, table, betas, ops, psum2, rsum, barriers, tr):
         """Item k's solve, gated RMSNorm and outputs (thread c = row / channel c) from
         its row sums: KdaFlow.solve and finish_alone."""
-        _, _, ops_empty, dots_full, dots_empty, _, _ = barriers
+        _, _, ops_empty, dots_full, dots_empty, _ = barriers
         xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
         eps = args[15]
         T: cutlass.Constexpr = self.tokens
@@ -760,12 +758,12 @@ class KdaRing(KdaFlow):
                 self.solve(values, b, betas, k, c, v_s, ce_s,
                            args[18][rec, head, None, None], po)  # fmt: skip
             pg = [Float32(g_s[b, t, c]) for t in range(T)]
-            sums = psum2[g, None, None]
+            sums = psum2[p, None, None]
             terms = [Float32(0) for _ in range(4)]
             for t in cutlass.range_constexpr(T):
                 terms[t] = po[t] * po[t]
             self.block_sums(terms, sums, c, 4)
-            self.pair_sync(g)  # the squares' partials; every row sum and block read
+            self.tail_sync()  # the squares' partials; every row sum and block read
             if c == 0:
                 cute.arch.mbarrier_arrive(dots_empty + p)
                 cute.arch.mbarrier_arrive(ops_empty + b)
@@ -785,11 +783,11 @@ class KdaRing(KdaFlow):
 
     # ------------------------------------------------------------------- scan
     @cute.jit
-    def scan_side(self, args, c, count, pages, table, ops, rsum, barriers):
+    def scan_side(self, args, c, count, pages, table, ops, rsum, sbuf, barriers):
         """The CTA's items in order (thread c of the scan warps; module docstring).
         Item j + 1's page goes to registers (and its slot eighth is refilled) between
         item j's math and its butterfly, whose shuffles hide the copy's latency."""
-        state_full, ops_full, _, dots_full, dots_empty, _, _ = barriers
+        state_full, ops_full, _, dots_full, dots_empty, _ = barriers
         xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
         state = args[9]
         T: cutlass.Constexpr = self.tokens
@@ -802,7 +800,7 @@ class KdaRing(KdaFlow):
         sts = cute.make_rmem_tensor((CHUNKS, QROWS, 4), Float32)
         if count > 0:
             self.page_in(args, pages, table, 0, count, sts, lane, warp, lane_in, base,
-                         state_full, tr, True)  # fmt: skip
+                         state_full, tr)  # fmt: skip
         for j in cutlass.range(count, unroll=1):
             b, p = j % NOPS, j % 2
             slot, head, pending = table[j, SLOT], table[j, HEAD], table[j, PENDING]
@@ -822,16 +820,28 @@ class KdaRing(KdaFlow):
                 stored = pending > 0
                 if cutlass.const_expr("store" in self.skip):
                     stored = pending < 0
+                if lane == 0:  # the warp's previous bulk store has read its eighth
+                    wait_bulk_reads()
+                cute.arch.sync_warp()
                 if cutlass.const_expr("scan" not in self.skip):
                     self.fold_dots(acc, sts, b, pending, lane_in, base, xv, fw_s, fu_s,
-                                   fd_s, state[Int64(slot), head, None, None],
-                                   stored)  # fmt: skip
+                                   fd_s, sbuf, stored)  # fmt: skip
+                if stored:
+                    fence_async_shared()
+                cute.arch.sync_warp()
+                if lane == 0:  # noqa: SIM102
+                    if stored:
+                        rows: cutlass.Constexpr = EIGHTH // (K * 4)
+                        destination = state[Int64(slot), head, None, None]
+                        store_bulk(at(destination, rows * warp, 0),
+                                   at(sbuf, rows * warp, 0), EIGHTH)  # fmt: skip
+                        bulk_commit()
             if cutlass.const_expr(self.trace):
                 tb = clock64()
                 tr[3] = tr[3] + (tb - ta)
             if j + 1 < count:
                 self.page_in(args, pages, table, j + 1, count, sts, lane, warp, lane_in,
-                             base, state_full, tr, False)  # fmt: skip
+                             base, state_full, tr)  # fmt: skip
             if cutlass.const_expr(self.trace):
                 ta = clock64()
             if j >= 2:
@@ -850,8 +860,6 @@ class KdaRing(KdaFlow):
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(dots_full + p)
-            if j + 1 < count:  # item j + 1's eighth is in registers: refill it
-                self.refill(args, pages, table, j + 1, count, lane, warp, state_full)
             if cutlass.const_expr(self.trace):
                 tr[5] = tr[5] + (clock64() - ta)
         if cutlass.const_expr(self.trace):  # noqa: SIM102
@@ -862,7 +870,7 @@ class KdaRing(KdaFlow):
 
     @cute.jit
     def page_in(self, args, pages, table, j, count, sts, lane, warp, lane_in, base,
-                state_full, tr, refill: cutlass.Constexpr):  # fmt: skip
+                state_full, tr):  # fmt: skip
         """Item j's page (this thread's rows / keys) into ``sts``; the warp's eighth
         of the slot is then refilled with item j + SLOTS's."""
         s = j % SLOTS
@@ -881,27 +889,18 @@ class KdaRing(KdaFlow):
                     sv = load_shared_f32x4(at(pages, s, (base + rr) * K + key))
                     for i in cutlass.range_constexpr(4):
                         sts[ch, rr, i] = sv[i]
-        if cutlass.const_expr(refill):
-            self.refill(args, pages, table, j, count, lane, warp, state_full)
-        if cutlass.const_expr(self.trace):
-            tr[2] = tr[2] + (clock64() - ta)
-
-    @cute.jit
-    def refill(self, args, pages, table, j, count, lane, warp, state_full):
-        """Item j's eighth of its slot (read into registers) refilled with item
-        j + SLOTS's."""
-        if table[j, SLOT] > 0:
             fence_async_shared()
         cute.arch.sync_warp()
         if lane == 0:  # noqa: SIM102
             if j + SLOTS < count:
-                self.load_eighth(args, pages, j % SLOTS, table, j + SLOTS, state_full,
-                                 warp)  # fmt: skip
+                self.load_eighth(args, pages, s, table, j + SLOTS, state_full, warp)
         cute.arch.sync_warp()
+        if cutlass.const_expr(self.trace):
+            tr[2] = tr[2] + (clock64() - ta)
 
     @cute.jit
     def fold_dots(self, acc, sts, b, pending, lane_in, base, xv, fw_s, fu_s, fd_s,
-                  destination, stored):  # fmt: skip
+                  sbuf, stored):  # fmt: skip
         """KdaFlow.scan from registers over rows base + [0, 4) (keys 4 (lane_in + 8 j)
         + [0, 4)): S = fma(S_0, D_n, fc), fc = sum_t fma(u_t, w_t, fc) over
         t = q - 1 .. 0; the committed element leaves for ``destination``; acc[r, m] +=
@@ -935,7 +934,7 @@ class KdaRing(KdaFlow):
                     sts[ch, rr, 2 * p], sts[ch, rr, 2 * p + 1] = pair
             for rr in cutlass.range_constexpr(QROWS):
                 if stored:
-                    store_global_cs(at(destination, base + rr, key),
+                    store_shared_f32x4(at(sbuf, base + rr, key),
                                     [sts[ch, rr, i] for i in range(4)])  # fmt: skip
             for e in cutlass.range_constexpr(4):
                 xs = cute.make_rmem_tensor(NV, Float32)
