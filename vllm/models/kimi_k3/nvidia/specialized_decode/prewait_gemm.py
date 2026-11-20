@@ -806,6 +806,7 @@ TMEM_CONFIGS = {32: (4, 1, 8, 2, 1, 960, 1, 15, 8), 64: (4, 1, 6, 2, 1, 960, 1, 
 # Full pre-wait weight residency (CR 2): 6-CTA split-K cluster (210 CTAs), NT K-blocks per CTA in TMEM, the rest in a
 # pool of NS 16 KiB slots that turns into the activation ring after the PDL wait.
 FULL_CONFIGS = {32: (6, 1, 12, 2, 1, 0, 2, 15, 0), 64: (6, 1, 11, 2, 1, 0, 2, 14, 0), 96: (6, 1, 10, 2, 1, 0, 2, 12, 0)}
+CONFIGS[64], CONFIGS[96] = TMEM_CONFIGS[64], TMEM_CONFIGS[96]  # EXPERIMENT: TMEM-staged weights in-step
 
 
 def _module():
