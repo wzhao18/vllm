@@ -512,7 +512,10 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             return SharedExpertStreamMixin._claim_shared_tile(self, work_id_worker, stage, next_id, fc2)
         work_tile = make_fc12_done_tile(True)
         if cutlass.const_expr(fc2 == 1):
-            local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2)
+            # DIAG STATIC2: every shared FC2 id is an early pair's static first unit.
+            local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2) + Int32(
+                2 * (self._shared_phase_tiles[1] // 2)
+            )
             if local_id < Int32(self._shared_phase_tiles[1]):
                 work_tile = self._decode_shared_tile(local_id, 1)
             else:
@@ -526,14 +529,22 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             st_rank = (st_tpc - Int32(10) - st_die) // Int32(2)
             st_on = self._static_first * Int32(st_tpc >= Int32(10)) * Int32(st_rank < st_half)
             shared_id = st_half * st_die + st_rank
-            if st_on == Int32(0):
+            st2_half = Int32(self._shared_phase_tiles[1] // 2)
+            st2_on = (
+                self._static_first * Int32(st_tpc >= Int32(10)) * Int32(st_rank >= st_half)
+                * Int32(st_rank < st_half + st2_half)
+            )
+            if st_on + st2_on == Int32(0):
                 shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
                 if shared_id < Int32(0):
                     shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
-            if shared_id >= Int32(0):
-                work_tile = self._decode_shared_tile(shared_id, 0)
+            if st2_on != Int32(0):
+                work_tile = self._decode_shared_tile(st2_half * st_die + (st_rank - st_half), 1)
             else:
-                stage = stage + Int32(1)
+                if shared_id >= Int32(0):
+                    work_tile = self._decode_shared_tile(shared_id, 0)
+                else:
+                    stage = stage + Int32(1)
         return work_tile, stage, next_id, work_id_worker
 
     @cute.jit
