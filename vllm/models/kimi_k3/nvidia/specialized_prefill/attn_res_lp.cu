@@ -189,14 +189,16 @@ constexpr uint32_t SEG_BYTES = SEG * 2;
 #ifndef K31LP_G
 #define K31LP_G 4
 #endif
-// Token claim queue: positions claimed QA ahead of the consumer (>= the
-// producer's run-ahead of D rows), QN entries.
+// Token claim queue (QN entries): a group claims qa positions ahead of the
+// token it processes, the fewest that keep the producer's run-ahead of D
+// rows (ceil(D / R) tokens) on claimed positions: qa = max(QA, ceil(D/R) + 1).
+// A short run-ahead balances the end of a call best.
 #ifndef K31LP_QA
-#define K31LP_QA 3
+#define K31LP_QA 2
 #endif
 constexpr int QA = K31LP_QA;
 constexpr int QN = 8;
-static_assert(QA < QN && (QN & (QN - 1)) == 0);
+static_assert(QA >= 2 && QA < QN && (QN & (QN - 1)) == 0);
 constexpr int G = K31LP_G;
 constexpr int CTA_THREADS = NT * G;
 // One lane's VEC BF16 values.
@@ -279,6 +281,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   const int n = a.n;
   constexpr int R0 = 1 + (HAS_DELTA ? 1 : 0);
   const int R = R0 + n;  // rows per token
+  const int qa = max(QA, (D + R - 1) / R + 1);  // claim run-ahead (< QN)
   const int64_t seg0 = (int64_t)warp * SEG;
   K31LP_CTA_STAMP(0);
 
@@ -350,9 +353,9 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
   if (tid == 0) {
-    const int j = atomicAdd(&a.claim[die], QA);  // first QA positions at once
+    const int j = atomicAdd(&a.claim[die], qa);  // first qa positions at once
 #pragma unroll 1
-    for (int i = 0; i < QA; ++i) {
+    for (int i = 0; i < qa; ++i) {
       sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
                                     : finish_claim(own_done ? 0 : cnt_own);
     }
@@ -360,7 +363,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   __syncthreads();
 
   // Producer (lane 0 of each warp): next row to issue (token position p_it,
-  // row p_r). It runs at most D rows (<= D < QA tokens) ahead.
+  // row p_r). It runs at most D rows (< qa tokens) ahead.
   int p_it = 0, p_r = 0, p_slot = 0;
   auto issue_next = [&]() {
     const int t = sm.tq[g][p_it & (QN - 1)];
@@ -502,7 +505,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     // term (no combine pass after the stream).
     K31LP_STAMP(3);
     if (tid == 0) {
-      sm.tq[g][(it + QA) & (QN - 1)] = finish_claim(pending);
+      sm.tq[g][(it + qa) & (QN - 1)] = finish_claim(pending);
       pending = start_claim();  // in flight for a whole token
     }
     group_sync(g);
@@ -753,7 +756,7 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   a.sf_padded_cols = H / 32;
   TORCH_CHECK(claim.scalar_type() == torch::kInt32 && claim.numel() >= 3);
   TORCH_CHECK(!sm_die.has_value() || (sm_die->scalar_type() == torch::kInt8 && sm_die->numel() >= 1024));
-  TORCH_CHECK(depth < QA, "attn_res_lp: ring depth >= claim run-ahead");
+  TORCH_CHECK(depth + 1 < QN, "attn_res_lp: ring depth exceeds the claim queue");
   a.sm_die = sm_die.has_value() ? sm_die->data_ptr<int8_t>() : nullptr;
   a.claim = claim.data_ptr<int>();
   a.stamps = stamps.has_value() ? reinterpret_cast<long long*>(stamps->data_ptr()) : nullptr;
