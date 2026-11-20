@@ -157,6 +157,23 @@ def _st_peer_i32(saddr, peer, value):
     )
 
 
+# m128x2 MMA (GEMM-EX1 ex1_m128_probe, VR200): tcgen05.mma.cta_group::2 M=128
+# kind::mxf8f6f4.block_scale runs bit-exact with the sm_100-style descriptor (instruction
+# K = 32); the CuTe DSL's sm_107 descriptor for it (bit 31 set) raises ILLEGAL INSTRUCTION.
+_M2_IDESC = (128 >> 3) << 17 | 1 << 23 | (128 >> 7) << 27  # N 128, UE8M0 scales, M 128
+_M2_DESC = 1 << 16 | (1024 >> 4) << 32 | 1 << 46 | 2 << 61  # SW128 K-major, SBO 1 KiB
+
+
+@asm()
+def _mma_m128x2(d, adesc, bdesc, idesc, sfa, sfb, accumulate):
+    code = ("{ .reg .pred p; setp.ne.b32 p, $6, 0; "
+            "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [$0], $1, $2, $3, [$4], [$5], p; }")
+    return code, "r,l,l,r,r,r,r", (
+        cutlass.Uint32(d), cutlass.Uint64(adesc), cutlass.Uint64(bdesc), cutlass.Uint32(idesc),
+        cutlass.Uint32(sfa), cutlass.Uint32(sfb), cutlass.Uint32(accumulate),
+    )
+
+
 @asm()
 def _s2t_sfb_m128x2(taddr, saddr):
     """tcgen05.cp.cta_group::2.64x128b.warpx2::01_23 of one 1 KiB SFB stage (64 rows x 16 B,
@@ -808,9 +825,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             a1 = sm100_utils.make_smem_layout_a(tiled_mma, self.mma_tiler, self.a_dtype, 1)
             b1 = sm100_utils.make_smem_layout_b(tiled_mma, self.mma_tiler, self.b_dtype, 1)
             c1 = sm100_utils.make_smem_layout_epi(self.c_dtype, self.c_layout, self.epi_tile, 1)
-            stage_bytes = (
-                cute.size_in_bytes(self.a_dtype, a1) + cute.size_in_bytes(self.b_dtype, b1) + 1024
-            )
+            self.m2_a_stage = cute.size_in_bytes(self.a_dtype, a1)
+            self.m2_b_stage = cute.size_in_bytes(self.b_dtype, b1)
+            stage_bytes = self.m2_a_stage + self.m2_b_stage + 1024
             self.num_c_stage = 2
             c_bytes = cute.size_in_bytes(self.c_dtype, c1) * self.num_c_stage
             self.num_ab_stage = (
@@ -2225,6 +2242,36 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
                         # (dbg_skip_mma: loads-only timing probe, no MMA issued)
                         num_kblocks = 0 if cutlass.const_expr(self.dbg_skip_mma) else cute.size(tCrA, mode=[2])
+                        if cutlass.const_expr(self.m128x2):
+                            num_kblocks = 0
+                            if cutlass.const_expr(not self.dbg_skip_mma):
+                                m2_a = cutlass.Uint32(sA.iterator.toint()) + cutlass.Uint32(
+                                    ab_consumer_state.index * self.m2_a_stage
+                                )
+                                m2_b = cutlass.Uint32(sB.iterator.toint()) + cutlass.Uint32(
+                                    ab_consumer_state.index * self.m2_b_stage
+                                )
+                                with cute.arch.elect_one():
+                                    for m2_k in cutlass.range_constexpr(4):
+                                        _mma_m128x2(
+                                            cutlass.Uint32(tCtAcc.iterator.toint()),
+                                            cutlass.Uint64(_M2_DESC)
+                                            | cutlass.Uint64((m2_a + cutlass.Uint32(32 * m2_k)) >> 4),
+                                            cutlass.Uint64(_M2_DESC)
+                                            | cutlass.Uint64((m2_b + cutlass.Uint32(32 * m2_k)) >> 4),
+                                            cutlass.Uint32(_M2_IDESC | m2_k << 29 | m2_k << 4),
+                                            cutlass.Uint32(
+                                                (acc_tmem_ptr + self.num_accumulator_tmem_cols).toint()
+                                            ),
+                                            cutlass.Uint32(
+                                                (
+                                                    acc_tmem_ptr
+                                                    + self.num_accumulator_tmem_cols
+                                                    + self.num_sfa_tmem_cols
+                                                ).toint()
+                                            ),
+                                            cutlass.Uint32(1) if m2_k > 0 else cutlass.Uint32(k_tile != 0),
+                                        )
                         for k_block in cutlass.range(num_kblocks, unroll_full=True):
                             if cutlass.const_expr(
                                 self.enable_breuse
