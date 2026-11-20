@@ -26,6 +26,8 @@ LOG2E = 1.4426950408889634
 
 # Device compilation controls and caches.
 _TPROBE = 0
+# Dev A/B constexpr overrides (benchmarks only; empty in production).
+_DEV: dict = {}
 _COMPILED: dict = {}
 _DUMMY_EXP: dict = {}
 _DUMMY_MID: dict = {}
@@ -97,6 +99,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        tuple(sorted(_DEV.items())),
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -148,6 +151,34 @@ def _get_compiled(
         stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
 
         def compile_kernel():
+            kw = dict(
+                H_=H,
+                stream=stream,
+                TPROBE_=_TPROBE,
+                GATE2_=gate2,
+                FINAL_=1 if store_final_state else 0,
+                SPLIT_=1 if has_split and not approximate_split else 0,
+                WARM_SPLIT_=1 if approximate_split else 0,
+                EXPORT_=1 if do_export else 0,
+                STATE_=1 if have_state else 0,
+                BETA_TMA_=1 if beta_tma else 0,
+                BF16_DV_=1 if bf16_dv else 0,
+                BETA_BF16_=1 if beta_bf16 else 0,
+                QK_ROWPAIR_=int(qk_rowpair),
+                RCP_DECOR_=1 if rcp_decor else 0,
+                RF_HOIST_=1 if rf_hoist else 0,
+                RESTORE_TAIL_=1 if restore_tail else 0,
+                GRAM_W9_=int(gram_w9),
+                REG_MODE_=int(reg_mode),
+                FULL_CHUNKS_=1 if full_chunks else 0,
+                LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
+                CLUSTER_=int(cluster_size),
+                SROW_=1 if state_rows else 0,
+                PREP_PEEL_=1 if prep_peel else 0,
+                PARTIAL_TMA_=1 if partial_tma else 0,
+                GATE_ROLL_=1 if gate_roll else 0,
+            )
+            kw.update(_DEV)
             return cute.compile(
                 _k._launch_pkd,
                 qkv_fake(),
@@ -182,31 +213,7 @@ def _get_compiled(
                 cutlass.Int32(1),
                 cutlass.Float32(1.0),
                 cutlass.Float32(-1.0),
-                H_=H,
-                stream=stream,
-                TPROBE_=_TPROBE,
-                GATE2_=gate2,
-                FINAL_=1 if store_final_state else 0,
-                SPLIT_=1 if has_split and not approximate_split else 0,
-                WARM_SPLIT_=1 if approximate_split else 0,
-                EXPORT_=1 if do_export else 0,
-                STATE_=1 if have_state else 0,
-                BETA_TMA_=1 if beta_tma else 0,
-                BF16_DV_=1 if bf16_dv else 0,
-                BETA_BF16_=1 if beta_bf16 else 0,
-                QK_ROWPAIR_=int(qk_rowpair),
-                RCP_DECOR_=1 if rcp_decor else 0,
-                RF_HOIST_=1 if rf_hoist else 0,
-                RESTORE_TAIL_=1 if restore_tail else 0,
-                GRAM_W9_=int(gram_w9),
-                REG_MODE_=int(reg_mode),
-                FULL_CHUNKS_=1 if full_chunks else 0,
-                LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
-                CLUSTER_=int(cluster_size),
-                SROW_=1 if state_rows else 0,
-                PREP_PEEL_=1 if prep_peel else 0,
-                PARTIAL_TMA_=1 if partial_tma else 0,
-                GATE_ROLL_=1 if gate_roll else 0,
+                **kw,
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
@@ -281,6 +288,10 @@ def state_cache_rows(cache, indices, has_initial_state, H: int):
 
 
 def _tprobe_buf(G: int, dev: torch.device):
+    if _DEV.get("TLINE_"):
+        tensor = torch.zeros(max(G * 64, 48 * 32), dtype=torch.int64, device=dev)
+        LAST_TPROBE[0] = tensor
+        return tensor
     if _TPROBE:
         tensor = torch.zeros(G * 64, dtype=torch.int64, device=dev)
         LAST_TPROBE[0] = tensor
