@@ -550,6 +550,51 @@ def _use_deep_select_prefill(
     )
 
 
+DCP8FIX_TOPK_RECS: list = []
+
+
+def _dcp8fix_topk_probe(name, logits, topk_indices, row_ends) -> None:
+    """DIAG (DCP8FIX r2): per-call set / order checksums of the prefill top-k
+    (DCP8FIX_TOPK=1), threshold-tie statistics, and DCP8FIX_TOPK_SORT=1 sorts each
+    row ascending (order discriminator)."""
+    import os
+
+    if not (os.environ.get("DCP8FIX_TOPK") or os.environ.get("DCP8FIX_TOPK_SORT")):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    if os.environ.get("DCP8FIX_TOPK_SORT"):
+        pad = topk_indices < 0
+        s = topk_indices.masked_fill(pad, 2**31 - 1).sort(dim=1).values
+        topk_indices.copy_(s.masked_fill_(s == 2**31 - 1, -1))
+    if not os.environ.get("DCP8FIX_TOPK"):
+        return
+    idx = topk_indices.long()
+    valid = idx >= 0
+    v = idx.clamp(min=0)
+    set_cs = int((v * v * valid).sum()) + int((v * valid).sum())
+    pos = torch.arange(1, idx.shape[1] + 1, device=idx.device)[None, :]
+    ord_cs = int(((v + 1) * pos * valid).sum() % (1 << 61))
+    sc = logits.float().gather(1, v).masked_fill(~valid, float("inf"))
+    thr = sc.min(dim=1, keepdim=True).values
+    n_at_thr_sel = (sc == thr).sum(1)
+    cols = torch.arange(logits.shape[1], device=logits.device)[None, :]
+    # rows' valid key range is unknown here; count ties over the whole row
+    # (masked columns are -inf / garbage-free only up to row end: use the max
+    # selected column + slack as a lower bound of the row's range).
+    n_at_thr_all = torch.zeros_like(n_at_thr_sel)
+    for r0 in range(0, logits.shape[0], 256):
+        blk = logits[r0 : r0 + 256].float()
+        inr = cols < row_ends[r0 : r0 + 256, None].long()
+        n_at_thr_all[r0 : r0 + 256] = ((blk == thr[r0 : r0 + 256]) & inr).sum(1)
+    straddle = int(((n_at_thr_all - n_at_thr_sel) > 0).sum())
+    zero_thr = int((thr == 0).sum())
+    DCP8FIX_TOPK_RECS.append(
+        (str(name), tuple(idx.shape), set_cs, ord_cs, straddle, zero_thr,
+         int(n_at_thr_sel.float().mean()), int(cols.shape[1]))
+    )
+
+
 def _prefill_topk(
     logits: torch.Tensor,
     row_starts: torch.Tensor | None,
@@ -1211,6 +1256,7 @@ def sparse_attn_indexer(
                     topk_tokens,
                     topk_backend,
                 )
+                _dcp8fix_topk_probe(k_cache_prefix, logits, topk_indices, row_ends)
 
             if deinterleave_idx is None:
                 # Under the PCP path the top-k already ran over the whole

@@ -98,8 +98,38 @@ class _NanProbe:
         return hook
 
     def start(self):
+        from vllm.model_executor.layers import sparse_attn_indexer as sai
+
+        self.topk_marks = getattr(self, "topk_marks", []) + [len(sai.DCP8FIX_TOPK_RECS)]
         if self.handles:
             self.passes.append([])
+
+    def report_topk(self, tag):
+        from vllm.model_executor.layers import sparse_attn_indexer as sai
+
+        recs = sai.DCP8FIX_TOPK_RECS
+        marks = getattr(self, "topk_marks", [])
+        if not recs or not marks:
+            return
+        rank = get_world_group().rank_in_group
+        bounds = marks + [len(recs)]
+        per = [recs[bounds[i]:bounds[i + 1]] for i in range(len(marks))]
+        for k, p in enumerate(per):
+            for j, r in enumerate(p[:40]):
+                if rank in (0, 3) and k == 0:
+                    print(f"[topk] {tag} r{rank} pass{k} call{j} {r[0]} {r[1]} "
+                          f"straddle_rows {r[4]} zero_thr_rows {r[5]} "
+                          f"mean_sel_at_thr {r[6]}", flush=True)
+        for k in range(1, len(per)):
+            a, b = per[k - 1], per[k]
+            nset = sum(1 for x, y in zip(a, b) if x[2] != y[2])
+            nord = sum(1 for x, y in zip(a, b) if x[3] != y[3])
+            first = next((j for j, (x, y) in enumerate(zip(a, b)) if x[2] != y[2]), None)
+            firsto = next((j for j, (x, y) in enumerate(zip(a, b)) if x[3] != y[3]), None)
+            print(f"[topk] {tag} r{rank} pass{k-1} vs pass{k}: calls {len(a)}/{len(b)} "
+                  f"set differs {nset} (first call {first}) order differs {nord} "
+                  f"(first call {firsto})", flush=True)
+        recs.clear()
 
     def report(self, tag):
         if not self.handles:
@@ -322,6 +352,7 @@ class ForwardBench:
                 torch.accelerator.synchronize()
                 restore()
             probe.report(self.name)
+            probe.report_topk(self.name)
             draft_reference = self.drafter.tokens.clone() if self.drafter else None
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
