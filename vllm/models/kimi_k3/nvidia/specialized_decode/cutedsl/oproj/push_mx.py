@@ -38,7 +38,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from ..common.primitives import asm, store_relaxed
+from ..common.primitives import asm, copy_bulk, store_relaxed
 from ..common.sp_comm import positive_zero32
 
 WIDTH = 7168  # output features (the hidden size)
@@ -97,7 +97,8 @@ class OprojPushMx:
     ``iw`` / ``ix`` TMA issuer warps for the weights / the activation."""
 
     def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 256,
-                 stages: int = 4, iw: int = 1, ix: int = 1, pair: bool = True):  # fmt: skip
+                 stages: int = 4, iw: int = 1, ix: int = 1, pair: bool = True,
+                 wimg: bool = False):  # fmt: skip
         ktiles = k // kt
         tblocks = -(-rows_max // MMA_N)
         if k % kt or ktiles % stages or rows_max > min(512, tp * cap):
@@ -111,6 +112,10 @@ class OprojPushMx:
         # pair: cta_group::2 M256 (128 features per CTA, B split over the pair); else
         # cta_group::1 M128 (each CTA loads all MMA_N tokens of B)
         self.pair, self.v = pair, 2 if pair else 1
+        # bench probe: A from a pre-swizzled weight image ([mblocks][ktiles][128 rows]
+        # [kt B], 16 B chunk c of row r at c ^ (r & 7)) by one 1D bulk copy per stage
+        assert not wimg or (not pair and kt == 128)
+        self.wimg = wimg
         self.feat = 128 * self.v
         self.mblocks = WIDTH // self.feat
         self.tblocks = tblocks
@@ -207,7 +212,7 @@ class OprojPushMx:
         self.kernel(
             mma, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb, pair_vmnk,
             pair_sfb_vmnk, a_layout, b_layout, sfa_layout, sfb_layout, tsfa_layout,
-            tsfb_layout, peers, rank, rows,
+            tsfb_layout, peers, rank, rows, w_ptr.toint(),
         ).launch(
             grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[nv, 1, 1],
             stream=stream, use_pdl=True,
@@ -221,7 +226,7 @@ class OprojPushMx:
                a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
                sfa_layout: cute.Layout, sfb_layout: cute.Layout,
                tsfa_layout: cute.Layout, tsfb_layout: cute.Layout, peers: cute.Tensor,
-               rank: Int32, rows: Int32):  # fmt: skip
+               rank: Int32, rows: Int32, w_addr: Int64):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -330,7 +335,15 @@ class OprojPushMx:
                 kk = (t + rot) % self.ktiles
                 ab.producer_acquire(prod)
                 bar = ab.producer_get_barrier(prod)
-                self._tma(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)], bar, a_mask)
+                if cutlass.const_expr(self.wimg):
+                    with cute.arch.elect_one():
+                        copy_bulk(
+                            Int32(st.sA.data_ptr().toint()) + Int32(prod.index) * (128 * self.kt),
+                            w_addr + Int64((mb * self.ktiles + kk) * (128 * self.kt)), bar,
+                            128 * self.kt,
+                        )  # fmt: skip
+                else:
+                    self._tma(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)], bar, a_mask)
                 self._tma(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)], bar,
                           a_mask)  # fmt: skip
                 for _ in cutlass.range_constexpr(self.iw):

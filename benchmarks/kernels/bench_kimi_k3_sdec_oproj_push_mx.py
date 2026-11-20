@@ -51,6 +51,19 @@ def graph_time(fn, reps=20, warm=3):
     return sorted(ts)[len(ts) // 2]
 
 
+def tile_sw128(w8, rows=128, kt=128):
+    """[N, K] FP8 -> [N / rows][K / kt][rows][kt] bytes with 16 B chunk c of row r at
+    c ^ (r & 7): the K-major SW128 shared-memory image of each A stage."""
+    n, k = w8.shape
+    t = w8.view(torch.uint8).reshape(n // rows, rows, k // kt, kt // 16, 16)
+    t = t.permute(0, 2, 1, 3, 4).contiguous()  # [mb, kt_i, r, c, 16]
+    r = torch.arange(rows, device=w8.device).view(rows, 1)
+    c = torch.arange(kt // 16, device=w8.device).view(1, kt // 16)
+    out = torch.empty_like(t)
+    out[:, :, torch.arange(rows, device=w8.device).view(rows, 1), c ^ (r % 8)] = t
+    return out
+
+
 def sanitize(t):
     w = t.contiguous().view(torch.int32).clone()
     w[w == -0x80000000] = 0
@@ -116,16 +129,17 @@ def main():
         print(f"R{rows} scaled_mm {t_stock:.2f} us/call ({len(ws)} weight copies)",
               flush=True)  # fmt: skip
         for var in args.variants.split(","):
-            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)(t\d+)?(c1)?", var)
+            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)(t\d+)?(c1)?(w1)?", var)
             stages, iw, ix = (int(g) for g in m.groups()[:3])
             kt = int(m.group(4)[1:]) if m.group(4) else 256
             try:
                 kern = OprojPushMx(args.k, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix,
-                                   pair=not m.group(5))  # fmt: skip
+                                   pair=not m.group(5), wimg=bool(m.group(6)))  # fmt: skip
+                imgs = {id(w): tile_sw128(w.data) for w in ws} if m.group(6) else {}
 
                 def ptrs(w):
                     return (
-                        make_ptr(f8, w.data.data_ptr(), g8, assumed_align=16),
+                        make_ptr(f8, imgs.get(id(w), w.data).data_ptr(), g8, assumed_align=16),
                         make_ptr(e8, w.scale.data_ptr(), g8, assumed_align=16),
                         make_ptr(f8, x.data.data_ptr(), g8, assumed_align=16),
                         make_ptr(e8, x.scale.data_ptr(), g8, assumed_align=16),
