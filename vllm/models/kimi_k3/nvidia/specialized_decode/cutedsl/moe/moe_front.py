@@ -332,10 +332,12 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       if (j % p.xg == 0) mbar_wait(xfull0 + 8 * gs, (g / p.xs) & 1);
       if (j == 0) {
         mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
+        // Orders the MMAs after the fill warp's tcgen05.cp; TMA-landed operands need
+        // only the barrier (no per-block tcgen05 fence: it stalls the issue).
+        asm volatile("tcgen05.fence::after_thread_sync;");
       } else if (j == nt) {
         mbar_wait(res_bar, 0);
       }
-      asm volatile("tcgen05.fence::after_thread_sync;");
       if (j == 0 && lane == 0) STAMP(6);
       if (lane == 0 && j < 24 && p.stamps) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
       const uint64_t b0 = smem_desc(ring_s + xs * n * 128);
