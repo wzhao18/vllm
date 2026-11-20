@@ -93,6 +93,15 @@ class PrefillKdaConvInProj:
         init = torch.zeros(1, dtype=torch.bool, device=dev)
         st = torch.zeros((1, nq, 3), dtype=torch.bfloat16, device=dev)
         self._gemm(x, sx, st, qsl, lines, init, null_block_id=NULL_BLOCK_ID)
+        # The fix-up's other block-group variant (batches of >= 96 row blocks)
+        # on the same buffers, so no shape compiles it while serving.
+        from .sm107_gemm.conv_fixup import conv_fixup
+        from .sm107_gemm.kda_conv_gemm import side_rows
+
+        out = torch.empty((3, rows, self.p), dtype=torch.bfloat16, device=dev)
+        side = torch.zeros((side_rows(rows, 1), nq), dtype=torch.bfloat16, device=dev)
+        conv_fixup(out, side, None, self.conv_w, st, qsl, lines, init, self.p,
+                   NULL_BLOCK_ID, bg=8)  # fmt: skip
 
     def fused(self, qa):
         """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta,
