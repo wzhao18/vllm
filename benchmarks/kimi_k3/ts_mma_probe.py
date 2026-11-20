@@ -52,7 +52,7 @@ __global__ void __launch_bounds__(128, 1) ts_mma(const char* wimg, const char* x
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __syncthreads();
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-  const uint32_t tb = *tptr, tw = tb + 256;   // D at columns [0, n), W at [256, 256 + nkb * 32)
+  const uint32_t tb = *tptr, tw = tb + ((mode >> 8) ? (uint32_t)(mode >> 8) : 256u);   // D at columns [0, n), W at [256, 256 + nkb * 32)
   const uint32_t xbytes = (uint32_t)n * 128;
   if (tid == 0) {
     bar_expect(bw, nkb * 16384); tma(sa(ws), wsrc, nkb * 16384, bw);
@@ -84,6 +84,9 @@ __global__ void __launch_bounds__(128, 1) ts_mma(const char* wimg, const char* x
                        "@P tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, Q; }"
                        :: "r"(tb), "r"(tw + kb * 32 + kk * 8), "l"(b0 + 2 * kk), "r"(idesc), "r"(en));
         }
+        if (mode & 2)
+          asm volatile("{ .reg .pred P; elect.sync _|P, 0xffffffff; "
+                       "@P tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0]; }" :: "r"(bc) : "memory");
       }
       asm volatile("{ .reg .pred P; elect.sync _|P, 0xffffffff; "
                    "@P tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0]; }" :: "r"(bd) : "memory");
@@ -152,6 +155,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nkb", type=int, default=7)
     ap.add_argument("--reps", type=int, default=50)
+    ap.add_argument("--aoff", type=int, default=0, help="A TMEM column (0: 256; -1: right after D)")
+    ap.add_argument("--commit-each", action="store_true")
     a = ap.parse_args()
     m = _module()
     dev = torch.device("cuda")
@@ -164,13 +169,16 @@ def main():
         ref = w.float() @ x.float().t()
         out = torch.zeros(128, n, device=dev)
         clk = torch.zeros(nsm, dtype=torch.int64, device=dev)
-        m.run(sw128_image(w), sw128_image(x), out, n, a.nkb, 1, clk, 1, 0)
+        m.run(sw128_image(w), sw128_image(x), out, n, a.nkb, 1, clk, 1,
+              ((n if a.aoff < 0 else a.aoff) << 8))
         torch.cuda.synchronize()
         err = (out - ref).abs().max().item()
         scale = ref.abs().max().item()
         ok = err <= 1e-3 * max(scale, 1.0)
         # timing: every SM runs reps sweeps of nkb x 4 MMAs (M128 N n K16)
-        m.run(sw128_image(w), sw128_image(x), out, n, a.nkb, a.reps, clk, nsm, 1)
+        aoff = n if a.aoff < 0 else a.aoff
+        m.run(sw128_image(w), sw128_image(x), out, n, a.nkb, a.reps, clk, nsm,
+              1 | (2 if a.commit_each else 0) | (aoff << 8))
         torch.cuda.synchronize()
         cyc = clk.float()
         per = cyc / (a.nkb * 4)
