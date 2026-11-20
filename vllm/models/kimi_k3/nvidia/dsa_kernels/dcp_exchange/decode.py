@@ -270,6 +270,16 @@ class DcpxDecode:
         md = get_forward_context().attn_metadata[layer.layer_name]
         _, stride = flat_kv_row_view(layer.kv_cache, md.block_size)
         max_local = min(self.max_local_len, logits.shape[1])
+        # DIAG (not for landing): per-layer, per-shape row stamps read by st_kr.py
+        from . import ops as _ops
+
+        bufs = _ops.__dict__.setdefault("_TOPKDBG", {})
+        key = (str(logits.device), prefix, rows)
+        dbg = bufs.get(key)
+        if dbg is None:
+            dbg = bufs[key] = torch.zeros(
+                rows * 64, dtype=torch.int64, device=logits.device
+            )
         self.ex.topk_v2(
             logits,
             local,
@@ -280,6 +290,7 @@ class DcpxDecode:
             block_size=md.block_size,
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
+            dbg=dbg,
         )
         return True
 
