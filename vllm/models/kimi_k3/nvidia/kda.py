@@ -879,6 +879,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self._segscan_bufs: kda_segscan.SegBuffers | None = None
         self._frost = False
         self._kda_persistent = False
+        self._qkn_route: tuple[KimiK3KDAMetadata, bool] | None = None
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -1106,6 +1107,36 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return self.gemm_rs_ar.apply(core_attn_out, self.o_proj, copy_out=False)
         return self.o_proj(core_attn_out)[0]
 
+    def qk_normalized_route(self, m: KimiK3KDAMetadata) -> bool:
+        """True when this prefill batch's q/k go to the persistent core, which
+        takes them l2-normalized by the in_proj conv epilogue (stock
+        l2norm_fwd before the chunk kernels): no checkpoint and no segment
+        plan, as the routing in ``_forward``. Cached per metadata object."""
+        cached = self._qkn_route
+        if cached is not None and cached[0] is m:
+            return cached[1]
+        route = (
+            self.kda_prefill_backend == "flashkda"
+            and self._frost
+            and self._kda_persistent
+            and m.checkpoint is None
+            and m.non_spec_query_start_loc_cpu is not None
+            and (
+                self._segscan_bufs is None
+                or kda_segscan.make_plan(
+                    m.non_spec_query_start_loc_cpu,
+                    self.local_num_heads,
+                    torch.device("cuda", torch.accelerator.current_device_index()),
+                    None,
+                    sms=self._segscan_bufs.sms,
+                    max_parts=self._segscan_bufs.n,
+                )
+                is None
+            )
+        )
+        self._qkn_route = (m, route)
+        return route
+
     def _recoverssm_verify(
         self,
         m: KimiK3KDAMetadata,
@@ -1250,6 +1281,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         has_spec_decode = m.num_spec_decodes > 0
         # (3, T, P): q|k|v planes the prefill in_proj already convolved.
         qkv_planes = mixed_qkv.dim() == 3
+        # The conv epilogue l2-normalized q/k (persistent prefill core route).
+        qk_normalized = qkv_planes and self.qk_normalized_route(m)
         mixed_qkv = (
             mixed_qkv[:, :num_actual_tokens]
             if qkv_planes
@@ -1584,6 +1617,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         seg_plan is not None
                         and seg_plan.num_seqs == initial_state.shape[0]
                     ):
+                        assert not qk_normalized
                         num_sequences = initial_state.shape[0]
                         final_state = final_state[:num_sequences]
                         checkpoint_state = checkpoint_state[:num_sequences]
@@ -1619,6 +1653,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                 cu_seqlens=non_spec_query_start_loc,
                             )
                     elif checkpoint is not None:
+                        assert not qk_normalized
                         assert non_spec_query_start_loc is not None
                         num_sequences = initial_state.shape[0]
                         assert checkpoint.checkpoint_offsets.shape == (num_sequences,)
@@ -1671,9 +1706,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     initial_state=initial_state,
                                     cu_seqlens=non_spec_query_start_loc,
                                     cu_seqlens_cpu=m.non_spec_query_start_loc_cpu,
+                                    qk_normalized=qk_normalized,
                                 )
                             )
                         else:
+                            assert not qk_normalized
                             frost_out, last_recurrent_state = (
                                 specialized_prefill_kda.frost_prefill(
                                     q=q_ns,

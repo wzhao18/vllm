@@ -35,7 +35,10 @@ def _operands(m, n, k, dev, seed):
     return x.to(torch.float8_e4m3fn), sx, w.to(torch.float8_e4m3fn), sw
 
 
-def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32):
+def _run(
+    seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32,
+    normalize_qk=False,
+):  # fmt: skip
     from vllm.models.kimi_k3.nvidia.ops import kda_conv
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
         KdaConvGemm,
@@ -67,13 +70,30 @@ def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32)
     ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, PART)
     gemm = KdaConvGemm(wq, ws, cw, PART, tactic=tactic)
     st = state0.clone()
-    out, _ = gemm(xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID)
+    out, _ = gemm(
+        xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID,
+        normalize_qk=normalize_qk,
+    )  # fmt: skip
     torch.cuda.synchronize()
     tot = int(qsl[-1])
     # qkv_conv leaves the rows of null-block sequences (padding) unwritten.
     keep = torch.ones(tot, dtype=torch.bool, device=dev)
     for i in (lines == NULL_BLOCK_ID).nonzero().flatten().tolist():
         keep[int(qsl[i]) : int(qsl[i + 1])] = False
+    if normalize_qk:
+        # Stock l2norm_fwd of the reference Q / K (FP32 sum of squares, then
+        # y * rsqrt(s + eps) in BF16): equal up to the reduction order, so at
+        # most one BF16 ulp apart; V and the conv state stay bitwise.
+        rh = ref[:2].float().unflatten(-1, (PART // 128, 128))
+        inv = torch.rsqrt(rh.square().sum(-1, keepdim=True) + 1e-6)
+        rn = (rh * inv).flatten(-2).to(torch.bfloat16)[:, :tot][:, keep]
+        got = out[:2, :tot][:, keep]
+        ulp = (got.view(torch.int16).int() - rn.view(torch.int16).int()).abs()
+        assert int(ulp.max()) <= 1
+        assert float((ulp > 0).float().mean()) < 0.01
+        assert torch.equal(out[2, :tot][keep], ref[2, :tot][keep])
+        assert torch.equal(st, st_ref)
+        return
     assert torch.equal(out[:, :tot][:, keep], ref[:, :tot][:, keep])
     assert torch.equal(st, st_ref)
     if deep:
@@ -102,6 +122,15 @@ def test_kda_conv_gemm_bf16_state():
 
 def test_kda_conv_gemm_exact_silu_path():
     _run([900, 513, 7], 1420, deep=True, seed=3)
+
+
+@pytest.mark.parametrize(
+    "seqlens,m,deep",
+    [([1, 2, 3, 125, 128, 3, 256, 600, 5], 1300, False), ([900, 513, 7], 1420, True)],
+)
+def test_kda_conv_gemm_normalize_qk(seqlens, m, deep):
+    # Q / K planes as the persistent prefill core consumes them (QKN route).
+    _run(seqlens, m, deep=deep, seed=3 if deep else 0, normalize_qk=True)
 
 
 def test_kda_conv_gemm_old_column_pass():

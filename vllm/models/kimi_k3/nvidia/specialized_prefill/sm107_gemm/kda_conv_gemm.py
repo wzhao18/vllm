@@ -32,7 +32,12 @@ _COMPILED: dict = {}
 
 class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
     def __init__(
-        self, tactic, conv: bool = False, norms: bool = False, drain: bool = False
+        self,
+        tactic,
+        conv: bool = False,
+        norms: bool = False,
+        drain: bool = False,
+        qkn: bool = False,
     ):
         (tm, tn), cluster, inst_m, swz, raster = tactic[:5]
         split_producer = len(tactic) > 5 and bool(tactic[5])
@@ -74,6 +79,8 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             raster_order=raster,
         )
         self.conv_norms = norms
+        # Q / K planes l2-normalized per head row (stock l2norm_fwd).
+        self.conv_qkn = qkn
         self.conv_drain = conv and drain
         if self.conv_drain or self.epi_drain:
             # Two warp groups drain the two M blocks of the B-reuse tile.
@@ -211,11 +218,14 @@ class KdaConvGemm:
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = {}
 
-    def _kernel(self, norms, args, problem, tail, conv, stream):
-        key = ("conv", self.tactic, norms, self.drain, self.weight.device.index, self.n, self.k)
+    def _kernel(self, norms, args, problem, tail, conv, stream, qkn=False):
+        key = (
+            "conv", self.tactic, norms, qkn, self.drain, self.weight.device.index,
+            self.n, self.k,
+        )  # fmt: skip
         fn = self._compiled.get(key) or _COMPILED.get(key)
         if fn is None:
-            gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain)
+            gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain, qkn=qkn)
             gemm.conv_mode = True
             gemm.conv_p_dim = self.p
             cl = self.tactic[1]
@@ -236,12 +246,17 @@ class KdaConvGemm:
 
     def __call__(
         self, x, x_scale, conv_state, qsl, lines, has_init, with_norms=False,
-        null_block_id: int | None = None,
+        null_block_id: int | None = None, normalize_qk: bool = False,
     ):  # fmt: skip
+        """``normalize_qk``: the Q and K planes come out l2-normalized per
+        (token, 128-channel head) row (stock ``l2norm_fwd``: FP32 sum of the
+        squared BF16 conv outputs, ``y * rsqrt(s + 1e-6)``, BF16)."""
         from cutlass.cute.runtime import from_dlpack
 
         from .conv_fixup import conv_fixup
 
+        if normalize_qk and (with_norms or not self._t2):
+            raise ValueError("KDA conv GEMM: normalize_qk needs the t2 column pass")
         m = x.shape[0]
         nseq = qsl.numel() - 1
         dev = x.device
@@ -271,11 +286,11 @@ class KdaConvGemm:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)
         args = (*args, from_dlpack(self.alpha))
-        fn = self._kernel(with_norms, args, problem, tail, conv, stream)
+        fn = self._kernel(with_norms, args, problem, tail, conv, stream, normalize_qk)
         fn(*args, problem, stream, *tail, cutlass.Int64(0), cutlass.Int64(0), *conv)
         conv_fixup(
             out, side, norms, self.conv_w, conv_state, qsl, lines, has_init,
-            self.p, null_block_id,
+            self.p, null_block_id, normalize=normalize_qk,
         )  # fmt: skip
         return out, norms
 

@@ -124,6 +124,7 @@ class PrefillKdaConvInProj:
             qa.data, x_scale, conv_state, m.non_spec_query_start_loc,
             m.non_spec_state_indices_tensor, m.has_initial_state,
             null_block_id=NULL_BLOCK_ID,
+            normalize_qk=self.layer.qk_normalized_route(m),
         )  # fmt: skip
         rest = torch._scaled_mm(
             qa.data,

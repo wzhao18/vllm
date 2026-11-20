@@ -39,6 +39,8 @@ ARMS = [
     ("l1", "lp1"),
     ("l2", "lp2"),
     ("l4", "lp4"),
+    # e with the Q / K planes l2-normalized in the epilogue (normalize_qk).
+    ("q", ""),
 ]
 #: cluster -> (swizzle, raster) as in the B3 tactics.
 RASTER = {(2, 1): (8, "n"), (4, 1): (8, "n"), (2, 4): (4, "m"), (2, 2): (8, "n")}
@@ -145,11 +147,22 @@ def main():
                 row = {"m": m, "cluster": "%dx%d" % cl, "arm": arm}
                 try:
                     g = KdaConvGemm(wq, ws, cw, p, tactic=tac)
+                    nq = arm == "q"
                     st = state0.clone()
                     t0 = time.perf_counter()
-                    y, _ = g(xq, xs, st, qsl, lines, has_init)
+                    y, _ = g(xq, xs, st, qsl, lines, has_init, normalize_qk=nq)
                     torch.cuda.synchronize()
                     row["first_call_s"] = round(time.perf_counter() - t0, 1)
+                    if nq:
+                        # Stock l2norm_fwd of the reference conv output.
+                        rh = ref[:2].float().unflatten(-1, (p // 128, 128))
+                        inv = torch.rsqrt(rh.square().sum(-1, keepdim=True) + 1e-6)
+                        rn = (rh * inv).flatten(-2).to(torch.bfloat16)
+                        d = (y[:2].view(torch.int16).int() - rn.view(torch.int16).int()).abs()
+                        row["qk_max_ulp"] = int(d.max())
+                        row["qk_ulp_frac"] = float((d > 0).float().mean())
+                        row["bitwise_v"] = bool(torch.equal(y[2], ref[2]))
+                        row["bitwise_state"] = bool(torch.equal(st, st_ref))
                     if arm in ("d1", "e", "en", "es", "e23", "l1", "l2", "l4"):
                         row["bitwise_out"] = bool(torch.equal(y, ref))
                         row["bitwise_state"] = bool(torch.equal(st, st_ref))
@@ -157,7 +170,7 @@ def main():
                             row["mismatch"] = int((y != ref).sum())
 
                     def f_arm():
-                        g(xq, xs, st, qsl, lines, has_init)
+                        g(xq, xs, st, qsl, lines, has_init, normalize_qk=nq)
 
                     if args.ncu:
                         f_arm()

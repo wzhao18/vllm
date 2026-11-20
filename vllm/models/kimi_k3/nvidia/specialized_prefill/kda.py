@@ -127,10 +127,15 @@ def persistent_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
+    qk_normalized: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
-    (sequence, head) chain pieces once per batch)."""
+    (sequence, head) chain pieces once per batch).
+
+    qk_normalized: the producer already l2-normalized q and k per (token,
+    head) row (stock l2norm_fwd before the chunk kernels); the kernel then
+    skips its own norm."""
     from .kda_persistent import forward as kp
 
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
@@ -159,6 +164,7 @@ def persistent_prefill(
         final_state=final_state,
         cu_seqlens=cu_seqlens,
         plan=plan,
+        qk_normalized=qk_normalized,
     )
     return out, final_state
 

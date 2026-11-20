@@ -1196,6 +1196,171 @@ _ONE2 = 0x3F8000003F800000
 _D_EXACT = 0x7E800000
 
 
+@dsl_user_op
+def sumsq_bf16x2(y: Uint32, s: Float32, *, loc=None, ip=None) -> Float32:
+    """``s + lo^2 + hi^2`` of a bf16x2 (FP32 FMA, low half first)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [_v(y, Uint32, loc, ip), _v(s, Float32, loc, ip)],
+            "{ .reg .b32 l, h; .reg .f32 fl, fh, t; shl.b32 l, $1, 16; "
+            "and.b32 h, $1, -65536; mov.b32 fl, l; mov.b32 fh, h; "
+            "fma.rn.f32 t, fl, fl, $2; fma.rn.f32 $0, fh, fh, t; }",
+            "=f,r,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def scale_bf16x2(y: Uint32, s: Float32, *, loc=None, ip=None) -> Uint32:
+    """``bf16x2(f32(y) * s)``, FP32 multiply, round to nearest even."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_v(y, Uint32, loc, ip), _v(s, Float32, loc, ip)],
+            "{ .reg .b32 l, h; .reg .f32 fl, fh; .reg .b64 Y, S; shl.b32 l, $1, 16; "
+            "and.b32 h, $1, -65536; mov.b64 Y, {l, h}; mov.b64 S, {$2, $2}; "
+            "mul.rn.f32x2 Y, Y, S; mov.b64 {fl, fh}, Y; cvt.rn.bf16x2.f32 $0, fh, fl; }",
+            "=r,r,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def shfl_idx_f32(v: Float32, src: Int32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [_v(v, Float32, loc, ip), _v(src, Int32, loc, ip)],
+            "shfl.sync.idx.b32 $0, $1, $2, 31, -1;",
+            "=f,f,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@dsl_user_op
+def stg4_row(addrs, i: int, nvalid: Int32, ys, *, loc=None, ip=None) -> None:
+    """Row ``i`` of a 16-row chunk in four column subtiles: one predicate
+    (``i < nvalid``), four 4-byte stores."""
+    st = " ".join(f"@p st.global.b32 [${j}], ${5 + j};" for j in range(4))
+    llvm.inline_asm(
+        None,
+        [_v(a, Int64, loc, ip) for a in addrs]
+        + [_v(nvalid, Int32, loc, ip)]
+        + [_v(y, Uint32, loc, ip) for y in ys],
+        "{ .reg .pred p; setp.gt.s32 p, $4, " + str(i) + "; " + st + " }",
+        "l,l,l,l,r,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@cute.jit
+def _t2_head_qkn(
+    xs4,
+    col0s,
+    trow: Int32,
+    wrow: Int32,
+    gbase: Int32,
+    bar: Int32,
+    rc: Int32,
+    r0: Int32,
+    cp: Int32,
+    cq: Int32,
+    cr: Int32,
+    w_addr: Int64,
+    out_addr: Int64,
+    part: Int32,
+    m_rows: Int32,
+    row_end: Int32,
+    nl2: Int64,
+    one2: Int64,
+    p_dim: cutlass.Constexpr,
+    scalar: cutlass.Constexpr,
+):
+    """One 128-column Q or K head (four 32-column subtiles) of the column
+    pass with the stock l2norm_fwd on its output: conv + SiLU as
+    ``_t2_chunk`` (bf16 y), FP32 sum of y^2 per row over the head (16 rows
+    per thread: 4 subtiles x 2 columns, then a reduce-scatter over the 16
+    column-pair lanes), ``y * rsqrt(s + 1e-6)`` rounded to bf16, stores."""
+    yh = cute.make_rmem_tensor(cute.make_layout((64,)), Uint32)
+    ssq = [Float32(0.0) for _ in range(16)]
+    lb = [gbase + rc * (16 * _PITCH * 4) + ((cq ^ j) * 16) + cr for j in range(4)]
+    for j in cutlass.range_constexpr(4):
+        col_n = col0s[j] + 2 * cp
+        wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
+        wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
+        wp = [wl[0], wl[1], wh[0], wh[1]]
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        for q in cutlass.range_constexpr(4):
+            sts_v4(wrow + (((trow % 4) ^ q) * 16), Int32(1), *xs4[j][4 * q : 4 * q + 4])
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        hr = []
+        for jj in cutlass.range_constexpr(3):
+            rr = rc * 16 - 3 + jj
+            rr = rr + 3 * b2i(rc == 0)
+            hr.append(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr))
+        xr = [lds_u32(lb[i % 4] + i * (_PITCH * 4)) for i in range(16)]
+        hp = [unpack_b64(v) for v in hr]
+        gm = Int32(0)
+        for i in cutlass.range_constexpr(16):
+            xp = unpack_b64(xr[i])
+            y, gm = conv_fast2(hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2, scalar)
+            yh[16 * j + i] = y
+            hp = [hp[1], hp[2], xp]
+        if b2i(gm <= _D_EXACT) * b2i(r0 + 16 <= row_end) == 0:
+            wv = []
+            for wj in wp:
+                wv.extend(split_b64(wj))
+            hx = [unpack_bf16x2(v) for v in hr]
+            for xi in cutlass.range_constexpr(16):
+                y2, s2 = conv_row(
+                    (hx[0][0], hx[0][1], hx[1][0], hx[1][1], hx[2][0], hx[2][1]),
+                    xr[xi], wv, Float32(0.0),
+                )  # fmt: skip
+                yh[16 * j + xi] = y2
+                hx = [hx[1], hx[2], unpack_bf16x2(xr[xi])]
+        for i in cutlass.range_constexpr(16):
+            ssq[i] = sumsq_bf16x2(yh[16 * j + i], ssq[i])
+    # Reduce-scatter: lane cp ends with the head sum of row cp of its chunk.
+    v = ssq
+    for d in (8, 4, 2, 1):
+        half = len(v) // 2
+        bit = (cp // d) % 2
+        nv = []
+        for jj in cutlass.range_constexpr(half):
+            a, b = v[jj], v[jj + half]
+            nv.append(self32(bit, b, a) + shfl_xor_f32(self32(bit, a, b), d))
+        v = nv
+    inv = rsqrt_eps(v[0])
+    nvalid = row_end - r0
+    addrs = [
+        out_addr
+        + ((Int64(part) * Int64(m_rows) + Int64(r0)) * Int64(p_dim)
+           + Int64(col0s[j] + 2 * cp - part * p_dim)) * 2
+        for j in range(4)
+    ]  # fmt: skip
+    src0 = (rc % 2) * 16
+    for i in cutlass.range_constexpr(16):
+        s_i = shfl_idx_f32(inv, src0 + i)
+        ys = [scale_bf16x2(yh[16 * j + i], s_i) for j in range(4)]
+        stg4_row([a + i * p_dim * 2 for a in addrs], i, nvalid, ys)
+
+
 @cute.jit
 def _t2_chunk(
     rc: Int32,
@@ -1427,6 +1592,58 @@ def epilogue_kda_conv_t2(
     cr = (cp % 4) * 4
     nl2 = Int64(_NL2)
     one2 = Int64(_ONE2)
+    if cutlass.const_expr(getattr(gemm_kernel, "conv_qkn", False)):
+        # Q / K tiles get the l2norm_fwd of their heads (V tiles: plain).
+        if cutlass.const_expr(epi_n % 4 != 0):
+            raise ValueError(f"conv epilogue q/k norm: {epi_n} subtiles per tile")
+        cols = [tTR_cC[(None, None, None, g, ni)][0][1] for ni in range(epi_n)]
+        part0 = cols[0] // p_dim
+        if part0 < 2:
+            for hh in cutlass.range_constexpr(epi_n // 4):
+                _t2_head_qkn(
+                    xs_all[4 * hh : 4 * hh + 4], cols[4 * hh : 4 * hh + 4],
+                    trow, wrow, gbase, bar, rc, r0, cp, cq, cr, w_addr, out_addr,
+                    part0, m_rows, row_end, nl2, one2, p_dim,
+                    getattr(gemm_kernel, "conv_scalar_silu", False),
+                )  # fmt: skip
+        else:
+            _t2_cols(
+                gemm_kernel, xs_all, tTR_cC, g, epi_n, trow, wrow, gbase, bar, rc, r0,
+                cp, cq, cr, w_addr, out_addr, m_rows, row_end, nl2, one2, p_dim,
+            )  # fmt: skip
+    else:
+        _t2_cols(
+            gemm_kernel, xs_all, tTR_cC, g, epi_n, trow, wrow, gbase, bar, rc, r0,
+            cp, cq, cr, w_addr, out_addr, m_rows, row_end, nl2, one2, p_dim,
+        )  # fmt: skip
+    return acc_consumer_state
+
+
+@cute.jit
+def _t2_cols(
+    gemm_kernel,
+    xs_all,
+    tTR_cC,
+    g: Int32,
+    epi_n: cutlass.Constexpr,
+    trow: Int32,
+    wrow: Int32,
+    gbase: Int32,
+    bar: Int32,
+    rc: Int32,
+    r0: Int32,
+    cp: Int32,
+    cq: Int32,
+    cr: Int32,
+    w_addr: Int64,
+    out_addr: Int64,
+    m_rows: Int32,
+    row_end: Int32,
+    nl2: Int64,
+    one2: Int64,
+    p_dim: cutlass.Constexpr,
+):
+    """The column pass of every subtile of the tile (no norms)."""
     # Conv weights in column-pair layout (KdaConvGemm.conv_w_pairs): 32 B per
     # column pair = taps 0..3 as (col, col + 1) f32x2 pairs.
     col_n = tTR_cC[(None, None, None, g, 0)][0][1] + 2 * cp
@@ -1455,9 +1672,8 @@ def epilogue_kda_conv_t2(
             _t2_chunk_loop(rc, r0, *args[:15], gemm_kernel.conv_loop_unroll)
         elif cutlass.const_expr(getattr(gemm_kernel, "conv_math_smsp23", False)):
             # Microbench: column pass only on the SMSP 2/3 warps (two chunks).
-            if gt >= 64:
+            if rc >= 4:
                 _t2_chunk(rc, r0, *args)
                 _t2_chunk(rc - 4, r0 - 64, *args)
         else:
             _t2_chunk(rc, r0, *args)
-    return acc_consumer_state

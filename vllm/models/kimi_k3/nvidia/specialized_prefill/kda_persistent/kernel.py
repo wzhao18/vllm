@@ -232,6 +232,7 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    QKN_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -2086,19 +2087,24 @@ def _pkd(
                                 for u in cutlass.range_constexpr(8):
                                     qr[u] = cutlass.BFloat16(0.0)
                                     kr[u] = cutlass.BFloat16(0.0)
-                        sq = cutlass.Float32(0.0)
-                        sk = cutlass.Float32(0.0)
-                        for u in cutlass.range_constexpr(8):
-                            fq = cutlass.Float32(qr[u])
-                            fk = cutlass.Float32(kr[u])
-                            sq += fq * fq
-                            sk += fk * fk
-                        for off in [1, 2, 4, 8]:
-                            sq += cute.arch.shuffle_sync_bfly(sq, off)
-                            sk += cute.arch.shuffle_sync_bfly(sk, off)
                         # scale folded into rqn: one FMUL replaces 8 per slice
-                        rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
-                        rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                        rqn = scale
+                        rkn = cutlass.Float32(1.0)
+                        # QKN_: the producer already l2-normalized q/k (stock
+                        # l2norm_fwd before the chunk kernels).
+                        if cutlass.const_expr(QKN_ == 0):
+                            sq = cutlass.Float32(0.0)
+                            sk = cutlass.Float32(0.0)
+                            for u in cutlass.range_constexpr(8):
+                                fq = cutlass.Float32(qr[u])
+                                fk = cutlass.Float32(kr[u])
+                                sq += fq * fq
+                                sk += fk * fk
+                            for off in [1, 2, 4, 8]:
+                                sq += cute.arch.shuffle_sync_bfly(sq, off)
+                                sk += cute.arch.shuffle_sync_bfly(sk, off)
+                            rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                            rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
                         g8s = v_gcs8[(rw2, None, sg2, inst)]
                         cute.autovec_copy(g8s, g8)
                         gv8 = g8.load()
@@ -2442,6 +2448,7 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    QKN_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2666,6 +2673,7 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        QKN_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),

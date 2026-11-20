@@ -68,6 +68,7 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    qk_normalized: bool = False,
 ):
     key = (
         dev.index,
@@ -95,6 +96,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        qk_normalized,
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -202,6 +204,7 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                QKN_=1 if qk_normalized else 0,
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
@@ -288,6 +291,7 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    qk_normalized=False,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -359,6 +363,7 @@ def _launch_forward(
         cluster_size=cluster_size,
         gate_roll=gate_roll,
         partial_tma=partial_tma,
+        qk_normalized=qk_normalized,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
@@ -623,7 +628,10 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     plan=None,
+    qk_normalized=False,
 ):
+    """qk_normalized: q/k are already l2-normalized per (token, head) row by the
+    producer (stock l2norm_fwd contract); the kernel then skips its own norm."""
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
         cu32,
@@ -675,4 +683,5 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
+        qk_normalized=qk_normalized,
     )

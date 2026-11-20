@@ -19,6 +19,7 @@ from vllm.triton_utils import tl, triton
 def _row(
     out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, x0, x1, x2, x3, part, c0, t,
     M, P, WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr,
+    NORMALIZE: tl.constexpr = False,
 ):  # fmt: skip
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     acc += x0 * w0
@@ -26,6 +27,12 @@ def _row(
     acc += x2 * w2
     acc += x3 * w3
     y = (acc / (1 + tl.exp(-acc))).to(tl.bfloat16)
+    if NORMALIZE:
+        # Q / K: y * rsqrt(sum(y^2) + 1e-6) per 128-column head (V: x 1).
+        yh = tl.reshape(y.to(tl.float32), [BLOCK // 128, 128])
+        inv = tl.math.rsqrt(tl.sum(yh * yh, axis=1) + 1e-6)
+        inv = tl.where(part < 2, inv, 1.0)
+        y = tl.reshape(yh * inv[:, None], [BLOCK]).to(tl.bfloat16)
     rowbase = (part * M + t).to(tl.int64)
     tl.store(out_ptr + rowbase * P + (cols - part * P), y, mask=cmask)
     if WITH_NORMS:
@@ -43,6 +50,7 @@ def _conv_fixup_kernel(
     M, N, P, NB, S, st_s0, st_s1, st_s2, ci_s0, null_id,
     HAS_NULL: tl.constexpr, WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr,
     SP2: tl.constexpr, SEQ_ONLY: tl.constexpr = False, PID_OFF=0,
+    NORMALIZE: tl.constexpr = False,
 ):  # fmt: skip
     pid = tl.program_id(0) - PID_OFF
     if SEQ_ONLY:
@@ -78,7 +86,7 @@ def _conv_fixup_kernel(
                 xc = tl.load(side_ptr + rc.to(tl.int64) * N + cols, mask=cmask, other=0.0).to(tl.float32)
                 xd = tl.load(side_ptr + rd.to(tl.int64) * N + cols, mask=cmask, other=0.0).to(tl.float32)
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, xa, xb, xc, xd,
-                     part, c0, t, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                     part, c0, t, M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
     else:
         s = pid - NB
         start = tl.load(qsl_ptr + s)
@@ -98,13 +106,13 @@ def _conv_fixup_kernel(
             x1 = tl.load(side_ptr + (r0 + 1).to(tl.int64) * N + cols, mask=cmask & (ln > 1), other=0.0).to(tl.float32)
             x2 = tl.load(side_ptr + (r0 + 2).to(tl.int64) * N + cols, mask=cmask & (ln > 2), other=0.0).to(tl.float32)
             _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, h0, h1, h2, x0, part, c0, start,
-                 M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                 M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
             if ln > 1:
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, h1, h2, x0, x1, part,
-                     c0, start + 1, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                     c0, start + 1, M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
             if ln > 2:
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, h2, x0, x1, x2, part,
-                     c0, start + 2, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                     c0, start + 2, M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
             t0 = tl.load(side_ptr + (r0 + 3).to(tl.int64) * N + cols, mask=cmask, other=0.0).to(tl.float32)
             t1 = tl.load(side_ptr + (r0 + 4).to(tl.int64) * N + cols, mask=cmask, other=0.0).to(tl.float32)
             t2 = tl.load(side_ptr + (r0 + 5).to(tl.int64) * N + cols, mask=cmask, other=0.0).to(tl.float32)
@@ -121,7 +129,7 @@ def _conv_fixup_kernel(
 def _fixup_blocks(
     out_ptr, side_ptr, norm_ptr, w_ptr, qsl_ptr, M, N, P, NB, S, bp,
     WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr, BG: tl.constexpr,
-    SP2: tl.constexpr,
+    SP2: tl.constexpr, NORMALIZE: tl.constexpr = False,
 ):  # fmt: skip
     """Rows 0-2 of 128-row blocks [BG * bp, BG * bp + BG) that are not
     sequence starts, from the saved rows 125-127 of the block before and
@@ -158,13 +166,13 @@ def _fixup_blocks(
             ok2 = (b0 + 2 < total) & (b0 + 2 < M) & (b0 + 2 - tl.load(qsl_ptr + s2) >= 3)
             if ok0:
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, p0, p1, p2, x0,
-                     part, c0, b0, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                     part, c0, b0, M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
             if ok1:
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, p1, p2, x0, x1,
-                     part, c0, b0 + 1, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                     part, c0, b0 + 1, M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
             if ok2:
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, p2, x0, x1, x2,
-                     part, c0, b0 + 2, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+                     part, c0, b0 + 2, M, P, WITH_NORMS, BLOCK, NORMALIZE)  # fmt: skip
 
 
 @triton.jit
@@ -172,19 +180,19 @@ def _conv_fixup_all_kernel(
     out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
     M, N, P, NB, S, NBG, st_s0, st_s1, st_s2, ci_s0, null_id,
     HAS_NULL: tl.constexpr, WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr,
-    BG: tl.constexpr, SP2: tl.constexpr,
+    BG: tl.constexpr, SP2: tl.constexpr, NORMALIZE: tl.constexpr = False,
 ):  # fmt: skip
     """One launch: programs [0, NBG) fix block rows (``_fixup_blocks``), the
     next S programs fix sequence starts and the conv state (disjoint rows)."""
     pid = tl.program_id(0)
     if pid < NBG:
         _fixup_blocks(out_ptr, side_ptr, norm_ptr, w_ptr, qsl_ptr, M, N, P, NB, S,
-                      pid, WITH_NORMS, BLOCK, BG, SP2)  # fmt: skip
+                      pid, WITH_NORMS, BLOCK, BG, SP2, NORMALIZE)  # fmt: skip
     else:
         _conv_fixup_kernel(
             out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
             M, N, P, NB, S, st_s0, st_s1, st_s2, ci_s0, null_id,
-            HAS_NULL, WITH_NORMS, BLOCK, SP2, True, NBG,
+            HAS_NULL, WITH_NORMS, BLOCK, SP2, True, NBG, NORMALIZE,
         )  # fmt: skip
 
 
@@ -205,6 +213,7 @@ def conv_fixup(
     has_init: torch.Tensor,
     part_dim: int,
     null_block_id: int | None,
+    normalize: bool = False,
 ) -> None:
     _, m, p = out.shape
     n = 3 * p
@@ -222,5 +231,5 @@ def conv_fixup(
         conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
         lines.stride(0), -1 if null_block_id is None else null_block_id,
         HAS_NULL=null_block_id is not None, WITH_NORMS=norms is not None,
-        BLOCK=block, BG=bg, SP2=sp2, num_warps=4,
+        BLOCK=block, BG=bg, SP2=sp2, NORMALIZE=normalize, num_warps=4,
     )  # fmt: skip
