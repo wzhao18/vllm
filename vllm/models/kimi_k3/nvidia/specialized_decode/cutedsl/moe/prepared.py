@@ -343,7 +343,9 @@ def stock_router(router):
     ``select_experts`` runs through ``torch.compile``, which guards on its arguments
     and compiles on a miss: the eager warmup calls it from the stock runner only,
     so a wide batch's first call compiled inside the capture and aborted it.
-    Raises unless the router takes that op (no EPLB, no padding masks)."""
+    An EPLB router's logical ids go through its stock ``_apply_eplb_mapping``
+    (replica choice + load record, graph-safe). Raises unless the router takes
+    that op (no padding masks)."""
     from vllm import _custom_ops as ops
     from vllm import envs
     from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
@@ -356,7 +358,6 @@ def stock_router(router):
         type(router) is GroupedTopKRouter
         and router.scoring_func == "sigmoid"
         and router.e_score_correction_bias is not None
-        and router.eplb_state is None
         and envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
         and groups <= 32
         and top_k <= 32
@@ -375,6 +376,8 @@ def stock_router(router):
         weights, ids = ops.grouped_topk(logits, *args)
         if ids.dtype != torch.int32:
             raise RuntimeError(f"wide MoE rows: {ids.dtype} routes")
+        if router.eplb_state is not None:
+            ids = router._apply_eplb_mapping(ids).to(torch.int32)
         return weights, ids
 
     return route

@@ -134,11 +134,6 @@ def _now():
     return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
 
 
-@asm(Int64)
-def _clk():
-    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
-
-
 @asm()
 def _st_u64(address, value):
     return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
@@ -295,11 +290,8 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False, maxreg=None):  # fmt: skip
+                 partials=False):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
-        # Launch bound (CTAs per SM) capping ptxas at maxreg registers per thread:
-        # 64 K / (256 x bound) (48 -> 5), so the CTA fits beside a predecessor's.
-        self.min_blocks = 65536 // (256 * maxreg) if maxreg else 0
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
         self.rows, self.n, self.k, self.split, self.silu = rows, n, k, split, silu
@@ -387,7 +379,6 @@ class WideGemm:
             cluster=(2, 1, 1),
             stream=stream,
             use_pdl=True,
-            **({"min_blocks_per_mp": self.min_blocks} if self.min_blocks else {}),
         )
 
     @cute.kernel
@@ -472,8 +463,7 @@ class WideGemm:
         # +0 epilogue start, +8 acc_full, +16 TMEM staged, +24 all splits published,
         # +32 peers' partials landed, +40 stored, +48 PDL wait done (activations),
         # +56 activations issued, +64 first full stage, +72 last full stage,
-        # +80 weights issued; K tile 8: +88 MMA loop top, +96 stages full, +104 issued;
-        # MMA warp clock64 totals: +112 waiting for stages, +120 issuing MMAs + commits.
+        # +80 weights issued; K tile 8: +88 MMA loop top, +96 stages full, +104 issued.
         stamp = mFlags.iterator.toint() + self.n_pad // 16 + (
             Int64(split_rank) * (self.n_pad // 128) + bidx) * STAMP_BYTES  # fmt: skip
         n_act, n_w = len(self.act_warps), len(self.weight_warps)
@@ -501,9 +491,7 @@ class WideGemm:
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
             if leader:
                 kblocks = cute.size(tCrA, mode=[2])
-                waited, issued = Int64(0), Int64(0)
                 for t in cutlass.range(k_count, unroll=1):
-                    c0 = _clk()
                     s, sb = t % wst, t % ast
                     if t == 8:
                         if lane == 0:
@@ -516,7 +504,6 @@ class WideGemm:
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 96, _now())
-                    c1 = _clk()
                     for c in cutlass.range_constexpr(chunks):
                         acc_c = acc[(None, None, None, c)]
                         for kb in cutlass.range_constexpr(kblocks):
@@ -529,13 +516,8 @@ class WideGemm:
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 104, _now())
-                    c2 = _clk()
-                    waited = waited + (c1 - c0)
-                    issued = issued + (c2 - c1)
                 if lane == 0:
                     _st_u64(stamp + 72, _now())
-                    _st_u64(stamp + 112, waited)
-                    _st_u64(stamp + 120, issued)
                 with cute.arch.elect_one():
                     tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
         elif warp >= 4:
@@ -888,12 +870,8 @@ class PreparedWide:
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
     [T, N / 2] with ``silu``)."""
 
-    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False,
-                 maxreg=None):  # fmt: skip
+    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False):
         self.silu, self.out_f32, self.partials = silu, out_f32 or partials, partials
-        # ptxas register cap: a CTA that must co-reside with its PDL predecessor
-        # (e.g. 3-4 AttnRes CTAs of 13 K registers each) fits only at <= 48.
-        self.maxreg = maxreg
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
@@ -912,7 +890,7 @@ class PreparedWide:
         for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials, self.maxreg,
+                w_warps, direct, rotate, self.partials,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -933,7 +911,7 @@ class PreparedWide:
             )
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
             key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
-            key += self.policies[rows] + (self.maxreg,)
+            key += self.policies[rows]
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)

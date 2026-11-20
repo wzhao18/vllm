@@ -250,6 +250,8 @@ class GqaWindowUmma:
         self.pages = -(-(window + q - 1 + 2 * KB) // page) + 1
         assert self.pages <= THREADS
         assert 4 * 32 * PITCH * 4 <= ring * SLOT  # (partials in the freed ring)
+        if splits == 1:  # (+ the own rows' partials, recv)
+            assert (4 * 32 + self.owned) * PITCH * 4 <= ring * SLOT
 
     @cute.jit
     def __call__(self, *args):
@@ -349,10 +351,21 @@ class GqaWindowUmma:
         newkv = alloc(smem, cutlass.Uint8, Q * 256, align=16)
         newvalid = alloc(smem, Int32, Q, align=16)
         bars = alloc(smem, cutlass.Int64, R + 4 * NS + 1, align=8)
-        recv = alloc(smem, Float32, max(S * OWN * PITCH, 4), align=16)
+        # S = 1: the own-row partials land in the freed ring behind the quarters'
+        # partials, and the merge stats in the Q tile (its last MMA completed before
+        # the merge reads PV's result): 2 CTAs per SM keep a 6-slot ring
+        if cutlass.const_expr(S == 1):
+            recv = cute.make_tensor(
+                cute.recast_ptr(ring.iterator + 4 * 32 * PITCH * 4, dtype=Float32),
+                cute.make_layout(OWN * PITCH),
+            )  # fmt: skip
+        else:
+            recv = alloc(smem, Float32, S * OWN * PITCH, align=16)
         recv_base = Int32(shared_address(recv.iterator))
         blocks = alloc(smem, Int32, NP, align=16)
-        stats = alloc(smem, Float32, 4 * 32 * 2, align=16)
+        stats = cute.make_tensor(
+            cute.recast_ptr(qtile.iterator, dtype=Float32), cute.make_layout(4 * 32 * 2)
+        )  # fmt: skip
         tslot = alloc(smem, Int32, 2, align=16)  # [1]: the redo flag
         ring_base = Int32(shared_address(ring.iterator))
         q_base = Int32(shared_address(qtile.iterator))
