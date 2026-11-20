@@ -963,6 +963,19 @@ class KimiK3MegaMoEExperts(nn.Module):
                 return b
         raise AssertionError("unreachable: the largest bucket holds max_num_tokens")
 
+    def reduce_rows_done(self, num_tokens: int) -> torch.Tensor | None:
+        """The ``[rows done, passed]`` pair of the fused-norm reduce that a forward of
+        ``num_tokens`` launches (``session.RubinMegaMoeSession.reduce_rows_done``)."""
+        return self.get_runtime().sessions[self.select_bucket(num_tokens)].reduce_rows_done()
+
+    def rearm_reduce_rows_done(self) -> None:
+        """Zero every session's pair (launches before a consumer existed, e.g. the
+        warmup, leave arrivals no consumer took)."""
+        for session in self.get_runtime().sessions.values():
+            pair = session.reduce_rows_done() if session._carved else None
+            if pair is not None:
+                pair.zero_()
+
     def ep_tokens(self, num_tokens: int) -> int | None:
         """EP-uniform live tokens per rank of this forward (the EP mean, which sets
         each rank's expert work); picks a capped prefill bucket's epilogue variant

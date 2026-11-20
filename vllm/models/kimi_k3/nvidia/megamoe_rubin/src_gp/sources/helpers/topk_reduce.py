@@ -34,7 +34,7 @@ from ..quant_def import CombineFormat
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_device import PackedF32
 from ...common.megamoe_constants import Nvfp4E2M1RcpLimit
 from ...common.dsl_helpers import mark_alignment
-from ...common.ptx_helpers import cvt_e2m1_to_fp32_cvt_ptx, cvt_e2m1_to_fp32_optimal_ptx, nanosleep
+from ...common.ptx_helpers import cvt_e2m1_to_fp32_cvt_ptx, cvt_e2m1_to_fp32_optimal_ptx, nanosleep, red_add_release_gpu_s32
 
 
 
@@ -420,6 +420,7 @@ class TopkReduce:
         rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a (VENDOR.md)
         rmsnorm_eps: Optional[Float32] = None,
         producer_done: Optional[cute.Tensor] = None,  # int32 x1: producer_arrivals counter (see __init__)
+        rows_done: Optional[cute.Tensor] = None,  # int32 x2: fused-norm form only, see _reduce_bf16_ll_rmsnorm
     ):
         """Launch the reduce.
 
@@ -497,6 +498,7 @@ class TopkReduce:
                 rmsnorm_eps,
                 shared_term,
                 producer_done,
+                rows_done,
             )
             if cutlass.const_expr(split == 1):
                 kernel.launch(
@@ -976,6 +978,7 @@ class TopkReduce:
         rmsnorm_eps: Float32,
         shared_term: Optional[cute.Tensor] = None,
         producer_done: Optional[cute.Tensor] = None,
+        rows_done: Optional[cute.Tensor] = None,
     ):
         """vLLM-local E2a on the polled plane: ``_reduce_bf16_ll`` of one token row per CTA (thread = one 8-wide
         hidden tile; same poll, top-k order and FP32 FMA form, same cell reset), then the stock vLLM ``rms_norm`` of
@@ -1142,6 +1145,14 @@ class TopkReduce:
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):
                 self._wait_producer(producer_done)
+        if cutlass.const_expr(rows_done is not None):
+            # One release arrival per CTA once its row slice is stored (and, on the producer-done acquirer, after
+            # that acquire): the consumer's acquire of the full count orders every normalized row and the
+            # producer's shared output before its reads, without waiting for either grid to complete.
+            cute.arch.sync_threads()
+            if thread_idx == Int32(0):
+                cute.arch.fence_acq_rel_gpu()
+                red_add_release_gpu_s32(rows_done.iterator, Int32(1))
 
     @cute.kernel
     def _reduce_persistent(

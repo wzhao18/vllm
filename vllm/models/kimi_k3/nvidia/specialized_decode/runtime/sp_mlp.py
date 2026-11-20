@@ -263,16 +263,23 @@ class SpMlp:
 
             prepare_output_rmsnorm(mlp.experts, norm)
             self.fused_norm = norm
-        # The fused path ends with that reduce, which releases its dependents at
-        # entry: the latent up-projection streams its weight on chip while the reduce
-        # still polls its cells (``gemm.latent_up``). Per-shape: other rows keep
-        # ``gemms["latent_up"]``.
+        # The fused path ends with that reduce, which releases its dependents at entry
+        # and counts its stored rows on the session's [rows done, passed] pair: the
+        # latent up-projection streams its weight on chip under the MegaMoE kernel's
+        # serial tail and waits on the pair, not on either grid (``gemm.latent_up``).
+        # Every fused-norm launch is consumed by it: fused buckets hold <= 128 rows.
         self.latent_up = None
         if self.fused_shared is not None and self.fused_norm is not None:
-            up_rows = tuple(r for r in self.rows if PreparedLatentUp.supports(r))
-            if up_rows:
-                self.latent_up = PreparedLatentUp(weights["latent_up"], up_rows)
-                self.latent_up.prepare()
+            runtime = mlp.experts.get_runtime()
+            fused = [s for s in runtime.sessions.values() if s.cfg.shared is not None]
+            cap = max(b.max_tokens for b in runtime.sessions if b.shared is not None)
+            if not PreparedLatentUp.supports(cap):
+                raise Unsupported("moe", cap, f"layer {index}: fused rows > latent_up's")
+            split = fused[0].kernel.reduce_norm_split
+            self.latent_up = PreparedLatentUp(
+                weights["latent_up"], (64, 96, 128), reduce_split=split
+            ).prepare()
+            mlp.experts.rearm_reduce_rows_done()
 
     def choices(self, n):
         """The four GEMM families' choices at ``n`` shard rows."""
@@ -358,7 +365,7 @@ class SpMlp:
                 gemms["shared_gu"].input.quantize(h)
             final, shared_out = experts(self.fused_shared)
             if fused_norm is not None and self.latent_up is not None:
-                tail = self.latent_up if n in self.latent_up.kernels else None
+                tail = self.latent_up
         elif mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
                 experts,
@@ -374,7 +381,7 @@ class SpMlp:
         if norm is not None and fused_norm is None:
             final = norm(final)
         if tail is not None:
-            return tail.run(final, shared_out)
+            return tail.run(final, shared_out, mlp.experts.reduce_rows_done(n))
         return gemms["latent_up"].run(final, residual=shared_out)
 
 

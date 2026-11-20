@@ -19,8 +19,8 @@ import json
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int64
-from cutlass.cute.runtime import make_fake_stream
+from cutlass import Int32, Int64
+from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_fake_tensor
 
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
     architecture,
@@ -39,17 +39,28 @@ def _now():
     return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
 
 
+@asm()
+def _red_release_add(address, value):
+    code = "red.release.gpu.global.add.s32 [$0], $1;"
+    return code, "l,r,~{memory}", (Int64(address), Int32(value))
+
+
 class Spin:
+    """The reduce's stand-in: releases its dependents at entry, spins, then posts
+    add arrivals on the sync pair (as the reduce's CTAs do)."""
+
     @cute.experimental.jit
-    def __call__(self, ns: Int64, stream):
-        self.kernel(ns).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+    def __call__(self, ns: Int64, sync: cute.Tensor, add: Int32, stream):
+        self.kernel(ns, sync, add).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
 
     @cute.experimental.kernel
-    def kernel(self, ns: Int64):
+    def kernel(self, ns: Int64, sync: cute.Tensor, add: Int32):
         cute.arch.griddepcontrol_launch_dependents()
         start = _now()
         while _now() - start < ns:
             pass
+        if cute.arch.lane_idx() == 0:
+            _red_release_add(sync.iterator.toint(), add)
 
 
 def graph_time(fn, reps):
@@ -79,7 +90,7 @@ def graph_time(fn, reps):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--tokens", default="32,64,96")
+    p.add_argument("--tokens", default="32,64,96,128")
     p.add_argument("--window", type=int, default=6000, help="spin ns before each op")
     p.add_argument("--copies", type=int, default=6)
     p.add_argument("--iters", type=int, default=12)
@@ -91,33 +102,43 @@ def main():
     torch.manual_seed(0)
     ws = [torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.02 for _ in range(a.copies)]
     arch = architecture(dev)
+    fake_pair = make_fake_tensor(cutlass.Int32, (2,), (1,), assumed_align=8)
     spin = cute.experimental.compile(
-        Spin(), Int64(0), make_fake_stream(), options=f"--gpu-arch={arch}"
+        Spin(), Int64(0), fake_pair, Int32(0), make_fake_stream(),
+        options=f"--gpu-arch={arch}",
     )
+    idle = torch.zeros(2, device=dev, dtype=torch.int32)
+    pair = torch.zeros(2, device=dev, dtype=torch.int32)
 
-    def spin_once():
-        spin(Int64(a.window), current_stream(dev))
+    def spin_once(sync, add):
+        view = from_dlpack(sync, assumed_align=8)
+        spin(Int64(a.window), view, Int32(add), current_stream(dev))
 
     results = []
     for t in (int(v) for v in a.tokens.split(",")):
         x = torch.randn(t, k, device=dev, dtype=torch.bfloat16)
         res = [torch.randn(t, n, device=dev, dtype=torch.bfloat16) for _ in range(a.copies)]
-        ups = [PreparedLatentUp(w, (t,)).prepare() for w in ws]
+        ups = [PreparedLatentUp(w, (t,), reduce_split=4).prepare() for w in ws]
         # correctness vs stock on copy 0
         ref = res[0].clone().addmm_(x, ws[0].t())
         out = res[0].clone()
-        ups[0].run(x, out)
+        pair.zero_()
+        pair[0] = 4 * t
+        ups[0].run(x, out, pair)
+        assert pair.tolist() == [0, 0]
         err = (out.float() - ref.float()).abs().max().item()
 
         def body(op, with_spin):
             def fn():
                 for i in range(a.iters):
+                    if op == "tmem":
+                        spin_once(pair, 4 * t)  # the reduce's arrivals
+                        ups[i % a.copies].run(x, res[i % a.copies], pair)
+                        continue
                     if with_spin:
-                        spin_once()
+                        spin_once(idle, 0)
                     if op == "cublas":
                         res[i % a.copies].addmm_(x, ws[i % a.copies].t())
-                    elif op == "tmem":
-                        ups[i % a.copies].run(x, res[i % a.copies])
             return fn
 
         base = graph_time(body(None, True), a.reps) if a.window else 0.0

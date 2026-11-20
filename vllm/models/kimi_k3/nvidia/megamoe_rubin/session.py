@@ -501,6 +501,24 @@ class RubinMegaMoeSession:
                 f"with 0 < n <= {self.cfg.max_tokens_per_rank} on {self.device}."
             )
 
+    def reduce_rows_done(self) -> torch.Tensor | None:
+        """The fused-norm reduce's ``[rows done, consumer CTAs passed]`` int32 pair (a
+        view of the local workspace), or None when this session's reduce keeps none.
+        Every reduce CTA of a launch release-adds 1 to rows done; the one consumer
+        that waits on it re-arms both (``specialized_decode`` ``gemm.latent_up``)."""
+        name = getattr(self.kernel, "reduce_rows_done_region", None)
+        workspace = self.kernel._device_workspace
+        if name is None or name not in {r.name for r in workspace.regions("local")}:
+            return None
+        if not self._carved:
+            raise RuntimeError("reduce_rows_done before the session is carved.")
+        offset = workspace.offset(name)
+        return self.local_workspace[offset : offset + 8].view(torch.int32)
+
+    def reduce_ctas(self, rows: int) -> int:
+        """CTAs of the fused-norm reduce launch for ``rows`` output rows."""
+        return rows * self.kernel.reduce_norm_split
+
     def use_s2(self, ep_tokens: int | None) -> bool:
         """The epilogue variant for a launch whose EP-uniform live tokens per rank are
         ``ep_tokens`` (None: the capacity). Same answer on every EP rank."""
