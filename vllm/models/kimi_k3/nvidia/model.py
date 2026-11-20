@@ -1703,7 +1703,9 @@ class KimiDecoderLayer(nn.Module):
         """(attention, mlp): which of this layer's output producers add into
         the die-local AttnRes prefix in their GEMM store (prefill dataflow C,
         specialized_prefill.attn_res_resid). Only while ``prefix_sum`` is the
-        die-local prefix buffer of an attn_res_lp forward."""
+        die-local prefix buffer of an attn_res_lp forward of at least
+        ``attn_res_resid.MIN_ROWS`` rows (``use_for``: shorter steps keep the
+        stock GEMM + AttnRes with a delta, which is faster there)."""
         caps = getattr(self, "_resid_caps", None)
         if caps is None:
             attn = (
@@ -1720,6 +1722,8 @@ class KimiDecoderLayer(nn.Module):
             )
             caps = self._resid_caps = (attn, mlp)
         if not (caps[0] or caps[1]) or prefix_sum is None or residual is None:
+            return False, False
+        if not prefill_attn_res_resid.use_for(prefix_sum.shape[0]):
             return False, False
         if not (
             prefill_attn_res_lp.active(residual, prefix_sum)

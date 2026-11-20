@@ -31,7 +31,17 @@ from vllm.platforms import current_platform
 # swap, epilogue flags: the 512x256 B-reuse tile on (2, 2) clusters is the
 # MXFP8 host at nvjet parity for the N = 7168 prefill shapes (P-GEMM R4-M3).
 TACTIC = ((512, 256), (2, 2), 256, 8, "n", 0, 0, "")
-MIN_ROWS = 4096
+# Rows per rank from which a prefill forward runs dataflow C. Below it the
+# reduce-store GEMM's fixed cost (the 512-row tile at a few waves) exceeds the
+# AttnRes row read + write it removes and the stock cuBLASLt GEMM + AttnRes with
+# a delta is faster (BUG-PRES-1, measured on the model step: PRES 2026-11-20).
+MIN_ROWS = 1 << 30  # BENCH-ONLY arm: dataflow C never
+
+
+def use_for(rows: int) -> bool:
+    """Per-shape policy: dataflow C for prefill forwards of at least
+    ``MIN_ROWS`` rows per rank (one decision per forward, all layers)."""
+    return rows >= MIN_ROWS
 
 
 def _weight_rows(linear) -> tuple[torch.Tensor, torch.Tensor] | None:
