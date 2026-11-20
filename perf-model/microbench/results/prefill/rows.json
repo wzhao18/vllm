@@ -1,0 +1,2643 @@
+[
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine"
+  ],
+  "row": "MOE.megamoe(dispatch+fc1+act+fc2+combine)",
+  "measured_us": 75254.0,
+  "t_sol_us": 30908.8,
+  "t_ach_us": 45927.0,
+  "derate": 1.639,
+  "notes": "busy 75.25 ms/step, critical-path excl 47.88 ms; kernels: vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubi 69.73 ms; router_kernel_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsources 2.93 ms; reduce_bf16_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceske 1.92 ms; model comm folded in: P11 EP-dispatch (MegaMoE dispatch), P12 EP-combine (MegaMoE combine)"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.in_proj"
+  ],
+  "row": "KDA.in_proj",
+  "measured_us": 29202.0,
+  "t_sol_us": 25460.9,
+  "t_ach_us": 27902.3,
+  "derate": 1.047,
+  "notes": "busy 29.20 ms/step, critical-path excl 29.16 ms; kernels: nvjet_sm107_tst_256x256_64x6_1x2_2cta_Breuse_h_bz_TNN 29.20 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.shared_down"
+  ],
+  "row": "MOE.shared_down",
+  "measured_us": 18107.0,
+  "t_sol_us": 4148.9,
+  "t_ach_us": 4546.8,
+  "derate": 3.982,
+  "notes": "KERNEL-DEBUG; busy 18.11 ms/step, critical-path excl 16.87 ms; kernels: nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN 18.11 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "comm.layer.kda"
+  ],
+  "row": "comm.layer.kda",
+  "measured_us": 17034.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 17.03 ms/step, critical-path excl 17.03 ms; kernels: _push_shard_kernel 16.40 ms; c10d::symmetric_memory::multimem_barrier_kernel 0.64 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.o_proj"
+  ],
+  "row": "KDA.o_proj+AR",
+  "measured_us": 16909.0,
+  "t_sol_us": 16747.3,
+  "t_ach_us": 29933.6,
+  "derate": 0.565,
+  "notes": "busy 16.91 ms/step, critical-path excl 16.91 ms; kernels: vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRs 16.91 ms; model comm folded in: P1 AR-NVLS (o_proj AR)"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.core_prefill"
+  ],
+  "row": "KDA.core_prefill",
+  "measured_us": 13836.0,
+  "t_sol_us": 8182.6,
+  "t_ach_us": 9603.5,
+  "derate": 1.441,
+  "notes": "busy 13.84 ms/step, critical-path excl 13.80 ms; kernels: _Z25_flash_kda_fwd_recurrenceIN4cute9TiledCopyINS0_9Copy_Ato 10.49 ms; _flash_kda_fwd_prepare 2.97 ms; _gather_initial_states_kernel 0.21 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.shared_gate_up"
+  ],
+  "row": "MOE.shared_gate_up",
+  "measured_us": 11173.0,
+  "t_sol_us": 8297.9,
+  "t_ach_us": 9093.6,
+  "derate": 1.229,
+  "notes": "busy 11.17 ms/step, critical-path excl 3.08 ms; kernels: nvjet_sm107_tst_256x256_64x6_1x2_2cta_Breuse_h_bz_TNN 11.17 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "comm.top(embed/final/bench restore)"
+  ],
+  "row": "comm.top(embed/final/bench restore)",
+  "measured_us": 8244.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 8.24 ms/step, critical-path excl 7.97 ms; kernels: Memcpy PtoP  4.64 ms; ncclDevKernel_AllGather_RING 2.75 ms; ncclDevKernel_ReduceScatter_bf16_RING 0.85 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.shared_act"
+  ],
+  "row": "MOE.shared_act",
+  "measured_us": 6515.0,
+  "t_sol_us": 105.6,
+  "t_ach_us": 105.6,
+  "derate": 61.698,
+  "notes": "KERNEL-DEBUG; busy 6.51 ms/step, critical-path excl 6.51 ms; kernels: situ_and_mul_vec8_kernel 6.51 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.sparse_mla"
+  ],
+  "row": "DSA.sparse_mla",
+  "measured_us": 6458.0,
+  "t_sol_us": 1469.1,
+  "t_ach_us": 1929.2,
+  "derate": 3.348,
+  "notes": "KERNEL-DEBUG; busy 6.46 ms/step, critical-path excl 6.45 ms; kernels: fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged 6.23 ms; sparse_mla_index_remap_kernel 0.23 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "comm.layer.dsa"
+  ],
+  "row": "comm.layer.dsa",
+  "measured_us": 5902.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 5.90 ms/step, critical-path excl 5.90 ms; kernels: _push_shard_kernel 5.72 ms; c10d::symmetric_memory::multimem_barrier_kernel 0.19 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.o_proj"
+  ],
+  "row": "DSA.o_proj+AR",
+  "measured_us": 5733.0,
+  "t_sol_us": 5825.2,
+  "t_ach_us": 10411.7,
+  "derate": 0.551,
+  "notes": "busy 5.73 ms/step, critical-path excl 5.73 ms; kernels: vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRs 5.73 ms; model comm folded in: P1 AR-NVLS (o_proj AR)"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.idx_score"
+  ],
+  "row": "DSA.idx_score",
+  "measured_us": 5513.0,
+  "t_sol_us": 3616.8,
+  "t_ach_us": 3616.8,
+  "derate": 1.524,
+  "notes": "busy 5.51 ms/step, critical-path excl 1.10 ms; kernels: deep_gemm::sm100_mqa_logits 4.71 ms; device_kernel____tensorptri32gmemo1___tensorptri32gmemo1_ten 0.81 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.prologue"
+  ],
+  "row": "DSA.prologue+aux",
+  "measured_us": 5198.0,
+  "t_sol_us": 154.7,
+  "t_ach_us": 244.9,
+  "derate": 21.226,
+  "notes": "KERNEL-DEBUG; busy 5.20 ms/step, critical-path excl 3.87 ms; kernels: Kernel 3.42 ms; shardq_query_quant_kernel 0.86 ms; rms_norm_rows_kernel 0.44 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "L.attnres_pre+post",
+  "measured_us": 4856.0,
+  "t_sol_us": 15662.8,
+  "t_ach_us": 24790.0,
+  "derate": 0.196,
+  "notes": "busy 4.86 ms/step, critical-path excl 4.24 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 4.86 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.qkv_a_packed"
+  ],
+  "row": "DSA.qkv_a_packed",
+  "measured_us": 4533.0,
+  "t_sol_us": 3201.9,
+  "t_ach_us": 3508.9,
+  "derate": 1.292,
+  "notes": "busy 4.53 ms/step, critical-path excl 4.44 ms; kernels: nvjet_sm107_tst_192x192_64x8_2x2f_2cta_v_bz_TNN 3.56 ms; nvjet_sm107_tst_128x160_64x11_2x4_2cta_h_bz_TNT 0.97 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.latent_down"
+  ],
+  "row": "MOE.latent_down",
+  "measured_us": 3766.0,
+  "t_sol_us": 2420.2,
+  "t_ach_us": 2652.3,
+  "derate": 1.42,
+  "notes": "busy 3.77 ms/step, critical-path excl 3.74 ms; kernels: nvjet_sm107_tst_320x128_64x8_1x2_2cta_h_bz_TNN 3.77 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.latent_up"
+  ],
+  "row": "MOE.latent_up",
+  "measured_us": 3369.0,
+  "t_sol_us": 2420.2,
+  "t_ach_us": 2652.3,
+  "derate": 1.27,
+  "notes": "busy 3.37 ms/step, critical-path excl 3.33 ms; kernels: nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_badd_TNN 3.37 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.topk"
+  ],
+  "row": "DSA.topk",
+  "measured_us": 3159.0,
+  "t_sol_us": 356.2,
+  "t_ach_us": 563.8,
+  "derate": 5.603,
+  "notes": "KERNEL-DEBUG; busy 3.16 ms/step, critical-path excl 0.33 ms; kernels: kern_vllmthird_partytrtllm_gvr_torchkernelsblackwelltop_kgvr 3.16 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.g_proj"
+  ],
+  "row": "DSA.g_proj",
+  "measured_us": 2727.0,
+  "t_sol_us": 2164.7,
+  "t_ach_us": 2372.2,
+  "derate": 1.15,
+  "notes": "busy 2.73 ms/step, critical-path excl 2.73 ms; kernels: nvjet_sm107_tst_256x256_64x6_1x2_2cta_Breuse_h_bz_TNN 2.73 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.conv"
+  ],
+  "row": "KDA.conv",
+  "measured_us": 2326.0,
+  "t_sol_us": 475.2,
+  "t_ach_us": 475.2,
+  "derate": 4.895,
+  "notes": "KERNEL-DEBUG; busy 2.33 ms/step, critical-path excl 2.33 ms; kernels: k3conv::qkv_conv_kernel 2.33 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DS.aux_capture",
+   "DS.fc",
+   "DS.hidden_norm",
+   "DS.ctx_kv_proj",
+   "DS.ctx_kv_insert"
+  ],
+  "row": "DS.drafter",
+  "measured_us": 2077.0,
+  "t_sol_us": 188.0,
+  "t_ach_us": 235.6,
+  "derate": 8.817,
+  "notes": "KERNEL-DEBUG; busy 2.08 ms/step, critical-path excl 1.92 ms; kernels: ncclDevKernel_AllGather_RING 0.53 ms; nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN 0.29 ms; flash::flash_fwd_splitkv_kernel 0.18 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.router"
+  ],
+  "row": "MOE.router",
+  "measured_us": 1859.0,
+  "t_sol_us": 605.1,
+  "t_ach_us": 663.1,
+  "derate": 2.804,
+  "notes": "KERNEL-DEBUG; busy 1.86 ms/step, critical-path excl 1.60 ms; kernels: nvjet_sm107_tss_64x224_64x14_8x1_2cta_v_bz_TNT 1.86 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "comm.dsa"
+  ],
+  "row": "comm.dsa",
+  "measured_us": 1831.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 1.83 ms/step, critical-path excl 1.33 ms; kernels: c10d::symmetric_memory::multimem_barrier_kernel 1.50 ms; dcp_shardq_rank_major_signal_kernel 0.33 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.o_norm"
+  ],
+  "row": "KDA.o_norm",
+  "measured_us": 1396.0,
+  "t_sol_us": 105.6,
+  "t_ach_us": 105.6,
+  "derate": 13.22,
+  "notes": "KERNEL-DEBUG; busy 1.40 ms/step, critical-path excl 1.40 ms; kernels: _kda_rmsnorm_gated_kernel 1.40 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.idx_q_quant"
+  ],
+  "row": "DSA.idx_q_quant+insert",
+  "measured_us": 1388.0,
+  "t_sol_us": 49.0,
+  "t_ach_us": 49.0,
+  "derate": 28.343,
+  "notes": "KERNEL-DEBUG; busy 1.39 ms/step, critical-path excl 1.16 ms; kernels: _mxfp4_k_norm_quant_insert_kernel 0.46 ms; vllm::cp_gather_indexer_k_quant_cache_kernel 0.42 ms; at::native::vectorized_gather_kernel 0.16 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.qb_wq_packed"
+  ],
+  "row": "DSA.qb_wq_packed",
+  "measured_us": 1327.0,
+  "t_sol_us": 1932.7,
+  "t_ach_us": 2118.1,
+  "derate": 0.627,
+  "notes": "busy 1.33 ms/step, critical-path excl 1.31 ms; kernels: nvjet_sm107_tst_128x256_64x9_2x1_2cta_v_bz_TNT 0.96 ms; nvjet_sm107_tst_128x352_64x8_2x1_2cta_v_bz_TNT 0.36 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.w_uv"
+  ],
+  "row": "DSA.w_uk+w_uv",
+  "measured_us": 1274.0,
+  "t_sol_us": 604.0,
+  "t_ach_us": 955.9,
+  "derate": 1.333,
+  "notes": "busy 1.27 ms/step, critical-path excl 1.01 ms; kernels: nvjet_sm107_tst_256x192_64x7_2x1_2cta_Breuse_v_bz_NNT 0.71 ms; nvjet_sm107_tst_128x160_64x8_1x2_h_bz_NNT 0.56 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.topk"
+  ],
+  "row": "MOE.topk",
+  "measured_us": 1123.0,
+  "t_sol_us": 7.7,
+  "t_ach_us": 7.7,
+  "derate": 145.852,
+  "notes": "KERNEL-DEBUG; busy 1.12 ms/step, critical-path excl 1.12 ms; kernels: vllm::moe::single_group_topk::detail::single_group_topk_bloc 1.12 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.f_b_proj"
+  ],
+  "row": "KDA.f_b_proj",
+  "measured_us": 879.0,
+  "t_sol_us": 160.7,
+  "t_ach_us": 254.4,
+  "derate": 3.455,
+  "notes": "KERNEL-DEBUG; busy 0.88 ms/step, critical-path excl 0.56 ms; kernels: nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT 0.88 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.latent_norm"
+  ],
+  "row": "MOE.latent_norm",
+  "measured_us": 833.0,
+  "t_sol_us": 20.5,
+  "t_ach_us": 20.5,
+  "derate": 40.57,
+  "notes": "KERNEL-DEBUG; busy 0.83 ms/step, critical-path excl 0.83 ms; kernels: rms_norm_rows_kernel 0.83 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DENSE.gate_up"
+  ],
+  "row": "DENSE.gate_up",
+  "measured_us": 531.0,
+  "t_sol_us": 496.1,
+  "t_ach_us": 543.6,
+  "derate": 0.977,
+  "notes": "busy 0.53 ms/step, critical-path excl 0.53 ms; kernels: nvjet_sm107_tst_256x256_64x6_1x2_2cta_Breuse_h_bz_TNN 0.53 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.gate_mul"
+  ],
+  "row": "DSA.gate_mul",
+  "measured_us": 475.0,
+  "t_sol_us": 23.0,
+  "t_ach_us": 23.0,
+  "derate": 20.692,
+  "notes": "KERNEL-DEBUG; busy 0.47 ms/step, critical-path excl 0.47 ms; kernels: gate_sigmoid_mul_kernel 0.47 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.gate_beta_norm"
+  ],
+  "row": "KDA.gate_beta_norm",
+  "measured_us": 323.0,
+  "t_sol_us": 158.8,
+  "t_ach_us": 158.8,
+  "derate": 2.034,
+  "notes": "KERNEL-DEBUG; busy 0.32 ms/step, critical-path excl 0.32 ms; kernels: at::native::elementwise_kernel 0.32 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DENSE.down"
+  ],
+  "row": "DENSE.down",
+  "measured_us": 274.0,
+  "t_sol_us": 248.0,
+  "t_ach_us": 271.8,
+  "derate": 1.008,
+  "notes": "busy 0.27 ms/step, critical-path excl 0.27 ms; kernels: nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN 0.27 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "DENSE.act"
+  ],
+  "row": "DENSE.act",
+  "measured_us": 88.0,
+  "t_sol_us": 6.3,
+  "t_ach_us": 6.3,
+  "derate": 13.94,
+  "notes": "KERNEL-DEBUG; busy 0.09 ms/step, critical-path excl 0.09 ms; kernels: situ_and_mul_vec8_kernel 0.09 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "other"
+  ],
+  "row": "other",
+  "measured_us": 87.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 0.09 ms/step, critical-path excl 0.09 ms; kernels: at::native::vectorized_elementwise_kernel 0.04 ms; at::native::CatArrayBatchedCopy_vectorized 0.04 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "G.embed"
+  ],
+  "row": "G.embed",
+  "measured_us": 39.0,
+  "t_sol_us": 2.7,
+  "t_ach_us": 4.2,
+  "derate": 9.231,
+  "notes": "KERNEL-DEBUG; busy 0.04 ms/step, critical-path excl 0.04 ms; kernels: vllm::vocab_embedding::vocab_parallel_embedding_kernel 0.04 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384] (step median 228.2 ms)",
+  "topology": "P1",
+  "op_ids": [
+   "F.attnres_final"
+  ],
+  "row": "F.attnres_final",
+  "measured_us": 38.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": 1051.725,
+  "notes": "KERNEL-DEBUG; busy 0.04 ms/step, critical-path excl 0.03 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 0.04 ms"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "KDA.in_proj",
+   "KDA.f_b_proj",
+   "KDA.conv",
+   "KDA.gate_beta_norm",
+   "KDA.core_prefill",
+   "KDA.o_norm",
+   "KDA.o_proj",
+   "comm:kda"
+  ],
+  "row": "block: KDA attention + its SP/AR comm (excl)",
+  "measured_us": 81504.0,
+  "t_sol_us": 51291.1,
+  "t_ach_us": 68433.4,
+  "derate": 1.191,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "DSA.qkv_a_packed",
+   "DSA.prologue",
+   "DSA.qb_wq_packed",
+   "DSA.g_proj",
+   "DSA.idx_q_quant",
+   "DSA.idx_score",
+   "DSA.topk",
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv",
+   "DSA.gate_mul",
+   "DSA.o_proj",
+   "comm:dsa"
+  ],
+  "row": "block: DSA attention + its SP/AR comm (excl)",
+  "measured_us": 35829.0,
+  "t_sol_us": 20053.2,
+  "t_ach_us": 26712.8,
+  "derate": 1.341,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "MOE.router",
+   "MOE.topk",
+   "MOE.latent_down",
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "MOE.latent_norm",
+   "MOE.latent_up",
+   "MOE.shared_gate_up",
+   "MOE.shared_act",
+   "MOE.shared_down",
+   "comm:moe"
+  ],
+  "row": "block: MoE (excl)",
+  "measured_us": 84964.0,
+  "t_sol_us": 62966.8,
+  "t_ach_us": 96486.7,
+  "derate": 0.881,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "block: AttnRes (excl)",
+  "measured_us": 4239.0,
+  "t_sol_us": 15662.8,
+  "t_ach_us": 24790.0,
+  "derate": 0.171,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "comm:P1 AR-NVLS (embed embed vocab reduce)",
+   "comm:P5 ShardQ out gather (dsa out gather)",
+   "comm:P1 AR-NVLS (moe shared partial + routed AR)",
+   "comm:P1 AR-NVLS (dense dense down AR)",
+   "comm:P16 sharded verify (final vocab-sharded verify)",
+   "comm:P2 drafter ctx AG (drafter fc/ctx rows AG)"
+  ],
+  "row": "comm (separate kernels)",
+  "measured_us": 33011.0,
+  "t_sol_us": 15041.4,
+  "t_ach_us": 32475.0,
+  "derate": 1.017,
+  "notes": "measured = all comm-classified kernels (incl. the per-layer _push_shard AG counted in the blocks) not fused into a GEMM / MegaMoE; model = synchronous comm rows not folded into a fused row above"
+ },
+ {
+  "case": "P1 pf16k_L78k [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 228203.4,
+  "t_sol_us": 151281.92609228182,
+  "t_ach_us": 218245.04179772397,
+  "derate": 1.046,
+  "notes": "8974 tok/s/GPU measured vs model achievable 9384; MegaMoE quant mxfp8 (pinned); vllm bench forward eager median (target + DSpark drafter, rank max) vs model step"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine"
+  ],
+  "row": "MOE.megamoe(dispatch+fc1+act+fc2+combine)",
+  "measured_us": 128892.0,
+  "t_sol_us": 62577.6,
+  "t_ach_us": 93384.4,
+  "derate": 1.38,
+  "notes": "busy 128.89 ms/step, critical-path excl 77.02 ms; kernels: vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubi 116.57 ms; router_kernel_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsources 7.67 ms; reduce_bf16_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceske 3.54 ms; model comm folded in: P11 EP-dispatch (MegaMoE dispatch), P12 EP-combine (MegaMoE combine)"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.in_proj"
+  ],
+  "row": "KDA.in_proj",
+  "measured_us": 53225.0,
+  "t_sol_us": 50403.1,
+  "t_ach_us": 55236.3,
+  "derate": 0.964,
+  "notes": "busy 53.23 ms/step, critical-path excl 53.17 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 53.23 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.shared_down"
+  ],
+  "row": "MOE.shared_down",
+  "measured_us": 34790.0,
+  "t_sol_us": 8297.9,
+  "t_ach_us": 9093.6,
+  "derate": 3.826,
+  "notes": "KERNEL-DEBUG; busy 34.79 ms/step, critical-path excl 33.25 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 34.79 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.core_prefill"
+  ],
+  "row": "KDA.core_prefill",
+  "measured_us": 20214.0,
+  "t_sol_us": 11488.8,
+  "t_ach_us": 11488.8,
+  "derate": 1.759,
+  "notes": "busy 20.21 ms/step, critical-path excl 20.18 ms; kernels: _Z25_flash_kda_fwd_recurrenceIN4cute9TiledCopyINS0_9Copy_Ato 14.12 ms; _flash_kda_fwd_prepare 5.57 ms; _gather_initial_states_kernel 0.28 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.shared_gate_up"
+  ],
+  "row": "MOE.shared_gate_up",
+  "measured_us": 19336.0,
+  "t_sol_us": 16595.8,
+  "t_ach_us": 18187.1,
+  "derate": 1.063,
+  "notes": "busy 19.34 ms/step, critical-path excl 17.82 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 19.34 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.o_proj"
+  ],
+  "row": "KDA.o_proj+AR",
+  "measured_us": 16762.0,
+  "t_sol_us": 19397.0,
+  "t_ach_us": 23566.6,
+  "derate": 0.711,
+  "notes": "busy 16.76 ms/step, critical-path excl 16.76 ms; kernels: vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRs 16.76 ms; model comm folded in: P3b RS-push (o_proj RS)"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.shared_act"
+  ],
+  "row": "MOE.shared_act",
+  "measured_us": 15140.0,
+  "t_sol_us": 211.2,
+  "t_ach_us": 211.2,
+  "derate": 71.689,
+  "notes": "KERNEL-DEBUG; busy 15.14 ms/step, critical-path excl 10.72 ms; kernels: situ_and_mul_vec8_kernel 15.14 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "comm.layer.kda"
+  ],
+  "row": "comm.layer.kda",
+  "measured_us": 13785.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 13.79 ms/step, critical-path excl 13.79 ms; kernels: _push_shard_kernel 13.37 ms; c10d::symmetric_memory::multimem_barrier_kernel 0.42 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.sparse_mla"
+  ],
+  "row": "DSA.sparse_mla",
+  "measured_us": 12354.0,
+  "t_sol_us": 2938.3,
+  "t_ach_us": 3858.4,
+  "derate": 3.202,
+  "notes": "KERNEL-DEBUG; busy 12.35 ms/step, critical-path excl 12.34 ms; kernels: fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged 11.96 ms; sparse_mla_index_remap_kernel 0.39 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.idx_score"
+  ],
+  "row": "DSA.idx_score",
+  "measured_us": 9956.0,
+  "t_sol_us": 7233.7,
+  "t_ach_us": 7233.7,
+  "derate": 1.376,
+  "notes": "busy 9.96 ms/step, critical-path excl 0.73 ms; kernels: deep_gemm::sm100_mqa_logits 9.29 ms; device_kernel____tensorptri32gmemo1___tensorptri32gmemo1_ten 0.67 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "L.attnres_pre+post",
+  "measured_us": 8639.0,
+  "t_sol_us": 3916.1,
+  "t_ach_us": 6198.1,
+  "derate": 1.394,
+  "notes": "busy 8.64 ms/step, critical-path excl 7.94 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 8.64 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.prologue"
+  ],
+  "row": "DSA.prologue+aux",
+  "measured_us": 8482.0,
+  "t_sol_us": 156.2,
+  "t_ach_us": 247.2,
+  "derate": 34.317,
+  "notes": "KERNEL-DEBUG; busy 8.48 ms/step, critical-path excl 8.48 ms; kernels: Kernel 5.83 ms; shardq_query_quant_kernel 1.56 ms; rms_norm_rows_kernel 0.44 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.latent_down"
+  ],
+  "row": "MOE.latent_down",
+  "measured_us": 6531.0,
+  "t_sol_us": 4840.4,
+  "t_ach_us": 5304.6,
+  "derate": 1.231,
+  "notes": "busy 6.53 ms/step, critical-path excl 6.50 ms; kernels: nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN 6.53 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "comm.top(embed/final/bench restore)"
+  ],
+  "row": "comm.top(embed/final/bench restore)",
+  "measured_us": 6408.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 6.41 ms/step, critical-path excl 6.34 ms; kernels: Memcpy PtoP  3.33 ms; ncclDevKernel_AllGather_RING 2.60 ms; ncclDevKernel_ReduceScatter_bf16_RING 0.47 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.latent_up"
+  ],
+  "row": "MOE.latent_up",
+  "measured_us": 6022.0,
+  "t_sol_us": 4840.4,
+  "t_ach_us": 5304.6,
+  "derate": 1.135,
+  "notes": "busy 6.02 ms/step, critical-path excl 5.97 ms; kernels: nvjet_sm107_tst_288x128_64x9_2x2f_2cta_h_badd_TNN 6.02 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.o_proj"
+  ],
+  "row": "DSA.o_proj+AR",
+  "measured_us": 5696.0,
+  "t_sol_us": 6746.8,
+  "t_ach_us": 8197.1,
+  "derate": 0.695,
+  "notes": "busy 5.70 ms/step, critical-path excl 5.70 ms; kernels: vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRs 5.70 ms; model comm folded in: P3b RS-push (o_proj RS)"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.g_proj"
+  ],
+  "row": "DSA.g_proj",
+  "measured_us": 5114.0,
+  "t_sol_us": 4329.3,
+  "t_ach_us": 4744.5,
+  "derate": 1.078,
+  "notes": "busy 5.11 ms/step, critical-path excl 5.11 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 5.11 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "comm.layer.dsa"
+  ],
+  "row": "comm.layer.dsa",
+  "measured_us": 4780.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 4.78 ms/step, critical-path excl 4.78 ms; kernels: _push_shard_kernel 4.65 ms; c10d::symmetric_memory::multimem_barrier_kernel 0.13 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.qkv_a_packed"
+  ],
+  "row": "DSA.qkv_a_packed",
+  "measured_us": 4629.0,
+  "t_sol_us": 3201.9,
+  "t_ach_us": 3508.9,
+  "derate": 1.319,
+  "notes": "busy 4.63 ms/step, critical-path excl 4.54 ms; kernels: nvjet_sm107_tst_192x192_64x8_2x2f_2cta_v_bz_TNN 3.68 ms; nvjet_sm107_tst_128x160_64x11_2x4_2cta_h_bz_TNT 0.95 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.topk"
+  ],
+  "row": "DSA.topk",
+  "measured_us": 4574.0,
+  "t_sol_us": 712.5,
+  "t_ach_us": 1127.7,
+  "derate": 4.056,
+  "notes": "KERNEL-DEBUG; busy 4.57 ms/step, critical-path excl 4.57 ms; kernels: kern_vllmthird_partytrtllm_gvr_torchkernelsblackwelltop_kgvr 4.57 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.conv"
+  ],
+  "row": "KDA.conv",
+  "measured_us": 4525.0,
+  "t_sol_us": 950.4,
+  "t_ach_us": 950.4,
+  "derate": 4.761,
+  "notes": "KERNEL-DEBUG; busy 4.53 ms/step, critical-path excl 4.53 ms; kernels: k3conv::qkv_conv_kernel 4.53 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.router"
+  ],
+  "row": "MOE.router",
+  "measured_us": 3046.0,
+  "t_sol_us": 1210.1,
+  "t_ach_us": 1326.1,
+  "derate": 2.297,
+  "notes": "KERNEL-DEBUG; busy 3.05 ms/step, critical-path excl 2.78 ms; kernels: nvjet_sm107_tss_224x128_64x10_1x8_2cta_v_bz_TNN 3.05 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.o_norm"
+  ],
+  "row": "KDA.o_norm",
+  "measured_us": 2453.0,
+  "t_sol_us": 211.2,
+  "t_ach_us": 211.2,
+  "derate": 11.615,
+  "notes": "KERNEL-DEBUG; busy 2.45 ms/step, critical-path excl 2.45 ms; kernels: _kda_rmsnorm_gated_kernel 2.45 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DS.aux_capture",
+   "DS.fc",
+   "DS.hidden_norm",
+   "DS.ctx_kv_proj",
+   "DS.ctx_kv_insert"
+  ],
+  "row": "DS.drafter",
+  "measured_us": 2390.0,
+  "t_sol_us": 270.7,
+  "t_ach_us": 304.7,
+  "derate": 7.845,
+  "notes": "KERNEL-DEBUG; busy 2.39 ms/step, critical-path excl 2.33 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 0.57 ms; ncclDevKernel_AllGather_RING 0.48 ms; vllm::rms_norm_kernel 0.21 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.qb_wq_packed"
+  ],
+  "row": "DSA.qb_wq_packed",
+  "measured_us": 2286.0,
+  "t_sol_us": 2628.5,
+  "t_ach_us": 2880.6,
+  "derate": 0.794,
+  "notes": "busy 2.29 ms/step, critical-path excl 2.26 ms; kernels: nvjet_sm107_tst_256x128_64x9_2x2f_2cta_h_bz_TNN 1.72 ms; nvjet_sm107_tst_224x192_64x8_1x2_2cta_h_bz_TNN 0.57 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.w_uv"
+  ],
+  "row": "DSA.w_uk+w_uv",
+  "measured_us": 2282.0,
+  "t_sol_us": 1180.5,
+  "t_ach_us": 1868.4,
+  "derate": 1.221,
+  "notes": "busy 2.28 ms/step, critical-path excl 2.26 ms; kernels: nvjet_sm107_tst_256x192_64x7_2x1_2cta_Breuse_v_bz_NNT 1.29 ms; nvjet_sm107_tst_128x160_64x8_1x2_h_bz_NNT 0.99 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.topk"
+  ],
+  "row": "MOE.topk",
+  "measured_us": 1803.0,
+  "t_sol_us": 15.4,
+  "t_ach_us": 15.4,
+  "derate": 117.084,
+  "notes": "KERNEL-DEBUG; busy 1.80 ms/step, critical-path excl 1.80 ms; kernels: vllm::moe::single_group_topk::detail::single_group_topk_bloc 1.80 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.idx_q_quant"
+  ],
+  "row": "DSA.idx_q_quant+insert",
+  "measured_us": 1626.0,
+  "t_sol_us": 49.0,
+  "t_ach_us": 49.0,
+  "derate": 33.203,
+  "notes": "KERNEL-DEBUG; busy 1.63 ms/step, critical-path excl 1.37 ms; kernels: _mxfp4_k_norm_quant_insert_kernel 0.46 ms; vllm::cp_gather_indexer_k_quant_cache_kernel 0.42 ms; at::native::vectorized_gather_kernel 0.25 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.f_b_proj"
+  ],
+  "row": "KDA.f_b_proj",
+  "measured_us": 1236.0,
+  "t_sol_us": 321.5,
+  "t_ach_us": 508.8,
+  "derate": 2.429,
+  "notes": "KERNEL-DEBUG; busy 1.24 ms/step, critical-path excl 0.99 ms; kernels: nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT 1.24 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DENSE.gate_up"
+  ],
+  "row": "DENSE.gate_up",
+  "measured_us": 1061.0,
+  "t_sol_us": 992.1,
+  "t_ach_us": 1087.3,
+  "derate": 0.976,
+  "notes": "busy 1.06 ms/step, critical-path excl 1.06 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 1.06 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "comm.dsa"
+  ],
+  "row": "comm.dsa",
+  "measured_us": 964.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 0.96 ms/step, critical-path excl 0.96 ms; kernels: c10d::symmetric_memory::multimem_barrier_kernel 0.83 ms; dcp_shardq_rank_major_signal_kernel 0.13 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.latent_norm"
+  ],
+  "row": "MOE.latent_norm",
+  "measured_us": 904.0,
+  "t_sol_us": 41.1,
+  "t_ach_us": 41.1,
+  "derate": 22.014,
+  "notes": "KERNEL-DEBUG; busy 0.90 ms/step, critical-path excl 0.90 ms; kernels: rms_norm_rows_kernel 0.90 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.gate_mul"
+  ],
+  "row": "DSA.gate_mul",
+  "measured_us": 857.0,
+  "t_sol_us": 45.9,
+  "t_ach_us": 45.9,
+  "derate": 18.667,
+  "notes": "KERNEL-DEBUG; busy 0.86 ms/step, critical-path excl 0.86 ms; kernels: gate_sigmoid_mul_kernel 0.86 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DENSE.down"
+  ],
+  "row": "DENSE.down",
+  "measured_us": 536.0,
+  "t_sol_us": 496.1,
+  "t_ach_us": 543.6,
+  "derate": 0.986,
+  "notes": "busy 0.54 ms/step, critical-path excl 0.54 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 0.54 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.gate_beta_norm"
+  ],
+  "row": "KDA.gate_beta_norm",
+  "measured_us": 182.0,
+  "t_sol_us": 317.6,
+  "t_ach_us": 317.6,
+  "derate": 0.573,
+  "notes": "busy 0.18 ms/step, critical-path excl 0.18 ms; kernels: at::native::transpose_copy_tiled_kernel 0.18 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "DENSE.act"
+  ],
+  "row": "DENSE.act",
+  "measured_us": 171.0,
+  "t_sol_us": 12.6,
+  "t_ach_us": 12.6,
+  "derate": 13.544,
+  "notes": "KERNEL-DEBUG; busy 0.17 ms/step, critical-path excl 0.17 ms; kernels: situ_and_mul_vec8_kernel 0.17 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "other"
+  ],
+  "row": "other",
+  "measured_us": 159.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 0.16 ms/step, critical-path excl 0.16 ms; kernels: at::native::vectorized_elementwise_kernel 0.08 ms; at::native::CatArrayBatchedCopy_vectorized 0.08 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "F.attnres_final"
+  ],
+  "row": "F.attnres_final",
+  "measured_us": 72.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": 6805.403,
+  "notes": "KERNEL-DEBUG; busy 0.07 ms/step, critical-path excl 0.07 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 0.07 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384] (step median 350.7 ms)",
+  "topology": "P2",
+  "op_ids": [
+   "G.embed"
+  ],
+  "row": "G.embed",
+  "measured_us": 43.0,
+  "t_sol_us": 5.3,
+  "t_ach_us": 8.5,
+  "derate": 5.089,
+  "notes": "KERNEL-DEBUG; busy 0.04 ms/step, critical-path excl 0.04 ms; kernels: vllm::vocab_embedding::vocab_parallel_embedding_kernel 0.04 ms"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "KDA.in_proj",
+   "KDA.f_b_proj",
+   "KDA.conv",
+   "KDA.gate_beta_norm",
+   "KDA.core_prefill",
+   "KDA.o_norm",
+   "KDA.o_proj",
+   "comm:kda"
+  ],
+  "row": "block: KDA attention + its SP/AR comm (excl)",
+  "measured_us": 112042.0,
+  "t_sol_us": 90039.7,
+  "t_ach_us": 102205.9,
+  "derate": 1.096,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "DSA.qkv_a_packed",
+   "DSA.prologue",
+   "DSA.qb_wq_packed",
+   "DSA.g_proj",
+   "DSA.idx_q_quant",
+   "DSA.idx_score",
+   "DSA.topk",
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv",
+   "DSA.gate_mul",
+   "DSA.o_proj",
+   "comm:dsa"
+  ],
+  "row": "block: DSA attention + its SP/AR comm (excl)",
+  "measured_us": 53970.0,
+  "t_sol_us": 32715.3,
+  "t_ach_us": 38733.8,
+  "derate": 1.393,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "MOE.router",
+   "MOE.topk",
+   "MOE.latent_down",
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "MOE.latent_norm",
+   "MOE.latent_up",
+   "MOE.shared_gate_up",
+   "MOE.shared_act",
+   "MOE.shared_down",
+   "comm:moe"
+  ],
+  "row": "block: MoE (excl)",
+  "measured_us": 156769.0,
+  "t_sol_us": 98629.8,
+  "t_ach_us": 132868.0,
+  "derate": 1.18,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "block: AttnRes (excl)",
+  "measured_us": 7936.0,
+  "t_sol_us": 3916.1,
+  "t_ach_us": 6198.1,
+  "derate": 1.28,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "comm:P3b RS-push (embed embed RS)",
+   "comm:P2 SP-AG (kda SP AG)",
+   "comm:P2 SP-AG (dsa SP AG)",
+   "comm:P5 ShardQ out gather (dsa out gather)",
+   "comm:P2 SP-AG (final final AG (rows consumed))",
+   "comm:P16 sharded verify (final vocab-sharded verify)",
+   "comm:P2 drafter ctx AG (drafter fc/ctx rows AG)",
+   "comm:P19 DP sync (step EP lock-step sync)"
+  ],
+  "row": "comm (separate kernels)",
+  "measured_us": 25937.0,
+  "t_sol_us": 10591.8,
+  "t_ach_us": 15107.7,
+  "derate": 1.717,
+  "notes": "measured = all comm-classified kernels (incl. the per-layer _push_shard AG counted in the blocks) not fused into a GEMM / MegaMoE; model = synchronous comm rows not folded into a fused row above"
+ },
+ {
+  "case": "P2 pf16k_L78k [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 350687.8,
+  "t_sol_us": 227253.3120741257,
+  "t_ach_us": 282215.26405744004,
+  "derate": 1.243,
+  "notes": "11680 tok/s/GPU measured vs model achievable 14514; MegaMoE quant mxfp8 (pinned); vllm bench forward eager median (target + DSpark drafter, rank max) vs model step"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine"
+  ],
+  "row": "MOE.megamoe(dispatch+fc1+act+fc2+combine)",
+  "measured_us": 127101.0,
+  "t_sol_us": 62577.6,
+  "t_ach_us": 93384.4,
+  "derate": 1.361,
+  "notes": "busy 127.10 ms/step, critical-path excl 73.99 ms; kernels: vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubi 113.63 ms; router_kernel_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsources 8.74 ms; reduce_bf16_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceske 3.58 ms; model comm folded in: P11 EP-dispatch (MegaMoE dispatch), P12 EP-combine (MegaMoE combine)"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.in_proj"
+  ],
+  "row": "KDA.in_proj",
+  "measured_us": 54286.0,
+  "t_sol_us": 50403.1,
+  "t_ach_us": 55236.3,
+  "derate": 0.983,
+  "notes": "busy 54.29 ms/step, critical-path excl 54.27 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 54.29 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.shared_down"
+  ],
+  "row": "MOE.shared_down",
+  "measured_us": 34891.0,
+  "t_sol_us": 8297.9,
+  "t_ach_us": 9093.6,
+  "derate": 3.837,
+  "notes": "KERNEL-DEBUG; busy 34.89 ms/step, critical-path excl 33.46 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 34.89 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.shared_gate_up"
+  ],
+  "row": "MOE.shared_gate_up",
+  "measured_us": 19724.0,
+  "t_sol_us": 16595.8,
+  "t_ach_us": 18187.1,
+  "derate": 1.085,
+  "notes": "busy 19.72 ms/step, critical-path excl 19.51 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 19.72 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.core_prefill"
+  ],
+  "row": "KDA.core_prefill",
+  "measured_us": 17170.0,
+  "t_sol_us": 8625.0,
+  "t_ach_us": 8625.0,
+  "derate": 1.991,
+  "notes": "busy 17.17 ms/step, critical-path excl 17.14 ms; kernels: _Z25_flash_kda_fwd_recurrenceIN4cute9TiledCopyINS0_9Copy_Ato 10.91 ms; _flash_kda_fwd_prepare 5.70 ms; _gather_initial_states_kernel 0.29 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.o_proj"
+  ],
+  "row": "KDA.o_proj+AR",
+  "measured_us": 16699.0,
+  "t_sol_us": 19397.0,
+  "t_ach_us": 23566.6,
+  "derate": 0.709,
+  "notes": "busy 16.70 ms/step, critical-path excl 16.70 ms; kernels: vllmmodel_executorkernelslinearcute_dslgemm_rs_arSm100GemmRs 16.70 ms; model comm folded in: P3b RS-push (o_proj RS)"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.shared_act"
+  ],
+  "row": "MOE.shared_act",
+  "measured_us": 15956.0,
+  "t_sol_us": 211.2,
+  "t_ach_us": 211.2,
+  "derate": 75.553,
+  "notes": "KERNEL-DEBUG; busy 15.96 ms/step, critical-path excl 10.47 ms; kernels: situ_and_mul_vec8_kernel 15.96 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "comm.layer.kda"
+  ],
+  "row": "comm.layer.kda",
+  "measured_us": 12717.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 12.72 ms/step, critical-path excl 12.72 ms; kernels: _push_shard_kernel 12.18 ms; c10d::symmetric_memory::multimem_barrier_kernel 0.53 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.sparse_mla"
+  ],
+  "row": "DSA.sparse_mla",
+  "measured_us": 12657.0,
+  "t_sol_us": 2938.3,
+  "t_ach_us": 3858.4,
+  "derate": 3.28,
+  "notes": "KERNEL-DEBUG; busy 12.66 ms/step, critical-path excl 12.64 ms; kernels: fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged 12.28 ms; sparse_mla_index_remap_kernel 0.37 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.idx_score"
+  ],
+  "row": "DSA.idx_score",
+  "measured_us": 9897.0,
+  "t_sol_us": 7298.7,
+  "t_ach_us": 7298.7,
+  "derate": 1.356,
+  "notes": "busy 9.90 ms/step, critical-path excl 9.89 ms; kernels: deep_gemm::sm100_mqa_logits 9.90 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "L.attnres_pre+post",
+  "measured_us": 8753.0,
+  "t_sol_us": 3916.1,
+  "t_ach_us": 6198.1,
+  "derate": 1.412,
+  "notes": "busy 8.75 ms/step, critical-path excl 8.18 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 8.75 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.latent_down"
+  ],
+  "row": "MOE.latent_down",
+  "measured_us": 6363.0,
+  "t_sol_us": 4840.4,
+  "t_ach_us": 5304.6,
+  "derate": 1.2,
+  "notes": "busy 6.36 ms/step, critical-path excl 6.36 ms; kernels: nvjet_sm107_tst_288x128_64x9_1x2_2cta_v_bz_TNN 6.36 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.latent_up"
+  ],
+  "row": "MOE.latent_up",
+  "measured_us": 5997.0,
+  "t_sol_us": 4840.4,
+  "t_ach_us": 5304.6,
+  "derate": 1.131,
+  "notes": "busy 6.00 ms/step, critical-path excl 5.95 ms; kernels: nvjet_sm107_tst_288x128_64x9_2x2f_2cta_h_badd_TNN 6.00 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.g_proj"
+  ],
+  "row": "DSA.g_proj",
+  "measured_us": 5175.0,
+  "t_sol_us": 4329.3,
+  "t_ach_us": 4744.5,
+  "derate": 1.091,
+  "notes": "busy 5.17 ms/step, critical-path excl 5.12 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 5.17 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.o_proj"
+  ],
+  "row": "DSA.o_proj+AR",
+  "measured_us": 4877.0,
+  "t_sol_us": 4329.3,
+  "t_ach_us": 4744.5,
+  "derate": 1.028,
+  "notes": "busy 4.88 ms/step, critical-path excl 4.88 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 4.88 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.conv"
+  ],
+  "row": "KDA.conv",
+  "measured_us": 4737.0,
+  "t_sol_us": 950.4,
+  "t_ach_us": 950.4,
+  "derate": 4.984,
+  "notes": "KERNEL-DEBUG; busy 4.74 ms/step, critical-path excl 4.74 ms; kernels: k3conv::qkv_conv_kernel 4.74 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.topk"
+  ],
+  "row": "DSA.topk",
+  "measured_us": 4044.0,
+  "t_sol_us": 718.6,
+  "t_ach_us": 1137.3,
+  "derate": 3.556,
+  "notes": "KERNEL-DEBUG; busy 4.04 ms/step, critical-path excl 4.04 ms; kernels: kern_vllmthird_partytrtllm_gvr_torchkernelsblackwelltop_kgvr 4.04 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.prologue"
+  ],
+  "row": "DSA.prologue+aux",
+  "measured_us": 3459.0,
+  "t_sol_us": 41.2,
+  "t_ach_us": 65.2,
+  "derate": 53.04,
+  "notes": "KERNEL-DEBUG; busy 3.46 ms/step, critical-path excl 3.46 ms; kernels: vllm::scaled_fp8_quant_kernel_strided_group_shape 1.37 ms; _pad_query_heads_kernel 1.03 ms; vllm::concat_and_cache_mla_kernel 0.45 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.router"
+  ],
+  "row": "MOE.router",
+  "measured_us": 2945.0,
+  "t_sol_us": 1210.1,
+  "t_ach_us": 1326.1,
+  "derate": 2.221,
+  "notes": "KERNEL-DEBUG; busy 2.94 ms/step, critical-path excl 2.69 ms; kernels: nvjet_sm107_tss_224x128_64x10_1x8_2cta_v_bz_TNN 2.94 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DS.aux_capture",
+   "DS.fc",
+   "DS.hidden_norm",
+   "DS.ctx_kv_proj",
+   "DS.ctx_kv_insert"
+  ],
+  "row": "DS.drafter",
+  "measured_us": 2601.0,
+  "t_sol_us": 360.6,
+  "t_ach_us": 405.8,
+  "derate": 6.409,
+  "notes": "KERNEL-DEBUG; busy 2.60 ms/step, critical-path excl 2.57 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 0.59 ms; ncclDevKernel_AllGather_RING 0.50 ms; vllm::rms_norm_kernel 0.27 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.qb_wq_packed"
+  ],
+  "row": "DSA.qb_wq_packed",
+  "measured_us": 2548.0,
+  "t_sol_us": 1700.8,
+  "t_ach_us": 1863.9,
+  "derate": 1.367,
+  "notes": "busy 2.55 ms/step, critical-path excl 2.45 ms; kernels: nvjet_sm107_tst_128x416_64x7_2x1_2cta_v_bz_TNT 1.92 ms; nvjet_sm107_tst_224x192_64x8_1x2_2cta_h_bz_TNN 0.63 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.o_norm"
+  ],
+  "row": "KDA.o_norm",
+  "measured_us": 2492.0,
+  "t_sol_us": 211.2,
+  "t_ach_us": 211.2,
+  "derate": 11.8,
+  "notes": "KERNEL-DEBUG; busy 2.49 ms/step, critical-path excl 2.49 ms; kernels: _kda_rmsnorm_gated_kernel 2.49 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.w_uv"
+  ],
+  "row": "DSA.w_uk+w_uv",
+  "measured_us": 2304.0,
+  "t_sol_us": 1180.5,
+  "t_ach_us": 1868.4,
+  "derate": 1.233,
+  "notes": "busy 2.30 ms/step, critical-path excl 2.28 ms; kernels: nvjet_sm107_tst_256x192_64x7_2x1_2cta_Breuse_v_bz_NNT 1.30 ms; nvjet_sm107_tst_128x160_64x8_1x2_h_bz_TNT 1.01 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.topk"
+  ],
+  "row": "MOE.topk",
+  "measured_us": 1844.0,
+  "t_sol_us": 15.4,
+  "t_ach_us": 15.4,
+  "derate": 119.746,
+  "notes": "KERNEL-DEBUG; busy 1.84 ms/step, critical-path excl 1.84 ms; kernels: vllm::moe::single_group_topk::detail::single_group_topk_bloc 1.84 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "comm.top(embed/final/bench restore)"
+  ],
+  "row": "comm.top(embed/final/bench restore)",
+  "measured_us": 1553.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 1.55 ms/step, critical-path excl 1.55 ms; kernels: ncclDevKernel_ReduceScatter_bf16_RING 1.10 ms; ncclDevKernel_AllGather_RING 0.46 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.qkv_a_packed"
+  ],
+  "row": "DSA.qkv_a_packed",
+  "measured_us": 1485.0,
+  "t_sol_us": 800.5,
+  "t_ach_us": 877.2,
+  "derate": 1.693,
+  "notes": "busy 1.49 ms/step, critical-path excl 1.42 ms; kernels: nvjet_sm107_tst_352x128_64x8_1x2_2cta_v_bz_TNN 1.11 ms; nvjet_sm107_tst_64x128_64x16_2x4_2cta_v_bz_TNT 0.37 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "comm.layer.dsa"
+  ],
+  "row": "comm.layer.dsa",
+  "measured_us": 1318.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 1.32 ms/step, critical-path excl 1.32 ms; kernels: c10d::symmetric_memory::multimem_barrier_kernel 1.09 ms; Memcpy DtoD  0.23 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "other"
+  ],
+  "row": "other",
+  "measured_us": 1311.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 1.31 ms/step, critical-path excl 1.31 ms; kernels: Kernel 1.00 ms; at::native::_scatter_gather_elementwise_kernel 0.23 ms; at::native::vectorized_elementwise_kernel 0.08 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.f_b_proj"
+  ],
+  "row": "KDA.f_b_proj",
+  "measured_us": 1268.0,
+  "t_sol_us": 321.5,
+  "t_ach_us": 508.8,
+  "derate": 2.492,
+  "notes": "KERNEL-DEBUG; busy 1.27 ms/step, critical-path excl 1.02 ms; kernels: nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT 1.27 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DENSE.gate_up"
+  ],
+  "row": "DENSE.gate_up",
+  "measured_us": 1076.0,
+  "t_sol_us": 992.1,
+  "t_ach_us": 1087.3,
+  "derate": 0.99,
+  "notes": "busy 1.08 ms/step, critical-path excl 1.07 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 1.08 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.latent_norm"
+  ],
+  "row": "MOE.latent_norm",
+  "measured_us": 913.0,
+  "t_sol_us": 41.1,
+  "t_ach_us": 41.1,
+  "derate": 22.233,
+  "notes": "KERNEL-DEBUG; busy 0.91 ms/step, critical-path excl 0.91 ms; kernels: rms_norm_rows_kernel 0.91 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.gate_mul"
+  ],
+  "row": "DSA.gate_mul",
+  "measured_us": 878.0,
+  "t_sol_us": 45.9,
+  "t_ach_us": 45.9,
+  "derate": 19.124,
+  "notes": "KERNEL-DEBUG; busy 0.88 ms/step, critical-path excl 0.88 ms; kernels: gate_sigmoid_mul_kernel 0.88 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.idx_q_quant"
+  ],
+  "row": "DSA.idx_q_quant+insert",
+  "measured_us": 625.0,
+  "t_sol_us": 12.2,
+  "t_ach_us": 12.2,
+  "derate": 51.05,
+  "notes": "KERNEL-DEBUG; busy 0.62 ms/step, critical-path excl 0.62 ms; kernels: _mxfp4_q_quant_kernel 0.21 ms; vllm::cp_gather_indexer_k_quant_cache_kernel 0.20 ms; _mxfp4_k_norm_quant_insert_kernel 0.17 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DENSE.down"
+  ],
+  "row": "DENSE.down",
+  "measured_us": 546.0,
+  "t_sol_us": 496.1,
+  "t_ach_us": 543.6,
+  "derate": 1.004,
+  "notes": "busy 0.55 ms/step, critical-path excl 0.55 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 0.55 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.gate_beta_norm"
+  ],
+  "row": "KDA.gate_beta_norm",
+  "measured_us": 185.0,
+  "t_sol_us": 317.6,
+  "t_ach_us": 317.6,
+  "derate": 0.582,
+  "notes": "busy 0.18 ms/step, critical-path excl 0.18 ms; kernels: at::native::transpose_copy_tiled_kernel 0.18 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "DENSE.act"
+  ],
+  "row": "DENSE.act",
+  "measured_us": 171.0,
+  "t_sol_us": 12.6,
+  "t_ach_us": 12.6,
+  "derate": 13.544,
+  "notes": "KERNEL-DEBUG; busy 0.17 ms/step, critical-path excl 0.17 ms; kernels: situ_and_mul_vec8_kernel 0.17 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "F.attnres_final"
+  ],
+  "row": "F.attnres_final",
+  "measured_us": 72.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": 5370.021,
+  "notes": "KERNEL-DEBUG; busy 0.07 ms/step, critical-path excl 0.07 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 0.07 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096] (step median 330.5 ms)",
+  "topology": "P4-4",
+  "op_ids": [
+   "G.embed"
+  ],
+  "row": "G.embed",
+  "measured_us": 41.0,
+  "t_sol_us": 5.3,
+  "t_ach_us": 8.5,
+  "derate": 4.852,
+  "notes": "KERNEL-DEBUG; busy 0.04 ms/step, critical-path excl 0.04 ms; kernels: vllm::vocab_embedding::vocab_parallel_embedding_kernel 0.04 ms"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "KDA.in_proj",
+   "KDA.f_b_proj",
+   "KDA.conv",
+   "KDA.gate_beta_norm",
+   "KDA.core_prefill",
+   "KDA.o_norm",
+   "KDA.o_proj",
+   "comm:kda"
+  ],
+  "row": "block: KDA attention + its SP/AR comm (excl)",
+  "measured_us": 109263.0,
+  "t_sol_us": 87175.9,
+  "t_ach_us": 99342.2,
+  "derate": 1.1,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "DSA.qkv_a_packed",
+   "DSA.prologue",
+   "DSA.qb_wq_packed",
+   "DSA.g_proj",
+   "DSA.idx_q_quant",
+   "DSA.idx_score",
+   "DSA.topk",
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv",
+   "DSA.gate_mul",
+   "DSA.o_proj",
+   "comm:dsa"
+  ],
+  "row": "block: DSA attention + its SP/AR comm (excl)",
+  "measured_us": 48992.0,
+  "t_sol_us": 24707.1,
+  "t_ach_us": 28348.1,
+  "derate": 1.728,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "MOE.router",
+   "MOE.topk",
+   "MOE.latent_down",
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "MOE.latent_norm",
+   "MOE.latent_up",
+   "MOE.shared_gate_up",
+   "MOE.shared_act",
+   "MOE.shared_down",
+   "comm:moe"
+  ],
+  "row": "block: MoE (excl)",
+  "measured_us": 155179.0,
+  "t_sol_us": 98629.8,
+  "t_ach_us": 132868.0,
+  "derate": 1.168,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "block: AttnRes (excl)",
+  "measured_us": 8176.0,
+  "t_sol_us": 3916.1,
+  "t_ach_us": 6198.1,
+  "derate": 1.319,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "comm:P3b RS-push (embed embed RS)",
+   "comm:P2 SP-AG (kda SP AG)",
+   "comm:P13 DSA-DP push_in (dsa push_in rows to owner)",
+   "comm:P13 DSA-DP push_out (dsa push_out owner rows)",
+   "comm:P2 SP-AG (final final AG (rows consumed))",
+   "comm:P16 sharded verify (final vocab-sharded verify)",
+   "comm:P2 drafter ctx AG (drafter fc/ctx rows AG)",
+   "comm:P19 DP sync (step EP lock-step sync)"
+  ],
+  "row": "comm (separate kernels)",
+  "measured_us": 15588.0,
+  "t_sol_us": 8423.0,
+  "t_ach_us": 11984.6,
+  "derate": 1.301,
+  "notes": "measured = all comm-classified kernels (incl. the per-layer _push_shard AG counted in the blocks) not fused into a GEMM / MegaMoE; model = synchronous comm rows not folded into a fused row above"
+ },
+ {
+  "case": "P4-4 pf16k_L78k(4x4096) [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 330521.2,
+  "t_sol_us": 216483.4428022108,
+  "t_ach_us": 269084.523621541,
+  "derate": 1.228,
+  "notes": "12393 tok/s/GPU measured vs model achievable 15222; MegaMoE quant mxfp8 (pinned); vllm bench forward eager median (target + DSpark drafter, rank max) vs model step"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine"
+  ],
+  "row": "MOE.megamoe(dispatch+fc1+act+fc2+combine)",
+  "measured_us": 238337.0,
+  "t_sol_us": 124365.8,
+  "t_ach_us": 185842.9,
+  "derate": 1.282,
+  "notes": "busy 238.34 ms/step, critical-path excl 207.31 ms; kernels: vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceskernel_srcrubi 198.24 ms; router_kernel_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsources 31.21 ms; reduce_bf16_vllmmodelskimi_k3nvidiamegamoe_rubinsrcsourceske 6.82 ms; model comm folded in: P11 EP-dispatch (MegaMoE dispatch), P12 EP-combine (MegaMoE combine)"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.in_proj"
+  ],
+  "row": "KDA.in_proj",
+  "measured_us": 112211.0,
+  "t_sol_us": 100028.3,
+  "t_ach_us": 109620.1,
+  "derate": 1.024,
+  "notes": "busy 112.21 ms/step, critical-path excl 112.04 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 112.21 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.shared_gate_up"
+  ],
+  "row": "MOE.shared_gate_up",
+  "measured_us": 36974.0,
+  "t_sol_us": 33191.5,
+  "t_ach_us": 36374.3,
+  "derate": 1.016,
+  "notes": "busy 36.97 ms/step, critical-path excl 36.97 ms; kernels: nvjet_sm107_tst_256x128_64x9_2x2f_2cta_h_bz_TNN 36.97 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.o_proj"
+  ],
+  "row": "KDA.o_proj+AR",
+  "measured_us": 29292.0,
+  "t_sol_us": 24893.6,
+  "t_ach_us": 27280.7,
+  "derate": 1.074,
+  "notes": "busy 29.29 ms/step, critical-path excl 29.29 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 29.29 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.core_prefill"
+  ],
+  "row": "KDA.core_prefill",
+  "measured_us": 27666.0,
+  "t_sol_us": 11488.8,
+  "t_ach_us": 11488.8,
+  "derate": 2.408,
+  "notes": "KERNEL-DEBUG; busy 27.67 ms/step, critical-path excl 27.67 ms; kernels: _Z25_flash_kda_fwd_recurrenceIN4cute9TiledCopyINS0_9Copy_Ato 15.40 ms; _flash_kda_fwd_prepare 11.17 ms; _gather_initial_states_kernel 0.57 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.sparse_mla"
+  ],
+  "row": "DSA.sparse_mla",
+  "measured_us": 25429.0,
+  "t_sol_us": 5876.6,
+  "t_ach_us": 7716.8,
+  "derate": 3.295,
+  "notes": "KERNEL-DEBUG; busy 25.43 ms/step, critical-path excl 25.43 ms; kernels: fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged 24.74 ms; sparse_mla_index_remap_kernel 0.69 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.idx_score"
+  ],
+  "row": "DSA.idx_score",
+  "measured_us": 20648.0,
+  "t_sol_us": 14467.4,
+  "t_ach_us": 14467.4,
+  "derate": 1.427,
+  "notes": "busy 20.65 ms/step, critical-path excl 20.65 ms; kernels: deep_gemm::sm100_mqa_logits 20.65 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.shared_down"
+  ],
+  "row": "MOE.shared_down",
+  "measured_us": 20552.0,
+  "t_sol_us": 16595.8,
+  "t_ach_us": 18187.1,
+  "derate": 1.13,
+  "notes": "busy 20.55 ms/step, critical-path excl 20.55 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 20.55 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "L.attnres_pre+post",
+  "measured_us": 16530.0,
+  "t_sol_us": 7831.6,
+  "t_ach_us": 12395.4,
+  "derate": 1.334,
+  "notes": "busy 16.53 ms/step, critical-path excl 15.68 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 16.53 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.latent_down"
+  ],
+  "row": "MOE.latent_down",
+  "measured_us": 12560.0,
+  "t_sol_us": 9680.9,
+  "t_ach_us": 10609.2,
+  "derate": 1.184,
+  "notes": "busy 12.56 ms/step, critical-path excl 12.56 ms; kernels: nvjet_sm107_tst_256x192_64x7_1x2_2cta_h_bz_TNN 12.56 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.latent_up"
+  ],
+  "row": "MOE.latent_up",
+  "measured_us": 12443.0,
+  "t_sol_us": 9680.9,
+  "t_ach_us": 10609.2,
+  "derate": 1.173,
+  "notes": "busy 12.44 ms/step, critical-path excl 12.44 ms; kernels: nvjet_sm107_tst_448x128_64x7_2x2f_2cta_h_badd_TNN 12.44 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.o_proj"
+  ],
+  "row": "DSA.o_proj+AR",
+  "measured_us": 10028.0,
+  "t_sol_us": 8658.7,
+  "t_ach_us": 9488.9,
+  "derate": 1.057,
+  "notes": "busy 10.03 ms/step, critical-path excl 10.03 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 10.03 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.g_proj"
+  ],
+  "row": "DSA.g_proj",
+  "measured_us": 9780.0,
+  "t_sol_us": 8658.7,
+  "t_ach_us": 9488.9,
+  "derate": 1.031,
+  "notes": "busy 9.78 ms/step, critical-path excl 9.72 ms; kernels: nvjet_sm107_tst_256x128_64x9_2x2f_2cta_h_bz_TNN 9.78 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.topk"
+  ],
+  "row": "DSA.topk",
+  "measured_us": 8738.0,
+  "t_sol_us": 1425.0,
+  "t_ach_us": 2255.3,
+  "derate": 3.874,
+  "notes": "KERNEL-DEBUG; busy 8.74 ms/step, critical-path excl 8.74 ms; kernels: kern_vllmthird_partytrtllm_gvr_torchkernelsblackwelltop_kgvr 8.74 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.conv"
+  ],
+  "row": "KDA.conv",
+  "measured_us": 8165.0,
+  "t_sol_us": 1900.7,
+  "t_ach_us": 1900.7,
+  "derate": 4.296,
+  "notes": "KERNEL-DEBUG; busy 8.16 ms/step, critical-path excl 8.16 ms; kernels: k3conv::qkv_conv_kernel 8.16 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.prologue"
+  ],
+  "row": "DSA.prologue+aux",
+  "measured_us": 6547.0,
+  "t_sol_us": 82.4,
+  "t_ach_us": 130.4,
+  "derate": 50.199,
+  "notes": "KERNEL-DEBUG; busy 6.55 ms/step, critical-path excl 6.55 ms; kernels: vllm::scaled_fp8_quant_kernel_strided_group_shape 2.60 ms; _pad_query_heads_kernel 2.06 ms; vllm::concat_and_cache_mla_kernel 0.84 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.shared_act"
+  ],
+  "row": "MOE.shared_act",
+  "measured_us": 6336.0,
+  "t_sol_us": 422.4,
+  "t_ach_us": 422.4,
+  "derate": 15.001,
+  "notes": "KERNEL-DEBUG; busy 6.34 ms/step, critical-path excl 6.34 ms; kernels: situ_and_mul_vec8_kernel 6.34 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.o_norm"
+  ],
+  "row": "KDA.o_norm",
+  "measured_us": 5168.0,
+  "t_sol_us": 422.4,
+  "t_ach_us": 422.4,
+  "derate": 12.235,
+  "notes": "KERNEL-DEBUG; busy 5.17 ms/step, critical-path excl 5.17 ms; kernels: _kda_rmsnorm_gated_kernel 5.17 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.w_uk",
+   "DSA.w_uv"
+  ],
+  "row": "DSA.w_uk+w_uv",
+  "measured_us": 4836.0,
+  "t_sol_us": 2333.6,
+  "t_ach_us": 3693.4,
+  "derate": 1.309,
+  "notes": "busy 4.84 ms/step, critical-path excl 4.83 ms; kernels: nvjet_sm107_tst_192x224_64x5_1x1_h_bz_NNT 2.91 ms; nvjet_sm107_tst_128x224_64x7_1x1_v_bz_TNT 1.92 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.router"
+  ],
+  "row": "MOE.router",
+  "measured_us": 4390.0,
+  "t_sol_us": 2420.2,
+  "t_ach_us": 2652.3,
+  "derate": 1.655,
+  "notes": "busy 4.39 ms/step, critical-path excl 4.16 ms; kernels: nvjet_sm107_tss_320x128_64x8_1x2_2cta_h_bz_TNN 4.39 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.qb_wq_packed"
+  ],
+  "row": "DSA.qb_wq_packed",
+  "measured_us": 4252.0,
+  "t_sol_us": 3401.6,
+  "t_ach_us": 3727.8,
+  "derate": 1.141,
+  "notes": "busy 4.25 ms/step, critical-path excl 4.18 ms; kernels: nvjet_sm107_tst_256x128_64x9_2x2f_2cta_h_bz_TNN 3.29 ms; nvjet_sm107_tst_128x256_64x9_2x1_2cta_v_bz_TNT 0.97 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DS.aux_capture",
+   "DS.fc",
+   "DS.hidden_norm",
+   "DS.ctx_kv_proj",
+   "DS.ctx_kv_insert"
+  ],
+  "row": "DS.drafter",
+  "measured_us": 3507.0,
+  "t_sol_us": 541.4,
+  "t_ach_us": 609.3,
+  "derate": 5.756,
+  "notes": "KERNEL-DEBUG; busy 3.51 ms/step, critical-path excl 3.49 ms; kernels: nvjet_sm107_tst_192x192_64x8_2x2f_2cta_v_bz_TNN 1.16 ms; vllm::rms_norm_kernel 0.39 ms; nvjet_sm107_tst_448x128_64x7_1x2_2cta_h_bz_TNN 0.34 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.topk"
+  ],
+  "row": "MOE.topk",
+  "measured_us": 3376.0,
+  "t_sol_us": 30.8,
+  "t_ach_us": 30.8,
+  "derate": 109.616,
+  "notes": "KERNEL-DEBUG; busy 3.38 ms/step, critical-path excl 3.38 ms; kernels: router_topk_kernel 3.38 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.qkv_a_packed"
+  ],
+  "row": "DSA.qkv_a_packed",
+  "measured_us": 2802.0,
+  "t_sol_us": 1600.9,
+  "t_ach_us": 1754.5,
+  "derate": 1.597,
+  "notes": "busy 2.80 ms/step, critical-path excl 2.67 ms; kernels: nvjet_sm107_tst_352x128_64x8_1x2_2cta_v_bz_TNN 2.16 ms; nvjet_sm107_tst_64x128_64x16_2x4_2cta_v_bz_TNT 0.64 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.f_b_proj"
+  ],
+  "row": "KDA.f_b_proj",
+  "measured_us": 2183.0,
+  "t_sol_us": 647.9,
+  "t_ach_us": 1025.4,
+  "derate": 2.129,
+  "notes": "KERNEL-DEBUG; busy 2.18 ms/step, critical-path excl 1.90 ms; kernels: nvjet_sm107_tst_256x128_64x7_2x2f_2cta_Breuse_h_bz_TNT 2.18 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DENSE.gate_up"
+  ],
+  "row": "DENSE.gate_up",
+  "measured_us": 2139.0,
+  "t_sol_us": 1984.3,
+  "t_ach_us": 2174.5,
+  "derate": 0.984,
+  "notes": "busy 2.14 ms/step, critical-path excl 2.14 ms; kernels: nvjet_sm107_tst_224x192_64x8_2x2f_2cta_v_bz_TNN 2.14 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.gate_mul"
+  ],
+  "row": "DSA.gate_mul",
+  "measured_us": 1692.0,
+  "t_sol_us": 91.8,
+  "t_ach_us": 91.8,
+  "derate": 18.427,
+  "notes": "KERNEL-DEBUG; busy 1.69 ms/step, critical-path excl 1.69 ms; kernels: gate_sigmoid_mul_kernel 1.69 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.latent_norm"
+  ],
+  "row": "MOE.latent_norm",
+  "measured_us": 1619.0,
+  "t_sol_us": 82.1,
+  "t_ach_us": 82.1,
+  "derate": 19.713,
+  "notes": "KERNEL-DEBUG; busy 1.62 ms/step, critical-path excl 1.62 ms; kernels: rms_norm_rows_kernel 1.62 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.idx_q_quant"
+  ],
+  "row": "DSA.idx_q_quant+insert",
+  "measured_us": 1337.0,
+  "t_sol_us": 24.5,
+  "t_ach_us": 24.5,
+  "derate": 54.603,
+  "notes": "KERNEL-DEBUG; busy 1.34 ms/step, critical-path excl 1.34 ms; kernels: vllm::cp_gather_indexer_k_quant_cache_kernel 0.62 ms; _mxfp4_q_quant_kernel 0.38 ms; _mxfp4_k_norm_quant_insert_kernel 0.29 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DENSE.down"
+  ],
+  "row": "DENSE.down",
+  "measured_us": 1089.0,
+  "t_sol_us": 992.1,
+  "t_ach_us": 1087.3,
+  "derate": 1.002,
+  "notes": "busy 1.09 ms/step, critical-path excl 1.09 ms; kernels: nvjet_sm107_tst_192x192_64x8_2x2f_2cta_v_bz_TNN 1.09 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "DENSE.act"
+  ],
+  "row": "DENSE.act",
+  "measured_us": 339.0,
+  "t_sol_us": 25.3,
+  "t_ach_us": 25.3,
+  "derate": 13.425,
+  "notes": "KERNEL-DEBUG; busy 0.34 ms/step, critical-path excl 0.34 ms; kernels: situ_and_mul_vec8_kernel 0.34 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.gate_beta_norm"
+  ],
+  "row": "KDA.gate_beta_norm",
+  "measured_us": 194.0,
+  "t_sol_us": 635.2,
+  "t_ach_us": 635.2,
+  "derate": 0.305,
+  "notes": "busy 0.19 ms/step, critical-path excl 0.19 ms; kernels: at::native::transpose_copy_tiled_kernel 0.19 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "other"
+  ],
+  "row": "other",
+  "measured_us": 153.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": null,
+  "notes": "busy 0.15 ms/step, critical-path excl 0.15 ms; kernels: at::native::vectorized_elementwise_kernel 0.15 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192] (step median 610.9 ms)",
+  "topology": "P3-16",
+  "op_ids": [
+   "F.attnres_final"
+  ],
+  "row": "F.attnres_final",
+  "measured_us": 137.0,
+  "t_sol_us": 0.0,
+  "t_ach_us": 0.0,
+  "derate": 7173.931,
+  "notes": "KERNEL-DEBUG; busy 0.14 ms/step, critical-path excl 0.13 ms; kernels: sm100::fwd_prod_v2::attn_res_fwd_online_v2_kernel 0.14 ms"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "KDA.in_proj",
+   "KDA.f_b_proj",
+   "KDA.conv",
+   "KDA.gate_beta_norm",
+   "KDA.core_prefill",
+   "KDA.o_norm",
+   "KDA.o_proj",
+   "comm:kda"
+  ],
+  "row": "block: KDA attention + its SP/AR comm (excl)",
+  "measured_us": 184426.0,
+  "t_sol_us": 140016.9,
+  "t_ach_us": 152373.2,
+  "derate": 1.21,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "DSA.qkv_a_packed",
+   "DSA.prologue",
+   "DSA.qb_wq_packed",
+   "DSA.g_proj",
+   "DSA.idx_q_quant",
+   "DSA.idx_score",
+   "DSA.topk",
+   "DSA.w_uk",
+   "DSA.sparse_mla",
+   "DSA.w_uv",
+   "DSA.gate_mul",
+   "DSA.o_proj",
+   "comm:dsa"
+  ],
+  "row": "block: DSA attention + its SP/AR comm (excl)",
+  "measured_us": 95829.0,
+  "t_sol_us": 46621.0,
+  "t_ach_us": 52839.7,
+  "derate": 1.814,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "MOE.router",
+   "MOE.topk",
+   "MOE.latent_down",
+   "MOE.dispatch",
+   "MOE.fc1",
+   "MOE.act",
+   "MOE.fc2",
+   "MOE.combine",
+   "MOE.latent_norm",
+   "MOE.latent_up",
+   "MOE.shared_gate_up",
+   "MOE.shared_act",
+   "MOE.shared_down",
+   "comm:moe"
+  ],
+  "row": "block: MoE (excl)",
+  "measured_us": 305334.0,
+  "t_sol_us": 196470.3,
+  "t_ach_us": 264810.2,
+  "derate": 1.153,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "L.attnres_pre",
+   "L.attnres_post"
+  ],
+  "row": "block: AttnRes (excl)",
+  "measured_us": 15677.0,
+  "t_sol_us": 7831.6,
+  "t_ach_us": 12395.4,
+  "derate": 1.265,
+  "notes": "critical-path exclusive GPU time of the block's kernels (concurrent streams counted once) vs model block = its ops + the unit's synchronous comm rows"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "comm:P19 DP sync (step EP lock-step sync)"
+  ],
+  "row": "comm (separate kernels)",
+  "measured_us": 0,
+  "t_sol_us": 2.9,
+  "t_ach_us": 3.4,
+  "derate": 0.0,
+  "notes": "measured = all comm-classified kernels (incl. the per-layer _push_shard AG counted in the blocks) not fused into a GEMM / MegaMoE; model = synchronous comm rows not folded into a fused row above"
+ },
+ {
+  "case": "P3-16 pf8k_L78k [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 610947.7,
+  "t_sol_us": 394603.27573639015,
+  "t_ach_us": 486505.8163337056,
+  "derate": 1.256,
+  "notes": "13409 tok/s/GPU measured vs model achievable 16838; MegaMoE quant mxfp8 (pinned); vllm bench forward eager median (target + DSpark drafter, rank max) vs model step"
+ },
+ {
+  "case": "P1 pf16k_L78k release MegaMoE policy (NVFP4 W4A4 MoE) [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 203393.7,
+  "t_sol_us": 151281.9,
+  "t_ach_us": 218245.0,
+  "derate": 0.932,
+  "notes": "10069 tok/s/GPU measured vs model achievable 9384 (MXFP8 MoE); MegaMoE quant nvfp4; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p1/p1_rel.log. deployed release policy: NVFP4 activations above 512 tok/rank (model O4, not in the mxfp4_release headline)"
+ },
+ {
+  "case": "P1 pf16k_fresh (1 x 16384 fresh, L 16K) MXFP8 [model P1 F16384]",
+  "topology": "P1",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 222396.4,
+  "t_sol_us": 146033.4,
+  "t_ach_us": 212724.5,
+  "derate": 1.045,
+  "notes": "9209 tok/s/GPU measured vs model achievable 9384 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p1/p1_mx.log. model is at L 78K (F16K L32K grid point 215.8 ms)",
+  "review_fix": {
+   "old": {
+    "t_sol_us": 151281.9,
+    "t_ach_us": 218245.0,
+    "derate": 1.019
+   },
+   "what": "fresh case was compared with the L78K prefix-hit model step; model re-evaluated at the fresh shape F16384 f16384 L16384"
+  }
+ },
+ {
+  "case": "P2 pf32k_L78k MXFP8 (production MNBT 32768) [model P2 F32768]",
+  "topology": "P2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 653064.9,
+  "t_sol_us": 441556.5,
+  "t_ach_us": 551293.4,
+  "derate": 1.185,
+  "notes": "12544 tok/s/GPU measured vs model achievable 14860 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p2b/p2_mx32.log. bench GMU 0.85 (0.92 OOMs with the bench state snapshot at 32K)"
+ },
+ {
+  "case": "P2 pf32k_L78k release MegaMoE policy (NVFP4) [model P2 F32768]",
+  "topology": "P2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 579497.3,
+  "t_sol_us": 441556.5,
+  "t_ach_us": 551293.4,
+  "derate": 1.051,
+  "notes": "14136 tok/s/GPU measured vs model achievable 14860 (MXFP8 MoE); MegaMoE quant nvfp4; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p2b/p2_rel32.log. deployed release policy (model O4 not in headline)"
+ },
+ {
+  "case": "P2 pf16k_L78k release MegaMoE policy (NVFP4) [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 307703.5,
+  "t_sol_us": 227253.3,
+  "t_ach_us": 282215.3,
+  "derate": 1.09,
+  "notes": "13312 tok/s/GPU measured vs model achievable 14514 (MXFP8 MoE); MegaMoE quant nvfp4; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p2/p2_rel.log. deployed release policy (model O4 not in headline)"
+ },
+ {
+  "case": "P2 pf16k_fresh MXFP8 [model P2 F16384]",
+  "topology": "P2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 347730.7,
+  "t_sol_us": 221735.7,
+  "t_ach_us": 279045.4,
+  "derate": 1.246,
+  "notes": "11779 tok/s/GPU measured vs model achievable 14514 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p2/p2_mx.log. fresh 16K chunk",
+  "review_fix": {
+   "old": {
+    "t_sol_us": 227253.3,
+    "t_ach_us": 282215.3,
+    "derate": 1.232
+   },
+   "what": "fresh case was compared with the L78K prefix-hit model step; model re-evaluated at the fresh shape F16384 f16384 L16384"
+  }
+ },
+ {
+  "case": "P3-16 pf16k_L78k MXFP8 (no profile) [model P3-16 F16384]",
+  "topology": "P3-16",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 1179833.5,
+  "t_sol_us": 776781.0,
+  "t_ach_us": 960363.2,
+  "derate": 1.229,
+  "notes": "13887 tok/s/GPU measured vs model achievable 17060 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p3h/p3_mx16.log. KV pool pinned 14 GiB, max-num-seqs 4, expandable segments (16K tokens/rank at TP1 does not fit the 0.92 pool)"
+ },
+ {
+  "case": "P3-16 pf16k_L78k release MegaMoE policy (NVFP4) [model P3-16 F16384]",
+  "topology": "P3-16",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 1063283.2,
+  "t_sol_us": 776781.0,
+  "t_ach_us": 960363.2,
+  "derate": 1.107,
+  "notes": "15409 tok/s/GPU measured vs model achievable 17060 (MXFP8 MoE); MegaMoE quant nvfp4; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p3e/p3_rel.log. KV 16 GiB, max-num-seqs 4"
+ },
+ {
+  "case": "P3-16 pf8k_L78k release MegaMoE policy (NVFP4) [model P3-16 F8192]",
+  "topology": "P3-16",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 531925.7,
+  "t_sol_us": 394603.3,
+  "t_ach_us": 486505.8,
+  "derate": 1.093,
+  "notes": "15401 tok/s/GPU measured vs model achievable 16838 (MXFP8 MoE); MegaMoE quant nvfp4; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p3g/p3_rel.log."
+ },
+ {
+  "case": "P4-4 pf16k_fresh (4 x 4096 fresh) MXFP8 [model P4-4 F16384 f4096]",
+  "topology": "P4-4",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 319763.0,
+  "t_sol_us": 207982.8,
+  "t_ach_us": 259967.2,
+  "derate": 1.23,
+  "notes": "12809 tok/s/GPU measured vs model achievable 15222 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p4/p4_4_mx.log.",
+  "review_fix": {
+   "old": {
+    "t_sol_us": 216483.4,
+    "t_ach_us": 269084.5,
+    "derate": 1.188
+   },
+   "what": "fresh case was compared with the L78K prefix-hit model step; model re-evaluated at the fresh shape F16384 f4096 L4096"
+  }
+ },
+ {
+  "case": "P4-2 pf16k_L78k (4 x 4096 @ 78K) MXFP8 [model P4-2 F16384 f4096]",
+  "topology": "P4-2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 622976.4,
+  "t_sol_us": 403473.5,
+  "t_ach_us": 500090.2,
+  "derate": 1.246,
+  "notes": "13150 tok/s/GPU measured vs model achievable 16381 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p4/p4_2_mx.log. PR #20 tree, VLLM_K3_TP_DSA_DP=1, replicated DSA KV, owner = batch index mod TP; no profile"
+ },
+ {
+  "case": "P4-2 pf16k_fresh MXFP8 [model P4-2 F16384 f4096]",
+  "topology": "P4-2",
+  "op_ids": [
+   "step"
+  ],
+  "row": "full step",
+  "measured_us": 607843.3,
+  "t_sol_us": 386472.1,
+  "t_ach_us": 481855.6,
+  "derate": 1.261,
+  "notes": "13477 tok/s/GPU measured vs model achievable 16381 (MXFP8 MoE); MegaMoE quant mxfp8; raw /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/mb/prefill/results/p4/p4_2_mx.log.",
+  "review_fix": {
+   "old": {
+    "t_sol_us": 403473.5,
+    "t_ach_us": 500090.2,
+    "derate": 1.215
+   },
+   "what": "fresh case was compared with the L78K prefix-hit model step; model re-evaluated at the fresh shape F16384 f4096 L4096"
+  }
+ }
+]

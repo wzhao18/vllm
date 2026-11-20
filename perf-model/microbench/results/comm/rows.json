@@ -1,0 +1,6516 @@
+[
+ {
+  "case": "comm-001",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P3-16",
+   "P9"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P0",
+  "count_per_step": 92,
+  "bytes_param": 117440512,
+  "bytes_actual": 117440512,
+  "hops": 1,
+  "measured_us": 1712.107,
+  "variant": "push2d",
+  "t_sol_us": 981.53,
+  "t_ach_us": 1412.64,
+  "derate": 1.212,
+  "measured_over_sol": 1.744,
+  "all_variants_us": {
+   "push": 1733.49,
+   "push2d": 1712.11,
+   "pull": 1785.41,
+   "ce": 2391.99,
+   "nccl": 4048.88
+  },
+  "notes": "NCCL 4048.9 us"
+ },
+ {
+  "case": "comm-002",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P0",
+  "count_per_step": 92,
+  "bytes_param": 29360128,
+  "bytes_actual": 29360128,
+  "hops": 1,
+  "measured_us": 439.251,
+  "variant": "push2d",
+  "t_sol_us": 247.53,
+  "t_ach_us": 355.68,
+  "derate": 1.235,
+  "measured_over_sol": 1.775,
+  "all_variants_us": {
+   "push": 444.74,
+   "push2d": 439.25,
+   "pull": 463.58,
+   "ce": 798.33,
+   "nccl": 1147.13
+  },
+  "notes": "NCCL 1147.1 us"
+ },
+ {
+  "case": "comm-011",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense down AR",
+   "dsa:o_proj AR",
+   "embed:embed vocab reduce",
+   "kda:o_proj AR",
+   "moe:shared partial + routed AR"
+  ],
+  "priority": "P0",
+  "count_per_step": 187,
+  "bytes_param": 234881024,
+  "bytes_actual": 234881024,
+  "hops": 0,
+  "measured_us": 295.402,
+  "variant": "nvls_tri",
+  "t_sol_us": 152.52,
+  "t_ach_us": 334.98,
+  "derate": 0.882,
+  "measured_over_sol": 1.937,
+  "all_variants_us": {
+   "nvls_tri": 295.4,
+   "torch_multimem": 813.94,
+   "torch_twoshot": 866.0,
+   "nccl": 796.43
+  },
+  "notes": "NCCL 796.4 us"
+ },
+ {
+  "case": "comm-015",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P4-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P0",
+  "count_per_step": 92,
+  "bytes_param": 58720256,
+  "bytes_actual": 58720256,
+  "hops": 1,
+  "measured_us": 862.059,
+  "variant": "push",
+  "t_sol_us": 492.19,
+  "t_ach_us": 708.0,
+  "derate": 1.218,
+  "measured_over_sol": 1.751,
+  "all_variants_us": {
+   "push": 862.06,
+   "push2d": 862.92,
+   "pull": 905.59,
+   "ce": 1252.47,
+   "nccl": 2090.19
+  },
+  "notes": "NCCL 2090.2 us"
+ },
+ {
+  "case": "comm-018",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:o_proj RS",
+   "embed:embed RS",
+   "kda:o_proj RS"
+  ],
+  "priority": "P0",
+  "count_per_step": 94,
+  "bytes_param": 234881024,
+  "bytes_actual": 234881024,
+  "hops": 0,
+  "measured_us": 235.968,
+  "variant": "nvls_tri",
+  "t_sol_us": 100.73,
+  "t_ach_us": 143.86,
+  "derate": 1.64,
+  "measured_over_sol": 2.343,
+  "all_variants_us": {
+   "nvls_tri": 235.97,
+   "push_sum": 240.0,
+   "dbg_push_only": 177.12,
+   "dbg_sum_only": 63.57,
+   "nccl": 396.83
+  },
+  "notes": "NCCL 396.8 us"
+ },
+ {
+  "case": "comm-019",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:SP AG",
+   "kda:SP AG"
+  ],
+  "priority": "P0",
+  "count_per_step": 93,
+  "bytes_param": 58720256,
+  "bytes_actual": 58720256,
+  "hops": 1,
+  "measured_us": 179.591,
+  "variant": "push2d",
+  "t_sol_us": 100.73,
+  "t_ach_us": 143.86,
+  "derate": 1.248,
+  "measured_over_sol": 1.783,
+  "all_variants_us": {
+   "push": 179.74,
+   "push2d": 179.59,
+   "mc": 216.31,
+   "ce": 403.77,
+   "nccl": 443.04
+  },
+  "notes": "NCCL 443.0 us"
+ },
+ {
+  "case": "comm-031",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense down AR",
+   "dsa:o_proj AR",
+   "embed:embed vocab reduce",
+   "kda:o_proj AR",
+   "moe:shared+latent_up AR",
+   "moe:shared/out AR"
+  ],
+  "priority": "P0",
+  "count_per_step": 187,
+  "bytes_param": 29360128,
+  "bytes_actual": 29360128,
+  "hops": 0,
+  "measured_us": 62.052,
+  "variant": "nvls_tri",
+  "t_sol_us": 23.05,
+  "t_ach_us": 50.75,
+  "derate": 1.223,
+  "measured_over_sol": 2.692,
+  "all_variants_us": {
+   "nvls_tri": 62.05,
+   "lamport_twoshot": 95.15,
+   "torch_multimem": 63.44,
+   "torch_twoshot": 128.73,
+   "nccl": 127.17
+  },
+  "notes": "NCCL 127.2 us"
+ },
+ {
+  "case": "comm-045",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense down AR",
+   "dsa:o_proj AR",
+   "embed:embed vocab reduce",
+   "kda:o_proj AR",
+   "moe:shared+latent_up AR",
+   "moe:shared/out AR"
+  ],
+  "priority": "P0",
+  "count_per_step": 187,
+  "bytes_param": 7340032,
+  "bytes_actual": 7340032,
+  "hops": 0,
+  "measured_us": 22.186,
+  "variant": "nvls_tri",
+  "t_sol_us": 10.05,
+  "t_ach_us": 17.72,
+  "derate": 1.252,
+  "measured_over_sol": 2.208,
+  "all_variants_us": {
+   "nvls_tri": 22.19,
+   "lamport_twoshot": 27.44,
+   "torch_multimem": 28.96,
+   "torch_twoshot": 62.05,
+   "torch_oneshot": 1546.06,
+   "nccl": 65.06
+  },
+  "notes": "NCCL 65.1 us"
+ },
+ {
+  "case": "comm-053",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P3-16",
+   "P9"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 60555264,
+  "bytes_actual": 60555264,
+  "hops": 2,
+  "measured_us": 896.331,
+  "variant": "push2d",
+  "t_sol_us": 510.35,
+  "t_ach_us": 733.37,
+  "derate": 1.222,
+  "measured_over_sol": 1.756,
+  "all_variants_us": {
+   "push": 902.91,
+   "push2d": 896.33,
+   "pull": 938.34,
+   "ce": 1290.02,
+   "nccl": 2152.31
+  },
+  "notes": "NCCL 2152.3 us"
+ },
+ {
+  "case": "comm-054",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 15138816,
+  "bytes_actual": 15138816,
+  "hops": 2,
+  "measured_us": 235.523,
+  "variant": "push2d",
+  "t_sol_us": 131.88,
+  "t_ach_us": 188.38,
+  "derate": 1.25,
+  "measured_over_sol": 1.786,
+  "all_variants_us": {
+   "push": 244.49,
+   "push2d": 235.52,
+   "pull": 253.24,
+   "ce": 562.72,
+   "nccl": 596.69
+  },
+  "notes": "NCCL 596.7 us"
+ },
+ {
+  "case": "comm-058",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P3-16",
+   "P9"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 33030144,
+  "bytes_actual": 33030144,
+  "hops": 2,
+  "measured_us": 499.048,
+  "variant": "push2d",
+  "t_sol_us": 280.97,
+  "t_ach_us": 403.07,
+  "derate": 1.238,
+  "measured_over_sol": 1.776,
+  "all_variants_us": {
+   "push": 501.7,
+   "push2d": 499.05,
+   "pull": 524.58,
+   "ce": 829.51,
+   "nccl": 1279.9
+  },
+  "notes": "NCCL 1279.9 us"
+ },
+ {
+  "case": "comm-063",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 8257536,
+  "bytes_actual": 8257536,
+  "hops": 2,
+  "measured_us": 135.556,
+  "variant": "push2d",
+  "t_sol_us": 74.53,
+  "t_ach_us": 105.8,
+  "derate": 1.281,
+  "measured_over_sol": 1.819,
+  "all_variants_us": {
+   "push": 142.61,
+   "push2d": 135.56,
+   "pull": 150.0,
+   "ce": 398.33,
+   "nccl": 339.13
+  },
+  "notes": "NCCL 339.1 us"
+ },
+ {
+  "case": "comm-075",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P0",
+  "count_per_step": 92,
+  "bytes_param": 917504,
+  "bytes_actual": 917504,
+  "hops": 1,
+  "measured_us": 21.158,
+  "variant": "push2d",
+  "t_sol_us": 10.51,
+  "t_ach_us": 14.37,
+  "derate": 1.473,
+  "measured_over_sol": 2.013,
+  "all_variants_us": {
+   "push": 23.94,
+   "lamport": 21.41,
+   "push2d": 21.16,
+   "pull": 30.97,
+   "ce": 264.4,
+   "nccl": 56.57
+  },
+  "notes": "NCCL 56.6 us"
+ },
+ {
+  "case": "comm-084",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 29360128,
+  "bytes_actual": 29360128,
+  "hops": 1,
+  "measured_us": 208.361,
+  "variant": "push",
+  "t_sol_us": 117.04,
+  "t_ach_us": 167.49,
+  "derate": 1.244,
+  "measured_over_sol": 1.78,
+  "all_variants_us": {
+   "push": 208.36,
+   "push2d": 213.73,
+   "pull": 227.54,
+   "ce": 346.72,
+   "nccl": 581.68
+  },
+  "notes": "NCCL 581.7 us"
+ },
+ {
+  "case": "comm-092",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "dsa:o_proj RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 7340032,
+  "bytes_actual": 7340032,
+  "hops": 0,
+  "measured_us": 13.935,
+  "variant": "lamport_sum",
+  "t_sol_us": 5.92,
+  "t_ach_us": 7.33,
+  "derate": 1.9,
+  "measured_over_sol": 2.354,
+  "all_variants_us": {
+   "nvls_tri": 22.84,
+   "lamport_sum": 13.94,
+   "push_sum": 16.4,
+   "dbg_push_only": 12.56,
+   "dbg_sum_only": 3.29,
+   "nccl": 61.25
+  },
+  "notes": "NCCL 61.3 us"
+ },
+ {
+  "case": "comm-093",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "dsa:SP AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 1835008,
+  "bytes_actual": 1835008,
+  "hops": 1,
+  "measured_us": 10.71,
+  "variant": "lamport",
+  "t_sol_us": 5.92,
+  "t_ach_us": 7.33,
+  "derate": 1.46,
+  "measured_over_sol": 1.809,
+  "all_variants_us": {
+   "push": 12.53,
+   "lamport": 10.71,
+   "push2d": 12.73,
+   "mc": 12.73,
+   "ce": 68.43,
+   "nccl": 70.1
+  },
+  "notes": "NCCL 70.1 us"
+ },
+ {
+  "case": "comm-102",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense down AR",
+   "dsa:o_proj AR",
+   "embed:embed vocab reduce",
+   "kda:o_proj AR",
+   "moe:shared+latent_up AR",
+   "moe:shared/out AR"
+  ],
+  "priority": "P0",
+  "count_per_step": 187,
+  "bytes_param": 917504,
+  "bytes_actual": 917504,
+  "hops": 0,
+  "measured_us": 15.091,
+  "variant": "lamport_twoshot",
+  "t_sol_us": 6.26,
+  "t_ach_us": 8.09,
+  "derate": 1.866,
+  "measured_over_sol": 2.411,
+  "all_variants_us": {
+   "nvls_tri": 16.23,
+   "lamport_oneshot": 24.69,
+   "lamport_twoshot": 15.09,
+   "torch_multimem": 18.37,
+   "torch_twoshot": 35.96,
+   "torch_oneshot": 220.94,
+   "nccl": 52.69
+  },
+  "notes": "NCCL 52.7 us"
+ },
+ {
+  "case": "comm-110",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 14680064,
+  "bytes_actual": 14680064,
+  "hops": 0,
+  "measured_us": 24.254,
+  "variant": "lamport_sum",
+  "t_sol_us": 10.0,
+  "t_ach_us": 13.35,
+  "derate": 1.817,
+  "measured_over_sol": 2.425,
+  "all_variants_us": {
+   "nvls_tri": 29.7,
+   "lamport_sum": 24.25,
+   "push_sum": 24.44,
+   "dbg_push_only": 19.88,
+   "dbg_sum_only": 3.71,
+   "nccl": 118.78
+  },
+  "notes": "NCCL 118.8 us"
+ },
+ {
+  "case": "comm-111",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 1835008,
+  "bytes_actual": 1835008,
+  "hops": 1,
+  "measured_us": 18.84,
+  "variant": "mc",
+  "t_sol_us": 10.0,
+  "t_ach_us": 13.35,
+  "derate": 1.411,
+  "measured_over_sol": 1.884,
+  "all_variants_us": {
+   "push": 21.06,
+   "lamport": 20.67,
+   "push2d": 20.6,
+   "mc": 18.84,
+   "ce": 144.66,
+   "nccl": 132.88
+  },
+  "notes": "NCCL 132.9 us"
+ },
+ {
+  "case": "comm-112",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "embed:embed RS",
+   "kda:o_proj RS"
+  ],
+  "priority": "P1",
+  "count_per_step": 70,
+  "bytes_param": 234881024,
+  "bytes_actual": 234881024,
+  "hops": 0,
+  "measured_us": 261.514,
+  "variant": "push_sum",
+  "t_sol_us": 68.11,
+  "t_ach_us": 96.81,
+  "derate": 2.701,
+  "measured_over_sol": 3.84,
+  "all_variants_us": {
+   "nvls_tri": 266.91,
+   "push_sum": 261.51,
+   "dbg_push_only": 123.82,
+   "dbg_sum_only": 137.85,
+   "nccl": 357.58
+  },
+  "notes": "KERNEL-DEBUG derate 2.70; decomposed: push 124 us (0.95 TB/s, fine) + unfused torch.sum over [2, 58.7M] bf16 138 us (~5x HBM roofline: column reduce); a fused owner-sum gives ~150 us (derate ~1.55). NVLS ld_reduce 267 us is egress-bound (moves M per GPU, 2x the push bytes at N=2); NCCL 357.6 us"
+ },
+ {
+  "case": "comm-114",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "kda:SP AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 69,
+  "bytes_param": 117440512,
+  "bytes_actual": 117440512,
+  "hops": 1,
+  "measured_us": 117.45,
+  "variant": "push",
+  "t_sol_us": 68.11,
+  "t_ach_us": 96.81,
+  "derate": 1.213,
+  "measured_over_sol": 1.724,
+  "all_variants_us": {
+   "push": 117.45,
+   "push2d": 129.84,
+   "mc": 226.18,
+   "ce": 157.73,
+   "nccl": 394.77
+  },
+  "notes": "NCCL 394.8 us"
+ },
+ {
+  "case": "comm-116",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P4-2"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 30277632,
+  "bytes_actual": 30277632,
+  "hops": 2,
+  "measured_us": 455.68,
+  "variant": "push2d",
+  "t_sol_us": 258.03,
+  "t_ach_us": 370.04,
+  "derate": 1.231,
+  "measured_over_sol": 1.766,
+  "all_variants_us": {
+   "push": 462.29,
+   "push2d": 455.68,
+   "pull": 484.74,
+   "ce": 825.89,
+   "nccl": 1178.73
+  },
+  "notes": "NCCL 1178.7 us"
+ },
+ {
+  "case": "comm-117",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P0",
+  "count_per_step": 92,
+  "bytes_param": 229376,
+  "bytes_actual": 229376,
+  "hops": 1,
+  "measured_us": 9.591,
+  "variant": "lamport",
+  "t_sol_us": 4.77,
+  "t_ach_us": 6.11,
+  "derate": 1.57,
+  "measured_over_sol": 2.011,
+  "all_variants_us": {
+   "push": 19.68,
+   "lamport": 9.59,
+   "push2d": 11.79,
+   "pull": 13.74,
+   "ce": 256.87,
+   "nccl": 44.0
+  },
+  "notes": "NCCL 44.0 us"
+ },
+ {
+  "case": "comm-119",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "dsa:o_proj RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 229376,
+  "bytes_actual": 229376,
+  "hops": 0,
+  "measured_us": 7.236,
+  "variant": "lamport_sum",
+  "t_sol_us": 2.96,
+  "t_ach_us": 3.07,
+  "derate": 2.359,
+  "measured_over_sol": 2.445,
+  "all_variants_us": {
+   "nvls_tri": 14.9,
+   "lamport_sum": 7.24,
+   "push_sum": 12.48,
+   "dbg_push_only": 9.65,
+   "dbg_sum_only": 2.02,
+   "nccl": 37.38
+  },
+  "notes": "KERNEL-DEBUG derate 2.36; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 37.4 us"
+ },
+ {
+  "case": "comm-120",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "dsa:SP AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 57344,
+  "bytes_actual": 57344,
+  "hops": 1,
+  "measured_us": 5.007,
+  "variant": "lamport",
+  "t_sol_us": 2.96,
+  "t_ach_us": 3.07,
+  "derate": 1.632,
+  "measured_over_sol": 1.692,
+  "all_variants_us": {
+   "push": 8.72,
+   "lamport": 5.01,
+   "push2d": 8.05,
+   "mc": 7.77,
+   "ce": 63.74,
+   "nccl": 37.51
+  },
+  "notes": "NCCL 37.5 us"
+ },
+ {
+  "case": "comm-123",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "dsa:o_proj RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 1835008,
+  "bytes_actual": 1835008,
+  "hops": 0,
+  "measured_us": 9.066,
+  "variant": "lamport_sum",
+  "t_sol_us": 3.62,
+  "t_ach_us": 4.03,
+  "derate": 2.249,
+  "measured_over_sol": 2.504,
+  "all_variants_us": {
+   "nvls_tri": 15.51,
+   "lamport_sum": 9.07,
+   "push_sum": 12.9,
+   "dbg_push_only": 9.76,
+   "dbg_sum_only": 2.26,
+   "nccl": 36.04
+  },
+  "notes": "KERNEL-DEBUG derate 2.25; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 36.0 us"
+ },
+ {
+  "case": "comm-124",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "dsa:SP AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P0",
+  "count_per_step": 163,
+  "bytes_param": 458752,
+  "bytes_actual": 458752,
+  "hops": 1,
+  "measured_us": 6.757,
+  "variant": "lamport",
+  "t_sol_us": 3.62,
+  "t_ach_us": 4.03,
+  "derate": 1.676,
+  "measured_over_sol": 1.867,
+  "all_variants_us": {
+   "push": 9.0,
+   "lamport": 6.76,
+   "push2d": 8.9,
+   "mc": 8.26,
+   "ce": 63.41,
+   "nccl": 34.35
+  },
+  "notes": "NCCL 34.4 us"
+ },
+ {
+  "case": "comm-135",
+  "primitive": "P12 EP-combine",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE combine"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 28672,
+  "bytes_actual": 28672,
+  "hops": 1,
+  "measured_us": 6.182,
+  "variant": "lamport",
+  "t_sol_us": 3.1,
+  "t_ach_us": 3.7,
+  "derate": 1.671,
+  "measured_over_sol": 1.994,
+  "all_variants_us": {
+   "push": 19.13,
+   "lamport": 6.18,
+   "push2d": 8.87,
+   "pull": 10.85,
+   "ce": 252.08,
+   "nccl": 43.66
+  },
+  "notes": "NCCL 43.7 us"
+ },
+ {
+  "case": "comm-136",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "P4-2"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 16515072,
+  "bytes_actual": 16515072,
+  "hops": 2,
+  "measured_us": 256.018,
+  "variant": "push2d",
+  "t_sol_us": 143.35,
+  "t_ach_us": 204.89,
+  "derate": 1.25,
+  "measured_over_sol": 1.786,
+  "all_variants_us": {
+   "push": 258.21,
+   "push2d": 256.02,
+   "pull": 273.99,
+   "ce": 586.19,
+   "nccl": 650.29
+  },
+  "notes": "NCCL 650.3 us"
+ },
+ {
+  "case": "comm-137",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 3670016,
+  "bytes_actual": 3670016,
+  "hops": 0,
+  "measured_us": 11.314,
+  "variant": "lamport_sum",
+  "t_sol_us": 4.64,
+  "t_ach_us": 5.64,
+  "derate": 2.006,
+  "measured_over_sol": 2.438,
+  "all_variants_us": {
+   "nvls_tri": 74.97,
+   "lamport_sum": 11.31,
+   "push_sum": 16.28,
+   "dbg_push_only": 13.07,
+   "dbg_sum_only": 2.45,
+   "nccl": 38.0
+  },
+  "notes": "KERNEL-DEBUG derate 2.01; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 38.0 us"
+ },
+ {
+  "case": "comm-138",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 458752,
+  "bytes_actual": 458752,
+  "hops": 1,
+  "measured_us": 8.956,
+  "variant": "lamport",
+  "t_sol_us": 4.64,
+  "t_ach_us": 5.64,
+  "derate": 1.588,
+  "measured_over_sol": 1.93,
+  "all_variants_us": {
+   "push": 11.82,
+   "lamport": 8.96,
+   "push2d": 11.13,
+   "mc": 9.46,
+   "ce": 132.5,
+   "nccl": 40.87
+  },
+  "notes": "NCCL 40.9 us"
+ },
+ {
+  "case": "comm-147",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 14784,
+  "bytes_actual": 14784,
+  "hops": 2,
+  "measured_us": 11.073,
+  "variant": "lamport",
+  "t_sol_us": 5.84,
+  "t_ach_us": 6.89,
+  "derate": 1.608,
+  "measured_over_sol": 1.896,
+  "all_variants_us": {
+   "push": 24.45,
+   "lamport": 11.07,
+   "push2d": 14.14,
+   "pull": 15.94,
+   "ce": 74.42,
+   "nccl": 41.88
+  },
+  "notes": "NCCL 41.9 us"
+ },
+ {
+  "case": "comm-148",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 8064,
+  "bytes_actual": 8064,
+  "hops": 2,
+  "measured_us": 10.999,
+  "variant": "lamport",
+  "t_sol_us": 5.79,
+  "t_ach_us": 6.81,
+  "derate": 1.616,
+  "measured_over_sol": 1.9,
+  "all_variants_us": {
+   "push": 24.09,
+   "lamport": 11.0,
+   "push2d": 13.79,
+   "pull": 15.88,
+   "ce": 72.33,
+   "nccl": 42.69
+  },
+  "notes": "NCCL 42.7 us"
+ },
+ {
+  "case": "comm-153",
+  "primitive": "P6 DCP q publish",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:FP8 MQA q publish"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 7077888,
+  "bytes_actual": 7077888,
+  "hops": 1,
+  "measured_us": 104.29,
+  "variant": "mc",
+  "t_sol_us": 61.84,
+  "t_ach_us": 88.29,
+  "derate": 1.181,
+  "measured_over_sol": 1.686,
+  "all_variants_us": {
+   "push": 138.56,
+   "push2d": 108.77,
+   "mc": 104.29,
+   "ce": 560.16,
+   "nccl": 343.67
+  },
+  "notes": "NCCL 343.7 us"
+ },
+ {
+  "case": "comm-157",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 118272,
+  "bytes_actual": 118272,
+  "hops": 2,
+  "measured_us": 12.191,
+  "variant": "lamport",
+  "t_sol_us": 6.71,
+  "t_ach_us": 8.13,
+  "derate": 1.5,
+  "measured_over_sol": 1.817,
+  "all_variants_us": {
+   "push": 24.12,
+   "lamport": 12.19,
+   "push2d": 15.01,
+   "pull": 17.46,
+   "ce": 261.81,
+   "nccl": 43.34
+  },
+  "notes": "NCCL 43.3 us"
+ },
+ {
+  "case": "comm-158",
+  "primitive": "P9 ShardQ ctx push (CE)",
+  "kind": "a2a_ce",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:context gather"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 37881113,
+  "bytes_actual": 37881152,
+  "hops": 1,
+  "measured_us": 174.408,
+  "variant": "ce",
+  "t_sol_us": 66.0,
+  "t_ach_us": 93.84,
+  "derate": 1.858,
+  "measured_over_sol": 2.643,
+  "all_variants_us": {
+   "push": 124.51,
+   "push2d": 126.43,
+   "pull": 151.11,
+   "ce": 174.41
+  },
+  "notes": ""
+ },
+ {
+  "case": "comm-164",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 458752,
+  "bytes_actual": 458752,
+  "hops": 0,
+  "measured_us": 7.972,
+  "variant": "lamport_sum",
+  "t_sol_us": 3.08,
+  "t_ach_us": 3.39,
+  "derate": 2.35,
+  "measured_over_sol": 2.588,
+  "all_variants_us": {
+   "nvls_tri": 15.39,
+   "lamport_sum": 7.97,
+   "push_sum": 15.98,
+   "dbg_push_only": 12.83,
+   "dbg_sum_only": 2.16,
+   "nccl": 27.37
+  },
+  "notes": "KERNEL-DEBUG derate 2.35; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 27.4 us"
+ },
+ {
+  "case": "comm-165",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 57344,
+  "bytes_actual": 57344,
+  "hops": 1,
+  "measured_us": 5.487,
+  "variant": "lamport",
+  "t_sol_us": 3.08,
+  "t_ach_us": 3.39,
+  "derate": 1.617,
+  "measured_over_sol": 1.781,
+  "all_variants_us": {
+   "push": 11.66,
+   "lamport": 5.49,
+   "push2d": 8.6,
+   "mc": 7.86,
+   "ce": 132.0,
+   "nccl": 39.02
+  },
+  "notes": "NCCL 39.0 us"
+ },
+ {
+  "case": "comm-166",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 258048,
+  "bytes_actual": 258048,
+  "hops": 2,
+  "measured_us": 15.069,
+  "variant": "lamport",
+  "t_sol_us": 7.87,
+  "t_ach_us": 9.81,
+  "derate": 1.537,
+  "measured_over_sol": 1.915,
+  "all_variants_us": {
+   "push": 24.81,
+   "lamport": 15.07,
+   "push2d": 17.58,
+   "pull": 19.91,
+   "ce": 263.6,
+   "nccl": 28.84
+  },
+  "notes": "NCCL 28.8 us"
+ },
+ {
+  "case": "comm-170",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 64512,
+  "bytes_actual": 64512,
+  "hops": 2,
+  "measured_us": 11.992,
+  "variant": "lamport",
+  "t_sol_us": 6.26,
+  "t_ach_us": 7.48,
+  "derate": 1.603,
+  "measured_over_sol": 1.916,
+  "all_variants_us": {
+   "push": 24.75,
+   "lamport": 11.99,
+   "push2d": 14.85,
+   "pull": 16.76,
+   "ce": 259.61,
+   "nccl": 29.05
+  },
+  "notes": "NCCL 29.1 us"
+ },
+ {
+  "case": "comm-180",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:latent AR"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 14680064,
+  "bytes_actual": 14680064,
+  "hops": 0,
+  "measured_us": 35.608,
+  "variant": "nvls_tri",
+  "t_sol_us": 14.38,
+  "t_ach_us": 28.73,
+  "derate": 1.239,
+  "measured_over_sol": 2.476,
+  "all_variants_us": {
+   "nvls_tri": 35.61,
+   "lamport_twoshot": 46.2,
+   "torch_multimem": 39.76,
+   "torch_twoshot": 85.0,
+   "torch_oneshot": 3041.1,
+   "nccl": 86.83
+  },
+  "notes": "NCCL 86.8 us"
+ },
+ {
+  "case": "comm-184",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D5"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 473088,
+  "bytes_actual": 473088,
+  "hops": 2,
+  "measured_us": 18.221,
+  "variant": "lamport",
+  "t_sol_us": 9.66,
+  "t_ach_us": 12.39,
+  "derate": 1.471,
+  "measured_over_sol": 1.886,
+  "all_variants_us": {
+   "push": 24.58,
+   "lamport": 18.22,
+   "push2d": 20.54,
+   "pull": 28.01,
+   "ce": 263.56,
+   "nccl": 44.78
+  },
+  "notes": "NCCL 44.8 us"
+ },
+ {
+  "case": "comm-192",
+  "primitive": "P5 ShardQ out gather",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:out gather"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 25165824,
+  "bytes_actual": 25165824,
+  "hops": 1,
+  "measured_us": 81.764,
+  "variant": "push2d",
+  "t_sol_us": 44.8,
+  "t_ach_us": 63.33,
+  "derate": 1.291,
+  "measured_over_sol": 1.825,
+  "all_variants_us": {
+   "push": 84.23,
+   "push2d": 81.76,
+   "pull": 94.24,
+   "ce": 142.71,
+   "nccl": 263.11
+  },
+  "notes": "NCCL 263.1 us"
+ },
+ {
+  "case": "comm-197",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 114688,
+  "bytes_actual": 114688,
+  "hops": 0,
+  "measured_us": 7.108,
+  "variant": "lamport_sum",
+  "t_sol_us": 2.89,
+  "t_ach_us": 2.91,
+  "derate": 2.446,
+  "measured_over_sol": 2.46,
+  "all_variants_us": {
+   "nvls_tri": 14.61,
+   "lamport_sum": 7.11,
+   "push_sum": 11.01,
+   "dbg_push_only": 8.03,
+   "dbg_sum_only": 2.1,
+   "nccl": 30.82
+  },
+  "notes": "KERNEL-DEBUG derate 2.45; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 30.8 us"
+ },
+ {
+  "case": "comm-198",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 57344,
+  "bytes_actual": 57344,
+  "hops": 1,
+  "measured_us": 5.32,
+  "variant": "lamport",
+  "t_sol_us": 2.89,
+  "t_ach_us": 2.91,
+  "derate": 1.831,
+  "measured_over_sol": 1.841,
+  "all_variants_us": {
+   "push": 8.11,
+   "lamport": 5.32,
+   "push2d": 8.16,
+   "mc": 7.7,
+   "ce": 77.74,
+   "nccl": 24.63
+  },
+  "notes": "NCCL 24.6 us"
+ },
+ {
+  "case": "comm-199",
+  "primitive": "P6 DCP q publish",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:FP8 MQA q publish"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 1769472,
+  "bytes_actual": 1769472,
+  "hops": 1,
+  "measured_us": 30.475,
+  "variant": "mc",
+  "t_sol_us": 17.61,
+  "t_ach_us": 24.59,
+  "derate": 1.239,
+  "measured_over_sol": 1.731,
+  "all_variants_us": {
+   "push": 36.47,
+   "lamport": 41.09,
+   "push2d": 33.52,
+   "mc": 30.48,
+   "ce": 307.07,
+   "nccl": 90.04
+  },
+  "notes": "NCCL 90.0 us"
+ },
+ {
+  "case": "comm-201",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:latent AR"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 3670016,
+  "bytes_actual": 3670016,
+  "hops": 0,
+  "measured_us": 18.109,
+  "variant": "nvls_tri",
+  "t_sol_us": 7.89,
+  "t_ach_us": 12.21,
+  "derate": 1.483,
+  "measured_over_sol": 2.295,
+  "all_variants_us": {
+   "nvls_tri": 18.11,
+   "lamport_oneshot": 100.77,
+   "lamport_twoshot": 20.84,
+   "torch_multimem": 22.11,
+   "torch_twoshot": 38.38,
+   "torch_oneshot": 785.16,
+   "nccl": 58.12
+  },
+  "notes": "NCCL 58.1 us"
+ },
+ {
+  "case": "comm-203",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 917504,
+  "bytes_actual": 917504,
+  "hops": 0,
+  "measured_us": 7.505,
+  "variant": "lamport_sum",
+  "t_sol_us": 3.12,
+  "t_ach_us": 3.23,
+  "derate": 2.326,
+  "measured_over_sol": 2.405,
+  "all_variants_us": {
+   "nvls_tri": 14.9,
+   "lamport_sum": 7.5,
+   "push_sum": 11.03,
+   "dbg_push_only": 8.24,
+   "dbg_sum_only": 2.32,
+   "nccl": 27.16
+  },
+  "notes": "KERNEL-DEBUG derate 2.33; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 27.2 us"
+ },
+ {
+  "case": "comm-204",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 458752,
+  "bytes_actual": 458752,
+  "hops": 1,
+  "measured_us": 5.638,
+  "variant": "lamport",
+  "t_sol_us": 3.12,
+  "t_ach_us": 3.23,
+  "derate": 1.747,
+  "measured_over_sol": 1.807,
+  "all_variants_us": {
+   "push": 8.18,
+   "lamport": 5.64,
+   "push2d": 8.41,
+   "mc": 8.1,
+   "ce": 30.84,
+   "nccl": 24.87
+  },
+  "notes": "NCCL 24.9 us"
+ },
+ {
+  "case": "comm-210",
+  "primitive": "RS",
+  "kind": "rs",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense RS",
+   "embed:embed RS",
+   "kda:o_proj RS",
+   "moe:MoE-dense RS"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 3670016,
+  "bytes_actual": 3670016,
+  "hops": 0,
+  "measured_us": 10.399,
+  "variant": "lamport_sum",
+  "t_sol_us": 3.88,
+  "t_ach_us": 4.33,
+  "derate": 2.403,
+  "measured_over_sol": 2.68,
+  "all_variants_us": {
+   "nvls_tri": 20.28,
+   "lamport_sum": 10.4,
+   "push_sum": 13.03,
+   "dbg_push_only": 9.15,
+   "dbg_sum_only": 3.35,
+   "nccl": 31.81
+  },
+  "notes": "KERNEL-DEBUG derate 2.40; harness floor: Lamport exchange kernel + counter kernel (2 graph nodes, ~5 us) + separate torch.sum kernel (2-3 us); production SpReduceScatter fuses the owner sum into the exchange, model charges one 2.9 us hop; NCCL 31.8 us"
+ },
+ {
+  "case": "comm-211",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dense:dense AG",
+   "final:final AG (rows consumed)",
+   "kda:SP AG",
+   "moe:MoE-dense AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 163,
+  "bytes_param": 1835008,
+  "bytes_actual": 1835008,
+  "hops": 1,
+  "measured_us": 7.14,
+  "variant": "lamport",
+  "t_sol_us": 3.88,
+  "t_ach_us": 4.33,
+  "derate": 1.65,
+  "measured_over_sol": 1.84,
+  "all_variants_us": {
+   "push": 9.2,
+   "lamport": 7.14,
+   "push2d": 9.3,
+   "mc": 10.73,
+   "ce": 32.61,
+   "nccl": 39.04
+  },
+  "notes": "NCCL 39.0 us"
+ },
+ {
+  "case": "comm-221",
+  "primitive": "P14 TP-MoE front AG",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 1376256,
+  "bytes_actual": 1376256,
+  "hops": 1,
+  "measured_us": 24.885,
+  "variant": "mc",
+  "t_sol_us": 14.33,
+  "t_ach_us": 19.87,
+  "derate": 1.252,
+  "measured_over_sol": 1.737,
+  "all_variants_us": {
+   "push": 29.82,
+   "lamport": 30.39,
+   "push2d": 28.22,
+   "mc": 24.89,
+   "ce": 291.32,
+   "nccl": 72.6
+  },
+  "notes": "NCCL 72.6 us"
+ },
+ {
+  "case": "comm-222",
+  "primitive": "P8 DCP top-k merge",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:exact top-k merge"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 3145728,
+  "bytes_actual": 3145728,
+  "hops": 2,
+  "measured_us": 57.471,
+  "variant": "push2d",
+  "t_sol_us": 31.93,
+  "t_ach_us": 44.46,
+  "derate": 1.293,
+  "measured_over_sol": 1.8,
+  "all_variants_us": {
+   "push": 58.37,
+   "lamport": 84.7,
+   "push2d": 57.47,
+   "pull": 70.57,
+   "ce": 314.53,
+   "nccl": 145.41
+  },
+  "notes": "NCCL 145.4 us"
+ },
+ {
+  "case": "comm-225",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 5376,
+  "bytes_actual": 5376,
+  "hops": 1,
+  "measured_us": 5.291,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 3.1,
+  "derate": 1.706,
+  "measured_over_sol": 1.837,
+  "all_variants_us": {
+   "push": 12.99,
+   "lamport": 5.29,
+   "push2d": 8.34,
+   "pull": 10.26,
+   "ce": 40.23,
+   "nccl": 24.95
+  },
+  "notes": "NCCL 24.9 us"
+ },
+ {
+  "case": "comm-226",
+  "primitive": "P7b DCP value push",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:proj value combine"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 3194880,
+  "bytes_actual": 3194880,
+  "hops": 1,
+  "measured_us": 53.69,
+  "variant": "push2d",
+  "t_sol_us": 29.48,
+  "t_ach_us": 41.69,
+  "derate": 1.288,
+  "measured_over_sol": 1.821,
+  "all_variants_us": {
+   "push": 54.01,
+   "lamport": 79.19,
+   "push2d": 53.69,
+   "pull": 66.98,
+   "ce": 306.56,
+   "nccl": 151.13
+  },
+  "notes": "NCCL 151.1 us"
+ },
+ {
+  "case": "comm-227",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 3584,
+  "bytes_actual": 3584,
+  "hops": 1,
+  "measured_us": 5.244,
+  "variant": "lamport",
+  "t_sol_us": 2.87,
+  "t_ach_us": 3.09,
+  "derate": 1.696,
+  "measured_over_sol": 1.827,
+  "all_variants_us": {
+   "push": 12.88,
+   "lamport": 5.24,
+   "push2d": 8.14,
+   "pull": 10.21,
+   "ce": 39.95,
+   "nccl": 39.46
+  },
+  "notes": "NCCL 39.5 us"
+ },
+ {
+  "case": "comm-230",
+  "primitive": "P9 ShardQ ctx push (CE)",
+  "kind": "a2a_ce",
+  "N": 8,
+  "topology": [
+   "P1",
+   "P9"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:context gather"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 18940556,
+  "bytes_actual": 18940608,
+  "hops": 1,
+  "measured_us": 275.343,
+  "variant": "ce",
+  "t_sol_us": 76.52,
+  "t_ach_us": 109.14,
+  "derate": 2.523,
+  "measured_over_sol": 3.598,
+  "all_variants_us": {
+   "push": 146.49,
+   "push2d": 150.28,
+   "pull": 168.64,
+   "ce": 275.34
+  },
+  "notes": "KERNEL-DEBUG derate 2.52; copy-engine path: one cudaMemcpy node per peer, CE peer-write rate 0.27-0.75 TB/s and ~16 us per copy node at N=16; SM push does it in 147 us. Runs async (CE) in production so it may hide under attention, but its own time is 2.5x t_ach"
+ },
+ {
+  "case": "comm-234",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "mxfp4_release"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 15138816,
+  "bytes_actual": 15138816,
+  "hops": 2,
+  "measured_us": 119.683,
+  "variant": "push",
+  "t_sol_us": 64.59,
+  "t_ach_us": 90.92,
+  "derate": 1.316,
+  "measured_over_sol": 1.853,
+  "all_variants_us": {
+   "push": 119.68,
+   "push2d": 121.04,
+   "pull": 132.55,
+   "ce": 251.63,
+   "nccl": 312.98
+  },
+  "notes": "NCCL 313.0 us"
+ },
+ {
+  "case": "comm-238",
+  "primitive": "P13 DSA-DP push_in",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_in rows to owner"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 0,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 4.225,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.93,
+  "derate": 1.441,
+  "measured_over_sol": 1.477,
+  "all_variants_us": {
+   "push": 9.02,
+   "lamport": 4.22,
+   "push2d": 7.58,
+   "pull": 9.42,
+   "ce": 26.01,
+   "nccl": 29.4
+  },
+  "notes": "NCCL 29.4 us"
+ },
+ {
+  "case": "comm-239",
+  "primitive": "P13 DSA-DP push_out",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_out owner rows"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 0,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 4.225,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.93,
+  "derate": 1.441,
+  "measured_over_sol": 1.477,
+  "all_variants_us": {
+   "push": 9.02,
+   "lamport": 4.22,
+   "push2d": 7.58,
+   "pull": 9.42,
+   "ce": 26.01,
+   "nccl": 29.4
+  },
+  "notes": "NCCL 29.4 us"
+ },
+ {
+  "case": "comm-243",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 10752,
+  "bytes_actual": 10752,
+  "hops": 1,
+  "measured_us": 5.263,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 2.96,
+  "derate": 1.78,
+  "measured_over_sol": 1.827,
+  "all_variants_us": {
+   "push": 9.72,
+   "lamport": 5.26,
+   "push2d": 8.14,
+   "pull": 10.2,
+   "ce": 27.18,
+   "nccl": 36.19
+  },
+  "notes": "NCCL 36.2 us"
+ },
+ {
+  "case": "comm-244",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 7168,
+  "bytes_actual": 7168,
+  "hops": 1,
+  "measured_us": 5.25,
+  "variant": "lamport",
+  "t_sol_us": 2.87,
+  "t_ach_us": 2.95,
+  "derate": 1.781,
+  "measured_over_sol": 1.829,
+  "all_variants_us": {
+   "push": 9.72,
+   "lamport": 5.25,
+   "push2d": 8.2,
+   "pull": 10.17,
+   "ce": 26.66,
+   "nccl": 94.33
+  },
+  "notes": "NCCL 94.3 us"
+ },
+ {
+  "case": "comm-253",
+  "primitive": "P8 DCP top-k merge",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:exact top-k merge"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 786432,
+  "bytes_actual": 786432,
+  "hops": 2,
+  "measured_us": 23.716,
+  "variant": "lamport",
+  "t_sol_us": 12.27,
+  "t_ach_us": 16.15,
+  "derate": 1.469,
+  "measured_over_sol": 1.933,
+  "all_variants_us": {
+   "push": 27.12,
+   "lamport": 23.72,
+   "push2d": 24.31,
+   "pull": 31.34,
+   "ce": 272.72,
+   "nccl": 52.5
+  },
+  "notes": "NCCL 52.5 us"
+ },
+ {
+  "case": "comm-257",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 43008,
+  "bytes_actual": 43008,
+  "hops": 1,
+  "measured_us": 5.848,
+  "variant": "lamport",
+  "t_sol_us": 3.03,
+  "t_ach_us": 3.31,
+  "derate": 1.765,
+  "measured_over_sol": 1.93,
+  "all_variants_us": {
+   "push": 13.39,
+   "lamport": 5.85,
+   "push2d": 8.76,
+   "pull": 10.62,
+   "ce": 130.89,
+   "nccl": 34.95
+  },
+  "notes": "NCCL 35.0 us"
+ },
+ {
+  "case": "comm-258",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 28672,
+  "bytes_actual": 28672,
+  "hops": 1,
+  "measured_us": 5.681,
+  "variant": "lamport",
+  "t_sol_us": 2.97,
+  "t_ach_us": 3.23,
+  "derate": 1.757,
+  "measured_over_sol": 1.913,
+  "all_variants_us": {
+   "push": 13.2,
+   "lamport": 5.68,
+   "push2d": 8.6,
+   "pull": 10.63,
+   "ce": 130.49,
+   "nccl": 25.75
+  },
+  "notes": "NCCL 25.8 us"
+ },
+ {
+  "case": "comm-262",
+  "primitive": "P14 TP-MoE front AG",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent AG"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 344064,
+  "bytes_actual": 344064,
+  "hops": 1,
+  "measured_us": 10.844,
+  "variant": "lamport",
+  "t_sol_us": 5.73,
+  "t_ach_us": 7.48,
+  "derate": 1.449,
+  "measured_over_sol": 1.892,
+  "all_variants_us": {
+   "push": 15.12,
+   "lamport": 10.84,
+   "push2d": 13.45,
+   "mc": 10.86,
+   "ce": 260.38,
+   "nccl": 66.55
+  },
+  "notes": "NCCL 66.6 us"
+ },
+ {
+  "case": "comm-266",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 86016,
+  "bytes_actual": 86016,
+  "hops": 1,
+  "measured_us": 5.572,
+  "variant": "lamport",
+  "t_sol_us": 3.0,
+  "t_ach_us": 3.14,
+  "derate": 1.776,
+  "measured_over_sol": 1.857,
+  "all_variants_us": {
+   "push": 9.95,
+   "lamport": 5.57,
+   "push2d": 8.27,
+   "pull": 10.3,
+   "ce": 63.28,
+   "nccl": 33.0
+  },
+  "notes": "NCCL 33.0 us"
+ },
+ {
+  "case": "comm-271",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 57344,
+  "bytes_actual": 57344,
+  "hops": 1,
+  "measured_us": 5.498,
+  "variant": "lamport",
+  "t_sol_us": 2.96,
+  "t_ach_us": 3.07,
+  "derate": 1.792,
+  "measured_over_sol": 1.857,
+  "all_variants_us": {
+   "push": 9.91,
+   "lamport": 5.5,
+   "push2d": 8.35,
+   "pull": 10.13,
+   "ce": 62.9,
+   "nccl": 32.85
+  },
+  "notes": "NCCL 32.9 us"
+ },
+ {
+  "case": "comm-276",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 21504,
+  "bytes_actual": 21504,
+  "hops": 1,
+  "measured_us": 5.178,
+  "variant": "lamport",
+  "t_sol_us": 2.87,
+  "t_ach_us": 2.88,
+  "derate": 1.8,
+  "measured_over_sol": 1.804,
+  "all_variants_us": {
+   "push": 8.17,
+   "lamport": 5.18,
+   "push2d": 7.96,
+   "pull": 9.88,
+   "ce": 31.11,
+   "nccl": 36.75
+  },
+  "notes": "NCCL 36.8 us"
+ },
+ {
+  "case": "comm-277",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 14336,
+  "bytes_actual": 14336,
+  "hops": 1,
+  "measured_us": 5.05,
+  "variant": "lamport",
+  "t_sol_us": 2.87,
+  "t_ach_us": 2.87,
+  "derate": 1.759,
+  "measured_over_sol": 1.76,
+  "all_variants_us": {
+   "push": 8.09,
+   "lamport": 5.05,
+   "push2d": 8.02,
+   "pull": 9.59,
+   "ce": 20.05,
+   "nccl": 36.25
+  },
+  "notes": "NCCL 36.3 us"
+ },
+ {
+  "case": "comm-280",
+  "primitive": "P6 DCP q publish",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:FP8 MQA q publish"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 7077888,
+  "bytes_actual": 7077888,
+  "hops": 1,
+  "measured_us": 26.876,
+  "variant": "push2d",
+  "t_sol_us": 14.66,
+  "t_ach_us": 19.92,
+  "derate": 1.349,
+  "measured_over_sol": 1.833,
+  "all_variants_us": {
+   "push": 27.87,
+   "push2d": 26.88,
+   "mc": 31.09,
+   "ce": 99.46,
+   "nccl": 89.04
+  },
+  "notes": "NCCL 89.0 us"
+ },
+ {
+  "case": "comm-281",
+  "primitive": "P7b DCP value push",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:proj value combine"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 798720,
+  "bytes_actual": 798720,
+  "hops": 1,
+  "measured_us": 19.094,
+  "variant": "lamport",
+  "t_sol_us": 9.52,
+  "t_ach_us": 12.94,
+  "derate": 1.476,
+  "measured_over_sol": 2.006,
+  "all_variants_us": {
+   "push": 22.0,
+   "lamport": 19.09,
+   "push2d": 19.93,
+   "pull": 26.46,
+   "ce": 264.85,
+   "nccl": 52.95
+  },
+  "notes": "NCCL 53.0 us"
+ },
+ {
+  "case": "comm-287",
+  "primitive": "P11 EP-dispatch",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:MegaMoE dispatch"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 8257536,
+  "bytes_actual": 8257536,
+  "hops": 2,
+  "measured_us": 71.847,
+  "variant": "push2d",
+  "t_sol_us": 37.83,
+  "t_ach_us": 52.39,
+  "derate": 1.371,
+  "measured_over_sol": 1.899,
+  "all_variants_us": {
+   "push": 72.03,
+   "push2d": 71.85,
+   "pull": 82.72,
+   "ce": 203.6,
+   "nccl": 180.95
+  },
+  "notes": "NCCL 180.9 us"
+ },
+ {
+  "case": "comm-288",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 172032,
+  "bytes_actual": 172032,
+  "hops": 1,
+  "measured_us": 5.397,
+  "variant": "lamport",
+  "t_sol_us": 2.96,
+  "t_ach_us": 3.0,
+  "derate": 1.8,
+  "measured_over_sol": 1.823,
+  "all_variants_us": {
+   "push": 8.37,
+   "lamport": 5.4,
+   "push2d": 8.31,
+   "pull": 10.1,
+   "ce": 31.53,
+   "nccl": 37.84
+  },
+  "notes": "NCCL 37.8 us"
+ },
+ {
+  "case": "comm-293",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 114688,
+  "bytes_actual": 114688,
+  "hops": 1,
+  "measured_us": 5.236,
+  "variant": "lamport",
+  "t_sol_us": 2.92,
+  "t_ach_us": 2.95,
+  "derate": 1.774,
+  "measured_over_sol": 1.793,
+  "all_variants_us": {
+   "push": 8.28,
+   "lamport": 5.24,
+   "push2d": 8.35,
+   "pull": 10.17,
+   "ce": 31.21,
+   "nccl": 27.57
+  },
+  "notes": "NCCL 27.6 us"
+ },
+ {
+  "case": "comm-300",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P1",
+  "count_per_step": 11,
+  "bytes_param": 5505024,
+  "bytes_actual": 5505024,
+  "hops": 0,
+  "measured_us": 20.959,
+  "variant": "nvls_tri",
+  "t_sol_us": 9.54,
+  "t_ach_us": 12.47,
+  "derate": 1.681,
+  "measured_over_sol": 2.197,
+  "all_variants_us": {
+   "nvls_tri": 20.96,
+   "lamport_twoshot": 21.04,
+   "torch_multimem": 50.06,
+   "torch_twoshot": 35.09,
+   "torch_oneshot": 110.51,
+   "nccl": 53.92
+  },
+  "notes": "NCCL 53.9 us"
+ },
+ {
+  "case": "comm-304",
+  "primitive": "P13 DSA-DP push_in",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_in rows to owner"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 0,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 4.491,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.07,
+  "derate": 1.462,
+  "measured_over_sol": 1.57,
+  "all_variants_us": {
+   "push": 12.29,
+   "lamport": 4.49,
+   "push2d": 7.75,
+   "pull": 9.73,
+   "ce": 39.94,
+   "nccl": 32.87
+  },
+  "notes": "NCCL 32.9 us"
+ },
+ {
+  "case": "comm-305",
+  "primitive": "P13 DSA-DP push_out",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_out owner rows"
+  ],
+  "priority": "P1",
+  "count_per_step": 24,
+  "bytes_param": 0,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 4.491,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.07,
+  "derate": 1.462,
+  "measured_over_sol": 1.57,
+  "all_variants_us": {
+   "push": 12.29,
+   "lamport": 4.49,
+   "push2d": 7.75,
+   "pull": 9.73,
+   "ce": 39.94,
+   "nccl": 32.87
+  },
+  "notes": "NCCL 32.9 us"
+ },
+ {
+  "case": "comm-306",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 344064,
+  "bytes_actual": 344064,
+  "hops": 1,
+  "measured_us": 6.267,
+  "variant": "lamport",
+  "t_sol_us": 3.43,
+  "t_ach_us": 3.76,
+  "derate": 1.669,
+  "measured_over_sol": 1.827,
+  "all_variants_us": {
+   "push": 9.9,
+   "lamport": 6.27,
+   "push2d": 9.0,
+   "pull": 10.8,
+   "ce": 63.15,
+   "nccl": 38.26
+  },
+  "notes": "NCCL 38.3 us"
+ },
+ {
+  "case": "comm-308",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 2688,
+  "bytes_actual": 2688,
+  "hops": 1,
+  "measured_us": 5.653,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 3.39,
+  "derate": 1.669,
+  "measured_over_sol": 1.963,
+  "all_variants_us": {
+   "push": 18.27,
+   "lamport": 5.65,
+   "push2d": 8.33,
+   "pull": 10.44,
+   "ce": 64.95,
+   "nccl": 38.33
+  },
+  "notes": "NCCL 38.3 us"
+ },
+ {
+  "case": "comm-309",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 1792,
+  "bytes_actual": 1792,
+  "hops": 1,
+  "measured_us": 5.752,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 3.38,
+  "derate": 1.704,
+  "measured_over_sol": 1.997,
+  "all_variants_us": {
+   "push": 18.22,
+   "lamport": 5.75,
+   "push2d": 8.41,
+   "pull": 10.41,
+   "ce": 64.31,
+   "nccl": 26.06
+  },
+  "notes": "NCCL 26.1 us"
+ },
+ {
+  "case": "comm-311",
+  "primitive": "P13 DSA-DP push_in",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_in rows to owner"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 58720256,
+  "bytes_actual": 58720256,
+  "hops": 1,
+  "measured_us": 64.823,
+  "variant": "push2d",
+  "t_sol_us": 35.48,
+  "t_ach_us": 49.84,
+  "derate": 1.301,
+  "measured_over_sol": 1.827,
+  "all_variants_us": {
+   "push": 65.95,
+   "push2d": 64.82,
+   "pull": 85.37,
+   "ce": 92.2,
+   "nccl": 305.07
+  },
+  "notes": "NCCL 305.1 us"
+ },
+ {
+  "case": "comm-312",
+  "primitive": "P13 DSA-DP push_out",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_out owner rows"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 58720256,
+  "bytes_actual": 58720256,
+  "hops": 1,
+  "measured_us": 64.823,
+  "variant": "push2d",
+  "t_sol_us": 35.48,
+  "t_ach_us": 49.84,
+  "derate": 1.301,
+  "measured_over_sol": 1.827,
+  "all_variants_us": {
+   "push": 65.95,
+   "push2d": 64.82,
+   "pull": 85.37,
+   "ce": 92.2,
+   "nccl": 305.07
+  },
+  "notes": "NCCL 305.1 us"
+ },
+ {
+  "case": "comm-314",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 172032,
+  "bytes_actual": 172032,
+  "hops": 1,
+  "measured_us": 6.538,
+  "variant": "lamport",
+  "t_sol_us": 3.53,
+  "t_ach_us": 4.04,
+  "derate": 1.62,
+  "measured_over_sol": 1.852,
+  "all_variants_us": {
+   "push": 13.51,
+   "lamport": 6.54,
+   "push2d": 9.27,
+   "pull": 11.15,
+   "ce": 131.74,
+   "nccl": 27.89
+  },
+  "notes": "NCCL 27.9 us"
+ },
+ {
+  "case": "comm-315",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 688128,
+  "bytes_actual": 688128,
+  "hops": 1,
+  "measured_us": 5.82,
+  "variant": "lamport",
+  "t_sol_us": 3.24,
+  "t_ach_us": 3.41,
+  "derate": 1.706,
+  "measured_over_sol": 1.796,
+  "all_variants_us": {
+   "push": 8.5,
+   "lamport": 5.82,
+   "push2d": 8.55,
+   "pull": 10.46,
+   "ce": 32.36,
+   "nccl": 36.7
+  },
+  "notes": "NCCL 36.7 us"
+ },
+ {
+  "case": "comm-316",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 229376,
+  "bytes_actual": 229376,
+  "hops": 1,
+  "measured_us": 5.992,
+  "variant": "lamport",
+  "t_sol_us": 3.24,
+  "t_ach_us": 3.48,
+  "derate": 1.721,
+  "measured_over_sol": 1.849,
+  "all_variants_us": {
+   "push": 10.08,
+   "lamport": 5.99,
+   "push2d": 8.52,
+   "pull": 10.41,
+   "ce": 63.66,
+   "nccl": 25.07
+  },
+  "notes": "NCCL 25.1 us"
+ },
+ {
+  "case": "comm-323",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P1",
+  "count_per_step": 92,
+  "bytes_param": 458752,
+  "bytes_actual": 458752,
+  "hops": 1,
+  "measured_us": 5.599,
+  "variant": "lamport",
+  "t_sol_us": 3.12,
+  "t_ach_us": 3.23,
+  "derate": 1.735,
+  "measured_over_sol": 1.795,
+  "all_variants_us": {
+   "push": 8.42,
+   "lamport": 5.6,
+   "push2d": 8.34,
+   "pull": 10.14,
+   "ce": 31.3,
+   "nccl": 36.98
+  },
+  "notes": "NCCL 37.0 us"
+ },
+ {
+  "case": "comm-327",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 114688,
+  "bytes_actual": 114688,
+  "hops": 1,
+  "measured_us": 6.219,
+  "variant": "lamport",
+  "t_sol_us": 3.31,
+  "t_ach_us": 3.71,
+  "derate": 1.674,
+  "measured_over_sol": 1.879,
+  "all_variants_us": {
+   "push": 13.44,
+   "lamport": 6.22,
+   "push2d": 8.88,
+   "pull": 10.84,
+   "ce": 132.5,
+   "nccl": 35.06
+  },
+  "notes": "NCCL 35.1 us"
+ },
+ {
+  "case": "comm-333",
+  "primitive": "P13 DSA-DP push_in",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_in rows to owner"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 0,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 3.863,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.86,
+  "derate": 1.351,
+  "measured_over_sol": 1.351,
+  "all_variants_us": {
+   "push": 7.63,
+   "lamport": 3.86,
+   "push2d": 7.49,
+   "pull": 9.01,
+   "ce": 19.62,
+   "nccl": 23.26
+  },
+  "notes": "NCCL 23.3 us"
+ },
+ {
+  "case": "comm-334",
+  "primitive": "P13 DSA-DP push_out",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:push_out owner rows"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 0,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 3.863,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.86,
+  "derate": 1.351,
+  "measured_over_sol": 1.351,
+  "all_variants_us": {
+   "push": 7.63,
+   "lamport": 3.86,
+   "push2d": 7.49,
+   "pull": 9.01,
+   "ce": 19.62,
+   "nccl": 23.26
+  },
+  "notes": "NCCL 23.3 us"
+ },
+ {
+  "case": "comm-343",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 22020096,
+  "bytes_actual": 22020096,
+  "hops": 0,
+  "measured_us": 48.191,
+  "variant": "nvls_tri",
+  "t_sol_us": 18.72,
+  "t_ach_us": 39.74,
+  "derate": 1.213,
+  "measured_over_sol": 2.574,
+  "all_variants_us": {
+   "nvls_tri": 48.19,
+   "lamport_twoshot": 66.24,
+   "torch_multimem": 52.8,
+   "torch_twoshot": 108.45,
+   "nccl": 100.73
+  },
+  "notes": "NCCL 100.7 us"
+ },
+ {
+  "case": "comm-350",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 1376256,
+  "bytes_actual": 1376256,
+  "hops": 0,
+  "measured_us": 11.951,
+  "variant": "lamport_oneshot",
+  "t_sol_us": 5.15,
+  "t_ach_us": 6.23,
+  "derate": 1.917,
+  "measured_over_sol": 2.321,
+  "all_variants_us": {
+   "nvls_tri": 16.38,
+   "lamport_oneshot": 11.95,
+   "lamport_twoshot": 13.62,
+   "torch_multimem": 23.71,
+   "torch_twoshot": 20.07,
+   "torch_oneshot": 41.43,
+   "nccl": 38.14
+  },
+  "notes": "NCCL 38.1 us"
+ },
+ {
+  "case": "comm-351",
+  "primitive": "P8 DCP top-k merge",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:exact top-k merge"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 98304,
+  "bytes_actual": 98304,
+  "hops": 2,
+  "measured_us": 12.1,
+  "variant": "lamport",
+  "t_sol_us": 6.54,
+  "t_ach_us": 7.89,
+  "derate": 1.534,
+  "measured_over_sol": 1.85,
+  "all_variants_us": {
+   "push": 24.63,
+   "lamport": 12.1,
+   "push2d": 15.04,
+   "pull": 17.07,
+   "ce": 259.49,
+   "nccl": 28.91
+  },
+  "notes": "NCCL 28.9 us"
+ },
+ {
+  "case": "comm-354",
+  "primitive": "P8 DCP top-k merge",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:exact top-k merge"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 24576,
+  "bytes_actual": 24576,
+  "hops": 2,
+  "measured_us": 10.268,
+  "variant": "lamport",
+  "t_sol_us": 5.76,
+  "t_ach_us": 5.92,
+  "derate": 1.734,
+  "measured_over_sol": 1.783,
+  "all_variants_us": {
+   "push": 15.06,
+   "lamport": 10.27,
+   "push2d": 13.64,
+   "pull": 15.43,
+   "ce": 69.13,
+   "nccl": 25.93
+  },
+  "notes": "NCCL 25.9 us"
+ },
+ {
+  "case": "comm-366",
+  "primitive": "P7b DCP value push",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:proj value combine"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 3194880,
+  "bytes_actual": 3194880,
+  "hops": 1,
+  "measured_us": 16.402,
+  "variant": "push2d",
+  "t_sol_us": 8.19,
+  "t_ach_us": 10.6,
+  "derate": 1.548,
+  "measured_over_sol": 2.003,
+  "all_variants_us": {
+   "push": 16.45,
+   "lamport": 16.61,
+   "push2d": 16.4,
+   "pull": 23.2,
+   "ce": 73.62,
+   "nccl": 51.43
+  },
+  "notes": "NCCL 51.4 us"
+ },
+ {
+  "case": "comm-367",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 5505024,
+  "bytes_actual": 5505024,
+  "hops": 0,
+  "measured_us": 20.306,
+  "variant": "nvls_tri",
+  "t_sol_us": 8.97,
+  "t_ach_us": 14.97,
+  "derate": 1.357,
+  "measured_over_sol": 2.264,
+  "all_variants_us": {
+   "nvls_tri": 20.31,
+   "lamport_twoshot": 24.26,
+   "torch_multimem": 25.26,
+   "torch_twoshot": 41.18,
+   "torch_oneshot": 1147.84,
+   "nccl": 60.71
+  },
+  "notes": "NCCL 60.7 us"
+ },
+ {
+  "case": "comm-375",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 21504,
+  "bytes_actual": 21504,
+  "hops": 1,
+  "measured_us": 6.184,
+  "variant": "lamport",
+  "t_sol_us": 3.04,
+  "t_ach_us": 3.61,
+  "derate": 1.712,
+  "measured_over_sol": 2.034,
+  "all_variants_us": {
+   "push": 18.68,
+   "lamport": 6.18,
+   "push2d": 8.75,
+   "pull": 10.74,
+   "ce": 253.44,
+   "nccl": 43.25
+  },
+  "notes": "NCCL 43.3 us"
+ },
+ {
+  "case": "comm-378",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 14336,
+  "bytes_actual": 14336,
+  "hops": 1,
+  "measured_us": 5.933,
+  "variant": "lamport",
+  "t_sol_us": 2.98,
+  "t_ach_us": 3.53,
+  "derate": 1.682,
+  "measured_over_sol": 1.991,
+  "all_variants_us": {
+   "push": 19.11,
+   "lamport": 5.93,
+   "push2d": 8.77,
+   "pull": 10.64,
+   "ce": 67.91,
+   "nccl": 33.23
+  },
+  "notes": "NCCL 33.2 us"
+ },
+ {
+  "case": "comm-381",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 11010048,
+  "bytes_actual": 11010048,
+  "hops": 0,
+  "measured_us": 29.725,
+  "variant": "nvls_tri",
+  "t_sol_us": 12.6,
+  "t_ach_us": 21.56,
+  "derate": 1.379,
+  "measured_over_sol": 2.359,
+  "all_variants_us": {
+   "nvls_tri": 29.73,
+   "lamport_twoshot": 34.65,
+   "torch_multimem": 51.09,
+   "torch_twoshot": 60.76,
+   "torch_oneshot": 529.67,
+   "nccl": 68.8
+  },
+  "notes": "NCCL 68.8 us"
+ },
+ {
+  "case": "comm-387",
+  "primitive": "P6 DCP q publish",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:FP8 MQA q publish"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 221184,
+  "bytes_actual": 221184,
+  "hops": 1,
+  "measured_us": 9.0,
+  "variant": "lamport",
+  "t_sol_us": 4.7,
+  "t_ach_us": 6.01,
+  "derate": 1.498,
+  "measured_over_sol": 1.915,
+  "all_variants_us": {
+   "push": 15.21,
+   "lamport": 9.0,
+   "push2d": 11.61,
+   "mc": 9.37,
+   "ce": 258.03,
+   "nccl": 53.57
+  },
+  "notes": "NCCL 53.6 us"
+ },
+ {
+  "case": "comm-393",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 172032,
+  "bytes_actual": 180224,
+  "hops": 0,
+  "measured_us": 7.572,
+  "variant": "lamport_oneshot",
+  "t_sol_us": 3.15,
+  "t_ach_us": 3.34,
+  "derate": 2.264,
+  "measured_over_sol": 2.404,
+  "all_variants_us": {
+   "nvls_tri": 15.83,
+   "lamport_oneshot": 7.57,
+   "lamport_twoshot": 11.81,
+   "torch_multimem": 14.77,
+   "torch_twoshot": 16.55,
+   "torch_oneshot": 19.43,
+   "nccl": 32.91
+  },
+  "notes": "KERNEL-DEBUG derate 2.26; harness floor: one-kernel Lamport all-gather (~5 us incl. counter node) + separate local sum kernel; model charges one 2.9 us hop for a fused one-shot; NCCL 32.9 us"
+ },
+ {
+  "case": "comm-396",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 2752512,
+  "bytes_actual": 2752512,
+  "hops": 0,
+  "measured_us": 17.434,
+  "variant": "lamport_twoshot",
+  "t_sol_us": 7.44,
+  "t_ach_us": 10.0,
+  "derate": 1.744,
+  "measured_over_sol": 2.343,
+  "all_variants_us": {
+   "nvls_tri": 17.58,
+   "lamport_oneshot": 34.1,
+   "lamport_twoshot": 17.43,
+   "torch_multimem": 24.49,
+   "torch_twoshot": 27.04,
+   "torch_oneshot": 145.1,
+   "nccl": 46.36
+  },
+  "notes": "NCCL 46.4 us"
+ },
+ {
+  "case": "comm-399",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:latent AR"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 458752,
+  "bytes_actual": 458752,
+  "hops": 0,
+  "measured_us": 14.086,
+  "variant": "lamport_twoshot",
+  "t_sol_us": 5.99,
+  "t_ach_us": 7.4,
+  "derate": 1.904,
+  "measured_over_sol": 2.352,
+  "all_variants_us": {
+   "nvls_tri": 15.99,
+   "lamport_oneshot": 15.62,
+   "lamport_twoshot": 14.09,
+   "torch_multimem": 15.29,
+   "torch_twoshot": 32.09,
+   "torch_oneshot": 138.85,
+   "nccl": 51.57
+  },
+  "notes": "NCCL 51.6 us"
+ },
+ {
+  "case": "comm-405",
+  "primitive": "P6 DCP q publish",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:FP8 MQA q publish"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 1769472,
+  "bytes_actual": 1769472,
+  "hops": 1,
+  "measured_us": 10.694,
+  "variant": "lamport",
+  "t_sol_us": 5.81,
+  "t_ach_us": 7.18,
+  "derate": 1.49,
+  "measured_over_sol": 1.841,
+  "all_variants_us": {
+   "push": 12.17,
+   "lamport": 10.69,
+   "push2d": 12.54,
+   "mc": 12.73,
+   "ce": 68.39,
+   "nccl": 68.62
+  },
+  "notes": "NCCL 68.6 us"
+ },
+ {
+  "case": "comm-409",
+  "primitive": "P8 DCP top-k merge",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:exact top-k merge"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 786432,
+  "bytes_actual": 786432,
+  "hops": 2,
+  "measured_us": 12.646,
+  "variant": "lamport",
+  "t_sol_us": 7.03,
+  "t_ach_us": 7.75,
+  "derate": 1.632,
+  "measured_over_sol": 1.799,
+  "all_variants_us": {
+   "push": 15.44,
+   "lamport": 12.65,
+   "push2d": 15.27,
+   "pull": 17.36,
+   "ce": 72.09,
+   "nccl": 39.77
+  },
+  "notes": "NCCL 39.8 us"
+ },
+ {
+  "case": "comm-424",
+  "primitive": "P8 DCP top-k merge",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:exact top-k merge"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 196608,
+  "bytes_actual": 196608,
+  "hops": 2,
+  "measured_us": 10.612,
+  "variant": "lamport",
+  "t_sol_us": 6.05,
+  "t_ach_us": 6.33,
+  "derate": 1.676,
+  "measured_over_sol": 1.754,
+  "all_variants_us": {
+   "push": 15.34,
+   "lamport": 10.61,
+   "push2d": 13.79,
+   "pull": 15.69,
+   "ce": 70.12,
+   "nccl": 37.96
+  },
+  "notes": "NCCL 38.0 us"
+ },
+ {
+  "case": "comm-425",
+  "primitive": "P7b DCP value push",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:proj value combine"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 99840,
+  "bytes_actual": 99840,
+  "hops": 1,
+  "measured_us": 6.765,
+  "variant": "lamport",
+  "t_sol_us": 3.69,
+  "t_ach_us": 4.55,
+  "derate": 1.486,
+  "measured_over_sol": 1.833,
+  "all_variants_us": {
+   "push": 19.2,
+   "lamport": 6.76,
+   "push2d": 9.76,
+   "pull": 11.47,
+   "ce": 254.77,
+   "nccl": 92.81
+  },
+  "notes": "NCCL 92.8 us"
+ },
+ {
+  "case": "comm-433",
+  "primitive": "P6 DCP q publish",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:FP8 MQA q publish"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 221184,
+  "bytes_actual": 221184,
+  "hops": 1,
+  "measured_us": 5.58,
+  "variant": "lamport",
+  "t_sol_us": 3.23,
+  "t_ach_us": 3.46,
+  "derate": 1.612,
+  "measured_over_sol": 1.728,
+  "all_variants_us": {
+   "push": 8.69,
+   "lamport": 5.58,
+   "push2d": 8.4,
+   "mc": 7.8,
+   "ce": 63.55,
+   "nccl": 38.08
+  },
+  "notes": "NCCL 38.1 us"
+ },
+ {
+  "case": "comm-437",
+  "primitive": "P5 ShardQ out gather",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:out gather"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 6291456,
+  "bytes_actual": 6291456,
+  "hops": 1,
+  "measured_us": 50.009,
+  "variant": "push",
+  "t_sol_us": 27.33,
+  "t_ach_us": 38.3,
+  "derate": 1.306,
+  "measured_over_sol": 1.83,
+  "all_variants_us": {
+   "push": 50.01,
+   "push2d": 51.31,
+   "pull": 61.62,
+   "ce": 187.17,
+   "nccl": 144.57
+  },
+  "notes": "NCCL 144.6 us"
+ },
+ {
+  "case": "comm-445",
+  "primitive": "P7b DCP value push",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:proj value combine"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 99840,
+  "bytes_actual": 99840,
+  "hops": 1,
+  "measured_us": 5.707,
+  "variant": "lamport",
+  "t_sol_us": 3.03,
+  "t_ach_us": 3.17,
+  "derate": 1.8,
+  "measured_over_sol": 1.883,
+  "all_variants_us": {
+   "push": 10.03,
+   "lamport": 5.71,
+   "push2d": 8.34,
+   "pull": 10.14,
+   "ce": 63.06,
+   "nccl": 32.56
+  },
+  "notes": "NCCL 32.6 us"
+ },
+ {
+  "case": "comm-467",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 344064,
+  "bytes_actual": 360448,
+  "hops": 0,
+  "measured_us": 10.262,
+  "variant": "lamport_oneshot",
+  "t_sol_us": 4.2,
+  "t_ach_us": 5.0,
+  "derate": 2.053,
+  "measured_over_sol": 2.443,
+  "all_variants_us": {
+   "nvls_tri": 16.25,
+   "lamport_oneshot": 10.26,
+   "lamport_twoshot": 12.77,
+   "torch_multimem": 15.1,
+   "torch_twoshot": 22.96,
+   "torch_oneshot": 36.25,
+   "nccl": 37.69
+  },
+  "notes": "KERNEL-DEBUG derate 2.05; harness floor: one-kernel Lamport all-gather (~5 us incl. counter node) + separate local sum kernel; model charges one 2.9 us hop for a fused one-shot; NCCL 37.7 us"
+ },
+ {
+  "case": "comm-473",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 688128,
+  "bytes_actual": 720896,
+  "hops": 0,
+  "measured_us": 14.698,
+  "variant": "lamport_twoshot",
+  "t_sol_us": 6.13,
+  "t_ach_us": 7.74,
+  "derate": 1.898,
+  "measured_over_sol": 2.398,
+  "all_variants_us": {
+   "nvls_tri": 16.19,
+   "lamport_oneshot": 20.59,
+   "lamport_twoshot": 14.7,
+   "torch_multimem": 15.54,
+   "torch_twoshot": 32.3,
+   "torch_oneshot": 180.14,
+   "nccl": 52.55
+  },
+  "notes": "NCCL 52.5 us"
+ },
+ {
+  "case": "comm-475",
+  "primitive": "P7b DCP value push",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "dsa:proj value combine"
+  ],
+  "priority": "P2",
+  "count_per_step": 24,
+  "bytes_param": 798720,
+  "bytes_actual": 798720,
+  "hops": 1,
+  "measured_us": 7.817,
+  "variant": "lamport",
+  "t_sol_us": 4.19,
+  "t_ach_us": 4.85,
+  "derate": 1.612,
+  "measured_over_sol": 1.866,
+  "all_variants_us": {
+   "push": 10.22,
+   "lamport": 7.82,
+   "push2d": 10.15,
+   "pull": 12.16,
+   "ce": 65.39,
+   "nccl": 38.91
+  },
+  "notes": "NCCL 38.9 us"
+ },
+ {
+  "case": "comm-483",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent col->row"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 86016,
+  "bytes_actual": 86016,
+  "hops": 1,
+  "measured_us": 6.766,
+  "variant": "lamport",
+  "t_sol_us": 3.58,
+  "t_ach_us": 4.39,
+  "derate": 1.542,
+  "measured_over_sol": 1.89,
+  "all_variants_us": {
+   "push": 19.31,
+   "lamport": 6.77,
+   "push2d": 9.75,
+   "pull": 11.68,
+   "ce": 257.43,
+   "nccl": 43.26
+  },
+  "notes": "NCCL 43.3 us"
+ },
+ {
+  "case": "comm-501",
+  "primitive": "P14 TP-MoE transpose",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:combined latent row->col (K-split latent_up)"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 57344,
+  "bytes_actual": 57344,
+  "hops": 1,
+  "measured_us": 6.58,
+  "variant": "lamport",
+  "t_sol_us": 3.34,
+  "t_ach_us": 4.04,
+  "derate": 1.628,
+  "measured_over_sol": 1.97,
+  "all_variants_us": {
+   "push": 19.43,
+   "lamport": 6.58,
+   "push2d": 9.58,
+   "pull": 11.24,
+   "ce": 251.74,
+   "nccl": 36.55
+  },
+  "notes": "NCCL 36.6 us"
+ },
+ {
+  "case": "comm-504",
+  "primitive": "P14 TP-MoE front AG",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "moe:router logits + latent AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 92,
+  "bytes_param": 43008,
+  "bytes_actual": 45056,
+  "hops": 1,
+  "measured_us": 6.071,
+  "variant": "lamport",
+  "t_sol_us": 3.22,
+  "t_ach_us": 3.87,
+  "derate": 1.568,
+  "measured_over_sol": 1.885,
+  "all_variants_us": {
+   "push": 15.12,
+   "lamport": 6.07,
+   "push2d": 9.1,
+   "mc": 7.87,
+   "ce": 254.64,
+   "nccl": 40.34
+  },
+  "notes": "NCCL 40.3 us"
+ },
+ {
+  "case": "comm-552",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 2752512,
+  "bytes_actual": 2752512,
+  "hops": 0,
+  "measured_us": 12.238,
+  "variant": "lamport_oneshot",
+  "t_sol_us": 4.39,
+  "t_ach_us": 5.06,
+  "derate": 2.418,
+  "measured_over_sol": 2.788,
+  "all_variants_us": {
+   "nvls_tri": 18.0,
+   "lamport_oneshot": 12.24,
+   "lamport_twoshot": 15.35,
+   "torch_multimem": 49.64,
+   "torch_twoshot": 44.61,
+   "torch_oneshot": 57.74,
+   "nccl": 34.66
+  },
+  "notes": "KERNEL-DEBUG derate 2.42; harness floor: one-kernel Lamport all-gather (~5 us incl. counter node) + separate local sum kernel; model charges one 2.9 us hop for a fused one-shot; NCCL 34.7 us"
+ },
+ {
+  "case": "comm-556",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 688128,
+  "bytes_actual": 688128,
+  "hops": 0,
+  "measured_us": 7.921,
+  "variant": "lamport_oneshot",
+  "t_sol_us": 3.24,
+  "t_ach_us": 3.41,
+  "derate": 2.322,
+  "measured_over_sol": 2.445,
+  "all_variants_us": {
+   "nvls_tri": 16.03,
+   "lamport_oneshot": 7.92,
+   "lamport_twoshot": 12.16,
+   "torch_multimem": 23.43,
+   "torch_twoshot": 17.89,
+   "torch_oneshot": 29.42,
+   "nccl": 36.79
+  },
+  "notes": "KERNEL-DEBUG derate 2.32; harness floor: one-kernel Lamport all-gather (~5 us incl. counter node) + separate local sum kernel; model charges one 2.9 us hop for a fused one-shot; NCCL 36.8 us"
+ },
+ {
+  "case": "comm-561",
+  "primitive": "AR",
+  "kind": "ar",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:ArNorm site 0",
+   "drafter:ArNorm site 1",
+   "drafter:ArNorm site 10",
+   "drafter:ArNorm site 2",
+   "drafter:ArNorm site 3",
+   "drafter:ArNorm site 4",
+   "drafter:ArNorm site 5",
+   "drafter:ArNorm site 6",
+   "drafter:ArNorm site 7",
+   "drafter:ArNorm site 8",
+   "drafter:ArNorm site 9"
+  ],
+  "priority": "P2",
+  "count_per_step": 11,
+  "bytes_param": 86016,
+  "bytes_actual": 90112,
+  "hops": 0,
+  "measured_us": 7.091,
+  "variant": "lamport_oneshot",
+  "t_sol_us": 2.91,
+  "t_ach_us": 2.93,
+  "derate": 2.421,
+  "measured_over_sol": 2.437,
+  "all_variants_us": {
+   "nvls_tri": 15.63,
+   "lamport_oneshot": 7.09,
+   "lamport_twoshot": 11.64,
+   "torch_multimem": 14.7,
+   "torch_twoshot": 14.85,
+   "torch_oneshot": 18.63,
+   "nccl": 36.04
+  },
+  "notes": "KERNEL-DEBUG derate 2.42; harness floor: one-kernel Lamport all-gather (~5 us incl. counter node) + separate local sum kernel; model charges one 2.9 us hop for a fused one-shot; NCCL 36.0 us"
+ },
+ {
+  "case": "comm-563",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 7064780,
+  "bytes_actual": 7065600,
+  "hops": 1,
+  "measured_us": 26.806,
+  "variant": "push2d",
+  "t_sol_us": 14.63,
+  "t_ach_us": 19.89,
+  "derate": 1.348,
+  "measured_over_sol": 1.832,
+  "all_variants_us": {
+   "push": 28.06,
+   "push2d": 26.81,
+   "mc": 30.95,
+   "ce": 99.41,
+   "nccl": 89.26
+  },
+  "notes": "NCCL 89.3 us"
+ },
+ {
+  "case": "comm-583",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 64,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 7.863,
+  "variant": "push2d",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.93,
+  "derate": 2.683,
+  "measured_over_sol": 2.749,
+  "all_variants_us": {
+   "push": 9.37,
+   "lamport": 63.04,
+   "push2d": 7.86,
+   "pull": 9.75,
+   "ce": 26.03,
+   "nccl": 37.29
+  },
+  "notes": "KERNEL-DEBUG derate 2.68; best variant is push2d/mc at the push+flag-barrier floor (~8 us, 2 kernels); the one-kernel Lamport variant hit a recurring ~63 us stall at this size (bench-kernel issue, not production code); NCCL 37.3 us"
+ },
+ {
+  "case": "comm-604",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 7064780,
+  "bytes_actual": 7065600,
+  "hops": 1,
+  "measured_us": 55.414,
+  "variant": "mc",
+  "t_sol_us": 30.33,
+  "t_ach_us": 42.63,
+  "derate": 1.3,
+  "measured_over_sol": 1.827,
+  "all_variants_us": {
+   "push": 65.72,
+   "push2d": 55.73,
+   "mc": 55.41,
+   "ce": 257.53,
+   "nccl": 174.07
+  },
+  "notes": "NCCL 174.1 us"
+ },
+ {
+  "case": "comm-620",
+  "primitive": "P19 DP sync",
+  "kind": "bar",
+  "N": 16,
+  "topology": [
+   "D3",
+   "D4-16",
+   "D5",
+   "P2",
+   "P3-16",
+   "P4-2",
+   "P9"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "step:EP lock-step sync"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 0,
+  "bytes_actual": 0,
+  "hops": 1,
+  "measured_us": 5.686,
+  "variant": "barrier",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.35,
+  "derate": 1.695,
+  "measured_over_sol": 1.988,
+  "all_variants_us": {
+   "barrier": 5.69,
+   "torch_barrier": 3.96
+  },
+  "notes": ""
+ },
+ {
+  "case": "comm-623",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 512,
+  "bytes_actual": 512,
+  "hops": 1,
+  "measured_us": 4.884,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.93,
+  "derate": 1.666,
+  "measured_over_sol": 1.708,
+  "all_variants_us": {
+   "push": 9.4,
+   "lamport": 4.88,
+   "push2d": 7.89,
+   "pull": 9.9,
+   "ce": 26.16,
+   "nccl": 29.84
+  },
+  "notes": "NCCL 29.8 us"
+ },
+ {
+  "case": "comm-633",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 22040476,
+  "bytes_actual": 22040576,
+  "hops": 1,
+  "measured_us": 71.208,
+  "variant": "push2d",
+  "t_sol_us": 39.59,
+  "t_ach_us": 55.83,
+  "derate": 1.275,
+  "measured_over_sol": 1.799,
+  "all_variants_us": {
+   "push": 71.72,
+   "push2d": 71.21,
+   "mc": 84.78,
+   "ce": 190.31,
+   "nccl": 182.32
+  },
+  "notes": "NCCL 182.3 us"
+ },
+ {
+  "case": "comm-635",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1600,
+  "bytes_actual": 1600,
+  "hops": 2,
+  "measured_us": 9.665,
+  "variant": "lamport",
+  "t_sol_us": 5.72,
+  "t_ach_us": 5.87,
+  "derate": 1.648,
+  "measured_over_sol": 1.69,
+  "all_variants_us": {
+   "push": 14.8,
+   "lamport": 9.66,
+   "push2d": 13.17,
+   "pull": 15.08,
+   "ce": 33.27,
+   "nccl": 90.59
+  },
+  "notes": "NCCL 90.6 us"
+ },
+ {
+  "case": "comm-647",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1766195,
+  "bytes_actual": 1769472,
+  "hops": 1,
+  "measured_us": 10.534,
+  "variant": "lamport",
+  "t_sol_us": 5.8,
+  "t_ach_us": 7.17,
+  "derate": 1.469,
+  "measured_over_sol": 1.816,
+  "all_variants_us": {
+   "push": 12.19,
+   "lamport": 10.53,
+   "push2d": 12.5,
+   "mc": 12.45,
+   "ce": 68.5,
+   "nccl": 68.67
+  },
+  "notes": "NCCL 68.7 us"
+ },
+ {
+  "case": "comm-660",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 2048,
+  "bytes_actual": 2048,
+  "hops": 1,
+  "measured_us": 4.815,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.94,
+  "derate": 1.64,
+  "measured_over_sol": 1.684,
+  "all_variants_us": {
+   "push": 9.43,
+   "lamport": 4.82,
+   "push2d": 7.92,
+   "pull": 9.94,
+   "ce": 26.0,
+   "nccl": 31.9
+  },
+  "notes": "NCCL 31.9 us"
+ },
+ {
+  "case": "comm-669",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 12800,
+  "bytes_actual": 12800,
+  "hops": 2,
+  "measured_us": 10.225,
+  "variant": "lamport",
+  "t_sol_us": 5.74,
+  "t_ach_us": 5.89,
+  "derate": 1.735,
+  "measured_over_sol": 1.781,
+  "all_variants_us": {
+   "push": 15.07,
+   "lamport": 10.22,
+   "push2d": 13.44,
+   "pull": 15.41,
+   "ce": 32.35,
+   "nccl": 37.91
+  },
+  "notes": "NCCL 37.9 us"
+ },
+ {
+  "case": "comm-671",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1766195,
+  "bytes_actual": 1769472,
+  "hops": 1,
+  "measured_us": 18.575,
+  "variant": "mc",
+  "t_sol_us": 9.73,
+  "t_ach_us": 12.96,
+  "derate": 1.433,
+  "measured_over_sol": 1.909,
+  "all_variants_us": {
+   "push": 20.73,
+   "lamport": 20.14,
+   "push2d": 20.03,
+   "mc": 18.57,
+   "ce": 143.41,
+   "nccl": 129.2
+  },
+  "notes": "NCCL 129.2 us"
+ },
+ {
+  "case": "comm-678",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 128,
+  "bytes_actual": 128,
+  "hops": 1,
+  "measured_us": 5.012,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.07,
+  "derate": 1.631,
+  "measured_over_sol": 1.752,
+  "all_variants_us": {
+   "push": 12.32,
+   "lamport": 5.01,
+   "push2d": 8.11,
+   "pull": 10.14,
+   "ce": 40.21,
+   "nccl": 31.68
+  },
+  "notes": "NCCL 31.7 us"
+ },
+ {
+  "case": "comm-686",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 220774,
+  "bytes_actual": 221184,
+  "hops": 1,
+  "measured_us": 5.561,
+  "variant": "lamport",
+  "t_sol_us": 3.23,
+  "t_ach_us": 3.46,
+  "derate": 1.607,
+  "measured_over_sol": 1.722,
+  "all_variants_us": {
+   "push": 8.86,
+   "lamport": 5.56,
+   "push2d": 8.41,
+   "mc": 7.85,
+   "ce": 63.61,
+   "nccl": 37.98
+  },
+  "notes": "NCCL 38.0 us"
+ },
+ {
+  "case": "comm-690",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1412956,
+  "bytes_actual": 1413120,
+  "hops": 1,
+  "measured_us": 9.389,
+  "variant": "lamport",
+  "t_sol_us": 5.21,
+  "t_ach_us": 6.32,
+  "derate": 1.485,
+  "measured_over_sol": 1.802,
+  "all_variants_us": {
+   "push": 11.46,
+   "lamport": 9.39,
+   "push2d": 11.43,
+   "mc": 12.19,
+   "ce": 67.3,
+   "nccl": 57.13
+  },
+  "notes": "NCCL 57.1 us"
+ },
+ {
+  "case": "comm-697",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 51200,
+  "bytes_actual": 51200,
+  "hops": 2,
+  "measured_us": 10.336,
+  "variant": "lamport",
+  "t_sol_us": 5.8,
+  "t_ach_us": 5.98,
+  "derate": 1.727,
+  "measured_over_sol": 1.782,
+  "all_variants_us": {
+   "push": 15.19,
+   "lamport": 10.34,
+   "push2d": 13.62,
+   "pull": 15.48,
+   "ce": 69.34,
+   "nccl": 33.37
+  },
+  "notes": "NCCL 33.4 us"
+ },
+ {
+  "case": "comm-698",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 44154,
+  "bytes_actual": 45056,
+  "hops": 1,
+  "measured_us": 5.592,
+  "variant": "lamport",
+  "t_sol_us": 2.93,
+  "t_ach_us": 3.04,
+  "derate": 1.841,
+  "measured_over_sol": 1.909,
+  "all_variants_us": {
+   "push": 8.95,
+   "lamport": 5.59,
+   "push2d": 8.42,
+   "mc": 7.79,
+   "ce": 63.29,
+   "nccl": 37.63
+  },
+  "notes": "NCCL 37.6 us"
+ },
+ {
+  "case": "comm-699",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 1024,
+  "bytes_actual": 1024,
+  "hops": 1,
+  "measured_us": 4.922,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.08,
+  "derate": 1.599,
+  "measured_over_sol": 1.721,
+  "all_variants_us": {
+   "push": 12.62,
+   "lamport": 4.92,
+   "push2d": 8.1,
+   "pull": 10.21,
+   "ce": 40.62,
+   "nccl": 25.43
+  },
+  "notes": "NCCL 25.4 us"
+ },
+ {
+  "case": "comm-704",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 32,
+  "bytes_actual": 64,
+  "hops": 1,
+  "measured_us": 4.167,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.86,
+  "derate": 1.457,
+  "measured_over_sol": 1.457,
+  "all_variants_us": {
+   "push": 7.73,
+   "lamport": 4.17,
+   "push2d": 7.8,
+   "pull": 9.26,
+   "ce": 19.58,
+   "nccl": 37.0
+  },
+  "notes": "NCCL 37.0 us"
+ },
+ {
+  "case": "comm-708",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "D3",
+   "D5",
+   "D7-4"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 353239,
+  "bytes_actual": 356352,
+  "hops": 1,
+  "measured_us": 5.827,
+  "variant": "lamport",
+  "t_sol_us": 3.45,
+  "t_ach_us": 3.78,
+  "derate": 1.542,
+  "measured_over_sol": 1.689,
+  "all_variants_us": {
+   "push": 8.83,
+   "lamport": 5.83,
+   "push2d": 8.81,
+   "mc": 8.08,
+   "ce": 63.57,
+   "nccl": 26.88
+  },
+  "notes": "NCCL 26.9 us"
+ },
+ {
+  "case": "comm-709",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 2048,
+  "bytes_actual": 2048,
+  "hops": 1,
+  "measured_us": 5.665,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 3.38,
+  "derate": 1.677,
+  "measured_over_sol": 1.967,
+  "all_variants_us": {
+   "push": 18.38,
+   "lamport": 5.67,
+   "push2d": 8.27,
+   "pull": 10.27,
+   "ce": 64.66,
+   "nccl": 37.78
+  },
+  "notes": "NCCL 37.8 us"
+ },
+ {
+  "case": "comm-711",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 256,
+  "bytes_actual": 256,
+  "hops": 1,
+  "measured_us": 4.894,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.36,
+  "derate": 1.457,
+  "measured_over_sol": 1.711,
+  "all_variants_us": {
+   "push": 17.51,
+   "lamport": 4.89,
+   "push2d": 7.91,
+   "pull": 9.85,
+   "ce": 64.47,
+   "nccl": 27.03
+  },
+  "notes": "NCCL 27.0 us"
+ },
+ {
+  "case": "comm-714",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 3200,
+  "bytes_actual": 3200,
+  "hops": 2,
+  "measured_us": 10.126,
+  "variant": "lamport",
+  "t_sol_us": 5.73,
+  "t_ach_us": 6.16,
+  "derate": 1.643,
+  "measured_over_sol": 1.767,
+  "all_variants_us": {
+   "push": 18.29,
+   "lamport": 10.13,
+   "push2d": 13.53,
+   "pull": 15.6,
+   "ce": 46.19,
+   "nccl": 25.15
+  },
+  "notes": "NCCL 25.1 us"
+ },
+ {
+  "case": "comm-718",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 256,
+  "bytes_actual": 256,
+  "hops": 1,
+  "measured_us": 4.377,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.86,
+  "derate": 1.53,
+  "measured_over_sol": 1.53,
+  "all_variants_us": {
+   "push": 7.8,
+   "lamport": 4.38,
+   "push2d": 7.71,
+   "pull": 9.4,
+   "ce": 19.9,
+   "nccl": 36.04
+  },
+  "notes": "NCCL 36.0 us"
+ },
+ {
+  "case": "comm-720",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1412956,
+  "bytes_actual": 1413120,
+  "hops": 1,
+  "measured_us": 25.544,
+  "variant": "mc",
+  "t_sol_us": 14.63,
+  "t_ach_us": 20.31,
+  "derate": 1.258,
+  "measured_over_sol": 1.746,
+  "all_variants_us": {
+   "push": 30.97,
+   "lamport": 32.24,
+   "push2d": 28.96,
+   "mc": 25.54,
+   "ce": 292.15,
+   "nccl": 75.68
+  },
+  "notes": "NCCL 75.7 us"
+ },
+ {
+  "case": "comm-728",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 25600,
+  "bytes_actual": 25600,
+  "hops": 2,
+  "measured_us": 10.644,
+  "variant": "lamport",
+  "t_sol_us": 5.82,
+  "t_ach_us": 6.29,
+  "derate": 1.693,
+  "measured_over_sol": 1.829,
+  "all_variants_us": {
+   "push": 18.45,
+   "lamport": 10.64,
+   "push2d": 13.8,
+   "pull": 15.96,
+   "ce": 136.57,
+   "nccl": 34.09
+  },
+  "notes": "NCCL 34.1 us"
+ },
+ {
+  "case": "comm-729",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 44080953,
+  "bytes_actual": 44081152,
+  "hops": 1,
+  "measured_us": 48.903,
+  "variant": "push",
+  "t_sol_us": 27.35,
+  "t_ach_us": 38.12,
+  "derate": 1.283,
+  "measured_over_sol": 1.788,
+  "all_variants_us": {
+   "push": 48.9,
+   "push2d": 51.68,
+   "mc": 89.43,
+   "ce": 80.14,
+   "nccl": 165.96
+  },
+  "notes": "NCCL 166.0 us"
+ },
+ {
+  "case": "comm-731",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 353239,
+  "bytes_actual": 356352,
+  "hops": 1,
+  "measured_us": 10.961,
+  "variant": "lamport",
+  "t_sol_us": 5.8,
+  "t_ach_us": 7.59,
+  "derate": 1.443,
+  "measured_over_sol": 1.89,
+  "all_variants_us": {
+   "push": 15.07,
+   "lamport": 10.96,
+   "push2d": 13.4,
+   "mc": 11.02,
+   "ce": 257.51,
+   "nccl": 67.01
+  },
+  "notes": "NCCL 67.0 us"
+ },
+ {
+  "case": "comm-736",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 11020238,
+  "bytes_actual": 11022336,
+  "hops": 1,
+  "measured_us": 82.39,
+  "variant": "push2d",
+  "t_sol_us": 45.72,
+  "t_ach_us": 64.78,
+  "derate": 1.272,
+  "measured_over_sol": 1.802,
+  "all_variants_us": {
+   "push": 98.04,
+   "push2d": 82.39,
+   "mc": 83.01,
+   "ce": 340.06,
+   "nccl": 210.59
+  },
+  "notes": "NCCL 210.6 us"
+ },
+ {
+  "case": "comm-738",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 51200,
+  "bytes_actual": 51200,
+  "hops": 2,
+  "measured_us": 11.812,
+  "variant": "lamport",
+  "t_sol_us": 6.15,
+  "t_ach_us": 7.32,
+  "derate": 1.613,
+  "measured_over_sol": 1.921,
+  "all_variants_us": {
+   "push": 24.6,
+   "lamport": 11.81,
+   "push2d": 14.83,
+   "pull": 16.64,
+   "ce": 260.66,
+   "nccl": 27.9
+  },
+  "notes": "NCCL 27.9 us"
+ },
+ {
+  "case": "comm-739",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 800,
+  "bytes_actual": 832,
+  "hops": 2,
+  "measured_us": 8.883,
+  "variant": "lamport",
+  "t_sol_us": 5.72,
+  "t_ach_us": 5.72,
+  "derate": 1.553,
+  "measured_over_sol": 1.553,
+  "all_variants_us": {
+   "push": 13.0,
+   "lamport": 8.88,
+   "push2d": 13.03,
+   "pull": 14.67,
+   "ce": 24.87,
+   "nccl": 31.36
+  },
+  "notes": "NCCL 31.4 us"
+ },
+ {
+  "case": "comm-740",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1412956,
+  "bytes_actual": 1413120,
+  "hops": 1,
+  "measured_us": 16.044,
+  "variant": "mc",
+  "t_sol_us": 8.36,
+  "t_ach_us": 10.98,
+  "derate": 1.461,
+  "measured_over_sol": 1.919,
+  "all_variants_us": {
+   "push": 18.28,
+   "lamport": 16.82,
+   "push2d": 17.65,
+   "mc": 16.04,
+   "ce": 141.64,
+   "nccl": 105.44
+  },
+  "notes": "NCCL 105.4 us"
+ },
+ {
+  "case": "comm-745",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 220774,
+  "bytes_actual": 221184,
+  "hops": 1,
+  "measured_us": 7.32,
+  "variant": "lamport",
+  "t_sol_us": 3.72,
+  "t_ach_us": 4.31,
+  "derate": 1.699,
+  "measured_over_sol": 1.968,
+  "all_variants_us": {
+   "push": 11.71,
+   "lamport": 7.32,
+   "push2d": 9.71,
+   "mc": 8.33,
+   "ce": 131.08,
+   "nccl": 38.42
+  },
+  "notes": "NCCL 38.4 us"
+ },
+ {
+  "case": "comm-747",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 6400,
+  "bytes_actual": 6400,
+  "hops": 2,
+  "measured_us": 10.872,
+  "variant": "lamport",
+  "t_sol_us": 5.77,
+  "t_ach_us": 6.79,
+  "derate": 1.602,
+  "measured_over_sol": 1.884,
+  "all_variants_us": {
+   "push": 23.86,
+   "lamport": 10.87,
+   "push2d": 13.82,
+   "pull": 15.62,
+   "ce": 71.74,
+   "nccl": 38.12
+  },
+  "notes": "NCCL 38.1 us"
+ },
+ {
+  "case": "comm-750",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 1024,
+  "bytes_actual": 1024,
+  "hops": 1,
+  "measured_us": 4.341,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.86,
+  "derate": 1.517,
+  "measured_over_sol": 1.518,
+  "all_variants_us": {
+   "push": 7.82,
+   "lamport": 4.34,
+   "push2d": 7.57,
+   "pull": 9.29,
+   "ce": 29.68,
+   "nccl": 36.67
+  },
+  "notes": "NCCL 36.7 us"
+ },
+ {
+  "case": "comm-751",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 7064780,
+  "bytes_actual": 7065600,
+  "hops": 1,
+  "measured_us": 13.806,
+  "variant": "push",
+  "t_sol_us": 6.79,
+  "t_ach_us": 8.51,
+  "derate": 1.622,
+  "measured_over_sol": 2.033,
+  "all_variants_us": {
+   "push": 13.81,
+   "push2d": 13.9,
+   "mc": 20.21,
+   "ce": 38.58,
+   "nccl": 45.48
+  },
+  "notes": "NCCL 45.5 us"
+ },
+ {
+  "case": "comm-756",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 353239,
+  "bytes_actual": 356352,
+  "hops": 1,
+  "measured_us": 8.121,
+  "variant": "lamport",
+  "t_sol_us": 4.23,
+  "t_ach_us": 5.05,
+  "derate": 1.608,
+  "measured_over_sol": 1.92,
+  "all_variants_us": {
+   "push": 11.95,
+   "lamport": 8.12,
+   "push2d": 10.57,
+   "mc": 8.85,
+   "ce": 133.18,
+   "nccl": 39.59
+  },
+  "notes": "NCCL 39.6 us"
+ },
+ {
+  "case": "comm-757",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 6400,
+  "bytes_actual": 6400,
+  "hops": 2,
+  "measured_us": 9.407,
+  "variant": "lamport",
+  "t_sol_us": 5.72,
+  "t_ach_us": 5.72,
+  "derate": 1.643,
+  "measured_over_sol": 1.645,
+  "all_variants_us": {
+   "push": 12.99,
+   "lamport": 9.41,
+   "push2d": 12.87,
+   "pull": 14.71,
+   "ce": 25.15,
+   "nccl": 36.49
+  },
+  "notes": "NCCL 36.5 us"
+ },
+ {
+  "case": "comm-764",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 4096,
+  "bytes_actual": 4096,
+  "hops": 1,
+  "measured_us": 5.402,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 3.1,
+  "derate": 1.745,
+  "measured_over_sol": 1.876,
+  "all_variants_us": {
+   "push": 12.88,
+   "lamport": 5.4,
+   "push2d": 8.28,
+   "pull": 10.19,
+   "ce": 40.59,
+   "nccl": 26.36
+  },
+  "notes": "NCCL 26.4 us"
+ },
+ {
+  "case": "comm-775",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 44154,
+  "bytes_actual": 45056,
+  "hops": 1,
+  "measured_us": 5.567,
+  "variant": "lamport",
+  "t_sol_us": 3.03,
+  "t_ach_us": 3.32,
+  "derate": 1.677,
+  "measured_over_sol": 1.837,
+  "all_variants_us": {
+   "push": 11.47,
+   "lamport": 5.57,
+   "push2d": 8.42,
+   "mc": 7.9,
+   "ce": 132.19,
+   "nccl": 38.35
+  },
+  "notes": "NCCL 38.3 us"
+ },
+ {
+  "case": "comm-783",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1766195,
+  "bytes_actual": 1769472,
+  "hops": 1,
+  "measured_us": 6.982,
+  "variant": "lamport",
+  "t_sol_us": 3.84,
+  "t_ach_us": 4.27,
+  "derate": 1.634,
+  "measured_over_sol": 1.818,
+  "all_variants_us": {
+   "push": 9.21,
+   "lamport": 6.98,
+   "push2d": 9.33,
+   "mc": 10.37,
+   "ce": 32.51,
+   "nccl": 31.71
+  },
+  "notes": "NCCL 31.7 us"
+ },
+ {
+  "case": "comm-785",
+  "primitive": "P16 Markov exchange",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:Markov argmax pos 0",
+   "drafter:Markov argmax pos 1",
+   "drafter:Markov argmax pos 2"
+  ],
+  "priority": "P2",
+  "count_per_step": 3,
+  "bytes_param": 8192,
+  "bytes_actual": 8192,
+  "hops": 1,
+  "measured_us": 5.944,
+  "variant": "lamport",
+  "t_sol_us": 2.93,
+  "t_ach_us": 3.45,
+  "derate": 1.721,
+  "measured_over_sol": 2.029,
+  "all_variants_us": {
+   "push": 18.93,
+   "lamport": 5.94,
+   "push2d": 8.74,
+   "pull": 10.56,
+   "ce": 66.81,
+   "nccl": 37.54
+  },
+  "notes": "NCCL 37.5 us"
+ },
+ {
+  "case": "comm-787",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 25600,
+  "bytes_actual": 25600,
+  "hops": 2,
+  "measured_us": 9.724,
+  "variant": "lamport",
+  "t_sol_us": 5.73,
+  "t_ach_us": 5.74,
+  "derate": 1.694,
+  "measured_over_sol": 1.697,
+  "all_variants_us": {
+   "push": 13.35,
+   "lamport": 9.72,
+   "push2d": 13.41,
+   "pull": 15.26,
+   "ce": 37.86,
+   "nccl": 28.61
+  },
+  "notes": "NCCL 28.6 us"
+ },
+ {
+  "case": "comm-788",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "D7-8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 102400,
+  "bytes_actual": 102400,
+  "hops": 2,
+  "measured_us": 11.099,
+  "variant": "lamport",
+  "t_sol_us": 6.12,
+  "t_ach_us": 6.72,
+  "derate": 1.652,
+  "measured_over_sol": 1.814,
+  "all_variants_us": {
+   "push": 18.89,
+   "lamport": 11.1,
+   "push2d": 14.34,
+   "pull": 16.2,
+   "ce": 138.87,
+   "nccl": 40.06
+  },
+  "notes": "NCCL 40.1 us"
+ },
+ {
+  "case": "comm-792",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 204800,
+  "bytes_actual": 204800,
+  "hops": 2,
+  "measured_us": 14.045,
+  "variant": "lamport",
+  "t_sol_us": 7.43,
+  "t_ach_us": 9.17,
+  "derate": 1.532,
+  "measured_over_sol": 1.89,
+  "all_variants_us": {
+   "push": 24.61,
+   "lamport": 14.04,
+   "push2d": 16.64,
+   "pull": 18.73,
+   "ce": 261.17,
+   "nccl": 37.87
+  },
+  "notes": "NCCL 37.9 us"
+ },
+ {
+  "case": "comm-800",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 16,
+  "topology": [
+   "D1",
+   "D8"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 44154,
+  "bytes_actual": 45056,
+  "hops": 1,
+  "measured_us": 7.911,
+  "variant": "mc",
+  "t_sol_us": 3.23,
+  "t_ach_us": 3.88,
+  "derate": 2.036,
+  "measured_over_sol": 2.449,
+  "all_variants_us": {
+   "push": 15.06,
+   "lamport": 64.48,
+   "push2d": 9.05,
+   "mc": 7.91,
+   "ce": 252.06,
+   "nccl": 40.95
+  },
+  "notes": "KERNEL-DEBUG derate 2.04; best variant is push2d/mc at the push+flag-barrier floor (~8 us, 2 kernels); the one-kernel Lamport variant hit a recurring ~63 us stall at this size (bench-kernel issue, not production code); NCCL 40.9 us"
+ },
+ {
+  "case": "comm-801",
+  "primitive": "P18 drafter aux AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:aux hidden rows AG (5 x 7168)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 220774,
+  "bytes_actual": 221184,
+  "hops": 1,
+  "measured_us": 5.161,
+  "variant": "lamport",
+  "t_sol_us": 2.98,
+  "t_ach_us": 3.04,
+  "derate": 1.699,
+  "measured_over_sol": 1.732,
+  "all_variants_us": {
+   "push": 8.05,
+   "lamport": 5.16,
+   "push2d": 8.15,
+   "mc": 7.66,
+   "ce": 30.6,
+   "nccl": 38.23
+  },
+  "notes": "NCCL 38.2 us"
+ },
+ {
+  "case": "comm-808",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 44154,
+  "bytes_actual": 45056,
+  "hops": 1,
+  "measured_us": 5.329,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 2.9,
+  "derate": 1.841,
+  "measured_over_sol": 1.85,
+  "all_variants_us": {
+   "push": 8.06,
+   "lamport": 5.33,
+   "push2d": 8.16,
+   "mc": 7.78,
+   "ce": 30.93,
+   "nccl": 37.53
+  },
+  "notes": "NCCL 37.5 us"
+ },
+ {
+  "case": "comm-812",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 353239,
+  "bytes_actual": 356352,
+  "hops": 1,
+  "measured_us": 5.498,
+  "variant": "lamport",
+  "t_sol_us": 3.06,
+  "t_ach_us": 3.14,
+  "derate": 1.749,
+  "measured_over_sol": 1.797,
+  "all_variants_us": {
+   "push": 8.24,
+   "lamport": 5.5,
+   "push2d": 8.21,
+   "mc": 8.05,
+   "ce": 30.99,
+   "nccl": 37.69
+  },
+  "notes": "NCCL 37.7 us"
+ },
+ {
+  "case": "comm-815",
+  "primitive": "P2 drafter ctx AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "D7-2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "drafter:fc/ctx rows AG"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 1412956,
+  "bytes_actual": 1413120,
+  "hops": 1,
+  "measured_us": 6.946,
+  "variant": "lamport",
+  "t_sol_us": 3.65,
+  "t_ach_us": 3.99,
+  "derate": 1.741,
+  "measured_over_sol": 1.903,
+  "all_variants_us": {
+   "push": 8.95,
+   "lamport": 6.95,
+   "push2d": 9.18,
+   "mc": 10.02,
+   "ce": 32.78,
+   "nccl": 38.57
+  },
+  "notes": "NCCL 38.6 us"
+ },
+ {
+  "case": "comm-847",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:final AG (rows consumed)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 10761,
+  "bytes_actual": 12288,
+  "hops": 1,
+  "measured_us": 5.366,
+  "variant": "lamport",
+  "t_sol_us": 2.88,
+  "t_ach_us": 2.96,
+  "derate": 1.815,
+  "measured_over_sol": 1.863,
+  "all_variants_us": {
+   "push": 8.79,
+   "lamport": 5.37,
+   "push2d": 8.27,
+   "mc": 7.69,
+   "ce": 28.43,
+   "nccl": 27.55
+  },
+  "notes": "NCCL 27.5 us"
+ },
+ {
+  "case": "comm-848",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 4,
+  "topology": [
+   "P2"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 300,
+  "bytes_actual": 320,
+  "hops": 1,
+  "measured_us": 4.84,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.93,
+  "derate": 1.651,
+  "measured_over_sol": 1.692,
+  "all_variants_us": {
+   "push": 9.41,
+   "lamport": 4.84,
+   "push2d": 7.75,
+   "pull": 9.71,
+   "ce": 25.7,
+   "nccl": 37.57
+  },
+  "notes": "NCCL 37.6 us"
+ },
+ {
+  "case": "comm-864",
+  "primitive": "P2 SP-AG",
+  "kind": "ag",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:final AG (rows consumed)"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 21523,
+  "bytes_actual": 24576,
+  "hops": 1,
+  "measured_us": 5.271,
+  "variant": "lamport",
+  "t_sol_us": 2.87,
+  "t_ach_us": 2.88,
+  "derate": 1.832,
+  "measured_over_sol": 1.837,
+  "all_variants_us": {
+   "push": 8.0,
+   "lamport": 5.27,
+   "push2d": 8.16,
+   "mc": 7.66,
+   "ce": 30.91,
+   "nccl": 36.89
+  },
+  "notes": "NCCL 36.9 us"
+ },
+ {
+  "case": "comm-865",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 2,
+  "topology": [
+   "P4-2",
+   "P6"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 300,
+  "bytes_actual": 320,
+  "hops": 1,
+  "measured_us": 4.376,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 2.86,
+  "derate": 1.53,
+  "measured_over_sol": 1.53,
+  "all_variants_us": {
+   "push": 7.91,
+   "lamport": 4.38,
+   "push2d": 7.71,
+   "pull": 9.34,
+   "ce": 19.63,
+   "nccl": 37.01
+  },
+  "notes": "NCCL 37.0 us"
+ },
+ {
+  "case": "comm-871",
+  "primitive": "P16 sharded verify",
+  "kind": "a2a",
+  "N": 8,
+  "topology": [
+   "P1"
+  ],
+  "ckpts": [
+   "mxfp4_release",
+   "nvfp4_modelopt"
+  ],
+  "op_ids": [
+   "final:vocab-sharded verify"
+  ],
+  "priority": "P2",
+  "count_per_step": 1,
+  "bytes_param": 300,
+  "bytes_actual": 320,
+  "hops": 1,
+  "measured_us": 5.03,
+  "variant": "lamport",
+  "t_sol_us": 2.86,
+  "t_ach_us": 3.07,
+  "derate": 1.636,
+  "measured_over_sol": 1.759,
+  "all_variants_us": {
+   "push": 12.64,
+   "lamport": 5.03,
+   "push2d": 8.07,
+   "pull": 10.22,
+   "ce": 40.4,
+   "nccl": 35.13
+  },
+  "notes": "NCCL 35.1 us"
+ }
+]

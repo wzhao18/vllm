@@ -164,7 +164,7 @@ roles:
       HF_HUB_OFFLINE: '1'
       VLLM_ITERLOG_DIR: ''
       VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: '1'
-      PYTHONPATH: /opt/k3/mooncake-0.3.14:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-fa43a52:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+      PYTHONPATH: /opt/k3/mooncake-0.3.14:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-1767cf7:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
     args:
       prefix-cache-policy: v2
       enable-mamba-shared-prefix-checkpoint: true
@@ -223,7 +223,7 @@ roles:
     workers: 1
     gpus: 16
     env:
-      PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-fa43a52:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
+      PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-1767cf7:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
       HF_HUB_OFFLINE: '1'
       VLLM_ITERLOG_DIR: ''
       K3_PIN_CPUS: '1'

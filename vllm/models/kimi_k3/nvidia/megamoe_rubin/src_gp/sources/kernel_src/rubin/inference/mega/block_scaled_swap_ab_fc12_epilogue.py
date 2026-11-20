@@ -25,6 +25,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 
+from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
@@ -1536,7 +1537,10 @@ class SwapABGatedActEpilogue(KernelComponent):
         )
 
         routed_ready = cutlass.Int32(0)
+        _dms_ue = cutlass.Int32(0)
         while work_tile_info.is_valid_tile:
+            _dms_uep = cutlass.Int32(tidx == cutlass.Int32(0)) * cutlass.Int32(_dms_ue < cutlass.Int32(16))
+            DG.put_gt_dyn(cutlass.Int32(DG.S_EPU0) + (_dms_ue & cutlass.Int32(15)), _dms_uep)
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
             cur_phase = work_tile_info.phase
             if cutlass.const_expr(routed_ready_flag is not None):
@@ -1565,6 +1569,7 @@ class SwapABGatedActEpilogue(KernelComponent):
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
                 )
+            DG.put_gt_dyn(cutlass.Int32(DG.S_EPM0) + (_dms_ue & cutlass.Int32(15)), _dms_uep)
             prev_work_tile_info = work_tile_info
             prev_is_fc1 = is_fc1
 
@@ -1615,6 +1620,8 @@ class SwapABGatedActEpilogue(KernelComponent):
                         flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                     else:
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+            DG.put_gt_dyn(cutlass.Int32(DG.S_EPS0) + (_dms_ue & cutlass.Int32(15)), _dms_uep)
+            _dms_ue = _dms_ue + cutlass.Int32(1)
         # Tail flush
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
