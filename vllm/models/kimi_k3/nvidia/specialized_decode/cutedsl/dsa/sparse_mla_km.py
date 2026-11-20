@@ -137,7 +137,7 @@ C_S, C_O = 0, 192  # TMEM: S^T 2 x 96 | O^T 4 x 96
 # (zero between launches: the tail's 12 correction warps add 1 each, the head's 12
 # readers add 1 each and the last one re-arms it to 0).
 WS_SLOT = H * D_NOPE * 2
-GRID_MAX = 1024
+GRID_MAX = 256  # SMs (VR200: 212)
 WS_LSE = GRID_MAX * WS_SLOT
 WS_FLAGS = WS_LSE + GRID_MAX * H * 4
 WS_BYTES = WS_FLAGS + GRID_MAX * 4
