@@ -1557,6 +1557,11 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
                 rows = torch.unique(idx[:, 0]).tolist()
                 heads = torch.unique(idx[:, 1]).tolist() if idx.shape[1] > 1 else []
                 vals = [(tuple(i.tolist()), int(a[tuple(i)]), int(b[tuple(i)])) for i in idx[:6]]
+                sh = [(tuple(i.tolist()), int(a[tuple(i)]), int(b[(i[0] + 256) % b.shape[0], i[1], i[2]])) for i in idx[:6]]
+                wr = (a != b)
+                rr = wr.nonzero()
+                b2 = b[(rr[:, 0] + 256) % b.shape[0], rr[:, 1], rr[:, 2]]
+                print(f"DBG7 {where} {tag}: odd==ref(row+256) {int((a[wr] == b2).sum())} of {int(wr.sum())}; samples (pos, odd, ref+256) {sh}")
                 odd_ff = int((a[a != b] == 0xFF).sum())
                 ref_ff = int((b[a != b] == 0xFF).sum())
                 print(f"DBG6 {where} {tag}: query shape {tuple(a.shape)} rows {rows[:12]} "
