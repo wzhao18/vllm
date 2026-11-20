@@ -245,6 +245,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     mbar_init(res_bar, 1);
     mbar_init(acc_bar, 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    if (nr > 0) mbar_expect_tx(res_bar, nr * kSlot);
   }
   if (threadIdx.x == 32) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tw)) : "memory");
@@ -263,35 +264,41 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   asm volatile("tcgen05.fence::after_thread_sync;");
   const uint32_t tmem = s_tmem;  // D: columns [0, n); weight K block j < nt: na + 32 j
 
-  if (warp == 0) {
-    // TMA issue: one bulk op completes at a time per issuing thread (~0.45 us, hwdb
-    // hw51), so every ring slot has its own issuing lane.
-    // Weights never depend on the predecessor: shared-memory-resident blocks and
-    // the TMEM fill stream start at entry, beside the AttnRes reduce.
-    if (lane == 0 && nr > 0) mbar_expect_tx(res_bar, nr * kSlot);
-    __syncwarp();
-    for (int r = lane; r < nr; r += 32)
+  // TMA issue: lane 0 of warps 0, 3 and 4-7 (the epilogue warps idle until the
+  // accumulator is done). Bulk ops from one issuing warp complete about one at a
+  // time (hwdb hw51), so each ring slot is owned by one issuer and the issuers run
+  // in parallel. Weights never depend on the predecessor: the shared-memory-resident
+  // blocks and the TMEM fill stream start at entry, beside the AttnRes reduce.
+  if ((warp == 0 || warp >= 3) && lane == 0) {
+    constexpr int kIssuers = 6;
+    const int u = warp == 0 ? 0 : warp - 2;
+    // res_bar's expect_tx is set before the CTA barrier above (thread 0).
+    for (int r = u; r < nr; r += kIssuers)
       tma_2d(res_s + r * kSlot, &tw, (kb0 + nt + r) * 64, wrow, res_bar);
-    if (lane < p.ns) {
-      for (int i = lane; i < nt; i += p.ns) {
-        if (i >= p.ns) mbar_wait(empty0 + 8 * lane, ((i / p.ns) & 1) ^ 1);
-        mbar_expect_tx(full0 + 8 * lane, kSlot);
-        tma_2d(ring_s + lane * kSlot, &tw, (kb0 + i) * 64, wrow, full0 + 8 * lane);
-      }
+    for (int i = 0; i < nt; ++i) {
+      const int slot = i % p.ns;
+      if (slot % kIssuers != u) continue;
+      if (i >= p.ns) mbar_wait(empty0 + 8 * slot, ((i / p.ns) & 1) ^ 1);
+      mbar_expect_tx(full0 + 8 * slot, kSlot);
+      tma_2d(ring_s + slot * kSlot, &tw, (kb0 + i) * 64, wrow, full0 + 8 * slot);
     }
-    if (lane < p.xs) {
-      // The token ring reuses the weight ring's memory in n x 128 B slots once the
-      // TMEM fill has read every weight slot (its commits complete in order).
+    // The token ring reuses the weight ring's memory in n x 128 B slots once the
+    // TMEM fill has read every weight slot (its commits complete in order).
+    if (u < p.xs) {
       mbar_wait(trdy0 + 8 * (nt - 1), 0);
       asm volatile("griddepcontrol.wait;" ::: "memory");
-      if (lane == 0) STAMP(1);
-      for (int j = lane; j < nk; j += p.xs) {
-        if (j >= p.xs) mbar_wait(xempty0 + 8 * lane, ((j / p.xs) & 1) ^ 1);
-        mbar_expect_tx(xfull0 + 8 * lane, n * 128);
-        tma_2d(ring_s + lane * n * 128, &tx, (kb0 + j) * 64, 0, xfull0 + 8 * lane);
+      if (u == 0) STAMP(1);
+      for (int j = 0; j < nk; ++j) {
+        const int xs = j % p.xs;
+        if (xs % kIssuers != u) continue;
+        if (j >= p.xs) mbar_wait(xempty0 + 8 * xs, ((j / p.xs) & 1) ^ 1);
+        mbar_expect_tx(xfull0 + 8 * xs, n * 128);
+        tma_2d(ring_s + xs * n * 128, &tx, (kb0 + j) * 64, 0, xfull0 + 8 * xs);
       }
     }
-  } else if (warp == 2) {
+  }
+  __syncwarp();  // the issuing lane rejoins its warp (tcgen05.ld below is .aligned)
+  if (warp == 2) {
     // TMEM fill: ring weight block i -> TMEM columns [na + 32 i, na + 32 i + 32).
     for (int i = 0; i < nt; ++i) {
       const int slot = i % p.ns;
