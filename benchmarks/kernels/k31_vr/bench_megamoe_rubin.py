@@ -194,7 +194,7 @@ def parse_args():
     )
     p.add_argument(
         "--shared-l2-position",
-        choices=("early", "tail"),
+        choices=("early", "middle", "tail"),
         default=None,
         help="fused shared FC2 placement (default: the session's)",
     )
