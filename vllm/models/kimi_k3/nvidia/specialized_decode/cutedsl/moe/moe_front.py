@@ -168,6 +168,57 @@ __device__ __forceinline__ void mma4_ss(uint32_t d, uint64_t a, uint64_t b, uint
       "@P tcgen05.mma.cta_group::1.kind::f16 [%0], a3, b3, %3, T; }" ::"r"(d),
       "l"(a), "l"(b), "r"(idesc), "r"(acc));
 }
+// Four consecutive weight blocks (TS: TMEM columns a + 32 q; SS: smem descriptor
+// a + 1024 q) against their token blocks b0..b3: 16 MMAs under one elect, so the
+// operands convert to uniform registers once per batch instead of per MMA.
+__device__ __forceinline__ void mma16_ts(uint32_t d, uint32_t a, uint64_t b0, uint64_t b1,
+                                         uint64_t b2, uint64_t b3, uint32_t idesc,
+                                         uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q, T; .reg .b32 ta; .reg .b64 tb;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %7, 0; setp.eq.u32 T, %7, %7;\n"
+      "add.u32 ta, %1, 0; add.u64 tb, %2, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, Q;\n"
+      "add.u32 ta, %1, 8; add.u64 tb, %2, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 16; add.u64 tb, %2, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 24; add.u64 tb, %2, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 32; add.u64 tb, %3, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 40; add.u64 tb, %3, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 48; add.u64 tb, %3, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 56; add.u64 tb, %3, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 64; add.u64 tb, %4, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 72; add.u64 tb, %4, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 80; add.u64 tb, %4, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 88; add.u64 tb, %4, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 96; add.u64 tb, %5, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 104; add.u64 tb, %5, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 112; add.u64 tb, %5, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T;\n"
+      "add.u32 ta, %1, 120; add.u64 tb, %5, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %6, T; }"
+      ::"r"(d), "r"(a), "l"(b0), "l"(b1), "l"(b2), "l"(b3), "r"(idesc), "r"(acc));
+}
+__device__ __forceinline__ void mma16_ss(uint32_t d, uint64_t a, uint64_t b0, uint64_t b1,
+                                         uint64_t b2, uint64_t b3, uint32_t idesc,
+                                         uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q, T; .reg .b64 ta, tb;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %7, 0; setp.eq.u32 T, %7, %7;\n"
+      "add.u64 ta, %1, 0; add.u64 tb, %2, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, Q;\n"
+      "add.u64 ta, %1, 2; add.u64 tb, %2, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 4; add.u64 tb, %2, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 6; add.u64 tb, %2, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 1024; add.u64 tb, %3, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 1026; add.u64 tb, %3, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 1028; add.u64 tb, %3, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 1030; add.u64 tb, %3, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 2048; add.u64 tb, %4, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 2050; add.u64 tb, %4, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 2052; add.u64 tb, %4, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 2054; add.u64 tb, %4, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 3072; add.u64 tb, %5, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 3074; add.u64 tb, %5, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 3076; add.u64 tb, %5, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T;\n"
+      "add.u64 ta, %1, 3078; add.u64 tb, %5, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T; }"
+      ::"r"(d), "l"(a), "l"(b0), "l"(b1), "l"(b2), "l"(b3), "r"(idesc), "r"(acc));
+}
 // One 128 x 64 BF16 K block (SWIZZLE_128B smem) -> 32 TMEM columns: 4 x 128x256b.
 __device__ __forceinline__ void cp4_el(uint32_t taddr, uint64_t src) {
   asm volatile(
@@ -252,42 +303,79 @@ struct MmaLoop {
 template <bool kStamp>
 __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool mma, int lane) {
   const int xg = p.xg, xs = p.xs;
+  // Batches of up to 4 weight blocks, all in TMEM or all in shared memory. A batch
+  // waits every token group it spans before its MMAs and releases them after, so it
+  // spans at most xs groups (a group's slot reuse never waits on its own batch).
+  const int bmax = max(1, min(4, (xs - 1) * xg + 1));
   uint32_t a_tm = m.a_tm, xph = 0;
-  uint64_t a_ss = m.a_ss, b = m.x0 + p.xslot[0] * (kSlot >> 4);
+  uint64_t a_ss = m.a_ss, xb = m.x0 + p.xslot[0] * (kSlot >> 4);
   int jx = 0, gs = 0, g = 0;
-  for (int j = 0; j < m.nk; ++j) {
-    if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
-    if (j < m.nt && (j & 3) == 0) {
-      // Weight blocks j..j+3 in TMEM (the fill commits each block, in order): one wait
-      // and one fence per 4 blocks; the MMAs run behind the fill, not after it.
-      mbar_wait(m.trdy0 + 8 * min(j + 3, m.nt - 1), 0);
+  for (int j = 0; j < m.nk;) {
+    const bool tm = j < m.nt;
+    const int jend = min(j + bmax, tm ? m.nt : m.nk);
+    if (tm) {
+      // Weight blocks j..jend-1 in TMEM: the fill commits each block, in order, so one
+      // wait and one fence cover the batch; the MMAs run behind the fill.
+      mbar_wait(m.trdy0 + 8 * (jend - 1), 0);
       asm volatile("tcgen05.fence::after_thread_sync;");
-      if (kStamp && j + 4 >= m.nt && lane == 0) {
+      if (kStamp && jend == m.nt && lane == 0) {
         p.stamps[blockIdx.x * kStampStride + 56] = globaltimer();
       }
     } else if (j == m.nt) {
       mbar_wait(m.res_bar, 0);
     }
-    if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
-    if (j < m.nt) {
-      if (mma) mma4_ts(m.d_tm, a_tm, b, m.idesc, j);
-      a_tm += 32;
-    } else {
-      if (mma) mma4_ss(m.d_tm, a_ss, b, m.idesc, j);
-      a_ss += kSlot >> 4;
-    }
-    b += m.xstep;
-    if (++jx == xg || j == m.nk - 1) {
-      if ((g + xs) * xg < m.nk) commit_el(m.xempty0 + 8 * gs);
-      jx = 0;
-      ++g;
-      if (++gs == xs) {
-        gs = 0;
-        xph ^= 1;
+    uint64_t b[4];
+    uint32_t rel = 0;  // token slots this batch frees (after its MMAs)
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      b[q] = 0;
+      if (j + q < jend) {
+        if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
+        b[q] = xb + static_cast<uint64_t>(jx) * m.xstep;
+        if (++jx == xg || j + q == m.nk - 1) {
+          if ((g + xs) * xg < m.nk) rel |= 1u << gs;
+          jx = 0;
+          ++g;
+          if (++gs == xs) {
+            gs = 0;
+            xph ^= 1;
+          }
+          xb = m.x0 + p.xslot[gs] * (kSlot >> 4);
+        }
       }
-      b = m.x0 + p.xslot[gs] * (kSlot >> 4);
+    }
+    if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
+    if (mma) {
+      if (jend - j == 4) {
+        if (tm) {
+          mma16_ts(m.d_tm, a_tm, b[0], b[1], b[2], b[3], m.idesc, j);
+        } else {
+          mma16_ss(m.d_tm, a_ss, b[0], b[1], b[2], b[3], m.idesc, j);
+        }
+      } else {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          if (j + q < jend) {
+            if (tm) {
+              mma4_ts(m.d_tm, a_tm + 32 * q, b[q], m.idesc, j + q);
+            } else {
+              mma4_ss(m.d_tm, a_ss + (kSlot >> 4) * q, b[q], m.idesc, j + q);
+            }
+          }
+        }
+      }
+    }
+    while (rel != 0) {
+      commit_el(m.xempty0 + 8 * (__ffs(rel) - 1));
+      rel &= rel - 1;
     }
     if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
+    if (tm) {
+      a_tm += 32 * (jend - j);
+    } else {
+      a_ss += (kSlot >> 4) * (jend - j);
+    }
+    j = jend;
   }
 }
 
