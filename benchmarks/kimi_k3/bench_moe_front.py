@@ -225,20 +225,32 @@ def main():
                 torch.cuda.synchronize()
             sv = st[: grid * 64].view(grid, 64)
             s = (sv.double() - float(end.item())) / 1000.0
-            names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end", "x0-mma", "acc-done"]
+            cols = {"entry": 0, "w-ready": 56, "x-issue": 1, "x0-mma": 6, "acc-done": 7, "partial": 2,
+                    "tile-sum": 3, "staged": 57, "topk-go": 4, "end": 5}
             parts = []
-            for i, nm in enumerate(names):
+            for nm, i in cols.items():
                 v = s[:, i][sv[:, i] != 0]
                 if v.numel():
                     parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
             print(f"  stamps dbg{skel_mode} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
                   flush=True)
-            for cta in (0, grid // 2, grid - 1):
-                c0 = int(sv[cta, 32])
-                rd = [str(int(sv[cta, 32 + j]) - c0) for j in range(24) if sv[cta, 32 + j] != 0]
-                iss = [str(int(sv[cta, 8 + j]) - c0) for j in range(24) if sv[cta, 8 + j] != 0]
-                print(f"  cta{cta} clk operands-ready per K block: {' '.join(rd)}", flush=True)
-                print(f"  cta{cta} clk MMAs-issued per K block: {' '.join(iss)}", flush=True)
+            ks = c[0]
+            tile = torch.arange(grid, device=dev) // ks
+            roles = {"router": (tile < E // 128) & (torch.arange(grid, device=dev) >= n),
+                     "topk": torch.arange(grid, device=dev) < n, "latent": tile >= E // 128}
+            rl = []
+            for nm, m in roles.items():
+                e = s[:, 5][m & (sv[:, 5] != 0)]
+                if e.numel():
+                    rl.append(f"{nm} {int(m.sum())} end {e.median().item():.2f}/{e.max().item():.2f}")
+            print("  roles: " + "; ".join(rl), flush=True)
+            last = torch.argsort(s[:, 5], descending=True)[:4].tolist()
+            for cta in last:
+                ph = " ".join(f"{nm}={s[cta, i].item():.2f}" for nm, i in cols.items() if sv[cta, i] != 0)
+                print(f"  late cta{cta} (tile {cta // ks}, split {cta % ks}): {ph}", flush=True)
+            c0 = int(sv[0, 32])
+            rd = [int(sv[0, 32 + j]) - c0 for j in range(24) if sv[0, 32 + j] != 0]
+            print("  cta0 clk per K block: " + " ".join(str(b - a) for a, b in zip(rd, rd[1:])), flush=True)
 
 
 if __name__ == "__main__":

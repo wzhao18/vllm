@@ -63,7 +63,7 @@ constexpr int kMaxR = 8;               // shared-memory-resident weight K blocks
 constexpr int kMaxX = 32;              // token ring slots (n x 128 B each, in the ring)
 constexpr int kLine = 32;              // one counter per 128 B line
 constexpr int kTileCnt = 3 * kLine;    // cnt[kTileCnt + kLine t]: partials stored for tile t
-constexpr int kStampStride = 64;  // [0, 8) phases (globaltimer), [8, 32) clock after MMA issue, [32, 56) clock operands ready, per K block
+constexpr int kStampStride = 64;  // [0, 8) phases (globaltimer), [8, 32) clock after MMA issue, [32, 56) clock operands ready, per K block, 56 W in TMEM, 57 latent staged
 constexpr int kSmemBudget = 214 * 1024;  // dynamic + static: co-resident with the AttnRes reduce
 
 struct Params {
@@ -407,6 +407,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
     mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
+    if (lane == 0) STAMP(56);
     // Orders the MMAs after the fill warp's tcgen05.cp; TMA-landed operands need
     // only their barrier.
     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -497,6 +498,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         }
       }
     }
+  }
+  if (p.stamps) {  // microbench: this CTA's latent sum + quantization done
+    __syncthreads();
+    if (threadIdx.x == 0) STAMP(57);
   }
   // Dead rows [n, capacity): routes -1 only (spread over the grid).
   {
