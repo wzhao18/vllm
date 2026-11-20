@@ -50,7 +50,8 @@ def main():
     p.add_argument("--depths", default="4")
     p.add_argument("--percall", type=int, default=1)
     p.add_argument("--dielocal", type=int, default=0)
-    p.add_argument("--groups", default="3")
+    p.add_argument("--groups", default="4")
+    p.add_argument("--vecs", default="8")
     args = p.parse_args()
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -237,12 +238,13 @@ def main():
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
 
     res = []
-    for d, gr in [(int(x), int(y)) for y in args.groups.split(",")
-                  for x in args.depths.split(",")]:
+    for d, gr, vv in [(int(x), int(y), int(v)) for v in args.vecs.split(",")
+                      for y in args.groups.split(",") for x in args.depths.split(",")]:
         attn_res_lp.RING_DEPTH = d
         attn_res_lp.GROUPS = gr
+        attn_res_lp.VEC = vv
         arms = [("old", lambda st, c: run_ref(st, c))] if args.old else []
-        arms.append((f"lp_g{gr}d{d}", run_lp))
+        arms.append((f"lp_v{vv}g{gr}d{d}", run_lp))
         order = arms + arms[::-1]
         for name, fn in order:
             r = timed(fn, bool(args.dielocal) and name != "old")

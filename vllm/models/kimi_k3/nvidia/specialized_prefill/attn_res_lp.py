@@ -45,6 +45,7 @@ MXFP8_BLOCK = 32
 # G4 d2/d3 25.85/25.97 ms, G5 d2 28.2 and G6 d2 33.3 ms (register spills).
 RING_DEPTH = 2
 GROUPS = 4
+VEC = 8  # BF16 per lane chunk (4 warps per token group; 4 -> 8 warps)
 _SRC = os.path.join(os.path.dirname(__file__), "attn_res_lp.cu")
 _lock = threading.Lock()
 _mod: dict[tuple, object] = {}
@@ -211,7 +212,7 @@ def attn_res(
     prefix_out: torch.Tensor | None = None,
     local_out: bool = True,
     _probe: int = 0,
-    _vec: int = 8,
+    _vec: int | None = None,
     _groups: int | None = None,
     _stamps: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, QuantizedActivation | None]:
@@ -256,7 +257,9 @@ def attn_res(
             # Scale rows past `rows` (last 128-row tile) are zero, as
             # mxfp8_quantize writes them; the kernel fills the real rows.
             sf.view(-1, 128 * (HIDDEN // MXFP8_BLOCK))[-1].zero_()
-    _module(_probe, _vec, GROUPS if _groups is None else _groups).attn_res_lp(
+    _module(
+        _probe, VEC if _vec is None else _vec, GROUPS if _groups is None else _groups
+    ).attn_res_lp(
         prefix,
         prefix_out,
         delta,

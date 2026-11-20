@@ -235,6 +235,20 @@ struct Smem {
     }                                                                        \
   } while (0)
 
+// Probe builds (K31LP_PROBE & 32): per-CTA globaltimer stamps (entry, loop
+// start, exit of group 0 / of the CTA) into stamps[blockIdx * 4 + j].
+__device__ __forceinline__ long long gtime() {
+  long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+#define K31LP_CTA_STAMP(j)                                                   \
+  do {                                                                       \
+    if constexpr ((K31LP_PROBE & 32) != 0) {                                 \
+      if (threadIdx.x == 0) a.stamps[(int64_t)blockIdx.x * 4 + (j)] = gtime(); \
+    }                                                                        \
+  } while (0)
+
 __device__ __forceinline__ void group_sync(int g) {
   asm volatile("bar.sync %0, %1;\n" ::"r"(1 + g), "n"(NT) : "memory");
 }
@@ -253,6 +267,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   constexpr int R0 = 1 + (HAS_DELTA ? 1 : 0);
   const int R = R0 + n;  // rows per token
   const int64_t seg0 = (int64_t)warp * SEG;
+  K31LP_CTA_STAMP(0);
 
   // Token schedule: each group claims its tokens one at a time, QA positions
   // ahead, into the smem queue tq[g] (thread 0 of the group claims; the group
@@ -379,6 +394,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   };
   load_logits(0);
 
+  K31LP_CTA_STAMP(1);
   int par = 0;
   // Thread 0: the own-die atomicAdd (in flight) for the next claimed position.
   int pending = tid == 0 ? start_claim() : 0;
@@ -579,8 +595,10 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     K31LP_STAMP(6);
     par ^= 1;
   }
+  K31LP_CTA_STAMP(2);
   // The last CTA out resets the claim counters for the next call.
   __syncthreads();
+  K31LP_CTA_STAMP(3);
   if (threadIdx.x == 0) {
     __threadfence();
     if (atomicAdd(&a.claim[2], 1) == (int)gridDim.x - 1) {

@@ -13,10 +13,10 @@ p.add_argument("--rows", type=int, default=16384)
 p.add_argument("--nb", type=int, default=5)
 p.add_argument("--variant", default="bq")
 p.add_argument("--iters", type=int, default=3)
-p.add_argument("--depth", type=int, default=3)
+p.add_argument("--depth", type=int, default=2)
 p.add_argument("--probes", default="0")
 p.add_argument("--vec", type=int, default=8)
-p.add_argument("--groups", type=int, default=3)
+p.add_argument("--groups", type=int, default=4)
 p.add_argument("--dielocal", type=int, default=0)
 args = p.parse_args()
 from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_lp
@@ -40,6 +40,10 @@ st.rstd.uniform_(0.5, 1.5)
 for b in range(NB):
     st.logits[b] = torch.randn(2 * plan.calls_after(b), T, device="cuda")
 prefix = torch.randn(T, H, device="cuda").bfloat16()
+if args.dielocal:  # the model's prefix lives in the die-local prefix buffer
+    pb = attn_res_dielocal.prefix_out(prefix, blocks)
+    pb.copy_(prefix)
+    prefix = pb
 delta = torch.randn(T, H, device="cuda").bfloat16()
 onw = (1 + 0.1 * torch.randn(H, device="cuda")).bfloat16()
 call = 24 * (args.nb - 1) + 5
@@ -64,7 +68,15 @@ for probe in [int(x) for x in args.probes.split(",")]:
         d = (st_[:, 2:15, 1:7] - st_[:, 2:15, 0:6]).reshape(-1, 6)
         tot = (st_[:, 3:15, 0] - st_[:, 2:14, 0]).reshape(-1)
         print("stamps (cycles, median over CTAs x tokens 2..14): "
-              "logits->prefix landed, ->delta+u, ->stats/stores, ->blocks done, "
-              "->group barrier, ->epilogue end:",
+              "logits->prefix landed, ->delta+u, ->stats/stores, ->stats barrier, "
+              "->blocks done, ->epilogue end:",
               [round(x) for x in d.median(0).values.tolist()],
               "token period", round(tot.median().item()))
+
+    if probe & 32:
+        st_ = stamps.view(-1, 4)[:1024].cpu().double()
+        st_ = st_[st_[:, 0] != 0]
+        t0 = st_[:, 0].min()
+        q = lambda x: [round(v / 1e3, 1) for v in torch.quantile(x, torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64)).tolist()]
+        print("cta us (min/med/max): entry", q(st_[:, 0] - t0), "loop start", q(st_[:, 1] - t0),
+              "group0 done", q(st_[:, 2] - t0), "cta done", q(st_[:, 3] - t0))
