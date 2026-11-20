@@ -1862,6 +1862,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 iket.range_pop()
 
         cute.arch.griddepcontrol_wait()
+        # This call's epoch: the comm grid acquired it before it released this grid and its completion is
+        # now visible here; only this call's last arriver advances it. Loaded now, its latency hides under
+        # the barriers below instead of sitting on the last arriver's serial path.
+        call_epoch = self.tail.read_epoch(self._device_workspace)
         # CTAs with no work can finish the epilogue before gather warps pass
         # their readiness waits. Join every role before clearing those flags.
         cute.arch.sync_threads()
@@ -1891,12 +1895,17 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 is_last = Int32(0)
                 if lane_idx == Int32(0):
                     if cutlass.const_expr(self.reduce_acquires_producer_done):
-                        # The reduce's completion orders the shared output through this arrival.
-                        cute.arch.atomic_add(
+                        # One arrival serves both: the reduce acquires the full count (the shared output's
+                        # completion; it re-arms the count before the next call can arrive), and its return
+                        # value names the last arriver, which has then acquired every other arrival.
+                        old = cute.arch.atomic_add(
                             self._device_workspace.ptr(self.producer_done_region), Int32(1), sem="acq_rel", scope="gpu"
                         )
-                    if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
-                        is_last = Int32(1)
+                        if old == Int32(self.promised_launchable_sm_count - 1):
+                            is_last = Int32(1)
+                    else:
+                        if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
+                            is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
                 if is_last != Int32(0):
                     # The last arriver has acquired every other CTA's arrival, so nothing on
@@ -1913,7 +1922,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     iket.range_pop()
                     iket.range_push("tail.nvlink_barrier")
                     if lane_idx == Int32(0):
-                        epoch = self.tail.read_epoch(self._device_workspace)
+                        # Read at entry: the last arriver alone advances it, after this point.
+                        epoch = call_epoch
                         if cutlass.const_expr(not self.epilogue.combine_ll_encoded):
                             # Peers reduce-add straight into this rank's output, so the
                             # call is complete only once every rank is through.
