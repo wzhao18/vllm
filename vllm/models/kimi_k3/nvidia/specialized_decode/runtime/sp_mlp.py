@@ -67,12 +67,6 @@ SHARED = ("shared_gu", "shared_down")
 # router || latent down pair, but in-step the concat also moves r24 onto route_stage):
 # r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
 ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
-# ``wide`` rows (none by default) run the token-wide 2-CTA GEMM (``gemm.wide``;
-# weights requested before the PDL wait) and leave FP32 split partials [split, n, N]
-# that route_stage sums in split order. In-step at n96 (r24, fastab ex3wf1) it ties
-# the split-K kernel (-2.9 us per step, CI 33). WideGemm policy per rows: (split,
-# activation warps, weight stages, weight warps, direct exchange, rotate).
-WIDE_FRONT = {96: (5, (1,), None, (0, 3), False, True)}
 # Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
 # PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
 # slice, split-K front vs prewait (fastab xy1/xy2, Rhea): n32 split-K faster
@@ -88,10 +82,6 @@ PREWAIT_ROWS = (64,)
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
-# WideGemm policy after the split (activation warps, weight stages, weight warps,
-# direct exchange, rotate, ring KiB, K per stage). 1 GPU after a 4 us predecessor
-# (us per call, striped K64 -> die-static K128): n32 4.84 -> 4.15, n96 5.80 -> 5.55.
-LATENT_UP_WIDE = ((1,), None, (0, 3), False, False, None, 128)
 
 
 class SplitKFront:
@@ -109,35 +99,12 @@ class SplitKFront:
         return self.proj.run(x, out)
 
 
-class WideFront:
-    """The router | latent down GEMM on ``gemm.wide`` for the rows of ``WIDE_FRONT``
-    in ``rows``: FP32 split partials [split, n, N] (``splits``) for route_stage."""
-
-    def __init__(self, packed, rows):
-        from ..cutedsl.gemm.wide import PreparedWide
-
-        policies = {r: WIDE_FRONT[r] for r in rows}
-        self.plans = dict.fromkeys(policies)
-        self.splits = {r: policy[0] for r, policy in policies.items()}
-        self.wide = PreparedWide(packed, policies, partials=True).prepare()
-
-    def run(self, w, x, out):
-        return self.wide.run(x, out)
-
-
 class FrontGemms:
-    """Per-rows dispatch of the concatenated GEMM over ``LtPin`` / ``SplitKFront`` /
-    ``WideFront``; ``output`` allocates the FP32 rows (or a wide row's partials)."""
+    """Per-rows dispatch of the concatenated GEMM over ``LtPin`` / ``SplitKFront``."""
 
     def __init__(self, gemms):
         self.by_rows = {r: g for g in gemms for r in g.plans}
         self.plans = dict.fromkeys(self.by_rows)
-        self.splits = {r: s for g in gemms for r, s in getattr(g, "splits", {}).items()}
-
-    def output(self, h, n_out):
-        split = self.splits.get(h.shape[0])
-        shape = (h.shape[0], n_out) if split is None else (split, h.shape[0], n_out)
-        return h.new_empty(shape, dtype=torch.float32)
 
     def run(self, w, x, out):
         return self.by_rows[x.shape[0]].run(w, x, out)
@@ -228,15 +195,12 @@ class SpMlp:
             n, k = packed.shape
             pinned = tuple(r for r in concat_rows if front[r] == "ltpin")
             split = {r: front[r] for r in concat_rows if isinstance(front[r], tuple)}
-            wide = tuple(r for r in concat_rows if front[r] == "wide")
             gemms = []
             if pinned:
                 gemms.append(LtPin("router_latent", n, k, pinned, out32=True,
                                    device=packed.device))  # fmt: skip
             if split:
                 gemms.append(SplitKFront(packed, split))
-            if wide:
-                gemms.append(WideFront(packed, wide))
             self.router_latent = (packed, FrontGemms(gemms), mlp.gate.weight.shape[0])
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
             # Pre-wait weight-streaming GEMM at the token counts it serves (its own
@@ -292,13 +256,9 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
-                # Die-static work on die-placed weights, two TMA boxes (K 128) per
-                # ring stage (LATENT_UP_WIDE); the stock up_proj reads the placed copy.
-                policies = {r: (s,) + LATENT_UP_WIDE for r, s in self.parts.items()}
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], policies, partials=True, dies=True
+                    weights["latent_up"], self.parts, partials=True
                 ).prepare()
-                transform.up_proj.weight.data = self.latent_up_parts.weight
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n
@@ -337,9 +297,8 @@ class SpMlp:
         out = {f: self.gemms[f].choice(n) for f in FAMILIES}
         concat = self.router_latent
         if concat is not None and n in concat[1].plans:
-            kind = "wide" if n in concat[1].splits else "ltpin"
             out["latent_down"] = Choice(
-                Path.TUNED, tactic=(kind, None), note=f"router|latent_down {kind}"
+                Path.TUNED, tactic=("ltpin", None), note="router|latent_down ltpin"
             )
         return out
 
@@ -383,7 +342,7 @@ class SpMlp:
             # Router | latent down as one FP32 GEMM, then one kernel stages its
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent
-            y = gemm.output(h, packed.shape[0])
+            y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
             pw = self.prewait_router_latent
             if (
                 pw is not None
