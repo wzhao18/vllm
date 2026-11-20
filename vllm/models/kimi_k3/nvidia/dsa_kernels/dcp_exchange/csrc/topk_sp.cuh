@@ -25,9 +25,11 @@ namespace k31dcpx {
 
 constexpr int kSpHdr = 8;
 constexpr int kSpWin = 256;
-constexpr int kSpBand = 64;
-constexpr int kSpMsg = kSpHdr + kSpWin / 2 + kSpBand;  // 200 words
+constexpr int kSpBand = 256;   // band keys per rank
+constexpr int kSpBandH = 128;  // band half-widths tried
+constexpr int kSpMsg = kSpHdr + kSpWin / 2 + kSpBand;  // 392 words
 static_assert(kSpMsg <= kV2Msg && kSpMsg % 4 == 0, "round-1 slot");
+static_assert(kV2Tie <= kSpBand, "tie lists in tg");
 constexpr int kSpFine = 2048;
 constexpr int kSpBt = 1024;   // block-table entries cached per row
 constexpr int kSpRs = 257;    // per-rank window suffix stride
@@ -78,6 +80,11 @@ __device__ __forceinline__ uint32_t sp_key_at(const uint4& kw, int j) {
   const uint32_t w = (j & 4) ? ((j & 2) ? kw.w : kw.z) : ((j & 2) ? kw.y : kw.x);
   return (j & 1) ? (w >> 16) : (w & 0xFFFFu);
 }
+__device__ __forceinline__ uint32_t sp_max_nan2(uint32_t a, uint32_t b) {
+  uint32_t m;
+  asm("max.NaN.bf16x2 %0, %1, %2;" : "=r"(m) : "r"(a), "r"(b));
+  return m;
+}
 __device__ __forceinline__ uint32_t sp_nvalid(const uint4& r) {
   const uint4 kw = sp_keys(r);
   uint32_t n = 0;
@@ -98,7 +105,6 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
   __shared__ __align__(16) uint32_t bm[2 * C::kBmW];
   __shared__ __align__(16) uint32_t fine[kSpFine + 64];  // later: window suffixes / radix rx
   __shared__ __align__(16) uint32_t coarse[256];         // later: radix histogram
-  __shared__ __align__(16) uint32_t rx[kV2MaxW * kSpMsg];
   __shared__ __align__(16) uint32_t msg[kSpMsg];
   __shared__ __align__(16) uint2 bnd[kSpBand];
   __shared__ __align__(16) uint32_t suf[T];
@@ -107,8 +113,13 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
   __shared__ uint32_t warp_sums[64];
   __shared__ int s_i[16];
   __shared__ uint32_t s_u[16];
+  __shared__ int s_tn[kV2MaxW];
   __shared__ long long s_dbg[32];
   uint32_t* const bmg = bm;
+  // round-1 slots received: in the SMEM row (dead after the candidate list; paths that read the
+  // row after the round re-land it)
+  uint32_t* const rx = reinterpret_cast<uint32_t*>(srow);
+  static_assert(kV2MaxW * kSpMsg * 4 <= C::kCapG * 16, "rx in the SMEM row");
   uint32_t* const bme = bm + C::kBmW;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   uint32_t ws_par = 0;
@@ -219,17 +230,37 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     }
     __syncthreads();
     const uint32_t mb = s_u[0];
-    const uint32_t base = mb > 1024u ? mb - 1024u : 1u;
+    // the sample's keys in the top 2 octaves below its max, one key per bin (few, mostly
+    // uncontended atomics); a sample with fewer than its share of q + 256 keys there takes the
+    // 8-octave histogram (bins of 4 keys)
+    uint32_t base = mb > 256u ? mb - 256u : 1u, bsh = 0;
 #pragma unroll 1
-    for (int g = tid * 8 + (tid & 7); g < ng; g += T * 8) {
-      const uint4 kw = sp_keys(grp(g));
+    for (int pass = 0;; ++pass) {
+      uint32_t nin = 0;
+#pragma unroll 1
+      for (int g = tid * 8 + (tid & 7); g < ng; g += T * 8) {
+        const uint4 r = grp(g);
+        if (max_key_bound(r) <= base) continue;
+        const uint4 kw = sp_keys(r);
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const uint32_t k = sp_key_at(kw, j);
-        if (k >= base) atomicAdd(&coarse[(k - base) >> 2], 1u);
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = sp_key_at(kw, j);
+          if (k >= base) {
+            atomicAdd(&coarse[(k - base) >> bsh], 1u);
+            ++nin;
+          }
+        }
       }
+      nin = __reduce_add_sync(0xffffffffu, nin);
+      if (lane == 0 && nin) atomicAdd(&s_u[13], nin);
+      __syncthreads();
+      if (K31_LIKELY(pass == 1 || s_u[13] >= (q + 256u + 7) / 8)) break;
+      __syncthreads();
+      for (int i = tid; i < 256; i += T) coarse[i] = 0;
+      base = mb > 1024u ? mb - 1024u : 1u;
+      bsh = 2;
+      __syncthreads();
     }
-    __syncthreads();
     SPDBG(10);
     if (warp == 0) {  // theta: the sample's (q + 256)-th key's bin; e_est: its q-th key's bin
       const uint32_t want = (q + 256u + 7) / 8, want_e = max(1u, q / 8);
@@ -251,8 +282,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
           const uint32_t b = 255 - 8 * lane - j;
           const bool a = run < want, ae = run < want_e;
           run += c[j];
-          if (ft && a && run >= want) s_i[0] = (int)(base + 4 * b);
-          if (fe && ae && run >= want_e) s_i[1] = (int)(base + 4 * b + 2);
+          if (ft && a && run >= want) s_i[0] = (int)(base + (b << bsh));
+          if (fe && ae && run >= want_e) s_i[1] = (int)(base + (b << bsh));
         }
       }
       const uint32_t bt = __ballot_sync(0xffffffffu, ft), be = __ballot_sync(0xffffffffu, fe);
@@ -264,7 +295,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     }
     __syncthreads();
     SPDBG(1);
-    const int theta = s_i[0], e_est = s_i[1];
+    int theta = s_i[0];
     // ---- 2. keys >= theta. Rows in SMEM: thread t tests its kNR contiguous groups (masks
     // in registers, no atomics), one scan places every candidate in position order
     // (cand[i] = position << 12 | min(key - theta, 4095)), then the fine histogram from
@@ -272,28 +303,42 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     // theta = key(+0) and lists over kCand take the full passes.
     uint32_t* const cand = bm;  // the selection bitmaps are unused on the list path
     int nc = 0;
-    bool ovf = ng > CG || theta == 0x8000;
+    bool ovf = ng > CG;
     if (!ovf) {
-      constexpr int NR = C::kNR, kMW = (NR + 3) / 4;
+      constexpr int NR = C::kNR;
       const int tg0 = tid * NR;
-      const uint32_t t2 = v2_th_bf16(theta);
-      uint32_t mk[kMW];
+      auto group = [&](int g) -> uint4 {  // positions >= L read as NaN
+        uint4 r = srow[g];
+        const int nvk = L - 8 * g;
+        if (K31_RARE(nvk < 8)) {
+          r.x |= (nvk > 0 ? 0u : 0xFFFFu) | (nvk > 1 ? 0u : 0xFFFF0000u);
+          r.y |= (nvk > 2 ? 0u : 0xFFFFu) | (nvk > 3 ? 0u : 0xFFFF0000u);
+          r.z |= (nvk > 4 ? 0u : 0xFFFFu) | (nvk > 5 ? 0u : 0xFFFF0000u);
+          r.w |= (nvk > 6 ? 0u : 0xFFFFu) | (nvk > 7 ? 0u : 0xFFFF0000u);
+        }
+        return r;
+      };
+      // per group: 4 packed compares (0xFFFF per key >= theta) summed as words (IADD3: the halves'
+      // counts come back from the sum, below), a has-candidate bit, a NaN-propagating max. A
+      // sample bound that admits fewer than q keys is lowered (1, 2, 4 octaves) and the pass redone.
+      constexpr int kMW = (NR + 3) / 4;
+      uint32_t mk[kMW], nv, tot, t2;
+      int c;
+#pragma unroll 1
+      for (int it = 0;; ++it) {
+      if (theta == 0x8000) {  // key(+0): -0 passes the packed compare
+        ovf = true;
+        break;
+      }
+      t2 = v2_th_bf16(theta);
+      uint32_t cnt = 0, nm0 = 0, nm1 = 0;
 #pragma unroll
       for (int w = 0; w < kMW; ++w) mk[w] = 0u;
-      uint32_t cnt = 0, nv = 0;
 #pragma unroll
       for (int i = 0; i < NR; ++i) {
         const int g = tg0 + i;
         if (g < ng) {
-          uint4 r = srow[g];
-          const int nvk = L - 8 * g;
-          if (K31_RARE(nvk < 8)) {  // positions >= L read as NaN
-            r.x |= (nvk > 0 ? 0u : 0xFFFFu) | (nvk > 1 ? 0u : 0xFFFF0000u);
-            r.y |= (nvk > 2 ? 0u : 0xFFFFu) | (nvk > 3 ? 0u : 0xFFFF0000u);
-            r.z |= (nvk > 4 ? 0u : 0xFFFFu) | (nvk > 5 ? 0u : 0xFFFF0000u);
-            r.w |= (nvk > 6 ? 0u : 0xFFFFu) | (nvk > 7 ? 0u : 0xFFFF0000u);
-          }
-          nv += K31_RARE(v2_is_nan2(v2_max_nan(r))) ? sp_nvalid(r) : 8u;
+          const uint4 r = group(g);
           // 0xFFFF / 0 per key -> one byte per key (prmt) -> one bit per key (mask, mul)
           const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
           const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);
@@ -301,13 +346,24 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
                               ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
           cnt += __popc(m8);
           mk[i / 4] |= m8 << (8 * (i % 4));
+          nm0 = sp_max_nan2(nm0, sp_max_nan2(r.x, r.y));
+          nm1 = sp_max_nan2(nm1, sp_max_nan2(r.z, r.w));
         }
       }
-      uint32_t tot;
-      int c = (int)(v2_scan<T>(cnt | (nv << 16), SPWS, &tot) & 0xFFFFu);
+      nv = 8u * (uint32_t)::max(0, ::min(NR, ng - tg0));
+      if (K31_RARE(v2_is_nan2(nm0) || v2_is_nan2(nm1))) {  // NaN keys (and the tail group): recount
+        nv = 0;
+        for (int i = 0; i < NR; ++i)
+          if (tg0 + i < ng) nv += sp_nvalid(group(tg0 + i));
+      }
+      c = (int)(v2_scan<T>(cnt | (nv << 16), SPWS, &tot) & 0xFFFFu);
       nc = (int)(tot & 0xFFFFu);
+      if (K31_LIKELY(nc >= (int)q || theta <= (int)base || it == 2)) break;
+      SPSTAT(14);
+      theta = ::max((int)base, theta - (128 << it));
+      }
       SPDBG(11);
-      ovf = nc > C::kCand;
+      ovf = ovf || nc > C::kCand;
       if (!ovf) {
         const uint16_t* s16 = reinterpret_cast<const uint16_t*>(srow);
 #pragma unroll
@@ -411,37 +467,44 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       const uint32_t c0 = e < 0 ? 0u : fine[lo - theta + 2 * tid], c1 = e < 0 ? 0u : fine[lo - theta + 2 * tid + 1];
       if (c0 >= kCountMax || c1 >= kCountMax) s_u[6] = 1;
       msg[kSpHdr + tid] = tagw(tag, (::min(c0, kCountMax) << 12) | ::min(c1, kCountMax));
-    } else if (warp == C::kWarps - 1) {
-      // band [e - d, e + d]: the largest d whose keys fit kSpBand
-      const int d = lane;
-      bool ok = e >= 0 && e - d >= theta && e + d + 1 <= theta + kSpFine && L < (1 << 18);
-      uint32_t c = 0;
-      if (ok) {
-        c = cloc(e - d) - cloc(e + d + 1);
-        ok = c <= (uint32_t)kSpBand;
-      }
-      const uint32_t bal = __ballot_sync(0xffffffffu, ok);
-      const int ds = ~bal ? __ffs(~bal) - 2 : 31;  // the longest prefix of ok
-      if (d == ::max(ds, 0)) {
-        s_i[9] = ds;
-        s_i[4] = e - ds;
-        s_i[5] = e + ds;
-        s_u[9] = c;
-        s_u[8] = e < 0 ? 0u : cloc(lo + kSpWin);
-      }
     }
-    __syncthreads();
-    const int bl = s_i[4], bh = s_i[5];
-    if (s_i[9] >= 0 && !ovf) {  // the band's keys from the list (bl >= theta)
-      for (int i = tid; i < nc; i += T) {
-        const uint32_t x = cand[i];
-        const int k = theta + (int)(x & 0xFFFu);
-        if (k >= bl && k <= bh) {
-          const uint32_t s = atomicAdd(&s_u[5], 1u);
-          if (s < kSpBand) bnd[s] = make_uint2(x >> 12, (uint32_t)k);
+    // band [e - h, e + h]: the widest half-width h < kSpBandH whose keys fit kSpBand (monotone in h:
+    // the count of passing h gives it, one barrier); band words are position (16 bits) | key - bl
+    // (8 bits), so a band needs L < 2^16
+    bool bok = false;
+    if (tid >= kSpWin / 2 && tid < kSpWin / 2 + kSpBandH) {
+      const int h = tid - kSpWin / 2;
+      bok = e >= 0 && e - h >= theta && e + h + 1 <= theta + kSpFine && L < (1 << 16) &&
+            cloc(e - h) - cloc(e + h + 1) <= (uint32_t)kSpBand;
+    }
+    const int hs = __syncthreads_count(bok) - 1;  // -1: no band
+    const int bl = e - hs, bh = e + hs;
+    if (tid == 0) {
+      s_i[9] = hs;
+      s_i[4] = bl;
+      s_i[5] = bh;
+      s_u[9] = hs >= 0 ? cloc(bl) - cloc(bh + 1) : 0u;
+      s_u[8] = e < 0 ? 0u : cloc(lo + kSpWin);
+    }
+    if (hs >= 0 && !ovf) {  // the band's keys from the list (bl >= theta), in position order
+      const int cp = (nc + T - 1) / T, i0 = ::min(nc, tid * cp), i1 = ::min(nc, i0 + cp);
+      const uint32_t dl = (uint32_t)(bl - theta), dh = (uint32_t)(bh - theta);
+      uint32_t cb = 0;
+      for (int i = i0; i < i1; ++i) {
+        const uint32_t d = cand[i] & 0xFFFu;
+        cb += d >= dl && d <= dh;
+      }
+      uint32_t btot;
+      uint32_t o = v2_scan<T>(cb, SPWS, &btot);
+      if (tid == 0) s_u[5] = btot;
+      for (int i = i0; i < i1 && cb; ++i) {
+        const uint32_t x = cand[i], d = x & 0xFFFu;
+        if (d >= dl && d <= dh) {
+          if (o < (uint32_t)kSpBand) msg[kSpHdr + kSpWin / 2 + o] = tagw(tag, (x >> 12) | ((d - dl) << 16));
+          ++o;
         }
       }
-    } else if (s_i[9] >= 0) {  // the band's keys (<= kSpBand by the counts) with their positions
+    } else if (hs >= 0) {  // the band's keys (<= kSpBand by the counts) with their positions
       const SpTh tl = sp_th(bl), th1 = sp_th(bh + 1);
       auto visit = [&](int g, const uint4& r) {
         if (g >= ng) return;
@@ -463,17 +526,17 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     __syncthreads();
     SPDBG(15);
     const int nb = ::min((int)s_u[5], kSpBand);
-    const bool bvalid = s_i[9] >= 0 && (uint32_t)nb == s_u[9] && s_u[5] <= (uint32_t)kSpBand;
+    const bool bvalid = hs >= 0 && (uint32_t)nb == s_u[9] && s_u[5] <= (uint32_t)kSpBand;
     if (tid < kSpBand) {
-      if (tid < nb && bvalid) {
+      if (ovf && tid < nb && bvalid) {
         const uint2 me = bnd[tid];
         int rk = 0;
         for (int s = 0; s < nb; ++s) rk += bnd[s].x < me.x;
-        msg[kSpHdr + kSpWin / 2 + rk] = tagw(tag, me.x | ((me.y - (uint32_t)bl) << 18));
+        msg[kSpHdr + kSpWin / 2 + rk] = tagw(tag, me.x | ((me.y - (uint32_t)bl) << 16));
       }
       if (tid >= (bvalid ? nb : 0)) msg[kSpHdr + kSpWin / 2 + tid] = tagw(tag, 0u);
     } else if (tid == kSpBand) {
-      const uint32_t flags = (e >= 0 && s_u[6] == 0 ? 1u : 0u) | (bvalid ? 2u : 0u);
+      const uint32_t flags = (e >= 0 && s_u[6] == 0 ? 1u : 0u) | (bvalid ? 2u : 0u) | (ovf ? 0u : 4u);
       msg[0] = tagw(tag, (uint32_t)lo | (flags << 16));
       msg[1] = tagw(tag, ::min(s_u[8], 0xFFFFFFu));
       msg[2] = tagw(tag, ::min(s_u[3], 0xFFFFFFu));
@@ -599,17 +662,74 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
             if (ties && !(((hdr(r, 0) >> 17) & 1u) && blr <= tau && tau <= bhr)) bok = false;
           }
           SPDBG(18);
+          // a band missed ties at tau: ONE tie round of complete ascending tie lists (<= kV2Tie ids
+          // per rank; ranks holding ties send them from their candidate lists), else id radix
+          bool tfit = true;
           if (!bok) {
+            for (int r = 0; r < W; ++r) {
+              int t = 0;
+              if (hdr(r, 2)) {
+                const int lr = (int)(hdr(r, 0) & 0xFFFFu);
+                t = (int)(rsuf[r * kSpRs + tau - lr] - rsuf[r * kSpRs + tau + 1 - lr]);
+              }
+              if (t > kV2Tie || (t > 0 && !((hdr(r, 0) >> 18) & 1u))) tfit = false;
+              if (tid == 0) s_tn[r] = t;
+            }
+          }
+          if (!bok && !tfit) {
             SPSTAT(11);
             lev0 = 2;
             rem = need;
+          } else if (!bok) {
+            SPSTAT(13);
+            __syncthreads();  // s_tn; every thread is past the round-1 reads of msg
+            const int tme = s_tn[p.rank];
+            if (tme > 0) {  // this rank's ties at tau from its list (position = id order)
+              const uint32_t dt = (uint32_t)(tau - theta);
+              const int cp = (nc + T - 1) / T, i0 = ::min(nc, tid * cp), i1 = ::min(nc, i0 + cp);
+              uint32_t ct = 0;
+              for (int i = i0; i < i1; ++i) ct += (cand[i] & 0xFFFu) == dt;
+              uint32_t ttot;
+              uint32_t o = v2_scan<T>(ct, SPWS, &ttot);
+              for (int i = i0; i < i1 && ct; ++i) {
+                const uint32_t x = cand[i];
+                if ((x & 0xFFFu) == dt) {
+                  if (o < (uint32_t)kV2Tie) msg[o] = tagw(tag, gid_of((int)(x >> 12), p.rank));
+                  ++o;
+                }
+              }
+              if (tid == 0 && (int)ttot != tme) spin_fail(p.err, 54);
+            }
+            const int nmp = (tme + 3) & ~3;
+            if (tme + tid < nmp) msg[tme + tid] = tagw(tag, 0u);
+            __syncthreads();
+            const int64_t trow = p.off_tie + ((int64_t)(par * p.cap + row) * W) * kV2Tie;
+            send(msg, nmp, trow + (int64_t)p.rank * kV2Tie);
+            for (int i = tid; i < W * (kV2Tie / 4); i += T) {
+              const int r = i / (kV2Tie / 4), j = (i % (kV2Tie / 4)) * 4;
+              if (j < ((s_tn[r] + 3) & ~3)) poll(p.box + trow + (int64_t)r * kV2Tie + j, tg + r * kV2Tie + j, 55);
+            }
+            __syncthreads();
+            for (int c = tid; c < W * kV2Tie; c += T) {  // the need-th smallest id of the union
+              const int r = c / kV2Tie, j = c % kV2Tie;
+              if (j >= s_tn[r]) continue;
+              const uint32_t x = tg[c] & 0xFFFFFFu;
+              int rk = j;
+              for (int r2 = 0; r2 < W; ++r2)
+                if (r2 != r) rk += count_below(tg + r2 * kV2Tie, s_tn[r2], x);
+              if (rk == (int)need - 1) s_u[7] = x;
+            }
+            for (int c = tid; c < W * kV2Tie; c += T)
+              if (c % kV2Tie < ((s_tn[c / kV2Tie] + 3) & ~3)) st_u32(p.box + trow + c, kSent);
+            __syncthreads();
+            gstar = s_u[7];
           } else {
             for (int i = tid; i < W * kSpBand; i += T) {  // every rank's ties at tau
               const int r = i / kSpBand, j = i % kSpBand;
               if (j < (int)hdr(r, 4)) {
                 const uint32_t w = hdr(r, kSpHdr + kSpWin / 2 + j);
-                if ((int)(hdr(r, 3) & 0xFFFFu) + (int)(w >> 18) == tau)
-                  tg[atomicAdd(&s_u[11], 1u)] = gid_of((int)(w & 0x3FFFFu), r);
+                if ((int)(hdr(r, 3) & 0xFFFFu) + (int)((w >> 16) & 0xFFu) == tau)
+                  tg[atomicAdd(&s_u[11], 1u)] = gid_of((int)(w & 0xFFFFu), r);
               }
             }
             __syncthreads();
@@ -630,6 +750,19 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       }
     }
     SPDBG(5);
+    // paths that read the row after the round (radix rounds, full selection) re-land it: the
+    // received slots overwrote its head
+    if (K31_RARE(ovf || lev0 >= 0 || vtot <= (uint32_t)K || tau < theta)) {
+      __syncthreads();
+      if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        const int c = tid >> 5, a = nsm * c / kV2Cp, b = nsm * (c + 1) / kV2Cp;
+        if (b > a) bulk_g2s(srow + a, reinterpret_cast<const uint4*>(lrow) + a, (uint32_t)(b - a) * 16u, &s_bar);
+        else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+      }
+      mbar_wait(&s_bar, bar_phase);
+      bar_phase ^= 1u;
+    }
     if (K31_RARE(lev0 >= 0)) {
       // radix rounds over c = key << 24 | (0xFFFFFF - gid): 8 bits per round, from the top
       SPSTAT(lev0 == 0 ? 3 : 2);
@@ -841,5 +974,190 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
 #undef SPSTAT
 #undef SPWS
 }
+
+#ifdef SP_SKEL
+// Sync-only skeleton of the topk_sp hot path (SOL protocol calibration, built only with -DSP_SKEL, launched in
+// place of topk_sp_kernel): the same landing, CTA barriers (19 per row), scans, message bytes and round as the R4
+// one-round path, without compares, atomics or selection. Rows are written as -1 (count 0). Same stamps.
+template <int T>
+__global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_skel_kernel(V2Params p) {
+  using C = SpCfg<T>;
+  constexpr int CG = C::kCapG, FB = C::kFB;
+  __shared__ __align__(128) uint4 srow[CG];
+  __shared__ __align__(8) uint64_t s_bar;
+  __shared__ __align__(16) uint32_t fine[kSpFine + 64];
+  __shared__ __align__(16) uint32_t coarse[256];
+  __shared__ __align__(16) uint32_t rx[kV2MaxW * kSpMsg];
+  __shared__ __align__(16) uint32_t msg[kSpMsg];
+  __shared__ __align__(16) uint32_t suf[T];
+  __shared__ int btab[kSpBt];
+  __shared__ uint32_t warp_sums[64];
+  __shared__ int s_i[16];
+  __shared__ uint32_t s_u[16];
+  __shared__ long long s_dbg[32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t ws_par = 0;
+#define SKWS (warp_sums + 32 * (ws_par ^= 1u))
+  for (int i = tid; i < kSpFine + 64; i += T) fine[i] = 0;
+  for (int i = tid; i < 256; i += T) coarse[i] = 0;
+  if (tid < 16) { s_u[tid] = 0; s_i[tid] = 0; }
+  if (tid == 0) {
+    mbar_init(&s_bar, kV2Cp);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  uint32_t bar_phase = 0;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  const int W = p.W, K = p.K;
+  const int bs_sh = (p.block_size > 0 && (p.block_size & (p.block_size - 1)) == 0) ? __ffs(p.block_size) - 1 : -1;
+#define SKDBG(i)                                                                     \
+  if (p.dbg && tid == 0) {                                                           \
+    if ((i) == 0) {                                                                  \
+      for (int z = 1; z < 30; ++z) s_dbg[z] = 0;                                     \
+      p.dbg[(int64_t)row * kV2Dbg] = now_ns();                                       \
+    }                                                                                \
+    s_dbg[i] = (long long)clock64();                                                 \
+    if ((i) == 8) {                                                                  \
+      p.dbg[(int64_t)row * kV2Dbg + 8] = now_ns();                                   \
+      for (int z = 0; z < 30; ++z) p.dbg[(int64_t)row * kV2Dbg + 32 + z] = s_dbg[z]; \
+    }                                                                                \
+  }
+  for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
+    SKDBG(0);
+    const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
+    const int L = p.local_len[row];
+    const int ng = (L + 7) >> 3, nsm = ::max(1, ::min(ng, CG));
+    if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      const int c = tid >> 5, a = nsm * c / kV2Cp, b = nsm * (c + 1) / kV2Cp;
+      if (b > a) bulk_g2s(srow + a, reinterpret_cast<const uint4*>(lrow) + a, (uint32_t)(b - a) * 16u, &s_bar);
+      else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+    }
+    int* orow = p.out + (int64_t)row * p.ostride;
+    const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
+    const int* btrow = p.block_table != nullptr ? p.block_table + (int64_t)req * p.bt_stride : nullptr;
+    const int ep = p.epoch[row];
+    const uint32_t tag = (uint32_t)(ep % 255);
+    const int par = ep & 1;
+    mbar_wait(&s_bar, bar_phase);
+    bar_phase ^= 1u;
+    SKDBG(9);
+    // 1. sample: max barrier, histogram barrier, warp-0 theta barrier
+    uint32_t x = srow[(tid * 8) % nsm].x;
+    if (lane == 0) s_u[0] = x;
+    __syncthreads();
+    x += s_u[0];
+    __syncthreads();
+    SKDBG(10);
+    if (warp == 0) {
+      uint32_t c8[8], s = 0;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) { c8[j] = coarse[255 - 8 * lane - j]; s += c8[j]; }
+      uint32_t y = s;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const uint32_t z = __shfl_up_sync(0xffffffffu, y, o);
+        if (lane >= o) y += z;
+      }
+      if (lane == 0) s_i[0] = (int)(y + (x & 1u));
+    }
+    __syncthreads();
+    SKDBG(1);
+    // 2. mask pass scan, compaction barrier, histogram barrier
+    uint32_t tot;
+    const uint32_t c0 = v2_scan<T>((x >> 3) & 1u, SKWS, &tot);
+    SKDBG(11);
+    __syncthreads();
+    SKDBG(12);
+    __syncthreads();
+    SKDBG(2);
+    // 3. e: scan over the fine bins, search barrier; window / band barrier; band barrier
+    {
+      uint32_t v = 0;
+#pragma unroll
+      for (int j = 0; j < FB; ++j) v += fine[kSpFine - 1 - FB * tid - j];
+      const uint32_t pre = v2_scan<T>(v, SKWS, &tot);
+      suf[tid] = pre + c0;
+    }
+    __syncthreads();
+    SKDBG(13);
+    if (tid < kSpWin / 2) msg[kSpHdr + tid] = tagw(tag, fine[2 * tid] + suf[tid]);
+    __syncthreads();
+    __syncthreads();
+    SKDBG(15);
+    if (tid < kSpBand) {
+      msg[kSpHdr + kSpWin / 2 + tid] = tagw(tag, 0u);
+    } else if (tid < kSpBand + kSpHdr) {
+      msg[tid - kSpBand] = tagw(tag, tid == kSpBand ? 0x10000u : 0u);
+    }
+    __syncthreads();
+    SKDBG(14);
+    // 4. round 1 (same message bytes, multicast, poll)
+    const int64_t r1row = p.off_r1 + ((int64_t)(par * p.cap + row) * W) * kV2Msg;
+    for (int j = tid * 4; j < kSpMsg; j += T * 4) {
+      const uint4 v = make_uint4(msg[j], msg[j + 1], msg[j + 2], msg[j + 3]);
+      const int64_t off = r1row + (int64_t)p.rank * kV2Msg + j;
+      if (p.mc) mc_st_v4(p.mc + off * 4, v);
+      else
+        for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
+    }
+    SKDBG(3);
+    const int nblk = bs_sh >= 0 ? (L + p.block_size - 1) >> bs_sh : kSpBt + 1;
+    if (btrow != nullptr && nblk <= kSpBt)
+      for (int i = tid; i < nblk; i += T) btab[i] = btrow[i];
+    for (int i = tid; i < W * (kSpMsg / 4); i += T) {
+      const int r = i / (kSpMsg / 4), j = (i % (kSpMsg / 4)) * 4;
+      const uint32_t* src = p.box + r1row + (int64_t)r * kV2Msg + j;
+      const long long t0 = now_ns();
+      uint4 v = ld_sys_v4(src);
+      while (!tagged(v, tag)) {
+        if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 51); break; }
+        __nanosleep(128);
+        v = ld_sys_v4(src);
+      }
+      *reinterpret_cast<uint4*>(rx + r * kSpMsg + j) = v;
+    }
+    __syncthreads();
+    SKDBG(4);
+    // 5. resolve: suffix barrier, tau count barrier, tie collection barrier, tie rank barrier
+    if (warp < W) {
+      uint32_t s = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) s += rx[warp * kSpMsg + kSpHdr + 4 * lane + j] & 0xFFFu;
+      uint32_t y = s;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const uint32_t z = __shfl_down_sync(0xffffffffu, y, o);
+        if (lane + o < 32) y += z;
+      }
+      fine[warp * kSpRs + lane] = y;
+    }
+    __syncthreads();
+    SKDBG(16);
+    const int n = __syncthreads_count(fine[(tid & 3) * kSpRs + (tid & 31)] > (uint32_t)K);
+    SKDBG(17);
+    if (tid < 16) s_u[tid] = (uint32_t)n;
+    __syncthreads();
+    SKDBG(18);
+    __syncthreads();
+    SKDBG(5);
+    // 6. selection scan, writes (-1 rows), count, epoch
+    const uint32_t pre = v2_scan<T>(s_u[tid & 15] & 1u, SKWS, &tot);
+    SKDBG(7);
+    for (int i = tid; i < K; i += T) orow[i] = (int)(pre & 0u) - 1;
+    if (tid == 0) {
+      p.out_count[row] = 0;
+      p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
+    }
+    SKDBG(8);
+    __syncthreads();
+    for (int i = tid; i < kSpFine + 64; i += T) fine[i] = 0;
+    if (tid < 16) { s_u[tid] = 0; s_i[tid] = 0; }
+    __syncthreads();
+  }
+#undef SKDBG
+#undef SKWS
+}
+#endif  // SP_SKEL
 
 }  // namespace k31dcpx

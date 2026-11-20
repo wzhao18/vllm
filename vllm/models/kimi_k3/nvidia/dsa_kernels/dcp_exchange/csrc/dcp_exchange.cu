@@ -3332,8 +3332,13 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
     a1[0].val.programmaticStreamSerializationAllowed = 1;
     c1.attrs = a1;
     c1.numAttrs = 1;
+#ifdef SP_SKEL  // sync-only skeleton (calibration builds only)
+    if (wide1) C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, topk_skel_kernel<1024>, p));
+    else C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, topk_skel_kernel<kV2T>, p));
+#else
     if (wide1) C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, topk_sp_kernel<1024>, p));
     else C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, topk_sp_kernel<kV2T>, p));
+#endif
     return;
   }
   const int nres = (int)topk_v2_resident_of(&nwide);

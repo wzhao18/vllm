@@ -43,7 +43,8 @@ STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass"
 PHASES_SP = {0: "start", 9: "landed+max", 10: "sampled", 1: "theta", 11: "mask+scan", 12: "compacted", 2: "pass", 13: "e", 14: "msg built",
              15: "band", 3: "sent", 4: "polled", 16: "r:suffix", 17: "r:tau", 18: "r:ties", 5: "resolved", 6: "radix",
              7: "selected", 8: "end"}
-STATS_SP = ("rows", "one_round", "id_radix", "key_radix", "select_all", "-", "-", "-")
+STATS_SP = ("rows", "one_round", "id_radix", "key_radix", "select_all", "list", "full_pass", "bad_window",
+            "disjoint", "tau_below", "tau_top", "band_miss", "list_sel", "tie_round", "retheta")
 
 
 def make_logits(case, T, width, Lloc, gen, dev, rank=0):
@@ -67,6 +68,10 @@ def make_logits(case, T, width, Lloc, gen, dev, rank=0):
                 x[rare, 1:10001:2] = 6.0
         else:
             x[rare] = torch.relu(x[rare] - 7.0)
+    elif case == "tierow":
+        # relu rows quantized to 1/16 (~50 keys per value near tau: ties beyond a 256-key band
+        # around each rank's own q-th key), ranks shifted 2 values apart: band misses
+        x = torch.round(torch.relu(x + 0.3) * 32.0) / 16.0 + 0.125 * rank
     elif case == "hot_recent":  # recent tokens score much higher (local position ~ L)
         pos = torch.arange(width, device=dev)[None, :]
         hot = (pos >= (Lloc[:, None] - 512)) & (pos < Lloc[:, None])
@@ -160,11 +165,11 @@ def main():
             g2.manual_seed(99 + 7 * rank + B)
             if case.startswith("dump:"):  # logits / lengths dumped from a decode step
                 dmp = torch.load(case[5:].replace("{rank}", str(rank)))
-                assert dmp["logits"].shape[0] == T, (dmp["logits"].shape, T)
-                L = dmp["local"].to(dev, torch.int32).contiguous()
-                G = dmp["glob"].to(dev, torch.int32).contiguous()
+                assert dmp["logits"].shape[0] >= T, (dmp["logits"].shape, T)  # first T rows
+                L = dmp["local"][:T].to(dev, torch.int32).contiguous()
+                G = dmp["glob"][:T].to(dev, torch.int32).contiguous()
                 logits = torch.full((T, width), float("nan"), dtype=torch.bfloat16, device=dev)
-                logits[:, : dmp["logits"].shape[1]] = dmp["logits"].to(dev)
+                logits[:, : dmp["logits"].shape[1]] = dmp["logits"][:T].to(dev)
                 if rank == 0:
                     print("dump stats", dmp["stats"].tolist(), "L", int(L.min()), int(L.max()), flush=True)
             else:
@@ -222,7 +227,7 @@ def main():
                 dist.all_reduce(m)
                 mism = int(m)
             # path counters + phase stamps (eager, one call)
-            stats = torch.zeros(8, dtype=torch.int32, device=dev)
+            stats = torch.zeros(16, dtype=torch.int32, device=dev)
             dbg = torch.zeros(T * 64, dtype=torch.int64, device=dev)
             phmap = PHASES_SP if a.impl == "sp" else PHASES_V2 if a.impl == "v2" else PHASES
             dist.barrier()
@@ -316,7 +321,7 @@ def main():
                         kern[nm[:60]] = (round(ev.self_device_time_total / max(n, 1), 2), n)
             torch.cuda.synchronize()
             ex.check()
-            st = torch.zeros(8, dtype=torch.int32, device=dev)
+            st = torch.zeros(16, dtype=torch.int32, device=dev)
             st.copy_(stats)
             dist.all_reduce(st)
             r = dict(B=B, T=T, case=case, cluster=cluster, segmax=segmax, max_local=max_local,

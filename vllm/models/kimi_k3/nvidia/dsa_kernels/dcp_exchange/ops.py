@@ -30,32 +30,6 @@ _EXT = None
 
 _COARSE_WORDS = 20
 _FINE_WORDS = 8
-_SPDIAG: dict = {}  # DIAG (not for landing): per-device topk_sp class counters
-
-
-def _spdiag_stats(dev):
-    """DIAG: counters every topk_v2 call adds to; a daemon thread prints them (SPSTAT lines)."""
-    t = _SPDIAG.get(dev)
-    if t is None:
-        import sys
-        import threading
-        import time
-
-        t = _SPDIAG[dev] = torch.zeros(16, dtype=torch.int32, device=dev)
-
-        def dump():
-            st = torch.cuda.Stream(device=dev)
-            host = torch.zeros(16, dtype=torch.int32, pin_memory=True)
-            t0 = time.time()
-            while True:
-                time.sleep(15)
-                with torch.cuda.stream(st):
-                    host.copy_(t, non_blocking=True)
-                st.synchronize()
-                print(f"SPSTAT t={time.time() - t0:.0f} dev={dev} {host.tolist()}", file=sys.stderr, flush=True)
-
-        threading.Thread(target=dump, daemon=True).start()
-    return t
 _TIE_LIST = 64  # kTieList
 _TIE_WORDS = 32  # kTieWords
 
@@ -409,8 +383,6 @@ class DcpExchange:
         [rows * 64] per-row phase stamps. Launches must stay stream-ordered.
         single_path: csrc/topk_sp.cuh (rows of at most ``sp_max_local`` positions; the
         same output, one kernel; stats 1 one round, 2 id radix, 3 key radix)."""
-        if stats is None and single_path:
-            stats = _spdiag_stats(logits.device)
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,
