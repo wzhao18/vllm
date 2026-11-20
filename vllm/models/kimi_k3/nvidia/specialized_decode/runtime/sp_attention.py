@@ -73,7 +73,7 @@ from ..cutedsl.common.sp_comm import SpComm, SpFinalGather
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
 from ...mxfp8 import is_mxfp8_linear
 from ..cutedsl.gemm.decode import DecodeProjection
-from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
+from ..cutedsl.gemm.mxfp8 import PRE_GATHER_CARVEOUT, Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
 from ..cutedsl.kda.sp import SpKdaCore
 from ..cutedsl.oproj.sp import SpOproj
@@ -155,9 +155,14 @@ def sp_boundary(decoder, comm, block, rows, mlp=None, delta_parts=()):
     first = decoder.layer_idx == 0
     gather_mx = isinstance(block.projection, Mxfp8Projection)
     out_mx = None if mlp is None else mlp.mx_input()
+    # An MXFP8 in-projection on the pre-wait kernel (``gemm.mxfp8`` kind "pre") streams
+    # its weights while the all-gather waits only if its CTAs are resident beside the
+    # gather's: the gather then runs at carve-out 100 (``PRE_GATHER_CARVEOUT``).
+    pre_carveout = PRE_GATHER_CARVEOUT if gather_mx and block.projection.pre else None
     return SpBoundary(
         comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first,
         gather_mx=gather_mx, out_mx=out_mx, delta_parts=delta_parts,
+        pre_carveout=pre_carveout,
     )  # fmt: skip
 
 

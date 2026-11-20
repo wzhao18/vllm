@@ -44,7 +44,7 @@ from cutlass import Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common import mx_rows
-from ..common.host import architecture, dynamic_fake, fake
+from ..common.host import architecture, dynamic_fake, fake, prepare_shared_carveout
 from ..common.mailbox import poll, rearm
 from ..common.primitives import at, launch, load_words, store_relaxed
 from ..common.sp_comm import positive_zero32
@@ -240,9 +240,11 @@ def _check_clusters(code, device, n_max, what):
 
 
 @cache
-def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts=0):
+def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts=0,
+                   carveout=None):  # fmt: skip
     """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx, parts) at any
-    n <= n_max."""
+    n <= n_max. ``carveout``: a preferred shared-memory carve-out (percent; keys the
+    cache) so a big-smem PDL successor becomes resident beside this kernel's CTAs."""
     with torch.accelerator.device_index(device):
         kernel = SpAttnResGather(
             nb, tp, has_delta=has_delta, write=write, mx=mx, parts=parts,
@@ -264,6 +266,8 @@ def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts
         RESIDENCY[("gather", nb, mx) + ((parts,) if parts else ())] = _check_clusters(
             code, device, n_max, "SP AttnRes + all-gather"
         )
+    if carveout is not None:
+        code = prepare_shared_carveout(code, device, carveout)
     return code
 
 
@@ -327,7 +331,7 @@ class SpBoundary:
     output row is also written into, quantized (the MLP's MXFP8 shared gate_up)."""
 
     def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False,
-                 gather_mx=False, out_mx=None, delta_parts=()):  # fmt: skip
+                 gather_mx=False, out_mx=None, delta_parts=(), pre_carveout=None):  # fmt: skip
         from ..common.host import to_cute
 
         self.comm, self.nb, self.write = comm, nb, write
@@ -353,13 +357,13 @@ class SpBoundary:
         self.codes = {}
         # The step's first layer has no delta (the embedding is the prefix).
         self.codes[("pre", not first)] = compile_gather(
-            nb, not first, write, tp, cap, n_max, device, gather_mx
+            nb, not first, write, tp, cap, n_max, device, gather_mx, 0, pre_carveout
         )
         # ``delta_parts``: split counts of a previous layer's beta-add GEMM that leaves
         # its output as FP32 partials (``SplitDelta``); summed here.
         for parts in sorted(set(delta_parts)):
             self.codes[("pre", True, parts)] = compile_gather(
-                nb, True, write, tp, cap, n_max, device, gather_mx, parts
+                nb, True, write, tp, cap, n_max, device, gather_mx, parts, pre_carveout
             )
         block = write >= 0
         for push in sorted({bool(p) for p in push_rows.values()}):
