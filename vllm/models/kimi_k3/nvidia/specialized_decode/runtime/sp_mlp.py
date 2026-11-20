@@ -54,9 +54,10 @@ SHARED = ("shared_gu", "shared_down")
 # router GEMM -> split-K reduce -> top-k -> (latent down join) -> stage.
 # Shard rows on the pinned GEMM (``ltpin``). In-step (D3-32 NVFP4 slice, step
 # median vs the router || latent down pair): n32 / n64 -34..-39 / -52..-64 us per
-# 24-layer step; n96 +28..+54 (the GEMM at 96 rows is no faster than the pair), so
-# n96 keeps the stock pair:
-ROUTER_LATENT = {"*": "25-72:ltpin"}
+# 24-layer step; n96 on the pinned GEMM was +28..+54. The rows ``prewait_gemm``
+# serves (n32 / n64 / n96) run the concat on it instead (weights streamed before the
+# dependency wait); the pinned plan stays the fallback for other row counts.
+ROUTER_LATENT = {"*": "25-100:ltpin"}
 
 
 def _stock_threshold():
