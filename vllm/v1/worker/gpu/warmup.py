@@ -904,12 +904,29 @@ def serving_shape_warmup_kernels(
         assert rejection_sampler is not None
         rejection_sampler.enable_adaptive_verification = False
     try:
+        serving_ladder_warmup(model_runner, worker_execute_model, worker_sample_tokens)
         serving_shape_warmup(model_runner, worker_execute_model, worker_sample_tokens)
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
             assert rejection_sampler is not None
             rejection_sampler.enable_adaptive_verification = True
+
+
+def serving_ladder_warmup(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
+    """Run the ``_serving_ladder_shapes`` step sets (small serving steps)."""
+    for i, shapes in enumerate(_serving_ladder_shapes(model_runner)):
+        run_serving_shape_warmup(
+            model_runner,
+            worker_execute_model,
+            worker_sample_tokens,
+            NUM_SERVING_WARMUP_VARIANTS + 1 + i,
+            ladder=shapes,
+        )
 
 
 def serving_shape_warmup(
@@ -929,15 +946,6 @@ def serving_shape_warmup(
     for variant in range(NUM_SERVING_WARMUP_VARIANTS):
         run_serving_shape_warmup(
             model_runner, worker_execute_model, worker_sample_tokens, variant
-        )
-    ladder = _serving_ladder_shapes(model_runner)
-    for i, shapes in enumerate(ladder):
-        run_serving_shape_warmup(
-            model_runner,
-            worker_execute_model,
-            worker_sample_tokens,
-            NUM_SERVING_WARMUP_VARIANTS + 1 + i,
-            ladder=shapes,
         )
     with jit_monitor.record_jit_events() as events:
         verified = run_serving_shape_warmup(
