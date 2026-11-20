@@ -81,18 +81,21 @@ SP_OPROJ = {4: "4-64:warp,65-:gemm"}
 # The online-MXFP8 o-projection per TP on token rows: "mx_push" = ``OprojPushMx``
 # (the GEMM pushes the partial rows to their owners), elsewhere "mxfp8" (the MXFP8
 # partial GEMM + ``SpReduceScatter(push=True)``).
-SP_OPROJ_MX = {4: "128:mx_push,256:mx_push,384:mx_push"}
+SP_OPROJ_MX = {4: "257-384:mx_push"}
+MX_BLOCK = 128  # OprojPushMx token rows per CTA pair
 
 
 @cache
-def compile_push_mx(rows, k, tp, cap, device):
-    kernel = OprojPushMx(k, rows, tp, cap)
+def compile_push_mx(rows_max, k, tp, cap, device):
+    """One OprojPushMx per 128-row token-block count (R is a runtime argument)."""
+    kernel = OprojPushMx(k, rows_max, tp, cap)
     g, f8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN
     e8 = cutlass.Float8E8M0FNU
     with torch.accelerator.device_index(device):
         ptrs = tuple(make_ptr(t, 16, g, assumed_align=16) for t in (f8, e8, f8, e8))
         peers = fake((tp,), None, torch.int64)
-        return cute.compile(kernel, *ptrs, peers, Int32(0), make_fake_stream())
+        args = (*ptrs, peers, Int32(0), Int32(rows_max))
+        return cute.compile(kernel, *args, make_fake_stream())
 
 
 def mx_tactic(tp: int, shape: Shape) -> str:
@@ -333,8 +336,10 @@ class SpOproj:
             comm.shard(r)  # raises for rows the mailbox cannot carry
             tactic = mx_tactic(ctx.tp, Shape(r, ctx.q))
             if tactic == "mx_push":
-                self.codes[r] = compile_push_mx(r, k, comm.tp, comm.rows_cap // comm.tp,
-                                                index)  # fmt: skip
+                bucket = -(-r // MX_BLOCK) * MX_BLOCK
+                self.codes[r] = compile_push_mx(
+                    bucket, k, comm.tp, comm.rows_cap // comm.tp, index
+                )
             elif tactic != "mxfp8":
                 raise Unsupported("oproj_rs", Shape(r, ctx.q), f"MXFP8 tactic {tactic!r}")
             comm.reduce_scatter_code(r, push=tactic == "mxfp8")
@@ -380,8 +385,9 @@ class SpOproj:
         )
         _, _, _, peers = self.comm.views(parity)
         self.codes[attn_out.rows](
-            *ptrs, peers, Int32(self.comm.rank), stream(w.weight.device)
-        )
+            *ptrs, peers, Int32(self.comm.rank), Int32(attn_out.rows),
+            stream(w.weight.device),
+        )  # fmt: skip
 
     def produce(self, attn_out: torch.Tensor, parity: int):
         """The o-projection half only, for an owner kernel that follows

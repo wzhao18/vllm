@@ -233,7 +233,7 @@ def _worker(env: dict[str, str]) -> None:
 
 # The online-MXFP8 o-projection: an "mxfp8" row (library GEMM + RS push) and the
 # OprojPushMx rows (the GEMM pushes to the owners), each twice (both parities).
-MX_ROWS = (64, 128, 256, 384)
+MX_ROWS = (64, 256, 324, 384)
 
 
 def _mx(x):
@@ -310,7 +310,7 @@ def _mx_worker(env: dict[str, str]) -> None:
         )  # fmt: skip
         oproj = sp.SpOproj(projection, comm, MX_ROWS, ctx)
         tactics = {r: oproj.choice(r).tactic for r in MX_ROWS}
-        assert tactics[384] == "mx_push" and not oproj.pushes(384), tactics
+        assert tactics[324] == tactics[384] == "mx_push" and not oproj.pushes(324), tactics
         out = torch.empty((CAP // world, WIDTH), dtype=torch.bfloat16, device=device)
         for step, rows in enumerate(MX_ROWS * 2):
             n = rows // world

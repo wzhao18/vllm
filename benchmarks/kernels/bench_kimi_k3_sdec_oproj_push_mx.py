@@ -127,10 +127,11 @@ def main():
                         make_ptr(e8, x.scale.data_ptr(), g8, assumed_align=16),
                     )
 
-                fn = cute.compile(kern, *ptrs(ws[0]), peers_c, cutlass.Int32(rank),
+                ri = cutlass.Int32(rows)
+                fn = cute.compile(kern, *ptrs(ws[0]), peers_c, cutlass.Int32(rank), ri,
                                   stream(dev))  # fmt: skip
                 recv.view(torch.int32).fill_(-0x80000000)
-                fn(*ptrs(ws[0]), peers_c, cutlass.Int32(rank), stream(dev))
+                fn(*ptrs(ws[0]), peers_c, cutlass.Int32(rank), ri, stream(dev))
                 torch.cuda.synchronize()
                 got = torch.stack([recv[o, rank, :n] for o in range(TP)]).view(rows, WIDTH)
                 want = sanitize(ref)
@@ -147,7 +148,7 @@ def main():
                 def mine(i=[0]):
                     j = i[0] % len(ws)
                     i[0] += 1
-                    fn(*cargs[j], peers_c, cutlass.Int32(rank), stream(dev))
+                    fn(*cargs[j], peers_c, cutlass.Int32(rank), ri, stream(dev))
 
                 t = graph_time(mine)
                 print(f"  {var}: {t:.2f} us/call (scaled_mm {t_stock:.2f})", flush=True)

@@ -109,25 +109,23 @@ class OprojPushMx:
     ``stages`` K tiles of ``kt`` in the operand ring; ``iw`` / ``ix`` TMA issuer warps
     for the weights / the activation (one issuer completes one bulk op at a time)."""
 
-    def __init__(self, k: int, rows: int, tp: int, cap: int, *, kt: int = 128,
+    def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 128,
                  stages: int = 8, iw: int = 1, ix: int = 1, prefetch: bool = False,
                  ksplit: int = 1):  # fmt: skip
         ktiles = k // kt // ksplit
-        tblocks = -(-rows // MMA_N)
+        tblocks = -(-rows_max // MMA_N)
         # ksplit 2: the two K halves of a (feature, token) block are two pairs of one
         # 4-CTA cluster that reduce over DSMEM; 4-CTA clusters co-reside only up to
         # ~46 at one CTA per SM (hwdb hw56C), so one token block (28 clusters).
-        if (k % (kt * ksplit) or ktiles % stages or rows % tp or rows // tp > cap
-                or rows > 512 or ksplit not in (1, 2) or (ksplit == 2 and tblocks > 1)):
-            raise ValueError(f"OprojPushMx k {k} rows {rows} tp {tp} cap {cap} "
+        if (k % (kt * ksplit) or ktiles % stages or rows_max > min(512, tp * cap)
+                or ksplit not in (1, 2) or (ksplit == 2 and tblocks > 1)):
+            raise ValueError(f"OprojPushMx k {k} rows {rows_max} tp {tp} cap {cap} "
                              f"kt {kt} stages {stages} ksplit {ksplit}")  # fmt: skip
-        self.k, self.rows, self.tp, self.cap = k, rows, tp, cap
-        self.n = rows // tp
+        self.k, self.tp, self.cap = k, tp, cap
         self.kt, self.stages, self.ktiles, self.ksplit = kt, stages, ktiles, ksplit
         self.iw, self.ix, self.prefetch = iw, ix, prefetch
         self.x_warp = TMA_WARP + iw
         self.threads = 32 * (TMA_WARP + iw + ix)
-        self.tma_rows = max(rows, TMA_MIN_ROWS)
         self.mblocks = WIDTH // FEATURES
         self.tblocks = tblocks
         self.clus = 2 * ksplit
@@ -145,13 +143,13 @@ class OprojPushMx:
 
     @cute.jit
     def __call__(self, w_ptr: cute.Pointer, sfw_ptr: cute.Pointer, x_ptr: cute.Pointer,
-                 sfx_ptr: cute.Pointer, peers: cute.Tensor, rank: Int32,
+                 sfx_ptr: cute.Pointer, peers: cute.Tensor, rank: Int32, rows: Int32,
                  stream: cuda.CUstream):  # fmt: skip
         k = self.k
         fp8, sf_t = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         a = cute.make_tensor(w_ptr, cute.make_ordered_layout((WIDTH, k, 1), order=(1, 0, 2)))
         b = cute.make_tensor(
-            x_ptr, cute.make_ordered_layout((self.tma_rows, k, 1), order=(1, 0, 2))
+            x_ptr, cute.make_ordered_layout((rows, k, 1), order=(1, 0, 2))
         )
         sfa = cute.make_tensor(sfw_ptr, blockscaled_utils.tile_atom_to_shape_SF(a.shape, SF_VEC))
         sfb = cute.make_tensor(sfx_ptr, blockscaled_utils.tile_atom_to_shape_SF(b.shape, SF_VEC))
@@ -226,7 +224,7 @@ class OprojPushMx:
         self.kernel(
             mma, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb, cl_vmnk,
             cl_sfb_vmnk, a_layout, b_layout, sfa_layout, sfb_layout, tsfa_layout,
-            tsfb_layout, peers, rank, w_ptr.toint(), sfw_ptr.toint(),
+            tsfb_layout, peers, rank, rows, w_ptr.toint(), sfw_ptr.toint(),
         ).launch(
             grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[self.clus, 1, 1],
             stream=stream, use_pdl=True,
@@ -240,7 +238,7 @@ class OprojPushMx:
                a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
                sfa_layout: cute.Layout, sfb_layout: cute.Layout,
                tsfa_layout: cute.Layout, tsfb_layout: cute.Layout, peers: cute.Tensor,
-               rank: Int32, w_addr: Int64, sfw_addr: Int64):  # fmt: skip
+               rank: Int32, rows: Int32, w_addr: Int64, sfw_addr: Int64):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -441,7 +439,7 @@ class OprojPushMx:
             accc = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             accp.consumer_wait(accc)
             self._push(
-                acc_ptr, peers, rank, mb, tb, v, kh, st.sA.data_ptr().toint(),
+                acc_ptr, peers, rank, rows, mb, tb, v, kh, st.sA.data_ptr().toint(),
                 st.sB.data_ptr().toint(), st.xbar.data_ptr(), crank, warp, tidx,
             )  # fmt: skip
             with cute.arch.elect_one():
@@ -488,7 +486,7 @@ class OprojPushMx:
         return tiled, src, dst
 
     @cute.jit
-    def _push(self, acc_ptr, peers, rank, mb, tb, v, kh, sa_s, sb_s, xbar, crank, warp,
+    def _push(self, acc_ptr, peers, rank, rows, mb, tb, v, kh, sa_s, sb_s, xbar, crank, warp,
               tidx):  # fmt: skip
         """Thread (warp w, lane l) holds feature 128 v + 32 w + l of feature block mb
         (TMEM lane 32 w + l) for the pair's 128 tokens. ksplit 1: BF16 into the
@@ -536,12 +534,12 @@ class OprojPushMx:
         bar_sync(EPI_BAR, 32 * EPI_WARPS)
         column = mb * FEATURES + 128 * v
         t0 = tb * MMA_N + kh * cols
-        n = self.n
+        n = rows // self.tp
         for j in cutlass.range_constexpr(cols * 16 // (32 * EPI_WARPS)):
             q = j * 32 * EPI_WARPS + tidx
             token = t0 + q // 16
             chunk = q % 16
-            if token < self.rows:
+            if token < rows:
                 w = ld_shared_u32x4(tile + ((q // 16) * 128 + chunk * 8) * 2)
                 words = tuple(positive_zero32(w[e]) for e in range(4))
                 owner = token // n
