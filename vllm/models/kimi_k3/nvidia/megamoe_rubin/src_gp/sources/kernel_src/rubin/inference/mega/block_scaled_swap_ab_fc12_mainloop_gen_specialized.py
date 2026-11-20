@@ -1455,9 +1455,15 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
         # Token-side operands (FC2 B = FC1 outputs, SFB) are re-read by every unit of their block.
         token_policy = make_l2_evict_last_policy()
+        _sh_nob = Int32(0)
+        _sh_tx = expected_tx
+        if cutlass.const_expr(is_fc1 is None and expected_tx is not None):
+            # DIAG nob: shared FC1 stages carry no B box (SFB only).
+            _sh_nob = Int32(work_tile.phase == Int32(3))
+            _sh_tx = expected_tx - Int32(self.shared_b_stage_tma_bytes) * _sh_nob
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
-            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=_sh_tx)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             if cutlass.const_expr(is_fc1 is not None):
@@ -1468,11 +1474,12 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             if k_tile_idx + 1 < k_tile_count:
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
             if cutlass.const_expr(is_fc1 is None):
-                cute.copy(
-                    _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask, token_policy),
-                    global_b_slice[(None, k_tile_idx)],
-                    partitioned_smem_b[(None, stage_index)],
-                )
+                if _sh_nob == Int32(0):
+                    cute.copy(
+                        _bind_tma_issue(b_exec_atom, tma_barrier, b_multicast_mask, token_policy),
+                        global_b_slice[(None, k_tile_idx)],
+                        partitioned_smem_b[(None, stage_index)],
+                    )
             else:
                 if not is_fc1:
                     cute.copy(
