@@ -10,10 +10,10 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
-from ......common.ptx_helpers import barrier_sync_unaligned
+from ......common.ptx_helpers import barrier_sync_unaligned, read_clock64, read_globaltimer_ns
 from .....helpers.cute_py_helpers import (
     Tcgen05MmaInstruction,
     make_smem_layouts,
@@ -56,6 +56,8 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
     tmem_holding_buffer_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_holding_buffer"
     tmem_deallocation_mbarrier_region: ClassVar[str] = "rubin.swap_ab_fc12.mainloop.tmem_deallocation_mbarrier"
     tmem_allocation_barrier_id: ClassVar[int] = 2
+    _probe_sf_mode: ClassVar[str] = "stage"
+    _probe_stamps: ClassVar[bool] = False
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -1108,9 +1110,23 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             multicast_mask,
             ab_pipeline,
         )
+        pr_t0 = Int64(0)
+        pr_ta = Int64(0)
+        pr_tw = Int64(0)
+        pr_ta2 = Int64(0)
+        pr_tb = Int64(0)
+        pr_sched = Int64(0)
+        pr_issue = Int64(0)
+        pr_n = Int32(0)
+        if cutlass.const_expr(self._probe_stamps):
+            pr_t0 = read_clock64()
         work_tile = sched_consumer.consume_work()
+        if cutlass.const_expr(self._probe_stamps):
+            pr_sched = pr_sched + (read_clock64() - pr_t0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
+            if cutlass.const_expr(self._probe_stamps):
+                pr_ta = read_clock64()
             if cutlass.const_expr(self.shared_enabled):
                 if self._is_shared_phase(phase):
                     if phase == Int32(BlockPhase.SharedLinear1):
@@ -1159,9 +1175,23 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 )
 
             iket.range_pop()
+            if cutlass.const_expr(self._probe_stamps):
+                pr_ta2 = read_clock64()
+                pr_issue = pr_issue + (pr_ta2 - pr_ta)
+                pr_n = pr_n + Int32(1)
+                pr_ta = pr_ta2
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(self._probe_stamps):
+                pr_sched = pr_sched + (read_clock64() - pr_ta)
 
         ab_pipeline.producer_tail(ab_pipeline_state)
+        if cutlass.const_expr(self._probe_stamps):
+            if self.is_leader_cta:
+                if cute.arch.lane_idx() == Int32(0):
+                    cute.printf(
+                        "PMS A {} {} {} {} {}",
+                        cute.arch.block_idx()[0], read_clock64() - pr_t0, pr_sched, pr_issue, pr_n,
+                    )
 
     @cute.jit
     def _issue_tma_b_tile(
@@ -1486,9 +1516,40 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             b_layouts,
             ab_pipeline,
         )
+        pr_t0 = Int64(0)
+        pr_ta = Int64(0)
+        pr_tw = Int64(0)
+        pr_ta2 = Int64(0)
+        pr_tb = Int64(0)
+        pr_sched = Int64(0)
+        pr_w1 = Int64(0)
+        pr_w2 = Int64(0)
+        pr_issue = Int64(0)
+        pr_n = Int32(0)
+        if cutlass.const_expr(self._probe_stamps):
+            pr_t0 = read_clock64()
         work_tile = sched_consumer.consume_work()
+        if cutlass.const_expr(self._probe_stamps):
+            pr_sched = pr_sched + (read_clock64() - pr_t0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
+            if cutlass.const_expr(self._probe_stamps):
+                pr_ta = read_clock64()
+                if phase == Int32(BlockPhase.Linear1):
+                    kernel_extension.wait_for_input(work_tile)
+                    pr_tw = read_clock64()
+                    pr_w1 = pr_w1 + (pr_tw - pr_ta)
+                    pr_ta = pr_tw
+                else:
+                    spin_wait(
+                        fc1_done_counter_pointer + (work_tile.cumulative_token_block_count + work_tile.tile_n_idx),
+                        lambda value: value >= fc2_spin_threshold,
+                        sleep_cycles=500,
+                        peek_status=work_tile.peek_ready,
+                    )
+                    pr_tw = read_clock64()
+                    pr_w2 = pr_w2 + (pr_tw - pr_ta)
+                    pr_ta = pr_tw
             if cutlass.const_expr(self.shared_enabled):
                 if self._is_shared_phase(phase):
                     if phase == Int32(BlockPhase.SharedLinear1):
@@ -1548,9 +1609,23 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 )
 
             iket.range_pop()
+            if cutlass.const_expr(self._probe_stamps):
+                pr_tb = read_clock64()
+                pr_issue = pr_issue + (pr_tb - pr_ta)
+                pr_n = pr_n + Int32(1)
+                pr_ta = pr_tb
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(self._probe_stamps):
+                pr_sched = pr_sched + (read_clock64() - pr_ta)
 
         ab_pipeline.producer_tail(ab_pipeline_state)
+        if cutlass.const_expr(self._probe_stamps):
+            if self.is_leader_cta:
+                if cute.arch.lane_idx() == Int32(0):
+                    cute.printf(
+                        "PMS B {} {} {} {} {} {} {}",
+                        cute.arch.block_idx()[0], read_clock64() - pr_t0, pr_sched, pr_w1, pr_w2, pr_issue, pr_n,
+                    )
 
     @cute.jit
     def _mma_tile(
@@ -1653,25 +1728,58 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
-                s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
-
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=mma_tmem_sfb,
-                    valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=instructions_per_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                if cutlass.const_expr(self._probe_sf_mode == "interleave"):
+                    for instruction_index in cutlass.range_constexpr(instructions_per_stage):
+                        cute.copy(
+                            tiled_copy_sfa,
+                            partitioned_smem_sfa[(None, None, None, instruction_index, ab_pipeline_state.index)],
+                            partitioned_tmem_sfa[(None, None, None, instruction_index)],
+                        )
+                        cute.copy(
+                            tiled_copy_sfb,
+                            partitioned_smem_sfb[(None, None, None, instruction_index, ab_pipeline_state.index)],
+                            partitioned_tmem_sfb[(None, None, None, instruction_index)],
+                        )
+                        dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                            quant_kind=quant_kind,
+                            acc_tensor=accumulator,
+                            a_window_frag=a_stage_frag,
+                            b_window_frag=b_stage_frag,
+                            sfa_window_tensor=cute.make_tensor(
+                                tmem_sfa[(None, 0, instruction_index)].iterator, tmem_sfa.layout
+                            ),
+                            sfb_window_tensor=cute.make_tensor(
+                                mma_tmem_sfb[(None, 0, instruction_index)].iterator, mma_tmem_sfb.layout
+                            ),
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
+                            mma_instruction_mnk=mma_instruction_mnk,
+                            window_instruction_offset=instruction_index,
+                            window_instruction_count=1,
+                            first_instruction_accumulate=(
+                                (k_tile_idx != 0) if cutlass.const_expr(instruction_index == 0) else True
+                            ),
+                        )
+                else:
+                    if cutlass.const_expr(self._probe_sf_mode == "stage"):
+                        s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
+                        cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                        cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                    if cutlass.const_expr(self._probe_sf_mode != "nomma"):
+                        dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                            quant_kind=quant_kind,
+                            acc_tensor=accumulator,
+                            a_window_frag=a_stage_frag,
+                            b_window_frag=b_stage_frag,
+                            sfa_window_tensor=tmem_sfa,
+                            sfb_window_tensor=mma_tmem_sfb,
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
+                            mma_instruction_mnk=mma_instruction_mnk,
+                            window_instruction_offset=0,
+                            window_instruction_count=instructions_per_stage,
+                            first_instruction_accumulate=k_tile_idx != 0,
+                        )
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
@@ -1727,7 +1835,23 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
         acc_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_accumulator_pipeline_stages
         )
+        pr_t0 = Int64(0)
+        pr_ta = Int64(0)
+        pr_tw = Int64(0)
+        pr_ta2 = Int64(0)
+        pr_tb = Int64(0)
+        pr_sched = Int64(0)
+        pr_accw = Int64(0)
+        pr_loop = Int64(0)
+        pr_n = Int32(0)
+        pr_g0 = Int64(0)
+        if cutlass.const_expr(self._probe_stamps):
+            pr_t0 = read_clock64()
+            pr_g0 = Int64(read_globaltimer_ns())
         work_tile = sched_consumer.consume_work()
+        if cutlass.const_expr(self._probe_stamps):
+            pr_ta = read_clock64()
+            pr_sched = pr_sched + (pr_ta - pr_t0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
             k_tile_count = Int32(self.fc2_k_tile_count)
@@ -1744,6 +1868,10 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                 accumulator = accumulator_base[(None, None, accumulator_stage_index)]
                 accumulator = cute.tiled_divide(accumulator, accumulator.shape)
                 acc_pipeline.producer_acquire(acc_producer_state)
+                if cutlass.const_expr(self._probe_stamps):
+                    pr_tw = read_clock64()
+                    pr_accw = pr_accw + (pr_tw - pr_ta)
+                    pr_ta = pr_tw
                 if cutlass.const_expr(self.heterogeneous_shared):
                     if self._is_shared_phase(phase):
                         ab_pipeline_state = self._mma_tile(
@@ -1788,10 +1916,27 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
                         self.num_mma_instructions_per_ab_stage,
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
+                if cutlass.const_expr(self._probe_stamps):
+                    pr_tw = read_clock64()
+                    pr_loop = pr_loop + (pr_tw - pr_ta)
+                    pr_ta = pr_tw
+                    pr_n = pr_n + Int32(1)
 
             acc_producer_state.advance()
             work_tile = sched_consumer.consume_work()
+            if cutlass.const_expr(self._probe_stamps):
+                pr_tw = read_clock64()
+                pr_sched = pr_sched + (pr_tw - pr_ta)
+                pr_ta = pr_tw
         acc_pipeline.producer_tail(acc_producer_state)
+        if cutlass.const_expr(self._probe_stamps):
+            if self.is_leader_cta:
+                if cute.arch.lane_idx() == Int32(0):
+                    cute.printf(
+                        "PMS M {} {} {} {} {} {} {} {}",
+                        cute.arch.block_idx()[0], read_clock64() - pr_t0, pr_sched, pr_accw, pr_loop, pr_n,
+                        pr_g0, Int64(read_globaltimer_ns()),
+                    )
 
 
 __all__ = ["BlockScaledSwapAbFc12Mainloop"]

@@ -27,6 +27,7 @@ from ....common.ptx_helpers import (
     f32x2_pack,
     fma_rn_f32x2_bf16x2,
     nanosleep,
+    read_globaltimer_ns,
     red_add_relaxed_sys_s32,
     stg_b64,
     stg_f32,
@@ -1368,11 +1369,14 @@ class TokenCommDedup(KernelComponent):
 
     transfer_warp_count: ClassVar[int] = 4
     transfer_thread_count: ClassVar[int] = transfer_warp_count * 32
+    _probe_stamps: ClassVar[bool] = False
+    _probe_tb_token_wait: ClassVar[bool] = False
+    _probe_acquire_poll: ClassVar[bool] = False
     standalone_chunk_bytes: ClassVar[int] = 2048
     reduction_round_group: ClassVar[int] = 4
-    # Last-copy reduce: two copies per 1-D TMA through two buffers, so per-warp SMEM is 2 x 2 x chunk.
+    # Last-copy reduce: two copies per 1-D TMA through three buffers (two fills in flight), per-warp SMEM 3 x 2 x chunk.
     token_back_copies_per_fill: ClassVar[int] = 2
-    token_back_fill_buffers: ClassVar[int] = 2
+    token_back_fill_buffers: ClassVar[int] = 3
     # Combine-warp fc2_done prefix-wait spin cadence (ns). Diagnostic override: MEGA_DEDUP_WAIT_SLEEP_NS.
     fc2_done_wait_sleep_ns: ClassVar[int] = int(os.environ.get("MEGA_DEDUP_WAIT_SLEEP_NS", "500"))
     fc2_done_wait_sleep_max_ns: ClassVar[int] = int(os.environ.get("MEGA_DEDUP_WAIT_SLEEP_MAX_NS", "8000"))
@@ -1952,6 +1956,11 @@ class TokenCommDedup(KernelComponent):
         lane_idx = self._lane_idx
         global_warp_idx = self._linear_cta_idx * Int32(self.transfer_warp_count) + transfer_warp_idx
         global_warp_count = Int32(self.promised_launchable_sm_count * self.transfer_warp_count)
+        pr_g0 = Int64(0)
+        pr_g1 = Int64(0)
+        pr_pulls = Int32(0)
+        if cutlass.const_expr(self._probe_stamps):
+            pr_g0 = Int64(read_globaltimer_ns())
 
         sizes = self._router.sizes_tensor(self._device_workspace)
         pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
@@ -1988,6 +1997,8 @@ class TokenCommDedup(KernelComponent):
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
         iket.range_pop()
+        if cutlass.const_expr(self._probe_stamps):
+            pr_g1 = Int64(read_globaltimer_ns())
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
             vector_idx = Int32(size_copy_round * self.transfer_thread_count) + transfer_thread_idx
@@ -2131,6 +2142,8 @@ class TokenCommDedup(KernelComponent):
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
                 cute.arch.sync_warp()
                 pull_phase = pull_phase ^ Int32(1)
+                if cutlass.const_expr(self._probe_stamps):
+                    pr_pulls = pr_pulls + Int32(1)
 
             next_dense_token = next_dense_token + pull_count * global_warp_count
             expert_valid_begin = expert_valid_end
@@ -2150,6 +2163,12 @@ class TokenCommDedup(KernelComponent):
         flag_tracker.fire()
         cute.arch.sync_warp()
         iket.range_pop()
+        if cutlass.const_expr(self._probe_stamps):
+            if (lane_idx == Int32(0)) and (self._linear_cta_idx % Int32(53) == Int32(0)):
+                cute.printf(
+                    "PMS I {} {} {} {} {} {}",
+                    self._linear_cta_idx, transfer_warp_idx, pr_g0, pr_g1, Int64(read_globaltimer_ns()), pr_pulls,
+                )
         if cutlass.const_expr(
             self.token_back_enabled and self.token_back_mode in ("reuse_dispatch_warps", "hybrid_warps")
         ):
@@ -2207,6 +2226,15 @@ class TokenCommDedup(KernelComponent):
         output_token_bytes = self.output_token_bytes
         # Fills issued by this worker so far: fill s uses buffer s % 2 and phase (s // 2) & 1 of its mbarrier.
         fill_sequence = Int32(0)
+        pr_g0 = Int64(0)
+        pr_ga = Int64(0)
+        pr_wait = Int64(0)
+        pr_np = Int32(0)
+        pr_gb = Int64(0)
+        pr_work = Int64(0)
+        pr_glast = Int64(0)
+        if cutlass.const_expr(self._probe_stamps):
+            pr_g0 = Int64(read_globaltimer_ns())
 
         iket.range_push("token_back.work")
         next_dense_token = global_worker_idx - global_worker_count
@@ -2228,6 +2256,8 @@ class TokenCommDedup(KernelComponent):
                 # Single-copy rows were pushed straight from the FC2 epilogue; only multi-copy blocks are reduced here.
                 if (metadata.is_last_copy != Int32(0)) and (metadata.dst_token_cnt > Int32(1)):
                     iket.range_push("token_back.wait_fc2_warp_prefix")
+                    if cutlass.const_expr(self._probe_stamps):
+                        pr_ga = Int64(read_globaltimer_ns())
                     wait_sleep_ns = Int32(self.fc2_done_wait_sleep_ns)
                     while completed_expert_prefix <= local_expert:
                         prefix_base = (completed_expert_prefix // Int32(32)) * Int32(32)
@@ -2237,17 +2267,29 @@ class TokenCommDedup(KernelComponent):
                             checked_count = owned_sizes[checked_expert]
                             checked_target = ((checked_count + Int32(self.tokens_per_fc1_ready_slot - 1))
                                 // Int32(self.tokens_per_fc1_ready_slot)) * Int32(self.fc2_done_signals_per_token_tile)
-                            lane_ready = cute.arch.load(fc2_done + checked_expert, Int32,
-                                                        sem="acquire", scope="gpu") >= checked_target
+                            if cutlass.const_expr(self._probe_acquire_poll):
+                                lane_ready = cute.arch.load(fc2_done + checked_expert, Int32,
+                                                            sem="acquire", scope="gpu") >= checked_target
+                            else:
+                                lane_ready = cute.arch.load(fc2_done + checked_expert, Int32,
+                                                            sem="relaxed", scope="gpu") >= checked_target
                         ready_mask = cute.arch.vote_ballot_sync(lane_ready)
                         completed_expert_prefix = cutlass.min(
                             prefix_base + Int32(cute.arch.clz(~ready_mask)), Int32(self.experts_per_rank))
                         if completed_expert_prefix <= local_expert:
                             nanosleep(wait_sleep_ns)
                             wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
-                    # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
+                    # Order every lane's fc2_done observation before the TMA that reads the completed copies: the
+                    # poll uses relaxed loads (an acquire load per poll invalidates the SM's L1 each iteration).
+                    if cutlass.const_expr(not self._probe_acquire_poll):
+                        cute.arch.fence_acq_rel_gpu()
                     cute.arch.sync_warp()
                     iket.range_pop()
+                    if cutlass.const_expr(self._probe_stamps):
+                        pr_gb = Int64(read_globaltimer_ns())
+                        pr_wait = pr_wait + (pr_gb - pr_ga)
+                        pr_ga = pr_gb
+                        pr_np = pr_np + Int32(1)
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)
                     fill_sequence = self._reduce_and_push(
@@ -2260,11 +2302,24 @@ class TokenCommDedup(KernelComponent):
                         fill_sequence,
                         chunk_bytes,
                     )
+                    if cutlass.const_expr(self._probe_stamps):
+                        pr_work = pr_work + (Int64(read_globaltimer_ns()) - pr_ga)
+                        pr_glast = Int64(read_globaltimer_ns())
                 next_dense_token = self.next_token(next_dense_token)
 
             expert_valid_begin = expert_valid_end
             local_expert = local_expert + Int32(1)
+        # Every push of this worker has landed before it leaves token_back (the kernel-end barrier follows).
+        cute.arch.cp_async_bulk_wait_group(0)
+        cute.arch.sync_warp()
         iket.range_pop()
+        if cutlass.const_expr(self._probe_stamps):
+            if lane_idx == Int32(0):
+                cute.printf(
+                    "PMS T {} {} {} {} {} {} {} {}",
+                    self._linear_cta_idx, worker_in_cta, pr_g0, Int64(read_globaltimer_ns()), pr_wait, pr_np, pr_work,
+                    pr_glast,
+                )
 
     @cute.jit
     def _issue_fill(
@@ -2337,6 +2392,11 @@ class TokenCommDedup(KernelComponent):
         fill_count = fills_per_chunk * Int32(chunk_count)
 
         iket.range_push("token_back.push_data")
+        # One bulk group per fill (empty unless the fill ends a chunk and pushes it), so group age = fill age. Fill s
+        # refills the buffer of fill s - B (B buffers): only that fill's push must have finished reading, and B - 1
+        # younger groups (fills s-1 .. s-B+1) may stay in flight.
+        fill_buffers = self.token_back_fill_buffers
+        cute.arch.cp_async_bulk_wait_group(fill_buffers - 1, read=True)
         with cute.arch.elect_one():
             self._issue_fill(fill_sequence, Int32(0), fills_per_chunk, copy_count, worker_mbarriers, stage_base, block_address, chunk_bytes)
         # Whole-chunk fp32 accumulators (round_group x 32 lanes x 16 B covers the chunk, checked at construction).
@@ -2350,9 +2410,10 @@ class TokenCommDedup(KernelComponent):
             sequence = fill_sequence + fill_idx
             buffer_base = stage_base + (sequence % Int32(self.token_back_fill_buffers)) * Int32(copies_per_fill * chunk_bytes)
             current_vectors = cutlass.min(Int32(chunk_bytes), Int32(output_token_bytes) - chunk_idx * Int32(chunk_bytes)) // Int32(16)
-            # Prefetch fill i+1 into the other buffer. If that buffer just fed a bulk copy, wait for its READ only.
+            # Prefetch fill i+1 into the buffer of fill i+1-B: wait only for that fill's push READ (groups of fills
+            # i-1 .. i+2-B, B-2 of them, may stay in flight; fill i commits its group below).
             if fill_idx + Int32(1) < fill_count:
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.cp_async_bulk_wait_group(fill_buffers - 2, read=True)
                 with cute.arch.elect_one():
                     self._issue_fill(sequence + Int32(1), fill_idx + Int32(1), fills_per_chunk, copy_count,
                                      worker_mbarriers, stage_base, block_address, chunk_bytes)
@@ -2407,10 +2468,12 @@ class TokenCommDedup(KernelComponent):
                         cp_reduce_async_bulk_add_bf16_s2g(destination_chunk, chunk_source, current_vectors * Int32(16))
                     else:
                         cp_async_bulk_s2g(destination_chunk, chunk_source, current_vectors * Int32(16))
-                cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_commit_group()
             cute.arch.sync_warp()
-        # The pushes of this token must have landed before the worker moves on (matches the previous per-chunk wait).
-        cute.arch.cp_async_bulk_wait_group(0)
+        # The pushes stay in flight across tokens: the next token's first fill waits for the read of the push that
+        # last used its buffer, and the worker drains every push before it leaves token_back.
+        if cutlass.const_expr(self._probe_tb_token_wait):
+            cute.arch.cp_async_bulk_wait_group(0)
         iket.range_pop()
         cute.arch.sync_warp()
         return fill_sequence + fill_count

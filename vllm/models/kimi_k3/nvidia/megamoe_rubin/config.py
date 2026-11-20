@@ -411,6 +411,7 @@ class RubinMoeConfig:
             "epi_warps",
             "standalone_warps",
             "reuse_dispatch_warps",
+            "hybrid_warps",
         ):
             raise ValueError(f"unknown token_back_mode {self.token_back_mode!r}.")
         if mode == "phase_interleave" and self.work_id_mode != "atomic_counter":

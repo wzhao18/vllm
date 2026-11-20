@@ -11,6 +11,8 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import Boolean, Int16, Int32
 
+_ACQUIRE_POLL = False
+
 
 @cute.jit
 def smem_exclusive_prefix(
@@ -95,16 +97,28 @@ def spin_wait(
     sleep_cycles: int = 150,
     peek_status: Optional[Boolean] = None,
 ) -> None:
-    """Wait until an acquire-loaded value satisfies the condition."""
+    """Wait until the value satisfies the condition, then acquire. Polls with relaxed loads and orders the
+    observation with one acquire-release fence: an acquire load per poll invalidates the SM's L1 every
+    iteration (CCTL.IVALL), which every other warp of the CTA pays for."""
     wait_required = Boolean(True)
     if cutlass.const_expr(peek_status is not None):
         wait_required = not peek_status
 
     if wait_required:
-        value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
-        while not condition(value):
-            nanosleep(sleep_cycles)
+        if cutlass.const_expr(_ACQUIRE_POLL):
             value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
+            while not condition(value):
+                nanosleep(sleep_cycles)
+                value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
+        else:
+            value = cute.arch.load(pointer, pointer.dtype, sem="relaxed", scope=scope)
+            while not condition(value):
+                nanosleep(sleep_cycles)
+                value = cute.arch.load(pointer, pointer.dtype, sem="relaxed", scope=scope)
+            if cutlass.const_expr(scope == "sys"):
+                cute.arch.fence_acq_rel_sys()
+            else:
+                cute.arch.fence_acq_rel_gpu()
 
 
 class ReadyFlag:

@@ -27,6 +27,9 @@ from .block_scaled_swap_ab_fc12_epilogue import (
 )
 
 
+_PROBE_FC2_STORE = "all"
+
+
 @dataclasses.dataclass(frozen=True)
 class GatedActEpilogueArgsDedup(GatedActEpilogueArgs):
     """Base epilogue args plus the pre-reduced (T, R, H) buffer and this rank's index (the kernel's host argument,
@@ -92,7 +95,7 @@ class Fc2DedupBulkRouter:
                         md.dst_order_id
                     )
                     dst_ptrs[iter_idx] = self.order_base + slot_index * Int64(self.chunk_bytes) + byte_in_chunk
-                    valid[iter_idx] = Int32(1)
+                    valid[iter_idx] = Int32(1) if cutlass.const_expr(_PROBE_FC2_STORE == "all") else Int32(4)
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid, copy_iters=copy_iters)
 
     @cute.jit
@@ -159,15 +162,22 @@ def fc2_dedup_bulk_store_function(
             owned_subtile = Int32(ublk_iter_idx * 2) + lane_idx // Int32(16)
         if owned_subtile == subtile_idx:
             dst_ptr, kind = fc2_output_router.get_data_dst(ublk_iter_idx)
-            if kind != Int32(0):
-                src_row = cute.slice_(smem_stage, (scratch_row, None))
-                if cutlass.const_expr(fc2_output_router.reduce_topk_in_kernel):
-                    if kind == Int32(2):
-                        cp_reduce_async_bulk_add_bf16_s2g(dst_ptr, src_row.iterator, copy_bytes)
+            if cutlass.const_expr(_PROBE_FC2_STORE == "all"):
+                if kind != Int32(0):
+                    src_row = cute.slice_(smem_stage, (scratch_row, None))
+                    if cutlass.const_expr(fc2_output_router.reduce_topk_in_kernel):
+                        if kind == Int32(2):
+                            cp_reduce_async_bulk_add_bf16_s2g(dst_ptr, src_row.iterator, copy_bytes)
+                        else:
+                            cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
                     else:
                         cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
-                else:
-                    cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
+            elif cutlass.const_expr(_PROBE_FC2_STORE == "remote_only"):
+                if kind == Int32(1):
+                    cp_async_bulk_s2g(dst_ptr, cute.slice_(smem_stage, (scratch_row, None)).iterator, copy_bytes)
+            elif cutlass.const_expr(_PROBE_FC2_STORE == "local_only"):
+                if kind == Int32(4):
+                    cp_async_bulk_s2g(dst_ptr, cute.slice_(smem_stage, (scratch_row, None)).iterator, copy_bytes)
 
     cute.arch.cp_async_bulk_commit_group()
     cute.arch.cp_async_bulk_wait_group(epi.fc2_tma_stages - 1, read=True)

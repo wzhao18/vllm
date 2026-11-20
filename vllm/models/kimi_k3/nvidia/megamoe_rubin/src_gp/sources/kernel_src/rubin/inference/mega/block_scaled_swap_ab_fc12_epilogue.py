@@ -49,6 +49,8 @@ from .....helpers.dsl_helpers import ReadyFlag, wait_ready
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
 from ......common.ptx_helpers import (
+    read_clock64,
+    read_globaltimer_ns,
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cvt_f32_to_fp8_to_f32,
@@ -960,6 +962,7 @@ class SwapABGatedActEpilogue(KernelComponent):
     # Default for subclasses with their own __init__ (local_mega): the plain combine plane. The
     # gen-phase kernel opts into the bit-inverted, self-validating plane through impl_desc.
     combine_ll_encoded: bool = False
+    _probe_stamps: bool = False
 
     _EpilogueSyncWaitBarId = 1  # Arrive and wait only
     _EpilogueAsyncBarIdBase = 4  # Some arrive, the others arrive and wait
@@ -1536,9 +1539,29 @@ class SwapABGatedActEpilogue(KernelComponent):
         )
 
         routed_ready = cutlass.Int32(0)
+        pr_t0 = Int64(0)
+        pr_ta = Int64(0)
+        pr_tw = Int64(0)
+        pr_wait = Int64(0)
+        pr_p1 = Int64(0)
+        pr_p2 = Int64(0)
+        pr_drain = Int64(0)
+        pr_sched = Int64(0)
+        pr_n1 = cutlass.Int32(0)
+        pr_n2 = cutlass.Int32(0)
+        pr_g0 = Int64(0)
+        if cutlass.const_expr(self._probe_stamps):
+            pr_t0 = read_clock64()
+            pr_ta = pr_t0
+            pr_g0 = Int64(read_globaltimer_ns())
         while work_tile_info.is_valid_tile:
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
             cur_phase = work_tile_info.phase
+            if cutlass.const_expr(self._probe_stamps):
+                acc_pipeline.consumer_wait(acc_consumer_state)
+                pr_tw = read_clock64()
+                pr_wait = pr_wait + (pr_tw - pr_ta)
+                pr_ta = pr_tw
             if cutlass.const_expr(routed_ready_flag is not None):
                 if routed_ready == cutlass.Int32(0):
                     if (cur_phase == cutlass.Int32(BlockPhase.Linear1)) | (
@@ -1565,6 +1588,15 @@ class SwapABGatedActEpilogue(KernelComponent):
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
                 )
+            if cutlass.const_expr(self._probe_stamps):
+                pr_tw = read_clock64()
+                if is_fc1:
+                    pr_p1 = pr_p1 + (pr_tw - pr_ta)
+                    pr_n1 = pr_n1 + cutlass.Int32(1)
+                else:
+                    pr_p2 = pr_p2 + (pr_tw - pr_ta)
+                    pr_n2 = pr_n2 + cutlass.Int32(1)
+                pr_ta = pr_tw
             prev_work_tile_info = work_tile_info
             prev_is_fc1 = is_fc1
 
@@ -1588,6 +1620,10 @@ class SwapABGatedActEpilogue(KernelComponent):
                     flag_tracker = flag_tracker.drained()
 
             work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(self._probe_stamps):
+                pr_tw = read_clock64()
+                pr_sched = pr_sched + (pr_tw - pr_ta)
+                pr_ta = pr_tw
 
             if not publish_before_fetch:
                 # Every asynchronous store commits at issue; drain before completion or scratch reuse.
@@ -1615,6 +1651,17 @@ class SwapABGatedActEpilogue(KernelComponent):
                         flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                     else:
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+            if cutlass.const_expr(self._probe_stamps):
+                pr_tw = read_clock64()
+                pr_drain = pr_drain + (pr_tw - pr_ta)
+                pr_ta = pr_tw
+        if cutlass.const_expr(self._probe_stamps):
+            if tidx == cutlass.Int32(0):
+                cute.printf(
+                    "PMS E {} {} {} {} {} {} {} {} {} {} {}",
+                    cute.arch.block_idx()[0], read_clock64() - pr_t0, pr_sched, pr_wait, pr_p1, pr_p2, pr_drain,
+                    pr_n1, pr_n2, pr_g0, Int64(read_globaltimer_ns()),
+                )
         # Tail flush
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
