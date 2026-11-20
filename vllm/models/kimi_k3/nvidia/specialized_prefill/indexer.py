@@ -308,23 +308,6 @@ def wg_sync(wg):
     cute.arch.barrier(barrier_id=2 + wg, number_of_threads=128)
 
 
-@asm(Int32)
-def try_wait_parity(barrier, phase):
-    """mbarrier.try_wait.parity without a suspend-time hint: the barrier unit
-    holds the warp up to its default window and releases it when the phase
-    completes (no software sleep between probes)."""
-    code = ("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2; "
-            "selp.u32 $0, 1, 0, p; }")
-    return code, "=r,r,r,~{memory}", (barrier, Int32(phase))
-
-
-@cute.jit
-def mbar_wait(barrier, phase):
-    done = try_wait_parity(barrier, phase)
-    while done == 0:
-        done = try_wait_parity(barrier, phase)
-
-
 def _mn_layout(t):
     """A tcgen05 accumulator as ((M), (N), stages)."""
     sh, sd = t.layout.shape, t.layout.stride
@@ -593,7 +576,7 @@ class IndexerScore:
                 key0 = items[item, 2]
                 ntiles = items[item, 3]
                 qs = jq % Q_STAGES
-                mbar_wait(q_empty + qs, ((jq // Q_STAGES) & 1) ^ 1)
+                cute.arch.mbarrier_wait(q_empty + qs, ((jq // Q_STAGES) & 1) ^ 1)
                 # row ends, head weights, query scales (SF atom order)
                 if lane < BQ:
                     e = Int32(0)
@@ -642,7 +625,7 @@ class IndexerScore:
                 for tt in cutlass.range(ntp, unroll=1):
                     t = cutlass.min(ntp - 1 - tt, ntiles - 1)
                     stage = kv_it % KV_STAGES
-                    mbar_wait(kv_empty + stage, ((kv_it // KV_STAGES) & 1) ^ 1)
+                    cute.arch.mbarrier_wait(kv_empty + stage, ((kv_it // KV_STAGES) & 1) ^ 1)
                     k_first = key0 + t * TILE
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(
@@ -676,13 +659,13 @@ class IndexerScore:
             for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
                 ntiles = items[item, 3]
                 qs = jq % Q_STAGES
-                mbar_wait(q_full + qs, (jq // Q_STAGES) & 1)
+                cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
                 cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, qs)], s2t_b[2])
                 for _t in cutlass.range(ntiles + (ntiles & 1), unroll=1):
                     stage = kv_it % KV_STAGES
                     a = acc_it % ACC_STAGES
-                    mbar_wait(acc_empty + a, ((acc_it // ACC_STAGES) & 1) ^ 1)
-                    mbar_wait(kv_full + stage, (kv_it // KV_STAGES) & 1)
+                    cute.arch.mbarrier_wait(acc_empty + a, ((acc_it // ACC_STAGES) & 1) ^ 1)
+                    cute.arch.mbarrier_wait(kv_full + stage, (kv_it // KV_STAGES) & 1)
                     cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, stage)], s2t_a[2])
                     mma.set(tcgen05.Field.ACCUMULATE, False)
                     for kb in cutlass.range_constexpr(
@@ -783,7 +766,7 @@ class IndexerScore:
             ntok = items[item, 1]
             ntiles = items[item, 3]
             qs = jq % Q_STAGES
-            mbar_wait(q_full + qs, (jq // Q_STAGES) & 1)
+            cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
             end0 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a) * 4))
             end1 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a + 1) * 4))
             row0 = token0 + tok_a
@@ -883,12 +866,12 @@ class IndexerScore:
             p1 = cutlass.min(p1, lim1)
         if cutlass.const_expr(self.epi == 3):
             for st in cutlass.range_constexpr(ACC_STAGES):
-                mbar_wait(acc_full + st, ph)
+                cute.arch.mbarrier_wait(acc_full + st, ph)
                 cute.arch.sync_warp()
                 if lane == 0:
                     cute.arch.mbarrier_arrive(acc_empty + st)
             return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
-        mbar_wait(acc_full, ph)
+        cute.arch.mbarrier_wait(acc_full, ph)
         h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
         h0n = h0
         for st in cutlass.range_constexpr(ACC_STAGES):
@@ -904,7 +887,7 @@ class IndexerScore:
             if lane == 0:
                 cute.arch.mbarrier_arrive(acc_empty + st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
-                mbar_wait(acc_full + st + 1, ph)
+                cute.arch.mbarrier_wait(acc_full + st + 1, ph)
                 h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
             if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
