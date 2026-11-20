@@ -2591,7 +2591,7 @@ class KimiLinearForCausalLM(
                 )
                 continue
             conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
-            conv_in_proj.prepare()
+            conv_in_proj.prepare(self.vllm_config.scheduler_config.max_num_seqs)
             module._prefill_conv_in_proj = conv_in_proj
             fused_conv += 1
         if fused_conv:
