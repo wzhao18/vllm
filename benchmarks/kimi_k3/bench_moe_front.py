@@ -214,9 +214,11 @@ def main():
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             stamped()
+        flush = torch.empty(512 << 20, dtype=torch.uint8, device=dev)  # > L2: cold weights
         for _ in range(3):
             end.zero_()
             st.zero_()
+            flush.zero_()
             g.replay()
             torch.cuda.synchronize()
         sv = st.view(grid, 64)
