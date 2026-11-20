@@ -137,8 +137,12 @@ class IndexerStage:
         buffer = indexer.topk_indices_buffer
         if rows != batch or buffer.shape[1] != self.topk:
             buffer[:batch] = -1  # as the op: only a full decode step skips it
-        if not torch.cuda.is_current_stream_capturing() and rows >= 256:
-            _probe(self, q_fp8, head_w, decode, rows, batch, q)  # PROBE (not for landing)
+        if rows >= 256 and len(_HELD) < 4:  # PROBE (not for landing): time at exit
+            import atexit
+
+            if not _HELD:
+                atexit.register(_probe_all)
+            _HELD.append((self, q_fp8, head_w, decode, rows, batch, q))
         logits = self.fp4_logits(q_fp8, head_w, decode, rows, batch, q)
         if not hook[1](logits, decode, buffer[:rows]):
             raise RuntimeError(
@@ -385,6 +389,15 @@ def warm_merge_rows(topk, local_topk, world_size, emit_ids, block_size):
 
 
 _PROBED = set()
+_HELD = []
+
+
+def _probe_all():
+    for args in _HELD:
+        try:
+            _probe(*args)
+        except Exception as e:  # noqa: BLE001
+            print(f"PROBE failed: {type(e).__name__}: {e}", flush=True)
 
 
 def _probe(stage, q_fp8, head_w, decode, rows, batch, q):
