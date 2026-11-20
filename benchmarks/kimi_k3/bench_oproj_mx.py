@@ -4,7 +4,7 @@ tokens split into N tiles: no split-K, all SMs), vs scaled_mm. Cold weights (rot
 copies + L2 flush between replays) or --warm (one copy). Optional producer (--prod k
 spin iterations, --prod_smem bytes: a smem-hogging predecessor leaves no co-residency).
 
-Arms: scaled_mm | own:<tile MxN>:<cluster>:<swap 0/1>:<inst_m>:<pdl 0/1>:<prewait>.
+Arms: scaled_mm | own:<tile MxN>:<cluster>:<swap 0/1>:<inst_m>:<pdl 0/1>:<prewait>[:<producers>[:<tile_k>[:<dbg>[:<max_stages>]]]].
 """
 
 import argparse
@@ -55,13 +55,22 @@ def mk_arm(arm, R, xq, xs):
                              scale_b=WS[i].view(torch.float8_e8m0fnu),
                              out_dtype=torch.bfloat16, out=out)
         return f, "scaled_mm"
-    _, tile, cl, swap, instm, pdl, pre = arm.split(":")
+    _, tile, cl, swap, instm, pdl, pre, *extra = arm.split(":")
+    prods, tile_k, dbg, mst, dl = ([int(v) for v in extra] + [1, 128, 0, 0, 0][len(extra):])[:5]
     tac = (tuple(int(v) for v in tile.split("x")), tuple(int(v) for v in cl.split("x")),
            swap == "1", int(instm))
-    g = pw.Mxfp8PreGemm(N, K, R, tac, use_pdl=pdl == "1", prewait=int(pre))
+    wl, split = W, None
+    if dl:  # die-local W (rows homed per die) + per-die tile claim
+        wl = []
+        for w in W[:args.chain]:
+            w2, split = pw.die_weight(w, tac[0][0] if tac[2] else tac[0][1])
+            wl.append(w2)
+    g = pw.Mxfp8PreGemm(N, K, R, tac, use_pdl=pdl == "1", prewait=int(pre),
+                        producers=prods, tile_k=tile_k, dbg=dbg, max_stages=mst,
+                        die_split=split)
 
     def f(i, out):
-        g(xq, xs, W[i], WS[i], out)
+        g(xq, xs, wl[i % len(wl)], WS[i], out)
     return f, f"stages {g.stages}"
 
 
