@@ -100,7 +100,8 @@ def test_kinds_vs_stock(family):
         rows = [
             r for r in ROWS[family]
             if kind != "dense_mx8"
-            or (r <= DENSE_MAX_ROWS and ((n, k) not in DENSE_TOKEN_SPLIT or r % 128 == 0))
+            # dense_mx8 where the policy selects it: the token-split shapes
+            or ((n, k) in DENSE_TOKEN_SPLIT and r <= DENSE_MAX_ROWS and r % 128 == 0)
         ]  # fmt: skip
         proj = Mxfp8Projection(
             (wq, sw), rows, family=f"t_{family}", tactics=dict.fromkeys(rows, kind)
