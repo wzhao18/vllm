@@ -555,6 +555,8 @@ class IndexerScore:
         tAcc = cute.make_tensor(tmem_ptr, acc_fake.layout)
         cute.arch.griddepcontrol_wait()
         n_items = n_items_t[0]
+        clk0 = clock64()
+        ns0 = globaltimer()
         if warp < PRODUCER:
             self.epilogue(
                 tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
@@ -711,6 +713,8 @@ class IndexerScore:
                     jq += 1
 
         cute.arch.sync_threads()
+        if tidx == 0 and self.mode == 6:
+            cute.printf("IDXCLK2 {} {} {}", bid, clock64() - clk0, globaltimer() - ns0)
         if warp == MMA_WARP:
             nvvm.tcgen05_dealloc(
                 nvvm.make_tmem_ptr(Int32(ld_shared_u32(st.tmem_hold.ptr.toint())), cutlass.Int8),
