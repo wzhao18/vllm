@@ -837,6 +837,11 @@ class IndexerScore:
                       (0x10 if h % 2 == 0 else 0x32)
                       | ((0x54 if _sigma(h) % 2 == 0 else 0x76) << 8))
                  for h in range(HEADS)]
+            # release the Q stage only after its row ends and weights are in
+            # registers (the PRMTs consume every loaded word): the fence completes
+            # this thread's shared-memory reads before the producer may refill the
+            # stage (INFRA / D-ATTN 2026-11-20 SASS release audit)
+            fence_async_shared()
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(q_empty + qs)
@@ -860,17 +865,20 @@ class IndexerScore:
                     hc[i] = Float32(0.0)
                 for i in cutlass.range_constexpr(4):
                     sc[i] = Uint32(0x7FC07FC0)
-                tc = Int32(0)
+                # publish tile word of the carried stage: (tile << 16) | lt, a
+                # per-thread register (publish2 reads only its high half), one
+                # tile below the pair's newer tile per stage
+                tw = (Uint32(ntp - 2 * n_edge) << Uint32(16)) | Uint32(lt)
                 for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
-                    p0, p1, tc = self.pair_rot(
-                        ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, w, p0, p1,
-                        thr, lim0, lim1, hc, sc, tc,
+                    p0, p1, tw = self.pair_rot(
+                        ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
+                        hc, sc, tw,
                     )
                     ph = ph ^ 1
                 p0 = cutlass.min(p0, lim0)
                 p1 = cutlass.min(p1, lim1)
                 p0, p1 = self.stage_tail(
-                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tc, p0, p1, thr
+                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tw, p0, p1, thr
                 )
             else:
                 for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
@@ -967,25 +975,25 @@ class IndexerScore:
         return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
 
     @cute.jit
-    def stage_tail(self, h1, w, ss, t, p0, p1, thr):
+    def stage_tail(self, h1, w, ss, tw, p0, p1, thr):
         """Heads 16-31 of a stage (h1) into its running sums, then publish both
         tokens' logits of tile t."""
         ss = self.reduce_half(h1, w, ss, HEADS // 2)
         r = self.combine2(ss)
-        return publish2(p0, p1, r, thr, Uint32(t) << Uint32(16))
+        return publish2(p0, p1, r, thr, tw)
 
     @cute.jit
-    def pair_rot(self, t_hi, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
-                 hc, sc, tc):
+    def pair_rot(self, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
+                 hc, sc, tw):
         """One interior tile pair, rotated: after each stage's barrier wait and its
-        first loads, finish the previous stage (the carry hc / sc / tc for stage 0, the
+        first loads, finish the previous stage (the carry hc / sc / tw for stage 0, the
         pair's own stage 0 for stage 1); returns with stage 1's second half (heads
         16-31, loaded) and first-half sums in the carry."""
         p0 = cutlass.min(p0, lim0)
         p1 = cutlass.min(p1, lim1)
         hp = [hc[i] for i in range(HEADS)]
         sp = [[sc[0], sc[1]], [sc[2], sc[3]]]
-        tp = tc
+        tp = tw
         for st in cutlass.range_constexpr(ACC_STAGES):
             col = tmem_q + st * N
             cute.arch.mbarrier_wait(acc_full + st, ph)
@@ -999,7 +1007,7 @@ class IndexerScore:
                 cute.arch.mbarrier_arrive(acc_empty + st)
             hp = h1
             sp = ss
-            tp = t_hi - st
+            tp = tw - Uint32((st + 1) << 16)
         for i in cutlass.range_constexpr(HEADS):
             hc[i] = hp[i]
         sc[0] = sp[0][0]
