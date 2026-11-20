@@ -3,7 +3,7 @@
 """P-MLA M10: h8 (TMA gather4 producer, A) vs h8g (LDGSTS row producer, B): bitwise
 equality on masked/short rows and ABBA timing at F16K L78K, full kernel and the
 gather-only diagnostic arm (no_store + no_math + no_mma).
-usage: pmla_h8g_ab.py [nlw ...]"""
+usage: pmla_h8g_ab.py [nlw:lag ...]"""
 import sys
 
 import torch
@@ -56,10 +56,10 @@ def abba(fa, fb, args, oa, ob, rounds=4):
 
 
 def main():
-    nlws = [int(x) for x in sys.argv[1:]] or [2, 1]
-    for nlw in nlws:
+    arms = [tuple(int(v) for v in x.split(":")) for x in sys.argv[1:]] or [(4, 3)]
+    for nlw, lag in arms:
         def kb(*a, knobs=(), **kw):
-            return sparse_mla_prefill_h8g(*a, knobs=knobs, nlw=nlw, **kw)
+            return sparse_mla_prefill_h8g(*a, knobs=knobs, nlw=nlw, lag=lag, **kw)
 
         for t, ctx in ((300, 9000), (16384, 78000)):
             args = case(t, ctx, 0.15)
@@ -68,7 +68,7 @@ def main():
             torch.cuda.synchronize()
             nd = (ra.view(torch.int16) != rb.view(torch.int16)).sum().item()
             md = (ra.float() - rb.float()).abs().max().item()
-            line = f"nlw={nlw} T={t} bitwise={nd == 0} ndiff={nd} maxdiff={md:.3g}"
+            line = f"nlw={nlw} lag={lag} T={t} bitwise={nd == 0} ndiff={nd} maxdiff={md:.3g}"
             if t >= 4096:
                 oa, ob = torch.empty_like(ra), torch.empty_like(rb)
                 a, b, amin, bmin = abba(ka, kb, args, oa, ob)
