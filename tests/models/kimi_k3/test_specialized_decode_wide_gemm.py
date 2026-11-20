@@ -100,3 +100,38 @@ def test_wide_gemm_decode_front(rows, n, k, split, partials):
             assert (got - full).abs().max() <= 1e-5 * full.abs().max()
         else:
             assert _ulps(out, full.bfloat16()) <= 1
+
+
+@pytest.mark.parametrize(
+    "rows,n,k,split",
+    [
+        (96, 7168, 3584, 3),  # MoE latent up at r24
+        (32, 7168, 3584, 3),  # r8
+        (96, 4480, 7168, 5),  # router | latent_down: n % 256 != 0
+    ],
+)
+def test_wide_gemm_die_static_k128(rows, n, k, split):
+    """Die-static work (one CTA pair per TPC, its tile and split from the per-TPC
+    table, weights die-placed) computes every (tile, split) partial with the same
+    K16 MMA sequence as the striped launch (bitwise equal FP32 partials); two TMA
+    boxes per ring stage (K 128) match the FP32 reference to FP32-reorder accuracy."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.wide import (
+        PreparedWide,
+    )
+
+    torch.manual_seed(rows + n + split)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    policy = {rows: (split, (1,), None, (0, 3), False, False, None, 128)}
+    base = PreparedWide(w, policy, partials=True).prepare()
+    die = PreparedWide(w, policy, partials=True, dies=True).prepare()
+    assert torch.equal(die.weight, w)
+    want = torch.empty(split, rows, n, device="cuda", dtype=torch.float32)
+    base.run(x, want)
+    full = x.float() @ w.float().t()
+    assert (want.sum(0) - full).abs().max() <= 1e-5 * full.abs().max()
+    for _ in range(3):
+        got = torch.full_like(want, float("nan"))
+        die.run(x, got)
+        torch.cuda.synchronize()
+        assert torch.equal(got, want)
