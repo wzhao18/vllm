@@ -1899,6 +1899,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
                 if is_last != Int32(0):
+                    # DIAG (never lands): hold the grid's completion 5 us after the last arrival; every
+                    # cell store of this rank is already complete (bulk wait_group 0 before tail.arrive).
+                    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.wide import _now as _dly_now
+
+                    dly_t0 = _dly_now()
+                    while _dly_now() - dly_t0 < Int64(5000):
+                        pass
                     # The last arriver has acquired every other CTA's arrival, so nothing on
                     # this rank reads the tail span any more: reset it, then meet the peers.
                     if cutlass.const_expr(self.lazy_comm_waits):
