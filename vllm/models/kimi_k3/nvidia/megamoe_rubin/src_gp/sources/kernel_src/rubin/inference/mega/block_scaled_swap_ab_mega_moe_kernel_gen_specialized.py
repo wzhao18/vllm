@@ -1820,8 +1820,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             # tile N 64, four otherwise) consume work and issue Gather4.
             if warp_idx < Int32(self.gather_b_warp_ids[0] + self.active_gather_b_warp_count):
                 iket.range_push("genphase.gather_b1")
+                # Shared builds too: their routed tokens land well after the shared stream starts
+                # (in-step the dispatch takes ~14 us on the slowest rank), and the first routed waves
+                # are what HBM can fetch into L2 while only the shared units stream.
                 if warp_idx == Int32(self.gather_b_warp_ids[0]) and cutlass.const_expr(
-                    self.l2_prefetch_budget_bytes > 0 and not self.lazy_comm_waits
+                    self.l2_prefetch_budget_bytes > 0
                 ):
                     iket.range_push("gather_b1.l2_prefetch")
                     spin_wait(
