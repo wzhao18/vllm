@@ -45,25 +45,34 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.skel_hot = "hot" in flags
         self.sf_tmem_slots = 2 if "sf2" in flags else 1
         self.epi_drain = "drain" in flags
+        self.l2_store_evict_first = "sef" in flags
+        # die_sched: clusters claim N tiles of their die's weight half
+        # (die-split weights, extra scheduler warp 10).
+        self.die_sched = any(f.startswith("die") for f in flags)
+        self.die_group = next((int(f[3:]) for f in flags if f.startswith("die") and f[3:].isdigit()), 0)
         # Drain skeletons (microbench only): 1 = drain + release, 2 = + math.
         self.epi_x2 = "x2" in flags
         self.epi_tanh = "tanh" in flags
         self.epi_roll = 2 if "roll2" in flags else 1 if "roll" in flags else 0
         self.epi_store = (
-            3 if "nost" in flags else 2 if "nosf" in flags else 4 if "st9" in flags
-            else 5 if "stl" in flags
-            else 1 if "st8" in flags else 0
+            3 if "nost" in flags else 2 if "nosf" in flags else 1 if "st8" in flags else 0
         )
-        self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else next(
-            (int(f[3:]) for f in flags if f.startswith("slp")), 0
-        )
-        self.use_pdl = "pdl" in flags
+        self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else 0
         self.ab_stage_cap = next((s for s in (3, 4, 5) if f"ab{s}" in flags), 0)
-        self.epi_drain_skel = next((i for i in (11, 10, 9, 1, 2, 3, 4, 5, 6, 7, 8) if f"dskel{i}" in flags), 0)
+        self.epi_drain_skel = next((i for i in (11, 10, 9, 1, 2, 3, 4, 5, 7) if f"dskel{i}" in flags), 0)
+        # Column-wise conv epilogue skeletons (microbench only, see
+        # conv_epilogue.epilogue_kda_conv_t).
+        self.conv_skel = next((i for i in (1, 2, 3, 4) if f"cskel{i}" in flags), 0)
+        # Branch-free column pass (epilogue_kda_conv_t2) unless "ct1".
+        self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
+        self.conv_scalar_silu = "sc" in flags
+        self.conv_math_smsp23 = "c23" in flags
+        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 0
+        self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
-            (tm, tn, 256 if "k256" in flags else 64 if "k64" in flags else 128),
+            (tm, tn, 256 if "k256" in flags else 128),
             cluster,
             prefetch_dist=0,
             swizzle_size=swz,
@@ -78,12 +87,22 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             self.mma_warp_id = 8
             self.tma_warp_id = 9
             self.threads_per_cta = 32 * 10
+            if self.die_sched:
+                self.sched_warp_id = 10
+                self.threads_per_cta = 32 * 11
             self.epilog_sync_barrier = pipeline.NamedBarrier(
                 barrier_id=self.epilog_sync_bar_id, num_threads=256
             )
             self.tmem_alloc_barrier = pipeline.NamedBarrier(
                 barrier_id=self.tmem_ptr_sync_bar_id, num_threads=32 * 9
             )
+        if self.conv_drain and self.conv_t2 and not split_producer and "nrs" not in flags:
+            # Twelve warps: warpgroup 2 = MMA, TMA, two idle warps; it drops to
+            # 40 registers so the epilogue warpgroups hold the drained tile
+            # (128 registers of BF16 pairs) plus the column pass without spills
+            # (sum 232 + 232 + 40 = 504, the SM107 limit).
+            self.threads_per_cta = 32 * 12
+            self.reg_split = (232, 40)
         if split_producer and tactic[5] == 2:
             # Second producer warp issues the odd k-blocks (whole stages).
             self.tma_kil_warp_id = self.tma_warp_id + 1
@@ -190,6 +209,13 @@ class KdaConvGemm:
             raise ValueError(f"KDA conv GEMM: conv weight {tuple(conv_w.shape)}")
         self.tactic = tactic or DEFAULT_TACTIC
         self.drain = drain and self.tactic[0][0] == 2 * self.tactic[2]
+        # Column-pair weight layout for the branch-free column pass:
+        # [col pair][tap][col, col + 1] (aligned f32x2 operands).
+        self.conv_w_pairs = conv_w.view(self.n // 2, 2, 4).transpose(1, 2).contiguous()
+        flags = set((self.tactic[7] if len(self.tactic) > 7 else "").split("+"))
+        self._t2 = self.drain and "ct1" not in flags and not any(
+            f.startswith("cskel") for f in flags
+        )
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = {}
 
@@ -199,6 +225,7 @@ class KdaConvGemm:
         if fn is None:
             gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain)
             gemm.conv_mode = True
+            gemm.conv_p_dim = self.p
             cl = self.tactic[1]
             mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
             layouts = (
@@ -239,7 +266,9 @@ class KdaConvGemm:
         nsteps = top.bit_length() if nseq > 1 else 0
         conv = (
             cutlass.Int64(out.data_ptr()),
-            cutlass.Int64(self.conv_w.data_ptr()),
+            cutlass.Int64(
+                (self.conv_w_pairs if self._t2 and not with_norms else self.conv_w).data_ptr()
+            ),
             cutlass.Int64(side.data_ptr()),
             cutlass.Int64(qsl.data_ptr()),
             cutlass.Int64(norms.data_ptr() if norms is not None else 0),

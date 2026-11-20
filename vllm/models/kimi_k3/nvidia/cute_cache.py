@@ -101,6 +101,18 @@ class _Uncacheable(Exception):
     """The fingerprint cannot describe an input: compile without the cache."""
 
 
+_IR_VALUES = ("OpResult", "BlockArgument", "Value")
+# Runtime arguments over real memory (from_dlpack, make_ptr). Not _FakeTensor: its DSL
+# key holds id()s of its SymInts, and its attributes fingerprint as they are.
+_DSL_RUNTIME_ARGS = ("cutlass.cute.runtime._Tensor", "cutlass.cute.runtime._Pointer")
+
+
+def _dsl_runtime_arg(t: type) -> bool:
+    return _qual(t) in _DSL_RUNTIME_ARGS and isinstance(
+        getattr(t, "__cache_key__", None), property
+    )
+
+
 @dataclass
 class Stats:
     loaded: int = 0  # hits
@@ -294,6 +306,30 @@ class _Fingerprint:
             o, (torch.dtype, torch.device, torch.Size, torch.layout, torch.memory_format)
         ):
             w(f"t:{o!r}")
+        elif _qual(t) == "cuda.bindings.driver.CUstream":
+            # A launch argument, not traced into the kernel: its handle differs per
+            # process (it made QueryUK and SparseMlaDecodeKM recompile every start).
+            w("CUstream")
+        elif _dsl_runtime_arg(t):
+            # A CuTe DSL runtime argument (from_dlpack tensor, make_ptr pointer): the
+            # DSL's own JIT cache key (dtype, layout marks, address space, assumed
+            # alignment) is what a trace reads of it; the DLPack capsule and the
+            # address are launch values (BlockScaledSwapAb*MoeKernel compiled
+            # outside the cache at every start because of the capsule).
+            ck = repr(o.__cache_key__)
+            if " at 0x" in ck:  # an object without a value repr: not a stable description
+                raise _Uncacheable(f"{_qual(t)} cache key {ck[:160]}")
+            w(f"DSLArg:{_qual(t)}:{ck}")
+        elif callable(getattr(t, "__cute_cache_key__", None)):
+            # A launch argument that declares its trace-relevant part (e.g. the
+            # MegaMoE SymmetricBufferHost: addresses are runtime fields).
+            w(f"CCK:{_qual(t)}")
+            self._classes(t)
+            self.add(o.__cute_cache_key__())
+        elif _qual(t).startswith("cutlass._mlir.") and t.__name__ in _IR_VALUES:
+            # An IR value an earlier trace left on a kernel object: it belongs to
+            # that trace's finished module and a new trace recomputes it.
+            w(f"IRValue:{t.__name__}")
         elif isinstance(o, ctypes._SimpleCData):
             w(f"C:{t.__name__}:{o.value!r}")
         else:
@@ -305,7 +341,7 @@ class _Fingerprint:
                 if s not in ("__dict__", "__weakref__")
             ]
             if not isinstance(state, dict) and not slots:
-                raise _Uncacheable(_qual(t))
+                raise _Uncacheable(f"{_qual(t)} at {' '.join(self.parts[-6:])[-240:]}")
             w(f"O:{_qual(t)}")
             self._classes(t)
             if isinstance(state, dict):
