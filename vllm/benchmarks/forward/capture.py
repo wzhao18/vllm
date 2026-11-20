@@ -10,6 +10,7 @@ metadata. Each replay first restores the KV blocks the step writes, so state the
 forward mutates in place (e.g. compressor state) is the same on every replay.
 """
 
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -127,9 +128,10 @@ class _NanProbe:
                 (x[0], x[1], x[2], x[4], y[4])
                 for x, y in zip(a, b)
                 if x[0] == y[0] and abs(x[4] - y[4]) > 1e-6 * max(abs(x[4]), 1.0)
+                and not re.search(r"layers\.\d+$", x[0])
             ]
             print(f"[probe] {tag} r{rank} pass{k-1} vs pass{k}: {len(diffs)} differ; "
-                  f"first: {diffs[:6]}", flush=True)
+                  f"first: {diffs[:4]} last: {diffs[-1:] if diffs else None}", flush=True)
 
 
 def write_input_ids(
