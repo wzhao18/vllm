@@ -230,7 +230,11 @@ class GqaWindowUmma:
     ``window`` keys. Same arguments as ``GqaWindow``."""
 
     def __init__(self, group, kv_heads, q, page, ring, window, v_scale=None,
-                 round_norm=False, debug=0, redo=False, splits=1):  # fmt: skip
+                 round_norm=False, debug=0, redo=False, splits=1, fill=0):  # fmt: skip
+        # ``fill`` (development, D-FUSE G5): where the first ring stages are issued:
+        # lanes [0, a) before griddepcontrol.wait, [a, b) right after it, the rest
+        # after the Q prep (whose qkv loads then do not queue behind the ring)
+        self.fill = ((0, ring), (0, 0), (ring, ring), (2, 2), (0, 2))[fill]
         # ``splits`` CTAs per (request, KV head), a cluster: an even share of the
         # stages each; their partial rows LSE-merge by DSMEM pushes to the CTA owning
         # each row (as GqaWindow's)
@@ -432,6 +436,15 @@ class GqaWindowUmma:
         cute.arch.sync_threads()
         if cutlass.const_expr(S > 1):
             cute.arch.cluster_arrive_relaxed()  # every barrier before any DSMEM push
+        spec_n = min(count0, Int32(R))
+        FA: cutlass.Constexpr = self.fill[0]
+        FB: cutlass.Constexpr = self.fill[1]
+        if cutlass.const_expr(FA > 0):
+            if warp == PRODUCER:
+                if lane < min(spec_n, Int32(FA)):
+                    j = first0 + lane
+                    self.issue(kv_map, full + 8 * lane, ring_base + lane * SLOT, head,
+                               blocks[j * KB // N - page_lo0], j * KB % N)  # fmt: skip
         self.rec(request, head, 0, global_timer(), tid == 0)
         cute.arch.griddepcontrol_wait()
         # (TMEM after the wait: allocated before it, while the previous kernel's CTAs
@@ -442,9 +455,8 @@ class GqaWindowUmma:
 
         # ---- after the wait: the first stages' loads at the pre-wait addresses, then
         # the metadata again (confirming them) and the prep math
-        spec_n = min(count0, Int32(R))
         if warp == PRODUCER:
-            if lane < spec_n:
+            if (lane >= FA) & (lane < min(spec_n, Int32(FB))):
                 j = first0 + lane
                 self.issue(kv_map, full + 8 * lane, ring_base + lane * SLOT, head,
                            blocks[j * KB // N - page_lo0], j * KB % N)  # fmt: skip
@@ -517,6 +529,12 @@ class GqaWindowUmma:
                     s_addr = kv_base + s_elem * 2
                     store_words(s_addr, tuple(roped))
                     store_words(s_addr + 128, tuple(value))
+        if cutlass.const_expr(FB < R):
+            if warp == PRODUCER:
+                if (lane >= FB) & (lane < spec_n):
+                    j = first0 + lane
+                    self.issue(kv_map, full + 8 * lane, ring_base + lane * SLOT, head,
+                               blocks[j * KB // N - page_lo0], j * KB % N)  # fmt: skip
         fence_async_shared()
         fence_tmem(before=True)
         cute.arch.sync_threads()
@@ -819,13 +837,13 @@ class GqaWindowUmma:
 @cache
 def compile_window_umma(
     group, kv_heads, q, page, ring, window, v_scale, max_position, device,
-    round_norm=False, debug=0, redo=False, splits=1,
+    round_norm=False, debug=0, redo=False, splits=1, fill=0,
 ):  # fmt: skip
     """``GqaWindowUmma`` for any request count (row-dynamic views); ``GqaWindow``'s
     arguments."""
     kernel = GqaWindowUmma(
         group, kv_heads, q, page, ring, window, v_scale, round_norm, debug, redo,
-        splits,
+        splits, fill,
     )
     i64, i32 = torch.int64, torch.int32
     count = cute.sym_int()
