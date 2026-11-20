@@ -534,7 +534,8 @@ class WideGemm:
             self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty, a_mask,
                          leader, k0, k_count, rot, Int32(1), n_w)  # fmt: skip
         elif warp == 1:  # activations: after it
-            cute.arch.griddepcontrol_wait()
+            if work >= 0:  # an idle die-static pair exits without waiting on the producer
+                cute.arch.griddepcontrol_wait()
             if lane == 0:
                 _st_u64(stamp + 48, _now())
             self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0, k_count,
@@ -602,7 +603,8 @@ class WideGemm:
                                  a_mask, leader, k0, k_count, rot, Int32(i), n_w)  # fmt: skip
             for i in cutlass.range_constexpr(1, n_act):
                 if warp == self.act_warps[i]:
-                    cute.arch.griddepcontrol_wait()
+                    if work >= 0:
+                        cute.arch.griddepcontrol_wait()
                     self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0,
                               k_count, rot, Int32(i), xoff, n_act)  # fmt: skip
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,

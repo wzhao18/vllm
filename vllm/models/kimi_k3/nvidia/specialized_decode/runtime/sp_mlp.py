@@ -82,6 +82,9 @@ PREWAIT_ROWS = (64,)
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
+# WideGemm policy after the split (activation warps, weight stages, weight warps,
+# direct exchange, rotate, ring KiB, K per stage): die-static work, K128 stages.
+LATENT_UP_WIDE = ((1,), None, (0, 3), False, False, None, 128)
 
 
 class SplitKFront:
@@ -256,9 +259,11 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
+                policies = {r: (s,) + LATENT_UP_WIDE for r, s in self.parts.items()}
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], self.parts, partials=True
+                    weights["latent_up"], policies, partials=True, dies=True
                 ).prepare()
+                transform.up_proj.weight.data = self.latent_up_parts.weight
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n
