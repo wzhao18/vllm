@@ -551,8 +551,13 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   }
 }
 
-// One block per row; K / 8 threads (K <= 8192), each owning 8 columns.
+// RMS_ROWS rows per block; K / 8 threads (K <= 8192), each owning 8 columns
+// of every row. All rows' loads are issued before the first reduction, so a
+// block keeps RMS_ROWS x K x 2 bytes in flight (one row per block left the
+// kernel latency bound at ~4 x 7 KiB per SM). Per row the arithmetic and the
+// reduction order are those of the one-row form (bitwise equal).
 // vLLM RMSNorm (ir rms_norm as dispatched on SM10x): out = (bf16)((bf16)(x * rstd) * w).
+constexpr int RMS_ROWS = 4;
 __global__ void rms_norm_quant_kernel(uint8_t* __restrict__ q,
                                       uint8_t* __restrict__ sf,
                                       uint16_t* __restrict__ y,
@@ -564,55 +569,69 @@ __global__ void rms_norm_quant_kernel(uint8_t* __restrict__ q,
                                       const int64_t y_stride,
                                       const int sf_col_base,
                                       const int padded_cols, const float eps) {
-  __shared__ float warp_sums[32];
-  const int64_t row = blockIdx.x;
+  __shared__ float warp_sums[RMS_ROWS][32];
+  const int64_t row0 = int64_t{blockIdx.x} * RMS_ROWS;
   const int col = threadIdx.x * 8;
-  const bool real = row < rows;
-  float v[8];
-  float ss = 0.f;
-  if (real) {
-    const uint4 raw =
-        __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-    const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw);
+  uint4 raw[RMS_ROWS];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      v[i] = bf16_bits_to_float(r16[i]);
-      ss += v[i] * v[i];
-    }
+  for (int r = 0; r < RMS_ROWS; ++r) {
+    raw[r] = row0 + r < rows
+                 ? __ldg(reinterpret_cast<const uint4*>(
+                       x + (row0 + r) * x_stride + col))
+                 : make_uint4(0u, 0u, 0u, 0u);
   }
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+  const uint4 wraw = __ldg(reinterpret_cast<const uint4*>(w + col));
+  const uint16_t* w16 = reinterpret_cast<const uint16_t*>(&wraw);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  if (lane == 0) warp_sums[warp] = ss;
-  __syncthreads();
   const int nwarps = blockDim.x >> 5;
-  float tot = lane < nwarps ? warp_sums[lane] : 0.f;
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffff, tot, o);
-  const float rstd = rsqrtf(tot / (float)k + eps);
-  float out[8];
-  if (real) {
-    const uint4 wraw = __ldg(reinterpret_cast<const uint4*>(w + col));
-    const uint16_t* w16 = reinterpret_cast<const uint16_t*>(&wraw);
-    uint4 yraw;
-    uint16_t* y16 = reinterpret_cast<uint16_t*>(&yraw);
+  for (int r = 0; r < RMS_ROWS; ++r) {
+    const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw[r]);
+    float ss = 0.f;
+    if (row0 + r < rows) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float n = bf16_bits_to_float(float_to_bf16_bits(v[i] * rstd));
-      y16[i] = float_to_bf16_bits(n * bf16_bits_to_float(w16[i]));
-      out[i] = bf16_bits_to_float(y16[i]);
+      for (int i = 0; i < 8; ++i) {
+        const float v = bf16_bits_to_float(r16[i]);
+        ss += v * v;
+      }
     }
-    if (y != nullptr) {
-      *reinterpret_cast<uint4*>(y + row * y_stride + col) = yraw;
-    }
-  } else {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) out[i] = 0.f;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    if (lane == 0) warp_sums[r][warp] = ss;
   }
-  quant8_store(out, q + (real ? row : 0) * q_stride + col, sf, row, col / 8,
-               sf_col_base, padded_cols, real);
-  if (!real && (threadIdx.x & 3) == 0) {
-    sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+  __syncthreads();
+#pragma unroll
+  for (int r = 0; r < RMS_ROWS; ++r) {
+    const int64_t row = row0 + r;
+    const bool real = row < rows;
+    float tot = lane < nwarps ? warp_sums[r][lane] : 0.f;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffff, tot, o);
+    const float rstd = rsqrtf(tot / (float)k + eps);
+    float out[8];
+    if (real) {
+      const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw[r]);
+      uint4 yraw;
+      uint16_t* y16 = reinterpret_cast<uint16_t*>(&yraw);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float n =
+            bf16_bits_to_float(float_to_bf16_bits(bf16_bits_to_float(r16[i]) * rstd));
+        y16[i] = float_to_bf16_bits(n * bf16_bits_to_float(w16[i]));
+        out[i] = bf16_bits_to_float(y16[i]);
+      }
+      if (y != nullptr) {
+        *reinterpret_cast<uint4*>(y + row * y_stride + col) = yraw;
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) out[i] = 0.f;
+    }
+    quant8_store(out, q + (real ? row : 0) * q_stride + col, sf, row, col / 8,
+                 sf_col_base, padded_cols, real);
+    if (!real && (threadIdx.x & 3) == 0) {
+      sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+    }
   }
 }
 
@@ -733,7 +752,7 @@ void rms_norm_quant(torch::Tensor& q, torch::Tensor& sf,
   const int64_t rows = x.size(0);
   if (rows == 0) return;
   const int64_t rows_pad = (rows + 127) / 128 * 128;
-  rms_norm_quant_kernel<<<(unsigned)rows_pad, k / 8, 0,
+  rms_norm_quant_kernel<<<(unsigned)(rows_pad / RMS_ROWS), k / 8, 0,
                           c10::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<uint8_t*>(q.data_ptr()),
       reinterpret_cast<uint8_t*>(sf.data_ptr()), yp,
