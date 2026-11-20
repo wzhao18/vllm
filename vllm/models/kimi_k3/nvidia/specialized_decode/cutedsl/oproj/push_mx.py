@@ -97,7 +97,7 @@ class OprojPushMx:
     ``iw`` / ``ix`` TMA issuer warps for the weights / the activation."""
 
     def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 256,
-                 stages: int = 4, iw: int = 1, ix: int = 1):  # fmt: skip
+                 stages: int = 4, iw: int = 1, ix: int = 1, pair: bool = True):  # fmt: skip
         ktiles = k // kt
         tblocks = -(-rows_max // MMA_N)
         if k % kt or ktiles % stages or rows_max > min(512, tp * cap):
@@ -108,17 +108,24 @@ class OprojPushMx:
         self.iw, self.ix = iw, ix
         self.x_warp = TMA_WARP + iw
         self.threads = 32 * (TMA_WARP + iw + ix)
-        self.mblocks = WIDTH // FEATURES
+        # pair: cta_group::2 M256 (128 features per CTA, B split over the pair); else
+        # cta_group::1 M128 (each CTA loads all MMA_N tokens of B)
+        self.pair, self.v = pair, 2 if pair else 1
+        self.feat = 128 * self.v
+        self.mblocks = WIDTH // self.feat
         self.tblocks = tblocks
-        self.grid = 2 * self.mblocks * self.tblocks
-        self.tiler = (FEATURES, MMA_N, kt)
+        self.grid = self.v * self.mblocks * self.tblocks
+        self.tiler = (self.feat, MMA_N, kt)
         self.tiler_sfb = (128, MMA_N, kt)
+
+    def _group(self):
+        return tcgen05.CtaGroup.TWO if self.pair else tcgen05.CtaGroup.ONE
 
     def _mma(self):
         return sm107_utils.make_blockscaled_trivial_tiled_mma(
             cutlass.Float8E4M3FN, cutlass.Float8E4M3FN, OperandMajorMode.K,
-            OperandMajorMode.K, cutlass.Float8E8M0FNU, SF_VEC, tcgen05.CtaGroup.TWO,
-            (FEATURES, MMA_N, MMA_K), a_collector_op=CollectorOp.DISCARD,
+            OperandMajorMode.K, cutlass.Float8E8M0FNU, SF_VEC, self._group(),
+            (self.feat, MMA_N, MMA_K), a_collector_op=CollectorOp.DISCARD,
             b_collector_op=CollectorOp.DISCARD,
         )  # fmt: skip
 
@@ -141,8 +148,9 @@ class OprojPushMx:
             tcgen05.CtaGroup.ONE, (128, MMA_N, MMA_K),
             a_collector_op=CollectorOp.DISCARD, b_collector_op=CollectorOp.DISCARD,
         )  # fmt: skip
-        pair_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (mma.thr_id.shape,))
-        pair_sfb_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (mma_sfb.thr_id.shape,))
+        nv = self.v
+        pair_vmnk = cute.tiled_divide(cute.make_layout((nv, 1, 1)), (mma.thr_id.shape,))
+        pair_sfb_vmnk = cute.tiled_divide(cute.make_layout((nv, 1, 1)), (mma_sfb.thr_id.shape,))
         a_layout = sm100_utils.make_smem_layout_a(mma, self.tiler, fp8, self.stages)
         b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, fp8, self.stages)
         sfa_layout = blockscaled_utils.make_smem_layout_sfa(mma, self.tiler, SF_VEC, self.stages)
@@ -159,7 +167,7 @@ class OprojPushMx:
         b_one = cute.slice_(b_layout, (None, None, None, 0))
         sfa_one = cute.slice_(sfa_layout, (None, None, None, 0))
         sfb_one = cute.slice_(sfb_layout, (None, None, None, 0))
-        cs = (2, 1)
+        cs = (nv, 1)
         tma_a, ta = cute.nvgpu.make_tiled_tma_atom_A(
             sm100_utils.cluster_shape_to_tma_atom_A(cs, mma.thr_id), a, a_one,
             self.tiler, mma, pair_vmnk.shape,
@@ -176,7 +184,7 @@ class OprojPushMx:
             sm100_utils.cluster_shape_to_tma_atom_SFB(cs, mma.thr_id), sfb, sfb_one,
             self.tiler_sfb, mma_sfb, pair_sfb_vmnk.shape, internal_type=cutlass.Int16,
         )  # fmt: skip
-        self.tx_bytes = 2 * (
+        self.tx_bytes = nv * (
             cute.size_in_bytes(fp8, a_one) + cute.size_in_bytes(fp8, b_one)
             + cute.size_in_bytes(sf_t, sfa_one) + cute.size_in_bytes(sf_t, sfb_one)
         )  # fmt: skip
@@ -201,7 +209,7 @@ class OprojPushMx:
             pair_sfb_vmnk, a_layout, b_layout, sfa_layout, sfb_layout, tsfa_layout,
             tsfb_layout, peers, rank, rows,
         ).launch(
-            grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[2, 1, 1],
+            grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[nv, 1, 1],
             stream=stream, use_pdl=True,
         )  # fmt: skip
 
@@ -223,12 +231,12 @@ class OprojPushMx:
             cpasync.prefetch_descriptor(tma_b)
             cpasync.prefetch_descriptor(tma_sfa)
             cpasync.prefetch_descriptor(tma_sfb)
-        v = bidx % 2
+        v = bidx % self.v
         is_leader = v == 0
         crank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         coord = pair_vmnk.get_flat_coord(crank)
         coord_sfb = pair_sfb_vmnk.get_flat_coord(crank)
-        pair = bidx // 2
+        pair = bidx // self.v
         mb = pair % self.mblocks
         tb = pair // self.mblocks
 
@@ -243,7 +251,9 @@ class OprojPushMx:
         accp = pipeline.PipelineUmmaAsync.create(
             barrier_storage=st.acc_full.data_ptr(), num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2 * EPI_WARPS),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.v * EPI_WARPS
+            ),
             cta_layout_vmnk=pair_vmnk, defer_sync=True,
         )  # fmt: skip
         tmem = utils.TmemAllocator(
@@ -251,10 +261,10 @@ class OprojPushMx:
             barrier_for_retrieve=pipeline.NamedBarrier(
                 barrier_id=TMEM_BAR, num_threads=32 * (EPI_WARPS + 1)
             ),
-            allocator_warp_id=0, is_two_cta=True,
+            allocator_warp_id=0, is_two_cta=self.pair,
             two_cta_tmem_dealloc_mbar_ptr=st.tmem_dealloc.ptr, arch="sm_107",
         )  # fmt: skip
-        pipeline_init_arrive(cluster_shape_mn=(2, 1), is_relaxed=True)
+        pipeline_init_arrive(cluster_shape_mn=(self.v, 1), is_relaxed=True)
 
         sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
         sB = st.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
@@ -301,7 +311,7 @@ class OprojPushMx:
         tCrB = mma.make_fragment_B(sB)
         acc_shape = mma.partition_shape_C(self.tiler[:2])
         acc_fake = mma.make_fragment_C(cute.append(acc_shape, 1))
-        pipeline_init_wait(cluster_shape_mn=(2, 1))
+        pipeline_init_wait(cluster_shape_mn=(self.v, 1))
         cute.arch.griddepcontrol_launch_dependents()
 
         # K-start rotation per feature block: pairs do not read the same x lines in
@@ -320,10 +330,9 @@ class OprojPushMx:
                 kk = (t + rot) % self.ktiles
                 ab.producer_acquire(prod)
                 bar = ab.producer_get_barrier(prod)
-                cute.copy(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)],
-                          tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
-                cute.copy(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)],
-                          tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
+                self._tma(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)], bar, a_mask)
+                self._tma(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)], bar,
+                          a_mask)  # fmt: skip
                 for _ in cutlass.range_constexpr(self.iw):
                     prod.advance()
             if iw == 0:
@@ -346,10 +355,9 @@ class OprojPushMx:
                 # same slot as the weight warp; only the weight warp arrives (expect_tx)
                 ab.sync_object_empty.wait(xs.index, xs.phase)
                 bar = ab.producer_get_barrier(xs)
-                cute.copy(tma_b, gB_s[(None, kk)], tBsB[(None, xs.index)],
-                          tma_bar_ptr=bar, mcast_mask=b_mask)  # fmt: skip
-                cute.copy(tma_sfb, tBgSFB[(None, tb, kk, 0)], tBsSFB[(None, xs.index)],
-                          tma_bar_ptr=bar, mcast_mask=sfb_mask)  # fmt: skip
+                self._tma(tma_b, gB_s[(None, kk)], tBsB[(None, xs.index)], bar, b_mask)
+                self._tma(tma_sfb, tBgSFB[(None, tb, kk, 0)], tBsSFB[(None, xs.index)], bar,
+                          sfb_mask)  # fmt: skip
                 for _ in cutlass.range_constexpr(self.ix):
                     xs.advance()
 
@@ -411,12 +419,19 @@ class OprojPushMx:
             tmem.relinquish_alloc_permit()
             tmem.free(acc_ptr)
 
+    @cute.jit
+    def _tma(self, atom, src, dst, bar, mask):
+        if cutlass.const_expr(self.pair):
+            cute.copy(atom, src, dst, tma_bar_ptr=bar, mcast_mask=mask)
+        else:
+            cute.copy(atom, src, dst, tma_bar_ptr=bar)
+
     def _s2t(self, sSF, tSF):
         """SMEM -> TMEM scale-factor copy (tcgen05.cp 4x32dp128bit, cta_group::2)."""
         sc = cute.filter_zeros(sSF)
         tc = cute.filter_zeros(tSF)
         atom = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.TWO), cutlass.Float8E8M0FNU
+            tcgen05.Cp4x32x128bOp(self._group()), cutlass.Float8E8M0FNU
         )
         tiled = tcgen05.make_s2t_copy(atom, tc)
         thr = tiled.get_slice(0)
@@ -448,7 +463,7 @@ class OprojPushMx:
             for i in cutlass.range_constexpr(16):
                 st_shared_bf16(sa_s + ((c0 + i) * 128 + r) * 2, vals[i])
         bar_sync(EPI_BAR, 32 * EPI_WARPS)
-        column = mb * FEATURES + 128 * v
+        column = mb * self.feat + 128 * v
         t0 = tb * MMA_N
         n = rows // self.tp
         for j in cutlass.range_constexpr(MMA_N * 16 // (32 * EPI_WARPS)):

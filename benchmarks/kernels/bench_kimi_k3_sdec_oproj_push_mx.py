@@ -115,11 +115,12 @@ def main():
         print(f"R{rows} scaled_mm {t_stock:.2f} us/call ({len(ws)} weight copies)",
               flush=True)  # fmt: skip
         for var in args.variants.split(","):
-            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)(t\d+)?", var)
+            m = re.fullmatch(r"s(\d+)i(\d+)x(\d+)(t\d+)?(c1)?", var)
             stages, iw, ix = (int(g) for g in m.groups()[:3])
             kt = int(m.group(4)[1:]) if m.group(4) else 256
             try:
-                kern = OprojPushMx(K, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix)
+                kern = OprojPushMx(K, rows, TP, CAP, kt=kt, stages=stages, iw=iw, ix=ix,
+                                   pair=not m.group(5))  # fmt: skip
 
                 def ptrs(w):
                     return (
