@@ -89,14 +89,19 @@ def main():
     def call(mode, knobs, i):
         kv, idx = layers[i % NL]
         if mode == "p":
-            kn = tuple(knobs) + (0,) * (28 - len(knobs)) + (1,)  # clk stamps
+            kn = list(knobs) + [0] * max(0, 30 - len(knobs))
+            kn[28] = 1  # clk stamps
+            kn = tuple(kn)
             sparse_mla_prefill_h8(q, kv.view(-1, 576), idx, seq, 0.0722, 1.0, out=o,
                                   knobs=kn, stamps=stamp)
         else:
             lidx, rq, btab = idx.logical
+            kn = list(knobs) + [0] * max(0, 30 - len(knobs))
+            kn[28] = 1  # clk stamps
+            kn = tuple(kn)
             sparse_mla_prefill_h8_logical(q, kv.view(-1, 576), lidx, rq, btab, 64, 64,
-                                          0.0722, 1.0, out=o, knobs=knobs, lengths=seq,
-                                          phys_dbg=idx)
+                                          0.0722, 1.0, out=o, knobs=kn, lengths=seq,
+                                          stamps=stamp)
 
     parsed = []
     for a in arms:
@@ -133,7 +138,7 @@ def main():
             e[i].record()
         torch.cuda.synchronize()
         mhz, w = nvml.stop()
-        if mode == "p":
+        if True:
             cyc, ns, nc = stamp.tolist()[:3]
             mhz = cyc / max(ns, 1) * 1e3  # kernel-body SM clock (MHz)
         us = statistics.median(a.elapsed_time(b) * 1e3 for a, b in zip(s, e))

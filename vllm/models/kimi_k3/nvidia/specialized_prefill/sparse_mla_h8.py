@@ -475,12 +475,15 @@ class SparseMlaPrefillH8:
         # 2 = C1 gather on warps 12-19 (2 per SMSP); 3 = C2 = C0 without the REG_LOW dealloc
         # clk (diagnostic): thread 0 of every CTA adds its clock64 / globaltimer deltas over
         # the kernel body and a CTA count to the u64 [3] at ``stamp`` (SM clock per call)
-        knobs = tuple(knobs) + (0,) * (29 - len(knobs))
+        # eph (P-MLA r7, logical tconv gather): gather warps pw >= 4 also wait for the S-free
+        # of subtile g - eph before issuing stage g, so the two copier halves issue at
+        # different phases of the subtile period (event-paced, half-size bursts)
+        knobs = tuple(knobs) + (0,) * (30 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
          self.epb, self.epw, self.msk, self.zf, self.pace, self.nbs, self.nex,
-         self.sw, self.cpb, self.qz, self.lad, self.clk) = knobs[:29]
+         self.sw, self.cpb, self.qz, self.lad, self.clk, self.eph) = knobs[:30]
         self.msk = self.msk != 9
         self.ssu = self.ssu or 16
         self.epb = self.epb != 9
@@ -617,9 +620,17 @@ class SparseMlaPrefillH8:
                         pw = Int32(0)
                     elif warp >= 12 and warp <= 18:
                         pw = warp - 11
-                if pw >= 0:
-                    lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
-                    lens_t = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+                lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+                lens_t = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+                if cutlass.const_expr(self.tconv):
+                    if warp == W_Q:
+                        self.slot_producer3(base, lane, cta, n_mine, tensormap.map_address(qn),
+                                            tensormap.map_address(qr), unit_rows, slots,
+                                            slot_stride, req_ids, btab, bt_stride, bt_cols,
+                                            bs_shift)
+                    elif pw >= 0:
+                        self.gather_cp_tconv(base, pw, lane, cta, n_mine, lens_t, kvp)
+                elif pw >= 0:
                     self.gather_cp(base, pw, lane, cta, n_mine, slots, slot_stride, lens_t,
                                    kvp, unit_rows)
                 if cutlass.const_expr(self.lad != 3):
@@ -1268,7 +1279,17 @@ class SparseMlaPrefillH8:
                 s = g % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 rc = Int32(ld_shared_u32(buf + Uint32(256) * Uint32(t)))
-                self.stage_wait(base, lane, g, s)
+                if cutlass.const_expr(self.lad):
+                    if g >= 4:
+                        mbar_wait(_bar(base, B_KVFULL + (g - 4) % NS),
+                                  Uint32(((g - 4) // NS) & 1))
+                else:
+                    if cutlass.const_expr(self.eph):
+                        if pw >= 4 and g >= self.eph:
+                            if lane == 0:
+                                v = g - self.eph
+                                mbar_wait(_bar(base, B_SFREE + v % 2), Uint32((v // 2) & 1))
+                    self.stage_wait(base, lane, g, s)
                 src = kvp
                 nb = Uint32(0)
                 if rc >= 0:
@@ -1281,6 +1302,8 @@ class SparseMlaPrefillH8:
             if lane == 0:
                 mbar_arrive(_bar(base, B_TKFREE + qi % 2))
         self.cp_drain(lane, base, g)
+        if cutlass.const_expr(self.lad):
+            cp_wait_all()
 
     @cute.jit
     def tconv_row(self, buf, lane, row, n, req_ids, btab, bt_stride, bt_cols, bs_shift,
@@ -1335,7 +1358,8 @@ class SparseMlaPrefillH8:
         n = self.tki_count(tki, lane, bt_cols, bs_shift)
         self.publish_count(base, lane, 0, n)
         if lane == 0:
-            self.q_issue(base, cta, Int32(0), tm_qn, tm_qr)
+            if cutlass.const_expr(not self.lad):
+                self.q_issue(base, cta, Int32(0), tm_qn, tm_qr)
         cute.arch.sync_warp()
         self.tconv_row(tki, lane, cta, n, req_ids, btab, bt_stride, bt_cols, bs_shift,
                        unit_rows)
@@ -1354,7 +1378,8 @@ class SparseMlaPrefillH8:
                 cute.arch.sync_warp()
                 if lane == 0:
                     mbar_arrive(_bar(base, B_TKCONV + (qi + 1) % 2))
-                    self.q_issue(base, row + self.grid, qi + 1, tm_qn, tm_qr)
+                    if cutlass.const_expr(not self.lad):
+                        self.q_issue(base, row + self.grid, qi + 1, tm_qn, tm_qr)
                 cute.arch.sync_warp()
             if qi + 2 < n_mine:
                 mbar_wait(_bar(base, B_TKFREE + qi % 2), Uint32((qi // 2) & 1))
@@ -2045,7 +2070,8 @@ def sparse_mla_prefill_h8_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
                                   block_stride_rows: int, scale: float, out_scale: float,
                                   out: torch.Tensor | None = None, knobs: tuple = (),
                                   lengths: torch.Tensor | None = None,
-                                  phys_dbg: torch.Tensor | None = None) -> torch.Tensor:
+                                  phys_dbg: torch.Tensor | None = None,
+                                  stamps: torch.Tensor | None = None) -> torch.Tensor:
     """``sparse_mla_prefill_h8`` on the indexer's request-relative top-k, with the
     index remap (``triton_convert_req_index_to_global_index``) fused into the gather:
     topk_indices [T, K] int32 (K % 64 == 0, 128 <= K <= 2048, < 0 invalid, valid
@@ -2082,7 +2108,8 @@ def sparse_mla_prefill_h8_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
        Int64(topk_indices.data_ptr()), Int32(topk_indices.stride(0)),
        Int64(0 if lengths is None else lengths.data_ptr()),  # lglob diagnostic only
        Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale),
-       Int32(kv_rows.shape[0]), Int64(0 if phys_dbg is None else phys_dbg.data_ptr()),
+       Int32(kv_rows.shape[0]), Int64(stamps.data_ptr() if stamps is not None else
+             0 if phys_dbg is None else phys_dbg.data_ptr()),
        Int64(req_ids.data_ptr()),
        Int64(block_table.data_ptr()), Int32(block_table.stride(0)),
        Int32(block_table.shape[1]), Int32(block_size.bit_length() - 1), stream)
