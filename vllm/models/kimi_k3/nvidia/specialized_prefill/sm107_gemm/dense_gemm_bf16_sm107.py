@@ -734,6 +734,14 @@ class PersistentDenseGemmKernel:
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        # Optional epilogue aux operand (ep_t1, (M, N, L) like C), partitioned as C
+        tCgAux = None
+        if cutlass.const_expr(self.aux_t2r):
+            tCgAux = thr_mma.partition_C(
+                cute.local_tile(
+                    ep_t1, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                )
+            )
         # Coordinates of C (row predication of the direct-store epilogue)
         tCcC = thr_mma.partition_C(
             cute.local_tile(
@@ -1053,6 +1061,9 @@ class PersistentDenseGemmKernel:
                         acc_pipeline,
                         c_pipeline,
                         cur_tile_coord,
+                        tCgAux,
+                        tCcC,
+                        mC_mnl,
                         ep_t0,
                         ep_t1,
                         ep_t2,
@@ -1115,6 +1126,9 @@ class PersistentDenseGemmKernel:
         acc_pipeline: pipeline.PipelineAsync,
         c_pipeline: pipeline.PipelineTmaStore,
         cta_tile_coord: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        tCgAux: Optional[cute.Tensor],
+        tCcC_base: cute.Tensor,
+        mC_mnl: cute.Tensor,
         ep_t0: Optional[cute.Tensor],
         ep_t1: Optional[cute.Tensor],
         ep_t2: Optional[cute.Tensor],
@@ -1154,12 +1168,44 @@ class PersistentDenseGemmKernel:
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         num_prev_subtiles = num_tiles_executed * subtile_cnt
+        if cutlass.const_expr(self.aux_t2r):
+            # aux in the TMEM-load (t2r) layout: one 16-byte load per 8 elements,
+            # rows past M predicated off (as the direct-store epilogue)
+            thr_t2r = tiled_copy_t2r.get_slice(epi_tidx)
+            tTR_gAux = thr_t2r.partition_D(
+                cute.flat_divide(
+                    _gemm_sm100.transform_partitioned_tensor_layout(tCgAux), epi_tile
+                )
+            )[(None, None, None, None, None, *mma_tile_coord_mnl)]
+            tTR_gAux = cute.group_modes(tTR_gAux, 3, cute.rank(tTR_gAux))
+            tTR_cAux = thr_t2r.partition_D(
+                cute.flat_divide(
+                    _gemm_sm100.transform_partitioned_tensor_layout(tCcC_base), epi_tile
+                )
+            )[(None, None, None, None, None, *mma_tile_coord_mnl)]
+            tTR_cAux = cute.group_modes(tTR_cAux, 3, cute.rank(tTR_cAux))
+            tTR_rAux = cute.make_rmem_tensor(tTR_rAcc.shape, ep_t1.element_type)
+            aux_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), ep_t1.element_type, num_bits_per_copy=128
+            )
         for subtile_idx in range(subtile_cnt):
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+            if cutlass.const_expr(self.aux_t2r):
+                c_sub = tTR_cAux[(None, None, None, subtile_idx)]
+                pred = cute.make_rmem_tensor((1, *c_sub.shape[1:]), cutlass.Boolean)
+                for mi in range(c_sub.shape[1]):
+                    for ni in range(c_sub.shape[2]):
+                        pred[(0, mi, ni)] = cute.elem_less(c_sub[(0, mi, ni)], mC_mnl.shape)
+                cute.copy(
+                    aux_atom, tTR_gAux[(None, None, None, subtile_idx)], tTR_rAux, pred=pred
+                )
             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-            self.epi_convert_regs(
-                tiled_copy_r2s.retile(tTR_rAcc), tRS_rC, epilogue_op, ep_t0
-            )
+            if cutlass.const_expr(self.aux_t2r):
+                self.epi_convert_regs_aux(tTR_rAcc, tTR_rAux, tRS_rC, tiled_copy_r2s)
+            else:
+                self.epi_convert_regs(
+                    tiled_copy_r2s.retile(tTR_rAcc), tRS_rC, epilogue_op, ep_t0
+                )
             c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
             cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
             cute.arch.fence_proxy("async.shared", space="cta")
@@ -1186,6 +1232,12 @@ class PersistentDenseGemmKernel:
     def epi_convert_regs(self, src, dst, epilogue_op, ep_t0):
         """Register fragment conversion (src FP32 -> dst C type, same layout)."""
         dst.store(self.epi_convert(src.load(), epilogue_op, ep_t0))
+
+    aux_t2r = False  # subclasses: ep_t1 is an (M, N, L) aux operand read in the epilogue
+
+    def epi_convert_regs_aux(self, acc_t2r, aux_t2r, dst, tiled_copy_r2s):
+        """Conversion with an aux fragment (both t2r layout) -> dst (r2s layout)."""
+        raise NotImplementedError
 
     def epi_tile_alloc(self, ep_t1):
         """Register buffer of the hooks' per-tile side loads (none in the base)."""
