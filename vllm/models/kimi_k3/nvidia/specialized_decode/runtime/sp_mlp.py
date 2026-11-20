@@ -58,8 +58,9 @@ SHARED = ("shared_gu", "shared_down")
 # TMA'd before the PDL wait, FP32 partials that route_stage sums in split order):
 ROUTER_LATENT = {"*": "25-72:ltpin,96:wide"}
 # ``wide`` rows -> PreparedWide policy (split, activation warps, weight stages,
-# weight warps, direct exchange, staggered K): 36 tiles x 5 splits = 180 CTAs.
-WIDE_FRONT = {96: (5, (1,), None, (0, 3), False, True)}
+# weight warps, direct exchange, staggered K): 36 tiles x 5 splits = 180 CTAs;
+# 10 weight stages (~190 KiB smem) leave room beside SpReduceAttnRes's CTAs.
+WIDE_FRONT = {96: (5, (1,), 10, (0, 3), False, True)}
 
 
 class RouterLatentGemm:
