@@ -760,6 +760,17 @@ class GenphaseTokenComm(KernelComponent):
     # covers a few hundred KB instead of the whole activation payload, so the SF
     # flag -- which gates the refine -- lands well before the data flag.
     sf_pusher_cta_count: ClassVar[int] = 8
+    # Refine groups the decode shapes need (one 128-row SF block per local expert
+    # and hot experts with two; 56 groups = one wave, the pre-43-pusher level). The remaining data pushers leave right after their sends: their SMs
+    # host the dependent main kernel's late clusters, which otherwise wait for the
+    # whole refine (~8 us after the pushes end).
+    refine_group_target: ClassVar[int] = 56
+
+    @property
+    def refine_pusher_cta_count(self) -> int:
+        """Pushers that join the refine after their sends: the SF pushers first, then data pushers."""
+        needed = ceil_div(self.refine_group_target, self.refine_participant_groups) - 1
+        return max(self.sf_pusher_cta_count, min(self.pusher_cta_count, needed))
 
     @property
     def data_pusher_cta_count(self) -> int:
@@ -1405,6 +1416,9 @@ class GenphaseTokenComm(KernelComponent):
                 linear_cta_idx - Int32(self.pusher_cta_begin),
                 thread_idx,
             )
+            if linear_cta_idx >= Int32(self.pusher_cta_begin + self.refine_pusher_cta_count):
+                self._leave(device_workspace, thread_idx)
+                exit()
 
         self._run_refine(device_workspace, smem_base, thread_idx)
         self._leave(device_workspace, thread_idx)
