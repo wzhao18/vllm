@@ -130,10 +130,14 @@ def persistent_prefill(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
     (sequence, head) chain pieces once per batch).
+
+    ``out`` (1, T, H, 128), contiguous, receives the output in place (the KDA
+    layer passes its ``core_attn_out`` rows); a new tensor otherwise.
 
     With ``state_cache`` [slots, H, D, D] the kernel loads each sequence's
     initial state from ``state_cache[state_indices[i]]`` (zero where
@@ -150,7 +154,16 @@ def persistent_prefill(
             _persistent_plans.clear()
         plan = kp.make_plan(list(offsets), H, q.device)
         _persistent_plans[key] = plan
-    out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
+    if out is None:
+        out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
+    elif not (
+        out.shape == (1, T, H, D) and out.dtype == q.dtype and out.is_contiguous()
+    ):
+        raise ValueError(
+            f"persistent KDA prefill out must be a contiguous (1, {T}, {H}, {D}) "
+            f"{q.dtype} tensor, got {tuple(out.shape)} {out.dtype} "
+            f"stride {out.stride()}"
+        )
     srow = None
     if state_cache is not None:
         assert state_indices is not None and has_initial_state is not None
