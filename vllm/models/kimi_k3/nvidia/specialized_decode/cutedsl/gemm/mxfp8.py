@@ -53,6 +53,13 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
         (257, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
+    # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
+    # 6.38, R384 6.75 / 6.69
+    (7168, 3072): (
+        (1, 128, ((128, 64), (1, 1), False, 128), 4),
+        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (257, 512, ((128, 128), (1, 1), False, 128), 4),
+    ),
 }
 
 
@@ -77,6 +84,7 @@ BLOCK = 32  # MXFP8 block along K
 #                       7.54 / 6.26 (= stock's rule: no entry)
 MX_TUNED: dict[tuple[int, int], dict] = {
     (12448, 7168): {"*": "1-384:pre,385-:scaled_mm"},
+    (7168, 3072): {"*": "1-16:fi_cute,17-384:pre,385-:scaled_mm"},
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
 }  # fmt: skip

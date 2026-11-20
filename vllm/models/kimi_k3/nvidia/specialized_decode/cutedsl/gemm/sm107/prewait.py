@@ -41,18 +41,23 @@ def _alpha_one(device):
 
 
 @cache
-def _compile(tactic, use_pdl, prewait, device_index, quiet=False):
+def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
+             prefetch=0, tile_k=TILER_K, die_claim=False):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
         (inst_m, tile[1], INST_K),
-        (tile[0], tile[1], TILER_K),
+        (tile[0], tile[1], tile_k),
         cluster,
+        prefetch_dist=prefetch,
         use_pdl=use_pdl,
         prewait_stages=prewait,
         weight_is_a=swap_ab,
         quiet_wait=quiet,
+        producers=producers,
+        die_claim=die_claim,
     )
+    gemm.dbg_skip_mma = bool(dbg & 1)
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16)
@@ -67,7 +72,9 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False):
         )
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
-    alpha = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
+    alpha = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (cute.sym_int() if die_claim else 1,), assumed_align=4
+    )
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
     with torch.accelerator.device_index(device_index):
@@ -85,22 +92,27 @@ class Mxfp8PreGemm:
     inst_m)`` (FlashInfer's sm_107 tactic tuple). ``out_layout``: "rn" = out [R, N]
     row-major; "cn" = the swap_ab store (out viewed with strides (1, R))."""
 
-    def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, device=None):
+    def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
+                 producers=1, prefetch=0, tile_k=TILER_K, die_split=None, device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
         if self.swap_ab:  # the swap_ab store layout is not wired (out would be wrong)
             raise ValueError("Mxfp8PreGemm: swap_ab tactics are not supported")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
-        if prewait and prewait > k // TILER_K:
+        if prewait and prewait > k // tile_k:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
         self.compiled, self.gemm = _compile(
-            tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet)
+            tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
+            int(producers), int(prefetch), int(tile_k), die_split is not None,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
+        self.aux, self.calls = None, 0
+        if die_split is not None:
+            self.aux = self._die_aux(tactic, rows, n, die_split, device)
         self.out_layout = "cn" if self.swap_ab else "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
@@ -113,8 +125,52 @@ class Mxfp8PreGemm:
         else:
             a, b, asf, bsf = xq, w, xs, ws
             c = out
-        self.compiled(a, b, c, *self.sf, asf.data_ptr(), bsf.data_ptr(), self.alpha)
+        alpha = self.alpha
+        if self.aux is not None:  # two counter sets, alternated per call
+            alpha = self.aux[self.calls % 2]
+            self.calls += 1
+        self.compiled(a, b, c, *self.sf, asf.data_ptr(), bsf.data_ptr(), alpha)
         return out
+
+    @staticmethod
+    def _die_aux(tactic, rows, n, die_split, device):
+        """alpha + die-claim state: int32 [4..6] counters (die 0, die 1, done), [8..11]
+        (first tile, tiles) per die, [12] M tiles, [16 + smid] die of the SM."""
+        from ...common.dies import sm_domains
+
+        tile, cluster = tactic[0], tactic[1]
+        if tuple(cluster) != (1, 1):
+            raise ValueError("die_claim needs a 1x1 cluster tactic")
+        m_tiles, n_tiles = -(-rows // tile[0]), -(-n // tile[1])
+        total = m_tiles * n_tiles
+        if total > _max_active_clusters(1):
+            raise ValueError(f"die_claim needs one tile per CTA ({total} tiles)")
+        table = sm_domains(device.index or 0)
+        n0 = min(die_split, n_tiles) * m_tiles
+        aux = torch.zeros(2, 272, dtype=torch.float32, device=device)
+        ints = aux.view(torch.int32)
+        aux[:, 0] = 1.0
+        ints[:, 8], ints[:, 9], ints[:, 10], ints[:, 11] = 0, n0, n0, total - n0
+        ints[:, 12] = m_tiles
+        ints[:, 16 : 16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=device)
+        return aux
+
+
+def die_weight(w: torch.Tensor, tile_n: int, device=None):
+    """(a copy of W [N, K] in die-placed memory, n_split): W rows [0, n_split * tile_n)
+    homed on die 0, the rest on die 1 (2 MiB chunks; the chunk across the split goes to
+    the die holding most of it), n_split balanced to the SMs per die."""
+    from ...common.dies import CHUNK, localized_like, sm_domains
+
+    n, k = w.shape
+    table = sm_domains(w.device.index or 0)
+    share = sum(1 for d in table if d == 0) / len(table)
+    n_tiles = -(-n // tile_n)
+    n_split = round(n_tiles * share)
+    split = n_split * tile_n * k * w.element_size()
+    chunks = -(-w.numel() * w.element_size() // CHUNK)
+    domains = [0 if (i + 0.5) * CHUNK < split else 1 for i in range(chunks)]
+    return localized_like(w, domains).view(w.dtype).view(n, k), n_split
 
 
 class _SpinKernel:
