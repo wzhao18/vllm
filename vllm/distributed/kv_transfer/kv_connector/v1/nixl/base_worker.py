@@ -5343,12 +5343,14 @@ class NixlBaseConnectorWorker:
                 _g = [b - a for a, b in zip(_gf, _gf[1:]) if a >= _t0]
                 logger.info(
                     "PDDIAG tp=%d req=%s seen_to_done=%.2fms polls=%d gap_max=%.2fms "
-                    "gap_mean=%.2fms span=%.2fms pop=%.3fms",
+                    "gap_mean=%.2fms span=%.2fms pop=%.3fms t0=%.0f t1=%.0f",
                     self.tp_rank, req_id[-10:], (time.perf_counter() - _t0) * 1e3,
                     len(_g), max(_g) * 1e3 if _g else 0.0,
                     sum(_g) / len(_g) * 1e3 if _g else 0.0,
                     (span[1] - span[0]) / 1e3 if span else -1.0,
                     (time.perf_counter() - _now) * 1e3,
+                    span[0] if span else -1.0,
+                    span[1] if span else -1.0,
                 )
             else:
                 transfers[req_id] = in_progress
