@@ -167,8 +167,10 @@ class SpReduceAttnRes(ClusterAttnRes):
         cute.arch.griddepcontrol_launch_dependents()
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (part, token, tid)
-        self.pre(state, bufs, rows, eps, ids)
         if cutlass.const_expr(self.push):
+            # Push this rank's o-projection partial rows first, then run the saved-block
+            # statistics (pre) while they are in flight: pre only reads rows complete at
+            # launch, so it hides under the NVLink hop instead of delaying the push.
             cute.arch.griddepcontrol_wait()  # the o-projection partial is complete
             cap = ring.shape[1]
             for o in cutlass.range_constexpr(self.tp):
@@ -176,6 +178,7 @@ class SpReduceAttnRes(ClusterAttnRes):
                 clean = tuple(positive_zero32(w) for w in words)
                 offset = Int64((rank * cap + token) * 7168 + col) * 2
                 store_relaxed(Int64(peers[o]) + offset, clean)
+        self.pre(state, bufs, rows, eps, ids)
         self.post(state, bufs, ring, rows, output, eps, out_eps, ids, ())
         if cutlass.const_expr(self.gather_mx):
             data, scale = gather
