@@ -293,31 +293,20 @@ class SpMlp:
 
             prepare_output_rmsnorm(mlp.experts, norm)
             self.fused_norm = norm
-        if self.latent_up_parts is not None:
-            with torch.accelerator.device_index(weights["latent_down"].device.index):
-                self._prepare_latent_up_parts(mlp, index)
-
-    def _prepare_latent_up_parts(self, mlp, index) -> None:
-        """S1-F: the latent up on rows whose MegaMoE forward ends with the fused-norm
-        reduce acquires that reduce's rows-done arrivals instead of the PDL wait, which
-        returns only after the MegaMoE kernel's serial tail (gemm.wide rows_sync).
-        Every such reduce launch must be consumed (the consumer re-arms the pair), so a
-        reduce row count without the split latent up raises here."""
-        sync = {}
+        # rows -> (rows-done pair, expected arrivals) of the fused-norm reduce (S1-F)
+        self.rows_done = {}
         if self.fused_norm is not None:
             for n in self.rows:
                 found = mlp.experts.reduce_rows_done(n)
-                if found is None:
-                    continue
-                if n not in self.parts:
-                    raise Unsupported(
-                        "moe", n, f"layer {index}: the fused-norm reduce counts rows for "
-                        "the split latent up, which these rows do not run",
-                    )  # fmt: skip
-                sync[n] = found
-        self.latent_up_parts.rows_sync = sync
-        self.latent_up_parts.prepare()
-        if sync:
+                if found is not None:
+                    self.rows_done[n] = found
+        if self.latent_up_parts is not None:
+            with torch.accelerator.device_index(weights["latent_down"].device.index):
+                self.latent_up_parts.rows_sync = {
+                    n: v for n, v in self.rows_done.items() if n in self.parts
+                }
+                self.latent_up_parts.prepare()
+        if self.rows_done:
             mlp.experts.rearm_reduce_rows_done()
 
     def choices(self, n):
@@ -429,7 +418,14 @@ class SpMlp:
             partials = final.new_empty((split * n, self.hidden), dtype=torch.float32)
             self.latent_up_parts.run(final.contiguous(), partials)
             return SplitDelta(partials, shared_out, split)
-        return gemms["latent_up"].run(final, residual=shared_out)
+        out = gemms["latent_up"].run(final, residual=shared_out)
+        sync = self.rows_done.get(n) if fused_norm is not None else None
+        if sync is not None:
+            # S1-F: this reduce launch counted its rows for the split latent up, which these rows do not run
+            # (stock latent up behind the PDL chain, so the reduce has completed): consume its arrivals.
+            pair, expected = sync
+            pair[:1].sub_(expected)
+        return out
 
 
 def _rubin_megamoe(experts) -> bool:
