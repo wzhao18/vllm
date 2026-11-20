@@ -247,6 +247,14 @@ def bulk_wait_read2():
 
 
 @asm()
+def publish_row(ctr):
+    """Release one finished row into its wave block counter: this thread's bulk
+    stores complete (not just read), then a gpu-scope release add."""
+    return ("cp.async.bulk.wait_group 0; fence.proxy.async.global; "
+            "red.release.gpu.global.add.u32 [$0], 1;", "l,~{memory}", (Int64(ctr),))
+
+
+@asm()
 def cp16(dst, src, n):
     """16 bytes global -> shared (cp.async; n = 0 zero-fills)."""
     return ("cp.async.cg.shared.global [$0], [$1], 16, $2;", "r,l,r,~{memory}",
@@ -430,7 +438,7 @@ class SparseMlaDecodeTS:
                  slot_stride: Int32, lengths: Int64, out: Int64, lse: Int64, scale_log2: Float32,
                  out_scale: Float32, kv_count: Int32, stamp: Int64, req_ids: Int64,
                  btab: Int64, bt_stride: Int32, bt_cols: Int32, bs_shift: Int32,
-                 stream: cuda.CUstream):
+                 ready: Int64, stream: cuda.CUstream):
         u8 = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
         bf16 = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
         l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
@@ -447,7 +455,7 @@ class SparseMlaDecodeTS:
                                   sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
         self.kernel(qn, qr, kvm, kvr, om, rows, unit_rows, slots, slot_stride, lengths,
                     scale_log2, out_scale, stamp, kv, req_ids, btab, bt_stride, bt_cols,
-                    bs_shift, lse).launch(
+                    bs_shift, lse, ready).launch(
             grid=(self.grid, 1, 1), block=(THREADS, 1, 1), smem=self.smem,
             stream=stream, min_blocks_per_mp=1)
 
@@ -457,7 +465,7 @@ class SparseMlaDecodeTS:
                rows: Int32, unit_rows: Int32, slots: Int64, slot_stride: Int32,
                lengths: Int64, scale_log2: Float32, out_scale: Float32, stamp: Int64,
                kvp: Int64, req_ids: Int64, btab: Int64, bt_stride: Int32, bt_cols: Int32,
-               bs_shift: Int32, lse: Int64):
+               bs_shift: Int32, lse: Int64, ready: Int64):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         # DcpValue (PDL) may launch at once: its CTAs take the SMs this grid vacates.
@@ -506,7 +514,7 @@ class SparseMlaDecodeTS:
             if warp < W_SM:
                 cute.arch.warpgroup_reg_alloc(REG_SM)
                 self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
-                             out_scale, tensormap.map_address(om), lse)
+                             out_scale, tensormap.map_address(om), lse, ready)
                 cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
             else:
                 cute.arch.warpgroup_reg_dealloc(REG_LOW)
@@ -1366,7 +1374,7 @@ class SparseMlaDecodeTS:
     # ------------------------------------------------------------------ softmax
     @cute.jit
     def softmax(self, base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
-                out_scale, tm_o, lse):
+                out_scale, tm_o, lse, ready):
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
         wg = warp // 4
@@ -1433,7 +1441,7 @@ class SparseMlaDecodeTS:
             if owner:
                 if qi + 1 < n_mine:
                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
-                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
+                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o, ready)
 
     @cute.jit
     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
@@ -1582,7 +1590,7 @@ class SparseMlaDecodeTS:
         return mp_last, lw
 
     @cute.jit
-    def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o):
+    def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o, ready):
         """O^T block b (lanes = dims, columns = heads) -> BF16 [heads x dims]: 16x256b
         TMEM loads give each thread two adjacent heads of one dim (an m8n8 b16
         fragment with dims as rows), scaled by s / l and packed; stmatrix.trans writes
@@ -1645,6 +1653,11 @@ class SparseMlaDecodeTS:
                 if cta == 0 and qi < 2:
                     sstamp_clock(base + Uint32(SMEM_BYTES + (27 + 2 * qi) * 4))
             mbar_arrive(_bar(base, B_EPIDONE))
+            # DcpValue (kernel_ov) consumes finished rows by wave block: row = CTA + i
+            # x grid, blocks of <= 32 rows inside a wave (dcp_value.wave_blocks).
+            if ready != Int64(0):
+                blk = qi * ((self.grid + 31) // 32) + cta // 32
+                publish_row(ready + Int64(4) * Int64(blk))
 
 
 @cache
@@ -1652,18 +1665,19 @@ def _compiled(grid: int, knobs: tuple = (), topk: int = 0):
     kernel = SparseMlaDecodeTS(grid, knobs, topk)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0), Int64(0),
             Int64(0), Float32(1.0), Float32(1.0), Int32(64), Int64(0), Int64(0), Int64(0), Int32(1),
-            Int32(1), Int32(6), cuda.CUstream(0))
+            Int32(1), Int32(6), Int64(0), cuda.CUstream(0))
     # register budgets come from setmaxnreg (.reqntid 640 -> 96 at launch)
     return cute.compile(kernel, *args)
 
 
 def sparse_mla_decode_ts(query, kv_rows, slots, valid, latent, lse, scale, out_scale,
-                         knobs=(), stamps=None):
+                         knobs=(), stamps=None, ready=None):
     """As ``sparse_mla_km.sparse_mla_decode_km``: query [R, 128, 576] FP8 (heads 0..95
     real), kv_rows [rows, 576] FP8, slots [R, W] int32 flat rows (valid entries first),
     valid [R] int32 counts, latent [R, 128, 512] BF16 and lse [R, 128] FP32 (heads
     0..95 written); ``scale`` = softmax scale x q scale x k scale (natural log units),
-    ``out_scale`` = k scale."""
+    ``out_scale`` = k scale. ``ready``: int32 counters each finished row adds 1 to,
+    at its wave block (dcp_value.wave_blocks of this grid; DcpValue.kernel_ov)."""
     rows = query.shape[0]
     if (query.shape[1:] != (HS, ROW) or not query.is_contiguous()
             or kv_rows.shape[1] != ROW or kv_rows.stride(0) != ROW
@@ -1685,7 +1699,7 @@ def sparse_mla_decode_ts(query, kv_rows, slots, valid, latent, lse, scale, out_s
        Int64(latent.data_ptr()), Int64(lse.data_ptr()), Float32(scale * LOG2E),
        Float32(out_scale), Int32(kv_rows.shape[0]),
        Int64(0 if stamps is None else stamps.data_ptr()), Int64(0), Int64(0), Int32(1),
-       Int32(1), Int32(6), stream)
+       Int32(1), Int32(6), Int64(0 if ready is None else ready.data_ptr()), stream)
     return latent, lse
 
 

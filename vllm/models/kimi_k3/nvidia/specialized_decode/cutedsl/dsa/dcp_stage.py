@@ -54,10 +54,12 @@ def compile_dcp_value(
     partials,
     cap=64,
     rearm=True,
+    ts_grid=0,
 ):
     """DcpValue of one batch (DSA layout over the ``q_heads``-padded mailbox of
     ``cap`` rows; ``partials``: the DcpBox's; ``rearm`` False: the q mailbox was
-    not published, local_query)."""
+    not published, local_query; ``ts_grid``: overlapped with sparse_mla_ts on that
+    persistent grid, DcpValue.kernel_ov)."""
     return compile_value(
         heads,
         dcp,
@@ -74,6 +76,7 @@ def compile_dcp_value(
         partials=partials,
         preprojected=partials == PROJECTED and not projects_on_tc(batch),
         rearm=rearm,
+        ts_grid=ts_grid,
     )
 
 
@@ -162,7 +165,8 @@ def run_value(
         uv = to_cute(values)
     v_args = (to_cute(latent), to_cute(lse, 4), counts, *boxes, *peers, mailbox, uv)
     s = stream(out.device)
-    kernel(*v_args, gate, lens, to_cute(out), cutlass.Int32(parity), rank, s)
+    sync = to_cute(mail.sync[parity], 4)
+    kernel(*v_args, gate, lens, to_cute(out), cutlass.Int32(parity), rank, sync, s)
     return out
 
 

@@ -59,7 +59,7 @@ from .dcp_stage import (
     run_core_value,
     run_value,
 )
-from .dcp_value import PROJECTED
+from .dcp_value import PROJECTED, SYNC_READY, projects_on_tc
 from .indexer import PAGE as INDEX_PAGE
 from .indexer import FusedIndexer
 from .indexer import reserve as reserve_fused_indexer
@@ -144,6 +144,7 @@ def compile_core(
     cap=64,
     release=True,
     rearm=True,
+    ts_grid=0,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
@@ -182,7 +183,7 @@ def compile_core(
         if dcp:
             args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
             value_kernel = compile_dcp_value(
-                *args, fp8, lse_base_e, partials, cap, rearm
+                *args, fp8, lse_base_e, partials, cap, rearm, ts_grid
             )
         else:
             latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
@@ -431,6 +432,7 @@ class PreparedDsa:
                     mode = overlap_for(batch, QUERY_OVERLAP_UNFUSED)
                 self.overlaps[batch, q] = mode
         unserved = []  # DSA sparse core shapes whose rows exchange "proj" partials
+        self.overlapped = set()  # (batch, q): DcpValue.kernel_ov after the ts core
         for batch, q in self.shapes:
             args: tuple = (batch, self.heads, self.pitches[batch], specs)
             args += (self.device.index, q)
@@ -442,6 +444,13 @@ class PreparedDsa:
             lse_base_e = self.cores[batch, q] not in ("trtllm", "km", "ts")
             overlap = self.overlaps[batch, q]
             cap = self.box.cap if self.box is not None else 64
+            # DcpValue overlapped with the persistent ts core (it publishes its rows).
+            ts_grid = 0
+            if (self.box is not None and self.cores[batch, q] == "ts"
+                    and partials == PROJECTED and projects_on_tc(batch)
+                    and self.is_local(batch)):
+                ts_grid = sms
+                self.overlapped.add((batch, q))
             if self.is_local(batch) and overlap != "fork":
                 raise ValueError(
                     f"Kimi K3.1 DSA local query at {batch} rows: overlap {overlap!r} "
@@ -457,6 +466,7 @@ class PreparedDsa:
                 cap=cap,
                 release=(batch, q) not in self.held(LATE),
                 rearm=not self.is_local(batch),
+                ts_grid=ts_grid,
             )
             if overlap != "serial" or batch <= FUSED_INDEX:
                 self.overlap_kernels[batch, q] = self.compile_overlap(
@@ -768,7 +778,8 @@ class PreparedDsa:
         return stage.run_index(kernel, projected, index_slots)
 
     def dcp_core(
-        self, cache, topk, metadata, batch, projected=None, join=None, q=1, query=None
+        self, cache, topk, metadata, batch, projected=None, join=None, q=1, query=None,
+        ready=None,
     ):
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
         local shard into the DcpValue rows, LSE and per-row valid counts: on a
@@ -809,7 +820,7 @@ class PreparedDsa:
                 merged = self.fi.convert(*args)
             if join is not None:
                 join()
-            latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
+            latent, lse = self.fi.decode(query, cache, *merged, md.block_size, ready)
             return latent, lse, merged[1]
         if topk is None:
             topk = self.indexer_core(projected, batch)
@@ -856,10 +867,13 @@ class PreparedDsa:
             buffers = self.fi.latent, self.fi.lse
             args = sparse[1], box, p, publish, self.heads, buffers, lengths[:reqs], uv
             return run_core_value(*args, projected, out)
+        ready = None  # the ts core's wave block counters (DcpValue.kernel_ov)
+        if (batch, q) in self.overlapped:
+            ready = box.mailbox(batch).sync[p, SYNC_READY:]
         if (batch, q) not in self.prioritized:
             self.run_index(index, projected, index_slots, q)
             args = cache, None, metadata, batch, projected, join, q
-            core = self.dcp_core(*args, query=query)
+            core = self.dcp_core(*args, query=query, ready=ready)
         else:
             # wq_b through the sparse core on the high-priority index stream.
             main = torch.cuda.current_stream(self.device)
@@ -868,7 +882,7 @@ class PreparedDsa:
             with torch.cuda.stream(hi):
                 self.run_index(index, projected, index_slots, q)
                 args = cache, None, metadata, batch, projected, join, q
-                core = self.dcp_core(*args, query=query)
+                core = self.dcp_core(*args, query=query, ready=ready)
             main.wait_stream(hi)
         w_uv = None
         if box.mailbox(batch).format == PROJECTED:

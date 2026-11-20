@@ -275,10 +275,11 @@ class FlashInferCore:
         view = torch.float8_e4m3fn if self.fmt == "native" else torch.uint8
         return flat_kv_row_view(cache.view(view), block_size)
 
-    def decode(self, query, cache, slots, valid, block_size):
+    def decode(self, query, cache, slots, valid, block_size, ready=None):
         """The sparse decode of ``query`` over this rank's flat rows ``slots`` of
         the packed ``cache`` (a compacted prefix of ``valid`` per row; e.g. from a
-        fused top-k that emits them) -> as ``run``."""
+        fused top-k that emits them) -> as ``run``. ``ready`` (ts only): the wave
+        block counters DcpValue.kernel_ov consumes the finished rows by."""
         rows, heads = query.shape[0], self.heads
         assert query.shape[1] == heads
         kv, stride_rows = self.rows(cache, block_size)
@@ -292,7 +293,7 @@ class FlashInferCore:
         elif self.kernels[rows] == "km":
             self.keys_on_m(query, kv, slots, valid, latent, lse)
         elif self.kernels[rows] == "ts":
-            self.latent_q_tmem(query, kv, slots, valid, latent, lse)
+            self.latent_q_tmem(query, kv, slots, valid, latent, lse, ready)
         else:
             self.trtllm(query, kv, stride_rows, slots, valid, latent, lse, block_size)
         return latent, lse
@@ -321,7 +322,7 @@ class FlashInferCore:
             impl.bmm2_scale,
         )
 
-    def latent_q_tmem(self, query, kv, slots, valid, latent, lse):
+    def latent_q_tmem(self, query, kv, slots, valid, latent, lse, ready=None):
         """sparse_mla_ts: the Rubin latent-Q-in-TMEM sparse MLA over the 96 real heads
         (the trtllm-gen arithmetic as ``km``: E4M3 P at 448 of the running max per
         128-key tile, FP32 sums, one unsplit pass per row; base-2 LSE)."""
@@ -343,6 +344,7 @@ class FlashInferCore:
             lse,
             impl.bmm1_scale,
             impl.bmm2_scale,
+            ready=ready,
         )
 
     def prims_ts(self, query, kv, slots, valid, latent, lse):
