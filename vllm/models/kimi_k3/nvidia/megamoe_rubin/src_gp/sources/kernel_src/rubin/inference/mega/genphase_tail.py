@@ -26,6 +26,7 @@ from cutlass.cutlass_dsl import Int32, Int64
 
 from .....helpers.device_workspace import DeviceWorkspace
 from ......common.ptx_helpers import red_add_relaxed_sys_s32
+from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
 
 
 class GenphaseTail:
@@ -117,13 +118,16 @@ class GenphaseTail:
         # so it must not sit behind the system fence that the peer-facing signals need.
         cute.arch.fence_acq_rel_gpu()
         cute.arch.store(workspace.ptr(self.epoch_region), epoch + Int32(1), sem="relaxed", scope="gpu")
+        DG.put_gt(DG.S_L_EPOCH, Int32(1))
         cute.arch.fence_acq_rel_sys()
+        DG.put_gt(DG.S_L_FSYS, Int32(1))
         signal_address = workspace.ptr(self.signal_region).toint()
         for destination_rank in cutlass.range_constexpr(self.world_size):
             red_add_relaxed_sys_s32(
                 peer_rank_ptr_mapper.map(signal_address, Int32(destination_rank), Int64(signal_phase * Int32(4))),
                 signal_delta,
             )
+        DG.put_gt(DG.S_L_SIG, Int32(1))
 
     @cute.jit
     def previous_done_observation(self, workspace: DeviceWorkspace) -> Int32:
