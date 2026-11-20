@@ -51,6 +51,7 @@ from .....helpers.iket_compat import iket
 from ......common.ptx_helpers import (
     atom_add_acq_rel_gpu_s32,
     ldg_cg_v4_b32,
+    opaque_zero_after,
     stg_v4_b32,
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
@@ -2871,17 +2872,17 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                 frag = ((own_slice * cutlass.Int32(split.subtiles) + subtile_idx) * cutlass.Int32(4) + warp) * (
                     cutlass.Int32(warp_words)
                 ) + lane_word
-                for chunk in cutlass.range_constexpr(SharedFc2SplitK.chunks):
-                    regs = top if chunk < SharedFc2SplitK.chunks // 2 else bottom
-                    first = (chunk % (SharedFc2SplitK.chunks // 2)) * 4
-                    words = cute.recast_tensor(regs, cutlass.Int32)
-                    stg_v4_b32(
-                        (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint(),
-                        words[first],
-                        words[first + 1],
-                        words[first + 2],
-                        words[first + 3],
-                    )
+                halves = (cute.recast_tensor(top, cutlass.Int32), cute.recast_tensor(bottom, cutlass.Int32))
+                for half in cutlass.range_constexpr(2):
+                    for quad in cutlass.range_constexpr(SharedFc2SplitK.chunks // 2):
+                        chunk = half * (SharedFc2SplitK.chunks // 2) + quad
+                        stg_v4_b32(
+                            (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint(),
+                            halves[half][quad * 4],
+                            halves[half][quad * 4 + 1],
+                            halves[half][quad * 4 + 2],
+                            halves[half][quad * 4 + 3],
+                        )
 
         # 2. Count this warp's slice (release); the completing warp acquires the other slices' fragments.
         cute.arch.sync_warp()
@@ -2895,31 +2896,34 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
         # 3. The completing warp: sum slices 0..ksplit-1 in order, one BF16 rounding, store its 32 hidden rows.
         if arrived == cutlass.Int32(split.ksplit - 1):
+            # Address dependency on the acquire: the slice loads below issue back to back, never above it.
+            lane_word = lane_word + opaque_zero_after(arrived)
             for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
                 if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
                     tmem_subtile = tmem_acc_tensor_tiled_by_epi_tile[None, None, subtile_idx]
                     top = cute.make_rmem_tensor((32,), cutlass.Float32)
                     bottom = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    sums = (top, bottom)
                     for k in cutlass.range_constexpr(split.ksplit):
                         frag = (
                             ((slot * cutlass.Int32(split.ksplit) + cutlass.Int32(k)) * cutlass.Int32(split.subtiles)
                              + subtile_idx) * cutlass.Int32(4) + warp
                         ) * cutlass.Int32(warp_words) + lane_word
-                        for chunk in cutlass.range_constexpr(SharedFc2SplitK.chunks):
-                            regs = top if chunk < SharedFc2SplitK.chunks // 2 else bottom
-                            first = (chunk % (SharedFc2SplitK.chunks // 2)) * 4
-                            words = ldg_cg_v4_b32(
-                                (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint()
-                            )
-                            loaded = cute.make_rmem_tensor((4,), cutlass.Int32)
-                            for i in cutlass.range_constexpr(4):
-                                loaded[i] = words[i]
-                            values = cute.recast_tensor(loaded, cutlass.Float32)
-                            for i in cutlass.range_constexpr(4):
-                                if cutlass.const_expr(k == 0):
-                                    regs[first + i] = values[i]
-                                else:
-                                    regs[first + i] = regs[first + i] + values[i]
+                        for half in cutlass.range_constexpr(2):
+                            for quad in cutlass.range_constexpr(SharedFc2SplitK.chunks // 2):
+                                chunk = half * (SharedFc2SplitK.chunks // 2) + quad
+                                words = ldg_cg_v4_b32(
+                                    (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint()
+                                )
+                                loaded = cute.make_rmem_tensor((4,), cutlass.Int32)
+                                for i in cutlass.range_constexpr(4):
+                                    loaded[i] = words[i]
+                                values = cute.recast_tensor(loaded, cutlass.Float32)
+                                for i in cutlass.range_constexpr(4):
+                                    if cutlass.const_expr(k == 0):
+                                        sums[half][quad * 4 + i] = values[i]
+                                    else:
+                                        sums[half][quad * 4 + i] = sums[half][quad * 4 + i] + values[i]
                     casted = fc2_f2fp(top, bottom, alpha_val=None, batch_invariant=self.batch_invariant)
                     pre_store = fc2_stg_post_f2fp_reorder(casted=casted, tmem_subtile_view=tmem_subtile)
                     fc2_stg_store_function(

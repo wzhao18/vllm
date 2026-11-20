@@ -957,7 +957,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self.fc1_k_tile_count = ceil_div(bound_hidden_size, self.mma_tile_k)
         self.fc2_k_tile_count = ceil_div(bound_intermediate_gateup_size // 2, self.mma_tile_k)
         self._set_shared_k_tile_counts()
-        if self.shared_fc2_ksplit > 1 and self.shared_fc2_k_tile_count % self.shared_fc2_ksplit != 0:
+        if cutlass.const_expr(self.shared_fc2_ksplit > 1 and self.shared_fc2_k_tile_count % self.shared_fc2_ksplit != 0):
             raise ValueError(
                 f"shared_fc2_ksplit={self.shared_fc2_ksplit} must divide the shared FC2 K tiles "
                 f"({self.shared_fc2_k_tile_count})."

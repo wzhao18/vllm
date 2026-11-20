@@ -1116,7 +1116,9 @@ def ldg_cg_v4_b32(address: Int64, *, loc=None, ip=None):
         [address.ir_value()],
         "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
-        has_side_effects=True,
+        # Not volatile: the loads of a batch must issue back to back (the caller orders them after its acquire by an
+        # address dependency, opaque_zero_after).
+        has_side_effects=False,
         asm_dialect=0,
         loc=loc,
         ip=ip,
@@ -1133,6 +1135,23 @@ def atom_add_acq_rel_gpu_s32(address: Int64, value: Int32, *, loc=None, ip=None)
         [address.ir_value(), value.ir_value()],
         "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
         "=r,l,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def opaque_zero_after(value: Int32, *, loc=None, ip=None) -> Int32:
+    """A 0 the compiler cannot fold or hoist above ``value``'s producer: add it to an address to keep a
+    non-volatile load after an acquire that returned ``value``."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [value.ir_value()],
+        "mov.b32 $0, 0;",
+        "=r,r",
         has_side_effects=True,
         asm_dialect=0,
         loc=loc,
