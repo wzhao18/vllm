@@ -117,6 +117,7 @@ def main():
             try:
                 g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
                              kred=bool(int(f.get("r", 0))), pair=bool(int(f.get("p", 1))),
+                             iw=int(f.get("w", 1)), ix=int(f.get("x", 1)),
                              debug=dbg, kt=kt)
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)

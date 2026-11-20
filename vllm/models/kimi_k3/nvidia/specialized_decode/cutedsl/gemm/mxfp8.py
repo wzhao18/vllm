@@ -18,8 +18,9 @@ Kinds (every kind sums K in FP32 and rounds once to BF16; the order differs):
   "fi_cute"     FlashInfer CuTe DSL MXFP8 GEMM (stock's choice at <= 16 rows)
   "fi_cutlass"  FlashInfer CUTLASS MXFP8 GEMM
   "scaled_mm"   cuBLASLt ``torch._scaled_mm`` (stock's choice above 16 rows)
-  "dense_mx8"   ``dense_mx8.DenseMx8``: 2-CTA M256 over all R tokens, K split in two,
-                weights loaded before the PDL wait
+  "dense_mx8"   ``dense_mx8.DenseMx8``: all R tokens per CTA, K split in two inside a
+                2-CTA cluster (FP32 partial reduced over DSMEM), weights loaded before
+                the PDL wait (form per R: ``DENSE_FORMS``)
 
 The per-R kind is GENERIC = stock's own per-call rule (``nvidia.mxfp8.use_cute_dsl``:
 the same kernel as the stock linear, so the stock bits) unless ``MX_TUNED`` names a
@@ -52,6 +53,16 @@ MX_TUNED: dict[tuple[int, int], dict] = {
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
 }  # fmt: skip
+
+# dense_mx8 form per R: cta_group::1 M128 row blocks with the two K halves in one
+# 2-CTA cluster (98 co-resident clusters at N 12448; the cta_group::2 form needs
+# 4-CTA clusters, only 46 of which fit) and the deepest ring that fits shared memory.
+DENSE_FORMS = "1-128:6,129-256:4,257-384:3"
+
+
+def dense_form(rows: int) -> dict:
+    stages = rows_policy(DENSE_FORMS, Shape(rows, 1), name="DENSE_FORMS")
+    return dict(ksplit=2, stages=stages, pair=False, kred=True)
 
 
 def stock_kind(n: int, k: int, rows: int) -> str:
@@ -273,7 +284,7 @@ class _DenseEngine:
         from ..common.host import stream
         from .dense_mx8 import DenseMx8
 
-        self.gemm = DenseMx8(n, k, rows, n)
+        self.gemm = DenseMx8(n, k, rows, n, **dense_form(rows))
         words, tickets = self.gemm.scratch_words()
         self.part = torch.empty(words, dtype=torch.float32, device=device)
         self.tickets = torch.zeros(tickets, dtype=torch.int32, device=device)

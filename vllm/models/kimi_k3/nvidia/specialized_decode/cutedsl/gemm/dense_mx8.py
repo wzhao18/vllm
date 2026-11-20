@@ -55,8 +55,6 @@ MMA_K = 64  # 2x-K mxf8f6f4
 EPI_WARPS = 4
 MMA_WARP = 4
 TMA_WARP = 5  # weights (A, SFA): issued before the PDL wait
-X_WARP = 6  # activation (B, SFB): a second TMA issuer, after the PDL wait
-THREADS = 32 * (X_WARP + 1)
 TMEM_COLS = 512
 TMEM_BAR = 1  # named barrier ids (0 = __syncthreads)
 EPI_BAR = 2
@@ -162,8 +160,16 @@ class DenseMx8:
     def __init__(self, n: int, k: int, rows: int, ldo: int, *, ksplit: int = 2,
                  kt: int = 128, stages: int = 4, collector: bool = True,
                  mc: int = 1, kred: bool = False, pair: bool = True,
-                 debug: int = 0):  # fmt: skip
+                 iw: int = 1, ix: int = 1, debug: int = 0):  # fmt: skip
         assert rows <= 384 and k % (kt * ksplit) == 0 and ksplit in (1, 2)
+        # iw / ix TMA issuer warps for the weights / the activation, each issuing every
+        # iw-th / ix-th K tile: one issuer completes one bulk op at a time (~0.3 us
+        # from L2 / HBM, hwdb hw51), so a single issuer caps the ring at one stage per
+        # op latency whatever its depth.
+        assert iw >= 1 and ix >= 1
+        self.iw, self.ix = iw, ix
+        self.x_warp = TMA_WARP + iw
+        self.threads = 32 * (TMA_WARP + iw + ix)
         # kred: the two K halves of a row block share one cluster and reduce the FP32
         # partial over DSMEM (symmetric reduce-scatter: each CTA owns half of the
         # token columns), instead of the global ticket exchange.
@@ -313,7 +319,7 @@ class DenseMx8:
             sfa_layout, sfb_layout, tsfa_layout, tsfb_layout, out_ptr, part_ptr,
             ticket_ptr,
         ).launch(
-            grid=[self.grid, 1, 1], block=[THREADS, 1, 1], cluster=[self.clus, 1, 1],
+            grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[self.clus, 1, 1],
             stream=stream, use_pdl=True,
         )  # fmt: skip
 
@@ -437,13 +443,17 @@ class DenseMx8:
         # K-start rotation per row block: pairs do not read the same x lines in
         # lock-step (an all-SM hot L2 region delivers a fraction of the L2 rate).
         rot = ((mb // self.mc) * 7) % self.ktiles  # one K order per cluster (multicast)
-        if warp == TMA_WARP and not cutlass.const_expr(self.debug & 32):
+        if (warp >= TMA_WARP and warp < self.x_warp
+                and not cutlass.const_expr(self.debug & 32)):  # fmt: skip
+            iw = warp - TMA_WARP
             gA_s = tAgA[(None, mb, None, 0)]
             gSFA_s = tAgSFA[(None, mb, None, 0)]
             prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
+            for _ in cutlass.range(iw, unroll=1):
+                prod.advance()
             # Weights do not depend on the predecessor: the ring fills with them while
             # the SP gather that writes x is still running.
-            for t in cutlass.range(self.ktiles, unroll=1):
+            for t in cutlass.range(iw, self.ktiles, self.iw, unroll=1):
                 kk = k0 + (t + rot) % self.ktiles
                 ab.producer_acquire(prod)
                 bar = ab.producer_get_barrier(prod)
@@ -453,14 +463,25 @@ class DenseMx8:
                 if cutlass.const_expr(not self.debug & 128):
                     self._tma(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)],
                               bar, a_mask)  # fmt: skip
-                prod.advance()
-            ab.producer_tail(prod)
+                for _ in cutlass.range_constexpr(self.iw):
+                    prod.advance()
+            if iw == 0:
+                tail = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.stages
+                )
+                for _ in cutlass.range(self.ktiles, unroll=1):
+                    tail.advance()
+                ab.producer_tail(tail)
 
-        if warp == X_WARP and not cutlass.const_expr(self.debug & 32):
+        if (warp >= self.x_warp and warp < self.x_warp + self.ix
+                and not cutlass.const_expr(self.debug & 32)):  # fmt: skip
+            ix = warp - self.x_warp
             gB_s = tBgB[(None, 0, None, 0)]
             xs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
+            for _ in cutlass.range(ix, unroll=1):
+                xs.advance()
             cute.arch.griddepcontrol_wait()
-            for t in cutlass.range(self.ktiles, unroll=1):
+            for t in cutlass.range(ix, self.ktiles, self.ix, unroll=1):
                 kk = k0 + (t + rot) % self.ktiles
                 # same slot as the weight warp; only the weight warp arrives (expect_tx)
                 ab.sync_object_empty.wait(xs.index, xs.phase)
@@ -474,7 +495,8 @@ class DenseMx8:
                             tma_sfb, tBgSFB[(None, j, kk, 0)], tBsSFBs[j][(None, xs.index)],
                             bar, sfb_mask,
                         )  # fmt: skip
-                xs.advance()
+                for _ in cutlass.range_constexpr(self.ix):
+                    xs.advance()
 
         if warp == MMA_WARP and not cutlass.const_expr(self.debug & 32):
             tmem.wait_for_alloc()
