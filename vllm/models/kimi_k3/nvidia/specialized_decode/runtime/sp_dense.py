@@ -25,11 +25,13 @@ from ..shapes import Choice, Path, Unsupported
 logger = init_logger(__name__)
 
 PLACE_SAMPLES, PLACE_PASSES = 8, 5
-# The most shard rows DenseStream serves; above, the stock dense MLP (cuBLAS) on the
-# same (re-homed) weights. In-step ABBA (fastab dd-ds1, D3-32 slice, Hecate): rows 32
-# -10.9 us/step; rows 64 / 96 +15.6 / +15.7 (gate_up 111-119 us in-step vs 90-98
-# standalone: the predecessor's tail overlap and the end-of-stream SiTU).
-STREAM_ROWS = 32
+MAX_ROWS = 128
+# The most shard rows whose gate_up stream applies SiTU in its epilogue. In-step
+# (fastab dd-ds1, D3-32 slice): fused at 32 rows -10.9 us/step, at 64 / 96 +15.6 /
+# +15.7 (gate_up 111-119 us in-step vs 90-98 standalone: the end-of-stream SiTU on
+# 12 warps); standalone at 96 rows the unfused form (gate_up 2 I + stock SiTU) is
+# 84.5 us vs fused 95.4 (stock 101.7), at 64 a tie, at 32 fused 70.8 vs 79.3.
+FUSED_ROWS = 32
 
 
 def dense_cause(mlp):
@@ -113,7 +115,10 @@ def place_rows(weight, die_of_row):
 
 class SpDenseMlp:
     """``run(h [n, H])`` -> [n, H] BF16 (stock ``mlp(h)``, the GEMMs' FP32 summation
-    order aside) for every captured shard row count ``n`` in ``rows``."""
+    order aside) for every captured shard row count ``n`` in ``rows``: at most
+    ``FUSED_ROWS`` rows the gate_up stream applies SiTU in its epilogue; above, it
+    writes the stock [n, 2 I] gate_up output and the stock SituAndMul follows (its
+    full-occupancy kernel beats the stream's end-of-stream SiTU there)."""
 
     def __init__(self, mlp, rows, device, index):
         cause = dense_cause(mlp)
@@ -122,17 +127,17 @@ class SpDenseMlp:
         gate_up, down = mlp.gate_up_proj.weight, mlp.down_proj.weight
         hidden, inter = down.shape
         self.hidden, self.inter = hidden, inter
-        act = mlp.act_fn
-        beta = float(act.beta)
-        linear = -1.0 if act.linear_beta is None else float(act.linear_beta)
-        self.rows = tuple(n for n in sorted(set(rows)) if n <= STREAM_ROWS)
-        if not self.rows:
-            raise Unsupported("dense", None, f"layer {index}: no shard rows <= {STREAM_ROWS}")
+        self.act = mlp.act_fn
+        beta = float(self.act.beta)
+        linear = -1.0 if self.act.linear_beta is None else float(self.act.linear_beta)
+        self.rows = tuple(sorted(set(rows)))
+        if not self.rows or self.rows[-1] > MAX_ROWS:
+            raise Unsupported("dense", None, f"layer {index}: shard rows {self.rows}")
         self.table, self.s0, self.s1 = die_map(device)
         two = self.s1 > 0
         nb0_gu = dsm.split_blocks(inter // 128, self.s0, self.s1)
         nb0_d = dsm.split_blocks(hidden // 128, self.s0, self.s1)
-        if two:
+        if two:  # gate block b and its up block on one die (fused and unfused alike)
             half_gu, half_d = nb0_gu * 128, nb0_d * 128
             placed = place_rows(gate_up, lambda row: int(row % inter >= half_gu))
             placed &= place_rows(down, lambda row: int(row >= half_d))
@@ -144,27 +149,35 @@ class SpDenseMlp:
         top = self.rows[-1]
         self.h = torch.empty(top, inter, dtype=torch.bfloat16, device=device)
         self.y = torch.empty(top, hidden, dtype=torch.bfloat16, device=device)
+        self.gu = None
+        if top > FUSED_ROWS:
+            self.gu = torch.empty(top, 2 * inter, dtype=torch.bfloat16, device=device)
         self.sync_gu = torch.zeros(dsm.SYNC_WORDS, dtype=torch.int32, device=device)
         self.sync_d = torch.zeros(dsm.SYNC_WORDS, dtype=torch.int32, device=device)
-        self.kernels = {}
-        ws_bytes = 0
+        ops, ws_bytes = {}, 0
         for bucket in sorted({-(-n // 16) * 16 for n in self.rows}):
-            op_gu = dsm.DenseStream(bucket, inter, hidden, situ_mode=True, beta=beta,
-                                    linear_beta=linear, two_dies=two, nb0=nb0_gu)  # fmt: skip
+            if bucket <= FUSED_ROWS:
+                op_gu = dsm.DenseStream(bucket, inter, hidden, situ_mode=True, beta=beta,
+                                        linear_beta=linear, two_dies=two, nb0=nb0_gu)  # fmt: skip
+            else:
+                op_gu = dsm.DenseStream(bucket, 2 * inter, hidden, two_dies=two,
+                                        nb0=nb0_gu, pairs=inter // 128)  # fmt: skip
             op_d = dsm.DenseStream(bucket, hidden, inter, two_dies=two, nb0=nb0_d)
             ws_bytes = max(ws_bytes, op_gu.ws_bytes(slots), op_d.ws_bytes(slots))
-            self.kernels[bucket] = (op_gu, op_d)
+            ops[bucket] = (op_gu, op_d)
         self.ws = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
         self.weights = (gate_up, down)
-        for bucket, (op_gu, op_d) in self.kernels.items():
+        self.kernels = {}
+        for bucket, (op_gu, op_d) in ops.items():
             x = torch.zeros(bucket, hidden, dtype=torch.bfloat16, device=device)
+            out = self.h if bucket <= FUSED_ROWS else self.gu
             self.kernels[bucket] = (
-                self._compile(op_gu, gate_up, x, self.h[:bucket], self.sync_gu),
+                self._compile(op_gu, gate_up, x, out[:bucket], self.sync_gu),
                 self._compile(op_d, down, self.h[:bucket], self.y[:bucket], self.sync_d),
             )
         logger.info_once(
-            "Kimi K3 dense MLP (layer %d): DenseStream gate_up+SiTU / down, %s, "
-            "shard rows %d-%d (%d kernels)", index,
+            "Kimi K3 dense MLP (layer %d): DenseStream gate_up (+SiTU up to %d rows) / "
+            "down, %s, shard rows %d-%d (%d kernels)", index, FUSED_ROWS,
             f"die-local ({self.s0} + {self.s1} SMs)" if two else "one die",
             self.rows[0], self.rows[-1], 2 * len(self.kernels),
             scope="local",
@@ -180,25 +193,25 @@ class SpDenseMlp:
         return n in self.rows
 
     def choice(self, n):
-        if n > STREAM_ROWS:
-            return Choice(
-                Path.STOCK, note=f"stock dense MLP above {STREAM_ROWS} shard rows (sp_dense)"
-            )
         if n not in self.rows:
             raise Unsupported("dense", n, "shard rows not prepared")
-        return Choice(Path.GENERIC, "stream", note="DenseStream die-local (sp_dense)")
+        form = "gate_up+SiTU" if n <= FUSED_ROWS else "gate_up, stock SiTU"
+        return Choice(Path.GENERIC, "stream", note=f"DenseStream die-local {form} (sp_dense)")
 
     def run(self, x):
         n = x.shape[0]
         fn_gu, fn_d = self.kernels[-(-n // 16) * 16]
         gate_up, down = self.weights
-        h, y = self.h[:n], self.y[:n]
+        y = self.y[:n]
         stream = cute_stream(x.device)
-        s0, s1, rows = (dsm.Int32(v) for v in (self.s0, self.s1, n))
+        launch = (dsm.as_cute(self.table), *(dsm.Int32(v) for v in (self.s0, self.s1, n)),
+                  stream)  # fmt: skip
+        ws = dsm.as_cute(self.ws)
+        fused = n <= FUSED_ROWS
+        out = self.h[:n] if fused else self.gu[:n]
         fn_gu(dsm.as_cute(gate_up, k_major=True), dsm.as_cute(x, k_major=True),
-              dsm.as_cute(h, rows=True), dsm.as_cute(self.ws), dsm.as_cute(self.sync_gu),
-              dsm.as_cute(self.table), s0, s1, rows, stream)  # fmt: skip
+              dsm.as_cute(out, rows=True), ws, dsm.as_cute(self.sync_gu), *launch)  # fmt: skip
+        h = out if fused else self.act(out)  # the stock SituAndMul above FUSED_ROWS
         fn_d(dsm.as_cute(down, k_major=True), dsm.as_cute(h, k_major=True),
-             dsm.as_cute(y, rows=True), dsm.as_cute(self.ws), dsm.as_cute(self.sync_d),
-             dsm.as_cute(self.table), s0, s1, rows, stream)  # fmt: skip
+             dsm.as_cute(y, rows=True), ws, dsm.as_cute(self.sync_d), *launch)  # fmt: skip
         return y

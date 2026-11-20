@@ -204,6 +204,29 @@ def main():
                         res[name + " gu"] = graph_time(run_gu, args.reps)
                     if "down" in args.only:
                         res[name + " down"] = graph_time(run_d, args.reps)
+            if "plain" in args.only:  # unfused: DenseStream gate_up (2 I outputs) + stock SiTU
+                op_p = dsm.DenseStream(T, 2 * I, H, nb0=dsm.split_blocks(2 * I // 128, s0, s1))
+                wgu_p = place_rows(wgu, lambda row: int(row >= op_p.nb0 * 128))
+                ws_p = torch.zeros(op_p.ws_bytes(s0 + s1) if hasattr(op_p, "ws_bytes") else 1,
+                                   dtype=torch.uint8, device=dev)  # fmt: skip
+                sync_p = torch.zeros(dsm.SYNC_WORDS, dtype=torch.int32, device=dev)
+                gu_p = torch.empty(T, 2 * I, device=dev, dtype=torch.bfloat16)
+                h_p = torch.empty(T, I, device=dev, dtype=torch.bfloat16)
+                fp, ap = dsm.compile_dense_stream(op_p, wgu_p, x, gu_p, ws_p, sync_p, table,
+                                                  s0, s1, stream(dev))  # fmt: skip
+                c0, c1, ct = cutlass.Int32(s0), cutlass.Int32(s1), cutlass.Int32(T)
+
+                def run_p():
+                    fp(*ap, c0, c1, ct, stream(dev))
+                    torch.ops._C.situ_and_mul(h_p, gu_p, beta, lin)
+
+                run_p()
+                torch.cuda.synchronize()
+                e = ((h_p.float() - h_ref.float()).abs().max() / h_ref.float().abs().max()).item()
+                print(f"T{T} plain: h rel {e:.2e}", flush=True)
+                res["ds-plain gu+stock situ"] = graph_time(run_p, args.reps)
+                res["ds-plain gu only"] = graph_time(
+                    lambda: fp(*ap, c0, c1, ct, stream(dev)), args.reps)
             if not args.no_stock:
                 if "gu" in args.only:
                     res["stock gu+situ"] = graph_time(

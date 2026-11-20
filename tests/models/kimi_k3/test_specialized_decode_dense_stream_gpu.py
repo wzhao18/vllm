@@ -33,8 +33,19 @@ def _close(out, ref):
     assert err <= 2e-2 * scale, (err, scale)
 
 
+class _Situ:
+    """The stock SituAndMul op (the KimiMLP act_fn)."""
+
+    beta, linear_beta = BETA, LINEAR
+
+    def __call__(self, x):
+        out = x.new_empty(x.shape[0], x.shape[1] // 2)
+        torch.ops._C.situ_and_mul(out, x, BETA, LINEAR)
+        return out
+
+
 def _mlp(wgu, wd):
-    act = types.SimpleNamespace(beta=BETA, linear_beta=LINEAR)
+    act = _Situ()
     lin = lambda w: types.SimpleNamespace(weight=torch.nn.Parameter(w, False),
                                           bias=None, tp_size=1)  # fmt: skip
     return types.SimpleNamespace(
@@ -43,7 +54,7 @@ def _mlp(wgu, wd):
     )  # fmt: skip
 
 
-@pytest.mark.parametrize("rows", [1, 20])
+@pytest.mark.parametrize("rows", [1, 20, 40])  # 40: unfused gate_up + stock SiTU
 def test_dense_stream_matches_stock(rows):
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
         SpDenseMlp,
@@ -59,7 +70,8 @@ def test_dense_stream_matches_stock(rows):
     mlp = _mlp(wgu.clone(), wd.clone())
     dense = SpDenseMlp(mlp, (rows,), dev, 0)
     y = dense.run(x).clone()
-    _close(dense.h[:rows], h_ref)
+    if rows <= 32:  # the fused form's SiTU output (unfused: a fresh stock tensor)
+        _close(dense.h[:rows], h_ref)
     _close(y, y_ref)
     # The re-homed stock weights keep their values; reruns are bitwise.
     assert torch.equal(mlp.gate_up_proj.weight, wgu)

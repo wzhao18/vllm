@@ -184,7 +184,7 @@ class DenseStream:
     of a call (``nrows`` <= ``rows``) is a launch argument."""
 
     def __init__(self, rows, n, k, situ_mode=False, beta=1.0, linear_beta=-1.0,
-                 ldo=None, debug=0, two_dies=True, nb0=None):  # fmt: skip
+                 ldo=None, debug=0, two_dies=True, nb0=None, pairs=0):  # fmt: skip
         assert supports(rows, n, k, situ_mode), (rows, n, k, situ_mode)
         self.rows, self.n, self.k, self.situ = rows, n, k, situ_mode
         self.t_mma = -(-rows // 16) * 16
@@ -197,7 +197,11 @@ class DenseStream:
         self.nb = n // 128  # blocks
         # Blocks [0, nb0) are homed on die 0 (``split_blocks``: in proportion to the
         # dies' SMs, so every SM streams the same bytes).
-        self.nb0 = (self.nb // 2 if nb0 is None else nb0) if two_dies else self.nb
+        # ``pairs`` (plain only, the gate_up weight unfused): blocks b and pairs + b
+        # (gate and up rows) share a die; nb0 then counts die 0's gate blocks.
+        self.pairs = pairs
+        nbs = pairs if pairs else self.nb
+        self.nb0 = (nbs // 2 if nb0 is None else nb0) if two_dies else nbs
         self.kt = k // K_TILE  # K steps a block
         self.mma_tiler = (128, self.t_mma, K_TILE)
         self.threads = 128 + EPI_THREADS  # warps 0-1 TMA, 2 MMA, 3 slot claim, 4+ epilogue
@@ -212,6 +216,13 @@ class DenseStream:
         self.tmem_cols = 32
         while self.tmem_cols < 2 * self.nacc * self.t_mma:
             self.tmem_cols *= 2
+
+    def gblock(self, b, bbase, nbd):
+        """Global block of the die's block b (``pairs``: its gate blocks, then their up
+        blocks)."""
+        if cutlass.const_expr(self.pairs):
+            return bbase + b + Int32(cutlass.select_(b >= nbd, Int32(self.pairs) - nbd, Int32(0)))
+        return bbase + b
 
     def ws_bytes(self, slots):
         return slots * self.part
@@ -340,13 +351,13 @@ class DenseStream:
         r = slot
         sd = s0
         bbase = Int32(0)
-        nbd = Int32(self.nb0)
+        nbd = Int32(self.nb0)  # the die's blocks (gate blocks with ``pairs``)
         if d1:
             r = slot - s0
             sd = s1
             bbase = Int32(self.nb0)
-            nbd = Int32(self.nb - self.nb0)
-        units = nbd * kt
+            nbd = Int32((self.pairs if self.pairs else self.nb) - self.nb0)
+        units = nbd * kt * (2 if self.pairs else 1)
         u0 = r * units // sd
         u1 = (r + 1) * units // sd
 
@@ -380,7 +391,7 @@ class DenseStream:
             while u < u1:
                 b = u // kt
                 kb1 = cutlass.min(kt, u1 - b * kt)
-                gb = bbase + b
+                gb = self.gblock(b, bbase, nbd)
                 for kb in cutlass.range(u - b * kt, kb1, unroll=1):
                     if turn == me:
                         cute.arch.mbarrier_wait(empty + s, phase)
@@ -455,7 +466,8 @@ class DenseStream:
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
             cute.arch.griddepcontrol_wait()
             self.epilogue(acc, acc_full, acc_empty, staged, warp - 4, lane, slot, r, sd,
-                          d1, s0, bbase, units, u0, u1, sp, mY, mWs, sync, nrows)  # fmt: skip
+                          d1, s0, bbase, units, u0, u1, sp, mY, mWs, sync, nrows,
+                          nbd)  # fmt: skip
             if warp == 4:
                 cute.arch.relinquish_tmem_alloc_permit()
             _bar(2, EPI_THREADS)
@@ -475,7 +487,7 @@ class DenseStream:
         self, acc: cute.Tensor, acc_full, acc_empty, staged, ew: Int32, lane: Int32,
         slot: Int32, r: Int32, sd: Int32, d1, s0: Int32, bbase: Int32, units: Int32,
         u0: Int32, u1: Int32, sp: Int32, mY: cute.Tensor, mWs: cute.Tensor,
-        sync: Int64, nrows: Int32,
+        sync: Int64, nrows: Int32, nbd: Int32,
     ):  # fmt: skip
         """Epilogue warp ew owns TMEM lane quarter ew % 4 (weight rows / output columns
         q = 32 (ew % 4) + lane of every block) and the 16-token chunks c with
@@ -495,7 +507,7 @@ class DenseStream:
         while u < u1:
             b = u // kt
             kb0 = u - b * kt
-            gb = bbase + b
+            gb = self.gblock(b, bbase, nbd)
             buf = seg & 1
             bstart = b * kt
             col = Int32(acc[(None, None, None, buf * nacc)].iterator.toint()) + lane_bits
@@ -662,7 +674,7 @@ def compile_dense_stream(op: DenseStream, w, x, y, ws, sync, table, s0, s1, stre
     """Compile (once per specialization) and return (launcher, tensor args); call as
     ``fn(*args, Int32(s0), Int32(s1), Int32(nrows), stream)``."""
     key = (op.rows, op.n, op.k, op.situ, op.beta, op.linear_beta, op.ldo, op.debug,
-           op.nb0, tuple(w.shape))  # fmt: skip
+           op.nb0, op.pairs, tuple(w.shape))  # fmt: skip
     fn = _COMPILED.get(key)
     args = (as_cute(w, k_major=True), as_cute(x, k_major=True), as_cute(y, rows=True),
             as_cute(ws), as_cute(sync), as_cute(table))  # fmt: skip

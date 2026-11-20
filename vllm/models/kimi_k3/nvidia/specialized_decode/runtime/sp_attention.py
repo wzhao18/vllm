@@ -80,7 +80,7 @@ from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
-from .sp_dense import STREAM_ROWS, SpDenseMlp
+from .sp_dense import MAX_ROWS, SpDenseMlp
 from .sp_mlp import SpMlp, moe_choice
 
 logger = init_logger(__name__)
@@ -475,7 +475,7 @@ class SpStep:
         self.dense_mlps = {
             d.layer_idx: SpDenseMlp(d.mlp, shards, self.device, d.layer_idx)
             for d in layers
-            if not d.is_moe_layer and shards[0] <= STREAM_ROWS
+            if not d.is_moe_layer and shards[-1] <= MAX_ROWS
         }
         # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
         # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
