@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
+    iter_layer_specs,
 )
 
 if TYPE_CHECKING:
@@ -437,6 +438,23 @@ class NixlBaseConnectorScheduler:
             held = [r in self._held_send_leases for r in req_ids]
             self._pending_lease_renewals.update(r for r, h in zip(req_ids, held) if h)
         return held
+
+    def fingerprint_state_blocks(self, block_ids: BlockIds) -> dict[int, int]:
+        """Each SSM (KDA) group's running-state slot of a request, picked as
+        transfers pick it, for the KV fingerprints (kv_fingerprint.py)."""
+        slots = {}
+        for g, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            specs = [
+                spec
+                for spec in iter_layer_specs(group.kv_cache_spec)
+                if isinstance(spec, MambaSpec) and not spec.tp_replicated
+            ]
+            if specs and block_ids[g]:
+                blocks = clip_ssm_state_blocks(
+                    list(block_ids[g]), specs[0].num_speculative_blocks
+                )
+                slots[g] = int(blocks[0])
+        return slots
 
     def get_exchange_clipped_blocks(
         self,

@@ -194,6 +194,29 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             return
 
+        peer = self._sub_block_peers.get(engine_id)
+        sub_blocks = peer.sub_blocks if peer is not None else 1
+        if meta.remote.sub_blocks != sub_blocks:
+            # The scheduler expanded P's block ids for a different sub-block
+            # count than the handshake found (P/D skew, e.g. an older P that
+            # does not advertise its block size): reading would scramble KV.
+            error = RuntimeError(
+                f"NIXL sub-block skew for {req_id}: the scheduler expanded P's "
+                f"blocks x{meta.remote.sub_blocks}, the handshake with engine "
+                f"{engine_id} found x{sub_blocks}"
+            )
+            self._log_failure(
+                failure_type="sub_block_mismatch",
+                req_id=req_id,
+                msg=str(error),
+                error=error,
+                dst_engine_id=engine_id,
+            )
+            self._handle_failed_transfer(
+                req_id, None, self._recv_failures, error=error
+            )
+            return
+
         if any(len(group) > 0 for group in meta.local_block_ids):
             # The scheduler waits for finished_recving from *every* worker.
             # Under DCP a rank's slice can legitimately come out empty when its
@@ -213,6 +236,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Units each group's posted reads write. Region-mapped pulls keep
         # their own plan (region_blocks_to_zero).
         written: list[set[int]] | None = None
+        # Draft groups of a sub-block peer: (group, remote rank, local, remote).
+        draft_reads: list[tuple[int, int, list[int], list[int]]] = []
         if not local_block_ids:
             # Region expansion cannot index empty groups. Pass empty specs to
             # _read_blocks so its existing cache-hit notification path runs.
@@ -319,6 +344,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             local_ids[g], remote_ids[g] = self._pair_blocks_from_end(
                                 local_ids[g], remote_ids[g], num_blocks
                             )
+                            if sub_blocks > 1 and local_ids[g]:
+                                # A sub-block's heads are not contiguous: read
+                                # them per head (_read_draft_heads).
+                                assert peer is not None
+                                assert rank in peer.draft_dst_handles
+                                draft_reads.append(
+                                    (g, rank, local_ids[g], remote_ids[g])
+                                )
+                                written[g].update(local_ids[g])
+                                local_ids[g], remote_ids[g] = [], []
                             continue
                         local_ids[g], remote_ids[g] = self._apply_dcp_prefix_caching(
                             local_ids[g],
@@ -348,6 +383,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_block_ids=remote_physical_ids,
                     )
                 )
+
+        # Head reads first, so the main read below defers P's notification
+        # until every transfer of the request has finished.
+        if draft_reads and not self._read_draft_heads(req_id, engine_id, draft_reads):
+            return
 
         # D may have to perform multiple reads from different remote ranks.
         # Pure MLA reads once because its cache is replicated. Hybrid
@@ -409,6 +449,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 awaiting_kvs=meta.awaiting_kvs,
                 num_tokens=meta.remote.num_tokens,
                 written=written,
+                defer_notif=bool(draft_reads),
             ):
                 return
 
@@ -447,6 +488,63 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         )
                         self.xfer_stats.record_failed_notification()
 
+    def _read_draft_heads(
+        self,
+        request_id: str,
+        engine_id: str,
+        draft_reads: list[tuple[int, int, list[int], list[int]]],
+    ) -> bool:
+        """Post the per-head READs of a sub-block peer's draft groups (see
+        ``_draft_head_dlists``), without notifying P. Returns False when the
+        request was routed to failure reporting."""
+        regions = sorted(self._head_sharded_draft_regions)
+        local_offsets = self._draft_head_region_offsets
+        peer = self._sub_block_peers[engine_id]
+        remote_offsets = peer.draft_region_offsets
+        handle = None
+        try:
+            for g, rank, local_ids, remote_ids in draft_reads:
+                positions = [
+                    regions.index(r) for r in self._group_region_indices[g] or ()
+                ]
+                local_desc_ids = np.concatenate(
+                    [local_offsets[k] + np.asarray(local_ids) for k in positions]
+                )
+                remote_desc_ids = np.concatenate(
+                    [remote_offsets[k] + np.asarray(remote_ids) for k in positions]
+                )
+                remote_handles = peer.draft_dst_handles[rank]
+                for local_handle, remote_handle in zip(
+                    self._draft_head_src_handles, remote_handles, strict=True
+                ):
+                    handle = self.nixl_wrapper.make_prepped_xfer(
+                        "READ",
+                        local_handle,
+                        local_desc_ids,
+                        remote_handle,
+                        remote_desc_ids,
+                    )
+                    self.nixl_wrapper.transfer(handle)
+                    self._recving_transfers.setdefault(request_id, []).append(
+                        handle
+                    )
+                    handle = None
+            return True
+        except Exception as e:
+            self._log_failure(
+                failure_type="transfer_setup_failed",
+                req_id=request_id,
+                msg="Draft head read setup failed",
+                error=e,
+                dst_engine_id=engine_id,
+            )
+            if not self._handle_failed_transfer(
+                request_id, handle, self._recv_failures, error=e
+            ):
+                assert handle is not None
+                self._recving_transfers[request_id].append(handle)
+            return False
+
     def _read_blocks(
         self,
         read_spec: ReadSpec,
@@ -460,6 +558,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         awaiting_kvs: bool,
         num_tokens: int | None = None,
         written: list[set[int]] | None = None,
+        defer_notif: bool = False,
     ) -> bool:
         """Post a READ point-to-point xfer request from a single local worker to
         a single remote worker.
@@ -504,6 +603,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
+        if not any(len(group) > 0 for group in local_block_ids) and defer_notif:
+            # Only other transfers of the request read from P (draft heads):
+            # notify P once they finish.
+            self._pending_recv_notifs.setdefault(request_id, []).append(
+                (self._remote_agents[dst_engine_id][(0, remote_rank)], notif_id)
+            )
+            return True
         if not any(len(group) > 0 for group in local_block_ids):
             # A full prefix cache hit is indicated with an empty list.
             agent_name = self._remote_agents[dst_engine_id][(0, remote_rank)]
@@ -618,7 +724,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # the request has finished (get_transfer_results).
             # A lease check must run before P is told the read finished.
             defer_notif = (
-                len(chunks) > 1
+                defer_notif
+                or len(chunks) > 1
                 or self._pull_retry_disconnect
                 or self._needs_lease_check(self._recving_metadata.get(request_id))
             )

@@ -368,22 +368,38 @@ class KimiVecSituAndMul(nn.Module):
     SituAndMul module itself, through its own dispatch; the vectorized kernel is
     bitwise its CUDA op (forward_cuda). Where the custom op dispatches to
     forward_native instead, the large inputs keep the CUDA op's bits (the same FP32
-    math, one BF16 rounding)."""
+    math, one BF16 rounding).
+
+    Prefill chunks (from ``_FAST_MIN_ROWS`` rows; the dense layer is 16K x 33792
+    at F16K) use the routed experts' MUFU-light SiTU form, as the shared experts'
+    MXFP8 SiTU does at prefill (``mxfp8_act.SITU_FAST_MIN_ROWS``): the
+    precise-tanhf kernel is FMA-issue bound at ~5x its HBM floor there, and the
+    fast form stays within one BF16 ulp of it."""
 
     _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
+    _FAST_MIN_ROWS = 4096
 
     def __init__(self, beta: float, linear_beta: float | None):
         super().__init__()
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
         self.small = SituAndMul(beta=self.beta, linear_beta=self.linear_beta)
+        from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import warmup
 
-        warmup()  # build / load the JIT extension at model init, not mid-step
+        warmup()  # build / load the JIT extensions at model init, not mid-step
+        mxfp8_act.warmup()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() // 2 < self._VEC_MIN_OUT_ELEMS:
             return self.small(x)
+        if x.numel() // x.shape[-1] >= self._FAST_MIN_ROWS:
+            from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+            if mxfp8_act.situ_fast_bf16_supported(x.shape[-1] // 2):
+                return mxfp8_act.situ_and_mul_fast_bf16(
+                    x, self.beta, self.linear_beta
+                )
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
 
         return situ_and_mul(x, self.beta, self.linear_beta)
@@ -476,6 +492,9 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
+    # specialized_prefill.shared_situ.PrefillSharedSitu (prefill workers only).
+    _prefill_situ = None
+
     def mxfp8_input(self) -> bool:
         """gate_up_proj takes an MXFP8 activation (QuantizedActivation)."""
         return not self.shard_sequence_parallel and takes_mxfp8_activation(
@@ -522,7 +541,16 @@ class KimiMLP(nn.Module):
             # compute this rank's partial for all of them, then reduce-scatter,
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
+        situ = self._prefill_situ
+        if situ is not None:
+            # Prefill shared expert: the gate_up GEMM writes the MXFP8 SiTU
+            # (specialized_prefill.shared_situ) at prefill-sized batches.
+            qa = situ.fused(x)
+            if qa is not None:
+                return self.down_proj(qa)[0]
         gate_up, _ = self.gate_up_proj(x)
+        if situ is not None:
+            gate_up = situ.deinterleave(gate_up)
         # Online-MXFP8 down_proj: the activation kernel writes its MXFP8 input.
         qa = self._act_mxfp8(gate_up)
         if qa is not None:
@@ -2387,6 +2415,14 @@ class KimiLinearForCausalLM(
                 "cuBLASLt MXFP8 dispatch.",
                 switched,
             )
+        from .specialized_prefill import gemm_tactics
+
+        if pinned := gemm_tactics.enable(self):
+            logger.info_once(
+                "Kimi K3: %d BF16 linears use pinned cuBLASLt tactics at >= %d rows.",
+                pinned,
+                gemm_tactics.MIN_ROWS,
+            )
         if any(
             takes_mxfp8_activation(m)
             for m in self.modules()
@@ -2425,6 +2461,58 @@ class KimiLinearForCausalLM(
             logger.info_once(
                 "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
                 packed_moe,
+            )
+        # Prefill workers: shared gate_up GEMM with the SiTU + MXFP8 epilogue.
+        from .specialized_prefill import shared_situ
+
+        fused_situ = 0
+        for module in self.model.modules():
+            if (
+                isinstance(module, KimiMoE)
+                and getattr(module, "_prefill_moe", None) is not None
+                and getattr(module, "_packed_moe", None) is None
+                and isinstance(module.shared_experts, KimiMLP)
+                and not module.shared_experts.shard_sequence_parallel
+                and shared_situ.supported(module.shared_experts)
+            ):
+                situ = shared_situ.PrefillSharedSitu(module.shared_experts)
+                situ.prepare()
+                module.shared_experts._prefill_situ = situ
+                fused_situ += 1
+        if fused_situ:
+            logger.info_once(
+                "Kimi K3: %d prefill shared experts run the gate_up GEMM with the "
+                "SiTU + MXFP8 epilogue (sm_107).",
+                fused_situ,
+            )
+        # Prefill workers (prefill MoE policy active): KDA q|k|v in_proj GEMM
+        # with the conv + SiLU in its epilogue.
+        from .specialized_prefill import kda_conv_in_proj
+
+        prefill_worker = any(
+            getattr(module, "_prefill_moe", None) is not None
+            for module in self.model.modules()
+            if isinstance(module, KimiMoE)
+        )
+        fused_conv = 0
+        for module in self.model.modules() if prefill_worker else ():
+            if not isinstance(module, KimiK3DeltaAttention):
+                continue
+            reason = kda_conv_in_proj.unsupported_reason(module)
+            if reason is not None:
+                logger.info_once(
+                    "Kimi K3: prefill KDA in_proj keeps the separate conv: %s", reason
+                )
+                continue
+            conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
+            conv_in_proj.prepare()
+            module._prefill_conv_in_proj = conv_in_proj
+            fused_conv += 1
+        if fused_conv:
+            logger.info_once(
+                "Kimi K3: %d prefill KDA layers run the q|k|v in_proj GEMM with the "
+                "conv + SiLU epilogue (sm_107).",
+                fused_conv,
             )
         # K3.1 DSA decode under DCP: the NCCL-free top-k exchange (on by policy).
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
