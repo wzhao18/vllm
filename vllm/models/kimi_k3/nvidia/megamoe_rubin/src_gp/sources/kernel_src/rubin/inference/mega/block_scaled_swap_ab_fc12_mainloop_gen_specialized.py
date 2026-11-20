@@ -28,11 +28,15 @@ on its own expert.
 
 from typing import ClassVar, Optional, Tuple
 
+import os as _dms_os
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+
+# DIAGNOSTIC ONLY (never lands): DMS_SFSKIP=1 skips the per-stage SFB S2T copies, 2 also SFA (timing, wrong numerics).
+_DMS_SFSKIP = int(_dms_os.environ.get("DMS_SFSKIP", "0"))
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
@@ -1851,8 +1855,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                for instruction_index in cutlass.range_constexpr(self.num_mma_instructions_per_ab_stage):
+                if cutlass.const_expr(_DMS_SFSKIP < 2):
+                    cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                for instruction_index in cutlass.range_constexpr(self.num_mma_instructions_per_ab_stage if _DMS_SFSKIP < 1 else 0):
                     # Rest_Tiler order: N0K0, N128K0, N0K64, N128K64.
                     lower_n_lower_k_source_coord = (None, 0, None, instruction_index, ab_pipeline_state.index)
                     lower_n_lower_k_destination_coord = (None, 0, None, instruction_index)
@@ -1900,8 +1905,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                if cutlass.const_expr(_DMS_SFSKIP < 2):
+                    cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                if cutlass.const_expr(_DMS_SFSKIP < 1):
+                    cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
