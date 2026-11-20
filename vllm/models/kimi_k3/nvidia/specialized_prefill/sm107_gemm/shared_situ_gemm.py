@@ -106,8 +106,14 @@ class SharedSituGemm:
             # die_sched: weight rows [0, n/2) homed on die 0, [n/2, n) on die 1
             # (die_sched.localize_rows) and an even count of N cluster tiles.
             cols = tactic[0][1] * tactic[1][1]
-            if n % (2 * cols):
-                raise ValueError(f"die-split SiTU GEMM: N {n} is not 2 x k x {cols}")
+            group = next(
+                (int(f[3:]) for f in str(tactic[7]).split("+")
+                 if f.startswith("die") and f[3:].isdigit()), 0,
+            )  # fmt: skip
+            if n % (2 * cols) or (group and (n // (2 * cols)) % group):
+                raise ValueError(
+                    f"die-split SiTU GEMM: N {n} is not 2 x {group or 1} x k x {cols}"
+                )
             from . import die_sched
 
             self._ctr = torch.zeros(4, dtype=torch.int32, device=weight_nk.device)

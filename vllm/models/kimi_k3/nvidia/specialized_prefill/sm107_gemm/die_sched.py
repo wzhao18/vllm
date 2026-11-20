@@ -3,19 +3,18 @@
 """Die-split dynamic tile claim for the prefill shared gate_up GEMM (sm_107).
 
 The GEMM's weight rows (N) are homed half on each die (``localize_rows``).
-Every cluster reads its die from ``%smid`` and claims cluster tiles of its
-die's N half from one global list of ``M tiles x N cluster tiles`` entries:
-die 0 takes entries from the front, die 1 from the back, so a die that runs
-out of its own half continues into the other one. Within a half the entries
-walk the half's N cluster tiles of one M tile before the next M tile, so a die
-keeps its weight half and the A rows in flight in its own L2.
+Every cluster reads its die from ``%smid`` and claims the cluster tiles of its
+die's N half (``M tiles x N/2 cluster tiles``) from that die's global counter;
+a die that runs out continues on the other die's counter. Both dies walk their
+halves in the same M order (the A rows in flight are shared through L2), a
+group of the half's N cluster tiles per M sweep.
 
 The leader CTA's scheduler warp claims (global atomics) and writes every claim
 into a ring of ``STAGES`` slots in the shared memory of each CTA of the cluster
 (``st.async`` completing the slot's full-barrier transaction); the TMA, MMA and
 epilogue warps of every CTA read each claim and release it to the leader's
-empty barrier. A claim past the end is the stop marker. The last cluster to
-finish zeroes the four global counters for the next launch.
+empty barrier. -1 is the stop marker. The last cluster to finish zeroes the
+counters (die 0, die 1, finished clusters) for the next launch.
 """
 
 import torch
