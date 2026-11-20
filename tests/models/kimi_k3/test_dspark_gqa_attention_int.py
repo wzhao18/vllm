@@ -638,9 +638,10 @@ def test_window_umma_variants_match_stock(shape, monkeypatch):
         del ours, stock, exact
 
 
-@pytest.mark.parametrize("shape", [(1, -2, 6, 0), (1, -2, 5, 4)])
+@pytest.mark.parametrize("shape", [(1, -3, 6, 0), (1, -2, 6, 0)])
 def test_window_kol_matches_stock(shape, monkeypatch):
-    """GqaWindowKol (keys on the TMEM lanes; key groups -2) at TP4 q3, batches up to
+    """GqaWindowKol (keys on the TMEM lanes; key groups -2) and its persistent
+    stream-K form GqaWindowKols (-3) at TP4 q3, batches up to
     96: cache bytes identical to stock's, rows within BF16 noise."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
         gqa_attention as ga,

@@ -25,6 +25,36 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (  # noq
 OPTS = {}
 
 
+def _patch_kols():
+    orig = ga.compile_window_kols
+
+    def patched(*args, **kwargs):
+        kwargs["debug"] = stamps.DBG.data_ptr()
+        return orig(*args, **kwargs)
+
+    ga.compile_window_kols = patched
+
+
+def _report_kols(b):
+    s = stamps.DBG.view(2, -1, 16)[0].cpu()
+    s = s[s[:, 0] > 0].double()
+    if s.shape[0] == 0:
+        print(f"B{b}: no stamps", flush=True)
+        return
+    t0 = s[:, 0].min()
+
+    def q(col, base=2):
+        v = (s[:, col] - s[:, base]) / 1e3
+        v = v[s[:, col] > 0]
+        if v.numel() == 0:
+            return "-"
+        return f"{float(v.median()):.2f}/{float(v.max()):.2f}"
+
+    print(f"B{b} KOLS: CTAs {s.shape[0]} span {float((s[:, 11].max() - t0) / 1e3):.2f} us | "
+          f"tape {q(2, 0)} | after tape (median/max): prep0 {q(4)} PV end {q(3)} "
+          f"softmax end {q(10)} last epi start {q(5)} merge end {q(6)} end {q(11)}", flush=True)
+
+
 def _patch():
     orig = ga.compile_window_kol
 
@@ -45,6 +75,7 @@ def main():
     ap.add_argument("--skeleton", action="store_true")
     ap.add_argument("--ahead", type=int, default=0, help="launch shape ahead bits (1: refill warp)")
     ap.add_argument("--trace", action="store_true", help="per-stage events of request 0 KV head 1")
+    ap.add_argument("--kols", action="store_true", help="GqaWindowKols (key groups -3)")
     args, rest = ap.parse_known_args()
     stamps.DBG = torch.zeros(2 * 8192 * 16, dtype=torch.int64, device="cuda")
     OPTS["fill"] = args.fill
@@ -53,7 +84,8 @@ def main():
     if args.trace:
         OPTS["trace"] = trace.data_ptr()
     _patch()
-    shape = f"1/-2/{args.ring}/{args.ahead}"
+    _patch_kols()
+    shape = f"1/-{3 if args.kols else 2}/{args.ring}/{args.ahead}"
     for b in [int(x) for x in args.batches.split(",")]:
         stamps.DBG.zero_()
         trace.zero_()
@@ -61,6 +93,9 @@ def main():
                     "fused", "--no-context", "--ctx", args.ctx, "--shape", shape] + rest
         bench.main()
         torch.cuda.synchronize()
+        if args.kols:
+            _report_kols(b)
+            continue
         stamps._report(b)
         s = stamps.DBG.view(2, -1, 16)[0].cpu()
         s = s[s[:, 0] > 0].double()

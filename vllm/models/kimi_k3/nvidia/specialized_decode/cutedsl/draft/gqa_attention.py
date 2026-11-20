@@ -65,6 +65,7 @@ from .gqa_window_stream import (
 )
 from . import gqa_window_kol
 from .gqa_window_kol import compile_window_kol, kv_map_kol
+from .gqa_window_kols import compile_window_kols
 from .gqa_window_umma import KB, compile_window_umma, kv_map_5d, umma_smem
 
 logger = init_logger(__name__)
@@ -99,7 +100,7 @@ KV_HEADS = (1, 2, 4)  # KV heads per rank: TP16, TP8, TP4
 # deployment) take shapes measured at the same CTA counts.
 # Tensor map of a launch shape's kernel by key groups (descriptor byte offset): 0
 # GqaWindowUmma and -1 GqaWindowStream {64, 64, 2} boxes, -2 GqaWindowKol {64, 64, 1}
-MAP_OFFSET = {0: 128, -1: 128, -2: 256}
+MAP_OFFSET = {0: 128, -1: 128, -2: 256, -3: 256}
 GQA_WINDOW = {
     (1, 7): ((4, (16, 4, 2, 0)), (8, (16, 2, 3, 0)), (16, (8, 4, 3, 0)), (32, (4, 4, 4, 0)),
              (0, (2, 4, 4, 0))),
@@ -235,6 +236,7 @@ class GqaAttentionState:
             from ..common.resident import ResidentGrid
 
             self.resident = ResidentGrid(device, 2)
+        self.kols_buffers(device)
         if not batches:
             return
         if self.resident is None and any(self.shapes[b][3] == 1 for b in batches):
@@ -259,6 +261,27 @@ class GqaAttentionState:
         words = units * self.pmax * GROUP * self.q * (HEAD + 2)
         self.partials = torch.empty(words, dtype=torch.float32, device=device)
         self.counters = torch.zeros(units, dtype=torch.int32, device=device)
+
+    def kols_buffers(self, device):
+        """GqaWindowKols' partials [SMs, PSZ] FP32 and flags [SMs] (zero; each
+        merging piece resets its partners') for launch shapes with key groups -3."""
+        batches = [b for b, s in self.shapes.items() if s is not None and s[1] == -3]
+        self.kols_sms, self.kols_partials, self.kols_flags = None, None, None
+        if not batches:
+            return
+        from .gqa_window_kols import BMAX, PMAX, PSZ
+
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        stages = -(-(WINDOW + self.q - 1 + 2 * KB) // (2 * KB))
+        worst = -(-max(batches) * self.kv_heads * stages // sms) + 1
+        if max(batches) > BMAX or worst > PMAX:
+            raise ValueError(
+                f"GqaWindowKols: B{max(batches)} exceeds {BMAX} requests or {PMAX} "
+                "pieces per CTA"
+            )
+        self.kols_sms = sms
+        self.kols_partials = torch.empty(sms * PSZ, dtype=torch.float32, device=device)
+        self.kols_flags = torch.zeros(sms, dtype=torch.int32, device=device)
 
     # ------------------------------------------------------------------ binding
     def cache_reason(self, cache):
@@ -349,6 +372,16 @@ class GqaAttentionState:
 
     def window(self, page, shape):
         splits, kgroups, ring, ahead = shape
+        if kgroups == -3:  # GqaWindowKols: GqaWindowKol as a persistent stream-K grid
+            if page % KB:
+                raise ValueError(
+                    f"GqaWindowKols launch shape {shape} on {page}-token pages"
+                )
+            return compile_window_kols(
+                GROUP, self.kv_heads, self.q, page, ring, WINDOW, None,
+                self.max_position, self.device.index, self.kols_sms,
+                round_norm=window_options().get("round_norm", False),
+            )  # fmt: skip
         if kgroups == -2:  # GqaWindowKol (tcgen05, keys on the TMEM lanes)
             if page % KB:
                 raise ValueError(
@@ -492,6 +525,9 @@ class GqaAttentionState:
         cache = attention.kv_cache
         out = qkv.new_empty((rows, self.heads * HEAD))
         extra = ()
+        if shape[1] == -3:
+            extra = (Int64(self.kols_partials.data_ptr()),
+                     Int64(self.kols_flags.data_ptr()))  # fmt: skip
         if shape[1] == -1:
             extra = (Int64(self.partials.data_ptr()), Int64(self.counters.data_ptr()))
         if shape[1] == 0 and shape[3] & 1:
