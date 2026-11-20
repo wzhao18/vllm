@@ -63,7 +63,7 @@ constexpr int kMaxR = 8;               // shared-memory-resident weight K blocks
 constexpr int kMaxX = 32;              // token ring slots (n x 128 B each, in the ring)
 constexpr int kLine = 32;              // one counter per 128 B line
 constexpr int kTileCnt = 3 * kLine;    // cnt[kTileCnt + kLine t]: partials stored for tile t
-constexpr int kStampStride = 64;  // [0, 8) phases, [8, 32) MMA issued, [32, 64) W landed per K block
+constexpr int kStampStride = 64;  // [0, 8) phases (globaltimer), [8, 32) clock after MMA issue, [32, 56) clock operands ready, per K block
 constexpr int kSmemBudget = 214 * 1024;  // dynamic + static: co-resident with the AttnRes reduce
 
 struct Params {
@@ -315,7 +315,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int i = 0; i < nt; ++i) {
       const int slot = i % p.ns;
       mbar_wait(full0 + 8 * slot, (i / p.ns) & 1);
-      if (lane == 0 && i < 32) STAMP(32 + i);
       const uint64_t src = smem_desc(ring_s + slot * kSlot);
 #pragma unroll
       for (int kk = 0; kk < 4; ++kk) cp_el(tmem + p.acol + 32 * i + 8 * kk, src + 2 * kk);
@@ -338,6 +337,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       }
       asm volatile("tcgen05.fence::after_thread_sync;");
       if (j == 0 && lane == 0) STAMP(6);
+      if (lane == 0 && j < 24 && p.stamps) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
       const uint64_t b0 = smem_desc(ring_s + xs * n * 128);
       if (p.debug & 1) {
       } else if (j < nt) {
@@ -351,7 +351,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       }
       if ((j % p.xg == p.xg - 1 || j == nk - 1) && (g + p.xs) * p.xg < nk)
         commit_el(xempty0 + 8 * gs);
-      if (lane == 0 && j < 24) STAMP(8 + j);
+      if (lane == 0 && j < 24 && p.stamps) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
     }
     commit_el(acc_bar);
   } else if (warp >= 4) {

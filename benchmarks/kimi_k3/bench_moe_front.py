@@ -232,10 +232,11 @@ def main():
         print(f"  stamps n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
               flush=True)
         for cta in (0, grid // 2, grid - 1):
-            it = [f"{s[cta, 8 + j].item():.2f}" for j in range(24) if sv[cta, 8 + j] != 0]
-            print(f"  cta{cta} mma-issued per K block: {' '.join(it)}", flush=True)
-            wl = [f"{s[cta, 32 + j].item():.2f}" for j in range(32) if sv[cta, 32 + j] != 0]
-            print(f"  cta{cta} W landed per TMEM K block: {' '.join(wl)}", flush=True)
+            c0 = int(sv[cta, 32])
+            rd = [str(int(sv[cta, 32 + j]) - c0) for j in range(24) if sv[cta, 32 + j] != 0]
+            iss = [str(int(sv[cta, 8 + j]) - c0) for j in range(24) if sv[cta, 8 + j] != 0]
+            print(f"  cta{cta} clk operands-ready per K block: {' '.join(rd)}", flush=True)
+            print(f"  cta{cta} clk MMAs-issued per K block: {' '.join(iss)}", flush=True)
 
 
 if __name__ == "__main__":
