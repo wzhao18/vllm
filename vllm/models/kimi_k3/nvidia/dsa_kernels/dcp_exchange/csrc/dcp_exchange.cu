@@ -3217,9 +3217,9 @@ int64_t max_coresident_ox(int64_t D) {
 std::vector<int64_t> topk_v2_layout(int64_t cap, int64_t W) {
   const int64_t r1 = 2 * cap * W * kV2Msg, tie = 2 * cap * W * kV2Tie,
                 rad = 2 * cap * kV2RadR * W * 256,
-                r2 = 2 * std::min<int64_t>(cap, kR2Rows) * W * kR2W;
-  // {round 1, tie round, radix rounds, total words, the R2 round}
-  return {0, r1, r1 + tie, r1 + tie + rad + r2, r1 + tie + rad};
+                r2 = 2 * std::min<int64_t>(cap, kR2Rows) * W * kR2W, r0 = 2 * cap * W * kR0W;
+  // {round 1, tie round, radix rounds, total words, the R2 round, R0}
+  return {0, r1, r1 + tie, r1 + tie + rad + r2 + r0, r1 + tie + rad, r1 + tie + rad + r2};
 }
 
 static constexpr size_t kV2Dyn = 0;
@@ -3285,7 +3285,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   p.W = (int)W; p.rank = (int)rank; p.K = (int)K; p.T = T; p.cap = (int)cap;
   p.interleave = (int)interleave;
   const auto lay = topk_v2_layout(cap, W);
-  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2]; p.off_r2 = lay[4];
+  p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2]; p.off_r2 = lay[4]; p.off_r0 = lay[5];
   p.epoch = epoch.data_ptr<int>();
   p.redo = p.epoch + cap;  // the epoch buffer's second half
   p.err = err.data_ptr<int>();

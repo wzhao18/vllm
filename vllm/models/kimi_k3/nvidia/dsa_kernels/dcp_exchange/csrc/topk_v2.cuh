@@ -65,6 +65,8 @@ constexpr int kR2Rows = 512;   // rows with an R2 mailbox (others keep the compl
 constexpr int kR2W = 2048;     // R2 slot words per (parity, row, rank)
 constexpr int kR2Cap = 1022;   // R2 entries (key, position) per rank
 constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
+constexpr int kR0Q = 64;        // R0: sample quantile keys per rank (sample counts 8, 16, .., 512)
+constexpr int kR0W = kR0Q + 4;  // R0 words per (parity, row, rank): 4 header words, then the keys
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
 constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
 // stats (rows): 0 exchanged, 1 resolved in round 1, 2 tie round, 3 radix, 4 select all
@@ -88,7 +90,7 @@ struct V2Params {
   uint64_t mc;
   const uint64_t* peers;
   int W, rank, K, T, cap, interleave;
-  int64_t off_r1, off_tie, off_rad, off_r2;
+  int64_t off_r1, off_tie, off_rad, off_r2, off_r0;
   int* epoch;
   int* redo;  // per row: 0, or the epoch the complete body runs the row at (+1)
   int* err;
@@ -350,7 +352,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // most kV2NR x kV2T groups are read from the SMEM copy (fast path: short loops);
     // longer rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
     for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
-    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; }
+    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; s_i[12] = -1; }
+    // R0 (kFast): this rank's sample quantile keys, sent before the candidate pass
+    __shared__ __align__(16) uint32_t s_r0[kR0W];
+    __shared__ __align__(16) uint32_t s_r0rx[kV2MaxW * kR0W];
+    if (kFast && tid < kR0Q) s_r0[4 + tid] = tagw(tag, 0u);
     const int head = min(L, head0);
     const int sh = (8 - head) & 7;  // == sh0 when L >= 8
     const int ng = (L + sh + 7) >> 3;
@@ -448,7 +454,29 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           if (run >= want_e) { s_i[14] = (bb * kV2PB + i) * 16; break; }
         }
       }
+      if constexpr (kFast) {
+        // R0 quantile j: the coarse bin where the sample suffix first reaches 8 (j + 1)
+        if (ab < 8u * kR0Q && v > 0u) {
+          uint32_t run = ab;
+          for (int i = kV2PB - 1; i >= 0; --i) {
+            const uint32_t nr = run + hist[bb * kV2PB + i];
+            for (uint32_t lv = run / 8u + 1u; 8u * lv <= nr && lv <= (uint32_t)kR0Q; ++lv)
+              s_r0[3 + lv] = tagw(tag, (uint32_t)(bb * kV2PB + i) * 16u);
+            run = nr;
+          }
+        }
+        if (tid < 4) s_r0[tid] = tagw(tag, 0u);
+      }
       __syncthreads();
+      if constexpr (kFast) {
+        const int64_t r0b = p.off_r0 + ((int64_t)(par * p.cap + row) * W + p.rank) * kR0W;
+        if (tid < kR0W / 4) {
+          const uint4 v4 = make_uint4(s_r0[4 * tid], s_r0[4 * tid + 1], s_r0[4 * tid + 2], s_r0[4 * tid + 3]);
+          if (p.mc) mc_st_v4(p.mc + (r0b + 4 * tid) * 4, v4);
+          else
+            for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + r0b + 4 * tid, v4);
+        }
+      }
       if (tid == 0 && s_th == 0) s_th = 1;  // short / sparse sample: every valid key
       __syncthreads();
     }
@@ -521,6 +549,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       V2DBG(26);
       return nv;
     };
+    int nc = 0, tauh = -1;
+#pragma unroll 1
+    for (int cp = 0;; ++cp) {
     {
       uint32_t nv = 0;
       if (regp) nv += cand_regp(th);
@@ -596,10 +627,62 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
       for (int o = 16; o > 0; o >>= 1) nv += __shfl_xor_sync(0xffffffffu, nv, o);
-      if ((tid & 31) == 0 && nv) atomicAdd(&s_valid, nv);
+      if ((tid & 31) == 0 && nv && cp == 0) atomicAdd(&s_valid, nv);
     }
     __syncthreads();
-    int nc = s_cnt;
+    nc = s_cnt;
+    if constexpr (kFast) {
+      if (cp == 0) {
+        // R0 arrived under the candidate pass: tau_hat = the largest quantile key x whose
+        // estimated global count of keys >= x (64 local keys per sample level) reaches K;
+        // every rank centers its window and band there
+        const int64_t r0r = p.off_r0 + ((int64_t)(par * p.cap + row) * W) * kR0W;
+        for (int i = tid; i < W * (kR0W / 4); i += kV2T) {
+          const int r = i / (kR0W / 4), j = (i % (kR0W / 4)) * 4;
+          const uint32_t* src = p.box + r0r + (int64_t)r * kR0W + j;
+          const long long t0 = now_ns();
+          uint4 v = ld_sys_v4(src);
+          while (!tagged(v, tag)) {
+            if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 33); break; }
+            __nanosleep(64);
+            v = ld_sys_v4(src);
+          }
+          *reinterpret_cast<uint4*>(s_r0rx + r * kR0W + j) = v;
+        }
+        __syncthreads();
+        int best = -1;
+        for (int it = tid; it < W * kR0Q; it += kV2T) {
+          const int r = it / kR0Q;
+          const int x = (int)(s_r0rx[r * kR0W + 4 + (it - r * kR0Q)] & 0xFFFFu);
+          if (x < 1) continue;
+          int jt = 0;
+          for (int r2 = 0; r2 < W; ++r2) {  // levels of rank r2 whose key is >= x (non-increasing)
+            const uint32_t* q2 = s_r0rx + r2 * kR0W + 4;
+            int a = 0, b = kR0Q;
+            while (a < b) {
+              const int m = (a + b) >> 1;
+              if ((int)(q2[m] & 0xFFFFu) >= x) a = m + 1; else b = m;
+            }
+            jt += a;
+          }
+          if (64 * jt >= K) best = max(best, x);
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) best = max(best, __shfl_xor_sync(0xffffffffu, best, o));
+        if ((tid & 31) == 0 && best >= 0) atomicMax(&s_i[12], best);
+        __syncthreads();
+        tauh = s_i[12];
+        // the hot rank: its theta sits above the window around tau_hat; candidates again
+        const int thn = max(1, tauh - kV2Win / 2 - 64);
+        if (tauh >= 0 && regp && th > thn) {
+          V2STAT(6);
+          th = thn;
+          continue;
+        }
+      }
+    }
+    break;
+    }
     if (!kFast && K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
       // the sample bound failed (tie-heavy or skewed rows): exact counts per key over
       // 2048-key ranges of the SMEM row (from theta up on overflow, down otherwise) give a
@@ -670,7 +753,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     int ew = -1;
     uint32_t wtot = 0;
     // the fine histogram's base key: theta, or kV2Fine / 2 below the estimated q-th key
-    int fb = s_i[14] >= 0 ? max(th, s_i[14] - kV2Fine / 2) : th;
+    int fb = tauh >= 0 ? max(th, min(tauh - kV2Fine / 2, 65536 - kV2Fine)) : s_i[14] >= 0 ? max(th, s_i[14] - kV2Fine / 2) : th;
     if (fast) {
       // thread t owns fine keys [kV2FB (kV2T - 1 - t), + kV2FB); Sx[b]: candidates with
       // fine key >= b (beyond included); the row buffer is free until the round
@@ -699,7 +782,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) Sx[kV2Fine] = s_beyond;
         __syncthreads();
-        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
+        if (K31_LIKELY(tauh >= 0 || pass == 1 || s_e >= 0 || s_beyond < q)) break;
         // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
         // candidates (32 keys per bin, the whole key range) locate it; rebase there
         V2STAT(7);
@@ -723,9 +806,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
       }
       V2DBG(13);
-      fast = s_e >= 0;
+      fast = tauh >= 0 || s_e >= 0;
       if (fast) {
-        const int e = s_e;
+        const int e = tauh >= 0 ? tauh : s_e;  // the window's center: tau_hat (R0), else the q-th key
         const int lo = min(max(fb, e - kV2Win / 2), fb + kV2Fine - kV2Win);
         const int b0 = lo - fb;
         const uint32_t sa = Sx[b0 + kV2Win];
