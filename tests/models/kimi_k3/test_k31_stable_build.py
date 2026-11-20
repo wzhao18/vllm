@@ -57,12 +57,14 @@ def test_copy_made_by_another_process_wins(tmp_path, monkeypatch):
     checkout = _checkout(tmp_path / "checkout")
     build = tmp_path / "build" / "00112233aabbccdd-s"
     build.mkdir(parents=True)
-    copytree = shutil.copytree
+    copytree, raced = shutil.copytree, []
 
-    def racing(src, dst, **kw):  # the other process renames its copy meanwhile
-        (build / "src").mkdir()
-        (build / "src" / "first.txt").write_text("first copy\n")
-        return copytree(src, dst, **kw)
+    def racing(*args, **kw):  # the other process renames its copy meanwhile
+        if not raced:  # (copytree recurses through the module name)
+            raced.append(1)
+            (build / "src").mkdir()
+            (build / "src" / "first.txt").write_text("first copy\n")
+        return copytree(*args, **kw)
 
     monkeypatch.setattr(shutil, "copytree", racing)
     assert stable_copy(str(build), str(checkout)) == str(build / "src")
