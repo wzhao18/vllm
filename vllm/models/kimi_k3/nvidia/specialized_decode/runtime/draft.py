@@ -96,8 +96,10 @@ WIDE_LM_HEAD = {16: "17-32:1"}
 # sp_attention.SP_DRAFTER_TABLES). TP4 (D3-32, [40960, 7168]
 # shard), VR200 1 GPU, cold weights, us, wide_sk vs the pinned cuBLASLt algorithm:
 # 96 rows 38.8 vs 47.0, 192 rows 46.6 vs 49.9, 288 rows 65.7 vs 66.8
-# (bench_kimi_k3_sdec_wide_sk.py).
-GQA_SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
+# (bench_kimi_k3_sdec_wide_sk.py). In-step (D3-32 NVFP4 slice, same-node ABBA, 3
+# rounds, Rhea) 192 rows were slower (+4.8, +7.4 us per step on two nodes) and 288
+# rows neutral (-5.5, +0.5), so only 96 rows run it.
+GQA_SK_LM_HEAD = {4: "96-96:1"}
 # Query rows whose context step (sharded projection + row gather, context-KV GEMM
 # and insert) the caller may run on a side stream, joined by the first MLA layer
 # right before its attention core (cutedsl.draft.attention ``join_context``): the
