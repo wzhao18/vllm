@@ -1266,7 +1266,8 @@ class SwapABGatedActEpilogue(KernelComponent):
         acc_pipeline.consumer_wait(acc_consumer_state)
         # DIAGNOSTIC ONLY (ladder skeleton T14s/T24s): FC1 parts store nothing (an in-cluster part-sum moves no
         # HBM bytes); FC2 parts keep their FP32 partial store (the off-main sum's input).
-        if work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear2):
+        # T14n/T24n: no partial store at all (structure only: counters, barriers, last-part epilogue).
+        if cutlass.const_expr(False):
             for chunk in cutlass.range_constexpr(self.cta_tile_n // 32):
                 if cutlass.Int32(chunk * 32) < valid_tokens:
                     regs = cute.make_rmem_tensor((32,), cutlass.Float32)
