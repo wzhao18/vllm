@@ -68,16 +68,21 @@ class Chain:
                 ws.append(tuple(t.to(device) for t in (norm, query, out)))
             self.w.append(ws)
 
-    def boundaries(self, mx=False):
+    def boundaries(self, mx=False, form=None):
         """``mx``: the MXFP8 forms (MXFP8 all-gather of every layer, the post-AttnRes
-        also writing an MXFP8 input scratch): the NVFP4 checkpoint's KDA layers."""
+        also writing an MXFP8 input scratch): the NVFP4 checkpoint's KDA layers.
+        ``form``: the signalled MXFP8 all-gather (no poll) with that diagnostic
+        ordering + count form (``sp_fused.SIGNAL_FORMS``)."""
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
             sp_fused,
         )
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import mxfp8
 
-        key = "_bmx" if mx else "_b"
+        key = ("_bmx" if mx else "_b") + ("" if form is None else f"_{form}")
         if getattr(self, key, None) is None:
+            if form is not None:
+                sp_fused.SIGNAL_FORM = form
+                sp_fused.compile_gather.cache_clear()
             bounds = []
             scratch = mxfp8.Mxfp8Input(self.n, WIDTH, self.comm.device) if mx else None
             for layer in range(self.layers):
@@ -88,12 +93,13 @@ class Chain:
                     self.comm, (self.w[layer][0], eps), (self.w[layer][1], eps),
                     prev, write, self.n, {self.rows: True}, layer == 0,
                     gather_mx=mx, out_mx=scratch,
+                    signal_rows=() if form is None else (self.rows,),
                 ))
             setattr(self, key, bounds)
         return getattr(self, key)
 
-    def run_fused(self, mx=False):
-        bounds = self.boundaries(mx)
+    def run_fused(self, mx=False, form=None):
+        bounds = self.boundaries(mx, form)
         hidden = None
         for layer in range(self.layers):
             parity = layer % 2
@@ -162,6 +168,8 @@ class Chain:
 
         if variant in ("fused", "fused_mx"):
             return self.run_fused(variant == "fused_mx")
+        if variant.startswith("sig:"):  # the signalled MXFP8 gather, one form
+            return self.run_fused(True, variant[4:])
 
         comm, n = self.comm, self.n
         prefix = self.prefix

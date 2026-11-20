@@ -54,6 +54,34 @@ CLUSTER = 7  # CTAs per row (1024 columns each)
 # (kind, nb) -> (CTAs per SM, SMs, registers, smem allowance) of the compiled codes
 RESIDENCY: dict = {}
 THREADS = 128
+# DIAGNOSTIC (bench_kimi_k3_sdec_sp_chain "sig:<form>" only; the model uses the
+# default): the signalled gather's ordering + count form.
+SIGNAL_FORM = "fence_relaxed"
+SIGNAL_FORMS = (
+    "fence_relaxed", "release", "none", "fence_only", "relaxed_only",
+    "gpu_fence_relaxed", "async_release",
+)
+
+
+@asm()
+def _fence_gpu():
+    return "fence.acq_rel.gpu;", "~{memory}", ()
+
+
+@asm()
+def _ready_add_release(address):
+    return (
+        "multimem.red.release.sys.global.add.u32 [$0], 1;", "l,~{memory}",
+        (Int64(address),),
+    )  # fmt: skip
+
+
+@asm()
+def _ready_add_async(address):
+    return (
+        "multimem.red.async.release.sys.global.add.u32 [$0], 1;", "l,~{memory}",
+        (Int64(address),),
+    )  # fmt: skip
 
 
 @asm()
@@ -126,6 +154,7 @@ class SpAttnResGather(ClusterAttnRes):
         if signal and not mx:
             raise ValueError("SpAttnResGather: signal needs the MXFP8 all-gather")
         self.tp, self.mx, self.signal = tp, mx, signal
+        self.form = SIGNAL_FORM
 
     @cute.jit
     def __call__(self, *args):
@@ -155,8 +184,22 @@ class SpAttnResGather(ClusterAttnRes):
                 # count them there (the CTA's stores, then one release).
                 cute.arch.sync_threads()
                 if tid == 0:
-                    _fence_sys()
-                    _ready_add(args[14] + Int64(part) * READY_STRIDE)
+                    word = args[14] + Int64(part) * READY_STRIDE
+                    form = self.form
+                    if cutlass.const_expr(form in ("fence_relaxed", "release")):
+                        _fence_sys()
+                    if cutlass.const_expr(form == "fence_only"):
+                        _fence_sys()
+                    if cutlass.const_expr(form == "gpu_fence_relaxed"):
+                        _fence_gpu()
+                    if cutlass.const_expr(form == "release"):
+                        _ready_add_release(word)
+                    if cutlass.const_expr(form == "async_release"):
+                        _ready_add_async(word)
+                    if cutlass.const_expr(
+                        form in ("fence_relaxed", "relaxed_only", "gpu_fence_relaxed")
+                    ):
+                        _ready_add(word)
             else:
                 # Every rank's MXFP8 row of this token, these 1024 columns: published?
                 mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
