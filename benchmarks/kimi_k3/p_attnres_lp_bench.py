@@ -47,11 +47,14 @@ def main():
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--check", type=int, default=1)
     p.add_argument("--old", type=int, default=1)
-    p.add_argument("--depths", default="4")
+    p.add_argument("--depths", default="2")
     p.add_argument("--percall", type=int, default=1)
     p.add_argument("--dielocal", type=int, default=0)
     p.add_argument("--groups", default="4")
     p.add_argument("--vecs", default="8")
+    p.add_argument("--qa", default="2", help="claim run-ahead builds")
+    p.add_argument("--pdl", default="1", help="PDL builds (1 production, 0 plain)")
+    p.add_argument("--qdeep", default="3", help="ring depth of MXFP8-only calls with >= 5 blocks")
     args = p.parse_args()
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -198,26 +201,31 @@ def main():
                     fn(st, c)
                 torch.cuda.synchronize()
         tot = {}
-        for e in prof.events():
-            if e.device_type != torch.autograd.DeviceType.CUDA:
-                continue
-            if "Memset" in e.name or "Memcpy" in e.name:
-                continue
+        # PDL-clipped totals (as the in-step parser): a kernel's time starts
+        # when its stream predecessor ends (one stream here).
+        evs = sorted((e for e in prof.events()
+                      if e.device_type == torch.autograd.DeviceType.CUDA
+                      and "Memset" not in e.name and "Memcpy" not in e.name),
+                     key=lambda e: e.time_range.start)
+        last_end = None
+        for e in evs:
             k = "lp" if "attn_res_lp" in e.name else (
                 "attnres_old" if "attn_res" in e.name else "other:" + e.name[:40])
-            tot[k] = tot.get(k, 0.0) + e.time_range.elapsed_us() / args.iters
+            s0, s1 = e.time_range.start, e.time_range.end
+            c0 = s0 if last_end is None else max(s0, min(last_end, s1))
+            last_end = s1 if last_end is None else max(last_end, s1)
+            tot[k] = tot.get(k, 0.0) + (s1 - s0) / args.iters
+            tot["clip:" + k] = tot.get("clip:" + k, 0.0) + (s1 - c0) / args.iters
         return {k: round(v / 1e3, 3) for k, v in sorted(tot.items())}
 
-    if args.percall:
+    for pd in [int(x) for x in args.depths.split(",")] if args.percall else []:
+        attn_res_lp.RING_DEPTH = pd
+        attn_res_lp.RING_DEPTH_Q_DEEP = pd
         st = State(bool(args.dielocal))
         for c in calls:
             run_lp(st, c)
         torch.cuda.synchronize()
         groups = {}
-        for c in calls:
-            if c["c"] == 0:
-                for c2 in calls[:1]:
-                    pass
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             st = State(bool(args.dielocal))
             for c in calls:
@@ -234,8 +242,16 @@ def main():
             g[0] += 1
             g[1] += e.time_range.elapsed_us()
         for k, (n, us, rows) in sorted(groups.items()):
-            print(json.dumps({"call": k, "n": n, "us": round(us / n, 1),
+            print(json.dumps({"depth": pd, "call": k, "n": n, "us": round(us / n, 1),
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
+
+    def lp_arm(qa, pdl, qdeep):
+        def fn(st, c):
+            attn_res_lp.CLAIM_AHEAD = qa
+            attn_res_lp.PDL = pdl
+            attn_res_lp.RING_DEPTH_Q_DEEP = qdeep
+            return run_lp(st, c)
+        return fn
 
     res = []
     for d, gr, vv in [(int(x), int(y), int(v)) for v in args.vecs.split(",")
@@ -244,15 +260,31 @@ def main():
         attn_res_lp.GROUPS = gr
         attn_res_lp.VEC = vv
         arms = [("old", lambda st, c: run_ref(st, c))] if args.old else []
-        arms.append((f"lp_v{vv}g{gr}d{d}", run_lp))
+        for qa in [int(x) for x in args.qa.split(",")]:
+            for pdl in [int(x) for x in args.pdl.split(",")]:
+                for qd in [int(x) for x in args.qdeep.split(",")]:
+                    arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}qd{qd}",
+                                 lp_arm(qa, pdl, qd)))
         order = arms + arms[::-1]
         for name, fn in order:
             r = timed(fn, bool(args.dielocal) and name != "old")
             r["arm"] = name
-            r["total_ms"] = round(sum(
-                v for k, v in r.items()
-                if k in ("lp", "attnres_old") or "nvjet" in k or "gemm" in k.lower()), 3)
-            r = {k: v for k, v in r.items() if k in ("arm", "total_ms", "lp", "attnres_old")}
+
+            def fam(pre):
+                tot = 0.0
+                for k, v in r.items():
+                    if not isinstance(v, float) or not k.startswith(pre):
+                        continue
+                    b = k[len(pre):]
+                    if b.startswith("clip:"):
+                        continue
+                    if b in ("lp", "attnres_old") or "nvjet" in b or "gemm" in b.lower():
+                        tot += v
+                return round(tot, 3)
+            r["total_ms"] = fam("")
+            r["clip_ms"] = fam("clip:")
+            r = {k: v for k, v in r.items()
+                 if k in ("arm", "total_ms", "clip_ms", "lp", "attnres_old", "clip:lp")}
             print(json.dumps(r))
             res.append(r)
 

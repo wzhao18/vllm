@@ -63,6 +63,15 @@ def make_logits(case, T, width, Lloc, gen, dev, rank=0):
                 x[rare, 1:10001:2] = 6.0
         else:
             x[rare] = torch.relu(x[rare] - 7.0)
+    elif case in ("hotrank", "hotrank2"):
+        # relu rows; one row in 128 is rank-skewed: DCP rank 0 holds 600 (hotrank) or 1500
+        # (hotrank2) keys two-plus binades above every other key, so the round-1 windows
+        # (each centered on its rank's q-th key) are disjoint (K = 2048); tau lies above
+        # (hotrank: CG round) or below (hotrank2: R2) rank 0's theta
+        x = torch.relu(x + 0.3) * 2.0
+        if rank == 0:
+            rare = torch.arange(T, device=dev) % 128 == 7
+            x[rare, 0:(1200 if case == "hotrank" else 3000):2] += 40.0
     elif case == "hot_recent":  # recent tokens score much higher (local position ~ L)
         pos = torch.arange(width, device=dev)[None, :]
         hot = (pos >= (Lloc[:, None] - 512)) & (pos < Lloc[:, None])

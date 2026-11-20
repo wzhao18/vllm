@@ -84,7 +84,7 @@ def make_case(rows, local, jitter, ctx_rows, gen, width=1024, empty=0, share=0.0
         if jitter:
             n = int(torch.randint(local - jitter, local + jitter + 1, (1,), generator=gen,
                                   device=dev).item())
-        if r < empty:
+        if r >= rows - empty:
             n = 0
         n = max(0, min(n, width))
         idx = torch.randperm(ctx_rows, generator=gen, device=dev)[:n]
@@ -119,6 +119,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rows", default="128,256,384,512")
     p.add_argument("--local", type=int, default=512)
+    p.add_argument("--width", type=int, default=1024, help="slot list width (top-k)")
     p.add_argument("--jitter", type=int, default=40)
     p.add_argument("--ctx", type=int, default=135000 // 4)
     p.add_argument("--share", type=float, default=0.0,
@@ -136,6 +137,11 @@ def main():
                    help="km: release KV tiles on landing (gather rate; output invalid)")
     p.add_argument("--prefetch", type=int, default=3, help="km: L2 prefetch distance (tiles)")
     p.add_argument("--v1", action="store_true", help="the V-split pair kernel")
+    p.add_argument("--h8knobs", default="",
+                   help="h8 knobs, comma-separated ints (no_store, no_gather, no_math, "
+                   "no_mma, sstamp, pad, ssmask, pin, parts, gskip, cpa, ...)")
+    p.add_argument("--kern", default="km", choices=("km", "h8", "ts"),
+                   help="h8: the prefill TS sparse MLA (latent only; LSE not written)")
     p.add_argument("--check", type=int, default=24)
     p.add_argument("--no-trtllm", action="store_true")
     p.add_argument("--out", default="")
@@ -150,6 +156,20 @@ def main():
     )
 
     def native(query, kv, slots, valid, lat, lse, bmm1, bmm2, stamps=None):
+        if a.kern == "ts":
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_ts import (  # noqa: E501
+                sparse_mla_decode_ts,
+            )
+            return sparse_mla_decode_ts(query, kv, slots, valid, lat, lse, bmm1, bmm2,
+                                        knobs=h8_knobs)
+        if a.kern == "h8":
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+                sparse_mla_prefill_h8,
+            )
+            q8, out8 = h8_bufs[query.shape[0]]
+            sparse_mla_prefill_h8(q8, kv, slots, valid, bmm1, bmm2, unit_rows=64,
+                                  out=out8, knobs=h8_knobs)
+            return
         if a.v1:
             return sparse_mla_decode(query, kv, slots, valid, lat, lse, bmm1, bmm2,
                                      stages=a.stages, clusters=a.clusters or None,
@@ -173,11 +193,14 @@ def main():
     workspace = torch.zeros(256 << 20, dtype=torch.uint8, device=dev)
     bmm1, bmm2 = 0.07, 0.8
     res = {}
+    h8_bufs = {}
+    h8_knobs = tuple(int(v) for v in a.h8knobs.split(",") if v != "")
     for rows in rows_list:
         query = (torch.randn(rows, heads, 576, device=dev, generator=gen) * 0.5).to(
             torch.float8_e4m3fn)
         query[:, 96:] = 0
-        slots, valid = make_case(rows, a.local, a.jitter, a.ctx, gen, empty=2, share=a.share)
+        slots, valid = make_case(rows, a.local, a.jitter, a.ctx, gen, width=a.width, empty=2,
+                                 share=a.share)
         lat_t = torch.zeros(rows, heads, 512, dtype=torch.bfloat16, device=dev)
         lse_t = torch.zeros(rows, heads, dtype=torch.float32, device=dev)
         lat_n = torch.zeros_like(lat_t)
@@ -197,8 +220,14 @@ def main():
         def nat():
             native(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n, bmm1, bmm2)
 
+        if a.kern == "h8":
+            h8_bufs[rows] = (query[:, :96].contiguous(),
+                             torch.zeros(rows, 96, 512, dtype=torch.bfloat16, device=dev))
         nat()
         torch.cuda.synchronize()
+        if a.kern == "h8":
+            lat_n[:, :96] = h8_bufs[rows][1]
+            lse_n.fill_(float("nan"))
         out = {}
         if not a.no_trtllm:
             trt()
@@ -229,7 +258,11 @@ def main():
         if not a.no_trtllm:
             nz = valid > 0
             d = (lat_n[nz, :96].float() - lat_t[nz, :96].float()).abs()
+            a_ = lat_n[nz, :96].double()
+            b_ = lat_t[nz, :96].double()
+            per = ((a_ - b_).norm(dim=-1) / b_.norm(dim=-1).clamp_min(1e-30)).max()
             out["native_vs_trtllm"] = dict(
+                rowhead_rel_max=float(f"{per.item():.3e}"),
                 max_abs=round(d.max().item(), 5), mean_abs=round(d.mean().item(), 6),
                 lse_max_abs=round((lse_n[nz, :96] - lse_t[nz, :96]).abs().max().item(),
                                   5),
@@ -237,7 +270,41 @@ def main():
         out["native_us"] = round(timed(nat, flush=flush), 2)
         out["native_graph_us"] = graph_time(nat, flush[: 1 << 26])
         out["native_warm_us"] = graph_time(nat, flush[:1])  # L2-warm KV (no flush)
-        if not a.v1:
+        if a.kern == "ts":
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_ts import (  # noqa: E501
+                kernel_info as ts_info,
+            )
+
+            out["regs_local"] = ts_info(0, h8_knobs)
+            if a.stamps:
+                from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_ts import (  # noqa: E501
+                    sparse_mla_decode_ts,
+                )
+
+                kn = tuple(h8_knobs) + (0,) * (5 - len(h8_knobs))
+                kn = kn[:4] + (1,) + kn[5:]
+                st = torch.zeros(256, dtype=torch.int32, device=dev)
+                flush.zero_()
+                sparse_mla_decode_ts(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n,
+                                     bmm1, bmm2, knobs=kn, stamps=st)
+                torch.cuda.synchronize()
+                st = st.view(8, 32).long()
+                t0 = int(st[0, 31])
+                rel = ((st - t0) % (1 << 32)).tolist()
+                names = {0: "sm0in", 1: "sm0Sfull", 2: "sm0ld", 3: "sm0dec", 4: "sm0Pfree",
+                         5: "sm0P", 6: "sm0rdy", 8: "sm1in", 9: "sm1Sfull", 10: "sm1ld",
+                         11: "sm1dec", 12: "sm1Pfree", 13: "sm1P", 14: "sm1rdy", 16: "qk16",
+                         17: "qk17", 18: "pvgo", 19: "pvdone", 20: "qk20", 22: "g22",
+                         23: "g23", 24: "qk24", 25: "qk25"}
+                tab = {}
+                for uu in range(8):
+                    tab[f"u{uu}"] = {names[k]: round(rel[uu][k] / 1e3, 2) for k in names
+                                      if int(st[uu, k]) != 0}
+                tab["misc_kclk"] = {n: round(rel[0][k] / 1e3, 2) for k, n in (
+                    (26, "epi0"), (27, "epi0done"), (28, "epi1"), (29, "epi1done"),
+                    (30, "exit")) if int(st[0, k]) != 0}
+                out["stamps_kclk"] = tab
+        if not a.v1 and a.kern == "km":
             from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_km import (  # noqa: E501
                 kernel_info,
             )
@@ -245,7 +312,7 @@ def main():
             grid = a.clusters or min(torch.cuda.get_device_properties(0).multi_processor_count, rows)
             out["regs_local"] = kernel_info(0, grid, a.stages, a.loaders, a.cpa,
                                             a.prefetch)
-        if a.stamps:
+        if a.stamps and a.kern == "km":
             st = torch.zeros(424 * 64, dtype=torch.int64, device=dev)
             flush.zero_()
             native(query, kv.view(torch.uint8), slots, valid, lat_n, lse_n, bmm1, bmm2,

@@ -80,6 +80,7 @@ from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
+from .sp_dense import MAX_ROWS, SpDenseMlp
 from .sp_mlp import SpMlp, moe_choice
 
 logger = init_logger(__name__)
@@ -470,6 +471,12 @@ class SpStep:
             for d in layers
             if d.is_moe_layer
         }
+        # The layer-0 dense MLP (replicated weights) as one die-local weight stream.
+        self.dense_mlps = {
+            d.layer_idx: SpDenseMlp(d.mlp, shards, self.device, d.layer_idx)
+            for d in layers
+            if not d.is_moe_layer and shards[-1] <= MAX_ROWS
+        }
         # MoE layers whose latent up leaves FP32 split partials that the next layer's
         # all-gather boundary sums (``SpMlp.parts``): not the last layer (the final
         # AttnRes) nor one whose output is also a BF16 aux hidden state.
@@ -545,7 +552,7 @@ class SpStep:
                 f"stock MegaMoE router / experts / norms on the shard (EP{ctx.ep}); "
                 "its dense GEMMs: moe_dense"
             )
-        if self.dense:
+        if self.dense and not self.dense_mlps:
             declared["dense"] = "stock dense MLP on the shard"
         if method == "synthetic":
             declared["verify"] = "stock (synthetic rejection)"
@@ -579,6 +586,8 @@ class SpStep:
                     choices.setdefault(family, choice)
             if self.mlps:
                 choices["moe_dense"] = moe_choice(self.mlps, r // ctx.tp)
+            for dense in self.dense_mlps.values():
+                choices["dense"] = dense.choice(r // ctx.tp)
             if "verify" not in declared:
                 choices["verify"] = Choice(Path.GENERIC, note="VerifyArgmax")
             coverage.specialize(r, choices)
@@ -688,7 +697,10 @@ class SpStep:
             out = prefix_sum.new_empty(prefix_sum.shape)
             hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
-            if mlp is None:
+            dense = self.dense_mlps.get(index)
+            if dense is not None and dense.serves(hidden.shape[0]):
+                hidden = dense.run(hidden)
+            elif mlp is None:
                 hidden = layer.mlp(hidden)
             else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
                 hidden = mlp.run(

@@ -51,7 +51,11 @@ constexpr int VEC = K31LP_VEC;       // bf16 per lane chunk
 constexpr int NT = H / (7 * VEC);  // threads per token group (128 at VEC 8)
 constexpr int NCH = H / (NT * VEC);  // 7 chunks per thread
 constexpr int MAXB = 8;
+constexpr int MAXT = 3;  // BF16 terms of a block logit (attn_res_lp.MAX_TERMS)
 constexpr float LOG2_E = 1.4426950408889634f;
+#ifndef K31LP_PDL
+#define K31LP_PDL 1  // programmatic dependent launch (0: bench A/B builds only)
+#endif
 #ifndef K31LP_PROBE
 #define K31LP_PROBE 0  // probe builds only (bench): 1 no block math, 2 no epilogue,
                        // 4 no output stores, 8 no CTA barriers (wrong values)
@@ -156,8 +160,11 @@ struct Args {
   const float* w;    // [H] FP32 norm_w * qk_w of this call
   const bf16_t* onw;  // output RMSNorm weight (NORM)
   float eps, oeps;
-  const float* lhi[MAXB];  // block i logit hi / lo row of this call ([T])
-  const float* llo[MAXB];
+  // Block i's logit term rows of this call ([T] FP32 each, terms k <
+  // nterms); the logit is (sum of terms) * lscale (exact power of two).
+  const float* lt[MAXT][MAXB];
+  int nterms;
+  float lscale;
   float* rstd;  // [MAXB][rstd_stride] per-block rsqrt(mean(v^2) + eps)
   int64_t rstd_stride;
   int n, widx, T;
@@ -186,10 +193,16 @@ constexpr uint32_t SEG_BYTES = SEG * 2;
 #ifndef K31LP_G
 #define K31LP_G 4
 #endif
-// Token claim queue: positions claimed QA ahead of the consumer (>= the
-// producer's run-ahead of D rows), QN entries.
-constexpr int QA = 5;
+// Token claim queue (QN entries): a group claims qa positions ahead of the
+// token it processes, the fewest that keep the producer's run-ahead of D
+// rows (ceil(D / R) tokens) on claimed positions: qa = max(QA, ceil(D/R) + 1).
+// A short run-ahead balances the end of a call best.
+#ifndef K31LP_QA
+#define K31LP_QA 2
+#endif
+constexpr int QA = K31LP_QA;
 constexpr int QN = 8;
+static_assert(QA >= 2 && QA < QN && (QN & (QN - 1)) == 0);
 constexpr int G = K31LP_G;
 constexpr int CTA_THREADS = NT * G;
 // One lane's VEC BF16 values.
@@ -218,11 +231,11 @@ struct Smem {
   float w[H];
   bf16_t onw[H];
   uint64_t full[G][NW][D];
+  uint64_t cbar;  // per-call constants (w, onw) landed
   float red[G][2][NW][3];  // [.][parity][warp]: sum u^2, u.w, sum out^2
   int tq[G][QN];
   float ew[G][NW][MAXB];  // per-warp normalized block weights of the token
-  const float* lhi[MAXB];  // logit row pointers (no dynamic param indexing)
-  const float* llo[MAXB];
+  const float* lt[MAXT][MAXB];  // logit term rows (no dynamic param indexing)
 };
 
 // Probe builds (K31LP_PROBE & 16): per-token phase clock stamps of group 0,
@@ -249,6 +262,11 @@ __device__ __forceinline__ long long gtime() {
     }                                                                        \
   } while (0)
 
+// Probe builds (K31LP_PROBE & 64): per-group end-of-call stats into
+// stamps[4096 + (blockIdx * G + g) * 4 + j]: die, own-die tokens,
+// other-die tokens, exit globaltimer.
+constexpr int kGroupStatsBase = 4096;
+
 __device__ __forceinline__ void group_sync(int g) {
   asm volatile("bar.sync %0, %1;\n" ::"r"(1 + g), "n"(NT) : "memory");
 }
@@ -266,6 +284,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   const int n = a.n;
   constexpr int R0 = 1 + (HAS_DELTA ? 1 : 0);
   const int R = R0 + n;  // rows per token
+  const int qa = max(QA, (D + R - 1) / R + 1);  // claim run-ahead (< QN)
   const int64_t seg0 = (int64_t)warp * SEG;
   K31LP_CTA_STAMP(0);
 
@@ -309,14 +328,6 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   auto start_claim = [&]() -> int {
     return own_done ? cnt_own : atomicAdd(&a.claim[die], 1);
   };
-  if (tid == 0) {
-    const int j = atomicAdd(&a.claim[die], QA);  // first QA positions at once
-#pragma unroll 1
-    for (int i = 0; i < QA; ++i) {
-      sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
-                                    : finish_claim(own_done ? 0 : cnt_own);
-    }
-  }
 
   if (lane == 0) {
 #pragma unroll
@@ -326,20 +337,36 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int i = 0; i < MAXB; ++i) {
-      sm.lhi[i] = a.lhi[i];
-      sm.llo[i] = a.llo[i];
+#pragma unroll
+      for (int k = 0; k < MAXT; ++k) sm.lt[k][i] = a.lt[k][i];
     }
+    // Per-call constants into shared memory: two bulk copies (one round
+    // trip), in flight across the dependency wait below.
+    mbar_init(&sm.cbar, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    mbar_expect_tx(&sm.cbar, H * 4 + (NORM ? H * 2 : 0));
+    bulk_g2s(sm.w, a.w, H * 4, &sm.cbar);
+    if constexpr (NORM) bulk_g2s(sm.onw, a.onw, H * 2, &sm.cbar);
   }
-  // Per-call constants into shared memory.
-  for (int i = threadIdx.x; i < H / 4; i += CTA_THREADS) {
-    reinterpret_cast<float4*>(sm.w)[i] = __ldg(reinterpret_cast<const float4*>(a.w) + i);
-    if constexpr (NORM)
-      reinterpret_cast<uint2*>(sm.onw)[i] = __ldg(reinterpret_cast<const uint2*>(a.onw) + i);
+#if K31LP_PDL
+  // Programmatic dependent launch: everything above reads only per-call
+  // constants. The prefix / delta rows, the logits, the claim counters and
+  // every output belong to this call's dependency chain: wait for the
+  // preceding grid before touching any of them.
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+  if (tid == 0) {
+    const int j = atomicAdd(&a.claim[die], qa);  // first qa positions at once
+#pragma unroll 1
+    for (int i = 0; i < qa; ++i) {
+      sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
+                                    : finish_claim(own_done ? 0 : cnt_own);
+    }
   }
   __syncthreads();
 
   // Producer (lane 0 of each warp): next row to issue (token position p_it,
-  // row p_r). It runs at most D rows (<= D < QA tokens) ahead.
+  // row p_r). It runs at most D rows (< qa tokens) ahead.
   int p_it = 0, p_r = 0, p_slot = 0;
   auto issue_next = [&]() {
     const int t = sm.tq[g][p_it & (QN - 1)];
@@ -383,29 +410,37 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   };
 
   // Lane i < n holds block i's logit inputs for the next token.
-  float nl_hi = 0.f, nl_lo = 0.f, nl_r = 0.f;
+  float nl_t0 = 0.f, nl_t1 = 0.f, nl_t2 = 0.f, nl_r = 0.f;
   auto load_logits = [&](int it) {
     const int t = sm.tq[g][it & (QN - 1)];
     if (lane < n && t >= 0) {
-      nl_hi = __ldg(sm.lhi[lane] + t);
-      nl_lo = __ldg(sm.llo[lane] + t);
+      nl_t0 = __ldg(sm.lt[0][lane] + t);
+      if (a.nterms > 1) nl_t1 = __ldg(sm.lt[1][lane] + t);
+      if (a.nterms > 2) nl_t2 = __ldg(sm.lt[2][lane] + t);
       nl_r = __ldg(a.rstd + (int64_t)lane * a.rstd_stride + t);
     }
   };
   load_logits(0);
+  mbar_wait(&sm.cbar, 0);
 
   K31LP_CTA_STAMP(1);
   int par = 0;
   // Thread 0: the own-die atomicAdd (in flight) for the next claimed position.
   int pending = tid == 0 ? start_claim() : 0;
+  [[maybe_unused]] int p_own = 0, p_oth = 0;
   for (int it = 0;; ++it) {
     const int tt = sm.tq[g][it & (QN - 1)];
     if (tt < 0) break;
     const int64_t t = tt;
+    if constexpr ((K31LP_PROBE & 64) != 0) {
+      if (tid == 0) {
+        if (a.sm_die == nullptr || ((tt >> SB) & 1) == die) ++p_own; else ++p_oth;
+      }
+    }
 
     K31LP_STAMP(0);
     // Block logits of this token (prefetched), then prefetch the next.
-    const float s_mine = (nl_hi + nl_lo) * nl_r;
+    const float s_mine = ((nl_t0 + nl_t1) + nl_t2) * a.lscale * nl_r;
     load_logits(it + 1);
     // Lane i < n: block i's softmax term (one register, not an array).
     float m_b = lane < n ? s_mine : -FLT_MAX;
@@ -474,7 +509,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     // term (no combine pass after the stream).
     K31LP_STAMP(3);
     if (tid == 0) {
-      sm.tq[g][(it + QA) & (QN - 1)] = finish_claim(pending);
+      sm.tq[g][(it + qa) & (QN - 1)] = finish_claim(pending);
       pending = start_claim();  // in flight for a whole token
     }
     group_sync(g);
@@ -595,6 +630,15 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     K31LP_STAMP(6);
     par ^= 1;
   }
+  if constexpr ((K31LP_PROBE & 64) != 0) {
+    if (tid == 0) {
+      long long* s = a.stamps + kGroupStatsBase + ((int64_t)blockIdx.x * G + g) * 4;
+      s[0] = die;
+      s[1] = p_own;
+      s[2] = p_oth;
+      s[3] = gtime();
+    }
+  }
   K31LP_CTA_STAMP(2);
   // The last CTA out resets the claim counters for the next call.
   __syncthreads();
@@ -627,8 +671,19 @@ void launch_t(const Args& a, cudaStream_t st) {
   }
   const int grid = std::min((a.T + G - 1) / G, occ * sms);  // co-resident
   if (grid <= 0) return;
-  k<<<grid, CTA_THREADS, smem, st>>>(a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // PDL: the CTAs become resident as the preceding kernel's CTAs exit and
+  // load the per-call constants before griddepcontrol.wait.
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(grid);
+  cfg.blockDim = dim3(CTA_THREADS);
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = K31LP_PDL;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, a));
 }
 
 template <int D>
@@ -657,7 +712,8 @@ static const void* opt_ptr(const c10::optional<torch::Tensor>& t) {
 static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefix_dst,
                  c10::optional<torch::Tensor> delta, torch::Tensor blocks,
                  torch::Tensor w, c10::optional<torch::Tensor> onw,
-                 torch::Tensor lptr, torch::Tensor rstd, int64_t n, int64_t widx,
+                 torch::Tensor lptr, int64_t nterms, double lscale,
+                 torch::Tensor rstd, int64_t n, int64_t widx,
                  double eps, double oeps, c10::optional<torch::Tensor> out,
                  c10::optional<torch::Tensor> q, c10::optional<torch::Tensor> sf,
                  int64_t depth, c10::optional<torch::Tensor> sm_die,
@@ -667,9 +723,14 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   TORCH_CHECK(blocks.dim() == 3 && blocks.size(2) == H && blocks.stride(2) == 1);
   TORCH_CHECK(n >= 0 && n <= MAXB && n <= blocks.size(1));
   TORCH_CHECK(widx < blocks.size(1));
-  TORCH_CHECK(w.scalar_type() == torch::kFloat32 && w.numel() == H);
+  TORCH_CHECK(w.scalar_type() == torch::kFloat32 && w.numel() == H && w.is_contiguous());
+  TORCH_CHECK(!onw.has_value() || (onw->numel() == H && onw->is_contiguous()));
+  TORCH_CHECK((reinterpret_cast<uintptr_t>(w.data_ptr()) & 15) == 0 &&
+                  (!onw.has_value() || (reinterpret_cast<uintptr_t>(onw->data_ptr()) & 15) == 0),
+              "attn_res_lp: w / output norm weight must be 16-byte aligned (bulk copies)");
+  TORCH_CHECK(nterms >= 1 && nterms <= MAXT, "attn_res_lp: ", nterms, " logit terms");
   TORCH_CHECK(lptr.device().is_cpu() && lptr.scalar_type() == torch::kInt64 &&
-              lptr.numel() >= 2 * n);
+              lptr.numel() >= nterms * n);
   TORCH_CHECK(rstd.scalar_type() == torch::kFloat32 && rstd.dim() == 2);
   if (delta.has_value()) TORCH_CHECK(delta->stride(0) == H && delta->size(0) >= prefix.size(0));
   const c10::cuda::CUDAGuard guard(prefix.device());
@@ -687,9 +748,11 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   a.eps = (float)eps;
   a.oeps = (float)oeps;
   const int64_t* lp = lptr.data_ptr<int64_t>();
+  a.nterms = (int)nterms;
+  a.lscale = (float)lscale;
   for (int i = 0; i < n; ++i) {
-    a.lhi[i] = reinterpret_cast<const float*>(lp[2 * i]);
-    a.llo[i] = reinterpret_cast<const float*>(lp[2 * i + 1]);
+    for (int k = 0; k < nterms; ++k)
+      a.lt[k][i] = reinterpret_cast<const float*>(lp[nterms * i + k]);
   }
   a.rstd = rstd.data_ptr<float>();
   a.rstd_stride = rstd.stride(0);
@@ -701,7 +764,7 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   a.sf_padded_cols = H / 32;
   TORCH_CHECK(claim.scalar_type() == torch::kInt32 && claim.numel() >= 3);
   TORCH_CHECK(!sm_die.has_value() || (sm_die->scalar_type() == torch::kInt8 && sm_die->numel() >= 1024));
-  TORCH_CHECK(depth < QA, "attn_res_lp: ring depth >= claim run-ahead");
+  TORCH_CHECK(depth + 1 < QN, "attn_res_lp: ring depth exceeds the claim queue");
   a.sm_die = sm_die.has_value() ? sm_die->data_ptr<int8_t>() : nullptr;
   a.claim = claim.data_ptr<int>();
   a.stamps = stamps.has_value() ? reinterpret_cast<long long*>(stamps->data_ptr()) : nullptr;

@@ -42,7 +42,7 @@ def _alpha_one(device):
 
 @cache
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
-             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, k_rotate=0):
+             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
@@ -56,17 +56,17 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         quiet_wait=quiet,
         producers=producers,
         die_claim=die_claim,
+        push=push,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
     gemm.max_ab_stages = max_stages
-    gemm.k_rotate = k_rotate
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16)
     b = cute.runtime.make_fake_compact_tensor(f8, (sym_n, sym_k), stride_order=(1, 0), assumed_align=16)
-    if swap_ab:  # out [R, N] row-major; only its pointer reaches the kernel (C M-major)
+    if swap_ab:
         c = cute.runtime.make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_n, sym_m), stride_order=(1, 0), assumed_align=16
+            cutlass.BFloat16, (sym_n, sym_m), stride_order=(0, 1), assumed_align=16
         )
     else:
         c = cute.runtime.make_fake_compact_tensor(
@@ -75,7 +75,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (cute.sym_int() if die_claim else 1,), assumed_align=4
+        cutlass.Float32, (cute.sym_int() if die_claim or push else 1,), assumed_align=8
     )
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
@@ -91,24 +91,35 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
 
 class Mxfp8PreGemm:
     """One (N, K, R) MXFP8 GEMM on a fixed tactic ``(tile_mn, cluster_mn, swap_ab,
-    inst_m)`` (FlashInfer's sm_107 tactic tuple); out is [R, N] row-major (``out_layout``
-    "rn") for every tactic."""
+    inst_m)`` (FlashInfer's sm_107 tactic tuple). ``out_layout``: "rn" = out [R, N]
+    row-major; swap_ab stores the same [R, N] row-major out (W is the MMA's M operand)."""
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 k_rotate=0, device=None):
+                 push=False, device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
-        # swap_ab: weights are operand A (M = N rows) and the kernel stores C M-major, i.e.
-        # straight into the row-major out [R, N].
         self.swap_ab = bool(tactic[2])
+        if self.swap_ab and tactic[0][1] % 64:  # (measured: N32 / N96 swap tiles store wrong rows)
+            raise ValueError(f"Mxfp8PreGemm: swap_ab needs a token tile multiple of 64 ({tactic[0]})")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
         if prewait and prewait > k // tile_k:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
+        if push:
+            # the push epilogue stages its tile in the drained A ring: one tile per CTA
+            # (cluster) and 128 rows per CTA
+            tile, cluster = tactic[0], tactic[1]
+            tiles = -(-rows // tile[0]) * -(-n // tile[1])
+            if tiles > _max_active_clusters(cluster[0] * cluster[1]):
+                raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
+            if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
+                raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
+        # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
+        self.push = int(push)
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), int(k_rotate),
+            int(max_stages), self.push,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
@@ -122,19 +133,44 @@ class Mxfp8PreGemm:
         km, kn = (n, rows) if self.swap_ab else (rows, n)
         self.sf = ((km + 127) // 128, (kn + 127) // 128, (k // SF_VEC + 3) // 4)
 
-    def __call__(self, xq, xs, w, ws, out):
+    def __call__(self, xq, xs, w, ws, out, push_args=None):
+        """``push_args`` (push GEMMs only): the float32 [push_epilogue.ARGS] buffer of
+        ``push_args``; ``out`` is then an unused [R, N] BF16 view (the C descriptor)."""
         if self.swap_ab:
+            # The kernel stores C [N, R] column-major (only C's pointer is used, leading
+            # dim N) = out [R, N] row-major; the strided view only matches the compiled
+            # argument's stride order.
             a, b, asf, bsf = w, xq, ws, xs
-            c = out
+            c = out.as_strided(out.shape, (1, out.shape[0]))
         else:
             a, b, asf, bsf = xq, w, xs, ws
             c = out
         alpha = self.alpha
+        if bool(self.push) != (push_args is not None):
+            raise ValueError(f"Mxfp8PreGemm(push={self.push}) push_args {push_args!r}")
+        if push_args is not None:
+            alpha = push_args
         if self.aux is not None:  # two counter sets, alternated per call
             alpha = self.aux[self.calls % 2]
             self.calls += 1
         self.compiled(a, b, c, *self.sf, asf.data_ptr(), bsf.data_ptr(), alpha)
         return out
+
+    @staticmethod
+    def push_args(peers: torch.Tensor, rank: int, n: int, cap: int, rows: int):
+        """The push epilogue's argument buffer (``push_epilogue`` docstring) for owner
+        receive bases ``peers`` (int64 [TP], device), on ``peers``' device."""
+        from .push_epilogue import ARGS
+
+        tp = peers.numel()
+        if tp > ARGS // 2 - 4 or rows > tp * n or n > cap:
+            raise ValueError(f"push args: TP {tp} rows {rows} n {n} cap {cap}")
+        args = torch.zeros(ARGS, dtype=torch.float32, device=peers.device)
+        args[0] = 1.0
+        ints = args.view(torch.int32)
+        ints[1], ints[2], ints[3], ints[4] = rank, n, cap, rows
+        args.view(torch.int64)[4 : 4 + tp].copy_(peers.to(torch.int64))
+        return args
 
     @staticmethod
     def _die_aux(tactic, rows, n, die_split, device):
