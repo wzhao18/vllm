@@ -38,7 +38,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from ..common.primitives import asm, store_relaxed
+from ..common.primitives import asm, prefetch_bytes, store_relaxed
 from ..common.sp_comm import positive_zero32
 
 WIDTH = 7168  # output features (the hidden size)
@@ -53,6 +53,7 @@ TMEM_COLS = 512
 TMEM_BAR = 1  # named barrier ids (0 = __syncthreads)
 EPI_BAR = 2
 TMA_MIN_ROWS = 2  # activation rows the TMA atoms span (a 1-row map faults on VR200)
+PF_BYTES = 32768  # L2 prefetch op size (weights)
 
 
 @asm()
@@ -95,7 +96,7 @@ class OprojPushMx:
     for the weights / the activation (one issuer completes one bulk op at a time)."""
 
     def __init__(self, k: int, rows: int, tp: int, cap: int, *, kt: int = 128,
-                 stages: int = 8, iw: int = 1, ix: int = 1):  # fmt: skip
+                 stages: int = 8, iw: int = 1, ix: int = 1, prefetch: bool = False):  # fmt: skip
         ktiles = k // kt
         if k % kt or ktiles % stages or rows % tp or rows // tp > cap or rows > 512:
             raise ValueError(f"OprojPushMx k {k} rows {rows} tp {tp} cap {cap} "
@@ -103,7 +104,7 @@ class OprojPushMx:
         self.k, self.rows, self.tp, self.cap = k, rows, tp, cap
         self.n = rows // tp
         self.kt, self.stages, self.ktiles = kt, stages, ktiles
-        self.iw, self.ix = iw, ix
+        self.iw, self.ix, self.prefetch = iw, ix, prefetch
         self.x_warp = TMA_WARP + iw
         self.threads = 32 * (TMA_WARP + iw + ix)
         self.tma_rows = max(rows, TMA_MIN_ROWS)
@@ -198,7 +199,7 @@ class OprojPushMx:
         self.kernel(
             mma, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb, pair_vmnk,
             pair_sfb_vmnk, a_layout, b_layout, sfa_layout, sfb_layout, tsfa_layout,
-            tsfb_layout, peers, rank,
+            tsfb_layout, peers, rank, w_ptr.toint(), sfw_ptr.toint(),
         ).launch(
             grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[2, 1, 1],
             stream=stream, use_pdl=True,
@@ -212,7 +213,7 @@ class OprojPushMx:
                a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
                sfa_layout: cute.Layout, sfb_layout: cute.Layout,
                tsfa_layout: cute.Layout, tsfb_layout: cute.Layout, peers: cute.Tensor,
-               rank: Int32):  # fmt: skip
+               rank: Int32, w_addr: Int64, sfw_addr: Int64):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -308,6 +309,19 @@ class OprojPushMx:
         rot = (mb * 7) % self.ktiles
         if warp >= TMA_WARP and warp < self.x_warp:
             iw = warp - TMA_WARP
+            if cutlass.const_expr(self.prefetch):
+                # The CTA's 128 weight rows (contiguous) and their scales (one 128-row
+                # F8_128x4 block) into L2 at once: the ring then loads at L2 latency.
+                lane = cute.arch.lane_idx()
+                row0 = mb * FEATURES + 128 * v
+                ops = 128 * self.k // PF_BYTES
+                if iw == 0:
+                    if lane < ops:
+                        prefetch_bytes(w_addr + Int64(row0 * self.k + lane * PF_BYTES),
+                                       PF_BYTES)  # fmt: skip
+                    if lane == ops:
+                        span = 128 * (self.k // SF_VEC)
+                        prefetch_bytes(sfw_addr + Int64((row0 // 128) * span), span)
             gA_s = tAgA[(None, mb, None, 0)]
             gSFA_s = tAgSFA[(None, mb, None, 0)]
             prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
