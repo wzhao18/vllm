@@ -88,16 +88,25 @@ SP_PARTIALS = PROJECTED
 #   MlaQuery 17.2  17.4  23.7  32.3  33.4  52.5  72.4  93.1
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
-SP_LOCAL_QUERY = "65-:local"
+# Off at every R until dsa.query_uk is fixed: in the first block run after other
+# kernels (or a graph capture) it intermittently writes wrong q_pe bytes of row tile
+# 1 for a few heads on one rank, with its inputs bit-identical (the SP DSA block
+# test's replay check, INFRA 2026-11-20). Was "65-:local".
+SP_LOCAL_QUERY = ""
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere): the
 # Rubin keys-on-M kernel ("km", dsa.sparse_mla_km: softmax groups correct O^T and
-# write the latent, QK and PV from separate warps, all-TMA gathers) where it wins
-# standalone (VR200, 1 GPU, CUDA graphs, cold L2, 512 local keys per row, 4 rows per
-# request sharing 80% of their keys; runs/D-ATTN/sp kmhE): 128 rows 16.0 vs 20.6 us,
-# 384 rows 31.1 vs 34.0; trtllm-gen at 256 rows (29.2 vs 27.4). In-step (D3-32 slice,
-# 3 runs each, dattn-kmg/kmh) km wins at 384 rows (step -14 us) but not at 128 rows
-# (step +19 us although the DSA family drops 15 us), so km runs from 320 rows.
-SP_KERNELS = "320-:km"
+# write the latent, QK and PV from separate warps, all-TMA gathers; one row per
+# persistent CTA and SM, its LSE written directly) where it wins. VR200 (212 SMs),
+# 1 GPU, CUDA graphs, cold L2, 512 +- 40 local keys per row, 4 rows per request
+# sharing 80% of their keys (runs/D-ATTN-SK/r2xo2), km vs trtllm-gen us (trtllm-gen
+# also runs ComputeLSEFromMD, ~1.1 us):
+#   rows        64    96   128   160   192   212   224   256   320
+#   km        15.1  15.4  16.0  16.8  18.3  18.4  28.7  29.1  29.9
+#   trtllm    13.7  15.6  22.1  22.8  23.1  23.1  27.4  28.4  29.8
+# km is flat up to one row per SM; trtllm-gen steps at ~106 rows, km at 213 (two
+# rows on some CTAs). In-step (D3-32 slice, fastab dsk2-km65): 128 rows -29.5 us per
+# step, 256 rows +11.9; 384 rows: km since dattn-kmg/kmh (step -14 us).
+SP_KERNELS = "107-212:km,320-:km"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 

@@ -555,145 +555,160 @@ class IndexerScore:
         tAcc = cute.make_tensor(tmem_ptr, acc_fake.layout)
         cute.arch.griddepcontrol_wait()
         n_items = n_items_t[0]
-
-        if warp == PRODUCER:
-            thr_mma = mma.get_slice(0)
-            gK = cute.local_tile(
-                mK, cute.slice_(self.tiler, (None, 0, None)), (None, None, None)
-            )
-            tKs, tKg = cpasync.tma_partition(
-                tma_k,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sA, 0, 3),
-                cute.group_modes(thr_mma.partition_A(gK), 0, 3),
-            )
-            kv_it = Int32(0)
-            jq = Int32(0)
-            for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
-                token0 = items[item, 0]
-                ntok = items[item, 1]
-                key0 = items[item, 2]
-                ntiles = items[item, 3]
-                qs = jq % Q_STAGES
-                cute.arch.mbarrier_wait(q_empty + qs, ((jq // Q_STAGES) & 1) ^ 1)
-                # row ends, head weights, query scales (SF atom order)
-                if lane < BQ:
-                    e = Int32(0)
-                    if lane < ntok:
-                        e = row_len[token0 + lane]
-                    st_shared_u32(end_a + (qs * BQ + lane) * 4, Uint32(e))
-                for i in cutlass.range_constexpr(4):
-                    wi = lane * 4 + i  # BQ * 16 = 128 words
-                    tok = wi // 16
-                    v = Uint32(0)
-                    if tok < ntok:
-                        v = Uint32(weights[token0 + tok, wi % 16])
-                    st_shared_u32(w_a + (qs * BQ * 16 + wi) * 4, v)
-                for c in cutlass.range_constexpr(N // 128):
-                    words = []
-                    for i in cutlass.range_constexpr(4):
-                        r = c * 128 + 32 * i + lane
-                        v = Uint32(0)
-                        if r // HEADS < ntok:
-                            v = Uint32(q_sf[token0 * HEADS + r])
-                        words.append(v)
-                    st_shared_v4(
-                        sfb_a + (qs * SF_WORDS_B + c * 128 + 4 * lane) * 4, *words
-                    )
-                fence_async_shared()
-                cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(q_full + qs, self.q_bytes)
-                gQ = cute.local_tile(
-                    cute.domain_offset((token0 * HEADS, 0, 0), mQ),
-                    cute.slice_(self.tiler, (0, None, None)),
-                    (None, None, None),
-                )
-                tQs, tQg = cpasync.tma_partition(
-                    tma_q,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sB, 0, 3),
-                    cute.group_modes(thr_mma.partition_B(gQ), 0, 3),
-                )
-                cute.copy(tma_q, tQg[(None, 0, 0, 0)], tQs[(None, qs)], tma_bar_ptr=q_full + qs)
-                jq += 1
-                # an even tile count (the epilogue takes the two accumulator stages
-                # per step): an odd count repeats the newest tile, fully masked
-                ntp = ntiles + (ntiles & 1)
-                for tt in cutlass.range(ntp, unroll=1):
-                    t = cutlass.min(ntp - 1 - tt, ntiles - 1)
-                    stage = kv_it % KV_STAGES
-                    cute.arch.mbarrier_wait(kv_empty + stage, ((kv_it // KV_STAGES) & 1) ^ 1)
-                    k_first = key0 + t * TILE
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            kv_full + stage, self.k_bytes + TILE * 4
-                        )
-                        bulk_g2s(
-                            sfa_a + stage * SF_WORDS_A * 4,
-                            k_sf.iterator.toint() + Int64(k_first) * 4,
-                            kv_full + stage,
-                            TILE * 4,
-                        )
-                    cute.copy(
-                        tma_k,
-                        tKg[(None, k_first // TILE, 0, 0)],
-                        tKs[(None, stage)],
-                        tma_bar_ptr=kv_full + stage,
-                    )
-                    kv_it += 1
-        elif warp == MMA_WARP:
-            tCrA = mma.make_fragment_A(sA)
-            tCrB = mma.make_fragment_B(sB)
-            sfa_ptr = cute.recast_ptr(tmem_ptr + ACC_STAGES * N, dtype=sf_t)
-            sfb_ptr = cute.recast_ptr(tmem_ptr + ACC_STAGES * N + self.sfa_cols, dtype=sf_t)
-            tCtSFA = cute.make_tensor(sfa_ptr, tsfa_layout)
-            tCtSFB = cute.make_tensor(sfb_ptr, tsfb_layout)
-            s2t_a = self.s2t(sSFA, tCtSFA)
-            s2t_b = self.s2t(sSFB, tCtSFB)
-            kv_it = Int32(0)
-            acc_it = Int32(0)
-            jq = Int32(0)
-            for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
-                ntiles = items[item, 3]
-                qs = jq % Q_STAGES
-                cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
-                cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, qs)], s2t_b[2])
-                for _t in cutlass.range(ntiles + (ntiles & 1), unroll=1):
-                    stage = kv_it % KV_STAGES
-                    a = acc_it % ACC_STAGES
-                    cute.arch.mbarrier_wait(acc_empty + a, ((acc_it // ACC_STAGES) & 1) ^ 1)
-                    cute.arch.mbarrier_wait(kv_full + stage, (kv_it // KV_STAGES) & 1)
-                    cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, stage)], s2t_a[2])
-                    mma.set(tcgen05.Field.ACCUMULATE, False)
-                    for kb in cutlass.range_constexpr(
-                        cute.size(tCrA, mode=[2]) if self.epi not in (4, 6) else 0
-                    ):
-                        cute.gemm(
-                            mma,
-                            tAcc[(None, None, None, a)],
-                            [tCrA[(None, None, kb, stage)], tCtSFA[(None, None, kb)]],
-                            [tCrB[(None, None, kb, qs)], tCtSFB[(None, None, kb)]],
-                            tAcc[(None, None, None, a)],
-                        )
-                        mma.set(tcgen05.Field.ACCUMULATE, True)
-                    with cute.arch.elect_one():
-                        tcgen05.commit(kv_empty + stage)
-                        tcgen05.commit(acc_full + a)
-                    kv_it += 1
-                    acc_it += 1
-                with cute.arch.elect_one():
-                    tcgen05.commit(q_empty + qs)
-                jq += 1
-        else:
+        if warp < PRODUCER:
             self.epilogue(
                 tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
                 logits, row_bin, (end_a, w_a, st.hist.data_ptr().toint(), st.wscan.data_ptr().toint()),
                 warp, tidx, bid,
                 lane,
             )
+        else:
+            if warp == PRODUCER:
+                thr_mma = mma.get_slice(0)
+                gK = cute.local_tile(
+                    mK, cute.slice_(self.tiler, (None, 0, None)), (None, None, None)
+                )
+                tKs, tKg = cpasync.tma_partition(
+                    tma_k,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sA, 0, 3),
+                    cute.group_modes(thr_mma.partition_A(gK), 0, 3),
+                )
+                # running K ring slot and phase (no div/mod chains per tile: this
+                # warp shares its scheduler with four issue-bound epilogue warps)
+                kv_stage = Int32(0)
+                kv_ph = Int32(0)
+                jq = Int32(0)
+                for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
+                    token0 = items[item, 0]
+                    ntok = items[item, 1]
+                    key0 = items[item, 2]
+                    ntiles = items[item, 3]
+                    qs = jq % Q_STAGES
+                    cute.arch.mbarrier_wait(q_empty + qs, ((jq // Q_STAGES) & 1) ^ 1)
+                    # row ends, head weights, query scales (SF atom order)
+                    if lane < BQ:
+                        e = Int32(0)
+                        if lane < ntok:
+                            e = row_len[token0 + lane]
+                        st_shared_u32(end_a + (qs * BQ + lane) * 4, Uint32(e))
+                    for i in cutlass.range_constexpr(4):
+                        wi = lane * 4 + i  # BQ * 16 = 128 words
+                        tok = wi // 16
+                        v = Uint32(0)
+                        if tok < ntok:
+                            v = Uint32(weights[token0 + tok, wi % 16])
+                        st_shared_u32(w_a + (qs * BQ * 16 + wi) * 4, v)
+                    for c in cutlass.range_constexpr(N // 128):
+                        words = []
+                        for i in cutlass.range_constexpr(4):
+                            r = c * 128 + 32 * i + lane
+                            v = Uint32(0)
+                            if r // HEADS < ntok:
+                                v = Uint32(q_sf[token0 * HEADS + r])
+                            words.append(v)
+                        st_shared_v4(
+                            sfb_a + (qs * SF_WORDS_B + c * 128 + 4 * lane) * 4, *words
+                        )
+                    fence_async_shared()
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(q_full + qs, self.q_bytes)
+                    gQ = cute.local_tile(
+                        cute.domain_offset((token0 * HEADS, 0, 0), mQ),
+                        cute.slice_(self.tiler, (0, None, None)),
+                        (None, None, None),
+                    )
+                    tQs, tQg = cpasync.tma_partition(
+                        tma_q,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sB, 0, 3),
+                        cute.group_modes(thr_mma.partition_B(gQ), 0, 3),
+                    )
+                    cute.copy(tma_q, tQg[(None, 0, 0, 0)], tQs[(None, qs)], tma_bar_ptr=q_full + qs)
+                    jq += 1
+                    # an even tile count (the epilogue takes the two accumulator stages
+                    # per step): an odd count repeats the newest tile, fully masked
+                    ntp = ntiles + (ntiles & 1)
+                    # key bases are 128-aligned (plan): tile coordinates add up
+                    kt0 = key0 >> 7
+                    for tt in cutlass.range(ntp, unroll=1):
+                        t = cutlass.min(ntp - 1 - tt, ntiles - 1)
+                        cute.arch.mbarrier_wait(kv_empty + kv_stage, kv_ph ^ 1)
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                kv_full + kv_stage, self.k_bytes + TILE * 4
+                            )
+                            bulk_g2s(
+                                sfa_a + kv_stage * SF_WORDS_A * 4,
+                                k_sf.iterator.toint() + Int64(key0 + t * TILE) * 4,
+                                kv_full + kv_stage,
+                                TILE * 4,
+                            )
+                        cute.copy(
+                            tma_k,
+                            tKg[(None, kt0 + t, 0, 0)],
+                            tKs[(None, kv_stage)],
+                            tma_bar_ptr=kv_full + kv_stage,
+                        )
+                        kv_stage += 1
+                        if kv_stage == KV_STAGES:
+                            kv_stage = Int32(0)
+                            kv_ph = kv_ph ^ 1
+            elif warp == MMA_WARP:
+                tCrA = mma.make_fragment_A(sA)
+                tCrB = mma.make_fragment_B(sB)
+                sfa_ptr = cute.recast_ptr(tmem_ptr + ACC_STAGES * N, dtype=sf_t)
+                sfb_ptr = cute.recast_ptr(tmem_ptr + ACC_STAGES * N + self.sfa_cols, dtype=sf_t)
+                tCtSFA = cute.make_tensor(sfa_ptr, tsfa_layout)
+                tCtSFB = cute.make_tensor(sfb_ptr, tsfb_layout)
+                s2t_a = self.s2t(sSFA, tCtSFA)
+                s2t_b = self.s2t(sSFB, tCtSFB)
+                # running K ring slot / phase and accumulator phase: items have an
+                # even tile count, so the accumulator stages go 0, 1 per tile pair
+                kv_stage = Int32(0)
+                kv_ph = Int32(0)
+                acc_ph = Int32(0)
+                jq = Int32(0)
+                for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
+                    ntiles = items[item, 3]
+                    qs = jq % Q_STAGES
+                    cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
+                    cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, qs)], s2t_b[2])
+                    for _p in cutlass.range((ntiles + 1) // 2, unroll=1):
+                        for a in cutlass.range_constexpr(ACC_STAGES):
+                            cute.arch.mbarrier_wait(acc_empty + a, acc_ph ^ 1)
+                            cute.arch.mbarrier_wait(kv_full + kv_stage, kv_ph)
+                            cute.copy(
+                                s2t_a[0], s2t_a[1][(None, None, None, None, kv_stage)],
+                                s2t_a[2],
+                            )
+                            mma.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(
+                                cute.size(tCrA, mode=[2]) if self.epi not in (4, 6) else 0
+                            ):
+                                cute.gemm(
+                                    mma,
+                                    tAcc[(None, None, None, a)],
+                                    [tCrA[(None, None, kb, kv_stage)],
+                                     tCtSFA[(None, None, kb)]],
+                                    [tCrB[(None, None, kb, qs)], tCtSFB[(None, None, kb)]],
+                                    tAcc[(None, None, None, a)],
+                                )
+                                mma.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(kv_empty + kv_stage)
+                                tcgen05.commit(acc_full + a)
+                            kv_stage += 1
+                            if kv_stage == KV_STAGES:
+                                kv_stage = Int32(0)
+                                kv_ph = kv_ph ^ 1
+                        acc_ph = acc_ph ^ 1
+                    with cute.arch.elect_one():
+                        tcgen05.commit(q_empty + qs)
+                    jq += 1
 
         cute.arch.sync_threads()
         if warp == MMA_WARP:
@@ -826,13 +841,35 @@ class IndexerScore:
                     key_in_tile, hist0, hist1,
                 )
                 ph = ph ^ 1
-            for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
-                ptr0, ptr1, p0, p1 = self.tile_pair(
-                    False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
-                    w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
-                    key_in_tile, hist0, hist1,
+            if cutlass.const_expr(self.mode >= PUBLISH and self.epi == 0):
+                # interior pairs, rotated: a stage's second half is finished in the
+                # next block; the carry starts as NaN sums (nothing published)
+                hc = cute.make_rmem_tensor((HEADS,), Float32)
+                sc = cute.make_rmem_tensor((4,), Uint32)
+                for i in cutlass.range_constexpr(HEADS):
+                    hc[i] = Float32(0.0)
+                for i in cutlass.range_constexpr(4):
+                    sc[i] = Uint32(0x7FC07FC0)
+                tc = Int32(0)
+                for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
+                    p0, p1, tc = self.pair_rot(
+                        ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, w, p0, p1,
+                        thr, lim0, lim1, hc, sc, tc,
+                    )
+                    ph = ph ^ 1
+                p0 = cutlass.min(p0, lim0)
+                p1 = cutlass.min(p1, lim1)
+                p0, p1 = self.stage_tail(
+                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tc, p0, p1, thr
                 )
-                ph = ph ^ 1
+            else:
+                for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
+                    ptr0, ptr1, p0, p1 = self.tile_pair(
+                        False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
+                        w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
+                        key_in_tile, hist0, hist1,
+                    )
+                    ph = ph ^ 1
             if cutlass.const_expr(self.mode >= PUBLISH):
                 # this thread's candidate counts of both rows
                 # (a full column counts as overflowed: the row is recomputed)
@@ -918,6 +955,48 @@ class IndexerScore:
                 red_shared(hist0 + (bfe(r, 5, 11) << Uint32(2)), 1)
                 red_shared(hist1 + (r >> Uint32(21) << Uint32(2)), 1)
         return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
+
+    @cute.jit
+    def stage_tail(self, h1, w, ss, t, p0, p1, thr):
+        """Heads 16-31 of a stage (h1) into its running sums, then publish both
+        tokens' logits of tile t."""
+        ss = self.reduce_half(h1, w, ss, HEADS // 2)
+        r = self.combine2(ss)
+        return publish2(p0, p1, r, thr, Uint32(t) << Uint32(16))
+
+    @cute.jit
+    def pair_rot(self, t_hi, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
+                 hc, sc, tc):
+        """One interior tile pair, rotated: after each stage's barrier wait and its
+        first loads, finish the previous stage (the carry hc / sc / tc for stage 0, the
+        pair's own stage 0 for stage 1); returns with stage 1's second half (heads
+        16-31, loaded) and first-half sums in the carry."""
+        p0 = cutlass.min(p0, lim0)
+        p1 = cutlass.min(p1, lim1)
+        hp = [hc[i] for i in range(HEADS)]
+        sp = [[sc[0], sc[1]], [sc[2], sc[3]]]
+        tp = tc
+        for st in cutlass.range_constexpr(ACC_STAGES):
+            col = tmem_q + st * N
+            cute.arch.mbarrier_wait(acc_full + st, ph)
+            h0 = (*tmem_ld16(col), *tmem_ld16(col + HEADS))
+            p0, p1 = self.stage_tail(hp, w, sp, tp, p0, p1, thr)
+            h0 = tmem_wait_n(*h0)
+            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
+            ss = self.reduce_half(h0, w, None, 0)
+            h1 = tmem_wait_n(*h1)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(acc_empty + st)
+            hp = h1
+            sp = ss
+            tp = t_hi - st
+        for i in cutlass.range_constexpr(HEADS):
+            hc[i] = hp[i]
+        sc[0] = sp[0][0]
+        sc[1] = sp[0][1]
+        sc[2] = sp[1][0]
+        sc[3] = sp[1][1]
+        return p0, p1, tp
 
     @cute.jit
     def reduce_half(self, buf, w, ss, h0: cutlass.Constexpr):
