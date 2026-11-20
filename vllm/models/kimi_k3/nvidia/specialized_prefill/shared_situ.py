@@ -112,6 +112,16 @@ class PrefillSharedSitu:
                         dtype=torch.bfloat16) * 0.5  # fmt: skip
         self._fake = mxfp8_e4m3_quantize(y, is_sf_swizzled_layout=True)
         del y
+        # CALIBRATION LOAD (cal branch, never landed): a BF16 GEMM of known
+        # at-cap energy (16384 x 3584 x 7168, the latent-down shape) in the
+        # family's place, to measure the step's energy->time conversion at
+        # this position independently of any gate_up implementation.
+        self._cal_x = torch.randn((16384, w.shape[1]), generator=g,
+                                  device=w.device, dtype=torch.bfloat16)  # fmt: skip
+        self._cal_w = torch.randn((3584, w.shape[1]), generator=g,
+                                  device=w.device, dtype=torch.bfloat16) * 0.02  # fmt: skip
+        self._cal_out = torch.empty((16384, 3584), device=w.device,
+                                    dtype=torch.bfloat16)  # fmt: skip
 
     def fused(self, x):
         """down_proj's MXFP8 input for a prefill-sized batch, else None."""
@@ -139,6 +149,7 @@ class PrefillSharedSitu:
 
         fq, fs = self._fake
         assert rows <= fq.shape[0], rows
+        torch.mm(self._cal_x[:rows], self._cal_w.t(), out=self._cal_out[:rows])
         nsc = (rows + 127) // 128 * 128 * (self.inter // 32)
         return QuantizedActivation(
             data=fq[:rows],
