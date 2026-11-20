@@ -86,12 +86,13 @@ def test_pre_graph_chain():
         with torch.cuda.graph(g):
             for p, o in zip(projs, outs):
                 p.run(q, o)
-        x.copy_(torch.randn_like(x, dtype=torch.float32).bfloat16())
-        q = projs[0].input.quantize(x)
-        g.replay()
-        torch.cuda.synchronize()
-        for (wq, sw), o in zip(weights, outs):
-            assert torch.equal(o, scaled_mm(q.data, q.scale, wq, sw)), r
+        for _ in range(2):  # replays reuse the die-claim counters (reset by the last CTA)
+            x.copy_(torch.randn_like(x, dtype=torch.float32).bfloat16())
+            q = projs[0].input.quantize(x)
+            g.replay()
+            torch.cuda.synchronize()
+            for (wq, sw), o in zip(weights, outs):
+                assert torch.equal(o, scaled_mm(q.data, q.scale, wq, sw)), r
 
 
 def test_pre_rejects():

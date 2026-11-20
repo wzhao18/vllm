@@ -220,6 +220,21 @@ class Mxfp8PreGemm:
         return aux
 
 
+def pair_claim_split(n: int, rows: int, tactic, device) -> int | None:
+    """Die-0 weight tiles of the die-matched pair claim, or None: a swap_ab 2x1 tactic whose
+    rows span >= 2 activation tiles claims (weight tile, activation tile) items per die so
+    the clusters sharing a weight tile run on one die (GEMM-EX1 p1: kda_in R384 swap
+    256x192 15.80 -> 15.18 us/call, bitwise); split by the SMs per die."""
+    tile, cluster, swap = tactic[0], tactic[1], tactic[2]
+    if not swap or tuple(cluster) != (2, 1) or -(-rows // tile[1]) < 2:
+        return None
+    from ...common.dies import sm_domains
+
+    table = sm_domains(device.index or 0)
+    share = sum(1 for d in table if d == 0) / len(table)
+    return round(-(-n // tile[0]) * share)
+
+
 def m128x2_weight_scales(ws: torch.Tensor) -> torch.Tensor:
     """F8_128x4 weight scales + the same atoms with the two 8 B halves of every 16 B lane
     row swapped (rows 64-127 of each 128-row atom first): the m128x2 tactic loads SFB rows

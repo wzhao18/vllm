@@ -240,11 +240,12 @@ class Mxfp8Projection:
                 found = pre_tactic(n, k, r)
                 if found is None:
                     raise Unsupported(family, r, f"pre: no tactic for [{n}, {k}]")
-                from .sm107.prewait import Mxfp8PreGemm
+                from .sm107.prewait import Mxfp8PreGemm, pair_claim_split
 
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
                     max_stages=found[2], device=weight.device,
+                    die_split=pair_claim_split(n, r, found[0], weight.device),
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
