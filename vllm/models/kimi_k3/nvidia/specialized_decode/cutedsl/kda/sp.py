@@ -85,11 +85,11 @@ SP_SPEC_SCHEDULE = {24: ""}
 REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
-KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "chain")
+KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "flowp", "chain")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide", "flow", "chain", "ring")
-DIE_KINDS = ("flow", "ring")  # die-matched items, MXFP8 outputs
+FOLDS = ("fused", "fused_ws", "wide", "flow", "flowp", "chain", "ring")
+DIE_KINDS = ("flow", "flowp", "ring")  # die-matched items, MXFP8 outputs
 MODES = ("deferred", "triton", "none")
 
 
@@ -172,7 +172,7 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFusedWS's shared memory does not fit")
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
-    if kind in ("flow", "chain", "ring"):
+    if kind in ("flow", "flowp", "chain", "ring"):
         if not record or not 2 <= tokens <= 4:
             cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
             raise Unsupported("kda", shape, cause)
@@ -191,6 +191,13 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
                 raise Unsupported("kda", shape, "KdaRing's shared memory does not fit")
             return ring.KdaRing(heads, tokens, mode, has_bias, *streamed, ctas,
                                 dies="dies" in options, mx="mx" in options)  # fmt: skip
+        if kind == "flowp":
+            if "dies" in options:
+                raise Unsupported("kda", shape, "KdaFlowP: no die-matched items")
+            if flow.shared_bytes_p(tokens, streamed[1], conv_size) > budget:
+                raise Unsupported("kda", shape, "KdaFlowP's shared memory does not fit")
+            return flow.KdaFlowP(heads, tokens, mode, has_bias, *streamed, ctas, stages,
+                                 mx="mx" in options)  # fmt: skip
         if kind == "chain":
             if len(specs) != 20:  # with the record rows, pending counts, scratch
                 raise Unsupported("kda", shape, "KdaChain runs deferred records only")

@@ -213,7 +213,7 @@ class KdaChain(KdaFlow):
             pt = zeros(6, Int64)
             self.prep_item(args, 0, tid, 0, slot, pending, conv_offset, raw, hc,
                            (convs[0, None, None], xs, gs, kgs, uss), ops, (sums,),
-                           kgo, pt, po)  # fmt: skip
+                           kgo, pt, po, 0)  # fmt: skip
             if tid == 0:  # the window (fenced and synced by the prep)
                 dim: cutlass.Constexpr = self.heads * K
                 part_bytes: cutlass.Constexpr = K * self.window * conv_type.width // 8

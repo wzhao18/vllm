@@ -217,6 +217,9 @@ def main():
     p.add_argument("--fence", type=int, default=0, help="KdaFlow fold fence interval")
     p.add_argument("--noprefetch", action="store_true", help="KdaFlow no prefetch")
     p.add_argument("--slots", type=int, default=0, help="KdaFlow page slots")
+    p.add_argument("--regs", default="", help="KdaFlowP setmaxnreg scan,prep")
+    p.add_argument("--rolled", action="store_true", help="KdaFlow runtime scan chunk loop")
+    p.add_argument("--switch", action="store_true", help="KdaFlowP setmaxnreg switch probe")
     p.add_argument("--gap", type=int, default=0, help="non-PDL neighbour per layer (<0: alone)")
     p.add_argument("--pending", type=int, default=0, help="pending tokens (0: 1..Q)")
     p.add_argument("--place", nargs="+", default=["striped"])
@@ -249,6 +252,18 @@ def main():
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.SLOTS = a.slots
+    if a.switch:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.SWITCH_PROBE = True
+    if a.rolled:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.SCAN_ROLLED = True
+    if a.regs:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
+
+        flow.SCAN_REGS, flow.PREP_REGS = map(int, a.regs.split(","))
     if a.skip:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 

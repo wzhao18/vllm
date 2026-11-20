@@ -43,8 +43,8 @@ def core_of(kind, attention, rows, records, caches):
 
 @pytest.mark.parametrize(
     "kind",
-    ["flow", "chain", "flow-local", "ring", "ring-local"],
-    ids=["flow", "chain", "flow_die_local", "ring", "ring_die_local"],
+    ["flow", "flowp", "chain", "flow-local", "ring", "ring-local"],
+    ids=["flow", "flowp", "chain", "flow_die_local", "ring", "ring_die_local"],
 )
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
@@ -190,10 +190,12 @@ def test_flow_mxfp8_output_is_act_quant_of_bf16():
     assert mismatch == 0, f"{mismatch} scale bytes differ"
 
 
+@pytest.mark.parametrize("other", ["ring", "flowp"])
 @pytest.mark.parametrize("mx", [False, True], ids=["bf16", "mxfp8"])
 @pytest.mark.parametrize("n", [3, 33, 96])
-def test_ring_is_bitwise_flow(n, mx):
-    """KdaRing (register page stream, prep / tail warps) computes KdaFlow's
+def test_core_is_bitwise_flow(n, mx, other):
+    """KdaRing (register page stream, prep / tail warps) and KdaFlowP (prep
+    warpgroup) compute KdaFlow's
     operations in KdaFlow's order: outputs, checkpoints, conv windows and records
     bit for bit, over steps that fold pending commits."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (
@@ -214,7 +216,7 @@ def test_ring_is_bitwise_flow(n, mx):
         ),
     )
     runs = []
-    for kind in ("flow", "ring"):
+    for kind in ("flow", other):
         layer = kda.layer()  # the same weights, their own records
         layer.deferred_recoverssm = True
         caches = [t.clone() for t in kv]
