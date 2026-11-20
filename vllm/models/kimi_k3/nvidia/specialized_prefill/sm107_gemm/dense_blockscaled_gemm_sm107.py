@@ -708,6 +708,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.occupancy,
             self.enable_breuse,
         )
+        # vLLM probe: cap the A/B ring depth (tactic flag ab<N>).
+        ab_cap = getattr(self, "ab_stage_cap", 0)
+        if ab_cap and self.num_ab_stage > ab_cap:
+            self.num_ab_stage = ab_cap
 
         if getattr(self, "epi_staged", False):
             self._restage_full_c(tiled_mma)
@@ -2234,6 +2238,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 ):
                     # vLLM S2: dense shared gate_up (no latent tiles), 8-warp
                     # drain-and-release SiTU + MXFP8 epilogue.
+                    # A swizzled raster pads the cluster grid to a multiple of
+                    # the swizzle: the padded N tiles are computed from
+                    # zero-filled operands and must not store (row-major Q
+                    # would wrap them into the next rows); 0 rows = no stores.
+                    q_rows = mQ_mnl.shape[0]
+                    if mma_tile_coord_mnl[1] >= cute.size(mQ_mnl, mode=[1]) // 256:
+                        q_rows = cutlass.Int32(0)
                     acc_consumer_state = epilogue_situ_mxfp8_drain(
                         self,
                         tidx,
@@ -2246,13 +2257,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         self.situ_a_pow,
                         self.situ_clamp_up,
                         mma_tile_coord_mnl,
-                        mQ_mnl.shape[0],
+                        q_rows,
                         acc_consumer_state,
                         acc_pipeline,
                         getattr(self, "epi_drain_skel", 0),
                         getattr(self, "epi_yield", 0),
                         getattr(self, "epi_x2", False),
                         getattr(self, "epi_tanh", False),
+                        getattr(self, "epi_roll", 0),
+                        getattr(self, "epi_store", 0),
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:

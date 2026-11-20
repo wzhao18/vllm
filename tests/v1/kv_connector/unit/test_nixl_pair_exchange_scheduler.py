@@ -188,6 +188,7 @@ def _pulled_units(
     recv = output.kv_connector_metadata.reqs_to_recv[req_id]
     assert recv.remote is not None
     worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
     pulled = [
         worker._apply_dcp_prefix_caching(
             list(recv.local_block_ids[group]),
@@ -669,15 +670,17 @@ def test_prefiller_skew_stops_the_decoder(skew: str):
         ("true", P_DCP, False),
         # Same DCP size: the pull places tokens as the decoder reads them.
         (True, D_DCP, True),
-        # A quarter of the DCP size: the handshake rejects the peer.
-        (True, P_DCP // 2, True),
+        # Not this DCP size over a power of two: the handshake rejects the peer.
+        (True, 3, True),
+        (True, 2 * D_DCP, True),
     ],
 )
 def test_no_plan_outside_pair_mode(
     opt_in: object, remote_dcp_size: int, pair_mode: bool
 ):
-    """Without the opt-in, or for a peer that is not half this DCP size, the
-    connector state and metadata stay as they are without pair mode."""
+    """Without the opt-in, or for a peer whose DCP size is not this one over a
+    power of two, the connector state and metadata stay as they are without
+    pair mode."""
     engine = _Engine(_make_scheduler(opt_in=opt_in))
     assert engine.nixl._pair_mode is pair_mode
     request = _pull_request(1, 3 * P_BLOCK + 1, remote_dcp_size=remote_dcp_size)
