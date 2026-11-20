@@ -85,9 +85,21 @@ class LatentUpTmem(SplitKTmemGemm64):
     CTAs to pass re-arms the pair for the next call. Everything the epilogue reads
     is causally after that acquire (x warp -> x barriers -> MMA warp -> epilogue)."""
 
-    def __init__(self, *, tactic: SplitKTactic, k: int, reduce_split: int):
+    def __init__(
+        self, *, tactic: SplitKTactic, k: int, reduce_split: int, tmem_tiles=None
+    ):
         super().__init__(tactic=tactic, k=k, owners=OWNERS, max_smem=MAX_SMEM)
         self.reduce_split = reduce_split
+        if tmem_tiles is not None and tmem_tiles != self.tmem_tiles:
+            # Fewer A tiles staged through tcgen05.cp, more in shared memory.
+            assert 1 <= tmem_tiles <= self.tmem_tiles
+            self.tmem_tiles = tmem_tiles
+            self.smem_tiles = self.k_tiles - tmem_tiles
+            data = self.smem_tiles * 128 * 64 * 2 + self.slots * self.b_tile
+            assert data >= self.tile_offset + self.n * self.share * 4
+            barriers = (2 * self.num_ab_stage + 2 * self.k_tiles + 6) * 8 + 4
+            self.smem_bytes = max((data + barriers + 2048 + 1023) // 1024 * 1024, 170 << 10)
+            assert self.smem_bytes <= MAX_SMEM, self.smem_bytes
 
     @cute.experimental.kernel
     def kernel(
@@ -177,13 +189,14 @@ class LatentUpTmem(SplitKTmemGemm64):
 
 
 def tactic_for(rows):
-    """(128, N tile, split, x's slots) for ``rows`` tokens, or None (no tactic)."""
+    """(128, N tile, split, x's slots, tensor-memory A tiles (None: all that fit))
+    for ``rows`` tokens, or None (no tactic)."""
     if rows <= 64:  # 18 x 8 KB slots (+ 5 A tiles in shared memory): 224 KB
-        return (128, 64, SPLIT, 18)
+        return (128, 64, SPLIT, 18, None)
     if rows <= 96:  # 16 x 12 KB slots (+ 6 A tiles): 288 KB
-        return (128, 96, SPLIT, 16)
+        return (128, 96, SPLIT, 16, None)
     if rows <= 128:  # 11 x 16 KB slots (+ 7 A tiles): 288 KB
-        return (128, 128, SPLIT, 11)
+        return (128, 128, SPLIT, 11, None)
     return None
 
 
@@ -197,7 +210,10 @@ def compile_latent_up(tactic, k, reduce_split, arch):
         return make_fake_tensor(dtype, shape, stride, assumed_align=16)
 
     assert tactic[1] in N_TILES
-    kernel = LatentUpTmem(tactic=SplitKTactic(*tactic), k=k, reduce_split=reduce_split)
+    kernel = LatentUpTmem(
+        tactic=SplitKTactic(*tactic[:4]), k=k, reduce_split=reduce_split,
+        tmem_tiles=tactic[4],
+    )
     y = fake(0)
     sync = make_fake_tensor(cutlass.Int32, (2,), (1,), assumed_align=8)
     args = (fake(1), fake(1), y, sync, cutlass.Int64(0), make_fake_stream())
@@ -209,7 +225,7 @@ class PreparedLatentUp:
     returns ``residual``), for the prepared row counts; ``reduce_split``: the
     reduce's CTAs per row (its arrivals per row on the ``sync`` pair)."""
 
-    def __init__(self, weight: torch.Tensor, rows, reduce_split: int):
+    def __init__(self, weight: torch.Tensor, rows, reduce_split: int, tactics=None):
         if weight.dtype != torch.bfloat16 or weight.dim() != 2:
             raise ValueError(f"latent_up weight {tuple(weight.shape)} {weight.dtype}")
         n, k = weight.shape
@@ -222,6 +238,7 @@ class PreparedLatentUp:
         if missing:
             raise ValueError(f"latent_up rows without a tactic: {missing}")
         self.weight, self.rows, self.reduce_split = weight, tuple(rows), reduce_split
+        self.tactics = {r: tactic_for(r) for r in self.rows} | dict(tactics or {})
         self.weight_view = matrix_view(weight)
         self.kernels, self.map = {}, None
 
@@ -232,7 +249,7 @@ class PreparedLatentUp:
     def prepare(self):
         arch, k = architecture(self.weight.device), self.weight.shape[1]
         with torch.accelerator.device_index(self.weight.device.index):
-            for tactic in {tactic_for(r) for r in self.rows}:
+            for tactic in set(self.tactics.values()):
                 self.kernels[tactic] = compile_latent_up(tactic, k, self.reduce_split, arch)
             self.map = weight_map(self.weight, 128)
         return self
@@ -241,7 +258,7 @@ class PreparedLatentUp:
         self, x: torch.Tensor, residual: torch.Tensor, sync: torch.Tensor
     ) -> torch.Tensor:
         rows = x.shape[0]
-        code = self.kernels.get(tactic_for(rows))
+        code = self.kernels.get(self.tactics.get(rows, tactic_for(rows)))
         if code is None or x.shape[1] != self.weight.shape[1]:
             raise ValueError(f"latent_up input {tuple(x.shape)}: prepared {self.rows}")
         if residual.shape != (rows, self.weight.shape[0]) or residual.stride(1) != 1:

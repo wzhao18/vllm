@@ -31,6 +31,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import asm
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.latent_up import (
     PreparedLatentUp,
+    tactic_for,
 )
 
 
@@ -96,6 +97,10 @@ def main():
     p.add_argument("--iters", type=int, default=12)
     p.add_argument("--reps", type=int, default=30)
     p.add_argument("--json", default=None)
+    p.add_argument(
+        "--variants", default="",
+        help="extra tactics n:slots:tmem_tiles (comma list), timed beside the default",
+    )
     a = p.parse_args()
     dev = torch.device("cuda")
     n, k = 7168, 3584
@@ -118,7 +123,20 @@ def main():
     for t in (int(v) for v in a.tokens.split(",")):
         x = torch.randn(t, k, device=dev, dtype=torch.bfloat16)
         res = [torch.randn(t, n, device=dev, dtype=torch.bfloat16) for _ in range(a.copies)]
-        ups = [PreparedLatentUp(w, (t,), reduce_split=4).prepare() for w in ws]
+        base_tactic = tactic_for(t)
+        variants = {"tmem": base_tactic}
+        for v in filter(None, a.variants.split(",")):
+            vn, vs, vt = (int(f) for f in v.split(":"))
+            if vn == base_tactic[1]:
+                variants[f"tmem_{vn}_{vs}_{vt}"] = (128, vn, base_tactic[2], vs, vt)
+        ups_by = {
+            key: [
+                PreparedLatentUp(w, (t,), reduce_split=4, tactics={t: tac}).prepare()
+                for w in ws
+            ]
+            for key, tac in variants.items()
+        }
+        ups = ups_by["tmem"]
         # correctness vs stock on copy 0
         ref = res[0].clone().addmm_(x, ws[0].t())
         out = res[0].clone()
@@ -131,9 +149,9 @@ def main():
         def body(op, with_spin):
             def fn():
                 for i in range(a.iters):
-                    if op == "tmem":
+                    if op.startswith("tmem"):
                         spin_once(pair, 4 * t)  # the reduce's arrivals
-                        ups[i % a.copies].run(x, res[i % a.copies], pair)
+                        ups_by[op][i % a.copies].run(x, res[i % a.copies], pair)
                         continue
                     if with_spin:
                         spin_once(idle, 0)
@@ -141,9 +159,9 @@ def main():
                         res[i % a.copies].addmm_(x, ws[i % a.copies].t())
             return fn
 
-        base = graph_time(body(None, True), a.reps) if a.window else 0.0
+        base = graph_time(body("none", True), a.reps) if a.window else 0.0
         row = {"tokens": t, "window_ns": a.window, "max_abs_err_vs_addmm": err}
-        for op in ("cublas", "tmem"):
+        for op in ("cublas", *variants):
             total = graph_time(body(op, a.window > 0), a.reps)
             row[op + "_us"] = round((total - base) / a.iters, 3)
         row["spin_us"] = round(base / a.iters, 3) if a.window else 0.0
