@@ -58,8 +58,12 @@ SHARED = ("shared_gu", "shared_down")
 # TMA'd before the PDL wait, FP32 partials that route_stage sums in split order):
 ROUTER_LATENT = {"*": "25-72:ltpin,96:wide"}
 # ``wide`` rows -> PreparedWide policy (split, activation warps, weight stages,
-# weight warps, direct exchange, staggered K): 36 tiles x 5 splits = 180 CTAs.
-WIDE_FRONT = {96: (5, (1,), None, (0, 3), False, True)}
+# weight warps, direct exchange, staggered K): 36 tiles x 5 splits = 180 CTAs;
+# 10 weight stages (~190 KiB smem) leave room beside SpReduceAttnRes's CTAs.
+WIDE_FRONT = {96: (5, (1,), 10, (0, 3), False, True)}
+# <= 48 registers: 256 threads x 48 fit beside 3-4 SpReduceAttnRes CTAs (128 threads
+# x 104 registers each) in the SM's 64 K registers, so the CTAs land pre-wait.
+WIDE_FRONT_REGS = 48
 
 
 class RouterLatentGemm:
@@ -78,7 +82,8 @@ class RouterLatentGemm:
         self.lt = None
         if lt:
             self.lt = LtPin("router_latent", n, k, lt, out32=True, device=packed.device)
-        self.wide = PreparedWide(packed, wide, partials=True).prepare() if wide else None
+        self.wide = (PreparedWide(packed, wide, partials=True, maxreg=WIDE_FRONT_REGS)
+                     .prepare() if wide else None)
         self.splits = {r: policy[0] for r, policy in wide.items()}
         self.plans = frozenset(self.lt.plans if lt else ()) | frozenset(wide)
 
