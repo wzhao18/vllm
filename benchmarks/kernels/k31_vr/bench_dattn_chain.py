@@ -72,7 +72,7 @@ def _graph_time(fn, layers, iters, dev):
     torch.accelerator.synchronize()
     per = torch.tensor([start.elapsed_time(end) * 1000 / (iters * layers)], device=dev)
     dist.all_reduce(per, op=dist.ReduceOp.MAX)
-    return per.item()
+    return per.item(), graph
 
 
 def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps):
@@ -102,14 +102,19 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
         run_value,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.r1 import DsaBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import (
+        sparse_mla_ts,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_ts import (  # noqa: E501
         sparse_mla_decode_ts,
     )
 
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     stamp = torch.zeros(sms * dcp_value.STAMP_SLOTS, dtype=torch.int64, device=dev)
+    ts_stamp = torch.zeros(sms * 8, dtype=torch.int64, device=dev)
     if stamps:
         dcp_value.STAMP_ADDR = stamp.data_ptr()
+        sparse_mla_ts.TS_STAMP_ADDR = ts_stamp.data_ptr()
     box = sp.sp_dsa_box(group, dev, rank, heads=HEADS, cap=CAP, interleave=1)
     gen = torch.Generator(device=dev).manual_seed(11 + rank)
     w_uv = (torch.randn(HEADS, 128, 512, generator=gen, device=dev) / 16).bfloat16()
@@ -133,14 +138,20 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
         w_g = dsa_box.gather_heads(w_uv)
         mail = dsa_box.mailbox(batch)
         kernels = {}
+        def ov_mode(mode):
+            return mode.startswith("ov")
+
         for mode in modes:
-            # tcc / ovc: KNOBS 8192 (latent rows read 1 KiB apart: wrong values, the
-            # head-major access pattern)
-            dcp_value.KNOBS = 8192 if mode in ("tcc", "ovc") else 0
+            # ovK<n>: kernel_ov with dcp_value.KNOBS n (ablation ladder); tcc / ovc:
+            # KNOBS 8192 (latent rows read 1 KiB apart: the head-major access pattern)
+            knobs = int(mode[3:]) if mode.startswith("ovK") else 0
+            if mode in ("tcc", "ovc"):
+                knobs = 8192
+            dcp_value.KNOBS = knobs
             kernels[mode] = compile_dcp_value(
                 HEADS, size, batch, layout(w_uv), PITCH, dev.index, sms, Q,
                 box.q_heads, True, False, "proj", box.cap, False,
-                sms if mode in ("ov", "ovc") else 0,
+                sms if ov_mode(mode) else 0,
             )  # fmt: skip
         dcp_value.KNOBS = 0
 
@@ -149,9 +160,9 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
             sparse_mla_decode_ts(query, kv, slots, valid, latent, lse, bmm1, bmm2,
                                  ready=sync)
 
-        line = "rows %3d core %.2f us" % (batch, _graph_time(core, layers, iters, dev))
+        line = "rows %3d core %.2f us" % (batch, _graph_time(core, layers, iters, dev)[0])
         if "ov" in modes:  # the core publishing its rows, nobody consuming them
-            pub = _graph_time(lambda p: core(p, True), layers, iters, dev)
+            pub = _graph_time(lambda p: core(p, True), layers, iters, dev)[0]
             mail.sync.zero_()
             line += " (publishing %.2f us)" % pub
         outs = {}
@@ -159,25 +170,36 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
             out = torch.zeros(batch, GATE, device=dev, dtype=torch.bfloat16)
 
             def chain(parity, mode=mode, out=out):
-                core(parity, mode in ("ov", "ovc"))
+                core(parity, ov_mode(mode))
                 publish = publish_args(box, parity)
                 run_value(kernels[mode], dsa_box, parity, publish, HEADS,
                           (latent, lse, valid), totals, None, projected, out, w_g)
 
-            t = _graph_time(chain, layers, iters, dev)
+            t, graph = _graph_time(chain, layers, iters, dev)
             outs[mode] = out.clone()
             line += "; %s chain %.2f us" % (mode, t)
-            if stamps and mode in ("ov", "ovc"):
-                # one more chained layer on its own: its stamps only (slot 0 = entry;
-                # a slot older than the CTA's entry is from an earlier layer)
+            if stamps and ov_mode(mode):
+                # one more replay of the timed graph: the last layer's stamps (slot 0 =
+                # entry; a slot older than the CTA's entry is from an earlier layer)
                 stamp.zero_()
+                ts_stamp.zero_()
                 torch.accelerator.synchronize()
                 dist.barrier()
-                chain(0)
+                graph.replay()
                 torch.accelerator.synchronize()
                 s = stamp.view(sms, dcp_value.STAMP_SLOTS).double().cpu()
                 have = s[:, 0] != 0
                 e0 = s[have, 0].min()
+                ts = ts_stamp.view(sms, 8).double().cpu()
+                # the last layer's core: stamps within 60 us before its DcpValue's end
+                last = s[have, 10].max()
+                tparts = []
+                for slot, name in ((0, "tsrow0"), (1, "tsrow1"), (7, "tsexit")):
+                    ok = (ts[:, slot] != 0) & (ts[:, slot] > last - 60000)
+                    v = ((ts[ok, slot] - e0) / 1000.0).sort().values
+                    if len(v):
+                        tparts.append("%s %.1f/%.1f/%.1f" % (
+                            name, v[0], v[len(v) // 2], v[-1]))
                 units = [int(x) for x in s[have, 11].tolist()]
                 parts = ["ctas %d units/cta hist %s" % (
                     int(have.sum()), {k: units.count(k) for k in sorted(set(units))})]
@@ -194,7 +216,7 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
                     if len(v):
                         parts.append("%s %.1f/%.1f/%.1f" % (
                             name, v[0], v[len(v) // 2], v[-1]))
-                line += "\n  r%d %s stamps us (min/med/max): %s" % (rank, mode, "; ".join(parts))
+                line += "\n  r%d %s stamps us (min/med/max): %s" % (rank, mode, "; ".join(tparts + parts))
         if len(modes) > 1:
             a, b = (outs[m] for m in modes[:2])
             same = torch.equal(a.view(torch.int16), b.view(torch.int16))

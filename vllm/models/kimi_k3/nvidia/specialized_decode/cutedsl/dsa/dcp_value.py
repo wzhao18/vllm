@@ -1010,17 +1010,17 @@ class DcpValue:
                 if u < self.units:
                     w, k0, nk, gh = self.stream_head(u)
                     # W_UV (2 tiles per ring slot) does not wait for the core
-                    for h2 in cutlass.range_constexpr(4):
-                        if lane == (kc + h2) % HS_ISS:
-                            st = (kc + h2) % HS_RING
-                            ph = ((kc + h2) // HS_RING) & 1
-                            full = bars + Uint32(8) * Uint32(st)
-                            dst = ring + Uint32(HS_CHUNK) * Uint32(st)
-                            mbar_wait(bars + Uint32(8) * Uint32(HS_RING + st), ph ^ 1)
-                            mbar_arrive_tx(full, Uint32(HS_CHUNK))
-                            for e in cutlass.range_constexpr(2):
-                                _tma3d(dst + Uint32(e * HS_CHUNK // 2), tm_b, full,
-                                       64 * (2 * h2 + e), 0, gh)
+                    # each issuing lane runs its own stages (independent progress)
+                    if lane < 4:
+                        st = (kc + lane) % HS_RING
+                        ph = ((kc + lane) // HS_RING) & 1
+                        full = bars + Uint32(8) * Uint32(st)
+                        dst = ring + Uint32(HS_CHUNK) * Uint32(st)
+                        mbar_wait(bars + Uint32(8) * Uint32(HS_RING + st), ph ^ 1)
+                        mbar_arrive_tx(full, Uint32(HS_CHUNK))
+                        for e in cutlass.range_constexpr(2):
+                            _tma3d(dst + Uint32(e * HS_CHUNK // 2), tm_b, full,
+                                   64 * (2 * lane + e), 0, gh)
                     kc = kc + 4
                     # the readiness warp saw every chunk of the part published before
                     # it hands over the first one
@@ -1032,8 +1032,9 @@ class DcpValue:
                     jc = jc + nk
                     if i == 0:
                         self.mark(c, 5, lane)
-                    for k in range(nk):
-                        if lane == (kc + k) % HS_ISS:
+                    if lane < HS_ISS:
+                        k = (lane - kc % HS_ISS + HS_ISS) % HS_ISS
+                        while k < nk:
                             t0, n = self.chunk_rows(w, k0 + k)
                             st = (kc + k) % HS_RING
                             ph = ((kc + k) // HS_RING) & 1
@@ -1046,6 +1047,8 @@ class DcpValue:
                                        64 * jj, gh, t0)
                             if (i == 0) & (k < 4):
                                 self.mark(c, 12 + k, 0)
+                            k = k + HS_ISS
+                    cute.arch.sync_warp()
                     kc = kc + nk
                     self.mark(c, 7, lane)
                 else:
@@ -1073,7 +1076,8 @@ class DcpValue:
                             tc_fence_after()
                             uvd = Uint64(SDESC_SW128) | Uint64(
                                 (ring + Uint32(HS_CHUNK) * Uint32(st)) >> Uint32(4))
-                            for e in cutlass.range_constexpr(2):
+                            for e in cutlass.range_constexpr(2 if self.knobs & 32768 == 0
+                                                             else 0):
                                 for q4 in cutlass.range_constexpr(4):
                                     _tmem_cp(taddr + Uint32(32 * (2 * h2 + e) + 8 * q4),
                                              uvd + Uint64(e * HS_CHUNK // 2 // 16 + 2 * q4))
@@ -1090,7 +1094,8 @@ class DcpValue:
                                 self.mark(c, 28 + k, lane)
                             acc = taddr + Uint32(HS_ACC) + Uint32(HS_ROWS) * Uint32(b)
                             src = ring + Uint32(HS_CHUNK) * Uint32(st)
-                            for kk in cutlass.range_constexpr(32):
+                            for kk in cutlass.range_constexpr(32 if self.knobs & 32768 == 0
+                                                              else 0):
                                 bd = Uint64(SDESC_SW128) | Uint64(
                                     (src + Uint32((kk // 4) * HS_CHUNK // 8 + 32 * (kk % 4)))
                                     >> 4)
@@ -1141,7 +1146,10 @@ class DcpValue:
                         t = t0 + lane
                         if not live:
                             t = Int32(0)
-                        lses.append(self.sent_lse(rows_lse, lens, t, gh))
+                        if cutlass.const_expr(self.knobs & 16384 == 0):
+                            lses.append(self.sent_lse(rows_lse, lens, t, gh))
+                        else:
+                            lses.append(Float32(EMPTY_LSE))
                         lives.append(live)
                         rws.append(t)
                     for kk in cutlass.range_constexpr(HS_PART):
@@ -1200,7 +1208,7 @@ class DcpValue:
                         accq = (taddr + Uint32(HS_ACC) + Uint32(HS_ROWS) * Uint32(b)
                                 + (Uint32(32 * (warp - TC_EPI)) << Uint32(16)))
                         halves = [_tmem_ld16x256(accq + Uint32(16 * hh << 16))
-                                  for hh in range(2)]
+                                  for hh in range(2 if self.knobs & 16384 == 0 else 0)]
                         tc_fence_before()
                         mbar_arrive(acc_free + Uint32(8) * Uint32(b))  # TMEM read
                         _epi_sync()  # every thread read the mask; the buffer is free
@@ -1211,7 +1219,7 @@ class DcpValue:
                         if (lane // 4) % 2 == 1:
                             sent = Uint32(0x80008000)
                         mk = lane // 8
-                        for hh in cutlass.range_constexpr(2):
+                        for hh in cutlass.range_constexpr(2 if self.knobs & 16384 == 0 else 0):
                             frag = []
                             for g in cutlass.range_constexpr(4):
                                 rows2 = (mask >> Uint32(8 * g + r0)) & Uint32(3)
@@ -1232,7 +1240,7 @@ class DcpValue:
                                             frag[4 * sx + 3])
                         _fence_async_shared()
                         _epi_sync()
-                        if cutlass.const_expr(self.knobs & 2 == 0):
+                        if cutlass.const_expr(self.knobs & (2 | 16384) == 0):
                             if v == 0:
                                 _bulk_push(peers[owner] + Int64(base + t0) * 256, out,
                                            Uint32(256 * n))

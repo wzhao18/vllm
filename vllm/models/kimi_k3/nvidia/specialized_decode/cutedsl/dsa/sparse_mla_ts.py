@@ -29,9 +29,16 @@ from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import tensormap
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import asm
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla import (
+    globaltimer,
     lg2,
     st_global_f32,
+    st_global_u64,
 )
+
+# Bench probe (benchmarks/kernels/k31_vr/bench_dattn_chain.py): the address of a
+# [CTAs, 8] u64 globaltimer buffer (slot qi < 7: row qi published, 7: CTA exit) when
+# compiled while it is nonzero (0, the default: no stamping code).
+TS_STAMP_ADDR = 0
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     D_NOPE,
     H,
@@ -376,6 +383,7 @@ def _subs(n):
 class SparseMlaDecodeTS:
     def __init__(self, grid: int, knobs: tuple = (), topk: int = 0):
         self.grid = grid
+        self.ts_stamp = TS_STAMP_ADDR
         # topk > 0: logical mode. ``slots`` holds the indexer's request-relative top-k
         # (width topk, < 0 invalid); the gather warps map them through the block table
         # (row = block_table[req][idx >> bs_shift] * unit_rows + idx % block size) and
@@ -546,6 +554,10 @@ class SparseMlaDecodeTS:
             if warp == 0:
                 tc_fence_after()
                 tmem_free_exclusive(taddr)
+            if cutlass.const_expr(self.ts_stamp != 0):
+                if tid == 0:
+                    st_global_u64(Int64(self.ts_stamp) + (Int64(cta) * 8 + Int64(7)) * 8,
+                                  globaltimer())
 
     @cute.jit
     def ss(self, base, cta, lane, u, slot, role: cutlass.Constexpr = 15):
@@ -1658,10 +1670,14 @@ class SparseMlaDecodeTS:
             if ready != Int64(0):
                 blk = qi * ((self.grid + 31) // 32) + cta // 32
                 publish_row(ready + Int64(4) * Int64(blk))
+            if cutlass.const_expr(self.ts_stamp != 0):
+                if qi < 7:
+                    st_global_u64(Int64(self.ts_stamp) + (Int64(cta) * 8 + Int64(qi)) * 8,
+                                  globaltimer())
 
 
 @cache
-def _compiled(grid: int, knobs: tuple = (), topk: int = 0):
+def _compiled(grid: int, knobs: tuple = (), topk: int = 0, ts_stamp: int = 0):
     kernel = SparseMlaDecodeTS(grid, knobs, topk)
     args = (Int64(0), Int32(1), Int64(0), Int32(64), Int64(0), Int32(1), Int64(0), Int64(0),
             Int64(0), Float32(1.0), Float32(1.0), Int32(64), Int64(0), Int64(0), Int64(0), Int32(1),
@@ -1692,7 +1708,7 @@ def sparse_mla_decode_ts(query, kv_rows, slots, valid, latent, lse, scale, out_s
         return latent, lse
     # one compile for every row count: CTAs past the rows exit
     grid = torch.cuda.get_device_properties(query.device).multi_processor_count
-    fn = _compiled(grid, tuple(knobs))
+    fn = _compiled(grid, tuple(knobs), 0, TS_STAMP_ADDR)
     stream = cuda.CUstream(torch.cuda.current_stream(query.device).cuda_stream)
     fn(Int64(query.data_ptr()), Int32(rows), Int64(kv_rows.data_ptr()), Int32(64),
        Int64(slots.data_ptr()), Int32(slots.stride(0)), Int64(valid.data_ptr()),
