@@ -64,6 +64,9 @@ struct V2Cfg {
 constexpr int kR2Rows = 512;   // rows with an R2 mailbox (others keep the complete body)
 constexpr int kR2W = 2048;     // R2 slot words per (parity, row, rank)
 constexpr int kR2Cap = 1022;   // R2 entries (key, position) per rank
+constexpr int kCgBins = 512;   // CG round: bins of the bracket (12-bit counts, 2 per word)
+constexpr int kCgMsg = kV2Hdr + kCgBins / 2;  // CG slot words (two rounds per R2 slot)
+static_assert(kCgMsg % 4 == 0 && kCgMsg <= kV2Msg && 2 * kCgMsg <= kR2W && kV2Cand <= 4095);
 constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
 constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
@@ -935,8 +938,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       msg[2] = tagw(tag, nb > 0 ? ((1u << 16) | ((uint32_t)bh << 8) | (uint32_t)bl) : 0u);
       msg[3] = tagw(tag, (uint32_t)nb);
       msg[4] = tagw(tag, min(s_valid, 0xFFFFFFu));
-      msg[5] = tagw(tag, 0u);
-      msg[6] = tagw(tag, 0u);
+      // for the CG rounds: the exact q-th key, theta and whether >= K keys are candidates
+      msg[5] = tagw(tag, pdone ? ((uint32_t)s_e | (1u << 16)) : 0u);
+      msg[6] = tagw(tag, (uint32_t)th | (nc >= K ? (1u << 16) : 0u));
       msg[7] = tagw(tag, 0u);
     }
     // the whole slot goes out (unused band words tagged), so one poll pass reads it
@@ -1110,7 +1114,116 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // keys >= LB overflow the message keep the complete body. Tier 2 (tau known, a band
       // missed its ties) takes the tie round below instead: tau lies in every window, so every
       // rank's ties are in its candidates.
-      if (tier == 3) {
+      //
+      // ---- CG first (rank-skewed rows: the round-1 windows are disjoint, or tau lies outside
+      // their common range). tau lies in [lo2, hi2]: lo2 = the largest theta of a rank with
+      // >= K candidates (its K-th key <= tau), hi2 = the largest q-th key (above it every rank
+      // has < q_r keys, sum (q_r - 1) < K). When every rank's theta is <= lo2, each rank's keys
+      // in the bracket are all candidates: every rank counts them into kCgBins bins of one
+      // common power-of-two width (one round in the R2 mailbox, the round-1 slot format) and
+      // locates tau's bin; a bin wider than one key takes one more round of width 1. Then
+      // tier 1 (quota) or the tie round, as after round 1: <= 2 rounds + the tie round, from
+      // the candidates (no lists, no row re-scan). Rows it cannot take keep R2.
+      bool cg = false;
+      if (K31_RARE(tier == 3) && s_tau < 0 && row < kR2Rows) {
+        __shared__ int s_cg[4];  // 0 base (-1: done / not eligible), 1 width shift, 2 bin, 3 need
+        __shared__ uint32_t s_cgab;
+        if (tid == 0) {
+          int lo2 = 0, hi2 = -1;
+          bool ok = true;
+          for (int r = 0; r < W; ++r) {
+            const uint32_t* s = rx + r * kV2Msg;
+            const uint32_t w5 = s[5] & 0xFFFFFFu, w6 = s[6] & 0xFFFFFFu;
+            ok = ok && !((s[0] >> 16) & 1u) && ((w5 >> 16) & 1u);
+            hi2 = max(hi2, (int)(w5 & 0xFFFFu));
+            if ((w6 >> 16) & 1u) lo2 = max(lo2, (int)(w6 & 0xFFFFu));
+          }
+          for (int r = 0; r < W; ++r) ok = ok && (int)(rx[r * kV2Msg + 6] & 0xFFFFu) <= lo2;
+          int sh = 0;
+          while (sh < 8 && hi2 - lo2 >= (kCgBins << sh)) ++sh;
+          s_cg[0] = (ok && lo2 >= 1 && hi2 >= lo2) ? lo2 : -1;
+          s_cg[1] = sh;
+        }
+        __syncthreads();
+        cg = s_cg[0] >= 0;
+        if (cg) V2STAT(3);
+        const int64_t cgrow = p.off_r2 + ((int64_t)(par * min(p.cap, kR2Rows) + row) * W) * kR2W;
+        const uint4 dead4 = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+        for (int it = 0; it < 2 && cg; ++it) {
+          const int lo2 = s_cg[0], sh = s_cg[1];
+          for (int b = tid; b < kCgBins; b += kV2T) hist[b] = 0u;
+          if (tid == 0) { s_cgab = 0u; s_cg[2] = -1; }
+          __syncthreads();
+          uint32_t ab = 0;
+          for (int c = tid; c < nc; c += kV2T) {
+            const int u = (int)ckey[c] - lo2;
+            if (u >= 0) {
+              if ((u >> sh) >= kCgBins) ++ab;
+              else atomicAdd(&hist[u >> sh], 1u);
+            }
+          }
+          for (int o = 16; o > 0; o >>= 1) ab += __shfl_xor_sync(0xffffffffu, ab, o);
+          if ((tid & 31) == 0 && ab) atomicAdd(&s_cgab, ab);
+          __syncthreads();
+          if (tid < kCgBins / 2) msg[kV2Hdr + tid] = pack2(tag, hist[2 * tid], hist[2 * tid + 1]);
+          if (tid < kV2Hdr) msg[tid] = tagw(tag, tid == 0 ? (uint32_t)lo2 : tid == 1 ? s_cgab : 0u);
+          __syncthreads();
+          const int64_t base = cgrow + it * kCgMsg;
+          send(msg, kCgMsg, base + (int64_t)p.rank * kR2W);
+          for (int i = tid; i < W * (kCgMsg / 4); i += kV2T) {
+            const int r = i / (kCgMsg / 4), j = (i % (kCgMsg / 4)) * 4;
+            uint32_t* const src = p.box + base + (int64_t)r * kR2W + j;
+            poll_words(src, rx + r * kV2Msg + j, 38);
+            st_v4(src, dead4);  // re-armed: the slot is reused only on rare rows
+          }
+          __syncthreads();
+          // tau's bin: thread t <-> bin kCgBins - 1 - t; keys above it from the scan
+          const int b = kCgBins - 1 - tid;
+          uint32_t g = 0, A = 0;
+          for (int r = 0; r < W; ++r) {
+            const uint32_t* s = rx + r * kV2Msg;
+            A += s[1] & 0xFFFFFFu;
+            if (b >= 0) g += v2_cnt(s, b);
+          }
+          uint32_t tot;
+          const uint32_t ex = v2_scan<T>(g, V2WS, &tot) + A;
+          if (b >= 0 && ex < (uint32_t)K && ex + g >= (uint32_t)K) { s_cg[2] = b; s_cg[3] = K - (int)ex; }
+          __syncthreads();
+          const int bin = s_cg[2];
+          if (bin < 0) {  // the bracket holds tau: unreachable
+            if (tid == 0) spin_fail(p.err, 39);
+            break;
+          }
+          if (sh > 0) {
+            __syncthreads();
+            if (tid == 0) { s_cg[0] = lo2 + (bin << sh); s_cg[1] = 0; }
+            __syncthreads();
+            continue;
+          }
+          // tau exact: the tie counts at tau from the bins
+          if (tid == 0) {
+            const int need = s_cg[3];
+            int tot_t = 0, nr = 0, mine = 0;
+            bool fit = true;
+            for (int r = 0; r < W; ++r) {
+              const int t = (int)v2_cnt(rx + r * kV2Msg, bin);
+              tot_t += t;
+              nr += t > 0;
+              fit = fit && t <= kV2Tie;
+              if (r == p.rank) mine = t;
+            }
+            s_tau = lo2 + bin;
+            s_need = need;
+            if (tot_t == need) { s_tier = 1; s_q = mine; }
+            else if (nr == 1) { s_tier = 1; s_q = mine > 0 ? need : 0; }
+            else s_tier = fit ? 2 : 3;
+          }
+          __syncthreads();
+          tier = s_tier;
+          break;
+        }
+      }
+      if (tier == 3 && !cg) {
         // saturated windows / failed fast paths take R2 too: every window is a lower bound
         if (row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
