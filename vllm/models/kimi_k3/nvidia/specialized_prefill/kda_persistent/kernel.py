@@ -232,6 +232,8 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    PREP_ONLY_: cutlass.Constexpr[int] = 0,
+    PREP_ABL_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -551,7 +553,7 @@ def _pkd(
     # =====================================================================
     # COMPUTE warpgroup (warps 0-3)
     # =====================================================================
-    if warp < 4:
+    if warp < (0 if PREP_ONLY_ else 4):
         if cutlass.const_expr(REG_MODE_ == 1):
             cute.arch.warpgroup_reg_alloc(160)
         else:
@@ -993,7 +995,7 @@ def _pkd(
     # =====================================================================
     # EPILOGUE warpgroup (warps 4-7)
     # =====================================================================
-    if (warp >= 4) & (warp < 8):
+    if (warp >= 4) & (warp < (4 if PREP_ONLY_ else 8)):
         if cutlass.const_expr(REG_MODE_ == 2):
             cute.arch.warpgroup_reg_alloc(96)
         else:
@@ -1461,103 +1463,117 @@ def _pkd(
         if cutlass.const_expr(GRAM_W9_ != 0):
             mma_warp = 8
         if warp == mma_warp:
-            if cutlass.const_expr(True):
+            if cutlass.const_expr(PREP_ONLY_ == 1):
                 csm = cutlass.Int32(0)
-                pm_oe = cutlass.Int32(1)
+                pm_qk = cutlass.Int32(0)
                 for kx in cutlass.range(k1 - k0):
-                    chain = cute.arch.make_warp_uniform(schain[k0 + kx])
-                    seq_idx = chain // H_
                     seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
-                    t_tiles = (seq_len + C - 1) // C
-                    for _t in cutlass.range(t_tiles):
-                        state_inp_bar.arrive_and_wait()
-                        mma_1.set(tcgen05.Field.ACCUMULATE, False)
-                        for kb in cutlass.range_constexpr(D // 16):
-                            cute.gemm(
-                                mma_1,
-                                t_u,
-                                t_inp[None, None, kb],
-                                b_kd[None, None, kb, csm],
-                                t_u,
-                            )
-                            mma_1.set(tcgen05.Field.ACCUMULATE, True)
+                    for _t in cutlass.range((seq_len + C - 1) // C):
+                        cute.arch.mbarrier_wait(mb + MB_QK + csm, pm_qk)
                         with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_OOUT + csm)
-                        cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
-                        mma_1.set(tcgen05.Field.ACCUMULATE, False)
-                        for kb in cutlass.range_constexpr(D // 16):
-                            cute.gemm(
-                                mma_1,
-                                t_out,
-                                t_inp[None, None, kb],
-                                b_qd[None, None, kb, csm],
-                                t_out,
-                            )
-                            mma_1.set(tcgen05.Field.ACCUMULATE, True)
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_RFREE + csm)
-
-                        u_inp_bar.arrive_and_wait()
-                        mma_3.set(tcgen05.Field.ACCUMULATE, False)
-                        for kb in cutlass.range_constexpr(C // 16):
-                            cute.gemm(
-                                mma_3,
-                                t_vst,
-                                t_ri3[None, None, kb],
-                                b_inv[None, None, kb, csm],
-                                t_vst,
-                            )
-                            mma_3.set(tcgen05.Field.ACCUMULATE, True)
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_U2ACC + csm)
-
-                        mma_4a.set(tcgen05.Field.ACCUMULATE, True)
-                        if cutlass.const_expr(GATE2_ == 1):
-                            u2_inp_lo_bar.arrive_and_wait()
-                            cute.gemm(
-                                mma_4a,
-                                t_d4a,
-                                t_ri4[None, None, 0],
-                                b_fta[None, None, 0, csm],
-                                t_d4a,
-                            )
-                            u2_inp_bar.arrive_and_wait()
-                            cute.gemm(
-                                mma_4a,
-                                t_d4a,
-                                t_ri4[None, None, 1],
-                                b_fta[None, None, 1, csm],
-                                t_d4a,
-                            )
-                        else:
-                            u2_inp_bar.arrive_and_wait()
-                            for kb in cutlass.range_constexpr(C // 16):
-                                cute.gemm(
-                                    mma_4a,
-                                    t_d4a,
-                                    t_ri4[None, None, kb],
-                                    b_fta[None, None, kb, csm],
-                                    t_d4a,
-                                )
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_FIN + csm)
-                        mma_4b.set(tcgen05.Field.ACCUMULATE, True)
-                        for kb in cutlass.range_constexpr(C // 16):
-                            cute.gemm(
-                                mma_4b,
-                                t_d4b,
-                                t_ri4[None, None, kb],
-                                b_ftb[None, None, kb, csm],
-                                t_d4b,
-                            )
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mb + MB_OFIN + csm)
-                            tcgen05.commit(mb + MB_SFREE + csm)
+                            cute.arch.mbarrier_arrive(mb + MB_RFREE + csm)
+                            cute.arch.mbarrier_arrive(mb + MB_SFREE + csm)
                         csm += 1
                         if csm == STAGES:
                             csm = 0
-                        pm_oe ^= 1
-        if warp == 10:
+                            pm_qk ^= 1
+            else:
+                    csm = cutlass.Int32(0)
+                    pm_oe = cutlass.Int32(1)
+                    for kx in cutlass.range(k1 - k0):
+                        chain = cute.arch.make_warp_uniform(schain[k0 + kx])
+                        seq_idx = chain // H_
+                        seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+                        t_tiles = (seq_len + C - 1) // C
+                        for _t in cutlass.range(t_tiles):
+                            state_inp_bar.arrive_and_wait()
+                            mma_1.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(D // 16):
+                                cute.gemm(
+                                    mma_1,
+                                    t_u,
+                                    t_inp[None, None, kb],
+                                    b_kd[None, None, kb, csm],
+                                    t_u,
+                                )
+                                mma_1.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_OOUT + csm)
+                            cute.arch.mbarrier_wait(mb + MB_OEMPTY, pm_oe)
+                            mma_1.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(D // 16):
+                                cute.gemm(
+                                    mma_1,
+                                    t_out,
+                                    t_inp[None, None, kb],
+                                    b_qd[None, None, kb, csm],
+                                    t_out,
+                                )
+                                mma_1.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_RFREE + csm)
+
+                            u_inp_bar.arrive_and_wait()
+                            mma_3.set(tcgen05.Field.ACCUMULATE, False)
+                            for kb in cutlass.range_constexpr(C // 16):
+                                cute.gemm(
+                                    mma_3,
+                                    t_vst,
+                                    t_ri3[None, None, kb],
+                                    b_inv[None, None, kb, csm],
+                                    t_vst,
+                                )
+                                mma_3.set(tcgen05.Field.ACCUMULATE, True)
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_U2ACC + csm)
+
+                            mma_4a.set(tcgen05.Field.ACCUMULATE, True)
+                            if cutlass.const_expr(GATE2_ == 1):
+                                u2_inp_lo_bar.arrive_and_wait()
+                                cute.gemm(
+                                    mma_4a,
+                                    t_d4a,
+                                    t_ri4[None, None, 0],
+                                    b_fta[None, None, 0, csm],
+                                    t_d4a,
+                                )
+                                u2_inp_bar.arrive_and_wait()
+                                cute.gemm(
+                                    mma_4a,
+                                    t_d4a,
+                                    t_ri4[None, None, 1],
+                                    b_fta[None, None, 1, csm],
+                                    t_d4a,
+                                )
+                            else:
+                                u2_inp_bar.arrive_and_wait()
+                                for kb in cutlass.range_constexpr(C // 16):
+                                    cute.gemm(
+                                        mma_4a,
+                                        t_d4a,
+                                        t_ri4[None, None, kb],
+                                        b_fta[None, None, kb, csm],
+                                        t_d4a,
+                                    )
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_FIN + csm)
+                            mma_4b.set(tcgen05.Field.ACCUMULATE, True)
+                            for kb in cutlass.range_constexpr(C // 16):
+                                cute.gemm(
+                                    mma_4b,
+                                    t_d4b,
+                                    t_ri4[None, None, kb],
+                                    b_ftb[None, None, kb, csm],
+                                    t_d4b,
+                                )
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mb + MB_OFIN + csm)
+                                tcgen05.commit(mb + MB_SFREE + csm)
+                            csm += 1
+                            if csm == STAGES:
+                                csm = 0
+                            pm_oe ^= 1
+        if warp == (-1 if PREP_ONLY_ else 10):
             csl = cutlass.Int32(0)
             pl_vfree = cutlass.Int32(1)
             pl_qk = cutlass.Int32(0)
@@ -2001,10 +2017,11 @@ def _pkd(
                                         g8[u] = cutlass.Float32(
                                             v_graw[rw0 + u, ptl, inst]
                                         )
-                                    g8.store(g8.load() * ea2c + dtbc)
-                                    for u in cutlass.range_constexpr(8):
-                                        g8[u] = _tanhf(g8[u])
-                                    g8.store(g8.load() * lb2h + lb2h)
+                                    if cutlass.const_expr((PREP_ABL_ & 4) == 0):
+                                        g8.store(g8.load() * ea2c + dtbc)
+                                        for u in cutlass.range_constexpr(8):
+                                            g8[u] = _tanhf(g8[u])
+                                        g8.store(g8.load() * lb2h + lb2h)
                                     if cutlass.const_expr(may_be_partial):
                                         if cc < C:
                                             for u in cutlass.range_constexpr(8):
@@ -2104,21 +2121,26 @@ def _pkd(
                                     kr[u] = cutlass.BFloat16(0.0)
                         sq = cutlass.Float32(0.0)
                         sk = cutlass.Float32(0.0)
-                        for u in cutlass.range_constexpr(8):
-                            fq = cutlass.Float32(qr[u])
-                            fk = cutlass.Float32(kr[u])
-                            sq += fq * fq
-                            sk += fk * fk
-                        for off in [1, 2, 4, 8]:
-                            sq += cute.arch.shuffle_sync_bfly(sq, off)
-                            sk += cute.arch.shuffle_sync_bfly(sk, off)
-                        # scale folded into rqn: one FMUL replaces 8 per slice
-                        rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
-                        rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+                        rqn = scale
+                        rkn = cutlass.Float32(1.0)
+                        if cutlass.const_expr((PREP_ABL_ & 1) == 0):
+                            for u in cutlass.range_constexpr(8):
+                                fq = cutlass.Float32(qr[u])
+                                fk = cutlass.Float32(kr[u])
+                                sq += fq * fq
+                                sk += fk * fk
+                            for off in [1, 2, 4, 8]:
+                                sq += cute.arch.shuffle_sync_bfly(sq, off)
+                                sk += cute.arch.shuffle_sync_bfly(sk, off)
+                            # scale folded into rqn: one FMUL replaces 8 per slice
+                            rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                            rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
                         g8s = v_gcs8[(rw2, None, sg2, inst)]
                         cute.autovec_copy(g8s, g8)
                         gv8 = g8.load()
-                        decv = cute.math.exp2(gv8 - anch, fastmath=True)
+                        decv = gv8
+                        if cutlass.const_expr((PREP_ABL_ & 2) == 0):
+                            decv = cute.math.exp2(gv8 - anch, fastmath=True)
                         qhv = qr.load().to(cutlass.Float32) * rqn
                         khv = kr.load().to(cutlass.Float32) * rkn
                         qr.store((qhv * decv).to(cutlass.BFloat16))
@@ -2130,7 +2152,9 @@ def _pkd(
                             # vector exp2 while retaining more precision than
                             # that store.  The exp2 control remains for matched
                             # profiling.
-                            idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                            idecv = decv
+                            if cutlass.const_expr((PREP_ABL_ & 2) == 0):
+                                idecv = cute.math.rcp(decv, approx=True, ftz=True)
                         else:
                             idecv = cute.math.exp2(anch - gv8, fastmath=True)
                         dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
@@ -2212,15 +2236,16 @@ def _pkd(
                             if c8 == lid:
                                 lv8 = cutlass.Float32(1.0)
                             g8[c8] = lv8
-                        for sr in cutlass.range_constexpr(7):
-                            rs8 = cutlass.Float32(0.0) - g8[sr]
-                            for pc in cutlass.range_constexpr(7):
-                                if cutlass.const_expr(pc < sr):
-                                    pv8 = cute.arch.shuffle_sync(g8[pc], b8 + sr)
-                                    if lid > sr:
-                                        g8[pc] = rs8 * pv8 + g8[pc]
-                            if lid > sr:
-                                g8[sr] = rs8
+                        if cutlass.const_expr((PREP_ABL_ & 8) == 0):
+                            for sr in cutlass.range_constexpr(7):
+                                rs8 = cutlass.Float32(0.0) - g8[sr]
+                                for pc in cutlass.range_constexpr(7):
+                                    if cutlass.const_expr(pc < sr):
+                                        pv8 = cute.arch.shuffle_sync(g8[pc], b8 + sr)
+                                        if lid > sr:
+                                            g8[pc] = rs8 * pv8 + g8[pc]
+                                if lid > sr:
+                                    g8[sr] = rs8
                         qr.store(g8.load().to(cutlass.BFloat16))
                         cute.autovec_copy(qr, v_inv[(b8 + lid, None, dgb, inst)])
                         # zero the upper-right 8x8 of each 16-block and the
@@ -2462,6 +2487,8 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    PREP_ONLY_: cutlass.Constexpr[int] = 0,
+    PREP_ABL_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2686,6 +2713,8 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        PREP_ONLY_,
+        PREP_ABL_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
