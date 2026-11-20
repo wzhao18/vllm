@@ -29,7 +29,7 @@ from .packed_situ_gemm import interleave_shared_rows, situ_constants
 
 # (tile, cluster, inst_m, swizzle, raster, split producer, swap, flags)
 # c2x4 m-raster mis-stores at M=4096 (N 3072/6144); c2x1 is bitwise at every tested shape.
-DEFAULT_TACTIC = ((512, 256), (2, 1), 256, 8, "n", 0, 0, "drain+roll+st8")
+DEFAULT_TACTIC = ((512, 256), (2, 1), 256, 8, "n", 0, 0, "drain+roll+st8+pdl")
 _COMPILED: dict = {}
 
 

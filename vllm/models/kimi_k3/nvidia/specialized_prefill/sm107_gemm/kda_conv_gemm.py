@@ -54,6 +54,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             else 1 if "st8" in flags else 0
         )
         self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else 0
+        self.use_pdl = "pdl" in flags
         self.epi_drain_skel = next((i for i in (11, 10, 9, 1, 2, 3, 4, 5, 6, 7, 8) if f"dskel{i}" in flags), 0)
         super().__init__(
             SF_VEC,

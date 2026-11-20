@@ -1368,6 +1368,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=getattr(self, "use_pdl", False),
         )
         return
 
@@ -1701,6 +1702,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
+        # vLLM: programmatic dependent launch (setup overlaps the producer).
+        if cutlass.const_expr(getattr(self, "use_pdl", False)):
+            cute.arch.griddepcontrol_wait()
 
         #
         # Construct the scheduler
@@ -2358,6 +2362,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
+        if cutlass.const_expr(getattr(self, "use_pdl", False)):
+            cute.arch.griddepcontrol_launch_dependents()
 
     # GPU device kernel
     @cute.kernel
