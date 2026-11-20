@@ -236,6 +236,14 @@ def tmem_ld16(taddr):
 
 
 @asm()
+def tmem_ld32(taddr):
+    """tcgen05.ld 32x32b.x32: 32 columns of this warp's 32 TMEM lanes (one per thread)."""
+    regs = ",".join(f"${i}" for i in range(32))
+    code = "tcgen05.ld.sync.aligned.32x32b.x32.b32 {" + regs + "}, [$32];"
+    return code, ",".join(["=f"] * 32) + ",r,~{memory}", (Int32(taddr),), (Float32,) * 32
+
+
+@asm()
 def tmem_wait_n(*vals):
     """tcgen05.wait::ld, with the loaded registers tied through it."""
     n = len(vals)
@@ -318,6 +326,13 @@ def _mn_layout(t):
     return cute.make_tensor(t.iterator, new)
 
 
+def _qn_layout():
+    """MMA N row n' = h' + 16 tok + 128 half -> Q row (tok, head 16 half + h') of the item,
+    as a linear index of the (16 h', 2 half, BQ tok) row mode: half-major, so a token
+    pair's 16-head half is 32 contiguous accumulator columns (one TMEM x32 load)."""
+    return cute.make_layout((16, BQ, 2), stride=(1, HEADS, 16))
+
+
 def _sigma(h: int) -> int:
     """Token 1's head paired with token 0's head h (skew within each group of 4)."""
     return h - h % 4 + (h % 4 + 1) % 4
@@ -371,7 +386,11 @@ class IndexerScore:
         nk = k8.shape[0]
         mQ = cute.make_tensor(
             cute.recast_ptr(q8.iterator, dtype=fp4),
-            cute.make_layout((nq, DIM, 1), stride=(DIM, 1, nq * DIM)),
+            # rows (16 heads, 2 halves, tokens): the B tiler gathers them half-major
+            cute.make_layout(
+                ((16, 2, nq // HEADS), DIM, 1),
+                stride=((DIM, 16 * DIM, HEADS * DIM), 1, nq * DIM),
+            ),
         )
         mK = cute.make_tensor(
             cute.recast_ptr(k8.iterator, dtype=fp4),
@@ -431,7 +450,7 @@ class IndexerScore:
             sm100_utils.cluster_shape_to_tma_atom_B((1, 1), mma.thr_id),
             mQ,
             b_one,
-            self.tiler,
+            (TILE, _qn_layout(), DIM),
             mma,
             vmnk.shape,
         )
@@ -608,10 +627,11 @@ class IndexerScore:
                     for c in cutlass.range_constexpr(N // 128):
                         words = []
                         for i in cutlass.range_constexpr(4):
-                            r = c * 128 + 32 * i + lane
+                            r = c * 128 + 32 * i + lane  # MMA N row (half-major)
+                            q_row = (r // 16) % BQ * HEADS + 16 * (r // (16 * BQ)) + r % 16
                             v = Uint32(0)
-                            if r // HEADS < ntok:
-                                v = Uint32(q_sf[token0 * HEADS + r])
+                            if q_row // HEADS < ntok:
+                                v = Uint32(q_sf[token0 * HEADS + q_row])
                             words.append(v)
                         st_shared_v4(
                             sfb_a + (qs * SF_WORDS_B + c * 128 + 4 * lane) * 4, *words
@@ -622,7 +642,7 @@ class IndexerScore:
                         cute.arch.mbarrier_arrive_and_expect_tx(q_full + qs, self.q_bytes)
                     gQ = cute.local_tile(
                         cute.domain_offset((token0 * HEADS, 0, 0), mQ),
-                        cute.slice_(self.tiler, (0, None, None)),
+                        (_qn_layout(), DIM),
                         (None, None, None),
                     )
                     tQs, tQg = cpasync.tma_partition(
@@ -774,7 +794,7 @@ class IndexerScore:
         key_in_tile = 4 * (lt % 32) + lt // 32
         tok_a = 2 * wg
         # this warp's TMEM lane quarter, column 0 of accumulator stage 0
-        tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * HEADS
+        tmem_q = Int32(tAcc.iterator.toint()) + ((wq * 32) << 16) + tok_a * 16
         hist0 = hist_a + tok_a * (S_BINS * 4)
         hist1 = hist0 + S_BINS * 4
         # zero the histograms once (re-zeroed after every item)
@@ -927,14 +947,14 @@ class IndexerScore:
                     cute.arch.mbarrier_arrive(acc_empty + st)
             return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
         cute.arch.mbarrier_wait(acc_full, ph)
-        h0 = tmem_wait_n(*tmem_ld16(tmem_q), *tmem_ld16(tmem_q + HEADS))
+        h0 = tmem_wait_n(*tmem_ld32(tmem_q))
         h0n = h0
         for st in cutlass.range_constexpr(ACC_STAGES):
             t = t_hi - st
             col = tmem_q + st * N
             if cutlass.const_expr(st > 0):
                 h0 = tmem_wait_n(*h0n)
-            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
+            h1 = tmem_ld32(col + 16 * BQ)
             if cutlass.const_expr(self.epi != 1):
                 ss = self.reduce_half(h0, w, None, 0)
             h1 = tmem_wait_n(*h1)
@@ -943,7 +963,7 @@ class IndexerScore:
                 cute.arch.mbarrier_arrive(acc_empty + st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
                 cute.arch.mbarrier_wait(acc_full + st + 1, ph)
-                h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
+                h0n = tmem_ld32(col + N)
             if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
                 r = self.combine2(ss)
@@ -997,10 +1017,10 @@ class IndexerScore:
         for st in cutlass.range_constexpr(ACC_STAGES):
             col = tmem_q + st * N
             cute.arch.mbarrier_wait(acc_full + st, ph)
-            h0 = (*tmem_ld16(col), *tmem_ld16(col + HEADS))
+            h0 = tmem_ld32(col)
             p0, p1 = self.stage_tail(hp, w, sp, tp, p0, p1, thr)
             h0 = tmem_wait_n(*h0)
-            h1 = (*tmem_ld16(col + HEADS // 2), *tmem_ld16(col + HEADS + HEADS // 2))
+            h1 = tmem_ld32(col + 16 * BQ)
             ss = self.reduce_half(h0, w, None, 0)
             h1 = tmem_wait_n(*h1)
             with cute.arch.elect_one():
