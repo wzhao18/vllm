@@ -66,6 +66,12 @@ SHARED = ("shared_gu", "shared_down")
 # router || latent down pair, but in-step the concat also moves r24 onto route_stage):
 # r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
 ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# Rows whose latent up (stock's beta-add ``shared_out.addmm_(final, W^T)``) runs the
+# token-wide 2-CTA GEMM (``gemm.wide``, residual epilogue) with K split over the
+# given number of CTA pairs: weights requested before the PDL wait, released by the
+# MegaMoE top-k reduce at its entry (it outlives the MegaMoE grid, so the wait also
+# covers the shared expert's output).
+LATENT_UP_WIDE = {"*": "32:3,64:3,96:3"}
 
 
 class SplitKFront:
@@ -226,6 +232,16 @@ class SpMlp:
                 self.gemms[family] = DecodeProjection(
                     weight, self.rows, tactics, family=table
                 )
+            wide = {r: rows_policy(LATENT_UP_WIDE, Shape(r, 1), default=None)
+                    for r in self.rows}  # fmt: skip
+            wide = {r: s for r, s in wide.items() if s is not None}
+            self.latent_up_wide = None
+            if wide:
+                from ..cutedsl.gemm.wide import PreparedWide
+
+                self.latent_up_wide = PreparedWide(
+                    weights["latent_up"], wide, residual=True, shared_state=True
+                ).prepare()
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n
@@ -351,6 +367,11 @@ class SpMlp:
         norm = mlp.routed_output_transform.norm
         if norm is not None and fused_norm is None:
             final = norm(final)
+        wide = self.latent_up_wide
+        if wide is not None and n in wide.kernels:
+            if not (final.is_contiguous() and shared_out.is_contiguous()):
+                raise Unsupported("moe", n, "latent up wide: non-contiguous operands")
+            return wide.run(final, shared_out, residual=shared_out)
         return gemms["latent_up"].run(final, residual=shared_out)
 
 

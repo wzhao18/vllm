@@ -20,6 +20,11 @@ the PDL wait; the activations follow it.
 tile holds 64 gate rows then their 64 up rows; the owner applies vLLM's silu_and_mul
 (gate and up rounded to BF16, silu(gate) = gate / (1 + exp(-gate)) in IEEE FP32
 rounded to BF16, times up in FP32, BF16 out) and writes h [T, N / 2].
+
+``residual``: the stock beta-add ``r.addmm_(x, W^T)`` (the MoE latent up): the owner
+adds the BF16 residual r [T, N] to its FP32 split sum and rounds once (cuBLAS's
+alpha = beta = 1 epilogue); y may be r (in place: every 16 B is read, then written,
+by the same thread).
 """
 
 import cuda.bindings.driver as _cuda
@@ -32,7 +37,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from ..common.primitives import asm, div_rn
+from ..common.primitives import asm, div_rn, unpack_bf16
 
 CHUNK = 16  # token columns per exchange chunk (one tcgen05.ld 32x32b.x16)
 K_TILE = 64  # K per ring stage (one 128-byte swizzle atom)
@@ -106,6 +111,12 @@ def _st_v4(address, a, b, c, d):
 def _ld_v4(address):
     code = "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];"
     return code, "=f,=f,=f,=f,l", (Int64(address),)
+
+
+@asm((cutlass.Uint32,) * 4)
+def _ld_v4_b32(address):
+    code = "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];"
+    return code, "=r,=r,=r,=r,l,~{memory}", (Int64(address),)
 
 
 @asm()
@@ -219,9 +230,11 @@ def supports(rows, n, k, split, silu=False):
 class WideGemm:
     """One (rows, N, K, split, silu) specialization; see the module docstring."""
 
-    def __init__(self, rows, n, k, split, silu=False):
+    def __init__(self, rows, n, k, split, silu=False, residual=False):
         assert supports(rows, n, k, split, silu), (rows, n, k, split, silu)
+        assert not (silu and residual), "the beta-add form has no silu"
         self.rows, self.n, self.k, self.split, self.silu = rows, n, k, split, silu
+        self.residual = residual
         self.n_mma, self.chunks = mma_columns(rows)
         self.mma_tiler = (256, self.n_mma, K_TILE)
         self.threads = 256  # warps: 0+3 weights, 1 activations, 2 MMA, 4-7 epilogue
@@ -237,10 +250,11 @@ class WideGemm:
     @cute.jit
     def __call__(
         self, w: cute.Tensor, x: cute.Tensor, y: cute.Tensor, ws: cute.Tensor,
-        flags: cute.Tensor, stream: _cuda.CUstream,
+        flags: cute.Tensor, r: cute.Tensor, stream: _cuda.CUstream,
     ):  # fmt: skip
         """w (N, K, 1) and x (T, K, 1) K-major; y [T, N or N / 2] row-major BF16;
-        ws [split, N, T] FP32; flags [2 * N / 128] int32 (zeroed once)."""
+        ws [split, N, T] FP32; flags [2 * N / 128] int32 (zeroed once); r [T, N] BF16
+        (read with ``residual`` only)."""
         dtype = cutlass.BFloat16
         major = tcgen05.OperandMajorMode.K
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -287,7 +301,7 @@ class WideGemm:
         self.storage = Storage
         self.kernel(
             tiled_mma, tma_a, tma_w, tma_b, tma_x, cluster_vmnk, a_layout, b_layout,
-            y, ws, flags,
+            y, ws, flags, r,
         ).launch(  # fmt: skip
             grid=(2 * (self.n // 256), self.split, 1),
             block=[self.threads, 1, 1],
@@ -301,7 +315,7 @@ class WideGemm:
         self, tiled_mma: cute.TiledMma, tma_a: cute.CopyAtom, mW: cute.Tensor,
         tma_b: cute.CopyAtom, mX: cute.Tensor, cluster_vmnk: cute.Layout,
         a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
-        mY: cute.Tensor, mWs: cute.Tensor, mFlags: cute.Tensor,
+        mY: cute.Tensor, mWs: cute.Tensor, mFlags: cute.Tensor, mR: cute.Tensor,
     ):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
@@ -406,7 +420,7 @@ class WideGemm:
             self.epilogue(
                 acc, acc_full, st.xfer.ptr, warp - 4, lane, bidx, split_rank,
                 Int32(st.sA.data_ptr().toint()),
-                mY, mWs, mFlags,
+                mY, mWs, mFlags, mR,
             )  # fmt: skip
             if warp == 4:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=True)
@@ -450,7 +464,7 @@ class WideGemm:
     def epilogue(
         self, acc: cute.Tensor, acc_full, xfer, ew: Int32, lane: Int32, tile: Int32,
         split_rank: Int32, stage_addr: Int32, mY: cute.Tensor, mWs: cute.Tensor,
-        mFlags: cute.Tensor,
+        mFlags: cute.Tensor, mR: cute.Tensor,
     ):  # fmt: skip
         """Thread (ew, lane) owns TMEM lane / weight row r = 32 ew + lane of 128-row
         tile ``tile``. The FP32 partial is staged as [token][row] in the drained
@@ -512,12 +526,15 @@ class WideGemm:
             _st_u64(stamp + 32, _now())
         # 4. Sum in split order, round, store 16 B per thread-iteration.
         y = mY.iterator.toint()
+        rp = mR.iterator.toint()
         mine = stage_addr + split_rank * rbytes
         if cutlass.const_expr(not self.silu):
             for it in cutlass.range_constexpr((region * 16 + 127) // 128):
                 e = it * 128 + tid  # unit of 8 rows: token e // 16, rows 8 (e % 16)
                 if e < region * 16:
-                    self.store_plain(stage_addr, rbytes, mine, split_rank, y, tile, region, e)
+                    self.store_plain(
+                        stage_addr, rbytes, mine, split_rank, y, tile, region, e, rp
+                    )
         else:
             for it in cutlass.range_constexpr((region * 8 + 127) // 128):
                 e = it * 128 + tid  # unit: token e // 8, gate rows 8 (e % 8), their up rows
@@ -534,12 +551,19 @@ class WideGemm:
                     _st_relaxed(done, 0)
 
     @cute.jit
-    def store_plain(self, stage_addr, rbytes, mine, split_rank, y, tile, region, e):
+    def store_plain(self, stage_addr, rbytes, mine, split_rank, y, tile, region, e, rp):
         tok = e // 16
         total = self.sum8(stage_addr, rbytes, mine, tok * 512 + (e % 16) * 32, split_rank)
-        w = [_pack_bf16(total[2 * q], total[2 * q + 1]) for q in range(4)]
         t = split_rank * region + tok
-        _st_v4_b32(y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2, *w)
+        offset = (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2
+        if cutlass.const_expr(self.residual):
+            words = _ld_v4_b32(rp + offset)
+            for q in cutlass.range_constexpr(4):
+                lo, hi = unpack_bf16(words[q])
+                total[2 * q] = total[2 * q] + lo
+                total[2 * q + 1] = total[2 * q + 1] + hi
+        w = [_pack_bf16(total[2 * q], total[2 * q + 1]) for q in range(4)]
+        _st_v4_b32(y + offset, *w)
 
     @cute.jit
     def store_silu(self, stage_addr, rbytes, mine, split_rank, y, tile, region, e):
@@ -568,6 +592,7 @@ class WideGemm:
 
 
 _COMPILED = {}
+_STATE = {}  # (rows, N, K, split, device) -> PreparedWide shared_state buffers
 
 
 def permute_gate_up(weight):
@@ -582,35 +607,49 @@ def permute_gate_up(weight):
 class PreparedWide:
     """``WideGemm`` per prepared row count on one weight (``silu``: a gate_up weight
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
-    [T, N / 2] with ``silu``)."""
+    [T, N / 2] with ``silu``); with ``residual``: ``run(x, out, residual)`` =
+    out = residual + x @ W^T (out may be residual).
 
-    def __init__(self, weight, policies, silu=False):
-        self.silu = silu
+    ``shared_state``: the FP32 split workspace and the per-tile counters are shared by
+    every instance of one (rows, N, K, split) on a device (the kernels of one stream
+    never overlap: each one's last split re-arms the counters before it exits)."""
+
+    def __init__(self, weight, policies, silu=False, residual=False, shared_state=False):
+        self.silu, self.residual, self.shared_state = silu, residual, shared_state
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         self.policies = dict(policies)  # rows -> split
         self.kernels, self.state = {}, {}
+
+    def _state(self, rows, split, dev):
+        key = (rows, self.n, self.k, split, dev)
+        if self.shared_state and key in _STATE:
+            return _STATE[key]
+        ws = torch.empty(max(split, 1), self.n, rows, dtype=torch.float32, device=dev)
+        flags = torch.zeros(
+            2 * self.n // 128 + 16 * split * self.n // 128, dtype=torch.int32, device=dev
+        )
+        state = (ws, flags, self._ws(ws), self._ws(flags))
+        if self.shared_state:
+            _STATE[key] = state
+        return state
 
     def prepare(self):
         dev = self.weight.device
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, split in self.policies.items():
-            gemm = WideGemm(rows, self.n, self.k, split, self.silu)
+            gemm = WideGemm(rows, self.n, self.k, split, self.silu, self.residual)
             x = torch.empty(rows, self.k, dtype=torch.bfloat16, device=dev)
             cols = self.n // 2 if self.silu else self.n
             y = torch.empty(rows, cols, dtype=torch.bfloat16, device=dev)
-            ws = torch.empty(max(split, 1), self.n, rows, dtype=torch.float32, device=dev)
-            flags = torch.zeros(
-                2 * self.n // 128 + 16 * split * self.n // 128, dtype=torch.int32, device=dev
-            )
-            args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
-            key = (rows, self.n, self.k, split, self.silu)
+            self.state[rows] = state = self._state(rows, split, dev)
+            args = (w, self._x(x), self._y(y), state[2], state[3], self._y(y))
+            key = (rows, self.n, self.k, split, self.silu, self.residual)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
             self.kernels[rows] = _COMPILED[key]
-            self.state[rows] = (ws, flags, self._ws(ws), self._ws(flags))
         self.w = w
         return self
 
@@ -628,9 +667,14 @@ class PreparedWide:
     def _ws(t):
         return from_dlpack(t, assumed_align=16)
 
-    def run(self, x, out):
+    def run(self, x, out, residual=None):
+        if (residual is None) == self.residual:
+            raise ValueError(f"residual given: {residual is not None}, prepared: "
+                             f"{self.residual}")  # fmt: skip
         rows = x.shape[0]
         _, _, ws, flags = self.state[rows]
         stream = _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-        self.kernels[rows](self.w, self._x(x), self._y(out), ws, flags, stream)
+        y = self._y(out)
+        r = y if residual is None or residual is out else self._y(residual)
+        self.kernels[rows](self.w, self._x(x), y, ws, flags, r, stream)
         return out

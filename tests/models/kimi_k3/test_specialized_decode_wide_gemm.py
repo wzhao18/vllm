@@ -61,3 +61,32 @@ def test_wide_gemm(rows, n, k, split, silu):
         torch.cuda.synchronize()
         assert not out.isnan().any()
         assert _ulps(out, ref) <= bound
+
+
+@pytest.mark.parametrize(
+    "rows,n,k,split,in_place",
+    [(96, 768, 1536, 3, True), (32, 512, 1024, 2, True), (64, 512, 1024, 2, False)],
+)
+def test_wide_gemm_residual(rows, n, k, split, in_place):
+    """The beta-add form (stock ``residual.addmm_(x, W^T)``, the MoE latent up):
+    the FP32 sum plus the BF16 residual, rounded once."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.wide import (
+        PreparedWide,
+    )
+
+    torch.manual_seed(rows + n + k + split)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn(rows, n, device="cuda", dtype=torch.bfloat16)
+    gemm = PreparedWide(w, {rows: split}, residual=True).prepare()
+    ref = (res.float() + x.float() @ w.float().t()).bfloat16()
+    for _ in range(3):
+        if in_place:
+            out = res.clone()
+            gemm.run(x, out, residual=out)
+        else:
+            out = torch.full_like(res, float("nan"))
+            gemm.run(x, out, residual=res)
+        torch.cuda.synchronize()
+        assert not out.isnan().any()
+        assert _ulps(out, ref) <= 1
