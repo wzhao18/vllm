@@ -1362,24 +1362,24 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           // this rank's quota: its ties whose global id ranks below `need` among every
           // rank's ties (ids distinct, groups unsorted). Item (i, r2): how many of rank r2's
           // ties lie below this rank's tie i; only this rank's ties are ranked.
+          static_assert(kV2Band <= kV2T);
+          // (m <= kV2Band <= kV2T: one of this rank's ties per thread, ranked against
+          // every rank's ties in one pass; no rank array, atomics or extra barriers)
           const int m = s_tc[p.rank];
-          int* rk = reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win);
-          if (tid < m) rk[tid] = 0;
-          __syncthreads();
-          const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
-          for (int it = tid; it < m * W; it += kV2T) {
-            const int i = it / W, r2 = it - i * W;
-            const uint32_t x = my[i] & 0xFFFFFFu;
-            const uint32_t* g = rx + r2 * kV2Msg + kV2Fix + s_toff[r2];
-            const int n2 = s_tc[r2];
+          bool sel = false;
+          if (tid < m) {
+            const uint32_t x = rx[p.rank * kV2Msg + kV2Fix + s_toff[p.rank] + tid] & 0xFFFFFFu;
             int c = 0;
+            for (int r2 = 0; r2 < W; ++r2) {
+              const uint32_t* g = rx + r2 * kV2Msg + kV2Fix + s_toff[r2];
+              const int n2 = s_tc[r2];
 #pragma unroll 4
-            for (int j = 0; j < n2; ++j) c += (g[j] & 0xFFFFFFu) < x;
-            if (c) atomicAdd(&rk[i], c);
+              for (int j = 0; j < n2; ++j) c += (g[j] & 0xFFFFFFu) < x;
+            }
+            sel = c < need;
           }
-          __syncthreads();
           rt = 1;
-          qv = __syncthreads_count(tid < m && rk[tid] < need);
+          qv = __syncthreads_count(sel);
         }
       }
       if (tid == 0) {
