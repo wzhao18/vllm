@@ -29,6 +29,7 @@ blocks after the gate_up stream. DenseFlow streams both weights in one grid:
 """
 
 import functools
+import math
 
 import cuda.bindings.driver as _cuda
 import cutlass
@@ -42,7 +43,6 @@ from ..common.dies import smid
 from ..common.primitives import asm
 from . import dense_stream as ds
 from .dense_stream import (
-    _atom_cas,
     _fence_before,
     _fence_gpu,
     _ld_s32,
@@ -103,6 +103,12 @@ NO_SITU = 8  # timing only: h = gate * up instead of SiTU
 NO_STORE = 16  # timing only: h / y never stored
 FAST_TANH = 32  # timing only: approximate tanh
 NO_EARLY_PDL = 512
+
+
+@asm(Int32)
+def _atom_cas(address, compare, value):
+    code = "atom.relaxed.gpu.global.cas.b32 $0, [$1], $2, $3;"
+    return code, "=r,l,r,r,~{memory}", (Int64(address), Int32(compare), Int32(value))
 
 
 @asm(Int32)
@@ -836,6 +842,34 @@ def compile_dense_flow(op: DenseFlow, wa, x, wb, h, y, ws, sync, table, ranges, 
     return fn, args
 
 
+def _scatter(n):
+    """A multiplier coprime to ``n`` near ``n`` / golden ratio: neighbouring SMs (one
+    TPC / GPC) take far-apart slots."""
+    p = max(1, int(round(n * 0.618)))
+    while math.gcd(p, n) != 1:
+        p += 1
+    return p
+
+
+def slot_sms(domains):
+    """smid of each slot: die 0's slots [0, s0), then die 1's; within a die, the SM of
+    smid rank i takes slot (i * _scatter(s)) % s."""
+    groups = [[s for s, d in enumerate(domains) if d == die] for die in (0, 1)]
+    if not groups[1]:
+        groups = [[s for s, d in enumerate(domains) if d >= 0], []]
+    out = []
+    for group in groups:
+        n = len(group)
+        if not n:
+            continue
+        slots = [0] * n
+        mult = _scatter(n)
+        for i, sm in enumerate(group):
+            slots[(i * mult) % n] = sm
+        out += slots
+    return out
+
+
 def _bounds(units, weights):
     total, acc, out = sum(weights), 0.0, [0]
     for w in weights:
@@ -884,7 +918,7 @@ def flow_tables(op: DenseFlow, domains, weights=None, device=None):
     SM's A + B work)."""
     import torch
 
-    sms = ds.slot_sms(domains)
+    sms = slot_sms(domains)
     s0 = sum(1 for d in domains if d == 0)
     if not any(d == 1 for d in domains):
         s0 = len(sms)

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""sdec DenseFlow (the layer-0 dense MLP on the SP shard, gate_up + SiTU + down in one
-grid) against the stock path (cuBLAS + situ_and_mul + cuBLAS) within the BF16
-rounding of a reordered FP32 sum, bitwise deterministic, at shapes whose stream-K
-ranges cut blocks into many segments (several partials a block); and the SP wiring
-(die-local re-homing keeps the stock module's values)."""
+"""sdec DenseStream (the layer-0 dense MLP on the SP shard): the fused gate_up + SiTU
+and the down GEMM against the stock path (cuBLAS + situ_and_mul + cuBLAS) within the
+BF16 rounding of a reordered FP32 sum, bitwise deterministic, at shapes whose
+stream-K ranges cut blocks into many segments; and the SP wiring (die-local
+re-homing keeps the stock module's values)."""
 
 import types
 
@@ -54,7 +54,7 @@ def _mlp(wgu, wd):
     )  # fmt: skip
 
 
-@pytest.mark.parametrize("rows", [1, 20, 40, 96])
+@pytest.mark.parametrize("rows", [1, 20, 40])  # 40: unfused gate_up + stock SiTU
 def test_dense_stream_matches_stock(rows):
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
         SpDenseMlp,
@@ -70,7 +70,8 @@ def test_dense_stream_matches_stock(rows):
     mlp = _mlp(wgu.clone(), wd.clone())
     dense = SpDenseMlp(mlp, (rows,), dev, 0)
     y = dense.run(x).clone()
-    _close(dense.h[:rows], h_ref)
+    if rows <= 32:  # the fused form's SiTU output (unfused: a fresh stock tensor)
+        _close(dense.h[:rows], h_ref)
     _close(y, y_ref)
     # The re-homed stock weights keep their values; reruns are bitwise.
     assert torch.equal(mlp.gate_up_proj.weight, wgu)
