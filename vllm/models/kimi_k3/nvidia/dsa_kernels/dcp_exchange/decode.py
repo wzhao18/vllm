@@ -55,6 +55,7 @@ import os as _os  # noqa: E402
 
 _DUMP_DIR = _os.environ.get("K31_TOPK_DUMP_DIR", "")
 _DUMP_STEPS = int(_os.environ.get("K31_TOPK_DUMP_STEPS", "3"))
+_DUMP_ROWS = int(_os.environ.get("K31_TOPK_DUMP_ROWS", "0"))  # 0: any step
 _DUMP_N: dict = {}
 
 # Serving spin deadline (s): long enough that a rank stalled on the host (cold JIT, GC,
@@ -305,7 +306,7 @@ class DcpxDecode:
             dp = get_dp_group().rank_in_group
         except Exception:  # noqa: BLE001
             dp = 0
-        if dp != 0:
+        if dp != 0 or (_DUMP_ROWS and rows != _DUMP_ROWS):
             return
         import re
 
