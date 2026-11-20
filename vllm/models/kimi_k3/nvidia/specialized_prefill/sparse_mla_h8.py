@@ -95,23 +95,27 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
 P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
 NS = 6  # 64-key KV stages
 NP = 3  # P buffers
-NLD = 9  # gather warps
 GATHER_PARTS = 1  # issuing lanes per quad (P-MLA run95)
 STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
 # warps: 0-3 / 4-7 softmax warpgroups (thread = head; warps 3 and 7 hold padding rows
 # 96-127 and only take part in barriers, rescales, Q copies and epilogues), 8 PV,
 # 9 Q loader, 10 and 12-19 gather, 11 QK
 W_SM, W_PV, W_Q, W_QK = 8, 8, 9, 11
-# 20-23: RoPE LDG warps (P-MLA M7): the 64 B RoPE piece of every stage row is loaded by
-# 16 B LDGs and written with st.shared, a second delivery path beside the per-SM TMA
-# gather4 op rate (~11-14 clk/op, hwdb hw31; LDG and gather4 add up, hw31b): 64 instead
-# of 80 gather4 ops per 64-key stage
-W_LDG, NLDG = 20, 4
-THREADS = 32 * 24
-REG_LAUNCH = 65536 // THREADS // 8 * 8  # 80
-REG_SM, REG_LOW = 144, 48
+# LDG row-producer warps (P-MLA M8): the last NLDG of the 9 producer warps (warps
+# 20 - NLDG .. 19) deliver the 64 B RoPE piece of every stage row plus the 512 B latent
+# rows of the last LQ quads of the stage by 16 B LDGs (one stage ahead in registers) and
+# st.shared into the swizzled stage tiles: a second delivery path beside the per-SM TMA
+# gather4 op rate (hwdb hw31; LDG and gather4 add up, hw31b; LDG st.shared keeps ~half
+# its rate under streaming MMA operand reads while gather4 writes starve, hw33). The
+# other 9 - NLDG gather warps issue 4 x (16 - LQ) gather4 ops per 64-key stage. The CTA
+# stays at 20 warps: ptxas honours the softmax setmaxnreg budget above the launch count
+# only up to 640 threads (24 warps: "Insufficient registers (80)", P-MLA run134).
+NPROD, NLDG, LQ = 9, 4, 4
+THREADS = 32 * 20
+REG_LAUNCH = 65536 // THREADS // 8 * 8  # 96
+REG_SM = 144
+REG_LOW = (THREADS * REG_LAUNCH - 256 * REG_SM) // (THREADS - 256) // 8 * 8  # 64
 assert 256 * REG_SM + (THREADS - 256) * REG_LOW <= THREADS * REG_LAUNCH
-
 # shared memory (bytes). SS A tiles have M = 128 rows; only 96 are loaded and rows
 # 96-127 read whatever follows (valid shared memory, padding rows of S only).
 ATOM = H * 128  # one Q latent SW128 atom (96 rows x 128 B)
@@ -311,9 +315,22 @@ class SparseMlaPrefillH8:
         # gskip (timing only): skip the last gskip gather4 ops of every quad (RoPE, then
         # latent atoms 3, 2, ...): stale stage data
         # cpa: the RoPE 64 B of every row by per-lane cp.async instead of TMA gather4
-        knobs = tuple(knobs) + (0,) * (11 - len(knobs))
+        # nldg1: LDG producer warps + 1 (0: NLDG); lq1: latent quads per stage delivered
+        # by them + 1 (0: LQ); timing A/B knobs
+        knobs = tuple(knobs) + (0,) * (13 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
-         self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa) = knobs[:11]
+         self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
+         self.nldg, lq1) = knobs[:13]
+        self.nldg = self.nldg - 1 if self.nldg else NLDG
+        self.lq = lq1 - 1 if lq1 else LQ
+        if self.cpa:
+            self.nldg, self.lq = 0, 0
+        self.nld = NPROD - self.nldg  # gather4 warps
+        assert self.nld >= 1 and self.lq <= 8 * self.nldg, knobs
+        nt = 32 * max(self.nldg, 1)
+        assert self.nldg == 0 or (256 % nt == 0 and (self.lq * 128) % nt == 0), knobs
+        self.ldg_chunks = (256 + self.lq * 128) // nt if self.nldg else 0  # 16 B / thread
+        assert self.ldg_chunks <= 8, knobs
         if not self.parts:
             self.parts = GATHER_PARTS
         if self.sstamp and not self.ssmask:
@@ -373,7 +390,7 @@ class SparseMlaPrefillH8:
                 mbar_init(_bar(base, B_PEMPTY + j), Uint32(1))
             for s in cutlass.range_constexpr(NS):
                 mbar_init(_bar(base, B_KVFULL + s),
-                          Uint32(1 + (256 if self.cpa else NLDG)))
+                          Uint32(1 + (256 if self.cpa else self.nldg)))
                 mbar_init(_bar(base, B_KVEMPTY + s), Uint32(1))
             cute.arch.mbarrier_init_fence()
         if warp == 0:
@@ -391,18 +408,17 @@ class SparseMlaPrefillH8:
         else:
             cute.arch.warpgroup_reg_dealloc(REG_LOW)
             taddr = Uint32(cute.arch.make_warp_uniform(taddr))
-            if warp >= W_LDG:
-                if cutlass.const_expr(not self.cpa):  # cpa: RoPE by the gather warps
-                    self.ldg_loader(base, warp - W_LDG, lane, cta, n_mine, unit_rows,
-                                    slots, slot_stride, lengths, kvp)
+            if warp >= 20 - self.nldg:
+                self.ldg_loader(base, warp - (20 - self.nldg), lane, cta, n_mine,
+                                unit_rows, slots, slot_stride, lengths, kvp)
             elif warp == W_PV:
                 self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
             elif warp == W_QK:
                 self.qk_loop(base, lane, taddr, n_mine, lengths, cta)
             else:
-                pw = warp - (W_Q + 1)  # gather 10 -> 0, 12-19 -> 1-8; Q warp 9 -> NLD
+                pw = warp - (W_Q + 1)  # gather 10 -> 0, 12.. -> 1..; Q warp 9 -> nld
                 if warp == W_Q:
-                    pw = Int32(NLD)
+                    pw = Int32(self.nld)
                 elif warp > W_QK:
                     pw = warp - (W_Q + 2)
                 self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
@@ -429,10 +445,14 @@ class SparseMlaPrefillH8:
                              + Uint32(((u - 16) * 32 + Int32(slot)) * 4))
 
     def _tma_ops(self):
-        return 4 if self.cpa else min(4, 5 - self.gskip)  # RoPE: cp.async / LDG warps
+        if self.cpa or self.nldg:  # RoPE: cp.async / LDG warps
+            return min(4, 5 - self.gskip)
+        return 5 - self.gskip
 
     def _skipped(self):
-        return sum((4096 if a == 4 else 8192) for a in range(self._tma_ops(), 5))
+        """stage bytes not delivered by the gather4 ops (LDG warps / gskip)."""
+        return sum((4096 if a == 4 else 8192) for a in range(self._tma_ops(), 5)) + (
+            self.lq * 4 * 512)
 
     @cute.jit
     def lpin(self, base, cta, lane, g):
@@ -446,10 +466,11 @@ class SparseMlaPrefillH8:
     @cute.jit
     def loader(self, base, pw, lane, cta, n_mine, tm_qn, tm_qr, tm_kv, tm_kr, unit_rows,
                slots, slot_stride, lengths, kvp):
-        quads = (16 - pw + NLD - 1) // NLD
+        nld = self.nld
+        quads = (16 - self.lq - pw + nld - 1) // nld
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
-        if pw == NLD:
+        if pw == nld:
             # Q warp: atoms 0-1 staging (single) is free once token qi - 1's Q is in TMEM
             # and token qi - 2's epilogue has stored its staging; SS buffer qi % 2 once
             # token qi - 2's last QK is done
@@ -475,7 +496,7 @@ class SparseMlaPrefillH8:
             # (hwdb 17: ~32 issuers per SM); the 4 slot indices are loaded one stage ahead
             npart = self.parts
             part = lane % npart
-            q = pw + NLD * (lane // npart)
+            q = pw + nld * (lane // npart)
             act = lane < quads * npart
             if not act:
                 q = pw  # idle lanes read a valid slot of the stage (unused)
@@ -563,45 +584,116 @@ class SparseMlaPrefillH8:
                     g = g + 1
 
     @cute.jit
-    def ldg_rope(self, kvp, unit_rows, rc, key, n, ch):
-        """16 B chunk ch of the RoPE piece of KV slot rc (zeros past n or for rc < 0,
-        as the TMA gather4 zero fill)."""
+    def ldg_chunk(self, kvp, unit_rows, rc, key, n, goff):
+        """16 B at byte goff of the row of KV slot rc (zeros past n or for rc < 0, as the
+        TMA gather4 zero fill)."""
         go = Int32(0)
         if rc >= 0 and key < n:
             go = Int32(1)
-        src = kvp + Int64((rc >> 6) * unit_rows + (rc & 63)) * Int64(ROW) + Int64(
-            D_NOPE + 16 * ch)
+        src = kvp + Int64((rc >> 6) * unit_rows + (rc & 63)) * Int64(ROW) + Int64(goff)
         return ld_global_v4_pred(src, go)
 
     @cute.jit
     def ldg_loader(self, base, lw, lane, cta, n_mine, unit_rows, slots, slot_stride,
                    lengths, kvp):
-        """RoPE pieces of every 64-key stage (rows lw * 8 + lane // 4 and + 32, chunk
-        lane % 4) by LDG one stage ahead, st.shared into the SW64 RoPE tile, then one
-        KV-full arrival per warp (generic -> async proxy fence first)."""
+        """Producer of the LDG part of every 64-key stage: the RoPE piece of rows 0-63 (SW64
+        tile, 4 chunks per row) and the latent 512 B of rows 64 - 4 lq .. 63 (the 4 SW128
+        atoms, 8 chunks each). Chunk c = thread + j * (32 nldg), j < ldg_chunks: loaded by
+        LDG one stage ahead (slot indices two ahead), st.shared once the stage is free, then
+        one KV-full arrival per warp (generic -> async proxy fence first)."""
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
-        ra = lw * 8 + lane // 4
-        rb = ra + 32
-        ch = lane % 4
-        oa = Uint32(4 * 8192) + Uint32(ra * 64) + (
-            (Uint32(ch) ^ ((Uint32(ra) >> Uint32(1)) & Uint32(3))) << Uint32(4))
-        ob = Uint32(4 * 8192) + Uint32(rb * 64) + (
-            (Uint32(ch) ^ ((Uint32(rb) >> Uint32(1)) & Uint32(3))) << Uint32(4))
+        nt = 32 * self.nldg
+        nrope = 256 // nt
+        nck = self.ldg_chunks
+        tix = lw * 32 + lane
+        rr = []  # stage row of chunk j
+        so = []  # shared offset in the stage
+        go = []  # byte offset in the KV row
+        for j in cutlass.range_constexpr(8):
+            jj = min(j, nck - 1)
+            if cutlass.const_expr(jj < nrope):
+                c = tix + jj * nt
+                r = c // 4
+                ch = c % 4
+                rr.append(r)
+                so.append(Uint32(4 * 8192) + Uint32(r * 64) + (
+                    (Uint32(ch) ^ ((Uint32(r) >> Uint32(1)) & Uint32(3))) << Uint32(4)))
+                go.append(D_NOPE + 16 * ch)
+            else:
+                c = tix + (jj * nt - 256)
+                r = (64 - 4 * self.lq) + c // 32
+                b = c % 32
+                rr.append(r)
+                so.append(Uint32(b // 8) * Uint32(8192) + Uint32(r * 128) + (
+                    (Uint32(b % 8) ^ (Uint32(r) & Uint32(7))) << Uint32(4)))
+                go.append(16 * b)
+        z = Int32(0)
+        one = Int32(1)
         g = Int32(0)
         for qi in range(n_mine):
             row = cta + qi * self.grid
             n = lens[row]
             subs = _subs(n)
             srow = slots + Int64(row) * Int64(slot_stride) * Int64(4)
-            one = Int32(1)
-            ia = ld_global_s32_pred(srow + Int64(4 * ra), one)
-            ib = ld_global_s32_pred(srow + Int64(4 * rb), one)
-            a0, a1, a2, a3 = self.ldg_rope(kvp, unit_rows, ia, ra, n, ch)
-            b0, b1, b2, b3 = self.ldg_rope(kvp, unit_rows, ib, rb, n, ch)
+            i0 = Int32(-1)
+            x0a, x0b, x0c, x0d = z, z, z, z
+            i1 = Int32(-1)
+            x1a, x1b, x1c, x1d = z, z, z, z
+            i2 = Int32(-1)
+            x2a, x2b, x2c, x2d = z, z, z, z
+            i3 = Int32(-1)
+            x3a, x3b, x3c, x3d = z, z, z, z
+            i4 = Int32(-1)
+            x4a, x4b, x4c, x4d = z, z, z, z
+            i5 = Int32(-1)
+            x5a, x5b, x5c, x5d = z, z, z, z
+            i6 = Int32(-1)
+            x6a, x6b, x6c, x6d = z, z, z, z
+            i7 = Int32(-1)
+            x7a, x7b, x7c, x7d = z, z, z, z
+            if cutlass.const_expr(nck > 0):
+                i0 = ld_global_s32_pred(srow + Int64(4 * rr[0]), one)
+                x0a, x0b, x0c, x0d = self.ldg_chunk(kvp, unit_rows, i0, rr[0], n, go[0])
+            if cutlass.const_expr(nck > 1):
+                i1 = ld_global_s32_pred(srow + Int64(4 * rr[1]), one)
+                x1a, x1b, x1c, x1d = self.ldg_chunk(kvp, unit_rows, i1, rr[1], n, go[1])
+            if cutlass.const_expr(nck > 2):
+                i2 = ld_global_s32_pred(srow + Int64(4 * rr[2]), one)
+                x2a, x2b, x2c, x2d = self.ldg_chunk(kvp, unit_rows, i2, rr[2], n, go[2])
+            if cutlass.const_expr(nck > 3):
+                i3 = ld_global_s32_pred(srow + Int64(4 * rr[3]), one)
+                x3a, x3b, x3c, x3d = self.ldg_chunk(kvp, unit_rows, i3, rr[3], n, go[3])
+            if cutlass.const_expr(nck > 4):
+                i4 = ld_global_s32_pred(srow + Int64(4 * rr[4]), one)
+                x4a, x4b, x4c, x4d = self.ldg_chunk(kvp, unit_rows, i4, rr[4], n, go[4])
+            if cutlass.const_expr(nck > 5):
+                i5 = ld_global_s32_pred(srow + Int64(4 * rr[5]), one)
+                x5a, x5b, x5c, x5d = self.ldg_chunk(kvp, unit_rows, i5, rr[5], n, go[5])
+            if cutlass.const_expr(nck > 6):
+                i6 = ld_global_s32_pred(srow + Int64(4 * rr[6]), one)
+                x6a, x6b, x6c, x6d = self.ldg_chunk(kvp, unit_rows, i6, rr[6], n, go[6])
+            if cutlass.const_expr(nck > 7):
+                i7 = ld_global_s32_pred(srow + Int64(4 * rr[7]), one)
+                x7a, x7b, x7c, x7d = self.ldg_chunk(kvp, unit_rows, i7, rr[7], n, go[7])
             if subs > 1:
-                ia = ld_global_s32_pred(srow + Int64(4 * (64 + ra)), one)
-                ib = ld_global_s32_pred(srow + Int64(4 * (64 + rb)), one)
+                nx = srow + Int64(4 * 64)
+                if cutlass.const_expr(nck > 0):
+                    i0 = ld_global_s32_pred(nx + Int64(4 * rr[0]), one)
+                if cutlass.const_expr(nck > 1):
+                    i1 = ld_global_s32_pred(nx + Int64(4 * rr[1]), one)
+                if cutlass.const_expr(nck > 2):
+                    i2 = ld_global_s32_pred(nx + Int64(4 * rr[2]), one)
+                if cutlass.const_expr(nck > 3):
+                    i3 = ld_global_s32_pred(nx + Int64(4 * rr[3]), one)
+                if cutlass.const_expr(nck > 4):
+                    i4 = ld_global_s32_pred(nx + Int64(4 * rr[4]), one)
+                if cutlass.const_expr(nck > 5):
+                    i5 = ld_global_s32_pred(nx + Int64(4 * rr[5]), one)
+                if cutlass.const_expr(nck > 6):
+                    i6 = ld_global_s32_pred(nx + Int64(4 * rr[6]), one)
+                if cutlass.const_expr(nck > 7):
+                    i7 = ld_global_s32_pred(nx + Int64(4 * rr[7]), one)
             for t in cutlass.range(subs, unroll=1):
                 s = g % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
@@ -609,19 +701,70 @@ class SparseMlaPrefillH8:
                     mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
                 cute.arch.sync_warp()
                 if cutlass.const_expr(not self.no_gather):
-                    st_shared_v4(st + oa, a0, a1, a2, a3)
-                    st_shared_v4(st + ob, b0, b1, b2, b3)
+                    if cutlass.const_expr(nck > 0):
+                        st_shared_v4(st + so[0], x0a, x0b, x0c, x0d)
+                    if cutlass.const_expr(nck > 1):
+                        st_shared_v4(st + so[1], x1a, x1b, x1c, x1d)
+                    if cutlass.const_expr(nck > 2):
+                        st_shared_v4(st + so[2], x2a, x2b, x2c, x2d)
+                    if cutlass.const_expr(nck > 3):
+                        st_shared_v4(st + so[3], x3a, x3b, x3c, x3d)
+                    if cutlass.const_expr(nck > 4):
+                        st_shared_v4(st + so[4], x4a, x4b, x4c, x4d)
+                    if cutlass.const_expr(nck > 5):
+                        st_shared_v4(st + so[5], x5a, x5b, x5c, x5d)
+                    if cutlass.const_expr(nck > 6):
+                        st_shared_v4(st + so[6], x6a, x6b, x6c, x6d)
+                    if cutlass.const_expr(nck > 7):
+                        st_shared_v4(st + so[7], x7a, x7b, x7c, x7d)
                     fence_async_smem()
                 cute.arch.sync_warp()
                 if lane == 0:
                     mbar_arrive(_bar(base, B_KVFULL + s))
                 if t + 1 < subs:
                     key = (t + 1) * 64
-                    a0, a1, a2, a3 = self.ldg_rope(kvp, unit_rows, ia, key + ra, n, ch)
-                    b0, b1, b2, b3 = self.ldg_rope(kvp, unit_rows, ib, key + rb, n, ch)
+                    if cutlass.const_expr(nck > 0):
+                        x0a, x0b, x0c, x0d = self.ldg_chunk(
+                            kvp, unit_rows, i0, key + rr[0], n, go[0])
+                    if cutlass.const_expr(nck > 1):
+                        x1a, x1b, x1c, x1d = self.ldg_chunk(
+                            kvp, unit_rows, i1, key + rr[1], n, go[1])
+                    if cutlass.const_expr(nck > 2):
+                        x2a, x2b, x2c, x2d = self.ldg_chunk(
+                            kvp, unit_rows, i2, key + rr[2], n, go[2])
+                    if cutlass.const_expr(nck > 3):
+                        x3a, x3b, x3c, x3d = self.ldg_chunk(
+                            kvp, unit_rows, i3, key + rr[3], n, go[3])
+                    if cutlass.const_expr(nck > 4):
+                        x4a, x4b, x4c, x4d = self.ldg_chunk(
+                            kvp, unit_rows, i4, key + rr[4], n, go[4])
+                    if cutlass.const_expr(nck > 5):
+                        x5a, x5b, x5c, x5d = self.ldg_chunk(
+                            kvp, unit_rows, i5, key + rr[5], n, go[5])
+                    if cutlass.const_expr(nck > 6):
+                        x6a, x6b, x6c, x6d = self.ldg_chunk(
+                            kvp, unit_rows, i6, key + rr[6], n, go[6])
+                    if cutlass.const_expr(nck > 7):
+                        x7a, x7b, x7c, x7d = self.ldg_chunk(
+                            kvp, unit_rows, i7, key + rr[7], n, go[7])
                     if t + 2 < subs:
-                        ia = ld_global_s32_pred(srow + Int64(4 * (key + 64 + ra)), one)
-                        ib = ld_global_s32_pred(srow + Int64(4 * (key + 64 + rb)), one)
+                        nx = srow + Int64(4 * (key + 64))
+                        if cutlass.const_expr(nck > 0):
+                            i0 = ld_global_s32_pred(nx + Int64(4 * rr[0]), one)
+                        if cutlass.const_expr(nck > 1):
+                            i1 = ld_global_s32_pred(nx + Int64(4 * rr[1]), one)
+                        if cutlass.const_expr(nck > 2):
+                            i2 = ld_global_s32_pred(nx + Int64(4 * rr[2]), one)
+                        if cutlass.const_expr(nck > 3):
+                            i3 = ld_global_s32_pred(nx + Int64(4 * rr[3]), one)
+                        if cutlass.const_expr(nck > 4):
+                            i4 = ld_global_s32_pred(nx + Int64(4 * rr[4]), one)
+                        if cutlass.const_expr(nck > 5):
+                            i5 = ld_global_s32_pred(nx + Int64(4 * rr[5]), one)
+                        if cutlass.const_expr(nck > 6):
+                            i6 = ld_global_s32_pred(nx + Int64(4 * rr[6]), one)
+                        if cutlass.const_expr(nck > 7):
+                            i7 = ld_global_s32_pred(nx + Int64(4 * rr[7]), one)
                 g = g + 1
 
     # ------------------------------------------------------------------ MMA
