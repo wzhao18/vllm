@@ -425,6 +425,27 @@ def is_flashinfer_recurrent_kda_prefill_supported(
     )
 
 
+def frost_out_feeds_o_norm(
+    flashkda_out: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    frost_out: torch.Tensor,
+    o_mxfp8: Mxfp8Buffer | None,
+) -> bool:
+    """Whether a FROST / persistent prefill output may skip its copy into
+    ``core_attn_out``: only on a pure prefill step (the output covers all of
+    ``core_attn_out``) whose gated o_norm is the MXFP8 prefill kernel, the one
+    o_norm that reads the FROST output (``o_norm_mxfp8(prefill_core_out)``).
+    Every other o_norm (the in-place ``kda_norm.rmsnorm_gated_`` that runs when
+    o_proj takes BF16 input, e.g. under the TP fused GEMM-AR o_proj) normalizes
+    ``core_attn_out`` itself, so the output must land there first: skipping the
+    copy left it uninitialized (NaN / non-reproducible TP8 + DCP8 prefill)."""
+    return (
+        o_mxfp8 is not None
+        and flashkda_out.data_ptr() == core_attn_out.data_ptr()
+        and frost_out.shape[1] == core_attn_out.shape[1]
+    )
+
+
 def _flashkda_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1714,9 +1735,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     cu_seqlens=non_spec_query_start_loc,
                                 )
                             )
-                        if (
-                            flashkda_out.data_ptr() == core_attn_out.data_ptr()
-                            and frost_out.shape[1] == core_attn_out.shape[1]
+                        if frost_out_feeds_o_norm(
+                            flashkda_out, core_attn_out, frost_out, o_mxfp8
                         ):
                             # Pure prefill: o_norm reads the FROST output.
                             prefill_core_out = frost_out
