@@ -210,6 +210,28 @@ def st_global_bf16(ptr, v):
             "l,f,~{memory}", (Int64(ptr), Float32(v)))
 
 
+@asm(Uint32)
+def pack_bf16x2(lo, hi):
+    """BF16 pair (lo in the low half), each rounded to nearest even."""
+    return "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", (Float32(lo), Float32(hi))
+
+
+@asm(Uint32)
+def shfl_xor_u32(v, m):
+    return "shfl.sync.bfly.b32 $0, $1, $2, 0x1f, 0xffffffff;", "=r,r,r", (
+        Uint32(v), Uint32(m))
+
+
+@asm(Uint32)
+def prmt(a, b, sel):
+    return "prmt.b32 $0, $1, $2, $3;", "=r,r,r,r", (Uint32(a), Uint32(b), Uint32(sel))
+
+
+@asm()
+def st_global_u32(ptr, v):
+    return "st.global.b32 [$0], $1;", "l,r,~{memory}", (Int64(ptr), Uint32(v))
+
+
 @asm()
 def st_global_bf16x2(ptr, lo, hi):
     return ("{ .reg .b32 t; cvt.rn.bf16x2.f32 t, $2, $1; st.global.b32 [$0], t; }",
@@ -253,7 +275,8 @@ class SparseMlaDecodeKM:
         self.gather_only = gather_only
         # bench knob: KV stages complete without loading (the MMA / softmax chain on
         # stale stage bytes: the attention time if the gather were free)
-        self.no_gather = no_gather
+        self.tile_load = no_gather == 2  # bench probe: contiguous 2D tile loads
+        self.no_gather = bool(no_gather) and not self.tile_load
         self.epi_store = epi_store  # bench knob: False drops the epilogue's stores
         self.tb = cpa if cpa else 4
         self.cpa_chunks = (4 - self.tb) * 8 + 4  # 16 B chunks per row by cp.async
@@ -311,19 +334,24 @@ class SparseMlaDecodeKM:
             kv, u8, (ROW, kv_count), (ROW,), (128, 1), sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
         kvr = tensormap.encode_map(
             kv, u8, (ROW, kv_count), (ROW,), (64, 1), sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
+        kvt = tensormap.encode_map(
+            kv, u8, (ROW, kv_count), (ROW,), (128, TN), sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
+        kvrt = tensormap.encode_map(
+            kv, u8, (ROW, kv_count), (ROW,), (64, TN), sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
         qn = tensormap.encode_map(
             q, u8, (D_NOPE, rows * q_heads), (ROW,), (128, H),
             sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
         qr = tensormap.encode_map(
             q + D_NOPE, u8, (64, rows * q_heads), (ROW,), (64, H),
             sw.CU_TENSOR_MAP_SWIZZLE_64B, l2)
-        self.kernel(kvm, kvr, qn, qr, kv, q, q_heads, rows, slots, slot_stride, valid, out,
+        self.kernel(kvm, kvr, kvt, kvrt, qn, qr, kv, q, q_heads, rows, slots, slot_stride, valid, out,
                     out_stride, lse, lse_stride, scale_log2, out_scale, stamp).launch(
             grid=(self.grid, 1, 1), block=(self.threads, 1, 1), smem=self.smem,
             stream=stream)
 
     @cute.kernel
     def kernel(self, kvm: tensormap.GridMap, kvr: tensormap.GridMap,
+               kvt: tensormap.GridMap, kvrt: tensormap.GridMap,
                qn: tensormap.GridMap, qr: tensormap.GridMap, kv: Int64, qp: Int64,
                q_heads: Int32,
                rows: Int32, slots: Int64, slot_stride: Int32, valid: Int64, out: Int64,
@@ -392,7 +420,9 @@ class SparseMlaDecodeKM:
             if (warp == 3) | (warp >= NW):
                 lw = cutlass.select_(warp >= NW, warp - NW + 1, 0)
                 self.loader(base, lw, lane, cta, n_mine, tensormap.map_address(kvm),
-                            tensormap.map_address(kvr), kv, qp, q_heads)
+                            tensormap.map_address(kvr), kv, qp, q_heads,
+                            tensormap.map_address(kvt), tensormap.map_address(kvrt),
+                            stamp)
         tc_fence_before()
         cute.arch.sync_threads()
         if warp == 0:
@@ -439,7 +469,8 @@ class SparseMlaDecodeKM:
                 prefetch_l2(a + Int64(128 * j))
 
     @cute.jit
-    def loader(self, base, lw, lane, cta, n_mine, tm_kv, tm_kr, kv, qp, q_heads):
+    def loader(self, base, lw, lane, cta, n_mine, tm_kv, tm_kr, kv, qp, q_heads, tm_kt,
+               tm_krt, stamp):
         """Loader warp lw, lane m: 4-row quad lw + L m of every tile; warp 0 arms.
         With ``prefetch``: a row's tiles 1.. and the next row's keys are prefetched
         into L2 once their slot lists are in SMEM."""
@@ -466,6 +497,8 @@ class SparseMlaDecodeKM:
                     if lane == 0:
                         mbar_wait(self.bar(base, B_KVEMPTY + s),
                                   ((g // self.stages) & 1) ^ 1)
+                        if (lw == 0) & (g < 8):
+                            self.mark(stamp, cta, 56 + g)
                         if cutlass.const_expr(self.no_gather):
                             if lw == 0:
                                 mbar_arrive(full)
@@ -476,8 +509,17 @@ class SparseMlaDecodeKM:
                                 else:
                                     mbar_arrive_tx(full, Uint32(STAGE))
                     cute.arch.sync_warp()
+                    if cutlass.const_expr(self.tile_load):
+                        if (lw == 0) & (lane == 0):
+                            r0 = Int32(ld_shared_u32(srow + Uint32(t * TN) * Uint32(4)))
+                            for a in cutlass.range_constexpr(4):
+                                tma_tile2d(st + Uint32(a * TN * 128), tm_kt, full,
+                                           Int32(128 * a), r0)
+                            tma_tile2d(st + Uint32(4 * TN * 128), tm_krt, full,
+                                       Int32(D_NOPE), r0)
                     quad = lw + self.loaders * lane
-                    if (lane < per) & (quad < (0 if self.no_gather else 32)):
+                    if (lane < per) & (quad < (0 if (self.no_gather or self.tile_load)
+                                                else 32)):
                         key = t * TN + 4 * quad
                         r = ld_shared_v4(srow + Uint32(key) * Uint32(4))
                         r0, r1, r2, r3 = Int32(r[0]), Int32(r[1]), Int32(r[2]), Int32(r[3])
@@ -620,7 +662,7 @@ class SparseMlaDecodeKM:
                         mbar_wait(self.bar(base, B_OEMPTY), (ro & 1) ^ 1)
                     b = g & 1
                     mbar_wait(self.bar(base, B_PFULL + b), (g >> 1) & 1)
-                    if ro * 8 + t < 8:
+                    if ro * 8 + t < 0:
                         self.mark(stamp, cta, 56 + t)
                     tc_fence_after()
                     s = g % self.stages
@@ -823,6 +865,10 @@ class SparseMlaDecodeKM:
                 mbar_wait(self.bar(base, B_PVDONE + (gl & 1)), (gl >> 1) & 1)
                 tc_fence_after()
                 odd = lane & 1
+                # Lane pairs: each packs its two heads' BF16 at its dim, swaps the pair
+                # with its neighbour, and keeps two adjacent dims of one head (even
+                # lanes head h: low halves, odd lanes head h + 1: high halves).
+                sel = cutlass.select_(odd == 1, Uint32(0x3276), Uint32(0x5410))
                 dst = out + (Int64(row) * Int64(out_stride)
                              + Int64(quarter * 32 + lane - odd)) * Int64(2)
                 fin = lfin + Uint32(4 * h0)
@@ -837,15 +883,12 @@ class SparseMlaDecodeKM:
                         i4 = ld_shared_v4f(fin + Uint32(16 * e))
                         for f in cutlass.range_constexpr(2):
                             h = 4 * e + 2 * f
-                            a = ov[h] * i4[2 * f]
-                            b2 = ov[h + 1] * i4[2 * f + 1]
-                            x = shfl_xor(cutlass.select_(odd == 1, a, b2), 1)
-                            lo = cutlass.select_(odd == 1, x, a)
-                            hi = cutlass.select_(odd == 1, b2, x)
+                            c = pack_bf16x2(ov[h] * i4[2 * f], ov[h + 1] * i4[2 * f + 1])
+                            w = prmt(c, shfl_xor_u32(c, Uint32(1)), sel)
                             if cutlass.const_expr(self.epi_store):
-                                st_global_bf16x2(
+                                st_global_u32(
                                     dst + Int64(((h0 + h + odd) * D_NOPE + 128 * blk)
-                                                * 2), lo, hi)
+                                                * 2), w)
                 if (warp == SOFT0) & (lane == 0) & (ro < 2):
                     self.mark(stamp, cta, 14 + 16 * ro)
                 ro = ro + 1
