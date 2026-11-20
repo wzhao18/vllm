@@ -55,6 +55,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.conv_skel = next((i for i in (1, 2, 3, 4) if f"cskel{i}" in flags), 0)
         # Branch-free column pass (epilogue_kda_conv_t2) unless "ct1".
         self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
+        self.conv_scalar_silu = "sc" in flags
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
