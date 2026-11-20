@@ -1496,7 +1496,16 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
 
         def _snap(tag, out):
             states.append((tag, out.clone(), block.attn_out[:r].clone(),
-                           [t.clone() for t in rec.get("t", [])]))
+                           [t.clone() for t in rec.get("t", [])],
+                           [t.clone() for t in rec.get("o", [])]))
+
+        def _ulps(a, b):
+            a, b = a.float(), b.float()
+            diff = (a - b).abs()
+            mag = torch.maximum(a.abs(), b.abs()).clamp_min(1e-30)
+            ulp = torch.exp2(torch.floor(torch.log2(mag)) - 7)
+            u = (diff / ulp)[diff > 0]
+            return f"ulps max {u.max().item() if u.numel() else 0:.1f} >1ulp {int((u > 1.01).sum())}"
 
         for k in range(2):  # eager reruns without the tap
             _prep()
@@ -1527,12 +1536,15 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
             torch.accelerator.synchronize()
             _snap(f"replay{k}{'p' if k >= 2 else ''}", replayed)
         print(f"DBG4 {where} decode outputs {[tuple(t.shape) for t in rec.get('o', [])]}")
-        base = states[0]
-        for tag, out, att, ts in states:
-            tdiff = [_d(a, b) for a, b in zip(ts, base[3])]
-            print(f"DBG3 {where} {tag}: out vs eager {_d(out, eager)} vs eager2 "
-                  f"{_d(out, base[1])} attn vs eager {_d(att, attn_in)} fi-args vs "
-                  f"eager2 {tdiff}")
+        ref = states[1]  # eager3: a run right after a run (no idle gap)
+        for tag, out, att, ts, os_ in states:
+            tdiff = [_d(a, b) for a, b in zip(ts, ref[3])]
+            odiff = [_d(a, b) for a, b in zip(os_, ref[4])]
+            extra = ""
+            if not torch.equal(att, ref[2]):
+                extra = f" attn {_ulps(att, ref[2])}"
+            print(f"DBG5 {where} {tag}: out vs eager3 {_d(out, ref[1])} attn vs eager3 "
+                  f"{_d(att, ref[2])}{extra} decode-in {tdiff} decode-out {odiff}")
         _barrier()
 
     if refusals:
