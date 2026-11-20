@@ -18,6 +18,10 @@ Kinds (every kind sums K in FP32 and rounds once to BF16; the order differs):
   "fi_cute"     FlashInfer CuTe DSL MXFP8 GEMM (stock's choice at <= 16 rows)
   "fi_cutlass"  FlashInfer CUTLASS MXFP8 GEMM
   "scaled_mm"   cuBLASLt ``torch._scaled_mm`` (stock's choice above 16 rows)
+  "pre"         the vendored FlashInfer sm_107 CuTe DSL kernel (``sm107.prewait``) on a
+                per-R tactic (``PRE_TACTICS``), launched with PDL; it issues the first
+                weight k-blocks before griddepcontrol.wait (bitwise fi_cute at the
+                same tactic)
 
 The per-R kind is GENERIC = stock's own per-call rule (``nvidia.mxfp8.use_cute_dsl``:
 the same kernel as the stock linear, so the stock bits) unless ``MX_TUNED`` names a
@@ -29,7 +33,26 @@ import torch
 
 from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 
-MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm")
+MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "pre")
+
+# "pre" tactics per weight [N, K]: (first R, last R, (tile_mn, cluster_mn, swap_ab,
+# inst_m), weight k-blocks issued before griddepcontrol.wait). VR200 GEMM-EX1 r2/r3
+# (1 GPU, CUDA-graph chain of 16 calls on cold weight copies, us per call; scaled_mm /
+# fi_cute / pre): kda_in R128 12.68 / 11.23 / 10.26, R256 14.97 / 13.02 / 10.93.
+PRE_TACTICS: dict[tuple[int, int], tuple] = {
+    (12448, 7168): (
+        (1, 128, ((128, 64), (1, 1), False, 128), 8),
+        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (257, 384, ((256, 256), (2, 1), False, 256), 8),
+    ),
+}
+
+
+def pre_tactic(n: int, k: int, rows: int):
+    for lo, hi, tactic, prewait in PRE_TACTICS.get((n, k), ()):
+        if lo <= rows <= hi:
+            return tactic, prewait
+    return None
 BLOCK = 32  # MXFP8 block along K
 
 # TUNED (VR200, D3-32 per-GPU shapes, 2026-11-18 D-GEMM bench1: 1 GPU, a CUDA graph of
@@ -45,7 +68,7 @@ BLOCK = 32  # MXFP8 block along K
 #   o_proj 7168 x 3072  R16 4.92 / 4.95, R128 5.84 / 5.13, R256 6.33 / 6.03, R384
 #                       7.54 / 6.26 (= stock's rule: no entry)
 MX_TUNED: dict[tuple[int, int], dict] = {
-    (12448, 7168): {"*": "1-320:fi_cute,321-:scaled_mm"},
+    (12448, 7168): {"*": "1-384:pre,385-:scaled_mm"},
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
 }  # fmt: skip
@@ -188,16 +211,29 @@ class Mxfp8Projection:
         self.kinds = dict(tactics) if tactics is not None else mxfp8_tactics(
             n, k, self.rows
         )
+        self.pre = {}
         for r in self.rows:
             kind = self.kinds.get(r)
             if kind not in MX_KINDS:
                 raise Unsupported(family, r, f"MXFP8 kind {kind!r} (kinds {MX_KINDS})")
+            if kind == "pre":
+                found = pre_tactic(n, k, r)
+                if found is None:
+                    raise Unsupported(family, r, f"pre: no tactic for [{n}, {k}]")
+                from .sm107.prewait import Mxfp8PreGemm
+
+                self.pre[r] = Mxfp8PreGemm(
+                    n, k, r, found[0], use_pdl=True, prewait=found[1],
+                    device=weight.device,
+                )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
 
     def _gemm(self, kind, xq, xs, out):
         import flashinfer
 
+        if kind == "pre":
+            return self.pre[xq.shape[0]](xq, xs, self.weight, self.scale, out)
         if kind == "scaled_mm":
             return torch._scaled_mm(
                 xq, self.weight.t(), scale_a=xs.view(torch.float8_e8m0fnu),
