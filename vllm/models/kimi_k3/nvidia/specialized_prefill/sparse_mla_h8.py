@@ -102,10 +102,15 @@ STAGE64 = 4 * 64 * 128 + 64 * 64  # 36864: 4 latent SW128 atoms + RoPE SW64
 # 96-127 and only take part in barriers, rescales, Q copies and epilogues), 8 PV,
 # 9 Q loader, 10 and 12-19 gather, 11 QK
 W_SM, W_PV, W_Q, W_QK = 8, 8, 9, 11
-THREADS = 32 * 20
-REG_LAUNCH = 65536 // THREADS // 8 * 8  # 96
-REG_SM, REG_LOW = 144, 56
-assert 256 * REG_SM + 384 * REG_LOW <= THREADS * REG_LAUNCH
+# 20-23: RoPE LDG warps (P-MLA M7): the 64 B RoPE piece of every stage row is loaded by
+# 16 B LDGs and written with st.shared, a second delivery path beside the per-SM TMA
+# gather4 op rate (~11-14 clk/op, hwdb hw31; LDG and gather4 add up, hw31b): 64 instead
+# of 80 gather4 ops per 64-key stage
+W_LDG, NLDG = 20, 4
+THREADS = 32 * 24
+REG_LAUNCH = 65536 // THREADS // 8 * 8  # 80
+REG_SM, REG_LOW = 144, 48
+assert 256 * REG_SM + (THREADS - 256) * REG_LOW <= THREADS * REG_LAUNCH
 
 # shared memory (bytes). SS A tiles have M = 128 rows; only 96 are loaded and rows
 # 96-127 read whatever follows (valid shared memory, padding rows of S only).
@@ -266,6 +271,14 @@ def tmem_st_o4(addr, v0, v1, v2, v3):
 
 
 @asm()
+def ld_global_v4_pred(ptr, ok):
+    """16 B ``*ptr`` if ok else zeros (no load issued when not ok)."""
+    code = ("{ .reg .pred p; setp.ne.b32 p, $5, 0; mov.b32 $0, 0; mov.b32 $1, 0; "
+            "mov.b32 $2, 0; mov.b32 $3, 0; @p ld.global.nc.v4.b32 {$0,$1,$2,$3}, [$4]; }")
+    return code, "=r,=r,=r,=r,l,r", (Int64(ptr), Int32(ok)), (Int32,) * 4
+
+
+@asm()
 def tmem_ld_max64(addr):
     """64 columns of this thread's TMEM lane and their maximum (tcgen05.ld.red)."""
     regs = ",".join(f"${i}" for i in range(64))
@@ -359,7 +372,8 @@ class SparseMlaPrefillH8:
                 mbar_init(_bar(base, B_OREADY + j), Uint32(self.sm_arrivals))
                 mbar_init(_bar(base, B_PEMPTY + j), Uint32(1))
             for s in cutlass.range_constexpr(NS):
-                mbar_init(_bar(base, B_KVFULL + s), Uint32(1 + (256 if self.cpa else 0)))
+                mbar_init(_bar(base, B_KVFULL + s),
+                          Uint32(1 + (256 if self.cpa else NLDG)))
                 mbar_init(_bar(base, B_KVEMPTY + s), Uint32(1))
             cute.arch.mbarrier_init_fence()
         if warp == 0:
@@ -377,7 +391,11 @@ class SparseMlaPrefillH8:
         else:
             cute.arch.warpgroup_reg_dealloc(REG_LOW)
             taddr = Uint32(cute.arch.make_warp_uniform(taddr))
-            if warp == W_PV:
+            if warp >= W_LDG:
+                if cutlass.const_expr(not self.cpa):  # cpa: RoPE by the gather warps
+                    self.ldg_loader(base, warp - W_LDG, lane, cta, n_mine, unit_rows,
+                                    slots, slot_stride, lengths, kvp)
+            elif warp == W_PV:
                 self.pv_loop(base, lane, taddr, n_mine, lengths, cta)
             elif warp == W_QK:
                 self.qk_loop(base, lane, taddr, n_mine, lengths, cta)
@@ -411,7 +429,7 @@ class SparseMlaPrefillH8:
                              + Uint32(((u - 16) * 32 + Int32(slot)) * 4))
 
     def _tma_ops(self):
-        return 4 if self.cpa else 5 - self.gskip
+        return 4 if self.cpa else min(4, 5 - self.gskip)  # RoPE: cp.async / LDG warps
 
     def _skipped(self):
         return sum((4096 if a == 4 else 8192) for a in range(self._tma_ops(), 5))
@@ -543,6 +561,68 @@ class SparseMlaPrefillH8:
                         self.ss(base, cta, lane, g, 23, 8)
                         self.lpin(base, cta, lane, g)
                     g = g + 1
+
+    @cute.jit
+    def ldg_rope(self, kvp, unit_rows, rc, key, n, ch):
+        """16 B chunk ch of the RoPE piece of KV slot rc (zeros past n or for rc < 0,
+        as the TMA gather4 zero fill)."""
+        go = Int32(0)
+        if rc >= 0 and key < n:
+            go = Int32(1)
+        src = kvp + Int64((rc >> 6) * unit_rows + (rc & 63)) * Int64(ROW) + Int64(
+            D_NOPE + 16 * ch)
+        return ld_global_v4_pred(src, go)
+
+    @cute.jit
+    def ldg_loader(self, base, lw, lane, cta, n_mine, unit_rows, slots, slot_stride,
+                   lengths, kvp):
+        """RoPE pieces of every 64-key stage (rows lw * 8 + lane // 4 and + 32, chunk
+        lane % 4) by LDG one stage ahead, st.shared into the SW64 RoPE tile, then one
+        KV-full arrival per warp (generic -> async proxy fence first)."""
+        lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+        lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+        ra = lw * 8 + lane // 4
+        rb = ra + 32
+        ch = lane % 4
+        oa = Uint32(4 * 8192) + Uint32(ra * 64) + (
+            (Uint32(ch) ^ ((Uint32(ra) >> Uint32(1)) & Uint32(3))) << Uint32(4))
+        ob = Uint32(4 * 8192) + Uint32(rb * 64) + (
+            (Uint32(ch) ^ ((Uint32(rb) >> Uint32(1)) & Uint32(3))) << Uint32(4))
+        g = Int32(0)
+        for qi in range(n_mine):
+            row = cta + qi * self.grid
+            n = lens[row]
+            subs = _subs(n)
+            srow = slots + Int64(row) * Int64(slot_stride) * Int64(4)
+            one = Int32(1)
+            ia = ld_global_s32_pred(srow + Int64(4 * ra), one)
+            ib = ld_global_s32_pred(srow + Int64(4 * rb), one)
+            a0, a1, a2, a3 = self.ldg_rope(kvp, unit_rows, ia, ra, n, ch)
+            b0, b1, b2, b3 = self.ldg_rope(kvp, unit_rows, ib, rb, n, ch)
+            if subs > 1:
+                ia = ld_global_s32_pred(srow + Int64(4 * (64 + ra)), one)
+                ib = ld_global_s32_pred(srow + Int64(4 * (64 + rb)), one)
+            for t in cutlass.range(subs, unroll=1):
+                s = g % NS
+                st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                if lane == 0:
+                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+                cute.arch.sync_warp()
+                if cutlass.const_expr(not self.no_gather):
+                    st_shared_v4(st + oa, a0, a1, a2, a3)
+                    st_shared_v4(st + ob, b0, b1, b2, b3)
+                    fence_async_smem()
+                cute.arch.sync_warp()
+                if lane == 0:
+                    mbar_arrive(_bar(base, B_KVFULL + s))
+                if t + 1 < subs:
+                    key = (t + 1) * 64
+                    a0, a1, a2, a3 = self.ldg_rope(kvp, unit_rows, ia, key + ra, n, ch)
+                    b0, b1, b2, b3 = self.ldg_rope(kvp, unit_rows, ib, key + rb, n, ch)
+                    if t + 2 < subs:
+                        ia = ld_global_s32_pred(srow + Int64(4 * (key + 64 + ra)), one)
+                        ib = ld_global_s32_pred(srow + Int64(4 * (key + 64 + rb)), one)
+                g = g + 1
 
     # ------------------------------------------------------------------ MMA
     @cute.jit
