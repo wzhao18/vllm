@@ -33,7 +33,32 @@ from .packed_situ_gemm import interleave_shared_rows, situ_constants
 # follows at the prefill power cap (sustained randn: 0.91-0.93x the (2, 1)
 # tactic). The m raster with swizzle 4 beat swizzle 1/2/8 and the n raster.
 DEFAULT_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8")
+# Die-split form (die_sched): each die's clusters walk 3 of its N cluster
+# tiles per M sweep with its weight half homed on it; MXFP8 stores evict-first
+# so they do not push the die's weight half out of its L2.
+DIE_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8+die3+sef")
 _COMPILED: dict = {}
+
+
+def die_tactic(weight_nk: torch.Tensor):
+    """``DIE_TACTIC`` when ``weight_nk`` (the contiguous [N, K] gate/up rows)
+    can be split by die: a two-die device, an even count of N cluster tiles
+    that the group divides, and 2 MiB-aligned row halves; else None."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+    n, k = weight_nk.shape
+    tile_n, cluster_n = DIE_TACTIC[0][1], DIE_TACTIC[1][1]
+    n_ct = n // (tile_n * cluster_n)
+    if (
+        not weight_nk.is_contiguous()
+        or n % (tile_n * cluster_n)
+        or n_ct % 2
+        or (n_ct // 2) % 3
+        or (n // 2) * k * weight_nk.element_size() % (2 << 20)
+        or dies.domain_count(weight_nk.device.index or 0) != 2
+    ):
+        return None
+    return DIE_TACTIC
 
 
 class _Kernel(_BaseKernel):
@@ -75,6 +100,29 @@ class SharedSituGemm:
         self.situ_k = k_host.to(weight_nk.device)
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = None
+        self.die = any(f.startswith("die") for f in str(tactic[7]).split("+"))
+        self._sched = ()
+        if self.die:
+            # die_sched: weight rows [0, n/2) homed on die 0, [n/2, n) on die 1
+            # (die_sched.localize_rows) and an even count of N cluster tiles.
+            cols = tactic[0][1] * tactic[1][1]
+            group = next(
+                (int(f[3:]) for f in str(tactic[7]).split("+")
+                 if f.startswith("die") and f[3:].isdigit()), 0,
+            )  # fmt: skip
+            if n % (2 * cols) or (group and (n // (2 * cols)) % group):
+                raise ValueError(
+                    f"die-split SiTU GEMM: N {n} is not 2 x {group or 1} x k x {cols}"
+                )
+            from . import die_sched
+
+            self._ctr = torch.zeros(4, dtype=torch.int32, device=weight_nk.device)
+            self._die_map = die_sched.die_map(weight_nk.device)
+            conv = (cutlass.Int64(0),) * 5 + (cutlass.Int32(0),) * 3
+            self._sched = conv + (
+                cutlass.Int64(self._ctr.data_ptr()),
+                cutlass.Int64(self._die_map.data_ptr()),
+            )
 
     def __call__(self, x: torch.Tensor, x_scale: torch.Tensor, act) -> None:
         m = x.shape[0]
@@ -124,7 +172,7 @@ class SharedSituGemm:
                 )
                 self._compiled = cute.compile(
                     gemm, *args, layouts, problem, mac, stream, lambda v: v,
-                    tail[0], None, *tail[1:], True, *situ,
+                    tail[0], None, *tail[1:], True, *situ, *self._sched,
                 )  # fmt: skip
                 _COMPILED[key] = self._compiled
-        self._compiled(*args, problem, stream, *tail, *situ)
+        self._compiled(*args, problem, stream, *tail, *situ, *self._sched)
