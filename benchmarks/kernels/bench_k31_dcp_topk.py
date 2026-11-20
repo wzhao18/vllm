@@ -83,8 +83,6 @@ def main():
     ap.add_argument("--skew-us", type=float, default=0.0,
                     help="the last rank sleeps this long before each call (in-step rank skew)")
     ap.add_argument("--impl", default="merge", choices=["merge", "v2"])
-    ap.add_argument("--gm", type=int, default=0,
-                    help="v2: feed the fused producer's gmax / NaN counts (computed from the logits)")
     ap.add_argument("--check", type=int, default=1, help="v2: compare with topk_merge")
     ap.add_argument("--k", type=int, default=2048, help="top-k (1-GPU ncu emulation: K / DCP)")
     a = ap.parse_args()
@@ -147,30 +145,6 @@ def main():
                 logits = make_logits(case, T, width, L, g2, dev)
 
             segcap = 0
-            gmx = nanc = nanc_ref = None
-            if a.gm:
-                # what idx_gmax writes: per row, the max logit (raw bf16; NaN if the group
-                # holds one) of each aligned 8-logit group of [0, L), via the exact key max
-                raw = logits.view(torch.int16).to(torch.int32) & 0xFFFF
-                kk = torch.where(raw >= 0x8000, raw ^ 0xFFFF, raw ^ 0x8000)
-                isn = (raw & 0x7FFF) > 0x7F80
-                inr = torch.arange(width, device=dev)[None, :] < L[:, None]
-                kk = torch.where(isn, torch.full_like(kk, 0xFFFF), kk)
-                kk = torch.where(inr, kk, torch.zeros_like(kk))
-                ngc = (width + 7) // 8
-                gs = (ngc + 7) // 8 * 8
-                kp = torch.nn.functional.pad(kk, (0, ngc * 8 - width))
-                gk = torch.zeros((T, gs), dtype=torch.int32, device=dev)
-                gk[:, :ngc] = kp.view(T, ngc, 8).amax(-1)
-                gr = torch.where(gk >= 0x8000, gk ^ 0x8000, gk ^ 0xFFFF)
-                gr = torch.where(gk == 0xFFFF, torch.full_like(gr, 0x7FC0), gr)
-                gr = torch.where(gk == 0, torch.full_like(gr, 0xFF80), gr)
-                gmx = gr.to(torch.int16).contiguous()
-                nanc_ref = torch.zeros(T, dtype=torch.int32, device=dev)
-                nanc = nanc_ref.clone()
-                del gk, gr
-                raw = kk = isn = None
-                del raw, kk, isn, inr, kp
 
             ev = (torch.empty(a.evict_mb << 18, dtype=torch.int32, device=dev) if a.evict_mb else None)
             ev2 = torch.empty_like(ev) if ev is not None else None
@@ -185,11 +159,9 @@ def main():
                 if a.skew_us > 0 and rank == W - 1:
                     torch.cuda._sleep(int(a.skew_us * 2400))
                 if a.impl == "v2":
-                    if nanc is not None:
-                        nanc.copy_(nanc_ref)  # the consumer re-zeroes it
                     ex.topk_v2(logits, L, G, out, cnt, block_table=bt,
                                block_size=bs, block_stride=bs, req_of_row=req_of_row,
-                               stats=stats, dbg=dbg, gmax=gmx, nanc=nanc)
+                               stats=stats, dbg=dbg)
                     return
                 ex.topk_merge(logits, L, G, out, cnt, max_local_len=max_local,
                               cluster=cluster, segmax=segmax, block_table=bt,

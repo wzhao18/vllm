@@ -95,11 +95,6 @@ struct V2Params {
   long long spin_ns;
   int* stats;
   long long* dbg;
-  // fused producer (idx_gmax): per row, the max key of every aligned 8-key group of the
-  // logits and the row's NaN count (re-zeroed here); null: the row is sampled from the logits
-  const uint16_t* gmax;
-  int64_t gstride;
-  int* nanc;
 };
 
 // Pairwise NaN-propagating max of 8 bf16 values (two halves; a NaN anywhere shows up).
@@ -184,13 +179,6 @@ __device__ __forceinline__ uint32_t v2_cnt_ge(const uint4& r, uint32_t th, uint3
   for (int j = 0; j < 8; ++j) c += k8.key(j) >= th;
   return c;
 }
-// the fused producer's group max (raw bf16, NaN-propagating, -inf outside the row) as the
-// order-preserving key; a NaN group maps above every key (always read, never in the histogram)
-__device__ __forceinline__ uint32_t v2_gkey(uint32_t raw) {
-  if ((raw & 0x7FFFu) > 0x7F80u) return 0xFFFFu;
-  return raw ^ ((raw >> 15) ? 0xFFFFu : 0x8000u);
-}
-
 __device__ __noinline__ uint32_t v2_nvalid(uint4 r) {
   const Keys8 k8(r);
   uint32_t n = 0;
@@ -315,14 +303,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
     const int sh0 = (8 - head0) & 7;
     const int gs_lo = sh0 ? 1 : 0, gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
-    // fused producer: each thread reads its groups' maxima (gmax) while the row copy lands; they
-    // place the exact threshold and let the candidate pass skip groups that cannot hold one
-    const bool gm = kFast && p.gmax != nullptr && sh0 == 0;
     if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
       // the previous row's generic SMEM writes before the async-proxy copy
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      const int c = tid >> 5;
-      const int n = max(0, gs_hi - gs_lo);
+      const int n = max(0, gs_hi - gs_lo), c = tid >> 5;
       const int a = gs_lo + (int)((int64_t)n * c / kV2Cp), b = gs_lo + (int)((int64_t)n * (c + 1) / kV2Cp);
       const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
       if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
@@ -398,24 +382,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
     if (tid == 0 && phead) pg = load_group(0);
     if (tid == 32 && ptail) pg = load_group(g_hi);
-    const bool gmh = gm && regp;
-    uint32_t gmw[(kV2NR + 1) / 2];
-#pragma unroll
-    for (int i = 0; i < (kV2NR + 1) / 2; ++i) gmw[i] = 0u;
-    if (gmh && tid * kV2NR < ng) {
-      const uint16_t* gp = p.gmax + (int64_t)row * p.gstride + tid * kV2NR;
-      if constexpr (kV2NR == 8) {
-        const uint4 v = __ldg(reinterpret_cast<const uint4*>(gp));
-        gmw[0] = v.x, gmw[1] = v.y, gmw[2] = v.z, gmw[3] = v.w;
-      } else if constexpr (kV2NR == 4) {
-        const uint2 v = __ldg(reinterpret_cast<const uint2*>(gp));
-        gmw[0] = v.x, gmw[1] = v.y;
-      } else {
-#pragma unroll
-        for (int i = 0; i < kV2NR; ++i) gmw[i >> 1] |= (uint32_t)__ldg(gp + i) << (16 * (i & 1));
-      }
-    }
-    auto gkey_of = [&](int i) -> uint32_t { return v2_gkey((gmw[i >> 1] >> (16 * (i & 1))) & 0xFFFFu); };
     // (sampling from global memory while the copy lands measured slower: r24 20.0 vs 18.5 us)
     mbar_wait(&s_bar, bar_phase);
     bar_phase ^= 1u;
@@ -423,14 +389,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (tid == 32 && ptail) srow[g_hi] = pg;
     __syncthreads();  // histogram zeroed, partial groups in place
     V2DBG(9);
-    if (gmh) {
-      // every group's max: the exact bound the threshold is placed with
-#pragma unroll
-      for (int i = 0; i < kV2NR; ++i) {
-        const uint32_t k = gkey_of(i);
-        if (tid * kV2NR + i < ng && k != 0xFFFFu) atomicAdd(&hist[k >> 4], 1u);
-      }
-    } else if (K31_LIKELY(regp)) {
+    if (K31_LIKELY(regp)) {
       // sample: one group in kV2SampleStride (spread over the 8 residues)
 #pragma unroll 1
       for (int g = tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride) {
@@ -464,10 +423,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
       // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
-      // gm: groups whose max reaches theta each hold >= 1 key >= theta, so the suffix of
-      // the gmax histogram reaching q + 256 groups puts theta below the q-th key (exact)
-      const uint32_t sstr = gmh ? 1u : (uint32_t)kV2SampleStride;
-      const uint32_t want = (q + 256u + sstr - 1) / sstr;
+      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -484,7 +440,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // the sample's estimate of the q-th key (its coarse bin): the fine histogram is
       // centered there, so rows with a wide upper tail (q-th key more than kV2Fine keys
       // above theta) need no rebase pass
-      const uint32_t want_e = max(1u, q / sstr);
+      const uint32_t want_e = max(1u, q / kV2SampleStride);
       if (ab < want_e && ab + v >= want_e) {
         uint32_t run = ab;
         for (int i = kV2PB - 1; i >= 0; --i) {
@@ -516,9 +472,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #pragma unroll
       for (int i = 0; i < kV2NR; ++i) {
         const int g = tg0 + i;
-        if (gmh && g < g_hi && gkey_of(i) < (uint32_t)thv) {
-          nv += 8u;  // a full group with every key below thv (NaN groups have max 0xFFFF)
-        } else if (g < ng) {
+        if (g < ng) {
           const uint4 r = sgroup(g);
           // (one NaN accumulator per thread + a recount measured no faster: the partial
           // groups' threads recount on the scan's critical path)

@@ -1360,13 +1360,7 @@ def sparse_attn_indexer(
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(
                 padded_q_quant_cast, padded_q_scale, weights[:num_padded_tokens]
             )
-            # a DCP decode top-k hook may bring its own logits producer (same logits)
-            logits_fn = (
-                dcp_hook[2]
-                if dcp_hook is not None and len(dcp_hook) > 2
-                else fp8_fp4_paged_mqa_logits
-            )
-            logits = logits_fn(
+            logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 decode_weights,

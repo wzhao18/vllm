@@ -195,16 +195,6 @@ class DcpxDecode:
         threads = int(getattr(props, "max_threads_per_multi_processor", 1024) or 1024)
         self.topk_cap = min(self.cap, self.sms * min(TOPK_CTAS_PER_SM, threads // 256))
         self.counts = torch.zeros(self.cap, dtype=torch.int32, device=device)
-        # fused producer outputs (idx_gmax): the indexer logits kernel writes each row's
-        # group max keys and NaN count; top-k reads the groups that can hold a candidate.
-        # Rows are as wide as DeepGEMM's logits stride for the model length / 8.
-        from ..idx_gmax import gmax_cols
-
-        self.model_len = model_len
-        self.gmax = torch.zeros(
-            (self.topk_cap, gmax_cols(model_len)), dtype=torch.int16, device=device
-        )
-        self.nanc = torch.zeros(self.topk_cap, dtype=torch.int32, device=device)
         self.global_rows = torch.zeros(self.cap, dtype=torch.int32, device=device)
         self.offsets = torch.arange(64, dtype=torch.int32, device=device)
         self.heads, self.hpr = heads, heads // self.W
@@ -290,43 +280,8 @@ class DcpxDecode:
             block_size=md.block_size,
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
-            gmax=self.gmax,
-            nanc=self.nanc,
         )
         return True
-
-    def decode_logits(
-        self,
-        q,
-        kv_cache,
-        weights,
-        context_lens,
-        block_table,
-        schedule_metadata,
-        max_model_len,
-        indices,
-    ):
-        """Indexer hook: the decode logits from DeepGEMM's paged MQA logits kernel with
-        the fused top-k producer (same logits; plus gmax / NaN counts for decode_topk)."""
-        from ..idx_gmax import paged_logits_gmax
-
-        if max_model_len > self.model_len or indices is None:
-            raise RuntimeError(
-                f"DcpExchange logits: max_model_len {max_model_len} > {self.model_len} "
-                "or no varlen indices"
-            )
-        return paged_logits_gmax(
-            q,
-            kv_cache,
-            weights,
-            context_lens,
-            block_table,
-            schedule_metadata,
-            max_model_len,
-            indices,
-            self.gmax,
-            self.nanc,
-        )
 
     def launch_params(self, rows: int, max_local: int) -> tuple[int, int]:
         """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch.
@@ -411,7 +366,6 @@ class DcpxDecode:
                 lambda logits, decode, out, p=prefix: self.decode_topk(
                     p, logits, decode, out
                 ),
-                self.decode_logits,
             )
             layer.impl.dcp_local_topk_counts = lambda rows, p=prefix: self.counts_for(
                 p, rows
