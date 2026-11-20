@@ -264,7 +264,7 @@ def attn_res(
     bf16_out: bool,
     quant_out: bool,
     prefix_out: torch.Tensor | None = None,
-    local_out: bool = True,
+    local_out: bool = False,
     _probe: int = 0,
     _vec: int | None = None,
     _groups: int | None = None,
