@@ -1,0 +1,13 @@
+175 1203 helpers
+1204 1597 setup
+1598 2039 COMPUTE
+2040 2457 EPILOGUE
+2458 2731 MMA_LOAD
+2732 2887 prep_setup
+2888 2990 p0_rawTMA
+2991 3123 p1p2_beta_gate
+3124 3210 p3_decor
+3211 3251 p5_gram
+3252 3350 p6_solve
+3351 3524 p7_restore
+3525 3525 prep_tail
