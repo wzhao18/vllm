@@ -174,7 +174,9 @@ B_TKI = B_SFREE1 + 2  # x2 (token parity): top-k row copy landed
 B_QKI = B_TKI + 2  # x8 (u % 8): QK(u) issued (pvd knob: PV(u - pvd) waits for it)
 B_TKCONV, B_TKFREE = B_QKI + 8, B_QKI + 10  # x2 (token parity, tconv knob): top-k row
 # converted to physical rows (Q warp) / read by every copying gather warp
-assert B_TKFREE + 2 <= NBAR
+# x2 (staging half, epw knob): the owner warpgroup wrote / the store warp's TMA stores read
+B_EPIFULL, B_EPIFREE = B_TKFREE + 2, B_TKFREE + 4
+assert B_EPIFREE + 2 <= NBAR
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
 # 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
 # warpgroup-wide
@@ -333,6 +335,16 @@ def tmem_st_o4(addr, v0, v1, v2, v3):
 
 
 @asm()
+def tmem_ld16x256x3(a0, a1, a2):
+    """Three tcgen05.ld 16x256b.x4 (see sparse_mla_h5.tmem_ld16x256) under one wait."""
+    regs = [",".join(f"${16 * k + i}" for i in range(16)) for k in range(3)]
+    code = "".join(f"tcgen05.ld.sync.aligned.16x256b.x4.b32 {{{regs[k]}}}, [${48 + k}]; "
+                   for k in range(3)) + "tcgen05.wait::ld.sync.aligned;"
+    return (code, ",".join(["=f"] * 48 + ["r", "r", "r", "~{memory}"]),
+            (Uint32(a0), Uint32(a1), Uint32(a2)), (Float32,) * 48)
+
+
+@asm()
 def tmem_ld_max64(addr):
     """64 columns of this thread's TMEM lane and their maximum (tcgen05.ld.red)."""
     regs = ",".join(f"${i}" for i in range(64))
@@ -394,10 +406,24 @@ class SparseMlaPrefillH8:
         # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
-        knobs = tuple(knobs) + (0,) * (16 - len(knobs))
+        # ssu (sstamp diagnostic): first stamped subtile (0 -> 16); 28 straddles the
+        # token 0 / token 1 boundary
+        # epb: the epilogue loads each 16-lane half of an O^T block (three 16x256b loads)
+        # under one tcgen05.wait::ld (production: knob 0; 9 = one wait per load)
+        # epw: warp 19 (idle gather warp pw 8) issues the epilogue's TMA stores and waits
+        # for them, so the owner softmax warpgroup only writes the staging and returns to
+        # its next subtile (production: knob 0; 9 = stores issued and awaited in the WG)
+        # msk: a token's last subtile takes the masked softmax path only when it is
+        # partial (n % 64 != 0); a full one keeps the tcgen05.ld.red max (exact either
+        # way) (production: knob 0; 9 = always masked)
+        knobs = tuple(knobs) + (0,) * (20 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys, self.pvd, self.tconv) = knobs[:16]
+         self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
+         self.epb, self.epw, self.msk) = knobs[:20]
+        self.msk = self.msk != 9
+        self.ssu = self.ssu or 16
+        self.epb = self.epb != 9
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -427,6 +453,7 @@ class SparseMlaPrefillH8:
         # per-stage slot ring (its register-rotated loads cost ~1 L2 round trip/stage)
         # (production: knob 0; 9 = the per-stage slot producer, diagnostic)
         self.tconv = self.tconv != 9 and self.logical and self.cpa in (3, 4) and not self.xphys
+        self.epw = (self.epw != 9 and self.cpa in (3, 4) and (self.tconv or not self.logical))
         # KVFULL arrivals per stage: one noinc async arrive per copying lane (3, 4, 6), one
         # per gather warp (5, 2 + the expect-tx arrive), per-lane RoPE copies (1), TMA (0)
         self.kv_full_arrivals = (256 if self.ldgsts and self.cpa != 5 else 8 if self.cpa == 5
@@ -488,6 +515,8 @@ class SparseMlaPrefillH8:
             for j in cutlass.range_constexpr(2):
                 mbar_init(_bar(base, B_TKCONV + j), Uint32(1))
                 mbar_init(_bar(base, B_TKFREE + j), Uint32(8))
+                mbar_init(_bar(base, B_EPIFULL + j), Uint32(1))
+                mbar_init(_bar(base, B_EPIFREE + j), Uint32(1))
             for j in cutlass.range_constexpr(4):
                 mbar_init(_bar(base, B_OFREE + j), Uint32(4))
             for j in cutlass.range_constexpr(NP):
@@ -527,6 +556,9 @@ class SparseMlaPrefillH8:
                     pw = Int32(NLD)
                 elif warp > W_QK:
                     pw = warp - (W_Q + 2)
+                if cutlass.const_expr(self.epw):
+                    if warp == THREADS // 32 - 1:
+                        self.epi_store(base, lane, cta, n_mine, tensormap.map_address(om))
                 self.loader(base, pw, lane, cta, n_mine, tensormap.map_address(qn),
                             tensormap.map_address(qr), tensormap.map_address(kvm),
                             tensormap.map_address(kvr), unit_rows, slots, slot_stride,
@@ -546,9 +578,9 @@ class SparseMlaPrefillH8:
     def ss(self, base, cta, lane, u, slot, role: cutlass.Constexpr = 15):
         """sstamp: CTA 0, subtiles 16-23, [8][32] u32 clock slots (lane 0 of the caller)."""
         if cutlass.const_expr(self.sstamp and (self.ssmask & role)):
-            if cta == 0 and lane == 0 and u >= 16 and u < 24:
+            if cta == 0 and lane == 0 and u >= self.ssu and u < self.ssu + 8:
                 sstamp_clock(base + Uint32(SMEM_BYTES)
-                             + Uint32(((u - 16) * 32 + Int32(slot)) * 4))
+                             + Uint32(((u - self.ssu) * 32 + Int32(slot)) * 4))
 
     def _tma_ops(self):
         if self.cpa == 2:
@@ -1521,7 +1553,15 @@ class SparseMlaPrefillH8:
             lw = Float32(0.0)
             for i in range(subs):
                 if u % 2 == wg:
-                    if i == subs - 1:
+                    full_last = Int32(0)
+                    if cutlass.const_expr(self.msk):
+                        if i == subs - 1 and n % 64 == 0:
+                            full_last = Int32(1)
+                    if full_last != 0:
+                        mp_last, lw = self.sub(base, warp, lane, wg, sp, h, lane_addr, real_m,
+                                               xv, scale_log2, u, i, n, more_tok, mp_last,
+                                               lw, cta, False)
+                    elif i == subs - 1:
                         mp_last, lw = self.sub(base, warp, lane, wg, sp, h, lane_addr, real_m,
                                                xv, scale_log2, u, i, n, more_tok, mp_last,
                                                lw, cta, True)
@@ -1543,11 +1583,14 @@ class SparseMlaPrefillH8:
             # qi + 1 could complete one generation alone, leaving the token-qi owner
             # waiting forever (two 1-subtile tokens per CTA hung, P-MLA runs 121-123)
             xbar = Uint32(7 + sp) + Uint32(5) * Uint32(qi % 2)
+            if owner:
+                self.ss(base, cta, lane, u - 1, 21, 1)
             if real:
                 st_shared_f32(tok + Uint32((wg * 2 * H + h) * 4), lw)
                 st_shared_f32(tok + Uint32((wg * 2 * H + H + h) * 4), mp_last)
                 if owner:
                     named_bar(xbar, 64)
+                    self.ss(base, cta, lane, u - 1, 22, 1)
                     o = 1 - wg
                     l1 = ld_shared_f32(tok + Uint32((o * 2 * H + h) * 4))
                     m1 = ld_shared_f32(tok + Uint32((o * 2 * H + H + h) * 4))
@@ -1562,7 +1605,8 @@ class SparseMlaPrefillH8:
             if owner:
                 if qi + 1 < n_mine:
                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
-                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
+                self.ss(base, cta, lane, u - 1, 23, 1)
+                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o, u - 1)
 
     @cute.jit
     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
@@ -1699,7 +1743,7 @@ class SparseMlaPrefillH8:
         return mp_last, lw
 
     @cute.jit
-    def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o):
+    def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o, ul):
         """O^T block b (lanes = dims, columns = heads) -> BF16 [heads x dims]: 16x256b
         TMEM loads give each thread two adjacent heads of one dim (an m8n8 b16
         fragment with dims as rows), scaled by s / l and packed; stmatrix.trans writes
@@ -1707,25 +1751,41 @@ class SparseMlaPrefillH8:
         staging), one TMA store each. Block b is released once read."""
         row = cta + qi * self.grid
         mbar_wait(_bar(base, B_OFULL), Uint32(qi & 1))
+        self.ss(base, cta, lane, ul, 26, 1)
         tc_fence_after()
         bid = Uint32(10 + wg)
         named_bar(bid, 128)  # 1/l of every head written
+        self.ss(base, cta, lane, ul, 27, 1)
         t4 = lane % 4
         j = lane % 8
         mk = lane // 8  # matrix this lane addresses in stmatrix.x4
         inv_base = base + Uint32(OFF_INV)
+        # epb: 1/l of this thread's 24 heads loaded once (the same for every block)
+        invs = []
+        if cutlass.const_expr(self.epb):
+            for c in cutlass.range_constexpr(3):
+                for g in cutlass.range_constexpr(4):
+                    invs.append(ld_shared_v2f(inv_base + Uint32((32 * c + 8 * g + 2 * t4) * 4)))
         for b in cutlass.range_constexpr(4):
             # staging halves alternate between Q atoms 0-1 and 2-3 (block b % 2): block
             # b reuses block b - 2's buffer once its two stores have read it
             if cutlass.const_expr(b >= 2):
-                if sp == 0 and lane == 0:
-                    bulk_wait_read2()
-                named_bar(bid, 128)
+                if cutlass.const_expr(self.epw):
+                    mbar_wait(_bar(base, B_EPIFREE + b % 2), Uint32(0))
+                else:
+                    if sp == 0 and lane == 0:
+                        bulk_wait_read2()
+                    named_bar(bid, 128)
             for hh in cutlass.range_constexpr(2):
                 d0 = 32 * sp + 16 * hh  # first dim (lane) of this 16-lane half
+                ha = lane_addr + Uint32(16 * hh << 16) + Uint32(C_O + 96 * b)
+                if cutlass.const_expr(self.epb):
+                    vh = tmem_ld16x256x3(ha, ha + Uint32(32), ha + Uint32(64))
                 for c in cutlass.range_constexpr(3):
-                    v = tmem_ld16x256(lane_addr + Uint32(16 * hh << 16)
-                                      + Uint32(C_O + 96 * b + 32 * c))
+                    if cutlass.const_expr(self.epb):
+                        v = vh[16 * c:16 * c + 16]
+                    else:
+                        v = tmem_ld16x256(ha + Uint32(32 * c))
                     if cutlass.const_expr(hh == 1 and c == 2):
                         tc_fence_before()
                         cute.arch.sync_warp()
@@ -1733,9 +1793,19 @@ class SparseMlaPrefillH8:
                             mbar_arrive(_bar(base, B_OFREE + b))
                     frag = []
                     for g in cutlass.range_constexpr(4):
-                        i0, i1 = ld_shared_v2f(inv_base + Uint32((32 * c + 8 * g + 2 * t4) * 4))
-                        frag.append(bf16x2(v[4 * g] * i0, v[4 * g + 1] * i1))
-                        frag.append(bf16x2(v[4 * g + 2] * i0, v[4 * g + 3] * i1))
+                        if cutlass.const_expr(self.epb):
+                            # packed products (+ -0.0: exactly v * i, signed zeros included)
+                            i0, i1 = invs[4 * c + g]
+                            p0, p1 = ffma2(v[4 * g], v[4 * g + 1], i0, i1, Float32(-0.0),
+                                           Float32(-0.0))
+                            p2, p3 = ffma2(v[4 * g + 2], v[4 * g + 3], i0, i1, Float32(-0.0),
+                                           Float32(-0.0))
+                            frag.append(bf16x2(p0, p1))
+                            frag.append(bf16x2(p2, p3))
+                        else:
+                            i0, i1 = ld_shared_v2f(inv_base + Uint32((32 * c + 8 * g + 2 * t4) * 4))
+                            frag.append(bf16x2(v[4 * g] * i0, v[4 * g + 1] * i1))
+                            frag.append(bf16x2(v[4 * g + 2] * i0, v[4 * g + 3] * i1))
                     for sx in cutlass.range_constexpr(2):
                         g = 2 * sx + mk // 2
                         dd = d0 + 8 * (mk % 2)  # first dim of the matrix (0-127)
@@ -1748,14 +1818,39 @@ class SparseMlaPrefillH8:
                                     frag[4 * sx + 3])
             fence_async_smem()
             named_bar(bid, 128)
+            self.ss(base, cta, lane, ul, 28 + b, 1)
             if sp == 0 and lane == 0:
-                if cutlass.const_expr(not self.no_store):
+                if cutlass.const_expr(self.epw):
+                    mbar_arrive(_bar(base, B_EPIFULL + b % 2))
+                elif cutlass.const_expr(not self.no_store):
                     for hf in cutlass.range_constexpr(2):
                         tma_store2d(tm_o, base + Uint32(OFF_QN + (b % 2) * 2 * ATOM + hf * H * 128),
                                     Int32(128 * b + 64 * hf), row * H)
-        if sp == 0 and lane == 0:
-            bulk_wait_read0()
-            mbar_arrive(_bar(base, B_EPIDONE))
+        if cutlass.const_expr(not self.epw):
+            if sp == 0 and lane == 0:
+                bulk_wait_read0()
+                mbar_arrive(_bar(base, B_EPIDONE))
+
+    @cute.jit
+    def epi_store(self, base, lane, cta, n_mine, tm_o):
+        """epw: per token, block b's staging half b % 2 -> two TMA stores once the owner
+        warpgroup wrote it (B_EPIFULL); the half is released (B_EPIFREE) and, after block 3,
+        the staging (B_EPIDONE: the Q warp's next Q load) once the stores have read it."""
+        for qi in range(n_mine):
+            row = cta + qi * self.grid
+            for b in cutlass.range_constexpr(4):
+                mbar_wait(_bar(base, B_EPIFULL + b % 2), Uint32(b // 2))
+                if lane == 0:
+                    if cutlass.const_expr(not self.no_store):
+                        for hf in cutlass.range_constexpr(2):
+                            tma_store2d(tm_o, base + Uint32(OFF_QN + (b % 2) * 2 * ATOM
+                                                            + hf * H * 128),
+                                        Int32(128 * b + 64 * hf), row * H)
+                    bulk_wait_read0()
+                    mbar_arrive(_bar(base, B_EPIFREE + b % 2))
+                    if cutlass.const_expr(b == 3):
+                        mbar_arrive(_bar(base, B_EPIDONE))
+                cute.arch.sync_warp()
 
 
 @cache

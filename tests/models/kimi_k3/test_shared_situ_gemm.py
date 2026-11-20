@@ -59,3 +59,36 @@ def test_shared_situ_gemm_bitwise(m, betas):
     torch.cuda.synchronize()
     assert torch.equal(out.data.view(torch.uint8), ref.data.view(torch.uint8))
     assert torch.equal(out.scale, ref.scale)
+
+
+@pytest.mark.parametrize("m", [4100])
+def test_shared_situ_gemm_die_split_bitwise(m):
+    """The die-split scheduler (weight halves homed per die, per-die tile
+    claims) writes the same bytes at the deployed width (inter 6144)."""
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import (
+        die_sched,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import (
+        shared_situ_gemm as ssg,
+    )
+
+    dev = torch.device("cuda")
+    inter, k = 6144, 7168
+    x, sx, w, sw = _operands(m, 2 * inter, k, dev)
+    wi, swi = w.clone(), sw.clone()
+    ssg.interleave_gate_up_rows(wi, swi)
+    tactic = ssg.die_tactic(wi)
+    if tactic is None:
+        pytest.skip("single-die device")
+    ref = mxfp8_act.Mxfp8Buffer(m, inter, dev)
+    ssg.SharedSituGemm(wi, swi, 4.0, 25.0)(x, sx, ref)
+    gemm = ssg.SharedSituGemm(die_sched.localize_rows(wi), swi, 4.0, 25.0, tactic=tactic)
+    out = mxfp8_act.Mxfp8Buffer(m, inter, dev)
+    for _ in range(2):  # the second launch runs on the counters the first reset
+        out.data.view(torch.uint8).fill_(0x7F)
+        out.scale.zero_()
+        gemm(x, sx, out)
+        torch.cuda.synchronize()
+        assert torch.equal(out.data.view(torch.uint8), ref.data.view(torch.uint8))
+        assert torch.equal(out.scale, ref.scale)
