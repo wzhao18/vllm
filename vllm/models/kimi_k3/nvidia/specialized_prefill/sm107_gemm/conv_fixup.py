@@ -42,9 +42,9 @@ def _conv_fixup_kernel(
     out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
     M, N, P, NB, S, st_s0, st_s1, st_s2, ci_s0, null_id,
     HAS_NULL: tl.constexpr, WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr,
-    SP2: tl.constexpr, SEQ_ONLY: tl.constexpr = False,
+    SP2: tl.constexpr, SEQ_ONLY: tl.constexpr = False, PID_OFF=0,
 ):  # fmt: skip
-    pid = tl.program_id(0)
+    pid = tl.program_id(0) - PID_OFF
     if SEQ_ONLY:
         pid += NB
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -118,12 +118,12 @@ def _conv_fixup_kernel(
 
 
 @triton.jit
-def _conv_fixup_blocks_kernel(
-    out_ptr, side_ptr, norm_ptr, w_ptr, qsl_ptr, M, N, P, NB, S,
+def _fixup_blocks(
+    out_ptr, side_ptr, norm_ptr, w_ptr, qsl_ptr, M, N, P, NB, S, bp,
     WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr, BG: tl.constexpr,
     SP2: tl.constexpr,
 ):  # fmt: skip
-    """Rows 0-2 of 128-row blocks [BG * pid0, BG * pid0 + BG) that are not
+    """Rows 0-2 of 128-row blocks [BG * bp, BG * bp + BG) that are not
     sequence starts, from the saved rows 125-127 of the block before and
     rows 0-2 of the block (same arithmetic as ``_conv_fixup_kernel``)."""
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -138,7 +138,7 @@ def _conv_fixup_blocks_kernel(
     w2 = tl.load(w_ptr + cols * 4 + 2, mask=cmask, other=0.0)
     w3 = tl.load(w_ptr + cols * 4 + 3, mask=cmask, other=0.0)
     for bi in tl.static_range(BG):
-        b = tl.program_id(0) * BG + bi
+        b = bp * BG + bi
         if b < NB:
             b0 = b * 128
             pm = cmask & (b > 0)
@@ -165,6 +165,27 @@ def _conv_fixup_blocks_kernel(
             if ok2:
                 _row(out_ptr, norm_ptr, w0, w1, w2, w3, cols, cmask, p2, x0, x1, x2,
                      part, c0, b0 + 2, M, P, WITH_NORMS, BLOCK)  # fmt: skip
+
+
+@triton.jit
+def _conv_fixup_all_kernel(
+    out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
+    M, N, P, NB, S, NBG, st_s0, st_s1, st_s2, ci_s0, null_id,
+    HAS_NULL: tl.constexpr, WITH_NORMS: tl.constexpr, BLOCK: tl.constexpr,
+    BG: tl.constexpr, SP2: tl.constexpr,
+):  # fmt: skip
+    """One launch: programs [0, NBG) fix block rows (``_fixup_blocks``), the
+    next S programs fix sequence starts and the conv state (disjoint rows)."""
+    pid = tl.program_id(0)
+    if pid < NBG:
+        _fixup_blocks(out_ptr, side_ptr, norm_ptr, w_ptr, qsl_ptr, M, N, P, NB, S,
+                      pid, WITH_NORMS, BLOCK, BG, SP2)  # fmt: skip
+    else:
+        _conv_fixup_kernel(
+            out_ptr, side_ptr, norm_ptr, w_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr,
+            M, N, P, NB, S, st_s0, st_s1, st_s2, ci_s0, null_id,
+            HAS_NULL, WITH_NORMS, BLOCK, SP2, True, NBG,
+        )  # fmt: skip
 
 
 #: Columns per program and 128-row blocks per block program (measured on
@@ -194,15 +215,12 @@ def conv_fixup(
     assert p % block == 0 and conv_state.dtype in (torch.float32, torch.bfloat16)
     sp2 = triton.next_power_of_2(nseq + 1)
     bg = FIXUP_BG or (8 if nb >= 96 else 4)
-    _conv_fixup_blocks_kernel[((nb + bg - 1) // bg, n // block)](
-        out, side, norms if norms is not None else out, conv_w, qsl, m, n, p, nb, nseq,
-        WITH_NORMS=norms is not None, BLOCK=block, BG=bg, SP2=sp2, num_warps=4,
-    )  # fmt: skip
-    _conv_fixup_kernel[(nseq, n // block)](
+    nbg = (nb + bg - 1) // bg
+    _conv_fixup_all_kernel[(nbg + nseq, n // block)](
         out, side, norms if norms is not None else out, conv_w, conv_state, qsl,
-        lines, has_init, m, n, p, nb, nseq,
+        lines, has_init, m, n, p, nb, nseq, nbg,
         conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
         lines.stride(0), -1 if null_block_id is None else null_block_id,
         HAS_NULL=null_block_id is not None, WITH_NORMS=norms is not None,
-        BLOCK=block, SP2=sp2, SEQ_ONLY=True, num_warps=4,
+        BLOCK=block, BG=bg, SP2=sp2, num_warps=4,
     )  # fmt: skip

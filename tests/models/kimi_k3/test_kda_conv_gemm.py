@@ -108,3 +108,18 @@ def test_kda_conv_gemm_old_column_pass():
     # The previous per-row column pass (kept for the inverse-norm variant).
     _run([1, 2, 3, 125, 128, 3, 256, 600, 5], 1300,
          tactic=((512, 256), (4, 1), 256, 8, "n", 0, 0, "ct1"))  # fmt: skip
+
+
+def test_contiguous_rows_bytes():
+    """The 16-byte-element copy of a row-strided slice is byte-identical to
+    .contiguous() (KDA beta columns of the g|f_a|beta projection)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+        contiguous_rows,
+    )
+
+    rest = torch.randn(1031, 12512, device="cuda").to(torch.bfloat16)
+    for lo, hi in ((12416, 12512), (12288, 12416), (3, 99)):
+        x = rest[:, lo:hi]
+        y = contiguous_rows(x)
+        assert y.is_contiguous() and y.dtype == x.dtype and y.shape == x.shape
+        assert torch.equal(y.view(torch.int16), x.contiguous().view(torch.int16))
