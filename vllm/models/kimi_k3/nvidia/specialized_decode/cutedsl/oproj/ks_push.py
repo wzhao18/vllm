@@ -156,10 +156,13 @@ class OprojKsPush:
     runtime argument): K (heads x 128), ``tp`` row owners, ``cap`` rows per sender
     slot of ``SpComm.recv``."""
 
-    def __init__(self, k: int, blocks: int, tp: int, cap: int):
+    def __init__(self, k: int, blocks: int, tp: int, cap: int, dbg: int = 0):
         if k % (KS * KT) or not 1 <= blocks <= MAX_BLOCKS:
             raise ValueError(f"OprojKsPush k {k} blocks {blocks}")
         self.k, self.tp, self.cap, self.blocks = k, tp, cap, blocks
+        # bench probes (wrong results): 1 no counter wait, 2 no scratch stores, 4 no
+        # owner pushes, 8 no MMAs
+        self.dbg = dbg
         self.ktiles = k // KT
         self.kslice = self.ktiles // KS
         self.nbuf = min(blocks, 3)
@@ -428,7 +431,7 @@ class OprojKsPush:
                         stage = (blk % 2) * kslice + j
                         cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, j)], s2t_a[2])
                         cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, stage)], s2t_b[2])
-                        for kb in cutlass.range_constexpr(nkb):
+                        for kb in cutlass.range_constexpr(nkb if not self.dbg & 8 else 0):
                             mma.set(tcgen05.Field.ACCUMULATE, j != 0 or kb != 0)
                             cute.gemm(
                                 mma, tAcc[(None, 0, 0, 0)],
@@ -513,7 +516,7 @@ class OprojKsPush:
                 base = self._slot_base(scratch, fv, blk, c, slot, tidx)
                 for t0 in cutlass.range_constexpr(0, CHUNK[c], 16):
                     vals = tmem_wait_n(*tmem_ld16(taddr + START[c] + t0))
-                    for q in cutlass.range_constexpr(4):
+                    for q in cutlass.range_constexpr(4 if not self.dbg & 2 else 0):
                         st_f32x4(base + (t0 + 4 * q) * 4, *vals[4 * q : 4 * q + 4])
         cute.arch.fence_acq_rel_gpu()
         bar_sync(EPI_BAR, 32 * EPI_WARPS)
@@ -531,8 +534,9 @@ class OprojKsPush:
         pushed to the row owners."""
         where = counters.iterator.toint() + Int64((fv * MAX_BLOCKS + blk) * KS + ks) * 4
         if tidx == 0:
-            while ld_acquire(where) < 2:
-                pass
+            if cutlass.const_expr(not self.dbg & 1):
+                while ld_acquire(where) < 2:
+                    pass
             st_relaxed_gpu(where, 0)  # (the next call's writers start after this one)
         bar_sync(EPI_BAR, 32 * EPI_WARPS)
         start = Int32(START[0]) + ks * Int32(START[1])  # 0 / 48 / 96
@@ -567,5 +571,6 @@ class OprojKsPush:
                 words = tuple(positive_zero32(w[e]) for e in range(4))
                 owner = token // n
                 offset = (rank * self.cap + token - owner * n) * WIDTH + column + chunk * 8
-                store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
+                if cutlass.const_expr(not self.dbg & 4):
+                    store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
         bar_sync(EPI_BAR, 32 * EPI_WARPS)  # the staging tile is free again

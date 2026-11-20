@@ -94,11 +94,11 @@ def mx_tactic(tp: int, shape: Shape) -> str:
 
 
 @cache
-def compile_ks_push(blocks, k, tp, cap, device):
+def compile_ks_push(blocks, k, tp, cap, device, dbg=0):
     """One ``OprojKsPush`` per 128-row token-block count (R is a runtime argument)."""
     from .ks_push import MAX_BLOCKS, OprojKsPush, counter_words, scratch_floats
 
-    kernel = OprojKsPush(k, blocks, tp, cap)
+    kernel = OprojKsPush(k, blocks, tp, cap, dbg)
     g, f8, e8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
     with torch.accelerator.device_index(device):
         ptrs = tuple(make_ptr(t, 16, g, assumed_align=16) for t in (f8, e8, f8, e8))

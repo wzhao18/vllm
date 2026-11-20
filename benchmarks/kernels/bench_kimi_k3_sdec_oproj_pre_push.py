@@ -56,6 +56,8 @@ def main():
     ap.add_argument("--rows", default="128,256,384")
     ap.add_argument("--copies", type=int, default=8)
     ap.add_argument("--ks", action="store_true", help="also OprojKsPush")
+    ap.add_argument("--ks-dbg", default="0", help="OprojKsPush probe masks (ks_push.py)")
+    ap.add_argument("--no-pre-push", action="store_true")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import pre_tactic
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (
@@ -84,29 +86,30 @@ def main():
         # this rank = 0: owner o's slot [0] holds rows o n .. o n + n - 1
         pargs = Mxfp8PreGemm.push_args(peers, 0, n, cap, rows)
         local(x.data, x.scale, w.data, w.scale, out)
-        push(x.data, x.scale, w.data, w.scale, out, pargs)
         torch.cuda.synchronize()
         words = out.view(torch.int32).clone()
         words[words == SENTINEL] = 0
-        got = recv.view(torch.int32).reshape(TP * cap, WIDTH // 2)[:rows]
-        same = (got == words).float().mean().item()
         t_local = graph_time(
             lambda i: local(x.data, x.scale, *copies[i % len(copies)], out)
         )
-        t_push = graph_time(
-            lambda i: push(x.data, x.scale, *copies[i % len(copies)], out, pargs)
-        )
-        line = (
-            f"R{rows} tactic {tactic}: pushed words bitwise {same * 100:.3f}%  "
-            f"pre {t_local:.2f} us  pre_push {t_push:.2f} us/call"
-        )
+        line = f"R{rows} tactic {tactic}: pre {t_local:.2f} us"
+        if not args.no_pre_push:
+            push(x.data, x.scale, w.data, w.scale, out, pargs)
+            torch.cuda.synchronize()
+            got = recv.view(torch.int32).reshape(TP * cap, WIDTH // 2)[:rows]
+            same = (got == words).float().mean().item()
+            t_push = graph_time(
+                lambda i: push(x.data, x.scale, *copies[i % len(copies)], out, pargs)
+            )
+            line += f"  pre_push {t_push:.2f} us/call (bitwise {same * 100:.3f}%)"
         print(line, flush=True)
         if args.ks:
-            print(f"R{rows} " + ks_push(rows, n, cap, x, copies, recv, peers, words),
-                  flush=True)  # fmt: skip
+            for dbg in (int(d) for d in args.ks_dbg.split(",")):
+                res = ks_push(rows, n, cap, x, copies, recv, peers, words, dbg)
+                print(f"R{rows} dbg {dbg} " + res, flush=True)
 
 
-def ks_push(rows, n, cap, x, copies, recv, peers, words):
+def ks_push(rows, n, cap, x, copies, recv, peers, words, dbg=0):
     """OprojKsPush (K split 3, block by block) into the same local slots: bits vs the
     pre GEMM's sanitized output and us/call."""
     import cutlass
@@ -123,7 +126,7 @@ def ks_push(rows, n, cap, x, copies, recv, peers, words):
 
     dev = x.data.device
     blocks = -(-rows // ks_push.TB)
-    code = sp.compile_ks_push(blocks, K, TP, cap, dev.index)
+    code = sp.compile_ks_push(blocks, K, TP, cap, dev.index, dbg)
     scratch, counters = sp.ks_scratch(dev)
     order = ks_push.block_order(rows, n, 0)
     order = torch.tensor(order + [0] * (ks_push.MAX_BLOCKS - len(order)),

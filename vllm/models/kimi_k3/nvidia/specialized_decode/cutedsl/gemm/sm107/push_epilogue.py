@@ -23,12 +23,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass import Float32, Int32, Int64
-from cutlass.utils.gemm.sm100 import (
-    epilogue_tmem_copy_and_partition,
-    transform_partitioned_tensor_layout,
-)
 
-from ...common.primitives import asm, load_words, store_relaxed
+from ...common.primitives import asm, bf16x2, load_words, store_relaxed, store_words
 from ...common.sp_comm import positive_zero32
 
 ARGS = 16  # float32 words of the alpha / push-argument buffer
@@ -42,67 +38,58 @@ def staging_bytes(tile_n: int) -> int:
 
 
 @asm()
-def st_shared_bf16(address, value):
-    """BF16 (RN) of ``value`` at shared ``address``."""
-    code = "{ .reg .b16 h; cvt.rn.bf16.f32 h,$1; st.shared.b16 [$0],h; }"
-    return code, "r,f,~{memory}", (Int32(address), Float32(value))
+def tmem_ld16(taddr):
+    """tcgen05.ld 32x32b.x16: 16 columns of this warp's 32 TMEM lanes."""
+    regs = ",".join(f"${i}" for i in range(16))
+    code = "tcgen05.ld.sync.aligned.32x32b.x16.b32 {" + regs + "}, [$16];"
+    return code, ",".join(["=f"] * 16) + ",r,~{memory}", (Int32(taddr),), (Float32,) * 16
+
+
+@asm()
+def tmem_wait_n(*vals):
+    n = len(vals)
+    cons = ",".join(["=f"] * n) + "," + ",".join(str(i) for i in range(n))
+    return "tcgen05.wait::ld.sync.aligned;", cons, tuple(vals), (Float32,) * n
 
 
 @cute.jit
-def epilogue_push(gemm_kernel, epi_tidx: Int32, tCtAcc_base: cute.Tensor,
-                  tCgC_base: cute.Tensor, epi_tile: cute.Tile, mma_tile_coord_mnl,
-                  acc_consumer_state: pipeline.PipelineState,
+def epilogue_push(gemm_kernel, epi_tidx: Int32, acc_tmem_ptr, mma_tile_coord_mnl,
+                  cta_v: Int32, acc_consumer_state: pipeline.PipelineState,
                   acc_pipeline: pipeline.PipelineAsync, aux: cute.Tensor,
                   stage: Int32) -> pipeline.PipelineState:  # fmt: skip
-    """One tile's push (module docstring); ``tCgC_base`` is the TMA coordinate
-    tensor of C (its elements are (row, feature, l)), ``stage`` the shared address of
-    the drained A ring. Each value is staged at its own coordinate (whatever the TMEM
-    load's register order); the words are sanitized as they leave."""
+    """One tile's push (module docstring). Thread (warp w, lane l) = TMEM lane 32 w + l
+    = tile row 32 w + l of this CTA (M128 per CTA, as every pre tactic); its 16-column
+    TMEM loads are BF16-packed into its row of the token-major staging tile, then the
+    sanitized 16-byte chunks leave along rows (``acc_tmem_ptr``: the accumulator stage
+    0 column; stage s is ``tile_n`` columns further, as the kernel allocates them)."""
     tile_n = cutlass.const_expr(gemm_kernel.mma_tiler[1])
     stride = cutlass.const_expr(2 * tile_n + PAD)
-    tCgC = transform_partitioned_tensor_layout(tCgC_base)
-    tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
-    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = epilogue_tmem_copy_and_partition(
-        gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
-    )
-    gC_epi = cute.flat_divide(tCgC, epi_tile)
-    thr = tiled_copy_t2r.get_slice(epi_tidx)
-    tTR_gC_part = thr.partition_D(gC_epi)
-    tTR_rC = cute.make_rmem_tensor(
-        tTR_gC_part[(None, None, None, 0, 0, 0, 0, 0)].shape, Float32
-    )
-    tTR_gC = tTR_gC_part[(None, None, None, None, None, *mma_tile_coord_mnl)]
-    tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
-    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
-    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
     words = cute.make_tensor(cute.recast_ptr(aux.iterator, dtype=Int32), cute.make_layout(ARGS))
     bases = cute.make_tensor(
         cute.recast_ptr(aux.iterator, dtype=Int64), cute.make_layout(ARGS // 2)
     )
-
+    warp = epi_tidx // 32
+    taddr = (
+        Int32(acc_tmem_ptr.toint()) + acc_consumer_state.index * tile_n + ((32 * warp) << 16)
+    )
     acc_pipeline.consumer_wait(acc_consumer_state)
-    subtiles = cutlass.const_expr(cute.size(tTR_tAcc.shape, mode=[3]))
-    row0, col0 = Int32(0), Int32(0)
-    for s in cutlass.range_constexpr(subtiles):
-        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
-        if s == subtiles - 1:
-            with cute.arch.elect_one():
-                acc_pipeline.consumer_release(acc_consumer_state)
-            acc_consumer_state.advance()
-        tTR_rC.store(tTR_rAcc.load())
-        coords = tTR_gC[(None, None, None, s)]
-        for i in cutlass.range_constexpr(cute.size(tTR_rC)):
-            crd = coords[i]
-            row, col = crd[0], crd[1]
-            lr, lc = row % ROWS, col % tile_n
-            row0, col0 = row - lr, col - lc
-            st_shared_bf16(stage + lr * stride + lc * 2, tTR_rC[i])
+    row_smem = stage + epi_tidx * stride
+    for c0 in cutlass.range_constexpr(0, tile_n, 16):
+        vals = tmem_wait_n(*tmem_ld16(taddr + c0))
+        packed = tuple(bf16x2(vals[2 * j], vals[2 * j + 1]) for j in range(8))
+        store_words(row_smem + c0 * 2, packed[0:4], shared=True)
+        store_words(row_smem + c0 * 2 + 16, packed[4:8], shared=True)
+    with cute.arch.elect_one():
+        acc_pipeline.consumer_release(acc_consumer_state)
+    acc_consumer_state.advance()
     threads = cutlass.const_expr(32 * len(gemm_kernel.epilogue_warp_id))
     pipeline.NamedBarrier(
         barrier_id=gemm_kernel.epilog_sync_bar_id, num_threads=threads
     ).arrive_and_wait()
 
     rank, n, cap, rows = words[1], words[2], words[3], words[4]
+    row0 = mma_tile_coord_mnl[0] * gemm_kernel.mma_tiler[0] + cta_v * ROWS
+    col0 = mma_tile_coord_mnl[1] * tile_n
     chunks = cutlass.const_expr(tile_n // 8)  # 16-byte chunks per staged row
     for k in cutlass.range_constexpr(chunks * ROWS // threads):
         index = k * threads + epi_tidx
@@ -115,3 +102,4 @@ def epilogue_push(gemm_kernel, epi_tidx: Int32, tCtAcc_base: cute.Tensor,
             clean = tuple(positive_zero32(w) for w in data)
             store_relaxed(bases[4 + owner] + offset, clean)
     return acc_consumer_state
+

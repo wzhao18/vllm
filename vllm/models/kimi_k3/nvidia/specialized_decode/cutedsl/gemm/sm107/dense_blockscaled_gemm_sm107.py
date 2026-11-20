@@ -2145,10 +2145,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     acc_consumer_state = epilogue_push(
                         self,
                         tidx,
-                        tCtAcc,
-                        tCgC,
-                        epi_tile,
+                        acc_tmem_ptr,
                         mma_tile_coord_mnl,
+                        mma_tile_coord_v,
                         acc_consumer_state,
                         acc_pipeline,
                         alpha,
