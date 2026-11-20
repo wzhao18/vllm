@@ -75,6 +75,9 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     kda as specialized_prefill_kda,
 )
+from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+    contiguous_rows,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -1051,6 +1054,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 [self.local_projection_size, self.head_dim, self.local_num_heads],
                 dim=-1,
             )[:3]
+            beta = contiguous_rows(beta)
             g1 = self.f_b_proj(f_a)[0]
         else:
             projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
