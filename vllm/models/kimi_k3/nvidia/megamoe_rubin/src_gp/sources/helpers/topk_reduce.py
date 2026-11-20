@@ -560,7 +560,7 @@ class TopkReduce:
             # device's shared-memory size at COMPILE time (cuDeviceGet), which
             # an AOT compile worker without a CUDA context cannot do. The reduce
             # uses no shared memory, so state the carveout: 0 = prefer L1.
-            launch_kwargs["preferred_smem_carveout"] = 0
+            launch_kwargs["preferred_smem_carveout"] = 100  # EXPERIMENT GEMM-EX3 R6: latent up co-resides
         if cutlass.const_expr(self.batch_invariant):
             self._reduce_quantized_bi(combine_quant, sf, topk_score, reduced_output, topk_indices).launch(**launch_kwargs)
         elif cutlass.const_expr(self.persistent):

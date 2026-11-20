@@ -258,7 +258,7 @@ class SpMlp:
                 from ..cutedsl.gemm.wide import PreparedWide
 
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], self.parts, partials=True
+                    weights["latent_up"], {r: (s, (1,), 11, (0, 3), False, False, 204) for r, s in self.parts.items()}, partials=True
                 ).prepare()
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
