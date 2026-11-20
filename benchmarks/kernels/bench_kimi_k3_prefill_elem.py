@@ -83,11 +83,14 @@ def main():
     if "topk" in only:
         E = 896
         for name, std, bstd in [("n1", 1.0, 0.0), ("n3b", 3.0, 0.02),
-                                ("n12sat", 12.0, 0.0), ("emu", 3.0, None)]:
+                                ("n12sat", 12.0, 0.0), ("emu", 3.0, None), ("emu4", 3.0, "emu4")]:
             sc = torch.randn(T, E, device=dev) * std
-            if bstd is None:
+            if bstd == "emu4":  # skewed: 4 of every 56 active (> 32 candidates)
                 bias = torch.full((E,), -100.0, device=dev)
                 bias[torch.arange(E, device=dev) % 56 < 4] = 0.0
+            elif bstd is None:
+                bias = torch.full((E,), -100.0, device=dev)
+                bias[torch.arange(E, device=dev) % 224 < 56] = 0.0  # step-bench EP16 emulation
             else:
                 bias = torch.randn(E, device=dev) * bstd
             t = bench(lambda: prefill_glue.router_topk(sc, bias, 16, c["renorm"],

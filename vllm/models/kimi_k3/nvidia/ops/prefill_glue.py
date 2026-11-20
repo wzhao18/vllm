@@ -155,25 +155,22 @@ __device__ __forceinline__ void write_outputs(
   }
 }
 
-// Top-2 of this lane's keys (expert j * 32 + lane, score sel[j]) strictly
-// below `limit` (0 = none).
-template <int VPL>
-__device__ __forceinline__ void lane_top2_regs(const float (&sel)[VPL],
-                                               int32_t lane, uint64_t limit,
-                                               uint64_t& h1, uint64_t& h2) {
-  h1 = 0;
-  h2 = 0;
+// 32-lane bitonic sort of one 64-bit key per lane, largest first (lane r
+// holds rank r).
+__device__ __forceinline__ uint64_t bitonic_sort_desc_u64(uint64_t key,
+                                                          int32_t lane) {
 #pragma unroll
-  for (int j = 0; j < VPL; ++j) {
-    uint64_t k = make_key(sel[j], j * 32 + lane);
-    k = k < limit ? k : 0;
-    if (k > h1) {
-      h2 = h1;
-      h1 = k;
-    } else if (k > h2) {
-      h2 = k;
+  for (int k = 2; k <= 32; k <<= 1) {
+#pragma unroll
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      uint32_t const ohi = __shfl_xor_sync(kFull, uint32_t(key >> 32), j);
+      uint32_t const olo = __shfl_xor_sync(kFull, uint32_t(key), j);
+      uint64_t const o = (uint64_t(ohi) << 32) | olo;
+      bool const keep_max = ((lane & j) == 0) == ((lane & k) == 0);
+      key = keep_max ? (key > o ? key : o) : (key < o ? key : o);
     }
   }
+  return key;
 }
 
 // One token per warp, its VPL * 32 selection scores in registers; WARPS
@@ -257,36 +254,40 @@ __global__ void __launch_bounds__(WARPS * 32)
       __syncwarp();
       uint64_t key = lane < num_cand ? cand_keys[wid][lane] : 0;
       __syncwarp();
-#pragma unroll
-      for (int k = 2; k <= 32; k <<= 1) {
-#pragma unroll
-        for (int j = k >> 1; j > 0; j >>= 1) {
-          uint32_t const ohi = __shfl_xor_sync(kFull, uint32_t(key >> 32), j);
-          uint32_t const olo = __shfl_xor_sync(kFull, uint32_t(key), j);
-          uint64_t const o = (uint64_t(ohi) << 32) | olo;
-          bool const keep_max = ((lane & j) == 0) == ((lane & k) == 0);
-          key = keep_max ? (key > o ? key : o) : (key < o ? key : o);
-        }
-      }
-      lane_packed = key;
+      lane_packed = bitonic_sort_desc_u64(key, lane);
     } else {
-      // Many scores tied at tau: select rank by rank from every lane's keys.
-      uint64_t h1, h2;
-      lane_top2_regs<VPL>(sel, lane, ~uint64_t{0}, h1, h2);
-      bool h2_valid = true;
-      for (int kk = 0; kk < topk; ++kk) {
-        uint64_t const best = warp_max_u64(h1);
-        if (lane == kk) lane_packed = best;
-        if (h1 == best) {  // the one lane holding it
-          if (h2_valid) {
-            h1 = h2;
-            h2_valid = false;
-          } else {
-            lane_top2_regs<VPL>(sel, lane, best, h1, h2);
-            h2_valid = true;
+      // More than 32 candidates (ties at tau, skewed rows): sort them in
+      // chunks of 32 and merge each sorted chunk into the running top 32
+      // (keys are unique, so the result equals the rank-by-rank selection).
+      uint64_t best = 0;
+      for (int32_t base = 0; base < num_cand; base += 32) {
+        int32_t pos = incl - count;
+#pragma unroll
+        for (int j = 0; j < VPL; ++j) {
+          if (sel[j] >= tau) {
+            if (pos >= base && pos < base + 32)
+              cand_keys[wid][pos - base] = make_key(sel[j], j * 32 + lane);
+            ++pos;
           }
         }
+        __syncwarp();
+        uint64_t key = lane < num_cand - base ? cand_keys[wid][lane] : 0;
+        __syncwarp();
+        key = bitonic_sort_desc_u64(key, lane);
+        uint32_t const rhi = __shfl_sync(kFull, uint32_t(key >> 32), 31 - lane);
+        uint32_t const rlo = __shfl_sync(kFull, uint32_t(key), 31 - lane);
+        uint64_t const rev = (uint64_t(rhi) << 32) | rlo;
+        best = best > rev ? best : rev;  // bitonic: the 32 largest of both
+#pragma unroll
+        for (int j = 16; j > 0; j >>= 1) {
+          uint32_t const ohi = __shfl_xor_sync(kFull, uint32_t(best >> 32), j);
+          uint32_t const olo = __shfl_xor_sync(kFull, uint32_t(best), j);
+          uint64_t const o = (uint64_t(ohi) << 32) | olo;
+          bool const keep_max = (lane & j) == 0;
+          best = keep_max ? (best > o ? best : o) : (best < o ? best : o);
+        }
       }
+      lane_packed = best;
     }
 
     float lane_score = -INFINITY;
