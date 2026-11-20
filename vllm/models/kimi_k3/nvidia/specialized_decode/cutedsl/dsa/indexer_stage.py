@@ -137,6 +137,8 @@ class IndexerStage:
         buffer = indexer.topk_indices_buffer
         if rows != batch or buffer.shape[1] != self.topk:
             buffer[:batch] = -1  # as the op: only a full decode step skips it
+        if not torch.cuda.is_current_stream_capturing() and rows >= 256:
+            _probe(self, q_fp8, head_w, decode, rows, batch, q)  # PROBE (not for landing)
         logits = self.fp4_logits(q_fp8, head_w, decode, rows, batch, q)
         if not hook[1](logits, decode, buffer[:rows]):
             raise RuntimeError(
@@ -380,3 +382,61 @@ def warm_merge_rows(topk, local_topk, world_size, emit_ids, block_size):
             topk, local_topk, world_size, emit_ids=emit_ids, block_size=block_size
         )
     registry.warmup()
+
+
+_PROBED = set()
+
+
+def _probe(stage, q_fp8, head_w, decode, rows, batch, q):
+    """PROBE (bench-only branch): stock DeepGEMM varlen vs request-batched FP4 logits on
+    this step's real inputs, cold (L2 flushed before each launch) and warm."""
+    from vllm.model_executor.layers.sparse_attn_indexer import kv_cache_as_quant_view
+    from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits, mqa_logits_mx_inputs
+
+    key = (rows, stage.k_cache_name)
+    if key in _PROBED or len(_PROBED) >= 4:
+        return
+    _PROBED.add(key)
+    query, q_scale = stage.query(q_fp8, rows, batch)
+    kv = kv_cache_as_quant_view(stage.indexer.k_cache.kv_cache, 128, True)
+    qv = query.view(torch.int8).view(rows, 1, 32, 64)
+    qs, w = mqa_logits_mx_inputs(qv, q_scale.view(rows, 1, 32), head_w[:rows])
+
+    def dg():
+        return fp8_fp4_paged_mqa_logits(
+            (qv, qs), kv, w, decode.seq_lens[:rows], decode.block_table[:rows],
+            decode.schedule_metadata, stage.max_model_len, indices=decode.indices)
+
+    def fp4():
+        return stage.fp4_logits(q_fp8, head_w, decode, rows, batch, q)
+
+    flush = torch.empty(1 << 29, dtype=torch.uint8, device=qv.device)
+    out = {}
+    for name, fn in (("dg", dg), ("fp4", fp4), ("dg2", dg), ("fp42", fp4)):
+        fn()
+        cold, warm = [], []
+        for _ in range(5):
+            flush.zero_()
+            a, b = torch.cuda.Event(True), torch.cuda.Event(True)
+            a.record()
+            fn()
+            b.record()
+            torch.cuda.synchronize()
+            cold.append(a.elapsed_time(b) * 1e3)
+            a.record()
+            fn()
+            b.record()
+            torch.cuda.synchronize()
+            warm.append(a.elapsed_time(b) * 1e3)
+        out[name] = (sorted(cold)[2], sorted(warm)[2])
+    lens = decode.seq_lens[:rows].reshape(-1).float()
+    kv_t = stage.indexer.k_cache.kv_cache
+    print(f"PROBE rows {rows} {stage.k_cache_name} lens mean {lens.mean().item():.0f} "
+          f"max {lens.max().item():.0f} cache {tuple(kv_t.shape)} stride {kv_t.stride()} "
+          f"bt {tuple(decode.block_table.shape)} | cold/warm us: " +
+          " ".join(f"{k} {c:.1f}/{w_:.1f}" for k, (c, w_) in out.items()), flush=True)
+    bt = decode.block_table[:rows]
+    d = (bt[:, 1:] - bt[:, :-1])[:, :64].reshape(-1)
+    print(f"PROBE block table row0 {bt[0, :8].tolist()} step mode "
+          f"{torch.mode(d).values.item()} frac1 {(d == 1).float().mean().item():.2f}",
+          flush=True)
