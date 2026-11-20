@@ -1285,6 +1285,18 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._fused_query = padded
         return padded[:, :num_heads]
 
+    def uk_query_fp8(
+        self, q: torch.Tensor, w_uk_t: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor | None:
+        """The FP8 query [T, H, L + R] of a prefill-sized call of the specialized
+        prefill sparse MLA (W_UK absorption, RoPE concat and static quant in one
+        GEMM pass), or None to let the layer run its bmm / concat / quant."""
+        if not self._runs_prefill_sparse_mla(q.shape[0]):
+            return None
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import uk_query
+
+        return uk_query.fused_query(q, w_uk_t, q_scale)
+
     def _runs_prefill_sparse_mla(self, num_rows: int) -> bool:
         psm = getattr(self, "_prefill_sparse_mla", None)
         return psm is not None and num_rows >= psm.MIN_ROWS
