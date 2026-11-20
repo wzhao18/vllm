@@ -20,13 +20,27 @@ from .....helpers.topk_reduce import add_shared_term, load_shared_term, shared_t
 from .....quant_def import CombineFormat
 
 
+@cute.jit
+def _popc31(v: Int32) -> Int32:
+    """Population count of a non-negative 31-bit mask (SWAR)."""
+    v = v - ((v >> Int32(1)) & Int32(0x55555555))
+    v = (v & Int32(0x33333333)) + ((v >> Int32(2)) & Int32(0x33333333))
+    v = (v + (v >> Int32(4))) & Int32(0x0F0F0F0F)
+    v = v + (v >> Int32(8))
+    return (v + (v >> Int32(16))) & Int32(0x3F)
+
+
 class TopkReduceDedup:
     _threads: ClassVar[int] = 128
     _hidden_per_thread: ClassVar[int] = 16  # one 32-byte BF16 load per rank slot
 
+    # Shared-memory rank slots of the fused-RMSNorm form: the first 8 valid ranks of a row, then the rest (2 phases),
+    # so 4 rows fit per SM (57 KiB each) instead of 2 with a slot per rank.
+    _stage_slots: ClassVar[int] = 8
+
     def _staged_smem_bytes(self) -> int:
         """Fused-RMSNorm form: every rank slot of the row staged in shared memory (cp.async), plus the warp sums."""
-        return self.world_size * self.hidden * 2 + 32 * 4 + 256
+        return self._stage_slots * self.hidden * 2 + 32 * 4 + 256
 
     def __init__(self, hidden: int, world_size: int, combine_format: CombineFormat) -> None:
         if combine_format.is_quantized or combine_format.act_dtype is not cutlass.BFloat16:
@@ -264,10 +278,9 @@ class TopkReduceDedup:
         token_idx = cute.arch.block_idx()[0]
         active = thread_idx < Int32(hidden_tiles)
 
+        slots: cutlass.Constexpr[int] = self._stage_slots
         smem = cutlass_utils.SmemAllocator()
-        stage = smem.allocate_tensor(
-            cutlass.BFloat16, cute.make_layout((world_size, self.hidden), stride=(self.hidden, 1)), 128
-        )
+        stage = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((slots, self.hidden), stride=(self.hidden, 1)), 128)
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
         g2s = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
@@ -277,35 +290,45 @@ class TopkReduceDedup:
         rank_mask = valid_rank_mask[token_idx]
         x = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
         sumsq = Float32(0)
-        if active:
-            row_slots = cute.zipped_divide(rank_slots[token_idx, None, None], (world_size, vec))
-            for rank in cutlass.range_constexpr(world_size):
-                if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
-                    for p in cutlass.range_constexpr(parts):
-                        tile = thread_idx * Int32(parts) + Int32(p)
-                        src = row_slots[(None, None), (0, tile)][rank, None]
-                        dst = cute.zipped_divide(stage[rank, None], (vec,))[(None,), (tile,)]
-                        cute.copy(g2s, mark_alignment(src, 16), mark_alignment(dst, 16))
-        cute.arch.cp_async_commit_group()
-        if active:
-            shared_reg = None
-            if cutlass.const_expr(shared_term is not None):
-                shared_reg = load_shared_term(shared_term, token_idx, thread_idx, hidden_per_thread)
+        acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+        for i in cutlass.range_constexpr(hidden_per_thread):
+            acc[i] = Float32(0.0)
+        one_pair = (Float32(1.0), Float32(1.0))
+        shared_reg = None
+        if cutlass.const_expr(shared_term is not None):
+            shared_reg = load_shared_term(shared_term, token_idx, thread_idx, hidden_per_thread)
+        row_slots = cute.zipped_divide(rank_slots[token_idx, None, None], (world_size, vec))
+        # Phase n stages the valid ranks of slot index 8n..8n+7 (ascending rank) into the same slots; each
+        # thread reads back only what it copied, so a cp.async wait (no barrier) orders a phase.
+        for phase in cutlass.range_constexpr((world_size + slots - 1) // slots):
+            if active:
+                for rank in cutlass.range_constexpr(world_size):
+                    slot = _popc31(rank_mask & Int32((1 << rank) - 1)) - Int32(phase * slots)
+                    if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
+                        if (slot >= Int32(0)) & (slot < Int32(slots)):
+                            for p in cutlass.range_constexpr(parts):
+                                tile = thread_idx * Int32(parts) + Int32(p)
+                                src = row_slots[(None, None), (0, tile)][rank, None]
+                                dst = cute.zipped_divide(stage[slot, None], (vec,))[(None,), (tile,)]
+                                cute.copy(g2s, mark_alignment(src, 16), mark_alignment(dst, 16))
+            cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
-            acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-            for i in cutlass.range_constexpr(hidden_per_thread):
-                acc[i] = Float32(0.0)
-            one_pair = (Float32(1.0), Float32(1.0))
-            for rank in cutlass.range_constexpr(world_size):
-                if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
-                    for p in cutlass.range_constexpr(parts):
-                        tile = thread_idx * Int32(parts) + Int32(p)
-                        term = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                        term.store(cute.zipped_divide(stage[rank, None], (vec,))[(None,), (tile,)].load())
-                        for i in cutlass.range_constexpr(0, vec, 2):
-                            j = p * vec + i
-                            value_pair = (Float32(term[i]), Float32(term[i + 1]))
-                            acc[j], acc[j + 1] = cute.arch.fma_packed_f32x2(value_pair, one_pair, (acc[j], acc[j + 1]))
+            if active:
+                for rank in cutlass.range_constexpr(world_size):
+                    slot = _popc31(rank_mask & Int32((1 << rank) - 1)) - Int32(phase * slots)
+                    if ((rank_mask >> Int32(rank)) & Int32(1)) != Int32(0):
+                        if (slot >= Int32(0)) & (slot < Int32(slots)):
+                            for p in cutlass.range_constexpr(parts):
+                                tile = thread_idx * Int32(parts) + Int32(p)
+                                term = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                                term.store(cute.zipped_divide(stage[slot, None], (vec,))[(None,), (tile,)].load())
+                                for i in cutlass.range_constexpr(0, vec, 2):
+                                    j = p * vec + i
+                                    value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                                    acc[j], acc[j + 1] = cute.arch.fma_packed_f32x2(
+                                        value_pair, one_pair, (acc[j], acc[j + 1])
+                                    )
+        if active:
             if cutlass.const_expr(shared_term is not None):
                 add_shared_term(acc, shared_reg, hidden_per_thread)
             x.store(acc.load().to(out_dtype))
