@@ -44,7 +44,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from ..common.primitives import asm, store_relaxed
+from ..common.primitives import asm, bf16x2, store_relaxed
 from ..common.sp_comm import positive_zero32
 
 WIDTH = 7168  # output features (the hidden size)
@@ -62,8 +62,12 @@ MMA_WARP = 4
 W_WARP = 5
 X_WARP = 6
 TMEM_COLS = 512
+GATHER_WARP = 7  # warps 7..10: the gather / push group (TMEM lane quarter = warp % 4)
 TMEM_BAR = 1
-EPI_BAR = 2
+EPI_BAR = 2  # the scatter group (warps 0..3)
+GATHER_BAR = 3
+DONE_BAR = 4  # both groups, before the TMEM is freed
+WRITERS = 2 * 32 * EPI_WARPS  # counter target: both writer CTAs' scatter threads
 MAX_BLOCKS = 4  # R <= 512
 STAMPS = 16  # bench probe (dbg & 32): int64 globaltimer stamps per CTA after the scratch
 STAMP_FLOATS = 2 * STAMPS * 2 * (WIDTH // FEATURES) * KS
@@ -158,6 +162,33 @@ def st_i64(address, value):
     return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
 
 
+@asm(Float32)
+def shfl_xor1(value):
+    return "shfl.sync.bfly.b32 $0, $1, 1, 0x1f, 0xffffffff;", "=f,f", (Float32(value),)
+
+
+@asm()
+def st_shared_u32(address, word):
+    return "st.shared.b32 [$0], $1;", "r,r,~{memory}", (Int32(address), Uint32(word))
+
+
+@asm()
+def bulk_s2g(dst, src, size):
+    code = "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    return code, "l,r,r,~{memory}", (Int64(dst), Int32(src), Int32(size))
+
+
+@asm()
+def bulk_commit_wait_read():
+    code = "cp.async.bulk.commit_group; cp.async.bulk.wait_group.read 0;"
+    return code, "~{memory}", ()
+
+
+@asm()
+def fence_proxy_async_smem():
+    return "fence.proxy.async.shared::cta;", "~{memory}", ()
+
+
 @asm()
 def bar_sync(barrier_id: int, count: int):
     return f"bar.sync {barrier_id},{count};", "~{memory}", ()
@@ -180,7 +211,7 @@ class OprojKsPush:
         self.nbuf = min(blocks, 3)
         self.mblocks = WIDTH // FEATURES
         self.grid = 2 * self.mblocks * KS
-        self.threads = 32 * (X_WARP + 1)
+        self.threads = 32 * (GATHER_WARP + EPI_WARPS)
         self.tiler = (FEATURES, TB, KT)
         self.tiler_sfb = (128, TB, KT)
 
@@ -324,13 +355,13 @@ class OprojKsPush:
         )  # fmt: skip
         acc_pipe = pipeline.PipelineUmmaAsync.create(
             barrier_storage=st.acc_full.data_ptr(), num_stages=nbuf, producer_group=thread,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2 * EPI_WARPS),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 4 * EPI_WARPS),
             cta_layout_vmnk=pair_vmnk, defer_sync=True,
         )  # fmt: skip
         tmem = utils.TmemAllocator(
             st.tmem_hold.ptr,
             barrier_for_retrieve=pipeline.NamedBarrier(
-                barrier_id=TMEM_BAR, num_threads=32 * (EPI_WARPS + 1)
+                barrier_id=TMEM_BAR, num_threads=32 * (2 * EPI_WARPS + 1)
             ),
             allocator_warp_id=0, is_two_cta=True,
             two_cta_tmem_dealloc_mbar_ptr=st.tmem_dealloc.ptr, arch="sm_107",
@@ -478,41 +509,51 @@ class OprojKsPush:
             a_cons.advance()
             acc_pipe.producer_tail(accs)
 
-        if warp < EPI_WARPS:
+        if warp < EPI_WARPS:  # scatter group: the other slices' chunks -> scratch
             tmem.allocate(TMEM_COLS)
+            tmem.wait_for_alloc()
+            acc_ptr = tmem.retrieve_ptr(Float32)
+            cute.arch.griddepcontrol_wait()
+            waits = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, nbuf)
+            taddr = Int32(acc_ptr.toint()) + ((32 * warp) << 16)
+            fv = mb * 2 + v  # this CTA's 128 output features: [128 fv, 128 fv + 128)
+            for blk in cutlass.range_constexpr(self.blocks):
+                acc_pipe.consumer_wait(waits)
+                if cutlass.const_expr(self.dbg & 32):
+                    if tidx == 0:
+                        st_i64(stamps + (8 + blk) * 8, globaltimer())
+                self._scatter(taddr + (blk % nbuf) * TB, scratch, counters, fv, blk, ks, tidx)
+                with cute.arch.elect_one():
+                    acc_pipe.consumer_release(waits)
+                waits.advance()
+            if cutlass.const_expr(self.dbg & 32):
+                if tidx == 0:
+                    st_i64(stamps + 14 * 8, globaltimer())
+            bar_sync(DONE_BAR, 64 * EPI_WARPS)  # the gather group read its last chunk
+            tmem.relinquish_alloc_permit()
+            tmem.free(acc_ptr)
+
+        if warp >= GATHER_WARP:  # gather group: this slice's chunk summed and pushed
             tmem.wait_for_alloc()
             acc_ptr = tmem.retrieve_ptr(Float32)
             cute.arch.griddepcontrol_wait()  # (owner slots written after the producers)
             waits = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, nbuf)
-            frees = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, nbuf)
-            taddr = Int32(acc_ptr.toint()) + ((32 * warp) << 16)
-            fv = mb * 2 + v  # this CTA's 128 output features: [128 fv, 128 fv + 128)
+            gid = tidx - 32 * GATHER_WARP  # 0..127
+            feature = 32 * (warp % 4) + cute.arch.lane_idx()
+            taddr = Int32(acc_ptr.toint()) + ((32 * (warp % 4)) << 16)
+            fv = mb * 2 + v
             stage = Int32(st.sStage.data_ptr().toint())
-            for blk in cutlass.range_constexpr(self.blocks + 1):
-                if blk < self.blocks:
-                    acc_pipe.consumer_wait(waits)
-                    if cutlass.const_expr(self.dbg & 32):
-                        if tidx == 0:
-                            st_i64(stamps + (8 + blk) * 8, globaltimer())
-                    self._scatter(taddr + (blk % nbuf) * TB, scratch, counters, fv, blk, ks,
-                                  tidx)  # fmt: skip
-                    waits.advance()
-                if blk >= 1:
-                    self._gather_push(
-                        taddr + ((blk - 1) % nbuf) * TB, scratch, counters, peers, order,
-                        stage, fv, blk - 1, ks, rank, rows, tidx,
-                    )  # fmt: skip
-                    with cute.arch.elect_one():
-                        acc_pipe.consumer_release(frees)
-                    frees.advance()
-                    if cutlass.const_expr(self.dbg & 32):
-                        if tidx == 0:
-                            st_i64(stamps + (11 + blk - 1) * 8, globaltimer())
-            if cutlass.const_expr(self.dbg & 32):
-                if tidx == 0:
-                    st_i64(stamps + 14 * 8, globaltimer())
-            tmem.relinquish_alloc_permit()
-            tmem.free(acc_ptr)
+            for blk in cutlass.range_constexpr(self.blocks):
+                acc_pipe.consumer_wait(waits)
+                self._gather_push(
+                    taddr + (blk % nbuf) * TB, scratch, counters, peers, order, stage, fv,
+                    blk, ks, rank, rows, gid, feature, acc_pipe, waits,
+                )  # fmt: skip
+                waits.advance()
+                if cutlass.const_expr(self.dbg & 32):
+                    if gid == 0:
+                        st_i64(stamps + (11 + blk) * 8, globaltimer())
+            bar_sync(DONE_BAR, 64 * EPI_WARPS)
 
     def _s2t(self, sSF, tSF):
         """SMEM -> TMEM scale-factor copy (tcgen05.cp 4x32dp128bit, cta_group::2)."""
@@ -549,71 +590,76 @@ class OprojKsPush:
     @cute.jit
     def _scatter(self, taddr, scratch, counters, fv, blk, ks, tidx):
         """This K slice's FP32 partials of the two token chunks other slices own:
-        thread = TMEM lane = feature, 16 tokens per TMEM load, written feature-major
-        into the owner slice's slot, then the owners' counters bumped (release)."""
+        thread = TMEM lane = feature, 32 tokens per TMEM wait, written as token quads
+        into the owner slice's slab, then the owners' counters bumped by every thread
+        (release: its own stores)."""
         for c in cutlass.range_constexpr(KS):
             if ks != c:
                 slot = (ks - c + 2) % 3
                 base = self._slot_base(scratch, fv, blk, c, slot, tidx)
-                for t0 in cutlass.range_constexpr(0, CHUNK[c], 16):
-                    vals = tmem_wait_n(*tmem_ld16(taddr + START[c] + t0))
-                    for q in cutlass.range_constexpr(4 if not self.dbg & 2 else 0):
+                for t0 in cutlass.range_constexpr(0, CHUNK[c], 32):
+                    if cutlass.const_expr(t0 + 16 < CHUNK[c]):
+                        a = tmem_ld16(taddr + START[c] + t0)
+                        b = tmem_ld16(taddr + START[c] + t0 + 16)
+                        vals = tmem_wait_n(*a, *b)
+                    else:
+                        vals = tmem_wait_n(*tmem_ld16(taddr + START[c] + t0))
+                    for q in cutlass.range_constexpr(len(vals) // 4 if not self.dbg & 2 else 0):
                         quad = (t0 + 4 * q) // 4  # token quad: 128 x 16 B apart
                         st_f32x4(base + quad * 2048, *vals[4 * q : 4 * q + 4])
-        cute.arch.fence_acq_rel_gpu()
-        bar_sync(EPI_BAR, 32 * EPI_WARPS)
-        if tidx == 0:
-            for c in cutlass.range_constexpr(KS):
-                if ks != c:
-                    where = (fv * MAX_BLOCKS + blk) * KS + c
-                    red_release_add(counters.iterator.toint() + Int64(where) * 4, 1)
+                where = (fv * MAX_BLOCKS + blk) * KS + c
+                red_release_add(counters.iterator.toint() + Int64(where) * 4, 1)
 
     @cute.jit
-    def _gather_push(self, taddr, scratch, counters, peers, order, stage, fv,
-                     blk, ks, rank, rows, tidx):  # fmt: skip
-        """Once both peers' partials of this slice's chunk are in: their sum with this
-        slice's own (K-slice order, FP32), one BF16 rounding, staged token-major and
-        pushed to the row owners."""
-        where = counters.iterator.toint() + Int64((fv * MAX_BLOCKS + blk) * KS + ks) * 4
-        if tidx == 0:
-            if cutlass.const_expr(not self.dbg & 1):
-                while ld_acquire(where) < 2:
-                    pass
-            st_relaxed_gpu(where, 0)  # (the next call's writers start after this one)
-        bar_sync(EPI_BAR, 32 * EPI_WARPS)
+    def _gather_push(self, taddr, scratch, counters, peers, order, stage, fv, blk, ks,
+                     rank, rows, gid, feature, acc_pipe, waits):  # fmt: skip
+        """This slice's own chunk read from TMEM (then the accumulator is released),
+        both peers' partials once their counter is full, the sum in K-slice order (FP32),
+        one BF16 rounding, sanitized pairs staged token-major, one bulk copy per row to
+        the row owner."""
         start = Int32(START[0]) + ks * Int32(START[1])  # 0 / 48 / 96
         size = Int32(cutlass.select_(ks == 2, Int32(CHUNK[2]), Int32(CMAX)))
-        base0 = self._slot_base(scratch, fv, blk, ks, 0, tidx)
-        base1 = self._slot_base(scratch, fv, blk, ks, 1, tidx)
+        own = []
         for t0 in cutlass.range_constexpr(0, CMAX, 16):
+            vals = tmem_wait_n(*tmem_ld16(taddr + start + t0))  # (beyond size: unused)
+            own.append(vals)
+        with cute.arch.elect_one():
+            acc_pipe.consumer_release(waits)
+        where = counters.iterator.toint() + Int64((fv * MAX_BLOCKS + blk) * KS + ks) * 4
+        if gid == 0:
+            if cutlass.const_expr(not self.dbg & 1):
+                while ld_acquire(where) < WRITERS:
+                    pass
+            st_relaxed_gpu(where, 0)  # (the next call's writers start after this one)
+        bar_sync(GATHER_BAR, 32 * EPI_WARPS)
+        base0 = self._slot_base(scratch, fv, blk, ks, 0, feature)
+        base1 = self._slot_base(scratch, fv, blk, ks, 1, feature)
+        for g in cutlass.range_constexpr(CMAX // 16):
+            t0 = 16 * g
             if t0 < size:
                 # all eight slab loads of the 16 tokens in flight before any use
                 s0 = [ld_f32x4_cg(base0 + ((t0 + 4 * q) // 4) * 2048) for q in range(4)]
                 s1 = [ld_f32x4_cg(base1 + ((t0 + 4 * q) // 4) * 2048) for q in range(4)]
-                own = tmem_wait_n(*tmem_ld16(taddr + start + t0))
                 for q in cutlass.range_constexpr(4):
                     for e in cutlass.range_constexpr(4):
-                        mine, a, b = own[4 * q + e], s0[q][e], s1[q][e]
+                        mine, a, b = own[g][4 * q + e], s0[q][e], s1[q][e]
                         # slice order: P0 + P1 + P2 (slot (k - ks - 1) mod 3 holds P_k)
                         p0 = Float32(cutlass.select_(ks == 0, mine, cutlass.select_(ks == 1, b, a)))
                         p1 = Float32(cutlass.select_(ks == 1, mine, cutlass.select_(ks == 0, a, b)))
                         p2 = Float32(cutlass.select_(ks == 2, mine, cutlass.select_(ks == 0, b, a)))
                         total = (p0 + p1) + p2
-                        st_shared_bf16(stage + ((t0 + 4 * q + e) * 128 + tidx) * 2, total)
-        bar_sync(EPI_BAR, 32 * EPI_WARPS)
+                        pair = shfl_xor1(total)  # the neighbouring feature's sum
+                        if (feature & 1) == 0:
+                            word = positive_zero32(bf16x2(total, pair))
+                            st_shared_u32(stage + ((t0 + 4 * q + e) * 128 + feature) * 2, word)
+        fence_proxy_async_smem()
+        bar_sync(GATHER_BAR, 32 * EPI_WARPS)
         n = rows // self.tp
-        tb = order[blk]
-        column = fv * 128
-        for j in cutlass.range_constexpr(CMAX * 16 // (32 * EPI_WARPS)):
-            q = j * 32 * EPI_WARPS + tidx
-            local = q // 16
-            chunk = q % 16
-            token = tb * TB + start + local
-            if (local < size) & (token < rows):
-                w = ld_shared_u32x4(stage + (local * 128 + chunk * 8) * 2)
-                words = tuple(positive_zero32(w[e]) for e in range(4))
-                owner = token // n
-                offset = (rank * self.cap + token - owner * n) * WIDTH + column + chunk * 8
-                if cutlass.const_expr(not self.dbg & 4):
-                    store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
-        bar_sync(EPI_BAR, 32 * EPI_WARPS)  # the staging tile is free again
+        token = order[blk] * TB + start + gid
+        if (gid < size) & (token < rows):
+            owner = token // n
+            offset = (rank * self.cap + token - owner * n) * WIDTH + fv * 128
+            if cutlass.const_expr(not self.dbg & 4):
+                bulk_s2g(Int64(peers[owner]) + Int64(offset) * 2, stage + gid * 256, 256)
+        bulk_commit_wait_read()
+        bar_sync(GATHER_BAR, 32 * EPI_WARPS)  # the staging tile is free again
