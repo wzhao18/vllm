@@ -522,7 +522,60 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       V2DBG(26);
       return nv;
     };
-    {
+    auto send = [&](const uint32_t* m, int nw, int64_t base) {
+      for (int j = tid * 4; j < nw; j += kV2T * 4) {
+        const uint4 v = make_uint4(m[j], m[j + 1], m[j + 2], m[j + 3]);
+        const int64_t off = base + j;
+        if (p.mc) mc_st_v4(p.mc + off * 4, v);
+        else
+          for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
+      }
+    };
+    auto poll_words = [&](const uint32_t* src, uint32_t* dst, int code) {
+      const long long t0 = now_ns();
+      uint4 v = ld_sys_v4(src);
+      while (!tagged(v, tag)) {
+        if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, code); break; }
+        __nanosleep(128);  // spinning warps steal issue slots / L2 from co-resident rows
+        v = ld_sys_v4(src);
+      }
+      *reinterpret_cast<uint4*>(dst) = v;
+    };
+    // ---- rounds. Round 1 puts each rank's window around its own q-th key. A row it leaves
+    // unresolved (tier 2/3; kFast) runs the SAME code once more, so its instructions are
+    // warm, with every rank's window at one common base X2 that the round-1 bounds put at
+    // or below tau (exact counts, bands of global ids, one more NVLink round).
+    int X2 = -1, c2 = 0, tier = 0, lo = 0, nc = 0;
+    bool fast = false, recand = true;
+#pragma unroll 1
+    for (int rnd = 0; rnd < (kFast ? 2 : 1); ++rnd) {
+    if (rnd > 0) {
+      if (tid == 0) s_sat = 0u;
+      recand = X2 < th;
+      if (recand) {
+        // the round-1 buffers (rx, slots, message, window) overwrote the row's first groups:
+        // copy those again; the candidate pass below then starts at X2
+        const int gr_hi = min(gs_hi, (kV2RxW + kV2Cand + kV2Msg + kV2Win + 3) / 4);
+        if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          const int n = max(0, gr_hi - gs_lo), c = tid >> 5;
+          const int a = gs_lo + (int)((int64_t)n * c / kV2Cp), b = gs_lo + (int)((int64_t)n * (c + 1) / kV2Cp);
+          const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
+          if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
+          else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+        }
+        uint4 pg2 = make_uint4(~0u, ~0u, ~0u, ~0u);
+        if (tid == 0 && phead) pg2 = load_group(0);
+        if (tid == 32 && ptail && g_hi < gr_hi) pg2 = load_group(g_hi);
+        mbar_wait(&s_bar, bar_phase);
+        bar_phase ^= 1u;
+        if (tid == 0 && phead) srow[0] = pg2;
+        if (tid == 32 && ptail && g_hi < gr_hi) srow[g_hi] = pg2;
+        __syncthreads();
+        th = X2;
+      }
+    }
+    if (recand) {
       uint32_t nv = 0;
       if (regp) nv += cand_regp(th);
       const int nfull = regp ? 0 : g_hi - g_lo;
@@ -597,10 +650,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
       for (int o = 16; o > 0; o >>= 1) nv += __shfl_xor_sync(0xffffffffu, nv, o);
-      if ((tid & 31) == 0 && nv) atomicAdd(&s_valid, nv);
+      if ((tid & 31) == 0 && nv && rnd == 0) atomicAdd(&s_valid, nv);
     }
     __syncthreads();
-    int nc = s_cnt;
+    nc = s_cnt;
     if (!kFast && K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
       // the sample bound failed (tie-heavy or skewed rows): exact counts per key over
       // 2048-key ranges of the SMEM row (from theta up on overflow, down otherwise) give a
@@ -659,61 +712,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     V2DBG(2);
     if (p.dbg && tid == 0) p.dbg[(int64_t)row * kV2Dbg + 31] = nc;
-    auto send = [&](const uint32_t* m, int nw, int64_t base) {
-      for (int j = tid * 4; j < nw; j += kV2T * 4) {
-        const uint4 v = make_uint4(m[j], m[j + 1], m[j + 2], m[j + 3]);
-        const int64_t off = base + j;
-        if (p.mc) mc_st_v4(p.mc + off * 4, v);
-        else
-          for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
-      }
-    };
-    auto poll_words = [&](const uint32_t* src, uint32_t* dst, int code) {
-      const long long t0 = now_ns();
-      uint4 v = ld_sys_v4(src);
-      while (!tagged(v, tag)) {
-        if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, code); break; }
-        __nanosleep(128);  // spinning warps steal issue slots / L2 from co-resident rows
-        v = ld_sys_v4(src);
-      }
-      *reinterpret_cast<uint4*>(dst) = v;
-    };
-    // ---- rounds. Round 1 puts each rank's window around its own q-th key. A row it leaves
-    // unresolved (tier 2/3; kFast) runs the SAME code once more, so its instructions are
-    // warm, with every rank's window at one common base X2 that the round-1 bounds put at
-    // or below tau (exact counts, bands of global ids, one more NVLink round).
-    int X2 = -1, c2 = 0, tier = 0, lo = 0;
-    bool fast = false;
-#pragma unroll 1
-    for (int rnd = 0; rnd < (kFast ? 2 : 1); ++rnd) {
-    if (rnd > 0) {
-      if (tid == 0) s_sat = 0u;
-      if (X2 < th) {
-        // the round-1 buffers (rx, slots, message, window) overwrote the row's first groups:
-        // copy those again, then the candidate pass from X2 (the round-1 code)
-        const int gr_hi = min(gs_hi, (kV2RxW + kV2Cand + kV2Msg + kV2Win + 3) / 4);
-        if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
-          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-          const int n = max(0, gr_hi - gs_lo), c = tid >> 5;
-          const int a = gs_lo + (int)((int64_t)n * c / kV2Cp), b = gs_lo + (int)((int64_t)n * (c + 1) / kV2Cp);
-          const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
-          if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
-          else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
-        }
-        uint4 pg2 = make_uint4(~0u, ~0u, ~0u, ~0u);
-        if (tid == 0 && phead) pg2 = load_group(0);
-        if (tid == 32 && ptail && g_hi < gr_hi) pg2 = load_group(g_hi);
-        mbar_wait(&s_bar, bar_phase);
-        bar_phase ^= 1u;
-        if (tid == 0 && phead) srow[0] = pg2;
-        if (tid == 32 && ptail && g_hi < gr_hi) srow[g_hi] = pg2;
-        __syncthreads();
-        th = X2;
-        if (regp) (void)cand_regp(th);
-        __syncthreads();
-        nc = s_cnt;
-      }
-    }
     // ---- 3. fine histogram above theta from the candidates -> e, window, band
     fast = nc <= kV2Cand && (rnd > 0 ? regp : (uint32_t)nc >= q);
     for (int b = tid; b < kV2Fine; b += kV2T) hist[b] = 0;
@@ -1167,9 +1165,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           anysat |= ((rx[r * kV2Msg] >> 16) & 1u) != 0u;
         }
         if (!anysat) UB = max(LB, min(UB, top));
-        if (LB >= 1) {
-          X2 = min(LB, 65536 - kV2Win);
-          c2 = min(max((LB + UB) / 2 - X2, 0), kV2Win - 1);
+        // tier 2: tau known (inside every window, so above every theta), only the bands
+        // missed its ties: the window starts at tau, the band around it
+        const int t2 = tier == 2 ? s_tau : -1;
+        if (t2 >= 1 || LB >= 1) {
+          X2 = min(t2 >= 1 ? t2 : LB, 65536 - kV2Win);
+          c2 = t2 >= 1 ? t2 - X2 : min(max((LB + UB) / 2 - X2, 0), kV2Win - 1);
           V2STAT(3);
           __syncthreads();  // S (hist) is reused by round 2
           continue;
