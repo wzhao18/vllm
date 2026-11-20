@@ -124,13 +124,21 @@ def persistent_prefill(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     lower_bound: float,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """KDA chunked prefill on the persistent kernel (same contract as
     ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
-    (sequence, head) chain pieces once per batch)."""
+    (sequence, head) chain pieces once per batch).
+
+    With ``state_cache`` [slots, H, D, D] the kernel loads each sequence's
+    initial state from ``state_cache[state_indices[i]]`` (zero where
+    ``has_initial_state[i]`` is false) and stores its final state back to that
+    row in place; the returned final state is then None."""
     from .kda_persistent import forward as kp
 
     T, H, D = q.shape[1], q.shape[2], q.shape[3]
@@ -143,7 +151,16 @@ def persistent_prefill(
         plan = kp.make_plan(list(offsets), H, q.device)
         _persistent_plans[key] = plan
     out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
-    final_state = torch.empty_like(initial_state)
+    srow = None
+    if state_cache is not None:
+        assert state_indices is not None and has_initial_state is not None
+        nseq = len(offsets) - 1
+        rows, srow = kp.state_cache_rows(
+            state_cache, state_indices[:nseq], has_initial_state, H
+        )
+        initial_state = final_state = rows
+    else:
+        final_state = torch.empty_like(initial_state)
     kp.fwd(
         q.contiguous(),
         k.contiguous(),
@@ -159,8 +176,27 @@ def persistent_prefill(
         final_state=final_state,
         cu_seqlens=cu_seqlens,
         plan=plan,
+        srow=srow,
     )
-    return out, final_state
+    return out, (None if srow is not None else final_state)
+
+
+_fp32_weights: dict = {}
+
+
+def _fp32_weight(weight: torch.Tensor) -> torch.Tensor:
+    """FP32 contiguous copy of a norm weight, made once per weight version
+    (a cast kernel per layer and step otherwise)."""
+    if weight.dtype == torch.float32 and weight.is_contiguous():
+        return weight
+    key = (weight.data_ptr(), weight.device, weight.dtype, weight._version)
+    w32 = _fp32_weights.get(key)
+    if w32 is None:
+        if len(_fp32_weights) >= 1024:
+            _fp32_weights.clear()
+        w32 = weight.float().contiguous()
+        _fp32_weights[key] = w32
+    return w32
 
 
 def o_norm_mxfp8(
@@ -174,5 +210,5 @@ def o_norm_mxfp8(
     into ``out`` (an ``mxfp8_act.Mxfp8Buffer`` of T rows)."""
     kda_segscan.load_extension()
     torch.ops.k3_flashkda_split.o_norm_mxfp8(
-        x, g, weight.float().contiguous(), eps, out.data, out.scale
+        x, g, _fp32_weight(weight), eps, out.data, out.scale
     )

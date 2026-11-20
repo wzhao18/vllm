@@ -133,3 +133,23 @@ class PrefillKdaConvInProj:
             out_dtype=torch.bfloat16,
         )
         return planes, rest
+
+
+def contiguous_rows(x: torch.Tensor) -> torch.Tensor:
+    """``x.contiguous()`` of a row-strided 2-D slice, copied as 16-byte
+    elements when rows and strides allow it (byte-identical; the generic
+    strided copy moves 2-byte elements: 7.7 vs ~1.5 us for the KDA beta
+    columns at F16K)."""
+    if x.is_contiguous():
+        return x
+    nbytes = x.size(-1) * x.element_size()
+    if (
+        x.dim() == 2
+        and x.stride(-1) == 1
+        and nbytes % 16 == 0
+        and (x.stride(0) * x.element_size()) % 16 == 0
+        and x.data_ptr() % 16 == 0
+    ):
+        return x.view(torch.complex128).contiguous().view(x.dtype)
+    return x.contiguous()
+
