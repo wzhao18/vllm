@@ -260,32 +260,28 @@ def test_draft_head_dlists_geometry():
 
 
 @pytest.mark.parametrize(
-    "remote_sub_blocks,peer_sub_blocks,local_block_ids,expected",
+    "remote_sub_blocks,peer_sub_blocks,local_block_ids,skewed",
     [
         # Notify-only: aborted before it was scheduled, ids never expanded.
-        (1, 4, [], None),
-        (1, 4, [[], []], None),
+        (1, 4, [], False),
+        (1, 4, [[], []], False),
         # A read whose expansion matches the handshake.
-        (4, 4, [[3, 4], []], None),
+        (4, 4, [[3, 4], []], False),
         # A read with unexpanded ids from a sub-block peer would scramble KV.
-        (1, 4, [[3, 4], []], 4),
+        (1, 4, [[3, 4], []], True),
         # Expanded ids, but the handshake found an equal-block peer.
-        (4, None, [[3]], 1),
+        (4, 1, [[3]], True),
     ],
 )
 def test_sub_block_skew_only_fails_reads(
-    remote_sub_blocks, peer_sub_blocks, local_block_ids, expected
+    remote_sub_blocks, peer_sub_blocks, local_block_ids, skewed
 ):
     """A request aborted before it was scheduled carries P's unexpanded block
     ids and no local blocks: it only frees P's blocks and must not fail on
     the sub-block skew (DP8 P/D gate, 2026-11-20: such cleanups logged
     sub_block_mismatch and never notified P)."""
-    peers = {}
-    if peer_sub_blocks is not None:
-        peers["p"] = SimpleNamespace(sub_blocks=peer_sub_blocks)
-    worker = SimpleNamespace(_sub_block_peers=peers)
     meta = SimpleNamespace(
         remote=SimpleNamespace(sub_blocks=remote_sub_blocks),
         local_block_ids=local_block_ids,
     )
-    assert NixlPullConnectorWorker._sub_block_skew(worker, "p", meta) == expected
+    assert NixlPullConnectorWorker._sub_block_skew(meta, peer_sub_blocks) == skewed

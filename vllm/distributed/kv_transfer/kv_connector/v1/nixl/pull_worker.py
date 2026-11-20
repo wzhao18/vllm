@@ -194,7 +194,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             return
 
-        if (sub_blocks := self._sub_block_skew(engine_id, meta)) is not None:
+        peer = self._sub_block_peers.get(engine_id)
+        sub_blocks = peer.sub_blocks if peer is not None else 1
+        if self._sub_block_skew(meta, sub_blocks):
             error = RuntimeError(
                 f"NIXL sub-block skew for {req_id}: the scheduler expanded P's "
                 f"blocks x{meta.remote.sub_blocks}, the handshake with engine "
@@ -483,21 +485,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         )
                         self.xfer_stats.record_failed_notification()
 
-    def _sub_block_skew(self, engine_id: str, meta: ReqMeta) -> int | None:
-        """The sub-block count the handshake with engine_id found, when the
-        scheduler expanded this request's P block ids for a different one (P/D
-        skew, e.g. an older P that does not advertise its block size): reading
-        would scramble KV. None when the counts agree, or when the request has
-        no local blocks: a request aborted before it was scheduled never went
-        through the expansion and only notifies P to free its blocks."""
+    @staticmethod
+    def _sub_block_skew(meta: ReqMeta, sub_blocks: int) -> bool:
+        """Whether the scheduler expanded this request's P block ids for a
+        different sub-block count than the handshake found (P/D skew, e.g. an
+        older P that does not advertise its block size): reading would
+        scramble KV. A request with no local blocks (aborted before it was
+        scheduled) never went through the expansion and only notifies P to
+        free its blocks, so it is never skewed."""
         assert meta.remote is not None
-        peer = self._sub_block_peers.get(engine_id)
-        sub_blocks = peer.sub_blocks if peer is not None else 1
-        if meta.remote.sub_blocks == sub_blocks or not any(
+        return meta.remote.sub_blocks != sub_blocks and any(
             len(group) > 0 for group in meta.local_block_ids
-        ):
-            return None
-        return sub_blocks
+        )
 
     def _read_draft_heads(
         self,
