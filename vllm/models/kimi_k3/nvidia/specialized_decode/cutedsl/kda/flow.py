@@ -338,10 +338,30 @@ class KdaFlow(KdaWS):
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
         self.fold_fence = FOLD_FENCE
         self.skip = tuple(SKIP)
+        # KdaCore's operand-block export (tests / the prep stand-in): after its prep
+        # every item's scan operands leave by bulk stores into the block tensor at
+        # args[dump_at] (core.OPB_FLOATS per item, head-major item rows).
+        self.dump = False
+        self.dump_at = self.mx_at + 2 * int(mx)
 
     @cute.jit
     def __call__(self, *args):
         launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1)
+
+    @cute.jit
+    def dump_block(self, args, g, j, table, ops, betas):
+        """Item j's prepared scan operands (group g's block) into its operand-block
+        row (core.py layout); in the bulk group the records stores commit."""
+        xv, v_s, g_s, fw_s, fu_s, fd_s, ce_s = ops
+        T: cutlass.Constexpr = self.tokens
+        requests: cutlass.Constexpr = args[10].shape[0] // T
+        row = args[self.dump_at][table[j, HEAD] * requests + table[j, REQUEST], None]
+        store_bulk(at(row, 0), at(xv, g, 0), 4 * T * K * 4)  # x | v | w
+        store_bulk(at(row, 4 * T * K), at(fu_s, g, 0, 0), T * K * 4)
+        store_bulk(at(row, 5 * T * K), at(fd_s, g, 0), K * 4)
+        store_bulk(at(row, 5 * T * K + K), at(g_s, g, 0, 0), T * K * 2)
+        store_bulk(at(row, 5 * T * K + K + T * K // 2), at(ce_s, g, 0), T * T * 4)
+        store_bulk(at(row, 5 * T * K + K + T * K // 2 + T * T), at(betas, j, 0), T * 4)
 
     # ---------------------------------------------------------------- helpers
     @cute.jit
@@ -937,6 +957,10 @@ class KdaFlow(KdaWS):
             for t in cutlass.range_constexpr(T):  # this item's output gates
                 pg[t] = Float32(g_s[g, t, c])
             self.group_sync(g)  # the block is complete; the staging buffers are read
+            if cutlass.const_expr(self.dump):  # noqa: SIM102
+                if c == 0:
+                    if slot > 0:
+                        self.dump_block(args, g, j, table, ops, betas)
             if c == 0:
                 recst = slot > 0
                 if cutlass.const_expr("recst" in self.skip):

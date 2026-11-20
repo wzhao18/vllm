@@ -190,7 +190,7 @@ def test_flow_mxfp8_output_is_act_quant_of_bf16():
     assert mismatch == 0, f"{mismatch} scale bytes differ"
 
 
-@pytest.mark.parametrize("other", ["ring", "flowp"])
+@pytest.mark.parametrize("other", ["ring", "flowp", "core"])
 @pytest.mark.parametrize("mx", [False, True], ids=["bf16", "mxfp8"])
 @pytest.mark.parametrize("n", [3, 33, 96])
 def test_core_is_bitwise_flow(n, mx, other):
@@ -228,6 +228,7 @@ def test_core_is_bitwise_flow(n, mx, other):
             sp.RECORD_KINDS.clear()
             sp.RECORD_KINDS.update(saved)
         assert core.kinds[rows] == kind
+        core.standin = kind == "core"  # KdaFlow's prep as KdaCore's prep pass
         if mx:
             core.mx_input = Mxfp8Input(rows, DIM, kda.DEVICE)
             view = core.mx_input.view(rows)  # (padding rows' scales: never written)
