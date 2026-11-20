@@ -858,7 +858,7 @@ def main():
             ta_n = v[live & (v[:, 8] > 0), 8]
             print(f"LDSTAMP T{n} ctas {int(live.sum())} | entry {rel(0)} | sizes {rel(3)} | ta_claim {rel(9)} | "
                   f"ta_end {rel(6)} | mma_end {rel(17)} | exit {rel(1)} | ta_empty_us {cyc(7)} | "
-                  f"mma_full_us {cyc(18)} | ta_claimw_us {cyc(33)} | ta_setup_us {cyc(35)} | ta_loop_us {cyc(36)} | ta_units p50 {int(v[live & (v[:, 34] > 0), 34].median()) if bool((live & (v[:, 34] > 0)).any()) else 0} | "
+                  f"mma_full_us {cyc(18)} | ta_claimw_us {cyc(33)} | ta_setup_us {cyc(35)} | ta_loop_us {cyc(36)} | mma_acc_us {cyc(21)} | mma_tile_us {cyc(20)} | mma_claim_us {cyc(39)} | ta_units p50 {int(v[live & (v[:, 34] > 0), 34].median()) if bool((live & (v[:, 34] > 0)).any()) else 0} | "
                   f"ta_stages p50 {int(ta_n.median()) if len(ta_n) else 0}", flush=True)
         # CUDA graph safety: a replayed forward equals an eager one
         forward()

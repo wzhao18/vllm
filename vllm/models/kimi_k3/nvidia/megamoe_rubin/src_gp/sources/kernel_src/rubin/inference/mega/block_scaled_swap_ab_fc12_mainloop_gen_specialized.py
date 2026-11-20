@@ -2247,7 +2247,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                             cute.make_tensor(cute.recast_ptr(sfb_column, dtype=self.shared_sf_dtype), shared_views[4]),
                             *shared_views[4:],
                         )
+                dg_ta = DG.clk()
                 acc_pipeline.producer_acquire(acc_producer_state)
+                DG.add_since(DG.S_MMA_ACC, dg_ta)
+                dg_tm = DG.clk()
                 if cutlass.const_expr(self.heterogeneous_shared):
                     if self._is_shared_phase(work_tile.phase):
                         ab_pipeline_state, token_pipeline_state = mma_tile(
@@ -2288,10 +2291,13 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         token_pipeline,
                         token_pipeline_state,
                     )
+                DG.add_since(DG.S_MMA_ISSUE, dg_tm)
                 acc_pipeline.producer_commit(acc_producer_state)
 
             acc_producer_state.advance()
+            dg_tc = DG.clk()
             work_tile = sched_consumer.consume_work()
+            DG.add_since(DG.S_MMA_CLAIM, dg_tc)
         acc_pipeline.producer_tail(acc_producer_state)
 
 
