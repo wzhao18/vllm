@@ -156,8 +156,52 @@ __device__ __forceinline__ float2 fm(float2 a, float2 b, float2 c) {
   return ffma2(a, b, c);
 }
 
+
+__device__ __forceinline__ void tm_st16(unsigned taddr, const float* r) {
+  asm volatile("tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+               :: "r"(taddr), "f"(r[0]), "f"(r[1]), "f"(r[2]), "f"(r[3]), "f"(r[4]), "f"(r[5]), "f"(r[6]), "f"(r[7]), "f"(r[8]), "f"(r[9]), "f"(r[10]), "f"(r[11]), "f"(r[12]), "f"(r[13]), "f"(r[14]), "f"(r[15]) : "memory");
+}
+__device__ __forceinline__ void tm_ld16(unsigned taddr, float* r) {
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+               : "=f"(r[0]), "=f"(r[1]), "=f"(r[2]), "=f"(r[3]), "=f"(r[4]), "=f"(r[5]), "=f"(r[6]), "=f"(r[7]), "=f"(r[8]), "=f"(r[9]), "=f"(r[10]), "=f"(r[11]), "=f"(r[12]), "=f"(r[13]), "=f"(r[14]), "=f"(r[15]) : "r"(taddr) : "memory");
+}
+__device__ __forceinline__ void tm_fence_before() { asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory"); }
+__device__ __forceinline__ void tm_fence_after() { asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory"); }
+__device__ __forceinline__ void tm_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory"); }
+__device__ __forceinline__ void tm_wait_ld() { asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory"); }
+// The storing warp's lane l (key lane l % 16): per key pair i, the 26 operand floats the
+// M=1 scan reads by LDS (w[0..3] float2, d float2, x[h][0..1] float4), padded to 32 columns.
+__device__ __forceinline__ void tm_store_ops(unsigned taddr, const float* ops, int l) {
+  const float* D = ops; const float* W = ops + 128; const float* X = ops + 640;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int p = i * 16 + l;
+    float r[32];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const float2 w = *(const float2*)(W + (t * 64 + p) * 2);
+      r[2 * t] = w.x; r[2 * t + 1] = w.y;
+    }
+    const float2 d = *(const float2*)(D + p * 2);
+    r[8] = d.x; r[9] = d.y;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float4* xp = (const float4*)X + ((2 * i + h) * 2) * 16 + l;
+      const float4 a = xp[0], b = xp[16];
+      r[10 + 8 * h] = a.x; r[11 + 8 * h] = a.y; r[12 + 8 * h] = a.z; r[13 + 8 * h] = a.w;
+      r[14 + 8 * h] = b.x; r[15 + 8 * h] = b.y; r[16 + 8 * h] = b.z; r[17 + 8 * h] = b.w;
+    }
+#pragma unroll
+    for (int k = 26; k < 32; ++k) r[k] = 0.f;
+    tm_st16(taddr + 32 * i, r);
+    tm_st16(taddr + 32 * i + 16, r + 16);
+  }
+  tm_wait_st();
+}
+
 template <int NC, int U, int M>
-__device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* ops, int c) {
+__device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* ops, int c,
+                                              unsigned taddr = 0) {
   const float* D = ops; const float* W = ops + 128; const float* X = ops + 640;
   const float* Ur = ops + 1664;
   const int l = c & 15;  // operands swizzled by lane: conflict-free shared loads
@@ -172,17 +216,36 @@ __device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* 
 #pragma unroll
     for (int t = 0; t < 4; ++t) ut[u][t] = Ur[t * 128 + (u * NC + c) / 16];
 #pragma unroll
+  // M 5/7 (diagnostic): every key pair reuses pair 0's operands (operand LDS / 4);
+  // M 6/7: no butterfly (the partials are folded locally).
+  constexpr bool kReuse = M == 5 || M == 7, kNoBfly = M == 6 || M == 7;
   for (int e = 0; e < 8; e += 2) {
-    const int p = (e >> 1) * 16 + l;
+    const int p = (kReuse ? 0 : (e >> 1) * 16) + l;
     float2 w[4];
-#pragma unroll
-    for (int t = 0; t < 4; ++t) w[t] = *(const float2*)(W + (t * 64 + p) * 2);
-    const float2 d = *(const float2*)(D + p * 2);
+    float2 d;
     float4 x[2][2];
+    if constexpr (M == 8) {  // operands from tensor memory (written by the quarter's storer)
+      float r[32];
+      tm_ld16(taddr + 32 * (e >> 1), r);
+      tm_ld16(taddr + 32 * (e >> 1) + 16, r + 16);
+      tm_wait_ld();
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      const float4* xp = (const float4*)X + ((e + h) * 2) * 16 + l;
-      x[h][0] = xp[0]; x[h][1] = xp[16];
+      for (int t = 0; t < 4; ++t) w[t] = make_float2(r[2 * t], r[2 * t + 1]);
+      d = make_float2(r[8], r[9]);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        x[h][0] = make_float4(r[10 + 8 * h], r[11 + 8 * h], r[12 + 8 * h], r[13 + 8 * h]);
+        x[h][1] = make_float4(r[14 + 8 * h], r[15 + 8 * h], r[16 + 8 * h], r[17 + 8 * h]);
+      }
+    } else {
+#pragma unroll
+      for (int t = 0; t < 4; ++t) w[t] = *(const float2*)(W + (t * 64 + p) * 2);
+      d = *(const float2*)(D + p * 2);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float4* xp = (const float4*)X + (((kReuse ? 0 : e) + h) * 2) * 16 + l;
+        x[h][0] = xp[0]; x[h][1] = xp[16];
+      }
     }
 #pragma unroll
     for (int u = 0; u < U; ++u) {
@@ -209,6 +272,12 @@ __device__ __forceinline__ unsigned scan_math(unsigned (&v)[U][8], const float* 
   for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int m = 0; m < 4; ++m) { vals[u * 8 + 2 * m] = acc[u][m].x; vals[u * 8 + 2 * m + 1] = acc[u][m].y; }
+  if constexpr (kNoBfly) {
+    unsigned r = 0;
+#pragma unroll
+    for (int i = 0; i < U * 8; ++i) r ^= __float_as_uint(vals[i]);
+    return r;
+  }
   int n = U * 8;
 #pragma unroll
   for (int off = 8; off >= 1; off >>= 1) {
@@ -419,6 +488,7 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
   extern __shared__ __align__(1024) unsigned char smem[];
   __shared__ __align__(8) unsigned long long full[S], empty[S];
   __shared__ int s_item[S];
+  __shared__ unsigned s_taddr;
   const int tid = threadIdx.x;
   if (tid == 0) {
     for (int s = 0; s < S; ++s) {
@@ -469,6 +539,18 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
   }
   asm volatile("griddepcontrol.wait;" ::: "memory");
   const int cg = tid - 32, grp = cg / NG, c = cg % NG;
+  unsigned tq = 0;  // this warp's TMEM lane quarter base (MATH 8)
+  if constexpr (MATH == 8) {
+    if (tid < 64) {
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;"
+                   :: "r"(sa(&s_taddr)) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    tm_fence_before();
+    asm volatile("bar.sync 1, %0;" :: "r"(NC) : "memory");
+    tm_fence_after();
+    tq = s_taddr + ((32u * ((tid >> 5) & 3)) << 16);
+  }
   unsigned acc = 0;
   for (int j = grp;; j += G) {
     int s = j % S;
@@ -506,7 +588,16 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
         __syncwarp();
         if ((c & 31) == 0) arrive(sa(&empty[s]));
       }
-      if (MATH == 1 || MATH == 2) acc ^= scan_math<NG, U, MATH>(v, (const float*)(smem + (size_t)S * SL), c);
+      if (MATH == 1 || MATH == 2 || (MATH >= 5 && MATH <= 7)) acc ^= scan_math<NG, U, MATH>(v, (const float*)(smem + (size_t)S * SL), c);
+      if constexpr (MATH == 8) {
+        const unsigned col = (j & 1) * 128;
+        const int hw = tid >> 5;
+        if (hw >= 4 && hw < 8) tm_store_ops(tq + col, (const float*)(smem + (size_t)S * SL), tid & 15);
+        tm_fence_before();
+        asm volatile("bar.sync %0, 128;" :: "r"(2 + (hw & 3)) : "memory");
+        tm_fence_after();
+        acc ^= scan_math<NG, U, 8>(v, (const float*)(smem + (size_t)S * SL), c, tq + col);
+      }
       if (wr) {
         char* b = a.state + (size_t)pg * PG;
 #pragma unroll
@@ -524,6 +615,12 @@ __global__ void __launch_bounds__(NC + 32, 1) tma_k(Args a) {
     for (int o = c * 32; o < a.sout_b; o += NG * 32) {
       unsigned r[8] = {acc, acc, acc, acc, acc, acc, acc, acc};
       STV8(a.sout + (size_t)pg * a.sout_b + o, r); }
+  }
+  if constexpr (MATH == 8) {
+    tm_fence_before();
+    asm volatile("bar.sync 1, %0;" :: "r"(NC) : "memory");
+    tm_fence_after();
+    if (tid < 64) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;" :: "r"(s_taddr) : "memory");
   }
   if (acc == 0x12345678u) a.sink[0] = 1.f;
 }
@@ -592,6 +689,11 @@ void launch(int64_t form, int64_t state, int64_t P, int64_t sin, int64_t sin_b,
     case 370541: go_tma<512, 4, 1, 3>(a, s); break;
     case 1370531: go_tma<512, 3, 1, 3, 2>(a, s); break;
     case 470531: go_tma<512, 3, 1, 4>(a, s); break;
+    case 570531: go_tma<512, 3, 1, 5>(a, s); break;
+    case 670531: go_tma<512, 3, 1, 6>(a, s); break;
+    case 770531: go_tma<512, 3, 1, 7>(a, s); break;
+    case 870531: go_tma<512, 3, 1, 8>(a, s); break;
+    case 570541: go_tma<512, 4, 1, 5>(a, s); break;
     default: TORCH_CHECK(false, "form");
   }
 }
@@ -611,6 +713,10 @@ std::vector<int64_t> attrs(int64_t form) {
     case 370531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 3>); break;
     case 1370531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 3, 2>); break;
     case 470531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 4>); break;
+    case 570531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 5>); break;
+    case 670531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 6>); break;
+    case 770531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 7>); break;
+    case 870531: cudaFuncGetAttributes(&f, tma_k<512, 3, 1, 8>); break;
     default: cudaFuncGetAttributes(&f, skel_k<256, 2>); break;
   }
   return {f.numRegs, (int64_t)f.localSizeBytes};
@@ -626,7 +732,7 @@ std::vector<int64_t> attrs(int64_t);
 
 def _module():
     return load_inline(
-        name="k31_kda_skel_v16",
+        name="k31_kda_skel_v19",
         cpp_sources=CPP,
         cuda_sources=CUDA,
         functions=["launch", "attrs"],
@@ -642,10 +748,10 @@ def parse_arm(arm):
             if form.startswith("t"):  # t<NC>s<S>o<OPS>[m|f][g]: TMA ring, NC consumers
                 grp = 1000000 if form.endswith("g") else 0  # g: 2 alternating groups
                 form = form.rstrip("g")
-                nc, ops = form[1:].rstrip("mfvw").split("o")
+                nc, ops = form[1:].rstrip("mfvwpbqt").split("o")
                 nc, slots = (nc.split("s") + ["3"])[:2]
                 code = (5 if nc == "512" else 2) * 100 + 10 * int(slots) + int(ops)
-                return kind, grp + 70000 + code + {"m": 100000, "f": 200000, "v": 300000, "w": 400000}.get(form[-1], 0)
+                return kind, grp + 70000 + code + {"m": 100000, "f": 200000, "v": 300000, "w": 400000, "p": 500000, "b": 600000, "q": 700000, "t": 800000}.get(form[-1], 0)
             nt, minb = form.split("x")
             return kind, int(nt) * 10 + int(minb)
     raise ValueError(arm)
