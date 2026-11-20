@@ -699,9 +699,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) Sx[kV2Fine] = s_beyond;
         __syncthreads();
-        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
-        // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
-        // candidates (32 keys per bin, the whole key range) locate it; rebase there
+        if (K31_LIKELY(pass == 1 || s_e >= 0)) break;
+        // the q-th key lies outside the fine range: above it (a wide upper tail), or below
+        // it when the sample's estimate of the q-th key was high (the range starts kV2Fine / 2
+        // under that estimate, above theta). Every candidate is >= theta and nc >= q, so
+        // coarse counts of the candidates (32 keys per bin, the whole key range) locate it;
+        // rebase there (pass 1 then finds e in [fb, fb + kV2Fine))
         V2STAT(7);
         for (int x = tid; x < kV2Fine; x += kV2T) hist[x] = 0;
         if (tid == 0) s_i[12] = -1;
