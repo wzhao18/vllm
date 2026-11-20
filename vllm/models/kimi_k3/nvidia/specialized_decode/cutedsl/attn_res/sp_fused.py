@@ -294,7 +294,7 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
         # The next kernel (the router | latent down GEMM) streams its weights before
         # its dependency wait; its CTAs can only land beside this one if the SM keeps
         # the full shared-memory carve-out (CuTe's launcher drops the preference).
-        code = prepare_shared_carveout(code, device, 100)
+        code = prepare_shared_carveout(code, device, 86)  # 196 KiB config: L1 left for the reduce
     return code
 
 
