@@ -141,6 +141,10 @@ MB_FIN = 60
 MB_OEMPTY = 65
 MB_BRAW = 66
 MB_GRAM = 71
+# Probe only (benchmarks set it on a module copy): 1 idles the compute,
+# epilogue and V-load roles and lets the MMA warp free every stage as soon
+# as prep publishes it, so the kernel time is the prep throughput floor.
+PREP_ONLY = 0
 
 
 def _exp2f(x):
@@ -551,7 +555,7 @@ def _pkd(
     # =====================================================================
     # COMPUTE warpgroup (warps 0-3)
     # =====================================================================
-    if warp < 4:
+    if warp < (0 if PREP_ONLY else 4):
         if cutlass.const_expr(REG_MODE_ == 1):
             cute.arch.warpgroup_reg_alloc(160)
         else:
@@ -993,7 +997,7 @@ def _pkd(
     # =====================================================================
     # EPILOGUE warpgroup (warps 4-7)
     # =====================================================================
-    if (warp >= 4) & (warp < 8):
+    if (warp >= 4) & (warp < (4 if PREP_ONLY else 8)):
         if cutlass.const_expr(REG_MODE_ == 2):
             cute.arch.warpgroup_reg_alloc(96)
         else:
@@ -1461,7 +1465,21 @@ def _pkd(
         if cutlass.const_expr(GRAM_W9_ != 0):
             mma_warp = 8
         if warp == mma_warp:
-            if cutlass.const_expr(True):
+            if cutlass.const_expr(PREP_ONLY == 1):
+                csm = cutlass.Int32(0)
+                pm_qk = cutlass.Int32(0)
+                for kx in cutlass.range(k1 - k0):
+                    seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
+                    for _t in cutlass.range((seq_len + C - 1) // C):
+                        cute.arch.mbarrier_wait(mb + MB_QK + csm, pm_qk)
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mb + MB_RFREE + csm)
+                            cute.arch.mbarrier_arrive(mb + MB_SFREE + csm)
+                        csm += 1
+                        if csm == STAGES:
+                            csm = 0
+                            pm_qk ^= 1
+            else:
                 csm = cutlass.Int32(0)
                 pm_oe = cutlass.Int32(1)
                 for kx in cutlass.range(k1 - k0):
@@ -1557,7 +1575,7 @@ def _pkd(
                         if csm == STAGES:
                             csm = 0
                         pm_oe ^= 1
-        if warp == 10:
+        if warp == (-1 if PREP_ONLY else 10):
             csl = cutlass.Int32(0)
             pl_vfree = cutlass.Int32(1)
             pl_qk = cutlass.Int32(0)

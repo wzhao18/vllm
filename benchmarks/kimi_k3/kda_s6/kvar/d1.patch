@@ -1,0 +1,138 @@
+--- m1.py	2026-11-20 01:36:56
++++ d1.py	2026-11-20 01:36:56
+@@ -151,6 +151,37 @@
+     return cute.math.tanh(x, fastmath=True)
+ 
+ 
++def _smem8(dtype, addr):
++    """Eight contiguous elements at a 16-byte aligned shared-memory address."""
++    return cute.make_tensor(
++        cute.make_ptr(dtype, addr, cute.AddressSpace.smem, assumed_align=16),
++        cute.make_layout((8,)),
++    )
++
++
++@dsl_user_op
++def _widen_bf16x8(src, dst, *, loc=None, ip=None):
++    """BF16 -> FP32 for eight packed values with one shift or mask each."""
++    words = cute.recast_tensor(src, cutlass.Int32)
++    for w in range(4):
++        res = llvm.inline_asm(
++            llvm.StructType.get_literal([T.f32()] * 2),
++            [words[w].ir_value(loc=loc, ip=ip)],
++            "{\n.reg .b32 lo, hi;\nshl.b32 lo, $2, 16;\n"
++            "and.b32 hi, $2, 0xffff0000;\nmov.b32 $0, lo;\nmov.b32 $1, hi;\n}",
++            "=f,=f,r",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++        for h in range(2):
++            dst[2 * w + h] = cutlass.Float32(
++                llvm.extractvalue(T.f32(), res, [h], loc=loc, ip=ip)
++            )
++
++
+ @cute.struct
+ class PkdStorage:
+     mbar: cute.struct.MemRange[cutlass.Int64, 76]
+@@ -1731,6 +1762,9 @@
+ 
+         qr = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
+         kr = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
++        qf8 = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.Float32)
++        kf8 = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.Float32)
++        ar_i32 = cutlass.Int32(ar0.toint())
+         g8 = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.Float32)
+         rf8 = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.Float32)
+         w2 = cute.make_rmem_tensor(cute.make_layout((2,)), cutlass.BFloat16)
+@@ -2056,22 +2090,40 @@
+                     # the 48-reg prep diet spills, reconfirming the v60 re-roll)
+                     if tma:
+                         cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
++                    # Rows wp * 8 + rb share their 128B-swizzle phase (row & 7),
++                    # so the swizzled slice addresses are formed once and each
++                    # row step adds 1 KiB (BF16 images) or 4 KiB (FP32 prefix).
++                    rb = (ptl >> 5) + ((ptl >> 2) & 4)
++                    sg2 = ptl & 15
++                    a_st = (
++                        ar_i32
++                        + inst * STAGE_BYTES
++                        + rb * 128
++                        + ((sg2 & 7) ^ (rb & 7)) * 16
++                    )
++                    a_qd = a_st + OFF_QD + (sg2 >> 3) * 8192
++                    a_ki = a_st + OFF_FT + (sg2 >> 3) * 4096
++                    a_gc = ar_i32 + OFF_GCS + inst * STAGE_BYTES + rb * 512 + sg2 * 32
+                     for wp in cutlass.range(4):
+                         # Both retained fixed/varlen policies use the same
+                         # four-row half-warp pairing. QK_ROWPAIR_ only selects
+                         # the surrounding gate pipeline now.
+-                        rw2 = wp * 8 + (ptl >> 5) + ((ptl >> 2) & 4)
+-                        sg2 = ptl & 15
++                        rw2 = wp * 8 + rb
++                        o_qd = a_qd + wp * 1024
++                        o_ki = a_ki + wp * 1024
+                         if tma:
+-                            q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+-                            cute.autovec_copy(q8s, qr)
+-                            k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+-                            cute.autovec_copy(k8s, kr)
++                            cute.autovec_copy(_smem8(cutlass.BFloat16, o_ki), qr)
++                            cute.autovec_copy(
++                                _smem8(cutlass.BFloat16, o_qd + 4096), kr
++                            )
+                             if cutlass.const_expr(may_be_partial):
+-                                if rw2 >= cc:
+-                                    for u in cutlass.range_constexpr(8):
+-                                        qr[u] = cutlass.BFloat16(0.0)
+-                                        kr[u] = cutlass.BFloat16(0.0)
++                                # warp-uniform guard: only a sequence's last
++                                # chunk carries rows past its end
++                                if cc < C:
++                                    if rw2 >= cc:
++                                        for u in cutlass.range_constexpr(8):
++                                            qr[u] = cutlass.BFloat16(0.0)
++                                            kr[u] = cutlass.BFloat16(0.0)
+                         else:
+                             if rw2 < cc:
+                                 gq8 = cute.local_tile(
+@@ -2099,12 +2151,15 @@
+                         # scale folded into rqn: one FMUL replaces 8 per slice
+                         rqn = cute.math.rsqrt(sq + 1e-6, fastmath=True) * scale
+                         rkn = cute.math.rsqrt(sk + 1e-6, fastmath=True)
+-                        g8s = v_gcs8[(rw2, None, sg2, inst)]
+-                        cute.autovec_copy(g8s, g8)
++                        cute.autovec_copy(
++                            _smem8(cutlass.Float32, a_gc + wp * 4096), g8
++                        )
+                         gv8 = g8.load()
+                         decv = cute.math.exp2(gv8 - anch, fastmath=True)
+-                        qhv = qr.load().to(cutlass.Float32) * rqn
+-                        khv = kr.load().to(cutlass.Float32) * rkn
++                        _widen_bf16x8(qr, qf8)
++                        _widen_bf16x8(kr, kf8)
++                        qhv = qf8.load() * rqn
++                        khv = kf8.load() * rkn
+                         qr.store((qhv * decv).to(cutlass.BFloat16))
+                         kr.store((khv * decv).to(cutlass.BFloat16))
+                         if cutlass.const_expr(RCP_DECOR_ == 1):
+@@ -2117,13 +2172,10 @@
+                             idecv = cute.math.rcp(decv, approx=True, ftz=True)
+                         else:
+                             idecv = cute.math.exp2(anch - gv8, fastmath=True)
+-                        dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+-                        cute.autovec_copy(qr, dq8)
+-                        dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+-                        cute.autovec_copy(kr, dk8)
++                        cute.autovec_copy(qr, _smem8(cutlass.BFloat16, o_qd))
++                        cute.autovec_copy(kr, _smem8(cutlass.BFloat16, o_qd + 4096))
+                         kr.store((khv * idecv).to(cutlass.BFloat16))
+-                        di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+-                        cute.autovec_copy(kr, di8)
++                        cute.autovec_copy(kr, _smem8(cutlass.BFloat16, o_ki))
+                     # gt/rf (dedicated buffers; gcs row 31 stable since the
+                     # post-walker barrier -> rides the decoration phase)
+                     if ptl < D:
