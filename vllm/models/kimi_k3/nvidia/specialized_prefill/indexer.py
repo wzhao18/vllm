@@ -318,6 +318,11 @@ def _mn_layout(t):
     return cute.make_tensor(t.iterator, new)
 
 
+def _sigma(h: int) -> int:
+    """Token 1's head paired with token 0's head h (skew within each group of 4)."""
+    return h - h % 4 + (h % 4 + 1) % 4
+
+
 def sf_word(row: int) -> int:
     """32-bit word of row ``row``'s four UE8M0 scales in the block-scaled SF atom
     ((32, 4), (32, 4)):((16, 4), (0, 1)) bytes, 128 rows per 512-byte chunk."""
@@ -818,15 +823,20 @@ class IndexerScore:
                 lim1 = cand1 + (SLOTS + 1) * TILE * 4
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
-            # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
+            # head weights (BF16x2) of both tokens: wt[j][i] = heads 2i, 2i + 1
             wbase = w_a + (qs * BQ * 16 + tok_a * 16) * 4
-            w = []
+            wt = []
             for j in cutlass.range_constexpr(2):
                 wj = []
                 for i in cutlass.range_constexpr(4):
                     v = lds_v4(wbase + (j * 16 + 4 * i) * 4)
                     wj.extend(v)
-                w.append(wj)
+                wt.append(wj)
+            # token-interleaved weights: w[h] = (token 0 head h, token 1 head sigma(h))
+            w = [prmt(wt[0][h // 2], wt[1][_sigma(h) // 2],
+                      (0x10 if h % 2 == 0 else 0x32)
+                      | ((0x54 if _sigma(h) % 2 == 0 else 0x76) << 8))
+                 for h in range(HEADS)]
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(q_empty + qs)
@@ -1001,29 +1011,32 @@ class IndexerScore:
     @cute.jit
     def reduce_half(self, buf, w, ss, h0: cutlass.Constexpr):
         """Heads h0 .. h0 + 15 of both tokens (buf: token 0's 16 values, then token
-        1's) into the running BF16 logit sums at stock precision: per token, s0
-        takes head pairs (4i, 4i + 1), s1 (4i + 2, 4i + 3), each head term
-        relu-rounded to BF16 and BF16x2-FMA'd with its weight."""
+        1's) into the running BF16 logit sums at stock precision. Stock keeps per
+        token four chains, head classes h % 4 = 0, 1, 2, 3 (s0.lo, s0.hi, s1.lo,
+        s1.hi), each head term relu-rounded to BF16 and FMA'd in BF16 in head
+        order. Here accumulator c holds token 0's chain c (low half) and token 1's
+        chain (c + 1) % 4 (high half): one F2FP packs (t0 head h, t1 head
+        sigma(h)), one HFMA2 advances both chains with the weights w[h]."""
         if cutlass.const_expr(ss is None):
-            ss = [[Uint32(0), Uint32(0)] for _ in range(2)]
+            acc = [Uint32(0) for _ in range(4)]
         else:
-            ss = [list(x) for x in ss]
-        for h in cutlass.range_constexpr(0, HEADS // 2, 4):
-            for j in cutlass.range_constexpr(2):
-                b = 16 * j + h
-                k = (h0 + h) // 2
-                ss[j][0] = fma_bf16x2(relu_bf16x2(buf[b], buf[b + 1]), w[j][k], ss[j][0])
-                ss[j][1] = fma_bf16x2(
-                    relu_bf16x2(buf[b + 2], buf[b + 3]), w[j][k + 1], ss[j][1]
-                )
-        return ss
+            acc = [ss[0][0], ss[0][1], ss[1][0], ss[1][1]]
+        for h in cutlass.range_constexpr(h0, h0 + HEADS // 2):
+            c = h % 4
+            acc[c] = fma_bf16x2(
+                relu_bf16x2(buf[h - h0], buf[16 + _sigma(h) - h0]), w[h], acc[c]
+            )
+        return [[acc[0], acc[1]], [acc[2], acc[3]]]
 
     @cute.jit
     def combine2(self, ss):
-        """(s0 + s1) per token, then low + high half: both tokens' BF16 logits."""
-        p0 = add_bf16x2(ss[0][0], ss[0][1])
-        p1 = add_bf16x2(ss[1][0], ss[1][1])
-        return add_bf16x2(prmt(p0, p1, 0x5410), prmt(p0, p1, 0x7632))
+        """Both tokens' BF16 logits (t0 low, t1 high): stock (s0.lo + s1.lo) +
+        (s0.hi + s1.hi) per token. x = acc0 + acc2 = (t0 s0.lo + s1.lo, t1 s0.hi +
+        s1.hi), y = acc1 + acc3 = (t0 s0.hi + s1.hi, t1 s1.lo + s0.lo); BF16
+        addition is commutative, so x + y is stock for both tokens."""
+        x = add_bf16x2(ss[0][0], ss[1][0])
+        y = add_bf16x2(ss[0][1], ss[1][1])
+        return add_bf16x2(x, y)
 
     @cute.jit
     def row_bound(self, hist, length, row, n_rows, row_bin, scan_a, wg, lt, wq, lane):
