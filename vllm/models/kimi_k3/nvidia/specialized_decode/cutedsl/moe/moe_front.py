@@ -72,7 +72,7 @@ struct Params {
   float* part;       // [grid][n][128] FP32 split-K partials
   unsigned* cnt;     // [2 kLine] CTAs finished, [kTileCnt + kLine t] partials stored of tile t
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
-  int kb, rtiles, ks, ns, xs, na, nt_max, nr_max, yfull;
+  int kb, rtiles, ks, ns, xs, xg, na, nt_max, nr_max, yfull;  // xs: token op slots of xg blocks
   int debug;  // microbench only (0 in production): bit 0 skips the MMAs
 };
 
@@ -114,6 +114,14 @@ __device__ __forceinline__ void tma_2d(uint32_t dst, const CUtensorMap* map, int
       "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
       " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(bar)
+      : "memory");
+}
+__device__ __forceinline__ void tma_3d(uint32_t dst, const CUtensorMap* map, int row, int kb,
+                                       uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(0), "r"(row), "r"(kb), "r"(bar)
       : "memory");
 }
 // K-major SWIZZLE_128B operand descriptor (8-row core groups 1024 B apart).
@@ -288,12 +296,15 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       mbar_wait(trdy0 + 8 * (nt - 1), 0);
       asm volatile("griddepcontrol.wait;" ::: "memory");
       if (u == 0) STAMP(1);
-      for (int j = 0; j < nk; ++j) {
-        const int xs = j % p.xs;
-        if (xs % kIssuers != u) continue;
-        if (j >= p.xs) mbar_wait(xempty0 + 8 * xs, ((j / p.xs) & 1) ^ 1);
-        mbar_expect_tx(xfull0 + 8 * xs, n * 128);
-        tma_2d(ring_s + xs * n * 128, &tx, (kb0 + j) * 64, 0, xfull0 + 8 * xs);
+      // One op = xg token K blocks (3-D map, [xg][n][128 B] SWIZZLE_128B tiles); the
+      // last op of the split may run past it (unused blocks, zero fill past K).
+      const int ng = (nk + p.xg - 1) / p.xg;
+      for (int g = 0; g < ng; ++g) {
+        const int gs = g % p.xs;
+        if (gs % kIssuers != u) continue;
+        if (g >= p.xs) mbar_wait(xempty0 + 8 * gs, ((g / p.xs) & 1) ^ 1);
+        mbar_expect_tx(xfull0 + 8 * gs, p.xg * n * 128);
+        tma_3d(ring_s + gs * p.xg * n * 128, &tx, 0, kb0 + g * p.xg, xfull0 + 8 * gs);
       }
     }
   }
@@ -317,8 +328,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
     for (int j = 0; j < nk; ++j) {
-      const int xs = j % p.xs;
-      mbar_wait(xfull0 + 8 * xs, (j / p.xs) & 1);
+      const int g = j / p.xg, gs = g % p.xs, xs = gs * p.xg + j % p.xg;
+      if (j % p.xg == 0) mbar_wait(xfull0 + 8 * gs, (g / p.xs) & 1);
       if (j == 0) {
         mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
       } else if (j == nt) {
@@ -337,7 +348,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) mma_ss(tmem, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
       }
-      if (j + p.xs < nk) commit_el(xempty0 + 8 * xs);
+      if ((j % p.xg == p.xg - 1 || j == nk - 1) && (g + p.xs) * p.xg < nk)
+        commit_el(xempty0 + 8 * gs);
       if (lane == 0 && j < 24) STAMP(8 + j);
     }
     commit_el(acc_bar);
@@ -454,6 +466,21 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   }
 }
 
+// {64 columns, rows, K blocks}: K block j of row r at r * k + 64 j; one op = box_kb
+// consecutive K blocks of the rows, stored as consecutive [rows][64] SWIZZLE_128B tiles.
+static void make_map3(CUtensorMap* m, const void* ptr, int rows, int k, int box_rows,
+                      int box_kb) {
+  cuuint64_t dims[3] = {64, static_cast<cuuint64_t>(rows), static_cast<cuuint64_t>(k / 64)};
+  cuuint64_t strides[2] = {static_cast<cuuint64_t>(k) * 2, 128};
+  cuuint32_t box[3] = {64, static_cast<cuuint32_t>(box_rows), static_cast<cuuint32_t>(box_kb)};
+  cuuint32_t es[3] = {1, 1, 1};
+  CUresult rc = cuTensorMapEncodeTiled(
+      m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(ptr), dims, strides, box,
+      es, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TORCH_CHECK(rc == CUDA_SUCCESS, "moe_front: cuTensorMapEncodeTiled ", static_cast<int>(rc));
+}
+
 static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_rows) {
   cuuint64_t dims[2] = {static_cast<cuuint64_t>(k), static_cast<cuuint64_t>(rows)};
   cuuint64_t strides[1] = {static_cast<cuuint64_t>(k) * 2};
@@ -467,7 +494,7 @@ static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_r
 }
 
 struct Plan {
-  int na, nt_max, nr_max, ns, smem, xs;
+  int na, nt_max, nr_max, ns, smem, xs, xg;
 };
 
 static int static_smem() {
@@ -488,7 +515,9 @@ static Plan plan_for(int n, int kb, int ks, int ns) {
   const int room = (kSmemBudget - static_smem() - fixed) / kSlot;
   pl.ns = ns > 0 ? ns : std::min(kMaxNS, room);
   pl.smem = fixed + pl.ns * kSlot;
-  pl.xs = std::min({kMaxX, nk_max, pl.ns * kSlot / (n * 128)});
+  // Token ops of xg K blocks (>= 16 KiB per op: one op completes at a time per issuer).
+  pl.xg = std::max(1, std::min(4, (kSlot + n * 128 - 1) / (n * 128)));
+  pl.xs = std::min({kMaxX, (nk_max + pl.xg - 1) / pl.xg, pl.ns * kSlot / (pl.xg * n * 128)});
   return pl;
 }
 
@@ -602,10 +631,11 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.nt_max = pl.nt_max;
   p.nr_max = pl.nr_max;
   p.xs = pl.xs;
+  p.xg = pl.xg;
   p.yfull = y.size(1) >= rows_w ? 1 : 0;
   CUtensorMap tw, tx;
   make_map(&tw, w.data_ptr(), (int)rows_w, (int)k, 128);
-  make_map(&tx, h.data_ptr(), (int)n, (int)k, (int)n);
+  make_map3(&tx, h.data_ptr(), (int)n, (int)k, (int)n, pl.xg);
   static int configured = 0;
   if (pl.smem > configured) {
     set_attrs(pl.smem);
