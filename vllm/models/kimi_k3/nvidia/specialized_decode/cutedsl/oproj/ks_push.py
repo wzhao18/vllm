@@ -562,7 +562,7 @@ class OprojKsPush:
             local = q // 16
             chunk = q % 16
             token = tb * TB + start + local
-            if local < size and token < rows:
+            if (local < size) & (token < rows):
                 w = ld_shared_u32x4(stage + (local * 128 + chunk * 8) * 2)
                 words = tuple(positive_zero32(w[e]) for e in range(4))
                 owner = token // n
