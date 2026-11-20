@@ -208,7 +208,7 @@ class DcpExchange:
             int(self.ext.topk_pp_words(cap)), dtype=torch.int32, device=device
         )
 
-        # ---- top-k v2 mailboxes (csrc/topk_v2.cuh): round 1, tie round, radix rounds
+        # ---- top-k v2 mailboxes (csrc/topk_v2.cuh): round 1, tie round, radix rounds, R2
         lay = self.ext.topk_v2_layout(cap, W)
         self.v2_box = symm_mem.empty(int(lay[3]), dtype=torch.int32, device=device)
         self.v2_box.fill_(-1)
