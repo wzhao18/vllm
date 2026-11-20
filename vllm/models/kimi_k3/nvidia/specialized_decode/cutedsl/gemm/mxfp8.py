@@ -33,6 +33,7 @@ import torch
 
 from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 
+_EX1_ALT: dict = {}
 MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "pre")
 
 # "pre" tactics: (first R, last R, (tile_mn, cluster_mn, swap_ab, inst_m), weight k-blocks
@@ -242,9 +243,16 @@ class Mxfp8Projection:
                     raise Unsupported(family, r, f"pre: no tactic for [{n}, {k}]")
                 from .sm107.prewait import Mxfp8PreGemm
 
+                tac, cap = found[0], found[2]
+                if (n, k) == (12448, 7168) and 257 <= r <= 384:
+                    # GEMM-EX1 PROBE (never land): alternate call sites between arm A
+                    # (2,1) and arm C (2,2 W multicast) for the in-step stamp A/B
+                    _EX1_ALT[r] = _EX1_ALT.get(r, 0) + 1
+                    if _EX1_ALT[r] % 2 == 0:
+                        tac, cap = (tac[0], (2, 2), tac[2], tac[3]), 0
                 self.pre[r] = Mxfp8PreGemm(
-                    n, k, r, found[0], use_pdl=True, prewait=found[1],
-                    max_stages=found[2], device=weight.device,
+                    n, k, r, tac, use_pdl=True, prewait=found[1],
+                    max_stages=cap, device=weight.device,
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)

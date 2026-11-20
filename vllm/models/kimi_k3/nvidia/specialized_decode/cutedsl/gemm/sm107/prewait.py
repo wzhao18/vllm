@@ -42,7 +42,8 @@ def _alpha_one(device):
 
 @cache
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
-             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False):
+             prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False,
+             stamp=False):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
@@ -57,10 +58,13 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         producers=producers,
         die_claim=die_claim,
         push=push,
+        stamp=stamp,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
     # experiment: operand-split producers (dbg bit 1, needs producers == 2)
     gemm.opsplit = bool(dbg & 2)
+    gemm.dbg_mma_only = bool(dbg & 4)
+    gemm.dbg_skip_epi = bool(dbg & 16)
     if gemm.opsplit and producers != 2:
         raise ValueError("opsplit needs producers=2")
     gemm.max_ab_stages = max_stages
@@ -79,7 +83,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (cute.sym_int() if die_claim or push else 1,), assumed_align=8
+        cutlass.Float32, (cute.sym_int() if die_claim or push or stamp else 1,), assumed_align=8
     )
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = _max_active_clusters(cluster[0] * cluster[1])
@@ -91,6 +95,49 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
             options=f"--opt-level 2 --gpu-arch={arch} --enable-tvm-ffi",
         )  # fmt: skip
     return compiled, gemm
+
+
+# GEMM-EX1 PROBE ONLY (never land): per-CTA globaltimer stamps of every call site, dumped
+# by a daemon thread every 10 s and at exit to $K/runs/GEMM-EX1/stamps/<host>_<pid>.pt.
+STAMP = True
+_STAMPS: list = []
+_STAMP_DIR = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/GEMM-EX1/stamps"
+
+
+def _stamp_dump():
+    import os
+    import socket
+
+    if not _STAMPS:
+        return
+    try:
+        stream = torch.cuda.Stream(device=_STAMPS[0][1].device)
+        with torch.cuda.stream(stream):
+            host = [(key, t.to("cpu", non_blocking=False)) for key, t in _STAMPS]
+        os.makedirs(_STAMP_DIR, exist_ok=True)
+        path = f"{_STAMP_DIR}/{socket.gethostname()}_{os.getpid()}.pt"
+        torch.save({"keys": [k for k, _ in host], "data": [t for _, t in host]}, path + ".tmp")
+        os.replace(path + ".tmp", path)
+    except Exception as exc:  # probe: never take the run down
+        print(f"GEMM-EX1 stamp dump failed: {exc!r}", flush=True)
+
+
+def _stamp_loop():
+    import time
+
+    while True:
+        time.sleep(2)
+        _stamp_dump()
+
+
+def _stamp_register(key, tensor):
+    if not _STAMPS:
+        import atexit
+        import threading
+
+        atexit.register(_stamp_dump)
+        threading.Thread(target=_stamp_loop, daemon=True).start()
+    _STAMPS.append((key, tensor))
 
 
 class Mxfp8PreGemm:
@@ -123,12 +170,18 @@ class Mxfp8PreGemm:
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), self.push,
+            int(max_stages), self.push, STAMP,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
+        if STAMP and n == 12448:
+            from .dense_blockscaled_gemm_sm107 import STAMP_OFF
+
+            self.alpha = torch.zeros(STAMP_OFF + 12 * 1024, device=device, dtype=torch.float32)
+            self.alpha[0] = 1.0
+            _stamp_register((n, k, rows, tuple(map(tuple, tactic[:2])), int(prewait)), self.alpha)
         self.aux, self.calls = None, 0
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
