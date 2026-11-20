@@ -231,3 +231,65 @@ def test_attn_res_lp_sequence(rows, dielocal, weights):
             assert torch.equal(rq.data.view(torch.uint8), qa.data.view(torch.uint8))
             assert torch.equal(rq.scale.view(torch.uint8), qa.scale.view(torch.uint8))
     assert lp_blocks.data_ptr() not in attn_res_lp._states  # released by the final call
+
+
+@pytest.mark.parametrize("rows,dielocal", [(2048, True), (5000, True)])
+def test_attn_res_lp_prefix_out_is_the_aux_capture(rows, dielocal):
+    """The DSpark aux capture of the model (KimiLinearModel: the aux state after
+    layer i is ``prefix_sum + mlp_out``, one BF16 add) taken from the next
+    AttnRes call: a pre-attention call (and the final call) given a fresh
+    ``prefix_out`` writes exactly that add there, at block-write and plain
+    layers, and the following call moves the prefix back to the die-local
+    buffer without touching the capture (the model redirects only with the
+    die-local buffers, where no AttnRes call updates a foreign prefix in
+    place)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+        attn_res_dielocal,
+        attn_res_lp,
+    )
+
+    nl, bs = 5, 2
+    calls = _calls(nl, bs)
+    nbt = math.ceil(nl / bs)
+    g = torch.Generator(device="cuda").manual_seed(1)
+
+    def rn(*s, scale=1.0):
+        return (torch.randn(*s, device="cuda", generator=g) * scale).bfloat16()
+
+    nw = [(1 + rn(H, scale=0.1).float()).bfloat16() for _ in calls]
+    qk = [rn(H, scale=H**-0.5) for _ in calls]
+    onw = (1 + rn(H, scale=0.1).float()).bfloat16()
+    plan = attn_res_lp.Plan(list(zip(nw, qk)), [EPS] * len(calls), bs, nbt)
+    prefix = rn(rows, H)
+    if dielocal:
+        blocks = attn_res_dielocal.block_residual(prefix, nbt)
+        if blocks is None:
+            pytest.skip("single-die device")
+        blocks.zero_()
+    else:
+        blocks = torch.zeros(rows, nbt, H, device="cuda", dtype=torch.bfloat16)
+    attn_res_lp.begin(plan, blocks)
+    captures = []
+    for c in calls:
+        if c["post"] and not c["delta"]:
+            prefix = rn(rows, H)  # a block-write layer restarts at its attention output
+        d = rn(rows, H, scale=0.5) if c["delta"] else None
+        aux = None
+        if not c["post"] and d is not None:
+            aux = torch.empty_like(prefix)
+            want = prefix + d  # the model's stock capture
+            po = aux
+        else:
+            po = attn_res_dielocal.prefix_out(prefix, blocks)
+        attn_res_lp.attn_res(prefix, d, blocks, c["c"], c["nb"], c["widx"],
+                             onw if c["norm"] else None, EPS, True, c["quant"],
+                             prefix_out=po)
+        if po is not None:
+            prefix = po
+        if aux is not None:
+            captures.append((aux, want.clone(), aux.clone()))
+            assert torch.equal(aux, want), c
+    torch.accelerator.synchronize()
+    for aux, want, at_capture in captures:
+        assert torch.equal(aux, at_capture)  # never written again
+        assert torch.equal(aux, want)
