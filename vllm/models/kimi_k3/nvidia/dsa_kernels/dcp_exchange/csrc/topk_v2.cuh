@@ -741,6 +741,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     if (K31_RARE(!fast)) {
       if constexpr (kFast) {  // tier 3 on every rank, then the complete body
+        if (!regp) V2STAT(9);
+        else if (nc > kV2Cand) V2STAT(10);
+        else if ((uint32_t)nc < q) V2STAT(11);
+        else V2STAT(12);
         if (tid == 0) { s_sat = 1u; s_above = 0u; s_lo = 0; }
       } else {
       V2STAT(5);
@@ -800,7 +804,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       int e;
       uint32_t tot;
       if (pdone) {  // e, P and the window total from the suffix scan
-        if (tid < kV2Win && win[tid] > kCountMax) atomicOr(&s_sat, 1u);
+        if (tid < kV2Win && win[tid] > kCountMax) { atomicOr(&s_sat, 1u); if (kFast && p.stats) atomicAdd(&p.stats[13], 1); }
         if (tid == 0) { s_bl = 1; s_bh = 0; s_n = 0; }
         e = ew;
         tot = wtot;
@@ -1059,7 +1063,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         uint32_t r2sat = 0;
         for (int r = 0; r < W; ++r) r2sat |= (rx[r * kV2Msg] >> 16) & 1u;
         if (r2sat) V2STAT(8);
-        if (!r2sat && row >= kR2Rows) V2STAT(9);
         if (!r2sat && row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
         __shared__ int s_r2[6];  // 0 LB, 1 tie count, 2 tau, 3 keys > tau, 4 quota, 5 bad
@@ -1101,7 +1104,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         V2DBG(6);
         const bool lbok = s_r2[0] >= 0;  // the same on every rank
-        if (!lbok) V2STAT(10);
         if (lbok) {
           const uint32_t LB = (uint32_t)max(s_r2[0], 1);
           const int64_t r2row = p.off_r2 + ((int64_t)(par * min(p.cap, kR2Rows) + row) * W) * kR2W;
@@ -1225,7 +1227,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           V2DBG(11);
           bool bad = false;
           for (int r = 0; r < W; ++r) bad |= s_r2n[r] < 0;
-          if (bad) V2STAT(11);
           if (!bad) {
             // tau: the K-th largest key of the union (two 8-bit levels)
             uint32_t* const h = hist;
@@ -1257,7 +1258,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             }
             V2DBG(13);
             const int tau2 = s_r2[2], need2 = K - s_r2[3];
-            if (tau2 < 0) { bad = true; V2STAT(12); }
+            if (tau2 < 0) bad = true;
             if (!bad) {
               // every rank's ties at tau by global id; this rank's quota
               auto gid_r = [&](int r, uint32_t pos) -> uint32_t {
@@ -1274,7 +1275,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               __syncthreads();
               const int mt = s_r2[1];
               bad = mt > kCoarseBins || mt < need2;
-              if (bad) V2STAT(13);
               if (!bad) {
                 const uint32_t* me = rcv + p.rank * RW + 4;
                 const int nme = s_r2n[p.rank];
