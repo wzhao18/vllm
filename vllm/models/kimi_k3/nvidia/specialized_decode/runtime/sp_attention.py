@@ -81,6 +81,7 @@ from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
 from .sp_mlp import SpMlp, moe_choice
+from .touch import FrontTouch
 
 logger = init_logger(__name__)
 
@@ -470,6 +471,8 @@ class SpStep:
             for d in layers
             if d.is_moe_layer
         }
+        # The MoE front's weights are touched into L2 during each layer's reduce.
+        self.front_touch = FrontTouch(self.mlps, self.device) if self.mlps else None
         # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
         # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
         self.bounds = {
@@ -674,6 +677,8 @@ class SpStep:
             if col is not None:  # the reduce updates prefix_sum in place
                 main.wait_stream(self.side)
             out = prefix_sum.new_empty(prefix_sum.shape)
+            if self.front_touch is not None:
+                self.front_touch.fork(index)
             hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
             if mlp is None:
@@ -686,6 +691,8 @@ class SpStep:
                         index, prefix_sum, hidden, residual
                     )
                 )
+        if self.front_touch is not None:
+            self.front_touch.join()
         final = backbone.output_attn_res_norm
         hidden = attn_res(
             prefix_sum,
