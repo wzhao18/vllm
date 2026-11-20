@@ -15,7 +15,8 @@ import statistics
 import torch
 import torch.nn.functional as F
 
-SHAPES = {"lm": (40960, 7168), "gu": (7168, 7168), "qkv": (2048, 7168)}
+SHAPES = {"lm": (40960, 7168), "gu": (7168, 7168), "qkv": (2048, 7168), "down": (7168, 3584),
+          "o": (7168, 1536), "markov": (40960, 512)}
 
 
 def time_graph(fn, ncopy, reps=10, rounds=5):
@@ -85,6 +86,71 @@ def stamp_summary(st, ks, total, pairs):
                 for kk, v in kinds.items()) + f' | us/step (seg>0) med {med(per_step):.3f}')
 
 
+def spread_arms(args, arms, m, n, k, x, ws, pairs, ncopy, res, run, configs):
+    """``spread`` arms: sp (BF16 out), spst (+ stamps), spsilu (gate/up + silu_and_mul vs
+    F.linear + vLLM silu_and_mul)."""
+    import vllm._custom_ops  # noqa: F401  (torch.ops._C.silu_and_mul)
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
+
+    for nw, nx, xs in configs:
+        if not wide_sk.supports(m, n, k, pairs, spread=True, x_stages=xs):
+            res[f"sp{nw}{nx}x{xs}"] = (float("nan"), "unsupported")
+            continue
+        for arm, dbg, silu in (("sp", 0, False), ("spst", 8, False), ("spsilu", 0, True)):
+            if arm not in arms:
+                continue
+            tag = f"{arm}{nw}{nx}x{xs}"
+            pk = [wide_sk.PreparedWideSK(w, [m], w_issuers=nw, x_issuers=nx, debug=dbg,
+                                         x_stages=xs, spread=True, silu=silu,
+                                         **args.extra).prepare()
+                  for w in ws]  # fmt: skip
+            if silu:
+                h = torch.empty(m, n, device=x.device, dtype=torch.bfloat16)
+                act = torch.empty(m, n // 2, device=x.device, dtype=torch.bfloat16)
+
+                def stock(i):
+                    torch.matmul(x, ws[i].t(), out=h)
+                    torch.ops._C.silu_and_mul(act, h)
+
+                stock(0)
+                ref_act = act.float().clone()
+                res["F.linear+silu"] = (time_graph(stock, ncopy), 0.0)
+                o = torch.empty(m, n // 2, device=x.device, dtype=torch.bfloat16)
+                pk[0].run(x, o)
+                torch.cuda.synchronize()
+                err = ((o.float() - ref_act).abs().max() / ref_act.abs().max()).item()
+                ulp = (o.float() != ref_act).float().mean().item()
+                res[tag] = (time_graph(lambda i, pk=pk: pk[i].run(x, o), ncopy), err)
+                pk[0].run(x, o)
+                o1 = o.clone()
+                pk[0].run(x, o)
+                torch.cuda.synchronize()
+                res[tag + ".det"] = (0.0, float((o1 != o).sum().item()))
+                res[tag + ".neq%"] = (0.0, 100.0 * ulp)
+            else:
+                run(tag, lambda i, pk=pk: pk[i].run(x, run.out), check=dbg == 0)
+                if dbg & 8:
+                    pk[0].run(x, run.out)
+                    torch.cuda.synchronize()
+                    st = pk[0].stamps(m).cpu()
+                    t0 = st[:, 0].min().item()
+                    rel = lambda c: (st[:, c] - t0).float() / 1e3  # noqa: E731
+                    print(f"R{m} {tag} stamps us (median/max over CTAs): "
+                          f"seg0 acc {rel(2).median():.1f}/{rel(2).max():.1f} "
+                          f"pub0 {rel(3).median():.1f}/{rel(3).max():.1f} "
+                          f"red-ready {rel(10).median():.1f}/{rel(10).max():.1f} "
+                          f"loaded {rel(11).median():.1f}/{rel(11).max():.1f} "
+                          f"end {rel(12).median():.1f}/{rel(12).max():.1f}", flush=True)
+                else:
+                    pk[0].run(x, run.out)
+                    o1 = run.out.clone()
+                    pk[0].run(x, run.out)
+                    torch.cuda.synchronize()
+                    res[tag + ".det"] = (0.0, float((o1 != run.out).sum().item()))
+            del pk
+            torch.cuda.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", default="96,192,288")
@@ -92,7 +158,13 @@ def main():
     ap.add_argument("--arms", default="lt,sk,striped,nomma")
     # weight warps : activation warps per chunk : activation ring stages, several
     ap.add_argument("--issuers", default="3:2:4")
+    ap.add_argument("--smem", type=int, default=0, help="KiB budget (0: smem_budget)")
+    ap.add_argument("--packed", type=int, default=0)
+    ap.add_argument("--keep-w", type=int, default=0)
+    ap.add_argument("--warm", type=int, default=0, help="one weight copy (L2-warm)")
     args = ap.parse_args()
+    args.extra = dict(smem=args.smem * 1024 or None, packed=bool(args.packed),
+                      keep_w=bool(args.keep_w))
     torch.manual_seed(0)
     dev = torch.device("cuda")
     print(torch.cuda.get_device_name(), flush=True)
@@ -105,7 +177,7 @@ def main():
     arms = args.arms.split(",")
     _, pairs = wide_sk.die_pairs(dev)
     print(f"shape {args.shape} N{n} K{k} pairs/die {pairs} configs {configs}", flush=True)
-    ncopy = max(2, min(16, int(1.2e9 // (n * k * 2)) + 1))
+    ncopy = 1 if args.warm else max(2, min(16, int(1.2e9 // (n * k * 2)) + 1))
     ws = [torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.02 for _ in range(ncopy)]
     for m in [int(r) for r in args.rows.split(",")]:
         x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
@@ -144,6 +216,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 res[tag] = (float("nan"), repr(e)[:160])
 
+        run.out = out
         run("F.linear", lambda i: torch.matmul(x, ws[i].t(), out=out))
         if "lt" in arms and m in lt_pin.pins_for((n, k)):
             pls = [lt_pin.pinned(w, [m]) for w in ws]
@@ -156,6 +229,8 @@ def main():
                                    ("wonly", True, 3), ("xonly", True, 5),
                                    ("stamp", True, 8), ("nommastamp", True, 9))
                 if a_ in arms]  # fmt: skip
+        if any(a.startswith("sp") for a in arms):
+            spread_arms(args, arms, m, n, k, x, ws, pairs, ncopy, res, run, configs)
         for arm, place, dbg, (nw, nx, xs) in todo:
             arm = f"{arm}{nw}{nx}x{xs}"
             if not wide_sk.supports(m, n, k, pairs):
@@ -163,7 +238,7 @@ def main():
                 continue
             pk = [
                 wide_sk.PreparedWideSK(w, [m], place=place, w_issuers=nw, x_issuers=nx,
-                                       debug=dbg, x_stages=xs).prepare()
+                                       debug=dbg, x_stages=xs, **args.extra).prepare()
                 for w in ws
             ]  # fmt: skip
             if arm.startswith("xl"):  # activations copied per die
@@ -189,7 +264,7 @@ def main():
             torch.cuda.empty_cache()
         base = res["F.linear"][0]
         line = " ".join(
-            f"{t}={v[1]:.0f}" if t.endswith(".det") else
+            f"{t}={v[1]:.2g}" if t.endswith((".det", ".neq%")) else
             f"{t}={v[0]:.2f}" + (f"(x{base / v[0]:.2f} e{v[1]:.1e})" if isinstance(v[1], float)
                                  else f"[{v[1]}]")
             for t, v in res.items()
