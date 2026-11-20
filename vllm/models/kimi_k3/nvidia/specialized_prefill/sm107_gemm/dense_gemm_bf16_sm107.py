@@ -1188,35 +1188,29 @@ class PersistentDenseGemmKernel:
             aux_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), ep_t1.element_type, num_bits_per_copy=128
             )
-        for subtile_idx in range(subtile_cnt):
-            tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-            if cutlass.const_expr(self.aux_t2r):
-                c_sub = tTR_cAux[(None, None, None, subtile_idx)]
-                pred = cute.make_rmem_tensor((1, *c_sub.shape[1:]), cutlass.Boolean)
-                for mi in range(c_sub.shape[1]):
-                    for ni in range(c_sub.shape[2]):
-                        pred[(0, mi, ni)] = cute.elem_less(c_sub[(0, mi, ni)], mC_mnl.shape)
-                cute.copy(
-                    aux_atom, tTR_gAux[(None, None, None, subtile_idx)], tTR_rAux, pred=pred
+        if cutlass.const_expr(self.aux_t2r):
+            # aux double-buffered in registers, one subtile ahead (unrolled)
+            bufs = (tTR_rAux, cute.make_rmem_tensor(tTR_rAcc.shape, ep_t1.element_type))
+            self._aux_load(aux_atom, tTR_gAux, tTR_cAux, mC_mnl, 0, bufs[0])
+            for s in cutlass.range_constexpr(subtile_cnt):
+                if cutlass.const_expr(s + 1 < subtile_cnt):
+                    self._aux_load(aux_atom, tTR_gAux, tTR_cAux, mC_mnl, s + 1, bufs[(s + 1) % 2])
+                cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+                self.epi_convert_regs_aux(tTR_rAcc, bufs[s % 2], tRS_rC, tiled_copy_r2s)
+                self._epi_store_subtile(
+                    s, num_prev_subtiles, tiled_copy_r2s, tRS_rC, tRS_sC,
+                    epilog_sync_barrier, warp_idx, tma_atom_c, bSG_sC, bSG_gC, c_pipeline,
                 )
-            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-            if cutlass.const_expr(self.aux_t2r):
-                self.epi_convert_regs_aux(tTR_rAcc, tTR_rAux, tRS_rC, tiled_copy_r2s)
-            else:
+        else:
+            for subtile_idx in range(subtile_cnt):
+                cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
                 self.epi_convert_regs(
                     tiled_copy_r2s.retile(tTR_rAcc), tRS_rC, epilogue_op, ep_t0
                 )
-            c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
-            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
-            cute.arch.fence_proxy("async.shared", space="cta")
-            epilog_sync_barrier.arrive_and_wait()
-            if warp_idx == self.epilogue_warp_id[0]:
-                cute.copy(
-                    tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, subtile_idx)]
+                self._epi_store_subtile(
+                    subtile_idx, num_prev_subtiles, tiled_copy_r2s, tRS_rC, tRS_sC,
+                    epilog_sync_barrier, warp_idx, tma_atom_c, bSG_sC, bSG_gC, c_pipeline,
                 )
-                c_pipeline.producer_commit()
-                c_pipeline.producer_acquire()
-            epilog_sync_barrier.arrive_and_wait()
         epilog_sync_barrier.arrive_and_wait()
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_consumer_state)
@@ -1234,6 +1228,31 @@ class PersistentDenseGemmKernel:
         dst.store(self.epi_convert(src.load(), epilogue_op, ep_t0))
 
     aux_t2r = False  # subclasses: ep_t1 is an (M, N, L) aux operand read in the epilogue
+
+    def _aux_load(self, atom, tTR_gAux, tTR_cAux, mC_mnl, subtile, dst):
+        """Predicated 16-byte loads of one aux subtile (t2r layout) into dst."""
+        c_sub = tTR_cAux[(None, None, None, subtile)]
+        pred = cute.make_rmem_tensor((1, *c_sub.shape[1:]), cutlass.Boolean)
+        for mi in range(c_sub.shape[1]):
+            for ni in range(c_sub.shape[2]):
+                pred[(0, mi, ni)] = cute.elem_less(c_sub[(0, mi, ni)], mC_mnl.shape)
+        cute.copy(atom, tTR_gAux[(None, None, None, subtile)], dst, pred=pred)
+
+    @cute.jit
+    def _epi_store_subtile(
+        self, subtile_idx, num_prev_subtiles, tiled_copy_r2s, tRS_rC, tRS_sC,
+        epilog_sync_barrier, warp_idx, tma_atom_c, bSG_sC, bSG_gC, c_pipeline,
+    ):
+        """C subtile registers -> smem -> TMA store (the example's per-subtile tail)."""
+        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
+        cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+        cute.arch.fence_proxy("async.shared", space="cta")
+        epilog_sync_barrier.arrive_and_wait()
+        if warp_idx == self.epilogue_warp_id[0]:
+            cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, subtile_idx)])
+            c_pipeline.producer_commit()
+            c_pipeline.producer_acquire()
+        epilog_sync_barrier.arrive_and_wait()
 
     def epi_convert_regs_aux(self, acc_t2r, aux_t2r, dst, tiled_copy_r2s):
         """Conversion with an aux fragment (both t2r layout) -> dst (r2s layout)."""
