@@ -129,14 +129,13 @@ class Fp4IndexLogits:
     rows of a step; ``q``: verify rows per request)."""
 
     def __init__(self, max_rows: int, q: int, device):
-        assert max_rows % q == 0 and 1 <= q <= 4, (max_rows, q)
+        assert 1 <= q <= 4, q
         self.q = q
         self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        reqs = max_rows // q
-        self.seq_lens = torch.zeros(reqs, dtype=torch.int32, device=device)
-        self.cum = torch.zeros(reqs, dtype=torch.int32, device=device)
-        self.schedule = torch.zeros(self.num_sms + 1, 2, dtype=torch.int32, device=device)
-        self.weights = torch.zeros(max_rows, HEADS, dtype=torch.float32, device=device)
+        self.max_rows = max_rows
+        # Step buffers come from the caller's stream allocation on every call (under
+        # CUDA graphs: the capturing graph's pool), so no tensor outlives a graph.
+        self.seq_lens = self.cum = self.schedule = self.weights = None
         self.arch = _arch(device)
         self.epi_math = True  # benchmarks only: False skips the head-sum math
 
@@ -151,7 +150,7 @@ class Fp4IndexLogits:
         ``block_table`` [rows, pages] (row r of request b: r = b * q + t; the request
         reads row b * q's)."""
         q, rows = self.q, query.shape[0]
-        assert rows % q == 0 and rows <= self.weights.shape[0], (rows, q)
+        assert rows % q == 0, (rows, q)
         assert query.is_contiguous() and q_scale.is_contiguous() and head_w.shape[1] == HEADS
         reqs = rows // q
         lens = row_lens.reshape(rows)
@@ -161,7 +160,12 @@ class Fp4IndexLogits:
 
     def prepare(self, head_w, lens, rows, reqs):
         """The per-request lengths, the CTA schedule and the FP32 head weights."""
-        q, w = self.q, self.weights[:rows]
+        dev = head_w.device
+        self.seq_lens = torch.empty(reqs, dtype=torch.int32, device=dev)
+        self.cum = torch.empty(reqs, dtype=torch.int32, device=dev)
+        self.schedule = torch.empty(self.num_sms + 1, 2, dtype=torch.int32, device=dev)
+        self.weights = torch.empty(rows, HEADS, dtype=torch.float32, device=dev)
+        q, w = self.q, self.weights
         n_w = rows * HEADS
         block_w = 4096
         grid = (1 + triton.cdiv(n_w, block_w),)

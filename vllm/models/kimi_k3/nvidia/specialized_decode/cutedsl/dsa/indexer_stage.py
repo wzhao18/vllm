@@ -309,12 +309,7 @@ class IndexerStage:
         from .fp4_index_logits import Fp4IndexLogits
 
         op = self.fp4_ops.get(q)
-        if op is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"IndexerStage: MXFP4 logits for q={q} first seen in graph capture "
-                    "(its buffers must exist before capture: run the step eagerly first)"
-                )
+        if op is None:  # no tensors: safe to create under graph capture
             device = self.indexer.topk_indices_buffer.device
             op = self.fp4_ops[q] = Fp4IndexLogits(max(batch, rows), q, device)
         query, q_scale = self.query(q_fp8, rows, batch)
