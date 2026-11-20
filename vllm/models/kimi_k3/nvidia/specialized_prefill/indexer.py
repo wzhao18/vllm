@@ -134,26 +134,6 @@ def st_global_u32(address, value):
     return "st.global.b32 [$0], $1;", "l,r,~{memory}", (Int64(address), Uint32(value))
 
 
-@asm(Uint32)
-def ld_acquire_u32(address):
-    return "ld.acquire.gpu.global.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
-
-
-@asm(Uint32)
-def ld_relaxed_u32(address):
-    return "ld.relaxed.gpu.global.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
-
-
-@asm()
-def st_release_u32(address, value):
-    return "st.release.gpu.global.b32 [$0], $1;", "l,r,~{memory}", (Int64(address), Uint32(value))
-
-
-@asm()
-def sleep_ns(ns: int):
-    return f"nanosleep.u32 {ns};", "~{memory}", ()
-
-
 @asm()
 def st_global_u16_off(address, value, off: int):
     code = "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.b16 [$0+" + str(off) + "], t; }"
@@ -328,12 +308,6 @@ def wg_sync(wg):
     cute.arch.barrier(barrier_id=2 + wg, number_of_threads=128)
 
 
-@cute.jit
-def epi_sync():
-    """All epilogue warps."""
-    cute.arch.barrier(barrier_id=1, number_of_threads=128 * EPI_WG)
-
-
 def _mn_layout(t):
     """A tcgen05 accumulator as ((M), (N), stages)."""
     sh, sd = t.layout.shape, t.layout.stride
@@ -356,16 +330,10 @@ class IndexerScore:
 
     def __init__(
         self, ctas: int, mode: int = 0, topk: int = 2048, epi: int = 0,
-        split: bool = False,
     ):
         """mode: 0 logits + per-row top-k bound (row_bin); STORE logits only;
-        PUBLISH candidates at or above the row thresholds (row_bin), no logits.
-        split (PUBLISH): CTA c works through the units unit_off[c] .. unit_off[c + 1]
-        of ``units`` (``tail_free``: equal tile-pair counts per CTA, an item split
-        across two CTAs continues its candidate lists) instead of every ctas-th
-        item."""
+        PUBLISH candidates at or above the row thresholds (row_bin), no logits."""
         self.mode = mode
-        self.split = split and mode >= PUBLISH
         self.ctas = ctas
         self.topk = topk
         # epilogue math (benchmark calibration only): 0 full; 1 skeleton (TMEM loads,
@@ -390,9 +358,6 @@ class IndexerScore:
         row_base: cute.Tensor,  # Int64 [T + 1]: row t's first element in logits (T: dummy row)
         logits: cute.Tensor,  # Int16 [*]: BF16 logits scratch
         row_bin: cute.Tensor,  # Int32 [2 * T]: per row the bound rank and the count above it
-        units: cute.Tensor,  # Int32 [m, 8]: item fields, pair range, continuation flags
-        unit_off: cute.Tensor,  # Int32 [ctas + 1]: each CTA's units
-        flags: cute.Tensor,  # Int32 [ctas]: split-item hand-over flags (self-resetting)
         s,
     ):
         fp4 = cutlass.Float4E2M1FN
@@ -488,9 +453,6 @@ class IndexerScore:
             row_base,
             logits,
             row_bin,
-            units,
-            unit_off,
-            flags,
         ).launch(
             grid=[self.ctas, 1, 1],
             block=[THREADS, 1, 1],
@@ -522,9 +484,6 @@ class IndexerScore:
         row_base: cute.Tensor,
         logits: cute.Tensor,
         row_bin: cute.Tensor,
-        units: cute.Tensor,
-        unit_off: cute.Tensor,
-        flags: cute.Tensor,
     ):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -598,8 +557,7 @@ class IndexerScore:
         n_items = n_items_t[0]
         if warp < PRODUCER:
             self.epilogue(
-                tAcc, acc_full, acc_empty, q_full, q_empty, items, units, unit_off,
-                flags, n_items, row_base,
+                tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
                 logits, row_bin, (end_a, w_a, st.hist.data_ptr().toint(), st.wscan.data_ptr().toint()),
                 warp, tidx, bid,
                 lane,
@@ -622,13 +580,11 @@ class IndexerScore:
                 kv_stage = Int32(0)
                 kv_ph = Int32(0)
                 jq = Int32(0)
-                u0, u1, ustep, wl = self.worklist(bid, n_items, items, units, unit_off)
-                for u in cutlass.range(u0, u1, ustep, unroll=1):
-                    token0 = wl[u, 0]
-                    ntok = wl[u, 1]
-                    key0 = wl[u, 2]
-                    ntiles = wl[u, 3]
-                    pb, pe, _, _ = self.unit_span(wl, u, ntiles)
+                for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
+                    token0 = items[item, 0]
+                    ntok = items[item, 1]
+                    key0 = items[item, 2]
+                    ntiles = items[item, 3]
                     qs = jq % Q_STAGES
                     cute.arch.mbarrier_wait(q_empty + qs, ((jq // Q_STAGES) & 1) ^ 1)
                     # row ends, head weights, query scales (SF atom order)
@@ -678,7 +634,7 @@ class IndexerScore:
                     ntp = ntiles + (ntiles & 1)
                     # key bases are 128-aligned (plan): tile coordinates add up
                     kt0 = key0 >> 7
-                    for tt in cutlass.range(2 * pb, 2 * pe, unroll=1):
+                    for tt in cutlass.range(ntp, unroll=1):
                         t = cutlass.min(ntp - 1 - tt, ntiles - 1)
                         cute.arch.mbarrier_wait(kv_empty + kv_stage, kv_ph ^ 1)
                         with cute.arch.elect_one():
@@ -716,14 +672,12 @@ class IndexerScore:
                 kv_ph = Int32(0)
                 acc_ph = Int32(0)
                 jq = Int32(0)
-                u0, u1, ustep, wl = self.worklist(bid, n_items, items, units, unit_off)
-                for u in cutlass.range(u0, u1, ustep, unroll=1):
-                    ntiles = wl[u, 3]
-                    pb, pe, _, _ = self.unit_span(wl, u, ntiles)
+                for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
+                    ntiles = items[item, 3]
                     qs = jq % Q_STAGES
                     cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
                     cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, qs)], s2t_b[2])
-                    for _p in cutlass.range(pb, pe, unroll=1):
+                    for _p in cutlass.range((ntiles + 1) // 2, unroll=1):
                         for a in cutlass.range_constexpr(ACC_STAGES):
                             cute.arch.mbarrier_wait(acc_empty + a, acc_ph ^ 1)
                             cute.arch.mbarrier_wait(kv_full + kv_stage, kv_ph)
@@ -765,20 +719,6 @@ class IndexerScore:
                 group=nvvm.CTAGroup.CTA_1,
             )
 
-    def worklist(self, bid, n_items, items, units, unit_off):
-        """(first, end, step, table) of this CTA's work units."""
-        if cutlass.const_expr(self.split):
-            return unit_off[bid], unit_off[bid + 1], 1, units
-        return bid, n_items, self.ctas, items
-
-    def unit_span(self, wl, u, ntiles):
-        """Tile pairs pb .. pe - 1 of unit u (pair p: tiles ntp - 1 - 2 p and the one
-        below), the flag it waits for before continuing an item (-1: none) and the
-        one it sets after handing the item over (-1: none)."""
-        if cutlass.const_expr(self.split):
-            return wl[u, 4], wl[u, 5], wl[u, 6], wl[u, 7]
-        return Int32(0), (ntiles + 1) // 2, Int32(-1), Int32(-1)
-
     def s2t(self, sSF, tSF):
         """SMEM -> TMEM scale-factor copy (tcgen05.cp 4x32dp128bit), as FlashInfer's
         dense block-scaled GEMM."""
@@ -804,8 +744,7 @@ class IndexerScore:
 
     @cute.jit
     def epilogue(
-        self, tAcc, acc_full, acc_empty, q_full, q_empty, items, units, unit_off, flags,
-        n_items, row_base,
+        self, tAcc, acc_full, acc_empty, q_full, q_empty, items, n_items, row_base,
         logits, row_bin, sm, warp, tidx, bid, lane,
     ):
         """Every epilogue warp reads every tile: warpgroup wg owns tokens 2 wg and
@@ -837,13 +776,10 @@ class IndexerScore:
         for i in cutlass.range_constexpr(2 * S_BINS // 128):
             st_shared_u32(hist0 + (i * 128 + lt) * 4, Uint32(0))
         wg_sync(wg)
-        flag_a = flags.iterator.toint()
-        u0, u1, ustep, wl = self.worklist(bid, n_items, items, units, unit_off)
-        for u in cutlass.range(u0, u1, ustep, unroll=1):
-            token0 = wl[u, 0]
-            ntok = wl[u, 1]
-            ntiles = wl[u, 3]
-            pb, pe, cin, cout = self.unit_span(wl, u, ntiles)
+        for item in cutlass.range(bid, n_items, self.ctas, unroll=1):
+            token0 = items[item, 0]
+            ntok = items[item, 1]
+            ntiles = items[item, 3]
             qs = jq % Q_STAGES
             cute.arch.mbarrier_wait(q_full + qs, (jq // Q_STAGES) & 1)
             end0 = Int32(ld_shared_u32(end_a + (qs * BQ + tok_a) * 4))
@@ -880,19 +816,6 @@ class IndexerScore:
                 p1 = cand1 + TILE * 4
                 lim0 = cand0 + (SLOTS + 1) * TILE * 4
                 lim1 = cand1 + (SLOTS + 1) * TILE * 4
-            if cutlass.const_expr(self.split):
-                if cin >= 0:
-                    # the item's newer pairs ran first on the previous CTA: once it
-                    # handed the item over, continue its candidate lists
-                    if tidx == 0:
-                        f = ld_acquire_u32(flag_a + cin * 4)
-                        while f == Uint32(0):
-                            sleep_ns(100)
-                            f = ld_acquire_u32(flag_a + cin * 4)
-                        st_global_u32(flag_a + cin * 4, Uint32(0))
-                    epi_sync()
-                    p0 = cand0 + Int64(ld_relaxed_u32(cand0) + Uint32(1)) * (TILE * 4)
-                    p1 = cand1 + Int64(ld_relaxed_u32(cand1) + Uint32(1)) * (TILE * 4)
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
             # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
@@ -911,10 +834,7 @@ class IndexerScore:
             # the repeated tile of an odd count) come first (newest to oldest);
             # the rest run without masking
             n_edge = cutlass.max(ntp + 1 - full_tiles, 0) // 2
-            e0 = cutlass.min(pb, n_edge)
-            e1 = cutlass.min(pe, n_edge)
-            i0 = cutlass.max(pb, n_edge)
-            for pp in cutlass.range(e0, e1, unroll=1):
+            for pp in cutlass.range(n_edge, unroll=1):
                 ptr0, ptr1, p0, p1 = self.tile_pair(
                     True, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
                     w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
@@ -931,7 +851,7 @@ class IndexerScore:
                 for i in cutlass.range_constexpr(4):
                     sc[i] = Uint32(0x7FC07FC0)
                 tc = Int32(0)
-                for pp in cutlass.range(i0, pe, unroll=1):
+                for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
                     p0, p1, tc = self.pair_rot(
                         ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, w, p0, p1,
                         thr, lim0, lim1, hc, sc, tc,
@@ -943,7 +863,7 @@ class IndexerScore:
                     hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tc, p0, p1, thr
                 )
             else:
-                for pp in cutlass.range(i0, pe, unroll=1):
+                for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
                     ptr0, ptr1, p0, p1 = self.tile_pair(
                         False, ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, lane,
                         w, ptr0, ptr1, p0, p1, thr, lim0, lim1, end0, end1, ntiles,
@@ -955,13 +875,6 @@ class IndexerScore:
                 # (a full column counts as overflowed: the row is recomputed)
                 st_global_u32(cand0, Uint32((p0 - cand0) // (TILE * 4) - 1))
                 st_global_u32(cand1, Uint32((p1 - cand1) // (TILE * 4) - 1))
-                if cutlass.const_expr(self.split):
-                    if cout >= 0:
-                        # hand the item over: every epilogue thread's counts first
-                        epi_sync()
-                        if tidx == 0:
-                            fence_acq_rel_gpu()
-                            st_release_u32(flag_a + cout * 4, Uint32(1))
             elif cutlass.const_expr(self.mode == 0):
                 # per row: bound bin rank and the count above it, then clear
                 wg_sync(wg)
@@ -2520,13 +2433,8 @@ class SelectivePlan:
 
     def __init__(self, row_counts, row_lens_last, key_bases, device, topk=2048):
         self.topk = topk
-        host_items, self.items, self.row_len, self.row_base, self.scratch = _plan(
+        self.items, self.row_len, self.row_base, self.scratch = plan(
             row_counts, row_lens_last, key_bases, device
-        )
-        # the PUBLISH launch's tail-free schedule (one CTA per SM)
-        self.sched = TailFree(
-            host_items, torch.cuda.get_device_properties(device).multi_processor_count,
-            device,
         )
         t = sum(row_counts)
         self.t = t
@@ -2607,8 +2515,7 @@ def publish(sp, q, q_scale, keys, key_scale, weights_bf16, ctas=None, mode=PUBLI
     cand = torch.empty((sp.t + 1) * REGION, dtype=torch.int32, device=q.device)
     score(q, q_scale, keys, key_scale, weights_bf16, sp.row_len, sp.items, sp.cand_base,
           cand.view(torch.bfloat16), sp.row_bin, ctas=ctas, mode=mode,
-          n_items=sp.n_items,
-          sched=sp.sched if ctas in (None, sp.sched.ctas) else None)
+          n_items=sp.n_items)
     return cand
 
 
@@ -2653,11 +2560,6 @@ def recover(sp, q, q_scale, keys, key_scale, weights_bf16, out, ctas=None,
 
 
 def plan(row_counts, row_lens_last, key_bases, device):
-    """``_plan`` without the host item list."""
-    return _plan(row_counts, row_lens_last, key_bases, device)[1:]
-
-
-def _plan(row_counts, row_lens_last, key_bases, device):
     """Work items and the logits scratch layout of the step's prefill requests.
 
     Request r has ``row_counts[r]`` query rows; its last row sees
@@ -2690,11 +2592,11 @@ def _plan(row_counts, row_lens_last, key_bases, device):
     it = torch.tensor(items, dtype=torch.int32, device=device).view(-1, 4)
     ln = torch.tensor(lens, dtype=torch.int32, device=device)
     rb = torch.tensor(bases, dtype=torch.int64, device=device)
-    return items, it, ln, rb, scratch
+    return it, ln, rb, scratch
 
 
 @functools.cache
-def _score_kernel(ctas, mode=0, topk=2048, epi=0, split=False):
+def _score_kernel(ctas, mode=0, topk=2048, epi=0):
     from cutlass.cute.runtime import make_fake_stream
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
@@ -2712,14 +2614,9 @@ def _score_kernel(ctas, mode=0, topk=2048, epi=0, split=False):
         fake((cute.sym_int(),), dtype=cutlass.Int64),
         fake((cute.sym_int(),), dtype=cutlass.Int16),
         fake((cute.sym_int(),), dtype=cutlass.Int32),
-        fake((cute.sym_int(), 8), dtype=cutlass.Int32),
-        fake((cute.sym_int(),), dtype=cutlass.Int32),
-        fake((cute.sym_int(),), dtype=cutlass.Int32),
         make_fake_stream(),
     )
-    return cute.compile(
-        IndexerScore(ctas, mode, topk, epi, split), *args, options="--enable-tvm-ffi"
-    )
+    return cute.compile(IndexerScore(ctas, mode, topk, epi), *args, options="--enable-tvm-ffi")
 
 
 @functools.cache
@@ -2754,26 +2651,18 @@ def _select_kernels(ctas, topk, words):
 
 
 def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
-          logits, row_bin, ctas=None, mode=0, topk=2048, n_items=None, epi=0,
-          sched=None):
+          logits, row_bin, ctas=None, mode=0, topk=2048, n_items=None, epi=0):
     """BF16 logits of every prefill row into ``logits`` and each row's top-k bound
     into ``row_bin`` (Int32 [3 T]: bound bin rank, count above, candidate count
     zeroed for the select) (see ``plan``). ``n_items`` (Int32 [1], device): only
-    the first n_items items run (default all). ``sched`` (PUBLISH): the
-    ``TailFree`` schedule of ``items`` for ``ctas`` CTAs."""
+    the first n_items items run (default all)."""
     dev = q.device
     t = q.shape[0]
     assert keys.shape[0] % TILE == 0
     ctas = ctas or torch.cuda.get_device_properties(dev).multi_processor_count
     if n_items is None:
         n_items = torch.full((1,), items.shape[0], dtype=torch.int32, device=dev)
-    split = sched is not None and mode >= PUBLISH
-    if split:
-        assert sched.ctas == ctas, (sched.ctas, ctas)
-        units, unit_off, flags = sched.units, sched.unit_off, sched.flags
-    else:
-        units, unit_off, flags = _no_sched(dev)
-    _score_kernel(ctas, mode, topk, epi, split)(
+    _score_kernel(ctas, mode, topk, epi)(
         q.view(t * HEADS, DIM // 2),
         q_scale.reshape(-1),
         keys,
@@ -2785,69 +2674,8 @@ def score(q, q_scale, keys, key_scale, weights_bf16, row_len, items, row_base,
         row_base,
         logits.view(torch.int16),
         row_bin,
-        units,
-        unit_off,
-        flags,
         torch.cuda.current_stream(dev).cuda_stream,
     )
-
-
-@functools.cache
-def _no_sched(dev):
-    return (torch.zeros(1, 8, dtype=torch.int32, device=dev),
-            torch.zeros(2, dtype=torch.int32, device=dev),
-            torch.zeros(1, dtype=torch.int32, device=dev))
-
-
-class TailFree:
-    """Balanced shares of an item list's tile pairs for ``ctas`` persistent CTAs. The
-    whole-item round-robin leaves the CTAs with one item fewer idle for a whole item
-    at the end (2049 items on 212 CTAs: 141 take 10, 71 take 9); a contiguous cut of
-    the list balances the work but desynchronizes the CTAs, which then stop reading
-    the same key tiles together (33% more L2 reads, 4% slower tiles in-step). So
-    the round-robin rounds stay and only the excess moves: a CTA with one item more
-    runs the newer pairs of its last item first and hands the older pairs over to a
-    CTA with one item fewer, which takes them after its own items and continues the
-    candidate lists (hand-over flag, release/acquire, self-resetting).
-    ``units``: Int32 [m, 8] (token0, ntok, key0, ntiles, first pair, end pair, flag
-    to wait for or -1, flag to set or -1), ``unit_off``: Int32 [ctas + 1]."""
-
-    def __init__(self, items, ctas, device):
-        import heapq
-
-        self.ctas = ctas
-        pairs = [(it[3] + 1) // 2 for it in items]
-        own = [list(range(c, len(items), ctas)) for c in range(ctas)]
-        load = [sum(pairs[k] for k in o) for o in own]
-        target = sum(pairs) / ctas
-        most = max((len(o) for o in own), default=0)
-        lists = [[[*items[k], 0, pairs[k], -1, -1] for k in o] for o in own]
-        takers = [(load[c] - target, c) for c in range(ctas) if len(own[c]) < most]
-        heapq.heapify(takers)
-        nflag = 0
-        for c in range(ctas):
-            if not takers or len(own[c]) < most or not own[c]:
-                continue
-            last = lists[c].pop()
-            give = min(max(round(load[c] - target), 0), pairs[own[c][-1]] - 1)
-            if give == 0:
-                lists[c].append(last)
-                continue
-            keep = last[5] - give
-            # the newer pairs first on this CTA, the older ones last on a taker
-            lists[c].insert(0, [*last[:4], 0, keep, -1, nflag])
-            deficit, t = heapq.heappop(takers)
-            lists[t].append([*last[:4], keep, last[5], nflag, -1])
-            heapq.heappush(takers, (deficit + give, t))
-            nflag += 1
-        units, off = [], [0]
-        for lst in lists:
-            units.extend(lst)
-            off.append(len(units))
-        self.units = torch.tensor(units, dtype=torch.int32, device=device).view(-1, 8)
-        self.unit_off = torch.tensor(off, dtype=torch.int32, device=device)
-        # zero once: each continuation resets the flag it waited for
-        self.flags = torch.zeros(max(nflag, 1), dtype=torch.int32, device=device)
 
 
 def select(logits, row_base, row_len, row_bin, bitmap, cand, out, ctas=None, gate=None):

@@ -5,7 +5,6 @@ DSA layer, 1 GPU): reference module(s) (REFS, files in this directory) vs this t
 Per arm: ABBA CUDA-event time, NVML energy per layer over a ~3 s loop (J, W, SM MHz)
 and bitwise equality of the candidate regions with the first arm."""
 import importlib.util
-import inspect
 import json
 import os
 import sys
@@ -37,11 +36,8 @@ def main():
     cands = {n: cand.clone() for n, _ in mods}
 
     def launch(n, m):
-        kw = {}
-        if "sched" in inspect.signature(m.score).parameters:
-            kw["sched"] = sp.sched
         m.score(d["q"], d["q_scale"], d["k8"], d["k_sf"], d["w"], sp.row_len, sp.items,
-                sp.cand_base, cands[n].view(torch.bfloat16), rb, mode=m.PUBLISH, **kw)
+                sp.cand_base, cands[n].view(torch.bfloat16), rb, mode=m.PUBLISH)
 
     order = mods + mods[::-1] + mods
     us = {}
