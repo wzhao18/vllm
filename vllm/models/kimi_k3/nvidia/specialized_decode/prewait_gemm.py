@@ -345,9 +345,10 @@ _mod = None
 _lock = threading.Lock()
 
 # Per-T launch config (C split-K CTAs per cluster, KB 64-wide K blocks per stage, NS stages,
-# NW weight-producer warps, XL activation-producer warps), measured on VR200 for the
-# [4480, 7168] router|latent concat (GEMM-EX2 sweeps run5 / run 1120002839).
-CONFIGS = {32: (4, 1, 8, 4, 4), 64: (4, 1, 7, 4, 2), 96: (4, 1, 6, 6, 3)}
+# NW weight-producer warps, XL activation-producer warps) for the [4480, 7168] router|latent
+# concat, chosen in-step on VR200 (D3-32 NVFP4 slice, fastab gemmex2-ab3: the standalone-best
+# n32 (4, 1, 8, 4, 4) was +8.7 us/step slower in-step than (4, 2, 5, 4, 2)).
+CONFIGS = {32: (4, 2, 5, 4, 2), 64: (4, 1, 7, 7, 1), 96: (4, 1, 6, 6, 3)}
 
 
 def _module():
