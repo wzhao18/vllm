@@ -234,17 +234,27 @@ ACT_WARPS = (1, 4, 5, 6, 7)  # warps that may issue activation stages (4-7: befo
 WEIGHT_WARPS = (0, 3, 4, 5, 6, 7)  # warps that may issue weight stages (4-7: before the epilogue)
 STAMP_BYTES = 128  # %globaltimer stamps per CTA after the split flags (see ``kernel``)
 SENTINEL = -1  # an unwritten exchange slot (FP32 bits no BF16 product sums to)
+# Rubin's oversized shared memory (327 KiB per CTA, hwdb topic 03; budget 320 KiB): rings past the opt-in limit.
+OVERSIZED_BUDGET = 320 * 1024
 
 
-def _rings(rows, wstages=None):
+def _rings(rows, wstages=None, astages=None):
     """(weight stages, activation stages, ring bytes): separate rings, the weight
     ring as deep as the activation ring (>= min(4, weight stages)) leaves room for,
     so most of a split's weights are staged before the PDL wait. ``wstages`` caps
-    the weight ring (the activation ring takes the rest, up to 16)."""
+    the weight ring (the activation ring takes the rest, up to 16). ``astages`` (with
+    ``wstages``) fixes both; rings past the opt-in limit use Rubin's oversized shared
+    memory (``OVERSIZED_BUDGET``)."""
     n_mma, chunks = mma_columns(rows)
     a_bytes = 128 * K_TILE * 2
     b_bytes = chunks * (n_mma // 2) * K_TILE * 2
     budget = utils.get_smem_capacity_in_bytes("sm_100") - 4096
+    if astages is not None:
+        assert wstages is not None, "astages needs wstages"
+        ring = wstages * a_bytes + astages * b_bytes
+        if astages < 2 or ring > OVERSIZED_BUDGET - 4096:
+            raise ValueError(f"wide GEMM: {wstages} + {astages} stages do not fit")
+        return wstages, astages, ring
     if wstages is not None:
         acts = min(16, (budget - wstages * a_bytes) // b_bytes)
         if acts < 2:
@@ -290,7 +300,7 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False):  # fmt: skip
+                 partials=False, astages=None):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
@@ -310,7 +320,9 @@ class WideGemm:
         self.n_mma, self.chunks = mma_columns(rows)
         self.mma_tiler = (256, self.n_mma, K_TILE)
         self.threads = 256  # warps: 0+3 weights, 1 activations, 2 MMA, 4-7 epilogue
-        self.wstages, self.astages, _ = _rings(rows, wstages)
+        self.wstages, self.astages, ring = _rings(rows, wstages, astages)
+        # Past the opt-in limit the launch requests the oversized shared memory.
+        self.smem = OVERSIZED_BUDGET if ring > utils.get_smem_capacity_in_bytes("sm_100") - 4096 else None
         self.maxreg = -(-rows // split)  # tokens per owner (largest region)
         self.uneven = rows % split != 0
         self.tmem_cols = 32
@@ -370,16 +382,27 @@ class WideGemm:
             ]
 
         self.storage = Storage
-        self.kernel(
+        kernel = self.kernel(
             tiled_mma, tma_a, tma_w, tma_b, tma_x, cluster_vmnk, a_layout, b_layout,
             y, ws, flags,
-        ).launch(  # fmt: skip
-            grid=(2 * (self.n_pad // 256), self.split, 1),
-            block=[self.threads, 1, 1],
-            cluster=(2, 1, 1),
-            stream=stream,
-            use_pdl=True,
-        )
+        )  # fmt: skip
+        if cutlass.const_expr(self.smem is not None):
+            kernel.launch(
+                grid=(2 * (self.n_pad // 256), self.split, 1),
+                block=[self.threads, 1, 1],
+                cluster=(2, 1, 1),
+                smem=self.smem,
+                stream=stream,
+                use_pdl=True,
+            )
+        else:
+            kernel.launch(
+                grid=(2 * (self.n_pad // 256), self.split, 1),
+                block=[self.threads, 1, 1],
+                cluster=(2, 1, 1),
+                stream=stream,
+                use_pdl=True,
+            )
 
     @cute.kernel
     def kernel(
@@ -875,22 +898,23 @@ class PreparedWide:
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
-        # [, weight issuer warps[, direct exchange[, rotate]]]]]) (``WideGemm`` arguments)
+        # [, weight issuer warps[, direct exchange[, rotate[, activation stages]]]]]])
+        # (``WideGemm`` arguments)
         self.policies = {}
         for r, v in dict(policies).items():
             v = (v,) if isinstance(v, int) else tuple(v)
-            v += ((1,), None, (0, 3), False, False)[len(v) - 1:]
-            self.policies[r] = (v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]))
+            v += ((1,), None, (0, 3), False, False, None)[len(v) - 1:]
+            self.policies[r] = (v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), v[6])
         self.kernels, self.state = {}, {}
 
     def prepare(self):
         dev = self.weight.device
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
-        for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
+        for rows, (split, act_warps, wst, w_warps, direct, rotate, ast) in self.policies.items():
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials,
+                w_warps, direct, rotate, self.partials, ast,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
