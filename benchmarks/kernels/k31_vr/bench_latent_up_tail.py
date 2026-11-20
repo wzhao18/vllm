@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""MegaMoE latent up-projection behind a predecessor that releases it early.
+
+In-step the latent up-projection follows the MegaMoE top-k reduce, which polls its
+combine cells for several microseconds. This bench stands a 1-CTA spin kernel (PDL
+trigger at entry, then ``--window`` ns of spinning) in for the reduce and times
+``spin -> latent_up`` vs ``spin`` alone in CUDA graphs, with the weights rotated over
+``--copies`` layers (cold in L2 as in-step):
+
+  exposed = (graph(spin + op) - graph(spin)) / iterations
+
+for stock's cuBLAS ``residual.addmm_`` and ``gemm.latent_up`` (PDL, weights staged
+before its wait). ``--window 0`` = back to back without a predecessor window."""
+
+import argparse
+import json
+
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass import Int64
+from cutlass.cute.runtime import make_fake_stream
+
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+    architecture,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+    stream as current_stream,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import asm
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.latent_up import (
+    PreparedLatentUp,
+)
+
+
+@asm(Int64)
+def _now():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
+
+
+class Spin:
+    @cute.experimental.jit
+    def __call__(self, ns: Int64, stream):
+        self.kernel(ns).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.experimental.kernel
+    def kernel(self, ns: Int64):
+        cute.arch.griddepcontrol_launch_dependents()
+        start = _now()
+        while _now() - start < ns:
+            pass
+
+
+def graph_time(fn, reps):
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        fn()  # warm
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(reps):
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        g.replay()
+        b.record()
+        b.synchronize()
+        times.append(a.elapsed_time(b) * 1e3)
+    times.sort()
+    return times[len(times) // 2]
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--tokens", default="32,64,96")
+    p.add_argument("--window", type=int, default=6000, help="spin ns before each op")
+    p.add_argument("--copies", type=int, default=6)
+    p.add_argument("--iters", type=int, default=12)
+    p.add_argument("--reps", type=int, default=30)
+    p.add_argument("--json", default=None)
+    a = p.parse_args()
+    dev = torch.device("cuda")
+    n, k = 7168, 3584
+    torch.manual_seed(0)
+    ws = [torch.randn(n, k, device=dev, dtype=torch.bfloat16) * 0.02 for _ in range(a.copies)]
+    arch = architecture(dev)
+    spin = cute.experimental.compile(
+        Spin(), Int64(0), make_fake_stream(), options=f"--gpu-arch={arch}"
+    )
+
+    def spin_once():
+        spin(Int64(a.window), current_stream(dev))
+
+    results = []
+    for t in (int(v) for v in a.tokens.split(",")):
+        x = torch.randn(t, k, device=dev, dtype=torch.bfloat16)
+        res = [torch.randn(t, n, device=dev, dtype=torch.bfloat16) for _ in range(a.copies)]
+        ups = [PreparedLatentUp(w, (t,)).prepare() for w in ws]
+        # correctness vs stock on copy 0
+        ref = res[0].clone().addmm_(x, ws[0].t())
+        out = res[0].clone()
+        ups[0].run(x, out)
+        err = (out.float() - ref.float()).abs().max().item()
+
+        def body(op, with_spin):
+            def fn():
+                for i in range(a.iters):
+                    if with_spin:
+                        spin_once()
+                    if op == "cublas":
+                        res[i % a.copies].addmm_(x, ws[i % a.copies].t())
+                    elif op == "tmem":
+                        ups[i % a.copies].run(x, res[i % a.copies])
+            return fn
+
+        base = graph_time(body(None, True), a.reps) if a.window else 0.0
+        row = {"tokens": t, "window_ns": a.window, "max_abs_err_vs_addmm": err}
+        for op in ("cublas", "tmem"):
+            total = graph_time(body(op, a.window > 0), a.reps)
+            row[op + "_us"] = round((total - base) / a.iters, 3)
+        row["spin_us"] = round(base / a.iters, 3) if a.window else 0.0
+        print(json.dumps(row), flush=True)
+        results.append(row)
+    if a.json:
+        with open(a.json, "w") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
+
+
+if __name__ == "__main__":
+    main()

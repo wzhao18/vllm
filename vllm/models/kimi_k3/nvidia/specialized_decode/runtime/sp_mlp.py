@@ -32,6 +32,7 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from ...mxfp8 import is_mxfp8_linear
 from .. import prewait_gemm
 from ..cutedsl.gemm.decode import DecodeProjection
+from ..cutedsl.gemm.latent_up import PreparedLatentUp
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
 from ..cutedsl.moe.route_stage import RouteStage, route_stage_cause
@@ -262,6 +263,16 @@ class SpMlp:
 
             prepare_output_rmsnorm(mlp.experts, norm)
             self.fused_norm = norm
+        # The fused path ends with that reduce, which releases its dependents at
+        # entry: the latent up-projection streams its weight on chip while the reduce
+        # still polls its cells (``gemm.latent_up``). Per-shape: other rows keep
+        # ``gemms["latent_up"]``.
+        self.latent_up = None
+        if self.fused_shared is not None and self.fused_norm is not None:
+            up_rows = tuple(r for r in self.rows if PreparedLatentUp.supports(r))
+            if up_rows:
+                self.latent_up = PreparedLatentUp(weights["latent_up"], up_rows)
+                self.latent_up.prepare()
 
     def choices(self, n):
         """The four GEMM families' choices at ``n`` shard rows."""
@@ -341,10 +352,13 @@ class SpMlp:
                     kwargs["fused_shared"] = shared
                 return mlp.experts(routed, router_output, topk_ids, **kwargs)
 
+        tail = None
         if self.fused_shared is not None and mlp.experts.fused_shared(n):
             if not prequantized:
                 gemms["shared_gu"].input.quantize(h)
             final, shared_out = experts(self.fused_shared)
+            if fused_norm is not None and self.latent_up is not None:
+                tail = self.latent_up if n in self.latent_up.kernels else None
         elif mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
                 experts,
@@ -359,6 +373,8 @@ class SpMlp:
         norm = mlp.routed_output_transform.norm
         if norm is not None and fused_norm is None:
             final = norm(final)
+        if tail is not None:
+            return tail.run(final, shared_out)
         return gemms["latent_up"].run(final, residual=shared_out)
 
 

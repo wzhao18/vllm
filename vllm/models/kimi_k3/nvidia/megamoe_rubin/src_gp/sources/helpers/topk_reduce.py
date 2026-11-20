@@ -953,9 +953,9 @@ class TopkReduce:
         Without ``producer_arrivals`` that is the producer grid's completion. With it, every producer CTA
         release-adds 1 once its stores are drained; acquiring the full count orders those stores before
         this grid's completion without waiting for the producer's tail (reset, peer signals, exit). The
-        count is re-armed here: all arrivals of this call are in, and this grid never triggers its
-        dependents early, so nothing after it in the stream (the next call's producer included) starts
-        before this CTA exits."""
+        count is re-armed here: all arrivals of this call are in, and nothing after this grid in the stream
+        that touches the count starts before this CTA exits (the next call's producer is a normal launch;
+        the fused-norm form's early-released dependent waits for this grid before reading anything)."""
         if cutlass.const_expr(self.producer_arrivals is None):
             cute.arch.griddepcontrol_wait()
         else:
@@ -980,7 +980,12 @@ class TopkReduce:
         """vLLM-local E2a on the polled plane: ``_reduce_bf16_ll`` of one token row per CTA (thread = one 8-wide
         hidden tile; same poll, top-k order and FP32 FMA form, same cell reset), then the stock vLLM ``rms_norm`` of
         the BF16-rounded row: FP32 sum of squares of the BF16 values, ``s = rsqrt(sum / hidden + eps)``,
-        ``out = bf16(x * s * w)``. Writes only the normalized row (its sole consumer)."""
+        ``out = bf16(x * s * w)``. Writes only the normalized row (its sole consumer).
+
+        Releases its programmatic dependents at entry: the consumer (the latent up-projection) stages its
+        weights while the cells are still in flight and reads the row only after its own PDL wait, i.e.
+        after this grid's completion. Normal launches after this grid are unaffected."""
+        cute.arch.griddepcontrol_launch_dependents()
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
