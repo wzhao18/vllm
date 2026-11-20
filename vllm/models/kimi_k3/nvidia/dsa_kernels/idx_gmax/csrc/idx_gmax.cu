@@ -14,7 +14,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "mqa_logits_gmax.cuh"
 

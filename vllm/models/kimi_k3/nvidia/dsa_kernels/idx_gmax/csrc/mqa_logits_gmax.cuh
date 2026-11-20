@@ -486,12 +486,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     const bool valid = seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i];
                     if (valid)
                         ptx::st_global_low_bf16(output_bases[i] + kv_offset, result);
-                    // the top-k's order-preserving key: x ^ 0x8000 (x >= 0), x ^ 0xFFFF (x < 0),
-                    // NaN -> 0 (counted per row: the top-k derives its valid-key count from it)
+                    // gmax input: the raw bf16 logit, -inf outside the row (a NaN propagates
+                    // into its group max; the top-k sends such rows to its exact NaN path)
                     const uint32_t raw = static_cast<uint32_t>(__bfloat16_as_ushort(__low2bfloat16(result)));
-                    const bool nan = (raw & 0x7FFFu) > 0x7F80u;
-                    if (valid and nan) atomicAdd(nan_count + task.q_token_base + i, 1);
-                    return (valid and not nan) ? (raw ^ ((raw >> 15) ? 0xFFFFu : 0x8000u)) : 0u;
+                    return valid ? raw : 0xFF80u;
                 };
                 const auto reduce_pairs = [&](const float* chunk, const nv_bfloat162* chunk_weights, const uint32_t& num_heads,
                                               nv_bfloat162& sum_0, nv_bfloat162& sum_1) {
@@ -538,11 +536,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     uint32_t gw[kNumPairs];
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumPairs; ++ j) {
-                        gw[j] = gk[2 * j] | ((2 * j + 1 < kNumValidTokens ? gk[2 * j + 1] : 0u) << 16);
+                        gw[j] = gk[2 * j] | ((2 * j + 1 < kNumValidTokens ? gk[2 * j + 1] : 0xFF80u) << 16);
                         #pragma unroll
                         for (uint32_t o = 1; o < 8; o <<= 1) {
                             const uint32_t other = __shfl_xor_sync(0xffffffffu, gw[j], o);
-                            asm("max.u16x2 %0, %0, %1;" : "+r"(gw[j]) : "r"(other));
+                            asm("max.NaN.bf16x2 %0, %0, %1;" : "+r"(gw[j]) : "r"(other));
                         }
                     }
                     if ((lane_idx & 7u) == 0u) {

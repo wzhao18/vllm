@@ -116,15 +116,19 @@ def main():
         valid = cols[None, :] < L[:, None]
         rb, ob = ref.view(torch.int16), out.view(torch.int16)
         lmism = int(((rb != ob) & valid).sum())
+        # gmax = the group's max logit as raw bf16 (NaN if the group holds one; -inf
+        # outside [0, L)); compared as order-preserving keys, a NaN group as 0xFFFF
         k, nan = keys_of(out)
+        k = torch.where(nan, torch.full_like(k, 0xFFFF), k)
         k = torch.where(valid, k, torch.zeros_like(k))
         ng = (ref.shape[1] + 7) // 8
         kp = torch.nn.functional.pad(k, (0, ng * 8 - k.shape[1]))
         gref = kp.view(rows, ng, 8).amax(-1)
         gvalid = (torch.arange(ng, device=dev)[None, :] * 8) < L[:, None]
-        got = gm[:, :ng].to(torch.int32) & 0xFFFF
-        gmism = int(((got != gref) & gvalid).sum())
-        nref = (nan & valid).sum(-1)
+        kg, ngn = keys_of(gm[:, :ng].contiguous())
+        kg = torch.where(ngn, torch.full_like(kg, 0xFFFF), kg)
+        gmism = int(((kg != gref) & gvalid).sum())
+        nref = torch.zeros_like(nanc[:rows])
         nmism = int((nanc[:rows] != nref).sum())
         t_stock = graph_us(stock)
         nanc.zero_()
