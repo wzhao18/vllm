@@ -373,19 +373,23 @@ class DcpExchange:
         stats: torch.Tensor | None = None,
         dbg: torch.Tensor | None = None,
         interleave: int | None = None,
+        gmax: torch.Tensor | None = None,
+        nanc: torch.Tensor | None = None,
     ) -> None:
         """Exact global top-K, one CTA per row (csrc/topk_v2.cuh): the same selection and
         output as topk_merge (ties at the K-th key by ascending global id; this rank's
         tokens above it in position order, then its selected ties in position order).
         stats: optional int32[8] row counters (0 exchanged, 1 one round, 2 tie round,
         3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
-        [rows * 64] per-row phase stamps. Launches must stay stream-ordered."""
-        self.ext.topk_v2(
+        [rows * 64] per-row phase stamps. gmax / nanc: the fused producer's outputs
+        (idx_gmax.paged_logits_gmax on the same logits): the hot rows read only the groups
+        that can hold a candidate. Launches must stay stream-ordered."""
+        self.ext.topk_v2_gm(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,
             self.v2_peers, self.W, self.rank, self.K, self.cap,
             self.interleave if interleave is None else interleave,
-            self.v2_epoch, self.err, stats, dbg,
+            self.v2_epoch, self.err, stats, dbg, gmax, nanc,
         )  # fmt: skip
 
     def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:

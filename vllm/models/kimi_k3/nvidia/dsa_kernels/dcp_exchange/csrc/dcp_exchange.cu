@@ -3249,13 +3249,15 @@ int64_t topk_v2_resident_of(int* wide) {
 }
 int64_t topk_v2_resident() { return topk_v2_resident_of(nullptr); }
 
-void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
+// gmax / nanc: the fused producer's per-row group max keys and NaN counts (idx_gmax), or none
+void topk_v2_impl(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
              torch::Tensor out, torch::Tensor out_count, c10::optional<torch::Tensor> block_table,
              int64_t block_size, int64_t block_stride, int64_t next_n,
              c10::optional<torch::Tensor> req_of_row, int64_t box, int64_t mc, torch::Tensor peers,
              int64_t W, int64_t rank, int64_t K, int64_t cap, int64_t interleave,
              torch::Tensor epoch, torch::Tensor err,
-             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg) {
+             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg,
+             c10::optional<torch::Tensor> gmax, c10::optional<torch::Tensor> nanc) {
   TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
   TORCH_CHECK(W >= 1 && W <= kV2MaxW, "topk_v2: DCP size must be in [1, 8]");
   TORCH_CHECK(K >= 1 && K <= kMaxK, "topk_v2: K must be in [1, 2048]");
@@ -3293,6 +3295,17 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
   TORCH_CHECK(!dbg.has_value() || dbg->numel() >= (int64_t)kV2Dbg * T, "topk_v2: dbg too small");
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  TORCH_CHECK(gmax.has_value() == nanc.has_value(), "topk_v2: gmax and nanc go together");
+  if (gmax.has_value()) {
+    TORCH_CHECK(gmax->element_size() == 2 && gmax->stride(1) == 1 && gmax->stride(0) % 8 == 0 &&
+                    gmax->size(0) >= T && gmax->stride(0) * 8 >= p.lcols &&
+                    reinterpret_cast<uintptr_t>(gmax->data_ptr()) % 16 == 0,
+                "topk_v2: gmax [>= rows, >= cols / 8] int16 with 16-byte rows");
+    TORCH_CHECK(nanc->scalar_type() == torch::kInt32 && nanc->numel() >= T, "topk_v2: nanc int32 [>= rows]");
+    p.gmax = reinterpret_cast<const uint16_t*>(gmax->data_ptr());
+    p.gstride = gmax->stride(0);
+    p.nanc = nanc->data_ptr<int>();
+  }
   int nwide = 0;
   const int nres = (int)topk_v2_resident_of(&nwide);
   TORCH_CHECK(nres >= 1, "topk_v2: no resident CTA");
@@ -3319,8 +3332,21 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
 
+void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
+             torch::Tensor out, torch::Tensor out_count, c10::optional<torch::Tensor> block_table,
+             int64_t block_size, int64_t block_stride, int64_t next_n,
+             c10::optional<torch::Tensor> req_of_row, int64_t box, int64_t mc, torch::Tensor peers,
+             int64_t W, int64_t rank, int64_t K, int64_t cap, int64_t interleave,
+             torch::Tensor epoch, torch::Tensor err,
+             c10::optional<torch::Tensor> stats, c10::optional<torch::Tensor> dbg) {
+  topk_v2_impl(logits, local_len, global_len, out, out_count, block_table, block_size, block_stride, next_n,
+               req_of_row, box, mc, peers, W, rank, K, cap, interleave, epoch, err, stats, dbg, c10::nullopt,
+               c10::nullopt);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_v2", &topk_v2);
+  m.def("topk_v2_gm", &topk_v2_impl);
   m.def("topk_v2_layout", &topk_v2_layout);
   m.def("topk_v2_resident", &topk_v2_resident);
   m.def("topk_merge", &topk_merge);

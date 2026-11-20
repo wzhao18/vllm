@@ -95,6 +95,11 @@ struct V2Params {
   long long spin_ns;
   int* stats;
   long long* dbg;
+  // fused producer (idx_gmax): per row, the max key of every aligned 8-key group of the
+  // logits and the row's NaN count (re-zeroed here); null: the row is sampled from the logits
+  const uint16_t* gmax;
+  int64_t gstride;
+  int* nanc;
 };
 
 // Pairwise NaN-propagating max of 8 bf16 values (two halves; a NaN anywhere shows up).
@@ -303,17 +308,35 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
     const int sh0 = (8 - head0) & 7;
     const int gs_lo = sh0 ? 1 : 0, gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
+    // fused producer: the row's gmax (one u16 per 8-key group, 1/8 of the row's bytes) is
+    // copied instead of the row; the groups that can hold a candidate are read from L2 later
+    const bool gm = kFast && p.gmax != nullptr && sh0 == 0;
     if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
       // the previous row's generic SMEM writes before the async-proxy copy
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      const int n = max(0, gs_hi - gs_lo), c = tid >> 5;
-      const int a = gs_lo + (int)((int64_t)n * c / kV2Cp), b = gs_lo + (int)((int64_t)n * (c + 1) / kV2Cp);
-      const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
-      if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
-      else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+      const int c = tid >> 5;
+      if (gm) {
+        const int n = (min((p.lcols + 7) >> 3, kV2NR * kV2T) + 7) >> 3;  // 16-byte units
+        const int a = (int)((int64_t)n * c / kV2Cp), b = (int)((int64_t)n * (c + 1) / kV2Cp);
+        const uint4* gb = reinterpret_cast<const uint4*>(p.gmax + (int64_t)row * p.gstride);
+        if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
+        else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+      } else {
+        const int n = max(0, gs_hi - gs_lo);
+        const int a = gs_lo + (int)((int64_t)n * c / kV2Cp), b = gs_lo + (int)((int64_t)n * (c + 1) / kV2Cp);
+        const uint4* gb = reinterpret_cast<const uint4*>(lrow - sh0);
+        if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
+        else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
+      }
     }
     const int L = p.local_len[row];
     const int Gl = p.global_len[row];
+    // the producer's NaN count is consumed (and re-zeroed for the next layer) on every row
+    int nan0 = 0;
+    if (p.nanc != nullptr && tid == 0) {
+      nan0 = p.nanc[row];
+      p.nanc[row] = 0;
+    }
     int* orow = p.out + (int64_t)row * p.ostride;
     const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
     const int* btrow = p.block_table != nullptr ? p.block_table + (int64_t)req * p.bt_stride : nullptr;
@@ -378,7 +401,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       __syncthreads();
     };
     // partial head / tail groups (masked, key by key), loaded while the copy lands
-    const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
+    const bool phead = !gm && regp && sh > 0, ptail = !gm && regp && g_hi < ng && g_hi > 0;
     uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
     if (tid == 0 && phead) pg = load_group(0);
     if (tid == 32 && ptail) pg = load_group(g_hi);
@@ -389,7 +412,15 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     if (tid == 32 && ptail) srow[g_hi] = pg;
     __syncthreads();  // histogram zeroed, partial groups in place
     V2DBG(9);
-    if (K31_LIKELY(regp)) {
+    const uint16_t* const sg = reinterpret_cast<const uint16_t*>(srow);  // gmax (gm)
+    if (gm && regp) {
+      // every group's max key: the exact bound the threshold is placed with
+#pragma unroll 1
+      for (int g = tid; g < ng; g += kV2T) {
+        const uint32_t k = sg[g];
+        if (k) atomicAdd(&hist[k >> 4], 1u);
+      }
+    } else if (K31_LIKELY(regp)) {
       // sample: one group in kV2SampleStride (spread over the 8 residues)
 #pragma unroll 1
       for (int g = tid * kV2SampleStride + (tid & 7); g < ng; g += kV2T * kV2SampleStride) {
@@ -423,7 +454,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
       // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
-      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+      // gm: groups whose max reaches theta each hold >= 1 key >= theta, so the suffix of
+      // the gmax histogram reaching q + 256 groups puts theta below the q-th key (exact)
+      const uint32_t sstr = gm ? 1u : (uint32_t)kV2SampleStride;
+      const uint32_t want = (q + 256u + sstr - 1) / sstr;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -440,7 +474,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // the sample's estimate of the q-th key (its coarse bin): the fine histogram is
       // centered there, so rows with a wide upper tail (q-th key more than kV2Fine keys
       // above theta) need no rebase pass
-      const uint32_t want_e = max(1u, q / kV2SampleStride);
+      const uint32_t want_e = max(1u, q / sstr);
       if (ab < want_e && ab + v >= want_e) {
         uint32_t run = ab;
         for (int i = kV2PB - 1; i >= 0; --i) {
@@ -521,9 +555,91 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       V2DBG(26);
       return nv;
     };
+    // the gm path's candidate pass: the groups whose max key reaches thv are listed in
+    // position order (from the SMEM gmax), read once from global memory (L2: the producer
+    // just wrote them) into SMEM staging, and their keys >= thv appended as cand_regp does.
+    // Every listed group holds a candidate, so more than kV2Cand groups is an overflow.
+    // Returns the row's valid-key count on thread 0 (L minus the producer's NaN count).
+    auto cand_gm = [&](int thv) -> uint32_t {
+      constexpr int kGmU = (kV2NR * kV2T) / 8;  // uint4 units reserved for gmax
+      int* const lst = reinterpret_cast<int*>(srow + kGmU);  // kV2Cand group ids
+      uint4* const stg = srow + kGmU + kV2Cand / 4;          // kV2Cand staged groups
+      static_assert(kGmU + kV2Cand / 4 + kV2Cand <= kV2NR * kV2T, "gm SMEM layout");
+      const int tg0 = tid * kV2NR;
+      uint32_t ns = 0;
+#pragma unroll
+      for (int i = 0; i < kV2NR; ++i) ns += (tg0 + i < ng && (int)sg[tg0 + i] >= thv) ? 1u : 0u;
+      uint32_t ntot;
+      int o = (int)v2_scan<T>(ns, V2WS, &ntot);
+      uint32_t nv = 0;
+      if (tid == 0) {
+        nv = (uint32_t)(L - nan0);
+      }
+      if (K31_RARE(ntot > (uint32_t)kV2Cand)) {
+        if (tid == 0) s_cnt = (int)ntot;
+        return nv;
+      }
+#pragma unroll
+      for (int i = 0; i < kV2NR; ++i)
+        if (tg0 + i < ng && (int)sg[tg0 + i] >= thv) lst[o++] = tg0 + i;
+      __syncthreads();
+      const int n = (int)ntot, per = (n + kV2T - 1) / kV2T;
+      const int a0 = min(n, tid * per), a1 = min(n, a0 + per);
+      const uint32_t t2 = v2_th_bf16(thv);
+      const bool kx = thv == 0x8000;
+      auto mask8 = [&](const uint4& r) -> uint32_t {
+        if (!kx) {
+          const uint32_t lo = __byte_perm(v2_ge2(r.x, t2), v2_ge2(r.y, t2), 0x6420);
+          const uint32_t hi = __byte_perm(v2_ge2(r.z, t2), v2_ge2(r.w, t2), 0x6420);
+          return (((lo & 0x08040201u) * 0x01010101u) >> 24) | ((((hi & 0x08040201u) * 0x01010101u) >> 20) & 0xF0u);
+        }
+        const Keys8 k8(r);
+        uint32_t m8 = 0;
+#pragma unroll 1
+        for (int j = 0; j < 8; ++j) m8 |= (k8.key(j) >= (uint32_t)thv ? 1u : 0u) << j;
+        return m8;
+      };
+      uint32_t cnt = 0;
+#pragma unroll 1
+      for (int a = a0; a < a1; a += 4) {
+        uint4 r[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) r[u] = a + u < a1 ? load_group(lst[a + u]) : make_uint4(~0u, ~0u, ~0u, ~0u);
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+          if (a + u < a1) {
+            stg[a + u] = r[u];
+            cnt += __popc(mask8(r[u]));
+          }
+      }
+      V2DBG(24);
+      uint32_t ctot;
+      int c = (int)v2_scan<T>(cnt, V2WS, &ctot);
+      V2DBG(25);
+      if (tid == 0) s_cnt = (int)ctot;
+#pragma unroll 1
+      for (int a = a0; a < a1; ++a) {
+        const uint4 r = stg[a];
+        uint32_t m = mask8(r);
+        const Keys8 k8(r);
+        const int p0 = 8 * lst[a];
+        while (m) {
+          const int j = __ffs(m) - 1;
+          m &= m - 1;
+          if (c < kV2Cand) {
+            cpos[c] = (uint32_t)(p0 + j);
+            ckey[c] = (uint16_t)k8.key(j);
+          }
+          ++c;
+        }
+      }
+      V2DBG(26);
+      return nv;
+    };
     {
       uint32_t nv = 0;
-      if (regp) nv += cand_regp(th);
+      if (gm && regp) nv += cand_gm(th);
+      else if (regp) nv += cand_regp(th);
       const int nfull = regp ? 0 : g_hi - g_lo;
       const int npart = regp ? 0 : ng - max(0, nfull);
       for (int b0 = 0; !kFast && K31_RARE(!regp) && b0 < max(0, nfull) + (npart > 0 ? kV2RegG * kV2T : 0); b0 += kV2RegG * kV2T) {
