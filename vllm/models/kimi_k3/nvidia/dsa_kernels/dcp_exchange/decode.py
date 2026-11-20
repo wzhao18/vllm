@@ -389,13 +389,17 @@ class DcpxDecode:
 
 
 def _reads_counts(impl) -> bool:
-    """Whether the sparse MLA impl's decode reads ``dcp_local_topk_counts`` (the
-    shared ``SparseMLACommonImpl.forward_mqa``)."""
+    """Whether the sparse MLA impl's decode reads ``dcp_local_topk_counts``: the
+    shared ``SparseMLACommonImpl.forward_mqa``, or an override that declares it
+    sends its DCP decode calls there (``dcp_decode_reads_topk_counts``)."""
     from vllm.model_executor.layers.attention.sparse_mla_attention import (
         SparseMLACommonImpl,
     )
 
-    return type(impl).forward_mqa is SparseMLACommonImpl.forward_mqa
+    cls = type(impl)
+    return cls.forward_mqa is SparseMLACommonImpl.forward_mqa or getattr(
+        cls, "dcp_decode_reads_topk_counts", False
+    )
 
 
 def build(model, vllm_config) -> DcpxDecode | None:

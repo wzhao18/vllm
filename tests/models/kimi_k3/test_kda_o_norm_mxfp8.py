@@ -17,7 +17,9 @@ pytestmark = pytest.mark.skipif(
 D = 128
 
 
-@pytest.mark.parametrize("tokens,heads", [(1, 4), (300, 8), (2051, 96)])
+@pytest.mark.parametrize(
+    "tokens,heads", [(1, 4), (300, 8), (2051, 96), (1, 32), (130, 64), (4097, 96)]
+)
 def test_o_norm_mxfp8(tokens, heads):
     """specialized_prefill.kda.o_norm_mxfp8 against kda_norm.rmsnorm_gated_mxfp8:
     same FP8 codes and scales up to rare one-step flips (the sum of squares
