@@ -132,22 +132,22 @@ class SpMlp:
             if rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) == "ltpin"
         )  # fmt: skip
         self.router_latent = self.route_stage = None
-        if (
-            concat_rows
-            and router_concat_cause(mlp) is None
-            and route_stage_cause(mlp) is None
-        ):
-            from ..cutedsl.gemm.ltpin import LtPin
+        if route_stage_cause(mlp) is None:
+            if concat_rows and router_concat_cause(mlp) is None:
+                from ..cutedsl.gemm.ltpin import LtPin
 
-            packed = pack_router_latent(mlp)
-            n, k = packed.shape
-            self.router_latent = (
-                packed,
-                LtPin("router_latent", n, k, concat_rows, out32=True,
-                      device=packed.device),
-                mlp.gate.weight.shape[0],
-            )  # fmt: skip
-            self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
+                packed = pack_router_latent(mlp)
+                n, k = packed.shape
+                self.router_latent = (
+                    packed,
+                    LtPin("router_latent", n, k, concat_rows, out32=True,
+                          device=packed.device),
+                    mlp.gate.weight.shape[0],
+                )  # fmt: skip
+            # Every shard row stages through route_stage: the concatenated GEMM's
+            # FP32 rows on its plans, else the stock router GEMM's FP32 logits
+            # and the latent down's BF16 rows (split input).
+            self.route_stage = RouteStage(mlp, self.rows)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -265,15 +265,29 @@ class SpMlp:
 
         fused_norm = self.fused_norm
         route = self.route_stage
+        concat = self.router_latent
         if route is not None and route.ready(n):
-            # Router | latent down as one FP32 GEMM, then one kernel stages its
-            # top-k routes and the quantized latent into MegaMoE (route_stage).
-            packed, gemm, _ = self.router_latent
-            y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
-            gemm.run(packed, h, y)
+            if concat is not None and n in concat[1].plans:
+                # Router | latent down as one FP32 GEMM, then one kernel stages
+                # its top-k routes and the quantized latent into MegaMoE.
+                packed, gemm, _ = concat
+                y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
+                gemm.run(packed, h, y)
+                staged = route.stage(y)
+            else:
+                # The stock pair (router GEMM || latent down), then the same one
+                # kernel on its FP32 logits and BF16 latent: no separate top-k
+                # or stager launch.
+                logits, routed = maybe_execute_in_parallel(
+                    lambda: mlp.gate(h)[0],
+                    down,
+                    mlp._down_proj_events[0],
+                    mlp._down_proj_events[1],
+                    mlp._down_proj_stream if n <= self.threshold else None,
+                )
+                staged = route.stage(logits, routed)
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
-            staged = route.stage(y)
 
             def experts(shared=None):
                 return route.launch(staged, fused_norm, shared)
