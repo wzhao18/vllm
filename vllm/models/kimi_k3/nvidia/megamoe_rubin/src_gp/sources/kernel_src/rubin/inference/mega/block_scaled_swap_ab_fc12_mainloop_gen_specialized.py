@@ -1146,8 +1146,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         ab_pipeline_state: pipeline.PipelineState,
         expected_tx: Optional[Int32] = None,
         dms_u=None,
+        progress_mbarrier=None,
     ) -> pipeline.PipelineState:
-        """Load one tile's A/SFA k tiles; ``kind`` bundles MMA, tiler, template views, SMEM tensors and extension."""
+        """Load one tile's A/SFA k tiles; ``kind`` bundles MMA, tiler, template views, SMEM tensors and extension.
+
+        ``progress_mbarrier`` (claim gate): arrived once per tile when the k tiles still to issue fit in the weight
+        ring, so the scheduler claims the next unit one ring depth before this one's last weight load instead of
+        at its first one (every pair holds one unit at launch, and claims stay close to when they start).
+        """
         (
             tiled_mma,
             mma_tiler_mnk,
@@ -1191,6 +1197,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         # evicting the token payload, scale factors and FC1 outputs that later units re-read.
         weight_policy = make_l2_evict_first_policy()
         _dms_c00 = read_clock64()
+        progress_k_tile = k_tile_count - Int32(self.num_weight_ab_stages)
+        if progress_k_tile < Int32(0):
+            progress_k_tile = Int32(0)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         _dms_w = read_clock64() - _dms_c00
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -1214,6 +1223,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 global_sfa_slice[(None, k_tile_idx)],
                 partitioned_smem_sfa[(None, stage_index)],
             )
+            if cutlass.const_expr(progress_mbarrier is not None):
+                if k_tile_idx == progress_k_tile:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(progress_mbarrier)
         DG.put_val_dyn(
             Int32(DG.S_TAW0) + (dms_u & Int32(15)),
             ((read_clock64() - _dms_c00) << Int64(32)) | _dms_w,
@@ -1294,9 +1307,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         routed_shared_sfa2 = None if self.heterogeneous_shared else shared_fc2_sfa_exec_atom
 
         work_tile = sched_consumer.consume_work()
-        if cutlass.const_expr(progress_mbarrier is not None):
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive(progress_mbarrier)
         _dms_u = Int32(0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
@@ -1335,6 +1345,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         ab_pipeline_state,
                         Int32(self.shared_weight_tx_count),
                         dms_u=_dms_u - Int32(1),
+                        progress_mbarrier=progress_mbarrier,
                     )
                 else:
                     ab_pipeline_state = self._issue_tma_a_tile(
@@ -1348,6 +1359,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         ab_pipeline,
                         ab_pipeline_state,
                         dms_u=_dms_u - Int32(1),
+                        progress_mbarrier=progress_mbarrier,
                     )
             else:
                 ab_pipeline_state = self._issue_tma_a_tile(
@@ -1363,12 +1375,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     ab_pipeline,
                     ab_pipeline_state,
                     dms_u=_dms_u - Int32(1),
+                    progress_mbarrier=progress_mbarrier,
                 )
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
-            if cutlass.const_expr(progress_mbarrier is not None):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(progress_mbarrier)
 
         if cutlass.const_expr(trigger_dependents_when_drained):
             # No work is left to claim: this CTA's last tile is already in flight, so
