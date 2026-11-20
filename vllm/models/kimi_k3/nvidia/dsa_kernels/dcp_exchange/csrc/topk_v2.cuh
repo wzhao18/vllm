@@ -242,6 +242,55 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
   __shared__ uint32_t s_cgab;
   const int tid = threadIdx.x, W = p.W, K = p.K;
   uint32_t ws_par = 0;
+  __shared__ uint32_t s_cgt[kV2MaxW];  // round-1 window totals
+  if ((tid >> 5) < W) {  // warp r: rank r's window total
+    const uint32_t* s = rx + (tid >> 5) * kV2Msg;
+    uint32_t c = 0;
+    for (int u = tid & 31; u < kV2Win; u += 32) c += v2_cnt(s, u);
+    for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+    if ((tid & 31) == 0) s_cgt[tid >> 5] = c;
+  }
+  __syncthreads();
+  // tighten the bracket with step bounds from the round-1 words (no scans): rank s's count
+  // of keys >= x lies in [A_s + T_s, x >= th_s ? nc_s : V_s] below its window [l_s, l_s +
+  // 256), in [A_s, A_s + T_s] inside it and in [0, A_s] above it (A above-window count, T
+  // window total, V valid keys); tau (the largest x whose true count reaches K) lies between
+  // the largest x whose lower sum reaches K and the largest whose upper sum does. The sums
+  // only change at l_s, l_s + 256 and th_s: lane i of warp 0 tests one such point.
+  __shared__ int s_cgb[2];
+  if (tid < 32) {
+    auto bnd = [&](int x, bool up) -> uint32_t {
+      uint32_t g = 0;
+      for (int r = 0; r < W; ++r) {
+        const uint32_t* s = rx + r * kV2Msg;
+        const int l = (int)(s[0] & 0xFFFFu), th = (int)(s[6] & 0xFFFFu);
+        const uint32_t A = s[1] & 0xFFFFFFu, Tw = s_cgt[r];
+        if (x >= l + kV2Win) g += up ? A : 0u;
+        else if (x >= l) g += up ? A + Tw : A;
+        else g += up ? (x >= th ? (s[7] & 0xFFFFFFu) : (s[4] & 0xFFFFFFu)) : A + Tw;
+      }
+      return g;
+    };
+    int lb = -1, ub = -1;
+    if (tid <= 3 * W) {
+      int x = 0xFFFF;
+      bool lbp = false;
+      if (tid < 3 * W) {
+        const uint32_t* s = rx + (tid / 3) * kV2Msg;
+        const int k = tid % 3, l = (int)(s[0] & 0xFFFFu), th = (int)(s[6] & 0xFFFFu);
+        x = k == 0 ? l - 1 : (k == 1 ? l + kV2Win - 1 : th - 1);
+        lbp = k < 2;
+      }
+      if (x >= 1 && x <= 0xFFFF) {
+        if (lbp && bnd(x, false) >= (uint32_t)K) lb = x;
+        if (bnd(x, true) >= (uint32_t)K) ub = x;
+      }
+    }
+    lb = __reduce_max_sync(0xffffffffu, lb);
+    ub = __reduce_max_sync(0xffffffffu, ub);
+    if (tid == 0) { s_cgb[0] = lb; s_cgb[1] = ub; }
+  }
+  __syncthreads();
   if (tid == 0) {
     int lo2 = 0, hi2 = -1;
     bool ok = true;
@@ -252,6 +301,8 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
       hi2 = max(hi2, (int)(w5 & 0xFFFFu));
       lo2 = max(lo2, (int)(s[6] & 0xFFFFu));
     }
+    lo2 = max(lo2, s_cgb[0]);
+    if (s_cgb[1] >= 0) hi2 = min(hi2, s_cgb[1]);
     int sh = 0;
     while (sh < 8 && hi2 - lo2 >= (kCgBins << sh)) ++sh;
     s_cg[0] = (ok && lo2 >= 1 && hi2 >= lo2) ? lo2 : -1;
@@ -1064,7 +1115,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // for the CG rounds: the exact q-th key and theta
       msg[5] = tagw(tag, pdone ? ((uint32_t)s_e | (1u << 16)) : 0u);
       msg[6] = tagw(tag, (uint32_t)th);
-      msg[7] = tagw(tag, 0u);
+      msg[7] = tagw(tag, (uint32_t)nc);
     }
     // the whole slot goes out (unused band words tagged), so one poll pass reads it
     const int words = kV2Msg;
