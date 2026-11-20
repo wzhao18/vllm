@@ -1486,7 +1486,9 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
 
         def spy(query, cache_, *rest):
             rec["t"] = [query] + [t for t in rest if isinstance(t, torch.Tensor)]
-            return inner(query, cache_, *rest)
+            res = inner(query, cache_, *rest)
+            rec["o"] = [t for t in res if isinstance(t, torch.Tensor)]
+            return res
 
         if fi is not None:
             fi.decode = spy
@@ -1514,12 +1516,17 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         _barrier()
         if fi is not None:
             fi.decode = inner
-        for k in range(4):
+        for k in range(8):
             _prep()
+            if k >= 2:  # the decode outputs poisoned before the replay
+                for t in rec.get("o", []):
+                    t.fill_(100.0 if t.dim() > 2 else 50.0)
+                torch.accelerator.synchronize()
             _barrier()
             graph.replay()
             torch.accelerator.synchronize()
-            _snap(f"replay{k}", replayed)
+            _snap(f"replay{k}{'p' if k >= 2 else ''}", replayed)
+        print(f"DBG4 {where} decode outputs {[tuple(t.shape) for t in rec.get('o', [])]}")
         base = states[0]
         for tag, out, att, ts in states:
             tdiff = [_d(a, b) for a, b in zip(ts, base[3])]
