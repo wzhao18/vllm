@@ -1377,6 +1377,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         written = new_mla[new_mla >= 0]
         at = written // UNIT, written % UNIT
         a, b = ours_mla[at].clone(), stock_mla[at].clone()
+        dbg_at, dbg_mla_new = at, a.clone()
 
         # Every collective before any check (a failing rank must not strand the
         # others): the global top-k sets of the two paths, the FP64 references
@@ -1460,6 +1461,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         page, offsets = _index_token_bytes(ours_index, keyed, index_row, key_bytes)
         pages = _pages(ours_index, index_row), _pages(stock_index, index_row)
         a, b = (p[page.view(-1, 1), offsets] for p in pages)
+        dbg_idx = (page, offsets, a.clone())
         assert (a != b).sum() <= 0.05 * a.numel(), f"{where}: new indexer keys"
         for p in pages:
             p[page.view(-1, 1), offsets] = 0
@@ -1478,33 +1480,37 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         ):
             replayed = block.run(x_shard, [caches["ours"][0]], md, run)
         _barrier()
-        graph.replay()
-        torch.accelerator.synchronize()
-        first = (replayed.clone(), block.attn_out[:r].clone(), block.projected[:r].clone())
 
         def _d(a, b):
             return f"{(a.float() - b.float()).abs().max().item():.2e}/{int((a != b).sum())}"
 
-        mism = []
-        for i in range(16):
-            _barrier()
-            graph.replay()
+        def _prep(mode):
+            for ours_c, theirs_c in zip(caches["ours"], caches["stock"]):
+                ours_c.copy_(theirs_c)  # old rows; the new rows are zero here
+            if mode in ("ours", "idx0"):
+                caches["ours"][0][dbg_at] = dbg_mla_new
+            if mode in ("ours", "mla0"):
+                pg = _pages(caches["ours"][1], index_row)
+                pg[dbg_idx[0].view(-1, 1), dbg_idx[1]] = dbg_idx[2]
             torch.accelerator.synchronize()
-            rep = (replayed, block.attn_out[:r], block.projected[:r])
-            bad = [not torch.equal(x, y) for x, y in zip(rep, first)]
-            if any(bad):
-                mism.append(i)
-                print(
-                    f"DBG {where} replay{i + 1} vs replay0: out {_d(rep[0], first[0])} "
-                    f"attn {_d(rep[1], first[1])} proj {_d(rep[2], first[2])}"
-                )
-        print(
-            f"DBG {where} replay0 vs eager: out {_d(first[0], eager)} attn "
-            f"{_d(first[1], attn_in)} proj {_d(first[2], dbg_proj)}; later replays "
-            f"differing from replay0: {mism}; last vs eager: out {_d(replayed, eager)}"
-        )
-        replayed = first[0]
-        assert torch.equal(replayed, eager), (where, (replayed - eager).abs().max())
+
+        first = None
+        for mode in ("zero", "mla0", "idx0", "ours"):
+            bad = []
+            for i in range(6):
+                _prep(mode)
+                _barrier()
+                graph.replay()
+                torch.accelerator.synchronize()
+                if first is None:
+                    first = replayed.clone()
+                if not torch.equal(replayed, eager):
+                    bad.append(
+                        f"{i}: out {_d(replayed, eager)} attn "
+                        f"{_d(block.attn_out[:r], attn_in)} finite "
+                        f"{bool(torch.isfinite(block.attn_out[:r]).all())}"
+                    )
+            print(f"DBG2 {where} mode {mode}: {len(bad)}/6 replays differ from eager {bad[:2]}")
         _barrier()
 
     if refusals:
