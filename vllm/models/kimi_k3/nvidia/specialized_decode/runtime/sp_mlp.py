@@ -27,7 +27,7 @@ fallback for a planned row."""
 
 import torch
 
-_EP32_SPIN = 12000  # EP32DIAG cycles
+_EP32_SPIN = 24000  # EP32DIAG cycles
 
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
