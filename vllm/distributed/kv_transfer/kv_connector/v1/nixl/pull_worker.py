@@ -194,12 +194,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             return
 
-        peer = self._sub_block_peers.get(engine_id)
-        sub_blocks = peer.sub_blocks if peer is not None else 1
-        if meta.remote.sub_blocks != sub_blocks:
-            # The scheduler expanded P's block ids for a different sub-block
-            # count than the handshake found (P/D skew, e.g. an older P that
-            # does not advertise its block size): reading would scramble KV.
+        if (sub_blocks := self._sub_block_skew(engine_id, meta)) is not None:
             error = RuntimeError(
                 f"NIXL sub-block skew for {req_id}: the scheduler expanded P's "
                 f"blocks x{meta.remote.sub_blocks}, the handshake with engine "
@@ -487,6 +482,22 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             remote_agent_name=agent,
                         )
                         self.xfer_stats.record_failed_notification()
+
+    def _sub_block_skew(self, engine_id: str, meta: ReqMeta) -> int | None:
+        """The sub-block count the handshake with engine_id found, when the
+        scheduler expanded this request's P block ids for a different one (P/D
+        skew, e.g. an older P that does not advertise its block size): reading
+        would scramble KV. None when the counts agree, or when the request has
+        no local blocks: a request aborted before it was scheduled never went
+        through the expansion and only notifies P to free its blocks."""
+        assert meta.remote is not None
+        peer = self._sub_block_peers.get(engine_id)
+        sub_blocks = peer.sub_blocks if peer is not None else 1
+        if meta.remote.sub_blocks == sub_blocks or not any(
+            len(group) > 0 for group in meta.local_block_ids
+        ):
+            return None
+        return sub_blocks
 
     def _read_draft_heads(
         self,
