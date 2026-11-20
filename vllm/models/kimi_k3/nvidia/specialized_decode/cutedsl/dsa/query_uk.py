@@ -9,7 +9,7 @@ written and read back once (2 x 2 R G KB), the pack is a separate kernel.
 
 Here CTA (h, n) of 2 G owns gathered head h's latent columns 256 n .. + 255 for every
 row: its W_UK_T slice [256 x 128] (K-major, staged once) times the q_nope rows of
-each 128-row tile (TMA, two stages) on tcgen05 (kind::f16, FP32 accumulation in
+each 128-row tile (TMA, two or three stages) on tcgen05 (kind::f16, FP32 accumulation in
 TMEM). The accumulator is two 128-column halves with their own full/free barriers
 and epilogue warp sets (8 warps each, thread = row), so the MMAs of one half run under
 the other half's epilogue. The epilogue rounds to BF16 as the bmm output, scales,
@@ -128,6 +128,10 @@ class QueryUK:
         self.rows, self.gathered = rows, gathered
         self.q_heads, self.q_stride = q_heads, q_stride
         self.tiles = -(-rows // 128)
+        # A stages: every row tile of up to three in flight from the start (the tile
+        # loads, ~1 us per 48 KB tile, are the CTA's serial chain); 3 x 48 KB + the
+        # 64 KB weight slice fit the 227 KB of shared memory
+        self.stages = min(max(self.tiles, STAGES), 3)
 
     @cute.jit
     def __call__(self, q: Int64, uk_t: Int64, out: Int64, scale: Int64,
@@ -153,15 +157,15 @@ class QueryUK:
         R, P = self.rows, self.q_heads
         smem = cutlass.utils.SmemAllocator()
         base = Uint32(smem.allocate_array(
-            Uint8, B_BYTES + STAGES * A_BYTES + 128, byte_alignment=1024).toint())
+            Uint8, B_BYTES + self.stages * A_BYTES + 128, byte_alignment=1024).toint())
         b_smem = base
         a_smem = base + Uint32(B_BYTES)
-        bars = a_smem + Uint32(STAGES * A_BYTES)
-        # b_full, a_full[STAGES], a_free[STAGES], acc_full[2], acc_free[2], slot
+        bars = a_smem + Uint32(self.stages * A_BYTES)
+        # b_full, a_full[stages], a_free[stages], acc_full[2], acc_free[2], slot
         b_full = bars
         a_full = bars + Uint32(8)
-        a_free = a_full + Uint32(8 * STAGES)
-        acc_full = a_free + Uint32(8 * STAGES)
+        a_free = a_full + Uint32(8 * self.stages)
+        acc_full = a_free + Uint32(8 * self.stages)
         acc_free = acc_full + Uint32(16)
         slot = acc_free + Uint32(16)
         tid, _, _ = cute.arch.thread_idx()
@@ -172,7 +176,7 @@ class QueryUK:
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
         if tid == 0:
             mbar_init(b_full, Uint32(1))
-            for st in cutlass.range_constexpr(STAGES):
+            for st in cutlass.range_constexpr(self.stages):
                 mbar_init(a_full + Uint32(8 * st), Uint32(1))
                 # the MMAs' commit and the 128 q_pe epilogue threads (warps 4-7)
                 mbar_init(a_free + Uint32(8 * st), Uint32(129))
@@ -198,8 +202,8 @@ class QueryUK:
         if warp == 0:
             if lane == 0:
                 for m in range(self.tiles):
-                    st = m % STAGES
-                    mbar_wait(a_free + Uint32(8) * Uint32(st), ((m // STAGES) & 1) ^ 1)
+                    st = m % self.stages
+                    mbar_wait(a_free + Uint32(8) * Uint32(st), ((m // self.stages) & 1) ^ 1)
                     full = a_full + Uint32(8) * Uint32(st)
                     mbar_arrive_tx(full, Uint32(A_BYTES))
                     dst = a_smem + Uint32(A_BYTES) * Uint32(st)
@@ -210,8 +214,8 @@ class QueryUK:
             if lane == 0:
                 mbar_wait(b_full, 0)
                 for m in range(self.tiles):
-                    st = m % STAGES
-                    mbar_wait(a_full + Uint32(8) * Uint32(st), (m // STAGES) & 1)
+                    st = m % self.stages
+                    mbar_wait(a_full + Uint32(8) * Uint32(st), (m // self.stages) & 1)
                     src = a_smem + Uint32(A_BYTES) * Uint32(st)
                     # accumulator half c (TMEM columns 128 c ..): latent columns
                     # 256 n + 128 c .. of the tile, its own full/free pair, so the
@@ -244,8 +248,8 @@ class QueryUK:
                 if e == 0:
                     # q_pe values 32 n .. + 31 (the A stage's third block, SW128: 16 B
                     # chunk j of row r at j ^ (r % 8)) -> bytes 512 + 32 n ..
-                    st = m % STAGES
-                    mbar_wait(a_full + Uint32(8) * Uint32(st), (m // STAGES) & 1)
+                    st = m % self.stages
+                    mbar_wait(a_full + Uint32(8) * Uint32(st), (m // self.stages) & 1)
                     pe = (a_smem + Uint32(A_BYTES) * Uint32(st) + Uint32(2 * A_BLOCK)
                           + Uint32(128) * Uint32(row))
                     words = [
