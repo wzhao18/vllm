@@ -2243,66 +2243,69 @@ class GenphaseTokenComm(KernelComponent):
                     offsets[chunk_begin + j] = route_word & Int32(0xFFFF)
         iket.range_pop()
 
-        iket.range_push("sort.wait_prefix")
-        if thread_idx == Int32(0):
-            spin_wait(device_workspace.ptr(self.prefix_ready_region), lambda value: value == Int32(1), scope="gpu")
-        cute.arch.sync_threads()
-        iket.range_pop()
+        # DIAG dr2 (timing only): no prefix wait and no scatter; metadata_ready once the routes are counted.
+        iket.range_push("sort.dr2")
+        if cutlass.const_expr(False):
+            iket.range_push("sort.wait_prefix")
+            if thread_idx == Int32(0):
+                spin_wait(device_workspace.ptr(self.prefix_ready_region), lambda value: value == Int32(1), scope="gpu")
+            cute.arch.sync_threads()
+            iket.range_pop()
 
-        iket.range_push("sort.scatter")
-        # This source's segment start inside each expert, staged once: every thread
-        # needs it for up to `route_rounds` unrelated buckets.
-        source_expert_base = device_workspace.tensor(self.source_expert_base_region)
-        for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
-            bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
-            if bucket < Int32(self.local_expert_bucket_count):
-                base_row[bucket] = source_expert_base[source_rank, bucket]
-        cute.arch.sync_threads()
+            iket.range_push("sort.scatter")
+            # This source's segment start inside each expert, staged once: every thread
+            # needs it for up to `route_rounds` unrelated buckets.
+            source_expert_base = device_workspace.tensor(self.source_expert_base_region)
+            for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
+                bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
+                if bucket < Int32(self.local_expert_bucket_count):
+                    base_row[bucket] = source_expert_base[source_rank, bucket]
+            cute.arch.sync_threads()
 
-        gather_index = device_workspace.tensor(self.gather_index_region)
-        if cutlass.const_expr(not self.sf_plain_transport):
-            row_source_ll_address = self._ll_half_address(device_workspace, self.refine_row_source_ll_region, call_tag)
-        token_metadata = device_workspace.tensor(self.token_src_metadata_region)
-        routed_scores = self.fc1_topk_scores_tensor(device_workspace)
-        if cutlass.const_expr(self.apply_topk_at_fc1):
-            score_slab_address = (
-                device_workspace.tensor(self.topk_score_inbox_region)[parity, source_rank, None].iterator.toint()
-            )
-        dense_row_begin = source_rank * Int32(self.max_tokens_per_rank)
-
-        present_zero = Int64(call_tag) << Int64(32)
-        for chunk_begin in cutlass.range_constexpr(0, route_rounds, self.sort_poll_chunk):
-            chunk_rounds = min(self.sort_poll_chunk, route_rounds - chunk_begin)
+            gather_index = device_workspace.tensor(self.gather_index_region)
+            if cutlass.const_expr(not self.sf_plain_transport):
+                row_source_ll_address = self._ll_half_address(device_workspace, self.refine_row_source_ll_region, call_tag)
+            token_metadata = device_workspace.tensor(self.token_src_metadata_region)
+            routed_scores = self.fc1_topk_scores_tensor(device_workspace)
             if cutlass.const_expr(self.apply_topk_at_fc1):
-                # The scores travel right behind their route words; load the chunk's
-                # together, as for the routes.
-                score_words = cute.make_rmem_tensor((chunk_rounds,), Int64)
-                score_addresses = cute.make_rmem_tensor((chunk_rounds,), Int64)
+                score_slab_address = (
+                    device_workspace.tensor(self.topk_score_inbox_region)[parity, source_rank, None].iterator.toint()
+                )
+            dense_row_begin = source_rank * Int32(self.max_tokens_per_rank)
+
+            present_zero = Int64(call_tag) << Int64(32)
+            for chunk_begin in cutlass.range_constexpr(0, route_rounds, self.sort_poll_chunk):
+                chunk_rounds = min(self.sort_poll_chunk, route_rounds - chunk_begin)
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    # The scores travel right behind their route words; load the chunk's
+                    # together, as for the routes.
+                    score_words = cute.make_rmem_tensor((chunk_rounds,), Int64)
+                    score_addresses = cute.make_rmem_tensor((chunk_rounds,), Int64)
+                    for j in cutlass.range_constexpr(chunk_rounds):
+                        route = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
+                        score_addresses[j] = score_slab_address + Int64(route) * Int64(8)
+                        score_words[j] = present_zero
+                        if buckets[chunk_begin + j] != Int32(self.trash_bucket_index):
+                            score_words[j] = load_ll_word(score_addresses[j])
+                    poll_ll_words(score_words, score_addresses, chunk_rounds, call_tag)
                 for j in cutlass.range_constexpr(chunk_rounds):
-                    route = Int32((chunk_begin + j) * self.threads_per_cta) + thread_idx
-                    score_addresses[j] = score_slab_address + Int64(route) * Int64(8)
-                    score_words[j] = present_zero
-                    if buckets[chunk_begin + j] != Int32(self.trash_bucket_index):
-                        score_words[j] = load_ll_word(score_addresses[j])
-                poll_ll_words(score_words, score_addresses, chunk_rounds, call_tag)
-            for j in cutlass.range_constexpr(chunk_rounds):
-                route_round = chunk_begin + j
-                route = Int32(route_round * self.threads_per_cta) + thread_idx
-                if buckets[route_round] != Int32(self.trash_bucket_index):
-                    source_token = route // Int32(self.topk)
-                    source_slot = route % Int32(self.topk)
-                    pool_row = base_row[buckets[route_round]] + offsets[route_round]
-                    gather_index[pool_row] = dense_row_begin + source_token
-                    if cutlass.const_expr(not self.sf_plain_transport):
-                        st_relaxed_gpu_b64(
-                            row_source_ll_address + Int64(pool_row) * Int64(8),
-                            (Int64(call_tag) << Int64(32)) | Int64(dense_row_begin + source_token),
-                        )
-                    token_metadata[pool_row] = TokenSrcMetadata(
-                        src_rank=source_rank, src_token=source_token, src_topk=source_slot
-                    ).pack()
-                    if cutlass.const_expr(self.apply_topk_at_fc1):
-                        routed_scores[pool_row] = _int32_bits_to_float32(Int32(score_words[j] & Int64(0xFFFFFFFF)))
+                    route_round = chunk_begin + j
+                    route = Int32(route_round * self.threads_per_cta) + thread_idx
+                    if buckets[route_round] != Int32(self.trash_bucket_index):
+                        source_token = route // Int32(self.topk)
+                        source_slot = route % Int32(self.topk)
+                        pool_row = base_row[buckets[route_round]] + offsets[route_round]
+                        gather_index[pool_row] = dense_row_begin + source_token
+                        if cutlass.const_expr(not self.sf_plain_transport):
+                            st_relaxed_gpu_b64(
+                                row_source_ll_address + Int64(pool_row) * Int64(8),
+                                (Int64(call_tag) << Int64(32)) | Int64(dense_row_begin + source_token),
+                            )
+                        token_metadata[pool_row] = TokenSrcMetadata(
+                            src_rank=source_rank, src_token=source_token, src_topk=source_slot
+                        ).pack()
+                        if cutlass.const_expr(self.apply_topk_at_fc1):
+                            routed_scores[pool_row] = _int32_bits_to_float32(Int32(score_words[j] & Int64(0xFFFFFFFF)))
 
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
