@@ -53,6 +53,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    LEASE_HEARTBEAT_MSG,
+    LEASE_PIN_FLAG,
     LEASE_QUERY_MSG,
     KVFingerprintReq,
     NixlAgentMetadata,
@@ -217,6 +219,24 @@ def query_remote_leases(
     if not isinstance(held, list) or len(held) != len(req_ids):
         raise ValueError(f"malformed lease answer from {path}: {held!r}")
     return [h is True for h in held]
+
+
+def send_lease_pin(
+    host: str, port: int, req_ids: list[str], timeout_s: float
+) -> list[bool]:
+    """Tell a P engine's side channel that the READs of ``req_ids`` (P request
+    ids) are posted, so P keeps their leases until D releases the blocks."""
+    path = make_zmq_path("tcp", host, port)
+    with zmq_ctx(zmq.REQ, path) as sock:
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, max(1, int(timeout_s * 1000)))
+        msg = (LEASE_HEARTBEAT_MSG, req_ids, LEASE_PIN_FLAG)
+        sock.send(msgspec.msgpack.encode(msg))
+        try:
+            reply = sock.recv()
+        except zmq.Again as e:
+            raise TimeoutError(f"no pin answer from {path}") from e
+    return [r is True for r in msgspec.msgpack.decode(reply)]
 
 
 class _PairExchangeTimes:
@@ -1297,6 +1317,10 @@ class NixlBaseConnectorWorker:
         self._lease_checks: dict[ReqId, tuple[Future[bool], float]] = {}
         self._lease_check_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="vllm-nixl-lease-check"
+        )
+        # P side: how long a pull pin keeps a lease without D's notification.
+        self._lease_pin_s = float(
+            self.kv_transfer_config.get_from_extra_config("kv_lease_pin_s", 600.0)
         )
 
         # Handshake metadata of this worker for NIXL transfers.
@@ -3867,6 +3891,9 @@ class NixlBaseConnectorWorker:
         process per attention-DP rank, still maps to its own NUMA-local NICs."""
         if not spec:
             return
+        if spec.strip().startswith("numa"):
+            NixlBaseConnectorWorker._select_numa_local_ucx_net_devices(spec)
+            return
         if gpu is None:
             gpu = torch.accelerator.current_device_index()
             with contextlib.suppress(Exception):
@@ -3879,6 +3906,93 @@ class NixlBaseConnectorWorker:
                 os.environ["UCX_NET_DEVICES"] = devices
                 logger.info("NIXL: UCX_NET_DEVICES=%s for local GPU %d", devices, gpu)
                 return
+
+    @staticmethod
+    def _select_numa_local_ucx_net_devices(
+        spec: str, gpu_pci: str | None = None, sysfs: str = "/sys"
+    ) -> None:
+        """``spec`` = ``numa[:<dev>,<dev>,...]``: give this rank's GPU an equal
+        share of the ACTIVE RDMA devices on its NUMA node (candidates: the
+        listed devices, else the fastest ones), split in PCI order among the
+        node's GPUs on that NUMA node, and one rendezvous rail per device plane
+        (UCX_MAX_RNDV_RAILS, unless set).
+
+        GPUDirect READs only use NICs on the GPU's NUMA node (VR200: the GPUs
+        reach every NIC through the CPU; a cross-socket NIC carried no bytes):
+        a GPU paired with a cross-socket NIC moves at one NIC's rate, and two
+        rails only cover the two planes of one 800G NIC."""
+        if gpu_pci is None:
+            try:
+                p = torch.cuda.get_device_properties(
+                    torch.accelerator.current_device_index()
+                )
+                dom, bus, dev = p.pci_domain_id, p.pci_bus_id, p.pci_device_id
+                gpu_pci = f"{dom:04x}:{bus:02x}:{dev:02x}.0"
+            except Exception as e:
+                logger.warning("NIXL: no PCI address for this GPU (%r)", e)
+                return
+
+        def text(path: str) -> str:
+            try:
+                with open(path) as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+
+        def numa_of(path: str) -> int:
+            return int(text(f"{path}/numa_node") or -1)
+
+        pci = f"{sysfs}/bus/pci/devices"
+        ib = f"{sysfs}/class/infiniband"
+        numa = numa_of(f"{pci}/{gpu_pci}")
+        gpus = sorted(
+            d
+            for d in (os.listdir(pci) if os.path.isdir(pci) else [])
+            if text(f"{pci}/{d}/vendor") == "0x10de"
+            and text(f"{pci}/{d}/class").startswith("0x03")
+            and numa_of(f"{pci}/{d}") == numa
+        )
+        nics = {}  # device -> (PCI address, port-1 rate)
+        for dev in sorted(os.listdir(ib)) if os.path.isdir(ib) else []:
+            if "ACTIVE" in text(f"{ib}/{dev}/ports/1/state") and (
+                numa_of(f"{ib}/{dev}/device") == numa
+            ):
+                rate = text(f"{ib}/{dev}/ports/1/rate").split(" ")[0] or "0"
+                addr = os.path.basename(os.path.realpath(f"{ib}/{dev}/device"))
+                nics[dev] = (addr, float(rate))
+        listed = [
+            d.split(":")[0]
+            for d in spec.partition(":")[2].replace("+", ",").split(",")
+            if d.strip()
+        ]
+        top = max((r for _, r in nics.values()), default=0.0)
+        local = sorted(
+            (d for d in nics if (d in listed if listed else nics[d][1] == top)),
+            key=lambda d: nics[d][0],
+        )
+        if numa < 0 or gpu_pci not in gpus or not local:
+            logger.warning(
+                "NIXL: no NUMA-local RDMA device for GPU %s (NUMA %d, candidates "
+                "%s): UCX_NET_DEVICES unchanged",
+                gpu_pci,
+                numa,
+                listed or "fastest",
+            )
+            return
+        k, per = gpus.index(gpu_pci), len(local) // len(gpus)
+        devices = local[k * per : (k + 1) * per] if per else [local[k % len(local)]]
+        os.environ["UCX_NET_DEVICES"] = ",".join(f"{d}:1" for d in devices)
+        os.environ.setdefault("UCX_MAX_RNDV_RAILS", str(2 * len(devices)))
+        logger.info(
+            "NIXL: UCX_NET_DEVICES=%s for GPU %s (NUMA %d, GPU %d of %d there), "
+            "UCX_MAX_RNDV_RAILS=%s",
+            os.environ["UCX_NET_DEVICES"],
+            gpu_pci,
+            numa,
+            k,
+            len(gpus),
+            os.environ["UCX_MAX_RNDV_RAILS"],
+        )
 
     def _validate_hybrid_hetero_dcp(
         self,
@@ -4806,7 +4920,12 @@ class NixlBaseConnectorWorker:
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
-                self._pending_recv_notifs.pop(req_id, None)
+                if self._lease_pinned(meta):
+                    # Nothing of ours reads P any more: release the pinned
+                    # blocks now instead of after kv_lease_pin_s.
+                    self._send_pending_recv_notifs(req_id)
+                else:
+                    self._pending_recv_notifs.pop(req_id, None)
                 # Every page may be partly written or not written at all. The
                 # scheduler recomputes them; zero them so no stale byte
                 # survives into a block it keeps or reallocates for a load.
@@ -5159,6 +5278,37 @@ class NixlBaseConnectorWorker:
 
         return self._lease_check_executor.submit(_query)
 
+    def _lease_pinned(self, meta: ReqMeta | None) -> bool:
+        """D side: whether this pull pins P's lease (see _pin_remote_lease)."""
+        return bool(
+            getattr(self, "_lease_check_enabled", False)
+            and meta is not None
+            and meta.awaiting_kvs
+            and meta.remote is not None
+            and meta.remote.lease_check is True
+        )
+
+    def _pin_remote_lease(self, meta: ReqMeta) -> None:
+        """D side: the READs of ``meta`` are being posted. Pin P's lease so a
+        slow read (queued transport, stalled heartbeats) cannot outlive it;
+        D's completion notifications (sent on failure too) release the blocks.
+        Fire and forget: a lost pin leaves the heartbeats and the post-read
+        lease check in charge. One message per request (TP rank 0)."""
+        if not self._lease_pinned(meta) or self.tp_rank != 0:
+            return
+        remote = meta.remote
+        assert remote is not None
+        try:
+            self._lease_check_executor.submit(
+                send_lease_pin,
+                remote.host,
+                remote.port,
+                [remote.request_id],
+                self._lease_check_timeout_s,
+            )
+        except RuntimeError:  # executor shut down
+            pass
+
     def _gate_on_remote_lease(
         self, done_recving: set[ReqId], failed_recv_reqs: set[ReqId]
     ) -> None:
@@ -5226,6 +5376,8 @@ class NixlBaseConnectorWorker:
             if reason != "released":
                 # P may still hold the blocks: release them now, not at expiry.
                 self._send_pending_recv_notifs(req_id)
+            else:
+                self._pending_recv_notifs.pop(req_id, None)
             failed_recv_reqs.add(req_id)
 
     def _reap_expired_send_leases(self, done_sending: set[str]) -> None:
@@ -5276,6 +5428,16 @@ class NixlBaseConnectorWorker:
                     self._lease_extension,
                     old,
                     new_expiry,
+                )
+
+    def _handle_lease_pins(self, req_ids: set[str]) -> None:
+        """P side: D posted the READs of ``req_ids``; keep their leases until
+        D's notification releases them, or ``kv_lease_pin_s`` (D died)."""
+        pinned_until = time.perf_counter() + self._lease_pin_s
+        for req_id in req_ids:
+            if req_id in self._reqs_to_send:
+                self._reqs_to_send[req_id] = max(
+                    self._reqs_to_send[req_id], pinned_until
                 )
 
     def _pop_done_transfers(

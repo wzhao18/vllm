@@ -265,6 +265,32 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         self.nixl_histogram_num_descriptors = create_metric_per_engine(
             nixl_histogram_num_descriptors, self.per_engine_labelvalues
         )
+        nixl_histogram_request_xfer_time = self._histogram_cls(
+            name="vllm:nixl_request_xfer_time_seconds",
+            documentation="Histogram of the per-rank transfer time of a request's "
+            "KV (first NIXL transfer start to last transfer end).",
+            buckets=[
+                0.0025,
+                0.005,
+                0.0075,
+                0.01,
+                0.0125,
+                0.015,
+                0.02,
+                0.025,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.25,
+                1.0,
+                5.0,
+            ],
+            labelnames=labelnames,
+        )
+        self.nixl_histogram_request_xfer_time = create_metric_per_engine(
+            nixl_histogram_request_xfer_time, self.per_engine_labelvalues
+        )
         counter_nixl_num_failed_transfers = self._counter_cls(
             name="vllm:nixl_num_failed_transfers",
             documentation="Number of failed NIXL KV Cache transfers, including"
@@ -337,6 +363,8 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data[list_item_key]:
                 prom_obj[engine_idx].observe(list_item)
+        for wall in transfer_stats_data.get("request_xfer_wall", ()):
+            self.nixl_histogram_request_xfer_time[engine_idx].observe(wall)
         for counter_obj, counter_item_keys in zip(
             [
                 self.counter_nixl_num_failed_transfers,
