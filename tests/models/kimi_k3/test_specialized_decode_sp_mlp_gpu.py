@@ -212,6 +212,32 @@ def test_graph_replay():
     assert torch.equal(got, want)
 
 
+def test_latent_up_parts():
+    """The latent up's FP32 split partials (``parts``): summed in split order plus
+    the residual and rounded once, they are the BF16 output's FP32 sum of the same
+    products (K order aside), within a BF16 ulp of the cuBLAS beta-add."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.sp_fused import (
+        SplitDelta,
+    )
+
+    mlp = layer(True, seed=3)
+    spm = sp_mlp.SpMlp(mlp, ROWS, context(), 1)
+    assert spm.parts, "no latent up rows on the partials GEMM"
+    g = torch.Generator(device=DEVICE).manual_seed(3)
+    h = torch.randn(max(ROWS), HIDDEN, device=DEVICE, generator=g).bfloat16()
+    for n, split in spm.parts.items():
+        want = spm.run(h[:n]).float()
+        got = spm.run(h[:n], parts=True)
+        assert isinstance(got, SplitDelta) and got.parts == split, n
+        p = got.partials.view(split, n, HIDDEN)
+        total = p[0].clone()
+        for s in range(1, split):
+            total += p[s]
+        out = (total + got.residual.float()).bfloat16().float()
+        ulp = (want.abs().clamp_min(1e-30).log2().floor() - 7).exp2()
+        assert ((out - want).abs() <= ulp + 1e-4 * want.abs().amax()).all(), n
+
+
 def test_unreproducible_layers_raise():
     ctx = context()
     mlp = layer(False, seed=3)

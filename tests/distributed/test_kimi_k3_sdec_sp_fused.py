@@ -242,6 +242,30 @@ def _worker(env: dict[str, str]) -> None:
                 assert torch.equal(y, res["fused_bf16"][1]), ("mx post", rows, layer)
                 ref = _quant(mxfp8_act, y)
                 assert _same_mx(scratch.view(n), ref, n), ("mx out", rows, layer)
+                if d is not None:
+                    # A beta-add GEMM's FP32 split partials + residual (SplitDelta, the
+                    # latent up's form): bitwise the gather of the BF16 delta its own
+                    # epilogue would form (split order, one rounding).
+                    pv = _rand((3, n, WIDTH), ("q", rows, rank), device, 0.05).float()
+                    resid = _rand((n, WIDTH), ("r", rows, rank), device, 0.1)
+                    want = (((pv[0] + pv[1]) + pv[2]) + resid.float()).bfloat16()
+                    pb = sp_fused.SpBoundary(
+                        comm, (pre_w, eps), (post_w, eps), prev,
+                        layer // BLOCK if write else -1, max(SHARDS), {rows: True},
+                        delta_parts=(3,),
+                    )  # fmt: skip
+                    got = []
+                    for dd in (want, sp_fused.SplitDelta(pv.reshape(3 * n, WIDTH),
+                                                         resid, 3)):  # fmt: skip
+                        prefix, blocks = prefix0.clone(), blocks0.clone()
+                        dist.barrier()
+                        g = pb.gather(dd, prefix, blocks, parity).clone()
+                        y = pb.reduce(prefix, blocks, out, parity, partial).clone()
+                        torch.accelerator.synchronize(device)
+                        assert _armed(comm, parity, rows), ("parts", rows, layer)
+                        got.append((g, y, prefix, blocks))
+                    for a, b in zip(*got):
+                        assert torch.equal(a, b), ("parts", rows, layer)
                 s, f = res["stock"], res["fused"]
                 assert torch.equal(s[2], f[2]), ("prefix", rows, layer)
                 assert torch.equal(s[3], f[3]), ("blocks", rows, layer)
