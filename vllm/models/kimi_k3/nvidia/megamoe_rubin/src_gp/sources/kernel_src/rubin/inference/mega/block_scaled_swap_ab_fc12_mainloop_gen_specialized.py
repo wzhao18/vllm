@@ -1195,7 +1195,13 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         _dms_w = read_clock64() - _dms_c00
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             _dms_c0 = read_clock64()
-            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            _sh_skip = Int32(0)
+            _sh_tx = expected_tx
+            if cutlass.const_expr(expected_tx is not None):
+                # DIAG halfa: odd shared-FC1 k tiles carry no A box.
+                _sh_skip = (k_tile_idx & Int32(1)) * Int32(work_tile.phase == Int32(3))
+                _sh_tx = expected_tx - Int32(self.shared_a_stage_tma_bytes) * _sh_skip
+            ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=_sh_tx)
             _dms_w = _dms_w + (read_clock64() - _dms_c0)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
@@ -1204,11 +1210,12 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 _dms_c1 = read_clock64()
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
-            cute.copy(
-                _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask, weight_policy),
-                global_a_slice[(None, k_tile_idx)],
-                partitioned_smem_a[(None, stage_index)],
-            )
+            if _sh_skip == Int32(0):
+                cute.copy(
+                    _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask, weight_policy),
+                    global_a_slice[(None, k_tile_idx)],
+                    partitioned_smem_a[(None, stage_index)],
+                )
             cute.copy(
                 _bind_tma_issue(sfa_exec_atom, tma_barrier, multicast_mask, weight_policy),
                 global_sfa_slice[(None, k_tile_idx)],
