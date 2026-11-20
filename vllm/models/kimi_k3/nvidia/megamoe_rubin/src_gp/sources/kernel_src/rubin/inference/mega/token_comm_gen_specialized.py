@@ -80,6 +80,8 @@ from .....quant_def import QuantKind
 
 from cutlass._mlir.dialects import llvm
 from .genphase_tail import GenphaseTail
+from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
+from ......common.ptx_helpers import read_globaltimer_ns as _dms_gt
 
 
 @cute.jit
@@ -1316,6 +1318,7 @@ class GenphaseTokenComm(KernelComponent):
         instance attributes: the component is shared by all CTAs, and stashing
         per-CTA values on it makes the data flow invisible at the call site.
         """
+        _dms_t_entry = Int64(_dms_gt())
         cta_idx_in_cluster, _, cluster_idx = cute.arch.block_idx()
         linear_cta_idx = cluster_idx * Int32(self.launch_cluster_width) + cta_idx_in_cluster
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -1367,6 +1370,12 @@ class GenphaseTokenComm(KernelComponent):
                 sleep_cycles=64,
             )
         cute.arch.sync_threads()
+        _dms_ep = self._tail.read_epoch(device_workspace)
+        DG.bind(device_workspace, _dms_ep)
+        _dms_t0 = Int32(thread_idx == Int32(0))
+        DG.put_val(DG.C_ENTRY, _dms_t_entry, _dms_t0)
+        DG.put_gt(DG.C_EPOK, _dms_t0)
+        DG.put_val(DG.C_EPOCH, Int64(_dms_ep) + Int64(1), _dms_t0)
         if cutlass.const_expr(not self.sf_plain_transport):
             epoch = self._tail.read_epoch(device_workspace)
             if (epoch >= Int32(-1)) & (epoch <= Int32(1)):
@@ -1389,10 +1398,15 @@ class GenphaseTokenComm(KernelComponent):
                 thread_idx,
             )
             self._run_sort(device_workspace, local_rank, smem_base, linear_cta_idx, thread_idx)
+            DG.put_gt(DG.C_ROLE, _dms_t0)
+            DG.put_val(DG.C_ROLEID, Int64(1), _dms_t0)
             self._leave(device_workspace, thread_idx)
+            DG.put_gt(DG.C_EXIT, _dms_t0)
             exit()
         elif linear_cta_idx == Int32(self.helper_cta_index):
             self._run_helper(device_workspace, local_rank, smem_base, thread_idx)
+            DG.put_gt(DG.C_ROLE, _dms_t0)
+            DG.put_val(DG.C_ROLEID, Int64(2), _dms_t0)
         else:
             self._run_pusher(
                 device_workspace,
@@ -1405,10 +1419,13 @@ class GenphaseTokenComm(KernelComponent):
                 linear_cta_idx - Int32(self.pusher_cta_begin),
                 thread_idx,
             )
+            DG.put_gt(DG.C_ROLE, _dms_t0)
+            DG.put_val(DG.C_ROLEID, Int64(3), _dms_t0)
 
         self._run_refine(device_workspace, smem_base, thread_idx)
+        DG.put_gt(DG.C_REFINE, _dms_t0)
         self._leave(device_workspace, thread_idx)
-
+        DG.put_gt(DG.C_EXIT, _dms_t0)
         device_workspace.remove_device_members()
 
     @cute.jit
