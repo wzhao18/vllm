@@ -24,7 +24,9 @@ class TopkReduceDedup:
     _threads: ClassVar[int] = 128
     _hidden_per_thread: ClassVar[int] = 16  # one 32-byte BF16 load per rank slot
 
-    def __init__(self, hidden: int, world_size: int, combine_format: CombineFormat) -> None:
+    def __init__(
+        self, hidden: int, world_size: int, combine_format: CombineFormat, norm_hidden_per_thread: int = 8
+    ) -> None:
         if combine_format.is_quantized or combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("TopkReduceDedup supports the BF16 combine format only.")
         if world_size > 32:
@@ -36,6 +38,11 @@ class TopkReduceDedup:
             raise ValueError(f"hidden ({self.hidden}) must be divisible by {self._hidden_per_thread}.")
         self.hidden_tiles = self.hidden // self._hidden_per_thread
         self.require_predicate = self.hidden_tiles % self._threads != 0
+        # Fused-RMSNorm form: one token row per CTA, ``norm_hidden_per_thread`` elements per thread.
+        self.norm_hpt = int(norm_hidden_per_thread)
+        if self.norm_hpt not in (8, 16) or self.hidden % self.norm_hpt != 0:
+            raise ValueError(f"norm_hidden_per_thread {self.norm_hpt} must be 8 or 16 and divide hidden.")
+        self.norm_tiles = self.hidden // self.norm_hpt
 
     @cute.jit
     def __call__(
@@ -63,14 +70,14 @@ class TopkReduceDedup:
         if cutlass.const_expr(shared_term is not None):
             shared_term = shared_term_view(shared_term, self.hidden)
         if cutlass.const_expr(rmsnorm_weight is not None):
-            if cutlass.const_expr(self.hidden_tiles > 1024):
-                raise ValueError("the fused RMSNorm reduce keeps one token row per CTA (hidden <= 16384).")
+            if cutlass.const_expr(self.norm_tiles > 1024):
+                raise ValueError("the fused RMSNorm reduce keeps one token row per CTA (<= 1024 threads).")
             rmsnorm_weight = cute.make_tensor(rmsnorm_weight.iterator, cute.make_layout((self.hidden,)))
             self._reduce_bf16_rmsnorm(
                 rank_slots, valid_rank_mask, reduced_output, rmsnorm_weight, rmsnorm_eps, shared_term
             ).launch(
                 grid=[reduced_output.shape[0], 1, 1],
-                block=[(self.hidden_tiles + 31) // 32 * 32, 1, 1],
+                block=[(self.norm_tiles + 31) // 32 * 32, 1, 1],
                 stream=stream,
             )
         else:
@@ -86,9 +93,10 @@ class TopkReduceDedup:
         token_idx: Int32,
         hidden_tile_idx: Int32,
         shared_term: Optional[cute.Tensor],
+        hidden_per_thread: cutlass.Constexpr[int],
     ) -> cute.Tensor:
-        """FP32 fold of one worker's 16-wide hidden tile: rank slots ascending, then the shared term."""
-        hidden_per_thread = self._hidden_per_thread
+        """FP32 fold of one worker's ``hidden_per_thread``-wide hidden tile: rank slots ascending, then the shared
+        term."""
         world_size: cutlass.Constexpr[int] = self.world_size
         # (token, rank, hidden) -> (rank, hidden_per_thread) slice owned by this worker
         slots = cute.zipped_divide(rank_slots[token_idx, None, None], (world_size, hidden_per_thread))[
@@ -138,11 +146,12 @@ class TopkReduceDedup:
         rmsnorm_eps: Float32,
         shared_term: Optional[cute.Tensor],
     ):
-        """One token row per CTA (thread = one 16-wide hidden tile): the rank fold of ``_reduce_bf16``, then the stock
-        vLLM ``rms_norm`` of the BF16-rounded row: FP32 sum of squares of the BF16 values,
-        ``s = rsqrt(sum / hidden + eps)``, ``out = bf16(x * s * w)`` (as E2a on the GenPhase reduce)."""
-        hidden_per_thread = self._hidden_per_thread
-        hidden_tiles = self.hidden_tiles
+        """One token row per CTA (thread = one ``norm_hpt``-wide hidden tile): the rank fold of ``_reduce_bf16``, then
+        the stock vLLM ``rms_norm`` of the BF16-rounded row: FP32 sum of squares of the BF16 values,
+        ``s = rsqrt(sum / hidden + eps)``, ``out = bf16(x * s * w)`` (as E2a on the GenPhase reduce). The weight tile
+        is loaded with the rank slots, so the only dependent step after the block reduction is the store."""
+        hidden_per_thread: cutlass.Constexpr[int] = self.norm_hpt
+        hidden_tiles = self.norm_tiles
         warps: cutlass.Constexpr[int] = (hidden_tiles + 31) // 32
         out_dtype = reduced_output.element_type
         token_idx = cute.arch.block_idx()[0]
@@ -156,9 +165,16 @@ class TopkReduceDedup:
         smem = cutlass_utils.SmemAllocator()
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
         x = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+        weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
         sumsq = Float32(0)
         if active:
-            acc = self._fold(rank_slots, valid_rank_mask, token_idx, hidden_tile_idx, shared_term)
+            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+            cute.copy(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128),
+                mark_alignment(wsrc, tile_bytes),
+                weight,
+            )
+            acc = self._fold(rank_slots, valid_rank_mask, token_idx, hidden_tile_idx, shared_term, hidden_per_thread)
             x.store(acc.load().to(out_dtype))
             for i in cutlass.range_constexpr(hidden_per_thread):
                 xf = Float32(x[i])
@@ -173,10 +189,6 @@ class TopkReduceDedup:
             total = total + partial[w]
         scale = cute.math.rsqrt(total / Float32(self.hidden) + rmsnorm_eps, fastmath=True)
         if active:
-            load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
-            weight = cute.make_rmem_tensor((hidden_per_thread,), rmsnorm_weight.element_type)
-            wsrc = cute.zipped_divide(rmsnorm_weight, (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
-            cute.copy(load_atom, mark_alignment(wsrc, tile_bytes), weight)
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             for i in cutlass.range_constexpr(hidden_per_thread):
                 out[i] = out_dtype(Float32(x[i]) * scale * Float32(weight[i]))
@@ -207,7 +219,7 @@ class TopkReduceDedup:
 
         if (not needs_guard) or token_idx < reduced_output.shape[0]:
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
-            acc = self._fold(rank_slots, valid_rank_mask, token_idx, hidden_tile_idx, shared_term)
+            acc = self._fold(rank_slots, valid_rank_mask, token_idx, hidden_tile_idx, shared_term, hidden_per_thread)
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

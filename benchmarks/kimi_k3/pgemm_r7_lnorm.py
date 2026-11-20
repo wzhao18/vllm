@@ -15,9 +15,10 @@ import json
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.models.kimi_k3.nvidia.ops import prefill_glue
 
 
-def compile_dedup(hidden, world, **kw):
+def compile_dedup(hidden, world, hpt=8, **kw):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -37,7 +38,7 @@ def compile_dedup(hidden, world, **kw):
             )
         return cutlass.Float32(v) if isinstance(v, float) else v
 
-    op = TopkReduceDedup(hidden, world, CombineFormat.parse("bf16"))
+    op = TopkReduceDedup(hidden, world, CombineFormat.parse("bf16"), norm_hidden_per_thread=hpt)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn = cute.compile(op, stream=stream, **{k: conv(v) for k, v in kw.items()})
     conv_kw = {k: conv(v) for k, v in kw.items()}
@@ -96,27 +97,39 @@ def main():
         plain = compile_dedup(
             hidden, world, rank_slots=slots, valid_rank_mask=mask, reduced_output=reduced
         )
-        fused = compile_dedup(
-            hidden,
-            world,
-            rank_slots=slots,
-            valid_rank_mask=mask,
-            reduced_output=fused_out,
-            rmsnorm_weight=weight,
-            rmsnorm_eps=eps,
-        )
+        fused = {
+            hpt: compile_dedup(
+                hidden,
+                world,
+                hpt,
+                rank_slots=slots,
+                valid_rank_mask=mask,
+                reduced_output=fused_out,
+                rmsnorm_weight=weight,
+                rmsnorm_eps=eps,
+            )
+            for hpt in (8, 16)
+        }
+
+        def norm_stock():
+            ops.rms_norm(normed, reduced, weight, eps)
 
         def norm_only():
-            ops.rms_norm(normed, reduced, weight, eps)
+            prefill_glue.rms_norm(reduced, weight, eps, out=normed)
 
         def pair():
             plain()
             norm_only()
 
         pair()
-        fused()
         torch.cuda.synchronize()
-        ulp = (fused_out.view(torch.int16).int() - normed.view(torch.int16).int()).abs()
+        ulps = {}
+        for hpt, fn in fused.items():
+            fused_out.zero_()
+            fn()
+            torch.cuda.synchronize()
+            u = (fused_out.view(torch.int16).int() - normed.view(torch.int16).int()).abs()
+            ulps[hpt] = (int(u.max()), float((u > 0).float().mean()))
         res = {
             "world": world,
             "rows": n,
@@ -124,14 +137,16 @@ def main():
             "ranks_per_token": float(
                 ((mask[:, None] >> torch.arange(world, device=dev)) & 1).sum(1).float().mean()
             ),
-            "max_ulp": int(ulp.max()),
-            "frac_ulp": float((ulp > 0).float().mean()),
+            "ulp_vs_prod_norm": ulps,
         }
-        for arm, fn in (("reduce", plain), ("norm", norm_only), ("pair", pair), ("fused", fused)):
+        arms = [("reduce", plain), ("norm", norm_only), ("norm_stock", norm_stock), ("pair", pair)]
+        arms += [(f"fused{h}", fn) for h, fn in fused.items()]
+        for arm, fn in arms:
             res[f"{arm}_warm_us"] = round(timed(fn, args.iters), 2)
             res[f"{arm}_thrash_us"] = round(timed(fn, args.iters, flush), 2)
-        res["saved_warm_us"] = round(res["pair_warm_us"] - res["fused_warm_us"], 2)
-        res["saved_thrash_us"] = round(res["pair_thrash_us"] - res["fused_thrash_us"], 2)
+        for h in fused:
+            for m in ("warm", "thrash"):
+                res[f"saved{h}_{m}_us"] = round(res[f"pair_{m}_us"] - res[f"fused{h}_{m}_us"], 2)
         print(json.dumps(res), flush=True)
 
 
