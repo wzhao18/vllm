@@ -94,7 +94,7 @@ class SchedulerBase(KernelComponent):
 
     pipeline_mbarriers_region = "scheduler.pipeline_mbarriers"
     work_tiles_region = "scheduler.work_tiles"
-    num_scheduler_stages = 2
+    num_scheduler_stages = 4  # DIAG ladder q4: claim queue depth 2 -> 4
 
     @classmethod
     def problem_desc_require(cls) -> dict:
