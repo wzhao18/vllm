@@ -207,6 +207,16 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
         if not (torch.equal(o2[:, :K], out[:, :K]) and torch.equal(c2, cnt)):
             nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
             errs.append(f"topk_v2 differs from topk_merge in {nd} rows")
+    # topk_sp (single path, csrc/topk_sp.cuh): bitwise the same output
+    for _ in range(2):
+        o3 = torch.full((T, K + 64), -7, dtype=torch.int32, device=dev)
+        c3 = torch.full((T,), -7, dtype=torch.int32, device=dev)
+        ex.topk_v2(local, Lr, G, o3, c3, interleave=il, single_path=True)
+        torch.cuda.synchronize()
+        ex.check()
+        if not (torch.equal(o3[:, :K], out[:, :K]) and torch.equal(c3, cnt)):
+            nd = int(((o3[:, :K] != out[:, :K]).any(1) | (c3 != cnt)).sum())
+            errs.append(f"topk_sp differs from topk_merge in {nd} rows")
     if case == "sample_high":
         d = (V2_STATS[0] - v2_before).tolist()
         # the hot path rebases (7) and stays on round 1: no radix (3), no full-pass message (5)
