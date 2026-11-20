@@ -439,7 +439,7 @@ _lock = threading.Lock()
 # n64 / n96 run the co-resident form: 8 warps at <= 64 registers and <= 215 KiB of shared
 # memory, so the CTAs land beside SpReduceAttnRes (launched with the full shared-memory
 # carve-out) and stage NS weight stages before the reduce ends.
-CONFIGS = {32: (4, 2, 5, 4, 2, 0, 0), 64: (4, 1, 7, 2, 1, 1440, 1), 96: (4, 1, 6, 2, 1, 1440, 1)}
+CONFIGS = {32: (4, 1, 8, 2, 1, 1440, 1), 64: (4, 1, 7, 2, 1, 1440, 1), 96: (4, 1, 6, 2, 1, 1440, 1)}
 
 
 def _module():
