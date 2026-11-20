@@ -1116,6 +1116,15 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         return value
 
     @cute.jit
+    def _holds_claim_gate(self, work_tile) -> Int32:
+        """A shared FC2 tile waits for every shared FC1 tile, so the claim gate opens only after its last weight load
+        (a unit claimed behind a parked tile would sit there and stall its expert's FC2 tiles)."""
+        hold = Int32(0)
+        if cutlass.const_expr(self.shared_enabled):
+            hold = Int32(work_tile.is_valid_tile) * Int32(work_tile.phase == Int32(BlockPhase.SharedLinear2))
+        return hold
+
+    @cute.jit
     def _is_fc1_gemm(self, phase: Int32) -> cutlass.Boolean:
         """FC1 of either expert (the routed or the shared one)."""
         is_fc1 = phase == Int32(BlockPhase.Linear1)
@@ -1283,8 +1292,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
         work_tile = sched_consumer.consume_work()
         if cutlass.const_expr(progress_mbarrier is not None):
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive(progress_mbarrier)
+            if self._holds_claim_gate(work_tile) == Int32(0):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(progress_mbarrier)
         _dms_u = Int32(0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
@@ -1353,10 +1363,16 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     dms_u=_dms_u - Int32(1),
                 )
             iket.range_pop()
+            if cutlass.const_expr(progress_mbarrier is not None):
+                # A held tile reports itself taken only now, after its last weight load.
+                if self._holds_claim_gate(work_tile) != Int32(0):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(progress_mbarrier)
             work_tile = sched_consumer.consume_work()
             if cutlass.const_expr(progress_mbarrier is not None):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(progress_mbarrier)
+                if self._holds_claim_gate(work_tile) == Int32(0):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(progress_mbarrier)
 
         if cutlass.const_expr(trigger_dependents_when_drained):
             # No work is left to claim: this CTA's last tile is already in flight, so
