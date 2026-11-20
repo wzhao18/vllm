@@ -68,10 +68,15 @@ class IndexerStage:
             return q_fp8[:rows].view(torch.float8_e4m3fn), None
         return fp4_query_views(q_fp8, batch, rows)
 
-    def run(self, projected, q_fp8, head_w):
-        """Top-k of the current rows into the shared buffer (stock decode scoring)."""
+    def run(self, projected, q_fp8, head_w, q=1):
+        """Top-k of the current rows into the shared buffer (stock decode scoring;
+        ``q`` query rows per request). A pure MXFP4 decode step that the DCP
+        decode top-k hook (DcpExchange) admits is scored per request
+        (``fp4_logits``) and handed to the hook as the stock op would."""
         indexer, batch = self.indexer, projected.shape[0]
         assert is_fp4_cache(indexer.k_cache.kv_cache) == self.fp4
+        if self.fp4 and q > 1 and self.run_fp4_hook(q_fp8, head_w, batch, q):
+            return indexer.topk_indices_buffer
         query, q_scale = self.query(q_fp8, batch, batch)
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
@@ -100,6 +105,44 @@ class IndexerStage:
             # Interleave 1: the exact one-round DCP merge (gated in the op).
             dcp_local_topk=indexer.dcp_local_topk,
         )
+
+    def run_fp4_hook(self, q_fp8, head_w, batch, q):
+        """The stock op's decode branch for a pure decode step of uniform ``q``-row
+        requests whose DCP decode top-k hook admits it, with the request-batched
+        logits: clears the top-k buffer where the op would, then the hook writes
+        the rows. False (nothing run) where the op must run: the decision reads
+        only the step metadata and the hook's row policy (same on every rank)."""
+        from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            DCP_DECODE_TOPK_HOOKS,
+        )
+
+        indexer = self.indexer
+        prefix = indexer.k_cache.prefix
+        hook = DCP_DECODE_TOPK_HOOKS.get(prefix)
+        if hook is None:
+            return False
+        index_md = get_forward_context().attn_metadata[prefix]
+        decode, rows = index_md.decode, index_md.num_decode_tokens
+        if (
+            decode is None
+            or index_md.num_prefills
+            or not 0 < rows <= batch
+            or rows % q
+            or decode.requires_padding
+            or decode.decode_lens.shape[0] != rows  # varlen: one entry per row
+            or not hook[0](rows)
+        ):
+            return False
+        buffer = indexer.topk_indices_buffer
+        if rows != batch or buffer.shape[1] != self.topk:
+            buffer[:batch] = -1  # as the op: only a full decode step skips it
+        logits = self.fp4_logits(q_fp8, head_w, decode, rows, batch, q)
+        if not hook[1](logits, decode, buffer[:rows]):
+            raise RuntimeError(
+                "DCP decode top-k hook declined a step its policy admitted"
+            )
+        return True
 
     # --- DCP top-k merge (#63) ---------------------------------------------------
     def warm(self, block_size):

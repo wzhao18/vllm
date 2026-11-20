@@ -641,11 +641,12 @@ class PreparedDsa:
             if core in HELD_KERNELS and self.overlaps[shape] in modes
         }
 
-    def indexer_core(self, projected, batch):
-        """Top-k of the current rows into the shared buffer (stock decode scoring)."""
+    def indexer_core(self, projected, batch, q=1):
+        """Top-k of the current rows into the shared buffer (stock decode scoring;
+        ``q`` query rows per request)."""
         stage = self.query_stage
         assert projected.shape[0] == batch
-        return self.indexer_stage.run(projected, stage.q_fp8, stage.head_w)
+        return self.indexer_stage.run(projected, stage.q_fp8, stage.head_w, q)
 
     def fused_core(self, cache, metadata, batch, q, join=None):
         """TP on FlashInfer: the fused decode indexer's physical rows, then the
@@ -801,7 +802,7 @@ class PreparedDsa:
                 )
             if merged is None:
                 if topk is None:
-                    topk = self.indexer_core(projected, batch)
+                    topk = self.indexer_core(projected, batch, q)
                 merged = exchanged(self.impl, topk, batch)
             if merged is None:
                 interleave = indexer.cp_kv_cache_interleave_size
@@ -812,7 +813,7 @@ class PreparedDsa:
             latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
             return latent, lse, merged[1]
         if topk is None:
-            topk = self.indexer_core(projected, batch)
+            topk = self.indexer_core(projected, batch, q)
         pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
         slots, valid = exchanged(self.impl, topk, batch) or local_slots(
             md,
@@ -893,7 +894,7 @@ class PreparedDsa:
         if self.fused is not None:
             latent = self.fused_core(cache, metadata, batch, q, join)
         else:
-            topk = self.indexer_core(projected, batch)
+            topk = self.indexer_core(projected, batch, q)
             if join is not None:
                 join()
             latent = self.sparse_core(cache, topk, metadata, batch, q)

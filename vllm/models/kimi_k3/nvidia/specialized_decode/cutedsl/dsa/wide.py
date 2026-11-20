@@ -735,7 +735,7 @@ class WideDsa:
         else:
             mq(*q_args, *publish, stream(self.device))
             self.run_index(x, index_slots, batch, index)
-            topk = self.indexer_core(projected, batch)
+            topk = self.indexer_core(projected, batch, q)
             if query_wait is not None:  # publish-only rows: poll before the decode
                 wait = partial(query_wait, mailbox, stream(self.device))
             latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box, wait)
@@ -786,7 +786,7 @@ class WideDsa:
 
         def chain():
             self.run_index(q_args[0], index_slots, batch, index)
-            topk = self.indexer_core(projected, batch)
+            topk = self.indexer_core(projected, batch, q)
             return self.dcp_core(cache, topk, metadata, batch, box, join)
 
         if batch not in self.prioritized:

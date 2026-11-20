@@ -30,14 +30,15 @@ PAGE = 64  # indexer page tokens
 
 
 @triton.jit
-def _prep_kernel(lens_ptr, sl_ptr, sched_ptr, hw_ptr, w_ptr, reqs, n_w,
+def _prep_kernel(lens_ptr, sl_ptr, cum_ptr, sched_ptr, hw_ptr, w_ptr, reqs, n_w,
                  Q: tl.constexpr, NUM_SMS: tl.constexpr, SPLIT: tl.constexpr,
-                 BLOCK_B: tl.constexpr, BLOCK_C: tl.constexpr, CHUNK_C: tl.constexpr,
+                 BLOCK_B: tl.constexpr, LOG_B: tl.constexpr, BLOCK_C: tl.constexpr,
                  BLOCK_W: tl.constexpr):
     """Program 0: per-request length (max of its Q row lengths) and the kernel's CTA
     schedule (FlashInfer/DeepGEMM PagedMQALogitsScheduler: the requests' SPLIT-token
     splits dealt evenly over NUM_SMS CTAs; row i = (request, split) where CTA i
-    starts, (reqs, 0) past the end). Other programs: head weights BF16 -> FP32."""
+    starts, (reqs, 0) past the end; the request by binary search over the inclusive
+    split sums in ``cum_ptr``). Other programs: head weights BF16 -> FP32."""
     pid = tl.program_id(0)
     if pid == 0:
         b = tl.arange(0, BLOCK_B)
@@ -47,20 +48,27 @@ def _prep_kernel(lens_ptr, sl_ptr, sched_ptr, hw_ptr, w_ptr, reqs, n_w,
             sl = tl.maximum(sl, tl.load(lens_ptr + b * Q + j, mask=m, other=0))
         tl.store(sl_ptr + b, sl, mask=m)
         splits = tl.where(m, (sl + SPLIT - 1) // SPLIT, 0)
-        cum = tl.cumsum(splits, 0)
+        tl.store(cum_ptr + b, tl.cumsum(splits, 0), mask=m)
         total = tl.sum(splits, 0)
+        tl.debug_barrier()
         q_div = total // NUM_SMS
         r_mod = total % NUM_SMS
-        for c0 in tl.static_range(0, BLOCK_C, CHUNK_C):  # [CHUNK_C, BLOCK_B] tiles
-            i = c0 + tl.arange(0, CHUNK_C)
-            tgt = i * q_div + tl.minimum(i, r_mod)
-            seq = tl.sum(((cum[None, :] <= tgt[:, None]) & m[None, :]).to(tl.int32), 1)
-            before = tl.sum(tl.where((b[None, :] < seq[:, None]) & m[None, :],
-                                     splits[None, :], 0), 1)
-            done = seq >= reqs
-            mi = i <= NUM_SMS
-            tl.store(sched_ptr + 2 * i, tl.where(done, reqs, seq), mask=mi)
-            tl.store(sched_ptr + 2 * i + 1, tl.where(done, 0, tgt - before), mask=mi)
+        i = tl.arange(0, BLOCK_C)
+        tgt = i * q_div + tl.minimum(i, r_mod)
+        lo = tl.zeros([BLOCK_C], dtype=tl.int32)
+        hi = tl.zeros([BLOCK_C], dtype=tl.int32) + reqs
+        for _ in tl.static_range(LOG_B + 1):  # first request whose sum exceeds tgt
+            act = lo < hi
+            mid = (lo + hi) // 2
+            c = tl.load(cum_ptr + mid, mask=act, other=0)
+            up = act & (c <= tgt)
+            lo = tl.where(up, mid + 1, lo)
+            hi = tl.where(act & (c > tgt), mid, hi)
+        before = tl.load(cum_ptr + lo - 1, mask=lo > 0, other=0)
+        done = lo >= reqs
+        mi = i <= NUM_SMS
+        tl.store(sched_ptr + 2 * i, tl.where(done, reqs, lo), mask=mi)
+        tl.store(sched_ptr + 2 * i + 1, tl.where(done, 0, tgt - before), mask=mi)
     else:
         o = (pid - 1) * BLOCK_W + tl.arange(0, BLOCK_W)
         mw = o < n_w
@@ -125,6 +133,7 @@ class Fp4IndexLogits:
         self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         reqs = max_rows // q
         self.seq_lens = torch.zeros(reqs, dtype=torch.int32, device=device)
+        self.cum = torch.zeros(reqs, dtype=torch.int32, device=device)
         self.schedule = torch.zeros(self.num_sms + 1, 2, dtype=torch.int32, device=device)
         self.weights = torch.zeros(max_rows, HEADS, dtype=torch.float32, device=device)
         self.arch = _arch(device)
@@ -154,12 +163,12 @@ class Fp4IndexLogits:
         n_w = rows * HEADS
         block_w = 4096
         grid = (1 + triton.cdiv(n_w, block_w),)
+        block_b = max(16, triton.next_power_of_2(reqs))
         _prep_kernel[grid](
-            lens, self.seq_lens, self.schedule, head_w[:rows].contiguous(), w, reqs, n_w,
-            Q=q, NUM_SMS=self.num_sms, SPLIT=SPLIT_KV,
-            BLOCK_B=max(16, triton.next_power_of_2(reqs)),
-            BLOCK_C=triton.next_power_of_2(self.num_sms + 1), CHUNK_C=32,
-            BLOCK_W=block_w, num_warps=4)
+            lens, self.seq_lens, self.cum, self.schedule, head_w[:rows].contiguous(), w,
+            reqs, n_w, Q=q, NUM_SMS=self.num_sms, SPLIT=SPLIT_KV, BLOCK_B=block_b,
+            LOG_B=block_b.bit_length() - 1,
+            BLOCK_C=triton.next_power_of_2(self.num_sms + 1), BLOCK_W=block_w)
 
     def launch(self, query, q_scale, kv_cache, block_table, max_len, rows, reqs):
         q, w = self.q, self.weights[:rows]
