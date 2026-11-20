@@ -333,7 +333,7 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
 }
 
 // Kimi-K3: gated o_norm + MXFP8 o_proj input (smxx/o_norm_mx.cu).
-void launch_o_norm_mx(const void* x, int64_t tokens, int heads,
+bool launch_o_norm_mx(const void* x, int64_t tokens, int heads,
                       NormMxArgs const& a, int num_sms, cudaStream_t stream);
 
 void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
@@ -375,8 +375,9 @@ void o_norm_mxfp8(const Tensor& x, const Tensor& g, const Tensor& weight,
   void* stream_ptr = nullptr;
   TORCH_ERROR_CODE_CHECK(
       aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream_ptr));
-  launch_o_norm_mx(x.const_data_ptr(), T, int(H), a, num_sms,
-                   static_cast<cudaStream_t>(stream_ptr));
+  STD_TORCH_CHECK(launch_o_norm_mx(x.const_data_ptr(), T, int(H), a, num_sms,
+                                   static_cast<cudaStream_t>(stream_ptr)),
+                  "o_norm_mxfp8: kernel launch failed");
 }
 
 void launch_k64_tc(void const* kdq, void const* kr, void const* inv, void const* mqk, float const* gt, void const* beta, void const* v,

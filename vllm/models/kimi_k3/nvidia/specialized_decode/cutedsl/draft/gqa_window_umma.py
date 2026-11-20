@@ -62,6 +62,7 @@ from ..common.primitives import (
     store_words,
     wait,
 )
+from ..common.resident import land, wait_landed
 from .gqa_window import (
     HEAD,
     LOG2E,
@@ -89,6 +90,7 @@ KTILE = KB * 128  # bytes of one stage's K (or V) image
 SLOT = 2 * KTILE  # K then V
 THREADS = 160  # warps 0-3 softmax (TMEM lane quarters), warp 4 producer / MMA
 PRODUCER = 4
+SWARP = 5  # (swarp) the S issuer: S = Q K^T as stages land, apart from PV / refill
 TMEM_COLS = 256
 NS = 2  # S buffers (64 FP32 columns each) and P buffers (32 packed BF16x2 columns)
 P_COL = 64 * NS
@@ -230,7 +232,28 @@ class GqaWindowUmma:
     ``window`` keys. Same arguments as ``GqaWindow``."""
 
     def __init__(self, group, kv_heads, q, page, ring, window, v_scale=None,
-                 round_norm=False, debug=0, redo=False, splits=1):  # fmt: skip
+                 round_norm=False, debug=0, redo=False, splits=1, fill=4, trace=0,
+                 trace_req=0, swarp=False, die_sms=None):  # fmt: skip
+        # swarp: a sixth warp issues S = Q K^T of each stage as soon as it landed
+        # and its S buffer is free; the producer warp then only issues PV and
+        # refills (the S issue no longer queues behind the P-ready wait)
+        self.swarp = swarp
+        self.threads = THREADS + (32 if swarp else 0)
+        # die_sms (die split): a resident grid of two CTAs per SM
+        # (common.resident); the CTAs of die d take the (request, KV head) units
+        # whose KV head the cache homes on die d (mask argument, bit h = die of
+        # KV head h), one unit per CTA
+        self.die_sms = die_sms
+        assert die_sms is None or splits == 1
+        # ``trace`` (development only): a global address of int64 [48, 16] per-stage
+        # clock64 events of the CTA (request ``trace_req``, KV head 1) (``trc``)
+        self.trace, self.trace_req = trace, trace_req
+        # ``fill`` (development only, never set by the install): where the first ring
+        # stages are issued: lanes [0, a) before griddepcontrol.wait, [a, b) right
+        # after it, the rest after the Q prep. Default 4: two stages after the wait,
+        # the rest after the Q prep, whose qkv loads otherwise queue behind the
+        # whole first fill (B96 setup 3.1 -> 2.3 us, layer -1.2 us)
+        self.fill = ((0, ring), (0, 0), (ring, ring), (2, 2), (0, 2))[fill]
         # ``splits`` CTAs per (request, KV head), a cluster: an even share of the
         # stages each; their partial rows LSE-merge by DSMEM pushes to the CTA owning
         # each row (as GqaWindow's)
@@ -260,9 +283,12 @@ class GqaWindowUmma:
         cluster = None
         if cutlass.const_expr(self.splits > 1):
             cluster = (self.splits, 1, 1)
+        grid = (self.splits, self.kv_heads, requests)
+        if cutlass.const_expr(self.die_sms is not None):
+            grid = (2 * sum(self.die_sms), 1, 1)
         launch(
-            self.kernel, args, (self.splits, self.kv_heads, requests), THREADS,
-            cluster=cluster, max_number_threads=[THREADS, 1, 1],
+            self.kernel, args, grid, self.threads,
+            cluster=cluster, max_number_threads=[self.threads, 1, 1],
         )  # fmt: skip
 
     @cute.jit
@@ -334,6 +360,7 @@ class GqaWindowUmma:
         c = Float32(LOG2E / (HEAD**0.5))
 
         split, head, request = cute.arch.block_idx()
+        TH: cutlass.Constexpr = self.threads
         S: cutlass.Constexpr = self.splits
         OWN: cutlass.Constexpr = self.owned
         tid, _, _ = cute.arch.thread_idx()
@@ -341,7 +368,6 @@ class GqaWindowUmma:
         lane = tid % 32
         group8 = lane & 7
         upper = group8 >= 4
-        table_row = table.iterator + request * table.layout.stride[0]
         table_last = Int32(table.shape[1] - 1)
         blocks_max = args[13] - 1
 
@@ -367,6 +393,44 @@ class GqaWindowUmma:
             cute.recast_ptr(qtile.iterator, dtype=Float32), cute.make_layout(4 * 32 * 2)
         )  # fmt: skip
         tslot = alloc(smem, Int32, 2, align=16)  # [1]: the redo flag
+        # ---- die split: this CTA's (request, KV head) from the resident grid's
+        # landing: die d's CTAs (slot-major over its SMs) take die d's units
+        live = Int32(1)
+        launch_i = Int32(0)
+        if cutlass.const_expr(self.die_sms is not None):
+            lslot = alloc(smem, Int32, 2, align=8)
+            mask = args[18]
+            if tid == 0:
+                d0, rank, slot, nth = land(args[15], args[16], args[17], 2)
+                n_d = Int32(self.die_sms[0])
+                if d0 != 0:
+                    n_d = Int32(self.die_sms[1])
+                lslot[0] = (d0 << 16) | (slot * n_d + rank)
+                lslot[1] = nth
+            cute.arch.sync_threads()
+            die = lslot[0] >> 16
+            cu = lslot[0] & 0xFFFF
+            launch_i = lslot[1]
+            split = Int32(0)
+            heads_d = Int32(0)
+            for h in cutlass.range_constexpr(HKV):
+                if ((mask >> h) & 1) == die:
+                    heads_d = heads_d + 1
+            units_d = (out.shape[0] // Q) * heads_d
+            if cu >= units_d:
+                live = Int32(0)
+            cu = max(min(cu, units_d - 1), Int32(0))
+            request = cu // max(heads_d, Int32(1))
+            k_h = cu - request * max(heads_d, Int32(1))
+            seen = Int32(0)
+            head = Int32(0)
+            for h in cutlass.range_constexpr(HKV):
+                if ((mask >> h) & 1) == die:
+                    if seen == k_h:
+                        head = Int32(h)
+                    seen = seen + 1
+        tr_cta = (request == self.trace_req) & (head == 1) & (split == 0)
+        table_row = table.iterator + request * table.layout.stride[0]
         ring_base = Int32(shared_address(ring.iterator))
         q_base = Int32(shared_address(qtile.iterator))
         kv_new = Int32(shared_address(newkv.iterator))
@@ -392,8 +456,8 @@ class GqaWindowUmma:
                 arm(recv_bar, S * my_rows * (PITCH * 4))
         # the Q tile's padding rows (32 - ROWS per lane quarter)
         PAD: cutlass.Constexpr = (32 - ROWS) * 4 * 8
-        for it in cutlass.range_constexpr(-(-PAD // THREADS)):
-            t = it * THREADS + tid
+        for it in cutlass.range_constexpr(-(-PAD // TH)):
+            t = it * TH + tid
             if t < PAD:
                 quarter, rest = t // ((32 - ROWS) * 8), t % ((32 - ROWS) * 8)
                 prow = 32 * quarter + ROWS + rest // 8
@@ -405,7 +469,7 @@ class GqaWindowUmma:
         # (the first stages' TMA loads right after the wait, the RoPE rows); after
         # the wait it is read again, and loads from moved metadata are redone (never
         # in a decode step: the metadata is written before the graph)
-        length0 = load_i32(seq_lens.iterator + request)
+        length0 = load_i32(seq_lens.iterator + request) * live
         _, first0, count0 = self.stages(length0, split)
         page_lo0 = first0 * KB // N
         if tid < NP:
@@ -413,8 +477,8 @@ class GqaWindowUmma:
             blocks[tid] = min(max(entry0, Int32(0)), blocks_max)
         TASKS: cutlass.Constexpr = ROWS * 8 + Q * 8
         tasks = []
-        for it in cutlass.range_constexpr(-(-TASKS // THREADS)):
-            t = it * THREADS + tid
+        for it in cutlass.range_constexpr(-(-TASKS // TH)):
+            t = it * TH + tid
             is_kv = t >= ROWS * 8
             i = min(t // 8, ROWS - 1) // G
             gq = min(t // 8, ROWS - 1) % G
@@ -432,6 +496,15 @@ class GqaWindowUmma:
         cute.arch.sync_threads()
         if cutlass.const_expr(S > 1):
             cute.arch.cluster_arrive_relaxed()  # every barrier before any DSMEM push
+        spec_n = min(count0, Int32(R))
+        FA: cutlass.Constexpr = self.fill[0]
+        FB: cutlass.Constexpr = self.fill[1]
+        if cutlass.const_expr(FA > 0):
+            if warp == PRODUCER:
+                if lane < min(spec_n, Int32(FA)):
+                    j = first0 + lane
+                    self.issue(kv_map, full + 8 * lane, ring_base + lane * SLOT, head,
+                               blocks[j * KB // N - page_lo0], j * KB % N)  # fmt: skip
         self.rec(request, head, 0, global_timer(), tid == 0)
         cute.arch.griddepcontrol_wait()
         # (TMEM after the wait: allocated before it, while the previous kernel's CTAs
@@ -442,13 +515,12 @@ class GqaWindowUmma:
 
         # ---- after the wait: the first stages' loads at the pre-wait addresses, then
         # the metadata again (confirming them) and the prep math
-        spec_n = min(count0, Int32(R))
         if warp == PRODUCER:
-            if lane < spec_n:
+            if (lane >= FA) & (lane < min(spec_n, Int32(FB))):
                 j = first0 + lane
                 self.issue(kv_map, full + 8 * lane, ring_base + lane * SLOT, head,
                            blocks[j * KB // N - page_lo0], j * KB % N)  # fmt: skip
-        length = load_i32(seq_lens.iterator + request)
+        length = load_i32(seq_lens.iterator + request) * live
         lo, first, count = self.stages(length, split)
         page_lo = first * KB // N
         moved = length != length0
@@ -517,6 +589,12 @@ class GqaWindowUmma:
                     s_addr = kv_base + s_elem * 2
                     store_words(s_addr, tuple(roped))
                     store_words(s_addr + 128, tuple(value))
+        if cutlass.const_expr(FB < R):
+            if warp == PRODUCER:
+                if (lane >= FB) & (lane < spec_n):
+                    j = first0 + lane
+                    self.issue(kv_map, full + 8 * lane, ring_base + lane * SLOT, head,
+                               blocks[j * KB // N - page_lo0], j * KB % N)  # fmt: skip
         fence_async_shared()
         fence_tmem(before=True)
         cute.arch.sync_threads()
@@ -551,39 +629,71 @@ class GqaWindowUmma:
             a_full = Int64(0)
             a_pready = Int64(0)
             loop0 = self.tick()
-            if count > 0:
-                a_full = a_full + self.issue_s(
-                    Int32(0), first, lo, lo_max, q_first, length, ring_base, full,
-                    sready, sfree, tmem, q_desc, lane, kv_new, newvalid, offset_bits,
-                )  # fmt: skip
-            for t in cutlass.range(count, unroll=1):
-                if t + 1 < count:
-                    a_full = a_full + self.issue_s(
-                        t + 1, first, lo, lo_max, q_first, length, ring_base, full,
-                        sready, sfree, tmem, q_desc, lane, kv_new, newvalid,
-                        offset_bits,
+            trp = tr_cta & (lane == 0)
+            if cutlass.const_expr(self.swarp):
+                # PV of each stage once its P is ready; the stage's slot refills as
+                # soon as its PV completed (S issued by the S warp)
+                for t in cutlass.range(count, unroll=1):
+                    b = t % NS
+                    self.trc(trp, t, 4)
+                    wait(pready + 8 * b, (t // NS) & 1, scope="cta")
+                    self.trc(trp, t, 5)
+                    fence_tmem()
+                    v_desc = desc_sw128(ring_base + (t % R) * SLOT + KTILE, KTILE)
+                    mma_pv_block(
+                        tmem + O_COL, tmem + P_COL + Uint32(32) * Uint32(b), v_desc,
+                        Uint32(PV_INSTR), Int32(t > 0), pvdone + 8 * b,
                     )  # fmt: skip
-                c0 = self.tick()
-                b = t % NS
-                wait(pready + 8 * b, (t // NS) & 1, scope="cta")
-                a_pready = a_pready + self.tick() - c0
-                fence_tmem()
-                v_desc = desc_sw128(ring_base + (t % R) * SLOT + KTILE, KTILE)
-                mma_pv_block(
-                    tmem + O_COL, tmem + P_COL + Uint32(32) * Uint32(b), v_desc,
-                    Uint32(PV_INSTR), Int32(t > 0), pvdone + 8 * b,
-                )  # fmt: skip
-                if t >= 1:
-                    nxt = t - 1 + R
-                    if nxt < count:  # stage t - 1's PV (issued last iteration) done
-                        wait(pvdone + 8 * ((t - 1) % NS), ((t - 1) // NS) & 1,
-                             scope="cta")  # fmt: skip
+                    self.trc(trp, t, 6)
+                    nxt = t + R
+                    if nxt < count:
+                        wait(pvdone + 8 * b, (t // NS) & 1, scope="cta")
+                        self.trc(trp, t, 7)
                         if lane == 0:
                             j = first + nxt
                             blk = blocks[j * KB // N - page_lo]
-                            r_i = (t - 1) % R
+                            r_i = t % R
                             self.issue(kv_map, full + 8 * r_i, ring_base + r_i * SLOT,
                                        head, blk, j * KB % N)  # fmt: skip
+            else:
+                if count > 0:
+                    a_full = a_full + self.issue_s(
+                        Int32(0), first, lo, lo_max, q_first, length, ring_base, full,
+                        sready, sfree, tmem, q_desc, lane, kv_new, newvalid, offset_bits,
+                        trp,
+                    )  # fmt: skip
+                for t in cutlass.range(count, unroll=1):
+                    if t + 1 < count:
+                        a_full = a_full + self.issue_s(
+                            t + 1, first, lo, lo_max, q_first, length, ring_base, full,
+                            sready, sfree, tmem, q_desc, lane, kv_new, newvalid,
+                            offset_bits, trp,
+                        )  # fmt: skip
+                    c0 = self.tick()
+                    b = t % NS
+                    self.trc(trp, t, 4)
+                    wait(pready + 8 * b, (t // NS) & 1, scope="cta")
+                    self.trc(trp, t, 5)
+                    a_pready = a_pready + self.tick() - c0
+                    fence_tmem()
+                    v_desc = desc_sw128(ring_base + (t % R) * SLOT + KTILE, KTILE)
+                    mma_pv_block(
+                        tmem + O_COL, tmem + P_COL + Uint32(32) * Uint32(b), v_desc,
+                        Uint32(PV_INSTR), Int32(t > 0), pvdone + 8 * b,
+                    )  # fmt: skip
+                    self.trc(trp, t, 6)
+                    if t >= 1:
+                        nxt = t - 1 + R
+                        if nxt < count:  # stage t - 1's PV (issued last iteration) done
+                            wait(pvdone + 8 * ((t - 1) % NS), ((t - 1) // NS) & 1,
+                                 scope="cta")  # fmt: skip
+                            self.trc(trp, t - 1, 7)
+                            if lane == 0:
+                                j = first + nxt
+                                blk = blocks[j * KB // N - page_lo]
+                                r_i = (t - 1) % R
+                                self.issue(kv_map, full + 8 * r_i, ring_base + r_i * SLOT,
+                                           head, blk, j * KB % N)  # fmt: skip
             first_lane = lane == 0
             self.rec(request, head, 3, global_timer(), first_lane)
             self.rec(request, head, 4, a_full, first_lane)
@@ -591,6 +701,18 @@ class GqaWindowUmma:
             self.rec(request, head, 15, self.tick() - loop0, first_lane)
             if cutlass.const_expr(S > 1):
                 cute.arch.cluster_wait()
+        elif warp == SWARP:
+            if cutlass.const_expr(self.swarp):
+                # ---- S issuer: S of stage t as soon as it landed and S buffer t % NS
+                # is free (the warps loaded stage t - NS's S)
+                q_desc_s = desc_sw128(q_base, 16)
+                trq = tr_cta & (lane == 0)
+                for t in cutlass.range(count, unroll=1):
+                    self.issue_s(
+                        t, first, lo, lo_max, q_first, length, ring_base, full,
+                        sready, sfree, tmem, q_desc_s, lane, kv_new, newvalid,
+                        offset_bits, trq,
+                    )  # fmt: skip
         else:
             # ---- softmax: warp w = TMEM lane quarter w, the stages' keys 16w..16w+15
             r = lane
@@ -607,16 +729,20 @@ class GqaWindowUmma:
             p_lanes = tmem + lanes + P_COL
             for k in cutlass.range_constexpr(NS):  # every P buffer's columns: zero
                 st32w(p_lanes + Uint32(32 * k), (Uint32(0),) * 32)
+            trs = tr_cta & (lane == 0) & (warp == 0)
             for t in cutlass.range(count, unroll=1):
                 b = t % NS
                 s_addr = tmem + lanes + Uint32(64) * Uint32(b)
                 c0 = self.tick()
+                self.trc(trs, t, 8)
                 wait(sready + 8 * b, (t // NS) & 1, scope="cta")
+                self.trc(trs, t, 9)
                 a_sr = a_sr + self.tick() - c0
                 fence_tmem()
                 raw = ld16(s_addr + Uint32(16) * Uint32(warp))
                 fence_tmem(before=True)
                 cute.arch.sync_warp()
+                self.trc(trs, t, 10)
                 if lane == 0:
                     arrive(sfree + 8 * b)
                 ps0 = (first + t) * KB
@@ -653,15 +779,19 @@ class GqaWindowUmma:
                 ps = [ex2(fma(xs[e], c, bias)) for e in range(16)]
                 l_run = l_run + tree(lambda u, v: u + v, ps)
                 packed = tuple(bf16x2(ps[2 * k], ps[2 * k + 1]) for k in range(8))
+                self.trc(trs, t, 11)
                 if t >= NS:  # stage t - NS's PV read this P buffer
                     wait(pvdone + 8 * b, ((t - NS) // NS) & 1, scope="cta")
                     fence_tmem()
+                self.trc(trs, t, 12)
                 p_own = p_lanes + Uint32(32) * Uint32(b) + Uint32(8) * Uint32(warp)
                 st8w(p_own, packed)
                 fence_tmem(before=True)
                 cute.arch.sync_warp()
                 if lane == 0:
                     arrive(pready + 8 * b)
+                self.trc(trs, t, 13)
+                self.trc(tr_cta & (lane == 0) & (warp == 3), t, 14)
             cute.arch.griddepcontrol_launch_dependents()
             self.rec(request, head, 8, a_sr, tid == 0)
             self.rec(request, head, 10, global_timer(), tid == 0)
@@ -710,7 +840,8 @@ class GqaWindowUmma:
                             hi = fma(bits_float(hi4[e]), weight, values[4 + e])
                             values[4 + e] = hi
                     if cutlass.const_expr(S == 1):
-                        self.store_row(out, request, head, rr, d8, values, total)
+                        if live != 0:
+                            self.store_row(out, request, head, rr, d8, values, total)
                     else:
                         slot_r = (split * OWN + rr % OWN) * PITCH
                         dst = recv_base + (slot_r + 8 * d8) * 4
@@ -751,6 +882,9 @@ class GqaWindowUmma:
                         self.store_row(out, request, head, split * OWN + rr, d8,
                                        values, total)  # fmt: skip
         self.rec(request, head, 11, global_timer(), tid == 0)
+        if cutlass.const_expr(self.die_sms is not None):
+            if tid == 0:  # (no CTA leaves before every CTA of the launch landed)
+                wait_landed(args[17], launch_i, 2 * sum(self.die_sms))
         # ---- teardown: the producer frees the TMEM after every tcgen05 operation
         fence_tmem(before=True)
         cute.arch.sync_threads()
@@ -775,7 +909,7 @@ class GqaWindowUmma:
     @cute.jit
     def issue_s(
         self, t, first, lo, lo_max, q_first, length, ring_base, full, sready, sfree,
-        tmem, q_desc, lane, kv_new, newvalid, offset_bits,
+        tmem, q_desc, lane, kv_new, newvalid, offset_bits, tr=False,
     ):  # fmt: skip
         """S = Q K^T of stage ``t`` into S buffer t % NS once its K / V landed (edge
         rows fixed first) and the warps loaded stage t - NS's S. Returns the cycles
@@ -784,8 +918,10 @@ class GqaWindowUmma:
         tile = ring_base + s_i * SLOT
         p0 = (first + t) * KB
         c0 = self.tick()
+        self.trc(tr, t, 0)
         wait(full + 8 * s_i, ((t // self.ring) + ((offset_bits >> s_i) & 1)) & 1,
              scope="cta")  # fmt: skip
+        self.trc(tr, t, 1)
         waited = self.tick() - c0
         if (p0 < lo_max) | (p0 + KB > q_first):
             self.fixup(tile, p0, lane, lo, length, kv_new, newvalid)
@@ -794,11 +930,13 @@ class GqaWindowUmma:
         b = t % NS
         if t >= NS:  # the warps loaded stage t - NS's S from these columns
             wait(sfree + 8 * b, ((t - NS) // NS) & 1, scope="cta")
+        self.trc(tr, t, 2)
         fence_tmem()
         mma_bf16_block(
             tmem + Uint32(64) * Uint32(b), q_desc, desc_sw128(tile, 16),
             Uint32(S_INSTR), Int32(0), sready + 8 * b, Int32(1),
         )  # fmt: skip
+        self.trc(tr, t, 3)
         return waited
 
     @cute.jit
@@ -809,6 +947,12 @@ class GqaWindowUmma:
         return value
 
     @cute.jit
+    def trc(self, on, t, e: cutlass.Constexpr[int]):
+        if cutlass.const_expr(self.trace != 0):
+            if on & (t < 48):
+                store_u64(Int64(self.trace) + (t * 16 + e) * 8, clock64())
+
+    @cute.jit
     def rec(self, request, head, k: cutlass.Constexpr[int], value, cond):
         if cutlass.const_expr(self.debug != 0):
             if cond:
@@ -816,16 +960,31 @@ class GqaWindowUmma:
                 store_u64(Int64(self.debug) + (cta * 16 + k) * 8, value)
 
 
+def umma_smem(ring, q, page, window, die_split=False):
+    """Dynamic shared memory bytes of a GqaWindowUmma CTA (the kernel's
+    allocation order and alignments)."""
+    off = 0
+    pages = -(-(window + q - 1 + 2 * KB) // page) + 1
+    sizes = [(ring * SLOT, 1024), (128 * 128, 1024), (q * 256, 16), (4 * q, 16),
+             (8 * (ring + 4 * NS + 1), 8), (4 * pages, 16), (8, 16)]  # fmt: skip
+    if die_split:
+        sizes.append((8, 8))
+    for n, align in sizes:
+        off = -(-off // align) * align + n
+    return off
+
+
 @cache
 def compile_window_umma(
     group, kv_heads, q, page, ring, window, v_scale, max_position, device,
-    round_norm=False, debug=0, redo=False, splits=1,
+    round_norm=False, debug=0, redo=False, splits=1, fill=4, trace=0, trace_req=0,
+    swarp=False, die_sms=None,
 ):  # fmt: skip
     """``GqaWindowUmma`` for any request count (row-dynamic views); ``GqaWindow``'s
     arguments."""
     kernel = GqaWindowUmma(
         group, kv_heads, q, page, ring, window, v_scale, round_norm, debug, redo,
-        splits,
+        splits, fill, trace, trace_req, swarp, die_sms,
     )
     i64, i32 = torch.int64, torch.int32
     count = cute.sym_int()
@@ -846,5 +1005,7 @@ def compile_window_umma(
         Int32(1),  # blocks
         Float32(1e-5),  # eps
     )
+    if die_sms is not None:  # (the resident grid: SM table, tickets, landings; mask)
+        args += (Int64(0), Int64(0), Int64(0), Int32(0))
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args, make_fake_stream())
