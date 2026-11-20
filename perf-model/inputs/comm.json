@@ -1,0 +1,919 @@
+{
+ "_meta": {
+  "what": "Per-op communication primitives and per-topology per-layer comm lists for the K3.1-Pro VR200 SOL model. Companion of topologies.md (same ids/sections).",
+  "units": "bytes per GPU over NVLink per collective call (in_B = received, out_B = sent), hops = dependent NVLink handoffs. Cost (hw.md sec.4): t = hops*2.9e-6 + max(in_B,out_B)/1.25e12 s (SOL 1.8e12).",
+  "formula_syntax": "Python expressions over the variables in 'variables' and 'constants'; sums over requests written as sum_C (sum of context lengths of the step's requests).",
+  "sources": [
+   "/Users/weizha/k31vr-dev/vllm/models/kimi_k3/nvidia/{model.py,dsa.py,kda.py,dspark_gqa.py,latent_moe_runner.py,ops/sp_all_gather.py}",
+   "/Users/weizha/k31vr-dev/vllm/v1/attention/ops/{shardq.py,dcp.py,dcp_shardq/*}",
+   "/Users/weizha/k31vr-dev/vllm/models/kimi_k3/nvidia/specialized_decode/{runtime,cutedsl}/*",
+   "/Users/weizha/k31vr-dev/vllm/models/kimi_k3/nvidia/megamoe_rubin/* (token_comm.py)",
+   "/Users/weizha/k31vr-dev/vllm/models/kimi_k3/nvidia/dsa_kernels/{dcp_exchange,dcp_prefill_topk_merge}",
+   "Inferact/nvidia-vllm-agentx PR #20 and #23 (ops/dsa_dp.py, ops/sp_local_aux.py, model.py, dsa.py, gqa_draft.py diffs)",
+   "results/k31vr-frozen-sweep-20261114/runs/C512-a1093684 and results/k31vr-release-draft-sweep-20261117/runs/C64-a1118777 (configs + logs)"
+  ],
+  "date": "2026-11-17"
+ },
+ "constants": {
+  "h": 7168,
+  "row_bf16": 14336,
+  "vocab": 163840,
+  "n_layers": 93,
+  "n_kda": 69,
+  "n_dsa": 24,
+  "n_moe": 92,
+  "dense_layer": 0,
+  "dsa_layers_0idx": [
+   3,
+   7,
+   11,
+   15,
+   19,
+   23,
+   27,
+   31,
+   35,
+   39,
+   43,
+   47,
+   51,
+   55,
+   59,
+   63,
+   67,
+   71,
+   75,
+   79,
+   83,
+   87,
+   91,
+   92
+  ],
+  "mla_heads": 96,
+  "q_lora": 1536,
+  "kv_lora": 512,
+  "qk_nope": 128,
+  "qk_rope": 64,
+  "v_head": 128,
+  "mqa_q_dim": 576,
+  "mqa_out_dim": 512,
+  "idx_heads": 32,
+  "idx_dim": 128,
+  "topk": 2048,
+  "kda_heads": 96,
+  "kda_dim": 128,
+  "kda_conv": 4,
+  "moe_experts": 896,
+  "moe_topk": 16,
+  "latent": 3584,
+  "moe_inter": 3072,
+  "shared_inter": 6144,
+  "mla_kv_B_per_tok_layer": 576,
+  "idx_kv_B_per_tok_layer": 68,
+  "dsa_kv_B_per_tok": 15456,
+  "dispatch_row_B": {
+   "mxfp8": 3696,
+   "nvfp4": 2016
+  },
+  "combine_row_B": 7168,
+  "draft": {
+   "layers": 5,
+   "q_heads": 96,
+   "kv_heads": 16,
+   "head_dim": 64,
+   "window": 2048,
+   "mlp": 14336,
+   "fc_in": 35840,
+   "markov_rank": 512,
+   "aux_layers": [
+    76,
+    80,
+    84,
+    88,
+    92
+   ],
+   "swa_B_per_tok": 20480,
+   "ar_sites_per_forward": 11
+  }
+ },
+ "variables": {
+  "N": "TP group size (heads/columns sharded); W = DCP size (= N in all shipped configs); D = DP size; E = EP size (= D*N with MegaMoE)",
+  "T": "rows of the step on one TP group (prefill: fresh tokens; decode: R = B*q)",
+  "B": "requests in the TP group (decode)",
+  "q": "1 + k (DSpark draft length k)",
+  "n": "rows per rank under SP = ceil(T/N)",
+  "m": "rows entering the MoE on this rank (T/N under SP or token shard, T under DEP, R under DEP decode)",
+  "sum_C": "sum over the step's requests of context length (prefix+new)",
+  "T_o": "rows owned by DSA-DP owner card o",
+  "imb": "MoE max/mean routes per rank (EPLB imbalance), >= 1",
+  "a": "dispatch payload per route: dispatch_row_B[mxfp8|nvfp4]",
+  "X_topk": "DcpExchange bytes per row per peer, ~1000-2000 (inferred, see topologies.md sec.10)",
+  "R_d": "rows of one drafter forward"
+ },
+ "primitives": {
+  "P1": {
+   "name": "all_reduce_nvls_gemm_ar",
+   "impl": "model_executor/kernels/linear/cute_dsl/gemm_rs_ar.py (multimem.ld_reduce f32 + multimem.st), bound by nvidia/model.py maybe_init_gemm_rs_ar",
+   "in_B": "M",
+   "out_B": "M*(1+1/N)",
+   "hops": 2,
+   "note": "M = full tensor bytes; switch reduction"
+  },
+  "P1b": {
+   "name": "all_reduce_twoshot_lamport",
+   "impl": "specialized_decode/cutedsl/common/twoshot.py",
+   "in_B": "2*M*(N-1)/N",
+   "out_B": "2*M*(N-1)/N",
+   "hops": 2
+  },
+  "P1c": {
+   "name": "all_reduce_oneshot_lamport_multicast",
+   "impl": "oproj/prepared.py (B<=8), draft/allreduce.py ArNorm",
+   "in_B": "(N-1)*M",
+   "out_B": "M",
+   "hops": 1
+  },
+  "P2": {
+   "name": "sp_all_gather_push",
+   "impl": "nvidia/ops/sp_all_gather.py SymmSpAllGather (push to peers + symm barrier); custom IPC AG for small shards",
+   "in_B": "(N-1)*n*row_bf16",
+   "out_B": "(N-1)*n*row_bf16",
+   "hops": 1,
+   "note": "measured 0.98 TB/s at 17.4K rows TP4 (191 us) vs NCCL ring 463 us"
+  },
+  "P2b": {
+   "name": "sp_all_gather_lamport_multicast",
+   "impl": "specialized_decode/cutedsl/common/sp_comm.py SpAllGather",
+   "in_B": "(N-1)*n*row_bf16",
+   "out_B": "n*row_bf16",
+   "hops": 1
+  },
+  "P3": {
+   "name": "sp_reduce_scatter_nvls_gemm_rs",
+   "impl": "gemm_rs_ar.py RS mode (prefill SP)",
+   "in_B": "T*row_bf16/N",
+   "out_B": "T*row_bf16*(N-1)/N",
+   "hops": 2
+  },
+  "P3b": {
+   "name": "sp_reduce_scatter_push_owner_sum",
+   "impl": "sp_comm.py SpReduceScatter / oproj/sp.py SpOprojWarp",
+   "in_B": "(N-1)*n*row_bf16",
+   "out_B": "(N-1)*n*row_bf16",
+   "hops": 1
+  },
+  "P4": {
+   "name": "shardq_shard_q",
+   "impl": "v1/attention/ops/shardq.py:349 (push rows, 2 barriers); proj variant d=192 bf16 (q before W_UK); non-proj d=576",
+   "in_B": "(T/N)*(N-1)*(96/N)*d*b",
+   "out_B": "T*(N-1)/N*(96/N)*d*b",
+   "hops": 1
+  },
+  "P5": {
+   "name": "shardq_unshard_out",
+   "impl": "shardq.py:418; proj variant d_v=128 bf16 (after W_UV); non-proj 512 bf16",
+   "in_B": "T*(N-1)/N*(96/N)*d_v*2",
+   "out_B": "T*(N-1)/N*(96/N)*d_v*2",
+   "hops": 1
+  },
+  "P6": {
+   "name": "dcp_q_gather",
+   "impl": "v1/attention/ops/dcp.py DirectDCPQGatherWorkspace; sdec MlaQuery publish (cutedsl/mla/dcp.py, dsa/dcp_stage.py)",
+   "in_B": "T*(W-1)*(96/W)*576",
+   "out_B": "T*(96/W)*576",
+   "hops": 1,
+   "note": "FP8 per-tensor MQA query (1 B/elem)"
+  },
+  "P7": {
+   "name": "dcp_lse_a2a_latent",
+   "impl": "dcp.py:945 dcp_a2a_lse_reduce / DirectDCPA2AWorkspace",
+   "in_B": "T*(W-1)*(96/W)*(512*2+8)",
+   "out_B": "T*(W-1)*(96/W)*(512*2+8)",
+   "hops": 1,
+   "note": "lse packed in output dtype"
+  },
+  "P7b": {
+   "name": "dcp_value_proj_push",
+   "impl": "specialized_decode/cutedsl/dsa/dcp_value.py (W_UV on all gathered heads first)",
+   "in_B": "T*(W-1)*(96/W)*(128*2+4)",
+   "out_B": "T*(W-1)*(96/W)*(128*2+4)",
+   "hops": 1
+  },
+  "P8": {
+   "name": "dcp_decode_topk_exchange",
+   "impl": "nvidia/dsa_kernels/dcp_exchange/ops.py DcpExchange.topk_merge (exact, histogram threshold)",
+   "in_B": "T*(W-1)*X_topk",
+   "out_B": "T*(W-1)*X_topk",
+   "hops": "1-3"
+  },
+  "P8b": {
+   "name": "dcp_prefill_topk_hist_merge",
+   "impl": "dsa_kernels/dcp_prefill_topk_merge/hist_merge.py",
+   "in_B": "T*(W-1)*(1536+4*tie_words)",
+   "out_B": "T*(W-1)*(1536+4*tie_words)",
+   "hops": "4-5"
+  },
+  "P8c": {
+   "name": "dcp_topk_generic_allgather",
+   "impl": "stock sparse_attn_indexer merge (score,id) candidates",
+   "in_B": "T*W*2048*8",
+   "out_B": "T*2048*8*(W-1)",
+   "hops": 1,
+   "note": "~1.9 GB per rank per 16K chunk; legacy"
+  },
+  "P9": {
+   "name": "dcp_shardq_context_push",
+   "impl": "v1/attention/ops/dcp_shardq/{context,gather,rank_major}.py (MLA rows by copy engine + flag; indexer rows SM push)",
+   "in_B": "sum_C*644*(W-1)/W + T*68*(W-1)/W",
+   "out_B": "sum_C*644*(W-1)/W + T*68*(W-1)/W",
+   "hops": 1,
+   "note": "off the SM critical path (CE) for the MLA rows"
+  },
+  "P10": {
+   "name": "dcp_chunked_context_kv_gather",
+   "impl": "dcp.py DirectDCPKVGatherWorkspace (dense-MHA / legacy prefill)",
+   "in_B": "C*(W-1)/W*576",
+   "out_B": "C*(W-1)/W*576",
+   "hops": 1
+  },
+  "P11": {
+   "name": "megamoe_dispatch_per_route",
+   "impl": "megamoe_rubin/src/sources/communication/nvlink_domain/token_comm.py token_in (one pull per route)",
+   "in_B": "imb*m*16*a*(E-1)/E",
+   "out_B": "m*16*a*(E-1)/E",
+   "hops": 2,
+   "note": "a = 3696 (MXFP8) or 2016 (NVFP4); Rubin backend uses NVFP4 above 512 tokens/rank (experts.py:145)"
+  },
+  "P12": {
+   "name": "megamoe_combine_per_route_bf16",
+   "impl": "token_comm.py token_back + separate TopkReduce",
+   "in_B": "m*16*7168*(E-1)/E",
+   "out_B": "imb*m*16*7168*(E-1)/E",
+   "hops": 1
+  },
+  "P13": {
+   "name": "dsadp_push_in_out",
+   "impl": "PR#20 nvidia/ops/dsa_dp.py push_in/push_out (shardq._push_rows, 2 barriers each)",
+   "in_B": "T_o*row_bf16*(N-1)/N",
+   "out_B": "n*row_bf16*(N-1)/N",
+   "hops": 1,
+   "note": "x2 per DSA layer (in + out); replaces SP AG + RS of DSA layers"
+  },
+  "P13b": {
+   "name": "dsadp_lamport_exchange_decode",
+   "impl": "PR#23 dsa_dp.py _lamport_exchange (bf16 -0.0 sentinel, no barrier)",
+   "in_B": "rows_not_local*row_bf16",
+   "out_B": "rows_not_local*row_bf16",
+   "hops": 1,
+   "note": "x2 per DSA layer"
+  },
+  "P14": {
+   "name": "tp_moe_front_allgather",
+   "impl": "specialized_decode/cutedsl/moe/front.py (router logits fp32 + latent bf16 shards, multicast)",
+   "in_B": "T*(N-1)/N*(896*4+3584*2)",
+   "out_B": "T/N*(896*4+3584*2)",
+   "hops": 1
+  },
+  "P15": {
+   "name": "tp_moe_tail",
+   "impl": "cutedsl/moe/tail.py; stock latent_moe_runner.py (latent AR [T,3584] + shared AR [T,7168])",
+   "in_B": "AR(T*7168)+AR(T*14336)",
+   "out_B": "AR(T*7168)+AR(T*14336)",
+   "hops": "2-3"
+  },
+  "P16": {
+   "name": "vocab_sharded_verify_markov_exchange",
+   "impl": "runtime/sampled_verify.py (2 rounds), cutedsl/draft/markov.py (u64 keys per position)",
+   "in_B": "T*(N-1)*~100",
+   "out_B": "T*~100",
+   "hops": "2 (verify), k (Markov)"
+  },
+  "P17": {
+   "name": "logits_allgather",
+   "impl": "ParallelLMHead + TP gather",
+   "in_B": "T*(N-1)/N*163840*2",
+   "out_B": "T*(N-1)/N*163840*2",
+   "hops": 1
+  },
+  "P18": {
+   "name": "final_sp_allgather_with_aux",
+   "impl": "nvidia/model.py:1865 (stock path, [hidden | 5 aux])",
+   "in_B": "(N-1)*n*6*row_bf16",
+   "out_B": "(N-1)*n*6*row_bf16",
+   "hops": 1,
+   "note": "PR#20 sp_local_aux: hidden only + drafter AG of projected [n,h]"
+  },
+  "P19": {
+   "name": "dp_token_sync",
+   "impl": "DP coordinator; megamoe_rubin/session.py ep_mean_tokens",
+   "in_B": "~0",
+   "out_B": "~0",
+   "hops": 1,
+   "note": "forces EP lock-step bucket = DP max"
+  },
+  "P20": {
+   "name": "nixl_pd_kv",
+   "impl": "distributed/kv_transfer/kv_connector/v1/nixl/* (RDMA)",
+   "in_B": "per request: dC*15456 + KDA(434e6 + conv) + SWA ~45e6; /W homogeneous DCP; DSA groups owner-only under DSA-DP",
+   "out_B": "",
+   "hops": "RDMA"
+  },
+  "P21": {
+   "name": "mooncake_store",
+   "impl": "distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py (RDMA, host/remote)",
+   "in_B": "per request load: C_hit*15456 + KDA checkpoint ~0.46-0.53e9 + SWA",
+   "out_B": "",
+   "hops": "RDMA"
+  }
+ },
+ "topologies": {
+  "TP": {
+   "desc": "TP-N, replicated residual (no SP). Used: P/D prefill TP8+DCP8 (DP1, EP8, MoE token shard); TP16+DCP16 decode (MoE TP, specialized decode).",
+   "code": "nvidia/model.py:1240 (use_sequence_parallel False), :205 use_moe_token_shard, :1051 _token_shard_forward",
+   "residual": "replicated [T,h] on every TP rank",
+   "layers": {
+    "kda": [
+     {
+      "op": "o_proj reduce",
+      "primitive": "P1|P1b|P1c",
+      "group": "TP",
+      "calls_per_layer": 1,
+      "in_B": "~T*row_bf16",
+      "out_B": "~T*row_bf16"
+     }
+    ],
+    "dsa": [
+     {
+      "op": "o_proj reduce",
+      "primitive": "P1|P1b|P1c",
+      "group": "TP",
+      "calls_per_layer": 1,
+      "in_B": "~T*row_bf16",
+      "out_B": "~T*row_bf16"
+     },
+     {
+      "op": "attention comm",
+      "primitive": "see DCP_decode / DCP_ShardQ_prefill / TP_ShardQ / DSA-DP",
+      "group": "TP",
+      "calls_per_layer": 1,
+      "note": "without any: replicated DSA KV + replicated indexer, local heads padded to the kernel tile"
+     }
+    ],
+    "moe_token_shard": [
+     {
+      "op": "dispatch",
+      "primitive": "P11",
+      "group": "EP=N",
+      "calls_per_layer": 1,
+      "note": "m = T/N"
+     },
+     {
+      "op": "combine",
+      "primitive": "P12",
+      "group": "EP=N",
+      "calls_per_layer": 1
+     },
+     {
+      "op": "single reduce (shared partial + routed rows)",
+      "primitive": "P1",
+      "group": "TP",
+      "calls_per_layer": 1,
+      "in_B": "~T*row_bf16",
+      "out_B": "~T*row_bf16",
+      "note": "GEMM-AR epilogue from 288 tokens"
+     }
+    ],
+    "moe_tp_no_ep": [
+     {
+      "op": "front AG logits+latent",
+      "primitive": "P14",
+      "group": "TP",
+      "calls_per_layer": 1
+     },
+     {
+      "op": "tail latent AR + shared RS + out AG",
+      "primitive": "P15",
+      "group": "TP",
+      "calls_per_layer": 1
+     }
+    ],
+    "dense_mlp_layer0": [
+     {
+      "op": "down_proj reduce",
+      "primitive": "P1",
+      "group": "TP",
+      "calls_per_layer": 1,
+      "in_B": "~T*row_bf16",
+      "out_B": "~T*row_bf16"
+     }
+    ],
+    "embedding": [
+     {
+      "op": "vocab-parallel reduce",
+      "primitive": "P1 (or owner publish in sdec TP16)",
+      "group": "TP",
+      "calls_per_layer": 1
+     }
+    ],
+    "lm_head": [
+     {
+      "op": "logits",
+      "primitive": "P17 (stock) | P16 (sdec sharded verify)",
+      "group": "TP",
+      "calls_per_layer": 1
+     }
+    ]
+   },
+   "replicated_compute": [
+    "fused_qkv_a 7168x2112 (all rows)",
+    "indexer wq 1536x4096 + wkv 7168x160 (all rows)",
+    "KDA f_a 7168x128",
+    "w/o ShardQ/DCP/DSA-DP: indexer scoring T*C*32*128 + top-k + MLA/indexer KV insert",
+    "stock plain-TP MoE: router + latent down/up on all rows"
+   ],
+   "kv_per_gpu_per_req": "dsa_kv_B_per_tok*C + (KDA + SWA + RecoverSSM)/N"
+  },
+  "TP_SP": {
+   "desc": "TP-N with sequence parallelism (EP, TP>1, PP1, MegaMoE or DP>1, not token shard). Used: C512 hybrid P and D; DSA-DP layouts.",
+   "code": "nvidia/model.py:1240, :1451-1480 forward, ops/sp_all_gather.py, :233 sp_embed",
+   "residual": "row-sharded [n,h], n = ceil(T/N)",
+   "layers": {
+    "kda": [
+     {
+      "op": "SP all-gather",
+      "primitive": "P2 (prefill) | P2b (sdec)",
+      "group": "TP",
+      "calls_per_layer": 1
+     },
+     {
+      "op": "o_proj reduce-scatter",
+      "primitive": "P3 (prefill) | P3b (sdec)",
+      "group": "TP",
+      "calls_per_layer": 1
+     }
+    ],
+    "dsa": [
+     {
+      "op": "SP all-gather",
+      "primitive": "P2|P2b",
+      "group": "TP",
+      "calls_per_layer": 1
+     },
+     {
+      "op": "o_proj reduce-scatter",
+      "primitive": "P3|P3b",
+      "group": "TP",
+      "calls_per_layer": 1
+     },
+     {
+      "op": "attention comm",
+      "primitive": "DCP_decode / DCP_ShardQ_prefill / DSA-DP",
+      "group": "TP",
+      "calls_per_layer": 1
+     }
+    ],
+    "moe": [
+     {
+      "op": "dispatch",
+      "primitive": "P11",
+      "group": "EP=D*N",
+      "calls_per_layer": 1,
+      "note": "m = n; router, latent, shared expert replicated weights on own rows, no TP collective"
+     },
+     {
+      "op": "combine",
+      "primitive": "P12",
+      "group": "EP=D*N",
+      "calls_per_layer": 1
+     }
+    ],
+    "dense_mlp_layer0": [
+     {
+      "op": "none (replicated MLP on shard)",
+      "primitive": "-",
+      "group": "-",
+      "calls_per_layer": 1,
+      "note": "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT=1 shards it with own AG+RS"
+     }
+    ],
+    "embedding": [
+     {
+      "op": "partial lookup reduce-scatter (T>=2048) else AR+shard",
+      "primitive": "P3|P1",
+      "group": "TP",
+      "calls_per_layer": 1
+     }
+    ],
+    "final": [
+     {
+      "op": "final all-gather with 5 drafter aux",
+      "primitive": "P18",
+      "group": "TP",
+      "calls_per_layer": 1,
+      "note": "PR#20: SP-local aux for eager steps >= 4096 rows"
+     }
+    ]
+   },
+   "replicated_weight_stream_per_moe_layer_B": 380000000.0,
+   "replicated_compute": [
+    "attention replication as TP (all T rows after AG)"
+   ],
+   "kv_per_gpu_per_req": "as TP (or DCP when W=N)"
+  },
+  "DCP_decode": {
+   "desc": "DCP W=N (interleave 1: token t on rank t mod W), DSA decode. Specialized decode path (sdec) and stock MLADCPManager.",
+   "code": "specialized_decode/cutedsl/{dsa/prepared.py,dsa/dcp_stage.py,dsa/dcp_value.py,dsa/indexer_stage.py,dsa/wide.py,dsa/sp.py,mla/dcp.py}; v1/attention/ops/dcp.py:1582; envs VLLM_USE_DIRECT_DCP_{A2A,Q_GATHER,KV_GATHER}",
+   "per_dsa_layer": [
+    {
+     "op": "q publish (FP8 MQA query, own heads to all ranks)",
+     "primitive": "P6",
+     "group": "DCP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "exact global top-k merge",
+     "primitive": "P8 (DcpExchange) | #63 merge | P8c stock",
+     "group": "DCP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "output combine (W_UV first, value rows to head owners, LSE merge)",
+     "primitive": "P7b (sdec 'proj') | P7 (stock latent A2A)",
+     "group": "DCP",
+     "calls_per_layer": 1
+    }
+   ],
+   "per_row_bytes_example_W16": {
+    "q_in": 51840,
+    "proj_in_out": 23400,
+    "topk_in_out": "15*X_topk",
+    "compare_oproj_ar_twoshot": 26880
+   },
+   "replicated_compute": [
+    "indexer q projection all rows",
+    "W_UV over all 96 heads on every rank (proj)",
+    "new-token MLA/indexer rows computed on every rank, stored by owner"
+   ],
+   "kv_per_gpu_per_req": "(dsa_kv_B_per_tok*C)/W + (KDA + SWA + RecoverSSM)/N"
+  },
+  "DCP_ShardQ_prefill": {
+   "desc": "DCP=TP prefill steps as ShardQ over a gathered context (dcp_shardq_configured, dcp.py:1086). ~100% of prefill tokens in TP8+DCP8 and DP4x(TP4+DCP4) logs.",
+   "code": "v1/attention/ops/dcp_shardq/{context,gather,rank_major,kv_insert,query_quant}.py; model_executor/layers/attention/sparse_mla_attention.py:1327 forward_mqa_shardq_proj",
+   "per_dsa_layer": [
+    {
+     "op": "context push (MLA 576 + indexer 68 B/token of every request in the step, plus new-token indexer rows)",
+     "primitive": "P9",
+     "group": "DCP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "q scatter heads->token slice, bf16 192-dim before W_UK",
+     "primitive": "P4",
+     "group": "TP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "value gather token slice->heads, bf16 128-dim after W_UV",
+     "primitive": "P5",
+     "group": "TP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "o_proj reduce",
+     "primitive": "P1 (TP) | P3 (SP)",
+     "group": "TP",
+     "calls_per_layer": 1
+    }
+   ],
+   "notes": [
+    "no top-k merge and no LSE combine",
+    "row split fold_split: 2W pieces per request, rank r owns r and 2W-1-r",
+    "workspace ~0.7 GB per 1M context tokens per rank",
+    "example T=16K, sum_C=130K, W=8: context 73 MB, q 64.5 MB, out 43 MB, o_proj AR 235 MB"
+   ],
+   "replicated_compute": [
+    "kv_a (fused_qkv_a) and MLA KV rows for all new tokens on every rank"
+   ]
+  },
+  "TP_ShardQ_or_indexer_split": {
+   "desc": "TP without DCP, replicated DSA KV (PR#20 commit 2): VLLM_K3_TP_SHARDQ=1 ShardQ on replicated KV; default 'indexer split' scores T/N rows and all-gathers top-k.",
+   "per_dsa_layer": [
+    {
+     "op": "ShardQ q scatter / out gather",
+     "primitive": "P4+P5",
+     "group": "TP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "indexer split top-k all-gather",
+     "primitive": "AG",
+     "group": "TP",
+     "calls_per_layer": 1,
+     "in_B": "T*2048*4*(N-1)/N",
+     "out_B": "T*2048*4*(N-1)/N"
+    }
+   ],
+   "kv_per_gpu_per_req": "dsa_kv_B_per_tok*C (replicated) + (KDA+SWA)/N"
+  },
+  "HYBRID_DPxTP_DCP_EP": {
+   "desc": "C512: DP4 x (TP4 = DCP4 = SP4), EP16 MegaMoE (kimi_k3_mega_moe), fp8 KV + mxfp4 indexer, interleave 1, dcp-comm-backend a2a. P MNBT 32768; D MNBT 8192, max-num-seqs 128/rank.",
+   "code": "results/k31vr-frozen-sweep-20261114/runs/C512-a1093684/agentx/config.yaml; specialized_decode/runtime/sp_attention.py",
+   "composition": "TP_SP inside each TP4 group + DCP_decode (D) / DCP_ShardQ_prefill (P) on the TP4 group + MegaMoE EP over all 16 GPUs",
+   "cross_dp": [
+    "P11/P12 MoE across DP",
+    "P19 DP token sync; EP lock-step bucket at DP max (padding)"
+   ],
+   "anchors": {
+    "decode_step_ms_by_B_per_rank": {
+     "4": 21.4,
+     "16": 25.1,
+     "32": 25.2,
+     "50": 30.5,
+     "64": 31.7
+    },
+    "prefill": "~13K-token steps, >=165 ms + 11 ms/1K tokens; 4.34 req/s per DP4 engine",
+    "megamoe_ep16_8192_nvfp4_p50_us": 1282
+   }
+  },
+  "DEP": {
+   "desc": "DP attention + EP MoE, TP=1: all attention/KDA/projections local per request; MegaMoE EP over all ranks.",
+   "layers": {
+    "kda": [],
+    "dsa": [],
+    "moe": [
+     {
+      "op": "dispatch",
+      "primitive": "P11",
+      "group": "EP=D",
+      "calls_per_layer": 1,
+      "note": "m = local rows"
+     },
+     {
+      "op": "combine",
+      "primitive": "P12",
+      "group": "EP=D",
+      "calls_per_layer": 1
+     }
+    ],
+    "sync": [
+     {
+      "op": "DP token sync",
+      "primitive": "P19",
+      "group": "DP",
+      "calls_per_layer": 1
+     }
+    ]
+   },
+   "notes": [
+    "no TP comm",
+    "dense weights fully replicated (~113 GB/GPU) -> weight-bound at small decode batch",
+    "DEP12 prefill measured 50.0K tok/s/GPU (PR#20, 24-layer model)"
+   ],
+   "kv_per_gpu_per_req": "dsa_kv_B_per_tok*C + KDA + SWA + RecoverSSM (all on one GPU)"
+  },
+  "DSA_DP": {
+   "desc": "TP for GEMMs/KDA/MoE; each request owned by one card of the TP group for DSA layers (VLLM_K3_TP_DSA_DP=1, TP>1, DCP=1). PR#20 prefill, PR#23 decode + P/D.",
+   "code": "PR#20 ops/dsa_dp.py, model.py _run_dsa_dp/_dsa_scatter, dsa.py local_full_heads, v1/core/dsa_dp_regions.py; PR#23 dsa_dp.py dep_order/DepPerm/_lamport_exchange",
+   "per_dsa_layer_sp": [
+    {
+     "op": "push_in rows to owner",
+     "primitive": "P13",
+     "group": "TP",
+     "calls_per_layer": 1
+    },
+    {
+     "op": "push_out owner outputs to shard owners",
+     "primitive": "P13",
+     "group": "TP",
+     "calls_per_layer": 1
+    }
+   ],
+   "per_dsa_layer_no_sp": [
+    {
+     "op": "zeros for non-owned rows + all-reduce [T,h]",
+     "primitive": "P1",
+     "group": "TP",
+     "calls_per_layer": 1
+    }
+   ],
+   "per_dsa_layer_decode": [
+    {
+     "op": "Lamport push in/out, DEP-ordered segments padded to busiest owner",
+     "primitive": "P13b",
+     "group": "TP",
+     "calls_per_layer": 1,
+     "note": "padding factor N*max_o(B_o)/B; graph sizes multiples of N*q"
+    }
+   ],
+   "kda_moe": "as TP_SP (KDA AG+RS, MoE EP)",
+   "replicated_weights": "DSA 480 MB/layer BF16 on every card (11.5 GB)",
+   "kv": "DSA + indexer KV in owner's static region (one copy per TP group); KDA, drafter SWA in shared pool (/N)",
+   "scheduler": {
+    "chunk": 4096,
+    "cost": "n*(1+(ctx+n/2)/C0)",
+    "C0": 180000,
+    "fit": "2.1e-3 ms/token + 1.18e-8 ms/token/ctx for 6 DSA layers"
+   },
+   "measured_prefill_tok_s_gpu_24layer_c3072": {
+    "TP4xDP3_replicated": 39900,
+    "TP4xDP3_DSA-DP": 42800,
+    "TP4xDP3_DSA-DP+SP-local-aux": 46100,
+    "TP2xDP6_DSA-DP": 45300,
+    "DP4xTP4/DCP4": 41400,
+    "TP8+DCP8": 32200,
+    "DEP12": 50000
+   },
+   "measured_decode_vs_replicated_step_pct": {
+    "2": 1.1,
+    "4": 0.1,
+    "8": -2.5,
+    "16": -3.7,
+    "32": -5.0
+   },
+   "pd": "P exports remote_dsa_owner=o; D owner = o*tp_D/tp_P; NIXL DSA groups only owner<-P rank o; pairs TP4->TP4, TP4->TP1(DEP)"
+  },
+  "MoE_EP_vs_TP": {
+   "ep_bytes_per_routed_token_per_layer": {
+    "dispatch_mxfp8": 59136,
+    "dispatch_nvfp4": 32256,
+    "combine_bf16": 114688,
+    "remote_fraction": "(E-1)/E",
+    "vs_hidden_row_bf16": 14336
+   },
+   "tp_no_ep_bytes_per_row_per_layer": "P14 ~10752*(N-1)/N + AR(7168) + AR(14336)",
+   "quant_kind": "Rubin MegaMoE: mxfp4_mxfp8 up to 512 tokens/rank, else exact MXFP4->NVFP4 weights with NVFP4 activations (experts.py:145); logs: TP8 prefill EP8 nvfp4 bucket 2048, C512 prefill EP16 nvfp4 bucket 8192",
+   "die_local": "decode only: experts homed per die (17.1 vs 13.9 TB/s); no comm change (die_local.py)"
+  }
+ },
+ "drafter": {
+  "TP": {
+   "ar_sites_per_forward": 11,
+   "ar_tensor": "[R_d, h] bf16",
+   "primitive": "P1c ArNorm (fused AR+residual+RMSNorm)",
+   "qkv": "96/N q, 16/N kv heads (N<=16)",
+   "lm_head": "vocab/N + P16 Markov key exchange per draft position",
+   "context_fc": "35840->7168 replicated; >=256 rows/rank row-sharded + AG [rows,h]",
+   "measured": "~13 us per stock fused site at TP16 B1"
+  },
+  "SP": {
+   "aux": "final AG [hidden|5 aux] 6h wide (P18) or PR#20 SP-local aux: fc on own shard + AG [n,h]",
+   "rest": "as TP"
+  },
+  "DEP": {
+   "comm": "none",
+   "weights": "~5 GB full drafter + full LM head/embedding per GPU"
+  },
+  "DSA_DP": {
+   "placement": "every card (TP); SWA KV in shared pool, kv heads /N (gqa_draft.py _dsa_dp_kv)"
+  }
+ },
+ "kv_capacity": {
+  "per_request_full_bytes": {
+   "mla_fp8": "24*576*C",
+   "indexer_mxfp4": "24*68*C",
+   "kda_recurrent_fp32": 434110464,
+   "kda_conv_fp32": "69*3*12288*(3+num_spec)*4  (30.5 MB k0, 61.0 MB k3, 101.7 MB k7)",
+   "recoverssm_records": "6.78e6*q",
+   "drafter_swa_bf16": "20480*min(C, 2048+slack) ~ 42-47 MB"
+  },
+  "sharding": {
+   "TP_no_DCP": {
+    "dsa": "replicated (x1 per GPU)",
+    "kda": "/N",
+    "swa": "/N"
+   },
+   "DCP_W": {
+    "dsa": "/W",
+    "kda": "/N",
+    "swa": "/N (not DCP-sharded)"
+   },
+   "DSA_DP": {
+    "dsa": "owner only (avg /N; static per-card region -> owner skew wastes capacity)",
+    "kda": "/N",
+    "swa": "/N"
+   },
+   "DEP": {
+    "dsa": "full",
+    "kda": "full",
+    "swa": "full"
+   }
+  },
+  "example_C135K_k3_GB_per_req": {
+   "dsa": 2.09,
+   "kda": 0.495,
+   "swa": 0.047,
+   "recoverssm": 0.027
+  },
+  "weights_GB_per_gpu": {
+   "TP16_moeTP": 108.6,
+   "TP8_EP8_tokenshard": 205.4,
+   "DP4xTP4_SP_EP16": 147.1,
+   "TP4xDP3_DSA-DP_EP12": 185.0,
+   "DEP12": 234.4,
+   "DEP16": 204.2,
+   "DEP32": 159.0,
+   "DEP72": 133.9,
+   "routed_total": 1446.5
+  },
+  "hbm_GB": 286.5,
+  "caveat": "hybrid KV manager packs KDA state pages, attention pages and SWA slots into one page pool (v1/core/kv_cache_utils); logged 'GPU KV cache size' tokens: TP16+DCP16 D 56.5M/engine, TP8+DCP8 P 10.8M, C512 D 19.3M per DP engine, C512 P 16.9M",
+  "script": "/private/tmp/claude-501/-Users-weizha/336f9053-a36a-4d25-82d2-841a719b34f0/scratchpad/solmodel_work/cap.py"
+ },
+ "new_strategies": [
+  {
+   "id": "S1",
+   "name": "DSA-DP + split indexer",
+   "comm_per_row": "(N-1)*(2200 + X_topk) + 8192 to owner",
+   "effect": "removes owner indexer hotspot at long context; MLA KV one copy"
+  },
+  {
+   "id": "S2",
+   "name": "DCP only for DSA layers (DSA-CP) over group G, DEP/TP elsewhere",
+   "comm_per_row_per_dsa_layer": "(G-1)*(96*576 + 96*260 + X_topk) ~ (G-1)*82e3",
+   "effect": "DSA KV /G; pays when DSA KV capacity binds"
+  },
+  {
+   "id": "S3",
+   "name": "Prefill CP over cached prefix: query shipping vs context gather",
+   "bytes": {
+    "context_gather": "C*644*(W-1)/W",
+    "query_ship": "T*(W-1)*84e3"
+   },
+   "crossover": "T/C ~ 644/(84e3*W) (~1/1000 at W=8): prefill keeps context gather, decode ships queries"
+  },
+  {
+   "id": "S4",
+   "name": "Pipeline / layer split over NVL72",
+   "boundary_bytes_per_token": "<= (1+ceil(layer/12))*14336 (residual + AttnRes block state)",
+   "effect": "weights and KV per GPU /S; bubbles; candidate for prefill with DEP inside a stage"
+  },
+  {
+   "id": "S5",
+   "name": "MoE dispatch dedup per destination rank + in-rank pre-combine",
+   "bytes_per_token": "U(E)*(3696+7168), U(E)=E*(1-(1-1/E)**16): 10.3 (E16), 12.4 (E32), 14.5 (E72)",
+   "effect": "-36%/-23%/-9% MoE comm",
+   "precision": "FP32 per-rank partial then one BF16 rounding: reorder vs stock per-route BF16 + TopkReduce; needs sign-off"
+  },
+  {
+   "id": "S6",
+   "name": "Mixed parallel degree per layer type (SP over G, KDA TP-N_k, DSA DSA-DP/DCP in subgroup, MoE EP over G/rack)",
+   "comm": "as TP_SP/DSA_DP with N=N_k; no resharding",
+   "effect": "C512 layout is G=16, N_k=4 special case"
+  },
+  {
+   "id": "S7",
+   "name": "Attention-DP + GEMM-TP for KDA (owner KDA core)",
+   "comm_per_row": "~98 KB to owner + 24.6 KB back",
+   "verdict": "worse than head-parallel KDA; recorded to close the option"
+  },
+  {
+   "id": "S8",
+   "name": "Sequence-parallel KDA (chunk scan across ranks)",
+   "comm": "log2(N) rounds of 96/N_h*128*128*4 B per layer per request",
+   "use": "C1 TTFT only",
+   "precision": "FP32 reorder of recurrence; sign-off"
+  },
+  {
+   "id": "S9",
+   "name": "Two-microbatch overlap of SP/DSA-DP/EP comm",
+   "model": "t_layer = max(compute, comm) + overhead",
+   "constraint": "use_ubatching excludes DCP ShardQ; MegaMoE lock-step"
+  },
+  {
+   "id": "S10",
+   "name": "Quantize-at-source where the consumer quantizes anyway",
+   "done": [
+    "DCP q FP8",
+    "MegaMoE dispatch MXFP8"
+   ],
+   "rule": "no lossy compression of BF16 activations"
+  },
+  {
+   "id": "S11",
+   "name": "Expert placement: rack-wide EP (EP72), EPLB redundancy, die-local",
+   "inputs": [
+    "imb(E)",
+    "die-local 17.1 vs 13.9 TB/s"
+   ]
+  },
+  {
+   "id": "S12",
+   "name": "Drafter placement: TP4 drafter under TP16 target, or drafter-DP",
+   "crossover": "5e9/13.9e12 s weight stream vs 11*AR(R_d*14336, N) per draft forward"
+  },
+  {
+   "id": "S13",
+   "name": "Indexer-only DCP (shard 68 B/token indexer keys widely, MLA owned/replicated)",
+   "comm": "as S1",
+   "effect": "O(C) indexer scan scales with group, MLA traffic unchanged"
+  }
+ ],
+ "inferred_not_read": [
+  "P8 DcpExchange per-row bytes (X_topk) by analogy with hist_merge; decode .cu not parsed",
+  "NVLS AR/RS per-GPU bytes ~M in/out (switch-reduction accounting, not per-link measured)",
+  "MegaMoE per-route metadata bytes ignored",
+  "drafter forward row count R_d per verify outcome not traced",
+  "hybrid KV manager page packing not modeled",
+  "PR#20/#23 code is from the PR diffs (not on wzhao/k31-agentx-dev)"
+ ]
+}

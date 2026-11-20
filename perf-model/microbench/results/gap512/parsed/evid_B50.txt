@@ -1,0 +1,57 @@
+kernel (group | name | grid): per-call median us rank0, per-rank step-sum min/med/max, calls
+  MOE.megamoe            deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl    [212, 1, 1]    call  116.6 (p10  113.3 p90  124.5) | sum   10379   10572   10814 | n 92
+  DSA.q_path             sd:mlaqueryMlaQuery                            [8, 24, 4]     call   97.9 (p10   96.9 p90  100.4) | sum    2329    2356    2391 | n 24
+  KDA.core               sd:kdawideKdaWide                              [24, 50, 1]    call   33.8 (p10   33.4 p90   34.2) | sum    2291    2322    2355 | n 69
+  KDA.in_proj            nvjet_sm107_tst_160x128_64x12_2x2_2cta_h_bz_TN [156, 1, 1]    call   27.6 (p10   26.6 p90   28.8) | sum    1783    1876    2018 | n 69
+  MOE.shared_gate_up     nvjet_sm107_tst_64x64_64x16_4x2f_2cta_h_bz_TNN [384, 1, 1]    call   20.1 (p10   19.9 p90   20.4) | sum    1851    1867    1892 | n 92
+  DSA.topk_merge         k31dcpx::topk_merge_kernel<16>                 [2, 200, 1]    call   70.2 (p10   68.3 p90   73.6) | sum    1683    1732    2007 | n 24
+  ATTNRES                true>                                          [212, 1, 1]    call    5.8 (p10    4.1 p90    9.0) | sum    1086    1340    1512 | n 186
+  MOE.latent_up          nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TN [224, 1, 1]    call   12.5 (p10   12.3 p90   12.7) | sum    1136    1154    1166 | n 92
+  MOE.shared_down        nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_spl [448, 1, 1]    call   11.3 (p10   11.1 p90   11.6) | sum    1028    1044    1130 | n 92
+  MOE.router+latent_down nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_spl [224, 1, 1]    call   11.3 (p10   10.2 p90   11.8) | sum    1017    1034    1052 | n 92
+  KDA.o_proj             nvjet_sm107_tst_160x64_64x16_1x4_2cta_h_bz_TNN [180, 1, 1]    call   12.4 (p10   11.9 p90   13.0) | sum     814     848     939 | n 69
+  COMM.SP_RS             sd:commonsp_commSpReduceScatter                [212, 1, 1]    call    7.9 (p10    6.5 p90    9.2) | sum     642     875    1053 | n 93
+  COMM.SP_AG             sd:commonsp_commSpAllGather                    [212, 1, 1]    call    7.8 (p10    7.2 p90    8.4) | sum     591     720     794 | n 93
+  DSA.idx_score          deep_gemm::sm100_paged_mqa_logits              [212, 1, 1]    call   29.0 (p10   28.4 p90   30.0) | sum     685     694     700 | n 24
+  WAIT                   sd:dsaoverlapQueryWait                         [32, 1, 1]     call   22.2 (p10   20.5 p90   24.5) | sum     512     525     539 | n 24
+  DSA.dcp_value          sd:dsadcp_valueDcpValue                        [24, 8, 1]     call   21.8 (p10   20.2 p90   23.5) | sum     497     545     586 | n 24
+  MOE.router+latent_down nvjet_sm107_tss_48x64_64x16_2x1_h_bz_splitK_TN [160, 1, 1]    call    5.3 (p10    5.0 p90    5.7) | sum     481     489     507 | n 92
+  DSA.topk               k31dcpx::topk_pp_win_kernel                    [848, 1, 1]    call   19.5 (p10   16.5 p90   21.4) | sum     410     448     467 | n 24
+  DSA.sparse_mla         fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HV [2, 1, 200]    call   18.7 (p10   18.4 p90   18.9) | sum     445     447     450 | n 24
+  DSA.o_proj             nvjet_sm107_tst_160x64_64x16_1x4_2cta_h_bz_TNN [180, 1, 1]    call   18.0 (p10   16.8 p90   20.5) | sum     426     458     496 | n 24
+  MOE.shared_down        __nv_bfloat16,                                 [224, 4, 1]    call    4.7 (p10    4.5 p90    4.9) | sum     430     435     471 | n 92
+  DSA.qkv_a              nvjet_sm107_tst_64x128_64x16_2x2_2cta_h_bz_TNT [168, 1, 1]    call   17.9 (p10   17.2 p90   18.8) | sum     416     433     446 | n 24
+  MOE.router+latent_down fal                                            [28, 4, 1]     call    4.7 (p10    3.8 p90    5.2) | sum     405     421     432 | n 92
+  DSA.topk               k31dcpx::topk_pp_hist_kernel                   [848, 1, 1]    call   17.7 (p10   16.2 p90   18.1) | sum     405     414     421 | n 24
+  DSA.g_proj             sd:gemmsplitkSplitKGemm                        [64, 4, 1]     call   16.8 (p10   16.4 p90   17.4) | sum     403     406     410 | n 24
+  MOE.topk               int,                                           [50, 1, 1]     call    4.3 (p10    4.1 p90    4.5) | sum     393     400     416 | n 92
+  MOE.shared_act         vllm::situ_and_mul_kernel<c10::BFloat16>       [50, 1, 1]     call    3.8 (p10    3.6 p90    4.0) | sum     344     358     364 | n 92
+  MOE.router+latent_down __nv_bfloat16,                                 [112, 4, 1]    call    3.7 (p10    3.5 p90    3.9) | sum     340     348     378 | n 92
+  MOE.latent_norm        true>                                          [50, 1, 1]     call    2.9 (p10    2.8 p90    3.1) | sum     261     266     272 | n 92
+  DSA.topk               k31dcpx::topk_pp_window_kernel                 [200, 1, 1]    call    9.8 (p10    9.1 p90   10.7) | sum     233     239     246 | n 24
+  MOE.prepare            _prepare_megamoe_inputs_kernel                 [50, 28, 1]    call    2.2 (p10    2.0 p90    2.5) | sum     203     206     208 | n 92
+  TAIL.drafter+final     nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT  [224, 1, 1]    call   16.7 (p10   12.2 p90   21.7) | sum     167     169     175 | n 10
+  DSA.w_uv               nvjet_sm107_tst_64x224_64x8_1x1_h_bz_TNT       [192, 1, 1]    call    5.9 (p10    5.8 p90    6.0) | sum     139     141     143 | n 24
+  DSA.prologue           sd:dsaindexDsaIndex                            [200, 1, 1]    call    4.9 (p10    4.3 p90    5.1) | sum     114     116     120 | n 24
+  TAIL.drafter+final     sd:draftallreduceArNormRows                    [150, 1, 1]    call    9.7 (p10    9.4 p90   10.0) | sum      96     103     107 | n 11
+  TAIL.drafter+final     sd:draftgqa_windowGqaWindow                    [2, 4, 50]     call   16.7 (p10   16.6 p90   17.2) | sum      83      84      85 | n 5
+  DENSE                  nvjet_sm107_tst_352x64_64x10_1x2_2cta_h_bz_TNN [384, 1, 1]    call   79.8 (p10   79.8 p90   79.8) | sum      75      79      82 | n 1
+  TAIL.drafter+final     ncclDevKernel_AllGather_RING                   [16, 1, 1]     call   75.4 (p10   75.4 p90   75.4) | sum      74      75      79 | n 1
+  DSA.q_path             sd:dsaoverlapQueryNorm                         [25, 1, 1]     call    3.2 (p10    2.6 p90    3.3) | sum      69      74      80 | n 24
+  TAIL.drafter+final     nvjet_sm107_tst_128x256_64x9_2x1_2cta_v_bz_TNT [320, 1, 1]    call   58.8 (p10   58.8 p90   58.8) | sum      58      59      62 | n 1
+GEMM groups: model bytes/call, measured us/call (incl reduce), achieved TB/s, model ach us/call
+  KDA.in_proj              measured    27.2 us/call  model ach  13.39 us/call  derate 2.03
+  KDA.core                 measured    33.6 us/call  model ach  13.68 us/call  derate 2.46
+  KDA.o_proj               measured    12.3 us/call  model ach   3.40 us/call  derate 3.62
+  DSA.qkv_a                measured    18.0 us/call  model ach   2.61 us/call  derate 6.90
+  DSA.g_proj               measured    16.9 us/call  model ach   3.31 us/call  derate 5.12
+  DSA.idx_score            measured    28.9 us/call  model ach  12.99 us/call  derate 2.22
+  DSA.sparse_mla           measured    20.4 us/call  model ach   4.99 us/call  derate 4.09
+  DSA.w_uv                 measured     5.9 us/call  model ach   2.70 us/call  derate 2.18
+  DSA.o_proj               measured    19.1 us/call  model ach   3.40 us/call  derate 5.62
+  ATTNRES                  measured    14.5 us/call  model ach   0.83 us/call  derate 17.47
+  MOE.router+latent_down   measured    24.9 us/call  model ach   4.76 us/call  derate 5.22
+  MOE.megamoe              measured   114.9 us/call  model ach  72.22 us/call  derate 1.59
+  MOE.shared_gate_up       measured    20.3 us/call  model ach  12.81 us/call  derate 1.58
+  MOE.shared_down          measured    16.1 us/call  model ach   6.43 us/call  derate 2.50
+  MOE.latent_up            measured    12.5 us/call  model ach   3.77 us/call  derate 3.32

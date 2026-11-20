@@ -30,6 +30,7 @@ import torch
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from ...mxfp8 import is_mxfp8_linear
+from .. import prewait_gemm
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
@@ -55,7 +56,48 @@ SHARED = ("shared_gu", "shared_down")
 # median vs the router || latent down pair): n32 / n64 -34..-39 / -52..-64 us per
 # 24-layer step; n96 +28..+54 (the GEMM at 96 rows is no faster than the pair), so
 # n96 keeps the stock pair:
-ROUTER_LATENT = {"*": "25-72:ltpin"}
+# Rows with a split-K tactic (M tile, N tile, split, stages) run the concatenated GEMM
+# on ``gemm.splitk.SplitKGemm`` (FP32 out; weights requested before the PDL wait, so
+# they stream while the SP reduce runs; no separate split-K reduce launch) instead of
+# the pinned cuBLASLt kernel. n32: 1 GPU 8.54 vs ltpin 9.22 us (flushed L2, after a
+# producer); in-step D3-32 NVFP4 slice r8 (fastab ABBA x2, same node) 3967.5 ->
+# 3902.8 us per 24-layer step (-65 us). n64 (64.64.2.6; 1 GPU 10.11 vs 9.74, but the
+# weights stream during the reduce in-step): r16 4639.5 -> 4605.8 (-34), r8 with both
+# -68.5 (another node), r24 unchanged. n96 (64.96.2.5; 1 GPU 11.58 us vs ~9.9 for the
+# router || latent down pair, but in-step the concat also moves r24 onto route_stage):
+# r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
+ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
+# PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
+# slice, split-K front vs prewait (fastab xy1/xy2, Rhea): n32 split-K faster
+# (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step).
+PREWAIT_ROWS = (64,)
+
+
+class SplitKFront:
+    """The router | latent down GEMM on the split-K kernel for the rows of
+    ``tactics`` ({rows: tactic}); ``LtPin``'s ``plans`` / ``run`` interface."""
+
+    def __init__(self, packed, tactics):
+        from ..cutedsl.gemm.projection import PreparedProjection
+
+        self.plans = dict(tactics)
+        self.proj = PreparedProjection(packed, tactics, output_dtype=torch.float32)
+        self.proj.prepare()
+
+    def run(self, w, x, out):
+        return self.proj.run(x, out)
+
+
+class FrontGemms:
+    """Per-rows dispatch of the concatenated GEMM over ``LtPin`` / ``SplitKFront``."""
+
+    def __init__(self, gemms):
+        self.by_rows = {r: g for g in gemms for r in g.plans}
+        self.plans = dict.fromkeys(self.by_rows)
+
+    def run(self, w, x, out):
+        return self.by_rows[x.shape[0]].run(w, x, out)
 
 
 def _stock_threshold():
@@ -127,11 +169,11 @@ class SpMlp:
         self.mxfp8 = bool(shared_mxfp8(mlp))
         # Router | latent down concatenation (before any GEMM reads the weights:
         # the stock linears become views of the packed weight).
-        concat_rows = tuple(
-            r for r in self.rows
-            if rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) == "ltpin"
-        )  # fmt: skip
+        front = {r: rows_policy(ROUTER_LATENT, Shape(r, 1), default=None)
+                 for r in self.rows}  # fmt: skip
+        concat_rows = tuple(r for r, v in front.items() if v is not None)
         self.router_latent = self.route_stage = None
+        self.prewait_router_latent = None
         if (
             concat_rows
             and router_concat_cause(mlp) is None
@@ -141,13 +183,22 @@ class SpMlp:
 
             packed = pack_router_latent(mlp)
             n, k = packed.shape
-            self.router_latent = (
-                packed,
-                LtPin("router_latent", n, k, concat_rows, out32=True,
-                      device=packed.device),
-                mlp.gate.weight.shape[0],
-            )  # fmt: skip
+            pinned = tuple(r for r in concat_rows if front[r] == "ltpin")
+            split = {r: front[r] for r in concat_rows if isinstance(front[r], tuple)}
+            gemms = []
+            if pinned:
+                gemms.append(LtPin("router_latent", n, k, pinned, out32=True,
+                                   device=packed.device))  # fmt: skip
+            if split:
+                gemms.append(SplitKFront(packed, split))
+            self.router_latent = (packed, FrontGemms(gemms), mlp.gate.weight.shape[0])
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
+            # Pre-wait weight-streaming GEMM at the token counts it serves (its own
+            # tile-image copy: the stock linears stay views of the row-major concat).
+            if any(
+                r in PREWAIT_ROWS and prewait_gemm.supported(r, k) for r in concat_rows
+            ):
+                self.prewait_router_latent = prewait_gemm.pack_weight(packed)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -270,7 +321,15 @@ class SpMlp:
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent
             y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
-            gemm.run(packed, h, y)
+            pw = self.prewait_router_latent
+            if (
+                pw is not None
+                and n in PREWAIT_ROWS
+                and prewait_gemm.supported(n, packed.shape[1])
+            ):
+                prewait_gemm.gemm(y, h, pw, packed.shape[0])
+            else:
+                gemm.run(packed, h, y)
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
             staged = route.stage(y)

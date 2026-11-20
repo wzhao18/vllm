@@ -1,4 +1,4 @@
-dsrel-c16-1p2d-xdr = frz-c16-1p2d-xdr + release draft (gen_dsrel.py md5 acfa9f33fb6da71993c3af93b7f61e26, 2026-11-17T02:22:42-08:00)
+dsrel-c16-1p2d-xdr = frz-c16-1p2d-xdr + release draft (gen_dsrel.py md5 acfa9f33fb6da71993c3af93b7f61e26, 2026-11-17T08:06:01-08:00)
   source: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/frz-c16-1p2d-xdr (frozen sweep render; its provenance: FRZ.txt, INTEG.txt)
   draft: Inferact/Kimi-K3.1-Pro-DSpark @ e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f (model.safetensors sha256 83a4f35d3a68fe69275b548a0658f687b5bddaf48f8201f999ef81b538f1fb5f)
          extra_mount /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark (ro); was /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-preview -> /raid/common-models/kimi-k3.1-pro-dspark-preview
@@ -6,6 +6,6 @@ dsrel-c16-1p2d-xdr = frz-c16-1p2d-xdr + release draft (gen_dsrel.py md5 acfa9f33
   now: {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 7, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 4.16}
   hybrid.yaml (srtctl's recipe record; render/config.yaml is what runs): the same draft edits; its speculative-config is synthetic, AL 3.69 -> 4.16
   target weights: /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07 (model view /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-pro-k3type at /model); was /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1 (view /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
-  tree (prefill + decode PYTHONPATH): /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-fa43a52 (was /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f)
+  tree (prefill + decode PYTHONPATH): /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-1767cf7 (was /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f)
   renamed frz-c16-1p2d-xdr -> dsrel-c16-1p2d-xdr in: hybrid.yaml x1, render/config.yaml x1, render/render.json x2, render/sbatch_script.sh x4
   kept: every other key and file (parsed-YAML diff vs the source = the keys above); AIPERF_RUNTIME_DIR /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/agentx-runtime/frz-c16-1p2d (the source's AgentX client venv, shared); bare source base frz-c16-1p2d still named in ['workflow.env.resolved'] (that runtime dir only)

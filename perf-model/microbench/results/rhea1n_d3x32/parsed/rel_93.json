@@ -1,0 +1,2043 @@
+{
+ "q4_B32_M128_u132k": {
+  "B": 32,
+  "r": 8.0,
+  "bench24_step_us": 12411.5,
+  "projected93_step_us": 21099.46902638712,
+  "model_ach_bench_scope_us": 9812.467972820621,
+  "model_sol_us": 6850.610775218792,
+  "multinode_measured_ms": 20.92,
+  "rows": [
+   {
+    "group": "MOE.megamoe",
+    "measured_us": 6743.968000000001,
+    "exposed_us": 6743.968000000001,
+    "t_ach_us": 4268.502086695802,
+    "t_sol_us": 3181.0389132028267,
+    "derate": 1.5799378477568997,
+    "exposed_gap_us": 2475.4659133041987,
+    "calls": 23,
+    "kernels": {
+     "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7097.9
+    },
+    "scale": 4.0,
+    "substituted": "substituted: FI EP32 MX standalone x92 x1.1 (range x1.0-1.2); 1-node EP4 measured 308 us/layer",
+    "per_layer_us": 7086.083984375
+   },
+   {
+    "group": "TAIL.drafter+final",
+    "measured_us": 525.0,
+    "exposed_us": 525.0,
+    "t_ach_us": 268.8103303015684,
+    "t_sol_us": 182.23710718767816,
+    "derate": 1.9530499419833376,
+    "exposed_gap_us": 256.1896696984316,
+    "calls": 123,
+    "kernels": {
+     "at::native::": 9.4,
+     "vllm::mnnvl_lamport_all_gather": 16.1,
+     "true>": 10.6,
+     "_prepare_dflash_inputs_kernel": 2.8,
+     "nvjet_sm107_tst_384x64_64x9_1x2_2cta_h_bz_splitK_TNN": 47.9,
+     "__nv_bfloat16,": 15.7,
+     "memcpy128_aligned": 2.3,
+     "_kernel_slots_kernel": 7.5,
+     "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN": 10.0,
+     "at::native::gpu_kernel_impl_nocast<at::native::direct_copy_k": 16.1,
+     "false>": 2.2,
+     "char,": 2.8,
+     "_dcp_local_seq_lens_kernel": 1.4,
+     ">": 5.8,
+     "uint4>": 2.3,
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 50.2,
+     "nvjet_sm107_tst_96x64_64x16_1x2_2cta_h_bz_splitK_TNN": 31.1,
+     "_quant_kernel": 2.0,
+     "_wlist_kernel": 7.2,
+     "sd:mlaqueryMlaQuery": 140.6,
+     "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 797.6,
+     "sd:mladcpDcpValue": 84.5,
+     "nvjet_sm107_tst_64x64_64x16_4x1_2cta_v_bz_TNT": 45.1,
+     "flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport": 36.1,
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 99.6,
+     "&": 9.6,
+     "long>": 5.6,
+     "nvjet_sm107_tst_192x128_64x11_2x2f_2cta_h_bz_TNN": 64.1,
+     "ncclDevKernel_AllGather_RING": 87.2,
+     "at::native::gpu_index_kernel<at::native::index_kernel_impl<a": 3.0,
+     "int>": 2.3,
+     "nvjet_sm107_tst_416x64_64x9_1x2_2cta_h_bz_TNN": 57.2,
+     "at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_a": 50.4,
+     "_gumbel_sample_kernel": 17.8,
+     "4,": 11.7,
+     "at::": 5.8
+    },
+    "scale": 1.0,
+    "substituted": "substituted: gap512 release-drafter tail; 1-node stock preview drafter measured 1753 us",
+    "per_layer_us": 350.67373046875
+   },
+   {
+    "group": "DSA.topk_merge",
+    "measured_us": 1222.0947265625,
+    "exposed_us": 1182.2216796875,
+    "t_ach_us": 154.02650566037732,
+    "t_sol_us": 145.14432,
+    "derate": 7.934314430642043,
+    "exposed_gap_us": 1028.1951740271227,
+    "calls": 6,
+    "kernels": {
+     "k31dcpx::topk_merge_kernel<16>": 300.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 305.523681640625
+   },
+   {
+    "group": "KDA.core",
+    "measured_us": 1469.563924153646,
+    "exposed_us": 1469.563924153646,
+    "t_ach_us": 604.4502299755521,
+    "t_sol_us": 383.4236908506863,
+    "derate": 2.4312405741215195,
+    "exposed_gap_us": 865.1136941780939,
+    "calls": 18,
+    "kernels": {
+     "sd:kdawideKdaWide": 383.0
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 383.364501953125
+   },
+   {
+    "group": "MOE.shared_gate_up",
+    "measured_us": 1813.9091796875,
+    "exposed_us": 1813.9091796875,
+    "t_ach_us": 1174.1976679136692,
+    "t_sol_us": 741.8794356363637,
+    "derate": 1.544807343137105,
+    "exposed_gap_us": 639.7115117738308,
+    "calls": 46,
+    "kernels": {
+     "nvjet_sm107_tst_128x40_64x15_4x1_v_bz_splitK_TNT": 394.2,
+     "__nv_bfloat16,": 63.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 226.7386474609375
+   },
+   {
+    "group": "MOE.shared_down",
+    "measured_us": 1131.5400390625,
+    "exposed_us": 1131.5400390625,
+    "t_ach_us": 588.6170060431655,
+    "t_sol_us": 371.8989265454545,
+    "derate": 1.922370620361451,
+    "exposed_gap_us": 542.9230330193345,
+    "calls": 46,
+    "kernels": {
+     "nvjet_sm107_tst_128x40_64x15_4x1_v_bz_splitK_TNT": 243.1,
+     "__nv_bfloat16,": 45.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 141.4425048828125
+   },
+   {
+    "group": "ATTNRES",
+    "measured_us": 487.2729691485969,
+    "exposed_us": 445.32365822305485,
+    "t_ach_us": 49.54892892086331,
+    "t_sol_us": 31.305914181818178,
+    "derate": 9.834177645430866,
+    "exposed_gap_us": 395.77472930219153,
+    "calls": 49,
+    "kernels": {
+     "true>": 123.7,
+     "false>": 3.5
+    },
+    "scale": 3.816326530612245,
+    "substituted": "",
+    "per_layer_us": 63.840576171875
+   },
+   {
+    "group": "MOE.router+latent_down",
+    "measured_us": 1650.9609375,
+    "exposed_us": 841.29248046875,
+    "t_ach_us": 433.438130647482,
+    "t_sol_us": 273.85409163636365,
+    "derate": 3.8089886901130465,
+    "exposed_gap_us": 407.854349821268,
+    "calls": 92,
+    "kernels": {
+     "nvjet_sm107_tss_64x32_64x16_2x1_2cta_h_bz_splitK_TNT": 105.5,
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_splitK_TNT": 221.3,
+     "fal": 52.5,
+     "__nv_bfloat16,": 38.6
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 103.18505859375
+   },
+   {
+    "group": "DSA.q_path",
+    "measured_us": 1250.0068359375,
+    "exposed_us": 631.88037109375,
+    "t_ach_us": 254.08601559371792,
+    "t_sol_us": 179.71776778082886,
+    "derate": 4.919620755265232,
+    "exposed_gap_us": 377.7943555000321,
+    "calls": 12,
+    "kernels": {
+     "sd:dsaoverlapQueryNorm": 10.5,
+     "sd:mlaqueryMlaQuery": 297.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 312.501708984375
+   },
+   {
+    "group": "DSA.sparse_mla",
+    "measured_us": 443.6484375,
+    "exposed_us": 439.84423828125,
+    "t_ach_us": 76.71955338129497,
+    "t_sol_us": 48.47280872727272,
+    "derate": 5.782729668603182,
+    "exposed_gap_us": 363.124684899955,
+    "calls": 12,
+    "kernels": {
+     "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 112.8,
+     "flashinfer::ComputeLSEFromMDKernel": 5.2
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 110.912109375
+   },
+   {
+    "group": "MOE.shared_act",
+    "measured_us": 326.9189453125,
+    "exposed_us": 326.9189453125,
+    "t_ach_us": 1.6499159349897254,
+    "t_sol_us": 1.6499159349897254,
+    "derate": 198.14278920491535,
+    "exposed_gap_us": 325.26902937751026,
+    "calls": 23,
+    "kernels": {
+     "vllm::situ_and_mul_kernel<c10::BFloat16>": 82.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 81.729736328125
+   },
+   {
+    "group": "KDA.in_proj",
+    "measured_us": 1220.8633219401042,
+    "exposed_us": 1220.8633219401042,
+    "t_ach_us": 911.2361184253789,
+    "t_sol_us": 575.7355475505802,
+    "derate": 1.3397881155652203,
+    "exposed_gap_us": 309.62720351472535,
+    "calls": 18,
+    "kernels": {
+     "nvjet_sm107_tst_192x64_64x15_4x2_2cta_v_bz_TNN": 334.7
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 318.486083984375
+   },
+   {
+    "group": "MOE.latent_up",
+    "measured_us": 654.4755859375,
+    "exposed_us": 654.4755859375,
+    "t_ach_us": 344.6250635971223,
+    "t_sol_us": 217.7403810909091,
+    "derate": 1.8990945670237231,
+    "exposed_gap_us": 309.8505223403777,
+    "calls": 23,
+    "kernels": {
+     "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT": 166.4
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 163.618896484375
+   },
+   {
+    "group": "MOE.latent_norm",
+    "measured_us": 245.3818359375,
+    "exposed_us": 245.3818359375,
+    "t_ach_us": 0.3208169873591133,
+    "t_sol_us": 0.3208169873591133,
+    "derate": 764.8654703649675,
+    "exposed_gap_us": 245.0610189501409,
+    "calls": 23,
+    "kernels": {
+     "true>": 62.0
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 61.345458984375
+   },
+   {
+    "group": "MOE.topk",
+    "measured_us": 390.46484375,
+    "exposed_us": 244.64013671875,
+    "t_ach_us": 0.12030637025966746,
+    "t_sol_us": 0.12030637025966746,
+    "derate": 3245.587435704581,
+    "exposed_gap_us": 244.51983034849033,
+    "calls": 23,
+    "kernels": {
+     "int,": 105.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 97.6162109375
+   },
+   {
+    "group": "KDA.o_proj",
+    "measured_us": 458.5372314453125,
+    "exposed_us": 458.5372314453125,
+    "t_ach_us": 228.70178071942445,
+    "t_sol_us": 144.4979432727273,
+    "derate": 2.00495697935931,
+    "exposed_gap_us": 229.83545072588805,
+    "calls": 18,
+    "kernels": {
+     "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 128.6
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 119.618408203125
+   },
+   {
+    "group": "DSA.dcp_value",
+    "measured_us": 337.478515625,
+    "exposed_us": 337.478515625,
+    "t_ach_us": 124.588679245283,
+    "t_sol_us": 100.58879999999999,
+    "derate": 2.7087414175134787,
+    "exposed_gap_us": 212.889836379717,
+    "calls": 6,
+    "kernels": {
+     "sd:dsadcp_valueDcpValue": 71.3
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 84.36962890625
+   },
+   {
+    "group": "MOE.prepare",
+    "measured_us": 196.09765625,
+    "exposed_us": 196.09765625,
+    "t_ach_us": 0.0,
+    "t_sol_us": 0.0,
+    "derate": null,
+    "exposed_gap_us": 196.09765625,
+    "calls": 23,
+    "kernels": {
+     "_prepare_megamoe_inputs_kernel": 50.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 49.0244140625
+   },
+   {
+    "group": "DSA.qkv_a",
+    "measured_us": 253.5712890625,
+    "exposed_us": 246.916015625,
+    "t_ach_us": 60.41099050359713,
+    "t_sol_us": 38.16876218181818,
+    "derate": 4.197436376207095,
+    "exposed_gap_us": 186.50502512140287,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN": 68.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 63.392822265625
+   },
+   {
+    "group": "COMM.SP_RS",
+    "measured_us": 564.834228515625,
+    "exposed_us": 564.834228515625,
+    "t_ach_us": 397.52801006289315,
+    "t_sol_us": 340.71114666666665,
+    "derate": 1.4208664904550052,
+    "exposed_gap_us": 167.30621845273185,
+    "calls": 25,
+    "kernels": {
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 16.2,
+     "sd:commonsp_commSpReduceScatter": 112.6
+    },
+    "scale": 3.875,
+    "substituted": "",
+    "per_layer_us": 145.763671875
+   },
+   {
+    "group": "DENSE",
+    "measured_us": 138.097900390625,
+    "exposed_us": 138.097900390625,
+    "t_ach_us": 105.18726246577259,
+    "t_sol_us": 66.49554100599494,
+    "derate": 1.3128766464053703,
+    "exposed_gap_us": 32.91063792485241,
+    "calls": 4,
+    "kernels": {
+     "nvjet_sm107_tst_224x64_64x14_4x2f_2cta_h_bz_TNN": 80.2,
+     "vllm::situ_and_mul_kernel<c10::BFloat16>": 14.3,
+     "nvjet_sm107_tst_192x64_64x15_1x2_2cta_h_bz_splitK_TNN": 42.8,
+     "__nv_bfloat16,": 3.0
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 138.097900390625
+   },
+   {
+    "group": "DSA.idx_score",
+    "measured_us": 493.9599609375,
+    "exposed_us": 246.97998046875,
+    "t_ach_us": 141.84816345323742,
+    "t_sol_us": 100.87801232953483,
+    "derate": 3.4823148140394644,
+    "exposed_gap_us": 105.13181701551258,
+    "calls": 6,
+    "kernels": {
+     "deep_gemm::sm100_paged_mqa_logits": 126.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 123.489990234375
+   },
+   {
+    "group": "DSA.g_proj",
+    "measured_us": 360.4580078125,
+    "exposed_us": 180.22900390625,
+    "t_ach_us": 78.19057726618705,
+    "t_sol_us": 49.40222836363636,
+    "derate": 4.609992922617511,
+    "exposed_gap_us": 102.03842664006295,
+    "calls": 6,
+    "kernels": {
+     "sd:gemmsplitkSplitKGemm": 92.4
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 90.114501953125
+   },
+   {
+    "group": "DSA.o_proj",
+    "measured_us": 157.1865234375,
+    "exposed_us": 157.1865234375,
+    "t_ach_us": 79.5484454676259,
+    "t_sol_us": 50.26015418181819,
+    "derate": 1.9759848544302572,
+    "exposed_gap_us": 77.6380779698741,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 41.3
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 39.296630859375
+   },
+   {
+    "group": "DSA.w_uv",
+    "measured_us": 114.115234375,
+    "exposed_us": 114.115234375,
+    "t_ach_us": 49.24193262897025,
+    "t_sol_us": 31.244006831717133,
+    "derate": 2.3174402035525143,
+    "exposed_gap_us": 64.87330174602975,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_64x160_64x16_2x1_2cta_v_bz_TNT": 28.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 28.52880859375
+   },
+   {
+    "group": "DSA.topk",
+    "measured_us": 140.5478515625,
+    "exposed_us": 70.27392578125,
+    "t_ach_us": 15.370608345323742,
+    "t_sol_us": 9.711429818181818,
+    "derate": 9.143935516726597,
+    "exposed_gap_us": 54.903317435926255,
+    "calls": 18,
+    "kernels": {
+     "k31dcpx::topk_pp_hist_kernel": 16.3,
+     "k31dcpx::topk_pp_window_kernel": 4.7,
+     "k31dcpx::topk_pp_win_kernel": 16.0
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 35.136962890625
+   },
+   {
+    "group": "OTHER",
+    "measured_us": 9.15234375,
+    "exposed_us": 9.15234375,
+    "t_ach_us": 0.0,
+    "t_sol_us": 0.0,
+    "derate": null,
+    "exposed_gap_us": 9.15234375,
+    "calls": 5,
+    "kernels": {
+     "fa": 9.0
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 9.15234375
+   },
+   {
+    "group": "DSA.prologue",
+    "measured_us": 72.5107421875,
+    "exposed_us": 36.25537109375,
+    "t_ach_us": 1.939780143884892,
+    "t_sol_us": 1.2255883636363636,
+    "derate": 37.38090753021072,
+    "exposed_gap_us": 34.31559094986511,
+    "calls": 6,
+    "kernels": {
+     "sd:dsaindexDsaIndex": 18.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 18.127685546875
+   },
+   {
+    "group": "COMM.SP_AG",
+    "measured_us": 423.835693359375,
+    "exposed_us": 423.835693359375,
+    "t_ach_us": 393.2989886792453,
+    "t_sol_us": 337.08655999999996,
+    "derate": 1.077642469365803,
+    "exposed_gap_us": 30.536704680129674,
+    "calls": 24,
+    "kernels": {
+     "sd:commonsp_commSpAllGather": 105.3
+    },
+    "scale": 3.875,
+    "substituted": "",
+    "per_layer_us": 109.376953125
+   },
+   {
+    "group": "EMBED",
+    "measured_us": 2.656005859375,
+    "exposed_us": 2.656005859375,
+    "t_ach_us": 0.06601669064748202,
+    "t_sol_us": 0.04171054545454545,
+    "derate": 40.23233872109135,
+    "exposed_gap_us": 2.589989168727518,
+    "calls": 1,
+    "kernels": {
+     "uint4>": 4.7
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 2.656005859375
+   }
+  ],
+  "families": [
+   {
+    "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+    "groups": [
+     "KDA.in_proj",
+     "KDA.o_proj",
+     "DSA.qkv_a",
+     "DSA.g_proj",
+     "DSA.o_proj",
+     "DSA.w_uv",
+     "MOE.router+latent_down",
+     "MOE.shared_gate_up",
+     "MOE.shared_down",
+     "MOE.latent_up",
+     "DENSE"
+    ],
+    "busy_us": 7953.715250651042,
+    "exposed_us": 6957.162516276042,
+    "t_ach_us": 4053.3949756783954,
+    "t_sol_us": 2561.1770182973833,
+    "derate": 1.9622354343397956,
+    "exposed_gap_us": 2903.7675405976465
+   },
+   {
+    "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+    "groups": [
+     "MOE.megamoe",
+     "MOE.prepare"
+    ],
+    "busy_us": 6940.065656250001,
+    "exposed_us": 6940.065656250001,
+    "t_ach_us": 4268.502086695802,
+    "t_sol_us": 3181.0389132028267,
+    "derate": 1.6258784733597789,
+    "exposed_gap_us": 2671.5635695541987
+   },
+   {
+    "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+    "groups": [
+     "ATTNRES",
+     "MOE.shared_act",
+     "MOE.latent_norm",
+     "MOE.topk",
+     "EMBED",
+     "OTHER"
+    ],
+    "busy_us": 1461.846943757972,
+    "exposed_us": 1274.0729258011797,
+    "t_ach_us": 51.705984904119305,
+    "t_sol_us": 33.43866401988123,
+    "derate": 28.27229664938671,
+    "exposed_gap_us": 1222.3669408970604
+   },
+   {
+    "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+    "groups": [
+     "DSA.topk",
+     "DSA.topk_merge"
+    ],
+    "busy_us": 1362.642578125,
+    "exposed_us": 1252.49560546875,
+    "t_ach_us": 169.39711400570107,
+    "t_sol_us": 154.8557498181818,
+    "derate": 8.044071979166896,
+    "exposed_gap_us": 1083.098491463049
+   },
+   {
+    "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+    "groups": [
+     "DSA.q_path",
+     "DSA.sparse_mla",
+     "DSA.dcp_value",
+     "DSA.prologue"
+    ],
+    "busy_us": 2103.64453125,
+    "exposed_us": 1445.45849609375,
+    "t_ach_us": 457.33402836418077,
+    "t_sol_us": 330.0049648717379,
+    "derate": 4.599798835819061,
+    "exposed_gap_us": 988.1244677295692
+   },
+   {
+    "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+    "groups": [
+     "KDA.core"
+    ],
+    "busy_us": 1469.563924153646,
+    "exposed_us": 1469.563924153646,
+    "t_ach_us": 604.4502299755521,
+    "t_sol_us": 383.4236908506863,
+    "derate": 2.4312405741215195,
+    "exposed_gap_us": 865.1136941780939
+   },
+   {
+    "family": "drafter + final (DSpark k=3 propose)",
+    "groups": [
+     "TAIL.drafter+final"
+    ],
+    "busy_us": 525.0,
+    "exposed_us": 525.0,
+    "t_ach_us": 268.8103303015684,
+    "t_sol_us": 182.23710718767816,
+    "derate": 1.9530499419833376,
+    "exposed_gap_us": 256.1896696984316
+   },
+   {
+    "family": "SP comm (AllGather / ReduceScatter push)",
+    "groups": [
+     "COMM.SP_AG",
+     "COMM.SP_RS"
+    ],
+    "busy_us": 988.669921875,
+    "exposed_us": 988.669921875,
+    "t_ach_us": 790.8269987421385,
+    "t_sol_us": 677.7977066666666,
+    "derate": 1.250172191196739,
+    "exposed_gap_us": 197.84292313286153
+   },
+   {
+    "family": "DSA indexer logits (paged_mqa_logits)",
+    "groups": [
+     "DSA.idx_score"
+    ],
+    "busy_us": 493.9599609375,
+    "exposed_us": 246.97998046875,
+    "t_ach_us": 141.84816345323742,
+    "t_sol_us": 100.87801232953483,
+    "derate": 3.4823148140394644,
+    "exposed_gap_us": 105.13181701551258
+   },
+   {
+    "family": "spin wait (QueryWait)",
+    "groups": [
+     "WAIT"
+    ],
+    "busy_us": 0,
+    "exposed_us": 0,
+    "t_ach_us": 0,
+    "t_sol_us": 0,
+    "derate": null,
+    "exposed_gap_us": 0
+   }
+  ]
+ },
+ "q4_B64_M256_u132k": {
+  "B": 64,
+  "r": 16.0,
+  "bench24_step_us": 15488.3,
+  "projected93_step_us": 26997.546820880503,
+  "model_ach_bench_scope_us": 11339.236857532798,
+  "model_sol_us": 8181.059918757098,
+  "multinode_measured_ms": 26.98,
+  "rows": [
+   {
+    "group": "MOE.megamoe",
+    "measured_us": 7115.372000000001,
+    "exposed_us": 7115.372000000001,
+    "t_ach_us": 4811.706910998674,
+    "t_sol_us": 3518.0927724547846,
+    "derate": 1.4787625538321076,
+    "exposed_gap_us": 2303.665089001327,
+    "calls": 23,
+    "kernels": {
+     "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7627.9
+    },
+    "scale": 4.0,
+    "substituted": "substituted: FI EP32 MX standalone x92 x1.1 (range x1.0-1.2); 1-node EP4 measured 331 us/layer",
+    "per_layer_us": 7623.12841796875
+   },
+   {
+    "group": "TAIL.drafter+final",
+    "measured_us": 697.0,
+    "exposed_us": 697.0,
+    "t_ach_us": 341.66144087117897,
+    "t_sol_us": 234.1778763296836,
+    "derate": 2.040031202300054,
+    "exposed_gap_us": 355.33855912882103,
+    "calls": 119,
+    "kernels": {
+     "at::native::": 21.1,
+     "ncclDevKernel_AllGather_RING": 213.4,
+     "true>": 16.4,
+     "_prepare_dflash_inputs_kernel": 3.1,
+     "nvjet_sm107_tst_320x128_64x8_1x2_2cta_h_bz_splitK_TNN": 57.3,
+     "__nv_bfloat16,": 6.5,
+     "DtoD": 1.9,
+     "_kernel_slots_kernel": 7.4,
+     "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN": 11.6,
+     "at::native::gpu_kernel_impl_nocast<at::native::direct_copy_k": 16.5,
+     "false>": 2.1,
+     "char,": 3.7,
+     "_dcp_local_seq_lens_kernel": 1.4,
+     ">": 5.8,
+     "uint4>": 2.4,
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 67.0,
+     "nvjet_sm107_tst_64x48_64x16_2x4_2cta_h_bz_TNT": 48.9,
+     "_quant_kernel": 2.6,
+     "_wlist_kernel": 15.1,
+     "sd:mlaqueryMlaQuery": 185.9,
+     "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 1557.4,
+     "sd:mladcpDcpValue": 140.9,
+     "nvjet_sm107_tst_192x64_64x15_4x2_2cta_v_bz_TNN": 181.0,
+     "flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport": 35.8,
+     "&": 11.5,
+     "long>": 6.0,
+     "nvjet_sm107_tst_128x288_64x9_2x1_2cta_v_bz_TNT": 72.1,
+     "at::native::gpu_index_kernel<at::native::index_kernel_impl<a": 3.3,
+     "int>": 1.9,
+     "nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT": 76.5,
+     "at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_a": 94.0,
+     "_gumbel_sample_kernel": 27.3,
+     "4,": 11.7,
+     "at::": 6.0
+    },
+    "scale": 1.0,
+    "substituted": "substituted: gap512 release-drafter tail; 1-node stock preview drafter measured 2912 us",
+    "per_layer_us": 582.3599609375
+   },
+   {
+    "group": "KDA.core",
+    "measured_us": 2661.773640950521,
+    "exposed_us": 2661.773640950521,
+    "t_ach_us": 1208.1684841237661,
+    "t_sol_us": 766.384906065009,
+    "derate": 2.2031477198157456,
+    "exposed_gap_us": 1453.6051568267549,
+    "calls": 18,
+    "kernels": {
+     "sd:kdawideKdaWide": 698.7
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 694.375732421875
+   },
+   {
+    "group": "DSA.topk_merge",
+    "measured_us": 1184.849609375,
+    "exposed_us": 1182.7080078125,
+    "t_ach_us": 167.38101132075468,
+    "t_sol_us": 153.00863999999999,
+    "derate": 7.078757620268259,
+    "exposed_gap_us": 1015.3269964917454,
+    "calls": 6,
+    "kernels": {
+     "k31dcpx::topk_merge_kernel<16>": 290.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 296.21240234375
+   },
+   {
+    "group": "KDA.in_proj",
+    "measured_us": 1779.9197998046875,
+    "exposed_us": 1779.9197998046875,
+    "t_ach_us": 933.2842679298946,
+    "t_sol_us": 794.9997298036363,
+    "derate": 1.9071571877587778,
+    "exposed_gap_us": 846.635531874793,
+    "calls": 18,
+    "kernels": {
+     "nvjet_sm107_tst_192x128_64x11_2x2_2cta_h_bz_TNN": 509.3
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 464.326904296875
+   },
+   {
+    "group": "MOE.latent_up",
+    "measured_us": 1117.1376953125,
+    "exposed_us": 1117.1376953125,
+    "t_ach_us": 349.17957985611514,
+    "t_sol_us": 220.61800727272725,
+    "derate": 3.1993213800555975,
+    "exposed_gap_us": 767.9581154563848,
+    "calls": 23,
+    "kernels": {
+     "nvjet_sm107_tst_64x48_64x16_2x1_2cta_v_badd_TNT": 277.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 279.284423828125
+   },
+   {
+    "group": "MOE.shared_down",
+    "measured_us": 1313.49609375,
+    "exposed_us": 1313.49609375,
+    "t_ach_us": 594.2559309352517,
+    "t_sol_us": 375.46170181818184,
+    "derate": 2.210320546036106,
+    "exposed_gap_us": 719.2401628147483,
+    "calls": 46,
+    "kernels": {
+     "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN": 271.0,
+     "__nv_bfloat16,": 74.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 164.18701171875
+   },
+   {
+    "group": "MOE.shared_gate_up",
+    "measured_us": 1844.18359375,
+    "exposed_us": 1844.18359375,
+    "t_ach_us": 1182.43917352518,
+    "t_sol_us": 747.0865687272726,
+    "derate": 1.5596435191266338,
+    "exposed_gap_us": 661.74442022482,
+    "calls": 23,
+    "kernels": {
+     "nvjet_sm107_tst_64x64_64x16_4x2f_2cta_h_bz_TNN": 474.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 461.0458984375
+   },
+   {
+    "group": "DSA.topk",
+    "measured_us": 632.005859375,
+    "exposed_us": 632.005859375,
+    "t_ach_us": 30.741216690647484,
+    "t_sol_us": 19.422859636363636,
+    "derate": 20.558908443180698,
+    "exposed_gap_us": 601.2646426843526,
+    "calls": 18,
+    "kernels": {
+     "k31dcpx::topk_pp_hist_kernel": 50.3,
+     "k31dcpx::topk_pp_window_kernel": 23.6,
+     "k31dcpx::topk_pp_win_kernel": 84.0
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 158.00146484375
+   },
+   {
+    "group": "MOE.router+latent_down",
+    "measured_us": 1920.4033203125,
+    "exposed_us": 1013.1298828125,
+    "t_ach_us": 441.7880771223022,
+    "t_sol_us": 279.12973963636364,
+    "derate": 4.346888066381353,
+    "exposed_gap_us": 571.3418056901978,
+    "calls": 92,
+    "kernels": {
+     "nvjet_sm107_tss_48x64_64x16_2x1_h_bz_splitK_TNN": 87.1,
+     "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN": 268.2,
+     "fal": 92.4,
+     "__nv_bfloat16,": 51.6
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 120.02520751953125
+   },
+   {
+    "group": "COMM.SP_RS",
+    "measured_us": 1015.3285217285156,
+    "exposed_us": 1015.3285217285156,
+    "t_ach_us": 519.5733534591194,
+    "t_sol_us": 412.58229333333327,
+    "derate": 1.9541581856899495,
+    "exposed_gap_us": 495.7551682693962,
+    "calls": 25,
+    "kernels": {
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 17.7,
+     "sd:commonsp_commSpReduceScatter": 148.1
+    },
+    "scale": 3.875,
+    "substituted": "",
+    "per_layer_us": 262.020263671875
+   },
+   {
+    "group": "DSA.sparse_mla",
+    "measured_us": 618.5029296875,
+    "exposed_us": 615.75244140625,
+    "t_ach_us": 153.43910676258994,
+    "t_sol_us": 96.94561745454544,
+    "derate": 4.030934112804008,
+    "exposed_gap_us": 462.31333464366,
+    "calls": 12,
+    "kernels": {
+     "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 148.8,
+     "flashinfer::ComputeLSEFromMDKernel": 6.7
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 154.625732421875
+   },
+   {
+    "group": "DSA.g_proj",
+    "measured_us": 1068.1171875,
+    "exposed_us": 534.05859375,
+    "t_ach_us": 80.34053525179857,
+    "t_sol_us": 67.645734912,
+    "derate": 13.294872683538516,
+    "exposed_gap_us": 453.71805849820146,
+    "calls": 6,
+    "kernels": {
+     "sd:gemmsplitkSplitKGemm": 265.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 267.029296875
+   },
+   {
+    "group": "KDA.o_proj",
+    "measured_us": 643.0865885416667,
+    "exposed_us": 643.0865885416667,
+    "t_ach_us": 238.7867810071942,
+    "t_sol_us": 194.481487872,
+    "derate": 2.69314149564373,
+    "exposed_gap_us": 404.2998075344725,
+    "calls": 18,
+    "kernels": {
+     "nvjet_sm107_tst_128x112_64x13_2x1_2cta_v_bz_TNT": 199.4
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 167.76171875
+   },
+   {
+    "group": "ATTNRES",
+    "measured_us": 510.66287667410717,
+    "exposed_us": 491.9488076969069,
+    "t_ach_us": 98.3284581294964,
+    "t_sol_us": 62.12570763636363,
+    "derate": 5.193439278805486,
+    "exposed_gap_us": 393.62034956741047,
+    "calls": 49,
+    "kernels": {
+     "true>": 131.4,
+     "false>": 3.7
+    },
+    "scale": 3.816326530612245,
+    "substituted": "",
+    "per_layer_us": 66.905029296875
+   },
+   {
+    "group": "DSA.q_path",
+    "measured_us": 1544.59765625,
+    "exposed_us": 774.63525390625,
+    "t_ach_us": 386.2370395327596,
+    "t_sol_us": 264.90245044536016,
+    "derate": 3.9990925213142106,
+    "exposed_gap_us": 388.3982143734904,
+    "calls": 12,
+    "kernels": {
+     "sd:dsaoverlapQueryNorm": 10.7,
+     "sd:mlaqueryMlaQuery": 374.7
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 386.1494140625
+   },
+   {
+    "group": "MOE.shared_act",
+    "measured_us": 345.7333984375,
+    "exposed_us": 345.7333984375,
+    "t_ach_us": 3.299831869979451,
+    "t_sol_us": 3.299831869979451,
+    "derate": 104.77303452422653,
+    "exposed_gap_us": 342.43356656752053,
+    "calls": 23,
+    "kernels": {
+     "vllm::situ_and_mul_kernel<c10::BFloat16>": 86.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 86.433349609375
+   },
+   {
+    "group": "DSA.idx_score",
+    "measured_us": 748.873046875,
+    "exposed_us": 622.630859375,
+    "t_ach_us": 283.69632690647484,
+    "t_sol_us": 201.75602465906965,
+    "derate": 2.6396994809237637,
+    "exposed_gap_us": 338.93453246852516,
+    "calls": 6,
+    "kernels": {
+     "deep_gemm::sm100_paged_mqa_logits": 188.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 187.21826171875
+   },
+   {
+    "group": "DSA.dcp_value",
+    "measured_us": 498.5029296875,
+    "exposed_us": 498.5029296875,
+    "t_ach_us": 178.84135849056605,
+    "t_sol_us": 132.5376,
+    "derate": 2.7874029469184345,
+    "exposed_gap_us": 319.66157119693395,
+    "calls": 6,
+    "kernels": {
+     "sd:dsadcp_valueDcpValue": 106.2
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 124.625732421875
+   },
+   {
+    "group": "DSA.qkv_a",
+    "measured_us": 348.0419921875,
+    "exposed_us": 334.728515625,
+    "t_ach_us": 64.58360633093525,
+    "t_sol_us": 50.029658112,
+    "derate": 5.389014518701311,
+    "exposed_gap_us": 270.14490929406475,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_160x64_64x16_1x4_2cta_h_bz_TNN": 98.3
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 87.010498046875
+   },
+   {
+    "group": "MOE.latent_norm",
+    "measured_us": 249.92578125,
+    "exposed_us": 249.92578125,
+    "t_ach_us": 0.6416339747182266,
+    "t_sol_us": 0.6416339747182266,
+    "derate": 389.5145692055269,
+    "exposed_gap_us": 249.28414727528178,
+    "calls": 23,
+    "kernels": {
+     "true>": 63.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 62.4814453125
+   },
+   {
+    "group": "MOE.topk",
+    "measured_us": 400.6474609375,
+    "exposed_us": 216.67333984375,
+    "t_ach_us": 0.24061274051933493,
+    "t_sol_us": 0.24061274051933493,
+    "derate": 1665.113244098166,
+    "exposed_gap_us": 216.43272710323066,
+    "calls": 23,
+    "kernels": {
+     "int,": 103.7
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 100.161865234375
+   },
+   {
+    "group": "MOE.prepare",
+    "measured_us": 208.2587890625,
+    "exposed_us": 205.4140625,
+    "t_ach_us": 0.0,
+    "t_sol_us": 0.0,
+    "derate": null,
+    "exposed_gap_us": 205.4140625,
+    "calls": 23,
+    "kernels": {
+     "_prepare_megamoe_inputs_kernel": 53.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 52.064697265625
+   },
+   {
+    "group": "DSA.o_proj",
+    "measured_us": 233.4755859375,
+    "exposed_us": 233.4755859375,
+    "t_ach_us": 83.05627165467625,
+    "t_sol_us": 67.645734912,
+    "derate": 2.8110530521791706,
+    "exposed_gap_us": 150.41931428282373,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_128x112_64x13_2x1_2cta_v_bz_TNT": 56.4
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 58.368896484375
+   },
+   {
+    "group": "DENSE",
+    "measured_us": 129.5537109375,
+    "exposed_us": 129.5537109375,
+    "t_ach_us": 105.81867342075378,
+    "t_sol_us": 66.93079401198987,
+    "derate": 1.2242991406854205,
+    "exposed_gap_us": 23.735037516746218,
+    "calls": 4,
+    "kernels": {
+     "nvjet_sm107_tst_352x64_64x10_1x2_2cta_h_bz_TNN": 76.6,
+     "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 5.5,
+     "nvjet_sm107_tst_192x112_64x10_4x1_2cta_v_bz_splitK_TNT": 44.7,
+     "__nv_bfloat16,": 4.3
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 129.5537109375
+   },
+   {
+    "group": "DSA.prologue",
+    "measured_us": 109.9482421875,
+    "exposed_us": 54.97412109375,
+    "t_ach_us": 3.87072,
+    "t_sol_us": 2.4455912727272726,
+    "derate": 28.405113825722346,
+    "exposed_gap_us": 51.10340109375,
+    "calls": 6,
+    "kernels": {
+     "sd:dsaindexDsaIndex": 28.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 27.487060546875
+   },
+   {
+    "group": "DSA.w_uv",
+    "measured_us": 123.005859375,
+    "exposed_us": 123.005859375,
+    "t_ach_us": 76.7579740349189,
+    "t_sol_us": 48.76120057252518,
+    "derate": 1.602515711514766,
+    "exposed_gap_us": 46.2478853400811,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_160x128_64x12_1x2_2cta_h_bz_TNN": 30.3
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 30.75146484375
+   },
+   {
+    "group": "OTHER",
+    "measured_us": 10.38330078125,
+    "exposed_us": 10.38330078125,
+    "t_ach_us": 0.0,
+    "t_sol_us": 0.0,
+    "derate": null,
+    "exposed_gap_us": 10.38330078125,
+    "calls": 5,
+    "kernels": {
+     "fa": 10.2
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 10.38330078125
+   },
+   {
+    "group": "COMM.SP_AG",
+    "measured_us": 537.4888000488281,
+    "exposed_us": 537.4888000488281,
+    "t_ach_us": 514.0459773584905,
+    "t_sol_us": 408.1931199999999,
+    "derate": 1.0456045251259476,
+    "exposed_gap_us": 23.442822690337607,
+    "calls": 24,
+    "kernels": {
+     "sd:commonsp_commSpAllGather": 115.8
+    },
+    "scale": 3.875,
+    "substituted": "",
+    "per_layer_us": 138.706787109375
+   },
+   {
+    "group": "EMBED",
+    "measured_us": 3.519775390625,
+    "exposed_us": 3.519775390625,
+    "t_ach_us": 0.13203338129496403,
+    "t_sol_us": 0.0834210909090909,
+    "derate": 26.65822351971569,
+    "exposed_gap_us": 3.387742009330036,
+    "calls": 1,
+    "kernels": {
+     "uint4>": 3.6
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 3.519775390625
+   }
+  ],
+  "families": [
+   {
+    "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+    "groups": [
+     "KDA.in_proj",
+     "KDA.o_proj",
+     "DSA.qkv_a",
+     "DSA.g_proj",
+     "DSA.o_proj",
+     "DSA.w_uv",
+     "MOE.router+latent_down",
+     "MOE.shared_gate_up",
+     "MOE.shared_down",
+     "MOE.latent_up",
+     "DENSE"
+    ],
+    "busy_us": 10520.421427408855,
+    "exposed_us": 9065.775919596355,
+    "t_ach_us": 4150.290871069021,
+    "t_sol_us": 2912.790357650697,
+    "derate": 2.5348636407016536,
+    "exposed_gap_us": 4915.485048527335
+   },
+   {
+    "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+    "groups": [
+     "MOE.megamoe",
+     "MOE.prepare"
+    ],
+    "busy_us": 7323.630789062501,
+    "exposed_us": 7320.786062500001,
+    "t_ach_us": 4811.706910998674,
+    "t_sol_us": 3518.0927724547846,
+    "derate": 1.52204424012652,
+    "exposed_gap_us": 2509.079151501327
+   },
+   {
+    "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+    "groups": [
+     "DSA.topk",
+     "DSA.topk_merge"
+    ],
+    "busy_us": 1816.85546875,
+    "exposed_us": 1814.7138671875,
+    "t_ach_us": 198.12222801140217,
+    "t_sol_us": 172.4314996363636,
+    "derate": 9.170376726459173,
+    "exposed_gap_us": 1616.591639176098
+   },
+   {
+    "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+    "groups": [
+     "KDA.core"
+    ],
+    "busy_us": 2661.773640950521,
+    "exposed_us": 2661.773640950521,
+    "t_ach_us": 1208.1684841237661,
+    "t_sol_us": 766.384906065009,
+    "derate": 2.2031477198157456,
+    "exposed_gap_us": 1453.6051568267549
+   },
+   {
+    "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+    "groups": [
+     "DSA.q_path",
+     "DSA.sparse_mla",
+     "DSA.dcp_value",
+     "DSA.prologue"
+    ],
+    "busy_us": 2771.5517578125,
+    "exposed_us": 1943.86474609375,
+    "t_ach_us": 722.3882247859157,
+    "t_sol_us": 496.8312591726328,
+    "derate": 3.8366513499494914,
+    "exposed_gap_us": 1221.4765213078344
+   },
+   {
+    "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+    "groups": [
+     "ATTNRES",
+     "MOE.shared_act",
+     "MOE.latent_norm",
+     "MOE.topk",
+     "EMBED",
+     "OTHER"
+    ],
+    "busy_us": 1520.872593470982,
+    "exposed_us": 1318.184403400032,
+    "t_ach_us": 102.64257009600838,
+    "t_sol_us": 66.39120731248974,
+    "derate": 14.817171784069801,
+    "exposed_gap_us": 1215.5418333040236
+   },
+   {
+    "family": "SP comm (AllGather / ReduceScatter push)",
+    "groups": [
+     "COMM.SP_AG",
+     "COMM.SP_RS"
+    ],
+    "busy_us": 1552.8173217773438,
+    "exposed_us": 1552.8173217773438,
+    "t_ach_us": 1033.6193308176098,
+    "t_sol_us": 820.7754133333332,
+    "derate": 1.5023106432704194,
+    "exposed_gap_us": 519.1979909597339
+   },
+   {
+    "family": "drafter + final (DSpark k=3 propose)",
+    "groups": [
+     "TAIL.drafter+final"
+    ],
+    "busy_us": 697.0,
+    "exposed_us": 697.0,
+    "t_ach_us": 341.66144087117897,
+    "t_sol_us": 234.1778763296836,
+    "derate": 2.040031202300054,
+    "exposed_gap_us": 355.33855912882103
+   },
+   {
+    "family": "DSA indexer logits (paged_mqa_logits)",
+    "groups": [
+     "DSA.idx_score"
+    ],
+    "busy_us": 748.873046875,
+    "exposed_us": 622.630859375,
+    "t_ach_us": 283.69632690647484,
+    "t_sol_us": 201.75602465906965,
+    "derate": 2.6396994809237637,
+    "exposed_gap_us": 338.93453246852516
+   },
+   {
+    "family": "spin wait (QueryWait)",
+    "groups": [
+     "WAIT"
+    ],
+    "busy_us": 0,
+    "exposed_us": 0,
+    "t_ach_us": 0,
+    "t_sol_us": 0,
+    "derate": null,
+    "exposed_gap_us": 0
+   }
+  ]
+ },
+ "q4_B96_M384_u132k": {
+  "B": 96,
+  "r": 24.0,
+  "bench24_step_us": 17430.0,
+  "projected93_step_us": 30166.403642310735,
+  "model_ach_bench_scope_us": 13379.70847570407,
+  "model_sol_us": 9828.216072695635,
+  "multinode_measured_ms": 30.48,
+  "rows": [
+   {
+    "group": "MOE.megamoe",
+    "measured_us": 7479.692,
+    "exposed_us": 7479.692,
+    "t_ach_us": 5354.911709655907,
+    "t_sol_us": 3855.146611773086,
+    "derate": 1.3967909100186875,
+    "exposed_gap_us": 2124.7802903440934,
+    "calls": 23,
+    "kernels": {
+     "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 7690.1
+    },
+    "scale": 4.0,
+    "substituted": "substituted: FI EP32 MX standalone x92 x1.1 (range x1.0-1.2); 1-node EP4 measured 335 us/layer",
+    "per_layer_us": 7697.128173828125
+   },
+   {
+    "group": "TAIL.drafter+final",
+    "measured_us": 891.0,
+    "exposed_us": 891.0,
+    "t_ach_us": 279.41639145200486,
+    "t_sol_us": 218.83094359997995,
+    "derate": 3.188789302481012,
+    "exposed_gap_us": 611.5836085479951,
+    "calls": 118,
+    "kernels": {
+     "at::native::": 29.3,
+     "ncclDevKernel_AllGather_RING": 277.2,
+     "true>": 18.7,
+     "_prepare_dflash_inputs_kernel": 3.0,
+     "nvjet_sm107_tst_256x64_64x13_2x2_2cta_v_bz_TNN": 85.7,
+     "DtoD": 1.8,
+     "_kernel_slots_kernel": 8.9,
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 19.5,
+     "at::native::gpu_kernel_impl_nocast<at::native::direct_copy_k": 17.3,
+     "false>": 2.3,
+     "char,": 4.8,
+     "_dcp_local_seq_lens_kernel": 1.6,
+     ">": 6.3,
+     "uint4>": 3.1,
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 92.8,
+     "nvjet_sm107_tst_64x64_64x16_1x2_2cta_h_bz_TNN": 56.4,
+     "_quant_kernel": 3.8,
+     "_wlist_kernel": 45.0,
+     "sd:mlaqueryMlaQuery": 278.5,
+     "kernel_cutlass_ts_split_kv_vllmmodelskimi_k3nvidiaspecialize": 2225.3,
+     "sd:mladcpDcpValue": 236.6,
+     "nvjet_sm107_tst_128x96_64x14_2x1_2cta_v_bz_TNT": 107.6,
+     "flashinfer::trtllm_mnnvl_allreduce::rmsNormLamport": 46.4,
+     "nvjet_sm107_tst_224x64_64x14_2x2_2cta_h_bz_TNN": 153.0,
+     "&": 14.6,
+     "long>": 6.2,
+     "nvjet_sm107_tst_192x192_64x8_2x2f_2cta_h_bz_TNN": 91.8,
+     "at::native::gpu_index_kernel<at::native::index_kernel_impl<a": 2.9,
+     "int>": 1.7,
+     "nvjet_sm107_tst_128x160_64x11_2x1_2cta_v_bz_TNT": 58.0,
+     "at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_a": 140.5,
+     "_gumbel_sample_kernel": 39.9,
+     "4,": 11.5,
+     "at::": 6.1
+    },
+    "scale": 1.0,
+    "substituted": "substituted: gap512 release-drafter tail; 1-node stock preview drafter measured 4096 us",
+    "per_layer_us": 819.26875
+   },
+   {
+    "group": "KDA.core",
+    "measured_us": 3394.8443603515625,
+    "exposed_us": 3394.8443603515625,
+    "t_ach_us": 1811.8867382719802,
+    "t_sol_us": 1149.3461212793316,
+    "derate": 1.8736515305527703,
+    "exposed_gap_us": 1582.9576220795823,
+    "calls": 18,
+    "kernels": {
+     "sd:kdaspecializedKdaWS": 888.0
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 885.611572265625
+   },
+   {
+    "group": "DSA.topk_merge",
+    "measured_us": 1344.8505859375,
+    "exposed_us": 1341.77880859375,
+    "t_ach_us": 180.73551698113206,
+    "t_sol_us": 160.87295999999998,
+    "derate": 7.440986743507066,
+    "exposed_gap_us": 1161.0432916126178,
+    "calls": 6,
+    "kernels": {
+     "k31dcpx::topk_merge_kernel<16>": 319.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 336.212646484375
+   },
+   {
+    "group": "DSA.topk",
+    "measured_us": 980.1083984375,
+    "exposed_us": 980.1083984375,
+    "t_ach_us": 46.11182503597123,
+    "t_sol_us": 29.134289454545456,
+    "derate": 21.25503377220334,
+    "exposed_gap_us": 933.9965734015287,
+    "calls": 18,
+    "kernels": {
+     "k31dcpx::topk_pp_hist_kernel": 66.8,
+     "k31dcpx::topk_pp_window_kernel": 24.8,
+     "k31dcpx::topk_pp_win_kernel": 154.8
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 245.027099609375
+   },
+   {
+    "group": "MOE.shared_gate_up",
+    "measured_us": 2079.890625,
+    "exposed_us": 2079.890625,
+    "t_ach_us": 1190.6806791366905,
+    "t_sol_us": 752.2937018181818,
+    "derate": 1.7468080749475468,
+    "exposed_gap_us": 889.2099458633095,
+    "calls": 23,
+    "kernels": {
+     "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 537.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 519.97265625
+   },
+   {
+    "group": "COMM.SP_RS",
+    "measured_us": 1404.4415283203125,
+    "exposed_us": 1404.4415283203125,
+    "t_ach_us": 641.6186968553459,
+    "t_sol_us": 484.45343999999994,
+    "derate": 2.1889036825199413,
+    "exposed_gap_us": 762.8228314649666,
+    "calls": 25,
+    "kernels": {
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 19.9,
+     "sd:commonsp_commSpReduceScatter": 221.6
+    },
+    "scale": 3.875,
+    "substituted": "",
+    "per_layer_us": 362.4365234375
+   },
+   {
+    "group": "DSA.g_proj",
+    "measured_us": 1569.4931640625,
+    "exposed_us": 784.74658203125,
+    "t_ach_us": 111.19846834849314,
+    "t_sol_us": 101.468602368,
+    "derate": 14.114341567581208,
+    "exposed_gap_us": 673.5481136827568,
+    "calls": 6,
+    "kernels": {
+     "sd:gemmsplitkSplitKGemm": 391.7
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 392.373291015625
+   },
+   {
+    "group": "KDA.in_proj",
+    "measured_us": 1861.5587565104167,
+    "exposed_us": 1861.5587565104167,
+    "t_ach_us": 1310.338137997359,
+    "t_sol_us": 1191.266326341818,
+    "derate": 1.4206705143723513,
+    "exposed_gap_us": 551.2206185130578,
+    "calls": 18,
+    "kernels": {
+     "nvjet_sm107_tst_128x192_64x11_2x1_2cta_v_bz_TNT": 574.0
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 485.6240234375
+   },
+   {
+    "group": "MOE.router+latent_down",
+    "measured_us": 1819.798828125,
+    "exposed_us": 1014.69580078125,
+    "t_ach_us": 450.13802359712236,
+    "t_sol_us": 284.4053876363636,
+    "derate": 4.042757404901517,
+    "exposed_gap_us": 564.5577771841276,
+    "calls": 69,
+    "kernels": {
+     "nvjet_sm107_tss_64x96_64x16_2x1_2cta_h_bz_splitK_TNT": 99.0,
+     "nvjet_sm107_tst_64x64_64x16_2x2_2cta_v_bz_TNN": 335.4,
+     "fal": 43.2
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 151.64990234375
+   },
+   {
+    "group": "DSA.sparse_mla",
+    "measured_us": 795.40234375,
+    "exposed_us": 792.55419921875,
+    "t_ach_us": 230.1586601438849,
+    "t_sol_us": 145.41842618181818,
+    "derate": 3.455887096547877,
+    "exposed_gap_us": 562.3955390748652,
+    "calls": 12,
+    "kernels": {
+     "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 190.8,
+     "flashinfer::ComputeLSEFromMDKernel": 8.0
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 198.8505859375
+   },
+   {
+    "group": "DSA.q_path",
+    "measured_us": 2142.75,
+    "exposed_us": 1074.22314453125,
+    "t_ach_us": 527.4050743496482,
+    "t_sol_us": 361.31782403167665,
+    "derate": 4.062816427472299,
+    "exposed_gap_us": 546.8180701816018,
+    "calls": 12,
+    "kernels": {
+     "sd:dsaoverlapQueryNorm": 9.8,
+     "sd:mlaqueryMlaQuery": 527.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 535.6875
+   },
+   {
+    "group": "DSA.idx_score",
+    "measured_us": 1025.8037109375,
+    "exposed_us": 890.2822265625,
+    "t_ach_us": 425.54449035971226,
+    "t_sol_us": 302.6340369886045,
+    "derate": 2.4105674827804475,
+    "exposed_gap_us": 464.73773620278774,
+    "calls": 6,
+    "kernels": {
+     "deep_gemm::sm100_paged_mqa_logits": 258.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 256.450927734375
+   },
+   {
+    "group": "KDA.o_proj",
+    "measured_us": 707.5494791666667,
+    "exposed_us": 707.5494791666667,
+    "t_ach_us": 319.6955965019178,
+    "t_sol_us": 291.722231808,
+    "derate": 2.213197450664361,
+    "exposed_gap_us": 387.85388266474894,
+    "calls": 18,
+    "kernels": {
+     "nvjet_sm107_tst_128x128_64x12_4x1_2cta_v_bz_TNT": 221.8
+    },
+    "scale": 3.8333333333333335,
+    "substituted": "",
+    "per_layer_us": 184.578125
+   },
+   {
+    "group": "DSA.dcp_value",
+    "measured_us": 624.578125,
+    "exposed_us": 624.578125,
+    "t_ach_us": 233.09403773584907,
+    "t_sol_us": 164.4864,
+    "derate": 2.6795113726066018,
+    "exposed_gap_us": 391.48408726415096,
+    "calls": 6,
+    "kernels": {
+     "sd:dsadcp_valueDcpValue": 141.0
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 156.14453125
+   },
+   {
+    "group": "MOE.shared_down",
+    "measured_us": 985.5546875,
+    "exposed_us": 985.5546875,
+    "t_ach_us": 599.8948558273381,
+    "t_sol_us": 379.0244770909091,
+    "derate": 1.6428790444298502,
+    "exposed_gap_us": 385.6598316726619,
+    "calls": 23,
+    "kernels": {
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 266.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 246.388671875
+   },
+   {
+    "group": "MOE.shared_act",
+    "measured_us": 347.4033203125,
+    "exposed_us": 347.4033203125,
+    "t_ach_us": 4.949747804969176,
+    "t_sol_us": 4.949747804969176,
+    "derate": 70.18606482611763,
+    "exposed_gap_us": 342.45357250753085,
+    "calls": 23,
+    "kernels": {
+     "vllm::situ_and_mul_kernel<c10::BFloat16>": 86.4
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 86.850830078125
+   },
+   {
+    "group": "ATTNRES",
+    "measured_us": 494.4136738679847,
+    "exposed_us": 459.08982631138394,
+    "t_ach_us": 147.1079873381295,
+    "t_sol_us": 92.94550109090909,
+    "derate": 3.3608893902651853,
+    "exposed_gap_us": 311.9818389732544,
+    "calls": 49,
+    "kernels": {
+     "true>": 126.6,
+     "false>": 3.7
+    },
+    "scale": 3.816326530612245,
+    "substituted": "",
+    "per_layer_us": 64.776123046875
+   },
+   {
+    "group": "MOE.latent_up",
+    "measured_us": 675.8525390625,
+    "exposed_us": 675.8525390625,
+    "t_ach_us": 353.73409611510795,
+    "t_sol_us": 223.49563345454544,
+    "derate": 1.9106231106502443,
+    "exposed_gap_us": 322.11844294739205,
+    "calls": 23,
+    "kernels": {
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_badd_TNT": 169.7
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 168.963134765625
+   },
+   {
+    "group": "DSA.qkv_a",
+    "measured_us": 371.779296875,
+    "exposed_us": 354.02197265625,
+    "t_ach_us": 82.24053388273973,
+    "t_sol_us": 75.044487168,
+    "derate": 4.520633309665653,
+    "exposed_gap_us": 271.7814387735103,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_64x192_64x15_2x2_2cta_v_bz_TNT": 112.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 92.94482421875
+   },
+   {
+    "group": "MOE.latent_norm",
+    "measured_us": 267.9091796875,
+    "exposed_us": 267.9091796875,
+    "t_ach_us": 0.9624509620773397,
+    "t_sol_us": 0.9624509620773397,
+    "derate": 278.36138176769947,
+    "exposed_gap_us": 266.94672872542264,
+    "calls": 23,
+    "kernels": {
+     "true>": 69.6
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 66.977294921875
+   },
+   {
+    "group": "MOE.prepare",
+    "measured_us": 221.123046875,
+    "exposed_us": 213.57373046875,
+    "t_ach_us": 0.0,
+    "t_sol_us": 0.0,
+    "derate": null,
+    "exposed_gap_us": 213.57373046875,
+    "calls": 23,
+    "kernels": {
+     "_prepare_megamoe_inputs_kernel": 53.2
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 55.28076171875
+   },
+   {
+    "group": "MOE.topk",
+    "measured_us": 422.216796875,
+    "exposed_us": 211.1083984375,
+    "t_ach_us": 0.3609191107790024,
+    "t_sol_us": 0.3609191107790024,
+    "derate": 1169.8377399957947,
+    "exposed_gap_us": 210.747479326721,
+    "calls": 23,
+    "kernels": {
+     "int,": 111.9
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 105.55419921875
+   },
+   {
+    "group": "DSA.o_proj",
+    "measured_us": 229.4423828125,
+    "exposed_us": 229.4423828125,
+    "t_ach_us": 111.19846834849314,
+    "t_sol_us": 101.468602368,
+    "derate": 2.0633592010767043,
+    "exposed_gap_us": 118.24391446400686,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_128x128_64x12_4x1_2cta_v_bz_TNT": 58.1
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 57.360595703125
+   },
+   {
+    "group": "DENSE",
+    "measured_us": 134.93017578125,
+    "exposed_us": 134.93017578125,
+    "t_ach_us": 106.45008437573499,
+    "t_sol_us": 67.36604701798483,
+    "derate": 1.2675440942347151,
+    "exposed_gap_us": 28.48009140551501,
+    "calls": 4,
+    "kernels": {
+     "nvjet_sm107_tst_192x192_64x8_2x1_2cta_v_bz_TNT": 82.6,
+     "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 6.7,
+     "nvjet_sm107_tst_192x160_64x9_2x1_2cta_h_bz_splitK_TNT": 48.4,
+     "__nv_bfloat16,": 5.0
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 134.93017578125
+   },
+   {
+    "group": "DSA.prologue",
+    "measured_us": 185.0888671875,
+    "exposed_us": 92.54443359375,
+    "t_ach_us": 5.8016598561151085,
+    "t_sol_us": 3.6655941818181814,
+    "derate": 31.902743659198023,
+    "exposed_gap_us": 86.74277373763489,
+    "calls": 6,
+    "kernels": {
+     "sd:dsaindexDsaIndex": 46.3
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 46.272216796875
+   },
+   {
+    "group": "COMM.SP_AG",
+    "measured_us": 699.6144104003906,
+    "exposed_us": 699.6144104003906,
+    "t_ach_us": 634.7929660377358,
+    "t_sol_us": 479.29967999999997,
+    "derate": 1.1021143078620714,
+    "exposed_gap_us": 64.8214443626548,
+    "calls": 24,
+    "kernels": {
+     "sd:commonsp_commSpAllGather": 129.4
+    },
+    "scale": 3.875,
+    "substituted": "",
+    "per_layer_us": 180.545654296875
+   },
+   {
+    "group": "DSA.w_uv",
+    "measured_us": 159.9423828125,
+    "exposed_us": 159.9423828125,
+    "t_ach_us": 104.27401544086756,
+    "t_sol_us": 66.27839431333322,
+    "derate": 1.5338661519484809,
+    "exposed_gap_us": 55.66836737163244,
+    "calls": 6,
+    "kernels": {
+     "nvjet_sm107_tst_160x192_64x9_1x2_2cta_h_bz_TNN": 40.5
+    },
+    "scale": 4.0,
+    "substituted": "",
+    "per_layer_us": 39.985595703125
+   },
+   {
+    "group": "OTHER",
+    "measured_us": 9.76025390625,
+    "exposed_us": 9.76025390625,
+    "t_ach_us": 0.0,
+    "t_sol_us": 0.0,
+    "derate": null,
+    "exposed_gap_us": 9.76025390625,
+    "calls": 5,
+    "kernels": {
+     "fa": 9.6
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 9.76025390625
+   },
+   {
+    "group": "EMBED",
+    "measured_us": 3.7119140625,
+    "exposed_us": 3.7119140625,
+    "t_ach_us": 0.19805007194244603,
+    "t_sol_us": 0.12513163636363636,
+    "derate": 18.742301005468423,
+    "exposed_gap_us": 3.513863990557554,
+    "calls": 1,
+    "kernels": {
+     "uint4>": 3.6
+    },
+    "scale": 1.0,
+    "substituted": "",
+    "per_layer_us": 3.7119140625
+   }
+  ],
+  "families": [
+   {
+    "family": "BF16 dense GEMMs (cuBLAS nvjet + CuTe split-K, +split-K reduce)",
+    "groups": [
+     "KDA.in_proj",
+     "KDA.o_proj",
+     "DSA.qkv_a",
+     "DSA.g_proj",
+     "DSA.o_proj",
+     "DSA.w_uv",
+     "MOE.router+latent_down",
+     "MOE.shared_gate_up",
+     "MOE.shared_down",
+     "MOE.latent_up",
+     "DENSE"
+    ],
+    "busy_us": 10595.792317708334,
+    "exposed_us": 8988.185384114584,
+    "t_ach_us": 4739.8429595718635,
+    "t_sol_us": 3533.833891385136,
+    "derate": 2.2354732863692646,
+    "exposed_gap_us": 4248.34242454272
+   },
+   {
+    "family": "MegaMoE (dispatch+fc1+act+fc2+combine, P11/P12)",
+    "groups": [
+     "MOE.megamoe",
+     "MOE.prepare"
+    ],
+    "busy_us": 7700.815046875,
+    "exposed_us": 7693.26573046875,
+    "t_ach_us": 5354.911709655907,
+    "t_sol_us": 3855.146611773086,
+    "derate": 1.438084410054603,
+    "exposed_gap_us": 2338.3540208128434
+   },
+   {
+    "family": "DSA DCP exact top-k (pp hist/window/win + DCP merge P8)",
+    "groups": [
+     "DSA.topk",
+     "DSA.topk_merge"
+    ],
+    "busy_us": 2324.958984375,
+    "exposed_us": 2321.88720703125,
+    "t_ach_us": 226.8473420171033,
+    "t_sol_us": 190.00724945454544,
+    "derate": 10.249002539336379,
+    "exposed_gap_us": 2095.039865014147
+   },
+   {
+    "family": "DSA q path + sparse MLA + DCP value (P6/P7b)",
+    "groups": [
+     "DSA.q_path",
+     "DSA.sparse_mla",
+     "DSA.dcp_value",
+     "DSA.prologue"
+    ],
+    "busy_us": 3747.8193359375,
+    "exposed_us": 2583.89990234375,
+    "t_ach_us": 996.4594320854972,
+    "t_sol_us": 674.888244395313,
+    "derate": 3.7611358930023493,
+    "exposed_gap_us": 1587.4404702582528
+   },
+   {
+    "family": "KDA core (KdaWide: conv+gate+recurrence+o_norm)",
+    "groups": [
+     "KDA.core"
+    ],
+    "busy_us": 3394.8443603515625,
+    "exposed_us": 3394.8443603515625,
+    "t_ach_us": 1811.8867382719802,
+    "t_sol_us": 1149.3461212793316,
+    "derate": 1.8736515305527703,
+    "exposed_gap_us": 1582.9576220795823
+   },
+   {
+    "family": "small elementwise (AttnRes mix, SiLU, latent RMSNorm, router top-k)",
+    "groups": [
+     "ATTNRES",
+     "MOE.shared_act",
+     "MOE.latent_norm",
+     "MOE.topk",
+     "EMBED",
+     "OTHER"
+    ],
+    "busy_us": 1545.4151387117347,
+    "exposed_us": 1298.982892717634,
+    "t_ach_us": 153.57915528789746,
+    "t_sol_us": 99.34375060509825,
+    "derate": 10.062662057326204,
+    "exposed_gap_us": 1145.4037374297366
+   },
+   {
+    "family": "SP comm (AllGather / ReduceScatter push)",
+    "groups": [
+     "COMM.SP_AG",
+     "COMM.SP_RS"
+    ],
+    "busy_us": 2104.055938720703,
+    "exposed_us": 2104.055938720703,
+    "t_ach_us": 1276.4116628930817,
+    "t_sol_us": 963.7531199999999,
+    "derate": 1.6484148491339419,
+    "exposed_gap_us": 827.6442758276214
+   },
+   {
+    "family": "drafter + final (DSpark k=3 propose)",
+    "groups": [
+     "TAIL.drafter+final"
+    ],
+    "busy_us": 891.0,
+    "exposed_us": 891.0,
+    "t_ach_us": 279.41639145200486,
+    "t_sol_us": 218.83094359997995,
+    "derate": 3.188789302481012,
+    "exposed_gap_us": 611.5836085479951
+   },
+   {
+    "family": "DSA indexer logits (paged_mqa_logits)",
+    "groups": [
+     "DSA.idx_score"
+    ],
+    "busy_us": 1025.8037109375,
+    "exposed_us": 890.2822265625,
+    "t_ach_us": 425.54449035971226,
+    "t_sol_us": 302.6340369886045,
+    "derate": 2.4105674827804475,
+    "exposed_gap_us": 464.73773620278774
+   },
+   {
+    "family": "spin wait (QueryWait)",
+    "groups": [
+     "WAIT"
+    ],
+    "busy_us": 0,
+    "exposed_us": 0,
+    "t_ach_us": 0,
+    "t_sol_us": 0,
+    "derate": null,
+    "exposed_gap_us": 0
+   }
+  ]
+ }
+}

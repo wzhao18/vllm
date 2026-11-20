@@ -1,0 +1,1662 @@
+{
+ "_meta": {
+  "device": "NVIDIA VR200 (Rubin, compute capability 10.7, 'sm_107'), Vera Rubin NVL72, 4 GPUs/node (2 Vera Rubin superchips)",
+  "measured_on": "Hecate batch-xdr, 2026-10-30, jobs 913068 (1 node), 913069/913098/913203 (4 nodes, --segment=4, 16 GPUs one NVL72 rack); container vllm-openai-cu134-nightly-3f1bcfd82b, torch 2.16.0.dev20261009+cu134, NCCL 2.32.3, triton 3.8, flashinfer 0.7.1",
+  "bench_scripts": "hecate:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hw/{hwbench.py,l2bench.py,ncclbench.py,symmbench.py,symm2.py}; logs c1-913068.log c4-913069.log c5-913098.log c6-913203.log (local copies: k31vr/solmodel/inputs/hw_src/raw/, flat dump: scratchpad/vr200_hw.jsonl)",
+  "spec_source": "NVIDIA Vera Rubin NVL72 product page spec table (https://www.nvidia.com/en-us/data-center/vera-rubin-nvl72/), 'Preliminary information. All values are up to and subject to change.'; rows marked dense where NVIDIA says so",
+  "convention": "every leaf {spec, measured, unit, source, note}; 'sol' = value the SOL model should use as the hardware bound; 'achievable' = best measured value (use for derating / microbench matching). TB = 1e12 B, GB = 1e9 B, GiB = 2^30 B, PF = 1e15 FLOP/s."
+ },
+ "topology": {
+  "gpus_per_node": {
+   "value": 4,
+   "source": "nvidia-smi topo (c1-913033.log: GPU0-3 NV36 to each other)",
+   "kind": "measured"
+  },
+  "nvlink_domain_gpus": {
+   "value": 72,
+   "source": "NVL72 product spec; Hecate segments nvlblk16 feature = 16-GPU (4-node) scheduling blocks, rack = 18 nodes",
+   "kind": "spec"
+  },
+  "nvlinks_per_gpu_pair_reported": {
+   "value": 36,
+   "source": "nvidia-smi topo 'NV36' (36 NVLink6 links per GPU through the switch)",
+   "kind": "measured"
+  },
+  "dies_per_gpu": {
+   "value": 2,
+   "source": "specialized_decode/cutedsl/common/dies.py docstring (CUDA 13.4 locality domains)",
+   "kind": "measured"
+  },
+  "sms_per_gpu": {
+   "value": 212,
+   "source": "cudaDevAttrMultiProcessorCount (c1)",
+   "kind": "measured"
+  },
+  "sms_per_die_driver": {
+   "value": 100,
+   "source": "dies.py: green contexts attribute 100 SMs to each die of a 212-SM part (12 SMs not in either green-context set)",
+   "kind": "measured"
+  },
+  "intra_vs_inter_node": "No difference measured: symm-mem ping-pong one-way 2.82-2.93 us to all 15 peers (same node or other nodes); NCCL p2p 1 MiB 24.0-24.6 GB/s to peers 1/4/8/12; remote read/write BW pair r0-r1 (same node) == r0-r4 (other node). Model the rack as a flat NVLink switch."
+ },
+ "clocks": {
+  "sm_clock_max_MHz": {
+   "value": 2424,
+   "source": "cudaDevAttrClockRate / nvidia-smi Max Clocks (c1, smi-q-913033.txt)",
+   "kind": "measured"
+  },
+  "sm_clock_observed_MHz": {
+   "value": 2280,
+   "source": "nvidia-smi -q Clocks.SM at idle sample (smi-q-913033.txt)",
+   "kind": "measured"
+  },
+  "mem_clock_MHz": {
+   "value": 4752,
+   "source": "cudaDevAttrMemoryClockRate",
+   "kind": "measured"
+  },
+  "power_limit_W": {
+   "value": 2300,
+   "source": "nvidia-smi GPU Ceiling Power Limit (default=max=2300 W)",
+   "kind": "measured"
+  }
+ },
+ "compute": {
+  "_note": "Dense tensor-core rates. 'measured' = best square GEMM (8192^3 or 16384^3) with BF16 output from hwbench.py (c1). Spec FP8 = NVIDIA 'FP8/FP6 Training' (dense); spec NVFP4 dense = 'NVFP4 Training' 35 PF (the 50 PF 'NVFP4 Inference' row is not marked dense; treat as non-dense/adaptive-compression figure, do NOT use in SOL). MXFP4 x MXFP4 and MXFP8 x MXFP4 run at the FP4 / FP8 tensor rate respectively (block-scaled MMA kinds mxf4nvf4 / mxf8f6f4).",
+  "bf16_dense_PF": {
+   "spec": 4.0,
+   "measured": 3.648,
+   "unit": "PFLOP/s",
+   "source": "spec: NVL72 table FP16/BF16 (dense) 4 PF/GPU; measured: torch bf16 GEMM 8192^3 3647.7 TF, 16384^3 3587.8 TF (c1)",
+   "sol": 4.0,
+   "achievable": 3.65,
+   "achievable_frac_of_spec": 0.91
+  },
+  "tf32_dense_PF": {
+   "spec": 2.0,
+   "measured": 1.949,
+   "unit": "PFLOP/s",
+   "source": "spec 2 PF dense; measured torch tf32 8192^3 1949 TF (c1)",
+   "sol": 2.0,
+   "achievable": 1.95
+  },
+  "fp8_dense_PF": {
+   "spec": 17.5,
+   "measured": 10.87,
+   "unit": "PFLOP/s",
+   "source": "spec: 'FP8/FP6 Training' 17.5 PF dense; measured: torch._scaled_mm FP8 e4m3 tensorwise 16384^3 10867.8 TF, 8192^3 10369 TF (rowwise-scaled cuBLAS path only 4.2-5.0 PF = a library path issue, not hardware)",
+   "sol": 17.5,
+   "achievable": 10.9,
+   "achievable_frac_of_spec": 0.62,
+   "note": "Large gap spec vs measured; likely power/clock-limited at 2300 W or immature cuBLAS sm_107 kernels. SOL uses spec; derate to 10.9."
+  },
+  "mxfp8_dense_PF": {
+   "spec": 17.5,
+   "measured": 10.9,
+   "unit": "PFLOP/s",
+   "source": "spec = FP8 row; measured torch._scaled_mm MXFP8 (e8m0 per-32) 16384^3 10899.6 TF, 8192^3 10125 TF (c1)",
+   "sol": 17.5,
+   "achievable": 10.9,
+   "note": "applies to MXFP8 act x MXFP4 weight routed experts too (mxf8f6f4 kind runs at the FP8 rate)"
+  },
+  "nvfp4_mxfp4_dense_PF": {
+   "spec": 35.0,
+   "spec_inference_not_dense": 50.0,
+   "measured": 21.12,
+   "unit": "PFLOP/s",
+   "source": "spec: 'NVFP4 Training' 35 PF dense ('NVFP4 Inference' 50 PF, not marked dense); measured: flashinfer mm_fp4 auto 16384^3 21120 TF, torch NVFP4 8192^3 17549 TF, cudnn 13.2-13.5 PF, cutlass 7.4-11.1 PF, trtllm 5.6-6.5 PF (c1); torch MXFP4 _scaled_mm unsupported (error)",
+   "sol": 35.0,
+   "achievable": 21.1,
+   "achievable_frac_of_spec": 0.6,
+   "note": "MXFP4 (e8m0 / 32) assumed equal to NVFP4 rate (same mxf4nvf4 MMA kind); not separately measured."
+  },
+  "fp32_cuda_core_TF": {
+   "spec": 130.0,
+   "derived": 131.6,
+   "unit": "TFLOP/s",
+   "source": "spec: NVL72 table FP32 130 TF/GPU; derived 212 SM x 128 FP32 lanes x 2 FLOP (FMA) x 2.424 GHz = 131.6 TF. Not measured.",
+   "sol": 130.0,
+   "achievable": null,
+   "note": "Use for KDA FP32 recurrence / conv (non-tensor-core). FP32 SGEMM via tensor-core emulation exists on the spec sheet but KDA state math is FFMA."
+  },
+  "fp64_TF": {
+   "spec": 33.0,
+   "unit": "TFLOP/s",
+   "source": "spec table",
+   "sol": 33.0
+  },
+  "per_sm_per_clk_derived": {
+   "note": "derived from spec / (212 SM x clock): BF16 4.0 PF -> 8192 FLOP/clk/SM at 2.30 GHz; FP8 17.5 PF -> 32768 FLOP/clk/SM at 2.52 GHz; NVFP4 35 PF -> 65536 FLOP/clk/SM at 2.52 GHz. The spec clock implied (~2.3-2.5 GHz) brackets the measured max 2.424 GHz; treat these as consistency checks only."
+  }
+ },
+ "memory": {
+  "hbm_capacity_spec_GB": {
+   "spec": 288,
+   "unit": "GB",
+   "source": "NVL72 spec table: 288 GB HBM4 per Rubin GPU",
+   "kind": "spec"
+  },
+  "hbm_total_GiB": {
+   "measured": 279.81,
+   "unit": "GiB",
+   "source": "nvidia-smi -q FB Total 286524 MiB (Reserved 1297 MiB, Free 285228 MiB) on all 4 GPUs (smi-q-913033.txt)"
+  },
+  "hbm_torch_total_GiB": {
+   "measured": 278.54,
+   "unit": "GiB",
+   "source": "vLLM startup 'Free memory on device (272.48-272.51/278.54 GiB) on startup' in every engine log of results/k31vr-frozen-sweep-20261114/runs"
+  },
+  "hbm_free_at_vllm_startup_GiB": {
+   "measured": 272.48,
+   "unit": "GiB",
+   "source": "same log line; ~6.06 GiB taken by CUDA context / NCCL / other processes before the engine profiles",
+   "note": "Use 272.48 GiB as the per-GPU budget for weights + activations + KV in the capacity model (then apply gpu_memory_utilization)."
+  },
+  "hbm_bw_TBps": {
+   "spec": 22.0,
+   "unit": "TB/s",
+   "source": "spec: NVL72 table 22 TB/s HBM4 per GPU (rack 1,580 TB/s / 72 = 21.9); derived from attributes 16128-bit bus x 4.752 GHz x 2 / 8 = 19.2 TB/s (attribute-based, unverified meaning)",
+   "measured_full_chip_read": 13.93,
+   "measured_full_chip_read_source": "hwbench triton read 8 GiB, 4 CTA/SM blk 4096: 13.927 TB/s; 8 CTA/SM 13.86 (c1); l2bench 8 GiB 13.75 (c5); megamoe_rubin/die_local.py '~13.9 TB/s'; dies.py '~12.6-13.6 TB/s'",
+   "measured_copy_read_plus_write": 13.88,
+   "measured_copy_source": "torch copy_ 8 GiB, (read+write)/t (c1); kda/verify_loop.py '~12.5-13 TB/s copy rate'",
+   "measured_write_only": 8.4,
+   "measured_write_source": "torch fill_ 8 GiB (c1) - fill kernel, likely not a write-BW ceiling",
+   "measured_die_local_read": 17.1,
+   "measured_die_local_source": "megamoe_rubin/die_local.py: '~17.1 TB/s when every SM reads its own die (ledger row 10, measured on VR200)'; dies.py says ~16.5 TB/s",
+   "sol": 22.0,
+   "achievable_default_alloc": 13.9,
+   "achievable_die_local": 17.1,
+   "note": "Default allocations interleave the two dies every 4 KiB, so a die-oblivious stream pulls ~half its bytes over the die-to-die link -> 13.9 TB/s. Die-local placement (cuMemCreate locality domain) -> 16.5-17.1 TB/s (78% of spec). SOL model: use 22 TB/s as spec bound, 17.1 (die-local) as the achievable ceiling for kernels that can place data per die (weights, experts, KV pages), 13.9 otherwise."
+  },
+  "die_to_die": {
+   "cold_miss_local_ns": 290,
+   "cold_miss_remote_die_ns": 455,
+   "source": "specialized_decode/cutedsl/common/dies.py docstring (latency probe)",
+   "note": "die-to-die bandwidth not separately measured; implied by 13.9 vs 17.1 TB/s"
+  },
+  "l2_size_MiB": {
+   "measured": 126.0,
+   "bytes": 132120576,
+   "per_die_MiB": 63.0,
+   "source": "cudaDevAttrL2CacheSize = 132120576 (c1); per die from dies.py ('each die has its own L2') assuming an even split",
+   "persisting_max_MiB": 78.75,
+   "persisting_source": "cudaDevAttrMaxPersistingL2CacheSize = 82575360"
+  },
+  "l2_read_bw_TBps": {
+   "measured": 35.0,
+   "unit": "TB/s",
+   "source": "l2bench.py repeated-read (int32, blk 1024, 8 CTA/SM): 16-64 MiB footprint 30.3-35.4 TB/s; 96 MiB 26.3; 128 MiB 18.4; >=192 MiB HBM-bound (c5)",
+   "note": "Effective L2-resident footprint for full-rate reuse ~64 MiB (one die's L2 worth, default die interleave), not 126 MiB."
+  },
+  "l2_round_trip_ns": {
+   "measured": 169,
+   "source": "common/primitives.py docstring: one warp, L2-resident dependent round trip relaxed.gpu 169.0 ns, relaxed.sys 168.2 ns; 16 in flight 380 ns"
+  },
+  "smem_per_sm_KiB": {
+   "measured": 228,
+   "bytes": 233472,
+   "per_block_optin_bytes": 232448,
+   "source": "cudaDevAttrMaxSharedMemoryPerMultiprocessor / PerBlockOptin (c1)"
+  },
+  "regs_per_sm": {
+   "measured": 65536,
+   "source": "c1 cuda_attrs"
+  },
+  "lpddr5x_per_superchip_TB": {
+   "spec": 1.5,
+   "source": "NVL72 spec table: 1.5 TB LPDDR5X per Vera CPU (2 GPUs); NVLink-C2C 1.8 TB/s per superchip",
+   "note": "relevant only for KV offload/Mooncake host tier"
+  },
+  "skinny_gemm_weight_stream": {
+   "source": "hwbench.py skinny GEMMs K=7168 N=16384 (c1)",
+   "bf16_M16_M64_M128_us": [
+    24.11,
+    24.06,
+    24.02
+   ],
+   "bf16_weight_TBps": 9.76,
+   "fp8_rowwise_M16_M64_M128_us": [
+    16.1,
+    16.16,
+    16.33
+   ],
+   "fp8_weight_TBps": 7.27,
+   "note": "cuBLAS decode-shape GEMMs stream weights at only 9.8 TB/s (70% of 13.9). In-tree CuTe kernels do better; the SOL model should use HBM SOL, not these."
+  },
+  "pointer_chase_unreliable": {
+   "data": [
+    {
+     "chase_footprint_MiB": 4,
+     "stride_B": 4096,
+     "ns_per_load": 832.7
+    },
+    {
+     "chase_footprint_MiB": 64,
+     "stride_B": 4096,
+     "ns_per_load": 331.9
+    },
+    {
+     "chase_footprint_MiB": 2048,
+     "stride_B": 1048576,
+     "ns_per_load": 88.4
+    }
+   ],
+   "note": "c5 l2bench pointer chase: 4 MiB/4 KiB stride 833 ns, 64 MiB 332 ns, 2 GiB/1 MiB stride 88 ns - inconsistent (TLB effects / short chain); do not use. Use dies.py 290/455 ns cold-miss and primitives.py 169 ns L2 numbers."
+  }
+ },
+ "nvlink": {
+  "per_gpu_bw_spec_TBps_bidir": {
+   "spec": 3.6,
+   "unit": "TB/s",
+   "source": "NVL72 spec table: NVLink 6 3.6 TB/s per GPU (rack 260 TB/s switch bandwidth); bidirectional"
+  },
+  "per_gpu_bw_spec_TBps_per_direction": {
+   "spec": 1.8,
+   "unit": "TB/s",
+   "source": "3.6 / 2 (36 links x 50 GB/s per direction)",
+   "sol": 1.8
+  },
+  "symm_mem_remote_write_TBps": {
+   "measured": 1.094,
+   "unit": "TB/s",
+   "source": "symm2.py (c6): one GPU (rank 0) SM-driven 16-B stores to one peer's symmetric buffer, 256 MiB: pair r0-r1 1.094, r0-r4 (other node) 1.092 TB/s at 8 CTA/SM; ring_all (every GPU writes its neighbour) 1.07 TB/s",
+   "achievable": 1.09,
+   "frac_of_spec_dir": 0.61
+  },
+  "symm_mem_remote_read_TBps": {
+   "measured": 1.072,
+   "unit": "TB/s",
+   "source": "symm2.py (c6): pair 1.06-1.07 TB/s at >=4 CTA/SM (1 CTA/SM: 0.28); ring_all 0.97 TB/s",
+   "note": "reads need >=4 CTA/SM of in-flight loads to saturate"
+  },
+  "nvlink_ingress_achievable_TBps": {
+   "measured": 1.25,
+   "unit": "TB/s",
+   "source": "nvidia/ops/sp_all_gather.py docstring ('the 1.25 TB/s NVLink ingress'); provenance of 1.25 not in the bench logs here",
+   "note": "Use 1.25 TB/s as achievable per-GPU NVLink ingress (many-to-one pushes); 1.09 measured for a single pair. SP all-gather push kernel reaches 0.98 TB/s (17.4K tokens TP4, 191 us) vs NCCL ring 0.40 TB/s."
+  },
+  "nccl_large_msg_busbw_GBps": {
+   "source": "ncclbench.py (c4), NVLS enabled, MNNVL, eager, 256 MiB",
+   "n4": {
+    "all_gather": 406.3,
+    "all_to_all": 310.4,
+    "all_reduce": 489.0
+   },
+   "n8": {
+    "all_gather": 449.6,
+    "all_to_all": 361.1,
+    "all_reduce": 512.4
+   },
+   "n16": {
+    "all_gather": 445.1,
+    "all_to_all": 386.3,
+    "all_reduce": 864.4
+   },
+   "note": "NCCL busbw (nccl-tests convention: AG/A2A x(n-1)/n, AR x2(n-1)/n) tops out at 0.31-0.45 TB/s for AG/A2A - only ~25-35% of the 1.25 TB/s achievable ingress; NCCL is far from SOL for bulk collectives. AR n16 864 GB/s uses NVLS (switch reduction). SOL model should model comm at the symmetric-memory push rate (1.09-1.25 TB/s per GPU) and keep NCCL numbers only as the 'stock' reference."
+  },
+  "p2p_nccl_send_recv": {
+   "data": [
+    {
+     "p2p_peer": 1,
+     "bytes": 4096,
+     "roundtrip_us": 43.0,
+     "oneway_GBps": 0.2
+    },
+    {
+     "p2p_peer": 1,
+     "bytes": 65536,
+     "roundtrip_us": 46.57,
+     "oneway_GBps": 2.8
+    },
+    {
+     "p2p_peer": 1,
+     "bytes": 1048576,
+     "roundtrip_us": 87.2,
+     "oneway_GBps": 24.0
+    },
+    {
+     "p2p_peer": 1,
+     "bytes": 67108864,
+     "roundtrip_us": 754.99,
+     "oneway_GBps": 177.8
+    },
+    {
+     "p2p_peer": 4,
+     "bytes": 4096,
+     "roundtrip_us": 44.09,
+     "oneway_GBps": 0.2
+    },
+    {
+     "p2p_peer": 4,
+     "bytes": 65536,
+     "roundtrip_us": 45.98,
+     "oneway_GBps": 2.9
+    },
+    {
+     "p2p_peer": 4,
+     "bytes": 1048576,
+     "roundtrip_us": 86.12,
+     "oneway_GBps": 24.4
+    },
+    {
+     "p2p_peer": 4,
+     "bytes": 67108864,
+     "roundtrip_us": 753.97,
+     "oneway_GBps": 178.0
+    },
+    {
+     "p2p_peer": 8,
+     "bytes": 4096,
+     "roundtrip_us": 43.09,
+     "oneway_GBps": 0.2
+    },
+    {
+     "p2p_peer": 8,
+     "bytes": 65536,
+     "roundtrip_us": 45.05,
+     "oneway_GBps": 2.9
+    },
+    {
+     "p2p_peer": 8,
+     "bytes": 1048576,
+     "roundtrip_us": 85.39,
+     "oneway_GBps": 24.6
+    },
+    {
+     "p2p_peer": 8,
+     "bytes": 67108864,
+     "roundtrip_us": 754.74,
+     "oneway_GBps": 177.8
+    },
+    {
+     "p2p_peer": 12,
+     "bytes": 4096,
+     "roundtrip_us": 41.38,
+     "oneway_GBps": 0.2
+    },
+    {
+     "p2p_peer": 12,
+     "bytes": 65536,
+     "roundtrip_us": 44.71,
+     "oneway_GBps": 2.9
+    },
+    {
+     "p2p_peer": 12,
+     "bytes": 1048576,
+     "roundtrip_us": 85.51,
+     "oneway_GBps": 24.5
+    },
+    {
+     "p2p_peer": 12,
+     "bytes": 67108864,
+     "roundtrip_us": 756.11,
+     "oneway_GBps": 177.5
+    }
+   ],
+   "source": "ncclbench.py p2p ping-pong (c4)",
+   "note": "64 MiB one-way 178 GB/s (NCCL send/recv, few channels); 4 KiB round trip 41-44 us."
+  }
+ },
+ "latency": {
+  "kernel_launch_eager_us": {
+   "measured": 2.27,
+   "source": "hwbench.py: eager tiny kernel (z.add_) back-to-back, 2000 iters (c1)"
+  },
+  "cuda_graph_node_us": {
+   "measured": 0.78,
+   "source": "hwbench.py: 1000 tiny kernels in one CUDA graph, per node (c1)",
+   "note": "Per-kernel floor inside a graph without PDL. Use as the per-kernel fixed overhead in the SOL model's launch term."
+  },
+  "pdl_dependent_release_us": {
+   "measured": [
+    0.73,
+    0.75
+   ],
+   "with_unfenced_nvlink_stores": [
+    0.9,
+    0.96
+   ],
+   "source": "specialized_decode/cutedsl/oproj/prepared.py docstring (1-GPU microbench: dependent released 0.73-0.75 us after last CTA exit; 0.90-0.96 with multimem stores in flight)"
+  },
+  "symm_mem_flag_oneway_us": {
+   "measured": 2.86,
+   "range": [
+    2.817,
+    2.899
+   ],
+   "source": "symm2.py ping-pong (c6), sys-scope release xchg / acquire poll, 1 warp, rank0 <-> peers 1..15 (intra- and inter-node), steady reps 1-2; rep0 134-247 us is first-touch / mapping warmup, ignore",
+   "note": "Per-hop signal latency for push_in/push_out style handoffs over NVLink (one-way, flag only, no payload). Same for all peers in the 16-GPU block."
+  },
+  "symm_mem_allreduce_us": {
+   "data": {
+    "4": [
+     {
+      "bytes": 16384,
+      "one_shot_us": 15.71,
+      "two_shot_us": 15.28,
+      "multimem_us": 14.71,
+      "one_shot_graph_us": 14.0
+     },
+     {
+      "bytes": 65536,
+      "one_shot_us": 19.87,
+      "two_shot_us": 16.82,
+      "multimem_us": 15.03,
+      "one_shot_graph_us": 18.78
+     },
+     {
+      "bytes": 262144,
+      "one_shot_us": 24.77,
+      "two_shot_us": 20.63,
+      "multimem_us": 18.67,
+      "one_shot_graph_us": 23.27
+     },
+     {
+      "bytes": 524288,
+      "one_shot_us": 28.8,
+      "two_shot_us": 20.94,
+      "multimem_us": 19.23,
+      "one_shot_graph_us": 27.87
+     },
+     {
+      "bytes": 1048576,
+      "one_shot_us": 38.64,
+      "two_shot_us": 21.32,
+      "multimem_us": 22.52,
+      "one_shot_graph_us": 37.2
+     },
+     {
+      "bytes": 4194304,
+      "one_shot_us": 91.62,
+      "two_shot_us": 31.84,
+      "multimem_us": 42.23,
+      "one_shot_graph_us": 90.61
+     }
+    ],
+    "8": [
+     {
+      "bytes": 16384,
+      "one_shot_us": 21.74,
+      "two_shot_us": 21.2,
+      "multimem_us": 15.59,
+      "one_shot_graph_us": 19.24
+     },
+     {
+      "bytes": 65536,
+      "one_shot_us": 26.26,
+      "two_shot_us": 21.54,
+      "multimem_us": 14.8,
+      "one_shot_graph_us": 24.89
+     },
+     {
+      "bytes": 262144,
+      "one_shot_us": 36.65,
+      "two_shot_us": 24.03,
+      "multimem_us": 15.88,
+      "one_shot_graph_us": 35.18
+     },
+     {
+      "bytes": 524288,
+      "one_shot_us": 46.38,
+      "two_shot_us": 27.89,
+      "multimem_us": 19.26,
+      "one_shot_graph_us": 45.54
+     },
+     {
+      "bytes": 1048576,
+      "one_shot_us": 72.95,
+      "two_shot_us": 28.35,
+      "multimem_us": 19.88,
+      "one_shot_graph_us": 72.08
+     },
+     {
+      "bytes": 4194304,
+      "one_shot_us": 217.83,
+      "two_shot_us": 40.27,
+      "multimem_us": 30.13,
+      "one_shot_graph_us": 240.43
+     }
+    ],
+    "16": [
+     {
+      "bytes": 16384,
+      "one_shot_us": 50.82,
+      "two_shot_us": 30.84,
+      "multimem_us": 15.12,
+      "one_shot_graph_us": 49.33
+     },
+     {
+      "bytes": 65536,
+      "one_shot_us": 57.41,
+      "two_shot_us": 30.57,
+      "multimem_us": 15.13,
+      "one_shot_graph_us": 56.74
+     },
+     {
+      "bytes": 262144,
+      "one_shot_us": 98.42,
+      "two_shot_us": 32.17,
+      "multimem_us": 15.43,
+      "one_shot_graph_us": 96.96
+     },
+     {
+      "bytes": 524288,
+      "one_shot_us": 138.94,
+      "two_shot_us": 33.17,
+      "multimem_us": 16.32,
+      "one_shot_graph_us": 138.78
+     },
+     {
+      "bytes": 1048576,
+      "one_shot_us": 261.89,
+      "two_shot_us": 37.27,
+      "multimem_us": 19.79,
+      "one_shot_graph_us": 259.79
+     },
+     {
+      "bytes": 4194304,
+      "one_shot_us": 907.05,
+      "two_shot_us": 40.22,
+      "multimem_us": 23.83,
+      "one_shot_graph_us": 904.61
+     }
+    ]
+   },
+   "source": "symmbench.py (c5) torch.ops.symm_mem one_shot / two_shot / multimem all-reduce, eager (includes ~2.3 us launch), bf16",
+   "note": "multimem (NVLS) AR n16 16 KiB-512 KiB: 15.1-16.3 us flat; n4: 14.7-19.2 us. Lower bound for an in-graph fused AR: drafter Lamport AR+RMSNorm ~13 us per site at B1 TP16 stock (specialized_decode/cutedsl/draft/allreduce.py)."
+  },
+  "nccl_small_msg_us": {
+   "source": "ncclbench.py (c4, NVLS on, default proto) eager + CUDA-graph; symmbench MODE=nccl variants nvls0/LL/dbg (c5) eager",
+   "summary": {
+    "n4": {
+     "all_gather": "21.5-24.4 us (16 KiB-1 MiB)",
+     "all_to_all": "22.3-30.8 us",
+     "all_reduce": "21.5-26.7 us"
+    },
+    "n8": {
+     "all_gather": "21.7-31.0 us",
+     "all_to_all": "22.8-42.5 us",
+     "all_reduce": "33.3-38.1 us"
+    },
+    "n16": {
+     "all_gather": "36.8-41.5 us",
+     "all_to_all": "23.8-88.7 us (64-89 us at >=512 KiB)",
+     "all_reduce": "47.6-66.7 us"
+    },
+    "graph_overhead": "CUDA-graph-captured NCCL is slower than eager here: n4 AG 36.5 vs 23 us, AR 41.5-45 vs 22-24 us; n16 AG 55-58 vs 37-40, AR 66-82 vs 48-64"
+   },
+   "note": "NCCL small-message latency (~22 us n4, ~40-65 us n16) is 8-20x the 2.9 us NVLink flag latency; the SOL model should use symmetric-memory push latency (alpha ~3 us per dependent hop + bytes / 1.09-1.25 TB/s) for new methods, NCCL only for stock paths."
+  }
+ },
+ "tables": {
+  "nccl_c4_nvls": {
+   "4": [
+    {
+     "bytes": 16384,
+     "all_gather_us": 23.57,
+     "all_gather_busbw_GBps": 0.5,
+     "all_gather_graph_us": 36.97,
+     "all_gather_graph_busbw_GBps": 0.3,
+     "all_to_all_us": 25.04,
+     "all_to_all_busbw_GBps": 0.5,
+     "all_to_all_graph_us": 33.74,
+     "all_to_all_graph_busbw_GBps": 0.4,
+     "all_reduce_us": 26.72,
+     "all_reduce_busbw_GBps": 0.9,
+     "all_reduce_graph_us": 42.17,
+     "all_reduce_graph_busbw_GBps": 0.6
+    },
+    {
+     "bytes": 32768,
+     "all_gather_us": 24.05,
+     "all_gather_busbw_GBps": 1.0,
+     "all_gather_graph_us": 36.45,
+     "all_gather_graph_busbw_GBps": 0.7,
+     "all_to_all_us": 24.04,
+     "all_to_all_busbw_GBps": 1.0,
+     "all_to_all_graph_us": 35.05,
+     "all_to_all_graph_busbw_GBps": 0.7,
+     "all_reduce_us": 24.1,
+     "all_reduce_busbw_GBps": 2.0,
+     "all_reduce_graph_us": 42.29,
+     "all_reduce_graph_busbw_GBps": 1.2
+    },
+    {
+     "bytes": 65536,
+     "all_gather_us": 22.97,
+     "all_gather_busbw_GBps": 2.1,
+     "all_gather_graph_us": 37.09,
+     "all_gather_graph_busbw_GBps": 1.3,
+     "all_to_all_us": 23.2,
+     "all_to_all_busbw_GBps": 2.1,
+     "all_to_all_graph_us": 35.24,
+     "all_to_all_graph_busbw_GBps": 1.4,
+     "all_reduce_us": 23.66,
+     "all_reduce_busbw_GBps": 4.2,
+     "all_reduce_graph_us": 41.91,
+     "all_reduce_graph_busbw_GBps": 2.3
+    },
+    {
+     "bytes": 131072,
+     "all_gather_us": 23.13,
+     "all_gather_busbw_GBps": 4.2,
+     "all_gather_graph_us": 36.55,
+     "all_gather_graph_busbw_GBps": 2.7,
+     "all_to_all_us": 29.1,
+     "all_to_all_busbw_GBps": 3.4,
+     "all_to_all_graph_us": 38.89,
+     "all_to_all_graph_busbw_GBps": 2.5,
+     "all_reduce_us": 24.49,
+     "all_reduce_busbw_GBps": 8.0,
+     "all_reduce_graph_us": 41.55,
+     "all_reduce_graph_busbw_GBps": 4.7
+    },
+    {
+     "bytes": 262144,
+     "all_gather_us": 23.02,
+     "all_gather_busbw_GBps": 8.5,
+     "all_gather_graph_us": 36.57,
+     "all_gather_graph_busbw_GBps": 5.4,
+     "all_to_all_us": 29.51,
+     "all_to_all_busbw_GBps": 6.7,
+     "all_to_all_graph_us": 40.13,
+     "all_to_all_graph_busbw_GBps": 4.9,
+     "all_reduce_us": 23.81,
+     "all_reduce_busbw_GBps": 16.5,
+     "all_reduce_graph_us": 41.99,
+     "all_reduce_graph_busbw_GBps": 9.4
+    },
+    {
+     "bytes": 524288,
+     "all_gather_us": 22.94,
+     "all_gather_busbw_GBps": 17.1,
+     "all_gather_graph_us": 38.16,
+     "all_gather_graph_busbw_GBps": 10.3,
+     "all_to_all_us": 29.63,
+     "all_to_all_busbw_GBps": 13.3,
+     "all_to_all_graph_us": 42.55,
+     "all_to_all_graph_busbw_GBps": 9.2,
+     "all_reduce_us": 23.83,
+     "all_reduce_busbw_GBps": 33.0,
+     "all_reduce_graph_us": 43.21,
+     "all_reduce_graph_busbw_GBps": 18.2
+    },
+    {
+     "bytes": 1048576,
+     "all_gather_us": 23.54,
+     "all_gather_busbw_GBps": 33.4,
+     "all_gather_graph_us": 40.75,
+     "all_gather_graph_busbw_GBps": 19.3,
+     "all_to_all_us": 30.15,
+     "all_to_all_busbw_GBps": 26.1,
+     "all_to_all_graph_us": 42.28,
+     "all_to_all_graph_busbw_GBps": 18.6,
+     "all_reduce_us": 22.85,
+     "all_reduce_busbw_GBps": 68.8,
+     "all_reduce_graph_us": 45.3,
+     "all_reduce_graph_busbw_GBps": 34.7
+    },
+    {
+     "bytes": 4194304,
+     "all_gather_us": 40.33,
+     "all_gather_busbw_GBps": 78.0,
+     "all_gather_graph_us": 59.62,
+     "all_gather_graph_busbw_GBps": 52.8,
+     "all_to_all_us": 30.34,
+     "all_to_all_busbw_GBps": 103.7,
+     "all_to_all_graph_us": 48.77,
+     "all_to_all_graph_busbw_GBps": 64.5,
+     "all_reduce_us": 55.99,
+     "all_reduce_busbw_GBps": 112.4,
+     "all_reduce_graph_us": 74.36,
+     "all_reduce_graph_busbw_GBps": 84.6
+    },
+    {
+     "bytes": 16777216,
+     "all_gather_us": 75.38,
+     "all_gather_busbw_GBps": 166.9,
+     "all_to_all_us": 55.12,
+     "all_to_all_busbw_GBps": 228.3,
+     "all_reduce_us": 82.82,
+     "all_reduce_busbw_GBps": 303.9
+    },
+    {
+     "bytes": 67108864,
+     "all_gather_us": 140.02,
+     "all_gather_busbw_GBps": 359.5,
+     "all_to_all_us": 179.31,
+     "all_to_all_busbw_GBps": 280.7,
+     "all_reduce_us": 216.99,
+     "all_reduce_busbw_GBps": 463.9
+    },
+    {
+     "bytes": 268435456,
+     "all_gather_us": 495.49,
+     "all_gather_busbw_GBps": 406.3,
+     "all_to_all_us": 648.53,
+     "all_to_all_busbw_GBps": 310.4,
+     "all_reduce_us": 823.39,
+     "all_reduce_busbw_GBps": 489.0
+    }
+   ],
+   "8": [
+    {
+     "bytes": 16384,
+     "all_gather_us": 30.96,
+     "all_gather_busbw_GBps": 0.5,
+     "all_gather_graph_us": 42.46,
+     "all_gather_graph_busbw_GBps": 0.3,
+     "all_to_all_us": 25.95,
+     "all_to_all_busbw_GBps": 0.6,
+     "all_to_all_graph_us": 34.19,
+     "all_to_all_graph_busbw_GBps": 0.4,
+     "all_reduce_us": 33.33,
+     "all_reduce_busbw_GBps": 0.9,
+     "all_reduce_graph_us": 53.19,
+     "all_reduce_graph_busbw_GBps": 0.5
+    },
+    {
+     "bytes": 32768,
+     "all_gather_us": 23.22,
+     "all_gather_busbw_GBps": 1.2,
+     "all_gather_graph_us": 42.43,
+     "all_gather_graph_busbw_GBps": 0.7,
+     "all_to_all_us": 23.74,
+     "all_to_all_busbw_GBps": 1.2,
+     "all_to_all_graph_us": 35.16,
+     "all_to_all_graph_busbw_GBps": 0.8,
+     "all_reduce_us": 34.36,
+     "all_reduce_busbw_GBps": 1.7,
+     "all_reduce_graph_us": 54.69,
+     "all_reduce_graph_busbw_GBps": 1.0
+    },
+    {
+     "bytes": 65536,
+     "all_gather_us": 21.83,
+     "all_gather_busbw_GBps": 2.6,
+     "all_gather_graph_us": 43.56,
+     "all_gather_graph_busbw_GBps": 1.3,
+     "all_to_all_us": 24.8,
+     "all_to_all_busbw_GBps": 2.3,
+     "all_to_all_graph_us": 36.82,
+     "all_to_all_graph_busbw_GBps": 1.6,
+     "all_reduce_us": 36.41,
+     "all_reduce_busbw_GBps": 3.1,
+     "all_reduce_graph_us": 55.64,
+     "all_reduce_graph_busbw_GBps": 2.1
+    },
+    {
+     "bytes": 131072,
+     "all_gather_us": 22.64,
+     "all_gather_busbw_GBps": 5.1,
+     "all_gather_graph_us": 43.58,
+     "all_gather_graph_busbw_GBps": 2.6,
+     "all_to_all_us": 22.86,
+     "all_to_all_busbw_GBps": 5.0,
+     "all_to_all_graph_us": 37.64,
+     "all_to_all_graph_busbw_GBps": 3.0,
+     "all_reduce_us": 35.66,
+     "all_reduce_busbw_GBps": 6.4,
+     "all_reduce_graph_us": 54.98,
+     "all_reduce_graph_busbw_GBps": 4.2
+    },
+    {
+     "bytes": 262144,
+     "all_gather_us": 22.4,
+     "all_gather_busbw_GBps": 10.2,
+     "all_gather_graph_us": 43.75,
+     "all_gather_graph_busbw_GBps": 5.2,
+     "all_to_all_us": 38.26,
+     "all_to_all_busbw_GBps": 6.0,
+     "all_to_all_graph_us": 44.28,
+     "all_to_all_graph_busbw_GBps": 5.2,
+     "all_reduce_us": 36.86,
+     "all_reduce_busbw_GBps": 12.4,
+     "all_reduce_graph_us": 55.67,
+     "all_reduce_graph_busbw_GBps": 8.2
+    },
+    {
+     "bytes": 524288,
+     "all_gather_us": 22.94,
+     "all_gather_busbw_GBps": 20.0,
+     "all_gather_graph_us": 44.11,
+     "all_gather_graph_busbw_GBps": 10.4,
+     "all_to_all_us": 38.31,
+     "all_to_all_busbw_GBps": 12.0,
+     "all_to_all_graph_us": 42.67,
+     "all_to_all_graph_busbw_GBps": 10.8,
+     "all_reduce_us": 36.89,
+     "all_reduce_busbw_GBps": 24.9,
+     "all_reduce_graph_us": 55.87,
+     "all_reduce_graph_busbw_GBps": 16.4
+    },
+    {
+     "bytes": 1048576,
+     "all_gather_us": 23.18,
+     "all_gather_busbw_GBps": 39.6,
+     "all_gather_graph_us": 45.43,
+     "all_gather_graph_busbw_GBps": 20.2,
+     "all_to_all_us": 38.63,
+     "all_to_all_busbw_GBps": 23.8,
+     "all_to_all_graph_us": 43.4,
+     "all_to_all_graph_busbw_GBps": 21.1,
+     "all_reduce_us": 38.11,
+     "all_reduce_busbw_GBps": 48.2,
+     "all_reduce_graph_us": 56.86,
+     "all_reduce_graph_busbw_GBps": 32.3
+    },
+    {
+     "bytes": 4194304,
+     "all_gather_us": 43.18,
+     "all_gather_busbw_GBps": 85.0,
+     "all_gather_graph_us": 61.59,
+     "all_gather_graph_busbw_GBps": 59.6,
+     "all_to_all_us": 41.93,
+     "all_to_all_busbw_GBps": 87.5,
+     "all_to_all_graph_us": 49.55,
+     "all_to_all_graph_busbw_GBps": 74.1,
+     "all_reduce_us": 50.8,
+     "all_reduce_busbw_GBps": 144.5,
+     "all_reduce_graph_us": 66.93,
+     "all_reduce_graph_busbw_GBps": 109.7
+    },
+    {
+     "bytes": 16777216,
+     "all_gather_us": 142.4,
+     "all_gather_busbw_GBps": 103.1,
+     "all_to_all_us": 56.82,
+     "all_to_all_busbw_GBps": 258.4,
+     "all_reduce_us": 87.94,
+     "all_reduce_busbw_GBps": 333.9
+    },
+    {
+     "bytes": 67108864,
+     "all_gather_us": 174.38,
+     "all_gather_busbw_GBps": 336.7,
+     "all_to_all_us": 181.13,
+     "all_to_all_busbw_GBps": 324.2,
+     "all_reduce_us": 202.92,
+     "all_reduce_busbw_GBps": 578.7
+    },
+    {
+     "bytes": 268435456,
+     "all_gather_us": 522.37,
+     "all_gather_busbw_GBps": 449.6,
+     "all_to_all_us": 650.53,
+     "all_to_all_busbw_GBps": 361.1,
+     "all_reduce_us": 916.73,
+     "all_reduce_busbw_GBps": 512.4
+    }
+   ],
+   "16": [
+    {
+     "bytes": 16384,
+     "all_gather_us": 37.8,
+     "all_gather_busbw_GBps": 0.4,
+     "all_gather_graph_us": 55.48,
+     "all_gather_graph_busbw_GBps": 0.3,
+     "all_to_all_us": 37.85,
+     "all_to_all_busbw_GBps": 0.4,
+     "all_to_all_graph_us": 37.82,
+     "all_to_all_graph_busbw_GBps": 0.4,
+     "all_reduce_us": 63.09,
+     "all_reduce_busbw_GBps": 0.5,
+     "all_reduce_graph_us": 80.9,
+     "all_reduce_graph_busbw_GBps": 0.4
+    },
+    {
+     "bytes": 32768,
+     "all_gather_us": 38.55,
+     "all_gather_busbw_GBps": 0.8,
+     "all_gather_graph_us": 55.32,
+     "all_gather_graph_busbw_GBps": 0.6,
+     "all_to_all_us": 29.19,
+     "all_to_all_busbw_GBps": 1.1,
+     "all_to_all_graph_us": 37.48,
+     "all_to_all_graph_busbw_GBps": 0.8,
+     "all_reduce_us": 64.44,
+     "all_reduce_busbw_GBps": 1.0,
+     "all_reduce_graph_us": 80.73,
+     "all_reduce_graph_busbw_GBps": 0.8
+    },
+    {
+     "bytes": 65536,
+     "all_gather_us": 36.99,
+     "all_gather_busbw_GBps": 1.7,
+     "all_gather_graph_us": 56.26,
+     "all_gather_graph_busbw_GBps": 1.1,
+     "all_to_all_us": 25.24,
+     "all_to_all_busbw_GBps": 2.4,
+     "all_to_all_graph_us": 36.99,
+     "all_to_all_graph_busbw_GBps": 1.7,
+     "all_reduce_us": 63.83,
+     "all_reduce_busbw_GBps": 1.9,
+     "all_reduce_graph_us": 81.55,
+     "all_reduce_graph_busbw_GBps": 1.5
+    },
+    {
+     "bytes": 131072,
+     "all_gather_us": 38.24,
+     "all_gather_busbw_GBps": 3.2,
+     "all_gather_graph_us": 56.7,
+     "all_gather_graph_busbw_GBps": 2.2,
+     "all_to_all_us": 25.74,
+     "all_to_all_busbw_GBps": 4.8,
+     "all_to_all_graph_us": 36.03,
+     "all_to_all_graph_busbw_GBps": 3.4,
+     "all_reduce_us": 47.72,
+     "all_reduce_busbw_GBps": 5.1,
+     "all_reduce_graph_us": 67.29,
+     "all_reduce_graph_busbw_GBps": 3.7
+    },
+    {
+     "bytes": 262144,
+     "all_gather_us": 37.65,
+     "all_gather_busbw_GBps": 6.5,
+     "all_gather_graph_us": 57.9,
+     "all_gather_graph_busbw_GBps": 4.2,
+     "all_to_all_us": 30.31,
+     "all_to_all_busbw_GBps": 8.1,
+     "all_to_all_graph_us": 41.69,
+     "all_to_all_graph_busbw_GBps": 5.9,
+     "all_reduce_us": 48.08,
+     "all_reduce_busbw_GBps": 10.2,
+     "all_reduce_graph_us": 66.12,
+     "all_reduce_graph_busbw_GBps": 7.4
+    },
+    {
+     "bytes": 524288,
+     "all_gather_us": 39.6,
+     "all_gather_busbw_GBps": 12.4,
+     "all_gather_graph_us": 58.43,
+     "all_gather_graph_busbw_GBps": 8.4,
+     "all_to_all_us": 61.79,
+     "all_to_all_busbw_GBps": 8.0,
+     "all_to_all_graph_us": 44.77,
+     "all_to_all_graph_busbw_GBps": 11.0,
+     "all_reduce_us": 49.41,
+     "all_reduce_busbw_GBps": 19.9,
+     "all_reduce_graph_us": 67.73,
+     "all_reduce_graph_busbw_GBps": 14.5
+    },
+    {
+     "bytes": 1048576,
+     "all_gather_us": 39.55,
+     "all_gather_busbw_GBps": 24.9,
+     "all_gather_graph_us": 58.67,
+     "all_gather_graph_busbw_GBps": 16.8,
+     "all_to_all_us": 64.64,
+     "all_to_all_busbw_GBps": 15.2,
+     "all_to_all_graph_us": 45.24,
+     "all_to_all_graph_busbw_GBps": 21.7,
+     "all_reduce_us": 49.79,
+     "all_reduce_busbw_GBps": 39.5,
+     "all_reduce_graph_us": 67.8,
+     "all_reduce_graph_busbw_GBps": 29.0
+    },
+    {
+     "bytes": 4194304,
+     "all_gather_us": 68.27,
+     "all_gather_busbw_GBps": 57.6,
+     "all_gather_graph_us": 72.89,
+     "all_gather_graph_busbw_GBps": 53.9,
+     "all_to_all_us": 81.24,
+     "all_to_all_busbw_GBps": 48.4,
+     "all_to_all_graph_us": 53.01,
+     "all_to_all_graph_busbw_GBps": 74.2,
+     "all_reduce_us": 53.85,
+     "all_reduce_busbw_GBps": 146.0,
+     "all_reduce_graph_us": 75.81,
+     "all_reduce_graph_busbw_GBps": 103.7
+    },
+    {
+     "bytes": 16777216,
+     "all_gather_us": 66.43,
+     "all_gather_busbw_GBps": 236.8,
+     "all_to_all_us": 78.02,
+     "all_to_all_busbw_GBps": 201.6,
+     "all_reduce_us": 86.67,
+     "all_reduce_busbw_GBps": 363.0
+    },
+    {
+     "bytes": 67108864,
+     "all_gather_us": 318.29,
+     "all_gather_busbw_GBps": 197.7,
+     "all_to_all_us": 182.66,
+     "all_to_all_busbw_GBps": 344.4,
+     "all_reduce_us": 216.17,
+     "all_reduce_busbw_GBps": 582.1
+    },
+    {
+     "bytes": 268435456,
+     "all_gather_us": 565.35,
+     "all_gather_busbw_GBps": 445.1,
+     "all_to_all_us": 651.51,
+     "all_to_all_busbw_GBps": 386.3,
+     "all_reduce_us": 582.26,
+     "all_reduce_busbw_GBps": 864.4
+    }
+   ]
+  },
+  "nccl_c5_variants": {
+   "nccl_nvls0": {
+    "4": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 22.7,
+      "all_to_all_us": 23.5,
+      "all_reduce_us": 23.68
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 22.48,
+      "all_to_all_us": 22.26,
+      "all_reduce_us": 23.54
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 22.26,
+      "all_to_all_us": 28.59,
+      "all_reduce_us": 23.81
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 22.34,
+      "all_to_all_us": 28.75,
+      "all_reduce_us": 23.28
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 23.03,
+      "all_to_all_us": 29.06,
+      "all_reduce_us": 22.35
+     }
+    ],
+    "8": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 28.95,
+      "all_to_all_us": 28.34,
+      "all_reduce_us": 35.28
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 22.06,
+      "all_to_all_us": 23.07,
+      "all_reduce_us": 35.07
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 22.61,
+      "all_to_all_us": 37.58,
+      "all_reduce_us": 35.1
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 22.69,
+      "all_to_all_us": 37.86,
+      "all_reduce_us": 35.51
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 22.02,
+      "all_to_all_us": 37.75,
+      "all_reduce_us": 37.84
+     }
+    ],
+    "16": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 40.13,
+      "all_to_all_us": 28.18,
+      "all_reduce_us": 65.18
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 38.2,
+      "all_to_all_us": 24.13,
+      "all_reduce_us": 64.34
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 39.11,
+      "all_to_all_us": 24.29,
+      "all_reduce_us": 64.88
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 40.07,
+      "all_to_all_us": 55.94,
+      "all_reduce_us": 66.55
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 40.09,
+      "all_to_all_us": 55.85,
+      "all_reduce_us": 66.68
+     }
+    ]
+   },
+   "nccl_LL": {
+    "4": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 21.56,
+      "all_to_all_us": 27.77,
+      "all_reduce_us": 23.81
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 23.52,
+      "all_to_all_us": 23.27,
+      "all_reduce_us": 24.84
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 24.35,
+      "all_to_all_us": 30.82,
+      "all_reduce_us": 24.26
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 22.4,
+      "all_to_all_us": 28.98,
+      "all_reduce_us": 24.23
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 23.16,
+      "all_to_all_us": 29.83,
+      "all_reduce_us": 22.29
+     }
+    ],
+    "8": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 26.38,
+      "all_to_all_us": 26.86,
+      "all_reduce_us": 34.27
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 23.13,
+      "all_to_all_us": 23.53,
+      "all_reduce_us": 34.9
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 24.13,
+      "all_to_all_us": 42.48,
+      "all_reduce_us": 35.41
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 22.5,
+      "all_to_all_us": 37.56,
+      "all_reduce_us": 35.45
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 22.8,
+      "all_to_all_us": 38.41,
+      "all_reduce_us": 37.53
+     }
+    ],
+    "16": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 37.65,
+      "all_to_all_us": 34.3,
+      "all_reduce_us": 63.09
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 37.77,
+      "all_to_all_us": 25.54,
+      "all_reduce_us": 64.01
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 38.42,
+      "all_to_all_us": 25.46,
+      "all_reduce_us": 64.59
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 39.46,
+      "all_to_all_us": 64.38,
+      "all_reduce_us": 66.2
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 39.35,
+      "all_to_all_us": 59.22,
+      "all_reduce_us": 66.21
+     }
+    ]
+   },
+   "nccl_dbg": {
+    "4": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 21.51,
+      "all_to_all_us": 27.85,
+      "all_reduce_us": 23.65
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 23.41,
+      "all_to_all_us": 24.8,
+      "all_reduce_us": 23.91
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 23.98,
+      "all_to_all_us": 30.47,
+      "all_reduce_us": 23.48
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 22.19,
+      "all_to_all_us": 28.75,
+      "all_reduce_us": 23.18
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 23.04,
+      "all_to_all_us": 29.78,
+      "all_reduce_us": 21.52
+     }
+    ],
+    "8": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 25.33,
+      "all_to_all_us": 31.38,
+      "all_reduce_us": 35.02
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 23.04,
+      "all_to_all_us": 22.77,
+      "all_reduce_us": 34.9
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 23.65,
+      "all_to_all_us": 39.7,
+      "all_reduce_us": 35.54
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 29.54,
+      "all_to_all_us": 39.71,
+      "all_reduce_us": 35.42
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 21.72,
+      "all_to_all_us": 38.12,
+      "all_reduce_us": 37.66
+     }
+    ],
+    "16": [
+     {
+      "bytes": 16384,
+      "all_gather_us": 41.45,
+      "all_to_all_us": 29.34,
+      "all_reduce_us": 62.95
+     },
+     {
+      "bytes": 65536,
+      "all_gather_us": 36.76,
+      "all_to_all_us": 23.82,
+      "all_reduce_us": 63.74
+     },
+     {
+      "bytes": 262144,
+      "all_gather_us": 38.04,
+      "all_to_all_us": 25.96,
+      "all_reduce_us": 47.62
+     },
+     {
+      "bytes": 524288,
+      "all_gather_us": 39.68,
+      "all_to_all_us": 88.71,
+      "all_reduce_us": 48.74
+     },
+     {
+      "bytes": 1048576,
+      "all_gather_us": 39.16,
+      "all_to_all_us": 56.43,
+      "all_reduce_us": 50.07
+     }
+    ]
+   }
+  },
+  "l2_read_c5": [
+   {
+    "read_MiB": 8,
+    "ctas_per_sm": 4,
+    "TBps": 29.0
+   },
+   {
+    "read_MiB": 8,
+    "ctas_per_sm": 8,
+    "TBps": 22.85
+   },
+   {
+    "read_MiB": 16,
+    "ctas_per_sm": 4,
+    "TBps": 34.81
+   },
+   {
+    "read_MiB": 16,
+    "ctas_per_sm": 8,
+    "TBps": 30.29
+   },
+   {
+    "read_MiB": 32,
+    "ctas_per_sm": 4,
+    "TBps": 27.67
+   },
+   {
+    "read_MiB": 32,
+    "ctas_per_sm": 8,
+    "TBps": 35.02
+   },
+   {
+    "read_MiB": 48,
+    "ctas_per_sm": 4,
+    "TBps": 24.96
+   },
+   {
+    "read_MiB": 48,
+    "ctas_per_sm": 8,
+    "TBps": 34.59
+   },
+   {
+    "read_MiB": 64,
+    "ctas_per_sm": 4,
+    "TBps": 21.31
+   },
+   {
+    "read_MiB": 64,
+    "ctas_per_sm": 8,
+    "TBps": 35.4
+   },
+   {
+    "read_MiB": 96,
+    "ctas_per_sm": 4,
+    "TBps": 15.4
+   },
+   {
+    "read_MiB": 96,
+    "ctas_per_sm": 8,
+    "TBps": 26.3
+   },
+   {
+    "read_MiB": 128,
+    "ctas_per_sm": 4,
+    "TBps": 9.02
+   },
+   {
+    "read_MiB": 128,
+    "ctas_per_sm": 8,
+    "TBps": 18.38
+   },
+   {
+    "read_MiB": 192,
+    "ctas_per_sm": 4,
+    "TBps": 6.75
+   },
+   {
+    "read_MiB": 192,
+    "ctas_per_sm": 8,
+    "TBps": 11.49
+   },
+   {
+    "read_MiB": 256,
+    "ctas_per_sm": 4,
+    "TBps": 6.77
+   },
+   {
+    "read_MiB": 256,
+    "ctas_per_sm": 8,
+    "TBps": 11.36
+   },
+   {
+    "read_MiB": 1024,
+    "ctas_per_sm": 4,
+    "TBps": 6.94
+   },
+   {
+    "read_MiB": 1024,
+    "ctas_per_sm": 8,
+    "TBps": 11.59
+   },
+   {
+    "read_MiB": 8192,
+    "ctas_per_sm": 4,
+    "TBps": 13.75
+   },
+   {
+    "read_MiB": 8192,
+    "ctas_per_sm": 8,
+    "TBps": 13.05
+   }
+  ],
+  "symm_pingpong_c6": [
+   {
+    "pingpong_peer": 1,
+    "rep0_oneway_us": 221.74,
+    "rep1_oneway_us": 2.822,
+    "rep2_oneway_us": 2.817
+   },
+   {
+    "pingpong_peer": 2,
+    "rep0_oneway_us": 136.26,
+    "rep1_oneway_us": 2.853,
+    "rep2_oneway_us": 2.847
+   },
+   {
+    "pingpong_peer": 3,
+    "rep0_oneway_us": 133.971,
+    "rep1_oneway_us": 2.859,
+    "rep2_oneway_us": 2.866
+   },
+   {
+    "pingpong_peer": 4,
+    "rep0_oneway_us": 224.69,
+    "rep1_oneway_us": 2.862,
+    "rep2_oneway_us": 2.851
+   },
+   {
+    "pingpong_peer": 5,
+    "rep0_oneway_us": 136.413,
+    "rep1_oneway_us": 2.87,
+    "rep2_oneway_us": 2.856
+   },
+   {
+    "pingpong_peer": 6,
+    "rep0_oneway_us": 134.103,
+    "rep1_oneway_us": 2.875,
+    "rep2_oneway_us": 2.866
+   },
+   {
+    "pingpong_peer": 7,
+    "rep0_oneway_us": 134.789,
+    "rep1_oneway_us": 2.901,
+    "rep2_oneway_us": 2.897
+   },
+   {
+    "pingpong_peer": 8,
+    "rep0_oneway_us": 223.529,
+    "rep1_oneway_us": 2.854,
+    "rep2_oneway_us": 2.839
+   },
+   {
+    "pingpong_peer": 9,
+    "rep0_oneway_us": 135.895,
+    "rep1_oneway_us": 2.895,
+    "rep2_oneway_us": 2.887
+   },
+   {
+    "pingpong_peer": 10,
+    "rep0_oneway_us": 136.937,
+    "rep1_oneway_us": 2.906,
+    "rep2_oneway_us": 2.88
+   },
+   {
+    "pingpong_peer": 11,
+    "rep0_oneway_us": 136.232,
+    "rep1_oneway_us": 2.876,
+    "rep2_oneway_us": 2.856
+   },
+   {
+    "pingpong_peer": 12,
+    "rep0_oneway_us": 247.01,
+    "rep1_oneway_us": 2.933,
+    "rep2_oneway_us": 2.899
+   },
+   {
+    "pingpong_peer": 13,
+    "rep0_oneway_us": 157.051,
+    "rep1_oneway_us": 2.858,
+    "rep2_oneway_us": 2.841
+   },
+   {
+    "pingpong_peer": 14,
+    "rep0_oneway_us": 134.68,
+    "rep1_oneway_us": 2.871,
+    "rep2_oneway_us": 2.867
+   },
+   {
+    "pingpong_peer": 15,
+    "rep0_oneway_us": 136.229,
+    "rep1_oneway_us": 2.895,
+    "rep2_oneway_us": 2.867
+   }
+  ],
+  "symm_remote_bw_c6": [
+   {
+    "pattern": "pair_r0_r1",
+    "ctas_per_sm": 1,
+    "remote_read_GBps": 282.0,
+    "remote_write_GBps": 1038.8
+   },
+   {
+    "pattern": "pair_r0_r1",
+    "ctas_per_sm": 2,
+    "remote_read_GBps": 556.1,
+    "remote_write_GBps": 1070.9
+   },
+   {
+    "pattern": "pair_r0_r1",
+    "ctas_per_sm": 4,
+    "remote_read_GBps": 1060.6,
+    "remote_write_GBps": 1090.6
+   },
+   {
+    "pattern": "pair_r0_r1",
+    "ctas_per_sm": 8,
+    "remote_read_GBps": 1063.1,
+    "remote_write_GBps": 1093.7
+   },
+   {
+    "pattern": "pair_r0_r4",
+    "ctas_per_sm": 1,
+    "remote_read_GBps": 284.5,
+    "remote_write_GBps": 1042.6
+   },
+   {
+    "pattern": "pair_r0_r4",
+    "ctas_per_sm": 2,
+    "remote_read_GBps": 559.8,
+    "remote_write_GBps": 1074.2
+   },
+   {
+    "pattern": "pair_r0_r4",
+    "ctas_per_sm": 4,
+    "remote_read_GBps": 1067.3,
+    "remote_write_GBps": 1088.7
+   },
+   {
+    "pattern": "pair_r0_r4",
+    "ctas_per_sm": 8,
+    "remote_read_GBps": 1071.7,
+    "remote_write_GBps": 1091.8
+   },
+   {
+    "pattern": "ring_all",
+    "ctas_per_sm": 1,
+    "remote_read_GBps": 275.9,
+    "remote_write_GBps": 1018.2
+   },
+   {
+    "pattern": "ring_all",
+    "ctas_per_sm": 2,
+    "remote_read_GBps": 532.2,
+    "remote_write_GBps": 1055.2
+   },
+   {
+    "pattern": "ring_all",
+    "ctas_per_sm": 4,
+    "remote_read_GBps": 964.6,
+    "remote_write_GBps": 1067.6
+   },
+   {
+    "pattern": "ring_all",
+    "ctas_per_sm": 8,
+    "remote_read_GBps": 970.8,
+    "remote_write_GBps": 1069.8
+   }
+  ]
+ },
+ "sol_model_defaults": {
+  "_note": "What the first-principles SOL model should plug in (spec bounds) and the measured derate per resource for matching microbenchmarks.",
+  "bf16_tc_PF": {
+   "sol": 4.0,
+   "derated": 3.65
+  },
+  "fp8_mxfp8_tc_PF": {
+   "sol": 17.5,
+   "derated": 10.9
+  },
+  "fp4_tc_PF": {
+   "sol": 35.0,
+   "derated": 21.1
+  },
+  "fp32_simt_TF": {
+   "sol": 130.0,
+   "derated": null
+  },
+  "hbm_TBps": {
+   "sol": 22.0,
+   "derated_die_local": 17.1,
+   "derated_default": 13.9
+  },
+  "l2_TBps": {
+   "derated": 35.0
+  },
+  "nvlink_TBps_per_dir": {
+   "sol": 1.8,
+   "derated": 1.25,
+   "derated_single_pair": 1.09
+  },
+  "nvlink_hop_latency_us": {
+   "derated": 2.86
+  },
+  "graph_kernel_overhead_us": {
+   "derated": 0.78
+  },
+  "pdl_release_us": {
+   "derated": 0.74
+  },
+  "hbm_budget_GiB": {
+   "value": 272.48
+  },
+  "nvlink_domain_gpus": 72
+ }
+}

@@ -1,0 +1,12 @@
+== p1/pf16k_L78k.rank0.trace.json.gz: span 230.19 ms, 3691 activities, 14.049 us/token
+component        excl ms   gap ms   busy ms  us/tok      %  sub (excl ms)
+moe                85.85     5.42    122.89   5.571   39.7  routed_experts 55.77, shared_experts 26.47, router 1.60, elementwise 1.21, gemm_other 0.80
+kda_core           17.85     0.19     17.88   1.101    7.8  kernel 17.18, elementwise 0.67
+kda_proj           46.62     0.06     46.99   2.849   20.3  gemm 46.62
+dsa_proj           12.96     0.01     12.99   0.792    5.6  gemm 12.96
+dsa_indexer         4.35     0.18     12.02   0.276    2.0  gemm 2.67, kernel 1.01, comm 0.66
+dsa_attn_op        12.62     1.23     14.61   0.845    6.0  kernel 10.79, gemm 1.01, comm 0.82
+layer_other        27.18     0.05     27.79   1.662   11.8  norm_attnres 26.35, comm 0.82
+drafter             1.92     0.05      2.08   0.121    0.9  compute 1.29, comm 0.63
+top_other           8.13     5.50      8.41   0.832    5.9  compute 4.53, comm 3.60
+layer kinds (ms per layer incl. gaps): {'KimiK3DeltaAttention': (69, 2.212), 'KimiK3DSAAttention': (24, 2.583), 'draft': (5, 0.091)}

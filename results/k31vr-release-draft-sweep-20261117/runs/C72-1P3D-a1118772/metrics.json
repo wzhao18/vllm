@@ -1,0 +1,1 @@
+{"label": "C72", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1118772-dsrel-c72-1p3d-spx-1117163220", "gpus": 56, "ok": 14292, "err": 4, "span_min": 60.0, "tput_per_gpu": 10459.6, "p90_itl_ms": 2.008, "p90_intvty": 498.06, "p90_e2e_norm_intvty": 164.27, "p90_e2el_s": 4.883, "p90_ttft_s": 0.953, "p50_ttft_s": 0.302}

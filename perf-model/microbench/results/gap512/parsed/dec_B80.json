@@ -1,0 +1,678 @@
+{
+ "q4_B80_M320_agentx": {
+  "B": 80,
+  "step_median_us": 33017.0,
+  "span_med_us": 33146.453369140625,
+  "union_med_us": 33115.187744140625,
+  "seg_types": "xkDkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmkmkmkmdmdmD",
+  "model_key": "B80_L190K",
+  "model_t_sol_us": 12340.590581105538,
+  "model_t_ach_us": 17766.163051987907,
+  "model_not_in_bench_ach_us": 65.95989756341775,
+  "model_launch_ach_us": 126.56552998458481,
+  "ranks": 16,
+  "rows": [
+   {
+    "group": "MOE.megamoe",
+    "op_ids": [
+     "MOE.dispatch",
+     "MOE.fc1",
+     "MOE.act",
+     "MOE.fc2",
+     "MOE.combine",
+     "COMM.P11.moe",
+     "COMM.P12.moe"
+    ],
+    "measured_us": 11243.0537109375,
+    "measured_rank0_us": 11333.02685546875,
+    "exposed_us": 11243.0537109375,
+    "exposed_gap_us": 2629.1404691229363,
+    "measured_max_us": 11400.30224609375,
+    "t_sol_us": 5719.033941092006,
+    "t_ach_us": 8613.913241814564,
+    "derate": 1.3052202170275278,
+    "gap_us": 2629.1404691229363,
+    "calls": 92,
+    "kernels": {
+     "deep_gemm::sm100_fp8_fp4_mega_moe_situ_impl": 11347.9
+    }
+   },
+   {
+    "group": "DSA.topk_merge",
+    "op_ids": [
+     "COMM.P8.dsa"
+    ],
+    "measured_us": 1853.170654296875,
+    "measured_rank0_us": 1884.10546875,
+    "exposed_us": 1851.6192626953125,
+    "exposed_gap_us": 1682.6357106953126,
+    "measured_max_us": 2481.31787109375,
+    "t_sol_us": 156.94079999999997,
+    "t_ach_us": 168.98355199999997,
+    "derate": 10.966574156855664,
+    "gap_us": 1684.187102296875,
+    "calls": 24,
+    "kernels": {
+     "k31dcpx::topk_merge_kernel<16>": 1878.0
+    }
+   },
+   {
+    "group": "KDA.core",
+    "op_ids": [
+     "KDA.conv",
+     "KDA.gate_beta_norm",
+     "KDA.core_decode",
+     "KDA.o_norm"
+    ],
+    "measured_us": 3115.055419921875,
+    "measured_rank0_us": 3110.47216796875,
+    "exposed_us": 3115.055419921875,
+    "exposed_gap_us": 1605.027808724002,
+    "measured_max_us": 3129.77734375,
+    "t_sol_us": 957.86551367217,
+    "t_ach_us": 1510.027611197873,
+    "derate": 2.0629128876992966,
+    "gap_us": 1605.027808724002,
+    "calls": 69,
+    "kernels": {
+     "sd:kdaspecializedKdaWS": 3110.5
+    }
+   },
+   {
+    "group": "KDA.in_proj",
+    "op_ids": [
+     "KDA.in_proj",
+     "KDA.f_b_proj"
+    ],
+    "measured_us": 2008.26904296875,
+    "measured_rank0_us": 1983.3369140625,
+    "exposed_us": 2008.26904296875,
+    "exposed_gap_us": 915.6699494577615,
+    "measured_max_us": 2099.71875,
+    "t_sol_us": 993.1330280727273,
+    "t_ach_us": 1092.5990935109885,
+    "derate": 1.8380658147128075,
+    "gap_us": 915.6699494577615,
+    "calls": 69,
+    "kernels": {
+     "nvjet_sm107_tst_160x192_64x9_2x2_2cta_h_bz_TNN": 2028.9
+    }
+   },
+   {
+    "group": "MOE.shared_gate_up",
+    "op_ids": [
+     "MOE.shared_gate_up"
+    ],
+    "measured_us": 2086.592041015625,
+    "measured_rank0_us": 2103.39697265625,
+    "exposed_us": 2086.592041015625,
+    "exposed_gap_us": 900.0321146846898,
+    "measured_max_us": 2106.28515625,
+    "t_sol_us": 749.6901352727273,
+    "t_ach_us": 1186.5599263309352,
+    "derate": 1.7585222580942514,
+    "gap_us": 900.0321146846898,
+    "calls": 92,
+    "kernels": {
+     "nvjet_sm107_tst_64x128_64x16_4x1_2cta_h_bz_TNT": 2128.4
+    }
+   },
+   {
+    "group": "DSA.topk",
+    "op_ids": [
+     "DSA.topk"
+    ],
+    "measured_us": 710.71240234375,
+    "measured_rank0_us": 719.07421875,
+    "exposed_us": 710.71240234375,
+    "exposed_gap_us": 657.0916368761241,
+    "measured_max_us": 729.259765625,
+    "t_sol_us": 33.87857454545454,
+    "t_ach_us": 53.6207654676259,
+    "derate": 13.254424776402159,
+    "gap_us": 657.0916368761241,
+    "calls": 72,
+    "kernels": {
+     "k31dcpx::topk_pp_hist_kernel": 246.5,
+     "k31dcpx::topk_pp_window_kernel": 90.9,
+     "k31dcpx::topk_pp_win_kernel": 380.4
+    }
+   },
+   {
+    "group": "KDA.o_proj",
+    "op_ids": [
+     "KDA.o_proj"
+    ],
+    "measured_us": 837.127685546875,
+    "measured_rank0_us": 824.41748046875,
+    "exposed_us": 837.127685546875,
+    "exposed_gap_us": 570.7146884619435,
+    "measured_max_us": 893.287109375,
+    "t_sol_us": 243.10185984,
+    "t_ach_us": 266.4129970849315,
+    "derate": 3.142217889917742,
+    "gap_us": 570.7146884619435,
+    "calls": 69,
+    "kernels": {
+     "nvjet_sm107_tst_176x128_64x11_2x2_2cta_h_bz_TNN": 831.2
+    }
+   },
+   {
+    "group": "DSA.sparse_mla",
+    "op_ids": [
+     "DSA.sparse_mla"
+    ],
+    "measured_us": 745.588623046875,
+    "measured_rank0_us": 742.49560546875,
+    "exposed_us": 744.0289306640625,
+    "exposed_gap_us": 552.2300472108251,
+    "measured_max_us": 754.02294921875,
+    "t_sol_us": 121.18202181818181,
+    "t_ach_us": 191.7988834532374,
+    "derate": 3.8873460033913982,
+    "gap_us": 553.7897395936376,
+    "calls": 48,
+    "kernels": {
+     "fmhaSm107aKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256Paged": 728.6,
+     "flashinfer::ComputeLSEFromMDKernel": 28.3
+    }
+   },
+   {
+    "group": "DSA.g_proj",
+    "op_ids": [
+     "DSA.g_proj"
+    ],
+    "measured_us": 1249.193603515625,
+    "measured_rank0_us": 1241.9599609375,
+    "exposed_us": 624.5968017578125,
+    "exposed_gap_us": 531.9314114674015,
+    "measured_max_us": 1258.46728515625,
+    "t_sol_us": 84.55716863999999,
+    "t_ach_us": 92.66539029041095,
+    "derate": 13.480692193716385,
+    "gap_us": 1156.5282132252141,
+    "calls": 24,
+    "kernels": {
+     "sd:gemmsplitkSplitKGemm": 1242.0
+    }
+   },
+   {
+    "group": "TAIL.drafter+final",
+    "op_ids": [
+     "DS.aux_capture",
+     "DS.fc",
+     "DS.hidden_norm",
+     "DS.ctx_kv_proj",
+     "DS.ctx_kv_insert",
+     "DS.embed",
+     "DS.norm_ar",
+     "DS.qkv",
+     "DS.attn",
+     "DS.o_proj",
+     "DS.gate_up",
+     "DS.silu",
+     "DS.down",
+     "DS.lm_head",
+     "DS.markov",
+     "DS.confidence",
+     "F.norm",
+     "COMM.P2.drafter",
+     "COMM.P18.drafter",
+     "COMM.P1c.drafter",
+     "COMM.P16.drafter",
+     "COMM.P2.final"
+    ],
+    "measured_us": 773.640625,
+    "measured_rank0_us": 772.29052734375,
+    "exposed_us": 773.640625,
+    "exposed_gap_us": 525.4794180706825,
+    "measured_max_us": 775.908203125,
+    "t_sol_us": 185.53795603028632,
+    "t_ach_us": 248.16120692931747,
+    "derate": 3.1174921921634278,
+    "gap_us": 525.4794180706825,
+    "calls": 69,
+    "kernels": {
+     "at::native::": 6.0,
+     "ncclDevKernel_AllGather_RING": 114.5,
+     "true>": 6.9,
+     "_prepare_dflash_inputs_kernel": 2.8,
+     "nvjet_sm107_tst_160x192_64x9_1x2_2cta_h_bz_splitK_TNN": 23.1,
+     "__nv_bfloat16,": 3.3,
+     "sd:draftcontextCtxGather": 8.6,
+     "memcpy128_aligned": 2.4,
+     "nvjet_sm107_tst_96x64_64x16_2x2_2cta_h_bz_TNN": 11.8,
+     "sd:draftgqa_context_kvContextKV": 2.9,
+     "sd:commonembeddingRingEmbeddingGather": 3.1,
+     "sd:draftallreduceArNormRows": 116.0,
+     "nvjet_sm107_tst_64x64_64x16_4x2_2cta_h_bz_TNN": 48.1,
+     "sd:draftgqa_windowGqaWindow": 159.8,
+     "nvjet_sm107_tst_128x112_64x13_2x1_2cta_v_bz_TNT": 82.9,
+     "nvjet_sm107_tst_192x64_64x15_1x4_2cta_h_bz_TNN": 75.3,
+     "&": 13.2,
+     "nvjet_sm107_tst_448x128_64x7_1x2_2cta_v_bz_TNN": 52.9,
+     "at::native::gpu_kernel_impl_nocast<at::native::converting_co": 1.3,
+     "long>": 1.9,
+     "nvjet_sm107_tst_128x176_64x11_4x1_2cta_v_bz_TNT": 24.2,
+     "_vp_markov_keys": 15.8,
+     "_vp_markov_select": 6.6
+    }
+   },
+   {
+    "group": "DSA.q_path",
+    "op_ids": [
+     "DSA.qb_wq_packed",
+     "DSA.w_uk",
+     "DSA.idx_q_quant",
+     "COMM.P6.dsa"
+    ],
+    "measured_us": 1816.1044921875,
+    "measured_rank0_us": 1814.9873046875,
+    "exposed_us": 911.3394775390625,
+    "exposed_gap_us": 504.69933539527267,
+    "measured_max_us": 1835.810546875,
+    "t_sol_us": 313.1101372385184,
+    "t_ach_us": 406.64014214378983,
+    "derate": 4.466122017892953,
+    "gap_us": 1409.46435004371,
+    "calls": 48,
+    "kernels": {
+     "sd:dsaoverlapQueryNorm": 37.0,
+     "sd:mlaqueryMlaQuery": 1775.9
+    }
+   },
+   {
+    "group": "MOE.router+latent_down",
+    "op_ids": [
+     "MOE.router",
+     "MOE.latent_down"
+    ],
+    "measured_us": 1791.76025390625,
+    "measured_rank0_us": 1787.88037109375,
+    "exposed_us": 948.4873046875,
+    "exposed_gap_us": 502.52425432778773,
+    "measured_max_us": 1806.38134765625,
+    "t_sol_us": 281.7675636363636,
+    "t_ach_us": 445.96305035971227,
+    "derate": 4.017732528425892,
+    "gap_us": 1345.7972035465377,
+    "calls": 368,
+    "kernels": {
+     "nvjet_sm107_tss_64x96_64x16_2x1_2cta_h_bz_splitK_TNT": 388.4,
+     "nvjet_sm107_tst_128x64_64x16_2x2_2cta_v_bz_splitK_TNN": 1004.4,
+     "fal": 197.7,
+     "__nv_bfloat16,": 201.7
+    }
+   },
+   {
+    "group": "DSA.idx_score",
+    "op_ids": [
+     "DSA.idx_score"
+    ],
+    "measured_us": 1129.19140625,
+    "measured_rank0_us": 1090.85107421875,
+    "exposed_us": 988.6297607421875,
+    "exposed_gap_us": 489.6640283680868,
+    "measured_max_us": 1144.23828125,
+    "t_sol_us": 354.94115449280775,
+    "t_ach_us": 498.9657323741007,
+    "derate": 2.263064040244323,
+    "gap_us": 630.2256738758992,
+    "calls": 24,
+    "kernels": {
+     "deep_gemm::sm100_paged_mqa_logits": 1098.6
+    }
+   },
+   {
+    "group": "MOE.shared_down",
+    "op_ids": [
+     "MOE.shared_down"
+    ],
+    "measured_us": 994.503173828125,
+    "measured_rank0_us": 993.5986328125,
+    "exposed_us": 994.503173828125,
+    "exposed_gap_us": 397.42778044683007,
+    "measured_max_us": 1002.4052734375,
+    "t_sol_us": 377.2430894545455,
+    "t_ach_us": 597.0753933812949,
+    "derate": 1.6656241152330171,
+    "gap_us": 397.42778044683007,
+    "calls": 92,
+    "kernels": {
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_bz_TNT": 1023.7
+    }
+   },
+   {
+    "group": "COMM.SP_RS",
+    "op_ids": [
+     "COMM.P3b.kda",
+     "COMM.P3b.dsa",
+     "COMM.P3b.embed"
+    ],
+    "measured_us": 909.768310546875,
+    "measured_rank0_us": 874.466796875,
+    "exposed_us": 909.768310546875,
+    "exposed_gap_us": 375.54951588020845,
+    "measured_max_us": 1101.63671875,
+    "t_sol_us": 448.51786666666663,
+    "t_ach_us": 534.2187946666666,
+    "derate": 1.7029882131244334,
+    "gap_us": 375.54951588020845,
+    "calls": 94,
+    "kernels": {
+     "flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel<": 15.5,
+     "sd:commonsp_commSpReduceScatter": 858.1
+    }
+   },
+   {
+    "group": "ATTNRES",
+    "op_ids": [
+     "L.attnres_pre",
+     "L.attnres_post",
+     "F.attnres_final",
+     "G.attnres_init"
+    ],
+    "measured_us": 544.688720703125,
+    "measured_rank0_us": 542.7197265625,
+    "exposed_us": 494.176025390625,
+    "exposed_gap_us": 371.4578026568121,
+    "measured_max_us": 547.27392578125,
+    "t_sol_us": 77.53560436363637,
+    "t_ach_us": 122.71822273381294,
+    "derate": 4.438531691292537,
+    "gap_us": 421.9704979693121,
+    "calls": 187,
+    "kernels": {
+     "true>": 538.6,
+     "false>": 4.0
+    }
+   },
+   {
+    "group": "DSA.dcp_value",
+    "op_ids": [
+     "COMM.P7b.dsa"
+    ],
+    "measured_us": 549.84423828125,
+    "measured_rank0_us": 534.62353515625,
+    "exposed_us": 549.84423828125,
+    "exposed_gap_us": 364.49255828125,
+    "measured_max_us": 581.4423828125,
+    "t_sol_us": 148.512,
+    "t_ach_us": 185.35168,
+    "derate": 2.9664917970058324,
+    "gap_us": 364.49255828125,
+    "calls": 24,
+    "kernels": {
+     "sd:dsadcp_valueDcpValue": 539.7
+    }
+   },
+   {
+    "group": "MOE.latent_up",
+    "op_ids": [
+     "MOE.latent_up"
+    ],
+    "measured_us": 687.3046875,
+    "measured_rank0_us": 690.6875,
+    "exposed_us": 687.3046875,
+    "exposed_gap_us": 335.8478495143885,
+    "measured_max_us": 690.6875,
+    "t_sol_us": 222.05682036363635,
+    "t_ach_us": 351.4568379856115,
+    "derate": 1.9555877513703062,
+    "gap_us": 335.8478495143885,
+    "calls": 92,
+    "kernels": {
+     "nvjet_sm107_tst_64x96_64x16_4x1_2cta_v_badd_TNT": 714.3
+    }
+   },
+   {
+    "group": "MOE.shared_act",
+    "op_ids": [
+     "MOE.shared_act"
+    ],
+    "measured_us": 332.494140625,
+    "measured_rank0_us": 336.35498046875,
+    "exposed_us": 332.494140625,
+    "exposed_gap_us": 328.36935078752566,
+    "measured_max_us": 338.17529296875,
+    "t_sol_us": 4.124789837474313,
+    "t_ach_us": 4.124789837474313,
+    "derate": 80.60874704554462,
+    "gap_us": 328.36935078752566,
+    "calls": 92,
+    "kernels": {
+     "vllm::situ_and_mul_kernel<c10::BFloat16>": 336.5
+    }
+   },
+   {
+    "group": "DSA.qkv_a",
+    "op_ids": [
+     "DSA.qkv_a_packed"
+    ],
+    "measured_us": 389.587158203125,
+    "measured_rank0_us": 388.57666015625,
+    "exposed_us": 372.0833740234375,
+    "exposed_gap_us": 303.5495957878211,
+    "measured_max_us": 410.07958984375,
+    "t_sol_us": 62.53707264,
+    "t_ach_us": 68.53377823561642,
+    "derate": 5.6846006193287595,
+    "gap_us": 321.0533799675086,
+    "calls": 24,
+    "kernels": {
+     "nvjet_sm107_tst_64x224_64x14_8x1_2cta_v_bz_TNT": 401.0
+    }
+   },
+   {
+    "group": "MOE.latent_norm",
+    "op_ids": [
+     "MOE.latent_norm"
+    ],
+    "measured_us": 253.823974609375,
+    "measured_rank0_us": 260.05859375,
+    "exposed_us": 253.823974609375,
+    "exposed_gap_us": 253.0219321409772,
+    "measured_max_us": 260.38427734375,
+    "t_sol_us": 0.802042468397783,
+    "t_ach_us": 0.802042468397783,
+    "derate": 316.4719882183194,
+    "gap_us": 253.0219321409772,
+    "calls": 92,
+    "kernels": {
+     "true>": 261.2
+    }
+   },
+   {
+    "group": "MOE.prepare",
+    "op_ids": [],
+    "measured_us": 215.14208984375,
+    "measured_rank0_us": 215.84228515625,
+    "exposed_us": 211.8189697265625,
+    "exposed_gap_us": 211.8189697265625,
+    "measured_max_us": 218.9775390625,
+    "t_sol_us": 0.0,
+    "t_ach_us": 0.0,
+    "derate": null,
+    "gap_us": 215.14208984375,
+    "calls": 92,
+    "kernels": {
+     "_prepare_megamoe_inputs_kernel": 215.6
+    }
+   },
+   {
+    "group": "MOE.topk",
+    "op_ids": [
+     "MOE.topk"
+    ],
+    "measured_us": 411.7822265625,
+    "measured_rank0_us": 412.35107421875,
+    "exposed_us": 206.0411376953125,
+    "exposed_gap_us": 205.74037176966334,
+    "measured_max_us": 415.07470703125,
+    "t_sol_us": 0.3007659256491687,
+    "t_ach_us": 0.3007659256491687,
+    "derate": 1369.1119619807841,
+    "gap_us": 411.48146063685084,
+    "calls": 92,
+    "kernels": {
+     "int,": 412.4
+    }
+   },
+   {
+    "group": "DSA.o_proj",
+    "op_ids": [
+     "DSA.o_proj"
+    ],
+    "measured_us": 273.458740234375,
+    "measured_rank0_us": 274.115234375,
+    "exposed_us": 273.458740234375,
+    "exposed_gap_us": 180.79334994396405,
+    "measured_max_us": 285.41064453125,
+    "t_sol_us": 84.55716863999999,
+    "t_ach_us": 92.66539029041095,
+    "derate": 2.9510342467383164,
+    "gap_us": 180.79334994396405,
+    "calls": 24,
+    "kernels": {
+     "nvjet_sm107_tst_176x128_64x11_2x2_2cta_h_bz_TNN": 277.5
+    }
+   },
+   {
+    "group": "COMM.SP_AG",
+    "op_ids": [
+     "COMM.P2.kda",
+     "COMM.P2.dsa"
+    ],
+    "measured_us": 619.05859375,
+    "measured_rank0_us": 610.1484375,
+    "exposed_us": 619.05859375,
+    "exposed_gap_us": 90.52297775000011,
+    "measured_max_us": 653.88720703125,
+    "t_sol_us": 443.7464,
+    "t_ach_us": 528.5356159999999,
+    "derate": 1.1712712918669235,
+    "gap_us": 90.52297775000011,
+    "calls": 93,
+    "kernels": {
+     "sd:commonsp_commSpAllGather": 610.1
+    }
+   },
+   {
+    "group": "DSA.prologue",
+    "op_ids": [
+     "DSA.prologue"
+    ],
+    "measured_us": 165.123291015625,
+    "measured_rank0_us": 167.294921875,
+    "exposed_us": 82.5616455078125,
+    "exposed_gap_us": 77.72545557975495,
+    "measured_max_us": 170.84814453125,
+    "t_sol_us": 3.0555927272727272,
+    "t_ach_us": 4.8361899280575535,
+    "derate": 34.14326018456154,
+    "gap_us": 160.28710108756744,
+    "calls": 24,
+    "kernels": {
+     "sd:dsaindexDsaIndex": 167.3
+    }
+   },
+   {
+    "group": "DSA.w_uv",
+    "op_ids": [
+     "DSA.w_uv",
+     "DSA.gate_mul"
+    ],
+    "measured_us": 167.024169921875,
+    "measured_rank0_us": 164.86376953125,
+    "exposed_us": 167.024169921875,
+    "exposed_gap_us": 76.50817518398176,
+    "measured_max_us": 168.193359375,
+    "t_sol_us": 57.51979744292919,
+    "t_ach_us": 90.51599473789324,
+    "derate": 1.8452448145272684,
+    "gap_us": 76.50817518398176,
+    "calls": 24,
+    "kernels": {
+     "nvjet_sm107_tst_192x160_64x7_1x1_h_bz_TNT": 167.1
+    }
+   },
+   {
+    "group": "DENSE",
+    "op_ids": [
+     "DENSE.gate_up",
+     "DENSE.act",
+     "DENSE.down"
+    ],
+    "measured_us": 138.016845703125,
+    "measured_rank0_us": 134.0810546875,
+    "exposed_us": 138.016845703125,
+    "exposed_gap_us": 31.882466804880607,
+    "measured_max_us": 141.47265625,
+    "t_sol_us": 67.14842051498735,
+    "t_ach_us": 106.13437889824439,
+    "derate": 1.3003971675892851,
+    "gap_us": 31.882466804880607,
+    "calls": 4,
+    "kernels": {
+     "nvjet_sm107_tst_192x192_64x8_2x1_2cta_v_bz_TNT": 79.4,
+     "(anonymous namespace)::situ_and_mul_vec8_kernel(unsigned sho": 5.4,
+     "nvjet_sm107_tst_192x160_64x9_2x1_2cta_h_bz_splitK_TNT": 47.3,
+     "__nv_bfloat16,": 4.5
+    }
+   },
+   {
+    "group": "OTHER",
+    "op_ids": [],
+    "measured_us": 9.264404296875,
+    "measured_rank0_us": 9.47216796875,
+    "exposed_us": 9.264404296875,
+    "exposed_gap_us": 9.264404296875,
+    "measured_max_us": 9.50439453125,
+    "t_sol_us": 0.0,
+    "t_ach_us": 0.0,
+    "derate": null,
+    "gap_us": 9.264404296875,
+    "calls": 5,
+    "kernels": {
+     "fa": 9.4
+    }
+   },
+   {
+    "group": "EMBED",
+    "op_ids": [
+     "G.embed"
+    ],
+    "measured_us": 3.6640625,
+    "measured_rank0_us": 3.583984375,
+    "exposed_us": 3.6640625,
+    "exposed_gap_us": 3.499020773381295,
+    "measured_max_us": 4.19189453125,
+    "t_sol_us": 0.10427636363636363,
+    "t_ach_us": 0.16504172661870503,
+    "derate": 22.200825058411215,
+    "gap_us": 3.499020773381295,
+    "calls": 1,
+    "kernels": {
+     "uint4>": 4.8
+    }
+   },
+   {
+    "group": "WAIT",
+    "op_ids": [],
+    "measured_us": 675.587890625,
+    "measured_rank0_us": 726.33740234375,
+    "exposed_us": 0.224365234375,
+    "exposed_gap_us": 0.224365234375,
+    "measured_max_us": 817.4736328125,
+    "t_sol_us": 0.0,
+    "t_ach_us": 0.0,
+    "derate": null,
+    "gap_us": 675.587890625,
+    "calls": 24,
+    "kernels": {
+     "sd:dsaoverlapQueryWait": 709.3
+    }
+   }
+  ]
+ }
+}

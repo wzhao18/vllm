@@ -105,6 +105,8 @@ POINTS = (
     ("C128-1P1D", "c128-1p1d", "spx"),
     ("C160-1P1D-llh", "c160-1p1d-llh", "xdr"),
     ("C512", "c512", "spx"),
+    # next-round experiment (results/k31vr-release-draft-sweep-20261117 projections): the frozen C224 2P1D render
+    ("C224-2P1D", "c224", "xdr"),
 )
 FABRICS = ("xdr", "spx")
 KINDS = ("agentx", "gsm8k")

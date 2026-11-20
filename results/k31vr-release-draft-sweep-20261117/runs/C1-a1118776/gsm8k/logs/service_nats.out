@@ -1,0 +1,29 @@
+[700761] 2026/11/17 09:36:30.937753 [INF] Starting nats-server
+[700761] 2026/11/17 09:36:30.937900 [INF]   Version:  2.10.28
+[700761] 2026/11/17 09:36:30.937904 [INF]   Git:      [e0b99bd]
+[700761] 2026/11/17 09:36:30.937905 [INF]   Name:     NCK6OXESHDMTKXO4CWF2NNES6SAUF7P3KIXJEYTJ5GYSGKDNPRNG6BLS
+[700761] 2026/11/17 09:36:30.937912 [INF]   Node:     kFSbyC39
+[700761] 2026/11/17 09:36:30.937914 [INF]   ID:       NCK6OXESHDMTKXO4CWF2NNES6SAUF7P3KIXJEYTJ5GYSGKDNPRNG6BLS
+[700761] 2026/11/17 09:36:30.937927 [INF] Using configuration file: /tmp/nats.conf
+[700761] 2026/11/17 09:36:30.937946 [WRN] Maximum payloads over 8.00 MB are generally discouraged and could lead to poor performance
+[700761] 2026/11/17 09:36:30.938536 [INF] Starting JetStream
+[700761] 2026/11/17 09:36:30.938704 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[700761] 2026/11/17 09:36:30.938718 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[700761] 2026/11/17 09:36:30.938721 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[700761] 2026/11/17 09:36:30.938722 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[700761] 2026/11/17 09:36:30.938722 [INF] 
+[700761] 2026/11/17 09:36:30.938723 [INF]          https://docs.nats.io/jetstream
+[700761] 2026/11/17 09:36:30.938724 [INF] 
+[700761] 2026/11/17 09:36:30.938725 [INF] ---------------- JETSTREAM ----------------
+[700761] 2026/11/17 09:36:30.938726 [INF]   Max Memory:      1.05 TB
+[700761] 2026/11/17 09:36:30.938728 [INF]   Max Storage:     536.25 GB
+[700761] 2026/11/17 09:36:30.938730 [INF]   Store Directory: "/tmp/nats/jetstream"
+[700761] 2026/11/17 09:36:30.938731 [INF] -------------------------------------------
+[700761] 2026/11/17 09:36:30.939610 [INF] Listening for client connections on 0.0.0.0:4222
+[700761] 2026/11/17 09:36:30.941376 [INF] Server is ready
+[2026-11-17T09:57:56.875] error: *** STEP 1118776.264 ON hecate0243 CANCELLED AT 2026-11-17T09:57:56 DUE to SIGNAL Terminated ***
+[700761] 2026/11/17 09:57:56.880062 [INF] Trapped "terminated" signal
+[700761] 2026/11/17 09:57:56.897310 [INF] Initiating Shutdown...
+[700761] 2026/11/17 09:57:56.897331 [INF] Initiating JetStream Shutdown...
+[700761] 2026/11/17 09:57:56.898209 [INF] JetStream Shutdown
+[700761] 2026/11/17 09:57:56.899206 [INF] Server Exiting..
