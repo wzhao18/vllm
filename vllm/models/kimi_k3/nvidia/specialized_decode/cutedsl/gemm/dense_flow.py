@@ -110,6 +110,8 @@ H_BULK = 128  # h tile staged in shared memory, one bulk store per token row (A/
 ROLLED = 256  # F1: SiTU finish as a rolled loop (one tanhf call site; whole-block ranges)
 WHOLE = 1024  # host: whole gate_up blocks per SM (flow_tables(whole=True))
 NO_EARLY_PDL = 512
+NO_PREWAIT = 2048  # A/B: first ring issued after the dependency wait
+OLD_FENCE = 4096  # A/B: fence.acq_rel.gpu before every ready / partial flag
 
 
 @asm(Int32)
@@ -179,6 +181,13 @@ def _ld_u64(address):
 @asm(Int32)
 def _lds_acquire(address):
     return "ld.acquire.cta.shared::cta.b32 $0, [$1];", "=r,r,~{memory}", (Int32(address),)
+
+
+def die_blocks(nb, s1):
+    """Blocks homed on die 0 of ``nb``: half (each die streams its own HBM at the same
+    rate whatever its SM count; an SM-proportional split leaves the die with more SMs
+    streaming more bytes for the whole kernel)."""
+    return nb // 2 if s1 else nb
 
 
 def supports(rows, hidden, inter):
@@ -468,11 +477,41 @@ class DenseFlow:
 
         if (warp < 4) & (warp != 2):  # TMA: stage g issued by producer g % PRODUCERS
             me = cutlass.min(warp, 2)
+            # The first ring of gate_up weight tiles depends on nothing: issued before
+            # the dependency wait (x tiles after it), so a CTA resident under its
+            # predecessor starts with a full ring.
+            npre = Int32(0)
+            if cutlass.const_expr(not (self.debug & NO_PREWAIT)):
+                npre = cutlass.min(Int32(stages), uA1 - uA0)
+            n1 = te - uA0
+            n2 = uA1 - hlo
+            for g in cutlass.range(npre, unroll=1):
+                if g % PRODUCERS == me:
+                    up = te + g - n1 - n2
+                    if g < n1:
+                        up = uA0 + g
+                    elif g < n1 + n2:
+                        up = hlo + g - n1
+                    bp_ = up // ktA
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(full + g, self.tx_bytes)
+                    cute.copy(tma_a, tAgWa[(None, bbA + bp_, up - bp_ * ktA, 0)],
+                              tAsA[(None, g)], tma_bar_ptr=full + g)  # fmt: skip
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.debug & ds.STAMPS):
                 if warp == 0:
                     with cute.arch.elect_one():
                         self.stamp(sync, slot, 15)
+            for g in cutlass.range(npre, unroll=1):
+                if g % PRODUCERS == me:
+                    up = te + g - n1 - n2
+                    if g < n1:
+                        up = uA0 + g
+                    elif g < n1 + n2:
+                        up = hlo + g - n1
+                    cute.copy(tma_xa, tBgX[(None, 0, up - (up // ktA) * ktA, 0)],
+                              tBsB[(None, g)], tma_bar_ptr=full + g)  # fmt: skip
+            gi = Int32(0)
             turn = Int32(0)
             s = Int32(0)
             phase = Int32(1)
@@ -483,7 +522,7 @@ class DenseFlow:
                     kb1 = cutlass.min(ktA, ahi - b * ktA)
                     gb = bbA + b
                     for kb in cutlass.range(u - b * ktA, kb1, unroll=1):
-                        if turn == me:
+                        if (turn == me) & (gi >= npre):
                             cute.arch.mbarrier_wait(empty + s, phase)
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive_and_expect_tx(full + s,
@@ -492,6 +531,7 @@ class DenseFlow:
                                       tma_bar_ptr=full + s)  # fmt: skip
                             cute.copy(tma_xa, tBgX[(None, 0, kb, 0)], tBsB[(None, s)],
                                       tma_bar_ptr=full + s)  # fmt: skip
+                        gi += 1
                         turn += 1
                         if turn == PRODUCERS:
                             turn = Int32(0)
@@ -733,9 +773,10 @@ class DenseFlow:
                     for j in cutlass.range_constexpr(CHUNK // 4):
                         _st_v4(row + j * 16, v[4 * j], v[4 * j + 1], v[4 * j + 2],
                                v[4 * j + 3])  # fmt: skip
-            self.gbar(grp)
+            self.gbar(grp)  # every thread's stores before the release (cumulative)
             if tid == 0:
-                _fence_gpu()
+                if cutlass.const_expr(self.debug & OLD_FENCE):
+                    _fence_gpu()
                 _st_release(flags + Int64(slot) * 4, 1)
         else:  # the head: own accumulator + the later ranges' partials, in slot order
             last = r
@@ -801,7 +842,7 @@ class DenseFlow:
                 for p in cutlass.range(r + 1, last + 1, unroll=1):
                     _st_relaxed(flags + Int64(slot_base + p) * 4, 0)
                 if cutlass.const_expr(ph == 0):  # the h block is complete
-                    if cutlass.const_expr(not (self.debug & NO_FENCE)):
+                    if cutlass.const_expr(self.debug & OLD_FENCE):
                         _fence_gpu()
                     _st_release(sync + (READY + Int64(gb)) * 4, epoch + 1)
 

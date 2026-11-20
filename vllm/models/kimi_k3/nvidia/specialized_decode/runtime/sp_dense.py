@@ -129,8 +129,8 @@ class SpDenseMlp:
             raise Unsupported("dense", None, f"layer {index}: {hidden} x {inter}")
         self.domains, self.s0, self.s1 = die_map(device)
         two = self.s1 > 0
-        nbA0 = dsm.split_blocks(inter // 64, self.s0, self.s1)
-        nbB0 = dsm.split_blocks(hidden // 128, self.s0, self.s1)
+        nbA0 = dfl.die_blocks(inter // 64, self.s1)
+        nbB0 = dfl.die_blocks(hidden // 128, self.s1)
         if two:  # a gate_up block's gate and up rows (64 each) and its down rows per die
             placed = place_rows(gate_up, lambda row: int((row % inter) // 64 >= nbA0))
             placed &= place_rows(down, lambda row: int(row // 128 >= nbB0))

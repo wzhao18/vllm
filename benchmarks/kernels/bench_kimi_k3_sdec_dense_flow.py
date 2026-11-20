@@ -108,6 +108,7 @@ def main():
     ap.add_argument("--no-stock", action="store_true")
     ap.add_argument("--one-die", action="store_true")
     ap.add_argument("--env", nargs="+", default=["none"])
+    ap.add_argument("--split", default="equal", choices=["equal", "sm"])
     args = ap.parse_args()
 
     import cutlass
@@ -127,8 +128,12 @@ def main():
     if args.one_die:
         doms = tuple(0 if d >= 0 else -1 for d in doms)
     s0, s1 = doms.count(0), doms.count(1)
-    nbA0 = dsm.split_blocks(I // 64, s0, s1)
-    nbB0 = dsm.split_blocks(H // 128, s0, s1)
+    if args.split == "sm":
+        nbA0 = dsm.split_blocks(I // 64, s0, s1)
+        nbB0 = dsm.split_blocks(H // 128, s0, s1)
+    else:
+        nbA0 = dfl.die_blocks(I // 64, s1)
+        nbB0 = dfl.die_blocks(H // 128, s1)
     print(f"SMs {len(doms)}: die0 {s0} die1 {s1}; die-0 blocks A {nbA0} of {I // 64}, "
           f"B {nbB0} of {H // 128}", flush=True)  # fmt: skip
     if s1:
@@ -230,6 +235,23 @@ def main():
                             txt.append(f"{nm} {v.min():.1f}/{v.median():.1f}/{v.max():.1f}")
                         print(f"T{T} d{debug} {name} stamps: " + "  ".join(txt), flush=True)
                         tab0 = tab[0].cpu()
+                        grp = {}
+                        for sl in range(s0 + s1):
+                            sm = int(stp[sl, 8])
+                            row = tab0[sm].tolist()
+                            ua = row[2] - row[1]
+                            units = ua + row[4] - row[3]
+                            span = (stp[sl, 1] - tt[sl, 0]) / 1e3
+                            key = (int(sl >= s0), ua // op.ktA)
+                            grp.setdefault(key, []).append(
+                                (units * 16384 / span / 1e3, (stp[sl, 1] - t0s) / 1e3))
+                        for key, vals in sorted(grp.items()):
+                            rt = torch.tensor([v[0] for v in vals])
+                            me = torch.tensor([v[1] for v in vals])
+                            print(f"   die {key[0]} {key[1]}-block SMs {len(vals)}: W GB/s/SM "
+                                  f"{rt.min():.0f}/{rt.median():.0f}/{rt.max():.0f} mma_end "
+                                  f"{me.min():.1f}/{me.median():.1f}/{me.max():.1f}",
+                                  flush=True)  # fmt: skip
                         for sl in (stp[:, 6] - t0s).argsort(descending=True)[:3].tolist():
                             sm = int(stp[sl, 8])
                             row = tab0[sm].tolist()[:5]
