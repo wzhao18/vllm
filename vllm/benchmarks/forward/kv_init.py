@@ -106,7 +106,11 @@ def _fill_random(v: torch.Tensor, name: str, mamba: bool, gen) -> None:
         v.copy_(torch.randn(v.shape, generator=gen, device=v.device).to(v.dtype))
         return
     assert v.dtype == torch.uint8, (name, v.dtype)
-    assert v.is_contiguous(), (name, v.shape, v.stride())
+    if not v.is_contiguous():
+        # Block stride wider than a block (shared allocation): fill per block.
+        for i in range(v.shape[0]):
+            _fill_random(v[i : i + 1], name, mamba, gen)
+        return
     blk = v.view(v.shape[0], -1)
     nbytes = blk.shape[1]
     if nbytes % 68 == 0 and "indexer" in name:
