@@ -252,7 +252,7 @@ STAMP_BYTES = 128  # %globaltimer stamps per CTA after the split flags (see ``ke
 SENTINEL = -1  # an unwritten exchange slot (FP32 bits no BF16 product sums to)
 
 
-def _rings(rows, wstages=None):
+def _rings(rows, wstages=None, budget=None):
     """(weight stages, activation stages, ring bytes): separate rings, the weight
     ring as deep as the activation ring (>= min(4, weight stages)) leaves room for,
     so most of a split's weights are staged before the PDL wait. ``wstages`` caps
@@ -260,13 +260,14 @@ def _rings(rows, wstages=None):
     n_mma, chunks = mma_columns(rows)
     a_bytes = 128 * K_TILE * 2
     b_bytes = chunks * (n_mma // 2) * K_TILE * 2
-    budget = utils.get_smem_capacity_in_bytes("sm_100") - 4096
+    default = utils.get_smem_capacity_in_bytes("sm_100") - 4096
+    budget = budget or default
     if wstages is not None:
         acts = min(16, (budget - wstages * a_bytes) // b_bytes)
         if acts < 2:
             raise ValueError(f"wide GEMM: {wstages} weight stages leave no activation ring")
         return wstages, acts, wstages * a_bytes + acts * b_bytes
-    for ws in range(12, 1, -1):
+    for ws in range(12 if budget <= default else 16, 1, -1):
         acts = min(ws, (budget - ws * a_bytes) // b_bytes)
         if acts >= min(4, ws):
             return ws, acts, ws * a_bytes + acts * b_bytes
@@ -306,7 +307,7 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False, tpcs=0):  # fmt: skip
+                 partials=False, tpcs=0, smem=None):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
         # ``tpcs`` > 0: die-static work. One CTA pair per TPC (every SM); each pair
         # reads its (tile, split) from the table after the split flags (``table_at``,
@@ -331,7 +332,9 @@ class WideGemm:
         self.n_mma, self.chunks = mma_columns(rows)
         self.mma_tiler = (256, self.n_mma, K_TILE)
         self.threads = 256  # warps: 0+3 weights, 1 activations, 2 MMA, 4-7 epilogue
-        self.wstages, self.astages, _ = _rings(rows, wstages)
+        # smem: ring budget in KiB (Rubin's oversized mode, up to 320), None = default.
+        self.budget = smem * 1024 - 4096 if smem else None
+        self.wstages, self.astages, _ = _rings(rows, wstages, self.budget)
         self.maxreg = -(-rows // split)  # tokens per owner (largest region)
         self.uneven = rows % split != 0
         self.tmem_cols = 32
@@ -977,8 +980,10 @@ class PreparedWide:
         self.policies = {}
         for r, v in dict(policies).items():
             v = (v,) if isinstance(v, int) else tuple(v)
-            v += ((1,), None, (0, 3), False, False)[len(v) - 1:]
-            self.policies[r] = (v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]))
+            v += ((1,), None, (0, 3), False, False, None)[len(v) - 1:]
+            self.policies[r] = (
+                v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), v[6]
+            )  # fmt: skip
         self.kernels, self.state = {}, {}
 
     def prepare(self):
@@ -990,10 +995,12 @@ class PreparedWide:
             self.weight = die_place(self.weight, t0)
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
-        for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
+        for rows, policy in self.policies.items():
+            split, act_warps, wst, w_warps, direct, rotate, smem = policy
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
                 w_warps, direct, rotate, self.partials, len(tpc_die) if self.dies else 0,
+                smem,
             )  # fmt: skip
             n_pad = gemm.n_pad
             if n_pad // 128 * split > sms:  # the splits spin on each other: one wave
