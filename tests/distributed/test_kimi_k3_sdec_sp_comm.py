@@ -309,6 +309,7 @@ def _mx_worker(env: dict[str, str]) -> None:
             (wqs[rank].data, wqs[rank].scale), MX_ROWS, family="o_proj",
             tactics=dict.fromkeys(MX_ROWS, "scaled_mm"),
         )  # fmt: skip
+        sp.SP_OPROJ_MX[world] = "257-384:mx_push"  # (the test's own seam, not the tuned table)
         oproj = sp.SpOproj(projection, comm, MX_ROWS, ctx)
         tactics = {r: oproj.choice(r).tactic for r in MX_ROWS}
         assert tactics[324] == tactics[384] == "mx_push", tactics
