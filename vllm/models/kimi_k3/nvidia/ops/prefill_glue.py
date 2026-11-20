@@ -388,88 +388,107 @@ __global__ void __launch_bounds__(128)
   }
 }
 
-// The same replay with one row per 4-warp CTA (real warp r replays stock
-// warps r * NW / 4 ..): wide rows on many tokens, where one row per warp
+// The same replay with one row per 4-warp CTA at a time (real warp r replays
+// stock warps r * NW / 4 ..): wide rows on many tokens, where one row per warp
 // leaves a partial second wave of rows (16384 rows on 212 x 64 warps).
+// Persistent CTAs (one resident wave) walk rows with a stride of gridDim.x and
+// load the next row before reducing / writing the current one, so HBM reads
+// stay in flight across the reduction and the __syncthreads (one row per CTA
+// without prefetch streamed ~6 TB/s). Per row the arithmetic and reduction
+// order are unchanged (bitwise).
 template <int NW, int VPT>
 __global__ void __launch_bounds__(128)
     rms_norm_cta_kernel(uint16_t* __restrict__ out,
                         const uint16_t* __restrict__ input, int64_t in_stride,
                         const uint16_t* __restrict__ weight, float epsilon,
-                        int32_t hidden_size) {
+                        int32_t hidden_size, int64_t num_rows) {
   static_assert(NW % 4 == 0, "4 real warps replay NW stock warps");
   constexpr int B = NW * 32;
   constexpr int PW = NW / 4;  // stock warps per real warp
   __shared__ float s_part[NW];
   int32_t const lane = threadIdx.x & 31;
   int32_t const rw = threadIdx.x >> 5;
-  int64_t const row = blockIdx.x;
   int32_t const num_vec = hidden_size / 8;
-  const uint4* v_in = reinterpret_cast<const uint4*>(input + row * in_stride);
 
   uint4 data[PW][VPT];
+  auto load_row = [&](int64_t r, uint4 (&dst)[PW][VPT]) {
+    const uint4* v_in = reinterpret_cast<const uint4*>(input + r * in_stride);
 #pragma unroll
-  for (int p = 0; p < PW; ++p) {
-    int const w = rw * PW + p;
+    for (int p = 0; p < PW; ++p) {
+      int const w = rw * PW + p;
 #pragma unroll
-    for (int t = 0; t < VPT; ++t) {
-      int32_t const i = lane + 32 * w + B * t;
-      if (i < num_vec) data[p][t] = v_in[i];
-    }
-  }
-#pragma unroll
-  for (int p = 0; p < PW; ++p) {
-    int const w = rw * PW + p;
-    float variance = 0.0f;
-#pragma unroll
-    for (int t = 0; t < VPT; ++t) {
-      int32_t const i = lane + 32 * w + B * t;
-      if (i < num_vec) {
-        const uint16_t* h = reinterpret_cast<const uint16_t*>(&data[p][t]);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          float x = bf16_bits_to_float(h[j]);
-          variance += x * x;
-        }
+      for (int t = 0; t < VPT; ++t) {
+        int32_t const i = lane + 32 * w + B * t;
+        if (i < num_vec) dst[p][t] = v_in[i];
       }
     }
-    float s = variance;
+  };
+  int64_t row = blockIdx.x;
+  if (row < num_rows) load_row(row, data);
+  for (; row < num_rows; row += gridDim.x) {
+    uint4 ndata[PW][VPT];
+    int64_t const nrow = row + gridDim.x;
+    if (nrow < num_rows) load_row(nrow, ndata);
 #pragma unroll
-    for (int off = 1; off < 32; off <<= 1) {
-      float o = __shfl_down_sync(kFull, s, off);
-      if (lane + off < 32) s = o + s;
+    for (int p = 0; p < PW; ++p) {
+      int const w = rw * PW + p;
+      float variance = 0.0f;
+#pragma unroll
+      for (int t = 0; t < VPT; ++t) {
+        int32_t const i = lane + 32 * w + B * t;
+        if (i < num_vec) {
+          const uint16_t* h = reinterpret_cast<const uint16_t*>(&data[p][t]);
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            float x = bf16_bits_to_float(h[j]);
+            variance += x * x;
+          }
+        }
+      }
+      float s = variance;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        float o = __shfl_down_sync(kFull, s, off);
+        if (lane + off < 32) s = o + s;
+      }
+      if (lane == 0) s_part[w] = s;
     }
-    if (lane == 0) s_part[w] = s;
-  }
-  __syncthreads();
-  float total = s_part[0];
+    __syncthreads();
+    float total = s_part[0];
 #pragma unroll
-  for (int w = 1; w < NW; ++w) total = total + s_part[w];
-  float const s_variance = rsqrtf(total / hidden_size + epsilon);
+    for (int w = 1; w < NW; ++w) total = total + s_part[w];
+    float const s_variance = rsqrtf(total / hidden_size + epsilon);
+    // s_part is rewritten by the next row's reduction.
+    __syncthreads();
 
-  const uint4* v_w = reinterpret_cast<const uint4*>(weight);
-  uint4* v_out = reinterpret_cast<uint4*>(out + row * hidden_size);
+    const uint4* v_w = reinterpret_cast<const uint4*>(weight);
+    uint4* v_out = reinterpret_cast<uint4*>(out + row * hidden_size);
 #pragma unroll
-  for (int p = 0; p < PW; ++p) {
-    int const w = rw * PW + p;
+    for (int p = 0; p < PW; ++p) {
+      int const w = rw * PW + p;
 #pragma unroll
-    for (int t = 0; t < VPT; ++t) {
-      int32_t const i = lane + 32 * w + B * t;
-      if (i < num_vec) {
-        uint4 wr = __ldg(v_w + i);
-        const uint16_t* h = reinterpret_cast<const uint16_t*>(&data[p][t]);
-        const uint16_t* wh = reinterpret_cast<const uint16_t*>(&wr);
-        uint4 o;
-        uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
+      for (int t = 0; t < VPT; ++t) {
+        int32_t const i = lane + 32 * w + B * t;
+        if (i < num_vec) {
+          uint4 wr = __ldg(v_w + i);
+          const uint16_t* h = reinterpret_cast<const uint16_t*>(&data[p][t]);
+          const uint16_t* wh = reinterpret_cast<const uint16_t*>(&wr);
+          uint4 o;
+          uint16_t* oh = reinterpret_cast<uint16_t*>(&o);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          float x = bf16_bits_to_float(h[j]);
-          float wv = bf16_bits_to_float(wh[j]);
-          oh[j] = c10::BFloat16(x * s_variance * wv).x;
+          for (int j = 0; j < 8; ++j) {
+            float x = bf16_bits_to_float(h[j]);
+            float wv = bf16_bits_to_float(wh[j]);
+            oh[j] = c10::BFloat16(x * s_variance * wv).x;
+          }
+          v_out[i] = o;
         }
-        v_out[i] = o;
       }
     }
+#pragma unroll
+    for (int p = 0; p < PW; ++p)
+#pragma unroll
+      for (int t = 0; t < VPT; ++t) data[p][t] = ndata[p][t];
   }
 }
 
@@ -818,11 +837,18 @@ void rms_norm_rows(torch::Tensor& out, const torch::Tensor& input,
       reinterpret_cast<const uint16_t*>(weight.data_ptr()), (float)epsilon, \
       (int32_t)n, (int32_t)h)
   if (nw == 8 && vpt == 2 && n >= kRmsCtaMinRows) {
-    rms_norm_cta_kernel<8, 2><<<(unsigned)n, 128, 0, stream>>>(
+    static int occ = 0;
+    if (occ == 0)
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, rms_norm_cta_kernel<8, 2>,
+                                                    128, 0);
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, input.get_device());
+    const int64_t ctas = std::min<int64_t>(n, (int64_t)sms * std::max(occ, 1));
+    rms_norm_cta_kernel<8, 2><<<(unsigned)ctas, 128, 0, stream>>>(
         reinterpret_cast<uint16_t*>(out.data_ptr()),
         reinterpret_cast<const uint16_t*>(input.data_ptr()), input.stride(0),
         reinterpret_cast<const uint16_t*>(weight.data_ptr()), (float)epsilon,
-        (int32_t)h);
+        (int32_t)h, (int64_t)n);
   } else if (nw == 2 && vpt == 1) {
     K3_RMS_LAUNCH(2, 1);
   } else if (nw == 4 && vpt == 1) {
