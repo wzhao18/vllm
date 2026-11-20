@@ -30,6 +30,34 @@ _EXT = None
 
 _COARSE_WORDS = 20
 _FINE_WORDS = 8
+_SPDIAG: dict = {}  # DIAG (not for landing): per device (device counters, pinned host copy)
+
+
+def _spdiag(dev):
+    """DIAG: device class counters of topk_sp; the grid's last CTA copies them into pinned host
+    memory (address in counters[20:22]), which a daemon thread prints (SPSTAT lines) without
+    any CUDA call (a cross-thread CUDA call during a graph capture invalidates the capture)."""
+    e = _SPDIAG.get(dev)
+    if e is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        import sys
+        import threading
+        import time
+
+        host = torch.zeros(20, dtype=torch.int32, pin_memory=True)
+        dst = torch.zeros(24, dtype=torch.int32, device=dev)
+        dst[20:22].copy_(torch.tensor([host.data_ptr()], dtype=torch.int64).view(torch.int32))
+        e = _SPDIAG[dev] = (dst, host)
+
+        def dump():
+            t0 = time.time()
+            while True:
+                time.sleep(15)
+                print(f"SPSTAT t={time.time() - t0:.0f} dev={dev} {host.tolist()}", file=sys.stderr, flush=True)
+
+        threading.Thread(target=dump, daemon=True).start()
+    return e[0]
 _TIE_LIST = 64  # kTieList
 _TIE_WORDS = 32  # kTieWords
 
@@ -383,6 +411,8 @@ class DcpExchange:
         [rows * 64] per-row phase stamps. Launches must stay stream-ordered.
         single_path: csrc/topk_sp.cuh (rows of at most ``sp_max_local`` positions; the
         same output, one kernel; stats 1 one round, 2 id radix, 3 key radix)."""
+        if stats is None and single_path:  # DIAG (not for landing)
+            stats = _spdiag(logits.device)
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,

@@ -227,7 +227,7 @@ def main():
                 dist.all_reduce(m)
                 mism = int(m)
             # path counters + phase stamps (eager, one call)
-            stats = torch.zeros(16, dtype=torch.int32, device=dev)
+            stats = torch.zeros(24, dtype=torch.int32, device=dev)
             dbg = torch.zeros(T * 64, dtype=torch.int64, device=dev)
             phmap = PHASES_SP if a.impl == "sp" else PHASES_V2 if a.impl == "v2" else PHASES
             dist.barrier()
@@ -321,7 +321,7 @@ def main():
                         kern[nm[:60]] = (round(ev.self_device_time_total / max(n, 1), 2), n)
             torch.cuda.synchronize()
             ex.check()
-            st = torch.zeros(16, dtype=torch.int32, device=dev)
+            st = torch.zeros(24, dtype=torch.int32, device=dev)
             st.copy_(stats)
             dist.all_reduce(st)
             r = dict(B=B, T=T, case=case, cluster=cluster, segmax=segmax, max_local=max_local,
