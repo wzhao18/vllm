@@ -17,5 +17,5 @@ $NCU -i $OUT.ncu-repz --page source --csv --print-source cuda > $OUT.cuda.csv 2>
 $NCU -i $OUT.ncu-repz --page source --csv --print-source sass > $OUT.sass.csv 2>&1
 $NCU -i $OUT.ncu-repz --page details --csv > $OUT.details.csv 2>&1
 ls -la $OUT.* | awk '{print $5, $9}'
-python3 -u benchmarks/kimi_k3/kda_dev/ncu_agg.py $OUT $RANGES 2>&1 | head -120
+$NCU -i $OUT.ncu-repz --page source --csv --print-source cuda,sass > $OUT.cs.csv 2>&1; python3 -u benchmarks/kimi_k3/kda_dev/ncu_agg.py $OUT.cs.csv $RANGES 30 2>&1 | head -60
 echo "NCU $TAG done $(date +%T)"
