@@ -72,7 +72,7 @@ ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-95:64.96.2.5,96:wide"}
 # partials [split, n, N] that route_stage sums in split order. Policy: (split,
 # activation warps, weight stages, weight warps, direct, rotate, smem KiB, K tile,
 # dies, prewait): 11 weight + 4 activation stages = 200 KiB, beside 4 RED CTAs.
-WIDE_FRONT = {96: (5, (1,), 11, (0, 3), False, True, 204, 64, False, None)}
+WIDE_FRONT = {96: (5, (1,), None, (0, 3), False, True, 320, 64, False, None)}
 # Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
 # PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
 # slice, split-K front vs prewait (fastab xy1/xy2/x96, Rhea): n32 split-K faster
