@@ -146,10 +146,16 @@ def lane_owns_scale():
 @cute.jit
 def publish(values, data_mc, scale_mc, row, col, width: cutlass.Constexpr[int]):
     """Multicast this lane's 8 columns of MXFP8 ``row`` (columns col..col + 7) into
-    every rank's box: data at ``data_mc`` [rows, width] FP8, scales at ``scale_mc``."""
+    every rank's box: data at ``data_mc`` [rows, width] FP8, scales at ``scale_mc``.
+    Even lanes store their own and the next lane's 8 columns as one 16-byte multimem
+    store (NVLink multicast ingress ~1.05 TB/s with 16 B stores vs ~0.6-0.7 with 8 B,
+    hwdb hw49 / D-ATTNRES E1). Warp-collective."""
     w0, w1, word = quantize8(values)
-    offset = Int64(row) * width + col
-    multicast_words(data_mc + offset, (w0, w1))
+    n0 = cute.arch.shuffle_sync_bfly(w0, 1)
+    n1 = cute.arch.shuffle_sync_bfly(w1, 1)
+    if (cute.arch.lane_idx() & 1) == 0:
+        offset = Int64(row) * width + col
+        multicast_words(data_mc + offset, (w0, w1, n0, n1))
     if lane_owns_scale():
         where = scale_offset(row, col // BLOCK, width // BLOCK)
         multicast_words(scale_mc + where, (word,))
