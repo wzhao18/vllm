@@ -97,7 +97,13 @@ SP_LOCAL_QUERY = "65-:local"
 # 384 rows 31.1 vs 34.0; trtllm-gen at 256 rows (29.2 vs 27.4). In-step (D3-32 slice,
 # 3 runs each, dattn-kmg/kmh) km wins at 384 rows (step -14 us) but not at 128 rows
 # (step +19 us although the DSA family drops 15 us), so km runs from 320 rows.
-SP_KERNELS = "320-:km"
+# The latent-Q-in-TMEM kernel ("ts", dsa.sparse_mla_ts: the prefill TS form with the
+# trtllm-gen arithmetic) at every row count: VR200 1 GPU, CUDA graphs, cold L2, us at
+# 128 / 256 / 384 rows: ts 16.0 / 28.8 / 30.1, trtllm-gen 21.5 / 28.2 / 34.9, km
+# 16.0 / 29.2 / 31.5 (runs/D-ATTN/r3 e8). Below 64 rows trtllm-gen splits each row's KV
+# across CTAs (BF16 partials), which an unsplit pass does not reproduce to the BF16
+# rounding of the output, so those rows stay on trtllm-gen.
+SP_KERNELS = "64-:ts"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
