@@ -1549,7 +1549,7 @@ class SwapABGatedActEpilogue(KernelComponent):
                         cur_phase == cutlass.Int32(BlockPhase.Linear2)
                     ):
                         iket.range_push("epilogue.wait_metadata_ready")
-                        wait_ready(routed_ready_flag)
+                        wait_ready(routed_ready_flag, sleep_cycles=600)  # DIAG backoff
                         iket.range_pop()
                         routed_ready = cutlass.Int32(1)
             is_fc1 = cur_phase == cutlass.Int32(BlockPhase.Linear1)
