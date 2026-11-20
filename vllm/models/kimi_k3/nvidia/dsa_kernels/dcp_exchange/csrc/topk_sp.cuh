@@ -540,6 +540,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     if (vtot <= (uint32_t)K) {
       SPSTAT(4);
     } else if (!wok || lo_max >= hi) {
+      SPSTAT(!wok ? 7 : 8);
       lev0 = 0;
       rem = (uint32_t)K;
     } else {
@@ -581,6 +582,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       const int n = __syncthreads_count(pr);
       SPDBG(17);
       if (n == 0 || s_i[6]) {
+        SPSTAT(n == 0 ? 9 : 10);
         lev0 = 0;
         rem = (uint32_t)K;
       } else {
@@ -598,6 +600,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
           }
           SPDBG(18);
           if (!bok) {
+            SPSTAT(11);
             lev0 = 2;
             rem = need;
           } else {
@@ -719,7 +722,9 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       // list path: every selected key is a candidate (tau >= lo >= theta); thread t
       // owns the contiguous list range [cp t, cp t + cp) (position order)
       const bool lsel = !ovf && lev0 < 0 && vtot > (uint32_t)K && tau >= theta;
+      SPSTAT(ovf ? 6 : 5);
       if (lsel) {
+        SPSTAT(12);
         const int cp = (nc + T - 1) / T, i0 = ::min(nc, tid * cp), i1 = ::min(nc, i0 + cp);
         const uint32_t dt = (uint32_t)(tau - theta);
         auto pick = [&](uint32_t x) -> int {  // 1 above tau, 2 selected tie, 0 neither
