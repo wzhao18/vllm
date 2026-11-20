@@ -422,8 +422,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     V2DBG(10);
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
-      // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
-      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+      // its share of q + 512 keys (8-key groups of adjacent tokens correlate: q + 256 left
+      // fewer than q candidates on ~3 of 1M rows, each costing the DCP group the complete body)
+      const uint32_t want = (q + 512u + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
