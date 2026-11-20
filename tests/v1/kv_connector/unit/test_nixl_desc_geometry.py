@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import page_zeroer
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
 )
@@ -936,6 +937,30 @@ def test_hetero_ppl_multi_read_writes_stay_within_request_blocks():
     assert total > 0
 
 
+def _cpu_page_zeroer(worker):
+    """The worker's PageZeroer over this fixture's caches.
+
+    _build_page_zeroer covers device caches only, and the fixture's are CPU
+    tensors standing in for them: build the same table over every attention
+    group's caches.
+    """
+    caches_by_group, flat_page_bytes = {}, {}
+    for g, group in enumerate(worker.kv_cache_config.transfer_groups):
+        if not bw._is_attention_spec(worker._group_spec_types[g]):
+            continue
+        caches_by_group[g] = [worker.device_kv_caches[n] for n in group.layer_names]
+        flat_page_bytes[g] = (
+            group.kv_cache_spec.page_size_bytes
+            // worker._physical_blocks_per_logical_kv_block
+        )
+    return page_zeroer.PageZeroer(caches_by_group, flat_page_bytes)
+
+
+def _cpu_h2d(data, device, dtype):
+    # PageZeroer stages block ids in pinned memory, which CPU-only hosts lack.
+    return torch.tensor(data, dtype=dtype, device=device)
+
+
 def _resolve(
     desc_arr,
     idx,
@@ -1026,11 +1051,16 @@ def _run_hetero_case(
     )
     worker._recving_metadata["req-b"] = meta
 
+    worker._page_zeroer = _cpu_page_zeroer(worker)
+
     # Sentinel-fill the local KV so untouched bytes are detectable.
     for t in worker._test_tensors:
         t.fill_(0xAA)
 
     worker._read_blocks_for_req("req-b", meta)
+    # As start_load_kv: one zeroing launch once every read of the step is posted.
+    with patch.object(page_zeroer, "async_tensor_h2d", _cpu_h2d):
+        worker._flush_unwritten_zeroing()
 
     # Invariant 1: all local writes within the request's own blocks.
     owned = _owned_byte_ranges(worker, local_ids)
@@ -1100,8 +1130,9 @@ def _run_hetero_case(
     # excludes the blocks covering the matched tokens from alloc-time KV
     # zeroing (the zeroing would race the RDMA write), so every byte of
     # those blocks must be either written by the transfer or zeroed by the
-    # receive post-process. Stale bytes surface as mid-response garbage
-    # once decode grows into the untransferred tail.
+    # pull (whole unwritten blocks when the reads are posted, a partly
+    # covered block's token tail at receive completion). Stale bytes surface
+    # as mid-response garbage once decode grows into the untransferred tail.
     for op, lh, lids, rh, rids in nixl.xfers:
         larr = nixl.dlists[lh]
         for li in lids:
@@ -1111,7 +1142,8 @@ def _run_hetero_case(
                 if 0 <= off < t.numel():
                     t[off : off + length] = 0  # simulate the RDMA write
                     break
-    done_sending, done_recving = worker.get_finished()
+    with patch.object(page_zeroer, "async_tensor_h2d", _cpu_h2d):
+        done_sending, done_recving = worker.get_finished()
     assert "req-b" in done_recving
     n_excluded = -(-matched // local_block)
     stale = []
