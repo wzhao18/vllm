@@ -210,7 +210,7 @@ def main():
             torch.cuda.synchronize()
         sv = st.view(grid, 8)
         s = (sv.double() - float(end.item())) / 1000.0
-        names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end"]
+        names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end", "x0-mma", "acc-done"]
         parts = []
         for i, nm in enumerate(names):
             v = s[:, i][sv[:, i] != 0]

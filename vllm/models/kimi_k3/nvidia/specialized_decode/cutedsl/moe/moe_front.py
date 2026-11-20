@@ -300,6 +300,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         mbar_wait(res_bar, 0);
       }
       asm volatile("tcgen05.fence::after_thread_sync;");
+      if (j == 0 && lane == 0) STAMP(6);
       const uint64_t b0 = smem_desc(ring_s + slot * kSlot);
       if (j < nt) {
 #pragma unroll
@@ -317,6 +318,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     // D (TMEM lane = weight row, column = token) -> this CTA's FP32 partial.
     asm volatile("griddepcontrol.wait;" ::: "memory");
     mbar_wait_sleep(acc_bar, 0);
+    if (threadIdx.x == 128) STAMP(7);
     asm volatile("tcgen05.fence::after_thread_sync;");
     const int q = warp & 3, row = q * 32 + lane;
     const uint32_t ta = tmem + (static_cast<uint32_t>(q * 32) << 16);
