@@ -194,3 +194,44 @@ def test_frost_requires_cudnn_frontend_133(monkeypatch):
     monkeypatch.setattr(cudnn, "__version__", "1.32.1")
     with pytest.raises(RuntimeError, match="older than 1.33"):
         sp_kda.frost_supported(torch.device("cuda"))
+
+
+@pytest.mark.parametrize("heads", [12, 96])
+def test_persistent_warm_covers_serving_beta_layouts(heads):
+    """The layer-init warm-up (warm_persistent) compiles the beta TMA variant
+    serving launches: TMA at H % 8 == 0, per-element loads at the TP8 shard's
+    12 heads (BUG-DCP8-3), also for misaligned beta views. A serving step must
+    not JIT (a mid-serving compile on one rank stalls its TP/DCP peers)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import kda as sp_kda
+
+    if not sp_kda.persistent_supported(torch.device("cuda")):
+        pytest.skip("CuTe DSL not installed")
+    if not hasattr(sp_kda, "warm_persistent"):
+        pytest.skip("no persistent-core warm-up in this tree")
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_persistent import (
+        forward as kp,
+    )
+
+    torch.manual_seed(0)
+    H, bf = heads, torch.bfloat16
+    sp_kda.warm_persistent(H, torch.device("cuda"), -5.0)
+    compiled = set(kp._COMPILED)
+    for lens in ([300, 1, 1029], [2048], [256, 256]):
+        T, N = sum(lens), len(lens)
+        offs = [0, *torch.tensor(lens).cumsum(0).tolist()]
+        cu_cpu = torch.tensor(offs, dtype=torch.int32)
+        q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
+        v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+        for beta in (
+            torch.randn(1, T, H, device="cuda").to(bf),
+            # a view one element past an aligned base
+            torch.randn(T * H + 1, device="cuda").to(bf)[1:].view(1, T, H),
+        ):
+            sp_kda.persistent_prefill(
+                q, k, v, g, beta, torch.randn(H, device="cuda") * 0.5,
+                torch.randn(H * D, device="cuda") * 0.1, -5.0,
+                torch.randn(N, H, D, D, device="cuda") * 0.1, cu_cpu.cuda(), cu_cpu,
+            )
+    torch.accelerator.synchronize()
+    new = set(kp._COMPILED) - compiled
+    assert not new, f"{len(new)} persistent-core variants compiled after warm-up"

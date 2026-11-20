@@ -718,6 +718,15 @@ def fwd(
         has_split,
         full_chunks,
     ) = plan
+    # The beta TMA choice depends on the head count only (H % 8 == 0): a beta
+    # view whose base or row stride is misaligned is copied, so serving launches
+    # the variant warm-up compiled for H and never JITs.
+    if (
+        beta.dtype == torch.bfloat16
+        and beta.shape[-1] % 8 == 0
+        and not beta_tma_supported(beta)
+    ):
+        beta = beta.clone(memory_format=torch.contiguous_format)
     # Reset before every launch, including captured launches and graph replays.
     if has_split:
         mfl.zero_()

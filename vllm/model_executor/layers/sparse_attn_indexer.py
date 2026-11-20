@@ -575,8 +575,17 @@ def _prefill_topk(
     if _use_deep_select_prefill(logits, row_starts, topk_tokens, topk_backend):
         deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
         return
-    if topk_backend != "trtllm_gvr2":
-        logits = as_fp32_logits(logits, row_ends)
+    if topk_backend == "trtllm_gvr2":
+        # No silent fallback: its own prefill engine and the FP32 kernels are
+        # not deterministic on tied BF16 logits. The model checks at load that
+        # DeepSelect takes every prefill chunk (deep_select_prefill_unsupported).
+        raise RuntimeError(
+            "sparse_indexer_topk_backend='trtllm_gvr2': DeepSelect cannot rank "
+            f"these prefill logits (dtype={logits.dtype}, shape="
+            f"{tuple(logits.shape)}, stride={tuple(logits.stride())}, row_starts "
+            f"{'set' if row_starts is not None else 'None'}, topk={topk_tokens})"
+        )
+    logits = as_fp32_logits(logits, row_ends)
     get_indexer_topk(topk_backend).forward_prefill(
         logits, row_starts, row_ends, topk_indices, topk_tokens
     )
