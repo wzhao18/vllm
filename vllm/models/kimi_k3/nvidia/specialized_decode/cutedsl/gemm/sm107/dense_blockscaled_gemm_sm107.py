@@ -712,6 +712,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.occupancy,
             self.enable_breuse,
         )
+        if getattr(self, "max_ab_stages", 0):
+            self.num_ab_stage = min(self.num_ab_stage, self.max_ab_stages)
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(

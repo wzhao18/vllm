@@ -64,9 +64,10 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
 
 
 def pre_tactic(n: int, k: int, rows: int):
-    for lo, hi, tactic, prewait in PRE_TACTICS.get((n, k), PRE_DEFAULT):
+    """(tactic, prewait k-blocks, smem stage cap or 0) for an R-row call, or None."""
+    for lo, hi, tactic, prewait, *cap in PRE_TACTICS.get((n, k), PRE_DEFAULT):
         if lo <= rows <= hi:
-            return tactic, prewait
+            return tactic, prewait, (cap or [0])[0]
     return None
 BLOCK = 32  # MXFP8 block along K
 
@@ -240,7 +241,7 @@ class Mxfp8Projection:
 
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
-                    device=weight.device,
+                    max_stages=found[2], device=weight.device,
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
