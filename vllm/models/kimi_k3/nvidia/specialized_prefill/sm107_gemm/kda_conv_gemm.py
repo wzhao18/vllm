@@ -50,6 +50,11 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.epi_tanh = "tanh" in flags
         self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else 0
         self.epi_drain_skel = next((i for i in (1, 2, 3, 4, 5, 6) if f"dskel{i}" in flags), 0)
+        # Column-wise conv epilogue skeletons (microbench only, see
+        # conv_epilogue.epilogue_kda_conv_t).
+        self.conv_skel = next((i for i in (1, 2, 3, 4) if f"cskel{i}" in flags), 0)
+        # Branch-free column pass (epilogue_kda_conv_t2) unless "ct1".
+        self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
@@ -74,6 +79,13 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             self.tmem_alloc_barrier = pipeline.NamedBarrier(
                 barrier_id=self.tmem_ptr_sync_bar_id, num_threads=32 * 9
             )
+        if self.conv_drain and self.conv_t2 and not split_producer and "nrs" not in flags:
+            # Twelve warps: warpgroup 2 = MMA, TMA, two idle warps; it drops to
+            # 40 registers so the epilogue warpgroups hold the drained tile
+            # (128 registers of BF16 pairs) plus the column pass without spills
+            # (sum 232 + 232 + 40 = 504, the SM107 limit).
+            self.threads_per_cta = 32 * 12
+            self.reg_split = (232, 40)
         if split_producer and tactic[5] == 2:
             # Second producer warp issues the odd k-blocks (whole stages).
             self.tma_kil_warp_id = self.tma_warp_id + 1
@@ -189,6 +201,7 @@ class KdaConvGemm:
         if fn is None:
             gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain)
             gemm.conv_mode = True
+            gemm.conv_p_dim = self.p
             cl = self.tactic[1]
             mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
             layouts = (
