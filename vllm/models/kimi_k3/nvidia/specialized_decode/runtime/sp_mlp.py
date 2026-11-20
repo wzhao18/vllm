@@ -222,6 +222,14 @@ class SpMlp:
                 weights["shared_down"] = bf16_weight(shared.down_proj)
         except ValueError as error:  # (re-raised with the layer)
             raise Unsupported("moe", None, f"layer {index}: {error}") from error
+        if any(rows_policy(LATENT_UP_PARTS, Shape(r, 1), default=None) for r in self.rows):
+            # One die-placed latent up weight (die-static wide partials) that every
+            # latent up GEMM and the stock up_proj read: no second copy.
+            from ..cutedsl.gemm.wide import die_layout, die_place
+
+            up = weights["latent_up"]
+            up = die_place(up, die_layout(up.shape[0], up.device)[1])
+            transform.up_proj.weight.data = weights["latent_up"] = up
         self.gemms = {}
         side = bool(mlp._shared_overlap)  # the shared expert beside MegaMoE
         # Rubin MegaMoE + MXFP8 shared expert: the wide-EP decode bucket runs the
@@ -261,9 +269,8 @@ class SpMlp:
 
                 policies = {r: (s,) + LATENT_UP_WIDE for r, s in self.parts.items()}
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], policies, partials=True, dies=True
+                    weights["latent_up"], policies, partials=True, dies="placed"
                 ).prepare()
-                transform.up_proj.weight.data = self.latent_up_parts.weight
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
             self.inter2 = self.gemms["shared_gu"].n

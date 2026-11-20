@@ -1002,8 +1002,8 @@ class PreparedWide:
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         # ``dies``: die-static work (``WideGemm`` ``tpcs``) on a die-placed copy of
-        # the weight (``die_place``); the caller re-points other users at
-        # ``self.weight``.
+        # the weight (``die_place``; the caller re-points other users at
+        # ``self.weight``), or "placed": ``weight`` already comes from ``die_place``.
         self.dies = dies
         self.trace, self.xcopies = trace, xcopies  # benchmarks only (``WideGemm``)
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
@@ -1023,7 +1023,8 @@ class PreparedWide:
         tpc_die = t0 = None
         if self.dies:
             tpc_die, t0 = die_layout(self.n, dev)
-            self.weight = die_place(self.weight, t0)
+            if self.dies != "placed":  # "placed": the caller already ran die_place
+                self.weight = die_place(self.weight, t0)
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, policy in self.policies.items():
