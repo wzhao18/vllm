@@ -31,6 +31,8 @@ _DUMMY_EXP: dict = {}
 _DUMMY_MID: dict = {}
 _DUMMY_TPR: dict = {}
 LAST_TPROBE: list = [None]
+# Dev A/B constexpr overrides (benchmarks only; empty in production).
+_DEV: dict = {}
 
 _SMS: dict = {}
 
@@ -95,6 +97,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        tuple(sorted(_DEV.items())),
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -202,6 +205,7 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                **_DEV,
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
