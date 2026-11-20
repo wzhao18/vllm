@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
   const int MODE = atoi(argv[1]), Wg = atoi(argv[2]), L = atoi(argv[3]), S = atoi(argv[4]);
   const double cfrac = argc > 5 ? atof(argv[5]) : 0.8;
   const int iters = argc > 6 ? atoi(argv[6]) : 10, CG = argc > 7 ? atoi(argv[7]) : 32;
-  const int NREQ = 96, R = 4 * NREQ, nmin = 448, nmax = 576, NL = Wg * L;
+  const int NREQ = argc > 8 ? atoi(argv[8]) : 96, R = 4 * NREQ, nmin = 448, nmax = 576, NL = Wg * L;
   const size_t NKV = (size_t)4 << 20;
   if (NL * S > 256 || NL > 64 || CG > 64 || NL % CG || ((MODE & 8) && (CG > 32 || NL / CG > 16))) { printf("bad cfg\n"); return 2; }
   int nsm, dev = 0; RK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
