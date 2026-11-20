@@ -224,12 +224,12 @@ class WideGemm:
         self.rows, self.n, self.k, self.split, self.silu = rows, n, k, split, silu
         self.n_mma, self.chunks = mma_columns(rows)
         self.mma_tiler = (256, self.n_mma, K_TILE)
-        self.threads = 256  # warps: 0 weights, 1 activations, 2 MMA, 3 idle, 4-7 epilogue
+        self.threads = 256  # warps: 0+3 weights, 1 activations, 2 MMA, 4-7 epilogue
         a_bytes = 128 * K_TILE * 2
         b_bytes = self.chunks * (self.n_mma // 2) * K_TILE * 2
         self.stage_bytes = a_bytes + b_bytes
         smem = utils.get_smem_capacity_in_bytes("sm_100")
-        self.stages = min(8, (smem - 16384) // self.stage_bytes)
+        self.stages = min(12, (smem - 16384) // self.stage_bytes)
         self.tmem_cols = 32
         while self.tmem_cols < rows:
             self.tmem_cols *= 2
@@ -365,31 +365,14 @@ class WideGemm:
 
         cute.arch.cluster_wait()
 
-        if warp == 0:  # weights: before the PDL wait
-            tAgW_tile = tAgW[(None, pair, None, 0)]
-            phase = Int32(1)
-            for t in cutlass.range(k_count, unroll=1):
-                s = t % stages
-                cute.arch.mbarrier_wait(empty + s, phase)
-                if leader:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_bytes)
-                cute.copy(tma_a, tAgW_tile[(None, k0 + t)], tAsA[(None, s)],
-                          tma_bar_ptr=full + s, mcast_mask=a_mask)  # fmt: skip
-                if s == stages - 1:
-                    phase = phase ^ 1
+        if warp == 0:  # weights: before the PDL wait (even stages)
+            self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty, a_mask,
+                         leader, k0, k_count, Int32(0))  # fmt: skip
+        elif warp == 3:  # weights: the odd stages (a second TMA issuer, hw51)
+            self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty, a_mask,
+                         leader, k0, k_count, Int32(1))  # fmt: skip
         elif warp == 1:  # activations: after it
-            cute.arch.griddepcontrol_wait()
-            phase = Int32(1)
-            for t in cutlass.range(k_count, unroll=1):
-                s = t % stages
-                cute.arch.mbarrier_wait(empty + s, phase)
-                for c in cutlass.range_constexpr(chunks):
-                    cute.copy(tma_b, tBgX[(None, c, k0 + t, 0)],
-                              tBsB[(None, s * chunks + c)],
-                              tma_bar_ptr=full + s, mcast_mask=b_mask)  # fmt: skip
-                if s == stages - 1:
-                    phase = phase ^ 1
+            self.acts(tma_b, tBgX, tBsB, full, empty, b_mask, k0, k_count, Int32(0), 1)
         elif warp == 2:
             cute.arch.barrier(barrier_id=1, number_of_threads=32 * 5)
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
@@ -432,6 +415,36 @@ class WideGemm:
                 cute.arch.mbarrier_arrive(dealloc, rank_in_cluster ^ 1)
                 cute.arch.mbarrier_wait(dealloc, 0)
                 cute.arch.dealloc_tmem(tmem_ptr, self.tmem_cols, is_two_cta=True)
+
+    @cute.jit
+    def weights(self, tma_a, tAgW_tile, tAsA, full, empty, a_mask, leader, k0, k_count, first):
+        """Weight stages ``first``, ``first + 2``, ... of this split: one TMA issuer
+        completes one bulk op at a time (hw51), so two issuer warps double the weight
+        rate a CTA can pull before and after the PDL wait."""
+        stages = self.stages
+        for t in cutlass.range(first, k_count, 2, unroll=1):
+            s = t % stages
+            phase = Int32(1) ^ ((t // stages) % 2)
+            cute.arch.mbarrier_wait(empty + s, phase)
+            if leader:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_bytes)
+            cute.copy(tma_a, tAgW_tile[(None, k0 + t)], tAsA[(None, s)],
+                      tma_bar_ptr=full + s, mcast_mask=a_mask)  # fmt: skip
+
+    @cute.jit
+    def acts(self, tma_b, tBgX, tBsB, full, empty, b_mask, k0, k_count, first, step: cutlass.Constexpr):
+        """Activation stages ``first``, ``first + step``, ... after the PDL wait (a
+        second activation issuer warp measured no gain: GEMM-EX3 2026-11-20)."""
+        stages, chunks = self.stages, self.chunks
+        cute.arch.griddepcontrol_wait()
+        for t in cutlass.range(first, k_count, step, unroll=1):
+            s = t % stages
+            phase = Int32(1) ^ ((t // stages) % 2)
+            cute.arch.mbarrier_wait(empty + s, phase)
+            for c in cutlass.range_constexpr(chunks):
+                cute.copy(tma_b, tBgX[(None, c, k0 + t, 0)], tBsB[(None, s * chunks + c)],
+                          tma_bar_ptr=full + s, mcast_mask=b_mask)  # fmt: skip
 
     @cute.jit
     def epilogue(
