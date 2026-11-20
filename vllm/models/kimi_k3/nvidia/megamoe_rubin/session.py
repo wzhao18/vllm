@@ -100,7 +100,7 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 
 # Fused shared expert: shared FC2 after the routed work ("tail") or right after shared
 # FC1, under the dispatch ("early").
-RUBIN_FUSED_SHARED_L2_POSITION = "early"
+RUBIN_FUSED_SHARED_L2_POSITION = "tail"
 
 # GenPhase fused shared expert: K parts per shared FC1 / FC2 tile. Whole-K tiles (1, 1): split tiles measured
 # slower on EP1 (+2..+9 us per layer at 96 tokens before the fixup; extra shared FC2 units park behind all of
