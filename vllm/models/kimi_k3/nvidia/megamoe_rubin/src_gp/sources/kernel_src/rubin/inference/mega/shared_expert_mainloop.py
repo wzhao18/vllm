@@ -85,8 +85,17 @@ class SharedKindMainloopMixin:
     def _set_shared_k_tile_counts(self) -> None:
         """K tiles of the shared FC1 (over K_s) and FC2 (over I_s); zero without a shared expert."""
         if self.shared_enabled:
-            self.shared_fc1_k_tile_count = ceil_div(self.shared_hidden_size, self.shared_mma_tile_k)
-            self.shared_fc2_k_tile_count = ceil_div(self.shared_intermediate_gateup_size // 2, self.shared_mma_tile_k)
+            # Per K part of a split shared tile (``shared_k_splits``): every part streams the same tile count.
+            splits = getattr(self, "_shared_k_splits", (1, 1))
+            totals = (
+                ceil_div(self.shared_hidden_size, self.shared_mma_tile_k),
+                ceil_div(self.shared_intermediate_gateup_size // 2, self.shared_mma_tile_k),
+            )
+            for total, parts in zip(totals, splits):
+                if total % parts != 0:
+                    raise ValueError(f"shared K of {total} tiles does not split into {parts} parts.")
+            self.shared_fc1_k_tile_count = totals[0] // splits[0]
+            self.shared_fc2_k_tile_count = totals[1] // splits[1]
         else:
             self.shared_fc1_k_tile_count = 0
             self.shared_fc2_k_tile_count = 0

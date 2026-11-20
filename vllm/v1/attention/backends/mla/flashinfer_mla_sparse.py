@@ -1199,6 +1199,32 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 vllm_config, self.use_shardq
             )
 
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+        skip_scale: bool = False,
+    ) -> None:
+        # Kimi K3.1 specialized prefill: the same FP8 insert at HBM rate
+        if self._prefill_sparse_mla is not None and kv_cache.numel() > 0:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import kv_insert
+
+            k_pe2 = k_pe.squeeze(1)
+            slots = slot_mapping.flatten()
+            if kv_insert.applicable(
+                kv_c_normed, k_pe2, kv_cache, slots, kv_cache_dtype, skip_scale
+            ):
+                kv_insert.insert(kv_c_normed, k_pe2, kv_cache, slots)
+                return
+        super().do_kv_cache_update(
+            kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale,
+            skip_scale,
+        )
+
     def _prepare_mqa_kernel(
         self,
         layer: AttentionLayer,

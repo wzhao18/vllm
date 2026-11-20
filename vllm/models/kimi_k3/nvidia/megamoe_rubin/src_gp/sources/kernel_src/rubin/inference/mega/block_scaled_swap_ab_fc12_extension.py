@@ -43,6 +43,9 @@ class BlockScaledSwapAbFc12Extension:
     # Shared-expert FC1 done counter (one slot per token block) and the count a shared FC2 tile waits for.
     shared_fc1_done_counter_pointer: Optional[Pointer] = None
     shared_fc2_spin_threshold: Optional[Int32] = None
+    # The shared kind's instance under split shared tiles: K elements per part of a shared FC1 / FC2 tile. The
+    # scheduler carries the part in ``expert_idx`` (a shared tile has no expert); (0, 0) = whole-K tiles.
+    shared_k_part_elems: Tuple[int, int] = (0, 0)
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
@@ -107,6 +110,7 @@ class BlockScaledSwapAbFc12Extension:
             fc2_half_cta_tiles=self.fc2_half_cta_tiles,
             shared_fc1_done_counter_pointer=shared_fc1_done_counter_pointer,
             shared_fc2_spin_threshold=shared_fc2_spin_threshold,
+            shared_k_part_elems=self.shared_k_part_elems,
         )
 
     @cute.jit
@@ -217,23 +221,33 @@ class BlockScaledSwapAbFc12Extension:
         weight_expert = expert_idx
         if cutlass.const_expr(self.n_split):
             weight_expert = self.weight_half(work_tile) * Int32(self.local_expert_count) + expert_idx
+        # K origin of the operand: the part's first K element for a split shared tile (A, SFA, B, SFB).
+        k_offset = Int32(0)
+        if cutlass.const_expr(self.shared_k_part_elems != (0, 0)):
+            part_elems = Int32(self.shared_k_part_elems[1])
+            if work_tile.phase == Int32(BlockPhase.SharedLinear1):
+                part_elems = Int32(self.shared_k_part_elems[0])
+            k_offset = expert_idx * part_elems
+            weight_expert = Int32(0)
 
         if cutlass.const_expr(tensor_name == "a"):
-            result = cute.domain_offset((0, 0, weight_expert), tensor)
+            result = cute.domain_offset((0, k_offset, weight_expert), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "b"):
-            result = cute.domain_offset((data_token_offset, 0, 0), tensor)
+            result = cute.domain_offset((data_token_offset, k_offset, 0), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "sfa"):
-            result = cute.domain_offset((0, 0, weight_expert), tensor)
+            result = cute.domain_offset((0, k_offset, weight_expert), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
 
         if cutlass.const_expr(tensor_name in ("sfb", "sfc")):
-            result = cute.domain_offset((sf_token_offset, 0, 0), tensor)
+            # The output scales (sfc) never move with the K part.
+            sf_k_offset = k_offset if cutlass.const_expr(tensor_name == "sfb") else Int32(0)
+            result = cute.domain_offset((sf_token_offset, sf_k_offset, 0), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
