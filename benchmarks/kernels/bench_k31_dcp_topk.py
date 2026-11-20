@@ -43,8 +43,9 @@ STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass"
 PHASES_SP = {0: "start", 9: "landed+max", 10: "sampled", 1: "theta", 11: "mask+scan", 12: "compacted", 2: "pass", 13: "e", 14: "msg built",
              15: "band", 3: "sent", 4: "polled", 16: "r:suffix", 17: "r:tau", 18: "r:ties", 5: "resolved", 6: "radix",
              7: "selected", 8: "end"}
-PHASES_S4 = {0: "start", 9: "zeroed", 10: "sampled", 1: "theta", 2: "pass", 13: "e+window", 3: "sent",
-             4: "polled", 5: "resolved", 6: "radix", 7: "counted", 8: "end"}
+PHASES_S4 = {0: "start", 9: "zeroed", 10: "sampled", 1: "theta", 11: "s1", 12: "s1bar", 14: "s2scan",
+             15: "s2wr", 2: "pass", 18: "bmz", 16: "e", 17: "band0", 13: "e+window", 3: "sent", 4: "polled",
+             19: "w0res", 5: "resolved", 6: "radix", 7: "counted", 8: "end"}
 STATS_S4 = ("rows", "one_round", "id_radix", "key_radix")
 STATS_SP = ("rows", "one_round", "id_radix", "key_radix", "select_all", "list", "full_pass", "bad_window",
             "disjoint", "tau_below", "tau_top", "band_miss", "list_sel", "tie_round", "retheta")

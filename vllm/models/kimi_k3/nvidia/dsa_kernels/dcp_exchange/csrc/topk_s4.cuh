@@ -286,23 +286,42 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
   using C = S4Cfg<T>;
   constexpr int CG = C::kCapG, NW = C::kWarps;
   constexpr int kBmW = CG / 4;  // bitmap words of the SMEM row's positions
-  __shared__ __align__(128) uint4 srow[CG];  // the row; after the pass: rx | bitmaps | tie list
+  struct Post {  // the SMEM row after the pass
+    uint32_t rx[kV2MaxW * kS4Msg];  // round-1 messages
+    uint32_t bmg[kBmW];             // keys above tau (bit per position)
+    uint32_t bme[kBmW];             // selected ties
+    uint2 tl[kV2MaxW * kS4Band];    // tie list: (gid, pos | own << 31)
+  };
+  static_assert(sizeof(Post) <= CG * 16, "post-pass aliases");
+  __shared__ __align__(128) union {
+    uint4 row[CG];
+    uint32_t w[4 * CG];  // two keys per word
+    Post post;
+  } su;
+  __shared__ __align__(16) union {
+    uint32_t w[kS4Cand];  // sample bins (key >> 4), then the candidate list
+    uint4 v[kS4Cand / 4];
+  } hu;
+  __shared__ __align__(16) union {
+    uint32_t w[kS4Fine];
+    uint4 v[kS4Fine / 4];
+  } fu;
   __shared__ __align__(8) uint64_t s_bar;
-  __shared__ __align__(16) uint32_t h1[256];       // sample key >> 8; radix digit counts
-  __shared__ __align__(16) uint32_t h2c[kS4Cand];  // sample key >> 4, then the candidate list
-  __shared__ __align__(16) uint32_t fine[kS4Fine];
+  __shared__ __align__(16) uint32_t h1[256];  // radix digit counts
   __shared__ __align__(16) uint32_t band[kS4Band];
   __shared__ int btab[kSpBt];
   __shared__ uint32_t s_ws[64];
-  __shared__ int s_i[8];
+  __shared__ int s_i[16];
   __shared__ uint32_t s_u[16];
   __shared__ long long s_dbg[32];
   static_assert(4096 <= kS4Cand, "sample bins in the candidate list");
-  uint32_t* const rx = reinterpret_cast<uint32_t*>(srow);  // kV2MaxW * kS4Msg
-  uint32_t* const bmg = rx + kV2MaxW * kS4Msg;              // keys above tau (bit per position)
-  uint32_t* const bme = bmg + kBmW;                          // selected ties
-  uint2* const tl = reinterpret_cast<uint2*>(bme + kBmW);    // tie list: (gid, pos | own << 31)
-  static_assert((kV2MaxW * kS4Msg + 2 * kBmW) * 4 + kV2MaxW * kS4Band * 8 <= CG * 16, "post-pass aliases");
+#define srow su.row
+#define rx su.post.rx
+#define bmg su.post.bmg
+#define bme su.post.bme
+#define tl su.post.tl
+#define h2c hu.w
+#define fine fu.w
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   if (tid == 0) {
     mbar_init(&s_bar, kV2Cp);
@@ -359,15 +378,11 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
       else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
     }
     {
-      uint4* a = reinterpret_cast<uint4*>(h2c);
 #pragma unroll 1
-      for (int i = tid; i < 4096 / 4; i += T) a[i] = make_uint4(0u, 0u, 0u, 0u);
-      uint4* b = reinterpret_cast<uint4*>(fine);
+      for (int i = tid; i < 4096 / 4; i += T) hu.v[i] = make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll 1
-      for (int i = tid; i < kS4Fine / 4; i += T) b[i] = make_uint4(0u, 0u, 0u, 0u);
-      if (tid < 64) reinterpret_cast<uint4*>(h1)[tid] = make_uint4(0u, 0u, 0u, 0u);
-      if (tid < 16) s_u[tid] = 0;
-      if (tid < 8) s_i[tid] = 0;
+      for (int i = tid; i < kS4Fine / 4; i += T) fu.v[i] = make_uint4(0u, 0u, 0u, 0u);
+      if (tid < 16) { s_u[tid] = 0; s_i[tid] = 0; }
     }
     if (tid == 0 && Gl >= (1 << 24)) spin_fail(p.err, 50);
     const int ep = p.epoch[row];
@@ -382,150 +397,176 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
     mbar_wait(&s_bar, bar_phase);
     bar_phase ^= 1u;
     S4DBG(9);
-    // ---- 1. sample: group 16 t + t % 16 per thread; lanes with the same 16-key bin add once
+    // ---- 1. sample: keys 0-3 of group 16 t + t % 16 -> whole-range bins of 16 keys
     {
       const int gs = tid * 16 + (tid & 15);
-      uint4 x = make_uint4(~0u, ~0u, ~0u, ~0u);
-      if (gs < nsm) {
-        x = srow[gs];
-        if (K31_RARE(L - 8 * gs < 8)) x = s4_tail(x, L - 8 * gs);
-      }
-      const uint4 kw = sp_keys(x);
       uint32_t ns = 0;
-#pragma unroll 1
-      for (int j = 0; j < 8; ++j) {
-        const uint32_t b = sp_key_at(kw, j) >> 4;  // 0 <=> NaN (the smallest valid key is 0x7F)
-        const uint32_t peers = __match_any_sync(0xffffffffu, b);
-        if (b != 0u && lane == __ffs(peers) - 1) {
-          const uint32_t c = __popc(peers);
-          atomicAdd(&h2c[b], c);
-          atomicAdd(&h1[b >> 4], c);
-        }
-        ns += b != 0u;
+      if (gs < nsm) {
+        uint4 x = srow[gs];
+        if (K31_RARE(L - 8 * gs < 8)) x = s4_tail(x, L - 8 * gs);
+        const uint32_t k0 = keys2(x.x), k1 = keys2(x.y);
+        const uint32_t b0 = (k0 & 0xFFFFu) >> 4, b1 = k0 >> 20, b2 = (k1 & 0xFFFFu) >> 4, b3 = k1 >> 20;
+        if (b0) atomicAdd(&h2c[b0], 1u);  // 0 <=> NaN (the smallest valid key is 0x7F)
+        if (b1) atomicAdd(&h2c[b1], 1u);
+        if (b2) atomicAdd(&h2c[b2], 1u);
+        if (b3) atomicAdd(&h2c[b3], 1u);
+        ns = (b0 != 0u) + (b1 != 0u) + (b2 != 0u) + (b3 != 0u);
       }
       ns = __reduce_add_sync(0xffffffffu, ns);
       if (lane == 0 && ns) atomicAdd(&s_u[2], ns);
     }
-    __syncthreads();  // sample histograms
+    __syncthreads();  // sample histogram
     S4DBG(10);
-    // theta (every warp alike): the 16-key bin holding the sample's want-th key
-    int theta = 1;
-    {
+    // theta (warp 0): the 16-key bin holding the sample's want-th key; lane l sums the
+    // 128 bins [4096 - 128 (l + 1), 4096 - 128 l) (lane 0 the top), then the crossing chunk
+    if (warp == 0) {
       const uint32_t ns = s_u[2];
       const uint32_t want = ((q + (uint32_t)kS4WantX) * ns + (uint32_t)L - 1u) / (uint32_t)max(L, 1);
-      uint32_t c[8], s = 0;
-      {
-        const uint4 a = *reinterpret_cast<const uint4*>(h1 + 248 - 8 * lane);
-        const uint4 b = *reinterpret_cast<const uint4*>(h1 + 252 - 8 * lane);
-        c[0] = b.w; c[1] = b.z; c[2] = b.y; c[3] = b.x; c[4] = a.w; c[5] = a.z; c[6] = a.y; c[7] = a.x;
+      uint32_t s = 0;
+#pragma unroll 8
+      for (int j = 0; j < 32; ++j) {  // rotated by lane: conflict-free
+        const uint4 v = hu.v[1024 - 32 * (lane + 1) + ((j + lane) & 31)];
+        s += v.x + v.y + v.z + v.w;
       }
-#pragma unroll
-      for (int j = 0; j < 8; ++j) s += c[j];
       const uint32_t x = s4_wscan(s, lane);
-      const bool hit = want > 0u && x - s < want && x >= want;
-      int b1 = -1;
-      uint32_t rem = 0;
-      if (hit) {
-        uint32_t run = x - s;
+      const uint32_t hc = __ballot_sync(0xffffffffu, want > 0u && x - s < want && x >= want);
+      int th = 1;
+      if (hc) {
+        const int cl = __ffs(hc) - 1;
+        const uint32_t exc = __shfl_sync(0xffffffffu, x - s, cl);
+        // lane l: bins top - 4 l - j (j < 4) of the chunk
+        const int top = 4095 - 128 * cl;
+        const uint4 v = hu.v[(top - 4 * lane - 3) >> 2];
+        const uint32_t c4 = v.x + v.y + v.z + v.w;
+        const uint32_t pre = exc + s4_wscan(c4, lane) - c4;
+        const bool hit = pre < want && pre + c4 >= want;
+        int bb = 0;
+        if (hit) {
+          const uint32_t c[4] = {v.w, v.z, v.y, v.x};
+          uint32_t run = pre;
+          bool f = false;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          if (b1 < 0 && run + c[j] >= want) { b1 = 255 - 8 * lane - j; rem = want - run; }
-          run += c[j];
-        }
-      }
-      const uint32_t hb = __ballot_sync(0xffffffffu, hit);
-      if (hb) {
-        const int src = __ffs(hb) - 1;
-        b1 = __shfl_sync(0xffffffffu, b1, src);
-        rem = __shfl_sync(0xffffffffu, rem, src);
-        const uint32_t v = lane < 16 ? h2c[(b1 << 4) + 15 - lane] : 0u;
-        const uint32_t y = s4_wscan(v, lane);
-        const uint32_t h = __ballot_sync(0xffffffffu, lane < 16 && y - v < rem && y >= rem);
-        theta = max(1, ((b1 << 4) + 15 - (__ffs(h) - 1)) << 4);
-      }
-    }
-    __syncthreads();  // theta read: the candidate list reuses the sample bins
-    S4DBG(1);
-    // ---- 2. keys >= theta -> fine[min(key - theta, kS4Fine - 1)] + the candidate list
-    // (key << 16 | position, warp-aggregated appends, any order)
-    {
-      const SpTh th = sp_th(theta);
-#pragma unroll 1
-      for (int c0 = 0; c0 < nsm; c0 += T) {
-        const int g = c0 + tid;
-        uint32_t m = 0;
-        uint4 x = make_uint4(~0u, ~0u, ~0u, ~0u);
-        if (g < nsm) {
-          x = srow[g];
-          if (K31_RARE(L - 8 * g < 8)) x = s4_tail(x, L - 8 * g);
-          m = sp_mask(x, th);
-        }
-        const uint32_t cm = __popc(m);
-        if (__ballot_sync(0xffffffffu, cm != 0u)) {
-          const uint32_t incl = s4_wscan(cm, lane);
-          uint32_t base = 0;
-          if (lane == 31) base = atomicAdd(&s_u[3], incl);
-          uint32_t o = __shfl_sync(0xffffffffu, base, 31) + incl - cm;
-          if (m) {
-            const uint4 kw = sp_keys(x);
-            do {
-              const int j = __ffs(m) - 1;
-              m &= m - 1;
-              const uint32_t k = sp_key_at(kw, j);
-              atomicAdd(&fine[::min(k - (uint32_t)theta, (uint32_t)kS4Fine - 1u)], 1u);
-              if (o < (uint32_t)kS4Cand) h2c[o] = (k << 16) | (uint32_t)(8 * g + j);
-              ++o;
-            } while (m);
+          for (int j = 0; j < 4; ++j) {
+            if (!f && run + c[j] >= want) { f = true; bb = top - 4 * lane - j; }
+            run += c[j];
           }
         }
+        th = max(1, __shfl_sync(0xffffffffu, bb, __ffs(__ballot_sync(0xffffffffu, hit)) - 1) << 4);
+      }
+      if (lane == 0) s_i[4] = th == 0x8000 ? 0x7FFF : th;  // key(-0): the packed compare stays exact
+    }
+    __syncthreads();  // theta (the candidate list reuses the sample bins)
+    const int theta = s_i[4];
+    S4DBG(1);
+    // ---- 2. keys >= theta: thread t takes groups t + c T (c < CI); 8-bit masks from packed
+    // compares (no key conversion), kept in registers; one warp scan + one atomic per warp
+    // place the thread's candidates in the list (key << 16 | position, any order); then each
+    // thread writes its candidates (strided groups: clustered candidates spread over threads)
+    // and the exact fine histogram of key - theta (the last bin clamps)
+    {
+      constexpr int CI = (CG + T - 1) / T;
+      const uint32_t t2 = v2_th_bf16(theta);  // theta != key(+0): the packed compare is exact
+      uint32_t mw[(CI + 3) / 4];
+#pragma unroll
+      for (int k = 0; k < (CI + 3) / 4; ++k) mw[k] = 0u;
+#pragma unroll
+      for (int c = 0; c < CI; ++c) {
+        const int g = tid + c * T;
+        if (g < nsm) {
+          uint4 x = srow[g];
+          if (K31_RARE(L - 8 * g < 8)) x = s4_tail(x, L - 8 * g);
+          const uint32_t a = v2_ge2(x.x, t2), b = v2_ge2(x.y, t2), cc = v2_ge2(x.z, t2), d = v2_ge2(x.w, t2);
+          if ((a | b | cc | d) != 0u) {
+            // byte masks of keys 0-3 / 4-7 (0x00 / 0xFF), then their top bits
+            const uint32_t lo4 = __byte_perm(a, b, 0x6420), hi4 = __byte_perm(cc, d, 0x6420);
+            const uint32_t m8 = (((lo4 & 0x80808080u) * 0x00204081u) >> 28) |
+                                ((((hi4 & 0x80808080u) * 0x00204081u) >> 28) << 4);
+            mw[c / 4] |= m8 << (8 * (c % 4));
+          }
+        }
+      }
+      S4DBG(11);
+      uint32_t cnt = 0;
+#pragma unroll
+      for (int k = 0; k < (CI + 3) / 4; ++k) cnt += __popc(mw[k]);
+      const uint32_t incl = s4_wscan(cnt, lane);
+      uint32_t base = 0;
+      if (lane == 31 && incl) base = atomicAdd(&s_u[3], incl);
+      uint32_t o = __shfl_sync(0xffffffffu, base, 31) + incl - cnt;
+      S4DBG(14);
+#pragma unroll
+      for (int k = 0; k < (CI + 3) / 4; ++k) {
+#pragma unroll 1
+        for (uint32_t v = mw[k]; v != 0u;) {
+          const int gb = (__ffs(v) - 1) >> 3;
+          uint32_t m = (v >> (8 * gb)) & 0xFFu;
+          v &= ~(0xFFu << (8 * gb));
+          const uint32_t p8 = (uint32_t)(8 * (tid + (4 * k + gb) * T));
+          do {  // positions only here (divergent loop: keep it short)
+            if (o < (uint32_t)kS4Cand) h2c[o] = p8 + (uint32_t)(__ffs(m) - 1);
+            ++o;
+            m &= m - 1;
+          } while (m);
+        }
+      }
+    }
+    __syncthreads();  // candidate positions
+    S4DBG(15);
+    // keys of the candidates (balanced over threads): fine histogram + list entries
+    {
+      const uint32_t n = ::min(s_u[3], (uint32_t)kS4Cand);
+#pragma unroll 1
+      for (uint32_t i = tid; i < n; i += T) {
+        const uint32_t pos = h2c[i];
+        const uint32_t w = su.w[pos >> 1];
+        const uint32_t key = (pos & 1) ? (keys2(w) >> 16) : (keys2(w) & 0xFFFFu);
+        atomicAdd(&fine[::min(key - (uint32_t)theta, (uint32_t)kS4Fine - 1u)], 1u);
+        h2c[i] = (key << 16) | pos;
       }
     }
     __syncthreads();  // fine histogram + candidate list
     S4DBG(2);
     const uint32_t nct = s_u[3];
-    // ---- 3. e (the q-th key), window, band (every warp alike), band entries from the list
-    int lo = theta, bl = 0, bh = -1;
-    uint32_t flags = 0;
-    if (nct < q || nct > (uint32_t)kS4Cand) {
-      flags = 1;  // too few keys >= theta, or a list overflow: radix rounds
-    } else {
-      uint32_t s = 0;
-      const uint4* f4 = reinterpret_cast<const uint4*>(fine + kS4Fine - 64 * (lane + 1));
-#pragma unroll 4
-      for (int j = 0; j < 16; ++j) {
-        const uint4 v = f4[j];
-        s += v.x + v.y + v.z + v.w;
-      }
-      const uint32_t x = s4_wscan(s, lane);
-      const int cl = __ffs(__ballot_sync(0xffffffffu, x - s < q && x >= q)) - 1;
-      const uint32_t exc = __shfl_sync(0xffffffffu, x - s, cl);
-      const int top = kS4Fine - 1 - 64 * cl;
-      const uint32_t a0 = fine[top - 2 * lane], a1 = fine[top - 2 * lane - 1];
-      const uint32_t pre = exc + s4_wscan(a0 + a1, lane) - (a0 + a1);
-      const bool c0 = pre < q && pre + a0 >= q, c1 = pre + a0 < q && pre + a0 + a1 >= q;
-      const int el = __ffs(__ballot_sync(0xffffffffu, c0 || c1)) - 1;
-      const int eb = __shfl_sync(0xffffffffu, c0 ? top - 2 * lane : top - 2 * lane - 1, el);
-      if (eb >= kS4Fine - 1) {
-        flags = 1;  // e among the clamped keys
+    // ---- 3. warp 0: e (the q-th key), window [lo, lo + 256), keys above it, band range
+    if (warp == 0) {
+      int lo = theta, bl = 0, bh = -1;
+      uint32_t flags = 0, above = 0;
+      if (nct < q || nct > (uint32_t)kS4Cand) {
+        flags = 1;  // too few keys >= theta, or a list overflow: radix rounds
       } else {
-        lo = ::min(::max(theta + eb - 127, theta), theta + kS4Fine - 1 - 256);
-        const int lb = lo - theta, eo = theta + eb - lo;
-        // band: the widest [eo - d, eo + d] (inside the window) with <= kS4Band keys
-        const uint32_t ce = fine[lb + eo];
-        int d = 0;
-        if (ce <= (uint32_t)kS4Band) {
-          // lane l tests d = l + 1 (counts of the 2 (l + 1) keys around e)
-          const int dl = lane + 1;
-          const uint32_t up = eo + dl <= 255 ? fine[lb + eo + dl] : 0x10000u;
-          const uint32_t dn = eo - dl >= 0 ? fine[lb + eo - dl] : 0x10000u;
-          const uint32_t add = up + dn;
-          const uint32_t cum = ce + s4_wscan(add, lane);
-          const uint32_t ok = __ballot_sync(0xffffffffu, cum <= (uint32_t)kS4Band);
-          d = __popc(~ok) == 0 ? 32 : __ffs(~ok) - 1;  // the first d that does not fit
-          bl = eo - d;
-          bh = eo + d;
+        uint32_t s = 0;
+#pragma unroll 4
+        for (int j = 0; j < 16; ++j) {  // rotated by lane: conflict-free
+          const uint4 v = fu.v[kS4Fine / 4 - 16 * (lane + 1) + ((j + lane) & 15)];
+          s += v.x + v.y + v.z + v.w;
         }
-        if (warp == 0) {
+        const uint32_t x = s4_wscan(s, lane);
+        const int cl = __ffs(__ballot_sync(0xffffffffu, x - s < q && x >= q)) - 1;
+        const uint32_t exc = __shfl_sync(0xffffffffu, x - s, cl);
+        const int top = kS4Fine - 1 - 64 * cl;
+        const uint32_t a0 = fine[top - 2 * lane], a1 = fine[top - 2 * lane - 1];
+        const uint32_t pre = exc + s4_wscan(a0 + a1, lane) - (a0 + a1);
+        const bool c0 = pre < q && pre + a0 >= q, c1 = pre + a0 < q && pre + a0 + a1 >= q;
+        const int el = __ffs(__ballot_sync(0xffffffffu, c0 || c1)) - 1;
+        const int eb = __shfl_sync(0xffffffffu, c0 ? top - 2 * lane : top - 2 * lane - 1, el);
+        S4DBG(16);
+        if (eb >= kS4Fine - 1) {
+          flags = 1;  // e among the clamped keys
+        } else {
+          lo = ::min(::max(theta + eb - 127, theta), theta + kS4Fine - 1 - 256);
+          const int lb = lo - theta, eo = theta + eb - lo;
+          // band: the widest [eo - d, eo + d] (inside the window) with <= kS4Band keys
+          const uint32_t ce = fine[lb + eo];
+          if (ce <= (uint32_t)kS4Band) {
+            const int dl = lane + 1;  // lane l tests d = l + 1
+            const uint32_t up = eo + dl <= 255 ? fine[lb + eo + dl] : 0x10000u;
+            const uint32_t dn = eo - dl >= 0 ? fine[lb + eo - dl] : 0x10000u;
+            const uint32_t cum = ce + s4_wscan(up + dn, lane);
+            const uint32_t ok = __ballot_sync(0xffffffffu, cum <= (uint32_t)kS4Band);
+            const int d = ~ok == 0u ? 32 : __ffs(~ok) - 1;
+            bl = eo - d;
+            bh = eo + d;
+          }
           // above: keys >= lo + 256 = bins >= lb + 256
           const int hbn = lb + 256;
           const int ch = (kS4Fine - 1 - hbn) >> 6;
@@ -534,12 +575,22 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
           uint32_t part = 0;
           if (ctop - 2 * lane >= hbn) part += fine[ctop - 2 * lane];
           if (ctop - 2 * lane - 1 >= hbn) part += fine[ctop - 2 * lane - 1];
-          const uint32_t above = exh + __reduce_add_sync(0xffffffffu, part);
-          if (lane == 0) s_u[6] = above;
+          above = exh + __reduce_add_sync(0xffffffffu, part);
         }
       }
+      if (lane == 0) {
+        s_i[5] = lo;
+        s_i[6] = bl;
+        s_i[7] = bh;
+        s_u[9] = flags;
+        s_u[6] = above;
+      }
     }
-    // band entries (every warp, a slice of the list): (key - lo) << 16 | position
+    S4DBG(17);
+    __syncthreads();  // e, window, band range
+    const int lo = s_i[5], bl = s_i[6], bh = s_i[7];
+    const uint32_t flags = s_u[9];
+    // band entries (all threads, the list in slices): (key - lo) << 16 | position
     if (bh >= bl) {
       const uint32_t klo = (uint32_t)(lo + bl), khi = (uint32_t)(lo + bh);
 #pragma unroll 1
@@ -548,9 +599,6 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
         if (k >= klo && k <= khi) band[atomicAdd(&s_u[7], 1u)] = ((k - (uint32_t)lo) << 16) | (e & 0xFFFFu);
       }
     }
-    // the bitmaps (post-pass SMEM row) are zeroed here, ordered before the marks by the poll
-#pragma unroll 1
-    for (int i = tid; i < 2 * kBmW; i += T) bmg[i] = 0u;
     __syncthreads();  // band entries
     S4DBG(13);
     // send: words [0, 8) header, [8, 136) window count pairs, [136, 136 + kS4Band) band
@@ -580,6 +628,10 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
       s4_put(p, r1row + (int64_t)p.rank * kV2Msg + w0, v);
     }
     S4DBG(3);
+    // the bitmaps (post-pass SMEM row) are zeroed in the round's wait, ordered before the
+    // marks by the poll barrier
+#pragma unroll 1
+    for (int i = tid; i < 2 * kBmW; i += T) bmg[i] = 0u;
     // poll (all threads, one v4 each)
     {
       const long long t0 = now_ns();
@@ -587,7 +639,12 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
       for (int i = tid; i < W * (kS4Msg / 4); i += T) {
         const int rr = i / (kS4Msg / 4), j = 4 * (i % (kS4Msg / 4));
         const uint32_t* src = p.box + r1row + (int64_t)rr * kV2Msg + j;
-        *reinterpret_cast<uint4*>(rx + rr * kS4Msg + j) = s4_poll(src, ld_sys_v4(src), tag, p.spin_ns, p.err, t0);
+        const uint4 v = s4_poll(src, ld_sys_v4(src), tag, p.spin_ns, p.err, t0);
+        uint32_t* const d = &rx[rr * kS4Msg + j];
+        d[0] = v.x;
+        d[1] = v.y;
+        d[2] = v.z;
+        d[3] = v.w;
       }
     }
     if (bt_sm)
@@ -677,6 +734,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
         s_u[0] = need;
         s_u[1] = ties;
       }
+      S4DBG(19);
     }
     __syncthreads();  // resolved
     S4DBG(5);
@@ -780,6 +838,13 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_s4_kernel(V2Params 
   }
 #undef S4DBG
 #undef S4STAT
+#undef srow
+#undef rx
+#undef bmg
+#undef bme
+#undef tl
+#undef h2c
+#undef fine
 }
 
 #ifdef S4_SKEL
