@@ -180,6 +180,13 @@ def parse_args():
         "(die_local.place_experts), as KimiK3MegaMoEExperts does on decode servers",
     )
     p.add_argument(
+        "--shared-place",
+        choices=("both", "fc1"),
+        default="both",
+        help="with --die-local: home both shared weights per die half (die_local.place_shared, "
+        "as the decode server) or only FC1 (diagnostic)",
+    )
+    p.add_argument(
         "--shared",
         default=None,
         help="HIDDEN,INTER: fuse a random MXFP8 E4M3 shared expert of that shape "
@@ -194,7 +201,7 @@ def parse_args():
     )
     p.add_argument(
         "--shared-l2-position",
-        choices=("early", "tail"),
+        choices=("early", "tail", "ready"),
         default=None,
         help="fused shared FC2 placement (default: the session's)",
     )
@@ -669,9 +676,11 @@ def main():
     fused = None
     if shared_shape is not None:
         fused, shared_ref = make_shared(W, shared_shape, max(caps), args.seed + rank, device)
-        if args.die_local:
+        if args.die_local and args.shared_place == "fc1":
             fc1 = die_local.place_halves(fused.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
             fused = fused._replace(fc1=(fc1, fused.fc1[1]))
+        elif args.die_local:
+            fused = die_local.place_shared(fused)
     moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),), shared=fused)
     rms = None
     if args.rmsnorm:

@@ -100,6 +100,32 @@ class SplitKFront:
         return self.proj.run(x, out)
 
 
+def _rehome_down(proj, linear, placed: torch.Tensor) -> None:
+    """Point the stock shared down projection (``proj``, and the ``linear`` whose
+    weight storage it views) at ``placed``, the fused kernel's die-homed copy of the
+    same [H, I] FP8 bytes (``die_local.place_shared``), so the layer keeps one copy:
+    the row-major stock buffer is dropped. No-op when the kernel kept the stock
+    buffer (no die-local placement)."""
+    old = proj.weight
+    if placed.data_ptr() == old.data_ptr():
+        return
+    param = linear.weight
+    if (
+        placed.shape != old.shape
+        or placed.stride() != old.stride()
+        or placed.dtype != old.dtype
+        or param.data_ptr() != old.data_ptr()
+        or param.data.numel() != old.numel()
+    ):
+        raise RuntimeError(
+            f"shared down re-home: placed {tuple(placed.shape)} {placed.stride()} "
+            f"{placed.dtype} does not replace the stock weight {tuple(old.shape)} "
+            f"{old.stride()} {old.dtype} (param {tuple(param.shape)} {param.stride()})"
+        )
+    param.data = placed.as_strided(param.shape, param.stride())
+    proj.weight = placed
+
+
 class FrontGemms:
     """Per-rows dispatch of the concatenated GEMM over ``LtPin`` / ``SplitKFront``."""
 
@@ -282,6 +308,7 @@ class SpMlp:
             self.fused_shared = mlp.experts.warmup_fused_shared(
                 FusedSharedArgs(buf.data, buf.scale, fc1, fc2)
             )
+            _rehome_down(dn, shared.down_proj, self.fused_shared.fc2[0][0].t())
         # Rubin MegaMoE: the latent RMSNorm folds into the kernel's top-k reduce (one
         # kernel and one [n, latent] round trip fewer per layer); compiled here, before
         # capture. Other MegaMoE backends keep the separate stock norm.

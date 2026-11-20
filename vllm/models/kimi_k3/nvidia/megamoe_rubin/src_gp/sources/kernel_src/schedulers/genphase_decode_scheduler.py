@@ -262,6 +262,8 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
     # Loop-carried device state; every other attribute is a host constant copied on rebuild. ``_lead_k_per_owner``
     # (the lead layout's K per owner, set by compute_stream_token_blocks) is () without a lead: no MLIR value.
     _device_fields = ("_work_id_worker", "_mapping", "_source", "_lead_k_per_owner")
+    # shared_l2_position 'ready': the kernel binds the shared FC1-done gate (assign_device_members shared_fc2_gate).
+    shared_fc2_ready_gate = True
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -349,6 +351,9 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         self._mapping = None
         self._source = None
         self._lead_k_per_owner = ()
+        # 'ready': (shared FC1-done counter of the last token block, its done count). Kernel-scope values bound once
+        # in assign_device_members and never reassigned: copied on rebuild like a host constant, not loop-carried.
+        self._shared_gate = None
 
     def _validate(self, fallback_cluster_shape_mn) -> None:
         """The policy's rules live here only; the kernel builds this scheduler in its constructor."""
@@ -423,6 +428,7 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         device_workspace: DeviceWorkspace,
         expert_remap: Optional[cute.Tensor] = None,
         die: Optional[Int32] = None,
+        shared_fc2_gate: Optional[Tuple] = None,
     ) -> None:
         """Bind the transport, the claim worker, the phase cursors and the source index (0). Lead builds: K is a
         placeholder 0 here (a fixed MLIR structure for the device state) and the scheduler warp must call
@@ -431,7 +437,11 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
 
         ``expert_token_sizes``: tokens per slot. ``expert_remap`` (slot -> expert): expert_half only, tells which die
         owns a slot. ``die``: this CTA's die, die-aware forms only, uniform within a cluster; clamped to {0, 1}.
+        ``shared_fc2_gate``: (shared FC1-done counter pointer, done count per token block), required by and only by
+        shared_l2_position 'ready' (the FC2 tiles wait on the same counter).
         """
+        if cutlass.const_expr((shared_fc2_gate is None) != (self.shared_fc2_position != "ready")):
+            raise ValueError("shared_fc2_gate is required by, and only by, shared_l2_position 'ready'.")
         if cutlass.const_expr(self.expert_half and expert_remap is None):
             raise ValueError("die_aware expert_half needs the slot -> expert remap.")
         if cutlass.const_expr((die is None) != (self.die_count == 1)):
@@ -465,6 +475,10 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             sizes_load_sorted=True,  # the GenPhase communication grid ranks slots by descending load
         )
         self._source = Int32(0)
+        if cutlass.const_expr(shared_fc2_gate is not None):
+            pointer, threshold = shared_fc2_gate
+            # FC1 tiles are claimed token block by token block, so the last token block's counter completes last.
+            self._shared_gate = (pointer + Int32(self.shared_token_blocks - 1), Int32(threshold))
         self._assign_shared_expert_stream(block_idx, device_workspace)
         if cutlass.const_expr(self.decode_lead is not None):
             # placeholder: K per owner comes from the scheduler warp's compute_stream_token_blocks (mandatory)
@@ -481,20 +495,21 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
 
     @property
     def shared_stream_count(self) -> int:
-        """Die-aware: one shared FC1 counter per die (its home half of the FC1 feature blocks) plus the FC2
-        counter; die-blind: the mixin's FC1 + FC2 counters."""
+        """Die-aware: one shared FC1 and one shared FC2 counter per die (each die's home half of the feature
+        blocks: counters FC1 die 0, FC1 die 1, FC2 die 0, FC2 die 1); die-blind: the mixin's FC1 + FC2 counters."""
         count = SharedExpertStreamMixin.shared_stream_count.fget(self)
-        return count + (1 if count and self.die_count == 2 else 0)
+        return count + (2 if count and self.die_count == 2 else 0)
 
     @cute.jit
-    def _claim_die_half(self, work_id_worker, side: Int32):
-        """Claim from the shared FC1 counter of die ``side`` (its feature blocks [base, base + count), every token
-        block). Returns (cluster-level shared FC1 id or -1 past the end, worker)."""
-        feature_blocks = self._shared_feature_blocks[0]
+    def _claim_die_half(self, work_id_worker, side: Int32, phase: int = 0):
+        """Claim from the shared FC1 (``phase`` 0) or FC2 (1) counter of die ``side`` (its feature blocks
+        [base, base + count), every token block). Returns (cluster-level shared id of that phase or -1 past the end,
+        worker)."""
+        feature_blocks = self._shared_feature_blocks[phase]
         half = feature_blocks // 2
         count = Int32(half) + Int32(feature_blocks - 2 * half) * side
         base = Int32(half) * side
-        local_id = work_id_worker.claim_next_work(self._shared_stream_index + side)
+        local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2 * phase + side)
         shared_id = Int32(-1)
         if local_id < count * Int32(self.shared_token_blocks):
             token_block = local_id // count
@@ -504,19 +519,25 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
     @cute.jit
     def _claim_shared_tile(self, work_id_worker, stage: Int32, next_id: Int32, fc2: int):
         """Die-aware (vLLM-local S-SH): shared FC1 tiles of this die's home half first (the die-local FC1 copy,
-        ``weights.prepare_mxfp8_shared_weights``), then the other die's; FC2 from its own counter. Die-blind: the
-        mixin's single FC1 / FC2 counters."""
+        ``die_local.place_shared``), then the other die's; shared FC2 tiles of this die's home half only (the
+        die-local FC2 halves: each die streams exactly its half, so the FC2 bytes split evenly between the dies
+        whichever die's clusters reach the claim first; a die's FC2 half is drained by its own clusters, each of which
+        passes the FC2 stage before its first routed claim). Die-blind: the mixin's single FC1 / FC2 counters."""
         if cutlass.const_expr(self.die_count == 1):
             return SharedExpertStreamMixin._claim_shared_tile(self, work_id_worker, stage, next_id, fc2)
         work_tile = make_fc12_done_tile(True)
+        # The mapping's owner is this CTA's die until the routed steal pass flips it (only leftover shared FC2 tiles
+        # are claimed after that, under 'ready' / 'tail': they start from the other die's half, then steal back).
+        own = Int32(self._mapping.owner_index)
         if cutlass.const_expr(fc2 == 1):
-            local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2)
-            if local_id < Int32(self._shared_phase_tiles[1]):
-                work_tile = self._decode_shared_tile(local_id, 1)
+            shared_id, work_id_worker = self._claim_die_half(work_id_worker, own, 1)
+            if shared_id < Int32(0):
+                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own, 1)
+            if shared_id >= Int32(0):
+                work_tile = self._decode_shared_tile(shared_id, 1)
             else:
                 stage = stage + Int32(1)
         else:
-            own = Int32(self._mapping.owner_index)
             shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
             if shared_id < Int32(0):
                 shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
@@ -525,6 +546,15 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             else:
                 stage = stage + Int32(1)
         return work_tile, stage, next_id, work_id_worker
+
+    @cute.jit
+    def _shared_fc2_ready(self, work_id_worker):
+        """'ready': whether every shared FC1 tile is done, loaded by the cluster leader and broadcast to every CTA of
+        the cluster (one decision per claim, so the CTAs of a cluster take the same source: K1). Only an order hint:
+        each shared FC2 tile still waits for its own counter (K3)."""
+        pointer, threshold = self._shared_gate
+        ready = work_id_worker.cluster_uniform_counter_ready(pointer, threshold)
+        return ready, work_id_worker
 
     @cute.jit
     def finish_claim_channel(self) -> None:

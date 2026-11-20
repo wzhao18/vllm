@@ -1573,6 +1573,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 device_workspace=self._device_workspace,
                 expert_remap=expert_remap,
                 die=die,
+                shared_fc2_gate=(
+                    (shared_fc1_done_counter_pointer, shared_fc2_spin_threshold)
+                    if self.scheduler.shared_fc2_position == "ready"
+                    else None
+                ),
             )
         else:
             # grouped / phase_interleave schedulers.
