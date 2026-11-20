@@ -746,7 +746,7 @@ class IndexerScore:
         end_a, w_a, hist_a, wscan_a = sm
         wg = warp // 4
         lt = tidx % 128
-        wq = lt // 32
+        wq = warp % 4  # = lt // 32, warp-uniform: TMEM addresses stay in uniform registers
         out_a = logits.iterator.toint()
         ph = Int32(0)
         jq = Int32(0)
