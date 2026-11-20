@@ -23,9 +23,10 @@ import cuda.bindings.driver as cuda
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", default="32,64,96")
-    ap.add_argument("--sleep-us", default="2,4,6")
+    ap.add_argument("--rows", default="32,96")
+    ap.add_argument("--sleep-us", default="4,6")
     ap.add_argument("--iters", type=int, default=40)
+    ap.add_argument("--cfg", default="16384x4,32768x4,32768x6,16384x8,65536x3")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     torch.manual_seed(0)
@@ -33,15 +34,19 @@ def main():
     rows = tuple(int(r) for r in args.rows.split(","))
     gemm = LtPin("router_latent", 4480, 7168, rows, out32=True, device=dev)
     table = touch_table([w], dev)
-    touch = compile_touch(1, sm_count(dev), dev.index)
+    cfgs = [tuple(int(v) for v in c.split("x")) for c in args.cfg.split(",")]
+    touches = {c: compile_touch(1, sm_count(dev), dev.index, *c) for c in cfgs}
     views = to_cute(table, 16)
     _, high = torch.cuda.Stream.priority_range()
     side = torch.cuda.Stream(device=dev, priority=high)
-    flush = torch.empty(1 << 29, dtype=torch.uint8, device=dev)
+    flush = torch.ones(1 << 28, dtype=torch.bfloat16, device=dev)  # read-only flush: clean lines
     main_s = torch.cuda.current_stream(dev)
     clk = 2.4e9  # SM clock under load (hwdb hw55)
     print(f"SMs {sm_count(dev)} clock {clk / 1e9:.2f} GHz")
-    for us in (float(s) for s in args.sleep_us.split(",")):
+    for c in cfgs:
+      touch = touches[c]
+      print(f"touch cfg chunk {c[0]} warps {c[1]}")
+      for us in (float(s) for s in args.sleep_us.split(",")):
         cycles = int(us * 1e-6 * clk)
         for n in rows:
             x = torch.randn(n, 7168, device=dev).to(torch.bfloat16)
@@ -50,7 +55,7 @@ def main():
                 y = torch.empty(n, 4480, device=dev, dtype=torch.float32)
                 ts = []
                 for _ in range(args.iters):
-                    flush.zero_()
+                    flush.sum()
                     a = torch.cuda.Event(enable_timing=True)
                     b = torch.cuda.Event(enable_timing=True)
                     a.record(main_s)
@@ -70,19 +75,19 @@ def main():
             mb, mt = statistics.median(times["base"]), statistics.median(times["touch"])
             print(f"producer {us:.0f} us n{n}: base {mb:.2f} touch {mt:.2f} us "
                   f"(delta {mt - mb:+.2f}) bitwise_equal={same}", flush=True)
-    # touch alone (cold), for the stream rate
-    ts = []
-    for _ in range(args.iters):
-        flush.zero_()
-        a = torch.cuda.Event(enable_timing=True)
-        b = torch.cuda.Event(enable_timing=True)
-        a.record(main_s)
-        touch(views, cuda.CUstream(main_s.cuda_stream))
-        b.record(main_s)
-        torch.cuda.synchronize()
-        ts.append(a.elapsed_time(b) * 1e3)
-    t = statistics.median(ts)
-    print(f"touch alone 64.2 MB cold: {t:.2f} us = {w.numel() * 2 / t / 1e6:.1f} TB/s")
+    for c, touch in touches.items():  # touch alone (cold, clean L2), stream rate
+        ts = []
+        for _ in range(args.iters):
+            flush.sum()
+            a = torch.cuda.Event(enable_timing=True)
+            b = torch.cuda.Event(enable_timing=True)
+            a.record(main_s)
+            touch(views, cuda.CUstream(main_s.cuda_stream))
+            b.record(main_s)
+            torch.cuda.synchronize()
+            ts.append(a.elapsed_time(b) * 1e3)
+        t = statistics.median(ts)
+        print(f"touch alone {c}: {t:.2f} us = {w.numel() * 2 / t / 1e6:.1f} TB/s")
 
 
 if __name__ == "__main__":

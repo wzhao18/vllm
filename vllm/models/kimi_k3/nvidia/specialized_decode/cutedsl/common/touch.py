@@ -36,14 +36,13 @@ def _bulk_load(dst, src, barrier, size):
 
 
 class L2Touch:
-    shared_bytes = WARPS * CHUNK + 8 * WARPS
-
-    def __init__(self, grid):
-        self.grid = grid
+    def __init__(self, grid, chunk=CHUNK, warps=WARPS):
+        self.grid, self.chunk, self.warps = grid, chunk, warps
+        self.shared_bytes = warps * chunk + 8 * warps
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.grid, 32 * WARPS, pdl=False)
+        launch(self.kernel, args, self.grid, 32 * self.warps, pdl=False)
 
     @cute.kernel
     def kernel(self, args):
@@ -51,27 +50,27 @@ class L2Touch:
         cute.arch.griddepcontrol_launch_dependents()
         tid, warp, lane, block = thread()
         storage = alloc(cutlass.utils.SmemAllocator(), Uint8, self.shared_bytes, 128)
-        slot = storage.iterator + warp * CHUNK
-        bars = cute.recast_ptr(storage.iterator + WARPS * CHUNK, dtype=Uint64)
+        slot = storage.iterator + warp * self.chunk
+        bars = cute.recast_ptr(storage.iterator + self.warps * self.chunk, dtype=Uint64)
         if tid == 0:
-            init_barriers(bars, WARPS, async_proxy=True)
+            init_barriers(bars, self.warps, async_proxy=True)
         cute.arch.sync_threads()
         if lane == 0:
             bar = bars + warp
             issuer = Int64(warp * self.grid + block)  # consecutive chunks: other SMs
-            issuers = Int64(self.grid * WARPS)
+            issuers = Int64(self.grid * self.warps)
             phase, done, row = Int32(0), Int64(0), Int32(0)
             while row < ranges.shape[0]:
                 base, nbytes = ranges[row, 0], ranges[row, 1]
-                chunks = (nbytes + CHUNK - 1) // CHUNK
+                chunks = (nbytes + self.chunk - 1) // self.chunk
                 index = issuer - done % issuers
                 if index < 0:
                     index += issuers
                 while index < chunks:
-                    offset = index * CHUNK
+                    offset = index * self.chunk
                     size = nbytes - offset
-                    if size > CHUNK:
-                        size = Int64(CHUNK)
+                    if size > self.chunk:
+                        size = Int64(self.chunk)
                     size = size & Int64(-16)
                     if size > 0:
                         cute.arch.mbarrier_arrive_and_expect_tx(bar, size.to(Int32))
@@ -84,10 +83,10 @@ class L2Touch:
 
 
 @functools.cache
-def compile_touch(count, grid, device_index):
+def compile_touch(count, grid, device_index, chunk=CHUNK, warps=WARPS):
     ranges = fake((count, 2), None, torch.int64)
     with torch.accelerator.device_index(device_index):
-        return cute.compile(L2Touch(grid), ranges, make_fake_stream())
+        return cute.compile(L2Touch(grid, chunk, warps), ranges, make_fake_stream())
 
 
 def touch_table(tensors, device):
