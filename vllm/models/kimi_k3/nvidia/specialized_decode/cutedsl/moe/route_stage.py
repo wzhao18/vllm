@@ -3,7 +3,9 @@
 """Router top-k + MegaMoE staging in one launch (SP decode MoE front).
 
 Input: the router | latent down GEMM's FP32 rows ``y [n, E + latent]``
-(``runtime.sp_mlp``: router logits in columns ``0:E``, the latent in ``E:``).
+(``runtime.sp_mlp``: router logits in columns ``0:E``, the latent in ``E:``), or a
+split-K GEMM's FP32 partials ``[splits, n, E + latent]`` summed here in split order
+(the GEMM's own deterministic FP32 sum, one kernel boundary and exchange fewer).
 One block per row:
 
 * all 8 warps: stock's sigmoid + correction-bias single-group top-k on the
@@ -96,6 +98,8 @@ __device__ __forceinline__ uint64_t warp_max_u64(uint64_t v) {
 struct Args {
   const float* y;
   int64_t ldy;
+  int32_t splits;        // y holds this many split-K partials, summed in order
+  int64_t split_stride;
   int32_t num_logits;
   const float* bias;
   uint8_t* x;
@@ -365,6 +369,8 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
   }
   // Every load of the row in flight at once: this thread's logits and its
   // quantization block (one per thread: hidden / vec <= 256, host-checked).
+  // A split-K GEMM's partials (splits > 1) are summed here in split order
+  // ((p0 + p1) + p2 ...): the FP32 accumulator the GEMM would have stored.
   const float* yrow = a.y + int64_t{row} * a.ldy;
   float lg[kPer];
 #pragma unroll
@@ -380,6 +386,26 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
         yrow + a.num_logits + int64_t{threadIdx.x} * vec);
 #pragma unroll
     for (int q = 0; q < vec / 4; ++q) in[q] = src[q];
+  }
+  for (int s = 1; s < a.splits; ++s) {
+    const float* ys = yrow + int64_t{s} * a.split_stride;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      int32_t const e = j * (kWarps * 32) + threadIdx.x;
+      if (e < a.num_logits) lg[j] += ys[e];
+    }
+    if (quant) {
+      const float4* src = reinterpret_cast<const float4*>(
+          ys + a.num_logits + int64_t{threadIdx.x} * vec);
+#pragma unroll
+      for (int q = 0; q < vec / 4; ++q) {
+        float4 const p = src[q];
+        in[q].x += p.x;
+        in[q].y += p.y;
+        in[q].z += p.z;
+        in[q].w += p.w;
+      }
+    }
   }
   __syncthreads();  // s_bias
   if (quant) {
@@ -400,8 +426,11 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                  const c10::optional<torch::Tensor>& pad, int64_t num_experts,
                  bool renormalize, double routed_scaling_factor, bool nvfp4,
                  double norm_const) {
-  TORCH_CHECK(y.scalar_type() == at::kFloat && y.dim() == 2 &&
-                  y.stride(1) == 1 && y.stride(0) % 4 == 0 &&
+  // y: FP32 rows [n, E + hidden], or split-K partials [splits, n, E + hidden].
+  const int64_t d = y.dim();
+  TORCH_CHECK(y.scalar_type() == at::kFloat && (d == 2 || d == 3) &&
+                  y.stride(d - 1) == 1 && y.stride(d - 2) % 4 == 0 &&
+                  (d == 2 || y.stride(0) % 4 == 0) &&
                   y.data_ptr<float>() != nullptr &&
                   reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
               "route_stage: y must be FP32 rows, 16-byte aligned");
@@ -414,8 +443,8 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
                   sw.scalar_type() == at::kFloat && sw.is_contiguous() &&
                   err.scalar_type() == at::kLong && err.numel() == 2,
               "route_stage: session buffers");
-  const int64_t n = y.size(0);
-  const int64_t hidden = y.size(1) - num_logits;
+  const int64_t n = y.size(d - 2);
+  const int64_t hidden = y.size(d - 1) - num_logits;
   const int64_t capacity = idx.size(0), topk = idx.size(1);
   const int64_t vec = nvfp4 ? 16 : 32;
   TORCH_CHECK(num_logits % 4 == 0 && num_logits <= 1024 && topk <= 32 &&
@@ -437,7 +466,9 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
   }
   Args a;
   a.y = y.data_ptr<float>();
-  a.ldy = y.stride(0);
+  a.ldy = y.stride(d - 2);
+  a.splits = d == 3 ? (int32_t)y.size(0) : 1;
+  a.split_stride = d == 3 ? y.stride(0) : 0;
   a.num_logits = (int32_t)num_logits;
   a.bias = bias.data_ptr<float>();
   a.x = x.data_ptr<uint8_t>();
@@ -585,12 +616,12 @@ class RouteStage:
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
         experts = self.mlp.experts
-        n = y.shape[0]
+        n = y.shape[-2]  # y [n, E + latent] or split-K partials [splits, n, E + latent]
         bucket = experts.select_bucket(n)
         rt = experts.get_runtime()
         session = rt.sessions[bucket]
         p = rt.problem
-        if y.shape[1] - self.num_logits != p.hidden or session.topk_idx.shape[1] != experts.top_k:
+        if y.shape[-1] - self.num_logits != p.hidden or session.topk_idx.shape[1] != experts.top_k:
             raise Unsupported("moe", n, "route_stage: MegaMoE problem shape")
         pad = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
