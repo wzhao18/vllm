@@ -224,6 +224,7 @@ def main():
     p.add_argument("--pending", type=int, default=0, help="pending tokens (0: 1..Q)")
     p.add_argument("--place", nargs="+", default=["striped"])
     p.add_argument("--mx", action="store_true", help="KdaFlow MXFP8 outputs")
+    p.add_argument("--qgroups", type=int, default=0, help="KdaCoreQ item groups")
     p.add_argument("--unfused", action="store_true", help="KdaFlow two verify passes")
     a = p.parse_args()
     global PENDING
@@ -264,6 +265,10 @@ def main():
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 
         flow.SCAN_REGS, flow.PREP_REGS = map(int, a.regs.split(","))
+    if a.qgroups:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import coreq
+
+        coreq.QGROUPS = a.qgroups
     if a.skip:
         from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import flow
 

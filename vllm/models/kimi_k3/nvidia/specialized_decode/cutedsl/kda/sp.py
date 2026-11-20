@@ -65,7 +65,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ...shapes import Choice, Path, Shape, Unsupported
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
-from . import chain, core, flow, fused_ws, ring, specialized
+from . import chain, core, coreq, flow, fused_ws, ring, specialized
 from .fused import KdaFused
 from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
@@ -86,11 +86,12 @@ REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
 KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "flowp", "chain",
-         "core")
+         "core", "coreq")
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
-FOLDS = ("fused", "fused_ws", "wide", "flow", "flowp", "chain", "ring", "core")
-DIE_KINDS = ("flow", "flowp", "ring", "core")  # die-matched items, MXFP8 outputs
+FOLDS = ("fused", "fused_ws", "wide", "flow", "flowp", "chain", "ring", "core",
+         "coreq")
+DIE_KINDS = ("flow", "flowp", "ring", "core", "coreq")  # die-matched items, MXFP8 outputs
 MODES = ("deferred", "triton", "none")
 
 
@@ -173,7 +174,7 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFusedWS's shared memory does not fit")
         ctas = persistent_ctas(items, sms)
         return KdaFusedWS(heads, tokens, mode, has_bias, *streamed, ctas)
-    if kind in ("flow", "flowp", "chain", "ring", "core", "flowdump"):
+    if kind in ("flow", "flowp", "chain", "ring", "core", "coreq", "flowdump"):
         if not record or not 2 <= tokens <= 4:
             cause = "KdaFlow runs RecoverSSM record steps of 2..4 tokens only"
             raise Unsupported("kda", shape, cause)
@@ -192,6 +193,13 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
                 raise Unsupported("kda", shape, "KdaRing's shared memory does not fit")
             return ring.KdaRing(heads, tokens, mode, has_bias, *streamed, ctas,
                                 dies="dies" in options, mx="mx" in options)  # fmt: skip
+        if kind == "coreq":
+            if len(specs) < 19 or tokens != core.TOKENS or "dies" in options:
+                raise Unsupported("kda", shape, "KdaCoreQ: deferred q4, static ranges")
+            if coreq.shared_bytes(coreq.QGROUPS) > budget:
+                raise Unsupported("kda", shape, "KdaCoreQ's shared memory does not fit")
+            return coreq.KdaCoreQ(heads, tokens, mode, has_bias, *streamed, ctas, stages,
+                                  mx="mx" in options)  # fmt: skip
         if kind in ("core", "flowdump"):
             if len(specs) < 19 or tokens != core.TOKENS:  # the deferred operands
                 raise Unsupported("kda", shape, "KdaCore runs deferred q4 records only")
@@ -436,7 +444,7 @@ class SpKdaCore:
                 chain_scratch(self.device, items)  # allocated before any capture
                 scratch = torch.empty(chain.scratch_shape(items), **meta)
                 deferred = (*deferred, scratch)
-            if kind == "core":  # the operand blocks (+ the state's TMA map)
+            if kind in ("core", "coreq"):  # the operand blocks (+ the TMA map)
                 self.core_operands(state, n)
                 deferred = (*deferred, torch.empty_like(self.opb, **meta))
                 dumped = self._operands(caches, projected, slots, out, accepted,
@@ -444,7 +452,7 @@ class SpKdaCore:
                 deferred = (*deferred, torch.empty_like(self.tmap, **meta))
                 if self.standin:
                     options = (self.heads, self.q, True, self.has_bias, self.device.index)
-                    stand = flavor.replace("core", "flowdump")
+                    stand = "flowdump" + flavor[len(kind):]
                     self.standins[r] = executable(tuple(map(layout, dumped)), stand,
                                                   *options)  # fmt: skip
             operands = self._operands(caches, projected, slots, out, accepted, deferred)
@@ -498,9 +506,11 @@ class SpKdaCore:
             slots = slots.contiguous()
         tensors = self._operands(caches, projected, slots, out, accepted[:n], extra)
         dumped = ()
-        if self.kinds[rows] == "core":
-            if self.tmap_state is not caches[1]:
-                raise Unsupported("kda", Shape(rows, self.q), "KdaCore: another cache")
+        if self.kinds[rows] in ("core", "coreq"):
+            if self.tmap_state.data_ptr() != caches[1].data_ptr():
+                if torch.cuda.is_current_stream_capturing():
+                    raise Unsupported("kda", Shape(rows, self.q), "KdaCore: another cache")
+                self.core_operands(caches[1], n)  # (tests: a cloned cache)
             dumped = (*tensors, self.opb)
             tensors = (*tensors, self.opb, self.tmap)
         specs = tuple(map(layout, tensors))

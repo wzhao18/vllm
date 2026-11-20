@@ -105,6 +105,11 @@ def wait_group_read1():
 
 
 @asm()
+def wait_group_read0():
+    return "cp.async.bulk.wait_group.read 0;", "~{memory}", ()
+
+
+@asm()
 def wait_group_all():
     return "cp.async.bulk.wait_group 0;", "~{memory}", ()
 
@@ -153,6 +158,10 @@ class KdaCore(flow.KdaFlow):
         super().__init__(*args, **kwargs)
         assert self.tokens == TOKENS
         self.opb_at = self.mx_at + 2 * int(self.mx)
+        # Diagnostics (benchmarks only): "qstore" = the warp's whole 16 KiB quarter
+        # leaves by one contiguous bulk store per item (2 sub-blocks in flight).
+        self.qstore = "qstore" in self.skip
+        self.nsub = 2 if self.qstore else NSUB
 
     @cute.jit
     def __call__(self, *args):
@@ -177,20 +186,23 @@ class KdaCore(flow.KdaFlow):
         count = Int32(total_items * (cta + 1) // self.ctas) - first
 
         smem = cutlass.utils.SmemAllocator()
-        lr = alloc(smem, Float32, (WARPS, NSUB, SUB_FLOATS), align=1024)
+        lr = alloc(smem, Float32, (WARPS, self.nsub, SUB_FLOATS), align=1024)
         scratch = cute.make_tensor(
             cute.recast_ptr(at(lr, 0, 0, 0), dtype=Int32), cute.make_layout(1024)
         )
         if cutlass.const_expr(self.dies):  # die-matched items
             count = self.die_claim(args, tid, cta, scratch)
-        ring = alloc(smem, Float32, (WARPS, 2, BOX * BOX), align=128)
+        if cutlass.const_expr(self.qstore):
+            ring = alloc(smem, Float32, (WARPS, 1, 32 * K), align=128)
+        else:
+            ring = alloc(smem, Float32, (WARPS, 2, BOX * BOX), align=128)
         opb = alloc(smem, Float32, (GROUPS, 2, OPB_FLOATS), align=128)
         table = alloc(smem, Int32, (MAX_ITEMS, META))
         sums = alloc(smem, Float32, (GROUPS, SUMS, 4))
-        bars = smem.allocate(cutlass.Uint64, WARPS * NSUB + 2 * GROUPS)
-        lfull, opb_full = bars, bars + WARPS * NSUB
+        bars = smem.allocate(cutlass.Uint64, WARPS * self.nsub + 2 * GROUPS)
+        lfull, opb_full = bars, bars + WARPS * self.nsub
         if tid == 0:
-            for s in cutlass.range_constexpr(WARPS * NSUB):
+            for s in cutlass.range_constexpr(WARPS * self.nsub):
                 cute.arch.mbarrier_init(lfull + s, 1)
             for b in cutlass.range_constexpr(2 * GROUPS):
                 cute.arch.mbarrier_init(opb_full + b, 1)
@@ -220,7 +232,7 @@ class KdaCore(flow.KdaFlow):
         # The state does not depend on the predecessor: the first sub-blocks go first.
         if tid % 32 == 0:
             prefetch_tensormap(tmap)
-            for m in cutlass.range_constexpr(NSUB):
+            for m in cutlass.range_constexpr(self.nsub):
                 if m < 2 * mine:
                     self.load_sub(lr, lfull, wid, m, table, g + GROUPS * (m // 2),
                                   m % 2, tmap)  # fmt: skip
@@ -251,13 +263,13 @@ class KdaCore(flow.KdaFlow):
     @cute.jit
     def load_sub(self, lr, lfull, wid, m, table, j, half, tmap):
         """Sub-block m of warp ``wid``'s stream (item j's rows 32 (wid % 4) + [0, 32),
-        keys 64 half + [0, 64)) into ring slot m % NSUB; a padded item arrives empty."""
+        keys 64 half + [0, 64)) into ring slot m % self.nsub; a padded item arrives empty."""
         slot, head = table[j, SLOT], table[j, HEAD]
-        barrier = lfull + wid * NSUB + m % NSUB
+        barrier = lfull + wid * self.nsub + m % self.nsub
         if slot > 0:
             cute.arch.mbarrier_arrive_and_expect_tx(barrier, SUB_FLOATS * 4)
             for b in cutlass.range_constexpr(2):
-                tma_load4(at(lr, wid, m % NSUB, b * BOX * BOX), tmap, barrier,
+                tma_load4(at(lr, wid, m % self.nsub, b * BOX * BOX), tmap, barrier,
                           Int32(64 * half + BOX * b), Int32(32 * (wid % 4)), head,
                           slot)  # fmt: skip
         else:
@@ -339,13 +351,13 @@ class KdaCore(flow.KdaFlow):
                 tmap = args[self.opb_at + 1].iterator
                 for half in cutlass.range_constexpr(2):
                     m = 2 * jj + half
-                    self.bwait(lfull + wid * NSUB + m % NSUB, (m // NSUB) % 2, "lfull")
+                    self.bwait(lfull + wid * self.nsub + m % self.nsub, (m // self.nsub) % 2, "lfull")
                     cute.arch.sync_warp()
                     if lane == 0:
-                        if m + NSUB < 2 * mine:
-                            self.load_sub(lr, lfull, wid, m + NSUB, table,
-                                          g + GROUPS * ((m + NSUB) // 2),
-                                          (m + NSUB) % 2, tmap)  # fmt: skip
+                        if m + self.nsub < 2 * mine:
+                            self.load_sub(lr, lfull, wid, m + self.nsub, table,
+                                          g + GROUPS * ((m + self.nsub) // 2),
+                                          (m + self.nsub) % 2, tmap)  # fmt: skip
                     cute.arch.sync_warp()
                 for t in cutlass.range_constexpr(T):
                     self.store_output(args, token + t, head, c, BFloat16(0))
@@ -379,16 +391,23 @@ class KdaCore(flow.KdaFlow):
         tmap = args[self.opb_at + 1].iterator
         for ch in cutlass.range_constexpr(CHUNKS):
             box = ring[wid, ch % 2, None]
+            if cutlass.const_expr(self.qstore):
+                box = ring[wid, 0, None]
+                if cutlass.const_expr(ch == 0):  # noqa: SIM102
+                    if stored:
+                        if lane == 0:
+                            wait_group_read0()
+                        cute.arch.sync_warp()
             m = 2 * jj + ch // 2
             if cutlass.const_expr(ch % 2 == 0):  # this half's sub-block has landed
                 w0 = Int64(0)
                 if cutlass.const_expr(self.trace):
                     w0 = clock64()
-                self.bwait(lfull + wid * NSUB + m % NSUB, (m // NSUB) % 2, "lfull")
+                self.bwait(lfull + wid * self.nsub + m % self.nsub, (m // self.nsub) % 2, "lfull")
                 if cutlass.const_expr(self.trace):
                     tr[2] = tr[2] + (clock64() - w0)
-            sub = lr[wid, m % NSUB, None]
-            if cutlass.const_expr("tma" not in self.skip):  # noqa: SIM102
+            sub = lr[wid, m % self.nsub, None]
+            if cutlass.const_expr("tma" not in self.skip and not self.qstore):  # noqa: SIM102
                 if stored:
                     w1 = Int64(0)
                     if cutlass.const_expr(self.trace):
@@ -405,17 +424,29 @@ class KdaCore(flow.KdaFlow):
                 fence_async_shared()
                 cute.arch.sync_warp()
                 if lane == 0:
-                    if m + NSUB < 2 * mine:
-                        self.load_sub(lr, lfull, wid, m + NSUB, table,
-                                      g + GROUPS * ((m + NSUB) // 2), (m + NSUB) % 2,
+                    if m + self.nsub < 2 * mine:
+                        self.load_sub(lr, lfull, wid, m + self.nsub, table,
+                                      g + GROUPS * ((m + self.nsub) // 2), (m + self.nsub) % 2,
                                       tmap)  # fmt: skip
-            if cutlass.const_expr("tma" not in self.skip):  # noqa: SIM102
+            if cutlass.const_expr(self.qstore and ch == CHUNKS - 1):  # noqa: SIM102
                 if stored:
                     fence_async_shared()
                     cute.arch.sync_warp()
                     if lane == 0:
-                        tma_store4(tmap, at(box, 0), Int32(BOX * ch), Int32(32 * warp),
-                                   head, slot)  # fmt: skip
+                        dest = args[9][Int64(slot), head, None, None]
+                        flow.store_bulk(at(dest, 32 * warp, 0), at(box, 0), 32 * K * 4)
+                        bulk_commit()
+            if cutlass.const_expr("tma" not in self.skip and not self.qstore):  # noqa: SIM102
+                if stored:
+                    fence_async_shared()
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        if cutlass.const_expr("l2store" in self.skip):  # one page
+                            tma_store4(tmap, at(box, 0), Int32(BOX * ch),
+                                       Int32(32 * warp), Int32(0), Int32(1))  # fmt: skip
+                        else:
+                            tma_store4(tmap, at(box, 0), Int32(BOX * ch),
+                                       Int32(32 * warp), head, slot)  # fmt: skip
                         bulk_commit()
             cute.arch.sync_warp()
 
@@ -455,7 +486,10 @@ class KdaCore(flow.KdaFlow):
                                      (xs[e, 2 * p], xs[e, 2 * p + 1]), pair)  # fmt: skip
                     acc[rr, 2 * p], acc[rr, 2 * p + 1] = pair
             if stored:
-                store_shared_f32x4(at(box, local), new)
+                if cutlass.const_expr(self.qstore):
+                    store_shared_f32x4(at(box, (row - 32 * warp) * K + key), new)
+                else:
+                    store_shared_f32x4(at(box, local), new)
 
     @cute.jit
     def xor_reduce(self, acc, lane_in):
