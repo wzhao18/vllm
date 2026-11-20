@@ -5293,7 +5293,14 @@ class NixlBaseConnectorWorker:
         """
         done_req_ids: set[str] = set()
         failed_req_ids: set[str] = set()
+        _now = time.perf_counter()  # PDDIAG (diagnostic branch only)
+        _gf = self.__dict__.setdefault("_pddiag_gf", [])
+        _fs = self.__dict__.setdefault("_pddiag_first", {})
+        if transfers:
+            _gf.append(_now)
+            del _gf[:-4096]
         for req_id, handles in list(transfers.items()):
+            _fs.setdefault(req_id, _now)
             in_progress = []
             for handle in handles:
                 try:
@@ -5332,6 +5339,17 @@ class NixlBaseConnectorWorker:
                 span = self._xfer_span_us.pop(req_id, None)
                 if span is not None and req_id not in failed_req_ids:
                     self.xfer_stats.record_request_xfer_wall((span[1] - span[0]) / 1e6)
+                _t0 = _fs.pop(req_id, _now)
+                _g = [b - a for a, b in zip(_gf, _gf[1:]) if a >= _t0]
+                logger.info(
+                    "PDDIAG tp=%d req=%s seen_to_done=%.2fms polls=%d gap_max=%.2fms "
+                    "gap_mean=%.2fms span=%.2fms pop=%.3fms",
+                    self.tp_rank, req_id[-10:], (time.perf_counter() - _t0) * 1e3,
+                    len(_g), max(_g) * 1e3 if _g else 0.0,
+                    sum(_g) / len(_g) * 1e3 if _g else 0.0,
+                    (span[1] - span[0]) / 1e3 if span else -1.0,
+                    (time.perf_counter() - _now) * 1e3,
+                )
             else:
                 transfers[req_id] = in_progress
         for req_id in failed_req_ids:
