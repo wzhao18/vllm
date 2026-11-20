@@ -83,6 +83,10 @@ PREWAIT_ROWS = (64, 96)
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
+# DIAG ONLY (D-MOE-LADDER R6-2, never lands): "pre" = no fused shared expert; the
+# shared expert forks to its side stream BEFORE the router | latent down, so it
+# streams under the router / top-k staging, and MegaMoE runs the routed experts only.
+_DML_SHPRE = "pre"
 
 
 class SplitKFront:
@@ -227,7 +231,7 @@ class SpMlp:
         # gate_up input scratch, the stock weights' bytes). Per-shape: rows above the
         # bucket keep the side-stream chain.
         fused_cap = None
-        if self.mxfp8 and _rubin_megamoe(mlp.experts):
+        if self.mxfp8 and _rubin_megamoe(mlp.experts) and _DML_SHPRE == "":
             from ...megamoe_rubin.experts import RUBIN_WIDE_EP_DECODE_TOKENS
 
             down = shared.down_proj
@@ -338,60 +342,75 @@ class SpMlp:
             return gemms["latent_down"].run(h, h.new_empty((n, self.latent)))
 
         fused_norm = self.fused_norm
-        route = self.route_stage
-        if route is not None and route.ready(n):
-            # Router | latent down as one FP32 GEMM, then one kernel stages its
-            # top-k routes and the quantized latent into MegaMoE (route_stage).
-            packed, gemm, _ = self.router_latent
-            y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
-            pw = self.prewait_router_latent
-            if (
-                pw is not None
-                and n in PREWAIT_ROWS
-                and prewait_gemm.supported(n, packed.shape[1])
-            ):
-                prewait_gemm.gemm(y, h, pw, packed.shape[0])
+
+        def make_experts():
+            route = self.route_stage
+            if route is not None and route.ready(n):
+                # Router | latent down as one FP32 GEMM, then one kernel stages its
+                # top-k routes and the quantized latent into MegaMoE (route_stage).
+                packed, gemm, _ = self.router_latent
+                y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
+                pw = self.prewait_router_latent
+                if (
+                    pw is not None
+                    and n in PREWAIT_ROWS
+                    and prewait_gemm.supported(n, packed.shape[1])
+                ):
+                    prewait_gemm.gemm(y, h, pw, packed.shape[0])
+                else:
+                    gemm.run(packed, h, y)
+                # Staged before the shared expert forks to its stream: nothing
+                # competes with the MegaMoE front.
+                staged = route.stage(y)
+
+                def experts(shared=None):
+                    return route.launch(staged, fused_norm, shared)
+
             else:
-                gemm.run(packed, h, y)
-            # Staged before the shared expert forks to its stream: nothing
-            # competes with the MegaMoE front.
-            staged = route.stage(y)
+                (router_output, topk_ids), routed = maybe_execute_in_parallel(
+                    lambda: mlp._router(h),
+                    down,
+                    mlp._down_proj_events[0],
+                    mlp._down_proj_events[1],
+                    mlp._down_proj_stream if n <= self.threshold else None,
+                )
 
-            def experts(shared=None):
-                return route.launch(staged, fused_norm, shared)
+                def experts(shared=None):
+                    kwargs = {}
+                    if fused_norm is not None:  # backends without the fused norm take no kwarg
+                        kwargs["output_rmsnorm"] = fused_norm
+                    if shared is not None:
+                        kwargs["fused_shared"] = shared
+                    return mlp.experts(routed, router_output, topk_ids, **kwargs)
 
-        else:
-            (router_output, topk_ids), routed = maybe_execute_in_parallel(
-                lambda: mlp._router(h),
-                down,
-                mlp._down_proj_events[0],
-                mlp._down_proj_events[1],
-                mlp._down_proj_stream if n <= self.threshold else None,
-            )
+            return experts
 
-            def experts(shared=None):
-                kwargs = {}
-                if fused_norm is not None:  # backends without the fused norm take no kwarg
-                    kwargs["output_rmsnorm"] = fused_norm
-                if shared is not None:
-                    kwargs["fused_shared"] = shared
-                return mlp.experts(routed, router_output, topk_ids, **kwargs)
-
-        if self.fused_shared is not None and mlp.experts.fused_shared(n):
-            if not prequantized:
-                gemms["shared_gu"].input.quantize(h)
-            final, shared_out = experts(self.fused_shared)
-        elif mlp._shared_overlap:
+        if _DML_SHPRE == "pre" and self.fused_shared is None and mlp._shared_overlap:
+            # DIAG R6-2: the shared expert streams under the router / top-k staging.
             final, shared_out = maybe_execute_in_parallel(
-                experts,
+                lambda: make_experts()(),
                 lambda: self._shared(h, prequantized),
                 mlp._shared_events[0],
                 mlp._shared_events[1],
                 mlp._shared_stream,
             )
         else:
-            final = experts()
-            shared_out = self._shared(h, prequantized)
+            experts = make_experts()
+            if self.fused_shared is not None and mlp.experts.fused_shared(n):
+                if not prequantized:
+                    gemms["shared_gu"].input.quantize(h)
+                final, shared_out = experts(self.fused_shared)
+            elif mlp._shared_overlap:
+                final, shared_out = maybe_execute_in_parallel(
+                    experts,
+                    lambda: self._shared(h, prequantized),
+                    mlp._shared_events[0],
+                    mlp._shared_events[1],
+                    mlp._shared_stream,
+                )
+            else:
+                final = experts()
+                shared_out = self._shared(h, prequantized)
         norm = mlp.routed_output_transform.norm
         if norm is not None and fused_norm is None:
             final = norm(final)
