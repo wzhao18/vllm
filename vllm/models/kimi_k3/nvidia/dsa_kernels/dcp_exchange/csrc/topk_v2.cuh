@@ -1086,14 +1086,27 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             xhi = max(xhi, lr + kV2Win);
           }
           xhi = min(xhi, 0x10000);
-          for (int x = xhi - 1 - tid; x >= xlo; x -= T) {
+          // LB = the largest x in [xlo, xhi) with g(x) >= K. g is non-increasing and changes
+          // only between x and x + 1 for x in [lr_r - 1, lr_r + kV2Win - 1] of some rank r, so
+          // LB is xhi - 1 or one of those W x (kV2Win + 1) points: evaluate only them (one or
+          // a few points per thread instead of a strided walk over up to 64K keys).
+          constexpr int kPts = kV2MaxW * (kV2Win + 1) + 1;
+          for (int i = tid; i < W * (kV2Win + 1) + 1 && i < kPts; i += T) {
+            int x;
+            if (i == W * (kV2Win + 1)) {
+              x = xhi - 1;
+            } else {
+              const int rr = i / (kV2Win + 1);
+              x = (int)(rx[rr * kV2Msg] & 0xFFFFu) - 1 + i % (kV2Win + 1);
+            }
+            if (x < xlo || x >= xhi) continue;
             uint32_t g = 0;
             for (int r = 0; r < W; ++r) {
               const int lr = (int)(rx[r * kV2Msg] & 0xFFFFu);
               const uint32_t* sr = suf + r * (kV2Win + 1);
               g += x < lr ? sr[0] : (x < lr + kV2Win ? sr[x - lr] : 0u);
             }
-            if (g >= (uint32_t)K) { atomicMax(&s_r2[0], x); break; }
+            if (g >= (uint32_t)K) atomicMax(&s_r2[0], x);
           }
         }
         __syncthreads();
@@ -1195,6 +1208,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
                 for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + base + 4 * j, v);
             }
           }
+          V2DBG(29);
           const uint4 dead = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
           auto poll = [&](int r, int j) -> uint4 {  // vector j of rank r's slot, then re-armed
             uint32_t* src = p.box + r2row + (int64_t)r * kR2W + 4 * j;

@@ -38,7 +38,8 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
-             7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
+             7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 11: "r2 polled",
+             29: "r2 sent", 8: "end"}
 STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
 
 
