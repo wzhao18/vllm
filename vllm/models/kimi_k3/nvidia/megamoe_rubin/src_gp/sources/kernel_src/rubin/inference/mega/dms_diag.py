@@ -16,7 +16,7 @@ from ......common.ptx_helpers import read_globaltimer_ns, read_smid
 ON = True
 REGION = "genphase.diag.stamps_ring"
 RING = 64
-SLOTS = 304
+SLOTS = 392
 MAX_SM = 256
 ENTRY_BYTES = MAX_SM * SLOTS * 8
 
@@ -45,6 +45,7 @@ S_GBU0 = 208  # Gather-B: unit start
 S_EPU0, S_EPM0, S_EPS0 = 224, 240, 256  # epilogue: unit start / math done / completion signal published
 S_TAW0 = 272  # TMA-A: clock64 (unit cycles << 32) | empty-wait cycles (acquire + try-acquire)
 S_MMX0 = 288  # MMA (leader): cycles in S2T copies << 42 | MMA issue << 21 | consumer release
+S_PKW0, S_PKP0, S_PKR0 = 304, 332, 360  # first unit, stage k < 28: after wait / after peek / after release
 S_DIE = 7  # die + 1 of this CTA (die-aware builds)  # TMA-A unit k start time / phase, k < 16
 # comm grid (token_comm) CTAs: entry, previous-tail wait passed, role work done, refine done, exit, role, epoch tag
 C_ENTRY, C_EPOK, C_ROLE, C_REFINE, C_EXIT, C_ROLEID, C_EPOCH = 12, 13, 14, 15, 18, 20, 21

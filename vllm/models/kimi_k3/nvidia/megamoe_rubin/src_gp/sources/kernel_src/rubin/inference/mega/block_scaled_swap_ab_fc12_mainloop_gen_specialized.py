@@ -1888,11 +1888,15 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 _dms_c1 = read_clock64()
                 if k_tile_idx == Int32(0):
                     DG.put_gt_dyn(Int32(DG.S_MMF0) + _dms_slot, _dms_p)
+                if dms_u == Int32(0):
+                    DG.put_gt_dyn(Int32(DG.S_PKW0) + (k_tile_idx & Int32(31)), DG.lane0() * Int32(k_tile_idx < Int32(28)))
                 _dms_w = _dms_w + (_dms_c1 - _dms_c0) * Int64(Int32(k_tile_idx > Int32(0)))
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
+                if dms_u == Int32(0):
+                    DG.put_gt_dyn(Int32(DG.S_PKP0) + (k_tile_idx & Int32(31)), DG.lane0() * Int32(k_tile_idx < Int32(28)))
                 _dms_c3 = read_clock64()
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
@@ -1936,6 +1940,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 _dms_mi = _dms_mi + (_dms_c5 - _dms_c4)
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 _dms_rl = _dms_rl + (read_clock64() - _dms_c5)
+                if dms_u == Int32(0):
+                    DG.put_gt_dyn(Int32(DG.S_PKR0) + (k_tile_idx & Int32(31)), DG.lane0() * Int32(k_tile_idx < Int32(28)))
                 ab_pipeline_state.advance()
                 next_ab_pipeline_state.advance()
                 full_status = next_full_status
@@ -1955,11 +1961,15 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 _dms_c1 = read_clock64()
                 if k_tile_idx == Int32(0):
                     DG.put_gt_dyn(Int32(DG.S_MMF0) + _dms_slot, _dms_p)
+                if dms_u == Int32(0):
+                    DG.put_gt_dyn(Int32(DG.S_PKW0) + (k_tile_idx & Int32(31)), DG.lane0() * Int32(k_tile_idx < Int32(28)))
                 _dms_w = _dms_w + (_dms_c1 - _dms_c0) * Int64(Int32(k_tile_idx > Int32(0)))
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
+                if dms_u == Int32(0):
+                    DG.put_gt_dyn(Int32(DG.S_PKP0) + (k_tile_idx & Int32(31)), DG.lane0() * Int32(k_tile_idx < Int32(28)))
                 _dms_c3 = read_clock64()
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
@@ -1988,6 +1998,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 _dms_mi = _dms_mi + (_dms_c5 - _dms_c4)
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 _dms_rl = _dms_rl + (read_clock64() - _dms_c5)
+                if dms_u == Int32(0):
+                    DG.put_gt_dyn(Int32(DG.S_PKR0) + (k_tile_idx & Int32(31)), DG.lane0() * Int32(k_tile_idx < Int32(28)))
                 ab_pipeline_state.advance()
                 next_ab_pipeline_state.advance()
                 full_status = next_full_status
