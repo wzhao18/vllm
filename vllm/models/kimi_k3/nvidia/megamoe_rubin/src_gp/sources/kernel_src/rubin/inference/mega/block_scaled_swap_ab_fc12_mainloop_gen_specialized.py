@@ -1591,7 +1591,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
                     fc1_sf_parts_per_block
                 )
-                spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
+                # DIAG dr1: the payload flag (pointer/target passed in place of fc1_sf_ready / parts per block).
+                spin_wait(fc1_sf_ready_pointer, lambda value: value == Int32(fc1_sf_parts_per_block), scope="sys")
             else:
                 # FC2 waits for its token block's FC1 tiles, shared FC2 for the shared ones; shared FC1 has no wait.
                 if cutlass.const_expr(not self.shared_enabled):

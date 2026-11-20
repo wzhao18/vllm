@@ -1422,7 +1422,7 @@ class GenphaseTokenComm(KernelComponent):
             DG.put_gt(DG.C_ROLE, _dms_t0)
             DG.put_val(DG.C_ROLEID, Int64(3), _dms_t0)
 
-        self._run_refine(device_workspace, smem_base, thread_idx)
+        # DIAG dr1 (timing only): no refine pass; routed FC1 TMA-B waits for the payload flag instead.
         DG.put_gt(DG.C_REFINE, _dms_t0)
         self._leave(device_workspace, thread_idx)
         DG.put_gt(DG.C_EXIT, _dms_t0)
