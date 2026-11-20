@@ -28,8 +28,11 @@ from .kda_conv_gemm import _Kernel as _BaseKernel
 from .packed_situ_gemm import interleave_shared_rows, situ_constants
 
 # (tile, cluster, inst_m, swizzle, raster, split producer, swap, flags)
-# c2x4 m-raster mis-stores at M=4096 (N 3072/6144); c2x1 is bitwise at every tested shape.
-DEFAULT_TACTIC = ((512, 256), (2, 1), 256, 8, "n", 0, 0, "drain")
+# (2, 4) clusters multicast each A tile to the 4 N tiles of the cluster: a
+# quarter of the L2 -> SM operand bytes for A, which is what the kernel's time
+# follows at the prefill power cap (sustained randn: 0.91-0.93x the (2, 1)
+# tactic). The m raster with swizzle 4 beat swizzle 1/2/8 and the n raster.
+DEFAULT_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8")
 _COMPILED: dict = {}
 
 

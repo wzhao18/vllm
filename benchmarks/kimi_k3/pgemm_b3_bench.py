@@ -118,7 +118,8 @@ PLAIN = [
 
 
 def tname(t):
-    return f"{t[0][0]}x{t[0][1]}_c{t[1][0]}x{t[1][1]}_{t[4]}{t[3]}" + (f"_{t[7]}" if t[7] else "")
+    s = f"_s{t[5]}" if len(t) > 5 and t[5] else ""
+    return f"{t[0][0]}x{t[0][1]}_c{t[1][0]}x{t[1][1]}_{t[4]}{t[3]}{s}" + (f"_{t[7]}" if t[7] else "")
 
 
 def main():

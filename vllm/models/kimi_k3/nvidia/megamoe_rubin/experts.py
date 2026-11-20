@@ -142,9 +142,12 @@ RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
 RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
 RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
 RUBIN_DEDUP_MIN_TOKENS = 4096
+# Cluster (2, 1): 106 CTA pairs cover all 212 SMs (cluster (4, 1) packs 46 clusters = 184 CTAs); dynamic B
+# gather on the pair. EP1 (28 experts, NVFP4, fused MXFP8 shared, same session ABBA, bitwise-equal outputs):
+# 55.4 / 56.4 / 59.6 vs 56.7 / 58.2 / 60.9 us at 32 / 96 / 128 tokens per rank.
 RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
     mma_tiler_mnk=(256, 128, 256),
-    cluster_shape_mn=(4, 1),
+    cluster_shape_mn=(2, 1),
     fallback_cluster_shape_mn=None,
     schedule_policy=("decode", None),
     work_id_mode="atomic_counter",

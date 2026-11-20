@@ -264,6 +264,10 @@ class _FakeExchanger:
     def warm_up(self) -> None:
         self.warm_ups += 1
 
+    def for_layout(self, layout):
+        """Another exchange stage of this rank, on the same buffers."""
+        return type(self)(self.fabric, self.buf, self.table, layout)
+
     def exchange(self, units) -> None:
         units = list(units)
         rank = self.layout.dcp_rank
@@ -823,7 +827,7 @@ def test_pull_then_exchange_on_k31_geometry(
             INDEX_VALUE_BYTES,
         )
         assert build["chunk_units"] == 4 and build["device"] == torch.device("cpu")
-        assert rank.worker._pair_exchanger.warm_ups == 1
+        assert rank.worker._pair_exchanger.first.warm_ups == 1
         assert rank.worker._pair_group == rank.dsa_group != 0
 
         tokens = _canonical_tokens(r, D_DCP, block_size, num_d)

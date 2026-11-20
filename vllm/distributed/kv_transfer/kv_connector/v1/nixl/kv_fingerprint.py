@@ -268,6 +268,10 @@ def layer_views(
         spec = layer_specs.get(name)
         if spec is None or not spec.dcp_sharded:
             continue
+        if name in draft_layers and not isinstance(spec, MLAAttentionSpec):
+            # A GQA drafter's pages are head-sharded by TP, so P and D rows
+            # differ whenever their TP sizes do: not fingerprinted.
+            continue
         if not isinstance(spec, MLAAttentionSpec) or spec.tokens_per_state != 1:
             raise ValueError(f"{name}: cannot fingerprint {type(spec).__name__}")
         bound = getattr(forward_context.get(name), "kv_cache", None)

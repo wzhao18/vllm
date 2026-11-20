@@ -12,7 +12,14 @@ import statistics
 
 import torch
 
-from pgemm_b3_bench import clock_power, kernel_times, real_operands, scaled_mm, tname
+from pgemm_b3_bench import (
+    clock_power,
+    exact_operands,
+    kernel_times,
+    real_operands,
+    scaled_mm,
+    tname,
+)
 
 
 def main():
@@ -25,6 +32,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--fused", type=json.loads, default=[])
     ap.add_argument("--plain", type=json.loads, default=[])
+    ap.add_argument("--exact", action="store_true", help="small-integer operands")
+    ap.add_argument("--noclock", action="store_true")
     args = ap.parse_args()
 
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -42,7 +51,7 @@ def main():
     m, inter, k = args.m, args.inter, args.k
     n = 2 * inter
     torch.manual_seed(m)
-    x, sx, w, sw = real_operands(m, n, k, dev)
+    x, sx, w, sw = (exact_operands if args.exact else real_operands)(m, n, k, dev)
     ref = mxfp8_act.Mxfp8Buffer(m, inter, dev)
     out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
     act = mxfp8_act.Mxfp8Buffer(m, inter, dev)
@@ -70,7 +79,7 @@ def main():
             times[name].append(kernel_times(fn)[0])
     rmed = statistics.median(times["ref"]) or 1.0
     for name, fn in variants.items():
-        mhz, watt = clock_power(fn, iters=200)
+        mhz, watt = (0, 0) if args.noclock else clock_power(fn, iters=200)
         med = statistics.median(times[name])
         print(json.dumps({"v": name, "med": round(med, 1), "min": round(min(times[name]), 1),
                           "max": round(max(times[name]), 1), "x_ref": round(med / rmed, 3),

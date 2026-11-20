@@ -87,6 +87,7 @@ def test_pair_index_format_from_row_width(width, values):
     view = torch.zeros(3, 64, width, dtype=torch.uint8)  # its kernel pages
     region = PairRegion(name, spec, view.data_ptr(), spec.page_size_bytes, 1 << 20)
     worker = object.__new__(NixlBaseConnectorWorker)
+    worker._sub_block_peers = {}
     text_config = SimpleNamespace(dsa_config=SimpleNamespace(index_head_dim=128))
     worker.vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(
