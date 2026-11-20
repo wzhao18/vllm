@@ -1910,43 +1910,45 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
                 _dms_c3 = read_clock64()
+                _dms_c4 = _dms_c3
+                if work_tile.phase != Int32(BlockPhase.SharedLinear1):  # DIAG SH-DA: shared FC1 stages skip S2T + MMA
 
-                s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                for instruction_index in cutlass.range_constexpr(self.num_mma_instructions_per_ab_stage):
-                    # Rest_Tiler order: N0K0, N128K0, N0K64, N128K64.
-                    lower_n_lower_k_source_coord = (None, 0, None, instruction_index, ab_pipeline_state.index)
-                    lower_n_lower_k_destination_coord = (None, 0, None, instruction_index)
-                    cute.copy(
-                        tiled_copy_sfb,
-                        partitioned_smem_sfb[lower_n_lower_k_source_coord],
-                        partitioned_tmem_sfb[lower_n_lower_k_destination_coord],
-                    )
-                    lower_n_upper_k_source_coord = (None, 2, None, instruction_index, ab_pipeline_state.index)
-                    compact_upper_k_destination_coord = (None, 1, None, instruction_index)
-                    cute.copy(
-                        tiled_copy_sfb,
-                        partitioned_smem_sfb[lower_n_upper_k_source_coord],
-                        partitioned_tmem_sfb[compact_upper_k_destination_coord],
-                    )
+                    s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
+                    cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                    for instruction_index in cutlass.range_constexpr(self.num_mma_instructions_per_ab_stage):
+                        # Rest_Tiler order: N0K0, N128K0, N0K64, N128K64.
+                        lower_n_lower_k_source_coord = (None, 0, None, instruction_index, ab_pipeline_state.index)
+                        lower_n_lower_k_destination_coord = (None, 0, None, instruction_index)
+                        cute.copy(
+                            tiled_copy_sfb,
+                            partitioned_smem_sfb[lower_n_lower_k_source_coord],
+                            partitioned_tmem_sfb[lower_n_lower_k_destination_coord],
+                        )
+                        lower_n_upper_k_source_coord = (None, 2, None, instruction_index, ab_pipeline_state.index)
+                        compact_upper_k_destination_coord = (None, 1, None, instruction_index)
+                        cute.copy(
+                            tiled_copy_sfb,
+                            partitioned_smem_sfb[lower_n_upper_k_source_coord],
+                            partitioned_tmem_sfb[compact_upper_k_destination_coord],
+                        )
 
-                _dms_c4 = read_clock64()
-                _dms_s2t = _dms_s2t + (_dms_c4 - _dms_c3)
-                a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
-                b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=tmem_sfb,
-                    valid_tokens_in_tile=valid_tokens_in_cta_tile,
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=self.num_mma_instructions_per_ab_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                    _dms_c4 = read_clock64()
+                    _dms_s2t = _dms_s2t + (_dms_c4 - _dms_c3)
+                    a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
+                    b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
+                    dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                        quant_kind=quant_kind,
+                        acc_tensor=accumulator,
+                        a_window_frag=a_stage_frag,
+                        b_window_frag=b_stage_frag,
+                        sfa_window_tensor=tmem_sfa,
+                        sfb_window_tensor=tmem_sfb,
+                        valid_tokens_in_tile=valid_tokens_in_cta_tile,
+                        mma_instruction_mnk=mma_instruction_mnk,
+                        window_instruction_offset=0,
+                        window_instruction_count=self.num_mma_instructions_per_ab_stage,
+                        first_instruction_accumulate=k_tile_idx != 0,
+                    )
 
                 _dms_c5 = read_clock64()
                 _dms_mi = _dms_mi + (_dms_c5 - _dms_c4)
@@ -1977,28 +1979,30 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
                 _dms_c3 = read_clock64()
+                _dms_c4 = _dms_c3
+                if work_tile.phase != Int32(BlockPhase.SharedLinear1):  # DIAG SH-DA: shared FC1 stages skip S2T + MMA
 
-                s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
+                    s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
+                    cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
+                    cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
 
-                _dms_c4 = read_clock64()
-                _dms_s2t = _dms_s2t + (_dms_c4 - _dms_c3)
-                a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
-                b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=tmem_sfb,
-                    valid_tokens_in_tile=valid_tokens_in_cta_tile,
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=self.num_mma_instructions_per_ab_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                    _dms_c4 = read_clock64()
+                    _dms_s2t = _dms_s2t + (_dms_c4 - _dms_c3)
+                    a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
+                    b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
+                    dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                        quant_kind=quant_kind,
+                        acc_tensor=accumulator,
+                        a_window_frag=a_stage_frag,
+                        b_window_frag=b_stage_frag,
+                        sfa_window_tensor=tmem_sfa,
+                        sfb_window_tensor=tmem_sfb,
+                        valid_tokens_in_tile=valid_tokens_in_cta_tile,
+                        mma_instruction_mnk=mma_instruction_mnk,
+                        window_instruction_offset=0,
+                        window_instruction_count=self.num_mma_instructions_per_ab_stage,
+                        first_instruction_accumulate=k_tile_idx != 0,
+                    )
 
                 _dms_c5 = read_clock64()
                 _dms_mi = _dms_mi + (_dms_c5 - _dms_c4)
