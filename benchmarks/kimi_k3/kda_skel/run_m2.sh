@@ -10,10 +10,10 @@ $NVCC -O3 -std=c++17 -Xptxas -v -gencode arch=compute_107a,code=sm_107a -o $O/kd
 grep -E "registers|spill" $O/calib.build.log | head -4
 [ -n "$SKIPCAL" ] || for n in "3 5461" "3 2731"; do timeout 200 $O/kda_calib $n 15 | grep CALIB; done
 for B in ${BUILDS:-8:64:1 8:32:2}; do
-  IFS=: read W CH NS <<< "$B"; X=$O/kda_skel_${W}_${CH}_${NS}
-  $NVCC -O3 -std=c++17 -DNCW=$W -DCHUNK=$CH -DNSLOT=$NS -DNGRP=1 -Xptxas -v -gencode arch=compute_107a,code=sm_107a -o $X \
+  IFS=: read W CH NS NG <<< "$B"; NG=${NG:-1}; X=$O/kda_skel_${W}_${CH}_${NS}_${NG}
+  $NVCC -O3 -std=c++17 -DNCW=$W -DCHUNK=$CH -DNSLOT=$NS -DNGRP=$NG $EXTRA -Xptxas -v -gencode arch=compute_107a,code=sm_107a -o $X \
     $S/kda_skel.cu -lcuda > $X.build.log 2>&1 || { grep -m20 -i -A2 error $X.build.log; continue; }
   grep -E "registers|spill" $X.build.log | head -2
-  for n in "3 5461" "3 2731"; do echo "== NCW=$W CHUNK=$CH NSLOT=$NS T=$n"; timeout 300 $X $n 11 ${SUITE:-m2} | grep -E "SKEL|SPAN|FAIL|WATCH"; done
+  for n in "3 5461" "3 2731"; do echo "== NCW=$W CHUNK=$CH NSLOT=$NS NGRP=$NG T=$n"; timeout 300 $X $n 11 ${SUITE:-m2} | grep -E "SKEL|SPAN|FAIL|WATCH"; done
 done
 echo "== END $(date)"

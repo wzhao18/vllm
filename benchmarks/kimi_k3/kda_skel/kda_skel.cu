@@ -41,6 +41,9 @@ constexpr int NWARP_SLOT = 1 + NCW;
 #ifndef EARLYREL
 #define EARLYREL 0
 #endif
+#ifndef ONORM_LDG
+#define ONORM_LDG 0
+#endif
 #ifndef NGRP
 #define NGRP 1
 #endif
@@ -91,6 +94,7 @@ struct Args {
 __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __grid_constant__ Maps M, Args a) {
   extern __shared__ __align__(1024) unsigned char sm[];
   __shared__ __align__(8) unsigned long long full[2][16], empty[2][16];
+  __shared__ volatile long long chain_seq[2];   // item groups: chain steps of a slot run in item order (serial recurrence)
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int slot = warp / NWARP_SLOT, role = warp % NWARP_SLOT;   // role 0 producer, 1-4 consumers
   // which chains / items this slot owns
@@ -119,6 +123,7 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&empty[s][i])));
       }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    chain_seq[0] = chain_seq[1] = 0;
   }
   __syncthreads();
   if (threadIdx.x == 0) atomicMin(&a.sink[2], gtime());   // kernel span (no launch latency): first CTA start
@@ -185,7 +190,9 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
     const int grp = ctid_all / GT, ctid = ctid_all % GT;
     const int bar_id = 1 + slot * NGRP + grp;
     unsigned acc = 0;
+#if !ONORM_LDG
     float wv[CPT]; int whead = -1;
+#endif
     long long i = 0, nout = 0;
     for (long long j = it0; j < it_end; j += it_step, ++i) {
       if ((int)(i % NGRP) != grp) continue;
@@ -247,7 +254,14 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         acc += sx;
       }
       if (a.lat && ctid == 0) {   // chain step (TMEM store, MMA, commit wait, TMEM load) overlapped with the SIMT load
-        while (clock64() < t_full + a.lat) { }
+        if (NGRP > 1) {   // the recurrence is serial: this item's step starts after the previous item's step ends
+          while (chain_seq[slot] != i) { }
+          const long long t0 = clock64();
+          while (clock64() < t0 + a.lat) { }
+          chain_seq[slot] = i + 1;
+        } else {
+          while (clock64() < t_full + a.lat) { }
+        }
       }
       unsigned char* o = ob + (size_t)(grp * 2 + (nout & 1)) * OUT_TILE;
       if (ctid == 0) asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
@@ -257,11 +271,15 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         const int tk = ctid / TPT, part = ctid % TPT;
         const uint4* orow = (const uint4*)(st + tk * 256 + part * CPT * 2);
         const uint4* grow = (const uint4*)(st + 4 * TILE + tk * 256 + part * CPT * 2);
+#if !ONORM_LDG
         if (head != whead) {
           whead = head;
 #pragma unroll
           for (int i = 0; i < CPT; ++i) wv[i] = a.w[head * D + part * CPT + i];
         }
+#else
+        const float4* wrow = (const float4*)(a.w + head * D + part * CPT);   // weights via L1 (float4), not resident registers
+#endif
         float y[CPT]; float ss = 0.f;
 #pragma unroll
         for (int q4 = 0; q4 < CPT / 8; ++q4) {
@@ -272,9 +290,11 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
             y[q4 * 8 + 2 * e] = lo; y[q4 * 8 + 2 * e + 1] = hi; ss = fmaf(lo, lo, ss); ss = fmaf(hi, hi, ss);
           }
         }
+#if !ONORM_LDG
         uint4 gw[CPT / 8];
 #pragma unroll
         for (int q4 = 0; q4 < CPT / 8; ++q4) gw[q4] = grow[q4];
+#endif
         if (EARLYREL && !(a.mode == 0 && k == a.nchunk - 1)) {   // stage fully read into registers: release it before the math
           named_bar(bar_id, GT);
           if (ctid == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(sa(&empty[slot][sl])) : "memory");
@@ -286,7 +306,13 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         float amax = 0.f;
 #pragma unroll
         for (int q4 = 0; q4 < CPT / 8; ++q4) {
+#if ONORM_LDG
+          uint4 u = grow[q4]; unsigned uu[4] = {u.x, u.y, u.z, u.w};
+          const float4 w0 = __ldg(wrow + 2 * q4), w1 = __ldg(wrow + 2 * q4 + 1);
+          const float wq[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#else
           uint4 u = gw[q4]; unsigned uu[4] = {u.x, u.y, u.z, u.w};
+#endif
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
             float gt = e & 1 ? __uint_as_float(uu[e >> 1] & 0xffff0000u) : __uint_as_float(uu[e >> 1] << 16);
@@ -294,7 +320,11 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
             asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ex) : "f"(gt * -1.4426950409f));
             asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sg) : "f"(1.f + ex));
             int i = q4 * 8 + e;
+#if ONORM_LDG
+            y[i] = y[i] * rstd * wq[e] * sg;
+#else
             y[i] = y[i] * rstd * wv[i] * sg;
+#endif
             amax = fmaxf(amax, fabsf(y[i]));
           }
         }
@@ -491,6 +521,19 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 5; ++i) vs.push_back({nm[i], 2, S, 1, (int)(F * sc[i]), (int)(U * sc[i]), 0, 0, 0, 1, 0, 0, 1});
     vs.push_back({"m7 onorm", 2, S, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0});
     vs.push_back({"m7 onorm + mix x0.25", 2, S, 1, F / 4, U / 4, 1, 0, 0, 1, 0, 0, 1});
+  }
+  if (argc > 4 && std::string(argv[4]) == "m8") {   // item groups: KDA-pass SIMT + serial chain latency
+    const int S = NSLOT == 1 ? 3 : 6, F = 70000 * C / 32, U = 16000 * C / 32;
+    vs = {{"m8 data", 2, S, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0}, {"m8 mix x1", 2, S, 1, F, U, 0, 0, 0, 1, 0, 0, 1},
+          {"m8 L1060 mix", 2, S, 1, F, U, 0, 0, 0, 1, 1060, 0, 1}, {"m8 L1700 mix", 2, S, 1, F, U, 0, 0, 0, 1, 1700, 0, 1},
+          {"m8 L2200 mix", 2, S, 1, F, U, 0, 0, 0, 1, 2200, 0, 1}, {"m8 L2600 mix", 2, S, 1, F, U, 0, 0, 0, 1, 2600, 0, 1},
+          {"m8 L3400 mix", 2, S, 1, F, U, 0, 0, 0, 1, 3400, 0, 1}, {"m8 mix x2", 2, S, 1, 2 * F, 2 * U, 0, 0, 0, 1, 0, 0, 1}};
+  }
+  if (argc > 4 && std::string(argv[4]) == "m9") {   // M3: o_norm role in the item-group structure (+ SIMT + serial chain)
+    const int S = NSLOT == 1 ? 3 : 6, F = 70000 * C / 32, U = 16000 * C / 32;
+    vs = {{"m9 data", 2, S, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0}, {"m9 onorm", 2, S, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0},
+          {"m9 mix onorm", 2, S, 1, F, U, 1, 0, 0, 1, 0, 0, 1}, {"m9 L1700 mix", 2, S, 1, F, U, 0, 0, 0, 1, 1700, 0, 1},
+          {"m9 L1700 mix onorm", 2, S, 1, F, U, 1, 0, 0, 1, 1700, 0, 1}};
   }
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
   { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
