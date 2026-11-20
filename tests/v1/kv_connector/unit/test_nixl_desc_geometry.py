@@ -353,6 +353,7 @@ def test_local_descriptors_follow_each_region_pool_capacity():
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.transfer_topo = MagicMock()
     worker.device_id = 0
     worker.block_len_per_layer = [16, 16]

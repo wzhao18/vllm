@@ -188,6 +188,7 @@ def _pulled_units(
     recv = output.kv_connector_metadata.reqs_to_recv[req_id]
     assert recv.remote is not None
     worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
     pulled = [
         worker._apply_dcp_prefix_caching(
             list(recv.local_block_ids[group]),

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import SubBlockPeer
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
     expand_sub_block_ids,
 )
@@ -44,6 +45,7 @@ def _decoder(block=8, dcp=4, tp=4, regions=3, ssm=(0,)):
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w.block_size = block
     w._physical_blocks_per_logical_kv_block = 1
     w.dcp_size, w.pcp_size, w.world_size = dcp, 1, tp
@@ -57,8 +59,7 @@ def _decoder(block=8, dcp=4, tp=4, regions=3, ssm=(0,)):
     w._mixed_mem_types = False
     w.region_names = [f"layer{i}" for i in range(regions)]
     w._ssm_region_indices = list(ssm)
-    w._remote_sub_blocks = {}
-    w._remote_sub_block_pages = {}
+    w._sub_block_peers = {}
     w._region_is_mla = [i not in ssm for i in range(regions)]
     w._group_spec_types = (MambaSpec, MLAAttentionSpec)
     w.transfer_topo = SimpleNamespace(tp_size=tp)
@@ -177,7 +178,7 @@ def test_sub_block_reads_token_oracle(num_tokens, cached):
         kv_caches_base_addr=[0, PAGE_P],
         device_id=0,
     )
-    w._remote_sub_blocks["P"] = w._sub_block_remote_meta(meta, 1)
+    w._sub_block_peers["P"] = SubBlockPeer(w._sub_block_remote_meta(meta, 1), [], B_P)
     remote_descs = _expand(w._build_fa_remote(None, meta, 1))
     assert len(remote_descs) == 2 * 16 * X
     p_mem = _p_memory(p_blocks, num_tokens)
@@ -231,8 +232,7 @@ def test_draft_head_dlists_geometry():
     w.block_stride_per_layer = [STRIDE_D, 1000]
     w.region_num_blocks = [8, 8]
     w.kv_caches_base_addr = {"D": {2: [0, 50_000]}}
-    w._remote_sub_blocks["P"] = X
-    w._remote_sub_block_pages["P"] = ([PAGE_P, 16 * B_P * c], B_P)
+    w._sub_block_peers["P"] = SubBlockPeer(X, [PAGE_P, 16 * B_P * c], B_P)
     meta = SimpleNamespace(
         engine_id="P",
         region_num_blocks=[16 * X, 16 * X],

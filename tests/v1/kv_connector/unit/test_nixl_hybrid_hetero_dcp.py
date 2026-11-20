@@ -203,6 +203,7 @@ def test_hetero_dcp_blocks_match_global_chunks(num_chunks, local_num_computed_bl
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     for d_rank in range(16):
         d_chunks = _owner_chunks(d_rank, 16, num_chunks)
         if len(d_chunks) <= local_num_computed_blocks:
@@ -309,6 +310,7 @@ def _worker_stub(
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w.block_size = block // phys
     w._physical_blocks_per_logical_kv_block = phys
     w.vllm_config = SimpleNamespace(
@@ -862,6 +864,7 @@ def _geometry_check(local, remote):
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w._mamba_state_geometry = local
     meta = SimpleNamespace(engine_id="remote", mamba_state_geometry=remote)
     w._validate_mamba_state_geometry(meta)

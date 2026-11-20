@@ -118,6 +118,7 @@ def _pull_as_today(d_ranks, d_ids, num_cached, p_ranks, p_ids) -> None:
     """Every D rank reads whole P pages as the worker matches them, then zeroes
     the pages its reads leave unwritten."""
     worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
     local = d_ids[num_cached:]
     for r, d in enumerate(d_ranks):
         p = p_ranks[r % P_DCP]
@@ -302,6 +303,7 @@ def _check_staged_oracle(
         rank.write(d_ids[num_cached:], stale)
 
     worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
     local = d_ids[num_cached:]
     for r, d in enumerate(d_ranks):
         dst, src = worker._apply_dcp_prefix_caching(
@@ -372,6 +374,7 @@ def _mla_pull_worker(dcp_rank: int, block_size: int, num_d: int, num_p: int):
     """TP16/DCP16 decoder rank with two MLA groups pulling from a TP8/DCP8
     prefiller. Real block matching and descriptors; the transport is mocked."""
     w = object.__new__(NixlPullConnectorWorker)
+    w._sub_block_peers = {}
     w.engine_id, w.tp_rank = "D", dcp_rank
     w.block_size = block_size
     w.use_mla, w._has_mamba = True, False
@@ -384,8 +387,6 @@ def _mla_pull_worker(dcp_rank: int, block_size: int, num_d: int, num_p: int):
     w._recving_transfers = {}
     w._invalid_remote_engines = set()
     w._remote_registration_generations = {}
-    w._remote_sub_blocks = {}
-    w._draft_head_dst_handles = {}
     w._transfer_layer_group_ids = ()
     spec = MLAAttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.uint8

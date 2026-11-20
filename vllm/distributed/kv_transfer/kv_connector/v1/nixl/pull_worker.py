@@ -194,7 +194,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             return
 
-        sub_blocks = self._remote_sub_blocks.get(engine_id, 1)
+        peer = self._sub_block_peers.get(engine_id)
+        sub_blocks = peer.sub_blocks if peer is not None else 1
         if meta.remote.sub_blocks != sub_blocks:
             # The scheduler expanded P's block ids for a different sub-block
             # count than the handshake found (P/D skew, e.g. an older P that
@@ -326,7 +327,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 ]
 
             read_specs = []
-            draft_head_handles = self._draft_head_dst_handles.get(engine_id)
             for rank in plan.all_source_ranks:
                 if dcp_active:
                     local_ids = group_ids(meta.local_block_ids, rank)
@@ -347,8 +347,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             if sub_blocks > 1 and local_ids[g]:
                                 # A sub-block's heads are not contiguous: read
                                 # them per head (_read_draft_heads).
-                                assert draft_head_handles is not None
-                                assert rank in draft_head_handles
+                                assert peer is not None
+                                assert rank in peer.draft_dst_handles
                                 draft_reads.append(
                                     (g, rank, local_ids[g], remote_ids[g])
                                 )
@@ -499,7 +499,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         request was routed to failure reporting."""
         regions = sorted(self._head_sharded_draft_regions)
         local_offsets = self._draft_head_region_offsets
-        remote_offsets = self._draft_head_dst_region_offsets[engine_id]
+        peer = self._sub_block_peers[engine_id]
+        remote_offsets = peer.draft_region_offsets
         handle = None
         try:
             for g, rank, local_ids, remote_ids in draft_reads:
@@ -512,7 +513,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_desc_ids = np.concatenate(
                     [remote_offsets[k] + np.asarray(remote_ids) for k in positions]
                 )
-                remote_handles = self._draft_head_dst_handles[engine_id][rank]
+                remote_handles = peer.draft_dst_handles[rank]
                 for local_handle, remote_handle in zip(
                     self._draft_head_src_handles, remote_handles, strict=True
                 ):
