@@ -1592,7 +1592,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     fc1_sf_parts_per_block
                 )
                 # DIAG dr1: the payload flag (pointer/target passed in place of fc1_sf_ready / parts per block).
-                spin_wait(fc1_sf_ready_pointer, lambda value: value == Int32(fc1_sf_parts_per_block), scope="sys")
+                pass  # DIAG dr3: no SF / payload wait (rung 3: routed FC1 waits only for sizes)
             else:
                 # FC2 waits for its token block's FC1 tiles, shared FC2 for the shared ones; shared FC1 has no wait.
                 if cutlass.const_expr(not self.shared_enabled):
@@ -1744,8 +1744,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 if cutlass.const_expr(routed_input_ready_flag is not None):
                     if routed_inputs_ready == Int32(0):
                         iket.range_push("gather_b1.wait_input_ready")
-                        wait_ready(routed_input_ready_flag)
-                        wait_ready(routed_metadata_ready_flag)
+                        pass  # DIAG dr3: no payload wait
+                        pass  # DIAG dr3: no metadata wait (the epilogue still waits metadata_ready)
                         iket.range_pop()
                         routed_inputs_ready = Int32(1)
                         DG.put_gt(DG.S_TOKREADY)
