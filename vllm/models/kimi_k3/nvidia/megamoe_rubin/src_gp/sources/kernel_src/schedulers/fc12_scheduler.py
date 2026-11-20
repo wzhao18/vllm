@@ -98,10 +98,18 @@ def shared_expert_impl_requirements() -> dict:
 
 # Shared expert stages of a cluster: claiming FC1 tiles, claiming FC2 tiles, no shared work left.
 _SHARED_FC1, _SHARED_FC2, _SHARED_DONE = 0, 1, 2
+# ``middle`` only: claiming FC1 after this cluster already got an FC1 tile; FC2 deferred past the routed work.
+_SHARED_FC1_HELD, _SHARED_FC2_TAIL = 3, 4
 
 
 class SharedExpertStreamMixin:
-    """Places the shared FC1/FC2 tiles around the routed work (FC2 first when ``early``, last when ``tail``)."""
+    """Places the shared FC1/FC2 tiles around the routed work (FC2 first when ``early``, last when ``tail``).
+
+    ``middle``: a cluster that streamed a shared FC1 tile claims shared FC2 right after the FC1 ids run out, so FC2
+    follows the FC1 wave on the clusters that ran it (each parks only until the last FC1 tile ends, not for the
+    whole FC1 wave); clusters that got no FC1 tile go straight to the routed work and take any FC2 left at their
+    tail. Every decision derives from claimed ids, which both CTAs of a cluster receive, so it is cluster-uniform.
+    """
 
     def _bind_shared_expert_stream(
         self,
@@ -154,8 +162,8 @@ class SharedExpertStreamMixin:
         if position is None or position == "auto":
             # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its tiles.
             position = "early" if self._shared_phase_tiles[1] <= self.compute_cluster_count else "tail"
-        if position not in ("early", "tail"):
-            raise ValueError(f"shared_l2_position must be 'auto', 'early' or 'tail', got {position!r}.")
+        if position not in ("early", "middle", "tail"):
+            raise ValueError(f"shared_l2_position must be 'auto', 'early', 'middle' or 'tail', got {position!r}.")
         self.shared_fc2_position = position
         swizzle = int(impl_desc.get("shared_fc1_swizzle") or 0)
         if swizzle < 0:
@@ -168,6 +176,9 @@ class SharedExpertStreamMixin:
         if mode == "atomic_counter" and self.work_id_mode != "atomic_counter":
             raise ValueError("shared_work_id_mode='atomic_counter' needs work_id_mode='atomic_counter'.")
         self.shared_ids_atomic = self.work_id_mode == "atomic_counter" and mode != "grid_stride"
+        if position == "middle" and not self.shared_ids_atomic:
+            # A grid-stride FC1 id past the end doubles as the cluster's first FC2 id; middle claims FC2 by counter.
+            raise ValueError("shared_l2_position='middle' needs atomic shared ids (work_id_mode='atomic_counter').")
         mixed_atomic = self.non_clc_mixed_cga_config.is_mixed and self.work_id_mode == "atomic_counter"
         if mixed_atomic and not self.shared_ids_atomic:
             # Fallback CTAs take their M slot from the registered group, which a block_idx-strided shared id ignores.
@@ -254,6 +265,27 @@ class SharedExpertStreamMixin:
         return work_tile, stage, next_id, work_id_worker
 
     @cute.jit
+    def _claim_shared_middle(self, work_id_worker, stage: Int32, next_id: Int32):
+        """``middle``: shared FC1 ids first; when they run out, a cluster that got one takes FC2 ids now and one that
+        got none defers FC2 to its tail. Returns (shared tile or DONE, stage, next_id, worker)."""
+        work_tile = make_fc12_done_tile(True)
+        claimed_stage = stage
+        if (stage == Int32(_SHARED_FC1)) | (stage == Int32(_SHARED_FC1_HELD)):
+            held = stage == Int32(_SHARED_FC1_HELD)
+            work_tile, claimed_stage, next_id, work_id_worker = self._claim_shared_tile(
+                work_id_worker, Int32(_SHARED_FC1), next_id, 0
+            )
+            if work_tile.is_valid_tile:
+                stage = Int32(_SHARED_FC1_HELD)
+            else:
+                stage = Int32(_SHARED_FC2_TAIL)
+                if held:
+                    stage = Int32(_SHARED_FC2)
+        if stage == Int32(_SHARED_FC2):
+            work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
+        return work_tile, stage, next_id, work_id_worker
+
+    @cute.jit
     def gen_next_work(self) -> SchedulerWorkTileBase:
         """Shared FC1, early shared FC2, routed work past the expert-sizes gate, tail shared FC2, then DONE."""
         if cutlass.const_expr(self.shared_fc2_position is None):
@@ -266,11 +298,18 @@ class SharedExpertStreamMixin:
         next_id = self._shared_next
         routed_done = self._routed_done
         work_tile = make_fc12_done_tile(True)
-        if stage == Int32(_SHARED_FC1):
-            work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 0)
-        if cutlass.const_expr(self.shared_fc2_position == "early"):
-            if stage == Int32(_SHARED_FC2):
-                work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
+        if cutlass.const_expr(self.shared_fc2_position == "middle"):
+            work_tile, stage, next_id, work_id_worker = self._claim_shared_middle(work_id_worker, stage, next_id)
+        else:
+            if stage == Int32(_SHARED_FC1):
+                work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
+                    work_id_worker, stage, next_id, 0
+                )
+            if cutlass.const_expr(self.shared_fc2_position == "early"):
+                if stage == Int32(_SHARED_FC2):
+                    work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
+                        work_id_worker, stage, next_id, 1
+                    )
         if not work_tile.is_valid_tile:
             if not routed_done:
                 # Stores on ``self`` make the DSL carry the state touched by the routed call out of this branch.
@@ -285,6 +324,12 @@ class SharedExpertStreamMixin:
                 if routed_done & (stage == Int32(_SHARED_FC2)):
                     work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
                         work_id_worker, stage, next_id, 1
+                    )
+            if cutlass.const_expr(self.shared_fc2_position == "middle"):
+                if routed_done & (stage == Int32(_SHARED_FC2_TAIL)):
+                    # A successful claim leaves the stage at FC2: the next call keeps claiming FC2 ids.
+                    work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
+                        work_id_worker, Int32(_SHARED_FC2), next_id, 1
                     )
         self._shared_stage = stage
         self._shared_next = next_id

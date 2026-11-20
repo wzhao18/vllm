@@ -52,9 +52,10 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
     return -(-int(shards.sum()) // shards.numel())
 
 
-# Fused shared expert: shared FC2 after the routed work ("tail") or right after shared
-# FC1, under the dispatch ("early").
-RUBIN_FUSED_SHARED_L2_POSITION = "early"
+# Fused shared expert: shared FC2 after the routed work ("tail"), claimed up front under
+# the dispatch ("early"), or by the clusters that ran shared FC1 once its ids run out
+# ("middle": no cluster parks on FC2 for the whole FC1 wave).
+RUBIN_FUSED_SHARED_L2_POSITION = "middle"
 
 
 def compile_cache_key(
