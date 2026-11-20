@@ -85,8 +85,14 @@ PROJ_ROWS = 32
 # accumulation; the legacy mma.sync path runs at a quarter of its rate): units of
 # (gathered head, 128 rows) [128 x 512] x [512 x 128] spread over every CTA, K in
 # 64-element blocks through a TMA ring (A: the latent rows, B: the head's W_UV).
-TC_STAGES = 4
-TC_STAGE = 2 * 128 * 128  # A + B: [128 x 64] BF16 each, SW128
+# A stage holds TC_KB K blocks of 64 of both operands ([128 x 64] BF16, SW128, 16 KB
+# each: A blocks then B blocks): one TMA issuer runs a stage per barrier hand-off
+# (~0.28 us), so 32 KB stages capped its loads at ~110 GB/s per SM (4 GPU stamps:
+# 2.3 us per 256 KB unit); 64 KB stages double that.
+TC_KB = 2
+TC_BLOCK = 128 * 128
+TC_STAGES = 2
+TC_STAGE = 2 * TC_KB * TC_BLOCK
 # A unit's BF16 value rows [128 x 128], staged for its one bulk push (two buffers:
 # a unit's push is in flight while the next one's epilogue writes).
 TC_OUT = 128 * 128 * 2
@@ -544,16 +550,19 @@ class DcpValue:
                 for u in range(c, self.units, G):
                     gh = u % DH
                     t0 = (u // DH) * 128
-                    for k in cutlass.range_constexpr(8):
+                    for k in cutlass.range_constexpr(8 // TC_KB):
                         st = (kc + k) % TC_STAGES
                         ph = ((kc + k) // TC_STAGES) & 1
                         full = bars + Uint32(8) * Uint32(st)
                         mbar_wait(bars + Uint32(8) * Uint32(TC_STAGES + st), ph ^ 1)
                         mbar_arrive_tx(full, Uint32(TC_STAGE))
                         dst = ring + Uint32(TC_STAGE) * Uint32(st)
-                        _tma3d(dst, tm_a, full, 64 * k, gh, t0)
-                        _tma3d(dst + Uint32(TC_STAGE // 2), tm_b, full, 64 * k, 0, gh)
-                    kc = kc + 8
+                        for kb in cutlass.range_constexpr(TC_KB):
+                            kx = 64 * (k * TC_KB + kb)
+                            _tma3d(dst + Uint32(TC_BLOCK * kb), tm_a, full, kx, gh, t0)
+                            _tma3d(dst + Uint32(TC_BLOCK * (TC_KB + kb)), tm_b, full,
+                                   kx, 0, gh)
+                    kc = kc + 8 // TC_KB
         if warp == 1:
             if lane == 0:
                 kc = Int32(0)
@@ -563,21 +572,25 @@ class DcpValue:
                     mbar_wait(acc_free + Uint32(8) * Uint32(b), ((j >> 1) & 1) ^ 1)
                     tc_fence_after()
                     acc = taddr + Uint32(128) * Uint32(b)
-                    for k in cutlass.range_constexpr(8):
+                    for k in cutlass.range_constexpr(8 // TC_KB):
                         st = (kc + k) % TC_STAGES
                         ph = ((kc + k) // TC_STAGES) & 1
                         mbar_wait(bars + Uint32(8) * Uint32(st), ph)
                         tc_fence_after()
                         src = ring + Uint32(TC_STAGE) * Uint32(st)
-                        for kk in cutlass.range_constexpr(4):
-                            ad = Uint64(SDESC_SW128) | Uint64((src + Uint32(32 * kk)) >> 4)
-                            bd = Uint64(SDESC_SW128) | Uint64(
-                                (src + Uint32(TC_STAGE // 2 + 32 * kk)) >> 4)
-                            _mma_f16(acc, ad, bd, Uint32(TC_IDESC),
-                                     Uint32(1 if k + kk > 0 else 0))
+                        for kb in cutlass.range_constexpr(TC_KB):
+                            a_blk = src + Uint32(TC_BLOCK * kb)
+                            b_blk = src + Uint32(TC_BLOCK * (TC_KB + kb))
+                            for kk in cutlass.range_constexpr(4):
+                                ad = Uint64(SDESC_SW128) | Uint64(
+                                    (a_blk + Uint32(32 * kk)) >> 4)
+                                bd = Uint64(SDESC_SW128) | Uint64(
+                                    (b_blk + Uint32(32 * kk)) >> 4)
+                                _mma_f16(acc, ad, bd, Uint32(TC_IDESC),
+                                         Uint32(1 if k + kb + kk > 0 else 0))
                         tc_commit(bars + Uint32(8) * Uint32(TC_STAGES + st))
                     tc_commit(acc_full + Uint32(8) * Uint32(b))
-                    kc = kc + 8
+                    kc = kc + 8 // TC_KB
                     j = j + 1
         if (warp >= TC_EPI) & (warp < TC_EPI + 4):
             row = tid - 32 * TC_EPI
