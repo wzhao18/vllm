@@ -185,7 +185,7 @@ class DenseMx8:
                  kt: int = 128, stages: int = 4, collector: bool = True,
                  mc: int = 1, kred: bool = False, pair: bool = True,
                  iw: int = 1, ix: int = 1, debug: int = 0, pre_ns: int = 0, xcopies: int = 1,
-                 wdie: tuple = (), sym: bool = False):  # fmt: skip
+                 wdie: tuple = (), sym: bool = False, mma_n: int = MMA_N):  # fmt: skip
         assert rows <= 384 and k % (kt * ksplit) == 0 and ksplit in (1, 2)
         # iw / ix TMA issuer warps for the weights / the activation, each issuing every
         # iw-th / ix-th K tile: one issuer completes one bulk op at a time (~0.3 us
@@ -236,25 +236,29 @@ class DenseMx8:
         # to the mc pairs (L2 reads of x / mc)
         self.mc = mc
         self.cs = (self.v * mc, 1)  # TMA multicast shape (the MMA pair)
-        self.nb = -(-rows // MMA_N)
+        # tokens per MMA: 128, or 256 (one full-rate 2-CTA N256 MMA per K64 step for
+        # 129-256 rows instead of two N128 at 2/3 rate)
+        assert mma_n in (128, 256)
+        self.mma_n = mma_n
+        self.nb = -(-rows // mma_n)
         self.ktiles = k // kt // ksplit  # K tiles per CTA
         self.mrows = 128 * self.v
         self.mblocks = -(-(-(-n // self.mrows)) // mc) * mc
-        self.tiler = (self.mrows, MMA_N * self.nb, kt)
-        self.tiler1 = (self.mrows, MMA_N, kt)  # one N block: the scale factors of B per block
-        self.tiler_sfb = (128, MMA_N, kt)
+        self.tiler = (self.mrows, self.mma_n * self.nb, kt)
+        self.tiler1 = (self.mrows, self.mma_n, kt)  # one N block: the scale factors of B per block
+        self.tiler_sfb = (128, self.mma_n, kt)
         self.grid = self.v * self.mblocks * ksplit
         # kred receives half the FP32 partial (128 rows x cols/2) into sA..sB (contiguous)
-        b_rows = MMA_N * self.nb // self.v
-        assert not kred or (MMA_N * self.nb // 2) * 128 * 4 <= stages * kt * (128 + b_rows)
+        b_rows = self.mma_n * self.nb // self.v
+        assert not kred or (self.mma_n * self.nb // 2) * 128 * 4 <= stages * kt * (128 + b_rows)
         # sym receives the peer's 128 x cols/2 FP32 partial into the drained B ring
-        assert not sym or (MMA_N * self.nb // 2) * 128 * 4 <= stages * kt * b_rows
+        assert not sym or (self.mma_n * self.nb // 2) * 128 * 4 <= stages * kt * b_rows
 
     def scratch_words(self) -> Tuple[int, int]:
         """(FP32 partial words, int32 ticket words) the caller allocates (zeroed
         tickets, persistent across calls)."""
         slots = self.v * self.mblocks
-        words = slots * 128 * MMA_N * self.nb
+        words = slots * 128 * self.mma_n * self.nb
         if self.debug & STAMP:  # bench: STAMPS int64 globaltimer stamps per CTA after it
             words += 2 * STAMPS * self.grid
         return words, (3 if self.sym else 2) * slots
@@ -264,7 +268,7 @@ class DenseMx8:
         return sm107_utils.make_blockscaled_trivial_tiled_mma(
             cutlass.Float8E4M3FN, cutlass.Float8E4M3FN, OperandMajorMode.K,
             OperandMajorMode.K, cutlass.Float8E8M0FNU, SF_VEC, group,
-            (self.mrows, MMA_N, MMA_K), a_collector_op=collector,
+            (self.mrows, self.mma_n, MMA_K), a_collector_op=collector,
             b_collector_op=CollectorOp.DISCARD,
         )  # fmt: skip
 
@@ -294,7 +298,7 @@ class DenseMx8:
                 self._mma(CollectorOp.USE), self._mma(CollectorOp.LASTUSE))  # fmt: skip
         mma_sfb = sm107_utils.make_blockscaled_trivial_tiled_mma(
             fp8, fp8, OperandMajorMode.K, OperandMajorMode.K, sf_t, SF_VEC,
-            tcgen05.CtaGroup.ONE, (128, MMA_N, MMA_K),
+            tcgen05.CtaGroup.ONE, (128, self.mma_n, MMA_K),
             a_collector_op=CollectorOp.DISCARD, b_collector_op=CollectorOp.DISCARD,
         )  # fmt: skip
         # kred: the K half is the cluster K mode (rank = v + 2 kh): masks and pipelines
@@ -576,7 +580,7 @@ class DenseMx8:
             tmem.wait_for_alloc()
             acc_ptr = tmem.retrieve_ptr(Float32)
             tAcc = cute.make_tensor(acc_ptr, acc_fake.layout)
-            acc_cols = MMA_N * self.nb
+            acc_cols = self.mma_n * self.nb
             tSFA = cute.make_tensor(cute.recast_ptr(acc_ptr + acc_cols, dtype=sf_t), tsfa_layout)
             tSFBs = [
                 cute.make_tensor(
@@ -700,7 +704,7 @@ class DenseMx8:
     @cute.jit
     def _stamp(self, part_ptr, bidx, i):
         if cutlass.const_expr(self.debug & STAMP):
-            words = self.v * self.mblocks * 128 * MMA_N * self.nb
+            words = self.v * self.mblocks * 128 * self.mma_n * self.nb
             st_global_s64(
                 part_ptr.toint() + Int64(words) * 4 + Int64(bidx * STAMPS + i) * 8,
                 global_time(),
@@ -754,7 +758,7 @@ class DenseMx8:
                   xbar, warp, lane, tidx, rank, kh, bidx):  # fmt: skip
         """Thread (warp w, lane l) owns weight row 128 v + 32 w + l of row block mb
         (TMEM lane 32 w + l) and all token columns."""
-        cols = MMA_N * self.nb
+        cols = self.mma_n * self.nb
         r = 32 * warp + lane
         n = mb * self.mrows + 128 * v + r
         taddr = Int32(acc_ptr.toint()) + ((32 * warp) << 16)

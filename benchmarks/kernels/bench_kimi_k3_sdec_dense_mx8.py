@@ -193,7 +193,7 @@ def main():
                              iw=int(f.get("w", 1)), ix=int(f.get("x", 1)),
                              debug=dbg, kt=kt, pre_ns=int(f.get("e", 0)) * 1000,
                              xcopies=int(f.get("y", 1)), wdie=wdie,
-                             sym=bool(int(f.get("g", 0))))
+                             sym=bool(int(f.get("g", 0))), mma_n=int(f.get("n", 128)))
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
