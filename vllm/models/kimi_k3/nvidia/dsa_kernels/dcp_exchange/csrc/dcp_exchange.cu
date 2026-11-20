@@ -3320,6 +3320,8 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
   int nwide = 0;
   if (impl == 1) {  // single path (csrc/topk_sp.cuh): one kernel, no redo launch
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(p.logits) & 15u) == 0 && p.lstride % 8 == 0 && p.lcols % 8 == 0,
+                "topk_sp: logits rows must be 16-byte aligned with a multiple of 8 columns");
     const int nres1 = (int)topk_sp_resident_of(&nwide);
     TORCH_CHECK(nres1 >= 1, "topk_sp: no resident CTA");
     const bool wide1 = T <= nwide;

@@ -29,8 +29,6 @@ constexpr int kSpBand = 64;
 constexpr int kSpMsg = kSpHdr + kSpWin / 2 + kSpBand;  // 200 words
 static_assert(kSpMsg <= kV2Msg && kSpMsg % 4 == 0, "round-1 slot");
 constexpr int kSpFine = 2048;
-constexpr int kSpStg = 256;   // band staging entries
-constexpr int kSpBandD = 32;  // staging half-width (keys) around the sample's estimate
 constexpr int kSpBt = 1024;   // block-table entries cached per row
 constexpr int kSpRs = 257;    // per-rank window suffix stride
 
@@ -66,6 +64,26 @@ __device__ __forceinline__ uint32_t sp_mask(const uint4& r, const SpTh& t) {
   return sp_bits(sp_ge(r.x, t), sp_ge(r.y, t), sp_ge(r.z, t), sp_ge(r.w, t));
 }
 
+// keys of 8 raw bf16 values as 4 packed words; key j of them (runtime j: selects, no
+// local memory)
+__device__ __forceinline__ uint4 sp_keys(const uint4& r) {
+  return make_uint4(keys2(r.x), keys2(r.y), keys2(r.z), keys2(r.w));
+}
+__device__ __forceinline__ uint32_t sp_key_at(const uint4& kw, int j) {
+  const uint32_t w = (j & 4) ? ((j & 2) ? kw.w : kw.z) : ((j & 2) ? kw.y : kw.x);
+  return (j & 1) ? (w >> 16) : (w & 0xFFFFu);
+}
+__device__ __forceinline__ uint32_t sp_nvalid(const uint4& r) {
+  const uint4 kw = sp_keys(r);
+  uint32_t n = 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t w = j == 0 ? kw.x : j == 1 ? kw.y : j == 2 ? kw.z : kw.w;
+    n += ((w & 0xFFFFu) != 0u) + ((w >> 16) != 0u);
+  }
+  return n;
+}
+
 template <int T>
 __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params p) {
   using C = SpCfg<T>;
@@ -76,7 +94,6 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
   __shared__ __align__(16) uint32_t coarse[256];         // later: radix histogram
   __shared__ __align__(16) uint32_t rx[kV2MaxW * kSpMsg];
   __shared__ __align__(16) uint32_t msg[kSpMsg];
-  __shared__ __align__(16) uint2 stg[kSpStg];
   __shared__ __align__(16) uint2 bnd[kSpBand];
   __shared__ __align__(16) uint32_t suf[T];
   __shared__ __align__(16) uint32_t tg[kV2MaxW * kSpBand];
@@ -130,21 +147,19 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
     const int L = p.local_len[row];
     const int Gl = p.global_len[row];
-    const int sh = (8 - (int)((((16u - (uint32_t)(reinterpret_cast<uintptr_t>(lrow) & 15u)) & 15u) >> 1))) & 7;
-    const int ng = (L + sh + 7) >> 3;
-    // group g = positions [8g - sh, 8g - sh + 8); positions outside [0, L) read as NaN
+    const int ng = (L + 7) >> 3;
+    // group g = positions [8g, 8g + 8) (16-byte aligned rows, lcols % 8 == 0: the host
+    // checks); positions >= L read as NaN
     auto ld_group = [&](int g) -> uint4 {
-      const int p0 = 8 * g - sh;
-      if (p0 >= 0 && p0 + 8 <= L) return __ldg(reinterpret_cast<const uint4*>(lrow - sh) + g);
-      uint32_t w[4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int a = p0 + 2 * j, b = a + 1;
-        const uint32_t lo16 = (a >= 0 && a < L) ? lrow[a] : 0xFFFFu;
-        const uint32_t hi16 = (b >= 0 && b < L) ? lrow[b] : 0xFFFFu;
-        w[j] = lo16 | (hi16 << 16);
+      uint4 r = __ldg(reinterpret_cast<const uint4*>(lrow) + g);
+      const int nv = L - 8 * g;
+      if (K31_RARE(nv < 8)) {
+        r.x |= (nv > 0 ? 0u : 0xFFFFu) | (nv > 1 ? 0u : 0xFFFF0000u);
+        r.y |= (nv > 2 ? 0u : 0xFFFFu) | (nv > 3 ? 0u : 0xFFFF0000u);
+        r.z |= (nv > 4 ? 0u : 0xFFFFu) | (nv > 5 ? 0u : 0xFFFF0000u);
+        r.w |= (nv > 6 ? 0u : 0xFFFFu) | (nv > 7 ? 0u : 0xFFFF0000u);
       }
-      return make_uint4(w[0], w[1], w[2], w[3]);
+      return r;
     };
     const int gw0 = warp * 32 * NRR;
     const int gsm = NRR * T + tid;  // this thread's SMEM group
@@ -185,7 +200,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     __syncthreads();
     SPDBG(9);
     const uint32_t mb = s_u[0];
-    const uint32_t base = mb > 4096u ? mb - 4096u : 1u;
+    // sample keys within 8 octaves of the max, 4 keys per bin
+    const uint32_t base = mb > 1024u ? mb - 1024u : 1u;
     {
       const int is = (lane + warp) % NR;
       uint4 r = sgrp[tid];
@@ -198,7 +214,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const uint32_t k = k8.key(j);
-          if (k >= base) atomicAdd(&coarse[(k - base) >> 4], 1u);
+          if (k >= base) atomicAdd(&coarse[(k - base) >> 2], 1u);
         }
       }
     }
@@ -224,8 +240,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
           const uint32_t b = 255 - 8 * lane - j;
           const bool a = run < want, ae = run < want_e;
           run += c[j];
-          if (ft && a && run >= want) s_i[0] = (int)(base + 16 * b);
-          if (fe && ae && run >= want_e) s_i[1] = (int)(base + 16 * b + 8);
+          if (ft && a && run >= want) s_i[0] = (int)(base + 4 * b);
+          if (fe && ae && run >= want_e) s_i[1] = (int)(base + 4 * b + 2);
         }
       }
       const uint32_t bt = __ballot_sync(0xffffffffu, ft), be = __ballot_sync(0xffffffffu, fe);
@@ -238,30 +254,24 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     __syncthreads();
     SPDBG(1);
     const int theta = s_i[0], e_est = s_i[1];
-    const int slo = ::max(theta, e_est - kSpBandD), shi = e_est + kSpBandD;
-    // ---- 2. keys >= theta: fine histogram, valid keys, band staging
+    // ---- 2. keys >= theta: fine histogram, valid keys
     {
       const SpTh tt = sp_th(theta);
       uint32_t cnt = 0, bey = 0, nv = 0;
       auto visit = [&](int g, const uint4& r) {
         if (g >= ng) return;
-        nv += v2_is_nan2(v2_max_nan(r)) ? v2_nvalid(r) : 8u;
-        const uint32_t mk = sp_mask(r, tt);
+        nv += K31_RARE(v2_is_nan2(v2_max_nan(r))) ? sp_nvalid(r) : 8u;
+        uint32_t mk = sp_mask(r, tt);
         if (mk) {
           cnt += __popc(mk);
-          const Keys8 k8(r);
-#pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            if ((mk >> j) & 1u) {
-              const int k = (int)k8.key(j);
-              const int d = k - theta;
-              if (d < kSpFine) atomicAdd(&fine[d], 1u);
-              else ++bey;
-              if (k >= slo && k <= shi) {
-                const uint32_t s = atomicAdd(&s_u[4], 1u);
-                if (s < kSpStg) stg[s] = make_uint2((uint32_t)(8 * g + j - sh), (uint32_t)k);
-              }
-            }
+          const uint4 kw = sp_keys(r);
+#pragma unroll 1
+          while (mk) {
+            const int j = __ffs(mk) - 1;
+            mk &= mk - 1;
+            const int d = (int)sp_key_at(kw, j) - theta;
+            if (d < kSpFine) atomicAdd(&fine[d], 1u);
+            else ++bey;
           }
         }
       };
@@ -315,9 +325,9 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       if (c0 >= kCountMax || c1 >= kCountMax) s_u[6] = 1;
       msg[kSpHdr + tid] = tagw(tag, (::min(c0, kCountMax) << 12) | ::min(c1, kCountMax));
     } else if (warp == C::kWarps - 1) {
-      // band [e - d, e + d] for the largest d whose keys fit kSpBand, inside the staged range
+      // band [e - d, e + d]: the largest d whose keys fit kSpBand
       const int d = lane;
-      bool ok = e >= 0 && e - d >= slo && e + d <= shi && e + d + 1 <= theta + kSpFine;
+      bool ok = e >= 0 && e - d >= theta && e + d + 1 <= theta + kSpFine;
       uint32_t c = 0;
       if (ok) {
         c = cloc(e - d) - cloc(e + d + 1);
@@ -335,17 +345,28 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
     }
     __syncthreads();
     const int bl = s_i[4], bh = s_i[5];
-    {
-      const int nst = ::min((int)s_u[4], kSpStg);
-      if (tid < nst && s_i[9] >= 0) {
-        const uint2 sv = stg[tid];
-        if ((int)sv.y >= bl && (int)sv.y <= bh) {
-          const uint32_t j = atomicAdd(&s_u[5], 1u);
-          if (j < kSpBand) bnd[j] = sv;
+    if (s_i[9] >= 0) {  // the band's keys (<= kSpBand by the counts) with their positions
+      const SpTh tl = sp_th(bl), th1 = sp_th(bh + 1);
+      auto visit = [&](int g, const uint4& r) {
+        if (g >= ng) return;
+        uint32_t mk = sp_mask(r, tl) & ~sp_mask(r, th1);
+        if (mk) {
+          const uint4 kw = sp_keys(r);
+#pragma unroll 1
+          while (mk) {
+            const int j = __ffs(mk) - 1;
+            mk &= mk - 1;
+            const uint32_t s = atomicAdd(&s_u[5], 1u);
+            if (s < kSpBand) bnd[s] = make_uint2((uint32_t)(8 * g + j), sp_key_at(kw, j));
+          }
         }
-      }
+      };
+#pragma unroll
+      for (int i = 0; i < NRR; ++i) visit(gw0 + 32 * i + lane, rg[i]);
+      visit(gsm, sgrp[tid]);
     }
     __syncthreads();
+    SPDBG(15);
     const int nb = ::min((int)s_u[5], kSpBand);
     const bool bvalid = s_i[9] >= 0 && (uint32_t)nb == s_u[9] && s_u[5] <= (uint32_t)kSpBand;
     if (tid < kSpBand) {
@@ -461,7 +482,9 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
       const int v = lo_max + tid;
       const bool pr = v <= hi && cglob(v) >= (uint32_t)K;
       if (pr && v == hi) s_i[6] = 1;
+      SPDBG(16);
       const int n = __syncthreads_count(pr);
+      SPDBG(17);
       if (n == 0 || s_i[6]) {
         lev0 = 0;
         rem = (uint32_t)K;
@@ -478,25 +501,25 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
             const int blr = (int)(hdr(r, 3) & 0xFFFFu), bhr = blr + (int)((hdr(r, 3) >> 16) & 0xFFu);
             if (ties && !(((hdr(r, 0) >> 17) & 1u) && blr <= tau && tau <= bhr)) bok = false;
           }
+          SPDBG(18);
           if (!bok) {
             lev0 = 2;
             rem = need;
           } else {
-            for (int i = tid; i < W * kSpBand; i += T) {
+            for (int i = tid; i < W * kSpBand; i += T) {  // every rank's ties at tau
               const int r = i / kSpBand, j = i % kSpBand;
-              uint32_t gv = 0xFFFFFFFFu;
               if (j < (int)hdr(r, 4)) {
                 const uint32_t w = hdr(r, kSpHdr + kSpWin / 2 + j);
-                if ((int)(hdr(r, 3) & 0xFFFFu) + (int)(w >> 18) == tau) gv = gid_of((int)(w & 0x3FFFFu), r);
+                if ((int)(hdr(r, 3) & 0xFFFFu) + (int)(w >> 18) == tau)
+                  tg[atomicAdd(&s_u[11], 1u)] = gid_of((int)(w & 0x3FFFFu), r);
               }
-              tg[i] = gv;
             }
             __syncthreads();
-            for (int i = tid; i < W * kSpBand; i += T) {
+            const int nt = (int)s_u[11];
+            for (int i = tid; i < nt; i += T) {  // the need-th smallest id
               const uint32_t gv = tg[i];
-              if (gv == 0xFFFFFFFFu) continue;
               uint32_t rho = 0;
-              for (int s = 0; s < W * kSpBand; ++s) rho += tg[s] < gv;
+              for (int s = 0; s < nt; ++s) rho += tg[s] < gv;
               if (rho == need - 1) s_u[7] = gv;
             }
             __syncthreads();
@@ -521,9 +544,10 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
           uint32_t run = 0;
           auto visit = [&](int g, const uint4& r) {
             if (g >= ng) return;
-            const Keys8 k8(r);
+            const uint4 kw = sp_keys(r);
+#pragma unroll 1
             for (int j = 0; j < 8; ++j) {
-              const uint32_t k = k8.key(j);
+              const uint32_t k = sp_key_at(kw, j);
               if (!k) continue;
               int dg;
               if (lev < 2) {
@@ -531,7 +555,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
                 dg = lev == 0 ? (int)(k >> 8) : (int)(k & 255u);
               } else {
                 if (k != (uint32_t)(pre >> (8 * (lev - 2)))) continue;
-                const uint64_t c40 = ((uint64_t)k << 24) | (0xFFFFFFu - gid_of(8 * g + j - sh, p.rank));
+                const uint64_t c40 = ((uint64_t)k << 24) | (0xFFFFFFu - gid_of(8 * g + j, p.rank));
                 if ((c40 >> (40 - 8 * lev)) != pre) continue;
                 dg = (int)((c40 >> (32 - 8 * lev)) & 255u);
               }
@@ -543,7 +567,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
               ++run;
             }
           };
-#pragma unroll 1
+#pragma unroll
           for (int i = 0; i < NRR; ++i) visit(gw0 + 32 * i + lane, rg[i]);
           visit(gsm, sgrp[tid]);
           if (run) atomicAdd(&coarse[cur], run);
@@ -594,10 +618,14 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
         if (g >= ng) return;
         const uint32_t mg = sp_mask(r, t1);
         uint32_t me = sp_mask(r, t0) & ~mg;
-        if (me && gstar != 0xFFFFFFFFu) {
-#pragma unroll
-          for (int j = 0; j < 8; ++j)
-            if (((me >> j) & 1u) && gid_of(8 * g + j - sh, p.rank) > gstar) me &= ~(1u << j);
+        if (K31_RARE(me && gstar != 0xFFFFFFFFu)) {
+          uint32_t m = me;
+#pragma unroll 1
+          while (m) {
+            const int j = __ffs(m) - 1;
+            m &= m - 1;
+            if (gid_of(8 * g + j, p.rank) > gstar) me &= ~(1u << j);
+          }
         }
         if (mg) atomicOr(&bmg[g >> 2], mg << (8 * (g & 3)));
         if (me) atomicOr(&bme[g >> 2], me << (8 * (g & 3)));
@@ -627,14 +655,14 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_sp_kernel(V2Params 
         while (m) {
           const int b = __ffs(m) - 1;
           m &= m - 1;
-          if (gp < K) orow[gp] = slot(32 * w + b - sh);
+          if (gp < K) orow[gp] = slot(32 * w + b);
           ++gp;
         }
         m = bme[w];
         while (m) {
           const int b = __ffs(m) - 1;
           m &= m - 1;
-          if (epi < K) orow[epi] = slot(32 * w + b - sh);
+          if (epi < K) orow[epi] = slot(32 * w + b);
           ++epi;
         }
       }

@@ -270,6 +270,12 @@ class DcpxDecode:
         md = get_forward_context().attn_metadata[layer.layer_name]
         _, stride = flat_kv_row_view(layer.kv_cache, md.block_size)
         max_local = min(self.max_local_len, logits.shape[1])
+        # single-path kernel (csrc/topk_sp.cuh) on 16-byte aligned logits rows
+        single = (
+            logits.data_ptr() % 16 == 0
+            and logits.stride(0) % 8 == 0
+            and logits.shape[1] % 8 == 0
+        )
         self.ex.topk_v2(
             logits,
             local,
@@ -280,6 +286,7 @@ class DcpxDecode:
             block_size=md.block_size,
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
+            single_path=single,
         )
         return True
 
