@@ -307,8 +307,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       const uint64_t src = smem_desc(ring_s + slot * kSlot);
 #pragma unroll
       for (int kk = 0; kk < 4; ++kk) cp_el(tmem + p.na + 32 * i + 8 * kk, src + 2 * kk);
-      commit_el(empty0 + 8 * slot);
-      commit_el(trdy0 + 8 * i);
+      // tcgen05.commit stalls the issuing thread's tensor pipe (measured ~0.25 us per
+      // K block with a commit each): commit only where a consumer needs it.
+      if (i + p.ns < nt) commit_el(empty0 + 8 * slot);
+      if (i == nt - 1) commit_el(trdy0 + 8 * i);
     }
   } else if (warp == 1) {
     // kind::f16: BF16 A/B, FP32 D, K-major, M = 128 weight rows, N = n tokens.
@@ -317,8 +319,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int j = 0; j < nk; ++j) {
       const int xs = j % p.xs;
       mbar_wait(xfull0 + 8 * xs, (j / p.xs) & 1);
-      if (j < nt) {
-        mbar_wait(trdy0 + 8 * j, 0);
+      if (j == 0) {
+        mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
       } else if (j == nt) {
         mbar_wait(res_bar, 0);
       }
@@ -335,7 +337,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) mma_ss(tmem, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
       }
-      commit_el(xempty0 + 8 * xs);
+      if (j + p.xs < nk) commit_el(xempty0 + 8 * xs);
       if (lane == 0 && j < 24) STAMP(8 + j);
     }
     commit_el(acc_bar);
