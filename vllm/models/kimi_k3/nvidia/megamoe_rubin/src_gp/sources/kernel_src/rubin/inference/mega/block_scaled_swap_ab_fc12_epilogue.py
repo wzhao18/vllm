@@ -986,8 +986,6 @@ class SwapABGatedActEpilogue(KernelComponent):
     use_tanh_sigmoid = False
     # vLLM-local S3 SiTU core (VENDOR.md): the prefill dedup epilogue only; GenPhase decode keeps upstream.
     situ_core_s3 = False
-    # vLLM-local (prefill dedup only): a tile whose flag accumulation does not publish drains only its staging reads.
-    defer_unpublished_bulk_writes = False
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -1584,11 +1582,6 @@ class SwapABGatedActEpilogue(KernelComponent):
                         flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, prev_work_tile_info, flag_tracker)
                         flag_tracker.fire()
                         flag_tracker = flag_tracker.drained()
-                    else:
-                        if cutlass.const_expr(self.defer_unpublished_bulk_writes):
-                            flag_tracker = flag_tracker.accumulate(
-                                prev_work_tile_info.phase, self.fc1_epi_flag_batch, Int64(0), True
-                            ).drained()
                 else:
                     flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, prev_work_tile_info, flag_tracker)
                     flag_tracker.fire()
@@ -1606,18 +1599,6 @@ class SwapABGatedActEpilogue(KernelComponent):
                         cute.arch.cp_async_bulk_wait_group(0)
                     else:
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
-                elif cutlass.const_expr(self.defer_unpublished_bulk_writes):
-                    # Only an accumulation that publishes needs the covered bulk writes landed; on the other tiles
-                    # the writes stay in flight under the next tile and only the staging reads drain (smem reuse).
-                    publishes = cutlass.Boolean(True)
-                    if prev_is_fc1:
-                        publishes = flag_tracker.publishes_on_accumulate(work_tile_info.phase, self.fc1_epi_flag_batch)
-                    else:
-                        publishes = flag_tracker.publishes_on_accumulate(work_tile_info.phase, self.fc2_epi_flag_batch)
-                    if publishes:
-                        cute.arch.cp_async_bulk_wait_group(0)
-                    else:
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
                 else:
                     cute.arch.cp_async_bulk_wait_group(0)
                 # _fence_rel_gpu()
@@ -1629,27 +1610,12 @@ class SwapABGatedActEpilogue(KernelComponent):
                             flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                         else:
                             flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
-                    else:
-                        if cutlass.const_expr(self.defer_unpublished_bulk_writes):
-                            # Mirror the batch state (no address, no fire): this warpgroup predicts the same publishes.
-                            if prev_is_fc1:
-                                flag_tracker = flag_tracker.accumulate(
-                                    work_tile_info.phase, self.fc1_epi_flag_batch, Int64(0), True
-                                )
-                            else:
-                                flag_tracker = flag_tracker.accumulate(
-                                    work_tile_info.phase, self.fc2_epi_flag_batch, Int64(0), True
-                                )
                 else:
                     if prev_is_fc1:
                         flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
                     else:
                         flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
         # Tail flush
-        if cutlass.const_expr(self.defer_unpublished_bulk_writes):
-            # A held batch may cover writes still in flight (non-publishing tiles drain only their reads).
-            cute.arch.cp_async_bulk_wait_group(0)
-            wait_only_named_barrier.arrive_and_wait()
         flag_tracker.fire()
         if cutlass.const_expr(self.combine_ll_encoded and not self.token_back_enabled):
             # The FC2 tiles above drained only their reads; leave with every write landed.
