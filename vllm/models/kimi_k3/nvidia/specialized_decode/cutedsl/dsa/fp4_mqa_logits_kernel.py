@@ -1102,12 +1102,9 @@ class FP4MQALogitsKernel:
         # Warp roles
         warpgroup_idx = warp_idx // 4
         is_math_warp = warp_idx < 8
-        if KV_ISSUERS == 2:  # second KV issuer per group: warps 12 / 13
-            is_tma_warp_0 = (warp_idx == 8) | (warp_idx == 12)
-            is_tma_warp_1 = (warp_idx == 9) | (warp_idx == 13)
-        else:
-            is_tma_warp_0 = warp_idx == 8
-            is_tma_warp_1 = warp_idx == 9
+        # second KV issuer per group (KV_ISSUERS 2): warps 12 / 13
+        is_tma_warp_0 = (warp_idx == 8) | (warp_idx == (12 if KV_ISSUERS == 2 else 8))
+        is_tma_warp_1 = (warp_idx == 9) | (warp_idx == (13 if KV_ISSUERS == 2 else 9))
         is_tma_warp = is_tma_warp_0 | is_tma_warp_1
         is_umma_warp_0 = warp_idx == 10
         is_umma_warp_1 = warp_idx == 11
