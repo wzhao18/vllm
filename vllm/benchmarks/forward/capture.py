@@ -59,6 +59,9 @@ class _NanProbe:
         def hook(mod, inp, out):
             if not self.passes or torch.cuda.is_current_stream_capturing():
                 return
+            import os
+            if os.environ.get("DCP8FIX_SYNC"):
+                torch.cuda.synchronize()
             ts = []
             stack = [out]
             while stack:
