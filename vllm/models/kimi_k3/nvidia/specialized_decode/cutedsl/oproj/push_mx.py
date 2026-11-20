@@ -38,7 +38,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from ..common.primitives import asm, prefetch_bytes, store_relaxed
+from ..common.primitives import asm, prefetch_bytes, push_float, store_relaxed, wait
 from ..common.sp_comm import positive_zero32
 
 WIDTH = 7168  # output features (the hidden size)
@@ -84,6 +84,20 @@ def ld_shared_u32x4(address):
     return code, "=r,=r,=r,=r,r,~{memory}", (Int32(address),)
 
 
+@asm((Float32,) * 4)
+def ld_shared_f32x4(address):
+    code = "ld.shared.v4.f32 {$0,$1,$2,$3}, [$4];"
+    return code, "=f,=f,=f,=f,r,~{memory}", (Int32(address),)
+
+
+@asm()
+def arrive_remote(barrier, peer):
+    """mbarrier arrive (release, cluster scope) on the same barrier of cluster CTA peer."""
+    code = "{ .reg .b32 b; mapa.shared::cluster.u32 b,$0,$1; "
+    code += "mbarrier.arrive.release.cluster.shared::cluster.b64 _,[b]; }"
+    return code, "r,r,~{memory}", (Int32(barrier), Int32(peer))
+
+
 @asm()
 def bar_sync(barrier_id: int, count: int):
     return f"bar.sync {barrier_id},{count};", "~{memory}", ()
@@ -96,21 +110,28 @@ class OprojPushMx:
     for the weights / the activation (one issuer completes one bulk op at a time)."""
 
     def __init__(self, k: int, rows: int, tp: int, cap: int, *, kt: int = 128,
-                 stages: int = 8, iw: int = 1, ix: int = 1, prefetch: bool = False):  # fmt: skip
-        ktiles = k // kt
-        if k % kt or ktiles % stages or rows % tp or rows // tp > cap or rows > 512:
+                 stages: int = 8, iw: int = 1, ix: int = 1, prefetch: bool = False,
+                 ksplit: int = 1):  # fmt: skip
+        ktiles = k // kt // ksplit
+        tblocks = -(-rows // MMA_N)
+        # ksplit 2: the two K halves of a (feature, token) block are two pairs of one
+        # 4-CTA cluster that reduce over DSMEM; 4-CTA clusters co-reside only up to
+        # ~46 at one CTA per SM (hwdb hw56C), so one token block (28 clusters).
+        if (k % (kt * ksplit) or ktiles % stages or rows % tp or rows // tp > cap
+                or rows > 512 or ksplit not in (1, 2) or (ksplit == 2 and tblocks > 1)):
             raise ValueError(f"OprojPushMx k {k} rows {rows} tp {tp} cap {cap} "
-                             f"kt {kt} stages {stages}")  # fmt: skip
+                             f"kt {kt} stages {stages} ksplit {ksplit}")  # fmt: skip
         self.k, self.rows, self.tp, self.cap = k, rows, tp, cap
         self.n = rows // tp
-        self.kt, self.stages, self.ktiles = kt, stages, ktiles
+        self.kt, self.stages, self.ktiles, self.ksplit = kt, stages, ktiles, ksplit
         self.iw, self.ix, self.prefetch = iw, ix, prefetch
         self.x_warp = TMA_WARP + iw
         self.threads = 32 * (TMA_WARP + iw + ix)
         self.tma_rows = max(rows, TMA_MIN_ROWS)
         self.mblocks = WIDTH // FEATURES
-        self.tblocks = -(-rows // MMA_N)
-        self.grid = 2 * self.mblocks * self.tblocks
+        self.tblocks = tblocks
+        self.clus = 2 * ksplit
+        self.grid = self.clus * self.mblocks * self.tblocks
         self.tiler = (FEATURES, MMA_N, kt)
         self.tiler_sfb = (128, MMA_N, kt)
 
@@ -143,6 +164,11 @@ class OprojPushMx:
         )  # fmt: skip
         pair_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (mma.thr_id.shape,))
         pair_sfb_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (mma_sfb.thr_id.shape,))
+        # the K half is the cluster K mode (rank = v + 2 kh): masks and pipelines stay
+        # inside one pair; the TMA atoms are built for the pair alone
+        kc = self.ksplit
+        cl_vmnk = cute.tiled_divide(cute.make_layout((2, 1, kc)), (mma.thr_id.shape,))
+        cl_sfb_vmnk = cute.tiled_divide(cute.make_layout((2, 1, kc)), (mma_sfb.thr_id.shape,))
         a_layout = sm100_utils.make_smem_layout_a(mma, self.tiler, fp8, self.stages)
         b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, fp8, self.stages)
         sfa_layout = blockscaled_utils.make_smem_layout_sfa(mma, self.tiler, SF_VEC, self.stages)
@@ -189,6 +215,7 @@ class OprojPushMx:
             acc_empty: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_dealloc: cutlass.Int64
             tmem_hold: cutlass.Int32
+            xbar: cute.struct.MemRange[cutlass.Int64, 2]
             # scale factors first: their smem descriptors must stay below 256 KiB
             sSFA: cute.struct.Align[cute.struct.MemRange[sf_t, cute.cosize(sfa_layout)], 128]
             sSFB: cute.struct.Align[cute.struct.MemRange[sf_t, cute.cosize(sfb_layout)], 128]
@@ -197,11 +224,11 @@ class OprojPushMx:
 
         self.storage = Storage
         self.kernel(
-            mma, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb, pair_vmnk,
-            pair_sfb_vmnk, a_layout, b_layout, sfa_layout, sfb_layout, tsfa_layout,
+            mma, mma_sfb, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb, cl_vmnk,
+            cl_sfb_vmnk, a_layout, b_layout, sfa_layout, sfb_layout, tsfa_layout,
             tsfb_layout, peers, rank, w_ptr.toint(), sfw_ptr.toint(),
         ).launch(
-            grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[2, 1, 1],
+            grid=[self.grid, 1, 1], block=[self.threads, 1, 1], cluster=[self.clus, 1, 1],
             stream=stream, use_pdl=True,
         )  # fmt: skip
 
@@ -229,8 +256,11 @@ class OprojPushMx:
         coord = pair_vmnk.get_flat_coord(crank)
         coord_sfb = pair_sfb_vmnk.get_flat_coord(crank)
         pair = bidx // 2
-        mb = pair % self.mblocks
-        tb = pair // self.mblocks
+        kh = pair % self.ksplit
+        blk = pair // self.ksplit
+        mb = blk % self.mblocks
+        tb = blk // self.mblocks
+        k0 = kh * self.ktiles
 
         smem = utils.SmemAllocator()
         st = smem.allocate(self.storage)
@@ -254,7 +284,12 @@ class OprojPushMx:
             allocator_warp_id=0, is_two_cta=True,
             two_cta_tmem_dealloc_mbar_ptr=st.tmem_dealloc.ptr, arch="sm_107",
         )  # fmt: skip
-        pipeline_init_arrive(cluster_shape_mn=(2, 1), is_relaxed=True)
+        if cutlass.const_expr(self.ksplit == 2):
+            if tidx == 0:  # DSMEM reduce: [0] partial received (tx), [1] peer ring drained
+                cute.arch.mbarrier_init(st.xbar.data_ptr(), 1)
+                cute.arch.mbarrier_init(st.xbar.data_ptr() + 1, 1)
+                cute.arch.mbarrier_init_fence()
+        pipeline_init_arrive(cluster_shape_mn=(self.clus, 1), is_relaxed=True)
 
         sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
         sB = st.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
@@ -301,7 +336,7 @@ class OprojPushMx:
         tCrB = mma.make_fragment_B(sB)
         acc_shape = mma.partition_shape_C(self.tiler[:2])
         acc_fake = mma.make_fragment_C(cute.append(acc_shape, 1))
-        pipeline_init_wait(cluster_shape_mn=(2, 1))
+        pipeline_init_wait(cluster_shape_mn=(self.clus, 1))
         cute.arch.griddepcontrol_launch_dependents()
 
         # K-start rotation per feature block: pairs do not read the same x lines in
@@ -330,7 +365,7 @@ class OprojPushMx:
             # Weights do not depend on the predecessor: the ring fills with them while
             # the attention core that writes x is still running.
             for t in cutlass.range(iw, self.ktiles, self.iw, unroll=1):
-                kk = (t + rot) % self.ktiles
+                kk = k0 + (t + rot) % self.ktiles
                 ab.producer_acquire(prod)
                 bar = ab.producer_get_barrier(prod)
                 cute.copy(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)],
@@ -355,7 +390,7 @@ class OprojPushMx:
                 xs.advance()
             cute.arch.griddepcontrol_wait()
             for t in cutlass.range(ix, self.ktiles, self.ix, unroll=1):
-                kk = (t + rot) % self.ktiles
+                kk = k0 + (t + rot) % self.ktiles
                 # same slot as the weight warp; only the weight warp arrives (expect_tx)
                 ab.sync_object_empty.wait(xs.index, xs.phase)
                 bar = ab.producer_get_barrier(xs)
@@ -415,8 +450,10 @@ class OprojPushMx:
             cute.arch.griddepcontrol_wait()  # (owner slots written after the producers)
             accc = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             accp.consumer_wait(accc)
-            self._push(acc_ptr, peers, rank, mb, tb, v, st.sA.data_ptr().toint(), warp,
-                       tidx)  # fmt: skip
+            self._push(
+                acc_ptr, peers, rank, mb, tb, v, kh, st.sA.data_ptr().toint(),
+                st.sB.data_ptr().toint(), st.xbar.data_ptr(), crank, warp, tidx,
+            )  # fmt: skip
             with cute.arch.elect_one():
                 accp.consumer_release(accc)
             tmem.relinquish_alloc_permit()
@@ -447,27 +484,61 @@ class OprojPushMx:
         return tiled, src, dst
 
     @cute.jit
-    def _push(self, acc_ptr, peers, rank, mb, tb, v, sa_s, warp, tidx):
+    def _push(self, acc_ptr, peers, rank, mb, tb, v, kh, sa_s, sb_s, xbar, crank, warp,
+              tidx):  # fmt: skip
         """Thread (warp w, lane l) holds feature 128 v + 32 w + l of feature block mb
-        (TMEM lane 32 w + l) for the pair's 128 tokens: BF16 into the token-major
-        tile T[128 tokens][128 features] (the drained A ring), then 16 B chunks of
-        T to the token's row owner."""
+        (TMEM lane 32 w + l) for the pair's 128 tokens. ksplit 1: BF16 into the
+        token-major tile T[128 tokens][128 features] (the drained A ring). ksplit 2:
+        symmetric reduce-scatter with the other K half (cluster CTA crank ^ 2, the
+        same features): this CTA owns tokens [64 kh, 64 kh + 64), pushes its FP32
+        partial of the other 64 into the peer's drained A ring (st.async, quad-major
+        [q][128 features]) once the peer's ring is free, adds the peer's partial of
+        its own (FP32 addition commutes: either CTA's sum is the same bits), rounds
+        once into T[64][128] (the drained B ring). Then 16 B chunks of T go to the
+        token's row owner."""
         r = tidx  # 32 w + l
         taddr = Int32(acc_ptr.toint()) + ((32 * warp) << 16)
-        for c0 in cutlass.range_constexpr(0, MMA_N, 16):
-            vals = tmem_wait_n(*tmem_ld16(taddr + c0))
-            for i in cutlass.range_constexpr(16):
-                st_shared_bf16(sa_s + ((c0 + i) * 128 + r) * 2, vals[i])
+        cols = MMA_N // self.ksplit
+        tile = sb_s if cutlass.const_expr(self.ksplit == 2) else sa_s
+        if cutlass.const_expr(self.ksplit == 1):
+            for c0 in cutlass.range_constexpr(0, MMA_N, 16):
+                vals = tmem_wait_n(*tmem_ld16(taddr + c0))
+                for i in cutlass.range_constexpr(16):
+                    st_shared_bf16(sa_s + ((c0 + i) * 128 + r) * 2, vals[i])
+        else:
+            o0 = kh * cols
+            p0 = cols - o0
+            peer = crank ^ 2
+            rbar = xbar.toint()
+            fbar = (xbar + 1).toint()
+            if tidx == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(xbar, cols * 128 * 4)
+                arrive_remote(fbar, peer)  # our ring is drained (accumulator complete)
+            wait(fbar, 0, scope="cluster")
+            for c0 in cutlass.range_constexpr(0, cols, 16):
+                vals = tmem_wait_n(*tmem_ld16(taddr + p0 + c0))
+                for qq in cutlass.range_constexpr(4):
+                    q = c0 // 4 + qq
+                    push_float(Int32(sa_s + (q * 128 + r) * 16),
+                               tuple(vals[4 * qq:4 * qq + 4]), Int32(rbar), peer)  # fmt: skip
+            wait(rbar, 0, scope="cluster")
+            for c0 in cutlass.range_constexpr(0, cols, 16):
+                vals = tmem_wait_n(*tmem_ld16(taddr + o0 + c0))
+                for qq in cutlass.range_constexpr(4):
+                    p = ld_shared_f32x4(sa_s + ((c0 // 4 + qq) * 128 + r) * 16)
+                    for i in cutlass.range_constexpr(4):
+                        c = c0 + 4 * qq + i
+                        st_shared_bf16(sb_s + (c * 128 + r) * 2, vals[4 * qq + i] + p[i])
         bar_sync(EPI_BAR, 32 * EPI_WARPS)
         column = mb * FEATURES + 128 * v
-        t0 = tb * MMA_N
+        t0 = tb * MMA_N + kh * cols
         n = self.n
-        for j in cutlass.range_constexpr(MMA_N * 16 // (32 * EPI_WARPS)):
+        for j in cutlass.range_constexpr(cols * 16 // (32 * EPI_WARPS)):
             q = j * 32 * EPI_WARPS + tidx
             token = t0 + q // 16
             chunk = q % 16
             if token < self.rows:
-                w = ld_shared_u32x4(sa_s + ((q // 16) * 128 + chunk * 8) * 2)
+                w = ld_shared_u32x4(tile + ((q // 16) * 128 + chunk * 8) * 2)
                 words = tuple(positive_zero32(w[e]) for e in range(4))
                 owner = token // n
                 offset = (rank * self.cap + token - owner * n) * WIDTH + column + chunk * 8
