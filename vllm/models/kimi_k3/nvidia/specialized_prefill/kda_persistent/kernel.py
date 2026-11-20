@@ -2032,9 +2032,13 @@ def _pkd(
                                 b_d,
                                 tma_bar_ptr=mb + MB_BRAW + inst,
                             )
+                    # Only the TMA-issuing warp needs the stage free here: the
+                    # other warps next read the stage after GRAW/QKRAW, which
+                    # complete only after this warp's TMA.  Fewer pollers keep
+                    # the SYNCS-wake retry loop off the shared issue slots.
                     if tma:
-                        cute.arch.mbarrier_wait(mb + MB_RFREE + inst, pp_rfree)
                         if plw == 0:
+                            cute.arch.mbarrier_wait(mb + MB_RFREE + inst, pp_rfree)
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive_and_expect_tx(
                                     mb + MB_GRAW + inst, C * D * 2
@@ -2111,7 +2115,10 @@ def _pkd(
                             early_gate0 = lb2h * _tanhf(ea2c * early_gv0 + dtbc) + lb2h
 
                     # -- phase 1: everything else waits MMA4(ci-5) --
-                    cute.arch.mbarrier_wait(mb + MB_SFREE + inst, pp_sfree)
+                    # one poller per instance; the others sleep on its barrier
+                    if plw == 0:
+                        cute.arch.mbarrier_wait(mb + MB_SFREE + inst, pp_sfree)
+                    ibar.arrive_and_wait()
                     if tma:
                         if plw == 0:
                             f_qr = cute.make_tensor(
