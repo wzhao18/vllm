@@ -63,7 +63,7 @@ def _dms_dump(current) -> None:
             off, nb = ws.offset(name), ws.nbytes(name)
         except Exception:
             continue
-        ring = lw[off:off + nb].view(torch.int64).view(-1, 256, 288)
+        ring = lw[off:off + nb].view(torch.int64).view(-1, 256, 304)
         sig = int(ring[:, :, 63].sum()) + int(ring[:, :, 1].sum() % 1000003)
         key = id(s)
         _DMS_T[key] = now

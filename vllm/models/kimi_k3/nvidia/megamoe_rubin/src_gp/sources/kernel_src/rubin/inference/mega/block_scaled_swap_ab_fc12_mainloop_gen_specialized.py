@@ -1879,6 +1879,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             next_ab_pipeline_state.advance()
             full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
             _dms_w = Int64(0)
+            _dms_s2t = Int64(0)
+            _dms_mi = Int64(0)
+            _dms_rl = Int64(0)
             for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
                 _dms_c0 = read_clock64()
                 ab_pipeline.consumer_wait(ab_pipeline_state, full_status)
@@ -1890,6 +1893,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
+                _dms_c3 = read_clock64()
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
@@ -1910,6 +1914,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         partitioned_tmem_sfb[compact_upper_k_destination_coord],
                     )
 
+                _dms_c4 = read_clock64()
+                _dms_s2t = _dms_s2t + (_dms_c4 - _dms_c3)
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
                 dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
@@ -1926,16 +1932,23 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     first_instruction_accumulate=k_tile_idx != 0,
                 )
 
+                _dms_c5 = read_clock64()
+                _dms_mi = _dms_mi + (_dms_c5 - _dms_c4)
                 ab_pipeline.consumer_release(ab_pipeline_state)
+                _dms_rl = _dms_rl + (read_clock64() - _dms_c5)
                 ab_pipeline_state.advance()
                 next_ab_pipeline_state.advance()
                 full_status = next_full_status
             DG.put_val_dyn(Int32(DG.S_MMC0) + _dms_slot, ((read_clock64() - _dms_c00) << Int64(40)) | (_dms_w << Int64(20)), _dms_p)
+            DG.put_val_dyn(Int32(DG.S_MMX0) + _dms_slot, (_dms_s2t << Int64(42)) | (_dms_mi << Int64(21)) | _dms_rl, _dms_p)
         else:
             next_ab_pipeline_state = ab_pipeline_state.clone()
             next_ab_pipeline_state.advance()
             full_status = ab_pipeline.consumer_try_wait(ab_pipeline_state)
             _dms_w = Int64(0)
+            _dms_s2t = Int64(0)
+            _dms_mi = Int64(0)
+            _dms_rl = Int64(0)
             for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
                 _dms_c0 = read_clock64()
                 ab_pipeline.consumer_wait(ab_pipeline_state, full_status)
@@ -1947,11 +1960,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
+                _dms_c3 = read_clock64()
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
                 cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
 
+                _dms_c4 = read_clock64()
+                _dms_s2t = _dms_s2t + (_dms_c4 - _dms_c3)
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
                 dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
@@ -1968,11 +1984,15 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     first_instruction_accumulate=k_tile_idx != 0,
                 )
 
+                _dms_c5 = read_clock64()
+                _dms_mi = _dms_mi + (_dms_c5 - _dms_c4)
                 ab_pipeline.consumer_release(ab_pipeline_state)
+                _dms_rl = _dms_rl + (read_clock64() - _dms_c5)
                 ab_pipeline_state.advance()
                 next_ab_pipeline_state.advance()
                 full_status = next_full_status
             DG.put_val_dyn(Int32(DG.S_MMC0) + _dms_slot, ((read_clock64() - _dms_c00) << Int64(40)) | (_dms_w << Int64(20)), _dms_p)
+            DG.put_val_dyn(Int32(DG.S_MMX0) + _dms_slot, (_dms_s2t << Int64(42)) | (_dms_mi << Int64(21)) | _dms_rl, _dms_p)
         return ab_pipeline_state, token_pipeline_state
 
     @cute.jit
