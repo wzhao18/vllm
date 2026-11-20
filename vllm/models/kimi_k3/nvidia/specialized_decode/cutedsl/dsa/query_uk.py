@@ -11,7 +11,7 @@ Here CTA (h, n) of 2 G owns gathered head h's latent columns 256 n .. + 255 for 
 row: its W_UK_T slice [256 x 128] (K-major, staged once) times the q_nope rows of
 each 128-row tile (TMA, two stages) on tcgen05 (kind::f16, FP32 accumulation in
 TMEM). The accumulator is two 128-column halves with their own full/free barriers
-and epilogue warp sets (8 warps, thread = row), so the MMAs of one half run under
+and epilogue warp sets (8 warps each, thread = row), so the MMAs of one half run under
 the other half's epilogue. The epilogue rounds to BF16 as the bmm output, scales,
 clamps and stores E4M3 (32 B per store) straight into the query rows, and q_pe
 values 32 n .. + 31.
@@ -49,9 +49,10 @@ A_BYTES = 3 * A_BLOCK  # a row tile's q_nope (two K blocks) and q_pe
 B_BYTES = 256 * 128 * 2  # W_UK_T slice [256 x 128] BF16 (two SW128 K blocks)
 B_HALF = 128 * 128  # one 128-column half's rows inside a B K block
 STAGES = 2
-# warp 0 TMA, warp 1 MMA, warps 4-7 epilogue of accumulator half 0 (+ q_pe), warps
-# 8-11 of half 1 (each set covers the four TMEM lane quadrants)
-THREADS = 384
+# warp 0 TMA, warp 1 MMA, warps 4-11 the epilogue of accumulator half 0 (warps 4-7
+# its columns 0-63 and the q_pe, 8-11 columns 64-127), warps 12-19 of half 1 (each
+# set of four covers the TMEM lane quadrants)
+THREADS = 640
 EPI = 4
 # kind::f16: FP32 D, BF16 A and B (K-major), N = 128 (one accumulator half), M = 128
 IDESC = (1 << 4) | (1 << 7) | (1 << 10) | ((128 >> 3) << 17) | ((128 >> 4) << 24)
@@ -72,10 +73,12 @@ def _tmem_free(taddr):
             (Uint32(taddr),))
 
 
-# The stock pack's E4M3 of x * (1 / scale) clamped to +-448 (0fC3E00000 = -448), round
-# to nearest, for four values -> four bytes (the first lowest).
-_CLAMP = ("mul.rn.f32 {v}, {v}, $5; max.f32 {v}, {v}, 0fC3E00000; "
-          "min.f32 {v}, {v}, 0f43E00000; ")
+# The stock pack's E4M3 of x * (1 / scale) clamped to +-448, round to nearest, for four
+# values -> four bytes (the first lowest). The stock clamp is fmaxf(-448, fminf(y, 448)):
+# min.f32 (NaN -> 448, as fminf) then the saturating convert (below -448 and -inf ->
+# -448) give the same byte for every input.
+_CLAMP = "mul.rn.f32 {v}, {v}, $5; min.f32 {v}, {v}, 0f43E00000; "
+
 _PACK = ("cvt.rn.satfinite.e4m3x2.f32 l, f1, f0; cvt.rn.satfinite.e4m3x2.f32 h, f3, f2; "
          "mov.b32 $0, {l, h}; }")
 _SPLIT = ("shl.b32 x0, p, 16; and.b32 x1, p, 0xFFFF0000; shl.b32 x2, r, 16; "
@@ -171,11 +174,11 @@ class QueryUK:
             mbar_init(b_full, Uint32(1))
             for st in cutlass.range_constexpr(STAGES):
                 mbar_init(a_full + Uint32(8 * st), Uint32(1))
-                # the MMAs' commit and the 128 half-0 epilogue threads (q_pe read)
+                # the MMAs' commit and the 128 q_pe epilogue threads (warps 4-7)
                 mbar_init(a_free + Uint32(8 * st), Uint32(129))
             for c in cutlass.range_constexpr(2):
                 mbar_init(acc_full + Uint32(8 * c), Uint32(1))
-                mbar_init(acc_free + Uint32(8 * c), Uint32(128))
+                mbar_init(acc_free + Uint32(8 * c), Uint32(256))
             fence_mbar_init()
         cute.arch.sync_threads()
         if warp == 0:
@@ -228,7 +231,8 @@ class QueryUK:
                         tc_commit(acc_full + Uint32(8 * c))
                     tc_commit(a_free + Uint32(8) * Uint32(st))
         if warp >= EPI:
-            g = (warp - EPI) // 4  # accumulator half
+            e = (warp - EPI) // 4  # epilogue set: accumulator half e // 2
+            g, sub = e // 2, e % 2  # columns 64 sub .. + 63 of the half
             qd = (warp - EPI) % 4  # TMEM lane quadrant
             row = 32 * qd + lane
             quad = Uint32(32 * qd) << Uint32(16)
@@ -237,7 +241,7 @@ class QueryUK:
                 t = 128 * m + row
                 live = t < R
                 dst = out + (Int64(t) * P + Int64(h)) * ROW
-                if g == 0:
+                if e == 0:
                     # q_pe values 32 n .. + 31 (the A stage's third block, SW128: 16 B
                     # chunk j of row r at j ^ (r % 8)) -> bytes 512 + 32 n ..
                     st = m % STAGES
@@ -259,13 +263,13 @@ class QueryUK:
                 full = acc_full + Uint32(8) * Uint32(g)
                 mbar_wait(full, m & 1)
                 tc_fence_after()
-                for c4 in cutlass.range_constexpr(4):  # (warp-collective TMEM loads)
+                for c4 in cutlass.range_constexpr(2):  # (warp-collective TMEM loads)
                     v = _tmem_ld32(taddr + quad + Uint32(128) * Uint32(g)
-                                   + Uint32(32 * c4))
+                                   + Uint32(64) * Uint32(sub) + Uint32(32 * c4))
                     if live:
                         ws = [_q4_acc(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3],
                                       inv) for i in range(8)]
-                        col = 256 * n + 128 * g + 32 * c4
+                        col = 256 * n + 128 * g + 64 * sub + 32 * c4
                         _st_global8(dst + col, *ws)
                 tc_fence_before()
                 mbar_arrive(acc_free + Uint32(8) * Uint32(g))

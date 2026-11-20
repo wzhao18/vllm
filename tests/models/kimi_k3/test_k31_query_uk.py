@@ -34,7 +34,10 @@ def test_query_uk_matches_stock(rows):
     torch.manual_seed(rows)
     dev = torch.device("cuda")
     q = (torch.randn(rows, G * QK, device=dev) * 2).to(torch.bfloat16)
-    q[1, NOPE + 3] = -1e30  # a q_pe value the stock clamp saturates
+    # q_pe values the stock clamp saturates (fmaxf(-448, fminf(y, 448)))
+    q[1, NOPE + 3] = -1e30
+    q[2, QK + NOPE + 5] = float("inf")
+    q[3, NOPE + 6] = float("-inf")
     uk_t = (torch.randn(G, LAT, NOPE, device=dev) * 0.1).to(torch.bfloat16)
     scale = torch.tensor([0.02], device=dev)
     out = torch.zeros((rows, P, ROW), dtype=torch.float8_e4m3fn, device=dev)
