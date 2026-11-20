@@ -252,7 +252,6 @@ class QueryUK:
                         _ld_shared_v4(pe + Uint32(16) * Uint32((4 * n + i) ^ (row % 8)))
                         for i in range(4)
                     ]
-                    mbar_arrive(a_free + Uint32(8) * Uint32(st))
                     if live:
                         ws = [
                             _q4_bf16(words[i // 2][2 * (i % 2)],
@@ -260,6 +259,14 @@ class QueryUK:
                             for i in range(8)
                         ]
                         _st_global8(dst + LATENT + 32 * n, *ws)
+                    # Free the stage only after the store above has consumed the q_pe
+                    # words. Arriving right after the loads raced: ptxas issues the
+                    # arrive (a uniform USYNCS.ARRIVE) behind the four LDS.128 without
+                    # waiting for their data, and a load still queued behind earlier
+                    # global stores (cold TLB in the first run after other kernels) read
+                    # the next TMA fill of this stage, tile m + 2 (SP DSA block test: every
+                    # odd q_pe byte of row tile 1 equals the q_pe of row + 256).
+                    mbar_arrive(a_free + Uint32(8) * Uint32(st))
                 full = acc_full + Uint32(8) * Uint32(g)
                 mbar_wait(full, m & 1)
                 tc_fence_after()
