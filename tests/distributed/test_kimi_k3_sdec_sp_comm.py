@@ -416,7 +416,11 @@ def _pre_push_worker(env: dict[str, str]) -> None:
         out = torch.empty((CAP // world, WIDTH), dtype=torch.bfloat16, device=device)
         for step, rows in enumerate(MX_ROWS * 2):
             n = rows // world
-            shard = oproj.run(_mx(_inputs(step, rank, rows, device)), out[:n], step % 2)
+            # first pass: the core's MXFP8 view; second: BF16 attn_out (a KDA record
+            # kind that writes BF16, e.g. prefix-caching servers' deferred replay)
+            x = _inputs(step, rank, rows, device)
+            x = _mx(x) if step < len(MX_ROWS) else x
+            shard = oproj.run(x, out[:n], step % 2)
             torch.accelerator.synchronize(device)
             _check_armed(comm, step % 2, rows)
             stock = _mx_reference(step, world, rank, rows, device, projections)
@@ -466,6 +470,8 @@ def test_sp_oproj_rs_mxfp8_pre_push():
     """SpOproj "pre_push" on an online-MXFP8 o-projection (NVFP4 checkpoint KDA
     layers) on 4 ranks: the pre GEMM pushing its partial rows to the row owners gives
     the owner shards of the same GEMM + RS push bit for bit (rows 64..384, both
-    parities, the 1- and 2-CTA tactics), re-arms the mailboxes, and replays captured."""
+    parities, the 1- and 2-CTA tactics; from the core's MXFP8 view and from a BF16
+    attn_out, which the D server's prefix-caching KDA path writes), re-arms the
+    mailboxes, and replays captured."""
     pytest.importorskip("cutlass")
     _distributed_run(_pre_push_worker, world_size=4)

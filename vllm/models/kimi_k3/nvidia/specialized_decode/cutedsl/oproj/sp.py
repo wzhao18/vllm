@@ -361,7 +361,13 @@ class SpOproj:
 
     def _push_pre(self, attn_out, parity):
         """The "pre_push" GEMM: ``attn_out``'s partial rows into ``parity``'s owner
-        slots (``comm.partial`` is only its unused C descriptor)."""
+        slots (``comm.partial`` is only its unused C descriptor). ``attn_out``: the
+        core's MXFP8 view, or BF16 [R, k] where the core writes BF16 (the KDA record
+        kinds other than "flow", e.g. the deferred-record replay of prefix-caching
+        servers), quantized here by the projection's own MXFP8 input (the "mxfp8"
+        tactic's quantization, so the same words)."""
+        if isinstance(attn_out, torch.Tensor):
+            attn_out = self.gemm.input.quantize(attn_out)
         gemm, args = self.codes[attn_out.rows]
         weight = self.gemm
         partial = self.comm.partial[: attn_out.rows]
