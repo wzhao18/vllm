@@ -1471,6 +1471,38 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
 
         # The block captured and replayed: the eager run's shard bit for bit.
         eager = got.clone()
+
+        def _d(a, b):
+            return f"{(a.float() - b.float()).abs().max().item():.2e}/{int((a != b).sum())}"
+
+        def _prep():
+            for ours_c, theirs_c in zip(caches["ours"], caches["stock"]):
+                ours_c.copy_(theirs_c)  # old rows; the new rows are zero here
+            torch.accelerator.synchronize()
+
+        fi = block.core.prepared.fi
+        rec = {}
+        inner = fi.decode if fi is not None else None
+
+        def spy(query, cache_, *rest):
+            rec["t"] = [query] + [t for t in rest if isinstance(t, torch.Tensor)]
+            return inner(query, cache_, *rest)
+
+        if fi is not None:
+            fi.decode = spy
+        states = []
+
+        def _snap(tag, out):
+            states.append((tag, out.clone(), block.attn_out[:r].clone(),
+                           [t.clone() for t in rec.get("t", [])]))
+
+        for k in range(2):  # eager reruns without the tap
+            _prep()
+            _barrier()
+            with override_forward_context(forward):
+                e2 = block.run(x_shard, [caches["ours"][0]], md, run)
+            torch.accelerator.synchronize()
+            _snap(f"eager{k + 2}", e2)
         _barrier()
         graph = torch.cuda.CUDAGraph()
         with (
@@ -1480,37 +1512,20 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         ):
             replayed = block.run(x_shard, [caches["ours"][0]], md, run)
         _barrier()
-
-        def _d(a, b):
-            return f"{(a.float() - b.float()).abs().max().item():.2e}/{int((a != b).sum())}"
-
-        def _prep(mode):
-            for ours_c, theirs_c in zip(caches["ours"], caches["stock"]):
-                ours_c.copy_(theirs_c)  # old rows; the new rows are zero here
-            if mode in ("ours", "idx0"):
-                caches["ours"][0][dbg_at] = dbg_mla_new
-            if mode in ("ours", "mla0"):
-                pg = _pages(caches["ours"][1], index_row)
-                pg[dbg_idx[0].view(-1, 1), dbg_idx[1]] = dbg_idx[2]
+        if fi is not None:
+            fi.decode = inner
+        for k in range(4):
+            _prep()
+            _barrier()
+            graph.replay()
             torch.accelerator.synchronize()
-
-        first = None
-        for mode in ("zero", "mla0", "idx0", "ours"):
-            bad = []
-            for i in range(6):
-                _prep(mode)
-                _barrier()
-                graph.replay()
-                torch.accelerator.synchronize()
-                if first is None:
-                    first = replayed.clone()
-                if not torch.equal(replayed, eager):
-                    bad.append(
-                        f"{i}: out {_d(replayed, eager)} attn "
-                        f"{_d(block.attn_out[:r], attn_in)} finite "
-                        f"{bool(torch.isfinite(block.attn_out[:r]).all())}"
-                    )
-            print(f"DBG2 {where} mode {mode}: {len(bad)}/6 replays differ from eager {bad[:2]}")
+            _snap(f"replay{k}", replayed)
+        base = states[0]
+        for tag, out, att, ts in states:
+            tdiff = [_d(a, b) for a, b in zip(ts, base[3])]
+            print(f"DBG3 {where} {tag}: out vs eager {_d(out, eager)} vs eager2 "
+                  f"{_d(out, base[1])} attn vs eager {_d(att, attn_in)} fi-args vs "
+                  f"eager2 {tdiff}")
         _barrier()
 
     if refusals:
