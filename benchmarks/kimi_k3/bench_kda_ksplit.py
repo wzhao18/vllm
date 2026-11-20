@@ -100,13 +100,15 @@ def stamp_summary(aux):
                 end=q(end))
 
 
-def die_setup(wq, L, tile_m, words=272, m_tiles=None, n_tiles=1):
+def die_setup(wq, L, tile_m, words=272, m_tiles=None, n_tiles=1, claim_only=False):
     """W [L][N][K/L] with the rows of the first n0 M pairs homed on die 0 (both K halves),
     plus one claim/alpha aux per chain slot (cluster tile c -> pair c // L, half c % L)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.dies import (
         CHUNK, localized_like, sm_domains)
     table = sm_domains(dev.index or 0)
     share = sum(1 for d in table if d == 0) / len(table)
+    if claim_only:  # one global W-major claim counter, striped W (no placement)
+        table, share = [0] * len(table), 1.0
     _, n, kh = wq.shape
     pairs = -(-n // tile_m)
     n0 = round(pairs * share)
@@ -125,7 +127,7 @@ def die_setup(wq, L, tile_m, words=272, m_tiles=None, n_tiles=1):
         ints[16:16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=dev)
         auxs.append(aux)
     print(f'die split: {n0}/{pairs} pairs on die 0 (share {share:.3f})', flush=True)
-    return (lambda: localized_like(wq, doms)), auxs
+    return (lambda: wq.clone() if claim_only else localized_like(wq, doms)), auxs
 res = []
 for R in [int(r) for r in args.rows.split(",")]:
     x = torch.randn(R, K, device=dev, dtype=torch.bfloat16)
@@ -149,7 +151,7 @@ for R in [int(r) for r in args.rows.split(",")]:
             ncopy = max(args.chain, -(-1_600_000_000 // wq.numel()))
             if dl:
                 if swap and tuple(cl) == (2, 1):
-                    wplace, auxs = die_setup(wq, L, tile[0], 4608 if st else 272,
+                    wplace, auxs = die_setup(wq, L, tile[0], 4608 if st else 272, claim_only=dl == 2,
                                              n_tiles=-(-R // tile[1]))
                 elif not swap and tuple(cl) == (1, 1) and tile[0] >= R and L == 1:
                     wplace, auxs = die_setup(wq, L, tile[1], 4608 if st else 272, m_tiles=1)
