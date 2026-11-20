@@ -741,10 +741,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     }
     if (K31_RARE(!fast)) {
       if constexpr (kFast) {  // tier 3 on every rank, then the complete body
-        if (!regp) V2STAT(9);
-        else if (nc > kV2Cand) V2STAT(10);
-        else if ((uint32_t)nc < q) V2STAT(11);
-        else V2STAT(12);
+        if (!regp) { V2STAT(9); }
+        else if (nc > kV2Cand) { V2STAT(10); }
+        else if ((uint32_t)nc < q) { V2STAT(11); }
+        else { V2STAT(12); }
         if (tid == 0) { s_sat = 1u; s_above = 0u; s_lo = 0; }
       } else {
       V2STAT(5);
