@@ -26,6 +26,26 @@ def mx(x):
     return buf
 
 
+_PLACED = {}
+
+
+def placed_copies(ws, n):
+    """Die-local copies of the weights (first n/2 rows on die 0, the rest on die 1)."""
+    import types
+
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin.die_local import place_halves
+
+    if id(ws) not in _PLACED:
+        out = []
+        for w in ws:
+            placed = place_halves(w.data.contiguous())
+            if placed is w.data:
+                raise RuntimeError("die-local placement not confirmed")
+            out.append(types.SimpleNamespace(data=placed, scale=w.scale))
+        _PLACED[id(ws)] = out
+    return _PLACED[id(ws)]
+
+
 def ptrs(w, x, out, part, tick):
     import cutlass
     import cutlass.cute as cute
@@ -114,18 +134,31 @@ def main():
             col, stg, ks = int(f["c"]), int(f["s"]), int(f["k"])
             mc, dbg = int(f.get("m", 1)), int(f.get("d", 0))
             kt, ns, nis = int(f.get("t", 128)), int(f.get("n", 1)), int(f.get("i", 1))
+            local = int(f.get("l", 0))  # l1: die-local weight halves + die-aware claim
             try:
+                wsv = ws
+                dsplit = None
+                if local:
+                    wsv = placed_copies(ws, n)
+                    dsplit = sum(1 for b in range(-(-n // 256)) if b * 256 + 128 < n // 2)
                 g = DenseMx8(n, k, rows, n, ksplit=ks, stages=stg, collector=bool(col), mc=mc,
-                             debug=dbg, kt=kt, nsplit=ns, issuers=nis)
+                             debug=dbg, kt=kt, nsplit=ns, issuers=nis, dsplit=dsplit)
                 pw, tw = g.scratch_words()
                 part = torch.zeros(pw, device=dev, dtype=torch.float32)
                 tick = torch.zeros(tw, device=dev, dtype=torch.int32)
+                if local:
+                    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+                        dies,
+                    )
+
+                    table = torch.tensor(dies.sm_domains(0), dtype=torch.int32)
+                    tick[tw - 256: tw - 256 + table.numel()] = table.to(dev)
                 t0 = time.time()
-                args0 = ptrs(ws[0], x, outs[0], part, tick)
+                args0 = ptrs(wsv[0], x, outs[0], part, tick)
                 fn = cute.compile(g, *args0, stream(dev))
                 print(f"  {var}: compiled in {time.time() - t0:.1f}s grid {g.grid} "
                       f"sfa/sfb cols {g.sfa_cols}/{g.sfb_cols}", flush=True)  # fmt: skip
-                all_args = [ptrs(w, x, o, part, tick) for w, o in zip(ws, outs)]
+                all_args = [ptrs(w, x, o, part, tick) for w, o in zip(wsv, outs)]
                 fn(*all_args[0], stream(dev))
                 torch.cuda.synchronize()
                 d = (outs[0].float() - ref.float())

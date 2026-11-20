@@ -22,11 +22,13 @@ ingests 1.6-2.7 MB, and per-SM ingest (~200 GB/s), not HBM, bounds them. Here:
 - PDL: the TMA warp loads the weights (and their scales) of the first ``stages`` K
   tiles BEFORE ``griddepcontrol.wait`` (the producer of x, the SP gather, is still
   running), then the activation tiles;
-- split-K reduce without a second kernel: the two CTAs of a (row block, pair half)
-  pair up by an atomic ticket; the first stores its FP32 partial (L2), the second
-  adds it to its own (FP32 addition commutes: bitwise independent of who is first),
-  rounds once to BF16 and stores. The second only ever waits for a CTA that already
-  holds its finished accumulator, so no co-scheduling is assumed.
+- split-K reduce without a second kernel, symmetric: K half kh owns half of the token
+  columns; each CTA publishes the other half of its FP32 accumulator (L2), waits for
+  its partner's publish, adds it to its own half (FP32 addition commutes: bitwise the
+  same whichever half owns a column), rounds once to BF16 and stores. Both halves
+  publish and reduce concurrently; the grid fits the SMs at 1 CTA/SM and
+  launch_dependents runs at entry, so every partner is resident;
+- ``dsplit``: die-local weights (row-block halves homed per die) claimed per die.
 
 Numerics: FP32 accumulation of the block-scaled products (stock: cuBLASLt MXFP8 with
 FP32 accumulation, BF16 output); the K order differs (two K halves summed last).
@@ -58,6 +60,7 @@ TMA_WARP = 5  # weights (A, SFA): issued before the PDL wait
 X_WARP = 6  # activation (B, SFB): a second TMA issuer, after the PDL wait
 THREADS = 32 * (X_WARP + 1)
 TMEM_COLS = 512
+SM_TABLE = 256  # dsplit: int32 die of each %smid after the 4 claim words
 TMEM_BAR = 1  # named barrier ids (0 = __syncthreads)
 EPI_BAR = 2
 
@@ -130,6 +133,27 @@ def bar_sync(barrier_id: int, count: int):
     return f"bar.sync {barrier_id},{count};", "~{memory}", ()
 
 
+@asm()
+def st_cluster_s32(address, rank, value):
+    """st.shared::cluster of ``value`` at CTA ``rank``'s copy of shared ``address``."""
+    return (
+        "{ .reg .b32 ra; mapa.shared::cluster.u32 ra, $0, $1; "
+        "st.shared::cluster.b32 [ra], $2; }",
+        "r,r,r,~{memory}", (Int32(address), Int32(rank), Int32(value)),
+    )
+
+
+@asm()
+def cluster_sync_all():
+    return ("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;",
+            "~{memory}", ())
+
+
+@asm(Uint32, pure=False)
+def sm_id():
+    return "mov.u32 $0, %smid;", "=r", ()
+
+
 @asm(Int32)
 def ld_shared_s32(address):
     return "ld.shared.b32 $0, [$1];", "=r,r,~{memory}", (Int32(address),)
@@ -149,7 +173,7 @@ class DenseMx8:
     def __init__(self, n: int, k: int, rows: int, ldo: int, *, ksplit: int = 2,
                  kt: int = 128, stages: int = 4, collector: bool = True,
                  mc: int = 1, nsplit: int = 1, issuers: int = 1,
-                 debug: int = 0):  # fmt: skip
+                 dsplit: int | None = None, debug: int = 0):  # fmt: skip
         assert rows <= 384 and k % (kt * ksplit) == 0 and ksplit in (1, 2)
         # nsplit: the R tokens split into nsplit chunks of R / nsplit (whole 128-token
         # MMA blocks: the F8_128x4 scale tiles) over separate CTA pairs (no K split:
@@ -181,13 +205,19 @@ class DenseMx8:
         self.tiler1 = (256, MMA_N, kt)  # one N block: the scale factors of B per block
         self.tiler_sfb = (128, MMA_N, kt)
         self.chunk_clusters = self.mblocks // mc * ksplit
+        # dsplit: die-local weights. Row blocks [0, dsplit) are homed on die 0, the rest
+        # on die 1 (die_local.place_halves); each CTA pair claims a (row block, K half)
+        # item of its own die (%smid -> die table in the ticket scratch) and steals from
+        # the other die only when its die's items are gone (one item per pair).
+        self.dsplit = dsplit
+        assert dsplit is None or (mc == 1 and nsplit == 1 and ksplit == 2)
         self.grid = 2 * self.mblocks * ksplit * nsplit
 
     def scratch_words(self) -> Tuple[int, int]:
         """(FP32 partial words, int32 ticket words) the caller allocates (zeroed
         tickets, persistent across calls)."""
         slots = 2 * self.mblocks
-        return slots * 128 * MMA_N * self.nb, 2 * slots
+        return slots * 128 * MMA_N * self.nb, 2 * slots + 4 + SM_TABLE
 
     def _mma(self, collector):
         return sm107_utils.make_blockscaled_trivial_tiled_mma(
@@ -326,6 +356,37 @@ class DenseMx8:
 
         smem = utils.SmemAllocator()
         st = smem.allocate(self.storage)
+        if cutlass.const_expr(self.dsplit is not None):
+            base = ticket_ptr.toint() + Int64(4 * self.mblocks) * 4
+            items0 = 2 * self.dsplit
+            items1 = 2 * (self.mblocks - self.dsplit)
+            tick_s = st.ticket.ptr.toint()
+            if tidx == 0 and v == 0:
+                die = ld_acquire_gpu(base + Int64(16) + Int64(sm_id()) * 4)
+                c = atom_add_gpu(base + Int64(die) * 4, 1)
+                item = Int32(-1)
+                if die == 0:
+                    if c < items0:
+                        item = c
+                else:
+                    if c < items1:
+                        item = items0 + c
+                if item < 0:  # this die's items are gone: take one of the other die
+                    c2 = atom_add_gpu(base + Int64(1 - die) * 4, 1)
+                    if die == 0:
+                        item = items0 + c2
+                    else:
+                        item = c2
+                if atom_add_gpu(base + Int64(8), 1) == self.grid // 2 - 1:
+                    st_release_gpu(base, 0)  # the last claimer resets for the next call
+                    st_release_gpu(base + Int64(4), 0)
+                    st_release_gpu(base + Int64(8), 0)
+                st_shared_s32(tick_s, item)
+                st_cluster_s32(tick_s, 1, item)
+            cluster_sync_all()
+            item = ld_shared_s32(tick_s)
+            mb = item // 2
+            kh = item % 2
         ab = pipeline.PipelineTmaUmma.create(
             barrier_storage=st.full.data_ptr(), num_stages=self.stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -537,7 +598,7 @@ class DenseMx8:
             if cutlass.const_expr(not self.debug & 1):
                 self._epilogue(
                     acc_ptr, out_ptr, part_ptr, ticket_ptr, st.ticket.ptr.toint(), mb, v,
-                    chunk, st.sA.data_ptr().toint(), st.sB.data_ptr().toint(), st.xbar.data_ptr(),
+                    chunk, kh, st.sA.data_ptr().toint(), st.sB.data_ptr().toint(), st.xbar.data_ptr(),
                     warp, lane, tidx,
                 )  # fmt: skip
             if cutlass.const_expr(not self.debug & 32):
@@ -569,7 +630,7 @@ class DenseMx8:
         return tiled, src, dst
 
     @cute.jit
-    def _epilogue(self, acc_ptr, out_ptr, part_ptr, ticket_ptr, ticket_s, mb, v, chunk,
+    def _epilogue(self, acc_ptr, out_ptr, part_ptr, ticket_ptr, ticket_s, mb, v, chunk, kh,
                   sa_s, sb_s,
                   xbar, warp, lane, tidx):  # fmt: skip
         """Thread (warp w, lane l) owns weight row 128 v + 32 w + l of row block mb
@@ -589,61 +650,71 @@ class DenseMx8:
                         if live:
                             out[n0 + (c0 + i) * self.ldo + n] = vals[i].to(cutlass.BFloat16)
         else:
+            # Symmetric split-K exchange: the K half kh owns the token columns
+            # [kh * half, (kh + 1) * half). Each CTA publishes the OTHER half of its FP32
+            # accumulator (half the bytes of a one-sided exchange, both CTAs at once),
+            # then adds its partner's published half to its own and stores BF16. Both
+            # halves run concurrently, so each CTA waits only for its partner's publish
+            # (not a serial publish + full reduce). Co-residency: launch_dependents runs
+            # at entry, so no dependent grid takes an SM before every CTA of this grid is
+            # resident (grid <= SMs at 1 CTA/SM): the partner always makes progress.
+            # FP32 addition commutes, so own + partner is bitwise the same value whichever
+            # K half owns the column.
+            half = cols // 2
             slot = mb * 2 + v
             part = cute.make_tensor(part_ptr, cute.make_layout(2 * self.mblocks * cols * 128))
-            base = slot * cols * 128 + r
-            tick_a = ticket_ptr.toint() + Int64(slot) * 4
-            flag_a = ticket_ptr.toint() + Int64(2 * self.mblocks + slot) * 4
-            if tidx == 0:
-                st_shared_s32(ticket_s, atom_add_gpu(tick_a, 1))
+            pub = slot * cols * 128 + (1 - kh) * half * 128 + r  # region (slot, 1 - kh)
+            own_a = ticket_ptr.toint() + Int64(2 * slot + kh) * 4
+            peer_a = ticket_ptr.toint() + Int64(2 * slot + 1 - kh) * 4
+            if tidx == 0:  # this CTA's launch epoch (only this CTA writes its flag)
+                st_shared_s32(ticket_s, ld_acquire_gpu(own_a) + 1)
             bar_sync(EPI_BAR, 32 * EPI_WARPS)
-            ticket = ld_shared_s32(ticket_s)
-            gen = ticket // 2 + 1
-            if ticket % 2 == 0:  # first: publish the FP32 partial
-                for c0 in cutlass.range_constexpr(0, cols, 16):
-                    vals = tmem_wait_n(*tmem_ld16(taddr + c0))
+            gen = ld_shared_s32(ticket_s)
+            c_pub = (1 - kh) * half
+            for c0 in cutlass.range_constexpr(0, half, 16):
+                vals = tmem_wait_n(*tmem_ld16(taddr + c_pub + c0))
+                for i in cutlass.range_constexpr(16):
+                    part[pub + (c0 + i) * 128] = vals[i]
+            fence_gpu()
+            bar_sync(EPI_BAR, 32 * EPI_WARPS)
+            # The partner's half (half x 128 FP32, column-major) arrives by 64-column bulk
+            # copies (32 KB) into the drained operand ring (sA, sB), double buffered.
+            chunk_cols = 64
+            chunk = chunk_cols * 128 * 4
+            nch = half // chunk_cols
+            src0 = part_ptr.toint() + Int64(slot * cols * 128 + kh * half * 128) * 4
+            if tidx == 0:
+                st_release_gpu(own_a, gen)
+                cute.arch.mbarrier_init(xbar, 1)
+                cute.arch.mbarrier_init(xbar + 1, 1)
+                cute.arch.mbarrier_init_fence()
+                while ld_acquire_gpu(peer_a) < gen:
+                    pass
+                fence_proxy_async_global()
+                cute.arch.mbarrier_arrive_and_expect_tx(xbar, chunk)
+                copy_bulk(sa_s, src0, xbar.toint(), chunk)
+                if cutlass.const_expr(nch > 1):
+                    cute.arch.mbarrier_arrive_and_expect_tx(xbar + 1, chunk)
+                    copy_bulk(sb_s, src0 + chunk, (xbar + 1).toint(), chunk)
+            bar_sync(EPI_BAR, 32 * EPI_WARPS)
+            c_own = kh * half
+            for j in cutlass.range_constexpr(nch):
+                sbase = sa_s if j % 2 == 0 else sb_s
+                wait((xbar + (j % 2)).toint(), (j // 2) % 2, scope="cta")
+                for c0 in cutlass.range_constexpr(0, chunk_cols, 16):
+                    cl_ = chunk_cols * j + c0  # column within the owned half
+                    vals = tmem_wait_n(*tmem_ld16(taddr + c_own + cl_))
+                    p = [ld_shared_f32(sbase + ((c0 + i) * 128 + r) * 4) for i in range(16)]
                     for i in cutlass.range_constexpr(16):
-                        part[base + (c0 + i) * 128] = vals[i]
-                fence_gpu()
-                bar_sync(EPI_BAR, 32 * EPI_WARPS)
-                if tidx == 0:
-                    st_release_gpu(flag_a, gen)
-            else:  # second: add the other half's partial, round once, store
-                # The partial (cols x 128 FP32, column-major) arrives by bulk copies of
-                # 128-column chunks (64 KB) into the drained operand ring (sA, sB): one
-                # async copy at the per-SM rate instead of latency-bound scalar loads.
-                chunk = 128 * 128 * 4
-                nch = self.nb
-                src0 = part_ptr.toint() + Int64(slot * cols * 128) * 4
-                if tidx == 0:
-                    cute.arch.mbarrier_init(xbar, 1)
-                    cute.arch.mbarrier_init(xbar + 1, 1)
-                    cute.arch.mbarrier_init_fence()
-                    while ld_acquire_gpu(flag_a) < gen:
-                        pass
-                    fence_proxy_async_global()
-                    cute.arch.mbarrier_arrive_and_expect_tx(xbar, chunk)
-                    copy_bulk(sa_s, src0, xbar.toint(), chunk)
-                    if cutlass.const_expr(nch > 1):
-                        cute.arch.mbarrier_arrive_and_expect_tx(xbar + 1, chunk)
-                        copy_bulk(sb_s, src0 + chunk, (xbar + 1).toint(), chunk)
-                bar_sync(EPI_BAR, 32 * EPI_WARPS)
-                for j in cutlass.range_constexpr(nch):
-                    sbase = sa_s if j % 2 == 0 else sb_s
-                    wait((xbar + (j % 2)).toint(), (j // 2) % 2, scope="cta")
-                    for c0 in cutlass.range_constexpr(0, 128, 16):
-                        cc = 128 * j + c0
-                        vals = tmem_wait_n(*tmem_ld16(taddr + cc))
-                        p = [ld_shared_f32(sbase + ((c0 + i) * 128 + r) * 4) for i in range(16)]
-                        for i in cutlass.range_constexpr(16):
-                            if cutlass.const_expr(cc + i < self.rows):
-                                if live:
-                                    out[n0 + (cc + i) * self.ldo + n] = (vals[i] + p[i]).to(
-                                        cutlass.BFloat16
-                                    )
-                    if cutlass.const_expr(j + 2 < nch):
-                        bar_sync(EPI_BAR, 32 * EPI_WARPS)  # chunk j's buffer is free again
-                        if tidx == 0:
-                            cute.arch.mbarrier_arrive_and_expect_tx(xbar + (j % 2), chunk)
-                            copy_bulk(sbase, src0 + (j + 2) * chunk, (xbar + (j % 2)).toint(),
-                                      chunk)  # fmt: skip
+                        cc = c_own + cl_ + i
+                        if cc < self.rows:
+                            if live:
+                                out[n0 + cc * self.ldo + n] = (vals[i] + p[i]).to(
+                                    cutlass.BFloat16
+                                )
+                if cutlass.const_expr(j + 2 < nch):
+                    bar_sync(EPI_BAR, 32 * EPI_WARPS)  # chunk j's buffer is free again
+                    if tidx == 0:
+                        cute.arch.mbarrier_arrive_and_expect_tx(xbar + (j % 2), chunk)
+                        copy_bulk(sbase, src0 + (j + 2) * chunk, (xbar + (j % 2)).toint(),
+                                  chunk)  # fmt: skip
