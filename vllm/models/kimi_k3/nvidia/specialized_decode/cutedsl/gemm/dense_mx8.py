@@ -164,6 +164,30 @@ def st_shared_s32(address, value):
     return "st.shared.b32 [$0], $1;", "r,r,~{memory}", (Int32(address), Int32(value))
 
 
+@asm()
+def st_shared_bf16(address, value):
+    code = "{ .reg .b16 t; cvt.rn.bf16.f32 t, $1; st.shared.b16 [$0], t; }"
+    return code, "r,f,~{memory}", (Int32(address), Float32(value))
+
+
+@asm()
+def ld_shared_v4(address):
+    return ("ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r,~{memory}",
+            (Int32(address),), (Uint32,) * 4)  # fmt: skip
+
+
+@asm()
+def st_global_v4(address, a, b, c, d):
+    return ("st.global.v4.b32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r,~{memory}",
+            (Int64(address), Uint32(a), Uint32(b), Uint32(c), Uint32(d)))  # fmt: skip
+
+
+def tmem_ld64(taddr):
+    """64 accumulator columns: four tcgen05.ld x16 in flight, one wait."""
+    return tmem_wait_n(*tmem_ld16(taddr), *tmem_ld16(taddr + 16),
+                       *tmem_ld16(taddr + 32), *tmem_ld16(taddr + 48))  # fmt: skip
+
+
 class DenseMx8:
     """One compiled shape: ``n`` x ``k`` weight, ``rows`` tokens (<= 384, any count:
     the token blocks past ``rows`` read TMA zero fill and are not stored), output row
@@ -643,9 +667,9 @@ class DenseMx8:
         n0 = chunk * (self.rows * self.ldo)  # this pair's token chunk
         live = n < self.n
         if cutlass.const_expr(self.ksplit == 1):
-            for c0 in cutlass.range_constexpr(0, cols, 16):
-                vals = tmem_wait_n(*tmem_ld16(taddr + c0))
-                for i in cutlass.range_constexpr(16):
+            for c0 in cutlass.range_constexpr(0, cols, 64):
+                vals = tmem_ld64(taddr + c0)
+                for i in cutlass.range_constexpr(64):
                     if cutlass.const_expr(c0 + i < self.rows):
                         if live:
                             out[n0 + (c0 + i) * self.ldo + n] = vals[i].to(cutlass.BFloat16)
@@ -671,10 +695,11 @@ class DenseMx8:
             bar_sync(EPI_BAR, 32 * EPI_WARPS)
             gen = ld_shared_s32(ticket_s)
             c_pub = (1 - kh) * half
-            for c0 in cutlass.range_constexpr(0, half, 16):
-                vals = tmem_wait_n(*tmem_ld16(taddr + c_pub + c0))
-                for i in cutlass.range_constexpr(16):
-                    part[pub + (c0 + i) * 128] = vals[i]
+            for c0 in cutlass.range_constexpr(0, half, 64):
+                vals = tmem_ld64(taddr + c_pub + c0)
+                if cutlass.const_expr(not self.debug & 1024):
+                    for i in cutlass.range_constexpr(64):
+                        part[pub + (c0 + i) * 128] = vals[i]
             fence_gpu()
             bar_sync(EPI_BAR, 32 * EPI_WARPS)
             # The partner's half (half x 128 FP32, column-major) arrives by 64-column bulk
@@ -688,8 +713,9 @@ class DenseMx8:
                 cute.arch.mbarrier_init(xbar, 1)
                 cute.arch.mbarrier_init(xbar + 1, 1)
                 cute.arch.mbarrier_init_fence()
-                while ld_acquire_gpu(peer_a) < gen:
-                    pass
+                if cutlass.const_expr(not self.debug & 4096):
+                    while ld_acquire_gpu(peer_a) < gen:
+                        pass
                 fence_proxy_async_global()
                 cute.arch.mbarrier_arrive_and_expect_tx(xbar, chunk)
                 copy_bulk(sa_s, src0, xbar.toint(), chunk)
@@ -698,23 +724,33 @@ class DenseMx8:
                     copy_bulk(sb_s, src0 + chunk, (xbar + 1).toint(), chunk)
             bar_sync(EPI_BAR, 32 * EPI_WARPS)
             c_own = kh * half
+            # BF16 staging (token-major, 128 weight rows = 256 B per token): two 16 KB
+            # buffers after the partner chunk buffer in sB (nch == 1: sB is free).
+            stg0 = sb_s + (chunk if nch > 1 else 0)
+            out_a = out_ptr.toint() + Int64(n0) * 2
+            ncol = mb * 256 + 128 * v
             for j in cutlass.range_constexpr(nch):
                 sbase = sa_s if j % 2 == 0 else sb_s
+                stg = stg0 + (j % 2) * (chunk_cols * 256)
                 wait((xbar + (j % 2)).toint(), (j // 2) % 2, scope="cta")
-                for c0 in cutlass.range_constexpr(0, chunk_cols, 16):
-                    cl_ = chunk_cols * j + c0  # column within the owned half
-                    vals = tmem_wait_n(*tmem_ld16(taddr + c_own + cl_))
-                    p = [ld_shared_f32(sbase + ((c0 + i) * 128 + r) * 4) for i in range(16)]
-                    for i in cutlass.range_constexpr(16):
-                        cc = c_own + cl_ + i
-                        if cc < self.rows:
-                            if live:
-                                out[n0 + cc * self.ldo + n] = (vals[i] + p[i]).to(
-                                    cutlass.BFloat16
-                                )
+                vals = tmem_ld64(taddr + c_own + chunk_cols * j)
+                p = [ld_shared_f32(sbase + (i * 128 + r) * 4) for i in range(chunk_cols)]
+                for i in cutlass.range_constexpr(chunk_cols):
+                    st_shared_bf16(stg + i * 256 + r * 2, vals[i] + p[i])
+                bar_sync(EPI_BAR, 32 * EPI_WARPS)  # staged; partner chunk j consumed
                 if cutlass.const_expr(j + 2 < nch):
-                    bar_sync(EPI_BAR, 32 * EPI_WARPS)  # chunk j's buffer is free again
                     if tidx == 0:
                         cute.arch.mbarrier_arrive_and_expect_tx(xbar + (j % 2), chunk)
                         copy_bulk(sbase, src0 + (j + 2) * chunk, (xbar + (j % 2)).toint(),
                                   chunk)  # fmt: skip
+                if cutlass.const_expr(not self.debug & 2048):
+                    for q in cutlass.range_constexpr(chunk_cols * 16 // (32 * EPI_WARPS)):
+                        idx = tidx + 32 * EPI_WARPS * q
+                        tok = idx >> 4
+                        seg = idx & 15
+                        cc = c_own + chunk_cols * j + tok
+                        nn = ncol + seg * 8
+                        if cc < self.rows:
+                            if nn < self.n:
+                                w = ld_shared_v4(stg + tok * 256 + seg * 16)
+                                st_global_v4(out_a + (Int64(cc) * self.ldo + nn) * 2, *w)

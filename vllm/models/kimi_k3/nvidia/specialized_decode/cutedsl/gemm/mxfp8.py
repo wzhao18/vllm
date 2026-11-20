@@ -214,6 +214,25 @@ class Mxfp8Projection:
             r: _dense_engine(n, k, r, weight.device)
             for r in self.rows if self.kinds[r] == "dense_mx8"
         }  # fmt: skip
+        if any(e.gemm.dsplit is not None for e in self._dense.values()):
+            self._home_weight(linear_or_weight)
+
+    def _home_weight(self, linear_or_weight):
+        """Die-local weights for the die-claiming dense_mx8: first N/2 rows homed on die
+        0, the rest on die 1 (``die_local.place_halves``); the linear's own weight is
+        replaced so the striped copy is freed. Unconfirmed homes keep the striped
+        weight (same results; the claim is die-aware either way)."""
+        from ....megamoe_rubin.die_local import place_halves
+
+        placed = place_halves(self.weight)
+        if placed is self.weight:
+            return
+        if not isinstance(linear_or_weight, tuple):
+            from ....mxfp8 import _kernel_layout
+
+            if _kernel_layout(linear_or_weight) != "kn":
+                linear_or_weight.weight.data = placed
+        self.weight = placed
 
     def _gemm(self, kind, xq, xs, out):
         import flashinfer
@@ -284,8 +303,13 @@ class _DenseEngine:
         from .dense_mx8 import DenseMx8
 
         stages = DENSE_TOKEN_SPLIT.get((n, k))
+        table = None
         if stages is None:
-            self.gemm = DenseMx8(n, k, rows, n)
+            table = _die_table(device)
+            dsplit = None
+            if table is not None:  # row blocks homed on die 0 (place_halves: N/2 rows)
+                dsplit = sum(1 for b in range(-(-n // 256)) if b * 256 + 128 < n // 2)
+            self.gemm = DenseMx8(n, k, rows, n, stages=DENSE_STAGES, dsplit=dsplit)
         else:
             self.gemm = DenseMx8(
                 n, k, rows, n, ksplit=1, nsplit=rows // 128, stages=stages
@@ -293,6 +317,10 @@ class _DenseEngine:
         words, tickets = self.gemm.scratch_words()
         self.part = torch.empty(words, dtype=torch.float32, device=device)
         self.tickets = torch.zeros(tickets, dtype=torch.int32, device=device)
+        if self.gemm.dsplit is not None:  # the %smid -> die table after the claim words
+            from .dense_mx8 import SM_TABLE
+
+            self.tickets[tickets - SM_TABLE: tickets - SM_TABLE + table.numel()] = table
         self.device = device
         self._stream = stream
         import cutlass.cute as cute
@@ -323,6 +351,20 @@ class _DenseEngine:
 
 
 _ENGINES: dict[tuple, _DenseEngine] = {}
+DENSE_STAGES = 5  # split-K dense_mx8 ring depth
+
+
+def _die_table(device) -> torch.Tensor | None:
+    """int32 die of each SM, or None without a trusted two-die map (die-oblivious)."""
+    from ....megamoe_rubin.die_local import die_sm_mask32
+
+    index = torch.device(device).index
+    mask = die_sm_mask32(torch.accelerator.current_device_index() if index is None else index)
+    if mask is None:
+        return None
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    dies = [(mask[sm // 32] >> (sm % 32)) & 1 for sm in range(sms)]
+    return torch.tensor(dies, dtype=torch.int32, device=device)
 
 
 def _dense_engine(n, k, rows, device) -> _DenseEngine:
