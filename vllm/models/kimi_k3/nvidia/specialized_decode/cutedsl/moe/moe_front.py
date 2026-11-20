@@ -257,12 +257,12 @@ __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool
   int jx = 0, gs = 0, g = 0;
   for (int j = 0; j < m.nk; ++j) {
     if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
-    if (j < m.nt) {
-      // Weight block j in TMEM (the fill commits each block): the MMAs run behind the
-      // fill instead of after it.
-      mbar_wait(m.trdy0 + 8 * j, 0);
+    if (j < m.nt && (j & 3) == 0) {
+      // Weight blocks j..j+3 in TMEM (the fill commits each block, in order): one wait
+      // and one fence per 4 blocks; the MMAs run behind the fill, not after it.
+      mbar_wait(m.trdy0 + 8 * min(j + 3, m.nt - 1), 0);
       asm volatile("tcgen05.fence::after_thread_sync;");
-      if (j == m.nt - 1 && lane == 0 && p.stamps) {
+      if (kStamp && j + 4 >= m.nt && lane == 0) {
         p.stamps[blockIdx.x * kStampStride + 56] = globaltimer();
       }
     } else if (j == m.nt) {
@@ -429,6 +429,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     int slot = 0;
     for (int i = 0; i < nt; ++i) {
       mbar_wait(full0 + 8 * slot, ph);
+      if (i == nt - 1 && lane == 0) STAMP(28);  // the last TMEM weight block landed
       cp4_el(ta, smem_desc(ring_s + slot * kSlot));
       commit_el(trdy0 + 8 * i);  // block i in TMEM: its MMAs may run
       // The slot is free: for the next weight block of the ring, or after its last

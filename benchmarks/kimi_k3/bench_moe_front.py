@@ -229,7 +229,7 @@ def main():
                 torch.cuda.synchronize()
             sv = st[: grid * 64].view(grid, 64)
             s = (sv.double() - float(end.item())) / 1000.0
-            cols = {"entry": 0, "w-ready": 56, "x-issue": 1, "x0-mma": 6, "acc-done": 7, "partial": 2,
+            cols = {"entry": 0, "w-landed": 28, "w-ready": 56, "x-issue": 1, "x0-mma": 6, "acc-done": 7, "partial": 2,
                     "tile-sum": 3, "staged": 57, "topk-go": 4, "end": 5}
             parts = []
             for nm, i in cols.items():
