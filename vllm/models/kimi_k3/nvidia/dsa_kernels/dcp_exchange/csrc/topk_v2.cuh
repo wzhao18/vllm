@@ -1022,7 +1022,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           int* rk = reinterpret_cast<int*>(hist + kV2Fine + 2 * kV2Win);
           if (tid < m) rk[tid] = 0;
           __syncthreads();
-          V2DBG(29);
           const uint32_t* my = rx + p.rank * kV2Msg + kV2Fix + s_toff[p.rank];
           for (int it = tid; it < m * W; it += kV2T) {
             const int i = it / W, r2 = it - i * W;
@@ -1049,51 +1048,6 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     V2DBG(5);
     int tier = s_tier;
     if constexpr (kFast) {
-      // The common case (tier 1 from round 1) writes and ends the row right here: the hot
-      // path stays one contiguous code region. Jumping over the rare tiers' code to a shared
-      // write and row end cost a cold instruction fetch per jump (ncu: no_instruction stalls
-      // at each far branch target, ~0.4-0.8 us each).
-      if (K31_LIKELY(tier == 1)) {
-        V2STAT(1);
-        const int tau = s_tau, qq = s_q;
-        if (tid == 0 && !(fast && regp && tau >= th)) spin_fail(p.err, 41);
-        const int cpt = (nc + kV2T - 1) / kV2T;
-        const int c0 = min(nc, tid * cpt), c1 = min(nc, c0 + cpt);
-        uint32_t ca = 0, ct = 0;
-        for (int c = c0; c < c1; ++c) {
-          const int k = ckey[c];
-          ca += k > tau;
-          ct += k == tau;
-        }
-        uint32_t tot;
-        const uint32_t pre = v2_scan<T>(ca | (ct << 16), V2WS, &tot);
-        const int gtt = (int)(tot & 0xFFFFu), nties = (int)(tot >> 16);
-        int a = (int)(pre & 0xFFFFu), t = (int)(pre >> 16);
-        for (int c = c0; c < c1; ++c) {
-          const int k = ckey[c];
-          if (k > tau) {
-            if (a < K) orow[a] = cslot[c];
-            ++a;
-          } else if (k == tau) {
-            if (t < qq && gtt + t < K) orow[gtt + t] = cslot[c];
-            ++t;
-          }
-        }
-        const int count = min(K, gtt + qq);
-        if (tid == 0 && (gtt + qq > K || nties < qq)) spin_fail(p.err, 40);
-        for (int i = count + tid; i < K; i += kV2T) orow[i] = -1;
-        if (tid == 0) {
-          p.out_count[row] = count;
-          p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
-          p.redo[row] = 0;
-        }
-        V2DBG(18);
-        V2DBG(8);
-        // the CTA's last row: end here (a return jumps to the kernel's row loop tail, far away)
-        if (row + (int)gridDim.x >= p.T) asm volatile("exit;" ::: "memory");
-        __syncthreads();  // SMEM reused by the next row
-        return 0;
-      }
       // ---- R2: the bounded exact fallback in this CTA (one more NVLink round, no redo
       // launch). LB = the largest key whose lower-bound global count of keys >= LB (from the
       // round-1 windows) reaches K, the same on every rank; every rank sends ALL its keys >= LB
