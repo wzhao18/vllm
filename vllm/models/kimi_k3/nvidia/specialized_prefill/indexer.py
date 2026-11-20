@@ -1575,6 +1575,75 @@ def key16_of_word(wd):
     return code, "=r,r", (Uint32(wd),)
 
 
+TIE_RANK = 256  # threshold ties ranked directly (more: the tile histogram path)
+
+
+@asm()
+def hist4_pos(hist_a, s, c0, c1, c2, c3, w0, w1, w2, w3, thr):
+    """Histogram of one lane quad of candidate slot s when the row threshold thr
+    is a positive BF16 (every candidate is a positive BF16 at or above it): one
+    count per valid word (s below its lane count) in bin min(bits - thr,
+    CS2_BINS - 1). Branch-free."""
+    code = "{ .reg .pred p; .reg .b32 v, a; "
+    for k in range(4):
+        code += (
+            f"setp.lt.u32 p, $1, ${2 + k}; and.b32 v, ${6 + k}, 0xFFFF; "
+            f"sub.u32 v, v, $10; min.u32 v, v, {CS2_BINS - 1}; "
+            f"mad.lo.u32 a, v, 4, $0; @p red.shared.add.u32 [a], 1; "
+        )
+    return code + "}", ",".join(["r"] * 11) + ",~{memory}", (
+        Int32(hist_a), Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(thr),
+    )
+
+
+@asm()
+def emit4_pos(s, c0, c1, c2, c3, w0, w1, w2, w3, t, pb, at, lt, lane, ocnt_a,
+              tcnt_a, tlist_a, orow):
+    """Emission of one lane quad of candidate slot s (positive-threshold rows, t
+    the BF16 bits of the k-th value): valid words above t (and at t when at != 0)
+    go to the output row at slots reserved by one shared atomic per warp; valid
+    words at t (at == 0) are appended to the tie list (tcnt_a counter, TIE list
+    capacity CS2_BINS). Key index of lane 4 q + k: (bits >> 16) * TILE + pb + 4 k.
+    Branch-free; every lane of the warp calls it."""
+    code = (
+        "{ .reg .pred v, at, nat, l0, pz, pc, g0, g1, g2, g3, e0, e1, e2, e3; "
+        ".reg .b32 x, j, a, base, tot, p0, p1, p2, p3, b0, b1, b2, b3, n0, n1, n2, n3; "
+        ".reg .b64 ad; "
+        "setp.ne.u32 at, $11, 0; not.pred nat, at; "
+    )
+    for k in range(4):
+        code += (
+            f"setp.lt.u32 v, $0, ${1 + k}; and.b32 x, ${5 + k}, 0xFFFF; "
+            f"shr.u32 p{k}, ${5 + k}, 9; and.b32 p{k}, p{k}, 0xFFFFFF80; "
+            f"add.u32 p{k}, p{k}, $10; add.u32 p{k}, p{k}, {4 * k}; "
+            f"setp.gt.and.u32 g{k}, x, $9, v; setp.eq.and.u32 e{k}, x, $9, v; "
+            f"@at or.pred g{k}, g{k}, e{k}; and.pred e{k}, e{k}, nat; "
+            f"@e{k} atom.shared.add.u32 j, [$15], 1; "
+            f"setp.lt.and.u32 pc, j, {CS2_BINS}, e{k}; mad.lo.u32 a, j, 4, $16; "
+            f"@pc st.shared.b32 [a], p{k}; "
+            f"vote.sync.ballot.b32 b{k}, g{k}, 0xffffffff; popc.b32 n{k}, b{k}; "
+        )
+    code += (
+        "add.u32 tot, n0, n1; add.u32 tot, tot, n2; add.u32 tot, tot, n3; "
+        "setp.eq.u32 l0, $13, 0; setp.ne.and.u32 pz, tot, 0, l0; mov.u32 base, 0; "
+        "@pz atom.shared.add.u32 base, [$14], tot; "
+        "shfl.sync.idx.b32 base, base, 0, 0x1f, 0xffffffff; "
+    )
+    for k in range(4):
+        code += (
+            f"and.b32 a, b{k}, $12; popc.b32 a, a; add.u32 a, a, base; "
+            f"mul.wide.u32 ad, a, 4; add.s64 ad, ad, $17; @g{k} st.global.b32 [ad], p{k}; "
+            f"add.u32 base, base, n{k}; "
+        )
+    return code + "}", ",".join(["r"] * 17) + ",l,~{memory}", (
+        Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(pb),
+        Uint32(at), Uint32(lt), Uint32(lane), Int32(ocnt_a), Int32(tcnt_a),
+        Int32(tlist_a), Int64(orow),
+    )
+
+
 class CandSelect2:
     """Exact top-k of each row from its PUBLISH candidates, persistent and
     double-buffered: a CTA walks rows bid, bid + G, ...; while it selects row r,
@@ -1591,7 +1660,9 @@ class CandSelect2:
     indices are emitted, found by a histogram of their tiles. Rows with fewer
     candidates than min(k, row length), an overflowed lane or more than CS2_BINS
     ties are flagged in row_bin[3 r + 1] (recomputed by the caller). Output order
-    is unspecified."""
+    is unspecified. Rows with a positive threshold (every candidate a positive
+    BF16, ordered by its bits) take branch-free histogram and emission passes
+    (hist4_pos, emit4_pos); up to TIE_RANK ties are ranked directly."""
 
     def __init__(self, topk: int, ctas: int, skeleton: bool = False):
         self.topk = topk
@@ -1754,11 +1825,26 @@ class CandSelect2:
                          Int32(mc) * (TILE * 4))
         if tid < TILE and bid + G < n_rows:
             nxt = Uint32(cand[Int64(bid + G) * REGION + tid])
+        # row length and PUBLISH threshold, one row ahead (their loads stay off
+        # the row's critical path)
+        n_nx = Int32(0)
+        thr_nx = Uint32(0)
+        if bid < n_rows:
+            n_nx = row_len[bid]
+            thr_nx = Uint32(row_bin[3 * bid])
+        lt_mask = lanemask_lt()
+        pb0 = Uint32(16 * (lane % 8) + lane // 8)
+        out_base = Int64(out.iterator.toint())
         n_it = (n_rows - bid + G - 1) // G
         for it in cutlass.range(n_it, unroll=1):
             row = bid + it * G
             b = it % 2
             nb = 1 - b
+            n = n_nx
+            thr_row = thr_nx & Uint32(0xFFFF)
+            if row + G < n_rows:
+                n_nx = row_len[row + G]
+                thr_nx = Uint32(row_bin[3 * (row + G)])
             # next row: counts -> shared, then its bulk copy into the other buffer
             if tid < TILE:
                 self.stage_counts(nxt, nb, cnt_a, part_a, tid, w, lane)
@@ -1795,7 +1881,6 @@ class CandSelect2:
             rb_a = buf_a + b * (CAP * 4)
             orow = Int64(row) * K
             cute.arch.mbarrier_wait(bar + b, (it // 2) % 2)
-            n = row_len[row]
             kk = cutlass.min(n, Int32(K))
             bad = Int32(0)
             if ovf != Uint32(0) or Int32(total) < kk:
@@ -1822,17 +1907,28 @@ class CandSelect2:
                         for i in cutlass.range(Int32(total) + tid, K, CS_THREADS, unroll=1):
                             out[orow + Int64(i)] = Int32(-1)
                     else:
-                        thr = Uint32(row_bin[3 * row]) & Uint32(0xFFFF)
+                        thr = thr_row
                         k0 = key16_of_word(thr)
                         shift = Uint32(0)
                         general = Uint32(0)
                         bb = Uint32(0)
                         above = Uint32(0)
                         m = Uint32(0)
+                        # a positive finite threshold: every candidate is a positive
+                        # BF16 at or above it, ordered by its raw bits
+                        fast = Uint32(0)
+                        if thr != Uint32(0) and thr < Uint32(0x7F80):
+                            fast = Uint32(1)
                         if thr == Uint32(0xFF80):
                             general = Uint32(1)
                         else:
-                            self.hist(rb_a, hist_a, cnt4, q, w, mc, k0, shift, Uint32(0), Uint32(0))
+                            if fast != Uint32(0):
+                                for s in cutlass.range(w, mc, WARPS, unroll=2):
+                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    hist4_pos(hist_a, s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                              wd[0], wd[1], wd[2], wd[3], thr)
+                            else:
+                                self.hist(rb_a, hist_a, cnt4, q, w, mc, k0, shift, Uint32(0), Uint32(0))
                             cute.arch.sync_threads()
                             bb, above, m = self.scan(hist_a, scr_a, Uint32(K), tid, w, lane)
                             if bb == Uint32(CS2_BINS - 1):
@@ -1874,27 +1970,52 @@ class CandSelect2:
                         all_ties = Uint32(0)
                         if m == need:
                             all_ties = Uint32(1)
-                        for s in cutlass.range(w, mc, WARPS, unroll=1):
-                            fl = []
-                            ps = []
-                            for valid, pos, key in self.quad(rb_a, cnt4, q, s):
-                                take = Uint32(0)
-                                if valid != Uint32(0):
-                                    if key > t:
-                                        take = Uint32(1)
-                                    elif key == t:
-                                        if all_ties != Uint32(0):
+                        if fast != Uint32(0) and general == Uint32(0):
+                            # t - k0 = bb: the k-th value's BF16 bits are thr + bb
+                            t16 = thr + bb
+                            orow_a = out_base + orow * 4
+                            for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                emit4_pos(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                          wd[0], wd[1], wd[2], wd[3], t16, pb0, all_ties,
+                                          lt_mask, lane, scr_a + 48, scr_a + 52, hist_a,
+                                          orow_a)
+                        else:
+                            for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                fl = []
+                                ps = []
+                                for valid, pos, key in self.quad(rb_a, cnt4, q, s):
+                                    take = Uint32(0)
+                                    if valid != Uint32(0):
+                                        if key > t:
                                             take = Uint32(1)
-                                        else:
-                                            jt = atom_add_shared(scr_a + 52, Uint32(1))
-                                            if jt < Uint32(CS2_BINS):
-                                                st_shared_u32(hist_a + jt * 4, Uint32(pos))
-                                fl.append(take)
-                                ps.append(pos)
-                            self.emit4(fl, ps, scr_a + 48, out, orow, lane)
+                                        elif key == t:
+                                            if all_ties != Uint32(0):
+                                                take = Uint32(1)
+                                            else:
+                                                jt = atom_add_shared(scr_a + 52, Uint32(1))
+                                                if jt < Uint32(CS2_BINS):
+                                                    st_shared_u32(hist_a + jt * 4, Uint32(pos))
+                                    fl.append(take)
+                                    ps.append(pos)
+                                self.emit4(fl, ps, scr_a + 48, out, orow, lane)
                         cute.arch.sync_threads()
                         n_tiles = (n + TILE - 1) // TILE
-                        if all_ties == Uint32(0) and (m > Uint32(CS2_BINS) or n_tiles > Int32(CS2_BINS)):
+                        if all_ties == Uint32(0) and m <= Uint32(TIE_RANK):
+                            # the need lowest key indices of the m ties: rank each
+                            # tie by the ties of smaller key index
+                            for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
+                                p = ld_shared_u32(hist_a + jt * 4)
+                                rank = Uint32(0)
+                                for x in cutlass.range(0, Int32(m), 4, unroll=2):
+                                    v4 = lds_v4(hist_a + x * 4)
+                                    for k in cutlass.range_constexpr(4):
+                                        if x + k < Int32(m) and v4[k] < p:
+                                            rank += Uint32(1)
+                                if rank < need:
+                                    o = atom_add_shared(scr_a + 48, Uint32(1))
+                                    out[orow + Int64(o)] = Int32(p)
+                        elif all_ties == Uint32(0) and (m > Uint32(CS2_BINS) or n_tiles > Int32(CS2_BINS)):
                             if tid == 0:
                                 row_bin[3 * row + 1] = Int32(1)
                         elif all_ties == Uint32(0):

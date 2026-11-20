@@ -266,6 +266,38 @@ def perf_sel(args):
     return res
 
 
+def perf_cs(args):
+    """Same-process ABBA of the candidate select of --refmod vs this tree on one
+    P3-16 layer's PUBLISH candidates; the two outputs must hold the same index set
+    per row."""
+    import importlib.util
+    import os
+    spec = importlib.util.spec_from_file_location(
+        "pidx_ref", os.path.join(os.path.dirname(__file__), args.refmod))
+    ref = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ref)
+    d = make([(5461, 78360), (5461, 78360), (5462, 78360)], seed=0)
+    sp = sel_plan(d)
+    row_bin, cand = run_sel(d, sp)
+    torch.cuda.synchronize()
+    rb0 = row_bin.clone()
+    st = torch.cuda.current_stream().cuda_stream
+    ctas = pidx.CS2_CTAS_PER_SM * torch.cuda.get_device_properties(0).multi_processor_count
+    outs, res = {}, {}
+    for name, mod in (("ref", ref), ("new", pidx), ("ref2", ref), ("new2", pidx)):
+        k4 = mod._cand_select2_kernel(2048, ctas)
+        rb = rb0.clone()
+        o = torch.full_like(d["out"], -7)
+        res[name] = timed(lambda: k4(cand, sp.row_len, rb, o.view(-1), st), args.iters)
+        outs[name[:3]] = (torch.sort(o, dim=1).values, rb[1::3].clone())
+    res["same_rows"] = int((outs["ref"][0] == outs["new"][0]).all(1).sum())
+    res["rows"] = int(d["out"].shape[0])
+    res["same_flags"] = bool(torch.equal(outs["ref"][1], outs["new"][1]))
+    res["flagged"] = int((outs["new"][1] != 0).sum())
+    print("perf_cs", json.dumps(res), flush=True)
+    return res
+
+
 def perf_ref(args):
     """Same-process A/B: the selective path of benchmarks/kimi_k3/pidx_ref_9eca.py
     (the landed kernels) vs this tree, PUBLISH and total, interleaved."""
@@ -301,6 +333,7 @@ def main():
     ap.add_argument("--json", default="")
     ap.add_argument("--sel", action="store_true")
     ap.add_argument("--ref", action="store_true")
+    ap.add_argument("--cs", action="store_true")
     ap.add_argument("--ncu", action="store_true")
     ap.add_argument("--samples", type=int, default=0)
     ap.add_argument("--margin", type=float, default=0.0)
@@ -323,6 +356,9 @@ def main():
     if a.sel:
         out["check_sel"] = [check_sel([(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000), (3, 140000)], zero=list(range(337, 346))), check_sel([(700, 78360)], seed=3)]
         out["perf_sel"] = perf_sel(a)
+    if a.cs:
+        out["check_sel"] = [check_sel([(37, 1000), (300, 5000), (9, 2100), (513, 9000), (40, 40000), (3, 140000)], zero=list(range(337, 346))), check_sel([(700, 78360)], seed=3)]
+        out["perf_cs"] = perf_cs(a)
     if a.ref:
         out["perf_ref"] = perf_ref(a)
     if a.perf:
