@@ -2501,6 +2501,14 @@ class KimiLinearForCausalLM(
                 "cuBLASLt MXFP8 dispatch.",
                 switched,
             )
+        from .specialized_prefill import gemm_tactics
+
+        if pinned := gemm_tactics.enable(self):
+            logger.info_once(
+                "Kimi K3: %d BF16 linears use pinned cuBLASLt tactics at >= %d rows.",
+                pinned,
+                gemm_tactics.MIN_ROWS,
+            )
         if any(
             takes_mxfp8_activation(m)
             for m in self.modules()
