@@ -217,14 +217,14 @@ __global__ void __launch_bounds__(NSLOT * NWARP_SLOT * 32, 1) skel_k(const __gri
         unsigned long long cm = *(unsigned long long*)&tm, cd = *(unsigned long long*)&td;
         float y0[4] = {f0 * -1.f, f0 * -0.5f, f0 * -0.25f, f0 * -0.125f};
         if (a.mix) {   // one loop: 8 FFMA2 per iteration, 4 ex2 spread evenly over the iterations
-          const int fi = (a.fma / NCT + 15) / 16, ui = (a.mufu / NCT + 3) / 4;
-          const int ni = fi > ui ? fi : ui;
-          for (int r = 0; r < ni; ++r) {
-            if (r * fi / ni != (r + 1) * fi / ni) {
+          const int fi = (a.fma / NCT + 15) / 16, ui = (a.mufu / NCT + 3) / 4;   // Bresenham spread, no divides (fi >= ui)
+          int e = 0;
+          for (int r = 0; r < fi; ++r) {
 #pragma unroll
-              for (int j = 0; j < 8; ++j) asm volatile("fma.rn.f32x2 %0, %0, %1, %2;" : "+l"(x[j]) : "l"(cm), "l"(cd));
-            }
-            if (r * ui / ni != (r + 1) * ui / ni) {
+            for (int j = 0; j < 8; ++j) asm volatile("fma.rn.f32x2 %0, %0, %1, %2;" : "+l"(x[j]) : "l"(cm), "l"(cd));
+            e += ui;
+            if (e >= fi) {
+              e -= fi;
 #pragma unroll
               for (int j = 0; j < 4; ++j) asm volatile("ex2.approx.ftz.f32 %0, %0;" : "+f"(y0[j]));
             }
@@ -482,6 +482,15 @@ int main(int argc, char** argv) {
           {"c SIMT mix", 2, S, 1, F, U, 0, 0, 0, 1, 0, 0, 1}, {"c L SIMT mix", 2, S, 1, F, U, 0, 0, 0, 1, Ls, 0, 1},
           {"c L2600 SIMT mix", 2, S, 1, F, U, 0, 0, 0, 1, 2600, 0, 1}, {"c onorm", 2, S, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0},
           {"c L SIMT mix onorm", 2, S, 1, F, U, 1, 0, 0, 1, Ls, 0, 1}};
+  }
+  if (argc > 4 && std::string(argv[4]) == "m7") {   // SIMT budget: largest interleaved FMA/MUFU load per item that hides under the stream
+    const int S = NSLOT == 1 ? 3 : 6, F = 70000 * C / 32, U = 16000 * C / 32;
+    vs = {{"m7 data", 2, S, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0}};
+    static const char* nm[] = {"m7 mix x0.125", "m7 mix x0.25", "m7 mix x0.5", "m7 mix x0.75", "m7 mix x1"};
+    const float sc[] = {0.125f, 0.25f, 0.5f, 0.75f, 1.f};
+    for (int i = 0; i < 5; ++i) vs.push_back({nm[i], 2, S, 1, (int)(F * sc[i]), (int)(U * sc[i]), 0, 0, 0, 1, 0, 0, 1});
+    vs.push_back({"m7 onorm", 2, S, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0});
+    vs.push_back({"m7 onorm + mix x0.25", 2, S, 1, F / 4, U / 4, 1, 0, 0, 1, 0, 0, 1});
   }
   unsigned* hdiag; CR(cudaHostAlloc(&hdiag, 64, cudaHostAllocMapped)); for (int i = 0; i < 16; ++i) hdiag[i] = 0;
   { unsigned* dd; CR(cudaHostGetDevicePointer(&dd, hdiag, 0)); CR(cudaMemcpyToSymbol(g_diag, &dd, sizeof(dd))); }
