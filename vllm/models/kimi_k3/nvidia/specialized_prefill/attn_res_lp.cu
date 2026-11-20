@@ -181,7 +181,10 @@ struct Args {
   int sf_padded_cols;
   long long* stamps;  // probe builds only
   const int8_t* sm_die;  // SM -> die (die-local block buffer) or nullptr
-  int* claim;            // [3] claim counters (own die, other die, done)
+  int* claim;            // [4] claim counters (die 0, die 1, done, die tail)
+  // Static die balance: die xdie also takes the last xfer tokens of the
+  // other die's range (per-die token counts follow per-die SM counts).
+  int xfer, xdie;
 };
 
 // A CTA runs G token groups of NT threads (NW warps); a group processes one
@@ -325,18 +328,36 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   };
   const int cnt_own = die_count(die);
   const int cnt_oth = die_count(die ^ 1);
+  // Static die balance: the receiving die (more SMs) claims the donor's
+  // last xfer tokens (counter claim[3]) after its own; the donor stops its
+  // own range xfer tokens early. Leftovers are still stolen either way.
+  const bool split = a.sm_die != nullptr && a.xfer > 0;
+  const bool recv = split && die == a.xdie;
+  const bool donor = split && die != a.xdie;
+  const int own_lim = donor ? cnt_own - a.xfer : cnt_own;
   bool own_done = false;
   // Finish a claim whose own-die atomicAdd returned j.
   auto finish_claim = [&](int j) -> int {
     if (!own_done) {
-      if (j < cnt_own) return die_token(die, j);
+      if (j < own_lim) return die_token(die, j);
       own_done = true;
     }
+    if (recv) {
+      const int kt = atomicAdd(&a.claim[3], 1);
+      if (kt < a.xfer) return die_token(die ^ 1, cnt_oth - a.xfer + kt);
+      const int ko = atomicAdd(&a.claim[die ^ 1], 1);
+      return ko < cnt_oth - a.xfer ? die_token(die ^ 1, ko) : -1;
+    }
     const int k = atomicAdd(&a.claim[die ^ 1], 1);
-    return k < cnt_oth ? die_token(die ^ 1, k) : -1;
+    if (k < cnt_oth) return die_token(die ^ 1, k);
+    if (donor) {
+      const int kt = atomicAdd(&a.claim[3], 1);
+      return kt < a.xfer ? die_token(die, cnt_own - a.xfer + kt) : -1;
+    }
+    return -1;
   };
   auto start_claim = [&]() -> int {
-    return own_done ? cnt_own : atomicAdd(&a.claim[die], 1);
+    return own_done ? own_lim : atomicAdd(&a.claim[die], 1);
   };
 
   if (lane == 0) {
@@ -374,8 +395,8 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     const int j = atomicAdd(&a.claim[die], qa);  // first qa positions at once
 #pragma unroll 1
     for (int i = 0; i < qa; ++i) {
-      sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
-                                    : finish_claim(own_done ? 0 : cnt_own);
+      sm.tq[g][i] = j + i < own_lim ? die_token(die, j + i)
+                                    : finish_claim(own_done ? 0 : own_lim);
     }
   }
   __syncthreads();
@@ -676,6 +697,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       atomicExch(&a.claim[0], 0);
       atomicExch(&a.claim[1], 0);
       atomicExch(&a.claim[2], 0);
+      atomicExch(&a.claim[3], 0);
     }
   }
 #endif
@@ -744,7 +766,8 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
                  double eps, double oeps, c10::optional<torch::Tensor> out,
                  c10::optional<torch::Tensor> q, c10::optional<torch::Tensor> sf,
                  int64_t depth, c10::optional<torch::Tensor> sm_die,
-                 torch::Tensor claim, c10::optional<torch::Tensor> stamps) {
+                 torch::Tensor claim, c10::optional<torch::Tensor> stamps,
+                 int64_t xfer, int64_t xdie) {
   using namespace k31lp;
   TORCH_CHECK(prefix.dim() == 2 && prefix.size(1) == H && prefix.stride(0) == H);
   TORCH_CHECK(blocks.dim() == 3 && blocks.size(2) == H && blocks.stride(2) == 1);
@@ -789,7 +812,10 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   a.q = reinterpret_cast<uint8_t*>(const_cast<void*>(opt_ptr(q)));
   a.sf = reinterpret_cast<uint8_t*>(const_cast<void*>(opt_ptr(sf)));
   a.sf_padded_cols = H / 32;
-  TORCH_CHECK(claim.scalar_type() == torch::kInt32 && claim.numel() >= 3);
+  TORCH_CHECK(claim.scalar_type() == torch::kInt32 && claim.numel() >= 4);
+  TORCH_CHECK(xfer >= 0 && xfer < prefix.size(0) && (xdie == 0 || xdie == 1));
+  a.xfer = (int)xfer;
+  a.xdie = (int)xdie;
   TORCH_CHECK(!sm_die.has_value() || (sm_die->scalar_type() == torch::kInt8 && sm_die->numel() >= 1024));
   TORCH_CHECK(depth + 1 < QN, "attn_res_lp: ring depth exceeds the claim queue");
   a.sm_die = sm_die.has_value() ? sm_die->data_ptr<int8_t>() : nullptr;

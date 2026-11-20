@@ -340,6 +340,7 @@ def attn_res(
         else RING_DEPTH,
         *_schedule_args(blocks),
         _stamps,
+        *attn_res_dielocal.die_split(blocks, rows),
     )
     if call == plan.num_calls - 1:
         # The final AttnRes is the forward's last reader of the plan state.

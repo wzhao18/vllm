@@ -142,6 +142,41 @@ def prefix_out(prefix: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor | Non
     return buf.prefix[: prefix.shape[0]]
 
 
+@functools.cache
+def _die_sms(device: int) -> tuple[int, int]:
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+    table = [max(d, 0) for d in dies.sm_domains(device)]
+    return table.count(0), table.count(1)
+
+
+def _die_tokens(rows: int, die: int) -> int:
+    """Tokens of a ``rows``-token forward homed on ``die`` (super-block k on
+    die k % 2, as the kernel's die_count)."""
+    nsb = -(-rows // SUPER_TOKENS)
+    full = (nsb - die + 1) >> 1
+    c = full * SUPER_TOKENS
+    if (nsb - 1) % 2 == die:
+        c -= nsb * SUPER_TOKENS - rows
+    return c
+
+
+def die_split(blocks: torch.Tensor, rows: int) -> tuple[int, int]:
+    """(xfer, xdie) for attn_res_lp: die ``xdie`` (the one with more SMs) also
+    takes the last ``xfer`` tokens of the other die's range, so each die's
+    token count follows its SM count (the call's latency-bound token chains
+    end together). (0, 0) off the die-local buffer or on balanced parts."""
+    if kernel_args(blocks)[0] is None:
+        return 0, 0
+    n0, n1 = _die_sms(blocks.device.index)
+    if n0 == n1 or n0 + n1 == 0:
+        return 0, 0
+    rx = 0 if n0 > n1 else 1
+    want = round(rows * max(n0, n1) / (n0 + n1))
+    xfer = max(0, min(want - _die_tokens(rows, rx), _die_tokens(rows, rx ^ 1) - 1))
+    return xfer, rx
+
+
 def is_prefix(prefix: torch.Tensor, blocks: torch.Tensor) -> bool:
     """Whether ``prefix`` is the die-local prefix buffer of ``blocks``' forward
     (the AttnRes prefix the dataflow-C producers update in place)."""
