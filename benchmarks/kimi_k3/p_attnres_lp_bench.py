@@ -50,6 +50,7 @@ def main():
     p.add_argument("--depths", default="4")
     p.add_argument("--percall", type=int, default=1)
     p.add_argument("--dielocal", type=int, default=0)
+    p.add_argument("--groups", default="3")
     args = p.parse_args()
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -207,7 +208,7 @@ def main():
         return {k: round(v / 1e3, 3) for k, v in sorted(tot.items())}
 
     if args.percall:
-        st = State()
+        st = State(bool(args.dielocal))
         for c in calls:
             run_lp(st, c)
         torch.cuda.synchronize()
@@ -217,7 +218,7 @@ def main():
                 for c2 in calls[:1]:
                     pass
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            st = State()
+            st = State(bool(args.dielocal))
             for c in calls:
                 run_lp(st, c)
             torch.cuda.synchronize()
@@ -225,20 +226,23 @@ def main():
                and "attn_res_lp" in e.name]
         evs.sort(key=lambda e: e.time_range.start)
         for c, e in zip(calls, evs):
-            rows = c["nb"] + 1 + int(c["delta"])
+            rows = c["nb"] + 1 + int(c["delta"]) + 1 + (c["widx"] >= 0) \
+                + (1 if c["impl"] != "mx_q" else 0) + (0.5 if c["impl"] != "native" else 0)
             k = f"{c['kind']}.{c['impl']}.nb{c['nb']}.d{int(c['delta'])}"
             g = groups.setdefault(k, [0, 0.0, rows])
             g[0] += 1
             g[1] += e.time_range.elapsed_us()
         for k, (n, us, rows) in sorted(groups.items()):
             print(json.dumps({"call": k, "n": n, "us": round(us / n, 1),
-                              "rd_TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
+                              "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
 
     res = []
-    for d in [int(x) for x in args.depths.split(",")]:
+    for d, gr in [(int(x), int(y)) for y in args.groups.split(",")
+                  for x in args.depths.split(",")]:
         attn_res_lp.RING_DEPTH = d
+        attn_res_lp.GROUPS = gr
         arms = [("old", lambda st, c: run_ref(st, c))] if args.old else []
-        arms.append((f"lp_d{d}", run_lp))
+        arms.append((f"lp_g{gr}d{d}", run_lp))
         order = arms + arms[::-1]
         for name, fn in order:
             r = timed(fn, bool(args.dielocal) and name != "old")

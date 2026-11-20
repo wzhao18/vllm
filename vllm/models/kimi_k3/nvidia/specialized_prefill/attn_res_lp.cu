@@ -184,7 +184,7 @@ constexpr int NW = NT / 32;
 constexpr int SEG = H / NW;
 constexpr uint32_t SEG_BYTES = SEG * 2;
 #ifndef K31LP_G
-#define K31LP_G 3
+#define K31LP_G 4
 #endif
 // Token claim queue: positions claimed QA ahead of the consumer (>= the
 // producer's run-ahead of D rows), QN entries.
@@ -218,7 +218,7 @@ struct Smem {
   float w[H];
   bf16_t onw[H];
   uint64_t full[G][NW][D];
-  float red[G][2][NW][2];
+  float red[G][2][NW][3];  // [.][parity][warp]: sum u^2, u.w, sum out^2
   int tq[G][QN];
 };
 
@@ -368,12 +368,12 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   load_logits(0);
 
   int par = 0;
-  int pending = 0;  // thread 0: own-die atomicAdd result of position it + QA
+  // Thread 0: the own-die atomicAdd (in flight) for the next claimed position.
+  int pending = tid == 0 ? start_claim() : 0;
   for (int it = 0;; ++it) {
     const int tt = sm.tq[g][it & (QN - 1)];
     if (tt < 0) break;
     const int64_t t = tt;
-    if (tid == 0) pending = start_claim();
 
     K31LP_STAMP(0);
     // Block logits of this token (prefetched), then prefetch the next.
@@ -448,13 +448,46 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       sm.red[g][par][warp][1] = dw;
     }
 
+    // Prefix statistics -> all softmax weights before the block stream: the
+    // block weights carry the normalization and acc starts at the prefix
+    // term (no combine pass after the stream).
     K31LP_STAMP(3);
-    // Block stream: acc = sum_i e_i v_i.
+    if (tid == 0) {
+      sm.tq[g][(it + QA) & (QN - 1)] = finish_claim(pending);
+      pending = start_claim();  // in flight for a whole token
+    }
+    group_sync(g);
+    K31LP_STAMP(4);
+    float tss = 0.f, tdw = 0.f;
+#pragma unroll
+    for (int wi = 0; wi < NW; ++wi) {
+      tss += sm.red[g][par][wi][0];
+      tdw += sm.red[g][par][wi][1];
+    }
+    const float r_p = rsqrtf(tss / H + a.eps);
+    if (a.widx >= 0 && tid == 0) a.rstd[(int64_t)a.widx * a.rstd_stride + t] = r_p;
+    float c_u = 1.f;
+    if (n > 0) {
+      const float s_p = tdw * r_p;
+      const float M = fmaxf(m_b, s_p);
+      const float sc = exp2f((m_b - M) * LOG2_E);
+      const float ep = exp2f((s_p - M) * LOG2_E);
+      const float inv = 1.f / (z_b * sc + ep);
+      const float c_acc = sc * inv;
+#pragma unroll
+      for (int i = 0; i < MAXB; ++i) e[i] *= c_acc;
+      c_u = ep * inv;
+    }
     float acc[NCH][VEC];
 #pragma unroll
-    for (int k = 0; k < NCH; ++k)
+    for (int k = 0; k < NCH; ++k) {
+      float f[VEC];
+      unpackv(u[k], f);
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) acc[k][j] = 0.f;
+      for (int j = 0; j < VEC; ++j) acc[k][j] = f[j] * c_u;
+    }
+
+    // Block stream: acc += e_i v_i.
 #pragma unroll 1
     for (int i = 0; i < n; ++i) {
       const vec_t* s = wait_row();
@@ -470,58 +503,25 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       }
       release_row();
     }
+    K31LP_STAMP(5);
     if constexpr ((K31LP_PROBE & 2) != 0) {
       if (acc[0][0] == 123.f) a.out[t] = __float2bfloat16(ss + dw);
-      if (tid == 0) sm.tq[g][(it + QA) & (QN - 1)] = finish_claim(pending);
-      group_sync(g);
       continue;
-    }
-
-    K31LP_STAMP(4);
-    if (tid == 0) sm.tq[g][(it + QA) & (QN - 1)] = finish_claim(pending);
-    group_sync(g);
-    K31LP_STAMP(5);
-    float tss = 0.f, tdw = 0.f;
-#pragma unroll
-    for (int wi = 0; wi < NW; ++wi) {
-      tss += sm.red[g][par][wi][0];
-      tdw += sm.red[g][par][wi][1];
-    }
-    const float r_p = rsqrtf(tss / H + a.eps);
-    if (a.widx >= 0 && tid == 0) a.rstd[(int64_t)a.widx * a.rstd_stride + t] = r_p;
-    float c_acc, c_u;
-    if (n == 0) {
-      c_acc = 0.f;
-      c_u = 1.f;
-    } else {
-      const float s_p = tdw * r_p;
-      const float M = fmaxf(m_b, s_p);
-      const float sc = exp2f((m_b - M) * LOG2_E);
-      const float ep = exp2f((s_p - M) * LOG2_E);
-      const float inv = 1.f / (z_b * sc + ep);
-      c_acc = sc * inv;
-      c_u = ep * inv;
     }
     float os = 0.f;
 #pragma unroll
-    for (int k = 0; k < NCH; ++k) {
-      float f[VEC];
-      unpackv(u[k], f);
+    for (int k = 0; k < NCH; ++k)
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) {
-        acc[k][j] = fmaf(acc[k][j], c_acc, f[j] * c_u);
-        os = fmaf(acc[k][j], acc[k][j], os);
-      }
-    }
+      for (int j = 0; j < VEC; ++j) os = fmaf(acc[k][j], acc[k][j], os);
     float orstd = 1.f;
     if constexpr (NORM) {
 #pragma unroll
       for (int o = 16; o > 0; o >>= 1) os += __shfl_xor_sync(0xffffffff, os, o);
-      if (lane == 0) sm.red[g][par][warp][0] = os;
+      if (lane == 0) sm.red[g][par][warp][2] = os;
       group_sync(g);
       float tos = 0.f;
 #pragma unroll
-      for (int wi = 0; wi < NW; ++wi) tos += sm.red[g][par][wi][0];
+      for (int wi = 0; wi < NW; ++wi) tos += sm.red[g][par][wi][2];
       orstd = rsqrtf(tos / H + a.oeps);
     }
 #pragma unroll

@@ -40,16 +40,17 @@ logger = init_logger(__name__)
 HIDDEN = 7168
 MAX_BLOCKS = 8
 MXFP8_BLOCK = 32
-# Per-warp row ring depth (measured 93-layer F16K die-local: d2 27.76, d3 27.49, d4 28.02 ms).
-RING_DEPTH = 3
-# Token groups per CTA of the kernel build.
-GROUPS = 3
+# Per-warp row ring depth and token groups per CTA, measured on the 93-layer
+# F16K die-local call sequence (VR200): G3 d2/d3/d4 27.71/27.21/28.0 ms,
+# G4 d2/d3 25.85/25.97 ms, G5 d2 28.2 and G6 d2 33.3 ms (register spills).
+RING_DEPTH = 2
+GROUPS = 4
 _SRC = os.path.join(os.path.dirname(__file__), "attn_res_lp.cu")
 _lock = threading.Lock()
 _mod: dict[tuple, object] = {}
 
 
-def _module(probe: int = 0, vec: int = 8, groups: int = 3):
+def _module(probe: int = 0, vec: int = 8, groups: int = 4):
     """``probe`` != 0: a probe build of the kernel (bench only)."""
     key = (probe, vec, groups)
     if key in _mod:
