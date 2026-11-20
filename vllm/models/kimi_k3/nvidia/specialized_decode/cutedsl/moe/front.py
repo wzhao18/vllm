@@ -805,6 +805,12 @@ class SharedFront:
                 code = gate, compile_down(tp, b, dev, self.split[b])
             elif b in fused:
                 code = compile_shared(tp, b, dev)
+            # The shared expert runs on the side stream beside the routed experts:
+            # full carveout, so a CTA landing first on an idle SM does not lock that
+            # SM's shared-memory config against a co-running full-smem CTA.
+            for k in (code if isinstance(code, tuple) else (code,)):
+                if k is not None:
+                    prepare_shared_carveout(k, self.device.index, 100)
             self.plans[b] = views, front, route, situ, args + self.scalars, extra, code
 
     def route(self, x):
