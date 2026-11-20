@@ -67,6 +67,11 @@ SHARED = ("shared_gu", "shared_down")
 # router || latent down pair, but in-step the concat also moves r24 onto route_stage):
 # r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
 ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
+# PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
+# slice, split-K front vs prewait (fastab xy1/xy2, Rhea): n32 split-K faster
+# (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step).
+PREWAIT_ROWS = (64,)
 # Rows whose latent up (stock's beta-add ``shared_out.addmm_(final, W^T)``) runs the
 # token-wide 2-CTA GEMM (``gemm.wide``, ``partials``) with K split over the given
 # number of CTA pairs and leaves FP32 split partials: the next layer's SP all-gather
@@ -200,7 +205,9 @@ class SpMlp:
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
             # Pre-wait weight-streaming GEMM at the token counts it serves (its own
             # tile-image copy: the stock linears stay views of the row-major concat).
-            if any(prewait_gemm.supported(r, k) for r in concat_rows):
+            if any(
+                r in PREWAIT_ROWS and prewait_gemm.supported(r, k) for r in concat_rows
+            ):
                 self.prewait_router_latent = prewait_gemm.pack_weight(packed)
         try:
             weights = {
@@ -337,7 +344,11 @@ class SpMlp:
             packed, gemm, _ = self.router_latent
             y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
             pw = self.prewait_router_latent
-            if pw is not None and prewait_gemm.supported(n, packed.shape[1]):
+            if (
+                pw is not None
+                and n in PREWAIT_ROWS
+                and prewait_gemm.supported(n, packed.shape[1])
+            ):
                 prewait_gemm.gemm(y, h, pw, packed.shape[0])
             else:
                 gemm.run(packed, h, y)

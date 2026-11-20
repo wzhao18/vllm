@@ -99,33 +99,6 @@ def test_route_stage_bitwise(nvfp4, n, padded, ties):
         assert bad.numel() == 0, f"{name}: {bad.shape[0]} mismatches, first {bad[:4].tolist()}"
 
 
-@pytest.mark.parametrize("nvfp4", [True, False])
-@pytest.mark.parametrize("n,splits", [(32, 3), (96, 5)])
-def test_route_stage_split_partials(nvfp4, n, splits):
-    """Split-K partials [splits, n, E + latent] summed in split order give exactly
-    what the summed rows give (the fused split-K GEMM front at n96)."""
-    dev = torch.device("cuda")
-    torch.manual_seed(n + splits + 2 * nvfp4)
-    parts = torch.randn((splits, n, E + LATENT), device=dev)
-    y = parts[0].clone()
-    for s in range(1, splits):
-        y += parts[s]
-    bias = (torch.randn(E, device=dev) * 0.1).float()
-    outs = []
-    for src in (y, parts):
-        got = _buffers(nvfp4, dev)
-        route_stage._module().route_stage(
-            src, E, bias, got[0], got[1], got[2], got[3], got[4], None, E, True,
-            SCALE, nvfp4, 1.0, None, None, None, None, None,
-        )  # fmt: skip
-        outs.append(got)
-    torch.accelerator.synchronize()
-    for name, a, b in zip(("x", "x_sf", "topk_idx", "topk_weights", "err"), *outs):
-        if a.dtype == torch.float32:
-            a, b = a.view(torch.int32), b.view(torch.int32)
-        assert torch.equal(a, b), name
-
-
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("record", [False, True])
 def test_route_stage_eplb(padded, record):
@@ -191,6 +164,33 @@ def test_route_stage_eplb(padded, record):
     assert torch.equal(load, load_ref)
     live = n - 7 - (int(pad[: n - 7].sum()) if padded else 0)
     assert int(load.sum()) == record * live * TOPK
+
+
+@pytest.mark.parametrize("nvfp4", [True, False])
+@pytest.mark.parametrize("n,splits", [(32, 3), (96, 5)])
+def test_route_stage_split_partials(nvfp4, n, splits):
+    """Split-K partials [splits, n, E + latent] summed in split order give exactly
+    what the summed rows give (the fused split-K GEMM front at n96)."""
+    dev = torch.device("cuda")
+    torch.manual_seed(n + splits + 2 * nvfp4)
+    parts = torch.randn((splits, n, E + LATENT), device=dev)
+    y = parts[0].clone()
+    for s in range(1, splits):
+        y += parts[s]
+    bias = (torch.randn(E, device=dev) * 0.1).float()
+    outs = []
+    for src in (y, parts):
+        got = _buffers(nvfp4, dev)
+        route_stage._module().route_stage(
+            src, E, bias, got[0], got[1], got[2], got[3], got[4], None, E, True,
+            SCALE, nvfp4, 1.0, None, None, None, None, None,
+        )  # fmt: skip
+        outs.append(got)
+    torch.accelerator.synchronize()
+    for name, a, b in zip(("x", "x_sf", "topk_idx", "topk_weights", "err"), *outs):
+        if a.dtype == torch.float32:
+            a, b = a.view(torch.int32), b.view(torch.int32)
+        assert torch.equal(a, b), name
 
 
 def test_route_stage_rejects_bad_shapes():
