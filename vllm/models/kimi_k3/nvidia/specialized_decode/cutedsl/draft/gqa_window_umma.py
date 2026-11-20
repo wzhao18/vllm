@@ -597,6 +597,7 @@ class GqaWindowUmma:
             q_desc = desc_sw128(q_base, 16)
             a_full = Int64(0)
             a_pready = Int64(0)
+            a_pv = Int64(0)
             loop0 = self.tick()
             if count > 0:
                 a_full = a_full + self.issue_s(
@@ -623,8 +624,10 @@ class GqaWindowUmma:
                 if t >= 1:
                     nxt = t - 1 + R
                     if nxt < count:  # stage t - 1's PV (issued last iteration) done
+                        c1 = self.tick()
                         wait(pvdone + 8 * ((t - 1) % NS), ((t - 1) // NS) & 1,
                              scope="cta")  # fmt: skip
+                        a_pv = a_pv + self.tick() - c1
                         # slot r_i's loads always come from lane r_i: one TMA
                         # issuing thread completes one op at a time (~0.45 us per
                         # 16 KiB box, hwdb hw51), so a single refill lane caps the
@@ -639,6 +642,7 @@ class GqaWindowUmma:
             self.rec(request, head, 3, global_timer(), first_lane)
             self.rec(request, head, 4, a_full, first_lane)
             self.rec(request, head, 6, a_pready, first_lane)
+            self.rec(request, head, 5, a_pv, first_lane)
             self.rec(request, head, 15, self.tick() - loop0, first_lane)
             if cutlass.const_expr(S > 1):
                 cute.arch.cluster_wait()

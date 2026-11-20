@@ -93,7 +93,7 @@ def _report(b):
         + " ".join(f"{k} {v:.2f}" for k, v in ph.items())
         + f" | loop max {loopmax:.2f} stages {stages:.0f} | end q10/50/90 "
         + "/".join(f"{x:.1f}" for x in endq.tolist())
-        + f" | wait full {full:.2f} pready {pready:.2f} of loop cycles",
+        + f" | wait full {full:.2f} pready {pready:.2f} pv {med(s[:, 5] / cyc):.2f} sm-sready {med(s[:, 8] / cyc):.2f} of loop cycles",
         flush=True,
     )
 
