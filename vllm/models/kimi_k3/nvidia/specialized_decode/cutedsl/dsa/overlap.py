@@ -91,8 +91,13 @@ QUERY_OVERLAP_UNFUSED = "1:front,2-9:serial,10:front,11-320:fork"
 # decode; per rows, measured (hti/p2/d512-combined, 4-node C512 decode step A/B,
 # CUDA-graph step vs none, ms): 128 rows -0.22, 208 rows -0.21; at 256 rows the
 # QueryWait end is the join (1-node SP DSA block, chain: -19..+0.3 us/layer; step,
-# wq_b through the logits only on the stream: +0.20 ms), so 209- runs without it.
-INDEX_PRIORITY = {"sp": "17-208:chain"}
+# wq_b through the logits only on the stream: +0.20 ms), so 209- ran without it.
+# From 65 rows the SP decode builds the query locally (sp.SP_LOCAL_QUERY: no
+# QueryWait join), and the side stream's q_b + dsa.query_uk (192 CTAs, one per SM)
+# then took the SMs of the chain's persistent logits (D3-32 d8 r24 trace: logits
+# 36.4 us/layer beside it vs ~28 alone), so the chain is prioritized at every row
+# count (D-ELEM-OTHER in-step A/B).
+INDEX_PRIORITY = {"sp": "17-:chain"}
 MODES = ("serial", "fork", "wait", "front", "late", "late_front")
 LATE = ("late", "late_front")  # TP with the fused indexer only (else: fork, front)
 NORM = ("fork", "late")  # QueryNorm writes the q_c rows
