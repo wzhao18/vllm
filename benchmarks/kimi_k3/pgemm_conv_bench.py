@@ -163,6 +163,8 @@ def mode_skel(args):
         print(json.dumps({"m": m, "sol_us": sol, "cublaslt": t_cub, "x_sol": round(t_cub / sol, 3)}), flush=True)
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
         tacs = [tuple(tuple(t) if isinstance(t, list) else t for t in args.tactic)] if args.tactic else SKEL_TACTICS
+        if args.tactics:
+            tacs = [tuple(tuple(t) if isinstance(t, list) else t for t in tac) for tac in args.tactics]
         for tac in tacs:
             if args.swap_only and len(tac) < 7:
                 continue
@@ -238,6 +240,42 @@ def mode_clk(args):
             "sm_mhz_med": clk[len(clk) // 2], "sm_mhz_min": clk[0], "sm_mhz_max": clk[-1],
             "power_w_med": pw[len(pw) // 2], "throttle": sorted({r[3].strip() for r in rows}), "samples": len(rows),
         }), flush=True)  # fmt: skip
+
+
+def mode_mix(args):
+    """Preferred/fallback cluster launch (all SMs) vs the single-cluster base."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+        MixedGemm,
+        PlainGemm,
+    )
+
+    n, k = args.n, args.k
+    for m in [int(v) for v in args.ms.split(",")]:
+        xq, xs, wq, ws = operands(m, n, k)
+        ref = cublas(xq, xs, wq, ws)
+        sol = args.sol_us * m / 16384
+        t_cub = kernel_times(lambda: cublas(xq, xs, wq, ws))[0]
+        print(json.dumps({"m": m, "sol_us": sol, "cublaslt": t_cub}), flush=True)
+        out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        cands = [("c2x4_m4", lambda: PlainGemm(wq, ws, ((512, 256), (2, 4), 256, 4, "m", 0, 0, "")))]
+        for pref, fb, ra, sw in [((2, 4), (2, 1), "m", 4), ((2, 4), (2, 1), "n", 8), ((2, 4), (2, 1), "m", 1),
+                                 ((4, 2), (2, 1), "m", 4), ((2, 2), (2, 1), "m", 4)]:  # fmt: skip
+            cands.append((f"mix_p{pref[0]}x{pref[1]}_f{fb[0]}x{fb[1]}_{ra}{sw}",
+                          lambda pref=pref, fb=fb, ra=ra, sw=sw: MixedGemm(wq, ws, (512, 256), pref, fb, ra, sw)))  # fmt: skip
+        for name, mk in cands:
+            try:
+                g = mk()
+                out.zero_()
+                g(xq, xs, out)
+                torch.cuda.synchronize()
+                eq = bool(torch.equal(out, ref))
+                t = kernel_times(lambda: g(xq, xs, out))[0]
+                row = {"m": m, "tactic": name, "us": t, "x_sol": round(t / sol, 3), "x_cublas": round(t / t_cub, 3), "bitwise": eq}
+            except Exception as e:  # noqa: BLE001
+                row = {"m": m, "tactic": name, "error": repr(e)[:300]}
+            print(json.dumps(row), flush=True)
+        del xq, xs, wq, ws, ref, out
+        torch.cuda.empty_cache()
 
 
 def mode_b3(args):
@@ -378,13 +416,14 @@ def main():
     ap.add_argument("--k", type=int, default=7168)
     ap.add_argument("--seqlens", default="")
     ap.add_argument("--tactic", type=json.loads, default=None)
+    ap.add_argument("--tactics", type=json.loads, default=None)
     ap.add_argument("--nodrain", action="store_true")
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--ms", default="16384,8192")
     ap.add_argument("--swap-only", dest="swap_only", action="store_true")
     ap.add_argument("--sol-us", dest="sol_us", type=float, default=748.0)
     args = ap.parse_args()
-    {"base": mode_base, "skel": mode_skel, "clk": mode_clk, "b3": mode_b3, "conv": mode_conv, "ncu": mode_ncu}[args.mode](args)
+    {"base": mode_base, "skel": mode_skel, "clk": mode_clk, "mix": mode_mix, "b3": mode_b3, "conv": mode_conv, "ncu": mode_ncu}[args.mode](args)
 
 
 if __name__ == "__main__":

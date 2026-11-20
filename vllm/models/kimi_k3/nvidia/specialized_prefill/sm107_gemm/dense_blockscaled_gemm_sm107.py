@@ -2015,7 +2015,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                             sfa_s2t_k = self._mainloop_s2t_copy_and_partition(sSFA, tCtSFA_k)
                             sfb_s2t_k = self._mainloop_s2t_copy_and_partition(sSFB, tCtSFB_k)
 
-                        if cutlass.const_expr(not self._is_interleaved_utccp()):
+                        if cutlass.const_expr(
+                            not self._is_interleaved_utccp()
+                            and not getattr(self, "skel_nomma", False)
+                        ):
                             # Unless UTCCPs are to be interleaved, all SFA/SFB for all
                             # k_blocks are copied before MMA are executed
                             self._mainloop_s2t_copies(
@@ -2024,6 +2027,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
                         # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
                         num_kblocks = cute.size(tCrA, mode=[2])
+                        if cutlass.const_expr(getattr(self, "skel_nomma", False)):
+                            # KM2' loads-only skeleton: same ring and barriers, no MMA.
+                            num_kblocks = 0
                         for k_block in cutlass.range(num_kblocks, unroll_full=True):
                             if cutlass.const_expr(
                                 self.enable_breuse

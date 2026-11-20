@@ -709,11 +709,8 @@ def epilogue_drain_store(
         acc_pipeline.consumer_release(acc_consumer_state)
     acc_consumer_state.advance()
 
-    atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), gemm_kernel.c_dtype, num_bits_per_copy=128
-    )
     for ni in cutlass.range_constexpr(epi_n):
-        cute.copy(atom, frags[ni], tTR_gC[(None, None, None, g, ni)])
+        cute.autovec_copy(frags[ni], tTR_gC[(None, None, None, g, ni)])
     return acc_consumer_state
 
 

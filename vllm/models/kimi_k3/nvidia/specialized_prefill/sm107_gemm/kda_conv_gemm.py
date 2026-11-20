@@ -43,6 +43,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.skel_noepi = "noepi" in flags
         self.epi_staged = "staged" in flags
         self.skel_hot = "hot" in flags
+        self.skel_nomma = "nomma" in flags
         self.sf_tmem_slots = 2 if "sf2" in flags else 1
         self.epi_drain = "drain" in flags
         super().__init__(
@@ -253,7 +254,7 @@ def reference_inv_norms(y: torch.Tensor, part_dim: int) -> torch.Tensor:
 class MixedGemm:
     """BF16 ``x @ W.T``, preferred / fallback cluster launch (full SM coverage)."""
 
-    def __init__(self, weight_nk, scale, tile, preferred, fallback):
+    def __init__(self, weight_nk, scale, tile, preferred, fallback, raster="m", swz=1):
         from .dense_blockscaled_gemm_sm107 import (
             Sm107BlockScaledPersistentDenseGemmMixedClustersKernel as K,
         )
@@ -262,6 +263,7 @@ class MixedGemm:
         self.n, self.k = weight_nk.shape
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self.gemm = K(SF_VEC, (256, tile[1], 64), (tile[0], tile[1], 128), preferred, fallback)
+        self.gemm.raster_order, self.gemm.swizzle_size = raster, swz
         hw = cutlass_utils.HardwareInfo()
         self.pmac = hw.get_max_active_clusters(preferred[0] * preferred[1])
         self.fmac = hw.get_max_active_clusters(fallback[0] * fallback[1])
