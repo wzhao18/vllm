@@ -470,6 +470,12 @@ class KdaCore(flow.KdaFlow):
             local = (row - 32 * warp) * BOX + 4 * lane_in
             sv = load_shared_f32x4(at(sub, (ch % 2) * BOX * BOX + local))
             new = [Float32(0) for _ in range(4)]
+            if cutlass.const_expr("scan" in self.skip):  # movement only (diagnostics)
+                new = [sv[e] for e in range(4)]
+                acc[rr, 0] = acc[rr, 0] + sv[0] + xs[0, 0] + w4[0][0] + d4[0]
+                if stored:
+                    store_shared_f32x4(at(box, local), new)
+                continue
             for p in cutlass.range_constexpr(2):
                 fc = (start, start)
                 for i in cutlass.range_constexpr(T):
