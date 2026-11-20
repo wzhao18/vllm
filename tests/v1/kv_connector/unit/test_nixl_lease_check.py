@@ -404,3 +404,172 @@ def test_p_worker_side_channel_renewal_prevents_expiry(
     done_sending, _ = worker.get_finished()
     assert rid not in done_sending
     assert worker._reqs_to_send[rid] > time.perf_counter() + 10
+
+
+# ---------------------------------------------------------------------------
+# Pull pins: D pins P's lease when it posts the READs, so a read queued behind
+# a slow transport (Rhea TCP gate: 66-85 s) cannot outlive the lease.
+# ---------------------------------------------------------------------------
+
+
+def test_pin_holds_known_lease_and_ignores_unknown_requests():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    w = object.__new__(NixlConnectorWorker)
+    w._lease_pin_s = 600.0
+    old = time.perf_counter() + 1.0
+    w._reqs_to_send = {"req-a": old}
+    w._handle_lease_pins({"req-a", "req-gone"})
+
+    assert w._reqs_to_send["req-a"] > old + 500
+    assert set(w._reqs_to_send) == {"req-a"}
+
+
+def test_side_channel_pin_reaches_worker_metadata():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        send_lease_pin,
+    )
+
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    nixl_sched = scheduler.connector.connector_scheduler
+    block_size = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        num_tokens=block_size * 3,
+        block_size=block_size,
+        do_remote_decode=True,
+    )
+    _finish_prefill(scheduler, request)
+    rid = request.request_id
+
+    port = _free_port()
+    stop, t = _start_listener(
+        port,
+        lease_renew=nixl_sched._queue_lease_renewals,
+        lease_pin=nixl_sched._queue_lease_pins,
+    )
+    try:
+        assert send_lease_pin("127.0.0.1", port, [rid, "gone"], 5.0) == [
+            True,
+            False,
+        ]
+    finally:
+        stop.set()
+        t.join(5)
+
+    meta = scheduler.schedule().kv_connector_metadata
+    assert meta.lease_pins == {rid}
+    assert meta.lease_renewals == set()
+    assert scheduler.schedule().kv_connector_metadata.lease_pins == set()
+
+
+def test_p_without_pins_reads_a_pin_as_heartbeat():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        send_lease_pin,
+    )
+
+    port = _free_port()
+    got: list[list[str]] = []
+    stop, t = _start_listener(
+        port,
+        lease_renew=lambda ids: (got.append(ids), [True] * len(ids))[1],  # type: ignore[func-returns-value]
+    )
+    try:
+        assert send_lease_pin("127.0.0.1", port, ["x"], 5.0) == [True]
+    finally:
+        stop.set()
+        t.join(5)
+    assert got == [["x"]]
+
+
+def test_p_worker_pin_outlives_lease_expiry(
+    default_vllm_config, dist_init, monkeypatch
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+        NixlConnector,
+        NixlConnectorMetadata,
+    )
+    from vllm.forward_context import ForwardContext
+
+    from .test_nixl_connector import FakeNixlConnectorWorker, FakeNixlWrapper
+    from .utils import make_kv_cache_config
+
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+
+    vllm_config = create_vllm_config(block_size=16)
+    connector = NixlConnector(
+        vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+    )
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config, connector.engine_id, hand_shake_latency=0
+    )
+    worker = connector.connector_worker
+    rid = "req-pinned"
+    worker._reqs_to_process.add(rid)
+    worker._reqs_to_send[rid] = time.perf_counter() - 0.1  # due, not yet reaped
+
+    metadata = NixlConnectorMetadata()
+    metadata.lease_pins = {rid}
+    connector.bind_connector_metadata(metadata)
+    connector.start_load_kv(
+        ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    )
+
+    done_sending, _ = worker.get_finished()
+    assert rid not in done_sending
+    assert worker._reqs_to_send[rid] > time.perf_counter() + 500
+
+
+def test_d_pins_awaited_pull_once_from_tp_rank_0():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        send_lease_pin,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    w = object.__new__(NixlConnectorWorker)
+    w._lease_check_enabled = True
+    w._lease_check_timeout_s = 30.0
+    w._lease_check_executor = MagicMock()
+    remote = SimpleNamespace(host="h", port=7, request_id="p-req", lease_check=True)
+    meta = SimpleNamespace(remote=remote, awaiting_kvs=True)
+    w.tp_rank = 0
+    w._pin_remote_lease(meta)
+    w._lease_check_executor.submit.assert_called_once_with(
+        send_lease_pin, "h", 7, ["p-req"], 30.0
+    )
+
+    w._lease_check_executor.reset_mock()
+    w.tp_rank = 1  # the other ranks of the same request
+    w._pin_remote_lease(meta)
+    w.tp_rank = 0
+    meta.awaiting_kvs = False  # notify-only: local hit or aborted cleanup
+    w._pin_remote_lease(meta)
+    meta.awaiting_kvs = True
+    remote.lease_check = False  # P without the side-channel lease protocol
+    w._pin_remote_lease(meta)
+    w._lease_check_executor.submit.assert_not_called()
+
+
+def test_failed_pinned_pull_releases_p_at_once(recv_worker):  # noqa: F811
+    """A pinned lease outlives the 30 s TTL: a pull that fails must notify P
+    (its reads are over) instead of leaving the blocks until kv_lease_pin_s."""
+    worker = recv_worker
+    _lease_worker(worker, deadline=time.perf_counter() + 60.0)
+    worker._recving_metadata["request"].awaiting_kvs = True
+    worker.nixl_wrapper.check_xfer_state.return_value = "ERR"
+
+    results = worker.get_transfer_results()
+
+    assert results.failed_recving == {"request"}
+    worker.nixl_wrapper.send_notif.assert_called_once_with(
+        "prefill", notif_msg=b"prefill-request:1"
+    )

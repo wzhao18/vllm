@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     LEASE_HEARTBEAT_MSG,
+    LEASE_PIN_FLAG,
     LEASE_QUERY_MSG,
     HeartbeatInfo,
     KVFingerprintReq,
@@ -193,6 +194,8 @@ class NixlBaseConnectorScheduler:
         self._held_send_leases_lock = threading.Lock()
         # P side: renewals received on the side channel, for the next step.
         self._pending_lease_renewals: set[ReqId] = set()
+        # P side: pull pins received on the side channel, for the next step.
+        self._pending_lease_pins: set[ReqId] = set()
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
@@ -439,6 +442,14 @@ class NixlBaseConnectorScheduler:
             self._pending_lease_renewals.update(r for r, h in zip(req_ids, held) if h)
         return held
 
+    def _queue_lease_pins(self, req_ids: list[str]) -> list[bool]:
+        """P side (listener thread): a D posted the READs of these requests;
+        the workers keep their leases until released (or kv_lease_pin_s)."""
+        with self._held_send_leases_lock:
+            held = [r in self._held_send_leases for r in req_ids]
+            self._pending_lease_pins.update(r for r, h in zip(req_ids, held) if h)
+        return held
+
     def fingerprint_state_blocks(self, block_ids: BlockIds) -> dict[int, int]:
         """Each SSM (KDA) group's running-state slot of a request, picked as
         transfers pick it, for the KV fingerprints (kv_fingerprint.py)."""
@@ -552,6 +563,7 @@ class NixlBaseConnectorScheduler:
                 kwargs={
                     "lease_query": self._query_send_leases,
                     "lease_renew": self._queue_lease_renewals,
+                    "lease_pin": self._queue_lease_pins,
                 },
                 daemon=True,
                 name="nixl_handshake_listener",
@@ -568,6 +580,7 @@ class NixlBaseConnectorScheduler:
         port: int,
         lease_query: Callable[[list[str]], list[bool]] | None = None,
         lease_renew: Callable[[list[str]], list[bool]] | None = None,
+        lease_pin: Callable[[list[str]], list[bool]] | None = None,
     ):
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
@@ -588,11 +601,13 @@ class NixlBaseConnectorScheduler:
                     continue
                 decoded = msgspec.msgpack.decode(msg)
                 if decoded and decoded[0] == LEASE_HEARTBEAT_MSG:
-                    # (LEASE_HEARTBEAT_MSG, [req_ids]) -> [renewed].
+                    # (LEASE_HEARTBEAT_MSG, [req_ids][, LEASE_PIN_FLAG]) -> [held].
                     req_ids = list(decoded[1])
+                    pin = len(decoded) > 2 and decoded[2] == LEASE_PIN_FLAG
+                    handler = lease_pin if pin and lease_pin else lease_renew
                     renewed = (
-                        lease_renew(req_ids)
-                        if lease_renew is not None
+                        handler(req_ids)
+                        if handler is not None
                         else [False] * len(req_ids)
                     )
                     sock.send_multipart(
@@ -759,6 +774,10 @@ class NixlBaseConnectorScheduler:
             with self._held_send_leases_lock:
                 meta.lease_renewals = self._pending_lease_renewals
                 self._pending_lease_renewals = set()
+        if getattr(self, "_pending_lease_pins", None):
+            with self._held_send_leases_lock:
+                meta.lease_pins = self._pending_lease_pins
+                self._pending_lease_pins = set()
 
         if self._pair_mode and self._pair_ready:
             # This step is the first that can promote these requests, so every
