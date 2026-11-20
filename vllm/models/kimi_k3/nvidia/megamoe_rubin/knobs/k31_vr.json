@@ -4602,6 +4602,70 @@
     "cuda_version": "13.4",
     "sha256": "2c3a03378f634c6ed57e8bd6211940f535687bd05453982553c9820907c99582"
    }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 4,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 224,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 8192,
+   "live_tokens": 8192,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1282.4959754943848,
+   "source": "P-ATTNRES bench-only E224 stand-in: copy of the NVFP4 inference ws16 max8192 E896 record",
+   "tuned_at": "2026-11-11T17:37:29",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i8192.json",
+    "sha256": "b445ca168d03c8361a4d19f76a6ff5a33bf8177f8a66b3d4137e5018b6cf2451",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
   }
  ]
 }
