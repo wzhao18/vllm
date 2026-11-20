@@ -92,7 +92,7 @@ from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
 )
-from ......common.ptx_helpers import barrier_sync_unaligned, read_smid
+from ......common.ptx_helpers import barrier_sync_unaligned, read_smid, tma_load_1d
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
@@ -665,6 +665,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        device_workspace.register(
+            self.ladder_warm_counter_region,
+            cutlass.Int32,
+            (2,),
+            buffer_space="local",
+            byte_alignment=16,
+            reset="tail_reset",
+        )
         if not self.reduce_topk_in_kernel:
             # Peers write their contributions straight into this plane, one row per
             # (token, top-k slot), so it has to be symmetric. The standalone
@@ -707,6 +715,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self.scheduler.register_smem_regions(smem_workspace)
         self.epilogue.register_smem_regions(smem_workspace, **self._shared_smem_kwargs())
         smem_workspace.register_mbarrier(self.tma_a_progress_region, 1)
+        smem_workspace.register_mbarrier(self.ladder_warm_mbar_region, 1)
+        smem_workspace.register_tensor(
+            self.ladder_warm_scratch_region, cutlass.Uint8, (8192,), stride=(1,), byte_alignment=128
+        )
         fixed_component_bytes = smem_workspace.estimate_total_bytes()
         alignment_shift_bytes = max(region.byte_alignment for region in smem_workspace.regions())
         mainloop_smem_budget_bytes = smem_limit - fixed_component_bytes - alignment_shift_bytes
@@ -1305,6 +1317,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     # TMA-A arrives once per work tile it takes; the scheduler claims unit j only after
     # TMA-A has taken unit j - 1, so claims follow the order units start in.
     tma_a_progress_region: ClassVar[str] = "genphase.smem.tma_a_progress"
+    # DIAGNOSTIC ONLY (ladder L1): L2 warming of each die's first routed FC1 units during the shared-FC2 park.
+    ladder_warm_mbar_region: ClassVar[str] = "ladder.l1.warm_mbar"
+    ladder_warm_scratch_region: ClassVar[str] = "ladder.l1.warm_scratch"
+    ladder_warm_counter_region: ClassVar[str] = "ladder.l1.warm_counter"
 
     @cute.jit
     def _prefetch_first_waves(self, linear_cta_idx: Int32, weight_bases: Tuple[Int64, Int64]) -> None:
@@ -1421,6 +1437,121 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     if first_row + Int32(slice_rows) <= Int32(entry_rows):
                         prefetch_span(a_base, slice_rows * row_bytes, lane_idx, self.l2_prefetch_chunk_bytes)
                         prefetch_span(sf_base, sf_block_bytes, lane_idx, self.l2_prefetch_chunk_bytes)
+
+
+    @cute.jit
+    def _ladder_warm_units(self, weight_bases, die, scratch, mbar, counter) -> None:
+        """DIAGNOSTIC ONLY (ladder L1): warm L2 with this die's first routed FC1 units (claim order: slot-major,
+        output block minor, as ``_prefetch_first_waves``) by real 1D TMA loads into a discarded 8 KiB smem scratch
+        at normal L2 priority; units come from a per-die counter, at most 25 MiB per die. One warp."""
+        hidden = self.hidden_size
+        gateup = self.intermediate_gateup_size
+        cluster_size = self.cluster_size
+        slice_rows = self.cta_tile_m
+        unit_rows = slice_rows * cluster_size
+        entry_rows = gateup // 2 if self.n_split else gateup
+        blocks_fc1 = ceil_div(entry_rows, unit_rows)
+        token_block = self.cta_tile_n
+        row_bytes = hidden * int(self.a_dtype.width) // 8
+        expert_bytes = entry_rows * row_bytes
+        sf_block_bytes = 128 * round_up(hidden // self.sf_vec_size, 4)
+        sf_expert_bytes = round_up(entry_rows, 128) // 128 * sf_block_bytes
+        chunk = 8192
+        a_chunks = unit_rows * row_bytes // chunk
+        sf_chunks = cluster_size * sf_block_bytes // chunk
+        if cutlass.const_expr(unit_rows * row_bytes % chunk != 0 or cluster_size * sf_block_bytes % chunk != 0
+                              or entry_rows % unit_rows != 0):
+            raise ValueError("ladder L1 warm needs whole 8 KiB chunks and whole units")
+        unit_chunks = a_chunks + sf_chunks
+        per_round = 21
+        rounds = ceil_div(unit_chunks, per_round)
+        budget_units = (25 << 20) // (unit_chunks * chunk)
+        scans = 2 if self.expert_half else 1
+        lane_idx = cute.arch.lane_idx()
+        spin_wait(
+            self._device_workspace.ptr(self.token_comm.sizes_ready_region), lambda value: value == Int32(1), scope="gpu"
+        )
+        sizes_by_slot = self.token_comm.scheduler_expert_sizes_tensor(self._device_workspace)
+        slot_to_expert = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+        slot_chunks = ceil_div(self.local_expert_count, 32)
+        chunk_end = cute.make_rmem_tensor((scans * slot_chunks,), Int32)
+        chunk_units = cute.make_rmem_tensor((scans * slot_chunks,), Int32)
+        chunk_expert = cute.make_rmem_tensor((slot_chunks,), Int32)
+        for scan in cutlass.range_constexpr(scans):
+            carry = Int32(0)
+            for slot_chunk in cutlass.range_constexpr(slot_chunks):
+                slot = Int32(slot_chunk * 32) + lane_idx
+                units = Int32(0)
+                if cutlass.const_expr(scan == 0):
+                    chunk_expert[slot_chunk] = Int32(-1)
+                if slot < Int32(self.local_expert_count):
+                    units = ceil_div(sizes_by_slot[slot], Int32(token_block)) * Int32(blocks_fc1)
+                    slot_expert = slot_to_expert[slot]
+                    if cutlass.const_expr(scan == 0):
+                        chunk_expert[slot_chunk] = slot_expert
+                    if cutlass.const_expr(self.expert_half):
+                        if (slot_expert * Int32(2)) // Int32(self.local_expert_count) != Int32(scan):
+                            units = Int32(0)
+                inclusive = units
+                for step_log in cutlass.range_constexpr(5):
+                    step = Int32(1 << step_log)
+                    previous = Int32(cute.arch.shuffle_sync(inclusive, lane_idx - step))
+                    if lane_idx >= step:
+                        inclusive = inclusive + previous
+                chunk_end[scan * slot_chunks + slot_chunk] = carry + inclusive
+                chunk_units[scan * slot_chunks + slot_chunk] = units
+                carry = carry + Int32(cute.arch.shuffle_sync(inclusive, Int32(31)))
+        if lane_idx == Int32(0):
+            cute.arch.mbarrier_init(mbar, 1)
+            cute.arch.mbarrier_init_fence()
+        phase = Int32(0)
+        done = Int32(0)
+        while done == Int32(0):
+            unit = Int32(0)
+            if lane_idx == Int32(0):
+                unit = cute.arch.atomic_add(counter + die, Int32(1))
+            unit = Int32(cute.arch.shuffle_sync(unit, Int32(0)))
+            expert = Int32(-1)
+            output_block = Int32(0)
+            for scan in cutlass.range_constexpr(scans):
+                for slot_chunk in cutlass.range_constexpr(slot_chunks):
+                    index = scan * slot_chunks + slot_chunk
+                    begin = chunk_end[index] - chunk_units[index]
+                    owns = (unit >= begin) & (unit < chunk_end[index])
+                    if cutlass.const_expr(scans > 1):
+                        owns = owns & (die == Int32(scan))
+                    ballot = Int32(cute.arch.vote_ballot_sync(owns))
+                    if ballot != Int32(0):
+                        owner = Int32(cute.arch.popc((ballot & (-ballot)) - Int32(1)))
+                        expert = Int32(cute.arch.shuffle_sync(chunk_expert[slot_chunk], owner))
+                        owner_begin = Int32(cute.arch.shuffle_sync(begin, owner))
+                        output_block = (unit - owner_begin) % Int32(blocks_fc1)
+            if (unit >= Int32(budget_units)) | (expert < Int32(0)):
+                done = Int32(1)
+            else:
+                entry = expert
+                if cutlass.const_expr(self.n_split):
+                    entry = die * Int32(self.local_expert_count) + expert
+                first_row = output_block * Int32(unit_rows)
+                a_base = weight_bases[0] + Int64(entry) * Int64(expert_bytes) + Int64(first_row) * Int64(row_bytes)
+                sf_base = (
+                    weight_bases[1]
+                    + Int64(entry) * Int64(sf_expert_bytes)
+                    + Int64(first_row // Int32(128)) * Int64(sf_block_bytes)
+                )
+                for warm_round in cutlass.range_constexpr(rounds):
+                    first = warm_round * per_round
+                    count = min(per_round, unit_chunks - first)
+                    if lane_idx == Int32(0):
+                        cute.arch.mbarrier_arrive_and_expect_tx(mbar, Int32(count * chunk))
+                        for c in cutlass.range_constexpr(count):
+                            index = first + c
+                            source = a_base + Int64(index * chunk)
+                            if cutlass.const_expr(index >= a_chunks):
+                                source = sf_base + Int64((index - a_chunks) * chunk)
+                            tma_load_1d(scratch, source, mbar, Int32(chunk), evict_first=False)
+                    cute.arch.mbarrier_wait(mbar, phase)
+                    phase = phase ^ Int32(1)
 
     # ------------------------------------------------------------------
     # Device entry
@@ -1879,7 +2010,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     iket.range_pop()
                 sched_consumer = scheduler.make_consumer()
                 DG.put_gt(DG.S_G0, Int32(warp_idx == Int32(self.gather_b_warp_ids[0])) * DG.lane0())
+                _ldw_die = Int32(0)
+                if cutlass.const_expr(self.die_aware != "off"):
+                    if cutlass.const_expr(self.die_sm_mask32 is not None):
+                        _ldw_die = cute.arch.make_warp_uniform(self._die_from_mask())
+                    else:
+                        _ldw_die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
+                _ldw_mbar = self._smem_workspace.ptr(self.ladder_warm_mbar_region, smem_base)
+                _ldw_scratch = self._smem_workspace.tensor(self.ladder_warm_scratch_region, smem_base).iterator
+                _ldw_counter = self._device_workspace.ptr(self.ladder_warm_counter_region)
                 self._mainloop.run_tma_gather_b1(
+                    ladder_warm=lambda: self._ladder_warm_units(
+                        weight_bases, _ldw_die, _ldw_scratch, _ldw_mbar, _ldw_counter
+                    ),
                     fc1_tma_b_atom=fc1_tma_b_atom,
                     gather_index=gather_index,
                     gather_source_rows=self.world_size * self.max_tokens_per_rank,

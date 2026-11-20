@@ -1701,6 +1701,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         gather_warp_idx: Int32,
         routed_input_ready_flag: Optional[ReadyFlag] = None,
         routed_metadata_ready_flag: Optional[ReadyFlag] = None,
+        ladder_warm=None,
     ) -> None:
         """Gather dense-order FC1 activations directly into B SMEM.
 
@@ -1733,6 +1734,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
         routed_inputs_ready = Int32(0)
         work_tile = sched_consumer.consume_work()
+        if cutlass.const_expr(ladder_warm is not None):
+            if gather_warp_idx == Int32(0):
+                if work_tile.phase == Int32(BlockPhase.SharedLinear2):
+                    ladder_warm()  # DIAG ladder L1: this CTA parks on shared FC2 first
         _dms_ug = Int32(0)
         while work_tile.is_valid_tile:
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
