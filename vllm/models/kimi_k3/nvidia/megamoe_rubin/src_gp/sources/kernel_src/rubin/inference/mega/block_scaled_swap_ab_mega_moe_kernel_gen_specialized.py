@@ -227,7 +227,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             self.cluster_shape_mn = (
                 self.default_cluster_shape_mn if supplied_cluster_shape_mn is None else supplied_cluster_shape_mn
             )
-            if self.cluster_shape_mn not in self.supported_cluster_shapes_mn:  # a list never equals a tuple
+            if self.cluster_shape_mn not in self.supported_cluster_shapes_mn and not (  # a list never equals a tuple
+                __import__("os").environ.get("DMS_CL11") == "1" and tuple(self.cluster_shape_mn) == (1, 1)
+            ):  # DIAGNOSTIC (D-MOE-LADDER): DMS_CL11=1 admits the 1CTA tile on cluster (1,1)
                 raise ValueError(
                     f"The generation-phase kernel supports cluster_shape_mn in {self.supported_cluster_shapes_mn} "
                     f"(default {self.default_cluster_shape_mn}) under the decode scheduler, got "
