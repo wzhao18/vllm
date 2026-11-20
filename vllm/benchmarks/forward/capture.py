@@ -91,14 +91,21 @@ class _NanProbe:
             bad = [r for r in recs if not r[3]]
             print(f"[probe] {tag} r{rank} pass{k}: {len(recs)} recs, "
                   f"{len(bad)} nonfinite; first: {bad[:4]}", flush=True)
-        if len(self.passes) >= 2:
-            a, b = self.passes[0], self.passes[1]
+        if rank == 0:
+            import os
+            pref = os.environ.get("DCP8FIX_DUMP", "layers.0.,layers.1.,layers.2.,layers.3.")
+            for j, x in enumerate(self.passes[0]):
+                if any(p in x[0] for p in pref.split(",")):
+                    cs = [ps[j][4] if j < len(ps) else None for ps in self.passes]
+                    print(f"[probe-dump] {tag} {x[0]} o{x[1]} {x[2]} {cs}", flush=True)
+        for k in range(1, len(self.passes)):
+            a, b = self.passes[k - 1], self.passes[k]
             diffs = [
                 (x[0], x[1], x[2], x[4], y[4])
                 for x, y in zip(a, b)
                 if x[0] == y[0] and abs(x[4] - y[4]) > 1e-6 * max(abs(x[4]), 1.0)
             ]
-            print(f"[probe] {tag} r{rank} pass0 vs pass1: {len(diffs)} differ; "
+            print(f"[probe] {tag} r{rank} pass{k-1} vs pass{k}: {len(diffs)} differ; "
                   f"first: {diffs[:6]}", flush=True)
 
 
@@ -285,6 +292,12 @@ class ForwardBench:
             probe.start()
             reference = _first_tensor(self._run_model()).clone()
             torch.accelerator.synchronize()
+            if probe.handles:
+                restore()
+                probe.start()
+                _ = _first_tensor(self._run_model()).clone()
+                torch.accelerator.synchronize()
+                restore()
             probe.report(self.name)
             draft_reference = self.drafter.tokens.clone() if self.drafter else None
             stream.synchronize()
