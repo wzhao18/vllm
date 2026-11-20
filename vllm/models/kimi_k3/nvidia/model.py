@@ -863,8 +863,10 @@ class KimiMoE(nn.Module):
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
             self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
             self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
-            # Shared experts beside the routing front of prefill chunks.
-            self._prefill_shared_side_stream = torch.cuda.Stream()
+            # Shared experts beside the routing front of prefill chunks, on a
+            # high-priority stream: the gate_up GEMM (persistent, 8-CTA
+            # clusters) gets its SMs before the router / latent down CTAs.
+            self._prefill_shared_side_stream = torch.cuda.Stream(priority=-1)
             self._prefill_shared_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
