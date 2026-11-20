@@ -12,14 +12,14 @@ One CTA per SM, persistent over rows; every gathered KV row lands in one SM once
 - QK: S^T [128 keys, 96 heads] = K Q^T, tcgen05 kind::f8f6f4 (Rubin 2x-K, K64 per
   MMA, FP32 accumulation), A = the gathered K tile (K-major), B = the row's 96 FP8
   query heads (TMA, K-major): no head padding; two S^T buffers in TMEM;
-- softmax: two warpgroups of 48 heads, thread = key; the running max per head in
+- softmax: three warpgroups of 32 heads, thread = key; the running max per head in
   log2 units (warp max reductions + a cross-quarter combine), P = E4M3(448 x 2^(x - m))
   against the running max as trtllm-gen, FP32 row sums; O^T rescaled in TMEM where a
-  head's max grew;
+  head's max grew, by separate correction warps (off the softmax path);
 - PV: O^T [512 dims, 96 heads] += V^T P^T, 4 MMAs of M = 128 dims, A = V^T (the same
   gathered tile read MN-major), B = P^T (SMEM, MN-major), FP32 accumulation;
-- epilogue: O / (448 l) x out_scale -> BF16 latent [R, Hq, 512] (heads 0..95), LSE =
-  m + log2 l -> [R, Hq].
+- epilogue (the correction warps, under the next row's softmax): O / (448 l) x
+  out_scale -> BF16 latent [R, Hq, 512] (heads 0..95), LSE = m + log2 l -> [R, Hq].
 TMEM (exclusive, 576 columns): S^T 2 x 96 | O^T 4 x 96.
 """
 
@@ -76,39 +76,47 @@ HW = 32  # heads per softmax group (4 warps, one per TMEM lane quarter)
 NG = H // HW  # softmax groups
 # Warpgroup-aligned roles (setmaxnreg is per warpgroup): WG0 = warp 0 (TMEM owner +
 # Q / index loader), warp 1 (QK MMAs), warp 2 (PV MMAs), warp 3 (KV gathers); WG1-3
-# = warps 4..15
-# (softmax, O^T correction and the epilogue of each group's heads); WG4-7 = warps
-# 16..31 (KV gathers).
+# = warps 4..15 (softmax and row sums of each group's heads); WG4-6 = warps 16..27
+# (O^T correction and the epilogue of each group's heads, off the softmax path: the
+# next row's softmax runs under a row's epilogue); WG7 = warps 28..31 (KV gathers).
 NW = 16
 SOFT0 = 4
+CORR0 = 16
+LOAD0 = 28
 # Register pool: 64 per thread x 1024 threads = 65536 >= 640 x 40 (lean: TMEM / Q /
-# MMA / 17 gather warps) + 384 x 104 (softmax).
+# MMA / gathers / corrections) + 384 x 104 (softmax).
 LEAN_REGS, SOFT_REGS = 40, 104
-LOADERS = 1 + 16
+LOADERS = 1 + 4
 # Per KV row: latent blocks 0-1 by TMA gather4 (4 rows per op); latent blocks 2-3 and
 # the RoPE bytes by cp.async (16 B, LSU path) from every loader thread: the per-SM TMA
 # op rate alone (~50 gather4 per us, 512 B each) held a 72 KB tile to ~2.5 us.
 CPA_THREADS = 32 * LOADERS
 NSOFT = 4 * NG  # softmax warps
 MAX_ROWS = 16  # rows per CTA
+KEYS = 17  # sort keys of the row deal: 16 - tiles (a row has at most 16 tiles)
 QBLK = H * 128  # one 128 B column block of the query rows [96 x 128 B]
 QBYTES = 4 * QBLK + H * 64
 PBYTES = TN * H  # P^T [128 keys x 96 heads] E4M3
 
 # Barriers
-B_QFULL, B_QEMPTY = 0, 1
+NCORR = 4 * NG  # correction warps
+B_QEMPTY = 1
 B_PFULL = 2  # + P buffer (tile parity): P^T, the tile's rescale factors and flags
 B_PVDONE = 4  # + P buffer: PV of that tile complete
-B_OEMPTY = 6
-B_SFULL = 7  # + buffer
-B_SEMPTY = 9  # + buffer
-B_IDXFULL = 11  # + row parity
-B_IDXEMPTY = 13  # + row parity
-B_KVFULL = 15  # + stage
-B_KVEMPTY = 23  # + stage
-B_PVBLK = 31  # + O^T block: that block's PV of the tile complete
-B_OREADY = 35  # + O^T block: corrected for the next tile's PV
-NBAR = 39
+B_SFULL = 6  # + buffer
+B_SEMPTY = 8  # + buffer
+B_IDXFULL = 10  # + row parity
+B_IDXEMPTY = 12  # + row parity
+B_KVFULL = 14  # + stage
+B_KVEMPTY = 22  # + stage
+B_PVBLK = 30  # + O^T block: that block's PV of the tile complete
+B_OREADY = 34  # + O^T block: corrected for the next tile's PV
+B_OEMPTY = 38  # + O^T block: read by the row's epilogue
+B_ALPHA = 42  # + NG x tile parity + group: the tile's rescale factors published
+B_LFULL = 48  # + group: the row's 1 / (448 l) published
+B_LEMPTY = 51  # + group: the epilogue read them
+B_QBLK = 54  # + query block (4 latent column blocks, RoPE): landed
+NBAR = 59
 
 C_S, C_O = 0, 192  # TMEM: S^T 2 x 96 | O^T 4 x 96
 
@@ -280,6 +288,10 @@ class SparseMlaDecodeKM:
         off += H * 4
         self.off_n = off
         off += 4 * MAX_ROWS
+        self.off_row = off  # [MAX_ROWS] this CTA's row ids (the deal of ``deal``)
+        off += 4 * MAX_ROWS
+        self.off_cnt = off  # [2][KEYS] tile-count histogram, then running positions
+        off += 8 * KEYS
         self.off_bar = off
         off += NBAR * 8
         self.off_tmem = off
@@ -291,6 +303,76 @@ class SparseMlaDecodeKM:
     @cute.jit
     def nrow(self, base, i):
         return Int32(ld_shared_u32(base + Uint32(self.off_n) + Uint32(4) * Uint32(i)))
+
+    @cute.jit
+    def rowid(self, base, i):
+        return Int32(ld_shared_u32(base + Uint32(self.off_row) + Uint32(4) * Uint32(i)))
+
+    @cute.jit
+    def slot(self, cta, i):
+        """Sorted position of this CTA's i-th row: the rows, ordered by tile count
+        (descending, stable), are dealt boustrophedon over the CTAs (LPT: a CTA's
+        second row is among the shortest of the second pass)."""
+        j = cta
+        if i % 2 == 1:
+            j = self.grid - 1 - cta
+        return i * self.grid + j
+
+    @cute.jit
+    def mine(self, cta, rows):
+        n = Int32(0)
+        for i in cutlass.range_constexpr(MAX_ROWS):
+            if self.slot(cta, Int32(i)) < rows:
+                n = n + 1
+        return n
+
+    @cute.jit
+    def deal(self, base, lane, cta, rows, valid):
+        """Warp 1: this CTA's rows and their key counts into SMEM (off_row, off_n).
+        Every CTA sorts the valid counts of all rows by tile count (a stable
+        counting sort: one histogram pass and one ranking pass, 32 rows per step,
+        ranks within a step by match.any) and keeps the rows dealt to it. Which CTA
+        computes a row changes, not how: the outputs are bitwise those of the
+        round-robin order; the longest CTA holds ~one tile less."""
+        cnt = base + Uint32(self.off_cnt)
+        for j in cutlass.range_constexpr((2 * KEYS + 31) // 32):
+            if lane + 32 * j < 2 * KEYS:
+                st_shared_u32(cnt + Uint32(4) * Uint32(lane + 32 * j), Uint32(0))
+        sync_warp()
+        lt = lanemask_lt()
+        steps = (rows + 31) // 32
+        for p in cutlass.range_constexpr(2):
+            for c in range(steps):
+                r = c * 32 + lane
+                key = Uint32(255)
+                n = Int32(0)
+                if r < rows:
+                    n = ld_global_s32(valid + Int64(r) * Int64(4))
+                    key = Uint32(KEYS - 1) - Uint32(_tiles(n))
+                peers = match_any(key)
+                ahead = popc(peers & lt)
+                if cutlass.const_expr(p == 1):
+                    if r < rows:
+                        pos = Int32(ld_shared_u32(cnt + Uint32(4 * KEYS) + Uint32(4) * key)) + Int32(ahead)
+                        i = pos // self.grid
+                        j = pos - i * self.grid
+                        if i % 2 == 1:
+                            j = self.grid - 1 - j
+                        if j == cta:
+                            st_shared_u32(base + Uint32(self.off_row) + Uint32(4) * Uint32(i), Uint32(r))
+                            st_shared_u32(base + Uint32(self.off_n) + Uint32(4) * Uint32(i), Uint32(n))
+                sync_warp()
+                if (r < rows) & (ahead == Uint32(0)):  # the group leader counts it
+                    at_ = cnt + Uint32(4 * KEYS * p) + Uint32(4) * key
+                    st_shared_u32(at_, ld_shared_u32(at_) + popc(peers))
+                sync_warp()
+            if cutlass.const_expr(p == 0):  # exclusive prefix: running positions
+                if lane == 0:
+                    acc = Uint32(0)
+                    for k in cutlass.range_constexpr(KEYS):
+                        st_shared_u32(cnt + Uint32(4 * (KEYS + k)), acc)
+                        acc = acc + ld_shared_u32(cnt + Uint32(4 * k))
+                sync_warp()
 
     @cute.jit
     def mark(self, stamp, bid, i):
@@ -338,11 +420,18 @@ class SparseMlaDecodeKM:
         base = Uint32(raw.toint())
         if tid == 0:
             self.mark(stamp, cta, 0)
-            for i, count in ((B_QFULL, 1), (B_QEMPTY, 1), (B_OEMPTY, NSOFT)):
-                mbar_init(self.bar(base, i), Uint32(count))
+            mbar_init(self.bar(base, B_QEMPTY), Uint32(1))
+            for j in cutlass.range_constexpr(5):
+                mbar_init(self.bar(base, B_QBLK + j), Uint32(1))
             for blk in cutlass.range_constexpr(4):
                 mbar_init(self.bar(base, B_PVBLK + blk), Uint32(1))
-                mbar_init(self.bar(base, B_OREADY + blk), Uint32(NSOFT))
+                mbar_init(self.bar(base, B_OREADY + blk), Uint32(NCORR))
+                mbar_init(self.bar(base, B_OEMPTY + blk), Uint32(NCORR))
+            for j in cutlass.range_constexpr(2 * NG):
+                mbar_init(self.bar(base, B_ALPHA + j), Uint32(32))
+            for j in cutlass.range_constexpr(NG):
+                mbar_init(self.bar(base, B_LFULL + j), Uint32(32))
+                mbar_init(self.bar(base, B_LEMPTY + j), Uint32(4))
             for b in cutlass.range_constexpr(2):
                 mbar_init(self.bar(base, B_PFULL + b), Uint32(NSOFT))
                 mbar_init(self.bar(base, B_PVDONE + b), Uint32(1))
@@ -357,11 +446,9 @@ class SparseMlaDecodeKM:
             fence_mbar_init()
         if warp == 0:
             tmem_alloc_exclusive(base + Uint32(self.off_tmem))
-        n_mine = (rows - cta + self.grid - 1) // self.grid
+        n_mine = self.mine(cta, rows)
         if warp == 1:
-            if lane < n_mine:
-                st_shared_u32(base + Uint32(self.off_n + 4 * lane), Uint32(
-                    ld_global_s32(valid + Int64(cta + lane * self.grid) * Int64(4))))
+            self.deal(base, lane, cta, rows, valid)
         tc_fence_before()
         cute.arch.sync_threads()
         tc_fence_after()
@@ -375,6 +462,10 @@ class SparseMlaDecodeKM:
                              lse_stride, scale_log2, out_scale, stamp)
         else:
             cute.arch.warpgroup_reg_dealloc(LEAN_REGS)
+            if (warp >= CORR0) & (warp < LOAD0):
+                if cutlass.const_expr(not self.gather_only):
+                    self.correct(base, warp, lane, taddr, cta, n_mine, out, out_stride,
+                                 stamp)
             if warp == 0:
                 if lane == 0:
                     self.qloader(base, cta, n_mine, q_heads, tensormap.map_address(qn),
@@ -389,8 +480,8 @@ class SparseMlaDecodeKM:
                 if lane == 0:
                     if cutlass.const_expr(not self.gather_only):
                         self.pv(base, taddr, n_mine, stamp, cta)
-            if (warp == 3) | (warp >= NW):
-                lw = cutlass.select_(warp >= NW, warp - NW + 1, 0)
+            if (warp == 3) | (warp >= LOAD0):
+                lw = cutlass.select_(warp >= LOAD0, warp - LOAD0 + 1, 0)
                 self.loader(base, lw, lane, cta, n_mine, tensormap.map_address(kvm),
                             tensormap.map_address(kvr), kv, qp, q_heads)
         tc_fence_before()
@@ -409,7 +500,7 @@ class SparseMlaDecodeKM:
         for i in range(n_mine):
             n = self.nrow(base, i)
             if n > 0:
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 b = rq & 1
                 mbar_wait(self.bar(base, B_IDXEMPTY + b), ((rq >> 1) & 1) ^ 1)
                 nbytes = Uint32(((n + 3) // 4) * 16)
@@ -419,11 +510,14 @@ class SparseMlaDecodeKM:
                           self.bar(base, B_IDXFULL + b))
                 if cutlass.const_expr(not self.gather_only):
                     mbar_wait(self.bar(base, B_QEMPTY), (rq & 1) ^ 1)
-                    full = self.bar(base, B_QFULL)
-                    mbar_arrive_tx(full, Uint32(QBYTES))
+                    # Block by block: the row's first QK starts on the first block.
                     for j in cutlass.range_constexpr(4):
+                        full = self.bar(base, B_QBLK + j)
+                        mbar_arrive_tx(full, Uint32(QBLK))
                         tma_tile2d(base + Uint32(self.off_q + j * QBLK), tm_qn, full,
                                    Int32(128 * j), row * q_heads)
+                    full = self.bar(base, B_QBLK + 4)
+                    mbar_arrive_tx(full, Uint32(H * 64))
                     tma_tile2d(base + Uint32(self.off_q + 4 * QBLK), tm_qr, full, Int32(0),
                                row * q_heads)
                 rq = rq + 1
@@ -457,7 +551,7 @@ class SparseMlaDecodeKM:
                 if (i + 1 < n_mine) & (me < QBYTES // 128):
                     # The next row's query heads into L2: its TMA load (after this
                     # row's last QK) then waits on L2, not HBM.
-                    prefetch_l2(qp + (Int64(cta + (i + 1) * self.grid) * Int64(q_heads)
+                    prefetch_l2(qp + (Int64(self.rowid(base, i + 1)) * Int64(q_heads)
                                       * Int64(ROW) + Int64(me * 128)))
                 for t in range(tiles):
                     s = g % self.stages
@@ -549,7 +643,7 @@ class SparseMlaDecodeKM:
 
     # ------------------------------------------------------------------ MMA
     @cute.jit
-    def qk(self, base, taddr, g, stamp, cta, mark, last):
+    def qk(self, base, taddr, g, stamp, cta, mark, last, first, ro):
         s = g % self.stages
         st = base + Uint32(self.off_kv) + Uint32(s) * Uint32(STAGE)
         b = g & 1
@@ -561,11 +655,16 @@ class SparseMlaDecodeKM:
         tc_fence_after()
         d = taddr + Uint32(C_S) + Uint32(96) * Uint32(b)
         for kk in cutlass.range_constexpr(8):
+            if cutlass.const_expr(kk % 2 == 0):
+                if first:
+                    mbar_wait(self.bar(base, B_QBLK + kk // 2), ro & 1)
             off = (kk // 2) * TN * 128 + (kk % 2) * 64
             ad = Uint64(SDESC_SW128) | Uint64((st + Uint32(off)) >> Uint32(4))
             qoff = self.off_q + (kk // 2) * QBLK + (kk % 2) * 64
             bd = Uint64(SDESC_SW128) | Uint64((base + Uint32(qoff)) >> Uint32(4))
             mma_ss(d, ad, bd, Uint32(IDESC_QK), Uint32(1 if kk > 0 else 0))
+        if first:
+            mbar_wait(self.bar(base, B_QBLK + 4), ro & 1)
         ad = Uint64(SDESC_SW64) | Uint64((st + Uint32(4 * TN * 128)) >> Uint32(4))
         bd = Uint64(SDESC_SW64) | Uint64((base + Uint32(self.off_q + 4 * QBLK)) >> Uint32(4))
         mma_ss(d, ad, bd, Uint32(IDESC_QK), Uint32(1))
@@ -598,9 +697,9 @@ class SparseMlaDecodeKM:
             n = self.nrow(base, i)
             if n > 0:
                 tiles = _tiles(n)
-                mbar_wait(self.bar(base, B_QFULL), ro & 1)
                 for t in range(tiles):
-                    self.qk(base, taddr, g, stamp, cta, ro * 8 + t, t + 1 == tiles)
+                    self.qk(base, taddr, g, stamp, cta, ro * 8 + t, t + 1 == tiles,
+                            t == 0, ro)
                     g = g + 1
                 ro = ro + 1
 
@@ -616,8 +715,6 @@ class SparseMlaDecodeKM:
             if n > 0:
                 tiles = _tiles(n)
                 for t in range(tiles):
-                    if t == 0:
-                        mbar_wait(self.bar(base, B_OEMPTY), (ro & 1) ^ 1)
                     b = g & 1
                     mbar_wait(self.bar(base, B_PFULL + b), (g >> 1) & 1)
                     if ro * 8 + t < 8:
@@ -628,12 +725,16 @@ class SparseMlaDecodeKM:
                     pdesc = Uint64(P_DESC) | Uint64(
                         (base + Uint32(self.off_p) + Uint32(b) * Uint32(PBYTES))
                         >> Uint32(4))
-                    # Block by block: the softmax groups rescale O^T block blk (by
+                    # Block by block: the correction groups rescale O^T block blk (by
                     # this tile's factors, after the previous PV of blk) while the
-                    # tensor pipe runs the other blocks.
+                    # tensor pipe runs the other blocks; a row's first PV of a block
+                    # follows the previous row's epilogue read of it.
                     for blk in cutlass.range_constexpr(4):
                         if t > 0:
                             mbar_wait(self.bar(base, B_OREADY + blk), gc & 1)
+                            tc_fence_after()
+                        else:
+                            mbar_wait(self.bar(base, B_OEMPTY + blk), (ro & 1) ^ 1)
                             tc_fence_after()
                         vd = Uint64(SDESC_SW128) | Uint64(
                             (st + Uint32(blk * TN * 128)) >> Uint32(4))
@@ -649,6 +750,96 @@ class SparseMlaDecodeKM:
                     if t > 0:
                         gc = gc + 1
                     g = g + 1
+                ro = ro + 1
+
+    # ------------------------------------------------------------------ correction
+    @cute.jit
+    def correct(self, base, warp, lane, taddr, cta, n_mine, out, out_stride, stamp):
+        """Group k (warps CORR0 + 4k ..) owns the O^T columns of heads 32k .. 32k + 31;
+        its warp of TMEM lane quarter q owns dims 32q .. 32q + 31 of every 128-dim
+        block. Per tile after a row's first: once the softmax group published the
+        tile's factors, O^T block by block x 2^(m_old - m_new) where a head's max
+        grew (after the previous PV of the block). Per row: the epilogue O / (448 l) x
+        out_scale -> BF16 while the softmax group goes on with the next row."""
+        k = (warp - CORR0) // 4
+        quarter = warp % 4
+        lanes = Uint32(quarter * 32) << Uint32(16)
+        h0 = k * HW
+        alpha_g = base + Uint32(self.off_alpha) + Uint32(4 * h0)
+        flag_g = base + Uint32(self.off_flag) + Uint32(4 * k)
+        fin = base + Uint32(self.off_l) + Uint32(4 * h0)
+        ocol = taddr + lanes + Uint32(C_O + HW * k)
+        odd = lane & 1
+        g = Int32(0)
+        ro = Int32(0)
+        for i in range(n_mine):
+            n = self.nrow(base, i)
+            if n > 0:
+                row = self.rowid(base, i)
+                tiles = _tiles(n)
+                for t in range(tiles):
+                    if t > 0:
+                        b = g & 1
+                        mbar_wait(self.bar(base, B_ALPHA + NG * b + k), (g >> 1) & 1)
+                        alpha_s = alpha_g + Uint32(b) * Uint32(H * 4)
+                        grew = ld_shared_u32(flag_g + Uint32(b) * Uint32(16)) != Uint32(0)
+                        for blk in cutlass.range_constexpr(4):
+                            if grew:
+                                # PVs of a block run in order: an unchanged block needs
+                                # no wait for the previous one.
+                                mbar_wait(self.bar(base, B_PVBLK + blk), (g - 1) & 1)
+                                tc_fence_after()
+                                for j in cutlass.range_constexpr(2):
+                                    col = ocol + Uint32(96 * blk + 16 * j)
+                                    ov = tmem_ld16(col)
+                                    vals = []
+                                    for c in cutlass.range_constexpr(4):
+                                        a4 = ld_shared_v4f(alpha_s + Uint32(64 * j + 16 * c))
+                                        vals.extend([ov[4 * c + e] * a4[e] for e in range(4)])
+                                    tmem_st16_nw(col, vals)
+                                tmem_wait_st()
+                                tc_fence_before()
+                            cute.arch.sync_warp()
+                            if lane == 0:
+                                mbar_arrive(self.bar(base, B_OREADY + blk))
+                    g = g + 1
+                # This group's 32 heads of the latent once the row's last PV is
+                # complete: thread = dim 32 quarter + lane of every 128-dim block, each
+                # O^T block released after its read. Lane pairs swap one value so each
+                # lane stores two adjacent dims of one head (BF16x2): even lanes head h,
+                # odd lanes head h + 1.
+                mbar_wait(self.bar(base, B_LFULL + k), ro & 1)
+                gl = g - 1
+                mbar_wait(self.bar(base, B_PVDONE + (gl & 1)), (gl >> 1) & 1)
+                tc_fence_after()
+                dst = out + (Int64(row) * Int64(out_stride)
+                             + Int64(quarter * 32 + lane - odd)) * Int64(2)
+                for blk in cutlass.range_constexpr(4):
+                    for j in cutlass.range_constexpr(2):
+                        ov = tmem_ld16(ocol + Uint32(96 * blk + 16 * j))
+                        if j == 1:
+                            tc_fence_before()
+                            cute.arch.sync_warp()
+                            if lane == 0:
+                                mbar_arrive(self.bar(base, B_OEMPTY + blk))
+                        for e in cutlass.range_constexpr(4):
+                            i4 = ld_shared_v4f(fin + Uint32(64 * j + 16 * e))
+                            for f in cutlass.range_constexpr(2):
+                                h = 4 * e + 2 * f
+                                a = ov[h] * i4[2 * f]
+                                b2 = ov[h + 1] * i4[2 * f + 1]
+                                x = shfl_xor(cutlass.select_(odd == 1, a, b2), 1)
+                                lo = cutlass.select_(odd == 1, x, a)
+                                hi = cutlass.select_(odd == 1, b2, x)
+                                if cutlass.const_expr(self.epi_store):
+                                    st_global_bf16x2(
+                                        dst + Int64(((h0 + 16 * j + h + odd) * D_NOPE
+                                                     + 128 * blk) * 2), lo, hi)
+                cute.arch.sync_warp()
+                if lane == 0:
+                    mbar_arrive(self.bar(base, B_LEMPTY + k))
+                if (warp == CORR0) & (lane == 0) & (ro < 2):
+                    self.mark(stamp, cta, 14 + 16 * ro)
                 ro = ro + 1
 
     # ------------------------------------------------------------------ softmax
@@ -682,7 +873,7 @@ class SparseMlaDecodeKM:
         for i in range(n_mine):
             n = self.nrow(base, i)
             if n > 0:
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 tiles = _tiles(n)
                 lp = [Float32(0.0)] * HW  # row-sum partials of this key lane
                 m = neg  # combiner: running max of head h0 + lane (log2 units)
@@ -713,6 +904,9 @@ class SparseMlaDecodeKM:
                                          r4[0], r4[1], r4[2], r4[3])
                     if sub:
                         self.mark(stamp, cta, 32)
+                    if g >= 2:  # PV(g - 2) is complete: its P^T buffer, rescale
+                        # factors and flags are free
+                        mbar_wait(self.bar(base, B_PVDONE + b), ((g >> 1) & 1) ^ 1)
                     named_bar(Uint32(1) + Uint32(k), Uint32(128))
                     if sub:
                         self.mark(stamp, cta, 33)
@@ -729,6 +923,8 @@ class SparseMlaDecodeKM:
                         grown = vote_any(Uint32(al < Float32(1.0)))
                         if lane == 0:
                             st_shared_u32(flag_s, grown)
+                        cute.arch.sync_warp()
+                        mbar_arrive(self.bar(base, B_ALPHA + NG * b + k))
                     named_bar(Uint32(1) + Uint32(k), Uint32(128))
                     if sub:
                         self.mark(stamp, cta, 34)
@@ -745,8 +941,6 @@ class SparseMlaDecodeKM:
                             lnew.append(fma_f(lp[4 * c + e], a4[e], p4[e]))
                     if sub:
                         self.mark(stamp, cta, 35)
-                    if g >= 2:  # PV(g - 2) is complete: its P^T buffer is free
-                        mbar_wait(self.bar(base, B_PVDONE + b), ((g >> 1) & 1) ^ 1)
                     if sub:
                         self.mark(stamp, cta, 36)
                     pb = pbase + Uint32(b) * Uint32(PBYTES)
@@ -760,32 +954,10 @@ class SparseMlaDecodeKM:
                     cute.arch.sync_warp()
                     if lane == 0:
                         mbar_arrive(self.bar(base, B_PFULL + b))
-                    if t > 0:
-                        # O^T rescale of this group's 32 head columns (thread = dim
-                        # 32 quarter + lane of every block) where a head's max grew,
-                        # block by block after the previous tile's PV of the block;
-                        # the three groups run in parallel beside the tensor pipe.
-                        grew = ld_shared_u32(flag_s) != Uint32(0)
-                        for blk in cutlass.range_constexpr(4):
-                            mbar_wait(self.bar(base, B_PVBLK + blk), (g - 1) & 1)
-                            if grew:
-                                tc_fence_after()
-                                col = taddr + lanes + Uint32(C_O + 96 * blk + HW * k)
-                                ov = tmem_ld32(col)
-                                vals = []
-                                for c in cutlass.range_constexpr(HW // 4):
-                                    a4 = ld_shared_v4f(alpha_s + Uint32(16 * c))
-                                    vals.extend([ov[4 * c + e] * a4[e] for e in range(4)])
-                                tmem_st32_nw(col, vals)
-                                tmem_wait_st()
-                            tc_fence_before()
-                            cute.arch.sync_warp()
-                            if lane == 0:
-                                mbar_arrive(self.bar(base, B_OREADY + blk))
                     g = g + 1
-                # Epilogue: the row sums (a transposing warp reduction: lane = head,
+                # Row end: the row sums (a transposing warp reduction: lane = head,
                 # then the 4 key quarters), LSE and 1 / (448 l) for the correction
-                # warps, which write O^T while these warps go on with the next row.
+                # groups, which write O^T while these warps go on with the next row.
                 ep = (warp == SOFT0) & (lane == 0) & (ro == 0)
                 if ep:
                     self.mark(stamp, cta, 15)
@@ -810,47 +982,16 @@ class SparseMlaDecodeKM:
                     # lt = 448 l: LSE = m + log2 l; O = O~ / (448 l) x out_scale
                     st_global_f32(lse + (Int64(row) * Int64(lse_stride) + Int64(h0 + lane))
                                   * Int64(4), m + lg2(lt) - log2_448)
+                    if ro > 0:  # the previous row's epilogue read its factors
+                        mbar_wait(self.bar(base, B_LEMPTY + k), (ro - 1) & 1)
                     st_shared_f32(lfin + Uint32(4) * Uint32(h0 + lane), out_scale / lt)
+                    mbar_arrive(self.bar(base, B_LFULL + k))
                 named_bar(Uint32(1) + Uint32(k), Uint32(128))  # the sums are read
                 if ep:
                     self.mark(stamp, cta, 16)
-                # This group's 32 heads of the latent once the row's last PV is
-                # complete: O / (448 l) x out_scale -> BF16, thread = dim 32 quarter +
-                # lane of every 128-dim block (O^T released after its last read).
-                # Lane pairs swap one value so each lane stores two adjacent dims of
-                # one head (BF16x2): even lanes head h, odd lanes head h + 1.
-                gl = g - 1
-                mbar_wait(self.bar(base, B_PVDONE + (gl & 1)), (gl >> 1) & 1)
-                tc_fence_after()
-                odd = lane & 1
-                dst = out + (Int64(row) * Int64(out_stride)
-                             + Int64(quarter * 32 + lane - odd)) * Int64(2)
-                fin = lfin + Uint32(4 * h0)
-                for blk in cutlass.range_constexpr(4):
-                    ov = tmem_ld32(taddr + lanes + Uint32(C_O + 96 * blk + HW * k))
-                    if blk == 3:
-                        tc_fence_before()
-                        cute.arch.sync_warp()
-                        if lane == 0:
-                            mbar_arrive(self.bar(base, B_OEMPTY))
-                    for e in cutlass.range_constexpr(8):
-                        i4 = ld_shared_v4f(fin + Uint32(16 * e))
-                        for f in cutlass.range_constexpr(2):
-                            h = 4 * e + 2 * f
-                            a = ov[h] * i4[2 * f]
-                            b2 = ov[h + 1] * i4[2 * f + 1]
-                            x = shfl_xor(cutlass.select_(odd == 1, a, b2), 1)
-                            lo = cutlass.select_(odd == 1, x, a)
-                            hi = cutlass.select_(odd == 1, b2, x)
-                            if cutlass.const_expr(self.epi_store):
-                                st_global_bf16x2(
-                                    dst + Int64(((h0 + h + odd) * D_NOPE + 128 * blk)
-                                                * 2), lo, hi)
-                if (warp == SOFT0) & (lane == 0) & (ro < 2):
-                    self.mark(stamp, cta, 14 + 16 * ro)
                 ro = ro + 1
             else:  # no keys: LSE -inf and a zero latent (as trtllm-gen)
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 if combiner:
                     st_global_f32(lse + (Int64(row) * Int64(lse_stride) + Int64(h0 + lane))
                                   * Int64(4), neg)
@@ -865,6 +1006,26 @@ class SparseMlaDecodeKM:
 @asm(Float32, pure=True)
 def fma_f(a, b, c):
     return "fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f", (Float32(a), Float32(b), Float32(c))
+
+
+@asm(Uint32, pure=False)
+def match_any(v):
+    return "match.any.sync.b32 $0, $1, 0xffffffff;", "=r,r", (Uint32(v),)
+
+
+@asm(Uint32, pure=True)
+def lanemask_lt():
+    return "mov.u32 $0, %lanemask_lt;", "=r", ()
+
+
+@asm(Uint32, pure=True)
+def popc(v):
+    return "popc.b32 $0, $1;", "=r,r", (Uint32(v),)
+
+
+@asm()
+def sync_warp():
+    return "bar.warp.sync 0xffffffff;", "~{memory}", ()
 
 
 @asm(Uint32, pure=False)
@@ -899,6 +1060,14 @@ def tmem_st32_nw(addr, vals):
     regs = ",".join(f"${i + 1}" for i in range(32))
     code = f"tcgen05.st.sync.aligned.32x32b.x32.b32 [$0], {{{regs}}};"
     return code, "r" + ",f" * 32 + ",~{memory}", (
+        Uint32(addr), *[Float32(v) for v in vals])
+
+
+@asm()
+def tmem_st16_nw(addr, vals):
+    regs = ",".join(f"${i + 1}" for i in range(16))
+    code = f"tcgen05.st.sync.aligned.32x32b.x16.b32 [$0], {{{regs}}};"
+    return code, "r" + ",f" * 16 + ",~{memory}", (
         Uint32(addr), *[Float32(v) for v in vals])
 
 
