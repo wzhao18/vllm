@@ -146,6 +146,22 @@ def _smid():
     return "mov.u32 $0, %smid;", "=r", ()
 
 
+@asm(cutlass.Int32)
+def _gtime_lo():
+    return "mov.u32 $0, %globaltimer_lo;", "=r,~{memory}", ()
+
+
+@asm()
+def _st_peer_s32(address, rank, value):
+    """Store ``value`` at the same shared-memory offset in cluster CTA ``rank``."""
+    return (
+        "{.reg .b32 a; mapa.shared::cluster.u32 a, $0, $1; "
+        "st.shared::cluster.s32 [a], $2; fence.acq_rel.cluster;}",
+        "r,r,r,~{memory}",
+        (address, rank, value),
+    )
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -234,6 +250,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.weight_is_a = weight_is_a
         self.quiet_wait = quiet_wait
         self.dbg_skip_mma = False
+        # dbg_stamps: per-CTA %globaltimer_lo stamps into the alpha/aux buffer (int32 words
+        # from 512, 8 per CTA): entry, first FULL, last FULL, epilogue end, smid, first
+        # post-wait TMA issue, last TMA issue (benchmarks only; needs a large aux buffer)
+        self.dbg_stamps = False
         # producers: TMA warps tma_warp_id .. tma_warp_id + producers - 1, warp i issues
         # the whole stages (A, B, SFA, SFB) of k-blocks with (k % producers) == i
         self.num_producers = producers
@@ -244,6 +264,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # push (one tile per CTA): the epilogue pushes the BF16 tile rows into the SP
         # reduce-scatter owners' receive slots (``push_epilogue``) instead of C
         self.push = push
+        # 2x1 clusters: the leader claims a cluster tile c and stores it in the peer;
+        # c -> (m pair c // L, batch c % L) with one N tile (aux[13] = L)
+        self.claim_cluster = cluster_shape_mn[0] * cluster_shape_mn[1]
+        if die_claim and self.claim_cluster not in (1, 2):
+            raise ValueError("die_claim supports 1x1 and 2x1 clusters")
         self.threads_per_cta = 32 * (len(self.epilog_warp_id) + 1 + producers)
 
         self.mma_inst_shape = mma_inst_shape
@@ -480,6 +505,18 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             current_stream,
             epilogue_op,
             c_ld,
+        )
+
+    def _claim_coord(self, claimed, claim_m, claim_l, cta_rank):
+        # 1x1: claim_m = M tiles; 2x1: claim_m = N tiles per cluster M tile (pair),
+        # claimed = (pair * claim_m + n tile) * claim_l + batch
+        if cutlass.const_expr(self.claim_cluster == 1):
+            return (claimed % claim_m, claimed // claim_m, 0)
+        rest = claimed // claim_l
+        return (
+            (rest // claim_m) * self.claim_cluster + cta_rank,
+            rest % claim_m,
+            claimed % claim_l,
         )
 
     def _get_mma_permutation_mnk(self):
@@ -1369,6 +1406,17 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        if cutlass.const_expr(self.dbg_stamps):
+            stamps = cute.make_tensor(
+                cute.recast_ptr(alpha.iterator + 512, dtype=cutlass.Int32), cute.make_layout(4096)
+            )
+            sb_x, sb_y, sb_z = cute.arch.block_idx()
+            sg_x, sg_y, sg_z = cute.arch.grid_dim()
+            st_base = ((sb_z * sg_y + sb_y) * sg_x + sb_x) * 8
+            if warp_idx == 0:
+                if cute.arch.lane_idx() == 0:
+                    stamps[st_base] = _gtime_lo()
+                    stamps[st_base + 4] = _smid()
 
         #
         # Prefetch tma desc
@@ -1607,7 +1655,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 cute.recast_ptr(alpha.iterator, dtype=cutlass.Int32), cute.make_layout(272)
             )
             claim_box = storage.claim_tile.get_tensor(cute.make_layout(1))
-            if warp_idx == self.mma_warp_id:
+            claim_leader = cutlass.Boolean(True)
+            if cutlass.const_expr(self.claim_cluster > 1):
+                claim_leader = cta_rank_in_cluster == 0
+            if warp_idx == self.mma_warp_id and claim_leader:
                 if cute.arch.lane_idx() == 0:
                     die = aux[16 + _smid()]
                     got = _atom_add(aux.iterator + 4 + die, cutlass.Int32(1))
@@ -1622,9 +1673,20 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     claim_box[0] = tile
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
         if cutlass.const_expr(self.die_claim):
+            if cutlass.const_expr(self.claim_cluster > 1):
+                # every CTA of the cluster has started (pipeline_init_wait): publish
+                # the leader's claim into the peers' claim_box
+                if warp_idx == self.mma_warp_id and claim_leader:
+                    if cute.arch.lane_idx() == 0:
+                        mine = claim_box[0]
+                        for peer in cutlass.range_constexpr(1, self.claim_cluster):
+                            _st_peer_s32(claim_box.iterator, cutlass.Int32(peer), mine)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             cute.arch.sync_threads()
             claimed = claim_box[0]
             claim_m = aux[12]
+            claim_l = aux[13]
 
         #
         # Construct the scheduler
@@ -1650,7 +1712,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 if work_tile.is_valid_tile:
                     p_tc = work_tile.tile_idx
                     if cutlass.const_expr(self.die_claim):
-                        p_tc = (claimed % claim_m, claimed // claim_m, 0)
+                        p_tc = self._claim_coord(claimed, claim_m, claim_l, cta_rank_in_cluster)
                     p_mn = (p_tc[0] // cute.size(tiled_mma.thr_id.shape), p_tc[1], p_tc[2])
                     p_a = tAgA[(None, p_mn[0], None, p_mn[2])]
                     p_sfa = tAgSFA[(None, p_mn[0], None, p_mn[2])]
@@ -1704,7 +1766,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
-                    cur_tile_coord = (claimed % claim_m, claimed // claim_m, 0)
+                    cur_tile_coord = self._claim_coord(claimed, claim_m, claim_l, cta_rank_in_cluster)
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -1817,6 +1879,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                 mcast_mask=sfa_full_mcast_mask,
                             )
+                        if cutlass.const_expr(self.dbg_stamps):
+                            if cute.arch.lane_idx() == 0:
+                                if k_tile == pre_left:
+                                    stamps[st_base + 5] = _gtime_lo()
+                                if k_tile == k_tile_cnt - 1:
+                                    stamps[st_base + 6] = _gtime_lo()
 
                     # Prefetch: Rolling prefetch for next tiles
                     if self.prefetch_enabled:
@@ -1916,7 +1984,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
-                    cur_tile_coord = (claimed % claim_m, claimed // claim_m, 0)
+                    cur_tile_coord = self._claim_coord(claimed, claim_m, claim_l, cta_rank_in_cluster)
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -1964,6 +2032,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        if cutlass.const_expr(self.dbg_stamps):
+                            if cute.arch.lane_idx() == 0:
+                                if k_tile == 0:
+                                    stamps[st_base + 1] = _gtime_lo()
+                                if k_tile == k_tile_cnt - 1:
+                                    stamps[st_base + 2] = _gtime_lo()
 
                         if cutlass.const_expr(
                             not self._is_interleaved_utccp() and not self.dbg_skip_mma
@@ -2129,7 +2203,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
-                    cur_tile_coord = (claimed % claim_m, claimed // claim_m, 0)
+                    cur_tile_coord = self._claim_coord(claimed, claim_m, claim_l, cta_rank_in_cluster)
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -2192,11 +2266,16 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     )
 
             c_pipeline.producer_tail()
+            if cutlass.const_expr(self.dbg_stamps):
+                if warp_idx == self.epilog_warp_id[0]:
+                    if cute.arch.lane_idx() == 0:
+                        stamps[st_base + 3] = _gtime_lo()
             if cutlass.const_expr(self.die_claim):
                 if warp_idx == self.epilog_warp_id[0]:
                     if cute.arch.lane_idx() == 0:
                         done = _atom_add(aux.iterator + 6, cutlass.Int32(1))
-                        if done == cute.arch.grid_dim()[0] - 1:
+                        gdim = cute.arch.grid_dim()
+                        if done == gdim[0] * gdim[1] * gdim[2] - 1:
                             aux[4] = cutlass.Int32(0)
                             aux[5] = cutlass.Int32(0)
                             aux[6] = cutlass.Int32(0)
