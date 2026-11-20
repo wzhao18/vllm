@@ -58,10 +58,12 @@ def main():
     ap.add_argument("--ctx", type=int, default=135168)
     ap.add_argument("--q", type=int, default=4)
     ap.add_argument("--uniform", action="store_true")
+    ap.add_argument("--contig", action="store_true")
     a = ap.parse_args()
     for reqs in [int(x) for x in a.reqs.split(",")]:
         q, rows = a.q, reqs * a.q
-        args, ref, lens = _case(reqs, q, a.ctx, 0, lo=a.ctx - 1 if a.uniform else None)
+        args, ref, lens = _case(reqs, q, a.ctx, 0, lo=a.ctx - 1 if a.uniform else None,
+                                contig=a.contig)
         op = Fp4IndexLogits(rows, q, "cuda")
         got = op(**args)
         _check(got, ref, lens, args, q)
@@ -85,11 +87,20 @@ def main():
                                                 args["kv_cache"], args["block_table"],
                                                 args["max_len"], rows, reqs))
         op.epi_math = True
+        op.sf_skip = True  # no KV scale transpose (timing only; wrong scales)
+        t_nosf = graph_time(lambda: op.launch(args["query"], args["q_scale"],
+                                              args["kv_cache"], args["block_table"],
+                                              args["max_len"], rows, reqs))
+        op.epi_math = False
+        t_nosf_nomath = graph_time(lambda: op.launch(args["query"], args["q_scale"],
+                                                     args["kv_cache"], args["block_table"],
+                                                     args["max_len"], rows, reqs))
+        op.epi_math, op.sf_skip = True, False
         mb = float(lens.view(reqs, q).amax(1).sum()) * 68 / 1e6
         print(f"R{rows} keys {mb:6.1f} MB: stock DG {t_dg:6.2f} us | fp4_index_logits "
               f"{t_new:6.2f} us ({t_dg / t_new:4.2f}x, {mb / t_new:5.2f} TB/s) = prep "
               f"{t_prep:5.2f} + kernel {t_launch:6.2f} ({mb / t_launch:5.2f} TB/s); no-math kernel "
-              f"{t_nomath:6.2f} check ok",
+              f"{t_nomath:6.2f}; no-SF-transpose {t_nosf:6.2f} (no math {t_nosf_nomath:6.2f}) check ok",
               flush=True)
 
 

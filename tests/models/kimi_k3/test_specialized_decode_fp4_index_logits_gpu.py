@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 PAGE, ROW, HEADS, DIM = 64, 68, 32, 128
 
 
-def _case(reqs, q, ctx, dcp_rank, world=4, seed=0, lo=None):
+def _case(reqs, q, ctx, dcp_rank, world=4, seed=0, lo=None, contig=False):
     from vllm.model_executor.layers.sparse_attn_indexer import kv_cache_as_quant_view
     from vllm.utils.deep_gemm import (
         fp8_fp4_paged_mqa_logits,
@@ -39,7 +39,8 @@ def _case(reqs, q, ctx, dcp_rank, world=4, seed=0, lo=None):
     store = torch.randint(0, 128, (nb, PAGE * ROW + gap), dtype=torch.uint8, device=dev,
                           generator=g)
     cache = store[:, : PAGE * ROW].view(nb, PAGE, ROW)
-    bt = torch.randperm(nb, device=dev, generator=g)[: reqs * pages].int().view(reqs, pages)
+    order = torch.arange(nb, device=dev) if contig else torch.randperm(nb, device=dev, generator=g)
+    bt = order[: reqs * pages].int().view(reqs, pages)  # contig: as large KV-manager blocks
     bt_rows = bt.repeat_interleave(q, 0).contiguous()
     query = (torch.randint(0, 256, (rows, HEADS, DIM // 2), dtype=torch.uint8, device=dev,
                            generator=g) & 0x77).contiguous()
