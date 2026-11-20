@@ -33,6 +33,7 @@ import threading
 import torch
 
 from vllm.logger import init_logger
+from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
@@ -88,12 +89,16 @@ def _module(
             h.update(f"{torch.__version__} {torch.version.cuda}".encode())
             h.update(f"{probe} {vec} {groups} {claim_ahead} {pdl}".encode())
             tag = h.hexdigest()[:16]
-            build = os.path.join(envs.VLLM_CACHE_ROOT, "k31pf_attn_res_lp", tag)
+            build = os.path.join(
+                envs.VLLM_CACHE_ROOT, "k31pf_attn_res_lp", tag + "-s"
+            )
             os.makedirs(build, exist_ok=True)
+            name = os.path.basename(_SRC)
+            src = stable_copy(build, os.path.dirname(_SRC), [name])
             _mod[key] = (
                 load(
                     name=f"k31pf_attn_res_lp_{tag}",
-                    sources=[_SRC],
+                    sources=[os.path.join(src, name)],
                     extra_cflags=["-O3"],
                     extra_cuda_cflags=[
                         "-O3",
