@@ -61,7 +61,7 @@ constexpr int kSlot = 128 * 128;       // one 128 x 64 BF16 weight K block (or <
 constexpr int kMaxNS = 16;             // ring slots
 constexpr int kMaxT = 16;              // TMEM-resident weight K blocks
 constexpr int kMaxR = 8;               // shared-memory-resident weight K blocks
-constexpr int kMaxX = 32;              // token ring slots (n x 128 B each, in the ring)
+constexpr int kMaxX = kMaxNS;          // token slots (<= 16 KiB each, one per W ring slot)
 constexpr int kLine = 32;              // one counter per 128 B line
 constexpr int kTileCnt = 3 * kLine;    // cnt[kTileCnt + kLine t]: partials stored for tile t
 constexpr int kMaxSmid = 512;
@@ -81,6 +81,9 @@ struct Params {
   const uint8_t* wimg;  // die-local weight tile image (front_image)
   int tiles, item_split, item_pad;  // items >= item_split start item_pad blocks later
   short smid_item[kMaxSmid];        // SM -> work item (tile * ks + split), -1: spare
+  // Token slot g lives in W ring slot xslot[g] once that slot's last weight block is in
+  // TMEM: its empty barrier phase of parity xfree[g] (-1: the slot never holds weights).
+  signed char xslot[kMaxNS], xfree[kMaxNS];
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -243,17 +246,27 @@ struct MmaLoop {
   uint64_t a_ss, x0;
   uint32_t xstep, idesc;
   int nk, nt;
-  uint32_t xfull0, xempty0, res_bar;
+  uint32_t xfull0, xempty0, res_bar, trdy0;
 };
 template <bool kStamp>
 __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool mma, int lane) {
   const int xg = p.xg, xs = p.xs;
   uint32_t a_tm = m.a_tm, xph = 0;
-  uint64_t a_ss = m.a_ss, b = m.x0;
+  uint64_t a_ss = m.a_ss, b = m.x0 + p.xslot[0] * (kSlot >> 4);
   int jx = 0, gs = 0, g = 0;
   for (int j = 0; j < m.nk; ++j) {
     if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
-    if (j == m.nt) mbar_wait(m.res_bar, 0);
+    if (j < m.nt) {
+      // Weight block j in TMEM (the fill commits each block): the MMAs run behind the
+      // fill instead of after it.
+      mbar_wait(m.trdy0 + 8 * j, 0);
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      if (j == m.nt - 1 && lane == 0 && p.stamps) {
+        p.stamps[blockIdx.x * kStampStride + 56] = globaltimer();
+      }
+    } else if (j == m.nt) {
+      mbar_wait(m.res_bar, 0);
+    }
     if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
     if (j < m.nt) {
       if (mma) mma4_ts(m.d_tm, a_tm, b, m.idesc, j);
@@ -270,8 +283,8 @@ __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool
       if (++gs == xs) {
         gs = 0;
         xph ^= 1;
-        b = m.x0;
       }
+      b = m.x0 + p.xslot[gs] * (kSlot >> 4);
     }
     if (kStamp && lane == 0 && j < 19) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
   }
@@ -376,10 +389,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         bulk_g2s(ring_s + slot * kSlot, wblk + (i0 + slot) * kSlot, kSlot, full0 + 8 * slot);
       }
     }
-    // The token ring reuses the weight ring's memory in n x 128 B slots once the
-    // TMEM fill has read every weight slot (its commits complete in order).
+    // Token slot gs takes over W ring slot xslot[gs] as soon as that slot's last
+    // weight block is in TMEM (its empty barrier), so the tokens follow the fill and
+    // the MMAs run behind it, not after the whole fill.
     if (u < p.xs) {
-      mbar_wait(trdy0 + 8 * (nt - 1), 0);
       asm volatile("griddepcontrol.wait;" ::: "memory");
       if (u == 0) STAMP(1);
       // One op = xg token K blocks (3-D map, [xg][n][128 B] SWIZZLE_128B tiles); the
@@ -389,9 +402,14 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       uint32_t xph = 0;
       for (int g0 = 0; g0 < ng; g0 += xs, xph ^= 1) {
         for (int gs = u; gs < xs && g0 + gs < ng; gs += kIssuers) {
-          if (g0 > 0) mbar_wait(xempty0 + 8 * gs, xph ^ 1);
+          const int ws = p.xslot[gs];
+          if (g0 > 0) {
+            mbar_wait(xempty0 + 8 * gs, xph ^ 1);
+          } else if (p.xfree[gs] >= 0) {
+            mbar_wait(empty0 + 8 * ws, p.xfree[gs]);
+          }
           mbar_expect_tx(xfull0 + 8 * gs, gbytes);
-          tma_3d(ring_s + gs * gbytes, &tx, 0, kb0 + (g0 + gs) * xg, xfull0 + 8 * gs);
+          tma_3d(ring_s + ws * kSlot, &tx, 0, kb0 + (g0 + gs) * xg, xfull0 + 8 * gs);
         }
       }
     }
@@ -409,23 +427,18 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int i = 0; i < nt; ++i) {
       mbar_wait(full0 + 8 * slot, ph);
       cp4_el(ta, smem_desc(ring_s + slot * kSlot));
-      if (i + ns < nt) commit_el(empty0 + 8 * slot);
+      commit_el(trdy0 + 8 * i);       // block i in TMEM: its MMAs may run
+      commit_el(empty0 + 8 * slot);   // the slot is free: weights or tokens reuse it
       ta += 32;
       if (++slot == ns) {
         slot = 0;
         ph ^= 1;
       }
     }
-    commit_el(trdy0 + 8 * (nt - 1));
   } else if (warp == 1) {
     // kind::f16: BF16 A/B, FP32 D, K-major, M = 128 weight rows, N = n tokens.
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
-    mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
-    if (lane == 0) STAMP(56);
-    // Orders the MMAs after the fill warp's tcgen05.cp; TMA-landed operands need
-    // only their barrier.
-    asm volatile("tcgen05.fence::after_thread_sync;");
     mbar_wait(xfull0, 0);
     if (lane == 0) STAMP(6);
     __syncwarp();
@@ -439,7 +452,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
                     nt,
                     xfull0,
                     xempty0,
-                    res_bar};
+                    res_bar,
+                    trdy0};
     if (p.stamps && !(p.debug & 4)) {
       mma_loop<true>(p, m, !(p.debug & 1), lane);
     } else {
@@ -597,6 +611,7 @@ static void make_map3(CUtensorMap* m, const void* ptr, int rows, int k, int box_
 
 struct Plan {
   int na, nt_max, nr_max, ns, smem, xs, xg;
+  signed char xslot[kMaxNS], xfree[kMaxNS];
 };
 
 static int static_smem() {
@@ -617,9 +632,23 @@ static Plan plan_for(int n, int kb, int ks, int ns) {
   const int room = (kSmemBudget - static_smem() - fixed) / kSlot;
   pl.ns = ns > 0 ? ns : std::min(kMaxNS, room);
   pl.smem = fixed + pl.ns * kSlot;
-  // Token ops of xg K blocks (>= 16 KiB per op: one op completes at a time per issuer).
-  pl.xg = std::max(1, std::min(4, (kSlot + n * 128 - 1) / (n * 128)));
-  pl.xs = std::min({kMaxX, (nk_max + pl.xg - 1) / pl.xg, pl.ns * kSlot / (pl.xg * n * 128)});
+  // Token ops of xg K blocks, <= 16 KiB: one W ring slot each.
+  pl.xg = std::max(1, std::min(4, kSlot / (n * 128)));
+  pl.xs = std::min({kMaxX, (nk_max + pl.xg - 1) / pl.xg, pl.ns});
+  // Token slots take the W slots in the order their last weight block leaves for TMEM
+  // (the fill visits items in order; every CTA has nt_max TMEM blocks).
+  const int nt = pl.nt_max;
+  int last[kMaxNS], order[kMaxNS];
+  for (int s = 0; s < pl.ns; ++s) {
+    last[s] = s < nt ? s + pl.ns * ((nt - 1 - s) / pl.ns) : -1;
+    order[s] = s;
+  }
+  std::sort(order, order + pl.ns, [&](int x, int y) { return last[x] < last[y]; });
+  for (int g = 0; g < pl.xs; ++g) {
+    const int s = order[g];
+    pl.xslot[g] = static_cast<signed char>(s);
+    pl.xfree[g] = static_cast<signed char>(last[s] < 0 ? -1 : ((nt - 1 - s) / pl.ns) & 1);
+  }
   return pl;
 }
 
@@ -695,6 +724,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
                   reinterpret_cast<uintptr_t>(wimg.data_ptr()) % 1024 == 0,
               "moe_front: weight image / plan (front_image)");
   TORCH_CHECK(ks >= 1 && ks <= kMaxKs && ks <= kb && grid >= n && items <= grid && pl.nr_max <= kMaxR &&
+                  kb / ks >= pl.nt_max &&
                   pl.ns >= 2 && pl.ns <= kMaxNS && pl.xs >= 1,
               "moe_front: launch configuration (ks ", ks, ", grid ", grid, " of ", sms,
               " SMs, ring ", pl.ns, ", smem blocks ", pl.nr_max, ")");
@@ -753,6 +783,10 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
   p.nr_max = pl.nr_max;
   p.xs = pl.xs;
   p.xg = pl.xg;
+  for (int g = 0; g < kMaxNS; ++g) {
+    p.xslot[g] = g < pl.xs ? pl.xslot[g] : 0;
+    p.xfree[g] = g < pl.xs ? pl.xfree[g] : -1;
+  }
   p.yfull = y.size(1) >= rows_w ? 1 : 0;
   p.wimg = wimg.data_ptr<uint8_t>();
   p.tiles = (int)tiles;
@@ -822,7 +856,7 @@ def _cuda_src() -> str:
     device, mark, host = _FRONT_SRC.partition("// ---- host ----\n")
     if not sep or not mark:
         raise RuntimeError("moe_front: route_stage source layout changed")
-    return "#include <cuda.h>\n" + head + device + sep + tail + host
+    return "#include <cuda.h>\n#include <algorithm>\n" + head + device + sep + tail + host
 
 
 _lock = threading.Lock()
