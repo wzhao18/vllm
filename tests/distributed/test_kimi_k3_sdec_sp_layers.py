@@ -735,6 +735,10 @@ class _FeedCore:
             latent[:, :heads].copy_(stock["latent"])
             lse[:, :heads].copy_(stock["lse"])
             valid[: stock["counts"].shape[0]].copy_(stock["counts"])
+            # After the keys-on-M kernel the merge reads the rows km publishes
+            # without waiting on its predecessor grid (DcpValue km_grid): injected
+            # partials must be complete before it launches (eager run only).
+            torch.accelerator.synchronize()
             return latent, lse
 
         self.fi.decode = decode
