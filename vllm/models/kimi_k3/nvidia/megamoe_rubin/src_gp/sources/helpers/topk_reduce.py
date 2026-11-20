@@ -73,6 +73,27 @@ def st_shared_cluster_f32(address, value, peer):
 
 
 @cute.jit
+def st_async_cluster_f32(address, value, mbar, peer):
+    """``value`` into cluster CTA ``peer``'s copy of this CTA's shared ``address``, completing 4 bytes of the
+    transaction on ``peer``'s copy of the mbarrier ``mbar`` (data-borne completion: no release fence)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Uint32(address).ir_value(),
+            Float32(value).ir_value(),
+            cutlass.Uint32(mbar).ir_value(),
+            Int32(peer).ir_value(),
+        ],
+        "{ .reg .b32 dst, bar; mapa.shared::cluster.u32 dst, $0, $3; mapa.shared::cluster.u32 bar, $2, $3; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [dst], $1, [bar]; }",
+        "r,f,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+
+
+@cute.jit
 def _zero_half_mask(word):
     """Nonzero exactly when one of the word's four 16-bit halves is zero (exact for "any")."""
     return (word - Int64(0x0001000100010001)) & (word ^ Int64(-1)) & Int64(-0x7FFF7FFF7FFF8000)
@@ -1009,6 +1030,18 @@ class TopkReduce:
         smem = cutlass_utils.SmemAllocator()
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
         cluster_partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
+        if cutlass.const_expr(split > 1):
+            # vLLM-local: the row's partial sums of squares travel as st.async stores that complete bytes on the
+            # receiver's mbarrier (data-borne), not behind a release/acquire cluster barrier: barrier.cluster.arrive
+            # (release) waited for every earlier global store of the arriving thread, the cell resets included.
+            # Armed at entry (one arrival + split * 4 bytes), visible to the peers before any of them can send.
+            exchange_bar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), 8)
+            if thread_idx == Int32(0):
+                cute.arch.mbarrier_init(exchange_bar.iterator, 1)
+                cute.arch.mbarrier_init_fence()
+                cute.arch.mbarrier_arrive_and_expect_tx(exchange_bar.iterator, split * 4)
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
         if cutlass.const_expr(self.outlive_producer):
             # vLLM-local: this grid completes after its producer's unpolled stores, so a
             # dependent's griddepcontrol.wait covers both; release it at entry and a PDL
@@ -1125,9 +1158,10 @@ class TopkReduce:
             # Every CTA of the cluster gets every partial, then sums them in rank order: one total row-wide.
             if thread_idx == Int32(0):
                 for peer in cutlass.range_constexpr(split):
-                    st_shared_cluster_f32((cluster_partial.iterator + part).toint(), total, Int32(peer))
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+                    st_async_cluster_f32(
+                        (cluster_partial.iterator + part).toint(), total, exchange_bar.iterator.toint(), Int32(peer)
+                    )
+            cute.arch.mbarrier_wait(exchange_bar.iterator, 0)
             total = Float32(0)
             for peer in cutlass.range_constexpr(split):
                 total = total + cluster_partial[peer]
