@@ -229,7 +229,8 @@ def main():
 
                 t = graph_time(ours)
                 print(f"  {var}: {t:.2f} us/call  ({t_stock / t:.2f}x scaled_mm)", flush=True)
-                if dbg & 16384:  # globaltimer stamps of the last call (DenseMx8 STAMP)
+
+                def stamps(tag):
                     base = pw - 16 * g.grid
                     st = part[base:].view(torch.int64).view(g.grid, 8).double().cpu()
                     t0 = st[:, 0].min()
@@ -240,19 +241,23 @@ def main():
                         f"{nm} {rel[:, i].min():.2f}/{rel[:, i].median():.2f}/"
                         f"{rel[:, i].max():.2f}" for i, nm in enumerate(names)
                     )
-                    print(f"  {var}: stamps min/med/max us: {line}", flush=True)
+                    print(f"  {var}{tag}: stamps min/med/max us: {line}", flush=True)
                     d = {
                         "acc-xwait": rel[:, 1] - rel[:, 6], "pub": rel[:, 2] - rel[:, 1],
                         "wait": rel[:, 3] - rel[:, 2], "copy": rel[:, 4] - rel[:, 3],
                         "sum+st": rel[:, 5] - rel[:, 4], "epi": rel[:, 5] - rel[:, 1],
                     }  # fmt: skip
-                    print(f"  {var}: phases med/max us: " + " ".join(
+                    print(f"  {var}{tag}: phases med/max us: " + " ".join(
                         f"{k_} {v_.median():.2f}/{v_.max():.2f}" for k_, v_ in d.items()
                     ), flush=True)  # fmt: skip
                 if int(f.get("e", 0)):
                     print(f"  {var}: in-kernel pre-wait spin {f['e']} us: exposed "
                           f"{t - int(f['e']):.2f} us", flush=True)  # fmt: skip
+                if dbg & 16384:  # globaltimer stamps of the last call (DenseMx8 STAMP)
+                    stamps("")
                 behind(var, ours)
+                if dbg & 16384 and args.pred_us:
+                    stamps(" behind")
             except Exception as e:  # report and go on with the next variant
                 tb = traceback.format_exc().splitlines()
                 print(f"  {var}: FAILED {type(e).__name__}: {str(e)[:1500]}", flush=True)
