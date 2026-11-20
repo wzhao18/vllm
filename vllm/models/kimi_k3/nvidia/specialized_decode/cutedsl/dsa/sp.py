@@ -88,11 +88,7 @@ SP_PARTIALS = PROJECTED
 #   MlaQuery 17.2  17.4  23.7  32.3  33.4  52.5  72.4  93.1
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
-# Off at every R until dsa.query_uk is fixed: in the first block run after other
-# kernels (or a graph capture) it intermittently writes wrong q_pe bytes of row tile
-# 1 for a few heads on one rank, with its inputs bit-identical (the SP DSA block
-# test's replay check, INFRA 2026-11-20). Was "65-:local".
-SP_LOCAL_QUERY = ""
+SP_LOCAL_QUERY = "65-:local"
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere): the
 # Rubin keys-on-M kernel ("km", dsa.sparse_mla_km: softmax groups correct O^T and
 # write the latent, QK and PV from separate warps, all-TMA gathers; one row per
@@ -106,7 +102,14 @@ SP_LOCAL_QUERY = ""
 # km is flat up to one row per SM; trtllm-gen steps at ~106 rows, km at 213 (two
 # rows on some CTAs). In-step (D3-32 slice, fastab dsk2-km65): 128 rows -29.5 us per
 # step, 256 rows +11.9; 384 rows: km since dattn-kmg/kmh (step -14 us).
-SP_KERNELS = "107-212:km,320-:km"
+# The latent-Q-in-TMEM kernel ("ts", dsa.sparse_mla_ts: the prefill TS form with the
+# trtllm-gen arithmetic) from 64 rows: VR200 1 GPU, CUDA graphs, cold L2, us at 128 /
+# 256 / 384 rows: ts 16.0 / 28.8 / 30.1, trtllm-gen 21.5 / 28.2 / 34.9, km 16.0 / 29.2 /
+# 31.5 (runs/D-ATTN/r3 e8); in-step vs int21 (trtllm-gen at 128 / 256, km at 384 rows;
+# fastab dattn3-ts1/ts2, 3 build pairs) -43.3 / -25.6 / -39.2 us per step. Below 64
+# rows trtllm-gen splits each row's KV across CTAs (BF16 partials), which an unsplit
+# pass does not reproduce to the BF16 rounding of the output: those stay on trtllm-gen.
+SP_KERNELS = "64-:ts"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
