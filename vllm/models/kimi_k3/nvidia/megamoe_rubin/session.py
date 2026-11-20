@@ -54,7 +54,7 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 
 # Fused shared expert: shared FC2 after the routed work ("tail") or right after shared
 # FC1, under the dispatch ("early").
-RUBIN_FUSED_SHARED_L2_POSITION = "early"
+RUBIN_FUSED_SHARED_L2_POSITION = __import__("os").environ.get("DMS_SHPOS", "early")  # DIAG ONLY (D-MOE-STREAM)
 
 
 def compile_cache_key(

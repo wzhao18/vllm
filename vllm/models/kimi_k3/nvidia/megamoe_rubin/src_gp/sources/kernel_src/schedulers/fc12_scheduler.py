@@ -125,6 +125,7 @@ class SharedExpertStreamMixin:
         self._shared_stage = None
         self._shared_next = None
         self._routed_done = None
+        self._routed_fc2_seen = None
         self.shared_fc2_position = None
         self._shared_fc1_swizzle = 0
         if not (impl_desc.get("shared_expert_stream", False) and problem_desc.get("shared_expert", False)):
@@ -154,8 +155,8 @@ class SharedExpertStreamMixin:
         if position is None or position == "auto":
             # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its tiles.
             position = "early" if self._shared_phase_tiles[1] <= self.compute_cluster_count else "tail"
-        if position not in ("early", "tail"):
-            raise ValueError(f"shared_l2_position must be 'auto', 'early' or 'tail', got {position!r}.")
+        if position not in ("early", "mid", "tail"):
+            raise ValueError(f"shared_l2_position must be 'auto', 'early', 'mid' or 'tail', got {position!r}.")
         self.shared_fc2_position = position
         swizzle = int(impl_desc.get("shared_fc1_swizzle") or 0)
         if swizzle < 0:
@@ -188,6 +189,7 @@ class SharedExpertStreamMixin:
             # Grid-stride only: this cluster's next shared id in the current stage.
             self._shared_next = Int32(block_idx[2])
             self._routed_done = Boolean(False)
+            self._routed_fc2_seen = Boolean(False)
 
     @cute.jit
     def _wait_expert_sizes_ready(self, sizes_ready: Boolean) -> Boolean:
@@ -265,11 +267,17 @@ class SharedExpertStreamMixin:
         stage = self._shared_stage
         next_id = self._shared_next
         routed_done = self._routed_done
+        routed_fc2_seen = self._routed_fc2_seen
         work_tile = make_fc12_done_tile(True)
         if stage == Int32(_SHARED_FC1):
             work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 0)
         if cutlass.const_expr(self.shared_fc2_position == "early"):
             if stage == Int32(_SHARED_FC2):
+                work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
+        if cutlass.const_expr(self.shared_fc2_position == "mid"):
+            # Mid: shared FC2 right after this cluster's first routed FC2 tile, i.e. once the routed FC1 ids are
+            # exhausted; by then every shared FC1 tile was claimed long before, so the FC2 B wait is short.
+            if (not work_tile.is_valid_tile) & routed_fc2_seen & (stage == Int32(_SHARED_FC2)):
                 work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(work_id_worker, stage, next_id, 1)
         if not work_tile.is_valid_tile:
             if not routed_done:
@@ -281,7 +289,10 @@ class SharedExpertStreamMixin:
                 work_id_worker = self._work_id_worker
                 if not work_tile.is_valid_tile:
                     routed_done = Boolean(True)
-            if cutlass.const_expr(self.shared_fc2_position == "tail"):
+                if cutlass.const_expr(self.shared_fc2_position == "mid"):
+                    if work_tile.is_valid_tile & (work_tile.phase == Int32(BlockPhase.Linear2)):
+                        routed_fc2_seen = Boolean(True)
+            if cutlass.const_expr(self.shared_fc2_position in ("mid", "tail")):
                 if routed_done & (stage == Int32(_SHARED_FC2)):
                     work_tile, stage, next_id, work_id_worker = self._claim_shared_tile(
                         work_id_worker, stage, next_id, 1
@@ -289,11 +300,16 @@ class SharedExpertStreamMixin:
         self._shared_stage = stage
         self._shared_next = next_id
         self._routed_done = routed_done
+        self._routed_fc2_seen = routed_fc2_seen
         self._work_id_worker = work_id_worker
         return work_tile
 
     def _shared_carried_names(self) -> tuple:
-        return ("_shared_stage", "_shared_next", "_routed_done") if self.shared_fc2_position is not None else ()
+        if self.shared_fc2_position is None:
+            return ()
+        if self.shared_fc2_position == "mid":
+            return ("_shared_stage", "_shared_next", "_routed_done", "_routed_fc2_seen")
+        return ("_shared_stage", "_shared_next", "_routed_done")
 
     def _extract_shared_stream_values(self) -> list:
         values = list(extract_mlir_values(self._expert_sizes_ready))
@@ -308,6 +324,7 @@ class SharedExpertStreamMixin:
                 setattr(result, name, value)
         result._expert_sizes_ready = rebuild(self._expert_sizes_ready)
         result._routed_done = None
+        result._routed_fc2_seen = None
         for name in self._shared_carried_names():
             setattr(result, name, rebuild(getattr(self, name)))
 

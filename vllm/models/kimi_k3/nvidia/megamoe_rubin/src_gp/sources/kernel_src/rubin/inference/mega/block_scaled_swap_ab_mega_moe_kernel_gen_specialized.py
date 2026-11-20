@@ -98,6 +98,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.dsl_helpers import ReadyFlag, wait_ready, spin_wait
 from .....helpers.iket_compat import iket
+from . import dms_diag
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.topk_reduce import TopkReduce, check_reduce_operand_alignment
@@ -712,6 +713,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             raise ValueError("Fixed kernel components leave no SMEM budget for the Mainloop.")
 
         mainloop_impl_desc = ImplDesc({**resolved_impl_desc, "mainloop_smem_budget_bytes": mainloop_smem_budget_bytes})
+        if dms_diag.PLAN:
+            print("DMS_PLAN smem_limit", smem_limit, "fixed", fixed_component_bytes, "occupancy", self.occupancy,
+                  "launch_clusters", resolved_impl_desc.get("launch_cluster_count"), flush=True)
         mainloop = BlockScaledSwapAbFc12MainloopGenSpecialized(problem_desc, mainloop_impl_desc)
 
         mainloop.register_smem_regions(smem_workspace)
@@ -1637,6 +1641,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         if warp_idx == self.scheduler_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             iket.range_push("genphase.scheduler")
+            dms_diag.tl_stamp(dms_diag.TL_MISC, 0, Int32(0))
             if cutlass.const_expr(self.schedule_mode == "decode" and not self.shared_expert):
                 # The decode scheduler has no expert-sizes gate of its own: wait for the published sizes here
                 # (with the fused shared expert its stream takes the gate after the shared FC1 claims).
@@ -1648,6 +1653,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     sleep_cycles=150,
                 )
                 iket.range_pop()
+                dms_diag.tl_stamp(dms_diag.TL_MISC, 1, Int32(0))
             if cutlass.const_expr(self.schedule_mode == "decode" and self.decode_lead is not None):
                 # Mandatory for a decode lead: the exact layout's K per stream (decode scheduler docstring), once,
                 # all lanes, before the first claim. Without a lead and for grouped / PI: no code.
@@ -1683,6 +1689,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             if cutlass.const_expr(self.schedule_mode == "decode"):
                 # Drain peers' DSMEM arrives before the leader can exit; see finish_claim_channel.
                 scheduler.finish_claim_channel()
+            dms_diag.tl_stamp(dms_diag.TL_MISC, 2, published)
             iket.range_pop()
             iket.range_pop()
 
@@ -1865,6 +1872,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         # CTAs with no work can finish the epilogue before gather warps pass
         # their readiness waits. Join every role before clearing those flags.
         cute.arch.sync_threads()
+        if warp_idx == Int32(self.epilogue_warp_ids[0]):
+            dms_diag.tl_stamp(dms_diag.TL_MISC, 6, Int32(0))
         # No CTA may leave while a cluster peer can still touch its shared memory: the
         # scheduler's work-id broadcast releases, the pipelines' consumer releases and the
         # multicast legs arrive on peer CTAs, and the last of them are issued after the
@@ -1883,6 +1892,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             iket.range_push("tail.arrive")
             cute.arch.barrier(barrier_id=self.tail_barrier_id, number_of_threads=epilogue_thread_count)
             iket.range_pop()
+            if warp_idx == Int32(self.epilogue_warp_ids[0]):
+                dms_diag.tl_stamp(dms_diag.TL_MISC, 7, Int32(0))
             # Release the top-k reduce launch: it is a programmatic dependent that waits
             # for this grid's completion itself, so it can be resident before the tail ends.
             cute.arch.griddepcontrol_launch_dependents()
@@ -1898,6 +1909,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
+                dms_diag.tl_stamp(dms_diag.TL_MISC, 9, is_last)
                 if is_last != Int32(0):
                     # The last arriver has acquired every other CTA's arrival, so nothing on
                     # this rank reads the tail span any more: reset it, then meet the peers.
@@ -1911,6 +1923,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     self.tail.reset_tail_space(self._device_workspace, lane_idx, 32)
                     cute.arch.sync_warp()
                     iket.range_pop()
+                    dms_diag.tl_stamp(dms_diag.TL_MISC, 10, Int32(0))
                     iket.range_push("tail.nvlink_barrier")
                     if lane_idx == Int32(0):
                         epoch = self.tail.read_epoch(self._device_workspace)
@@ -1924,6 +1937,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                             # flags do (wait_previous_done in the comm kernel's pushers).
                             self.tail.signal_done(self._device_workspace, peer_rank_ptr_mapper, epoch)
                     iket.range_pop()
+                    dms_diag.tl_stamp(dms_diag.TL_MISC, 8, Int32(0))
 
         if cutlass.const_expr(self.schedule_mode == "decode"):
             # Release/acquire keeps each CTA's shared memory alive through its peers'

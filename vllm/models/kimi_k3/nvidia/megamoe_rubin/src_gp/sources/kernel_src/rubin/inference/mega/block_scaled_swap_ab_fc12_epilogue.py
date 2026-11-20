@@ -48,6 +48,7 @@ from ......common.utils import round_up
 from .....helpers.dsl_helpers import ReadyFlag, wait_ready
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
+from . import dms_diag
 from ......common.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
@@ -1536,6 +1537,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         )
 
         routed_ready = cutlass.Int32(0)
+        dms_unit = cutlass.Int32(0)
         while work_tile_info.is_valid_tile:
             tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
             cur_phase = work_tile_info.phase
@@ -1567,6 +1569,7 @@ class SwapABGatedActEpilogue(KernelComponent):
                 )
             prev_work_tile_info = work_tile_info
             prev_is_fc1 = is_fc1
+            dms_diag.tl_stamp(dms_diag.TL_EPI_END, dms_unit, dms_diag.tile_info(work_tile_info))
 
             acc_consumer_state.advance()
 
@@ -1588,6 +1591,8 @@ class SwapABGatedActEpilogue(KernelComponent):
                     flag_tracker = flag_tracker.drained()
 
             work_tile_info = sched_consumer.consume_work()
+            dms_diag.tl_stamp(dms_diag.TL_EPI_FETCH, dms_unit, cutlass.Int32(0))
+            dms_unit = dms_unit + cutlass.Int32(1)
 
             if not publish_before_fetch:
                 # Every asynchronous store commits at issue; drain before completion or scratch reuse.

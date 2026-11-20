@@ -37,6 +37,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 # DIAGNOSTIC ONLY (never lands): DMS_SFSKIP=1 skips the per-stage SFB S2T copies, 2 also SFA (timing, wrong numerics).
 _DMS_SFSKIP = int(_dms_os.environ.get("DMS_SFSKIP", "0"))
+# DIAGNOSTIC ONLY: DMS_BFIX=1 points every FC1 Gather-B row at the first rows of the pool (L2-hot B, same bytes/ops).
+_DMS_BFIX = _dms_os.environ.get("DMS_BFIX") == "1"
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
@@ -62,6 +64,7 @@ from .....quant_def import QuantKind
 from ....schedulers.base import SchedulerConsumer
 from ....schedulers.fc12_mapping import BlockPhase
 from . import dynamic_mainloop
+from . import dms_diag
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .shared_expert_mainloop import SharedKindMainloopMixin
 from .tma_gather import sm107_tma_gather4_load
@@ -529,6 +532,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             return weight_stages, token_stages
 
         self.num_weight_ab_stages, self.num_token_ab_stages = plan_stages()
+        if dms_diag.PLAN:
+            print(
+                "DMS_PLAN budget", self.mainloop_smem_budget_bytes, "weight_stages", self.num_weight_ab_stages,
+                "token_stages", self.num_token_ab_stages, "asym", self.uses_asymmetric_ab_stages,
+                "w_stage_B", weight_stage_cost_bytes, "t_stage_B", token_stage_cost_bytes,
+                "tile", self.mma_tiler_mnk, "cluster", self.cluster_shape_mn, "2cta", self.use_2cta_instrs,
+                "acc_stages", self.num_accumulator_pipeline_stages, flush=True,
+            )
         # Retained for the callers that size one pipeline's state: under the shared
         # plan both depths are this, and under the split plan the weight side is
         # the one the MMA's primary state follows.
@@ -1276,8 +1287,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         if cutlass.const_expr(progress_mbarrier is not None):
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(progress_mbarrier)
+        dms_unit = Int32(0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
+            dms_diag.tl_stamp(dms_diag.TL_A_START, dms_unit, dms_diag.tile_info(work_tile))
             # The fixed FC1 / FC2 range names the iket summaries key on (shared tiles count with their GEMM).
             if self._is_fc1_gemm(phase):
                 iket.range_push("tma_weight_fc1")
@@ -1336,6 +1349,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     ab_pipeline_state,
                 )
             iket.range_pop()
+            dms_diag.tl_stamp(dms_diag.TL_A_END, dms_unit, k_tile_count)
+            dms_unit = dms_unit + Int32(1)
             work_tile = sched_consumer.consume_work()
             if cutlass.const_expr(progress_mbarrier is not None):
                 with cute.arch.elect_one():
@@ -1346,6 +1361,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             # the polling top-k reduce may become resident while it drains.
             cute.arch.griddepcontrol_launch_dependents()
         ab_pipeline.producer_tail(ab_pipeline_state)
+        dms_diag.tl_stamp(dms_diag.TL_MISC, 3, dms_unit)
 
     @cute.jit
     def _issue_tma_b_tile(
@@ -1537,6 +1553,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         routed_shared_sfb2 = None if self.heterogeneous_shared else shared_fc2_sfb_exec_atom
 
         work_tile = sched_consumer.consume_work()
+        dms_unit = Int32(0)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
             is_fc1 = phase == Int32(BlockPhase.Linear1)
@@ -1557,10 +1574,11 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block)) * Int32(
                     fc1_sf_parts_per_block
                 )
-                spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
+                if cutlass.const_expr(dms_diag.NODEP < 2):
+                    spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
             else:
                 # FC2 waits for its token block's FC1 tiles, shared FC2 for the shared ones; shared FC1 has no wait.
-                if cutlass.const_expr(not self.shared_enabled):
+                if cutlass.const_expr(not self.shared_enabled and dms_diag.NODEP < 1):
                     counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
                     spin_wait(
                         fc1_done_counter_pointer + counter_slot,
@@ -1568,7 +1586,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         sleep_cycles=500,
                         peek_status=work_tile.peek_ready,
                     )
-                else:
+                elif cutlass.const_expr(dms_diag.NODEP < 1):
                     if phase != Int32(BlockPhase.SharedLinear1):
                         counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
                         wait_address = (fc1_done_counter_pointer + counter_slot).toint()
@@ -1583,6 +1601,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                             peek_status=work_tile.peek_ready,
                         )
             iket.range_pop()
+            dms_diag.tl_stamp(dms_diag.TL_B_READY, dms_unit, dms_diag.tile_info(work_tile))
 
             if cutlass.const_expr(self.heterogeneous_shared):
                 if self._is_shared_phase(phase):
@@ -1648,9 +1667,11 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     is_fc1,
                 )
             iket.range_pop()
+            dms_unit = dms_unit + Int32(1)
             work_tile = sched_consumer.consume_work()
 
         ab_pipeline.producer_tail(ab_pipeline_state)
+        dms_diag.tl_stamp(dms_diag.TL_MISC, 5, dms_unit)
 
     @cute.jit
     def run_tma_gather_b1(
@@ -1739,6 +1760,12 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                                 tile_pool_base + cta_row_base + run_row + Int32(row_in_run)
                             ) % Int32(gather_source_rows)
 
+                if cutlass.const_expr(_DMS_BFIX):
+                    for local_run in cutlass.range_constexpr(self.gather_b_runs_per_unit):
+                        for row_in_run in cutlass.range_constexpr(self.gather_index_load_rows):
+                            row_ids[local_run * self.gather_index_load_rows + row_in_run] = Int32(
+                                local_run * self.gather_index_load_rows + row_in_run
+                            )
                 for k_tile_idx in cutlass.range(self.fc1_k_tile_count, unroll=1):
                     # TMA-B has already acquired this stage and contributed its
                     # stage-specific transaction expectation. The named barrier orders that
@@ -1855,9 +1882,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                if cutlass.const_expr(_DMS_SFSKIP < 2):
+                if cutlass.const_expr(_DMS_SFSKIP < 2 and not dms_diag.NOMMA):
                     cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                for instruction_index in cutlass.range_constexpr(self.num_mma_instructions_per_ab_stage if _DMS_SFSKIP < 1 else 0):
+                for instruction_index in cutlass.range_constexpr(self.num_mma_instructions_per_ab_stage if (_DMS_SFSKIP < 1 and not dms_diag.NOMMA) else 0):
                     # Rest_Tiler order: N0K0, N128K0, N0K64, N128K64.
                     lower_n_lower_k_source_coord = (None, 0, None, instruction_index, ab_pipeline_state.index)
                     lower_n_lower_k_destination_coord = (None, 0, None, instruction_index)
@@ -1876,19 +1903,20 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=tmem_sfb,
-                    valid_tokens_in_tile=valid_tokens_in_cta_tile,
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=self.num_mma_instructions_per_ab_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                if cutlass.const_expr(not dms_diag.NOMMA):
+                  dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                      quant_kind=quant_kind,
+                      acc_tensor=accumulator,
+                      a_window_frag=a_stage_frag,
+                      b_window_frag=b_stage_frag,
+                      sfa_window_tensor=tmem_sfa,
+                      sfb_window_tensor=tmem_sfb,
+                      valid_tokens_in_tile=valid_tokens_in_cta_tile,
+                      mma_instruction_mnk=mma_instruction_mnk,
+                      window_instruction_offset=0,
+                      window_instruction_count=self.num_mma_instructions_per_ab_stage,
+                      first_instruction_accumulate=k_tile_idx != 0,
+                  )
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
@@ -1905,26 +1933,27 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
-                if cutlass.const_expr(_DMS_SFSKIP < 2):
+                if cutlass.const_expr(_DMS_SFSKIP < 2 and not dms_diag.NOMMA):
                     cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
-                if cutlass.const_expr(_DMS_SFSKIP < 1):
+                if cutlass.const_expr(_DMS_SFSKIP < 1 and not dms_diag.NOMMA):
                     cute.copy(tiled_copy_sfb, partitioned_smem_sfb[s2t_stage_coord], partitioned_tmem_sfb)
 
                 a_stage_frag = fragment_a[(None, None, None, ab_pipeline_state.index)]
                 b_stage_frag = fragment_b[(None, None, None, ab_pipeline_state.index)]
-                dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
-                    quant_kind=quant_kind,
-                    acc_tensor=accumulator,
-                    a_window_frag=a_stage_frag,
-                    b_window_frag=b_stage_frag,
-                    sfa_window_tensor=tmem_sfa,
-                    sfb_window_tensor=tmem_sfb,
-                    valid_tokens_in_tile=valid_tokens_in_cta_tile,
-                    mma_instruction_mnk=mma_instruction_mnk,
-                    window_instruction_offset=0,
-                    window_instruction_count=self.num_mma_instructions_per_ab_stage,
-                    first_instruction_accumulate=k_tile_idx != 0,
-                )
+                if cutlass.const_expr(not dms_diag.NOMMA):
+                  dynamic_mainloop.issue_dynamic_block_scaled_mma_window(
+                      quant_kind=quant_kind,
+                      acc_tensor=accumulator,
+                      a_window_frag=a_stage_frag,
+                      b_window_frag=b_stage_frag,
+                      sfa_window_tensor=tmem_sfa,
+                      sfb_window_tensor=tmem_sfb,
+                      valid_tokens_in_tile=valid_tokens_in_cta_tile,
+                      mma_instruction_mnk=mma_instruction_mnk,
+                      window_instruction_offset=0,
+                      window_instruction_count=self.num_mma_instructions_per_ab_stage,
+                      first_instruction_accumulate=k_tile_idx != 0,
+                  )
 
                 ab_pipeline.consumer_release(ab_pipeline_state)
                 ab_pipeline_state.advance()
@@ -2095,6 +2124,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             pipeline.PipelineUserType.Producer, self.num_accumulator_pipeline_stages
         )
         work_tile = sched_consumer.consume_work()
+        dms_unit = Int32(0)
         while work_tile.is_valid_tile:
             k_tile_count = self._phase_k_tile_count(work_tile.phase)
             accumulator_stage_index = acc_producer_state.index
@@ -2129,6 +2159,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                             *shared_views[4:],
                         )
                 acc_pipeline.producer_acquire(acc_producer_state)
+                dms_diag.tl_stamp(dms_diag.TL_MMA_START, dms_unit, dms_diag.tile_info(work_tile))
                 if cutlass.const_expr(self.heterogeneous_shared):
                     if self._is_shared_phase(work_tile.phase):
                         ab_pipeline_state, token_pipeline_state = mma_tile(
@@ -2169,11 +2200,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         token_pipeline,
                         token_pipeline_state,
                     )
+                dms_diag.tl_stamp(dms_diag.TL_MMA_END, dms_unit, k_tile_count)
                 acc_pipeline.producer_commit(acc_producer_state)
 
             acc_producer_state.advance()
+            dms_unit = dms_unit + Int32(1)
             work_tile = sched_consumer.consume_work()
         acc_pipeline.producer_tail(acc_producer_state)
+        dms_diag.tl_stamp(dms_diag.TL_MISC, 4, dms_unit)
 
 
 __all__ = ["BlockScaledSwapAbFc12MainloopGenSpecialized"]
