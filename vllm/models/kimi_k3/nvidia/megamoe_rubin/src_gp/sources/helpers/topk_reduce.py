@@ -34,7 +34,7 @@ from ..quant_def import CombineFormat
 from vllm.models.kimi_k3.nvidia.megamoe_rubin.src.fi_numerics.moe_ep_batch_invariant.nvfp4_device import PackedF32
 from ...common.megamoe_constants import Nvfp4E2M1RcpLimit
 from ...common.dsl_helpers import mark_alignment
-from ...common.ptx_helpers import cvt_e2m1_to_fp32_cvt_ptx, cvt_e2m1_to_fp32_optimal_ptx, nanosleep
+from ...common.ptx_helpers import cvt_e2m1_to_fp32_cvt_ptx, cvt_e2m1_to_fp32_optimal_ptx, nanosleep, read_globaltimer_ns
 
 
 
@@ -1006,6 +1006,7 @@ class TopkReduce:
             hidden_tile_idx = part * Int32(tiles_per_cta) + thread_idx
             active = (thread_idx < Int32(tiles_per_cta)) & (hidden_tile_idx < Int32(hidden_tiles))
 
+        dbg_t0 = read_globaltimer_ns()  # DIAG D-MOE-EP32 (not for landing)
         smem = cutlass_utils.SmemAllocator()
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
         cluster_partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
@@ -1113,6 +1114,7 @@ class TopkReduce:
         if lane_idx == Int32(0):
             partial[warp_idx] = sumsq
         cute.arch.sync_threads()
+        dbg_t1 = read_globaltimer_ns()  # DIAG: every cell of the row valid + folded
         total = Float32(0)
         for w in cutlass.range_constexpr(warps):
             total = total + partial[w]
@@ -1134,9 +1136,14 @@ class TopkReduce:
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
             store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
             cute.copy(store_atom, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
+        dbg_tw = read_globaltimer_ns()  # DIAG: row normalized + stored (before the producer wait)
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):
                 self._wait_producer(producer_done)
+        if thread_idx == Int32(0):
+            if (token_idx == Int32(0)) | (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)):
+                dbg_t2 = read_globaltimer_ns()
+                cute.printf("EP32DIAG RED tok={} n={} t0={} t1={} t2={} tw={}", token_idx, cute.arch.grid_dim()[0], dbg_t0, dbg_t1, dbg_t2, dbg_tw)
 
     @cute.kernel
     def _reduce_persistent(

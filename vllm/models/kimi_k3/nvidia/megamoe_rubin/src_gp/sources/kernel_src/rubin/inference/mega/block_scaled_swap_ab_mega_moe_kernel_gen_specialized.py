@@ -98,6 +98,7 @@ from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.dsl_helpers import ReadyFlag, wait_ready, spin_wait
 from .....helpers.iket_compat import iket
+from ......common.ptx_helpers import read_globaltimer_ns
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.topk_reduce import TopkReduce, check_reduce_operand_alignment
@@ -1889,6 +1890,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             if warp_idx == Int32(self.epilogue_warp_ids[0]):
                 lane_idx = cute.arch.lane_idx()
                 is_last = Int32(0)
+                dbg_tx = read_globaltimer_ns()  # DIAG D-MOE-EP32: tail arrive (before the arrival atomics)
                 if lane_idx == Int32(0):
                     if cutlass.const_expr(self.reduce_acquires_producer_done):
                         # The reduce's completion orders the shared output through this arrival.
@@ -1898,7 +1900,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     if self.tail.arrive(self._device_workspace, Int32(self.promised_launchable_sm_count)):
                         is_last = Int32(1)
                 is_last = Int32(cute.arch.shuffle_sync(is_last, Int32(0)))
+                dbg_ty = read_globaltimer_ns()  # DIAG: arrival atomics + tail.arrive returned
                 if is_last != Int32(0):
+                    if lane_idx == Int32(0):
+                        cute.printf("EP32DIAG TAIL arrive={} atomic_done={}", dbg_tx, dbg_ty)
                     # The last arriver has acquired every other CTA's arrival, so nothing on
                     # this rank reads the tail span any more: reset it, then meet the peers.
                     if cutlass.const_expr(self.lazy_comm_waits):
@@ -1922,7 +1927,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                             # The standalone reduce polls its cells itself, so nothing in
                             # this call waits for the peers: only the next call's payload
                             # flags do (wait_previous_done in the comm kernel's pushers).
+                            dbg_ta = read_globaltimer_ns()  # DIAG D-MOE-EP32 (not for landing)
                             self.tail.signal_done(self._device_workspace, peer_rank_ptr_mapper, epoch)
+                            dbg_tb = read_globaltimer_ns()
+                            cute.printf("EP32DIAG MAIN last_arrive={} signal_done_end={}", dbg_ta, dbg_tb)
                     iket.range_pop()
 
         if cutlass.const_expr(self.schedule_mode == "decode"):
