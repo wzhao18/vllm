@@ -53,7 +53,7 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
         # R257-384: swap_ab 2-CTA M256 (W) x N192 (tokens), 6 smem stages: 315 vs 361 MB
         # SM-delivered at R384, cold chain 16.13 vs 16.83 us/call (D-GEMM R4-7)
-        (257, 384, ((256, 192), (2, 1), True, 256), 4, 6),
+        (257, 384, ((256, 192), (2, 1), True, 256), 4),
         (385, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
@@ -72,7 +72,11 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
 # die's rows). VR200 D-GEMM R6-2 (cold chain, us/call): kda_in R384 swap 256x192
 # uncapped die-local 15.11 vs striped cap 6 16.06; a coupled ring needs >= ~160 KB of
 # weight in flight per SM for the die-local rate.
-DIE_LOCAL: dict[tuple[int, int], int] = {(12448, 7168): 256}
+DIE_LOCAL: dict[tuple[int, int], int] = {}
+# "pre" rows whose CTAs claim tiles from one counter in weight-unit-major order (the
+# token tiles of a weight pair start together, so its second weight read hits L2):
+# VR200 D-GEMM R6 E8 kda_in R384 swap 256x192 uncapped, cold chain 15.58 vs 16.24 us
+CLAIM_ORDER: dict[tuple[int, int], tuple[int, int]] = {(12448, 7168): (257, 384)}
 PRE_DIE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
         (1, 128, ((128, 64), (1, 1), False, 128), 8),
@@ -282,6 +286,8 @@ class Mxfp8Projection:
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
                     max_stages=found[2], die_rows=die_rows, device=weight.device,
+                    claim_order=die_rows is None
+                    and CLAIM_ORDER.get((n, k), (0, -1))[0] <= r <= CLAIM_ORDER.get((n, k), (0, -1))[1],
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)

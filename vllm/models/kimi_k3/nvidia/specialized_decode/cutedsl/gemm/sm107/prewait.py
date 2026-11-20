@@ -96,7 +96,7 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_rows=None, max_stages=0,
-                 push=False, device=None):
+                 push=False, claim_order=False, device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
@@ -118,7 +118,7 @@ class Mxfp8PreGemm:
         self.push = int(push)
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
-            int(producers), int(prefetch), int(tile_k), die_rows is not None,
+            int(producers), int(prefetch), int(tile_k), die_rows is not None or claim_order,
             int(max_stages), self.push,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
@@ -126,8 +126,9 @@ class Mxfp8PreGemm:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
         self.aux, self.calls = None, 0
-        if die_rows is not None:
-            self.aux = self._die_aux(tactic, rows, n, die_rows, device)
+        if die_rows is not None or claim_order:
+            self.aux = self._die_aux(tactic, rows, n, n if claim_order else die_rows, device,
+                                     order_only=claim_order)
         self.out_layout = "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
@@ -173,7 +174,7 @@ class Mxfp8PreGemm:
         return args
 
     @staticmethod
-    def _die_aux(tactic, rows, n, die_rows, device):
+    def _die_aux(tactic, rows, n, die_rows, device, order_only=False):
         """alpha + die-claim state for weight rows [0, die_rows) homed on die 0: int32
         [4..6] counters (die 0, die 1, done), [8..11] (first claim, claims) per die, [12]
         token units per weight unit, [13] batch (1), [16 + smid] die of the SM. A claim
@@ -184,14 +185,18 @@ class Mxfp8PreGemm:
         if tuple(cluster) not in ((1, 1), (2, 1)) or (cluster[0] == 2) != (inst_m == 256):
             raise ValueError(f"die_claim: tactic {tactic} (1x1, or 2x1 with a 2-CTA MMA)")
         w_rows, t_rows = (tile[0], tile[1]) if swap else (tile[1], tile[0])
-        if die_rows % w_rows:
+        if die_rows % w_rows and not order_only:
             raise ValueError(f"die_claim: die split row {die_rows} % {w_rows} weight rows")
         w_units, t_units = -(-n // w_rows), -(-rows // t_rows)
         total = w_units * t_units
         if total > _max_active_clusters(cluster[0] * cluster[1]):
             raise ValueError(f"die_claim needs one tile per cluster ({total} tiles)")
+        # order_only: one claim counter for every SM (weight-unit-major order, so the token
+        # units of a weight unit run together and its second read hits L2), no die homing
         table = sm_domains(device.index or 0)
-        c0 = min(die_rows // w_rows, w_units) * t_units
+        if order_only:
+            table = (0,) * len(table)
+        c0 = total if order_only else min(die_rows // w_rows, w_units) * t_units
         aux = torch.zeros(2, 272, dtype=torch.float32, device=device)
         ints = aux.view(torch.int32)
         aux[:, 0] = 1.0
