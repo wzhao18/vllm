@@ -37,6 +37,8 @@ DEFAULT_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8")
 # tiles per M sweep with its weight half homed on it; MXFP8 stores evict-first
 # so they do not push the die's weight half out of its L2.
 DIE_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8+die3+sef")
+# DIAGNOSTIC (never land): cap on the persistent grid (clusters); the step uses it.
+MAC_CAP = 16
 _COMPILED: dict = {}
 
 
@@ -159,12 +161,14 @@ class SharedSituGemm:
             from_dlpack(self.situ_k),
         )  # fmt: skip
         if self._compiled is None:
-            key = (self.tactic, self.a_pow, self.clamp_up, x.device.index, self.n, self.k)
+            key = (self.tactic, self.a_pow, self.clamp_up, x.device.index, self.n, self.k, MAC_CAP)
             self._compiled = _COMPILED.get(key)
             if self._compiled is None:
                 gemm = _Kernel(self.tactic, self.a_pow, self.clamp_up)
                 cl = self.tactic[1]
                 mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
+                if MAC_CAP:
+                    mac = min(mac, MAC_CAP)
                 layouts = (
                     OperandMajorMode.K,
                     OperandMajorMode.K,

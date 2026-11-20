@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--m", type=int, default=16384)
     ap.add_argument("--inter", type=int, default=6144)
     ap.add_argument("--k", type=int, default=7168)
-    ap.add_argument("--variant", default="die", choices=["die", "c2x4", "cublas", "latent"])
+    ap.add_argument("--variant", default="die", choices=["die", "c2x4", "cublas", "latent", "stock"])
     ap.add_argument("--secs", type=float, default=40.0)
     ap.add_argument("--every", type=float, default=2.0)
     ap.add_argument("--gap-us", type=float, default=0.0)
@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--corun-seq", action="store_true", help="co-run GEMM after, same stream")
     ap.add_argument("--tactic", type=json.loads, default=None, help="tactic JSON override")
     ap.add_argument("--b3-time", action="store_true", help="time the B3 call alone in co-run mode")
+    ap.add_argument("--mac", type=int, default=-1, help="cluster cap (diag MAC_CAP; 0 = none)")
     args = ap.parse_args()
 
     import pynvml as N
@@ -52,6 +53,8 @@ def main():
         shared_situ_gemm as ssg,
     )
 
+    if args.mac >= 0:
+        ssg.MAC_CAP = args.mac
     N.nvmlInit()
     h = N.nvmlDeviceGetHandleByUUID("GPU-" + str(torch.cuda.get_device_properties(0).uuid))
     samples, stop = [], [False]
@@ -96,6 +99,9 @@ def main():
     if args.variant == "cublas":
         def fn0():
             scaled_mm(x, sx, w, sw)
+    elif args.variant == "stock":
+        def fn0():
+            mxfp8_act.situ_and_mul_quantize_auto(scaled_mm(x, sx, w, sw), 4.0, 25.0, out=act)
     elif args.variant == "latent":
         xl = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
         wlat = torch.randn(3584, k, device=dev, dtype=torch.bfloat16) * 0.02
