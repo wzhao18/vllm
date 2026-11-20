@@ -422,8 +422,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     V2DBG(10);
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
-      // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
-      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+      // its share of q + 512 keys (8-key groups of adjacent tokens correlate: q + 256 left
+      // fewer than q candidates on ~3 of 1M rows, each costing the DCP group the complete body)
+      const uint32_t want = (q + 512u + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -699,9 +700,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) Sx[kV2Fine] = s_beyond;
         __syncthreads();
-        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
-        // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
-        // candidates (32 keys per bin, the whole key range) locate it; rebase there
+        if (K31_LIKELY(pass == 1 || s_e >= 0)) break;
+        // the q-th key lies outside the fine range: above it (a wide upper tail), or below
+        // it when the sample's estimate of the q-th key was high (the range starts kV2Fine / 2
+        // under that estimate, above theta). Every candidate is >= theta and nc >= q, so
+        // coarse counts of the candidates (32 keys per bin, the whole key range) locate it;
+        // rebase there (pass 1 then finds e in [fb, fb + kV2Fine))
         V2STAT(7);
         for (int x = tid; x < kV2Fine; x += kV2T) hist[x] = 0;
         if (tid == 0) s_i[12] = -1;
