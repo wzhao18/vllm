@@ -47,7 +47,7 @@ from ..common import mx_rows
 from ..common.host import architecture, dynamic_fake, fake
 from ..common.mailbox import poll, rearm
 from ..common.primitives import asm, at, launch, load_words, store_relaxed
-from ..common.sp_comm import READY_WORDS, positive_zero32
+from ..common.sp_comm import READY_STRIDE, READY_WORDS, positive_zero32
 from .kernel import ClusterAttnRes
 
 CLUSTER = 7  # CTAs per row (1024 columns each)
@@ -64,9 +64,10 @@ def _fence_sys():
 @asm()
 def _ready_add(address):
     """+1 on every rank's copy of the counter at multicast ``address`` (Int64),
-    released after the CTA's earlier stores (``_fence_sys`` after a CTA barrier)."""
+    ordered after the CTA's earlier stores by the preceding ``_fence_sys`` (after a
+    CTA barrier): a fence-release pattern, the relaxed add itself."""
     return (
-        "multimem.red.release.sys.global.add.u32 [$0], 1;", "l,~{memory}",
+        "multimem.red.relaxed.sys.global.add.u32 [$0], 1;", "l,~{memory}",
         (Int64(address),),
     )  # fmt: skip
 
@@ -155,7 +156,7 @@ class SpAttnResGather(ClusterAttnRes):
                 cute.arch.sync_threads()
                 if tid == 0:
                     _fence_sys()
-                    _ready_add(args[14] + Int64(part) * 4)
+                    _ready_add(args[14] + Int64(part) * READY_STRIDE)
             else:
                 # Every rank's MXFP8 row of this token, these 1024 columns: published?
                 mx_rows.poll(data, scale, token, n, self.tp, col, 7168)
@@ -226,7 +227,7 @@ class SpReduceAttnRes(ClusterAttnRes):
             # The signalled all-gather's chunk counters (local; the in-projection
             # consumed them): zero for this parity's next all-gather.
             if part == 0 and token == 0 and tid < READY_WORDS:
-                _store_zero(ready + Int64(tid) * 4)
+                _store_zero(ready + Int64(tid) * READY_STRIDE)
         else:
             for o in cutlass.range_constexpr(self.tp):
                 rearm(at(gather, o * n + token, col))

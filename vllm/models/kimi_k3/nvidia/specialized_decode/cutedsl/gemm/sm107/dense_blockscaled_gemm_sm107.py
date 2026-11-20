@@ -156,6 +156,11 @@ def _fence_proxy_async_global():
     return "fence.proxy.async.global;", "~{memory}", ()
 
 
+@asm()
+def _nanosleep():
+    return "nanosleep.u32 64;", "~{memory}", ()
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -234,14 +239,16 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         die_claim: bool = False,
         push: bool = False,
         gate_tiles: int = 0,
+        gate_stride: int = 4,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
         # gate_tiles > 0 (``prewait.gate_args`` in the aux buffer that also carries
         # alpha): the activation operand of k-block k is issued only once the counter
         # word k // gate_tiles at the gate address reaches the gate target
         # (acquire, then a generic -> async proxy fence): the signalled SP all-gather
-        # (``SpComm.mx_gated_view``) counts its rows per gate_tiles k-blocks.
-        self.gate_tiles = gate_tiles
+        # (``SpComm.mx_gated_view``) counts its rows per gate_tiles k-blocks; the
+        # counters are gate_stride bytes apart. One lane polls, with a back-off.
+        self.gate_tiles, self.gate_stride = gate_tiles, gate_stride
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
         # ``weight_is_a``, else B) and its scale factors of the first
         # ``prewait_stages`` k-blocks of its first tile BEFORE griddepcontrol.wait,
@@ -1821,10 +1828,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         if cutlass.const_expr(self.gate_tiles > 0):
                             chunk = ab_producer_state.count // self.gate_tiles
                             if chunk > gate_ready:
-                                address = gate_base + cutlass.Int64(chunk) * 4
-                                seen = _load_acquire(address)
-                                while seen < gate_target:
+                                address = gate_base + cutlass.Int64(chunk) * self.gate_stride
+                                if cute.arch.lane_idx() == 0:
                                     seen = _load_acquire(address)
+                                    while seen < gate_target:
+                                        _nanosleep()
+                                        seen = _load_acquire(address)
+                                cute.arch.sync_warp()
                                 _fence_proxy_async_global()
                                 gate_ready = chunk
                         if cutlass.const_expr(self.weight_is_a):

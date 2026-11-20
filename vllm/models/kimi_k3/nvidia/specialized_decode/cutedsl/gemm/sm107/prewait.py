@@ -17,7 +17,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream, make_ptr
 
-from ...common.mx_rows import READY_COLUMNS
+from ...common.mx_rows import READY_COLUMNS, READY_STRIDE
 from .dense_blockscaled_gemm_sm107 import Sm107BlockScaledPersistentDenseGemmKernel
 
 SF_VEC = 32
@@ -74,6 +74,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         die_claim=die_claim,
         push=push,
         gate_tiles=READY_COLUMNS // tile_k if gate else 0,
+        gate_stride=READY_STRIDE,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
     gemm.max_ab_stages = max_stages

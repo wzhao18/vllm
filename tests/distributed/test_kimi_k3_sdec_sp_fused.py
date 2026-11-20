@@ -266,7 +266,7 @@ def _worker(env: dict[str, str]) -> None:
                 torch.accelerator.synchronize(device)
                 assert _same_mx(gs.view, ref, rows), ("signalled gather", rows)
                 assert torch.equal(a, b), ("gated gemm", rows, layer)
-                ready = comm.box[parity, -1].view(torch.int32)[:7]
+                ready = comm.box[parity, -1].view(torch.int32)[: 7 * 32 : 32]
                 assert bool((ready == rows).all()), ("ready counts", rows, ready)
                 y = mx.reduce(prefix, blocks, out, parity, partial).clone()
                 torch.accelerator.synchronize(device)

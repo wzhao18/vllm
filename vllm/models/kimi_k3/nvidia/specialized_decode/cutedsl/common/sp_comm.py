@@ -91,6 +91,7 @@ GATHER_BATCH = 8
 PUSH_CTAS = 32
 WIDTH_CHUNK = 7168 // 8
 READY_COLUMNS, READY_WORDS = mx_rows.READY_COLUMNS, mx_rows.READY_WORDS
+READY_STRIDE = mx_rows.READY_STRIDE
 
 
 class GatedMx:
@@ -425,8 +426,8 @@ class SpComm:
         # MXFP8 form of the same all-gather (``mx_view``: an MXFP8 in-projection's
         # input, FP8 rows over the box's first bytes; ``common.mx_rows``).
         self.mx_scale_bytes = mx_rows.scale_bytes(rows_cap, width)
-        # + one row whose first READY_WORDS int32 words count the MXFP8 rows published
-        # per 1024-column chunk (``ready_addresses``: the signalled all-gather).
+        # + one row whose READY_WORDS int32 words (READY_STRIDE bytes apart) count
+        # the rows published per 1024-column chunk (``ready_addresses``).
         extra = -(-self.mx_scale_bytes // (2 * width)) + 1
         self.ready_offset = (rows_cap + extra - 1) * width * 2
         box = symm_mem.empty((parities, rows_cap + extra, width), **bf16)
