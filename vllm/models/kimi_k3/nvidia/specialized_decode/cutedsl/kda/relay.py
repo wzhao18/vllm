@@ -466,6 +466,8 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
 #pragma unroll
       for (int m = 0; m < 4; ++m) acc[h][m] = make_float2(0.f, 0.f);
     // key pair q: x of both keys at columns 16 q, [D w0 w1 w2] at 128 + 8 q, w3 at 192 + 2 q
+    const bool store = it.slot > 0 && it.pending > 0;
+    float* g = p.state + (long long)it.slot * p.slot_stride + (long long)it.head * K * K;
     float A[10], B[16];
     tm_ld8(tb + 128, A);
     tm_ld2(tb + 192, A + 8);
@@ -484,6 +486,10 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
         const float2 st = (q & 1) ? make_float2(v[h][jq].z, v[h][jq].w) : make_float2(v[h][jq].x, v[h][jq].y);
         n[h] = ffma2(st, make_float2(A[0], A[1]), fc);
         if (q & 1) { v[h][jq].z = n[h].x; v[h][jq].w = n[h].y; } else { v[h][jq].x = n[h].x; v[h][jq].y = n[h].y; }
+      }
+      if ((q & 1) && store) {  // keys 32 jq + 4 b + [0, 4) of both rows are folded
+#pragma unroll
+        for (int h = 0; h < 2; ++h) *(float4*)(g + (r0 + h) * K + jq * 32 + b * 4) = v[h][jq];
       }
       tm_wait_ld();  // B of pair q
       if (q < 7) {
@@ -505,13 +511,6 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     tm_fence_before();
     __syncwarp();
     if (l == 0) arrive(sa(&oempty[bq]));
-    if (it.slot > 0 && it.pending > 0) {
-      float* g = p.state + (long long)it.slot * p.slot_stride + (long long)it.head * K * K;
-#pragma unroll
-      for (int h = 0; h < 2; ++h)
-#pragma unroll
-        for (int q = 0; q < 4; ++q) *(float4*)(g + (r0 + h) * K + q * 32 + b * 4) = v[h][q];
-    }
     STAMP(4)
     // 8-lane transposed butterfly: lane b keeps dots 2 q4 + {0, 1} of row r0 + hh
     float vals[16];
