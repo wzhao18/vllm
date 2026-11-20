@@ -27,7 +27,11 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from vllm.logger import init_logger
+
 from .dense_gemm_bf16_sm107 import PersistentDenseGemmKernel
+
+logger = init_logger(__name__)
 
 FP8_MAX = 448.0
 # (mma tile M, N), (cluster M, N), TMA store, direct-store epilogue N, max A/B stages
@@ -113,10 +117,11 @@ def _launch(
     mac: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
-    h, p, lat, qs, os_ = dims
-    # A (M, K=P, H): q[:, h, :P]; B (N=L, K=P, H): W_UK_T[h] (N-major); C (M, L, H).
+    h, p, lat, qs, os_, ws = dims
+    # A (M, K=P, H): q[:, h, :P]; B (N=L, K=P, H): W_UK_T[h] (its strides: the
+    # layer's W_UK_T is a permuted view, K-major); C (M, L, H).
     a = cute.make_tensor(q_ptr, cute.make_layout((m, p, h), stride=(h * qs, 1, qs)))
-    b = cute.make_tensor(w_ptr, cute.make_layout((lat, p, h), stride=(1, lat, p * lat)))
+    b = cute.make_tensor(w_ptr, cute.make_layout((lat, p, h), stride=(ws[2], ws[1], ws[0])))
     c = cute.make_tensor(out_ptr, cute.make_layout((m, lat, h), stride=(h * os_, 1, os_)))
     inv = cute.make_tensor(inv_ptr, cute.make_layout((1,)))
     gemm(a, b, c, mac, stream, lambda x: x, inv, None, None)
@@ -137,6 +142,15 @@ def _rope_fp8_kernel(
         x = x * tl.load(inv_ptr)
     x = tl.minimum(tl.maximum(x, -448.0), 448.0)
     tl.store(out_ptr + rows[:, None] * OD + LAT + cols[None, :], x.to(tl.float8e4nv), mask=mask)
+
+
+def _w_ok(w: torch.Tensor) -> bool:
+    """W_UK_T (H, P, L) strides the GEMM's B operand takes: P or L contiguous, the
+    rest 16-byte multiples."""
+    s = w.stride()
+    return (s[1] == 1 or s[2] == 1) and all(x == 1 or x % 8 == 0 for x in s) and (
+        w.data_ptr() % 16 == 0
+    )
 
 
 def _ptr(dtype, t: torch.Tensor, align: int = 16):
@@ -182,7 +196,7 @@ class UkQueryFp8:
         h2, p, lat = w_uk_t.shape
         r = d - p
         assert h2 == h and out.shape == (t, h, lat + r) and q.stride(2) == 1
-        assert q.stride(1) == d and q.stride(0) == h * d and w_uk_t.is_contiguous()
+        assert q.stride(1) == d and q.stride(0) == h * d and _w_ok(w_uk_t)
         assert q.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0 and d % 8 == 0
         assert out.is_contiguous() and q.dtype == torch.bfloat16
         assert out.dtype == torch.float8_e4m3fn and inv_scale.dtype == torch.float32
@@ -195,7 +209,7 @@ class UkQueryFp8:
             _ptr(cutlass.Float32, inv_scale, 4),
             cutlass.Int32(t),
         )
-        dims = (h, p, lat, d, lat + r)
+        dims = (h, p, lat, d, lat + r, tuple(w_uk_t.stride()))
         self._compiled(dims, stream, args)(*args, stream)
         if self.rope and r > 0:
             n = t * h
@@ -236,7 +250,7 @@ def fused_query(
         or w_uk_t.dtype != torch.bfloat16
         or w_uk_t.dim() != 3
         or w_uk_t.shape[0] != h
-        or not w_uk_t.is_contiguous()
+        or not _w_ok(w_uk_t)
         or q.stride() != (h * d, d, 1)
         or q.data_ptr() % 16
         or d % 8
@@ -251,6 +265,7 @@ def fused_query(
         unit = not torch.cuda.is_current_stream_capturing() and bool(q_scale == 1)
         ent = _SCALES[q_scale] = (inv, unit)
     inv, unit = ent
+    logger.info_once("Kimi K3.1 prefill: fused W_UK / RoPE / FP8 query (uk_query) active")
     out = torch.empty(
         (t, h, w_uk_t.shape[2] + d - w_uk_t.shape[1]),
         dtype=torch.float8_e4m3fn,

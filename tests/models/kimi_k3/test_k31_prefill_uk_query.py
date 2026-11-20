@@ -32,13 +32,20 @@ def _stock(q, w_uk_t, q_scale):
 @pytest.mark.parametrize("t", [1, 300, 4097])
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("amp", [1.0, 40.0])
-def test_fused_query_bitwise(t, scale, amp):
+@pytest.mark.parametrize("layout", ["model", "contiguous"])
+def test_fused_query_bitwise(t, scale, amp, layout):
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import uk_query
 
     torch.manual_seed(t)
-    h, p, r, lat = 96, 128, 64, 512
+    h, p, r, lat, v = 96, 128, 64, 512, 128
     q = (torch.randn(t, h, p + r, device="cuda") * 2.0 * amp).to(torch.bfloat16)
-    w = (torch.randn(h, p, lat, device="cuda") * 0.5).to(torch.bfloat16)
+    if layout == "model":
+        # MLAAttention's W_UK_T: kv_b_proj.T viewed (L, H, P + V), W_UK = [..., :P],
+        # permuted (1, 2, 0) -> (H, P, L) with P contiguous.
+        kv_b = (torch.randn(lat, h, p + v, device="cuda") * 0.5).to(torch.bfloat16)
+        w = kv_b[..., :p].permute(1, 2, 0)
+    else:
+        w = (torch.randn(h, p, lat, device="cuda") * 0.5).to(torch.bfloat16)
     q_scale = torch.tensor([scale], device="cuda", dtype=torch.float32)
     out = uk_query.fused_query(q, w, q_scale)
     assert out is not None and out.dtype == torch.float8_e4m3fn
