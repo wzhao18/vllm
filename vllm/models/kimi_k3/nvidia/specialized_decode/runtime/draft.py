@@ -2104,6 +2104,9 @@ class VocabParallelMarkov:
             gather = lambda x: coordinator.all_gather(x, dim=0)  # noqa: E731
         self.gather = gather
         self.batches: set[tuple[int, bool]] = set()
+        # The bias GEMM on pinned cuBLASLt algorithms (lt_pin.PINS) at the prepared
+        # batches that have one (the heuristic pick is slow), else F.linear.
+        self.bias_pins = None
         self.buffers: dict[int, tuple] = {}
         # ``group`` (a process group, with ``cap`` = the largest batch): the keys'
         # all-gather becomes peer stores into a mailbox [steps, TP, cap] polled by
@@ -2176,6 +2179,9 @@ class VocabParallelMarkov:
                 ),
             )
         self.batches.add((batch, sampled))
+        from ..lt_pin import pinned
+
+        self.bias_pins = pinned(self.w2, sorted({b for b, _ in self.batches}))
         self.run(base, anchors, draft, sampling)
         torch.accelerator.synchronize(self.device)
 
@@ -2220,7 +2226,10 @@ class VocabParallelMarkov:
         if poll and batch > self.cap:
             raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
         for step in range(self.steps):
-            bias = torch.nn.functional.linear(emb, self.w2)
+            if self.bias_pins is not None and self.bias_pins.takes(emb):
+                bias = self.bias_pins.run(emb, emb.new_empty((batch, self.vocab_rank)))
+            else:
+                bias = torch.nn.functional.linear(emb, self.w2)
             _vp_markov_keys[grid](
                 keys,
                 base,
