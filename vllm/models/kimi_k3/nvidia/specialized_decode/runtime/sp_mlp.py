@@ -59,8 +59,9 @@ SHARED = ("shared_gu", "shared_down")
 ROUTER_LATENT = {"*": "25-72:ltpin,96:wide"}
 # ``wide`` rows -> PreparedWide policy (split, activation warps, weight stages,
 # weight warps, direct exchange, staggered K): 36 tiles x 5 splits = 180 CTAs;
-# 10 weight stages (~190 KiB smem) leave room beside SpReduceAttnRes's CTAs.
-WIDE_FRONT = {96: (5, (1,), 10, (0, 3), False, True)}
+# 11 weight + 4 activation stages (200 KiB smem) leave room beside 4
+# SpReduceAttnRes CTAs (~3 KiB each), so the CTAs land before the PDL wait.
+WIDE_FRONT = {96: (5, (1,), 11, (0, 3), False, True, 4)}
 # <= 48 registers: 256 threads x 48 fit beside 3-4 SpReduceAttnRes CTAs (128 threads
 # x 104 registers each) in the SM's 64 K registers, so the CTAs land pre-wait.
 WIDE_FRONT_REGS = 48
