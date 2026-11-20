@@ -611,7 +611,12 @@ def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp.add(kwargs)
     target = _compile_target(compile_fn, fn, kwargs)
     head = f"{_versions()}\n{_environment()}\n{target}\n"
-    return hashlib.sha256((head + fp.digest()).encode()).hexdigest(), fp.modules
+    key = hashlib.sha256((head + fp.digest()).encode()).hexdigest()
+    _DIAG_PARTS[key] = [head] + fp.parts[:20000]
+    return key, fp.modules
+
+
+_DIAG_PARTS: dict = {}  # DIAGNOSTIC BRANCH ONLY: fingerprint tokens stored with each entry
 
 
 def key_of(compile_fn: Any, fn: Any, args: tuple, kwargs: dict) -> str:
@@ -1106,6 +1111,7 @@ def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
         "host": socket.gethostname(),
         "sources": sources,
         "kwargs": launcher,
+        "fingerprint": _DIAG_PARTS.get(key),
     }
 
     def write_obj(path):
