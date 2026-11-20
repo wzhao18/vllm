@@ -93,6 +93,7 @@ LOADERS = 1 + 4
 CPA_THREADS = 32 * LOADERS
 NSOFT = 4 * NG  # softmax warps
 MAX_ROWS = 16  # rows per CTA
+KEYS = 17  # sort keys of the row deal: 16 - tiles (a row has at most 16 tiles)
 QBLK = H * 128  # one 128 B column block of the query rows [96 x 128 B]
 QBYTES = 4 * QBLK + H * 64
 PBYTES = TN * H  # P^T [128 keys x 96 heads] E4M3
@@ -287,6 +288,10 @@ class SparseMlaDecodeKM:
         off += H * 4
         self.off_n = off
         off += 4 * MAX_ROWS
+        self.off_row = off  # [MAX_ROWS] this CTA's row ids (the deal of ``deal``)
+        off += 4 * MAX_ROWS
+        self.off_cnt = off  # [2][KEYS] tile-count histogram, then running positions
+        off += 8 * KEYS
         self.off_bar = off
         off += NBAR * 8
         self.off_tmem = off
@@ -298,6 +303,76 @@ class SparseMlaDecodeKM:
     @cute.jit
     def nrow(self, base, i):
         return Int32(ld_shared_u32(base + Uint32(self.off_n) + Uint32(4) * Uint32(i)))
+
+    @cute.jit
+    def rowid(self, base, i):
+        return Int32(ld_shared_u32(base + Uint32(self.off_row) + Uint32(4) * Uint32(i)))
+
+    @cute.jit
+    def slot(self, cta, i):
+        """Sorted position of this CTA's i-th row: the rows, ordered by tile count
+        (descending, stable), are dealt boustrophedon over the CTAs (LPT: a CTA's
+        second row is among the shortest of the second pass)."""
+        j = cta
+        if i % 2 == 1:
+            j = self.grid - 1 - cta
+        return i * self.grid + j
+
+    @cute.jit
+    def mine(self, cta, rows):
+        n = Int32(0)
+        for i in cutlass.range_constexpr(MAX_ROWS):
+            if self.slot(cta, Int32(i)) < rows:
+                n = n + 1
+        return n
+
+    @cute.jit
+    def deal(self, base, lane, cta, rows, valid):
+        """Warp 1: this CTA's rows and their key counts into SMEM (off_row, off_n).
+        Every CTA sorts the valid counts of all rows by tile count (a stable
+        counting sort: one histogram pass and one ranking pass, 32 rows per step,
+        ranks within a step by match.any) and keeps the rows dealt to it. Which CTA
+        computes a row changes, not how: the outputs are bitwise those of the
+        round-robin order; the longest CTA holds ~one tile less."""
+        cnt = base + Uint32(self.off_cnt)
+        for j in cutlass.range_constexpr((2 * KEYS + 31) // 32):
+            if lane + 32 * j < 2 * KEYS:
+                st_shared_u32(cnt + Uint32(4) * Uint32(lane + 32 * j), Uint32(0))
+        sync_warp()
+        lt = lanemask_lt()
+        steps = (rows + 31) // 32
+        for p in cutlass.range_constexpr(2):
+            for c in range(steps):
+                r = c * 32 + lane
+                key = Uint32(255)
+                n = Int32(0)
+                if r < rows:
+                    n = ld_global_s32(valid + Int64(r) * Int64(4))
+                    key = Uint32(KEYS - 1) - Uint32(_tiles(n))
+                peers = match_any(key)
+                ahead = popc(peers & lt)
+                if cutlass.const_expr(p == 1):
+                    if r < rows:
+                        pos = Int32(ld_shared_u32(cnt + Uint32(4 * KEYS) + Uint32(4) * key)) + Int32(ahead)
+                        i = pos // self.grid
+                        j = pos - i * self.grid
+                        if i % 2 == 1:
+                            j = self.grid - 1 - j
+                        if j == cta:
+                            st_shared_u32(base + Uint32(self.off_row) + Uint32(4) * Uint32(i), Uint32(r))
+                            st_shared_u32(base + Uint32(self.off_n) + Uint32(4) * Uint32(i), Uint32(n))
+                sync_warp()
+                if (r < rows) & (ahead == Uint32(0)):  # the group leader counts it
+                    at_ = cnt + Uint32(4 * KEYS * p) + Uint32(4) * key
+                    st_shared_u32(at_, ld_shared_u32(at_) + popc(peers))
+                sync_warp()
+            if cutlass.const_expr(p == 0):  # exclusive prefix: running positions
+                if lane == 0:
+                    acc = Uint32(0)
+                    for k in cutlass.range_constexpr(KEYS):
+                        st_shared_u32(cnt + Uint32(4 * (KEYS + k)), acc)
+                        acc = acc + ld_shared_u32(cnt + Uint32(4 * k))
+                sync_warp()
 
     @cute.jit
     def mark(self, stamp, bid, i):
@@ -371,11 +446,9 @@ class SparseMlaDecodeKM:
             fence_mbar_init()
         if warp == 0:
             tmem_alloc_exclusive(base + Uint32(self.off_tmem))
-        n_mine = (rows - cta + self.grid - 1) // self.grid
+        n_mine = self.mine(cta, rows)
         if warp == 1:
-            if lane < n_mine:
-                st_shared_u32(base + Uint32(self.off_n + 4 * lane), Uint32(
-                    ld_global_s32(valid + Int64(cta + lane * self.grid) * Int64(4))))
+            self.deal(base, lane, cta, rows, valid)
         tc_fence_before()
         cute.arch.sync_threads()
         tc_fence_after()
@@ -427,7 +500,7 @@ class SparseMlaDecodeKM:
         for i in range(n_mine):
             n = self.nrow(base, i)
             if n > 0:
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 b = rq & 1
                 mbar_wait(self.bar(base, B_IDXEMPTY + b), ((rq >> 1) & 1) ^ 1)
                 nbytes = Uint32(((n + 3) // 4) * 16)
@@ -478,7 +551,7 @@ class SparseMlaDecodeKM:
                 if (i + 1 < n_mine) & (me < QBYTES // 128):
                     # The next row's query heads into L2: its TMA load (after this
                     # row's last QK) then waits on L2, not HBM.
-                    prefetch_l2(qp + (Int64(cta + (i + 1) * self.grid) * Int64(q_heads)
+                    prefetch_l2(qp + (Int64(self.rowid(base, i + 1)) * Int64(q_heads)
                                       * Int64(ROW) + Int64(me * 128)))
                 for t in range(tiles):
                     s = g % self.stages
@@ -702,7 +775,7 @@ class SparseMlaDecodeKM:
         for i in range(n_mine):
             n = self.nrow(base, i)
             if n > 0:
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 tiles = _tiles(n)
                 for t in range(tiles):
                     if t > 0:
@@ -800,7 +873,7 @@ class SparseMlaDecodeKM:
         for i in range(n_mine):
             n = self.nrow(base, i)
             if n > 0:
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 tiles = _tiles(n)
                 lp = [Float32(0.0)] * HW  # row-sum partials of this key lane
                 m = neg  # combiner: running max of head h0 + lane (log2 units)
@@ -918,7 +991,7 @@ class SparseMlaDecodeKM:
                     self.mark(stamp, cta, 16)
                 ro = ro + 1
             else:  # no keys: LSE -inf and a zero latent (as trtllm-gen)
-                row = cta + i * self.grid
+                row = self.rowid(base, i)
                 if combiner:
                     st_global_f32(lse + (Int64(row) * Int64(lse_stride) + Int64(h0 + lane))
                                   * Int64(4), neg)
@@ -933,6 +1006,26 @@ class SparseMlaDecodeKM:
 @asm(Float32, pure=True)
 def fma_f(a, b, c):
     return "fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f", (Float32(a), Float32(b), Float32(c))
+
+
+@asm(Uint32, pure=False)
+def match_any(v):
+    return "match.any.sync.b32 $0, $1, 0xffffffff;", "=r,r", (Uint32(v),)
+
+
+@asm(Uint32, pure=True)
+def lanemask_lt():
+    return "mov.u32 $0, %lanemask_lt;", "=r", ()
+
+
+@asm(Uint32, pure=True)
+def popc(v):
+    return "popc.b32 $0, $1;", "=r,r", (Uint32(v),)
+
+
+@asm()
+def sync_warp():
+    return "bar.warp.sync 0xffffffff;", "~{memory}", ()
 
 
 @asm(Uint32, pure=False)
