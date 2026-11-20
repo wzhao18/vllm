@@ -86,6 +86,33 @@ def test_steps_fill_the_budget_with_mixed_rows(variant, monkeypatch):
         assert step3.total_num_scheduled_tokens == BUDGET
 
 
+def test_ladder_steps_cover_every_token_count_octave(monkeypatch):
+    """Small serving steps (65 tokens up to the budget, single-sequence prefills
+    among them) run at startup in every power-of-two octave, so kernels that
+    pick a tile or a specialization by token or sequence count do not compile
+    in the first small mixed serving step. Same shapes on every DP rank."""
+    runner = _runner()
+    ladder = warmup._serving_ladder_shapes(runner)
+    assert ladder == warmup._serving_ladder_shapes(_runner(dp_rank=3))
+    monkeypatch.setattr(warmup.torch.accelerator, "synchronize", lambda: None)
+    totals, single = [], []
+    for i, shapes in enumerate(ladder):
+        steps: list[SchedulerOutput] = []
+        assert warmup.run_serving_shape_warmup(
+            runner, steps.append, lambda grammar_output: None, 100 + i, ladder=shapes
+        )
+        step1, step2, step3, cleanup = steps
+        assert len(step1.scheduled_new_reqs) == 1
+        single.append(step1.total_num_scheduled_tokens)
+        for step in (step1, step2, step3):
+            assert step.total_num_scheduled_tokens <= BUDGET
+            totals.append(step.total_num_scheduled_tokens)
+        assert cleanup.finished_req_ids == {*step3.num_scheduled_tokens}
+    for k in range(6, BUDGET.bit_length() - 1):
+        assert any(2**k < t <= 2 ** (k + 1) for t in totals), k
+    assert min(single) <= 128 and max(single) > BUDGET // 4
+
+
 def test_verification_shapes_differ_per_dp_rank_and_from_warmup(monkeypatch):
     shapes = {
         (variant, rank): warmup._serving_step_shapes(_runner(dp_rank=rank), variant)

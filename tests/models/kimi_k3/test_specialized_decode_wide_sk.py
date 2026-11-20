@@ -57,6 +57,31 @@ def test_wide_sk(rows, place):
             assert torch.equal(out, first)
 
 
+@pytest.mark.parametrize("rows", [96, 288])
+def test_wide_sk_nocopy_matches_copy(rows):
+    """The two-accumulator epilogue (no register copy) gives the copy form's bits."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
+
+    try:
+        _, pairs = wide_sk.die_pairs("cuda")
+    except ValueError:
+        pytest.skip("die-local GEMM needs a two-die device")
+    n, k = 40960, 1024
+    if not wide_sk.supports(rows, n, k, pairs):
+        pytest.skip(f"shape not supported at {pairs} pairs per die")
+    torch.manual_seed(rows + 1)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    outs = []
+    for nocopy in (True, False):
+        gemm = wide_sk.PreparedWideSK(w, [rows], nocopy=nocopy).prepare()
+        out = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        gemm.run(x, out)
+        torch.cuda.synchronize()
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1])
+
+
 def _pairs_or_skip(wide_sk, rows, n, k):
     try:
         _, pairs = wide_sk.die_pairs("cuda")

@@ -94,12 +94,10 @@ WIDE_LM_HEAD = {16: "17-32:1"}
 # pair per SM pair, all rows on the MMA's N), per TP, for the release drafter
 # (GqaDraftFastPath; the SP decode declares the preview drafter's LM head stock,
 # sp_attention.SP_DRAFTER_TABLES). TP4 (D3-32, [40960, 7168]
-# shard), VR200 1 GPU, cold weights, us, wide_sk vs the pinned cuBLASLt algorithm:
-# 96 rows 38.8 vs 47.0, 192 rows 46.6 vs 49.9, 288 rows 65.7 vs 66.8
-# (bench_kimi_k3_sdec_wide_sk.py). In-step (D3-32 NVFP4 slice, same-node ABBA, 3
-# rounds, Rhea) 192 rows were slower (+4.8, +7.4 us per step on two nodes) and 288
-# rows neutral (-5.5, +0.5), so only 96 rows run it.
-GQA_SK_LM_HEAD = {4: "96-96:1"}
+# shard), VR200 1 GPU, cold weights, us, wide_sk (two TMEM accumulators) vs the
+# pinned cuBLASLt algorithm: 96 rows 39.3 vs 47.0, 192 rows 46.2 vs 49.9, 288 rows
+# 65.3 vs 66.8 (bench_kimi_k3_sdec_wide_sk.py).
+GQA_SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
 # Batches whose Markov bias GEMM ([B, 512] x [vocab / TP, 512]^T, three per step) is
 # that kernel too, per TP. TP4 [40960, 512] shard, VR200 1 GPU, cold weights, us,
 # wide_sk vs F.linear: B32 6.4 vs 11.8 (B64 7.0 vs 7.1, B96 7.5 vs 7.0: cuBLAS).

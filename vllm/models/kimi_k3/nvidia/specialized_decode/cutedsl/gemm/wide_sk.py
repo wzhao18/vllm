@@ -132,6 +132,32 @@ def _tma2_stream(dst, tmap, c0, c1, mbar):
     )
 
 
+@asm(Int32, pure=True)
+def _pack_bf16x2(lo, hi):
+    """BF16x2 of two FP32 values (each rounded to nearest even, as cvt.rn.bf16.f32)."""
+    return "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", (Float32(lo), Float32(hi))
+
+
+@asm()
+def _st_bf16_pair(lo_addr, hi_addr, packed):
+    code = ("{ .reg .b16 l, h; mov.b32 {l, h}, $2; st.global.b16 [$0], l; "
+            "st.global.b16 [$1], h; }")
+    return code, "l,l,r,~{memory}", (Int64(lo_addr), Int64(hi_addr), Int32(packed))
+
+
+@asm()
+def _tmem_alloc_x(holder, cols):
+    """Exclusive TMEM allocation (sm_107: up to 576 columns, one TMEM-using CTA per SM)."""
+    code = "tcgen05.alloc.exclusive.cta_group::2.sync.aligned.shared::cta.b32 [$0], $1;"
+    return code, "r,r,~{memory}", (Int32(holder), Int32(cols))
+
+
+@asm()
+def _tmem_dealloc_x(taddr, cols):
+    code = "tcgen05.dealloc.exclusive.cta_group::2.sync.aligned.b32 $0, $1;"
+    return code, "r,r,~{memory}", (Int32(taddr), Int32(cols))
+
+
 @asm()
 def _tma2(dst, tmap, c0, c1, mbar):
     code = (
@@ -265,14 +291,16 @@ class WideSK:
     """One (rows, N, K, pairs per die) specialization; see the module docstring.
     ``debug`` bits: 1 no MMA (rings and epilogues only), 2 no activation loads,
     4 no weight loads (skeletons), 8 globaltimer stamps per CTA after the flags
-    (``STAMPS`` u64: entry, slot, then per segment acc_full seen / done, end)."""
+    (``STAMPS`` u64: entry, slot, then per segment acc_full seen / done, end; the
+    one-accumulator form also stamps the TMEM release of segments 0 / 1 in 12 / 13)."""
 
     def __init__(self, rows, n, k, pairs, ldo=None, w_issuers=3, x_issuers=2, debug=0,
                  x_stages=4, spread=False, silu=False, smem=None, packed=False,
-                 keep_w=False):  # fmt: skip
+                 keep_w=False, nocopy=True):  # fmt: skip
         """``smem``: the shared-memory budget (default: the sm_100 capacity);
         ``packed``: the weight halves are ``pack_tiles`` layouts; ``keep_w``: load the
-        weight with the default L2 policy (it is read again soon), not evict-first."""
+        weight with the default L2 policy (it is read again soon), not evict-first;
+        ``nocopy`` (non-spread): two TMEM accumulators, see below."""
         assert supports(rows, n, k, pairs, spread, x_stages, smem), (rows, n, k, pairs)
         assert spread or not silu
         self.packed, self.keep_w = packed, keep_w
@@ -302,7 +330,16 @@ class WideSK:
         self.threads = 32 * 11
         self.ks = k // K_TILE
         self.total = n // 512 * self.ks  # K steps per die
-        self.acc_bufs = 1  # one TMEM accumulator (288 tokens take 288 of 512 columns)
+        # ``nocopy``: two TMEM accumulators (2 x 288 columns take Rubin's exclusive
+        # 576-column allocation), so no epilogue copies a whole accumulator into
+        # registers before releasing it (the 144-value copy of the one-accumulator
+        # form spilled ~78 MB of local-memory traffic per 288-row launch): a
+        # contributor streams its FP32 partial out 16 columns at a time while the MMA
+        # runs the next segment in the other buffer; whole / head tiles hold their
+        # BF16 values packed in pairs. Same sums and roundings as the copy form.
+        self.nocopy = bool(nocopy) and not spread
+        self.acc_bufs = 2 if self.nocopy else 1
+        assert self.acc_bufs * rows <= 576
         # Separate rings: the weights stream from HBM (deep ring: the die-local rate
         # needs >= ~128-192 KiB in flight per SM), the activations from L2 (shallow).
         a_bytes = 128 * K_TILE * 2
@@ -317,6 +354,8 @@ class WideSK:
         self.tmem_cols = 32
         while self.tmem_cols < self.acc_bufs * rows:
             self.tmem_cols *= 2
+        if self.tmem_cols > 512:  # exclusive allocation (one TMEM-using CTA per SM)
+            self.tmem_cols = 576
 
     @cute.jit
     def __call__(
@@ -560,7 +599,7 @@ class WideSK:
                             cute.arch.mbarrier_wait(x_full + q, (step // sx) & 1)
                         if cutlass.const_expr((self.debug & 1) == 0):
                             for c in cutlass.range_constexpr(chunks):
-                                acc_c = acc[(None, None, None, c)]
+                                acc_c = acc[(None, None, None, b * chunks + c)]
                                 for kb in cutlass.range_constexpr(kblocks):
                                     if cutlass.const_expr(kb == 0):
                                         tiled_mma.set(tcgen05.Field.ACCUMULATE, kk != lo_k)
@@ -576,7 +615,10 @@ class WideSK:
                         tcgen05.commit(acc_full + b, 3, tcgen05.CtaGroup.TWO)
         elif warp < 8:
             if warp == 0:
-                cute.arch.alloc_tmem(self.tmem_cols, tmem_holder, is_two_cta=True)
+                if cutlass.const_expr(self.tmem_cols > 512):
+                    _tmem_alloc_x(Int32(tmem_holder.toint()), self.tmem_cols)
+                else:
+                    cute.arch.alloc_tmem(self.tmem_cols, tmem_holder, is_two_cta=True)
             cute.arch.barrier(barrier_id=1, number_of_threads=32 * 9)
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
                                                    ptr_to_buffer_holding_addr=tmem_holder)  # fmt: skip
@@ -608,7 +650,10 @@ class WideSK:
             if warp == 0:
                 cute.arch.mbarrier_arrive(dealloc, rank_in_cluster ^ 1)
                 cute.arch.mbarrier_wait(dealloc, 0)
-                cute.arch.dealloc_tmem(tmem_ptr, self.tmem_cols, is_two_cta=True)
+                if cutlass.const_expr(self.tmem_cols > 512):
+                    _tmem_dealloc_x(Int32(tmem_ptr.toint()), self.tmem_cols)
+                else:
+                    cute.arch.dealloc_tmem(tmem_ptr, self.tmem_cols, is_two_cta=True)
 
     def token(self, col):
         """Token of accumulator column ``col`` (chunk-major): MMA chunk c's columns
@@ -659,47 +704,105 @@ class WideSK:
                     if si < 6:
                         _st_u64(stamp + (2 + 2 * si) * 8, _now())
             _fence_after()
-            vals = []
-            for jj in cutlass.range_constexpr(hcols // CHUNK):
-                vals += list(_tmem_ld16w(self.taddr(base, b, first_col + jj * CHUNK)))
-            _fence_before()
-            if lane == 0:
-                cute.arch.mbarrier_arrive(acc_empty + b, Int32(0))
-            if lo_k != t * ks:  # a later part: publish the partial
-                wsb = ws + (Int64(g * 2 + v) * rows + first_col) * 512 + r * 4
-                for i in cutlass.range_constexpr(hcols):
-                    _st_f32(wsb + i * 512, vals[i])
-                _bar(2, 256)
-                if lead:
-                    _red_release_add(flags + Int64(g * 2 + v) * 4, 1)
-            else:  # a whole tile or the head of a shared one
-                last = (t + 1) * ks
-                ncon = (last * nd + total - 1) // total - 1 - j
-                if ncon < 0:
-                    ncon = Int32(0)
-                if ncon > 0:  # the next range's partial into the drained ring
-                    if ew == 0:
-                        if lane == 0:
-                            flag = flags + Int64((g + 1) * 2 + v) * 4
-                            while _ld_acquire(flag) == 0:
-                                _nanosleep()
-                            cute.arch.mbarrier_arrive_and_expect_tx(xfer, rows * 512)
-                        cute.arch.sync_warp()
-                        _fence_proxy_global()
-                        per = rows * 512 // 32
-                        src = ws + (Int64((g + 1) * 2 + v) * rows) * 512 + lane * per
-                        _bulk_load(stage_addr + lane * per, src, per, xfer)
-                    cute.arch.mbarrier_wait(xfer, 0)
-                yrow = y + (wd * (self.n // 2) + t * 256 + v * 128 + r) * 2
-                for i in cutlass.range_constexpr(hcols):
-                    val = _add_lds_if(vals[i], stage_addr + ((first_col + i) * 128 + r) * 4,
-                                      ncon)  # fmt: skip
-                    tok = self.token(first_col + i)
-                    _st_bf16(yrow + Int64(tok) * (self.ldo * 2), val)
-                if ncon > 0:
+            if cutlass.const_expr(self.nocopy):
+                if lo_k != t * ks:  # a later part: publish the FP32 partial, 16 at a time
+                    wsb = ws + (Int64(g * 2 + v) * rows + first_col) * 512 + r * 4
+                    for jj in cutlass.range_constexpr(hcols // CHUNK):
+                        v16 = _tmem_ld16w(self.taddr(base, b, first_col + jj * CHUNK))
+                        for i in cutlass.range_constexpr(CHUNK):
+                            _st_f32(wsb + (jj * CHUNK + i) * 512, v16[i])
+                    _fence_before()
+                    if lane == 0:
+                        cute.arch.mbarrier_arrive(acc_empty + b, Int32(0))
                     _bar(2, 256)
                     if lead:
-                        _st_relaxed(flags + Int64((g + 1) * 2 + v) * 4, 0)
+                        _red_release_add(flags + Int64(g * 2 + v) * 4, 1)
+                else:  # a whole tile or the head of a shared one
+                    last = (t + 1) * ks
+                    ncon = (last * nd + total - 1) // total - 1 - j
+                    if ncon < 0:
+                        ncon = Int32(0)
+                    if ncon > 0:  # the next range's partial into the drained ring
+                        if ew == 0:
+                            if lane == 0:
+                                flag = flags + Int64((g + 1) * 2 + v) * 4
+                                while _ld_acquire(flag) == 0:
+                                    _nanosleep()
+                                cute.arch.mbarrier_arrive_and_expect_tx(xfer, rows * 512)
+                            cute.arch.sync_warp()
+                            _fence_proxy_global()
+                            per = rows * 512 // 32
+                            src = ws + (Int64((g + 1) * 2 + v) * rows) * 512 + lane * per
+                            _bulk_load(stage_addr + lane * per, src, per, xfer)
+                        cute.arch.mbarrier_wait(xfer, 0)
+                    packed = []  # the FP32 sum first, then one rounding (as the copy form)
+                    for jj in cutlass.range_constexpr(hcols // CHUNK):
+                        v16 = _tmem_ld16w(self.taddr(base, b, first_col + jj * CHUNK))
+                        for i in cutlass.range_constexpr(0, CHUNK, 2):
+                            col = first_col + jj * CHUNK + i
+                            a0 = _add_lds_if(v16[i], stage_addr + (col * 128 + r) * 4, ncon)
+                            a1 = _add_lds_if(v16[i + 1],
+                                             stage_addr + ((col + 1) * 128 + r) * 4, ncon)
+                            packed.append(_pack_bf16x2(a0, a1))
+                    _fence_before()
+                    if lane == 0:
+                        cute.arch.mbarrier_arrive(acc_empty + b, Int32(0))
+                    yrow = y + (wd * (self.n // 2) + t * 256 + v * 128 + r) * 2
+                    for i in cutlass.range_constexpr(hcols // 2):
+                        col = first_col + 2 * i
+                        _st_bf16_pair(yrow + Int64(self.token(col)) * (self.ldo * 2),
+                                      yrow + Int64(self.token(col + 1)) * (self.ldo * 2),
+                                      packed[i])  # fmt: skip
+                    if ncon > 0:
+                        _bar(2, 256)
+                        if lead:
+                            _st_relaxed(flags + Int64((g + 1) * 2 + v) * 4, 0)
+            else:
+                vals = []
+                for jj in cutlass.range_constexpr(hcols // CHUNK):
+                    vals += list(_tmem_ld16w(self.taddr(base, b, first_col + jj * CHUNK)))
+                _fence_before()
+                if lane == 0:
+                    cute.arch.mbarrier_arrive(acc_empty + b, Int32(0))
+                if cutlass.const_expr(self.debug & 8):
+                    if lead:
+                        if si < 2:  # TMEM released (stamps 12 / 13: segments 0 / 1)
+                            _st_u64(stamp + (12 + si) * 8, _now())
+                if lo_k != t * ks:  # a later part: publish the partial
+                    wsb = ws + (Int64(g * 2 + v) * rows + first_col) * 512 + r * 4
+                    for i in cutlass.range_constexpr(hcols):
+                        _st_f32(wsb + i * 512, vals[i])
+                    _bar(2, 256)
+                    if lead:
+                        _red_release_add(flags + Int64(g * 2 + v) * 4, 1)
+                else:  # a whole tile or the head of a shared one
+                    last = (t + 1) * ks
+                    ncon = (last * nd + total - 1) // total - 1 - j
+                    if ncon < 0:
+                        ncon = Int32(0)
+                    if ncon > 0:  # the next range's partial into the drained ring
+                        if ew == 0:
+                            if lane == 0:
+                                flag = flags + Int64((g + 1) * 2 + v) * 4
+                                while _ld_acquire(flag) == 0:
+                                    _nanosleep()
+                                cute.arch.mbarrier_arrive_and_expect_tx(xfer, rows * 512)
+                            cute.arch.sync_warp()
+                            _fence_proxy_global()
+                            per = rows * 512 // 32
+                            src = ws + (Int64((g + 1) * 2 + v) * rows) * 512 + lane * per
+                            _bulk_load(stage_addr + lane * per, src, per, xfer)
+                        cute.arch.mbarrier_wait(xfer, 0)
+                    yrow = y + (wd * (self.n // 2) + t * 256 + v * 128 + r) * 2
+                    for i in cutlass.range_constexpr(hcols):
+                        val = _add_lds_if(vals[i], stage_addr + ((first_col + i) * 128 + r) * 4,
+                                          ncon)  # fmt: skip
+                        tok = self.token(first_col + i)
+                        _st_bf16(yrow + Int64(tok) * (self.ldo * 2), val)
+                    if ncon > 0:
+                        _bar(2, 256)
+                        if lead:
+                            _st_relaxed(flags + Int64((g + 1) * 2 + v) * 4, 0)
             if cutlass.const_expr(self.debug & 8):
                 if lead:
                     if si < 6:
@@ -902,7 +1005,7 @@ class PreparedWideSK:
 
     def __init__(self, weight, rows, ldo=None, place=True, w_issuers=3, x_issuers=2,
                  debug=0, x_stages=4, spread=False, silu=False, share=None, smem=None,
-                 packed=False, keep_w=False):  # fmt: skip
+                 packed=False, keep_w=False, nocopy=True):  # fmt: skip
         """``share``: a prepared instance of the same shape and options whose workspace
         and counters this one reuses (launches on one stream never overlap); ``smem``:
         the shared-memory budget (default: the 227 KiB opt-in; above it, in Rubin's
@@ -921,7 +1024,7 @@ class PreparedWideSK:
         self.rows = tuple(rows)
         self.ldo = ldo
         self.opts = (w_issuers, x_issuers, debug, x_stages, spread, silu, smem, packed,
-                     keep_w)
+                     keep_w, nocopy)
         self.kernels, self.state = {}, {}
 
     def prepare(self):
