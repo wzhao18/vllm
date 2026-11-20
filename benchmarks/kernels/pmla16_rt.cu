@@ -64,6 +64,18 @@ __device__ __forceinline__ void commit(uint32_t bar) {
 __device__ __forceinline__ uint32_t cs(int lay) { return lay == 0 ? 128u : 144u; }
 __device__ __forceinline__ int nk(int lay) { return lay == 0 ? 64 : lay == 1 ? 48 : 32; }
 
+__device__ __forceinline__ void qk_half(int h, uint32_t t, uint64_t bd0, uint64_t aq) {
+  constexpr uint32_t iq2 = (1u << 4) | ((32u >> 3) << 17) | (8u << 24) | (1u << 29);
+  const uint32_t d = t + 128 + 32 * h;
+  const uint64_t ro = (uint64_t)(h * 32 * 128 / 16);
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int k2 = 0; k2 < 2; ++k2)
+      MMA_TS(d, t + C_Q + 32 * j + 16 * k2, bd0 + j * 512 + k2 * 4 + ro, iq2, (j + k2 > 0) ? 1u : 0u);
+  MMA_SS(d, aq, ((bd0 + 4 * 512) ^ (SW128 ^ SW64)) + (uint64_t)(h * 32 * 64 / 16), iq2, 1);
+}
+
 template <int lay>
 __device__ __forceinline__ void qk(uint32_t t, uint64_t bd0, uint64_t aq) {
   constexpr uint32_t n = lay == 0 ? 64u : lay == 1 ? 48u : 32u;
@@ -135,8 +147,9 @@ __device__ __forceinline__ float ldr64(uint32_t a) {
 }
 
 // lay: 0 h8 / 1 L1 / 2 L2; pvon: PV MMAs after each S-free; chain: 0 = free-running TC mix (no softmax)
-template <int lay>
-__global__ void __launch_bounds__(320, 1) rt(int pvon, int chain, int nsub, long long* out, int red) {
+// W2 > 0: h8 layout with QK N-split over warp 8 (keys 0-31) and warp W2 (keys 32-63), S-full count 2
+template <int lay, int W2 = 0>
+__global__ void __launch_bounds__(512, 1) rt(int pvon, int chain, int nsub, long long* out, int red) {
   extern __shared__ __align__(1024) unsigned char dyn[];
   __shared__ uint64_t bars[10];
   __shared__ uint32_t tslot;
@@ -150,7 +163,7 @@ __global__ void __launch_bounds__(320, 1) rt(int pvon, int chain, int nsub, long
         "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::"r"(sa(&tslot))
         : "memory");
   if (tid == 0) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(sa(&bars[0])) : "memory");  // S-full
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(sa(&bars[0])), "r"(W2 ? 2 : 1) : "memory");  // S-full
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 4;" ::"r"(sa(&bars[1])) : "memory");  // S-free
     for (int j = 2; j < 6; ++j) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(sa(&bars[j])) : "memory");
     for (int j = 6; j < 10; ++j) asm volatile("mbarrier.init.shared::cta.b64 [%0], 4;" ::"r"(sa(&bars[j])) : "memory");
@@ -167,23 +180,27 @@ __global__ void __launch_bounds__(320, 1) rt(int pvon, int chain, int nsub, long
   const int n = nk(lay), npv = n / 16;
   long long c0 = clock64();
   float acc = 0.f;
-  if (warp == 8) {  // QK issuer
+  if (warp == 8 || (W2 && warp == W2)) {  // QK issuer(s)
     for (int i = 0; i < nsub; ++i) {
       if (chain) {
         if (i >= 1) wait_par(sfree, (i - 1) & 1);
         if (pvon && i >= 2) wait_par(pvr + 8 * (i & 1), ((i >> 1) - 1) & 1);  // bounds the PV lag to 2
       } else if (i >= 2) {
-        wait_par(qkr + 8 * (i & 1), ((i >> 1) - 1) & 1);
+        wait_par(qkr + 8 * (i & 1) + (W2 && warp != 8 ? 16 : 0), ((i >> 1) - 1) & 1);
       }
       asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-      qk<lay>(t, SW128 | ((b0 + (i % NSTG) * STAGE) >> 4), aq);
-      commit(chain ? sfull : qkr + 8 * (i & 1));
+      if constexpr (W2 != 0)
+        qk_half(warp == 8 ? 0 : 1, t, SW128 | ((b0 + (i % NSTG) * STAGE) >> 4), aq);
+      else
+        qk<lay>(t, SW128 | ((b0 + (i % NSTG) * STAGE) >> 4), aq);
+      commit(chain ? sfull : qkr + 8 * (i & 1) + (W2 && warp != 8 ? 16 : 0));
     }
     if (chain)
       wait_par(sfree, (nsub - 1) & 1);
     else
-      for (int i = nsub > 2 ? nsub - 2 : 0; i < nsub; ++i) wait_par(qkr + 8 * (i & 1), (i >> 1) & 1);
-  } else if (warp == 9 && pvon) {  // PV issuer
+      for (int i = nsub > 2 ? nsub - 2 : 0; i < nsub; ++i)
+        wait_par(qkr + 8 * (i & 1) + (W2 && warp != 8 ? 16 : 0), (i >> 1) & 1);
+  } else if (warp == 10 && pvon) {  // PV issuer (sub-partition 2)
     for (int i = 0; i < nsub; ++i) {
       if (chain) wait_par(go + 8 * (i & 3), (i >> 2) & 1);
       if (i >= 2) wait_par(pvr + 8 * (i & 1), ((i >> 1) - 1) & 1);
@@ -229,10 +246,12 @@ int main(int argc, char** argv) {
   CK(cudaFuncSetAttribute(rt<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM + 1024));
   CK(cudaFuncSetAttribute(rt<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM + 1024));
   CK(cudaFuncSetAttribute(rt<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM + 1024));
+  CK(cudaFuncSetAttribute(rt<0, 9>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM + 1024));
+  CK(cudaFuncSetAttribute(rt<0, 15>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM + 1024));
   long long* d;
   CK(cudaMalloc(&d, sms * sizeof(long long)));
   const int nsub = argc > 1 ? atoi(argv[1]) : 4096;
-  const char* ln[] = {"L0 h8 (S64, RoPE SS)", "L1 (S48, RoPE TS)", "L2 (S32, RoPE TS)"};
+  const char* ln[] = {"L0 h8 (S64, RoPE SS)", "L1 (S48, RoPE TS)", "L2 (S32, RoPE TS)", "h8 QK N-split", "h8 QK N-split"};
   cudaEvent_t e0, e1;
   CK(cudaEventCreate(&e0));
   CK(cudaEventCreate(&e1));
@@ -240,16 +259,19 @@ int main(int argc, char** argv) {
     int lay, pvon, chain, red;
     const char* what;
   };
-  const M ms[] = {{0, 0, 1, 1, "chain, ld.red (rt13a)"}, {1, 0, 1, 1, "chain, ld.red"}, {2, 0, 1, 1, "chain, ld.red"},
-                  {0, 1, 1, 1, "chain + PV, ld.red"}, {1, 1, 1, 1, "chain + PV, ld.red"},
-                  {0, 1, 0, 1, "free-running QK+PV"}, {1, 1, 0, 1, "free-running QK+PV"},
-                  {0, 0, 0, 1, "free-running QK only"}, {1, 0, 0, 1, "free-running QK only"}};
+  // lay 3 / 4 = h8 with QK N-split over warps 8 + 9 (different sub-partitions) / 8 + 15 (sub-partition 3 vs 0)
+  const M ms[] = {{0, 0, 1, 1, "chain (1 QK warp)"}, {3, 0, 1, 1, "chain, QK N-split 8+9"},
+                  {4, 0, 1, 1, "chain, QK N-split 8+15"}, {0, 1, 1, 1, "chain + PV (1 QK warp)"},
+                  {3, 1, 1, 1, "chain + PV, N-split 8+9"}, {0, 0, 0, 1, "free QK only (1 warp)"},
+                  {3, 0, 0, 1, "free QK only, N-split 8+9"}, {4, 0, 0, 1, "free QK only, N-split 8+15"}};
   for (int rep = 0; rep < 2; ++rep)
     for (const M& m : ms) {
       auto launch = [&](int ns) {
-        if (m.lay == 0) rt<0><<<sms, 320, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
-        else if (m.lay == 1) rt<1><<<sms, 320, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
-        else rt<2><<<sms, 320, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
+        if (m.lay == 0) rt<0><<<sms, 512, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
+        else if (m.lay == 1) rt<1><<<sms, 512, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
+        else if (m.lay == 2) rt<2><<<sms, 512, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
+        else if (m.lay == 3) rt<0, 9><<<sms, 512, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
+        else rt<0, 15><<<sms, 512, SMEM + 1024>>>(m.pvon, m.chain, ns, d, m.red);
       };
       launch(64);
       CK(cudaEventRecord(e0));
@@ -261,7 +283,7 @@ int main(int argc, char** argv) {
       std::vector<long long> h(sms);
       CK(cudaMemcpy(h.data(), d, sms * sizeof(long long), cudaMemcpyDeviceToHost));
       std::sort(h.begin(), h.end());
-      const int n = m.lay == 0 ? 64 : m.lay == 1 ? 48 : 32;
+      const int n = m.lay == 1 ? 48 : m.lay == 2 ? 32 : 64;
       const double cps = (double)h[sms / 2] / nsub, mhz = (double)h[sms / 2] / (msec * 1e3);
       const double c64 = cps * 64.0 / n, usl = msec * 1e3 * 2473.0 / nsub * 64.0 / n;
       printf("rep %d %-22s %-24s clk/rt %6.1f -> %6.1f clk/64 keys at %5.0f MHz | event %7.1f us/layer\n", rep,
