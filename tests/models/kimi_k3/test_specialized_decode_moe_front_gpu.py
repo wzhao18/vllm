@@ -49,7 +49,7 @@ def _same(got, ref):
 @pytest.mark.parametrize("nvfp4", [True, False])
 @pytest.mark.parametrize("n", [32, 64, 96])
 @pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("tiles", ["config", "tr256"])
+@pytest.mark.parametrize("tiles", ["config", "ks4ring3"])
 def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     dev = torch.device("cuda")
     torch.manual_seed(n + 2 * nvfp4 + 4 * padded)
@@ -59,16 +59,17 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     w[E : E + 64] = 0  # zero latent blocks
     bias = (torch.randn(E, device=dev) * 0.1).float()
     pad = (torch.rand(n, device=dev) < 0.3) if padded else None
-    # tr256: 256-row weight tiles (a tile holds router and latent rows), 8-CTA clusters
-    cfg = moe_front.config_for(n) if tiles == "config" else (8, 2, 2, 2, 2, 2, 256)
+    # ks4ring3: 4 K splits (more shared-memory weight blocks) through a 3-slot ring
+    cfg = moe_front.config_for(n, dev) if tiles == "config" else (4, 3)
     stamps = torch.empty(0, dtype=torch.int64, device=dev)
-    cnt = torch.zeros(4, dtype=torch.int32, device=dev)
+    cnt = torch.zeros(64, dtype=torch.int32, device=dev)
+    part = torch.empty(35 * cfg[0] * n * 128, device=dev)
     mod = moe_front._module()
 
     # Test form: y holds the FP32 rows of the whole GEMM.
     y = torch.full((n, E + LATENT), float("nan"), device=dev)
     got = _buffers(nvfp4, dev)
-    mod.moe_front(w, h, y, cnt, bias, *got[:5], pad, E, E, True, SCALE, nvfp4, 1.0,
+    mod.moe_front(w, h, y, cnt, part, bias, *got[:5], pad, E, E, True, SCALE, nvfp4, 1.0,
                   *cfg, stamps)  # fmt: skip
     torch.accelerator.synchronize()
     ref_y = (h.double() @ w.double().t()).float()
@@ -105,7 +106,7 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     for _ in range(2):
         y_r = torch.empty((n, E), device=dev)
         again = _buffers(nvfp4, dev)
-        mod.moe_front(w, h, y_r, cnt, bias, *again[:5], pad, E, E, True, SCALE,
+        mod.moe_front(w, h, y_r, cnt, part, bias, *again[:5], pad, E, E, True, SCALE,
                       nvfp4, 1.0, *cfg, stamps)  # fmt: skip
         torch.accelerator.synchronize()
         assert torch.equal(y_r.view(torch.int32), y[:, :E].view(torch.int32))
@@ -119,7 +120,8 @@ def test_moe_front_rejects_bad_shapes():
     b = _buffers(True, dev)
     with pytest.raises(RuntimeError):
         moe_front._module().moe_front(
-            w, h, torch.zeros((32, E), device=dev), torch.zeros(4, dtype=torch.int32,
-            device=dev), torch.zeros(E, device=dev), *b, None, E, E, True, 1.0, True,
-            1.0, 5, 4, 4, 3, 1, 2, 128, torch.empty(0, dtype=torch.int64, device=dev),
+            w, h, torch.zeros((32, E), device=dev), torch.zeros(64, dtype=torch.int32,
+            device=dev), torch.zeros(35 * 4 * 32 * 128, device=dev),
+            torch.zeros(E, device=dev), *b, None, E, E, True, 1.0, True, 1.0, 4, 0,
+            torch.empty(0, dtype=torch.int64, device=dev),
         )  # fmt: skip

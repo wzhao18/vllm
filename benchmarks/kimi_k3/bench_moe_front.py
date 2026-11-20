@@ -11,7 +11,7 @@ time minus the producer-only graph, i.e. producer end -> front staged.
 Also a stamped moe_front run: per-CTA phase times after the producer's end.
 
 python bench_moe_front.py [--rows 32,64,96] [--layers 8] [--busy-us 6]
-       [--cfg C,wst,xst,nprod,xg ...]
+       [--cfg ks,ns ...]
 """
 
 import argparse
@@ -118,9 +118,8 @@ def main():
     ap.add_argument("--rows", default="32,64,96")
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--busy-us", type=float, default=6.0)
-    ap.add_argument("--cfg", action="append", default=[])
+    ap.add_argument("--cfg", action="append", default=[], help="ks,ns")
     ap.add_argument("--no-base", action="store_true")
-    ap.add_argument("--debug", type=int, default=0)
     ap.add_argument("--carveout", type=int, default=-1, help="producer preferred smem carveout (-1 default)")
     args = ap.parse_args()
     dev = torch.device("cuda")
@@ -137,16 +136,14 @@ def main():
     carve = args.carveout
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     print(f"SMs {sms}; layers {L}; producer busy {args.busy_us} us; carveout {carve}")
-    print(f"  moe_front registers/local bytes: {fm.moe_front_attrs()}")
-    for c in range(2, 9):
-        sm_ = fm.moe_front_smem(32, 8, 2, 2, 128)
-        print(f"  max co-resident clusters C={c} smem {sm_ // 1024}K: {fm.moe_front_max_clusters(c, sm_)}")
+    print(f"  moe_front registers/local bytes/static smem: {fm.moe_front_attrs()}")
     for n in [int(r) for r in args.rows.split(",")]:
         src = torch.randn((n, K), device=dev).to(torch.bfloat16)
         h = torch.empty_like(src)
         y32 = torch.empty((n, E + LATENT), device=dev)
         yr = torch.empty((n, E), device=dev)
-        cnt = torch.zeros(4, dtype=torch.int32, device=dev)
+        cnt = torch.zeros(64, dtype=torch.int32, device=dev)
+        part = torch.empty(35 * 8 * n * 128, device=dev)
 
         def producer_only():
             for _ in range(L):
@@ -155,6 +152,14 @@ def main():
         t_p = _time_graph(producer_only)
         line = f"n{n}: producer {t_p / L:.2f} us/layer"
         if not args.no_base:
+            def cublas():
+                for i in range(L):
+                    pm.prod(src, h, busy, nostamp, carve)
+                    yc = torch.mm(h, ws[i].t(), out_dtype=torch.float32)
+                    rm.route_stage(yc, E, bias, *sess, None, E, True, 2.827, True, 1.0)
+
+            t_c = _time_graph(cublas)
+            line += f" | cublas+route_stage {(t_c - t_p) / L:.2f}"
             try:
                 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.ltpin import LtPin
 
@@ -169,56 +174,33 @@ def main():
                 t_b = _time_graph(base)
                 line += f" | ltpin+route_stage {(t_b - t_p) / L:.2f}"
             except Exception as e:  # noqa: BLE001
-                line += f" | base n/a ({type(e).__name__}: {str(e)[:80]})"
-        cfgs = [tuple(int(v) for v in c.split(",")) for c in args.cfg] or [moe_front.config_for(n)]
+                line += f" | ltpin n/a ({type(e).__name__}: {str(e)[:60]})"
+        cfgs = [tuple(int(v) for v in c.split(",")) for c in args.cfg] or [moe_front.config_for(n, dev)]
         for c in cfgs:
-            csize, wst, xst, nprod, xg, wg, tr = c
-            smem = fm.moe_front_smem((n + 15) // 16 * 16, wst * wg, xst, xg, tr)
-            mc = fm.moe_front_max_clusters(csize, smem)
+            plan = fm.moe_front_plan(n, K, *c)
 
             def front(c=c):
                 for i in range(L):
                     pm.prod(src, h, busy, nostamp, carve)
-                    fm.moe_front(ws[i], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True,
-                                 1.0, *c, nostamp)  # fmt: skip
+                    fm.moe_front(ws[i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
+                                 True, 1.0, *c, nostamp)  # fmt: skip
 
             t_f = _time_graph(front)
-            line += f" | front{c} smem {smem // 1024}K clusters {mc} {(t_f - t_p) / L:.2f}"
-            # Skeleton: same bytes, barriers, reduce and epilogue, no MMAs (probe bit 0).
-            skel = torch.zeros(1, dtype=torch.int64, device=dev)
-
-            def skeleton(c=c):
-                for i in range(L):
-                    pm.prod(src, h, busy, nostamp, carve)
-                    fm.moe_front(ws[i], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True,
-                                 1.0, *c, skel)  # fmt: skip
-
-            t_s = _time_graph(skeleton)
-            line += f" skeleton {(t_s - t_p) / L:.2f}"
-            nopf = torch.zeros(4, dtype=torch.int64, device=dev)  # probe bit 2: no L2 prefetch
-
-            def no_prefetch(c=c):
-                for i in range(L):
-                    pm.prod(src, h, busy, nostamp, carve)
-                    fm.moe_front(ws[i], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True,
-                                 1.0, *c, nopf)  # fmt: skip
-
-            t_n = _time_graph(no_prefetch)
-            line += f" no-L2-prefetch {(t_n - t_p) / L:.2f}"
+            line += f" | front{c} ring {plan[0]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
         print(line, flush=True)
-        # Stamped single layer (eager, after a warm call): phase times after the
-        # producer's end, median over CTAs.
+        # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]
-        grid = -(-(E + LATENT) // c[6]) * c[0]
-        st = torch.zeros(grid * 328 + args.debug, dtype=torch.int64, device=dev)
+        grid = 35 * c[0]
+        st = torch.zeros(grid * 8, dtype=torch.int64, device=dev)
         end = torch.zeros(1, dtype=torch.int64, device=dev)
+
         def stamped():
             pm.prod(src, h, busy, end, carve)
-            fm.moe_front(ws[0], h, yr, cnt, bias, *sess, None, E, E, True, 2.827, True, 1.0,
-                         *c, st)  # fmt: skip
+            fm.moe_front(ws[0], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827, True,
+                         1.0, *c, st)  # fmt: skip
 
         stamped()
-        g = torch.cuda.CUDAGraph()  # graph launch: no CPU gap between the two kernels
+        g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             stamped()
         for _ in range(3):
@@ -226,38 +208,16 @@ def main():
             st.zero_()
             g.replay()
             torch.cuda.synchronize()
-        sv = st[: grid * 328].view(grid, 328)
+        sv = st.view(grid, 8)
         s = (sv.double() - float(end.item())) / 1000.0
-        names = ["entry", "x-wait", "lastMMA", "accum", "reduced", "topk-go", "end"]  # globaltimer
+        names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end"]
         parts = []
         for i, nm in enumerate(names):
-            v = s[:, i]
-            v = v[sv[:, i] != 0]
+            v = s[:, i][sv[:, i] != 0]
             if v.numel():
                 parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
         print(f"  stamps n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
               flush=True)
-        for cta in (0, grid - 1):
-            raw = sv[cta].double()
-            # clock stamps -> us after the producer end via the CTA's entry/end pairs
-            hz = (raw[199] - raw[7]) / max(float(raw[6] - raw[0]), 1.0)  # cycles per ns
-            row = s[cta].clone()
-            for i in list(range(8, 198)) + list(range(200, 328)):
-                if sv[cta, i] != 0:
-                    row[i] = s[cta, 0] + (raw[i] - raw[7]) / hz / 1000.0
-            ok = sv[cta] != 0
-            print(f"  cta{cta} clock {hz.item():.3f} GHz; W slots landed at dependency release: {int(sv[cta, 198]):b}")
-            row[198] = 0
-            xr = [f"{row[8 + i].item():.1f}" for i in range(64) if ok[8 + i]]
-            wr = [f"{row[72 + i].item():.1f}" for i in range(64) if ok[72 + i]]
-            wi = [f"{row[136 + i].item():.1f}" for i in range(64) if ok[136 + i]]
-            mi = [f"{row[200 + i].item():.1f}" for i in range(64) if ok[200 + i]]
-            print(f"  cta{cta} mma-issued {' '.join(mi)}")
-            xi = [f"{row[264 + i].item():.2f}" for i in range(64) if ok[264 + i]]
-            print(f"  cta{cta} x-issue {' '.join(xi)}")
-            print(f"  cta{cta} x-ready {' '.join(xr)}")
-            print(f"  cta{cta} W-ready {' '.join(wr)}")
-            print(f"  cta{cta} W-issue {' '.join(wi)}", flush=True)
 
 
 if __name__ == "__main__":
