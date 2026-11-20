@@ -56,7 +56,19 @@ def test_frost_prefill_matches_flashkda(lens, heads):
 
 
 @pytest.mark.parametrize(
-    "lens,heads", [([37], 8), ([300, 1, 1029], 8), ([2051, 777, 64], 96), ([5461] * 3, 96)]
+    "lens,heads",
+    [
+        ([37], 8),
+        ([300, 1, 1029], 8),
+        ([2051, 777, 64], 96),
+        ([5461] * 3, 96),
+        # TP shards of the 96-head KDA whose beta rows are not 16 B multiples
+        # (TP8: 12 heads; the beta TMA path read wrong rows, BUG-DCP8-3).
+        ([300, 1, 1029], 12),
+        ([2048] * 8, 12),
+        ([37], 4),
+        ([300, 1], 20),
+    ],
 )
 def test_persistent_prefill_matches_flashkda(lens, heads):
     """The persistent core (LPT chain pieces with FP32 state handoffs; the
@@ -98,7 +110,9 @@ def test_persistent_prefill_matches_flashkda(lens, heads):
     assert _rel_rms(state, fs) < 2e-2
 
 
-@pytest.mark.parametrize("lens,heads", [([300, 1, 1029], 8), ([5461] * 3, 96)])
+@pytest.mark.parametrize(
+    "lens,heads", [([300, 1, 1029], 8), ([5461] * 3, 96), ([300, 1, 1029], 12)]
+)
 def test_persistent_prefill_state_in_place(lens, heads):
     """In-place state I/O on a padded state cache (slot stride > H*D*D,
     scattered slots, one sequence without an initial state) is bitwise equal
