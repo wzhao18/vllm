@@ -215,6 +215,22 @@ def _sel_eq(a, b, x, y):
     return code, "=r,r,r,r,r", (Int32(a), Int32(b), Int32(x), Int32(y))
 
 
+@asm(Int32, pure=True)
+def _sel_neg(a, x, y):
+    code = "{ .reg .pred p; setp.lt.s32 p, $1, 0; selp.b32 $0, $2, $3, p; }"
+    return code, "=r,r,r,r", (Int32(a), Int32(x), Int32(y))
+
+
+@asm(Int32)
+def _smid():
+    return "mov.u32 $0, %smid;", "=r", ()
+
+
+@asm(Int32)
+def _ld_nc_s32(address):
+    return "ld.global.nc.s32 $0, [$1];", "=r,l", (Int64(address),)
+
+
 @asm()
 def _bar(barrier_id, count):
     return f"bar.sync {barrier_id}, {count};", "~{memory}", ()
@@ -290,8 +306,13 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False):  # fmt: skip
+                 partials=False, tpcs=0):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
+        # ``tpcs`` > 0: die-static work. One CTA pair per TPC (every SM); each pair
+        # reads its (tile, split) from the table after the split flags (``table_at``,
+        # indexed by %smid / 2: a 2-CTA cluster sits on one TPC, smids 2j / 2j + 1),
+        # so it streams weight rows homed on its own die (PreparedWide places them).
+        self.tpcs = tpcs
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
         self.rows, self.n, self.k, self.split, self.silu = rows, n, k, split, silu
@@ -316,6 +337,11 @@ class WideGemm:
         self.tmem_cols = 32
         while self.tmem_cols < rows:
             self.tmem_cols *= 2
+        # int32 offsets in ``flags``: split counters, then STAMP_BYTES per CTA slot
+        # (split x n_pad / 128 work slots, then one per launched CTA for idle pairs),
+        # then the die-static work table.
+        self.stamp_slots = split * (self.n_pad // 128) + 2 * tpcs
+        self.table_at = 2 * self.n_pad // 128 + self.stamp_slots * STAMP_BYTES // 4
 
     @cute.jit
     def __call__(
@@ -374,7 +400,7 @@ class WideGemm:
             tiled_mma, tma_a, tma_w, tma_b, tma_x, cluster_vmnk, a_layout, b_layout,
             y, ws, flags,
         ).launch(  # fmt: skip
-            grid=(2 * (self.n_pad // 256), self.split, 1),
+            grid=(2 * self.tpcs, 1, 1) if self.tpcs else (2 * (self.n_pad // 256), self.split, 1),
             block=[self.threads, 1, 1],
             cluster=(2, 1, 1),
             stream=stream,
@@ -393,6 +419,18 @@ class WideGemm:
         bidx, split_rank, _ = cute.arch.block_idx()
         v = bidx % 2  # rank in the CTA pair; 0 issues the MMAs
         leader = v == 0
+        tiles = self.n_pad // 256
+        slot = split_rank * (self.n_pad // 128) + bidx  # stamp slot
+        work = Int32(0)
+        if cutlass.const_expr(self.tpcs):
+            # Die-static work of this TPC: tile << 8 | split, or < 0 (idle pair: no
+            # K tiles, a tile index past n, so it skips every load and store).
+            table = mFlags.iterator.toint() + Int64(self.table_at * 4)
+            work = _ld_nc_s32(table + Int64(_smid() >> 1) * 4)
+            slot = _sel_neg(work, Int32(self.split * (self.n_pad // 128)) + bidx,
+                            (work & 255) * (self.n_pad // 128) + 2 * (work >> 8) + v)  # fmt: skip
+            split_rank = _sel_neg(work, Int32(0), work & 255)
+            bidx = 2 * _sel_neg(work, Int32(tiles), work >> 8) + v
         pair = bidx // 2
         rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         coord_vmnk = cluster_vmnk.get_flat_coord(rank_in_cluster)
@@ -427,6 +465,8 @@ class WideGemm:
         k_tiles = self.k // K_TILE
         k0 = split_rank * k_tiles // self.split
         k_count = (split_rank + 1) * k_tiles // self.split - k0
+        if cutlass.const_expr(self.tpcs):
+            k_count = _sel_neg(work, Int32(0), k_count)
         # Pairs of one split walk its K tiles from staggered starts, so the CTAs
         # sharing an activation slice do not read the same lines in lock step
         # (hw37: a hot L2 region broadcast to every SM runs at ~1/3 the spread rate).
@@ -464,8 +504,7 @@ class WideGemm:
         # +32 peers' partials landed, +40 stored, +48 PDL wait done (activations),
         # +56 activations issued, +64 first full stage, +72 last full stage,
         # +80 weights issued; K tile 8: +88 MMA loop top, +96 stages full, +104 issued.
-        stamp = mFlags.iterator.toint() + self.n_pad // 16 + (
-            Int64(split_rank) * (self.n_pad // 128) + bidx) * STAMP_BYTES  # fmt: skip
+        stamp = mFlags.iterator.toint() + self.n_pad // 16 + Int64(slot) * STAMP_BYTES
         n_act, n_w = len(self.act_warps), len(self.weight_warps)
 
         if warp == 0:  # weights: before the PDL wait (stages 0, n_w, ...)
@@ -856,6 +895,60 @@ class WideGemm:
 _COMPILED = {}
 
 
+def die_layout(n, device):
+    """(die of each TPC, indexed by %smid // 2; weight tiles of 256 rows homed on die
+    0). The two SMs of a TPC share a die; the tiles split the rows evenly (each die
+    streams its own half at the die-local rate). Single-die: every tile on die 0."""
+    from ..common.dies import sm_domains
+
+    table = sm_domains(torch.device(device).index or 0)
+    if len(table) % 2:
+        raise ValueError(f"wide GEMM dies: odd smid range {len(table)}")
+    tpc_die = []
+    for t in range(len(table) // 2):
+        a, b = table[2 * t], table[2 * t + 1]
+        if a != b or a < 0:
+            raise ValueError(f"wide GEMM dies: TPC {t} SMs on dies {a} / {b}")
+        tpc_die.append(a)
+    tiles = -(-n // 256)
+    return tuple(tpc_die), (round(n / 512) if max(tpc_die) else tiles)
+
+
+def die_place(weight, t0):
+    """A copy of ``weight`` [N, K] whose rows [0, 256 t0) are homed on die 0 and the
+    rest on die 1 (2 MiB chunks; the chunk across the boundary goes to the die holding
+    most of it). Single-die devices keep ``weight``."""
+    from ..common.dies import CHUNK, domain_count, localized_like
+
+    if domain_count(weight.device.index or 0) == 1:
+        return weight
+    n, k = weight.shape
+    boundary = min(256 * t0, n) * k * weight.element_size()
+    chunks = -(-weight.numel() * weight.element_size() // CHUNK)
+    domains = [0 if (i + 0.5) * CHUNK < boundary else 1 for i in range(chunks)]
+    return localized_like(weight, domains).view(weight.dtype).view(n, k)
+
+
+def work_table(tpc_die, t0, tiles, split):
+    """Per TPC: ``tile << 8 | split`` of its die's next work, or -1 (idle pair). Die 0
+    takes tiles [0, t0), die 1 the rest; raises when a die has more works than TPCs."""
+    works = (
+        [(t, s) for t in range(t0) for s in range(split)],
+        [(t, s) for t in range(t0, tiles) for s in range(split)],
+    )
+    table, used = [], [0, 0]
+    for d in tpc_die:
+        i = used[d]
+        used[d] += 1
+        table.append(works[d][i][0] << 8 | works[d][i][1] if i < len(works[d]) else -1)
+    for d in (0, 1):
+        if used[d] < len(works[d]):
+            raise ValueError(
+                f"wide GEMM dies: {len(works[d])} works on die {d}, {used[d]} TPCs"
+            )
+    return table
+
+
 def permute_gate_up(weight):
     """[gate; up] rows -> per 128-row tile 64 gate rows then their 64 up rows."""
     n, k = weight.shape
@@ -870,10 +963,15 @@ class PreparedWide:
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
     [T, N / 2] with ``silu``)."""
 
-    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False):
+    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False,
+                 dies=False):  # fmt: skip
         self.silu, self.out_f32, self.partials = silu, out_f32 or partials, partials
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
+        # ``dies``: die-static work (``WideGemm`` ``tpcs``) on a die-placed copy of
+        # the weight (``die_place``); the caller re-points other users at
+        # ``self.weight``.
+        self.dies = dies
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
         # [, weight issuer warps[, direct exchange[, rotate]]]]]) (``WideGemm`` arguments)
         self.policies = {}
@@ -885,15 +983,19 @@ class PreparedWide:
 
     def prepare(self):
         dev = self.weight.device
+        sms = torch.cuda.get_device_properties(dev).multi_processor_count
+        tpc_die = t0 = None
+        if self.dies:
+            tpc_die, t0 = die_layout(self.n, dev)
+            self.weight = die_place(self.weight, t0)
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials,
+                w_warps, direct, rotate, self.partials, len(tpc_die) if self.dies else 0,
             )  # fmt: skip
             n_pad = gemm.n_pad
-            sms = torch.cuda.get_device_properties(dev).multi_processor_count
             if n_pad // 128 * split > sms:  # the splits spin on each other: one wave
                 raise ValueError(f"wide GEMM: {n_pad // 128 * split} CTAs > {sms} SMs")
             x = torch.empty(rows, self.k, dtype=torch.bfloat16, device=dev)
@@ -904,14 +1006,13 @@ class PreparedWide:
             ws = torch.full(
                 (max(split, 1), n_pad, rows), SENTINEL, dtype=torch.int32, device=dev
             ).view(torch.float32)
-            flags = torch.zeros(
-                2 * n_pad // 128 + STAMP_BYTES // 4 * split * n_pad // 128,
-                dtype=torch.int32,
-                device=dev,
-            )
+            table = work_table(tpc_die, t0, n_pad // 256, split) if self.dies else []
+            flags = torch.zeros(gemm.table_at + len(table), dtype=torch.int32, device=dev)
+            if self.dies:
+                flags[gemm.table_at :] = torch.tensor(table, dtype=torch.int32)
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
             key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
-            key += self.policies[rows]
+            key += self.policies[rows] + (gemm.tpcs,)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
