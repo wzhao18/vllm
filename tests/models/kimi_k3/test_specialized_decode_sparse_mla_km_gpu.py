@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi K3.1 SP decode sparse MLA on Rubin: the keys-on-M kernel (dsa.sparse_mla_km,
-SP_KERNELS rows) against FlashInfer trtllm-gen, the stock decode's kernel, on the same
+"""Kimi K3.1 SP decode sparse MLA on Rubin: the keys-on-M kernel (dsa.sparse_mla_km)
+and the latent-Q-in-TMEM kernel (dsa.sparse_mla_ts, SP_KERNELS rows) against FlashInfer
+trtllm-gen, the stock decode's kernel, on the same
 FP8 query (96 real of 128 mailbox heads), per-tensor FP8 KV rows, flat slots and
 counts (~512 keys per row of a DCP4 shard, rows without keys included).
 
@@ -45,8 +46,9 @@ def _case(rows, gen):
     return query, kv, slots, valid
 
 
+@pytest.mark.parametrize("kernel", ["km", "ts"])
 @pytest.mark.parametrize("rows", [68, 256])
-def test_keys_on_m_matches_trtllm_gen(rows):
+def test_keys_on_m_matches_trtllm_gen(rows, kernel):
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_km import (  # noqa: E501
@@ -69,10 +71,20 @@ def test_keys_on_m_matches_trtllm_gen(rows):
         max_seq_len=WIDTH, out=lat_t.unsqueeze(1), bmm1_scale=BMM1, bmm2_scale=BMM2,
         sparse_mla_top_k=WIDTH, return_lse=True, lse=lse_t, **extra,
     )  # fmt: skip
-    sparse_mla_decode_km(
-        query.view(torch.uint8), kv.view(torch.uint8), slots, valid, lat_k, lse_k,
-        BMM1, BMM2,
-    )  # fmt: skip
+    if kernel == "km":
+        sparse_mla_decode_km(
+            query.view(torch.uint8), kv.view(torch.uint8), slots, valid, lat_k, lse_k,
+            BMM1, BMM2,
+        )  # fmt: skip
+    else:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_ts import (  # noqa: E501
+            sparse_mla_decode_ts,
+        )
+
+        sparse_mla_decode_ts(
+            query.view(torch.uint8), kv.view(torch.uint8), slots, valid, lat_k, lse_k,
+            BMM1, BMM2,
+        )  # fmt: skip
     torch.cuda.synchronize()
 
     keyed = valid > 0
