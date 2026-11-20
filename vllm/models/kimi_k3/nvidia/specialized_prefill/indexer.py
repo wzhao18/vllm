@@ -2800,41 +2800,49 @@ def _no_sched(dev):
 
 
 class TailFree:
-    """Equal shares of an item list's tile pairs for ``ctas`` persistent CTAs (the
-    whole-item schedule leaves the CTAs with one item fewer idle for a whole item
-    at the end). The items, longest first, are cut into consecutive shares; an item
-    cut between CTAs c and c + 1 runs its newer pairs on c and its older pairs on
-    c + 1, which continue the candidate lists after a hand-over flag. Each CTA
-    takes its share's units in reverse order, so a hand-over is the first unit of
-    one CTA and the last unit of the next: the wait never stalls in practice.
+    """Balanced shares of an item list's tile pairs for ``ctas`` persistent CTAs. The
+    whole-item round-robin leaves the CTAs with one item fewer idle for a whole item
+    at the end (2049 items on 212 CTAs: 141 take 10, 71 take 9); a contiguous cut of
+    the list balances the work but desynchronizes the CTAs, which then stop reading
+    the same key tiles together (33% more L2 reads, 4% slower tiles in-step). So
+    the round-robin rounds stay and only the excess moves: a CTA with one item more
+    runs the newer pairs of its last item first and hands the older pairs over to a
+    CTA with one item fewer, which takes them after its own items and continues the
+    candidate lists (hand-over flag, release/acquire, self-resetting).
     ``units``: Int32 [m, 8] (token0, ntok, key0, ntiles, first pair, end pair, flag
     to wait for or -1, flag to set or -1), ``unit_off``: Int32 [ctas + 1]."""
 
     def __init__(self, items, ctas, device):
+        import heapq
+
         self.ctas = ctas
         pairs = [(it[3] + 1) // 2 for it in items]
-        total = sum(pairs)
-        shares = [[] for _ in range(ctas)]
-        c, done, nflag = 0, 0, 0
-        for it, n in zip(items, pairs):
-            pb, cin = 0, -1
-            while pb < n:
-                end = (c + 1) * total // ctas
-                take = min(n - pb, end - done)
-                if take <= 0 and c + 1 < ctas:
-                    c += 1
-                    continue
-                take = n - pb if c + 1 == ctas else take
-                cout = -1
-                if pb + take < n:
-                    cout, nflag = nflag, nflag + 1
-                shares[c].append([*it, pb, pb + take, cin, cout])
-                cin = cout
-                pb += take
-                done += take
+        own = [list(range(c, len(items), ctas)) for c in range(ctas)]
+        load = [sum(pairs[k] for k in o) for o in own]
+        target = sum(pairs) / ctas
+        most = max((len(o) for o in own), default=0)
+        lists = [[[*items[k], 0, pairs[k], -1, -1] for k in o] for o in own]
+        takers = [(load[c] - target, c) for c in range(ctas) if len(own[c]) < most]
+        heapq.heapify(takers)
+        nflag = 0
+        for c in range(ctas):
+            if not takers or len(own[c]) < most or not own[c]:
+                continue
+            last = lists[c].pop()
+            give = min(max(round(load[c] - target), 0), pairs[own[c][-1]] - 1)
+            if give == 0:
+                lists[c].append(last)
+                continue
+            keep = last[5] - give
+            # the newer pairs first on this CTA, the older ones last on a taker
+            lists[c].insert(0, [*last[:4], 0, keep, -1, nflag])
+            deficit, t = heapq.heappop(takers)
+            lists[t].append([*last[:4], keep, last[5], nflag, -1])
+            heapq.heappush(takers, (deficit + give, t))
+            nflag += 1
         units, off = [], [0]
-        for sh in shares:
-            units.extend(reversed(sh))
+        for lst in lists:
+            units.extend(lst)
             off.append(len(units))
         self.units = torch.tensor(units, dtype=torch.int32, device=device).view(-1, 8)
         self.unit_off = torch.tensor(off, dtype=torch.int32, device=device)
