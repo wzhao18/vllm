@@ -1494,9 +1494,15 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
             fi.decode = spy
         states = []
 
+        prep_ = block.core.prepared
+        lq = getattr(prep_, "local", None)
+
         def _snap(tag, out):
+            extra_t = []
+            if lq is not None:
+                extra_t = [lq.buffers.q[:r].clone(), prep_.query_stage.qc[:r].clone()]
             states.append((tag, out.clone(), block.attn_out[:r].clone(),
-                           [t.clone() for t in rec.get("t", [])],
+                           [t.clone() for t in rec.get("t", [])] + extra_t,
                            [t.clone() for t in rec.get("o", [])]))
 
         def _ulps(a, b):
