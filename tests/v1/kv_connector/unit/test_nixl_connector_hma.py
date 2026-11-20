@@ -52,6 +52,7 @@ def region_pull_worker():
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.engine_id = "D"
     worker.tp_rank = 0
     worker.block_size = 64
@@ -360,6 +361,7 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.use_mla = use_mla
     plan = MagicMock()
     plan.all_source_ranks = source_ranks
@@ -537,6 +539,7 @@ def test_apply_dcp_prefix_caching_matches_global_logical_positions(
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
 
     actual_local, actual_remote = worker._apply_dcp_prefix_caching(
         local_ids,
@@ -567,6 +570,7 @@ def test_logical_to_kernel_block_ids_with_hma():
     # Create a mock worker with just the required attributes
     # (use __new__ to skip __init__)
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
 
     # Simulate HMA scenario: logical block size = 32, kernel block size = 16
     # So each logical block maps to 2 kernel blocks eg [0]->[0,1]
@@ -612,6 +616,7 @@ def test_sync_device_after_direct_recv_gates(
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._has_mamba = has_mamba
     worker.use_host_buffer = use_host_buffer
 
@@ -697,6 +702,7 @@ def test_read_blocks_for_req_expands_remote_ids(
     resolved_types = tuple(spec_name_to_type[n] for n in group_spec_types)
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker._invalid_remote_engines = set()
     worker._remote_registration_generations = {}
@@ -808,6 +814,7 @@ def test_apply_prefix_caching_mamba_hybrid(
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._has_mamba = True
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker._group_spec_types = (FullAttentionSpec, MambaSpec)
@@ -888,6 +895,7 @@ def test_apply_prefix_caching_ssm_prefix_cache_hit(
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._has_mamba = True
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker._group_spec_types = (FullAttentionSpec, MambaSpec)
@@ -919,6 +927,7 @@ def test_apply_prefix_caching_ssm_unpairable_slots_rejected():
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._has_mamba = True
     worker._physical_blocks_per_logical_kv_block = 10
     worker._group_spec_types = (FullAttentionSpec, MambaSpec)
@@ -995,6 +1004,7 @@ def test_mismatched_physical_per_logical_fails_with_prefix_caching(
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker.kv_cache_config = make_kv_cache_config(
         block_size=16,
@@ -2063,6 +2073,7 @@ def test_logical_to_kernel_block_ids_with_remote_ratio(
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker.kv_cache_config = make_kv_cache_config(
         block_size=16,
@@ -2386,6 +2397,7 @@ def test_push_write_hybrid_mla_replicates_attention():
     from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 
     worker = object.__new__(NixlPushConnectorWorker)
+    worker._sub_block_peers = {}
     worker.shutdown = lambda: None  # type: ignore[method-assign]  # silence __del__
     worker.use_mla = True
     worker._has_mamba = True
@@ -2447,6 +2459,7 @@ def _make_host_buffer_worker(copy_op):
     )
 
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.use_host_buffer = True
     worker.copy_blocks = copy_op
     return worker

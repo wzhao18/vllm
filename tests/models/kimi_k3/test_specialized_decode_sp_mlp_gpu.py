@@ -92,6 +92,8 @@ def silu_and_mul(x):
 class Shared(types.SimpleNamespace):
     """The shared expert: the stock ``KimiMLP`` methods bound to stand-in fields."""
 
+    _prefill_situ = None  # KimiMLP class default (prefill SiTU epilogue, unset in decode)
+
     def __call__(self, x):
         return self.forward(x)
 
@@ -210,6 +212,37 @@ def test_graph_replay():
     graph.replay()
     torch.accelerator.synchronize()
     assert torch.equal(got, want)
+
+
+def test_latent_up_parts():
+    """The latent up's FP32 split partials (``parts``) formed as stock's cuBLAS
+    beta-add does (BF16 GEMM output, then + residual, rounded): the stock output up to
+    the K order (within a BF16 ulp, nearly every element bitwise)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.sp_fused import (
+        SplitDelta,
+    )
+
+    mlp = layer(True, seed=3)
+    spm = sp_mlp.SpMlp(mlp, ROWS, context(), 1)
+    assert spm.parts, "no latent up rows on the partials GEMM"
+    g = torch.Generator(device=DEVICE).manual_seed(3)
+    h = torch.randn(max(ROWS), HIDDEN, device=DEVICE, generator=g).bfloat16()
+    for n, split in spm.parts.items():
+        want = spm.run(h[:n]).float()
+        got = spm.run(h[:n], parts=True)
+        assert isinstance(got, SplitDelta) and got.parts == split, n
+        p = got.partials.view(split, n, HIDDEN)
+        total = p[0].clone()
+        for s in range(1, split):
+            total += p[s]
+        out = (total.bfloat16().float() + got.residual.float()).bfloat16().float()
+        def ulp(t):
+            return (t.abs().clamp_min(1e-30).log2().floor() - 7).exp2()
+
+        # a K-order ulp of the GEMM output carries through the residual add
+        bound = ulp(want) + ulp(total) + 1e-4 * want.abs().amax()
+        assert ((out - want).abs() <= bound).all(), n
+        assert (out == want).float().mean().item() > 0.99, n
 
 
 def test_unreproducible_layers_raise():

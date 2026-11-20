@@ -113,8 +113,9 @@ class Fakes:
                 assert 0 < col < self.width and width < self.width, (col, width)
                 self.pushes.append((rows, col))
 
-        def boundary(decoder, comm, block, rows, mlp=None):
+        def boundary(decoder, comm, block, rows, mlp=None, delta_parts=()):
             assert block.oproj.comm is comm and tuple(rows) == tuple(ROWS), rows
+            assert delta_parts == (), delta_parts  # stand-in MLPs have no split partials
             assert (mlp is None) == (decoder.layer_idx == 0), decoder.layer_idx
             fakes.events.add("SpBoundary", decoder.layer_idx, block.parity)
             return SimpleNamespace(layer=decoder.layer_idx, comm=comm)
@@ -185,14 +186,15 @@ class Fakes:
                 assert mlp.use_mega_moe and ctx.sequence_parallel
                 assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
                 gaps = fakes.gaps.get("moe_dense", ())
-                self.parts = {}
+                self.providers = {}
                 for f in ("latent_down", "shared_gu", "shared_down", "latent_up"):
-                    self.parts[f] = Provider(rows, gaps)
-                    self.parts[f].family = f
+                    self.providers[f] = Provider(rows, gaps)
+                    self.providers[f].family = f
+                self.parts = {}  # SpMlp.parts: no latent up split-partial rows
                 fakes.events.add("SpMlp", index)
 
             def choices(self, n):
-                return {f: p.choice(n) for f, p in self.parts.items()}
+                return {f: p.choice(n) for f, p in self.providers.items()}
 
         def tactics(family, n, k, rows, ctx):
             assert ctx.sequence_parallel and ctx.tp == TP, ctx

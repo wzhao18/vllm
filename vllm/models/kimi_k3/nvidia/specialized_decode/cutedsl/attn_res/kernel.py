@@ -19,6 +19,7 @@ from ..common.primitives import (
     at,
     bf16,
     bf16x2,
+    bits_float,
     dot,
     fma,
     group_barrier,
@@ -91,8 +92,16 @@ class ClusterAttnRes:
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
         stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
-        out_mc=False, out_mx=None,
+        out_mc=False, out_mx=None, delta_parts=0,
     ):  # fmt: skip
+        # ``delta_parts`` (slots 0): the delta is the beta-add GEMM's output left as
+        # FP32 split-K partials: ``post`` takes (partials [parts * n, 7168] FP32,
+        # residual [n, 7168] BF16) and forms the delta as stock's cuBLAS beta-add does
+        # on Rubin (a BF16 output reduce-added into the residual: two roundings,
+        # measured bitwise on every element): bf16(bf16(partials summed in split
+        # order) + residual).
+        assert not (delta_parts and slots), (delta_parts, slots)
+        self.delta_parts = delta_parts
         # ``out_mc`` (row-sharded AttnRes, M >= 256, ``attn_res.sharded``): the output
         # row (and the aux rows) go to every rank's Lamport all-gather row row0 + token
         # at the trailing multicast address (the aux args are multicast addresses too)
@@ -253,6 +262,31 @@ class ClusterAttnRes:
             store_words(block_ptr(blocks, token, self.write, col), row)
 
     @cute.jit
+    def sum_parts(self, delta, token, col, cur):
+        """cur[0, :8] = bf16(bf16(partials summed in split order) + residual) at
+        (token, col)."""
+        parts, residual = delta
+        n = residual.shape[0]
+        for p in cutlass.range_constexpr(self.delta_parts):
+            for h in cutlass.range_constexpr(2):
+                words = load_words(
+                    at(parts, p * n + token, col + 4 * h), count=4, mutable=True
+                )
+                for i in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(p == 0):
+                        cur[0, 4 * h + i] = bits_float(words[i])
+                    else:
+                        cur[0, 4 * h + i] = cur[0, 4 * h + i] + bits_float(words[i])
+        for j in cutlass.range_constexpr(4):  # the GEMM's BF16 output
+            round_pair(cur, 0, j)
+        res = cute.make_rmem_tensor((1, 8), Float32)
+        unpack(load_words(at(residual, token, col), count=4, mutable=True), res, 0)
+        for i in cutlass.range_constexpr(8):
+            cur[0, i] = cur[0, i] + res[0, i]
+        for j in cutlass.range_constexpr(4):  # + the residual, rounded again
+            round_pair(cur, 0, j)
+
+    @cute.jit
     def post(
         self, state, bufs, delta, rows, output, eps: Float32, out_eps: Float32, ids, aux
     ):
@@ -273,7 +307,10 @@ class ClusterAttnRes:
         cur = cute.make_rmem_tensor((1, 8), Float32)
         if cutlass.const_expr(self.slots == 0):
             cute.arch.griddepcontrol_wait()
-            unpack(load_words(at(delta, token, col), count=4, mutable=True), cur, 0)
+            if cutlass.const_expr(self.delta_parts > 0):
+                self.sum_parts(delta, token, col, cur)
+            else:
+                unpack(load_words(at(delta, token, col), count=4, mutable=True), cur, 0)
         else:
             cur.fill(0)
             base = delta.iterator + token * 7168 + col
