@@ -112,6 +112,7 @@ def main():
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.bf16_gemm import Bf16Gemm
 
     torch.manual_seed(0)
+    torch.zeros(1, device="cuda")  # CUDA context before the CuTeDSL hardware queries
     T = args.rows
     base = Bf16Gemm()
     ab_sum = AbGemm(load_example(False))
