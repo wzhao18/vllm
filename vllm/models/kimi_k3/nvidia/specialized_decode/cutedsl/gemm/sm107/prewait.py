@@ -60,6 +60,9 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     gemm.dbg_skip_mma = bool(dbg & 1)
     gemm.max_ab_stages = max_stages
     gemm.k_rotate = k_rotate
+    # swap_ab: the token tiles that share one weight tile must be adjacent clusters (same
+    # die, concurrent), so the weight tile is streamed once and re-read from the local L2.
+    gemm.raster_order = "n" if swap_ab else "m"
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16)
