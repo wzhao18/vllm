@@ -986,6 +986,8 @@ class SwapABGatedActEpilogue(KernelComponent):
     use_tanh_sigmoid = False
     # vLLM-local S3 SiTU core (VENDOR.md): the prefill dedup epilogue only; GenPhase decode keeps upstream.
     situ_core_s3 = False
+    # vLLM-local (prefill dedup only): warpgroup 1 runs the FC1 subtile chain phase-shifted (see _subtile_activation).
+    fc1_wg1_phase_shift = False
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -1934,6 +1936,39 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             wrap_into_copy_standard_layout(tmem_subtile_tensor_in_first_load_view[None, 3]),
             wrap_into_copy_standard_layout(up_token_32_64),
         )
+
+        if cutlass.const_expr(self.fc1_wg1_phase_shift and self.two_epilogue_warpgroups):
+            # The two warps of an SM sub-partition (one per warpgroup) run their subtile chains in lockstep, so both
+            # wait on the MUFU pipe (SiTU) and then both on TMEM (transposes). Warpgroup 1 runs the same steps
+            # phase-shifted (transpose, SiTU, transpose, SiTU against SiTU, transpose, SiTU, transpose): the pair
+            # alternates pipes. Same values, same TMEM scratch order (32x32 before 16x32).
+            token_0_32_pre_quant = cute.make_rmem_tensor((16,), cutlass.Float32)
+            token_32_64_pre_quant = cute.make_rmem_tensor((16,), cutlass.Float32)
+            if self.warpgroup_idx == cutlass.Int32(1):
+                g1t, u1t = TmemTranspose32x32Inplace(
+                    tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
+                ).from_r1_perm_until_last_store()
+                a0 = self.alpha_swiglu_clamp(gate_token_0_32, up_token_0_32, alpha_val)
+                a0t = TmemTranspose16x32(
+                    tmem_subtile_tensor.iterator, Region.Top, reg_tensor=a0
+                ).from_r1_perm_until_last_store()
+                a1 = self.alpha_swiglu_clamp(g1t, u1t, alpha_val)
+                for r in cutlass.range_constexpr(16):
+                    token_0_32_pre_quant[r] = a0t[r]
+                    token_32_64_pre_quant[r] = a1[r]
+            else:
+                a0 = self.alpha_swiglu_clamp(gate_token_0_32, up_token_0_32, alpha_val)
+                g1t, u1t = TmemTranspose32x32Inplace(
+                    tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
+                ).from_r1_perm_until_last_store()
+                a1 = self.alpha_swiglu_clamp(g1t, u1t, alpha_val)
+                a0t = TmemTranspose16x32(
+                    tmem_subtile_tensor.iterator, Region.Top, reg_tensor=a0
+                ).from_r1_perm_until_last_store()
+                for r in cutlass.range_constexpr(16):
+                    token_0_32_pre_quant[r] = a0t[r]
+                    token_32_64_pre_quant[r] = a1[r]
+            return (token_0_32_pre_quant, token_32_64_pre_quant)
 
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(gate_token_0_32, up_token_0_32, alpha_val)
