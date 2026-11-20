@@ -25,6 +25,11 @@ from ..shapes import Choice, Path, Unsupported
 logger = init_logger(__name__)
 
 PLACE_SAMPLES, PLACE_PASSES = 8, 5
+# The most shard rows DenseStream serves; above, the stock dense MLP (cuBLAS) on the
+# same (re-homed) weights. In-step ABBA (fastab dd-ds1, D3-32 slice, Hecate): rows 32
+# -10.9 us/step; rows 64 / 96 +15.6 / +15.7 (gate_up 111-119 us in-step vs 90-98
+# standalone: the predecessor's tail overlap and the end-of-stream SiTU).
+STREAM_ROWS = 32
 
 
 def dense_cause(mlp):
@@ -120,9 +125,9 @@ class SpDenseMlp:
         act = mlp.act_fn
         beta = float(act.beta)
         linear = -1.0 if act.linear_beta is None else float(act.linear_beta)
-        self.rows = tuple(sorted(set(rows)))
-        if not self.rows or self.rows[-1] > 128:
-            raise Unsupported("dense", None, f"layer {index}: shard rows {self.rows}")
+        self.rows = tuple(n for n in sorted(set(rows)) if n <= STREAM_ROWS)
+        if not self.rows:
+            raise Unsupported("dense", None, f"layer {index}: no shard rows <= {STREAM_ROWS}")
         self.table, self.s0, self.s1 = die_map(device)
         two = self.s1 > 0
         nb0_gu = dsm.split_blocks(inter // 128, self.s0, self.s1)
@@ -171,7 +176,14 @@ class SpDenseMlp:
                                          self.s0, self.s1, cute_stream(dev))  # fmt: skip
         return fn
 
+    def serves(self, n):
+        return n in self.rows
+
     def choice(self, n):
+        if n > STREAM_ROWS:
+            return Choice(
+                Path.STOCK, note=f"stock dense MLP above {STREAM_ROWS} shard rows (sp_dense)"
+            )
         if n not in self.rows:
             raise Unsupported("dense", n, "shard rows not prepared")
         return Choice(Path.GENERIC, "stream", note="DenseStream die-local (sp_dense)")
