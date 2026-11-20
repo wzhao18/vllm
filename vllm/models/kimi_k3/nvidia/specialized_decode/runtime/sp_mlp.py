@@ -30,6 +30,7 @@ import torch
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from ...mxfp8 import is_mxfp8_linear
+from .. import prewait_gemm
 from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.gemm.mxfp8 import Mxfp8Projection
 from ..cutedsl.gemm.sp_policy import sp_projection_tactics
@@ -132,6 +133,7 @@ class SpMlp:
             if rows_policy(ROUTER_LATENT, Shape(r, 1), default=None) == "ltpin"
         )  # fmt: skip
         self.router_latent = self.route_stage = None
+        self.prewait_router_latent = None
         if (
             concat_rows
             and router_concat_cause(mlp) is None
@@ -148,6 +150,10 @@ class SpMlp:
                 mlp.gate.weight.shape[0],
             )  # fmt: skip
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
+            # Pre-wait weight-streaming GEMM at the token counts it serves (its own
+            # tile-image copy: the stock linears stay views of the row-major concat).
+            if any(prewait_gemm.supported(r, k) for r in concat_rows):
+                self.prewait_router_latent = prewait_gemm.pack_weight(packed)
         try:
             weights = {
                 "latent_down": bf16_weight(mlp.routed_expert_down_proj),
@@ -270,7 +276,11 @@ class SpMlp:
             # top-k routes and the quantized latent into MegaMoE (route_stage).
             packed, gemm, _ = self.router_latent
             y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
-            gemm.run(packed, h, y)
+            pw = self.prewait_router_latent
+            if pw is not None and prewait_gemm.supported(n, packed.shape[1]):
+                prewait_gemm.gemm(y, h, pw, packed.shape[0])
+            else:
+                gemm.run(packed, h, y)
             # Staged before the shared expert forks to its stream: nothing
             # competes with the MegaMoE front.
             staged = route.stage(y)
