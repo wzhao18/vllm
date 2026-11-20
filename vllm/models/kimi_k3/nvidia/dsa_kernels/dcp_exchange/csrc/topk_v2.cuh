@@ -346,9 +346,9 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
   return false;  // unreachable: the second round has width 1
 }
 
-// R2L: ONE more NVLink round of explicit (key, global id) lists for every row round 1 leaves
-// unresolved whose bracket keys are candidates on every rank. tau known (tier 2: a band missed
-// its ties; tier 3: ties beyond the tie list): lo = hi = tau, the lists are the ties. tau
+// R2L: ONE more NVLink round of explicit (key, global id) lists for the tier-3 rows round 1
+// leaves unresolved whose bracket keys are candidates on every rank. tau known (ties beyond
+// the tie list): lo = hi = tau, the lists are the ties. tau
 // unknown (rank-skewed rows): v2_cg's bracket, lo = the largest theta (every rank's keys >= lo
 // are candidates), hi = the largest exact q-th key (tau <= hi). Each rank sends its candidates
 // in [lo, hi] (R2 slot, unordered) and its count above hi; every rank derives tau (K-th
@@ -360,12 +360,15 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
 template <int T>
 __device__ __noinline__ int v2_r2l(const V2Params p, const uint32_t* rx, uint32_t* hist, uint32_t* z,
                                    int zwords, const uint16_t* ckey, const uint32_t* cpos, int nc,
-                                   uint32_t tag, int par, int row, uint32_t* warp_sums, int* s_i) {
+                                   uint32_t tag, int par, int row, uint32_t* warp_sums, int* s_i,
+                                   long long* s_dbg) {
   __shared__ int s_l[4];  // 0 lo (-1: not eligible), 1 hi, 2 list length, 3 ties
   __shared__ int s_rn[kV2MaxW];
   __shared__ uint32_t s_ra[kV2MaxW + 1];
   const int tid = threadIdx.x, lane = tid & 31, W = p.W, K = p.K, IL = p.interleave;
   uint32_t ws_par = 0;
+#define R2LDBG(i) \
+  if (p.dbg && tid == 0) s_dbg[i] = (long long)clock64();
   const int cap = min(min(kR2Cap, kCoarseBins / W), (zwords / (W + 1) - 8) / 2);  // tie ids fit hist
   const int RW = (4 + 2 * cap + 3) & ~3;
   uint32_t* const snd = z;
@@ -434,6 +437,7 @@ __device__ __noinline__ int v2_r2l(const V2Params p, const uint32_t* rx, uint32_
         for (int d = 0; d < W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + base + 4 * j, v);
     }
   }
+  R2LDBG(7);
   const uint4 dead = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
   auto poll = [&](int r, int j) -> uint4 {  // vector j of rank r's slot, then re-armed
     uint32_t* src = p.box + r2row + (int64_t)r * kR2W + 4 * j;
@@ -457,6 +461,7 @@ __device__ __noinline__ int v2_r2l(const V2Params p, const uint32_t* rx, uint32_
     for (int j = 1 + tid; j < nvr; j += T) *reinterpret_cast<uint4*>(rcv + r * RW + 4 * j) = poll(r, j);
   }
   __syncthreads();
+  R2LDBG(11);
   int A = 0, M = 0;
   bool bad = false;
   for (int r = 0; r < W; ++r) {
@@ -495,6 +500,7 @@ __device__ __noinline__ int v2_r2l(const V2Params p, const uint32_t* rx, uint32_
   }
   if (tid == 0) { s_l[3] = 0; s_i[3] = 0; }
   __syncthreads();
+  R2LDBG(13);
   const int tau = s_i[1], need = s_i[2];
   if (tau < lo) return 2;
   // ties at tau: every rank's global ids, then this rank's quota (its ties ranked below need)
@@ -531,7 +537,9 @@ __device__ __noinline__ int v2_r2l(const V2Params p, const uint32_t* rx, uint32_
     if (p.stats) atomicAdd(&p.stats[w == 1 ? 2 : 3], 1);
   }
   __syncthreads();
+  R2LDBG(16);
   return 1;
+#undef R2LDBG
 }
 
 // One row. kFast: the common case only, compact code (in-step every call fetches the
@@ -1426,14 +1434,15 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // missed its ties) takes the tie round below instead: tau lies in every window, so every
       // rank's ties are in its candidates.
       //
-      // ---- R2L first (tie-band misses, ties beyond the tie list, rank-skewed rows): one
+      // ---- R2L first (ties beyond the tie list, rank-skewed rows; a tie-band miss keeps the
+      // sorted-list tie round, cheaper for many ties): one
       // round of explicit lists, out of line (v2_r2l); rows it cannot take keep R2, rows it
       // fails after its round (list overflow, tau below its bracket) take the complete body
       int rl = 0;
-      if (K31_RARE(tier == 2 || tier == 3)) {
+      if (K31_RARE(tier == 3)) {
         constexpr int kZ = kV2RxW + kV2Cand + kV2Msg + kV2Win;  // after win (16-byte aligned)
         rl = v2_r2l<T>(p, rx, hist, reinterpret_cast<uint32_t*>(srow) + kZ, kV2NR * T * 4 - kZ,
-                       ckey, cpos, nc, tag, par, row, warp_sums, s_i);
+                       ckey, cpos, nc, tag, par, row, warp_sums, s_i, s_dbg);
         tier = rl == 1 ? 1 : rl == 2 ? 6 : tier;
       }
       if (tier == 3) {
