@@ -481,20 +481,20 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
 
     @property
     def shared_stream_count(self) -> int:
-        """Die-aware: one shared FC1 counter per die (its home half of the FC1 feature blocks) plus the FC2
-        counter; die-blind: the mixin's FC1 + FC2 counters."""
+        """Die-aware: one shared FC1 and one shared FC2 counter per die (its half of the feature blocks);
+        die-blind: the mixin's FC1 + FC2 counters."""
         count = SharedExpertStreamMixin.shared_stream_count.fget(self)
-        return count + (1 if count and self.die_count == 2 else 0)
+        return count + (2 if count and self.die_count == 2 else 0)
 
     @cute.jit
-    def _claim_die_half(self, work_id_worker, side: Int32):
+    def _claim_die_half(self, work_id_worker, side: Int32, fc2: int = 0):
         """Claim from the shared FC1 counter of die ``side`` (its feature blocks [base, base + count), every token
         block). Returns (cluster-level shared FC1 id or -1 past the end, worker)."""
-        feature_blocks = self._shared_feature_blocks[0]
+        feature_blocks = self._shared_feature_blocks[fc2]
         half = feature_blocks // 2
         count = Int32(half) + Int32(feature_blocks - 2 * half) * side
         base = Int32(half) * side
-        local_id = work_id_worker.claim_next_work(self._shared_stream_index + side)
+        local_id = work_id_worker.claim_next_work(Int32(self._shared_stream_index + 2 * fc2) + side)
         shared_id = Int32(-1)
         if local_id < count * Int32(self.shared_token_blocks):
             token_block = local_id // count
@@ -503,27 +503,20 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
 
     @cute.jit
     def _claim_shared_tile(self, work_id_worker, stage: Int32, next_id: Int32, fc2: int):
-        """Die-aware (vLLM-local S-SH): shared FC1 tiles of this die's home half first (the die-local FC1 copy,
-        ``weights.prepare_mxfp8_shared_weights``), then the other die's; FC2 from its own counter. Die-blind: the
-        mixin's single FC1 / FC2 counters."""
+        """Die-aware (vLLM-local S-SH): shared FC1 / FC2 tiles of this die's half first (FC1 from the die-local copy,
+        ``weights.prepare_mxfp8_shared_weights``), then the other die's; per-die counters keep the shared work even
+        across the dies. Die-blind: the mixin's single FC1 / FC2 counters."""
         if cutlass.const_expr(self.die_count == 1):
             return SharedExpertStreamMixin._claim_shared_tile(self, work_id_worker, stage, next_id, fc2)
         work_tile = make_fc12_done_tile(True)
-        if cutlass.const_expr(fc2 == 1):
-            local_id = work_id_worker.claim_next_work(self._shared_stream_index + 2)
-            if local_id < Int32(self._shared_phase_tiles[1]):
-                work_tile = self._decode_shared_tile(local_id, 1)
-            else:
-                stage = stage + Int32(1)
+        own = Int32(self._mapping.owner_index)
+        shared_id, work_id_worker = self._claim_die_half(work_id_worker, own, fc2)
+        if shared_id < Int32(0):
+            shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own, fc2)
+        if shared_id >= Int32(0):
+            work_tile = self._decode_shared_tile(shared_id, fc2)
         else:
-            own = Int32(self._mapping.owner_index)
-            shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
-            if shared_id < Int32(0):
-                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
-            if shared_id >= Int32(0):
-                work_tile = self._decode_shared_tile(shared_id, 0)
-            else:
-                stage = stage + Int32(1)
+            stage = stage + Int32(1)
         return work_tile, stage, next_id, work_id_worker
 
     @cute.jit
