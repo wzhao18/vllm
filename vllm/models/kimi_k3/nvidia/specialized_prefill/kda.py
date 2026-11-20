@@ -115,6 +115,21 @@ def persistent_supported(device: torch.device) -> bool:
     return True
 
 
+def warm_persistent(H: int, device: torch.device, lower_bound: float) -> None:
+    """Compile every persistent-core variant a prefill step can launch for H
+    heads at load, so no serving step compiles (once per process)."""
+    key = (H, device.index, lower_bound)
+    if key in _persistent_warmed:
+        return
+    from .kda_persistent import forward as kp
+
+    kp.warm_compile(H, device, lower_bound)
+    _persistent_warmed.add(key)
+
+
+_persistent_warmed: set = set()
+
+
 def persistent_prefill(
     q: torch.Tensor,
     k: torch.Tensor,

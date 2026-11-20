@@ -920,6 +920,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     torch.device("cuda", torch.accelerator.current_device_index())
                 )
             )
+            if self._kda_persistent:
+                specialized_prefill_kda.warm_persistent(
+                    self.local_num_heads,
+                    torch.device("cuda", torch.accelerator.current_device_index()),
+                    self.gate_lower_bound,
+                )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
