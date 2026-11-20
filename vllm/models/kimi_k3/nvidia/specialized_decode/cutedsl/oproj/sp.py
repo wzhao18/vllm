@@ -84,7 +84,9 @@ WARP_ROWS = 128  # rows whose x / partial tiles fit one CTA's shared memory
 SP_OPROJ = {4: "4-64:warp,65-:gemm"}
 # The online-MXFP8 o-projection per TP on token rows: "pre_push" where the projection
 # runs the "pre" kind (its GEMM, the epilogue pushing to the row owners), elsewhere
-# "mxfp8" (the MXFP8 partial GEMM + ``SpReduceScatter(push=True)``).
+# "mxfp8" (the MXFP8 partial GEMM + ``SpReduceScatter(push=True)``). "pre_push" takes
+# the core's MXFP8 view or BF16 attn_out (quantized in ``_push_pre``; the KDA record
+# kinds other than "flow", e.g. prefix-caching servers' deferred replay, write BF16).
 SP_OPROJ_MX = {4: "17-256:pre_push"}
 
 
@@ -361,7 +363,13 @@ class SpOproj:
 
     def _push_pre(self, attn_out, parity):
         """The "pre_push" GEMM: ``attn_out``'s partial rows into ``parity``'s owner
-        slots (``comm.partial`` is only its unused C descriptor)."""
+        slots (``comm.partial`` is only its unused C descriptor). ``attn_out``: the
+        core's MXFP8 view, or BF16 [R, k] where the core writes BF16 (the KDA record
+        kinds other than "flow", e.g. the deferred-record replay of prefix-caching
+        servers), quantized here by the projection's own MXFP8 input (the "mxfp8"
+        tactic's quantization, so the same words)."""
+        if isinstance(attn_out, torch.Tensor):
+            attn_out = self.gemm.input.quantize(attn_out)
         gemm, args = self.codes[attn_out.rows]
         weight = self.gemm
         partial = self.comm.partial[: attn_out.rows]

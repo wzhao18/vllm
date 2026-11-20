@@ -113,6 +113,11 @@ def _st_global8(addr, *w):
 
 
 @asm()
+def _fence_proxy_async():
+    return "fence.proxy.async.shared::cta;", "~{memory}", ()
+
+
+@asm()
 def _ld_shared_v4(addr):
     return ("ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r,~{memory}",
             (Uint32(addr),), (Uint32,) * 4)
@@ -252,13 +257,19 @@ class QueryUK:
                         _ld_shared_v4(pe + Uint32(16) * Uint32((4 * n + i) ^ (row % 8)))
                         for i in range(4)
                     ]
+                    # Release the stage only after the q_pe words are in registers
+                    # (the pack consumes them) and ordered before the producer's next
+                    # TMA into this stage (generic reads -> async-proxy writes): tile
+                    # m + STAGES' q_pe bytes otherwise replaced tile m's (R512 SP DSA
+                    # block, INFRA 2026-11-20).
+                    ws = [
+                        _q4_bf16(words[i // 2][2 * (i % 2)],
+                                 words[i // 2][2 * (i % 2) + 1], inv)
+                        for i in range(8)
+                    ]
+                    _fence_proxy_async()
                     mbar_arrive(a_free + Uint32(8) * Uint32(st))
                     if live:
-                        ws = [
-                            _q4_bf16(words[i // 2][2 * (i % 2)],
-                                     words[i // 2][2 * (i % 2) + 1], inv)
-                            for i in range(8)
-                        ]
                         _st_global8(dst + LATENT + 32 * n, *ws)
                 full = acc_full + Uint32(8) * Uint32(g)
                 mbar_wait(full, m & 1)
