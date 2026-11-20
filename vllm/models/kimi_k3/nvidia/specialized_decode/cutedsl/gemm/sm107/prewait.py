@@ -95,7 +95,7 @@ class Mxfp8PreGemm:
     row-major; swap_ab stores the same [R, N] row-major out (W is the MMA's M operand)."""
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
-                 producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
+                 producers=1, prefetch=0, tile_k=TILER_K, die_rows=None, max_stages=0,
                  push=False, device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
@@ -112,13 +112,13 @@ class Mxfp8PreGemm:
             tiles = -(-rows // tile[0]) * -(-n // tile[1])
             if tiles > _max_active_clusters(cluster[0] * cluster[1]):
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
-            if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
+            if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_rows is not None:
                 raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
         # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
         self.push = int(push)
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
-            int(producers), int(prefetch), int(tile_k), die_split is not None,
+            int(producers), int(prefetch), int(tile_k), die_rows is not None,
             int(max_stages), self.push,
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
@@ -126,8 +126,8 @@ class Mxfp8PreGemm:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
         self.alpha = _alpha_one(device)
         self.aux, self.calls = None, 0
-        if die_split is not None:
-            self.aux = self._die_aux(tactic, rows, n, die_split, device)
+        if die_rows is not None:
+            self.aux = self._die_aux(tactic, rows, n, die_rows, device)
         self.out_layout = "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
@@ -173,44 +173,48 @@ class Mxfp8PreGemm:
         return args
 
     @staticmethod
-    def _die_aux(tactic, rows, n, die_split, device):
-        """alpha + die-claim state: int32 [4..6] counters (die 0, die 1, done), [8..11]
-        (first tile, tiles) per die, [12] M tiles, [16 + smid] die of the SM."""
+    def _die_aux(tactic, rows, n, die_rows, device):
+        """alpha + die-claim state for weight rows [0, die_rows) homed on die 0: int32
+        [4..6] counters (die 0, die 1, done), [8..11] (first claim, claims) per die, [12]
+        token units per weight unit, [13] batch (1), [16 + smid] die of the SM. A claim
+        is one cluster tile (``_claim_coord``: weight-unit-major), one per cluster."""
         from ...common.dies import sm_domains
 
-        tile, cluster = tactic[0], tactic[1]
-        if tuple(cluster) != (1, 1):
-            raise ValueError("die_claim needs a 1x1 cluster tactic")
-        m_tiles, n_tiles = -(-rows // tile[0]), -(-n // tile[1])
-        total = m_tiles * n_tiles
-        if total > _max_active_clusters(1):
-            raise ValueError(f"die_claim needs one tile per CTA ({total} tiles)")
+        tile, cluster, swap, inst_m = tactic
+        if tuple(cluster) not in ((1, 1), (2, 1)) or (cluster[0] == 2) != (inst_m == 256):
+            raise ValueError(f"die_claim: tactic {tactic} (1x1, or 2x1 with a 2-CTA MMA)")
+        w_rows, t_rows = (tile[0], tile[1]) if swap else (tile[1], tile[0])
+        if die_rows % w_rows:
+            raise ValueError(f"die_claim: die split row {die_rows} % {w_rows} weight rows")
+        w_units, t_units = -(-n // w_rows), -(-rows // t_rows)
+        total = w_units * t_units
+        if total > _max_active_clusters(cluster[0] * cluster[1]):
+            raise ValueError(f"die_claim needs one tile per cluster ({total} tiles)")
         table = sm_domains(device.index or 0)
-        n0 = min(die_split, n_tiles) * m_tiles
+        c0 = min(die_rows // w_rows, w_units) * t_units
         aux = torch.zeros(2, 272, dtype=torch.float32, device=device)
         ints = aux.view(torch.int32)
         aux[:, 0] = 1.0
-        ints[:, 8], ints[:, 9], ints[:, 10], ints[:, 11] = 0, n0, n0, total - n0
-        ints[:, 12] = m_tiles
+        ints[:, 8], ints[:, 9], ints[:, 10], ints[:, 11] = 0, c0, c0, total - c0
+        ints[:, 12], ints[:, 13] = t_units, 1
         ints[:, 16 : 16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=device)
         return aux
 
 
-def die_weight(w: torch.Tensor, tile_n: int, device=None):
-    """(a copy of W [N, K] in die-placed memory, n_split): W rows [0, n_split * tile_n)
-    homed on die 0, the rest on die 1 (2 MiB chunks; the chunk across the split goes to
-    the die holding most of it), n_split balanced to the SMs per die."""
+def die_weight(w: torch.Tensor, unit: int):
+    """(a copy of W [N, K] in die-placed memory, die_rows): W rows [0, die_rows) homed on
+    die 0, the rest on die 1 (2 MiB chunks; the chunk across the split goes to the die
+    holding most of it); die_rows a multiple of ``unit`` balanced to the SMs per die."""
     from ...common.dies import CHUNK, localized_like, sm_domains
 
     n, k = w.shape
     table = sm_domains(w.device.index or 0)
     share = sum(1 for d in table if d == 0) / len(table)
-    n_tiles = -(-n // tile_n)
-    n_split = round(n_tiles * share)
-    split = n_split * tile_n * k * w.element_size()
+    die_rows = round(-(-n // unit) * share) * unit
+    split = die_rows * k * w.element_size()
     chunks = -(-w.numel() * w.element_size() // CHUNK)
     domains = [0 if (i + 0.5) * CHUNK < split else 1 for i in range(chunks)]
-    return localized_like(w, domains).view(w.dtype).view(n, k), n_split
+    return localized_like(w, domains).view(w.dtype).view(n, k), die_rows
 
 
 class _SpinKernel:

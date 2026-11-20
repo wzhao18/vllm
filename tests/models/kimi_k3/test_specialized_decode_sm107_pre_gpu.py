@@ -23,11 +23,13 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (  # noqa:
     swizzle_mxfp8_scale,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (  # noqa: E402
+    DIE_LOCAL,
     Mxfp8Projection,
     pre_tactic,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (  # noqa: E402
     Mxfp8PreGemm,
+    die_weight,
 )
 
 DEVICE = torch.device("cuda", 0)
@@ -98,3 +100,33 @@ def test_pre_rejects():
         Mxfp8PreGemm(N, K, 128, ((256, 96), (2, 1), True, 256), device=DEVICE)
     with pytest.raises(ValueError):
         Mxfp8PreGemm(N, 256, 128, ((128, 64), (1, 1), False, 128), prewait=8, device=DEVICE)
+
+
+def test_pre_die_local():
+    """kda_in on a die-homed weight with the die-claiming tactics (each CTA / 2-CTA pair
+    claims a tile of its own die's rows): bitwise ``_scaled_mm`` eager and across graph
+    replays (the last CTA of a call resets the claim counters)."""
+    torch.cuda.set_device(DEVICE)
+    wq, sw = mx_weight(N, K, 4)
+    placed, die_rows = die_weight(wq, DIE_LOCAL[(N, K)])
+    assert torch.equal(placed, wq) and die_rows % 256 == 0
+    for r in ROWS:
+        tactic, prewait, cap = pre_tactic(N, K, r, die=True)
+        gemm = Mxfp8PreGemm(
+            N, K, r, tactic, prewait=prewait, max_stages=cap, die_rows=die_rows,
+            device=DEVICE,
+        )  # fmt: skip
+        x = torch.randn(r, K, device=DEVICE).bfloat16()
+        xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+        ref = scaled_mm(xq, xs, wq, sw)
+        out = torch.empty_like(ref)
+        gemm(xq, xs, placed, sw, out)
+        assert torch.equal(out, ref), r
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            gemm(xq, xs, placed, sw, out)
+        for _ in range(3):
+            out.zero_()
+            g.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, ref), r
