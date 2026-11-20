@@ -36,6 +36,7 @@ from ..common.primitives import asm, div_rn
 
 CHUNK = 16  # token columns per exchange chunk (one tcgen05.ld 32x32b.x16)
 K_TILE = 64  # K per ring stage (one 128-byte swizzle atom)
+PT = 32  # tokens per bulk piece of the split exchange (16 KiB of FP32 partials)
 
 
 @asm()
@@ -351,6 +352,10 @@ class WideGemm:
         self.wstages, self.astages, _ = _rings(rows, wstages, self.budget, ktile)
         self.maxreg = -(-rows // split)  # tokens per owner (largest region)
         self.uneven = rows % split != 0
+        # Pipelined split exchange (``exchange_fast``): owner regions of whole
+        # PT-token bulk pieces, BF16 out.
+        self.fast_x = (split > 1 and not self.uneven and not silu and not out_f32
+                       and (rows // split) % PT == 0)  # fmt: skip
         self.tmem_cols = 32
         while self.tmem_cols < rows:
             self.tmem_cols *= 2
@@ -681,10 +686,9 @@ class WideGemm:
         tile ``tile``. The FP32 partial is staged as [token][row] in the drained
         operand ring; split o owns tokens [o T / S, (o + 1) T / S). Thread o issues
         the bulk op of region / peer o (one op at a time per issuing thread, hw51)."""
-        rows, n, split = self.rows, self.n, self.split
+        rows, split = self.rows, self.split
         r = ew * 32 + lane
         tid = r
-        ntiles = self.n_pad // 128
         lo = split_rank * rows // split
         mine_n = (split_rank + 1) * rows // split - lo  # tokens I own
         if tid == 0:
@@ -699,6 +703,32 @@ class WideGemm:
             Int32(acc[(None, None, None, c)].iterator.toint()) + lane_bits
             for c in range(self.chunks)
         ]
+        flag = mFlags.iterator.toint() + Int64(tile) * 8
+        done = flag + 4
+        if cutlass.const_expr(self.fast_x):
+            self.exchange_fast(col0, r, split_rank, lo, stage_addr, xfer, mWs, mY,
+                               tile, flag, stamp)  # fmt: skip
+        else:
+            self.exchange(col0, r, split_rank, lo, mine_n, stage_addr, xfer, mWs,
+                          mY, tile, flag, stamp)  # fmt: skip
+        if tid == 0:
+            _st_u64(stamp + 40, _now())
+        # 5. The last split to finish reading re-arms the tile's counters.
+        if cutlass.const_expr(split > 1):
+            _bar(3, 128)
+            if tid == 0:
+                if _atom_add(done, 1) == split - 1:
+                    _st_relaxed(flag, 0)
+                    _st_relaxed(done, 0)
+
+    @cute.jit
+    def exchange(self, col0, r: Int32, split_rank: Int32, lo: Int32, mine_n: Int32,
+                 stage_addr: Int32, xfer, mWs: cute.Tensor, mY: cute.Tensor, tile: Int32,
+                 flag: Int64, stamp: Int64):  # fmt: skip
+        """Steps 1-4 of ``epilogue`` (any owner regions, gate_up / FP32 out)."""
+        rows, split = self.rows, self.split
+        tid = r
+        ntiles = self.n_pad // 128
         # 1. TMEM -> shared [token][row] FP32 (all tokens).
         for j in cutlass.range_constexpr(rows // CHUNK):
             c, off = divmod(j * CHUNK, self.n_mma)
@@ -707,8 +737,6 @@ class WideGemm:
                 _sts_f32(stage_addr + ((j * CHUNK + i) * 128 + r) * 4, vals[i])
         if tid == 0:
             _st_u64(stamp + 16, _now())
-        flag = mFlags.iterator.toint() + Int64(tile) * 8
-        done = flag + 4
         ws_tile = mWs.iterator.toint() + (Int64(split_rank) * ntiles + tile) * (rows * 512)
         mine = stage_addr + lo * 512
         # The peers' partials of my tokens: in place over their (published) regions
@@ -761,15 +789,93 @@ class WideGemm:
                 e = it * 128 + tid  # unit: token e // 8, gate rows 8 (e % 8), their up rows
                 if e < mine_n * 8:
                     self.store_silu(recv, rstride, mine, split_rank, lo, y, tile, e)
+
+    @cute.jit
+    def exchange_fast(self, col0, r: Int32, split_rank: Int32, lo: Int32,
+                      stage_addr: Int32, xfer, mWs: cute.Tensor, mY: cute.Tensor,
+                      tile: Int32, flag: Int64, stamp: Int64):  # fmt: skip
+        """Steps 1-4 of ``epilogue`` with equal owner regions of whole PT-token pieces:
+        the peers' token chunks leave TMEM first and are published (16 KiB bulk pieces
+        from several threads) while my own chunks are staged; the peers' partials of my
+        tokens arrive the same way; the sum issues the shared loads of four 8-row units
+        before it adds and stores them. Same FP32 sums in split order as ``exchange``."""
+        rows, split = self.rows, self.split
+        tid = r
+        ntiles = self.n_pad // 128
+        per = rows // split
+        nch = rows // CHUNK
+        pch = per // CHUNK
+        ppo = per // PT  # pieces per owner region
+        npc = (split - 1) * ppo
+        ws_tile = mWs.iterator.toint() + (Int64(split_rank) * ntiles + tile) * (rows * 512)
+        cstep = col0[self.chunks - 1] - col0[0] - (self.chunks - 1) * self.n_mma
+        # 1. TMEM -> shared [token][row] FP32: the peers' chunks first, then mine.
+        for jj in cutlass.range_constexpr(nch):
+            col = ((split_rank * pch + pch + jj) % nch) * CHUNK
+            taddr = col0[0] + col
+            if cutlass.const_expr(self.chunks > 1):
+                taddr = taddr + (col // self.n_mma) * cstep
+            vals = _tmem_wait16(*_tmem_ld16(taddr))
+            for i in cutlass.range_constexpr(CHUNK):
+                _sts_f32(stage_addr + ((col + i) * 128 + r) * 4, vals[i])
+            if cutlass.const_expr(jj == nch - pch - 1):
+                # 2. Publish the peers' token ranges (bulk pieces), mine still in TMEM.
+                _fence_proxy_shared()
+                _bar(3, 128)
+                for p in cutlass.range_constexpr(npc):
+                    if tid == p:
+                        o = (split_rank + 1 + p // ppo) % split
+                        t0 = o * per + (p % ppo) * PT
+                        _bulk_store(ws_tile + t0 * 512, stage_addr + t0 * 512, PT * 512)
+                        _bulk_commit()
         if tid == 0:
-            _st_u64(stamp + 40, _now())
-        # 5. The last split to finish reading re-arms the tile's counters.
-        if cutlass.const_expr(split > 1):
-            _bar(3, 128)
-            if tid == 0:
-                if _atom_add(done, 1) == split - 1:
-                    _st_relaxed(flag, 0)
-                    _st_relaxed(done, 0)
+            _st_u64(stamp + 16, _now())
+        if tid < npc:
+            _bulk_wait()
+            _fence_proxy_global()
+        _bar(3, 128)
+        if tid == 0:
+            _red_release_add(flag, 1)
+            while _ld_acquire(flag) < split:
+                _nanosleep()
+            _st_u64(stamp + 24, _now())
+            cute.arch.mbarrier_arrive_and_expect_tx(xfer, (split - 1) * per * 512)
+        _bar(3, 128)
+        # 3. The peers' partials of my tokens, in place over their published regions.
+        for p in cutlass.range_constexpr(npc):
+            if tid == p:
+                s = (split_rank + 1 + p // ppo) % split
+                q = p % ppo
+                _fence_proxy_global()
+                src = mWs.iterator.toint() + (Int64(s) * ntiles + tile) * (rows * 512) + (
+                    lo + q * PT) * 512  # fmt: skip
+                _bulk_load(stage_addr + s * (per * 512) + q * (PT * 512), src, PT * 512, xfer)
+        cute.arch.mbarrier_wait(xfer, 0)
+        if tid == 0:
+            _st_u64(stamp + 32, _now())
+        # 4. Sum in split order, round, store: 4 units' loads before their sums.
+        y = mY.iterator.toint()
+        mine = stage_addr + lo * 512
+        units = per * 16 // 128
+        for it0 in cutlass.range_constexpr(0, units, 4):
+            nb = min(4, units - it0)
+            parts = []
+            for b in cutlass.range_constexpr(nb):
+                e = (it0 + b) * 128 + tid
+                off = (e // 16) * 512 + (e % 16) * 32
+                ps = []
+                for s in cutlass.range_constexpr(split):
+                    a = _sel_eq(split_rank, Int32(s), mine + off, stage_addr + s * (per * 512) + off)
+                    ps.append(list(_lds_v4(a)) + list(_lds_v4(a + 16)))
+                parts.append(ps)
+            for b in cutlass.range_constexpr(nb):
+                e = (it0 + b) * 128 + tid
+                total = parts[b][0]
+                for s in cutlass.range_constexpr(1, split):
+                    total = [u + v for u, v in zip(total, parts[b][s])]
+                w = [_pack_bf16(total[2 * q], total[2 * q + 1]) for q in range(4)]
+                t = lo + e // 16
+                _st_v4_b32(y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2, *w)
 
     @cute.jit
     def epilogue_partials(
