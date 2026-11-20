@@ -54,7 +54,6 @@ def main():
     ap.add_argument("--rows", default="288")  # query rows (B x k3); context rows = B x 4
     ap.add_argument("--only", default="")
     ap.add_argument("--fi", default=",".join(FI_BACKENDS))
-    ap.add_argument("--lmparts", default="")  # tiles:split,... e.g. 106:1,53:2,1:9
     ap.add_argument("--wide", default="")  # WideGemm K splits to time, e.g. 1,2,3
     args = ap.parse_args()
     torch.manual_seed(0)
@@ -106,22 +105,6 @@ def main():
                         pws = [wide.PreparedWide(w, {m: sp}).prepare() for w in ws]
                         run(f"wide{sp}", lambda i, pws=pws: pws[i].run(x, out))
                         del pws
-                if args.lmparts and n % 256 == 0:
-                    parts = [tuple(int(v) for v in pp.split(':')) for pp in args.lmparts.split(',')]
-                    def mk(w):
-                        res_, r0 = [], 0
-                        for tiles, sp in parts:
-                            r1 = r0 + tiles * 256
-                            res_.append((r0, r1, wide.PreparedWide(w[r0:r1], {m: sp}, ldo=n).prepare()))
-                            r0 = r1
-                        assert r0 == n, (r0, n)
-                        return res_
-                    pls3 = [mk(w) for w in ws]
-                    def run3(i):
-                        for r0, r1, pw in pls3[i]:
-                            pw.run(x, out[:, r0:r1])
-                    run('parts', run3)
-                    del pls3
             if mm_bf16 is not None and args.fi:
                 for be in args.fi.split(","):
                     run("fi:" + be, lambda i, be=be: mm_bf16(x, ws[i].t(), out=out, backend=be))
