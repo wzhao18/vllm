@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--rest", type=int, default=12512)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--arms", default="", help="comma subset of arms (default all)")
+    ap.add_argument("--sus", action="store_true", help="also back-to-back at the cap")
+    ap.add_argument("--hot", action="store_true", help="time after a 30 ms GEMM burst")
     args = ap.parse_args()
 
     from vllm.models.kimi_k3.nvidia.ops import kda_segscan
@@ -71,7 +74,7 @@ def main():
             "B8i": (x_d, rest_d, (8, 0, True)),
             "D8": (x_s, rest_s, (8, 0)),
         }
-        arms = list(cfg)
+        arms = [a for a in cfg if not args.arms or a in args.arms.split(",")]
         outs = {k: (torch.empty(T, P, dtype=torch.float8_e4m3fn, device=dev),
                     torch.zeros(sf_n, dtype=torch.uint8, device=dev)) for k in arms}  # fmt: skip
         nd = [int((sm_die == d).sum()) for d in (0, 1)]
@@ -105,6 +108,37 @@ def main():
             res[k] = round(statistics.median(times[k]), 1)
             res[k + "-A"] = round(res[k] - statistics.median(times["A"]), 1)
         res["sm_die_count"] = [int((sm_die == d).sum()) for d in (0, 1)]
+        if args.hot:
+            a8 = torch.randn(8192, 8192, device=dev).to(torch.bfloat16)
+            b8 = torch.randn(8192, 8192, device=dev).to(torch.bfloat16)
+
+            def hot(k):
+                for _ in range(12):
+                    torch.mm(a8, b8)
+                e0 = torch.cuda.Event(enable_timing=True)
+                e1 = torch.cuda.Event(enable_timing=True)
+                e0.record()
+                run(k)
+                e1.record()
+                torch.cuda.synchronize()
+                return e0.elapsed_time(e1) * 1000, torch.cuda.clock_rate()
+
+            for _ in range(3):
+                for k in arms + arms[::-1]:
+                    for _ in range(5):
+                        t, mhz = hot(k)
+                        res.setdefault("hot_" + k, []).append(round(t, 1))
+                        res.setdefault("hot_mhz_" + k, []).append(mhz)
+            for k in arms:
+                res["hot_" + k] = round(statistics.median(res["hot_" + k]), 1)
+                res["hot_mhz_" + k] = round(statistics.mean(res["hot_mhz_" + k]))
+        if args.sus:
+            from pkda_m9_bench import sustained
+
+            for _ in range(2):
+                for k in arms + arms[::-1]:
+                    r = sustained(lambda k=k: run(k), seconds=1.5)
+                    res.setdefault("sus_" + k, []).append((r["us"], r["mhz"], r["w"]))
         print(json.dumps(res), flush=True)
 
 
