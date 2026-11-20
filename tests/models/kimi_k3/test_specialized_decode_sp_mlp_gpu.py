@@ -92,6 +92,8 @@ def silu_and_mul(x):
 class Shared(types.SimpleNamespace):
     """The shared expert: the stock ``KimiMLP`` methods bound to stand-in fields."""
 
+    _prefill_situ = None  # KimiMLP class default (prefill SiTU epilogue, unset in decode)
+
     def __call__(self, x):
         return self.forward(x)
 
