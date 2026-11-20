@@ -73,6 +73,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=16384)
     ap.add_argument("--only", default="topk,norm,act,dedup")
+    ap.add_argument("--dump", default="", help="save the act output (q, sf)")
     a = ap.parse_args()
     T, dev = a.rows, "cuda"
     c = cfg()
@@ -105,9 +106,14 @@ def main():
         res["rms_norm"] = t
         print(f"rms_norm [T,3584] {t:8.2f} us {2 * x.numel() * 2 / t / 1e6:6.2f} TB/s")
     if "act" in only:
+        torch.manual_seed(0)
         x = torch.randn(T, 12288, device=dev, dtype=torch.bfloat16) * 2
         t = bench(lambda: mxfp8_act.situ_and_mul_quantize_auto(
             x, c["beta"], c["linear_beta"]))
+        if a.dump:
+            o = mxfp8_act.situ_and_mul_quantize_auto(x, c["beta"], c["linear_beta"])
+            torch.save({"q": o.data.view(torch.uint8).cpu(), "sf": o.scale.cpu()},
+                       a.dump)
         res["situ_act"] = t
         by = x.numel() * 2 + x.numel() // 2 + x.numel() // 64
         print(f"situ_act [T,12288] {t:8.2f} us {by / t / 1e6:6.2f} TB/s")
