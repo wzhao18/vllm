@@ -38,7 +38,7 @@ DEFAULT_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8")
 # so they do not push the die's weight half out of its L2.
 DIE_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain+roll+st8+die3+sef")
 # DIAGNOSTIC (never land): cap on the persistent grid (clusters); the step uses it.
-MAC_CAP = 16
+MAC_CAP = 11
 _COMPILED: dict = {}
 
 
