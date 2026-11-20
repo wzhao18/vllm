@@ -322,6 +322,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._fingerprint_pulls[request.request_id] = KVFingerprintReq(
                 req_id=params["remote_request_id"],
                 block_ids=blocks.get_block_ids(),
+                state_blocks=self.fingerprint_state_blocks(blocks.get_block_ids()),
                 num_tokens=num_tokens,
                 first_block=(num_tokens - num_external_tokens)
                 // (self.block_size * dcp_size),
@@ -429,6 +430,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         req_id=request.request_id,
                         block_ids=tuple(list(group) for group in block_ids),
                         num_tokens=request.num_computed_tokens,
+                        state_blocks=self.fingerprint_state_blocks(block_ids),
                     )
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
