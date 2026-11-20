@@ -17,6 +17,9 @@ from cutlass.cute.runtime import from_dlpack
 from . import kernel as _k
 
 
+# timing probe only: duplicate the recurrent chain work on a phantom second lane
+_PHANTOM = 0
+
 def build_and_load_cute_dsl_kernel(module_name, kernel_name, compile_fn, extra_key_files=()):
     return compile_fn()
 
@@ -70,7 +73,10 @@ def _get_compiled(
     partial_tma: bool = True,
     state_rows: bool = False,
 ):
+    if gram_w9:
+        raise ValueError("gram_w9 needs one Gram window per stage; the kernel shares two")
     key = (
+        _PHANTOM,
         state_rows,
         dev.index,
         torch.cuda.get_device_capability(dev),
@@ -204,6 +210,7 @@ def _get_compiled(
                 LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
                 CLUSTER_=int(cluster_size),
                 SROW_=1 if state_rows else 0,
+                PHANTOM_=_PHANTOM,
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
