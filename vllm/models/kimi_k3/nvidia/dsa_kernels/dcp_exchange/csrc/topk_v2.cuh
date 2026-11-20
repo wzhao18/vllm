@@ -521,6 +521,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       V2DBG(26);
       return nv;
     };
+    // candidate pass; a row whose sample bound fails re-thresholds once and repeats it
+    // (one call site of the inlined pass: the hot instance stays compact)
+    int nc = 0;
+    for (int cpass = 0;; ++cpass) {
     {
       uint32_t nv = 0;
       if (regp) nv += cand_regp(th);
@@ -596,11 +600,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
       }
       for (int o = 16; o > 0; o >>= 1) nv += __shfl_xor_sync(0xffffffffu, nv, o);
-      if ((tid & 31) == 0 && nv) atomicAdd(&s_valid, nv);
+      if ((tid & 31) == 0 && nv && cpass == 0) atomicAdd(&s_valid, nv);
     }
     __syncthreads();
-    int nc = s_cnt;
-    if (K31_RARE(regp && (nc > kV2Cand || (uint32_t)nc < q))) {
+    nc = s_cnt;
+    if (cpass == 1 || K31_LIKELY(!(regp && (nc > kV2Cand || (uint32_t)nc < q)))) break;
+    {
       // (the hot instance too: a group's row that leaves the hot CTA costs every rank of
       // the DCP group tier 3 plus the complete body, ~120-170 us, and at EP32 every rank of
       // every group waits for it at the next MoE)
@@ -652,12 +657,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
       }
       if (tid == 0) s_beyond = 0;  // the fine histogram's count again
-      if (th2 >= 1) {
-        th = th2;
-        cand_regp(th);
-        __syncthreads();
-        nc = s_cnt;
-      }
+      if (th2 < 1) break;
+      th = th2;
+    }
     }
     V2DBG(2);
     if (p.dbg && tid == 0) p.dbg[(int64_t)row * kV2Dbg + 31] = nc;
