@@ -1052,6 +1052,31 @@ mov.b32 i1, e1;
 max.s32 im, i0, i1;
 max.s32 $1, im, $10;
 }"""
+# Microbench probe (conv_probe 3): _CONV_FAST2 without the d > 2^126 tracking.
+_CONV_FAST2_NOGM = """{
+.reg .b32 i0, i1, im;
+.reg .b64 A, E, R;
+.reg .f32 e0, e1, r0, r1;
+mov.b64 A, 0;
+fma.rn.f32x2 A, $2, $6, A;
+fma.rn.f32x2 A, $3, $7, A;
+fma.rn.f32x2 A, $4, $8, A;
+fma.rn.f32x2 A, $5, $9, A;
+mul.rn.f32x2 E, A, $11;
+mov.b64 {e0, e1}, E;
+ex2.approx.ftz.f32 e0, e0;
+ex2.approx.ftz.f32 e1, e1;
+mov.b64 E, {e0, e1};
+add.rn.f32x2 E, E, $12;
+mov.b64 {e0, e1}, E;
+rcp.approx.ftz.f32 r0, e0;
+rcp.approx.ftz.f32 r1, e1;
+mov.b64 R, {r0, r1};
+mul.rn.f32x2 R, A, R;
+mov.b64 {r0, r1}, R;
+cvt.rn.bf16x2.f32 $0, r1, r0;
+mov.b32 $1, $10;
+}"""
 # Same arithmetic with scalar add / mul after the MUFU ops (no pair repacking).
 _CONV_FAST3 = """{
 .reg .b32 i0, i1;
@@ -1082,13 +1107,15 @@ max.s32 $1, i0, $10;
 
 
 @dsl_user_op
-def conv_fast2(x3, x2, x1, x0, w, gm, nl, one, scalar=False, *, loc=None, ip=None):
+def conv_fast2(
+    x3, x2, x1, x0, w, gm, nl, one, scalar=False, nogm=False, *, loc=None, ip=None
+):
     res = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
         [_v(v, Int64, loc, ip) for v in (x3, x2, x1, x0)]
         + [_v(v, Int64, loc, ip) for v in w]
         + [_v(gm, Int32, loc, ip), _v(nl, Int64, loc, ip), _v(one, Int64, loc, ip)],
-        _CONV_FAST3 if scalar else _CONV_FAST2,
+        _CONV_FAST3 if scalar else _CONV_FAST2_NOGM if nogm else _CONV_FAST2,
         "=r,=r," + ",".join(["l"] * 8 + ["r", "l", "l"]),
         has_side_effects=False,
         loc=loc,
@@ -1239,7 +1266,7 @@ def _t2_chunk(
     gm = Int32(0)
     for i in cutlass.range_constexpr(16):
         xp = unpack_b64(xr[i])
-        y, gm = conv_fast2(hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2, scalar)
+        y, gm = conv_fast2(hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2, scalar, probe == 3)
         ys.append(y)
         hp = [hp[1], hp[2], xp]
     obase = out_addr + (

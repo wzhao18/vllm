@@ -39,6 +39,8 @@ ARMS = [
     ("l1", "lp1"),
     ("l2", "lp2"),
     ("l4", "lp4"),
+    # Probe: e without the d > 2^126 tracking (2 VIMNMX per column pair-row).
+    ("eg", "nogm"),
 ]
 #: cluster -> (swizzle, raster) as in the B3 tactics.
 RASTER = {(2, 1): (8, "n"), (4, 1): (8, "n"), (2, 4): (4, "m"), (2, 2): (8, "n")}
