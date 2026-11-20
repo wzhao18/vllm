@@ -46,3 +46,37 @@ def test_o_norm_mxfp8(tokens, heads):
     b = ref.data.view(torch.uint8).to(torch.int16)
     assert ((a - b).abs() > 1).float().mean().item() <= 1e-4
     assert (a != b).float().mean().item() <= 2e-3
+
+
+_RCP_SRC = r"""
+#include <torch/extension.h>
+__global__ void k(uint32_t lo, uint32_t n, unsigned long long* bad) {
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    const float d = __uint_as_float(lo + i);
+    float a, b;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(a) : "f"(1.0f), "f"(d));
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(b) : "f"(d));
+    if (__float_as_uint(a) != __float_as_uint(b)) atomicAdd(bad, 1ull);
+  }
+}
+torch::Tensor run(int64_t lo, int64_t n) {
+  auto bad = torch::zeros({1}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+  k<<<4096, 256>>>(uint32_t(lo), uint32_t(n), reinterpret_cast<unsigned long long*>(bad.data_ptr()));
+  return bad;
+}
+"""
+
+
+def test_sigmoid_reciprocal_matches_div_full():
+    """The kernel's sigmoid takes rcp.approx.ftz for 1 / d, d in [1, 2^126]
+    (larger d use div.full): bitwise div.full.f32 on every float there."""
+    from torch.utils.cpp_extension import load_inline
+
+    mod = load_inline(
+        "k3_onorm_rcp_check",
+        cpp_sources="torch::Tensor run(int64_t lo, int64_t n);",
+        cuda_sources=_RCP_SRC,
+        functions=["run"],
+    )
+    lo, hi = 0x3F800000, 0x7E800000  # 1.0, 2^126 (inclusive)
+    assert int(mod.run(lo, hi - lo + 1).item()) == 0
