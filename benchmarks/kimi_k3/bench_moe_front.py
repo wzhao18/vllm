@@ -178,24 +178,27 @@ def main():
             except Exception as e:  # noqa: BLE001
                 line += f" | ltpin n/a ({type(e).__name__}: {str(e)[:60]})"
         cfgs = [tuple(int(v) for v in c.split(",")) for c in args.cfg] or [moe_front.config_for(n, dev)]
+        imgs = {}
         for c in cfgs:
+            if c[0] not in imgs:
+                imgs[c[0]] = [moe_front.front_image(w, c[0]) for w in ws]
             plan = fm.moe_front_plan(n, K, *c)
 
             def front(c=c):
                 for i in range(L):
                     pm.prod(src, h, busy, nostamp, carve)
-                    fm.moe_front(ws[i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
+                    fm.moe_front(ws[i], *imgs[c[0]][i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
                                  True, 1.0, *c, nostamp, *_NO_EPLB)  # fmt: skip
 
             t_f = _time_graph(front)
             line += f" | front{c} ring {plan[0]} xslots {plan[3]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
             # Skeleton: same bytes, barriers, reduce and epilogue, no MMAs (debug bit 0).
-            skel = torch.zeros(35 * c[0] * 64 + 1, dtype=torch.int64, device=dev)
+            skel = torch.zeros(sms * 64 + 1, dtype=torch.int64, device=dev)
 
             def skeleton(c=c):
                 for i in range(L):
                     pm.prod(src, h, busy, nostamp, carve)
-                    fm.moe_front(ws[i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
+                    fm.moe_front(ws[i], *imgs[c[0]][i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
                                  True, 1.0, *c, skel, *_NO_EPLB)  # fmt: skip
 
             t_s = _time_graph(skeleton)
@@ -204,13 +207,13 @@ def main():
         # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]
         for skel_mode in [int(v) for v in args.stamp_modes.split(",")]:
-            grid = 35 * c[0]
+            grid = sms  # one CTA per SM
             st = torch.zeros(grid * 64 + skel_mode, dtype=torch.int64, device=dev)
             end = torch.zeros(1, dtype=torch.int64, device=dev)
 
             def stamped():
                 pm.prod(src, h, busy, end, carve)
-                fm.moe_front(ws[0], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827, True,
+                fm.moe_front(ws[0], *imgs[c[0]][0], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827, True,
                              1.0, *c, st, *_NO_EPLB)  # fmt: skip
 
             stamped()
@@ -236,9 +239,10 @@ def main():
             print(f"  stamps dbg{skel_mode} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
                   flush=True)
             ks = c[0]
-            tile = torch.arange(grid, device=dev) // ks
+            item = sv[:, 31] - 1  # the CTA's work item (-1: spare SM)
+            tile = torch.where(item >= 0, item // ks, torch.full_like(item, 1 << 20))
             roles = {"router": (tile < E // 128) & (torch.arange(grid, device=dev) >= n),
-                     "topk": torch.arange(grid, device=dev) < n, "latent": tile >= E // 128}
+                     "topk": torch.arange(grid, device=dev) < n, "latent": (tile >= E // 128) & (item >= 0)}
             rl = []
             for nm, m in roles.items():
                 e = s[:, 5][m & (sv[:, 5] != 0)]
@@ -248,7 +252,8 @@ def main():
             last = torch.argsort(s[:, 5], descending=True)[:4].tolist()
             for cta in last:
                 ph = " ".join(f"{nm}={s[cta, i].item():.2f}" for nm, i in cols.items() if sv[cta, i] != 0)
-                print(f"  late cta{cta} (tile {cta // ks}, split {cta % ks}): {ph}", flush=True)
+                it = int(item[cta])
+                print(f"  late cta{cta} (item {it}: tile {it // ks}, split {it % ks}): {ph}", flush=True)
                 if sv[cta, 27] != 0:
                     rb = " ".join(str(int(sv[cta, 58 + i] - sv[cta, 27])) for i in range(6))
                     print(f"  late cta{cta} route clk after topk-go (entry sorted pass1 barrier pass2 end): {rb}",

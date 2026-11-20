@@ -70,7 +70,8 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     # Test form: y holds the FP32 rows of the whole GEMM.
     y = torch.full((n, E + LATENT), float("nan"), device=dev)
     got = _buffers(nvfp4, dev)
-    mod.moe_front(w, h, y, cnt, part, bias, *got[:5], pad, E, E, True, SCALE, nvfp4, 1.0,
+    img = moe_front.front_image(w, cfg[0])
+    mod.moe_front(w, *img, h, y, cnt, part, bias, *got[:5], pad, E, E, True, SCALE, nvfp4, 1.0,
                   *cfg, stamps, *_NO_EPLB)  # fmt: skip
     torch.accelerator.synchronize()
     ref_y = (h.double() @ w.double().t()).float()
@@ -107,7 +108,7 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     for _ in range(2):
         y_r = torch.empty((n, E), device=dev)
         again = _buffers(nvfp4, dev)
-        mod.moe_front(w, h, y_r, cnt, part, bias, *again[:5], pad, E, E, True, SCALE,
+        mod.moe_front(w, *img, h, y_r, cnt, part, bias, *again[:5], pad, E, E, True, SCALE,
                       nvfp4, 1.0, *cfg, stamps, *_NO_EPLB)  # fmt: skip
         torch.accelerator.synchronize()
         assert torch.equal(y_r.view(torch.int32), y[:, :E].view(torch.int32))
@@ -121,7 +122,7 @@ def test_moe_front_rejects_bad_shapes():
     b = _buffers(True, dev)
     with pytest.raises(RuntimeError):
         moe_front._module().moe_front(
-            w, h, torch.zeros((32, E), device=dev), torch.zeros(2048, dtype=torch.int32,
+            w, *moe_front.front_image(w, 4), h, torch.zeros((32, E), device=dev), torch.zeros(2048, dtype=torch.int32,
             device=dev), torch.zeros(35 * 4 * 32 * 128, device=dev),
             torch.zeros(E, device=dev), *b, None, E, E, True, 1.0, True, 1.0, 4, 0,
             torch.empty(0, dtype=torch.int64, device=dev), *_NO_EPLB,
