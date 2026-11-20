@@ -1196,6 +1196,158 @@ _ONE2 = 0x3F8000003F800000
 _D_EXACT = 0x7E800000
 
 
+@dsl_user_op
+def sumsq_bf16x2(y: Uint32, s: Float32, *, loc=None, ip=None) -> Float32:
+    """``s + lo^2 + hi^2`` of a bf16x2 (FP32 FMA, low half first)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [_v(y, Uint32, loc, ip), _v(s, Float32, loc, ip)],
+            "{ .reg .b32 l, h; .reg .f32 fl, fh, t; shl.b32 l, $1, 16; "
+            "and.b32 h, $1, -65536; mov.b32 fl, l; mov.b32 fh, h; "
+            "fma.rn.f32 t, fl, fl, $2; fma.rn.f32 $0, fh, fh, t; }",
+            "=f,r,f",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+            **_ASM,
+        )
+    )
+
+
+@cute.jit
+def _t2_chunk_ssq(
+    rc: Int32,
+    r0: Int32,
+    gbase: Int32,
+    cq: Int32,
+    cr: Int32,
+    w0: Int64,
+    w1: Int64,
+    w2: Int64,
+    w3: Int64,
+    nl2: Int64,
+    one2: Int64,
+    out_addr: Int64,
+    part: Int32,
+    m_rows: Int32,
+    cc: Int32,
+    row_end: Int32,
+    ssq: cute.Tensor,
+    p_dim: cutlass.Constexpr,
+    scalar: cutlass.Constexpr,
+):
+    """``_t2_chunk`` that also adds each row's squared bf16 outputs (two
+    columns) into ``ssq`` (16 FP32 registers)."""
+    wp = [w0, w1, w2, w3]
+    lb = [gbase + rc * (16 * _PITCH * 4) + ((cq ^ j) * 16) + cr for j in range(4)]
+    hr = []
+    for j in cutlass.range_constexpr(3):
+        rr = rc * 16 - 3 + j
+        rr = rr + 3 * b2i(rc == 0)
+        hr.append(lds_u32(gbase + rr * (_PITCH * 4) + ((cq ^ (rr % 4)) * 16) + cr))
+    xr = [lds_u32(lb[i % 4] + i * (_PITCH * 4)) for i in range(16)]
+    hp = [unpack_b64(v) for v in hr]
+    ys = []
+    gm = Int32(0)
+    for i in cutlass.range_constexpr(16):
+        xp = unpack_b64(xr[i])
+        y, gm = conv_fast2(hp[0], hp[1], hp[2], xp, wp, gm, nl2, one2, scalar)
+        ys.append(y)
+        hp = [hp[1], hp[2], xp]
+    obase = out_addr + (
+        (Int64(part) * Int64(m_rows) + Int64(r0)) * Int64(p_dim) + Int64(cc)
+    ) * 2
+    if b2i(gm <= _D_EXACT) * b2i(r0 + 16 <= row_end) != 0:
+        for fi in cutlass.range_constexpr(16):
+            stg_u32_all(obase + fi * p_dim * 2, ys[fi])
+            ssq[fi] = sumsq_bf16x2(ys[fi], ssq[fi])
+    else:
+        wv = []
+        for wj in wp:
+            wv.extend(split_b64(wj))
+        hx = [unpack_bf16x2(v) for v in hr]
+        for xi in cutlass.range_constexpr(16):
+            y2, s2 = conv_row(
+                (hx[0][0], hx[0][1], hx[1][0], hx[1][1], hx[2][0], hx[2][1]),
+                xr[xi], wv, Float32(0.0),
+            )  # fmt: skip
+            stg_u32(obase + Int64(xi) * Int64(p_dim) * 2, b2i(r0 + xi < row_end), y2)
+            ssq[xi] = sumsq_bf16x2(y2, ssq[xi])
+            hx = [hx[1], hx[2], unpack_bf16x2(xr[xi])]
+
+
+@cute.jit
+def _t2_cols_inv(
+    xs_all,
+    cols,
+    trow: Int32,
+    wrow: Int32,
+    gbase: Int32,
+    bar: Int32,
+    rc: Int32,
+    r0: Int32,
+    cp: Int32,
+    cq: Int32,
+    cr: Int32,
+    w_addr: Int64,
+    out_addr: Int64,
+    norm_addr: Int64,
+    part: Int32,
+    m_rows: Int32,
+    row_end: Int32,
+    nl2: Int64,
+    one2: Int64,
+    epi_n: cutlass.Constexpr,
+    p_dim: cutlass.Constexpr,
+    scalar: cutlass.Constexpr,
+):
+    """Q or K tile: the column pass of ``_t2_cols`` (weights prefetched one
+    subtile ahead) plus the FP32 inverse L2 norm of each head row,
+    ``rsqrt(sum(y^2) + 1e-6)`` of the bf16 outputs: 16 rows per thread over
+    the head's 4 subtiles x 2 columns, then a reduce-scatter over the 16
+    column-pair lanes (lane cp stores row r0 + cp). Rows 0-2 of blocks and
+    sequences get their norms from the fix-up with their outputs."""
+    ssq = cute.make_rmem_tensor(cute.make_layout((16,)), Float32)
+    col_n = cols[0] + 2 * cp
+    wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
+    wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
+    h = p_dim // 128
+    for ni in cutlass.range_constexpr(epi_n):
+        if cutlass.const_expr(ni % 4 == 0):
+            for i in cutlass.range_constexpr(16):
+                ssq[i] = Float32(0.0)
+        wp = [wl[0], wl[1], wh[0], wh[1]]
+        if cutlass.const_expr(ni + 1 < epi_n):
+            col_n = cols[ni + 1] + 2 * cp
+            wl = ldg_b64x2(w_addr + Int64(col_n) * 16)
+            wh = ldg_b64x2(w_addr + Int64(col_n) * 16 + 16)
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        for q in cutlass.range_constexpr(4):
+            sts_v4(wrow + (((trow % 4) ^ q) * 16), Int32(1), *xs_all[ni][4 * q : 4 * q + 4])
+        cute.arch.barrier(barrier_id=bar, number_of_threads=128)
+        _t2_chunk_ssq(
+            rc, r0, gbase, cq, cr, wp[0], wp[1], wp[2], wp[3], nl2, one2, out_addr,
+            part, m_rows, cols[ni] + 2 * cp - part * p_dim, row_end, ssq, p_dim, scalar,
+        )  # fmt: skip
+        if cutlass.const_expr(ni % 4 == 3):
+            v = [ssq[i] for i in range(16)]
+            for d in (8, 4, 2, 1):
+                half = len(v) // 2
+                bit = (cp // d) % 2
+                nv = []
+                for jj in cutlass.range_constexpr(half):
+                    a, b = v[jj], v[jj + half]
+                    nv.append(self32(bit, b, a) + shfl_xor_f32(self32(bit, a, b), d))
+                v = nv
+            t = r0 + cp
+            hd = (cols[ni - 3] - part * p_dim) // 128
+            naddr = norm_addr + (
+                (Int64(part) * Int64(m_rows) + Int64(t)) * Int64(h) + Int64(hd)
+            ) * 4
+            stg_f32(naddr, b2i(t < row_end), rsqrt_eps(v[0]))
+
+
 @cute.jit
 def _t2_chunk(
     rc: Int32,
@@ -1427,6 +1579,56 @@ def epilogue_kda_conv_t2(
     cr = (cp % 4) * 4
     nl2 = Int64(_NL2)
     one2 = Int64(_ONE2)
+    if cutlass.const_expr(gemm_kernel.conv_norms):
+        # Q / K tiles also emit the inverse L2 norms of their head rows.
+        if cutlass.const_expr(epi_n % 4 != 0):
+            raise ValueError(f"conv epilogue norms: {epi_n} subtiles per tile")
+        cols = [tTR_cC[(None, None, None, g, ni)][0][1] for ni in range(epi_n)]
+        part0 = cols[0] // p_dim
+        if part0 < 2:
+            _t2_cols_inv(
+                xs_all, cols, trow, wrow, gbase, bar, rc, r0, cp, cq, cr, w_addr,
+                out_addr, norm_addr, part0, m_rows, row_end, nl2, one2, epi_n, p_dim,
+                getattr(gemm_kernel, "conv_scalar_silu", False),
+            )  # fmt: skip
+        else:
+            _t2_cols(
+                gemm_kernel, xs_all, tTR_cC, g, epi_n, trow, wrow, gbase, bar, rc, r0,
+                cp, cq, cr, w_addr, out_addr, m_rows, row_end, nl2, one2, p_dim,
+            )  # fmt: skip
+    else:
+        _t2_cols(
+            gemm_kernel, xs_all, tTR_cC, g, epi_n, trow, wrow, gbase, bar, rc, r0,
+            cp, cq, cr, w_addr, out_addr, m_rows, row_end, nl2, one2, p_dim,
+        )  # fmt: skip
+    return acc_consumer_state
+
+
+@cute.jit
+def _t2_cols(
+    gemm_kernel,
+    xs_all,
+    tTR_cC,
+    g: Int32,
+    epi_n: cutlass.Constexpr,
+    trow: Int32,
+    wrow: Int32,
+    gbase: Int32,
+    bar: Int32,
+    rc: Int32,
+    r0: Int32,
+    cp: Int32,
+    cq: Int32,
+    cr: Int32,
+    w_addr: Int64,
+    out_addr: Int64,
+    m_rows: Int32,
+    row_end: Int32,
+    nl2: Int64,
+    one2: Int64,
+    p_dim: cutlass.Constexpr,
+):
+    """The column pass of every subtile of the tile (no norms)."""
     # Conv weights in column-pair layout (KdaConvGemm.conv_w_pairs): 32 B per
     # column pair = taps 0..3 as (col, col + 1) f32x2 pairs.
     col_n = tTR_cC[(None, None, None, g, 0)][0][1] + 2 * cp
@@ -1455,9 +1657,8 @@ def epilogue_kda_conv_t2(
             _t2_chunk_loop(rc, r0, *args[:15], gemm_kernel.conv_loop_unroll)
         elif cutlass.const_expr(getattr(gemm_kernel, "conv_math_smsp23", False)):
             # Microbench: column pass only on the SMSP 2/3 warps (two chunks).
-            if gt >= 64:
+            if rc >= 4:
                 _t2_chunk(rc, r0, *args)
                 _t2_chunk(rc - 4, r0 - 64, *args)
         else:
             _t2_chunk(rc, r0, *args)
-    return acc_consumer_state

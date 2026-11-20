@@ -39,6 +39,8 @@ ARMS = [
     ("l1", "lp1"),
     ("l2", "lp2"),
     ("l4", "lp4"),
+    # e with the FP32 inverse L2 norms of the Q / K head rows (with_norms).
+    ("n", ""),
 ]
 #: cluster -> (swizzle, raster) as in the B3 tactics.
 RASTER = {(2, 1): (8, "n"), (4, 1): (8, "n"), (2, 4): (4, "m"), (2, 2): (8, "n")}
@@ -145,11 +147,25 @@ def main():
                 row = {"m": m, "cluster": "%dx%d" % cl, "arm": arm}
                 try:
                     g = KdaConvGemm(wq, ws, cw, p, tactic=tac)
+                    nq = arm == "n"
                     st = state0.clone()
                     t0 = time.perf_counter()
-                    y, _ = g(xq, xs, st, qsl, lines, has_init)
+                    y = g(xq, xs, st, qsl, lines, has_init, with_norms=nq)
                     torch.cuda.synchronize()
                     row["first_call_s"] = round(time.perf_counter() - t0, 1)
+                    if nq:
+                        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+                            reference_inv_norms,
+                        )
+
+                        y, nrm = y
+                        rn = reference_inv_norms(ref, p)
+                        rel = ((nrm - rn).abs() / rn).max()
+                        row["norm_max_rel"] = float(rel)
+                        row["bitwise_v"] = bool(torch.equal(y, ref))
+                        row["bitwise_state"] = bool(torch.equal(st, st_ref))
+                    else:
+                        y = y[0]
                     if arm in ("d1", "e", "en", "es", "e23", "l1", "l2", "l4"):
                         row["bitwise_out"] = bool(torch.equal(y, ref))
                         row["bitwise_state"] = bool(torch.equal(st, st_ref))
@@ -157,7 +173,7 @@ def main():
                             row["mismatch"] = int((y != ref).sum())
 
                     def f_arm():
-                        g(xq, xs, st, qsl, lines, has_init)
+                        g(xq, xs, st, qsl, lines, has_init, with_norms=nq)
 
                     if args.ncu:
                         f_arm()

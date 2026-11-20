@@ -2209,7 +2209,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     if cutlass.const_expr(
                         getattr(self, "conv_drain", False)
                         and getattr(self, "conv_t2", False)
-                        and not self.conv_norms
                     ):
                         acc_consumer_state = epilogue_kda_conv_t2(
                             self,

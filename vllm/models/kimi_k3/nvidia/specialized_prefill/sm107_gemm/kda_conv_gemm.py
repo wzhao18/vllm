@@ -259,7 +259,7 @@ class KdaConvGemm:
         conv = (
             cutlass.Int64(out.data_ptr()),
             cutlass.Int64(
-                (self.conv_w_pairs if self._t2 and not with_norms else self.conv_w).data_ptr()
+                (self.conv_w_pairs if self._t2 else self.conv_w).data_ptr()
             ),
             cutlass.Int64(side.data_ptr()),
             cutlass.Int64(qsl.data_ptr()),
