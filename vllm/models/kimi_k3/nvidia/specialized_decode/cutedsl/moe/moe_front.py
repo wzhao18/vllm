@@ -132,25 +132,45 @@ __device__ __forceinline__ uint64_t smem_desc(uint32_t addr) {
          (1ull << 46) | (2ull << 61);
 }
 // Warp-uniform issue (hwdb hw28c): the whole warp runs the asm, elect.sync picks the
-// issuing lane, so descriptors stay in uniform registers.
-__device__ __forceinline__ void mma_ts(uint32_t d, uint32_t a_tmem, uint64_t b, uint32_t idesc,
-                                       uint32_t acc) {
+// issuing lane, so descriptors stay in uniform registers. One weight K block (64) =
+// 4 MMAs of K16: A +8 TMEM columns (TS) or +32 B (SS), B +32 B per MMA.
+__device__ __forceinline__ void mma4_ts(uint32_t d, uint32_t a_tmem, uint64_t b, uint32_t idesc,
+                                        uint32_t acc) {
   asm volatile(
-      "{ .reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; "
-      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, Q; }" ::"r"(d),
+      "{ .reg .pred P, Q, T; .reg .b32 a1, a2, a3; .reg .b64 b1, b2, b3;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; setp.eq.u32 T, %4, %4;\n"
+      "add.u32 a1, %1, 8; add.u32 a2, %1, 16; add.u32 a3, %1, 24;\n"
+      "add.u64 b1, %2, 2; add.u64 b2, %2, 4; add.u64 b3, %2, 6;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, Q;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], [a1], b1, %3, T;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], [a2], b2, %3, T;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], [a3], b3, %3, T; }" ::"r"(d),
       "r"(a_tmem), "l"(b), "r"(idesc), "r"(acc));
 }
-__device__ __forceinline__ void mma_ss(uint32_t d, uint64_t a, uint64_t b, uint32_t idesc,
-                                       uint32_t acc) {
+__device__ __forceinline__ void mma4_ss(uint32_t d, uint64_t a, uint64_t b, uint32_t idesc,
+                                        uint32_t acc) {
   asm volatile(
-      "{ .reg .pred P, Q; elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; "
-      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, Q; }" ::"r"(d),
+      "{ .reg .pred P, Q, T; .reg .b64 a1, a2, a3, b1, b2, b3;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %4, 0; setp.eq.u32 T, %4, %4;\n"
+      "add.u64 a1, %1, 2; add.u64 a2, %1, 4; add.u64 a3, %1, 6;\n"
+      "add.u64 b1, %2, 2; add.u64 b2, %2, 4; add.u64 b3, %2, 6;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, Q;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], a1, b1, %3, T;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], a2, b2, %3, T;\n"
+      "@P tcgen05.mma.cta_group::1.kind::f16 [%0], a3, b3, %3, T; }" ::"r"(d),
       "l"(a), "l"(b), "r"(idesc), "r"(acc));
 }
-__device__ __forceinline__ void cp_el(uint32_t taddr, uint64_t src) {
+// One 128 x 64 BF16 K block (SWIZZLE_128B smem) -> 32 TMEM columns: 4 x 128x256b.
+__device__ __forceinline__ void cp4_el(uint32_t taddr, uint64_t src) {
   asm volatile(
-      "{ .reg .pred P; elect.sync _|P, 0xffffffff; "
-      "@P tcgen05.cp.cta_group::1.128x256b [%0], %1; }" ::"r"(taddr),
+      "{ .reg .pred P; .reg .b32 t1, t2, t3; .reg .b64 s1, s2, s3;\n"
+      "elect.sync _|P, 0xffffffff;\n"
+      "add.u32 t1, %0, 8; add.u32 t2, %0, 16; add.u32 t3, %0, 24;\n"
+      "add.u64 s1, %1, 2; add.u64 s2, %1, 4; add.u64 s3, %1, 6;\n"
+      "@P tcgen05.cp.cta_group::1.128x256b [%0], %1;\n"
+      "@P tcgen05.cp.cta_group::1.128x256b [t1], s1;\n"
+      "@P tcgen05.cp.cta_group::1.128x256b [t2], s2;\n"
+      "@P tcgen05.cp.cta_group::1.128x256b [t3], s3; }" ::"r"(taddr),
       "l"(src)
       : "memory");
 }
@@ -210,6 +230,49 @@ __device__ __forceinline__ float4 tile_sum(const float* pt, int64_t stride, int 
   return acc;
 }
 
+// MMA warp: K block j of the CTA multiplies weight block j (TMEM block j < nt, then
+// shared-memory block j - nt) by token block j of the token ring (xs slots of xg
+// blocks). Every counter and descriptor advances incrementally: the loop body is the
+// barrier wait at a token group start, the four MMAs and the slot release.
+struct MmaLoop {
+  uint32_t d_tm, a_tm;
+  uint64_t a_ss, x0;
+  uint32_t xstep, idesc;
+  int nk, nt;
+  uint32_t xfull0, xempty0, res_bar;
+};
+template <bool kStamp>
+__device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool mma, int lane) {
+  const int xg = p.xg, xs = p.xs;
+  uint32_t a_tm = m.a_tm, xph = 0;
+  uint64_t a_ss = m.a_ss, b = m.x0;
+  int jx = 0, gs = 0, g = 0;
+  for (int j = 0; j < m.nk; ++j) {
+    if (jx == 0) mbar_wait(m.xfull0 + 8 * gs, xph);
+    if (j == m.nt) mbar_wait(m.res_bar, 0);
+    if (kStamp && lane == 0 && j < 24) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
+    if (j < m.nt) {
+      if (mma) mma4_ts(m.d_tm, a_tm, b, m.idesc, j);
+      a_tm += 32;
+    } else {
+      if (mma) mma4_ss(m.d_tm, a_ss, b, m.idesc, j);
+      a_ss += kSlot >> 4;
+    }
+    b += m.xstep;
+    if (++jx == xg || j == m.nk - 1) {
+      if ((g + xs) * xg < m.nk) commit_el(m.xempty0 + 8 * gs);
+      jx = 0;
+      ++g;
+      if (++gs == xs) {
+        gs = 0;
+        xph ^= 1;
+        b = m.x0;
+      }
+    }
+    if (kStamp && lane == 0 && j < 24) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
+  }
+}
+
 // One CTA per (128-row weight tile, K split): blockIdx = tile * ks + split. 1 CTA/SM,
 // the whole grid co-resident (host check). Weight K blocks of the CTA: the first nt
 // live in TMEM (A operand of the TS MMA, filled by tcgen05.cp through the ring before
@@ -234,7 +297,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const uint32_t full0 = smem_u32(s_bar), empty0 = full0 + 8 * kMaxNS,
                  trdy0 = empty0 + 8 * kMaxNS, res_bar = trdy0 + 8 * kMaxT,
                  acc_bar = res_bar + 8, xfull0 = acc_bar + 8, xempty0 = xfull0 + 8 * kMaxX;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  // Warp-uniform (CUTLASS canonical_warp_idx_sync): role branches and the values the
+  // tcgen05 / TMA loops derive from it stay in uniform registers.
+  const int warp = __shfl_sync(0xffffffffu, static_cast<int>(threadIdx.x >> 5), 0);
+  const int lane = threadIdx.x & 31;
   const int tile = static_cast<int>(blockIdx.x) / p.ks, split = static_cast<int>(blockIdx.x) % p.ks;
   const int kb0 = split * p.kb / p.ks, nk = (split + 1) * p.kb / p.ks - kb0;
   const int nt = min(nk, p.nt_max), nr = nk - nt;
@@ -272,25 +338,31 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   asm volatile("tcgen05.fence::before_thread_sync;");
   __syncthreads();
   asm volatile("tcgen05.fence::after_thread_sync;");
-  const uint32_t tmem = s_tmem;  // D: columns [0, n); weight K block j < nt: na + 32 j
+  // D: columns [dcol, dcol + n); weight K block j < nt: acol + 32 j. Warp-uniform.
+  const uint32_t tmem = __shfl_sync(0xffffffffu, s_tmem, 0);
 
   // TMA issue: lane 0 of warps 0, 3 and 4-7 (the epilogue warps idle until the
   // accumulator is done). Bulk ops from one issuing warp complete about one at a
   // time (hwdb hw51), so each ring slot is owned by one issuer and the issuers run
   // in parallel. Weights never depend on the predecessor: the shared-memory-resident
   // blocks and the TMEM fill stream start at entry, beside the AttnRes reduce.
+  // Ring items run in rounds of ns slots (tokens: xs slots); issuer u owns the slots
+  // s = u (mod kIssuers) and visits them in item order, counters advance without a
+  // division.
   if ((warp == 0 || warp >= 3) && lane == 0) {
     constexpr int kIssuers = 6;
     const int u = warp == 0 ? 0 : warp - 2;
+    const int ns = p.ns;
     // res_bar's expect_tx is set before the CTA barrier above (thread 0).
     for (int r = u; r < nr; r += kIssuers)
       tma_2d(res_s + r * kSlot, &tw, (kb0 + nt + r) * 64, wrow, res_bar);
-    for (int i = 0; i < nt; ++i) {
-      const int slot = i % p.ns;
-      if (slot % kIssuers != u) continue;
-      if (i >= p.ns) mbar_wait(empty0 + 8 * slot, ((i / p.ns) & 1) ^ 1);
-      mbar_expect_tx(full0 + 8 * slot, kSlot);
-      tma_2d(ring_s + slot * kSlot, &tw, (kb0 + i) * 64, wrow, full0 + 8 * slot);
+    uint32_t ph = 0;
+    for (int i0 = 0; i0 < nt; i0 += ns, ph ^= 1) {
+      for (int slot = u; slot < ns && i0 + slot < nt; slot += kIssuers) {
+        if (i0 > 0) mbar_wait(empty0 + 8 * slot, ph ^ 1);
+        mbar_expect_tx(full0 + 8 * slot, kSlot);
+        tma_2d(ring_s + slot * kSlot, &tw, (kb0 + i0 + slot) * 64, wrow, full0 + 8 * slot);
+      }
     }
     // The token ring reuses the weight ring's memory in n x 128 B slots once the
     // TMEM fill has read every weight slot (its commits complete in order).
@@ -300,65 +372,62 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       if (u == 0) STAMP(1);
       // One op = xg token K blocks (3-D map, [xg][n][128 B] SWIZZLE_128B tiles); the
       // last op of the split may run past it (unused blocks, zero fill past K).
-      const int ng = (nk + p.xg - 1) / p.xg;
-      for (int g = 0; g < ng; ++g) {
-        const int gs = g % p.xs;
-        if (gs % kIssuers != u) continue;
-        if (g >= p.xs) mbar_wait(xempty0 + 8 * gs, ((g / p.xs) & 1) ^ 1);
-        mbar_expect_tx(xfull0 + 8 * gs, p.xg * n * 128);
-        tma_3d(ring_s + gs * p.xg * n * 128, &tx, 0, kb0 + g * p.xg, xfull0 + 8 * gs);
+      const int xg = p.xg, xs = p.xs, ng = (nk + xg - 1) / xg;
+      const int gbytes = xg * n * 128;
+      uint32_t xph = 0;
+      for (int g0 = 0; g0 < ng; g0 += xs, xph ^= 1) {
+        for (int gs = u; gs < xs && g0 + gs < ng; gs += kIssuers) {
+          if (g0 > 0) mbar_wait(xempty0 + 8 * gs, xph ^ 1);
+          mbar_expect_tx(xfull0 + 8 * gs, gbytes);
+          tma_3d(ring_s + gs * gbytes, &tx, 0, kb0 + (g0 + gs) * xg, xfull0 + 8 * gs);
+        }
       }
     }
   }
   __syncwarp();  // the issuing lane rejoins its warp (tcgen05.ld below is .aligned)
   if (warp == 2) {
-    // TMEM fill: ring weight block i -> TMEM columns [na + 32 i, na + 32 i + 32).
+    // TMEM fill: ring weight block i -> TMEM columns [acol + 32 i, acol + 32 i + 32).
+    // Commit only where a consumer waits (a slot reused by the ring, the last block).
+    const int ns = p.ns;
+    uint32_t ta = tmem + p.acol, ph = 0;
+    int slot = 0;
     for (int i = 0; i < nt; ++i) {
-      const int slot = i % p.ns;
-      mbar_wait(full0 + 8 * slot, (i / p.ns) & 1);
-      const uint64_t src = smem_desc(ring_s + slot * kSlot);
-#pragma unroll
-      for (int kk = 0; kk < 4; ++kk) cp_el(tmem + p.acol + 32 * i + 8 * kk, src + 2 * kk);
-      // tcgen05.commit stalls the issuing thread's tensor pipe (measured ~0.25 us per
-      // K block with a commit each): commit only where a consumer needs it.
-      if (i + p.ns < nt) commit_el(empty0 + 8 * slot);
-      if (i == nt - 1) commit_el(trdy0 + 8 * i);
+      mbar_wait(full0 + 8 * slot, ph);
+      cp4_el(ta, smem_desc(ring_s + slot * kSlot));
+      if (i + ns < nt) commit_el(empty0 + 8 * slot);
+      ta += 32;
+      if (++slot == ns) {
+        slot = 0;
+        ph ^= 1;
+      }
     }
+    commit_el(trdy0 + 8 * (nt - 1));
   } else if (warp == 1) {
     // kind::f16: BF16 A/B, FP32 D, K-major, M = 128 weight rows, N = n tokens.
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
-    for (int j = 0; j < nk; ++j) {
-      const int g = j / p.xg, gs = g % p.xs, xs = gs * p.xg + j % p.xg;
-      if ((p.debug & 8) && j == 0) {  // probe (n32: no ring reuse): all tokens landed first
-        for (int q = 0; q < min(p.xs, (nk + p.xg - 1) / p.xg); ++q) mbar_wait(xfull0 + 8 * q, 0);
-        mbar_wait(res_bar, 0);
-      }
-      if (j % p.xg == 0 && !(p.debug & 8)) mbar_wait(xfull0 + 8 * gs, (g / p.xs) & 1);
-      if (j == 0) {
-        mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
-        // Orders the MMAs after the fill warp's tcgen05.cp; TMA-landed operands need
-        // only the barrier (no per-block tcgen05 fence: it stalls the issue).
-        asm volatile("tcgen05.fence::after_thread_sync;");
-      } else if (j == nt && !(p.debug & 8)) {
-        mbar_wait(res_bar, 0);
-      }
-      if (j == 0 && lane == 0) STAMP(6);
-      if (lane == 0 && j < 24 && p.stamps && !(p.debug & 4)) p.stamps[blockIdx.x * kStampStride + 32 + j] = clock64();
-      const uint64_t b0 = smem_desc(ring_s + xs * n * 128);
-      if (p.debug & 1) {
-      } else if (j < nt) {
-#pragma unroll
-        for (int kk = 0; kk < 4; ++kk)
-          mma_ts(tmem + p.dcol, tmem + p.acol + 32 * j + 8 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
-      } else {
-        const uint64_t a0 = smem_desc(res_s + (j - nt) * kSlot);
-#pragma unroll
-        for (int kk = 0; kk < 4; ++kk) mma_ss(tmem + p.dcol, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
-      }
-      if ((j % p.xg == p.xg - 1 || j == nk - 1) && (g + p.xs) * p.xg < nk)
-        commit_el(xempty0 + 8 * gs);
-      if (lane == 0 && j < 24 && p.stamps && !(p.debug & 4)) p.stamps[blockIdx.x * kStampStride + 8 + j] = clock64();
+    mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
+    // Orders the MMAs after the fill warp's tcgen05.cp; TMA-landed operands need
+    // only their barrier.
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    mbar_wait(xfull0, 0);
+    if (lane == 0) STAMP(6);
+    __syncwarp();
+    const MmaLoop m{tmem + p.dcol,
+                    tmem + p.acol,
+                    smem_desc(res_s),
+                    smem_desc(ring_s),
+                    static_cast<uint32_t>(n) * 8,  // n x 128 B per token K block, 16 B units
+                    idesc,
+                    nk,
+                    nt,
+                    xfull0,
+                    xempty0,
+                    res_bar};
+    if (p.stamps && !(p.debug & 4)) {
+      mma_loop<true>(p, m, !(p.debug & 1), lane);
+    } else {
+      mma_loop<false>(p, m, !(p.debug & 1), lane);
     }
     commit_el(acc_bar);
   } else if (warp >= 4) {
