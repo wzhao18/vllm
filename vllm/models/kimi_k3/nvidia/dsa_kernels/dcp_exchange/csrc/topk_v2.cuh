@@ -1708,6 +1708,8 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params 
 // run in the same order everywhere; the flags of a CTA's rows are read at once.
 __global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
   V2_KERNEL_PROLOGUE(kV2T)
+  // its dependent (the sparse core) may start its prologue now; it waits for this grid's end
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   int any = 0;
   for (int row = blockIdx.x + threadIdx.x * gridDim.x; row < p.T; row += kV2T * gridDim.x) any |= p.redo[row];
   if (!__syncthreads_or(any)) return;
