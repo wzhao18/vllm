@@ -670,8 +670,7 @@ def main():
     if shared_shape is not None:
         fused, shared_ref = make_shared(W, shared_shape, max(caps), args.seed + rank, device)
         if args.die_local:
-            fc1 = die_local.place_halves(fused.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
-            fused = fused._replace(fc1=(fc1, fused.fc1[1]))
+            fused = die_local.place_shared(fused)
     moe.warmup(weights, ids_dtypes=(getattr(torch, args.ids_dtype),), shared=fused)
     rms = None
     if args.rmsnorm:

@@ -136,6 +136,18 @@ def place_halves(t: torch.Tensor) -> torch.Tensor:
     return t if placed is None else placed.view(t.shape)
 
 
+def place_shared(shared):
+    """``shared`` (``session.FusedSharedArgs``) with the fused shared expert's FC1 and
+    FC2 weight codes homed per die half: FC1 [1, K, N] and FC2 [1, I, H] are K-major
+    views of [1, N, K] / [1, H, I] buffers, so each half of the buffer is one half of
+    the feature (N / H) rows, the half the GenPhase decode scheduler claims on that
+    die. Same bytes and views; the scale factors stay where they are. A weight whose
+    homes cannot be confirmed keeps its buffer (``place_halves``)."""
+    fc1 = place_halves(shared.fc1[0].permute(0, 2, 1)).permute(0, 2, 1)
+    fc2 = place_halves(shared.fc2[0].permute(0, 2, 1)).permute(0, 2, 1)
+    return shared._replace(fc1=(fc1, shared.fc1[1]), fc2=(fc2, shared.fc2[1]))
+
+
 def place_experts(weights: RubinMoeWeights) -> RubinMoeWeights:
     """``weights`` with every expert-major tensor (FC1/FC2 codes and scales) homed
     per die half (``expert_split``); per-expert scalars stay where they are. The
