@@ -215,21 +215,25 @@ constexpr int CTA_THREADS = NT * G;
 using vec_t = std::conditional_t<VEC == 8, uint4, uint2>;
 constexpr int VW = VEC / 2;  // 32-bit words per vec_t
 
-__device__ __forceinline__ void unpackv(const vec_t& p, float (&f)[VEC]) {
+// A lane's values as FP32 pairs: the element math runs as packed FP32x2
+// instructions (FFMA2 / FMUL2 / FADD2: two IEEE FP32 operations per
+// instruction, the same per-element rounding as FFMA / FMUL / FADD).
+__device__ __forceinline__ float2 unpack2(uint32_t w) {
+  return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+__device__ __forceinline__ void unpack2v(const vec_t& p, float2 (&f)[VW]) {
   const uint32_t* w = reinterpret_cast<const uint32_t*>(&p);
 #pragma unroll
-  for (int i = 0; i < VW; ++i) {
-    f[2 * i] = __uint_as_float(w[i] << 16);
-    f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
-  }
+  for (int i = 0; i < VW; ++i) f[i] = unpack2(w[i]);
 }
-__device__ __forceinline__ vec_t packv(const float (&f)[VEC]) {
+__device__ __forceinline__ vec_t pack2v(const float2 (&f)[VW]) {
   vec_t p;
   uint32_t* w = reinterpret_cast<uint32_t*>(&p);
 #pragma unroll
-  for (int i = 0; i < VW; ++i) w[i] = pack2(f[2 * i], f[2 * i + 1]);
+  for (int i = 0; i < VW; ++i) w[i] = pack2(f[i].x, f[i].y);
   return p;
 }
+__device__ __forceinline__ float2 bcast2(float x) { return make_float2(x, x); }
 
 template <int D>
 struct Smem {
@@ -469,37 +473,36 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
         s = wait_row();
 #pragma unroll
         for (int k = 0; k < NCH; ++k) {
-          float fp[VEC], fd[VEC];
-          unpackv(u[k], fp);
-          unpackv(s[k * 32 + lane], fd);
+          float2 fp[VW], fd[VW];
+          unpack2v(u[k], fp);
+          unpack2v(s[k * 32 + lane], fd);
 #pragma unroll
-          for (int j = 0; j < VEC; ++j) fp[j] += fd[j];
-          u[k] = packv(fp);
+          for (int j = 0; j < VW; ++j) fp[j] = __fadd2_rn(fp[j], fd[j]);
+          u[k] = pack2v(fp);
         }
       }
       release_row();
     }
     K31LP_STAMP(2);
-    float ss = 0.f, dw = 0.f;
+    float2 ss2 = bcast2(0.f), dw2 = bcast2(0.f);
 #pragma unroll
     for (int k = 0; k < NCH; ++k) {
       const int c = (int)seg0 + (k * 32 + lane) * VEC;
       if (a.write_prefix) *reinterpret_cast<vec_t*>(a.prefix_dst + t * H + c) = u[k];
       if (a.widx >= 0)
         *reinterpret_cast<vec_t*>(a.blocks + t * a.bsm + a.widx * a.bsr + c) = u[k];
-      float f[VEC], ww[VEC];
-      unpackv(u[k], f);
+      float2 f[VW];
+      unpack2v(u[k], f);
 #pragma unroll
-      for (int j = 0; j < VEC; j += 4) {
-        const float4 w4 = *reinterpret_cast<const float4*>(sm.w + c + j);
-        ww[j] = w4.x; ww[j + 1] = w4.y; ww[j + 2] = w4.z; ww[j + 3] = w4.w;
-      }
-#pragma unroll
-      for (int j = 0; j < VEC; ++j) {
-        ss = fmaf(f[j], f[j], ss);
-        dw = fmaf(f[j], ww[j], dw);
+      for (int i = 0; i < VW; i += 2) {
+        const float4 w4 = *reinterpret_cast<const float4*>(sm.w + c + 2 * i);
+        ss2 = __ffma2_rn(f[i], f[i], ss2);
+        dw2 = __ffma2_rn(f[i], make_float2(w4.x, w4.y), dw2);
+        ss2 = __ffma2_rn(f[i + 1], f[i + 1], ss2);
+        dw2 = __ffma2_rn(f[i + 1], make_float2(w4.z, w4.w), dw2);
       }
     }
+    float ss = ss2.x + ss2.y, dw = dw2.x + dw2.y;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
       ss += __shfl_xor_sync(0xffffffff, ss, o);
@@ -542,40 +545,45 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     }
     if (lane < MAXB) sm.ew[g][warp][lane] = e_mine;
     __syncwarp();
-    float acc[NCH][VEC];
+    float2 acc[NCH][VW];
+    {
+      const float2 cu2 = bcast2(c_u);
 #pragma unroll
-    for (int k = 0; k < NCH; ++k) {
-      float f[VEC];
-      unpackv(u[k], f);
+      for (int k = 0; k < NCH; ++k) {
+        float2 f[VW];
+        unpack2v(u[k], f);
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) acc[k][j] = f[j] * c_u;
+        for (int j = 0; j < VW; ++j) acc[k][j] = __fmul2_rn(f[j], cu2);
+      }
     }
 
     // Block stream: acc += e_i v_i.
 #pragma unroll 1
     for (int i = 0; i < n; ++i) {
       const vec_t* s = wait_row();
-      const float ei = sm.ew[g][warp][i];
+      const float2 ei = bcast2(sm.ew[g][warp][i]);
 #pragma unroll
       for (int k = 0; k < ((K31LP_PROBE & 129) ? 0 : NCH); ++k) {
-        float f[VEC];
-        unpackv(s[k * 32 + lane], f);
+        float2 f[VW];
+        unpack2v(s[k * 32 + lane], f);
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) acc[k][j] = fmaf(ei, f[j], acc[k][j]);
+        for (int j = 0; j < VW; ++j) acc[k][j] = __ffma2_rn(ei, f[j], acc[k][j]);
       }
       release_row();
     }
     K31LP_STAMP(5);
     if constexpr ((K31LP_PROBE & 2) != 0) {
-      if (acc[0][0] == 123.f) a.out[t] = __float2bfloat16(ss + dw);
+      if (acc[0][0].x == 123.f) a.out[t] = __float2bfloat16(ss + dw);
       continue;
     }
     float os = 0.f;
     if constexpr (!K31LP_SKEL) {
+      float2 os2 = bcast2(0.f);
 #pragma unroll
       for (int k = 0; k < NCH; ++k)
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) os = fmaf(acc[k][j], acc[k][j], os);
+        for (int j = 0; j < VW; ++j) os2 = __ffma2_rn(acc[k][j], acc[k][j], os2);
+      os = os2.x + os2.y;
     }
     float orstd = 1.f;
     if constexpr (NORM && K31LP_SKEL) {
@@ -593,17 +601,18 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
 #pragma unroll
     for (int k = 0; k < NCH; ++k) {
       const int c = (int)seg0 + (k * 32 + lane) * VEC;
-      float v[VEC];
+      float2 v[VW];
       if constexpr (NORM && !K31LP_SKEL) {
-        float wf[VEC];
-        unpackv(*reinterpret_cast<const vec_t*>(sm.onw + c), wf);
+        float2 wf[VW];
+        unpack2v(*reinterpret_cast<const vec_t*>(sm.onw + c), wf);
+        const float2 or2 = bcast2(orstd);
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) v[j] = acc[k][j] * orstd * wf[j];
+        for (int j = 0; j < VW; ++j) v[j] = __fmul2_rn(__fmul2_rn(acc[k][j], or2), wf[j]);
       } else {
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) v[j] = acc[k][j];
+        for (int j = 0; j < VW; ++j) v[j] = acc[k][j];
       }
-      const vec_t ob = packv(v);
+      const vec_t ob = pack2v(v);
       if constexpr ((K31LP_PROBE & 4) != 0) {
         if (*reinterpret_cast<const uint32_t*>(&ob) == 0x12345678u) a.out[t] = a.onw[0];
         continue;
@@ -615,21 +624,21 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
         *reinterpret_cast<uint2*>(a.q + t * H + c) = *reinterpret_cast<const uint2*>(&ob);
         if ((c & 31) == 0) a.sf[swizzled_sf_offset(t, c >> 5, a.sf_padded_cols)] = 0;
       } else if constexpr (QUANT) {
-        float qv[VEC];
-        unpackv(ob, qv);
+        float2 qv[VW];
+        unpack2v(ob, qv);
         float amax = 0.f;
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) amax = fmaxf(amax, fabsf(qv[j]));
+        for (int j = 0; j < VW; ++j) amax = fmaxf(amax, fmaxf(fabsf(qv[j].x), fabsf(qv[j].y)));
 #pragma unroll
         for (int m = 1; m < 32 / VEC; m <<= 1)
           amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, m));
         const uint32_t ex = float_to_ue8m0(amax * (1.0f / 448.0f));
-        const float inv = ue8m0_to_inv_scale(ex);
+        const float2 inv2 = bcast2(ue8m0_to_inv_scale(ex));
         uint32_t wq[VEC / 4];
 #pragma unroll
         for (int j = 0; j < VEC / 4; ++j) {
-          wq[j] = (uint32_t)fp8x2(qv[4 * j] * inv, qv[4 * j + 1] * inv) |
-                  ((uint32_t)fp8x2(qv[4 * j + 2] * inv, qv[4 * j + 3] * inv) << 16);
+          const float2 q0 = __fmul2_rn(qv[2 * j], inv2), q1 = __fmul2_rn(qv[2 * j + 1], inv2);
+          wq[j] = (uint32_t)fp8x2(q0.x, q0.y) | ((uint32_t)fp8x2(q1.x, q1.y) << 16);
         }
         if constexpr (VEC == 8) {
           *reinterpret_cast<uint2*>(a.q + t * H + c) = make_uint2(wq[0], wq[1]);

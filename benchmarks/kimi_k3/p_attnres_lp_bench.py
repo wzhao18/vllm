@@ -277,32 +277,42 @@ def main():
             tot["clip:" + k] = tot.get("clip:" + k, 0.0) + (s1 - c0) / args.iters
         return {k: round(v / 1e3, 3) for k, v in sorted(tot.items())}
 
-    for pd in [int(x) for x in args.depths.split(",")] if args.percall else []:
+    pc_modes = [(rs, int(pb)) for rs in args.resid.split(",") for pb in args.probe.split(",")]
+    for pd, (rs, pb) in [(int(x), m) for x in args.depths.split(",") for m in pc_modes] \
+            if args.percall else []:
         attn_res_lp.RING_DEPTH = pd
         attn_res_lp.RING_DEPTH_Q_DEEP = pd
+        mode["resid"], mode["probe"], mode["psim"] = rs, pb, 0
         st = State(bool(args.dielocal))
         for c in calls:
             run_lp(st, c)
         torch.cuda.synchronize()
         groups = {}
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            st = State(bool(args.dielocal))
-            for c in calls:
-                run_lp(st, c)
+            for _ in range(args.iters):
+                for c in calls:
+                    run_lp(st, c)
             torch.cuda.synchronize()
         evs = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
                and "attn_res_lp" in e.name]
         evs.sort(key=lambda e: e.time_range.start)
-        for c, e in zip(calls, evs):
-            rows = c["nb"] + 1 + int(c["delta"]) + 1 + (c["widx"] >= 0) \
+        for i, e in enumerate(evs):
+            c = calls[i % len(calls)]
+            dlt = c["delta"] and rs != "c"
+            wb = (dlt or (c["kind"] == "post" and not c["delta"])) and args.dielocal and rs != "c"
+            rows = c["nb"] + 1 + int(dlt) + int(wb) + (c["widx"] >= 0) \
                 + (1 if c["impl"] != "mx_q" else 0) + (0.5 if c["impl"] != "native" else 0)
             k = f"{c['kind']}.{c['impl']}.nb{c['nb']}.d{int(c['delta'])}"
             g = groups.setdefault(k, [0, 0.0, rows])
             g[0] += 1
             g[1] += e.time_range.elapsed_us()
+        tot = 0.0
         for k, (n, us, rows) in sorted(groups.items()):
-            print(json.dumps({"depth": pd, "call": k, "n": n, "us": round(us / n, 1),
+            tot += us / args.iters
+            print(json.dumps({"pc": f"d{pd}r{rs}pb{pb}", "call": k, "n": n // args.iters,
+                              "us": round(us / n, 1), "rows": rows,
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
+        print(json.dumps({"pc": f"d{pd}r{rs}pb{pb}", "sum_ms": round(tot / 1e3, 3)}))
 
     def lp_arm(qa, pdl, qdeep, resid="a", probe=0, psim=0):
         def fn(st, c):
