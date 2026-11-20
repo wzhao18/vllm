@@ -58,9 +58,15 @@ constexpr float LOG2_E = 1.4426950408889634f;
 #endif
 #ifndef K31LP_PROBE
 #define K31LP_PROBE 0  // probe builds only (bench): 1 no block math, 2 no epilogue,
-                       // 4 no output stores, 8 no CTA barriers (wrong values)
+                       // 4 no output stores, 8 no CTA barriers (wrong values),
+                       // 128 data-movement skeleton: every load, store, claim and
+                       // barrier of the real kernel, no block / norm / quant math
+#endif
+#ifndef K31LP_SKEL
+#define K31LP_SKEL ((K31LP_PROBE & 128) != 0)
 #endif
 static_assert(NCH * NT * VEC == H);
+static_assert(!K31LP_SKEL || VEC == 8, "skeleton probe: VEC 8 only");
 
 using bf16_t = __nv_bfloat16;
 
@@ -551,7 +557,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       const vec_t* s = wait_row();
       const float ei = sm.ew[g][warp][i];
 #pragma unroll
-      for (int k = 0; k < ((K31LP_PROBE & 1) ? 0 : NCH); ++k) {
+      for (int k = 0; k < ((K31LP_PROBE & 129) ? 0 : NCH); ++k) {
         float f[VEC];
         unpackv(s[k * 32 + lane], f);
 #pragma unroll
@@ -565,12 +571,16 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       continue;
     }
     float os = 0.f;
+    if constexpr (!K31LP_SKEL) {
 #pragma unroll
-    for (int k = 0; k < NCH; ++k)
+      for (int k = 0; k < NCH; ++k)
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) os = fmaf(acc[k][j], acc[k][j], os);
+        for (int j = 0; j < VEC; ++j) os = fmaf(acc[k][j], acc[k][j], os);
+    }
     float orstd = 1.f;
-    if constexpr (NORM) {
+    if constexpr (NORM && K31LP_SKEL) {
+      group_sync(g);  // the norm barrier, no math
+    } else if constexpr (NORM) {
 #pragma unroll
       for (int o = 16; o > 0; o >>= 1) os += __shfl_xor_sync(0xffffffff, os, o);
       if (lane == 0) sm.red[g][par][warp][2] = os;
@@ -584,7 +594,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     for (int k = 0; k < NCH; ++k) {
       const int c = (int)seg0 + (k * 32 + lane) * VEC;
       float v[VEC];
-      if constexpr (NORM) {
+      if constexpr (NORM && !K31LP_SKEL) {
         float wf[VEC];
         unpackv(*reinterpret_cast<const vec_t*>(sm.onw + c), wf);
 #pragma unroll
@@ -601,7 +611,10 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       if constexpr (WRITE_BF16) {
         *reinterpret_cast<vec_t*>(a.out + t * H + c) = ob;
       }
-      if constexpr (QUANT) {
+      if constexpr (QUANT && K31LP_SKEL) {  // same bytes, no quant math
+        *reinterpret_cast<uint2*>(a.q + t * H + c) = *reinterpret_cast<const uint2*>(&ob);
+        if ((c & 31) == 0) a.sf[swizzled_sf_offset(t, c >> 5, a.sf_padded_cols)] = 0;
+      } else if constexpr (QUANT) {
         float qv[VEC];
         unpackv(ob, qv);
         float amax = 0.f;
