@@ -70,7 +70,7 @@ struct Params {
   Args a;            // route_stage's arguments (y = router logits rows, ldy)
   float* y;          // [n, ldy] FP32 router logits
   float* part;       // [grid][n][128] FP32 split-K partials
-  unsigned* cnt;     // [kLine] router CTAs done [2 kLine] CTAs finished [kTileCnt + kLine t] tile t
+  unsigned* cnt;     // [2 kLine] CTAs finished, [kTileCnt + kLine t] partials stored of tile t
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
   int kb, rtiles, ks, ns, xs, na, nt_max, nr_max, yfull;
   int debug;  // microbench only (0 in production): bit 0 skips the MMAs
@@ -369,13 +369,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     const int t0 = split * n / p.ks, t1 = (split + 1) * n / p.ks;
     const float* pt = p.part + int64_t{tile} * p.ks * n * 128;
     const int64_t stride = int64_t{n} * 128;
-    if (tile < p.rtiles) {
-      for (int f = threadIdx.x; f < (t1 - t0) * 32; f += kThreads) {
-        const int t = t0 + f / 32, r4 = (f % 32) * 4;
-        const float4 acc = tile_sum(pt, stride, p.ks, int64_t{t} * 128 + r4);
-        *reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + wrow + r4) = acc;
-      }
-    } else {
+    // Router tiles: the top-k CTA of each row sums its logits itself (below).
+    if (tile >= p.rtiles) {
       // Latent: BF16 round + the stager's quantization of each block of this tile.
       constexpr int vec = NVFP4 ? 16 : 32;
       constexpr int per = 128 / vec;
@@ -399,11 +394,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       }
     }
   }
-  __syncthreads();
-  if (tile < p.rtiles && threadIdx.x == 0) {
-    __threadfence();
-    atomicAdd(p.cnt + kLine, 1u);
-  }
   // Dead rows [n, capacity): routes -1 only (spread over the grid).
   {
     const int64_t lo = int64_t{n} * a.topk, hi = int64_t{a.capacity} * a.topk;
@@ -413,18 +403,35 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   }
   const int row = blockIdx.x;
   if (row < n) {
-    if (threadIdx.x == 0) {
-      const unsigned need = static_cast<unsigned>(p.rtiles * p.ks);
-      while (ld_acquire(p.cnt + kLine) < need) __nanosleep(32);
-      STAMP(4);
+    // Every router tile's partials stored: sum this row's logits in rank order
+    // (bitwise the tile sum) from the partials, one counter round trip fewer.
+    if (threadIdx.x < p.rtiles) {
+      const unsigned* c = p.cnt + kTileCnt + kLine * threadIdx.x;
+      while (ld_acquire(c) < static_cast<unsigned>(p.ks)) __nanosleep(32);
     }
     __syncthreads();
-    const float* yrow = p.y + int64_t{row} * a.ldy;
+    if (threadIdx.x == 0) STAMP(4);
+    const int64_t stride = int64_t{n} * 128;
     float lg[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
       const int e = j * kThreads + threadIdx.x;
-      lg[j] = e < a.num_logits ? __ldcg(yrow + e) : 0.0F;
+      float v[kMaxKs];
+      if (e < a.num_logits) {
+        const float* pe = p.part + (int64_t{e / 128} * p.ks * n + row) * 128 + (e % 128);
+#pragma unroll
+        for (int q = 0; q < kMaxKs; ++q)
+          if (q < p.ks) v[q] = __ldcg(pe + q * stride);
+      }
+      float acc = 0.0F;
+      if (e < a.num_logits) {
+        acc = v[0];
+#pragma unroll
+        for (int q = 1; q < kMaxKs; ++q)
+          if (q < p.ks) acc += v[q];
+        p.y[int64_t{row} * a.ldy + e] = acc;
+      }
+      lg[j] = acc;
     }
     route_block(a, row, lg, s_bias, s_unb, s_cand);  // warps 1.. return inside
   }
@@ -432,7 +439,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     STAMP(5);
     // The last CTA of the grid (every CTA is past its waits) resets the counters.
     if (atomicAdd(p.cnt + 2 * kLine, 1u) == gridDim.x - 1) {
-      p.cnt[kLine] = 0;
       p.cnt[2 * kLine] = 0;
       for (int t = 0; t < static_cast<int>(gridDim.x) / p.ks; ++t) p.cnt[kTileCnt + kLine * t] = 0;
     }
