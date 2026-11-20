@@ -214,10 +214,14 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
                                             const float (&lg)[kPer],
                                             const float* s_bias, float* s_unb,
                                             uint64_t* s_cand,
-                                            unsigned long long* clk = nullptr) {
+                                            unsigned long long* clk = nullptr,
+                                            int warm = 0) {
 #define RB_CLK(i) \
   if (clk != nullptr && threadIdx.x == 0) clk[i] = clock64()
   RB_CLK(0);
+  // warm (moe_front's instruction warm-up only): 0 the real selection; else no global
+  // write, and 1 stops after the sort, 2 skips the scoring and sort, 3 runs it all.
+  bool const dry = warm != 0;
   // Per-row flags read at entry: their load latency hides under the selection.
   bool const pad_row = a.pad != nullptr && a.pad[row];
   bool const record_row = a.l2p != nullptr && *a.record &&
@@ -231,14 +235,15 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
   for (int j = 0; j < kPer; ++j) {
     int32_t const e = j * (kWarps * 32) + threadIdx.x;
     k1[j] = 0;
-    if (e < num_experts) {
+    if (e < num_experts && warm != 2) {
       float unb, s;
       preprocess_score(lg[j], s_bias[e], unb, s);
       s_unb[e] = unb;
       k1[j] = make_key(s, e);
     }
   }
-  sort_desc<kPer>(k1);
+  if (warm != 2) sort_desc<kPer>(k1);
+  if (warm == 1) return;
   RB_CLK(1);
   // Pass 1: every warp's first r1 keys (of its topk), descending on lanes 0..r1-1.
   int32_t const r1 = min(topk, kRound1);
@@ -310,21 +315,23 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
         phys = a.l2p[id * a.map_slots + hashed % reps];
       }
       id = phys;
-      if (record_row && phys >= 0 && phys < a.load_size) {
+      if (!dry && record_row && phys >= 0 && phys < a.load_size) {
         atomicAdd(a.load + phys, 1);
       }
     }
     bool const valid = id >= 0 && id < a.num_experts;
-    if (id != -1 && !valid) {
+    if (!dry && id != -1 && !valid) {
       a.err[0] = 1;
       a.err[1] = id;
     }
     int64_t const o = int64_t{row} * topk + lane;
-    a.idx[o] = valid ? int32_t(id) : -1;
-    a.sw[o] = valid ? output : 0.0F;
+    if (!dry) {
+      a.idx[o] = valid ? int32_t(id) : -1;
+      a.sw[o] = valid ? output : 0.0F;
+    }
   }
   int32_t const vec = a.scale_mult > 0.0F ? 16 : 32;
-  for (int32_t c = a.hidden / vec + lane; c < a.sf_cols; c += 32) {
+  for (int32_t c = a.hidden / vec + lane; !dry && c < a.sf_cols; c += 32) {
     a.sf[int64_t{row} * a.sf_stride + c] = 0;
   }
   RB_CLK(5);
@@ -356,7 +363,8 @@ __device__ __forceinline__ float e4m3_to_float(uint8_t b) {
 
 // NVFP4 block16 of the stager (one block per thread).
 __device__ __forceinline__ void quant_nvfp4(const Args& a, int32_t row,
-                                            int32_t blk, const float4 (&in)[8]) {
+                                            int32_t blk, const float4 (&in)[8],
+                                            bool dry = false) {
   float v[16];
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
@@ -387,6 +395,7 @@ __device__ __forceinline__ void quant_nvfp4(const Args& a, int32_t row,
     if ((p & 0x70) == 0) p &= 0x7F;
     w[j / 4] |= uint32_t(p) << (8 * (j % 4));
   }
+  if (dry) return;
   *reinterpret_cast<uint2*>(a.x + int64_t{row} * a.x_stride + int64_t{blk} * 8) =
       make_uint2(w[0], w[1]);
   a.sf[int64_t{row} * a.sf_stride + blk] = s8;
@@ -394,7 +403,8 @@ __device__ __forceinline__ void quant_nvfp4(const Args& a, int32_t row,
 
 // MXFP8 block32 of the stager (one block per thread).
 __device__ __forceinline__ void quant_mxfp8(const Args& a, int32_t row,
-                                            int32_t blk, const float4 (&in)[8]) {
+                                            int32_t blk, const float4 (&in)[8],
+                                            bool dry = false) {
   float v[32];
 #pragma unroll
   for (int q = 0; q < 8; ++q) {
@@ -424,6 +434,7 @@ __device__ __forceinline__ void quant_mxfp8(const Args& a, int32_t row,
     }
     w[q] = word;
   }
+  if (dry) return;
   uint4* dst = reinterpret_cast<uint4*>(a.x + int64_t{row} * a.x_stride +
                                         int64_t{blk} * 32);
   dst[0] = make_uint4(w[0], w[1], w[2], w[3]);

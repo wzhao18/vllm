@@ -77,7 +77,7 @@ struct Params {
   int kb, rtiles, ks, ns, xs, xg, na, nt_max, nr_max, yfull;
   int dcol, acol;  // TMEM columns of D [n] and of the first weight K block  // xs: token op slots of xg blocks
   int debug;  // microbench only (0 in production): bit 0 skips the MMAs, bit 1 one
-              // accumulator poller, bit 2 no per-K-block stamps
+              // accumulator poller, bit 2 no per-K-block stamps, bit 3 no tail warm-up
   const uint8_t* wimg;  // die-local weight tile image (front_image)
   int tiles, item_split, item_pad;  // items >= item_split start item_pad blocks later
   short smid_item[kMaxSmid];        // SM -> work item (tile * ks + split), -1: spare
@@ -127,10 +127,14 @@ __device__ __forceinline__ void tma_3d(uint32_t dst, const CUtensorMap* map, int
       "l"(reinterpret_cast<uint64_t>(map)), "r"(0), "r"(row), "r"(kb), "r"(bar)
       : "memory");
 }
+// Weights are read once per step: evict-first in L2, so the 64 MB stream does not push
+// out what the step reuses (the tail's instructions, warmed before the dependency).
 __device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes,
                                          uint32_t bar) {
   asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+      "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+      "[%0], [%1], %2, [%3], pol; }"
       ::"r"(dst), "l"(reinterpret_cast<uint64_t>(src)), "r"(bytes), "r"(bar)
       : "memory");
 }
@@ -578,77 +582,91 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       for (int j = 0; j < 16; ++j) __stcg(dst + (c + j) * 128, v[j]);
     }
   }
-  // Every thread past the dependency before any global write below.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("tcgen05.fence::before_thread_sync;");
-  __syncthreads();
-  // A top-k CTA holds its TMEM to its end: a dependent CTA waiting for TMEM on this
-  // SM (launched at our entry trigger) would otherwise start beside the top-k (in-step
-  // stamps: route_block 3-7x slower there). The others free it now.
   const int row = smid < kMaxSmid ? p.smid_row[smid] : kMaxSmid;
-  if (warp == 1 && row >= n) {
-    asm volatile("tcgen05.fence::after_thread_sync;");
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
-  }
-  if (work && threadIdx.x == 0) {
-    STAMP(2);
-    __threadfence();
-    atomicAdd(p.cnt + kTileCnt + kLine * tile, 1u);
-    while (ld_acquire(p.cnt + kTileCnt + kLine * tile) < static_cast<unsigned>(p.ks)) __nanosleep(32);
-    STAMP(3);
+  // The tail below is long straight-line code run once per layer. In a decode step
+  // the other kernels evict it from L2 between two layers, and fetching it cold from
+  // HBM made the tail 3-4x slower in-step than warm (route_block 21.6K vs 5.9K clk;
+  // bench with an L2 + instruction-cache thrash: 24.6K). A spare SM (no weight item,
+  // no top-k row) runs this same code first, before the dependency, as a latent item's
+  // sum + quantization and row 0's top-k with every global write and wait off ("dry"),
+  // so the other CTAs' tails fetch it from L2.
+  const bool dry = !work && row >= n && !(p.debug & 8);
+  // With two or more spare SMs (rows items, items + 1, ...) the first warms the latent
+  // sum + quantization, the row's logits and its scoring + sort, the second the rest.
+  const int items = p.tiles * p.ks;
+  const int warm = !dry                                    ? 0
+                   : static_cast<int>(gridDim.x) - items < 2 ? 3
+                   : ((row - items) & 1)                   ? 2
+                                                           : 1;
+  const int ttile = dry ? p.rtiles : tile, tsplit = dry ? 0 : split;
+  const int trow = dry ? 0 : row;
+  if (!dry) {
+    // Every thread past the dependency before any global write below.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("tcgen05.fence::before_thread_sync;");
+    __syncthreads();
+    // A top-k CTA holds its TMEM to its end; the others free it now.
+    if (warp == 1 && row >= n) {
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
+    }
+    if (work && threadIdx.x == 0) {
+      STAMP(2);
+      __threadfence();
+      atomicAdd(p.cnt + kTileCnt + kLine * tile, 1u);
+      while (ld_acquire(p.cnt + kTileCnt + kLine * tile) < static_cast<unsigned>(p.ks))
+        __nanosleep(32);
+      STAMP(3);
+    }
   }
   __syncthreads();
   {
     // Split-K reduce of token rows [t0, t1) of this tile, partials in rank order.
-    const int t0 = split * n / p.ks, t1 = (split + 1) * n / p.ks;
-    const float* pt = p.part + int64_t{tile} * p.ks * n * 128;
+    const int t0 = tsplit * n / p.ks, t1 = (tsplit + 1) * n / p.ks;
+    const float* pt = p.part + int64_t{ttile} * p.ks * n * 128;
     const int64_t stride = int64_t{n} * 128;
     // Router tiles: the top-k CTA of each row sums its logits itself (below).
-    if (work && tile >= p.rtiles) {
+    if ((work || (dry && warm != 2)) && ttile >= p.rtiles) {
       // Latent: BF16 round + the stager's quantization of each block of this tile.
       constexpr int vec = NVFP4 ? 16 : 32;
       constexpr int per = 128 / vec;
-      const int blk0 = (wrow - a.num_logits) / vec;
+      const int twrow = ttile * 128;
+      const int blk0 = (twrow - a.num_logits) / vec;
       for (int f = threadIdx.x; f < (t1 - t0) * per; f += kThreads) {
         const int t = t0 + f / per, b = f % per;
         float4 in[8];
 #pragma unroll
         for (int q = 0; q < vec / 4; ++q)
           in[q] = tile_sum(pt, stride, p.ks, int64_t{t} * 128 + b * vec + 4 * q);
-        if (p.yfull) {
-          float4* dst = reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + wrow + b * vec);
+        if (p.yfull && !dry) {
+          float4* dst = reinterpret_cast<float4*>(p.y + int64_t{t} * a.ldy + twrow + b * vec);
 #pragma unroll
           for (int q = 0; q < vec / 4; ++q) dst[q] = in[q];
         }
         if constexpr (NVFP4) {
-          quant_nvfp4(a, t, blk0 + b, in);
+          quant_nvfp4(a, t, blk0 + b, in, dry);
         } else {
-          quant_mxfp8(a, t, blk0 + b, in);
+          quant_mxfp8(a, t, blk0 + b, in, dry);
         }
       }
     }
   }
-  if (p.stamps) {  // microbench: this CTA's latent sum + quantization done
+  if (p.stamps && !dry) {  // microbench: this CTA's latent sum + quantization done
     __syncthreads();
     if (threadIdx.x == 0) STAMP(57);
   }
-  // Dead rows [n, capacity): routes -1 only (spread over the grid).
-  {
-    const int64_t lo = int64_t{n} * a.topk, hi = int64_t{a.capacity} * a.topk;
-    for (int64_t i = lo + int64_t{blockIdx.x} * kThreads + threadIdx.x; i < hi;
-         i += int64_t{gridDim.x} * kThreads)
-      a.idx[i] = -1;
-  }
-  if (row < n) {
+  if (trow < n) {
     // Every router tile's partials stored: sum this row's logits in rank order
     // (bitwise the tile sum) from the partials, one counter round trip fewer.
-    if (threadIdx.x < p.rtiles) {
+    if (threadIdx.x < p.rtiles && !dry) {
       const unsigned* c = p.cnt + kTileCnt + kLine * threadIdx.x;
       while (ld_acquire(c) < static_cast<unsigned>(p.ks)) __nanosleep(32);
     }
     __syncthreads();
-    if (threadIdx.x == 0) STAMP(4);
-    if (threadIdx.x == 0 && p.stamps) p.stamps[blockIdx.x * kStampStride + 27] = clock64();
+    if (threadIdx.x == 0 && !dry) {
+      STAMP(4);
+      if (p.stamps) p.stamps[blockIdx.x * kStampStride + 27] = clock64();
+    }
     const int64_t stride = int64_t{n} * 128;
     // Every partial load is issued before the first store (one L2 round trip, not
     // one per expert slot), then the rank-order sums.
@@ -656,8 +674,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
       const int e = j * kThreads + threadIdx.x;
-      if (e < a.num_logits) {
-        const float* pe = p.part + (int64_t{e / 128} * p.ks * n + row) * 128 + (e % 128);
+      if (e < a.num_logits && warm != 2) {
+        const float* pe = p.part + (int64_t{e / 128} * p.ks * n + trow) * 128 + (e % 128);
 #pragma unroll
         for (int q = 0; q < kMaxKs; ++q)
           if (q < p.ks) v[j][q] = __ldcg(pe + q * stride);
@@ -668,21 +686,35 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int j = 0; j < kPer; ++j) {
       const int e = j * kThreads + threadIdx.x;
       float acc = 0.0F;
-      if (e < a.num_logits) {
+      if (e < a.num_logits && warm != 2) {
         acc = v[j][0];
 #pragma unroll
         for (int q = 1; q < kMaxKs; ++q)
           if (q < p.ks) acc += v[j][q];
-        p.y[int64_t{row} * a.ldy + e] = acc;
+        if (!dry) p.y[int64_t{trow} * a.ldy + e] = acc;
       }
       lg[j] = acc;
     }
-    route_block(a, row, lg, s_bias, s_unb, s_cand,  // warps 1.. return inside
-                p.stamps ? p.stamps + blockIdx.x * kStampStride + 58 : nullptr);
+    route_block(a, trow, lg, s_bias, s_unb, s_cand,  // warps 1.. return inside
+                p.stamps && !dry ? p.stamps + blockIdx.x * kStampStride + 58 : nullptr, warm);
+    if (warp == 1 && !dry) {
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
+    }
+  }
+  if (dry) {  // the spare SM's own work below follows the dependency
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     if (warp == 1) {
       asm volatile("tcgen05.fence::after_thread_sync;");
       asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" ::"r"(tmem));
     }
+  }
+  // Dead rows [n, capacity): routes -1 only (spread over the grid).
+  {
+    const int64_t lo = int64_t{n} * a.topk, hi = int64_t{a.capacity} * a.topk;
+    for (int64_t i = lo + int64_t{blockIdx.x} * kThreads + threadIdx.x; i < hi;
+         i += int64_t{gridDim.x} * kThreads)
+      a.idx[i] = -1;
   }
   if (threadIdx.x == 0) {
     STAMP(5);
@@ -1029,8 +1061,8 @@ _CHUNK_SLOTS = (2 << 20) // _SLOT  # tiles per 2 MiB chunk (the die homing unit)
 def _front_plan(device: int, items: int, item_slots: tuple, router_items: int) -> tuple:
     """(plan, split item, die-0 chunks, die-1 chunks): every SM's work item, the die-0
     SMs taking items [0, split) and the die-1 SMs the rest (one CTA per SM), every SM's
-    top-k row (router items first, then spare SMs, then latent items: the rows go to
-    CTAs without latent work first), and the 2 MiB chunks of each die's image region.
+    top-k row (router items first, then latent items, spare SMs last: they stay
+    row-free and warm the tail's code), and the 2 MiB chunks of each die's image region.
     item_slots[i]: item i's 16 KiB tiles."""
     from ..common import dies
 
@@ -1047,7 +1079,7 @@ def _front_plan(device: int, items: int, item_slots: tuple, router_items: int) -
     sms = [s for s, d in enumerate(table) if d >= 0]
     item = {s: int(plan[s]) for s in sms}
     order = sorted(sms, key=lambda s: (
-        0 if 0 <= item[s] < router_items else 1 if item[s] < 0 else 2, item[s]))
+        0 if 0 <= item[s] < router_items else 2 if item[s] < 0 else 1, item[s]))
     plan[_MAX_SMID : 2 * _MAX_SMID] = _MAX_SMID
     for r, s in enumerate(order):
         plan[_MAX_SMID + s] = r

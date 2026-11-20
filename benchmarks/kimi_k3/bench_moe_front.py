@@ -50,6 +50,18 @@ __global__ void __launch_bounds__(128) prod_kernel(const __nv_bfloat16* src, __n
     atomicMax(end_stamp, e + (unsigned long long)pad[0]);
   }
 }
+// Instruction-cache thrash: ~256 KB of straight-line code run by 4 CTAs per SM, so the
+// next kernel starts with cold SM instruction caches (as in a decode step, where ~90
+// other kernels run between two MoE fronts).
+__global__ void __launch_bounds__(128) thrash_kernel(float* out, float a) {
+  float x = a * threadIdx.x, y = a + threadIdx.x;
+#pragma unroll
+  for (int i = 0; i < 16384; ++i) x = fmaf(x, y, __int_as_float(0x3f800000 + 7 * i));
+  if (x == 1.2345f) out[threadIdx.x] = x;
+}
+void thrash(torch::Tensor out, int64_t ctas) {
+  thrash_kernel<<<(int)ctas, 128, 0, c10::cuda::getCurrentCUDAStream()>>>((float*)out.data_ptr(), 1e-3f);
+}
 void prod(torch::Tensor src, torch::Tensor dst, int64_t busy_ns, torch::Tensor end, int64_t carve) {
   static int64_t set = -2;
   if (carve != set) { TORCH_CHECK(cudaFuncSetAttribute(prod_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int)carve) == cudaSuccess); set = carve; }
@@ -74,8 +86,10 @@ def _prod_mod():
     build = os.path.join(root, "k3_moe_front_bench_prod")
     os.makedirs(build, exist_ok=True)
     return load_inline(
-        name="k3_moe_front_bench_prod", cpp_sources="void prod(torch::Tensor src, torch::Tensor dst, int64_t busy_ns, torch::Tensor end, int64_t carve);",
-        cuda_sources="#include <cuda_bf16.h>\n" + _PROD, functions=["prod"],
+        name="k3_moe_front_bench_prod",
+        cpp_sources="void prod(torch::Tensor src, torch::Tensor dst, int64_t busy_ns, torch::Tensor end, int64_t carve);"
+        "void thrash(torch::Tensor out, int64_t ctas);",
+        cuda_sources="#include <cuda_bf16.h>\n" + _PROD, functions=["prod", "thrash"],
         extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
         build_directory=build, verbose=False,
     )  # fmt: skip
@@ -123,6 +137,9 @@ def main():
     ap.add_argument("--no-base", action="store_true")
     ap.add_argument("--stamp-modes", default="0,1", help="debug bits per stamped pass")
     ap.add_argument("--carveout", type=int, default=-1, help="producer preferred smem carveout (-1 default)")
+    ap.add_argument("--rs-cold", action="store_true", help="time route_stage alone warm vs cold code")
+    ap.add_argument("--dbg-time", default="", help="extra graph timings with stamps on, per debug value")
+    ap.add_argument("--thrash", default="0", help="stamped passes: 0 warm code, 1 cold L2 + cold SM i-cache, 2 cold i-cache only")
     args = ap.parse_args()
     dev = torch.device("cuda")
     torch.manual_seed(0)
@@ -177,6 +194,34 @@ def main():
                 line += f" | ltpin+route_stage {(t_b - t_p) / L:.2f}"
             except Exception as e:  # noqa: BLE001
                 line += f" | ltpin n/a ({type(e).__name__}: {str(e)[:60]})"
+        if args.rs_cold:
+            # route_stage alone on GEMM rows: warm, and after an L2 flush + instruction-cache thrash (the
+            # in-step state: its code is evicted between layers), minus the flush + thrash alone.
+            yc = torch.mm(src, ws[0].t(), out_dtype=torch.float32)
+            fl = torch.empty(512 << 20, dtype=torch.uint8, device=dev)
+            tho = torch.zeros(128, device=dev)
+
+            def rs_warm():
+                for _ in range(L):
+                    rm.route_stage(yc, E, bias, *sess, None, E, True, 2.827, True, 1.0, *_NO_EPLB)
+
+            def cold_only():
+                for _ in range(L):
+                    fl.zero_()
+                    pm.thrash(tho, sms * 4)
+
+            def rs_cold():
+                for _ in range(L):
+                    fl.zero_()
+                    pm.thrash(tho, sms * 4)
+                    rm.route_stage(yc, E, bias, *sess, None, E, True, 2.827, True, 1.0, *_NO_EPLB)
+
+            t_w = _time_graph(rs_warm, iters=20)
+            t_0 = _time_graph(cold_only, iters=10)
+            t_c = _time_graph(rs_cold, iters=10)
+            print(f"n{n}: route_stage alone warm {t_w / L:.2f} us | cold (flush+thrash before) {(t_c - t_0) / L:.2f} us",
+                  flush=True)
+            del fl
         cfgs = [tuple(int(v) for v in c.split(",")) for c in args.cfg] or [moe_front.config_for(n, dev)]
         imgs = {}
         for c in cfgs:
@@ -191,6 +236,16 @@ def main():
                                  True, 1.0, *c, nostamp, *_NO_EPLB)  # fmt: skip
 
             t_f = _time_graph(front)
+            for dbg in [int(v) for v in args.dbg_time.split(",") if v]:
+                dst = torch.zeros(sms * 64 + dbg, dtype=torch.int64, device=dev)
+
+                def front_dbg(c=c, dst=dst):
+                    for i in range(L):
+                        pm.prod(src, h, busy, nostamp, carve)
+                        fm.moe_front(ws[i], *imgs[c[0]][i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
+                                     True, 1.0, *c, dst, *_NO_EPLB)  # fmt: skip
+
+                line += f" | stamped dbg{dbg} {(_time_graph(front_dbg) - t_p) / L:.2f}"
             line += f" | front{c} ring {plan[0]} xslots {plan[3]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
             # Skeleton: same bytes, barriers, reduce and epilogue, no MMAs (debug bit 0).
             skel = torch.zeros(sms * 64 + 1, dtype=torch.int64, device=dev)
@@ -206,7 +261,8 @@ def main():
         print(line, flush=True)
         # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]
-        for skel_mode in [int(v) for v in args.stamp_modes.split(",")]:
+        thr_out = torch.zeros(128, device=dev)
+        for skel_mode, th in [(int(v), int(t)) for v in args.stamp_modes.split(",") for t in args.thrash.split(",")]:
             grid = sms  # one CTA per SM
             st = torch.zeros(grid * 64 + skel_mode, dtype=torch.int64, device=dev)
             end = torch.zeros(1, dtype=torch.int64, device=dev)
@@ -224,7 +280,10 @@ def main():
             for _ in range(3):
                 end.zero_()
                 st.zero_()
-                flush.zero_()
+                if th != 2:
+                    flush.zero_()
+                if th:
+                    pm.thrash(thr_out, sms * 4)
                 g.replay()
                 torch.cuda.synchronize()
             sv = st[: grid * 64].view(grid, 64)
@@ -236,8 +295,13 @@ def main():
                 v = s[:, i][sv[:, i] != 0]
                 if v.numel():
                     parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
-            print(f"  stamps dbg{skel_mode} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
+            print(f"  stamps dbg{skel_mode} th{th} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
                   flush=True)
+            tk = sv[:, 27] != 0
+            if tk.any():
+                rc = [(sv[:, 58 + i][tk] - sv[:, 27][tk]).double().median().item() for i in range(6)]
+                print(f"  th{th} top-k CTAs {int(tk.sum())}: median route clk after topk-go (entry sorted pass1 "
+                      f"barrier pass2 end): " + " ".join(f"{v:.0f}" for v in rc), flush=True)
             ks = c[0]
             item = sv[:, 31] - 1  # the CTA's work item (-1: spare SM)
             tile = torch.where(item >= 0, item // ks, torch.full_like(item, 1 << 20))
