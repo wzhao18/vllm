@@ -272,3 +272,23 @@ def test_qkv_conv_supported_shapes():
         qkv_conv_supported(x, w, state[..., :2], 256)
     with pytest.raises(ValueError, match="weight not contiguous"):
         qkv_conv_supported(x, w.t().contiguous().t(), state, 256)
+
+
+@pytest.mark.parametrize("dim_first", [True, False])
+def test_qkv_conv_normalize_qk(dim_first):
+    """normalize_qk: the q/k planes are stock ``l2norm_fwd`` of the conv output
+    (x * rsqrt(sum(x^2) + 1e-6) per 128-channel head row, FP32, bf16 out; within
+    one bf16 ulp, reduction order differs), the v plane and the state are unchanged."""
+    seqlens, part = [7, 300, 1, 1029, 64], 1024
+    case = _case(seqlens, part, torch.float32, dim_first, 0)
+    x, weight, state, qsl, cache_indices, has_init = case
+    s_raw, s_nrm = state.clone(), state.clone()
+    raw = qkv_conv(x, weight, s_raw, qsl, cache_indices, has_init, part)
+    nrm = qkv_conv(x, weight, s_nrm, qsl, cache_indices, has_init, part, normalize_qk=True)
+    rows = int(qsl[-1].item()) - seqlens[-1]  # last sequence is the padding line
+    assert torch.equal(s_raw, s_nrm)
+    assert torch.equal(nrm[2, :rows], raw[2, :rows])
+    ref = raw[:2, :rows].float().unflatten(-1, (-1, 128))
+    ref = (ref * torch.rsqrt(ref.square().sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16)
+    got = nrm[:2, :rows].unflatten(-1, (-1, 128))
+    torch.testing.assert_close(got.float(), ref.float(), atol=4e-3, rtol=8e-3)

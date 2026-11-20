@@ -26,6 +26,8 @@ def main():
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--variants", nargs="+", default=["{}"])
+    ap.add_argument("--prenorm", action="store_true",
+                    help="feed l2-normalized q/k (producer contract for QKN_)")
     a = ap.parse_args()
     variants = [json.loads(v) for v in a.variants]
     for lens_s in a.lens:
@@ -42,6 +44,11 @@ def one_shape(a, lens_s, variants):
     cu = cu_cpu.cuda()
     q, k, g = (torch.randn(1, T, H, D, device="cuda").to(bf) for _ in range(3))
     v = (torch.randn(1, T, H, D, device="cuda") * 0.5).to(bf)
+    if a.prenorm:
+        q, k = (
+            (x.float() * torch.rsqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)).to(bf)
+            for x in (q, k)
+        )
     beta = torch.randn(1, T, H, device="cuda").to(bf)
     A_log = torch.randn(H, device="cuda") * 0.5
     dt_bias = torch.randn(H * D, device="cuda") * 0.1

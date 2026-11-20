@@ -857,13 +857,17 @@ def qkv_conv(
     has_initial_state: torch.Tensor,
     part_dim: int,
     null_block_id: int | None = NULL_BLOCK_ID,
+    normalize_qk: bool = False,
 ) -> torch.Tensor:
     """``causal_conv1d_fn`` (width 4, SiLU, no bias) of the packed Q|K|V columns
     ``x`` (tokens, 3 * part_dim), conv state (cache lines, 3 * part_dim, >= 3)
     updated in place. Returns (3, tokens, part_dim): plane i is the dense output
     of channels [i * part_dim, (i + 1) * part_dim). Rows of padding sequences
     (cache line ``null_block_id``) and rows outside query_start_loc are not
-    written. CUDA graph safe: the row split is read on the device."""
+    written. CUDA graph safe: the row split is read on the device.
+    normalize_qk l2-normalizes the q and k planes per (token, head) row
+    (stock l2norm_fwd: x * rsqrt(sum(x^2) + 1e-6) in FP32, bf16 out);
+    part_dim must then be a multiple of 256."""
     _load_qkv_conv()
     num_tokens, dim = x.shape
     out = torch.empty((3, num_tokens, part_dim), dtype=x.dtype, device=x.device)
@@ -877,5 +881,6 @@ def qkv_conv(
         out,
         null_block_id if null_block_id is not None else -1,
         _qkv_conv_warps(dim, num_tokens),
+        normalize_qk,
     )
     return out
