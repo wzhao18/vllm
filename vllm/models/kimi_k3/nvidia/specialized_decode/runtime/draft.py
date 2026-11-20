@@ -91,11 +91,13 @@ FAST_LM_HEAD = {16: "1-7:1"}
 WIDE_LM_HEAD = {16: "17-32:1"}
 # Query rows whose LM-head shard GEMM is the die-local persistent stream-K token-wide
 # GEMM (cutedsl.gemm.wide_sk: the shard's two halves homed on the two dies, one CTA
-# pair per SM pair, all rows on the MMA's N), per TP. TP4 (D3-32, [40960, 7168]
+# pair per SM pair, all rows on the MMA's N), per TP, for the release drafter
+# (GqaDraftFastPath; the SP decode declares the preview drafter's LM head stock,
+# sp_attention.SP_DRAFTER_TABLES). TP4 (D3-32, [40960, 7168]
 # shard), VR200 1 GPU, cold weights, us, wide_sk vs the pinned cuBLASLt algorithm:
 # 96 rows 38.8 vs 47.0, 192 rows 46.6 vs 49.9, 288 rows 65.7 vs 66.8
 # (bench_kimi_k3_sdec_wide_sk.py).
-SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
+GQA_SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
 # Query rows whose context step (sharded projection + row gather, context-KV GEMM
 # and insert) the caller may run on a side stream, joined by the first MLA layer
 # right before its attention core (cutedsl.draft.attention ``join_context``): the
@@ -465,9 +467,9 @@ class DraftFastPath:
         self.lm_logits = None
         self.wide_batches = rows(WIDE_LM_HEAD) & self.batches
         self.lm_wide = None
-        # The die-local stream-K GEMM's rows (SK_LM_HEAD), prepared with the LM head.
-        self.sk_batches = rows(SK_LM_HEAD) & self.batches - self.lm_batches
-        self.sk_batches -= self.wide_batches
+        # The die-local stream-K GEMM's rows (the release drafter's GQA_SK_LM_HEAD),
+        # prepared with the LM head.
+        self.sk_batches = frozenset()
         self.lm_sk = None
         # The stock LM-head GEMM's rows on pinned cuBLASLt algorithms (lt_pin), for
         # the batches no fast LM head serves: prepared with the LM head.
@@ -918,7 +920,7 @@ class DraftFastPath:
             base = rows.new_empty((rows.shape[0], self.lm_sk.n))
             self.lm_sk.run(rows, base)
         elif self.strict and batch in self.sk_batches:
-            # NQ-NOFALLBACK: an SK_LM_HEAD batch whose kernel is not prepared.
+            # NQ-NOFALLBACK: a GQA_SK_LM_HEAD batch whose kernel is not prepared.
             refuse(
                 "DSpark drafter LM head",
                 "its die-local stream-K kernel is not prepared or does not take the rows",
@@ -975,8 +977,9 @@ class DraftFastPath:
         self.lm_pins = pinned(weight, rows)
 
     def prepare_lm_sk(self, model):
-        """The die-local stream-K LM-head GEMM of SK_LM_HEAD batches, once the (shared)
-        LM head is there; outside graph captures (it compiles and places the shard)."""
+        """The die-local stream-K LM-head GEMM of GQA_SK_LM_HEAD batches, once the
+        (shared) LM head is there; outside graph captures (it compiles and places the
+        shard)."""
         if self.lm_sk is not None or self.markov is None or not self.sk_batches:
             return
         weight = getattr(getattr(model, "lm_head", None), "weight", None)
@@ -1599,6 +1602,9 @@ class GqaDraftFastPath(DraftFastPath):
         )
         self.lm_batches = rows(GQA_FAST_LM_HEAD) & self.batches
         self.wide_batches = rows(GQA_WIDE_LM_HEAD) & self.batches
+        self.sk_batches = (
+            rows(GQA_SK_LM_HEAD) & self.batches - self.lm_batches - self.wide_batches
+        )
         self.overlap_batches = rows(GQA_CONTEXT_OVERLAP)
         self.attention = attention
 
