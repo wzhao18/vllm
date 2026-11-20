@@ -1236,6 +1236,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         )
 
         self.buffer_align_bytes = 1024
+        if cutlass.const_expr(self.push):
+            assert cute.cosize(self.a_smem_layout_staged.outer) >= staging_bytes(
+                self.mma_tiler[1]
+            ), "push: the A ring cannot stage a tile"
 
         # Define shared storage for kernel
         @cute.struct
@@ -2138,9 +2142,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # flashinfer local fix (b53cfd6a7, not in TRT-LLM): apply alpha in
                 # Float32 before the c_dtype conversion to avoid fp16 overflow.
                 if cutlass.const_expr(self.push):
-                    assert cute.cosize(self.a_smem_layout_staged.outer) >= staging_bytes(
-                        self.mma_tiler[1]
-                    ), "push: the A ring cannot stage a tile"
                     acc_consumer_state = epilogue_push(
                         self,
                         tidx,
