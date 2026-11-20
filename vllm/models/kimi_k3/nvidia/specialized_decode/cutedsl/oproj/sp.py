@@ -386,7 +386,7 @@ class SpOproj:
         try:
             gemm = Mxfp8PreGemm(
                 projection.n, projection.k, rows, tactic, use_pdl=True, prewait=prewait,
-                max_stages=stages, push=True, device=projection.weight.device,
+                max_stages=stages, push=3, device=projection.weight.device,
             )  # fmt: skip
         except ValueError as e:
             raise Unsupported("oproj_rs", shape, f"pre_push: {e}") from e
