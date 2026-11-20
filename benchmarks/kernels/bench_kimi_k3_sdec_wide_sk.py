@@ -83,7 +83,8 @@ def stamp_summary(st, ks, total, pairs):
             f'tail max {tail.max():.2f} | end-entry med {(st[:, 15] - st[:, 0]).median():.1f} | '
             f'slot med {(st[:, 1] - st[:, 0]).median():.2f} | epi by kind ' + ' '.join(
                 f'{kk} n{len(v)} med {med(v):.2f} max {max(v) if v else 0:.2f}'
-                for kk, v in kinds.items()) + f' | us/step (seg>0) med {med(per_step):.3f}')
+                for kk, v in kinds.items()) + f' | us/step (seg>0) med {med(per_step):.3f}'
+            + f' | tmem-release seg0 med {(st[:, 12] - st[:, 2]).median():.2f}')
 
 
 def spread_arms(args, arms, m, n, k, x, ws, pairs, ncopy, res, run, configs):
@@ -162,9 +163,10 @@ def main():
     ap.add_argument("--packed", type=int, default=0)
     ap.add_argument("--keep-w", type=int, default=0)
     ap.add_argument("--warm", type=int, default=0, help="one weight copy (L2-warm)")
+    ap.add_argument("--nocopy", type=int, default=1, help="two TMEM accumulators (0: copy form)")
     args = ap.parse_args()
     args.extra = dict(smem=args.smem * 1024 or None, packed=bool(args.packed),
-                      keep_w=bool(args.keep_w))
+                      keep_w=bool(args.keep_w), nocopy=bool(args.nocopy))
     torch.manual_seed(0)
     dev = torch.device("cuda")
     print(torch.cuda.get_device_name(), flush=True)
@@ -227,7 +229,8 @@ def main():
                 for a_, p_, d_ in (("sk", True, 0), ("striped", False, 0), ("nomma", True, 1),
                                    ("xl", True, 0), ("xlnomma", True, 1),
                                    ("wonly", True, 3), ("xonly", True, 5),
-                                   ("stamp", True, 8), ("nommastamp", True, 9))
+                                   ("stamp", True, 8), ("nommastamp", True, 9),
+                                   ("wonlystamp", True, 11), ("xonlystamp", True, 13))
                 if a_ in arms]  # fmt: skip
         if any(a.startswith("sp") for a in arms):
             spread_arms(args, arms, m, n, k, x, ws, pairs, ncopy, res, run, configs)
