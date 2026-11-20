@@ -1372,7 +1372,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=getattr(self, "use_pdl", False),
         )
         return
 
@@ -1517,7 +1516,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
         conv_smem = None
-        situ_smem = storage.sC.data_ptr().toint()
         if cutlass.const_expr(getattr(self, "conv_mode", False)):
             conv_smem = storage.sC.data_ptr().toint()
             if cutlass.const_expr(
@@ -1706,9 +1704,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
-        # vLLM: programmatic dependent launch (setup overlaps the producer).
-        if cutlass.const_expr(getattr(self, "use_pdl", False)):
-            cute.arch.griddepcontrol_wait()
 
         #
         # Construct the scheduler
@@ -2271,8 +2266,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         getattr(self, "epi_tanh", False),
                         getattr(self, "epi_roll", 0),
                         getattr(self, "epi_store", 0),
-                        situ_smem,
-                        mQ_mnl.layout.stride[0],
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
@@ -2374,8 +2367,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
-        if cutlass.const_expr(getattr(self, "use_pdl", False)):
-            cute.arch.griddepcontrol_launch_dependents()
 
     # GPU device kernel
     @cute.kernel
