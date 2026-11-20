@@ -43,7 +43,7 @@ __device__ __forceinline__ void issue(int mode, const CUtensorMap* mw, const CUt
 
 __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMap mg, const __grid_constant__ CUtensorMap m128, const __grid_constant__ CUtensorMap m64, const uint4* quads, const int* off,
                                               int mode, int Wg, int L, int S, int CG, int qoff, unsigned long long* tspan,
-                                              unsigned long long* cnt, unsigned* sink) {
+                                              unsigned long long* cnt, unsigned* sink, int nd0, int* dctr) {
   extern __shared__ __align__(1024) unsigned char smem[];
   __shared__ __align__(8) unsigned long long full[256], empty[256];
   __shared__ unsigned qctr;
@@ -51,8 +51,21 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
   __shared__ volatile int rel[256];
   uint4* sq = (uint4*)smem;
   unsigned char* ring = smem + qoff;  // 1024-aligned
-  const int q0 = off[blockIdx.x], nq = off[blockIdx.x + 1] - q0, NL = Wg * L;
+  // MODE bit10 (M3f die-homed): KV pages homed per die, quads split per die; a CTA claims an ordinal on its own die
+  // (die = (smid >> 1) & 1, hw6 pair rule) and drains that die's range: off = [die0 offsets nd0+1][die1 offsets]
+  __shared__ int s_q0, s_nq;
+  if (threadIdx.x == 0) {
+    if (mode & 1024) {
+      unsigned sm; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+      const int die = (sm >> 1) & 1, ord = atomicAdd(&dctr[die], 1), b = die ? nd0 + 1 + ord : ord;
+      s_q0 = off[b]; s_nq = off[b + 1] - off[b];
+    } else { s_q0 = off[blockIdx.x]; s_nq = off[blockIdx.x + 1] - off[blockIdx.x]; }
+  }
+  __syncthreads();
+  const int q0 = s_q0, nq = s_nq, NL = Wg * L;
   const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const bool brk = mode & 512;  // M3f fixed-term breakdown stamps (min via max of ~t)
+  if (brk && threadIdx.x == 0) { unsigned long long e = gt(); atomicMax(&tspan[1000], ~e); atomicMax(&tspan[1001], e); }
   for (int i = threadIdx.x; i < nq; i += blockDim.x) sq[i] = quads[q0 + i];
   if (threadIdx.x == 0) {
     qctr = 0; T0 = gt();
@@ -75,8 +88,9 @@ __global__ void __launch_bounds__(1024, 1) g2(const __grid_constant__ CUtensorMa
       int n = 0;
       for (;;) {
         if (n >= S) { int sl = (n - S) % S; wait_par(sa(&full[it * S + sl]), ((n - S) / S) & 1); acc += myring[(size_t)sl * OPB + 16]; }
+        if (brk && n == S) { unsigned long long e = gt(); atomicMax(&tspan[1002], ~e); atomicMax(&tspan[1003], e); }
         unsigned q = atomicAdd(&qctr, 1u);
-        if ((int)q >= nq) break;
+        if ((int)q >= nq) { if (brk) atomicMax(&tspan[1004], gt()); break; }
         uint4 r = sq[q];
         int sl = n % S; unsigned b = sa(&full[it * S + sl]);
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(b), "r"(OPB) : "memory");
@@ -186,16 +200,45 @@ int main(int argc, char** argv) {
     }
     while (rows.size() % 4) rows.push_back(rows.back());
   }
-  const int NQ = (int)(rows.size() / 4);
-  int grid = nsm;
+  const size_t CHK = 2u << 20;
+  const bool diem = MODE & 1024;
+  auto rdie = [&](unsigned r) { return (int)((((size_t)r * ROWB) / CHK) & 1); };
+  int grid = nsm, nd[2] = {0, 0};
+  for (int s2 = 0; s2 < nsm; ++s2) nd[(s2 >> 1) & 1]++;
   std::vector<int> off(grid + 1);
-  for (int c = 0; c <= grid; ++c) off[c] = (int)((long long)NQ * c / grid);
-  if (off[1] - off[0] > QMAX) { printf("QMAX\n"); return 2; }
+  if (diem) {  // split rows by home die, pad each list to quads, die-0 list then die-1 list
+    std::vector<unsigned> l[2];
+    for (unsigned r : rows) l[rdie(r)].push_back(r);
+    for (int d2 = 0; d2 < 2; ++d2) while (l[d2].size() % 4) l[d2].push_back(l[d2].back());
+    const int nq0 = (int)(l[0].size() / 4), nq1 = (int)(l[1].size() / 4);
+    rows = l[0]; rows.insert(rows.end(), l[1].begin(), l[1].end());
+    off.assign(grid + 2, 0);
+    for (int c = 0; c <= nd[0]; ++c) off[c] = (int)((long long)nq0 * c / nd[0]);
+    for (int c = 0; c <= nd[1]; ++c) off[nd[0] + 1 + c] = nq0 + (int)((long long)nq1 * c / nd[1]);
+    printf("DIE quads %d / %d, SMs %d / %d\n", nq0, nq1, nd[0], nd[1]);
+  }
+  const int NQ = (int)(rows.size() / 4);
+  if (!diem) for (int c = 0; c <= grid; ++c) off[c] = (int)((long long)NQ * c / grid);
+  int maxq = 0; for (size_t c = 0; c + 1 < off.size(); ++c) maxq = std::max(maxq, off[c + 1] - off[c]);
+  if (maxq > QMAX) { printf("QMAX\n"); return 2; }
   uint4* dq; int* doff; unsigned long long *dts, *dcnt; unsigned* dsink;
   RK(cudaMalloc(&dq, NQ * 16)); RK(cudaMemcpy(dq, rows.data(), NQ * 16, cudaMemcpyHostToDevice));
-  RK(cudaMalloc(&doff, (grid + 1) * 4)); RK(cudaMemcpy(doff, off.data(), (grid + 1) * 4, cudaMemcpyHostToDevice));
+  RK(cudaMalloc(&doff, off.size() * 4)); RK(cudaMemcpy(doff, off.data(), off.size() * 4, cudaMemcpyHostToDevice));
+  int* dctr; RK(cudaMalloc(&dctr, 8));
   RK(cudaMalloc(&dts, 8 * 1024)); RK(cudaMalloc(&dcnt, 8)); RK(cudaMalloc(&dsink, 4));
-  unsigned char* kv; RK(cudaMalloc(&kv, NKV * ROWB)); RK(cudaMemset(kv, 1, NKV * ROWB));
+  unsigned char* kv;
+  if (diem) {  // alternating 2 MiB chunks homed on die (chunk & 1) via VMM locality domains
+    const size_t pb = (NKV * ROWB + CHK - 1) / CHK * CHK;
+    CUmemAllocationProp p = {}; p.type = CU_MEM_ALLOCATION_TYPE_PINNED; p.location.type = CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN;
+    CUdeviceptr va; CK(cuMemAddressReserve(&va, pb, CHK, 0, 0));
+    for (size_t o = 0; o < pb; o += CHK) {
+      p.location.localized.deviceId = 0; p.location.localized.localityDomainId = (int)((o / CHK) & 1);
+      CUmemGenericAllocationHandle h; CK(cuMemCreate(&h, CHK, &p, 0)); CK(cuMemMap(va + o, CHK, 0, h, 0));
+    }
+    CUmemAccessDesc a = {}; a.location.type = CU_MEM_LOCATION_TYPE_DEVICE; a.location.id = 0; a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CK(cuMemSetAccess(va, pb, &a, 1)); kv = (unsigned char*)va;
+  } else RK(cudaMalloc(&kv, NKV * ROWB));
+  RK(cudaMemset(kv, 1, NKV * ROWB));
   CUtensorMap kvw;
   cuuint64_t dw[2] = {(cuuint64_t)ROWB / 4, (cuuint64_t)NKV}, strides[1] = {(cuuint64_t)ROWB};
   cuuint32_t bw[2] = {ROWB / 4, 1}, es[2] = {1, 1};
@@ -210,7 +253,7 @@ int main(int argc, char** argv) {
                               CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   }
   size_t FL = 1024ull << 20; unsigned char* flush; RK(cudaMalloc(&flush, FL));
-  const int qoff = ((off[1] - off[0] + 1) * 16 + 1023) / 1024 * 1024;
+  const int qoff = ((maxq + 1) * 16 + 1023) / 1024 * 1024;
   const size_t smem = qoff + (size_t)NL * S * OPB;
   RK(cudaFuncSetAttribute(g2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
   const int threads = (Wg + ((MODE & 2) && !(MODE & 64) ? 1 : 0)) * 32;
@@ -219,14 +262,20 @@ int main(int argc, char** argv) {
   for (int it = 0; it < iters + 2; ++it) {
     if (!(MODE & 4)) RK(cudaMemsetAsync(flush, it, FL));
     unsigned long long init[2] = {~0ull, 0ull};
-    RK(cudaMemsetAsync(dts, 0, 8 * 1024)); RK(cudaMemcpyAsync(dts, init, 16, cudaMemcpyHostToDevice)); RK(cudaMemsetAsync(dcnt, 0, 8));
+    RK(cudaMemsetAsync(dts, 0, 8 * 1024)); RK(cudaMemcpyAsync(dts, init, 16, cudaMemcpyHostToDevice)); RK(cudaMemsetAsync(dcnt, 0, 8)); RK(cudaMemsetAsync(dctr, 0, 8));
     RK(cudaEventRecord(e0));
-    g2<<<grid, threads, smem>>>(kvw, k128, k64, dq, doff, MODE, Wg, L, S, CG, qoff, dts, dcnt, dsink);
+    g2<<<grid, threads, smem>>>(kvw, k128, k64, dq, doff, MODE, Wg, L, S, CG, qoff, dts, dcnt, dsink, nd[0], dctr);
     RK(cudaEventRecord(e1)); RK(cudaEventSynchronize(e1)); RK(cudaGetLastError());
     unsigned long long h[2], hc; RK(cudaMemcpy(h, dts, 16, cudaMemcpyDeviceToHost)); RK(cudaMemcpy(&hc, dcnt, 8, cudaMemcpyDeviceToHost));
     if (hc != (unsigned long long)NQ) { printf("COUNT MISMATCH %llu vs %d\n", hc, NQ); return 1; }
     float ms; RK(cudaEventElapsedTime(&ms, e0, e1));
     if (it >= 2) { span.push_back((h[1] - h[0]) / 1000.f); ev.push_back(ms * 1000.f); }
+  }
+  if (MODE & 512) {  // M3f breakdown of the last iteration (us from the earliest kernel entry)
+    unsigned long long b[5]; RK(cudaMemcpy(b, dts + 1000, 40, cudaMemcpyDeviceToHost)); unsigned long long h2[2]; RK(cudaMemcpy(h2, dts, 16, cudaMemcpyDeviceToHost));
+    const double e0n = (double)~b[0];
+    printf("BRK entry skew %.2f | staged(min) %.2f | first landing min %.2f max %.2f | last issue %.2f | end %.2f us\n", (b[1] - e0n) / 1e3,
+           (h2[0] - e0n) / 1e3, (~b[2] - e0n) / 1e3, (b[3] - e0n) / 1e3, (b[4] - e0n) / 1e3, (h2[1] - e0n) / 1e3);
   }
   if (MODE & 16) {  // CTA 0 OOO consumer trace: time(us) chunk tile
     unsigned long long tr[126]; RK(cudaMemcpy(tr, dts + 2, sizeof(tr), cudaMemcpyDeviceToHost));

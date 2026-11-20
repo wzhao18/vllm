@@ -23,16 +23,19 @@ __device__ __forceinline__ void wait_cta(unsigned b, unsigned ph) {
 
 // items: block byte offsets, sorted die-0 list then die-1 list; cnt[0..1] claim counters; n0 = size of die-0 list
 __global__ void __launch_bounds__(512, 1) skel(const unsigned char* __restrict__ pool, const long long* __restrict__ items, int n0, int nt,
-                                               int* cnt, int diem, int D, unsigned long long* stamps) {
+                                               int* cnt, int diem, int D, unsigned long long* stamps, int LPW) {
   extern __shared__ __align__(1024) unsigned char smem[];
   __shared__ __align__(8) unsigned long long bars[512 * 4];
   unsigned sm; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
   const int die = diem ? (sm >> 1) & 1 : 0;
-  const int tid = threadIdx.x;
-  for (int j = 0; j < D; ++j) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&bars[tid * D + j])));
+  // LPW < 32: only lanes < LPW of each warp issue (issuers spread over warps: one stream per warp, hw33f/hw51)
+  const int lpw = LPW < 32 ? LPW : 32, tid = (threadIdx.x >> 5) * lpw + (threadIdx.x & 31);
+  const bool iss = (int)(threadIdx.x & 31) < lpw;
+  if (iss) for (int j = 0; j < D; ++j) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&bars[tid * D + j])));
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   __syncthreads();
   unsigned long long t0; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  if (iss) {
   unsigned dst0 = sa(smem) + tid * D * BLK;
   int lists[2][2] = {{0, n0}, {n0, nt}};
   int n = 0;
@@ -53,13 +56,14 @@ __global__ void __launch_bounds__(512, 1) skel(const unsigned char* __restrict__
     }
   }
   for (int x = (n > D ? n - D : 0); x < n; ++x) wait_cta(sa(&bars[tid * D + x % D]), (x / D) & 1);
+  }
   __syncthreads();
   if (tid == 0) { unsigned long long t1; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1)); stamps[2 * blockIdx.x] = t0; stamps[2 * blockIdx.x + 1] = t1; }
 }
 
 int main(int argc, char** argv) {
   if (argc < 5) { printf("usage: %s NREQ NBLK THREADS DEPTH [iters]\n", argv[0]); return 2; }
-  const int NREQ = atoi(argv[1]), NBLK = atoi(argv[2]), TH = atoi(argv[3]), D = atoi(argv[4]), iters = argc > 5 ? atoi(argv[5]) : 10;
+  const int NREQ = atoi(argv[1]), NBLK = atoi(argv[2]), TH = atoi(argv[3]), D = atoi(argv[4]), iters = argc > 5 ? atoi(argv[5]) : 10, LPW = argc > 6 ? atoi(argv[6]) : 32;
   RK(cudaSetDevice(0)); RK(cudaFree(0));
   int nsm; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
   const int nt = NREQ * NBLK;
@@ -91,12 +95,12 @@ int main(int argc, char** argv) {
   long long* di; RK(cudaMalloc(&di, nt * 8)); RK(cudaMemcpy(di, its.data(), nt * 8, cudaMemcpyHostToDevice));
   int* cnt; RK(cudaMalloc(&cnt, 8));
   unsigned long long* st; RK(cudaMalloc(&st, 16 * nsm));
-  size_t smem = (size_t)TH * D * BLK;
+  size_t smem = (size_t)(LPW < 32 ? (TH / 32) * LPW : TH) * D * BLK;
   RK(cudaFuncSetAttribute(skel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
   size_t FL = 1024ull << 20; unsigned char* flush; RK(cudaMalloc(&flush, FL));
   cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-  printf("SKEL-IDX NREQ=%d NBLK=%d blocks=%d bytes=%.1f MB TH=%d D=%d smem=%zu die0/die1 blocks %zu/%zu; SOL(18.5 TB/s) %.2f us\n",
-         NREQ, NBLK, nt, (double)nt * BLK / 1e6, TH, D, smem, l0.size(), l1.size(), (double)nt * BLK / 18.5e6);
+  printf("SKEL-IDX NREQ=%d NBLK=%d blocks=%d bytes=%.1f MB TH=%d LPW=%d D=%d smem=%zu die0/die1 blocks %zu/%zu; SOL(18.5 TB/s) %.2f us\n",
+         NREQ, NBLK, nt, (double)nt * BLK / 1e6, TH, LPW, D, smem, l0.size(), l1.size(), (double)nt * BLK / 18.5e6);
   for (int mode = 0; mode < 2; ++mode) {
     const unsigned char* pool = mode ? (const unsigned char*)va : ps;
     std::vector<float> tc, tw, sp;
@@ -106,7 +110,7 @@ int main(int argc, char** argv) {
       if (cold) RK(cudaMemsetAsync(flush, it, FL));
       RK(cudaMemsetAsync(cnt, 0, 8));
       cudaEventRecord(e0);
-      skel<<<nsm, TH, smem>>>(pool, di, (int)l0.size(), nt, cnt, mode, D, st);
+      skel<<<nsm, TH, smem>>>(pool, di, (int)l0.size(), nt, cnt, mode, D, st, LPW);
       cudaEventRecord(e1); RK(cudaEventSynchronize(e1)); RK(cudaGetLastError());
       float ms; cudaEventElapsedTime(&ms, e0, e1);
       if (it) (cold ? tc : tw).push_back(ms * 1000);
