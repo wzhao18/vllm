@@ -62,5 +62,11 @@ def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
     assert torch.equal(_bits(vec), _bits(cuda_op))
     if small:  # the stock module and its dispatch
         assert torch.equal(_bits(ours), _bits(dispatched))
+    elif rows >= KimiVecSituAndMul._FAST_MIN_ROWS:
+        # prefill chunks: the routed experts' SiTU form (test_k31_situ_fast.py)
+        from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+        fast = mxfp8_act.situ_and_mul_fast_bf16(x, beta, linear_beta)
+        assert torch.equal(_bits(ours), _bits(fast))
     else:
         assert torch.equal(_bits(ours), _bits(cuda_op))

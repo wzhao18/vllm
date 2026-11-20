@@ -204,6 +204,15 @@ def test_key_covers_cpu_tensor_contents():
     assert _key(_Kernel(1.0), torch.empty(0)) == _key(_Kernel(1.0), torch.empty(0))
 
 
+def test_cuda_stream_argument_is_keyed_by_type():
+    """A CUstream launch argument is described by its type: two processes (other
+    stream handles) share the cache entry instead of compiling without it."""
+    driver = pytest.importorskip("cuda.bindings.driver")
+    a, b = driver.CUstream(0), driver.CUstream(12345)
+    assert _key(_Kernel(1.0), a) == _key(_Kernel(1.0), b)
+    assert _key(_Kernel(1.0), a) != _key(_Kernel(2.0), a)
+
+
 def test_fingerprint_functions_closures_cycles():
     def make(n):
         def inner():

@@ -294,6 +294,10 @@ class _Fingerprint:
             o, (torch.dtype, torch.device, torch.Size, torch.layout, torch.memory_format)
         ):
             w(f"t:{o!r}")
+        elif _qual(t) == "cuda.bindings.driver.CUstream":
+            # A launch argument, not traced into the kernel: its handle differs per
+            # process (it made QueryUK and SparseMlaDecodeKM recompile every start).
+            w("CUstream")
         elif isinstance(o, ctypes._SimpleCData):
             w(f"C:{t.__name__}:{o.value!r}")
         else:
