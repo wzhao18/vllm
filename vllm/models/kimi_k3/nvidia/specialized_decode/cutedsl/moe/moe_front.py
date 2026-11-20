@@ -330,13 +330,17 @@ __global__ void __maxnreg__(96)  // launched with kThreads
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
     for (int j = 0; j < nk; ++j) {
       const int g = j / p.xg, gs = g % p.xs, xs = gs * p.xg + j % p.xg;
-      if (j % p.xg == 0) mbar_wait(xfull0 + 8 * gs, (g / p.xs) & 1);
+      if ((p.debug & 8) && j == 0) {  // probe (n32: no ring reuse): all tokens landed first
+        for (int q = 0; q < min(p.xs, (nk + p.xg - 1) / p.xg); ++q) mbar_wait(xfull0 + 8 * q, 0);
+        mbar_wait(res_bar, 0);
+      }
+      if (j % p.xg == 0 && !(p.debug & 8)) mbar_wait(xfull0 + 8 * gs, (g / p.xs) & 1);
       if (j == 0) {
         mbar_wait(trdy0 + 8 * (nt - 1), 0);  // the whole TMEM fill (one commit)
         // Orders the MMAs after the fill warp's tcgen05.cp; TMA-landed operands need
         // only the barrier (no per-block tcgen05 fence: it stalls the issue).
         asm volatile("tcgen05.fence::after_thread_sync;");
-      } else if (j == nt) {
+      } else if (j == nt && !(p.debug & 8)) {
         mbar_wait(res_bar, 0);
       }
       if (j == 0 && lane == 0) STAMP(6);
