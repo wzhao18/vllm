@@ -54,6 +54,13 @@ from ...shapes import refuse
 from ..common.host import dynamic_view, stream, tensor_maps, to_cute
 from .gqa_context_kv import compile_context_kv
 from .gqa_window import TB, compile_window
+from .gqa_window_stream import (
+    MAXP,
+    compile_window_stream,
+    grid_ctas,
+    piece_bounds,
+    unit_slots,
+)
 from .gqa_window_umma import KB, compile_window_umma, kv_map_5d
 
 logger = init_logger(__name__)
@@ -177,6 +184,7 @@ class GqaAttentionState:
         self.rows = frozenset(r for r in query_rows if r % q == 0)
         batches = sorted({r // q for r in self.rows})
         self.shapes = {b: window_shape(self.kv_heads, q, b) for b in batches}
+        self.stream_buffers(device)
         self.eps = Float32(first.q_norm.variance_epsilon)
         rope = first.rotary_emb
         self.cos_sin = rope.cos_sin_cache
@@ -203,6 +211,38 @@ class GqaAttentionState:
             cache = getattr(attention, "kv_cache", None)
             if isinstance(cache, torch.Tensor) and cache.numel() > 0:
                 self.bind(i, cache)  # (already bound)
+
+    def stream_buffers(self, device):
+        """GqaWindowStream's partials [units, pieces, rows x 66] FP32 and per-unit
+        counters (zero; each launch's last pieces reset theirs) for the batches it
+        serves (launch shapes with key groups -1)."""
+        batches = [b for b, s in self.shapes.items() if s is not None and s[1] < 0]
+        self.pmax, self.partials, self.counters = 1, None, None
+        # die split (launch shapes ahead 1): the resident grid, and the KV heads' home
+        # dies (bit h: die of KV head h) of a die-localized cache layout
+        self.resident, self.head_dies = None, None
+        if not batches:
+            return
+        if any(self.shapes[b][3] == 1 for b in batches):
+            from ..common.resident import ResidentGrid
+
+            self.resident = ResidentGrid(device, 2)
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        slots = unit_slots(WINDOW, self.q)
+        for b in batches:
+            units = b * self.kv_heads
+            ctas = grid_ctas(units, slots, sms, self.shapes[b][0])
+            per_cta, per_unit = piece_bounds(units, slots, ctas)
+            if per_cta > MAXP:
+                raise ValueError(
+                    f"GqaWindowStream: B{b} spreads {per_cta} units over one CTA "
+                    f"(at most {MAXP})"
+                )
+            self.pmax = max(self.pmax, per_unit)
+        units = max(batches) * self.kv_heads
+        words = units * self.pmax * GROUP * self.q * (HEAD + 2)
+        self.partials = torch.empty(words, dtype=torch.float32, device=device)
+        self.counters = torch.zeros(units, dtype=torch.int32, device=device)
 
     # ------------------------------------------------------------------ binding
     def cache_reason(self, cache):
@@ -291,6 +331,22 @@ class GqaAttentionState:
 
     def window(self, page, shape):
         splits, kgroups, ring, ahead = shape
+        if kgroups < 0:  # GqaWindowStream: the persistent stream over every SM
+            if page % KB or page < 2 * KB:
+                raise ValueError(
+                    f"GqaWindowStream launch shape {shape} on {page}-token pages"
+                )
+            die_sms = self.resident.die_sms if ahead == 1 else None
+            compiled = compile_window_stream(
+                GROUP, self.kv_heads, self.q, page, ring, WINDOW, None,
+                self.max_position, self.device.index, self.pmax,
+                round_norm=window_options().get("round_norm", False), cap=splits,
+                die_sms=die_sms,
+            )  # fmt: skip
+            if die_sms is not None:
+                smem = ring * 2 * KB * 128 + 16384 + self.q * 260 + (ring + 9) * 8 + 1056
+                self.resident.check(compiled, 160, smem, "GqaWindowStream die split")
+            return compiled
         if kgroups == 0:  # GqaWindowUmma (tcgen05): splits CTAs per (request, head)
             if page % KB:
                 raise ValueError(
@@ -391,6 +447,16 @@ class GqaAttentionState:
         layer = self.layers[index]
         cache = attention.kv_cache
         out = qkv.new_empty((rows, self.heads * HEAD))
+        extra = ()
+        if shape[1] < 0:
+            extra = (Int64(self.partials.data_ptr()), Int64(self.counters.data_ptr()))
+        if shape[1] < 0 and shape[3] == 1:
+            if self.head_dies is None:
+                raise RuntimeError(
+                    "GqaWindowStream die split: no KV head -> die map for the cache"
+                )
+            extra += tuple(Int64(a) for a in self.resident.addresses())
+            extra += (Int32(self.head_dies),)
         bound.kernels[shape](
             dynamic_view(qkv),
             to_cute(positions[:rows], 8),
@@ -401,12 +467,13 @@ class GqaAttentionState:
             to_cute(layer.q_norm.weight.data),
             to_cute(layer.k_norm.weight.data),
             dynamic_view(out),
-            Int64(bound.descriptor.data_ptr() + (128 if shape[1] == 0 else 0)),
+            Int64(bound.descriptor.data_ptr() + (128 if shape[1] <= 0 else 0)),
             Int64(cache.data_ptr()),
             Int64(bound.block_stride),
             Int64(bound.head_stride),
             Int32(bound.blocks),
             self.eps,
+            *extra,
             stream(self.device),
         )
         return out

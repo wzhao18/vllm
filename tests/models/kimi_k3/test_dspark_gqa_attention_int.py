@@ -612,6 +612,60 @@ def test_window_umma_redo(monkeypatch):
     check_rows(ours, stock, exact, 96, 3, "umma redo")
 
 
+STREAM = (0, -1, 6, 0)  # GqaWindowStream's launch shape (key groups -1)
+
+
+@pytest.mark.parametrize("layout", ["rows", "slots"])
+def test_window_stream_matches_stock(layout, monkeypatch):
+    """GqaWindowStream (the persistent stream over every SM: units split into pieces,
+    the pieces' partials merged by each unit's last piece) at TP4 q3, batches 1-128:
+    cache bytes identical to stock's, rows within BF16 noise."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_attention as ga,
+    )
+
+    monkeypatch.setitem(ga.GQA_WINDOW, (4, 3), ((0, STREAM),))
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(43)
+    layers = make_layers(4, gen)
+    state = install(layers, 3, BATCHES)
+    assert state.counters is not None
+    for B in BATCHES:
+        seed = 4300 + 10 * (layout == "slots") + B
+        ours, stock, exact, lengths, differ = run_case(
+            state, layers, layout, B, 3, gen, seed=seed
+        )
+        label = f"stream {layout} B{B}"
+        assert differ == 0, f"{label}: {differ} cache elements differ from stock"
+        check_rows(ours, stock, exact, B, 3, label)
+        assert int(state.counters.abs().sum()) == 0, f"{label}: counters not reset"
+        del ours, stock, exact
+
+
+def test_window_stream_redo(monkeypatch):
+    """GqaWindowStream's moved-metadata path (the speculated first loads drained and
+    reissued, forced on unmoved metadata): stock's cache bytes and rows (B96)."""
+    import functools
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_attention as ga,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_window_stream as gs,
+    )
+
+    compile_redo = functools.partial(gs.compile_window_stream.__wrapped__, redo=True)
+    monkeypatch.setattr(ga, "compile_window_stream", compile_redo)
+    monkeypatch.setitem(ga.GQA_WINDOW, (4, 3), ((0, STREAM),))
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(97)
+    layers = make_layers(4, gen)
+    state = install(layers, 3, (96,))
+    ours, stock, exact, lengths, differ = run_case(state, layers, "slots", 96, 3, gen)
+    assert differ == 0
+    check_rows(ours, stock, exact, 96, 3, "stream redo")
+
+
 @pytest.mark.parametrize("layout", ["rows", "slots"])
 def test_window_ignores_stale_nan(layout):
     """Never-zeroed blocks: NaN in every cache byte outside the requests' written keys
