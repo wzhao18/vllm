@@ -1001,6 +1001,13 @@ class NixlBaseConnectorWorker:
                 "ucx_net_devices_by_gpu", None
             )
         )
+        # Without GPUDirect RDMA (no nvidia_peermem, e.g. in containers) UCX
+        # stages GPU memory through host fragments. Its error-handling pipeline
+        # protocol for that moves ~14 GB/s per GPU; the fragmented copy-in /
+        # copy-out protocol reaches the NIC line rate (98 GB/s of 2 x 400 Gb/s,
+        # VR200 nodes). GPUDirect transfers use neither. Set before the UCX
+        # backend is created; an explicit setting wins.
+        os.environ.setdefault("UCX_RNDV_PIPELINE_ERROR_HANDLING", "n")
         if nixl_agent_config is None:
             config = None
         else:
