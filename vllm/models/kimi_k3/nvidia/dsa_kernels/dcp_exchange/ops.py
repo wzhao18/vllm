@@ -33,6 +33,7 @@ _FINE_WORDS = 8
 _TIE_LIST = 64  # kTieList
 _TIE_WORDS = 32  # kTieWords
 
+_EP32DIAG_CALLS: list = []  # EP32DIAG (not for landing)
 # stats counters (kSt* in the kernel)
 STAT_NAMES = (
     "rows", "one_round", "two_round_refine", "fallback_r8", "tie_round",
@@ -380,6 +381,13 @@ class DcpExchange:
         stats: optional int32[8] row counters (0 exchanged, 1 one round, 2 tie round,
         3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
         [rows * 64] per-row phase stamps. Launches must stay stream-ordered."""
+        if stats is None and dbg is None and torch.cuda.is_current_stream_capturing():
+            # EP32DIAG (not for landing): per-call-site row counters + per-row stamps of the
+            # last replay (the captured fills re-zero them at every replay); dumped by the
+            # D-MOE-EP32 emulator server (runs/D-MOE-EP32/tools/ep32_serve.py)
+            stats = torch.zeros(32, dtype=torch.int32, device=logits.device)
+            dbg = torch.zeros(64 * int(logits.shape[0]), dtype=torch.int64, device=logits.device)
+            _EP32DIAG_CALLS.append((int(logits.shape[0]), stats, dbg))
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,

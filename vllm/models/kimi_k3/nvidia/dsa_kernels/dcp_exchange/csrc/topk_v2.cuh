@@ -791,6 +791,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       if constexpr (kFast) {
         // tier 3 on every rank, then R2. The message carries a valid lower bound only: an
         // empty window just below theta and the exact count of keys >= theta above it.
+        V2STAT(12);
         if (tid == 0) {
           s_sat = 1u;
           s_lo = min(max(0, th - kV2Win), 65536 - kV2Win);
@@ -996,6 +997,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         tv += s[4] & 0xFFFFFFu;
       }
       int rt = tv <= (uint32_t)K ? 4 : (sat || mx >= mn) ? 3 : 0;
+      int why3 = rt == 3 ? (sat ? 1 : 2) : 0;  // EP32DIAG
       int tau = -1, need = 0, qv = 0;
       V2DBG(19);
       if (rt == 0) {
@@ -1030,7 +1032,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         tau = s_tau;
         need = s_need;
-        if (tau < 0) rt = 3;  // the K-th key lies above or below the common range
+        if (tau < 0) { rt = 3; why3 = 3; }  // the K-th key lies above or below the common range
         V2DBG(20);
       }
       if (rt == 0) {
@@ -1067,7 +1069,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if (tot_t == need) { rt = 1; qv = mine; }
         else if (nr == 1) { rt = 1; qv = mine > 0 ? need : 0; }
         else if (band_ok) rt = 5;
-        else rt = fit ? 2 : 3;
+        else { rt = fit ? 2 : 3; if (!fit) why3 = 4; }
         if (rt == 5) {
           // this rank's quota: its ties whose global id ranks below `need` among every
           // rank's ties (ids distinct, groups unsorted). Item (i, r2): how many of rank r2's
@@ -1092,6 +1094,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           qv = __syncthreads_count(tid < m && rk[tid] < need);
         }
       }
+      if (rt == 3) V2STAT(12 + why3);  // EP32DIAG: 13 sat, 14 windows apart, 15 tau outside, 16 ties overflow
       if (tid == 0) {
         s_tier = rt;
         if (rt != 3 || tau >= 0) { s_tau = tau; s_need = need; }
@@ -1112,7 +1115,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // rank's ties are in its candidates.
       if (tier == 3) {
         // saturated windows / failed fast paths take R2 too: every window is a lower bound
+        if (row >= kR2Rows) V2STAT(10);
         if (row < kR2Rows) {
+        V2STAT(9);
         __shared__ int s_r2n[kV2MaxW];
         __shared__ int s_r2[6];  // 0 LB, 1 tie count, 2 tau, 3 keys > tau, 4 quota, 5 bad
         uint32_t* const z = reinterpret_cast<uint32_t*>(srow) + 4096;
@@ -1376,7 +1381,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
                   p.out_count[row] = count;
                   p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
                 }
-                V2STAT(2);
+                V2STAT(8);
                 V2DBG(17);
                 V2DBG(8);
                 __syncthreads();  // SMEM reused by the next row
@@ -1389,6 +1394,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
       if (tier != 1 && tier != 2) {  // the same on every rank: the complete body takes the row
+        V2STAT(11);
         __syncthreads();
         return 1 + ep;
       }
