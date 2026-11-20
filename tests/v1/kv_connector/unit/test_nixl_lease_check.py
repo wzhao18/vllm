@@ -261,6 +261,7 @@ def test_heartbeat_extends_known_and_ignores_unknown_requests():
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w._lease_extension = 20
     old = time.perf_counter() + 1.0
     w._reqs_to_send = {"req-a": old}
