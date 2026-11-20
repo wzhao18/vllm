@@ -394,6 +394,10 @@ class SpMlp:
                 mlp._shared_events[1],
                 mlp._shared_stream,
             )
+        elif _DML_SHPRE == "ser" and self.fused_shared is None:
+            # DIAG R6-2 control: the same shared expert serially before the router.
+            shared_out = self._shared(h, prequantized)
+            final = make_experts()()
         else:
             experts = make_experts()
             if self.fused_shared is not None and mlp.experts.fused_shared(n):
