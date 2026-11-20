@@ -179,7 +179,8 @@ B_EPIFULL, B_EPIFREE = B_TKFREE + 2, B_TKFREE + 4
 assert B_EPIFREE + 2 <= NBAR
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
 # 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
-# warpgroup-wide
+# warpgroup-wide, 15 S free (nbs knob: owning softmax WG -> QK warp)
+NB_SFREE = 15
 C_Q, C_S, C_O = 0, 128, 192  # Q latent dims 0-511; S; O^T
 
 # instruction descriptors (dense kind::f8f6f4, E4M3 x E4M3 -> FP32, Rubin K64 bit 29)
@@ -273,6 +274,11 @@ def cp_commit():
 
 
 @asm()
+def nanosleep(ns):
+    return ("nanosleep.u32 $0;", "r,~{memory}", (Uint32(ns),))
+
+
+@asm()
 def cp_wait_lag():
     """Wait until at most CPA_LAG - 1 cp.async groups of this thread are pending."""
     return (f"cp.async.wait_group {CPA_LAG - 1};", "~{memory}", ())
@@ -342,6 +348,16 @@ def tmem_ld16x256x3(a0, a1, a2):
                    for k in range(3)) + "tcgen05.wait::ld.sync.aligned;"
     return (code, ",".join(["=f"] * 48 + ["r", "r", "r", "~{memory}"]),
             (Uint32(a0), Uint32(a1), Uint32(a2)), (Float32,) * 48)
+
+
+@asm()
+def tmem_zero128(addr):
+    """Zero 128 consecutive 32-bit TMEM columns of the calling warp's 32 lanes (16 x
+    32x32b.x8 stores of one zero register) and wait for them."""
+    z = ",".join(["$1"] * 8)
+    code = "".join(f"tcgen05.st.sync.aligned.32x32b.x8.b32 [$0 + {8 * c}], {{{z}}}; " for c in range(16))
+    code += "tcgen05.wait::st.sync.aligned;"
+    return code, "r,r,~{memory}", (Uint32(addr), Uint32(0))
 
 
 @asm()
@@ -416,14 +432,37 @@ class SparseMlaPrefillH8:
         # msk: a token's last subtile takes the masked softmax path only when it is
         # partial (n % 64 != 0); a full one keeps the tcgen05.ld.red max (exact either
         # way) (production: knob 0; 9 = always masked)
-        knobs = tuple(knobs) + (0,) * (20 - len(knobs))
+        # zf (timing only): every cp.async zero-fills (src-size 0: no L2 request), so the
+        # gather warps keep their instruction stream without delivering any data
+        # pace (timing only): every gather lane sleeps pace ns after each of its first
+        # 8 cp.async of a row, so a stage's 72 LDGSTS leave the SM in 8-instruction slices
+        # nbs: S-free as named barrier NB_SFREE (the owning softmax warpgroup bar.arrives
+        # after its S load, the QK warp bar.syncs before QK(u + 1)): one generation per
+        # subtile (WG u % 2 can only arrive for u once QK(u) was issued, i.e. after the
+        # QK warp consumed u - 1), no shared-memory mbarrier round trip on the S chain
+        # nex (timing only): the P math uses FMUL2 instead of MUFU ex2 (wrong values)
+        # sw: how a cp.async gather warp waits for a free (KVEMPTY) and capped (KVFULL of
+        # stage g - CP_CAP) KV stage: 0 = lane 0 waits both, then a warp sync (production);
+        # 1 = every lane waits both; 2 = lane 0 KVEMPTY + every lane the cap; 3 = every lane
+        # KVEMPTY + lane 0 the cap (P-MLA pmla12: in the bare producer a lane-0 wait + warp
+        # sync costs ~216 clk per stage; in the kernel every-lane waits on KVEMPTY are slower)
+        # cpb (timing only): every cp.async gather lane copies only the first cpb of its 9
+        # chunks per row (the rest of the stage stays stale): KV bytes vs ring protocol
+        # qz: the QK warp (TMEM lanes 96-127) zeroes the 32 padding-head lanes of the latent
+        # Q columns after each token's Q copy (the copy fills them with the neighbouring Q
+        # atom's rows), so the QK MMAs multiply zeros there. The kernel is power-bound at the
+        # 2.3 kW cap (P-MLA run184-185: sustained -2.5%, bitwise equal): operand energy is
+        # time. Production: knob 0; 9 = off (diagnostic).
+        knobs = tuple(knobs) + (0,) * (27 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
-         self.epb, self.epw, self.msk) = knobs[:20]
+         self.epb, self.epw, self.msk, self.zf, self.pace, self.nbs, self.nex,
+         self.sw, self.cpb, self.qz) = knobs[:27]
         self.msk = self.msk != 9
         self.ssu = self.ssu or 16
         self.epb = self.epb != 9
+        self.qz = self.qz != 9
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -814,10 +853,7 @@ class SparseMlaPrefillH8:
                     c2 = ld_global_s32_pred(rsl + Int64((t + 2) * 256),
                                             Int32(t + 2 < subs and (t + 2) * 64 + r < n))
                     compiler_fence()
-                    if lane == 0:
-                        mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                        self.cp_cap(base, g)
-                    cute.arch.sync_warp()
+                    self.stage_wait(base, lane, g, s)
                     src = kvp
                     nb = Uint32(0)
                     if rc >= 0:
@@ -830,14 +866,45 @@ class SparseMlaPrefillH8:
             self.cp_drain(lane, base, g)
 
     @cute.jit
+    def stage_wait(self, base, lane, g, s):
+        """cp.async gather warp: KV stage g (ring slot s) is free (KVEMPTY) and within the
+        in-flight cap (form: knob sw)."""
+        if cutlass.const_expr(self.sw in (0, 2)):
+            if lane == 0:
+                mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+                if cutlass.const_expr(self.sw == 0):
+                    self.cp_cap(base, g)
+            cute.arch.sync_warp()
+            if cutlass.const_expr(self.sw == 2):
+                self.cp_cap(base, g)
+        else:
+            mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+            if cutlass.const_expr(self.sw == 1):
+                self.cp_cap(base, g)
+            else:
+                if lane == 0:
+                    self.cp_cap(base, g)
+                cute.arch.sync_warp()
+
+    @cute.jit
     def cp_row(self, st, d0, d1, dr, src, nb):
         """This lane's 9 x 16 B of its row (latent chunks ch + 4 j into SW128 atoms j // 2,
         RoPE chunk ch into the SW64 atom); nb = 0 zero-fills (invalid key)."""
+        if cutlass.const_expr(self.zf):
+            nb = Uint32(0)
         if cutlass.const_expr(not self.no_gather):
+            nc = self.cpb if self.cpb else 9
             for a in cutlass.range_constexpr(4):
-                cp16(st + Uint32(a * 8192) + d0, src + Int64(128 * a), nb)
-                cp16(st + Uint32(a * 8192) + d1, src + Int64(128 * a + 64), nb)
-            cp16(st + dr, src + Int64(D_NOPE), nb)
+                if cutlass.const_expr(2 * a < nc):
+                    cp16(st + Uint32(a * 8192) + d0, src + Int64(128 * a), nb)
+                    if cutlass.const_expr(self.pace):
+                        nanosleep(self.pace)
+                if cutlass.const_expr(2 * a + 1 < nc):
+                    cp16(st + Uint32(a * 8192) + d1, src + Int64(128 * a + 64), nb)
+                    if cutlass.const_expr(self.pace):
+                        nanosleep(self.pace)
+            if cutlass.const_expr(nc == 9):
+                cp16(st + dr, src + Int64(D_NOPE), nb)
 
     @cute.jit
     def cp_cap(self, base, g):
@@ -902,9 +969,7 @@ class SparseMlaPrefillH8:
                 cute.arch.sync_warp()
                 if lane == 0:
                     mbar_arrive(_bar(base, B_SLEMPTY + sl))
-                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                    self.cp_cap(base, g)
-                cute.arch.sync_warp()
+                self.stage_wait(base, lane, g, s)
                 if pw < 8:
                     src = kvp
                     nb = Uint32(0)
@@ -1144,10 +1209,7 @@ class SparseMlaPrefillH8:
                 s = g % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 rc = Int32(ld_shared_u32(buf + Uint32(256) * Uint32(t)))
-                if lane == 0:
-                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
-                    self.cp_cap(base, g)
-                cute.arch.sync_warp()
+                self.stage_wait(base, lane, g, s)
                 src = kvp
                 nb = Uint32(0)
                 if rc >= 0:
@@ -1414,16 +1476,29 @@ class SparseMlaPrefillH8:
                 for c in cutlass.range_constexpr(4):
                     cp_e(taddr + Uint32(C_Q + 32 * j + 8 * c), qd + Uint64(j * ATOM // 16 + 2 * c))
             commit_e(_bar(base, B_QLFREE))
+            if cutlass.const_expr(self.qz):
+                # the copy has landed (QLFREE), then zero this warp's lanes 96-127 of Q
+                mbar_wait(_bar(base, B_QLFREE), Uint32(qi & 1))
+                tc_fence_after()
+                tmem_zero128(taddr + Uint32(96 << 16) + Uint32(C_Q))
+                tc_fence_before()
+                cute.arch.sync_warp()
+                tc_fence_after()
             for i in range(subs):
-                self.ss(base, cta, lane, u, 25, 2)
                 if not self.qkh:
                     if u >= 1:
-                        mbar_wait(_bar(base, B_SFREE + (u - 1) % 2),
-                                  Uint32(((u - 1) // 2) & 1))
+                        if cutlass.const_expr(self.nbs):
+                            named_bar(Uint32(NB_SFREE), Uint32(32 + 128))
+                        else:
+                            mbar_wait(_bar(base, B_SFREE + (u - 1) % 2),
+                                      Uint32(((u - 1) // 2) & 1))
                         tc_fence_after()
                 self.ss(base, cta, lane, u, 24, 2)
                 self.qk(base, lane, taddr, u, qi, i == subs - 1, cta)
                 u = u + 1
+        if cutlass.const_expr(self.nbs and not self.qkh):
+            if u >= 1:  # the last subtile's S-free generation
+                named_bar(Uint32(NB_SFREE), Uint32(32 + 128))
 
     @cute.jit
     def qk(self, base, lane, taddr, u, qi, last, cta):
@@ -1498,10 +1573,12 @@ class SparseMlaPrefillH8:
             for i in range(subs):
                 s = u % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                self.ss(base, cta, lane, u, 7, 4)
                 if cutlass.const_expr(self.pvd):
                     if i + self.pvd < subs:
                         v = u + self.pvd
                         mbar_wait(_bar(base, B_QKI + v % 8), Uint32((v // 8) & 1))
+                self.ss(base, cta, lane, u, 15, 4)
                 mbar_wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
                 self.ss(base, cta, lane, u, 18, 4)
                 if cutlass.const_expr(self.cpa in (2, 3, 6)):
@@ -1643,10 +1720,14 @@ class SparseMlaPrefillH8:
                 smax = sm[64]
             for k in cutlass.range_constexpr(64):
                 xv[k] = sa[k]
+            self.ss(base, cta, lane, u, 25, 1)
             tc_fence_before()
-            cute.arch.sync_warp()
-            if lane == 0:
-                mbar_arrive(_bar(base, B_SFREE + u % 2))
+            if cutlass.const_expr(self.nbs):
+                named_bar_arrive(Uint32(NB_SFREE), Uint32(32 + 128))
+            else:
+                cute.arch.sync_warp()
+                if lane == 0:
+                    mbar_arrive(_bar(base, B_SFREE + u % 2))
         self.ss(base, cta, lane, u, 8 * wg + 2, 1)
         mbx = base + Uint32(OFF_MBOX)
         grow = Int32(0)
@@ -1706,10 +1787,15 @@ class SparseMlaPrefillH8:
                 w = []
                 for q in cutlass.range_constexpr(4):
                     k = 16 * ch + 4 * q
-                    p0 = ex2(xv[k])
-                    p1 = ex2(xv[k + 1])
-                    p2 = ex2(xv[k + 2])
-                    p3 = ex2(xv[k + 3])
+                    if cutlass.const_expr(self.nex):  # timing only: FMUL instead of MUFU
+                        h0, z0 = Float32(0.5), Float32(-0.0)
+                        p0, p1 = ffma2(xv[k], xv[k + 1], h0, h0, z0, z0)
+                        p2, p3 = ffma2(xv[k + 2], xv[k + 3], h0, h0, z0, z0)
+                    else:
+                        p0 = ex2(xv[k])
+                        p1 = ex2(xv[k + 1])
+                        p2 = ex2(xv[k + 2])
+                        p3 = ex2(xv[k + 3])
                     a0, a1 = fadd2(a0, a1, p0, p1)
                     b0, b1 = fadd2(b0, b1, p2, p3)
                     w.append(cvt_e4m3x2(p0, p1) | (cvt_e4m3x2(p2, p3) << Uint32(16)))
