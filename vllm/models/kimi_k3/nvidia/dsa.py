@@ -867,12 +867,40 @@ class KimiK3DSAAttention(nn.Module):
             )
         else:
             attn_out = self._fused_attention(hidden_states, x)
+            gated = None if fused_gate else self._prefill_gate_gemm(x, attn_out)
+            if gated is not None:
+                return self._o_proj(gated)
             gate = self.g_proj(x)[0]
         # The fused GEMM-RS/AR takes a BF16 input: the MXFP8 fused gate only feeds
         # an o_proj call that runs unfused (per call, as GEMM-RS/AR's should_run).
         if fused_gate and not self._fused_o_proj(attn_out):
             return self.o_proj(mxfp8_act.gate_sigmoid_mul_quantize(attn_out, gate))[0]
         return self._o_proj(_gate_sigmoid_mul(attn_out, gate))
+
+    def _prefill_gate_gemm(
+        self, x: torch.Tensor, attn_out: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Prefill rows on sm_107: ``attn_out * g_proj(x).sigmoid()`` as one GEMM with
+        the gate in its epilogue (same BF16 roundings as g_proj + the gate kernel,
+        no gate tensor round trip), or None for the two-pass path."""
+        if (
+            x.shape[0] < 4096
+            or x.dtype != torch.bfloat16
+            or x.stride(1) != 1
+            or not attn_out.is_contiguous()
+            or self.g_proj.bias is not None
+            or not isinstance(self.g_proj.quant_method, UnquantizedLinearMethod)
+            or not current_platform.is_device_capability((10, 7))
+            or self._fused_o_proj(attn_out)
+        ):
+            return None
+        if getattr(self, "_gate_gemm", None) is None:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import (
+                bf16_gemm,
+            )
+
+            self._gate_gemm = bf16_gemm.Bf16GateGemm(((256, 256), (2, 1), 6))
+        return self._gate_gemm(x, self.g_proj.weight, attn_out, torch.empty_like(attn_out))
 
     def _fused_o_proj(self, attn_out: torch.Tensor) -> bool:
         return self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out)
