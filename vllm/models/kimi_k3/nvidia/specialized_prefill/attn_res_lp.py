@@ -12,10 +12,13 @@ scalars per token instead of reducing every block row again, and streams the
 block rows as a plain weighted sum. Per call only the prefix source needs a
 row reduction, so the per-source compute no longer grows with depth.
 
-Exactness: w_c = norm_w * qk_w (two BF16) has at most 16 significant bits, so
-w_c = hi + lo with hi, lo BF16 exactly (checked at plan build); the GEMM's
+Exactness: the query is the stock kernel's, w_c = ftz(ftz(norm_w) * ftz(qk_w))
+in FP32 (flush-to-zero, as --use_fast_math does there). Scaled by 2^32
+(exact), it is an exact sum of BF16 terms (1-2 for BF16 weights, 3 for any
+normal FP32; checked at plan build, never approximated), so the GEMM's
 BF16 x BF16 products are exact and accumulate in FP32 like the stock kernel
-(only the summation order differs).
+(only the summation order differs); the kernel scales the logit back by
+2^-32 (exact).
 
 Lifecycle: the model calls :func:`begin` with the forward's block buffer at
 the start of a prefill forward; every AttnRes call of that forward then goes
@@ -117,10 +120,45 @@ def _module(
 
 use_for = attn_res_mxfp8.use_for
 
+# The block-logit GEMMs run on the query scaled by 2^QUERY_SCALE_EXP (exact):
+# the real checkpoint's normal queries reach down to 2^-126, whose BF16 low
+# term would be subnormal (inexact); scaled, every query of hf-1d82032 is an
+# exact sum of 1-2 BF16 terms. The kernel scales the logit back (exact).
+QUERY_SCALE_EXP = 32
+QUERY_SCALE = 2.0**QUERY_SCALE_EXP
+MAX_TERMS = 3
+
+
+def _ftz(x: torch.Tensor) -> torch.Tensor:
+    """Flush FP32 subnormals to zero: the stock AttnRes kernel builds its query
+    q = rms_w * res_w under --use_fast_math (csrc/kimi_k3/attn_res_kernel.cu),
+    so subnormal weights and subnormal products are zero there."""
+    return torch.where(x.abs() < torch.finfo(torch.float32).tiny, torch.zeros_like(x), x)
+
+
+def _bf16_terms(x: torch.Tensor) -> list[torch.Tensor]:
+    """BF16 tensors whose FP32 sum is exactly ``x`` (FP32), fewest first: one
+    to three terms (8 significant bits each) for any normal FP32 value."""
+    terms = []
+    r = x
+    while True:
+        t = r.bfloat16()
+        terms.append(t)
+        r = r - t.float()
+        if not bool(r.any()):
+            return terms
+        if len(terms) == MAX_TERMS:
+            bad = int((r != 0).sum())
+            raise ValueError(
+                f"attn_res_lp: {bad} AttnRes query values are not an exact sum of "
+                f"{MAX_TERMS} BF16 terms"
+            )
+
 
 class Plan:
-    """Static per-model tables: the FP32 query of every AttnRes call and,
-    per block, the BF16 hi/lo query rows of the calls after its write."""
+    """Static per-model tables: the FP32 query of every AttnRes call (stock
+    flush-to-zero semantics) and, per block, the BF16 term rows of the scaled
+    query of the calls after its write (``terms[k][c]``: term k of call c)."""
 
     def __init__(
         self,
@@ -138,20 +176,17 @@ class Plan:
         self.num_blocks = num_blocks
         self.num_calls = len(weights)
         w32 = torch.stack(
-            [nw.float() * qw.float() for nw, qw in weights]
+            [_ftz(_ftz(nw.float()) * _ftz(qw.float())) for nw, qw in weights]
         ).contiguous()
-        hi = w32.bfloat16()
-        lo = (w32 - hi.float()).bfloat16()
-        if not torch.equal(hi.float() + lo.float(), w32):
-            raise ValueError("attn_res_lp: AttnRes query is not BF16 hi + lo exact")
         self.w32 = w32
+        self.terms = _bf16_terms(w32 * QUERY_SCALE)
         # Block b is written by call 2 * block_size * b (pre-attention of
         # layer block_size * b) and read by every later call.
         self.first_call = [2 * block_size * b + 1 for b in range(num_blocks)]
         self.wcat = []
         for b in range(num_blocks):
             c0 = self.first_call[b]
-            self.wcat.append(torch.cat([hi[c0:], lo[c0:]]).contiguous())
+            self.wcat.append(torch.cat([t[c0:] for t in self.terms]).contiguous())
 
     def calls_after(self, b: int) -> int:
         return self.num_calls - self.first_call[b]
@@ -250,8 +285,8 @@ def attn_res(
         if not 0 <= row < n_after:
             raise RuntimeError(f"attn_res_lp: call {call} has no logits of block {i}")
         base = lg.data_ptr()
-        lp += [base + row * rows * 4, base + (n_after + row) * rows * 4]
-    lptr = torch.tensor(lp or [0, 0], dtype=torch.int64)
+        lp += [base + (k * n_after + row) * rows * 4 for k in range(len(plan.terms))]
+    lptr = torch.tensor(lp or [0], dtype=torch.int64)
     # local_out: outputs consumed within the layer (every call but the final
     # one, whose output leaves the model) go to die-local rotating buffers,
     # written by the SMs of their token's die.
@@ -290,6 +325,8 @@ def attn_res(
         plan.w32[call],
         output_norm_weight,
         lptr,
+        len(plan.terms),
+        1.0 / QUERY_SCALE,
         st.rstd,
         num_blocks,
         block_write_idx,
@@ -308,8 +345,8 @@ def attn_res(
         # The final AttnRes is the forward's last reader of the plan state.
         del _states[st.ptr]
     elif block_write_idx >= 0 and plan.calls_after(block_write_idx) > 0:
-        # v_b . w_c for every later call c: [2 * calls_after, rows] FP32
-        # (hi rows, then lo rows).
+        # 2^32 v_b . w_c for every later call c: [terms * calls_after, rows]
+        # FP32 (the rows of term 0, then of term 1, ...).
         st.logits[block_write_idx] = torch.mm(
             plan.wcat[block_write_idx],
             blocks[:, block_write_idx].t(),

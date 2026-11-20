@@ -52,12 +52,105 @@ def _ref64(prefix, delta, blocks, nb, w, onw):
     return acc
 
 
+REAL_CKPT = "/lustre/share/coreai_comparch_aarwlt/models/nvidia_kimi-k31-pro-nvfp4/hf-1d82032"
+PREFIX = "language_model.model."
+
+
+def _real_attn_res_tensors(nl: int | None = None):
+    """(norm, proj) BF16 tensors of the AttnRes calls of layers 0..nl-1 and the
+    final AttnRes, in call order, read straight from the real checkpoint."""
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    if not os.path.isdir(REAL_CKPT):
+        pytest.skip(f"real checkpoint {REAL_CKPT} not on this cluster")
+    wmap = json.load(open(os.path.join(REAL_CKPT, "model.safetensors.index.json")))
+    wmap = wmap["weight_map"]
+    if nl is None:
+        nl = 1 + max(int(k.split(".")[3]) for k in wmap if "res_norm" in k and ".layers." in k)
+    names = []
+    for l in range(nl):
+        for kind in ("self_attention", "mlp"):
+            names.append(f"{PREFIX}layers.{l}.{kind}_res_")
+    names.append(f"{PREFIX}output_attn_res_")
+    out = []
+    for n in names:
+        pair = []
+        for part in ("norm", "proj"):
+            key = f"{n}{part}.weight"
+            with safe_open(os.path.join(REAL_CKPT, wmap[key]), "pt") as f:
+                pair.append(f.get_tensor(key).reshape(-1))
+        out.append(tuple(pair))
+    return out
+
+
+def test_plan_query_is_the_stock_query_exactly():
+    """Plan's FP32 query is the stock kernel's (flush-to-zero, as its
+    --use_fast_math build: subnormal weights and products are zero) and its
+    BF16 terms sum to 2^32 times it exactly, also for the hard values the real
+    checkpoint has: subnormal weights, products below 2^-126, products in
+    [2^-126, 2^-118) (subnormal low term unscaled) and FP32 norm weights."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_lp
+
+    tiny = torch.finfo(torch.float32).tiny
+    g = torch.Generator().manual_seed(1)
+    nw = (torch.randn(H, generator=g) * 0.05).bfloat16()
+    qk = (torch.randn(H, generator=g) * H**-0.5).bfloat16()
+    qk[:8] = torch.tensor([9.18e-41, -3e-39, 1e-37, 2e-36, 5e-35, 0.0, 1e-30, 4e-38]).bfloat16()
+    nw[8:12] = torch.tensor([1e-39, 0.03, 0.05, 0.07]).bfloat16()
+    qk[8:12] = torch.tensor([0.5, 1e-37, 3e-37, 2e-36]).bfloat16()
+    nw32 = torch.randn(H, generator=g) * 0.05  # 24-bit significands: 3 terms
+    for weights, nterms in (([(nw, qk)] * 3, 2), ([(nw32, qk)] * 3, 3)):
+        plan = attn_res_lp.Plan(weights, [EPS] * 3, 1, 1)
+        n, q = weights[0]
+        prod = n.float() * q.float()
+        ref = torch.where(
+            (n.float().abs() < tiny) | (q.float().abs() < tiny) | (prod.abs() < tiny),
+            torch.zeros_like(prod), prod)
+        assert torch.equal(plan.w32[0], ref)
+        assert len(plan.terms) == nterms
+        total = sum(t.double() for t in plan.terms)
+        assert torch.equal(total, plan.w32.double() * attn_res_lp.QUERY_SCALE)
+
+
+def test_plan_builds_from_the_real_checkpoint():
+    """Every AttnRes query of hf-1d82032 (187 calls), from the safetensors and
+    from the parameters vLLM loads them into (RMSNorm weight, BF16 [1, H] proj
+    weight through the default weight loader), is an exact BF16 term sum."""
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import attn_res_lp
+
+    real = _real_attn_res_tensors()
+    assert len(real) == 187
+    plans = [attn_res_lp.Plan(real, [EPS] * len(real), 12, 8)]
+    loaded = []
+    for nw, qk in real:
+        norm = RMSNorm(H, eps=EPS, dtype=torch.bfloat16)
+        default_weight_loader(norm.weight, nw)
+        proj = torch.nn.Parameter(torch.empty(1, H, dtype=torch.bfloat16), requires_grad=False)
+        default_weight_loader(proj, qk.reshape(1, H))
+        loaded.append((norm.weight.data, proj.data.squeeze(0)))
+    plans.append(attn_res_lp.Plan(loaded, [EPS] * len(loaded), 12, 8))
+    for plan in plans:
+        assert len(plan.terms) == 2
+        total = sum(t.double() for t in plan.terms)
+        assert torch.equal(total, plan.w32.double() * attn_res_lp.QUERY_SCALE)
+    assert torch.equal(plans[0].w32, plans[1].w32)
+
+
 @pytest.mark.parametrize(
-    "rows,dielocal", [(1500, False), (77, False), (5000, True), (77, True)]
+    "rows,dielocal,weights",
+    [(1500, False, "synthetic"), (77, False, "synthetic"), (5000, True, "synthetic"),
+     (77, True, "synthetic"), (1500, False, "real"), (5000, True, "real")],
 )
-def test_attn_res_lp_sequence(rows, dielocal):
+def test_attn_res_lp_sequence(rows, dielocal, weights):
     """``dielocal``: the production prefill path (die-local block / prefix
-    buffers, die-aware token claims, rotating die-local output buffers)."""
+    buffers, die-aware token claims, rotating die-local output buffers).
+    ``weights`` real: the AttnRes norm / proj weights of layers 0..6 and the
+    final AttnRes of hf-1d82032 (subnormal weights and tiny products)."""
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
     from vllm.models.kimi_k3.nvidia.specialized_prefill import (
@@ -73,8 +166,13 @@ def test_attn_res_lp_sequence(rows, dielocal):
     def rn(*s, scale=1.0):
         return (torch.randn(*s, device="cuda", generator=g) * scale).bfloat16()
 
-    nw = [(1 + rn(H, scale=0.1).float()).bfloat16() for _ in calls]
-    qk = [rn(H, scale=H**-0.5) for _ in calls]
+    if weights == "real":
+        real = _real_attn_res_tensors(nl)
+        nw = [n.cuda() for n, _ in real]
+        qk = [q.cuda() for _, q in real]
+    else:
+        nw = [(1 + rn(H, scale=0.1).float()).bfloat16() for _ in calls]
+        qk = [rn(H, scale=H**-0.5) for _ in calls]
     onw = (1 + rn(H, scale=0.1).float()).bfloat16()
     plan = attn_res_lp.Plan(list(zip(nw, qk)), [EPS] * len(calls), bs, nbt)
     prefix0 = rn(rows, H)

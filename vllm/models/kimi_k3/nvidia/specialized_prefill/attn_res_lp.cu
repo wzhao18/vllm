@@ -51,6 +51,7 @@ constexpr int VEC = K31LP_VEC;       // bf16 per lane chunk
 constexpr int NT = H / (7 * VEC);  // threads per token group (128 at VEC 8)
 constexpr int NCH = H / (NT * VEC);  // 7 chunks per thread
 constexpr int MAXB = 8;
+constexpr int MAXT = 3;  // BF16 terms of a block logit (attn_res_lp.MAX_TERMS)
 constexpr float LOG2_E = 1.4426950408889634f;
 #ifndef K31LP_PDL
 #define K31LP_PDL 1  // programmatic dependent launch (0: bench A/B builds only)
@@ -159,8 +160,11 @@ struct Args {
   const float* w;    // [H] FP32 norm_w * qk_w of this call
   const bf16_t* onw;  // output RMSNorm weight (NORM)
   float eps, oeps;
-  const float* lhi[MAXB];  // block i logit hi / lo row of this call ([T])
-  const float* llo[MAXB];
+  // Block i's logit term rows of this call ([T] FP32 each, terms k <
+  // nterms); the logit is (sum of terms) * lscale (exact power of two).
+  const float* lt[MAXT][MAXB];
+  int nterms;
+  float lscale;
   float* rstd;  // [MAXB][rstd_stride] per-block rsqrt(mean(v^2) + eps)
   int64_t rstd_stride;
   int n, widx, T;
@@ -231,8 +235,7 @@ struct Smem {
   float red[G][2][NW][3];  // [.][parity][warp]: sum u^2, u.w, sum out^2
   int tq[G][QN];
   float ew[G][NW][MAXB];  // per-warp normalized block weights of the token
-  const float* lhi[MAXB];  // logit row pointers (no dynamic param indexing)
-  const float* llo[MAXB];
+  const float* lt[MAXT][MAXB];  // logit term rows (no dynamic param indexing)
 };
 
 // Probe builds (K31LP_PROBE & 16): per-token phase clock stamps of group 0,
@@ -334,8 +337,8 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int i = 0; i < MAXB; ++i) {
-      sm.lhi[i] = a.lhi[i];
-      sm.llo[i] = a.llo[i];
+#pragma unroll
+      for (int k = 0; k < MAXT; ++k) sm.lt[k][i] = a.lt[k][i];
     }
     // Per-call constants into shared memory: two bulk copies (one round
     // trip), in flight across the dependency wait below.
@@ -407,12 +410,13 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   };
 
   // Lane i < n holds block i's logit inputs for the next token.
-  float nl_hi = 0.f, nl_lo = 0.f, nl_r = 0.f;
+  float nl_t0 = 0.f, nl_t1 = 0.f, nl_t2 = 0.f, nl_r = 0.f;
   auto load_logits = [&](int it) {
     const int t = sm.tq[g][it & (QN - 1)];
     if (lane < n && t >= 0) {
-      nl_hi = __ldg(sm.lhi[lane] + t);
-      nl_lo = __ldg(sm.llo[lane] + t);
+      nl_t0 = __ldg(sm.lt[0][lane] + t);
+      if (a.nterms > 1) nl_t1 = __ldg(sm.lt[1][lane] + t);
+      if (a.nterms > 2) nl_t2 = __ldg(sm.lt[2][lane] + t);
       nl_r = __ldg(a.rstd + (int64_t)lane * a.rstd_stride + t);
     }
   };
@@ -436,7 +440,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
 
     K31LP_STAMP(0);
     // Block logits of this token (prefetched), then prefetch the next.
-    const float s_mine = (nl_hi + nl_lo) * nl_r;
+    const float s_mine = ((nl_t0 + nl_t1) + nl_t2) * a.lscale * nl_r;
     load_logits(it + 1);
     // Lane i < n: block i's softmax term (one register, not an array).
     float m_b = lane < n ? s_mine : -FLT_MAX;
@@ -708,7 +712,8 @@ static const void* opt_ptr(const c10::optional<torch::Tensor>& t) {
 static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefix_dst,
                  c10::optional<torch::Tensor> delta, torch::Tensor blocks,
                  torch::Tensor w, c10::optional<torch::Tensor> onw,
-                 torch::Tensor lptr, torch::Tensor rstd, int64_t n, int64_t widx,
+                 torch::Tensor lptr, int64_t nterms, double lscale,
+                 torch::Tensor rstd, int64_t n, int64_t widx,
                  double eps, double oeps, c10::optional<torch::Tensor> out,
                  c10::optional<torch::Tensor> q, c10::optional<torch::Tensor> sf,
                  int64_t depth, c10::optional<torch::Tensor> sm_die,
@@ -723,8 +728,9 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   TORCH_CHECK((reinterpret_cast<uintptr_t>(w.data_ptr()) & 15) == 0 &&
                   (!onw.has_value() || (reinterpret_cast<uintptr_t>(onw->data_ptr()) & 15) == 0),
               "attn_res_lp: w / output norm weight must be 16-byte aligned (bulk copies)");
+  TORCH_CHECK(nterms >= 1 && nterms <= MAXT, "attn_res_lp: ", nterms, " logit terms");
   TORCH_CHECK(lptr.device().is_cpu() && lptr.scalar_type() == torch::kInt64 &&
-              lptr.numel() >= 2 * n);
+              lptr.numel() >= nterms * n);
   TORCH_CHECK(rstd.scalar_type() == torch::kFloat32 && rstd.dim() == 2);
   if (delta.has_value()) TORCH_CHECK(delta->stride(0) == H && delta->size(0) >= prefix.size(0));
   const c10::cuda::CUDAGuard guard(prefix.device());
@@ -742,9 +748,11 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   a.eps = (float)eps;
   a.oeps = (float)oeps;
   const int64_t* lp = lptr.data_ptr<int64_t>();
+  a.nterms = (int)nterms;
+  a.lscale = (float)lscale;
   for (int i = 0; i < n; ++i) {
-    a.lhi[i] = reinterpret_cast<const float*>(lp[2 * i]);
-    a.llo[i] = reinterpret_cast<const float*>(lp[2 * i + 1]);
+    for (int k = 0; k < nterms; ++k)
+      a.lt[k][i] = reinterpret_cast<const float*>(lp[nterms * i + k]);
   }
   a.rstd = rstd.data_ptr<float>();
   a.rstd_stride = rstd.stride(0);

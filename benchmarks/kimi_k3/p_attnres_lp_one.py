@@ -38,7 +38,7 @@ attn_res_lp.begin(plan, blocks)
 st = attn_res_lp._states[blocks.data_ptr()]
 st.rstd.uniform_(0.5, 1.5)
 for b in range(NB):
-    st.logits[b] = torch.randn(2 * plan.calls_after(b), T, device="cuda")
+    st.logits[b] = torch.randn(len(plan.terms) * plan.calls_after(b), T, device="cuda")
 prefix = torch.randn(T, H, device="cuda").bfloat16()
 if args.dielocal:  # the model's prefix lives in the die-local prefix buffer
     pb = attn_res_dielocal.prefix_out(prefix, blocks)
