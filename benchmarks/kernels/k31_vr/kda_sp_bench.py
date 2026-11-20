@@ -34,6 +34,7 @@ PENDING = 0  # pending replay tokens per request; 0: uniform 1..Q
 # with the die table inverted: every item remote).
 PLACE = "striped"
 MX = False  # KdaFlow writes the MXFP8 o_proj input (I5) instead of BF16
+RTRACE = False  # KdaRelay per-phase cycle stamps (layer 0, CTAs 0-3)
 
 
 def _pending(g):
@@ -146,6 +147,11 @@ def bench(n, kind, layers, iters, seed=0):
 
                 core.mx_input = mxfp8.shared_input("o_proj", rows, DIM, kda.DEVICE)
             core.prepare_caches(kv)
+            if kind == "relay" and PLACE == "local":
+                core.kernels[rows].die_order = True  # die-matched items (static metadata)
+            if RTRACE and kind == "relay" and i == 0:
+                rtrace = torch.zeros(4 * 32 * 16 * 10 + 8, dtype=torch.int32, device=kda.DEVICE)
+                core.kernels[rows].trace = rtrace
             if PLACE in ("local", "swap") and kind == "flow":
                 assert core.die_ops is not None, "state not die-localized"
             if PLACE == "swap":
@@ -200,6 +206,21 @@ def bench(n, kind, layers, iters, seed=0):
         times.append(start.elapsed_time(end) * 1e3 / layers)
     times.sort()
     del graph
+    if RTRACE and kind == "relay":
+        ck = rtrace[4 * 32 * 16 * 10 :].view(torch.int64).double().tolist()
+        if ck[3] > ck[1]:
+            n_items = int((rtrace[: 4 * 32 * 16 * 10].view(4, 32, 16, 10)[0, :, 0, :9].sum(-1) > 0).sum())
+            print(f"RTRACE n{n} SM clock {(ck[2] - ck[0]) / (ck[3] - ck[1]):.3f} GHz; CTA 0 item-to-item "
+                  f"{(ck[2] - ck[0]) / max(n_items - 1, 1):.0f} clk ({n_items} items)", flush=True)
+        t = rtrace[: 4 * 32 * 16 * 10].view(4, 32, 16, 10).double()
+        live = t[..., :9].sum(-1) > 0  # (cta, item, warp) entries that ran
+        names = "page_wait copy u_wait opnd_wait math solve fin_ring stg finish".split()
+        med = [float(t[..., i][live].mean()) for i in range(9)]
+        tot = t[..., :9].sum(-1)[live]
+        print(f"RTRACE n{n} item-warp total clk mean {float(tot.mean()):.0f} p90 {float(tot.quantile(0.9)):.0f} max {float(tot.max()):.0f}", flush=True)
+        items = float(live.any(-1).sum(-1).double().mean())
+        print(f"RTRACE n{n} items/cta {items:.1f} clk mean per item-warp: "
+              + " ".join(f"{a} {b:.0f}" for a, b in zip(names, med)) + f" sum {sum(med):.0f}", flush=True)
     return times[len(times) // 2], times[0]
 
 
@@ -224,6 +245,7 @@ def main():
     p.add_argument("--pending", type=int, default=0, help="pending tokens (0: 1..Q)")
     p.add_argument("--place", nargs="+", default=["striped"])
     p.add_argument("--mx", action="store_true", help="KdaFlow MXFP8 outputs")
+    p.add_argument("--rtrace", action="store_true", help="KdaRelay phase stamps")
     p.add_argument("--qgroups", type=int, default=0, help="KdaCoreQ item groups")
     p.add_argument("--unfused", action="store_true", help="KdaFlow two verify passes")
     a = p.parse_args()
@@ -276,8 +298,8 @@ def main():
     props = torch.cuda.get_device_properties(0)
     print(f"device {props.name} sms {props.multi_processor_count}", flush=True)
     results = []
-    global PLACE, MX
-    MX = a.mx
+    global PLACE, MX, RTRACE
+    MX, RTRACE = a.mx, a.rtrace
     for n, place, kind in [(n, pl, k) for n in a.n for pl in a.place for k in a.kinds]:
         PLACE = place
         if True:

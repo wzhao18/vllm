@@ -65,7 +65,7 @@ from cutlass.cute.runtime import make_fake_stream
 from ...shapes import Choice, Path, Shape, Unsupported
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
-from . import chain, core, coreq, flow, fused_ws, ring, specialized
+from . import chain, core, coreq, flow, fused_ws, relay, ring, specialized
 from .fused import KdaFused
 from .fused_ws import KdaFusedWS
 from .recover import KdaSplit
@@ -90,8 +90,10 @@ KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws", "flow", "flowp", 
 # "deferred": cores that fold the pending commit themselves (no flush): the replaying
 # cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
 FOLDS = ("fused", "fused_ws", "wide", "flow", "flowp", "chain", "ring", "core",
-         "coreq")
+         "coreq", "relay")
 DIE_KINDS = ("flow", "flowp", "ring", "core", "coreq")  # die-matched items, MXFP8 outputs
+MX_KINDS = (*DIE_KINDS, "relay")  # MXFP8 outputs
+BLOCK_KINDS = ("core", "coreq", "relay")  # operand blocks from the prep pass
 MODES = ("deferred", "triton", "none")
 
 
@@ -401,6 +403,12 @@ class SpKdaCore:
         if getattr(self, "tmap_state", None) is not state:
             self.tmap, self.tmap_state = core.state_map(state), state
 
+    def relay_operands(self, n):
+        """KdaRelay's operand blocks (sized for the largest R)."""
+        items = self.heads * (max(self.rows) // self.q)
+        if getattr(self, "ropb", None) is None or self.ropb.shape[0] < items:
+            self.ropb = torch.zeros(items, relay.OPB_FLOATS, device=self.device)
+
     def prepare_caches(self, caches):
         """Compile every R's core for the bound KV cache (before graph capture)."""
         if self.plain is not None:
@@ -433,7 +441,7 @@ class SpKdaCore:
             if kind in DIE_KINDS and self.die_ops is not None:
                 deferred = (*deferred, *self.die_ops)
                 flavor += "+dies"
-            mx_kind = kind in DIE_KINDS and self.mode == "deferred"
+            mx_kind = kind in MX_KINDS and self.mode == "deferred"
             if mx_kind and self.mx_input is not None:
                 view = self.mx_input.view(r)
                 mx = (view.data.view(torch.uint8), view.scale)
@@ -444,12 +452,18 @@ class SpKdaCore:
                 chain_scratch(self.device, items)  # allocated before any capture
                 scratch = torch.empty(chain.scratch_shape(items), **meta)
                 deferred = (*deferred, scratch)
-            if kind in ("core", "coreq"):  # the operand blocks (+ the TMA map)
+            if kind in BLOCK_KINDS:  # the operand blocks (+ the TMA map)
                 self.core_operands(state, n)
                 deferred = (*deferred, torch.empty_like(self.opb, **meta))
                 dumped = self._operands(caches, projected, slots, out, accepted,
                                         deferred)  # fmt: skip
-                deferred = (*deferred, torch.empty_like(self.tmap, **meta))
+                if kind == "relay":
+                    self.relay_operands(n)
+                    self.kernels[r] = relay.KdaRelay(
+                        self.heads, self.q, self.layer.o_norm.eps,
+                        "+mx" in flavor, self.device)  # fmt: skip
+                else:
+                    deferred = (*deferred, torch.empty_like(self.tmap, **meta))
                 if self.standin:
                     options = (self.heads, self.q, True, self.has_bias, self.device.index)
                     stand = "flowdump" + flavor[len(kind):]
@@ -461,6 +475,8 @@ class SpKdaCore:
                 self.kinds[r] = kind = "fused"  # KdaFused: no persistent page staging
             if kind not in DIE_KINDS:
                 flavor = kind
+            if kind == "relay":
+                continue
             options = (self.heads, self.q, True, self.has_bias, self.device.index)
             self.kernels[r] = executable(specs, flavor, *options)
             self.specs[r] = specs
@@ -496,7 +512,7 @@ class SpKdaCore:
             extra = (deferred.record_rows[:n], deferred.pending)
             if self.kinds[rows] in DIE_KINDS and self.die_ops is not None:
                 extra = (*extra, *self.die_ops)
-            if self.kinds[rows] in DIE_KINDS and self.mx_input is not None:
+            if self.kinds[rows] in MX_KINDS and self.mx_input is not None:
                 mx_out = self.mx_input.view(rows)
                 extra = (*extra, mx_out.data.view(torch.uint8), mx_out.scale)
             if self.kinds[rows] == "chain":
@@ -506,21 +522,39 @@ class SpKdaCore:
             slots = slots.contiguous()
         tensors = self._operands(caches, projected, slots, out, accepted[:n], extra)
         dumped = ()
-        if self.kinds[rows] in ("core", "coreq"):
-            if self.tmap_state.data_ptr() != caches[1].data_ptr():
+        if self.kinds[rows] in BLOCK_KINDS:
+            stale = self.tmap_state.data_ptr() != caches[1].data_ptr()
+            if stale and self.kinds[rows] != "relay":  # (KdaRelay: no TMA map)
                 if torch.cuda.is_current_stream_capturing():
                     raise Unsupported("kda", Shape(rows, self.q), "KdaCore: another cache")
                 self.core_operands(caches[1], n)  # (tests: a cloned cache)
             dumped = (*tensors, self.opb)
             tensors = (*tensors, self.opb, self.tmap)
+        if self.kinds[rows] == "relay":
+            self.run_standin(rows, dumped)
+            if self.standin:
+                relay.from_core(self.opb[: self.heads * n], self.ropb[: self.heads * n])
+            kernel.launch((*tensors[:-2], self.ropb))
+            if extra and self.mx_input is not None:
+                return self.mx_input.view(rows)
+            return out
         specs = tuple(map(layout, tensors))
         if specs != self.specs[rows]:  # CuTe takes a mismatched layout silently
             pairs = enumerate(zip(specs, self.specs[rows]))
             changed = [i for i, (a, b) in pairs if a != b]
             cause = f"operand layouts {changed} differ from the compiled ones"
             raise Unsupported("kda", Shape(rows, self.q), cause)
-        if dumped and self.standin:  # the prep stand-in (KdaFlow, no checkpoint)
-            # (its outputs go to scratch: only KdaCore writes the step's outputs)
+        self.run_standin(rows, dumped)
+        views = tuple(to_cute(t, 16) for t in tensors)
+        kernel(*views[:13], *self.scalars, *views[13:], stream(self.device))
+        if extra and self.kinds[rows] in DIE_KINDS and self.mx_input is not None:
+            return self.mx_input.view(rows)
+        return out
+
+    def run_standin(self, rows, dumped):
+        """The prep stand-in (KdaFlow's prep, no checkpoint) into the operand blocks;
+        its outputs go to scratch: only the state pass writes the step's outputs."""
+        if dumped and self.standin:
             dumped = list(dumped)
             mx_at = 19 + 2 * int(self.die_ops is not None)
             scratch = [10] + ([mx_at, mx_at + 1] if self.mx_input is not None else [])
@@ -529,11 +563,6 @@ class SpKdaCore:
             dumped = tuple(to_cute(t, 16) for t in dumped)
             self.standins[rows](*dumped[:13], *self.scalars, *dumped[13:],
                                 stream(self.device))  # fmt: skip
-        views = tuple(to_cute(t, 16) for t in tensors)
-        kernel(*views[:13], *self.scalars, *views[13:], stream(self.device))
-        if extra and self.kinds[rows] in DIE_KINDS and self.mx_input is not None:
-            return self.mx_input.view(rows)
-        return out
 
     def choice(self, rows):
         """The coverage entry at ``rows``: GENERIC (no 24-head table is measured)."""

@@ -37,16 +37,17 @@ def core_of(kind, attention, rows, records, caches):
         sp.RECORD_KINDS.clear()
         sp.RECORD_KINDS.update(saved)
     assert core.kinds[rows] == kind
-    core.standin = kind in ("core", "coreq")  # KdaFlow's prep as the prep pass
+    core.standin = kind in ("core", "coreq", "relay")  # KdaFlow's prep as the prep pass
     core.prepare_caches(list(caches))
     return core
 
 
 @pytest.mark.parametrize(
     "kind",
-    ["flow", "flowp", "chain", "flow-local", "ring", "ring-local", "core", "coreq"],
+    ["flow", "flowp", "chain", "flow-local", "ring", "ring-local", "core", "coreq",
+     "relay"],
     ids=["flow", "flowp", "chain", "flow_die_local", "ring", "ring_die_local", "core",
-         "coreq"],
+         "coreq", "relay"],
 )
 @pytest.mark.parametrize("stages", [1])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
