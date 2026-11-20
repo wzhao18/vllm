@@ -53,6 +53,7 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     gather4,
     cp_async_arrive,
     ld_global_s32_pred,
+    ld_global_v4_s32,
     ld_shared_f32,
     ld_shared_u32,
     mbar_arrive,
@@ -71,7 +72,6 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla import (
     tmem_ld,
 )
 from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h2 import (
-    bulk_g2s,
     ld_shared_v4u,
     tmem_st_u32,
 )
@@ -123,11 +123,7 @@ OFF_BAR = OFF_TOK0 + 4 * H * 4
 OFF_TMEM = OFF_BAR + 40 * 8
 OFF_GMASK = OFF_TMEM + 16  # [2 WG][2 (u // 2 parity)][4] u32: heads that grew (ballots)
 OFF_KV = (OFF_GMASK + 64 + 1023) // 1024 * 1024
-# per-token slot indices (token parity x IDXK int32), one bulk copy per token by the
-# Q warp: the gather warps read each stage's 4 indices by ld.shared (P-MLA M9)
-IDXK = 2048
-OFF_IDX = OFF_KV + NS * STAGE64
-SMEM_BYTES = OFF_IDX + 2 * IDXK * 4
+SMEM_BYTES = OFF_KV + NS * STAGE64
 # RoPE A tile rows 96-127 of each QS buffer (read by the MMA, never loaded): the
 # lazy-max mailbox ([2][96] f32, buffer 0) and token parity 1 of the l/m exchange
 OFF_MBOX = OFF_QS + H * 64
@@ -143,8 +139,7 @@ B_QFULL, B_QREMPTY = 8, 10  # x2 (token parity)
 B_OFREE = 12  # x4 (O^T block)
 B_OREADY, B_PEMPTY = 16, 19  # x3 (P buffer u % 3)
 B_KVFULL, B_KVEMPTY = 22, 28  # x NS
-B_IFULL, B_IEMPTY = 34, 36  # x2 (token parity): slot indices landed / read by all gather warps
-assert B_KVEMPTY + NS <= B_IFULL and B_IEMPTY + 2 <= 40
+assert B_KVEMPTY + NS <= 40
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
 # 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
 # warpgroup-wide
@@ -271,12 +266,6 @@ def tmem_st_o4(addr, v0, v1, v2, v3):
 
 
 @asm()
-def ld_shared_v4_s32(addr):
-    return ("ld.shared.v4.b32 {$0,$1,$2,$3}, [$4];", "=r,=r,=r,=r,r,~{memory}",
-            (Uint32(addr),), (Int32,) * 4)
-
-
-@asm()
 def tmem_ld_max64(addr):
     """64 columns of this thread's TMEM lane and their maximum (tcgen05.ld.red)."""
     regs = ",".join(f"${i}" for i in range(64))
@@ -372,9 +361,6 @@ class SparseMlaPrefillH8:
             for s in cutlass.range_constexpr(NS):
                 mbar_init(_bar(base, B_KVFULL + s), Uint32(1 + (256 if self.cpa else 0)))
                 mbar_init(_bar(base, B_KVEMPTY + s), Uint32(1))
-            for j in cutlass.range_constexpr(2):
-                mbar_init(_bar(base, B_IFULL + j), Uint32(1))
-                mbar_init(_bar(base, B_IEMPTY + j), Uint32(NLD))
             cute.arch.mbarrier_init_fence()
         if warp == 0:
             tmem_alloc_exclusive(base + Uint32(OFF_TMEM))
@@ -452,15 +438,6 @@ class SparseMlaPrefillH8:
             if lane == 0:
                 for qi in range(n_mine):
                     row = cta + qi * self.grid
-                    # token qi's slot indices (buffer qi % 2 is free once every gather warp
-                    # has read token qi - 2's)
-                    if qi >= 2:
-                        mbar_wait(_bar(base, B_IEMPTY + qi % 2), Uint32((qi // 2 - 1) & 1))
-                    ifull = _bar(base, B_IFULL + qi % 2)
-                    nb = Uint32(_subs(lens[row]) * 256)
-                    mbar_arrive_tx(ifull, nb)
-                    bulk_g2s(base + Uint32(OFF_IDX) + Uint32(qi % 2) * Uint32(IDXK * 4),
-                             slots + Int64(row) * Int64(slot_stride) * Int64(4), nb, ifull)
                     if qi >= 1:
                         mbar_wait(_bar(base, B_QLFREE), Uint32((qi - 1) & 1))
                     if qi >= 2:
@@ -489,8 +466,8 @@ class SparseMlaPrefillH8:
                 row = cta + qi * self.grid
                 n = lens[row]
                 subs = _subs(n)
-                ibuf = base + Uint32(OFF_IDX) + Uint32(qi % 2) * Uint32(IDXK * 4) + Uint32(16 * q)
-                mbar_wait(_bar(base, B_IFULL + qi % 2), Uint32((qi // 2) & 1))
+                srow = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(16 * q)
+                c0, c1, c2, c3 = ld_global_v4_s32(srow)
                 # cpa: lane id = 32 pw + lane < 256 copies RoPE chunk id % 4 of row id // 4
                 rid = pw * 32 + lane
                 rrow = rid // 4
@@ -505,9 +482,10 @@ class SparseMlaPrefillH8:
                     st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                     full = _bar(base, B_KVFULL + s)
                     key = t * 64 + 4 * q
-                    r = ld_shared_v4_s32(ibuf + Uint32(t * 256))
+                    r = (c0, c1, c2, c3)
                     rc = cr
                     if t + 1 < subs:
+                        c0, c1, c2, c3 = ld_global_v4_s32(srow + Int64((t + 1) * 256))
                         if cutlass.const_expr(self.cpa):
                             cr = ld_global_s32_pred(rsl + Int64((t + 1) * 256), Int32(rop))
                     # keep the prefetch here (issued before the stage-free wait): without
@@ -565,9 +543,6 @@ class SparseMlaPrefillH8:
                         self.ss(base, cta, lane, g, 23, 8)
                         self.lpin(base, cta, lane, g)
                     g = g + 1
-                cute.arch.sync_warp()
-                if lane == 0:
-                    mbar_arrive(_bar(base, B_IEMPTY + qi % 2))
 
     # ------------------------------------------------------------------ MMA
     @cute.jit
@@ -937,10 +912,6 @@ def sparse_mla_prefill_h8(q8: torch.Tensor, kv_rows: torch.Tensor, slots: torch.
         raise ValueError("sparse_mla_prefill_h8: out must be contiguous [T, 96, 512]")
     if t == 0:
         return out
-    if (slots.shape[1] > IDXK or slots.stride(1) != 1 or slots.stride(0) % 4
-            or slots.data_ptr() % 16):
-        raise ValueError(f"sparse_mla_prefill_h8: slots must be int32 [T, <= {IDXK}] with "
-                         "unit column stride, 16 B aligned rows")
     sms = torch.cuda.get_device_properties(q8.device).multi_processor_count
     grid = min(sms, t)
     fn = _compiled(grid, tuple(knobs))
