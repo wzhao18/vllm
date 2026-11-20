@@ -327,8 +327,6 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tw)) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(reinterpret_cast<uint64_t>(&tx)) : "memory");
   }
-  // Router correction bias (a weight: before the dependency).
-  for (int e = threadIdx.x; e < a.num_logits; e += kThreads) s_bias[e] = a.bias[e];
   if (warp == 1) {
     asm volatile(
         "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" ::"r"(
@@ -432,6 +430,9 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     }
     commit_el(acc_bar);
   } else if (warp >= 4) {
+    // Router correction bias (a weight, read by the top-k after a CTA barrier): the
+    // epilogue warps load it while the accumulator runs, off the W stream's start.
+    for (int e = threadIdx.x - 128; e < a.num_logits; e += 128) s_bias[e] = a.bias[e];
     // D (TMEM lane = weight row, column = token) -> this CTA's FP32 partial.
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (p.debug & 2) {
