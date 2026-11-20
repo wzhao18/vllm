@@ -350,14 +350,16 @@ class DcpxDecode:
         # top-k on both sides, decided once here.
         topk = getattr(indexer, "candidate_blocks", None) is None
         if topk and not _reads_counts(layer.impl):
-            # FlashMLA sparse (fp8_ds_mla) filters the DCP ids in its own
-            # forward_mqa: slots would be read as global ids there.
-            logger.warning_once(
-                "DcpExchange top-k: %s converts the DCP top-k itself; its layers "
-                "keep the stock top-k",
-                type(layer.impl).__name__,
+            # An impl that converts the DCP top-k itself (FlashMLA sparse filters the
+            # DCP ids in its own forward_mqa) would read the exchange's slots as
+            # global ids. No silent stock fallback: the specialized DCP decode needs
+            # an impl that reads dcp_local_topk_counts.
+            raise RuntimeError(
+                f"DcpExchange top-k: {type(layer.impl).__name__} ({prefix}) does not "
+                "read dcp_local_topk_counts (its forward_mqa converts the DCP top-k "
+                "itself); the Kimi K3.1 DCP decode needs a sparse MLA impl that does "
+                "(FlashInferMLASparseImpl)"
             )
-            topk = False
         if topk:
             self.layers[prefix] = layer
             self.indexers[prefix] = indexer

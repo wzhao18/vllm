@@ -63,6 +63,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 
@@ -143,7 +144,7 @@ def load_extension() -> None:
             h.update(fh.read())
         h.update(f"{torch.__version__} {torch.version.cuda}".encode())
         build = os.path.join(
-            envs.VLLM_CACHE_ROOT, "k3_flashkda_split", h.hexdigest()[:16]
+            envs.VLLM_CACHE_ROOT, "k3_flashkda_split", h.hexdigest()[:16] + "-s"
         )
         os.makedirs(build, exist_ok=True)
         flags = [
@@ -166,7 +167,7 @@ def load_extension() -> None:
             "--threads",
             "8",
         ]
-        csrc = os.path.join(_SRC, "csrc")
+        csrc = os.path.join(stable_copy(build, _SRC), "csrc")
         load(
             name="k3_flashkda_split",
             sources=[
