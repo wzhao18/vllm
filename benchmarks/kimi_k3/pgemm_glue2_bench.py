@@ -20,7 +20,7 @@ def main():
 
     prefill_glue.warmup()
     out = []
-    for m in (16384, 8192):
+    for m in (16384, 8192, 4097):
         x = torch.randn(m, 896, device="cuda") * 2
         bias = torch.randn(896, device="cuda") * 0.05
         v0, i0 = ops.grouped_topk(x, 1, 1, 16, True, 2.5, bias, 1)
