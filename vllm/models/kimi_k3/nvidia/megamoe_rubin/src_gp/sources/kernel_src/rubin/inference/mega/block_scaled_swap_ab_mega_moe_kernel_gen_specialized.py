@@ -1667,6 +1667,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             iket.range_pop()
             DG.put_gt(DG.S_SIZES)
             published = Int32(0)
+            _dms_first_routed = Int32(0)
             helper_ready_latched = Int32(0)
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
@@ -1678,6 +1679,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 scheduler.publish_work(prepared_tile)
                 DG.put_gt_dyn(Int32(DG.S_PUB0) + published % Int32(4))
                 DG.put_val_dyn(Int32(DG.S_UNIT0) + published % Int32(4), DG.unit_code(prepared_tile))
+                if published < Int32(4):
+                    DG.put_gt_dyn(Int32(DG.S_FPUB0) + published)
+                    DG.put_val_dyn(Int32(DG.S_FUNIT0) + published, DG.unit_code(prepared_tile))
+                if (_dms_first_routed == Int32(0)) & ((prepared_tile.phase_and_flags & Int32(0xFF)) == Int32(1)):
+                    DG.put_gt(DG.S_FIRSTROUTED)
+                    _dms_first_routed = Int32(1)
                 published = published + Int32(1)
                 iket.range_pop()
                 # Unit j is claimed once TMA-A has taken unit j - 1 (waiting from unit 1 keeps the parity exact):

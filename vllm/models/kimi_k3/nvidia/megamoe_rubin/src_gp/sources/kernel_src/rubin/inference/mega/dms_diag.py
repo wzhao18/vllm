@@ -32,6 +32,8 @@ S_NPUB = 31
 S_GDW, S_SYNC, S_CLB, S_TAILBAR, S_ARRIVE = 40, 41, 42, 43, 44
 S_L_COMM, S_L_RESET, S_L_EPOCH, S_L_FSYS, S_L_SIG = 45, 46, 47, 48, 49
 S_CLB2, S_ISLAST = 50, 51
+S_FPUB0, S_FUNIT0 = 32, 36  # first 4 publishes (time, unit code)
+S_TOKREADY, S_FIRSTROUTED = 26, 27
 S_PUB0, S_UNIT0 = 52, 56  # last 4 scheduler publishes: time (52..55) and unit code (56..59), index = n % 4
 S_BLOCK, S_EPOCH = 62, 63
 

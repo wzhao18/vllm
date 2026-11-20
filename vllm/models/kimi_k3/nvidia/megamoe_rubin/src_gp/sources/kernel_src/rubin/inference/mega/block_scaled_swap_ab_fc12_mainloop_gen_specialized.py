@@ -52,6 +52,7 @@ from .....helpers.cute_py_helpers import (
 from ......common.dsl_helpers import mark_alignment
 from .....helpers.dsl_helpers import ReadyFlag, wait_ready, spin_wait, tma_multicast_mask
 from .....helpers.iket_compat import iket
+from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
 from .....helpers.smem_workspace import SmemWorkspace
 from ......common.utils import ceil_div, round_up
 from .....quant_def import QuantKind
@@ -1704,6 +1705,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         wait_ready(routed_metadata_ready_flag)
                         iket.range_pop()
                         routed_inputs_ready = Int32(1)
+                        DG.put_gt(DG.S_TOKREADY)
                 tile_pool_base = work_tile.cumulative_data_physical_row + work_tile.tile_n_idx * Int32(self.cta_tile_n)
                 # The MMA issues a dynamic instruction N, so under two-CTA
                 # instructions the pair splits that runtime extent rather than the
