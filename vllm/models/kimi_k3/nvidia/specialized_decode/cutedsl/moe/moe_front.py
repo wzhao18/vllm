@@ -216,7 +216,7 @@ __device__ __forceinline__ float4 tile_sum(const float* pt, int64_t stride, int 
 // the dependency), the last nr in shared memory (A operand of the SS MMA). Ring items:
 // nt weight K blocks, then nk token K blocks (after griddepcontrol.wait).
 template <bool NVFP4>
-__global__ void __maxnreg__(128)  // launched with kThreads (256 x 128 regs beside the AttnRes reduce)
+__global__ void __maxnreg__(96)  // launched with kThreads
     moe_front_kernel(const __grid_constant__ CUtensorMap tw,
                      const __grid_constant__ CUtensorMap tx,
                      const __grid_constant__ Params p) {
