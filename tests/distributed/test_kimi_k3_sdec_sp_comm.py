@@ -410,6 +410,9 @@ def _pre_push_worker(env: dict[str, str], mode: str = "pre_push") -> None:
         if mode == "ks_push":
             _ks_push_rows(sp, projections, comm, ctx, world, rank, device)
             return
+        # (the test's own seam: every row on the pushing GEMM; the tuned table keeps it
+        # where it wins)
+        sp.SP_OPROJ_MX[world] = "17-384:pre_push"
         oproj = sp.SpOproj(projections[rank], comm, MX_ROWS, ctx)
         tactics = {r: oproj.choice(r).tactic for r in MX_ROWS}
         assert all(t == ("pre_push", "pre") for t in tactics.values()), tactics
