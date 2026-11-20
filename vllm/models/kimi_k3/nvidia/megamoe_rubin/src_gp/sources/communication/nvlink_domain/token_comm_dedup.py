@@ -1372,6 +1372,9 @@ class TokenCommDedup(KernelComponent):
     _probe_stamps: ClassVar[bool] = False
     _probe_tb_token_wait: ClassVar[bool] = False
     _probe_acquire_poll: ClassVar[bool] = False
+    _probe_fc2_stg: ClassVar[bool] = False
+    _probe_tb_ef: ClassVar[bool] = False
+    _probe_order_window: ClassVar[int] = 0
     standalone_chunk_bytes: ClassVar[int] = 2048
     reduction_round_group: ClassVar[int] = 4
     # Last-copy reduce: two copies per 1-D TMA through three buffers (two fills in flight), per-warp SMEM 3 x 2 x chunk.
@@ -2284,6 +2287,8 @@ class TokenCommDedup(KernelComponent):
                     if cutlass.const_expr(not self._probe_acquire_poll):
                         cute.arch.fence_acq_rel_gpu()
                     cute.arch.sync_warp()
+                    if cutlass.const_expr(self._probe_fc2_stg):
+                        cute.arch.fence_proxy("async.global")
                     iket.range_pop()
                     if cutlass.const_expr(self._probe_stamps):
                         pr_gb = Int64(read_globaltimer_ns())
@@ -2291,6 +2296,8 @@ class TokenCommDedup(KernelComponent):
                         pr_ga = pr_gb
                         pr_np = pr_np + Int32(1)
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
+                    if cutlass.const_expr(self._probe_order_window > 0):
+                        block_index = block_index % Int64(self._probe_order_window)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)
                     fill_sequence = self._reduce_and_push(
                         block_address,
@@ -2467,7 +2474,10 @@ class TokenCommDedup(KernelComponent):
                     if cutlass.const_expr(self.reduce_topk_in_kernel):
                         cp_reduce_async_bulk_add_bf16_s2g(destination_chunk, chunk_source, current_vectors * Int32(16))
                     else:
-                        cp_async_bulk_s2g(destination_chunk, chunk_source, current_vectors * Int32(16))
+                        cp_async_bulk_s2g(
+                            destination_chunk, chunk_source, current_vectors * Int32(16),
+                            evict_first=self._probe_tb_ef,
+                        )
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.sync_warp()
         # The pushes stay in flight across tokens: the next token's first fill waits for the read of the push that

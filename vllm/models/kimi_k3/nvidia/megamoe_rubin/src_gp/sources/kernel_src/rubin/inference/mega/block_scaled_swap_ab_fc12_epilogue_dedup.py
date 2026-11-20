@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
@@ -16,18 +17,31 @@ from .....api import ImplDesc, ProblemDesc
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....helpers.iket_compat import iket
-from ......common.ptx_helpers import cp_async_bulk_s2g, cp_reduce_async_bulk_add_bf16_s2g
+from ......common.ptx_helpers import (
+    cp_async_bulk_s2g,
+    cp_reduce_async_bulk_add_bf16_s2g,
+    lds128_v4_b32,
+    stg_v4_b32,
+    stmatrix_x4_trans_b16,
+)
 from ....function_mapping import FunctionMapping
 from ....schedulers.fc12_mapping import SwapAbFc12WorkTileInfo
 from .block_scaled_swap_ab_fc12_epilogue import (
     GatedActEpilogueArgs,
     SwapABFc2Epilogue,
     SwapABGatedActEpilogue,
+    TmemTranspose32x64B16Movm,
     make_fc2_ublk_process_pipeline,
 )
 
-
-_PROBE_FC2_STORE = "all"
+# W2 FC2 staging row pitch in BF16 elements: 128 hidden + a 16-byte pad, so the eight 16 B token rows one STSM.trans
+# matrix writes land on distinct banks.
+_FC2_STSM_ROW_STRIDE = 136
+_PROBE_FC2_STSM = False  # probe A/B gates (pmoe_probe2.py PMOE_FC2STSM / PMOE_FC2STG)
+_PROBE_FC2_STG = False
+_PROBE_FC2_EF = False  # L2 evict-first FC2 bulk stores
+_PROBE_ORDER_WINDOW = 0  # timing probe: block % N
+_PROBE_FC2_STG_SKIP = False  # timing/debug: no STG
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,17 +105,40 @@ class Fc2DedupBulkRouter:
                     valid[iter_idx] = Int32(2) if cutlass.const_expr(self.reduce_topk_in_kernel) else Int32(1)
                 else:
                     block_index = Int64(md.src_token) * Int64(self.world_size) + Int64(md.src_rank)
+                    if cutlass.const_expr(_PROBE_ORDER_WINDOW > 0):
+                        block_index = block_index % Int64(_PROBE_ORDER_WINDOW)
                     slot_index = (block_index * Int64(self.chunks_per_row) + chunk_index) * Int64(self.topk) + Int64(
                         md.dst_order_id
                     )
                     dst_ptrs[iter_idx] = self.order_base + slot_index * Int64(self.chunk_bytes) + byte_in_chunk
-                    valid[iter_idx] = Int32(1) if cutlass.const_expr(_PROBE_FC2_STORE == "all") else Int32(4)
+                    valid[iter_idx] = Int32(1)
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid, copy_iters=copy_iters)
 
     @cute.jit
     def get_data_dst(self, iter_idx: int) -> Tuple[cute.Pointer, Int32]:
         ptr = cute.make_ptr(cutlass.BFloat16, self.dst_ptrs[iter_idx], AddressSpace.gmem, assumed_align=16)
         return ptr, self.valid[iter_idx]
+
+
+@cute.jit
+def fc2_dedup_frag_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, epi, **_):
+    """Two warpgroups: this warpgroup's 32-token half of the warp's 32 hidden lanes, as two 16-lane ``16x256b`` loads.
+
+    Register ``4 k + {0, 1}`` holds (lane ``l // 4``, tokens ``8 k + 2 (l % 4) + {0, 1}``) and ``4 k + {2, 3}`` the
+    same tokens of lane ``l // 4 + 8``, so after ``fc2_f2fp`` each BF16 pair is one m8n8 fragment word for STSM."""
+    tmem_subtile_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None, epi.warp_idx), None]
+    tmem_half = cute.flat_divide(tmem_subtile_per_warp, (32, 32))[None, None, 0, epi.warpgroup_idx]
+    tmem_ptr = tmem_half.iterator
+    atom = cute.make_copy_atom(tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), cutlass.Float32)
+    top = cute.make_rmem_tensor((16,), cutlass.Float32)
+    bottom = cute.make_rmem_tensor((16,), cutlass.Float32)
+    top_view = cute.make_tensor(tmem_ptr, TmemTranspose32x64B16Movm._tmem_layout(16, 32))
+    bottom_view = cute.make_tensor(
+        tmem_ptr + 16 * TmemTranspose32x64B16Movm._tmem_row_stride, TmemTranspose32x64B16Movm._tmem_layout(16, 32)
+    )
+    cute.copy(atom, top_view, TmemTranspose32x64B16Movm._rmem_copy_view(top, 16))
+    cute.copy(atom, bottom_view, TmemTranspose32x64B16Movm._rmem_copy_view(bottom, 16))
+    return top, bottom
 
 
 @cute.jit
@@ -138,11 +175,25 @@ def fc2_dedup_bulk_store_function(
     smem_stage = smem_tensor[None, None, stage_idx]
 
     warp_hidden_base = Int32(warp_idx * 32)
-    for token_idx in cutlass.range_constexpr(staged_token_rows):
-        smem_stage[token_row_base + token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]
-
-    cute.arch.fence_proxy("async.shared", space="cta")
-    smem_read_write_bar.arrive_and_wait()
+    if cutlass.const_expr(epi.two_epilogue_warpgroups and _PROBE_FC2_STSM):
+        # m8n8 fragments from fc2_dedup_frag_tmem_acc_load: words 2k / 2k+1 are hidden lanes 0-7 / 8-15, words
+        # 8+2k / 9+2k lanes 16-23 / 24-31, all for tokens 8k..8k+7. STSM.trans stores token rows of 8 hidden (16 B);
+        # lanes 8i..8i+7 address matrix i's rows (tokens 8k + lane % 8, hidden 8i).
+        words = cute.recast_tensor(data_subtile, Int32)
+        row_in_block = lane_idx % Int32(8)
+        hidden_col = warp_hidden_base + (lane_idx // Int32(8)) * Int32(8)
+        for k in cutlass.range_constexpr(4):
+            row = cute.slice_(smem_stage, (token_row_base + Int32(8 * k) + row_in_block, None))
+            stmatrix_x4_trans_b16(
+                row.iterator + hidden_col,
+                Int32(words[2 * k]),
+                Int32(words[2 * k + 1]),
+                Int32(words[8 + 2 * k]),
+                Int32(words[9 + 2 * k]),
+            )
+    else:
+        for token_idx in cutlass.range_constexpr(staged_token_rows):
+            smem_stage[token_row_base + token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]
 
     copy_elems = Int32(epi._EpilogueFc2HiddenTileSize)
     if cutlass.const_expr(epi.fc2_hidden_needs_predicate):
@@ -155,14 +206,49 @@ def fc2_dedup_bulk_store_function(
     else:
         scratch_row = warp_idx * Int32(16) + lane_idx % Int32(16)
     copy_iters: cutlass.Constexpr[int] = fc2_output_router.mapping.domain.axis_size("iter_idx")
-    for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
-        if cutlass.const_expr(epi.two_epilogue_warpgroups):
-            owned_subtile = lane_idx // Int32(8)
-        else:
-            owned_subtile = Int32(ublk_iter_idx * 2) + lane_idx // Int32(16)
-        if owned_subtile == subtile_idx:
-            dst_ptr, kind = fc2_output_router.get_data_dst(ublk_iter_idx)
-            if cutlass.const_expr(_PROBE_FC2_STORE == "all"):
+    if cutlass.const_expr(
+        epi.two_epilogue_warpgroups and not fc2_output_router.reduce_topk_in_kernel and _PROBE_FC2_STG
+    ):
+        # The row owner (lane // 8 == subtile) publishes (destination, kind) in its row's 16 B pad; after the
+        # warpgroup barrier 16 threads per row copy it with LDS.128 + STG.128 (LSU instead of 256 B bulk copies,
+        # whose per-op cost bounds this epilogue). The barrier of the next subtile protects this stage's reuse.
+        if cutlass.const_expr(copy_iters != 1):
+            raise ValueError("The two-warpgroup dedup FC2 store owns one token per thread and tile.")
+        if cutlass.const_expr(cute.size(smem_stage, mode=[1]) != _FC2_STSM_ROW_STRIDE):
+            raise ValueError("The two-warpgroup dedup FC2 store needs padded staging rows (hidden tile + 16 B pad).")
+        pad_offset = Int32(epi._EpilogueFc2HiddenTileSize)
+        if lane_idx // Int32(8) == subtile_idx:
+            dst_ptr, kind = fc2_output_router.get_data_dst(0)
+            pad = cute.slice_(smem_stage, (scratch_row, None)).iterator + pad_offset
+            pad_i64 = cute.make_tensor(cute.recast_ptr(pad, dtype=Int64), cute.make_layout((2,)))
+            pad_i32 = cute.make_tensor(cute.recast_ptr(pad, dtype=Int32), cute.make_layout((4,)))
+            pad_i64[0] = dst_ptr.toint()
+            pad_i32[2] = kind
+        smem_read_write_bar.arrive_and_wait()
+        wg_tid = warp_idx * Int32(32) + lane_idx
+        seg = wg_tid % Int32(16)
+        for row_pass in cutlass.range_constexpr(staged_token_rows // 8):
+            row_ptr = cute.slice_(
+                smem_stage, (token_row_base + Int32(8 * row_pass) + wg_tid // Int32(16), None)
+            ).iterator
+            row_pad = row_ptr + pad_offset
+            row_kind = cute.make_tensor(cute.recast_ptr(row_pad, dtype=Int32), cute.make_layout((4,)))[2]
+            if row_kind != Int32(0):
+                if seg * Int32(16) < copy_bytes:
+                    row_dst = cute.make_tensor(cute.recast_ptr(row_pad, dtype=Int64), cute.make_layout((2,)))[0]
+                    w0, w1, w2, w3 = lds128_v4_b32(row_ptr + seg * Int32(8))
+                    if cutlass.const_expr(not _PROBE_FC2_STG_SKIP):
+                        stg_v4_b32(row_dst + Int64(seg) * Int64(16), w0, w1, w2, w3)
+    else:
+        cute.arch.fence_proxy("async.shared", space="cta")
+        smem_read_write_bar.arrive_and_wait()
+        for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
+            if cutlass.const_expr(epi.two_epilogue_warpgroups):
+                owned_subtile = lane_idx // Int32(8)
+            else:
+                owned_subtile = Int32(ublk_iter_idx * 2) + lane_idx // Int32(16)
+            if owned_subtile == subtile_idx:
+                dst_ptr, kind = fc2_output_router.get_data_dst(ublk_iter_idx)
                 if kind != Int32(0):
                     src_row = cute.slice_(smem_stage, (scratch_row, None))
                     if cutlass.const_expr(fc2_output_router.reduce_topk_in_kernel):
@@ -171,17 +257,11 @@ def fc2_dedup_bulk_store_function(
                         else:
                             cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
                     else:
-                        cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
-            elif cutlass.const_expr(_PROBE_FC2_STORE == "remote_only"):
-                if kind == Int32(1):
-                    cp_async_bulk_s2g(dst_ptr, cute.slice_(smem_stage, (scratch_row, None)).iterator, copy_bytes)
-            elif cutlass.const_expr(_PROBE_FC2_STORE == "local_only"):
-                if kind == Int32(4):
-                    cp_async_bulk_s2g(dst_ptr, cute.slice_(smem_stage, (scratch_row, None)).iterator, copy_bytes)
+                        cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes, evict_first=_PROBE_FC2_EF)
 
-    cute.arch.cp_async_bulk_commit_group()
-    cute.arch.cp_async_bulk_wait_group(epi.fc2_tma_stages - 1, read=True)
-    smem_read_write_bar.arrive_and_wait()
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(epi.fc2_tma_stages - 1, read=True)
+        smem_read_write_bar.arrive_and_wait()
 
 
 class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
@@ -224,15 +304,15 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         if smem_tensor is None:
             raise ValueError("The dedup FC2 epilogue needs the FC2 staging SMEM (fc2_use_bulk).")
         self.smem_tensor = smem_tensor
-        self.process_pipeline = dataclasses.replace(
-            make_fc2_ublk_process_pipeline(
-                combine_format=base.combine_format,
-                cta_token_tile_size=base.cta_tile_n,
-                cta_hidden_tile_size=base.cta_tile_m,
-                split_token_halves=base.two_epilogue_warpgroups,
-            ),
-            store_function=fc2_dedup_bulk_store_function,
+        process_pipeline = make_fc2_ublk_process_pipeline(
+            combine_format=base.combine_format,
+            cta_token_tile_size=base.cta_tile_n,
+            cta_hidden_tile_size=base.cta_tile_m,
+            split_token_halves=base.two_epilogue_warpgroups,
         )
+        if base.two_epilogue_warpgroups and _PROBE_FC2_STSM:
+            process_pipeline = dataclasses.replace(process_pipeline, tmem_acc_load=fc2_dedup_frag_tmem_acc_load)
+        self.process_pipeline = dataclasses.replace(process_pipeline, store_function=fc2_dedup_bulk_store_function)
         self._freeze()
 
     @cute.jit
@@ -332,6 +412,14 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
 
     def _make_fc2_epilogue(self, *args, **kwargs) -> SwapABFc2EpilogueDedup:
         return SwapABFc2EpilogueDedup(self, *args, **kwargs)
+
+    def _make_fc2_single_stage_region(self):
+        region = super()._make_fc2_single_stage_region()
+        if self.fc2_use_tma or not self.two_epilogue_warpgroups or not _PROBE_FC2_STSM:
+            return region
+        # Two warpgroups stage through STSM.trans (fc2_dedup_bulk_store_function): padded token rows whose 16 B
+        # pad (columns 128-135) carries the row's destination for the LSU copy.
+        return dataclasses.replace(region, shape=(region.shape[0], _FC2_STSM_ROW_STRIDE), stride=(_FC2_STSM_ROW_STRIDE, 1))
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         super().__init__(problem_desc, impl_desc)

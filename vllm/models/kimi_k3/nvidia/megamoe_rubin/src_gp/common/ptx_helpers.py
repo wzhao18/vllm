@@ -305,18 +305,27 @@ def cp_async_bulk_s2g(
     source_smem,
     num_bytes,
     *,
+    evict_first: bool = False,
     loc: Optional[ir.Location] = None,
     ip: Optional[ir.InsertionPoint] = None,
 ) -> None:
+    """Bulk SMEM -> global copy; ``evict_first`` stores with the L2 evict-first policy (data read once later)."""
+    operands = [
+        _address_value(destination_gmem, loc=loc, ip=ip),
+        source_smem.toint(loc=loc, ip=ip).ir_value(),
+        num_bytes.ir_value(),
+    ]
+    instruction = "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    constraints = "l,r,r"
+    if evict_first:
+        operands.append(Int64(TmaCacheHintEvictFirst).ir_value())
+        instruction = "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [$0], [$1], $2, $3;"
+        constraints = "l,r,r,l"
     llvm.inline_asm(
         None,
-        [
-            _address_value(destination_gmem, loc=loc, ip=ip),
-            source_smem.toint(loc=loc, ip=ip).ir_value(),
-            num_bytes.ir_value(),
-        ],
-        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
-        "l,r,r",
+        operands,
+        instruction,
+        constraints,
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -390,6 +399,29 @@ def lds128_v4_b32(smem_pointer, *, loc=None, ip=None):
         ip=ip,
     )
     return tuple(Int32(llvm.extractvalue(T.i32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def stmatrix_x4_trans_b16(smem_pointer, word0: Int32, word1: Int32, word2: Int32, word3: Int32, *, loc=None, ip=None):
+    """``stmatrix.sync.aligned.m8n8.x4.trans.shared.b16``: word ``i`` is this thread's m8n8 fragment of matrix ``i``
+    (row ``lane // 4``, columns ``2 * (lane % 4)`` and ``+1``); lanes ``8 i + j`` give the 16-byte row ``j`` address
+    of matrix ``i``, which receives fragment column ``j`` (warp-collective)."""
+    llvm.inline_asm(
+        None,
+        [
+            smem_pointer.toint(loc=loc, ip=ip).ir_value(),
+            word0.ir_value(),
+            word1.ir_value(),
+            word2.ir_value(),
+            word3.ir_value(),
+        ],
+        "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
