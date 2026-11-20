@@ -142,7 +142,7 @@ def x_rec(phase):
 
 def zero_ext(pred) -> None:
     if cutlass.const_expr(ON):
-        for j in cutlass.range_constexpr(96, SLOTS):
+        for j in range(96, SLOTS):
             _st(_addr(j), Int64(0), Int32(pred))
 
 
