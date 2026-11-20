@@ -446,9 +446,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         )
 
     # vLLM-local: CTAs per token row of the fused-RMSNorm reduce (TopkReduce ``norm_split``). One whole-row CTA
-    # (448 threads x 128 registers at hidden 3584) needs an empty SM, so it waits for this grid's CTAs to exit;
-    # quarter-row CTAs fit beside them and the reduce spreads over every SM.
-    reduce_norm_split: ClassVar[int] = 4
+    # (448 threads x 128 registers at hidden 3584) needs an empty SM; the reduce launches when the last CTA of this
+    # grid reaches its tail, when every other CTA has left its SM, while its cells land only an NVLink hop later
+    # (in-step stamps: cells complete 2.7-4.6 us after that point). Whole rows skip the cluster exchange of the
+    # row's sum of squares (~1.1 us in-step after the last cell).
+    reduce_norm_split: ClassVar[int] = 1
 
     @property
     def reduce_acquires_producer_done(self) -> bool:
