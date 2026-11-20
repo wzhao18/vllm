@@ -526,6 +526,7 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             else:
                 stage = stage + Int32(1)
         else:
+            own = Int32(self._mapping.owner_index)  # DIAG V3
             shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
             if shared_id < Int32(0):
                 shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
