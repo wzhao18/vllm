@@ -13,9 +13,12 @@ view of the same weight. Batches with decode or speculative tokens, and
 smaller batches, keep the stock in_proj + conv.
 """
 
+from typing import NamedTuple
+
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 MIN_ROWS = 2048
@@ -103,9 +106,15 @@ class PrefillKdaConvInProj:
         )
 
     def fused(self, qa):
-        """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta)`` for an
-        eager prefill-only batch of at least ``MIN_ROWS`` rows that exports no
-        prefill checkpoint, else None (stock in_proj + conv)."""
+        """``((3, T, P) conv + SiLU q|k|v planes, (T, rest) g|f_a|beta,
+        checkpoint rows)`` for an eager prefill-only batch of at least
+        ``MIN_ROWS`` rows, else None (stock in_proj + conv).
+
+        A step that exports prefill checkpoints (prefix-cache snapshots) stores
+        the raw q|k|v rows before each checkpoint offset as its conv state. The
+        fused GEMM never materializes the raw rows, so its epilogue saves those
+        windows (``CheckpointRows``); the exporter reads them in place of the
+        in_proj output, bit for bit the same rows."""
         gemm = self._gemm
         assert gemm is not None, "PrefillKdaConvInProj.prepare() not run"
         rows = qa.data.shape[0]
@@ -127,12 +136,18 @@ class PrefillKdaConvInProj:
             or m.num_prefills == 0
             or m.num_decodes != 0
             or m.num_spec_decodes != 0
-            # A prefill checkpoint (prefix-cache snapshot) stores the raw
-            # q|k|v inputs before its offset as the conv state; the fused GEMM
-            # never materializes them (the checkpoint exporter would read the
-            # convolved planes as raw rows: wrong state, out-of-bounds rows).
-            or m.checkpoint is not None
         ):
+            return None
+        qsl = m.non_spec_query_start_loc
+        nseq = qsl.numel() - 1
+        ckpt = m.checkpoint
+        if ckpt is not None and (
+            not gemm.supports_checkpoint_halo
+            or ckpt.checkpoint_offsets.numel() != nseq
+            or ckpt.checkpoint_offsets.dtype != torch.int32
+            or not ckpt.checkpoint_offsets.is_contiguous()
+        ):
+            # The exporter needs the raw rows the fused GEMM does not keep.
             return None
         from vllm.model_executor.layers.mamba.mamba_utils import (
             is_conv_state_dim_first,
@@ -144,10 +159,19 @@ class PrefillKdaConvInProj:
         if conv_state.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(f"KDA conv GEMM: conv state dtype {conv_state.dtype}")
         x_scale = qa.scale.view(torch.uint8).reshape(-1)
+        ckpt_rows = None
+        halo = None
+        if ckpt is not None:
+            halo = torch.empty(
+                (nseq, 3, 3 * self.p), dtype=torch.bfloat16, device=qa.data.device
+            )
+            ckpt_rows = CheckpointRows(halo.view(3 * nseq, 3 * self.p), _halo_qsl(ckpt))
         planes, _ = gemm(
-            qa.data, x_scale, conv_state, m.non_spec_query_start_loc,
+            qa.data, x_scale, conv_state, qsl,
             m.non_spec_state_indices_tensor, m.has_initial_state,
             null_block_id=NULL_BLOCK_ID,
+            checkpoint_offsets=ckpt.checkpoint_offsets if ckpt is not None else None,
+            halo=halo,
         )  # fmt: skip
         rest = torch._scaled_mm(
             qa.data,
@@ -156,7 +180,40 @@ class PrefillKdaConvInProj:
             scale_b=self.s_rest.view(torch.float8_e8m0fnu),
             out_dtype=torch.bfloat16,
         )
-        return planes, rest
+        return planes, rest, ckpt_rows
+
+
+class CheckpointRows(NamedTuple):
+    """The pre-conv rows a checkpoint exporter reads, for the fused in_proj:
+    ``raw`` holds sequence ``s``'s three rows before its checkpoint offset at
+    rows ``3 s .. 3 s + 2``; ``qsl`` is the per-sequence start the exporter
+    adds the offset to (``3 s + 3 - offset``), so it reads exactly those."""
+
+    raw: torch.Tensor
+    qsl: torch.Tensor
+
+
+#: (checkpoint metadata, its halo starts): one per step, shared by the layers.
+_HALO_QSL: list = [None, None]
+
+
+def _halo_qsl(ckpt) -> torch.Tensor:
+    if _HALO_QSL[0] is not ckpt:
+        offsets = ckpt.checkpoint_offsets
+        n = offsets.numel()
+        if ckpt.offsets is not None:
+            starts = async_tensor_h2d(
+                [3 * s + 3 - o for s, o in enumerate(ckpt.offsets)],
+                dtype=torch.int32,
+                device=offsets.device,
+            )
+        else:
+            starts = (
+                torch.arange(3, 3 * n + 3, 3, dtype=torch.int32, device=offsets.device)
+                - offsets
+            )
+        _HALO_QSL[0], _HALO_QSL[1] = ckpt, starts
+    return _HALO_QSL[1]
 
 
 def contiguous_rows(x: torch.Tensor) -> torch.Tensor:

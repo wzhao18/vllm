@@ -989,6 +989,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         conv_nsteps: cutlass.Int32 = cutlass.Int32(0),
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
+        conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
+        conv_halo: cutlass.Int64 = cutlass.Int64(0),
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -1388,6 +1390,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             sched_ctr,
             sched_die_map,
             drain_c_tensor,
+            conv_ckpt,
+            conv_halo,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1447,6 +1451,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
         mCg_mnl: Optional[cute.Tensor] = None,
+        conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
+        conv_halo: cutlass.Int64 = cutlass.Int64(0),
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
@@ -2318,7 +2324,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                             mC_mnl.shape[1],
                             (
                                 conv_out, conv_w, conv_side, conv_qsl, conv_norm,
-                                conv_nseq, conv_top, conv_nsteps,
+                                conv_nseq, conv_top, conv_nsteps, conv_ckpt,
+                                conv_halo,
                             ),
                             conv_smem,
                             acc_consumer_state,
@@ -2552,6 +2559,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         sched_ctr: cutlass.Int64 = cutlass.Int64(0),
         sched_die_map: cutlass.Int64 = cutlass.Int64(0),
         mCg_mnl: Optional[cute.Tensor] = None,
+        conv_ckpt: cutlass.Int64 = cutlass.Int64(0),
+        conv_halo: cutlass.Int64 = cutlass.Int64(0),
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2603,6 +2612,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             sched_ctr,
             sched_die_map,
             mCg_mnl,
+            conv_ckpt,
+            conv_halo,
         )
 
     @staticmethod
