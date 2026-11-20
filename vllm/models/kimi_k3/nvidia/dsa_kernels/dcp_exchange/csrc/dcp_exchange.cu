@@ -3311,9 +3311,15 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  // (rows that need the complete body run it in their CTA: v2_complete)
-  if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024>, p));
-  else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T>, p));
+  if (!wide) {  // rows that need the complete body run it in their CTA (v2_complete)
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T>, p));
+    return;
+  }
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024>, p));
+  // the wide variant leaves those rows to the redo kernel (most CTAs exit after the PDL wait)
+  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
+  cfg.blockDim = dim3(kV2T, 1, 1);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

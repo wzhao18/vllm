@@ -1847,7 +1847,13 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params 
   V2_KERNEL_PROLOGUE(T)
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
     const int r = v2_row<true, T>(p, sm, row, -1, bar_phase);
-    if (K31_RARE(r)) v2_complete<T>(p, sm, row, r == 510 ? 0 : r, &bar_phase);
+    // per shape: the 1024-thread variant (r1/r8) keeps topk_v2_redo_kernel (its in-CTA call
+    // measured +0.5 us/call at r8 in-step, x1k2), the 512-thread one runs it in the CTA
+    if constexpr (T < 1024) {
+      if (K31_RARE(r)) v2_complete<T>(p, sm, row, r == 510 ? 0 : r, &bar_phase);
+    } else {
+      if (threadIdx.x == 0) p.redo[row] = r;
+    }
   }
 }
 
