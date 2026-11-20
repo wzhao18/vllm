@@ -84,7 +84,7 @@ BLOCK = 32  # MXFP8 block along K
 #   o_proj 7168 x 3072  R16 4.92 / 4.95, R128 5.84 / 5.13, R256 6.33 / 6.03, R384
 #                       7.54 / 6.26 (= stock's rule: no entry)
 MX_TUNED: dict[tuple[int, int], dict] = {
-    (12448, 7168): {"*": "1-384:pre,385-:scaled_mm"},
+    (12448, 7168): {"*": "1-256:pre,257-:scaled_mm"},
     (7168, 3072): {"*": "1-16:fi_cute,17-384:pre,385-:scaled_mm"},
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
