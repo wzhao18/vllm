@@ -460,6 +460,8 @@ class SparseMlaDecodeTS:
                bs_shift: Int32, lse: Int64):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
+        # DcpValue (PDL) may launch at once: its CTAs take the SMs this grid vacates.
+        cute.arch.griddepcontrol_launch_dependents()
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         smem = cutlass.utils.SmemAllocator()
