@@ -1942,10 +1942,17 @@ def _vp_markov_keys(
     peers_ptr,
     box_offset,
     programs,
+    gathered_ptr,
+    num_reqs,
+    draft_ptr,
+    draft_stride,
+    emb_ptr,
+    w1_ptr,
     SAMPLED: tl.constexpr,
     BLOCK: tl.constexpr,
     TP: tl.constexpr,
     PUBLISH: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     req = tl.program_id(0)
     block = tl.program_id(1)
@@ -2003,6 +2010,28 @@ def _vp_markov_keys(
                 # (plain stores: a remote atomic waits for its reply, four in a row)
                 peer = tl.load(peers_ptr + r) + (box_offset + req) * 8
                 tl.store(peer.to(tl.pointer_type(tl.int64)), final)
+            # The request's select (``_vp_markov_select``, POLL) in the same program:
+            # every rank's key of this position, the draft token, the next position's
+            # markov_w1 row (this position's bias GEMM, the reader of ``emb``, is
+            # complete: its output is this kernel's input).
+            top = _vp_take(gathered_ptr + req)
+            for r in tl.static_range(1, TP):
+                top = tl.maximum(top, _vp_take(gathered_ptr + r * num_reqs + req))
+            drafted = 0x7FFFFFFF - (top & 0x7FFFFFFF)
+            tl.store(draft_ptr + req * draft_stride + step, drafted)
+            rcols = tl.arange(0, RANK)
+            w1row = tl.load(w1_ptr + drafted * RANK + rcols)
+            tl.store(emb_ptr + req * RANK + rcols, w1row)
+
+
+@triton.jit
+def _vp_markov_rows(anchors_ptr, anchor_stride, w1_ptr, emb_ptr, RANK: tl.constexpr):
+    """The first position's markov_w1 rows: emb[req] = w1[anchors[req]] (int32
+    anchors read directly: no int64 cast launch)."""
+    req = tl.program_id(0)
+    token = tl.load(anchors_ptr + req * anchor_stride).to(tl.int64)
+    cols = tl.arange(0, RANK)
+    tl.store(emb_ptr + req * RANK + cols, tl.load(w1_ptr + token * RANK + cols))
 
 
 @triton.jit
@@ -2175,7 +2204,9 @@ class VocabParallelMarkov:
         if draft.shape != (batch, self.steps) or draft.stride(1) != 1:
             raise ValueError(f"Markov drafting: unexpected draft {tuple(draft.shape)}")
         keys, emb = self._buffers(batch)
-        torch.index_select(self.w1, 0, anchors.long(), out=emb)
+        _vp_markov_rows[(batch,)](
+            anchors, anchors.stride(0), self.w1, emb, RANK=self.markov_rank
+        )
         sampled = sampling is not None
         if sampled:
             temperature, seeds, slots, positions, cache = sampling
@@ -2210,11 +2241,20 @@ class VocabParallelMarkov:
                 self.peers[step] if poll else keys,
                 self.rank * self.cap,
                 grid[1],
+                self.box[step] if poll else keys,
+                self.cap,
+                draft,
+                draft.stride(0),
+                emb,
+                self.w1,
                 SAMPLED=sampled,
                 BLOCK=VP_MARKOV_BLOCK,
                 TP=self.tp,
                 PUBLISH=poll,
+                RANK=self.markov_rank,
             )
+            if poll:
+                continue  # (the keys kernel's last programs ran the select)
             _vp_markov_select[(batch,)](
                 self.box[step] if poll else self.gather(keys),
                 keys,
