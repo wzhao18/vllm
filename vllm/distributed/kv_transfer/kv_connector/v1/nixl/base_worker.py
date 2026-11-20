@@ -1266,6 +1266,9 @@ class NixlBaseConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        # [req_id -> [first start, last end]] of its done transfers (NIXL
+        # telemetry clock, us), for the request-level transfer time stat.
+        self._xfer_span_us: dict[ReqId, list[float]] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Replicated-KV PCP ranks > 0 never transfer; requests they are asked
@@ -5298,6 +5301,7 @@ class NixlBaseConnectorWorker:
                     if xfer_state == "DONE":
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        self._note_xfer_span(req_id, res)
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -5325,9 +5329,29 @@ class NixlBaseConnectorWorker:
             if not in_progress:
                 done_req_ids.add(req_id)
                 del transfers[req_id]
+                span = self._xfer_span_us.pop(req_id, None)
+                if span is not None and req_id not in failed_req_ids:
+                    self.xfer_stats.record_request_xfer_wall((span[1] - span[0]) / 1e6)
             else:
                 transfers[req_id] = in_progress
+        for req_id in failed_req_ids:
+            self._xfer_span_us.pop(req_id, None)
         return done_req_ids, failed_req_ids
+
+    def _note_xfer_span(self, req_id: str, res: Any) -> None:
+        """Extend the request's transfer span (first start to last end) by one
+        done transfer; skipped when the telemetry has no start time."""
+        try:
+            start = float(res.startTime)
+            end = start + float(res.xferDuration)
+        except Exception:
+            return
+        span = self._xfer_span_us.get(req_id)
+        if span is None:
+            self._xfer_span_us[req_id] = [start, end]
+        else:
+            span[0] = min(span[0], start)
+            span[1] = max(span[1], end)
 
     def _try_release_xfer_handle(self, req_id: str, handle: int) -> bool:
         """Release a handle, returning False if the caller must retain it."""
@@ -6137,6 +6161,7 @@ class NixlBaseConnectorWorker:
 
     def _finish_shutdown(self) -> None:
         self._recving_transfers.clear()
+        self._xfer_span_us.clear()
         try:
             self._release_local_xfer_handles()
         except Exception:
@@ -6169,4 +6194,5 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        self._xfer_span_us.clear()
         self._finish_shutdown()
