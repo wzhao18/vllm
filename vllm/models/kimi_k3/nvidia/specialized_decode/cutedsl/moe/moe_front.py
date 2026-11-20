@@ -290,6 +290,9 @@ __global__ void __maxnreg__(96)  // launched with kThreads
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
     for (int j = 0; j < nk; ++j) {
       const int i = nt + j, slot = i % p.ns;
+      // The slot's previous item may be a weight block (TMEM fill warp): wait until it
+      // is consumed so the parity below names item i's phase, not an older one.
+      if (i >= p.ns && i - p.ns < nt) mbar_wait(trdy0 + 8 * (i - p.ns), 0);
       mbar_wait(full0 + 8 * slot, (i / p.ns) & 1);
       if (j < nt) {
         mbar_wait(trdy0 + 8 * j, 0);
