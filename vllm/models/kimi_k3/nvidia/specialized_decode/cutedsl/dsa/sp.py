@@ -88,11 +88,7 @@ SP_PARTIALS = PROJECTED
 #   MlaQuery 17.2  17.4  23.7  32.3  33.4  52.5  72.4  93.1
 #   Local    26.7  26.4  30.2  25.2  29.0  30.9  36.9  44.2
 # NQ-TUNE: 17-64 rows in-step (the publish and QueryWait the local query also saves).
-# Off at every R until dsa.query_uk is fixed: in the first block run after other
-# kernels (or a graph capture) it intermittently writes wrong q_pe bytes of row tile
-# 1 for a few heads on one rank, with its inputs bit-identical (the SP DSA block
-# test's replay check, INFRA 2026-11-20). Was "65-:local".
-SP_LOCAL_QUERY = ""
+SP_LOCAL_QUERY = "65-:local"
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere): the
 # Rubin keys-on-M kernel ("km", dsa.sparse_mla_km: softmax groups correct O^T and
 # write the latent, QK and PV from separate warps, all-TMA gathers; one row per

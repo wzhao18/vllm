@@ -143,9 +143,12 @@ class QueryUK:
         bm = tensormap.encode_map(uk_t, bf, (QK_NOPE, LATENT, self.gathered),
                                   (QK_NOPE * 2, LATENT * QK_NOPE * 2), (64, 256, 1),
                                   sw, l2)
+        # No PDL: launched early beside its predecessor (the q_b projection), its q_pe
+        # epilogue intermittently read stale stage-1 SMEM in the SP DSA block (wrong
+        # q_pe bytes of row tile 1; INFRA 2026-11-20).
         self.kernel(am, bm, q, out, scale).launch(
             grid=(2 * self.gathered, 1, 1), block=(THREADS, 1, 1), stream=stream,
-            use_pdl=True)
+            use_pdl=False)
 
     @cute.kernel
     def kernel(self, am: tensormap.GridMap, bm: tensormap.GridMap, q: Int64,
