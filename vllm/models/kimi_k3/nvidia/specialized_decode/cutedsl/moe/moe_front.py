@@ -625,7 +625,23 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   __syncthreads();
   {
     // Split-K reduce of token rows [t0, t1) of this tile, partials in rank order.
-    const int t0 = tsplit * n / p.ks, t1 = (tsplit + 1) * n / p.ks;
+    // Latent tiles: the plan puts the top-k rows the router items cannot host (rows
+    // rtiles * ks ..) on latent splits 0, 1, .. of the latent tiles, tile-major
+    // round robin; those CTAs select their row and stage nothing, the tile's other
+    // splits stage its n rows (staging is latency-bound: a few rows more cost little).
+    int t0 = tsplit * n / p.ks, t1 = (tsplit + 1) * n / p.ks;
+    if (!dry && ttile >= p.rtiles) {
+      const int nl = max(0, n - p.rtiles * p.ks), lt = ttile - p.rtiles;
+      const int ltiles = p.tiles - p.rtiles;
+      const int hosts = nl > lt ? (nl - lt + ltiles - 1) / ltiles : 0;
+      if (tsplit < hosts) {
+        t0 = t1 = 0;
+      } else {
+        const int idx = tsplit - hosts, mm = p.ks - hosts;
+        t0 = idx * n / mm;
+        t1 = (idx + 1) * n / mm;
+      }
+    }
     const float* pt = p.part + int64_t{ttile} * p.ks * n * 128;
     const int64_t stride = int64_t{n} * 128;
     // Router tiles: the top-k CTA of each row sums its logits itself (below).
@@ -1061,7 +1077,7 @@ _CHUNK_SLOTS = (2 << 20) // _SLOT  # tiles per 2 MiB chunk (the die homing unit)
 
 
 @functools.cache
-def _front_plan(device: int, items: int, item_slots: tuple, router_items: int) -> tuple:
+def _front_plan(device: int, items: int, item_slots: tuple, router_items: int, ks: int) -> tuple:
     """(plan, split item, die-0 chunks, die-1 chunks): every SM's work item, the die-0
     SMs taking items [0, split) and the die-1 SMs the rest (one CTA per SM), every SM's
     top-k row (router items first, then latent items, spare SMs last: they stay
@@ -1084,8 +1100,12 @@ def _front_plan(device: int, items: int, item_slots: tuple, router_items: int) -
         plan[s] = split + i
     sms = [s for s, d in enumerate(table) if d >= 0]
     item = {s: int(plan[s]) for s in sms}
+    # Rows: router items first, then latent items split-major (split 0 of every latent
+    # tile, then split 1, ..): at most a couple of row hosts per latent tile, which stage
+    # nothing (the kernel gives their staging rows to the tile's other splits).
     order = sorted(sms, key=lambda s: (
-        0 if 0 <= item[s] < router_items else 2 if item[s] < 0 else 1, item[s]))
+        0 if 0 <= item[s] < router_items else 2 if item[s] < 0 else 1,
+        item[s] if item[s] < router_items else (item[s] % ks, item[s] // ks)))
     plan[_MAX_SMID : 2 * _MAX_SMID] = _MAX_SMID
     for r, s in enumerate(order):
         plan[_MAX_SMID + s] = r
@@ -1117,7 +1137,7 @@ def front_image(
     )
     dev = packed.device.index or 0
     plan, split, chunks0, chunks1 = _front_plan(
-        dev, tiles * ks, item_slots, num_logits // 128 * ks
+        dev, tiles * ks, item_slots, num_logits // 128 * ks, ks
     )
     flat = pack_weight(packed).view(torch.uint8).view(-1, _SLOT)
     slots0 = sum(item_slots[:split])
