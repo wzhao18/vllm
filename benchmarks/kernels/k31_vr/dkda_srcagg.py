@@ -34,7 +34,7 @@ for r in csv.reader(open(sys.argv[1])):
     if hdr is None or len(r) <= ii:
         continue
     if r[0].strip().isdigit():
-        cur = fn(int(r[0])) if cur_file == "flow.py" else cur_file
+        cur = fn(int(r[0])) if cur_file == sys.argv[2].rsplit("/", 1)[-1] else cur_file
         continue
     if r[2].startswith("0x"):
         a = agg[cur]
