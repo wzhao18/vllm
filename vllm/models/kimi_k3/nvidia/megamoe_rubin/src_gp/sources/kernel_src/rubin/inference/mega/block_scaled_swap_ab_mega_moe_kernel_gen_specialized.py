@@ -1298,7 +1298,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
     # ------------------------------------------------------------------
 
     # Total across all clusters, issued once the payload flag is seen (see profiles/NOTES.md).
-    l2_prefetch_budget_bytes: ClassVar[int] = 64 << 20
+    # Off: the burst lands in the dispatch's refine window and competes with its round trips.
+    l2_prefetch_budget_bytes: ClassVar[int] = 0
     l2_prefetch_chunk_bytes: ClassVar[int] = 16384
     # TMA-A arrives once per work tile it takes; the scheduler claims unit j only after
     # TMA-A has taken unit j - 1, so claims follow the order units start in.
