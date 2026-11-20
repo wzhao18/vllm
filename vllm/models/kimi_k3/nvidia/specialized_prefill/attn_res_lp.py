@@ -1,0 +1,302 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Kimi K3.1 prefill AttnRes with precomputed block logits.
+
+Every AttnRes call c mixes the completed block rows v_b and the prefix source
+u with softmax weights over s = (v . w_c) * rsqrt(mean(v^2) + eps). For a
+block row both factors are fixed once the block is written: its RMS factor
+(stored by the writing call) and its dot with the static per-call query w_c.
+So when block b is written, one tensor-core GEMM computes v_b . w_c for every
+later call of the forward; the per-call kernel (attn_res_lp.cu) then reads n
+scalars per token instead of reducing every block row again, and streams the
+block rows as a plain weighted sum. Per call only the prefix source needs a
+row reduction, so the per-source compute no longer grows with depth.
+
+Exactness: w_c = norm_w * qk_w (two BF16) has at most 16 significant bits, so
+w_c = hi + lo with hi, lo BF16 exactly (checked at plan build); the GEMM's
+BF16 x BF16 products are exact and accumulate in FP32 like the stock kernel
+(only the summation order differs).
+
+Lifecycle: the model calls :func:`begin` with the forward's block buffer at
+the start of a prefill forward; every AttnRes call of that forward then goes
+through :func:`attn_res` with its call index (layer l: 2 l pre-attention,
+2 l + 1 post-attention; the final AttnRes: 2 * num_layers).
+"""
+
+import hashlib
+import os
+import threading
+
+import torch
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+
+from . import attn_res_dielocal, attn_res_mxfp8
+
+logger = init_logger(__name__)
+
+HIDDEN = 7168
+MAX_BLOCKS = 8
+MXFP8_BLOCK = 32
+# Per-warp row ring depth and token groups per CTA, measured on the 93-layer
+# F16K die-local call sequence (VR200): G3 d2/d3/d4 27.71/27.21/28.0 ms,
+# G4 d2/d3 25.85/25.97 ms, G5 d2 28.2 and G6 d2 33.3 ms (register spills).
+RING_DEPTH = 2
+GROUPS = 4
+VEC = 8  # BF16 per lane chunk (4 warps per token group; 4 -> 8 warps)
+_SRC = os.path.join(os.path.dirname(__file__), "attn_res_lp.cu")
+_lock = threading.Lock()
+_mod: dict[tuple, object] = {}
+
+
+def _module(probe: int = 0, vec: int = 8, groups: int = 4):
+    """``probe`` != 0: a probe build of the kernel (bench only)."""
+    key = (probe, vec, groups)
+    if key in _mod:
+        return _mod[key]
+    with _lock:
+        if key not in _mod:
+            from torch.utils.cpp_extension import load
+
+            import vllm.envs as envs
+
+            h = hashlib.sha256()
+            with open(_SRC, "rb") as fh:
+                h.update(fh.read())
+            h.update(f"{torch.__version__} {torch.version.cuda}".encode())
+            h.update(f"{probe} {vec} {groups}".encode())
+            tag = h.hexdigest()[:16]
+            build = os.path.join(envs.VLLM_CACHE_ROOT, "k31pf_attn_res_lp", tag)
+            os.makedirs(build, exist_ok=True)
+            _mod[key] = (
+                load(
+                    name=f"k31pf_attn_res_lp_{tag}",
+                    sources=[_SRC],
+                    extra_cflags=["-O3"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        f"-DK31LP_PROBE={probe}",
+                        f"-DK31LP_VEC={vec}",
+                        f"-DK31LP_G={groups}",
+                        "--use_fast_math",
+                        "--expt-relaxed-constexpr",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                        "-U__CUDA_NO_HALF2_OPERATORS__",
+                        "-gencode",
+                        "arch=compute_100f,code=sm_100f",
+                    ],
+                    build_directory=build,
+                    verbose=False,
+                )
+            )
+    return _mod[key]
+
+
+use_for = attn_res_mxfp8.use_for
+
+
+class Plan:
+    """Static per-model tables: the FP32 query of every AttnRes call and,
+    per block, the BF16 hi/lo query rows of the calls after its write."""
+
+    def __init__(
+        self,
+        weights: list[tuple[torch.Tensor, torch.Tensor]],
+        eps: list[float],
+        block_size: int,
+        num_blocks: int,
+    ):
+        if len(set(eps)) != 1:
+            raise ValueError(f"attn_res_lp: AttnRes eps differ across calls {set(eps)}")
+        if num_blocks > MAX_BLOCKS:
+            raise ValueError(f"attn_res_lp: {num_blocks} blocks > {MAX_BLOCKS}")
+        self.eps = eps[0]
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+        self.num_calls = len(weights)
+        w32 = torch.stack(
+            [nw.float() * qw.float() for nw, qw in weights]
+        ).contiguous()
+        hi = w32.bfloat16()
+        lo = (w32 - hi.float()).bfloat16()
+        if not torch.equal(hi.float() + lo.float(), w32):
+            raise ValueError("attn_res_lp: AttnRes query is not BF16 hi + lo exact")
+        self.w32 = w32
+        # Block b is written by call 2 * block_size * b (pre-attention of
+        # layer block_size * b) and read by every later call.
+        self.first_call = [2 * block_size * b + 1 for b in range(num_blocks)]
+        self.wcat = []
+        for b in range(num_blocks):
+            c0 = self.first_call[b]
+            self.wcat.append(torch.cat([hi[c0:], lo[c0:]]).contiguous())
+
+    def calls_after(self, b: int) -> int:
+        return self.num_calls - self.first_call[b]
+
+
+class _Forward:
+    def __init__(self, plan: Plan, blocks: torch.Tensor):
+        self.plan = plan
+        self.blocks = blocks
+        self.ptr = blocks.data_ptr()
+        self.tokens = blocks.shape[0]
+        self.rstd = torch.empty(
+            (MAX_BLOCKS, self.tokens), dtype=torch.float32, device=blocks.device
+        )
+        self.logits: list[torch.Tensor | None] = [None] * plan.num_blocks
+
+
+_state: list[_Forward | None] = [None]
+_claims: dict[int, torch.Tensor] = {}
+
+
+def _schedule_args(blocks: torch.Tensor):
+    """(sm_die, claim): die-aware token claims when ``blocks`` is the
+    die-local block buffer, else plain claims (sm_die None)."""
+    sm_die, claim = attn_res_dielocal.kernel_args(blocks)
+    if claim is not None:
+        return sm_die, claim
+    dev = blocks.device.index
+    claim = _claims.get(dev)
+    if claim is None:
+        claim = _claims[dev] = torch.zeros(4, dtype=torch.int32, device=blocks.device)
+    return None, claim
+
+
+def begin(plan: Plan, blocks: torch.Tensor) -> None:
+    """Start a prefill forward whose AttnRes block buffer is ``blocks``."""
+    _state[0] = _Forward(plan, blocks)
+    logger.info_once(
+        "Kimi K3.1 prefill AttnRes: precomputed block logits (attn_res_lp, "
+        "%d calls, %d blocks, die-aware claims: %s)",
+        plan.num_calls, plan.num_blocks,
+        attn_res_dielocal.kernel_args(blocks)[0] is not None,
+    )
+
+
+def active(blocks: torch.Tensor, prefix: torch.Tensor) -> bool:
+    """A planned prefill forward owns this AttnRes call's block buffer."""
+    st = _state[0]
+    return (
+        st is not None
+        and st.ptr == blocks.data_ptr()
+        and st.tokens == prefix.shape[0]
+    )
+
+
+def _forward_for(blocks: torch.Tensor, rows: int) -> _Forward:
+    st = _state[0]
+    if st is None or st.ptr != blocks.data_ptr() or st.tokens != rows:
+        raise RuntimeError(
+            "attn_res_lp: AttnRes call outside the prefill forward it was "
+            "planned for (begin() not called with this block buffer)"
+        )
+    return st
+
+
+def attn_res(
+    prefix: torch.Tensor,
+    delta: torch.Tensor | None,
+    blocks: torch.Tensor,
+    call: int,
+    num_blocks: int,
+    block_write_idx: int,
+    output_norm_weight: torch.Tensor | None,
+    output_norm_eps: float,
+    bf16_out: bool,
+    quant_out: bool,
+    prefix_out: torch.Tensor | None = None,
+    local_out: bool = True,
+    _probe: int = 0,
+    _vec: int | None = None,
+    _groups: int | None = None,
+    _stamps: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, QuantizedActivation | None]:
+    """AttnRes call ``call`` of the current prefill forward. Returns the BF16
+    output (``bf16_out``) and the MXFP8 activation (``quant_out``)."""
+    rows = prefix.shape[0]
+    st = _forward_for(blocks, rows)
+    plan = st.plan
+    lp = []
+    for i in range(num_blocks):
+        lg = st.logits[i]
+        if lg is None:
+            raise RuntimeError(f"attn_res_lp: block {i} read before its write")
+        row = call - plan.first_call[i]
+        n_after = plan.calls_after(i)
+        if not 0 <= row < n_after:
+            raise RuntimeError(f"attn_res_lp: call {call} has no logits of block {i}")
+        base = lg.data_ptr()
+        lp += [base + row * rows * 4, base + (n_after + row) * rows * 4]
+    lptr = torch.tensor(lp or [0, 0], dtype=torch.int64)
+    # local_out: outputs consumed within the layer (every call but the final
+    # one, whose output leaves the model) go to die-local rotating buffers,
+    # written by the SMs of their token's die.
+    local_out = local_out and call != plan.num_calls - 1
+    out = q = sf = None
+    if bf16_out:
+        if local_out:
+            out = attn_res_dielocal.out_buffer(blocks, "bf16", rows)
+        if out is None:
+            out = torch.empty_like(prefix)
+    if quant_out:
+        if local_out:
+            q = attn_res_dielocal.out_buffer(blocks, "fp8", rows)
+        if q is None:
+            q = torch.empty((rows, HIDDEN), dtype=torch.float8_e4m3fn, device=prefix.device)
+        sf = torch.empty(
+            (max(rows, 1) + 127) // 128 * 128 * (HIDDEN // MXFP8_BLOCK),
+            dtype=torch.uint8,
+            device=prefix.device,
+        )
+        if rows % 128:
+            # Scale rows past `rows` (last 128-row tile) are zero, as
+            # mxfp8_quantize writes them; the kernel fills the real rows.
+            sf.view(-1, 128 * (HIDDEN // MXFP8_BLOCK))[-1].zero_()
+    _module(
+        _probe, VEC if _vec is None else _vec, GROUPS if _groups is None else _groups
+    ).attn_res_lp(
+        prefix,
+        prefix_out,
+        delta,
+        blocks,
+        plan.w32[call],
+        output_norm_weight,
+        lptr,
+        st.rstd,
+        num_blocks,
+        block_write_idx,
+        float(plan.eps),
+        float(output_norm_eps),
+        out,
+        None if q is None else q.view(torch.uint8),
+        sf,
+        RING_DEPTH,
+        *_schedule_args(blocks),
+        _stamps,
+    )
+    if call == plan.num_calls - 1:
+        # The final AttnRes is the forward's last reader of the plan state.
+        _state[0] = None
+    elif block_write_idx >= 0 and plan.calls_after(block_write_idx) > 0:
+        # v_b . w_c for every later call c: [2 * calls_after, rows] FP32
+        # (hi rows, then lo rows).
+        st.logits[block_write_idx] = torch.mm(
+            plan.wcat[block_write_idx],
+            blocks[:, block_write_idx].t(),
+            out_dtype=torch.float32,
+        )
+    qa = None
+    if quant_out:
+        qa = QuantizedActivation(
+            data=q,
+            scale=sf,
+            orig_dtype=prefix.dtype,
+            orig_shape=torch.Size((rows, HIDDEN)),
+            quant_key=kMxfp8Dynamic,
+        )
+    return out, qa
