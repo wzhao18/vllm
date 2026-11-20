@@ -385,13 +385,14 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                     else {}
                 ),
                 # Combine dedup: the dedup FC2 epilogue scatters rows into the local order buffer
-                # [T, R, chunks_per_row, K, chunk] whose geometry TokenCommDedup owns.
+                # [T, R, chunks_per_row, K, chunk_size(c)] whose geometry TokenCommDedup owns.
                 **(
                     {
                         "dedup_world_size": self.world_size,
                         "dedup_topk": self.topk,
                         "dedup_chunk_bytes": self.token_comm.order_chunk_bytes,
                         "dedup_chunks_per_row": self.token_comm.order_chunks_per_row,
+                        "dedup_row_bytes": self.token_comm.order_row_bytes,
                     }
                     if self.combine_dedup
                     else {}
