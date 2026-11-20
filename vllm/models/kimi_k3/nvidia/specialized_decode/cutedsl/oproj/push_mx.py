@@ -111,7 +111,7 @@ class OprojPushMx:
 
     def __init__(self, k: int, rows_max: int, tp: int, cap: int, *, kt: int = 128,
                  stages: int = 8, iw: int = 1, ix: int = 1, prefetch: bool = False,
-                 ksplit: int = 1):  # fmt: skip
+                 ksplit: int = 1, debug: int = 0):  # fmt: skip
         ktiles = k // kt // ksplit
         tblocks = -(-rows_max // MMA_N)
         # ksplit 2: the two K halves of a (feature, token) block are two pairs of one
@@ -124,6 +124,8 @@ class OprojPushMx:
         self.k, self.tp, self.cap = k, tp, cap
         self.kt, self.stages, self.ktiles, self.ksplit = kt, stages, ktiles, ksplit
         self.iw, self.ix, self.prefetch = iw, ix, prefetch
+        # bench only: 1 no MMAs, 2 no activation (B) loads, 4 no weight (A) loads
+        self.debug = debug
         self.x_warp = TMA_WARP + iw
         self.threads = 32 * (TMA_WARP + iw + ix)
         self.mblocks = WIDTH // FEATURES
@@ -200,9 +202,10 @@ class OprojPushMx:
             sm100_utils.cluster_shape_to_tma_atom_SFB(cs, mma.thr_id), sfb, sfb_one,
             self.tiler_sfb, mma_sfb, pair_sfb_vmnk.shape, internal_type=cutlass.Int16,
         )  # fmt: skip
+        dbg = self.debug
         self.tx_bytes = 2 * (
-            cute.size_in_bytes(fp8, a_one) + cute.size_in_bytes(fp8, b_one)
-            + cute.size_in_bytes(sf_t, sfa_one) + cute.size_in_bytes(sf_t, sfb_one)
+            (0 if dbg & 4 else cute.size_in_bytes(fp8, a_one) + cute.size_in_bytes(sf_t, sfa_one))
+            + (0 if dbg & 2 else cute.size_in_bytes(fp8, b_one) + cute.size_in_bytes(sf_t, sfb_one))
         )  # fmt: skip
 
         @cute.struct
@@ -353,10 +356,11 @@ class OprojPushMx:
                 kk = k0 + (t + rot) % self.ktiles
                 ab.producer_acquire(prod)
                 bar = ab.producer_get_barrier(prod)
-                cute.copy(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)],
-                          tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
-                cute.copy(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)],
-                          tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
+                if cutlass.const_expr(not self.debug & 4):
+                    cute.copy(tma_a, gA_s[(None, kk)], tAsA[(None, prod.index)],
+                              tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
+                    cute.copy(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)],
+                              tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
                 if cutlass.const_expr(self.prefetch):
                     if t == self.stages - 1:
                         self._prefetch(w_addr, sfw_addr, mb, v)
@@ -382,10 +386,11 @@ class OprojPushMx:
                 # same slot as the weight warp; only the weight warp arrives (expect_tx)
                 ab.sync_object_empty.wait(xs.index, xs.phase)
                 bar = ab.producer_get_barrier(xs)
-                cute.copy(tma_b, gB_s[(None, kk)], tBsB[(None, xs.index)],
-                          tma_bar_ptr=bar, mcast_mask=b_mask)  # fmt: skip
-                cute.copy(tma_sfb, tBgSFB[(None, tb, kk, 0)], tBsSFB[(None, xs.index)],
-                          tma_bar_ptr=bar, mcast_mask=sfb_mask)  # fmt: skip
+                if cutlass.const_expr(not self.debug & 2):
+                    cute.copy(tma_b, gB_s[(None, kk)], tBsB[(None, xs.index)],
+                              tma_bar_ptr=bar, mcast_mask=b_mask)  # fmt: skip
+                    cute.copy(tma_sfb, tBgSFB[(None, tb, kk, 0)], tBsSFB[(None, xs.index)],
+                              tma_bar_ptr=bar, mcast_mask=sfb_mask)  # fmt: skip
                 for _ in cutlass.range_constexpr(self.ix):
                     xs.advance()
 
@@ -413,7 +418,7 @@ class OprojPushMx:
                         ab.consumer_wait(cons)
                         cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, s)], s2t_a[2])
                         cute.copy(s2t_b[0], s2t_b[1][(None, None, None, None, s)], s2t_b[2])
-                        for kb in cutlass.range_constexpr(nkb):
+                        for kb in cutlass.range_constexpr(0 if self.debug & 1 else nkb):
                             if cutlass.const_expr(s == 0 and kb == 0):
                                 mma.set(tcgen05.Field.ACCUMULATE, tt != 0)
                             else:
