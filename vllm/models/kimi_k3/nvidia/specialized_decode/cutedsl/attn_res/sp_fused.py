@@ -44,7 +44,7 @@ from cutlass import Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common import mx_rows
-from ..common.host import architecture, dynamic_fake, fake, prepare_shared_carveout
+from ..common.host import architecture, dynamic_fake, fake
 from ..common.mailbox import poll, rearm
 from ..common.primitives import at, launch, load_words, store_relaxed
 from ..common.sp_comm import positive_zero32
@@ -280,10 +280,6 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
         RESIDENCY["reduce", nb, gather_mx, out_mx] = _check_clusters(
             code, device, n_max, "SP reduce-scatter + AttnRes"
         )
-        # The next kernel (the router | latent down GEMM) streams its weights before
-        # its dependency wait; its CTAs can only land beside this one if the SM keeps
-        # the full shared-memory carve-out (CuTe's launcher drops the preference).
-        code = prepare_shared_carveout(code, device, 100)
     return code
 
 
