@@ -969,6 +969,106 @@ def test_select_ucx_net_devices(monkeypatch, gpu, expected):
     assert os.environ["UCX_NET_DEVICES"] == expected
 
 
+# VR200 xdr node (topo -m + sysfs, hecate0142): GPU0/1 and the 800G NICs
+# mlx5_0/1/2/5 on NUMA 0, GPU2/3 and mlx5_6/7/8/11 on NUMA 1, plus 400G
+# front-end ports and a DOWN port.
+_VR_GPUS = {
+    "0002:81:00.0": 0,
+    "0002:c1:00.0": 0,
+    "000a:81:00.0": 1,
+    "000a:e1:00.0": 1,
+}
+_VR_NICS = {
+    "mlx5_0": ("0001:03:00.0", 0, 800, "4: ACTIVE"),
+    "mlx5_1": ("0003:01:00.0", 0, 800, "4: ACTIVE"),
+    "mlx5_2": ("0004:03:00.0", 0, 800, "4: ACTIVE"),
+    "mlx5_3": ("0005:01:00.0", 0, 400, "4: ACTIVE"),
+    "mlx5_4": ("0005:01:00.1", 0, 400, "1: DOWN"),
+    "mlx5_5": ("0006:01:00.0", 0, 800, "4: ACTIVE"),
+    "mlx5_6": ("0009:03:00.0", 1, 800, "4: ACTIVE"),
+    "mlx5_7": ("000b:01:00.0", 1, 800, "4: ACTIVE"),
+    "mlx5_8": ("000c:03:00.0", 1, 800, "4: ACTIVE"),
+    "mlx5_9": ("000d:01:00.0", 1, 400, "4: ACTIVE"),
+    "mlx5_11": ("000e:01:00.0", 1, 800, "4: ACTIVE"),
+}
+
+
+def _vr_sysfs(root):
+    pci = root / "bus/pci/devices"
+    for addr, numa in _VR_GPUS.items():
+        (pci / addr).mkdir(parents=True)
+        attrs = {"vendor": "0x10de", "class": "0x030200", "numa_node": numa}
+        for name, val in attrs.items():
+            (pci / addr / name).write_text(f"{val}\n")
+    for dev, (addr, numa, rate, state) in _VR_NICS.items():
+        (pci / addr).mkdir(parents=True)
+        attrs = {"vendor": "0x15b3", "class": "0x020700", "numa_node": numa}
+        for name, val in attrs.items():
+            (pci / addr / name).write_text(f"{val}\n")
+        port = root / "class/infiniband" / dev / "ports/1"
+        port.mkdir(parents=True)
+        (port / "state").write_text(f"{state}\n")
+        (port / "rate").write_text(f"{rate} Gb/sec (4X XDR)\n")
+        (root / "class/infiniband" / dev / "device").symlink_to(pci / addr)
+    return str(root)
+
+
+@pytest.mark.parametrize(
+    "spec", ["numa", "numa:mlx5_0,mlx5_1,mlx5_2,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_11"]
+)
+@pytest.mark.parametrize(
+    "gpu_pci,expected",
+    [
+        ("0002:81:00.0", "mlx5_0:1,mlx5_1:1"),
+        ("0002:c1:00.0", "mlx5_2:1,mlx5_5:1"),
+        ("000a:81:00.0", "mlx5_6:1,mlx5_7:1"),
+        ("000a:e1:00.0", "mlx5_8:1,mlx5_11:1"),
+    ],
+)
+def test_numa_local_ucx_net_devices(monkeypatch, tmp_path, spec, gpu_pci, expected):
+    """Every GPU gets two NICs of its own NUMA node (the production map paired
+    each GPU with a cross-socket NIC, which carried no bytes) and one rail per
+    NIC plane, so a READ stripes over both 800G NICs."""
+    import os
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    monkeypatch.setenv("UCX_NET_DEVICES", "inherited")
+    monkeypatch.delenv("UCX_MAX_RNDV_RAILS", raising=False)
+    NixlConnectorWorker._select_numa_local_ucx_net_devices(
+        spec, gpu_pci=gpu_pci, sysfs=_vr_sysfs(tmp_path)
+    )
+    assert os.environ["UCX_NET_DEVICES"] == expected
+    assert os.environ.pop("UCX_MAX_RNDV_RAILS") == "4"
+
+
+def test_numa_local_ucx_net_devices_keeps_explicit_rails_and_unknown_gpu(
+    monkeypatch, tmp_path
+):
+    import os
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    sysfs = _vr_sysfs(tmp_path)
+    monkeypatch.setenv("UCX_NET_DEVICES", "inherited")
+    monkeypatch.setenv("UCX_MAX_RNDV_RAILS", "2")
+    NixlConnectorWorker._select_numa_local_ucx_net_devices(
+        "numa", gpu_pci="000a:e1:00.0", sysfs=sysfs
+    )
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_8:1,mlx5_11:1"
+    assert os.environ["UCX_MAX_RNDV_RAILS"] == "2"
+
+    monkeypatch.setenv("UCX_NET_DEVICES", "inherited")
+    NixlConnectorWorker._select_numa_local_ucx_net_devices(
+        "numa", gpu_pci="0003:00:00.0", sysfs=sysfs
+    )
+    assert os.environ["UCX_NET_DEVICES"] == "inherited"
+
+
 def test_select_ucx_net_devices_plus_separator(monkeypatch):
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,

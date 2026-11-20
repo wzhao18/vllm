@@ -3891,6 +3891,9 @@ class NixlBaseConnectorWorker:
         process per attention-DP rank, still maps to its own NUMA-local NICs."""
         if not spec:
             return
+        if spec.strip().startswith("numa"):
+            NixlBaseConnectorWorker._select_numa_local_ucx_net_devices(spec)
+            return
         if gpu is None:
             gpu = torch.accelerator.current_device_index()
             with contextlib.suppress(Exception):
@@ -3903,6 +3906,93 @@ class NixlBaseConnectorWorker:
                 os.environ["UCX_NET_DEVICES"] = devices
                 logger.info("NIXL: UCX_NET_DEVICES=%s for local GPU %d", devices, gpu)
                 return
+
+    @staticmethod
+    def _select_numa_local_ucx_net_devices(
+        spec: str, gpu_pci: str | None = None, sysfs: str = "/sys"
+    ) -> None:
+        """``spec`` = ``numa[:<dev>,<dev>,...]``: give this rank's GPU an equal
+        share of the ACTIVE RDMA devices on its NUMA node (candidates: the
+        listed devices, else the fastest ones), split in PCI order among the
+        node's GPUs on that NUMA node, and one rendezvous rail per device plane
+        (UCX_MAX_RNDV_RAILS, unless set).
+
+        GPUDirect READs only use NICs on the GPU's NUMA node (VR200: the GPUs
+        reach every NIC through the CPU; a cross-socket NIC carried no bytes):
+        a GPU paired with a cross-socket NIC moves at one NIC's rate, and two
+        rails only cover the two planes of one 800G NIC."""
+        if gpu_pci is None:
+            try:
+                p = torch.cuda.get_device_properties(
+                    torch.accelerator.current_device_index()
+                )
+                dom, bus, dev = p.pci_domain_id, p.pci_bus_id, p.pci_device_id
+                gpu_pci = f"{dom:04x}:{bus:02x}:{dev:02x}.0"
+            except Exception as e:
+                logger.warning("NIXL: no PCI address for this GPU (%r)", e)
+                return
+
+        def text(path: str) -> str:
+            try:
+                with open(path) as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+
+        def numa_of(path: str) -> int:
+            return int(text(f"{path}/numa_node") or -1)
+
+        pci = f"{sysfs}/bus/pci/devices"
+        ib = f"{sysfs}/class/infiniband"
+        numa = numa_of(f"{pci}/{gpu_pci}")
+        gpus = sorted(
+            d
+            for d in (os.listdir(pci) if os.path.isdir(pci) else [])
+            if text(f"{pci}/{d}/vendor") == "0x10de"
+            and text(f"{pci}/{d}/class").startswith("0x03")
+            and numa_of(f"{pci}/{d}") == numa
+        )
+        nics = {}  # device -> (PCI address, port-1 rate)
+        for dev in sorted(os.listdir(ib)) if os.path.isdir(ib) else []:
+            if "ACTIVE" in text(f"{ib}/{dev}/ports/1/state") and (
+                numa_of(f"{ib}/{dev}/device") == numa
+            ):
+                rate = text(f"{ib}/{dev}/ports/1/rate").split(" ")[0] or "0"
+                addr = os.path.basename(os.path.realpath(f"{ib}/{dev}/device"))
+                nics[dev] = (addr, float(rate))
+        listed = [
+            d.split(":")[0]
+            for d in spec.partition(":")[2].replace("+", ",").split(",")
+            if d.strip()
+        ]
+        top = max((r for _, r in nics.values()), default=0.0)
+        local = sorted(
+            (d for d in nics if (d in listed if listed else nics[d][1] == top)),
+            key=lambda d: nics[d][0],
+        )
+        if numa < 0 or gpu_pci not in gpus or not local:
+            logger.warning(
+                "NIXL: no NUMA-local RDMA device for GPU %s (NUMA %d, candidates "
+                "%s): UCX_NET_DEVICES unchanged",
+                gpu_pci,
+                numa,
+                listed or "fastest",
+            )
+            return
+        k, per = gpus.index(gpu_pci), len(local) // len(gpus)
+        devices = local[k * per : (k + 1) * per] if per else [local[k % len(local)]]
+        os.environ["UCX_NET_DEVICES"] = ",".join(f"{d}:1" for d in devices)
+        os.environ.setdefault("UCX_MAX_RNDV_RAILS", str(2 * len(devices)))
+        logger.info(
+            "NIXL: UCX_NET_DEVICES=%s for GPU %s (NUMA %d, GPU %d of %d there), "
+            "UCX_MAX_RNDV_RAILS=%s",
+            os.environ["UCX_NET_DEVICES"],
+            gpu_pci,
+            numa,
+            k,
+            len(gpus),
+            os.environ["UCX_MAX_RNDV_RAILS"],
+        )
 
     def _validate_hybrid_hetero_dcp(
         self,
