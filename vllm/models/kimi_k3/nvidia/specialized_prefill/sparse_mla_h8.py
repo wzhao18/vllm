@@ -94,6 +94,9 @@ from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_sol import (
 
 P_PRE, THR = 4, 4.5  # P = 2^(s - m + P_PRE) <= 2^(P_PRE + THR) = 362 < 448 (E4M3 max)
 NS = 6  # 64-key KV stages
+# cpa 2: a gather warp signals stage g full once its stage g - CPA_LAG + 1 copies are done
+# (one arrive per warp; per-thread cp.async.mbarrier arrives serialize at ~0.9 us per stage)
+CPA_LAG = 4
 NP = 3  # P buffers
 NLD = 9  # gather warps
 GATHER_PARTS = 1  # issuing lanes per quad (P-MLA run95)
@@ -238,6 +241,22 @@ def cp16(dst, src, n):
     """16 bytes global -> shared (cp.async; n = 0 zero-fills)."""
     return ("cp.async.cg.shared.global [$0], [$1], 16, $2;", "r,l,r,~{memory}",
             (Uint32(dst), Int64(src), Uint32(n)))
+
+
+@asm()
+def cp_commit():
+    return ("cp.async.commit_group;", "~{memory}", ())
+
+
+@asm()
+def cp_wait_lag():
+    """Wait until at most CPA_LAG - 1 cp.async groups of this thread are pending."""
+    return (f"cp.async.wait_group {CPA_LAG - 1};", "~{memory}", ())
+
+
+@asm()
+def cp_wait_all():
+    return ("cp.async.wait_group 0;", "~{memory}", ())
 
 
 @asm()
@@ -417,7 +436,7 @@ class SparseMlaPrefillH8:
                 mbar_init(_bar(base, B_OREADY + j), Uint32(self.sm_arrivals))
                 mbar_init(_bar(base, B_PEMPTY + j), Uint32(1))
             for s in cutlass.range_constexpr(NS):
-                mbar_init(_bar(base, B_KVFULL + s), Uint32(1 + (256 if self.cpa else 0)))
+                mbar_init(_bar(base, B_KVFULL + s), Uint32(1 + (8 if self.cpa == 2 else (256 if self.cpa else 0))))
                 mbar_init(_bar(base, B_KVEMPTY + s), Uint32(1))
             for j in cutlass.range_constexpr(NCR):
                 mbar_init(_bar(base, B_NFULL + j), Uint32(1))
@@ -474,6 +493,8 @@ class SparseMlaPrefillH8:
                              + Uint32(((u - 16) * 32 + Int32(slot)) * 4))
 
     def _tma_ops(self):
+        if self.cpa == 2:
+            return 0
         return 4 if self.cpa else 5 - self.gskip
 
     def _skipped(self):
@@ -541,7 +562,9 @@ class SparseMlaPrefillH8:
                     n = lens[row]
                     subs = _subs(n)
                     srow = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(16 * q)
-                    c0, c1, c2, c3 = ld_global_v4_s32(srow)
+                    c0 = c1 = c2 = c3 = Int32(-1)
+                    if cutlass.const_expr(self.cpa != 2):
+                        c0, c1, c2, c3 = ld_global_v4_s32(srow)
                     # cpa: lane id = 32 pw + lane < 256 copies RoPE chunk id % 4 of row id // 4
                     rid = pw * 32 + lane
                     rrow = rid // 4
@@ -549,6 +572,12 @@ class SparseMlaPrefillH8:
                     rop = rid < (256 if self.cpa else 0)
                     rsl = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(4 * rrow)
                     cr = ld_global_s32_pred(rsl, Int32(rop))
+                    # cpa 2: every 16 B piece by cp.async (LDGSTS reaches the 30.8 TB/s random
+                    # 576 B row ceiling with 8 warps once indices are >= 2 stages ahead;
+                    # P-MLA-2CTA gather6/probe5): slot index prefetched two stages ahead
+                    cr2 = cr
+                    if cutlass.const_expr(self.cpa == 2):
+                        cr2 = ld_global_s32_pred(rsl + Int64(256), Int32(rop and subs > 1))
                     # unroll=1: the 2x LLVM unroll (register stage addresses, BRA.DIV gather
                     # blocks) ran the kernel at 3.63 vs 2.02 ms/layer (P-MLA runs 64-71)
                     for t in cutlass.range(subs, unroll=1):
@@ -559,8 +588,13 @@ class SparseMlaPrefillH8:
                         r = (c0, c1, c2, c3)
                         rc = cr
                         if t + 1 < subs:
-                            c0, c1, c2, c3 = ld_global_v4_s32(srow + Int64((t + 1) * 256))
-                            if cutlass.const_expr(self.cpa):
+                            if cutlass.const_expr(self.cpa != 2):
+                                c0, c1, c2, c3 = ld_global_v4_s32(srow + Int64((t + 1) * 256))
+                            if cutlass.const_expr(self.cpa == 2):
+                                cr = cr2
+                                cr2 = ld_global_s32_pred(rsl + Int64((t + 2) * 256),
+                                                         Int32(rop and t + 2 < subs))
+                            elif cutlass.const_expr(self.cpa):
                                 cr = ld_global_s32_pred(rsl + Int64((t + 1) * 256), Int32(rop))
                         # keep the prefetch here (issued before the stage-free wait): without
                         # a barrier the compiler sinks it to its use, exposing an L2 round trip
@@ -587,8 +621,25 @@ class SparseMlaPrefillH8:
                                 cp16(st + Uint32(4 * 8192) + Uint32(rrow * 64) + (
                                     (Uint32(rch) ^ ((Uint32(rrow) >> Uint32(1)) & Uint32(3)))
                                     << Uint32(4)), src, nb)
-                                cp_async_arrive(full)
-                        if cutlass.const_expr(not self.no_gather):
+                                if cutlass.const_expr(self.cpa == 2):
+                                    # latent chunk c = rch + 4 k (16 B) of row rrow -> SW128 atom
+                                    # c // 8, 16 B column (c % 8) ^ (rrow % 8)
+                                    lsrc = kvp
+                                    if nb > Uint32(0):
+                                        lsrc = src - Int64(D_NOPE)
+                                    for k in cutlass.range_constexpr(8):
+                                        cp16(st + Uint32((k // 2) * 8192) + Uint32(rrow * 128) + (
+                                            ((Uint32(rch) + Uint32(4 * (k % 2))) ^ (Uint32(rrow) & Uint32(7)))
+                                            << Uint32(4)),
+                                            lsrc + Int64(64 * k), nb)
+                                    cp_commit()
+                                    cp_wait_lag()
+                                    cute.arch.sync_warp()
+                                    if lane == 0 and g >= CPA_LAG - 1:
+                                        mbar_arrive(_bar(base, B_KVFULL + (g - (CPA_LAG - 1)) % NS))
+                                else:
+                                    cp_async_arrive(full)
+                        if cutlass.const_expr(not self.no_gather and self.cpa != 2):
                             if act:
                                 r0 = (r[0] >> 6) * unit_rows + (r[0] & 63)
                                 r1 = (r[1] >> 6) * unit_rows + (r[1] & 63)
@@ -617,6 +668,15 @@ class SparseMlaPrefillH8:
                             self.ss(base, cta, lane, g, 23, 8)
                             self.lpin(base, cta, lane, g)
                         g = g + 1
+                if cutlass.const_expr(self.cpa == 2 and not self.no_gather):
+                    # drain: the last CPA_LAG - 1 stages are signalled here
+                    if pw * 32 + lane < 256:
+                        cp_wait_all()
+                        cute.arch.sync_warp()
+                        if lane == 0:
+                            for j in cutlass.range_constexpr(CPA_LAG - 1):
+                                if g - (CPA_LAG - 1) + j >= 0:
+                                    mbar_arrive(_bar(base, B_KVFULL + (g - (CPA_LAG - 1) + j) % NS))
 
     @cute.jit
     def q_issue(self, base, row, qi, tm_qn, tm_qr):
@@ -939,6 +999,8 @@ class SparseMlaPrefillH8:
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 mbar_wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
                 self.ss(base, cta, lane, u, 18, 4)
+                if cutlass.const_expr(self.cpa == 2):
+                    fence_async_smem()  # V chunks written by cp.async (generic proxy)
                 tc_fence_after()
                 pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
                 bd = Uint64(SDESC_SW64) | Uint64(pbuf >> Uint32(4))
