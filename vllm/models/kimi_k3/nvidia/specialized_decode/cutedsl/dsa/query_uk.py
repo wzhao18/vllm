@@ -10,8 +10,7 @@ written and read back once (2 x 2 R G KB), the pack is a separate kernel.
 Here CTA (h, n) of 2 G owns gathered head h's latent columns 256 n .. + 255 for every
 row: its W_UK_T slice [256 x 128] (K-major, staged once) times the q_nope rows of
 each 128-row tile (TMA, two stages) on tcgen05 (kind::f16, FP32 accumulation in
-TMEM); the two CTAs of head h form a cluster and read each q tile once, multicast
-into both. The accumulator is two 128-column halves with their own full/free barriers
+TMEM). The accumulator is two 128-column halves with their own full/free barriers
 and epilogue warp sets (8 warps each, thread = row), so the MMAs of one half run under
 the other half's epilogue. The epilogue rounds to BF16 as the bmm output, scales,
 clamps and stores E4M3 (32 B per store) straight into the query rows, and q_pe
@@ -32,7 +31,6 @@ from ..common.primitives import asm, div_rn
 from .dcp_value import _mma_f16, _tma3d, _tmem_ld32
 from .sparse_mla import (
     SDESC_SW128,
-    cluster_sync,
     fence_mbar_init,
     ld_shared_u32,
     mbar_arrive,
@@ -40,7 +38,6 @@ from .sparse_mla import (
     mbar_init,
     mbar_wait,
     tc_commit,
-    tc_commit_pair,
     tc_fence_after,
     tc_fence_before,
 )
@@ -109,31 +106,6 @@ def _q4_bf16(w0, w1, inv):
 
 
 @asm()
-def _tma3d_pair(dst, tmap, bar, c0, c1, c2):
-    """TMA 3D box into ``dst`` of both CTAs of the pair, completing on ``bar`` in each."""
-    code = (
-        "{ .reg .b16 m; mov.b16 m, 3; "
-        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx"
-        "::bytes.multicast::cluster [$0], [$1, {$3, $4, $5}], [$2], m; }"
-    )
-    return code, "r,l,r,r,r,r,~{memory}", (
-        Uint32(dst), Int64(tmap), Uint32(bar), Int32(c0), Int32(c1), Int32(c2))
-
-
-@asm()
-def _arrive_peer(bar, peer):
-    """Arrive (release, cluster scope) on ``bar`` of cluster CTA ``peer``."""
-    code = ("{ .reg .b32 r; mapa.shared::cluster.u32 r, $0, $1; "
-            "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [r]; }")
-    return code, "r,r,~{memory}", (Uint32(bar), Uint32(peer))
-
-
-@asm()
-def _named_sync(bid, n):
-    return "bar.sync $0, $1;", "r,r,~{memory}", (Uint32(bid), Uint32(n))
-
-
-@asm()
 def _st_global8(addr, *w):
     return ("st.global.v8.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};",
             "l," + ",".join(["r"] * 8) + ",~{memory}",
@@ -172,8 +144,8 @@ class QueryUK:
                                   (QK_NOPE * 2, LATENT * QK_NOPE * 2), (64, 256, 1),
                                   sw, l2)
         self.kernel(am, bm, q, out, scale).launch(
-            grid=(2 * self.gathered, 1, 1), block=(THREADS, 1, 1), cluster=(2, 1, 1),
-            stream=stream, use_pdl=True)
+            grid=(2 * self.gathered, 1, 1), block=(THREADS, 1, 1), stream=stream,
+            use_pdl=True)
 
     @cute.kernel
     def kernel(self, am: tensormap.GridMap, bm: tensormap.GridMap, q: Int64,
@@ -202,14 +174,13 @@ class QueryUK:
             mbar_init(b_full, Uint32(1))
             for st in cutlass.range_constexpr(STAGES):
                 mbar_init(a_full + Uint32(8 * st), Uint32(1))
-                # both CTAs' MMA commits and q_pe reads (warps 4-7): the stage is
-                # filled by multicast into both CTAs of the pair
-                mbar_init(a_free + Uint32(8 * st), Uint32(4))
+                # the MMAs' commit and the 128 q_pe epilogue threads (warps 4-7)
+                mbar_init(a_free + Uint32(8 * st), Uint32(129))
             for c in cutlass.range_constexpr(2):
                 mbar_init(acc_full + Uint32(8 * c), Uint32(1))
                 mbar_init(acc_free + Uint32(8 * c), Uint32(256))
             fence_mbar_init()
-        cluster_sync()  # both CTAs' barriers initialized before any multicast
+        cute.arch.sync_threads()
         if warp == 0:
             if lane == 0:  # the weights do not depend on the predecessor
                 mbar_arrive_tx(b_full, Uint32(B_BYTES))
@@ -232,20 +203,9 @@ class QueryUK:
                     full = a_full + Uint32(8) * Uint32(st)
                     mbar_arrive_tx(full, Uint32(A_BYTES))
                     dst = a_smem + Uint32(A_BYTES) * Uint32(st)
-                    # the pair's CTAs read the tile once: CTA 0 q_nope K block 0 and
-                    # q_pe, CTA 1 K block 1, each multicast into both
-                    if n == 0:
-                        _tma3d_pair(dst, tm_a, full, QK * h, 128 * m, 0)
-                        _tma3d_pair(dst + Uint32(2 * A_BLOCK), tm_a, full,
-                                    QK * h + 128, 128 * m, 0)
-                    else:
-                        _tma3d_pair(dst + Uint32(A_BLOCK), tm_a, full, QK * h + 64,
-                                    128 * m, 0)
-                # drain: every arrival (this CTA's and the peer's) on a_free landed
-                for st in cutlass.range_constexpr(STAGES):
-                    uses = (self.tiles - st + STAGES - 1) // STAGES
-                    if cutlass.const_expr(uses > 0):
-                        mbar_wait(a_free + Uint32(8 * st), (uses - 1) & 1)
+                    for k in cutlass.range_constexpr(3):
+                        _tma3d(dst + Uint32(k * A_BLOCK), tm_a, full,
+                               QK * h + 64 * k, 128 * m, 0)
         if warp == 1:
             if lane == 0:
                 mbar_wait(b_full, 0)
@@ -269,7 +229,7 @@ class QueryUK:
                                 _mma_f16(taddr + Uint32(128 * c), ad, bd, Uint32(IDESC),
                                          Uint32(1 if k + kk > 0 else 0))
                         tc_commit(acc_full + Uint32(8 * c))
-                    tc_commit_pair(a_free + Uint32(8) * Uint32(st))
+                    tc_commit(a_free + Uint32(8) * Uint32(st))
         if warp >= EPI:
             e = (warp - EPI) // 4  # epilogue set: accumulator half e // 2
             g, sub = e // 2, e % 2  # columns 64 sub .. + 63 of the half
@@ -292,10 +252,7 @@ class QueryUK:
                         _ld_shared_v4(pe + Uint32(16) * Uint32((4 * n + i) ^ (row % 8)))
                         for i in range(4)
                     ]
-                    _named_sync(1, 128)  # warps 4-7 read their q_pe
-                    if row == 0:
-                        mbar_arrive(a_free + Uint32(8) * Uint32(st))
-                        _arrive_peer(a_free + Uint32(8) * Uint32(st), Uint32(1 - n))
+                    mbar_arrive(a_free + Uint32(8) * Uint32(st))
                     if live:
                         ws = [
                             _q4_bf16(words[i // 2][2 * (i % 2)],
@@ -317,7 +274,7 @@ class QueryUK:
                 tc_fence_before()
                 mbar_arrive(acc_free + Uint32(8) * Uint32(g))
         tc_fence_before()
-        cluster_sync()  # every multicast into / remote arrive on this CTA has landed
+        cute.arch.sync_threads()
         if warp == 0:
             tc_fence_after()
             _tmem_free(taddr)
