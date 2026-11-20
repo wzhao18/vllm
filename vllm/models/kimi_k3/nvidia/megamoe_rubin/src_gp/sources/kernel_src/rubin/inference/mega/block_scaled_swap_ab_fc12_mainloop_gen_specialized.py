@@ -116,6 +116,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
     a_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
     b_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
     asymmetric_token_stages: ClassVar[int] = 6
+    # The decode pair tile's token ring (L2-resident B): short, so the weight ring takes the depth.
+    decode_split_token_stages: ClassVar[int] = 4
     asymmetric_token_tile: ClassVar[int] = 256
 
     @classmethod
@@ -519,7 +521,11 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 )
             if not self.uses_asymmetric_ab_stages:
                 return shared_stages, shared_stages
-            token_stages = self.asymmetric_token_stages
+            token_stages = (
+                self.asymmetric_token_stages
+                if self.cta_tile_n == self.asymmetric_token_tile
+                else self.decode_split_token_stages
+            )
             weight_stages = (stage_budget_bytes - token_stages * token_stage_cost_bytes) // weight_stage_cost_bytes
             if weight_stages <= shared_stages:
                 if not self.shared_enabled:
