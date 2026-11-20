@@ -300,6 +300,7 @@ def _pkd(
     DECV_: cutlass.Constexpr[int] = 0,
     RPF_: cutlass.Constexpr[int] = 0,
     RAWG_: cutlass.Constexpr[int] = 0,
+    SOLVW_: cutlass.Constexpr[int] = 0,
 ):
     if cutlass.const_expr(WAITH_ == 1):
         _mbw = _mbar_wait_hint
@@ -2699,7 +2700,7 @@ def _pkd(
                     # elimination (zero LDS on the elimination chain);
                     # level 2: both 16-blocks' -B^-1 C A^-1 combines batched
                     # as block-diagonal [16,16] warp-MMAs. --
-                    if plw == 0:
+                    if plw == (SOLVW_ if cutlass.const_expr((PROBE_ & 16) == 0) else 99):
                         dgb = lane >> 3
                         lid = lane & 7
                         b8 = dgb * 8
@@ -2801,7 +2802,7 @@ def _pkd(
                     # INV[16:,:16] = -(Tb @ Lc) @ Ta; fragments loaded elementwise
                     # by identity coords (transposed dynamic-offset views reject
                     # autovec: provenance law).
-                    if plw == 0:
+                    if plw == (SOLVW_ if cutlass.const_expr((PROBE_ & 16) == 0) else 99):
                         Cy = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
                         Cy.fill(0.0)
                         fat = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
@@ -2856,7 +2857,7 @@ def _pkd(
                             5 if cutlass.const_expr(RESTORE_TAIL_ == 1) else 6
                         )
                         for wp in cutlass.range(restore_iters):
-                            item = wp * 96 + (ptl - 32)
+                            item = wp * 96 + (((plw - SOLVW_ + 3) & 3) * 32 + lane)
                             if item < C * 16:
                                 rw3 = item >> 4
                                 sg3 = item & 15
@@ -2988,6 +2989,7 @@ def _launch_pkd(
     DECV_: cutlass.Constexpr[int] = 0,
     RPF_: cutlass.Constexpr[int] = 0,
     RAWG_: cutlass.Constexpr[int] = 0,
+    SOLVW_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -3227,6 +3229,7 @@ def _launch_pkd(
         DECV_,
         RPF_,
         RAWG_,
+        SOLVW_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
