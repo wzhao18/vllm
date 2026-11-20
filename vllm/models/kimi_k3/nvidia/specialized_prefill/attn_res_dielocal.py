@@ -7,8 +7,8 @@ The prefill AttnRes calls of one forward read ``block_residual`` [T, NB, H]
 HBM traffic. A default allocation interleaves the two VR200 dies every 4 KiB,
 so these reads run at the striped rate. Here the buffer is one persistent VMM
 range whose physical memory is homed per 1024-token super-block: tokens
-[1024 k, 1024 (k + 1)) live on die k % 2 (1024 tokens x NB rows x 14 KiB =
-7 NB whole 2 MiB chunks). ``attn_res_pf`` CTAs claim tokens homed on their own
+[2048 k, 2048 (k + 1)) live on die k % 2 (whole 2 MiB chunks for the
+block rows, the prefix and the BF16 / MXFP8 outputs). ``attn_res_pf`` CTAs claim tokens homed on their own
 SM's die (``sm_die`` from the sdec latency probe) and steal the other die's
 leftovers, so the block reads are die-local whatever the SM split.
 
@@ -20,7 +20,7 @@ import functools
 
 import torch
 
-SUPER_TOKENS = 1024
+SUPER_TOKENS = 2048
 CHUNK = 2 << 20
 
 
@@ -66,7 +66,37 @@ class _Buffer:
         self.prefix = praw[:pbytes].view(torch.bfloat16).view(self.tokens, hidden)
         self.prefix_base = self.prefix.data_ptr()
         self.sm_die = _sm_die(device)
+        self.device = device
+        # Rotating pairs of die-local output buffers (AttnRes outputs consumed
+        # within the layer: the KDA in_proj / DSA projections / MoE inputs).
+        self.outs: dict[str, list[torch.Tensor]] = {}
+        self.out_next: dict[str, int] = {}
         self.claim = torch.zeros(4, dtype=torch.int32, device=f"cuda:{device}")
+
+
+    def out(self, kind: str, rows: int) -> torch.Tensor:
+        """The next of two die-local [tokens, H] output buffers of ``kind``
+        ('bf16' or 'fp8'), first ``rows`` rows."""
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+        pair = self.outs.get(kind)
+        if pair is None:
+            esize = 2 if kind == "bf16" else 1
+            row = self.hidden * esize
+            per_super = SUPER_TOKENS * row // CHUNK
+            assert SUPER_TOKENS * row % CHUNK == 0
+            nbytes = self.tokens * row
+            domains = [(c // per_super) & 1 for c in range(nbytes // CHUNK)]
+            dtype = torch.bfloat16 if kind == "bf16" else torch.float8_e4m3fn
+            pair = self.outs[kind] = [
+                dies.localized_empty(nbytes, domains, self.device)[:nbytes]
+                .view(dtype).view(self.tokens, self.hidden)
+                for _ in range(2)
+            ]
+            self.out_next[kind] = 0
+        i = self.out_next[kind]
+        self.out_next[kind] = i ^ 1
+        return pair[i][:rows]
 
 
 _buffers: dict[int, _Buffer] = {}
@@ -110,3 +140,12 @@ def prefix_out(prefix: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor | Non
     if prefix.data_ptr() == buf.prefix_base:
         return None
     return buf.prefix[: prefix.shape[0]]
+
+
+def out_buffer(blocks: torch.Tensor, kind: str, rows: int) -> torch.Tensor | None:
+    """A die-local output buffer (rotating pair per kind) when ``blocks`` is
+    the die-local block buffer, else None. Only for outputs consumed before
+    the next-but-one AttnRes call of the same kind."""
+    if kernel_args(blocks)[0] is None:
+        return None
+    return _buffers[blocks.device.index].out(kind, rows)

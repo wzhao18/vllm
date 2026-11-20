@@ -265,17 +265,19 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
     die = a.sm_die[smid & 1023];
   }
-  const int nsb = (a.T + 1023) >> 10;
+  // Super-block k of 2^SB tokens lives on die k % 2 (attn_res_dielocal).
+  constexpr int SB = 11;
+  const int nsb = (a.T + (1 << SB) - 1) >> SB;
   auto die_count = [&](int d) -> int {
     if (a.sm_die == nullptr) return d == 0 ? a.T : 0;
     const int full = (nsb - d + 1) >> 1;  // super-blocks k < nsb with k % 2 == d
-    int c = full << 10;
-    if (((nsb - 1) & 1) == d) c -= (nsb << 10) - a.T;
+    int c = full << SB;
+    if (((nsb - 1) & 1) == d) c -= (nsb << SB) - a.T;
     return c;
   };
   auto die_token = [&](int d, int j) -> int {
     if (a.sm_die == nullptr) return j;
-    return ((((j >> 10) << 1) + d) << 10) | (j & 1023);
+    return ((((j >> SB) << 1) + d) << SB) | (j & ((1 << SB) - 1));
   };
   const int cnt_own = die_count(die);
   const int cnt_oth = die_count(die ^ 1);

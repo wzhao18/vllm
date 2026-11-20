@@ -209,6 +209,7 @@ def attn_res(
     bf16_out: bool,
     quant_out: bool,
     prefix_out: torch.Tensor | None = None,
+    local_out: bool = True,
     _probe: int = 0,
     _vec: int = 8,
     _groups: int | None = None,
@@ -231,10 +232,21 @@ def attn_res(
         base = lg.data_ptr()
         lp += [base + row * rows * 4, base + (n_after + row) * rows * 4]
     lptr = torch.tensor(lp or [0, 0], dtype=torch.int64)
-    out = torch.empty_like(prefix) if bf16_out else None
-    q = sf = None
+    # local_out: outputs consumed within the layer (every call but the final
+    # one, whose output leaves the model) go to die-local rotating buffers,
+    # written by the SMs of their token's die.
+    local_out = local_out and call != plan.num_calls - 1
+    out = q = sf = None
+    if bf16_out:
+        if local_out:
+            out = attn_res_dielocal.out_buffer(blocks, "bf16", rows)
+        if out is None:
+            out = torch.empty_like(prefix)
     if quant_out:
-        q = torch.empty((rows, HIDDEN), dtype=torch.float8_e4m3fn, device=prefix.device)
+        if local_out:
+            q = attn_res_dielocal.out_buffer(blocks, "fp8", rows)
+        if q is None:
+            q = torch.empty((rows, HIDDEN), dtype=torch.float8_e4m3fn, device=prefix.device)
         sf = torch.empty(
             (max(rows, 1) + 127) // 128 * 128 * (HIDDEN // MXFP8_BLOCK),
             dtype=torch.uint8,
