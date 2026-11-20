@@ -8,9 +8,8 @@ One block per row:
 
 * all 8 warps: stock's sigmoid + correction-bias single-group top-k on the
   logits (``_moe_C.grouped_topk`` / ``single_group_topk``, bitwise: the same
-  packed ``(score, 65535 - id)`` key order, selected exactly in two passes,
-  per warp then across the warps, and the same ``write_outputs`` weights on
-  warp 0), written straight into the session's route buffers with the stager's rules (``megamoe_rubin.staging``:
+  packed ``(score, 65535 - id)`` key order, selected exactly by counting ranks
+  (``route_block``), and the same ``write_outputs`` weights on warp 0), written straight into the session's route buffers with the stager's rules (``megamoe_rubin.staging``:
   padding rows and out-of-range ids masked to -1 with weight 0, the sticky
   ``route_error`` flag, SF pad columns zeroed);
 * before that, the same threads: the latent row rounded to BF16 (round to nearest, as a BF16-output
@@ -86,13 +85,6 @@ __device__ __forceinline__ void unpack_key(uint64_t key, float& v,
   v = __uint_as_float(bits);
 }
 
-__device__ __forceinline__ uint64_t warp_max_u64(uint64_t v) {
-  uint32_t hi = uint32_t(v >> 32), lo = uint32_t(v);
-  uint32_t mhi = __reduce_max_sync(kFull, hi);
-  uint32_t mlo = __reduce_max_sync(kFull, hi == mhi ? lo : 0u);
-  return (uint64_t(mhi) << 32) | uint64_t(mlo);
-}
-
 struct Args {
   const float* y;
   int64_t ldy;
@@ -141,35 +133,27 @@ __device__ __forceinline__ void sort_desc(uint64_t (&k)[P]) {
   }
 }
 
-// The warp's `topk` largest keys, rank r returned on lane r (0 elsewhere), from
-// every lane's descending list k. Keys are unique (the expert id is in them),
-// so exactly one lane holds each rank's key.
-template <int P>
-__device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
-                                                int32_t topk) {
-  uint64_t mine = 0;
-  for (int r = 0; r < topk; ++r) {
-    uint64_t const best = warp_max_u64(k[0]);
-    if (lane == r) mine = best;
-    if (best != 0 && k[0] == best) {
-#pragma unroll
-      for (int j = 0; j + 1 < P; ++j) k[j] = k[j + 1];
-      k[P - 1] = 0;
-    }
-  }
-  return mine;
-}
-
 // Block-parallel top-k of one row (the stock selection order: largest
 // (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
 // write_outputs (verbatim) and the stager's route rules on warp 0.
-// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
-// warp 0 selects the top-k of the 8 sorted warp lists (exact:
-// the global top-k is inside the union of the per-warp top-k).
+// Exact selection by counting, no serial argmax rounds:
+//  1. every thread sorts its kPer keys; its largest is the lane maximum;
+//  2. each warp ranks its 32 lane maxima (smem broadcast reads) and lists its
+//     top-k maxima in rank order;
+//  3. a listed maximum's block rank = its warp rank + a binary search in each
+//     other warp's sorted list; the k lanes with the largest maxima hold the
+//     whole top-k (any key above the k-th largest lane maximum lives in one of
+//     them), so they copy their kPer keys into k * kPer candidate slots;
+//  4. each candidate's rank among the slots puts the top-k in order.
+// Equal keys (only the 0 keys of experts past num_logits) order by position,
+// so every rank is distinct.
 __device__ __forceinline__ void route_block(const Args& a, int32_t row,
                                             const float (&lg)[kPer],
                                             const float* s_bias, float* s_unb,
                                             uint64_t* s_cand) {
+  __shared__ uint64_t s_max[kWarps * 32];
+  __shared__ uint64_t s_slot[32 * kPer];
+  __shared__ uint64_t s_sel[32];
   int32_t const lane = threadIdx.x & 31;
   int32_t const wid = threadIdx.x >> 5;
   int32_t const num_experts = a.num_logits;
@@ -187,15 +171,66 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
     }
   }
   sort_desc<kPer>(k1);
-  uint64_t const w = warp_select<kPer>(k1, lane, topk);
-  s_cand[wid * 32 + lane] = w;
+  uint64_t const m = k1[0];
+  s_max[threadIdx.x] = m;
+  __syncthreads();
+  // 2. Rank among the warp's lane maxima (position breaks ties).
+  int32_t rw = 0;
+  {
+    const ulonglong2* wm =
+        reinterpret_cast<const ulonglong2*>(s_max + wid * 32);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      ulonglong2 const v = wm[j];
+      rw += (v.x > m || (v.x == m && 2 * j < lane)) ? 1 : 0;
+      rw += (v.y > m || (v.y == m && 2 * j + 1 < lane)) ? 1 : 0;
+    }
+  }
+  if (rw < topk) s_cand[wid * topk + rw] = m;
+  __syncthreads();
+  // 3. Block rank of a listed maximum: elements before it in each other
+  // warp's descending list (lower warps first on equal keys).
+  int32_t g = topk;
+  if (rw < topk) {
+    g = rw;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+      if (w == wid) continue;
+      const uint64_t* list = s_cand + w * topk;
+      bool const before_eq = w < wid;
+      int32_t lo = 0, len = topk;
+      while (len > 0) {
+        int32_t const half = len >> 1;
+        uint64_t const v = list[lo + half];
+        if (v > m || (before_eq && v == m)) {
+          lo += half + 1;
+          len -= half + 1;
+        } else {
+          len = half;
+        }
+      }
+      g += lo;
+    }
+  }
+  if (g < topk) {
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) s_slot[g * kPer + j] = k1[j];
+  }
+  __syncthreads();
+  // 4. Rank among the topk * kPer candidate slots.
+  int32_t const slots = topk * kPer;
+  if (threadIdx.x < slots) {
+    uint64_t const c = s_slot[threadIdx.x];
+    int32_t r = 0;
+    for (int j = 0; j < slots; ++j) {
+      uint64_t const v = s_slot[j];
+      r += (v > c || (v == c && j < int32_t(threadIdx.x))) ? 1 : 0;
+    }
+    if (r < topk) s_sel[r] = c;
+  }
   __syncthreads();
   if (wid != 0) return;
-  // Lane l: warp l / 4's ranks (l % 4) * 8 .. + 8 (already descending).
-  uint64_t k2[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) k2[j] = s_cand[(lane >> 2) * 32 + (lane & 3) * 8 + j];
-  uint64_t const lane_packed = warp_select<8>(k2, lane, topk);
+  uint64_t const lane_packed = lane < topk ? s_sel[lane] : 0;
 
   auto warp = cg::tiled_partition<32>(cg::this_thread_block());
   float lane_score = -INFINITY;

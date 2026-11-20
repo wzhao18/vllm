@@ -37,7 +37,8 @@ def _buffers(capacity, nvfp4, device):
 @pytest.mark.parametrize("nvfp4", [True, False])
 @pytest.mark.parametrize("n,capacity", [(1, 64), (33, 128), (96, 128), (96, 384)])
 @pytest.mark.parametrize("renormalize", [True, False])
-def test_route_stage_split_vs_stock(nvfp4, n, capacity, renormalize):
+@pytest.mark.parametrize("ties", [False, True])
+def test_route_stage_split_vs_stock(nvfp4, n, capacity, renormalize, ties):
     from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
         fused_grouped_topk,
     )
@@ -51,6 +52,9 @@ def test_route_stage_split_vs_stock(nvfp4, n, capacity, renormalize):
     logits = torch.randn(n, E, device=device) * 3
     logits[:, 5] = logits[:, 6]  # exact ties: stock tie order
     bias = torch.randn(E, device=device) * 0.1
+    if ties:  # heavy exact ties: a few distinct scores, many equal lane maxima
+        logits = torch.randint(-2, 3, (n, E), device=device).float()
+        bias = torch.zeros(E, device=device)
     latent = (torch.randn(n, HIDDEN, device=device) * 4).to(torch.bfloat16)
     latent[:, 64:96] = 0  # all-zero quantization blocks
     norm_const, scale = 2.5, 2.827
