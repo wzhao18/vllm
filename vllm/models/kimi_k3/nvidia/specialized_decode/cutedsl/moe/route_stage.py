@@ -168,16 +168,60 @@ __device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
   return mine;
 }
 
+// Rounds [r0, r1) of warp_select: rank r on lane r.
+template <int P>
+__device__ __forceinline__ void warp_select_rounds(uint64_t (&k)[P], int32_t lane, int32_t r0,
+                                                   int32_t r1, uint64_t& mine) {
+  for (int r = r0; r < r1; ++r) {
+    uint64_t const best = warp_max_u64(k[0]);
+    if (lane == r) mine = best;
+    if (best != 0 && k[0] == best) {
+#pragma unroll
+      for (int j = 0; j + 1 < P; ++j) k[j] = k[j + 1];
+      k[P - 1] = 0;
+    }
+  }
+}
+
+// Keys of the kWarps descending 32-entry lists s_cand (zero past their length) larger
+// than w, the key of lane "lane" of list "wid" (unique keys: its own list has "lane").
+__device__ __forceinline__ int32_t rank_in_lists(const uint64_t* s_cand, uint64_t w,
+                                                 int32_t lane, int32_t wid) {
+  int32_t rank = lane;
+#pragma unroll
+  for (int v = 1; v < kWarps; ++v) {
+    const uint64_t* list = s_cand + ((wid + v) % kWarps) * 32;
+    int32_t i = 0;
+#pragma unroll
+    for (int step = 16; step >= 1; step >>= 1) i += list[i + step - 1] > w ? step : 0;
+    rank += i;
+  }
+  return rank;
+}
+
+// Pass-1 rounds before the exactness check (the rest only when a warp may hold more).
+constexpr int kRound1 = 8;
+
 // Block-parallel top-k of one row (the stock selection order: largest
 // (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
 // write_outputs (verbatim) and the stager's route rules on warp 0.
-// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2:
-// warp 0 selects the top-k of the 8 sorted warp lists (exact:
-// the global top-k is inside the union of the per-warp top-k).
+// Pass 1: every warp selects its top-k of the 128 experts it scored; pass 2 ranks
+// the 8 sorted warp lists against each other (exact: the global top-k is inside
+// the union of the per-warp top-k).
+// clk (microbench only, null otherwise): thread 0 records clock64 at the phase ends
+// [entry, keys sorted, pass 1, block barrier, pass 2, outputs].
 __device__ __forceinline__ void route_block(const Args& a, int32_t row,
                                             const float (&lg)[kPer],
                                             const float* s_bias, float* s_unb,
-                                            uint64_t* s_cand) {
+                                            uint64_t* s_cand,
+                                            unsigned long long* clk = nullptr) {
+#define RB_CLK(i) \
+  if (clk != nullptr && threadIdx.x == 0) clk[i] = clock64()
+  RB_CLK(0);
+  // Per-row flags read at entry: their load latency hides under the selection.
+  bool const pad_row = a.pad != nullptr && a.pad[row];
+  bool const record_row = a.l2p != nullptr && *a.record &&
+                          (a.unpadded == nullptr || row < *a.unpadded);
   int32_t const lane = threadIdx.x & 31;
   int32_t const wid = threadIdx.x >> 5;
   int32_t const num_experts = a.num_logits;
@@ -195,15 +239,34 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
     }
   }
   sort_desc<kPer>(k1);
-  uint64_t const w = warp_select<kPer>(k1, lane, topk);
+  RB_CLK(1);
+  // Pass 1: every warp's first r1 keys (of its topk), descending on lanes 0..r1-1.
+  int32_t const r1 = min(topk, kRound1);
+  uint64_t w = 0;
+  warp_select_rounds<kPer>(k1, lane, 0, r1, w);
+  RB_CLK(2);
   s_cand[wid * 32 + lane] = w;
   __syncthreads();
+  RB_CLK(3);
+  // Pass 2: the global rank of every per-warp candidate (keys are unique): its rank
+  // in its own warp list plus the larger keys of the other 7 lists (each descending,
+  // zero past its length: a 5-step binary search counts them). Exact when no warp's
+  // last extracted key is selected (its unextracted keys are all smaller than every
+  // selected key); otherwise every warp extracts the rest of its topk and pass 2
+  // reruns (in-kernel, rare). Ranks < topk are the selection, in order.
+  __shared__ uint64_t s_top[32];
+  int32_t rank = rank_in_lists(s_cand, w, lane, wid);
+  if (__syncthreads_or(lane == r1 - 1 && r1 < topk && w != 0 && rank < topk)) {
+    warp_select_rounds<kPer>(k1, lane, r1, topk, w);
+    s_cand[wid * 32 + lane] = w;
+    __syncthreads();
+    rank = rank_in_lists(s_cand, w, lane, wid);
+  }
+  if (lane < topk && w != 0 && rank < topk) s_top[rank] = w;
+  __syncthreads();
   if (wid != 0) return;
-  // Lane l: warp l / 4's ranks (l % 4) * 8 .. + 8 (already descending).
-  uint64_t k2[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) k2[j] = s_cand[(lane >> 2) * 32 + (lane & 3) * 8 + j];
-  uint64_t const lane_packed = warp_select<8>(k2, lane, topk);
+  uint64_t const lane_packed = lane < topk ? s_top[lane] : 0;
+  RB_CLK(4);
 
   auto warp = cg::tiled_partition<32>(cg::this_thread_block());
   float lane_score = -INFINITY;
@@ -236,7 +299,7 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
     }
     // megamoe_rubin.staging._stage_kernel route rules.
     int64_t id = lane_expert;
-    if (a.pad != nullptr && a.pad[row]) id = -1;
+    if (pad_row) id = -1;
     if (a.l2p != nullptr) {
       // Logical -> physical, the stock replica choice (Knuth hash of the row);
       // masked / out-of-range logical ids map to -1. Load recorded per route.
@@ -247,8 +310,7 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
         phys = a.l2p[id * a.map_slots + hashed % reps];
       }
       id = phys;
-      if (*a.record && (a.unpadded == nullptr || row < *a.unpadded) &&
-          phys >= 0 && phys < a.load_size) {
+      if (record_row && phys >= 0 && phys < a.load_size) {
         atomicAdd(a.load + phys, 1);
       }
     }
@@ -265,6 +327,8 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
   for (int32_t c = a.hidden / vec + lane; c < a.sf_cols; c += 32) {
     a.sf[int64_t{row} * a.sf_stride + c] = 0;
   }
+  RB_CLK(5);
+#undef RB_CLK
 }
 
 __device__ __forceinline__ float bf16_rn(float v) {
@@ -443,6 +507,44 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
 
 }  // namespace
 
+// EPLB (stock eplb_map_to_physical_and_record) inputs of route_block: all null
+// without EPLB.
+static void route_eplb(Args& a, int64_t num_logits, const c10::optional<torch::Tensor>& l2p,
+                       const c10::optional<torch::Tensor>& replicas,
+                       const c10::optional<torch::Tensor>& load,
+                       const c10::optional<torch::Tensor>& record,
+                       const c10::optional<torch::Tensor>& unpadded) {
+  a.l2p = nullptr;
+  a.replicas = nullptr;
+  a.load = nullptr;
+  a.record = nullptr;
+  a.unpadded = nullptr;
+  a.map_slots = 0;
+  a.load_size = 0;
+  if (l2p.has_value()) {
+    TORCH_CHECK(replicas.has_value() && load.has_value() && record.has_value(),
+                "route_stage: EPLB needs the map, replica count, load and record tensors");
+    TORCH_CHECK(l2p->scalar_type() == at::kLong && l2p->dim() == 2 &&
+                    l2p->is_contiguous() && l2p->size(0) == num_logits &&
+                    replicas->scalar_type() == at::kLong &&
+                    replicas->is_contiguous() && replicas->numel() == num_logits &&
+                    load->scalar_type() == at::kInt && load->is_contiguous() &&
+                    record->scalar_type() == at::kBool && record->numel() == 1,
+                "route_stage: EPLB tensors");
+    a.l2p = l2p->data_ptr<int64_t>();
+    a.replicas = replicas->data_ptr<int64_t>();
+    a.load = load->data_ptr<int32_t>();
+    a.record = record->data_ptr<bool>();
+    a.map_slots = (int32_t)l2p->size(1);
+    a.load_size = (int32_t)load->numel();
+    if (unpadded.has_value()) {
+      TORCH_CHECK(unpadded->scalar_type() == at::kInt && unpadded->numel() == 1,
+                  "route_stage: EPLB unpadded token count");
+      a.unpadded = unpadded->data_ptr<int32_t>();
+    }
+  }
+}
+
 void route_stage(const torch::Tensor& y, int64_t num_logits,
                  const torch::Tensor& bias, torch::Tensor& x, torch::Tensor& sf,
                  torch::Tensor& idx, torch::Tensor& sw, torch::Tensor& err,
@@ -492,35 +594,7 @@ void route_stage(const torch::Tensor& y, int64_t num_logits,
     pad_ptr = pad->data_ptr<bool>();
   }
   Args a;
-  a.l2p = nullptr;
-  a.replicas = nullptr;
-  a.load = nullptr;
-  a.record = nullptr;
-  a.unpadded = nullptr;
-  a.map_slots = 0;
-  a.load_size = 0;
-  if (l2p.has_value()) {
-    TORCH_CHECK(replicas.has_value() && load.has_value() && record.has_value(),
-                "route_stage: EPLB needs the map, replica count, load and record tensors");
-    TORCH_CHECK(l2p->scalar_type() == at::kLong && l2p->dim() == 2 &&
-                    l2p->is_contiguous() && l2p->size(0) == num_logits &&
-                    replicas->scalar_type() == at::kLong &&
-                    replicas->is_contiguous() && replicas->numel() == num_logits &&
-                    load->scalar_type() == at::kInt && load->is_contiguous() &&
-                    record->scalar_type() == at::kBool && record->numel() == 1,
-                "route_stage: EPLB tensors");
-    a.l2p = l2p->data_ptr<int64_t>();
-    a.replicas = replicas->data_ptr<int64_t>();
-    a.load = load->data_ptr<int32_t>();
-    a.record = record->data_ptr<bool>();
-    a.map_slots = (int32_t)l2p->size(1);
-    a.load_size = (int32_t)load->numel();
-    if (unpadded.has_value()) {
-      TORCH_CHECK(unpadded->scalar_type() == at::kInt && unpadded->numel() == 1,
-                  "route_stage: EPLB unpadded token count");
-      a.unpadded = unpadded->data_ptr<int32_t>();
-    }
-  }
+  route_eplb(a, num_logits, l2p, replicas, load, record, unpadded);
   a.y = y.data_ptr<float>();
   a.ldy = y.stride(d - 2);
   a.splits = d == 3 ? (int32_t)y.size(0) : 1;
