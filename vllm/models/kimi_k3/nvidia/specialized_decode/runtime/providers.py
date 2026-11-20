@@ -340,20 +340,35 @@ def bf16_weight(linear):
 # Linears of a decoder layer the TP providers never read: stock absorbs ``kv_b_proj``
 # into W_UK / W_UV at load (the decode reads those).
 UNREAD_LINEARS = ("kv_b_proj",)
+# Unquantized linears stock keeps in another dtype, read as that dtype: the KDA
+# short-convolution taps (``KimiDeltaAttention.conv1d``, FP32).
+LINEAR_DTYPES = {"conv1d": torch.float32}
 
 
 def check_bf16_projections(decoder):
     """Every linear of a decoder layer the TP (non-SP) providers read (attention
     projections, AttnRes, router, latent MoE down / up, shared experts, dense MLP)
-    as a BF16 [N, K] matrix: refuses a checkpoint-quantized one (e.g. ModelOpt MXFP8
-    or NVFP4) at build instead of programming its packed bytes as BF16."""
-    from vllm.model_executor.layers.linear import LinearBase
+    as a BF16 [N, K] matrix (``LINEAR_DTYPES``: in its stock dtype): refuses a
+    checkpoint-quantized one (e.g. ModelOpt MXFP8 or NVFP4) at build instead of
+    programming its packed bytes as BF16."""
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
     for name, module in decoder.named_modules():
-        if isinstance(module, LinearBase) and name.rsplit(".", 1)[-1] not in (
-            UNREAD_LINEARS
-        ):
+        leaf = name.rsplit(".", 1)[-1]
+        if not isinstance(module, LinearBase) or leaf in UNREAD_LINEARS:
+            continue
+        dtype = LINEAR_DTYPES.get(leaf)
+        if dtype is None:
             bf16_weight(module)
+        elif (
+            not isinstance(module.quant_method, UnquantizedLinearMethod)
+            or module.weight.dtype != dtype
+        ):
+            raise ValueError(
+                f"Kimi K3 specialized decode needs an unquantized {dtype} {leaf}, "
+                f"got {type(module.quant_method).__name__} ({module.weight.dtype}) "
+                f"in {getattr(module, 'prefix', name)}"
+            )
 
 
 def routed_format(method) -> str:

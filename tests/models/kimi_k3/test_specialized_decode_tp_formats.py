@@ -158,6 +158,9 @@ def decoder(o_proj_method, o_proj_dtype=torch.bfloat16, kv_b_method=None):
         "layers.1.self_attn.kv_b_proj", torch.zeros(8, 8, dtype=torch.float8_e4m3fn),
         kv_b_method or FakeQuantized(),
     )  # fmt: skip
+    layer.self_attn.conv1d = linear(  # FP32 in stock (KimiDeltaAttention)
+        "layers.1.self_attn.conv1d", torch.zeros(8, 1, 4, dtype=torch.float32), plain
+    )
     layer.mlp = nn.Module()
     layer.mlp.shared_experts = nn.Module()
     layer.mlp.shared_experts.down_proj = linear(
@@ -185,6 +188,19 @@ def test_bf16_projections_refuse_non_bf16():
     """An unquantized projection in another dtype raises too."""
     layer = decoder(method(UnquantizedLinearMethod), torch.float16)
     with pytest.raises(ValueError, match="float16"):
+        providers.check_bf16_projections(layer)
+
+
+def test_conv1d_keeps_stock_dtype():
+    """The KDA conv1d taps are FP32 in stock (pass); quantized or BF16 they raise."""
+    plain = method(UnquantizedLinearMethod)
+    layer = decoder(plain)
+    layer.self_attn.conv1d.weight.data = layer.self_attn.conv1d.weight.data.bfloat16()
+    with pytest.raises(ValueError, match="unquantized torch.float32 conv1d"):
+        providers.check_bf16_projections(layer)
+    layer.self_attn.conv1d.weight.data = layer.self_attn.conv1d.weight.data.float()
+    layer.self_attn.conv1d.quant_method = FakeQuantized()
+    with pytest.raises(ValueError, match="FakeQuantized"):
         providers.check_bf16_projections(layer)
 
 
