@@ -1297,6 +1297,22 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         return uk_query.fused_query(q, w_uk_t, q_scale)
 
+    def v_up_gate(
+        self,
+        latent: torch.Tensor,
+        w_uv: torch.Tensor,
+        gate: torch.Tensor,
+        out: torch.Tensor,
+    ) -> bool:
+        """Write the gated attention output ``bmm(latent, W_UV) * gate.sigmoid()``
+        of a prefill-sized call into ``out`` (the up-projection and the model's
+        output gate in one GEMM pass); False to let the layer run its bmm."""
+        if not self._runs_prefill_sparse_mla(latent.shape[0]):
+            return False
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import uv_gate
+
+        return uv_gate.v_up_gate(latent, w_uv, gate, out)
+
     def _runs_prefill_sparse_mla(self, num_rows: int) -> bool:
         psm = getattr(self, "_prefill_sparse_mla", None)
         return psm is not None and num_rows >= psm.MIN_ROWS

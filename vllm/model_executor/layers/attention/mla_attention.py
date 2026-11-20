@@ -444,6 +444,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     # Under PCP+DCP only the decode rows carry an LSE; the base forward
     # merges a full-batch LSE, so subclasses opt in with their own forward.
     supports_pcp_dcp: ClassVar[bool] = False
+    # A model with an output gate on the attention output may hand it to the
+    # layer for one forward (``set_v_gate``): a backend with ``v_up_gate`` then
+    # writes the gated output in the W_UV up-projection; ``v_gate_applied``
+    # tells the model whether it still has to apply the gate.
+    _v_gate: torch.Tensor | None = None
+    v_gate_applied: bool = False
+
+    def set_v_gate(self, gate: torch.Tensor | None) -> None:
+        self._v_gate = gate
+        self.v_gate_applied = False
 
     def __init__(
         self,
@@ -1996,6 +2006,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return q_dcp_replicated is None and fuses is not None and fuses(num_rows)
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+        gate, self._v_gate = self._v_gate, None
+        v_up_gate = None if gate is None else getattr(self.impl, "v_up_gate", None)
+        if v_up_gate is not None and v_up_gate(
+            x.view(-1, self.num_heads, self.kv_lora_rank), self.W_UV, gate, out
+        ):
+            self.v_gate_applied = True
+            return
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         out = out.view(-1, self.num_heads, self.v_head_dim)

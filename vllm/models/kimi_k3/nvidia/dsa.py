@@ -82,6 +82,10 @@ from vllm.v1.attention.ops.dcp_topk_merge import init_dcp_topk_merge
 
 logger = init_logger(__name__)
 
+# Prefill rows (= specialized_prefill sm107_gemm.uv_gate.MIN_ROWS): g_proj runs
+# before the attention so that the W_UV up-projection can apply the output gate.
+_V_GATE_MIN_ROWS = 512
+
 
 def online_quant_config_only(
     quant_config: QuantizationConfig | None,
@@ -865,6 +869,18 @@ class KimiK3DSAAttention(nn.Module):
                 *self._gate_events,
                 self.aux_stream,
             )
+        elif not fused_gate and hidden_states.shape[0] >= _V_GATE_MIN_ROWS:
+            # Prefill rows: g_proj first, so that the attention's W_UV
+            # up-projection can write the gated output in its epilogue
+            # (MLAAttention.set_v_gate; the stock gate runs where it declines).
+            gate = self.g_proj(x)[0]
+            attn = cast(Any, self.mla_attn.mla_attn)
+            attn.set_v_gate(gate)
+            attn_out = self._fused_attention(hidden_states, x)
+            applied = attn.v_gate_applied
+            attn.set_v_gate(None)
+            if applied:
+                return self._o_proj(attn_out)
         else:
             attn_out = self._fused_attention(hidden_states, x)
             gate = self.g_proj(x)[0]
