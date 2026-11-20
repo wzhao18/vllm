@@ -45,6 +45,18 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# DIAG (not for landing): dump the exact top-k input rows of real decode steps.
+# K31_TOPK_DUMP_DIR=<dir>: on DP rank 0 (its DCP group), the first K31_TOPK_DUMP_STEPS
+# (3) eager decode steps of the first and the last DSA layer write
+# <dir>/g{dcp rank}_L{layer}_s{step}_r{rows}.pt = {"logits", "local", "glob", "stats",
+# "layer", "step"} (bench_k31_dcp_topk.py --cases dump:<file with {rank}>). Graph
+# replays do not call the hook: run the arm eager (--enforce-eager).
+import os as _os  # noqa: E402
+
+_DUMP_DIR = _os.environ.get("K31_TOPK_DUMP_DIR", "")
+_DUMP_STEPS = int(_os.environ.get("K31_TOPK_DUMP_STEPS", "3"))
+_DUMP_N: dict = {}
+
 # Serving spin deadline (s): long enough that a rank stalled on the host (cold JIT, GC,
 # a P/D handshake) only delays its peers, as a stock collective would. The kernels'
 # own 5 s default applies to tests and the build-time warmup only.
@@ -270,6 +282,8 @@ class DcpxDecode:
         md = get_forward_context().attn_metadata[layer.layer_name]
         _, stride = flat_kv_row_view(layer.kv_cache, md.block_size)
         max_local = min(self.max_local_len, logits.shape[1])
+        if _DUMP_DIR and not torch.cuda.is_current_stream_capturing():
+            self._dump(prefix, logits, local, glob, rows, max_local)
         self.ex.topk_v2(
             logits,
             local,
@@ -282,6 +296,42 @@ class DcpxDecode:
             req_of_row=md.req_id_per_token[:rows],
         )
         return True
+
+    def _dump(self, prefix, logits, local, glob, rows, max_local) -> None:
+        """DIAG (not for landing): see _DUMP_DIR."""
+        try:
+            from vllm.distributed.parallel_state import get_dp_group
+
+            dp = get_dp_group().rank_in_group
+        except Exception:  # noqa: BLE001
+            dp = 0
+        if dp != 0:
+            return
+        import re
+
+        idx = sorted(int(m.group(1)) for k in self.layers
+                     if (m := re.search(r"layers\.(\d+)\.", k)))
+        m = re.search(r"layers\.(\d+)\.", prefix)
+        if not idx or m is None or int(m.group(1)) not in (idx[0], idx[-1]):
+            return
+        li = int(m.group(1))
+        n = _DUMP_N.get(li, 0)
+        if n >= _DUMP_STEPS:
+            return
+        _DUMP_N[li] = n + 1
+        _os.makedirs(_DUMP_DIR, exist_ok=True)
+        lmax = int(local.max().item())
+        width = max(lmax, 1)
+        f = f"{_DUMP_DIR}/g{self.ex.rank}_L{li}_s{n}_r{rows}.pt"
+        torch.save({
+            "logits": logits[:rows, :width].detach().cpu().clone(),
+            "local": local.detach().cpu().clone(),
+            "glob": glob.detach().cpu().clone(),
+            "stats": torch.tensor([rows, lmax, int(glob.max().item()), max_local]),
+            "layer": prefix,
+            "step": n,
+        }, f)
+        logger.warning("K31 TOPK DUMP %s (rows %d, local max %d)", f, rows, lmax)
 
     def launch_params(self, rows: int, max_local: int) -> tuple[int, int]:
         """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch.
