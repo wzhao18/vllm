@@ -25,8 +25,11 @@ def _stock(q, uk_t, scale, rows):
     return out
 
 
-@pytest.mark.parametrize("rows", [72, 128, 200, 384])
-def test_query_uk_matches_stock(rows):
+# split None: the per-shape default (one row tile per CTA from 2 tiles)
+@pytest.mark.parametrize(
+    "rows,split", [(72, None), (128, None), (200, None), (200, 1), (384, None), (384, 1)]
+)
+def test_query_uk_matches_stock(rows, split):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_uk import (
         query_uk,
     )
@@ -41,7 +44,7 @@ def test_query_uk_matches_stock(rows):
     uk_t = (torch.randn(G, LAT, NOPE, device=dev) * 0.1).to(torch.bfloat16)
     scale = torch.tensor([0.02], device=dev)
     out = torch.zeros((rows, P, ROW), dtype=torch.float8_e4m3fn, device=dev)
-    query_uk(q, uk_t, scale, out)
+    query_uk(q, uk_t, scale, out, split)
     ref = _stock(q, uk_t, scale, rows)
     a, b = out.view(torch.uint8), ref.view(torch.uint8)
     # q_pe and the padding heads: bitwise

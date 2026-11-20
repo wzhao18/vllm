@@ -7,8 +7,8 @@ Stock (and LocalQuery before): ``torch.bmm(q_nope [G, R, 128], W_UK_T [G, 128, 5
 clamped to +-448, E4M3 round to nearest -> query [R, P, 576]. The BF16 latent is
 written and read back once (2 x 2 R G KB), the pack is a separate kernel.
 
-Here CTA (h, n) of 2 G owns gathered head h's latent columns 256 n .. + 255 for every
-row: its W_UK_T slice [256 x 128] (K-major, staged once) times the q_nope rows of
+Here CTA (h, n, s) of 2 G S owns gathered head h's latent columns 256 n .. + 255 for
+the row tiles s, s + S, .. (``tile_split``): its W_UK_T slice [256 x 128] (K-major, staged once) times the q_nope rows of
 each 128-row tile (TMA, two stages) on tcgen05 (kind::f16, FP32 accumulation in
 TMEM). The accumulator is two 128-column halves with their own full/free barriers
 and epilogue warp sets (8 warps each, thread = row), so the MMAs of one half run under
@@ -123,11 +123,21 @@ def _ld_global_f32(addr):
     return "ld.global.f32 $0, [$1];", "=f,l", (Int64(addr),)
 
 
+# Row-tile split per tile count (CTA (h, n, s) takes tiles s, s + S, ..): one tile per
+# CTA from 2 tiles, so a CTA holds its SM for one tile's chain, not all of them.
+def tile_split(tiles):
+    return tiles if tiles >= 2 else 1
+
+
 class QueryUK:
-    def __init__(self, rows, gathered, q_heads, q_stride):
+    def __init__(self, rows, gathered, q_heads, q_stride, split=None):
         self.rows, self.gathered = rows, gathered
         self.q_heads, self.q_stride = q_heads, q_stride
         self.tiles = -(-rows // 128)
+        self.split = tile_split(self.tiles) if split is None else split
+        if self.tiles % self.split:
+            raise ValueError(f"query_uk: split {self.split} of {self.tiles} tiles")
+        self.per = self.tiles // self.split  # row tiles per CTA
 
     @cute.jit
     def __call__(self, q: Int64, uk_t: Int64, out: Int64, scale: Int64,
@@ -144,7 +154,7 @@ class QueryUK:
                                   (QK_NOPE * 2, LATENT * QK_NOPE * 2), (64, 256, 1),
                                   sw, l2)
         self.kernel(am, bm, q, out, scale).launch(
-            grid=(2 * self.gathered, 1, 1), block=(THREADS, 1, 1), stream=stream,
+            grid=(2 * self.gathered * self.split, 1, 1), block=(THREADS, 1, 1), stream=stream,
             use_pdl=True)
 
     @cute.kernel
@@ -168,7 +178,9 @@ class QueryUK:
         cta, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
-        h, n = cta // 2, cta % 2
+        hn = cta % (2 * self.gathered)
+        s = cta // (2 * self.gathered)  # the CTA's first row tile
+        h, n = hn // 2, hn % 2
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
         if tid == 0:
             mbar_init(b_full, Uint32(1))
@@ -197,9 +209,10 @@ class QueryUK:
         taddr = ld_shared_u32(slot)
         if warp == 0:
             if lane == 0:
-                for m in range(self.tiles):
-                    st = m % STAGES
-                    mbar_wait(a_free + Uint32(8) * Uint32(st), ((m // STAGES) & 1) ^ 1)
+                for j in range(self.per):
+                    m = s + j * self.split
+                    st = j % STAGES
+                    mbar_wait(a_free + Uint32(8) * Uint32(st), ((j // STAGES) & 1) ^ 1)
                     full = a_full + Uint32(8) * Uint32(st)
                     mbar_arrive_tx(full, Uint32(A_BYTES))
                     dst = a_smem + Uint32(A_BYTES) * Uint32(st)
@@ -209,15 +222,15 @@ class QueryUK:
         if warp == 1:
             if lane == 0:
                 mbar_wait(b_full, 0)
-                for m in range(self.tiles):
-                    st = m % STAGES
-                    mbar_wait(a_full + Uint32(8) * Uint32(st), (m // STAGES) & 1)
+                for j in range(self.per):
+                    st = j % STAGES
+                    mbar_wait(a_full + Uint32(8) * Uint32(st), (j // STAGES) & 1)
                     src = a_smem + Uint32(A_BYTES) * Uint32(st)
                     # accumulator half c (TMEM columns 128 c ..): latent columns
                     # 256 n + 128 c .. of the tile, its own full/free pair, so the
                     # MMAs of one half run under the other half's epilogue
                     for c in cutlass.range_constexpr(2):
-                        mbar_wait(acc_free + Uint32(8 * c), (m & 1) ^ 1)
+                        mbar_wait(acc_free + Uint32(8 * c), (j & 1) ^ 1)
                         tc_fence_after()
                         for k in cutlass.range_constexpr(2):
                             for kk in cutlass.range_constexpr(4):
@@ -237,15 +250,16 @@ class QueryUK:
             row = 32 * qd + lane
             quad = Uint32(32 * qd) << Uint32(16)
             inv = div_rn(Float32(1), _ld_global_f32(scale))
-            for m in range(self.tiles):
+            for j in range(self.per):
+                m = s + j * self.split
                 t = 128 * m + row
                 live = t < R
                 dst = out + (Int64(t) * P + Int64(h)) * ROW
                 if e == 0:
                     # q_pe values 32 n .. + 31 (the A stage's third block, SW128: 16 B
                     # chunk j of row r at j ^ (r % 8)) -> bytes 512 + 32 n ..
-                    st = m % STAGES
-                    mbar_wait(a_full + Uint32(8) * Uint32(st), (m // STAGES) & 1)
+                    st = j % STAGES
+                    mbar_wait(a_full + Uint32(8) * Uint32(st), (j // STAGES) & 1)
                     pe = (a_smem + Uint32(A_BYTES) * Uint32(st) + Uint32(2 * A_BLOCK)
                           + Uint32(128) * Uint32(row))
                     words = [
@@ -261,7 +275,7 @@ class QueryUK:
                         ]
                         _st_global8(dst + LATENT + 32 * n, *ws)
                 full = acc_full + Uint32(8) * Uint32(g)
-                mbar_wait(full, m & 1)
+                mbar_wait(full, j & 1)
                 tc_fence_after()
                 for c4 in cutlass.range_constexpr(2):  # (warp-collective TMEM loads)
                     v = _tmem_ld32(taddr + quad + Uint32(128) * Uint32(g)
@@ -281,14 +295,14 @@ class QueryUK:
 
 
 @cache
-def _compiled(rows, gathered, q_heads, q_stride, device):
-    kernel = QueryUK(rows, gathered, q_heads, q_stride)
+def _compiled(rows, gathered, q_heads, q_stride, device, split=None):
+    kernel = QueryUK(rows, gathered, q_heads, q_stride, split)
     args = (Int64(0), Int64(0), Int64(0), Int64(0), cuda.CUstream(0))
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args)
 
 
-def query_uk(q, uk_t, scale, out):
+def query_uk(q, uk_t, scale, out, split=None):
     """``q`` [R, G x 192] BF16 (q_b rows, row-major), ``uk_t`` [G, 512, 128] BF16
     (W_UK_T K-major), ``scale`` [1] FP32 (q_scale) -> ``out`` [R, P, 576] E4M3 heads
     0..G-1 = cat(q_nope W_UK_T, q_pe) / q_scale as the stock bmm + pack."""
@@ -301,7 +315,7 @@ def query_uk(q, uk_t, scale, out):
         raise ValueError(
             f"query_uk: q {tuple(q.shape)} {q.dtype}, uk_t {tuple(uk_t.shape)}, "
             f"out {tuple(out.shape)}")
-    fn = _compiled(rows, gathered, out.shape[1], q.stride(0), q.device.index)
+    fn = _compiled(rows, gathered, out.shape[1], q.stride(0), q.device.index, split)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     fn(Int64(q.data_ptr()), Int64(uk_t.data_ptr()), Int64(out.data_ptr()),
        Int64(scale.data_ptr()), stream)
