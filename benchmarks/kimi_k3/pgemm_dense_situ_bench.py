@@ -43,10 +43,14 @@ def main():
         t_fast = timed(lambda: mxfp8_act.situ_and_mul_fast_bf16(x, beta, lbeta))
         ulp = (ordered(mxfp8_act.situ_and_mul_fast_bf16(x, beta, lbeta))
                - ordered(situ_and_mul(x, beta, lbeta))).abs()
+        f, pr = mxfp8_act.situ_and_mul_fast_bf16(x, beta, lbeta).float(), situ_and_mul(x, beta, lbeta).float()
+        amax = pr.abs().reshape(rows, -1, 32).amax(-1, keepdim=True)
+        bulp = torch.exp2(torch.floor(torch.log2(amax.clamp_min(2.0**-126))) - 7)
+        berr = float(((f - pr).abs().reshape(rows, -1, 32) / bulp).max())
         gb = rows * d * 6 / 1e9
         print(json.dumps({"rows": rows, "d": d, "vec8_us": round(t_vec, 1), "fast_us": round(t_fast, 1),
                           "speedup": round(t_vec / t_fast, 2), "fast_TBps": round(gb / t_fast * 1e3, 2),
-                          "ulp_max": int(ulp.max()), "ulp_frac": float((ulp > 0).float().mean())}), flush=True)
+                          "ulp_max": int(ulp.max()), "block_ulp_err": round(berr, 3), "ulp_frac": float((ulp > 0).float().mean())}), flush=True)
 
 
 if __name__ == "__main__":

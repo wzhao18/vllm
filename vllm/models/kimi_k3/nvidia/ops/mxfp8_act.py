@@ -445,8 +445,9 @@ __global__ void __launch_bounds__(1024) situ4_row_kernel(
   sf[sf_off] = (uint8_t)e;
 }
 
-// SiTU-and-mul in the routed experts' MUFU-light form with BF16 output: one CTA
-// per row, 32 columns per thread, the BF16 values situ4_row_kernel quantizes.
+// SiTU-and-mul in the routed experts' MUFU-light form with BF16 output: CTA
+// (row, column chunk of 32 x blockDim columns), 32 columns per thread, the BF16
+// values situ4_row_kernel quantizes.
 template <int A_POW, bool CLAMP>
 __global__ void __launch_bounds__(1024) situ4_bf16_row_kernel(
     uint16_t* __restrict__ out, const uint16_t* __restrict__ x, const int d,
@@ -459,7 +460,7 @@ __global__ void __launch_bounds__(1024) situ4_bf16_row_kernel(
   const float2 k_a = make_float2(-log2e, -log2e), k_b = make_float2(kb, kb);
   const float2 k_c = make_float2(kc, kc), bb = make_float2(bbs, bbs);
   const int64_t row = blockIdx.x;
-  const int blk = threadIdx.x;
+  const int blk = blockIdx.y * blockDim.x + threadIdx.x;
   const uint4* gp =
       reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
   const uint4* up = reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
@@ -810,9 +811,15 @@ void situ_fast_bf16(torch::Tensor& out, const torch::Tensor& x, double beta,
   const float half = 0.5f * (float)beta;
   const int a_pow =
       (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+  // Column chunks of at most 256 threads (32 columns each): whole-row CTAs of
+  // the 18432-wide dense SiTU (576 threads) leave SMs under-occupied.
+  int threads = (int)(d / 32);
+  for (int t = 256; t >= 1; --t)
+    if ((d / 32) % t == 0) { threads = t; break; }
+  const dim3 grid((unsigned)rows, (unsigned)((d / 32) / threads));
   auto stream = c10::cuda::getCurrentCUDAStream();
 #define BF16_LAUNCH(P, C)                                                      \
-  situ4_bf16_row_kernel<P, C><<<(unsigned)rows, (unsigned)(d / 32), 0, stream>>>( \
+  situ4_bf16_row_kernel<P, C><<<grid, (unsigned)threads, 0, stream>>>(          \
       reinterpret_cast<uint16_t*>(out.data_ptr()),                             \
       reinterpret_cast<const uint16_t*>(x.data_ptr()), (int)d, x.stride(0),    \
       out.stride(0), (float)beta, (float)linear_beta)
