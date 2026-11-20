@@ -1792,6 +1792,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
                     )
+                import os as _os
+                if _os.environ.get("DCP8FIX_KDA") and not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
+
+                    def _cs(t):
+                        return None if t is None else round(float(t.float().nan_to_num(0, 0, 0).double().abs().sum()), 6)
+
+                    _route = ("seg" if seg_plan is not None and self.kda_prefill_backend == "flashkda" else "") + (
+                        "frost" if self._frost else "") + ("pers" if self._kda_persistent else "") + (
+                        "inplace" if inplace_state else "")
+                    _pco = locals().get("prefill_core_out")
+                    print(f"[kdaprobe] {self.prefix} route={_route} q={_cs(q_ns)} k={_cs(k_ns)} v={_cs(v_ns)} g={_cs(g1_ns)} b={_cs(beta_ns)} "
+                          f"init={_cs(initial_state)} his={_cs(has_initial_state)} out={_cs(core_attn_out_non_spec)} pco={_cs(_pco)} "
+                          f"last={_cs(last_recurrent_state)}", flush=True)
                 # One row-copy launch (same result as the index_put_);
                 # in-place prefill already wrote the cache rows.
                 if last_recurrent_state is not None:
