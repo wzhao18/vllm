@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""sdec DenseStream (the layer-0 dense MLP on the SP shard): the fused gate_up + SiTU
+and the down GEMM against the stock path (cuBLAS + situ_and_mul + cuBLAS) within the
+BF16 rounding of a reordered FP32 sum, bitwise deterministic, at shapes whose
+stream-K ranges cut blocks into many segments; and the SP wiring (die-local
+re-homing keeps the stock module's values)."""
+
+import types
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="tcgen05 (Blackwell / Rubin)",
+)
+
+BETA, LINEAR = 4.0, 25.0
+
+
+def _stock(x, wgu, wd):
+    gu = x @ wgu.t()
+    h = torch.empty(x.shape[0], wd.shape[1], dtype=x.dtype, device=x.device)
+    torch.ops._C.situ_and_mul(h, gu, BETA, LINEAR)
+    return h, F.linear(h, wd)
+
+
+def _close(out, ref):
+    err = (out.float() - ref.float()).abs().max().item()
+    scale = ref.float().abs().max().item()
+    assert err <= 2e-2 * scale, (err, scale)
+
+
+class _Situ:
+    """The stock SituAndMul op (the KimiMLP act_fn)."""
+
+    beta, linear_beta = BETA, LINEAR
+
+    def __call__(self, x):
+        out = x.new_empty(x.shape[0], x.shape[1] // 2)
+        torch.ops._C.situ_and_mul(out, x, BETA, LINEAR)
+        return out
+
+
+def _mlp(wgu, wd):
+    act = _Situ()
+    lin = lambda w: types.SimpleNamespace(weight=torch.nn.Parameter(w, False),
+                                          bias=None, tp_size=1)  # fmt: skip
+    return types.SimpleNamespace(
+        gate_up_proj=lin(wgu), down_proj=lin(wd), act_fn=act,
+        shard_sequence_parallel=False, gemm_rs_ar=None,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("rows", [1, 20, 40])  # 40: unfused gate_up + stock SiTU
+def test_dense_stream_matches_stock(rows):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
+        SpDenseMlp,
+    )
+
+    dev = torch.device("cuda")
+    torch.manual_seed(rows)
+    hidden, inter = 1024, 4096  # ~2-3 K steps a range: every block in many segments
+    wgu = torch.randn(2 * inter, hidden, device=dev, dtype=torch.bfloat16) * 0.03
+    wd = torch.randn(hidden, inter, device=dev, dtype=torch.bfloat16) * 0.02
+    x = torch.randn(rows, hidden, device=dev, dtype=torch.bfloat16)
+    h_ref, y_ref = _stock(x, wgu, wd)
+    mlp = _mlp(wgu.clone(), wd.clone())
+    dense = SpDenseMlp(mlp, (rows,), dev, 0)
+    y = dense.run(x).clone()
+    if rows <= 32:  # the fused form's SiTU output (unfused: a fresh stock tensor)
+        _close(dense.h[:rows], h_ref)
+    _close(y, y_ref)
+    # The re-homed stock weights keep their values; reruns are bitwise.
+    assert torch.equal(mlp.gate_up_proj.weight, wgu)
+    assert torch.equal(mlp.down_proj.weight, wd)
+    for _ in range(3):
+        assert torch.equal(dense.run(x), y)
+
+
+def test_dense_stream_layer0_shape():
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
+        SpDenseMlp,
+    )
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    hidden, inter, rows = 7168, 33792, 32
+    wgu = torch.randn(2 * inter, hidden, device=dev, dtype=torch.bfloat16) * 0.02
+    wd = torch.randn(hidden, inter, device=dev, dtype=torch.bfloat16) * 0.02
+    x = torch.randn(rows, hidden, device=dev, dtype=torch.bfloat16)
+    h_ref, y_ref = _stock(x, wgu, wd)
+    dense = SpDenseMlp(_mlp(wgu, wd), (rows,), dev, 0)
+    y = dense.run(x)
+    _close(dense.h[:rows], h_ref)
+    _close(y, y_ref)
+    # SiTU on the BF16-rounded gate / up as the stock op: only GEMM-order flips.
+    assert (dense.h[:rows] != h_ref).float().mean().item() < 0.02
