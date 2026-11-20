@@ -220,6 +220,9 @@ struct Smem {
   uint64_t full[G][NW][D];
   float red[G][2][NW][3];  // [.][parity][warp]: sum u^2, u.w, sum out^2
   int tq[G][QN];
+  float ew[G][NW][MAXB];  // per-warp normalized block weights of the token
+  const float* lhi[MAXB];  // logit row pointers (no dynamic param indexing)
+  const float* llo[MAXB];
 };
 
 // Probe builds (K31LP_PROBE & 16): per-token phase clock stamps of group 0,
@@ -303,6 +306,13 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     for (int s = 0; s < D; ++s) mbar_init(&sm.full[g][warp][s], 1);
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
   }
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int i = 0; i < MAXB; ++i) {
+      sm.lhi[i] = a.lhi[i];
+      sm.llo[i] = a.llo[i];
+    }
+  }
   // Per-call constants into shared memory.
   for (int i = threadIdx.x; i < H / 4; i += CTA_THREADS) {
     reinterpret_cast<float4*>(sm.w)[i] = __ldg(reinterpret_cast<const float4*>(a.w) + i);
@@ -360,8 +370,8 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   auto load_logits = [&](int it) {
     const int t = sm.tq[g][it & (QN - 1)];
     if (lane < n && t >= 0) {
-      nl_hi = __ldg(a.lhi[lane] + t);
-      nl_lo = __ldg(a.llo[lane] + t);
+      nl_hi = __ldg(sm.lhi[lane] + t);
+      nl_lo = __ldg(sm.llo[lane] + t);
       nl_r = __ldg(a.rstd + (int64_t)lane * a.rstd_stride + t);
     }
   };
@@ -379,21 +389,14 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     // Block logits of this token (prefetched), then prefetch the next.
     const float s_mine = (nl_hi + nl_lo) * nl_r;
     load_logits(it + 1);
-    float e[MAXB];
-    float m_b = -FLT_MAX;
+    // Lane i < n: block i's softmax term (one register, not an array).
+    float m_b = lane < n ? s_mine : -FLT_MAX;
 #pragma unroll
-    for (int i = 0; i < MAXB; ++i) {
-      e[i] = __shfl_sync(0xffffffff, s_mine, i);
-      if (i < n) m_b = fmaxf(m_b, e[i]);
-    }
-    float z_b = 0.f;
+    for (int o = 16; o > 0; o >>= 1) m_b = fmaxf(m_b, __shfl_xor_sync(0xffffffff, m_b, o));
+    float e_mine = lane < n ? exp2f((s_mine - m_b) * LOG2_E) : 0.f;
+    float z_b = e_mine;
 #pragma unroll
-    for (int i = 0; i < MAXB; ++i) {
-      if (i < n) {
-        e[i] = exp2f((e[i] - m_b) * LOG2_E);
-        z_b += e[i];
-      }
-    }
+    for (int o = 16; o > 0; o >>= 1) z_b += __shfl_xor_sync(0xffffffff, z_b, o);
 
     // Prefix source u = bf16(prefix + delta).
     vec_t u[NCH];
@@ -475,9 +478,11 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       const float inv = 1.f / (z_b * sc + ep);
       const float c_acc = sc * inv;
 #pragma unroll
-      for (int i = 0; i < MAXB; ++i) e[i] *= c_acc;
+      e_mine *= c_acc;
       c_u = ep * inv;
     }
+    if (lane < MAXB) sm.ew[g][warp][lane] = e_mine;
+    __syncwarp();
     float acc[NCH][VEC];
 #pragma unroll
     for (int k = 0; k < NCH; ++k) {
@@ -491,9 +496,7 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
 #pragma unroll 1
     for (int i = 0; i < n; ++i) {
       const vec_t* s = wait_row();
-      float ei = e[0];
-#pragma unroll
-      for (int q = 1; q < MAXB; ++q) ei = (i == q) ? e[q] : ei;
+      const float ei = sm.ew[g][warp][i];
 #pragma unroll
       for (int k = 0; k < ((K31LP_PROBE & 1) ? 0 : NCH); ++k) {
         float f[VEC];
