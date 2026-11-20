@@ -416,6 +416,9 @@ class SpBoundary:
                 gather_mx, out_mx is not None,
             )  # fmt: skip
         self.push_rows = push_rows  # R -> the reduce kernel pushes the partial
+        for rows in sorted(self.checked_rows):  # the GEMM check arguments, before capture
+            for parity in (0, 1):
+                comm.mx_checked_view(parity, rows)
 
     def gather(self, delta, prefix, blocks, parity):
         """The pre-AttnRes of ``delta`` (None: none) over this rank's shard, all-

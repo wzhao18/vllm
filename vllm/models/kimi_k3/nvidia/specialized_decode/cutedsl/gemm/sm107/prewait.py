@@ -46,11 +46,12 @@ def check_args(data: int, scale: int, rows: int, k: int, device) -> torch.Tensor
     word 2 the activation rows to check (0: none), word 3 the activation row pitch K;
     int64 words 2 / 3 the global addresses of the activation's MXFP8 data [R, K] and
     its F8_128x4 scales (``check_x``)."""
-    args = torch.zeros(8, dtype=torch.float32)
+    args = torch.zeros(8, dtype=torch.float32, device=device)
     args[0] = 1.0
-    args.view(torch.int32)[2:4] = torch.tensor([rows, k], dtype=torch.int32)
-    args.view(torch.int64)[2:4] = torch.tensor([data, scale], dtype=torch.int64)
-    return args.to(device)
+    words, words64 = args.view(torch.int32), args.view(torch.int64)
+    words[2], words[3] = rows, k
+    words64[2], words64[3] = data, scale
+    return args
 
 
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
