@@ -138,7 +138,7 @@ OFF_INV = OFF_FLAG + 16  # [96] out_scale / l of the token in its epilogue
 OFF_TOK0 = OFF_INV + H * 4  # token parity 0: [2 WG][2 (l, m)][96]
 NSL = 2 * NS  # logical mode: physical-row ring (the producer runs up to NSL stages ahead)
 NCR = 32  # logical mode: token-count ring (> NSL + NS: the producer's max token lead)
-NBAR = 96
+NBAR = 104
 OFF_BAR = OFF_TOK0 + 4 * H * 4
 OFF_TMEM = OFF_BAR + NBAR * 8
 OFF_GMASK = OFF_TMEM + 16  # [2 WG][2 (u // 2 parity)][4] u32: heads that grew (ballots)
@@ -171,7 +171,8 @@ B_SLFULL = B_NFULL + NCR  # x NSL (logical mode: physical rows of stage g % NSL 
 B_SLEMPTY = B_SLFULL + NSL  # x NSL (... read by every gather warp)
 B_SFULL1, B_SFREE1 = B_SLEMPTY + NSL, B_SLEMPTY + NSL + 2  # x2: S keys 32-63 (qkh knob)
 B_TKI = B_SFREE1 + 2  # x2 (token parity): top-k row copy landed
-assert B_TKI + 2 <= NBAR
+B_QKI = B_TKI + 2  # x8 (u % 8): QK(u) issued (pvd knob: PV(u - pvd) waits for it)
+assert B_QKI + 8 <= NBAR
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
 # 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
 # warpgroup-wide
@@ -391,10 +392,10 @@ class SparseMlaPrefillH8:
         # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
-        knobs = tuple(knobs) + (0,) * (14 - len(knobs))
+        knobs = tuple(knobs) + (0,) * (15 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys) = knobs[:14]
+         self.qkh, self.lglob, self.xphys, self.pvd) = knobs[:15]
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -412,6 +413,12 @@ class SparseMlaPrefillH8:
         # (TMA gather4): logical mode with the shared-memory top-k slot producer
         self.ldgsts = self.cpa in (3, 4, 5, 6)
         self.prod2 = self.cpa in (3, 4, 5, 7)
+        # pvd: PV(u) is issued only after QK(u + pvd) was issued (within a token), so the
+        # tensor pipe runs QK(u + pvd), PV(u), QK(u + pvd + 1): with pvd 2 the PV of an
+        # older subtile covers the single-S round trip (S(u) load -> QK(u + 1) issue)
+        # production pvd 2 (knob 0); 9 = off (diagnostic); qkh issues QK in halves: no pvd
+        self.pvd = 0 if self.qkh or self.pvd == 9 else (self.pvd or 2)
+        assert self.pvd in (0, 1, 2, 3), self.pvd
         # KVFULL arrivals per stage: one noinc async arrive per copying lane (3, 4, 6), one
         # per gather warp (5, 2 + the expect-tx arrive), per-lane RoPE copies (1), TMA (0)
         self.kv_full_arrivals = (256 if self.ldgsts and self.cpa != 5 else 8 if self.cpa == 5
@@ -468,6 +475,8 @@ class SparseMlaPrefillH8:
                 mbar_init(_bar(base, B_QFULL + j), Uint32(1))
                 mbar_init(_bar(base, B_QREMPTY + j), Uint32(1))
                 mbar_init(_bar(base, B_TKI + j), Uint32(1))
+            for j in cutlass.range_constexpr(8):
+                mbar_init(_bar(base, B_QKI + j), Uint32(1))
             for j in cutlass.range_constexpr(4):
                 mbar_init(_bar(base, B_OFREE + j), Uint32(4))
             for j in cutlass.range_constexpr(NP):
@@ -1280,6 +1289,9 @@ class SparseMlaPrefillH8:
             commit_e(_bar(base, B_SFULL + u % 2))
             if last:
                 commit_e(_bar(base, B_QREMPTY + qi % 2))
+            if cutlass.const_expr(self.pvd):
+                if lane == 0:
+                    mbar_arrive(_bar(base, B_QKI + u % 8))
 
     @cute.jit
     def qk_halves(self, base, taddr, u, qi, last, sc, qs, bd0):
@@ -1319,6 +1331,10 @@ class SparseMlaPrefillH8:
             for i in range(subs):
                 s = u % NS
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                if cutlass.const_expr(self.pvd):
+                    if i + self.pvd < subs:
+                        v = u + self.pvd
+                        mbar_wait(_bar(base, B_QKI + v % 8), Uint32((v // 8) & 1))
                 mbar_wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
                 self.ss(base, cta, lane, u, 18, 4)
                 if cutlass.const_expr(self.cpa in (2, 3, 6)):
