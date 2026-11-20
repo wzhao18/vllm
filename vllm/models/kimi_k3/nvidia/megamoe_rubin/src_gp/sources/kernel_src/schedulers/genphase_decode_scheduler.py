@@ -487,7 +487,7 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         """Die-aware: one shared FC1 and one shared FC2 counter per die (each die's home half of the feature
         blocks: counters FC1 die 0, FC1 die 1, FC2 die 0, FC2 die 1); die-blind: the mixin's FC1 + FC2 counters."""
         count = SharedExpertStreamMixin.shared_stream_count.fget(self)
-        return count + (2 if count and self.die_count == 2 else 0)
+        return count + (1 if count and self.die_count == 2 else 0)  # DIAG V4: 7 counters
 
     @cute.jit
     def _claim_die_half(self, work_id_worker, side: Int32, phase: int = 0):
@@ -526,7 +526,6 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             else:
                 stage = stage + Int32(1)
         else:
-            own = Int32(self._mapping.owner_index)  # DIAG V3
             shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
             if shared_id < Int32(0):
                 shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
