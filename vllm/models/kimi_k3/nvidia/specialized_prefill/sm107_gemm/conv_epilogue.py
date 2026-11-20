@@ -1290,6 +1290,16 @@ def _t2_chunk(
         # Microbench probe: stores issued but predicated off (no memory).
         for fi in cutlass.range_constexpr(16):
             stg_u32(obase + fi * p_dim * 2, b2i(r0 < 0), ys[fi])
+    elif cutlass.const_expr(probe == 3):
+        # Microbench probe: same bytes, full 128 B lines per warp store (the
+        # two half-warps of a warp fill one line; scrambled layout).
+        gcol = Int64(part) * Int64(p_dim) + Int64(cc)
+        tl = Int64(r0 // 256) * Int64(3 * p_dim // 256) + gcol // 256
+        rcl = (r0 % 128) // 16
+        line = ((Int64((r0 // 128) % 2) * 8 + (gcol % 256) // 32) * 4 + Int64(rcl // 2)) * 16
+        pb = out_addr + tl * 131072 + line * 128 + Int64(rcl % 2) * 64 + ((gcol % 32) // 2) * 4
+        for fi in cutlass.range_constexpr(16):
+            stg_u32_all(pb + fi * 128, ys[fi])
     elif b2i(gm <= _D_EXACT) * b2i(r0 + 16 <= row_end) != 0:
         for fi in cutlass.range_constexpr(16):
             stg_u32_all(obase + fi * p_dim * 2, ys[fi])
