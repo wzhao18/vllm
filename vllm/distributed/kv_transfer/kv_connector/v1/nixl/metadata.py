@@ -325,6 +325,9 @@ class KVFingerprintReq:
     # without cells, so the comparator reports the request's cells missing on
     # D rather than listing it as P only.
     exchanged: bool = True
+    # Per SSM (KDA) group: the running-state slot a transfer moves
+    # (clip_ssm_state_blocks of the request's own blocks).
+    state_blocks: dict[int, int] = field(default_factory=dict)
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):

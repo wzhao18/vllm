@@ -293,6 +293,97 @@ def layer_views(
     return views
 
 
+def byte_pages(
+    cache: torch.Tensor, base: int, page_bytes: int, stride: int, num_pages: int
+) -> torch.Tensor:
+    """``[num_pages, page_bytes]`` uint8 view of the NIXL region at ``base``
+    (page ``b`` at ``base + b * stride``) in ``cache``'s storage."""
+    storage = cache.untyped_storage()
+    offset = base - storage.data_ptr()
+    end = offset + (num_pages - 1) * stride + page_bytes
+    if num_pages < 1 or offset < 0 or stride < page_bytes or end > storage.nbytes():
+        raise ValueError(
+            f"region {base:#x} ({num_pages} pages of {page_bytes} B, stride "
+            f"{stride}) is not inside the cache storage"
+        )
+    pages = torch.empty(0, dtype=torch.uint8, device=cache.device)
+    pages.set_(storage, offset, (num_pages, page_bytes), (stride, 1))
+    return pages
+
+
+@dataclass(frozen=True)
+class StateView:
+    """One SSM (KDA) layer's state pages, as NIXL moves them.
+
+    Page ``b`` (``pages[b]``) holds ``segments``: ``(offset, size)`` byte runs
+    of the conv sub-projections, then the temporal state. TP rank ``r`` of
+    ``tp_size`` holds slice ``r`` of each segment of the TP1 page, which
+    starts at ``tp_size * offset + r * size`` there: words are keyed by that
+    TP1 offset, so the sum over any TP's ranks is the same.
+    """
+
+    name: str
+    pages: torch.Tensor
+    segments: tuple[tuple[int, int], ...]
+    tp_size: int
+    tp_rank: int
+
+
+def state_fingerprint(view: StateView, block_id: int) -> int:
+    """``F`` of one state page: each 32-bit word ``w`` at TP1 byte offset
+    ``o`` adds ``splitmix64(o / 4 ^ salt) * (2 c(w) + 1)``."""
+    page = view.pages[block_id]
+    mix = _i64(salt(view.name, "state"))
+    total = torch.zeros((), dtype=torch.int64, device=page.device)
+    for offset, size in view.segments:
+        if offset % 4 or size % 4:
+            raise ValueError(f"{view.name}: state segment {offset}+{size} not in words")
+        full = view.tp_size * offset + view.tp_rank * size
+        ids = torch.arange(full // 4, (full + size) // 4, device=page.device)
+        words = page[offset : offset + size].view(-1, 4)
+        total += (_splitmix64(ids ^ mix) * (2 * _row_hash(words) + 1)).sum()
+    return int(total.item()) & _U64
+
+
+@dataclass(frozen=True)
+class DraftView:
+    """One head-sharded GQA drafter layer's pages ``[blocks, heads, tokens,
+    bytes]``: this rank's KV heads ``head0 ..`` of ``total_heads``, for the
+    last ``window`` tokens (all when None) the drafter attends to."""
+
+    name: str
+    pages: torch.Tensor
+    head0: int
+    total_heads: int
+    window: int | None
+
+
+def draft_fingerprint(
+    view: DraftView, block_ids: Sequence[int], num_tokens: int
+) -> int:
+    """``F`` of a request's draft rows: row ``(t, h)`` (token ``t``, KV head
+    ``h``) adds ``splitmix64((t * heads + h) ^ salt) * (2 c(row) + 1)``."""
+    _, heads, block_size, _ = view.pages.shape
+    first = 0 if view.window is None else max(0, num_tokens - view.window)
+    if num_tokens <= first:
+        return 0
+    if len(block_ids) < cdiv(num_tokens, block_size):
+        raise ValueError(
+            f"{view.name}: {len(block_ids)} blocks cannot hold {num_tokens} tokens"
+        )
+    device = view.pages.device
+    tokens = torch.arange(first, num_tokens, device=device)
+    ids = torch.tensor(list(block_ids), dtype=torch.int64, device=device)
+    blocks, rows = ids[tokens // block_size], tokens % block_size
+    mix = _i64(salt(view.name, "draft_h"))
+    total = torch.zeros((), dtype=torch.int64, device=device)
+    for h in range(heads):
+        key = tokens * view.total_heads + (view.head0 + h)
+        row_hash = _row_hash(view.pages[blocks, h, rows])
+        total += (_splitmix64(key ^ mix) * (2 * row_hash + 1)).sum()
+    return int(total.item()) & _U64
+
+
 def compute_fingerprint(
     views: Sequence[LayerView],
     block_ids: Sequence[int],
@@ -437,6 +528,23 @@ class KVFingerprintLog:
             req_id, num_tokens, first_block, block_ids, cells, fp, extra
         )
 
+    def log_values(
+        self,
+        req_id: str,
+        kind: str,
+        values: Sequence[tuple[str, str, bool, int]],
+        num_tokens: int,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Appends a record of whole-request ``F`` values ``(layer, field,
+        draft, F)`` of ``kind`` ("state", "draft"): no cells, the comparator
+        sums them over ranks."""
+        fp = [
+            {"layer": layer, "field": field, "draft": draft, "f": [f"{value:016x}"]}
+            for layer, field, draft, value in values
+        ]
+        return self._append(req_id, num_tokens, 0, [], [], fp, extra, kind=kind)
+
     def log_unexchanged(
         self,
         req_id: str,
@@ -463,9 +571,11 @@ class KVFingerprintLog:
         cells: list[tuple[int, int, int]],
         fp: list[dict[str, Any]],
         extra: Mapping[str, Any] | None,
+        kind: str = "dsa",
     ) -> dict[str, Any]:
         record = {
             "v": RECORD_VERSION,
+            "kind": kind,
             "side": self.side,
             "rank": self.dcp_rank,
             "grid": [self.grid.p_dcp_size, self.grid.d_dcp_size, self.grid.block_size],
