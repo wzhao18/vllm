@@ -86,7 +86,7 @@ LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
 # DIAG ONLY (D-MOE-LADDER R6-2, never lands): "pre" = no fused shared expert; the
 # shared expert forks to its side stream BEFORE the router | latent down, so it
 # streams under the router / top-k staging, and MegaMoE runs the routed experts only.
-_DML_SHPRE = "pre"
+_DML_SHPRE = "ser"
 
 
 class SplitKFront:
