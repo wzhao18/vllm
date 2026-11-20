@@ -1278,7 +1278,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             phase = work_tile.phase
             if _dms_u < Int32(16):
                 DG.put_gt_dyn(Int32(DG.S_TAU0) + _dms_u)
-                DG.put_val_dyn(Int32(DG.S_TAPH0) + _dms_u, cutlass.Int64(phase))
+                DG.put_val_dyn(Int32(DG.S_TAPH0) + _dms_u, cutlass.Int64(phase) | (cutlass.Int64(work_tile.expert_idx & Int32(0xFFFF)) << cutlass.Int64(8)))
             _dms_u = _dms_u + Int32(1)
             # The fixed FC1 / FC2 range names the iket summaries key on (shared tiles count with their GEMM).
             if self._is_fc1_gemm(phase):

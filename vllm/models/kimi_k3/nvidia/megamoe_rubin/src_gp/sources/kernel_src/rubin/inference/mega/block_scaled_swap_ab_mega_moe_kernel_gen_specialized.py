@@ -1564,6 +1564,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                     die = cute.arch.make_warp_uniform(self._die_from_mask())
                 else:
                     die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
+                DG.put_val(DG.S_DIE, Int64(die) + Int64(1), Int32(cute.arch.thread_idx()[0] == Int32(0)))
             self.scheduler.assign_device_members(
                 expert_token_sizes=scheduler_expert_sizes,
                 block_idx=block_idx,

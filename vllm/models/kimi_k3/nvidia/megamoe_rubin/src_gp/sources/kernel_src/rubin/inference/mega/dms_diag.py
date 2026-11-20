@@ -36,7 +36,8 @@ S_FPUB0, S_FUNIT0 = 32, 36  # first 4 publishes (time, unit code)
 S_TOKREADY, S_FIRSTROUTED = 26, 27
 S_PUB0, S_UNIT0 = 52, 56  # last 4 scheduler publishes: time (52..55) and unit code (56..59), index = n % 4
 S_BLOCK, S_EPOCH = 62, 63
-S_TAU0, S_TAPH0 = 64, 80  # TMA-A unit k start time / phase, k < 16
+S_TAU0, S_TAPH0 = 64, 80
+S_DIE = 7  # die + 1 of this CTA (die-aware builds)  # TMA-A unit k start time / phase, k < 16
 # comm grid (token_comm) CTAs: entry, previous-tail wait passed, role work done, refine done, exit, role, epoch tag
 C_ENTRY, C_EPOK, C_ROLE, C_REFINE, C_EXIT, C_ROLEID, C_EPOCH = 12, 13, 14, 15, 18, 20, 21
 
