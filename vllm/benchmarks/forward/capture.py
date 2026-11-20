@@ -54,6 +54,23 @@ class _NanProbe:
             return
         for name, mod in model.named_modules():
             self.handles.append(mod.register_forward_hook(self._hook(name)))
+        from vllm.model_executor.kernels.linear.cute_dsl import gemm_rs_ar as g
+        op = g._gemm_rs_ar
+        if op is not None and not hasattr(op, "_probe_orig"):
+            op._probe_orig = op.apply
+            hin, hout = self._hook("gemm_rs_ar.in"), self._hook("gemm_rs_ar.out")
+            hres = self._hook("gemm_rs_ar.res")
+
+            def apply(x, linear, residual=None, residual_row0=0, copy_out=True):
+                hin(None, None, x)
+                if residual is not None:
+                    hres(None, None, residual)
+                out = op._probe_orig(x, linear, residual, residual_row0, copy_out)
+                hout(None, None, out)
+                return out
+
+            op.apply = apply
+        self.op = op
 
     def _hook(self, name):
         def hook(mod, inp, out):
@@ -89,6 +106,9 @@ class _NanProbe:
             return
         for h in self.handles:
             h.remove()
+        if getattr(self, "op", None) is not None and hasattr(self.op, "_probe_orig"):
+            self.op.apply = self.op._probe_orig
+            del self.op._probe_orig
         rank = get_world_group().rank_in_group
         for k, recs in enumerate(self.passes):
             bad = [r for r in recs if not r[3]]
