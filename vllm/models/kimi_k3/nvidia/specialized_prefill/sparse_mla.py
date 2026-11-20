@@ -869,6 +869,21 @@ def sparse_mla_prefill(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                                  unit_rows=unit_rows, out=out)
 
 
+def sparse_mla_prefill_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
+                               topk_indices: torch.Tensor, req_ids: torch.Tensor,
+                               block_table: torch.Tensor, block_size: int,
+                               block_stride_rows: int, scale: float,
+                               out_scale: float) -> torch.Tensor:
+    """``sparse_mla_prefill`` on the indexer's request-relative top-k: the index remap
+    runs inside the kernel's gather (see sparse_mla_h8.sparse_mla_prefill_h8_logical)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+        sparse_mla_prefill_h8_logical,
+    )
+
+    return sparse_mla_prefill_h8_logical(q8, kv_rows, topk_indices, req_ids, block_table,
+                                         block_size, block_stride_rows, scale, out_scale)
+
+
 def sparse_mla_prefill_v1(q8: torch.Tensor, kv_rows: torch.Tensor, unit_rows: int,
                        slots: torch.Tensor, lengths: torch.Tensor, scale: float,
                        out_scale: float, out: torch.Tensor | None = None,
