@@ -21,6 +21,7 @@ ap.add_argument("--rows", default="128,256")
 ap.add_argument("--arms", required=True)
 ap.add_argument("--chain", type=int, default=16)
 ap.add_argument("--reps", type=int, default=15)
+ap.add_argument("--warm", action="store_true")
 args = ap.parse_args()
 
 from flashinfer import mxfp8_quantize  # noqa: E402
@@ -46,13 +47,14 @@ def quant_split(t, L):
     return torch.stack(qs).contiguous(), torch.cat(ss).contiguous()
 
 
-def compile_arm(tile, cluster, swap, inst_m, L, cdt):
+def compile_arm(tile, cluster, swap, inst_m, L, cdt, dbg=0, dl=0, st=0):
     gemm = pw.Sm107BlockScaledPersistentDenseGemmKernel(
         pw.SF_VEC, (inst_m, tile[1], pw.INST_K), (tile[0], tile[1], pw.TILER_K), cluster,
         prefetch_dist=0, use_pdl=True, prewait_stages=0, weight_is_a=swap, quiet_wait=False,
-        producers=1, die_claim=False,
+        producers=1, die_claim=bool(dl),
     )
-    gemm.dbg_skip_mma = False
+    gemm.dbg_skip_mma = bool(dbg)
+    gemm.dbg_stamps = bool(st)
     gemm.max_ab_stages = 0
     sm, sk, sn = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
@@ -65,7 +67,8 @@ def compile_arm(tile, cluster, swap, inst_m, L, cdt):
         c = cute.runtime.make_fake_compact_tensor(ct, (sm, sn), stride_order=(1, 0), assumed_align=16)
     sfa = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
     sfb = make_ptr(cutlass.Float8E8M0FNU, 16, cute.AddressSpace.gmem, 16)
-    alpha = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
+    alpha = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (cute.sym_int() if dl or st else 1,), assumed_align=4)
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
     mac = pw._max_active_clusters(cluster[0] * cluster[1])
     return cute.compile(
@@ -77,6 +80,51 @@ def compile_arm(tile, cluster, swap, inst_m, L, cdt):
 
 flush = torch.empty(512 * 1024 * 1024, device=dev, dtype=torch.uint8)
 alpha_t = torch.ones(1, device=dev, dtype=torch.float32)
+
+
+def stamp_summary(aux):
+    """Per-CTA timeline (us from the earliest entry) of the last call that wrote aux."""
+    v = aux.view(torch.int32)[512:512 + 4096].view(-1, 8).to(torch.int64).cpu()
+    live = v[:, 0] != 0
+    v = v[live]
+    base = v[:, 0].min()
+    rel = ((v - base) % (1 << 32)).double() / 1000.0
+    ent, f0, f1, end, i0, i1 = rel[:, 0], rel[:, 1], rel[:, 2], rel[:, 3], rel[:, 5], rel[:, 6]
+    lead = v[:, 1] != 0
+
+    def q(x):
+        x = x.sort().values
+        return [round(float(x[int(f * (len(x) - 1))]), 2) for f in (0.0, 0.5, 1.0)]
+    return dict(ctas=int(live.sum()), entry=q(ent), issue0=q(i0 - ent), ramp=q(f0[lead] - i0[lead]),
+                stream=q(f1[lead] - f0[lead]), lastiss=q(i1 - ent), tail=q(end[lead] - f1[lead]),
+                end=q(end))
+
+
+def die_setup(wq, L, tile_m, words=272):
+    """W [L][N][K/L] with the rows of the first n0 M pairs homed on die 0 (both K halves),
+    plus one claim/alpha aux per chain slot (cluster tile c -> pair c // L, half c % L)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.dies import (
+        CHUNK, localized_like, sm_domains)
+    table = sm_domains(dev.index or 0)
+    share = sum(1 for d in table if d == 0) / len(table)
+    _, n, kh = wq.shape
+    pairs = -(-n // tile_m)
+    n0 = round(pairs * share)
+    split = n0 * tile_m
+    nbytes = wq.numel() * wq.element_size()
+    chunks = -(-nbytes // CHUNK)
+    doms = [0 if (int((i + 0.5) * CHUNK) % (n * kh)) // kh < split else 1 for i in range(chunks)]
+    auxs = []
+    for _ in range(args.chain):
+        aux = torch.zeros(words, dtype=torch.float32, device=dev)
+        ints = aux.view(torch.int32)
+        aux[0] = 1.0
+        ints[8], ints[9], ints[10], ints[11] = 0, n0 * L, n0 * L, (pairs - n0) * L
+        ints[12], ints[13] = pairs, L
+        ints[16:16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=dev)
+        auxs.append(aux)
+    print(f'die split: {n0}/{pairs} pairs on die 0 (share {share:.3f})', flush=True)
+    return (lambda: localized_like(wq, doms)), auxs
 res = []
 for R in [int(r) for r in args.rows.split(",")]:
     x = torch.randn(R, K, device=dev, dtype=torch.bfloat16)
@@ -86,15 +134,29 @@ for R in [int(r) for r in args.rows.split(",")]:
                            scale_b=ws1.view(torch.float8_e8m0fnu), out_dtype=torch.float32)
     for arm in args.arms.split(","):
         try:
-            tile, cl, swap, instm, L, cdt = arm.split(":")
+            tile, cl, swap, instm, L, cdt, *xd = arm.split(":")
+            dbg = int(xd[0]) if xd else 0
+            dl = int(xd[1]) if len(xd) > 1 else 0
+            st = int(xd[2]) if len(xd) > 2 else 0
             tile = tuple(int(v) for v in tile.split("x"))
             cl = tuple(int(v) for v in cl.split("x"))
             swap, L = swap == "1", int(L)
-            comp, gemm = compile_arm(tile, cl, swap, int(instm), L, cdt)
+            comp, gemm = compile_arm(tile, cl, swap, int(instm), L, cdt, dbg, dl, st)
             xq, xs = quant_split(x, L)
             wq, ws = quant_split(w_bf, L)
             ncopy = max(args.chain, -(-1_600_000_000 // wq.numel()))
-            W = [(wq.clone(), ws.clone()) for _ in range(ncopy)]
+            if dl:
+                if not swap or tuple(cl) != (2, 1) or tile[1] < R:
+                    raise ValueError('dl arms: swap 2x1 with one token tile')
+                wplace, auxs = die_setup(wq, L, tile[0], 4608 if st else 272)
+                W = [(wplace(), ws)] * ncopy if args.warm else [(wplace(), ws.clone()) for _ in range(ncopy)]
+            else:
+                auxs = None
+                if st:
+                    big = torch.zeros(4608, dtype=torch.float32, device=dev)
+                    big[0] = 1.0
+                    auxs = [big]
+                W = [(wq, ws)] * ncopy if args.warm else [(wq.clone(), ws.clone()) for _ in range(ncopy)]
             kh = K // L
             km, kn = (N, R) if swap else (R, N)
             sf = ((km + 127) // 128, (kn + 127) // 128, (kh // 32 + 3) // 4)
@@ -109,7 +171,8 @@ for R in [int(r) for r in args.rows.split(",")]:
                 else:
                     a_, b_, asf, bsf = xq[0], w[0], xs, s
                     c_ = out[0]
-                comp(a_, b_, c_, *sf, asf.data_ptr(), bsf.data_ptr(), alpha_t)
+                comp(a_, b_, c_, *sf, asf.data_ptr(), bsf.data_ptr(),
+                     alpha_t if auxs is None else auxs[i % len(auxs)])
 
             out = outs[0]
             out.fill_(float("nan"))
@@ -128,7 +191,8 @@ for R in [int(r) for r in args.rows.split(",")]:
                     call(i, outs[i % 2])
             ts = []
             for _ in range(args.reps + 2):
-                flush.zero_()
+                if not args.warm:
+                    flush.zero_()
                 e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
                 e0.record()
                 g.replay()
@@ -137,6 +201,8 @@ for R in [int(r) for r in args.rows.split(",")]:
                 ts.append(e0.elapsed_time(e1) * 1000 / args.chain)
             row = dict(R=R, arm=arm, rel=rel, stages=getattr(gemm, "num_ab_stage", None),
                        us=round(statistics.median(ts[2:]), 2))
+            if st:
+                row["stamps"] = stamp_summary(auxs[(args.chain - 1) % len(auxs)])
         except Exception as e:  # report and continue
             row = dict(R=R, arm=arm, error=f"{type(e).__name__}: {str(e)[:300]}")
         print(json.dumps(row), flush=True)
