@@ -49,6 +49,9 @@ A_BYTES = 3 * A_BLOCK  # a row tile's q_nope (two K blocks) and q_pe
 B_BYTES = 256 * 128 * 2  # W_UK_T slice [256 x 128] BF16 (two SW128 K blocks)
 B_HALF = 128 * 128  # one 128-column half's rows inside a B K block
 STAGES = 2
+# latent staging for the TMA store: per accumulator half [128 rows x 128 B] FP8, SW128
+OUT_HALF = 128 * 128
+SMEM_CAP = 227 * 1024
 # warp 0 TMA, warp 1 MMA, warps 4-11 the epilogue of accumulator half 0 (warps 4-7
 # its columns 0-63 and the q_pe, 8-11 columns 64-127), warps 12-19 of half 1 (each
 # set of four covers the TMEM lane quadrants)
@@ -106,6 +109,40 @@ def _q4_bf16(w0, w1, inv):
 
 
 @asm()
+def _st_shared4(addr, w0, w1, w2, w3):
+    return ("st.shared.v4.b32 [$0], {$1, $2, $3, $4};", "r,r,r,r,r,~{memory}",
+            (Uint32(addr), Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3)))
+
+
+@asm()
+def _named_sync(bid, n):
+    return "bar.sync $0, $1;", "r,r,~{memory}", (Uint32(bid), Uint32(n))
+
+
+@asm()
+def _fence_async_shared():
+    return "fence.proxy.async.shared::cta;", "~{memory}", ()
+
+
+@asm()
+def _tma_store3d(tmap, src, c0, c1, c2):
+    code = ("cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group "
+            "[$0, {$2, $3, $4}], [$1]; cp.async.bulk.commit_group;")
+    return code, "l,r,r,r,r,~{memory}", (Int64(tmap), Uint32(src), Int32(c0), Int32(c1),
+                                         Int32(c2))
+
+
+@asm()
+def _bulk_wait_read():
+    return "cp.async.bulk.wait_group.read 0;", "~{memory}", ()
+
+
+@asm()
+def _bulk_wait():
+    return "cp.async.bulk.wait_group 0;", "~{memory}", ()
+
+
+@asm()
 def _st_global8(addr, *w):
     return ("st.global.v8.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};",
             "l," + ",".join(["r"] * 8) + ",~{memory}",
@@ -131,12 +168,14 @@ class QueryUK:
         # A stages: every row tile of up to three in flight from the start (the tile
         # loads, ~1 us per 48 KB tile, are the CTA's serial chain); 3 x 48 KB + the
         # 64 KB weight slice fit the 227 KB of shared memory
-        self.stages = min(max(self.tiles, STAGES), 3)
+        fixed = B_BYTES + 2 * OUT_HALF + 128
+        self.stages = 3 if self.tiles >= 3 and fixed + 3 * A_BYTES <= SMEM_CAP else STAGES
 
     @cute.jit
     def __call__(self, q: Int64, uk_t: Int64, out: Int64, scale: Int64,
                  stream: cuda.CUstream):
         bf = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+        u8 = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8
         sw = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
         l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         # A: q rows [R, G * 192]: [128 rows x 64] boxes at column 192 h + 64 k
@@ -147,20 +186,27 @@ class QueryUK:
         bm = tensormap.encode_map(uk_t, bf, (QK_NOPE, LATENT, self.gathered),
                                   (QK_NOPE * 2, LATENT * QK_NOPE * 2), (64, 256, 1),
                                   sw, l2)
-        self.kernel(am, bm, q, out, scale).launch(
+        # out: query rows [R, P x 576] bytes: [128 rows x 128 B] boxes (store; rows
+        # past R are clipped)
+        width = self.q_heads * ROW
+        om = tensormap.encode_map(out, u8, (width, self.rows, 1),
+                                  (width, self.rows * width), (128, 128, 1), sw, l2)
+        self.kernel(am, bm, om, q, out, scale).launch(
             grid=(2 * self.gathered, 1, 1), block=(THREADS, 1, 1), stream=stream,
             use_pdl=True)
 
     @cute.kernel
-    def kernel(self, am: tensormap.GridMap, bm: tensormap.GridMap, q: Int64,
-               out: Int64, scale: Int64):
+    def kernel(self, am: tensormap.GridMap, bm: tensormap.GridMap,
+               om: tensormap.GridMap, q: Int64, out: Int64, scale: Int64):
         R, P = self.rows, self.q_heads
         smem = cutlass.utils.SmemAllocator()
         base = Uint32(smem.allocate_array(
-            Uint8, B_BYTES + self.stages * A_BYTES + 128, byte_alignment=1024).toint())
+            Uint8, B_BYTES + self.stages * A_BYTES + 2 * OUT_HALF + 128,
+            byte_alignment=1024).toint())
         b_smem = base
         a_smem = base + Uint32(B_BYTES)
-        bars = a_smem + Uint32(self.stages * A_BYTES)
+        o_smem = a_smem + Uint32(self.stages * A_BYTES)
+        bars = o_smem + Uint32(2 * OUT_HALF)
         # b_full, a_full[stages], a_free[stages], acc_full[2], acc_free[2], slot
         b_full = bars
         a_full = bars + Uint32(8)
@@ -174,6 +220,7 @@ class QueryUK:
         lane = tid % 32
         h, n = cta // 2, cta % 2
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
+        tm_o = tensormap.map_address(om)
         if tid == 0:
             mbar_init(b_full, Uint32(1))
             for st in cutlass.range_constexpr(self.stages):
@@ -267,16 +314,32 @@ class QueryUK:
                 full = acc_full + Uint32(8) * Uint32(g)
                 mbar_wait(full, m & 1)
                 tc_fence_after()
+                # half g's staging [128 rows x 128 B] (SW128: 16 B chunk j of row r at
+                # j ^ (r % 8)) is free once the previous tile's store has read it
+                stage = o_smem + Uint32(OUT_HALF) * Uint32(g) + Uint32(128) * Uint32(row)
+                lead = (warp - EPI) % 8 == 0 and lane == 0
+                if lead:
+                    _bulk_wait_read()
+                _named_sync(1 + g, 256)
                 for c4 in cutlass.range_constexpr(2):  # (warp-collective TMEM loads)
                     v = _tmem_ld32(taddr + quad + Uint32(128) * Uint32(g)
                                    + Uint32(64) * Uint32(sub) + Uint32(32 * c4))
-                    if live:
-                        ws = [_q4_acc(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3],
-                                      inv) for i in range(8)]
-                        col = 256 * n + 128 * g + 64 * sub + 32 * c4
-                        _st_global8(dst + col, *ws)
+                    ws = [_q4_acc(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3],
+                                  inv) for i in range(8)]
+                    for j in cutlass.range_constexpr(2):
+                        chunk = 4 * sub + 2 * c4 + j
+                        _st_shared4(stage + Uint32(16) * Uint32(chunk ^ (row % 8)),
+                                    ws[4 * j], ws[4 * j + 1], ws[4 * j + 2], ws[4 * j + 3])
                 tc_fence_before()
                 mbar_arrive(acc_free + Uint32(8) * Uint32(g))
+                _fence_async_shared()
+                _named_sync(1 + g, 256)
+                if lead:  # columns 256 n + 128 g of head h, rows 128 m .. (clipped at R)
+                    _tma_store3d(tm_o, o_smem + Uint32(OUT_HALF) * Uint32(g),
+                                 ROW * h + 256 * n + 128 * g, 128 * m, 0)
+        if warp >= EPI:
+            if (warp - EPI) % 8 == 0 and lane == 0:
+                _bulk_wait()  # the latent stores complete before the grid does
         tc_fence_before()
         cute.arch.sync_threads()
         if warp == 0:
