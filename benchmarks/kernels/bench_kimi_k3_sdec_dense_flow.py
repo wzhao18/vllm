@@ -110,7 +110,7 @@ def main():
             for debug in [0] + list(args.debug):
                 op = dfl.DenseFlow(T, H, I, beta, lin, nbA0=nbA0, nbB0=nbB0,
                                    two_dies=s1 > 0, debug=debug)  # fmt: skip
-                tab = dfl.flow_tables(op, doms, None, dev)
+                tab = dfl.flow_tables(op, doms, None, dev, whole=bool(debug & dfl.WHOLE))
                 sync = torch.zeros(dfl.SYNC_WORDS, dtype=torch.int32, device=dev)
                 sync_ref = sync
                 ws = torch.zeros(op.ws_bytes(s0 + s1), dtype=torch.uint8, device=dev)
@@ -128,7 +128,7 @@ def main():
                 torch.cuda.synchronize()
                 print(f"T{T} d{debug}: stages {op.stages}, compiled+ran in "
                       f"{time.time() - t0:.1f} s", flush=True)  # fmt: skip
-                if not debug:
+                if not debug & 7:
                     h1, y1 = h.clone(), y.clone()
                     run()
                     torch.cuda.synchronize()

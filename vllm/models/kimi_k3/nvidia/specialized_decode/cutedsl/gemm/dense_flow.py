@@ -83,7 +83,10 @@ BULK = 32768
 PRODUCERS = 3
 EPI_WARPS = 24
 EPI_THREADS = 32 * EPI_WARPS
-EPI_SPLIT = EPI_WARPS // 4
+EPI_GROUPS = 1  # epilogue groups finishing alternate segments (2 measured slower)
+GROUP_WARPS = EPI_WARPS // EPI_GROUPS
+GROUP_THREADS = 32 * GROUP_WARPS
+EPI_SPLIT = GROUP_WARPS // 4  # warps of a group per TMEM lane quarter
 WATCH_WARP = 4 + EPI_WARPS
 STAMP_WORDS = 32
 # sync words
@@ -102,6 +105,10 @@ NO_EPILOGUE = 2  # accumulators released unread; h never written (loads-only ske
 NO_SITU = 8  # timing only: h = gate * up instead of SiTU
 NO_STORE = 16  # timing only: h / y never stored
 FAST_TANH = 32  # timing only: approximate tanh
+NO_FENCE = 64  # timing only: no fence before the h ready flag (st.release only)
+H_BULK = 128  # h tile staged in shared memory, one bulk store per token row (A/B)
+ROLLED = 256  # F1: SiTU finish as a rolled loop (one tanhf call site; whole-block ranges)
+WHOLE = 1024  # host: whole gate_up blocks per SM (flow_tables(whole=True))
 NO_EARLY_PDL = 512
 
 
@@ -117,6 +124,34 @@ def _low_bit(mask):
     """Index of the lowest set bit of ``mask``; 32 when none."""
     code = "{ .reg .b32 r; brev.b32 r, $1; bfind.shiftamt.u32 r, r; min.u32 $0, r, 32; }"
     return code, "=r,r", (Int32(mask),)
+
+
+@asm()
+def _sts_bf16_rne(saddr, value):
+    """``value`` to shared memory as BF16, rounded as cvt.rn (``_rne_bf16``)."""
+    code = "{ .reg .b32 u, l; .reg .b16 h; .reg .pred n; mov.b32 u, $1; shr.u32 l, u, 16; "
+    code += "and.b32 l, l, 1; add.u32 u, u, l; add.u32 u, u, 0x7fff; shr.u32 u, u, 16; "
+    code += "setp.nan.f32 n, $1, $1; @n mov.b32 u, 0x7fff; cvt.u16.u32 h, u; "
+    code += "st.shared.b16 [$0], h; }"
+    return code, "r,f,~{memory}", (Int32(saddr), Float32(value))
+
+
+@asm()
+def _bulk_store(gaddr, saddr, nbytes):
+    code = "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    return code, "l,r,r,~{memory}", (Int64(gaddr), Int32(saddr), Int32(nbytes))
+
+
+@asm()
+def _bulk_commit_wait():
+    return "cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;", "~{memory}", ()
+
+
+@asm(Float32)
+def _tmem_ld1(taddr):
+    """One 32-bit TMEM column of this lane (tcgen05.ld 32x32b.x1) and its wait."""
+    code = "tcgen05.ld.sync.aligned.32x32b.x1.b32 {$0}, [$1]; tcgen05.wait::ld.sync.aligned;"
+    return code, "=f,r,~{memory}", (Int32(taddr),)
 
 
 @asm()
@@ -175,7 +210,8 @@ class DenseFlow:
         self.threads = 128 + EPI_THREADS + 32
         self.stage_bytes = 128 * K_TILE * 2 + self.t_mma * K_TILE * 2
         self.part = 128 * self.t_pad * 4
-        self.stages = min(16, (SMEM_BUDGET - RESERVE) // self.stage_bytes)
+        self.hst_bytes = self.t_mma * 64 * 2 if debug & H_BULK else 0
+        self.stages = min(16, (SMEM_BUDGET - RESERVE - self.hst_bytes) // self.stage_bytes)
         self.nstage_p = self.stages * self.stage_bytes // self.part
         assert self.stages >= 4, (rows, self.stages)
         # Accumulators in TMEM: as many as fit (<= 4), so the MMA runs up to three
@@ -259,6 +295,7 @@ class DenseFlow:
             info: cute.struct.MemRange[cutlass.Int32, 8]
             bnd: cute.struct.MemRange[cutlass.Int32, 2 * (MAX_DIE + 1)]
             order: cute.struct.MemRange[cutlass.Int32, MAX_WIN]
+            hst: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, max(1, self.hst_bytes // 4)], 128]
             sA: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(a_layout.outer)], 1024
             ]
@@ -302,6 +339,7 @@ class DenseFlow:
         info = Int32(st.info.data_ptr().toint())
         bnd = Int32(st.bnd.data_ptr().toint())
         order = Int32(st.order.data_ptr().toint())
+        hst = Int32(st.hst.data_ptr().toint())
         sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
         sB = st.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
         sp = Int32(st.sA.data_ptr().toint())  # the ring: B partials after the stream
@@ -318,7 +356,7 @@ class DenseFlow:
                     cute.arch.mbarrier_init(empty + i, 1)
                 for i in cutlass.range_constexpr(self.nbuf):
                     cute.arch.mbarrier_init(acc_full + i, 1)
-                    cute.arch.mbarrier_init(acc_empty + i, EPI_THREADS)
+                    cute.arch.mbarrier_init(acc_empty + i, GROUP_THREADS)
                 cute.arch.mbarrier_init(staged, 1)
                 cute.arch.mbarrier_init(permrdy, 1)
         if warp == 3:
@@ -587,7 +625,7 @@ class DenseFlow:
             epoch = _ld_s32(sync + EPOCH * 4)
             self.epilogue(acc, acc_full, acc_empty, staged, warp - 4, lane, slot, r, sd,
                           d1, s0, bnd, uA0, uA1, uB0, uB1, bbA, bbB, sp, mY, mHp, mWs, sync,
-                          nrows, epoch, te, hlo)  # fmt: skip
+                          nrows, epoch, te, hlo, hst)  # fmt: skip
             if warp == 4:
                 cute.arch.relinquish_tmem_alloc_permit()
             _bar(2, EPI_THREADS)
@@ -606,14 +644,18 @@ class DenseFlow:
         slot: Int32, r: Int32, sd: Int32, d1, s0: Int32, bnd: Int32, uA0: Int32, uA1: Int32,
         uB0: Int32, uB1: Int32, bbA: Int32, bbB: Int32, sp: Int32, mY: cute.Tensor,
         mH: cute.Tensor, mWs: cute.Tensor, sync: Int64, nrows: Int32, epoch: Int32,
-        te: Int32, hlo: Int32,
+        te: Int32, hlo: Int32, hst: Int32,
     ):  # fmt: skip
-        """Epilogue warp ew owns TMEM lane quarter ew % 4 and the 16-token chunks c
-        with c % EPI_SPLIT == ew // 4."""
-        quad = ew % 4
-        half = ew // 4
+        """Epilogue warp ew is warp gw = ew % GROUP_WARPS of group ew // GROUP_WARPS
+        (the groups finish alternate segments, so one block's SiTU / stores overlap the
+        next one's); it owns TMEM lane quarter gw % 4 and the 16-token chunks c with
+        c % EPI_SPLIT == gw // 4."""
+        grp = ew // GROUP_WARPS
+        gw = ew % GROUP_WARPS
+        quad = gw % 4
+        half = gw // 4
         q = quad * 32 + lane
-        tid = ew * 32 + lane
+        tid = gw * 32 + lane
         lane_bits = (quad * 32) << 16
         ws = mWs.iterator.toint()
         slot_base = Int32(cutlass.select_(d1, s0, Int32(0)))
@@ -626,16 +668,17 @@ class DenseFlow:
             while u < hi:
                 b = u // kt
                 kb0 = u - b * kt
-                buf = seg % self.nbuf
-                col = Int32(acc[(None, None, None, buf)].iterator.toint()) + lane_bits
-                cute.arch.mbarrier_wait(acc_full + buf, (seg // self.nbuf) & 1)
-                _fence_after()
-                if cutlass.const_expr(not (self.debug & NO_EPILOGUE)):
-                    self.segment(ph, kb0, b * kt, col, slot, r, bnd, slot_base, ws, sp,
-                                 bb + b, q, quad, lane, tid, half, mY, mH, sync, nrows,
-                                 epoch, staged)  # fmt: skip
-                _fence_before()
-                cute.arch.mbarrier_arrive(acc_empty + buf)
+                if seg % EPI_GROUPS == grp:
+                    buf = seg % self.nbuf
+                    col = Int32(acc[(None, None, None, buf)].iterator.toint()) + lane_bits
+                    cute.arch.mbarrier_wait(acc_full + buf, (seg // self.nbuf) & 1)
+                    _fence_after()
+                    if cutlass.const_expr(not (self.debug & NO_EPILOGUE)):
+                        self.segment(ph, kb0, b * kt, col, slot, r, bnd, slot_base, ws, sp,
+                                     bb + b, q, quad, lane, tid, half, mY, mH, sync, nrows,
+                                     epoch, staged, grp, hst)  # fmt: skip
+                    _fence_before()
+                    cute.arch.mbarrier_arrive(acc_empty + buf)
                 seg += 1
                 u = (b + 1) * kt
             if cutlass.const_expr(idx == 2):
@@ -647,7 +690,8 @@ class DenseFlow:
         self, ph: cutlass.Constexpr, kb0: Int32, bstart: Int32, col: Int32, slot: Int32,
         r: Int32, bnd: Int32, slot_base: Int32, ws: Int64, sp: Int32, gb: Int32, q: Int32,
         quad: Int32, lane: Int32, tid: Int32, half: Int32, mY: cute.Tensor,
-        mH: cute.Tensor, sync: Int64, nrows: Int32, epoch: Int32, staged,
+        mH: cute.Tensor, sync: Int64, nrows: Int32, epoch: Int32, staged, grp: Int32,
+        hst: Int32,
     ):  # fmt: skip
         t_mma, t_pad, part = self.t_mma, self.t_pad, self.part
         kt = self.ktA if ph == 0 else self.ktB
@@ -664,7 +708,7 @@ class DenseFlow:
                     for j in cutlass.range_constexpr(CHUNK // 4):
                         _st_v4(row + j * 16, v[4 * j], v[4 * j + 1], v[4 * j + 2],
                                v[4 * j + 3])  # fmt: skip
-            _bar(3, EPI_THREADS)
+            self.gbar(grp)
             if tid == 0:
                 _fence_gpu()
                 _st_release(flags + Int64(slot) * 4, 1)
@@ -701,25 +745,47 @@ class DenseFlow:
                 cute.arch.mbarrier_wait(staged, 0)
             tf = _now()
             self.finish(ph, col, r, last, bp, slot_base, wsp, sp, nst, gb, q, quad, lane,
-                        half, mY, mH, nrows, sync, slot)  # fmt: skip
+                        half, mY, mH, nrows, sync, slot, hst)  # fmt: skip
+            if cutlass.const_expr((self.debug & H_BULK) and ph == 0):
+                # the staged h tile: one bulk store per token row, complete before
+                # the ready flag
+                self.gbar(grp)
+                if tid < 32:
+                    hp = mH.iterator.toint()
+                    for i in cutlass.range_constexpr(-(-self.t_mma // 32)):
+                        t = tid + i * 32
+                        if t < nrows:
+                            _bulk_store(hp + (Int64(t) * self.inter + gb * 64) * 2,
+                                        hst + t * 128, 128)  # fmt: skip
+                    _bulk_commit_wait()
+                    _fence_proxy_global()
             if cutlass.const_expr((self.debug & ds.STAMPS) and ph == 0):
                 if tid == 0:
                     base = sync + STAMP_BASE * 4 + Int64(slot) * STAMP_WORDS * 4 + 11 * 8
                     _st_u64(base, _ld_u64(base) + (_now() - tf))
-            _bar(3, EPI_THREADS)
+            self.gbar(grp)
             if tid == 0:
                 for p in cutlass.range(r + 1, last + 1, unroll=1):
                     _st_relaxed(flags + Int64(slot_base + p) * 4, 0)
                 if cutlass.const_expr(ph == 0):  # the h block is complete
-                    _fence_gpu()
+                    if cutlass.const_expr(not (self.debug & NO_FENCE)):
+                        _fence_gpu()
                     _st_release(sync + (READY + Int64(gb)) * 4, epoch + 1)
+
+    @cute.jit
+    def gbar(self, grp: Int32):
+        """Named barrier of epilogue group ``grp``."""
+        if grp == 0:
+            _bar(3, GROUP_THREADS)
+        else:
+            _bar(4, GROUP_THREADS)
 
     @cute.jit
     def finish(
         self, ph: cutlass.Constexpr, col: Int32, r: Int32, last: Int32, bp: Int32,
         slot_base: Int32, wsp: Int64, sp: Int32, nst: Int32, gb: Int32, q: Int32,
         quad: Int32, lane: Int32, half: Int32, mY: cute.Tensor, mH: cute.Tensor,
-        nrows: Int32, sync: Int64, slot: Int32,
+        nrows: Int32, sync: Int64, slot: Int32, hst: Int32 = Int32(0),
     ):  # fmt: skip
         """Own accumulator + partials of ranges r + 1 .. last in slot order. Phase A
         the partials of every chunk this thread finishes are loaded up front (one memory
@@ -741,6 +807,30 @@ class DenseFlow:
                 pre[i] = Float32(0)
                 tmp[i] = Float32(0)
             has_p = last > r
+            if cutlass.const_expr(self.debug & ROLLED):
+                # F1: one SiTU call site; gate lane (l < 16) finishes token c*16 + j,
+                # up lane token c*16 + 8 + j (whole-block ranges: no partials)
+                hp_r = mH.iterator.toint()
+                for kr in cutlass.range_constexpr(nk):
+                    cr = kr * EPI_SPLIT + half
+                    if cr < chunks:
+                        for jr in cutlass.range(CHUNK // 2, unroll=1):
+                            tgr = cr * CHUNK + jr
+                            vg = _tmem_ld1(col + tgr)
+                            vu = _tmem_ld1(col + tgr + CHUNK // 2)
+                            sendr = cutlass.select_(up_lane, vg, vu)
+                            recvr = cute.arch.shuffle_sync_bfly(sendr, 16)
+                            gr = _rne_bf16(cutlass.select_(up_lane, recvr, vg))
+                            upr = _rne_bf16(cutlass.select_(up_lane, vu, recvr))
+                            ar = half_beta * tanh(gr * inv_beta)
+                            ar = ar * (Float32(1) + tanh(gr * Float32(0.5)))
+                            if cutlass.const_expr(self.consts[2] > 0):
+                                upr = lin * tanh(upr * inv_lin)
+                            tr = tgr + Int32(cutlass.select_(up_lane, Int32(CHUNK // 2), Int32(0)))
+                            if tr < nrows:
+                                hcolr = gb * 64 + quad * 16 + (lane & 15)
+                                _st_bf16_rne(hp_r + (Int64(tr) * self.inter + hcolr) * 2, ar * upr)
+                return
             for p in cutlass.range(r + 1, last + 1, unroll=1):  # one round trip each
                 if _lds_s32(bp + p * 4) < _lds_s32(bp + p * 4 + 4):
                     base = wsp + Int64(slot_base + p) * part + q * t_pad * 4
@@ -784,7 +874,9 @@ class DenseFlow:
                     lim = nrows - 1000000 if cutlass.const_expr(self.debug & NO_STORE) else nrows
                     for i in cutlass.range_constexpr(CHUNK // 2):
                         t = t0 + i
-                        if t < lim:
+                        if cutlass.const_expr(self.debug & H_BULK):
+                            _sts_bf16_rne(hst + (t * 64 + quad * 16 + (lane & 15)) * 2, out[i])
+                        elif t < lim:
                             _st_bf16_rne(hp + (Int64(t) * self.inter + hcol) * 2, out[i])
         else:
             for c in cutlass.range_constexpr(chunks):
@@ -873,7 +965,7 @@ def _split_work(blocks, kt, ub, w):
     return a, b
 
 
-def flow_tables(op: DenseFlow, domains, weights=None, device=None):
+def flow_tables(op: DenseFlow, domains, weights=None, device=None, whole=False):
     """(table int32 [1024, 8], ranges int32 [4 (MAX_DIE + 1)], perm int32 [2, U]):
     slot r of die d (``dense_stream.slot_sms``) streams A units [a_d[r], a_d[r + 1])
     and B units [b_d[r], b_d[r + 1]) of its die, in proportion to ``weights[smid]``
@@ -893,8 +985,12 @@ def flow_tables(op: DenseFlow, domains, weights=None, device=None):
     bounds = {}
     for die, group in enumerate(groups):
         w = [1.0 if weights is None else max(float(weights[sm]), 1e-9) for sm in group]
-        bounds[("a", die)] = _bounds((ua0, ua1)[die], w) if group else [0]
-        bounds[("b", die)] = _bounds((ub0, ub1)[die], w) if group else [0]
+        if whole and group:
+            bounds[("a", die)], bounds[("b", die)] = _split_work(
+                (ua0, ua1)[die] // op.ktA, op.ktA, (ub0, ub1)[die], w)
+        else:
+            bounds[("a", die)] = _bounds((ua0, ua1)[die], w) if group else [0]
+            bounds[("b", die)] = _bounds((ub0, ub1)[die], w) if group else [0]
     table = torch.full((1024, 8), -1, dtype=torch.int32)
     ranges = torch.zeros(4 * (MAX_DIE + 1), dtype=torch.int32)
     for die, group in enumerate(groups):
@@ -906,14 +1002,18 @@ def flow_tables(op: DenseFlow, domains, weights=None, device=None):
         ranges[die * (MAX_DIE + 1): die * (MAX_DIE + 1) + len(a)] = torch.tensor(a)
         o = (2 + die) * (MAX_DIE + 1)
         ranges[o: o + len(b)] = torch.tensor(b)
-    # Expected ready time of every h block (fraction of its last segment's SM work).
-    ready = [0.0] * op.nbA
+    # Expected ready time of every h block, in stream units of its SM (one unit = one
+    # 16 KB weight stage; the SMs stream at about the same rate): the unit count at
+    # which its last segment ends (order: tail, head, whole blocks) + a finish margin.
+    margin = op.ktA // 4
+    ready = [0] * op.nbA
+    a_units = {}
     for die, group in enumerate(groups):
-        a, b = bounds[("a", die)], bounds[("b", die)]
+        a = bounds[("a", die)]
         base = 0 if die == 0 else op.nbA0
         for rr in range(len(group)):
             lo, hi = a[rr], a[rr + 1]
-            work = max(1, (hi - lo) + (b[rr + 1] - b[rr]))
+            a_units[(die, rr)] = hi - lo
             te = min(hi, (lo // op.ktA + 1) * op.ktA) if lo % op.ktA else lo
             hlo = max(te, ((hi - 1) // op.ktA) * op.ktA) if hi % op.ktA else hi
             done = 0
@@ -924,26 +1024,26 @@ def flow_tables(op: DenseFlow, domains, weights=None, device=None):
                     end = min(phi, (blk + 1) * op.ktA)
                     done += end - u
                     g = base + blk
-                    ready[g] = max(ready[g], done / work)
+                    ready[g] = max(ready[g], done + margin)
                     u = end
+    # Per output block, every down position's consumption time (its SM's A units +
+    # its offset in the SM's down range); the h blocks sorted by ready time go to the
+    # positions sorted by consumption time (earliest ready -> earliest consumed).
     by_ready = sorted(range(op.nbA), key=lambda g: (ready[g], g))
     width = max(ub0, ub1, 1)
     perm = torch.zeros((2, width), dtype=torch.int32)
     for die, group in enumerate(groups):
         b = bounds[("b", die)]
         nob = (op.nbB0, op.nbB - op.nbB0)[die]
+        owner = []  # (consumption time, position) of every down unit of the die
+        for rr in range(len(group)):
+            for pos in range(b[rr], b[rr + 1]):
+                owner.append((a_units[(die, rr)] + pos - b[rr], pos))
+        owner.sort(key=lambda x: x[1])
         for ob in range(nob):
-            lo_ob, hi_ob = ob * op.ktB, (ob + 1) * op.ktB
-            wins = []  # (start position, size) of each range's share of this block
-            for rr in range(len(group)):
-                lo, hi = max(b[rr], lo_ob), min(b[rr + 1], hi_ob)
-                if lo < hi:
-                    wins.append([lo, hi - lo, []])
-            for i, g in enumerate(by_ready):  # deal in ready order, largest deficit
-                best = max(wins, key=lambda w: w[1] * (i + 1) / op.ktB - len(w[2]))
-                best[2].append(g)
-            for lo, _, ks in wins:
-                perm[die, lo: lo + len(ks)] = torch.tensor(ks, dtype=torch.int32)
+            slots = sorted(owner[ob * op.ktB: (ob + 1) * op.ktB])
+            for (_, pos), g in zip(slots, by_ready):
+                perm[die, pos] = g
     return table.to(device), ranges.to(device), perm.to(device)
 
 
