@@ -262,6 +262,7 @@ def _pkd(
     WAIT_SLEEP_: cutlass.Constexpr[int] = 0,
     IMG_EARLY_: cutlass.Constexpr[int] = 0,
     VRING_: cutlass.Constexpr[int] = 0,
+    NOSOLVE_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -2384,7 +2385,7 @@ def _pkd(
                     # elimination (zero LDS on the elimination chain);
                     # level 2: both 16-blocks' -B^-1 C A^-1 combines batched
                     # as block-diagonal [16,16] warp-MMAs. --
-                    if plw == 0:
+                    if plw == (0 if NOSOLVE_ == 0 else 99):
                         dgb = lane >> 3
                         lid = lane & 7
                         b8 = dgb * 8
@@ -2481,7 +2482,7 @@ def _pkd(
                     # INV[16:,:16] = -(Tb @ Lc) @ Ta; fragments loaded elementwise
                     # by identity coords (transposed dynamic-offset views reject
                     # autovec: provenance law).
-                    if plw == 0:
+                    if plw == (0 if NOSOLVE_ == 0 else 99):
                         Cy = mma_a.make_fragment_C(mma_a.partition_shape_C((16, 16)))
                         Cy.fill(0.0)
                         fat = thr_a.make_fragment_A(mma_a.partition_shape_A((16, 16)))
@@ -2530,7 +2531,7 @@ def _pkd(
                                 ),
                             )
                             cute.autovec_copy(c2, d2)
-                    else:
+                    elif plw != 0:
                         # ``96`` restore workers advance by a whole multiple of
                         # the 16 RF segments, so each thread's segment is
                         # invariant across all six row-work iterations.  Load
@@ -2652,6 +2653,7 @@ def _launch_pkd(
     WAIT_SLEEP_: cutlass.Constexpr[int] = 0,
     IMG_EARLY_: cutlass.Constexpr[int] = 0,
     VRING_: cutlass.Constexpr[int] = 0,
+    NOSOLVE_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2881,6 +2883,7 @@ def _launch_pkd(
         WAIT_SLEEP_,
         IMG_EARLY_,
         VRING_,
+        NOSOLVE_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
