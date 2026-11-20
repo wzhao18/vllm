@@ -134,6 +134,11 @@ def _now():
     return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
 
 
+@asm(Int64)
+def _clk():
+    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
+
+
 @asm()
 def _st_u64(address, value):
     return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
@@ -307,8 +312,12 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False, tpcs=0, smem=None):  # fmt: skip
+                 partials=False, tpcs=0, smem=None, trace=False, xcopies=1):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
+        # Benchmarks only: ``trace`` stores the MMA warp's clock64 waits on weight /
+        # activation stages; ``xcopies`` reads x from x[(tile % xcopies) * rows + t]
+        # (copies of the same rows: the hot-activation ablation).
+        self.trace, self.xcopies = trace, xcopies
         # ``tpcs`` > 0: die-static work. One CTA pair per TPC (every SM); each pair
         # reads its (tile, split) from the table after the split flags (``table_at``,
         # indexed by %smid / 2: a 2-CTA cluster sits on one TPC, smids 2j / 2j + 1),
@@ -435,6 +444,7 @@ class WideGemm:
             split_rank = _sel_neg(work, Int32(0), work & 255)
             bidx = 2 * _sel_neg(work, Int32(tiles), work >> 8) + v
         pair = bidx // 2
+        xoff = (pair % self.xcopies) * self.chunks  # 0 unless the xcopies ablation
         rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         coord_vmnk = cluster_vmnk.get_flat_coord(rank_in_cluster)
         wst, ast, chunks = self.wstages, self.astages, self.chunks
@@ -523,7 +533,7 @@ class WideGemm:
             if lane == 0:
                 _st_u64(stamp + 48, _now())
             self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0, k_count,
-                      rot, Int32(0), n_act)  # fmt: skip
+                      rot, Int32(0), xoff, n_act)  # fmt: skip
             if lane == 0:
                 _st_u64(stamp + 56, _now())
         elif warp == 2:
@@ -533,13 +543,22 @@ class WideGemm:
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
             if leader:
                 kblocks = cute.size(tCrA, mode=[2])
+                w_wait, a_wait = Int64(0), Int64(0)
                 for t in cutlass.range(k_count, unroll=1):
                     s, sb = t % wst, t % ast
                     if t == 8:
                         if lane == 0:
                             _st_u64(stamp + 88, _now())
+                    if cutlass.const_expr(self.trace):
+                        c0 = _clk()
                     cute.arch.mbarrier_wait(full + s, (t // wst) % 2)
+                    if cutlass.const_expr(self.trace):
+                        c1 = _clk()
                     cute.arch.mbarrier_wait(bfull + sb, (t // ast) % 2)
+                    if cutlass.const_expr(self.trace):
+                        c2 = _clk()
+                        w_wait = w_wait + (c1 - c0)
+                        a_wait = a_wait + (c2 - c1)
                     if t == 0:
                         if lane == 0:
                             _st_u64(stamp + 64, _now())
@@ -560,6 +579,10 @@ class WideGemm:
                             _st_u64(stamp + 104, _now())
                 if lane == 0:
                     _st_u64(stamp + 72, _now())
+                    if cutlass.const_expr(self.trace):
+                        # clock64 the MMA warp spent waiting on weight / activation stages
+                        _st_u64(stamp + 112, w_wait)
+                        _st_u64(stamp + 120, a_wait)
                 with cute.arch.elect_one():
                     tcgen05.commit(acc_full, 3, tcgen05.CtaGroup.TWO)
         elif warp >= 4:
@@ -576,7 +599,7 @@ class WideGemm:
                 if warp == self.act_warps[i]:
                     cute.arch.griddepcontrol_wait()
                     self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0,
-                              k_count, rot, Int32(i), n_act)  # fmt: skip
+                              k_count, rot, Int32(i), xoff, n_act)  # fmt: skip
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
                                                    ptr_to_buffer_holding_addr=tmem_holder)  # fmt: skip
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
@@ -625,7 +648,7 @@ class WideGemm:
 
     @cute.jit
     def acts(self, tma_b, tBgX, tBsB, full, empty, b_mask, leader, k0, k_count, rot, first,
-             step: cutlass.Constexpr):  # fmt: skip
+             xoff, step: cutlass.Constexpr):  # fmt: skip
         """Activation stages ``first``, ``first + step``, ... into their own ring (the
         caller has passed the PDL wait)."""
         stages, chunks = self.astages, self.chunks
@@ -638,7 +661,7 @@ class WideGemm:
                     cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_b)
             kt = (t + rot) % k_count
             for c in cutlass.range_constexpr(chunks):
-                cute.copy(tma_b, tBgX[(None, c, k0 + kt, 0)], tBsB[(None, s * chunks + c)],
+                cute.copy(tma_b, tBgX[(None, c + xoff, k0 + kt, 0)], tBsB[(None, s * chunks + c)],
                           tma_bar_ptr=full + s, mcast_mask=b_mask)  # fmt: skip
 
     @cute.jit
@@ -967,7 +990,7 @@ class PreparedWide:
     [T, N / 2] with ``silu``)."""
 
     def __init__(self, weight, policies, silu=False, out_f32=False, partials=False,
-                 dies=False):  # fmt: skip
+                 dies=False, trace=False, xcopies=1):  # fmt: skip
         self.silu, self.out_f32, self.partials = silu, out_f32 or partials, partials
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
@@ -975,6 +998,7 @@ class PreparedWide:
         # the weight (``die_place``); the caller re-points other users at
         # ``self.weight``.
         self.dies = dies
+        self.trace, self.xcopies = trace, xcopies  # benchmarks only (``WideGemm``)
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
         # [, weight issuer warps[, direct exchange[, rotate]]]]]) (``WideGemm`` arguments)
         self.policies = {}
@@ -1000,12 +1024,12 @@ class PreparedWide:
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
                 w_warps, direct, rotate, self.partials, len(tpc_die) if self.dies else 0,
-                smem,
+                smem, self.trace, self.xcopies,
             )  # fmt: skip
             n_pad = gemm.n_pad
             if n_pad // 128 * split > sms:  # the splits spin on each other: one wave
                 raise ValueError(f"wide GEMM: {n_pad // 128 * split} CTAs > {sms} SMs")
-            x = torch.empty(rows, self.k, dtype=torch.bfloat16, device=dev)
+            x = torch.empty(rows * self.xcopies, self.k, dtype=torch.bfloat16, device=dev)
             cols = self.n // 2 if self.silu else self.n
             ydt = torch.float32 if self.out_f32 else torch.bfloat16
             y = torch.empty(rows * (split if self.partials else 1), cols, dtype=ydt, device=dev)
@@ -1019,7 +1043,7 @@ class PreparedWide:
                 flags[gemm.table_at :] = torch.tensor(table, dtype=torch.int32)
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
             key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
-            key += self.policies[rows] + (gemm.tpcs,)
+            key += self.policies[rows] + (gemm.tpcs, self.trace, self.xcopies)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
@@ -1043,7 +1067,7 @@ class PreparedWide:
         return from_dlpack(t, assumed_align=16)
 
     def run(self, x, out):
-        rows = x.shape[0]
+        rows = x.shape[0] // self.xcopies
         _, _, ws, flags = self.state[rows]
         stream = _cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         y = out.view(-1, out.shape[-1])  # partials: [split, T, N] -> [split * T, N]
