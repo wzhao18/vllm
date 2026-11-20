@@ -238,7 +238,10 @@ struct V2Sm {
 template <int T>
 __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* hist, uint32_t* msg,
                                    const uint16_t* ckey, const uint32_t* cpos, int nc, uint32_t tag,
-                                   int par, int row, uint32_t* warp_sums, int* s_i, uint32_t* lrx) {
+                                   int par, int row, uint32_t* warp_sums, int* s_i, uint32_t* lrx,
+                                   long long* s_dbg) {
+#define CGDBG(i) \
+  if (p.dbg && threadIdx.x == 0) s_dbg[i] = (long long)clock64();
   __shared__ int s_cg[5];  // 0 base (-1: not eligible), 1 width shift, 2 bin, 3 need, 4 top
   __shared__ uint32_t s_cgab;
   const int tid = threadIdx.x, W = p.W, K = p.K;
@@ -312,6 +315,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
   }
   __syncthreads();
   if (s_cg[0] < 0) return false;
+  CGDBG(7);  // bracket
   uint32_t* const cgrx = hist + 512;  // W x kCgMsg received words
   const uint4 dead4 = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
   for (int it = 0; it < 2; ++it) {
@@ -362,6 +366,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
         if ((int)tot + tid < tp) lst[tot + tid] = tagw(tag, 0u);
       }
     }
+    CGDBG(22);  // bins + list built
     if (tid < kCgBins / 2) msg[kV2Hdr + tid] = pack2(tag, hist[2 * tid], hist[2 * tid + 1]);
     if (tid < kV2Hdr) msg[tid] = tagw(tag, tid == 0 ? (uint32_t)lo2 : tid == 1 ? s_cgab : tid == 2 ? nlist : 0u);
     __syncthreads();
@@ -393,6 +398,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     };
     for (int i = tid; i < W * (kCgMsg / 4); i += T) poll4(p.box + base + 4 * (int64_t)i, cgrx + 4 * i);
     __syncthreads();
+    CGDBG(11);  // bins polled
     if (capL > 0) {
       // every rank's list (all of it: each word is re-armed after its poll, so no stale
       // word of this epoch's tag is left in a slot a later round polls)
@@ -403,6 +409,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
           poll4(p.box + slot_base(it + 1 + j / kCgMsg) + (int64_t)r * kCgMsg + j % kCgMsg, lrx + r * 1024 + j);
       }
       __syncthreads();
+      CGDBG(17);  // lists polled
     }
     // tau's bin: thread t <-> bin kCgBins - 1 - t; keys above it from the scan
     const int b = kCgBins - 1 - tid;
@@ -493,9 +500,11 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     for (int i = tid; i < W * kCgMsg; i += T) rx[(i / kCgMsg) * kV2Msg + i % kCgMsg] = cgrx[i];
     __syncthreads();
     if (p.stats && tid == 0) atomicAdd(&p.stats[3], 1);
+    CGDBG(23);  // cut
     return true;
   }
   return false;  // unreachable: the second round has width 1
+#undef CGDBG
 }
 
 // One row. kFast: the common case only, compact code (in-step every call fetches the
@@ -1397,7 +1406,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         static_assert(kV2RxW + kV2Cand + kV2Msg + kV2Win <= 7168 &&
                       7168 + kV2MaxW * 1024 <= V2Cfg<T>::kNR * T * 4);
         cg = v2_cg<T>(p, rx, hist, msg, ckey, cpos, nc, tag, par, row, warp_sums, s_i,
-                      reinterpret_cast<uint32_t*>(srow) + 7168);
+                      reinterpret_cast<uint32_t*>(srow) + 7168, s_dbg);
         if (cg) tier = s_tier;
       }
       if (tier == 3 && !cg) {
