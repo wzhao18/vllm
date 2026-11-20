@@ -49,6 +49,7 @@ from .epilogue_utils import (
     epilogue_tma_store_mxfp8,
     epilogue_tma_store_with_alpha,
 )
+from .push_epilogue import epilogue_push, staging_bytes
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
@@ -221,6 +222,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         quiet_wait: bool = False,
         producers: int = 1,
         die_claim: bool = False,
+        push: bool = False,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
@@ -239,6 +241,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # die's weight half (smid -> die table + per-die counters in the aux buffer
         # that also carries alpha; the last CTA resets the counters)
         self.die_claim = die_claim
+        # push (one tile per CTA): the epilogue pushes the BF16 tile rows into the SP
+        # reduce-scatter owners' receive slots (``push_epilogue``) instead of C
+        self.push = push
         self.threads_per_cta = 32 * (len(self.epilog_warp_id) + 1 + producers)
 
         self.mma_inst_shape = mma_inst_shape
@@ -2132,7 +2137,23 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
                 # flashinfer local fix (b53cfd6a7, not in TRT-LLM): apply alpha in
                 # Float32 before the c_dtype conversion to avoid fp16 overflow.
-                if cutlass.const_expr(mSFC_mnl is not None):
+                if cutlass.const_expr(self.push):
+                    assert cute.cosize(self.a_smem_layout_staged.outer) >= staging_bytes(
+                        self.mma_tiler[1]
+                    ), "push: the A ring cannot stage a tile"
+                    acc_consumer_state = epilogue_push(
+                        self,
+                        tidx,
+                        tCtAcc,
+                        tCgC,
+                        epi_tile,
+                        mma_tile_coord_mnl,
+                        acc_consumer_state,
+                        acc_pipeline,
+                        alpha,
+                        storage.sA.data_ptr().toint(),
+                    )
+                elif cutlass.const_expr(mSFC_mnl is not None):
                     acc_consumer_state = epilogue_tma_store_mxfp8(
                         self,
                         tidx,

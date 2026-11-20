@@ -338,3 +338,131 @@ def test_sp_embed_scatter():
     pytest.importorskip("cutlass")
     world = 4 if torch.accelerator.device_count() >= 4 else 2
     _distributed_run(_embed_worker, world_size=world)
+
+
+# The online-MXFP8 o-projection ("pre" GEMM kind): "pre_push" rows (the GEMM pushes to
+# the row owners) vs the same GEMM's local partials summed as the owner sums them.
+MX_ROWS = (64, 128, 256, 320, 384)
+
+
+def _mx(x):
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+    out = mxfp8_act.Mxfp8Buffer(x.shape[0], x.shape[1], x.device)
+    mxfp8_act.quantize(x, out=out)
+    return out
+
+
+def _mx_reference(step, world, rank, rows, device, projections):
+    """sanitize(bf16(rank-order FP32 sum of the pre GEMM's sanitized BF16 partials))
+    of this rank's rows: what the "mxfp8" tactic + SpReduceScatter(push=True) give."""
+    n = rows // world
+    mine = slice(rank * n, (rank + 1) * n)
+    total = None
+    for src in range(world):
+        xq = _mx(_inputs(step, src, rows, device))
+        partial = torch.empty((rows, WIDTH), dtype=torch.bfloat16, device=device)
+        projections[src].run(xq, partial)
+        partial = _sanitized(partial)[mine].float()
+        total = partial if total is None else total + partial
+    return _sanitized(total.bfloat16())
+
+
+def _pre_push_worker(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(backend="nccl")
+    try:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+            sp_comm,
+        )
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import mxfp8
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import sp
+        from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Context
+
+        rank, world = dist.get_rank(), dist.get_world_size()
+        group = dist.group.WORLD
+        try:  # (older torch: symmetric memory is enabled per group)
+            from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+
+            enable_symm_mem_for_group(group.group_name)
+        except (ImportError, AttributeError):
+            pass
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        ctx = Context(
+            arch="rubin", tp=world, rank=rank, dcp=world, sms=sms, q=4,
+            max_rows=CAP, max_context=1 << 17, bf16_state=False, dp=1, ep=world,
+            sequence_parallel=True, heads_per_rank=K // 128,
+        )  # fmt: skip
+        comm = sp_comm.SpComm(group, device, world, rank, rows_cap=CAP)
+        projections = []
+        for src in range(world):
+            wq = _mx(_weight(src, device))
+            projections.append(
+                mxfp8.Mxfp8Projection(
+                    (wq.data, wq.scale), MX_ROWS, family="o_proj",
+                    tactics=dict.fromkeys(MX_ROWS, "pre"),
+                )  # fmt: skip
+            )
+        oproj = sp.SpOproj(projections[rank], comm, MX_ROWS, ctx)
+        tactics = {r: oproj.choice(r).tactic for r in MX_ROWS}
+        assert all(t == ("pre_push", "pre") for t in tactics.values()), tactics
+        assert not any(oproj.pushes(r) for r in MX_ROWS), tactics
+        out = torch.empty((CAP // world, WIDTH), dtype=torch.bfloat16, device=device)
+        for step, rows in enumerate(MX_ROWS * 2):
+            n = rows // world
+            shard = oproj.run(_mx(_inputs(step, rank, rows, device)), out[:n], step % 2)
+            torch.accelerator.synchronize(device)
+            _check_armed(comm, step % 2, rows)
+            stock = _mx_reference(step, world, rank, rows, device, projections)
+            same = shard.view(torch.int16) == stock.view(torch.int16)
+            assert bool(same.all()), ("pre_push shard", step, rows, same.float().mean())
+        # A captured two-block step (parities 0, 1) at the largest rows, replayed.
+        rows = MX_ROWS[-1]
+        n = rows // world
+        xqs = [_mx(_inputs(0, rank, rows, device)) for _ in range(2)]
+        outs = [torch.empty_like(out[:n]) for _ in range(2)]
+
+        def block():
+            for p in range(2):
+                oproj.run(xqs[p], outs[p], p)
+
+        dist.barrier()
+        block()  # (warm: every rank, the same launches)
+        torch.accelerator.synchronize(device)
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            block()
+        for replay in range(3):
+            base = 3000 + 2 * replay
+            for p in range(2):
+                fresh = _mx(_inputs(base + p, rank, rows, device))
+                xqs[p].data.copy_(fresh.data)
+                xqs[p].scale.copy_(fresh.scale)
+            dist.barrier()
+            graph.replay()
+            torch.accelerator.synchronize(device)
+            for p in range(2):
+                _check_armed(comm, p, rows)
+                stock = _mx_reference(base + p, world, rank, rows, device, projections)
+                same = outs[p].view(torch.int16) == stock.view(torch.int16)
+                assert bool(same.all()), ("pre_push replay", replay, p)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4 or not _has_multicast_support(),
+    reason="Need 4 GPUs with symmetric-memory multicast.",
+)
+def test_sp_oproj_rs_mxfp8_pre_push():
+    """SpOproj "pre_push" on an online-MXFP8 o-projection (NVFP4 checkpoint KDA
+    layers) on 4 ranks: the pre GEMM pushing its partial rows to the row owners gives
+    the owner shards of the same GEMM + RS push bit for bit (rows 64..384, both
+    parities, the 1- and 2-CTA tactics), re-arms the mailboxes, and replays captured."""
+    pytest.importorskip("cutlass")
+    _distributed_run(_pre_push_worker, world_size=4)
