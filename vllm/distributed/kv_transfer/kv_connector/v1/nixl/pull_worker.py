@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -386,7 +387,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         # Head reads first, so the main read below defers P's notification
         # until every transfer of the request has finished.
-        if draft_reads and not self._read_draft_heads(req_id, engine_id, draft_reads):
+        # DIAG ONLY (PDDIAG_MAIN_FIRST): post the main read before the heads.
+        main_first = bool(os.environ.get("PDDIAG_MAIN_FIRST"))
+        if (
+            not main_first
+            and draft_reads
+            and not self._read_draft_heads(req_id, engine_id, draft_reads)
+        ):
             return
 
         # D may have to perform multiple reads from different remote ranks.
@@ -452,6 +459,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 defer_notif=bool(draft_reads),
             ):
                 return
+
+        if (
+            main_first
+            and draft_reads
+            and not self._read_draft_heads(req_id, engine_id, draft_reads)
+        ):
+            return
 
         if written is not None:
             self._queue_unwritten_zeroing(
