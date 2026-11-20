@@ -387,23 +387,46 @@ __global__ void __launch_bounds__(kWarps * 32) route_stage_kernel(Args a) {
 #pragma unroll
     for (int q = 0; q < vec / 4; ++q) in[q] = src[q];
   }
-  for (int s = 1; s < a.splits; ++s) {
-    const float* ys = yrow + int64_t{s} * a.split_stride;
+  // Every split of a batch loaded before any is added (one L2 round trip per
+  // batch, not per split), then added in split order: the same FP32 sums.
+  constexpr int kBatch = NVFP4 ? 7 : 3;
+  for (int s0 = 1; s0 < a.splits; s0 += kBatch) {
+    float plg[kBatch][kPer];
+    float4 pin[kBatch][vec / 4];
 #pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-      int32_t const e = j * (kWarps * 32) + threadIdx.x;
-      if (e < a.num_logits) lg[j] += ys[e];
+    for (int b = 0; b < kBatch; ++b) {
+      if (s0 + b < a.splits) {
+        const float* ys = yrow + int64_t{s0 + b} * a.split_stride;
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+          int32_t const e = j * (kWarps * 32) + threadIdx.x;
+          plg[b][j] = e < a.num_logits ? ys[e] : 0.0F;
+        }
+        if (quant) {
+          const float4* src = reinterpret_cast<const float4*>(
+              ys + a.num_logits + int64_t{threadIdx.x} * vec);
+#pragma unroll
+          for (int q = 0; q < vec / 4; ++q) pin[b][q] = src[q];
+        }
+      }
     }
-    if (quant) {
-      const float4* src = reinterpret_cast<const float4*>(
-          ys + a.num_logits + int64_t{threadIdx.x} * vec);
 #pragma unroll
-      for (int q = 0; q < vec / 4; ++q) {
-        float4 const p = src[q];
-        in[q].x += p.x;
-        in[q].y += p.y;
-        in[q].z += p.z;
-        in[q].w += p.w;
+    for (int b = 0; b < kBatch; ++b) {
+      if (s0 + b < a.splits) {
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+          int32_t const e = j * (kWarps * 32) + threadIdx.x;
+          if (e < a.num_logits) lg[j] += plg[b][j];
+        }
+        if (quant) {
+#pragma unroll
+          for (int q = 0; q < vec / 4; ++q) {
+            in[q].x += pin[b][q].x;
+            in[q].y += pin[b][q].y;
+            in[q].z += pin[b][q].z;
+            in[q].w += pin[b][q].w;
+          }
+        }
       }
     }
   }
