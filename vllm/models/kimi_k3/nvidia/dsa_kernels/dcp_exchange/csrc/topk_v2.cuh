@@ -386,12 +386,13 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
         put4(slot_base(it + 1 + j / kCgMsg) + (int64_t)p.rank * kCgMsg + j % kCgMsg,
              make_uint4(lst[j], lst[j + 1], lst[j + 2], lst[j + 3]));
     auto poll4 = [&](uint32_t* src, uint32_t* dst) {
-      const long long t0 = now_ns();
       uint4 v = ld_sys_v4(src);
-      while (!tagged(v, tag)) {
-        if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 38); break; }
-        __nanosleep(128);
-        v = ld_sys_v4(src);
+      if (!tagged(v, tag)) {
+        const long long t0 = now_ns();
+        do {
+          if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 38); break; }
+          v = ld_sys_v4(src);
+        } while (!tagged(v, tag));
       }
       *reinterpret_cast<uint4*>(dst) = v;
       st_v4(src, dead4);  // re-armed: radix slots are used only on rare rows
@@ -424,6 +425,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     if (b >= 0 && ex < (uint32_t)K && ex + g >= (uint32_t)K) { s_cg[2] = b; s_cg[3] = K - (int)ex; }
     __syncthreads();
     const int bin = s_cg[2];
+    CGDBG(6);  // tau's bin
     if (bin < 0) return false;  // tau < lo2: R2 (rx untouched)
     if (sh > 0) {
       __syncthreads();
