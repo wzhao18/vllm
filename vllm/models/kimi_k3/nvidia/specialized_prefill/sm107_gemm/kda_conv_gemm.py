@@ -242,10 +242,20 @@ class KdaConvGemm:
         self._compiled[key] = fn
         return fn
 
+    @property
+    def supports_checkpoint_halo(self) -> bool:
+        """Whether ``__call__`` takes ``checkpoint_offsets`` (the branch-free
+        column-pass epilogue, no norms)."""
+        return self._t2
+
     def __call__(
         self, x, x_scale, conv_state, qsl, lines, has_init, with_norms=False,
-        null_block_id: int | None = None,
+        null_block_id: int | None = None, checkpoint_offsets=None, halo=None,
     ):  # fmt: skip
+        """``checkpoint_offsets`` (int32, one per sequence, 0 = none) with
+        ``halo`` (BF16 ``(nseq, 3, N)``): the epilogue also writes the three
+        pre-conv (in_proj output) rows before each checkpoint offset >= 3 to
+        ``halo[s]``; other rows of ``halo`` are left untouched."""
         from cutlass.cute.runtime import from_dlpack
 
         from .conv_fixup import conv_fixup
@@ -253,6 +263,21 @@ class KdaConvGemm:
         m = x.shape[0]
         nseq = qsl.numel() - 1
         dev = x.device
+        ckpt_ptr = halo_ptr = 0
+        if checkpoint_offsets is not None:
+            if not self._t2 or with_norms:
+                raise ValueError("KDA conv GEMM: checkpoint halo needs the t2 epilogue")
+            if (
+                checkpoint_offsets.dtype != torch.int32
+                or checkpoint_offsets.numel() != nseq
+                or not checkpoint_offsets.is_contiguous()
+                or halo is None
+                or halo.dtype != torch.bfloat16
+                or tuple(halo.shape) != (nseq, 3, self.n)
+                or not halo.is_contiguous()
+            ):
+                raise ValueError("KDA conv GEMM: checkpoint offsets / halo layout")
+            ckpt_ptr, halo_ptr = checkpoint_offsets.data_ptr(), halo.data_ptr()
         out = torch.empty(3, m, self.p, dtype=torch.bfloat16, device=dev)
         side = torch.empty(side_rows(m, nseq), self.n, dtype=torch.bfloat16, device=dev)
         norms = (
@@ -275,6 +300,8 @@ class KdaConvGemm:
             cutlass.Int32(nseq),
             cutlass.Int32(top),
             cutlass.Int32(nsteps),
+            cutlass.Int64(ckpt_ptr),
+            cutlass.Int64(halo_ptr),
         )
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         args, problem, tail = _common_args(x, x_scale, self.weight, self.scale, out, self.n)
