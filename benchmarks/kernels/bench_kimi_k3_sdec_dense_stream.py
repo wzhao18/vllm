@@ -63,24 +63,55 @@ def place_rows(w, die_of_row):
 
 
 def print_stamps(label, sync, slots, dsm):
-    """Per-CTA globaltimer stamps (us from the earliest start): quantiles."""
-    base = 16 + dsm.MAX_SLOTS
-    st = sync[base: base + slots * dsm.STAMP_WORDS].view(torch.int64).view(slots, 8)
-    st = st.double().cpu()
-    t0 = st[:, 0].min()
+    """Per-CTA globaltimer stamps (us from the earliest kernel entry): min/med/max."""
+    base = dsm.STAMP_BASE
+    st = sync[base: base + slots * dsm.STAMP_WORDS].view(torch.int64).view(slots, -1)
+    st = st[:, :8].double().cpu()
+    t0 = st[:, 7].min() if bool((st[:, 7] > 0).all()) else st[:, 0].min()
     rel = (st - t0) / 1e3
-    names = ["start", "mma_end", "lastseg", "acc_rdy", "flags", "finish", "end"]
-    out = []
-    for i, n in enumerate(names):
-        col = rel[:, i]
-        out.append(f"{n} {col.median():.2f}/{col.max():.2f}")
-    print(f"{label} stamps med/max us: " + "  ".join(out), flush=True)
-    d = rel[:, 6] - rel[:, 1]
-    print(f"{label} end-mma_end med {d.median():.2f} max {d.max():.2f}; "
-          f"acc_rdy-lastseg med {(rel[:, 3] - rel[:, 2]).median():.2f}; "
-          f"flags-acc_rdy med {(rel[:, 4] - rel[:, 3]).median():.2f} max "
-          f"{(rel[:, 4] - rel[:, 3]).max():.2f}; finish-flags med "
-          f"{(rel[:, 5] - rel[:, 4]).median():.2f}", flush=True)  # fmt: skip
+    names = ["claim", "mma_end", "lastseg", "accrdy|first", "flags", "finish", "end",
+             "entry"]  # fmt: skip
+    out = [f"{n} {rel[:, i].min():.2f}/{rel[:, i].median():.2f}/{rel[:, i].max():.2f}"
+           for i, n in enumerate(names) if bool((st[:, i] > 0).any())]  # fmt: skip
+    print(f"{label} stamps min/med/max us: " + "  ".join(out), flush=True)
+
+
+def sm_rates(label, sync, slots, dsm, fn, runs):
+    """Per-SM stream time (first stage landed -> last stage consumed) over ``runs``
+    calls of a NO_EPILOGUE|STAMPS kernel: spread, run-to-run correlation, and the
+    span if every SM's range were sized by its measured rate."""
+    base = dsm.STAMP_BASE
+    per = []
+    for _ in range(runs):
+        fn()
+        torch.cuda.synchronize()
+        st = sync[base: base + slots * dsm.STAMP_WORDS].view(torch.int64).view(slots, -1)
+        st = st.cpu()
+        sm = st[:, 8].long()
+        t = (st[:, 1] - st[:, 3]).double() / 1e3
+        v = torch.zeros(1024, dtype=torch.float64)
+        v[sm] = t
+        per.append((sm, v))
+    sm = per[0][0]
+    m = torch.stack([v[sm] for _, v in per])
+    qs = torch.tensor([0.0, 0.1, 0.5, 0.9, 1.0], dtype=torch.float64)
+    q = torch.quantile(m[0], qs)
+    cs = [float(torch.corrcoef(torch.stack([m[0], m[i]]))[0, 1]) for i in range(1, runs)]
+    mean = m.mean(0)
+    bal = 1.0 / (1.0 / mean).mean()
+    qtxt = "/".join(f"{x:.2f}" for x in q.tolist())
+    ctxt = " ".join(f"{c:.2f}" for c in cs)
+    span = float(m.max(1).values.mean())
+    print(f"{label} per-SM stream us q0/10/50/90/100 {qtxt} corr {ctxt} "
+          f"rate-sized {bal:.2f} vs max {span:.2f}", flush=True)
+    order = torch.argsort(mean)
+    print(f"{label} fastest smids {sm[order[:12]].tolist()} "
+          f"slowest {sm[order[-12:]].tolist()}", flush=True)
+    srt = sm.tolist()
+    by = sorted(zip(srt, mean.tolist()))
+    print(f"{label} by smid: " + " ".join(f"{a}:{b:.1f}" for a, b in by), flush=True)
+    print(f"{label} by slot: " + " ".join(f"{i}:{a}:{b:.2f}" for i, (a, b) in
+                                          enumerate(zip(srt, mean.tolist()))), flush=True)
 
 
 def main():
@@ -94,6 +125,9 @@ def main():
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--only", default="gu,down")
     ap.add_argument("--no-stock", action="store_true")
+    ap.add_argument("--rates", type=int, default=0)
+    ap.add_argument("--calib", action="store_true")
+    ap.add_argument("--calib-trace", type=int, default=0)
     args = ap.parse_args()
 
     import cutlass
@@ -110,8 +144,10 @@ def main():
     wd = torch.randn(H, I, device=dev, dtype=torch.bfloat16) * 0.02
     doms = dies.sm_domains(dev.index)
     s0, s1 = doms.count(0), doms.count(1)
-    table = torch.zeros(1024, dtype=torch.int32, device=dev)
-    table[: len(doms)] = torch.tensor(doms, dtype=torch.int32, device=dev)
+
+    def tabs(op):  # per-SM ranges: equal, or by the calibrated stream rates (--calib)
+        return dsm.slot_tables(op, doms, None, dev)
+
     print(f"SMs {len(doms)}: die0 {s0} die1 {s1}", flush=True)
     nb0_gu = dsm.split_blocks(I // 128, s0, s1)
     nb0_d = dsm.split_blocks(H // 128, s0, s1)
@@ -160,12 +196,14 @@ def main():
                         continue
                     if debug & dsm.CONTIG_W:  # skeleton: each weight box 16 KB contiguous
                         wg, wdd = wg.view(-1, 64), wdd.view(-1, 64)
-                    fg, ag = dsm.compile_dense_stream(op_gu, wg, x, h, ws, sync, table, s0, s1,
+                    tg = tabs(op_gu)
+                    fg, ag = dsm.compile_dense_stream(op_gu, wg, x, h, ws, sync, *tg, s0, s1,
                                                       stream(dev))  # fmt: skip
+                    td = tabs(op_d)
                     fd, ad = None, None
                     if "down" in args.only:
                         fd, ad = dsm.compile_dense_stream(op_d, wdd, h, y, ws, sync_d,
-                                                          table, s0, s1, stream(dev))  # fmt: skip
+                                                          *td, s0, s1, stream(dev))  # fmt: skip
                     s0c, s1c, tc = cutlass.Int32(s0), cutlass.Int32(s1), cutlass.Int32(T)
 
                     def run_gu(fg=fg, ag=ag):
@@ -179,6 +217,19 @@ def main():
                     run_gu()
                     run_d()
                     torch.cuda.synchronize()
+                    if args.calib and tag == "loc":
+                        ks = [(op_gu, sync, *tg)] + ([(op_d, sync_d, *td)] if fd else [])
+                        if args.calib_trace and debug & dsm.STAMPS:
+                            for rnd in range(args.calib_trace):
+                                dsm.calibrate(lambda: (run_gu(), run_d()), ks, doms, rounds=1)
+                                for nm, sy, fn in (("gu", sync, run_gu), ("down", sync_d, run_d)):
+                                    sm_rates(f"T{T} d{debug} round{rnd} {nm}", sy, s0 + s1, dsm,
+                                             fn, 2)  # fmt: skip
+                                print(f"T{T} d{debug} round{rnd} gu "
+                                      f"{graph_time(run_gu, args.reps):.2f} down "
+                                      f"{graph_time(run_d, args.reps):.2f} us", flush=True)
+                        else:
+                            dsm.calibrate(lambda: (run_gu(), run_d()), ks, doms)
                     print(f"T{T} {tag} d{debug}: compiled+ran in {time.time() - t0:.1f} s",
                           flush=True)  # fmt: skip
                     if not debug:
@@ -199,6 +250,9 @@ def main():
                             fn()
                             torch.cuda.synchronize()
                             print_stamps(f"T{T} {tag} d{debug} {nm}", sy, s0 + s1, dsm)
+                            if args.rates and debug & dsm.NO_EPILOGUE:
+                                sm_rates(f"T{T} {tag} d{debug} {nm}", sy, s0 + s1, dsm, fn,
+                                         args.rates)  # fmt: skip
                     name = f"ds-{tag}" + (f"-d{debug}" if debug else "")
                     if "gu" in args.only:
                         res[name + " gu"] = graph_time(run_gu, args.reps)
@@ -212,7 +266,8 @@ def main():
                 sync_p = torch.zeros(dsm.SYNC_WORDS, dtype=torch.int32, device=dev)
                 gu_p = torch.empty(T, 2 * I, device=dev, dtype=torch.bfloat16)
                 h_p = torch.empty(T, I, device=dev, dtype=torch.bfloat16)
-                fp, ap = dsm.compile_dense_stream(op_p, wgu_p, x, gu_p, ws_p, sync_p, table,
+                tp = tabs(op_p)
+                fp, ap = dsm.compile_dense_stream(op_p, wgu_p, x, gu_p, ws_p, sync_p, *tp,
                                                   s0, s1, stream(dev))  # fmt: skip
                 c0, c1, ct = cutlass.Int32(s0), cutlass.Int32(s1), cutlass.Int32(T)
 
@@ -222,6 +277,8 @@ def main():
 
                 run_p()
                 torch.cuda.synchronize()
+                if args.calib:
+                    dsm.calibrate(run_p, [(op_p, sync_p, *tp)], doms)
                 e = ((h_p.float() - h_ref.float()).abs().max() / h_ref.float().abs().max()).item()
                 print(f"T{T} plain: h rel {e:.2e}", flush=True)
                 res["ds-plain gu+stock situ"] = graph_time(run_p, args.reps)

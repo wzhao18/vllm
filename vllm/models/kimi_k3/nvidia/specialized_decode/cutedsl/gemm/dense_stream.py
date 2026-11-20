@@ -35,12 +35,14 @@ issuing threads, >= 128-180 KiB in flight, lean producer loop):
   blocks runs after the stream and needs the issue slots); TMEM holds two
   accumulator sets so a block's epilogue overlaps the next block's MMAs.
 - PDL: launched as a dependent (the slot claim and the prologue overlap the
-  predecessor's tail) but never releases its own dependents early: the slot claims
-  are re-armed by the last CTA, so a following instance of the same kernel must not
-  claim before every CTA of this one has finished.
+  predecessor's tail) and releases its dependents right after its own setup: with
+  oversized shared memory they take an SM only when this kernel's CTA leaves it, so
+  their launch and prologue overlap this kernel's tail. Each CTA releases its slot
+  claim when it leaves; the next instance's CTA on that SM claims it again.
 """
 
 import functools
+import math
 
 import cuda.bindings.driver as _cuda
 import cutlass
@@ -75,8 +77,13 @@ from .wide import (
 K_TILE = 64  # K per ring stage (one 128-byte swizzle atom)
 CHUNK = 16  # token columns per tcgen05.ld 32x32b.x16
 MAX_SLOTS = 512  # ranges (one per SM)
-STAMP_WORDS = 16  # 8 u64 globaltimer stamps per slot (debug STAMPS)
-SYNC_WORDS = 16 + MAX_SLOTS + MAX_SLOTS * STAMP_WORDS  # claims, flags, stamps
+MAX_DIE = 255  # slots (SMs) a die
+STAMP_WORDS = 24  # 12 u64 per slot: globaltimer stamps + %smid (debug STAMPS)
+FLAGS = 16  # sync words: [0, 16) counters, then per slot: partial flags,
+CLAIMS = FLAGS + MAX_SLOTS  # slot claims,
+TIMES = CLAIMS + MAX_SLOTS  # u64 (first stage landed, last stage consumed),
+STAMP_BASE = TIMES + 4 * MAX_SLOTS  # debug stamps
+SYNC_WORDS = STAMP_BASE + MAX_SLOTS * STAMP_WORDS
 SMEM_BUDGET = 320 * 1024  # oversized shared memory (hwdb topic 03: 327 KiB, budget 320)
 BULK = 32768  # bytes per bulk-copy op of a staged partial
 PRODUCERS = 3  # TMA issuing warps (0, 1 and 3): one op in flight per issuing thread
@@ -91,6 +98,11 @@ STAMPS = 4  # per-slot globaltimer stamps after the flags (see ``stamp``)
 NO_SITU = 8  # the epilogue stores the rounded gate instead of SiTU (timing only)
 NO_STORE = 16  # the epilogue computes but never stores (timing only)
 CONTIG_W = 32  # with NO_MMA: w passed as (rows * K / 64, 64), each box 16 KB contiguous
+NO_X = 64  # with NO_MMA: the activation tile is never loaded (weight-only ring)
+XDIV2 = 128  # with NO_MMA: the activation tile is loaded every 2nd K step only
+XDIV4 = 256  # with NO_MMA: ... every 4th K step only
+NO_EARLY_PDL = 512  # dependents launch only when this grid completes (A/B only)
+STAGES_SHIFT = 12  # (debug >> 12) & 31: ring stages override (benchmarks only)
 
 tanh = functools.partial(cute.math.tanh, fastmath=False)
 
@@ -98,6 +110,12 @@ tanh = functools.partial(cute.math.tanh, fastmath=False)
 @asm(Int32)
 def _ld_s32(address):
     return "ld.global.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
+
+
+@asm(Int32)
+def _atom_cas(address, compare, value):
+    code = "atom.relaxed.gpu.global.cas.b32 $0, [$1], $2, $3;"
+    return code, "=r,l,r,r,~{memory}", (Int64(address), Int32(compare), Int32(value))
 
 
 @asm()
@@ -210,6 +228,9 @@ class DenseStream:
         # Staged partials: the gate_up head has one (ranges >= a block); down's head
         # up to a few. Keep >= 4 ring stages (>= ~120 KiB of weights in flight).
         self.stages = min(16, (SMEM_BUDGET - 4096) // self.stage_bytes)
+        if (debug >> STAGES_SHIFT) & 31:
+            self.stages = min(self.stages, (debug >> STAGES_SHIFT) & 31)
+        self.x_div = 2 if debug & XDIV2 else (4 if debug & XDIV4 else 1)
         # A head's partials staged in the drained ring; any further ones read L2.
         self.nstage_p = self.stages * self.stage_bytes // self.part
         assert self.stages >= 3, (rows, n, k, self.stages)
@@ -230,14 +251,14 @@ class DenseStream:
     def stamp(self, sync, slot, index):
         """globaltimer into stamp ``index`` of ``slot`` (debug STAMPS only)."""
         if cutlass.const_expr(self.debug & STAMPS):
-            base = sync + (16 + MAX_SLOTS) * 4 + Int64(slot) * STAMP_WORDS * 4
+            base = sync + STAMP_BASE * 4 + Int64(slot) * STAMP_WORDS * 4
             _st_u64(base + index * 8, _now())
 
     @cute.jit
     def __call__(
         self, w: cute.Tensor, x: cute.Tensor, y: cute.Tensor, ws: cute.Tensor,
-        sync: cute.Tensor, table: cute.Tensor, s0: Int32, s1: Int32, nrows: Int32,
-        stream: _cuda.CUstream,
+        sync: cute.Tensor, table: cute.Tensor, ranges: cute.Tensor, s0: Int32, s1: Int32,
+        nrows: Int32, stream: _cuda.CUstream,
     ):  # fmt: skip
         """w (Nw, K, 1) and x (T, K, 1) K-major BF16; y [T, ldo] BF16; ws uint8
         (``ws_bytes``); sync int32 [SYNC_WORDS] zeroed once; table int32 [1024] die of
@@ -269,6 +290,7 @@ class DenseStream:
         a_bytes = cute.size_in_bytes(dtype, a_one)
         b_bytes = cute.size_in_bytes(dtype, b_one)
         self.tx_bytes = a_bytes * self.nacc + b_bytes
+        self.tx_w = a_bytes * self.nacc
 
         @cute.struct
         class Storage:
@@ -279,6 +301,9 @@ class DenseStream:
             staged: cutlass.Int64
             tmem_holder: cutlass.Int32
             slot: cutlass.Int32
+            ru0: cutlass.Int32
+            ru1: cutlass.Int32
+            bnd: cute.struct.MemRange[cutlass.Int32, MAX_DIE + 1]
             sA: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(a_layout.outer)], 1024
             ]
@@ -289,7 +314,7 @@ class DenseStream:
         self.storage = Storage
         self.kernel(
             tiled_mma, tma_a, tma_w, tma_b, tma_x, a_layout, b_layout, y, ws, sync,
-            table, s0, s1, nrows,
+            table, ranges, s0, s1, nrows,
         ).launch(  # fmt: skip
             grid=(s0 + s1, 1, 1),
             block=[self.threads, 1, 1],
@@ -303,7 +328,8 @@ class DenseStream:
         self, tiled_mma: cute.TiledMma, tma_a: cute.CopyAtom, mW: cute.Tensor,
         tma_b: cute.CopyAtom, mX: cute.Tensor, a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout, mY: cute.Tensor, mWs: cute.Tensor,
-        mSync: cute.Tensor, mTable: cute.Tensor, s0: Int32, s1: Int32, nrows: Int32,
+        mSync: cute.Tensor, mTable: cute.Tensor, mRanges: cute.Tensor, s0: Int32, s1: Int32,
+        nrows: Int32,
     ):  # fmt: skip
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
@@ -316,6 +342,9 @@ class DenseStream:
         staged = st.staged.ptr
         tmem_holder = st.tmem_holder.ptr
         slot_s = Int32(st.slot.ptr.toint())
+        ru0_s = Int32(st.ru0.ptr.toint())
+        ru1_s = Int32(st.ru1.ptr.toint())
+        bnd_s = Int32(st.bnd.data_ptr().toint())
         sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
         sB = st.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
         sp = Int32(st.sA.data_ptr().toint())  # the ring: staging after the stream
@@ -334,16 +363,38 @@ class DenseStream:
                 cute.arch.mbarrier_init(staged, 1)
         if warp == 3:
             if lane == 0:
-                die = _ld_s32(mTable.iterator.toint() + Int64(smid() & 1023) * 4)
-                slot = Int32(0)
-                if die == 0:
-                    slot = _atom_add(sync, 1)
-                else:
-                    slot = s0 + s1 - 1 - _atom_add(sync + 4, 1)
+                t_entry = _now()
+                entry = mTable.iterator.toint() + Int64(smid() & 1023) * 16
+                pref = _ld_s32(entry)
+                ru0 = _ld_s32(entry + 4)
+                ru1 = _ld_s32(entry + 8)
+                claims = sync + CLAIMS * 4
+                slot = Int32(-1)
+                if pref >= 0:
+                    if _atom_cas(claims + Int64(pref) * 4, 0, 1) == 0:
+                        slot = pref
+                if slot < 0:  # this SM's slot is taken (or unmapped): any free slot
+                    p = Int32(0)
+                    while (slot < 0) & (p < s0 + s1):
+                        if _atom_cas(claims + Int64(p) * 4, 0, 1) == 0:
+                            slot = p
+                        p += 1
+                    rb = mRanges.iterator.toint() + Int64(
+                        cutlass.select_(slot >= s0, slot - s0 + MAX_DIE + 1, slot)) * 4
+                    ru0 = _ld_s32(rb)
+                    ru1 = _ld_s32(rb + 4)
                 _sts_s32(slot_s, slot)
+                _sts_s32(ru0_s, ru0)
+                _sts_s32(ru1_s, ru1)
                 self.stamp(sync, slot, 0)
+                if cutlass.const_expr(self.debug & STAMPS):
+                    base = sync + STAMP_BASE * 4 + Int64(slot) * STAMP_WORDS * 4
+                    _st_u64(base + 7 * 8, t_entry)
+                    _st_u64(base + 8 * 8, Int64(smid()))
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
+        if cutlass.const_expr(not (self.debug & NO_EARLY_PDL)):
+            cute.arch.griddepcontrol_launch_dependents()
 
         # This CTA's range [u0, u1) of its die's (block, K step) units.
         slot = _lds_s32(slot_s)
@@ -358,8 +409,8 @@ class DenseStream:
             bbase = Int32(self.nb0)
             nbd = Int32((self.pairs if self.pairs else self.nb) - self.nb0)
         units = nbd * kt * (2 if self.pairs else 1)
-        u0 = r * units // sd
-        u1 = (r + 1) * units // sd
+        u0 = _lds_s32(ru0_s)
+        u1 = _lds_s32(ru1_s)
 
         gW = cute.local_tile(mW, cute.slice_(self.mma_tiler, (None, 0, None)),
                              (None, None, None))  # fmt: skip
@@ -395,8 +446,14 @@ class DenseStream:
                 for kb in cutlass.range(u - b * kt, kb1, unroll=1):
                     if turn == me:
                         cute.arch.mbarrier_wait(empty + s, phase)
+                        tx = Int32(self.tx_bytes)
+                        if cutlass.const_expr(self.debug & NO_X):
+                            tx = Int32(self.tx_w)
+                        elif cutlass.const_expr(self.x_div > 1):
+                            tx = cutlass.select_(kb % self.x_div == 0, Int32(self.tx_bytes),
+                                                 Int32(self.tx_w))  # fmt: skip
                         with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_bytes)
+                            cute.arch.mbarrier_arrive_and_expect_tx(full + s, tx)
                         if cutlass.const_expr(self.debug & CONTIG_W):
                             cute.copy(tma_a, tAgW[(None, gb * kt + kb, 0, 0)],
                                       tAsA[(None, s * nacc)], tma_bar_ptr=full + s)  # fmt: skip
@@ -409,8 +466,15 @@ class DenseStream:
                             if cutlass.const_expr(nacc == 2):
                                 cute.copy(tma_a, tAgW[(None, self.nb + gb, kb, 0)],
                                           tAsA[(None, s * nacc + 1)], tma_bar_ptr=full + s)  # fmt: skip
-                        cute.copy(tma_b, tBgX[(None, 0, kb, 0)], tBsB[(None, s)],
-                                  tma_bar_ptr=full + s)  # fmt: skip
+                        if cutlass.const_expr(self.debug & NO_X):
+                            pass
+                        elif cutlass.const_expr(self.x_div > 1):
+                            if kb % self.x_div == 0:
+                                cute.copy(tma_b, tBgX[(None, 0, kb, 0)], tBsB[(None, s)],
+                                          tma_bar_ptr=full + s)  # fmt: skip
+                        else:
+                            cute.copy(tma_b, tBgX[(None, 0, kb, 0)], tBsB[(None, s)],
+                                      tma_bar_ptr=full + s)  # fmt: skip
                     turn += 1
                     if turn == PRODUCERS:
                         turn = Int32(0)
@@ -438,6 +502,12 @@ class DenseStream:
                 _fence_after()
                 for kk in cutlass.range(kb1 - kb0, unroll=1):
                     cute.arch.mbarrier_wait(full + s, phase)
+                    if (u == u0) & (kk == 0):
+                        with cute.arch.elect_one():
+                            _st_u64(sync + TIMES * 4 + Int64(slot) * 16, _now())
+                            if cutlass.const_expr((self.debug & STAMPS) and
+                                                  (self.debug & NO_EPILOGUE)):  # fmt: skip
+                                self.stamp(sync, slot, 3)
                     if cutlass.const_expr(not (self.debug & NO_MMA)):
                         for a in cutlass.range_constexpr(nacc):
                             acc_a = acc[(None, None, None, buf * nacc + a)]
@@ -456,6 +526,7 @@ class DenseStream:
                 seg += 1
                 u = (b + 1) * kt
             with cute.arch.elect_one():
+                _st_u64(sync + TIMES * 4 + Int64(slot) * 16 + 8, _now())
                 self.stamp(sync, slot, 1)
         elif warp >= 4:
             if warp == 4:
@@ -465,8 +536,14 @@ class DenseStream:
                                                    ptr_to_buffer_holding_addr=tmem_holder)  # fmt: skip
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
             cute.arch.griddepcontrol_wait()
+            tid = (warp - 4) * 32 + lane
+            if tid <= sd:
+                rd = mRanges.iterator.toint() + Int64(
+                    cutlass.select_(d1, Int32(MAX_DIE + 1), Int32(0)) + tid) * 4
+                _sts_s32(bnd_s + tid * 4, _ld_s32(rd))
+            _bar(3, EPI_THREADS)
             self.epilogue(acc, acc_full, acc_empty, staged, warp - 4, lane, slot, r, sd,
-                          d1, s0, bbase, units, u0, u1, sp, mY, mWs, sync, nrows,
+                          d1, s0, bbase, bnd_s, u0, u1, sp, mY, mWs, sync, nrows,
                           nbd)  # fmt: skip
             if warp == 4:
                 cute.arch.relinquish_tmem_alloc_permit()
@@ -476,16 +553,14 @@ class DenseStream:
                     self.stamp(sync, slot, 6)
             if warp == 4:
                 cute.arch.dealloc_tmem(tmem_ptr, self.tmem_cols)
-                if lane == 0:  # the last CTA re-arms the slot claims
-                    if _atom_add(sync + 8, 1) == s0 + s1 - 1:
-                        _st_relaxed(sync, 0)
-                        _st_relaxed(sync + 4, 0)
-                        _st_relaxed(sync + 8, 0)
+                if lane == 0:  # release the slot: the next instance's CTA on this SM
+                    # (dependents start only as this CTA leaves the SM) claims it again
+                    _st_relaxed(sync + CLAIMS * 4 + Int64(slot) * 4, 0)
 
     @cute.jit
     def epilogue(
         self, acc: cute.Tensor, acc_full, acc_empty, staged, ew: Int32, lane: Int32,
-        slot: Int32, r: Int32, sd: Int32, d1, s0: Int32, bbase: Int32, units: Int32,
+        slot: Int32, r: Int32, sd: Int32, d1, s0: Int32, bbase: Int32, bnd_s: Int32,
         u0: Int32, u1: Int32, sp: Int32, mY: cute.Tensor, mWs: cute.Tensor,
         sync: Int64, nrows: Int32, nbd: Int32,
     ):  # fmt: skip
@@ -517,7 +592,7 @@ class DenseStream:
                 cute.arch.mbarrier_wait(acc_full + buf, (seg >> 1) & 1)
             else:
                 self.segment(acc_full, staged, buf, seg, kb0, bstart, col, slot, r, sd,
-                             units, slot_base, ws, flags, sp, y, gb, q, tid, half,
+                             bnd_s, slot_base, ws, flags, sp, y, gb, q, tid, half,
                              nrows, sync)  # fmt: skip
             _fence_before()
             cute.arch.mbarrier_arrive(acc_empty + buf)
@@ -527,7 +602,7 @@ class DenseStream:
     @cute.jit
     def segment(
         self, acc_full, staged, buf: Int32, seg: Int32, kb0: Int32, bstart: Int32,
-        col: Int32, slot: Int32, r: Int32, sd: Int32, units: Int32, slot_base: Int32,
+        col: Int32, slot: Int32, r: Int32, sd: Int32, bnd_s: Int32, slot_base: Int32,
         ws: Int64, flags: Int64, sp: Int32, y: Int64, gb: Int32, q: Int32, tid: Int32,
         half: Int32, nrows: Int32, sync: Int64,
     ):  # fmt: skip
@@ -554,20 +629,21 @@ class DenseStream:
                 self.stamp(sync, slot, 4)
         else:  # the head: own accumulator + the later ranges' partials
             last = r
-            while (last + 1) * units // sd < bstart + kt:  # start(sd) = units: stops
+            while _lds_s32(bnd_s + (last + 1) * 4) < bstart + kt:  # bnd[sd] = units
                 last += 1
             # Partials staged in the drained ring (a head with partials is its range's
             # last segment: every stage has been consumed).
             nst = Int32(0)
             for p in cutlass.range(r + 1, last + 1, unroll=1):
-                if (p * units // sd < (p + 1) * units // sd) & (nst < self.nstage_p):
+                if (_lds_s32(bnd_s + p * 4) < _lds_s32(bnd_s + p * 4 + 4)) & (
+                        nst < self.nstage_p):  # fmt: skip
                     nst += 1
             if tid == 0:
                 if nst > 0:
                     cute.arch.mbarrier_arrive_and_expect_tx(staged, nst * part)
                 j = Int32(0)
                 for p in cutlass.range(r + 1, last + 1, unroll=1):
-                    if (p * units // sd < (p + 1) * units // sd) & (j < nst):
+                    if (_lds_s32(bnd_s + p * 4) < _lds_s32(bnd_s + p * 4 + 4)) & (j < nst):
                         while _ld_acquire(flags + Int64(slot_base + p) * 4) == 0:
                             pass
                         _fence_proxy_global()  # the bulk copy (async proxy) reads them
@@ -578,14 +654,14 @@ class DenseStream:
                                        staged)  # fmt: skip
                         j += 1
             for p in cutlass.range(r + 1, last + 1, unroll=1):  # acquire every partial
-                if p * units // sd < (p + 1) * units // sd:
+                if _lds_s32(bnd_s + p * 4) < _lds_s32(bnd_s + p * 4 + 4):
                     while _ld_acquire(flags + Int64(slot_base + p) * 4) == 0:
                         pass
             if nst > 0:
                 cute.arch.mbarrier_wait(staged, 0)
             if tid == 0:
                 self.stamp(sync, slot, 4)
-            self.finish(col, r, last, sd, units, slot_base, ws, sp, y, gb, q, half,
+            self.finish(col, r, last, sd, bnd_s, slot_base, ws, sp, y, gb, q, half,
                         nrows)  # fmt: skip
             _bar(3, EPI_THREADS)
             if tid == 0:
@@ -595,7 +671,7 @@ class DenseStream:
 
     @cute.jit
     def finish(
-        self, col: Int32, r: Int32, last: Int32, sd: Int32, units: Int32,
+        self, col: Int32, r: Int32, last: Int32, sd: Int32, bnd_s: Int32,
         slot_base: Int32, ws: Int64, sp: Int32, y: Int64, gb: Int32, q: Int32,
         half: Int32, nrows: Int32,
     ):  # fmt: skip
@@ -615,7 +691,7 @@ class DenseStream:
                     off = ((a * 128 + q) * t_pad + c * CHUNK) * 4
                     j = Int32(0)
                     for p in cutlass.range(r + 1, last + 1, unroll=1):
-                        if p * units // sd < (p + 1) * units // sd:
+                        if _lds_s32(bnd_s + p * 4) < _lds_s32(bnd_s + p * 4 + 4):
                             if j < self.nstage_p:
                                 src = sp + j * part + off
                                 for v4 in cutlass.range_constexpr(CHUNK // 4):
@@ -670,15 +746,131 @@ def as_cute(t, *, k_major=False, rows=False):
     return from_dlpack(t, assumed_align=16)
 
 
-def compile_dense_stream(op: DenseStream, w, x, y, ws, sync, table, s0, s1, stream):
+def compile_dense_stream(op: DenseStream, w, x, y, ws, sync, table, ranges, s0, s1,
+                         stream):  # fmt: skip
     """Compile (once per specialization) and return (launcher, tensor args); call as
-    ``fn(*args, Int32(s0), Int32(s1), Int32(nrows), stream)``."""
+    ``fn(*args, Int32(s0), Int32(s1), Int32(nrows), stream)``. ``table`` / ``ranges``:
+    ``slot_tables``."""
     key = (op.rows, op.n, op.k, op.situ, op.beta, op.linear_beta, op.ldo, op.debug,
            op.nb0, op.pairs, tuple(w.shape))  # fmt: skip
     fn = _COMPILED.get(key)
     args = (as_cute(w, k_major=True), as_cute(x, k_major=True), as_cute(y, rows=True),
-            as_cute(ws), as_cute(sync), as_cute(table))  # fmt: skip
+            as_cute(ws), as_cute(sync), as_cute(table), as_cute(ranges))  # fmt: skip
     if fn is None:
         fn = cute.compile(op, *args, Int32(s0), Int32(s1), Int32(x.shape[0]), stream)
         _COMPILED[key] = fn
     return fn, args
+
+
+def die_units(op: DenseStream):
+    """(units of die 0, units of die 1) of ``op``'s (block, K step) space."""
+    nbs = op.pairs if op.pairs else op.nb
+    mult = 2 if op.pairs else 1
+    return op.nb0 * op.kt * mult, (nbs - op.nb0) * op.kt * mult
+
+
+def _scatter(n):
+    """A multiplier coprime to ``n`` near ``n`` / golden ratio: neighbouring SMs (one
+    TPC / GPC) stream far-apart ranges."""
+    p = max(1, int(round(n * 0.618)))
+    while math.gcd(p, n) != 1:
+        p += 1
+    return p
+
+
+def slot_sms(domains):
+    """smid of each slot: die 0's slots [0, s0), then die 1's; within a die, the SM of
+    smid rank i takes slot (i * _scatter(s)) % s."""
+    groups = [[s for s, d in enumerate(domains) if d == die] for die in (0, 1)]
+    if not groups[1]:
+        groups = [[s for s, d in enumerate(domains) if d >= 0], []]
+    out = []
+    for group in groups:
+        n = len(group)
+        if not n:
+            continue
+        slots = [0] * n
+        mult = _scatter(n)
+        for i, sm in enumerate(group):
+            slots[(i * mult) % n] = sm
+        out += slots
+    return out
+
+
+def slot_tables(op: DenseStream, domains, weights=None, device=None):
+    """(table int32 [1024, 4], ranges int32 [2 (MAX_DIE + 1)]) for ``op``: slot r of
+    die d (``slot_sms``) streams units [bound_d[r], bound_d[r + 1]) of the die's
+    space, in proportion to ``weights[smid]`` (the SM's measured stream rate on this
+    kernel, ``calibrate``; default equal). Table row ``smid``: (slot, u0, u1, 0);
+    -1 for an SM without a slot (it claims any free slot)."""
+    import torch
+
+    sms = slot_sms(domains)
+    s0 = sum(1 for d in domains if d == 0)
+    if s0 == len(sms) or not any(d == 1 for d in domains):
+        s0 = len(sms)
+    assert s0 <= MAX_DIE and len(sms) - s0 <= MAX_DIE, (s0, len(sms))
+    table = torch.full((1024, 4), -1, dtype=torch.int32)
+    ranges = torch.zeros(2 * (MAX_DIE + 1), dtype=torch.int32)
+    for die, units in enumerate(die_units(op)):
+        group = sms[:s0] if die == 0 else sms[s0:]
+        if not group:
+            continue
+        w = [1.0 if weights is None else max(float(weights[sm]), 1e-9) for sm in group]
+        total, acc, bounds = sum(w), 0.0, [0]
+        for wi in w:
+            acc += wi
+            bounds.append(int(round(units * acc / total)))
+        bounds[-1] = units
+        base = 0 if die == 0 else s0
+        for r, sm in enumerate(group):
+            table[sm] = torch.tensor([base + r, bounds[r], bounds[r + 1], 0])
+        ranges[die * (MAX_DIE + 1): die * (MAX_DIE + 1) + len(bounds)] = torch.tensor(bounds)
+    return table.to(device), ranges.to(device)
+
+
+def calibrate(run, kernels, domains, calls=4, rounds=2):
+    """Size every SM's ranges by its measured stream rate on each kernel (the SMs'
+    HBM read rates differ by up to ~25% and depend on the kernel's data layout:
+    equal ranges wait on the slowest). ``run()`` launches every kernel of
+    ``kernels`` = [(op, sync, table, ranges)] once; their tables are updated in place.
+    Returns the per-smid weights of each kernel."""
+    import torch
+
+    sms = slot_sms(domains)
+    out = [None] * len(kernels)
+    for _ in range(rounds):
+        spans = []
+        for _, _, table, _ in kernels:
+            cpu = table.cpu()
+            spans.append([(int(cpu[sm, 1]), int(cpu[sm, 2])) for sm in sms])
+        acc = [[0.0] * 1024 for _ in kernels]
+        for call in range(calls):
+            run()
+            torch.accelerator.synchronize()
+            if call == 0:  # cold
+                continue
+            for k, (_, sync, _, _) in enumerate(kernels):
+                t = stream_times(sync, len(sms))
+                for slot, sm in enumerate(sms):
+                    u0, u1 = spans[k][slot]
+                    dt = int(t[slot, 1] - t[slot, 0])
+                    if u1 > u0 and dt > 0:
+                        acc[k][sm] += (u1 - u0) / dt
+        for k, (op, _, table, ranges) in enumerate(kernels):
+            known = [a for a in acc[k] if a > 0]
+            mean = sum(known) / len(known) if known else 1.0
+            out[k] = [a if a > 0 else mean for a in acc[k]]
+            t2, r2 = slot_tables(op, domains, out[k], table.device)
+            table.copy_(t2)
+            ranges.copy_(r2)
+    return out
+
+
+def stream_times(sync, slots):
+    """Per slot (first stage landed, last stage consumed) of the last call, in ns
+    (int64 CPU tensor [slots, 2])."""
+    import torch
+
+    t = sync[TIMES: TIMES + 4 * slots].view(torch.int64).view(slots, 2)
+    return t.cpu()
