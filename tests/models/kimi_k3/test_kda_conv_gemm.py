@@ -35,15 +35,16 @@ def _operands(m, n, k, dev, seed):
     return x.to(torch.float8_e4m3fn), sx, w.to(torch.float8_e4m3fn), sw
 
 
-def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32):
+def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32,
+         part=PART, k=K):  # fmt: skip
     from vllm.models.kimi_k3.nvidia.ops import kda_conv
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
         KdaConvGemm,
     )
 
     dev = torch.device("cuda")
-    n = 3 * PART
-    xq, xs, wq, ws = _operands(m, n, K, dev, seed)
+    n = 3 * part
+    xq, xs, wq, ws = _operands(m, n, k, dev, seed)
     proj = torch._scaled_mm(
         xq, wq.t(),
         scale_a=xs.view(torch.float8_e8m0fnu), scale_b=ws.view(torch.float8_e8m0fnu),
@@ -64,8 +65,8 @@ def _run(seqlens, m, deep=False, tactic=None, seed=0, state_dtype=torch.float32)
     state0 = state0.to(torch.bfloat16).to(state_dtype)[:, :, :3]
 
     st_ref = state0.clone()
-    ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, PART)
-    gemm = KdaConvGemm(wq, ws, cw, PART, tactic=tactic)
+    ref = kda_conv.qkv_conv(proj, cw, st_ref, qsl, lines, has_init, part)
+    gemm = KdaConvGemm(wq, ws, cw, part, tactic=tactic)
     st = state0.clone()
     out, _ = gemm(xq, xs, st, qsl, lines, has_init, null_block_id=NULL_BLOCK_ID)
     torch.cuda.synchronize()
@@ -108,6 +109,50 @@ def test_kda_conv_gemm_old_column_pass():
     # The previous per-row column pass (kept for the inverse-norm variant).
     _run([1, 2, 3, 125, 128, 3, 256, 600, 5], 1300,
          tactic=((512, 256), (4, 1), 256, 8, "n", 0, 0, "ct1"))  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "part,k,m",
+    [
+        (12288, 7168, 16384),  # deployed K3.1 KDA layer (DEP prefill)
+        (1024, 1024, 16384),  # 3 cluster columns: swizzle 4 -> 3 (was an IMA)
+        (3072, 1024, 16384),  # 9 cluster columns: swizzle 4 -> 3 (was an IMA)
+        (6144, 7168, 8192),  # 18 cluster columns: swizzle 4 -> 3 (TP2 plane)
+    ],
+)
+def test_kda_conv_gemm_deployed_tactic_shapes(part, k, m):
+    """The deployed 2x4-cluster "m"-raster TACTIC at plane widths whose cluster
+    column count the swizzle (4) does not divide: the persistent scheduler
+    pads the cluster grid to a multiple of the swizzle, and the conv
+    epilogue's unbounded stores of the padded tiles wrote past the planes
+    (illegal address at P=1024 K=1024 M=16384). shape_tactic fits the swizzle
+    to the shape; output and conv state stay bitwise equal to stock."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+
+    _run([m // 3, m // 3, m - 2 * (m // 3)], m, tactic=TACTIC, part=part, k=k)
+
+
+def test_shape_tactic():
+    """Swizzle fitted to the cluster column count ("m" raster only); N that the
+    clusters cannot tile is rejected (kda_conv_in_proj.unsupported_reason)."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import TACTIC
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm.kda_conv_gemm import (  # noqa: E501
+        DEFAULT_TACTIC,
+        shape_tactic,
+    )
+
+    assert shape_tactic(3 * 12288, TACTIC) == TACTIC  # 36 cluster columns
+    assert shape_tactic(3 * 1024, TACTIC)[3] == 3
+    assert shape_tactic(3 * 2048, TACTIC)[3] == 3  # 6 columns
+    assert shape_tactic(3 * 4096, TACTIC)[3] == 4
+    assert shape_tactic(3 * 1024 * 7, TACTIC)[3] == 3  # 21 columns
+    assert shape_tactic(3 * 1024 * 5, TACTIC)[3] == 3  # 15 columns
+    fitted = shape_tactic(3 * 1024, TACTIC)
+    assert fitted[:3] == TACTIC[:3] and fitted[4:] == TACTIC[4:]
+    for p in (256, 512, 768, 1280):
+        with pytest.raises(ValueError):
+            shape_tactic(3 * p, TACTIC)
+    assert shape_tactic(3 * 512, DEFAULT_TACTIC) == DEFAULT_TACTIC  # "n" raster
 
 
 def test_contiguous_rows_bytes():

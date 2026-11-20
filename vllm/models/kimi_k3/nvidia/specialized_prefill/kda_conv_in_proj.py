@@ -34,7 +34,8 @@ def _qkv_rows(lin) -> torch.Tensor:
 def unsupported_reason(layer) -> str | None:
     """None when the layer can run the fused GEMM: SM107, online-MXFP8 in_proj
     with K-major [N, K] rows (either kernel layout), FP32 width-4 conv
-    weights, 256-multiple planes; else why not."""
+    weights, 256-multiple planes that ``TACTIC``'s clusters tile exactly
+    (``kda_conv_gemm.shape_tactic``); else why not."""
     from vllm.platforms import current_platform
 
     if not current_platform.is_device_capability((10, 7)):
@@ -51,6 +52,12 @@ def unsupported_reason(layer) -> str | None:
         return f"conv weight {w.dtype} {tuple(w.shape)} (FP32 width 4 only)"
     if layer.local_projection_size % 256 or lin.input_size_per_partition % 128:
         return "plane / K size"
+    from .sm107_gemm.kda_conv_gemm import shape_tactic
+
+    try:
+        shape_tactic(3 * layer.local_projection_size, TACTIC)
+    except ValueError as e:
+        return str(e)
     return None
 
 
