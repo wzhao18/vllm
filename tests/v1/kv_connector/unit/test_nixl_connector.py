@@ -2457,6 +2457,7 @@ def _run_abort_timeout_test(llm: LLM, timeout: int):
 
 def test_mixed_memory_local_descriptors_split_by_memory_type():
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.transfer_topo = MagicMock()
     worker.block_size = 16
     worker.engine_id = "local"
@@ -2502,6 +2503,7 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
 def recv_worker():
     """Receive lifecycle state without distributed or device initialization."""
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.transfer_topo = MagicMock()
     worker.transfer_topo.block_size_ratio.return_value = 1
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
