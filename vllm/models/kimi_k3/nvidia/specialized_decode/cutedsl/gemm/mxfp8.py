@@ -47,14 +47,11 @@ PRE_DEFAULT = (
     (129, 256, ((256, 128), (2, 1), False, 256), 4),
     (257, 512, ((256, 256), (2, 1), False, 256), 4),
 )
-# kda_in: one smem stage below FlashInfer's count (12 / 12 / 9) so a CTA fits beside
-# the SP all-gather's CTAs (run at ``PRE_GATHER_CARVEOUT``), every stage's weight half
-# issued before griddepcontrol.wait.
 PRE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
-        (1, 128, ((128, 64), (1, 1), False, 128), 11, 11),
-        (129, 256, ((256, 128), (2, 1), False, 256), 11, 11),
-        (257, 512, ((256, 256), (2, 1), False, 256), 8, 8),
+        (1, 128, ((128, 64), (1, 1), False, 128), 8),
+        (129, 256, ((256, 128), (2, 1), False, 256), 4),
+        (257, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
@@ -64,10 +61,6 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
         (257, 512, ((128, 128), (1, 1), False, 128), 4),
     ),
 }
-
-
-# Preferred shared-memory carve-out of the SP all-gather before a "pre" in-projection.
-PRE_GATHER_CARVEOUT = 100
 
 
 def pre_tactic(n: int, k: int, rows: int):
