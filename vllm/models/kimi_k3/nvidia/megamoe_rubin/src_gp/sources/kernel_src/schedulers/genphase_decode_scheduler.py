@@ -496,9 +496,18 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         base = Int32(half) * side
         local_id = work_id_worker.claim_next_work(self._shared_stream_index + side)
         shared_id = Int32(-1)
-        if local_id < count * Int32(self.shared_token_blocks):
+        die_tiles = count * Int32(self.shared_token_blocks)
+        if local_id < die_tiles * Int32(self._shared_k_splits[0]):
+            # K part slowest, as in ``_decode_shared_tile``.
+            k_part = local_id // die_tiles
+            local_id = local_id - k_part * die_tiles
             token_block = local_id // count
-            shared_id = token_block * Int32(feature_blocks) + base + (local_id - token_block * count)
+            shared_id = (
+                k_part * Int32(feature_blocks * self.shared_token_blocks)
+                + token_block * Int32(feature_blocks)
+                + base
+                + (local_id - token_block * count)
+            )
         return shared_id, work_id_worker
 
     @cute.jit

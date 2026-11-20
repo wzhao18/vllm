@@ -90,6 +90,7 @@ def shared_expert_impl_requirements() -> dict:
         "shared_l2_position": OptionalRequirement(Optional[str]),
         "shared_work_id_mode": OptionalRequirement(Optional[str]),
         "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        "shared_k_splits": OptionalRequirement(Optional[tuple]),
         "expert_sizes_ready_region": OptionalRequirement(str),
         "expert_sizes_ready_target": OptionalRequirement(int),
         "expert_sizes_ready_scope": OptionalRequirement(str),
@@ -127,6 +128,7 @@ class SharedExpertStreamMixin:
         self._routed_done = None
         self.shared_fc2_position = None
         self._shared_fc1_swizzle = 0
+        self._shared_k_splits = (1, 1)
         if not (impl_desc.get("shared_expert_stream", False) and problem_desc.get("shared_expert", False)):
             return
         if not self.is_swap_ab:
@@ -149,11 +151,18 @@ class SharedExpertStreamMixin:
         self._shared_token_count = tokens
         self.shared_token_blocks = ceil_div(tokens, cta_tile_n)
         self._shared_feature_blocks = (ceil_div(gateup, feature_tile), ceil_div(output, feature_tile))
-        self._shared_phase_tiles = tuple(blocks * self.shared_token_blocks for blocks in self._shared_feature_blocks)
+        # K parts per shared tile (FC1, FC2): a part streams a contiguous 1/s of K and the epilogue sums the
+        # parts' FP32 accumulators in part order before the activation / output (``shared_k_splits``).
+        splits = tuple(impl_desc.get("shared_k_splits") or (1, 1))
+        if len(splits) != 2 or any(type(v) is not int or v < 1 for v in splits):
+            raise ValueError(f"shared_k_splits must be two positive ints, got {splits!r}.")
+        self._shared_k_splits = splits
+        whole_tiles = tuple(blocks * self.shared_token_blocks for blocks in self._shared_feature_blocks)
+        self._shared_phase_tiles = tuple(tiles * parts for tiles, parts in zip(whole_tiles, splits))
         position = impl_desc.get("shared_l2_position")
         if position is None or position == "auto":
-            # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its tiles.
-            position = "early" if self._shared_phase_tiles[1] <= self.compute_cluster_count else "tail"
+            # DeepGEMM's rule: FC2 goes first when one wave of clusters covers its whole tiles.
+            position = "early" if whole_tiles[1] <= self.compute_cluster_count else "tail"
         if position not in ("early", "tail"):
             raise ValueError(f"shared_l2_position must be 'auto', 'early' or 'tail', got {position!r}.")
         self.shared_fc2_position = position
@@ -203,8 +212,14 @@ class SharedExpertStreamMixin:
 
     @cute.jit
     def _decode_shared_tile(self, local_id: Int32, phase_offset: int) -> SwapAbFc12WorkTileInfo:
-        """Map a shared FC1 (``phase_offset`` 0) or FC2 (1) cluster work id to this CTA's tile, feature block fast."""
+        """Map a shared FC1 (``phase_offset`` 0) or FC2 (1) cluster work id to this CTA's tile, feature block fast,
+        K part slowest (carried in ``expert_idx``: a shared tile has no expert)."""
         feature_blocks = Int32(self._shared_feature_blocks[phase_offset])
+        k_part = Int32(0)
+        if cutlass.const_expr(self._shared_k_splits[phase_offset] > 1):
+            whole_tiles = feature_blocks * Int32(self.shared_token_blocks)
+            k_part = local_id // whole_tiles
+            local_id = local_id - k_part * whole_tiles
         token_block = local_id // feature_blocks
         feature_block = local_id - token_block * feature_blocks
         if cutlass.const_expr(phase_offset == 0 and self._shared_fc1_swizzle > 0):
@@ -224,7 +239,7 @@ class SharedExpertStreamMixin:
             Int32(self._shared_token_count) - token_block * Int32(self._shared_tile_n), Int32(self._shared_tile_n)
         )
         return SwapAbFc12WorkTileInfo(
-            expert_idx=Int32(0),
+            expert_idx=k_part,
             tile_m_idx=feature_block * Int32(self._shared_cluster_m) + cta_m,
             tile_n_idx=token_block,
             cumulative_data_physical_row=Int32(0),
