@@ -981,7 +981,7 @@ class GenphaseTokenComm(KernelComponent):
             )
         # One slot per local expert
         workspace.register(
-            self.fc1_sf_ready_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
+            self.fc1_sf_ready_region, cutlass.Int32, (self.experts_per_rank * 32,), buffer_space="local", reset="tail_reset"
         )
 
     # ------------------------------------------------------------------
@@ -2805,7 +2805,7 @@ class GenphaseTokenComm(KernelComponent):
             cute.arch.cp_async_bulk_wait_group(0)
             cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
             if thread_in_group == Int32(0):
-                red_async_add_release_gpu_s32(fc1_sf_ready + owning_expert, Int32(1))
+                red_async_add_release_gpu_s32(fc1_sf_ready + owning_expert * Int32(32), Int32(1))  # DIAG: one 128 B line per expert
             iket.range_pop()
             owning_expert = self._claim_next_block(
                 claim, expert_table, work_counter, block_total, group_idx, thread_in_group, group_barrier, group_threads
