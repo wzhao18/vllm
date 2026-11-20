@@ -26,8 +26,6 @@ LOG2E = 1.4426950408889634
 
 # Device compilation controls and caches.
 _TPROBE = 0
-# Fused N64 [out | U] MMA (1); 0 = two N32 MMAs (dev A/B only).
-_MMA1W = 1
 _COMPILED: dict = {}
 _DUMMY_EXP: dict = {}
 _DUMMY_MID: dict = {}
@@ -74,8 +72,6 @@ def _get_compiled(
 ):
     key = (
         state_rows,
-        _MMA1W,
-        _TPROBE,
         dev.index,
         torch.cuda.get_device_capability(dev),
         H,
@@ -208,7 +204,6 @@ def _get_compiled(
                 LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
                 CLUSTER_=int(cluster_size),
                 SROW_=1 if state_rows else 0,
-                MMA1W_=_MMA1W,
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
