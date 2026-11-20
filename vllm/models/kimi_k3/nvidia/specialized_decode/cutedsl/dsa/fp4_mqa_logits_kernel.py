@@ -2289,6 +2289,8 @@ class FP4MQALogitsKernel:
                 m_coord = tTR_cC[0][0]
 
                 tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                tTR_rAccB = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                tTR_rAccs = (tTR_rAcc, tTR_rAccB)
 
                 # Step 5.8: MAX_NUM_W_IN_REG. Both fp16 and bf16 use 2-byte
                 # weights (pack 2 per 32-bit reg) — same budget. Only fp32
@@ -2455,29 +2457,50 @@ class FP4MQALogitsKernel:
                                 s0y = cutlass.Float32(0.0)
                                 s1x = cutlass.Float32(0.0)
                                 s1y = cutlass.Float32(0.0)
+                                s2x = cutlass.Float32(0.0)
+                                s2y = cutlass.Float32(0.0)
+                                s3x = cutlass.Float32(0.0)
+                                s3y = cutlass.Float32(0.0)
                             for i in cutlass.range_constexpr(num_epi_subtiles):
                                 # LDTM for sub-tiles 1..N-1
                                 # (sub-tile 0 handled above)
-                                if t > 0 or i > 0:
-                                    cute.copy(
-                                        tiled_copy_ref_0,
-                                        tTR_0[
-                                            (
-                                                None,
-                                                None,
-                                                None,
-                                                0,
-                                                t * num_epi_subtiles + i,
-                                            )
-                                        ],
-                                        tTR_rAcc,
-                                    )
-                                    cute.arch.fence_view_async_tmem_load()
-                                # Release UMMA after last LDTM+fence
-                                if t == next_n - 1 and i == num_epi_subtiles - 1:
-                                    umma_pipeline_0.consumer_release(umma_cons_state_0)
-                                    umma_cons_state_0.advance()
-                                acc_vec = tTR_rAcc.load()
+                                if cutlass.const_expr(num_epi_subtiles == 1):
+                                    # Row t's TMEM load was issued one row earlier: wait
+                                    # for it, take its registers, then put row t+1's load
+                                    # in flight while row t is reduced.
+                                    if cutlass.const_expr(t > 0):
+                                        cute.arch.fence_view_async_tmem_load()
+                                    acc_vec = tTR_rAccs[t % 2].load()
+                                    if cutlass.const_expr(t + 1 < next_n):
+                                        cute.copy(
+                                            tiled_copy_ref_0,
+                                            tTR_0[(None, None, None, 0, t + 1)],
+                                            tTR_rAccs[(t + 1) % 2],
+                                        )
+                                    else:
+                                        umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                        umma_cons_state_0.advance()
+                                else:
+                                    if t > 0 or i > 0:
+                                        cute.copy(
+                                            tiled_copy_ref_0,
+                                            tTR_0[
+                                                (
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    0,
+                                                    t * num_epi_subtiles + i,
+                                                )
+                                            ],
+                                            tTR_rAcc,
+                                        )
+                                        cute.arch.fence_view_async_tmem_load()
+                                    # Release UMMA after last LDTM+fence
+                                    if t == next_n - 1 and i == num_epi_subtiles - 1:
+                                        umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                        umma_cons_state_0.advance()
+                                    acc_vec = tTR_rAcc.load()
                                 # Reg-path: weights from registers
                                 reg_h_end = min(
                                     subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
@@ -2546,12 +2569,20 @@ class FP4MQALogitsKernel:
                                         w1 = w_cache[r0 + 1]
                                         w2 = w_cache[r0 + 2]
                                         w3 = w_cache[r0 + 3]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
+                                        if cutlass.const_expr((h // 4) % 2 == 0):
+                                            s0x, s0y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                            )
+                                            s1x, s1y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                            )
+                                        else:
+                                            s2x, s2y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s2x, s2y), rnd=_RND_RN
+                                            )
+                                            s3x, s3y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s3x, s3y), rnd=_RND_RN
+                                            )
                                 # SMEM-path: weights from shared mem
                                 smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
                                 for h in cutlass.range_constexpr(
@@ -2658,12 +2689,20 @@ class FP4MQALogitsKernel:
                                         w3 = sW[
                                             (t * num_heads + h_g + 3, q_stage_local)
                                         ]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
+                                        if cutlass.const_expr((h // 4) % 2 == 0):
+                                            s0x, s0y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                            )
+                                            s1x, s1y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                            )
+                                        else:
+                                            s2x, s2y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s2x, s2y), rnd=_RND_RN
+                                            )
+                                            s3x, s3y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s3x, s3y), rnd=_RND_RN
+                                            )
                             # Step 5.9: result reduction — packed path catches both
                             if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                                 ps_sum = add_f16x2(ps0, ps1)
@@ -2674,7 +2713,9 @@ class FP4MQALogitsKernel:
                                 sum_lo, sum_hi = unpack_bf16x2(ps_sum)
                                 result_t = sum_lo + sum_hi
                             else:
-                                result_t = s0x + s0y + s1x + s1y
+                                result_t = (s0x + s2x) + (s0y + s2y) + (s1x + s3x) + (
+                                    s1y + s3y
+                                )
                             # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.use_batched_store):
                                 result_arr[t] = self.output_dtype(result_t)
@@ -2764,6 +2805,8 @@ class FP4MQALogitsKernel:
                 m_coord = tTR_cC[0][0]
 
                 tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                tTR_rAccB = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                tTR_rAccs = (tTR_rAcc, tTR_rAccB)
 
                 # Step 5.8: see WG 0 for rationale.
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
@@ -2913,26 +2956,47 @@ class FP4MQALogitsKernel:
                                 s0y = cutlass.Float32(0.0)
                                 s1x = cutlass.Float32(0.0)
                                 s1y = cutlass.Float32(0.0)
+                                s2x = cutlass.Float32(0.0)
+                                s2y = cutlass.Float32(0.0)
+                                s3x = cutlass.Float32(0.0)
+                                s3y = cutlass.Float32(0.0)
                             for i in cutlass.range_constexpr(num_epi_subtiles):
-                                if t > 0 or i > 0:
-                                    cute.copy(
-                                        tiled_copy_ref_1,
-                                        tTR_1[
-                                            (
-                                                None,
-                                                None,
-                                                None,
-                                                0,
-                                                t * num_epi_subtiles + i,
-                                            )
-                                        ],
-                                        tTR_rAcc,
-                                    )
-                                    cute.arch.fence_view_async_tmem_load()
-                                if t == next_n - 1 and i == num_epi_subtiles - 1:
-                                    umma_pipeline_1.consumer_release(umma_cons_state_1)
-                                    umma_cons_state_1.advance()
-                                acc_vec = tTR_rAcc.load()
+                                if cutlass.const_expr(num_epi_subtiles == 1):
+                                    # Row t's TMEM load was issued one row earlier: wait
+                                    # for it, take its registers, then put row t+1's load
+                                    # in flight while row t is reduced.
+                                    if cutlass.const_expr(t > 0):
+                                        cute.arch.fence_view_async_tmem_load()
+                                    acc_vec = tTR_rAccs[t % 2].load()
+                                    if cutlass.const_expr(t + 1 < next_n):
+                                        cute.copy(
+                                            tiled_copy_ref_1,
+                                            tTR_1[(None, None, None, 0, t + 1)],
+                                            tTR_rAccs[(t + 1) % 2],
+                                        )
+                                    else:
+                                        umma_pipeline_1.consumer_release(umma_cons_state_1)
+                                        umma_cons_state_1.advance()
+                                else:
+                                    if t > 0 or i > 0:
+                                        cute.copy(
+                                            tiled_copy_ref_1,
+                                            tTR_1[
+                                                (
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    0,
+                                                    t * num_epi_subtiles + i,
+                                                )
+                                            ],
+                                            tTR_rAcc,
+                                        )
+                                        cute.arch.fence_view_async_tmem_load()
+                                    if t == next_n - 1 and i == num_epi_subtiles - 1:
+                                        umma_pipeline_1.consumer_release(umma_cons_state_1)
+                                        umma_cons_state_1.advance()
+                                    acc_vec = tTR_rAcc.load()
                                 # Reg-path
                                 reg_h_end = min(
                                     subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
@@ -3001,12 +3065,20 @@ class FP4MQALogitsKernel:
                                         w1 = w_cache[r0 + 1]
                                         w2 = w_cache[r0 + 2]
                                         w3 = w_cache[r0 + 3]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
+                                        if cutlass.const_expr((h // 4) % 2 == 0):
+                                            s0x, s0y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                            )
+                                            s1x, s1y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                            )
+                                        else:
+                                            s2x, s2y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s2x, s2y), rnd=_RND_RN
+                                            )
+                                            s3x, s3y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s3x, s3y), rnd=_RND_RN
+                                            )
                                 # SMEM-path
                                 smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
                                 for h in cutlass.range_constexpr(
@@ -3113,12 +3185,20 @@ class FP4MQALogitsKernel:
                                         w3 = sW[
                                             (t * num_heads + h_g + 3, q_stage_local)
                                         ]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
+                                        if cutlass.const_expr((h // 4) % 2 == 0):
+                                            s0x, s0y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                            )
+                                            s1x, s1y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                            )
+                                        else:
+                                            s2x, s2y = cute.arch.fma_packed_f32x2(
+                                                (a0, a1), (w0, w1), (s2x, s2y), rnd=_RND_RN
+                                            )
+                                            s3x, s3y = cute.arch.fma_packed_f32x2(
+                                                (a2, a3), (w2, w3), (s3x, s3y), rnd=_RND_RN
+                                            )
                             # Step 5.9: result reduction
                             if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                                 ps_sum = add_f16x2(ps0, ps1)
@@ -3129,7 +3209,9 @@ class FP4MQALogitsKernel:
                                 sum_lo, sum_hi = unpack_bf16x2(ps_sum)
                                 result_t = sum_lo + sum_hi
                             else:
-                                result_t = s0x + s0y + s1x + s1y
+                                result_t = (s0x + s2x) + (s0y + s2y) + (s1x + s3x) + (
+                                    s1y + s3y
+                                )
                             # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.use_batched_store):
                                 result_arr[t] = self.output_dtype(result_t)
