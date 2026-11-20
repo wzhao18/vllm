@@ -665,6 +665,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             sn = n_idx // 2
         return tAgSFA[(None, m_idx, None, l_idx)], tBgSFB[(None, sn, None, l_idx)], None
 
+    def _claim_coord(self, claimed, claim_x, thr):
+        """Tile coordinate of die-claim item ``claimed``: items run along the activation
+        tiles of one weight tile (weights on N: M fastest; weights on M: N fastest), so
+        consecutive claims on one die share the weight tile."""
+        if cutlass.const_expr(self.weight_is_a):
+            return ((claimed // claim_x) * thr, claimed % claim_x, 0)
+        return ((claimed % claim_x) * thr, claimed // claim_x, 0)
+
     def _copy_a(self, atom, src, dst, tma_bar_ptr=None, mcast_mask=None):
         if cutlass.const_expr(not self.dbg_skip_a):
             cute.copy(atom, src, dst, tma_bar_ptr=tma_bar_ptr, mcast_mask=mcast_mask)
@@ -1856,7 +1864,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 if work_tile.is_valid_tile:
                     p_tc = work_tile.tile_idx
                     if cutlass.const_expr(self.die_claim):
-                        p_tc = ((claimed % claim_m) * cute.size(tiled_mma.thr_id.shape), claimed // claim_m, 0)
+                        p_tc = self._claim_coord(claimed, claim_m, cute.size(tiled_mma.thr_id.shape))
                     p_mn = (p_tc[0] // cute.size(tiled_mma.thr_id.shape), p_tc[1], p_tc[2])
                     p_a = tAgA[(None, p_mn[0], None, p_mn[2])]
                     p_b = tBgB[(None, p_mn[1], None, p_mn[2])]
@@ -1914,7 +1922,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
-                    cur_tile_coord = ((claimed % claim_m) * cute.size(tiled_mma.thr_id.shape), claimed // claim_m, 0)
+                    cur_tile_coord = self._claim_coord(claimed, claim_m, cute.size(tiled_mma.thr_id.shape))
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -2144,7 +2152,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
-                    cur_tile_coord = ((claimed % claim_m) * cute.size(tiled_mma.thr_id.shape), claimed // claim_m, 0)
+                    cur_tile_coord = self._claim_coord(claimed, claim_m, cute.size(tiled_mma.thr_id.shape))
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -2392,7 +2400,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
-                    cur_tile_coord = ((claimed % claim_m) * cute.size(tiled_mma.thr_id.shape), claimed // claim_m, 0)
+                    cur_tile_coord = self._claim_coord(claimed, claim_m, cute.size(tiled_mma.thr_id.shape))
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
@@ -2464,7 +2472,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 if warp_idx == self.epilog_warp_id[0]:
                     if cute.arch.lane_idx() == 0:
                         done = _atom_add(aux.iterator + 6, cutlass.Int32(1))
-                        if done == cute.arch.grid_dim()[0] - 1:
+                        dgx, dgy, dgz = cute.arch.grid_dim()
+                        if done == dgx * dgy * dgz - 1:
                             aux[4] = cutlass.Int32(0)
                             aux[5] = cutlass.Int32(0)
                             aux[6] = cutlass.Int32(0)

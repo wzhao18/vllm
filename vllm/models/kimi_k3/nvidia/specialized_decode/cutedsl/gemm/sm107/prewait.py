@@ -193,21 +193,29 @@ class Mxfp8PreGemm:
         (first tile, tiles) per die, [12] M tiles, [16 + smid] die of the SM."""
         from ...common.dies import sm_domains
 
-        tile, cluster = tactic[0], tactic[1]
-        csize = 2 if m128x2 else 1
-        if tuple(cluster) != ((2, 1) if m128x2 else (1, 1)):
-            raise ValueError("die_claim needs a 1x1 (m128x2: 2x1) cluster tactic")
-        m_tiles, n_tiles = -(-rows // tile[0]), -(-n // tile[1])
+        tile, cluster, swap = tactic[0], tactic[1], tactic[2]
+        csize = cluster[0] * cluster[1]
+        if tuple(cluster) not in ((1, 1), (2, 1)):
+            raise ValueError(f"die_claim needs a 1x1 or 2x1 cluster tactic ({cluster})")
+        if swap:  # weights on M: the kernel's M = N weight rows, its N = the R rows
+            m_tiles, n_tiles = -(-n // tile[0]), -(-rows // tile[1])
+        else:
+            m_tiles, n_tiles = -(-rows // tile[0]), -(-n // tile[1])
         total = m_tiles * n_tiles
         if total > _max_active_clusters(csize):
-            raise ValueError(f"die_claim needs one tile per CTA ({total} tiles)")
+            raise ValueError(f"die_claim needs one tile per cluster ({total} tiles)")
         table = sm_domains(device.index or 0)
-        n0 = min(die_split, n_tiles) * m_tiles
+        # die 0's items: the first die_split weight tiles (items run along the activation
+        # tiles of one weight tile; the kernel's _claim_coord)
+        if swap:
+            n0 = min(die_split, m_tiles) * n_tiles
+        else:
+            n0 = min(die_split, n_tiles) * m_tiles
         aux = torch.zeros(2, 272, dtype=torch.float32, device=device)
         ints = aux.view(torch.int32)
         aux[:, 0] = 1.0
         ints[:, 8], ints[:, 9], ints[:, 10], ints[:, 11] = 0, n0, n0, total - n0
-        ints[:, 12] = m_tiles
+        ints[:, 12] = n_tiles if swap else m_tiles
         ints[:, 16 : 16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=device)
         return aux
 
