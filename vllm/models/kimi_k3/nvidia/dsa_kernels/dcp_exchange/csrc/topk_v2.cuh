@@ -239,7 +239,7 @@ template <int T>
 __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* hist, uint32_t* msg,
                                    const uint16_t* ckey, const uint32_t* cpos, int nc, uint32_t tag,
                                    int par, int row, uint32_t* warp_sums, int* s_i, uint32_t* lrx) {
-  __shared__ int s_cg[4];  // 0 base (-1: not eligible), 1 width shift, 2 bin, 3 need
+  __shared__ int s_cg[5];  // 0 base (-1: not eligible), 1 width shift, 2 bin, 3 need, 4 top
   __shared__ uint32_t s_cgab;
   const int tid = threadIdx.x, W = p.W, K = p.K;
   uint32_t ws_par = 0;
@@ -308,6 +308,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     while (sh < 8 && hi2 - lo2 >= (kCgBins << sh)) ++sh;
     s_cg[0] = (ok && lo2 >= 1 && hi2 >= lo2) ? lo2 : -1;
     s_cg[1] = sh;
+    s_cg[4] = hi2;  // tau <= hi2: the final round lists keys in [base, top] only
   }
   __syncthreads();
   if (s_cg[0] < 0) return false;
@@ -338,9 +339,10 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     uint32_t* const loff = hist + 1536;  // kCgBins list offsets
     uint32_t* const lst = hist + 2048;   // staged list (<= 1024 words)
     uint32_t nlist = 0;                  // header word 2
+    const int ub = min(s_cg[4] - lo2, kCgBins - 1);  // list bins [0, ub]
     if (capL > 0) {
       const int b = kCgBins - 1 - tid;
-      const uint32_t c = b >= 0 ? hist[b] : 0u;
+      const uint32_t c = (b >= 0 && b <= ub) ? hist[b] : 0u;
       uint32_t tot;
       const uint32_t ex = v2_scan<T>(c, warp_sums + 32 * (ws_par ^= 1u), &tot);
       if (b >= 0) loff[b] = ex;
@@ -350,7 +352,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
         const int IL = p.interleave;
         for (int c2 = tid; c2 < nc; c2 += T) {
           const int u = (int)ckey[c2] - lo2;
-          if (u >= 0 && u < kCgBins) {
+          if (u >= 0 && u <= ub) {
             const int pos = (int)cpos[c2];
             const uint32_t gid = (uint32_t)(((pos / IL) * W + p.rank) * IL + pos % IL);
             lst[atomicAdd(&loff[u], 1u)] = tagw(tag, gid);
@@ -417,7 +419,11 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
     if (bin < 0) return false;  // tau < lo2: R2 (rx untouched)
     if (sh > 0) {
       __syncthreads();
-      if (tid == 0) { s_cg[0] = lo2 + (bin << sh); s_cg[1] = 0; }
+      if (tid == 0) {
+        s_cg[0] = lo2 + (bin << sh);
+        s_cg[1] = 0;
+        s_cg[4] = min(s_cg[4], lo2 + ((bin + 1) << sh) - 1);
+      }
       __syncthreads();
       continue;
     }
@@ -429,7 +435,7 @@ __device__ __noinline__ bool v2_cg(const V2Params p, uint32_t* rx, uint32_t* his
       const int r = tid >> 5, lane = tid & 31;
       const uint32_t* s = cgrx + r * kCgMsg;
       uint32_t a = 0;
-      for (int u = bin + 1 + lane; u < kCgBins; u += 32) a += v2_cnt(s, u);
+      for (int u = bin + 1 + lane; u <= ub; u += 32) a += v2_cnt(s, u);
       for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
       if (lane == 0) { s_cgt2[r] = (int)v2_cnt(s, bin); s_cgs2[r] = (int)a; }
     }
