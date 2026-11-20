@@ -548,7 +548,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     int X2 = -1, c2 = 0, tier = 0, lo = 0, nc = 0;
     bool fast = false, recand = true;
 #pragma unroll 1
-    for (int rnd = 0; rnd < (kFast ? 3 : 1); ++rnd) {
+    for (int rnd = 0; rnd < 1; ++rnd) {  // BISECT: one round
     if (K31_RARE(rnd > 0)) {
       // the row geometry again: recomputed (from an opaque copy of row) rather than kept
       // live through round 1, whose registers are tight
