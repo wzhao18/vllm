@@ -143,7 +143,7 @@ __global__ void __cluster_dims__(KS, 1, 1) __launch_bounds__(128, 1) skel(Prm p)
   __syncthreads();
   asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory");
   unsigned long long t1 = gt();
-  if (tid == 0) { atomicMin(p.ts + 0, t0); atomicMax(p.ts + 1, t1); }
+  if (tid == 0) { atomicMin(p.ts + 0, t0); atomicMax(p.ts + 1, t1); atomicMax(p.ts + 2, t0); atomicMin(p.ts + 3, t1); }
 }
 
 void setup_peers(int64_t ngpu) {
@@ -204,7 +204,7 @@ def main():
             ws.append(torch.randint(0, 255, (56 * 3 * 128 * 1024,), dtype=torch.uint8, device=d))
             xs.append(torch.randint(0, 255, (4 * 3 * 96 * 1024,), dtype=torch.uint8, device=d))
             recv.append(torch.zeros(4 * n * 7168, dtype=torch.bfloat16, device=d))
-            ts.append(torch.zeros(2, dtype=torch.int64, device=d))
+            ts.append(torch.zeros(4, dtype=torch.int64, device=d))
             st.append(torch.cuda.Stream(device=d))
         peers = [r.data_ptr() for r in recv]
         flag = torch.zeros(1, dtype=torch.int32).pin_memory()
@@ -216,7 +216,7 @@ def main():
                 for g in range(ng):
                     with torch.cuda.device(g):
                         ts[g][0] = (1 << 62)
-                        ts[g][1] = 0
+                        ts[g][1] = 0; ts[g][2] = 0; ts[g][3] = (1 << 62)
                 for g in range(ng):
                     torch.cuda.synchronize(g)
                 for g in range(ng):
@@ -228,11 +228,12 @@ def main():
                 if it >= 3:
                     for g in range(ng):
                         t = ts[g].cpu()
-                        res[g].append((int(t[1]) - int(t[0])) / 1e3)
+                        res[g].append(((int(t[1]) - int(t[0])) / 1e3, (int(t[2]) - int(t[0])) / 1e3, (int(t[1]) - int(t[3])) / 1e3))
             med = [sorted(r)[len(r) // 2] for r in res]
             label = "+".join(v for k, v in names.items() if mode & k) or "none"
-            print(f"R{R} n{n} mode {mode} ({label}): window us per GPU "
-                  + " ".join(f"{m:6.2f}" for m in med) + f" | max {max(med):6.2f}", flush=True)
+            print(f"R{R} n{n} mode {mode} ({label}): window/start-spread/end-spread us per GPU "
+                  + " ".join(f"{m[0]:6.2f}/{m[1]:5.2f}/{m[2]:5.2f}" for m in med)
+                  + f" | max {max(m[0] for m in med):6.2f}", flush=True)
 
 
 if __name__ == "__main__":
