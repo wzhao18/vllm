@@ -672,17 +672,26 @@ def epilogue_drain_store(
     tidx: Int32,
     tCtAcc_base: cute.Tensor,
     tCgC_base: cute.Tensor,
+    tCcC_base: cute.Tensor,
     epi_tile: cute.Tile,
     alpha_value: cutlass.Float32,
     mma_tile_coord_mnl: Tuple[Int32, Int32, Int32],
+    m_rows: Int32,
+    n_cols: Int32,
     acc_consumer_state: pipeline.PipelineState,
     acc_pipeline: pipeline.PipelineAsync,
 ) -> pipeline.PipelineState:
-    """Drain-and-release BF16 epilogue for the B-reuse tile (8 warps; warp
-    group g drains M block g): every thread loads its TMEM row (all column
-    subtiles) into registers as C values, hands TMEM back to the MMA warp,
-    then stores its row with 16-byte vector stores while the next tile's
-    mainloop runs. Full tiles only (M, N multiples of the tile)."""
+    """Drain-and-release BF16 epilogue for the 1-stage B-reuse tile (8
+    epilogue warps; warp group g drains M block g): every thread loads its
+    TMEM row of all column subtiles into registers as C values (same
+    ``(acc * alpha).to(c_dtype)`` rounding as the TMA-store epilogue), hands
+    TMEM back to the MMA warp, then writes its row with 32-byte vector stores
+    (one full sector per store) while the next tile's mainloop runs. Rows
+    >= m_rows and column subtiles starting at >= n_cols (the N tail and
+    the padded tiles of a swizzled raster) are not stored; n_cols must be
+    a multiple of the epilogue subtile width."""
+    from .situ_epilogue import st_global_v8_b32
+
     g = tidx // 128
     gt = tidx % 128
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
@@ -694,8 +703,12 @@ def epilogue_drain_store(
     tTR_gC = thr_copy_t2r.partition_D(cute.flat_divide(tCgC, epi_tile))[
         (None, None, None, None, None, *mma_tile_coord_mnl)
     ]
+    tTR_cC = thr_copy_t2r.partition_D(
+        cute.flat_divide(transform_partitioned_tensor_layout(tCcC_base), epi_tile)
+    )[(None, None, None, None, None, *mma_tile_coord_mnl)]
     tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
     epi_n = cute.size(tTR_tAcc.shape, mode=[4])
+    n_vec = cute.size(tTR_rAcc) // 16  # 32-byte stores per subtile row
 
     acc_pipeline.consumer_wait(acc_consumer_state)
     frags = []
@@ -703,17 +716,19 @@ def epilogue_drain_store(
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, g, ni)], tTR_rAcc)
         rC = cute.make_rmem_tensor(tTR_rAcc.shape, gemm_kernel.c_dtype)
         rC.store((tTR_rAcc.load() * alpha_value).to(gemm_kernel.c_dtype))
-        frags.append(rC)
+        frags.append(cute.recast_tensor(rC, cutlass.Uint32))
     cute.arch.fence_view_async_tmem_load()
     with cute.arch.elect_one():
         acc_pipeline.consumer_release(acc_consumer_state)
     acc_consumer_state.advance()
 
-    atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), gemm_kernel.c_dtype, num_bits_per_copy=128
-    )
     for ni in cutlass.range_constexpr(epi_n):
-        cute.copy(atom, frags[ni], tTR_gC[(None, None, None, g, ni)])
+        crd = tTR_cC[(None, None, None, g, ni)][0]
+        if crd[0] < m_rows and crd[1] < n_cols:
+            addr = tTR_gC[(None, None, None, g, ni)].iterator.toint()
+            v = frags[ni]
+            for j in cutlass.range_constexpr(n_vec):
+                st_global_v8_b32(addr + 32 * j, [v[8 * j + q] for q in range(8)])
     return acc_consumer_state
 
 
