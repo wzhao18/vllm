@@ -293,7 +293,7 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
         )
     # EXPERIMENT (GEMM-EX3 R6): carve-out 100 so the MoE front GEMM after it (PDL)
     # can land beside these CTAs before griddepcontrol.wait (hw29b).
-    return prepare_shared_carveout(code, device, 100)
+    return code
 
 
 class SplitDelta:
