@@ -51,7 +51,7 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
         (1, 128, ((128, 64), (1, 1), False, 128), 8),
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
-        (257, 512, ((256, 256), (2, 1), False, 256), 8),
+        (257, 512, ((256, 256), (2, 1), False, 256), 5, 5, 0),
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
@@ -64,10 +64,12 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
 
 
 def pre_tactic(n: int, k: int, rows: int):
-    """(tactic, prewait k-blocks, smem stage cap or 0) for an R-row call, or None."""
-    for lo, hi, tactic, prewait, *cap in PRE_TACTICS.get((n, k), PRE_DEFAULT):
+    """(tactic, prewait k-blocks, smem stage cap or 0, pre-wait pace clk or 0) for an
+    R-row call, or None."""
+    for lo, hi, tactic, prewait, *rest in PRE_TACTICS.get((n, k), PRE_DEFAULT):
         if lo <= rows <= hi:
-            return tactic, prewait, (cap or [0])[0]
+            rest = list(rest) + [0, 0]
+            return tactic, prewait, rest[0], rest[1]
     return None
 BLOCK = 32  # MXFP8 block along K
 
@@ -242,6 +244,7 @@ class Mxfp8Projection:
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
                     max_stages=found[2], device=weight.device,
+                    quiet=bool(found[3]), pace=found[3],
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)

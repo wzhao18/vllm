@@ -145,6 +145,27 @@ def _smid():
     return "mov.u32 $0, %smid;", "=r", ()
 
 
+@asm(cutlass.Int64)
+def _clk():
+    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
+
+
+@asm()
+def _nanosleep():
+    return "nanosleep.u32 64;", "~{memory}", ()
+
+
+@asm(cutlass.Int32)
+def _pace_state(target, mbar):
+    """2 once ``mbar`` (arrived after griddepcontrol.wait) completed phase 0, else 1
+    while %clock64 < ``target``, else 0 (a paced pre-wait issuer spins while 1)."""
+    code = "{ .reg .pred p, q; .reg .u64 t; .reg .u32 a; "
+    code += "mbarrier.test_wait.parity.shared::cta.b64 q, [$2], 0; "
+    code += "mov.u64 t, %clock64; setp.lt.u64 p, t, $1; selp.u32 a, 1, 0, p; "
+    code += "selp.u32 $0, 2, a, q; }"
+    return code, "=r,l,r,~{memory}", (cutlass.Int64(target), mbar)
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -221,6 +242,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         quiet_wait: bool = False,
         producers: int = 1,
         die_claim: bool = False,
+        prewait_pace: int = 0,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
@@ -231,6 +253,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.prewait_stages = prewait_stages if use_pdl else 0
         self.weight_is_a = weight_is_a
         self.quiet_wait = quiet_wait
+        # EXPERIMENT (GEMM-EX3 R6): pre-wait k-block pk not before clock t0 + pk x
+        # prewait_pace while the PDL wait is pending (needs quiet_wait: the MMA warp
+        # arrives on pace_dep after griddepcontrol.wait).
+        self.prewait_pace = prewait_pace if (quiet_wait and self.prewait_stages) else 0
         self.dbg_skip_mma = False
         # producers: TMA warps tma_warp_id .. tma_warp_id + producers - 1, warp i issues
         # the whole stages (A, B, SFA, SFB) of k-blocks with (k % producers) == i
@@ -1242,6 +1268,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             claim_tile: cute.struct.MemRange[cutlass.Int32, 1]
+            pace_dep: cutlass.Int64
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -1434,6 +1461,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             arch=self.arch,
         )
 
+        if cutlass.const_expr(self.prewait_pace > 0):
+            if warp_idx == self.tma_warp_id:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(storage.pace_dep.ptr, 1)
+            cute.arch.mbarrier_init_fence()
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cluster_shape_mn, is_relaxed=True)
 
@@ -1653,8 +1685,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     pre_state = ab_producer_state.clone()
                     # host guarantees prewait_stages <= min(num_ab_stage, k tiles)
                     n_pre = cutlass.const_expr(min(self.prewait_stages, self.num_ab_stage))
+                    t_pace = _clk()
                     for pk in cutlass.range_constexpr(n_pre):
                         if (pk % self.num_producers) == kil:
+                            if cutlass.const_expr(self.prewait_pace > 0):
+                                due = t_pace + cutlass.Int64(pk * self.prewait_pace)
+                                pstate = _pace_state(due, storage.pace_dep.ptr)
+                                while pstate == 1:
+                                    _nanosleep()
+                                    pstate = _pace_state(due, storage.pace_dep.ptr)
                             ab_pipeline.producer_acquire(pre_state)
                             if cutlass.const_expr(self.weight_is_a):
                                 cute.copy(
@@ -1858,6 +1897,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             # the first full barrier while a co-resident predecessor runs
             if cutlass.const_expr(self.use_pdl and self.quiet_wait):
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(self.prewait_pace > 0):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(storage.pace_dep.ptr)
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
