@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3 multimodal model implementation for vLLM."""
 
+import contextlib
 import math
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
@@ -1788,6 +1789,46 @@ _DSA_RENAME_PARAMS_MAPPING = [
 ]
 
 
+# P-ELEM PA prototype (timing experiment only, never landed): run every
+# layer twice (microbatch A on the current stream, an identical copy B) to
+# measure what a two-microbatch schedule overlaps with today's kernels.
+# "serial": A.attn(l) B.attn(l) A.mlp(l) B.mlp(l) on one stream (control);
+# "tbo": B on a side stream; attention blocks and MLP blocks each form one
+# chain across the halves, so B.attn(l) || A.mlp(l) and A.attn(l+1) || B.mlp(l).
+_PA_EMU_MODE = "tbo"
+
+
+def _pa_layer_attn(layer, positions, hidden_states, residual, prefix_sum):
+    pre_mxfp8, post_mxfp8 = layer._attn_res_mxfp8_consumers(prefix_sum)
+    if pre_mxfp8:
+        hidden_states = layer._attn_res_mxfp8(
+            prefix_sum, hidden_states, residual, pre=True
+        )[1]
+    else:
+        hidden_states, prefix_sum, residual = layer._pre_attn_norm(
+            hidden_states, residual, prefix_sum
+        )
+    hidden_states = layer._run_self_attn(positions, hidden_states)
+    return hidden_states, prefix_sum, residual, post_mxfp8
+
+
+def _pa_layer_mlp(layer, hidden_states, residual, prefix_sum, post_mxfp8):
+    if post_mxfp8:
+        if layer.is_block_write_layer:
+            if _gemm_ar_owns(hidden_states):
+                hidden_states = hidden_states.clone()
+            prefix_sum = hidden_states
+        hidden_states, shared_mxfp8 = layer._attn_res_mxfp8(
+            prefix_sum, hidden_states, residual, pre=False
+        )
+        hidden_states = layer.mlp(hidden_states, shared_mxfp8_input=shared_mxfp8)
+        return hidden_states, prefix_sum, residual
+    hidden_states, prefix_sum, residual = layer._post_attn_norm(
+        hidden_states, residual, prefix_sum
+    )
+    return layer.mlp(hidden_states), prefix_sum, residual
+
+
 class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -2087,16 +2128,71 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = None
             residual = block_residual
 
+        pa_emu = (
+            _PA_EMU_MODE != "off"
+            and self.use_attn_res
+            and not self.use_sequence_parallel
+            and positions.shape[0] >= 4096
+        )
+        pa_b = pa_side = pa_prev = None
+        if pa_emu:
+            pa_b = [
+                None if t is None else t.clone()
+                for t in (hidden_states, prefix_sum, residual)
+            ]
+            pa_main = torch.cuda.current_stream()
+            if _PA_EMU_MODE == "tbo":
+                pa_side = getattr(self, "_pa_side_stream", None)
+                if pa_side is None:
+                    pa_side = self._pa_side_stream = torch.cuda.Stream()
+                fork = torch.cuda.Event()
+                fork.record(pa_main)
+                pa_side.wait_event(fork)
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
-            hidden_states, prefix_sum, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                prefix_sum=prefix_sum,
-                residual=residual,
-            )
+            if pa_emu:
+                side_ctx = (
+                    torch.cuda.stream(pa_side)
+                    if pa_side is not None
+                    else contextlib.nullcontext()
+                )
+                if pa_prev is not None:
+                    pa_main.wait_event(pa_prev[0])
+                hA, pA, rA, postA = _pa_layer_attn(
+                    layer, positions, hidden_states, residual, prefix_sum
+                )
+                a_attn = torch.cuda.Event()
+                a_attn.record(pa_main)
+                with side_ctx:
+                    torch.cuda.current_stream().wait_event(a_attn)
+                    hB, pB, rB, postB = _pa_layer_attn(
+                        layer, positions, pa_b[0], pa_b[2], pa_b[1]
+                    )
+                    b_attn = torch.cuda.Event()
+                    b_attn.record()
+                if pa_prev is not None:
+                    pa_main.wait_event(pa_prev[1])
+                hidden_states, prefix_sum, residual = _pa_layer_mlp(
+                    layer, hA, rA, pA, postA
+                )
+                a_mlp = torch.cuda.Event()
+                a_mlp.record(pa_main)
+                with side_ctx:
+                    torch.cuda.current_stream().wait_event(a_mlp)
+                    hB, pB, rB = _pa_layer_mlp(layer, hB, rB, pB, postB)
+                    pa_b = [hB, pB, rB]
+                    b_mlp = torch.cuda.Event()
+                    b_mlp.record()
+                pa_prev = (b_attn, b_mlp)
+            else:
+                hidden_states, prefix_sum, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    prefix_sum=prefix_sum,
+                    residual=residual,
+                )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if self.use_attn_res:
                     assert prefix_sum is not None
@@ -2109,6 +2205,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     aux_hidden_state = hidden_states + residual
 
                 aux_hidden_states.append(aux_hidden_state)
+        if pa_prev is not None:
+            pa_main.wait_event(pa_prev[1])
 
         assert hidden_states is not None
         assert residual is not None
