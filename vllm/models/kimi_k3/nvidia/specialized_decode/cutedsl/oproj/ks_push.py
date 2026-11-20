@@ -634,15 +634,17 @@ class OprojKsPush:
         bar_sync(GATHER_BAR, 32 * EPI_WARPS)
         base0 = self._slot_base(scratch, fv, blk, ks, 0, feature)
         base1 = self._slot_base(scratch, fv, blk, ks, 1, feature)
+        # every slab load of the chunk (2 slots x 12 token quads) in flight before any
+        # use: one L2 round trip per block (the quads past a 32-row chunk are unused)
+        s0 = [ld_f32x4_cg(base0 + quad * 2048) for quad in range(CMAX // 4)]
+        s1 = [ld_f32x4_cg(base1 + quad * 2048) for quad in range(CMAX // 4)]
         for g in cutlass.range_constexpr(CMAX // 16):
             t0 = 16 * g
             if t0 < size:
-                # all eight slab loads of the 16 tokens in flight before any use
-                s0 = [ld_f32x4_cg(base0 + ((t0 + 4 * q) // 4) * 2048) for q in range(4)]
-                s1 = [ld_f32x4_cg(base1 + ((t0 + 4 * q) // 4) * 2048) for q in range(4)]
                 for q in cutlass.range_constexpr(4):
                     for e in cutlass.range_constexpr(4):
-                        mine, a, b = own[g][4 * q + e], s0[q][e], s1[q][e]
+                        mine = own[g][4 * q + e]
+                        a, b = s0[4 * g + q][e], s1[4 * g + q][e]
                         # slice order: P0 + P1 + P2 (slot (k - ks - 1) mod 3 holds P_k)
                         p0 = Float32(cutlass.select_(ks == 0, mine, cutlass.select_(ks == 1, b, a)))
                         p1 = Float32(cutlass.select_(ks == 1, mine, cutlass.select_(ks == 0, a, b)))
