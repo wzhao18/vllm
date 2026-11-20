@@ -1264,16 +1264,19 @@ class SwapABGatedActEpilogue(KernelComponent):
         tile_base = (partial_base + slot * parts) * tile_elems + tidx
         own_base = tile_base + work_tile_info.expert_idx * tile_elems
         acc_pipeline.consumer_wait(acc_consumer_state)
-        for chunk in cutlass.range_constexpr(self.cta_tile_n // 32):
-            if cutlass.Int32(chunk * 32) < valid_tokens:
-                regs = cute.make_rmem_tensor((32,), cutlass.Float32)
-                cute.copy(
-                    ld_atom,
-                    wrap_into_copy_standard_layout(tmem_chunks[None, None, 0, chunk]),
-                    wrap_into_copy_standard_layout(regs),
-                )
-                for j in cutlass.range_constexpr(32):
-                    partials[own_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m)] = regs[j]
+        # DIAGNOSTIC ONLY (ladder skeleton T14s/T24s): FC1 parts store nothing (an in-cluster part-sum moves no
+        # HBM bytes); FC2 parts keep their FP32 partial store (the off-main sum's input).
+        if work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear2):
+            for chunk in cutlass.range_constexpr(self.cta_tile_n // 32):
+                if cutlass.Int32(chunk * 32) < valid_tokens:
+                    regs = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    cute.copy(
+                        ld_atom,
+                        wrap_into_copy_standard_layout(tmem_chunks[None, None, 0, chunk]),
+                        wrap_into_copy_standard_layout(regs),
+                    )
+                    for j in cutlass.range_constexpr(32):
+                        partials[own_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m)] = regs[j]
         cute.arch.fence_acq_rel_gpu()
         barrier.arrive_and_wait()
         flag = cute.make_tensor(cute.recast_ptr(flag_pointer, dtype=cutlass.Int32), cute.make_layout((1,)))
@@ -1285,33 +1288,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             flag[0] = last_flag
         barrier.arrive_and_wait()
         is_last = flag[0] != cutlass.Int32(0)
-        if is_last:
-            cute.arch.fence_acq_rel_gpu()
-            for chunk in cutlass.range_constexpr(self.cta_tile_n // 32):
-                if cutlass.Int32(chunk * 32) < valid_tokens:
-                    acc = cute.make_rmem_tensor((32,), cutlass.Float32)
-                    for j in cutlass.range_constexpr(32):
-                        acc[j] = cute.arch.load(
-                            partials.iterator + tile_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m),
-                            cutlass.Float32,
-                            sem="relaxed",
-                            scope="gpu",
-                        )
-                    for part in cutlass.range(1, parts, unroll=1):
-                        part_base = tile_base + part * tile_elems
-                        for j in cutlass.range_constexpr(32):
-                            acc[j] = acc[j] + cute.arch.load(
-                                partials.iterator + part_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m),
-                                cutlass.Float32,
-                                sem="relaxed",
-                                scope="gpu",
-                            )
-                    cute.copy(
-                        st_atom,
-                        wrap_into_copy_standard_layout(acc),
-                        wrap_into_copy_standard_layout(tmem_chunks[None, None, 0, chunk]),
-                    )
-            cute.arch.fence_view_async_tmem_store()
+        # DIAGNOSTIC ONLY (ladder skeleton): no part-sum; the last arriving part runs the epilogue on its own
+        # partial (values invalid, data movement and dependencies as in the split schedule).
         # The flag word is the FC1 staging scratch: every thread has read it before the epilogue reuses it.
         barrier.arrive_and_wait()
         return is_last
