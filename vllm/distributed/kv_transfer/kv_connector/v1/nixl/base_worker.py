@@ -1001,13 +1001,7 @@ class NixlBaseConnectorWorker:
                 "ucx_net_devices_by_gpu", None
             )
         )
-        # Without GPUDirect RDMA (no nvidia_peermem, e.g. in containers) UCX
-        # stages GPU memory through host fragments. Its error-handling pipeline
-        # protocol for that moves ~14 GB/s per GPU; the fragmented copy-in /
-        # copy-out protocol reaches the NIC line rate (98 GB/s of 2 x 400 Gb/s,
-        # VR200 nodes). GPUDirect transfers use neither. Set before the UCX
-        # backend is created; an explicit setting wins.
-        os.environ.setdefault("UCX_RNDV_PIPELINE_ERROR_HANDLING", "n")
+        self._set_ucx_env_defaults()
         if nixl_agent_config is None:
             config = None
         else:
@@ -3837,6 +3831,27 @@ class NixlBaseConnectorWorker:
             )
             for descs in remote
         ]
+
+    @staticmethod
+    def _set_ucx_env_defaults() -> None:
+        """UCX defaults for KV transfers, set before the UCX backend is created;
+        explicit settings win.
+
+        Without GPUDirect RDMA (no nvidia_peermem, e.g. in containers) UCX
+        stages GPU memory through host fragments. Its error-handling pipeline
+        protocol for that moves ~14 GB/s per GPU; the fragmented copy-in /
+        copy-out protocol reaches the NIC line rate (98 GB/s of 2 x 400 Gb/s,
+        VR200 nodes). GPUDirect transfers use neither.
+
+        With a per-rank NIC list (UCX_NET_DEVICES), UCX's GPU-NIC assignment
+        splits those NICs among every GPU the process can see, so the rank's own
+        GPU can get none and its GPU-memory lanes are dropped (VR200, UCX 1.23:
+        3-5 GB/s per reader instead of 32, 0.1 GB/s between two such ranks).
+        The list already names this rank's NICs: turn the assignment off.
+        """
+        os.environ.setdefault("UCX_RNDV_PIPELINE_ERROR_HANDLING", "n")
+        if os.environ.get("UCX_NET_DEVICES"):
+            os.environ.setdefault("UCX_GPU_NIC_ASSIGNMENT_MODE", "off")
 
     @staticmethod
     def _select_ucx_net_devices(spec: str | None, gpu: int | None = None) -> None:
