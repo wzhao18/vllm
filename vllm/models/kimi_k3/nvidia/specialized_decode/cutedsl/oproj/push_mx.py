@@ -95,7 +95,7 @@ class OprojPushMx:
     for the weights / the activation (one issuer completes one bulk op at a time)."""
 
     def __init__(self, k: int, rows: int, tp: int, cap: int, *, kt: int = 128,
-                 stages: int = 6, iw: int = 1, ix: int = 1):  # fmt: skip
+                 stages: int = 8, iw: int = 1, ix: int = 1):  # fmt: skip
         ktiles = k // kt
         if k % kt or ktiles % stages or rows % tp or rows // tp > cap or rows > 512:
             raise ValueError(f"OprojPushMx k {k} rows {rows} tp {tp} cap {cap} "
