@@ -318,6 +318,11 @@ def _mn_layout(t):
     return cute.make_tensor(t.iterator, new)
 
 
+def _sigma(h: int) -> int:
+    """Token 1's head paired with token 0's head h (skew within each group of 4)."""
+    return h - h % 4 + (h % 4 + 1) % 4
+
+
 def sf_word(row: int) -> int:
     """32-bit word of row ``row``'s four UE8M0 scales in the block-scaled SF atom
     ((32, 4), (32, 4)):((16, 4), (0, 1)) bytes, 128 rows per 512-byte chunk."""
@@ -818,15 +823,25 @@ class IndexerScore:
                 lim1 = cand1 + (SLOTS + 1) * TILE * 4
             # tile pairs whose newer tile reaches past a row end (causal edge)
             full_tiles = cutlass.min(end0, end1) // TILE
-            # head weights (BF16x2) of both tokens: w[j][i] = heads 2i, 2i + 1
+            # head weights (BF16x2) of both tokens: wt[j][i] = heads 2i, 2i + 1
             wbase = w_a + (qs * BQ * 16 + tok_a * 16) * 4
-            w = []
+            wt = []
             for j in cutlass.range_constexpr(2):
                 wj = []
                 for i in cutlass.range_constexpr(4):
                     v = lds_v4(wbase + (j * 16 + 4 * i) * 4)
                     wj.extend(v)
-                w.append(wj)
+                wt.append(wj)
+            # token-interleaved weights: w[h] = (token 0 head h, token 1 head sigma(h))
+            w = [prmt(wt[0][h // 2], wt[1][_sigma(h) // 2],
+                      (0x10 if h % 2 == 0 else 0x32)
+                      | ((0x54 if _sigma(h) % 2 == 0 else 0x76) << 8))
+                 for h in range(HEADS)]
+            # release the Q stage only after its row ends and weights are in
+            # registers (the PRMTs consume every loaded word): the fence completes
+            # this thread's shared-memory reads before the producer may refill the
+            # stage (INFRA / D-ATTN 2026-11-20 SASS release audit)
+            fence_async_shared()
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(q_empty + qs)
@@ -850,17 +865,20 @@ class IndexerScore:
                     hc[i] = Float32(0.0)
                 for i in cutlass.range_constexpr(4):
                     sc[i] = Uint32(0x7FC07FC0)
-                tc = Int32(0)
+                # publish tile word of the carried stage: (tile << 16) | lt, a
+                # per-thread register (publish2 reads only its high half), one
+                # tile below the pair's newer tile per stage
+                tw = (Uint32(ntp - 2 * n_edge) << Uint32(16)) | Uint32(lt)
                 for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
-                    p0, p1, tc = self.pair_rot(
-                        ntp - 1 - 2 * pp, ph, tmem_q, acc_full, acc_empty, w, p0, p1,
-                        thr, lim0, lim1, hc, sc, tc,
+                    p0, p1, tw = self.pair_rot(
+                        ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
+                        hc, sc, tw,
                     )
                     ph = ph ^ 1
                 p0 = cutlass.min(p0, lim0)
                 p1 = cutlass.min(p1, lim1)
                 p0, p1 = self.stage_tail(
-                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tc, p0, p1, thr
+                    hc, w, [[sc[0], sc[1]], [sc[2], sc[3]]], tw, p0, p1, thr
                 )
             else:
                 for pp in cutlass.range(n_edge, ntp // 2, unroll=1):
@@ -957,25 +975,25 @@ class IndexerScore:
         return ptr0 - 2 * TILE * 2, ptr1 - 2 * TILE * 2, p0, p1
 
     @cute.jit
-    def stage_tail(self, h1, w, ss, t, p0, p1, thr):
+    def stage_tail(self, h1, w, ss, tw, p0, p1, thr):
         """Heads 16-31 of a stage (h1) into its running sums, then publish both
         tokens' logits of tile t."""
         ss = self.reduce_half(h1, w, ss, HEADS // 2)
         r = self.combine2(ss)
-        return publish2(p0, p1, r, thr, Uint32(t) << Uint32(16))
+        return publish2(p0, p1, r, thr, tw)
 
     @cute.jit
-    def pair_rot(self, t_hi, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
-                 hc, sc, tc):
+    def pair_rot(self, ph, tmem_q, acc_full, acc_empty, w, p0, p1, thr, lim0, lim1,
+                 hc, sc, tw):
         """One interior tile pair, rotated: after each stage's barrier wait and its
-        first loads, finish the previous stage (the carry hc / sc / tc for stage 0, the
+        first loads, finish the previous stage (the carry hc / sc / tw for stage 0, the
         pair's own stage 0 for stage 1); returns with stage 1's second half (heads
         16-31, loaded) and first-half sums in the carry."""
         p0 = cutlass.min(p0, lim0)
         p1 = cutlass.min(p1, lim1)
         hp = [hc[i] for i in range(HEADS)]
         sp = [[sc[0], sc[1]], [sc[2], sc[3]]]
-        tp = tc
+        tp = tw
         for st in cutlass.range_constexpr(ACC_STAGES):
             col = tmem_q + st * N
             cute.arch.mbarrier_wait(acc_full + st, ph)
@@ -989,7 +1007,7 @@ class IndexerScore:
                 cute.arch.mbarrier_arrive(acc_empty + st)
             hp = h1
             sp = ss
-            tp = t_hi - st
+            tp = tw - Uint32((st + 1) << 16)
         for i in cutlass.range_constexpr(HEADS):
             hc[i] = hp[i]
         sc[0] = sp[0][0]
@@ -1001,29 +1019,32 @@ class IndexerScore:
     @cute.jit
     def reduce_half(self, buf, w, ss, h0: cutlass.Constexpr):
         """Heads h0 .. h0 + 15 of both tokens (buf: token 0's 16 values, then token
-        1's) into the running BF16 logit sums at stock precision: per token, s0
-        takes head pairs (4i, 4i + 1), s1 (4i + 2, 4i + 3), each head term
-        relu-rounded to BF16 and BF16x2-FMA'd with its weight."""
+        1's) into the running BF16 logit sums at stock precision. Stock keeps per
+        token four chains, head classes h % 4 = 0, 1, 2, 3 (s0.lo, s0.hi, s1.lo,
+        s1.hi), each head term relu-rounded to BF16 and FMA'd in BF16 in head
+        order. Here accumulator c holds token 0's chain c (low half) and token 1's
+        chain (c + 1) % 4 (high half): one F2FP packs (t0 head h, t1 head
+        sigma(h)), one HFMA2 advances both chains with the weights w[h]."""
         if cutlass.const_expr(ss is None):
-            ss = [[Uint32(0), Uint32(0)] for _ in range(2)]
+            acc = [Uint32(0) for _ in range(4)]
         else:
-            ss = [list(x) for x in ss]
-        for h in cutlass.range_constexpr(0, HEADS // 2, 4):
-            for j in cutlass.range_constexpr(2):
-                b = 16 * j + h
-                k = (h0 + h) // 2
-                ss[j][0] = fma_bf16x2(relu_bf16x2(buf[b], buf[b + 1]), w[j][k], ss[j][0])
-                ss[j][1] = fma_bf16x2(
-                    relu_bf16x2(buf[b + 2], buf[b + 3]), w[j][k + 1], ss[j][1]
-                )
-        return ss
+            acc = [ss[0][0], ss[0][1], ss[1][0], ss[1][1]]
+        for h in cutlass.range_constexpr(h0, h0 + HEADS // 2):
+            c = h % 4
+            acc[c] = fma_bf16x2(
+                relu_bf16x2(buf[h - h0], buf[16 + _sigma(h) - h0]), w[h], acc[c]
+            )
+        return [[acc[0], acc[1]], [acc[2], acc[3]]]
 
     @cute.jit
     def combine2(self, ss):
-        """(s0 + s1) per token, then low + high half: both tokens' BF16 logits."""
-        p0 = add_bf16x2(ss[0][0], ss[0][1])
-        p1 = add_bf16x2(ss[1][0], ss[1][1])
-        return add_bf16x2(prmt(p0, p1, 0x5410), prmt(p0, p1, 0x7632))
+        """Both tokens' BF16 logits (t0 low, t1 high): stock (s0.lo + s1.lo) +
+        (s0.hi + s1.hi) per token. x = acc0 + acc2 = (t0 s0.lo + s1.lo, t1 s0.hi +
+        s1.hi), y = acc1 + acc3 = (t0 s0.hi + s1.hi, t1 s1.lo + s0.lo); BF16
+        addition is commutative, so x + y is stock for both tokens."""
+        x = add_bf16x2(ss[0][0], ss[1][0])
+        y = add_bf16x2(ss[0][1], ss[1][1])
+        return add_bf16x2(x, y)
 
     @cute.jit
     def row_bound(self, hist, length, row, n_rows, row_bin, scan_a, wg, lt, wq, lane):

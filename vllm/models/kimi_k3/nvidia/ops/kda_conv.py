@@ -56,6 +56,7 @@ import threading
 import torch
 
 from vllm.logger import init_logger
+from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -759,11 +760,15 @@ def _load_qkv_conv() -> None:
         with open(_QKV_SRC, "rb") as fh:
             h.update(fh.read())
         h.update(f"{torch.__version__} {torch.version.cuda}".encode())
-        build = os.path.join(envs.VLLM_CACHE_ROOT, "k3_kda_conv", h.hexdigest()[:16])
+        build = os.path.join(
+            envs.VLLM_CACHE_ROOT, "k3_kda_conv", h.hexdigest()[:16] + "-s"
+        )
         os.makedirs(build, exist_ok=True)
+        name = os.path.basename(_QKV_SRC)
+        src = stable_copy(build, os.path.dirname(_QKV_SRC), [name])
         load(
             name="k3_kda_conv",
-            sources=[_QKV_SRC],
+            sources=[os.path.join(src, name)],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
             build_directory=build,

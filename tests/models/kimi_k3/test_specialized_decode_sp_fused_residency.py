@@ -34,7 +34,9 @@ def _spill(code, device):
         resolve_kernel,
     )
 
-    _, function = resolve_kernel(code, device)
+    # compile_reduce returns the compiled kernel wrapped with its launch attributes
+    # (prepare_shared_carveout): resolve the kernel underneath.
+    _, function = resolve_kernel(getattr(code, "compiled", code), device)
     local = cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
     return _checked(cuda.cuFuncGetAttribute(local, function))[0]
 
