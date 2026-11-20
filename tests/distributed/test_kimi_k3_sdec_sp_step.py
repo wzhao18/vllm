@@ -58,7 +58,7 @@ def stand_in_step(monkeypatch, blocks, rows=ROWS, method="synthetic"):
     step.blocks = dict(enumerate(blocks))
     step.moe, step.dense = True, False
     step.embedding = None  # (the stock embedding, declared)
-    step.gqa_drafter, step.mlps = False, {}
+    step.gqa_drafter, step.mlps, step.dense_mlps = False, {}, {}
     spec = SimpleNamespace(rejection_sample_method=method)
     config = SimpleNamespace(speculative_config=spec)
     monkeypatch.setattr(sp_attention, "get_current_vllm_config", lambda: config)

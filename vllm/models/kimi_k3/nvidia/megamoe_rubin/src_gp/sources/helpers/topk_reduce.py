@@ -1009,6 +1009,11 @@ class TopkReduce:
         smem = cutlass_utils.SmemAllocator()
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
         cluster_partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
+        if cutlass.const_expr(self.outlive_producer):
+            # vLLM-local: this grid completes after its producer's unpolled stores, so a
+            # dependent's griddepcontrol.wait covers both; release it at entry and a PDL
+            # consumer (the sdec latent up) streams its weights while the rows are polled.
+            cute.arch.griddepcontrol_launch_dependents()
 
         score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)

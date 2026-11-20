@@ -129,9 +129,17 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_dielocal as prefill_attn_res_dielocal,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
+    attn_res_lp as prefill_attn_res_lp,
+)
+from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     attn_res_mxfp8 as prefill_attn_res_mxfp8,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+
+
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -152,6 +160,26 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
 
     from .specialized_decode.runtime.decode import SpecializedDecode
+
+
+def _attn_res(
+    prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor,
+    *args, call: int | None = None, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AttnRes with a BF16 output -> (output, updated prefix): on a prefill
+    forward planned by ``attn_res_lp.begin`` the precomputed-logit kernel
+    (AttnRes call index ``call``; the prefix moves to the die-local prefix
+    buffer), the native one otherwise."""
+    if call is not None and prefill_attn_res_lp.active(blocks, prefix):
+        prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
+        out, _ = prefill_attn_res_lp.attn_res(
+            prefix, delta, blocks, call, kwargs["num_blocks"],
+            kwargs["block_write_idx"], args[2], kwargs["output_norm_eps"],
+            bf16_out=True, quant_out=False, prefix_out=prefix_out,
+        )
+        return out, prefix if prefix_out is None else prefix_out
+    return attn_res(prefix, delta, blocks, *args, **kwargs), prefix
+
 
 logger = init_logger(__name__)
 
@@ -368,22 +396,38 @@ class KimiVecSituAndMul(nn.Module):
     SituAndMul module itself, through its own dispatch; the vectorized kernel is
     bitwise its CUDA op (forward_cuda). Where the custom op dispatches to
     forward_native instead, the large inputs keep the CUDA op's bits (the same FP32
-    math, one BF16 rounding)."""
+    math, one BF16 rounding).
+
+    Prefill chunks (from ``_FAST_MIN_ROWS`` rows; the dense layer is 16K x 33792
+    at F16K) use the routed experts' MUFU-light SiTU form, as the shared experts'
+    MXFP8 SiTU does at prefill (``mxfp8_act.SITU_FAST_MIN_ROWS``): the
+    precise-tanhf kernel is FMA-issue bound at ~5x its HBM floor there, and the
+    fast form stays within one BF16 ulp of it."""
 
     _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
+    _FAST_MIN_ROWS = 4096
 
     def __init__(self, beta: float, linear_beta: float | None):
         super().__init__()
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
         self.small = SituAndMul(beta=self.beta, linear_beta=self.linear_beta)
+        from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import warmup
 
-        warmup()  # build / load the JIT extension at model init, not mid-step
+        warmup()  # build / load the JIT extensions at model init, not mid-step
+        mxfp8_act.warmup()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() // 2 < self._VEC_MIN_OUT_ELEMS:
             return self.small(x)
+        if x.numel() // x.shape[-1] >= self._FAST_MIN_ROWS:
+            from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+            if mxfp8_act.situ_fast_bf16_supported(x.shape[-1] // 2):
+                return mxfp8_act.situ_and_mul_fast_bf16(
+                    x, self.beta, self.linear_beta
+                )
         from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
 
         return situ_and_mul(x, self.beta, self.linear_beta)
@@ -476,6 +520,9 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
+    # specialized_prefill.shared_situ.PrefillSharedSitu (prefill workers only).
+    _prefill_situ = None
+
     def mxfp8_input(self) -> bool:
         """gate_up_proj takes an MXFP8 activation (QuantizedActivation)."""
         return not self.shard_sequence_parallel and takes_mxfp8_activation(
@@ -522,7 +569,16 @@ class KimiMLP(nn.Module):
             # compute this rank's partial for all of them, then reduce-scatter,
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
+        situ = self._prefill_situ
+        if situ is not None:
+            # Prefill shared expert: the gate_up GEMM writes the MXFP8 SiTU
+            # (specialized_prefill.shared_situ) at prefill-sized batches.
+            qa = situ.fused(x)
+            if qa is not None:
+                return self.down_proj(qa)[0]
         gate_up, _ = self.gate_up_proj(x)
+        if situ is not None:
+            gate_up = situ.deinterleave(gate_up)
         # Online-MXFP8 down_proj: the activation kernel writes its MXFP8 input.
         qa = self._act_mxfp8(gate_up)
         if qa is not None:
@@ -1590,7 +1646,7 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         assert residual is not None
-        hidden_states = attn_res(
+        hidden_states, prefix_sum = _attn_res(
             prefix_sum,
             hidden_states,
             residual,
@@ -1601,6 +1657,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
+            call=2 * self.layer_idx,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1627,7 +1684,7 @@ class KimiDecoderLayer(nn.Module):
         else:
             prefix_delta = hidden_states
         mlp_valid_blocks = self.prev_valid_blocks + self.is_block_write_layer
-        hidden_states = attn_res(
+        hidden_states, prefix_sum = _attn_res(
             prefix_sum,
             prefix_delta,
             residual,
@@ -1638,6 +1695,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=-1,
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            call=2 * self.layer_idx + 1,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1653,9 +1711,9 @@ class KimiDecoderLayer(nn.Module):
         if pre_mxfp8:
             # Prefill: the AttnRes writes the KDA in_proj's MXFP8 input (its
             # only consumer) instead of BF16.
-            hidden_states = self._attn_res_mxfp8(
+            _, hidden_states, prefix_sum = self._attn_res_mxfp8(
                 prefix_sum, hidden_states, residual, pre=True
-            )[1]
+            )
         else:
             hidden_states, prefix_sum, residual = self._pre_attn_norm(
                 hidden_states, residual, prefix_sum
@@ -1684,7 +1742,7 @@ class KimiDecoderLayer(nn.Module):
                 if _gemm_ar_owns(hidden_states):
                     hidden_states = hidden_states.clone()
                 prefix_sum = hidden_states
-            hidden_states, shared_mxfp8 = self._attn_res_mxfp8(
+            hidden_states, shared_mxfp8, prefix_sum = self._attn_res_mxfp8(
                 prefix_sum, hidden_states, residual, pre=False
             )
             hidden_states = self.mlp(hidden_states, shared_mxfp8_input=shared_mxfp8)
@@ -1740,8 +1798,27 @@ class KimiDecoderLayer(nn.Module):
     ):
         """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
         the MXFP8 output (BF16 output only after attention)."""
+        if prefill_attn_res_lp.active(residual, prefix_sum):
+            prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
+            new_prefix = prefix_sum if prefix_out is None else prefix_out
+            if pre:
+                delta = hidden_states
+                num_blocks = self.prev_valid_blocks
+                widx = self.block_write_idx if self.is_block_write_layer else -1
+                onw = self.input_layernorm
+            else:
+                delta = None if self.is_block_write_layer else hidden_states
+                num_blocks = self.prev_valid_blocks + self.is_block_write_layer
+                widx = -1
+                onw = self.post_attention_layernorm
+            out, qa = prefill_attn_res_lp.attn_res(
+                prefix_sum, delta, residual, 2 * self.layer_idx + (not pre),
+                num_blocks, widx, onw.weight, onw.variance_epsilon,
+                bf16_out=not pre, quant_out=True, prefix_out=prefix_out,
+            )
+            return out, qa, new_prefix
         if pre:
-            return prefill_attn_res_mxfp8.attn_res_mxfp8(
+            out, qa = prefill_attn_res_mxfp8.attn_res_mxfp8(
                 prefix_sum,
                 hidden_states,
                 residual,
@@ -1756,8 +1833,9 @@ class KimiDecoderLayer(nn.Module):
                 output_norm_eps=self.input_layernorm.variance_epsilon,
                 bf16_out=False,
             )
+            return out, qa, prefix_sum
         prefix_delta = None if self.is_block_write_layer else hidden_states
-        return prefill_attn_res_mxfp8.attn_res_mxfp8(
+        out, qa = prefill_attn_res_mxfp8.attn_res_mxfp8(
             prefix_sum,
             prefix_delta,
             residual,
@@ -1770,6 +1848,7 @@ class KimiDecoderLayer(nn.Module):
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
             bf16_out=True,
         )
+        return out, qa, prefix_sum
 
 
 # (param_name, shard_name, shard_id) for the merged DSA wkv_index.
@@ -1932,6 +2011,26 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             "num_attention_heads must be divisible by world_size"
         )
 
+    def _attn_res_lp_plan(self) -> "prefill_attn_res_lp.Plan":
+        """Per-call AttnRes queries of the whole forward (layer l: 2 l
+        pre-attention, 2 l + 1 post-attention; the final AttnRes last), built
+        once from the loaded weights."""
+        plan = getattr(self, "_attn_res_lp_plan_cache", None)
+        if plan is None:
+            norms = []
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                norms.append((layer.self_attention_res_norm, layer.self_attention_res_proj))
+                norms.append((layer.mlp_res_norm, layer.mlp_res_proj))
+            norms.append((self.output_attn_res_norm, self.output_attn_res_proj))
+            assert self.attn_res_block_size is not None
+            plan = self._attn_res_lp_plan_cache = prefill_attn_res_lp.Plan(
+                [(nm.weight, pj.weight.squeeze(0)) for nm, pj in norms],
+                [nm.variance_epsilon for nm, _ in norms],
+                self.attn_res_block_size,
+                self.num_attn_res_blocks,
+            )
+        return plan
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -2076,13 +2175,27 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         prefix_sum = None
         if self.use_attn_res:
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.num_attn_res_blocks,
-                hidden_states.size(1),
-            )
+            block_residual = None
+            if residual is None and prefill_attn_res_mxfp8.use_for(hidden_states):
+                # Prefill: block rows homed per die for die-local AttnRes reads.
+                block_residual = prefill_attn_res_dielocal.block_residual(
+                    hidden_states, self.num_attn_res_blocks
+                )
+            if block_residual is None:
+                block_residual = hidden_states.new_empty(
+                    hidden_states.size(0),
+                    self.num_attn_res_blocks,
+                    hidden_states.size(1),
+                )
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
+            elif (
+                prefill_attn_res_lp.use_for(hidden_states)
+                and self.start_layer == 0
+                and get_pp_group().is_last_rank
+            ):
+                # Prefill: block logits precomputed per block write.
+                prefill_attn_res_lp.begin(self._attn_res_lp_plan(), block_residual)
             prefix_sum = hidden_states
             hidden_states = None
             residual = block_residual
@@ -2128,7 +2241,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         if self.use_attn_res:
             assert prefix_sum is not None
-            hidden_states = attn_res(
+            hidden_states, _ = _attn_res(
                 prefix_sum,
                 hidden_states,
                 residual,
@@ -2139,6 +2252,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
+                call=2 * self.end_layer,
             )
         else:
             hidden_states = hidden_states + residual
@@ -2420,6 +2534,14 @@ class KimiLinearForCausalLM(
                 "cuBLASLt MXFP8 dispatch.",
                 switched,
             )
+        from .specialized_prefill import gemm_tactics
+
+        if pinned := gemm_tactics.enable(self):
+            logger.info_once(
+                "Kimi K3: %d BF16 linears use pinned cuBLASLt tactics at >= %d rows.",
+                pinned,
+                gemm_tactics.MIN_ROWS,
+            )
         if any(
             takes_mxfp8_activation(m)
             for m in self.modules()
@@ -2458,6 +2580,58 @@ class KimiLinearForCausalLM(
             logger.info_once(
                 "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
                 packed_moe,
+            )
+        # Prefill workers: shared gate_up GEMM with the SiTU + MXFP8 epilogue.
+        from .specialized_prefill import shared_situ
+
+        fused_situ = 0
+        for module in self.model.modules():
+            if (
+                isinstance(module, KimiMoE)
+                and getattr(module, "_prefill_moe", None) is not None
+                and getattr(module, "_packed_moe", None) is None
+                and isinstance(module.shared_experts, KimiMLP)
+                and not module.shared_experts.shard_sequence_parallel
+                and shared_situ.supported(module.shared_experts)
+            ):
+                situ = shared_situ.PrefillSharedSitu(module.shared_experts)
+                situ.prepare()
+                module.shared_experts._prefill_situ = situ
+                fused_situ += 1
+        if fused_situ:
+            logger.info_once(
+                "Kimi K3: %d prefill shared experts run the gate_up GEMM with the "
+                "SiTU + MXFP8 epilogue (sm_107).",
+                fused_situ,
+            )
+        # Prefill workers (prefill MoE policy active): KDA q|k|v in_proj GEMM
+        # with the conv + SiLU in its epilogue.
+        from .specialized_prefill import kda_conv_in_proj
+
+        prefill_worker = any(
+            getattr(module, "_prefill_moe", None) is not None
+            for module in self.model.modules()
+            if isinstance(module, KimiMoE)
+        )
+        fused_conv = 0
+        for module in self.model.modules() if prefill_worker else ():
+            if not isinstance(module, KimiK3DeltaAttention):
+                continue
+            reason = kda_conv_in_proj.unsupported_reason(module)
+            if reason is not None:
+                logger.info_once(
+                    "Kimi K3: prefill KDA in_proj keeps the separate conv: %s", reason
+                )
+                continue
+            conv_in_proj = kda_conv_in_proj.PrefillKdaConvInProj(module)
+            conv_in_proj.prepare()
+            module._prefill_conv_in_proj = conv_in_proj
+            fused_conv += 1
+        if fused_conv:
+            logger.info_once(
+                "Kimi K3: %d prefill KDA layers run the q|k|v in_proj GEMM with the "
+                "conv + SiLU epilogue (sm_107).",
+                fused_conv,
             )
         # K3.1 DSA decode under DCP: the NCCL-free top-k exchange (on by policy).
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx

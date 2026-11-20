@@ -26,6 +26,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from vllm.models.kimi_k3.nvidia.dsa_kernels import stable_sources
+
 _EXT = None
 
 _COARSE_WORDS = 20
@@ -108,16 +110,20 @@ def _load_ext():
     digest = h.hexdigest()[:10]
     # (infrastructure: where torch keeps the extension build; default its cache)
     build = os.environ.get("K31_DCPX_BUILD_DIR")
+    sources = [str(src)]
     if build:
-        build = str(Path(build) / digest)
+        # "-s": compiled from the digest-keyed source copy (a different ninja
+        # command than builds from the checkout path, which must not share a dir)
+        build = str(Path(build) / f"{digest}-s")
         Path(build).mkdir(parents=True, exist_ok=True)
+        sources = stable_sources(build, [src])
     # (infrastructure: extra nvcc flags for debug builds, e.g. -DK31_DCPX_DEBUG_PRINT)
     extra = os.environ.get("K31_DCPX_EXTRA_CFLAGS", "").split()
     if extra:
         digest += "_" + hashlib.sha1(" ".join(extra).encode()).hexdigest()[:6]
     _EXT = load(
         name=f"k31_dcp_exchange_sm{arch}_{digest}",
-        sources=[str(src)],
+        sources=sources,
         extra_cuda_cflags=extra + [
             "-O3",
             f"-gencode=arch=compute_{arch},code=sm_{arch}",

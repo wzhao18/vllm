@@ -1253,7 +1253,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_aiter_triton_fp4_bmm_enabled:
+            # A backend may write the FP8 query (W_UK absorption, RoPE concat
+            # and static quant) in one kernel from the unsplit query.
+            uk_query = (
+                getattr(self.impl, "uk_query_fp8", None)
+                if fp8_attention
+                and self.impl.supports_quant_query_input
+                and not qrep_decode
+                and self.q_pad_num_heads is None
+                and mqa_q_pe.shape[-1] > 0
+                else None
+            )
+            mqa_q_fp8 = (
+                uk_query(mqa_q, self.W_UK_T, self._q_scale)
+                if uk_query is not None
+                else None
+            )
+            if mqa_q_fp8 is not None:
+                mqa_ql_nope = None
+            elif self.is_aiter_triton_fp4_bmm_enabled:
                 mqa_ql_nope = rocm_aiter_ops.batched_gemm_a16wfp4(
                     mqa_q_nope,
                     self.W_K,
@@ -1325,7 +1343,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
                     torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if mqa_q_fp8 is not None:
+                mqa_q = mqa_q_fp8
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 # A backend may write the decode kernel's query (concat, quant

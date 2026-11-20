@@ -80,6 +80,7 @@ from ..cutedsl.oproj.sp import SpOproj
 from ..recoverssm import prepare_recoverssm
 from ..shapes import Choice, Coverage, Path, Shape, Unsupported, shard_rows
 from .providers import attention_kind, bf16_weight, pack_dsa_projection
+from .sp_dense import MAX_ROWS, SpDenseMlp
 from .sp_mlp import SpMlp, moe_choice
 
 logger = init_logger(__name__)
@@ -121,7 +122,7 @@ def sp_layer(decoder, step):
         )  # fmt: skip
 
 
-def sp_boundary(decoder, comm, block, rows, mlp=None):
+def sp_boundary(decoder, comm, block, rows, mlp=None, delta_parts=()):
     """The layer's fused SP boundaries (``attn_res.sp_fused.SpBoundary``): the stock
     ``_pre_attn_norm`` / ``_post_attn_norm`` weights, block pattern and epsilons. An
     MXFP8 in-projection (the NVFP4 checkpoint's KDA layers) takes the all-gather as
@@ -157,7 +158,7 @@ def sp_boundary(decoder, comm, block, rows, mlp=None):
     out_mx = None if mlp is None else mlp.mx_input()
     return SpBoundary(
         comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes, first,
-        gather_mx=gather_mx, out_mx=out_mx,
+        gather_mx=gather_mx, out_mx=out_mx, delta_parts=delta_parts,
     )  # fmt: skip
 
 
@@ -470,12 +471,30 @@ class SpStep:
             for d in layers
             if d.is_moe_layer
         }
+        # The layer-0 dense MLP (replicated weights) as one die-local weight stream.
+        self.dense_mlps = {
+            d.layer_idx: SpDenseMlp(d.mlp, shards, self.device, d.layer_idx)
+            for d in layers
+            if not d.is_moe_layer and shards[-1] <= MAX_ROWS
+        }
+        # MoE layers whose latent up leaves FP32 split partials that the next layer's
+        # all-gather boundary sums (``SpMlp.parts``): not the last layer (the final
+        # AttnRes) nor one whose output is also a BF16 aux hidden state.
+        self.parts_ok: dict[int, bool] = {}
+        delta_parts: dict[int, tuple] = {}
+        order = [d.layer_idx for d in layers]
+        for index, nxt in zip(order, order[1:]):
+            mlp = self.mlps.get(index)
+            aux_bf16 = index + 1 in self.aux_layers and index + 1 not in self.early_aux
+            if mlp is not None and mlp.parts and not aux_bf16:
+                self.parts_ok[index] = True
+                delta_parts[nxt] = tuple(sorted(set(mlp.parts.values())))
         # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
         # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
         self.bounds = {
             d.layer_idx: sp_boundary(
                 d, self.comm, self.blocks[d.layer_idx], rows,
-                self.mlps.get(d.layer_idx),
+                self.mlps.get(d.layer_idx), delta_parts.get(d.layer_idx, ()),
             )  # fmt: skip
             for d in layers
         }
@@ -533,7 +552,7 @@ class SpStep:
                 f"stock MegaMoE router / experts / norms on the shard (EP{ctx.ep}); "
                 "its dense GEMMs: moe_dense"
             )
-        if self.dense:
+        if self.dense and not self.dense_mlps:
             declared["dense"] = "stock dense MLP on the shard"
         if method == "synthetic":
             declared["verify"] = "stock (synthetic rejection)"
@@ -567,6 +586,8 @@ class SpStep:
                     choices.setdefault(family, choice)
             if self.mlps:
                 choices["moe_dense"] = moe_choice(self.mlps, r // ctx.tp)
+            for dense in self.dense_mlps.values():
+                choices["dense"] = dense.choice(r // ctx.tp)
             if "verify" not in declared:
                 choices["verify"] = Choice(Path.GENERIC, note="VerifyArgmax")
             coverage.specialize(r, choices)
@@ -676,10 +697,16 @@ class SpStep:
             out = prefix_sum.new_empty(prefix_sum.shape)
             hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
-            if mlp is None:
+            dense = self.dense_mlps.get(index)
+            if dense is not None and dense.serves(hidden.shape[0]):
+                hidden = dense.run(hidden)
+            elif mlp is None:
                 hidden = layer.mlp(hidden)
             else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
-                hidden = mlp.run(hidden, prequantized=bound.out_mx is not None)
+                hidden = mlp.run(
+                    hidden, prequantized=bound.out_mx is not None,
+                    parts=self.parts_ok.get(index, False),
+                )  # fmt: skip
             if index + 1 in self.aux_layers and index + 1 not in early:
                 aux.append(
                     backbone._capture_aux_hidden_stream(

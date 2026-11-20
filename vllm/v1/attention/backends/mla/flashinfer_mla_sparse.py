@@ -1071,6 +1071,15 @@ def _finish_dcp_partials(
     )
 
 
+def _joined_query(q: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    if not isinstance(q, tuple):
+        return q
+    ql_nope, q_pe = q
+    if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
+        return ql_nope
+    return torch.cat(q, dim=-1)
+
+
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """FlashInfer MLA Sparse implementation.
 
@@ -1089,6 +1098,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     # ShardQ under DCP only: TP-only steps keep the head-sharded path
     # (Inferact/mum#66 also turns TP ShardQ on for this backend).
     supports_dcp_shardq: ClassVar[bool] = True
+    # forward_mqa sends every call that returns the LSE (all DCP decode) to
+    # SparseMLACommonImpl.forward_mqa, which reads dcp_local_topk_counts; only
+    # prefill-sized calls take the specialized prefill kernel.
+    dcp_decode_reads_topk_counts: ClassVar[bool] = True
     # fp8 query quantization is required when using fp8 kv_cache,
     # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
     # for query and kv_cache (mixed bf16+fp8 is not supported).
@@ -1199,6 +1212,32 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 vllm_config, self.use_shardq
             )
 
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+        skip_scale: bool = False,
+    ) -> None:
+        # Kimi K3.1 specialized prefill: the same FP8 insert at HBM rate
+        if self._prefill_sparse_mla is not None and kv_cache.numel() > 0:
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import kv_insert
+
+            k_pe2 = k_pe.squeeze(1)
+            slots = slot_mapping.flatten()
+            if kv_insert.applicable(
+                kv_c_normed, k_pe2, kv_cache, slots, kv_cache_dtype, skip_scale
+            ):
+                kv_insert.insert(kv_c_normed, k_pe2, kv_cache, slots)
+                return
+        super().do_kv_cache_update(
+            kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale,
+            skip_scale,
+        )
+
     def _prepare_mqa_kernel(
         self,
         layer: AttentionLayer,
@@ -1245,6 +1284,18 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             return None
         self._fused_query = padded
         return padded[:, :num_heads]
+
+    def uk_query_fp8(
+        self, q: torch.Tensor, w_uk_t: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor | None:
+        """The FP8 query [T, H, L + R] of a prefill-sized call of the specialized
+        prefill sparse MLA (W_UK absorption, RoPE concat and static quant in one
+        GEMM pass), or None to let the layer run its bmm / concat / quant."""
+        if not self._runs_prefill_sparse_mla(q.shape[0]):
+            return None
+        from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import uk_query
+
+        return uk_query.fused_query(q, w_uk_t, q_scale)
 
     def _runs_prefill_sparse_mla(self, num_rows: int) -> bool:
         psm = getattr(self, "_prefill_sparse_mla", None)
@@ -1549,6 +1600,69 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             return num_heads
         return trtllm_gen_query_heads(num_heads)
 
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        layer: AttentionLayer,
+        *,
+        row_offset: int = 0,
+        num_step_rows: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Prefill-sized calls of the specialized prefill kernel take the indexer's
+        # request-relative top-k: the kernel's gather does the block-table remap.
+        num_tokens = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
+        block_size = attn_metadata.block_size
+        psm = self._prefill_sparse_mla
+        if (
+            psm is None
+            or row_offset != 0
+            or self.need_to_return_lse_for_decode
+            or not self._runs_prefill_sparse_mla(num_tokens)
+            or isinstance(self.index_group, HiSparseMLAIndexGroup)
+            or block_size & (block_size - 1)
+        ):
+            return super().forward_mqa(
+                q,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                layer,
+                row_offset=row_offset,
+                num_step_rows=num_step_rows,
+            )
+        assert self.topk_indices_buffer is not None
+        q = self._prefill_sparse_mla_query(q)
+        self._prepare_mqa_kernel(layer, q.device)
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        kv_rows, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache.view(q.dtype), block_size
+        )
+        out = psm.sparse_mla_prefill_logical(
+            q,
+            kv_rows,
+            self.topk_indices_buffer[:num_tokens],
+            attn_metadata.req_id_per_token[:num_tokens],
+            attn_metadata.block_table,
+            block_size,
+            block_stride_rows,
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+        self._fused_query = None
+        return out, None
+
+    def _prefill_sparse_mla_query(
+        self, q: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        psm = self._prefill_sparse_mla
+        assert psm is not None
+        q = _joined_query(q)
+        assert q.dtype == torch.float8_e4m3fn, q.dtype
+        if q.shape[1] != psm.H or not q.is_contiguous():
+            q = q[:, : psm.H].contiguous()
+        return q
+
     def _forward_mqa_kernel(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1563,12 +1677,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if return_lse is None:
             return_lse = self.need_to_return_lse_for_decode
-        if isinstance(q, tuple):
-            ql_nope, q_pe = q
-            if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
-                q = ql_nope
-            else:
-                q = torch.cat(q, dim=-1)
+        q = _joined_query(q)
 
         if self.use_prims_ts:
             return self._forward_prims_ts(
@@ -1582,9 +1691,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         if not return_lse and self._runs_prefill_sparse_mla(q.shape[0]):
             psm = self._prefill_sparse_mla
-            assert psm is not None and q.dtype == torch.float8_e4m3fn, q.dtype
-            if q.shape[1] != psm.H or not q.is_contiguous():
-                q = q[:, : psm.H].contiguous()
+            assert psm is not None
+            q = self._prefill_sparse_mla_query(q)
             kv_rows, _ = flat_kv_row_view(kv_cache.view(q.dtype), block_size)
             # Physical slots are flat rows of kv_rows (block stride included).
             out = psm.sparse_mla_prefill(

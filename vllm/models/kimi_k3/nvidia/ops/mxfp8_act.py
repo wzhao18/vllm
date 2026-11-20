@@ -462,6 +462,40 @@ __global__ void __launch_bounds__(1024) situ4_row_kernel(
   sf[sf_off] = (uint8_t)e;
 }
 
+// SiTU-and-mul in the routed experts' MUFU-light form with BF16 output: CTA
+// (row, column chunk of 32 x blockDim columns), 32 columns per thread, the BF16
+// values situ4_row_kernel quantizes.
+template <int A_POW, bool CLAMP>
+__global__ void __launch_bounds__(1024) situ4_bf16_row_kernel(
+    uint16_t* __restrict__ out, const uint16_t* __restrict__ x, const int d,
+    const int64_t x_stride, const int64_t out_stride, const float beta,
+    const float linear_beta) {
+  const float log2e = 1.4426950408889634f;
+  const float kb = -2.0f * log2e / beta;
+  const float kc = CLAMP ? -2.0f * log2e / linear_beta : 0.0f;
+  const float bbs = CLAMP ? beta * linear_beta : beta;
+  const float2 k_a = make_float2(-log2e, -log2e), k_b = make_float2(kb, kb);
+  const float2 k_c = make_float2(kc, kc), bb = make_float2(bbs, bbs);
+  const int64_t row = blockIdx.x;
+  const int blk = blockIdx.y * blockDim.x + threadIdx.x;
+  const uint4* gp =
+      reinterpret_cast<const uint4*>(x + row * x_stride + blk * 32);
+  const uint4* up = reinterpret_cast<const uint4*>(x + row * x_stride + d + blk * 32);
+  uint4 a[4], b[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) a[i] = __ldg(gp + i);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) b[i] = __ldg(up + i);
+  uint4* op = reinterpret_cast<uint4*>(out + row * out_stride + blk * 32);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    op[i] = make_uint4(situ4_pair_ct<A_POW, CLAMP>(a[i].x, b[i].x, k_a, k_b, k_c, bb),
+                       situ4_pair_ct<A_POW, CLAMP>(a[i].y, b[i].y, k_a, k_b, k_c, bb),
+                       situ4_pair_ct<A_POW, CLAMP>(a[i].z, b[i].z, k_a, k_b, k_c, bb),
+                       situ4_pair_ct<A_POW, CLAMP>(a[i].w, b[i].w, k_a, k_b, k_c, bb));
+  }
+}
+
 // mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 4 the same with the
 //       routed experts' MUFU-light SiTU, 2 silu-and-mul,
 //       3 x * sigmoid(g)  (two inputs, both [rows, d])
@@ -568,8 +602,13 @@ __global__ void act_quant_kernel(uint8_t* __restrict__ q,
   }
 }
 
-// One block per row; K / 8 threads (K <= 8192), each owning 8 columns.
+// RMS_ROWS rows per block; K / 8 threads (K <= 8192), each owning 8 columns
+// of every row. All rows' loads are issued before the first reduction, so a
+// block keeps RMS_ROWS x K x 2 bytes in flight (one row per block left the
+// kernel latency bound at ~4 x 7 KiB per SM). Per row the arithmetic and the
+// reduction order are those of the one-row form (bitwise equal).
 // vLLM RMSNorm (ir rms_norm as dispatched on SM10x): out = (bf16)((bf16)(x * rstd) * w).
+constexpr int RMS_ROWS = 4;
 __global__ void rms_norm_quant_kernel(uint8_t* __restrict__ q,
                                       uint8_t* __restrict__ sf,
                                       uint16_t* __restrict__ y,
@@ -581,55 +620,69 @@ __global__ void rms_norm_quant_kernel(uint8_t* __restrict__ q,
                                       const int64_t y_stride,
                                       const int sf_col_base,
                                       const int padded_cols, const float eps) {
-  __shared__ float warp_sums[32];
-  const int64_t row = blockIdx.x;
+  __shared__ float warp_sums[RMS_ROWS][32];
+  const int64_t row0 = int64_t{blockIdx.x} * RMS_ROWS;
   const int col = threadIdx.x * 8;
-  const bool real = row < rows;
-  float v[8];
-  float ss = 0.f;
-  if (real) {
-    const uint4 raw =
-        __ldg(reinterpret_cast<const uint4*>(x + row * x_stride + col));
-    const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw);
+  uint4 raw[RMS_ROWS];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      v[i] = bf16_bits_to_float(r16[i]);
-      ss += v[i] * v[i];
-    }
+  for (int r = 0; r < RMS_ROWS; ++r) {
+    raw[r] = row0 + r < rows
+                 ? __ldg(reinterpret_cast<const uint4*>(
+                       x + (row0 + r) * x_stride + col))
+                 : make_uint4(0u, 0u, 0u, 0u);
   }
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+  const uint4 wraw = __ldg(reinterpret_cast<const uint4*>(w + col));
+  const uint16_t* w16 = reinterpret_cast<const uint16_t*>(&wraw);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  if (lane == 0) warp_sums[warp] = ss;
-  __syncthreads();
   const int nwarps = blockDim.x >> 5;
-  float tot = lane < nwarps ? warp_sums[lane] : 0.f;
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffff, tot, o);
-  const float rstd = rsqrtf(tot / (float)k + eps);
-  float out[8];
-  if (real) {
-    const uint4 wraw = __ldg(reinterpret_cast<const uint4*>(w + col));
-    const uint16_t* w16 = reinterpret_cast<const uint16_t*>(&wraw);
-    uint4 yraw;
-    uint16_t* y16 = reinterpret_cast<uint16_t*>(&yraw);
+  for (int r = 0; r < RMS_ROWS; ++r) {
+    const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw[r]);
+    float ss = 0.f;
+    if (row0 + r < rows) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float n = bf16_bits_to_float(float_to_bf16_bits(v[i] * rstd));
-      y16[i] = float_to_bf16_bits(n * bf16_bits_to_float(w16[i]));
-      out[i] = bf16_bits_to_float(y16[i]);
+      for (int i = 0; i < 8; ++i) {
+        const float v = bf16_bits_to_float(r16[i]);
+        ss += v * v;
+      }
     }
-    if (y != nullptr) {
-      *reinterpret_cast<uint4*>(y + row * y_stride + col) = yraw;
-    }
-  } else {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) out[i] = 0.f;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    if (lane == 0) warp_sums[r][warp] = ss;
   }
-  quant8_store(out, q + (real ? row : 0) * q_stride + col, sf, row, col / 8,
-               sf_col_base, padded_cols, real);
-  if (!real && (threadIdx.x & 3) == 0) {
-    sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+  __syncthreads();
+#pragma unroll
+  for (int r = 0; r < RMS_ROWS; ++r) {
+    const int64_t row = row0 + r;
+    const bool real = row < rows;
+    float tot = lane < nwarps ? warp_sums[r][lane] : 0.f;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffff, tot, o);
+    const float rstd = rsqrtf(tot / (float)k + eps);
+    float out[8];
+    if (real) {
+      const uint16_t* r16 = reinterpret_cast<const uint16_t*>(&raw[r]);
+      uint4 yraw;
+      uint16_t* y16 = reinterpret_cast<uint16_t*>(&yraw);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float n =
+            bf16_bits_to_float(float_to_bf16_bits(bf16_bits_to_float(r16[i]) * rstd));
+        y16[i] = float_to_bf16_bits(n * bf16_bits_to_float(w16[i]));
+        out[i] = bf16_bits_to_float(y16[i]);
+      }
+      if (y != nullptr) {
+        *reinterpret_cast<uint4*>(y + row * y_stride + col) = yraw;
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) out[i] = 0.f;
+    }
+    quant8_store(out, q + (real ? row : 0) * q_stride + col, sf, row, col / 8,
+                 sf_col_base, padded_cols, real);
+    if (!real && (threadIdx.x & 3) == 0) {
+      sf[swizzled_sf_offset(row, sf_col_base + col / 32, padded_cols)] = 0;
+    }
   }
 }
 
@@ -750,13 +803,56 @@ void rms_norm_quant(torch::Tensor& q, torch::Tensor& sf,
   const int64_t rows = x.size(0);
   if (rows == 0) return;
   const int64_t rows_pad = (rows + 127) / 128 * 128;
-  rms_norm_quant_kernel<<<(unsigned)rows_pad, k / 8, 0,
+  rms_norm_quant_kernel<<<(unsigned)(rows_pad / RMS_ROWS), k / 8, 0,
                           c10::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<uint8_t*>(q.data_ptr()),
       reinterpret_cast<uint8_t*>(sf.data_ptr()), yp,
       reinterpret_cast<const uint16_t*>(x.data_ptr()),
       reinterpret_cast<const uint16_t*>(w.data_ptr()), rows, k, x.stride(0),
       q.stride(0), y_stride, (int)sf_col_base, (int)padded_cols, (float)eps);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// out[rows, d] = situ_and_mul(x[rows, 2d]) in BF16, MUFU-light SiTU (mode 4's
+// BF16 values); d % 32 == 0.
+void situ_fast_bf16(torch::Tensor& out, const torch::Tensor& x, double beta,
+                    double linear_beta) {
+  check_bf16_rows(x, "x");
+  check_bf16_rows(out, "out");
+  const int64_t rows = x.size(0);
+  const int64_t d = x.size(1) / 2;
+  TORCH_CHECK(x.size(1) == 2 * d && out.size(0) == rows && out.size(1) == d);
+  TORCH_CHECK(d % 32 == 0, "situ_fast_bf16: d % 32 == 0");
+  if (rows == 0) return;
+  const bool clamp = linear_beta > 0.0;
+  const float half = 0.5f * (float)beta;
+  const int a_pow =
+      (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
+  // Column chunks of at most 256 threads (32 columns each): whole-row CTAs
+  // (the dense SiTU is 33792 wide) leave SMs under-occupied or exceed 1024.
+  int threads = (int)(d / 32);
+  for (int t = 256; t >= 1; --t)
+    if ((d / 32) % t == 0) { threads = t; break; }
+  const dim3 grid((unsigned)rows, (unsigned)((d / 32) / threads));
+  auto stream = c10::cuda::getCurrentCUDAStream();
+#define BF16_LAUNCH(P, C)                                                      \
+  situ4_bf16_row_kernel<P, C><<<grid, (unsigned)threads, 0, stream>>>(          \
+      reinterpret_cast<uint16_t*>(out.data_ptr()),                             \
+      reinterpret_cast<const uint16_t*>(x.data_ptr()), (int)d, x.stride(0),    \
+      out.stride(0), (float)beta, (float)linear_beta)
+  switch (a_pow * 2 + (clamp ? 1 : 0)) {
+    case 0: BF16_LAUNCH(0, false); break;
+    case 1: BF16_LAUNCH(0, true); break;
+    case 2: BF16_LAUNCH(1, false); break;
+    case 3: BF16_LAUNCH(1, true); break;
+    case 4: BF16_LAUNCH(2, false); break;
+    case 5: BF16_LAUNCH(2, true); break;
+    case 6: BF16_LAUNCH(3, false); break;
+    case 7: BF16_LAUNCH(3, true); break;
+    case 8: BF16_LAUNCH(4, false); break;
+    default: BF16_LAUNCH(4, true); break;
+  }
+#undef BF16_LAUNCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
@@ -770,6 +866,8 @@ void rms_norm_quant(torch::Tensor& q, torch::Tensor& sf,
                     const c10::optional<torch::Tensor>& y,
                     const torch::Tensor& x, const torch::Tensor& w, double eps,
                     int64_t sf_col_base, int64_t padded_cols);
+void situ_fast_bf16(torch::Tensor& out, const torch::Tensor& x, double beta,
+                    double linear_beta);
 """
 
 _lock = threading.Lock()
@@ -796,7 +894,7 @@ def _module():
                 name=f"k3_mxfp8_act_{tag}",
                 cpp_sources=_CPP_SRC,
                 cuda_sources=_CUDA_SRC,
-                functions=["act_quant", "rms_norm_quant"],
+                functions=["act_quant", "rms_norm_quant", "situ_fast_bf16"],
                 extra_cuda_cflags=["-O3"],
                 build_directory=build,
                 verbose=False,
@@ -927,6 +1025,29 @@ def situ_and_mul_quantize_fast(
     return _act_quant(
         4, x, x.shape[-1] // 2, beta=beta, linear_beta=linear_beta, out=out, col=col
     )
+
+
+def situ_fast_bf16_supported(d: int) -> bool:
+    return d % 32 == 0
+
+
+def situ_and_mul_fast_bf16(
+    x: torch.Tensor, beta: float, linear_beta: float | None
+) -> torch.Tensor:
+    """``situ_and_mul(x)`` ([..., 2d] -> [..., d], BF16) in the routed experts'
+    SiTU form: the BF16 values ``situ_and_mul_quantize_fast`` quantizes."""
+    d = x.shape[-1] // 2
+    x2 = x.reshape(-1, x.shape[-1])
+    out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+    if x2.shape[0] == 0:
+        return out
+    _module().situ_fast_bf16(
+        out.view(-1, d),
+        x2,
+        float(beta),
+        -1.0 if linear_beta is None else float(linear_beta),
+    )
+    return out
 
 
 def silu_and_mul_quantize(
