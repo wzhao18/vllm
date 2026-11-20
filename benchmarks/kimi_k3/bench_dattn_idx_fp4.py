@@ -59,12 +59,19 @@ def main():
     ap.add_argument("--q", type=int, default=4)
     ap.add_argument("--uniform", action="store_true")
     ap.add_argument("--contig", action="store_true")
+    ap.add_argument("--ncu-nomath", action="store_true", help="one no-math launch only")
     a = ap.parse_args()
     for reqs in [int(x) for x in a.reqs.split(",")]:
         q, rows = a.q, reqs * a.q
         args, ref, lens = _case(reqs, q, a.ctx, 0, lo=a.ctx - 1 if a.uniform else None,
                                 contig=a.contig)
         op = Fp4IndexLogits(rows, q, "cuda")
+        if a.ncu_nomath:  # profiler target: the data path alone, launched twice
+            op.epi_math = False
+            for _ in range(2):
+                op(**args)
+            torch.cuda.synchronize()
+            continue
         got = op(**args)
         _check(got, ref, lens, args, q)
         kv = kv_cache_as_quant_view(args["kv_cache"], 128, True)
