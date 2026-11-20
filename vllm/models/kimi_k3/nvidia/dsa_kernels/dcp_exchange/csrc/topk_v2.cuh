@@ -1058,6 +1058,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         // every rank fast (no saturated window) on this row: the windows only missed tau
         uint32_t r2sat = 0;
         for (int r = 0; r < W; ++r) r2sat |= (rx[r * kV2Msg] >> 16) & 1u;
+        if (r2sat) V2STAT(8);
+        if (!r2sat && row >= kR2Rows) V2STAT(9);
         if (!r2sat && row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
         __shared__ int s_r2[6];  // 0 LB, 1 tie count, 2 tau, 3 keys > tau, 4 quota, 5 bad
@@ -1099,6 +1101,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         V2DBG(6);
         const bool lbok = s_r2[0] >= 0;  // the same on every rank
+        if (!lbok) V2STAT(10);
         if (lbok) {
           const uint32_t LB = (uint32_t)max(s_r2[0], 1);
           const int64_t r2row = p.off_r2 + ((int64_t)(par * min(p.cap, kR2Rows) + row) * W) * kR2W;
@@ -1222,6 +1225,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           V2DBG(11);
           bool bad = false;
           for (int r = 0; r < W; ++r) bad |= s_r2n[r] < 0;
+          if (bad) V2STAT(11);
           if (!bad) {
             // tau: the K-th largest key of the union (two 8-bit levels)
             uint32_t* const h = hist;
@@ -1253,7 +1257,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             }
             V2DBG(13);
             const int tau2 = s_r2[2], need2 = K - s_r2[3];
-            if (tau2 < 0) bad = true;
+            if (tau2 < 0) { bad = true; V2STAT(12); }
             if (!bad) {
               // every rank's ties at tau by global id; this rank's quota
               auto gid_r = [&](int r, uint32_t pos) -> uint32_t {
@@ -1270,6 +1274,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               __syncthreads();
               const int mt = s_r2[1];
               bad = mt > kCoarseBins || mt < need2;
+              if (bad) V2STAT(13);
               if (!bad) {
                 const uint32_t* me = rcv + p.rank * RW + 4;
                 const int nme = s_r2n[p.rank];
@@ -1329,6 +1334,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
       if (tier != 1) {  // the same on every rank: the complete body takes the row
+        V2STAT(14);
         __syncthreads();
         return 1 + ep;
       }
