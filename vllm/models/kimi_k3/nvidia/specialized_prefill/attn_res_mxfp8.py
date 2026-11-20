@@ -26,6 +26,7 @@ import torch
 
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.models.kimi_k3.nvidia.ops.stable_build import stable_copy
 from vllm.platforms import current_platform
 
 HIDDEN = 7168
@@ -51,12 +52,16 @@ def _module(chunk_depth: int = 2):
                 h.update(fh.read())
             h.update(f"{torch.__version__} {torch.version.cuda} {chunk_depth}".encode())
             tag = h.hexdigest()[:16]
-            build = os.path.join(envs.VLLM_CACHE_ROOT, "k31pf_attn_res_mxfp8", tag)
+            build = os.path.join(
+                envs.VLLM_CACHE_ROOT, "k31pf_attn_res_mxfp8", tag + "-s"
+            )
             os.makedirs(build, exist_ok=True)
+            name = os.path.basename(_SRC)
+            src = stable_copy(build, os.path.dirname(_SRC), [name])
             # Same flags as the native kernel (CMakeLists.txt KIMI_K3_ATTN_RES).
             mod = load(
                 name=f"k31pf_attn_res_mxfp8_{tag}",
-                sources=[_SRC],
+                sources=[os.path.join(src, name)],
                 extra_cflags=["-O3"],
                 extra_cuda_cflags=[
                     "-O3",
