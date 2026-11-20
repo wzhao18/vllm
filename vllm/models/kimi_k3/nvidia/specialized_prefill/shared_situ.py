@@ -120,6 +120,29 @@ class PrefillSharedSitu:
         if rows < mxfp8_act.SITU_FAST_MIN_ROWS:
             return None
         out = mxfp8_act.Mxfp8Buffer(rows, self.inter, x_fp8.device)
+        # DIAGNOSTIC (capture branch, never landed): dump the first eager
+        # prefill call's operands of every layer for the power-capped bench.
+        if rows >= 16384 and not torch.cuda.is_current_stream_capturing():
+            import os
+
+            d = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-GEMM-B3/capture"
+            rank = int(os.environ.get("RANK", "0"))
+            n = getattr(PrefillSharedSitu, "_ncap", 0)
+            if rank == 0 and n < 4:
+                PrefillSharedSitu._ncap = n + 1
+                os.makedirs(d, exist_ok=True)
+                w, s = self._weight_rows()
+                torch.save(
+                    {
+                        "x": x_fp8[:16384].cpu(),
+                        "sx": x_scale.view(torch.uint8).reshape(-1)[
+                            : 16384 * x_fp8.shape[1] // 32
+                        ].cpu(),
+                        "w": w.cpu(),
+                        "sw": s.view(torch.uint8).reshape(-1).cpu(),
+                    },
+                    f"{d}/r{rank}_c{n}_m{rows}.pt",
+                )
         gemm(x_fp8, x_scale.view(torch.uint8).reshape(-1), out)
         return out.activation()
 
