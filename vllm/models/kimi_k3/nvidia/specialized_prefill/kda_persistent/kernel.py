@@ -197,6 +197,8 @@ def _tanhf(x):
 class PkdStorage:
     mbar: cute.struct.MemRange[cutlass.Int64, 99]
     tmem_holding: cutlass.Int32
+    # per-window Gram release counters (4 warp arrivals per use)
+    g_rel: cute.struct.MemRange[cutlass.Int32, 2]
 
 
 @cute.kernel
@@ -475,8 +477,12 @@ def _pkd(
 
     # ---- mbarrier init ----
     mb = storage.mbar.data_ptr()
+    g_rel = storage.g_rel.data_ptr()
     if warp == 0:
         with cute.arch.elect_one():
+            g_rel_t = cute.make_tensor(g_rel, cute.make_layout(GRAM_WINDOWS))
+            for i in cutlass.range_constexpr(GRAM_WINDOWS):
+                g_rel_t[i] = cutlass.Int32(0)
             for i in cutlass.range_constexpr(STAGES):
                 cute.arch.mbarrier_init(mb + MB_QK + i, 1)
                 cute.arch.mbarrier_init(mb + MB_GRAW + i, 1)
@@ -562,7 +568,8 @@ def _pkd(
         cute.recast_ptr(tmem_ptr + 192, dtype=cutlass.Float32), d4b_base.layout
     )
     mst_base = acc32_base  # [128,32] column-window template
-    NLANE = 1 + PHANTOM_
+    # PHANTOM_ 1: lockstep second lane (chain SIMT + MMA); 2: MMAs only
+    NLANE = 2 if PHANTOM_ == 1 else 1
     t_inp_b = cute.make_tensor(
         cute.recast_ptr(tmem_ptr + LANE_COLS, dtype=cutlass.BFloat16), inp_base.layout
     )
@@ -1702,9 +1709,10 @@ def _pkd(
                     seq_len = cute.arch.make_warp_uniform(sptn[k0 + kx])
                     t_tiles = (seq_len + C - 1) // C
                     for _t in cutlass.range(t_tiles):
-                        if cutlass.const_expr(PHANTOM_ == 1):
+                        if cutlass.const_expr(PHANTOM_ >= 1):
                             for L in cutlass.range_constexpr(2):
-                                inp_bars[L].arrive_and_wait()
+                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                    inp_bars[L].arrive_and_wait()
                                 mma_1.set(tcgen05.Field.ACCUMULATE, False)
                                 for kb in cutlass.range_constexpr(D // 16):
                                     cute.gemm(
@@ -1718,7 +1726,8 @@ def _pkd(
                                 with cute.arch.elect_one():
                                     tcgen05.commit(mb + [MB_OOUT, MB_OOUT_B][L] + csm)
                             for L in cutlass.range_constexpr(2):
-                                cute.arch.mbarrier_wait(mb + [MB_OEMPTY, MB_OEMPTY_B][L], pm_oe)
+                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                    cute.arch.mbarrier_wait(mb + [MB_OEMPTY, MB_OEMPTY_B][L], pm_oe)
                                 mma_1.set(tcgen05.Field.ACCUMULATE, False)
                                 for kb in cutlass.range_constexpr(D // 16):
                                     cute.gemm(
@@ -1732,7 +1741,8 @@ def _pkd(
                             with cute.arch.elect_one():
                                 tcgen05.commit(mb + MB_RFREE + csm)
                             for L in cutlass.range_constexpr(2):
-                                u_bars[L].arrive_and_wait()
+                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                    u_bars[L].arrive_and_wait()
                                 mma_3.set(tcgen05.Field.ACCUMULATE, False)
                                 for kb in cutlass.range_constexpr(C // 16):
                                     cute.gemm(
@@ -1746,7 +1756,8 @@ def _pkd(
                                 with cute.arch.elect_one():
                                     tcgen05.commit(mb + [MB_U2ACC, MB_U2ACC_B][L] + csm)
                             for L in cutlass.range_constexpr(2):
-                                u2_bars[L].arrive_and_wait()
+                                if cutlass.const_expr(L == 0 or PHANTOM_ == 1):
+                                    u2_bars[L].arrive_and_wait()
                                 mma_4a.set(tcgen05.Field.ACCUMULATE, True)
                                 for kb in cutlass.range_constexpr(C // 16):
                                     cute.gemm(
@@ -2485,10 +2496,21 @@ def _pkd(
                     if cutlass.const_expr(GRAM_W9_ == 0):
                         # Warp 2 balances Gram issue against warp 0's solve path.
                         if plw == 2:
-                            # item gi waits for item gi - 2 to release window gw
-                            cute.arch.mbarrier_wait(
-                                mb + MB_GFREE + gw, ((gi >> 1) & 1) ^ 1
+                            # item gi waits until items gi - 2, gi - 4, ... have
+                            # released window gw (monotone counter: five
+                            # instances run out of order, so mbarrier parity
+                            # would alias)
+                            gneed = (gi >> 1) * 4
+                            gcur = cute.arch.atomic_add(
+                                g_rel + gw, cutlass.Int32(0), sem="acquire", scope="cta"
                             )
+                            while gcur < gneed:
+                                gcur = cute.arch.atomic_add(
+                                    g_rel + gw,
+                                    cutlass.Int32(0),
+                                    sem="acquire",
+                                    scope="cta",
+                                )
                             _tc_fence_after_sync()
                             mma_g.set(tcgen05.Field.ACCUMULATE, False)
                             for kb in cutlass.range_constexpr(D // 16):
@@ -2507,7 +2529,9 @@ def _pkd(
                     cute.arch.fence_view_async_tmem_load()
                     _tc_fence_before_sync()
                     with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(mb + MB_GFREE + gw)
+                        cute.arch.atomic_add(
+                            g_rel + gw, cutlass.Int32(1), sem="release", scope="cta"
+                        )
                     if plw < 2:
                         for e in cutlass.range_constexpr(cute.size(r_gram)):
                             crd = gram_id[e]

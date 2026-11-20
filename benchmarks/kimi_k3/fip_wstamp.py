@@ -72,7 +72,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lens", default="5461,5461,5462")
     ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--phantom", type=int, default=0)
     args = ap.parse_args()
+    kp._PHANTOM = args.phantom
     dev = torch.device("cuda")
     lens = [int(s) for s in args.lens.split(",")]
     x = make_inputs(lens, dev)
