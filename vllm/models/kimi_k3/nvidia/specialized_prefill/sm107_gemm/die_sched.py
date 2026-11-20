@@ -151,22 +151,29 @@ def produce(
         die = _ld_global_u8(die_map + Int64(_smid()))
     die = cute.arch.shuffle_sync(die, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
     ps = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, STAGES)
+    half = n_tiles // 2
+    own = ctr + Int64(4) * Int64(die)
+    other = ctr + Int64(4) * Int64(1 - die)
     entry = Int32(0)
     while entry >= 0:
         sched_pipeline.producer_acquire(ps)
         entry = Int32(-1)
         if lane == 0:
-            t = _atom_add(ctr, Int32(1))
-            if t < n_tiles:
-                if die == 0:
-                    entry = _atom_add(ctr + Int64(4), Int32(1))
-                else:
-                    entry = n_tiles - 1 - _atom_add(ctr + Int64(8), Int32(1))
+            # Both dies walk their halves in the same M order (the A rows in
+            # flight are shared through L2); a die that runs out continues in
+            # the other half.
+            j = _atom_add(own, Int32(1))
+            if j < half:
+                entry = die * half + j
             else:
-                done = _atom_add(ctr + Int64(12), Int32(1))
-                if done == num_clusters - 1:
-                    for c in cutlass.range_constexpr(4):
-                        _atom_exch(ctr + Int64(4 * c), Int32(0))
+                j2 = _atom_add(other, Int32(1))
+                if j2 < half:
+                    entry = (1 - die) * half + j2
+                else:
+                    done = _atom_add(ctr + Int64(8), Int32(1))
+                    if done == num_clusters - 1:
+                        for c in cutlass.range_constexpr(3):
+                            _atom_exch(ctr + Int64(4 * c), Int32(0))
         entry = cute.arch.shuffle_sync(entry, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
         full = sched_pipeline.sync_object_full.get_barrier(ps.index)
         if lane < cluster_size:
@@ -203,7 +210,7 @@ def consume(
     j = e
     n_off = Int32(0)
     if e >= half:
-        j = n_tiles - 1 - e
+        j = e - half
         n_off = n_half
     mt = j // n_half
     nt = n_off + j % n_half

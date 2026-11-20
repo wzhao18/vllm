@@ -1848,6 +1848,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                             tAsA[(None, ab_producer_state.index)],
                             tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                             mcast_mask=a_full_mcast_mask,
+                            cache_policy=cutlass.Int64(0x12F0000000000000) if getattr(self, "l2_a_evict_first", False) else None,
                         )
                         if cutlass.const_expr(self.tma_b_warp_id is None):
                             cute.copy(
@@ -1856,6 +1857,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 tBsB[(None, ab_producer_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                                 mcast_mask=b_full_mcast_mask,
+                                cache_policy=cutlass.Int64(0x14F0000000000000) if getattr(self, "l2_b_evict_last", False) else None,
                             )
                         cute.copy(
                             tma_atom_sfa,
@@ -2348,6 +2350,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         getattr(self, "epi_tanh", False),
                         getattr(self, "epi_roll", 0),
                         getattr(self, "epi_store", 0),
+                        l2_store_evict_first=getattr(self, "l2_store_evict_first", False),
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
