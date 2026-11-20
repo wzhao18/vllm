@@ -58,10 +58,14 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
     ),
     # KDA o_proj: GEMM-EX1 r11 (us/call scaled_mm / pre): R128 5.37 / 5.41, R256 6.63 /
     # 6.38, R384 6.75 / 6.69
+    # every smem stage's weight k-block is issued before griddepcontrol.wait (12 / 12 / 9
+    # stages): KdaFlow's ragged tail leaves kda_o CTAs resident ~1.3-2.9 us before the
+    # wait (D-GEMM R5-8), and a pre-staged weight byte saves ~2.5 L2 bytes of the SM's
+    # in-flight budget after it (D-GEMM R6-3)
     (7168, 3072): (
-        (1, 128, ((128, 64), (1, 1), False, 128), 4),
-        (129, 256, ((256, 128), (2, 1), False, 256), 4),
-        (257, 512, ((128, 128), (1, 1), False, 128), 4),
+        (1, 128, ((128, 64), (1, 1), False, 128), 12),
+        (129, 256, ((256, 128), (2, 1), False, 256), 12),
+        (257, 512, ((128, 128), (1, 1), False, 128), 9),
     ),
 }
 
