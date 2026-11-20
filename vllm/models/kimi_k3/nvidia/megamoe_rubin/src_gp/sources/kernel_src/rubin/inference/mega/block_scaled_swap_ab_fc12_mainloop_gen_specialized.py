@@ -1177,14 +1177,20 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
         global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
+        _dms_c00 = read_clock64()
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
+        _dms_w = read_clock64() - _dms_c00
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
+            _dms_c0 = read_clock64()
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
+            _dms_w = _dms_w + (read_clock64() - _dms_c0)
             tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
             stage_index = ab_pipeline_state.index
             ab_pipeline_state.advance()
             if k_tile_idx + 1 < k_tile_count:
+                _dms_c1 = read_clock64()
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
+                _dms_w = _dms_w + (read_clock64() - _dms_c1)
             cute.copy(
                 _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask),
                 global_a_slice[(None, k_tile_idx)],
@@ -1195,6 +1201,11 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 global_sfa_slice[(None, k_tile_idx)],
                 partitioned_smem_sfa[(None, stage_index)],
             )
+        DG.put_val_dyn(
+            Int32(DG.S_TAW0) + (self._dms_cur & Int32(15)),
+            ((read_clock64() - _dms_c00) << Int64(32)) | _dms_w,
+            DG.lane0() * Int32(self._dms_cur < Int32(16)),
+        )
         return ab_pipeline_state
 
     @cute.jit
@@ -1279,6 +1290,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             if _dms_u < Int32(16):
                 DG.put_gt_dyn(Int32(DG.S_TAU0) + _dms_u)
                 DG.put_val_dyn(Int32(DG.S_TAPH0) + _dms_u, cutlass.Int64(phase) | (cutlass.Int64(work_tile.expert_idx & Int32(0xFFFF)) << cutlass.Int64(8)))
+            self._dms_cur = _dms_u
             _dms_u = _dms_u + Int32(1)
             # The fixed FC1 / FC2 range names the iket summaries key on (shared tiles count with their GEMM).
             if self._is_fc1_gemm(phase):
@@ -1874,6 +1886,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
+                _dms_w = _dms_w + (read_clock64() - _dms_c1)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
@@ -1930,6 +1943,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 next_full_status = cutlass.Boolean(1)
                 if k_tile_idx + 1 < k_tile_count:
                     next_full_status = ab_pipeline.consumer_try_wait(next_ab_pipeline_state)
+                _dms_w = _dms_w + (read_clock64() - _dms_c1)
 
                 s2t_stage_coord = (None, None, None, None, ab_pipeline_state.index)
                 cute.copy(tiled_copy_sfa, partitioned_smem_sfa[s2t_stage_coord], partitioned_tmem_sfa)
