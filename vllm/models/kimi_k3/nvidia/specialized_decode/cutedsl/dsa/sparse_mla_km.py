@@ -364,10 +364,6 @@ class SparseMlaDecodeKM:
                     ld_global_s32(valid + Int64(cta + lane * self.grid) * Int64(4))))
         tc_fence_before()
         cute.arch.sync_threads()
-        # Nothing after this kernel waits on its CTAs to be dispatched: the DSA
-        # DcpValue (PDL) launches now, takes the SMs this grid leaves idle and
-        # loads its W_UV there before its griddepcontrol_wait.
-        cute.arch.griddepcontrol_launch_dependents()
         tc_fence_after()
         if tid == 0:
             self.mark(stamp, cta, 1)
