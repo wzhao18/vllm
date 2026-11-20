@@ -133,6 +133,15 @@ def query_norm_rsqrt(total: Float32, eps: Float32):
     return code, "=f,f,f", (total, eps)
 
 
+@asm(Float32, pure=True)
+def kv_norm_rsqrt(total: Float32, eps: Float32):
+    """rsqrtf(total / 512 + eps): the stock rms_norm_kernel's scale of a 512-wide
+    row (``rsqrt.approx.f32``, as rsqrtf compiles)."""
+    code = "{ .reg .f32 mean; div.rn.f32 mean,$1,0f44000000; "
+    code += "add.f32 mean,mean,$2; rsqrt.approx.f32 $0,mean; }"
+    return code, "=f,f,f", (total, eps)
+
+
 @asm(Float64, pure=True)
 def reciprocal64(value: Float64):
     step = "fma.rn.f64 e,n,r,0d3ff0000000000000; fma.rn.f64 {},r,e,r; "

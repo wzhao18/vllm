@@ -20,15 +20,18 @@ from functools import cache
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32
+from cutlass import BFloat16, Float32
 
 from ..common.policy import batch_table
 from ..common.primitives import (
     alloc,
     at,
     bf16x2,
+    div_rn,
     fma,
     fma2,
+    fp8_bits,
+    kv_norm_rsqrt,
     launch,
     load_bf16x8,
     load_volatile,
@@ -129,10 +132,18 @@ def index_stream(device_index):
 
 class QueryNorm:
     """The q_a RMSNorm of ``batch`` rows of the packed projection -> q_c [B, 1536]
-    BF16, exactly as MlaQuery (``heads``) computes it for the same batch."""
+    BF16, exactly as MlaQuery (``heads``) computes it for the same batch.
 
-    def __init__(self, heads: int, batch: int):
-        self.batch = batch
+    ``insert``: the same launch also inserts each row's MLA KV into the per-tensor
+    FP8 cache (local_query: in place of the stock rms_norm + concat_and_cache_mla
+    pair), as the stock ops compute it: kv_a RMSNorm to BF16 (``x * rsqrtf(mean +
+    eps) * w``, the sum's order aside), then that row and k_pe divided by k_scale,
+    E4M3 satfinite, round to nearest; rows whose slot is negative are skipped. Extra
+    arguments (after eps): the kv_a norm weight [512], the cache [blocks, block
+    size, 576] bytes, the slots [B] int64 and k_scale [1] FP32."""
+
+    def __init__(self, heads: int, batch: int, insert: bool = False):
+        self.batch, self.insert = batch, insert
         self.wide = batch >= TILED_FROM[heads]
         self.grid = -(-batch // 8) if self.wide else batch
 
@@ -140,10 +151,42 @@ class QueryNorm:
     def __call__(self, *args):
         launch(self.tiled if self.wide else self.kernel, args, self.grid, 256)
 
+    @cute.jit
+    def insert_kv(self, args, row, lane):
+        """One warp: row ``row``'s KV insert (``insert``; lane owns 16 latent
+        columns, lanes 0-7 also 8 k_pe columns)."""
+        qkv, eps, w_kva, cache, slots, k_scale = args[0], args[3], *args[4:8]
+        slot = slots[row]
+        if slot >= 0:
+            xv = cute.make_rmem_tensor(16, Float32)
+            total = Float32(0)
+            for h in cutlass.range_constexpr(2):
+                values = load_bf16x8(
+                    at(qkv, row, 1536 + lane * 16 + h * 8), mutable=True
+                )
+                for i in cutlass.range_constexpr(8):
+                    xv[h * 8 + i] = values[i]
+                    total = fma(values[i], values[i], total)
+            total = warp_sum(total)
+            rr = kv_norm_rsqrt(total, eps)
+            ks = k_scale[0]
+            page, offset = slot // cache.shape[1], slot % cache.shape[1]
+            for h in cutlass.range_constexpr(2):
+                weights = load_bf16x8(w_kva.iterator + lane * 16 + h * 8)
+                for i in cutlass.range_constexpr(8):
+                    normed = Float32(BFloat16(xv[h * 8 + i] * rr * weights[i]))
+                    col = lane * 16 + h * 8 + i
+                    cache[page, offset, col] = fp8_bits(div_rn(normed, ks))
+            if lane < 8:
+                pe = load_bf16x8(at(qkv, row, 2048 + lane * 8), mutable=True)
+                for i in cutlass.range_constexpr(8):
+                    col = 512 + lane * 8 + i
+                    cache[page, offset, col] = fp8_bits(div_rn(pe[i], ks))
+
     @cute.kernel
     def kernel(self, args):
         """One row per CTA: 8 columns per thread, MlaQuery.kernel's FMA order."""
-        qkv, w_qa, qc, eps = args
+        qkv, w_qa, qc, eps = args[:4]
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
@@ -173,11 +216,14 @@ class QueryNorm:
                 for i in range(0, 8, 2)
             ]
             store_words(at(qc, row, tid * 8), tuple(words))
+        if cutlass.const_expr(self.insert):
+            if warp == 6:  # idle in the q_a norm (192 threads)
+                self.insert_kv(args, row, lane)
 
     @cute.kernel
     def tiled(self, args):
         """One row per warp: 48 columns per lane, MlaQuery.tiled's packed pairs."""
-        qkv, w_qa, qc, eps = args
+        qkv, w_qa, qc, eps = args[:4]
         tid, _, _ = cute.arch.thread_idx()
         tile, _, _ = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
@@ -208,6 +254,8 @@ class QueryNorm:
                     y = mul2(mul2(x, (rr, rr)), (gamma[e], gamma[e + 1]))
                     words.append(bf16x2(*y))
                 store_words(at(qc, row, 256 * i + 8 * lane), tuple(words))
+            if cutlass.const_expr(self.insert):
+                self.insert_kv(args, row, lane)
 
 
 class QueryWait:

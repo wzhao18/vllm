@@ -711,12 +711,17 @@ class PreparedDsa:
         reads them), then on the query side stream every gathered head's FP8 query
         and this rank's KV insert. Returns what makes the sparse core wait for it."""
         stage, batch = self.query_stage, projected.shape[0]
-        stage.run_norm(self.overlap_kernels[batch, q][2], projected)
+        # The same QueryNorm launch also normalizes kv_a and inserts this rank's
+        # KV rows (stock rms_norm + concat_and_cache_mla math, one launch).
+        u8 = cache.view(torch.uint8)
+        layout = tuple(u8.shape), tuple(u8.stride()), u8.dtype
+        norm = compile_norm(batch, self.heads, self.pitches[batch], layout)
+        stage.run_norm(norm, projected, (cache, slots, self.local.k_scale))
         main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
         side.wait_stream(main)
         with torch.cuda.stream(side):
-            self.local.run(stage.qc[:batch], projected, cache, slots)
+            self.local.run(stage.qc[:batch], projected)
         return lambda: torch.cuda.current_stream(self.device).wait_stream(side)
 
     def run_query(self, projected, cache, slots, q, publish=(), poll=True):

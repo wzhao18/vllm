@@ -116,17 +116,13 @@ class LocalQuery:
     def query(self):
         return self.buffers.query
 
-    def run(self, qc, projected, cache, slots):
+    def run(self, qc, projected):
         """``qc`` [R, 1536] the normalized q_a rows, ``projected`` [R, pitch] the
         packed in-projection rows -> the FP8 query rows ``query[:R]`` of every
-        gathered head, and this rank's KV rows inserted at ``slots``."""
-        from vllm import _custom_ops as ops
-
+        gathered head. This rank's KV rows are inserted by the QueryNorm launch
+        that wrote ``qc`` (``overlap.QueryNorm`` insert: stock rms_norm(kv_a) +
+        concat_and_cache_mla math)."""
         rows, b = qc.shape[0], self.buffers
         q = self.projection.run(qc, b.q[:rows])
         query_uk(q, self.uk_t, self.q_scale, b.query[:rows])
-        kv = b.kv[:rows]
-        ops.rms_norm(kv, projected[:, 1536:2048], self.kv_norm, self.kv_eps)
-        k_pe = projected[:, 2048:2112]
-        ops.concat_and_cache_mla(kv, k_pe, cache, slots[:rows], "fp8", self.k_scale)
         return b.query[:rows]

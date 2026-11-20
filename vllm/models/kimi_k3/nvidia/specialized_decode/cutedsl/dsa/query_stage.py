@@ -103,14 +103,26 @@ def compile_query(
 
 
 @cache
-def compile_norm(batch, heads, pitch):
-    """QueryNorm of one batch of rows (shared by every DSA layer: no state)."""
+def compile_norm(batch, heads, pitch, cache=None):
+    """QueryNorm of one batch of rows (shared by every DSA layer: no state).
+    ``cache``: the per-tensor FP8 MLA cache's (shape, stride, dtype) as uint8 bytes:
+    the launch also inserts the rows' KV (local_query)."""
+    insert: tuple = ()
+    if cache is not None:
+        shape, stride, _ = cache
+        insert = (
+            fake((512,), (1,)),
+            fake(shape, stride, torch.uint8),
+            fake((batch,), (1,), torch.int64, 8),
+            fake((1,), (1,), torch.float32, 4),
+        )
     return cute.compile(
-        QueryNorm(heads, batch),
+        QueryNorm(heads, batch, insert=cache is not None),
         fake((batch, pitch), (pitch, 1)),
         fake((1536,), (1,)),
         fake((batch, 1536), (1536, 1)),
         cutlass.Float32(1e-6),
+        *insert,
         make_fake_stream(),
     )
 
@@ -260,11 +272,18 @@ class QueryStage:
         query, qc = to_cute(self.query[:batch]), to_cute(self.qc[:batch])
         kernel(*q_args, query, qc, *publish, s)
 
-    def run_norm(self, kernel, projected):
-        """QueryNorm: the q_c rows of ``projected`` (query overlap)."""
+    def run_norm(self, kernel, projected, insert=()):
+        """QueryNorm: the q_c rows of ``projected`` (query overlap). ``insert``:
+        (cache, slots, k_scale) of a kernel compiled with the KV insert."""
         batch, s = projected.shape[0], stream(self.device)
         qnorm = self.views[0]
-        kernel(to_cute(projected), qnorm, to_cute(self.qc[:batch]), self.eps, s)
+        extra: tuple = ()
+        if insert:
+            cache, slots, k_scale = insert
+            extra = (self.views[1], to_cute(cache.view(torch.uint8)))
+            extra += (to_cute(slots[:batch], 8), to_cute(k_scale, 4))
+        args = to_cute(projected), qnorm, to_cute(self.qc[:batch]), self.eps
+        kernel(*args, *extra, s)
 
     def run_front(self, kernel, projected, index_slots, normalized=False):
         """The fused index front: the FP8 indexer query and head weights straight
