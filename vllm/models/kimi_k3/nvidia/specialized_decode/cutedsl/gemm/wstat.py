@@ -30,7 +30,7 @@ import torch
 _CPP_SRC = r"""
 #include <torch/extension.h>
 void wstat_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& w, int64_t n, int64_t C,
-                int64_t NWS, int64_t NXS, int64_t NW, int64_t XL, int64_t KB);
+                int64_t NWS, int64_t NXS, int64_t NW, int64_t XL, int64_t KB, int64_t sleep_ns);
 int64_t wstat_smem_optin();
 void wstat_host(int64_t iters, int64_t ctas, torch::Tensor& sink);
 """
@@ -44,7 +44,7 @@ _CUDA_SRC = r"""
 #include <cstdint>
 
 struct P {
-  int N, K, T, C, NWS, NXS, NW, XL, KB, RT, KBT, packed;
+  int N, K, T, C, NWS, NXS, NW, XL, KB, RT, KBT, packed, sleep_ns;
   unsigned idesc, tcols, x_off, w_off;
 };
 
@@ -55,6 +55,18 @@ __device__ __forceinline__ void mb_init(uint32_t b, unsigned c) {
 __device__ __forceinline__ void mb_wait(uint32_t b, unsigned ph) {
   asm volatile("{.reg .pred P; W: mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1; @!P bra W;}"
                :: "r"(b), "r"(ph) : "memory");
+}
+// Waits that can span the predecessor's whole run (weight producers on a full ring, the MMA warp on
+// the first activation stage) back off with nanosleep so the co-resident predecessor keeps its issue slots.
+__device__ __forceinline__ void mb_wait_bo(uint32_t b, unsigned ph, unsigned ns) {
+  uint32_t ok;
+  asm volatile("{.reg .pred P; mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2; selp.u32 %0, 1, 0, P;}"
+               : "=r"(ok) : "r"(b), "r"(ph) : "memory");
+  while (!ok) {
+    if (ns) __nanosleep(ns);
+    asm volatile("{.reg .pred P; mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2; selp.u32 %0, 1, 0, P;}"
+                 : "=r"(ok) : "r"(b), "r"(ph) : "memory");
+  }
 }
 __device__ __forceinline__ uint32_t uni(uint32_t v) { return __shfl_sync(0xffffffffu, v, 0); }
 __device__ __forceinline__ uint64_t sdesc(uint32_t saddr) {  // K-major SW128, SBO 1024 B, 15-bit address
@@ -141,7 +153,7 @@ __global__ void __launch_bounds__(512, 1) wstat_k(const __grid_constant__ CUtens
   if (warp >= ww0) {  // W producers: never wait on the predecessor
     for (int i = warp - ww0; i < nst; i += p.NW) {
       const int s = i % p.NWS, b0 = kb0 + i * KB, nb = min(KB, kb1 - b0);
-      if (i >= p.NWS) mb_wait(sa(&wempty[s]), ((i / p.NWS) - 1) & 1);
+      if (i >= p.NWS) mb_wait_bo(sa(&wempty[s]), ((i / p.NWS) - 1) & 1, p.sleep_ns);
       const uint32_t dst = uni(sa(sm + p.w_off + (size_t)s * WB)), bar = uni(sa(&wfull[s]));
       if (p.packed)  // the tile image: one contiguous bulk copy per stage
         bulk_e(dst, wp + ((size_t)rt * p.KBT + b0) * WB1, nb * WB1, bar);
@@ -170,7 +182,7 @@ __global__ void __launch_bounds__(512, 1) wstat_k(const __grid_constant__ CUtens
     for (int i = 0; i < nst; ++i) {
       const int sw = i % p.NWS, sx = i % p.NXS;
       mb_wait(sa(&wfull[sw]), (i / p.NWS) & 1);
-      mb_wait(sa(&xfull[sx]), (i / p.NXS) & 1);
+      mb_wait_bo(sa(&xfull[sx]), (i / p.NXS) & 1, i == 0 ? p.sleep_ns : 0u);
       asm volatile("tcgen05.fence::after_thread_sync;");
       // warp-uniform descriptor bases once per stage, constant offsets per MMA (no R2UR waterfall)
       const uint64_t ad = sdesc(uni(sa(sm + p.w_off + (size_t)sw * WB)));
@@ -266,7 +278,7 @@ typedef void (*KF)(CUtensorMap, CUtensorMap, const uint8_t*, __nv_bfloat16*, P);
 KF pick(int T, int C, int KB) {
 #define C_(t, kb) if (T == t && KB == kb) return C == 1 ? wstat_k<t, 1, kb> : C == 2 ? wstat_k<t, 2, kb> : \
     C == 4 ? wstat_k<t, 4, kb> : C == 6 ? wstat_k<t, 6, kb> : nullptr;
-  C_(32, 1) C_(32, 2) C_(64, 1) C_(64, 2) C_(96, 1) C_(96, 2) C_(128, 1) C_(128, 2)
+  C_(32, 1) C_(32, 2) C_(32, 4) C_(64, 1) C_(64, 2) C_(64, 4) C_(96, 1) C_(96, 2) C_(128, 1) C_(128, 2)
 #undef C_
   return nullptr;
 }
@@ -313,7 +325,7 @@ void wstat_host(int64_t iters, int64_t ctas, torch::Tensor& sink) {
 }
 
 void wstat_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& w, int64_t n, int64_t C,
-                int64_t NWS, int64_t NXS, int64_t NW, int64_t XL, int64_t KB) {
+                int64_t NWS, int64_t NXS, int64_t NW, int64_t XL, int64_t KB, int64_t sleep_ns) {
   // w: [N, K] row-major (2D TMA boxes) or the tile image [ceil(N / 128), K / 64, 128 x 64] of
   // prewait_gemm.pack_weight (one bulk copy per stage); n: the output features.
   const int T = (int)x.size(0), K = (int)x.size(1);
@@ -332,7 +344,7 @@ void wstat_gemm(torch::Tensor& out, const torch::Tensor& x, const torch::Tensor&
   TORCH_CHECK(kf, "wstat_gemm: no kernel for T=", T, " C=", C);
   P p = {};
   p.N = N; p.K = K; p.T = T; p.C = (int)C; p.NWS = (int)NWS; p.NXS = (int)NXS; p.NW = (int)NW;
-  p.XL = (int)XL; p.KB = (int)KB; p.packed = packed;
+  p.XL = (int)XL; p.KB = (int)KB; p.packed = packed; p.sleep_ns = (int)sleep_ns;
   p.RT = (N + 127) / 128; p.KBT = K / 64;
   p.idesc = (1u << 4) | (1u << 7) | (1u << 10) | ((unsigned)(T >> 3) << 17) | ((unsigned)(128 >> 4) << 24);
   unsigned tc = 32; while (tc < (unsigned)T) tc <<= 1; p.tcols = tc;
@@ -437,6 +449,6 @@ def _module():
 def gemm(out: torch.Tensor, x: torch.Tensor, w: torch.Tensor, cfg) -> torch.Tensor:
     """``out[T, N] = x @ w^T`` on config ``cfg = (C, NWS, NXS, NW, XL, KB)``: cluster K-split,
     weight / activation ring slots, weight / activation producer warps, K blocks per stage."""
-    c, nws, nxs, nw, xl, kb = cfg
-    _module().wstat_gemm(out, x, w, out.shape[1], c, nws, nxs, nw, xl, kb)
+    c, nws, nxs, nw, xl, kb, *rest = cfg
+    _module().wstat_gemm(out, x, w, out.shape[1], c, nws, nxs, nw, xl, kb, rest[0] if rest else 0)
     return out
