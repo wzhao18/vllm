@@ -97,7 +97,7 @@ SP_LOCAL_QUERY = "65-:local"
 # 384 rows 31.1 vs 34.0; trtllm-gen at 256 rows (29.2 vs 27.4). In-step (D3-32 slice,
 # 3 runs each, dattn-kmg/kmh) km wins at 384 rows (step -14 us) but not at 128 rows
 # (step +19 us although the DSA family drops 15 us), so km runs from 320 rows.
-SP_KERNELS = "320-:km"
+SP_KERNELS = "65-:km"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 
