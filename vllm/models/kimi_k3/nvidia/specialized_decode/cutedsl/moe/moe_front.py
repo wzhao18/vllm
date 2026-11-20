@@ -82,8 +82,9 @@ struct Params {
   int tiles, item_split, item_pad;  // items >= item_split start item_pad blocks later
   short smid_item[kMaxSmid];        // SM -> work item (tile * ks + split), -1: spare
   // Token slot g lives in W ring slot xslot[g] once that slot's last weight block is in
-  // TMEM: its empty barrier phase of parity xfree[g] (-1: the slot never holds weights).
+  // TMEM (its wfree barrier; xfree[g] = 0: the slot never holds weights).
   signed char xslot[kMaxNS], xfree[kMaxNS];
+  short smid_row[kMaxSmid];  // SM -> top-k row (router tiles first: no latent work)
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -303,7 +304,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   __shared__ float s_bias[kWarps * 32 * kPer];
   __shared__ float s_unb[kWarps * 32 * kPer];
   __shared__ uint64_t s_cand[kWarps * 32];
-  __shared__ __align__(8) uint64_t s_bar[2 * kMaxNS + kMaxT + 2 + 2 * kMaxX];
+  __shared__ __align__(8) uint64_t s_bar[3 * kMaxNS + kMaxT + 2 + 2 * kMaxX];
   __shared__ uint32_t s_tmem;
   const Args& a = p.a;
   uint8_t* base = reinterpret_cast<uint8_t*>(
@@ -312,7 +313,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const uint32_t ring_s = res_s + p.nr_max * kSlot;
   const uint32_t full0 = smem_u32(s_bar), empty0 = full0 + 8 * kMaxNS,
                  trdy0 = empty0 + 8 * kMaxNS, res_bar = trdy0 + 8 * kMaxT,
-                 acc_bar = res_bar + 8, xfull0 = acc_bar + 8, xempty0 = xfull0 + 8 * kMaxX;
+                 acc_bar = res_bar + 8, xfull0 = acc_bar + 8, xempty0 = xfull0 + 8 * kMaxX,
+                 wfree0 = xempty0 + 8 * kMaxX;
   // Warp-uniform (CUTLASS canonical_warp_idx_sync): role branches and the values the
   // tcgen05 / TMA loops derive from it stay in uniform registers.
   const int warp = __shfl_sync(0xffffffffu, static_cast<int>(threadIdx.x >> 5), 0);
@@ -340,6 +342,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int s = 0; s < p.ns; ++s) {
       mbar_init(full0 + 8 * s, 1);
       mbar_init(empty0 + 8 * s, 1);
+      mbar_init(wfree0 + 8 * s, 1);
     }
     for (int j = 0; j < kMaxT; ++j) mbar_init(trdy0 + 8 * j, 1);
     for (int s = 0; s < p.xs; ++s) {
@@ -405,8 +408,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
           const int ws = p.xslot[gs];
           if (g0 > 0) {
             mbar_wait(xempty0 + 8 * gs, xph ^ 1);
-          } else if (p.xfree[gs] >= 0) {
-            mbar_wait(empty0 + 8 * ws, p.xfree[gs]);
+          } else if (p.xfree[gs]) {
+            mbar_wait(wfree0 + 8 * ws, 0);
           }
           mbar_expect_tx(xfull0 + 8 * gs, gbytes);
           tma_3d(ring_s + ws * kSlot, &tx, 0, kb0 + (g0 + gs) * xg, xfull0 + 8 * gs);
@@ -427,8 +430,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int i = 0; i < nt; ++i) {
       mbar_wait(full0 + 8 * slot, ph);
       cp4_el(ta, smem_desc(ring_s + slot * kSlot));
-      commit_el(trdy0 + 8 * i);       // block i in TMEM: its MMAs may run
-      commit_el(empty0 + 8 * slot);   // the slot is free: weights or tokens reuse it
+      commit_el(trdy0 + 8 * i);  // block i in TMEM: its MMAs may run
+      // The slot is free: for the next weight block of the ring, or after its last
+      // weight block for tokens (one commit on a barrier of its own: no parity alias).
+      commit_el((i + ns < nt ? empty0 : wfree0) + 8 * slot);
       ta += 32;
       if (++slot == ns) {
         slot = 0;
@@ -542,7 +547,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
          i += int64_t{gridDim.x} * kThreads)
       a.idx[i] = -1;
   }
-  const int row = blockIdx.x;
+  const int row = smid < kMaxSmid ? p.smid_row[smid] : kMaxSmid;
   if (row < n) {
     // Every router tile's partials stored: sum this row's logits in rank order
     // (bitwise the tile sum) from the partials, one counter round trip fewer.
@@ -647,7 +652,7 @@ static Plan plan_for(int n, int kb, int ks, int ns) {
   for (int g = 0; g < pl.xs; ++g) {
     const int s = order[g];
     pl.xslot[g] = static_cast<signed char>(s);
-    pl.xfree[g] = static_cast<signed char>(last[s] < 0 ? -1 : ((nt - 1 - s) / pl.ns) & 1);
+    pl.xfree[g] = static_cast<signed char>(last[s] >= 0);
   }
   return pl;
 }
@@ -718,9 +723,9 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   const int64_t grid = sms;  // one CTA per SM (plan: SM -> item)
   TORCH_CHECK(plan.device().is_cpu() && plan.scalar_type() == at::kInt && plan.is_contiguous() &&
-                  plan.numel() == kMaxSmid + 3 && plan[kMaxSmid].item<int>() == items &&
+                  plan.numel() == 2 * kMaxSmid + 3 && plan[2 * kMaxSmid].item<int>() == items &&
                   wimg.is_cuda() && wimg.scalar_type() == at::kByte &&
-                  wimg.numel() >= (kb * tiles + plan[kMaxSmid + 2].item<int>()) * kSlot &&
+                  wimg.numel() >= (kb * tiles + plan[2 * kMaxSmid + 2].item<int>()) * kSlot &&
                   reinterpret_cast<uintptr_t>(wimg.data_ptr()) % 1024 == 0,
               "moe_front: weight image / plan (front_image)");
   TORCH_CHECK(ks >= 1 && ks <= kMaxKs && ks <= kb && grid >= n && items <= grid && pl.nr_max <= kMaxR &&
@@ -785,15 +790,18 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
   p.xg = pl.xg;
   for (int g = 0; g < kMaxNS; ++g) {
     p.xslot[g] = g < pl.xs ? pl.xslot[g] : 0;
-    p.xfree[g] = g < pl.xs ? pl.xfree[g] : -1;
+    p.xfree[g] = g < pl.xs ? pl.xfree[g] : 0;
   }
   p.yfull = y.size(1) >= rows_w ? 1 : 0;
   p.wimg = wimg.data_ptr<uint8_t>();
   p.tiles = (int)tiles;
   const int* pp = plan.data_ptr<int>();
-  for (int s = 0; s < kMaxSmid; ++s) p.smid_item[s] = static_cast<short>(pp[s]);
-  p.item_split = pp[kMaxSmid + 1];
-  p.item_pad = pp[kMaxSmid + 2];
+  for (int s = 0; s < kMaxSmid; ++s) {
+    p.smid_item[s] = static_cast<short>(pp[s]);
+    p.smid_row[s] = static_cast<short>(pp[kMaxSmid + s]);
+  }
+  p.item_split = pp[2 * kMaxSmid + 1];
+  p.item_pad = pp[2 * kMaxSmid + 2];
   CUtensorMap tx;
   make_map3(&tx, h.data_ptr(), (int)n, (int)k, (int)n, pl.xg);
   static int configured = 0;
@@ -923,10 +931,12 @@ _CHUNK_SLOTS = (2 << 20) // _SLOT  # tiles per 2 MiB chunk (the die homing unit)
 
 
 @functools.cache
-def _front_plan(device: int, items: int, item_slots: tuple) -> tuple:
+def _front_plan(device: int, items: int, item_slots: tuple, router_items: int) -> tuple:
     """(plan, split item, die-0 chunks, die-1 chunks): every SM's work item, the die-0
-    SMs taking items [0, split) and the die-1 SMs the rest (one CTA per SM), and the
-    2 MiB chunks of each die's image region. item_slots[i]: item i's 16 KiB tiles."""
+    SMs taking items [0, split) and the die-1 SMs the rest (one CTA per SM), every SM's
+    top-k row (router items first, then spare SMs, then latent items: the rows go to
+    CTAs without latent work first), and the 2 MiB chunks of each die's image region.
+    item_slots[i]: item i's 16 KiB tiles."""
     from ..common import dies
 
     table = dies.sm_domains(device)
@@ -934,21 +944,30 @@ def _front_plan(device: int, items: int, item_slots: tuple) -> tuple:
     split = min(len(by_die[0]), items)
     if items - split > len(by_die[1]) or len(table) > _MAX_SMID:
         raise Unsupported("moe", None, f"moe_front: {items} items on {len(table)} SMs")
-    plan = torch.full((_MAX_SMID + 3,), -1, dtype=torch.int32)
+    plan = torch.full((2 * _MAX_SMID + 3,), -1, dtype=torch.int32)
     for i, s in enumerate(by_die[0][:split]):
         plan[s] = i
     for i, s in enumerate(by_die[1][: items - split]):
         plan[s] = split + i
+    sms = [s for s, d in enumerate(table) if d >= 0]
+    item = {s: int(plan[s]) for s in sms}
+    order = sorted(sms, key=lambda s: (
+        0 if 0 <= item[s] < router_items else 1 if item[s] < 0 else 2, item[s]))
+    plan[_MAX_SMID : 2 * _MAX_SMID] = _MAX_SMID
+    for r, s in enumerate(order):
+        plan[_MAX_SMID + s] = r
     slots0 = sum(item_slots[:split])
     chunks0 = -(-slots0 // _CHUNK_SLOTS)
     chunks1 = -(-sum(item_slots[split:]) // _CHUNK_SLOTS)
-    plan[_MAX_SMID] = items
-    plan[_MAX_SMID + 1] = split
-    plan[_MAX_SMID + 2] = chunks0 * _CHUNK_SLOTS - slots0  # die 1 starts on its own chunk
+    plan[2 * _MAX_SMID] = items
+    plan[2 * _MAX_SMID + 1] = split
+    plan[2 * _MAX_SMID + 2] = chunks0 * _CHUNK_SLOTS - slots0  # die 1 on its own chunk
     return plan, split, chunks0, chunks1
 
 
-def front_image(packed: torch.Tensor, ks: int) -> tuple[torch.Tensor, torch.Tensor]:
+def front_image(
+    packed: torch.Tensor, ks: int, num_logits: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """(image, plan) of the front's weight stream: the [128 rows x 64 K] tiles of
     packed ([router | latent down], BF16) in the TMEM fill's 128-byte-swizzled
     shared-memory layout (prewait_gemm.pack_weight), work item (tile, K split) after
@@ -964,7 +983,9 @@ def front_image(packed: torch.Tensor, ks: int) -> tuple[torch.Tensor, torch.Tens
         (s + 1) * kb // ks - s * kb // ks for _ in range(tiles) for s in range(ks)
     )
     dev = packed.device.index or 0
-    plan, split, chunks0, chunks1 = _front_plan(dev, tiles * ks, item_slots)
+    plan, split, chunks0, chunks1 = _front_plan(
+        dev, tiles * ks, item_slots, num_logits // 128 * ks
+    )
     flat = pack_weight(packed).view(torch.uint8).view(-1, _SLOT)
     slots0 = sum(item_slots[:split])
     nbytes = (chunks0 + chunks1) * _CHUNK_SLOTS * _SLOT
@@ -974,7 +995,7 @@ def front_image(packed: torch.Tensor, ks: int) -> tuple[torch.Tensor, torch.Tens
         image = torch.empty(nbytes, dtype=torch.uint8, device=packed.device)
     view = image.view(-1, _SLOT)
     view[:slots0].copy_(flat[:slots0])
-    start1 = slots0 + int(plan[_MAX_SMID + 2])
+    start1 = slots0 + int(plan[2 * _MAX_SMID + 2])
     view[start1 : start1 + flat.shape[0] - slots0].copy_(flat[slots0:])
     return image, plan
 
@@ -1009,7 +1030,7 @@ class MoeFront:
         self.part = torch.empty(tiles * ks * n_max * 128, dtype=torch.float32, device=dev)
         # Die-local weight stream: the tile image this layer's front reads (the stock
         # linears keep viewing the row-major packed).
-        self.wimg, self.plan = front_image(packed, ks)
+        self.wimg, self.plan = front_image(packed, ks, self.num_logits)
         self.no_stamps = torch.empty(0, dtype=torch.int64, device=dev)
         _module()
 

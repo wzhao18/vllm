@@ -168,6 +168,40 @@ __device__ __forceinline__ uint64_t warp_select(uint64_t (&k)[P], int32_t lane,
   return mine;
 }
 
+// Rounds [r0, r1) of warp_select: rank r on lane r.
+template <int P>
+__device__ __forceinline__ void warp_select_rounds(uint64_t (&k)[P], int32_t lane, int32_t r0,
+                                                   int32_t r1, uint64_t& mine) {
+  for (int r = r0; r < r1; ++r) {
+    uint64_t const best = warp_max_u64(k[0]);
+    if (lane == r) mine = best;
+    if (best != 0 && k[0] == best) {
+#pragma unroll
+      for (int j = 0; j + 1 < P; ++j) k[j] = k[j + 1];
+      k[P - 1] = 0;
+    }
+  }
+}
+
+// Keys of the kWarps descending 32-entry lists s_cand (zero past their length) larger
+// than w, the key of lane "lane" of list "wid" (unique keys: its own list has "lane").
+__device__ __forceinline__ int32_t rank_in_lists(const uint64_t* s_cand, uint64_t w,
+                                                 int32_t lane, int32_t wid) {
+  int32_t rank = lane;
+#pragma unroll
+  for (int v = 1; v < kWarps; ++v) {
+    const uint64_t* list = s_cand + ((wid + v) % kWarps) * 32;
+    int32_t i = 0;
+#pragma unroll
+    for (int step = 16; step >= 1; step >>= 1) i += list[i + step - 1] > w ? step : 0;
+    rank += i;
+  }
+  return rank;
+}
+
+// Pass-1 rounds before the exactness check (the rest only when a warp may hold more).
+constexpr int kRound1 = 8;
+
 // Block-parallel top-k of one row (the stock selection order: largest
 // (score, 65535 - expert) key first, i.e. ties to the lower expert id), then
 // write_outputs (verbatim) and the stager's route rules on warp 0.
@@ -206,28 +240,29 @@ __device__ __forceinline__ void route_block(const Args& a, int32_t row,
   }
   sort_desc<kPer>(k1);
   RB_CLK(1);
-  uint64_t const w = warp_select<kPer>(k1, lane, topk);
+  // Pass 1: every warp's first r1 keys (of its topk), descending on lanes 0..r1-1.
+  int32_t const r1 = min(topk, kRound1);
+  uint64_t w = 0;
+  warp_select_rounds<kPer>(k1, lane, 0, r1, w);
   RB_CLK(2);
   s_cand[wid * 32 + lane] = w;
   __syncthreads();
   RB_CLK(3);
   // Pass 2: the global rank of every per-warp candidate (keys are unique): its rank
   // in its own warp list plus the larger keys of the other 7 lists (each descending,
-  // zero past topk: a 5-step binary search counts them). Ranks < topk are the
-  // selection, in order.
+  // zero past its length: a 5-step binary search counts them). Exact when no warp's
+  // last extracted key is selected (its unextracted keys are all smaller than every
+  // selected key); otherwise every warp extracts the rest of its topk and pass 2
+  // reruns (in-kernel, rare). Ranks < topk are the selection, in order.
   __shared__ uint64_t s_top[32];
-  if (lane < topk) {
-    int32_t rank = lane;
-#pragma unroll
-    for (int v = 1; v < kWarps; ++v) {
-      const uint64_t* list = s_cand + ((wid + v) % kWarps) * 32;
-      int32_t i = 0;
-#pragma unroll
-      for (int step = 16; step >= 1; step >>= 1) i += list[i + step - 1] > w ? step : 0;
-      rank += i;
-    }
-    if (rank < topk) s_top[rank] = w;
+  int32_t rank = rank_in_lists(s_cand, w, lane, wid);
+  if (__syncthreads_or(lane == r1 - 1 && r1 < topk && w != 0 && rank < topk)) {
+    warp_select_rounds<kPer>(k1, lane, r1, topk, w);
+    s_cand[wid * 32 + lane] = w;
+    __syncthreads();
+    rank = rank_in_lists(s_cand, w, lane, wid);
   }
+  if (lane < topk && w != 0 && rank < topk) s_top[rank] = w;
   __syncthreads();
   if (wid != 0) return;
   uint64_t const lane_packed = lane < topk ? s_top[lane] : 0;

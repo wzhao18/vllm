@@ -181,7 +181,7 @@ def main():
         imgs = {}
         for c in cfgs:
             if c[0] not in imgs:
-                imgs[c[0]] = [moe_front.front_image(w, c[0]) for w in ws]
+                imgs[c[0]] = [moe_front.front_image(w, c[0], E) for w in ws]
             plan = fm.moe_front_plan(n, K, *c)
 
             def front(c=c):
