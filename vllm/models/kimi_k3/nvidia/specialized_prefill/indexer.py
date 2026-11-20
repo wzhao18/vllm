@@ -1315,10 +1315,10 @@ class PrefillMark:
     5 key bits) to the row's candidate list (``cand``, count in row_bin[3 r + 2],
     zeroed by the scorer). Rows with at most ``topk`` keys are skipped."""
 
-    def __init__(self, ctas: int, topk: int, words: int):
+    def __init__(self, ctas: int, topk: int):
         self.ctas = ctas
         self.topk = topk
-        self.words = words  # bitmap words per row (stride)
+
 
     @cute.jit
     def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, gate, s):
@@ -1342,7 +1342,10 @@ class PrefillMark:
         n_rows = Int32(row_len.shape[0])
         if gate[0] == 0:
             n_rows = Int32(0)  # nothing to select (recovery with no flagged row)
-        cpr = (self.words * 32 + CHUNK_V * 8 - 1) // (CHUNK_V * 8)
+        # bitmap words per row (its stride: the longest row's positions / 32), at
+        # run time so one compile serves every context length
+        bm_words = Int32(bitmap.shape[0]) // cutlass.max(Int32(row_len.shape[0]), Int32(1))
+        cpr = (bm_words * 32 + CHUNK_V * 8 - 1) // (CHUNK_V * 8)
         logits_a = logits.iterator.toint()
         bm_a = bitmap.iterator.toint()
         cand_a = cand.iterator.toint()
@@ -1376,7 +1379,7 @@ class PrefillMark:
                         wbits = wbits | cute.arch.shuffle_sync_bfly(wbits, 1)
                         wbits = wbits | cute.arch.shuffle_sync_bfly(wbits, 2)
                         if lane % 4 == 0 and v < vectors:
-                            st_global_u32(bm_a + (Int64(row) * self.words + (v >> 2)) * 4, wbits)
+                            st_global_u32(bm_a + (Int64(row) * bm_words + (v >> 2)) * 4, wbits)
                         # bound-bin keys into the CTA's shared buffer (one slot claim
                         # per warp)
                         if cute.arch.vote_any_sync(nb > Uint32(0)):
@@ -1427,10 +1430,9 @@ class PrefillFinish:
     indices (-1 pads rows with at most ``topk`` keys). Rows whose candidates
     overflowed re-read their logits (exact, slower)."""
 
-    def __init__(self, ctas: int, topk: int, words: int):
+    def __init__(self, ctas: int, topk: int):
         self.ctas = ctas
         self.topk = topk
-        self.words = words
 
     @cute.jit
     def __call__(self, logits, row_base, row_len, row_bin, bitmap, cand, out, gate, s):
@@ -1455,6 +1457,7 @@ class PrefillFinish:
         tie_buf_a = tcnt_a + 16
         cute.arch.griddepcontrol_wait()
         n_rows = Int32(row_len.shape[0])
+        bm_words = Int32(bitmap.shape[0]) // cutlass.max(n_rows, Int32(1))  # bitmap stride
         if gate[0] == 0:
             n_rows = Int32(0)  # nothing to select (recovery with no flagged row)
         out_a = out.iterator.toint()
@@ -1474,7 +1477,7 @@ class PrefillFinish:
                         v = e
                     st_global_s32(orow + e * 4, v)
             else:
-                brow = bm_a + Int64(row) * self.words * 4
+                brow = bm_a + Int64(row) * bm_words * 4
                 crow = cand_a + Int64(row) * CAND * 4
                 address = logits_a + row_base[row] * 2
                 low = Uint32(row_bin[3 * row]) << Uint32(5)
@@ -2661,7 +2664,7 @@ def _score_kernel(ctas, mode=0, topk=2048, epi=0):
 
 
 @functools.cache
-def _select_kernels(ctas, topk, words):
+def _select_kernels(ctas, topk):
     from cutlass.cute.runtime import make_fake_stream
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import fake
@@ -2677,11 +2680,11 @@ def _select_kernels(ctas, topk, words):
     )
     gate = fake((1,), dtype=cutlass.Int32)
     mark = cute.compile(
-        PrefillMark(ctas, topk, words), *common, gate, make_fake_stream(),
+        PrefillMark(ctas, topk), *common, gate, make_fake_stream(),
         options="--enable-tvm-ffi",
     )
     fin = cute.compile(
-        PrefillFinish(ctas * 8, topk, words),
+        PrefillFinish(ctas * 8, topk),
         *common,
         fake((t, topk), dtype=cutlass.Int32),
         gate,
@@ -2726,8 +2729,7 @@ def select(logits, row_base, row_len, row_bin, bitmap, cand, out, ctas=None, gat
     ``cand``: Int32 [T * CAND]; ``row_bin`` Int32 [3 T] from score. ``gate``
     (Int32 [1], device): 0 skips every row."""
     ctas = ctas or torch.cuda.get_device_properties(out.device).multi_processor_count
-    words = bitmap.numel() // row_len.shape[0]
-    mark, fin = _select_kernels(ctas * 4, out.shape[1], words)
+    mark, fin = _select_kernels(ctas * 4, out.shape[1])
     stream = torch.cuda.current_stream(out.device).cuda_stream
     if gate is None:
         gate = torch.ones(1, dtype=torch.int32, device=out.device)
