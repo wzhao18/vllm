@@ -2483,20 +2483,86 @@ def _pkd(
                         if (slot == 0) & (kx == 0) & (ci < 48) & (plw == 0):
                             with cute.arch.elect_one():
                                 tprobe[ci * 32 + 17] = _clock64()
+                    # Swizzle-resolved SW128 byte addresses of this thread's
+                    # [row, 8-element] slot at wp = 0; +8 rows is +1024 B (the
+                    # XOR source bits 7-9 do not change), so each iteration
+                    # steps one base per access instead of re-deriving it.
+                    # packed varlen GATE2 route only (measured: the fixed
+                    # routes keep more live registers and lose)
+                    HOIST_QK = GATE2_ == 1 and QK_ROWPAIR_ == 8
+                    if cutlass.const_expr(HOIST_QK):
+                        rwb = (ptl >> 5) + ((ptl >> 2) & 4)
+                        sgx = ptl & 15
+                        a_q = (
+                            cutlass.Int32(ar0.toint())
+                            + OFF_QD
+                            + 2 * (rwb * 64 + 8 * (sgx & 7) + 4096 * (sgx >> 3))
+                            + 2 * STAGE_ELTS * inst
+                        )
+                        a_f = (
+                            cutlass.Int32(ar0.toint())
+                            + OFF_FT
+                            + 2 * (rwb * 64 + 8 * (sgx & 7) + 2048 * (sgx >> 3))
+                            + 2 * STAGE_ELTS * inst
+                        )
+                        a_k = a_q + 4096
+                        a_q = a_q ^ (((a_q >> 7) & 7) << 4)
+                        a_k = a_k ^ (((a_k >> 7) & 7) << 4)
+                        a_f = a_f ^ (((a_f >> 7) & 7) << 4)
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
                         # four-row half-warp pairing. QK_ROWPAIR_ only selects
                         # the surrounding gate pipeline now.
-                        rw2 = wp * 8 + (ptl >> 5) + ((ptl >> 2) & 4)
-                        sg2 = ptl & 15
+                        if cutlass.const_expr(HOIST_QK):
+                            rw2 = wp * 8 + rwb
+                            sg2 = sgx
+                            o8 = wp * 1024
+                            s_q8 = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    a_q + o8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                            s_k8 = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    a_k + o8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                            s_f8 = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    a_f + o8,
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                        else:
+                            rw2 = wp * 8 + (ptl >> 5) + ((ptl >> 2) & 4)
+                            sg2 = ptl & 15
                         if tma:
-                            q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                            q8s = (
+                                s_f8
+                                if cutlass.const_expr(HOIST_QK)
+                                else v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                            )
                             if cutlass.const_expr((PROBE_ & 8) == 0):
                                 cute.autovec_copy(q8s, qr)
                             if cutlass.const_expr(RAWG_ == 1):
                                 k8s = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                             else:
-                                k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                                k8s = (
+                                    s_k8
+                                    if cutlass.const_expr(HOIST_QK)
+                                    else v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                                )
                             cute.autovec_copy(k8s, kr)
                             if cutlass.const_expr(may_be_partial):
                                 if rw2 >= cc:
@@ -2568,13 +2634,25 @@ def _pkd(
                             idecv = cute.math.rcp(decv, approx=True, ftz=True)
                         else:
                             idecv = cute.math.exp2(anch - gv8, fastmath=True)
-                        dq8 = v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        dq8 = (
+                            s_q8
+                            if cutlass.const_expr(HOIST_QK)
+                            else v_qd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        )
                         if cutlass.const_expr((PROBE_ & 8) == 0):
                             cute.autovec_copy(qr, dq8)
-                        dk8 = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        dk8 = (
+                            s_k8
+                            if cutlass.const_expr(HOIST_QK)
+                            else v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        )
                         cute.autovec_copy(kr, dk8)
                         kr.store((khv * idecv).to(cutlass.BFloat16))
-                        di8 = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        di8 = (
+                            s_f8
+                            if cutlass.const_expr(HOIST_QK)
+                            else v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
+                        )
                         cute.autovec_copy(kr, di8)
                     # gt/rf (dedicated buffers; gcs row 31 stable since the
                     # post-walker barrier -> rides the decoration phase)
