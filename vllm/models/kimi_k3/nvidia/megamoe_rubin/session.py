@@ -72,8 +72,13 @@ def _dms_dump(current) -> None:
         _DMS_SIG[key] = sig
         _DMS_N[0] += 1
         _dms_os.makedirs(_DMS_OUT, exist_ok=True)
+        try:  # D-MOE-STREAM reduce stamps (same ring index)
+            roff, rnb = ws.offset("genphase.diag.reduce_ring"), ws.nbytes("genphase.diag.reduce_ring")
+            rring = lw[roff:roff + rnb].view(torch.int64).view(32, 1024, 8).cpu()
+        except Exception:
+            rring = None
         torch.save(
-            {"ring": ring.cpu(), "rank": s.cfg.rank, "tokens": s.cfg.padded_tokens_per_rank,
+            {"ring": ring.cpu(), "rring": rring, "rank": s.cfg.rank, "tokens": s.cfg.padded_tokens_per_rank,
              "world": s.cfg.world_size, "t": _dms_time.time()},
             f"{_DMS_OUT}/r{s.cfg.rank}-t{s.cfg.padded_tokens_per_rank}-{_DMS_N[0]:04d}.pt",
         )

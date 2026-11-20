@@ -420,6 +420,8 @@ class TopkReduce:
         rmsnorm_weight: Optional[cute.Tensor] = None,  # (hidden,) BF16: vLLM-local E2a (VENDOR.md)
         rmsnorm_eps: Optional[Float32] = None,
         producer_done: Optional[cute.Tensor] = None,  # int32 x1: producer_arrivals counter (see __init__)
+        diag_ring: Optional[cute.Tensor] = None,  # DIAG ONLY (D-MOE-STREAM reduce stamps)
+        diag_epoch: Optional[cute.Tensor] = None,
     ):
         """Launch the reduce.
 
@@ -497,6 +499,8 @@ class TopkReduce:
                 rmsnorm_eps,
                 shared_term,
                 producer_done,
+                diag_ring,
+                diag_epoch,
             )
             if cutlass.const_expr(split == 1):
                 kernel.launch(
@@ -976,6 +980,8 @@ class TopkReduce:
         rmsnorm_eps: Float32,
         shared_term: Optional[cute.Tensor] = None,
         producer_done: Optional[cute.Tensor] = None,
+        diag_ring: Optional[cute.Tensor] = None,
+        diag_epoch: Optional[cute.Tensor] = None,
     ):
         """vLLM-local E2a on the polled plane: ``_reduce_bf16_ll`` of one token row per CTA (thread = one 8-wide
         hidden tile; same poll, top-k order and FP32 FMA form, same cell reset), then the stock vLLM ``rms_norm`` of
@@ -1006,6 +1012,14 @@ class TopkReduce:
             hidden_tile_idx = part * Int32(tiles_per_cta) + thread_idx
             active = (thread_idx < Int32(tiles_per_cta)) & (hidden_tile_idx < Int32(hidden_tiles))
 
+        if cutlass.const_expr(diag_ring is not None):
+            # DIAG ONLY (D-MOE-STREAM reduce stamps, never lands)
+            from ..kernel_src.rubin.inference.mega import dms_diag as DG
+            from ...common.ptx_helpers import read_smid as _dg_smid
+
+            _dg_epoch = DG.rbind(Int64(diag_ring.iterator.toint()), diag_epoch.iterator, cute.arch.block_idx()[0])
+            DG.rput_gt(DG.R_ENTRY, thread_idx == Int32(0))
+            DG.rput_val(DG.R_SMID, _dg_smid(), thread_idx == Int32(0))
         smem = cutlass_utils.SmemAllocator()
         partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32,)), 16)
         cluster_partial = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
@@ -1118,6 +1132,8 @@ class TopkReduce:
         if lane_idx == Int32(0):
             partial[warp_idx] = sumsq
         cute.arch.sync_threads()
+        if cutlass.const_expr(diag_ring is not None):
+            DG.rput_gt(DG.R_SYNC, thread_idx == Int32(0))
         total = Float32(0)
         for w in cutlass.range_constexpr(warps):
             total = total + partial[w]
@@ -1131,6 +1147,8 @@ class TopkReduce:
             total = Float32(0)
             for peer in cutlass.range_constexpr(split):
                 total = total + cluster_partial[peer]
+            if cutlass.const_expr(diag_ring is not None):
+                DG.rput_gt(DG.R_CLUSTER, thread_idx == Int32(0))
         scale = cute.math.rsqrt(total / Float32(self.hidden) + rmsnorm_eps, fastmath=True)
         if active:
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
@@ -1139,9 +1157,15 @@ class TopkReduce:
             dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
             store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
             cute.copy(store_atom, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
+        if cutlass.const_expr(diag_ring is not None):
+            DG.rput_gt(DG.R_STORE, thread_idx == Int32(0))
         if cutlass.const_expr(self.outlive_producer and shared_term is None):
             if (cute.arch.block_idx()[0] == cute.arch.grid_dim()[0] - Int32(1)) & (thread_idx == Int32(0)):
                 self._wait_producer(producer_done)
+        if cutlass.const_expr(diag_ring is not None):
+            DG.rput_gt(DG.R_END, thread_idx == Int32(0))
+            DG.rput_val(DG.R_VALID, Int64(_dg_epoch) + Int64(1) + (Int64(cute.arch.grid_dim()[0]) << Int64(32)),
+                        thread_idx == Int32(0))
 
     @cute.kernel
     def _reduce_persistent(

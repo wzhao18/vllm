@@ -1210,6 +1210,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         producer_done = None
         if cutlass.const_expr(self.reduce_acquires_producer_done):
             producer_done = self._device_workspace.tensor(self.producer_done_region)
+        dg_reduce_ring = self._device_workspace.tensor(DG.R_REGION)  # DIAG ONLY (D-MOE-STREAM reduce stamps)
+        dg_reduce_epoch = self._device_workspace.tensor(DG.R_EPOCH)
         self._device_workspace.remove_device_members()
         self._kernel(
             fc1_tma_a_tensor,
@@ -1270,6 +1272,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 rmsnorm_weight=rmsnorm_weight,
                 rmsnorm_eps=rmsnorm_eps,
                 producer_done=producer_done,
+                diag_ring=dg_reduce_ring,
+                diag_epoch=dg_reduce_epoch,
             )
         elif cutlass.const_expr(rmsnorm_weight is not None):
             raise ValueError("the fused output RMSNorm needs the separate top-k reduce.")
@@ -1488,6 +1492,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
         _dms_epoch = self.tail.read_epoch(self._device_workspace)
         DG.bind(self._device_workspace, _dms_epoch)
+        DG.put_reduce_epoch(self._device_workspace, _dms_epoch)
         DG.put_gt(DG.S_ENTRY, Int32(cute.arch.thread_idx()[0] == Int32(0)))
         DG.put_val(DG.S_EPOCH, Int64(_dms_epoch) + Int64(1), Int32(cute.arch.thread_idx()[0] == Int32(0)))
         DG.put_val(DG.S_BLOCK, Int64(cute.arch.block_idx()[0]), Int32(cute.arch.thread_idx()[0] == Int32(0)))

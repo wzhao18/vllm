@@ -45,6 +45,50 @@ def register(device_workspace) -> None:
         REGION, cutlass.Int64, (RING * MAX_SM * SLOTS,), buffer_space="local", byte_alignment=128,
         reset="zero_on_first_allocate",
     )
+    # D-MOE-STREAM reduce stamps: per reduce CTA (block index), same ring (epoch mod RING) as the main kernel.
+    device_workspace.register(
+        R_REGION, cutlass.Int64, (RING * R_MAX * R_SLOTS,), buffer_space="local", byte_alignment=128,
+        reset="zero_on_first_allocate",
+    )
+    device_workspace.register(R_EPOCH, cutlass.Int32, (4,), buffer_space="local", byte_alignment=16,
+                              reset="zero_on_first_allocate")
+
+
+# Reduce ring (DIAG, D-MOE-STREAM): slot map per reduce CTA, decoded by runs-local/D-MOE-STREAM/rst.py
+R_REGION = "genphase.diag.reduce_ring"
+R_EPOCH = "genphase.diag.reduce_epoch"
+R_MAX = 1024
+R_SLOTS = 8
+R_ENTRY_BYTES = R_MAX * R_SLOTS * 8
+R_VALID, R_ENTRY, R_SYNC, R_CLUSTER, R_END, R_POLLS, R_SMID, R_STORE = 0, 1, 2, 3, 4, 5, 6, 7
+
+
+class _RBound:
+    base = None
+
+
+def put_reduce_epoch(device_workspace, epoch) -> None:
+    """Main kernel, every CTA's thread 0 at entry: the epoch its reduce files its stamps under."""
+    if cutlass.const_expr(ON):
+        _st(Int64(device_workspace.ptr(R_EPOCH).toint()), Int64(epoch), Int32(cute.arch.thread_idx()[0] == Int32(0)))
+
+
+def rbind(ring_ptr_int: Int64, epoch_ptr, block: Int32) -> Int32:
+    """Reduce kernel entry (every thread): this launch's ring entry, this CTA's slots. Returns the epoch."""
+    epoch = cute.arch.load(epoch_ptr, Int32, sem="relaxed", scope="gpu")
+    _RBound.base = (ring_ptr_int + Int64(epoch & Int32(RING - 1)) * Int64(R_ENTRY_BYTES)
+                    + Int64(block) * Int64(R_SLOTS * 8))
+    return epoch
+
+
+def rput_gt(slot: int, pred) -> None:
+    if cutlass.const_expr(ON):
+        _st(_RBound.base + Int64(slot * 8), Int64(read_globaltimer_ns()), Int32(pred))
+
+
+def rput_val(slot: int, value, pred) -> None:
+    if cutlass.const_expr(ON):
+        _st(_RBound.base + Int64(slot * 8), Int64(value), Int32(pred))
 
 
 def bind(device_workspace, epoch) -> None:
