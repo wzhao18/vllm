@@ -99,6 +99,7 @@ def _compiled(q: int, num_sms: int, arch: str, epi_math: bool = True):
         num_epi_subtiles=1,
         num_umma_stages=2,
         epi_math=epi_math,
+        kv_issuers=2,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.BFloat16,
         remove_online_sf_transpose=False,
