@@ -201,42 +201,43 @@ def main():
         print(line, flush=True)
         # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]
-        grid = 35 * c[0]
-        st = torch.zeros(grid * 64, dtype=torch.int64, device=dev)
-        end = torch.zeros(1, dtype=torch.int64, device=dev)
+        for skel_mode in (0, 1):
+            grid = 35 * c[0]
+            st = torch.zeros(grid * 64 + skel_mode, dtype=torch.int64, device=dev)
+            end = torch.zeros(1, dtype=torch.int64, device=dev)
 
-        def stamped():
-            pm.prod(src, h, busy, end, carve)
-            fm.moe_front(ws[0], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827, True,
-                         1.0, *c, st)  # fmt: skip
+            def stamped():
+                pm.prod(src, h, busy, end, carve)
+                fm.moe_front(ws[0], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827, True,
+                             1.0, *c, st)  # fmt: skip
 
-        stamped()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
             stamped()
-        flush = torch.empty(512 << 20, dtype=torch.uint8, device=dev)  # > L2: cold weights
-        for _ in range(3):
-            end.zero_()
-            st.zero_()
-            flush.zero_()
-            g.replay()
-            torch.cuda.synchronize()
-        sv = st.view(grid, 64)
-        s = (sv.double() - float(end.item())) / 1000.0
-        names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end", "x0-mma", "acc-done"]
-        parts = []
-        for i, nm in enumerate(names):
-            v = s[:, i][sv[:, i] != 0]
-            if v.numel():
-                parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
-        print(f"  stamps n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
-              flush=True)
-        for cta in (0, grid // 2, grid - 1):
-            c0 = int(sv[cta, 32])
-            rd = [str(int(sv[cta, 32 + j]) - c0) for j in range(24) if sv[cta, 32 + j] != 0]
-            iss = [str(int(sv[cta, 8 + j]) - c0) for j in range(24) if sv[cta, 8 + j] != 0]
-            print(f"  cta{cta} clk operands-ready per K block: {' '.join(rd)}", flush=True)
-            print(f"  cta{cta} clk MMAs-issued per K block: {' '.join(iss)}", flush=True)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                stamped()
+            flush = torch.empty(512 << 20, dtype=torch.uint8, device=dev)  # > L2: cold weights
+            for _ in range(3):
+                end.zero_()
+                st.zero_()
+                flush.zero_()
+                g.replay()
+                torch.cuda.synchronize()
+            sv = st[: grid * 64].view(grid, 64)
+            s = (sv.double() - float(end.item())) / 1000.0
+            names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end", "x0-mma", "acc-done"]
+            parts = []
+            for i, nm in enumerate(names):
+                v = s[:, i][sv[:, i] != 0]
+                if v.numel():
+                    parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
+            print(f"  stamps{' SKELETON' if skel_mode else ''} n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
+                  flush=True)
+            for cta in (0, grid // 2, grid - 1):
+                c0 = int(sv[cta, 32])
+                rd = [str(int(sv[cta, 32 + j]) - c0) for j in range(24) if sv[cta, 32 + j] != 0]
+                iss = [str(int(sv[cta, 8 + j]) - c0) for j in range(24) if sv[cta, 8 + j] != 0]
+                print(f"  cta{cta} clk operands-ready per K block: {' '.join(rd)}", flush=True)
+                print(f"  cta{cta} clk MMAs-issued per K block: {' '.join(iss)}", flush=True)
 
 
 if __name__ == "__main__":
