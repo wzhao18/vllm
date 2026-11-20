@@ -38,7 +38,7 @@ PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "load
              2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
              22: "r:class", 5: "resolved", 6: "tie round", 23: "w:bitmap(last)",
-             7: "radix", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
+             7: "radix", 11: "r2:polled", 17: "gtt", 18: "write scan", 27: "r:pre", 28: "slots", 8: "end"}
 STATS_V2 = ("rows", "one_round", "tie_round", "radix", "select_all", "full_pass", "retheta", "rebase")
 
 
@@ -50,6 +50,19 @@ def make_logits(case, T, width, Lloc, gen, dev, rank=0):
         x = torch.relu(x + 0.3) * 2.0 + (0.12 if case == "skew1" else 0.3) * rank
     elif case == "relu":  # indexer-like: sum of ReLU scores, many small, heavy right tail
         x = torch.relu(x + 0.3) * 2.0
+    elif case in ("r2row", "satrow", "zerorow"):
+        # relu rows; one row in 128 is a rare in-step tail row: ranks shifted apart (r2row),
+        # 5000 equal high keys on rank 0 (satrow: saturated window, R2 overflow), or fewer
+        # than K positive keys (zerorow: tau = +0 with every zero key tied)
+        x = torch.relu(x + 0.3) * 2.0
+        rare = torch.arange(T, device=dev) % 128 == 7
+        if case == "r2row":
+            x[rare] += 0.12 * rank
+        elif case == "satrow":
+            if rank == 0:
+                x[rare, 1:10001:2] = 3.0
+        else:
+            x[rare] = torch.relu(x[rare] - 7.0)
     elif case == "hot_recent":  # recent tokens score much higher (local position ~ L)
         pos = torch.arange(width, device=dev)[None, :]
         hot = (pos >= (Lloc[:, None] - 512)) & (pos < Lloc[:, None])
