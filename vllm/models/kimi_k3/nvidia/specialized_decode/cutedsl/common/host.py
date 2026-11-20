@@ -176,6 +176,16 @@ def check_registers(compiled, device, limit: int, what: str):
         raise RuntimeError(f"{what} uses {registers} registers per thread (> {limit})")
 
 
+def prefer_oversized(compiled, device_index: int):
+    """Ask for the oversized shared-memory configuration (sm_107: up to 327 KiB per CTA,
+    8 KiB L1) on the SMs that host ``compiled``'s CTAs, so an oversized dependent CTA
+    (PDL, released at this kernel's entry) fits beside them; call once before capture."""
+    _, function = resolve_kernel(compiled, device_index)
+    mode = cuda.CUsharedMemoryMode.CU_SHARED_MEMORY_MODE_PREFER_OVERSIZED_SHARED_MEMORY
+    attribute = cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE
+    _checked(cuda.cuFuncSetAttribute(function, attribute, mode))
+
+
 def prepare_shared_carveout(compiled, device_index: int, value: int):
     """Restore ``value`` (CuTe's launcher drops preferred_smem_carveout) as a driver
     function attribute; call once before capture."""
