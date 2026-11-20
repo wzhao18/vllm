@@ -44,6 +44,11 @@ MXFP8_BLOCK = 32
 # F16K die-local call sequence (VR200): G3 d2/d3/d4 27.71/27.21/28.0 ms,
 # G4 d2/d3 25.85/25.97 ms, G5 d2 28.2 and G6 d2 33.3 ms (register spills).
 RING_DEPTH = 2
+# Per-shape ring depth (93-layer F16K die-local sequence, per-call A/B of
+# depth 2 vs 3): MXFP8-only outputs with >= 5 blocks run 2-3 % faster with a
+# 3-row ring; every other shape 0-8 % slower.
+RING_DEPTH_Q_DEEP = 3
+Q_DEEP_MIN_BLOCKS = 5
 GROUPS = 4
 VEC = 8  # BF16 per lane chunk (4 warps per token group; 4 -> 8 warps)
 # Floor of the tokens a group claims ahead of the one it processes (the
@@ -293,7 +298,9 @@ def attn_res(
         out,
         None if q is None else q.view(torch.uint8),
         sf,
-        RING_DEPTH,
+        RING_DEPTH_Q_DEEP
+        if quant_out and not bf16_out and num_blocks >= Q_DEEP_MIN_BLOCKS
+        else RING_DEPTH,
         *_schedule_args(blocks),
         _stamps,
     )

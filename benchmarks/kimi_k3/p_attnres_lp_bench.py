@@ -54,6 +54,7 @@ def main():
     p.add_argument("--vecs", default="8")
     p.add_argument("--qa", default="2", help="claim run-ahead builds")
     p.add_argument("--pdl", default="1", help="PDL builds (1 production, 0 plain)")
+    p.add_argument("--qdeep", default="3", help="ring depth of MXFP8-only calls with >= 5 blocks")
     args = p.parse_args()
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
@@ -219,6 +220,7 @@ def main():
 
     for pd in [int(x) for x in args.depths.split(",")] if args.percall else []:
         attn_res_lp.RING_DEPTH = pd
+        attn_res_lp.RING_DEPTH_Q_DEEP = pd
         st = State(bool(args.dielocal))
         for c in calls:
             run_lp(st, c)
@@ -243,10 +245,11 @@ def main():
             print(json.dumps({"depth": pd, "call": k, "n": n, "us": round(us / n, 1),
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
 
-    def lp_arm(qa, pdl):
+    def lp_arm(qa, pdl, qdeep):
         def fn(st, c):
             attn_res_lp.CLAIM_AHEAD = qa
             attn_res_lp.PDL = pdl
+            attn_res_lp.RING_DEPTH_Q_DEEP = qdeep
             return run_lp(st, c)
         return fn
 
@@ -259,7 +262,9 @@ def main():
         arms = [("old", lambda st, c: run_ref(st, c))] if args.old else []
         for qa in [int(x) for x in args.qa.split(",")]:
             for pdl in [int(x) for x in args.pdl.split(",")]:
-                arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}", lp_arm(qa, pdl)))
+                for qd in [int(x) for x in args.qdeep.split(",")]:
+                    arms.append((f"lp_v{vv}g{gr}d{d}qa{qa}p{pdl}qd{qd}",
+                                 lp_arm(qa, pdl, qd)))
         order = arms + arms[::-1]
         for name, fn in order:
             r = timed(fn, bool(args.dielocal) and name != "old")
