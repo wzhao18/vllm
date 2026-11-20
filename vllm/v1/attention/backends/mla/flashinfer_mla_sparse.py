@@ -1098,6 +1098,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     # ShardQ under DCP only: TP-only steps keep the head-sharded path
     # (Inferact/mum#66 also turns TP ShardQ on for this backend).
     supports_dcp_shardq: ClassVar[bool] = True
+    # forward_mqa sends every call that returns the LSE (all DCP decode) to
+    # SparseMLACommonImpl.forward_mqa, which reads dcp_local_topk_counts; only
+    # prefill-sized calls take the specialized prefill kernel.
+    dcp_decode_reads_topk_counts: ClassVar[bool] = True
     # fp8 query quantization is required when using fp8 kv_cache,
     # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
     # for query and kv_cache (mixed bf16+fp8 is not supported).
