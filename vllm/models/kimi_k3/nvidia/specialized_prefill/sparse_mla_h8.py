@@ -106,6 +106,8 @@ CPA_LAG = 4
 # g - CP_CAP to land before issuing g): > ~150-250 KB of LDGSTS in flight collapses the
 # random-row gather rate (pmla10 probe; h8 cpa 3 at NS 6 / 5 / 4: 3284 / 2270 / 1491 us)
 CP_CAP = 4
+# cpa 8: rows 0 .. RCP - 1 of every stage by cp.async, rows RCP .. 63 by TMA gather4
+RCP = 48
 NP = 3  # P buffers
 NLD = 9  # gather warps
 GATHER_PARTS = 1  # issuing lanes per quad (P-MLA run95)
@@ -410,11 +412,13 @@ class SparseMlaPrefillH8:
         self.sm_arrivals = 4  # S-free / O-ready arrivals per subtile (one per softmax warp)
         # cpa 3-6: KV rows by per-lane cp.async (6: with the old slot producer); cpa 3-5 and 7
         # (TMA gather4): logical mode with the shared-memory top-k slot producer
-        self.ldgsts = self.cpa in (3, 4, 5, 6)
+        self.ldgsts = self.cpa in (3, 4, 5, 6, 8)
+        assert not (self.logical and self.cpa == 8), "cpa 8: physical-slot split producer"
         self.prod2 = self.cpa in (3, 4, 5, 7)
         # KVFULL arrivals per stage: one noinc async arrive per copying lane (3, 4, 6), one
         # per gather warp (5, 2 + the expect-tx arrive), per-lane RoPE copies (1), TMA (0)
-        self.kv_full_arrivals = (256 if self.ldgsts and self.cpa != 5 else 8 if self.cpa == 5
+        self.kv_full_arrivals = (RCP // 8 * 32 + (64 - RCP) // 4 if self.cpa == 8
+                                 else 256 if self.ldgsts and self.cpa != 5 else 8 if self.cpa == 5
                                  else 1 + (8 if self.cpa == 2 else 256 if self.cpa == 1 else 0))
 
     @cute.jit
@@ -600,7 +604,7 @@ class SparseMlaPrefillH8:
                                     lens)
             elif cutlass.const_expr(self.ldgsts):
                 self.gather_cp(base, pw, lane, cta, n_mine, slots, slot_stride, lens, kvp,
-                               unit_rows)
+                               unit_rows, tm_kv, tm_kr)
             else:
                 g = Int32(0)
                 for qi in range(n_mine):
@@ -726,14 +730,14 @@ class SparseMlaPrefillH8:
 
     @cute.jit
     def gather_cp(self, base, pw, lane, cta, n_mine, slots, slot_stride, lens, kvp,
-                  unit_rows):
+                  unit_rows, tm_kv, tm_kr):
         """cpa 3: every 16 B of every row by cp.async (LDGSTS is not starved by the SS
         MMA operand reads, TMA gather4 is: hwdb 24/32 vs P-MLA-2CTA probe5). Warps
         pw 0-7 own rows 8 pw .. 8 pw + 7 of every 64-key stage; lane = (row, 16 B column
         ch + 4 j of the latent, ch of the RoPE). Each lane's noinc async arrive on
         KVFULL tracks its own copies, so no gather warp ever waits for its loads (a
         CTA-wide barrier with 256 such arrivals per phase costs nothing: pmla10 M2)."""
-        if pw < 8:
+        if pw < (RCP // 8 if self.cpa == 8 else 8):
             r = pw * 8 + lane // 4
             ch = lane % 4
             rx = (lane // 4) % 8
@@ -770,6 +774,59 @@ class SparseMlaPrefillH8:
                     self.cp_signal(base, lane, g, s)
                     g = g + 1
             self.cp_drain(lane, base, g)
+        if cutlass.const_expr(self.cpa == 8):
+            if pw >= RCP // 8:
+                self.gather_tail4(base, pw - RCP // 8, lane, cta, n_mine, slots, slot_stride,
+                                  lens, unit_rows, tm_kv, tm_kr)
+
+    @cute.jit
+    def gather_tail4(self, base, gw, lane, cta, n_mine, slots, slot_stride, lens,
+                     unit_rows, tm_kv, tm_kr):
+        """cpa 8: rows RCP .. 63 of every stage by TMA gather4 from producer warps
+        RCP / 8 .. NLD - 1 (gw = 0 ..), one 4-row quad per lane (its 4 latent atoms + RoPE,
+        expect-tx arrive of its own bytes), while warps 0 .. RCP / 8 - 1 copy rows 0 ..
+        RCP - 1 by cp.async: LDGSTS and the TMA unit fill each stage in parallel."""
+        ngw = NLD - RCP // 8
+        qq = gw + ngw * lane
+        act = qq < (64 - RCP) // 4
+        quad = RCP // 4 + qq
+        if not act:
+            quad = Int32(RCP // 4)
+        g = Int32(0)
+        for qi in range(n_mine):
+            row = cta + qi * self.grid
+            n = lens[row]
+            subs = _subs(n)
+            srow = slots + Int64(row) * Int64(slot_stride) * Int64(4) + Int64(16 * quad)
+            c0, c1, c2, c3 = ld_global_v4_s32(srow)
+            for t in cutlass.range(subs, unroll=1):
+                s = g % NS
+                st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
+                full = _bar(base, B_KVFULL + s)
+                key = t * 64 + 4 * quad
+                r = (c0, c1, c2, c3)
+                if t + 1 < subs:
+                    c0, c1, c2, c3 = ld_global_v4_s32(srow + Int64((t + 1) * 256))
+                compiler_fence()
+                if lane == 0:
+                    mbar_wait(_bar(base, B_KVEMPTY + s), Uint32(((g // NS) & 1) ^ 1))
+                cute.arch.sync_warp()
+                if act:
+                    rr = []
+                    for j in cutlass.range_constexpr(4):
+                        v = (r[j] >> 6) * unit_rows + (r[j] & 63)
+                        if r[j] < 0 or key + j >= n:
+                            v = Int32(-1)
+                        rr.append(v)
+                    mbar_arrive_tx(full, Uint32(4 * ROW))
+                    for a in cutlass.range_constexpr(5):
+                        if cutlass.const_expr(a < 4):
+                            gather4(st + Uint32(a * 8192) + Uint32(quad) * Uint32(512), tm_kv,
+                                    full, Int32(128 * a), rr[0], rr[1], rr[2], rr[3])
+                        else:
+                            gather4(st + Uint32(4 * 8192) + Uint32(quad) * Uint32(256), tm_kr,
+                                    full, Int32(D_NOPE), rr[0], rr[1], rr[2], rr[3])
+                g = g + 1
 
     @cute.jit
     def cp_row(self, st, d0, d1, dr, src, nb):
@@ -785,7 +842,7 @@ class SparseMlaPrefillH8:
     def cp_cap(self, base, g):
         """Lane 0, cpa 3/4: stage g is issued only once stage g - CP_CAP has landed (its
         KVFULL phase completed), bounding the cp.async bytes in flight."""
-        if cutlass.const_expr(self.cpa in (3, 4, 6) and CP_CAP < NS):
+        if cutlass.const_expr(self.cpa in (3, 4, 6, 8) and CP_CAP < NS):
             if g >= CP_CAP:
                 mbar_wait(_bar(base, B_KVFULL + (g - CP_CAP) % NS),
                           Uint32(((g - CP_CAP) // NS) & 1))
@@ -1256,7 +1313,7 @@ class SparseMlaPrefillH8:
         self.ss(base, cta, lane, u, 16, 2)
         mbar_wait(_bar(base, B_KVFULL + s), Uint32((u // NS) & 1))
         self.ss(base, cta, lane, u, 20, 2)
-        if cutlass.const_expr(self.cpa in (1, 2, 3, 6)):
+        if cutlass.const_expr(self.cpa in (1, 2, 3, 6, 8)):
             fence_async_smem()  # RoPE chunks written by cp.async (generic proxy)
         tc_fence_after()
         sc = taddr + Uint32(C_S)
@@ -1321,7 +1378,7 @@ class SparseMlaPrefillH8:
                 st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
                 mbar_wait(_bar(base, B_OREADY + u % NP), Uint32((u // NP) & 1))
                 self.ss(base, cta, lane, u, 18, 4)
-                if cutlass.const_expr(self.cpa in (2, 3, 6)):
+                if cutlass.const_expr(self.cpa in (2, 3, 6, 8)):
                     fence_async_smem()  # V chunks written by cp.async (generic proxy)
                 tc_fence_after()
                 pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
