@@ -96,6 +96,10 @@ WIDE_LM_HEAD = {16: "17-32:1"}
 # 96 rows 38.8 vs 47.0, 192 rows 46.6 vs 49.9, 288 rows 65.7 vs 66.8
 # (bench_kimi_k3_sdec_wide_sk.py).
 SK_LM_HEAD = {4: "96-96:1,192-192:1,288-288:1"}
+# Batches whose Markov bias GEMM ([B, 512] x [vocab / TP, 512]^T, three per step) is
+# that kernel too, per TP. TP4 [40960, 512] shard, VR200 1 GPU, cold weights, us,
+# wide_sk vs F.linear: B32 6.4 vs 11.8 (B64 7.0 vs 7.1, B96 7.5 vs 7.0: cuBLAS).
+SK_MARKOV = {4: (32,)}
 # Query rows whose context step (sharded projection + row gather, context-KV GEMM
 # and insert) the caller may run on a side stream, joined by the first MLA layer
 # right before its attention core (cutedsl.draft.attention ``join_context``): the
@@ -2141,6 +2145,7 @@ class VocabParallelMarkov:
         self.gather = gather
         self.batches: set[tuple[int, bool]] = set()
         self.buffers: dict[int, tuple] = {}
+        self.sk = None  # the die-local stream-K bias GEMM (SK_MARKOV batches)
         # ``group`` (a process group, with ``cap`` = the largest batch): the keys'
         # all-gather becomes peer stores into a mailbox [steps, TP, cap] polled by
         # the select (no collective launch). One mailbox per draft position: a peer
@@ -2189,9 +2194,31 @@ class VocabParallelMarkov:
             )
         return self.buffers[batch]
 
+    def prepare_sk(self):
+        """The SK_MARKOV batches' bias GEMM on the die-local stream-K kernel (on its
+        die-homed copy of the shard); compiled here, outside CUDA graph captures."""
+        if self.sk is not None:
+            return
+        from ..cutedsl.gemm import wide_sk
+
+        rows = SK_MARKOV.get(self.tp, ())
+        if not rows or self.w2.dtype != torch.bfloat16:
+            return
+        _, pairs = wide_sk.die_pairs(self.device)
+        n, k = self.w2.shape
+        rows = [r for r in rows if wide_sk.supports(r, n, k, pairs)]
+        if rows:
+            self.sk = wide_sk.PreparedWideSK(self.w2, rows).prepare()
+            logger.info_once(
+                "Kimi K3.1 DSpark drafter: die-local stream-K Markov bias GEMM for "
+                "batches %s",
+                tuple(rows),
+            )
+
     def prepare(self, batch, anchor_stride, draft_stride, sampled=False):
         """Compile and run once (every rank together: the keys are all-gathered),
         so nothing compiles during CUDA graph capture."""
+        self.prepare_sk()
         rows = batch * self.steps
         base = torch.zeros(
             (rows, self.vocab_rank), dtype=torch.bfloat16, device=self.device
@@ -2253,8 +2280,12 @@ class VocabParallelMarkov:
         poll = self.box is not None
         if poll and batch > self.cap:
             raise ValueError(f"Markov drafting: batch {batch} above the mailbox's {self.cap}")
+        sk = self.sk if self.sk is not None and self.sk.takes(emb) else None
         for step in range(self.steps):
-            bias = torch.nn.functional.linear(emb, self.w2)
+            if sk is not None:
+                bias = sk.run(emb, emb.new_empty((batch, self.vocab_rank)))
+            else:
+                bias = torch.nn.functional.linear(emb, self.w2)
             _vp_markov_keys[grid](
                 keys,
                 base,

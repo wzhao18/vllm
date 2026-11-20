@@ -28,7 +28,7 @@ def _ulps(got, ref):
 
 
 @pytest.mark.parametrize("place", [True, False])
-@pytest.mark.parametrize("rows", [96, 192, 288])
+@pytest.mark.parametrize("rows", [32, 96, 192, 288])
 def test_wide_sk(rows, place):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide_sk
 
