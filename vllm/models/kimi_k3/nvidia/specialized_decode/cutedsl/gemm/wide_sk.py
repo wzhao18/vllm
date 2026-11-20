@@ -23,6 +23,12 @@ hardware limits of these shapes:
   (~0.5-1 us each under load), so every lane of the weight warp and of the activation
   warp is its own issuer (K-step residue); a CTA's activation rows for a K step are
   one box (both MMA chunks: a token permutation the epilogue undoes).
+- ``spread``: any number of ranges per tile (the drafter's square / skinny linears,
+  ~4-14 ranges per tile). Every segment publishes its FP32 partial to a die-homed
+  workspace; once a tile's ranges have all published, its 2 KiB units are split over
+  them, and each sums its units' partials in K order (bulk loads into the drained
+  ring; deterministic) and stores BF16, or (``silu``: gate/up rows interleaved per 64)
+  vLLM's silu_and_mul of the BF16 gate and up values.
 """
 
 import cuda.bindings.driver as _cuda
@@ -36,20 +42,24 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 
 from ..common import dies, tensormap
-from ..common.primitives import asm
+from ..common.primitives import asm, div_rn
 from .wide import (
     _now,
     _st_u64,
+    _atom_add,
     _bar,
     _bulk_load,
     _fence_after,
     _fence_proxy_global,
     _ld_acquire,
+    _lds_v4,
     _nanosleep,
     _red_release_add,
+    _round_bf16,
     _st_bf16,
     _st_f32,
     _st_relaxed,
+    _st_v4,
     mma_columns,
 )
 
@@ -150,6 +160,17 @@ def _fence_before():
     return "tcgen05.fence::before_thread_sync;", "~{memory}", ()
 
 
+@asm()
+def _bar_n(barrier_id, count):
+    return "bar.sync $0, $1;", "r,r,~{memory}", (Int32(barrier_id), Int32(count))
+
+
+@asm()
+def _sts_v4(address, a, b, c, d):
+    code = "st.shared.v4.f32 [$0], {$1, $2, $3, $4};"
+    return code, "r,f,f,f,f,~{memory}", (Int32(address), a, b, c, d)
+
+
 @asm(Float32)
 def _add_lds_if(acc, address, pred):
     code = (
@@ -172,7 +193,57 @@ def max_contributors(total, slots, ks):
     return worst
 
 
-def supports(rows, n, k, pairs):
+def tile_ranges(total, slots, ks):
+    """(first range, ranges) of every tile of ``ks`` K steps; range s holds the K steps
+    [s total // slots, (s + 1) total // slots), so step x lies in range
+    ((x + 1) slots + total - 1) // total - 1."""
+    out = []
+    for t in range(total // ks):
+        a = ((t * ks + 1) * slots + total - 1) // total - 1
+        b = ((t + 1) * ks * slots + total - 1) // total - 1
+        out.append((a, b - a + 1))
+    return out
+
+
+OVERSIZED_BUDGET = 320 * 1024  # Rubin's oversized shared memory mode (327 KiB per CTA)
+MAX_W_STAGES = 20
+
+
+def smem_budget(device=None):
+    """Shared memory one CTA may use: the oversized budget on sm_107, else opt-in."""
+    props = torch.cuda.get_device_properties(device)
+    limit = props.shared_memory_per_block_optin
+    if (props.major, props.minor) == (10, 7):
+        limit = max(limit, OVERSIZED_BUDGET)
+    return limit
+
+
+def ring_bytes(rows, x_stages=4, smem=None):
+    """(weight stages, ring bytes) of the shared-memory budget ``smem``."""
+    n_mma, chunks = mma_columns(rows)
+    a_bytes = 128 * K_TILE * 2
+    b_bytes = chunks * (n_mma // 2) * K_TILE * 2
+    smem = smem or utils.get_smem_capacity_in_bytes("sm_100")
+    w_stages = min(MAX_W_STAGES, (smem - 4096 - x_stages * b_bytes) // a_bytes)
+    return w_stages, w_stages * a_bytes + x_stages * b_bytes
+
+
+def pack_tiles(weight):
+    """[R, K] -> [R / 128 * K / 64 * 128, 64]: each [128 rows, 64 K] tile contiguous
+    (row tile major, then K step), so one weight stage is one 16 KiB DRAM run."""
+    r, k = weight.shape
+    tiles = weight.view(r // 128, 128, k // K_TILE, K_TILE).permute(0, 2, 1, 3)
+    return tiles.contiguous().view(-1, K_TILE)
+
+
+def spread_bytes(rows, ranges):
+    """Shared memory a range's reduction of one tile needs: its unit pairs' (warps q
+    and q + 2) partials from all ``ranges`` ranges, 2 KiB each."""
+    units = 4 * (rows // 2 // CHUNK)
+    return -(-units // ranges) * 2 * ranges * 2048
+
+
+def supports(rows, n, k, pairs, spread=False, x_stages=4, smem=None):
     n_mma, chunks = mma_columns(rows)
     if not (
         rows % 32 == 0 and chunks > 0 and n_mma % 16 == 0 and n % 512 == 0
@@ -181,6 +252,12 @@ def supports(rows, n, k, pairs):
         return False
     ks = k // K_TILE
     total = n // 512 * ks
+    if spread:  # every range holds at least one K step
+        ring = ring_bytes(rows, x_stages, smem)[1]
+        return all(total >= p for p in pairs) and all(
+            spread_bytes(rows, c) <= ring for p in pairs
+            for _, c in tile_ranges(total, p, ks)
+        )  # fmt: skip
     return all(max_contributors(total, p, ks) <= MAX_CONTRIBUTORS for p in pairs)
 
 
@@ -191,13 +268,32 @@ class WideSK:
     (``STAMPS`` u64: entry, slot, then per segment acc_full seen / done, end)."""
 
     def __init__(self, rows, n, k, pairs, ldo=None, w_issuers=3, x_issuers=2, debug=0,
-                 x_stages=4):  # fmt: skip
-        assert supports(rows, n, k, pairs), (rows, n, k, pairs)
+                 x_stages=4, spread=False, silu=False, smem=None, packed=False,
+                 keep_w=False):  # fmt: skip
+        """``smem``: the shared-memory budget (default: the sm_100 capacity);
+        ``packed``: the weight halves are ``pack_tiles`` layouts; ``keep_w``: load the
+        weight with the default L2 policy (it is read again soon), not evict-first."""
+        assert supports(rows, n, k, pairs, spread, x_stages, smem), (rows, n, k, pairs)
+        assert spread or not silu
+        self.packed, self.keep_w = packed, keep_w
         self.rows, self.n, self.k = rows, n, k
         self.p0, self.p1 = pairs
         self.pairs = self.p0 + self.p1
-        self.ldo = ldo or n
+        self.spread, self.silu = spread, silu
+        self.ldo = ldo or (n // 2 if silu else n)
         self.debug = debug
+        self.nch = rows // 2 // CHUNK  # 16-column units per epilogue thread
+        self.tpd = n // 512  # tiles per die
+        # spread: workspace [die][tile][range in tile][CTA] of one CTA's FP32 partial
+        # (8 warps x nch 2 KiB units), each die's part 2 MiB aligned (homed there);
+        # then 2 x tpd tile counters per die (published, done) after the stamps
+        ks_ = k // K_TILE
+        self.cmax = max(c for p in pairs for _, c in tile_ranges(n // 512 * ks_, p, ks_))
+        self.cta_bytes = 8 * self.nch * 2048
+        part = self.tpd * self.cmax * 2 * self.cta_bytes
+        self.die_stride = -(-part // (2 << 20)) * (2 << 20)
+        self.cnt_byte = self.pairs * 8 + 8 + 2 * self.pairs * STAMPS * 8
+        self.done_byte = self.cnt_byte + 2 * self.tpd * 2 * 4
         self.n_mma, self.chunks = mma_columns(rows)
         self.mma_tiler = (256, self.n_mma, K_TILE)
         self.nw, self.nx = w_issuers, x_issuers  # issuing lanes
@@ -212,11 +308,10 @@ class WideSK:
         a_bytes = 128 * K_TILE * 2
         b_bytes = self.chunks * (self.n_mma // 2) * K_TILE * 2
         self.a_stage, self.b_stage = a_bytes, b_bytes
-        smem = utils.get_smem_capacity_in_bytes("sm_100")
         self.x_stages = x_stages
-        self.w_stages = min(14, (smem - 4096 - x_stages * b_bytes) // a_bytes)
-        ring = self.w_stages * a_bytes + x_stages * b_bytes
+        self.w_stages, ring = ring_bytes(rows, x_stages, smem)
         assert ring >= rows * 512  # owner partial staging
+        assert not spread or ring >= spread_bytes(rows, self.cmax)
         # one issuing lane per in-flight stage at most (two lanes would arm one phase)
         assert self.nw <= self.w_stages and self.nx <= x_stages
         self.tmem_cols = 32
@@ -251,8 +346,12 @@ class WideSK:
         l2 = _cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         k, half, rows = self.k, self.n // 2, self.rows
         # weights: a CTA's 128 rows x one K step; activations: a CTA's T / 2 rows
-        wmap0 = tensormap.encode_map(w0, bf16, (k, half), (k * 2,), (K_TILE, 128), sw128, l2)
-        wmap1 = tensormap.encode_map(w1, bf16, (k, half), (k * 2,), (K_TILE, 128), sw128, l2)
+        if cutlass.const_expr(self.packed):  # [tiles x 128, 64]: one box = one 16 KiB run
+            wdims, wstride = (K_TILE, half * k // K_TILE), (K_TILE * 2,)
+        else:
+            wdims, wstride = (k, half), (k * 2,)
+        wmap0 = tensormap.encode_map(w0, bf16, wdims, wstride, (K_TILE, 128), sw128, l2)
+        wmap1 = tensormap.encode_map(w1, bf16, wdims, wstride, (K_TILE, 128), sw128, l2)
         xmap0 = tensormap.encode_map(x, bf16, (k, rows), (k * 2,), (K_TILE, rows // 2),
                                      sw128, l2)  # fmt: skip
         xmap1 = tensormap.encode_map(x1, bf16, (k, rows), (k * 2,), (K_TILE, rows // 2),
@@ -268,6 +367,7 @@ class WideSK:
             x_empty: cute.struct.MemRange[cutlass.Int64, self.x_stages]
             acc_full: cute.struct.MemRange[cutlass.Int64, 2]
             acc_empty: cute.struct.MemRange[cutlass.Int64, 2]
+            red: cute.struct.MemRange[cutlass.Int64, 8]
             dealloc: cutlass.Int64
             xfer: cutlass.Int64
             tmem_holder: cutlass.Int32
@@ -317,6 +417,7 @@ class WideSK:
         w_full, w_empty = st.w_full.data_ptr(), st.w_empty.data_ptr()
         x_full, x_empty = st.x_full.data_ptr(), st.x_empty.data_ptr()
         acc_full, acc_empty = st.acc_full.data_ptr(), st.acc_empty.data_ptr()
+        red = st.red.data_ptr()
         dealloc, xfer = st.dealloc.ptr, st.xfer.ptr
         tmem_holder = st.tmem_holder.ptr
         slot_addr = Int32(st.slot.ptr.toint())
@@ -339,6 +440,8 @@ class WideSK:
                 for i in cutlass.range_constexpr(2):
                     cute.arch.mbarrier_init(acc_full + i, 1)
                     cute.arch.mbarrier_init(acc_empty + i, 16)
+                for i in cutlass.range_constexpr(8):
+                    cute.arch.mbarrier_init(red + i, 1)
                 cute.arch.mbarrier_init(dealloc, 32)
                 cute.arch.mbarrier_init(xfer, 1)
         cute.arch.mbarrier_init_fence()
@@ -405,8 +508,16 @@ class WideSK:
                     bar = Int32((w_full + s).toint())
                     if leader:
                         cute.arch.mbarrier_arrive_and_expect_tx(w_full + s, self.tx_a)
-                    _tma2_stream(sa_addr + s * self.a_stage, wmap, (gk - t * ks) * K_TILE,
-                                 t * 256 + v * 128, _mapa(bar, 0))  # fmt: skip
+                    c0 = (gk - t * ks) * K_TILE
+                    c1 = t * 256 + v * 128
+                    if cutlass.const_expr(self.packed):
+                        c0 = Int32(0)
+                        c1 = ((t * 2 + v) * ks + gk - t * ks) * 128
+                    if cutlass.const_expr(self.keep_w):  # re-read soon: keep in L2
+                        _tma2(sa_addr + s * self.a_stage, wmap, c0, c1, _mapa(bar, 0))
+                    else:
+                        _tma2_stream(sa_addr + s * self.a_stage, wmap, c0, c1,
+                                     _mapa(bar, 0))  # fmt: skip
         elif warp == 10:  # activations: one issuer per lane, after the PDL wait
             xmap = tensormap.map_address(xmap0)
             if mTable[_smid()] != 0:  # the copy homed on this CTA's die
@@ -470,12 +581,22 @@ class WideSK:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, alignment=16,
                                                    ptr_to_buffer_holding_addr=tmem_holder)  # fmt: skip
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
-            if warp < 4:
-                self.epilogue(acc, acc_full, acc_empty, xfer, warp, lane, v, g, wd, j, nd,
-                              s0, s1, stage_addr, mY, mWs, flags, stamp, 0)  # fmt: skip
+            if cutlass.const_expr(self.spread):
+                if warp < 4:
+                    self.epilogue_spread(acc, acc_full, acc_empty, red, warp, lane, v, wd,
+                                         j, nd, s0, s1, stage_addr, mY, mWs, flags, stamp,
+                                         0)  # fmt: skip
+                else:
+                    self.epilogue_spread(acc, acc_full, acc_empty, red, warp, lane, v, wd,
+                                         j, nd, s0, s1, stage_addr, mY, mWs, flags, stamp,
+                                         1)  # fmt: skip
             else:
-                self.epilogue(acc, acc_full, acc_empty, xfer, warp, lane, v, g, wd, j, nd,
-                              s0, s1, stage_addr, mY, mWs, flags, stamp, 1)  # fmt: skip
+                if warp < 4:
+                    self.epilogue(acc, acc_full, acc_empty, xfer, warp, lane, v, g, wd, j,
+                                  nd, s0, s1, stage_addr, mY, mWs, flags, stamp, 0)  # fmt: skip
+                else:
+                    self.epilogue(acc, acc_full, acc_empty, xfer, warp, lane, v, g, wd, j,
+                                  nd, s0, s1, stage_addr, mY, mWs, flags, stamp, 1)  # fmt: skip
             if cutlass.const_expr(self.debug & 8):
                 if warp == 0:
                     if lane == 0:
@@ -584,6 +705,156 @@ class WideSK:
                     if si < 6:
                         _st_u64(stamp + (3 + 2 * si) * 8, _now())
 
+    @cute.jit
+    def epilogue_spread(
+        self, acc: cute.Tensor, acc_full, acc_empty, red, ew: Int32, lane: Int32,
+        v: Int32, wd: Int32, j: Int32, nd: Int32, s0: Int32, s1: Int32,
+        stage_addr: Int32, mY: cute.Tensor, mWs: cute.Tensor, flags: Int64,
+        stamp: Int64, half: cutlass.Constexpr[int],
+    ):  # fmt: skip
+        """``spread``: warp ew (0-7) drains TMEM lane quarter ew % 4 and columns
+        [h T / 2, (h + 1) T / 2), h = ew // 4, per segment and publishes them as nch
+        2 KiB units ([4][32 lanes][4] FP32: a warp store covers 512 contiguous bytes),
+        then counts the tile. After its last segment the range takes its share of every
+        tile it touched: unit pair u (warps q, q + 2 and one 16-column unit) belongs to
+        the tile's range (u mod c) (c ranges, K order); it bulk-loads the unit's c
+        partials into the drained ring, sums them in K order and stores BF16 (silu: the
+        up warp hands its sums to the gate warp, which stores silu_and_mul)."""
+        rows, ks, total, nch = self.rows, self.ks, self.total, self.nch
+        unit = 2048
+        cta = self.cta_bytes
+        quarter = ew % 4
+        hcols = rows // 2
+        lane_bits = (quarter * 32) << 16
+        base = [
+            Int32(acc[(None, None, None, c)].iterator.toint()) + lane_bits
+            for c in range(self.chunks)
+        ]
+        ws = mWs.iterator.toint() + Int64(wd) * self.die_stride
+        y = mY.iterator.toint()
+        first_col = half * hcols
+        lead = ew * 32 + lane == 0
+        t0 = s0 // ks
+        nseg = (s1 - 1) // ks - t0 + 1
+        cnt0 = flags + Int64(self.cnt_byte + wd * self.tpd * 8)
+        done0 = flags + Int64(self.done_byte + wd * self.tpd * 8)
+        for si in cutlass.range(nseg, unroll=1):
+            t = t0 + si
+            b = si % self.acc_bufs
+            cute.arch.mbarrier_wait(acc_full + b, (si // self.acc_bufs) & 1)
+            if cutlass.const_expr(self.debug & 8):
+                if lead:
+                    if si < 4:
+                        _st_u64(stamp + (2 + 2 * si) * 8, _now())
+            _fence_after()
+            vals = []
+            for jj in cutlass.range_constexpr(nch):
+                vals += list(_tmem_ld16w(self.taddr(base, b, first_col + jj * CHUNK)))
+            _fence_before()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(acc_empty + b, Int32(0))
+            jf = ((t * ks + 1) * nd + total - 1) // total - 1
+            dst = ws + Int64(((t * self.cmax + j - jf) * 2 + v) * cta + ew * nch * unit)
+            dst = dst + Int64(lane * 16)
+            for jj in cutlass.range_constexpr(nch):
+                for q4 in cutlass.range_constexpr(4):
+                    i0 = jj * CHUNK + q4 * 4
+                    _st_v4(dst + (jj * unit + q4 * 512), vals[i0], vals[i0 + 1],
+                           vals[i0 + 2], vals[i0 + 3])  # fmt: skip
+            _bar(2, 256)
+            if lead:
+                _red_release_add(cnt0 + Int64(t * 2 + v) * 4, 1)
+            if cutlass.const_expr(self.debug & 8):
+                if lead:
+                    if si < 4:
+                        _st_u64(stamp + (3 + 2 * si) * 8, _now())
+        ph = Int32(0)
+        up_id = half * 2 + quarter % 2
+        p = quarter // 2
+        sums = cute.make_rmem_tensor(CHUNK, Float32)
+        for si in cutlass.range(nseg, unroll=1):
+            t = t0 + si
+            jf = ((t * ks + 1) * nd + total - 1) // total - 1
+            jl = ((t + 1) * ks * nd + total - 1) // total - 1
+            c = jl - jf + 1
+            me = j - jf
+            cnt = cnt0 + Int64(t * 2 + v) * 4
+            if lead:
+                while _ld_acquire(cnt) < c:
+                    _nanosleep()
+            _bar(2, 256)
+            if cutlass.const_expr(self.debug & 8):
+                if lead:
+                    if si == 0:
+                        _st_u64(stamp + 10 * 8, _now())
+            _fence_proxy_global()
+            src = ws + Int64((t * self.cmax * 2 + v) * cta + ew * nch * unit)
+            own = Int32(0)
+            for jj in cutlass.range_constexpr(nch):
+                if (up_id * nch + jj) % c == me:
+                    own = own + 1
+            if own > 0:
+                if lane == 0:
+                    cute.arch.mbarrier_arrive_and_expect_tx(red + ew, own * c * unit)
+                cute.arch.sync_warp()
+                for jj in cutlass.range_constexpr(nch):
+                    u = up_id * nch + jj
+                    if u % c == me:
+                        sdst = stage_addr + ((u // c) * 2 + p) * c * unit
+                        for i in cutlass.range(lane, c, 32, unroll=1):
+                            _bulk_load(sdst + i * unit, src + Int64(i * 2 * cta + jj * unit),
+                                       unit, red + ew)  # fmt: skip
+                cute.arch.mbarrier_wait(red + ew, ph)
+                ph = ph ^ 1
+            if cutlass.const_expr(self.debug & 8):
+                if lead:
+                    if si == 0:
+                        _st_u64(stamp + 11 * 8, _now())
+            for jj in cutlass.range_constexpr(nch):
+                u = up_id * nch + jj
+                if u % c == me:
+                    sb = stage_addr + ((u // c) * 2 + p) * c * unit + lane * 16
+                    for e in cutlass.range_constexpr(CHUNK):
+                        sums[e] = Float32(0)
+                    for i in cutlass.range(c, unroll=1):
+                        for q4 in cutlass.range_constexpr(4):
+                            a = _lds_v4(sb + i * unit + q4 * 512)
+                            for e in cutlass.range_constexpr(4):
+                                sums[q4 * 4 + e] = sums[q4 * 4 + e] + a[e]
+                    if cutlass.const_expr(self.silu):
+                        xb = stage_addr + ((u // c) * 2 + 1) * c * unit + lane * 16
+                        if p == 1:  # up rows: hand the sums to the gate warp
+                            for q4 in cutlass.range_constexpr(4):
+                                _sts_v4(xb + q4 * 512, sums[q4 * 4], sums[q4 * 4 + 1],
+                                        sums[q4 * 4 + 2], sums[q4 * 4 + 3])  # fmt: skip
+                        _bar_n(3 + up_id, 64)
+                        if p == 0:
+                            col = wd * (self.n // 4) + t * 128 + v * 64 + quarter * 32 + lane
+                            for q4 in cutlass.range_constexpr(4):
+                                ups = _lds_v4(xb + q4 * 512)
+                                for e in cutlass.range_constexpr(4):
+                                    gate = _round_bf16(sums[q4 * 4 + e])
+                                    up = _round_bf16(ups[e])
+                                    act = div_rn(gate, Float32(1) + cute.math.exp(
+                                        -gate, fastmath=False))  # fmt: skip
+                                    act = Float32(cutlass.BFloat16(act)) * (up + Float32(0))
+                                    tok = self.token(first_col + jj * CHUNK + q4 * 4 + e)
+                                    _st_bf16(y + (Int64(tok) * self.ldo + col) * 2, act)
+                    else:
+                        row = wd * (self.n // 2) + t * 256 + v * 128 + quarter * 32 + lane
+                        for e in cutlass.range_constexpr(CHUNK):
+                            tok = self.token(first_col + jj * CHUNK + e)
+                            _st_bf16(y + (Int64(tok) * self.ldo + row) * 2, sums[e])
+            _bar(2, 256)
+            if lead:  # the tile's last range to finish resets its counters
+                done = done0 + Int64(t * 2 + v) * 4
+                if _atom_add(done, 1) == c - 1:
+                    _st_relaxed(cnt, 0)
+                    _st_relaxed(done, 0)
+        if cutlass.const_expr(self.debug & 8):
+            if lead:
+                _st_u64(stamp + 12 * 8, _now())
+
     def taddr(self, base, b, col):
         """TMEM address of accumulator column ``col`` (chunk-major) of buffer b."""
         c, off = divmod(col, self.n_mma)
@@ -615,39 +886,71 @@ def place_halves(weight):
     return dies.localized_like(weight.contiguous(), domains)
 
 
+def silu_rows(weight):
+    """A merged [gate; up] weight [2 I, K] with its rows interleaved per 64: rows
+    [128 b, 128 b + 64) gate rows [64 b, 64 b + 64), the next 64 the same up rows."""
+    n, k = weight.shape
+    return weight.view(2, n // 128, 64, k).transpose(0, 1).reshape(n, k)
+
+
 class PreparedWideSK:
     """``WideSK`` per prepared row count on one [N, K] BF16 weight. ``place``: copy it
     into die-homed halves (else the kernel streams it where it lies, e.g. striped).
-    ``run(x, out)``: out [T, N] BF16 (row pitch ``ldo``)."""
+    ``spread``: the any-ranges-per-tile reduction; ``silu``: ``weight`` is a merged
+    [gate; up] weight and the output its silu_and_mul [T, N / 2].
+    ``run(x, out)``: out [T, N] BF16 (row pitch ``ldo``; [T, N / 2] with ``silu``)."""
 
     def __init__(self, weight, rows, ldo=None, place=True, w_issuers=3, x_issuers=2,
-                 debug=0, x_stages=4):  # fmt: skip
+                 debug=0, x_stages=4, spread=False, silu=False, share=None, smem=None,
+                 packed=False, keep_w=False):  # fmt: skip
+        """``share``: a prepared instance of the same shape and options whose workspace
+        and counters this one reuses (launches on one stream never overlap); ``smem``:
+        the shared-memory budget (default: the 227 KiB opt-in; above it, in Rubin's
+        oversized mode, the 288-row LM head measured 2x slower); ``packed``: stream the
+        halves as ``pack_tiles`` copies."""
+        self.share = share
         self.doms, self.pairs = die_pairs(weight.device)
+        if silu:
+            weight = silu_rows(weight)
+        self.n, self.k = weight.shape
+        if packed:
+            h = self.n // 2
+            weight = torch.cat([pack_tiles(weight[:h]), pack_tiles(weight[h:])])
         self.weight = place_halves(weight) if place else weight.contiguous()
-        self.n, self.k = self.weight.shape
+        self.out_n = self.n // 2 if silu else self.n
         self.rows = tuple(rows)
         self.ldo = ldo
-        self.opts = (w_issuers, x_issuers, debug, x_stages)
+        self.opts = (w_issuers, x_issuers, debug, x_stages, spread, silu, smem, packed,
+                     keep_w)
         self.kernels, self.state = {}, {}
 
     def prepare(self):
         dev = self.weight.device
-        half = self.n // 2
-        self.w0 = self.weight[:half].data_ptr()
-        self.w1 = self.weight[half:].data_ptr()
+        self.w0 = self.weight.data_ptr()  # each half: N / 2 x K elements (either layout)
+        self.w1 = self.w0 + self.n // 2 * self.k * self.weight.element_size()
         self.table = torch.tensor(self.doms, dtype=torch.int32, device=dev)
         self.table_c = from_dlpack(self.table, assumed_align=16)
         npairs = sum(self.pairs)
         for rows in self.rows:
             gemm = WideSK(rows, self.n, self.k, self.pairs, self.ldo, *self.opts)
             x = torch.empty(rows, self.k, dtype=torch.bfloat16, device=dev)
-            y = torch.empty(rows, self.ldo or self.n, dtype=torch.bfloat16, device=dev)
-            ws = torch.empty(npairs, 2, rows, 128, dtype=torch.float32, device=dev)
-            flags = torch.zeros(2 * npairs + 2 + 4 * npairs * STAMPS, dtype=torch.int32,
-                                device=dev)  # fmt: skip
-            args = (self.w0, self.w1, x.data_ptr(), x.data_ptr(), self._y(y[:, : self.n]),
-                    from_dlpack(ws, assumed_align=16), from_dlpack(flags, assumed_align=16),
-                    self.table_c)  # fmt: skip
+            y = torch.empty(rows, self.ldo or self.out_n, dtype=torch.bfloat16, device=dev)
+            if self.share is not None:
+                assert (self.share.n, self.share.k, self.share.opts) == (
+                    self.n, self.k, self.opts)  # fmt: skip
+                ws, flags = self.share.state[rows][:2]
+            elif gemm.spread:  # each die's partials homed on that die
+                chunks = gemm.die_stride // (2 << 20)
+                ws = dies.localized_empty(2 * gemm.die_stride, [0] * chunks + [1] * chunks,
+                                          dev)  # fmt: skip
+            else:
+                ws = torch.empty(npairs, 2, rows, 128, dtype=torch.float32, device=dev)
+            if self.share is None:
+                flags = torch.zeros(2 * npairs + 2 + 4 * npairs * STAMPS + 8 * gemm.tpd,
+                                    dtype=torch.int32, device=dev)  # fmt: skip
+            args = (self.w0, self.w1, x.data_ptr(), x.data_ptr(),
+                    self._y(y[:, : self.out_n]), from_dlpack(ws, assumed_align=16),
+                    from_dlpack(flags, assumed_align=16), self.table_c)  # fmt: skip
             key = (rows, self.n, self.k, self.pairs, self.ldo, self.opts)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
@@ -670,7 +973,8 @@ class PreparedWideSK:
         """[2 * pairs, STAMPS] int64 stamps of the last ``debug & 8`` launch."""
         flags = self.state[rows][1]
         npairs = sum(self.pairs)
-        return flags[2 * npairs + 2:].view(torch.int64).view(2 * npairs, STAMPS)
+        st = flags[2 * npairs + 2 : 2 * npairs + 2 + 4 * npairs * STAMPS]
+        return st.view(torch.int64).view(2 * npairs, STAMPS)
 
     def takes(self, x):
         return (

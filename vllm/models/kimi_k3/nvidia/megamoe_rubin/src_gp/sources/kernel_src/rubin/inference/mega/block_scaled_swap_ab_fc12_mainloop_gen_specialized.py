@@ -61,14 +61,22 @@ from . import dynamic_mainloop
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .shared_expert_mainloop import SharedKindMainloopMixin
 from .tma_gather import sm107_tma_gather4_load
-from ...custom_mix_cga_helpers import bind_executable_tma_load_fields, make_executable_tma_atom_or_pair
+from ...custom_mix_cga_helpers import (
+    bind_executable_tma_load_fields,
+    make_executable_tma_atom_or_pair,
+    make_l2_evict_first_policy,
+)
 
 
-def _bind_tma_issue(exec_atom: cute.CopyAtom, tma_barrier: cute.Pointer, mcast_mask) -> cute.CopyAtom:
+def _bind_tma_issue(
+    exec_atom: cute.CopyAtom, tma_barrier: cute.Pointer, mcast_mask, cache_policy=None
+) -> cute.CopyAtom:
     """Bind one stage's barrier (and, on multicast atoms, the mask) to an executable TMA load atom."""
     if not isinstance(exec_atom._trait, CopyBulkTensorTileG2SMulticastTrait):
         mcast_mask = None
-    return bind_executable_tma_load_fields(exec_atom, tma_bar_ptr=tma_barrier, tma_desc_ptr=None, mcast_mask=mcast_mask)
+    return bind_executable_tma_load_fields(
+        exec_atom, tma_bar_ptr=tma_barrier, tma_desc_ptr=None, mcast_mask=mcast_mask, cache_policy=cache_policy
+    )
 
 class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, KernelComponent):
     """Own all Rubin load, MMA, pipeline, SMEM, and TMEM mainloop state."""
@@ -1176,6 +1184,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
         global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
+        # Every weight byte is read once per launch: evict_first keeps the weight stream from
+        # evicting the token payload, scale factors and FC1 outputs that later units re-read.
+        weight_policy = make_l2_evict_first_policy()
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
@@ -1185,12 +1196,12 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             if k_tile_idx + 1 < k_tile_count:
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
             cute.copy(
-                _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask),
+                _bind_tma_issue(a_exec_atom, tma_barrier, multicast_mask, weight_policy),
                 global_a_slice[(None, k_tile_idx)],
                 partitioned_smem_a[(None, stage_index)],
             )
             cute.copy(
-                _bind_tma_issue(sfa_exec_atom, tma_barrier, multicast_mask),
+                _bind_tma_issue(sfa_exec_atom, tma_barrier, multicast_mask, weight_policy),
                 global_sfa_slice[(None, k_tile_idx)],
                 partitioned_smem_sfa[(None, stage_index)],
             )

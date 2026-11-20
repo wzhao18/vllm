@@ -71,8 +71,7 @@ int64_t lt_version();
 int64_t lt_plan(int64_t n, int64_t k, bool mx, const std::string& hex);
 std::vector<int64_t> lt_info(int64_t id, int64_t rows);
 void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::Tensor& out,
-            const torch::Tensor& ws, const c10::optional<torch::Tensor>& wsf,
-            const c10::optional<torch::Tensor>& xsf);
+            const c10::optional<torch::Tensor>& wsf, const c10::optional<torch::Tensor>& xsf);
 """
 
 _CUDA_SRC = r"""
@@ -91,7 +90,6 @@ _CUDA_SRC = r"""
 namespace {
 struct Rows {
   cublasLtMatrixLayout_t b, d;
-  size_t ws;
 };
 struct Plan {
   cublasLtMatmulDesc_t op;
@@ -141,7 +139,12 @@ Rows& rows_for(Plan& p, int64_t rows) {
     TORCH_CHECK(false, "gemm_tactics: cublasLtMatmulAlgoCheck rejected the pinned algorithm for [",
                 p.n, ", ", p.k, "] x ", rows, " rows (status ", (int)st, ")");
   }
-  r.ws = h.workspaceSize;
+  // Pins run without workspace: calls on concurrent streams share nothing.
+  if (h.workspaceSize) {
+    cublasLtMatrixLayoutDestroy(r.b); cublasLtMatrixLayoutDestroy(r.d);
+    TORCH_CHECK(false, "gemm_tactics: the pinned algorithm for [", p.n, ", ", p.k, "] x ", rows,
+                " rows needs ", h.workspaceSize, " workspace bytes; pins must need none");
+  }
   return p.rows.emplace(rows, r).first->second;
 }
 }  // namespace
@@ -168,13 +171,13 @@ int64_t lt_plan(int64_t n, int64_t k, bool mx, const std::string& hex) {
   return (int64_t)g_plans.size() - 1;
 }
 
-// [workspace bytes, algo id, tile, stages, split-K, cluster shape] at `rows` rows.
+// [algo id, tile, stages, split-K, cluster shape] (checked at `rows` rows).
 std::vector<int64_t> lt_info(int64_t id, int64_t rows) {
   std::lock_guard<std::mutex> lock(g_mu);
   TORCH_CHECK(id >= 0 && id < (int64_t)g_plans.size(), "gemm_tactics: no plan ", id);
   Plan& p = g_plans[id];
-  Rows& r = rows_for(p, rows);
-  return {(int64_t)r.ws, cfg_attr(p.algo, CUBLASLT_ALGO_CONFIG_ID, 4),
+  rows_for(p, rows);
+  return {cfg_attr(p.algo, CUBLASLT_ALGO_CONFIG_ID, 4),
           cfg_attr(p.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, 4),
           cfg_attr(p.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, 4),
           cfg_attr(p.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, 4),
@@ -182,8 +185,7 @@ std::vector<int64_t> lt_info(int64_t id, int64_t rows) {
 }
 
 void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::Tensor& out,
-            const torch::Tensor& ws, const c10::optional<torch::Tensor>& wsf,
-            const c10::optional<torch::Tensor>& xsf) {
+            const c10::optional<torch::Tensor>& wsf, const c10::optional<torch::Tensor>& xsf) {
   std::lock_guard<std::mutex> lock(g_mu);
   TORCH_CHECK(id >= 0 && id < (int64_t)g_plans.size(), "gemm_tactics: no plan ", id);
   Plan& p = g_plans[id];
@@ -197,7 +199,6 @@ void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::T
   TORCH_CHECK(w.scalar_type() == x.scalar_type() &&
               w.scalar_type() == (p.mx ? at::kFloat8_e4m3fn : at::kBFloat16), "gemm_tactics: operand dtype");
   Rows& r = rows_for(p, rows);
-  TORCH_CHECK((size_t)ws.nbytes() >= r.ws, "gemm_tactics: plan needs ", r.ws, " workspace bytes");
   if (p.mx) {
     TORCH_CHECK(wsf.has_value() && xsf.has_value(), "gemm_tactics: MXFP8 needs both scale tensors");
     const void* a = wsf->data_ptr(); const void* b = xsf->data_ptr();
@@ -207,8 +208,8 @@ void lt_run(int64_t id, const torch::Tensor& w, const torch::Tensor& x, torch::T
   const c10::cuda::CUDAGuard guard(out.device());
   float alpha = 1.f, beta = 0.f;
   LTCHECK(cublasLtMatmul(handle_for(out.get_device()), p.op, &alpha, w.data_ptr(), p.a, x.data_ptr(), r.b,
-                         &beta, out.data_ptr(), r.d, out.data_ptr(), r.d, &p.algo,
-                         r.ws ? ws.data_ptr() : nullptr, r.ws, c10::cuda::getCurrentCUDAStream()));
+                         &beta, out.data_ptr(), r.d, out.data_ptr(), r.d, &p.algo, nullptr, 0,
+                         c10::cuda::getCurrentCUDAStream()));
 }
 """
 
@@ -245,8 +246,6 @@ def _module():
 
 
 _PLANS: dict[tuple[str, int, int], int] = {}
-_WORKSPACE: dict[int, torch.Tensor] = {}
-_WS_BYTES = 32 << 20
 
 
 def _supported() -> bool:
@@ -273,15 +272,6 @@ def plan(dtype: str, n: int, k: int) -> int | None:
     return _PLANS[key]
 
 
-def _workspace(device: torch.device) -> torch.Tensor:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    ws = _WORKSPACE.get(index)
-    if ws is None:
-        ws = torch.empty(_WS_BYTES, dtype=torch.uint8, device=device)
-        _WORKSPACE[index] = ws
-    return ws
-
-
 def mm(
     plan_id: int,
     x: torch.Tensor,
@@ -291,7 +281,7 @@ def mm(
 ) -> torch.Tensor:
     """``x[R, K] @ w[N, K]^T`` -> BF16 [R, N] on the pinned tactic."""
     out = torch.empty((x.shape[0], w.shape[0]), dtype=torch.bfloat16, device=x.device)
-    _module().lt_run(plan_id, w, x, out, _workspace(x.device), w_scale, x_scale)
+    _module().lt_run(plan_id, w, x, out, w_scale, x_scale)
     return out
 
 
