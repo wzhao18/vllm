@@ -63,6 +63,42 @@ def test_wide_gemm(rows, n, k, split, silu):
         assert _ulps(out, ref) <= bound
 
 
+@pytest.mark.parametrize("rows", [32, 64, 96])
+def test_wide_gemm_latent_up_rings(rows):
+    """The split latent up (n 7168, k 3584, split 3, FP32 partials) with the sdec
+    per-row (weight, activation) rings in the oversized shared memory
+    (``sp_mlp.LATENT_UP_RINGS``): split partials summed in split order match the
+    FP32 reference, and equal the default-ring kernel's bit for bit."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.wide import (
+        PreparedWide,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_mlp import (
+        LATENT_UP_RINGS,
+    )
+
+    n, k, split = 7168, 3584, 3
+    torch.manual_seed(rows)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    ws, ast = LATENT_UP_RINGS[rows]
+    deep = PreparedWide(w, {rows: (split, (1,), ws, (0, 3), False, False, ast)}, partials=True).prepare()
+    base = PreparedWide(w, {rows: split}, partials=True).prepare()
+    full = x.float() @ w.float().t()
+    got = torch.empty(split, rows, n, device="cuda", dtype=torch.float32)
+    ref = torch.empty_like(got)
+    for _ in range(3):
+        got.fill_(float("nan"))
+        deep.run(x, got)
+        base.run(x, ref)
+        torch.cuda.synchronize()
+        assert not got.isnan().any()
+        assert torch.equal(got, ref)
+        total = got[0].clone()
+        for s in range(1, split):
+            total += got[s]
+        assert (total - full).abs().max() <= 1e-5 * full.abs().max()
+
+
 @pytest.mark.parametrize(
     "rows,n,k,split,partials",
     [
