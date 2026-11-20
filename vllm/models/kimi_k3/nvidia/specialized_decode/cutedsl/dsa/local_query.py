@@ -123,8 +123,8 @@ class LocalQuery:
         from vllm import _custom_ops as ops
 
         rows, b = qc.shape[0], self.buffers
-        q = self.projection.run(qc, b.q[:rows])
-        query_uk(q, self.uk_t, self.q_scale, b.query[:rows])
+        # DEBUG PROBE (never land): q_b + QueryUK skipped (timing only: the query
+        # rows keep whatever they held) to measure the index chain without them.
         kv = b.kv[:rows]
         ops.rms_norm(kv, projected[:, 1536:2048], self.kv_norm, self.kv_eps)
         k_pe = projected[:, 2048:2112]
