@@ -79,10 +79,8 @@ def main():
         plain = len(f) > 7 and bool(f[7])
         skip = len(f) > 8 and bool(f[8])
         unit = len(f) > 9 and bool(f[9])
-        clamp = not (len(f) > 10 and f[10] == 0)
         k = U.UkQueryFp8(
-            ((tm, tn), (cm, cn), tma, epn, mab), plain=plain, skip_rope=skip,
-            unit_scale=unit, clamp=clamp,
+            ((tm, tn), (cm, cn), tma, epn, mab), unit_scale=unit, rope=not skip, plain=plain
         )
         out = torch.full((T, H, L + R), 0x55, device=dev, dtype=torch.uint8).view(
             torch.float8_e4m3fn
@@ -103,7 +101,6 @@ def main():
             "nope_mismatch": np_eq,
             "nope_max_rel": float(rel.max()),
             "us": us,
-            "stages": [getattr(k.gemm, n, None) for n in ("num_acc_stage", "num_ab_stage", "num_c_stage")],
         }
         print(tac, json.dumps(res[tac]), flush=True)
     print(json.dumps(res), flush=True)

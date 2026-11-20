@@ -4,19 +4,24 @@ The stock MLA prefill path builds the sparse-MLA FP8 query in three passes
 (``mla_attention``: ``torch.bmm(q_nope, W_UK_T)`` into the NoPE columns of a
 BF16 ``(T, H, L + R)`` buffer, the RoPE part copied beside it, then
 ``_DecodeConcatQuantFP8`` / ``QuantFP8`` static per-tensor quant). ``UkQueryFp8``
-writes the FP8 query directly: a batched (one batch per head) BF16 tcgen05 GEMM
-whose epilogue rounds each FP32 accumulator to BF16 (the bmm output dtype), then
-quantizes exactly as ``QuantFP8`` (``x * (1 / scale)`` in FP32, clamp to the E4M3
-range, round to nearest even); the CTAs of the first N tile also quantize the
-RoPE columns of their rows. Same math as the three stock passes (the GEMM's
-FP32 accumulation order is the tensor-core order, as for any GEMM backend).
+writes the FP8 query in two passes: a batched (one batch per head) BF16 tcgen05
+GEMM whose epilogue rounds each FP32 accumulator to BF16 (the bmm output dtype),
+then quantizes exactly as ``QuantFP8`` (``x * (1 / scale)`` in FP32, clamp to the
+E4M3 range, round to nearest even) straight into the NoPE columns, and a small
+pass that quantizes the RoPE columns the same way. Bitwise equal to the stock
+passes (the GEMM's FP32 accumulation order is the tensor-core order, as for any
+GEMM backend). F16K (16383 rows x 96 heads): 178 vs 473 us per layer (1 GPU).
 """
+
+import weakref
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
+import triton
+import triton.language as tl
 from cutlass import Float32, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_ptr
@@ -26,7 +31,7 @@ from .dense_gemm_bf16_sm107 import PersistentDenseGemmKernel
 
 FP8_MAX = 448.0
 # (mma tile M, N), (cluster M, N), TMA store, direct-store epilogue N, max A/B stages
-DEFAULT_TACTIC = ((256, 256), (2, 1), False, 64, None)
+DEFAULT_TACTIC = ((256, 256), (2, 1), True, 64, None)
 _COMPILED: dict = {}
 
 
@@ -77,25 +82,8 @@ def _q8_f32x4(x0, x1, x2, x3, inv, scaled: bool, *, loc=None, ip=None) -> Uint32
     )
 
 
-@dsl_user_op
-def _q8_bf16x4(w0, w1, inv, scaled: bool, *, loc=None, ip=None) -> Uint32:
-    ops = [Uint32(v).ir_value(loc=loc, ip=ip) for v in (w0, w1)]
-    cons = "=r,r,r"
-    if scaled:
-        ops.append(Float32(inv).ir_value(loc=loc, ip=ip))
-        cons += ",f"
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(), ops, _q8_ptx(False, scaled), cons,
-            has_side_effects=False, is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-        )
-    )
-
-
 class _UkQueryKernel(PersistentDenseGemmKernel):
-    """C = FP8(BF16(A @ B) * inv_scale); ep_t0 = inv_scale (1 FP32), ep_t1 / ep_t2 =
-    RoPE part in (BF16) / out (FP8) as (row, 16 B chunk, 8, head)."""
+    """C = FP8(BF16(A @ B) * inv_scale); ep_t0 = inv_scale (1 FP32)."""
 
     plain = False  # microbench only: plain FP32 -> FP8 conversion
     unit_scale = False  # q_scale == 1: x * (1 / q_scale) is x
@@ -112,54 +100,6 @@ class _UkQueryKernel(PersistentDenseGemmKernel):
                     inv, not self.unit_scale,
                 )
 
-    def _rope_rows(self, epi_tidx, cta_tile_coord):
-        lane = epi_tidx % 32
-        m0 = cta_tile_coord[0] * self.cta_tile_shape_mnk[0] + (epi_tidx // 32) * 4 + lane // 8
-        return m0, lane % 8
-
-    def epi_tile_alloc(self, ep_t1):
-        if cutlass.const_expr(ep_t1 is None):
-            return None
-        # (8 elements, rows per thread): one row's 16 B contiguous
-        return cute.make_rmem_tensor((8, self.cta_tile_shape_mnk[0] // 16), cutlass.BFloat16)
-
-    @cute.jit
-    def epi_tile_prefetch(self, epi_tidx, tile_coord, valid, ep_t1, pf):
-        # RoPE part of a tile's rows (CTAs of N tile 0), loaded one tile ahead:
-        # 8 lanes per row (16 B each), 4 rows per warp per step. Branch-free row
-        # clamp (rows past the end re-read the last row; their stores are skipped).
-        if cutlass.const_expr(ep_t1 is not None):
-            if valid:
-                if tile_coord[1] == 0:
-                    m0, chunk = self._rope_rows(epi_tidx, tile_coord)
-                    rows = cute.size(ep_t1, mode=[0])
-                    for it in cutlass.range_constexpr(self.cta_tile_shape_mnk[0] // 16):
-                        r = cutlass.min(m0 + it * 16, rows - 1)
-                        pf[(None, it)].store(ep_t1[(r, chunk, None, tile_coord[2])].load())
-
-    @cute.jit
-    def epi_tile_extra(self, epi_tidx, cta_tile_coord, ep_t0, ep_t1, ep_t2, pf):
-        if cutlass.const_expr(ep_t1 is not None):
-            self._rope_store(epi_tidx, cta_tile_coord, ep_t0, ep_t1, ep_t2, pf)
-
-    @cute.jit
-    def _rope_store(self, epi_tidx, cta_tile_coord, ep_t0, ep_t1, ep_t2, pf):
-        n_it = self.cta_tile_shape_mnk[0] // 16
-        m0, chunk = self._rope_rows(epi_tidx, cta_tile_coord)
-        rows = cute.size(ep_t1, mode=[0])
-        inv = None if self.unit_scale else ep_t0[0]
-        w = cute.recast_tensor(pf, Uint32)
-        if cta_tile_coord[1] == 0:
-            for it in cutlass.range_constexpr(n_it):
-                if m0 + it * 16 < rows:
-                    o = cute.make_rmem_tensor((2,), Uint32)
-                    o[0] = _q8_bf16x4(w[(0, it)], w[(1, it)], inv, not self.unit_scale)
-                    o[1] = _q8_bf16x4(w[(2, it)], w[(3, it)], inv, not self.unit_scale)
-                    dst = cute.recast_tensor(
-                        ep_t2[(m0 + it * 16, chunk, None, cta_tile_coord[2])], Uint32
-                    )
-                    dst.store(o.load())
-
 
 @cute.jit
 def _launch(
@@ -168,30 +108,35 @@ def _launch(
     w_ptr: cute.Pointer,
     out_ptr: cute.Pointer,
     inv_ptr: cute.Pointer,
-    qpe_ptr: cute.Pointer,
-    ope_ptr: cute.Pointer,
     m: cutlass.Int32,
     dims: cutlass.Constexpr,
     mac: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
-    h, p, r, lat, qs, os_ = dims
+    h, p, lat, qs, os_ = dims
     # A (M, K=P, H): q[:, h, :P]; B (N=L, K=P, H): W_UK_T[h] (N-major); C (M, L, H).
     a = cute.make_tensor(q_ptr, cute.make_layout((m, p, h), stride=(h * qs, 1, qs)))
     b = cute.make_tensor(w_ptr, cute.make_layout((lat, p, h), stride=(1, lat, p * lat)))
     c = cute.make_tensor(out_ptr, cute.make_layout((m, lat, h), stride=(h * os_, 1, os_)))
-    # RoPE part as (row, 16 B chunk, element, head)
-    qpe = cute.make_tensor(
-        qpe_ptr, cute.make_layout((m, r // 8, 8, h), stride=(h * qs, 8, 1, qs))
-    )
-    ope = cute.make_tensor(
-        ope_ptr, cute.make_layout((m, r // 8, 8, h), stride=(h * os_, 8, 1, os_))
-    )
     inv = cute.make_tensor(inv_ptr, cute.make_layout((1,)))
-    if cutlass.const_expr(gemm.skip_rope):
-        gemm(a, b, c, mac, stream, lambda x: x, inv, None, None)
-    else:
-        gemm(a, b, c, mac, stream, lambda x: x, inv, qpe, ope)
+    gemm(a, b, c, mac, stream, lambda x: x, inv, None, None)
+
+
+@triton.jit
+def _rope_fp8_kernel(
+    q_ptr, out_ptr, inv_ptr, n_rows,
+    D: tl.constexpr, P: tl.constexpr, R: tl.constexpr, OD: tl.constexpr, LAT: tl.constexpr,
+    BLOCK: tl.constexpr, UNIT: tl.constexpr,
+):
+    # RoPE columns of the FP8 query: QuantFP8 static (x * (1 / scale), clamp, RNE).
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, R)
+    mask = rows[:, None] < n_rows
+    x = tl.load(q_ptr + rows[:, None] * D + P + cols[None, :], mask=mask).to(tl.float32)
+    if not UNIT:
+        x = x * tl.load(inv_ptr)
+    x = tl.minimum(tl.maximum(x, -448.0), 448.0)
+    tl.store(out_ptr + rows[:, None] * OD + LAT + cols[None, :], x.to(tl.float8e4nv), mask=mask)
 
 
 def _ptr(dtype, t: torch.Tensor, align: int = 16):
@@ -203,21 +148,19 @@ class UkQueryFp8:
 
     q: (T, H, P + R) BF16 with the RoPE part already applied (token stride H*(P+R),
     head stride P+R); w_uk_t: (H, P, L) BF16 contiguous; out: (T, H, L + R)
-    float8_e4m3fn contiguous; inv_scale: (1,) FP32 = 1 / q_scale.
+    float8_e4m3fn contiguous; inv_scale: (1,) FP32 = 1 / q_scale. unit_scale (a
+    q_scale of exactly 1) skips the multiply. The GEMM writes the NoPE columns, a
+    small pass the RoPE columns (``rope=False``: GEMM only, microbench).
     """
 
-    def __init__(
-        self, tactic=DEFAULT_TACTIC, plain=False, skip_rope=False, unit_scale=False,
-        clamp=True,
-    ):
+    def __init__(self, tactic=DEFAULT_TACTIC, unit_scale=False, rope=True, plain=False):
         self.tactic = tactic
         self.unit_scale = unit_scale
-        self.clamp = clamp
-        self.plain = plain  # microbench arms only
-        self.skip_rope = skip_rope
+        self.rope = rope
+        self.plain = plain  # microbench only
 
     def _compiled(self, dims, stream, args):
-        key = (self.tactic, dims, self.plain, self.skip_rope, self.unit_scale, self.clamp)
+        key = (self.tactic, dims, self.unit_scale, self.plain)
         fn = _COMPILED.get(key)
         if fn is None:
             (tm, tn), cluster = self.tactic[:2]
@@ -225,11 +168,8 @@ class UkQueryFp8:
             gemm = _UkQueryKernel(cutlass.Float32, tm == 256, (tm, tn), cluster, tma_store)
             gemm.direct_epi_n = self.tactic[3] if len(self.tactic) > 3 else 64
             gemm.max_ab_stage = self.tactic[4] if len(self.tactic) > 4 else None
-            gemm.plain = self.plain
             gemm.unit_scale = self.unit_scale
-            gemm.clamp = self.clamp
-            gemm.skip_rope = self.skip_rope
-            self.gemm = gemm
+            gemm.plain = self.plain
             mac = cutlass_utils.HardwareInfo().get_max_active_clusters(
                 cluster[0] * cluster[1]
             )
@@ -244,23 +184,26 @@ class UkQueryFp8:
         assert h2 == h and out.shape == (t, h, lat + r) and q.stride(2) == 1
         assert q.stride(1) == d and q.stride(0) == h * d and w_uk_t.is_contiguous()
         assert q.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0 and d % 8 == 0
-        assert p % 8 == 0 and lat % 16 == 0 and r % 16 == 0
         assert out.is_contiguous() and q.dtype == torch.bfloat16
         assert out.dtype == torch.float8_e4m3fn and inv_scale.dtype == torch.float32
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
         args = (
             _ptr(cutlass.BFloat16, q),
             _ptr(cutlass.BFloat16, w_uk_t),
             _ptr(cutlass.Float8E4M3FN, out),
             _ptr(cutlass.Float32, inv_scale, 4),
-            # RoPE columns: their own 16-B aligned pointers (vector loads/stores)
-            make_ptr(cutlass.BFloat16, q.data_ptr() + 2 * p, cute.AddressSpace.gmem, assumed_align=16),
-            make_ptr(cutlass.Float8E4M3FN, out.data_ptr() + lat, cute.AddressSpace.gmem, assumed_align=16),
             cutlass.Int32(t),
         )
-        dims = (h, p, r, lat, d, lat + r)
-        fn = self._compiled(dims, stream, args)
-        fn(*args, stream)
+        dims = (h, p, lat, d, lat + r)
+        self._compiled(dims, stream, args)(*args, stream)
+        if self.rope and r > 0:
+            n = t * h
+            block = 64
+            _rope_fp8_kernel[(triton.cdiv(n, block),)](
+                q, out, inv_scale, n, d, p, r, lat + r, lat, block, self.unit_scale,
+                num_warps=4,
+            )
         return out
 
 
@@ -273,3 +216,44 @@ def reference(q, w_uk_t, q_scale, out_dtype=torch.float8_e4m3fn):
     cat[..., lat:].copy_(q[..., p:])
     x = cat.float() * q_scale.float().reciprocal()
     return x.clamp(-FP8_MAX, FP8_MAX).to(out_dtype)
+
+
+_KERNEL = UkQueryFp8()
+_UNIT_KERNEL = UkQueryFp8(unit_scale=True)
+# q_scale tensor -> (1 / q_scale, q_scale == 1); weak keys: a freed scale tensor's
+# address can be reused by another one.
+_SCALES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def fused_query(
+    q: torch.Tensor, w_uk_t: torch.Tensor, q_scale: torch.Tensor
+) -> torch.Tensor | None:
+    """The prefill sparse-MLA FP8 query of ``q`` (T, H, P + R) or None when the
+    shapes are outside this kernel (then the stock passes run)."""
+    t, h, d = q.shape
+    if (
+        q.dtype != torch.bfloat16
+        or w_uk_t.dtype != torch.bfloat16
+        or w_uk_t.dim() != 3
+        or w_uk_t.shape[0] != h
+        or not w_uk_t.is_contiguous()
+        or q.stride() != (h * d, d, 1)
+        or q.data_ptr() % 16
+        or d % 8
+        or w_uk_t.shape[2] % 16
+        or q_scale.numel() != 1
+    ):
+        return None
+    ent = _SCALES.get(q_scale)
+    if ent is None:
+        inv = q_scale.detach().float().reciprocal().reshape(1)
+        # q_scale is a fixed per-layer constant: read once (outside capture).
+        unit = not torch.cuda.is_current_stream_capturing() and bool(q_scale == 1)
+        ent = _SCALES[q_scale] = (inv, unit)
+    inv, unit = ent
+    out = torch.empty(
+        (t, h, w_uk_t.shape[2] + d - w_uk_t.shape[1]),
+        dtype=torch.float8_e4m3fn,
+        device=q.device,
+    )
+    return (_UNIT_KERNEL if unit else _KERNEL)(q, w_uk_t, inv, out)
