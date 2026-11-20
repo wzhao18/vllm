@@ -82,12 +82,6 @@ PREWAIT_ROWS = (64,)
 # stores). 1 GPU (cold weights, behind a 4 us predecessor, us per call, vs nvjet
 # badd): n32 4.56 vs 7.79, n64 4.95 vs 8.96, n96 5.59 vs 7.28.
 LATENT_UP_PARTS = {"*": "32:3,64:3,96:3"}
-# WideGemm policy after the split (activation warps, weight stages, weight warps,
-# direct exchange, rotate, ring KiB, K per stage): die-static work, K128 stages.
-LATENT_UP_WIDE = ((1,), None, (0, 3), False, False, None, 128, True)
-# Rows on LATENT_UP_WIDE (in-step fastab ex3lu2/ex3lu3, rhea -r 3: r8 -11.7 / -13.9 us
-# per step; at r16 +3.0 / +8.6, r24 -4.6 / +5.4, so 64 / 96 keep the striped K64 launch).
-LATENT_UP_DIE_ROWS = (32,)
 
 
 class SplitKFront:
@@ -225,14 +219,6 @@ class SpMlp:
                 weights["shared_down"] = bf16_weight(shared.down_proj)
         except ValueError as error:  # (re-raised with the layer)
             raise Unsupported("moe", None, f"layer {index}: {error}") from error
-        if any(rows_policy(LATENT_UP_PARTS, Shape(r, 1), default=None) for r in self.rows):
-            # One die-placed latent up weight (die-static wide partials) that every
-            # latent up GEMM and the stock up_proj read: no second copy.
-            from ..cutedsl.gemm.wide import die_layout, die_place
-
-            up = weights["latent_up"]
-            up = die_place(up, die_layout(up.shape[0], up.device)[1])
-            transform.up_proj.weight.data = weights["latent_up"] = up
         self.gemms = {}
         side = bool(mlp._shared_overlap)  # the shared expert beside MegaMoE
         # Rubin MegaMoE + MXFP8 shared expert: the wide-EP decode bucket runs the
@@ -270,13 +256,8 @@ class SpMlp:
             if self.parts:
                 from ..cutedsl.gemm.wide import PreparedWide
 
-                striped = ((1,), None, (0, 3), False, False, None, 64, False)
-                policies = {
-                    r: (s,) + (LATENT_UP_WIDE if r in LATENT_UP_DIE_ROWS else striped)
-                    for r, s in self.parts.items()
-                }
                 self.latent_up_parts = PreparedWide(
-                    weights["latent_up"], policies, partials=True, dies="placed"
+                    weights["latent_up"], self.parts, partials=True
                 ).prepare()
         self.latent = weights["latent_down"].shape[0]
         if self.mxfp8:
