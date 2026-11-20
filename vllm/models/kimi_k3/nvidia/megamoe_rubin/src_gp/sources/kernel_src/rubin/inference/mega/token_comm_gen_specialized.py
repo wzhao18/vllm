@@ -1405,6 +1405,20 @@ class GenphaseTokenComm(KernelComponent):
             exit()
         elif linear_cta_idx == Int32(self.helper_cta_index):
             self._run_helper(device_workspace, local_rank, smem_base, thread_idx)
+            if thread_idx == Int32(0):
+                spin_wait(
+                    device_workspace.ptr(self.token_data_ready_region),
+                    lambda value: value == Int32(self.payload_ready_target),
+                    scope="sys",
+                )
+                DG.put_gt(22, Int32(1))
+                spin_wait(
+                    device_workspace.ptr(self.metadata_ready_region),
+                    lambda value: value == Int32(self.metadata_ready_target),
+                    scope="gpu",
+                )
+                DG.put_gt(23, Int32(1))
+            cute.arch.sync_threads()
             DG.put_gt(DG.C_ROLE, _dms_t0)
             DG.put_val(DG.C_ROLEID, Int64(2), _dms_t0)
         else:
@@ -2129,7 +2143,9 @@ class GenphaseTokenComm(KernelComponent):
                 lambda value: value == Int32(self.data_pusher_cta_count),
                 scope="gpu",
             )
+            DG.put_gt(8, Int32(1))
             cute.arch.fence_acq_rel_sys()
+            DG.put_gt(9, Int32(1))
         cute.arch.sync_warp()
         if lane_idx < Int32(self.world_size):
             # The flag counters are in the peers' tail-reset span: a peer must have
@@ -2139,6 +2155,7 @@ class GenphaseTokenComm(KernelComponent):
             # Lane l signals peers l, l + 32, ...: every rank gets its flag for any world size.
             for peer in cutlass.range(lane_idx, self.world_size, 32):
                 red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, peer, Int64(0)), Int32(1))
+            DG.put_gt(19, Int32(lane_idx == Int32(0)))
 
     @cute.jit
     def _publish_payload_flags(
