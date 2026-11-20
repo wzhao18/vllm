@@ -287,6 +287,7 @@ class DcpxDecode:
             block_stride=stride,
             req_of_row=md.req_id_per_token[:rows],
             single_path=single,
+            s4=single,
         )
         return True
 

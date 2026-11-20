@@ -402,6 +402,7 @@ class DcpExchange:
         dbg: torch.Tensor | None = None,
         interleave: int | None = None,
         single_path: bool = False,
+        s4: bool = False,
     ) -> None:
         """Exact global top-K, one CTA per row (csrc/topk_v2.cuh): the same selection and
         output as topk_merge (ties at the K-th key by ascending global id; this rank's
@@ -410,15 +411,17 @@ class DcpExchange:
         3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
         [rows * 64] per-row phase stamps. Launches must stay stream-ordered.
         single_path: csrc/topk_sp.cuh (rows of at most ``sp_max_local`` positions; the
-        same output, one kernel; stats 1 one round, 2 id radix, 3 key radix)."""
-        if stats is None and single_path:  # DIAG (not for landing)
+        same output, one kernel; stats 1 one round, 2 id radix, 3 key radix).
+        s4: csrc/topk_s4.cuh (the row in registers; stats 1 one round, 2 id radix, 3 key
+        radix); rows longer than its register row take the single path."""
+        if stats is None and single_path and not s4:  # DIAG (not for landing)
             stats = _spdiag(logits.device)
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,
             self.v2_peers, self.W, self.rank, self.K, self.cap,
             self.interleave if interleave is None else interleave,
-            self.v2_epoch, self.err, stats, dbg, 1 if single_path else 0,
+            self.v2_epoch, self.err, stats, dbg, 2 if s4 else 1 if single_path else 0,
         )  # fmt: skip
 
     @property

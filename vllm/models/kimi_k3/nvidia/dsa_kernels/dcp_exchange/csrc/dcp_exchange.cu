@@ -2949,6 +2949,7 @@ __global__ void __launch_bounds__(256) o_exchange_kernel(OxParams p) {
 
 #include "topk_v2.cuh"
 #include "topk_sp.cuh"
+#include "topk_s4.cuh"
 
 // ------------------------------------------------------------------ host side
 using namespace k31dcpx;
@@ -3267,6 +3268,28 @@ static int64_t topk_sp_resident_of(int* wide) {
   return v;
 }
 
+// Co-resident topk_s4 CTAs: 512-thread variant (two per SM); *wide: 1024-thread variant.
+static int64_t topk_s4_resident_of(int* wide) {
+  static int v = 0, w = 0;
+  if (!v) {
+    int dev, sms, occ = 0, occw = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_s4_kernel<kV2T>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_s4_kernel<1024>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#ifdef S4_SKEL
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_s4_skel<kV2T>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_s4_skel<1024>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#endif
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_s4_kernel<kV2T>, kV2T, 0));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occw, topk_s4_kernel<1024>, 1024, 0));
+    v = sms * occ;
+    w = sms * occw;
+  }
+  if (wide) *wide = w;
+  return v;
+}
+
 // Longest local row (positions) of the single-path kernel's SMEM copy; longer rows read
 // the rest from global memory.
 int64_t topk_sp_max_local() { return (int64_t)SpCfg<kV2T>::kCapG * 8; }
@@ -3317,6 +3340,32 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   TORCH_CHECK(!dbg.has_value() || dbg->numel() >= (int64_t)kV2Dbg * T, "topk_v2: dbg too small");
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
   int nwide = 0;
+  if (impl == 2) {  // register rows (csrc/topk_s4.cuh): one kernel, no redo launch
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(p.logits) & 15u) == 0 && p.lstride % 8 == 0 && p.lcols % 8 == 0,
+                "topk_s4: logits rows must be 16-byte aligned with a multiple of 8 columns");
+    const int nres2 = (int)topk_s4_resident_of(&nwide);
+    TORCH_CHECK(nres2 >= 1 && W + 1 <= kV2T / 32, "topk_s4: no resident CTA");
+    const bool wide2 = T <= nwide;
+    {
+      cudaLaunchConfig_t c2 = {};
+      c2.gridDim = dim3((unsigned)std::min(T, wide2 ? nwide : nres2), 1, 1);
+      c2.blockDim = dim3(wide2 ? 1024 : kV2T, 1, 1);
+      c2.stream = c10::cuda::getCurrentCUDAStream();
+      cudaLaunchAttribute a2[1];
+      a2[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      a2[0].val.programmaticStreamSerializationAllowed = 1;
+      c2.attrs = a2;
+      c2.numAttrs = 1;
+#ifdef S4_SKEL  // sync-only skeleton (calibration builds only)
+      if (wide2) C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_s4_skel<1024>, p));
+      else C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_s4_skel<kV2T>, p));
+#else
+      if (wide2) C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_s4_kernel<1024>, p));
+      else C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_s4_kernel<kV2T>, p));
+#endif
+      return;
+    }
+  }
   if (impl == 1) {  // single path (csrc/topk_sp.cuh): one kernel, no redo launch
     TORCH_CHECK((reinterpret_cast<uintptr_t>(p.logits) & 15u) == 0 && p.lstride % 8 == 0 && p.lcols % 8 == 0,
                 "topk_sp: logits rows must be 16-byte aligned with a multiple of 8 columns");
