@@ -1122,13 +1122,33 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         uint32_t* const snd = z;
         uint32_t* const rcv = z + RW;
         uint32_t* const suf = rcv;  // W x (kV2Win + 1): above + window keys >= lr + i
-        for (int r = 0; r < W; ++r) {
-          const uint32_t* s = rx + r * kV2Msg;
-          const uint32_t c = tid < kV2Win ? v2_cnt(s, kV2Win - 1 - tid) : 0u;
-          uint32_t tot;
-          const uint32_t ex = v2_scan<T>(c, V2WS, &tot);
-          if (tid < kV2Win) suf[r * (kV2Win + 1) + kV2Win - 1 - tid] = ex + c + (s[1] & 0xFFFFFFu);
-          if (tid == 0) suf[r * (kV2Win + 1) + kV2Win] = s[1] & 0xFFFFFFu;
+        // suffix counts of every rank's window, one warp per rank (no block scan): lane l holds
+        // the window's keys kV2Win - 1 - [8 l, 8 l + 8), counted from the top
+        if ((tid >> 5) < W) {
+          constexpr int kPer = kV2Win / 32;
+          const int lane = tid & 31;
+          const uint32_t* s = rx + (tid >> 5) * kV2Msg;
+          const uint32_t above = s[1] & 0xFFFFFFu;
+          uint32_t c[kPer], sum = 0;
+#pragma unroll
+          for (int j = 0; j < kPer; ++j) {
+            c[j] = v2_cnt(s, kV2Win - 1 - (lane * kPer + j));
+            sum += c[j];
+          }
+          uint32_t x = sum;
+#pragma unroll
+          for (int o = 1; o < 32; o <<= 1) {
+            const uint32_t y = __shfl_up_sync(0xffffffffu, x, o);
+            if (lane >= o) x += y;
+          }
+          uint32_t run = above + x - sum;  // the rank's keys above this lane's top key
+          uint32_t* const sr = suf + (tid >> 5) * (kV2Win + 1);
+#pragma unroll
+          for (int j = 0; j < kPer; ++j) {
+            run += c[j];
+            sr[kV2Win - 1 - (lane * kPer + j)] = run;
+          }
+          if (lane == 0) sr[kV2Win] = above;
         }
         if (tid == 0) { s_r2[0] = -1; s_r2[1] = 0; s_r2[2] = -1; s_r2[4] = 0; s_r2[5] = 0; }
         __syncthreads();
@@ -1144,6 +1164,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           // window keys: the largest x with g(x) >= K is a window key or the key just below a
           // window. W x (kV2Win + 1) candidates instead of every key of [xlo, xhi), which
           // spans up to the whole key range when the windows lie far apart.
+          int best = -1;  // every x below LB qualifies too: reduce per warp, then one atomic
           for (int c = tid; c < W * (kV2Win + 1); c += T) {
             const int r0 = c / (kV2Win + 1);
             const int x = (int)(rx[r0 * kV2Msg] & 0xFFFFu) + (c - r0 * (kV2Win + 1)) - 1;
@@ -1154,8 +1175,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               const uint32_t* sr = suf + r * (kV2Win + 1);
               g += x < lr ? sr[0] : (x < lr + kV2Win ? sr[x - lr] : 0u);
             }
-            if (g >= (uint32_t)K) atomicMax(&s_r2[0], x);
+            if (g >= (uint32_t)K) best = max(best, x);
           }
+          best = __reduce_max_sync(0xffffffffu, best);
+          if ((tid & 31) == 0 && best >= 0) atomicMax(&s_r2[0], best);
         }
         __syncthreads();
         V2DBG(6);
