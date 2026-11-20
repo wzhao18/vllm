@@ -447,6 +447,14 @@ def _check_core_replay(name, replay, record, impl, cache):
     assert shift <= 1e-3, (name, shift)
     if launches == 1 and kernel == "trtllm":
         assert float(errors.max()) <= 1e-3, (name, errors.max())
+    elif launches == 1:
+        # a Rubin kernel with trtllm-gen's arithmetic (E4M3 P at 448 of the running max
+        # per 128-key tile, FP32 sums, one unsplit pass: dsa.sparse_mla_ts / _km) whose
+        # FP32 accumulation order differs (an E4M3 rounding tie of P then flips a code
+        # now and then: one element in 3M 1.2e-3 apart at R64): as the kernels' unit
+        # test, the whole latent within 2e-3 of stock's (relative L2)
+        apart = float((latent.double() - want.double()).norm() / want.double().norm())
+        assert apart < 2e-3, (name, "core replay vs stock", apart)
     assert ours_total <= 1.5 * stock_total + 1e-6, (name, ours_total, stock_total)
     assert ours_total >= stock_total / 1.5 - 1e-6, (name, ours_total, stock_total)
 
