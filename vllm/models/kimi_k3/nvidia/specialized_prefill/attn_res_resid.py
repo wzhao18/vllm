@@ -74,7 +74,17 @@ class ResidGemm:
         rows = _weight_rows(linear)
         if rows is None:
             raise ValueError("attn_res_resid: linear is not an MXFP8 [N, K] linear")
-        self.weight, self.scale = rows
+        self._init(*rows)
+
+    @classmethod
+    def from_rows(cls, weight_nk: torch.Tensor, scale: torch.Tensor) -> "ResidGemm":
+        """From the E4M3 [N, K] weight and its flat swizzled UE8M0 scales."""
+        g = cls.__new__(cls)
+        g._init(weight_nk, scale)
+        return g
+
+    def _init(self, weight_nk: torch.Tensor, scale: torch.Tensor) -> None:
+        self.weight, self.scale = weight_nk, scale
         self.n, self.k = self.weight.shape
         self._gemm: dict[bool, object] = {}
 
