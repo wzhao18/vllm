@@ -18,6 +18,49 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <atomic>
+#include <dlfcn.h>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+typedef int (*nvmlInit_t)();
+typedef int (*nvmlHandle_t)(unsigned, void**);
+typedef int (*nvmlPower_t)(void*, unsigned*);
+static nvmlPower_t g_pow = nullptr;
+static void* g_dev = nullptr;
+static void nvml_open() {
+  void* h = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+  if (!h) return;
+  auto init = (nvmlInit_t)dlsym(h, "nvmlInit_v2");
+  auto get = (nvmlHandle_t)dlsym(h, "nvmlDeviceGetHandleByIndex_v2");
+  g_pow = (nvmlPower_t)dlsym(h, "nvmlDeviceGetPowerUsage");
+  int dev = 0;
+  if (const char* v = getenv("CUDA_VISIBLE_DEVICES")) dev = atoi(v);  // NVML ignores CUDA_VISIBLE_DEVICES
+  if (!init || !get || !g_pow || init() != 0 || get(dev, &g_dev) != 0) g_pow = nullptr;
+}
+// mean power (W) over [skip_s, end) of a window while fn runs
+template <class F>
+double power_window(F fn, double skip_s) {
+  std::atomic<bool> on{true};
+  double sum = 0;
+  long n = 0;
+  auto t0 = std::chrono::steady_clock::now();
+  std::thread th([&] {
+    while (on) {
+      unsigned mw = 0;
+      const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      if (g_pow && t >= skip_s && g_pow(g_dev, &mw) == 0) {
+        sum += mw / 1000.0;
+        ++n;
+      }
+      usleep(10000);
+    }
+  });
+  fn();
+  on = false;
+  th.join();
+  return n ? sum / n : 0.0;
+}
 
 constexpr int NS = 6, STAGE = 36864, ROWB = 576, KEYS = 2048, SUBS = KEYS / 64, NTOK = 16384;
 constexpr int OFF_BAR = NS * STAGE;                // 221184
@@ -228,11 +271,14 @@ void run(const char* name, int nsm, int warps, const uint8_t* kv, const int* idx
   cudaEvent_t a, b;
   cudaEventCreate(&a);
   cudaEventCreate(&b);
-  cudaEventRecord(a);
-  const int reps = 5;
-  for (int i = 0; i < reps; ++i) cuLaunchKernelEx(&cfg, f, args, nullptr);
-  cudaEventRecord(b);
-  cudaEventSynchronize(b);
+  const int reps = getenv("PMLA12_REPS") ? atoi(getenv("PMLA12_REPS")) : 5;
+  double watts = 0;
+  watts = power_window([&] {
+    cudaEventRecord(a);
+    for (int i = 0; i < reps; ++i) cuLaunchKernelEx(&cfg, f, args, nullptr);
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+  }, 1.0);
   float ms;
   cudaEventElapsedTime(&ms, a, b);
   cudaError_t e = cudaGetLastError();
@@ -247,8 +293,8 @@ void run(const char* name, int nsm, int warps, const uint8_t* kv, const int* idx
   const double spread = h[2] > h[0] ? 100.0 * (double)(wmax - wmin) / (double)(h[2] - h[0]) : 0.0;
   const double mhz = (h[3] > h[1]) ? (double)(h[2] - h[0]) / (double)(h[3] - h[1]) * 1000.0 : 0.0;
   const double us = ms * 1000 / reps, bytes = (double)NTOK * KEYS * ROWB;
-  printf("%-34s W%2d: %7.1f us/layer %5.1f TB/s %5.1f B/clk/SM (clk %4.0f MHz) warp-finish spread %4.1f%% %s\n", name,
-         warps, us, bytes / us / 1e6, bytes / (us * 1e-6) / nsm / (mhz * 1e6), mhz, spread,
+  printf("%-34s W%2d: %7.1f us/layer %5.1f TB/s %5.1f B/clk/SM (clk %4.0f MHz) %5.0f W spread %4.1f%% %s\n", name,
+         warps, us, bytes / us / 1e6, bytes / (us * 1e-6) / nsm / (mhz * 1e6), mhz, watts, spread,
          e == cudaSuccess ? "" : cudaGetErrorString(e));
 }
 
@@ -261,7 +307,15 @@ int main() {
   int* idx;
   unsigned long long* dclk;
   cudaMalloc(&kv, (size_t)nrows * ROWB);
-  cudaMemset(kv, 0x11, (size_t)nrows * ROWB);
+  {
+    std::vector<uint32_t> hk((size_t)nrows * ROWB / 4);
+    uint32_t x = 12345u;
+    for (auto& v : hk) {
+      x = x * 1664525u + 1013904223u;
+      v = x & 0xbfbfbfbfu;  // random finite E4M3 bytes (real-KV-like bit activity)
+    }
+    cudaMemcpy(kv, hk.data(), hk.size() * 4, cudaMemcpyHostToDevice);
+  }
   std::vector<int> hi(nkeys);
   srand(1);
   for (long t = 0; t < NTOK; ++t) {
@@ -270,17 +324,27 @@ int main() {
   }
   cudaMalloc(&idx, nkeys * 4);
   cudaMemcpy(idx, hi.data(), nkeys * 4, cudaMemcpyHostToDevice);
+  int* idxs;  // sequential rows: token t reads rows (t * 2048 + k) % nrows (contiguous 576 B rows)
+  {
+    std::vector<int> hs(nkeys);
+    for (long t = 0; t < NTOK; ++t)
+      for (int k = 0; k < KEYS; ++k) hs[t * KEYS + k] = (int)((t * KEYS + k) % nrows);
+    cudaMalloc(&idxs, nkeys * 4);
+    cudaMemcpy(idxs, hs.data(), nkeys * 4, cudaMemcpyHostToDevice);
+  }
+  nvml_open();
+  printf("nvml power %s\n", g_pow ? "ok" : "missing");
   cudaMalloc(&dclk, 256);
   cuInit(0);
   printf("SMs %d, KV %d rows (%.1f MB), %ld token-keys x 576 B; smem %d B\n", nsm, nrows, nrows * ROWB / 1e6, nkeys,
          SMEM);
+  {
+    double w = power_window([] { usleep(3000000); }, 1.0);
+    printf("idle (3 s) %5.0f W\n", w);
+  }
   for (int rep = 0; rep < 2; ++rep) {
-    run<1, 1, 0, 4, 0, 1>("L1 lean h8 layout, smem idx", nsm, 10, kv, idx, dclk);
-    run<1, 1, 3, 4, 0, 1>("C1 CTA cap 4 lane0, no consumer", nsm, 10, kv, idx, dclk);
-    run<1, 1, 3, 6, 0, 1>("C2 CTA cap 6 lane0, no consumer", nsm, 10, kv, idx, dclk);
-    run<1, 1, 4, 4, 0, 1>("C3 CTA cap 4 all lanes", nsm, 10, kv, idx, dclk);
-    run<1, 1, 4, 2, 0, 1>("C4 CTA cap 2 all lanes", nsm, 10, kv, idx, dclk);
-    run<1, 1, 1, 4, 1, 1>("R5 h8 producer (CTA cap 4)", nsm, 10, kv, idx, dclk);
+    run<1, 1, 0, 4, 0, 1>("L1 lean LDGSTS random rows", nsm, 10, kv, idx, dclk);
+    run<1, 1, 0, 4, 0, 1>("S1 lean LDGSTS sequential rows", nsm, 10, kv, idxs, dclk);
   }
   return 0;
 }
