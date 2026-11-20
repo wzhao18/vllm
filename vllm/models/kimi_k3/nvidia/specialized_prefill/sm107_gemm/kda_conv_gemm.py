@@ -193,6 +193,13 @@ class KdaConvGemm:
             raise ValueError(f"KDA conv GEMM: conv weight {tuple(conv_w.shape)}")
         self.tactic = tactic or DEFAULT_TACTIC
         self.drain = drain and self.tactic[0][0] == 2 * self.tactic[2]
+        # Column-pair weight layout for the branch-free column pass:
+        # [col pair][tap][col, col + 1] (aligned f32x2 operands).
+        self.conv_w_pairs = conv_w.view(self.n // 2, 2, 4).transpose(1, 2).contiguous()
+        flags = set((self.tactic[7] if len(self.tactic) > 7 else "").split("+"))
+        self._t2 = self.drain and "ct1" not in flags and not any(
+            f.startswith("cskel") for f in flags
+        )
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = {}
 
@@ -243,7 +250,9 @@ class KdaConvGemm:
         nsteps = top.bit_length() if nseq > 1 else 0
         conv = (
             cutlass.Int64(out.data_ptr()),
-            cutlass.Int64(self.conv_w.data_ptr()),
+            cutlass.Int64(
+                (self.conv_w_pairs if self._t2 and not with_norms else self.conv_w).data_ptr()
+            ),
             cutlass.Int64(side.data_ptr()),
             cutlass.Int64(qsl.data_ptr()),
             cutlass.Int64(norms.data_ptr() if norms is not None else 0),
