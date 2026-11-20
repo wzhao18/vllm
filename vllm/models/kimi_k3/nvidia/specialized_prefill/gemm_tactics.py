@@ -285,6 +285,21 @@ def mm(
     return out
 
 
+def _pinned_apply(
+    plan_id: int,
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """The pinned tactic's output for a prefill-sized BF16 call, else None."""
+    rows = x.numel() // x.shape[-1]
+    if rows < MIN_ROWS or bias is not None or x.dtype != torch.bfloat16:
+        return None
+    x2 = x.reshape(rows, x.shape[-1]).contiguous()
+    out = mm(plan_id, x2, layer.weight)
+    return out.view(*x.shape[:-1], out.shape[-1])
+
+
 class _PinnedBf16Method(UnquantizedLinearMethod):
     """A BF16 linear on its pinned tactic at >= ``MIN_ROWS`` rows."""
 
@@ -296,24 +311,54 @@ class _PinnedBf16Method(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        rows = x.numel() // x.shape[-1]
-        if rows >= MIN_ROWS and bias is None and x.dtype == torch.bfloat16:
-            x2 = x.reshape(rows, x.shape[-1]).contiguous()
-            out = mm(self.plan_id, x2, layer.weight)
-            return out.view(*x.shape[:-1], out.shape[-1])
-        return super().apply(layer, x, bias)
+        out = _pinned_apply(self.plan_id, layer, x, bias)
+        return out if out is not None else super().apply(layer, x, bias)
+
+
+_LOW_LATENCY: tuple[type, type] | None = None
+
+
+def _low_latency_classes() -> tuple[type, type]:
+    """(Kimi low-latency BF16 linear method, its pinned subclass). The
+    low-latency method keeps its small-row plans; prefill-sized calls of a
+    pinned shape (latent-MoE down_proj) take the pin instead of the stock
+    fallback it would otherwise reach."""
+    global _LOW_LATENCY
+    if _LOW_LATENCY is None:
+        from ..low_latency_gemm import KimiK3LowLatencyLinearMethod
+
+        class _PinnedLowLatencyMethod(KimiK3LowLatencyLinearMethod):
+            plan_id: int
+
+            def apply(
+                self,
+                layer: torch.nn.Module,
+                x: torch.Tensor,
+                bias: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                out = _pinned_apply(self.plan_id, layer, x, bias)
+                return out if out is not None else super().apply(layer, x, bias)
+
+        _LOW_LATENCY = (KimiK3LowLatencyLinearMethod, _PinnedLowLatencyMethod)
+    return _LOW_LATENCY
 
 
 def enable(model: torch.nn.Module) -> int:
     """Put every BF16 linear whose weight shape has a pin on its pinned tactic
-    (prefill row counts only). Returns the number switched."""
+    (prefill row counts only): stock BF16 linears and Kimi low-latency linears
+    (their small-row plans stay). Returns the number switched."""
+    low_latency, pinned_low_latency = _low_latency_classes()
     switched = 0
     for module in model.modules():
         method = getattr(module, "quant_method", None)
         weight = getattr(module, "weight", None)
-        if type(method) is not UnquantizedLinearMethod or not isinstance(
-            weight, torch.Tensor
-        ):
+        if type(method) is UnquantizedLinearMethod:
+            cls = _PinnedBf16Method
+        elif type(method) is low_latency:
+            cls = pinned_low_latency
+        else:
+            continue
+        if not isinstance(weight, torch.Tensor):
             continue
         if weight.dtype != torch.bfloat16 or weight.dim() != 2:
             continue
@@ -322,7 +367,7 @@ def enable(model: torch.nn.Module) -> int:
         plan_id = plan("bf16", weight.shape[0], weight.shape[1])
         if plan_id is None:
             continue
-        pinned = object.__new__(_PinnedBf16Method)
+        pinned = object.__new__(cls)
         pinned.__dict__.update(method.__dict__)
         pinned.plan_id = plan_id
         module.quant_method = pinned

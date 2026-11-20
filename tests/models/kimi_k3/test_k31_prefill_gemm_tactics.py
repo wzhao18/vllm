@@ -94,3 +94,45 @@ def test_bf16_dispatch_routes_prefill_rows_only():
     finally:
         gemm_tactics.mm = real_mm
     assert calls == [gemm_tactics.MIN_ROWS]
+
+
+def test_low_latency_linear_takes_the_pin_at_prefill_rows():
+    """The latent-MoE down_proj carries the Kimi low-latency method (small-row
+    CuTe plans); its prefill rows must reach the pin, not the stock fallback."""
+    from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
+        KimiK3LowLatencyLinearMethod,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_prefill import gemm_tactics
+
+    key = ("bf16", 3584, 7168)
+    if key not in gemm_tactics.PINS:
+        pytest.skip("no latent down_proj pin")
+    _, n, k = key
+
+    class Lin(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                (0.02 * torch.randn(n, k, device="cuda")).bfloat16(),
+                requires_grad=False,
+            )
+            self.quant_method = KimiK3LowLatencyLinearMethod({}, {})
+
+    lin = Lin()
+    assert gemm_tactics.enable(lin) == 1
+    method = lin.quant_method
+    assert isinstance(method, KimiK3LowLatencyLinearMethod)
+    calls = []
+    real_mm = gemm_tactics.mm
+    gemm_tactics.mm = lambda *a, **kw: calls.append(a[1].shape[0]) or real_mm(*a, **kw)
+    try:
+        for rows in (8, gemm_tactics.MIN_ROWS - 1, gemm_tactics.MIN_ROWS):
+            x = torch.randn(rows, k, device="cuda").bfloat16()
+            out = method.apply(lin, x)
+            assert out.shape == (rows, n)
+            if rows == gemm_tactics.MIN_ROWS:
+                ref = torch.nn.functional.linear(x, lin.weight)
+                torch.testing.assert_close(out, ref, rtol=1.6e-2, atol=1e-3)
+    finally:
+        gemm_tactics.mm = real_mm
+    assert calls == [gemm_tactics.MIN_ROWS]
