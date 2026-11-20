@@ -5309,6 +5309,11 @@ class NixlBaseConnectorWorker:
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
                         self._note_xfer_span(req_id, res)
+                        try:  # PDDIAG per handle: (start us, dur us, MB)
+                            self.__dict__.setdefault("_pddiag_h", {}).setdefault(req_id, []).append(
+                                (float(res.startTime), float(res.xferDuration), res.totalBytes / 2**20))
+                        except Exception:
+                            pass
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -5340,6 +5345,11 @@ class NixlBaseConnectorWorker:
                 if span is not None and req_id not in failed_req_ids:
                     self.xfer_stats.record_request_xfer_wall((span[1] - span[0]) / 1e6)
                 _t0 = _fs.pop(req_id, _now)
+                _hs = self.__dict__.setdefault("_pddiag_h", {}).pop(req_id, [])
+                if _hs and self.tp_rank == 0:
+                    _s0 = min(h[0] for h in _hs)
+                    logger.info("PDDIAG-H req=%s %s", req_id[-10:], " ".join(
+                        "%.1f+%.1f/%.0f" % ((h[0] - _s0) / 1e3, h[1] / 1e3, h[2]) for h in sorted(_hs)))
                 _g = [b - a for a, b in zip(_gf, _gf[1:]) if a >= _t0]
                 logger.info(
                     "PDDIAG tp=%d req=%s seen_to_done=%.2fms polls=%d gap_max=%.2fms "
