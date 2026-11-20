@@ -256,6 +256,11 @@ __device__ __forceinline__ long long gtime() {
     }                                                                        \
   } while (0)
 
+// Probe builds (K31LP_PROBE & 64): per-group end-of-call stats into
+// stamps[4096 + (blockIdx * G + g) * 4 + j]: die, own-die tokens,
+// other-die tokens, exit globaltimer.
+constexpr int kGroupStatsBase = 4096;
+
 __device__ __forceinline__ void group_sync(int g) {
   asm volatile("bar.sync %0, %1;\n" ::"r"(1 + g), "n"(NT) : "memory");
 }
@@ -412,10 +417,16 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   int par = 0;
   // Thread 0: the own-die atomicAdd (in flight) for the next claimed position.
   int pending = tid == 0 ? start_claim() : 0;
+  [[maybe_unused]] int p_own = 0, p_oth = 0;
   for (int it = 0;; ++it) {
     const int tt = sm.tq[g][it & (QN - 1)];
     if (tt < 0) break;
     const int64_t t = tt;
+    if constexpr ((K31LP_PROBE & 64) != 0) {
+      if (tid == 0) {
+        if (a.sm_die == nullptr || ((tt >> SB) & 1) == die) ++p_own; else ++p_oth;
+      }
+    }
 
     K31LP_STAMP(0);
     // Block logits of this token (prefetched), then prefetch the next.
@@ -608,6 +619,15 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     }
     K31LP_STAMP(6);
     par ^= 1;
+  }
+  if constexpr ((K31LP_PROBE & 64) != 0) {
+    if (tid == 0) {
+      long long* s = a.stamps + kGroupStatsBase + ((int64_t)blockIdx.x * G + g) * 4;
+      s[0] = die;
+      s[1] = p_own;
+      s[2] = p_oth;
+      s[3] = gtime();
+    }
   }
   K31LP_CTA_STAMP(2);
   // The last CTA out resets the claim counters for the next call.

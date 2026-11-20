@@ -54,7 +54,7 @@ for probe in [int(x) for x in args.probes.split(",")]:
     ev[0].record()
     attn_res_lp.attn_res(prefix, delta, blocks, call, args.nb, -1, onw, 1e-6,
                          args.variant == "bq", True, _probe=probe, _vec=args.vec, _groups=args.groups,
-                         _stamps=stamps if probe & 48 else None)
+                         _stamps=stamps if probe & 112 else None)
     ev[1].record()
     torch.cuda.synchronize()
     us = ev[0].elapsed_time(ev[1]) * 1e3
@@ -72,6 +72,22 @@ for probe in [int(x) for x in args.probes.split(",")]:
               "->blocks done, ->epilogue end:",
               [round(x) for x in d.median(0).values.tolist()],
               "token period", round(tot.median().item()))
+
+    if probe & 64 and i == args.iters - 1:
+        cta = stamps.view(-1, 4)[:1024].cpu().double()
+        t0 = cta[cta[:, 0] != 0][:, 0].min() if probe & 32 else None
+        gs = stamps[4096:4096 + 1024 * args.groups * 4].view(-1, 4).cpu().double()
+        gs = gs[gs[:, 3] != 0]
+        for d in (0, 1):
+            x = gs[gs[:, 0] == d]
+            if len(x) == 0:
+                continue
+            ex = x[:, 3] - (t0 if t0 is not None else gs[:, 3].min())
+            qs = torch.quantile(ex, torch.tensor([0.0, 0.1, 0.5, 0.9, 1.0], dtype=torch.float64))
+            print(f"die {d}: groups {len(x)} own {int(x[:, 1].sum())} other {int(x[:, 2].sum())}"
+                  f" tok/group {x[:, 1:3].sum(1).mean():.2f} exit us q0/10/50/90/100"
+                  f" {[round(v / 1e3, 1) for v in qs.tolist()]}"
+                  f" exit(other>0) {round(ex[x[:, 2] > 0].mean().item() / 1e3, 1) if (x[:, 2] > 0).any() else '-'}")
 
     if probe & 32:
         st_ = stamps.view(-1, 4)[:1024].cpu().double()
