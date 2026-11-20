@@ -50,6 +50,7 @@ from ..common.primitives import (
     bf16,
     bf16x2,
     bits_float,
+    float_bits,
     commit_asm,
     fence_tmem,
     fma,
@@ -161,6 +162,17 @@ def ld16(address):
 
 
 @asm()
+def ld8(address):
+    """8 FP32 TMEM columns of this lane, waited."""
+    names = ",".join(f"${i}" for i in range(8))
+    code = f"tcgen05.ld.sync.aligned.32x32b.x8.b32 {{{names}}},[$8]; "
+    code += "tcgen05.wait::ld.sync.aligned;"
+    return code, ",".join(["=f"] * 8 + ["r", "~{memory}"]), (Uint32(address),), (
+        (Float32,) * 8
+    )
+
+
+@asm()
 def ld64(address):
     names = ",".join(f"${i}" for i in range(64))
     code = f"tcgen05.ld.sync.aligned.32x32b.x64.b32 {{{names}}},[$64]; "
@@ -184,6 +196,20 @@ def st8w(address, words):
     code = f"tcgen05.st.sync.aligned.32x32b.x8.b32 [$0],{{{names}}}; "
     code += "tcgen05.wait::st.sync.aligned;"
     return code, "r" + ",r" * 8 + ",~{memory}", (Uint32(address), *words)
+
+
+@asm()
+def st4w(address, words):
+    names = ",".join(f"${i + 1}" for i in range(4))
+    code = f"tcgen05.st.sync.aligned.32x32b.x4.b32 [$0],{{{names}}}; "
+    code += "tcgen05.wait::st.sync.aligned;"
+    return code, "r" + ",r" * 4 + ",~{memory}", (Uint32(address), *words)
+
+
+@asm()
+def pair_barrier(barrier_id):
+    """bar.sync of 64 threads (a warp pair) on a register barrier id."""
+    return "bar.sync $0, 64;", "r,~{memory}", (Int32(barrier_id),)
 
 
 @asm()
@@ -233,12 +259,18 @@ class GqaWindowUmma:
 
     def __init__(self, group, kv_heads, q, page, ring, window, v_scale=None,
                  round_norm=False, debug=0, redo=False, splits=1, fill=4, trace=0,
-                 trace_req=0, swarp=False, die_sms=None):  # fmt: skip
+                 trace_req=0, swarp=False, die_sms=None, wide=False):  # fmt: skip
         # swarp: a sixth warp issues S = Q K^T of each stage as soon as it landed
         # and its S buffer is free; the producer warp then only issues PV and
         # refills (the S issue no longer queues behind the P-ready wait)
         self.swarp = swarp
-        self.threads = THREADS + (32 if swarp else 0)
+        # wide (needs swarp): warps 6-9 are four more softmax warps; warp w and
+        # warp w + 4 (w + 8 for quarters 0-1) split their lane quarter's 16 keys of
+        # a stage in two halves of 8, agreeing on the row max of the stage
+        # through shared memory, so each warp's dependent chain is half as long
+        assert not wide or swarp
+        self.wide = wide
+        self.threads = THREADS + (32 if swarp else 0) + (128 if wide else 0)
         # die_sms (die split): a resident grid of two CTAs per SM
         # (common.resident); the CTAs of die d take the (request, KV head) units
         # whose KV head the cache homes on die d (mask argument, bit h = die of
@@ -393,6 +425,11 @@ class GqaWindowUmma:
             cute.recast_ptr(qtile.iterator, dtype=Float32), cute.make_layout(4 * 32 * 2)
         )  # fmt: skip
         tslot = alloc(smem, Int32, 2, align=16)  # [1]: the redo flag
+        # wide: [3][2 halves][4 quarters][32 lanes] stage maxima (stage parity
+        # 0 / 1) and the halves' row sums (2) the pair exchanges
+        WIDE: cutlass.Constexpr = self.wide
+        SW: cutlass.Constexpr = 8 if self.wide else 4  # softmax warps
+        xch = alloc(smem, Float32, 768 if self.wide else 4, align=16)
         # ---- die split: this CTA's (request, KV head) from the resident grid's
         # landing: die d's CTAs (slot-major over its SMs) take die d's units
         live = Int32(1)
@@ -448,9 +485,9 @@ class GqaWindowUmma:
                 init_barrier(full + 8 * i, 1)
             for b in cutlass.range_constexpr(NS):
                 init_barrier(sready + 8 * b, 1)
-                init_barrier(pready + 8 * b, 4)
+                init_barrier(pready + 8 * b, SW)
                 init_barrier(pvdone + 8 * b, 1)
-                init_barrier(sfree + 8 * b, 4)
+                init_barrier(sfree + 8 * b, SW)
             if cutlass.const_expr(S > 1):
                 init_barrier(recv_bar, 1)
                 arm(recv_bar, S * my_rows * (PITCH * 4))
@@ -715,8 +752,15 @@ class GqaWindowUmma:
                     )  # fmt: skip
         else:
             # ---- softmax: warp w = TMEM lane quarter w, the stages' keys 16w..16w+15
+            # (wide: quarter w % 4, half hf of those keys, KW = 8 keys each)
+            KW: cutlass.Constexpr = 8 if self.wide else 16
+            qtr = warp % 4
+            hf = Int32(0)
+            if warp > SWARP:
+                hf = Int32(1)
+            kofs = 16 * qtr + KW * hf  # the warp's first key column of a stage
             r = lane
-            lanes = Uint32(32 * warp) << 16
+            lanes = Uint32(32 * qtr) << 16
             hi_r = length - 1
             lo_r = lo
             if r < ROWS:
@@ -727,8 +771,17 @@ class GqaWindowUmma:
             a_sr = Int64(0)
             a_res = Int64(0)
             p_lanes = tmem + lanes + P_COL
-            for k in cutlass.range_constexpr(NS):  # every P buffer's columns: zero
-                st32w(p_lanes + Uint32(32 * k), (Uint32(0),) * 32)
+            if cutlass.const_expr(self.wide):
+                # the other quarters' 8-column chunks of every P buffer: zero (the
+                # quarter's own chunk is written whole every stage by its pair)
+                for k in cutlass.range_constexpr(NS):
+                    for ch in cutlass.range_constexpr(4):
+                        if ch != qtr:
+                            st8w(p_lanes + Uint32(32 * k + 8 * ch), (Uint32(0),) * 8)
+            else:
+                for k in cutlass.range_constexpr(NS):  # every P buffer's columns: zero
+                    st32w(p_lanes + Uint32(32 * k), (Uint32(0),) * 32)
+            xch_base = Int32(shared_address(xch.iterator))
             trs = tr_cta & (lane == 0) & (warp == 0)
             for t in cutlass.range(count, unroll=1):
                 b = t % NS
@@ -739,22 +792,36 @@ class GqaWindowUmma:
                 self.trc(trs, t, 9)
                 a_sr = a_sr + self.tick() - c0
                 fence_tmem()
-                raw = ld16(s_addr + Uint32(16) * Uint32(warp))
+                if cutlass.const_expr(self.wide):
+                    raw = ld8(s_addr + Uint32(kofs))
+                else:
+                    raw = ld16(s_addr + Uint32(16) * Uint32(warp))
                 fence_tmem(before=True)
                 cute.arch.sync_warp()
                 self.trc(trs, t, 10)
                 if lane == 0:
                     arrive(sfree + 8 * b)
                 ps0 = (first + t) * KB
-                xs = cute.make_rmem_tensor(16, Float32)
-                for e in cutlass.range_constexpr(16):
+                xs = cute.make_rmem_tensor(KW, Float32)
+                for e in cutlass.range_constexpr(KW):
                     xs[e] = raw[e]
                 if (ps0 < lo_max) | (ps0 + KB > q_first):
-                    for e in cutlass.range_constexpr(16):
-                        key = ps0 + 16 * warp + e
+                    for e in cutlass.range_constexpr(KW):
+                        key = ps0 + kofs + e
                         if (key < lo_r) | (key > hi_r):
                             xs[e] = Float32(NEG_INF)
-                mx = tree(fmax, [xs[e] for e in range(16)]) * c
+                mx = tree(fmax, [xs[e] for e in range(KW)]) * c
+                if cutlass.const_expr(self.wide):
+                    # the pair's row max of the stage (both halves then take the
+                    # same rescale decisions and P scale)
+                    xslot = ((t % 2) * 8 + hf * 4 + qtr) * 32 + lane
+                    store_shared_u32(xch_base + 4 * xslot, float_bits(mx))
+                    pair_barrier(8 + qtr)
+                    xother = load_words(
+                        xch_base + 4 * (xslot + 128 - 256 * hf), count=1, shared=True,
+                        result_type=Float32, word_type="f32",
+                    )[0]  # fmt: skip
+                    mx = fmax(mx, xother)
                 need = mx > m_use + Float32(THRESH)
                 rescale = Int32(0)
                 if need & (m_use > Float32(NEG_INF)):
@@ -765,27 +832,31 @@ class GqaWindowUmma:
                         alpha = ex2(m_use - mx)
                     l_run = l_run * alpha
                     a_res = a_res + 1
-                    wait(pvdone + 8 * ((t - 1) % NS), ((t - 1) // NS) & 1,
-                         scope="cta")  # fmt: skip
-                    fence_tmem()
-                    o_addr = tmem + lanes + O_COL
-                    o = ld64(o_addr)
-                    st64(o_addr, tuple(o[e] * alpha for e in range(64)))
+                    if hf == 0:  # (wide: one warp of the pair rescales the quarter's O)
+                        wait(pvdone + 8 * ((t - 1) % NS), ((t - 1) // NS) & 1,
+                             scope="cta")  # fmt: skip
+                        fence_tmem()
+                        o_addr = tmem + lanes + O_COL
+                        o = ld64(o_addr)
+                        st64(o_addr, tuple(o[e] * alpha for e in range(64)))
                 if need:
                     m_use = mx
                 bias = Float32(0)
                 if m_use > Float32(NEG_INF):
                     bias = -m_use
-                ps = [ex2(fma(xs[e], c, bias)) for e in range(16)]
+                ps = [ex2(fma(xs[e], c, bias)) for e in range(KW)]
                 l_run = l_run + tree(lambda u, v: u + v, ps)
-                packed = tuple(bf16x2(ps[2 * k], ps[2 * k + 1]) for k in range(8))
+                packed = tuple(bf16x2(ps[2 * k], ps[2 * k + 1]) for k in range(KW // 2))
                 self.trc(trs, t, 11)
                 if t >= NS:  # stage t - NS's PV read this P buffer
                     wait(pvdone + 8 * b, ((t - NS) // NS) & 1, scope="cta")
                     fence_tmem()
                 self.trc(trs, t, 12)
-                p_own = p_lanes + Uint32(32) * Uint32(b) + Uint32(8) * Uint32(warp)
-                st8w(p_own, packed)
+                if cutlass.const_expr(self.wide):
+                    st4w(p_lanes + Uint32(32) * Uint32(b) + Uint32(kofs // 2), packed)
+                else:
+                    p_own = p_lanes + Uint32(32) * Uint32(b) + Uint32(8) * Uint32(warp)
+                    st8w(p_own, packed)
                 fence_tmem(before=True)
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -795,92 +866,104 @@ class GqaWindowUmma:
             cute.arch.griddepcontrol_launch_dependents()
             self.rec(request, head, 8, a_sr, tid == 0)
             self.rec(request, head, 10, global_timer(), tid == 0)
-            # ---- merge the four quarters' partials (S > 1: then the cluster's)
-            if cutlass.const_expr(S > 1):
-                cute.arch.cluster_wait()  # every peer's receive barrier is armed
-            if count > 0:
-                last = count - 1
-                wait(pvdone + 8 * (last % NS), (last // NS) & 1, scope="cta")
-                fence_tmem()
-            ov = cute.make_rmem_tensor(64, Float32)
-            for e in cutlass.range_constexpr(64):
-                ov[e] = Float32(0)
-            if count > 0:
-                o = ld64(tmem + lanes + O_COL)
+            if cutlass.const_expr(self.wide):
+                # the pair's row sums: half 1 hands its l to half 0, which merges
+                if hf != 0:
+                    store_shared_u32(xch_base + 4 * (512 + qtr * 32 + lane),
+                                     float_bits(l_run))  # fmt: skip
+                pair_barrier(8 + qtr)
+                if hf == 0:
+                    l_run = l_run + load_words(
+                        xch_base + 4 * (512 + qtr * 32 + lane), count=1, shared=True,
+                        result_type=Float32, word_type="f32",
+                    )[0]  # fmt: skip
+            if hf == 0:
+                # ---- merge the four quarters' partials (S > 1: then the cluster's)
+                if cutlass.const_expr(S > 1):
+                    cute.arch.cluster_wait()  # every peer's receive barrier is armed
+                if count > 0:
+                    last = count - 1
+                    wait(pvdone + 8 * (last % NS), (last // NS) & 1, scope="cta")
+                    fence_tmem()
+                ov = cute.make_rmem_tensor(64, Float32)
                 for e in cutlass.range_constexpr(64):
-                    ov[e] = o[e]
-            named_barrier(1, 128)  # every warp past its PV wait: the ring is free
-            part = ring_base + (warp * 32 + r) * (PITCH * 4)
-            for k in cutlass.range_constexpr(16):
-                vals = (ov[4 * k], ov[4 * k + 1], ov[4 * k + 2], ov[4 * k + 3])
-                store_words(part + 16 * k, tuple(float_word(v) for v in vals),
-                            shared=True)  # fmt: skip
-            stats[(warp * 32 + r) * 2] = m_use
-            stats[(warp * 32 + r) * 2 + 1] = l_run
-            named_barrier(1, 128)
-            for it in cutlass.range_constexpr(-(-(ROWS * 8) // 128)):
-                task = it * 128 + tid
-                if task < ROWS * 8:
-                    rr, d8 = task // 8, task % 8
-                    ms = [stats[(w * 32 + rr) * 2] for w in range(4)]
-                    top = fmax(fmax(ms[0], ms[1]), fmax(ms[2], ms[3]))
-                    use = top
-                    if top == Float32(NEG_INF):
-                        use = Float32(0)
-                    total = Float32(0)
-                    values = [Float32(0)] * 8
-                    for w in cutlass.range_constexpr(4):
-                        weight = ex2(ms[w] - use)
-                        total = fma(stats[(w * 32 + rr) * 2 + 1], weight, total)
-                        src = ring_base + (w * 32 + rr) * (PITCH * 4) + 32 * d8
-                        lo4 = load_words(src, count=4, shared=True)
-                        hi4 = load_words(src + 16, count=4, shared=True)
-                        for e in cutlass.range_constexpr(4):
-                            values[e] = fma(bits_float(lo4[e]), weight, values[e])
-                            hi = fma(bits_float(hi4[e]), weight, values[4 + e])
-                            values[4 + e] = hi
-                    if cutlass.const_expr(S == 1):
-                        if live != 0:
-                            self.store_row(out, request, head, rr, d8, values, total)
-                    else:
-                        slot_r = (split * OWN + rr % OWN) * PITCH
-                        dst = recv_base + (slot_r + 8 * d8) * 4
-                        lo_w = tuple(float_word(values[e]) for e in range(4))
-                        hi_w = tuple(float_word(values[4 + e]) for e in range(4))
-                        push4(dst, lo_w, recv_bar, rr // OWN)
-                        push4(dst + 16, hi_w, recv_bar, rr // OWN)
-                        if d8 == 0:
-                            stat4 = (float_word(top), float_word(total), Uint32(0),
-                                     Uint32(0))  # fmt: skip
-                            push4(recv_base + (slot_r + 64) * 4, stat4, recv_bar,
-                                  rr // OWN)  # fmt: skip
-            if cutlass.const_expr(S > 1):
-                # ---- the owned rows: every CTA's partial landed
-                wait(recv_bar, 0, scope="cta")
-                for it in cutlass.range_constexpr(-(-(OWN * 8) // 128)):
+                    ov[e] = Float32(0)
+                if count > 0:
+                    o = ld64(tmem + lanes + O_COL)
+                    for e in cutlass.range_constexpr(64):
+                        ov[e] = o[e]
+                named_barrier(1, 128)  # every warp past its PV wait: the ring is free
+                part = ring_base + (warp * 32 + r) * (PITCH * 4)
+                for k in cutlass.range_constexpr(16):
+                    vals = (ov[4 * k], ov[4 * k + 1], ov[4 * k + 2], ov[4 * k + 3])
+                    store_words(part + 16 * k, tuple(float_word(v) for v in vals),
+                                shared=True)  # fmt: skip
+                stats[(warp * 32 + r) * 2] = m_use
+                stats[(warp * 32 + r) * 2 + 1] = l_run
+                named_barrier(1, 128)
+                for it in cutlass.range_constexpr(-(-(ROWS * 8) // 128)):
                     task = it * 128 + tid
-                    rr, d8 = task // 8, task % 8
-                    if (task < OWN * 8) & (rr < my_rows):
-                        tops = [recv[(sp * OWN + rr) * PITCH + 64] for sp in range(S)]
-                        top = tree(fmax, tops)
+                    if task < ROWS * 8:
+                        rr, d8 = task // 8, task % 8
+                        ms = [stats[(w * 32 + rr) * 2] for w in range(4)]
+                        top = fmax(fmax(ms[0], ms[1]), fmax(ms[2], ms[3]))
                         use = top
                         if top == Float32(NEG_INF):
                             use = Float32(0)
                         total = Float32(0)
                         values = [Float32(0)] * 8
-                        for sp in cutlass.range_constexpr(S):
-                            base_s = (sp * OWN + rr) * PITCH
-                            weight = ex2(tops[sp] - use)
-                            total = fma(recv[base_s + 65], weight, total)
-                            src = recv_base + (base_s + 8 * d8) * 4
+                        for w in cutlass.range_constexpr(4):
+                            weight = ex2(ms[w] - use)
+                            total = fma(stats[(w * 32 + rr) * 2 + 1], weight, total)
+                            src = ring_base + (w * 32 + rr) * (PITCH * 4) + 32 * d8
                             lo4 = load_words(src, count=4, shared=True)
                             hi4 = load_words(src + 16, count=4, shared=True)
                             for e in cutlass.range_constexpr(4):
                                 values[e] = fma(bits_float(lo4[e]), weight, values[e])
                                 hi = fma(bits_float(hi4[e]), weight, values[4 + e])
                                 values[4 + e] = hi
-                        self.store_row(out, request, head, split * OWN + rr, d8,
-                                       values, total)  # fmt: skip
+                        if cutlass.const_expr(S == 1):
+                            if live != 0:
+                                self.store_row(out, request, head, rr, d8, values, total)
+                        else:
+                            slot_r = (split * OWN + rr % OWN) * PITCH
+                            dst = recv_base + (slot_r + 8 * d8) * 4
+                            lo_w = tuple(float_word(values[e]) for e in range(4))
+                            hi_w = tuple(float_word(values[4 + e]) for e in range(4))
+                            push4(dst, lo_w, recv_bar, rr // OWN)
+                            push4(dst + 16, hi_w, recv_bar, rr // OWN)
+                            if d8 == 0:
+                                stat4 = (float_word(top), float_word(total), Uint32(0),
+                                         Uint32(0))  # fmt: skip
+                                push4(recv_base + (slot_r + 64) * 4, stat4, recv_bar,
+                                      rr // OWN)  # fmt: skip
+                if cutlass.const_expr(S > 1):
+                    # ---- the owned rows: every CTA's partial landed
+                    wait(recv_bar, 0, scope="cta")
+                    for it in cutlass.range_constexpr(-(-(OWN * 8) // 128)):
+                        task = it * 128 + tid
+                        rr, d8 = task // 8, task % 8
+                        if (task < OWN * 8) & (rr < my_rows):
+                            tops = [recv[(sp * OWN + rr) * PITCH + 64] for sp in range(S)]
+                            top = tree(fmax, tops)
+                            use = top
+                            if top == Float32(NEG_INF):
+                                use = Float32(0)
+                            total = Float32(0)
+                            values = [Float32(0)] * 8
+                            for sp in cutlass.range_constexpr(S):
+                                base_s = (sp * OWN + rr) * PITCH
+                                weight = ex2(tops[sp] - use)
+                                total = fma(recv[base_s + 65], weight, total)
+                                src = recv_base + (base_s + 8 * d8) * 4
+                                lo4 = load_words(src, count=4, shared=True)
+                                hi4 = load_words(src + 16, count=4, shared=True)
+                                for e in cutlass.range_constexpr(4):
+                                    values[e] = fma(bits_float(lo4[e]), weight, values[e])
+                                    hi = fma(bits_float(hi4[e]), weight, values[4 + e])
+                                    values[4 + e] = hi
+                            self.store_row(out, request, head, split * OWN + rr, d8,
+                                           values, total)  # fmt: skip
         self.rec(request, head, 11, global_timer(), tid == 0)
         if cutlass.const_expr(self.die_sms is not None):
             if tid == 0:  # (no CTA leaves before every CTA of the launch landed)
@@ -978,13 +1061,13 @@ def umma_smem(ring, q, page, window, die_split=False):
 def compile_window_umma(
     group, kv_heads, q, page, ring, window, v_scale, max_position, device,
     round_norm=False, debug=0, redo=False, splits=1, fill=4, trace=0, trace_req=0,
-    swarp=False, die_sms=None,
+    swarp=False, die_sms=None, wide=False,
 ):  # fmt: skip
     """``GqaWindowUmma`` for any request count (row-dynamic views); ``GqaWindow``'s
     arguments."""
     kernel = GqaWindowUmma(
         group, kv_heads, q, page, ring, window, v_scale, round_norm, debug, redo,
-        splits, fill, trace, trace_req, swarp, die_sms,
+        splits, fill, trace, trace_req, swarp, die_sms, wide,
     )
     i64, i32 = torch.int64, torch.int32
     count = cute.sym_int()

@@ -368,17 +368,18 @@ class GqaAttentionState:
                     f"GqaWindowUmma launch shape {shape} on {page}-token pages"
                 )
             # ahead bit 0: die split (resident grid, one unit per CTA on its KV
-            # head's die); bit 1: the separate S issuer warp
+            # head's die); bit 1: the separate S issuer warp; bit 2 (with bit 1):
+            # eight softmax warps, two per TMEM lane quarter
             die_sms = self.resident.die_sms if ahead & 1 else None
             compiled = compile_window_umma(
                 GROUP, self.kv_heads, self.q, page, ring, WINDOW, None,
                 self.max_position, self.device.index,
                 round_norm=window_options().get("round_norm", False), splits=splits,
-                swarp=bool(ahead & 2), die_sms=die_sms,
+                swarp=bool(ahead & 2), die_sms=die_sms, wide=bool(ahead & 4),
             )  # fmt: skip
             if die_sms is not None:
                 self.resident.check(
-                    compiled, 192 if ahead & 2 else 160,
+                    compiled, 160 + 32 * bool(ahead & 2) + 128 * bool(ahead & 4),
                     umma_smem(ring, self.q, page, WINDOW, True),
                     "GqaWindowUmma die split",
                 )  # fmt: skip

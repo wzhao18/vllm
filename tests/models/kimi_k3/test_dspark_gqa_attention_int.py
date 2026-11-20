@@ -612,11 +612,14 @@ def test_window_umma_redo(monkeypatch):
     check_rows(ours, stock, exact, 96, 3, "umma redo")
 
 
-@pytest.mark.parametrize("shape", [(1, 0, 6, 2), (1, 0, 6, 3)])
+@pytest.mark.parametrize(
+    "shape", [(1, 0, 6, 2), (1, 0, 6, 3), (1, 0, 6, 6), (2, 0, 6, 6)]
+)
 def test_window_umma_variants_match_stock(shape, monkeypatch):
-    """GqaWindowUmma with the separate S issuer warp (ahead bit 1) and the die split
-    (bit 0: resident grid, each CTA one unit of its die; heads 2-3 on die 1) at TP4
-    q3, batches up to 96: cache bytes identical to stock's, rows within BF16 noise."""
+    """GqaWindowUmma with the separate S issuer warp (ahead bit 1), the die split
+    (bit 0: resident grid, each CTA one unit of its die; heads 2-3 on die 1) and the
+    eight softmax warps (bit 2, also over a 2-CTA cluster) at TP4 q3, batches up to
+    96: cache bytes identical to stock's, rows within BF16 noise."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
         gqa_attention as ga,
     )
