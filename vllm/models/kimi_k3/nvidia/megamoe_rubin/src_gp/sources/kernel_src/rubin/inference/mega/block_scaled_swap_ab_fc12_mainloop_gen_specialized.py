@@ -56,7 +56,7 @@ from . import dms_diag as DG  # DIAG ONLY (D-MOE-LADDER)
 
 # DIAG ONLY (D-MOE-LADDER R6-1): "" = production; "2i" = the TMA-B warp issues the odd shared-FC1 A
 # stages; "nob" = shared FC1 skips the token B/SFB loads after the first ring pass; "2inob" = both.
-_DML_SH_MODE = ""
+_DML_SH_MODE = "2inob"
 from .....helpers.smem_workspace import SmemWorkspace
 from ......common.utils import ceil_div, round_up
 from .....quant_def import QuantKind
