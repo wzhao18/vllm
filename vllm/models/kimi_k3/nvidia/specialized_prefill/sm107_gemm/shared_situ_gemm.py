@@ -28,7 +28,7 @@ from .kda_conv_gemm import _Kernel as _BaseKernel
 from .packed_situ_gemm import interleave_shared_rows, situ_constants
 
 # (tile, cluster, inst_m, swizzle, raster, split producer, swap, flags)
-DEFAULT_TACTIC = ((512, 256), (2, 4), 256, 4, "m", 0, 0, "drain")
+DEFAULT_TACTIC = ((512, 256), (2, 1), 256, 8, "n", 0, 0, "drain")
 _COMPILED: dict = {}
 
 
