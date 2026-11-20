@@ -219,9 +219,11 @@ def supports(rows, n, k, split, silu=False):
 class WideGemm:
     """One (rows, N, K, split, silu) specialization; see the module docstring."""
 
-    def __init__(self, rows, n, k, split, silu=False):
+    def __init__(self, rows, n, k, split, silu=False, ldo=None):
         assert supports(rows, n, k, split, silu), (rows, n, k, split, silu)
         self.rows, self.n, self.k, self.split, self.silu = rows, n, k, split, silu
+        # output row pitch (elements): a column slice of a wider output (lm_head parts)
+        self.ldo = ldo or (n // 2 if silu else n)
         self.n_mma, self.chunks = mma_columns(rows)
         self.mma_tiler = (256, self.n_mma, K_TILE)
         self.threads = 256  # warps: 0 weights, 1 activations, 2 MMA, 3 idle, 4-7 epilogue
@@ -526,7 +528,7 @@ class WideGemm:
         total = self.sum8(stage_addr, rbytes, mine, tok * 512 + (e % 16) * 32, split_rank)
         w = [_pack_bf16(total[2 * q], total[2 * q + 1]) for q in range(4)]
         t = split_rank * region + tok
-        _st_v4_b32(y + (Int64(t) * self.n + tile * 128 + (e % 16) * 8) * 2, *w)
+        _st_v4_b32(y + (Int64(t) * self.ldo + tile * 128 + (e % 16) * 8) * 2, *w)
 
     @cute.jit
     def store_silu(self, stage_addr, rbytes, mine, split_rank, y, tile, region, e):
@@ -541,7 +543,7 @@ class WideGemm:
             h.append(_round_bf16(div_rn(g, den)) * _round_bf16(up[q]))
         w = [_pack_bf16(h[2 * q], h[2 * q + 1]) for q in range(4)]
         t = split_rank * region + tok
-        _st_v4_b32(y + (Int64(t) * (self.n // 2) + tile * 64 + (e % 8) * 8) * 2, *w)
+        _st_v4_b32(y + (Int64(t) * self.ldo + tile * 64 + (e % 8) * 8) * 2, *w)
 
     def sum8(self, stage_addr, rbytes, mine, off, split_rank):
         """8 consecutive FP32 values at ``off`` of my region, summed over the splits in
@@ -571,8 +573,8 @@ class PreparedWide:
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
     [T, N / 2] with ``silu``)."""
 
-    def __init__(self, weight, policies, silu=False):
-        self.silu = silu
+    def __init__(self, weight, policies, silu=False, ldo=None):
+        self.silu, self.ldo = silu, ldo
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         self.policies = dict(policies)  # rows -> split
@@ -583,16 +585,16 @@ class PreparedWide:
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, split in self.policies.items():
-            gemm = WideGemm(rows, self.n, self.k, split, self.silu)
+            gemm = WideGemm(rows, self.n, self.k, split, self.silu, self.ldo)
             x = torch.empty(rows, self.k, dtype=torch.bfloat16, device=dev)
             cols = self.n // 2 if self.silu else self.n
-            y = torch.empty(rows, cols, dtype=torch.bfloat16, device=dev)
+            y = torch.empty(rows, self.ldo or cols, dtype=torch.bfloat16, device=dev)[:, :cols]
             ws = torch.empty(max(split, 1), self.n, rows, dtype=torch.float32, device=dev)
             flags = torch.zeros(
                 2 * self.n // 128 + 16 * split * self.n // 128, dtype=torch.int32, device=dev
             )
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
-            key = (rows, self.n, self.k, split, self.silu)
+            key = (rows, self.n, self.k, split, self.silu, self.ldo)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)

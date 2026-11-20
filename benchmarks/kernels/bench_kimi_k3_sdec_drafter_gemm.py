@@ -54,7 +54,8 @@ def main():
     ap.add_argument("--rows", default="288")  # query rows (B x k3); context rows = B x 4
     ap.add_argument("--only", default="")
     ap.add_argument("--fi", default=",".join(FI_BACKENDS))
-    ap.add_argument("--wide", default="1,2,3,4,6,8")
+    ap.add_argument("--lmparts", default="")  # tiles:split,... e.g. 106:1,53:2,1:9
+    ap.add_argument("--wide", default="")  # WideGemm K splits to time, e.g. 1,2,3
     args = ap.parse_args()
     torch.manual_seed(0)
     dev = torch.device("cuda")
@@ -97,32 +98,33 @@ def main():
                 pls = [lt_pin.pinned(w, [m]) for w in ws]
                 if all(p is not None for p in pls):
                     run("lt_pin", lambda i: pls[i].run(x, out))
-            if args.wide:  # owned token-wide 2-CTA split-K GEMM (cutedsl/gemm/wide.py)
+            if args.wide:
                 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm import wide
 
-                for split in [int(s) for s in args.wide.split(",")]:
-                    if not wide.supports(m, n, k, split) or (
-                        split > 1 and 2 * (n // 256) * split > 212
-                    ):
-                        continue
-                    try:
-                        pws = [wide.PreparedWide(w, {m: split}).prepare() for w in ws]
-                        run(f"wide{split}", lambda i, p=pws: p[i].run(x, out))
-                    except Exception as e:  # noqa: BLE001
-                        res[f"wide{split}"] = (float("nan"), repr(e)[:90])
-            if mm_bf16 is not None:
+                for sp in [int(v) for v in args.wide.split(",")]:
+                    if wide.supports(m, n, k, sp):
+                        pws = [wide.PreparedWide(w, {m: sp}).prepare() for w in ws]
+                        run(f"wide{sp}", lambda i, pws=pws: pws[i].run(x, out))
+                        del pws
+                if args.lmparts and n % 256 == 0:
+                    parts = [tuple(int(v) for v in pp.split(':')) for pp in args.lmparts.split(',')]
+                    def mk(w):
+                        res_, r0 = [], 0
+                        for tiles, sp in parts:
+                            r1 = r0 + tiles * 256
+                            res_.append((r0, r1, wide.PreparedWide(w[r0:r1], {m: sp}, ldo=n).prepare()))
+                            r0 = r1
+                        assert r0 == n, (r0, n)
+                        return res_
+                    pls3 = [mk(w) for w in ws]
+                    def run3(i):
+                        for r0, r1, pw in pls3[i]:
+                            pw.run(x, out[:, r0:r1])
+                    run('parts', run3)
+                    del pls3
+            if mm_bf16 is not None and args.fi:
                 for be in args.fi.split(","):
                     run("fi:" + be, lambda i, be=be: mm_bf16(x, ws[i].t(), out=out, backend=be))
-                try:  # FlashInfer's autotuner picks tactics per backend (cached after)
-                    from flashinfer.autotuner import autotune
-
-                    for be in ("cutlass", "cudnn", "auto"):
-                        with autotune(True):
-                            mm_bf16(x, ws[0].t(), out=out, backend=be)
-                        run("fiT:" + be,
-                            lambda i, be=be: mm_bf16(x, ws[i].t(), out=out, backend=be))
-                except Exception as e:  # noqa: BLE001
-                    res["fiT"] = (float("nan"), repr(e)[:90])
             base = res["F.linear"][0]
             line = " ".join(
                 f"{t}={v[0]:.2f}" + (f"(x{base / v[0]:.2f} e{v[1]:.1e})" if isinstance(v[1], float)
