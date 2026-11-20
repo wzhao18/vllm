@@ -155,6 +155,9 @@ def main():
     parser.add_argument("--shape", default="")
     parser.add_argument("--arms", default="stock,fused")
     parser.add_argument("--no-context", action="store_true")
+    # the cache in die-localized memory (2 MiB chunks alternating dies 0 / 1, so
+    # rows-layout heads 0-1 / 2-3 of a 4 MiB layer page sit on dies 0 / 1)
+    parser.add_argument("--localized", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda", 0)
@@ -200,6 +203,8 @@ def run_shape(args, H, q, batches, shape, table, device):
     page = 128 if args.layout == "slots" else (4096 if H == 4 else 1024)
     layer_page = H * page * 2 * HEAD
     stride = LAYERS * layer_page + (64 if args.layout == "slots" else 128)
+    if args.localized:
+        stride = LAYERS * layer_page
     width = (G * H + 2 * H) * HEAD
     L = args.ctx + q
     lo = L - q - (WINDOW - 1)
@@ -212,7 +217,15 @@ def run_shape(args, H, q, batches, shape, table, device):
         per_call = B * H * (WINDOW - 1 + q) * 256
         copies = max(2, min(64, (600 << 20) // per_call))
         blocks = copies * B * len(pages) + 2
-        buffer = torch.empty(blocks * stride, dtype=torch.bfloat16, device=device)
+        if args.localized:
+            from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import (
+                dies,
+            )
+
+            buffer = dies.localized_empty(blocks * stride * 2, [0, 1], device)
+            buffer = buffer.view(torch.bfloat16)
+        else:
+            buffer = torch.empty(blocks * stride, dtype=torch.bfloat16, device=device)
         buffer.normal_()
         views = [
             buffer.as_strided((blocks, H, page, 2 * HEAD),

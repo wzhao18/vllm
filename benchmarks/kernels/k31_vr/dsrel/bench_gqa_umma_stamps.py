@@ -31,18 +31,37 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (  # noq
 DBG = None
 
 
+CLAIM = 0
+TABLE = None
+
+
 def _patch():
     orig = ga.compile_window_umma
 
     def patched(*args, **kwargs):
         kwargs["debug"] = DBG.data_ptr()
+        kwargs["claim"] = CLAIM
         return orig(*args, **kwargs)
 
     ga.compile_window_umma = patched
+    maps = ga.tensor_maps
+
+    def maps_plus(specs, device):  # (+ 128 zero bytes: the claim counters)
+        t = maps(specs, device)
+        return torch.cat([t, torch.zeros(128, dtype=t.dtype, device=t.device)])
+
+    ga.tensor_maps = maps_plus
 
 
 def _report(b):
-    s = DBG.view(-1, 16).cpu()
+    raw = DBG.view(2, -1, 16)[1].cpu()
+    if CLAIM and (raw[:, 14] != 0).any():
+        n = int((raw[:, 14] != 0).sum())
+        die, ticket = raw[:n, 13] >> 32, raw[:n, 13] & 0xFFFFFFFF
+        print(f"B{b} claim: CTAs {n} die0 {int((die == 0).sum())} die1 "
+              f"{int((die == 1).sum())} ticket max {int(ticket.max())} unique "
+              f"{len(set(zip(die.tolist(), ticket.tolist())))}", flush=True)
+    s = DBG.view(2, -1, 16)[0].cpu()
     ok = s[:, 0] > 0
     s = s[ok].double()
     n = s.shape[0]
@@ -84,8 +103,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batches", default="32,64,96")
     ap.add_argument("--ctx", default="150000")
+    ap.add_argument("--claim", action="store_true", help="die-matched (request, head) claim")
     args, rest = ap.parse_known_args()
-    DBG = torch.zeros(8192 * 16, dtype=torch.int64, device="cuda")
+    DBG = torch.zeros(2 * 8192 * 16, dtype=torch.int64, device="cuda")
+    global CLAIM
+    if args.claim:
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+        global TABLE  # keep the table alive (a freed block gets reused: garbage dies)
+        TABLE = (dies.sm_domain_table(torch.device("cuda", 0)),
+                 torch.zeros(4, dtype=torch.int32, device="cuda"))  # fmt: skip
+        CLAIM = (TABLE[0].data_ptr(), TABLE[1].data_ptr())
     _patch()
     for b in [int(x) for x in args.batches.split(",")]:
         DBG.zero_()

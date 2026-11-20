@@ -204,6 +204,33 @@ def clock64():
     return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
 
 
+@asm(Int32)
+def sm_id():
+    return "mov.u32 $0, %smid;", "=r", ()
+
+
+@asm(Int32)
+def atom_add_u32(address, value):
+    return ("atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;", "=r,l,r,~{memory}",
+            (Int64(address), Int32(value)))  # fmt: skip
+
+
+@asm(Int32)
+def load_u32_addr(address):
+    return "ld.global.cg.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
+
+
+@asm()
+def store_u32_relaxed(address, value):
+    return ("st.relaxed.gpu.global.u32 [$0], $1;", "l,r,~{memory}",
+            (Int64(address), Int32(value)))  # fmt: skip
+
+
+@asm()
+def fence_gpu():
+    return "fence.acq_rel.gpu;", "~{memory}", ()
+
+
 @asm()
 def store_u64(address, value):
     return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
@@ -230,7 +257,14 @@ class GqaWindowUmma:
     ``window`` keys. Same arguments as ``GqaWindow``."""
 
     def __init__(self, group, kv_heads, q, page, ring, window, v_scale=None,
-                 round_norm=False, debug=0, redo=False, splits=1):  # fmt: skip
+                 round_norm=False, debug=0, redo=False, splits=1, claim=0):  # fmt: skip
+        # ``claim`` (experimental, D-FUSE G1): (address of the int32 SM -> die
+        # table, address of 3 zeroed int32 claim counters); then each CTA claims a (request, KV head) item homed on its own die
+        # (heads [d * H / 2, (d + 1) * H / 2) on die d, the die-localized cache's
+        # chunk pattern) from the counters, stealing from the
+        # other die when its own is empty; the last CTA re-arms the counters
+        self.claim = claim
+        assert claim == 0 or (splits == 1 and kv_heads % 2 == 0 and len(claim) == 2)
         # ``splits`` CTAs per (request, KV head), a cluster: an even share of the
         # stages each; their partial rows LSE-merge by DSMEM pushes to the CTA owning
         # each row (as GqaWindow's)
@@ -339,7 +373,6 @@ class GqaWindowUmma:
         lane = tid % 32
         group8 = lane & 7
         upper = group8 >= 4
-        table_row = table.iterator + request * table.layout.stride[0]
         table_last = Int32(table.shape[1] - 1)
         blocks_max = args[13] - 1
 
@@ -364,6 +397,33 @@ class GqaWindowUmma:
         pvdone = pready + 8 * NS  # [NS]
         sfree = pvdone + 8 * NS  # [NS]: the warps loaded S
         recv_bar = sfree + 8 * NS  # the cluster's partial rows landed
+        if cutlass.const_expr(self.claim != 0):
+            HD: cutlass.Constexpr = HKV // 2
+            table_ptr, ctr = self.claim  # (SM -> die table, 3 int32 counters)
+            if tid == 0:
+                die = load_u32_addr(Int64(table_ptr) + Int64(sm_id()) * 4) & 1
+                _, _, n_req = cute.arch.grid_dim()
+                per = Int32(n_req) * HD
+                ticket = atom_add_u32(Int64(ctr) + Int64(die) * 4, 1)
+                if ticket >= per:
+                    die = 1 - die
+                    ticket = atom_add_u32(Int64(ctr) + Int64(die) * 4, 1)
+                ticket = min(max(ticket, Int32(0)), per - 1)
+                stats[0] = Float32(ticket // HD)  # (smem broadcast; exact < 2^24)
+                stats[1] = Float32(die * HD + ticket % HD)
+                # the last claimer re-arms (every other CTA finished its claim
+                # atomics before counting itself); visible before its PDL trigger,
+                # and the next launch's CTAs claim only after every CTA triggered
+                if atom_add_u32(Int64(ctr) + 8, 1) == per * 2 - 1:
+                    store_u32_relaxed(Int64(ctr), 0)
+                    store_u32_relaxed(Int64(ctr) + 4, 0)
+                    store_u32_relaxed(Int64(ctr) + 8, 0)
+                    fence_gpu()
+            cute.arch.sync_threads()
+            request = Int32(stats[0])
+            head = Int32(stats[1])
+            cute.arch.sync_threads()  # (stats is reused by the merge)
+        table_row = table.iterator + request * table.layout.stride[0]
         my_rows = min(max(ROWS - split * OWN, 0), OWN)
 
         if tid == 0:
@@ -806,13 +866,13 @@ class GqaWindowUmma:
 @cache
 def compile_window_umma(
     group, kv_heads, q, page, ring, window, v_scale, max_position, device,
-    round_norm=False, debug=0, redo=False, splits=1,
+    round_norm=False, debug=0, redo=False, splits=1, claim=0,
 ):  # fmt: skip
     """``GqaWindowUmma`` for any request count (row-dynamic views); ``GqaWindow``'s
     arguments."""
     kernel = GqaWindowUmma(
         group, kv_heads, q, page, ring, window, v_scale, round_norm, debug, redo,
-        splits,
+        splits, claim,
     )
     i64, i32 = torch.int64, torch.int32
     count = cute.sym_int()

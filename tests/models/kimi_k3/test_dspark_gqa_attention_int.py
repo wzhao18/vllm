@@ -612,6 +612,50 @@ def test_window_umma_redo(monkeypatch):
     check_rows(ours, stock, exact, 96, 3, "umma redo")
 
 
+def test_window_umma_die_claim(monkeypatch):
+    """GqaWindowUmma with the die-matched (request, KV head) claim: rows bitwise equal
+    to the static grid's on the same inputs, across repeated launches (the counters
+    re-arm), and the cache bytes as stock's (TP4 q3, B96 on the GqaWindowUmma shape)."""
+    import functools
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_attention as ga,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        gqa_window_umma as gu,
+    )
+
+    device = _device()
+    maps = ga.tensor_maps
+    monkeypatch.setattr(ga, "tensor_maps", lambda specs, dev: torch.cat(
+        [maps(specs, dev), torch.zeros(128, dtype=torch.uint8, device=dev)]))
+    results = []
+    table = dies.sm_domain_table(device)  # (alive for the whole test)
+    counters = torch.zeros(4, dtype=torch.int32, device=device)
+    for claim in (0, (table.data_ptr(), counters.data_ptr())):
+        compile_claim = functools.partial(gu.compile_window_umma.__wrapped__,
+                                          claim=claim)  # fmt: skip
+        monkeypatch.setattr(ga, "compile_window_umma", compile_claim)
+        gen = torch.Generator(device=device).manual_seed(96)
+        layers = make_layers(4, gen)
+        assert ga.window_shape(4, 3, 96)[1] == 0  # (the GqaWindowUmma shape)
+        state = install(layers, 3, (96,))
+        for rep in range(3 if claim else 1):
+            gen = torch.Generator(device=device).manual_seed(5)
+            ours, stock, exact, lengths, differ = run_case(
+                state, layers, "rows", 96, 3, gen, seed=11
+            )
+            assert differ == 0
+            results.append([o.clone() for o in ours])
+        check_rows(ours, stock, exact, 96, 3, f"umma claim={bool(claim)}")
+        if claim:
+            assert counters.tolist() == [0, 0, 0, 0]  # (re-armed)
+    for rep in results[1:]:
+        for a, b in zip(results[0], rep):
+            assert torch.equal(a, b)
+
+
 @pytest.mark.parametrize("layout", ["rows", "slots"])
 def test_window_ignores_stale_nan(layout):
     """Never-zeroed blocks: NaN in every cache byte outside the requests' written keys

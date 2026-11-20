@@ -112,6 +112,15 @@ COLUMNS = HIDDEN // CLUSTER  # 896: 112 threads x 8 columns
 # Benchmarks only: one-shot sites write CTA (0, 0)'s %globaltimer at entry, after the
 # PDL wait, after the poll and at the end into PreparedDraftAr.stamps (4 per site).
 STAMPS = False
+# Benchmarks only: a global address of int64 [CTAs, 8]; ArNormRows CTAs write
+# %globaltimer at entry, after the PDL wait, after the pushes, after the owner
+# reduces, at the end (read at compile time).
+ROWS_STAMPS = 0
+
+
+@asm()
+def _stamp_u64(address, value):
+    return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
 
 
 @asm(Int64)
@@ -485,6 +494,13 @@ class ArNormRows:
         self.push = push and self.reduce
         self.owned_chunks = HIDDEN // tp // 8
         self.ctas = ctas
+        self.dbg = ROWS_STAMPS
+
+    @cute.jit
+    def rec(self, cta, k: cutlass.Constexpr[int], tid):
+        if cutlass.const_expr(self.dbg != 0):
+            if tid == 0:
+                _stamp_u64(Int64(self.dbg) + (Int64(cta) * 8 + k) * 8, globaltimer())
 
     @cute.jit
     def __call__(self, *args):
@@ -581,7 +597,9 @@ class ArNormRows:
         live = local < COLUMNS // 8
         col = group * COLUMNS + min(local, COLUMNS // 8 - 1) * 8
         weights = load_words(gamma.iterator + col, count=4)  # static: before the wait
+        self.rec(first, 0, tid)
         cute.arch.griddepcontrol_wait()
+        self.rec(first, 1, tid)
         if cutlass.const_expr(self.trigger):
             cute.arch.griddepcontrol_launch_dependents()
         out = (eps, norm_out, gather, sums)
@@ -589,8 +607,10 @@ class ArNormRows:
             row = first
             if cutlass.const_expr(self.push):
                 self.push_row(partial, recv, peers, rank, row, live, col)
+                self.rec(first, 2, tid)
                 self.reduce_row(recv, gather, mc, rank, row, tid)
                 cute.arch.sync_threads()  # the gather row's pollers after the owners
+                self.rec(first, 3, tid)
             self.finish_row(partial, residual, weights, *out, row, tid, live, col)
         else:  # persistent: all pushes, then all owner reduces, then the rows
             rows = norm_out.shape[0]
@@ -600,12 +620,15 @@ class ArNormRows:
             if cutlass.const_expr(self.push):
                 for row in cutlass.range(first, rows, stride, unroll=1):
                     self.push_row(partial, recv, peers, rank, row, live, col)
+                self.rec(first, 2, tid)
                 for row in cutlass.range(first, rows, stride, unroll=1):
                     self.reduce_row(recv, gather, mc, rank, row, tid)
                 cute.arch.sync_threads()  # the gather rows' pollers after the owners
+                self.rec(first, 3, tid)
             # (``finish_row`` opens with a barrier: the previous row's ``sums`` read)
             for row in cutlass.range(first, rows, stride, unroll=1):
                 self.finish_row(partial, residual, weights, *out, row, tid, live, col)
+        self.rec(first, 4, tid)
         if cutlass.const_expr(not self.trigger):
             cute.arch.griddepcontrol_launch_dependents()
 
