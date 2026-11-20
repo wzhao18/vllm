@@ -253,9 +253,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
   constexpr int kV2PB = V2Cfg<T>::kPB, kV2FB = V2Cfg<T>::kFB;
   const int W = p.W, K = p.K, IL = p.interleave;
   auto log2_or = [](int x) -> int { return (x > 0 && (x & (x - 1)) == 0) ? __ffs(x) - 1 : -1; };
-  const int bs_sh = log2_or(p.block_size), il_sh = log2_or(IL), w_sh = log2_or(W);
+  int bs_sh = log2_or(p.block_size), il_sh = log2_or(IL), w_sh = log2_or(W);
   // gid = ((pos / IL) * W + rank) * IL + pos % IL = (pos / IL) << (w_sh + il_sh) | rank << il_sh | pos % IL
-  const int gid_sh = (il_sh >= 0 && w_sh >= 0) ? il_sh + w_sh : -1;
+  int gid_sh = (il_sh >= 0 && w_sh >= 0) ? il_sh + w_sh : -1;
   // scalar slots
   int& s_tier = s_i[0];
   int& s_tau = s_i[1];
@@ -299,11 +299,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // SMEM front end: the row's groups (group g = positions [8g - sh0, +8), 16-byte
     // aligned) are bulk-copied into srow[g] before the row's lengths are known, by
     // kV2Cp warps at once; partial groups (head, tail, past lcols) are read key by key.
+    // (geometry: non-const, round 2 recomputes it rather than keeping it live)
     const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
     const uintptr_t la = reinterpret_cast<uintptr_t>(lrow);
     const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
-    const int sh0 = (8 - head0) & 7;
-    const int gs_lo = sh0 ? 1 : 0, gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
+    int sh0 = (8 - head0) & 7;
+    int gs_lo = sh0 ? 1 : 0, gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
     if ((tid & 31) == 0 && (tid >> 5) < kV2Cp) {
       // the previous row's generic SMEM writes before the async-proxy copy
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -313,7 +314,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       if (b > a) bulk_g2s(srow + a, gb + a, (uint32_t)(b - a) * 16u, &s_bar);
       else asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&s_bar)) : "memory");
     }
-    const int L = p.local_len[row];
+    int L = p.local_len[row];
     const int Gl = p.global_len[row];
     int* orow = p.out + (int64_t)row * p.ostride;
     const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
@@ -352,11 +353,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // longer rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
     for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
     if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; }
-    const int head = min(L, head0);
-    const int sh = (8 - head) & 7;  // == sh0 when L >= 8
-    const int ng = (L + sh + 7) >> 3;
-    const int g_lo = sh ? 1 : 0, g_hi = (L + sh) >> 3;  // full groups [g_lo, g_hi)
-    const bool regp = L >= 8 && ng <= kV2NR * kV2T;  // the SMEM path (same group layout)
+    int head = min(L, head0);
+    int sh = (8 - head) & 7;  // == sh0 when L >= 8
+    int ng = (L + sh + 7) >> 3;
+    int g_lo = sh ? 1 : 0, g_hi = (L + sh) >> 3;  // full groups [g_lo, g_hi)
+    bool regp = L >= 8 && ng <= kV2NR * kV2T;  // the SMEM path (same group layout)
     auto load_group = [&](int g) -> uint4 {
       if (g >= g_lo && g < g_hi) return __ldg(reinterpret_cast<const uint4*>(lrow - sh) + g);
       if (g < 0 || g >= ng) return make_uint4(~0u, ~0u, ~0u, ~0u);
@@ -379,7 +380,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       __syncthreads();
     };
     // partial head / tail groups (masked, key by key), loaded while the copy lands
-    const bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
+    bool phead = regp && sh > 0, ptail = regp && g_hi < ng && g_hi > 0;
     uint4 pg = make_uint4(~0u, ~0u, ~0u, ~0u);
     if (tid == 0 && phead) pg = load_group(0);
     if (tid == 32 && ptail) pg = load_group(g_hi);
@@ -550,6 +551,35 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #pragma unroll 1
     for (int rnd = 0; rnd < (kFast ? 2 : 1); ++rnd) {
     if (rnd > 0) {
+      // the row geometry again: recomputed (from an opaque copy of row) rather than kept
+      // live through round 1, whose registers are tight
+      {
+        int rr;
+        asm volatile("mov.b32 %0, %1;" : "=r"(rr) : "r"(row));
+        lrow = p.logits + (int64_t)rr * p.lstride;
+        const int h0 = (int)(((16u - (uint32_t)(reinterpret_cast<uintptr_t>(lrow) & 15u)) & 15u) >> 1);
+        sh0 = (8 - h0) & 7;
+        gs_lo = sh0 ? 1 : 0;
+        gs_hi = min((p.lcols + sh0) >> 3, kV2NR * kV2T);
+        L = p.local_len[rr];
+        head = min(L, h0);
+        sh = (8 - head) & 7;
+        ng = (L + sh + 7) >> 3;
+        g_lo = sh ? 1 : 0;
+        g_hi = (L + sh) >> 3;
+        regp = L >= 8 && ng <= kV2NR * kV2T;
+        phead = regp && sh > 0;
+        ptail = regp && g_hi < ng && g_hi > 0;
+        const int rq = p.req_of_row != nullptr ? p.req_of_row[rr] : rr / p.next_n;
+        btrow = p.block_table != nullptr ? p.block_table + (int64_t)rq * p.bt_stride : nullptr;
+        int bs2, il2;
+        asm volatile("mov.b32 %0, %1;" : "=r"(bs2) : "r"(p.block_size));
+        asm volatile("mov.b32 %0, %1;" : "=r"(il2) : "r"(p.interleave));
+        bs_sh = log2_or(bs2);
+        il_sh = log2_or(il2);
+        w_sh = log2_or(W);
+        gid_sh = (il_sh >= 0 && w_sh >= 0) ? il_sh + w_sh : -1;
+      }
       if (tid == 0) s_sat = 0u;
       recand = X2 < th;
       if (recand) {
