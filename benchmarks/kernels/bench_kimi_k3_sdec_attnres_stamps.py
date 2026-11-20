@@ -484,17 +484,26 @@ __global__ void __launch_bounds__(512, 1) gemm_k(Prm p) {
     __shared__ volatile int codone;
     __shared__ unsigned long long cot;
     __shared__ int cokb;
+    __shared__ volatile int corel;
     if (threadIdx.x == 32) {
       for (int i = 0; i < 12; ++i) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(cobar + i)) : "memory");
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-      codone = 0;
+      codone = 0; corel = 0;
     }
     __syncthreads();
     if (threadIdx.x < 32) {
       asm volatile("griddepcontrol.wait;" ::: "memory");
-      if (threadIdx.x == 0) { cot = gtime(); cokb = codone * (CO_CHUNK / 1024); }
+      if (threadIdx.x == 0) { cot = gtime(); cokb = codone * (CO_CHUNK / 1024); corel = 1; }
     } else if (p.co == 1) {
       if (threadIdx.x == 32) co_stream(p, reinterpret_cast<char*>(ring), cobar, p.co_nst, &codone);
+    } else if (p.co == 4) {
+      if (threadIdx.x == 32) {
+        co_stream(p, reinterpret_cast<char*>(ring), cobar, p.co_nst, &codone);
+        uint32_t ok = 0;
+        while (!corel && !ok)
+          asm volatile("{ .reg .pred q; mbarrier.try_wait.parity.shared::cta.b64 q, [%1], %2; selp.u32 %0, 1, 0, q; }"
+                       : "=r"(ok) : "r"(sa(cobar + 11)), "r"(1u) : "memory");
+      }
     } else if (p.co == 2) {
       float x = threadIdx.x * 1e-3f;
       const unsigned long long t0 = gtime();
@@ -857,10 +866,11 @@ def main():
                         for co in cos:
                             cfgs.append((pre, mode, ch, rs, co))
         for pre, mode, ch, rs, co in cfgs:
-            kind_, _, arg_ = (co or "off").partition(":")
-            ns_ = int(arg_ or 0)
-            cmode = {"off": 0, "park": 0, "none": 3, "fma": 2, "l2": 1, "hbm": 1}[kind_]
-            mod.set_co(cmode, ns_, args.co_kb * 1024, (32 << 20) if kind_ == "l2" else 0,
+            kind_, *rest_ = (co or "off").split(":")
+            ns_ = int(rest_[0]) if rest_ else 0
+            kb_ = int(rest_[1]) if len(rest_) > 1 else args.co_kb
+            cmode = {"off": 0, "park": 0, "none": 3, "fma": 2, "l2": 1, "hbm": 1, "spin": 4}[kind_]
+            mod.set_co(cmode, ns_, kb_ * 1024, (32 << 20) if kind_ == "l2" else 0,
                        co_buf.data_ptr(), co_buf.numel())
             grid = rs * min(sms // rs, mod.max_clusters(rs, smem)) if rs > 1 else sms
             assert R // 4 <= grid // rs, "one shard row per owner cluster"
