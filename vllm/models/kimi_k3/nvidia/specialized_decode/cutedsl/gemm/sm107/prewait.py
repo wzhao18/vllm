@@ -43,7 +43,7 @@ def _alpha_one(device):
 @cache
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
              prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, push=False,
-             k_rotate=0):
+             k_rotate=0, m128x2=False, raster="m"):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
@@ -58,10 +58,18 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         producers=producers,
         die_claim=die_claim,
         push=push,
+        m128x2=m128x2,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
+    gemm.dbg_skip_sfb_cp = bool(dbg & 2)
+    gemm.dbg_skip_sfa_cp = bool(dbg & 4)
+    gemm.dbg_skip_sf_tma = bool(dbg & 8)
+    gemm.dbg_skip_epi = bool(dbg & 16)
+    gemm.dbg_sf_shift = 0 if dbg & 32 else (2 if dbg & 64 else 1)
+    gemm.dbg_skip_a = bool(dbg & 128)
     gemm.max_ab_stages = max_stages
     gemm.k_rotate = k_rotate
+    gemm.raster_order = raster
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16)
@@ -98,7 +106,7 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 push=False, k_rotate=0, device=None):
+                 push=False, k_rotate=0, m128x2=False, raster="m", device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         # swap_ab: weights are operand A (M = N rows) and the kernel stores C M-major, i.e.
@@ -121,7 +129,7 @@ class Mxfp8PreGemm:
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), self.push, int(k_rotate),
+            int(max_stages), self.push, int(k_rotate), bool(m128x2), str(raster),
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
@@ -129,7 +137,7 @@ class Mxfp8PreGemm:
         self.alpha = _alpha_one(device)
         self.aux, self.calls = None, 0
         if die_split is not None:
-            self.aux = self._die_aux(tactic, rows, n, die_split, device)
+            self.aux = self._die_aux(tactic, rows, n, die_split, device, m128x2)
         self.out_layout = "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
@@ -172,17 +180,18 @@ class Mxfp8PreGemm:
         return args
 
     @staticmethod
-    def _die_aux(tactic, rows, n, die_split, device):
+    def _die_aux(tactic, rows, n, die_split, device, m128x2=False):
         """alpha + die-claim state: int32 [4..6] counters (die 0, die 1, done), [8..11]
         (first tile, tiles) per die, [12] M tiles, [16 + smid] die of the SM."""
         from ...common.dies import sm_domains
 
         tile, cluster = tactic[0], tactic[1]
-        if tuple(cluster) != (1, 1):
-            raise ValueError("die_claim needs a 1x1 cluster tactic")
+        csize = 2 if m128x2 else 1
+        if tuple(cluster) != ((2, 1) if m128x2 else (1, 1)):
+            raise ValueError("die_claim needs a 1x1 (m128x2: 2x1) cluster tactic")
         m_tiles, n_tiles = -(-rows // tile[0]), -(-n // tile[1])
         total = m_tiles * n_tiles
-        if total > _max_active_clusters(1):
+        if total > _max_active_clusters(csize):
             raise ValueError(f"die_claim needs one tile per CTA ({total} tiles)")
         table = sm_domains(device.index or 0)
         n0 = min(die_split, n_tiles) * m_tiles
