@@ -162,6 +162,7 @@ B_SLFULL = B_NFULL + NCR  # x NSL (logical mode: physical rows of stage g % NSL 
 B_SLEMPTY = B_SLFULL + NSL  # x NSL (... read by every gather warp)
 B_SFULL1, B_SFREE1 = B_SLEMPTY + NSL, B_SLEMPTY + NSL + 2  # x2: S keys 32-63 (qkh knob)
 B_TKI = B_SFREE1 + 2  # x2 (token parity): top-k row copy landed
+B_MAXF = B_SFREE1  # x2 (own knob, tile parity): a tile's running max published
 assert B_TKI + 2 <= NBAR
 # named barriers: 1-3 / 4-6 m handoff WG0 -> WG1 / WG1 -> WG0 (per sub-partition),
 # 7-9 / 12-14 token-end l/m exchange (per sub-partition, token parity), 10 + wg
@@ -399,10 +400,14 @@ class SparseMlaDecodeTS:
         # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
-        knobs = tuple(knobs) + (0,) * (14 - len(knobs))
+        # own: owner-WG tiles - one softmax WG owns both 64-key subtiles of a 128-key
+        # tile (S(u0) max pass, S(u1), S(u0) recomputed by a second QK), the WGs alternate
+        # tiles, the running max is handed one way to the next tile's WG (no swap)
+        knobs = tuple(knobs) + (0,) * (15 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys) = knobs[:14]
+         self.qkh, self.lglob, self.xphys, self.own) = knobs[:15]
+        assert not (self.own and self.qkh), "own uses the qkh barrier slots"
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -1240,6 +1245,8 @@ class SparseMlaDecodeTS:
         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
         u = Int32(0)
+        seq = Int32(0)  # own knob: S-buffer uses
+        tt = Int32(0)  # own knob: 128-key tiles
         for qi in range(n_mine):
             subs = _subs(self.ntok(base, lens, cta + qi * self.grid, qi))
             # the next token's latent Q: staging -> TMEM by tcgen05.cp from this warp, once
@@ -1254,19 +1261,44 @@ class SparseMlaDecodeTS:
                 for c in cutlass.range_constexpr(4):
                     cp_e(taddr + Uint32(C_Q + 32 * j + 8 * c), qd + Uint64(j * ATOM // 16 + 2 * c))
             commit_e(_bar(base, B_QLFREE))
-            for i in range(subs):
-                self.ss(base, cta, lane, u, 25, 2)
-                if not self.qkh:
-                    if u >= 1:
-                        mbar_wait(_bar(base, B_SFREE + (u - 1) % 2),
-                                  Uint32(((u - 1) // 2) & 1))
-                        tc_fence_after()
-                self.ss(base, cta, lane, u, 24, 2)
-                self.qk(base, lane, taddr, u, qi, i == subs - 1, cta)
-                u = u + 1
+            if cutlass.const_expr(self.own):
+                # per 128-key tile: S(u0) (its owner's max pass), S(u1), S(u0) again
+                for k in range((subs + 1) // 2):
+                    u0 = u + 2 * k
+                    if 2 * k + 1 < subs:
+                        seq = self.qk_own(base, lane, taddr, u0, qi, False, cta, seq, tt)
+                        seq = self.qk_own(base, lane, taddr, u0 + 1, qi, False, cta, seq, tt)
+                    seq = self.qk_own(base, lane, taddr, u0, qi, 2 * k + 2 >= subs, cta, seq,
+                                      tt)
+                    tt = tt + 1
+                u = u + subs
+            else:
+                for i in range(subs):
+                    self.ss(base, cta, lane, u, 25, 2)
+                    if not self.qkh:
+                        if u >= 1:
+                            mbar_wait(_bar(base, B_SFREE + (u - 1) % 2),
+                                      Uint32(((u - 1) // 2) & 1))
+                            tc_fence_after()
+                    self.ss(base, cta, lane, u, 24, 2)
+                    self.qk(base, lane, taddr, u, qi, i == subs - 1, cta, u)
+                    u = u + 1
 
     @cute.jit
-    def qk(self, base, lane, taddr, u, qi, last, cta):
+    def qk_own(self, base, lane, taddr, u, qi, last, cta, seq, tt):
+        """own knob: QK(u) as S-buffer use ``seq`` (once use seq - 1 was loaded), S-full
+        to the owner WG of tile tt (B_SFULL + tt % 2: per-WG phases, so a WG waiting
+        for its next use can never pass on another WG's phase)."""
+        if seq >= 1:
+            mbar_wait(_bar(base, B_SFREE + (seq - 1) % 2), Uint32(((seq - 1) // 2) & 1))
+            tc_fence_after()
+        self.qk(base, lane, taddr, u, qi, last, cta, tt)
+        return seq + 1
+
+    @cute.jit
+    def qk(self, base, lane, taddr, u, qi, last, cta, sb):
+        """QK(u) into the S buffer; ``sb``: its S-full barrier index (u, or the own knob's
+        S-buffer use count)."""
         s = u % NS
         st = base + Uint32(OFF_KV) + Uint32(s) * Uint32(STAGE64)
         self.ss(base, cta, lane, u, 16, 2)
@@ -1293,7 +1325,7 @@ class SparseMlaDecodeTS:
             if cutlass.const_expr(not self.no_mma):
                 mma_ss_e(sc, ad, bd, Uint32(IDESC_QK), Uint32(1))
             self.ss(base, cta, lane, u, 17, 2)
-            commit_e(_bar(base, B_SFULL + u % 2))
+            commit_e(_bar(base, B_SFULL + sb % 2))
             if last:
                 commit_e(_bar(base, B_QREMPTY + qi % 2))
 
@@ -1375,6 +1407,9 @@ class SparseMlaDecodeTS:
         real_m = h < (0 if self.no_math else H)
         xv = cute.make_rmem_tensor((64,), Float32)
         u = Int32(0)
+        tt = Int32(0)  # own knob: 128-key tiles so far (owner WG tt % 2)
+        seq = Int32(0)  # own knob: S-buffer uses so far (3 per two-subtile tile)
+        cw = Int32(0)  # own knob: S-buffer uses of this WG (its B_SFULL + wg phases)
         for qi in range(n_mine):
             row = cta + qi * self.grid
             n = self.ntok(base, lens, row, qi)
@@ -1384,22 +1419,38 @@ class SparseMlaDecodeTS:
             subs = _subs(n)
             mp_last = Float32(-1e30)  # running max m; this WG's l is relative to m - P_PRE
             lw = Float32(0.0)
-            for i in range(subs):
-                if u % 2 == wg:
-                    if i == subs - 1:
-                        mp_last, lw = self.sub(base, warp, lane, wg, sp, h, lane_addr, real_m,
-                                               xv, scale_log2, u, i, n, more_tok, mp_last,
-                                               lw, cta, True)
+            if cutlass.const_expr(self.own):
+                for k in range((subs + 1) // 2):
+                    full = 2 * k + 1 < subs
+                    if tt % 2 == wg:
+                        mp_last, lw, cw = self.tile_own(base, warp, lane, wg, sp, h,
+                                                        lane_addr, real_m, xv, scale_log2,
+                                                        u + 2 * k, k, n, subs, seq, tt,
+                                                        mp_last, lw, cw)
+                    if full:
+                        seq = seq + 3
                     else:
-                        mp_last, lw = self.sub(base, warp, lane, wg, sp, h, lane_addr, real_m,
-                                               xv, scale_log2, u, i, n, Int32(1), mp_last,
-                                               lw, cta, False)
-                u = u + 1
+                        seq = seq + 1
+                    tt = tt + 1
+                u = u + subs
+                owner = (tt - 1) % 2 == wg
+            else:
+                for i in range(subs):
+                    if u % 2 == wg:
+                        if i == subs - 1:
+                            mp_last, lw = self.sub(base, warp, lane, wg, sp, h, lane_addr,
+                                                   real_m, xv, scale_log2, u, i, n, more_tok,
+                                                   mp_last, lw, cta, True)
+                        else:
+                            mp_last, lw = self.sub(base, warp, lane, wg, sp, h, lane_addr,
+                                                   real_m, xv, scale_log2, u, i, n, Int32(1),
+                                                   mp_last, lw, cta, False)
+                    u = u + 1
+                owner = (u - 1) % 2 == wg
             # ---- token end. The WG owning the last subtile (u - 1) combines
             # l = l0 2^(m0 - m) + l1 2^(m1 - m), m = max(m0, m1) and runs the epilogue (in
             # the Q staging, once the next token's Q is in TMEM); the other WG hands over
             # (l, m) and goes on.
-            owner = (u - 1) % 2 == wg
             tok = base + Uint32(OFF_TOK0)
             if qi % 2 == 1:
                 tok = base + Uint32(OFF_TOK1)
@@ -1432,6 +1483,186 @@ class SparseMlaDecodeTS:
                 if qi + 1 < n_mine:
                     mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
                 self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
+
+    @cute.jit
+    def tile_own(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u0, k,
+                 n, subs, seq, tt, mp_last, lw, cw):
+        """own knob: 128-key tile k of its token (subtiles u0 and u0 + 1, or u0 alone as
+        the token's last tile) on WG tt % 2. S-buffer uses: seq = S(u0) max pass, seq + 1
+        = S(u0 + 1), seq + 2 = S(u0) again (one-subtile tile: seq = S(u0)). The running
+        max m comes from the previous tile's WG (one way, B_MAXF) and is published for the
+        next one; P codes, l and the O^T rescale are the stock anchoring of sub(). Returns
+        (m, l) of this WG."""
+        s_addr = lane_addr + Uint32(C_S)
+        cta = Int32(cute.arch.block_idx()[0])
+        self.ss(base, cta, lane, u0, 8 * wg + 0, 1)  # tile start
+        i0 = 2 * k
+        full = i0 + 1 < subs
+        last = i0 + 2 >= subs  # the token's last tile: its last subtile may be partial
+        m0 = Float32(-math.inf)
+        if full:
+            mbar_wait(_bar(base, B_SFULL + wg), Uint32(cw & 1))
+            cw = cw + 1
+            self.ss(base, cta, lane, u0, 8 * wg + 1, 1)  # S(u0) max pass full
+            tc_fence_after()
+            sm0 = tmem_ld_max64(s_addr)
+            m0 = sm0[64]
+            tc_fence_before()
+            cute.arch.sync_warp()
+            if lane == 0:
+                mbar_arrive(_bar(base, B_SFREE + seq % 2))
+        sq = seq
+        iv = i0
+        ux = u0
+        if full:
+            sq = seq + 1
+            iv = i0 + 1
+            ux = u0 + 1
+        mbar_wait(_bar(base, B_SFULL + wg), Uint32(cw & 1))
+        cw = cw + 1
+        self.ss(base, cta, lane, u0, 8 * wg + 2, 1)  # S(u1) full
+        tc_fence_after()
+        m1 = Float32(-math.inf)
+        if last:
+            sa = tmem_ld(s_addr, 64)
+            for j in cutlass.range_constexpr(64):
+                xv[j] = sa[j]
+        else:
+            sm1 = tmem_ld_max64(s_addr)
+            for j in cutlass.range_constexpr(64):
+                xv[j] = sm1[j]
+            m1 = sm1[64]
+        tc_fence_before()
+        cute.arch.sync_warp()
+        if lane == 0:
+            mbar_arrive(_bar(base, B_SFREE + sq % 2))
+        mbx = base + Uint32(OFF_MBOX)
+        grow = Int32(0)
+        alpha = Float32(1.0)
+        mp = Float32(0.0)
+        mprev = Float32(-1e30)
+        if k >= 1:
+            mbar_wait(_bar(base, B_MAXF + (tt - 1) % 2), Uint32(((tt - 1) // 2) & 1))
+        if real_m:
+            if last:
+                for j in cutlass.range_constexpr(64):
+                    if 64 * iv + j >= n:
+                        xv[j] = Float32(-math.inf)
+                m1 = _tree_max([xv[j] for j in range(64)])
+            xm = cute.arch.fmax(m0, m1) * scale_log2
+            if k >= 1:
+                mprev = ld_shared_f32(mbx + Uint32((tt - 1) % 2) * Uint32(H * 4)
+                                      + Uint32(h * 4))
+            mr = mprev
+            if k == 0:
+                if xm > Float32(-1e30):
+                    mr = xm
+            else:
+                if xm > mprev:
+                    mr = xm
+                    grow = Int32(1)
+                    alpha = ex2(mprev - xm)
+            mp = mr - Float32(P_PRE)
+            if mr != mp_last:
+                lw = lw * ex2((mp_last - Float32(P_PRE)) - mp)
+                mp_last = mr
+            st_shared_f32(mbx + Uint32(tt % 2) * Uint32(H * 4) + Uint32(h * 4), mr)
+        cute.arch.sync_warp()
+        if lane == 0:
+            mbar_arrive(_bar(base, B_MAXF + tt % 2))
+        self.ss(base, cta, lane, u0, 8 * wg + 3, 1)  # decision + m published
+        par = Uint32(wg * 2) + Uint32((tt // 2) % 2)
+        gm = base + Uint32(OFF_GMASK) + par * Uint32(16)
+        alb = base + Uint32(OFF_AL) + par * Uint32(H * 4)
+        gw = ballot(Uint32(grow))
+        if lane == 0 and sp < 3:
+            st_shared_u32(gm + Uint32(4 * sp), gw)
+        if real_m:
+            st_shared_f32(alb + Uint32(h * 4), alpha)
+        anyg = bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow))
+        lw = self.p_own(base, h, real_m, xv, scale_log2, mp, ux, lw)
+        self.ss(base, cta, lane, u0, 8 * wg + 4, 1)  # P(u1) stored
+        if full:
+            # S(u0) again right away: the S buffer goes to the next tile's WG before this
+            # tile's P(u0) and O^T rescale
+            sb = seq + 2
+            mbar_wait(_bar(base, B_SFULL + wg), Uint32(cw & 1))
+            cw = cw + 1
+            self.ss(base, cta, lane, u0, 8 * wg + 5, 1)  # S(u0) recompute full
+            tc_fence_after()
+            sa2 = tmem_ld(s_addr, 64)
+            for j in cutlass.range_constexpr(64):
+                xv[j] = sa2[j]
+            tc_fence_before()
+            cute.arch.sync_warp()
+            if lane == 0:
+                mbar_arrive(_bar(base, B_SFREE + sb % 2))
+            lw = self.p_own(base, h, real_m, xv, scale_log2, mp, u0, lw)
+        if anyg != Uint32(0):
+            self.rescale_own(base, lane, lane_addr, gm, alb, u0)
+        self.ss(base, cta, lane, u0, 8 * wg + 6, 1)  # P(u0) + rescale done
+        fence_async_smem()
+        cute.arch.sync_warp()
+        if lane == 0:
+            mbar_arrive(_bar(base, B_OREADY + u0 % NP))
+            if full:
+                mbar_arrive(_bar(base, B_OREADY + (u0 + 1) % NP))
+        return mp_last, lw, cw
+
+    @cute.jit
+    def p_own(self, base, h, real_m, xv, scale_log2, mp, u, lw):
+        """own knob: P(u) of the 64 values in xv against m (mp = m - P_PRE), as sub()."""
+        if u >= NP:
+            mbar_wait(_bar(base, B_PEMPTY + u % NP), Uint32((u // NP - 1) & 1))
+        if real_m:
+            pbuf = base + Uint32(OFF_P) + Uint32(u % NP) * Uint32(P_BYTES)
+            a0, a1 = Float32(0.0), Float32(0.0)
+            b0, b1 = Float32(0.0), Float32(0.0)
+            nmp = Float32(0.0) - mp
+            for k in cutlass.range_constexpr(32):
+                xv[2 * k], xv[2 * k + 1] = ffma2(xv[2 * k], xv[2 * k + 1], scale_log2,
+                                                 scale_log2, nmp, nmp)
+            for ch in cutlass.range_constexpr(4):
+                w = []
+                for q in cutlass.range_constexpr(4):
+                    k = 16 * ch + 4 * q
+                    p0 = ex2(xv[k])
+                    p1 = ex2(xv[k + 1])
+                    p2 = ex2(xv[k + 2])
+                    p3 = ex2(xv[k + 3])
+                    a0, a1 = fadd2(a0, a1, p0, p1)
+                    b0, b1 = fadd2(b0, b1, p2, p3)
+                    w.append(cvt_e4m3x2(p0, p1) | (cvt_e4m3x2(p2, p3) << Uint32(16)))
+                st_shared_v4(pbuf + Uint32(h * 64) + (
+                    (Uint32(ch) ^ ((Uint32(h) >> Uint32(1)) & Uint32(3))) << Uint32(4)),
+                    w[0], w[1], w[2], w[3])
+            a0, a1 = fadd2(a0, a1, b0, b1)
+            lw = lw + (a0 + a1)
+        return lw
+
+    @cute.jit
+    def rescale_own(self, base, lane, lane_addr, gm, alb, u0):
+        """own knob: the grown heads' O^T columns times alpha after PV(u0 - 1), as sub()."""
+        mbar_wait(_bar(base, B_PEMPTY + (u0 - 1) % NP), Uint32(((u0 - 1) // NP) & 1))
+        tc_fence_after()
+        for w in cutlass.range_constexpr(3):
+            m = ld_shared_u32(gm + Uint32(4 * w))
+            if popc(m) > Uint32(DENSE_MIN):
+                al = [ld_shared_f32(alb + Uint32((32 * w + k) * 4)) for k in range(32)]
+                for b in cutlass.range_constexpr(4):
+                    col = lane_addr + Uint32(C_O + 96 * b + 32 * w)
+                    v = tmem_ld(col, 32)
+                    tmem_st(col, [v[k] * al[k] for k in range(32)])
+                m = Uint32(0)
+            while m != Uint32(0):
+                j = bfind(m)
+                m = m ^ (Uint32(1) << j)
+                hh = Uint32(32 * w) + j
+                al = ld_shared_f32(alb + hh * Uint32(4))
+                col = lane_addr + Uint32(C_O) + hh
+                o0, o1, o2, o3 = tmem_ld_o4(col)
+                tmem_st_o4(col, o0 * al, o1 * al, o2 * al, o3 * al)
+        tc_fence_before()
 
     @cute.jit
     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
