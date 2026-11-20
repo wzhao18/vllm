@@ -7,7 +7,10 @@ Compares, sustained back to back at the power cap (randn MXFP8 operands):
   seq       the two N halves one after the other on all SMs (B striped);
   die       half h on a green context of die h with its B half homed on die h,
             both halves concurrently (die-local B, each die's L2 holds its half);
-  die_str   as ``die`` with striped B halves.
+  die_str   as ``die`` with striped B halves;
+  h<A><B>   (--homes) the die halves with A (x + its scales) and B homed l = on the
+            launch's die, s = striped, r = on the other die: same bytes, only the
+            cross-die share changes (prices a cross-die byte at the cap).
 Each half writes its own MXFP8 buffer (bytes as the full kernel's halves).
 """
 
@@ -42,6 +45,8 @@ def main():
     ap.add_argument("--secs", type=float, default=2.0)
     ap.add_argument("--half-swz", default="m6,m2")
     ap.add_argument("--die-mac", default="11,10")
+    ap.add_argument("--homes", default="", help="A/B home arms, e.g. ll,sl,rl,ls,ss,rs (A then B: l local, s striped, r remote)")
+    ap.add_argument("--skip-seq", action="store_true")
     args = ap.parse_args()
 
     import cutlass.utils as cu
@@ -99,7 +104,9 @@ def main():
             cu.HardwareInfo = real_hw
         return g, out
 
-    def concurrent(hs2):
+    def concurrent(hs2, xa=None):
+        xs = xa or [(x, sx), (x, sx)]
+
         def run():
             ev = torch.cuda.Event()
             ev.record()
@@ -107,7 +114,7 @@ def main():
             for d in range(2):
                 streams[d].wait_event(ev)
                 with torch.cuda.stream(streams[d]):
-                    hs2[d][0](x, sx, hs2[d][1])
+                    hs2[d][0](xs[d][0], xs[d][1], hs2[d][1])
                 e = torch.cuda.Event()
                 e.record(streams[d])
                 done.append(e)
@@ -121,7 +128,7 @@ def main():
     g, o = make(wi, swi, tac("m4"))
     variants["full_m4"] = lambda g=g, o=o: g(x, sx, o)
     ok = []
-    for swz in swzs:
+    for swz in [] if args.skip_seq else swzs:
         try:
             hs = [make(w_h[d], s_h[d], tac(swz)) for d in range(2)]
         except Exception as e:  # noqa: BLE001
@@ -129,7 +136,22 @@ def main():
             continue
         ok.append(swz)
         variants[f"seq_{swz}"] = lambda hs=hs: [g(x, sx, o) for g, o in hs]
-    for mac in [int(v) for v in args.die_mac.split(",")]:
+    if args.skip_seq:
+        ok = swzs
+    # A homes per die-d launch: l = die d, s = striped (the default allocation), r = die 1 - d
+    a_home = {"l": [(dies.localized_like(x, [d]), dies.localized_like(sx, [d])) for d in range(2)],
+              "s": [(x, sx), (x, sx)],
+              "r": [(dies.localized_like(x, [1 - d]), dies.localized_like(sx, [1 - d])) for d in range(2)]}
+    w_rem = [dies.localized_like(w_h[d], [1 - d]) for d in range(2)]
+    s_rem = [dies.localized_like(s_h[d], [1 - d]) for d in range(2)]
+    b_home = {"l": (w_loc, s_loc), "s": (w_h, s_h), "r": (w_rem, s_rem)}
+    for mac in [int(v) for v in args.die_mac.split(",")] if args.homes else []:
+        for swz in ok:
+            for ab in args.homes.split(","):
+                ws, ss = b_home[ab[1]]
+                hs2 = [make(ws[d], ss[d], tac(swz), mac) for d in range(2)]
+                variants[f"h{ab}_{swz}_mac{mac}"] = concurrent(hs2, a_home[ab[0]])
+    for mac in [] if args.homes else [int(v) for v in args.die_mac.split(",")]:
         for swz in ok:
             for name, ws, ss in (("die", w_loc, s_loc), ("die_str", w_h, s_h)):
                 hs2 = [make(ws[d], ss[d], tac(swz), mac) for d in range(2)]
