@@ -1,0 +1,154 @@
+diff --git a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+index 9a207a30fb..127c56acb1 100644
+--- a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+@@ -191,6 +191,32 @@ def _bar(base, i):
+     return base + Uint32(OFF_BAR + 8 * i)
+ 
+ 
++
++@asm(Int64)
++def clock64():
++    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
++
++
++@asm(Int64)
++def globaltimer():
++    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
++
++
++@asm()
++def st_shared_u64(addr, v):
++    return "st.shared.u64 [$0], $1;", "r,l,~{memory}", (Uint32(addr), Int64(v))
++
++
++@asm(Int64)
++def ld_shared_u64(addr):
++    return "ld.shared.u64 $0, [$1];", "=l,r,~{memory}", (Uint32(addr),)
++
++
++@asm()
++def red_add_u64_sys(address, value):
++    return ("red.relaxed.sys.global.add.u64 [$0], $1;", "l,l,~{memory}",
++            (Int64(address), Int64(value)))
++
+ @asm()
+ def clock_read():
+     return "{ .reg .b32 c; mov.u32 c, %clock; }", "~{memory}", ()
+@@ -416,11 +442,14 @@ class SparseMlaPrefillH8:
+         # msk: a token's last subtile takes the masked softmax path only when it is
+         # partial (n % 64 != 0); a full one keeps the tcgen05.ld.red max (exact either
+         # way) (production: knob 0; 9 = always masked)
+-        knobs = tuple(knobs) + (0,) * (20 - len(knobs))
++        # clkp (diagnostic, P-MLA round 6): thread 0 of every CTA adds its clock64 and
++        # globaltimer deltas (kernel body) and a CTA count to the 3 u64 at ``stamp``
++        # (system-scope reductions; host-pinned buffer): the SM clock during the kernel
++        knobs = tuple(knobs) + (0,) * (21 - len(knobs))
+         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
+          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
+          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
+-         self.epb, self.epw, self.msk) = knobs[:20]
++         self.epb, self.epw, self.msk, self.clkp) = knobs[:21]
+         self.msk = self.msk != 9
+         self.ssu = self.ssu or 16
+         self.epb = self.epb != 9
+@@ -435,7 +464,7 @@ class SparseMlaPrefillH8:
+         if self.sstamp and not self.ssmask:
+             self.ssmask = 15
+         assert not (self.logical and self.cpa in (1, 2)), "cpa 1-2: physical-slot diagnostics"
+-        self.smem = SMEM_BYTES + (1024 if self.sstamp or self.pad else 0)
++        self.smem = SMEM_BYTES + (1024 if self.sstamp or self.pad or self.clkp else 0)
+         self.sm_arrivals = 4  # S-free / O-ready arrivals per subtile (one per softmax warp)
+         # cpa 3-6: KV rows by per-lane cp.async (6: with the old slot producer); cpa 3-5 and 7
+         # (TMA gather4): logical mode with the shared-memory top-k slot producer
+@@ -537,6 +566,10 @@ class SparseMlaPrefillH8:
+         cute.arch.sync_threads()
+         tc_fence_after()
+         taddr = ld_shared_u32(base + Uint32(OFF_TMEM))
++        if cutlass.const_expr(self.clkp):
++            if tid == 0:
++                st_shared_u64(base + Uint32(SMEM_BYTES), clock64())
++                st_shared_u64(base + Uint32(SMEM_BYTES + 8), globaltimer())
+         n_mine = (rows - cta + self.grid - 1) // self.grid
+         if warp < W_SM:
+             cute.arch.warpgroup_reg_alloc(REG_SM)
+@@ -566,6 +599,14 @@ class SparseMlaPrefillH8:
+             cute.arch.warpgroup_reg_alloc(REG_LAUNCH)
+         tc_fence_before()
+         cute.arch.sync_threads()
++        if cutlass.const_expr(self.clkp):
++            if tid == 0 and stamp != Int64(0):
++                c1 = clock64()
++                g1 = globaltimer()
++                red_add_u64_sys(stamp, c1 - ld_shared_u64(base + Uint32(SMEM_BYTES)))
++                red_add_u64_sys(stamp + Int64(8),
++                                g1 - ld_shared_u64(base + Uint32(SMEM_BYTES + 8)))
++                red_add_u64_sys(stamp + Int64(16), Int64(1))
+         if cutlass.const_expr(self.sstamp):
+             if cta == 0 and tid < 256 and stamp != Int64(0):
+                 st_global_u32(stamp + Int64(4 * tid),
+@@ -1894,6 +1935,47 @@ def sparse_mla_prefill_h8(q8: torch.Tensor, kv_rows: torch.Tensor, slots: torch.
+     return out
+ 
+ 
++_CLKP: dict = {}  # clkp diagnostic: device index -> [pinned int64 [256, 4], call counter]
++
++
++def _clkp_stamp(dev: int) -> int:
++    """clkp knob: a per-call 32-byte slot of a host-pinned buffer (a CUDA-graph capture
++    keeps one slot per captured call); a daemon thread writes every slot with its
++    SM clock (cycles / ns) to runs/P-MLA/clkp/<host>-<pid>.txt every 5 s."""
++    ent = _CLKP.get(dev)
++    if ent is None:
++        ent = _CLKP[dev] = [torch.zeros((256, 4), dtype=torch.int64, pin_memory=True), 0]
++        if len(_CLKP) == 1:
++            import os
++            import socket
++            import threading
++            import time
++            out = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/clkp"
++
++            def dump():
++                while True:
++                    time.sleep(5)
++                    try:
++                        os.makedirs(out, exist_ok=True)
++                        lines = []
++                        for d, (b, n) in list(_CLKP.items()):
++                            for i, (cyc, ns, ctas, _) in enumerate(b.tolist()):
++                                if ns > 0:
++                                    lines.append(f"dev {d} slot {i} ctas {ctas} cycles {cyc} "
++                                                 f"ns {ns} MHz {1000.0 * cyc / ns:.1f}")
++                        fn = f"{out}/{socket.gethostname()}-{os.getpid()}.txt"
++                        with open(fn + ".tmp", "w") as f:
++                            f.write("\n".join(lines) + "\n")
++                        os.replace(fn + ".tmp", fn)
++                    except Exception:
++                        pass
++
++            threading.Thread(target=dump, daemon=True).start()
++    slot = ent[1] % 256
++    ent[1] += 1
++    return ent[0].data_ptr() + 32 * slot
++
++
+ def sparse_mla_prefill_h8_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
+                                   topk_indices: torch.Tensor, req_ids: torch.Tensor,
+                                   block_table: torch.Tensor, block_size: int,
+@@ -1932,12 +2014,15 @@ def sparse_mla_prefill_h8_logical(q8: torch.Tensor, kv_rows: torch.Tensor,
+     sms = torch.cuda.get_device_properties(q8.device).multi_processor_count
+     grid = min(sms, t)
+     fn = _compiled(grid, tuple(knobs), k)
++    stamp = 0 if phys_dbg is None else phys_dbg.data_ptr()
++    if len(knobs) > 20 and knobs[20] and phys_dbg is None:
++        stamp = _clkp_stamp(q8.device.index)
+     stream = cuda.CUstream(torch.cuda.current_stream(q8.device).cuda_stream)
+     fn(Int64(q8.data_ptr()), Int32(t), Int64(kv_rows.data_ptr()), Int32(block_stride_rows),
+        Int64(topk_indices.data_ptr()), Int32(topk_indices.stride(0)),
+        Int64(0 if lengths is None else lengths.data_ptr()),  # lglob diagnostic only
+        Int64(out.data_ptr()), Float32(scale * LOG2E), Float32(out_scale),
+-       Int32(kv_rows.shape[0]), Int64(0 if phys_dbg is None else phys_dbg.data_ptr()),
++       Int32(kv_rows.shape[0]), Int64(stamp),
+        Int64(req_ids.data_ptr()),
+        Int64(block_table.data_ptr()), Int32(block_table.stride(0)),
+        Int32(block_table.shape[1]), Int32(block_size.bit_length() - 1), stream)
