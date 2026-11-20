@@ -102,6 +102,11 @@ def ep_mean_tokens(num_tokens_across_dp: torch.Tensor, sp_size: int) -> int:
 # FC1, under the dispatch ("early").
 RUBIN_FUSED_SHARED_L2_POSITION = "early"
 
+# GenPhase fused shared expert: K parts per shared FC1 / FC2 tile. Whole-K tiles (1, 1): split tiles measured
+# slower on EP1 (+2..+9 us per layer at 96 tokens before the fixup; extra shared FC2 units park behind all of
+# shared FC1), see the D-MOE-TAPE W-series.
+RUBIN_GENPHASE_SHARED_K_SPLITS = (1, 1)
+
 
 def compile_cache_key(
     cfg: RubinMoeConfig, kernel_name: str, cutlass_version: str, device: int
@@ -296,6 +301,8 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
     if cfg.kernel_variant == "genphase":
         for name in ("token_in_flag_batch", "token_back_mode"):
             impl_fields.pop(name)
+        if getattr(cfg, "shared", None) is not None:
+            impl_fields["shared_k_splits"] = RUBIN_GENPHASE_SHARED_K_SPLITS
     if cfg.kernel_variant == "inference_dedup_wg2":
         impl_fields["epilogue_warpgroups"] = 2
     if cfg.kernel_variant in DEDUP_VARIANTS:
