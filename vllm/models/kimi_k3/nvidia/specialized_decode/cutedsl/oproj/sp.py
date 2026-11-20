@@ -85,7 +85,7 @@ SP_OPROJ = {4: "4-64:warp,65-:gemm"}
 # The online-MXFP8 o-projection per TP on token rows: "pre_push" where the projection
 # runs the "pre" kind (its GEMM, the epilogue pushing to the row owners), elsewhere
 # "mxfp8" (the MXFP8 partial GEMM + ``SpReduceScatter(push=True)``).
-SP_OPROJ_MX = {4: "17-384:pre_push"}
+SP_OPROJ_MX = {4: "17-128:pre_push"}
 
 
 def mx_tactic(tp: int, shape: Shape) -> str:
