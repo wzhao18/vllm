@@ -86,12 +86,18 @@ class SpAttnResGather(ClusterAttnRes):
     [n, NB, 7168], norm, query, out_norm [7168], output (unused row view), eps,
     out_eps, the gather multicast address, rank, the local gather view [cap, 7168]."""
 
-    def __init__(self, nb, tp, *, has_delta, write, mx=False, **options):
+    def __init__(self, nb, tp, *, has_delta, write, mx=False, parts=0, **options):
         # ``mx``: publish the normed rows as MXFP8 into the MXFP8 box (``SpComm``
         # gather data + scale regions; ``common.mx_rows``) for an MXFP8 in-projection;
         # args 9.. are then (data mc, scale mc, rank, local data, local scales).
+        # ``parts``: the delta is a beta-add GEMM's FP32 split-K partials (arg 0,
+        # [parts * n, 7168]) and its BF16 residual (the last arg, [n, 7168]); see
+        # ``ClusterAttnRes.sum_parts``.
         out = dict(out_mx="publish") if mx else dict(out_mc=True)
-        super().__init__(nb, slots=0, has_delta=has_delta, write=write, **out, **options)
+        super().__init__(
+            nb, slots=0, has_delta=has_delta, write=write, delta_parts=parts, **out,
+            **options,
+        )  # fmt: skip
         self.tp, self.mx = tp, mx
 
     @cute.jit
@@ -101,6 +107,8 @@ class SpAttnResGather(ClusterAttnRes):
     @cute.kernel
     def kernel(self, args):
         delta, prefix, blocks, norm, query, out_norm, output, eps, out_eps = args[0:9]
+        if cutlass.const_expr(self.delta_parts > 0):
+            delta = (delta, args[len(args) - 1])
         part, token, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         n = prefix.shape[0]
@@ -232,25 +240,28 @@ def _check_clusters(code, device, n_max, what):
 
 
 @cache
-def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False):
-    """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx) at any
+def compile_gather(nb, has_delta, write, tp, cap, n_max, device, mx=False, parts=0):
+    """``SpAttnResGather`` for a layer key (nb, has_delta, write, mx, parts) at any
     n <= n_max."""
     with torch.accelerator.device_index(device):
         kernel = SpAttnResGather(
-            nb, tp, has_delta=has_delta, write=write, mx=mx,
+            nb, tp, has_delta=has_delta, write=write, mx=mx, parts=parts,
             min_blocks=_co_resident(n_max, device), **_options(device),
         )  # fmt: skip
         row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
-        args = (row, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
+        delta = dynamic_fake(2, torch.float32) if parts else row
+        args = (delta, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
         if mx:
             args += (Int64(0), Int64(0), Int32(0), Int64(0), Int64(0))
         else:
             args += (Int64(0), Int32(0), fake((cap, 7168)))
+        if parts:
+            args += (row,)
         arch = architecture(torch.device("cuda", device))
         code = cute.compile(
             kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}"
         )
-        RESIDENCY["gather", nb, mx] = _check_clusters(
+        RESIDENCY[("gather", nb, mx) + ((parts,) if parts else ())] = _check_clusters(
             code, device, n_max, "SP AttnRes + all-gather"
         )
     return code
@@ -283,6 +294,25 @@ def compile_reduce(nb, has_delta, push, tp, cap, n_max, device, gather_mx=False,
     return code
 
 
+class SplitDelta:
+    """A beta-add GEMM's output left for the next boundary to form: FP32 split-K
+    ``partials`` [parts * n, 7168] (split s in rows [s n, (s + 1) n)) and the BF16
+    ``residual`` [n, 7168]; the delta is bf16(bf16(sum of the partials in split
+    order) + residual), stock's beta-add arithmetic (``ClusterAttnRes.sum_parts``)."""
+
+    def __init__(self, partials, residual, parts):
+        rows = residual.shape[0]
+        if partials.shape != (parts * rows, residual.shape[1]) or not (
+            partials.is_contiguous() and residual.is_contiguous()
+        ):
+            raise ValueError(
+                f"SplitDelta: partials {tuple(partials.shape)} for {parts} x "
+                f"{tuple(residual.shape)}"
+            )
+        self.partials, self.residual, self.parts = partials, residual, parts
+        self.shape = residual.shape
+
+
 class SpBoundary:
     """One decoder layer's two fused SP boundaries (host side). ``pre`` / ``post``:
     (norm, query, out_norm) BF16 [7168] weights and (eps, out_eps) of the stock
@@ -297,7 +327,7 @@ class SpBoundary:
     output row is also written into, quantized (the MLP's MXFP8 shared gate_up)."""
 
     def __init__(self, comm, pre, post, nb, write, n_max, push_rows, first=False,
-                 gather_mx=False, out_mx=None):  # fmt: skip
+                 gather_mx=False, out_mx=None, delta_parts=()):  # fmt: skip
         from ..common.host import to_cute
 
         self.comm, self.nb, self.write = comm, nb, write
@@ -325,6 +355,12 @@ class SpBoundary:
         self.codes[("pre", not first)] = compile_gather(
             nb, not first, write, tp, cap, n_max, device, gather_mx
         )
+        # ``delta_parts``: split counts of a previous layer's beta-add GEMM that leaves
+        # its output as FP32 partials (``SplitDelta``); summed here.
+        for parts in sorted(set(delta_parts)):
+            self.codes[("pre", True, parts)] = compile_gather(
+                nb, True, write, tp, cap, n_max, device, gather_mx, parts
+            )
         block = write >= 0
         for push in sorted({bool(p) for p in push_rows.values()}):
             self.codes[("post", push)] = compile_reduce(
@@ -341,21 +377,27 @@ class SpBoundary:
 
         comm = self.comm
         n = prefix.shape[0]
-        code = self.codes[("pre", delta is not None)]
-        source = prefix if delta is None else delta
+        tail = ()
+        if isinstance(delta, SplitDelta):
+            code = self.codes[("pre", True, delta.parts)]
+            source = delta.partials
+            tail = (dynamic_view(delta.residual),)
+        else:
+            code = self.codes[("pre", delta is not None)]
+            source = prefix if delta is None else delta
         rows = map(dynamic_view, (source, prefix, blocks, prefix))
         source_v, prefix_v, blocks_v, dummy = rows
         if self.gather_mx:
             mc, smc, data, scale = comm.mx_addresses(parity)
             code(
                 source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
-                mc, smc, comm._rank, data, scale, stream(comm.device),
+                mc, smc, comm._rank, data, scale, *tail, stream(comm.device),
             )  # fmt: skip
             return comm.mx_view(parity, n * comm.tp)
         gather, mc, _, _ = comm.views(parity)
         code(
             source_v, prefix_v, blocks_v, *self.pre_w, dummy, *self.pre_eps,
-            mc, comm._rank, gather, stream(comm.device),
+            mc, comm._rank, gather, *tail, stream(comm.device),
         )  # fmt: skip
         return comm.gather[parity, : n * comm.tp]
 
