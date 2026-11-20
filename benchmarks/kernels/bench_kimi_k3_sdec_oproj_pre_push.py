@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--ks", action="store_true", help="also OprojKsPush")
     ap.add_argument("--ks-dbg", default="0", help="OprojKsPush probe masks (ks_push.py)")
     ap.add_argument("--no-pre-push", action="store_true")
+    ap.add_argument("--push-modes", default="1", help="1 relaxed.sys, 2 weak, 3 bulk")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import pre_tactic
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (
@@ -74,9 +75,6 @@ def main():
         tactic, prewait, stages = pre_tactic(WIDTH, K, rows)
         x = mx(torch.randn(rows, K, device=dev).bfloat16())
         local = Mxfp8PreGemm(WIDTH, K, rows, tactic, prewait=prewait, max_stages=stages)
-        push = Mxfp8PreGemm(
-            WIDTH, K, rows, tactic, prewait=prewait, max_stages=stages, push=True
-        )
         out = torch.empty(rows, WIDTH, dtype=torch.bfloat16, device=dev)
         recv = torch.empty(TP, cap, WIDTH, dtype=torch.bfloat16, device=dev)
         recv.view(torch.int32).fill_(SENTINEL)
@@ -93,7 +91,11 @@ def main():
             lambda i: local(x.data, x.scale, *copies[i % len(copies)], out)
         )
         line = f"R{rows} tactic {tactic}: pre {t_local:.2f} us"
-        if not args.no_pre_push:
+        for mode in ([] if args.no_pre_push else [int(m) for m in args.push_modes.split(",")]):
+            push = Mxfp8PreGemm(
+                WIDTH, K, rows, tactic, prewait=prewait, max_stages=stages, push=mode
+            )
+            recv.view(torch.int32).fill_(SENTINEL)
             push(x.data, x.scale, w.data, w.scale, out, pargs)
             torch.cuda.synchronize()
             got = recv.view(torch.int32).reshape(TP * cap, WIDTH // 2)[:rows]
@@ -101,7 +103,7 @@ def main():
             t_push = graph_time(
                 lambda i: push(x.data, x.scale, *copies[i % len(copies)], out, pargs)
             )
-            line += f"  pre_push {t_push:.2f} us/call (bitwise {same * 100:.3f}%)"
+            line += f"  pre_push[{mode}] {t_push:.2f} us (bitwise {same * 100:.2f}%)"
         print(line, flush=True)
         if args.ks:
             for dbg in (int(d) for d in args.ks_dbg.split(",")):

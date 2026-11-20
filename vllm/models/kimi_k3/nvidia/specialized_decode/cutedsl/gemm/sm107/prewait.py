@@ -114,7 +114,8 @@ class Mxfp8PreGemm:
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
             if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
                 raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
-        self.push = bool(push)
+        # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
+        self.push = int(push)
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
@@ -142,7 +143,7 @@ class Mxfp8PreGemm:
             a, b, asf, bsf = xq, w, xs, ws
             c = out
         alpha = self.alpha
-        if self.push != (push_args is not None):
+        if bool(self.push) != (push_args is not None):
             raise ValueError(f"Mxfp8PreGemm(push={self.push}) push_args {push_args!r}")
         if push_args is not None:
             alpha = push_args

@@ -52,6 +52,23 @@ def tmem_wait_n(*vals):
     return "tcgen05.wait::ld.sync.aligned;", cons, tuple(vals), (Float32,) * n
 
 
+@asm()
+def bulk_s2g(dst, src, size):
+    code = "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;"
+    return code, "l,r,r,~{memory}", (Int64(dst), Int32(src), Int32(size))
+
+
+@asm()
+def bulk_commit_wait_read():
+    code = "cp.async.bulk.commit_group; cp.async.bulk.wait_group.read 0;"
+    return code, "~{memory}", ()
+
+
+@asm()
+def fence_proxy_async_smem():
+    return "fence.proxy.async.shared::cta;", "~{memory}", ()
+
+
 @cute.jit
 def epilogue_push(gemm_kernel, epi_tidx: Int32, acc_tmem_ptr, mma_tile_coord_mnl,
                   cta_v: Int32, acc_consumer_state: pipeline.PipelineState,
@@ -77,11 +94,15 @@ def epilogue_push(gemm_kernel, epi_tidx: Int32, acc_tmem_ptr, mma_tile_coord_mnl
     for c0 in cutlass.range_constexpr(0, tile_n, 16):
         vals = tmem_wait_n(*tmem_ld16(taddr + c0))
         packed = tuple(bf16x2(vals[2 * j], vals[2 * j + 1]) for j in range(8))
+        if cutlass.const_expr(gemm_kernel.push == 3):  # the bulk copies send smem as is
+            packed = tuple(positive_zero32(w) for w in packed)
         store_words(row_smem + c0 * 2, packed[0:4], shared=True)
         store_words(row_smem + c0 * 2 + 16, packed[4:8], shared=True)
     with cute.arch.elect_one():
         acc_pipeline.consumer_release(acc_consumer_state)
     acc_consumer_state.advance()
+    if cutlass.const_expr(gemm_kernel.push == 3):
+        fence_proxy_async_smem()
     threads = cutlass.const_expr(32 * len(gemm_kernel.epilogue_warp_id))
     pipeline.NamedBarrier(
         barrier_id=gemm_kernel.epilog_sync_bar_id, num_threads=threads
@@ -91,7 +112,15 @@ def epilogue_push(gemm_kernel, epi_tidx: Int32, acc_tmem_ptr, mma_tile_coord_mnl
     row0 = mma_tile_coord_mnl[0] * gemm_kernel.mma_tiler[0] + cta_v * ROWS
     col0 = mma_tile_coord_mnl[1] * tile_n
     chunks = cutlass.const_expr(tile_n // 8)  # 16-byte chunks per staged row
-    for k in cutlass.range_constexpr(chunks * ROWS // threads):
+    if cutlass.const_expr(gemm_kernel.push == 3):
+        # one bulk copy of this thread's staged row (2 tile_n bytes) to its owner slot
+        row = row0 + epi_tidx
+        if row < rows:
+            owner = row // n
+            offset = Int64((rank * cap + row - owner * n) * WIDTH + col0) * 2
+            bulk_s2g(bases[4 + owner] + offset, stage + epi_tidx * stride, 2 * tile_n)
+        bulk_commit_wait_read()
+    for k in cutlass.range_constexpr(chunks * ROWS // threads if gemm_kernel.push < 3 else 0):
         index = k * threads + epi_tidx
         lr, c = index // chunks, index % chunks
         row = row0 + lr
@@ -100,6 +129,9 @@ def epilogue_push(gemm_kernel, epi_tidx: Int32, acc_tmem_ptr, mma_tile_coord_mnl
             offset = Int64((rank * cap + row - owner * n) * WIDTH + col0 + c * 8) * 2
             data = load_words(stage + lr * stride + c * 16, count=4, shared=True)
             clean = tuple(positive_zero32(w) for w in data)
-            store_relaxed(bases[4 + owner] + offset, clean)
+            if cutlass.const_expr(gemm_kernel.push == 2):
+                store_words(bases[4 + owner] + offset, clean)  # weak: self-validating words
+            else:
+                store_relaxed(bases[4 + owner] + offset, clean)
     return acc_consumer_state
 
