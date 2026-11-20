@@ -23,6 +23,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (  # noqa:
 )
 
 E, TOPK, LATENT, K, CAP, SCALE = 896, 16, 3584, 7168, 128, 2.827
+_NO_EPLB = (None,) * 5  # moe_front EPLB inputs (l2p, replicas, load, record, unpadded)
 
 
 def _buffers(nvfp4, dev):
@@ -70,7 +71,7 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     y = torch.full((n, E + LATENT), float("nan"), device=dev)
     got = _buffers(nvfp4, dev)
     mod.moe_front(w, h, y, cnt, part, bias, *got[:5], pad, E, E, True, SCALE, nvfp4, 1.0,
-                  *cfg, stamps)  # fmt: skip
+                  *cfg, stamps, *_NO_EPLB)  # fmt: skip
     torch.accelerator.synchronize()
     ref_y = (h.double() @ w.double().t()).float()
     assert torch.isfinite(y).all()
@@ -107,7 +108,7 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
         y_r = torch.empty((n, E), device=dev)
         again = _buffers(nvfp4, dev)
         mod.moe_front(w, h, y_r, cnt, part, bias, *again[:5], pad, E, E, True, SCALE,
-                      nvfp4, 1.0, *cfg, stamps)  # fmt: skip
+                      nvfp4, 1.0, *cfg, stamps, *_NO_EPLB)  # fmt: skip
         torch.accelerator.synchronize()
         assert torch.equal(y_r.view(torch.int32), y[:, :E].view(torch.int32))
         _same(again, ref)
@@ -123,5 +124,5 @@ def test_moe_front_rejects_bad_shapes():
             w, h, torch.zeros((32, E), device=dev), torch.zeros(2048, dtype=torch.int32,
             device=dev), torch.zeros(35 * 4 * 32 * 128, device=dev),
             torch.zeros(E, device=dev), *b, None, E, E, True, 1.0, True, 1.0, 4, 0,
-            torch.empty(0, dtype=torch.int64, device=dev),
+            torch.empty(0, dtype=torch.int64, device=dev), *_NO_EPLB,
         )  # fmt: skip

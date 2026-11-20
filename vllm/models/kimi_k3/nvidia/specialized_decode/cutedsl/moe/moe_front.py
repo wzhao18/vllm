@@ -523,23 +523,29 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     if (threadIdx.x == 0) STAMP(4);
     if (threadIdx.x == 0 && p.stamps) p.stamps[blockIdx.x * kStampStride + 27] = clock64();
     const int64_t stride = int64_t{n} * 128;
-    float lg[kPer];
+    // Every partial load is issued before the first store (one L2 round trip, not
+    // one per expert slot), then the rank-order sums.
+    float v[kPer][kMaxKs];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
       const int e = j * kThreads + threadIdx.x;
-      float v[kMaxKs];
       if (e < a.num_logits) {
         const float* pe = p.part + (int64_t{e / 128} * p.ks * n + row) * 128 + (e % 128);
 #pragma unroll
         for (int q = 0; q < kMaxKs; ++q)
-          if (q < p.ks) v[q] = __ldcg(pe + q * stride);
+          if (q < p.ks) v[j][q] = __ldcg(pe + q * stride);
       }
+    }
+    float lg[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const int e = j * kThreads + threadIdx.x;
       float acc = 0.0F;
       if (e < a.num_logits) {
-        acc = v[0];
+        acc = v[j][0];
 #pragma unroll
         for (int q = 1; q < kMaxKs; ++q)
-          if (q < p.ks) acc += v[q];
+          if (q < p.ks) acc += v[j][q];
         p.y[int64_t{row} * a.ldy + e] = acc;
       }
       lg[j] = acc;
@@ -628,7 +634,12 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                torch::Tensor& err, const c10::optional<torch::Tensor>& pad,
                int64_t num_logits, int64_t num_experts, bool renormalize,
                double routed_scaling_factor, bool nvfp4, double norm_const, int64_t ks,
-               int64_t ns, const torch::Tensor& stamps) {
+               int64_t ns, const torch::Tensor& stamps,
+               const c10::optional<torch::Tensor>& l2p,
+               const c10::optional<torch::Tensor>& replicas,
+               const c10::optional<torch::Tensor>& load,
+               const c10::optional<torch::Tensor>& record,
+               const c10::optional<torch::Tensor>& unpadded) {
   using namespace k3front;
   TORCH_CHECK(w.scalar_type() == at::kBFloat16 && h.scalar_type() == at::kBFloat16 &&
                   w.is_contiguous() && h.is_contiguous(),
@@ -684,6 +695,9 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   }
   Params p;
   Args& a = p.a;
+  route_eplb(a, num_logits, l2p, replicas, load, record, unpadded);
+  a.splits = 1;  // the front sums its own split-K partials
+  a.split_stride = 0;
   a.y = y.data_ptr<float>();
   a.ldy = y.stride(0);
   a.num_logits = (int32_t)num_logits;
@@ -772,7 +786,12 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
                torch::Tensor& err, const c10::optional<torch::Tensor>& pad,
                int64_t num_logits, int64_t num_experts, bool renormalize,
                double routed_scaling_factor, bool nvfp4, double norm_const, int64_t ks,
-               int64_t ns, const torch::Tensor& stamps);
+               int64_t ns, const torch::Tensor& stamps,
+               const c10::optional<torch::Tensor>& l2p,
+               const c10::optional<torch::Tensor>& replicas,
+               const c10::optional<torch::Tensor>& load,
+               const c10::optional<torch::Tensor>& record,
+               const c10::optional<torch::Tensor>& unpadded);
 std::vector<int64_t> moe_front_plan(int64_t n, int64_t k, int64_t ks, int64_t ns);
 std::vector<int64_t> moe_front_attrs();
 """
@@ -908,6 +927,7 @@ class MoeFront:
             p.quant_kind == "nvfp4", float(p.input_norm_const),
             *cfg,
             self.no_stamps if stamps is None else stamps,
+            *self.route._eplb_args(),
         )  # fmt: skip
         return rt, session, n
 

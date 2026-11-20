@@ -227,10 +227,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self.uses_asymmetric_ab_stages = self.cta_tile_n == self.asymmetric_token_tile
         # Decode MMA reads only a 16-row-aligned valid token window. Keep the
         # allocated layout, but omit padding-row B transfers in the qualified
-        # N64 geometry and register their exact completion bytes per stage.
+        # N64 / N128 geometries and register their exact completion bytes per stage.
         self.dynamic_gather = (
-            self.mma_tiler_mnk == self.n64_decode_tile
-            and self.cluster_shape_mn == (4, 1)
+            self.mma_tiler_mnk in (self.n64_decode_tile, self.n128_decode_tile)
+            and self.cluster_shape_mn in ((4, 1), (2, 1))
             and self.use_2cta_instrs
             and not self.uses_asymmetric_ab_stages
         )
@@ -420,6 +420,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
     def n64_decode_tile(self) -> Tuple[int, int, int]:
         """The one tile-N-64 geometry: K sized so one token row is a 128-byte swizzle atom."""
         return (256, 64, 128 * 8 // int(self.b_dtype.width))
+
+    @property
+    def n128_decode_tile(self) -> Tuple[int, int, int]:
+        return (256, 128, 128 * 8 // int(self.b_dtype.width))
 
     def _select_ab_stage_plan(self) -> None:
         stage_one_regions = make_smem_layouts(

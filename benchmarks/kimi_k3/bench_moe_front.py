@@ -23,6 +23,7 @@ from torch.utils.cpp_extension import load_inline
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import moe_front, route_stage
 
 E, LATENT, K, CAP, TOPK = 896, 3584, 7168, 128, 16
+_NO_EPLB = (None,) * 5  # moe_front EPLB inputs (l2p, replicas, load, record, unpadded)
 
 _PROD = r"""
 #include <torch/extension.h>
@@ -184,7 +185,7 @@ def main():
                 for i in range(L):
                     pm.prod(src, h, busy, nostamp, carve)
                     fm.moe_front(ws[i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
-                                 True, 1.0, *c, nostamp)  # fmt: skip
+                                 True, 1.0, *c, nostamp, *_NO_EPLB)  # fmt: skip
 
             t_f = _time_graph(front)
             line += f" | front{c} ring {plan[0]} xslots {plan[3]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
@@ -195,7 +196,7 @@ def main():
                 for i in range(L):
                     pm.prod(src, h, busy, nostamp, carve)
                     fm.moe_front(ws[i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
-                                 True, 1.0, *c, skel)  # fmt: skip
+                                 True, 1.0, *c, skel, *_NO_EPLB)  # fmt: skip
 
             t_s = _time_graph(skeleton)
             line += f" skeleton {(t_s - t_p) / L:.2f}"
@@ -210,7 +211,7 @@ def main():
             def stamped():
                 pm.prod(src, h, busy, end, carve)
                 fm.moe_front(ws[0], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827, True,
-                             1.0, *c, st)  # fmt: skip
+                             1.0, *c, st, *_NO_EPLB)  # fmt: skip
 
             stamped()
             g = torch.cuda.CUDAGraph()

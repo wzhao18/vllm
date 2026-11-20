@@ -172,6 +172,7 @@ def _mla_pull_worker(dcp_rank: int, cache: torch.Tensor):
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w.engine_id, w.tp_rank = "D", dcp_rank
     w.block_size = 896
     w.use_mla, w._has_mamba = True, False
