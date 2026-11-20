@@ -135,3 +135,32 @@ def test_wide_gemm_die_static_k128(rows, n, k, split):
         die.run(x, got)
         torch.cuda.synchronize()
         assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize(
+    "prewait", [("none",), ("n", 2), ("n", 4), ("pace", 2880), ("l2", 2880)]
+)
+def test_wide_gemm_prewait_modes(prewait):
+    """The pre-wait weight issue policy only moves when weight stages are
+    requested (before or after griddepcontrol.wait, paced, or L2-prefetched first):
+    the MMA sequence and its FP32 split partials are bitwise those of the default
+    (whole ring before the wait), at the r24 MoE front shape with a 200 KiB ring."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.wide import (
+        PreparedWide,
+    )
+
+    rows, n, k, split = 96, 4480, 7168, 5
+    torch.manual_seed(7)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    base = (split, (1,), 11, (0, 3), False, True, 204, 64, False)
+    want = torch.empty(split, rows, n, device="cuda", dtype=torch.float32)
+    PreparedWide(w, {rows: base}, partials=True).prepare().run(x, want)
+    full = x.float() @ w.float().t()
+    assert (want.sum(0) - full).abs().max() <= 1e-5 * full.abs().max()
+    gemm = PreparedWide(w, {rows: base + (prewait,)}, partials=True).prepare()
+    for _ in range(3):
+        got = torch.full_like(want, float("nan"))
+        gemm.run(x, got)
+        torch.cuda.synchronize()
+        assert torch.equal(got, want)
