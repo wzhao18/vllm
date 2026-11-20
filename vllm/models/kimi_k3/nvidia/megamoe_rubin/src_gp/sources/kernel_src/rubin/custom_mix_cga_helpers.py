@@ -20,10 +20,47 @@ from cutlass.cute.nvgpu.cpasync.copy import (
     TMA_MBAR_PTR_FIELD_NAME,
     TMA_MCAST_MASK_FIELD_NAME,
 )
-from cutlass.cutlass_dsl import Boolean, Int16, Int32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Boolean, Int16, Int32, Int64
 
 
 TmaAtomOrPair = Union[cute.CopyAtom, Tuple[cute.CopyAtom, cute.CopyAtom]]
+
+
+@cute.jit
+def make_l2_evict_first_policy() -> Int64:
+    """``createpolicy`` L2 evict_first (fraction 1.0) for operands streamed once per launch.
+
+    A runtime instruction on purpose: a constant policy makes ptxas emit an
+    invalid encoding on some toolchains.
+    """
+    return Int64(
+        llvm.inline_asm(
+            Int64.mlir_type,
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def make_l2_evict_last_policy() -> Int64:
+    """``createpolicy`` L2 evict_last (fraction 1.0) for operands many units re-read in one launch."""
+    return Int64(
+        llvm.inline_asm(
+            Int64.mlir_type,
+            [],
+            "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 @cute.jit
@@ -61,10 +98,21 @@ def select_tma_atom_for_cluster(atom_or_pair: TmaAtomOrPair, is_fallback_cluster
 
 @cute.jit
 def bind_executable_tma_load_fields(
-    atom: cute.CopyAtom, *, tma_bar_ptr: cute.Pointer, tma_desc_ptr: Optional[cute.Pointer], mcast_mask: Optional[Int32]
+    atom: cute.CopyAtom,
+    *,
+    tma_bar_ptr: cute.Pointer,
+    tma_desc_ptr: Optional[cute.Pointer],
+    mcast_mask: Optional[Int32],
+    cache_policy: Optional[Int64] = None,
 ) -> cute.CopyAtom:
-    """Bind per-issue fields to an already executable TMA load atom."""
+    """Bind per-issue fields to an already executable TMA load atom.
+
+    ``cache_policy`` is an L2 eviction policy from ``make_l2_evict_first_policy``.
+    """
     executable_value = atom._trait.value
+    if cutlass.const_expr(cache_policy is not None):
+        policy_attr = ir.Attribute.parse("#cute_nvgpu.atom_copy_field_tmaload<cache_policy>")
+        executable_value = _cute_nvgpu_ir.atom_set_value(executable_value, policy_attr, cache_policy.ir_value())
     if cutlass.const_expr(mcast_mask is not None):
         mcast_attr = ir.Attribute.parse(f"#cute_nvgpu.atom_copy_field_tmaload<{TMA_MCAST_MASK_FIELD_NAME}>")
         executable_value = _cute_nvgpu_ir.atom_set_value(executable_value, mcast_attr, Int16(mcast_mask).ir_value())
