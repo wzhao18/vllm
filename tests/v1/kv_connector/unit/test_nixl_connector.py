@@ -2101,6 +2101,32 @@ def test_kv_connector_stats_failure_grouping():
     assert reduced["Num notifs after expiry"] == 1
 
 
+def test_request_xfer_time_spans_concurrent_transfers():
+    """A request's transfer time runs from its first transfer start to its
+    last transfer end: concurrent transfers count once, unlike the per-
+    transfer average. Telemetry without a start time is skipped."""
+    import types
+
+    def telem(start_us, dur_us):
+        return types.SimpleNamespace(startTime=start_us, xferDuration=dur_us)
+
+    worker = types.SimpleNamespace(_xfer_span_us={})
+    note = NixlConnectorWorker._note_xfer_span
+    note(worker, "r", telem(1000, 3000))  # 1.0 .. 4.0 ms
+    note(worker, "r", telem(500, 1000))  # 0.5 .. 1.5 ms
+    note(worker, "r", get_default_xfer_telemetry())  # no startTime: ignored
+    assert worker._xfer_span_us["r"] == [500, 4000]
+
+    stats = NixlKVConnectorStats()
+    stats.record_transfer(get_default_xfer_telemetry())
+    stats.record_request_xfer_wall((4000 - 500) / 1e6)
+    stats.record_request_xfer_wall(1e-3)
+    reduced = stats.reduce()
+    assert reduced["Max request xfer time (ms)"] == 3.5
+    assert reduced["Avg request xfer time (ms)"] == 2.25
+    assert "Max request xfer time (ms)" not in NixlKVConnectorStats().reduce()
+
+
 def test_nixl_prom_metrics_group_handshake_with_transfer_failures():
     """vllm:nixl_num_failed_transfers counts handshake and notification
     failures too, while vllm:nixl_num_kv_expired_reqs stays a separate

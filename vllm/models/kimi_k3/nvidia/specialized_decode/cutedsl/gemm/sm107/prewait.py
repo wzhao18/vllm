@@ -92,7 +92,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
 class Mxfp8PreGemm:
     """One (N, K, R) MXFP8 GEMM on a fixed tactic ``(tile_mn, cluster_mn, swap_ab,
     inst_m)`` (FlashInfer's sm_107 tactic tuple). ``out_layout``: "rn" = out [R, N]
-    row-major; "cn" = the swap_ab store (out viewed with strides (1, R))."""
+    row-major; swap_ab stores the same [R, N] row-major out (W is the MMA's M operand)."""
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
@@ -100,8 +100,8 @@ class Mxfp8PreGemm:
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
-        if self.swap_ab:  # the swap_ab store layout is not wired (out would be wrong)
-            raise ValueError("Mxfp8PreGemm: swap_ab tactics are not supported")
+        if self.swap_ab and tactic[0][1] % 64:  # (measured: N32 / N96 swap tiles store wrong rows)
+            raise ValueError(f"Mxfp8PreGemm: swap_ab needs a token tile multiple of 64 ({tactic[0]})")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
         if prewait and prewait > k // tile_k:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
@@ -128,7 +128,7 @@ class Mxfp8PreGemm:
         self.aux, self.calls = None, 0
         if die_split is not None:
             self.aux = self._die_aux(tactic, rows, n, die_split, device)
-        self.out_layout = "cn" if self.swap_ab else "rn"
+        self.out_layout = "rn"
         # (sf_m, sf_n, sf_k) of the kernel's M (weights when swap_ab) and N
         km, kn = (n, rows) if self.swap_ab else (rows, n)
         self.sf = ((km + 127) // 128, (kn + 127) // 128, (k // SF_VEC + 3) // 4)
@@ -137,6 +137,9 @@ class Mxfp8PreGemm:
         """``push_args`` (push GEMMs only): the float32 [push_epilogue.ARGS] buffer of
         ``push_args``; ``out`` is then an unused [R, N] BF16 view (the C descriptor)."""
         if self.swap_ab:
+            # The kernel stores C [N, R] column-major (only C's pointer is used, leading
+            # dim N) = out [R, N] row-major; the strided view only matches the compiled
+            # argument's stride order.
             a, b, asf, bsf = w, xq, ws, xs
             c = out.as_strided(out.shape, (1, out.shape[0]))
         else:

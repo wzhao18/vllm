@@ -979,3 +979,33 @@ def test_select_ucx_net_devices_plus_separator(monkeypatch):
     import os
 
     assert os.environ["UCX_NET_DEVICES"] == "c:1,d:1"
+
+
+@pytest.mark.parametrize(
+    "net_devices,explicit,expected",
+    [("mlx5_0:1", None, "off"), ("mlx5_0:1", "auto", "auto"), (None, None, None)],
+)
+def test_ucx_gpu_nic_assignment_off_with_device_list(
+    monkeypatch, net_devices, explicit, expected
+):
+    """A per-rank NIC list must not be re-split among all visible GPUs by UCX:
+    that left GPU-memory ranks without lanes (3-5 GB/s instead of 32 per
+    reader, 0.1 GB/s between two such ranks). Explicit settings win."""
+    import os
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    for var, val in (
+        ("UCX_NET_DEVICES", net_devices),
+        ("UCX_GPU_NIC_ASSIGNMENT_MODE", explicit),
+    ):
+        monkeypatch.setenv(var, "restore-on-undo")
+        if val is None:
+            monkeypatch.delenv(var)
+        else:
+            monkeypatch.setenv(var, val)
+    monkeypatch.setenv("UCX_RNDV_PIPELINE_ERROR_HANDLING", "n")
+    NixlConnectorWorker._set_ucx_env_defaults()
+    assert os.environ.get("UCX_GPU_NIC_ASSIGNMENT_MODE") == expected
