@@ -135,12 +135,16 @@ class PrefillSubcallExperts:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        output_rmsnorm: torch.nn.Module | None = None,
     ) -> torch.Tensor:
+        """``output_rmsnorm``: the latent RMSNorm applied inside every sub-call's
+        top-k reduce (:func:`fused_output_norm`), or None."""
         experts = self.experts
         n = hidden_states.shape[0]
         nsub, ep_rows = self._plan(n)
+        norm = {} if output_rmsnorm is None else {"output_rmsnorm": output_rmsnorm}
         if nsub == 1 and n <= self.capacity:
-            return experts(hidden_states, topk_weights, topk_ids)
+            return experts(hidden_states, topk_weights, topk_ids, **norm)
         if n > nsub * self.capacity:
             raise AssertionError(f"{n} rows exceed {nsub} sub-calls of {self.capacity}")
         is_padding = None
@@ -164,7 +168,28 @@ class PrefillSubcallExperts:
                     is_padding=None if is_padding is None else is_padding[lo:hi],
                     out=out[lo:hi],
                     ep_tokens=ep_rows[i],
+                    **norm,
                 )
         finally:
             experts.capture_fn = capture_fn
         return out
+
+
+def fused_output_norm(experts, transform) -> torch.nn.Module | None:
+    """The latent RMSNorm of a prefill-worker MoE layer, compiled into the Rubin
+    MegaMoE top-k reduce (E2a / E2a-dedup: the reduce writes ``norm(routed output)``,
+    one ``[n, latent]`` BF16 write + read and one launch fewer per sub-call), or None
+    where the layer keeps its own norm: no latent norm, the online-MXFP8 up-projection
+    (its norm writes the MXFP8 operand), or another MegaMoE backend. Raises if the
+    Rubin runtime cannot compile the fused variant (no silent fallback)."""
+    from ..megamoe_rubin.experts import KimiK3MegaMoEExperts, prepare_output_rmsnorm
+
+    norm = None if transform is None else transform.norm
+    if (
+        norm is None
+        or not isinstance(experts, KimiK3MegaMoEExperts)
+        or transform._norm_mxfp8()
+    ):
+        return None
+    prepare_output_rmsnorm(experts, norm)
+    return norm

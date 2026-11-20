@@ -622,6 +622,7 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        normed: bool = False,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
@@ -630,9 +631,11 @@ class KimiRoutedOutputTransform(nn.Module):
             residual: Optional tensor of the up-projection's output shape to
                 accumulate into. Unquantized projections fuse the addition
                 into the GEMM epilogue.
+            normed: The routed experts already applied ``self.norm`` (fused
+                into the MegaMoE top-k reduce).
 
         """
-        if self.norm is not None:
+        if self.norm is not None and not normed:
             if self._norm_mxfp8():
                 # Online-MXFP8 up_proj: the latent norm writes its MXFP8 input.
                 qa = mxfp8_act.rms_norm_quantize(
@@ -760,6 +763,8 @@ class KimiMoE(nn.Module):
         # Prefill-worker MegaMoE policy (specialized_prefill.moe); None: stock.
         self._prefill_moe = None
         self._prefill_subcalls = None
+        # Latent norm fused into the MegaMoE reduce (specialized_prefill.moe).
+        self._fused_output_norm: nn.Module | None = None
         assert not (self.moe_token_shard and use_sequence_parallel)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -1117,13 +1122,16 @@ class KimiMoE(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        output_rmsnorm: nn.Module | None = None,
     ) -> torch.Tensor:
         """MegaMoE routed experts; prefill workers split the batch into
-        EP-uniform capacity sub-calls (specialized_prefill.moe)."""
+        EP-uniform capacity sub-calls (specialized_prefill.moe).
+        ``output_rmsnorm``: the latent norm, applied in the kernel's reduce."""
+        norm = {} if output_rmsnorm is None else {"output_rmsnorm": output_rmsnorm}
         subcalls = self._prefill_subcalls
         if subcalls is None:
-            return self.experts(hidden_states, topk_weights, topk_ids)
-        return subcalls(hidden_states, topk_weights, topk_ids)
+            return self.experts(hidden_states, topk_weights, topk_ids, **norm)
+        return subcalls(hidden_states, topk_weights, topk_ids, **norm)
 
     def _packed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE layer on the packed GEMMs of pack_projections()."""
@@ -1346,14 +1354,17 @@ class KimiMoE(nn.Module):
         routed_hidden_states, router_output, topk_ids = (
             self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
         )
+        fused_norm = self._fused_output_norm
         if prefill_shared is not None:
             done.wait()
             assert self.routed_output_transform is not None
             final_hidden_states = self._routed_experts(
-                routed_hidden_states, router_output, topk_ids
+                routed_hidden_states, router_output, topk_ids, fused_norm
             )
             final_hidden_states = self.routed_output_transform(
-                final_hidden_states, residual=shared_output
+                final_hidden_states,
+                residual=shared_output,
+                normed=fused_norm is not None,
             )
         elif self.use_mega_moe:
             assert self.routed_output_transform is not None
@@ -1361,7 +1372,7 @@ class KimiMoE(nn.Module):
             if self._shared_overlap:
                 final_hidden_states, shared_output = maybe_execute_in_parallel(
                     lambda: self._routed_experts(
-                        routed_hidden_states, router_output, topk_ids
+                        routed_hidden_states, router_output, topk_ids, fused_norm
                     ),
                     lambda: self.shared_experts(shared_input),
                     self._shared_events[0],
@@ -1370,7 +1381,7 @@ class KimiMoE(nn.Module):
                 )
             else:
                 final_hidden_states = self._routed_experts(
-                    routed_hidden_states, router_output, topk_ids
+                    routed_hidden_states, router_output, topk_ids, fused_norm
                 )
                 shared_output = (
                     self.shared_experts(shared_input)
@@ -1380,7 +1391,9 @@ class KimiMoE(nn.Module):
             # The shared output is folded into the up-projection GEMM's beta-add
             # epilogue, so combining the two branches costs no extra kernel.
             final_hidden_states = self.routed_output_transform(
-                final_hidden_states, residual=shared_output
+                final_hidden_states,
+                residual=shared_output,
+                normed=fused_norm is not None,
             )
         else:
             # Routed experts consume the down-projected latent; shared experts
@@ -2547,6 +2560,26 @@ class KimiLinearForCausalLM(
             logger.info_once(
                 "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
                 packed_moe,
+            )
+        # Prefill workers: the latent RMSNorm runs in the MegaMoE top-k reduce.
+        from .specialized_prefill.moe import fused_output_norm
+
+        fused_norms = 0
+        for module in self.model.modules():
+            if (
+                isinstance(module, KimiMoE)
+                and getattr(module, "_prefill_moe", None) is not None
+                and getattr(module, "_packed_moe", None) is None
+            ):
+                module._fused_output_norm = fused_output_norm(
+                    module.experts, module.routed_output_transform
+                )
+                fused_norms += module._fused_output_norm is not None
+        if fused_norms:
+            logger.info_once(
+                "Kimi K3: %d prefill MoE layers apply the latent RMSNorm in the "
+                "MegaMoE top-k reduce.",
+                fused_norms,
             )
         # Prefill workers: shared gate_up GEMM with the SiTU + MXFP8 epilogue.
         from .specialized_prefill import shared_situ
