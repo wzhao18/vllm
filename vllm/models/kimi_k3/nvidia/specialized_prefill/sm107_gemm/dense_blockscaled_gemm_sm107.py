@@ -1512,6 +1512,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
         conv_smem = None
+        situ_smem = storage.sC.data_ptr().toint()
         if cutlass.const_expr(getattr(self, "conv_mode", False)):
             conv_smem = storage.sC.data_ptr().toint()
             if cutlass.const_expr(
@@ -2253,6 +2254,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         getattr(self, "epi_yield", 0),
                         getattr(self, "epi_x2", False),
                         getattr(self, "epi_tanh", False),
+                        getattr(self, "epi_roll", 0),
+                        getattr(self, "epi_store", 0),
+                        situ_smem,
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:

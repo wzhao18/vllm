@@ -27,13 +27,15 @@ import re
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Float32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 from cutlass.utils.gemm.sm100 import (
     epilogue_tmem_copy_and_partition,
     transform_partitioned_tensor_layout,
 )
+
+from .conv_epilogue import lds_v4, stg_v4
 
 _ONE = "0f3F800000"
 _NEG_ONE = "0fBF800000"
@@ -186,6 +188,53 @@ def _situ_pair_packed_ptx(a_pow: int, clamp_up: bool, probe: int = 0) -> str:
         # Microbench probe only (wrong values): MUFU ops -> FMUL.
         src = re.sub(r"(ex2|rcp)\.approx\.ftz\.f32 (\w+), (\w+);", r"mul.rn.f32 \2, \3, 0f3F000000;", src)
     return src
+
+
+@dsl_user_op
+def st_global_v8_b32(addr, vals, *, loc=None, ip=None) -> None:
+    """One 256-bit global store (a full 32-byte sector per thread)."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [Uint32(v).ir_value(loc=loc, ip=ip) for v in vals],
+        "st.global.v8.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};",
+        "l,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def sts_b32(addr, val, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Uint32(val).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_global_b32(addr, val, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(val).ir_value(loc=loc, ip=ip)],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -730,13 +779,22 @@ def epilogue_situ_mxfp8_drain(
     yield_mode: Constexpr = 0,
     x2: Constexpr = False,
     tanh: Constexpr = False,
+    roll: Constexpr = 0,
+    store: Constexpr = 0,
+    smem_scr: cutlass.Int32 = None,
 ) -> pipeline.PipelineState:
     """Drain-and-release form of ``epilogue_situ_mxfp8`` for the 1-stage
     B-reuse tile (8 epilogue warps; warp group g owns M block g): every thread
     loads its TMEM row of all gate/up subtiles, rounds them to BF16 (the stock
     GEMM output) into registers and hands TMEM back to the MMA warp, then runs
     the same SiTU + MXFP8 math and stores while the next tile's mainloop
-    runs. Bytes equal ``epilogue_situ_mxfp8``."""
+    runs. Bytes equal ``epilogue_situ_mxfp8``.
+
+    ``roll`` > 0 runs the math as a loop over ``roll`` output blocks per
+    iteration (the drained row shifts down by that many blocks each step), so
+    the epilogue code is ``roll`` blocks long instead of all of them: the fully
+    unrolled code streams through the instruction cache and slows the MMA and
+    TMA warps' loops."""
     k_b, k_a, k_c, bb = situ_k
     g = tidx // 128
     gt = tidx % 128
@@ -790,15 +848,145 @@ def epilogue_situ_mxfp8_drain(
                 rQ32[0] = acc
                 cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, 0)])
         return acc_consumer_state
-    if cutlass.const_expr(skel == 6):
-        # Probe: same math instruction count, issued only by the warps of
-        # SMSPs 2 and 3 (twice each); SMSPs 0/1 (MMA, TMA warps) get none.
-        if (tidx // 32) % 4 >= 2:
+    if cutlass.const_expr(skel == 6 or skel == 8):
+        # Probe: same math instruction count, issued twice by the warps of
+        # SMSPs 2/3 only (6) or of SMSPs 0/1 only (8; MMA and TMA warps live
+        # there). The second pass swaps two constants (no CSE) and a compare
+        # on the result keeps the math live without storing it.
+        x = Uint32(0)
+        if cutlass.const_expr(skel == 6):
+            sel = (tidx // 32) % 4 >= 2
+        else:
+            sel = (tidx // 32) % 4 < 2
+        if sel:
+            swapped = (k_a, k_b, k_c, bb)
             x = _drain_math_probe(frags, half, n_blk, rQ32, situ_k, a_pow, clamp_up)
-            x = x ^ _drain_math_probe(frags, half, n_blk, rQ32, situ_k, a_pow, clamp_up)
+            x = x ^ _drain_math_probe(frags, half, n_blk, rQ32, swapped, a_pow, clamp_up)
+        if x == Uint32(0x12345677):
             rQ32[0] = x
-        if m_rows < 0:
             cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, 0)])
+        return acc_consumer_state
+    if cutlass.const_expr(skel == 7):
+        # Probe: the math's instruction count as a rolled loop (tiny code
+        # footprint) on all 8 warps; separates i-cache from issue pressure.
+        x = Uint32(0)
+        for f in frags:
+            for i in cutlass.range_constexpr(cute.size(f)):
+                x = x ^ f[i]
+        gp = frags[0][0]
+        up = frags[half][0]
+        for _ in cutlass.range(half * n_blk * 16, unroll=1):
+            h, am = situ_pair_packed(gp, up, k_b, k_a, k_c, bb, a_pow, clamp_up)
+            q = e4m3x4_of_bf16x4(h, gp, am)
+            x = x ^ q
+            gp = up ^ h
+            up = q
+        if x == Uint32(0x12345677):
+            rQ32[0] = x
+            cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, 0)])
+        return acc_consumer_state
+    if cutlass.const_expr(skel >= 9):
+        # Probe: rolled loop with `chains` independent SiTU chains (ILP and
+        # code size grow with chains; the total instruction count matches).
+        chains = {9: 4, 10: 8, 11: 16}[skel]
+        x = Uint32(0)
+        for f in frags:
+            for i in cutlass.range_constexpr(cute.size(f)):
+                x = x ^ f[i]
+        gbuf = cute.make_rmem_tensor((chains,), Uint32)
+        ubuf = cute.make_rmem_tensor((chains,), Uint32)
+        for c in cutlass.range_constexpr(chains):
+            gbuf[c] = frags[(c // 16) % half][c % 16]
+            ubuf[c] = frags[half + (c // 16) % half][c % 16]
+        for _ in cutlass.range(half * n_blk * 16 // chains, unroll=1):
+            for c in cutlass.range_constexpr(chains):
+                h, am = situ_pair_packed(gbuf[c], ubuf[c], k_b, k_a, k_c, bb, a_pow, clamp_up)
+                q = e4m3x4_of_bf16x4(h, gbuf[c], am)
+                x = x ^ q
+                gbuf[c] = ubuf[c] ^ h
+                ubuf[c] = q
+        if x == Uint32(0x12345677):
+            rQ32[0] = x
+            cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, 0)])
+        return acc_consumer_state
+    if cutlass.const_expr(roll > 0):
+        per = cute.size(frags[0])
+        buf = cute.make_rmem_tensor((2 * half * per,), Uint32)
+        for ni in cutlass.range_constexpr(half):
+            for i in cutlass.range_constexpr(per):
+                buf[2 * ni * per + i] = frags[ni][i]
+                buf[(2 * ni + 1) * per + i] = frags[ni + half][i]
+        shift = 2 * roll * per
+        # store: 0 two 128-bit stores + one scale byte per block; 1 one 256-bit
+        # store per block + the row's 4 scale bytes as one 32-bit store per
+        # tile (the 128x4 swizzle keeps them adjacent); 2/3 probes: no scale
+        # stores / no stores.
+        packed = cutlass.const_expr(store >= 1 and n_blk == 1 and half == 4)
+        row0 = tTR_cQ[(None, None, None, g, 0)][0][0]
+        sw = cute.make_rmem_tensor((1,), Uint32)
+        sw[0] = Uint32(0)
+        xs = cute.make_rmem_tensor((1,), Uint32)
+        xs[0] = Uint32(0)
+        for it in cutlass.range(half // roll, unroll=1):
+            for s in cutlass.range_constexpr(roll):
+                ni = it * roll + s
+                row = tTR_cQ[(None, None, None, g, ni)][0][0]
+                sf_frg = cute.logical_divide(
+                    tTR_gSF[(None, None, None, g, ni)], cute.make_layout(32)
+                )
+                base = 2 * s * per
+                for vi in cutlass.range_constexpr(n_blk):
+                    hs = []
+                    amax = Float32(0.0)
+                    for p in cutlass.range_constexpr(16):
+                        h, am = situ_pair_packed(
+                            buf[base + vi * 16 + p], buf[base + per + vi * 16 + p],
+                            k_b, k_a, k_c, bb, a_pow, clamp_up,
+                        )  # fmt: skip
+                        hs.append(h)
+                        amax = fmax_f32(amax, am)
+                    e = ue8m0_of_amax(amax)
+                    inv = inv_scale_of_ue8m0(e)
+                    for q in cutlass.range_constexpr(8):
+                        rQ32[vi * 8 + q] = e4m3x4_of_bf16x4(hs[2 * q], hs[2 * q + 1], inv)
+                    if cutlass.const_expr(packed):
+                        sw[0] = sw[0] | (e << Uint32(8 * ni))
+                    elif row < (m_rows + 127) // 128 * 128:
+                        sf_frg[0, vi] = e.to(cutlass.Uint8)
+                if cutlass.const_expr(packed and store == 3):
+                    for q in cutlass.range_constexpr(8):
+                        xs[0] = xs[0] ^ rQ32[q]
+                elif cutlass.const_expr(packed):
+                    if row < m_rows:
+                        st_global_v8_b32(
+                            tTR_gQ[(None, None, None, g, ni)].iterator.toint(),
+                            [rQ32[q] for q in range(8)],
+                        )
+                elif row < m_rows:
+                    cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, ni)])
+            for i in cutlass.range_constexpr(2 * half * per - shift):
+                buf[i] = buf[i + shift]
+        if cutlass.const_expr(packed and store == 1):
+            if row0 < (m_rows + 127) // 128 * 128:
+                st_global_b32(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
+        if cutlass.const_expr(packed and store == 4):
+            # The warp group's 128 rows x 4 scale bytes are one 512-byte 128x4
+            # swizzle atom: stage it in shared memory (double-buffered by tile
+            # parity) and let its first warp write it as full 16-byte chunks;
+            # per-row 4-byte stores (8 partial writes per 32-byte sector) stall
+            # the TMA operand stream.
+            slot = smem_scr + acc_consumer_state.phase * 1024 + g * 512
+            sts_b32(slot + (gt % 32) * 16 + (gt // 32) * 4, sw[0])
+            cute.arch.barrier(barrier_id=3 + g, number_of_threads=128)
+            if gt < 32:
+                v = lds_v4(slot + gt * 16)
+                ok = Int32(0)
+                if row0 < (m_rows + 127) // 128 * 128:
+                    ok = Int32(1)
+                stg_v4(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), ok, *v)
+        if cutlass.const_expr(packed and (store == 2 or store == 3)):
+            if (xs[0] ^ sw[0]) == Uint32(0x12345677):
+                st_global_b32(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
         return acc_consumer_state
     for ni in cutlass.range_constexpr(half // 2 if skel == 4 else half):
         rG = frags[ni]
