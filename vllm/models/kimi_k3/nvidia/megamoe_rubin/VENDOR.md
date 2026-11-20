@@ -309,6 +309,13 @@ p50 (682 vs 731 us).
   of one token row per CTA followed by the consumer's stock RMSNorm (``rmsnorm_weight`` /
   ``rmsnorm_eps`` through the GenPhase kernel's ``__call__``), replacing the separate
   ``rms_norm`` launch after the GenPhase bucket.
+- **S-PAIR** (vLLM-local): ``PairedStagePipeline`` (``block_scaled_swap_ab_fc12_mainloop_gen_specialized``):
+  on the shared AB stage plan each mbarrier covers two consecutive SMEM stages (half the barriers,
+  two producer arrivals and two consumer releases per barrier), so the MMA waits once per two
+  K256 tiles. One 18 KiB weight K tile per barrier from one TMA issuer caps the weight stream at
+  ~14 TB/s per chip at any ring depth; two per barrier reach ~96% of the die-local rate (VR200).
+  Active when every phase has an even K tile count and the ring has at least four stages (an odd
+  stage count drops one stage); producers and the MMA are unchanged.
 - **Use**: the wide-EP decode bucket with the fused MXFP8 E4M3 shared expert
   (``experts.enable_fused_shared``; ``reduce_shared_output=False``: the shared output lands in its
   own BF16 tensor, added by the latent up-projection's residual epilogue as before), routing

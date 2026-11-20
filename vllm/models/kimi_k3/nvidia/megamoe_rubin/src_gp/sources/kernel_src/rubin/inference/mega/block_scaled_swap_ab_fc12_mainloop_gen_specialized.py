@@ -70,6 +70,50 @@ def _bind_tma_issue(exec_atom: cute.CopyAtom, tma_barrier: cute.Pointer, mcast_m
         mcast_mask = None
     return bind_executable_tma_load_fields(exec_atom, tma_bar_ptr=tma_barrier, tma_desc_ptr=None, mcast_mask=mcast_mask)
 
+class PairedStagePipeline:
+    """A TMA-to-UMMA pipeline whose barriers each cover two consecutive SMEM stages.
+
+    Callers keep stepping a state over all ``2 * inner.num_stages`` SMEM stages; stage ``i`` waits
+    on and arrives at barrier ``i // 2`` in the same phase. The inner pipeline counts two
+    producer arrivals and two consumer releases per barrier (one per stage), so a barrier
+    completes once both stages' bytes have landed and frees once both stages are consumed.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    @staticmethod
+    def _barrier_state(state: pipeline.PipelineState) -> pipeline.PipelineState:
+        return pipeline.PipelineState(state.stages // 2, state.count, state.index // Int32(2), state.phase)
+
+    def producer_try_acquire(self, state):
+        return self.inner.producer_try_acquire(self._barrier_state(state))
+
+    def producer_acquire(self, state, try_acquire_token=None, **kwargs):
+        return self.inner.producer_acquire(self._barrier_state(state), try_acquire_token, **kwargs)
+
+    def producer_get_barrier(self, state):
+        return self.inner.producer_get_barrier(self._barrier_state(state))
+
+    def producer_commit(self, state):
+        return self.inner.producer_commit(self._barrier_state(state))
+
+    def consumer_try_wait(self, state):
+        return self.inner.consumer_try_wait(self._barrier_state(state))
+
+    def consumer_wait(self, state, try_wait_token=None):
+        return self.inner.consumer_wait(self._barrier_state(state), try_wait_token)
+
+    def consumer_release(self, state):
+        return self.inner.consumer_release(self._barrier_state(state))
+
+    def producer_tail(self, state):
+        # Every barrier's last phase is drained once acquiring the stage before ``state``'s.
+        for _ in range(state.stages - 1):
+            state.advance()
+        self.producer_acquire(state)
+
+
 class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, KernelComponent):
     """Own all Rubin load, MMA, pipeline, SMEM, and TMEM mainloop state."""
 
@@ -425,6 +469,31 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
     def n128_decode_tile(self) -> Tuple[int, int, int]:
         return (256, 128, 128 * 8 // int(self.b_dtype.width))
 
+    def _ab_stages_pairable(self) -> bool:
+        """Two K tiles per barrier stage (``PairedStagePipeline``) on the shared plan.
+
+        One 16 KiB weight K tile per barrier caps a CTA's TMA weight stream at ~14 TB/s per chip
+        at any ring depth; two K tiles per barrier reach ~96% of the die-local rate. Pairs follow
+        the ring's issue order and may span work tiles, so every phase's K tile count must be
+        even (a pair is never left half filled at the end of the stream) and the ring needs at
+        least two pairs.
+        """
+        if self.uses_asymmetric_ab_stages:
+            return False
+        sizes = [self.hidden_size, self.intermediate_gateup_size]
+        if not all(isinstance(size, int) for size in sizes):
+            return False
+        k_tiles = [ceil_div(self.hidden_size, self.mma_tile_k), ceil_div(self.intermediate_gateup_size // 2, self.mma_tile_k)]
+        if getattr(self, "shared_enabled", False):
+            shared_sizes = [self.shared_hidden_size, self.shared_intermediate_gateup_size]
+            if not all(isinstance(size, int) for size in shared_sizes):
+                return False
+            k_tiles += [
+                ceil_div(self.shared_hidden_size, self.shared_mma_tile_k),
+                ceil_div(self.shared_intermediate_gateup_size // 2, self.shared_mma_tile_k),
+            ]
+        return all(count % 2 == 0 for count in k_tiles) and self.num_weight_ab_stages >= 4
+
     def _select_ab_stage_plan(self) -> None:
         stage_one_regions = make_smem_layouts(
             self.mma_instruction, self.mma_tiler_mnk, 1, (self.a_major_mode, self.b_major_mode), self.architecture
@@ -525,6 +594,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             return weight_stages, token_stages
 
         self.num_weight_ab_stages, self.num_token_ab_stages = plan_stages()
+        self.paired_ab_stages = self._ab_stages_pairable()
+        if self.paired_ab_stages and self.num_weight_ab_stages % 2 != 0:
+            self.num_weight_ab_stages -= 1
+            self.num_token_ab_stages -= 1
         # Retained for the callers that size one pipeline's state: under the shared
         # plan both depths are this, and under the split plan the weight side is
         # the one the MMA's primary state follows.
@@ -965,12 +1038,13 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         Gather-B never arrives: it only lets its completions decrement the byte
         count that TMA-B already registered.
         """
-        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 2)
+        pair = 2 if self.paired_ab_stages else 1
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 2 * pair)
         num_tma_consumers = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_consumers)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_consumers * pair)
         return pipeline.PipelineTmaUmma.create(
             barrier_storage=smem_workspace.ptr(self.ab_pipeline_mbarriers_region, smem_base),
-            num_stages=self.num_ab_pipeline_stages,
+            num_stages=self.num_ab_pipeline_stages // pair,
             producer_group=producer_group,
             consumer_group=consumer_group,
             tx_count=self.ab_pipeline_tx_count_per_producer,
@@ -2169,4 +2243,4 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         acc_pipeline.producer_tail(acc_producer_state)
 
 
-__all__ = ["BlockScaledSwapAbFc12MainloopGenSpecialized"]
+__all__ = ["BlockScaledSwapAbFc12MainloopGenSpecialized", "PairedStagePipeline"]
