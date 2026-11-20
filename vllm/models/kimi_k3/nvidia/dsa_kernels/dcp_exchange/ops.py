@@ -35,6 +35,7 @@ _FINE_WORDS = 8
 _TIE_LIST = 64  # kTieList
 _TIE_WORDS = 32  # kTieWords
 
+_TOPKDIAG: dict = {}  # DIAG (not for landing)
 # stats counters (kSt* in the kernel)
 STAT_NAMES = (
     "rows", "one_round", "two_round_refine", "fallback_r8", "tie_round",
@@ -386,6 +387,12 @@ class DcpExchange:
         stats: optional int32[8] row counters (0 exchanged, 1 one round, 2 tie round,
         3 radix, 4 select every valid key, 5 message from full passes); dbg: optional int64
         [rows * 64] per-row phase stamps. Launches must stay stream-ordered."""
+        if stats is None:  # DIAG (not for landing): E1 row-class counters, read by the bench
+            stats = _TOPKDIAG.get(logits.device)
+            if stats is None:
+                stats = _TOPKDIAG[logits.device] = torch.zeros(
+                    32, dtype=torch.int32, device=logits.device
+                )
         self.ext.topk_v2(
             logits, local_len, global_len, out, out_count, block_table, block_size,
             block_stride, next_n, req_of_row, self.v2_box.data_ptr(), self.v2_mc,

@@ -1123,6 +1123,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         tv += s[4] & 0xFFFFFFu;
       }
       int rt = tv <= (uint32_t)K ? 4 : (sat || mx >= mn) ? 3 : 0;
+      if (tv > (uint32_t)K && sat) V2STAT(9);
+      if (tv > (uint32_t)K && !sat && mx >= mn) V2STAT(10);
+      if (s_valid < (uint32_t)L) V2STAT(12);
+      if (s_th <= 1) V2STAT(19);
+      if (s_th == 0x8000) V2STAT(20);
       int tau = -1, need = 0, qv = 0;
       V2DBG(19);
       if (rt == 0) {
@@ -1157,7 +1162,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         tau = s_tau;
         need = s_need;
-        if (tau < 0) rt = 3;  // the K-th key lies above or below the common range
+        if (tau < 0) { rt = 3; V2STAT(11); }  // the K-th key lies above or below the common range
+        if (tau == 0x8000 || tau == 0x7FFF) V2STAT(18);
         V2DBG(20);
       }
       if (rt == 0) {
@@ -1241,8 +1247,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // ---- CG first (rank-skewed rows), out of line (v2_cg); rows it cannot take keep R2
       bool cg = false;
       if (K31_RARE(tier == 3) && s_tau < 0) {
+        V2STAT(13);
         cg = v2_cg<T>(p, rx, hist, msg, ckey, nc, tag, par, row, warp_sums, s_i);
-        if (cg) tier = s_tier;
+        if (cg) { tier = s_tier; V2STAT(14); }
       }
       if (tier == 3 && !cg) {
         // saturated windows / failed fast paths take R2 too: every window is a lower bound
@@ -1287,6 +1294,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         V2DBG(6);
         const bool lbok = s_r2[0] >= 0;  // the same on every rank
+        V2STAT(15);
+        if (!lbok) V2STAT(16);
         if (lbok) {
           const uint32_t LB = (uint32_t)max(s_r2[0], 1);
           const int64_t r2row = p.off_r2 + ((int64_t)(par * min(p.cap, kR2Rows) + row) * W) * kR2W;
@@ -1523,6 +1532,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
       if (tier != 1 && tier != 2) {  // the same on every rank: the complete body takes the row
+        V2STAT(17);
         __syncthreads();
         return 1 + ep;
       }
