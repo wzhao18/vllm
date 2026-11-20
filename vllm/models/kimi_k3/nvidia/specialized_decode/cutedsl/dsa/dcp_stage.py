@@ -154,6 +154,9 @@ def run_value(
     if mail.format == PROJECTED and projects_on_tc(batch):
         assert w_uv is not None
         uv = to_cute(w_uv)  # DcpValue projects on tcgen05
+        # and puts its remote units into the owners' counted fabric windows
+        boxes = to_cute(mail.values[parity]), boxes[1]
+        peers = to_cute(mail.fabric_args, 8), peers[1]
     elif mail.format == PROJECTED:
         assert w_uv is not None
         rows = projected_rows(out.device, box.cap, gathered)

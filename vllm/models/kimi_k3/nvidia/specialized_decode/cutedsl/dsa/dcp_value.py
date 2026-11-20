@@ -20,8 +20,9 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from ... import fabric as fabric_window
 from ...symm import peer_rendezvous
-from ..common import tensormap
+from ..common import fabric, tensormap
 from ..common.host import fake
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -61,6 +62,7 @@ from .sparse_mla import (
 )
 
 LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends
+FABRIC_DATA = fabric_window.DATA  # first data byte of a counted fabric window
 # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.
 EMPTY_LSE = -3.0e38
 Q_SENT = 0xFFFFFFFF  # four FP8 0xFF bytes: never written (satfinite, canonical NaN)
@@ -155,6 +157,18 @@ def _fence_async_shared():
 
 
 @asm()
+def _trap_if(flag):
+    return "{ .reg .pred p; setp.ne.u32 p,$0,0; @p trap; }", "r", (Uint32(flag),)
+
+
+@cute.jit
+def _fabric_done(barrier, phase):
+    """Wait for a staging buffer's counted put (its smem source read and the put
+    complete); a fabric error traps (no silent loss of a unit)."""
+    _trap_if(fabric.wait(barrier, phase))
+
+
+@asm()
 def _epi_sync():
     """Barrier 1 over the 128 epilogue threads."""
     return "bar.sync 1, 128;", "~{memory}", ()
@@ -232,6 +246,31 @@ class DcpMailbox:
         self.lse_peers = torch.tensor(handles[1].buffer_ptrs, **i64)
         self.partial.view(torch.int32).fill_(PAIR_SENT - (1 << 32))
         self.lse.view(torch.int32).fill_(-1)
+        self.fabric = None
+        if fmt == PROJECTED:
+            self._add_fabric(group, device, shape, width)
+
+    def _add_fabric(self, group, device, shape, width):
+        """The tcgen05 "proj" DcpValue's value rows ([2, DCP, H, CAP, 128], the same
+        layout and sentinels as ``partial``) in a counted fabric window: remote units
+        arrive as one counted put each (counter (parity, head, 128-row block) at the
+        owner, see fabric_counter), the own unit by local stores (Lamport). Collective;
+        raises FabricUnavailable without counted fabric operations."""
+        size, heads, cap = shape[1], shape[2], shape[3]
+        blocks = -(-cap // 128)
+        assert 2 * heads * blocks <= fabric_window.COUNTERS, (heads, cap)
+        nbytes = self.partial.numel() * self.partial.element_size()
+        self.fabric = fabric_window.FabricWindow(group, nbytes, multicast=False,
+                                                 device=device)
+        data = self.fabric.local[fabric_window.DATA:fabric_window.DATA + nbytes]
+        self.values = data.view(torch.bfloat16).view(*shape, width)
+        self.values.view(torch.int32).fill_(PAIR_SENT - (1 << 32))
+        # kernel_tc's ``peers`` argument: endpoint base, window address (counters
+        # first), the running-target slots (FabricWindow.expected), 128-row blocks.
+        self.fabric_args = torch.tensor(
+            [self.fabric.base, self.fabric.local.data_ptr(),
+             self.fabric.expected.data_ptr(), blocks] + [0] * (size - 4),
+            dtype=torch.int64, device=device)
 
 
 def gather_heads(w_uv, size, group):
@@ -498,13 +537,16 @@ class DcpValue:
         smem = cutlass.utils.SmemAllocator()
         scales = alloc(smem, Float32, (16 * self.merge_tiles, D))
         ring = Uint32(smem.allocate_array(
-            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 128, byte_alignment=1024
+            Uint8, TC_STAGES * TC_STAGE + 2 * TC_OUT + 256, byte_alignment=1024
         ).toint())
         outs = ring + Uint32(TC_STAGES * TC_STAGE)
         bars = outs + Uint32(2 * TC_OUT)  # full[st], empty[st]
         acc_full = bars + Uint32(16 * TC_STAGES)  # [2]
         acc_free = acc_full + Uint32(16)  # [2]
-        slot_addr = acc_free + Uint32(16)
+        fbars = acc_free + Uint32(16)  # [2] fabric completion of a staging buffer
+        slot_addr = fbars + Uint32(16)
+        # The counted fabric window (DcpMailbox.fabric_args): endpoint base.
+        ep_base = Int32(peers[0])
         tid, _, _ = cute.arch.thread_idx()
         head, y, _ = cute.arch.block_idx()
         lane = tid % 32
@@ -517,6 +559,7 @@ class DcpValue:
             for b in cutlass.range_constexpr(2):
                 mbar_init(acc_full + Uint32(8 * b), Uint32(1))
                 mbar_init(acc_free + Uint32(8 * b), Uint32(128))
+                fabric.barrier_init(fbars + Uint32(8 * b))
             fence_mbar_init()
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
@@ -572,7 +615,9 @@ class DcpValue:
         if (warp >= TC_EPI) & (warp < TC_EPI + 4):
             row = tid - 32 * TC_EPI
             quad = Uint32(32 * (warp - TC_EPI)) << Uint32(16)
+            blocks = Int32(peers[3])
             j = Int32(0)
+            jf = Int32(0)  # remote units put so far; staging buffer jf % 2
             for u in range(c, self.units, G):
                 b = j & 1
                 gh = u % DH
@@ -584,13 +629,16 @@ class DcpValue:
                     lse = self.sent_lse(rows_lse, lens, t, gh)
                 send = live & (lse > Float32(EMPTY_LSE))
                 owner = gh // H
+                remote = owner != rank
                 base = ((parity * D + rank) * H + gh % H) * cap
-                if row == 0:  # this buffer's push (two units ago) has read it
-                    _bulk_read_wait1()
+                sb = jf & 1
+                if remote & (row == 0) & (jf >= 2):
+                    # this staging buffer's put (two remote units ago) has read it
+                    _fabric_done(fbars + Uint32(8) * Uint32(sb), ((jf - 2) >> 1) & 1)
                 _epi_sync()
                 mbar_wait(acc_full + Uint32(8) * Uint32(b), (j >> 1) & 1)
                 tc_fence_after()
-                out = outs + Uint32(TC_OUT) * Uint32(b) + Uint32(256) * Uint32(row)
+                out = outs + Uint32(TC_OUT) * Uint32(sb) + Uint32(256) * Uint32(row)
                 swz = row % 8  # chunk ^ (t % 8): conflict-free rows, as the mailbox
                 acc = taddr + Uint32(128) * Uint32(b) + quad
                 for c4 in cutlass.range_constexpr(4):  # (warp-collective TMEM loads)
@@ -602,24 +650,38 @@ class DcpValue:
                                 pack_pair(v[8 * q4 + 2 * i], v[8 * q4 + 2 * i + 1],
                                           policy="latent")
                                 for i in range(4))
-                        chunk = Uint32(swz ^ Int32(4 * c4 + q4))
-                        _st_shared4(out + chunk * Uint32(16), *words)
+                        chunk = swz ^ Int32(4 * c4 + q4)
+                        if remote:
+                            _st_shared4(out + Uint32(chunk) * Uint32(16), *words)
+                        elif send:  # the own unit: Lamport stores into the window
+                            store_relaxed(at(box, rank, gh % H, t, 8 * chunk), words)
                 tc_fence_before()
                 mbar_arrive(acc_free + Uint32(8) * Uint32(b))  # TMEM read
                 if live:
                     lse_at = lpeers[owner] + Int64(base + t) * 4
                     store_relaxed(lse_at, (float_bits(lse),))
-                _fence_async_shared()
-                _epi_sync()
-                if row == 0:
-                    n = B - t0
-                    if n > 128:
-                        n = 128
-                    _bulk_push(peers[owner] + Int64(base + t0) * 256,
-                               outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
+                if remote:
+                    _fence_async_shared()
+                    _epi_sync()
+                    if row == 0:
+                        n = B - t0
+                        if n > 128:
+                            n = 128
+                        bar = fbars + Uint32(8) * Uint32(sb)
+                        counter = ((parity * H + gh % H) * blocks + t0 // 128) * 256
+                        fabric.put(bar, ep_base + owner,
+                                   Int64(FABRIC_DATA) + Int64(base + t0) * 256,
+                                   Int64(counter), outs + Uint32(TC_OUT) * Uint32(sb),
+                                   Uint32(256 * n))
+                        fabric.submit_expect(bar, Uint32(256 * n))
+                    jf = jf + 1
                 j = j + 1
-            if row == 0:
-                _bulk_wait0()
+            if row == 0:  # the smem sources stay valid until their puts read them
+                if jf >= 2:
+                    _fabric_done(fbars + Uint32(8) * Uint32(jf & 1), ((jf - 2) >> 1) & 1)
+                if jf >= 1:
+                    _fabric_done(fbars + Uint32(8) * Uint32((jf - 1) & 1),
+                                 ((jf - 1) >> 1) & 1)
         cute.arch.sync_threads()
         # Free TMEM before the dependents launch: a dependent CTA placed on this SM
         # while the merge spins may require TMEM column 0 (exclusive allocators).
@@ -629,6 +691,34 @@ class DcpValue:
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
         self.merge_rows(args, scales, tid, y)
+
+    @cute.jit
+    def wait_units(self, args, head, y):
+        """kernel_tc's counted fabric units of ``head``: every (parity, head, 128-row
+        block) counter receives one put of the block's rows per remote source each
+        launch. This CTA advances its running target of every block (the grid is the
+        same for every tcgen05 batch, so every slot follows its counter) and waits
+        for the blocks its merge rows fall in (then plain loads see the values)."""
+        peers, parity = args[5], args[12]
+        D, H, B = self.size, self.heads, self.batch
+        win, slots, blocks = Int64(peers[1]), Int64(peers[2]), Int32(peers[3])
+        cta = y * H + head
+        for m in range(blocks):
+            n = B - m * 128
+            if n > 128:
+                n = 128
+            if n < 0:
+                n = 0
+            cid = (parity * H + head) * blocks + m
+            slot = slots + Int64(cid * fabric_window.MAX_CTAS + cta) * 8
+            target = fabric.advance(slot, Uint64((D - 1) * 256) * Uint64(n))
+            touched = Int32(0)
+            for k in cutlass.range_constexpr(self.merge_tiles):
+                t = (y + k * self.grid[1]) * 16
+                if (t < B) & (t // 128 == m):
+                    touched = Int32(1)
+            if touched == 1:
+                fabric.wait_counter(win + Int64(cid) * 256, target)
 
     @cute.jit
     def merge_rows(self, args, scales, tid, y):
@@ -683,7 +773,10 @@ class DcpValue:
                 if lses[s] <= Float32(EMPTY_LSE):
                     scale = Float32(-1)  # no value row: neither polled nor re-armed
                 scales[tid, s] = scale
+        if tid == 0:
+            self.wait_units(args, head, y)
         cute.arch.sync_threads()
+        fabric.fabric_acquire()  # every reader of the fabric-written values
         for i in range(tid, R * 16, 512):
             r, chunk = i // 16, i % 16
             t = (y + (r // 16) * step) * 16 + r % 16
@@ -695,7 +788,10 @@ class DcpValue:
                 for k in cutlass.range_constexpr(D):
                     w = scales[r, k]
                     if w >= Float32(0):
-                        self.poll_pair(sources[k], loads[k], w, merged)
+                        if Int32(k) == args[13]:  # own unit: Lamport stores
+                            self.poll_pair(sources[k], loads[k], w, merged)
+                        else:  # counted fabric put, landed (wait_units)
+                            self.add_pair(loads[k], w, merged)
                 col = head * 128 + 8 * chunk
                 gates = load_words(at(gate, t, col), count=4, mutable=True)
                 words = []
@@ -1017,6 +1113,11 @@ class DcpValue:
         while not published(words):
             words = load_volatile(source, count=4)
         store_words(source, (Uint32(PAIR_SENT),) * 4)
+        self.add_pair(words, w, merged)
+
+    @cute.jit
+    def add_pair(self, words, w, merged):
+        """Adds a BF16 partial chunk (8 values), weighted by ``w``, to ``merged``."""
         for e in cutlass.range_constexpr(4):
             lo, hi = unpack_bf16(words[e])
             merged[2 * e] += w * lo
@@ -1087,8 +1188,10 @@ def compile_value(
     box = fake((*lead, width), None, torch.bfloat16)
     lbox = fake(lead, None, f32, 4)
     peers = fake((size,), None, torch.int64, 8)
+    # tcgen05 "proj": DcpMailbox.fabric_args in place of the value peers
+    fabric_args = fake((max(4, size),), None, torch.int64, 8) if value.tc else peers
     output = fake((batch, heads * 128), (heads * 128, 1))
-    args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
+    args: tuple = (rows, rows_lse, lens, box, lbox, fabric_args, peers, mailbox, w_uv)
     args += (gate, totals, output, Int32(0), Int32(0), make_fake_stream())
     with torch.accelerator.device_index(device):
         return cute.compile(value, *args)
