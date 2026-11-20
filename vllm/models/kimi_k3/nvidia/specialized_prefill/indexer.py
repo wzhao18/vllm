@@ -339,7 +339,8 @@ class IndexerScore:
         # epilogue math (benchmark calibration only): 0 full; 1 skeleton (TMEM loads,
         # stage release and publish of a value tied to the loads, no math);
         # 2 heads 0-15 only (half the math, all loads); 3 no TMEM loads (MMA path
-        # alone); 4 skeleton epilogue with the MMAs skipped (TMEM loads alone)
+        # alone); 4 skeleton epilogue with the MMAs skipped (TMEM loads alone);
+        # 6 full epilogue math with the MMAs skipped (TMEM loads + math alone)
         self.epi = epi
         self.tiler = (TILE, N, DIM)
 
@@ -668,7 +669,7 @@ class IndexerScore:
                     cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, stage)], s2t_a[2])
                     mma.set(tcgen05.Field.ACCUMULATE, False)
                     for kb in cutlass.range_constexpr(
-                        cute.size(tCrA, mode=[2]) if self.epi != 4 else 0
+                        cute.size(tCrA, mode=[2]) if self.epi not in (4, 6) else 0
                     ):
                         cute.gemm(
                             mma,
@@ -745,7 +746,7 @@ class IndexerScore:
         end_a, w_a, hist_a, wscan_a = sm
         wg = warp // 4
         lt = tidx % 128
-        wq = lt // 32
+        wq = warp % 4  # = lt // 32, warp-uniform: TMEM addresses stay in uniform registers
         out_a = logits.iterator.toint()
         ph = Int32(0)
         jq = Int32(0)
@@ -882,13 +883,13 @@ class IndexerScore:
             if cutlass.const_expr(self.epi != 1):
                 ss = self.reduce_half(h0, w, None, 0)
             h1 = tmem_wait_n(*h1)
-            cute.arch.sync_warp()
-            if lane == 0:
+            # tcgen05.wait::ld is warp-aligned: every lane's loads have landed
+            with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(acc_empty + st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
                 cute.arch.mbarrier_wait(acc_full + st + 1, ph)
                 h0n = (*tmem_ld16(col + N), *tmem_ld16(col + N + HEADS))
-            if cutlass.const_expr(self.epi == 0):
+            if cutlass.const_expr(self.epi in (0, 6)):
                 ss = self.reduce_half(h1, w, ss, HEADS // 2)
                 r = self.combine2(ss)
             elif cutlass.const_expr(self.epi == 2):
@@ -1574,6 +1575,123 @@ def key16_of_word(wd):
     return code, "=r,r", (Uint32(wd),)
 
 
+TIE_RANK = 256  # threshold ties ranked directly (more: the tile histogram path)
+
+
+@asm()
+def hist4_pos(hist_a, s, c0, c1, c2, c3, w0, w1, w2, w3, thr):
+    """Histogram of one lane quad of candidate slot s when the row threshold thr
+    is a positive BF16 (every candidate is a positive BF16 at or above it): one
+    count per valid word (s below its lane count) in bin min(bits - thr,
+    CS2_BINS - 1). Branch-free."""
+    code = "{ .reg .pred p; .reg .b32 v, a; "
+    for k in range(4):
+        code += (
+            f"setp.lt.u32 p, $1, ${2 + k}; and.b32 v, ${6 + k}, 0xFFFF; "
+            f"sub.u32 v, v, $10; min.u32 v, v, {CS2_BINS - 1}; "
+            f"mad.lo.u32 a, v, 4, $0; @p red.shared.add.u32 [a], 1; "
+        )
+    return code + "}", ",".join(["r"] * 11) + ",~{memory}", (
+        Int32(hist_a), Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(thr),
+    )
+
+
+STAGE = CS2_BINS + TIE_RANK  # staged output row (K words) + the ranked ties
+
+
+def _quad_code(ties: bool, write: bool) -> str:
+    """PTX over one lane quad of candidate slot $1 (counts $2-$5, words $6-$9) of a
+    positive-threshold row (t = $10, the BF16 bits of the k-th value). Takes are
+    the valid words above t (ties=True) or at or above t (ties=False); with
+    ties=True the valid words at t are ties. count: $0 = $11 + takes + ties << 16.
+    write: the key index of each take is stored at shared $12 and $12 advances one
+    word ($0 returns it), each tie likewise at $13 ($1); pb = $14. No branches."""
+    cmp = "gt" if ties else "ge"
+    code = "{ .reg .pred v, g, e; .reg .b32 x, q; "
+    if write:
+        code += "mov.b32 $0, $13; mov.b32 $1, $14; "
+    else:
+        code += "mov.b32 $0, $11; "
+    for k in range(4):
+        code += (f"setp.lt.u32 v, $1X, ${2 + k}X; and.b32 x, ${6 + k}X, 0xFFFF; "
+                 f"setp.{cmp}.and.u32 g, x, $10X, v; ")
+        if ties:
+            code += "setp.eq.and.u32 e, x, $10X, v; "
+        if write:
+            code += (f"shr.u32 q, ${6 + k}X, 9; and.b32 q, q, 0xFFFFFF80; "
+                     f"add.u32 q, q, $14X; add.u32 q, q, {4 * k}; "
+                     "@g st.shared.b32 [$0], q; @g add.u32 $0, $0, 4; ")
+            if ties:
+                code += "@e st.shared.b32 [$1], q; @e add.u32 $1, $1, 4; "
+        else:
+            code += "@g add.u32 $0, $0, 1; "
+            if ties:
+                code += "@e add.u32 $0, $0, 0x10000; "
+    code += "}"
+    # inputs are numbered after the outputs
+    shift = 2 if write else 1
+    out = []
+    i = 0
+    while i < len(code):
+        if code[i] == "$" and code[i + 1].isdigit():
+            j = i + 1
+            while j < len(code) and code[j].isdigit():
+                j += 1
+            num = int(code[i + 1:j])
+            if j < len(code) and code[j] == "X":
+                out.append(f"${num - 1 + shift}")
+                i = j + 1
+                continue
+            out.append(code[i:j])
+            i = j
+            continue
+        out.append(code[i])
+        i += 1
+    return "".join(out)
+
+
+@asm(Uint32)
+def count4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
+    """n + this lane quad's takes + (ties << 16) (ties = ties not all taken)."""
+    return _quad_code(True, False), "=r," + ",".join(["r"] * 11), (
+        Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n))
+
+
+@asm(Uint32)
+def count4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n):
+    """n + this lane quad's takes when every tie is taken."""
+    return _quad_code(False, False), "=r," + ",".join(["r"] * 11), (
+        Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n))
+
+
+@asm()
+def write4(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, pb):
+    """Stage this lane quad's takes at tk and ties at te; returns both advanced."""
+    return _quad_code(True, True), "=r,=r," + ",".join(["r"] * 14) + ",~{memory}", (
+        Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n),
+        Int32(tk), Int32(te), Uint32(pb)), (Int32, Int32)
+
+
+@asm()
+def write4_all(s, c0, c1, c2, c3, w0, w1, w2, w3, t, n, tk, te, pb):
+    """Stage this lane quad's takes (every tie taken) at tk; returns tk advanced."""
+    return _quad_code(False, True), "=r,=r," + ",".join(["r"] * 14) + ",~{memory}", (
+        Uint32(s), Uint32(c0), Uint32(c1), Uint32(c2), Uint32(c3),
+        Uint32(w0), Uint32(w1), Uint32(w2), Uint32(w3), Uint32(t), Uint32(n),
+        Int32(tk), Int32(te), Uint32(pb)), (Int32, Int32)
+
+
+@asm()
+def st_global_v4(address, a, b, c, d):
+    code = "st.global.v4.b32 [$0], {$1, $2, $3, $4};"
+    return code, "l,r,r,r,r,~{memory}", (Int64(address), Uint32(a), Uint32(b),
+                                          Uint32(c), Uint32(d))
+
+
 class CandSelect2:
     """Exact top-k of each row from its PUBLISH candidates, persistent and
     double-buffered: a CTA walks rows bid, bid + G, ...; while it selects row r,
@@ -1590,7 +1708,9 @@ class CandSelect2:
     indices are emitted, found by a histogram of their tiles. Rows with fewer
     candidates than min(k, row length), an overflowed lane or more than CS2_BINS
     ties are flagged in row_bin[3 r + 1] (recomputed by the caller). Output order
-    is unspecified."""
+    is unspecified. Rows with a positive threshold (every candidate a positive
+    BF16, ordered by its bits) take branch-free histogram and emission passes
+    (hist4_pos, emit4_pos); up to TIE_RANK ties are ranked directly."""
 
     def __init__(self, topk: int, ctas: int, skeleton: bool = False):
         self.topk = topk
@@ -1718,7 +1838,7 @@ class CandSelect2:
         smem = utils.SmemAllocator()
         buf = smem.allocate_tensor(Uint32, cute.make_layout(2 * CAP), 128)
         buf_a = buf.iterator.toint()
-        hist = smem.allocate_tensor(Uint32, cute.make_layout(CS2_BINS), 16)
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(STAGE), 16)
         hist_a = hist.iterator.toint()  # the threshold ties alias it after the scan
         cnts = smem.allocate_tensor(Uint32, cute.make_layout(2 * TILE), 16)
         cnt_a = cnts.iterator.toint()
@@ -1753,11 +1873,26 @@ class CandSelect2:
                          Int32(mc) * (TILE * 4))
         if tid < TILE and bid + G < n_rows:
             nxt = Uint32(cand[Int64(bid + G) * REGION + tid])
+        # row length and PUBLISH threshold, one row ahead (their loads stay off
+        # the row's critical path)
+        n_nx = Int32(0)
+        thr_nx = Uint32(0)
+        if bid < n_rows:
+            n_nx = row_len[bid]
+            thr_nx = Uint32(row_bin[3 * bid])
+        lt_mask = lanemask_lt()
+        pb0 = Uint32(16 * (lane % 8) + lane // 8)
+        out_base = Int64(out.iterator.toint())
         n_it = (n_rows - bid + G - 1) // G
         for it in cutlass.range(n_it, unroll=1):
             row = bid + it * G
             b = it % 2
             nb = 1 - b
+            n = n_nx
+            thr_row = thr_nx & Uint32(0xFFFF)
+            if row + G < n_rows:
+                n_nx = row_len[row + G]
+                thr_nx = Uint32(row_bin[3 * (row + G)])
             # next row: counts -> shared, then its bulk copy into the other buffer
             if tid < TILE:
                 self.stage_counts(nxt, nb, cnt_a, part_a, tid, w, lane)
@@ -1794,7 +1929,6 @@ class CandSelect2:
             rb_a = buf_a + b * (CAP * 4)
             orow = Int64(row) * K
             cute.arch.mbarrier_wait(bar + b, (it // 2) % 2)
-            n = row_len[row]
             kk = cutlass.min(n, Int32(K))
             bad = Int32(0)
             if ovf != Uint32(0) or Int32(total) < kk:
@@ -1821,17 +1955,28 @@ class CandSelect2:
                         for i in cutlass.range(Int32(total) + tid, K, CS_THREADS, unroll=1):
                             out[orow + Int64(i)] = Int32(-1)
                     else:
-                        thr = Uint32(row_bin[3 * row]) & Uint32(0xFFFF)
+                        thr = thr_row
                         k0 = key16_of_word(thr)
                         shift = Uint32(0)
                         general = Uint32(0)
                         bb = Uint32(0)
                         above = Uint32(0)
                         m = Uint32(0)
+                        # a positive finite threshold: every candidate is a positive
+                        # BF16 at or above it, ordered by its raw bits
+                        fast = Uint32(0)
+                        if thr != Uint32(0) and thr < Uint32(0x7F80):
+                            fast = Uint32(1)
                         if thr == Uint32(0xFF80):
                             general = Uint32(1)
                         else:
-                            self.hist(rb_a, hist_a, cnt4, q, w, mc, k0, shift, Uint32(0), Uint32(0))
+                            if fast != Uint32(0):
+                                for s in cutlass.range(w, mc, WARPS, unroll=2):
+                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    hist4_pos(hist_a, s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                              wd[0], wd[1], wd[2], wd[3], thr)
+                            else:
+                                self.hist(rb_a, hist_a, cnt4, q, w, mc, k0, shift, Uint32(0), Uint32(0))
                             cute.arch.sync_threads()
                             bb, above, m = self.scan(hist_a, scr_a, Uint32(K), tid, w, lane)
                             if bb == Uint32(CS2_BINS - 1):
@@ -1873,27 +2018,114 @@ class CandSelect2:
                         all_ties = Uint32(0)
                         if m == need:
                             all_ties = Uint32(1)
-                        for s in cutlass.range(w, mc, WARPS, unroll=1):
-                            fl = []
-                            ps = []
-                            for valid, pos, key in self.quad(rb_a, cnt4, q, s):
-                                take = Uint32(0)
-                                if valid != Uint32(0):
-                                    if key > t:
-                                        take = Uint32(1)
-                                    elif key == t:
-                                        if all_ties != Uint32(0):
+                        staged = Uint32(0)
+                        if fast != Uint32(0) and general == Uint32(0):
+                            if all_ties != Uint32(0) or m <= Uint32(TIE_RANK):
+                                staged = Uint32(1)
+                        if staged != Uint32(0):
+                            # t - k0 = bb: the k-th value's BF16 bits are thr + bb.
+                            # Counts, a block scan, then every thread stages its
+                            # takes (and ties) contiguously in shared memory; the
+                            # ranked ties fill the row's tail; one coalesced copy out
+                            t16 = thr + bb
+                            cnt = Uint32(0)
+                            if all_ties != Uint32(0):
+                                for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    cnt = count4_all(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                                     wd[0], wd[1], wd[2], wd[3], t16, cnt)
+                            else:
+                                for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    cnt = count4(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                                 wd[0], wd[1], wd[2], wd[3], t16, cnt)
+                            incl = warp_inclusive(cnt, lane)
+                            if lane == 31:
+                                st_shared_u32(scr_a + w * 4, incl)
+                            cute.arch.sync_threads()
+                            pre = incl - cnt
+                            tot = Uint32(0)
+                            for k in cutlass.range_constexpr(WARPS):
+                                wt = ld_shared_u32(scr_a + k * 4)
+                                tot += wt
+                                if k < w:
+                                    pre += wt
+                            n_take = tot & Uint32(0xFFFF)
+                            tie_a = hist_a + ((n_take + Uint32(3)) & Uint32(0xFFFFFFFC)) * 4
+                            tk = Int32(hist_a + (pre & Uint32(0xFFFF)) * 4)
+                            te = Int32(tie_a + (pre >> Uint32(16)) * 4)
+                            if all_ties != Uint32(0):
+                                for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    tk, te = write4_all(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                                        wd[0], wd[1], wd[2], wd[3], t16,
+                                                        Uint32(0), tk, te, pb0)
+                            else:
+                                for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                    wd = lds_v4(rb_a + (s * TILE + 4 * q) * 4)
+                                    tk, te = write4(s, cnt4[0], cnt4[1], cnt4[2], cnt4[3],
+                                                    wd[0], wd[1], wd[2], wd[3], t16,
+                                                    Uint32(0), tk, te, pb0)
+                            cute.arch.sync_threads()
+                            if all_ties == Uint32(0):
+                                # the need lowest key indices of the m ties: tie of
+                                # rank r (ties of smaller key index) -> slot above + r
+                                p = Uint32(0)
+                                rank = Uint32(K)
+                                if tid < Int32(m):
+                                    p = ld_shared_u32(tie_a + tid * 4)
+                                    rank = Uint32(0)
+                                    for x in cutlass.range(0, Int32(m), 4, unroll=2):
+                                        v4 = lds_v4(tie_a + x * 4)
+                                        for k in cutlass.range_constexpr(4):
+                                            if x + k < Int32(m) and v4[k] < p:
+                                                rank += Uint32(1)
+                                cute.arch.sync_threads()
+                                if rank < need:
+                                    st_shared_u32(hist_a + (above + rank) * 4, p)
+                                cute.arch.sync_threads()
+                            orow_a = out_base + orow * 4
+                            for i in cutlass.range(tid * 4, K, CS_THREADS * 4, unroll=1):
+                                v4 = lds_v4(hist_a + i * 4)
+                                st_global_v4(orow_a + i * 4, v4[0], v4[1], v4[2], v4[3])
+                        else:
+                            for s in cutlass.range(w, mc, WARPS, unroll=1):
+                                fl = []
+                                ps = []
+                                for valid, pos, key in self.quad(rb_a, cnt4, q, s):
+                                    take = Uint32(0)
+                                    if valid != Uint32(0):
+                                        if key > t:
                                             take = Uint32(1)
-                                        else:
-                                            jt = atom_add_shared(scr_a + 52, Uint32(1))
-                                            if jt < Uint32(CS2_BINS):
-                                                st_shared_u32(hist_a + jt * 4, Uint32(pos))
-                                fl.append(take)
-                                ps.append(pos)
-                            self.emit4(fl, ps, scr_a + 48, out, orow, lane)
+                                        elif key == t:
+                                            if all_ties != Uint32(0):
+                                                take = Uint32(1)
+                                            else:
+                                                jt = atom_add_shared(scr_a + 52, Uint32(1))
+                                                if jt < Uint32(CS2_BINS):
+                                                    st_shared_u32(hist_a + jt * 4, Uint32(pos))
+                                    fl.append(take)
+                                    ps.append(pos)
+                                self.emit4(fl, ps, scr_a + 48, out, orow, lane)
                         cute.arch.sync_threads()
                         n_tiles = (n + TILE - 1) // TILE
-                        if all_ties == Uint32(0) and (m > Uint32(CS2_BINS) or n_tiles > Int32(CS2_BINS)):
+                        if staged != Uint32(0):
+                            pass
+                        elif all_ties == Uint32(0) and m <= Uint32(TIE_RANK):
+                            # the need lowest key indices of the m ties: rank each
+                            # tie by the ties of smaller key index
+                            for jt in cutlass.range(tid, Int32(m), CS_THREADS, unroll=1):
+                                p = ld_shared_u32(hist_a + jt * 4)
+                                rank = Uint32(0)
+                                for x in cutlass.range(0, Int32(m), 4, unroll=2):
+                                    v4 = lds_v4(hist_a + x * 4)
+                                    for k in cutlass.range_constexpr(4):
+                                        if x + k < Int32(m) and v4[k] < p:
+                                            rank += Uint32(1)
+                                if rank < need:
+                                    o = atom_add_shared(scr_a + 48, Uint32(1))
+                                    out[orow + Int64(o)] = Int32(p)
+                        elif all_ties == Uint32(0) and (m > Uint32(CS2_BINS) or n_tiles > Int32(CS2_BINS)):
                             if tid == 0:
                                 row_bin[3 * row + 1] = Int32(1)
                         elif all_ties == Uint32(0):
