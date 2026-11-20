@@ -261,7 +261,7 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
     work_tile_type = SwapAbFc12WorkTileInfo
     # Loop-carried device state; every other attribute is a host constant copied on rebuild. ``_lead_k_per_owner``
     # (the lead layout's K per owner, set by compute_stream_token_blocks) is () without a lead: no MLIR value.
-    _device_fields = ("_work_id_worker", "_mapping", "_source", "_lead_k_per_owner", "_die", "_shared_gate")
+    _device_fields = ("_work_id_worker", "_mapping", "_source", "_lead_k_per_owner")
     # shared_l2_position 'ready': the kernel binds the shared FC1-done gate (assign_device_members shared_fc2_gate).
     shared_fc2_ready_gate = True
 
@@ -351,8 +351,9 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         self._mapping = None
         self._source = None
         self._lead_k_per_owner = ()
-        self._die = None  # this CTA's die (die-aware forms; 0 die-blind): the shared claims' home die
-        self._shared_gate = None  # 'ready': (shared FC1-done counter of the last token block, its done count)
+        # 'ready': (shared FC1-done counter of the last token block, its done count). Kernel-scope values bound once
+        # in assign_device_members and never reassigned: copied on rebuild like a host constant, not loop-carried.
+        self._shared_gate = None
 
     def _validate(self, fallback_cluster_shape_mn) -> None:
         """The policy's rules live here only; the kernel builds this scheduler in its constructor."""
@@ -474,8 +475,6 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
             sizes_load_sorted=True,  # the GenPhase communication grid ranks slots by descending load
         )
         self._source = Int32(0)
-        # The routed steal pass flips the mapping's owner; the shared claims keep the CTA's own die.
-        self._die = Int32(owner_index)
         if cutlass.const_expr(shared_fc2_gate is not None):
             pointer, threshold = shared_fc2_gate
             # FC1 tiles are claimed token block by token block, so the last token block's counter completes last.
@@ -527,7 +526,9 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         if cutlass.const_expr(self.die_count == 1):
             return SharedExpertStreamMixin._claim_shared_tile(self, work_id_worker, stage, next_id, fc2)
         work_tile = make_fc12_done_tile(True)
-        own = self._die
+        # The mapping's owner is this CTA's die until the routed steal pass flips it (only leftover shared FC2 tiles
+        # are claimed after that, under 'ready' / 'tail': they start from the other die's half, then steal back).
+        own = Int32(self._mapping.owner_index)
         if cutlass.const_expr(fc2 == 1):
             shared_id, work_id_worker = self._claim_die_half(work_id_worker, own, 1)
             if shared_id < Int32(0):
