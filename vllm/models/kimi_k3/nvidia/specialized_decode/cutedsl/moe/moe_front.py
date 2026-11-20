@@ -179,15 +179,23 @@ __device__ __forceinline__ unsigned long long globaltimer() {
     if (p.stamps) p.stamps[blockIdx.x * kStampStride + (i)] = globaltimer(); \
   } while (0)
 
-// Sum of the tile's ks partials at float offset `off` of a [n][128] partial (rank order).
+// Sum of the tile's ks (<= kMaxKs) partials at float offset `off` of a [n][128]
+// partial, in rank order: every load is issued before the first add.
+constexpr int kMaxKs = 8;
 __device__ __forceinline__ float4 tile_sum(const float* pt, int64_t stride, int ks, int64_t off) {
-  float4 acc = __ldcg(reinterpret_cast<const float4*>(pt + off));
-  for (int q = 1; q < ks; ++q) {
-    const float4 v = __ldcg(reinterpret_cast<const float4*>(pt + q * stride + off));
-    acc.x += v.x;
-    acc.y += v.y;
-    acc.z += v.z;
-    acc.w += v.w;
+  float4 v[kMaxKs];
+#pragma unroll
+  for (int q = 0; q < kMaxKs; ++q)
+    if (q < ks) v[q] = __ldcg(reinterpret_cast<const float4*>(pt + q * stride + off));
+  float4 acc = v[0];
+#pragma unroll
+  for (int q = 1; q < kMaxKs; ++q) {
+    if (q < ks) {
+      acc.x += v[q].x;
+      acc.y += v[q].y;
+      acc.z += v[q].z;
+      acc.w += v[q].w;
+    }
   }
   return acc;
 }
@@ -527,7 +535,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   const Plan pl = plan_for((int)n, (int)kb, (int)ks, (int)ns);
   int dev = h.get_device(), sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-  TORCH_CHECK(ks >= 1 && ks <= kb && grid >= n && grid <= sms && pl.nr_max <= kMaxR &&
+  TORCH_CHECK(ks >= 1 && ks <= kMaxKs && ks <= kb && grid >= n && grid <= sms && pl.nr_max <= kMaxR &&
                   pl.ns >= 2 && pl.ns <= kMaxNS,
               "moe_front: launch configuration (ks ", ks, ", grid ", grid, " of ", sms,
               " SMs, ring ", pl.ns, ", smem blocks ", pl.nr_max, ")");
