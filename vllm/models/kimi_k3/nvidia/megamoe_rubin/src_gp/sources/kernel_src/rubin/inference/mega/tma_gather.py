@@ -24,6 +24,7 @@ def sm107_tma_gather4_load(
     *,
     use_cta_group_2: bool = False,
     mcast_mask=None,
+    cache_policy=None,
     loc=None,
     ip=None,
 ):
@@ -51,7 +52,7 @@ def sm107_tma_gather4_load(
     r1_i32 = cutlass.Int32(r1).ir_value(loc=loc, ip=ip)
     r2_i32 = cutlass.Int32(r2).ir_value(loc=loc, ip=ip)
     r3_i32 = cutlass.Int32(r3).ir_value(loc=loc, ip=ip)
-    cache_hint_i64 = cutlass.Int64(0).ir_value(loc=loc, ip=ip)
+    cache_hint_i64 = cutlass.Int64(0 if cache_policy is None else cache_policy).ir_value(loc=loc, ip=ip)
 
     use_mcast = mcast_mask is not None
     if use_mcast:

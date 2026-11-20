@@ -49,7 +49,8 @@ KDA_PITCH = 4 * HEADS * 128 + 128 + HEADS + 8  # [q | k | v | g | f_a | beta | p
 KINDS = ("kda", "kda", "dsa", "kda", "dsa", "kda", "kda")
 SPECIALIZED = {"ag", "dsa_in", "dsa", "kda_in", "kda", "oproj_rs", "moe_dense"}
 SPECIALIZED |= {"sp_boundary", "final_gather"}  # fused AttnRes + SP AG / RS, final AG
-DECLARED = {"embed", "attn_res", "moe", "dense", "lm_head"}
+SPECIALIZED |= {"dense"}  # the layer-0 dense MLP (SpDenseMlp) at <= 128 shard rows
+DECLARED = {"embed", "attn_res", "moe", "lm_head"}
 DECLARED |= {"sampler", "drafter", "verify"}
 
 
@@ -196,6 +197,17 @@ class Fakes:
             def choices(self, n):
                 return {f: p.choice(n) for f, p in self.providers.items()}
 
+        class Dense(Provider):
+            family = "dense"
+
+            def __init__(self, mlp, rows, device, index):
+                assert index == 0 and not mlp.use_mega_moe, index
+                assert tuple(rows) == tuple(range(1, 129)), rows  # n = R / 4
+                super().__init__(rows, fakes.gaps.get("dense", ()))
+
+            def serves(self, n):
+                return n in self.rows
+
         def tactics(family, n, k, rows, ctx):
             assert ctx.sequence_parallel and ctx.tp == TP, ctx
             return dict.fromkeys(rows, ("cublas", None))
@@ -226,6 +238,7 @@ class Fakes:
             SpKdaCore=KdaCore,
             SpOproj=Oproj,
             SpMlp=Mlp,
+            SpDenseMlp=Dense,
             sp_projection_tactics=tactics,
             sp_dsa_box=box,
             sp_dsa_scratch=scratch,

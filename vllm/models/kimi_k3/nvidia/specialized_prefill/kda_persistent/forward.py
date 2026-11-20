@@ -26,6 +26,8 @@ LOG2E = 1.4426950408889634
 
 # Device compilation controls and caches.
 _TPROBE = 0
+# Dev A/B constexpr overrides (benchmarks only; empty in production).
+_DEV: dict = {}
 _COMPILED: dict = {}
 _DUMMY_EXP: dict = {}
 _DUMMY_MID: dict = {}
@@ -68,8 +70,10 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    state_rows: bool = False,
 ):
     key = (
+        state_rows,
         dev.index,
         torch.cuda.get_device_capability(dev),
         H,
@@ -95,6 +99,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        tuple(sorted(_DEV.items())),
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -133,6 +138,7 @@ def _get_compiled(
         sptn = torch.full((G,), T // 2, dtype=torch.int32, device=dev)
         ssrc = torch.full((G,), -1, dtype=torch.int32, device=dev)
         sdst = torch.full((G,), -1, dtype=torch.int32, device=dev)
+        srow_d = torch.zeros(2 * G, dtype=torch.int64, device=dev)
         mid = torch.empty(
             2, D, D, dtype=torch.bfloat16 if mid_bf16 else torch.float32, device=dev
         )
@@ -145,6 +151,34 @@ def _get_compiled(
         stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
 
         def compile_kernel():
+            kw = dict(
+                H_=H,
+                stream=stream,
+                TPROBE_=_TPROBE,
+                GATE2_=gate2,
+                FINAL_=1 if store_final_state else 0,
+                SPLIT_=1 if has_split and not approximate_split else 0,
+                WARM_SPLIT_=1 if approximate_split else 0,
+                EXPORT_=1 if do_export else 0,
+                STATE_=1 if have_state else 0,
+                BETA_TMA_=1 if beta_tma else 0,
+                BF16_DV_=1 if bf16_dv else 0,
+                BETA_BF16_=1 if beta_bf16 else 0,
+                QK_ROWPAIR_=int(qk_rowpair),
+                RCP_DECOR_=1 if rcp_decor else 0,
+                RF_HOIST_=1 if rf_hoist else 0,
+                RESTORE_TAIL_=1 if restore_tail else 0,
+                GRAM_W9_=int(gram_w9),
+                REG_MODE_=int(reg_mode),
+                FULL_CHUNKS_=1 if full_chunks else 0,
+                LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
+                CLUSTER_=int(cluster_size),
+                SROW_=1 if state_rows else 0,
+                PREP_PEEL_=1 if prep_peel else 0,
+                PARTIAL_TMA_=1 if partial_tma else 0,
+                GATE_ROLL_=1 if gate_roll else 0,
+            )
+            kw.update(_DEV)
             return cute.compile(
                 _k._launch_pkd,
                 qkv_fake(),
@@ -156,6 +190,7 @@ def _get_compiled(
                 from_dlpack(dtb, assumed_align=16),
                 mk(st),
                 mk(ns),
+                mk(srow_d, 8),
                 mk(out),
                 mk(cu_t, 4),
                 mk(soff, 4),
@@ -178,30 +213,7 @@ def _get_compiled(
                 cutlass.Int32(1),
                 cutlass.Float32(1.0),
                 cutlass.Float32(-1.0),
-                H_=H,
-                stream=stream,
-                TPROBE_=_TPROBE,
-                GATE2_=gate2,
-                FINAL_=1 if store_final_state else 0,
-                SPLIT_=1 if has_split and not approximate_split else 0,
-                WARM_SPLIT_=1 if approximate_split else 0,
-                EXPORT_=1 if do_export else 0,
-                STATE_=1 if have_state else 0,
-                BETA_TMA_=1 if beta_tma else 0,
-                BF16_DV_=1 if bf16_dv else 0,
-                BETA_BF16_=1 if beta_bf16 else 0,
-                QK_ROWPAIR_=int(qk_rowpair),
-                RCP_DECOR_=1 if rcp_decor else 0,
-                RF_HOIST_=1 if rf_hoist else 0,
-                RESTORE_TAIL_=1 if restore_tail else 0,
-                GRAM_W9_=int(gram_w9),
-                REG_MODE_=int(reg_mode),
-                FULL_CHUNKS_=1 if full_chunks else 0,
-                LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
-                CLUSTER_=int(cluster_size),
-                PREP_PEEL_=1 if prep_peel else 0,
-                PARTIAL_TMA_=1 if partial_tma else 0,
-                GATE_ROLL_=1 if gate_roll else 0,
+                **kw,
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
@@ -240,7 +252,46 @@ def _dummy_mid(dev: torch.device):
     return tensors
 
 
+_DUMMY_SROW: dict = {}
+
+
+def _dummy_srow(dev: torch.device):
+    tensor = _DUMMY_SROW.get(dev.index)
+    if tensor is None:
+        tensor = torch.zeros(2, dtype=torch.int64, device=dev)
+        _DUMMY_SROW[dev.index] = tensor
+    return tensor
+
+
+def state_cache_rows(cache, indices, has_initial_state, H: int):
+    """In-place state I/O on the recurrent-state cache ``cache`` [slots, H, D, D]
+    (FP32; each (D, D) block dense, any slot stride, e.g. the hybrid cache's
+    shared per-slot page).
+
+    Returns ``(rows, srow)``: ``rows`` is a (1, D, D) view at the cache storage
+    base and ``srow`` the int64 [2 * N * H] chain -> element offset table (load
+    offset, or -1 for a zero initial state; then store offset) for
+    ``fwd(..., srow=srow)``. Same result as gather_initial_states + fwd +
+    write_state_rows.
+    """
+    assert cache.dtype == torch.float32 and cache.shape[1:] == (H, D, D)
+    assert cache.stride()[1:] == (D * D, D, 1)
+    assert cache.stride(0) % 8 == 0, "state slots must be 32-byte aligned"
+    rows = cache.as_strided((1, D, D), (D * D, D, 1))
+    n = indices.numel()
+    base = indices.to(torch.int64).view(n, 1) * cache.stride(0) + torch.arange(
+        H, dtype=torch.int64, device=cache.device
+    ) * (D * D)
+    load = torch.where(has_initial_state[:n].view(n, 1).bool(), base, -1)
+    srow = torch.cat((load.reshape(-1), base.reshape(-1)))
+    return rows, srow
+
+
 def _tprobe_buf(G: int, dev: torch.device):
+    if _DEV.get("TLINE_"):
+        tensor = torch.zeros(max(G * 64, 48 * 32), dtype=torch.int64, device=dev)
+        LAST_TPROBE[0] = tensor
+        return tensor
     if _TPROBE:
         tensor = torch.zeros(G * 64, dtype=torch.int64, device=dev)
         LAST_TPROBE[0] = tensor
@@ -288,6 +339,7 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    srow=None,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -310,6 +362,11 @@ def _launch_forward(
     if final_state is None:
         final_state = torch.empty(nseqs, H, D, D, dtype=torch.float32, device=dev)
     have_state = 1 if initial_state is not None else 0
+    if srow is not None:
+        # initial_state / final_state are the same flat (rows, D, D) view of
+        # the recurrent-state cache; srow maps chains to its rows.
+        assert initial_state is not None and final_state is not None
+        assert srow.numel() == 2 * nseqs * H and srow.dtype == torch.int64
     st = initial_state if initial_state is not None else final_state
     if st.dtype != torch.float32:
         st = st.float()
@@ -358,6 +415,7 @@ def _launch_forward(
         prep_peel=prep_peel,
         cluster_size=cluster_size,
         gate_roll=gate_roll,
+        state_rows=srow is not None,
         partial_tma=partial_tma,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
@@ -369,8 +427,11 @@ def _launch_forward(
         bf_,
         A_log,
         dt_bias.view(H, D),
-        st.view(nseqs * H, D, D),
-        final_state.view(nseqs * H, D, D),
+        st.view(-1, D, D) if srow is not None else st.view(nseqs * H, D, D),
+        final_state.view(-1, D, D)
+        if srow is not None
+        else final_state.view(nseqs * H, D, D),
+        srow if srow is not None else _dummy_srow(dev),
         of,
         cu_t,
         soff,
@@ -623,6 +684,7 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     plan=None,
+    srow=None,
 ):
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
@@ -642,13 +704,17 @@ def fwd(
     # Reset before every launch, including captured launches and graph replays.
     if has_split:
         mfl.zero_()
-    # The only route decision is a single sequence versus packed sequences.
-    # Single sequences use the fused-gate kernel with row-paired Q/K prep and a
-    # per-element partial tail; packed sequences roll the gate scan in
-    # eight-row batches and TMA-load partial chunks with row masks. Whether
-    # every chunk is full is a static property of the lengths, and a -5 lower
-    # bound folds into the gate. Measured on H32/64/96/128 fixed and varlen
-    # shapes; there are no per-head-count settings.
+    # Route: single sequence versus packed sequences.  Single sequences use the
+    # fused-gate kernel with row-paired Q/K prep and a per-element partial
+    # tail; packed sequences roll the gate scan in eight-row batches and
+    # TMA-load partial chunks with row masks.  Packed sequences that end in a
+    # partial chunk also run the GATE2 recurrence (wide V residual, two-half
+    # V_new handoff, FIN-gated epilogue image): bitwise identical, 2-3.5%
+    # faster at H96 (f16k, 3x5456, mixed, 2x8k with partial tails) but 9-19%
+    # slower when every chunk is full (4x4k, 2x8k), so all-full packed shapes
+    # keep the plain recurrence.  Whether every chunk is full is a static
+    # property of the lengths, and a -5 lower bound folds into the gate.
+    # There are no per-head-count settings.
     return _launch_forward(
         q,
         k,
@@ -664,7 +730,7 @@ def fwd(
         final_state=final_state,
         cu_seqlens=cu32,
         sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, 1),
-        gate2=1 if fixed else 0,
+        gate2=1 if (fixed or not full_chunks) else 0,
         has_split=has_split,
         beta_tma=True,
         qk_rowpair=4 if fixed else 8,
@@ -675,4 +741,5 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
+        srow=srow,
     )

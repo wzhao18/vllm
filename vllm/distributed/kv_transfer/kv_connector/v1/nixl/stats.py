@@ -43,6 +43,8 @@ class NixlKVConnectorStats(KVConnectorStats):
             "num_kv_expired_reqs": [],
             "num_notifications_after_expiry": [],
             "num_kv_lease_lost": [],
+            # Per request and rank: first transfer start to last transfer end.
+            "request_xfer_wall": [],
         }
 
     def record_transfer(self, res: "nixlXferTelemetry | None"):
@@ -53,6 +55,11 @@ class NixlKVConnectorStats(KVConnectorStats):
         self.data["post_duration"].append(res.postDuration / 1e6)
         self.data["bytes_transferred"].append(res.totalBytes)
         self.data["num_descriptors"].append(res.descCount)
+
+    def record_request_xfer_wall(self, seconds: float):
+        """Record one request's transfer time on this rank: first transfer
+        start to last transfer end, so concurrent transfers count once."""
+        self.data["request_xfer_wall"].append(seconds)
 
     def record_failed_transfer(self):
         """Record a failed NIXL transfer operation."""
@@ -150,6 +157,15 @@ class NixlKVConnectorStats(KVConnectorStats):
         total_time_seconds = xfer_time.sum()
         throughput_mb_s = total_mb / total_time_seconds
 
+        wall = self.data["request_xfer_wall"]
+        req_wall = (
+            {
+                "Avg request xfer time (ms)": round(float(np.mean(wall)) * 1e3, 3),
+                "Max request xfer time (ms)": round(float(np.max(wall)) * 1e3, 3),
+            }
+            if wall
+            else {}
+        )
         return {
             "Num successful transfers": n,
             "Avg xfer time (ms)": round(xfer_time.mean().item() * 1e3, 3),
@@ -159,6 +175,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             "Avg MB per transfer": round(avg_mb.item(), 3),
             "Throughput (MB/s)": round(throughput_mb_s.item(), 3),
             "Avg number of descriptors": round(descs.mean().item(), 1),
+            **req_wall,
             **failure_counts,
         }
 

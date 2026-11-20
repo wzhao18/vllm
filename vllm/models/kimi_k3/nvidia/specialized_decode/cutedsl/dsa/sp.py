@@ -91,13 +91,25 @@ SP_PARTIALS = PROJECTED
 SP_LOCAL_QUERY = "65-:local"
 # The sparse MLA kernel per row count ("rows:kernel" table; trtllm-gen elsewhere): the
 # Rubin keys-on-M kernel ("km", dsa.sparse_mla_km: softmax groups correct O^T and
-# write the latent, QK and PV from separate warps, all-TMA gathers) where it wins
-# standalone (VR200, 1 GPU, CUDA graphs, cold L2, 512 local keys per row, 4 rows per
-# request sharing 80% of their keys; runs/D-ATTN/sp kmhE): 128 rows 16.0 vs 20.6 us,
-# 384 rows 31.1 vs 34.0; trtllm-gen at 256 rows (29.2 vs 27.4). In-step (D3-32 slice,
-# 3 runs each, dattn-kmg/kmh) km wins at 384 rows (step -14 us) but not at 128 rows
-# (step +19 us although the DSA family drops 15 us), so km runs from 320 rows.
-SP_KERNELS = "320-:km"
+# write the latent, QK and PV from separate warps, all-TMA gathers; one row per
+# persistent CTA and SM, its LSE written directly) where it wins. VR200 (212 SMs),
+# 1 GPU, CUDA graphs, cold L2, 512 +- 40 local keys per row, 4 rows per request
+# sharing 80% of their keys (runs/D-ATTN-SK/r2xo2), km vs trtllm-gen us (trtllm-gen
+# also runs ComputeLSEFromMD, ~1.1 us):
+#   rows        64    96   128   160   192   212   224   256   320
+#   km        15.1  15.4  16.0  16.8  18.3  18.4  28.7  29.1  29.9
+#   trtllm    13.7  15.6  22.1  22.8  23.1  23.1  27.4  28.4  29.8
+# km is flat up to one row per SM; trtllm-gen steps at ~106 rows, km at 213 (two
+# rows on some CTAs). In-step (D3-32 slice, fastab dsk2-km65): 128 rows -29.5 us per
+# step, 256 rows +11.9; 384 rows: km since dattn-kmg/kmh (step -14 us).
+# The latent-Q-in-TMEM kernel ("ts", dsa.sparse_mla_ts: the prefill TS form with the
+# trtllm-gen arithmetic) from 64 rows: VR200 1 GPU, CUDA graphs, cold L2, us at 128 /
+# 256 / 384 rows: ts 16.0 / 28.8 / 30.1, trtllm-gen 21.5 / 28.2 / 34.9, km 16.0 / 29.2 /
+# 31.5 (runs/D-ATTN/r3 e8); in-step vs int21 (trtllm-gen at 128 / 256, km at 384 rows;
+# fastab dattn3-ts1/ts2, 3 build pairs) -43.3 / -25.6 / -39.2 us per step. Below 64
+# rows trtllm-gen splits each row's KV across CTAs (BF16 partials), which an unsplit
+# pass does not reproduce to the BF16 rounding of the output: those stay on trtllm-gen.
+SP_KERNELS = "64-:ts"
 SP_KV_DTYPES = ("fp8", "fp8_e4m3")  # per-tensor FP8 MLA KV
 
 

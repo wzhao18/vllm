@@ -16,7 +16,7 @@ import time
 
 import torch
 
-from pgemm_b3_bench import exact_operands, real_operands, scaled_mm, tname
+from pgemm_b3_bench import _die_rows, exact_operands, real_operands, scaled_mm, tname
 
 
 def main():
@@ -80,7 +80,7 @@ def main():
         )
         variants["cublas"] = lambda: scaled_mm(x, sx, w, sw)
     for t in args.fused:
-        g = ssg.SharedSituGemm(wi, swi, args.beta, args.lbeta, tactic=tac(t))
+        g = ssg.SharedSituGemm(_die_rows(wi, tac(t)), swi, args.beta, args.lbeta, tactic=tac(t))
         variants["fused_" + tname(tac(t))] = lambda g=g: g(x, sx, act)
     for fn in variants.values():
         fn()
