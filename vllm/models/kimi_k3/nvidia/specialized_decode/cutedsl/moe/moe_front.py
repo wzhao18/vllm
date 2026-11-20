@@ -303,10 +303,10 @@ struct MmaLoop {
 template <bool kStamp>
 __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool mma, int lane) {
   const int xg = p.xg, xs = p.xs;
-  // Batches of up to 4 weight blocks, all in TMEM or all in shared memory. A batch
-  // waits every token group it spans before its MMAs and releases them after, so it
-  // spans at most xs groups (a group's slot reuse never waits on its own batch).
-  const int bmax = max(1, min(4, (xs - 1) * xg + 1));
+  // Batches of one token group (<= 4 weight blocks), all in TMEM or all in shared
+  // memory: a batch's MMAs start as soon as its tokens land, and its token slot is
+  // released right after them.
+  const int bmax = max(1, min(4, xg));
   uint32_t a_tm = m.a_tm, xph = 0;
   uint64_t a_ss = m.a_ss, xb = m.x0 + p.xslot[0] * (kSlot >> 4);
   int jx = 0, gs = 0, g = 0;

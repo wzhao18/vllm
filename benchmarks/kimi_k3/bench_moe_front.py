@@ -258,9 +258,14 @@ def main():
                     rb = " ".join(str(int(sv[cta, 58 + i] - sv[cta, 27])) for i in range(6))
                     print(f"  late cta{cta} route clk after topk-go (entry sorted pass1 barrier pass2 end): {rb}",
                           flush=True)
-            c0 = int(sv[0, 32])
-            rd = [int(sv[0, 32 + j]) - c0 for j in range(24) if sv[0, 32 + j] != 0]
-            print("  cta0 clk per K block: " + " ".join(str(b - a) for a, b in zip(rd, rd[1:])), flush=True)
+            for cta in (last[0], int(torch.argmax(sv[:, 7]))):  # latest end, latest acc-done
+                if sv[cta, 32] == 0:
+                    continue
+                c0 = int(sv[cta, 32])
+                rd = [(j, int(sv[cta, 32 + j]) - c0, int(sv[cta, 8 + j]) - c0) for j in range(19)
+                      if sv[cta, 32 + j] != 0]
+                print(f"  cta{cta} clk per batch (block: ready/issued): "
+                      + " ".join(f"{j}:{r}/{i}" for j, r, i in rd), flush=True)
 
 
 if __name__ == "__main__":
