@@ -22,6 +22,7 @@ On 2 or 4 ranks (the deployment is TP4; the mailboxes are generic in TP):
   steps of other row counts.
 """
 
+import functools
 import time
 import zlib
 
@@ -368,7 +369,7 @@ def _mx_reference(step, world, rank, rows, device, projections):
     return _sanitized(total.bfloat16())
 
 
-def _pre_push_worker(env: dict[str, str]) -> None:
+def _pre_push_worker(env: dict[str, str], mode: str = "pre_push") -> None:
     update_environment_variables(env)
     local_rank = int(env["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
@@ -406,6 +407,9 @@ def _pre_push_worker(env: dict[str, str]) -> None:
                     tactics=dict.fromkeys(MX_ROWS, "pre"),
                 )  # fmt: skip
             )
+        if mode == "ks_push":
+            _ks_push_rows(sp, projections, comm, ctx, world, rank, device)
+            return
         oproj = sp.SpOproj(projections[rank], comm, MX_ROWS, ctx)
         tactics = {r: oproj.choice(r).tactic for r in MX_ROWS}
         assert all(t == ("pre_push", "pre") for t in tactics.values()), tactics
@@ -453,6 +457,41 @@ def _pre_push_worker(env: dict[str, str]) -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def _ks_push_rows(sp, projections, comm, ctx, world, rank, device):
+    """"ks_push" (the K-split GEMM pushing block by block, the test's own table): the
+    same products summed in K-slice order, so within the order bound of the pre GEMM."""
+    sp.SP_OPROJ_MX[world] = "1-512:ks_push"
+    ks = sp.SpOproj(projections[rank], comm, MX_ROWS, ctx)
+    assert all(ks.choice(r).tactic[0] == "ks_push" for r in MX_ROWS)
+    assert not any(ks.pushes(r) for r in MX_ROWS)
+    out = torch.empty((CAP // world, WIDTH), dtype=torch.bfloat16, device=device)
+    for step, rows in enumerate(MX_ROWS * 2):
+        n = rows // world
+        shard = ks.run(_mx(_inputs(step, rank, rows, device)), out[:n], step % 2)
+        torch.accelerator.synchronize(device)
+        _check_armed(comm, step % 2, rows)
+        stock = _mx_reference(step, world, rank, rows, device, projections)
+        same = (shard.view(torch.int16) == stock.view(torch.int16)).float().mean()
+        error = (shard.float() - stock.float()).abs().max().item()
+        scale = stock.float().abs().max().item()
+        assert same.item() > 0.98, ("ks_push bits", step, rows, same.item())
+        assert error <= world * scale * 2**-7, ("ks_push error", step, rows, error)
+    dist.barrier()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4 or not _has_multicast_support(),
+    reason="Need 4 GPUs with symmetric-memory multicast.",
+)
+def test_sp_oproj_rs_mxfp8_ks_push():
+    """SpOproj "ks_push" (OprojKsPush: K split 3, the weight slice resident, token
+    blocks reduce-scattered over the K slices and pushed block by block) on 4 ranks:
+    the owner shards within the K-order bound of the pre GEMM + RS push, >98% of the
+    bits equal, mailboxes re-armed (rows 64..384, both parities)."""
+    pytest.importorskip("cutlass")
+    _distributed_run(functools.partial(_pre_push_worker, mode="ks_push"), world_size=4)
 
 
 @pytest.mark.skipif(

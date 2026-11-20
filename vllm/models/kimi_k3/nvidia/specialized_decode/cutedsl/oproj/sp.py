@@ -52,7 +52,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Constexpr, Float32, Int32, Int64, Uint32
-from cutlass.cute.runtime import make_fake_stream
+from cutlass.cute.runtime import make_fake_stream, make_ptr
 
 from ...shapes import Choice, Context, Path, Shape, Unsupported, rows_policy
 from ..common.host import fake, stream, to_cute
@@ -91,6 +91,42 @@ SP_OPROJ_MX = {4: "17-384:pre_push"}
 def mx_tactic(tp: int, shape: Shape) -> str:
     """The online-MXFP8 o-projection tactic at ``shape`` (``SP_OPROJ_MX``)."""
     return rows_policy(SP_OPROJ_MX.get(tp, ""), shape, default="mxfp8")
+
+
+@cache
+def compile_ks_push(blocks, k, tp, cap, device):
+    """One ``OprojKsPush`` per 128-row token-block count (R is a runtime argument)."""
+    from .ks_push import MAX_BLOCKS, OprojKsPush, counter_words, scratch_floats
+
+    kernel = OprojKsPush(k, blocks, tp, cap)
+    g, f8, e8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+    with torch.accelerator.device_index(device):
+        ptrs = tuple(make_ptr(t, 16, g, assumed_align=16) for t in (f8, e8, f8, e8))
+        args = (
+            *ptrs, fake((tp,), None, torch.int64), fake((scratch_floats(),), None, torch.float32),
+            fake((counter_words(),), None, torch.int32), fake((MAX_BLOCKS,), None, torch.int32),
+            Int32(0), Int32(blocks * 128),
+        )  # fmt: skip
+        return cute.compile(kernel, *args, make_fake_stream())
+
+
+_KS_SCRATCH: dict = {}
+
+
+def ks_scratch(device):
+    """The ``OprojKsPush`` reduce-scatter scratch and counters of a device (FP32 and
+    int32, shared by every layer: the o-projections run one after another; the
+    counters start at 0 and each reader re-zeroes its own)."""
+    from .ks_push import counter_words, scratch_floats
+
+    device = torch.device(device)
+    found = _KS_SCRATCH.get(device)
+    if found is None:
+        found = _KS_SCRATCH[device] = (
+            torch.empty(scratch_floats(), dtype=torch.float32, device=device),
+            torch.zeros(counter_words(), dtype=torch.int32, device=device),
+        )
+    return found
 
 
 @asm((Float32,) * 4)
@@ -326,6 +362,8 @@ class SpOproj:
             tactic = mx_tactic(ctx.tp, Shape(r, ctx.q))
             if tactic == "pre_push":
                 self.codes[r] = self._pre_push(projection, r)
+            elif tactic == "ks_push":
+                self.codes[r] = self._ks_push(projection, r)
             elif tactic != "mxfp8":
                 raise Unsupported("oproj_rs", Shape(r, ctx.q), f"MXFP8 tactic {tactic!r}")
             comm.reduce_scatter_code(r, push=tactic == "mxfp8")
@@ -367,6 +405,49 @@ class SpOproj:
         partial = self.comm.partial[: attn_out.rows]
         gemm(attn_out.data, attn_out.scale, weight.weight, weight.scale, partial, args[parity])
 
+    def _ks_push(self, projection, rows):
+        """(``OprojKsPush`` compiled for ``rows``' token blocks, its cute scratch /
+        counters / block-order arguments) at ``rows``."""
+        from .ks_push import KS, KT, MAX_BLOCKS, TB, block_order
+
+        comm, shape = self.comm, Shape(rows, self.ctx.q)
+        if projection.k % (KS * KT) or rows > MAX_BLOCKS * TB or comm.width != WIDTH:
+            raise Unsupported(
+                "oproj_rs", shape, f"ks_push: K {projection.k} (multiple of {KS * KT}), "
+                f"R <= {MAX_BLOCKS * TB}",
+            )  # fmt: skip
+        device = projection.weight.device
+        blocks = -(-rows // TB)
+        code = compile_ks_push(
+            blocks, projection.k, comm.tp, comm.rows_cap // comm.tp, device.index
+        )
+        order = block_order(rows, rows // comm.tp, comm.rank)
+        order = torch.tensor(
+            order + [0] * (MAX_BLOCKS - len(order)), dtype=torch.int32, device=device
+        )
+        scratch, counters = ks_scratch(device)
+        self._keep = getattr(self, "_keep", []) + [order]
+        return code, (to_cute(scratch), to_cute(counters), to_cute(order))
+
+    def _push_ks(self, attn_out, parity):
+        """The "ks_push" GEMM: ``attn_out``'s partial rows into ``parity``'s owner
+        slots, block by block."""
+        code, views = self.codes[attn_out.rows]
+        g, f8, e8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+        weight = self.gemm
+        ptrs = tuple(
+            make_ptr(t, x.data_ptr(), g, assumed_align=16)
+            for t, x in (
+                (f8, weight.weight), (e8, weight.scale), (f8, attn_out.data),
+                (e8, attn_out.scale),
+            )
+        )  # fmt: skip
+        _, _, _, peers = self.comm.views(parity)
+        code(
+            *ptrs, peers, *views, Int32(self.comm.rank), Int32(attn_out.rows),
+            stream(weight.weight.device),
+        )  # fmt: skip
+
     def choice(self, rows: int) -> Choice:
         tactic = self.tactics.get(rows)
         if tactic is None:
@@ -378,6 +459,9 @@ class SpOproj:
         if tactic == "pre_push":
             note = "sp oproj MXFP8 pre GEMM pushing to the row owners (NQ-TUNE)"
             return Choice(Path.GENERIC, (tactic, "pre"), note=note)
+        if tactic == "ks_push":
+            note = "sp oproj OprojKsPush (K-split MXFP8 GEMM pushing block by block)"
+            return Choice(Path.GENERIC, (tactic, "ks3"), note=note + " (NQ-TUNE)")
         if tactic == "gemm":
             choice = self.gemm.choice(rows)
             kind = choice.tactic[0]
@@ -391,7 +475,7 @@ class SpOproj:
         """Whether the owner kernel must push this rank's partial at ``rows`` (the
         GEMM tactics stage it in ``comm.partial``; "warp" and "pre_push" push from the
         GEMM)."""
-        return self.tactics[rows] not in ("warp", "pre_push")
+        return self.tactics[rows] not in ("warp", "pre_push", "ks_push")
 
     def produce(self, attn_out: torch.Tensor, parity: int):
         """The o-projection half only, for an owner kernel that follows
@@ -413,6 +497,9 @@ class SpOproj:
         if tactic == "pre_push":
             self._push_pre(attn_out, parity)
             return None
+        if tactic == "ks_push":
+            self._push_ks(attn_out, parity)
+            return None
         _, _, recv, peers = comm.views(parity)
         self.codes[rows](
             to_cute(attn_out), self.wview, recv, peers, Int32(comm.rank),
@@ -427,7 +514,7 @@ class SpOproj:
         if not isinstance(attn_out, torch.Tensor):
             rows = attn_out.rows
             tactic = self.tactics.get(rows)
-            if tactic not in ("mxfp8", "pre_push") or attn_out.k != self.k:
+            if tactic not in ("mxfp8", "pre_push", "ks_push") or attn_out.k != self.k:
                 raise Unsupported(
                     "oproj_rs", rows, f"an MXFP8 [{rows}, {attn_out.k}] attn_out "
                     f"for tactic {tactic} (prepared: [R, {self.k}])",
@@ -463,6 +550,9 @@ class SpOproj:
             return comm.reduce_scatter(out_shard, parity, rows, partial)
         if tactic == "pre_push":
             self._push_pre(attn_out, parity)
+            return comm.reduce_scatter(out_shard, parity, rows)
+        if tactic == "ks_push":
+            self._push_ks(attn_out, parity)
             return comm.reduce_scatter(out_shard, parity, rows)
         _, _, recv, peers = comm.views(parity)
         self.codes[rows](

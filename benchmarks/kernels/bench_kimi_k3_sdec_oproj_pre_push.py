@@ -55,6 +55,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", default="128,256,384")
     ap.add_argument("--copies", type=int, default=8)
+    ap.add_argument("--ks", action="store_true", help="also OprojKsPush")
     args = ap.parse_args()
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import pre_tactic
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (
@@ -95,10 +96,57 @@ def main():
         t_push = graph_time(
             lambda i: push(x.data, x.scale, *copies[i % len(copies)], out, pargs)
         )
-        print(
+        line = (
             f"R{rows} tactic {tactic}: pushed words bitwise {same * 100:.3f}%  "
             f"pre {t_local:.2f} us  pre_push {t_push:.2f} us/call"
         )
+        if args.ks:
+            line += "  " + ks_push(rows, n, cap, x, copies, recv, peers, words)
+        print(line, flush=True)
+
+
+def ks_push(rows, n, cap, x, copies, recv, peers, words):
+    """OprojKsPush (K split 3, block by block) into the same local slots: bits vs the
+    pre GEMM's sanitized output and us/call."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from cutlass.cute.runtime import make_ptr
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import ks_push
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import sp
+
+    dev = x.data.device
+    blocks = -(-rows // ks_push.TB)
+    code = sp.compile_ks_push(blocks, K, TP, cap, dev.index)
+    scratch, counters = sp.ks_scratch(dev)
+    order = ks_push.block_order(rows, n, 0)
+    order = torch.tensor(order + [0] * (ks_push.MAX_BLOCKS - len(order)),
+                         dtype=torch.int32, device=dev)  # fmt: skip
+    views = (to_cute(peers), to_cute(scratch), to_cute(counters), to_cute(order))
+    g, f8, e8 = cute.AddressSpace.gmem, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+
+    def call(i):
+        w, ws = copies[i % len(copies)]
+        ptrs = tuple(
+            make_ptr(t, a.data_ptr(), g, assumed_align=16)
+            for t, a in ((f8, w), (e8, ws), (f8, x.data), (e8, x.scale))
+        )
+        code(*ptrs, *views, Int32(0), Int32(rows), stream(dev))
+
+    recv.view(torch.int32).fill_(SENTINEL)
+    call(0)
+    torch.cuda.synchronize()
+    got = recv.view(torch.int32).reshape(TP * cap, WIDTH // 2)[:rows]
+    bits = (got == words).float().mean().item()
+    ref = words.view(torch.bfloat16).float()
+    err = (got.view(torch.bfloat16).float() - ref).abs().max().item()
+    t = graph_time(call)
+    return f"ks_push {t:.2f} us/call (bits {bits * 100:.2f}%, max err {err:.3g})"
 
 
 if __name__ == "__main__":
