@@ -3321,7 +3321,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
 void topk_skel(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
                torch::Tensor out, torch::Tensor out_count, int64_t box, int64_t mc, torch::Tensor peers,
                int64_t W, int64_t rank, int64_t K, int64_t cap, torch::Tensor epoch, torch::Tensor err,
-               int64_t mode, int64_t threads) {
+               int64_t mode, int64_t threads, std::optional<torch::Tensor> dbg) {
   TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
   const int T = (int)logits.size(0);
   if (T == 0) return;
@@ -3346,6 +3346,7 @@ void topk_skel(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glob
   p.redo = p.epoch + cap;
   p.err = err.data_ptr<int>();
   p.spin_ns = g_spin_ns;
+  p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
   int nwide = 0;
   const int nres = (int)topk_v2_resident_of(&nwide);
   const bool wide = threads == 1024 || (threads == 0 && T <= nwide);

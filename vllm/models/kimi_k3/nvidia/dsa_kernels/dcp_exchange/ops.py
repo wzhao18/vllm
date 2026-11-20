@@ -395,12 +395,12 @@ class DcpExchange:
         )  # fmt: skip
 
     def topk_skel(self, logits, local_len, global_len, out, out_count, mode: int = 7,
-                  threads: int = 0) -> None:
+                  threads: int = 0, dbg=None) -> None:
         """Benchmark only: data-movement skeleton of topk_v2 (csrc/topk_skel.cuh)."""
         self.ext.topk_skel(
             logits, local_len, global_len, out, out_count, self.v2_box.data_ptr(), self.v2_mc,
             self.v2_peers, self.W, self.rank, self.K, self.cap, self.v2_epoch, self.err, mode,
-            threads,
+            threads, dbg,
         )  # fmt: skip
 
     def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:

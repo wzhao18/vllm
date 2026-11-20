@@ -34,6 +34,8 @@ PHASES = {
     12: "bitmap", 24: "offsets", 15: "enumerated", 11: "ties", 9: "s9", 10: "s10",
     14: "s14", 25: "s25", 26: "s26", 27: "s27", 28: "s28", 8: "row end",
 }
+PHASES_FX = {1: "landed", 2: "count1", 3: "sent1", 4: "polled1", 5: "b1", 6: "count2", 7: "polled2",
+             9: "tau", 10: "write"}
 PHASES_V2 = {24: "c:pass1", 25: "c:offsets", 26: "c:pass2", 0: "start", 9: "loads issued", 10: "sampled", 1: "theta",
              2: "cand", 12: "fine hist", 13: "e", 14: "window", 15: "band pick",
              16: "band ids", 3: "msg", 4: "polled", 19: "r:hdr", 20: "r:tau", 21: "r:groups",
@@ -190,7 +192,7 @@ def main():
                 if a.skew_us > 0 and rank == W - 1:
                     torch.cuda._sleep(int(a.skew_us * 2400))
                 if a.impl == "skel":
-                    ex.topk_skel(logits, L, G, out, cnt, a.skel_mode, a.skel_threads)
+                    ex.topk_skel(logits, L, G, out, cnt, a.skel_mode, a.skel_threads, dbg=dbg)
                     return
                 if a.impl == "v2":
                     ex.topk_v2(logits, L, G, out, cnt, block_table=bt,
@@ -226,7 +228,8 @@ def main():
             # path counters + phase stamps (eager, one call)
             stats = torch.zeros(8, dtype=torch.int32, device=dev)
             dbg = torch.zeros(T * 64, dtype=torch.int64, device=dev)
-            phmap = PHASES_V2 if a.impl == "v2" else PHASES
+            fxd = a.impl == "skel" and a.skel_mode >= 20
+            phmap = PHASES_V2 if a.impl == "v2" else (PHASES_FX if fxd else PHASES)
             dist.barrier()
             for _ in range(a.warm):
                 torch.matmul(wa, wa, out=wb)
@@ -249,7 +252,7 @@ def main():
             d = dbg.view(T, 64).cpu()
             t0 = int(d[:, 0][d[:, 0] > 0].min()) if (d[:, 0] > 0).any() else 0
             phases = {}
-            if a.impl == "v2":  # SM clock from (clock64, globaltimer) at row start / end
+            if a.impl == "v2" or fxd:  # SM clock from (clock64, globaltimer) at row start / end
                 c0, c1, t0n, t1n = d[:, 32].double(), d[:, 40].double(), d[:, 0].double(), d[:, 8].double()
                 okr = t1n > t0n
                 phases["ncand"] = (float(d[:, 31].double().median()), 0, 0)

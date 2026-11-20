@@ -100,13 +100,29 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
   V2_KERNEL_PROLOGUE(T)
   constexpr int kW = T / 32, kH = kW < 16 ? kW : 16;  // warp-private histograms (16 KB in hist)
   const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, hh = wid * kH / kW;
-  const bool agg = (mode % 10) == 1, full = mode >= 20;
+  const bool agg = (mode % 10) == 1, full = mode >= 20, lean = mode >= 30;
+  // phase stamps in topk_v2's dbg format (row start / end globaltimer at 0 / 8, clock64 at 32 + i)
+  auto stamp = [&](int row, int i) {
+    if (p.dbg && tid == 0) {
+      if (i == 0) {
+        for (int z = 1; z < 30; ++z) s_dbg[z] = 0;
+        p.dbg[(int64_t)row * kV2Dbg] = now_ns();
+      }
+      if (*reinterpret_cast<volatile int*>(&s_i[15]) == 0x7FFFFFF1) __trap();
+      s_dbg[i] = (long long)clock64();
+      if (i == 8) {
+        p.dbg[(int64_t)row * kV2Dbg + 8] = now_ns();
+        for (int z = 0; z < 30; ++z) p.dbg[(int64_t)row * kV2Dbg + 32 + z] = s_dbg[z];
+      }
+    }
+  };
   uint32_t* const wh = hist;                           // kH x 256
   uint32_t* const rx = cpos;                           // W x 256 received words (round 1, 2)
   int* const s = s_i;                                  // 0 b1, 1 a1, 2 tau, 3 need, 4 cnt
   (void)ckey; (void)warp_sums; (void)s_u; (void)s_pref; (void)s_dbg;
   if (p.W > 4 && tid == 0) spin_fail(p.err, 62);  // rx + counts in cpos: W <= 4
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
+    stamp(row, 0);
     const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
     const uintptr_t la = reinterpret_cast<uintptr_t>(lrow);
     const int head0 = (int)(((16u - (uint32_t)(la & 15u)) & 15u) >> 1);
@@ -128,7 +144,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
     const int sh = sh0;  // rows >= 8 keys (the benchmark's)
     const int ng = (L + sh + 7) >> 3, g_hi = (L + sh) >> 3;
     for (int b = tid; b < kH * 256; b += T) wh[b] = 0;
-    if (tid == 0) { s[0] = -1; s[1] = 0; s[2] = -1; s[3] = 0; s[4] = 0; }
+    if (tid == 0) { s[0] = -1; s[1] = 0; s[2] = -1; s[3] = 0; s[4] = 0; s[5] = 0; }
     mbar_wait(&s_bar, bar_phase);
     bar_phase ^= 1u;
     // partial head / tail groups: keys outside [0, L) read as NaN (key 0)
@@ -149,10 +165,18 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
       srow[g_hi] = make_uint4(w[0], w[1], w[2], w[3]);
     }
     __syncthreads();
+    stamp(row, 1);
     // one bin increment per valid key: plain SMEM atomics, or warp-aggregated (the leader
     // of the lanes holding the same bin adds their count)
     auto bump = [&](uint32_t bin, bool ok) {
       if (!agg) {
+        if (lean) {  // the whole warp on one bin (ties, one binade): one atomic
+          const uint32_t b0 = __shfl_sync(0xffffffffu, bin, 0);
+          if (__all_sync(0xffffffffu, ok && bin == b0)) {
+            if (lane == 0) atomicAdd(&wh[hh * 256 + b0], 32u);
+            return;
+          }
+        }
         if (ok) atomicAdd(&wh[hh * 256 + bin], 1u);
         return;
       }
@@ -167,16 +191,64 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
       }
     };
     const int ngr = (ng + T - 1) / T * T;  // whole warps in the loop (ballots)
-    for (int g = tid; g < ngr; g += T) {
-      const uint4 r = g < ng ? srow[g] : make_uint4(~0u, ~0u, ~0u, ~0u);
-      const Keys8 k8(r);
+    // rung 0' round-1 counts: tau >= every rank's local K-th key, so each rank's top-byte
+    // counts from its max bin down to the bin of its local K-th key decide tau's top byte
+    // exactly. The 4 bins below the row max are counted in registers (8-bit fields, no
+    // atomics); a row whose 4 top bins hold < K keys sends a wide flag and every rank then
+    // takes the full histogram round (round 1b).
+    int s_mb = 0, wide = 0;
+    if (lean) {
+      uint32_t mx = 0;
+      for (int g = tid; g < ng; g += T) {
+        const Keys8 k8(srow[g]);
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const uint32_t k = k8.key(j);
-        bump(k >> 8, k != 0u);
+        for (int w = 0; w < 4; ++w) mx = __vmaxu2(mx, k8.w[w]);
       }
+      mx = max(mx & 0xFFFFu, mx >> 16);
+      mx = __reduce_max_sync(0xffffffffu, mx);
+      uint32_t* const wm = cpos + 2304;  // per-warp maxima / counts (rx 0..2047, counts 2048..2303)
+      if (lane == 0) wm[wid] = mx;
+      __syncthreads();
+      uint32_t m2 = 0;
+#pragma unroll
+      for (int w2 = 0; w2 < kW; ++w2) m2 = max(m2, wm[w2]);
+      const int mb = (int)(m2 >> 8);
+      uint32_t c4 = 0;  // bins mb, mb - 1, mb - 2, mb - 3 in bytes 0..3
+      for (int g = tid; g < ng; g += T) {
+        const Keys8 k8(srow[g]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = k8.key(j), d = (uint32_t)(mb - (int)(k >> 8));
+          c4 += (k != 0u && d < 4u) ? (1u << (8 * d)) : 0u;
+        }
+      }
+      // 16-bit fields for the warp sum (<= 32 x 72 keys)
+      uint32_t lo = __reduce_add_sync(0xffffffffu, (c4 & 0xFFu) | ((c4 & 0xFF00u) << 8));
+      uint32_t hi = __reduce_add_sync(0xffffffffu, ((c4 >> 16) & 0xFFu) | ((c4 >> 8) & 0xFF0000u));
+      __syncthreads();  // wm read
+      if (lane == 0) { wm[2 * wid] = lo; wm[2 * wid + 1] = hi; }
+      __syncthreads();
+      uint32_t a = 0, b = 0;
+#pragma unroll
+      for (int w2 = 0; w2 < kW; ++w2) { a += wm[2 * w2]; b += wm[2 * w2 + 1]; }
+      const uint32_t cb[4] = {a & 0xFFFFu, a >> 16, b & 0xFFFFu, b >> 16};
+      s_mb = mb;
+      wide = (int)(cb[0] + cb[1] + cb[2] + cb[3] < (uint32_t)p.K);
+      if (tid < 4) wh[tid] = cb[tid];  // the 4 counts (wh is free: no atomics in lean)
+      __syncthreads();
+    } else {
+      for (int g = tid; g < ngr; g += T) {
+        const uint4 r = g < ng ? srow[g] : make_uint4(~0u, ~0u, ~0u, ~0u);
+        const Keys8 k8(r);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = k8.key(j);
+          bump(k >> 8, k != 0u);
+        }
+      }
+      __syncthreads();
     }
-    __syncthreads();
+    stamp(row, 2);
     // one round of the 256 top-byte counts; tau's top byte from every rank's counts
     auto round = [&](int64_t rrow, uint32_t* dst) {
       uint32_t* const st = cpos + 2048;  // the summed counts (rx holds 2 x W x 256 words, W <= 4)
@@ -207,9 +279,81 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
       }
       __syncthreads();
     };
-    if (full) {
-      // round-1 words in the r1 slot: rank r's 256 counts at r1row + r * kV2Msg
+    if (lean) {
       const int64_t r1row = p.off_r1 + ((int64_t)(par * p.cap + row) * p.W) * kV2Msg;
+      if (tid < 4) {
+        const uint4 v = tid == 0 ? make_uint4(tagw(tag, (uint32_t)s_mb | ((uint32_t)wide << 8)), tagw(tag, wh[0]),
+                                              tagw(tag, wh[1]), tagw(tag, wh[2]))
+                                 : make_uint4(tagw(tag, wh[3]), tagw(tag, 0u), tagw(tag, 0u), tagw(tag, 0u));
+        if (tid < 2) {
+          const int64_t off = r1row + (int64_t)p.rank * kV2Msg + tid * 4;
+          if (p.mc) mc_st_v4(p.mc + off * 4, v);
+          else
+            for (int d = 0; d < p.W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
+        }
+      }
+      stamp(row, 3);
+      if (tid < p.W * 2) {
+        const int r = tid >> 1, j = (tid & 1) * 4;
+        const uint32_t* src = p.box + r1row + (int64_t)r * kV2Msg + j;
+        const long long t0 = now_ns();
+        uint4 v = ld_sys_v4(src);
+        while (!tagged(v, tag)) {
+          if (spin_late(p.spin_ns, t0)) { spin_fail(p.err, 63); break; }
+          v = ld_sys_v4(src);
+        }
+        *reinterpret_cast<uint4*>(rx + r * 8 + j) = v;
+      }
+      __syncthreads();
+      stamp(row, 4);
+      // b1 from the headers: bins >= max over ranks of (mb_r - 3) are exact on every rank
+      if (tid == 0) {
+        int anyw = 0, lo = 0, hb = 0;
+        for (int r = 0; r < p.W; ++r) {
+          const uint32_t h = rx[r * 8] & 0xFFFFFFu;
+          anyw |= (int)((h >> 8) & 1u);
+          hb = max(hb, (int)(h & 0xFFu));
+        }
+        int b1 = -1, a1 = 0;
+        if (!anyw) {
+          for (int r = 0; r < p.W; ++r) lo = max(lo, (int)(rx[r * 8] & 0xFFu) - 3);
+          uint32_t run = 0;
+          for (int b = hb; b >= lo && b1 < 0; --b) {
+            uint32_t c = 0;
+            for (int r = 0; r < p.W; ++r) {
+              const int d = (int)(rx[r * 8] & 0xFFu) - b;
+              if (d >= 0 && d < 4) c += rx[r * 8 + 1 + d] & 0xFFFFFFu;
+            }
+            if (run + c >= (uint32_t)p.K) { b1 = b; a1 = (int)run; }
+            run += c;
+          }
+          if (b1 < 0) spin_fail(p.err, 64);  // impossible: every rank's 4 bins hold >= K keys
+        }
+        s[0] = b1; s[1] = a1; s[5] = anyw;
+      }
+      __syncthreads();
+      stamp(row, 5);
+    }
+    if (full && (!lean || s[5])) {
+      // round-1 words in the r1 slot: rank r's 256 counts at r1row + r * kV2Msg (rung 0; rung 0'
+      // round 1b for wide rows, in radix slot 1)
+      const int64_t r1row = lean ? p.off_rad + (((int64_t)(par * p.cap + row) * kV2RadR + 1) * p.W) * 256 - 0
+                                 : p.off_r1 + ((int64_t)(par * p.cap + row) * p.W) * kV2Msg;
+      const int r1st = lean ? 256 : kV2Msg;
+      if (lean) {  // the full top-byte histogram (rare rows: the 4 top bins hold < K keys)
+        for (int b = tid; b < kH * 256; b += T) wh[b] = 0;
+        __syncthreads();
+        for (int g = tid; g < ngr; g += T) {
+          const uint4 r = g < ng ? srow[g] : make_uint4(~0u, ~0u, ~0u, ~0u);
+          const Keys8 k8(r);
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            const uint32_t k = k8.key(j);
+            bump(k >> 8, k != 0u);
+          }
+        }
+        __syncthreads();
+      }
       {
         uint32_t* const st = cpos + 2048;
         if (tid < 256) {
@@ -222,14 +366,15 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
         if (tid < 64) {
           const int j = tid * 4;
           const uint4 v = make_uint4(tagw(tag, st[j]), tagw(tag, st[j + 1]), tagw(tag, st[j + 2]), tagw(tag, st[j + 3]));
-          const int64_t off = r1row + (int64_t)p.rank * kV2Msg + j;
+          const int64_t off = r1row + (int64_t)p.rank * r1st + j;
           if (p.mc) mc_st_v4(p.mc + off * 4, v);
           else
             for (int d = 0; d < p.W; ++d) st_v4(reinterpret_cast<uint32_t*>(p.peers[d]) + off, v);
         }
+        stamp(row, 3);
         if (tid < p.W * 64) {
           const int r = tid >> 6, j = (tid & 63) * 4;
-          const uint32_t* src = p.box + r1row + (int64_t)r * kV2Msg + j;
+          const uint32_t* src = p.box + r1row + (int64_t)r * r1st + j;
           const long long t0 = now_ns();
           uint4 v = ld_sys_v4(src);
           while (!tagged(v, tag)) {
@@ -239,6 +384,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
           *reinterpret_cast<uint4*>(rx + r * 256 + j) = v;
         }
         __syncthreads();
+        stamp(row, 4);
       }
       // b1: bins from the top (thread t <-> bin 255 - t)
       {
@@ -248,9 +394,13 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
         uint32_t tot;
         const uint32_t ex = v2_scan<T>(hb, warp_sums, &tot);
         if (tid < 256 && ex < (uint32_t)p.K && ex + hb >= (uint32_t)p.K) { s[0] = 255 - tid; s[1] = (int)ex; }
-        for (int b = tid; b < kH * 256; b += T) wh[b] = 0;
         __syncthreads();
+        stamp(row, 5);
       }
+    }
+    if (full) {
+      for (int b = tid; b < kH * 256; b += T) wh[b] = 0;
+      __syncthreads();
       const int b1 = s[0];
       if (b1 >= 0) {
         // low-byte counts of the keys in b1, the second round (radix slot 0)
@@ -264,8 +414,10 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
           }
         }
         __syncthreads();
+        stamp(row, 6);
         const int64_t rrow = p.off_rad + (((int64_t)(par * p.cap + row) * kV2RadR + 0) * p.W) * 256;
         round(rrow, rx + p.W * 256);
+        stamp(row, 7);
         uint32_t hb = 0;
         if (tid < 256)
           for (int r = 0; r < p.W; ++r) hb += rx[p.W * 256 + r * 256 + 255 - tid] & 0xFFFFFFu;
@@ -274,6 +426,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
         const uint32_t ex = v2_scan<T>(hb, warp_sums + 32, &tot);
         if (tid < 256 && ex < want && ex + hb >= want) { s[2] = (b1 << 8) | (255 - tid); s[3] = (int)(want - ex); }
         __syncthreads();
+        stamp(row, 9);
       }
       // threshold write: keys > tau (unordered), -1 pad; the count (+ need on rank 0)
       const int tau = s[2];
@@ -301,6 +454,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
         }
       }
       __syncthreads();
+      stamp(row, 10);
       const int cnt = min(s[4], p.K);
       for (int i = cnt + tid; i < p.K; i += T) orow[i] = -1;
       if (tid == 0) p.out_count[row] = s[4] + (p.rank == 0 ? s[3] : 0);
@@ -310,6 +464,7 @@ __global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_fx_kernel(V2Params 
     }
     if (tid == 0) p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
     __syncthreads();  // SMEM reused by the next row
+    stamp(row, 8);
   }
 }
 
