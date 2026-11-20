@@ -103,9 +103,9 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 push=False, device=None, die_static=False, k_rotate=0):
+                 push=False, device=None, die_static=False, k_rotate=0, die_rows=None):
         device = torch.device("cuda") if device is None else device
-        self.die_static = self._die_static(tactic, rows, n, device) if die_static else None
+        self.die_static = self._die_static(tactic, rows, n, device, die_rows) if die_static else None
         if self.die_static is not None and (die_split is not None or push):
             raise ValueError("die_static excludes die_split / push")
         self.n, self.k, self.rows = n, k, rows
@@ -187,7 +187,7 @@ class Mxfp8PreGemm:
         return args
 
     @staticmethod
-    def _die_static(tactic, rows, n, device):
+    def _die_static(tactic, rows, n, device, die_rows=None):
         """(split, weight tiles, activation tiles, clusters, die-1 unit mask words, die-0
         unit mask words) of the claim-free die placement on a ``die_weight(w, weight
         tile)`` copy: one cluster per placement unit (TPC = smid >> 1 for 2-CTA clusters,
@@ -216,8 +216,13 @@ class Mxfp8PreGemm:
             raise ValueError(f"die_static: {count} units vs {_max_active_clusters(cs)} co-resident clusters")
         tw, ta = (tile[0], tile[1]) if swap_ab else (tile[1], tile[0])
         w_tiles, a_tiles = -(-n // tw), -(-rows // ta)
-        share = sum(1 for d in table if d == 0) / sms
-        split = round(w_tiles * share)  # = die_weight(w, tw)'s split
+        if die_rows is None:
+            share = sum(1 for d in table if d == 0) / sms
+            split = round(w_tiles * share)  # = die_weight(w, tw)'s split
+        elif die_rows % tw:
+            raise ValueError(f"die_static: die rows {die_rows} not a multiple of the weight tile {tw}")
+        else:
+            split = die_rows // tw  # = die_weight_rows(w, die_rows)'s split
         if split * a_tiles > count[0] or (w_tiles - split) * a_tiles > count[1]:
             raise ValueError(f"die_static: {w_tiles} x {a_tiles} tiles, split {split}, units {count}")
 
@@ -253,6 +258,20 @@ class Mxfp8PreGemm:
         ints[:, 12] = m_tiles
         ints[:, 16 : 16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=device)
         return aux
+
+
+def die_weight_rows(w: torch.Tensor, die_rows: int) -> torch.Tensor:
+    """A copy of W [N, K] in die-placed memory: rows [0, die_rows) homed on die 0, the
+    rest on die 1 (``die_rows`` rows must end on a 2 MiB chunk boundary)."""
+    from ...common.dies import CHUNK, localized_like
+
+    n, k = w.shape
+    split = die_rows * k * w.element_size()
+    if split % CHUNK or not 0 < die_rows < n:
+        raise ValueError(f"die_weight_rows: {die_rows} rows of [{n}, {k}] do not end on a chunk")
+    chunks = -(-w.numel() * w.element_size() // CHUNK)
+    domains = [0 if i * CHUNK < split else 1 for i in range(chunks)]
+    return localized_like(w, domains).view(w.dtype).view(n, k)
 
 
 def die_weight(w: torch.Tensor, tile_n: int, device=None):

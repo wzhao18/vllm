@@ -66,6 +66,28 @@ PRE_TACTICS: dict[tuple[int, int], tuple] = {
 }
 
 
+# Die-static "pre" GEMMs (GEMM-EX1 R7): the weight is re-homed per die once at load
+# (rows [0, DIE_ROWS) on die 0, the rest on die 1: a 2 MiB chunk boundary and a multiple
+# of every die-static tactic's weight tile) and each placement unit (TPC / SM) computes
+# tiles of its own die's rows (``Mxfp8PreGemm(die_static=True)``), so no weight byte
+# crosses the die-to-die link. VR200 rhea, kda_in R384 swap 256x192 cold chain 16: cross-
+# die traffic 99 -> 10.7 MB / call, stream 11.6 -> 8.2 us (per-CTA stamps).
+DIE_ROWS: dict[tuple[int, int], int] = {(12448, 7168): 6144}
+# (first R, last R, smem stage cap override or None): the die-local stream of the swap
+# 256x192 R384 tactic wants the full ring (10 stages: stream 8.2 us vs 6-stage cap)
+PRE_DIE_STATIC: dict[tuple[int, int], tuple[tuple[int, int, int | None], ...]] = {
+    (12448, 7168): ((1, 256, None), (257, 384, 0)),
+}
+
+
+def pre_die_static(n: int, k: int, rows: int):
+    """None, or the (stage cap override or None,) of a die-static R-row "pre" call."""
+    for lo, hi, cap in PRE_DIE_STATIC.get((n, k), ()):
+        if lo <= rows <= hi:
+            return (cap,)
+    return None
+
+
 def pre_tactic(n: int, k: int, rows: int):
     """(tactic, prewait k-blocks, smem stage cap or 0) for an R-row call, or None."""
     for lo, hi, tactic, prewait, *cap in PRE_TACTICS.get((n, k), PRE_DEFAULT):
@@ -232,6 +254,23 @@ class Mxfp8Projection:
             n, k, self.rows
         )
         self.pre = {}
+        ds_rows = [r for r in self.rows if self.kinds.get(r) == "pre" and pre_die_static(n, k, r) is not None]
+        self.die_rows = None
+        if ds_rows:
+            # re-home the weight per die once (same bytes and layout: every kind reads it);
+            # a linear's weight is replaced in place, a (weight, scale) tuple is copied
+            if (n, k) not in DIE_ROWS:
+                raise Unsupported(family, ds_rows[0], f"die-static pre: no DIE_ROWS for [{n}, {k}]")
+            from .sm107.prewait import die_weight_rows
+
+            self.die_rows = DIE_ROWS[(n, k)]
+            placed = die_weight_rows(weight, self.die_rows)
+            if not isinstance(linear_or_weight, tuple):
+                data = linear_or_weight.weight.data
+                linear_or_weight.weight.data = placed if data.shape == placed.shape else placed.t()
+                del data
+                torch.accelerator.empty_cache()
+            self.weight = weight = placed
         for r in self.rows:
             kind = self.kinds.get(r)
             if kind not in MX_KINDS:
@@ -242,9 +281,14 @@ class Mxfp8Projection:
                     raise Unsupported(family, r, f"pre: no tactic for [{n}, {k}]")
                 from .sm107.prewait import Mxfp8PreGemm
 
+                ds = r in ds_rows
+                cap = found[2]
+                if ds and pre_die_static(n, k, r)[0] is not None:
+                    cap = pre_die_static(n, k, r)[0]
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
-                    max_stages=found[2], device=weight.device,
+                    max_stages=cap, device=weight.device, die_static=ds,
+                    die_rows=self.die_rows if ds else None,
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)

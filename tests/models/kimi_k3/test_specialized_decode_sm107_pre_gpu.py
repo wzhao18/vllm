@@ -23,11 +23,14 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (  # noqa:
     swizzle_mxfp8_scale,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (  # noqa: E402
+    DIE_ROWS,
     Mxfp8Projection,
+    pre_die_static,
     pre_tactic,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (  # noqa: E402
     Mxfp8PreGemm,
+    die_weight_rows,
 )
 
 DEVICE = torch.device("cuda", 0)
@@ -91,6 +94,31 @@ def test_pre_graph_chain():
         torch.cuda.synchronize()
         for (wq, sw), o in zip(weights, outs):
             assert torch.equal(o, scaled_mm(q.data, q.scale, wq, sw)), r
+
+
+def test_pre_die_static():
+    """Die-static placement (one cluster per TPC / SM, die-local weight rows): bitwise to
+    _scaled_mm over back-to-back PDL calls on both counter sets; the landing gate resets."""
+    torch.cuda.set_device(DEVICE)
+    wq, sw = mx_weight(N, K, 4)
+    rows_d0 = DIE_ROWS[(N, K)]
+    wd = die_weight_rows(wq, rows_d0)
+    for r in ROWS:
+        tactic, pre, cap = pre_tactic(N, K, r)
+        if pre_die_static(N, K, r)[0] is not None:
+            cap = pre_die_static(N, K, r)[0]
+        g = Mxfp8PreGemm(N, K, r, tactic, prewait=pre, max_stages=cap, die_static=True,
+                         die_rows=rows_d0, device=DEVICE)
+        x = torch.randn(r, K, device=DEVICE).bfloat16()
+        xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+        outs = [torch.empty(r, N, device=DEVICE, dtype=torch.bfloat16) for _ in range(3)]
+        for o in outs:
+            g(xq, xs, wd, sw, o)
+        ref = scaled_mm(xq, xs, wq, sw)
+        for o in outs:
+            assert torch.equal(o, ref), r
+        torch.cuda.synchronize()
+        assert not g.aux.view(torch.int32)[:, [4, 6]].any(), r
 
 
 def test_pre_rejects():
