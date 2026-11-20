@@ -5,11 +5,16 @@ SP_KERNELS rows) against FlashInfer trtllm-gen, the stock decode's kernel, on th
 FP8 query (96 real of 128 mailbox heads), per-tensor FP8 KV rows, flat slots and
 counts (~512 keys per row of a DCP4 shard, rows without keys included).
 
-Both quantize P to E4M3 at 448 of the running row max over 128-key tiles, sum in FP32
-and run each row in one unsplit pass at these row counts, so the latent agrees to the
-BF16 rounding of the output (measured max 4.9e-4 absolute at a mean |latent| 1.6e-2,
-runs/D-ATTN/sp) and the base-2 LSE to FP32 rounding; rows without keys: LSE -inf and
-a zero latent on both."""
+Both quantize P to E4M3 at 448 of the running row max over 128-key tiles and sum in
+FP32. A row the kernel runs in one pass (not cut by the split-K deal) agrees with
+trtllm-gen to the BF16 rounding of the output (measured max 4.9e-4 absolute at a mean
+|latent| 1.6e-2, runs/D-ATTN/sp) and the base-2 LSE to FP32 rounding. A row cut over
+CTAs runs its segments from their own running max (P quantized against a different
+max, as any split-KV pass) and is merged as DCP does: it must be as close to the exact
+FP32 attention as trtllm-gen is (measured R384: mean relative error 0.0239 vs 0.0240).
+Rows without keys: LSE -inf and a zero latent on both."""
+
+import math
 
 import pytest
 import torch
@@ -45,6 +50,22 @@ def _case(rows, gen):
     return query, kv, slots, valid
 
 
+def _split_rows(valid, grid):
+    """Rows the split-K deal (sparse_mla_km.deal) cuts over several CTAs."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.sparse_mla_km import (  # noqa: E501
+        MIN_Q,
+    )
+
+    tiles = [-(-int(n) // 128) for n in valid.tolist()]
+    q = max(-(-sum(tiles) // grid), MIN_Q)
+    out, pre = [], 0
+    for r, t in enumerate(tiles):
+        if t and pre // q != (pre + t - 1) // q:
+            out.append(r)
+        pre += t
+    return out
+
+
 @pytest.mark.parametrize("rows", [68, 256, 384])
 def test_keys_on_m_matches_trtllm_gen(rows):
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
@@ -77,7 +98,23 @@ def test_keys_on_m_matches_trtllm_gen(rows):
 
     keyed = valid > 0
     empty = ~keyed
-    assert bool(empty.any()) and bool(keyed.any())
+    split = torch.zeros_like(keyed)
+    split[_split_rows(valid, torch.cuda.get_device_properties(0).multi_processor_count)] = True
+    assert bool(split.any()), "the case must exercise the split-K merge"
+    # Split rows: error vs the exact FP32 attention no worse than trtllm-gen's.
+    err_k, err_t, lse_err = 0.0, 0.0, 0.0
+    for r in split.nonzero().flatten().tolist():
+        n = int(valid[r])
+        k = kv[slots[r, :n].long()].float()
+        s = (query[r, :REAL].float() @ k.T) * BMM1
+        exact = (torch.softmax(s, -1) @ k[:, :512]) * BMM2
+        err_k += float((lat_k[r, :REAL].float() - exact).norm() / exact.norm())
+        err_t += float((lat_t[r, :REAL].float() - exact).norm() / exact.norm())
+        lse_exact = torch.logsumexp(s, -1) / math.log(2)
+        lse_err = max(lse_err, float((lse_k[r, :REAL] - lse_exact).abs().max()))
+    assert err_k <= 1.05 * err_t, (err_k, err_t)
+    assert lse_err < 1e-3, lse_err
+    keyed = keyed & ~split
     got, want = lat_k[keyed, :REAL].float(), lat_t[keyed, :REAL].float()
     torch.testing.assert_close(got, want, atol=1e-3, rtol=1.6e-2)
     rel = (got - want).norm() / want.norm()
