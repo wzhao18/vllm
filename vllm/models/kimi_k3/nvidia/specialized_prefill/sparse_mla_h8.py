@@ -330,7 +330,9 @@ class SparseMlaPrefillH8:
         self.topk = topk
         assert topk == 0 or (topk % 64 == 0 and 128 <= topk <= 2048), topk  # lane per chunk
         # diagnostics (timing only): no_store (no TMA stores), no_gather (stages are
-        # signalled without gathers: stale data), no_math (softmax warps skip all math),
+        # signalled without gathers: stale data; 2: only the first NS stages of each CTA
+        # are gathered, later stages reuse those real rows), no_math (softmax warps skip
+        # all math),
         # no_mma (MMA warps only commit), sstamp (CTA 0 shared-memory clock stamps)
         # pad: 1 KiB of extra dynamic shared memory (no stamps)
         # ssmask: roles whose sstamp sites are compiled (1 softmax, 2 QK, 4 PV, 8 gather)
@@ -571,8 +573,13 @@ class SparseMlaPrefillH8:
                             if pw == 0:
                                 self.ss(base, cta, lane, g, 22, 8)
                                 self.lpin(base, cta, lane, g)
-                                if cutlass.const_expr(self.no_gather):
+                                if cutlass.const_expr(self.no_gather == 1):
                                     mbar_arrive(full)
+                                elif cutlass.const_expr(self.no_gather == 2):
+                                    if g < NS:
+                                        mbar_arrive_tx(full, Uint32(STAGE64 - self._skipped()))
+                                    else:
+                                        mbar_arrive(full)
                                 else:
                                     mbar_arrive_tx(full, Uint32(STAGE64 - self._skipped()))
                         cute.arch.sync_warp()
@@ -588,8 +595,11 @@ class SparseMlaPrefillH8:
                                     (Uint32(rch) ^ ((Uint32(rrow) >> Uint32(1)) & Uint32(3)))
                                     << Uint32(4)), src, nb)
                                 cp_async_arrive(full)
-                        if cutlass.const_expr(not self.no_gather):
-                            if act:
+                        if cutlass.const_expr(self.no_gather != 1):
+                            gok = act
+                            if cutlass.const_expr(self.no_gather == 2):
+                                gok = act and g < NS
+                            if gok:
                                 r0 = (r[0] >> 6) * unit_rows + (r[0] & 63)
                                 r1 = (r[1] >> 6) * unit_rows + (r[1] & 63)
                                 r2 = (r[2] >> 6) * unit_rows + (r[2] & 63)
