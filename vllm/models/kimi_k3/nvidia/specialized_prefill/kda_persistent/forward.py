@@ -213,16 +213,19 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
-                DP_PREP_=_k.DP_PREP
-                if (
-                    beta_tma
-                    and partial_tma
-                    and gate_roll
-                    and rcp_decor
-                    and not prep_peel
-                    and gram_w9 == 0
-                )
-                else 0,
+                **(
+                    {"DP_PREP_": getattr(_k, "DP_PREP", 0)}
+                    if (
+                        getattr(_k, "DP_PREP", 0)
+                        and beta_tma
+                        and partial_tma
+                        and gate_roll
+                        and rcp_decor
+                        and not prep_peel
+                        and gram_w9 == 0
+                    )
+                    else {}
+                ),
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
