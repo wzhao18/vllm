@@ -883,8 +883,8 @@ class IndexerScore:
             if cutlass.const_expr(self.epi != 1):
                 ss = self.reduce_half(h0, w, None, 0)
             h1 = tmem_wait_n(*h1)
-            cute.arch.sync_warp()
-            if lane == 0:
+            # tcgen05.wait::ld is warp-aligned: every lane's loads have landed
+            with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(acc_empty + st)
             if cutlass.const_expr(st + 1 < ACC_STAGES):
                 cute.arch.mbarrier_wait(acc_full + st + 1, ph)
