@@ -189,6 +189,17 @@ def _nanosleep():
     return "nanosleep.u32 64;", "~{memory}", ()
 
 
+@asm(Int32)
+def _pace_state(target, mbar):
+    """2 if ``mbar`` (the PDL-wait barrier) completed phase 0, else 1 while
+    %clock64 < ``target``, else 0 (a paced pre-wait issuer spins while 1)."""
+    code = "{ .reg .pred p, q; .reg .u64 t; .reg .u32 a; "
+    code += "mbarrier.test_wait.parity.shared::cta.b64 q, [$2], 0; "
+    code += "mov.u64 t, %clock64; setp.lt.u64 p, t, $1; selp.u32 a, 1, 0, p; "
+    code += "selp.u32 $0, 2, a, q; }"
+    return code, "=r,l,r,~{memory}", (Int64(target), mbar)
+
+
 @asm()
 def _fence_after():
     return "tcgen05.fence::after_thread_sync;", "~{memory}", ()
@@ -314,8 +325,15 @@ class WideGemm:
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
                  partials=False, tpcs=0, smem=None, trace=False, xcopies=1,
-                 ktile=K_TILE):  # fmt: skip
+                 ktile=K_TILE, prewait=None):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
+        # Experiments only (co-residency vs pre-wait traffic behind a latency-bound
+        # producer): weight bytes issued before the PDL wait. None: the whole ring;
+        # ("none",): none; ("n", s): the first s stages; ("pace", clk): stage t not
+        # before clock t0 + t * clk until the wait passes; ("l2", clk): TMA L2
+        # prefetch of the split's stages at that pace, the ring filled after the wait.
+        self.prewait = tuple(prewait) if prewait else ("all",)
+        assert self.prewait[0] in ("all", "none", "n", "pace", "l2"), prewait
         # Benchmarks only: ``trace`` stores the MMA warp's clock64 waits on weight /
         # activation stages; ``xcopies`` reads x from x[(tile % xcopies) * rows + t]
         # (copies of the same rows: the hot-activation ablation).
@@ -408,6 +426,7 @@ class WideGemm:
             bempty: cute.struct.MemRange[cutlass.Int64, self.astages]
             acc_full: cutlass.Int64
             dealloc: cutlass.Int64
+            dep: cutlass.Int64
             tmem_holder: cutlass.Int32
             xfer: cutlass.Int64
             sA: cute.struct.Align[
@@ -480,6 +499,7 @@ class WideGemm:
                     cute.arch.mbarrier_init(bempty + i, 1)
                 cute.arch.mbarrier_init(acc_full, 1)
                 cute.arch.mbarrier_init(dealloc, 32)
+                cute.arch.mbarrier_init(st.dep.ptr, 1)
                 cute.arch.mbarrier_init(st.xfer.ptr, 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive_relaxed()
@@ -532,15 +552,18 @@ class WideGemm:
 
         if warp == 0:  # weights: before the PDL wait (stages 0, n_w, ...)
             self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty, a_mask,
-                         leader, k0, k_count, rot, Int32(0), n_w)  # fmt: skip
+                         leader, k0, k_count, rot, Int32(0), st.dep.ptr, n_w)  # fmt: skip
             if lane == 0:
                 _st_u64(stamp + 80, _now())
         elif warp == 3:  # weights: stages 1, 1 + n_w, ... (one op at a time per issuer, hw51)
             self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty, a_mask,
-                         leader, k0, k_count, rot, Int32(1), n_w)  # fmt: skip
+                         leader, k0, k_count, rot, Int32(1), st.dep.ptr, n_w)  # fmt: skip
         elif warp == 1:  # activations: after it
             if work >= 0:  # an idle die-static pair exits without waiting on the producer
                 cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.prewait[0] in ("pace", "l2")):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(st.dep.ptr)
             if lane == 0:
                 _st_u64(stamp + 48, _now())
             self.acts(tma_b, tBgX, tBsB, bfull, bempty, b_mask, leader, k0, k_count,
@@ -605,7 +628,7 @@ class WideGemm:
             for i in cutlass.range_constexpr(2, n_w):
                 if warp == self.weight_warps[i]:
                     self.weights(tma_a, tAgW[(None, pair, None, 0)], tAsA, full, empty,
-                                 a_mask, leader, k0, k_count, rot, Int32(i), n_w)  # fmt: skip
+                                 a_mask, leader, k0, k_count, rot, Int32(i), st.dep.ptr, n_w)  # fmt: skip
             for i in cutlass.range_constexpr(1, n_act):
                 if warp == self.act_warps[i]:
                     if work >= 0:
@@ -642,14 +665,53 @@ class WideGemm:
 
     @cute.jit
     def weights(self, tma_a, tAgW_tile, tAsA, full, empty, a_mask, leader, k0, k_count, rot,
-                first, step: cutlass.Constexpr):  # fmt: skip
+                first, dep, step: cutlass.Constexpr):  # fmt: skip
         """Weight stages ``first``, ``first + 2``, ... of this split: one TMA issuer
         completes one bulk op at a time (hw51), so two issuer warps double the weight
-        rate a CTA can pull before and after the PDL wait."""
+        rate a CTA can pull before and after the PDL wait. ``dep``: the barrier the
+        activation warp arrives on after the PDL wait (``prewait`` pacing)."""
         stages = self.wstages
+        mode = self.prewait[0]
+        if cutlass.const_expr(mode == "none"):
+            cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(mode == "l2"):
+            pace = Int64(self.prewait[1])
+            t0 = _clk()
+            t = first
+            go = Int32(1)
+            while go != 0:
+                if t >= k_count:
+                    go = Int32(0)
+                else:
+                    state = _pace_state(t0 + Int64(t) * pace, dep)
+                    while state == 1:
+                        _nanosleep()
+                        state = _pace_state(t0 + Int64(t) * pace, dep)
+                    if state == 2:
+                        go = Int32(0)
+                    else:
+                        cute.prefetch(tma_a, tAgW_tile[(None, k0 + (t + rot) % k_count)])
+                        t = t + step
+            cute.arch.griddepcontrol_wait()
+        t_wait = Int32(-1)
+        if cutlass.const_expr(mode == "n"):
+            # This warp's first stage at or past the pre-wait budget.
+            t_wait = first + step * ((Int32(self.prewait[1]) - first + step - 1) // step)
+        t_pace = Int64(0)
+        if cutlass.const_expr(mode == "pace"):
+            t_pace = _clk()
         for t in cutlass.range(first, k_count, step, unroll=1):
             s = t % stages
             phase = Int32(1) ^ ((t // stages) % 2)
+            if cutlass.const_expr(mode == "n"):
+                if t == t_wait:
+                    cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(mode == "pace"):
+                due = t_pace + Int64(t) * Int64(self.prewait[1])
+                state = _pace_state(due, dep)
+                while state == 1:
+                    _nanosleep()
+                    state = _pace_state(due, dep)
             cute.arch.mbarrier_wait(empty + s, phase)
             if leader:
                 with cute.arch.elect_one():
@@ -1117,12 +1179,13 @@ class PreparedWide:
         self.policies = {}
         for r, v in dict(policies).items():
             v = (v,) if isinstance(v, int) else tuple(v)
-            # 9th field: die-static launch for this row (None: whenever ``dies``)
-            v += ((1,), None, (0, 3), False, False, None, K_TILE, None)[len(v) - 1:]
+            # 9th field: die-static launch for this row (None: whenever ``dies``);
+            # 10th: ``WideGemm`` ``prewait`` (experiments).
+            v += ((1,), None, (0, 3), False, False, None, K_TILE, None, None)[len(v) - 1:]
             die = bool(dies) if v[8] is None else bool(v[8]) and bool(dies)
             self.policies[r] = (
                 v[0], tuple(v[1]), v[2], tuple(v[3]), bool(v[4]), bool(v[5]), v[6], v[7],
-                die,
+                die, tuple(v[9]) if v[9] else None,
             )  # fmt: skip
         self.kernels, self.state = {}, {}
 
@@ -1137,11 +1200,11 @@ class PreparedWide:
         w = from_dlpack(self.weight.unsqueeze(-1), assumed_align=16)
         w = w.mark_layout_dynamic(leading_dim=1)
         for rows, policy in self.policies.items():
-            split, act_warps, wst, w_warps, direct, rotate, smem, ktile, die = policy
+            split, act_warps, wst, w_warps, direct, rotate, smem, ktile, die, pw = policy
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
                 w_warps, direct, rotate, self.partials, len(tpc_die) if die else 0,
-                smem, self.trace, self.xcopies, ktile,
+                smem, self.trace, self.xcopies, ktile, pw,
             )  # fmt: skip
             n_pad = gemm.n_pad
             if n_pad // 128 * split > sms:  # the splits spin on each other: one wave
