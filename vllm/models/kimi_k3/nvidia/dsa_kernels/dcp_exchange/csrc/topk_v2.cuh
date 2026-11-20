@@ -744,8 +744,14 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
     if (K31_RARE(!fast)) {
-      if constexpr (kFast) {  // tier 3 on every rank, then the complete body
-        if (tid == 0) { s_sat = 1u; s_above = 0u; s_lo = 0; }
+      if constexpr (kFast) {
+        // tier 3 on every rank, then R2. The message carries a valid lower bound only: an
+        // empty window just below theta and the exact count of keys >= theta above it.
+        if (tid == 0) {
+          s_sat = 1u;
+          s_lo = min(max(0, th - kV2Win), 65536 - kV2Win);
+          s_above = s_lo + kV2Win == th ? (uint32_t)s_cnt : 0u;
+        }
       } else {
       V2STAT(5);
       // the same message from passes over every key: coarse histogram, the coarse bin of
@@ -1059,10 +1065,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // then derives tau, need and the tie cut by global id from the union (exact). Rows whose
       // keys >= LB overflow the message keep the complete body.
       if (tier == 2 || tier == 3) {
-        // every rank fast (no saturated window) on this row: the windows only missed tau
-        uint32_t r2sat = 0;
-        for (int r = 0; r < W; ++r) r2sat |= (rx[r * kV2Msg] >> 16) & 1u;
-        if (!r2sat && row < kR2Rows) {
+        // saturated windows / failed fast paths take R2 too: every window is a lower bound
+        if (row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
         __shared__ int s_r2[6];  // 0 LB, 1 tie count, 2 tau, 3 keys > tau, 4 quota, 5 bad
         uint32_t* const z = reinterpret_cast<uint32_t*>(srow) + 4096;
