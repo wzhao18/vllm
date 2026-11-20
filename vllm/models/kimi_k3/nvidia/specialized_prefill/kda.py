@@ -163,6 +163,24 @@ def persistent_prefill(
     return out, final_state
 
 
+_fp32_weights: dict = {}
+
+
+def _fp32_weight(weight: torch.Tensor) -> torch.Tensor:
+    """FP32 contiguous copy of a norm weight, made once per weight version
+    (a cast kernel per layer and step otherwise)."""
+    if weight.dtype == torch.float32 and weight.is_contiguous():
+        return weight
+    key = (weight.data_ptr(), weight.device, weight.dtype, weight._version)
+    w32 = _fp32_weights.get(key)
+    if w32 is None:
+        if len(_fp32_weights) >= 1024:
+            _fp32_weights.clear()
+        w32 = weight.float().contiguous()
+        _fp32_weights[key] = w32
+    return w32
+
+
 def o_norm_mxfp8(
     x: torch.Tensor,
     g: torch.Tensor,
@@ -174,5 +192,5 @@ def o_norm_mxfp8(
     into ``out`` (an ``mxfp8_act.Mxfp8Buffer`` of T rows)."""
     kda_segscan.load_extension()
     torch.ops.k3_flashkda_split.o_norm_mxfp8(
-        x, g, weight.float().contiguous(), eps, out.data, out.scale
+        x, g, _fp32_weight(weight), eps, out.data, out.scale
     )

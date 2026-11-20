@@ -642,13 +642,17 @@ def fwd(
     # Reset before every launch, including captured launches and graph replays.
     if has_split:
         mfl.zero_()
-    # The only route decision is a single sequence versus packed sequences.
-    # Single sequences use the fused-gate kernel with row-paired Q/K prep and a
-    # per-element partial tail; packed sequences roll the gate scan in
-    # eight-row batches and TMA-load partial chunks with row masks. Whether
-    # every chunk is full is a static property of the lengths, and a -5 lower
-    # bound folds into the gate. Measured on H32/64/96/128 fixed and varlen
-    # shapes; there are no per-head-count settings.
+    # Route: single sequence versus packed sequences.  Single sequences use the
+    # fused-gate kernel with row-paired Q/K prep and a per-element partial
+    # tail; packed sequences roll the gate scan in eight-row batches and
+    # TMA-load partial chunks with row masks.  Packed sequences that end in a
+    # partial chunk also run the GATE2 recurrence (wide V residual, two-half
+    # V_new handoff, FIN-gated epilogue image): bitwise identical, 2-3.5%
+    # faster at H96 (f16k, 3x5456, mixed, 2x8k with partial tails) but 9-19%
+    # slower when every chunk is full (4x4k, 2x8k), so all-full packed shapes
+    # keep the plain recurrence.  Whether every chunk is full is a static
+    # property of the lengths, and a -5 lower bound folds into the gate.
+    # There are no per-head-count settings.
     return _launch_forward(
         q,
         k,
@@ -664,7 +668,7 @@ def fwd(
         final_state=final_state,
         cu_seqlens=cu32,
         sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, 1),
-        gate2=1 if fixed else 0,
+        gate2=1 if (fixed or not full_chunks) else 0,
         has_split=has_split,
         beta_tma=True,
         qk_rowpair=4 if fixed else 8,
