@@ -190,3 +190,17 @@ def test_topk_prepass_policy():
     assert ops.topk_prepass_min(1, 512, 848) == 16384
     assert ops.topk_prepass_min(2, 512, 424) == 2 * 32768
     assert ops.topk_prepass_min(1, 1024, 848) == 32768
+
+
+def test_exchange_attaches_to_impls_that_read_counts():
+    """DcpExchange stays on for the FlashInfer sparse MLA impl, whose forward_mqa
+    override sends every DCP decode call to the shared counts-reading path, and
+    off for FlashMLA sparse, which filters the DCP ids itself (an override that
+    silently turned the exchange off cost 0.5-0.7 ms per 24-layer decode slice)."""
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        FlashInferMLASparseImpl,
+    )
+    from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+
+    assert decode._reads_counts(object.__new__(FlashInferMLASparseImpl))
+    assert not decode._reads_counts(object.__new__(FlashMLASparseImpl))

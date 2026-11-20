@@ -35,6 +35,8 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.platforms import current_platform
 
+from .specialized_prefill import gemm_tactics
+
 # Above this many rows the cuBLASLt MXFP8 GEMM beats the CuTe DSL one on SM107
 # for most shapes (the default for shapes not in the table below).
 CUTE_DSL_MAX_ROWS = 16
@@ -100,6 +102,20 @@ class KimiK3Mxfp8Kernel(FlashInferCutedslMxfp8LinearKernel):
             x_fp8, x_scale = mxfp8_e4m3_quantize(
                 x.reshape(-1, k), is_sf_swizzled_layout=True
             )
+        if (
+            rows >= gemm_tactics.MIN_ROWS
+            and bias is None
+            and out_dtype == torch.bfloat16
+            and (plan := gemm_tactics.plan("mxfp8", n, k)) is not None
+        ):
+            out = gemm_tactics.mm(
+                plan,
+                x_fp8.reshape(-1, k),
+                weight.t(),
+                x_scale.view(torch.uint8),
+                layer.weight_scale.view(torch.uint8),
+            )
+            return out.view(*input_shape[:-1], n)
         out = torch._scaled_mm(
             x_fp8,
             weight,
