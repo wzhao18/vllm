@@ -577,12 +577,17 @@ class DcpValue:
             # [128 outputs x 64] (latent-contiguous, gather_heads' layout)
             # (bench probe KNOBS 8192: rows 1 KiB apart, the head-major access pattern)
             row_stride = 1024 if self.knobs & 8192 else self.q_heads * 1024
+            if self.knobs & 131072:  # bench probe: a latent row pitch of q_heads + 1 heads
+                row_stride = (self.q_heads + 1) * 1024
             if cutlass.const_expr(self.ov):
                 # one TMA op per chunk / per two W_UV tiles: [64 dims, rows, k-block,
                 # head] boxes land as the k-block-major SW128 tiles the MMAs read
+                head_stride = 1024
+                if self.knobs & 262144:  # bench probe: head-major latent [heads, rows, 512]
+                    row_stride, head_stride = 1024, self.batch * 1024
                 am = tensormap.encode_map(
                     rows.iterator.toint(), bf, (64, self.batch, 8, self.q_heads),
-                    (row_stride, 128, 1024), (64, HS_ROWS, 8, 1), sw, l2)
+                    (row_stride, 128, head_stride), (64, HS_ROWS, 8, 1), sw, l2)
                 bm = tensormap.encode_map(
                     w_uv.iterator.toint(), bf, (64, 128, 8, self.size * self.heads),
                     (1024, 128, 128 * 1024), (64, 128, 2, 1), sw, l2)

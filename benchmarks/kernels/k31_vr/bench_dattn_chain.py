@@ -145,8 +145,14 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
             # ovK<n>: kernel_ov with dcp_value.KNOBS n (ablation ladder); tcc / ovc:
             # KNOBS 8192 (latent rows read 1 KiB apart: the head-major access pattern)
             knobs = int(mode[3:]) if mode.startswith("ovK") else 0
+            # ovs: kernel_ov reading a static copy of the latent (not the core's
+            # output of this layer): is the core-written latent the slow part?
             if mode in ("tcc", "ovc"):
                 knobs = 8192
+            if mode == "ovp":  # static latent at a 129-head row pitch (camping probe)
+                knobs = 131072
+            if mode == "ovh":  # static head-major latent [heads, rows, 512]
+                knobs = 262144
             dcp_value.KNOBS = knobs
             kernels[mode] = compile_dcp_value(
                 HEADS, size, batch, layout(w_uv), PITCH, dev.index, sms, Q,
@@ -169,11 +175,19 @@ def _worker(rank, size, port, rows, layers, iters, modes, local, jitter, stamps)
         for mode in modes:
             out = torch.zeros(batch, GATE, device=dev, dtype=torch.bfloat16)
 
-            def chain(parity, mode=mode, out=out):
+            static = latent.clone() if mode == "ovs" else latent
+            if mode == "ovp":
+                pad = torch.zeros(batch, box.q_heads + 1, 512, dtype=latent.dtype, device=dev)
+                pad[:, : box.q_heads] = latent
+                static = pad
+            if mode == "ovh":
+                static = latent.transpose(0, 1).contiguous()  # [heads, rows, 512]
+
+            def chain(parity, mode=mode, out=out, static=static):
                 core(parity, ov_mode(mode))
                 publish = publish_args(box, parity)
                 run_value(kernels[mode], dsa_box, parity, publish, HEADS,
-                          (latent, lse, valid), totals, None, projected, out, w_g)
+                          (static, lse, valid), totals, None, projected, out, w_g)
 
             t, graph = _graph_time(chain, layers, iters, dev)
             outs[mode] = out.clone()
