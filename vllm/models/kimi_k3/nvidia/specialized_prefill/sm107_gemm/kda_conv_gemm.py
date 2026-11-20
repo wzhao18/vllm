@@ -134,10 +134,12 @@ def _common_args(x, x_scale, weight, scale, out, n):
 class PlainGemm:
     """BF16 ``x @ W.T`` with the vendored kernel (tactic benchmarking)."""
 
-    def __init__(self, weight_nk, scale, tactic=DEFAULT_TACTIC):
+    def __init__(self, weight_nk, scale, tactic=DEFAULT_TACTIC, max_clusters=None):
         self.weight, self.scale, self.tactic = weight_nk, scale, tactic
         self.n, self.k = weight_nk.shape
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
+        # Persistent grid size in clusters (default: all that fit the GPU).
+        self.max_clusters = max_clusters
         self._compiled = None
 
     def __call__(self, x, x_scale, out):
@@ -158,12 +160,14 @@ class PlainGemm:
             tail = (tail[0], tail[1], tail[2], cutlass.Int64(self.weight.stride(0)), *tail[4:])
         args = (*args, from_dlpack(self.alpha))
         if self._compiled is None:
-            key = ("plain", self.tactic, x.device.index, self.n, self.k)
+            key = ("plain", self.tactic, x.device.index, self.n, self.k, self.max_clusters)
             self._compiled = _COMPILED.get(key)
             if self._compiled is None:
                 gemm = _Kernel(self.tactic)
                 cl = self.tactic[1]
-                mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
+                mac = self.max_clusters or cutlass_utils.HardwareInfo().get_max_active_clusters(
+                    cl[0] * cl[1]
+                )
                 layouts = (
                     OperandMajorMode.K,
                     OperandMajorMode.K,
