@@ -144,6 +144,9 @@ def main():
         torch.cuda.synchronize()
         fns = {
             "nvjet": lambda s: torch.mm(s[0], s[1].t(), out=s[3]),
+            # cuBLASLt beta-add into the prefix (ONE rounding: not stock; a
+            # precision decision item only)
+            "nvjet_beta": lambda s: torch.addmm(s[2], s[0], s[1].t(), out=s[2]),
             "base": lambda s: base(s[0], s[1], s[3]),
             "ab_sum": lambda s: ab_sum(s[0], s[1], s[2], s[3]),
             "ab_res": lambda s: ab_res(s[0], s[1], s[2], s[2]),
