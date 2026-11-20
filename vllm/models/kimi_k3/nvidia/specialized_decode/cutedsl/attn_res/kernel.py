@@ -267,11 +267,19 @@ class ClusterAttnRes:
         (token, col)."""
         parts, residual = delta
         n = residual.shape[0]
+        # every partial and the residual in flight before the first add (one round
+        # trip instead of one per load); the sums keep the split order
+        loaded = [
+            [
+                load_words(at(parts, p * n + token, col + 4 * h), count=4, mutable=True)
+                for h in range(2)
+            ]
+            for p in range(self.delta_parts)
+        ]
+        res_words = load_words(at(residual, token, col), count=4, mutable=True)
         for p in cutlass.range_constexpr(self.delta_parts):
             for h in cutlass.range_constexpr(2):
-                words = load_words(
-                    at(parts, p * n + token, col + 4 * h), count=4, mutable=True
-                )
+                words = loaded[p][h]
                 for i in cutlass.range_constexpr(4):
                     if cutlass.const_expr(p == 0):
                         cur[0, 4 * h + i] = bits_float(words[i])
@@ -280,7 +288,7 @@ class ClusterAttnRes:
         for j in cutlass.range_constexpr(4):  # the GEMM's BF16 output
             round_pair(cur, 0, j)
         res = cute.make_rmem_tensor((1, 8), Float32)
-        unpack(load_words(at(residual, token, col), count=4, mutable=True), res, 0)
+        unpack(res_words, res, 0)
         for i in cutlass.range_constexpr(8):
             cur[0, i] = cur[0, i] + res[0, i]
         for j in cutlass.range_constexpr(4):  # + the residual, rounded again
