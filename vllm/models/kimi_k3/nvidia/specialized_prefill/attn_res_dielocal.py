@@ -142,6 +142,19 @@ def prefix_out(prefix: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor | Non
     return buf.prefix[: prefix.shape[0]]
 
 
+def is_prefix(prefix: torch.Tensor, blocks: torch.Tensor) -> bool:
+    """Whether ``prefix`` is the die-local prefix buffer of ``blocks``' forward
+    (the AttnRes prefix the dataflow-C producers update in place)."""
+    buf = _buffers.get(blocks.device.index)
+    return (
+        buf is not None
+        and kernel_args(blocks)[0] is not None
+        and prefix.data_ptr() == buf.prefix_base
+        and prefix.dim() == 2
+        and prefix.stride(0) == buf.hidden
+    )
+
+
 def out_buffer(blocks: torch.Tensor, kind: str, rows: int) -> torch.Tensor | None:
     """A die-local output buffer (rotating pair per kind) when ``blocks`` is
     the die-local block buffer, else None. Only for outputs consumed before
