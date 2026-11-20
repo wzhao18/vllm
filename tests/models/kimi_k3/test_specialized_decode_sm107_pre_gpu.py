@@ -71,7 +71,7 @@ def test_pre_check_x_patches_every_word():
     """``check_x``: activation stages loaded as sentinels (a publish-only SP all-gather
     box before its rows land) are re-read word by word from the check arguments'
     addresses: bitwise the unchecked GEMM, for the 1-CTA and 2-CTA activation
-    tactics; rows >= R are not checked."""
+    tactics, activation as A or as B (swap_ab); rows >= R are not checked."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.sm107.prewait import (
         check_args,
     )
@@ -84,6 +84,9 @@ def test_pre_check_x_patches_every_word():
         (128, ((128, 64), (1, 1), False, 128)),
         (256, ((256, 128), (2, 1), False, 256)),
         (384, ((256, 256), (2, 1), False, 256)),
+        (384, ((256, 192), (2, 1), True, 256)),
+        (320, ((256, 192), (2, 1), True, 256)),
+        (256, ((256, 128), (2, 1), True, 256)),
     )
     for r, tactic in cases:
         x = torch.randn(r, K, device=DEVICE).bfloat16()

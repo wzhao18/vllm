@@ -1021,23 +1021,45 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
         if cutlass.const_expr(self.check_x):
-            # check_x.check_stage's layout: the activation is A with 128 rows x one
-            # 128-column K block per CTA stage, its scales one 512-byte atom
+            # check_x.check_stage's layout: per CTA stage the activation (A, or B with
+            # swap_ab) is x_rows <= 128 rows x one 128-column K block, its scales
+            # 1 or 2 512-byte atoms (a full 128-row window per CTA)
             self.num_check_stage = self.num_ab_stage
+            x_layout = (
+                self.b_smem_layout_staged if self.weight_is_a else self.a_smem_layout_staged
+            )
+            sf_layout = (
+                self.sfb_smem_layout_staged
+                if self.weight_is_a
+                else self.sfa_smem_layout_staged
+            )
+            x_stage = cute.cosize(x_layout.outer) // self.num_ab_stage
+            sf_stage = cute.cosize(sf_layout) // self.num_ab_stage
+            self.check_x_rows = x_stage // 128
+            self.check_sf_atoms = sf_stage // 512
+            pair = 2 if self.mma_tiler[0] != self.cta_tile_shape_mnk[0] else 1
+            x_tile = self.mma_tiler[1] if self.weight_is_a else self.mma_tiler[0]
             a_stage = cute.cosize(self.a_smem_layout_staged.outer) // self.num_ab_stage
             sfa_stage = cute.cosize(self.sfa_smem_layout_staged) // self.num_ab_stage
             bad = (
-                self.weight_is_a
-                or self.cta_tile_shape_mnk[0] != 128
-                or self.mma_tiler[2] != 128
-                or a_stage != 128 * 128
-                or sfa_stage != 512
+                self.mma_tiler[2] != 128
+                or x_stage % 128 != 0
+                or self.check_x_rows * pair != x_tile
+                or self.check_x_rows > 128
+                or sf_stage % 512 != 0
+                or self.check_sf_atoms not in (1, 2)
+                or (not self.weight_is_a and self.check_sf_atoms != 1)
                 or len(self.epilog_warp_id) != 4
             )
             if cutlass.const_expr(bad):
                 raise NotImplementedError(
                     f"check_x: tile {self.mma_tiler} A stage {a_stage} SFA stage "
-                    f"{sfa_stage} epilogue warps {len(self.epilog_warp_id)}"
+                    f"{sfa_stage} B stage "
+                    f"{cute.cosize(self.b_smem_layout_staged.outer) // self.num_ab_stage}"
+                    f" SFB stage "
+                    f"{cute.cosize(self.sfb_smem_layout_staged) // self.num_ab_stage}"
+                    f" SFB layout {self.sfb_smem_layout_staged}"
+                    f" epilogue warps {len(self.epilog_warp_id)}"
                 )
 
         a_layout = cute.make_ordered_layout((m, cute.assume(k, 32), l), order=(0, 1, 2))
@@ -2181,9 +2203,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 check_i64 = cute.make_tensor(
                     cute.recast_ptr(alpha.iterator, dtype=cutlass.Int64), cute.make_layout(4)
                 )
-                x_stage_bytes = self.cta_tile_shape_mnk[0] * 128
-                x_smem = cutlass.Int32(storage.sA.data_ptr().toint())
-                sf_smem = cutlass.Int32(storage.sSFA.data_ptr().toint())
+                x_stage_bytes = self.check_x_rows * 128
+                sf_stage_bytes = self.check_sf_atoms * 512
+                if cutlass.const_expr(self.weight_is_a):
+                    x_smem = cutlass.Int32(storage.sB.data_ptr().toint())
+                    sf_smem = cutlass.Int32(storage.sSFB.data_ptr().toint())
+                else:
+                    x_smem = cutlass.Int32(storage.sA.data_ptr().toint())
+                    sf_smem = cutlass.Int32(storage.sSFA.data_ptr().toint())
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 if cutlass.const_expr(self.die_claim):
@@ -2194,21 +2221,25 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[2],
                 )
                 if cutlass.const_expr(self.check_x):
-                    # Lamport check of this tile's activation (A) stages (``check_x``)
+                    # Lamport check of this tile's activation stages (``check_x``)
                     check_rows = check_i32[check_x.ROWS_WORD]
                     pitch = check_i32[check_x.K_WORD]
-                    first = (
-                        mma_tile_coord_mnl[0] * self.mma_tiler[0]
-                        + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
-                    )
-                    row_ok = first + tidx < check_rows
-                    sf_ok = first + (tidx % 4) * 32 + tidx // 4 < check_rows
+                    if cutlass.const_expr(self.weight_is_a):
+                        tile0 = mma_tile_coord_mnl[1] * self.mma_tiler[1]
+                        sf_first = tile0 // 128 * 128
+                    else:
+                        tile0 = mma_tile_coord_mnl[0] * self.mma_tiler[0]
+                        sf_first = tile0 + mma_tile_coord_v * self.check_x_rows
+                    first = tile0 + mma_tile_coord_v * self.check_x_rows
+                    row_ok = (tidx < self.check_x_rows) & (first + tidx < check_rows)
                     data_row = check_i64[check_x.DATA_WORD64] + cutlass.Int64(
                         first + tidx
                     ) * cutlass.Int64(pitch)
+                    sf_row = sf_first + (tidx % 4) * 32 + tidx // 4
+                    sf_ok = sf_row < check_rows
                     sf_word = (
                         check_i64[check_x.SCALE_WORD64]
-                        + cutlass.Int64(first // 128) * cutlass.Int64(pitch * 4)
+                        + cutlass.Int64(sf_first // 128) * cutlass.Int64(pitch * 4)
                         + cutlass.Int64(tidx * 4)
                     )
                     for k_tile in cutlass.range(k_tile_cnt, unroll=1):
@@ -2235,13 +2266,24 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                             )
                         wrote = check_x.check_stage(
                             x_smem + s * x_stage_bytes,
-                            sf_smem + s * 512,
+                            sf_smem + s * sf_stage_bytes,
                             tidx,
                             row_ok,
                             data_row + cutlass.Int64(k_tile * 128),
                             sf_ok,
                             sf_word + cutlass.Int64(k_tile * 512),
                         )
+                        if cutlass.const_expr(self.check_sf_atoms == 2):
+                            # the window's second 128-row scale atom (scales only)
+                            wrote |= check_x.check_stage(
+                                x_smem + s * x_stage_bytes,
+                                sf_smem + s * sf_stage_bytes + 512,
+                                tidx,
+                                False,
+                                data_row,
+                                sf_row + 128 < check_rows,
+                                sf_word + cutlass.Int64(pitch * 4 + k_tile * 512),
+                            )
                         if wrote != 0:
                             check_x.fence_proxy_async_smem()
                         cute.arch.sync_warp()

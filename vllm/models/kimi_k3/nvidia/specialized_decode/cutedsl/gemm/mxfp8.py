@@ -213,7 +213,7 @@ class Mxfp8Projection:
     """``out[R, N] = x @ W^T`` for an MXFP8 weight (module docstring) for each
     prepared R with its kind. ``run(x, out)``: ``x`` BF16 [R, K] (quantized into the
     scratch) or an ``mxfp8_act.Mxfp8Buffer`` view of R rows; ``out`` BF16 [R, N]
-    packed rows. ``checked``: the non-swap "pre" GEMMs check their activation
+    packed rows. ``checked``: the "pre" GEMMs check their activation
     (``checked_rows``, ``sm107.check_x``): there ``x`` may be a publish-only all-gather
     (``sp_comm.CheckedMx``) read as its rows land."""
 
@@ -247,7 +247,7 @@ class Mxfp8Projection:
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
                     max_stages=found[2], device=weight.device,
-                    check=checked and not found[0][2],
+                    check=checked,
                 )  # fmt: skip
         self.checked_rows = frozenset(r for r, g in self.pre.items() if g.check)
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)

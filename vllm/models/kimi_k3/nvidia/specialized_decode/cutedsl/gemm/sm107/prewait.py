@@ -136,8 +136,8 @@ class Mxfp8PreGemm:
                 raise ValueError(f"push: {tiles} tiles > one per CTA (R {rows})")
             if tile[0] != 128 * cluster[0] or cluster[1] != 1 or die_split is not None:
                 raise ValueError(f"push: tactic {tactic} (128 rows per CTA, no die split)")
-        if check and (push or die_split is not None or not use_pdl or self.swap_ab):
-            raise ValueError("check: a PDL GEMM without push / die split / swap_ab")
+        if check and (push or die_split is not None or not use_pdl):
+            raise ValueError("check: a PDL GEMM without push / die split")
         # push: 1 relaxed.sys 16 B stores, 2 weak stores, 3 one bulk copy per row
         self.push, self.check = int(push), bool(check)
         if check:  # the whole ring (the kernel caps it at its stage count)

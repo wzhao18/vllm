@@ -26,6 +26,10 @@ from cutlass import Int32, Int64, Uint32
 from ...common.mx_rows import SCALE_SENTINEL
 from ...common.primitives import asm, published
 
+# DIAG (bench): barrier forms under test
+CTA_SCOPE = True
+WAIT_OP = "test_wait"
+
 # aux buffer words (``prewait.check_args``): int32 [2] rows, [3] K; int64 [2] data,
 # [3] scales
 ROWS_WORD, K_WORD, DATA_WORD64, SCALE_WORD64 = 2, 3, 2, 3
@@ -44,8 +48,9 @@ def mbar_init_fence():
 @asm(Int32)
 def _try_wait(bar, parity, *, cluster=False):
     sem = ".acquire.cluster" if cluster else ""
+    sem = "" if CTA_SCOPE else sem
     code = (
-        "{ .reg .pred p; mbarrier.try_wait.parity" + sem + ".shared::cta.b64 p, [$1], $2; "
+        "{ .reg .pred p; mbarrier." + WAIT_OP + ".parity" + sem + ".shared::cta.b64 p, [$1], $2; "
         "selp.s32 $0, 1, 0, p; }"
     )
     return code, "=r,r,r,~{memory}", (bar, Int32(parity))
@@ -70,7 +75,7 @@ def mbar_arrive_peer(bar, peer):
     """Arrive on the barrier at ``bar``'s offset in cluster CTA ``peer``."""
     code = (
         "{ .reg .b32 r; mapa.shared::cluster.u32 r, $0, $1; "
-        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [r]; }"
+        "mbarrier.arrive" + ("" if CTA_SCOPE else ".release.cluster") + ".shared::cluster.b64 _, [r]; }"
     )
     return code, "r,r,~{memory}", (bar, Int32(peer))
 
