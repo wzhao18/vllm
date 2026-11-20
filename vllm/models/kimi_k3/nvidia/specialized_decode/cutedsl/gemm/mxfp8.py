@@ -232,7 +232,20 @@ class Mxfp8Projection:
             n, k, self.rows
         )
         self.pre = {}
-        self.weight_dl, self.dl_rows = None, set()
+        found_all = {
+            r: pre_tactic(n, k, r) for r in self.rows if self.kinds.get(r) == "pre"
+        }
+        die_splits = {}
+        if found_all and len(found_all) == len(self.rows):
+            from .sm107.prewait import die_local_weight
+
+            placed = die_local_weight(
+                linear_or_weight, weight, n, {r: f[0] for r, f in found_all.items()
+                                              if f is not None}
+            )
+            if placed is not None:
+                weight, die_splits = placed
+                self.weight = weight
         for r in self.rows:
             kind = self.kinds.get(r)
             if kind not in MX_KINDS:
@@ -241,16 +254,12 @@ class Mxfp8Projection:
                 found = pre_tactic(n, k, r)
                 if found is None:
                     raise Unsupported(family, r, f"pre: no tactic for [{n}, {k}]")
-                from .sm107.prewait import Mxfp8PreGemm, die_weight, pair_claim_split
+                from .sm107.prewait import Mxfp8PreGemm
 
-                split = pair_claim_split(n, r, found[0], weight.device)
-                if split is not None:
-                    if self.weight_dl is None:
-                        self.weight_dl, split = die_weight(weight, found[0][0][0])
-                    self.dl_rows.add(r)
                 self.pre[r] = Mxfp8PreGemm(
                     n, k, r, found[0], use_pdl=True, prewait=found[1],
-                    max_stages=found[2], device=weight.device, die_split=split,
+                    max_stages=found[2], device=weight.device,
+                    die_split=die_splits.get(r),
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
         self.input = shared_input(family, cap or self.rows[-1], k, weight.device)
@@ -259,9 +268,7 @@ class Mxfp8Projection:
         import flashinfer
 
         if kind == "pre":
-            rows = xq.shape[0]
-            w = self.weight_dl if rows in self.dl_rows else self.weight
-            return self.pre[rows](xq, xs, w, self.scale, out)
+            return self.pre[xq.shape[0]](xq, xs, self.weight, self.scale, out)
         if kind == "scaled_mm":
             return torch._scaled_mm(
                 xq, self.weight.t(), scale_a=xs.view(torch.float8_e8m0fnu),

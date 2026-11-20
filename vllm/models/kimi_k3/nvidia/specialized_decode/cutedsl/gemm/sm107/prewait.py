@@ -188,6 +188,14 @@ class Mxfp8PreGemm:
         return args
 
     @staticmethod
+    def _one_tile_per_cta(tactic, rows, n) -> bool:
+        tile, cluster, swap = tactic[0], tactic[1], tactic[2]
+        tm, tn = (-(-n // tile[0]), -(-rows // tile[1])) if swap else (
+            -(-rows // tile[0]), -(-n // tile[1])
+        )
+        return tm * tn <= _max_active_clusters(cluster[0] * cluster[1])
+
+    @staticmethod
     def _die_aux(tactic, rows, n, die_split, device, m128x2=False):
         """alpha + die-claim state: int32 [4..6] counters (die 0, die 1, done), [8..11]
         (first tile, tiles) per die, [12] M tiles, [16 + smid] die of the SM."""
@@ -218,6 +226,31 @@ class Mxfp8PreGemm:
         ints[:, 12] = n_tiles if swap else m_tiles
         ints[:, 16 : 16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=device)
         return aux
+
+
+def die_local_weight(linear, weight: torch.Tensor, n: int, tactics: dict):
+    """(die-local W, {R: die split}) when every R's pre tactic can claim tiles of its own
+    die (1x1 / 2x1 clusters, one tile per cluster), else None. W rows [0, s * 256) are homed
+    on die 0 (s balanced to the SMs per die), so every tiling's weight tiles (64 / 128 / 256
+    rows) are single-die; the linear's storage is re-pointed at the copy (no second W).
+    GEMM-EX1 ex1dl1 (in-step, -k 3): die-local W + pair claim at kda_in R384 r24 -24.3 us/step."""
+    splits = {}
+    for r, tac in tactics.items():
+        tile, cluster, swap = tac[0], tac[1], tac[2]
+        if tuple(cluster) not in ((1, 1), (2, 1)) or not Mxfp8PreGemm._one_tile_per_cta(
+            tac, r, n
+        ):
+            return None
+        rows_per_tile = tile[0] if swap else tile[1]
+        if 256 % rows_per_tile:
+            return None
+        splits[r] = 256 // rows_per_tile
+    placed, s256 = die_weight(weight, 256)
+    if linear is not None and not isinstance(linear, tuple):
+        # re-point the linear at the die-local copy (the striped original is freed)
+        stored = linear.weight.data
+        linear.weight.data = placed if stored.shape == placed.shape else placed.t()
+    return placed, {r: s256 * f for r, f in splits.items()}
 
 
 def pair_claim_split(n: int, rows: int, tactic, device) -> int | None:
