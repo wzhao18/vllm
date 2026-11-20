@@ -344,19 +344,6 @@ class OprojPushMx:
         rot = (mb * 7) % self.ktiles
         if warp >= TMA_WARP and warp < self.x_warp:
             iw = warp - TMA_WARP
-            if cutlass.const_expr(self.prefetch):
-                # The CTA's 128 weight rows (contiguous) and their scales (one 128-row
-                # F8_128x4 block) into L2 at once: the ring then loads at L2 latency.
-                lane = cute.arch.lane_idx()
-                row0 = mb * FEATURES + 128 * v
-                ops = 128 * self.k // PF_BYTES
-                if iw == 0:
-                    if lane < ops:
-                        prefetch_bytes(w_addr + Int64(row0 * self.k + lane * PF_BYTES),
-                                       PF_BYTES)  # fmt: skip
-                    if lane == ops:
-                        span = 128 * (self.k // SF_VEC)
-                        prefetch_bytes(sfw_addr + Int64((row0 // 128) * span), span)
             gA_s = tAgA[(None, mb, None, 0)]
             gSFA_s = tAgSFA[(None, mb, None, 0)]
             prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
@@ -372,6 +359,9 @@ class OprojPushMx:
                           tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
                 cute.copy(tma_sfa, gSFA_s[(None, kk)], tAsSFA[(None, prod.index)],
                           tma_bar_ptr=bar, mcast_mask=a_mask)  # fmt: skip
+                if cutlass.const_expr(self.prefetch):
+                    if t == self.stages - 1:
+                        self._prefetch(w_addr, sfw_addr, mb, v)
                 for _ in cutlass.range_constexpr(self.iw):
                     prod.advance()
             if iw == 0:
@@ -458,6 +448,20 @@ class OprojPushMx:
                 accp.consumer_release(accc)
             tmem.relinquish_alloc_permit()
             tmem.free(acc_ptr)
+
+    @cute.jit
+    def _prefetch(self, w_addr, sfw_addr, mb, v):
+        """Once the ring's first fill is issued: the CTA's 128 weight rows (contiguous;
+        both K halves) and their scales (one 128-row F8_128x4 block) into L2, so the
+        later ring loads hit L2 instead of HBM."""
+        lane = cute.arch.lane_idx()
+        row0 = mb * FEATURES + 128 * v
+        ops = 128 * self.k // PF_BYTES
+        if lane < ops:
+            prefetch_bytes(w_addr + Int64(row0 * self.k + lane * PF_BYTES), PF_BYTES)
+        if lane == ops:
+            span = 128 * (self.k // SF_VEC)
+            prefetch_bytes(sfw_addr + Int64((row0 // 128) * span), span)
 
     def _s2t(self, sSF, tSF):
         """SMEM -> TMEM scale-factor copy (tcgen05.cp 4x32dp128bit, cta_group::2)."""
