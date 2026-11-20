@@ -60,7 +60,7 @@ def make_logits(case, T, width, Lloc, gen, dev, rank=0):
             x[rare] += 0.12 * rank
         elif case == "satrow":
             if rank == 0:
-                x[rare, 1:10001:2] = 3.0
+                x[rare, 1:10001:2] = 6.0
         else:
             x[rare] = torch.relu(x[rare] - 7.0)
     elif case == "hot_recent":  # recent tokens score much higher (local position ~ L)
