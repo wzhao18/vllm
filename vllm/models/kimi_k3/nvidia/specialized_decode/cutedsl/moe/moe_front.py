@@ -3,37 +3,41 @@
 """The SP decode MoE front as ONE kernel: router | latent down GEMM, stock router
 top-k and the MegaMoE input staging (``moe_front``).
 
-Replaces router|latent GEMM -> (cuBLASLt split-K reduce) -> ``route_stage``: the
-chain from the AttnRes output ``h [n, 7168]`` to a staged MegaMoE session is one
-launch, so the per-boundary grid drain + memory flush and the separate one-row
-top-k grid leave the critical path.
+Replaces router|latent GEMM -> (split-K reduce) -> ``route_stage``: the chain from
+the AttnRes output ``h [n, 7168]`` to a staged MegaMoE session is one launch.
 
-Kernel (Rubin, tcgen05, one CTA of 256 threads per SM slot):
+Kernel (Rubin, tcgen05, one CTA of 256 threads per SM, the whole grid co-resident):
 
 * GEMM ``y = h @ W^T`` with ``W = [router (E) | latent down (L)] [E + L, K]`` BF16
   (``sp_mlp.pack_router_latent``), FP32 accumulation. Swap-AB: a 128-row weight
-  tile is the MMA M operand, the n <= 256 tokens the N operand. One cluster of C
-  CTAs per weight tile; CTA rank r streams K blocks [r kb / C, (r + 1) kb / C).
-* PDL: the kernel launches with programmatic stream serialization; the weight ring
-  is issued before ``griddepcontrol.wait`` (weights never depend on the
-  predecessor), the tokens after it. The predecessor (AttnRes reduce) triggers its
-  dependents at entry and uses ~2 KB of shared memory per CTA, so this grid's CTAs
-  can sit beside it and stream weights while it runs.
-* Split-K reduce: every CTA leaves its FP32 partial in its own shared memory; after
-  a cluster barrier rank r sums the token rows [r n / C, (r + 1) n / C) over ranks
-  0..C-1 in rank order (deterministic) from DSMEM.
-  - router tiles store the FP32 logits rows (``y``) and then count themselves done
-    (release, one global counter);
-  - latent tiles round to BF16 (as the stock BF16 latent down output) and run the
-    MegaMoE stager's quantization (NVFP4 block16 / MXFP8 block32, ``route_stage``'s
-    ``quant_*``: bitwise ``megamoe_rubin.staging._stage_kernel``) straight into the
-    session's ``x`` / ``x_sf``.
-* Top-k: CTA b < n waits (acquire) until every router CTA is done and runs stock's
-  sigmoid + bias single-group top-k on row b with ``route_stage``'s ``route_block``
-  (bitwise ``_moe_C`` ``single_group_topk``: same keys, same exact selection, same
-  ``write_outputs`` math, the stager's route rules). Router tiles are claimed first,
-  by clusters that are already running, so the wait cannot deadlock.
-* Dead rows ``[n, capacity)`` get ``topk_idx = -1`` as ``route_stage``.
+  tile is the MMA M operand, the n <= 96 tokens the N operand. Work item = (tile,
+  K split): 35 tiles x 6 splits on 210 SMs; the host plan gives every SM the items
+  whose weights its die homes (``front_image``: die-local weight image).
+* Weights before the dependency: the item's first K blocks go to TMEM (tcgen05.cp
+  through a shared-memory ring, A operand of the TS MMA), the rest stay in shared
+  memory (SS MMA). The predecessor (AttnRes reduce) uses little shared memory, so
+  this grid's CTAs enter early and the weights are on chip by griddepcontrol.wait
+  (r8/r16; at r24 the fill ends shortly after it).
+* Tokens after the dependency: 3-D TMA ops of up to 16 KiB per ring slot (several
+  issuing warps), recycled through the ring when they do not all fit.
+* MMA issue: one warp (n96), or two warps at n <= 64 (warp 1 the even token
+  groups, warp 2 the odd ones after the TMEM fill, each into its own D; the
+  epilogue adds D1 to D0): a single issuing warp bounds the MMA phase by its
+  per-iteration latency, not by the tensor pipe.
+* Split-K exchange: every CTA stores its FP32 partial [n][128] and signals its tile
+  (one release add). Latent CTAs wait for their tile, sum its partials in rank
+  order (deterministic), round to BF16 (the stock latent down output) and run the
+  MegaMoE stager's quantization (NVFP4 block16 / MXFP8 block32, ``route_stage``'s
+  ``quant_*``) straight into the session's ``x`` / ``x_sf``.
+* Top-k: the SM of row b (router items first, then latent items) waits for every
+  router tile, sums the row's logits from the partials in rank order and runs
+  stock's sigmoid + bias single-group top-k with ``route_stage``'s ``route_block``
+  (bitwise ``_moe_C`` ``single_group_topk`` keys, exact selection, write_outputs
+  math, the stager's route rules). Dead rows ``[n, capacity)`` get ``topk_idx =
+  -1`` as ``route_stage``.
+* Cold code: the tail is long straight-line code that the step's other kernels
+  evict from L2 between layers; the spare SMs (no item) run it dry before the
+  dependency so the real pass finds it in L2.
 
 Numerics vs stock: router logits FP32 with a different summation order than
 cuBLAS (same inputs, FP32 accumulation); the latent the BF16 round of an FP32 sum
@@ -75,6 +79,7 @@ struct Params {
   unsigned* cnt;     // [2 kLine] CTAs finished, [kTileCnt + kLine t] partials stored of tile t
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
   int kb, rtiles, ks, ns, xs, xg, na, nt_max, nr_max, yfull;
+  int dual;        // two MMA warps (even / odd token groups), D1 = D0 + na columns
   int dcol, acol;  // TMEM columns of D [n] and of the first weight K block  // xs: token op slots of xg blocks
   int debug;  // microbench only (0 in production): bit 0 skips the MMAs, bit 1 one
               // accumulator poller, bit 2 no per-K-block stamps, bit 3 no tail warm-up
@@ -223,6 +228,74 @@ __device__ __forceinline__ void mma16_ss(uint32_t d, uint64_t a, uint64_t b0, ui
       "add.u64 ta, %1, 3078; add.u64 tb, %5, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %6, T; }"
       ::"r"(d), "l"(a), "l"(b0), "l"(b1), "l"(b2), "l"(b3), "r"(idesc), "r"(acc));
 }
+__device__ __forceinline__ void mma8_ts(uint32_t d, uint32_t a, uint64_t b0, uint64_t b1, uint32_t idesc,
+                                         uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q, T; .reg .b32 ta; .reg .b64 tb;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %5, 0; setp.eq.u32 T, %5, %5;\n"
+      "add.u32 ta, %1, 0; add.u64 tb, %2, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, Q;\n"
+      "add.u32 ta, %1, 8; add.u64 tb, %2, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T;\n"
+      "add.u32 ta, %1, 16; add.u64 tb, %2, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T;\n"
+      "add.u32 ta, %1, 24; add.u64 tb, %2, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T;\n"
+      "add.u32 ta, %1, 32; add.u64 tb, %3, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T;\n"
+      "add.u32 ta, %1, 40; add.u64 tb, %3, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T;\n"
+      "add.u32 ta, %1, 48; add.u64 tb, %3, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T;\n"
+      "add.u32 ta, %1, 56; add.u64 tb, %3, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %4, T; }"
+      ::"r"(d), "r"(a), "l"(b0), "l"(b1), "r"(idesc), "r"(acc));
+}
+__device__ __forceinline__ void mma12_ts(uint32_t d, uint32_t a, uint64_t b0, uint64_t b1, uint64_t b2, uint32_t idesc,
+                                         uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q, T; .reg .b32 ta; .reg .b64 tb;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %6, 0; setp.eq.u32 T, %6, %6;\n"
+      "add.u32 ta, %1, 0; add.u64 tb, %2, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, Q;\n"
+      "add.u32 ta, %1, 8; add.u64 tb, %2, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 16; add.u64 tb, %2, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 24; add.u64 tb, %2, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 32; add.u64 tb, %3, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 40; add.u64 tb, %3, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 48; add.u64 tb, %3, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 56; add.u64 tb, %3, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 64; add.u64 tb, %4, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 72; add.u64 tb, %4, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 80; add.u64 tb, %4, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T;\n"
+      "add.u32 ta, %1, 88; add.u64 tb, %4, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], tb, %5, T; }"
+      ::"r"(d), "r"(a), "l"(b0), "l"(b1), "l"(b2), "r"(idesc), "r"(acc));
+}
+__device__ __forceinline__ void mma8_ss(uint32_t d, uint64_t a, uint64_t b0, uint64_t b1, uint32_t idesc,
+                                         uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q, T; .reg .b64 ta, tb;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %5, 0; setp.eq.u32 T, %5, %5;\n"
+      "add.u64 ta, %1, 0; add.u64 tb, %2, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, Q;\n"
+      "add.u64 ta, %1, 2; add.u64 tb, %2, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T;\n"
+      "add.u64 ta, %1, 4; add.u64 tb, %2, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T;\n"
+      "add.u64 ta, %1, 6; add.u64 tb, %2, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T;\n"
+      "add.u64 ta, %1, 1024; add.u64 tb, %3, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T;\n"
+      "add.u64 ta, %1, 1026; add.u64 tb, %3, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T;\n"
+      "add.u64 ta, %1, 1028; add.u64 tb, %3, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T;\n"
+      "add.u64 ta, %1, 1030; add.u64 tb, %3, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %4, T; }"
+      ::"r"(d), "l"(a), "l"(b0), "l"(b1), "r"(idesc), "r"(acc));
+}
+__device__ __forceinline__ void mma12_ss(uint32_t d, uint64_t a, uint64_t b0, uint64_t b1, uint64_t b2, uint32_t idesc,
+                                         uint32_t acc) {
+  asm volatile(
+      "{ .reg .pred P, Q, T; .reg .b64 ta, tb;\n"
+      "elect.sync _|P, 0xffffffff; setp.ne.b32 Q, %6, 0; setp.eq.u32 T, %6, %6;\n"
+      "add.u64 ta, %1, 0; add.u64 tb, %2, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, Q;\n"
+      "add.u64 ta, %1, 2; add.u64 tb, %2, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 4; add.u64 tb, %2, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 6; add.u64 tb, %2, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 1024; add.u64 tb, %3, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 1026; add.u64 tb, %3, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 1028; add.u64 tb, %3, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 1030; add.u64 tb, %3, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 2048; add.u64 tb, %4, 0; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 2050; add.u64 tb, %4, 2; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 2052; add.u64 tb, %4, 4; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T;\n"
+      "add.u64 ta, %1, 2054; add.u64 tb, %4, 6; @P tcgen05.mma.cta_group::1.kind::f16 [%0], ta, tb, %5, T; }"
+      ::"r"(d), "l"(a), "l"(b0), "l"(b1), "l"(b2), "r"(idesc), "r"(acc));
+}
 // One 128 x 64 BF16 K block (SWIZZLE_128B smem) -> 32 TMEM columns: 4 x 128x256b.
 __device__ __forceinline__ void cp4_el(uint32_t taddr, uint64_t src) {
   asm volatile(
@@ -369,6 +442,66 @@ __device__ __forceinline__ void mma_loop(const Params& p, const MmaLoop& m, bool
   }
 }
 
+// Dual MMA issue: the MMA phase is bound by ONE warp's issue latency (~425 clk per loop
+// iteration with no waits; drain bench r4b/r4f), so two warps issue in parallel: warp 1
+// the even token groups into D0, warp 2 (after the TMEM fill) the odd ones into D1; the
+// epilogue adds D1 to D0. Group g = K blocks [g xg, min(g xg + xg, nk)) in token slot
+// g % xs (parity (g / xs) & 1); weight block j in TMEM (j < nt, filled in order) or in
+// shared memory (j >= nt, one barrier for all).
+__device__ __forceinline__ void mma_groups(const Params& p, const MmaLoop& m, bool mma, int g0) {
+  const int xg = p.xg, xs = p.xs, nk = m.nk, nt = m.nt;
+  const int ng = (nk + xg - 1) / xg;
+  int ready = 0;
+  bool res_ok = nt >= nk, first = true;
+  for (int g = g0; g < ng; g += 2) {
+    const int gs = g % xs;
+    const uint32_t xph = (g / xs) & 1;
+    const int j0 = g * xg, j1 = min(j0 + xg, nk);
+    const int tl = min(j1, nt);
+    if (tl > ready) {
+      mbar_wait(m.trdy0 + 8 * (tl - 1), 0);
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      ready = tl;
+    }
+    if (j1 > nt && !res_ok) {
+      mbar_wait(m.res_bar, 0);
+      res_ok = true;
+    }
+    mbar_wait(m.xfull0 + 8 * gs, xph);
+    const uint64_t b0 = m.x0 + p.xslot[gs] * (kSlot >> 4);
+    if (mma) {
+      const uint32_t a0 = first ? 0u : 1u;
+      const uint64_t s0 = m.a_ss + static_cast<uint64_t>(j0 - nt) * (kSlot >> 4);
+      const uint64_t x1 = b0 + m.xstep, x2 = b0 + 2 * m.xstep, x3 = b0 + 3 * m.xstep;
+      if (j1 - j0 == 4 && j1 <= nt) {
+        mma16_ts(m.d_tm, m.a_tm + 32 * j0, b0, x1, x2, x3, m.idesc, a0);
+      } else if (j1 - j0 == 4 && j0 >= nt) {
+        mma16_ss(m.d_tm, s0, b0, x1, x2, x3, m.idesc, a0);
+      } else if (j1 - j0 == 3 && j1 <= nt) {
+        mma12_ts(m.d_tm, m.a_tm + 32 * j0, b0, x1, x2, m.idesc, a0);
+      } else if (j1 - j0 == 3 && j0 >= nt) {
+        mma12_ss(m.d_tm, s0, b0, x1, x2, m.idesc, a0);
+      } else if (j1 - j0 == 2 && j1 <= nt) {
+        mma8_ts(m.d_tm, m.a_tm + 32 * j0, b0, x1, m.idesc, a0);
+      } else if (j1 - j0 == 2 && j0 >= nt) {
+        mma8_ss(m.d_tm, s0, b0, x1, m.idesc, a0);
+      } else {
+        for (int j = j0; j < j1; ++j) {
+          const uint64_t b = b0 + static_cast<uint64_t>(j - j0) * m.xstep;
+          const uint32_t acc = first && j == j0 ? 0u : 1u;
+          if (j < nt) {
+            mma4_ts(m.d_tm, m.a_tm + 32 * j, b, m.idesc, acc);
+          } else {
+            mma4_ss(m.d_tm, m.a_ss + static_cast<uint64_t>(j - nt) * (kSlot >> 4), b, m.idesc, acc);
+          }
+        }
+      }
+    }
+    first = false;
+    if ((g + xs) * xg < nk) commit_el(m.xempty0 + 8 * gs);
+  }
+}
+
 // One CTA per (128-row weight tile, K split): blockIdx = tile * ks + split. 1 CTA/SM,
 // the whole grid co-resident (host check). Weight K blocks of the CTA: the first nt
 // live in TMEM (A operand of the TS MMA, filled by tcgen05.cp through the ring before
@@ -421,7 +554,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       mbar_init(xempty0 + 8 * s, 1);
     }
     mbar_init(res_bar, 1);
-    mbar_init(acc_bar, 1);
+    mbar_init(acc_bar, p.dual ? 2 : 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   if (threadIdx.x == 32) {
@@ -529,6 +662,14 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         ph ^= 1;
       }
     }
+    if (p.dual) {
+      const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
+                             (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
+      const MmaLoop m{tmem + p.dcol + p.na, tmem + p.acol, smem_desc(res_s), smem_desc(ring_s),
+                      static_cast<uint32_t>(n) * 8, idesc, nk, nt, xfull0, xempty0, res_bar, trdy0};
+      mma_groups(p, m, !(p.debug & 1), 1);
+      commit_el(acc_bar);
+    }
   } else if (warp == 1) {
     // kind::f16: BF16 A/B, FP32 D, K-major, M = 128 weight rows, N = n tokens.
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
@@ -548,7 +689,9 @@ __global__ void __maxnreg__(96)  // launched with kThreads
                     xempty0,
                     res_bar,
                     trdy0};
-    if (p.stamps && !(p.debug & 4)) {
+    if (p.dual) {
+      mma_groups(p, m, !(p.debug & 1), 0);
+    } else if (p.stamps && !(p.debug & 4)) {
       if (p.xg == 4) {
         mma_loop<true, true>(p, m, !(p.debug & 1), lane);
       } else {
@@ -581,6 +724,12 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int c = 0; c < n; c += 16) {
       float v[16];
       tmem_ld16(ta + c, v);
+      if (p.dual) {  // D0 + D1 (fixed order)
+        float w[16];
+        tmem_ld16(ta + p.na + c, w);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) v[j] += w[j];
+      }
 #pragma unroll
       for (int j = 0; j < 16; ++j) __stcg(dst + (c + j) * 128, v[j]);
     }
@@ -760,10 +909,14 @@ static int static_smem() {
 
 // TMEM: D in columns [0, na), then as many weight K blocks (32 columns each) as fit;
 // the rest of the CTA's K blocks in shared memory; the ring takes what is left.
-static Plan plan_for(int n, int kb, int ks, int ns) {
+static Plan plan_for(int n, int kb, int ks, int ns, bool dual = false) {
   Plan pl;
   pl.na = (n + 31) / 32 * 32;
-  pl.nt_max = std::min(kMaxT, (512 - pl.na) / 32);
+  pl.nt_max = std::min(kMaxT, (512 - (dual ? 2 : 1) * pl.na) / 32);
+  if (dual) {  // whole token groups in TMEM or in shared memory: one issue per group
+    const int xg = std::max(1, std::min(4, kSlot / (n * 128)));
+    pl.nt_max = pl.nt_max / xg * xg;
+  }
   const int nk_max = (kb + ks - 1) / ks;
   pl.nr_max = std::max(0, nk_max - pl.nt_max);
   const int fixed = 1024 + pl.nr_max * kSlot;
@@ -851,7 +1004,8 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
                   sf.size(1) >= hidden / vec && x.stride(0) % 16 == 0 &&
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
               "moe_front: session shapes");
-  const Plan pl = plan_for((int)n, (int)kb, (int)ks, (int)(ns & 255));
+  const bool dual = (ns >> 9) & 1;  // two MMA warps (even / odd token groups)
+  const Plan pl = plan_for((int)n, (int)kb, (int)ks, (int)(ns & 255), dual);
   int dev = h.get_device(), sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   const int64_t grid = sms;  // one CTA per SM (plan: SM -> item)
@@ -915,8 +1069,9 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
   p.na = pl.na;
   // ns bits 8+: TMEM layout (0: D in the first columns, 1: D in the last columns).
   const bool dtop = (ns >> 8) & 1;
-  p.dcol = dtop ? 512 - pl.na : 0;
-  p.acol = dtop ? 0 : pl.na;
+  p.dual = dual ? 1 : 0;
+  p.dcol = dtop ? 512 - (dual ? 2 : 1) * pl.na : 0;
+  p.acol = dtop ? 0 : (dual ? 2 : 1) * pl.na;
   p.nt_max = pl.nt_max;
   p.nr_max = pl.nr_max;
   p.xs = pl.xs;
@@ -960,7 +1115,8 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& wimg, const torch::T
 
 // (ring slots, shared-memory weight K blocks, dynamic smem bytes) at this shape.
 std::vector<int64_t> moe_front_plan(int64_t n, int64_t k, int64_t ks, int64_t ns) {
-  const k3front::Plan pl = k3front::plan_for((int)n, (int)(k / 64), (int)ks, (int)(ns & 255));
+  const k3front::Plan pl =
+      k3front::plan_for((int)n, (int)(k / 64), (int)ks, (int)(ns & 255), (ns >> 9) & 1);
   return {pl.ns, pl.nr_max, pl.smem, pl.xs};
 }
 
@@ -1055,7 +1211,13 @@ def config_for(n: int, device=None):
         return None
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     ks = min(MAX_SPLITS, sms // 35)
-    return (ks, 0) if ks >= 2 else None
+    # ns: ring slots in bits 0-7 (0: as many as fit), bit 9: two MMA-issuing warps.
+    # Two MMA warps where the 2n D columns leave the token ring its slots: n <= 64 (bench
+    # r4m: -1.5 / -0.5 us/layer at n32 / n64); at n96 the weight blocks would not fit.
+    return (ks, DUAL_MMA if n <= 64 else 0) if ks >= 2 else None
+
+
+DUAL_MMA = 1 << 9  # ns bit: warp 1 issues the even token groups, warp 2 the odd ones
 
 
 _SLOT = 128 * 64 * 2  # one [128 rows][64 K] BF16 tile (kSlot)
