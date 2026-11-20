@@ -557,7 +557,6 @@ def test_p_scheduler_keeps_the_lease_while_the_send_is_held(kvfp_dir):
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kda_group", [None, 0], ids=["attention", "kda+attention"])
 def _state_slots(engine, table) -> dict[int, int]:
     """The running-state slot of each KDA group: its last block before the
     speculative scratch slots."""
@@ -570,6 +569,7 @@ def _state_slots(engine, table) -> dict[int, int]:
     return slots
 
 
+@pytest.mark.parametrize("kda_group", [None, 0], ids=["attention", "kda+attention"])
 def test_d_scheduler_sends_each_pull_with_its_plan(kvfp_dir, kda_group):
     """Two turns, the second hitting the m = 2 D blocks the first cached. Each
     pull's fingerprint inputs go with its plan, once: P's request id, the
