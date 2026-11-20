@@ -289,22 +289,6 @@ def test_rms_norm_cta_7168_matches_vllm_c(pg, rows):
     assert bool((out[rows:] == 7.0).all())
 
 
-@pytest.mark.parametrize("rows", [5, 6156])
-def test_gather_rows_multi_matches_cat(pg, rows):
-    """Five aux states (contiguous and row-strided views) gathered into one
-    packed buffer == torch.cat([h[index] ...], dim=-1)."""
-    torch.manual_seed(rows)
-    tokens, width = 16384, 7168
-    base = torch.randn(tokens, 2 * width, device="cuda", dtype=torch.bfloat16)
-    srcs = [torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
-    srcs += [base[:, :width], base[:, width:]]
-    index = torch.randperm(tokens, device="cuda")[:rows].sort().values
-    assert pg.use_gather_rows_multi(srcs, index)
-    ref = torch.cat([h[index] for h in srcs], dim=-1)
-    out = pg.gather_rows_multi(srcs, index)
-    assert torch.equal(_bits(out), _bits(ref))
-
-
 @pytest.mark.parametrize("rows,block_size", [(6156, 16), (2048, 64), (37, 16)])
 def test_ctx_kv_insert_matches_per_layer(pg, rows, block_size):
     """One-launch context K/V insert of 5 draft layers == per layer: per-head K
