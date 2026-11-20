@@ -199,8 +199,8 @@ def test_shared_situ_gemm_padded_n_tiles(inter, tactic):
     [
         # 3 N tiles over 2x2 clusters: the 4th (padded) tile is a shared tile.
         (256, 256, ((256, 256), (2, 2), True)),
-        # 7 N tiles over 2x2 clusters.
-        (512, 1280, ((256, 256), (2, 2), True)),
+        # 11 N tiles (2 latent + 9 shared) over 2x2 clusters.
+        (512, 1152, ((256, 256), (2, 2), True)),
         # The packed GEMM's default tactic (2x1 cluster: no padded N tiles).
         (3584, 6144, None),
     ],

@@ -106,6 +106,7 @@ def test_pre_push_rejects_width():
     N does not divide, or swap_ab must refuse at build; the deployed o_proj
     pre_push tactics still build."""
     o_n, o_k = 7168, 3072
+    torch.zeros(1, device=DEVICE)  # a current CUDA context before the host-side compile
     with pytest.raises(ValueError, match="receive row width"):
         Mxfp8PreGemm(3072, o_k, 128, ((128, 128), (1, 1), False, 128), push=3, device=DEVICE)
     with pytest.raises(ValueError, match="receive row width"):
