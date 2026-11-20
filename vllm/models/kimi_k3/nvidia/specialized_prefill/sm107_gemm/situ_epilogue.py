@@ -35,7 +35,7 @@ from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
 )
 
-from .conv_epilogue import lds_v4, stg_v4
+from .conv_epilogue import lds_v4, stg_v4, sts_v4
 
 _ONE = "0f3F800000"
 _NEG_ONE = "0fBF800000"
@@ -208,6 +208,24 @@ def st_global_v8_b32(addr, vals, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def st_global_v8_b32_if(addr, pred, vals, *, loc=None, ip=None) -> None:
+    """``st_global_v8_b32`` when ``pred`` (Int32) is nonzero."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)]
+        + [Uint32(v).ir_value(loc=loc, ip=ip) for v in vals],
+        "{ .reg .pred p; setp.ne.s32 p, $1, 0; "
+        "@p st.global.v8.b32 [$0], {$2, $3, $4, $5, $6, $7, $8, $9}; }",
+        "l,r,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def sts_b32(addr, val, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -238,10 +256,10 @@ def st_global_b32(addr, val, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def warp_yield(*, loc=None, ip=None) -> None:
-    """``nanosleep 0``: lets the scheduler pick another warp (MMA/TMA)."""
+def warp_yield(ns: int = 0, *, loc=None, ip=None) -> None:
+    """``nanosleep ns``: lets the scheduler pick another warp (MMA/TMA)."""
     llvm.inline_asm(
-        None, [], "nanosleep.u32 0;", "", has_side_effects=True,
+        None, [], f"nanosleep.u32 {ns};", "", has_side_effects=True,
         is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
     )  # fmt: skip
 
@@ -782,6 +800,7 @@ def epilogue_situ_mxfp8_drain(
     roll: Constexpr = 0,
     store: Constexpr = 0,
     smem_scr: cutlass.Int32 = None,
+    q_ld: cutlass.Int64 = None,
 ) -> pipeline.PipelineState:
     """Drain-and-release form of ``epilogue_situ_mxfp8`` for the 1-stage
     B-reuse tile (8 epilogue warps; warp group g owns M block g): every thread
@@ -956,6 +975,8 @@ def epilogue_situ_mxfp8_drain(
                 if cutlass.const_expr(packed and store == 3):
                     for q in cutlass.range_constexpr(8):
                         xs[0] = xs[0] ^ rQ32[q]
+                elif cutlass.const_expr(packed and store == 5):
+                    pass
                 elif cutlass.const_expr(packed):
                     if row < m_rows:
                         st_global_v8_b32(
@@ -966,7 +987,46 @@ def epilogue_situ_mxfp8_drain(
                     cute.copy(store_atom, rQ, tTR_gQ[(None, None, None, g, ni)])
             for i in cutlass.range_constexpr(2 * half * per - shift):
                 buf[i] = buf[i + shift]
-        if cutlass.const_expr(packed and store == 1):
+            if cutlass.const_expr(packed and store == 5 and roll == 1):
+                # Park the block's 32 bytes in the slot the shift just freed;
+                # after the last step block b sits at buf[32 * b : 32 * b + 8].
+                for q in cutlass.range_constexpr(8):
+                    buf[2 * half * per - shift + q] = rQ32[q]
+            if cutlass.const_expr(yield_mode >= 10):
+                # Spread the epilogue over the next tile's mainloop.
+                warp_yield(yield_mode)
+        if cutlass.const_expr(packed and store == 5 and roll == 1):
+            # Full-line stores: each warp transposes its 32 rows x 128 bytes
+            # through 2 KB of shared memory in two 16-row passes, so lanes
+            # 4k..4k+3 write the four 32-byte blocks of one row and every
+            # 256-bit store instruction writes eight whole 128-byte lines.
+            lane = tidx % 32
+            wbase = smem_scr + (tidx // 32) * 2048
+            base0 = tTR_gQ[(None, None, None, g, 0)].iterator.toint()
+            for p in cutlass.range_constexpr(2):
+                if lane // 16 == p:
+                    r = lane % 16
+                    for q in cutlass.range_constexpr(8):
+                        b, h = q // 2, (q % 2) * 4
+                        sts_v4(
+                            wbase + r * 128 + (((r % 8) ^ q) * 16), Int32(1),
+                            buf[32 * b + h], buf[32 * b + h + 1],
+                            buf[32 * b + h + 2], buf[32 * b + h + 3],
+                        )  # fmt: skip
+                cute.arch.sync_warp()
+                for j in cutlass.range_constexpr(2):
+                    k = lane // 4 + 8 * j
+                    b = lane % 4
+                    v0 = lds_v4(wbase + k * 128 + (((2 * b) ^ (k % 8)) * 16))
+                    v1 = lds_v4(wbase + k * 128 + (((2 * b + 1) ^ (k % 8)) * 16))
+                    trow = 16 * p + k
+                    ok = Int32(0)
+                    if row0 - lane + trow < m_rows:
+                        ok = Int32(1)
+                    gaddr = base0 + Int64(trow - lane) * q_ld + Int64(b * 32)
+                    st_global_v8_b32_if(gaddr, ok, [*v0, *v1])
+                cute.arch.sync_warp()
+        if cutlass.const_expr(packed and (store == 1 or store == 5)):
             if row0 < (m_rows + 127) // 128 * 128:
                 st_global_b32(tTR_gSF[(None, None, None, g, 0)].iterator.toint(), sw[0])
         if cutlass.const_expr(packed and store == 4):

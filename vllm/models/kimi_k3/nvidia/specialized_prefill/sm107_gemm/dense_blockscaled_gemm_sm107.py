@@ -708,6 +708,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.occupancy,
             self.enable_breuse,
         )
+        # vLLM probe: cap the A/B ring depth (tactic flag ab<N>).
+        ab_cap = getattr(self, "ab_stage_cap", 0)
+        if ab_cap and self.num_ab_stage > ab_cap:
+            self.num_ab_stage = ab_cap
 
         if getattr(self, "epi_staged", False):
             self._restage_full_c(tiled_mma)
@@ -2261,6 +2265,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                         getattr(self, "epi_roll", 0),
                         getattr(self, "epi_store", 0),
                         situ_smem,
+                        mQ_mnl.layout.stride[0],
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:

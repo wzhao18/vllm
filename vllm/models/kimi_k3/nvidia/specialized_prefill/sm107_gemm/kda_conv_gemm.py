@@ -51,10 +51,14 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.epi_roll = 2 if "roll2" in flags else 1 if "roll" in flags else 0
         self.epi_store = (
             3 if "nost" in flags else 2 if "nosf" in flags else 4 if "st9" in flags
+            else 5 if "stl" in flags
             else 1 if "st8" in flags else 0
         )
-        self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else 0
+        self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else next(
+            (int(f[3:]) for f in flags if f.startswith("slp")), 0
+        )
         self.use_pdl = "pdl" in flags
+        self.ab_stage_cap = next((s for s in (3, 4, 5) if f"ab{s}" in flags), 0)
         self.epi_drain_skel = next((i for i in (11, 10, 9, 1, 2, 3, 4, 5, 6, 7, 8) if f"dskel{i}" in flags), 0)
         super().__init__(
             SF_VEC,
