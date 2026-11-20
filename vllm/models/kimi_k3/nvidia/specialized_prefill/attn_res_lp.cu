@@ -145,6 +145,12 @@ __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, uint32_t by
       : "memory");
 }
 
+__device__ __forceinline__ int ld_relaxed(const int* p) {
+  int v;
+  asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+
 __device__ __forceinline__ uint32_t pack2(float a, float b) {
   __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
   return *reinterpret_cast<uint32_t*>(&v);
@@ -171,7 +177,8 @@ struct Args {
   int sf_padded_cols;
   long long* stamps;  // probe builds only
   const int8_t* sm_die;  // SM -> die (die-local block buffer) or nullptr
-  int* claim;            // [3] claim counters (own die, other die, done)
+  int die_sms[2];        // SMs per die (claim balancing)
+  int* claim;            // [3] claim counters (die 0, die 1, done)
 };
 
 // A CTA runs G token groups of NT threads (NW warps); a group processes one
@@ -196,6 +203,9 @@ constexpr uint32_t SEG_BYTES = SEG * 2;
 #endif
 constexpr int QA = K31LP_QA;
 constexpr int QN = 8;
+// A group steals the other die's tokens while that die has more than this
+// many unclaimed tokens per SM above its own die.
+constexpr int kStealMargin = 1;
 static_assert(QA < QN && (QN & (QN - 1)) == 0);
 constexpr int G = K31LP_G;
 constexpr int CTA_THREADS = NT * G;
@@ -225,6 +235,7 @@ struct Smem {
   float w[H];
   bf16_t onw[H];
   uint64_t full[G][NW][D];
+  uint64_t cbar;  // per-call constants (w, onw) landed
   float red[G][2][NW][3];  // [.][parity][warp]: sum u^2, u.w, sum out^2
   int tq[G][QN];
   float ew[G][NW][MAXB];  // per-warp normalized block weights of the token
@@ -308,18 +319,40 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
   };
   const int cnt_own = die_count(die);
   const int cnt_oth = die_count(die ^ 1);
-  bool own_done = false;
-  // Finish a claim whose own-die atomicAdd returned j.
-  auto finish_claim = [&](int j) -> int {
-    if (!own_done) {
-      if (j < cnt_own) return die_token(die, j);
-      own_done = true;
-    }
-    const int k = atomicAdd(&a.claim[die ^ 1], 1);
-    return k < cnt_oth ? die_token(die ^ 1, k) : -1;
+  // Balanced die-aware claims (thread 0 of each group, one claim in flight
+  // per token). A claim takes the next position of one die's counter: the
+  // group's own die, unless the other die has more unclaimed tokens per SM
+  // (a.die_sms) by more than kStealMargin tokens per SM (a stolen token's
+  // rows are remote), judged from both counters one claim earlier. Dies with
+  // unequal SM counts (100/112, 102/110, 108/104 parts) then finish
+  // together instead of the smaller die finishing last. An exhausted counter
+  // falls back to the other die's; both exhausted -> -1 (monotonic).
+  const int s_own = a.die_sms[die], s_oth = a.die_sms[die ^ 1];
+  int src = die, pend = 0, pend_o = 0;
+  auto start_claim = [&]() {
+    pend = atomicAdd(&a.claim[src], 1);
+    if (a.sm_die != nullptr) pend_o = ld_relaxed(&a.claim[src ^ 1]);
   };
-  auto start_claim = [&]() -> int {
-    return own_done ? cnt_own : atomicAdd(&a.claim[die], 1);
+  auto finish_claim = [&]() -> int {
+    const int d = src;
+    const int cnt_d = d == die ? cnt_own : cnt_oth;
+    const int cnt_e = d == die ? cnt_oth : cnt_own;
+    int tok = pend < cnt_d ? die_token(d, pend) : -1;
+    if (tok < 0) {
+      const int k = atomicAdd(&a.claim[d ^ 1], 1);
+      if (k < cnt_e) tok = die_token(d ^ 1, k);
+      src = d ^ 1;
+    } else if (a.sm_die != nullptr) {
+      const int rem_d = cnt_d - pend - 1, rem_e = cnt_e - pend_o;
+      const int rem_own = d == die ? rem_d : rem_e;
+      const int rem_oth = d == die ? rem_e : rem_d;
+      const bool steal =
+          rem_own <= 0 ||
+          (rem_oth > 0 && (int64_t)rem_oth * s_own >
+                              (int64_t)rem_own * s_oth + (int64_t)kStealMargin * s_own * s_oth);
+      src = steal ? die ^ 1 : die;
+    }
+    return tok;
   };
 
   if (lane == 0) {
@@ -333,12 +366,13 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       sm.lhi[i] = a.lhi[i];
       sm.llo[i] = a.llo[i];
     }
-  }
-  // Per-call constants into shared memory.
-  for (int i = threadIdx.x; i < H / 4; i += CTA_THREADS) {
-    reinterpret_cast<float4*>(sm.w)[i] = __ldg(reinterpret_cast<const float4*>(a.w) + i);
-    if constexpr (NORM)
-      reinterpret_cast<uint2*>(sm.onw)[i] = __ldg(reinterpret_cast<const uint2*>(a.onw) + i);
+    // Per-call constants into shared memory: two bulk copies (one round
+    // trip), in flight across the dependency wait below.
+    mbar_init(&sm.cbar, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    mbar_expect_tx(&sm.cbar, H * 4 + (NORM ? H * 2 : 0));
+    bulk_g2s(sm.w, a.w, H * 4, &sm.cbar);
+    if constexpr (NORM) bulk_g2s(sm.onw, a.onw, H * 2, &sm.cbar);
   }
 #if K31LP_PDL
   // Programmatic dependent launch: everything above reads only per-call
@@ -351,8 +385,13 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     const int j = atomicAdd(&a.claim[die], QA);  // first QA positions at once
 #pragma unroll 1
     for (int i = 0; i < QA; ++i) {
-      sm.tq[g][i] = j + i < cnt_own ? die_token(die, j + i)
-                                    : finish_claim(own_done ? 0 : cnt_own);
+      if (j + i < cnt_own) {
+        sm.tq[g][i] = die_token(die, j + i);
+      } else {  // own die exhausted (short calls): claim synchronously
+        src = die ^ 1;
+        start_claim();
+        sm.tq[g][i] = finish_claim();
+      }
     }
   }
   __syncthreads();
@@ -412,11 +451,12 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     }
   };
   load_logits(0);
+  mbar_wait(&sm.cbar, 0);
 
   K31LP_CTA_STAMP(1);
   int par = 0;
-  // Thread 0: the own-die atomicAdd (in flight) for the next claimed position.
-  int pending = tid == 0 ? start_claim() : 0;
+  // Thread 0: the claim of the next queue position is in flight.
+  if (tid == 0) start_claim();
   [[maybe_unused]] int p_own = 0, p_oth = 0;
   for (int it = 0;; ++it) {
     const int tt = sm.tq[g][it & (QN - 1)];
@@ -499,8 +539,8 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
     // term (no combine pass after the stream).
     K31LP_STAMP(3);
     if (tid == 0) {
-      sm.tq[g][(it + QA) & (QN - 1)] = finish_claim(pending);
-      pending = start_claim();  // in flight for a whole token
+      sm.tq[g][(it + QA) & (QN - 1)] = finish_claim();
+      start_claim();  // in flight for a whole token
     }
     group_sync(g);
     K31LP_STAMP(4);
@@ -706,13 +746,18 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
                  double eps, double oeps, c10::optional<torch::Tensor> out,
                  c10::optional<torch::Tensor> q, c10::optional<torch::Tensor> sf,
                  int64_t depth, c10::optional<torch::Tensor> sm_die,
+                 int64_t sms0, int64_t sms1,
                  torch::Tensor claim, c10::optional<torch::Tensor> stamps) {
   using namespace k31lp;
   TORCH_CHECK(prefix.dim() == 2 && prefix.size(1) == H && prefix.stride(0) == H);
   TORCH_CHECK(blocks.dim() == 3 && blocks.size(2) == H && blocks.stride(2) == 1);
   TORCH_CHECK(n >= 0 && n <= MAXB && n <= blocks.size(1));
   TORCH_CHECK(widx < blocks.size(1));
-  TORCH_CHECK(w.scalar_type() == torch::kFloat32 && w.numel() == H);
+  TORCH_CHECK(w.scalar_type() == torch::kFloat32 && w.numel() == H && w.is_contiguous());
+  TORCH_CHECK(!onw.has_value() || (onw->numel() == H && onw->is_contiguous()));
+  TORCH_CHECK((reinterpret_cast<uintptr_t>(w.data_ptr()) & 15) == 0 &&
+                  (!onw.has_value() || (reinterpret_cast<uintptr_t>(onw->data_ptr()) & 15) == 0),
+              "attn_res_lp: w / output norm weight must be 16-byte aligned (bulk copies)");
   TORCH_CHECK(lptr.device().is_cpu() && lptr.scalar_type() == torch::kInt64 &&
               lptr.numel() >= 2 * n);
   TORCH_CHECK(rstd.scalar_type() == torch::kFloat32 && rstd.dim() == 2);
@@ -748,6 +793,10 @@ static void attn_res_lp(torch::Tensor prefix, c10::optional<torch::Tensor> prefi
   TORCH_CHECK(!sm_die.has_value() || (sm_die->scalar_type() == torch::kInt8 && sm_die->numel() >= 1024));
   TORCH_CHECK(depth < QA, "attn_res_lp: ring depth >= claim run-ahead");
   a.sm_die = sm_die.has_value() ? sm_die->data_ptr<int8_t>() : nullptr;
+  TORCH_CHECK(!sm_die.has_value() || (sms0 > 0 && sms1 > 0),
+              "attn_res_lp: die-local claims need the SM count of both dies");
+  a.die_sms[0] = (int)std::max<int64_t>(sms0, 1);
+  a.die_sms[1] = (int)std::max<int64_t>(sms1, 1);
   a.claim = claim.data_ptr<int>();
   a.stamps = stamps.has_value() ? reinterpret_cast<long long*>(stamps->data_ptr()) : nullptr;
   a.write_prefix = delta.has_value() || widx >= 0 || prefix_dst.has_value();

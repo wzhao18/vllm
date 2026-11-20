@@ -32,6 +32,15 @@ def _two_dies(device: int) -> bool:
 
 
 @functools.cache
+def die_sm_counts(device: int) -> tuple[int, int]:
+    """SMs per die, as mapped by the SM -> die table (claim balancing)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
+
+    table = [max(d, 0) for d in dies.sm_domains(device)]
+    return table.count(0), table.count(1)
+
+
+@functools.cache
 def _sm_die(device: int) -> torch.Tensor:
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common import dies
 
