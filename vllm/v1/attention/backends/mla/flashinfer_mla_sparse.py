@@ -1649,6 +1649,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             self.bmm1_scale,
             self.bmm2_scale,
         )
+        import os as _os
+        if _os.environ.get("PSHORT_PROBE") and not torch.cuda.is_current_stream_capturing():
+            _pshort_probe(self, psm, q, kv_rows, num_tokens, attn_metadata, block_size,
+                          block_stride_rows, out)
         self._fused_query = None
         return out, None
 
@@ -1819,3 +1823,41 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         elif lse is not None:
             _finish_dcp_partials(out, lse, seq_lens)
         return out, lse
+
+
+_PSHORT_N = [0]
+
+
+def _pshort_probe(self, psm, q, kv_rows, num_tokens, md, block_size, stride, out):
+    """PSHORT diag (not for merge): top-k row checks + MLA kernel determinism."""
+    torch.cuda.synchronize()
+    idx = self.topk_indices_buffer[:num_tokens].clone()
+    req = md.req_id_per_token[:num_tokens]
+    valid = (idx >= 0).sum(1)
+    hole = ((idx[:, 1:] >= 0) & (idx[:, :-1] < 0)).any(1)
+    big = torch.where(idx < 0, torch.full_like(idx, 1 << 30), idx)
+    srt = big.sort(1).values
+    srt = torch.where(srt == (1 << 30), torch.full_like(srt, -1), srt)
+    ar = torch.arange(idx.shape[1], device=idx.device, dtype=torch.int64)
+    dense = ((srt.long() == ar[None, :]) | (srt < 0)).all(1)
+    ocs = int((idx.long() * (ar[None, :] + 1)).sum())
+    scs = int((srt.long() * (ar[None, :] + 1)).sum())
+    dup = int(((srt[:, 1:] == srt[:, :-1]) & (srt[:, 1:] >= 0)).sum())
+    args = (q, kv_rows, None, req, md.block_table, block_size, stride,
+            self.bmm1_scale, self.bmm2_scale)
+    o2 = psm.sparse_mla_prefill_logical(q, kv_rows, idx, *args[3:])
+    o3 = psm.sparse_mla_prefill_logical(q, kv_rows, srt.contiguous(), *args[3:])
+    torch.cuda.synchronize()
+    def rr(a, b):
+        d = (a.float() - b.float()).square().mean().sqrt()
+        return float(d / b.float().square().mean().sqrt().clamp(min=1e-12))
+    k = _PSHORT_N[0]
+    _PSHORT_N[0] += 1
+    from vllm.distributed.parallel_state import get_world_group
+    if get_world_group().rank_in_group == 0:
+        print(f"[pshort] call{k} T={num_tokens} K={idx.shape[1]} valid[min,max]="
+              f"[{int(valid.min())},{int(valid.max())}] v0={int(valid[0])} vL={int(valid[-1])}"
+              f" holes={int(hole.sum())} dense_rows={int(dense.sum())} dup={dup}"
+              f" ocs={ocs} scs={scs} out_cs={float(out.float().abs().sum()):.6f}"
+              f" rerun_eq={bool(torch.equal(out, o2))} rr_rerun={rr(o2, out):.3e}"
+              f" rr_sorted={rr(o3, out):.3e}", flush=True)
