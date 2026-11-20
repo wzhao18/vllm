@@ -30,7 +30,6 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import use_cute_dsl  # noqa: E402
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (  # noqa: E402
     MX_KINDS,
     Mxfp8Projection,
-    DENSE_MAX_ROWS,
     mxfp8_tactics,
     stock_kind,
 )
@@ -96,7 +95,6 @@ def test_kinds_vs_stock(family):
     wq, sw, ws = mx_weight(n, k, 1)
     rows = ROWS[family]
     for kind in MX_KINDS:
-        rows = [r for r in ROWS[family] if kind != "dense_mx8" or r <= DENSE_MAX_ROWS]
         proj = Mxfp8Projection(
             (wq, sw), rows, family=f"t_{family}", tactics=dict.fromkeys(rows, kind)
         )
