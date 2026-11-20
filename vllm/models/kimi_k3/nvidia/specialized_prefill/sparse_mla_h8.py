@@ -202,6 +202,22 @@ def compiler_fence():
     return "", "~{memory}", ()
 
 
+@asm(Int64)
+def clock64():
+    return "mov.u64 $0, %clock64;", "=l,~{memory}", ()
+
+
+@asm(Int64)
+def globaltimer():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
+
+
+@asm()
+def red_add_u64(address, value):
+    return ("red.relaxed.gpu.global.add.u64 [$0], $1;", "l,l,~{memory}",
+            (Int64(address), Int64(value)))
+
+
 @asm()
 def ld_global_v2_s32(ptr):
     return "ld.global.nc.v2.b32 {$0,$1}, [$2];", "=r,=r,l", (Int64(ptr),), (Int32,) * 2
@@ -453,12 +469,18 @@ class SparseMlaPrefillH8:
         # atom's rows), so the QK MMAs multiply zeros there. The kernel is power-bound at the
         # 2.3 kW cap (P-MLA run184-185: sustained -2.5%, bitwise equal): operand energy is
         # time. Production: knob 0; 9 = off (diagnostic).
-        knobs = tuple(knobs) + (0,) * (27 - len(knobs))
+        # lad (timing only, P-MLA r7 in-situ copier ladder): every role except the cp.async
+        # gather warps returns at entry; each gather lane waits the CTA-wide KVFULL of its
+        # stage g - 4 (no KVEMPTY: no consumer). 1 = C0 production warps 10, 12-18;
+        # 2 = C1 gather on warps 12-19 (2 per SMSP); 3 = C2 = C0 without the REG_LOW dealloc
+        # clk (diagnostic): thread 0 of every CTA adds its clock64 / globaltimer deltas over
+        # the kernel body and a CTA count to the u64 [3] at ``stamp`` (SM clock per call)
+        knobs = tuple(knobs) + (0,) * (29 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
          self.qkh, self.lglob, self.xphys, self.pvd, self.tconv, self.ssu,
          self.epb, self.epw, self.msk, self.zf, self.pace, self.nbs, self.nex,
-         self.sw, self.cpb, self.qz) = knobs[:27]
+         self.sw, self.cpb, self.qz, self.lad, self.clk) = knobs[:29]
         self.msk = self.msk != 9
         self.ssu = self.ssu or 16
         self.epb = self.epb != 9
@@ -570,6 +592,11 @@ class SparseMlaPrefillH8:
                 mbar_init(_bar(base, B_SLFULL + j), Uint32(1))
                 mbar_init(_bar(base, B_SLEMPTY + j), Uint32(NLD))
             cute.arch.mbarrier_init_fence()
+        c_start = Int64(0)
+        g_start = Int64(0)
+        if cutlass.const_expr(self.clk):
+            c_start = clock64()
+            g_start = globaltimer()
         if warp == 0:
             tmem_alloc_exclusive(base + Uint32(OFF_TMEM))
         tc_fence_before()
@@ -577,7 +604,27 @@ class SparseMlaPrefillH8:
         tc_fence_after()
         taddr = ld_shared_u32(base + Uint32(OFF_TMEM))
         n_mine = (rows - cta + self.grid - 1) // self.grid
-        if warp < W_SM:
+        if cutlass.const_expr(self.lad):
+            if warp >= W_SM:
+                if cutlass.const_expr(self.lad != 3):
+                    cute.arch.warpgroup_reg_dealloc(REG_LOW)
+                pw = Int32(-1)
+                if cutlass.const_expr(self.lad == 2):
+                    if warp >= 12:
+                        pw = warp - 12
+                else:
+                    if warp == 10:
+                        pw = Int32(0)
+                    elif warp >= 12 and warp <= 18:
+                        pw = warp - 11
+                if pw >= 0:
+                    lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+                    lens_t = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+                    self.gather_cp(base, pw, lane, cta, n_mine, slots, slot_stride, lens_t,
+                                   kvp, unit_rows)
+                if cutlass.const_expr(self.lad != 3):
+                    cute.arch.warpgroup_reg_alloc(REG_LAUNCH)
+        elif warp < W_SM:
             cute.arch.warpgroup_reg_alloc(REG_SM)
             self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
                          out_scale, tensormap.map_address(om))
@@ -605,6 +652,11 @@ class SparseMlaPrefillH8:
             cute.arch.warpgroup_reg_alloc(REG_LAUNCH)
         tc_fence_before()
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.clk):
+            if tid == 0 and stamp != Int64(0):
+                red_add_u64(stamp, clock64() - c_start)
+                red_add_u64(stamp + Int64(8), globaltimer() - g_start)
+                red_add_u64(stamp + Int64(16), Int64(1))
         if cutlass.const_expr(self.sstamp):
             if cta == 0 and tid < 256 and stamp != Int64(0):
                 st_global_u32(stamp + Int64(4 * tid),
@@ -853,7 +905,12 @@ class SparseMlaPrefillH8:
                     c2 = ld_global_s32_pred(rsl + Int64((t + 2) * 256),
                                             Int32(t + 2 < subs and (t + 2) * 64 + r < n))
                     compiler_fence()
-                    self.stage_wait(base, lane, g, s)
+                    if cutlass.const_expr(self.lad):
+                        if g >= 4:
+                            mbar_wait(_bar(base, B_KVFULL + (g - 4) % NS),
+                                      Uint32(((g - 4) // NS) & 1))
+                    else:
+                        self.stage_wait(base, lane, g, s)
                     src = kvp
                     nb = Uint32(0)
                     if rc >= 0:
@@ -864,6 +921,8 @@ class SparseMlaPrefillH8:
                     self.cp_signal(base, lane, g, s)
                     g = g + 1
             self.cp_drain(lane, base, g)
+            if cutlass.const_expr(self.lad):
+                cp_wait_all()
 
     @cute.jit
     def stage_wait(self, base, lane, g, s):
