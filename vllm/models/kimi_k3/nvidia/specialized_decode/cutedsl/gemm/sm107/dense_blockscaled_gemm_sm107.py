@@ -207,6 +207,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         use_pdl: bool = False,
         prewait_stages: int = 0,
         weight_is_a: bool = True,
+        quiet_wait: bool = False,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
         # vLLM decode: PDL launch; the TMA warp issues the weight operand (A when
@@ -216,6 +217,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.use_pdl = use_pdl
         self.prewait_stages = prewait_stages if use_pdl else 0
         self.weight_is_a = weight_is_a
+        self.quiet_wait = quiet_wait
 
         self.mma_inst_shape = mma_inst_shape
         self.mma_tiler = mma_tiler
@@ -1798,6 +1800,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
+            # quiet_wait: park in griddepcontrol.wait (no issue) instead of polling
+            # the first full barrier while a co-resident predecessor runs
+            if cutlass.const_expr(self.use_pdl and self.quiet_wait):
+                cute.arch.griddepcontrol_wait()
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
@@ -2021,6 +2027,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             # Alloc tensor memory buffer
             #
             tmem.allocate(self.num_tmem_alloc_cols)
+            if cutlass.const_expr(self.use_pdl and self.quiet_wait):
+                cute.arch.griddepcontrol_wait()
 
             #
             # Bar sync for retrieve tensor memory ptr from shared memory

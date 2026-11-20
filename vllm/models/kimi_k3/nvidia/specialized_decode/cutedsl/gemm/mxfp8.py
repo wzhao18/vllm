@@ -35,21 +35,29 @@ from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 
 MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm", "pre")
 
-# "pre" tactics per weight [N, K]: (first R, last R, (tile_mn, cluster_mn, swap_ab,
-# inst_m), weight k-blocks issued before griddepcontrol.wait). VR200 GEMM-EX1 r2/r3
-# (1 GPU, CUDA-graph chain of 16 calls on cold weight copies, us per call; scaled_mm /
-# fi_cute / pre): kda_in R128 12.68 / 11.23 / 10.26, R256 14.97 / 13.02 / 10.93.
+# "pre" tactics: (first R, last R, (tile_mn, cluster_mn, swap_ab, inst_m), weight k-blocks
+# issued before griddepcontrol.wait), per weight [N, K] (``PRE_TACTICS``) else by R
+# (``PRE_DEFAULT``: FlashInfer's untuned sm_107 picks at 128 / 256 / 512 rows, without
+# swap_ab). VR200 GEMM-EX1 r2/r3 (1 GPU, CUDA-graph chain of 16 calls on cold weight
+# copies, us per call; scaled_mm / fi_cute / pre): kda_in R128 12.9 / 11.2 / 10.15
+# (ltpin 10.12), R256 15.0 / 13.0 / 10.9, R384 15.2 / 17.3 / 14.8. In-step (fastab ex1a,
+# NVFP4 D3-32 slice, ABBA vs int15): r8 -1.62%, r16 -1.21%, r24 -0.13% per step.
+PRE_DEFAULT = (
+    (1, 128, ((128, 64), (1, 1), False, 128), 4),
+    (129, 256, ((256, 128), (2, 1), False, 256), 4),
+    (257, 512, ((256, 256), (2, 1), False, 256), 4),
+)
 PRE_TACTICS: dict[tuple[int, int], tuple] = {
     (12448, 7168): (
         (1, 128, ((128, 64), (1, 1), False, 128), 8),
         (129, 256, ((256, 128), (2, 1), False, 256), 4),
-        (257, 384, ((256, 256), (2, 1), False, 256), 8),
+        (257, 512, ((256, 256), (2, 1), False, 256), 8),
     ),
 }
 
 
 def pre_tactic(n: int, k: int, rows: int):
-    for lo, hi, tactic, prewait in PRE_TACTICS.get((n, k), ()):
+    for lo, hi, tactic, prewait in PRE_TACTICS.get((n, k), PRE_DEFAULT):
         if lo <= rows <= hi:
             return tactic, prewait
     return None

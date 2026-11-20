@@ -41,7 +41,7 @@ def _alpha_one(device):
 
 
 @cache
-def _compile(tactic, use_pdl, prewait, device_index):
+def _compile(tactic, use_pdl, prewait, device_index, quiet=False):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
@@ -51,6 +51,7 @@ def _compile(tactic, use_pdl, prewait, device_index):
         use_pdl=use_pdl,
         prewait_stages=prewait,
         weight_is_a=swap_ab,
+        quiet_wait=quiet,
     )
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
@@ -84,14 +85,18 @@ class Mxfp8PreGemm:
     inst_m)`` (FlashInfer's sm_107 tactic tuple). ``out_layout``: "rn" = out [R, N]
     row-major; "cn" = the swap_ab store (out viewed with strides (1, R))."""
 
-    def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, device=None):
+    def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         self.swap_ab = bool(tactic[2])
+        if self.swap_ab:  # the swap_ab store layout is not wired (out would be wrong)
+            raise ValueError("Mxfp8PreGemm: swap_ab tactics are not supported")
         tactic = (tuple(tactic[0]), tuple(tactic[1]), self.swap_ab, int(tactic[3]))
         if prewait and prewait > k // TILER_K:
             raise ValueError(f"prewait {prewait} > {k // TILER_K} k-blocks")
-        self.compiled, self.gemm = _compile(tactic, bool(use_pdl), int(prewait), device.index or 0)
+        self.compiled, self.gemm = _compile(
+            tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet)
+        )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
             raise ValueError(f"prewait {prewait} > {self.stages} smem stages")
