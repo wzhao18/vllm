@@ -31,6 +31,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (  
     MX_KINDS,
     Mxfp8Projection,
     DENSE_MAX_ROWS,
+    DENSE_TOKEN_SPLIT,
     mxfp8_tactics,
     stock_kind,
 )
@@ -49,7 +50,7 @@ SHAPES = {
 # D3-32: R = 16 r gathered rows (KDA), n = 4 r shard rows (shared expert)
 ROWS = {
     "kda_in": (4, 16, 20, 128, 384, 512),
-    "o_proj": (4, 16, 128, 384),
+    "o_proj": (4, 16, 128, 256, 384),
     "shared_gu": (1, 4, 16, 32, 96, 128),
     "shared_down": (1, 4, 32, 96, 128),
 }
@@ -96,7 +97,11 @@ def test_kinds_vs_stock(family):
     wq, sw, ws = mx_weight(n, k, 1)
     rows = ROWS[family]
     for kind in MX_KINDS:
-        rows = [r for r in ROWS[family] if kind != "dense_mx8" or r <= DENSE_MAX_ROWS]
+        rows = [
+            r for r in ROWS[family]
+            if kind != "dense_mx8"
+            or (r <= DENSE_MAX_ROWS and ((n, k) not in DENSE_TOKEN_SPLIT or r % 128 == 0))
+        ]  # fmt: skip
         proj = Mxfp8Projection(
             (wq, sw), rows, family=f"t_{family}", tactics=dict.fromkeys(rows, kind)
         )

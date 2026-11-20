@@ -51,7 +51,15 @@ MX_TUNED: dict[tuple[int, int], dict] = {
     (12448, 7168): {"*": "1-320:fi_cute,321-:scaled_mm"},
     (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
     (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
+    # KDA o_proj: token-split DenseMx8 (DENSE_TOKEN_SPLIT) at whole 128-token R.
+    # 2026-11-19 D-LINEAR-KDA M1 (Hecate 1 GPU, graph, 12 cold weight copies): R256
+    # 6.07 vs scaled_mm 6.79, R384 5.95 vs 6.95-7.07; R128 5.41 vs 5.18 (stock).
+    (7168, 3072): {"*": "256:dense_mx8,384:dense_mx8"},
 }  # fmt: skip
+
+# dense_mx8 shapes run as a token split (one CTA pair per 256 weight rows x 128
+# tokens over the full K, no split-K exchange): (N, K) -> ring stages.
+DENSE_TOKEN_SPLIT: dict[tuple[int, int], int] = {(7168, 3072): 8}
 
 
 def stock_kind(n: int, k: int, rows: int) -> str:
@@ -200,6 +208,8 @@ class Mxfp8Projection:
         for r in self.rows:
             if self.kinds[r] == "dense_mx8" and (r > DENSE_MAX_ROWS or k % 256):
                 raise Unsupported(family, r, f"dense_mx8 needs R <= {DENSE_MAX_ROWS}, K % 256")
+            if self.kinds[r] == "dense_mx8" and (n, k) in DENSE_TOKEN_SPLIT and r % 128:
+                raise Unsupported(family, r, "token-split dense_mx8 needs R % 128 == 0")
         self._dense = {
             r: _dense_engine(n, k, r, weight.device)
             for r in self.rows if self.kinds[r] == "dense_mx8"
@@ -273,7 +283,13 @@ class _DenseEngine:
         from ..common.host import stream
         from .dense_mx8 import DenseMx8
 
-        self.gemm = DenseMx8(n, k, rows, n)
+        stages = DENSE_TOKEN_SPLIT.get((n, k))
+        if stages is None:
+            self.gemm = DenseMx8(n, k, rows, n)
+        else:
+            self.gemm = DenseMx8(
+                n, k, rows, n, ksplit=1, nsplit=rows // 128, stages=stages
+            )
         words, tickets = self.gemm.scratch_words()
         self.part = torch.empty(words, dtype=torch.float32, device=device)
         self.tickets = torch.zeros(tickets, dtype=torch.int32, device=device)
