@@ -1145,14 +1145,21 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
             xhi = max(xhi, lr + kV2Win);
           }
           xhi = min(xhi, 0x10000);
-          for (int x = xhi - 1 - tid; x >= xlo; x -= T) {
+          // a rank's bound is constant below its window and above it, so g changes only at
+          // window keys: the largest x with g(x) >= K is a window key or the key just below a
+          // window. W x (kV2Win + 1) candidates instead of every key of [xlo, xhi), which
+          // spans up to the whole key range when the windows lie far apart.
+          for (int c = tid; c < W * (kV2Win + 1); c += T) {
+            const int r0 = c / (kV2Win + 1);
+            const int x = (int)(rx[r0 * kV2Msg] & 0xFFFFu) + (c - r0 * (kV2Win + 1)) - 1;
+            if (x < xlo || x >= xhi) continue;
             uint32_t g = 0;
             for (int r = 0; r < W; ++r) {
               const int lr = (int)(rx[r * kV2Msg] & 0xFFFFu);
               const uint32_t* sr = suf + r * (kV2Win + 1);
               g += x < lr ? sr[0] : (x < lr + kV2Win ? sr[x - lr] : 0u);
             }
-            if (g >= (uint32_t)K) { atomicMax(&s_r2[0], x); break; }
+            if (g >= (uint32_t)K) atomicMax(&s_r2[0], x);
           }
         }
         __syncthreads();
@@ -1296,10 +1303,18 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               __syncthreads();
               for (int r = 0; r < W; ++r) {
                 const uint32_t* e = rcv + r * RW + 4;
-                for (int i = tid; i < s_r2n[r]; i += T) {
-                  const uint32_t k = e[2 * i] & 0xFFFFu;
-                  if (lvl == 0) atomicAdd(&h[k >> 8], 1u);
-                  else if ((int)(k >> 8) == b1) atomicAdd(&h[k & 0xFFu], 1u);
+                const int nr = s_r2n[r];
+                // keys >= LB fall in a few bins: one atomic per (warp, bin), not per key
+                for (int i0 = tid & ~31; i0 < nr; i0 += T) {
+                  const int i = i0 + (tid & 31);
+                  const uint32_t k = i < nr ? e[2 * i] & 0xFFFFu : 0u;
+                  const bool in = i < nr && (lvl == 0 || (int)(k >> 8) == b1);
+                  const uint32_t bin = lvl == 0 ? k >> 8 : k & 0xFFu;
+                  const unsigned inm = __ballot_sync(0xFFFFFFFFu, in);
+                  if (in) {
+                    const unsigned peers = __match_any_sync(inm, bin);
+                    if ((tid & 31) == __ffs(peers) - 1) atomicAdd(&h[bin], (uint32_t)__popc(peers));
+                  }
                 }
               }
               __syncthreads();
