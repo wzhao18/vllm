@@ -15,7 +15,7 @@ from ......common.ptx_helpers import read_globaltimer_ns, read_smid
 
 ON = True
 REGION = "genphase.diag.stamps_ring"
-RING = 32
+RING = 64
 SLOTS = 64
 MAX_SM = 256
 ENTRY_BYTES = MAX_SM * SLOTS * 8
