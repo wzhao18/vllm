@@ -1392,8 +1392,10 @@ class TokenCommDedup(KernelComponent):
     fc1_activation_region = "nvlink.token_comm_dedup.fc1_activation"
     fc1_activation_sf_region = "nvlink.token_comm_dedup.fc1_activation_sf"
     fc2_done_region = "nvlink.token_comm_dedup.fc2_done"
-    # Order buffer the FC2 epilogue scatters into at [src_token, src_rank, dst_order_id].
+    # FC2 slab [pool row, hidden]: multi-copy rows land at their own (expert-sorted) pool row.
     fc2_order_output_region = "nvlink.token_comm_dedup.fc2_order_output"
+    # Pool row of every multi-copy route, at [src_token, src_rank, dst_order_id] (written by token_in).
+    fc2_copy_rows_region = "nvlink.token_comm_dedup.fc2_copy_rows"
     pre_reduced_activation_region = "nvlink.token_comm_dedup.pre_reduced_activation"
     pre_reduced_activation_sf_region = "nvlink.token_comm_dedup.pre_reduced_activation_sf"
     token_back_schedule_region = "nvlink.token_comm_dedup.token_back_schedule"
@@ -1810,14 +1812,21 @@ class TokenCommDedup(KernelComponent):
         workspace.register(
             self.fc2_done_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
         )
-        # Order buffer [T, R, chunks_per_row, K, chunk]; never cleared (every byte read was written this launch).
-        order_bytes = self.max_tokens_per_rank * self.world_size * self.order_block_bytes
+        # FC2 slab [pool rows, hidden] plus one chunk of tail padding (token_back loads whole chunks); never cleared
+        # (every byte read was written this launch).
+        slab_bytes = self.worst_case_token_count * self.output_token_bytes + self.order_chunk_bytes
         workspace.register(
             self.fc2_order_output_region,
             self.combine_format.act_dtype,
-            (order_bytes * 8 // int(self.combine_format.act_dtype.width),),
+            (slab_bytes * 8 // int(self.combine_format.act_dtype.width),),
             buffer_space="local",
             byte_alignment=128,
+        )
+        workspace.register(
+            self.fc2_copy_rows_region,
+            cutlass.Int32,
+            (self.max_tokens_per_rank * self.world_size * self.topk,),
+            buffer_space="local",
         )
         if self.token_back_schedule_mode == "atomic_counter":
             workspace.register(
@@ -1930,10 +1939,8 @@ class TokenCommDedup(KernelComponent):
 
     @cute.jit
     def fc2_activation_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
-        """Base of the order buffer as a (T*R*K, 1, hidden) tensor. Only the base pointer and the hidden extent
-        (shape[2]) are meaningful: the epilogue addresses rows through the chunked layout
-        [T, R, chunks_per_row, K, chunk] (``dedup_chunk_bytes`` / ``dedup_chunks_per_row`` in its impl_desc)."""
-        rows = self.max_tokens_per_rank * self.world_size * self.topk
+        """The FC2 slab as a (pool rows, 1, hidden) tensor: a multi-copy route's FC2 row sits at its pool row."""
+        rows = self.worst_case_token_count
         return cute.make_tensor(
             device_workspace.ptr(self.fc2_order_output_region),
             cute.make_layout((rows, 1, self.hidden_size), stride=(self.hidden_size, self.hidden_size, 1)),
@@ -2173,6 +2180,14 @@ class TokenCommDedup(KernelComponent):
                         issue_barrier,
                         activation_sf_bytes,
                     )
+                    if cutlass.const_expr(self.token_back_push_data):
+                        if metadata.dst_token_cnt > Int32(1):
+                            copy_rows = self._device_workspace.tensor(self.fc2_copy_rows_region)
+                            copy_rows[
+                                (Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank))
+                                * Int64(self.topk)
+                                + Int64(metadata.dst_order_id)
+                            ] = issue_pool_token
                 cute.arch.sync_warp()
                 issue_row = issue_row + global_warp_count
                 issued = issued + Int32(1)
@@ -2286,7 +2301,8 @@ class TokenCommDedup(KernelComponent):
         pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)
         fc2_done = self._device_workspace.ptr(self.fc2_done_region)
-        order_pointer = self._device_workspace.ptr(self.fc2_order_output_region)
+        slab_address = self._device_workspace.ptr(self.fc2_order_output_region).toint()
+        copy_rows = self._device_workspace.ptr(self.fc2_copy_rows_region)
         output_token_bytes = self.output_token_bytes
         # Fills issued by this worker so far: fill s uses buffer s % 2 and phase (s // 2) & 1 of its mbarrier.
         fill_sequence = Int32(0)
@@ -2332,9 +2348,18 @@ class TokenCommDedup(KernelComponent):
                     cute.arch.sync_warp()
                     iket.range_pop()
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
-                    block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)
+                    # Lane o holds the pool row of copy o (after the fc2_done acquire above; L2-coherent load).
+                    lane_copy_row = Int32(0)
+                    if lane_idx < metadata.dst_token_cnt:
+                        lane_copy_row = cute.arch.load(
+                            copy_rows + (block_index * Int64(self.topk) + Int64(lane_idx)),
+                            Int32,
+                            sem="relaxed",
+                            scope="gpu",
+                        )
                     fill_sequence = self._reduce_and_push(
-                        block_address,
+                        slab_address,
+                        lane_copy_row,
                         metadata.dst_token_cnt,
                         metadata.src_rank,
                         metadata.src_token,
@@ -2358,30 +2383,44 @@ class TokenCommDedup(KernelComponent):
         copy_count: Int32,
         worker_mbarriers: cute.Pointer,
         stage_base,
-        block_address: Int64,
+        slab_address: Int64,
+        fill_rows: Tuple,
         chunk_bytes: int,
     ) -> None:
-        """Elected lane: one 1-D TMA of the two copies of fill ``fill_idx`` (chunk-major, copies ascending) into
-        buffer ``sequence % 2``, arming that buffer's mbarrier with the byte count."""
+        """Elected lane: one 1-D TMA per copy of fill ``fill_idx`` (chunk-major, copies ascending; copy i of the fill
+        from slab row ``fill_rows[i]``) into buffer ``sequence % fill_buffers``, arming its mbarrier with the bytes."""
         chunk_idx = fill_idx // fills_per_chunk
         first_copy = (fill_idx - chunk_idx * fills_per_chunk) * Int32(self.token_back_copies_per_fill)
         copies = cutlass.min(Int32(self.token_back_copies_per_fill), copy_count - first_copy)
         buffer_idx = sequence % Int32(self.token_back_fill_buffers)
         mbarrier = worker_mbarriers + buffer_idx
-        destination = cute.make_ptr(
-            cutlass.Uint8,
-            stage_base + buffer_idx * Int32(self.token_back_copies_per_fill * chunk_bytes),
-            AddressSpace.smem,
-            assumed_align=16,
-        )
-        source = block_address + (Int64(chunk_idx) * Int64(self.topk) + Int64(first_copy)) * Int64(chunk_bytes)
+        destination_base = stage_base + buffer_idx * Int32(self.token_back_copies_per_fill * chunk_bytes)
+        chunk_offset = Int64(chunk_idx) * Int64(chunk_bytes)
         cute.arch.mbarrier_arrive_and_expect_tx(mbarrier, copies * Int32(chunk_bytes))
-        tma_load_1d(destination, source, mbarrier, copies * Int32(chunk_bytes))
+        for copy_in_fill in cutlass.range_constexpr(self.token_back_copies_per_fill):
+            if Int32(copy_in_fill) < copies:
+                destination = cute.make_ptr(
+                    cutlass.Uint8,
+                    destination_base + Int32(copy_in_fill * chunk_bytes),
+                    AddressSpace.smem,
+                    assumed_align=16,
+                )
+                source = slab_address + Int64(fill_rows[copy_in_fill]) * Int64(self.output_token_bytes) + chunk_offset
+                tma_load_1d(destination, source, mbarrier, Int32(chunk_bytes))
+
+    @cute.jit
+    def _fill_rows(self, lane_copy_row: Int32, first_copy: Int32) -> Tuple:
+        """Slab rows of copies ``first_copy ..`` of one fill, broadcast from the lanes holding them (whole warp)."""
+        rows = []
+        for copy_in_fill in cutlass.range_constexpr(self.token_back_copies_per_fill):
+            rows.append(Int32(cute.arch.shuffle_sync(lane_copy_row, first_copy + Int32(copy_in_fill))))
+        return tuple(rows)
 
     @cute.jit
     def _reduce_and_push(
         self,
-        block_address: Int64,
+        slab_address: Int64,
+        lane_copy_row: Int32,
         copy_count: Int32,
         src_rank: Int32,
         src_token: Int32,
@@ -2390,7 +2429,7 @@ class TokenCommDedup(KernelComponent):
         fill_sequence: Int32,
         chunk_bytes: int,
     ) -> Int32:
-        """Reduce the ``copy_count`` copies of the order block at ``block_address`` chunk by chunk (two copies per
+        """Reduce the ``copy_count`` copies (slab row of copy o in lane o of ``lane_copy_row``) chunk by chunk (two copies per
         TMA through two buffers, fp32 accumulation in order 0..cnt-1, one bf16 rounding) and push each chunk.
         Returns the advanced fill sequence."""
         lane_idx = self._lane_idx
@@ -2420,8 +2459,9 @@ class TokenCommDedup(KernelComponent):
         fill_count = fills_per_chunk * Int32(chunk_count)
 
         iket.range_push("token_back.push_data")
+        first_rows = self._fill_rows(lane_copy_row, Int32(0))
         with cute.arch.elect_one():
-            self._issue_fill(fill_sequence, Int32(0), fills_per_chunk, copy_count, worker_mbarriers, stage_base, block_address, chunk_bytes)
+            self._issue_fill(fill_sequence, Int32(0), fills_per_chunk, copy_count, worker_mbarriers, stage_base, slab_address, first_rows, chunk_bytes)
         # Whole-chunk fp32 accumulators (round_group x 32 lanes x 16 B covers the chunk, checked at construction).
         words = cute.make_rmem_tensor((4,), cutlass.Int32)
         acc = cute.make_rmem_tensor((4, round_group), cutlass.Int64)
@@ -2435,10 +2475,13 @@ class TokenCommDedup(KernelComponent):
             current_vectors = cutlass.min(Int32(chunk_bytes), Int32(output_token_bytes) - chunk_idx * Int32(chunk_bytes)) // Int32(16)
             # Prefetch fill i+1 into the other buffer. If that buffer just fed a bulk copy, wait for its READ only.
             if fill_idx + Int32(1) < fill_count:
+                next_fill = fill_idx + Int32(1)
+                next_first_copy = (next_fill - (next_fill // fills_per_chunk) * fills_per_chunk) * Int32(copies_per_fill)
+                next_rows = self._fill_rows(lane_copy_row, next_first_copy)
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 with cute.arch.elect_one():
-                    self._issue_fill(sequence + Int32(1), fill_idx + Int32(1), fills_per_chunk, copy_count,
-                                     worker_mbarriers, stage_base, block_address, chunk_bytes)
+                    self._issue_fill(sequence + Int32(1), next_fill, fills_per_chunk, copy_count,
+                                     worker_mbarriers, stage_base, slab_address, next_rows, chunk_bytes)
             if fill_in_chunk == Int32(0):
                 for group in cutlass.range_constexpr(round_group):
                     for word in cutlass.range_constexpr(4):

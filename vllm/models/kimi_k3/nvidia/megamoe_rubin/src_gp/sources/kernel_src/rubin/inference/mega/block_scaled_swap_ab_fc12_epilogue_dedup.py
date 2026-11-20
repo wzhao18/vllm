@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
@@ -38,12 +39,12 @@ class GatedActEpilogueArgsDedup(GatedActEpilogueArgs):
 
 @dataclasses.dataclass(frozen=True)
 class Fc2DedupBulkRouter:
-    """Per work tile: the bulk-copy destination of every token this thread owns. Order-buffer slot =
-    ``(((src_token * R + src_rank) * chunks_per_row + hidden_chunk) * K + dst_order_id) * chunk``; single-copy
-    tokens map to ``pre_reduced[src_token][slot][hidden_base]`` (slot = my rank, 0 under in-kernel REDG)."""
+    """Per work tile: the bulk-copy destination of every token this thread owns. Single-copy tokens map to
+    ``pre_reduced[src_token][slot][hidden_base]`` (slot = my rank, 0 under in-kernel REDG); a multi-copy token is
+    kind 3: it reaches its own pool row of the FC2 slab through its warp's 8-row TMA box store."""
 
     metadata: cute.Tensor  # domain-offset to the tile's first pool row
-    order_base: Int64
+    pool_row_base: Int32  # pool row of the tile's first token
     remote_output: cute.Tensor  # local pre-reduced buffer (T, R, H); (T, 1, H) view of the output under REDG
     peer_rank_ptr_mapper: SymmetricBufferDevice
     local_rank: Int32
@@ -51,15 +52,12 @@ class Fc2DedupBulkRouter:
     valid_tokens_this_cta_tile: Int32
     valid_hidden_this_cta_tile: Int32
     world_size: int
-    topk: int
-    chunk_bytes: int
-    chunks_per_row: int
     element_bytes: int
     reduce_topk_in_kernel: bool
     mapping: FunctionMapping  # per-issue (epi_tid, iter_idx) -> token_in_cta_tile
     epi_tid: Int32
     dst_ptrs: Optional[cute.Tensor] = None  # i64 x copy_iters
-    valid: Optional[cute.Tensor] = None  # i32 x copy_iters: 0 skip, 1 bulk copy, 2 bulk reduce-add
+    valid: Optional[cute.Tensor] = None  # i32 x copy_iters: 0 skip, 1 bulk copy, 2 bulk reduce-add, 3 slab box
     copy_iters: int = 0
 
     @cute.jit
@@ -67,9 +65,6 @@ class Fc2DedupBulkRouter:
         copy_iters: cutlass.Constexpr[int] = self.mapping.domain.axis_size("iter_idx")
         valid = cute.make_rmem_tensor((copy_iters,), Int32)
         dst_ptrs = cute.make_rmem_tensor((copy_iters,), Int64)
-        hidden_base_bytes = Int64(self.hidden_base) * Int64(self.element_bytes)
-        chunk_index = hidden_base_bytes // Int64(self.chunk_bytes)
-        byte_in_chunk = hidden_base_bytes - chunk_index * Int64(self.chunk_bytes)
         remote_slot = Int32(0) if cutlass.const_expr(self.reduce_topk_in_kernel) else self.local_rank
         for iter_idx in cutlass.range_constexpr(copy_iters):
             token_in_tile = Int32(self.mapping.evaluate(epi_tid=self.epi_tid, iter_idx=iter_idx)["token_in_cta_tile"])
@@ -87,12 +82,7 @@ class Fc2DedupBulkRouter:
                     dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.map(local_row, md.src_rank)
                     valid[iter_idx] = Int32(2) if cutlass.const_expr(self.reduce_topk_in_kernel) else Int32(1)
                 else:
-                    block_index = Int64(md.src_token) * Int64(self.world_size) + Int64(md.src_rank)
-                    slot_index = (block_index * Int64(self.chunks_per_row) + chunk_index) * Int64(self.topk) + Int64(
-                        md.dst_order_id
-                    )
-                    dst_ptrs[iter_idx] = self.order_base + slot_index * Int64(self.chunk_bytes) + byte_in_chunk
-                    valid[iter_idx] = Int32(1)
+                    valid[iter_idx] = Int32(3)
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid, copy_iters=copy_iters)
 
     @cute.jit
@@ -152,6 +142,7 @@ def fc2_dedup_bulk_store_function(
     else:
         scratch_row = warp_idx * Int32(16) + lane_idx % Int32(16)
     copy_iters: cutlass.Constexpr[int] = fc2_output_router.mapping.domain.axis_size("iter_idx")
+    slab_row_in_warp = Int32(0)
     for ublk_iter_idx in cutlass.range_constexpr(copy_iters):
         if cutlass.const_expr(epi.two_epilogue_warpgroups):
             owned_subtile = lane_idx // Int32(8)
@@ -159,7 +150,9 @@ def fc2_dedup_bulk_store_function(
             owned_subtile = Int32(ublk_iter_idx * 2) + lane_idx // Int32(16)
         if owned_subtile == subtile_idx:
             dst_ptr, kind = fc2_output_router.get_data_dst(ublk_iter_idx)
-            if kind != Int32(0):
+            if kind == Int32(3):
+                slab_row_in_warp = Int32(1)
+            elif kind != Int32(0):
                 src_row = cute.slice_(smem_stage, (scratch_row, None))
                 if cutlass.const_expr(fc2_output_router.reduce_topk_in_kernel):
                     if kind == Int32(2):
@@ -168,6 +161,28 @@ def fc2_dedup_bulk_store_function(
                         cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
                 else:
                     cp_async_bulk_s2g(dst_ptr, src_row.iterator, copy_bytes)
+
+    # Multi-copy rows: one TMA box store of this warp's staged rows into their (consecutive) slab pool rows.
+    box_rows = epi.dedup_box_rows
+    hidden_tile = epi._EpilogueFc2HiddenTileSize
+    if cute.arch.vote_ballot_sync(slab_row_in_warp != Int32(0)) != 0:
+        with cute.arch.elect_one():
+            warp_first_row = Int32(token_row_base) + warp_idx * Int32(box_rows)
+            smem_box = cute.flat_divide(smem_stage, (box_rows, hidden_tile))[None, None, warp_first_row // box_rows, 0]
+            slab_row = (
+                fc2_output_router.pool_row_base + subtile_idx * Int32(epi._EpilogueTokenTileSize) + warp_first_row
+            )
+            gmem_box = cute.flat_divide(epi.fc2_tma_output, (box_rows, hidden_tile))[
+                None, None, slab_row // box_rows, fc2_output_router.hidden_base // hidden_tile
+            ]
+            tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
+                epi.tma_atom_fc2_output,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(smem_box, 0, 2),
+                cute.group_modes(gmem_box, 0, 2),
+            )
+            cute.copy(epi.tma_atom_fc2_output, tma_smem_src, tma_gmem_dst)
 
     cute.arch.cp_async_bulk_commit_group()
     cute.arch.cp_async_bulk_wait_group(epi.fc2_tma_stages - 1, read=True)
@@ -184,7 +199,7 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         smem_tensor: Optional[cute.Tensor],
         tma_atom_fc2_output: Optional[cute.CopyAtom],
         fc2_tma_output: Optional[cute.Tensor],
-        fc2_output: cute.Tensor,  # order buffer base as a (T*R*K, 1, hidden) tensor
+        fc2_output: cute.Tensor,  # FC2 slab as a (pool rows, 1, hidden) tensor
         token_src_metadata: Optional[cute.Tensor],
         fc2_done_counter: Optional[cute.Tensor],
         fc2_output_sf: Optional[cute.Tensor],
@@ -201,8 +216,11 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
         )
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
-        self.tma_atom_fc2_output = None
-        self.fc2_tma_output = None
+        # The slab TMA box store (built by SwapABGatedActEpilogueDedup.prepare_tma_store_params).
+        self.tma_atom_fc2_output = tma_atom_fc2_output
+        self.fc2_tma_output = fc2_tma_output
+        if tma_atom_fc2_output is None or fc2_tma_output is None:
+            raise ValueError("The dedup FC2 epilogue needs the slab TMA store atom and tensor.")
         self.fc2_output = fc2_output
         self.token_src_metadata = token_src_metadata
         self.fc2_done_counter = fc2_done_counter
@@ -245,7 +263,7 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
             raise ValueError("The dedup FC2 epilogue needs local_rank (the kernel's host-provided rank argument).")
         return Fc2DedupBulkRouter(
             metadata=cute.domain_offset((task_tile_data_row_start,), self.token_src_metadata),
-            order_base=self.fc2_output.iterator.toint(),
+            pool_row_base=task_tile_data_row_start,
             remote_output=remote_output,
             peer_rank_ptr_mapper=self.peer_rank_ptr_mapper,
             local_rank=Int32(local_rank),
@@ -253,9 +271,6 @@ class SwapABFc2EpilogueDedup(SwapABFc2Epilogue):
             valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,
             valid_hidden_this_cta_tile=valid_hidden,
             world_size=self.dedup_world_size,
-            topk=self.dedup_topk,
-            chunk_bytes=self.dedup_chunk_bytes,
-            chunks_per_row=self.dedup_chunks_per_row,
             element_bytes=self.combine_format.act_dtype.width // 8,
             reduce_topk_in_kernel=self.reduce_topk_in_kernel,
             mapping=self.process_pipeline.store_out_mapping,
@@ -322,6 +337,34 @@ class SwapABGatedActEpilogueDedup(SwapABGatedActEpilogue):
 
     def _make_fc2_epilogue(self, *args, **kwargs) -> SwapABFc2EpilogueDedup:
         return SwapABFc2EpilogueDedup(self, *args, **kwargs)
+
+    @property
+    def dedup_box_rows(self) -> int:
+        """Staged FC2 rows one epilogue warp owns per subtile (its slab TMA box)."""
+        return 8 if self.two_epilogue_warpgroups else 16
+
+    def _make_fc2_single_stage_region(self):
+        # The slab TMA box store reads the staged rows: 128 B aligned stages.
+        return dataclasses.replace(super()._make_fc2_single_stage_region(), byte_alignment=128)
+
+    def prepare_tma_store_params(
+        self, fc1_output_template: cute.Tensor, fc2_output_template: cute.Tensor
+    ) -> Tuple[cute.CopyAtom, cute.Tensor, Optional[cute.CopyAtom], Optional[cute.Tensor]]:
+        """The FC1 TMA store and, in the FC2 slot, the (box_rows x hidden tile) TMA store into the FC2 slab
+        (``fc2_output_template`` = the (pool rows, 1, hidden) slab)."""
+        fc1_atom, fc1_tensor, _, _ = super().prepare_tma_store_params(fc1_output_template, fc2_output_template)
+        box = (self.dedup_box_rows, self._EpilogueFc2HiddenTileSize)
+        slab = cute.make_tensor(
+            fc2_output_template.iterator,
+            cute.make_layout(
+                (cutlass.Int32(fc2_output_template.shape[0]), cutlass.Int32(fc2_output_template.shape[2])),
+                stride=(fc2_output_template.stride[0], 1),
+            ),
+        )
+        slab_atom, slab_tensor = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(), slab, cute.make_layout(box, stride=(box[1], 1)), box
+        )
+        return fc1_atom, fc1_tensor, slab_atom, slab_tensor
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         super().__init__(problem_desc, impl_desc)

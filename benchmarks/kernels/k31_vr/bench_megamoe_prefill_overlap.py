@@ -66,6 +66,11 @@ def parse_args():
         help="local: every route to this rank's own experts (no NVLink payload; "
         "the compute-only floor of the layer)",
     )
+    p.add_argument(
+        "--top-k", type=int, default=16,
+        help="routes per token (fewer routes x more tokens emulates the EP16 combine "
+        "pattern on EP4: same routes per GPU, ~1-2 copies per (token, rank))",
+    )
     p.add_argument("--hidden", type=int, default=7168)
     p.add_argument("--shared-inter", type=int, default=6144)
     p.add_argument("--samples", type=int, default=10)
@@ -125,7 +130,9 @@ def main():
     )
     from vllm.models.kimi_k3.nvidia.megamoe_rubin.runtime import RubinMegaMoE
 
-    problem = RubinMoeProblem(num_experts=args.num_experts, quant_kind="nvfp4")
+    problem = RubinMoeProblem(
+        num_experts=args.num_experts, quant_kind="nvfp4", top_k=args.top_k
+    )
     knobs = RubinKnobs.from_dict(json.loads(args.knobs))
     T, C = args.tokens, args.capacity
     nsub = -(-T // C)
@@ -219,7 +226,7 @@ def main():
             main.wait_stream(side)
 
         fns = {"moe": moe_calls, "shared": shared, "serial": serial, "overlap": overlap}
-        ref = fp = None
+        ref = fp = pos = None
         for mode in modes:
             if cap is not None and mode == "shared":
                 continue
@@ -236,6 +243,9 @@ def main():
             torch.cuda.synchronize()
             if mode in ("moe", "serial", "overlap"):
                 fp = out.float().abs().sum().item()
+                # position-sensitive: a permutation of output elements changes it
+                flat = out.float().flatten()
+                pos = (flat * (torch.arange(flat.numel(), device=flat.device) % 1009 + 1)).sum().item()
                 ref = fp if ref is None else ref
             res = measure(graph.replay, args.samples, args.replays, group)
             prof = None
@@ -266,7 +276,8 @@ def main():
                 "tokens": T, "capacity": C,
                 "subcalls": nsub, "world": world, "routing": args.routing,
                 "num_experts": problem.num_experts,
-                "out_abs_sum": fp if mode != "shared" else None, **res,
+                "out_abs_sum": fp if mode != "shared" else None,
+                "out_pos_sum": pos if mode != "shared" else None, **res,
                 "kernels_us": prof,
             }
             rows.append(row)
