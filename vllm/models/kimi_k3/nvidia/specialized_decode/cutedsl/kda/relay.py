@@ -14,13 +14,14 @@ Roles (one persistent CTA per SM, a static head-major item range each):
               (FFMA2) read their per-key operands from tensor memory; the folded rows
               back to the cache (128-bit stores); an 8-lane butterfly; each lane's 2
               dots to a 2-slot dots ring;
-  warp 17     copier: the per-key part of each operand block (2 slots) to tensor memory,
+  warp 17     copier: the per-key part + u of each operand block (2 slots; the per-key
+              part to tensor memory,
               26 tcgen05.cp.128x256b with a zero stride-dimension offset (lane L
               receives key group L % 8), double-buffered;
   warps 18-19 finishers (thread = rows 64 f + lane, + 32): the token solve on the
               dots, the records, the gated RMSNorm (2-warp sums of squares) and the
               outputs (BF16, or MXFP8 with KdaFlow's store_output numerics, batched);
-              warp 19 also loads the rest of each block (3 slots).
+              warp 19 also loads the rest of each block (4 slots).
 
 Operand block (OPB_FLOATS 4-byte words per item, head-major item rows): the per-key
 part, 26 copy blocks [2 halves][8 key groups][4] holding tensor-memory columns 16 q (x_0..7
@@ -57,18 +58,20 @@ _CUDA_SRC = r"""
 
 namespace {
 constexpr int T = 4, K = 128, PG = K * K * 4;
-constexpr int S = 3, NX = 2, NR = 3, NCW = 16, NC = NCW * 32;
+constexpr int S = 3, NX = 2, NR = 4, NCW = 16, NC = NCW * 32;
 constexpr int THREADS = 32 + NC + 96;  // producer, consumers, copier, finishers A / B
 // Operand block (bytes): the per-key part (26 copy blocks of 256 B: TMEM columns 16 q (x of
 // key pair q), 128 + 8 q (D, w0..w2), 192 + 2 q (w3)), then the rest: u FP32 [T][K],
 // v BF16 [T][K], gates BF16 [T][K], couplings FP32 [16], betas FP32 [T].
 constexpr int NCP = 26, TCOLS = 8 * NCP;  // copies / TMEM columns per item
-constexpr int X_BYTES = NCP * 256, R_BYTES = 4176, OPB_BYTES = X_BYTES + R_BYTES;
-constexpr int OPB_FLOATS = OPB_BYTES / 4;
-constexpr int RU = 0, RV = 2048, RG = 3072, RCE = 4096, RBETA = 4160;  // bytes in the rest
+// The copier's slot holds the per-key part + u (read by the consumers before the scan);
+// the finishers' slot holds the rest (v, gates, couplings, betas).
+constexpr int X_BYTES = NCP * 256, XU_BYTES = X_BYTES + T * K * 4, R_BYTES = 2128;
+constexpr int OPB_BYTES = XU_BYTES + R_BYTES, OPB_FLOATS = OPB_BYTES / 4;
+constexpr int RV = 0, RG = 1024, RCE = 2048, RBETA = 2112;  // bytes in the rest
 constexpr int DOT_BYTES = K * 8 * 4;  // the consumers' dots of an item: [row][8]
 constexpr int MAX_ITEMS = 32;  // items per CTA
-constexpr int X_AT = S * PG, R_AT = X_AT + NX * X_BYTES, D_AT = R_AT + NR * R_BYTES;
+constexpr int X_AT = S * PG, R_AT = X_AT + NX * XU_BYTES, D_AT = R_AT + NR * R_BYTES;
 constexpr int FS_AT = D_AT + 2 * DOT_BYTES, SMEM = FS_AT + 2 * 2 * T * 4;
 
 struct Params {
@@ -212,11 +215,11 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     }
     for (int x = 0; x < NX; ++x) {
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&xfull[x])));
-      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&xdone[x])));
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(sa(&xdone[x])), "r"(NCW + 1));
     }
     for (int r = 0; r < NR; ++r) {
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&rfull[r])));
-      asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(sa(&rfree[r])), "r"(NCW + 2));
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 2;" :: "r"(sa(&rfree[r])));
     }
     for (int b = 0; b < 2; ++b) {
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(sa(&ofull[b])));
@@ -259,7 +262,7 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     auto load_r = [&](int jj) {
       if (lane == 0)
         expect_load(sa(smem + R_AT + (size_t)(jj % NR) * R_BYTES),
-                    (const char*)(p.opb + (long long)s_items[jj].item * OPB_FLOATS) + X_BYTES, R_BYTES,
+                    (const char*)(p.opb + (long long)s_items[jj].item * OPB_FLOATS) + XU_BYTES, R_BYTES,
                     sa(&rfull[jj % NR]));
     };
     if (fw == 1)
@@ -392,21 +395,21 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     const int lane = tid & 31;
     auto load_x = [&](int jj) {  // the per-key part of item jj's block
       if (lane == 0)
-        expect_load(sa(smem + X_AT + (size_t)(jj % NX) * X_BYTES), p.opb + (long long)s_items[jj].item * OPB_FLOATS,
-                    X_BYTES, sa(&xfull[jj % NX]));
+        expect_load(sa(smem + X_AT + (size_t)(jj % NX) * XU_BYTES), p.opb + (long long)s_items[jj].item * OPB_FLOATS,
+                    XU_BYTES, sa(&xfull[jj % NX]));
     };
     if (count > 0) load_x(0);
     for (int j = 0; j < count; ++j) {
       const int x = j % NX, b = j & 1;
       if (j + 1 < count) {  // item j + 1's per-key part, once copy j - 1 has read its slot
-        if (j >= 1) wait_par(sa(&xdone[(j + 1) % NX]), ((j - 1) / NX) & 1);
+        if (j >= 1) wait_par(sa(&xdone[(j + 1) % NX]), ((j - 1) / NX) & 1);  // copy + u reads of j - 1
         load_x(j + 1);
       }
       wait_par(sa(&xfull[x]), (j / NX) & 1);
       if (j >= 2) wait_par(sa(&oempty[b]), ((j >> 1) - 1) & 1);
       tm_fence_after();
       // TMEM base 0 (this CTA owns all 512 columns): every copy operand is warp-uniform.
-      const unsigned src = sa(smem + X_AT + (size_t)x * X_BYTES), dst = TCOLS * b;
+      const unsigned src = sa(smem + X_AT + (size_t)x * XU_BYTES), dst = TCOLS * b;
 #pragma unroll
       for (int k = 0; k < NCP; ++k) tm_cp(dst + 8 * k, cp_desc(src + 256 * k));
       tm_commit(sa(&ofull[b]));
@@ -420,7 +423,7 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
   const int r0 = 8 * cw + 2 * (l >> 3);
   const unsigned tq = (32u * ((tid >> 5) & 3)) << 16;
   for (int j = 0; j < count; ++j) {
-    const int s = j % S, rs = j % NR, bq = j & 1, f = j & 1;
+    const int s = j % S, bq = j & 1, f = j & 1;
     const Item it = s_items[j];
     long long t0 = 0;
     int* trc = nullptr;
@@ -442,15 +445,16 @@ __global__ void __launch_bounds__(THREADS, 1) relay_k(Params p) {
     __syncwarp();
     if (l == 0) arrive(sa(&empty[s]));
     STAMP(1)
-    wait_par(sa(&rfull[rs]), (j / NR) & 1);
+    const int xs = j % NX;
+    wait_par(sa(&xfull[xs]), (j / NX) & 1);
     float ut[2][4];
 #pragma unroll
     for (int t = 0; t < T; ++t) {
-      const float2 u = *(const float2*)((const float*)(smem + R_AT + (size_t)rs * R_BYTES + RU) + t * K + r0);
+      const float2 u = *(const float2*)((const float*)(smem + X_AT + (size_t)xs * XU_BYTES + X_BYTES) + t * K + r0);
       ut[0][t] = u.x; ut[1][t] = u.y;
     }
     __syncwarp();
-    if (l == 0) arrive(sa(&rfree[rs]));
+    if (l == 0) arrive(sa(&xdone[xs]));
     STAMP(2)
     wait_par(sa(&ofull[bq]), (j >> 1) & 1);
     tm_fence_after();
