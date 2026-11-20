@@ -1,0 +1,182 @@
+diff --git a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+index 83fc5451be..95ec350997 100644
+--- a/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_prefill/sparse_mla_h8.py
+@@ -201,6 +201,29 @@ def mma_cb_e(d, a, b, idesc, acc, op: str):
+                                           Uint32(acc))
+ 
+ 
++@asm(Float32)
++def shfl_bfly(v, m):
++    return "shfl.sync.bfly.b32 $0, $1, $2, 31, -1;", "=f,f,r", (Float32(v), Int32(m))
++
++
++@asm(Float32)
++def sel_f(a, b, c):
++    """a if c != 0 else b."""
++    return ("{ .reg .pred p; setp.ne.s32 p, $3, 0; selp.f32 $0, $1, $2, p; }", "=f,f,f,r",
++            (Float32(a), Float32(b), Int32(c)))
++
++
++@asm(Uint32)
++def bf16x2_rn(lo, hi):
++    return "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", (Float32(lo), Float32(hi))
++
++
++@asm()
++def st_global_v4(ptr, a, b, c, e):
++    return ("st.global.v4.b32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r,~{memory}",
++            (Int64(ptr), Uint32(a), Uint32(b), Uint32(c), Uint32(e)))
++
++
+ @asm()
+ def bulk_wait_read2():
+     return "cp.async.bulk.wait_group.read 2;", "~{memory}", ()
+@@ -327,7 +350,7 @@ class SparseMlaPrefillH8:
+         om = tensormap.encode_map(out, bf16, (D_NOPE, rows * H), (D_NOPE * 2,), (64, H),
+                                   sw.CU_TENSOR_MAP_SWIZZLE_128B, l2)
+         self.kernel(qn, qr, kvm, kvr, om, rows, unit_rows, slots, slot_stride, lengths,
+-                    scale_log2, out_scale, stamp, kv).launch(
++                    scale_log2, out_scale, stamp, kv, out).launch(
+             grid=(self.grid, 1, 1), block=(THREADS, 1, 1), smem=self.smem,
+             stream=stream, min_blocks_per_mp=1)
+ 
+@@ -336,7 +359,7 @@ class SparseMlaPrefillH8:
+                kvm: tensormap.GridMap, kvr: tensormap.GridMap, om: tensormap.GridMap,
+                rows: Int32, unit_rows: Int32, slots: Int64, slot_stride: Int32,
+                lengths: Int64, scale_log2: Float32, out_scale: Float32, stamp: Int64,
+-               kvp: Int64):
++               kvp: Int64, outp: Int64):
+         tid, _, _ = cute.arch.thread_idx()
+         cta, _, _ = cute.arch.block_idx()
+         warp = cute.arch.make_warp_uniform(tid // 32)
+@@ -371,7 +394,7 @@ class SparseMlaPrefillH8:
+         if warp < W_SM:
+             cute.arch.warpgroup_reg_alloc(REG_SM)
+             self.softmax(base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
+-                         out_scale, tensormap.map_address(om))
++                         out_scale, outp)
+             cute.arch.warpgroup_reg_dealloc(REG_LAUNCH)
+         else:
+             cute.arch.warpgroup_reg_dealloc(REG_LOW)
+@@ -641,7 +664,7 @@ class SparseMlaPrefillH8:
+     # ------------------------------------------------------------------ softmax
+     @cute.jit
+     def softmax(self, base, tid, warp, lane, taddr, n_mine, lengths, cta, scale_log2,
+-                out_scale, tm_o):
++                out_scale, outp):
+         lptr = cute.make_ptr(Int32, lengths, cute.AddressSpace.gmem, assumed_align=4)
+         lens = cute.make_tensor(lptr, cute.make_layout(1 << 30))
+         wg = warp // 4
+@@ -697,9 +720,7 @@ class SparseMlaPrefillH8:
+                 else:
+                     named_bar_arrive(Uint32(7 + sp), 64)
+             if owner:
+-                if qi + 1 < n_mine:
+-                    mbar_wait(_bar(base, B_QLFREE), Uint32((qi + 1) & 1))
+-                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, tm_o)
++                self.epilogue(base, wg, sp, lane, lane_addr, qi, cta, outp)
+ 
+     @cute.jit
+     def sub(self, base, warp, lane, wg, sp, h, lane_addr, real_m, xv, scale_log2, u, i, n,
+@@ -819,63 +840,51 @@ class SparseMlaPrefillH8:
+         return mp_last, lw
+ 
+     @cute.jit
+-    def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, tm_o):
+-        """O^T block b (lanes = dims, columns = heads) -> BF16 [heads x dims]: 16x256b
+-        TMEM loads give each thread two adjacent heads of one dim (an m8n8 b16
+-        fragment with dims as rows), scaled by s / l and packed; stmatrix.trans writes
+-        head rows into two SW128 [96 x 64 dims] staging halves (the Q latent atoms 0-1
+-        staging), one TMA store each. Block b is released once read."""
++    def epilogue(self, base, wg, sp, lane, lane_addr, qi, cta, outp):
++        """O^T block b (lanes = dims, columns = heads) -> BF16 out[head][dim] without
++        shared memory: per 32x32b TMEM load (one dim of 32 heads per thread), 8x8
++        butterfly transposes inside 8-lane groups give each lane 8 consecutive dims
++        of one head, scaled by s / l, packed and stored as 16 B (a warp store covers
++        8 head rows x 64 B). Block b is released once read."""
+         row = cta + qi * self.grid
+         mbar_wait(_bar(base, B_OFULL), Uint32(qi & 1))
+         tc_fence_after()
+         bid = Uint32(10 + wg)
+         named_bar(bid, 128)  # 1/l of every head written
+-        t4 = lane % 4
+-        j = lane % 8
+-        mk = lane // 8  # matrix this lane addresses in stmatrix.x4
++        if sp == 0 and lane == 0:
++            mbar_arrive(_bar(base, B_EPIDONE))  # the Q staging is not used here
+         inv_base = base + Uint32(OFF_INV)
++        j = lane % 8
++        orow = outp + Int64(row) * Int64(H * D_NOPE * 2) + Int64(
++            (32 * sp + 8 * (lane // 8)) * 2)
+         for b in cutlass.range_constexpr(4):
+-            # staging halves alternate between Q atoms 0-1 and 2-3 (block b % 2): block
+-            # b reuses block b - 2's buffer once its two stores have read it
+-            if cutlass.const_expr(b >= 2):
+-                if sp == 0 and lane == 0:
+-                    bulk_wait_read2()
+-                named_bar(bid, 128)
+-            for hh in cutlass.range_constexpr(2):
+-                d0 = 32 * sp + 16 * hh  # first dim (lane) of this 16-lane half
+-                for c in cutlass.range_constexpr(3):
+-                    v = tmem_ld16x256(lane_addr + Uint32(16 * hh << 16)
+-                                      + Uint32(C_O + 96 * b + 32 * c))
+-                    if cutlass.const_expr(hh == 1 and c == 2):
+-                        tc_fence_before()
+-                        cute.arch.sync_warp()
+-                        if lane == 0:
+-                            mbar_arrive(_bar(base, B_OFREE + b))
+-                    frag = []
+-                    for g in cutlass.range_constexpr(4):
+-                        i0, i1 = ld_shared_v2f(inv_base + Uint32((32 * c + 8 * g + 2 * t4) * 4))
+-                        frag.append(bf16x2(v[4 * g] * i0, v[4 * g + 1] * i1))
+-                        frag.append(bf16x2(v[4 * g + 2] * i0, v[4 * g + 3] * i1))
+-                    for sx in cutlass.range_constexpr(2):
+-                        g = 2 * sx + mk // 2
+-                        dd = d0 + 8 * (mk % 2)  # first dim of the matrix (0-127)
+-                        hrow = 32 * c + 8 * g + j  # stored row = head
+-                        half = base + Uint32(OFF_QN + (b % 2) * 2 * ATOM) + Uint32(
+-                            dd // 64) * Uint32(H * 128)
+-                        addr = half + Uint32(hrow * 128) + (
+-                            ((Uint32((dd % 64) // 8)) ^ (Uint32(hrow) & Uint32(7))) << Uint32(4))
+-                        stmatrix_t4(addr, frag[4 * sx], frag[4 * sx + 1], frag[4 * sx + 2],
+-                                    frag[4 * sx + 3])
+-            fence_async_smem()
+-            named_bar(bid, 128)
+-            if sp == 0 and lane == 0:
++            for c in cutlass.range_constexpr(3):
++                v = tmem_ld(lane_addr + Uint32(C_O + 96 * b + 32 * c), 32)
++                if cutlass.const_expr(c == 2):
++                    tc_fence_before()
++                    cute.arch.sync_warp()
++                    if lane == 0:
++                        mbar_arrive(_bar(base, B_OFREE + b))
+                 if cutlass.const_expr(not self.no_store):
+-                    for hf in cutlass.range_constexpr(2):
+-                        tma_store2d(tm_o, base + Uint32(OFF_QN + (b % 2) * 2 * ATOM + hf * H * 128),
+-                                    Int32(128 * b + 64 * hf), row * H)
+-        if sp == 0 and lane == 0:
+-            bulk_wait_read0()
+-            mbar_arrive(_bar(base, B_EPIDONE))
++                    for hb in cutlass.range_constexpr(4):
++                        t = []
++                        for k in cutlass.range_constexpr(8):
++                            t.append(v[8 * hb + k])
++                        for si in cutlass.range_constexpr(3):
++                            sh = 4 >> si
++                            up = j & sh
++                            for k in cutlass.range_constexpr(8):
++                                if cutlass.const_expr((k & sh) == 0):
++                                    rcv = shfl_bfly(sel_f(t[k], t[k + sh], up), sh)
++                                    t[k], t[k + sh] = (sel_f(rcv, t[k], up),
++                                                       sel_f(t[k + sh], rcv, up))
++                        hd = 32 * c + 8 * hb + j
++                        iv = ld_shared_f32(inv_base + Uint32(hd * 4))
++                        w = []
++                        for e in cutlass.range_constexpr(4):
++                            w.append(bf16x2_rn(t[2 * e] * iv, t[2 * e + 1] * iv))
++                        st_global_v4(orow + Int64(hd * D_NOPE * 2 + 128 * b * 2),
++                                     w[0], w[1], w[2], w[3])
+ 
+ 
+ @cache

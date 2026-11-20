@@ -139,7 +139,7 @@ def test_matches_stock_trtllm_kernel():
     assert ours_h6 <= 1.25 * stock + 1e-3, (ours_h6, stock)
 
 
-@pytest.mark.parametrize("kernel", ["sol", "h2", "h4", "h4_tma", "h5", "h5_tma", "h5_split", "h5_stm", "h6", "h7", "h8"])
+@pytest.mark.parametrize("kernel", ["sol", "h2", "h4", "h4_tma", "h5", "h5_tma", "h5_split", "h5_stm", "h6", "h7", "h8", "h8_qkh"])
 @pytest.mark.parametrize("scale_mul", [0.7, 3.0])
 def test_sol_matches_fp32_reference(scale_mul, kernel):
     """Gather-floor kernel; scale_mul 3 drives the lazy-max slow path often."""
@@ -153,7 +153,8 @@ def test_sol_matches_fp32_reference(scale_mul, kernel):
           "h8": sparse_mla_prefill_h8}[kernel.split("_")[0]]
     knobs = {"tma": (0, 0, 1, 1), "split": (0, 0, 0, 0, 0, 0, 1),
              "stm": (0, 0, 2, 0, 0, 0, 1), "pp": (0, 0, 2, 0, 0, 0, 1, 1),
-             "pp2": (0, 0, 2, 0, 0, 0, 1, 1, 0, 1)}.get(
+             "pp2": (0, 0, 2, 0, 0, 0, 1, 1, 0, 1),
+             "qkh": (0,) * 11 + (1,)}.get(
         kernel.split("_")[-1], ())
     out = (fn(q8, kv, slots, lens, scale, out_scale, knobs=knobs) if knobs
            else fn(q8, kv, slots, lens, scale, out_scale))
@@ -167,6 +168,48 @@ def test_sol_matches_fp32_reference(scale_mul, kernel):
     rel = rel[~zero]
     assert rel.mean().item() < 0.02, rel.mean().item()
     assert rel.max().item() < 0.08, rel.max().item()
+
+
+@pytest.mark.parametrize("block_size", [64, 32])
+def test_h8_logical_topk_matches_physical(block_size):
+    """The fused index remap (request-relative top-k through the block table) gathers
+    the rows the stock remap would have handed the physical-slot kernel: same output
+    bit for bit, including tokens with fewer valid entries than the top-k width."""
+    from vllm.models.kimi_k3.nvidia.specialized_prefill.sparse_mla_h8 import (
+        sparse_mla_prefill_h8_logical,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(1)
+    stride, blocks, reqs, width = 64, 900, 3, 2048
+    ctx_blocks = [400, 120, 300]  # 120 x 32 < 2048: short request rows end in -1
+    kv = (torch.randn(blocks * stride, ROW, device="cuda", generator=g) * 0.8).to(E4M3)
+    bt = torch.full((reqs, 512), 0, dtype=torch.int32, device="cuda")
+    perm = torch.randperm(blocks, device="cuda", generator=g).to(torch.int32)
+    start = 0
+    for r, nb in enumerate(ctx_blocks):
+        bt[r, :nb] = perm[start:start + nb]
+        start += nb
+    lengths = [2048, 1, 2047, 129, 0, 2048, 64, 1000] * 40
+    t = len(lengths)
+    req_ids = torch.arange(t, device="cuda", dtype=torch.int32) % reqs
+    topk = torch.full((t, width), -1, dtype=torch.int32, device="cuda")
+    for i, n in enumerate(lengths):
+        ctx = ctx_blocks[i % reqs] * block_size
+        n = min(n, ctx)
+        lengths[i] = n
+        if n:
+            topk[i, :n] = torch.randperm(ctx, device="cuda", generator=g)[:n].to(torch.int32)
+    q8 = (torch.randn(t, H, ROW, device="cuda", generator=g) * 0.8).to(E4M3)
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    valid = topk >= 0
+    blk = bt[req_ids.long()[:, None], (topk.clamp(min=0) // block_size).long()]
+    slots = torch.where(valid, blk * stride + topk.clamp(min=0) % block_size, -1)
+    scale, out_scale = 192**-0.5 * 3.0, 1.3
+    ref = sparse_mla_prefill_h8(q8, kv, slots.to(torch.int32), lens, scale, out_scale)
+    out = sparse_mla_prefill_h8_logical(q8, kv, topk, req_ids, bt, block_size, stride,
+                                        scale, out_scale)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
 
 
 @pytest.mark.parametrize("kernel", ["h6", "h8"])
