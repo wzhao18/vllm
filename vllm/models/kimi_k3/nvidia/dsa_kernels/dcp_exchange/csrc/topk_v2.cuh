@@ -1072,33 +1072,52 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         uint32_t* const snd = z;
         uint32_t* const rcv = z + RW;
         uint32_t* const suf = rcv;  // W x (kV2Win + 1): above + window keys >= lr + i
-        for (int r = 0; r < W; ++r) {
+        // S_r[i] = rank r's keys >= lr_r + i (exact, or a lower bound when saturated): one
+        // pass, 4 warps per rank, warp suffix sums
+        for (int b0 = 0; b0 < W * (kV2Win / 2); b0 += T) {
+          const int it = b0 + tid;
+          const bool ok = it < W * (kV2Win / 2);
+          const int r = ok ? it / (kV2Win / 2) : 0, c = it % (kV2Win / 2);
           const uint32_t* s = rx + r * kV2Msg;
-          const uint32_t c = tid < kV2Win ? v2_cnt(s, kV2Win - 1 - tid) : 0u;
-          uint32_t tot;
-          const uint32_t ex = v2_scan<T>(c, V2WS, &tot);
-          if (tid < kV2Win) suf[r * (kV2Win + 1) + kV2Win - 1 - tid] = ex + c + (s[1] & 0xFFFFFFu);
-          if (tid == 0) suf[r * (kV2Win + 1) + kV2Win] = s[1] & 0xFFFFFFu;
+          const uint32_t w0 = ok ? v2_cnt(s, 2 * c) : 0u, w1 = ok ? v2_cnt(s, 2 * c + 1) : 0u;
+          uint32_t x = w0 + w1;
+#pragma unroll
+          for (int o = 1; o < 32; o <<= 1) {
+            const uint32_t y = __shfl_down_sync(0xffffffffu, x, o);
+            if ((tid & 31) + o < 32) x += y;
+          }
+          uint32_t* const wsb = V2WS;
+          if ((tid & 31) == 0) wsb[tid >> 5] = x;
+          __syncthreads();
+          const int wq = (tid >> 5) & 3;
+          for (int w2 = wq + 1; w2 < 4; ++w2) x += wsb[(tid >> 5) - wq + w2];
+          if (ok) {
+            const uint32_t ab = s[1] & 0xFFFFFFu;
+            suf[r * (kV2Win + 1) + 2 * c] = x + ab;
+            suf[r * (kV2Win + 1) + 2 * c + 1] = x - w0 + ab;
+            if (c == 0) suf[r * (kV2Win + 1) + kV2Win] = ab;
+          }
         }
         if (tid == 0) { s_r2[0] = -1; s_r2[1] = 0; s_r2[2] = -1; s_r2[4] = 0; s_r2[5] = 0; }
         __syncthreads();
         {
-          int xlo = 1 << 30, xhi = 0;
-          for (int r = 0; r < W; ++r) {
-            const int lr = (int)(rx[r * kV2Msg] & 0xFFFFu);
-            xlo = min(xlo, lr);
-            xhi = max(xhi, lr + kV2Win);
-          }
-          xhi = min(xhi, 0x10000);
-          for (int x = xhi - 1 - tid; x >= xlo; x -= T) {
+          // the lower-bound global count only changes at window keys: LB is one of them
+          int best = -1;
+          for (int it = tid; it < W * (kV2Win + 1); it += T) {
+            const int r = it / (kV2Win + 1);
+            const int x = (int)(rx[r * kV2Msg] & 0xFFFFu) + (it - r * (kV2Win + 1));
+            if (x < 1 || x > 0xFFFF) continue;
             uint32_t g = 0;
-            for (int r = 0; r < W; ++r) {
-              const int lr = (int)(rx[r * kV2Msg] & 0xFFFFu);
-              const uint32_t* sr = suf + r * (kV2Win + 1);
-              g += x < lr ? sr[0] : (x < lr + kV2Win ? sr[x - lr] : 0u);
+            for (int r2 = 0; r2 < W; ++r2) {
+              const int d = x - (int)(rx[r2 * kV2Msg] & 0xFFFFu);
+              const uint32_t* sr = suf + r2 * (kV2Win + 1);
+              g += d <= 0 ? sr[0] : d <= kV2Win ? sr[d] : 0u;
             }
-            if (g >= (uint32_t)K) { atomicMax(&s_r2[0], x); break; }
+            if (g >= (uint32_t)K) best = max(best, x);
           }
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) best = max(best, __shfl_xor_sync(0xffffffffu, best, o));
+          if ((tid & 31) == 0 && best >= 0) atomicMax(&s_r2[0], best);
         }
         __syncthreads();
         V2DBG(6);
@@ -1227,34 +1246,46 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           bool bad = false;
           for (int r = 0; r < W; ++r) bad |= s_r2n[r] < 0;
           if (!bad) {
-            // tau: the K-th largest key of the union (two 8-bit levels)
+            // tau: the K-th largest key of the union, one histogram of key - LB (lanes of a warp
+            // with the same key add once)
             uint32_t* const h = hist;
-            int b1 = -1, above1 = 0;
-            for (int lvl = 0; lvl < 2; ++lvl) {
-              for (int i = tid; i < 256; i += T) h[i] = 0u;
-              __syncthreads();
-              for (int r = 0; r < W; ++r) {
-                const uint32_t* e = rcv + r * RW + 4;
-                for (int i = tid; i < s_r2n[r]; i += T) {
-                  const uint32_t k = e[2 * i] & 0xFFFFu;
-                  if (lvl == 0) atomicAdd(&h[k >> 8], 1u);
-                  else if ((int)(k >> 8) == b1) atomicAdd(&h[k & 0xFFu], 1u);
+            for (int i = tid; i < kV2Fine; i += T) h[i] = 0u;
+            if (tid == 0) s_beyond = 0u;
+            __syncthreads();
+            uint32_t bey = 0;
+            for (int r = 0; r < W; ++r) {
+              const uint32_t* e = rcv + r * RW + 4;
+              const int nr = s_r2n[r];
+              for (int i0 = 0; i0 < nr; i0 += T) {
+                const int i = i0 + tid;
+                const int d = i < nr ? (int)(e[2 * i] & 0xFFFFu) - (int)LB : -1;
+                const bool in = d >= 0 && d < kV2Fine;
+                bey += (i < nr && d >= kV2Fine) ? 1u : 0u;
+                const unsigned am = __ballot_sync(0xffffffffu, in);
+                if (in) {
+                  const unsigned pm = __match_any_sync(am, d);
+                  if ((tid & 31) == __ffs(pm) - 1) atomicAdd(&h[d], (uint32_t)__popc(pm));
                 }
               }
-              __syncthreads();
-              const uint32_t c = tid < 256 ? h[255 - tid] : 0u;
-              uint32_t tot;
-              const uint32_t ex = v2_scan<T>(c, V2WS, &tot) + (uint32_t)above1;
-              if (tid < 256 && ex < (uint32_t)K && ex + c >= (uint32_t)K) {
-                s_r2[2] = lvl == 0 ? 255 - tid : (b1 << 8) | (255 - tid);
-                s_r2[3] = (int)ex;
-              }
-              __syncthreads();
-              const int got = s_r2[2], gab = s_r2[3];
-              __syncthreads();
-              if (got < 0) break;
-              if (lvl == 0) { b1 = got; above1 = gab; if (tid == 0) s_r2[2] = -1; __syncthreads(); }
             }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) bey += __shfl_xor_sync(0xffffffffu, bey, o);
+            if ((tid & 31) == 0 && bey) atomicAdd(&s_beyond, bey);
+            __syncthreads();
+            {
+              const int f0 = (T - 1 - tid) * kV2FB;
+              uint32_t hv[kV2FB];
+              const uint32_t hs = v2_ldbins(h + f0, hv);
+              uint32_t tot;
+              uint32_t run = v2_scan<T>(hs, V2WS, &tot) + s_beyond;
+#pragma unroll
+              for (int i = kV2FB - 1; i >= 0; --i) {
+                const uint32_t nx = run;
+                run += hv[i];
+                if (run >= (uint32_t)K && nx < (uint32_t)K) { s_r2[2] = (int)LB + f0 + i; s_r2[3] = (int)nx; }
+              }
+            }
+            __syncthreads();
             V2DBG(13);
             const int tau2 = s_r2[2], need2 = K - s_r2[3];
             if (tau2 < 0) bad = true;
@@ -1265,11 +1296,18 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
               };
               for (int r = 0; r < W; ++r) {
                 const uint32_t* e = rcv + r * RW + 4;
-                for (int i = tid; i < s_r2n[r]; i += T)
-                  if ((int)(e[2 * i] & 0xFFFFu) == tau2) {
-                    const int t = atomicAdd(&s_r2[1], 1);
+                for (int i0 = 0; i0 < s_r2n[r]; i0 += T) {
+                  const int i = i0 + tid;
+                  const bool tie = i < s_r2n[r] && (int)(e[2 * i] & 0xFFFFu) == tau2;
+                  const unsigned tm = __ballot_sync(0xffffffffu, tie);
+                  int t0 = 0;
+                  if ((tid & 31) == 0 && tm) t0 = atomicAdd(&s_r2[1], __popc(tm));
+                  t0 = __shfl_sync(0xffffffffu, t0, 0);
+                  if (tie) {
+                    const int t = t0 + __popc(tm & ((1u << (tid & 31)) - 1u));
                     if (t < kCoarseBins) h[t] = gid_r(r, e[2 * i + 1] & 0xFFFFFFu);
                   }
+                }
               }
               __syncthreads();
               const int mt = s_r2[1];
