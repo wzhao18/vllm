@@ -60,6 +60,15 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.epi_yield = 1 if "y1" in flags else 2 if "y2" in flags else 0
         self.ab_stage_cap = next((s for s in (3, 4, 5) if f"ab{s}" in flags), 0)
         self.epi_drain_skel = next((i for i in (11, 10, 9, 1, 2, 3, 4, 5, 7) if f"dskel{i}" in flags), 0)
+        # Column-wise conv epilogue skeletons (microbench only, see
+        # conv_epilogue.epilogue_kda_conv_t).
+        self.conv_skel = next((i for i in (1, 2, 3, 4) if f"cskel{i}" in flags), 0)
+        # Branch-free column pass (epilogue_kda_conv_t2) unless "ct1".
+        self.conv_t2 = "ct1" not in flags and self.conv_skel == 0
+        self.conv_scalar_silu = "sc" in flags
+        self.conv_math_smsp23 = "c23" in flags
+        self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 0
+        self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
         super().__init__(
             SF_VEC,
             (inst_m, tn, 64),
@@ -87,6 +96,13 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
             self.tmem_alloc_barrier = pipeline.NamedBarrier(
                 barrier_id=self.tmem_ptr_sync_bar_id, num_threads=32 * 9
             )
+        if self.conv_drain and self.conv_t2 and not split_producer and "nrs" not in flags:
+            # Twelve warps: warpgroup 2 = MMA, TMA, two idle warps; it drops to
+            # 40 registers so the epilogue warpgroups hold the drained tile
+            # (128 registers of BF16 pairs) plus the column pass without spills
+            # (sum 232 + 232 + 40 = 504, the SM107 limit).
+            self.threads_per_cta = 32 * 12
+            self.reg_split = (232, 40)
         if split_producer and tactic[5] == 2:
             # Second producer warp issues the odd k-blocks (whole stages).
             self.tma_kil_warp_id = self.tma_warp_id + 1
@@ -193,6 +209,13 @@ class KdaConvGemm:
             raise ValueError(f"KDA conv GEMM: conv weight {tuple(conv_w.shape)}")
         self.tactic = tactic or DEFAULT_TACTIC
         self.drain = drain and self.tactic[0][0] == 2 * self.tactic[2]
+        # Column-pair weight layout for the branch-free column pass:
+        # [col pair][tap][col, col + 1] (aligned f32x2 operands).
+        self.conv_w_pairs = conv_w.view(self.n // 2, 2, 4).transpose(1, 2).contiguous()
+        flags = set((self.tactic[7] if len(self.tactic) > 7 else "").split("+"))
+        self._t2 = self.drain and "ct1" not in flags and not any(
+            f.startswith("cskel") for f in flags
+        )
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
         self._compiled = {}
 
@@ -202,6 +225,7 @@ class KdaConvGemm:
         if fn is None:
             gemm = _Kernel(self.tactic, conv=True, norms=norms, drain=self.drain)
             gemm.conv_mode = True
+            gemm.conv_p_dim = self.p
             cl = self.tactic[1]
             mac = cutlass_utils.HardwareInfo().get_max_active_clusters(cl[0] * cl[1])
             layouts = (
@@ -242,7 +266,9 @@ class KdaConvGemm:
         nsteps = top.bit_length() if nseq > 1 else 0
         conv = (
             cutlass.Int64(out.data_ptr()),
-            cutlass.Int64(self.conv_w.data_ptr()),
+            cutlass.Int64(
+                (self.conv_w_pairs if self._t2 and not with_norms else self.conv_w).data_ptr()
+            ),
             cutlass.Int64(side.data_ptr()),
             cutlass.Int64(qsl.data_ptr()),
             cutlass.Int64(norms.data_ptr() if norms is not None else 0),

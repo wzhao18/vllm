@@ -204,6 +204,74 @@ def test_key_covers_cpu_tensor_contents():
     assert _key(_Kernel(1.0), torch.empty(0)) == _key(_Kernel(1.0), torch.empty(0))
 
 
+def test_cuda_stream_argument_is_keyed_by_type():
+    """A CUstream launch argument is described by its type: two processes (other
+    stream handles) share the cache entry instead of compiling without it."""
+    driver = pytest.importorskip("cuda.bindings.driver")
+    a, b = driver.CUstream(0), driver.CUstream(12345)
+    assert _key(_Kernel(1.0), a) == _key(_Kernel(1.0), b)
+    assert _key(_Kernel(1.0), a) != _key(_Kernel(2.0), a)
+
+
+def _capsule(address):
+    import ctypes
+
+    new = ctypes.pythonapi.PyCapsule_New
+    new.restype, new.argtypes = ctypes.py_object, [ctypes.c_void_p, ctypes.c_char_p]
+    new.argtypes += [ctypes.c_void_p]
+    return new(address, b"dltensor", None)
+
+
+class _DslTensor:
+    """Stand-in for cute.runtime._Tensor: a DLPack capsule plus the DSL cache key."""
+
+    __module__, __qualname__ = "cutlass.cute.runtime", "_Tensor"
+
+    def __init__(self, address, layout):
+        self._dlpack_data, self._layout = _capsule(address), layout
+
+    @property
+    def __cache_key__(self):
+        return ("Float8E4M3FN", 16, self._layout)
+
+
+def test_dsl_runtime_argument_is_keyed_by_its_dsl_cache_key():
+    """A from_dlpack argument is described by the DSL's own cache key: the capsule
+    and address differ per process (the MegaMoE kernels compiled outside the cache
+    at every start), the layout marks do not."""
+    a, b = _DslTensor(0x1000, (2, 1)), _DslTensor(0x2000, (2, 1))
+    assert _key(_Kernel(1.0), a) == _key(_Kernel(1.0), b)
+    assert _key(_Kernel(1.0), a) != _key(_Kernel(1.0), _DslTensor(0x1000, (1, 2)))
+
+
+def test_stale_ir_value_on_a_kernel_is_keyed_by_type():
+    """An IR value a finished trace left on the kernel object does not make the
+    next compile of that object uncacheable."""
+    ir_value = type("OpResult", (), {"__slots__": (), "__module__": "cutlass._mlir.ir"})
+    k, j = _Kernel(1.0), _Kernel(1.0)
+    k.tma, j.tma = ir_value(), ir_value()
+    assert _key(k) == _key(j)
+    assert _key(k) != _key(_Kernel(1.0))
+
+
+class _PeerMapper:
+    """A launch argument with runtime addresses that declares its trace key."""
+
+    def __init__(self, base, ranks):
+        self.base_address, self.offsets, self.max_ranks = base, tuple(range(ranks)), ranks
+
+    def __cute_cache_key__(self):
+        return self.max_ranks, len(self.offsets)
+
+
+def test_declared_cute_cache_key_replaces_the_attributes():
+    """The MegaMoE peer mapper's workspace address differs per process: keyed by
+    what it declares, two processes share the entry; the rank count still keys."""
+    four = _key(_Kernel(1.0), _PeerMapper(0x7F00, 4))
+    assert four == _key(_Kernel(1.0), _PeerMapper(0x9F00, 4))
+    assert four != _key(_Kernel(1.0), _PeerMapper(0x7F00, 8))
+
+
 def test_fingerprint_functions_closures_cycles():
     def make(n):
         def inner():

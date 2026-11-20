@@ -27,9 +27,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import 
     PairUnit,
     build_pair_row_table,
     check_pair_coverage,
+    exchange_strides,
     pair_layout,
     pair_units,
     reference_pair_exchange,
+    stage_units,
     reference_read_pages,
     reference_zero_pages,
 )
@@ -116,6 +118,7 @@ def _pull_as_today(d_ranks, d_ids, num_cached, p_ranks, p_ids) -> None:
     """Every D rank reads whole P pages as the worker matches them, then zeroes
     the pages its reads leave unwritten."""
     worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
     local = d_ids[num_cached:]
     for r, d in enumerate(d_ranks):
         p = p_ranks[r % P_DCP]
@@ -274,6 +277,95 @@ def test_lone_unit_zero_fills_its_second_half():
 
 
 # ----------------------------------------------------------------------------
+# A1b: staged exchange, D DCP = P DCP x 2^k (e.g. DEP16 P at DCP 1 -> DCP4 D)
+# ----------------------------------------------------------------------------
+
+
+def _check_staged_oracle(
+    p_dcp: int, d_dcp: int, block_size: int, num_tokens: int, num_cached: int
+) -> None:
+    """Pull as the worker matches blocks (rank r reads P block
+    ``r // W + R(m + i)`` of P rank ``r % W``), then the staged exchange:
+    every D row holds its interleave-1 token and rows past L are zero."""
+    case = f"W={p_dcp} D={d_dcp} B={block_size} L={num_tokens} m={num_cached}"
+    num_d = cdiv(num_tokens, d_dcp * block_size)
+    num_p = cdiv(num_tokens, p_dcp * block_size)
+    d_ids, p_ids = _block_tables(np.random.default_rng(num_tokens), num_d, num_p)
+    p_ranks = [_TokenRank(block_size, num_p + 2, 8, 40) for _ in range(p_dcp)]
+    for p, rank in enumerate(p_ranks):
+        tokens = _canonical_tokens(p, p_dcp, block_size, num_p)
+        rank.write(p_ids, np.where(tokens < num_tokens, tokens + 1, 0))
+    d_ranks = [_TokenRank(block_size, num_d + 2, 16, 8) for _ in range(d_dcp)]
+    stale = np.full((num_d - num_cached, block_size), STALE * 0x0101010101010101)
+    for r, rank in enumerate(d_ranks):
+        cached = _canonical_tokens(r, d_dcp, block_size, num_cached)
+        rank.write(d_ids[:num_cached], cached + 1)
+        rank.write(d_ids[num_cached:], stale)
+
+    worker = object.__new__(NixlPullConnectorWorker)
+    worker._sub_block_peers = {}
+    local = d_ids[num_cached:]
+    for r, d in enumerate(d_ranks):
+        dst, src = worker._apply_dcp_prefix_caching(
+            local,
+            p_ids,
+            remote_rank=r % p_dcp,
+            local_dcp_size=d_dcp,
+            local_dcp_rank=r,
+            remote_dcp_size=p_dcp,
+            local_num_computed_blocks=num_cached,
+        )
+        reference_read_pages(d.buf, d.table, dst, p_ranks[r % p_dcp].buf,
+                             p_ranks[r % p_dcp].table, src)
+        reference_zero_pages(d.buf, d.table, unwritten_blocks(local, set(dst)))
+    ratio = d_dcp // p_dcp
+    units = pair_units(
+        [local], [num_cached], [p_ids], groups=[0], ratio=ratio,
+        remote_dcp_size=p_dcp,
+    )
+    reference_pair_exchange(
+        [d.buf for d in d_ranks], [{0: d.table} for d in d_ranks], units
+    )
+    for r, rank in enumerate(d_ranks):
+        tokens = _canonical_tokens(r, d_dcp, block_size, num_d)
+        got = rank.read(d_ids)
+        held = tokens < num_tokens
+        np.testing.assert_array_equal(
+            got[held], tokens[held] + 1, err_msg=f"{case} rank={r}"
+        )
+        assert (got[~held] == 0).all(), f"{case} rank={r}: stale row past L"
+        assert rank.untouched_outside(d_ids), f"{case} rank={r}"
+
+
+@pytest.mark.parametrize("p_dcp,d_dcp", [(1, 4), (1, 8), (2, 8), (1, 2), (8, 16)])
+@pytest.mark.parametrize("block_size", [8, 64])
+def test_staged_token_oracle(p_dcp: int, d_dcp: int, block_size: int):
+    """A1b: the staged exchange (log2(R) pair stages) lays every D rank out in
+    interleave-1 order for any power-of-two DCP ratio, with prefix hits and
+    partial last blocks; at ratio 2 it is the one-stage exchange."""
+    span = d_dcp * block_size
+    for num_tokens in sorted({1, 2, 3, 5, span // 2 + 1, span - 1, span, span + 1,
+                              2 * span + 3, 3 * span - 1}):
+        num_d = cdiv(num_tokens, span)
+        for num_cached in sorted({0, 1} & set(range(num_d))):
+            _check_staged_oracle(p_dcp, d_dcp, block_size, num_tokens, num_cached)
+
+
+def test_staged_units_match_one_stage_at_ratio_2():
+    """At ratio 2 the staged plan is the one-stage plan."""
+    local, remote = [[5, 6, 7]], [[1, 2, 3, 4, 9]]
+    one = pair_units(local, [0], remote, groups=[0])
+    for r in range(16):
+        staged = stage_units(one, r, 8, 8)
+        assert [(u.block_id, u.has_partner) for u in staged] == [
+            (u.block_id, u.has_partner) for u in one
+        ]
+    assert exchange_strides(16, 8) == [8]
+    assert exchange_strides(4, 1) == [1, 2]
+    assert exchange_strides(16, 2) == [2, 4, 8]
+
+
+# ----------------------------------------------------------------------------
 # A2: the plan matches the blocks the worker pulls
 # ----------------------------------------------------------------------------
 
@@ -282,6 +374,7 @@ def _mla_pull_worker(dcp_rank: int, block_size: int, num_d: int, num_p: int):
     """TP16/DCP16 decoder rank with two MLA groups pulling from a TP8/DCP8
     prefiller. Real block matching and descriptors; the transport is mocked."""
     w = object.__new__(NixlPullConnectorWorker)
+    w._sub_block_peers = {}
     w.engine_id, w.tp_rank = "D", dcp_rank
     w.block_size = block_size
     w.use_mla, w._has_mamba = True, False
@@ -469,7 +562,11 @@ def test_coverage_check_rejects_a_short_prefiller():
 
 @pytest.mark.parametrize(
     "dcp_size,remote_dcp_size,block_size,interleave",
-    [(16, 8, 1024, 1024), (16, 8, 1024, 64), (16, 16, 1024, 1), (16, 4, 1024, 1)],
+    [
+        *((16, 8, 1024, 1024), (16, 8, 1024, 64), (16, 16, 1024, 1)),
+        # The DCP ratio must be a power of two (D DCP 12 over P DCP 4 is 3).
+        *((16, 3, 1024, 1), (12, 4, 1024, 1), (16, 8, 1023, 1)),
+    ],
 )
 def test_pair_layout_rejects_other_modes(
     dcp_size, remote_dcp_size, block_size, interleave
