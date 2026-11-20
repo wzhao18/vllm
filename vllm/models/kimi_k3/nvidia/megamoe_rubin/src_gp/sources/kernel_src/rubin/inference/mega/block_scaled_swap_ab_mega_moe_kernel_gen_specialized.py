@@ -109,7 +109,10 @@ from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInte
 from ....schedulers.genphase_decode_scheduler import GenphaseDecodeFc12Scheduler
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
-from .block_scaled_swap_ab_fc12_mainloop_gen_specialized import BlockScaledSwapAbFc12MainloopGenSpecialized
+from .block_scaled_swap_ab_fc12_mainloop_gen_specialized import (
+    BlockScaledSwapAbFc12MainloopGenSpecialized,
+    PairedStagePipeline,
+)
 from .shared_expert_helper import (
     SharedExpertKernelMixin,
     shared_kernel_impl_requirements,
@@ -1530,6 +1533,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             token_pipeline = self._mainloop.create_token_pipeline(self._smem_workspace, smem_base)
         else:
             ab_pipeline = self._mainloop.create_ab_pipeline(self._smem_workspace, smem_base)
+            if cutlass.const_expr(self._mainloop.paired_ab_stages):
+                ab_pipeline = PairedStagePipeline(ab_pipeline)
             token_pipeline = ab_pipeline
         tma_a_pipeline_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self._mainloop.num_weight_ab_stages
