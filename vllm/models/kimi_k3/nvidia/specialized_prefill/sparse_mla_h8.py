@@ -393,10 +393,11 @@ class SparseMlaPrefillH8:
         # xphys (logical mode, timing only): the gather warps run the physical-slot loop on
         # the slots passed as ``stamp`` (counts from ``lengths``); the producer still runs,
         # gated by B_KVEMPTY
-        knobs = tuple(knobs) + (0,) * (14 - len(knobs))
+        # fpad (A/B): the padding softmax warps also run the P proxy fence (pre-M14)
+        knobs = tuple(knobs) + (0,) * (15 - len(knobs))
         (self.no_store, self.no_gather, self.no_math, self.no_mma, self.sstamp,
          self.pad, self.ssmask, self.pin, self.parts, self.gskip, self.cpa,
-         self.qkh, self.lglob, self.xphys) = knobs[:14]
+         self.qkh, self.lglob, self.xphys, self.fpad) = knobs[:15]
         if self.cpa == 0:
             self.cpa = 3
         elif self.cpa == 9:
@@ -1597,7 +1598,13 @@ class SparseMlaPrefillH8:
                     o0, o1, o2, o3 = tmem_ld_o4(col)
                     tmem_st_o4(col, o0 * al, o1 * al, o2 * al, o3 * al)
             tc_fence_before()
-        fence_async_smem()
+        # only the warps that wrote P order it for the PV MMA (the padding warp writes
+        # no P; a proxy fence is not free next to the cp.async gather)
+        if cutlass.const_expr(self.fpad):
+            fence_async_smem()
+        else:
+            if real_m:
+                fence_async_smem()
         cute.arch.sync_warp()
         self.ss(base, cta, lane, u, 8 * wg + 6, 1)
         if lane == 0:
