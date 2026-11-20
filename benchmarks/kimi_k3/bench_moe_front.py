@@ -158,7 +158,7 @@ def main():
                 for i in range(L):
                     pm.prod(src, h, busy, nostamp, carve)
                     yc = torch.mm(h, ws[i].t(), out_dtype=torch.float32)
-                    rm.route_stage(yc, E, bias, *sess, None, E, True, 2.827, True, 1.0)
+                    rm.route_stage(yc, E, bias, *sess, None, E, True, 2.827, True, 1.0, *_NO_EPLB)
 
             t_c = _time_graph(cublas)
             line += f" | cublas+route_stage {(t_c - t_p) / L:.2f}"
@@ -171,7 +171,7 @@ def main():
                     for i in range(L):
                         pm.prod(src, h, busy, nostamp, carve)
                         lt.run(ws[i], h, y32)
-                        rm.route_stage(y32, E, bias, *sess, None, E, True, 2.827, True, 1.0)
+                        rm.route_stage(y32, E, bias, *sess, None, E, True, 2.827, True, 1.0, *_NO_EPLB)
 
                 t_b = _time_graph(base)
                 line += f" | ltpin+route_stage {(t_b - t_p) / L:.2f}"

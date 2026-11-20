@@ -99,7 +99,7 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
 
     ref = _buffers(nvfp4, dev)
     route_stage._module().route_stage(
-        y, E, bias, *ref[:5], pad, E, True, SCALE, nvfp4, 1.0
+        y, E, bias, *ref[:5], pad, E, True, SCALE, nvfp4, 1.0, *_NO_EPLB
     )  # fmt: skip
     torch.accelerator.synchronize()
     _same(got, ref)
