@@ -227,7 +227,37 @@ def main():
                 res["ds-plain gu+stock situ"] = graph_time(run_p, args.reps)
                 res["ds-plain gu only"] = graph_time(
                     lambda: fp(*ap, c0, c1, ct, stream(dev)), args.reps)
+            if "sp" in args.only:  # the production SpDenseMlp (fused <= 32 rows, unfused above)
+                import types
+
+                from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_dense import (
+                    SpDenseMlp,
+                )
+
+                class _Situ:
+                    def __init__(self):
+                        self.beta, self.linear_beta = beta, lin
+
+                    def __call__(self, v):
+                        o = v.new_empty(v.shape[0], v.shape[1] // 2)
+                        torch.ops._C.situ_and_mul(o, v, beta, lin)
+                        return o
+
+                lin_ = lambda w: types.SimpleNamespace(weight=torch.nn.Parameter(w.clone(), False),
+                                                       bias=None, tp_size=1)  # fmt: skip
+                mlp = types.SimpleNamespace(gate_up_proj=lin_(wgu), down_proj=lin_(wd),
+                                            act_fn=_Situ(), shard_sequence_parallel=False,
+                                            gemm_rs_ar=None)  # fmt: skip
+                dense = SpDenseMlp(mlp, (T,), dev, 0)
+                ysp = dense.run(x)
+                torch.cuda.synchronize()
+                e = ((ysp.float() - y_ref.float()).abs().max() / y_ref.float().abs().max()).item()
+                print(f"T{T} sp: y rel {e:.2e}", flush=True)
+                res["sp dense run"] = graph_time(lambda: dense.run(x), args.reps)
+                del dense, mlp
+                torch.cuda.empty_cache()
             if not args.no_stock:
+                res["stock gu+situ+down"] = graph_time(stock, args.reps)
                 if "gu" in args.only:
                     res["stock gu+situ"] = graph_time(
                         lambda: (torch.mm(x, wgu.t(), out=gu),
