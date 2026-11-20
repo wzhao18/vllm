@@ -168,6 +168,16 @@ def _tma3d(dst, tmap, bar, c0, c1, c2):
 
 
 @asm()
+def _tma4d(dst, tmap, bar, c0, c1, c2, c3):
+    code = (
+        "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx"
+        "::bytes [$0], [$1, {$3, $4, $5, $6}], [$2];"
+    )
+    return code, "r,l,r,r,r,r,r,~{memory}", (
+        Uint32(dst), Int64(tmap), Uint32(bar), Int32(c0), Int32(c1), Int32(c2), Int32(c3))
+
+
+@asm()
 def _mma_f16(d, a, b, idesc, acc):
     code = (
         "{ .reg .pred p; setp.ne.b32 p, $4, 0; "
@@ -567,12 +577,22 @@ class DcpValue:
             # [128 outputs x 64] (latent-contiguous, gather_heads' layout)
             # (bench probe KNOBS 8192: rows 1 KiB apart, the head-major access pattern)
             row_stride = 1024 if self.knobs & 8192 else self.q_heads * 1024
-            am = tensormap.encode_map(
-                rows.iterator.toint(), bf, (512, self.q_heads, self.batch),
-                (1024, row_stride), (64, 1, HS_ROWS if self.ov else 128), sw, l2)
-            bm = tensormap.encode_map(
-                w_uv.iterator.toint(), bf, (512, 128, self.size * self.heads),
-                (1024, 128 * 1024), (64, 128, 1), sw, l2)
+            if cutlass.const_expr(self.ov):
+                # one TMA op per chunk / per two W_UV tiles: [64 dims, rows, k-block,
+                # head] boxes land as the k-block-major SW128 tiles the MMAs read
+                am = tensormap.encode_map(
+                    rows.iterator.toint(), bf, (64, self.batch, 8, self.q_heads),
+                    (row_stride, 128, 1024), (64, HS_ROWS, 8, 1), sw, l2)
+                bm = tensormap.encode_map(
+                    w_uv.iterator.toint(), bf, (64, 128, 8, self.size * self.heads),
+                    (1024, 128, 128 * 1024), (64, 128, 2, 1), sw, l2)
+            else:
+                am = tensormap.encode_map(
+                    rows.iterator.toint(), bf, (512, self.q_heads, self.batch),
+                    (1024, row_stride), (64, 1, 128), sw, l2)
+                bm = tensormap.encode_map(
+                    w_uv.iterator.toint(), bf, (512, 128, self.size * self.heads),
+                    (1024, 128 * 1024), (64, 128, 1), sw, l2)
             # The descriptors are grid-constant parameters (not tuple members, which
             # the kernel would copy to local memory, an invalid TMA source).
             kernel = self.kernel_tc
@@ -1018,9 +1038,7 @@ class DcpValue:
                         dst = ring + Uint32(HS_CHUNK) * Uint32(st)
                         mbar_wait(bars + Uint32(8) * Uint32(HS_RING + st), ph ^ 1)
                         mbar_arrive_tx(full, Uint32(HS_CHUNK))
-                        for e in cutlass.range_constexpr(2):
-                            _tma3d(dst + Uint32(e * HS_CHUNK // 2), tm_b, full,
-                                   64 * (2 * lane + e), 0, gh)
+                        _tma4d(dst, tm_b, full, 0, 0, 2 * lane, gh)
                     kc = kc + 4
                     # the readiness warp saw every chunk of the part published before
                     # it hands over the first one
@@ -1042,9 +1060,7 @@ class DcpValue:
                             dst = ring + Uint32(HS_CHUNK) * Uint32(st)
                             mbar_wait(bars + Uint32(8) * Uint32(HS_RING + st), ph ^ 1)
                             mbar_arrive_tx(full, Uint32(HS_CHUNK))
-                            for jj in cutlass.range_constexpr(8):
-                                _tma3d(dst + Uint32(jj * HS_CHUNK // 8), tm_a, full,
-                                       64 * jj, gh, t0)
+                            _tma4d(dst, tm_a, full, 0, t0, 0, gh)
                             if (i == 0) & (k < 4):
                                 self.mark(c, 12 + k, 0)
                             k = k + HS_ISS
