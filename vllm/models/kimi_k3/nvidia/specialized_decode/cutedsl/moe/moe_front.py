@@ -63,7 +63,7 @@ constexpr int kMaxR = 8;               // shared-memory-resident weight K blocks
 constexpr int kMaxX = 32;              // token ring slots (n x 128 B each, in the ring)
 constexpr int kLine = 32;              // one counter per 128 B line
 constexpr int kTileCnt = 3 * kLine;    // cnt[kTileCnt + kLine t]: partials stored for tile t
-constexpr int kStampStride = 8;
+constexpr int kStampStride = 64;  // [0, 8) phases, [8, 32) MMA issued, [32, 64) W landed per K block
 constexpr int kSmemBudget = 214 * 1024;  // dynamic + static: co-resident with the AttnRes reduce
 
 struct Params {
@@ -73,6 +73,7 @@ struct Params {
   unsigned* cnt;     // [kLine] router CTAs done [2 kLine] CTAs finished [kTileCnt + kLine t] tile t
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
   int kb, rtiles, ks, ns, xs, na, nt_max, nr_max, yfull;
+  int debug;  // microbench only (0 in production): bit 0 skips the MMAs
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -286,6 +287,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     for (int i = 0; i < nt; ++i) {
       const int slot = i % p.ns;
       mbar_wait(full0 + 8 * slot, (i / p.ns) & 1);
+      if (lane == 0 && i < 32) STAMP(32 + i);
       const uint64_t src = smem_desc(ring_s + slot * kSlot);
 #pragma unroll
       for (int kk = 0; kk < 4; ++kk) cp_el(tmem + p.na + 32 * i + 8 * kk, src + 2 * kk);
@@ -307,7 +309,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       asm volatile("tcgen05.fence::after_thread_sync;");
       if (j == 0 && lane == 0) STAMP(6);
       const uint64_t b0 = smem_desc(ring_s + xs * n * 128);
-      if (j < nt) {
+      if (p.debug & 1) {
+      } else if (j < nt) {
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk)
           mma_ts(tmem, tmem + p.na + 32 * j + 8 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
@@ -317,6 +320,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         for (int kk = 0; kk < 4; ++kk) mma_ss(tmem, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
       }
       commit_el(xempty0 + 8 * xs);
+      if (lane == 0 && j < 24) STAMP(8 + j);
     }
     commit_el(acc_bar);
   } else if (warp >= 4) {
@@ -562,6 +566,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.y = y.data_ptr<float>();
   p.part = part.data_ptr<float>();
   p.cnt = reinterpret_cast<unsigned*>(cnt.data_ptr<int32_t>());
+  p.debug = static_cast<int>(stamps.numel() > grid * kStampStride ? stamps.numel() - grid * kStampStride : 0);
   p.stamps = stamps.numel() >= grid * kStampStride
                  ? reinterpret_cast<unsigned long long*>(stamps.data_ptr())
                  : nullptr;

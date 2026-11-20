@@ -49,7 +49,7 @@ def _same(got, ref):
 @pytest.mark.parametrize("nvfp4", [True, False])
 @pytest.mark.parametrize("n", [32, 64, 96])
 @pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("tiles", ["config", "ks4ring3"])
+@pytest.mark.parametrize("tiles", ["config", "ring3"])
 def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     dev = torch.device("cuda")
     torch.manual_seed(n + 2 * nvfp4 + 4 * padded)
@@ -59,8 +59,8 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     w[E : E + 64] = 0  # zero latent blocks
     bias = (torch.randn(E, device=dev) * 0.1).float()
     pad = (torch.rand(n, device=dev) < 0.3) if padded else None
-    # ks4ring3: 4 K splits (more shared-memory weight blocks) through a 3-slot ring
-    cfg = moe_front.config_for(n, dev) if tiles == "config" else (4, 3)
+    # ring3: a 3-slot ring (token ring reuse, fewer token slots)
+    cfg = moe_front.config_for(n, dev) if tiles == "config" else (6, 3)
     stamps = torch.empty(0, dtype=torch.int64, device=dev)
     cnt = torch.zeros(2048, dtype=torch.int32, device=dev)
     part = torch.empty(35 * cfg[0] * n * 128, device=dev)

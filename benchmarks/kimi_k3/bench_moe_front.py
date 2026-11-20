@@ -187,11 +187,22 @@ def main():
 
             t_f = _time_graph(front)
             line += f" | front{c} ring {plan[0]} xslots {plan[3]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
+            # Skeleton: same bytes, barriers, reduce and epilogue, no MMAs (debug bit 0).
+            skel = torch.zeros(35 * c[0] * 64 + 1, dtype=torch.int64, device=dev)
+
+            def skeleton(c=c):
+                for i in range(L):
+                    pm.prod(src, h, busy, nostamp, carve)
+                    fm.moe_front(ws[i], h, yr, cnt, part, bias, *sess, None, E, E, True, 2.827,
+                                 True, 1.0, *c, skel)  # fmt: skip
+
+            t_s = _time_graph(skeleton)
+            line += f" skeleton {(t_s - t_p) / L:.2f}"
         print(line, flush=True)
         # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]
         grid = 35 * c[0]
-        st = torch.zeros(grid * 8, dtype=torch.int64, device=dev)
+        st = torch.zeros(grid * 64, dtype=torch.int64, device=dev)
         end = torch.zeros(1, dtype=torch.int64, device=dev)
 
         def stamped():
@@ -208,7 +219,7 @@ def main():
             st.zero_()
             g.replay()
             torch.cuda.synchronize()
-        sv = st.view(grid, 8)
+        sv = st.view(grid, 64)
         s = (sv.double() - float(end.item())) / 1000.0
         names = ["entry", "x-issue", "partial", "tile-sum", "topk-go", "end", "x0-mma", "acc-done"]
         parts = []
@@ -218,6 +229,11 @@ def main():
                 parts.append(f"{nm} {v.median().item():.2f}/{v.max().item():.2f}")
         print(f"  stamps n{n} cfg{c} (us after producer end, median/max): " + ", ".join(parts),
               flush=True)
+        for cta in (0, grid // 2, grid - 1):
+            it = [f"{s[cta, 8 + j].item():.2f}" for j in range(24) if sv[cta, 8 + j] != 0]
+            print(f"  cta{cta} mma-issued per K block: {' '.join(it)}", flush=True)
+            wl = [f"{s[cta, 32 + j].item():.2f}" for j in range(32) if sv[cta, 32 + j] != 0]
+            print(f"  cta{cta} W landed per TMEM K block: {' '.join(wl)}", flush=True)
 
 
 if __name__ == "__main__":

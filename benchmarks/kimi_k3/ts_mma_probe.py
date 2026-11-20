@@ -117,7 +117,7 @@ void run(torch::Tensor wimg, torch::Tensor ximg, torch::Tensor out, int64_t n, i
   TORCH_CHECK(smem <= 232448 && n % 16 == 0 && n <= 256 && nkb <= 8);
   TORCH_CHECK(cudaFuncSetAttribute(ts_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) == cudaSuccess);
   ts_mma<<<grid, 128, smem, c10::cuda::getCurrentCUDAStream()>>>((const char*)wimg.data_ptr(), (const char*)ximg.data_ptr(),
-      out.data_ptr<float>(), n, nkb, reps, clk.numel() ? clk.data_ptr<long long>() : nullptr, mode);
+      out.data_ptr<float>(), n, nkb, reps, clk.numel() ? reinterpret_cast<long long*>(clk.data_ptr()) : nullptr, mode);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 """
