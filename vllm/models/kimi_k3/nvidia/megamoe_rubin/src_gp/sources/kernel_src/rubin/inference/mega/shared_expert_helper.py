@@ -42,6 +42,9 @@ def shared_kernel_impl_requirements() -> dict:
         # Shared FC1 L2 swizzle: walk the tiles G feature blocks at a time so fewer weight bytes are live (0: off,
         # unset: the kernel's default).
         "shared_fc1_swizzle": OptionalRequirement(Optional[int]),
+        # K parts (FC1, FC2) per shared tile: more, smaller shared units so every SM streams the shared expert at
+        # the start; the epilogue sums the parts' FP32 accumulators in part order (unset: whole-K tiles).
+        "shared_k_splits": OptionalRequirement(Optional[tuple]),
     }
 
 
@@ -93,6 +96,7 @@ class SharedExpertKernelMixin:
         position = impl_desc.get("shared_l2_position")
         self.shared_work_id_mode = impl_desc.get("shared_work_id_mode")
         self.shared_fc1_swizzle = impl_desc.get("shared_fc1_swizzle")
+        self.shared_k_splits = tuple(impl_desc.get("shared_k_splits") or (1, 1))
         self.reduce_shared_output = bool(problem_desc.get("reduce_shared_output", False))
         if not self.shared_expert:
             stray = [key for key, value in supplied.items() if value is not None]
@@ -122,6 +126,8 @@ class SharedExpertKernelMixin:
         self.shared_intermediate_gateup_size = supplied["shared_intermediate_gateup_size"]
         self.shared_output_size = supplied["shared_output_size"]
         self.heterogeneous_shared = self.shared_quant_kind != self.quant_kind
+        if self.shared_k_splits != (1, 1) and not self.heterogeneous_shared:
+            raise ValueError("shared_k_splits needs the shared expert's own kind (its own GMEM view adapter).")
         if self.helper_expert_count > 0:
             raise ValueError("shared_expert is not supported together with helper (DLB) experts.")
         if self.reduce_shared_output:
@@ -212,7 +218,10 @@ class SharedExpertKernelMixin:
             }
         )
         self.shared_epilogue = SwapABGatedActEpilogue(shared_epilogue_problem_desc, shared_epilogue_impl_desc)
-        self.shared_fc2_spin_threshold = ceil_div(self.shared_intermediate_gateup_size, self.cta_tile_m)
+        # Every K part of a shared FC1 tile signals once (only the last part's epilogue writes the tile).
+        self.shared_fc2_spin_threshold = ceil_div(self.shared_intermediate_gateup_size, self.cta_tile_m) * (
+            self.shared_k_splits[0]
+        )
 
     def _check_shared_tile_k(self) -> None:
         if self.shared_expert and self.shared_tile_k % self._mainloop.shared_mma_tile_k != 0:
@@ -228,6 +237,7 @@ class SharedExpertKernelMixin:
             "shared_l2_position": position if position is not None else self._shared_l2_position_request,
             "shared_work_id_mode": self.shared_work_id_mode,
             "shared_fc1_swizzle": fc1_swizzle if fc1_swizzle is not None else self.shared_fc1_swizzle,
+            "shared_k_splits": self.shared_k_splits,
         }
 
     def _shared_smem_kwargs(self) -> dict:
@@ -270,6 +280,37 @@ class SharedExpertKernelMixin:
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.shared_k_splits != (1, 1):
+            # Split shared tiles: one FP32 accumulator image per (CTA tile, K part), column-major so a warp's
+            # 32 rows of one token column are one 128-byte line; one arrival counter per CTA tile.
+            slots = self._shared_split_slot_counts()
+            device_workspace.register(
+                self.shared_split_partials_region,
+                cutlass.Float32,
+                ((slots[0] * self.shared_k_splits[0] + slots[1] * self.shared_k_splits[1])
+                 * self.cta_tile_m * self.cta_tile_n,),
+                buffer_space="local",
+                byte_alignment=128,
+            )
+            device_workspace.register(
+                self.shared_split_counter_region,
+                cutlass.Int32,
+                (slots[0] + slots[1],),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="tail_reset",
+            )
+
+    def _shared_split_tile_rows(self) -> Tuple[int, int]:
+        """CTA tiles per shared token block of the shared FC1 / FC2 (feature rows / CTA tile M)."""
+        return (
+            ceil_div(self.shared_intermediate_gateup_size, self.cta_tile_m),
+            ceil_div(self.shared_output_size, self.cta_tile_m),
+        )
+
+    def _shared_split_slot_counts(self) -> Tuple[int, int]:
+        rows = self._shared_split_tile_rows()
+        return (rows[0] * self.scheduler.shared_token_blocks, rows[1] * self.scheduler.shared_token_blocks)
 
     def _shared_name_suffix(self) -> str:
         if not self.shared_expert:
@@ -491,8 +532,23 @@ class SharedExpertKernelMixin:
         # The extension derives SF views from its vector size, so the shared kind needs its own instance.
         shared_kernel_extension = kernel_extension
         if self.heterogeneous_shared:
+            part_elems = (0, 0)
+            if self.shared_k_splits != (1, 1):
+                part_elems = (
+                    self.shared_hidden_size // self.shared_k_splits[0],
+                    self.shared_intermediate_gateup_size // 2 // self.shared_k_splits[1],
+                )
             shared_kernel_extension = dataclasses.replace(
-                kernel_extension, sf_vec_size=self.shared_quant_kind.sf_vec_size
+                kernel_extension, sf_vec_size=self.shared_quant_kind.sf_vec_size, shared_k_part_elems=part_elems
+            )
+        split_kwargs = {}
+        if self.shared_k_splits != (1, 1):
+            split_kwargs = dict(
+                k_splits=self.shared_k_splits,
+                split_tile_rows=self._shared_split_tile_rows(),
+                split_slot_counts=self._shared_split_slot_counts(),
+                split_partials=self._device_workspace.tensor(self.shared_split_partials_region),
+                split_counters=self._device_workspace.tensor(self.shared_split_counter_region),
             )
         bindings = SharedEpilogueBindings(
             base=self.shared_epilogue,
@@ -506,6 +562,7 @@ class SharedExpertKernelMixin:
             fc2_tma_output=shared_fc2_output_tma_tensor,
             # mxfp8 carries its whole rescale in the e8m0 block scales: no alpha or norm constant.
             epi_args=GatedActEpilogueArgs(fc1_alpha=None, fc2_alpha=None, fc1_norm_const=None, topk_scores=None),
+            **split_kwargs,
         )
         return shared_kernel_extension, bindings
 

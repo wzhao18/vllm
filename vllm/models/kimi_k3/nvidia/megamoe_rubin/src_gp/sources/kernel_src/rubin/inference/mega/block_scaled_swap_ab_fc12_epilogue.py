@@ -936,6 +936,13 @@ class SharedEpilogueBindings:
     epi_args: GatedActEpilogueArgs
     tma_atom_fc2_output: Optional[cute.CopyAtom] = None  # set when the shared FC2 takes the TMA store
     fc2_tma_output: Optional[cute.Tensor] = None  # token-major (token, N_s, 1) view for that store
+    # Split shared tiles (K parts per FC1 / FC2 tile): CTA tiles per token block, CTA tiles in all, the FP32
+    # part images (column-major per CTA tile and part) and one arrival counter per CTA tile.
+    k_splits: Tuple[int, int] = (1, 1)
+    split_tile_rows: Tuple[int, int] = (0, 0)
+    split_slot_counts: Tuple[int, int] = (0, 0)
+    split_partials: Optional[cute.Tensor] = None
+    split_counters: Optional[cute.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.base.communication_enabled:
@@ -1216,6 +1223,98 @@ class SwapABGatedActEpilogue(KernelComponent):
         else:
             self.fc2_tma_stages = 0
             self.fc2_staging_spec = None
+
+    @cute.jit
+    def _shared_split_fixup(
+        self,
+        shared: "SharedEpilogueBindings",
+        work_tile_info,
+        tmem_acc_tensor: cute.Tensor,
+        acc_pipeline,
+        acc_consumer_state,
+        tidx: cutlass.Int32,
+        flag_pointer,
+        barrier: pipeline.NamedBarrier,
+    ) -> cutlass.Boolean:
+        """K part ``expert_idx`` of a split shared tile: store this part's FP32 accumulator to the workspace and
+        count it; the part that completes the count sums every part in part order (fixed: the result does not
+        depend on arrival order) back into TMEM and runs the tile's epilogue. Returns whether it runs it.
+        Thread t owns accumulator row t (warp w reads TMEM lanes [32 w, 32 w + 32))."""
+        if cutlass.const_expr(self.two_epilogue_warpgroups or self.cta_tile_m != 32 * self._EpilogueWarpCnt):
+            raise ValueError("Split shared tiles need one epilogue warpgroup with one thread per accumulator row.")
+        is_fc1 = work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear1)
+        parts = cutlass.Int32(shared.k_splits[1])
+        rows = cutlass.Int32(shared.split_tile_rows[1])
+        counter_base = cutlass.Int32(shared.split_slot_counts[0])
+        partial_base = cutlass.Int32(shared.split_slot_counts[0] * shared.k_splits[0])
+        if is_fc1:
+            parts = cutlass.Int32(shared.k_splits[0])
+            rows = cutlass.Int32(shared.split_tile_rows[0])
+            counter_base = cutlass.Int32(0)
+            partial_base = cutlass.Int32(0)
+        slot = work_tile_info.tile_n_idx * rows + work_tile_info.tile_m_idx
+        tile_elems = cutlass.Int32(self.cta_tile_m * self.cta_tile_n)
+        warp = tidx // cutlass.Int32(32)
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        tmem_warp = cute.logical_divide(tmem_acc_tensor, (32, None))[(None, warp), None]
+        tmem_chunks = cute.flat_divide(tmem_warp, (32, 32))
+        ld_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32)
+        st_atom = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition.x32), cutlass.Float32)
+        partials = shared.split_partials
+        tile_base = (partial_base + slot * parts) * tile_elems + tidx
+        own_base = tile_base + work_tile_info.expert_idx * tile_elems
+        acc_pipeline.consumer_wait(acc_consumer_state)
+        for chunk in cutlass.range_constexpr(self.cta_tile_n // 32):
+            if cutlass.Int32(chunk * 32) < valid_tokens:
+                regs = cute.make_rmem_tensor((32,), cutlass.Float32)
+                cute.copy(
+                    ld_atom,
+                    wrap_into_copy_standard_layout(tmem_chunks[None, None, 0, chunk]),
+                    wrap_into_copy_standard_layout(regs),
+                )
+                for j in cutlass.range_constexpr(32):
+                    partials[own_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m)] = regs[j]
+        cute.arch.fence_acq_rel_gpu()
+        barrier.arrive_and_wait()
+        flag = cute.make_tensor(cute.recast_ptr(flag_pointer, dtype=cutlass.Int32), cute.make_layout((1,)))
+        if tidx == cutlass.Int32(0):
+            arrived = cute.arch.atomic_add(shared.split_counters.iterator + counter_base + slot, cutlass.Int32(1))
+            last_flag = cutlass.Int32(0)
+            if arrived + cutlass.Int32(1) == parts:
+                last_flag = cutlass.Int32(1)
+            flag[0] = last_flag
+        barrier.arrive_and_wait()
+        is_last = flag[0] != cutlass.Int32(0)
+        if is_last:
+            cute.arch.fence_acq_rel_gpu()
+            for chunk in cutlass.range_constexpr(self.cta_tile_n // 32):
+                if cutlass.Int32(chunk * 32) < valid_tokens:
+                    acc = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    for j in cutlass.range_constexpr(32):
+                        acc[j] = cute.arch.load(
+                            partials.iterator + tile_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m),
+                            cutlass.Float32,
+                            sem="relaxed",
+                            scope="gpu",
+                        )
+                    for part in cutlass.range(1, parts, unroll=1):
+                        part_base = tile_base + part * tile_elems
+                        for j in cutlass.range_constexpr(32):
+                            acc[j] = acc[j] + cute.arch.load(
+                                partials.iterator + part_base + cutlass.Int32((chunk * 32 + j) * self.cta_tile_m),
+                                cutlass.Float32,
+                                sem="relaxed",
+                                scope="gpu",
+                            )
+                    cute.copy(
+                        st_atom,
+                        wrap_into_copy_standard_layout(acc),
+                        wrap_into_copy_standard_layout(tmem_chunks[None, None, 0, chunk]),
+                    )
+            cute.arch.fence_view_async_tmem_store()
+        # The flag word is the FC1 staging scratch: every thread has read it before the epilogue reuses it.
+        barrier.arrive_and_wait()
+        return is_last
 
     @classmethod
     def epilogue_sync_barrier(cls) -> pipeline.NamedBarrier:
@@ -1555,20 +1654,41 @@ class SwapABGatedActEpilogue(KernelComponent):
             is_fc1 = cur_phase == cutlass.Int32(BlockPhase.Linear1)
             if cutlass.const_expr(shared is not None):
                 is_fc1 = is_fc1 | (cur_phase == cutlass.Int32(BlockPhase.SharedLinear1))
-            if is_fc1:
-                fc1_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                )
+            run_tile_epilogue = cutlass.Boolean(True)
+            if cutlass.const_expr(shared is not None and shared.k_splits != (1, 1)):
+                if (cur_phase == cutlass.Int32(BlockPhase.SharedLinear1)) | (
+                    cur_phase == cutlass.Int32(BlockPhase.SharedLinear2)
+                ):
+                    run_tile_epilogue = self._shared_split_fixup(
+                        shared,
+                        work_tile_info,
+                        tmem_acc_current,
+                        acc_pipeline,
+                        acc_consumer_state,
+                        tidx,
+                        fc1_staging_pointer,
+                        wait_only_named_barrier,
+                    )
+            if run_tile_epilogue:
+                if is_fc1:
+                    fc1_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+                else:
+                    fc2_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
             else:
-                fc2_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                )
+                # An earlier K part of a split shared tile: its accumulator is in the workspace, the last part
+                # writes the tile.
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
             DG.put_gt_dyn(cutlass.Int32(DG.S_EPM0) + (_dms_ue & cutlass.Int32(15)), _dms_uep)
             prev_work_tile_info = work_tile_info
             prev_is_fc1 = is_fc1

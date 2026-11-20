@@ -156,6 +156,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self.acc_dtype = tcgen05_block_scaled_acc_dtype
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+        self._shared_k_splits = tuple(impl_desc.get("shared_k_splits") or (1, 1))
         self._parse_shared_problem(problem_desc)
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
