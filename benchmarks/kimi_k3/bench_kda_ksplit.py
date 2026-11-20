@@ -47,7 +47,7 @@ def quant_split(t, L):
     return torch.stack(qs).contiguous(), torch.cat(ss).contiguous()
 
 
-def compile_arm(tile, cluster, swap, inst_m, L, cdt, dbg=0, dl=0, st=0):
+def compile_arm(tile, cluster, swap, inst_m, L, cdt, dbg=0, dl=0, st=0, cap=0):
     gemm = pw.Sm107BlockScaledPersistentDenseGemmKernel(
         pw.SF_VEC, (inst_m, tile[1], pw.INST_K), (tile[0], tile[1], pw.TILER_K), cluster,
         prefetch_dist=0, use_pdl=True, prewait_stages=0, weight_is_a=swap, quiet_wait=False,
@@ -55,7 +55,7 @@ def compile_arm(tile, cluster, swap, inst_m, L, cdt, dbg=0, dl=0, st=0):
     )
     gemm.dbg_skip_mma = bool(dbg)
     gemm.dbg_stamps = bool(st)
-    gemm.max_ab_stages = 0
+    gemm.max_ab_stages = cap
     sm, sk, sn = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sm, sk), stride_order=(1, 0), assumed_align=16)
@@ -100,7 +100,7 @@ def stamp_summary(aux):
                 end=q(end))
 
 
-def die_setup(wq, L, tile_m, words=272):
+def die_setup(wq, L, tile_m, words=272, m_tiles=None, n_tiles=1):
     """W [L][N][K/L] with the rows of the first n0 M pairs homed on die 0 (both K halves),
     plus one claim/alpha aux per chain slot (cluster tile c -> pair c // L, half c % L)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.dies import (
@@ -119,8 +119,9 @@ def die_setup(wq, L, tile_m, words=272):
         aux = torch.zeros(words, dtype=torch.float32, device=dev)
         ints = aux.view(torch.int32)
         aux[0] = 1.0
-        ints[8], ints[9], ints[10], ints[11] = 0, n0 * L, n0 * L, (pairs - n0) * L
-        ints[12], ints[13] = pairs, L
+        t = n_tiles * L  # claims per pair (2x1: token tiles x batch)
+        ints[8], ints[9], ints[10], ints[11] = 0, n0 * t, n0 * t, (pairs - n0) * t
+        ints[12], ints[13] = (n_tiles if m_tiles is None else m_tiles), L
         ints[16:16 + len(table)] = torch.tensor(table, dtype=torch.int32, device=dev)
         auxs.append(aux)
     print(f'die split: {n0}/{pairs} pairs on die 0 (share {share:.3f})', flush=True)
@@ -138,17 +139,22 @@ for R in [int(r) for r in args.rows.split(",")]:
             dbg = int(xd[0]) if xd else 0
             dl = int(xd[1]) if len(xd) > 1 else 0
             st = int(xd[2]) if len(xd) > 2 else 0
+            cap = int(xd[3]) if len(xd) > 3 else 0
             tile = tuple(int(v) for v in tile.split("x"))
             cl = tuple(int(v) for v in cl.split("x"))
             swap, L = swap == "1", int(L)
-            comp, gemm = compile_arm(tile, cl, swap, int(instm), L, cdt, dbg, dl, st)
+            comp, gemm = compile_arm(tile, cl, swap, int(instm), L, cdt, dbg, dl, st, cap)
             xq, xs = quant_split(x, L)
             wq, ws = quant_split(w_bf, L)
             ncopy = max(args.chain, -(-1_600_000_000 // wq.numel()))
             if dl:
-                if not swap or tuple(cl) != (2, 1) or tile[1] < R:
-                    raise ValueError('dl arms: swap 2x1 with one token tile')
-                wplace, auxs = die_setup(wq, L, tile[0], 4608 if st else 272)
+                if swap and tuple(cl) == (2, 1):
+                    wplace, auxs = die_setup(wq, L, tile[0], 4608 if st else 272,
+                                             n_tiles=-(-R // tile[1]))
+                elif not swap and tuple(cl) == (1, 1) and tile[0] >= R and L == 1:
+                    wplace, auxs = die_setup(wq, L, tile[1], 4608 if st else 272, m_tiles=1)
+                else:
+                    raise ValueError('dl arms: swap 2x1 / non-swap 1x1 with one token tile')
                 W = [(wplace(), ws)] * ncopy if args.warm else [(wplace(), ws.clone()) for _ in range(ncopy)]
             else:
                 auxs = None

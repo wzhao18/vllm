@@ -503,11 +503,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         )
 
     def _claim_coord(self, claimed, claim_m, claim_l, cta_rank):
+        # 1x1: claim_m = M tiles; 2x1: claim_m = N tiles per cluster M tile (pair),
+        # claimed = (pair * claim_m + n tile) * claim_l + batch
         if cutlass.const_expr(self.claim_cluster == 1):
             return (claimed % claim_m, claimed // claim_m, 0)
+        rest = claimed // claim_l
         return (
-            (claimed // claim_l) * self.claim_cluster + cta_rank,
-            0,
+            (rest // claim_m) * self.claim_cluster + cta_rank,
+            rest % claim_m,
             claimed % claim_l,
         )
 
