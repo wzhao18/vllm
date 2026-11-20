@@ -1360,6 +1360,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
             got = block.run(x_shard, [caches["ours"][0]], md, run).clone()
         torch.accelerator.synchronize()
         attn_in = block.attn_out[:r].clone()
+        dbg_proj = block.projected[:r].clone()
         # (our in-projection's k_pe of this rank's new rows: the rope part's source)
         ours_pe = block.projected[:r][new_mla >= 0, KPE].clone()
         assert tap.q is not None and tap.q.shape[0] == r, "our sparse decode's query"
@@ -1479,6 +1480,30 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         _barrier()
         graph.replay()
         torch.accelerator.synchronize()
+        first = (replayed.clone(), block.attn_out[:r].clone(), block.projected[:r].clone())
+
+        def _d(a, b):
+            return f"{(a.float() - b.float()).abs().max().item():.2e}/{int((a != b).sum())}"
+
+        mism = []
+        for i in range(16):
+            _barrier()
+            graph.replay()
+            torch.accelerator.synchronize()
+            rep = (replayed, block.attn_out[:r], block.projected[:r])
+            bad = [not torch.equal(x, y) for x, y in zip(rep, first)]
+            if any(bad):
+                mism.append(i)
+                print(
+                    f"DBG {where} replay{i + 1} vs replay0: out {_d(rep[0], first[0])} "
+                    f"attn {_d(rep[1], first[1])} proj {_d(rep[2], first[2])}"
+                )
+        print(
+            f"DBG {where} replay0 vs eager: out {_d(first[0], eager)} attn "
+            f"{_d(first[1], attn_in)} proj {_d(first[2], dbg_proj)}; later replays "
+            f"differing from replay0: {mism}; last vs eager: out {_d(replayed, eager)}"
+        )
+        replayed = first[0]
         assert torch.equal(replayed, eager), (where, (replayed - eager).abs().max())
         _barrier()
 
