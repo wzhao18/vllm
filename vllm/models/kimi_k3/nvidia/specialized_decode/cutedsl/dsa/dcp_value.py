@@ -50,15 +50,22 @@ from ..common.primitives import (
 from .sparse_mla import (
     SDESC_SW128,
     fence_mbar_init,
+    globaltimer,
     ld_shared_u32,
     mbar_arrive,
     mbar_arrive_tx,
     mbar_init,
     mbar_wait,
+    st_global_u64,
     tc_commit,
     tc_fence_after,
     tc_fence_before,
 )
+
+# Bench probe (benchmarks/kernels/k31_vr/bench_dattn_dcpv.py): the address of a
+# [CTAs, 16] u64 globaltimer buffer the "proj" tcgen05 DcpValue stamps its phases
+# into when compiled while it is nonzero (0, the default: no stamping code).
+STAMP_ADDR = 0
 
 LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends
 # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.
@@ -305,6 +312,7 @@ class DcpValue:
         already projected (the stock W_UV bmm over the gathered heads), so the
         projecting CTAs only push them."""
         self.heads, self.size, self.batch = heads, size, batch
+        self.stamp_addr = STAMP_ADDR
         assert partials in FORMATS, partials
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
@@ -519,6 +527,7 @@ class DcpValue:
                 mbar_init(acc_free + Uint32(8 * b), Uint32(128))
             fence_mbar_init()
         tm_a, tm_b = tensormap.map_address(am), tensormap.map_address(bm)
+        self.mark(c, 0, tid)
         # Allocate TMEM only once the predecessor grid is complete: under PDL its
         # CTAs may still be resident here and allocate TMEM after this CTA would.
         cute.arch.griddepcontrol_wait()
@@ -528,6 +537,7 @@ class DcpValue:
         cute.arch.sync_threads()
         tc_fence_after()
         taddr = ld_shared_u32(slot_addr)
+        self.mark(c, 1, tid)
         if warp == 0:
             if lane == 0:
                 kc = Int32(0)
@@ -590,6 +600,7 @@ class DcpValue:
                 _epi_sync()
                 mbar_wait(acc_full + Uint32(8) * Uint32(b), (j >> 1) & 1)
                 tc_fence_after()
+                self.mark(c, 2 + 2 * j, row)
                 out = outs + Uint32(TC_OUT) * Uint32(b) + Uint32(256) * Uint32(row)
                 swz = row % 8  # chunk ^ (t % 8): conflict-free rows, as the mailbox
                 acc = taddr + Uint32(128) * Uint32(b) + quad
@@ -617,9 +628,11 @@ class DcpValue:
                         n = 128
                     _bulk_push(peers[owner] + Int64(base + t0) * 256,
                                outs + Uint32(TC_OUT) * Uint32(b), Uint32(256 * n))
+                self.mark(c, 3 + 2 * j, row)
                 j = j + 1
             if row == 0:
                 _bulk_wait0()
+            self.mark(c, 8, row)
         cute.arch.sync_threads()
         # Free TMEM before the dependents launch: a dependent CTA placed on this SM
         # while the merge spins may require TMEM column 0 (exclusive allocators).
@@ -629,6 +642,16 @@ class DcpValue:
         self.rearm(mailbox, c * 512 + tid, G * 512)
         cute.arch.griddepcontrol_launch_dependents()
         self.merge_rows(args, scales, tid, y)
+        self.mark(c, 10, tid)
+
+    @cute.jit
+    def mark(self, c, slot, who):
+        """Bench probe: thread ``who`` == 0 stamps globaltimer into slot ``slot`` of
+        CTA ``c`` (STAMP_ADDR; slots past 15 are dropped)."""
+        if cutlass.const_expr(self.stamp_addr != 0):
+            if (who == 0) & (slot < 16):
+                at_ = Int64(self.stamp_addr) + (Int64(c) * 16 + Int64(slot)) * 8
+                st_global_u64(at_, globaltimer())
 
     @cute.jit
     def merge_rows(self, args, scales, tid, y):
@@ -657,6 +680,7 @@ class DcpValue:
                 lse = bits_float(word)
             scales[r, s] = lse
         cute.arch.sync_threads()
+        self.mark(y * self.heads + head, 9, tid)
         if tid < R:
             lses = [scales[tid, s] for s in range(D)]
             top = lses[0]
