@@ -53,8 +53,8 @@ mandatory in lead builds; no code without a lead or for grouped / phase_interlea
 so no claim below the end of a stream maps to no tile (each cluster still claims
 one past-the-end id per counter it visits, as without a lead). The decode
 scheduler itself never waits for in-kernel progress; the scheduler warp's claim
-gate (``claim_gate_on_tma_a``, default on) claims unit j+1 only after this CTA's
-TMA-A has taken unit j. The only FC1 -> FC2 synchronization is still the FC2
+gate (``claim_gate_on_tma_a``, default on) claims unit j+1 only once this CTA's
+TMA-A is one weight-ring depth from the end of unit j. The only FC1 -> FC2 synchronization is still the FC2
 TMA-B wait on the fc1_done counters, and the claim order keeps that wait live
 (see the decode scheduler's docstring, blocking point W5 for the gate). The
 cluster shape is (4, 1); decode also takes (2, 1) (with the N128 / N256 tiles; N64 is 4x1 only).
@@ -1669,8 +1669,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 scheduler.publish_work(prepared_tile)
                 published = published + Int32(1)
                 iket.range_pop()
-                # Unit j is claimed once TMA-A has taken unit j - 1 (waiting from unit 1 keeps the parity exact):
-                # one unit of lookahead for the weight stream, and claims in start order.
+                # Unit j is claimed once TMA-A is one weight-ring depth from the end of unit j - 1 (its arrival per
+                # unit keeps the parity exact): the stream never drains between units, every pair holds one unit at
+                # launch (the first wave spreads over all present pairs), and claims stay close to when they start.
                 if cutlass.const_expr(self.claim_gate_on_tma_a):
                     if published >= Int32(1):
                         cute.arch.mbarrier_wait(tma_a_progress, (published - Int32(1)) % Int32(2))

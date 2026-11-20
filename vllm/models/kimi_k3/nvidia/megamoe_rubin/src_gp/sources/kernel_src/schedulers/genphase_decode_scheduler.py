@@ -50,15 +50,15 @@ that depends on a peeked counter. The kernel's scheduler warp blocks only at W:
   W4  die-blind DLB builds only: the helper-weight READY gate in the publish loop (the external weight transport,
       never a tile of this launch);
   W5  the claim gate (kernel ``claim_gate_on_tma_a``, default on): after publishing its n-th unit the scheduler warp
-      waits on a CTA-local mbarrier until this CTA's TMA-A has taken that unit (K7), then claims the next one; Done is
-      published without it.
+      waits on a CTA-local mbarrier until this CTA's TMA-A is one weight-ring depth from the end of that unit (it has
+      issued all but the ring's stage count of its k tiles; K7), then claims the next one; Done is published without it.
 W1, W2 and W5 depend on in-kernel progress, but only on units this cluster claimed earlier. W1 (publishing unit j) waits
 for every consumer warp of this CTA to have taken unit j - 2 (two-stage queue; each consumer warp takes a unit after its
 part of the previous one, e.g. TMA-B after the previous unit's FC2 fc1_done spin, the MMA warp after the previous unit's
 k-tiles). W2 waits for the leader's broadcast and, at the leader, for every CTA's scheduler warp to have consumed the
 previous broadcast, i.e. for the cluster's own W1 / W5 on earlier units. W5 (after publishing unit j) waits for this
-CTA's TMA-A to have taken j, which it does once it has issued every weight load of unit j - 1, i.e. once AB stages are
-free; each weight stage is released by the MMAs of every MMA pair of the cluster, which can need an earlier FC2 unit's
+CTA's TMA-A to be one ring depth from the end of j, which needs every weight load of unit j - 1 and the first ones of
+j issued, i.e. AB stages freed by the MMAs of j - 1 and j; each weight stage is released by the MMAs of every MMA pair of the cluster, which can need an earlier FC2 unit's
 TMA-B fc1_done wait (K3) and the TMEM accumulators the epilogue releases inside each unit. So W1, W2 and W5 are open
 once the cluster has finished every unit claimed before the one being claimed or published; W3 waits only for the
 communication grid, W4 only for the external weight transport.

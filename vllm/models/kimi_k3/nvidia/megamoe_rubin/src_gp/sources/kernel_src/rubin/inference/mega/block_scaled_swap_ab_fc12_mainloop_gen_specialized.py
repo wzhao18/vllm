@@ -1144,8 +1144,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         ab_pipeline: pipeline.PipelineAsync,
         ab_pipeline_state: pipeline.PipelineState,
         expected_tx: Optional[Int32] = None,
+        progress_mbarrier=None,
     ) -> pipeline.PipelineState:
-        """Load one tile's A/SFA k tiles; ``kind`` bundles MMA, tiler, template views, SMEM tensors and extension."""
+        """Load one tile's A/SFA k tiles; ``kind`` bundles MMA, tiler, template views, SMEM tensors and extension.
+
+        ``progress_mbarrier`` (claim gate): arrived once per tile when the k tiles still to issue fit in the weight
+        ring, so the scheduler claims the next unit one ring depth before this one's last weight load instead of
+        at its first one (every pair holds one unit at launch, and claims stay close to when they start).
+        """
         (
             tiled_mma,
             mma_tiler_mnk,
@@ -1188,6 +1194,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         # Every weight byte is read once per launch: evict_first keeps the weight stream from
         # evicting the token payload, scale factors and FC1 outputs that later units re-read.
         weight_policy = make_l2_evict_first_policy()
+        progress_k_tile = k_tile_count - Int32(self.num_weight_ab_stages)
+        if progress_k_tile < Int32(0):
+            progress_k_tile = Int32(0)
         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=expected_tx)
@@ -1206,6 +1215,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 global_sfa_slice[(None, k_tile_idx)],
                 partitioned_smem_sfa[(None, stage_index)],
             )
+            if cutlass.const_expr(progress_mbarrier is not None):
+                if k_tile_idx == progress_k_tile:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(progress_mbarrier)
         return ab_pipeline_state
 
     @cute.jit
@@ -1281,9 +1294,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         routed_shared_sfa2 = None if self.heterogeneous_shared else shared_fc2_sfa_exec_atom
 
         work_tile = sched_consumer.consume_work()
-        if cutlass.const_expr(progress_mbarrier is not None):
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive(progress_mbarrier)
         while work_tile.is_valid_tile:
             phase = work_tile.phase
             # The fixed FC1 / FC2 range names the iket summaries key on (shared tiles count with their GEMM).
@@ -1316,6 +1326,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         ab_pipeline,
                         ab_pipeline_state,
                         Int32(self.shared_weight_tx_count),
+                        progress_mbarrier=progress_mbarrier,
                     )
                 else:
                     ab_pipeline_state = self._issue_tma_a_tile(
@@ -1328,6 +1339,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         k_tile_count,
                         ab_pipeline,
                         ab_pipeline_state,
+                        progress_mbarrier=progress_mbarrier,
                     )
             else:
                 ab_pipeline_state = self._issue_tma_a_tile(
@@ -1342,12 +1354,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     k_tile_count,
                     ab_pipeline,
                     ab_pipeline_state,
+                    progress_mbarrier=progress_mbarrier,
                 )
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
-            if cutlass.const_expr(progress_mbarrier is not None):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(progress_mbarrier)
 
         if cutlass.const_expr(trigger_dependents_when_drained):
             # No work is left to claim: this CTA's last tile is already in flight, so
