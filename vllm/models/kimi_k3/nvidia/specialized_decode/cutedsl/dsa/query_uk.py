@@ -145,7 +145,7 @@ class QueryUK:
                                   sw, l2)
         self.kernel(am, bm, q, out, scale).launch(
             grid=(2 * self.gathered, 1, 1), block=(THREADS, 1, 1), stream=stream,
-            use_pdl=False)
+            use_pdl=True)
 
     @cute.kernel
     def kernel(self, am: tensormap.GridMap, bm: tensormap.GridMap, q: Int64,
