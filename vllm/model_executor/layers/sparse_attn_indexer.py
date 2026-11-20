@@ -831,6 +831,16 @@ def sparse_attn_indexer(
                 dcp_world_size,
             ),
         )
+        if (
+            use_fp4_cache
+            and topk_tokens == 2048
+            and dcp_world_size == 1
+            and current_platform.is_device_capability((10, 7))
+        ):
+            # Kimi K3.1 sm_107 selective prefill indexer: its per-layer scratch
+            from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer_step
+
+            max_logits_bytes = max(max_logits_bytes, indexer_step.reserved_bytes())
         _ = torch.empty(
             max_logits_bytes, dtype=torch.uint8, device=hidden_states.device
         )

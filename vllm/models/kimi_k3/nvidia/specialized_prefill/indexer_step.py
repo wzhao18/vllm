@@ -26,7 +26,25 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import mqa_logits_mx_inputs
 
 _KEY = "kimi_k3_pidx"
-GROUP_ROWS = 8192
+GROUP_ROWS = 16384
+# Transient device memory one row group may hold (candidate regions, sampled
+# logits, the recovery's logits scratch, bitmap and bound-bin keys): the memory
+# profile reserves it (reserved_bytes), so groups at long contexts get fewer rows.
+SCRATCH_BUDGET = 4 << 30
+
+
+def group_bytes(rows: int, pitch: int) -> int:
+    """Transient bytes of a group of ``rows`` rows whose widest request has
+    ``pitch`` (128-aligned) keys."""
+    per_row = (
+        pidx.REGION * 4 + pidx.SAMPLES * 2 + pitch * 2 + pitch // 8 + pidx.CAND * 4
+    )
+    return (rows + 1) * per_row + pitch * 2
+
+
+def reserved_bytes() -> int:
+    """Bytes the memory profile reserves for this path's per-layer scratch."""
+    return SCRATCH_BUDGET
 
 
 def applicable(
@@ -108,6 +126,7 @@ def _layout(chunks, device):
     torch.cuda.current_stream(device).synchronize()
     groups, segs, r0 = [], [], chunks[0].token_start
     next_row = r0
+    pitch = 0
     for ci, (c, (ks, ke, cu, bt)) in enumerate(zip(chunks, host)):
         ks, ke, cu = ks.tolist(), ke.tolist(), cu.tolist()
         assert c.token_start == next_row and len(ks) == c.token_end - c.token_start, (
@@ -115,6 +134,7 @@ def _layout(chunks, device):
         )
         next_row = c.token_end
         starts = {s: b for b, s in enumerate(cu[:-1])}
+        chunk_segs = []
         i = 0
         while i < len(ks):
             j = i
@@ -125,12 +145,21 @@ def _layout(chunks, device):
             # the request's identity: its blocks (a request split over chunks has
             # the same block table row in each)
             req = bt[b].numpy().tobytes()
-            segs.append((ci, b, j - i + 1, ke[j] - ks[i], n, req))
+            chunk_segs.append((ci, b, j - i + 1, ke[j] - ks[i], n, req))
             i = j + 1
+        c_rows = sum(s[2] for s in chunk_segs)
+        c_pitch = max(-(-s[4] // pidx.TILE) * pidx.TILE for s in chunk_segs)
+        rows = sum(s[2] for s in segs)
+        if segs and group_bytes(rows + c_rows, max(pitch, c_pitch)) > SCRATCH_BUDGET:
+            # the chunk would push the group past the scratch budget
+            groups.append(_Group(segs, r0, r0 + rows, device))
+            segs, r0, pitch = [], r0 + rows, 0
+        segs += chunk_segs
+        pitch = max(pitch, c_pitch)
         rows = sum(s[2] for s in segs)
         if rows >= GROUP_ROWS or ci == len(chunks) - 1:
             groups.append(_Group(segs, r0, r0 + rows, device))
-            segs, r0 = [], r0 + rows
+            segs, r0, pitch = [], r0 + rows, 0
     chunks[0].logits_inputs[_KEY] = groups
     return groups
 

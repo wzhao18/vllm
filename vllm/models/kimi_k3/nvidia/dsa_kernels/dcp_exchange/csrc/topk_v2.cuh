@@ -47,15 +47,21 @@ constexpr int kV2RadR = 5;      // radix rounds (40-bit composite, 8 bits each)
 constexpr int kV2Cand = 3072;   // candidate list
 constexpr int kV2Fine = 2048;   // fine histogram keys above theta
 constexpr int kV2Chunk = 65536; // WRITE positions per bitmap chunk (2048 words)
-constexpr int kV2T = 512;  // threads per CTA (one CTA per row, 2 CTAs per SM; 256 measured slower)
-constexpr int kV2Warps = kV2T / 32;
+// threads per CTA, by shape: 1024 (one CTA per SM) when every row has an SM of its own,
+// else 512 (two CTAs per SM; 256 measured slower). kV2T: the two-per-SM variant.
+constexpr int kV2T = 512;
 constexpr int kV2RegG = 4;      // 8-key groups per thread per candidate batch (16384 keys)
 constexpr int kV2Dbg = 64;      // dbg stamps per row
 constexpr int kV2SampleStride = 8;  // sample: one 8-key group in 8
-constexpr int kV2NR = 9;        // SMEM row: rows of <= kV2NR x kV2T groups (36,864 keys), odd pitch
-constexpr int kV2PB = kCoarseBins / kV2T;  // coarse bins per thread in scans
-constexpr int kV2FB = kV2Fine / kV2T;      // fine bins per thread in scans
-static_assert(kV2T >= kV2Win && kV2PB * kV2T == kCoarseBins && kV2FB * kV2T == kV2Fine && kV2FB % 4 == 0);
+template <int T>
+struct V2Cfg {
+  static constexpr int kWarps = T / 32;
+  static constexpr int kNR = T >= 1024 ? 5 : 9;  // SMEM row: <= kNR x T groups, odd 16-byte pitch
+  static constexpr int kPB = kCoarseBins / T;    // coarse bins per thread in scans
+  static constexpr int kFB = kV2Fine / T;        // fine bins per thread in scans
+  static_assert(T >= kV2Win && kPB * T == kCoarseBins && kFB * T == kV2Fine && kFB % 2 == 0 && kWarps <= 32);
+};
+constexpr int kV2RedoCtas = 32;  // grid of topk_v2_redo_kernel
 constexpr int kV2Cp = 8;        // bulk copies (issuing warps) per row
 constexpr int kV2RxW = ((kV2MaxW * kV2Msg + 31) / 32) * 32;  // rx words in the row buffer
 // stats (rows): 0 exchanged, 1 resolved in round 1, 2 tie round, 3 radix, 4 select all
@@ -81,6 +87,7 @@ struct V2Params {
   int W, rank, K, T, cap, interleave;
   int64_t off_r1, off_tie, off_rad;
   int* epoch;
+  int* redo;  // per row: 0, or the epoch the complete body runs the row at (+1)
   int* err;
   long long spin_ns;
   int* stats;
@@ -107,7 +114,9 @@ __device__ __forceinline__ uint32_t v2_cnt(const uint32_t* slot, int u) {
 // Exclusive prefix over the kV2T-thread block; the total in *total. One barrier: every
 // warp scans the warp totals itself. `ws` (>= kV2Warps words) must not be the buffer of
 // the previous scan (callers alternate two buffers, V2WS), so no barrier protects reuse.
+template <int T>
 __device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* ws, uint32_t* total) {
+  constexpr int kV2Warps = V2Cfg<T>::kWarps;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   uint32_t x = v;
 #pragma unroll
@@ -130,13 +139,14 @@ __device__ __forceinline__ uint32_t v2_scan(uint32_t v, uint32_t* ws, uint32_t* 
 }
 
 // kV2FB consecutive (16-byte aligned) histogram words -> v; returns their sum
-__device__ __forceinline__ uint32_t v2_ldbins(const uint32_t* h, uint32_t (&v)[kV2FB]) {
+template <int FB>
+__device__ __forceinline__ uint32_t v2_ldbins(const uint32_t* h, uint32_t (&v)[FB]) {
   uint32_t s = 0;
 #pragma unroll
-  for (int i = 0; i < kV2FB; i += 4) {
-    const uint4 x = *reinterpret_cast<const uint4*>(h + i);
-    v[i] = x.x; v[i + 1] = x.y; v[i + 2] = x.z; v[i + 3] = x.w;
-    s += x.x + x.y + x.z + x.w;
+  for (int i = 0; i < FB; i += 2) {
+    const uint2 x = *reinterpret_cast<const uint2*>(h + i);
+    v[i] = x.x; v[i + 1] = x.y;
+    s += x.x + x.y;
   }
   return s;
 }
@@ -211,9 +221,9 @@ struct V2Sm {
 // executed code cold from L2; the rare paths inline made the hot path 2x slower there):
 // a rank whose candidates or window fall outside the fast path sends a saturated
 // message, which every rank reads as tier 3; any tier other than 1 returns 1 and the
-// caller runs the row again with the complete body (out of line) at the next epoch, on
+// redo kernel runs the row again with the complete body at the next epoch, on
 // every rank alike (the tier comes from the exchanged words).
-template <bool kFast>
+template <bool kFast, int T>
 // ep_in < 0: the row's epoch is read here (after the copy is issued). Returns 0, or
 // 1 + the epoch used when the complete body must run the row.
 __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const int row, const int ep_in,
@@ -235,6 +245,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
   unsigned long long& s_pref = *sm.pref;
   long long* const s_dbg = sm.dbg;
   const int tid = threadIdx.x;
+  constexpr int kV2T = T, kV2Warps = V2Cfg<T>::kWarps, kV2NR = V2Cfg<T>::kNR;
+  constexpr int kV2PB = V2Cfg<T>::kPB, kV2FB = V2Cfg<T>::kFB;
   const int W = p.W, K = p.K, IL = p.interleave;
   auto log2_or = [](int x) -> int { return (x > 0 && (x & (x - 1)) == 0) ? __ffs(x) - 1 : -1; };
   const int bs_sh = log2_or(p.block_size), il_sh = log2_or(IL), w_sh = log2_or(W);
@@ -335,7 +347,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     // most kV2NR x kV2T groups are read from the SMEM copy (fast path: short loops);
     // longer rows sample from global memory, then compact in batches of kV2RegG x 256 groups.
     for (int b = tid; b < kCoarseBins; b += kV2T) hist[b] = 0;
-    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; }
+    if (tid == 0) { s_valid = 0; s_sat = 0; s_cnt = 0; s_beyond = 0; s_th = 0; s_i[14] = -1; }
     const int head = min(L, head0);
     const int sh = (8 - head) & 7;  // == sh0 when L >= 8
     const int ng = (L + sh + 7) >> 3;
@@ -414,12 +426,23 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #pragma unroll
       for (int i = 0; i < kV2PB; ++i) v += hist[bb * kV2PB + i];
       uint32_t tot;
-      const uint32_t ab = v2_scan(v, V2WS, &tot);
+      const uint32_t ab = v2_scan<T>(v, V2WS, &tot);
       if (ab < want && ab + v >= want) {
         uint32_t run = ab;
         for (int i = kV2PB - 1; i >= 0; --i) {
           run += hist[bb * kV2PB + i];
           if (run >= want) { s_th = (bb * kV2PB + i) * 16; break; }
+        }
+      }
+      // the sample's estimate of the q-th key (its coarse bin): the fine histogram is
+      // centered there, so rows with a wide upper tail (q-th key more than kV2Fine keys
+      // above theta) need no rebase pass
+      const uint32_t want_e = max(1u, q / kV2SampleStride);
+      if (ab < want_e && ab + v >= want_e) {
+        uint32_t run = ab;
+        for (int i = kV2PB - 1; i >= 0; --i) {
+          run += hist[bb * kV2PB + i];
+          if (run >= want_e) { s_i[14] = (bb * kV2PB + i) * 16; break; }
         }
       }
       __syncthreads();
@@ -470,7 +493,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
       V2DBG(24);
       uint32_t ctot;
-      int c = (int)v2_scan(cnt, V2WS, &ctot);
+      int c = (int)v2_scan<T>(cnt, V2WS, &ctot);
       V2DBG(25);
       if (tid == 0) s_cnt = (int)ctot;
       const uint16_t* srow16 = reinterpret_cast<const uint16_t*>(srow);
@@ -605,7 +628,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         const uint32_t hs = v2_ldbins(hist + f0, hv);
         uint32_t tot;
         const uint32_t sb = s_beyond;
-        uint32_t run = v2_scan(hs, V2WS, &tot) + sb;
+        uint32_t run = v2_scan<T>(hs, V2WS, &tot) + sb;
 #pragma unroll
         for (int i = kV2FB - 1; i >= 0; --i) {  // run: keys >= base + f0 + i
           const uint32_t nx = run;
@@ -643,7 +666,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     bool pdone = false;
     int ew = -1;
     uint32_t wtot = 0;
-    int fb = th;  // the fine histogram's base key
+    // the fine histogram's base key: theta, or kV2Fine / 2 below the estimated q-th key
+    int fb = s_i[14] >= 0 ? max(th, s_i[14] - kV2Fine / 2) : th;
     if (fast) {
       // thread t owns fine keys [kV2FB (kV2T - 1 - t), + kV2FB); Sx[b]: candidates with
       // fine key >= b (beyond included); the row buffer is free until the round
@@ -663,7 +687,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         uint32_t hv[kV2FB];
         const uint32_t hs = v2_ldbins(hist + f0, hv);
         uint32_t tot;
-        uint32_t run = v2_scan(hs, V2WS, &tot) + s_beyond;
+        uint32_t run = v2_scan<T>(hs, V2WS, &tot) + s_beyond;
 #pragma unroll
         for (int i = kV2FB - 1; i >= 0; --i) {
           run += hv[i];
@@ -684,7 +708,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         uint32_t gv[kV2FB];
         const uint32_t gs = v2_ldbins(hist + f0, gv);
-        uint32_t crun = v2_scan(gs, V2WS, &tot);
+        uint32_t crun = v2_scan<T>(gs, V2WS, &tot);
 #pragma unroll
         for (int i = kV2FB - 1; i >= 0; --i) {
           crun += gv[i];
@@ -735,7 +759,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #pragma unroll
       for (int i = 0; i < kV2PB; ++i) v += hist[bb * kV2PB + i];
       uint32_t tot;
-      const uint32_t ab = v2_scan(v, V2WS, &tot);
+      const uint32_t ab = v2_scan<T>(v, V2WS, &tot);
       if (tid == 0) s_e = 0;
       __syncthreads();
       if (ab < q && ab + v >= q) {
@@ -781,7 +805,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         const int u = kV2Win - 1 - tid;  // thread t < 256 <-> window key 255 - t
         const uint32_t c = u >= 0 ? win[u] : 0u;
         if (c > kCountMax) atomicOr(&s_sat, 1u);
-        const uint32_t ab = v2_scan(c, V2WS, &tot) + s_above;
+        const uint32_t ab = v2_scan<T>(c, V2WS, &tot) + s_above;
         if (tid == 0) { s_e = -1; s_bl = 1; s_bh = 0; s_n = 0; }
         __syncthreads();
         if (ab < q && ab + c >= q) s_e = u;
@@ -937,10 +961,10 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         uint32_t tot, tota = 0, ex;
         if constexpr (kOne) {
-          ex = v2_scan(a + v, V2WS, &tot);  // a and v live on disjoint threads
+          ex = v2_scan<T>(a + v, V2WS, &tot);  // a and v live on disjoint threads
         } else {
-          v2_scan(a, V2WS, &tota);
-          ex = v2_scan(v, V2WS, &tot) + tota;
+          v2_scan<T>(a, V2WS, &tota);
+          ex = v2_scan<T>(v, V2WS, &tot) + tota;
         }
         if (tb >= 0 && tb < kV2Win && ex < (uint32_t)K && ex + v >= (uint32_t)K) {
           s_tau = mn - 1 - tb;
@@ -1142,7 +1166,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if (tid < 256)
           for (int r = 0; r < W; ++r) hb += rx[r * 256 + (255 - tid)] & 0xFFFFFFu;
         uint32_t tot;
-        const uint32_t ex = v2_scan(hb, V2WS, &tot);
+        const uint32_t ex = v2_scan<T>(hb, V2WS, &tot);
         const uint32_t want = (uint32_t)s_cnt;
         if (tid == 0) s_n = 0;
         __syncthreads();
@@ -1185,7 +1209,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
           ct += k == tau;
         }
         uint32_t tot;
-        const uint32_t pre = v2_scan(ca | (ct << 16), V2WS, &tot);
+        const uint32_t pre = v2_scan<T>(ca | (ct << 16), V2WS, &tot);
         const int gtt = (int)(tot & 0xFFFFu), nties = (int)(tot >> 16);
         int a = (int)(pre & 0xFFFFu), t = (int)(pre >> 16);
         for (int c = c0; c < c1; ++c) {
@@ -1278,7 +1302,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         uint32_t cg = 0, ce = 0;
         for (int w = w0; w < w1; ++w) { cg += __popc(bmg[w]); ce += __popc(bme[w]); }
         uint32_t tot;
-        const uint32_t pre = v2_scan(cg | (ce << 16), V2WS, &tot);
+        const uint32_t pre = v2_scan<T>(cg | (ce << 16), V2WS, &tot);
         int gp = run_g + (int)(pre & 0xFFFFu), epi = run_e + (int)(pre >> 16);
         for (int w = w0; w < w1; ++w) {
           uint32_t m = bmg[w];
@@ -1321,34 +1345,36 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
 #undef V2STAT
 }
 
-__device__ __noinline__ int v2_row_full(const V2Params& p, const V2Sm& sm, int row, int ep, uint32_t& bar_phase) {
-  return v2_row<false>(p, sm, row, ep, bar_phase);
+
+// SMEM of one row (both kernels), the mbarrier, then the PDL wait
+#define V2_KERNEL_PROLOGUE(T)                                                                   __shared__ __align__(16) uint32_t hist[kCoarseBins];                                       __shared__ __align__(16) uint32_t cpos[kV2Cand];                                           __shared__ __align__(16) uint16_t ckey[kV2Cand];                                           __shared__ __align__(128) uint4 srow[V2Cfg<T>::kNR * (T)];                                        __shared__ __align__(8) uint64_t s_bar;                                                    __shared__ uint32_t warp_sums[64];                                                         __shared__ int s_i[16];                                                                    __shared__ uint32_t s_u[16];                                                               __shared__ unsigned long long s_pref;                                                      __shared__ long long s_dbg[32];                                                            const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};        if (threadIdx.x == 0) {                                                                      mbar_init(&s_bar, kV2Cp);                                                                  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");                     }                                                                                          __syncthreads();                                                                           uint32_t bar_phase = 0;                                                                    asm volatile("griddepcontrol.wait;" ::: "memory");
+
+// The common case: one compact row body (PDL: the prologue overlaps the logits kernel's
+// tail; every global read follows the wait). Rows that need the complete body are left
+// to topk_v2_redo_kernel, launched right after: a call into the complete body from here
+// (out of line) cost ~2 us per call (stack frame, CTA start), the complete body inline
+// ~8 us in-step (instruction fetch).
+template <int T>
+__global__ void __launch_bounds__(T, T >= 1024 ? 1 : 2) topk_v2_kernel(V2Params p) {
+  V2_KERNEL_PROLOGUE(T)
+  for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
+    const int r = v2_row<true, T>(p, sm, row, -1, bar_phase);
+    if (threadIdx.x == 0) p.redo[row] = r;
+  }
 }
 
-__global__ void __launch_bounds__(kV2T, 2) topk_v2_kernel(V2Params p) {
-  __shared__ __align__(16) uint32_t hist[kCoarseBins];  // histograms; later bitmaps / scratch
-  __shared__ __align__(16) uint32_t cpos[kV2Cand];
-  __shared__ __align__(16) uint16_t ckey[kV2Cand];
-  // the row's keys (fast path); after the candidate pass the exchange buffers live there
-  __shared__ __align__(128) uint4 srow[kV2NR * kV2T];
-  __shared__ __align__(8) uint64_t s_bar;
-  __shared__ uint32_t warp_sums[64];  // two scan buffers (V2WS alternates)
-  __shared__ int s_i[16];
-  __shared__ uint32_t s_u[16];
-  __shared__ unsigned long long s_pref;
-  __shared__ long long s_dbg[32];
-  const V2Sm sm{hist, cpos, ckey, srow, &s_bar, warp_sums, s_i, s_u, &s_pref, s_dbg};
-  if (threadIdx.x == 0) {
-    mbar_init(&s_bar, kV2Cp);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
-  __syncthreads();
-  uint32_t bar_phase = 0;
-  // PDL: the prologue above overlaps the logits kernel's tail; every global read follows
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+// The rows topk_v2_kernel left (the same rows on every rank: the tier comes from the
+// exchanged words), with the complete body at the next epoch; CTAs without one exit.
+// A small grid (kV2RedoCtas): row r goes to CTA r % grid on every rank, so a CTA's rows
+// run in the same order everywhere; the flags of a CTA's rows are read at once.
+__global__ void __launch_bounds__(kV2T, 2) topk_v2_redo_kernel(V2Params p) {
+  V2_KERNEL_PROLOGUE(kV2T)
+  int any = 0;
+  for (int row = blockIdx.x + threadIdx.x * gridDim.x; row < p.T; row += kV2T * gridDim.x) any |= p.redo[row];
+  if (!__syncthreads_or(any)) return;
   for (int row = blockIdx.x; row < p.T; row += gridDim.x) {
-    const int r = v2_row<true>(p, sm, row, -1, bar_phase);
-    if (r) v2_row_full(p, sm, row, r == 510 ? 0 : r, bar_phase);  // epoch r - 1 + 1
+    const int r = p.redo[row];
+    if (r) v2_row<false, kV2T>(p, sm, row, r == 510 ? 0 : r, bar_phase);
   }
 }
 

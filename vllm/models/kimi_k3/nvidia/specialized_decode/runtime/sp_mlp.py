@@ -172,10 +172,23 @@ class SpMlp:
             raise Unsupported("moe", None, f"layer {index}: {error}") from error
         self.gemms = {}
         side = bool(mlp._shared_overlap)  # the shared expert beside MegaMoE
+        # Rubin MegaMoE + MXFP8 shared expert: the wide-EP decode bucket runs the
+        # shared expert inside the GenPhase kernel (same MXFP8 operands: the shared
+        # gate_up input scratch, the stock weights' bytes). Per-shape: rows above the
+        # bucket keep the side-stream chain.
+        fused_cap = None
+        if self.mxfp8 and _rubin_megamoe(mlp.experts):
+            from ...megamoe_rubin.experts import RUBIN_WIDE_EP_DECODE_TOKENS
+
+            down = shared.down_proj
+            if mlp.experts.enable_fused_shared(
+                down.output_size_per_partition, down.input_size_per_partition
+            ):
+                fused_cap = max(self.rows[-1], RUBIN_WIDE_EP_DECODE_TOKENS)
         with torch.accelerator.device_index(weights["latent_down"].device.index):
             if self.mxfp8:  # NVFP4 checkpoint: MXFP8 W8A8 shared expert (gemm.mxfp8)
                 self.gemms["shared_gu"] = Mxfp8Projection(
-                    shared.gate_up_proj, self.rows, family="shared_gu"
+                    shared.gate_up_proj, self.rows, family="shared_gu", cap=fused_cap
                 )
                 self.gemms["shared_down"] = Mxfp8Projection(
                     shared.down_proj, self.rows, family="shared_down"
@@ -195,6 +208,20 @@ class SpMlp:
             self.inter2 = weights["shared_gu"].shape[0]
             self.hidden = weights["shared_down"].shape[0]
         self.threshold = _stock_threshold()
+        self.fused_shared = None
+        if fused_cap is not None:
+            from ...megamoe_rubin.session import FusedSharedArgs
+            from ...megamoe_rubin.weights import prepare_mxfp8_shared_weights
+
+            gu, dn = self.gemms["shared_gu"], self.gemms["shared_down"]
+            fc1, fc2 = prepare_mxfp8_shared_weights(
+                gu.weight, gu.scale, dn.weight, dn.scale,
+                hidden=self.hidden, intermediate=self.inter2 // 2,
+            )  # fmt: skip
+            buf = gu.input.buf
+            self.fused_shared = mlp.experts.warmup_fused_shared(
+                FusedSharedArgs(buf.data, buf.scale, fc1, fc2)
+            )
         # Rubin MegaMoE: the latent RMSNorm folds into the kernel's top-k reduce (one
         # kernel and one [n, latent] round trip fewer per layer); compiled here, before
         # capture. Other MegaMoE backends keep the separate stock norm.
@@ -272,8 +299,8 @@ class SpMlp:
             # competes with the MegaMoE front.
             staged = route.stage(y)
 
-            def experts():
-                return route.launch(staged, fused_norm)
+            def experts(shared=None):
+                return route.launch(staged, fused_norm, shared)
 
         else:
             (router_output, topk_ids), routed = maybe_execute_in_parallel(
@@ -284,14 +311,19 @@ class SpMlp:
                 mlp._down_proj_stream if n <= self.threshold else None,
             )
 
-            def experts():
-                if fused_norm is None:
-                    return mlp.experts(routed, router_output, topk_ids)
-                return mlp.experts(
-                    routed, router_output, topk_ids, output_rmsnorm=fused_norm
-                )
+            def experts(shared=None):
+                kwargs = {}
+                if fused_norm is not None:  # backends without the fused norm take no kwarg
+                    kwargs["output_rmsnorm"] = fused_norm
+                if shared is not None:
+                    kwargs["fused_shared"] = shared
+                return mlp.experts(routed, router_output, topk_ids, **kwargs)
 
-        if mlp._shared_overlap:
+        if self.fused_shared is not None and mlp.experts.fused_shared(n):
+            if not prequantized:
+                gemms["shared_gu"].input.quantize(h)
+            final, shared_out = experts(self.fused_shared)
+        elif mlp._shared_overlap:
             final, shared_out = maybe_execute_in_parallel(
                 experts,
                 lambda: self._shared(h, prequantized),

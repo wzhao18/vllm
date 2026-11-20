@@ -126,10 +126,12 @@ def main():
     p.add_argument("--stages", type=int, default=3)
     p.add_argument("--clusters", type=int, default=0)
     p.add_argument("--stamps", action="store_true")
-    p.add_argument("--loaders", type=int, default=14)
+    p.add_argument("--loaders", type=int, default=17)
     p.add_argument("--no-mc", action="store_true")
     p.add_argument("--cpa", type=int, default=0, help="km: TMA latent blocks, rest by cp.async (0: all TMA)")
     p.add_argument("--no-epi-store", action="store_true", help="km: drop epilogue stores")
+    p.add_argument("--no-gather", action="store_true",
+                   help="km: stages complete unloaded (attention chain only)")
     p.add_argument("--gather-only", action="store_true",
                    help="km: release KV tiles on landing (gather rate; output invalid)")
     p.add_argument("--prefetch", type=int, default=3, help="km: L2 prefetch distance (tiles)")
@@ -156,7 +158,7 @@ def main():
         return sparse_mla_decode_km(query, kv, slots, valid, lat, lse, bmm1, bmm2,
                                     grid=a.clusters or None, stages=a.stages,
                                     loaders=a.loaders, stamps=stamps, cpa=a.cpa,
-                                    prefetch=a.prefetch, gather_only=a.gather_only,
+                                    prefetch=a.prefetch, gather_only=a.gather_only, no_gather=a.no_gather,
                                     epi_store=not a.no_epi_store)
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import _kv_counters
 

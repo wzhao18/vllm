@@ -3223,19 +3223,29 @@ std::vector<int64_t> topk_v2_layout(int64_t cap, int64_t W) {
 static constexpr size_t kV2Dyn = 0;
 
 // Co-resident topk_v2 CTAs (a launch walks rows beyond it in turns, NVLink rounds included).
-int64_t topk_v2_resident() {
-  static int v = 0;
+// resident CTAs of the 512-thread top-k variant (two per SM); *wide: of the 1024-thread
+// variant (one per SM), used when every row fits in it
+int64_t topk_v2_resident_of(int* wide) {
+  static int v = 0, w = 0;
   if (!v) {
-    int dev, sms, occ = 0;
+    int dev, sms, occ = 0, occw = 0, occ2 = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    // two ~108 KB CTAs per SM (one row each): the largest SMEM carveout
-    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel, kV2T, kV2Dyn));
+    // ~110 KB CTAs (one row each): the largest SMEM carveout
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<kV2T>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_kernel<1024>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(topk_v2_redo_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ2, topk_v2_redo_kernel, kV2T, kV2Dyn));
+    TORCH_CHECK(occ2 >= 1, "topk_v2: the complete row body does not fit");
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, topk_v2_kernel<kV2T>, kV2T, kV2Dyn));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occw, topk_v2_kernel<1024>, 1024, kV2Dyn));
     v = sms * occ;
+    w = sms * occw;
   }
+  if (wide) *wide = w;
   return v;
 }
+int64_t topk_v2_resident() { return topk_v2_resident_of(nullptr); }
 
 void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
              torch::Tensor out, torch::Tensor out_count, c10::optional<torch::Tensor> block_table,
@@ -3250,7 +3260,7 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   TORCH_CHECK(interleave >= 1);
   const int T = (int)logits.size(0);
   if (T == 0) return;
-  TORCH_CHECK(T <= cap && epoch.numel() >= T, "topk_v2: rows > cap");
+  TORCH_CHECK(T <= cap && epoch.numel() >= 2 * cap, "topk_v2: rows > cap or epoch < 2 cap");
   const c10::cuda::CUDAGuard guard(logits.device());
   V2Params p{};
   p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
@@ -3275,16 +3285,21 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   const auto lay = topk_v2_layout(cap, W);
   p.off_r1 = lay[0]; p.off_tie = lay[1]; p.off_rad = lay[2];
   p.epoch = epoch.data_ptr<int>();
+  p.redo = p.epoch + cap;  // the epoch buffer's second half
   p.err = err.data_ptr<int>();
   p.spin_ns = g_spin_ns;
   p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
   TORCH_CHECK(!dbg.has_value() || dbg->numel() >= (int64_t)kV2Dbg * T, "topk_v2: dbg too small");
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
-  const int nres = (int)topk_v2_resident();
+  int nwide = 0;
+  const int nres = (int)topk_v2_resident_of(&nwide);
   TORCH_CHECK(nres >= 1, "topk_v2: no resident CTA");
+  // per shape: 1024 threads per row when every row gets an SM of its own (r1/r8:
+  // the row's front end over twice the threads), else 512 (two rows per SM)
+  const bool wide = T <= nwide;
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3((unsigned)std::min(T, nres), 1, 1);
-  cfg.blockDim = dim3(kV2T, 1, 1);
+  cfg.gridDim = dim3((unsigned)std::min(T, wide ? nwide : nres), 1, 1);
+  cfg.blockDim = dim3(wide ? 1024 : kV2T, 1, 1);
   cfg.dynamicSmemBytes = kV2Dyn;
   cfg.stream = c10::cuda::getCurrentCUDAStream();
   // PDL: the prologue (barrier init) overlaps the logits kernel; the kernel never
@@ -3294,7 +3309,12 @@ void topk_v2(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel, p));
+  if (wide) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<1024>, p));
+  else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_kernel<kV2T>, p));
+  // the rows that need the complete body (rare; most CTAs exit after the PDL wait)
+  cfg.gridDim = dim3((unsigned)std::min(T, kV2RedoCtas), 1, 1);
+  cfg.blockDim = dim3(kV2T, 1, 1);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, topk_v2_redo_kernel, p));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

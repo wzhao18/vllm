@@ -62,7 +62,9 @@ state; only the FP32 reduction order of the recurrence's dot products differs.
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
+
+from ..common import mx_rows
 
 from ..common.primitives import (
     alloc,
@@ -72,7 +74,9 @@ from ..common.primitives import (
     fma,
     fma2,
     launch,
+    load_bf16x8,
     mma_into,
+    store_words,
     try_wait,
     wait,
     warp_sum,
@@ -250,12 +254,17 @@ class KdaFlow(KdaWS):
         window,
         ctas,
         stages=1,
+        mx=False,
     ):
         assert 2 <= tokens <= 4 and stages == 1 and conv_dim_first
         super().__init__(
             heads, tokens, True, gate_mode, has_bias, conv_dim_first, window, ctas
         )
         self.stages = stages
+        # MXFP8 output (``quantize_outputs``): two more operands after the others,
+        # the E4M3 bytes [R, D] and the F8_128x4 scales of the online-MXFP8
+        # o_proj's input.
+        self.mx = mx
         self.trace, self.hang, self.packed = TRACE, HANG, PACKED
         self.fold_fence = FOLD_FENCE
         self.skip = tuple(SKIP)
@@ -263,6 +272,52 @@ class KdaFlow(KdaWS):
     @cute.jit
     def __call__(self, *args):
         launch(self.kernel, args, self.ctas, THREADS, min_blocks_per_mp=1)
+
+    def folds(self, args):
+        """Whether the deferred operands (record rows, pending counts) follow."""
+        return len(args) - (2 if self.mx else 0) > 20
+
+    @cute.jit
+    def quantize_outputs(self, args, tid, count, table):
+        """``mx``: after both groups stored their items' BF16 outputs (the caller's
+        CTA barrier makes them visible), the CTA quantizes its items' output rows
+        into the MXFP8 o_proj input, ``ops.mxfp8_act.quantize`` bit for bit (4
+        lanes per 32-wide block, 8 columns each: its quant8_store). Off the item
+        chains: the scan loop is unchanged."""
+        output, data, scale = args[10], args[len(args) - 2], args[len(args) - 1]
+        T: cutlass.Constexpr = self.tokens
+        width: cutlass.Constexpr = self.heads * K
+        units: cutlass.Constexpr = T * (K // 8)  # 8-column lane units per item
+        rounds: cutlass.Constexpr = -(-MAX_ITEMS * units // THREADS)
+        lanes = count * units
+        # Every round's loads first (one L2 round trip), then the quantization.
+        held = cute.make_rmem_tensor((rounds, 8), Float32)
+        rows = cute.make_rmem_tensor(rounds, Int32)
+        cols = cute.make_rmem_tensor(rounds, Int32)
+        for it in cutlass.range_constexpr(rounds):
+            unit = it * THREADS + tid
+            j = unit // units
+            if unit >= lanes:
+                j = Int32(0)
+            within = unit % units
+            rows[it] = table[j, REQUEST] * T + within // (K // 8)
+            cols[it] = table[j, HEAD] * K + (within % (K // 8)) * 8
+            for i in cutlass.range_constexpr(8):
+                held[it, i] = Float32(0)
+            if unit < lanes:
+                loaded = load_bf16x8(at(output, rows[it], cols[it]), mutable=True)
+                for i in cutlass.range_constexpr(8):
+                    held[it, i] = loaded[i]
+        for it in cutlass.range_constexpr(rounds):
+            values = [held[it, i] for i in range(8)]
+            w0, w1, e = mx_rows.quantize8_plain(values)
+            if it * THREADS + tid < lanes:
+                row, col = rows[it], cols[it]
+                store_words(at(data, row, col), (w0, w1))
+                if tid % 4 == 0:
+                    where = mx_rows.scale_offset(row, col // mx_rows.BLOCK,
+                                                 width // mx_rows.BLOCK)  # fmt: skip
+                    scale[where] = Uint8(e)
 
     # ---------------------------------------------------------------- helpers
     @cute.jit
@@ -311,7 +366,7 @@ class KdaFlow(KdaWS):
         head, request, slot, conv_slot, offset = self.item_slots(args, item)
         pending = Int32(0)
         rec = Int32(request)
-        if cutlass.const_expr(len(args) > 20):
+        if cutlass.const_expr(self.folds(args)):
             rec = Int32(args[20][request])
             pending = Int32(0)
             if rec >= 0:
@@ -601,6 +656,9 @@ class KdaFlow(KdaWS):
             self.group_items(args, g, c, count, h0, pages, table, betas, raw, hcs,
                              buffers, ops, outs, sums_g, state_full,
                              stage_full + g, k0)  # fmt: skip
+        if cutlass.const_expr(self.mx):
+            cute.arch.barrier()  # both groups' outputs stored
+            self.quantize_outputs(args, tid, count, table)
 
     @cute.jit
     def gate_projection(self, tid, count, h0, table, fbs, fas, raw):
@@ -998,7 +1056,7 @@ class KdaFlow(KdaWS):
         (sums,) = sums_g
         T: cutlass.Constexpr = self.tokens
         NV: cutlass.Constexpr = 2 * T
-        FOLD: cutlass.Constexpr = len(args) > 20
+        FOLD: cutlass.Constexpr = self.folds(args)
         blk = g
         conv_type: cutlass.Constexpr = convs.element_type
         consts = hc[None, c]
