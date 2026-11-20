@@ -186,7 +186,7 @@ def make_core(kind, specs, heads, tokens, record, has_bias, device):
             raise Unsupported("kda", shape, "KdaFlow: a CTA would span three heads")
         if kind == "ring":
             if len(specs) < 23:  # the deferred operands and the operand blocks
-                raise Unsupported("kda", shape, "KdaRing runs deferred records only")
+                raise Unsupported("kda", shape, f"KdaRing runs deferred records only ({len(specs)} operands)")
             if ring.shared_bytes(tokens) > budget:
                 raise Unsupported("kda", shape, "KdaRing's shared memory does not fit")
             return ring.KdaRing(heads, tokens, mode, has_bias, *streamed, ctas, items,
