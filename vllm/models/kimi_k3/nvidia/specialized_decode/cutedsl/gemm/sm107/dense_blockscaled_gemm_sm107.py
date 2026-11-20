@@ -237,6 +237,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # producers: TMA warps tma_warp_id .. tma_warp_id + producers - 1, warp i issues
         # the whole stages (A, B, SFA, SFB) of k-blocks with (k % producers) == i
         self.num_producers = producers
+        # opsplit (producers == 2): warp 0 acquires every stage and issues only the
+        # weight operand + its SFs, warp 1 waits for the same stage's EMPTY barrier
+        # (no arrive) and issues only the activation operand + its SFs on the same
+        # FULL barrier (tx bytes of both operands are expected by warp 0's arrive)
+        self.opsplit = False
         # die_claim (1x1 clusters, one tile per CTA): each CTA claims a tile of its own
         # die's weight half (smid -> die table + per-die counters in the aux buffer
         # that also carries alpha; the last CTA resets the counters)
@@ -1663,7 +1668,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     # host guarantees prewait_stages <= min(num_ab_stage, k tiles)
                     n_pre = cutlass.const_expr(min(self.prewait_stages, self.num_ab_stage))
                     for pk in cutlass.range_constexpr(n_pre):
-                        if (pk % self.num_producers) == kil:
+                        pk_owner = 0 if self.opsplit else pk % self.num_producers
+                        if pk_owner == kil:
                             ab_pipeline.producer_acquire(pre_state)
                             if cutlass.const_expr(self.weight_is_a):
                                 cute.copy(
@@ -1751,7 +1757,79 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Tma load loop
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    if (ab_producer_state.count % self.num_producers) == kil:
+                    if cutlass.const_expr(self.opsplit):
+                        if kil == 0:
+                            # weight issuer: acquire (EMPTY wait + FULL arrive with the
+                            # bytes of both operands) and issue the weight operand + SFs
+                            if k_tile >= pre_left:
+                                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                                if cutlass.const_expr(self.weight_is_a):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tAgA_slice[(None, ab_producer_state.count)],
+                                        tAsA[(None, ab_producer_state.index)],
+                                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                        mcast_mask=a_full_mcast_mask,
+                                    )
+                                    cute.copy(
+                                        tma_atom_sfa,
+                                        tAgSFA_slice[(None, ab_producer_state.count)],
+                                        tAsSFA[(None, ab_producer_state.index)],
+                                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                        mcast_mask=sfa_full_mcast_mask,
+                                    )
+                                else:
+                                    cute.copy(
+                                        tma_atom_b,
+                                        tBgB_slice[(None, ab_producer_state.count)],
+                                        tBsB[(None, ab_producer_state.index)],
+                                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                        mcast_mask=b_full_mcast_mask,
+                                    )
+                                    cute.copy(
+                                        tma_atom_sfb,
+                                        tBgSFB_slice[(None, ab_producer_state.count)],
+                                        tBsSFB[(None, ab_producer_state.index)],
+                                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                        mcast_mask=sfb_full_mcast_mask,
+                                    )
+                        else:
+                            # activation issuer: wait for the slot to be released (no
+                            # arrive: warp 0's arrive carries both operands' tx bytes)
+                            ab_pipeline.sync_object_empty.wait(
+                                ab_producer_state.index, ab_producer_state.phase
+                            )
+                            if cutlass.const_expr(self.weight_is_a):
+                                cute.copy(
+                                    tma_atom_b,
+                                    tBgB_slice[(None, ab_producer_state.count)],
+                                    tBsB[(None, ab_producer_state.index)],
+                                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atom_sfb,
+                                    tBgSFB_slice[(None, ab_producer_state.count)],
+                                    tBsSFB[(None, ab_producer_state.index)],
+                                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_slice[(None, ab_producer_state.count)],
+                                    tAsA[(None, ab_producer_state.index)],
+                                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                    mcast_mask=a_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atom_sfa,
+                                    tAgSFA_slice[(None, ab_producer_state.count)],
+                                    tAsSFA[(None, ab_producer_state.index)],
+                                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                    mcast_mask=sfa_full_mcast_mask,
+                                )
+                    elif (ab_producer_state.count % self.num_producers) == kil:
                         # Stages [0, pre_left) of the first tile were acquired and
                         # their weight operand issued before griddepcontrol.wait.
                         if k_tile >= pre_left:

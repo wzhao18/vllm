@@ -59,6 +59,10 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
         push=push,
     )
     gemm.dbg_skip_mma = bool(dbg & 1)
+    # experiment: operand-split producers (dbg bit 1, needs producers == 2)
+    gemm.opsplit = bool(dbg & 2)
+    if gemm.opsplit and producers != 2:
+        raise ValueError("opsplit needs producers=2")
     gemm.max_ab_stages = max_stages
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
