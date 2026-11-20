@@ -1017,6 +1017,7 @@ FULL_CONFIGS = {32: (6, 1, 12, 2, 1, 0, 2, 15, 0), 64: (6, 1, 11, 2, 1, 0, 2, 14
 # cta_group::2 pair form (CR 3): 8-CTA clusters (2 pair members x 4 K-splits), NS ring stages of 16 KiB weights + half
 # the tokens' activations.
 PAIR_CONFIGS = {32: (4, 1, 11, 2, 1, 1440, 3, 0, 0), 64: (4, 1, 9, 2, 1, 1440, 3, 0, 0), 96: (4, 1, 8, 2, 1, 1440, 3, 0, 0)}
+CONFIGS[64], CONFIGS[96] = PAIR_CONFIGS[64], PAIR_CONFIGS[96]  # EXPERIMENT: pair form in-step
 
 
 def _module():
