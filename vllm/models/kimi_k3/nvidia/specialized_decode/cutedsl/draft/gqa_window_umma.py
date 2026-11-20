@@ -565,10 +565,14 @@ class GqaWindowUmma:
                     if nxt < count:  # stage t - 1's PV (issued last iteration) done
                         wait(pvdone + 8 * ((t - 1) % NS), ((t - 1) // NS) & 1,
                              scope="cta")  # fmt: skip
-                        if lane == 0:
+                        # slot r_i's loads always come from lane r_i: one TMA
+                        # issuing thread completes one op at a time (~0.45 us per
+                        # 16 KiB box, hwdb hw51), so a single refill lane caps the
+                        # CTA at ~35 GB/s; R lanes are R independent streams
+                        r_i = (t - 1) % R
+                        if lane == r_i:
                             j = first + nxt
                             blk = blocks[j * KB // N - page_lo]
-                            r_i = (t - 1) % R
                             self.issue(kv_map, full + 8 * r_i, ring_base + r_i * SLOT,
                                        head, blk, j * KB % N)  # fmt: skip
             first_lane = lane == 0
