@@ -712,8 +712,12 @@ class PreparedDsa:
         and this rank's KV insert. Returns what makes the sparse core wait for it."""
         stage, batch = self.query_stage, projected.shape[0]
         stage.run_norm(self.overlap_kernels[batch, q][2], projected)
-        self.local.run(stage.qc[:batch], projected, cache, slots)  # DEBUG: serial
-        return None
+        main = torch.cuda.current_stream(self.device)
+        side = side_stream(self.device.index)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            self.local.run(stage.qc[:batch], projected, cache, slots)
+        return lambda: torch.cuda.current_stream(self.device).wait_stream(side)
 
     def run_query(self, projected, cache, slots, q, publish=(), poll=True):
         """MlaQuery and the q_c rows per the overlap mode. Returns what makes the
