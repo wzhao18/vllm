@@ -90,12 +90,13 @@ def make_logits(case: str, T: int, G: torch.Tensor, gen: torch.Generator, device
         u = torch.rand(T, Gmax, generator=gen, device=device)
         hi = torch.exp2(u * 60 - 30) if case == "skew_a" else torch.exp2(u * 40 - 5)
         x = torch.where(owner[None, :], hi, torch.exp2(u * 10 - 70))
-    elif case == "hot_rank":
-        # rank-skewed rows (topk_v2 CG rounds): DCP rank 0 holds 400 keys two-plus octaves
-        # above the rest; the round-1 windows are disjoint, tau lies among the other keys
+    elif case in ("hot_rank", "hot_rank2"):
+        # rank-skewed rows (topk_v2 CG rounds): DCP rank 0 holds 600 (1500) keys two-plus
+        # octaves above the rest; the round-1 windows are disjoint; tau lies among the other
+        # keys above (hot_rank2: below) rank 0's theta
         pos = torch.arange(Gmax, device=device)
         owner = ((pos // INTERLEAVE_CUR[0]) % WORLD[0]) == 0
-        hot = owner & (torch.cumsum(owner.int(), 0) <= 400)
+        hot = owner & (torch.cumsum(owner.int(), 0) <= (600 if case == "hot_rank" else 1500))
         x = torch.relu(x + 0.3) * 2.0 + hot[None, :] * 40.0
     elif case == "sample_high":
         # topk_v2's 1/8 sample (local 8-key group g with g % 8 == (g // 8) % 8) holds ~80
@@ -642,6 +643,7 @@ def main():
         ("short", 192, 8, 4000),        # T = 1536, select-all rows
         ("flat_rank0", 2, 4, 60_000),   # one rank holds > kTieStore ties to select
         ("hot_rank", 4, 4, 120_000),    # rank-skewed rows: topk_v2 CG round (one)
+        ("hot_rank2", 4, 4, 120_000),   # rank-skewed, tau below the hot rank's theta: R2
         ("skew_a", 4, 4, 60_000),       # tau octaves wide: CG rounds (two)
         ("skew_b", 2, 4, 90_000),
         # K < context < W * 896 at IL 896: ranks without keys, tau low in the context
