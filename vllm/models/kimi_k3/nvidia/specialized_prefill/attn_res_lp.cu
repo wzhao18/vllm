@@ -145,6 +145,10 @@ __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, uint32_t by
       : "memory");
 }
 
+__device__ __forceinline__ void prefetch_l2(const void* src, uint32_t bytes) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(src), "r"(bytes) : "memory");
+}
+
 __device__ __forceinline__ uint32_t pack2(float a, float b) {
   __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
   return *reinterpret_cast<uint32_t*>(&v);
@@ -432,6 +436,15 @@ __global__ void __launch_bounds__(CTA_THREADS, 1) attn_res_lp_kernel(const Args 
       if (tid == 0) {
         if (a.sm_die == nullptr || ((tt >> SB) & 1) == die) ++p_own; else ++p_oth;
       }
+    }
+
+    // The group's last token (the call's end): its block rows go to L2 at
+    // once, so the ring's copies stop paying HBM latency while the other
+    // groups drain (the end spread is about one token period).
+    if (lane == 0 && sm.tq[g][(it + 1) & (QN - 1)] < 0) {
+#pragma unroll 1
+      for (int i = 0; i < n; ++i)
+        prefetch_l2(a.blocks + t * a.bsm + (int64_t)i * a.bsr + seg0, SEG_BYTES);
     }
 
     K31LP_STAMP(0);
