@@ -68,6 +68,7 @@ def _get_compiled(
     gate_roll: bool = False,
     cluster_size: int = 1,
     partial_tma: bool = True,
+    onorm: int = 0,
 ):
     key = (
         dev.index,
@@ -95,6 +96,7 @@ def _get_compiled(
         cluster_size,
         gate_roll,
         partial_tma,
+        onorm,
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -178,6 +180,14 @@ def _get_compiled(
                 cutlass.Int32(1),
                 cutlass.Float32(1.0),
                 cutlass.Float32(-1.0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int32(0),
+                cutlass.Float32(0.0),
                 H_=H,
                 stream=stream,
                 TPROBE_=_TPROBE,
@@ -202,6 +212,7 @@ def _get_compiled(
                 PREP_PEEL_=1 if prep_peel else 0,
                 PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
+                ONORM_=int(onorm),
                 options="--enable-tvm-ffi --opt-level 3",
             )
 
@@ -254,6 +265,35 @@ def _tprobe_buf(G: int, dev: torch.device):
 
 
 @torch.no_grad()
+def _onorm_args(o_norm, T: int, H: int):
+    """Runtime arguments of the fused gated o_norm + MXFP8 epilogue:
+    ``o_norm = (gate rows [T, >= H 128] bf16, weight [128] fp32, eps,
+    e4m3 data [T, H 128], uint8 swizzled scales)``."""
+    if o_norm is None:
+        return (0, 0, 0, 0, 0, 0, 0, 0.0)
+    gate, weight, eps, qd, qs = o_norm
+    P = H * D
+    assert gate.dtype == torch.bfloat16 and gate.dim() == 2 and gate.stride(1) == 1
+    assert gate.size(0) >= T and gate.size(1) >= P and gate.stride(0) % 8 == 0
+    assert gate.data_ptr() % 16 == 0
+    assert weight.dtype == torch.float32 and weight.numel() == D
+    assert weight.is_contiguous()
+    assert qd.dim() == 2 and qd.size(0) >= T and qd.size(1) == P
+    assert qd.stride(1) == 1 and qd.stride(0) % 16 == 0 and qd.data_ptr() % 16 == 0
+    assert qd.element_size() == 1 and qs.dtype == torch.uint8 and qs.is_contiguous()
+    assert qs.numel() >= ((T + 127) // 128) * 128 * (P // 32)
+    return (
+        gate.data_ptr(),
+        gate.stride(0) * 2,
+        weight.data_ptr(),
+        qd.data_ptr(),
+        qd.stride(0),
+        qs.data_ptr(),
+        P // 32,
+        float(eps),
+    )
+
+
 def _launch_forward(
     q,
     k,
@@ -288,6 +328,8 @@ def _launch_forward(
     cluster_size=1,
     gate_roll=False,
     partial_tma=True,
+    o_norm=None,
+    onorm_keep_out=False,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -359,6 +401,7 @@ def _launch_forward(
         cluster_size=cluster_size,
         gate_roll=gate_roll,
         partial_tma=partial_tma,
+        onorm=0 if o_norm is None else (1 if onorm_keep_out else 2),
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
@@ -393,6 +436,7 @@ def _launch_forward(
         fepoch,
         float(scale),
         float(lower_bound) * LOG2E,
+        *_onorm_args(o_norm, T * B, H),
         stream,
     )
     return out, final_state
@@ -623,6 +667,8 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     plan=None,
+    o_norm=None,
+    onorm_keep_out=False,
 ):
     fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
@@ -675,4 +721,6 @@ def fwd(
         approximate_split=False,
         gate_roll=not fixed,
         partial_tma=not fixed,
+        o_norm=o_norm,
+        onorm_keep_out=onorm_keep_out,
     )

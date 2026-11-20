@@ -35,6 +35,8 @@ from cutlass.cute.arch import nvvm_wrappers
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from . import onorm_epi as _on
+
 
 @dsl_user_op
 def _bulk_prefetch_l2(addr, size, *, loc=None, ip=None):
@@ -206,6 +208,14 @@ def _pkd(
     fepoch: cutlass.Int32,
     scale: cutlass.Float32,
     lb2: cutlass.Float32,
+    og_addr: cutlass.Int64,
+    og_ld: cutlass.Int64,
+    onw_addr: cutlass.Int64,
+    oq_addr: cutlass.Int64,
+    oq_ld: cutlass.Int64,
+    osf_addr: cutlass.Int64,
+    osf_cols: cutlass.Int32,
+    oeps: cutlass.Float32,
     lay_qd: cute.ComposedLayout,
     lay_inv: cute.ComposedLayout,
     lay_ft: cute.ComposedLayout,
@@ -232,6 +242,7 @@ def _pkd(
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
+    ONORM_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     slot, _, _ = cute.arch.block_idx()
@@ -269,6 +280,10 @@ def _pkd(
     # Trailing mirror keeps every pre-existing shared address unchanged.
     s_btb5 = smem.allocate_tensor(
         cutlass.BFloat16, cute.make_layout((C, STAGES), stride=(1, C)), 16
+    )
+    # gated o_norm weights (ONORM_: the epilogue writes the MXFP8 o_proj input)
+    s_onw = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((D if ONORM_ >= 1 else 4,)), 16
     )
 
     ar0 = arena.iterator
@@ -1018,6 +1033,12 @@ def _pkd(
         mtx = lne >> 3
         row8 = lne & 7
         so_base = cutlass.Int32(s_out.iterator.toint())
+        s_w_base = cutlass.Int32(s_onw.iterator.toint())
+        if cutlass.const_expr(ONORM_ >= 1):
+            _on.sts_f32(
+                s_w_base + etx * 4, _on.ldg_f32(onw_addr + cutlass.Int64(etx * 4))
+            )
+            ep_bar.arrive_and_wait()
 
         # ---- decay-help machinery: [128,16] half-window TMEM copies
         # (mma_h exists only to mint the [BM,16] f32 accumulator layout)
@@ -1276,7 +1297,7 @@ def _pkd(
                     cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(mb + MB_OEMPTY)
-                    if full:
+                    if full or ONORM_ >= 1:
                         if warp == 4:
                             # unconditional: stores may be in flight across
                             # chain boundaries; no-op when nothing pending
@@ -1317,23 +1338,51 @@ def _pkd(
                                 cute.copy(stm_np, s8, dst)
                         cute.arch.fence_proxy("async.shared", space="cta")
                         ep_bar.arrive_and_wait()
-                        if warp == 4:
+                        if cutlass.const_expr(full and ONORM_ != 2):
+                            if warp == 4:
+                                if t >= warm_chunks:
+                                    f_o = cute.make_tensor(
+                                        p_o + ping * (C * D),
+                                        cute.make_layout(
+                                            (C, 1, (64, 2)), stride=(64, 0, (1, 2048))
+                                        ),
+                                    )
+                                    o_s, o_g = cpasync.tma_partition(
+                                        tma_o,
+                                        0,
+                                        cute.make_layout(1),
+                                        cute.group_modes(f_o, 0, 3),
+                                        cute.group_modes(gO, 0, 3),
+                                    )
+                                    cute.copy(tma_o, o_s, o_g[(None, t, hidx, 0)])
+                                    cute.arch.cp_async_bulk_commit_group()
+                        if cutlass.const_expr(ONORM_ >= 1):
                             if t >= warm_chunks:
-                                f_o = cute.make_tensor(
-                                    p_o + ping * (C * D),
-                                    cute.make_layout(
-                                        (C, 1, (64, 2)), stride=(64, 0, (1, 2048))
-                                    ),
+                                pf_n = cutlass.Int32(0)
+                                if t + 1 < t_tiles:
+                                    pf_n = cutlass.min(seq_len - (t + 1) * C, C)
+                                _on.onorm_tile(
+                                    so_base + ping * 8192,
+                                    s_w_base,
+                                    etx,
+                                    bos + t * C,
+                                    cutlass.min(cc_t, C),
+                                    hidx,
+                                    og_addr,
+                                    og_ld,
+                                    oq_addr,
+                                    oq_ld,
+                                    osf_addr,
+                                    osf_cols,
+                                    oeps,
+                                    bos + (t + 1) * C,
+                                    pf_n,
                                 )
-                                o_s, o_g = cpasync.tma_partition(
-                                    tma_o,
-                                    0,
-                                    cute.make_layout(1),
-                                    cute.group_modes(f_o, 0, 3),
-                                    cute.group_modes(gO, 0, 3),
-                                )
-                                cute.copy(tma_o, o_s, o_g[(None, t, hidx, 0)])
-                                cute.arch.cp_async_bulk_commit_group()
+                        if cutlass.const_expr((not full) and ONORM_ == 1):
+                            for e in cutlass.range_constexpr(cute.size(r_o)):
+                                tt2 = o_id[e][1]
+                                if (tt2 < cc_t) & (t >= warm_chunks):
+                                    out_raw[bos + t * C + tt2, hidx, o_id[e][0]] = r_ob[e]
                         ping ^= 1
                     else:
                         r_ob.store((r_o.load() * out_deanchor).to(cutlass.BFloat16))
@@ -2418,6 +2467,14 @@ def _launch_pkd(
     fepoch: cutlass.Int32,
     scale: cutlass.Float32,
     lb2: cutlass.Float32,
+    og_addr: cutlass.Int64,
+    og_ld: cutlass.Int64,
+    onw_addr: cutlass.Int64,
+    oq_addr: cutlass.Int64,
+    oq_ld: cutlass.Int64,
+    osf_addr: cutlass.Int64,
+    osf_cols: cutlass.Int32,
+    oeps: cutlass.Float32,
     H_: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
     TPROBE_: cutlass.Constexpr[int] = 0,
@@ -2442,6 +2499,7 @@ def _launch_pkd(
     PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
+    ONORM_: cutlass.Constexpr[int] = 0,
 ):
     mma_1 = cute.make_tiled_mma(
         tcgen05.MmaF16BF16Op(
@@ -2640,6 +2698,14 @@ def _launch_pkd(
         fepoch,
         scale,
         lb2,
+        og_addr,
+        og_ld,
+        onw_addr,
+        oq_addr,
+        oq_ld,
+        osf_addr,
+        osf_cols,
+        oeps,
         lay_qd,
         lay_inv,
         lay_ft,
@@ -2666,6 +2732,7 @@ def _launch_pkd(
         PREP_PEEL_,
         PARTIAL_TMA_,
         GATE_ROLL_,
+        ONORM_,
     ).launch(
         grid=(gcnt, 1, 1),
         block=(THREADS, 1, 1),
