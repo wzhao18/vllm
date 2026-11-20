@@ -22,7 +22,7 @@ import re
 import statistics
 import sys
 import time
-import types
+
 
 import torch
 
@@ -50,11 +50,18 @@ def load_example(residual: bool):
         )
         src, n = pat.subn(new, src)
         assert n == 1, f"epilogue math patch matched {n} times"
+    # CuTeDSL compiles from the source file: write the patched copy to disk.
+    import importlib.util
+    import tempfile
+
     name = "ab_res_example" if residual else "ab_sum_example"
-    mod = types.ModuleType(name)
-    mod.__file__ = path
+    fn = os.path.join(tempfile.mkdtemp(prefix="pattnres_"), name + ".py")
+    with open(fn, "w") as fh:
+        fh.write(src)
+    spec = importlib.util.spec_from_file_location(name, fn)
+    mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    exec(compile(src, path + (".res" if residual else ""), "exec"), mod.__dict__)
+    spec.loader.exec_module(mod)
     return mod
 
 
