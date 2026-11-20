@@ -4,7 +4,8 @@
 // _kda_rmsnorm_gated_mxfp8_kernel (norm_mx.cuh). 8 lanes per row, 16 columns
 // per lane (two lanes per MX block), 4 rows per warp step, kSteps steps of
 // loads in flight. The sum of squares is a lane butterfly (another order than
-// Triton's tl.sum: stock tolerance).
+// Triton's tl.sum: stock tolerance). Element pairs run in packed FP32
+// (mul/add.rn.f32x2, cvt.rn.bf16x2.f32, max.bf16x2): bitwise the scalar ops.
 #include <algorithm>
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -58,34 +59,47 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
 #pragma unroll
     for (int s = 0; s < kSteps; ++s) {
       const int r = r0 + 4 * s + sub;
-      float xf[16];
+      // Element pairs in packed FP32 (mul/add .rn.f32x2 round each lane as the
+      // scalar op: bitwise the scalar expressions, half the FMA-pipe issue).
+      float2 xf[8];
       const uint32_t xw[8] = {xv[s][0].x, xv[s][0].y, xv[s][0].z, xv[s][0].w,
                               xv[s][1].x, xv[s][1].y, xv[s][1].z, xv[s][1].w};
       const uint32_t gw[8] = {gv[s][0].x, gv[s][0].y, gv[s][0].z, gv[s][0].w,
                               gv[s][1].x, gv[s][1].y, gv[s][1].z, gv[s][1].w};
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        xf[2 * i] = lo(xw[i]);
-        xf[2 * i + 1] = hi(xw[i]);
-      }
+      for (int i = 0; i < 8; ++i) xf[i] = make_float2(lo(xw[i]), hi(xw[i]));
       float ss = 0.0f;
 #pragma unroll
-      for (int i = 0; i < 16; ++i) ss = __fadd_rn(ss, __fmul_rn(xf[i], xf[i]));
+      for (int i = 0; i < 8; ++i) {  // same left-to-right sum as the scalar loop
+        const float2 sq = __fmul2_rn(xf[i], xf[i]);
+        ss = __fadd_rn(__fadd_rn(ss, sq.x), sq.y);
+      }
 #pragma unroll
       for (int o = 1; o <= 4; o <<= 1)
         ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
       const float rstd = norm_mx::div_full(
           1.0f, norm_mx::sqrt_approx(
                     __fadd_rn(norm_mx::div_full(ss, 128.0f), a.eps)));
-      float y[16], amax = 0.0f;
+      const float2 rstd2 = make_float2(rstd, rstd);
+      float2 y[8];
+      __nv_bfloat162 amax2 = __floats2bfloat162_rn(0.0f, 0.0f);
 #pragma unroll
-      for (int i = 0; i < 16; ++i) {
-        const float gf = (i % 2 == 0) ? lo(gw[i / 2]) : hi(gw[i / 2]);
-        float v = __fmul_rn(__fmul_rn(xf[i], rstd), w[i]);
-        v = __fmul_rn(v, norm_mx::sigmoid_triton(gf));
-        y[i] = __bfloat162float(__float2bfloat16_rn(v));
-        amax = fmaxf(amax, fabsf(y[i]));
+      for (int i = 0; i < 8; ++i) {
+        const float2 t = __fmul2_rn(make_float2(lo(gw[i]), hi(gw[i])),
+                                    make_float2(-1.4426950216293335f, -1.4426950216293335f));
+        float ex, ey;
+        asm("ex2.approx.f32 %0, %1;" : "=f"(ex) : "f"(t.x));
+        asm("ex2.approx.f32 %0, %1;" : "=f"(ey) : "f"(t.y));
+        const float2 d = __fadd2_rn(make_float2(1.0f, 1.0f), make_float2(ex, ey));
+        const float2 sg = make_float2(norm_mx::div_full(1.0f, d.x), norm_mx::div_full(1.0f, d.y));
+        float2 v = __fmul2_rn(__fmul2_rn(xf[i], rstd2), make_float2(w[2 * i], w[2 * i + 1]));
+        v = __fmul2_rn(v, sg);
+        const __nv_bfloat162 b = __float22bfloat162_rn(v);  // cvt.rn.bf16x2.f32
+        amax2 = __hmax2(amax2, __habs2(b));                   // exact on BF16 values
+        const uint32_t bw = *reinterpret_cast<const uint32_t*>(&b);
+        y[i] = make_float2(lo(bw), hi(bw));
       }
+      float amax = fmaxf(__low2float(amax2), __high2float(amax2));
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
       float inv;
       const uint32_t e = norm_mx::ue8m0(amax, inv);
@@ -97,13 +111,11 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
         e4 |= __shfl_sync(0xffffffffu, e, (lane & ~7) + 2 * j) << (8 * j);
       if (r >= rows) continue;
       uint32_t q[4];
+      const float2 inv2 = make_float2(inv, inv);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        q[i] = uint32_t(norm_mx::fp8x2(__fmul_rn(y[4 * i], inv),
-                                       __fmul_rn(y[4 * i + 1], inv))) |
-               (uint32_t(norm_mx::fp8x2(__fmul_rn(y[4 * i + 2], inv),
-                                        __fmul_rn(y[4 * i + 3], inv)))
-                << 16);
+        const float2 u = __fmul2_rn(y[2 * i], inv2), v = __fmul2_rn(y[2 * i + 1], inv2);
+        q[i] = uint32_t(norm_mx::fp8x2(u.x, u.y)) | (uint32_t(norm_mx::fp8x2(v.x, v.y)) << 16);
       }
       const int tok = r / heads, head = r - tok * heads;
       *reinterpret_cast<uint4*>(static_cast<uint8_t*>(a.q) + int64_t(tok) * a.q_ld +
