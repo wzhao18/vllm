@@ -175,6 +175,7 @@ def _attn_res(
     (AttnRes call index ``call``; the prefix moves to the die-local prefix
     buffer, or to ``prefix_out`` when given), the native one otherwise."""
     if call is not None and prefill_attn_res_lp.active(blocks, prefix):
+        keep = prefix_out is not None and _aux_copy_keeps_prefix(prefix, delta, blocks)
         if prefix_out is None:
             prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
         out, _ = prefill_attn_res_lp.attn_res(
@@ -182,13 +183,27 @@ def _attn_res(
             kwargs["block_write_idx"], args[2], kwargs["output_norm_eps"],
             bf16_out=True, quant_out=False, prefix_out=prefix_out,
         )
-        return out, prefix if prefix_out is None else prefix_out
+        return out, prefix if prefix_out is None or keep else prefix_out
     if prefix_out is not None:
         raise RuntimeError(
             "Kimi K3 AttnRes: an explicit prefix_out needs the planned prefill "
             "(attn_res_lp) kernel"
         )
     return attn_res(prefix, delta, blocks, *args, **kwargs), prefix
+
+
+def _aux_copy_keeps_prefix(
+    prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor
+) -> bool:
+    """For an AttnRes call that writes the DSpark aux capture (an explicit
+    ``prefix_out``): whether the capture is a copy and the die-local prefix
+    stays the prefix. True under prefill dataflow C (no delta: the producers
+    already added the previous outputs into the die-local prefix in place):
+    the call writes the unchanged prefix to the capture as a side output and
+    the next producers keep adding into the die-local prefix (they never
+    touch the capture). Otherwise (a delta) the updated prefix moves to the
+    capture and the call after it moves it back."""
+    return delta is None and prefill_attn_res_dielocal.is_prefix(prefix, blocks)
 
 
 logger = init_logger(__name__)
@@ -1912,9 +1927,12 @@ class KimiDecoderLayer(nn.Module):
         the attention output is already in the prefix (dataflow C)."""
         if prefill_attn_res_lp.active(residual, prefix_sum):
             prefix_out = self._take_aux_prefix_out() if pre else None
+            keep = prefix_out is not None and _aux_copy_keeps_prefix(
+                prefix_sum, hidden_states, residual
+            )
             if prefix_out is None:
                 prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
-            new_prefix = prefix_sum if prefix_out is None else prefix_out
+            new_prefix = prefix_sum if prefix_out is None or keep else prefix_out
             if pre:
                 delta = hidden_states
                 num_blocks = self.prev_valid_blocks
@@ -2344,7 +2362,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # one) writes anyway (prefix + MLP output, one BF16 add): that call
         # writes it to a fresh buffer instead of the die-local prefix buffer
         # (the call after it moves the prefix back), so the capture costs no
-        # extra pass over [tokens, hidden].
+        # extra pass over [tokens, hidden]. Under dataflow C (the producers
+        # already added the outputs into the die-local prefix) that call writes
+        # the capture as a copy and the prefix stays die-local
+        # (_aux_copy_keeps_prefix).
         aux_dst: torch.Tensor | None = None
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
