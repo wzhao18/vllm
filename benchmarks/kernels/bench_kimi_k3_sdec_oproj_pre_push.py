@@ -150,7 +150,19 @@ def ks_push(rows, n, cap, x, copies, recv, peers, words, dbg=0):
     ref = words.view(torch.bfloat16).float()
     err = (got.view(torch.bfloat16).float() - ref).abs().max().item()
     t = graph_time(call)
-    return f"ks_push {t:.2f} us/call (bits {bits * 100:.2f}%, max err {err:.3g})"
+    line = f"ks_push {t:.2f} us/call (bits {bits * 100:.2f}%, max err {err:.3g})"
+    if dbg & 32:  # one more call, then its stamps (us after the earliest CTA start)
+        call(0)
+        torch.cuda.synchronize()
+        st = scratch[-ks_push.STAMP_FLOATS :].view(torch.int64)
+        st = st.view(-1, ks_push.STAMPS)[: 2 * 28 * ks_push.KS].double()
+        t0 = st[:, 0].min()
+        names = ("start", "A", "B0", "B1", "B2", "M0", "M1", "M2", "E0", "E1", "E2",
+                 "P0", "P1", "P2", "end", "Xw")  # fmt: skip
+        cols = [i for i in range(ks_push.STAMPS) if (st[:, i] > 0).any()]
+        med = {names[i]: ((st[:, i][st[:, i] > 0] - t0).median() / 1e3).item() for i in cols}
+        line += " | stamps us: " + " ".join(f"{k} {v:.2f}" for k, v in med.items())
+    return line
 
 
 if __name__ == "__main__":

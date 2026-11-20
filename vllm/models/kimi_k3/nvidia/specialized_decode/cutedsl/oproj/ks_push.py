@@ -65,6 +65,8 @@ TMEM_COLS = 512
 TMEM_BAR = 1
 EPI_BAR = 2
 MAX_BLOCKS = 4  # R <= 512
+STAMPS = 16  # bench probe (dbg & 32): int64 globaltimer stamps per CTA after the scratch
+STAMP_FLOATS = 2 * STAMPS * 2 * (WIDTH // FEATURES) * KS
 
 
 def block_order(rows: int, n: int, rank: int) -> list[int]:
@@ -82,7 +84,7 @@ def block_order(rows: int, n: int, rank: int) -> list[int]:
 def scratch_floats() -> int:
     """FP32 words of the reduce-scatter scratch: [56 CTA features][block][chunk]
     [2 writer slots][128 features][48 tokens]."""
-    return (WIDTH // 128) * MAX_BLOCKS * KS * 2 * 128 * CMAX
+    return (WIDTH // 128) * MAX_BLOCKS * KS * 2 * 128 * CMAX + STAMP_FLOATS
 
 
 def counter_words() -> int:
@@ -144,6 +146,16 @@ def ld_acquire(address):
 def st_relaxed_gpu(address, value):
     code = "st.relaxed.gpu.global.b32 [$0], $1;"
     return code, "l,r,~{memory}", (Int64(address), Int32(value))
+
+
+@asm(Int64)
+def globaltimer():
+    return "mov.u64 $0, %globaltimer;", "=l,~{memory}", ()
+
+
+@asm()
+def st_i64(address, value):
+    return "st.global.u64 [$0], $1;", "l,l,~{memory}", (Int64(address), Int64(value))
 
 
 @asm()
@@ -372,7 +384,13 @@ class OprojKsPush:
         pipeline_init_wait(cluster_shape_mn=(2, 1))
         cute.arch.griddepcontrol_launch_dependents()
 
+        stamps = scratch.iterator.toint() + Int64(
+            (scratch_floats() - STAMP_FLOATS + 2 * STAMPS * bidx) * 4
+        )
         if warp == W_WARP:
+            if cutlass.const_expr(self.dbg & 32):
+                if cute.arch.lane_idx() == 0:
+                    st_i64(stamps, globaltimer())
             # The weight slice does not depend on the predecessor: issued at once.
             gA_s = tAgA[(None, mb, None, 0)]
             gSFA_s = tAgSFA[(None, mb, None, 0)]
@@ -391,6 +409,9 @@ class OprojKsPush:
         if warp == X_WARP:
             xs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.dbg & 32):
+                if cute.arch.lane_idx() == 0:
+                    st_i64(stamps + 15 * 8, globaltimer())
             for blk in cutlass.range_constexpr(self.blocks):
                 tb = order[blk]
                 gB_s = tBgB[(None, tb, None, 0)]
@@ -422,11 +443,17 @@ class OprojKsPush:
             nkb = cute.size(tCrA, mode=[2])
             if is_leader:
                 a_pipe.consumer_wait(a_cons)
+                if cutlass.const_expr(self.dbg & 32):
+                    if cute.arch.lane_idx() == 0:
+                        st_i64(stamps + 1 * 8, globaltimer())
             for blk in cutlass.range_constexpr(self.blocks):
                 tAcc = cute.make_tensor(acc_ptr + (blk % nbuf) * TB, acc_fake.layout)
                 if is_leader:
                     acc_pipe.producer_acquire(accs)
                     b_pipe.consumer_wait(b_cons)
+                    if cutlass.const_expr(self.dbg & 32):
+                        if cute.arch.lane_idx() == 0:
+                            st_i64(stamps + (2 + blk) * 8, globaltimer())
                     for j in cutlass.range_constexpr(kslice):
                         stage = (blk % 2) * kslice + j
                         cute.copy(s2t_a[0], s2t_a[1][(None, None, None, None, j)], s2t_a[2])
@@ -441,6 +468,9 @@ class OprojKsPush:
                             )  # fmt: skip
                     b_pipe.consumer_release(b_cons)
                     acc_pipe.producer_commit(accs)
+                    if cutlass.const_expr(self.dbg & 32):
+                        if cute.arch.lane_idx() == 0:
+                            st_i64(stamps + (5 + blk) * 8, globaltimer())
                 b_cons.advance()
                 accs.advance()
             if is_leader:
@@ -461,6 +491,9 @@ class OprojKsPush:
             for blk in cutlass.range_constexpr(self.blocks + 1):
                 if blk < self.blocks:
                     acc_pipe.consumer_wait(waits)
+                    if cutlass.const_expr(self.dbg & 32):
+                        if tidx == 0:
+                            st_i64(stamps + (8 + blk) * 8, globaltimer())
                     self._scatter(taddr + (blk % nbuf) * TB, scratch, counters, fv, blk, ks,
                                   tidx)  # fmt: skip
                     waits.advance()
@@ -472,6 +505,12 @@ class OprojKsPush:
                     with cute.arch.elect_one():
                         acc_pipe.consumer_release(frees)
                     frees.advance()
+                    if cutlass.const_expr(self.dbg & 32):
+                        if tidx == 0:
+                            st_i64(stamps + (11 + blk - 1) * 8, globaltimer())
+            if cutlass.const_expr(self.dbg & 32):
+                if tidx == 0:
+                    st_i64(stamps + 14 * 8, globaltimer())
             tmem.relinquish_alloc_permit()
             tmem.free(acc_ptr)
 
