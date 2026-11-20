@@ -54,6 +54,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 ROUTER_TOPK_MIN_ROWS = 6144
 RMS_NORM_MIN_ROWS = 2048
 RMS_NORM_MAX_VECS_PER_LANE = 2
+# kRmsCtaMinRows: rows from which 8-warp stock blocks run as persistent CTAs.
+RMS_NORM_CTA_MIN_ROWS = 4096
 GATE_MIN_ROWS = 1024
 
 _CUDA_SRC = r"""
@@ -728,6 +730,164 @@ __global__ void rope_store_kv_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// ctx_kv_insert: the context K/V insert of EVERY draft layer in one launch.
+// Per (context row, layer): the per-head K RMSNorm (rms_norm_seg_kernel<SEG>,
+// the stock SEG-thread block replay, SEG = head_dim / 8), the NeoX RoPE of the
+// normed K and the BF16 insert of K and V into the layer's cache
+// (rope_store_kv_kernel): bitwise the 2 x layers launches it replaces, with
+// the normed K kept in registers instead of a [rows, heads, head_dim] buffer.
+// kv: [rows, layers, 2, heads, head_dim] token-major (row stride kv_stride).
+// One CTA per context row walks the layers; a SEG-lane segment owns one head
+// (lane j holds elements 8j..8j+7; the RoPE partner of lane j is lane j ^ SEG/2).
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// gather_rows_multi: dst[r, s*W:(s+1)*W] = src_s[index[r], :] for every source
+// s in ONE launch (the drafter's window rows of the target aux hidden states,
+// packed as adjacent column blocks for the fc GEMM). One 128-thread CTA per
+// (destination row, source) pair; every thread issues all its 16-byte loads
+// (up to kGatherVecs, row_vecs <= 128 * kGatherVecs) before its stores.
+// ---------------------------------------------------------------------------
+constexpr int kGatherMaxSrc = 8;
+constexpr int kGatherVecs = 8;
+struct GatherSrcs {
+  const uint4* src[kGatherMaxSrc];
+  int64_t stride[kGatherMaxSrc];  // in uint4
+};
+
+__global__ void __launch_bounds__(128) gather_rows_multi_kernel(
+    uint4* __restrict__ dst, int64_t dst_stride, const int64_t* __restrict__ index,
+    const GatherSrcs s, int row_vecs) {
+  const int64_t r = blockIdx.x;
+  const int q = blockIdx.y;
+  const uint4* src = s.src[q] + index[r] * s.stride[q];
+  uint4* d = dst + r * dst_stride + (int64_t)q * row_vecs;
+  uint4 v[kGatherVecs];
+#pragma unroll
+  for (int u = 0; u < kGatherVecs; ++u) {
+    const int e = threadIdx.x + u * 128;
+    if (e < row_vecs) v[u] = __ldg(src + e);
+  }
+#pragma unroll
+  for (int u = 0; u < kGatherVecs; ++u) {
+    const int e = threadIdx.x + u * 128;
+    if (e < row_vecs) d[e] = v[u];
+  }
+}
+
+constexpr int kCtxKvMaxLayers = 8;
+struct CtxKvLayers {
+  const uint16_t* knorm_w[kCtxKvMaxLayers];
+  const int64_t* slots[kCtxKvMaxLayers];
+  __nv_bfloat16* kc[kCtxKvMaxLayers];
+  __nv_bfloat16* vc[kCtxKvMaxLayers];
+  int rows[kCtxKvMaxLayers];
+};
+
+template <int SEG>
+__global__ void __launch_bounds__(256) ctx_kv_insert_kernel(
+    const __nv_bfloat16* __restrict__ kv, int64_t kv_stride, int layers,
+    int heads, const int64_t* __restrict__ positions,
+    const __nv_bfloat16* __restrict__ cos_sin, int64_t cs_stride,
+    const CtxKvLayers p, float epsilon, int64_t kbs, int64_t kps, int64_t khs,
+    int64_t vbs, int64_t vps, int64_t vhs, int64_t block_size) {
+  // blockDim.x = heads * SEG (full warps, host check): thread u owns the
+  // 16-byte vector u of every layer's K and V row (head u / SEG).
+  constexpr int HD = SEG * 8;
+  constexpr int HALF = HD / 2;
+  const int row = blockIdx.x;
+  const int u = threadIdx.x;
+  const int lane = u & 31;
+  const int seg_lane = lane & (SEG - 1);
+  const int h = u / SEG;
+  // All loads of the row first (every layer's K and V vector, slots, cos /
+  // sin), then the per-layer norm + RoPE + stores.
+  int64_t slot[kCtxKvMaxLayers];
+  uint4 kdat[kCtxKvMaxLayers], vdat[kCtxKvMaxLayers];
+  const __nv_bfloat16* kr0 = kv + row * kv_stride;
+#pragma unroll
+  for (int l = 0; l < kCtxKvMaxLayers; ++l) {
+    slot[l] = -1;
+    if (l < layers && row < p.rows[l]) {
+      slot[l] = p.slots[l][row];
+      const __nv_bfloat16* kr = kr0 + (int64_t)(2 * l) * heads * HD;
+      kdat[l] = reinterpret_cast<const uint4*>(kr + h * HD)[seg_lane];
+      vdat[l] = reinterpret_cast<const uint4*>(kr + heads * HD + h * HD)[seg_lane];
+    }
+  }
+  // cos / sin of this lane's 8 elements: x lanes (seg_lane < SEG / 2) hold
+  // elements c = 8 seg_lane, y lanes the same c of the second half.
+  const int c = 8 * (seg_lane & (SEG / 2 - 1));
+  const __nv_bfloat16* cs = cos_sin + positions[row] * cs_stride;
+  const uint4 cv = *reinterpret_cast<const uint4*>(cs + c);
+  const uint4 sv = *reinterpret_cast<const uint4*>(cs + HALF + c);
+  const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
+  const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
+  const bool is_x = seg_lane < SEG / 2;
+#pragma unroll
+  for (int l = 0; l < kCtxKvMaxLayers; ++l) {
+    if (l >= layers || slot[l] < 0) continue;  // CTA-uniform
+    const int64_t blk = slot[l] / block_size, off = slot[l] % block_size;
+    __nv_bfloat16* kd = p.kc[l] + blk * kbs + off * kps;
+    {
+      // rms_norm_seg_kernel<SEG> on head h (hidden_size = HD).
+      const uint4 data = kdat[l];
+      const uint16_t* hb = reinterpret_cast<const uint16_t*>(&data);
+      float s = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        float x = bf16_bits_to_float(hb[j]);
+        s += x * x;
+      }
+#pragma unroll
+      for (int o = 1; o < SEG; o <<= 1) {
+        float t = __shfl_down_sync(kFull, s, o);
+        if (seg_lane + o < SEG) s = t + s;
+      }
+      const float s_variance = __shfl_sync(
+          kFull, rsqrtf(s / HD + epsilon), lane & ~(SEG - 1));
+      const uint4 wr = __ldg(reinterpret_cast<const uint4*>(p.knorm_w[l]) + seg_lane);
+      const uint16_t* wh = reinterpret_cast<const uint16_t*>(&wr);
+      uint4 nk;
+      uint16_t* nh = reinterpret_cast<uint16_t*>(&nk);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        float x = bf16_bits_to_float(hb[j]);
+        float wv = bf16_bits_to_float(wh[j]);
+        nh[j] = c10::BFloat16(x * s_variance * wv).x;
+      }
+      // NeoX RoPE of the normed head (rope_store_kv_kernel expression): the
+      // partner lane holds the other half of the same 8 element pairs.
+      uint4 pk;
+      pk.x = __shfl_xor_sync(kFull, nk.x, SEG / 2);
+      pk.y = __shfl_xor_sync(kFull, nk.y, SEG / 2);
+      pk.z = __shfl_xor_sync(kFull, nk.z, SEG / 2);
+      pk.w = __shfl_xor_sync(kFull, nk.w, SEG / 2);
+      const __nv_bfloat16* mine = reinterpret_cast<const __nv_bfloat16*>(&nk);
+      const __nv_bfloat16* other = reinterpret_cast<const __nv_bfloat16*>(&pk);
+      uint4 ro;
+      c10::BFloat16* rob = reinterpret_cast<c10::BFloat16*>(&ro);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float cos_f = __bfloat162float(cb[i]);
+        const float sin_f = __bfloat162float(sb[i]);
+        if (is_x) {
+          const float x_f = __bfloat162float(mine[i]);
+          const float y_f = __bfloat162float(other[i]);
+          rob[i] = static_cast<c10::BFloat16>(x_f * cos_f - y_f * sin_f);
+        } else {
+          const float x_f = __bfloat162float(other[i]);
+          const float y_f = __bfloat162float(mine[i]);
+          rob[i] = static_cast<c10::BFloat16>(y_f * cos_f + x_f * sin_f);
+        }
+      }
+      *reinterpret_cast<uint4*>(kd + h * khs + 8 * seg_lane) = ro;
+    }
+    __nv_bfloat16* vd = p.vc[l] + blk * vbs + off * vps;
+    *reinterpret_cast<uint4*>(vd + h * vhs + 8 * seg_lane) = vdat[l];
+  }
+}
+
 }  // namespace
 
 void router_topk(torch::Tensor& topk_values, torch::Tensor& topk_indices,
@@ -837,19 +997,28 @@ void rms_norm_rows(torch::Tensor& out, const torch::Tensor& input,
       reinterpret_cast<const uint16_t*>(input.data_ptr()), input.stride(0), \
       reinterpret_cast<const uint16_t*>(weight.data_ptr()), (float)epsilon, \
       (int32_t)n, (int32_t)h)
-  if (nw == 8 && vpt == 2 && n >= kRmsCtaMinRows) {
-    static int occ = 0;
-    if (occ == 0)
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, rms_norm_cta_kernel<8, 2>,
-                                                    128, 0);
+  if (nw == 8 && (vpt == 2 || vpt == 4) && n >= kRmsCtaMinRows) {
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, input.get_device());
-    const int64_t ctas = std::min<int64_t>(n, (int64_t)sms * std::max(occ, 1));
-    rms_norm_cta_kernel<8, 2><<<(unsigned)ctas, 128, 0, stream>>>(
-        reinterpret_cast<uint16_t*>(out.data_ptr()),
-        reinterpret_cast<const uint16_t*>(input.data_ptr()), input.stride(0),
-        reinterpret_cast<const uint16_t*>(weight.data_ptr()), (float)epsilon,
-        (int32_t)h, (int64_t)n);
+#define K3_RMS_CTA_LAUNCH(VPT)                                                 \
+  {                                                                            \
+    static int occ = 0;                                                        \
+    if (occ == 0)                                                              \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(                           \
+          &occ, rms_norm_cta_kernel<8, VPT>, 128, 0);                          \
+    const int64_t ctas = std::min<int64_t>(n, (int64_t)sms * std::max(occ, 1)); \
+    rms_norm_cta_kernel<8, VPT><<<(unsigned)ctas, 128, 0, stream>>>(           \
+        reinterpret_cast<uint16_t*>(out.data_ptr()),                           \
+        reinterpret_cast<const uint16_t*>(input.data_ptr()), input.stride(0),  \
+        reinterpret_cast<const uint16_t*>(weight.data_ptr()), (float)epsilon,  \
+        (int32_t)h, (int64_t)n);                                               \
+  }
+    if (vpt == 2) {
+      K3_RMS_CTA_LAUNCH(2);
+    } else {
+      K3_RMS_CTA_LAUNCH(4);
+    }
+#undef K3_RMS_CTA_LAUNCH
   } else if (nw == 2 && vpt == 1) {
     K3_RMS_LAUNCH(2, 1);
   } else if (nw == 4 && vpt == 1) {
@@ -979,6 +1148,100 @@ void rope_store_kv(const torch::Tensor& k, const torch::Tensor& v,
       key_cache.size(1), rows, heads, head_dim);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+void gather_rows_multi(torch::Tensor& dst, const torch::Tensor& index,
+                       const std::vector<torch::Tensor>& srcs) {
+  // dst [n, nsrc * W] (row stride dst.stride(0)), srcs nsrc x [T, W] (any row
+  // stride), index [n] int64 rows of the sources.
+  const int nsrc = (int)srcs.size();
+  TORCH_CHECK(nsrc > 0 && nsrc <= kGatherMaxSrc && index.dim() == 1 &&
+              index.scalar_type() == at::kLong && index.is_contiguous() &&
+              dst.dim() == 2 && dst.stride(1) == 1);
+  const int64_t n = index.numel();
+  TORCH_CHECK(dst.size(0) == n && n < (1LL << 31));
+  const int64_t es = dst.element_size();
+  const int64_t width = srcs[0].size(1);
+  TORCH_CHECK(dst.size(1) == width * nsrc && (width * es) % 16 == 0 &&
+              (dst.stride(0) * es) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(dst.data_ptr()) % 16 == 0);
+  GatherSrcs s{};
+  for (int q = 0; q < nsrc; ++q) {
+    const torch::Tensor& t = srcs[q];
+    TORCH_CHECK(t.dim() == 2 && t.size(1) == width && t.stride(1) == 1 &&
+                t.scalar_type() == dst.scalar_type() &&
+                (t.stride(0) * es) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0);
+    s.src[q] = reinterpret_cast<const uint4*>(t.data_ptr());
+    s.stride[q] = t.stride(0) * es / 16;
+  }
+  TORCH_CHECK(width * es / 16 <= 128 * kGatherVecs);
+  if (n == 0) return;
+  auto stream = c10::cuda::getCurrentCUDAStream();
+  gather_rows_multi_kernel<<<dim3((unsigned)n, (unsigned)nsrc), 128, 0, stream>>>(
+      reinterpret_cast<uint4*>(dst.data_ptr()), dst.stride(0) * es / 16,
+      index.data_ptr<int64_t>(), s, (int)(width * es / 16));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void ctx_kv_insert(const torch::Tensor& kv, const std::vector<torch::Tensor>& knorm_w,
+                   double epsilon, const torch::Tensor& positions,
+                   const torch::Tensor& cos_sin,
+                   const std::vector<torch::Tensor>& slots,
+                   const std::vector<torch::Tensor>& key_caches,
+                   const std::vector<torch::Tensor>& value_caches) {
+  // kv [rows, layers, 2, heads, head_dim] BF16, row stride kv.stride(0); one
+  // entry per layer in the lists (an undefined slots tensor skips the layer).
+  TORCH_CHECK(kv.dim() == 5 && kv.size(2) == 2 && kv.stride(4) == 1 &&
+              kv.stride(3) == kv.size(4) && kv.stride(2) == kv.size(3) * kv.size(4) &&
+              kv.stride(1) == 2 * kv.stride(2));
+  const int64_t rows = kv.size(0);
+  const int layers = (int)kv.size(1), heads = (int)kv.size(3);
+  const int head_dim = (int)kv.size(4);
+  TORCH_CHECK(layers <= kCtxKvMaxLayers && (int)knorm_w.size() == layers &&
+              (int)slots.size() == layers && (int)key_caches.size() == layers &&
+              (int)value_caches.size() == layers);
+  TORCH_CHECK((head_dim == 64 || head_dim == 128) &&
+              (heads * (head_dim / 8)) % 32 == 0 &&
+              heads * (head_dim / 8) <= 256 && rows < (1LL << 31));
+  if (rows == 0) return;
+  CtxKvLayers p{};
+  int ref = -1;
+  for (int l = 0; l < layers; ++l) {
+    if (!slots[l].defined() || slots[l].numel() == 0) {
+      p.rows[l] = 0;
+      continue;
+    }
+    TORCH_CHECK(slots[l].numel() <= rows);
+    p.knorm_w[l] = reinterpret_cast<const uint16_t*>(knorm_w[l].data_ptr());
+    p.slots[l] = slots[l].data_ptr<int64_t>();
+    p.kc[l] = reinterpret_cast<__nv_bfloat16*>(key_caches[l].data_ptr());
+    p.vc[l] = reinterpret_cast<__nv_bfloat16*>(value_caches[l].data_ptr());
+    p.rows[l] = (int)slots[l].numel();
+    if (ref < 0) ref = l;
+    // One stride set for every layer (host-checked by use_ctx_kv_insert).
+    TORCH_CHECK(key_caches[l].strides() == key_caches[ref].strides() &&
+                value_caches[l].strides() == value_caches[ref].strides() &&
+                key_caches[l].size(1) == key_caches[ref].size(1));
+  }
+  if (ref < 0) return;
+  const torch::Tensor& kc = key_caches[ref];
+  const torch::Tensor& vc = value_caches[ref];
+  auto stream = c10::cuda::getCurrentCUDAStream();
+#define K3_CTX_KV_LAUNCH(S)                                                  \
+  ctx_kv_insert_kernel<S><<<(unsigned)rows, heads * (head_dim / 8), 0, stream>>>( \
+      reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()), kv.stride(0),   \
+      layers, heads, positions.data_ptr<int64_t>(),                          \
+      reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr()),            \
+      cos_sin.stride(0), p, (float)epsilon, kc.stride(0), kc.stride(1),      \
+      kc.stride(2), vc.stride(0), vc.stride(1), vc.stride(2), kc.size(1))
+  if (head_dim == 64) {
+    K3_CTX_KV_LAUNCH(8);
+  } else {
+    K3_CTX_KV_LAUNCH(16);
+  }
+#undef K3_CTX_KV_LAUNCH
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 """
 
 _CPP_SRC = """
@@ -996,6 +1259,14 @@ void rope_store_kv(const torch::Tensor& k, const torch::Tensor& v,
                    const torch::Tensor& positions, const torch::Tensor& cos_sin,
                    const torch::Tensor& slots, torch::Tensor& key_cache,
                    torch::Tensor& value_cache);
+void ctx_kv_insert(const torch::Tensor& kv, const std::vector<torch::Tensor>& knorm_w,
+                   double epsilon, const torch::Tensor& positions,
+                   const torch::Tensor& cos_sin,
+                   const std::vector<torch::Tensor>& slots,
+                   const std::vector<torch::Tensor>& key_caches,
+                   const std::vector<torch::Tensor>& value_caches);
+void gather_rows_multi(torch::Tensor& dst, const torch::Tensor& index,
+                       const std::vector<torch::Tensor>& srcs);
 """
 
 _lock = threading.Lock()
@@ -1029,6 +1300,8 @@ def _module():
                     "gate_sigmoid_mul",
                     "scatter_rows",
                     "rope_store_kv",
+                    "ctx_kv_insert",
+                    "gather_rows_multi",
                 ],
                 extra_cuda_cflags=["-O3"],
                 build_directory=build,
@@ -1114,6 +1387,10 @@ def use_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> bool:
     vpt = -(-(hidden // 8) // block)
     if block in (8, 16):
         return hidden == block * 8
+    if (block, vpt) == (256, 4):
+        # 7168 columns: only the persistent one-row-per-CTA replay (the warp
+        # per row form is slower than stock at 4 vectors per lane).
+        return x.shape[0] >= RMS_NORM_CTA_MIN_ROWS
     return (
         block % 32 == 0
         and vpt <= RMS_NORM_MAX_VECS_PER_LANE
@@ -1280,6 +1557,132 @@ def rope_store_kv(
     in one pass (slots < 0 skipped): bitwise the two stock kernels. Callers check
     :func:`use_rope_store_kv`."""
     _module().rope_store_kv(k, v, positions, cos_sin, slots, key_cache, value_cache)
+
+
+CTX_KV_MAX_LAYERS = 8
+GATHER_MAX_SOURCES = 8
+GATHER_MAX_ROW_VECS = 128 * 8  # kGatherVecs 16-byte vectors per thread
+
+
+def use_gather_rows_multi(srcs: list[torch.Tensor], index: torch.Tensor) -> bool:
+    """Whether :func:`gather_rows_multi` covers these sources: 2-D same-dtype
+    same-width tensors (any 16-byte aligned row stride) and an int64 index."""
+    if not srcs or len(srcs) > GATHER_MAX_SOURCES:
+        return False
+    h0 = srcs[0]
+    es = h0.element_size()
+    return (
+        index.dim() == 1
+        and index.dtype == torch.int64
+        and index.is_contiguous()
+        and index.is_cuda
+        and index.numel() < 2**31
+        and all(
+            h.dim() == 2
+            and h.dtype == h0.dtype
+            and h.device == index.device
+            and h.shape[1] == h0.shape[1]
+            and h.stride(1) == 1
+            and (h.stride(0) * es) % 16 == 0
+            and h.data_ptr() % 16 == 0
+            for h in srcs
+        )
+        and (h0.shape[1] * es) % 16 == 0
+        and h0.shape[1] * es // 16 <= GATHER_MAX_ROW_VECS
+    )
+
+
+def gather_rows_multi(srcs: list[torch.Tensor], index: torch.Tensor) -> torch.Tensor:
+    """``torch.cat([h[index] for h in srcs], dim=-1)`` in one launch (one
+    [len(index), len(srcs) * W] row-major buffer). Callers check
+    :func:`use_gather_rows_multi`."""
+    h0 = srcs[0]
+    out = h0.new_empty((index.numel(), len(srcs) * h0.shape[1]))
+    _module().gather_rows_multi(out, index, list(srcs))
+    return out
+
+
+def use_ctx_kv_insert(
+    kv: torch.Tensor,
+    knorm_weights: list[torch.Tensor],
+    eps: float,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    slots: list[torch.Tensor | None],
+    caches: list[tuple[torch.Tensor, torch.Tensor] | None],
+) -> bool:
+    """Whether :func:`ctx_kv_insert` covers this context step: ``kv`` the dense
+    token-major projection ``[rows, layers, 2, heads, head_dim]``, every layer
+    with a cache covered by :func:`use_rope_store_kv` on the same cache strides,
+    per-head K norms replayed by the SEG = head_dim / 8 segment kernel."""
+    if kv.dim() != 5 or kv.shape[2] != 2 or not kv.is_contiguous():
+        return False
+    rows, layers, _, heads, head_dim = kv.shape
+    if not (
+        0 < layers <= CTX_KV_MAX_LAYERS
+        and len(knorm_weights) == len(slots) == len(caches) == layers
+        and head_dim in (64, 128)
+        and (heads * (head_dim // 8)) % 32 == 0
+        and heads * (head_dim // 8) <= 256
+        and kv.dtype == torch.bfloat16
+        and kv.data_ptr() % 16 == 0
+    ):
+        return False
+    ref = None
+    for w, s, c in zip(knorm_weights, slots, caches):
+        if c is None or s is None:
+            continue
+        if not (
+            w.dtype == torch.bfloat16
+            and w.is_contiguous()
+            and w.numel() == head_dim
+            and w.data_ptr() % 16 == 0
+        ):
+            return False
+        # The per-head norm launch this kernel replaces (stock blocks of SEG).
+        if stock_rms_norm_block_size(rows * heads, head_dim) != head_dim // 8:
+            return False
+        k = kv[: s.numel(), 0, 0]
+        if not use_rope_store_kv(k, k, positions, cos_sin, s, *c):
+            return False
+        if ref is None:
+            ref = c
+        elif (
+            c[0].stride() != ref[0].stride()
+            or c[1].stride() != ref[1].stride()
+            or c[0].shape[1] != ref[0].shape[1]
+        ):
+            return False
+    return ref is not None
+
+
+def ctx_kv_insert(
+    kv: torch.Tensor,
+    knorm_weights: list[torch.Tensor],
+    eps: float,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    slots: list[torch.Tensor | None],
+    caches: list[tuple[torch.Tensor, torch.Tensor] | None],
+) -> None:
+    """Per layer ``i``: ``k = rms_norm(kv[:, i, 0], knorm_weights[i])`` (per head),
+    then :func:`rope_store_kv` ``(k, kv[:, i, 1], positions, cos_sin, slots[i],
+    *caches[i])`` - every layer in ONE launch, bitwise the per-layer kernels.
+    Layers without slots or cache are skipped. Callers check
+    :func:`use_ctx_kv_insert`."""
+    none = kv.new_empty(0, dtype=torch.int64)
+    live = [c is not None and s is not None for s, c in zip(slots, caches)]
+    first = next(i for i, ok in enumerate(live) if ok)
+    _module().ctx_kv_insert(
+        kv,
+        [w if ok else knorm_weights[first] for w, ok in zip(knorm_weights, live)],
+        float(eps),
+        positions,
+        cos_sin,
+        [s if ok else none for s, ok in zip(slots, live)],
+        [c[0] if ok else caches[first][0] for c, ok in zip(caches, live)],
+        [c[1] if ok else caches[first][1] for c, ok in zip(caches, live)],
+    )
 
 
 def warmup() -> None:

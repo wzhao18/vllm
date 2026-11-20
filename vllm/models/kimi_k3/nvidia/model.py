@@ -164,20 +164,27 @@ if TYPE_CHECKING:
 
 def _attn_res(
     prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor,
-    *args, call: int | None = None, **kwargs
+    *args, call: int | None = None, prefix_out: torch.Tensor | None = None,
+    **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """AttnRes with a BF16 output -> (output, updated prefix): on a prefill
     forward planned by ``attn_res_lp.begin`` the precomputed-logit kernel
     (AttnRes call index ``call``; the prefix moves to the die-local prefix
-    buffer), the native one otherwise."""
+    buffer, or to ``prefix_out`` when given), the native one otherwise."""
     if call is not None and prefill_attn_res_lp.active(blocks, prefix):
-        prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
+        if prefix_out is None:
+            prefix_out = prefill_attn_res_dielocal.prefix_out(prefix, blocks)
         out, _ = prefill_attn_res_lp.attn_res(
             prefix, delta, blocks, call, kwargs["num_blocks"],
             kwargs["block_write_idx"], args[2], kwargs["output_norm_eps"],
             bf16_out=True, quant_out=False, prefix_out=prefix_out,
         )
         return out, prefix if prefix_out is None else prefix_out
+    if prefix_out is not None:
+        raise RuntimeError(
+            "Kimi K3 AttnRes: an explicit prefix_out needs the planned prefill "
+            "(attn_res_lp) kernel"
+        )
     return attn_res(prefix, delta, blocks, *args, **kwargs), prefix
 
 
@@ -1600,6 +1607,11 @@ class KimiDecoderLayer(nn.Module):
             self.is_block_write_layer = layer_idx % self.attn_res_block_size == 0
             self.block_write_idx = layer_idx // self.attn_res_block_size
             self.prev_valid_blocks = cdiv(layer_idx, self.attn_res_block_size)
+            # Set by the model for one forward when the previous layer is a
+            # DSpark aux layer: the pre-attention AttnRes writes its updated
+            # prefix (= the aux state, one BF16 add) there (_aux_prefix_dst).
+            self._aux_prefix_out: torch.Tensor | None = None
+            self._aux_prefix_used = False
             self.self_attention_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
@@ -1658,8 +1670,18 @@ class KimiDecoderLayer(nn.Module):
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
             call=2 * self.layer_idx,
+            prefix_out=self._take_aux_prefix_out(),
         )
         return hidden_states, prefix_sum, residual
+
+    def _take_aux_prefix_out(self) -> torch.Tensor | None:
+        """The aux capture buffer this forward's pre-attention AttnRes writes
+        its updated prefix to (consumed once), or None."""
+        dst = self._aux_prefix_out
+        if dst is not None:
+            self._aux_prefix_out = None
+            self._aux_prefix_used = True
+        return dst
 
     def _post_attn_norm(
         self,
@@ -1799,7 +1821,9 @@ class KimiDecoderLayer(nn.Module):
         """``_pre_attn_norm`` (``pre``) / ``_post_attn_norm`` AttnRes with
         the MXFP8 output (BF16 output only after attention)."""
         if prefill_attn_res_lp.active(residual, prefix_sum):
-            prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
+            prefix_out = self._take_aux_prefix_out() if pre else None
+            if prefix_out is None:
+                prefix_out = prefill_attn_res_dielocal.prefix_out(prefix_sum, residual)
             new_prefix = prefix_sum if prefix_out is None else prefix_out
             if pre:
                 delta = hidden_states
@@ -2076,6 +2100,27 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def _aux_attn_res_stream(self) -> bool:
         return envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM
 
+    def _aux_from_next_attn_res(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor | None,
+    ) -> bool:
+        """Whether the aux state after ``layer_idx`` (prefix_sum + the pending
+        MLP output) is captured as the updated prefix the next AttnRes call of
+        this rank writes (prefill forwards on the attn_res_lp plan with the
+        die-local buffers: the call after it then writes the die-local prefix
+        buffer, never the capture in place)."""
+        return (
+            self.use_attn_res
+            and not self._aux_attn_res_stream
+            and prefix_sum is not None
+            and block_residual is not None
+            and (layer_idx + 1 < self.end_layer or get_pp_group().is_last_rank)
+            and prefill_attn_res_lp.active(block_residual, prefix_sum)
+            and prefill_attn_res_dielocal.kernel_args(block_residual)[0] is not None
+        )
+
     def _capture_aux_hidden_stream(
         self,
         layer_idx: int,
@@ -2200,18 +2245,39 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = None
             residual = block_residual
 
+        # Prefill (attn_res_lp plan): the aux state after layer i is the prefix
+        # the next AttnRes call (layer i + 1's pre-attention one, or the final
+        # one) writes anyway (prefix + MLP output, one BF16 add): that call
+        # writes it to a fresh buffer instead of the die-local prefix buffer
+        # (the call after it moves the prefix back), so the capture costs no
+        # extra pass over [tokens, hidden].
+        aux_dst: torch.Tensor | None = None
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
+            if aux_dst is not None:
+                layer._aux_prefix_out = aux_dst
+                layer._aux_prefix_used = False
             hidden_states, prefix_sum, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 prefix_sum=prefix_sum,
                 residual=residual,
             )
+            if aux_dst is not None:
+                layer._aux_prefix_out = None
+                if not layer._aux_prefix_used:
+                    raise RuntimeError(
+                        f"Kimi K3 aux capture: layer {layer_idx} did not write the "
+                        "aux state (its pre-attention AttnRes left the LP kernel)"
+                    )
+                aux_hidden_states.append(aux_dst)
+                aux_dst = None
             if (layer_idx + 1) in self.aux_hidden_state_layers:
-                if self.use_attn_res:
+                if self._aux_from_next_attn_res(layer_idx, prefix_sum, residual):
+                    aux_dst = torch.empty_like(prefix_sum)
+                elif self.use_attn_res:
                     assert prefix_sum is not None
                     assert residual is not None
                     aux_hidden_state = self._capture_aux_hidden_stream(
@@ -2253,7 +2319,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
                 call=2 * self.end_layer,
+                prefix_out=aux_dst,
             )
+            if aux_dst is not None:  # the last layer is an aux layer
+                aux_hidden_states.append(aux_dst)
+                aux_dst = None
         else:
             hidden_states = hidden_states + residual
 

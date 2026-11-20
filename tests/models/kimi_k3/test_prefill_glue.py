@@ -266,3 +266,93 @@ def test_rope_store_kv_matches_rotary_and_cache(pg, rows, block_size):
     assert pg.use_rope_store_kv(k, v, positions, cos_sin, slots, ok, ov)
     pg.rope_store_kv(k, v, positions, cos_sin, slots, ok, ov)
     assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("rows", [4096, 6156])
+def test_rms_norm_cta_7168_matches_vllm_c(pg, rows):
+    """The DSpark hidden_norm (7168 columns: 8-warp stock blocks, 4 vectors per
+    lane) on the persistent one-row-per-CTA replay, written in place."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(rows)
+    x = torch.randn(rows, 7168, device="cuda", dtype=torch.bfloat16) * 3
+    x[0] = 0
+    x[1, :8] = 3.0e38
+    w = (torch.rand(7168, device="cuda") + 0.5).to(torch.bfloat16)
+    assert pg.use_rms_norm(x, w)
+    assert not pg.use_rms_norm(x[: pg.RMS_NORM_CTA_MIN_ROWS - 1], w)
+    ref = torch.empty_like(x)
+    ops.rms_norm(ref, x, w, 1e-6)
+    out = torch.full((rows + 3, 7168), 7.0, device="cuda", dtype=torch.bfloat16)
+    pg.rms_norm(x, w, 1e-6, out=out[:rows])
+    assert torch.equal(_bits(out[:rows]), _bits(ref))
+    assert bool((out[rows:] == 7.0).all())
+
+
+@pytest.mark.parametrize("rows", [5, 6156])
+def test_gather_rows_multi_matches_cat(pg, rows):
+    """Five aux states (contiguous and row-strided views) gathered into one
+    packed buffer == torch.cat([h[index] ...], dim=-1)."""
+    torch.manual_seed(rows)
+    tokens, width = 16384, 7168
+    base = torch.randn(tokens, 2 * width, device="cuda", dtype=torch.bfloat16)
+    srcs = [torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    srcs += [base[:, :width], base[:, width:]]
+    index = torch.randperm(tokens, device="cuda")[:rows].sort().values
+    assert pg.use_gather_rows_multi(srcs, index)
+    ref = torch.cat([h[index] for h in srcs], dim=-1)
+    out = pg.gather_rows_multi(srcs, index)
+    assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("rows,block_size", [(6156, 16), (2048, 64), (37, 16)])
+def test_ctx_kv_insert_matches_per_layer(pg, rows, block_size):
+    """One-launch context K/V insert of 5 draft layers == per layer: per-head K
+    RMSNorm (_C.rms_norm on [rows * heads, head_dim]), NeoX ops.rotary_embedding
+    and reshape_and_cache_flash; skipped (-1) slots, a layer without a cache, a
+    layer with fewer slots than rows."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(rows + block_size)
+    layers, nkv, hd, max_pos, eps = 5, 16, 64, 1 << 17, 1e-6
+    kv = torch.randn(rows, layers, 2, nkv, hd, device="cuda", dtype=torch.bfloat16) * 2
+    kv[0, 1, 0, :, :4] = 3.0e38
+    kv[min(1, rows - 1), 3, 0, 2] = 0
+    positions = torch.randint(0, max_pos, (rows,), device="cuda", dtype=torch.int64)
+    inv = 1.0 / (50000.0 ** (torch.arange(0, hd, 2, device="cuda").float() / hd))
+    freqs = torch.arange(max_pos, device="cuda").float()[:, None] * inv[None]
+    cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.bfloat16)
+    weights = [(torch.rand(hd, device="cuda") + 0.5).to(torch.bfloat16) for _ in range(layers)]
+    blocks = rows // block_size + 8
+    refs, outs, slots, caches = [], [], [], []
+    for i in range(layers):
+        if i == 2:
+            refs.append(None)
+            outs.append(None)
+            slots.append(None)
+            caches.append(None)
+            continue
+        n = rows - 3 if (i == 4 and rows > 8) else rows
+        s = torch.randperm(blocks * block_size, device="cuda")[:n]
+        s[::7] = -1
+        ref = torch.randn(blocks, nkv, block_size, 2 * hd, device="cuda").to(torch.bfloat16)
+        refs.append(ref)
+        outs.append(ref.clone())
+        slots.append(s)
+        caches.append(tuple(outs[-1].transpose(1, 2).split(hd, dim=-1)))
+    scale = torch.ones((), device="cuda")
+    for i in range(layers):
+        if refs[i] is None:
+            continue
+        n = slots[i].numel()
+        k = torch.empty(rows * nkv, hd, device="cuda", dtype=torch.bfloat16)
+        ops.rms_norm(k, kv[:, i, 0].reshape(rows * nkv, hd), weights[i], eps)
+        k = k.view(rows, nkv, hd)[:n].clone()
+        ops.rotary_embedding(positions[:n], k.view(n, nkv * hd), None, hd, cos_sin, True)
+        rk, rv = refs[i].transpose(1, 2).split(hd, dim=-1)
+        ops.reshape_and_cache_flash(k, kv[:n, i, 1], rk, rv, slots[i], "auto", scale, scale)
+    assert pg.use_ctx_kv_insert(kv, weights, eps, positions, cos_sin, slots, caches)
+    pg.ctx_kv_insert(kv, weights, eps, positions, cos_sin, slots, caches)
+    for i in range(layers):
+        if refs[i] is not None:
+            assert torch.equal(_bits(outs[i]), _bits(refs[i])), f"layer {i}"

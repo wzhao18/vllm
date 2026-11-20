@@ -263,25 +263,33 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
         # The context K/V insert of the fused GQA attention (or None).
         self._fast_context_kv = None
 
-    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """hidden_norm(fc(hidden_states)) [rows, hidden]."""
+    def combine(
+        self, hidden_states: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """hidden_norm(fc(hidden_states)) [rows, hidden], written to ``out`` (a
+        contiguous [rows, hidden] buffer) when given."""
         fast = self._fast_context
         if fast is not None:
             combined = fast.combine(hidden_states)
             if combined is not None:
-                return combined
+                if out is None:
+                    return combined
+                return out.copy_(combined)
         projected = self.fc(hidden_states.to(self.fc.params_dtype))
-        return self.normalize(projected)
+        return self.normalize(projected, out=out)
 
-    def normalize(self, rows: torch.Tensor) -> torch.Tensor:
+    def normalize(
+        self, rows: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """``hidden_norm`` with the stock context step's kernel (``ops.rms_norm``),
         or its bitwise-equal prefill replay on long context steps."""
         weight = self.hidden_norm.weight.data
+        if out is None:
+            out = torch.empty_like(rows)
         if prefill_glue.use_rms_norm(rows, weight):
             return prefill_glue.rms_norm(
-                rows, weight, self.hidden_norm.variance_epsilon
+                rows, weight, self.hidden_norm.variance_epsilon, out=out
             )
-        out = torch.empty_like(rows)
         ops.rms_norm(
             out, rows, self.hidden_norm.weight.data, self.hidden_norm.variance_epsilon
         )
@@ -410,6 +418,17 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
                 "Kimi K3 DSpark context K/V: projection layout "
                 f"{tuple(kv.shape)} / {kv.stride()} after the coverage check"
             )
+        weights = [self._k_norm_weights[i] for i in range(layers)]
+        if prefill_glue.use_ctx_kv_insert(
+            kv, weights, self._rms_norm_eps, positions, cos_sin, slots, caches
+        ):
+            # Every layer's K norm + RoPE + insert in one launch (bitwise the
+            # per-layer pair below).
+            prefill_glue.ctx_kv_insert(
+                kv, weights, self._rms_norm_eps, positions, cos_sin, slots, caches
+            )
+            logger.info_once("Kimi K3.1 DSpark context K/V: one-launch insert")
+            return True
         for i in range(layers):
             if caches[i] is None:
                 continue
@@ -537,9 +556,11 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
 
         return super().load_weights(checked(weights))
 
-    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(
+        self, hidden_states: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """hidden_norm(fc(cat(aux))): the context rows, normalized (module
-        docstring)."""
+        docstring); written to ``out`` ([rows, hidden], contiguous) when given."""
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
@@ -549,8 +570,38 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
                 f"DSpark drafter expects {expected} concatenated aux hidden "
                 f"features but received {hidden_states.shape[-1]}."
             )
-        result = self.model.combine(hidden_states)
+        if out is not None and (
+            needs_squeeze
+            or not out.is_contiguous()
+            or out.shape != (hidden_states.shape[0], self.model.fc.output_size)
+        ):
+            raise ValueError(
+                f"DSpark combine: out {tuple(out.shape)} / {out.stride()} for "
+                f"{tuple(hidden_states.shape)} rows"
+            )
+        result = self.model.combine(hidden_states, out=out)
         return result.squeeze(0) if needs_squeeze else result
+
+    def gather_aux_rows(
+        self, aux_hidden_states: list[torch.Tensor], index: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """The DFlash window context rows ``[h[index] for h in aux]`` as adjacent
+        column blocks of one row-major buffer (the stock ``gather_aux_rows``
+        contract: the fc reads them without a concat), every aux layer in one
+        launch (``prefill_glue.gather_rows_multi``)."""
+        if not prefill_glue.use_gather_rows_multi(aux_hidden_states, index):
+            from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+                gather_aux_rows,
+            )
+
+            _uncovered(aux_hidden_states[0], "aux row gather layout")
+            return gather_aux_rows(aux_hidden_states, index)
+        packed = prefill_glue.gather_rows_multi(aux_hidden_states, index)
+        width = aux_hidden_states[0].shape[1]
+        return [
+            packed[:, i * width : (i + 1) * width]
+            for i in range(len(aux_hidden_states))
+        ]
 
     def combine_aux_rows(
         self,
@@ -571,7 +622,11 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         tp = get_tensor_model_parallel_world_size()
         if tp == 1 or num_rows < tp * _CONTEXT_ROW_SHARD_MIN_ROWS:
             rows = _aux_rows(aux_hidden_states, start, end)
-            out.copy_(self.combine_hidden_states(rows))
+            if out.is_contiguous():
+                # The norm writes the speculator's rows directly (no copy).
+                self.combine_hidden_states(rows, out=out)
+            else:
+                out.copy_(self.combine_hidden_states(rows))
             return
         chunk = -(-num_rows // tp)
         lo = start + get_tensor_model_parallel_rank() * chunk
