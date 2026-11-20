@@ -148,7 +148,8 @@ class SpDenseMlp:
             op = dfl.DenseFlow(bucket, hidden, inter, beta, linear, nbA0=nbA0, nbB0=nbB0,
                                two_dies=two)  # fmt: skip
             ws_bytes = max(ws_bytes, op.ws_bytes(self.s0 + self.s1))
-            self.kernels[bucket] = (op, dfl.flow_tables(op, self.domains, None, device))
+            self.kernels[bucket] = (op, dfl.flow_tables(op, self.domains, None, device,
+                                                        whole=True))
         self.ws = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
         for bucket, (op, tables) in list(self.kernels.items()):
             x = torch.zeros(bucket, hidden, dtype=torch.bfloat16, device=device)

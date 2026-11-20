@@ -198,13 +198,14 @@ class DenseFlow:
     call (``nrows`` <= ``rows``) is a launch argument."""
 
     def __init__(self, rows, hidden, inter, beta=1.0, linear_beta=-1.0, nbA0=None,
-                 nbB0=None, two_dies=True, debug=0):  # fmt: skip
+                 nbB0=None, two_dies=True, debug=0, host_stamps=0):  # fmt: skip
         assert supports(rows, hidden, inter), (rows, hidden, inter)
         self.rows, self.hidden, self.inter = rows, hidden, inter
         self.t_mma = -(-rows // 16) * 16
         self.t_pad = self.t_mma + 4
         self.consts = situ_constants(beta, linear_beta)
         self.debug = debug
+        self.host_stamps = host_stamps  # diagnostics: host-mapped stamp buffer address
         self.nbA, self.nbB = inter // 64, hidden // 128
         self.ktA, self.ktB = hidden // K_TILE, inter // K_TILE
         if two_dies:
@@ -648,6 +649,19 @@ class DenseFlow:
                     if _atom_add(sync + END * 4, 1) == s0 + s1 - 1:  # every CTA done
                         _st_relaxed(sync + END * 4, 0)
                         _st_relaxed(sync + EPOCH * 4, epoch + 1)
+        if cutlass.const_expr(self.host_stamps != 0 and (self.debug & ds.STAMPS)):
+            # diagnostics: this CTA's stamps + times to a host-mapped buffer at exit
+            cute.arch.barrier()
+            if warp == 0:
+                if lane < STAMP_WORDS // 2:
+                    src = sync + STAMP_BASE * 4 + Int64(slot) * STAMP_WORDS * 4 + lane * 8
+                    dst = Int64(self.host_stamps) + Int64(slot) * STAMP_WORDS * 4 + lane * 8
+                    _st_u64(dst, _ld_u64(src))
+                elif lane < STAMP_WORDS // 2 + 2:
+                    src = sync + TIMES * 4 + Int64(slot) * 16 + (lane - STAMP_WORDS // 2) * 8
+                    dst = (Int64(self.host_stamps) + MAX_SLOTS * STAMP_WORDS * 4
+                           + Int64(slot) * 16 + (lane - STAMP_WORDS // 2) * 8)  # fmt: skip
+                    _st_u64(dst, _ld_u64(src))
 
     @cute.jit
     def epilogue(
@@ -733,25 +747,33 @@ class DenseFlow:
                     if (_lds_s32(bp + p * 4) < _lds_s32(bp + p * 4 + 4)) & (
                             nst < self.nstage_p):  # fmt: skip
                         nst += 1
+            # Every partial acquired in ONE warp, one lane per later range, polled in
+            # parallel: a generic round trip queues behind the weight streams (D25), so
+            # per-partial (or per-thread) acquire chains cost one round trip each.
+            if tid < 32:
+                pl = r + 1 + tid
+                late = Int32(0)
+                if pl <= last:
+                    if _lds_s32(bp + pl * 4) < _lds_s32(bp + pl * 4 + 4):
+                        late = Int32(1)
+                while _ballot(late) != 0:
+                    if late != 0:
+                        if _ld_acquire(flags + Int64(slot_base + pl) * 4) != 0:
+                            late = Int32(0)
                 if tid == 0:
                     if nst > 0:
+                        _fence_proxy_global()
                         cute.arch.mbarrier_arrive_and_expect_tx(staged, nst * part)
-                    j = Int32(0)
-                    for p in cutlass.range(r + 1, last + 1, unroll=1):
-                        if (_lds_s32(bp + p * 4) < _lds_s32(bp + p * 4 + 4)) & (j < nst):
-                            while _ld_acquire(flags + Int64(slot_base + p) * 4) == 0:
-                                pass
-                            _fence_proxy_global()
-                            src = wsp + Int64(slot_base + p) * part
-                            for o in cutlass.range_constexpr(-(-part // BULK)):
-                                n_o = min(BULK, part - o * BULK)
-                                _bulk_load(sp + j * part + o * BULK, src + o * BULK, n_o,
-                                           staged)  # fmt: skip
-                            j += 1
-            for p in cutlass.range(r + 1, last + 1, unroll=1):  # acquire every partial
-                if _lds_s32(bp + p * 4) < _lds_s32(bp + p * 4 + 4):
-                    while _ld_acquire(flags + Int64(slot_base + p) * 4) == 0:
-                        pass
+                        j = Int32(0)
+                        for p in cutlass.range(r + 1, last + 1, unroll=1):
+                            if (_lds_s32(bp + p * 4) < _lds_s32(bp + p * 4 + 4)) & (j < nst):
+                                src = wsp + Int64(slot_base + p) * part
+                                for o in cutlass.range_constexpr(-(-part // BULK)):
+                                    n_o = min(BULK, part - o * BULK)
+                                    _bulk_load(sp + j * part + o * BULK, src + o * BULK,
+                                               n_o, staged)  # fmt: skip
+                                j += 1
+            self.gbar(grp)
             if nst > 0:
                 cute.arch.mbarrier_wait(staged, 0)
             tf = _now()
@@ -928,7 +950,8 @@ def compile_dense_flow(op: DenseFlow, wa, x, wb, h, y, ws, sync, table, ranges, 
     """Compile once per specialization; returns (launcher, tensor args): call as
     ``fn(*args, Int32(s0), Int32(s1), Int32(nrows), stream)``."""
     as_cute = ds.as_cute
-    key = (op.rows, op.hidden, op.inter, op.consts, op.debug, op.nbA0, op.nbB0)
+    key = (op.rows, op.hidden, op.inter, op.consts, op.debug, op.nbA0, op.nbB0,
+           op.host_stamps)  # fmt: skip
     args = (as_cute(wa, k_major=True), as_cute(x, k_major=True), as_cute(wb, k_major=True),
             as_cute(h, k_major=True), as_cute(y, rows=True), as_cute(ws), as_cute(sync),
             as_cute(table), as_cute(ranges), as_cute(perm))  # fmt: skip
@@ -988,8 +1011,14 @@ def _split_work(blocks, kt, ub, w):
     total = blocks * kt + ub
     want = [blocks * wi / tw for wi in w]
     nb = [int(x) for x in want]
+    # The extra blocks go to evenly spread slots, so short down windows (SMs with an
+    # extra block) alternate with long ones: every output block spans few down ranges
+    # (each later range is one partial its head stages).
     order = sorted(range(n), key=lambda i: want[i] - nb[i], reverse=True)
-    for i in order[: blocks - sum(nb)]:
+    extra = blocks - sum(nb)
+    if extra > 0 and all(abs(x - want[0]) < 1e-9 for x in want):
+        order = sorted({(i * n) // extra for i in range(extra)})
+    for i in order[:extra]:
         nb[i] += 1
     share = [total * wi / tw for wi in w]
     bu = [max(0.0, share[i] - nb[i] * kt) for i in range(n)]
@@ -1038,6 +1067,10 @@ def flow_tables(op: DenseFlow, domains, weights=None, device=None, whole=False):
             table[sm] = torch.tensor([rr + (s0 if die else 0), a[rr], a[rr + 1], b[rr],
                                       b[rr + 1], 0, 0, 0])  # fmt: skip
             assert b[rr + 1] - b[rr] <= MAX_WIN, (b[rr + 1] - b[rr], MAX_WIN)
+        for bd, kt in ((a, op.ktA), (b, op.ktB)):  # one acquiring lane per later range
+            for lo in range(0, bd[-1], kt):
+                n = sum(1 for rr in range(len(bd) - 1) if bd[rr] < lo + kt and bd[rr + 1] > lo)
+                assert n <= 33, (die, lo, n)
         ranges[die * (MAX_DIE + 1): die * (MAX_DIE + 1) + len(a)] = torch.tensor(a)
         o = (2 + die) * (MAX_DIE + 1)
         ranges[o: o + len(b)] = torch.tensor(b)

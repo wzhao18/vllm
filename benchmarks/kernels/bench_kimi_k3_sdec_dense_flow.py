@@ -229,6 +229,14 @@ def main():
                             v = stp[:, i] / 1e3
                             txt.append(f"{nm} {v.min():.1f}/{v.median():.1f}/{v.max():.1f}")
                         print(f"T{T} d{debug} {name} stamps: " + "  ".join(txt), flush=True)
+                        tab0 = tab[0].cpu()
+                        for sl in (stp[:, 6] - t0s).argsort(descending=True)[:3].tolist():
+                            sm = int(stp[sl, 8])
+                            row = tab0[sm].tolist()[:5]
+                            v = [(stp[sl, i] - t0s) / 1e3 for i in (2, 3, 1, 6)]
+                            print(f"   late slot {sl} smid {sm} row {row} A_end {v[0]:.1f} "
+                                  f"A_epi {v[1]:.1f} mma_end {v[2]:.1f} end {v[3]:.1f}",
+                                  flush=True)  # fmt: skip
         except Exception:
             traceback.print_exc()
             sys.stdout.flush()
