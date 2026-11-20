@@ -125,6 +125,7 @@ class SharedExpertStreamMixin:
         self._shared_stage = None
         self._shared_next = None
         self._routed_done = None
+        self._static_first = None
         self.shared_fc2_position = None
         self._shared_fc1_swizzle = 0
         if not (impl_desc.get("shared_expert_stream", False) and problem_desc.get("shared_expert", False)):
@@ -188,6 +189,7 @@ class SharedExpertStreamMixin:
             # Grid-stride only: this cluster's next shared id in the current stage.
             self._shared_next = Int32(block_idx[2])
             self._routed_done = Boolean(False)
+            self._static_first = Int32(1)
 
     @cute.jit
     def _wait_expert_sizes_ready(self, sizes_ready: Boolean) -> Boolean:
@@ -287,13 +289,18 @@ class SharedExpertStreamMixin:
                         work_id_worker, stage, next_id, 1
                     )
         self._shared_stage = stage
+        self._static_first = Int32(0)  # DIAG STATIC1: only the first claim may be static
         self._shared_next = next_id
         self._routed_done = routed_done
         self._work_id_worker = work_id_worker
         return work_tile
 
     def _shared_carried_names(self) -> tuple:
-        return ("_shared_stage", "_shared_next", "_routed_done") if self.shared_fc2_position is not None else ()
+        return (
+            ("_shared_stage", "_shared_next", "_routed_done", "_static_first")
+            if self.shared_fc2_position is not None
+            else ()
+        )
 
     def _extract_shared_stream_values(self) -> list:
         values = list(extract_mlir_values(self._expert_sizes_ready))

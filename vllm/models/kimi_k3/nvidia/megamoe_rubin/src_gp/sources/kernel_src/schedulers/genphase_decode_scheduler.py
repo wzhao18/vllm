@@ -153,6 +153,7 @@ from .fc12_scheduler import (
     shared_expert_problem_requirements,
 )
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
+from ....common.ptx_helpers import read_smid
 
 # The policy: (side, phase) per source; side 0 = this CTA's die (die-blind: the one stream), 1 = the other die;
 # phase 0 = FC1, 1 = FC2. Safety-critical: n_split never claims the other die's FC1 (K6 and the argument above).
@@ -494,7 +495,8 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
         half = feature_blocks // 2
         count = Int32(half) + Int32(feature_blocks - 2 * half) * side
         base = Int32(half) * side
-        local_id = work_id_worker.claim_next_work(self._shared_stream_index + side)
+        # DIAG STATIC1: ids [0, half) of each die half are the early pairs' static first units.
+        local_id = work_id_worker.claim_next_work(self._shared_stream_index + side) + Int32(half)
         shared_id = Int32(-1)
         if local_id < count * Int32(self.shared_token_blocks):
             token_block = local_id // count
@@ -517,9 +519,17 @@ class GenphaseDecodeFc12Scheduler(SharedExpertStreamMixin, SchedulerBase):
                 stage = stage + Int32(1)
         else:
             own = Int32(self._mapping.owner_index)
-            shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
-            if shared_id < Int32(0):
-                shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
+            # DIAG STATIC1: the first claim of an early pair is static (no round trip).
+            st_half = Int32(self._shared_feature_blocks[0] // 2)
+            st_tpc = read_smid() // Int32(2)
+            st_die = st_tpc % Int32(2)
+            st_rank = (st_tpc - Int32(10) - st_die) // Int32(2)
+            st_on = self._static_first * Int32(st_tpc >= Int32(10)) * Int32(st_rank < st_half)
+            shared_id = st_half * st_die + st_rank
+            if st_on == Int32(0):
+                shared_id, work_id_worker = self._claim_die_half(work_id_worker, own)
+                if shared_id < Int32(0):
+                    shared_id, work_id_worker = self._claim_die_half(work_id_worker, Int32(1) - own)
             if shared_id >= Int32(0):
                 work_tile = self._decode_shared_tile(shared_id, 0)
             else:
