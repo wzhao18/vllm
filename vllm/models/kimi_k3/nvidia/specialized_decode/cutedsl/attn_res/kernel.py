@@ -91,19 +91,22 @@ class ClusterAttnRes:
     def __init__(
         self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
         stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
-        out_mc=False, out_mx=None,
+        out_mc=False, out_mx=None, poll_sleep=0,
     ):  # fmt: skip
+        # ``poll_sleep`` (ns): back off between Lamport re-polls (``common.mailbox``).
+        self.poll_sleep = poll_sleep
         # ``out_mc`` (row-sharded AttnRes, M >= 256, ``attn_res.sharded``): the output
         # row (and the aux rows) go to every rank's Lamport all-gather row row0 + token
         # at the trailing multicast address (the aux args are multicast addresses too)
         # instead of ``output`` (-0 halves made +0: the sentinel's word).
         self.out_mc = out_mc
-        # ``out_mx`` ("publish" / "store"): the normed output row goes out as MXFP8
-        # (``common.mx_rows``: FP8 data [rows, 7168] + F8_128x4 E8M0 scales) instead
-        # of BF16: "publish" multicasts it into every rank's Lamport MXFP8 box row
-        # row0 + token (output = (data mc, row0, scale mc)), "store" writes BF16
+        # ``out_mx`` ("publish" / "store" / "stage"): the normed output row goes out
+        # as MXFP8 (``common.mx_rows``: FP8 data [rows, 7168] + F8_128x4 E8M0 scales)
+        # instead of BF16: "publish" multicasts it into every rank's Lamport MXFP8 box
+        # row row0 + token (output = (data mc, row0, scale mc)), "store" writes BF16
         # ``output`` and also its MXFP8 row token locally (output = (tensor, data
-        # address, scale address)).
+        # address, scale address)), "stage" leaves the CTA's 1024 columns in shared
+        # staging for one counted fabric put (output = (data words, scale words)).
         self.out_mx = out_mx
         # ``poll_warp`` (Rubin): the delta's Lamport poll exits by a warp vote
         # (``common.mailbox.poll_warp``), so the exchange's shuffles that follow do not
@@ -278,9 +281,9 @@ class ClusterAttnRes:
             cur.fill(0)
             base = delta.iterator + token * 7168 + col
             if cutlass.const_expr(self.poll_warp):
-                got = poll_warp(base, delta.shape[1] * 7168, self.slots)
+                got = poll_warp(base, delta.shape[1] * 7168, self.slots, self.poll_sleep)
             else:
-                got = poll(base, delta.shape[1] * 7168, self.slots)
+                got = poll(base, delta.shape[1] * 7168, self.slots, self.poll_sleep)
             for slot in cutlass.range_constexpr(self.slots):
                 rearm(base + slot * delta.shape[1] * 7168)
                 part = cute.make_rmem_tensor((1, 8), Float32)
@@ -360,6 +363,9 @@ class ClusterAttnRes:
             if cutlass.const_expr(self.out_mx == "publish"):
                 mc, row0, smc = output
                 mx_rows.publish(values, mc, smc, row0 + token, col, 7168)
+            elif cutlass.const_expr(self.out_mx == "stage"):
+                data, scales = output  # shared staging of one counted put
+                mx_rows.stage(values, data, scales, tid)
             else:
                 out, data, scale = output
                 store_words(at(out, token, col), tuple(words[j] for j in range(4)))

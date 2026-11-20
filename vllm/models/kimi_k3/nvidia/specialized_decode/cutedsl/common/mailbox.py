@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Uint32
 
-from .primitives import load_words, published, store_relaxed
+from .primitives import load_words, published, sleep_ns, store_relaxed
 
 SENTINEL = 0x80000000
 
@@ -26,7 +26,8 @@ def fetch(values, i: cutlass.Constexpr[int], pointer):
 
 
 @cute.jit
-def poll_warp(base, stride, count: cutlass.Constexpr[int]):
+def poll_warp(base, stride, count: cutlass.Constexpr[int],
+              sleep: cutlass.Constexpr[int] = 0):
     """``poll`` whose loop exit is a warp vote: every lane re-polls its dirty fragments
     until no lane has one, so the lanes leave together. A warp-collective step after
     a per-lane poll loop (shuffles, MMA) waits ~1000-1500 cycles for the lanes to
@@ -37,6 +38,8 @@ def poll_warp(base, stride, count: cutlass.Constexpr[int]):
     for i in cutlass.range_constexpr(count):
         pending = pending | fetch(values, i, base + i * stride)
     while not cute.arch.vote_all_sync(pending == 0):
+        if cutlass.const_expr(sleep > 0):  # back off: the poll loads compete with ingress
+            sleep_ns(sleep)
         again = Uint32(0)
         for i in cutlass.range_constexpr(count):
             if (pending >> i) & 1:
@@ -46,7 +49,7 @@ def poll_warp(base, stride, count: cutlass.Constexpr[int]):
 
 
 @cute.jit
-def poll(base, stride, count: cutlass.Constexpr[int]):
+def poll(base, stride, count: cutlass.Constexpr[int], sleep: cutlass.Constexpr[int] = 0):
     """Lamport-poll ``count`` 16-byte fragments at base + i*stride (elements); all
     loads issue before any check and only dirty fragments re-poll."""
     values = cute.make_rmem_tensor((count, 4), Uint32)
@@ -54,6 +57,8 @@ def poll(base, stride, count: cutlass.Constexpr[int]):
     for i in cutlass.range_constexpr(count):
         pending = pending | fetch(values, i, base + i * stride)
     while pending != 0:
+        if cutlass.const_expr(sleep > 0):
+            sleep_ns(sleep)
         again = Uint32(0)
         for i in cutlass.range_constexpr(count):
             if (pending >> i) & 1:

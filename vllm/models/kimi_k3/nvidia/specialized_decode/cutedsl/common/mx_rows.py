@@ -24,7 +24,9 @@ import cutlass.cute as cute
 from cutlass import Float32, Int64, Uint32
 
 from .mailbox import SENTINEL
-from .primitives import asm, bits_float, multicast_words, pack_fp8, store_words
+from .primitives import (
+    asm, bits_float, load_words, multicast_words, pack_fp8, sleep_ns, store_words,
+)
 
 BLOCK = 32
 SCALE_SENTINEL = 0xFFFFFFFF
@@ -156,6 +158,32 @@ def publish(values, data_mc, scale_mc, row, col, width: cutlass.Constexpr[int]):
 
 
 @cute.jit
+def stage(values, data, scales, tid):
+    """``publish`` into shared staging for one counted fabric put per CTA (the
+    counted all-gather, ``attn_res.sp_fused``): this lane's 8 FP8 columns at
+    ``data`` words 2 tid, 2 tid + 1 (the CTA's 1024 columns in order) and, on the
+    scale-owning lanes, the word of 4 E8M0 scales of its 128 columns at ``scales``
+    word tid // 16 (row-major: the swizzled F8_128x4 words mix four rows, so they
+    cannot be put in place)."""
+    w0, w1, word = quantize8(values)
+    data[2 * tid] = w0
+    data[2 * tid + 1] = w1
+    if lane_owns_scale():
+        scales[tid // 16] = word
+
+
+@cute.jit
+def unstage_scale(staged, scale, row, part, i, width: cutlass.Constexpr[int]):
+    """Move staged scale word ``i`` of (``row``, 1024-column ``part``) from the
+    row-major staging [rows, width / 1024, 8] words at ``staged`` (byte address)
+    into the F8_128x4 region at ``scale`` (plain local loads / stores, after the
+    counted wait)."""
+    word = load_words(staged + (Int64(row) * (width // 1024) + part) * 32 + i * 4, count=1, mutable=True)
+    where = scale_offset(row, (part * 1024 + i * 128) // BLOCK, width // BLOCK)
+    store_words(scale + where, (word[0],))
+
+
+@cute.jit
 def store(values, data, scale, row, col, width: cutlass.Constexpr[int]):
     """``publish`` into this GPU's own buffers (plain stores, no Lamport box)."""
     w0, w1, word = quantize8(values)
@@ -188,7 +216,7 @@ def _landed(data, scale, row, col, width: cutlass.Constexpr[int]):
 
 @cute.jit
 def poll(data, scale, first, stride, count: cutlass.Constexpr[int], col,
-         width: cutlass.Constexpr[int]):  # fmt: skip
+         width: cutlass.Constexpr[int], sleep: cutlass.Constexpr[int] = 0):  # fmt: skip
     """Lamport-poll this lane's columns of rows first + i stride, i < count, of the
     local MXFP8 box until all landed (data words and scale words)."""
     pending = Uint32(0)
@@ -196,6 +224,8 @@ def poll(data, scale, first, stride, count: cutlass.Constexpr[int], col,
         if not _landed(data, scale, first + i * stride, col, width):
             pending = pending | Uint32(1 << i)
     while pending != 0:
+        if cutlass.const_expr(sleep > 0):
+            sleep_ns(sleep)
         again = Uint32(0)
         for i in cutlass.range_constexpr(count):
             if (pending >> i) & 1:

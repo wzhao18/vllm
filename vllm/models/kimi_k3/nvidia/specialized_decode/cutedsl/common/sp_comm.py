@@ -57,6 +57,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.logger import init_logger
+
 from ...shapes import Choice, Path, Unsupported
 from ...symm import multicast_rendezvous, peer_rendezvous
 from . import mx_rows
@@ -77,6 +79,8 @@ from .primitives import (
     zeros,
 )
 from .twoshot import poll_slots
+
+logger = init_logger(__name__)
 
 SENTINEL = -0x80000000  # the Lamport arm word (int32); 0x80000000 as Uint32
 THREADS = 256
@@ -460,13 +464,55 @@ class SpComm:
         ]  # fmt: skip
         self._mx_views: dict = {}
         self._rank = Int32(rank)
+        self._counted_box(group, device, parities, rows_cap, width)
+
+    def _counted_box(self, group, device, parities, rows_cap, width):
+        """The MXFP8 all-gather box as a counted fabric window (``fabric``), when the
+        group supports counted fabric operations (``counted``): per parity, at window
+        offset ``DATA + p * mx_pitch`` of every rank's multicast replica, FP8 data
+        [rows_cap, width], the row-major scale staging [rows_cap, width / 1024, 32 B]
+        and the F8_128x4 scales; the parity's byte counter is window counter p. A
+        group without counted operations keeps the Lamport box (a capability, as
+        ``FabricWindow`` reports it; the choice is logged)."""
+        from ... import fabric as host_fabric
+
+        staging = rows_cap * (width // 1024) * 32
+        pitch = rows_cap * width + staging + self.mx_scale_bytes
+        self.mx_pitch = -(-pitch // 4096) * 4096
+        self.counted, self.window = False, None
+        try:
+            self.window = host_fabric.FabricWindow(
+                group, parities * self.mx_pitch, multicast=True, device=device
+            )
+        except host_fabric.FabricUnavailable as error:
+            logger.info("SP MXFP8 all-gather: Lamport multicast box (%s)", error)
+            return
+        self.counted = True
+        self.window.mc_local.zero_()
+        replica = self.window.mc_local.data_ptr()
+        data = host_fabric.DATA
+        self._mx_counted = [
+            (
+                Int64(data + p * self.mx_pitch),  # window offset of the box
+                Int64(host_fabric.FabricWindow.counter(p)),
+                Int64(replica + data + p * self.mx_pitch),  # local box address
+                Int64(replica + host_fabric.FabricWindow.counter(p)),
+                Int32(self.window.multicast),
+            )
+            for p in range(parities)
+        ]
+        logger.info("SP MXFP8 all-gather: counted multimem fabric puts")
 
     def nbytes(self) -> int:
         return sum(t.numel() * 2 for t in (self.box, self.recv, self.partial))
 
     def mx_addresses(self, parity: int):
         """(data multicast, scale multicast, local data, local scales) addresses of
-        the MXFP8 form of ``parity``'s box (kernel arguments)."""
+        the MXFP8 form of ``parity``'s box (kernel arguments); with ``counted``,
+        (window offset of the box, counter offset, local box, local counter,
+        multicast endpoint)."""
+        if self.counted:
+            return self._mx_counted[parity]
         return self._mx[parity]
 
     def mx_view(self, parity: int, rows: int):
@@ -480,14 +526,22 @@ class SpComm:
             from ....ops import mxfp8_act
 
             self.shard(rows)
-            flat = self.box[parity].view(torch.uint8).reshape(-1)
+            if self.counted:
+                from ... import fabric as host_fabric
+
+                begin = host_fabric.DATA + parity * self.mx_pitch
+                flat = self.window.mc_local[begin : begin + self.mx_pitch]
+                staging = self.rows_cap * (self.width // 1024) * 32
+                start = self.rows_cap * self.width + staging  # the F8_128x4 scales
+            else:
+                flat = self.box[parity].view(torch.uint8).reshape(-1)
+                start = self.rows_cap * self.width * 2
             view = object.__new__(mxfp8_act.Mxfp8Buffer)
             view.rows, view.k = rows, self.width
             view.padded_cols = self.width // mx_rows.BLOCK
             view.data = flat[: rows * self.width].view(torch.float8_e4m3fn).view(
                 rows, self.width
             )
-            start = self.rows_cap * self.width * 2
             view.scale = flat[start : start + mx_rows.scale_bytes(rows, self.width)]
             view.orig_dtype = torch.bfloat16
             self._mx_views[key] = view
