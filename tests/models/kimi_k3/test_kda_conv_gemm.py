@@ -184,12 +184,16 @@ def test_fused_in_proj_never_captured(monkeypatch):
     assert calls == [False]
 
 
-def test_conv_fixup_warm_covers_serving_steps():
+@pytest.mark.parametrize("dim_first", [True, False])
+def test_conv_fixup_warm_covers_serving_steps(monkeypatch, dim_first):
     """``conv_fixup.warm`` compiles every fix-up variant a prefill step of up
     to max_num_seqs sequences launches: row / block / sequence counts and the
-    state / index strides of the serving KV cache add no compile."""
+    state / index strides of the serving KV cache add no compile (either conv
+    state layout)."""
+    from vllm.model_executor.layers.mamba import mamba_utils
     from vllm.models.kimi_k3.nvidia.specialized_prefill.sm107_gemm import conv_fixup
 
+    monkeypatch.setattr(mamba_utils, "is_conv_state_dim_first", lambda: dim_first)
     kern = conv_fixup._conv_fixup_all_kernel
 
     def variants() -> set:
@@ -202,9 +206,12 @@ def test_conv_fixup_warm_covers_serving_steps():
         conv_fixup.warm(PART, cw, dtype, 32, NULL_BLOCK_ID)
         warmed = variants()
         assert warmed
-        # A paged conv state view (row stride of the KV cache page) and 2-D
-        # state index rows, as a serving step passes them.
-        st = torch.empty(5, nq, 7, dtype=dtype, device=dev)[:, :, :3]
+        # A paged conv state view (row stride of the KV cache page), as the
+        # fused path passes it, and 2-D state index rows.
+        if dim_first:
+            st = torch.empty(5, nq, 7, dtype=dtype, device=dev)[:, :, :3]
+        else:
+            st = torch.empty(5, 7, nq, dtype=dtype, device=dev)[:, :3].transpose(-1, -2)
         for nseq in (1, 2, 3, 5, 16, 17, 31, 32):
             qsl = torch.zeros(nseq + 1, dtype=torch.int32, device=dev)
             lines = torch.zeros(nseq, 9, dtype=torch.int32, device=dev)[:, 0]
