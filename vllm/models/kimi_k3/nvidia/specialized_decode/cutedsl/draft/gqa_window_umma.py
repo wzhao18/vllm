@@ -230,10 +230,12 @@ class GqaWindowUmma:
     ``window`` keys. Same arguments as ``GqaWindow``."""
 
     def __init__(self, group, kv_heads, q, page, ring, window, v_scale=None,
-                 round_norm=False, debug=0, redo=False, splits=1, fill=0):  # fmt: skip
-        # ``fill`` (development, D-FUSE G5): where the first ring stages are issued:
-        # lanes [0, a) before griddepcontrol.wait, [a, b) right after it, the rest
-        # after the Q prep (whose qkv loads then do not queue behind the ring)
+                 round_norm=False, debug=0, redo=False, splits=1, fill=4):  # fmt: skip
+        # ``fill`` (development only, never set by the install): where the first ring
+        # stages are issued: lanes [0, a) before griddepcontrol.wait, [a, b) right
+        # after it, the rest after the Q prep. Default 4: two stages after the wait,
+        # the rest after the Q prep, whose qkv loads otherwise queue behind the
+        # whole first fill (B96 setup 3.1 -> 2.3 us, layer -1.2 us)
         self.fill = ((0, ring), (0, 0), (ring, ring), (2, 2), (0, 2))[fill]
         # ``splits`` CTAs per (request, KV head), a cluster: an even share of the
         # stages each; their partial rows LSE-merge by DSMEM pushes to the CTA owning
@@ -837,7 +839,7 @@ class GqaWindowUmma:
 @cache
 def compile_window_umma(
     group, kv_heads, q, page, ring, window, v_scale, max_position, device,
-    round_norm=False, debug=0, redo=False, splits=1, fill=0,
+    round_norm=False, debug=0, redo=False, splits=1, fill=4,
 ):  # fmt: skip
     """``GqaWindowUmma`` for any request count (row-dynamic views); ``GqaWindow``'s
     arguments."""

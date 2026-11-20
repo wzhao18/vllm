@@ -31,7 +31,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (  # noq
 DBG = None
 
 
-FILL = 0
+FILL = 4
 
 
 def _patch():
@@ -88,7 +88,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batches", default="32,64,96")
     ap.add_argument("--ctx", default="150000")
-    ap.add_argument("--fill", type=int, default=0, help="first-ring issue placement (GqaWindowUmma fill)")
+    ap.add_argument("--fill", type=int, default=4, help="first-ring issue placement (GqaWindowUmma fill)")
     args, rest = ap.parse_known_args()
     DBG = torch.zeros(2 * 8192 * 16, dtype=torch.int64, device="cuda")
     global FILL
