@@ -352,9 +352,7 @@ class KimiK3DSAIndexer(nn.Module):
         shardq = getattr(attn_metadata.get(self.shardq_layer_name), "shardq", None)
         return None if shardq is None else shardq.indexer_rows
 
-    def _fused_k_insert(
-        self, index_k: torch.Tensor, num_tokens: int, has_shardq: bool = False
-    ) -> None:
+    def _fused_k_insert(self, index_k: torch.Tensor, num_tokens: int) -> None:
         attn_metadata = get_forward_context().attn_metadata
         kv_cache = self.k_cache.kv_cache
         # Dummy / profiling run: the op leaves the cache and top-k buffer
@@ -365,35 +363,10 @@ class KimiK3DSAIndexer(nn.Module):
         assert isinstance(metadata, v32_indexer.DeepseekV32IndexerMetadata)
         assert self.topk_indices_buffer is not None
         norm = cast(KimiK3DSAIndexerKNorm, self.k_index_norm)
-        if not self.use_fp4_cache:
-            indexer_k_norm_quant_insert(
-                index_k,
-                norm.weight,
-                norm.bias,
-                norm.eps,
-                metadata.slot_mapping,
-                kv_cache,
-                self.topk_indices_buffer,
-                num_tokens,
-            )
-            return
-        # Prefill rows the sm_107 selective prefill indexer writes in full (same
-        # predicate as its sparse_attn_indexer dispatch) skip the -1 fill.
-        from vllm.models.kimi_k3.nvidia.specialized_prefill import indexer_step
-
-        fill_skip = None
-        chunks = metadata.prefill.chunks if metadata.prefill is not None else ()
-        if (
-            len(chunks) > 0
-            and self.topk_indices_buffer.shape[-1] == self.topk_tokens
-            and indexer_step.writes_full_rows(
-                True, self.topk_tokens, self.index_num_heads, self.dcp_world_size,
-                has_shardq, False, self.use_pcp,
-            )
-        ):
-            # the rows layer_topk writes: the chunks' consecutive token range
-            fill_skip = (chunks[0].token_start, chunks[-1].token_end)
-        mxfp4_k_norm_quant_insert(
+        insert = indexer_k_norm_quant_insert
+        if self.use_fp4_cache:
+            insert = mxfp4_k_norm_quant_insert
+        insert(
             index_k,
             norm.weight,
             norm.bias,
@@ -402,7 +375,6 @@ class KimiK3DSAIndexer(nn.Module):
             kv_cache,
             self.topk_indices_buffer,
             num_tokens,
-            fill_skip,
         )
 
     def forward(
@@ -430,7 +402,7 @@ class KimiK3DSAIndexer(nn.Module):
         if rows is not None:
             index_weights = index_weights[rows]
         if self.use_fused_k_insert:
-            self._fused_k_insert(index_k, hidden_states.shape[0], rows is not None)
+            self._fused_k_insert(index_k, hidden_states.shape[0])
             index_k = None
         else:
             index_k = self.k_index_norm(index_k)

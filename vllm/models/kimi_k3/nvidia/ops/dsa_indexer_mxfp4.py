@@ -128,17 +128,14 @@ def _mxfp4_k_norm_quant_insert_kernel(
     cache_block_stride,
     topk_ptr,
     topk_stride,
-    fill_lo,
-    fill_hi,
     HEAD_DIM: tl.constexpr,
     TOPK: tl.constexpr,
     TOPK_BLOCK: tl.constexpr,
 ):
     tok = tl.program_id(0).to(tl.int64)
     if tl.program_id(1) == 1:
-        # Padding rows included; rows [fill_lo, fill_hi) are written in full later.
-        if tok < fill_lo or tok >= fill_hi:
-            _fill_topk(topk_ptr + tok * topk_stride, TOPK, TOPK_BLOCK)
+        # Padding rows included.
+        _fill_topk(topk_ptr + tok * topk_stride, TOPK, TOPK_BLOCK)
     else:
         _mxfp4_k_insert(
             tok,
@@ -173,12 +170,10 @@ def mxfp4_k_norm_quant_insert(
     kv_cache: torch.Tensor,
     topk_indices_buffer: torch.Tensor,
     num_tokens: int,
-    fill_skip: tuple[int, int] | None = None,
 ) -> None:
     """``indexer_k_norm_quant_insert`` for the MXFP4 cache: LayerNorm + MXFP4
     quant + cache insert of the indexer key, and the -1 fill of the top-k rows
-    ``[:num_tokens]`` except ``fill_skip = (lo, hi)``: rows the caller's top-k
-    writes in full (every column, -1 padded).
+    ``[:num_tokens]``.
 
     ``kv_cache`` is ``[num_blocks, block_size, indexer_cache_entry_bytes]`` uint8,
     possibly a strided page view of a packed cache. Rows past ``slot_mapping`` or
@@ -192,9 +187,7 @@ def mxfp4_k_norm_quant_insert(
     assert triton.next_power_of_2(head_dim) == head_dim
     cache = _cache_bytes(kv_cache, head_dim)
     topk = topk_indices_buffer.shape[-1]
-    lo, hi = fill_skip if fill_skip is not None else (0, 0)
-    fill = lo > 0 or hi < num_tokens
-    _mxfp4_k_norm_quant_insert_kernel[(num_tokens, 2 if fill else 1)](
+    _mxfp4_k_norm_quant_insert_kernel[(num_tokens, 2)](
         k,
         k.stride(0),
         norm_weight,
@@ -207,8 +200,6 @@ def mxfp4_k_norm_quant_insert(
         cache.stride(0),
         topk_indices_buffer,
         topk_indices_buffer.stride(0),
-        lo,
-        hi,
         HEAD_DIM=head_dim,
         TOPK=topk,
         TOPK_BLOCK=min(1024, triton.next_power_of_2(topk)),
