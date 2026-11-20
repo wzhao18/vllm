@@ -348,6 +348,7 @@ class SpOproj:
         try:
             gemm = Mxfp8PreGemm(
                 projection.n, projection.k, rows, tactic, use_pdl=True, prewait=prewait,
+                quiet=True,
                 max_stages=stages, push=3, device=projection.weight.device,
             )  # fmt: skip
         except ValueError as e:

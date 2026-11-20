@@ -240,7 +240,7 @@ class Mxfp8Projection:
                 from .sm107.prewait import Mxfp8PreGemm
 
                 self.pre[r] = Mxfp8PreGemm(
-                    n, k, r, found[0], use_pdl=True, prewait=found[1],
+                    n, k, r, found[0], use_pdl=True, prewait=found[1], quiet=True,
                     max_stages=found[2], device=weight.device,
                 )  # fmt: skip
         self.scale_e8 = scale.view(torch.float8_e8m0fnu)
