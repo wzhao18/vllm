@@ -1,2 +1,0 @@
-I=$(python3 -c "from torch.utils.cpp_extension import include_paths as p; print(' '.join('-I'+x for x in p(device_type='cuda')))")
-cd /tmp && nvcc -O3 --use_fast_math --expt-relaxed-constexpr -std=c++20 $I -I/usr/include/python3.12 -gencode arch=compute_100f,code=sm_100f -Xptxas -v -DK31LP_VEC=${VEC:-8} -DK31LP_G=${G:-3} -c /k31ov/vllm/models/kimi_k3/nvidia/specialized_prefill/attn_res_lp.cu -o /tmp/x.o 2>&1 | grep -E "Used|spill|error" | head -40
