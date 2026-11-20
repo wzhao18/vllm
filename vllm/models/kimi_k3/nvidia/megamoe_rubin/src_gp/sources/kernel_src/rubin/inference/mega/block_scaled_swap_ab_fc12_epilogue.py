@@ -50,9 +50,9 @@ from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.iket_compat import iket
 from ......common.ptx_helpers import (
     atom_add_acq_rel_gpu_s32,
-    ldg_cg_v4_b32,
+    ldg_cg_v4_f32,
     opaque_zero_after,
-    stg_v4_b32,
+    stg_v4_f32,
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cvt_f32_to_fp8_to_f32,
@@ -2872,11 +2872,11 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                 frag = ((own_slice * cutlass.Int32(split.subtiles) + subtile_idx) * cutlass.Int32(4) + warp) * (
                     cutlass.Int32(warp_words)
                 ) + lane_word
-                halves = (cute.recast_tensor(top, cutlass.Int32), cute.recast_tensor(bottom, cutlass.Int32))
+                halves = (top, bottom)
                 for half in cutlass.range_constexpr(2):
                     for quad in cutlass.range_constexpr(SharedFc2SplitK.chunks // 2):
                         chunk = half * (SharedFc2SplitK.chunks // 2) + quad
-                        stg_v4_b32(
+                        stg_v4_f32(
                             (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint(),
                             halves[half][quad * 4],
                             halves[half][quad * 4 + 1],
@@ -2912,13 +2912,9 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                         for half in cutlass.range_constexpr(2):
                             for quad in cutlass.range_constexpr(SharedFc2SplitK.chunks // 2):
                                 chunk = half * (SharedFc2SplitK.chunks // 2) + quad
-                                words = ldg_cg_v4_b32(
+                                values = ldg_cg_v4_f32(
                                     (split.partials.iterator + frag + cutlass.Int32(chunk * 32 * 4)).toint()
                                 )
-                                loaded = cute.make_rmem_tensor((4,), cutlass.Int32)
-                                for i in cutlass.range_constexpr(4):
-                                    loaded[i] = words[i]
-                                values = cute.recast_tensor(loaded, cutlass.Float32)
                                 for i in cutlass.range_constexpr(4):
                                     if cutlass.const_expr(k == 0):
                                         sums[half][quad * 4 + i] = values[i]

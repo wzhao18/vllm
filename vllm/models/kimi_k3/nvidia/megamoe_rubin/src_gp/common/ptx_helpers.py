@@ -1158,3 +1158,34 @@ def opaque_zero_after(value: Int32, *, loc=None, ip=None) -> Int32:
         ip=ip,
     )
     return Int32(result)
+
+
+@dsl_user_op
+def ldg_cg_v4_f32(address: Int64, *, loc=None, ip=None):
+    """Four FP32 from one 16-byte ``ld.global.cg.v4.f32`` (L2 only); not volatile, so a batch issues back to back."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [address.ir_value()],
+        "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=False,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def stg_v4_f32(address: Int64, v0: Float32, v1: Float32, v2: Float32, v3: Float32, *, loc=None, ip=None) -> None:
+    """One 16-byte global store (``st.global.v4.f32``) of four FP32 registers."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), v0.ir_value(), v1.ir_value(), v2.ir_value(), v3.ir_value()],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
