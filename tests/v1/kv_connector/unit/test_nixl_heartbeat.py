@@ -28,6 +28,7 @@ def _worker_stub():
     )
 
     w = object.__new__(NixlConnectorWorker)
+    w._sub_block_peers = {}
     w._reqs_to_send = {}
     w._lease_extension = 20
     w._reqs_to_process = set()

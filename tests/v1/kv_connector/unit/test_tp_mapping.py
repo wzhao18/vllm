@@ -189,6 +189,7 @@ def _make_mock_worker_for_splits(group_spec_types):
     FA descriptor as SPLIT, matching the legacy behavior these tests assert.
     """
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker._group_spec_types = group_spec_types
     worker.transfer_topo = SimpleNamespace(virtually_split_kv_in_blocks=False)
     worker.block_len_per_layer = []
@@ -395,6 +396,7 @@ class TestMambaPlanSplitHandles:
 )
 def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, compatible):
     worker = object.__new__(NixlConnectorWorker)
+    worker._sub_block_peers = {}
     worker.world_size = local_tp
     worker._is_csa_linear = True
     worker.transfer_topo = SimpleNamespace(total_num_kv_heads=total_kv_heads)

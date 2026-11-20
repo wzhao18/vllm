@@ -422,8 +422,9 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
     V2DBG(10);
     {
       // theta: the bottom of the coarse bin where the sample's suffix count first reaches
-      // its share of q + 256 keys (the sample's standard error at q ~ 512 is ~3% of q)
-      const uint32_t want = (q + 256u + kV2SampleStride - 1) / kV2SampleStride;
+      // its share of q + 512 keys (8-key groups of adjacent tokens correlate: q + 256 left
+      // fewer than q candidates on ~3 of 1M rows, each costing the DCP group the complete body)
+      const uint32_t want = (q + 512u + kV2SampleStride - 1) / kV2SampleStride;
       const int bb = kV2T - 1 - tid;
       uint32_t v = 0;
 #pragma unroll
@@ -699,9 +700,12 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         }
         if (tid == 0) Sx[kV2Fine] = s_beyond;
         __syncthreads();
-        if (K31_LIKELY(pass == 1 || s_e >= 0 || s_beyond < q)) break;
-        // the q-th key lies above the fine range (a wide upper tail): coarse counts of the
-        // candidates (32 keys per bin, the whole key range) locate it; rebase there
+        if (K31_LIKELY(pass == 1 || s_e >= 0)) break;
+        // the q-th key lies outside the fine range: above it (a wide upper tail), or below
+        // it when the sample's estimate of the q-th key was high (the range starts kV2Fine / 2
+        // under that estimate, above theta). Every candidate is >= theta and nc >= q, so
+        // coarse counts of the candidates (32 keys per bin, the whole key range) locate it;
+        // rebase there (pass 1 then finds e in [fb, fb + kV2Fine))
         V2STAT(7);
         for (int x = tid; x < kV2Fine; x += kV2T) hist[x] = 0;
         if (tid == 0) s_i[12] = -1;
@@ -740,8 +744,14 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       }
     }
     if (K31_RARE(!fast)) {
-      if constexpr (kFast) {  // tier 3 on every rank, then the complete body
-        if (tid == 0) { s_sat = 1u; s_above = 0u; s_lo = 0; }
+      if constexpr (kFast) {
+        // tier 3 on every rank, then R2. The message carries a valid lower bound only: an
+        // empty window just below theta and the exact count of keys >= theta above it.
+        if (tid == 0) {
+          s_sat = 1u;
+          s_lo = min(max(0, th - kV2Win), 65536 - kV2Win);
+          s_above = s_lo + kV2Win == th ? (uint32_t)s_cnt : 0u;
+        }
       } else {
       V2STAT(5);
       // the same message from passes over every key: coarse histogram, the coarse bin of
@@ -1055,10 +1065,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
       // then derives tau, need and the tie cut by global id from the union (exact). Rows whose
       // keys >= LB overflow the message keep the complete body.
       if (tier == 2 || tier == 3) {
-        // every rank fast (no saturated window) on this row: the windows only missed tau
-        uint32_t r2sat = 0;
-        for (int r = 0; r < W; ++r) r2sat |= (rx[r * kV2Msg] >> 16) & 1u;
-        if (!r2sat && row < kR2Rows) {
+        // saturated windows / failed fast paths take R2 too: every window is a lower bound
+        if (row < kR2Rows) {
         __shared__ int s_r2n[kV2MaxW];
         __shared__ int s_r2[6];  // 0 LB, 1 tie count, 2 tau, 3 keys > tau, 4 quota, 5 bad
         uint32_t* const z = reinterpret_cast<uint32_t*>(srow) + 4096;
