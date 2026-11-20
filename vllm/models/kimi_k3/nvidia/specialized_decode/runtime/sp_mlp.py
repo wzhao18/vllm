@@ -27,6 +27,8 @@ fallback for a planned row."""
 
 import torch
 
+_EP32_SPIN = 0  # EP32DIAG cycles
+
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from ...mxfp8 import is_mxfp8_linear
@@ -377,6 +379,10 @@ class SpMlp:
                     kwargs["fused_shared"] = shared
                 return mlp.experts(routed, router_output, topk_ids, **kwargs)
 
+        # EP32DIAG (not for landing): rank 0 reaches every MoE layer _EP32_SPIN clock cycles late (slope test:
+        # is a late rank paid 1:1 by the step?). _EP32_SPIN = 0 keeps the extra kernel boundary (control).
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            torch.cuda._sleep(_EP32_SPIN)
         if self.fused_shared is not None and mlp.experts.fused_shared(n):
             if not prequantized:
                 gemms["shared_gu"].input.quantize(h)
