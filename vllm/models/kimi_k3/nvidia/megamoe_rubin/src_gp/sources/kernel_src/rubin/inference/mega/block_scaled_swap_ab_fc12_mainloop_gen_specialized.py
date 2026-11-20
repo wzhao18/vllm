@@ -1136,6 +1136,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         ab_pipeline: pipeline.PipelineAsync,
         ab_pipeline_state: pipeline.PipelineState,
         expected_tx: Optional[Int32] = None,
+        dms_u=None,
     ) -> pipeline.PipelineState:
         """Load one tile's A/SFA k tiles; ``kind`` bundles MMA, tiler, template views, SMEM tensors and extension."""
         (
@@ -1202,9 +1203,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 _dms_w = _dms_w + (read_clock64() - _dms_c1)
         DG.put_val_dyn(
-            Int32(DG.S_TAW0) + (self._dms_cur & Int32(15)),
+            Int32(DG.S_TAW0) + (dms_u & Int32(15)),
             ((read_clock64() - _dms_c00) << Int64(32)) | _dms_w,
-            DG.lane0() * Int32(self._dms_cur < Int32(16)),
+            DG.lane0() * Int32(dms_u < Int32(16)),
         )
         return ab_pipeline_state
 
@@ -1290,7 +1291,6 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             if _dms_u < Int32(16):
                 DG.put_gt_dyn(Int32(DG.S_TAU0) + _dms_u)
                 DG.put_val_dyn(Int32(DG.S_TAPH0) + _dms_u, cutlass.Int64(phase) | (cutlass.Int64(work_tile.expert_idx & Int32(0xFFFF)) << cutlass.Int64(8)))
-            self._dms_cur = _dms_u
             _dms_u = _dms_u + Int32(1)
             # The fixed FC1 / FC2 range names the iket summaries key on (shared tiles count with their GEMM).
             if self._is_fc1_gemm(phase):
@@ -1322,6 +1322,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         ab_pipeline,
                         ab_pipeline_state,
                         Int32(self.shared_weight_tx_count),
+                        dms_u=_dms_u - Int32(1),
                     )
                 else:
                     ab_pipeline_state = self._issue_tma_a_tile(
@@ -1334,6 +1335,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                         k_tile_count,
                         ab_pipeline,
                         ab_pipeline_state,
+                        dms_u=_dms_u - Int32(1),
                     )
             else:
                 ab_pipeline_state = self._issue_tma_a_tile(
@@ -1348,6 +1350,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                     k_tile_count,
                     ab_pipeline,
                     ab_pipeline_state,
+                    dms_u=_dms_u - Int32(1),
                 )
             iket.range_pop()
             work_tile = sched_consumer.consume_work()
