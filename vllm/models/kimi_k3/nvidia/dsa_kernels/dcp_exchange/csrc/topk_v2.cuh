@@ -1000,6 +1000,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         tv += s[4] & 0xFFFFFFu;
       }
       int rt = tv <= (uint32_t)K ? 4 : (sat || mx >= mn) ? 3 : 0;
+      if (tv > (uint32_t)K && sat) V2STAT(8);
+      if (tv > (uint32_t)K && !sat && mx >= mn) V2STAT(9);
       int tau = -1, need = 0, qv = 0;
       V2DBG(19);
       if (rt == 0) {
@@ -1034,7 +1036,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         tau = s_tau;
         need = s_need;
-        if (tau < 0) rt = 3;  // the K-th key lies above or below the common range
+        if (tau < 0) { rt = 3; V2STAT(10); }  // the K-th key lies above or below the common range
         V2DBG(20);
       }
       if (rt == 0) {
@@ -1071,7 +1073,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if (tot_t == need) { rt = 1; qv = mine; }
         else if (nr == 1) { rt = 1; qv = mine > 0 ? need : 0; }
         else if (band_ok) rt = 5;
-        else rt = fit ? 2 : 3;
+        else { rt = fit ? 2 : 3; if (!fit) V2STAT(11); }
         if (rt == 5) {
           // this rank's quota: its ties whose global id ranks below `need` among every
           // rank's ties (ids distinct, groups unsorted). Item (i, r2): how many of rank r2's
@@ -1267,6 +1269,8 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         __syncthreads();
         V2DBG(6);
         const bool lbok = s_r2[0] >= 0;  // the same on every rank
+        V2STAT(12);
+        if (!lbok) V2STAT(13);
         if (lbok) {
           const uint32_t LB = (uint32_t)max(s_r2[0], 1);
           const int64_t r2row = p.off_r2 + ((int64_t)(par * min(p.cap, kR2Rows) + row) * W) * kR2W;
@@ -1490,7 +1494,7 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
                   p.out_count[row] = count;
                   p.epoch[row] = ep + 1 == 510 ? 0 : ep + 1;
                 }
-                V2STAT(2);
+                V2STAT(14);
                 V2DBG(17);
                 V2DBG(8);
                 __syncthreads();  // SMEM reused by the next row
