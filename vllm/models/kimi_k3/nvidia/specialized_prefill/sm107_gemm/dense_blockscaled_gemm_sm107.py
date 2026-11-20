@@ -2401,6 +2401,18 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     )
                 elif cutlass.const_expr(mQ_mnl is not None):
                     if mma_tile_coord_mnl[1] >= self.situ_n_lat_tiles:
+                        # N tiles past the shared columns (a cluster N that
+                        # does not divide the tile count, or the padded
+                        # clusters of an "m" raster swizzle) must not store:
+                        # the epilogue bounds rows only and would wrap them
+                        # into the next rows / past the buffer (as the drain
+                        # form above); 0 rows = no stores.
+                        q_rows = mQ_mnl.shape[0]
+                        if (
+                            mma_tile_coord_mnl[1] - self.situ_n_lat_tiles
+                            >= cute.size(mQ_mnl, mode=[1]) // 256
+                        ):
+                            q_rows = cutlass.Int32(0)
                         acc_consumer_state = epilogue_situ_mxfp8(
                             self,
                             tidx,
@@ -2417,7 +2429,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                                 mma_tile_coord_mnl[1] - self.situ_n_lat_tiles,
                                 mma_tile_coord_mnl[2],
                             ),
-                            mQ_mnl.shape[0],
+                            q_rows,
                             acc_consumer_state,
                             acc_pipeline,
                         )

@@ -98,3 +98,21 @@ def test_pre_rejects():
         Mxfp8PreGemm(N, K, 128, ((256, 96), (2, 1), True, 256), device=DEVICE)
     with pytest.raises(ValueError):
         Mxfp8PreGemm(N, 256, 128, ((128, 64), (1, 1), False, 128), prewait=8, device=DEVICE)
+
+
+def test_pre_push_rejects_width():
+    """The push epilogue stores rows at the receive slots' fixed pitch (WIDTH =
+    7168) with raw addresses bounded by row only: any other N, an N that tile
+    N does not divide, or swap_ab must refuse at build; the deployed o_proj
+    pre_push tactics still build."""
+    o_n, o_k = 7168, 3072
+    with pytest.raises(ValueError, match="receive row width"):
+        Mxfp8PreGemm(3072, o_k, 128, ((128, 128), (1, 1), False, 128), push=3, device=DEVICE)
+    with pytest.raises(ValueError, match="receive row width"):
+        Mxfp8PreGemm(o_n, o_k, 128, ((128, 96), (1, 1), False, 128), push=3, device=DEVICE)
+    for rows in (32, 128, 256):
+        tactic, prewait, stages = pre_tactic(o_n, o_k, rows)
+        Mxfp8PreGemm(
+            o_n, o_k, rows, tactic, prewait=prewait, max_stages=stages, push=3,
+            device=DEVICE,
+        )  # fmt: skip

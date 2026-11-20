@@ -131,6 +131,11 @@ class PackedSituGemm:
         n, k = weight_nk.shape
         if n_lat % TILE[1] or (n - n_lat) % TILE[1] or k % 128:
             raise ValueError(f"packed SiTU GEMM: unsupported N/K ({n_lat}, {n}, {k})")
+        if tactic[0][1] != TILE[1]:
+            # The latent / shared split and the SiTU gate|up pairing are in
+            # 256-wide N tiles; shared N tiles past column N (a cluster N that
+            # does not divide the tile count) are dropped in the kernel.
+            raise ValueError(f"packed SiTU GEMM: tile N {tactic[0][1]} ({TILE[1]} only)")
         self.weight, self.scale = weight_nk, scale
         self.n, self.k, self.n_lat = n, k, n_lat
         k_host, self.a_pow, self.clamp_up = situ_constants(beta, linear_beta)
