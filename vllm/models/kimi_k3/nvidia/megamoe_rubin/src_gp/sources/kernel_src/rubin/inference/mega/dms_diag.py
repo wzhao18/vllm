@@ -16,7 +16,7 @@ from ......common.ptx_helpers import read_globaltimer_ns, read_smid
 ON = True
 REGION = "genphase.diag.stamps_ring"
 RING = 64
-SLOTS = 96
+SLOTS = 272
 MAX_SM = 256
 ENTRY_BYTES = MAX_SM * SLOTS * 8
 
@@ -37,6 +37,12 @@ S_TOKREADY, S_FIRSTROUTED = 26, 27
 S_PUB0, S_UNIT0 = 52, 56  # last 4 scheduler publishes: time (52..55) and unit code (56..59), index = n % 4
 S_BLOCK, S_EPOCH = 62, 63
 S_TAU0, S_TAPH0 = 64, 80
+# per-unit wait-cause stamps, unit k < 16 (k = this warp's k-th consumed work tile; all roles consume the same order)
+S_TBU0, S_TBD0 = 96, 112  # TMA-B: unit start / dependency wait (FC1 expert SF ready, FC2 FC1-done, shared FC2) passed
+S_MMU0, S_MMQ0, S_MMF0, S_MME0 = 128, 144, 160, 176  # MMA (leader): unit start / acc stage acquired / 1st stage full / end
+S_MMC0 = 192  # MMA (leader): clock64 cycles (unit << 40) | (A-or-weight wait << 20) | token wait (split plan; else 0)
+S_GBU0 = 208  # Gather-B: unit start
+S_EPU0, S_EPM0, S_EPS0 = 224, 240, 256  # epilogue: unit start / math done / completion signal published
 S_DIE = 7  # die + 1 of this CTA (die-aware builds)  # TMA-A unit k start time / phase, k < 16
 # comm grid (token_comm) CTAs: entry, previous-tail wait passed, role work done, refine done, exit, role, epoch tag
 C_ENTRY, C_EPOK, C_ROLE, C_REFINE, C_EXIT, C_ROLEID, C_EPOCH = 12, 13, 14, 15, 18, 20, 21
@@ -51,6 +57,15 @@ def register(device_workspace) -> None:
         REGION, cutlass.Int64, (RING * MAX_SM * SLOTS,), buffer_space="local", byte_alignment=128,
         reset="zero_on_first_allocate",
     )
+
+
+def unbind() -> None:
+    """Call after the kernel's last stamp: a later trace of another kernel (sharing the epilogue) stamps nothing."""
+    _Bound.base = None
+
+
+def bound() -> bool:
+    return _Bound.base is not None
 
 
 def bind(device_workspace, epoch) -> None:
@@ -82,12 +97,12 @@ def lane0():
 
 
 def put_gt(slot: int, pred=None) -> None:
-    if cutlass.const_expr(ON):
+    if cutlass.const_expr(ON and _Bound.base is not None):
         _st(_addr(slot), Int64(read_globaltimer_ns()), lane0() if pred is None else Int32(pred))
 
 
 def put_val(slot: int, value, pred=None) -> None:
-    if cutlass.const_expr(ON):
+    if cutlass.const_expr(ON and _Bound.base is not None):
         _st(_addr(slot), Int64(value), lane0() if pred is None else Int32(pred))
 
 
@@ -96,12 +111,12 @@ def _addr_dyn(slot):
 
 
 def put_gt_dyn(slot, pred=None) -> None:
-    if cutlass.const_expr(ON):
+    if cutlass.const_expr(ON and _Bound.base is not None):
         _st(_addr_dyn(slot), Int64(read_globaltimer_ns()), lane0() if pred is None else Int32(pred))
 
 
 def put_val_dyn(slot, value, pred=None) -> None:
-    if cutlass.const_expr(ON):
+    if cutlass.const_expr(ON and _Bound.base is not None):
         _st(_addr_dyn(slot), Int64(value), lane0() if pred is None else Int32(pred))
 
 

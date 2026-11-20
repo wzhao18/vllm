@@ -1972,6 +1972,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         DG.put_gt(DG.S_EXIT, Int32(cute.arch.thread_idx()[0] == Int32(0)))
+        DG.unbind()
         self._device_workspace.remove_device_members()
 
 
