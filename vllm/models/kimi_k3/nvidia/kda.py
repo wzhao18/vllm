@@ -75,6 +75,9 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
 from vllm.models.kimi_k3.nvidia.specialized_prefill import (
     kda as specialized_prefill_kda,
 )
+from vllm.models.kimi_k3.nvidia.specialized_prefill.kda_conv_in_proj import (
+    contiguous_rows,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -665,6 +668,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             (torch.cuda.Event(), torch.cuda.Event()) if aux_stream is not None else None
         )
         self._projection_overlap_max_tokens = 0
+        # Prefill workers: q|k|v in_proj GEMM with the conv in its epilogue
+        # (specialized_prefill.kda_conv_in_proj, set after weight loading).
+        self._prefill_conv_in_proj = None
 
         # Keep f_a before the narrow beta shard, then align each TP-local row.
         qkvg_output_sizes = [self.projection_size] * 4
@@ -1037,6 +1043,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 [3 * self.local_projection_size, self.local_projection_size],
                 dim=-1,
             )
+        elif (
+            qa is not None
+            and self._prefill_conv_in_proj is not None
+            and (fused := self._prefill_conv_in_proj.fused(qa)) is not None
+        ):
+            # (3, T, P) q|k|v planes after conv + SiLU; _forward skips the conv.
+            mixed_qkv, projected_rest = fused
+            g_proj_states, f_a, beta = projected_rest.split(
+                [self.local_projection_size, self.head_dim, self.local_num_heads],
+                dim=-1,
+            )[:3]
+            beta = contiguous_rows(beta)
+            g1 = self.f_b_proj(f_a)[0]
         else:
             projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
             split_sizes = [
@@ -1229,7 +1248,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_actual_tokens = m.num_actual_tokens
         checkpoint = m.checkpoint
         has_spec_decode = m.num_spec_decodes > 0
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        # (3, T, P): q|k|v planes the prefill in_proj already convolved.
+        qkv_planes = mixed_qkv.dim() == 3
+        mixed_qkv = (
+            mixed_qkv[:, :num_actual_tokens]
+            if qkv_planes
+            else mixed_qkv[:num_actual_tokens]
+        )
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
@@ -1427,9 +1452,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             if non_spec_token_start is not None:
                 non_spec_out = core_attn_out[:, non_spec_slice]
             if m.num_prefills > 0:
-                q_ns, k_ns, v_ns = mixed_qkv_ns.split(
-                    self.local_projection_size, dim=-1
-                )
+                if not qkv_planes:
+                    q_ns, k_ns, v_ns = mixed_qkv_ns.split(
+                        self.local_projection_size, dim=-1
+                    )
 
                 # Separate convolution calls accept row-strided packed inputs
                 # and produce dense Q/K/V without an additional V copy.
@@ -1468,7 +1494,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     and non_spec_query_start_loc is not None
                     and non_spec_state_indices_tensor is not None
                 )
-                if have_meta and kda_conv.qkv_conv_supported(
+                if qkv_planes:
+                    q_ns, k_ns, v_ns = mixed_qkv_ns.unbind(0)
+                elif have_meta and kda_conv.qkv_conv_supported(
                     mixed_qkv_ns,
                     conv_weights,
                     conv_state,
@@ -1520,10 +1548,23 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
-                initial_state = gather_initial_states(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    has_initial_state,
+                # The persistent prefill kernel reads and writes the state
+                # cache rows in place (no gather / row-scatter launches).
+                inplace_state = (
+                    self.kda_prefill_backend == "flashkda"
+                    and self._frost
+                    and self._kda_persistent
+                    and checkpoint is None
+                    and m.non_spec_query_start_loc_cpu is not None
+                )
+                initial_state = (
+                    None
+                    if inplace_state
+                    else gather_initial_states(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
+                    )
                 )
                 if self.kda_prefill_backend == "flashkda":
                     assert self.gate_lower_bound is not None
@@ -1552,6 +1593,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         and flashkda_out.is_contiguous()
                         else None
                     )
+                    if inplace_state and seg_plan is not None:
+                        # Segment-parallel route: it takes gathered states.
+                        inplace_state = False
+                        initial_state = gather_initial_states(
+                            recurrent_state,
+                            non_spec_state_indices_tensor,
+                            has_initial_state,
+                        )
                     if (
                         seg_plan is not None
                         and seg_plan.num_seqs == initial_state.shape[0]
@@ -1643,6 +1692,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                                     initial_state=initial_state,
                                     cu_seqlens=non_spec_query_start_loc,
                                     cu_seqlens_cpu=m.non_spec_query_start_loc_cpu,
+                                    state_cache=(
+                                        recurrent_state if inplace_state else None
+                                    ),
+                                    state_indices=non_spec_state_indices_tensor,
+                                    has_initial_state=has_initial_state,
                                 )
                             )
                         else:
@@ -1738,12 +1792,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
                     )
-                # One row-copy launch (same result as the index_put_).
-                prefill_glue.write_state_rows(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    last_recurrent_state,
-                )
+                # One row-copy launch (same result as the index_put_);
+                # in-place prefill already wrote the cache rows.
+                if last_recurrent_state is not None:
+                    prefill_glue.write_state_rows(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        last_recurrent_state,
+                    )
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None

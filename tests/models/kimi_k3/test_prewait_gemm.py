@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("t", [32, 64])
+@pytest.mark.parametrize("t", [32, 64, 96])
 @pytest.mark.parametrize("n,out_dtype", [(4480, torch.float32), (3584, torch.bfloat16), (1000, torch.float32)])
 def test_prewait_gemm_matches_torch(t, n, out_dtype):
     from vllm.models.kimi_k3.nvidia.specialized_decode import prewait_gemm as pg
