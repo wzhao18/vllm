@@ -43,7 +43,7 @@ def _alpha_one(device):
 @cache
 def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, producers=1,
              prefetch=0, tile_k=TILER_K, die_claim=False, max_stages=0, k_rotate=0,
-             m128x2=False):
+             m128x2=False, raster="m"):
     tile, cluster, swap_ab, inst_m = tactic
     gemm = Sm107BlockScaledPersistentDenseGemmKernel(
         SF_VEC,
@@ -68,6 +68,7 @@ def _compile(tactic, use_pdl, prewait, device_index, quiet=False, dbg=0, produce
     gemm.dbg_skip_a = bool(dbg & 128)
     gemm.max_ab_stages = max_stages
     gemm.k_rotate = k_rotate
+    gemm.raster_order = raster
     sym_m, sym_k, sym_n = cute.sym_int(), cute.sym_int(), cute.sym_int()
     f8 = cutlass.Float8E4M3FN
     a = cute.runtime.make_fake_compact_tensor(f8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16)
@@ -104,7 +105,7 @@ class Mxfp8PreGemm:
 
     def __init__(self, n, k, rows, tactic, *, use_pdl=True, prewait=0, quiet=False, dbg=0,
                  producers=1, prefetch=0, tile_k=TILER_K, die_split=None, max_stages=0,
-                 k_rotate=0, m128x2=False, device=None):
+                 k_rotate=0, m128x2=False, raster="m", device=None):
         device = torch.device("cuda") if device is None else device
         self.n, self.k, self.rows = n, k, rows
         # swap_ab: weights are operand A (M = N rows) and the kernel stores C M-major, i.e.
@@ -116,7 +117,7 @@ class Mxfp8PreGemm:
         self.compiled, self.gemm = _compile(
             tactic, bool(use_pdl), int(prewait), device.index or 0, bool(quiet), int(dbg),
             int(producers), int(prefetch), int(tile_k), die_split is not None,
-            int(max_stages), int(k_rotate), bool(m128x2),
+            int(max_stages), int(k_rotate), bool(m128x2), str(raster),
         )
         self.stages = getattr(self.gemm, "num_ab_stage", None)
         if prewait and self.stages is not None and prewait > self.stages:
