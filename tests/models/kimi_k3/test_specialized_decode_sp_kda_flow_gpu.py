@@ -27,11 +27,13 @@ Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
 STEPS = 6
 
 
-def core_of(kind, attention, rows, records, caches):
+def core_of(kind, attention, rows, records, caches, mx_out=False):
     saved = dict(sp.RECORD_KINDS)
     sp.RECORD_KINDS[HEADS] = f"1-:{kind}"
     try:
-        core = sp.SpKdaCore(attention, (rows,), records=records, ctx=kda.context())
+        core = sp.SpKdaCore(
+            attention, (rows,), records=records, ctx=kda.context(), mx_out=mx_out
+        )
     finally:
         sp.RECORD_KINDS.clear()
         sp.RECORD_KINDS.update(saved)
@@ -120,4 +122,75 @@ def test_flow_fold_matches_ws_and_stock_commit(n, graph, stages, monkeypatch):
         pending.zero_()
         pending[index] = accepted
     assert folded > 0
+    sp.executable.cache_clear()
+
+
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("n", [33, 96])
+def test_flow_mxfp8_output_is_the_quantized_bf16_output(n, graph):
+    """KdaFlow writing the online-MXFP8 o_proj's input itself (``mx_out``) equals its
+    BF16 output quantized by ``ops.mxfp8_act.quantize`` (the standalone kernel it
+    replaces), E4M3 bytes and F8_128x4 scales bit for bit, over folding steps."""
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.mxfp8 import (
+        Mxfp8Input,
+    )
+
+    sp.executable.cache_clear()
+    rows, slots = Q * n, 2 * n + 2
+    plain, mx = kda.layer(), kda.layer()  # the same weights, their own records
+    plain.deferred_recoverssm = mx.deferred_recoverssm = True
+    kv = kda.caches(slots)
+    mx_kv = tuple(t.clone() for t in kv)
+    _, metadata = kda.step(n, slots)
+    record_rows = torch.randperm(MAX_REQS, generator=torch.Generator().manual_seed(5))
+    record_rows = record_rows[:n].to(torch.int32).to(kda.DEVICE)
+    pending = torch.zeros(MAX_REQS, dtype=torch.int32, device=kda.DEVICE)
+    deferred = kda.Module(
+        **vars(metadata),
+        recoverssm_deferred=kda.Module(
+            record_rows=record_rows, pending=pending, flush=None
+        ),
+    )
+    core = core_of("flow", plain, rows, "deferred", kv)
+    mx_core = core_of("flow", mx, rows, "deferred", mx_kv, mx_out=True)
+    assert mx_core.writes_mxfp8(rows) and not core.writes_mxfp8(rows)
+    projected = torch.empty(rows, kda.PITCH, dtype=torch.bfloat16, device=kda.DEVICE)
+    out = torch.empty(rows, DIM, dtype=torch.bfloat16, device=kda.DEVICE)
+    got = Mxfp8Input(rows, DIM, kda.DEVICE).view(rows)
+    want = Mxfp8Input(rows, DIM, kda.DEVICE).view(rows)
+    # (the core leaves the scales of the last tile's rows past R as they are)
+    got.scale.zero_()
+    caches, mx_caches = list(kv), list(mx_kv)
+
+    def verify():
+        core.run(projected, out, caches=caches, metadata=deferred)
+        mx_core.run(projected, got, caches=mx_caches, metadata=deferred)
+
+    replay = None
+    if graph:
+        scratch, mx_scratch = [t.clone() for t in kv], [t.clone() for t in mx_kv]
+        core.run(projected, out, caches=scratch, metadata=deferred)
+        mx_core.run(projected, got, caches=mx_scratch, metadata=deferred)
+        torch.cuda.synchronize()
+        replay = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(replay):
+            verify()
+
+    for step in range(3):
+        projected.copy_(kda.step(n, slots, seed=200 + step)[0])
+        if replay is not None:
+            replay.replay()
+        else:
+            verify()
+        mxfp8_act.quantize(out, out=want)
+        torch.cuda.synchronize()
+        where = f"step {step}"
+        assert out.abs().amax() > 0, where
+        for name, a, b in (("E4M3", got.data, want.data),
+                           ("scales", got.scale, want.scale)):  # fmt: skip
+            diff = a.view(torch.uint8) != b.view(torch.uint8)
+            assert not diff.any(), f"{where} {name}: {int(diff.sum())} differ"
+        pending.zero_()
+        pending[record_rows.long()] = accepted_counts(n, step)
     sp.executable.cache_clear()

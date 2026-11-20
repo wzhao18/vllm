@@ -341,7 +341,7 @@ class SpOproj:
         [R, 7168] into ``comm.partial`` and return it (the owner kernel pushes it);
         "warp" pushes from the GEMM and returns None. (The MXFP8 o-projection is a
         GEMM tactic: "mxfp8".)"""
-        rows = attn_out.shape[0]
+        rows = attn_out.shape[0] if isinstance(attn_out, torch.Tensor) else attn_out.rows
         tactic = self._checked(attn_out)
         comm = self.comm
         if tactic == "cublas":
@@ -360,6 +360,18 @@ class SpOproj:
         return None
 
     def _checked(self, attn_out):
+        """The tactic at ``attn_out``'s rows: a packed [R, k] BF16 ``attn_out``, or
+        for the MXFP8 GEMM tactic an ``ops.mxfp8_act.Mxfp8Buffer`` view of R rows
+        (the core wrote the GEMM's MXFP8 input)."""
+        if not isinstance(attn_out, torch.Tensor):
+            rows = attn_out.rows
+            tactic = self.tactics.get(rows)
+            if tactic != "mxfp8" or attn_out.k != self.k:
+                raise Unsupported(
+                    "oproj_rs", rows, f"an MXFP8 [{rows}, {attn_out.k}] attn_out "
+                    f"for tactic {tactic} (prepared: [R, {self.k}])",
+                )  # fmt: skip
+            return tactic
         rows = attn_out.shape[0]
         tactic = self.tactics.get(rows)
         if (
@@ -377,18 +389,8 @@ class SpOproj:
     def run(
         self, attn_out: torch.Tensor, out_shard: torch.Tensor, parity: int
     ) -> torch.Tensor:
-        rows = attn_out.shape[0]
-        tactic = self.tactics.get(rows)
-        if (
-            tactic is None
-            or attn_out.dtype != torch.bfloat16
-            or attn_out.shape[1] != self.k
-            or attn_out.stride() != (self.k, 1)
-        ):
-            raise Unsupported(
-                "oproj_rs", rows, f"attn_out {tuple(attn_out.shape)} stride "
-                f"{attn_out.stride()} {attn_out.dtype} (prepared: [R, {self.k}] BF16)",
-            )  # fmt: skip
+        rows = attn_out.shape[0] if isinstance(attn_out, torch.Tensor) else attn_out.rows
+        tactic = self._checked(attn_out)
         comm = self.comm
         if tactic == "cublas":
             partial = comm.partial[:rows]

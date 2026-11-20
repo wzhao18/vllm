@@ -33,7 +33,11 @@ _frost_fn = None
 
 
 def frost_supported(device: torch.device) -> bool:
-    """cuDNN FROST KDA is importable and the GPU is SM100-class."""
+    """Whether the KDA prefill core runs cuDNN FROST: every SM100-class GPU.
+
+    Capability only: other GPUs return False. On SM10x a missing or older cuDNN
+    frontend is an install error and raises (FROST is the prefill policy there; a
+    silent FlashKDA fallback would hide it)."""
     global _frost_fn
     if torch.cuda.get_device_capability(device)[0] != 10:
         return False
@@ -41,12 +45,19 @@ def frost_supported(device: torch.device) -> bool:
         try:
             import cudnn
             from cudnn.linear_attention.ops import kimi_delta_attention
-        except ImportError:
-            _frost_fn = False
-            return False
+        except ImportError as e:
+            raise RuntimeError(
+                "Kimi K3 KDA prefill on SM10x runs cuDNN FROST: install "
+                "nvidia-cudnn-frontend >= 1.33 (with nvidia-cutlass-dsl)"
+            ) from e
         version = tuple(int(x) for x in cudnn.__version__.split(".")[:2])
-        _frost_fn = kimi_delta_attention if version >= _FROST_MIN_VERSION else False
-    return _frost_fn is not False
+        if version < _FROST_MIN_VERSION:
+            raise RuntimeError(
+                f"Kimi K3 KDA prefill on SM10x runs cuDNN FROST: cuDNN frontend "
+                f"{cudnn.__version__} at {cudnn.__file__} is older than 1.33"
+            )
+        _frost_fn = kimi_delta_attention
+    return True
 
 
 def frost_prefill(
@@ -88,6 +99,68 @@ def frost_prefill(
         plan_name="kda_frost",
     )[:2]
     return o.view(1, T, H, D), final_state
+
+
+_persistent_plans: dict = {}
+
+
+def persistent_supported(device: torch.device) -> bool:
+    """The persistent CuTe DSL KDA core can run (SM100-class GPU, CuTe DSL)."""
+    if torch.cuda.get_device_capability(device)[0] != 10:
+        return False
+    try:
+        import cutlass  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def persistent_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """KDA chunked prefill on the persistent kernel (same contract as
+    ``frost_prefill``; ``cu_seqlens_cpu`` is the host copy used to plan the
+    (sequence, head) chain pieces once per batch)."""
+    from .kda_persistent import forward as kp
+
+    T, H, D = q.shape[1], q.shape[2], q.shape[3]
+    offsets = tuple(cu_seqlens_cpu.tolist())
+    key = (offsets, H, q.device.index)
+    plan = _persistent_plans.get(key)
+    if plan is None:
+        if len(_persistent_plans) >= 64:
+            _persistent_plans.clear()
+        plan = kp.make_plan(list(offsets), H, q.device)
+        _persistent_plans[key] = plan
+    out = torch.empty(1, T, H, D, dtype=q.dtype, device=q.device)
+    final_state = torch.empty_like(initial_state)
+    kp.fwd(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta.reshape(1, T, H).contiguous(),
+        D**-0.5,
+        out,
+        A_log,
+        dt_bias.view(H, D),
+        lower_bound,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu_seqlens,
+        plan=plan,
+    )
+    return out, final_state
 
 
 def o_norm_mxfp8(

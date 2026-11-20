@@ -86,6 +86,10 @@ CHUNKS_PER_THREAD = 2
 MAX_ROUNDS = 32
 # SpGatherCopy: 16-byte chunks per thread in flight per batch.
 GATHER_BATCH = 8
+# SpGatherPush: CTAs per early push (beside the step's kernels), 16-byte chunks
+# per 7168-wide row.
+PUSH_CTAS = 32
+WIDTH_CHUNK = 7168 // 8
 
 
 @asm(Uint32, pure=True)
@@ -237,6 +241,18 @@ class SpReduceScatter:
                     owner = row // n
                     offset = cute.crd2idx((rank, row - owner * n, column), recv.layout)
                     store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
+        self.reduce_owned(recv, out, gather, g)
+
+    @cute.jit
+    def reduce_owned(self, recv, out, gather, g):
+        """Poll, sum in rank order, store and re-arm this rank's n rows; re-arm the
+        gather rows [0, R) of the same parity (``g``: this thread's global index)."""
+        tp: cutlass.Constexpr = self.tp
+        R: cutlass.Constexpr = self.rows
+        n: cutlass.Constexpr = R // tp
+        width: cutlass.Constexpr = out.shape[1]
+        per: cutlass.Constexpr = width // 8
+        total: cutlass.Constexpr = self.grid * THREADS
         for i in cutlass.range_constexpr(rounds(n * per, self.grid)):
             c = g + i * total
             if c < n * per:
@@ -263,6 +279,55 @@ class SpReduceScatter:
             c = g + i * total
             if c < R * per:
                 rearm(at(gather, c // per, c % per * 8))
+
+
+class SpEmbedScatter(SpReduceScatter):
+    """The SP decode's input embedding straight into the row shards: the vocab-
+    parallel gather (stock ``VocabParallelEmbedding``: this rank's vocabulary shard
+    rows, zeros for ids it does not hold) pushed as the reduce-scatter's partial,
+    then ``SpReduceScatter``'s owner half. Replaces the masked gather, the TP
+    all-reduce of all R rows and the shard slice. Exactly one rank holds a valid id's
+    row, so the rank-order FP32 sum is that row bit for bit (a -0 becomes +0, as in
+    the all-reduce's x + 0).
+
+    Args: ids [R] (int32 / int64), weight [shard, width] (this rank's vocabulary
+    rows), start (the shard's first id), vocab (ids >= vocab are zero), then
+    ``SpReduceScatter``'s recv, peers, out, gather, rank."""
+
+    def __init__(self, tp, rows, grid):
+        super().__init__(tp, rows, grid, True)
+
+    @cute.kernel
+    def kernel(self, args):
+        ids, weight, start, vocab, recv, peers, out, gather, rank = args
+        tp: cutlass.Constexpr = self.tp
+        R: cutlass.Constexpr = self.rows
+        n: cutlass.Constexpr = R // tp
+        width: cutlass.Constexpr = out.shape[1]
+        per: cutlass.Constexpr = width // 8
+        total: cutlass.Constexpr = self.grid * THREADS
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        g = cta * THREADS + tid
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        for i in cutlass.range_constexpr(rounds(R * per, self.grid)):
+            c = g + i * total
+            if c < R * per:
+                row, column = c // per, c % per * 8
+                token = Int64(ids[row])
+                local = token - start
+                held = zeros((4,), Uint32)
+                valid = (token >= 0) & (token < vocab)
+                if valid & (local >= 0) & (local < weight.shape[0]):
+                    words = sanitized(load_vector(at(weight, local, column)))
+                    for j in cutlass.range_constexpr(4):
+                        held[j] = words[j]
+                owner = row // n
+                offset = cute.crd2idx((rank, row - owner * n, column), recv.layout)
+                words = tuple(held[j] for j in range(4))
+                store_relaxed(Int64(peers[owner]) + Int64(offset) * 2, words)
+        self.reduce_owned(recv, out, gather, g)
 
 
 def _check_rounds(count, what):
@@ -301,6 +366,26 @@ def compile_reduce_scatter(rows, tp, cap, width, grid, push, device):
         args = (partial, recv, peers, out, gather, Int32(0))
         compiled = cute.compile(kernel, *args, make_fake_stream())
         what = f"Kimi K3 SP reduce-scatter ({rows} rows, TP{tp})"
+        check_residency(compiled, device, grid, THREADS, what)
+    return compiled
+
+
+@cache
+def compile_embed_scatter(rows, tp, cap, width, grid, shard, ids_dtype, device):
+    """``SpEmbedScatter`` of ``rows`` token ids over ``grid`` CTAs."""
+    _check_rounds(rounds(rows * width // 8, grid), "SP embedding scatter")
+    with torch.accelerator.device_index(device):
+        size = torch.empty((), dtype=ids_dtype).element_size()
+        ids = fake((rows,), None, ids_dtype, size)
+        weight = fake((shard, width))
+        recv = fake((tp, cap // tp, width))
+        peers = fake((tp,), None, torch.int64)
+        out, gather = fake((rows // tp, width)), fake((cap, width))
+        args = (ids, weight, Int64(0), Int64(0), recv, peers, out, gather, Int32(0))
+        compiled = cute.compile(
+            SpEmbedScatter(tp, rows, grid), *args, make_fake_stream()
+        )
+        what = f"Kimi K3 SP embedding scatter ({rows} rows, TP{tp})"
         check_residency(compiled, device, grid, THREADS, what)
     return compiled
 
@@ -435,6 +520,27 @@ class SpComm:
             self.device.index,
         )  # fmt: skip
 
+    def embed_scatter(
+        self, ids, weight, start: int, vocab: int, out_shard, parity: int
+    ) -> torch.Tensor:
+        """``SpEmbedScatter``: this rank's shard [n, width] of the embedding of the
+        R = len(ids) tokens (``weight``: this rank's vocabulary rows from id
+        ``start``) into ``out_shard``. Re-arms gather[parity][:R]."""
+        rows = ids.shape[0]
+        n = self.shard(rows)
+        if out_shard.shape != (n, self.width) or not out_shard.is_contiguous():
+            raise Unsupported("embed", rows, f"out_shard {tuple(out_shard.shape)}")
+        gather, _, recv, peers = self._views[parity]
+        code = compile_embed_scatter(
+            rows, self.tp, self.rows_cap, self.width, self.grid(rows),
+            weight.shape[0], ids.dtype, self.device.index,
+        )  # fmt: skip
+        size = ids.element_size()
+        args = (to_cute(ids, size), to_cute(weight), Int64(start), Int64(vocab))
+        code(*args, recv, peers, to_cute(out_shard), gather, self._rank,
+             stream(self.device))  # fmt: skip
+        return out_shard
+
     def views(self, parity: int):
         """(local gather, its multicast address, local recv, peers) of ``parity``
         as kernel arguments."""
@@ -509,17 +615,15 @@ class SpComm:
         return out_shard
 
 
-class SpGatherCopy:
-    """The step's final row all-gather (stock ``sp_all_gather`` of the packed
-    [hidden | aux...] shard rows, width W): multicast-store this rank's n rows
-    (sanitized words) into rows [rank n, (rank + 1) n) of every rank's box [cap, W],
-    then poll every chunk of rows [0, TP n), copy it into ``out`` [TP n, W] and re-arm
-    it. One kernel; its CTAs poll stores of every rank's grid: at most one CTA per SM
-    (co-resident). Args: x [n, W], the local box view, its multicast address, out,
-    rank."""
+class SpGatherPush:
+    """The early part of ``SpGatherCopy``'s push: multicast-store this rank's n rows of
+    ``x`` [n, w] (sanitized words) into columns [col, col + w) of rows [rank n,
+    (rank + 1) n) of every rank's box [cap, W], for packed columns that are final
+    before the step's end (``SpFinalGather.push``). No poll: ``SpGatherCopy`` polls
+    every column. Args: x [n, w], the box's multicast address, rank."""
 
-    def __init__(self, tp, grid):
-        self.tp, self.grid = tp, grid
+    def __init__(self, grid, width, col):
+        self.grid, self.width, self.col = grid, width, col
 
     @cute.jit
     def __call__(self, *args):
@@ -527,9 +631,64 @@ class SpGatherCopy:
 
     @cute.kernel
     def kernel(self, args):
-        x, box, mc, out, rank = args
-        n: cutlass.Constexpr = x.shape[0]
-        width: cutlass.Constexpr = x.shape[1]
+        x, mc, rank = args
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        push_rows(x, mc, rank, self.col, self.width, cta * THREADS + tid,
+                  self.grid * THREADS)  # fmt: skip
+
+
+@cute.jit
+def push_rows(x, mc, rank, col: cutlass.Constexpr, width: cutlass.Constexpr, g, total):
+    """Multicast-store rows [0, n) of ``x`` [n, w] at rows rank n + row, columns col +
+    .. of a box of ``width`` columns: GATHER_BATCH chunks per thread in flight (all
+    loads, then all stores: a load -> store chain per chunk is latency bound)."""
+    n: cutlass.Constexpr = x.shape[0]
+    per: cutlass.Constexpr = x.shape[1] // 8
+    U: cutlass.Constexpr = GATHER_BATCH
+    held = cute.make_rmem_tensor(4 * U, Uint32)
+    for base in range(g, n * per, total * U):
+        for i in cutlass.range_constexpr(U):
+            c = base + i * total
+            if c < n * per:
+                words = load_vector(at(x, c // per, c % per * 8))
+                for j in cutlass.range_constexpr(4):
+                    held[4 * i + j] = words[j]
+        for i in cutlass.range_constexpr(U):
+            c = base + i * total
+            if c < n * per:
+                row, column = c // per, c % per * 8
+                words = sanitized(tuple(held[4 * i + j] for j in range(4)))
+                offset = Int64(rank * n + row) * width + col + column
+                multicast_words(mc + offset * 2, words)
+
+
+class SpGatherCopy:
+    """The step's final row all-gather (stock ``sp_all_gather`` of the packed
+    [hidden | aux...] shard rows, width W): multicast-store this rank's n rows of each
+    source (``cols``: its first packed column; the other columns were pushed earlier
+    by ``SpGatherPush``) into rows [rank n, (rank + 1) n) of every rank's box [cap, W],
+    then poll every chunk of rows [0, TP n), copy it into ``out`` [TP n, W] and re-arm
+    it. One kernel; its CTAs poll stores of every rank's grid: at most one CTA per SM
+    (co-resident). Args: the sources [n, w_i], the local box view, its multicast
+    address, out, rank."""
+
+    def __init__(self, tp, grid, cols=(0,)):
+        self.tp, self.grid, self.cols = tp, grid, cols
+
+    @cute.jit
+    def __call__(self, *args):
+        launch(self.kernel, args, self.grid, THREADS)
+
+    @cute.kernel
+    def kernel(self, args):
+        S: cutlass.Constexpr = len(self.cols)
+        xs = args[:S]
+        box, mc, out, rank = args[S:]
+        n: cutlass.Constexpr = xs[0].shape[0]
+        width: cutlass.Constexpr = out.shape[1]
         per: cutlass.Constexpr = width // 8
         total: cutlass.Constexpr = self.grid * THREADS
         R: cutlass.Constexpr = self.tp * n
@@ -538,24 +697,10 @@ class SpGatherCopy:
         g = cta * THREADS + tid
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
-        # GATHER_BATCH chunks per thread in flight: all loads, then all stores (a
-        # load -> store chain per chunk leaves the push and the poll latency bound).
+        for s in cutlass.range_constexpr(S):
+            push_rows(xs[s], mc, rank, self.cols[s], width, g, total)
         U: cutlass.Constexpr = GATHER_BATCH
         held = cute.make_rmem_tensor(4 * U, Uint32)
-        for base in range(g, n * per, total * U):
-            for i in cutlass.range_constexpr(U):
-                c = base + i * total
-                if c < n * per:
-                    words = load_vector(at(x, c // per, c % per * 8))
-                    for j in cutlass.range_constexpr(4):
-                        held[4 * i + j] = words[j]
-            for i in cutlass.range_constexpr(U):
-                c = base + i * total
-                if c < n * per:
-                    row, column = c // per, c % per * 8
-                    words = sanitized(tuple(held[4 * i + j] for j in range(4)))
-                    offset = Int64(rank * n + row) * width + column
-                    multicast_words(mc + offset * 2, words)
         for base in range(g, R * per, total * U):
             pending = Uint32(0)
             for i in cutlass.range_constexpr(U):
@@ -586,16 +731,27 @@ class SpGatherCopy:
 
 
 @cache
-def compile_gather_copy(n, tp, cap, width, grid, device):
+def compile_gather_copy(n, tp, cap, width, grid, device, cols=(0,), widths=None):
+    widths = widths or (width,)
     with torch.accelerator.device_index(device):
-        x, box, out = fake((n, width)), fake((cap, width)), fake((tp * n, width))
-        kernel = SpGatherCopy(tp, grid)
+        xs = tuple(fake((n, w)) for w in widths)
+        box, out = fake((cap, width)), fake((tp * n, width))
+        kernel = SpGatherCopy(tp, grid, cols)
         compiled = cute.compile(
-            kernel, x, box, Int64(0), out, Int32(0), make_fake_stream()
+            kernel, *xs, box, Int64(0), out, Int32(0), make_fake_stream()
         )
         what = f"Kimi K3 SP final gather ({tp} x {n} rows x {width})"
         check_residency(compiled, device, grid, THREADS, what)
     return compiled
+
+
+@cache
+def compile_gather_push(n, w, width, col, grid, device):
+    with torch.accelerator.device_index(device):
+        kernel = SpGatherPush(grid, width, col)
+        return cute.compile(
+            kernel, fake((n, w)), Int64(0), Int32(0), make_fake_stream()
+        )
 
 
 class SpFinalGather:
@@ -627,29 +783,61 @@ class SpFinalGather:
         chunks = rows * self.width // 8
         return max(1, min(self.sms, -(-chunks // (THREADS * 8))))
 
-    def prepare(self, rows):
+    def prepare(self, rows, cols=(0,), widths=None):
         n = rows // self.tp
         return compile_gather_copy(
-            n, self.tp, self.rows_cap, self.width, self.grid(rows), self.device.index
+            n, self.tp, self.rows_cap, self.width, self.grid(rows),
+            self.device.index, tuple(cols), None if widths is None else tuple(widths),
+        )  # fmt: skip
+
+    def push_grid(self, rows):
+        """A few CTAs: the early pushes run beside the step's own kernels."""
+        chunks = rows // self.tp * WIDTH_CHUNK
+        return max(1, min(PUSH_CTAS, -(-chunks // (THREADS * GATHER_BATCH))))
+
+    def prepare_push(self, rows, col, w):
+        n = rows // self.tp
+        return compile_gather_push(
+            n, w, self.width, col, self.push_grid(rows), self.device.index
         )
 
-    def run(self, x_shard: torch.Tensor) -> torch.Tensor:
-        n = x_shard.shape[0]
-        rows = n * self.tp
+    def _check(self, x_shard, w, rows):
         if (
-            x_shard.shape[1] != self.width
+            x_shard.shape[1] != w
             or not x_shard.is_contiguous()
             or x_shard.dtype != torch.bfloat16
             or rows > self.rows_cap
         ):
             raise Unsupported(
                 "final_gather", rows, f"x_shard {tuple(x_shard.shape)} (width "
-                f"{self.width}, cap {self.rows_cap})",
+                f"{w} of {self.width}, cap {self.rows_cap})",
             )  # fmt: skip
-        out = x_shard.new_empty((rows, self.width))
-        code = self.prepare(rows)
+
+    def push(self, x_shard: torch.Tensor, col: int) -> None:
+        """Multicast this rank's rows of packed columns [col, col + w) now (the
+        column block is final); the step's ``run`` polls them with the rest."""
+        n, w = x_shard.shape
+        rows = n * self.tp
+        self._check(x_shard, w, rows)
+        code = self.prepare_push(rows, col, w)
+        code(to_cute(x_shard), Int64(self.mc), self._rank, stream(self.device))
+
+    def run(self, x_shard: torch.Tensor, cols=None) -> torch.Tensor:
+        """The packed all-gather [TP n, W]: ``x_shard`` [n, W], or the column blocks
+        not pushed yet: ``cols`` = ((tensor [n, w], first column), ...)."""
+        full = cols is None
+        if full:
+            cols = ((x_shard, 0),)
+        n = cols[0][0].shape[0]
+        rows = n * self.tp
+        for t, _ in cols:
+            self._check(t, self.width if full else t.shape[1], rows)
+        out = cols[0][0].new_empty((rows, self.width))
+        offsets = tuple(c for _, c in cols)
+        widths = None if full else tuple(t.shape[1] for t, _ in cols)
+        code = self.prepare(rows, offsets, widths)
         code(
-            to_cute(x_shard), self._box, Int64(self.mc), to_cute(out), self._rank,
-            stream(self.device),
+            *(to_cute(t) for t, _ in cols), self._box, Int64(self.mc), to_cute(out),
+            self._rank, stream(self.device),
         )  # fmt: skip
         return out

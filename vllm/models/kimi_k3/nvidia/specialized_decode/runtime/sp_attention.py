@@ -213,7 +213,12 @@ class SpAttentionBlock:
             self.slots = attention.mla_attn.mla_attn.layer_name  # (as run_dsa)
             self.index_prefix = attention.dsa_indexer.k_cache.prefix
         else:
-            self.core = SpKdaCore(attention, rows, records=step.records, ctx=ctx)
+            # The MXFP8 o_proj's input written by the KDA core itself where it can
+            # (``SpKdaCore.mx_rows``), not by a standalone quantization of attn_out.
+            self.core = SpKdaCore(
+                attention, rows, records=step.records, ctx=ctx, mx_out=mx_out
+            )
+        self.mx_input = output.input if mx_out else None
         if self.core.pitch != pitch:
             raise Unsupported(
                 kind, None,
@@ -236,7 +241,7 @@ class SpAttentionBlock:
         rows = gathered.shape[0] if isinstance(gathered, torch.Tensor) else gathered.rows
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
-        attn_out = self.attn_out[:rows]
+        attn_out = self.core_output(rows)
         if self.kind == "dsa":
             indexer = get_forward_context().attn_metadata[self.index_prefix]
             self.core.run(
@@ -258,7 +263,7 @@ class SpAttentionBlock:
         gathered = comm.all_gather(x_shard, self.parity)
         projected = self.projected[:rows]
         self.projection.run(gathered, projected)
-        attn_out = self.attn_out[:rows]
+        attn_out = self.core_output(rows)
         if self.kind == "dsa":
             # The packed indexer's write slots come from its own metadata
             # (``providers.Attention.run_dsa``).
@@ -272,6 +277,13 @@ class SpAttentionBlock:
             self.core.run(projected, attn_out, caches=caches, metadata=metadata)
         shard = x_shard.new_empty((n, WIDTH))
         return self.oproj.run(attn_out, shard, self.parity)
+
+    def core_output(self, rows):
+        """The core's output at ``rows``: BF16 ``attn_out``, or the MXFP8 o_proj's
+        input view where the KDA core writes it (``SpKdaCore.writes_mxfp8``)."""
+        if self.kind == "kda" and self.core.writes_mxfp8(rows):
+            return self.mx_input.view(rows)
+        return self.attn_out[:rows]
 
     @property
     def comm(self) -> SpComm:
@@ -332,6 +344,30 @@ def check_stock_drafter(tp):
     return tuple(sorted(tables))
 
 
+def sp_embedding(embedding, ctx):
+    """(weight, start, vocab) of the vocabulary shard ``SpEmbedScatter`` gathers from
+    (stock ``VocabParallelEmbedding``: rank r holds ids [r shard, (r + 1) shard) below
+    ``org_vocab_size``), or None where its layout is not that one (the stock module
+    then runs, declared)."""
+    weight = getattr(embedding, "weight", None)
+    shards = getattr(embedding, "shard_indices", None)
+    if (
+        weight is None
+        or shards is None
+        or weight.dtype != torch.bfloat16
+        or weight.dim() != 2
+        or weight.shape[1] != WIDTH
+        or not weight.is_contiguous()
+        or getattr(embedding, "num_added_embeddings", 0)
+        or shards.org_vocab_start_index != ctx.rank * weight.shape[0]
+        or shards.padded_org_vocab_start_index != shards.org_vocab_start_index
+        or shards.padded_org_vocab_end_index - shards.org_vocab_start_index
+        != weight.shape[0]
+    ):
+        return None
+    return weight.detach(), shards.org_vocab_start_index, embedding.org_vocab_size
+
+
 class SpStep:
     """Builds the SP blocks on a ``SpecializedDecode`` (``runtime``, built with
     ``sequence_parallel``) and runs its captured steps (module docstring). All
@@ -362,6 +398,10 @@ class SpStep:
                 raise Unsupported("sp_step", shape, f"not whole q{self.q} requests")
             shard_rows(shape, ctx)
         self.shard_cap = rows[-1] // ctx.tp
+        if self.shard_cap >= 256:  # normalize: one stock RMSNorm launch per shard
+            raise Unsupported(
+                "sp_step", None, f"{self.shard_cap} shard rows (final norm < 256)"
+            )
         self.layers = layers = runtime.layers
         for decoder in layers:
             sp_layer(decoder, self)
@@ -378,8 +418,31 @@ class SpStep:
         # rank's: no pipeline stages on the SP path).
         packed = WIDTH * (1 + len(self.aux_layers))
         self.final_gather = SpFinalGather(*owner, width=packed, rows_cap=rows[-1])
+        # Early aux columns. In the stock prefix-only capture an aux stream is
+        # prefix_sum + the layer's MLP output: exactly the prefix row the next layer's
+        # pre-AttnRes stores, which stays until that layer's reduce. A side stream
+        # multicasts it into the final box meanwhile ({gather layer: packed column});
+        # the other columns go with the final gather.
+        self.early_aux: dict[int, int] = {}
+        prefix_only = not (backbone._aux_attn_res_stream and backbone.use_attn_res)
+        indices = {d.layer_idx for d in layers}
+        for k, a in enumerate(self.aux_layers):
+            if prefix_only and a in indices and a != backbone.start_layer:
+                self.early_aux[a] = WIDTH * (1 + k)
+        self.tail_cols = (0,) + tuple(
+            WIDTH * (1 + k)
+            for k, a in enumerate(self.aux_layers)
+            if a not in self.early_aux
+        )
+        self.side = torch.cuda.Stream(self.device) if self.early_aux else None
         for r in rows:
             self.final_gather.prepare(r)
+            if self.early_aux:
+                widths = (WIDTH,) * len(self.tail_cols)
+                self.final_gather.prepare(r, self.tail_cols, widths)
+            for col in self.early_aux.values():
+                self.final_gather.prepare_push(r, col, WIDTH)
+        self.embedding = sp_embedding(backbone.embed_tokens, ctx)
         kinds = {attention_kind(d.self_attn) for d in layers}
         self.dsa_box = self.dsa_scratch = None
         self.dsa_layers = 0
@@ -457,11 +520,12 @@ class SpStep:
         spec = get_current_vllm_config().speculative_config
         method = getattr(spec, "rejection_sample_method", None)
         declared = {
-            "embed": "stock VocabParallelEmbedding",
             "attn_res": "the final AttnRes: stock attn_res on the shard",
             "lm_head": "stock",
             "sampler": "stock",
         }
+        if self.embedding is None:
+            declared["embed"] = "stock VocabParallelEmbedding"
         if not self.gqa_drafter:
             declared["drafter"] = DRAFTER_NOTE
         if self.moe:
@@ -488,6 +552,12 @@ class SpStep:
             choices["final_gather"] = Choice(
                 Path.GENERIC, "multicast", note="SpFinalGather (Lamport, one kernel)"
             )
+            if self.embedding is not None:
+                choices["embed"] = Choice(
+                    Path.GENERIC, "scatter",
+                    note="vocab-parallel gather pushed as the SP reduce-scatter "
+                    "(SpEmbedScatter)",
+                )  # fmt: skip
             choices["sp_boundary"] = Choice(
                 Path.GENERIC, "cluster",
                 note="AttnRes + SP AG / RS fused (attn_res.sp_fused)",
@@ -556,9 +626,9 @@ class SpStep:
         runtime = self.runtime
         backbone = runtime.backbone
         x = inputs_embeds
-        if x is None:
+        if x is None and self.embedding is None:
             x = backbone.embed_input_ids(input_ids)
-        rows = x.shape[0]
+        rows = (x if x is not None else input_ids).shape[0]
         if rows not in self.rows:
             raise Unsupported(
                 "sp_step", Shape(rows, step.q), "not a captured row count"
@@ -567,8 +637,20 @@ class SpStep:
         # forward context when the stock deployment skips them.
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             context = get_forward_context()
-            context.is_padding = sp_padding_mask(context.is_padding, x)
-        hidden = sp_shard(x)
+            rows_like = x if x is not None else input_ids
+            context.is_padding = sp_padding_mask(context.is_padding, rows_like)
+        if x is None:
+            # This rank's shard rows of the embedding, straight from the vocabulary
+            # shards (SpEmbedScatter, the reduce-scatter parity of block 1: block 0
+            # re-arms nothing it uses; module docstring of common.sp_comm).
+            weight, start, vocab = self.embedding
+            shard = backbone.embed_tokens.weight.new_empty((rows // self.ctx.tp, WIDTH))
+            parity = 1 % self.comm.parities
+            hidden = self.comm.embed_scatter(
+                input_ids, weight, start, vocab, shard, parity
+            )
+        else:
+            hidden = sp_shard(x)
         remote = backbone.collect_remote_aux_hidden_states(None)
         aux = [hidden] if backbone.start_layer in self.aux_layers else []
         residual = hidden.new_empty(
@@ -577,11 +659,20 @@ class SpStep:
         prefix_sum, hidden = hidden, None
         # The prefix sum is updated in place (the embedding shard first): the fused
         # boundaries store each updated / new prefix row into it.
+        early = self.early_aux
+        main = torch.cuda.current_stream(self.device)
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
             block, bound = self.blocks[index], self.bounds[index]
             gathered = bound.gather(hidden, prefix_sum, residual, block.parity)
+            col = early.get(index)
+            if col is not None:  # prefix_sum now holds the previous layer's aux row
+                self.side.wait_stream(main)
+                with torch.cuda.stream(self.side):
+                    self.final_gather.push(prefix_sum, col)
             partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
+            if col is not None:  # the reduce updates prefix_sum in place
+                main.wait_stream(self.side)
             out = prefix_sum.new_empty(prefix_sum.shape)
             hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
@@ -589,7 +680,7 @@ class SpStep:
                 hidden = layer.mlp(hidden)
             else:  # (its MXFP8 shared gate_up input: written by bound.reduce)
                 hidden = mlp.run(hidden, prequantized=bound.out_mx is not None)
-            if index + 1 in self.aux_layers:
+            if index + 1 in self.aux_layers and index + 1 not in early:
                 aux.append(
                     backbone._capture_aux_hidden_stream(
                         index, prefix_sum, hidden, residual
@@ -608,16 +699,26 @@ class SpStep:
             eps=final.variance_epsilon,
             output_norm_eps=0.0,
         )
+        # The backbone's final norm on this rank's rows, before the gather: a shard
+        # has < 256 rows, so the stock RMSNorm kernel reduces each row as
+        # ``runtime.normalize`` does in its 255-row chunks (bit-equal rows, one
+        # small kernel instead of two chunks and a cat over the gathered rows).
+        hidden = runtime.normalize(hidden)
         # The final row all-gather on the multicast box (``SpFinalGather``; stock
         # ``sp_all_gather``'s rows, sanitized words).
-        if aux:
+        if early:
+            width = hidden.shape[-1]
+            sources = tuple(zip((hidden, *aux), self.tail_cols))
+            packed = self.final_gather.run(None, cols=sources)[:rows]
+            hidden, *aux = packed.split(width, dim=-1)
+        elif aux:
             width = hidden.shape[-1]
             packed = self.final_gather.run(torch.cat([hidden, *aux], dim=-1))[:rows]
             hidden, *aux = packed.split(width, dim=-1)
         else:
             hidden = self.final_gather.run(hidden.contiguous())[:rows]
         aux = remote + aux
-        return runtime.normalize((hidden, aux) if aux else hidden)
+        return (hidden, aux) if aux else hidden
 
     def prepare_kv(self):
         """Compile every block's core for the bound KV cache (the profiling cache,

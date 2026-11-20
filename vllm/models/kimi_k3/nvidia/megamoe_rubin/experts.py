@@ -61,9 +61,11 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from .config import (
+    DEDUP_VARIANTS,
     SHIPPED_KNOBS,
     QuantKind,
     RubinBucket,
+    RubinKnobs,
     RubinMoeConfig,
     RubinMoeProblem,
     Variant,
@@ -120,6 +122,44 @@ RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 # FlashInfer a368c5f66, hint 64, CUDA graph): capacity 128 / N128 at 32 / 96 / 128
 # live tokens 44.9 / 47.8 / 50.7 us vs capacity 256 / N256 51.0 / 52.8 / 55.9 us.
 RUBIN_WIDE_EP_DECODE_TOKENS = 128
+
+# EP32 decode: the <=128-token bucket runs the refreshed GenPhase kernel (src_gp) on its
+# decode scheduler, die-aware (expert_half) on decode servers. Measured at real EP32
+# (8 nodes x 4 VR200, 896 experts, NVFP4, 128-token capacity, random routing, CUDA graph
+# of the kernel, p50 of the slowest rank, die-local weights; D-MOE runs/D-MOE/out/ep32
+# g32inf / g32gpa): inference kernel 67.8 / 70.5 / 68.7 us vs GenPhase 62.7 / 63.8 /
+# 65.6 us at 32 / 96 / 128 tokens per rank (rel-L2 vs the bf16 reference 0.166 both).
+# EP28 keeps the inference kernel (not measured).
+RUBIN_GENPHASE_DECODE_EP_SIZES = (32,)
+
+# Prefill-sized NVFP4 inference buckets (at least RUBIN_DEDUP_MIN_TOKENS tokens per rank:
+# the P3-16 8192-token sub-call) run the refreshed inference kernel with the deduplicated
+# combine and two epilogue warpgroups (variant inference_dedup_wg2, token back from
+# standalone warps): one BF16 row per (owner rank, token) crosses NVLink instead of one
+# per route (EP16 top-16: ~10.3 instead of 16 rows per token), and the FC1/FC2 epilogue
+# (the compute-side bound) runs on 8 warps. Measured on VR200 (NVFP4, 56 experts/GPU,
+# 2 x 8192 tokens/rank, random routing): EP4 2110 (shipped) -> 1893 (dedup) -> 1736 us.
+RUBIN_DEDUP_VARIANT = "inference_dedup_wg2"
+RUBIN_DEDUP_TOKEN_BACK_MODE = "standalone_warps"
+RUBIN_DEDUP_MIN_TOKENS = 4096
+RUBIN_GENPHASE_DECODE_KNOBS = RubinKnobs(
+    mma_tiler_mnk=(256, 128, 256),
+    cluster_shape_mn=(4, 1),
+    fallback_cluster_shape_mn=None,
+    schedule_policy=("decode", None),
+    work_id_mode="atomic_counter",
+    fc2_use_bulk=True,
+    fc2_tma_stages=2,
+    epi_flag_batches=(1, 4),
+    token_in_flag_batch=1,
+    token_back_mode="epi_warps",
+    reduce_topk_in_kernel=False,
+)
+
+# The decode bucket with the fused MXFP8 shared expert (enable_fused_shared): the decode
+# scheduler (die-aware on decode servers) with the shared tile stream ahead of the routed
+# sources (VENDOR.md S-SH): shared FC1 streams under the dispatch.
+RUBIN_GENPHASE_FUSED_SHARED_KNOBS = RUBIN_GENPHASE_DECODE_KNOBS
 
 
 def rubin_bucket_capacities(
@@ -237,10 +277,45 @@ def select_rubin_buckets(
     else:
         buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
         own = f"knobs of the {main.max_tokens} bucket"
-    for bucket in buckets:
+    if world_size in RUBIN_GENPHASE_DECODE_EP_SIZES and problem.quant_kind == "nvfp4":
+        buckets = [_genphase_decode(b) for b in buckets]
+        main = _genphase_decode(main)
+    if problem.quant_kind == "nvfp4":
+        buckets = [_prefill_dedup(b) for b in buckets]
+        main = _prefill_dedup(main)
+    for bucket in (*buckets, main):
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
     return (*buckets, main), notes + extra
+
+
+def _prefill_dedup(bucket: RubinBucket) -> RubinBucket:
+    """A prefill-sized inference bucket on the refreshed dedup-combine kernel (same
+    tile/schedule knobs, token back from standalone warps); others unchanged."""
+    if (
+        bucket.variant != "inference"
+        or bucket.die_sm_mask32 is not None
+        or bucket.max_tokens < RUBIN_DEDUP_MIN_TOKENS
+    ):
+        return bucket
+    return dataclasses.replace(
+        bucket,
+        variant=RUBIN_DEDUP_VARIANT,
+        knobs=dataclasses.replace(
+            bucket.knobs, token_back_mode=RUBIN_DEDUP_TOKEN_BACK_MODE
+        ),
+    )
+
+
+def _genphase_decode(bucket: RubinBucket) -> RubinBucket:
+    """A wide-EP bucket of at most :data:`RUBIN_WIDE_EP_DECODE_TOKENS` tokens per rank
+    on the refreshed GenPhase kernel (src_gp, decode scheduler; die-aware
+    ``expert_half`` once the bucket is die-local); larger buckets unchanged."""
+    if bucket.variant != "inference" or bucket.max_tokens > RUBIN_WIDE_EP_DECODE_TOKENS:
+        return bucket
+    return dataclasses.replace(
+        bucket, variant="genphase", knobs=RUBIN_GENPHASE_DECODE_KNOBS
+    )
 
 
 # The forward's DPMetadata (held, so its id is never reused) and whether its DP batch
@@ -654,28 +729,86 @@ class KimiK3MegaMoEExperts(nn.Module):
         # die-local 148.3 / 158.6 / 158.9, full-grid die-local 140.8 / 149.8 / 150.5
         # (bitwise equal). Capped, each die's stream gets the clusters the side
         # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
+        # The prefill-sized dedup buckets have no die-split schedule: they keep the
+        # die-oblivious form and leave the decode buckets' die-local choice alone.
         die_mask = None
         if die_local and not self.prefill_worker and all(
-            bucket.variant == "inference"
-            and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
+            tuple(bucket.knobs.schedule_policy)[0]
+            == ("decode" if bucket.variant == "genphase" else "phase_interleave")
             for bucket in self.buckets
+            if bucket.variant not in DEDUP_VARIANTS
         ):
             from . import die_local
 
             die_mask = die_local.current_die_sm_mask32()
-        self.buckets = tuple(
-            dataclasses.replace(
+
+        def _placed(bucket: RubinBucket) -> RubinBucket:
+            mask = None if bucket.variant in DEDUP_VARIANTS else die_mask
+            return dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
-                max_sm_count=max_sm_count if die_mask is None else None,
-                die_sm_mask32=die_mask,
+                max_sm_count=max_sm_count if mask is None else None,
+                die_sm_mask32=mask,
             )
-            for bucket in self.buckets
-        )
+
+        self.buckets = tuple(_placed(bucket) for bucket in self.buckets)
         self.bucket = self.buckets[-1]
         # The overlap runs under sequence parallelism: each TP rank holds a 1/TP
         # shard of its DP batch (sequence_parallel_chunk).
         self.sequence_parallel = True
+
+    def enable_fused_shared(self, hidden: int, intermediate: int) -> bool:
+        """Switch this layer's wide-EP decode bucket (``RUBIN_WIDE_EP_DECODE_TOKENS``
+        tokens per rank, the D3-32 SP shard) to the refreshed GenPhase kernel with an
+        MXFP8 E4M3 shared expert of ``(hidden, intermediate)`` fused in (its FC1 tiles
+        run under the dispatch; the side-stream shared expert then has nothing left
+        to overlap). Per-shape: larger buckets keep their kernel. Returns whether a
+        bucket switched. Same call on every layer of the EP group (the buckets key
+        the runtime); then :meth:`warmup_fused_shared` before CUDA graph capture."""
+        if self.prefill_worker:
+            return False
+        switched = False
+        buckets = []
+        for bucket in self.buckets:
+            if (
+                bucket.max_tokens <= RUBIN_WIDE_EP_DECODE_TOKENS
+                and self.problem.quant_kind == "nvfp4"
+            ):
+                bucket = dataclasses.replace(
+                    bucket,
+                    variant="genphase",
+                    knobs=RUBIN_GENPHASE_FUSED_SHARED_KNOBS,
+                    max_sm_count=None,
+                    shared=(hidden, intermediate),
+                )
+                switched = True
+            buckets.append(bucket)
+        self.buckets = tuple(buckets)
+        self.bucket = self.buckets[-1]
+        return switched
+
+    def fused_shared(self, num_tokens: int) -> bool:
+        """Whether a forward of ``num_tokens`` runs the fused shared expert (it then
+        takes ``fused_shared=``)."""
+        return self.select_bucket(num_tokens).shared is not None
+
+    def warmup_fused_shared(self, shared):
+        """Collective: build, compile and warm the fused-shared runtime with one
+        layer's ``session.FusedSharedArgs``; returns the arguments to launch with
+        (FC1 homed per die on die-local buckets)."""
+        if self.kernel_weights is None:
+            raise RuntimeError(f"{self.prefix}: warmup_fused_shared before weights.")
+        if self.bucket.die_sm_mask32 is not None:
+            from .die_local import place_halves
+
+            # FC1 [1, K, N] is a K-major view of the striped [1, N, K] copy: home its
+            # feature halves per die (the decode scheduler claims them die-local).
+            w = shared.fc1[0]
+            placed = place_halves(w.permute(0, 2, 1)).permute(0, 2, 1)
+            shared = shared._replace(fc1=(placed, shared.fc1[1]))
+        self.get_runtime().warmup(self.kernel_weights, shared=shared)
+        self._warm_fused_shared = shared
+        return shared
 
     # -- runtime / kernel layout -----------------------------------------------------
 
@@ -860,7 +993,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         out: torch.Tensor | None = None,
         ep_tokens: int | None = None,
         output_rmsnorm: nn.Module | None = None,
-    ) -> torch.Tensor:
+        fused_shared=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the routed experts (and an unfused ``shared_experts``) on this rank's
         tokens; arguments and result as :meth:`DeepGemmMegaMoEExperts.forward`.
 
@@ -925,6 +1059,19 @@ class KimiK3MegaMoEExperts(nn.Module):
             if shared_experts is not None:
                 raise ValueError("output_rmsnorm with an unfused shared expert is not supported.")
             extra["rmsnorm"] = _rmsnorm_args(output_rmsnorm)
+        drop_shared = False
+        if fused_shared is not None:
+            if shared_experts is not None or bucket.shared is None:
+                raise ValueError(f"{self.prefix}: no fused shared expert at {num_tokens} tokens.")
+            extra["shared"] = fused_shared
+        elif bucket.shared is not None:
+            # A caller outside the specialized decoder (the stock forward, e.g. a
+            # bench's context prefill) runs its own shared expert: the fused bucket's
+            # shared tiles run on the warmed operands and their output is dropped.
+            extra["shared"] = getattr(self, "_warm_fused_shared", None)
+            if extra["shared"] is None:
+                raise ValueError(f"{self.prefix}: the {bucket.max_tokens} bucket fuses the shared expert.")
+            drop_shared = True
         y = self.get_runtime().forward(
             hidden_states,
             topk_ids,
@@ -937,6 +1084,8 @@ class KimiK3MegaMoEExperts(nn.Module):
             ep_tokens=self.ep_tokens(num_tokens) if ep_tokens is None else ep_tokens,
             **extra,
         )
+        if drop_shared:
+            y = y[0]
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y
