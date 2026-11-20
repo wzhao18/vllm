@@ -865,6 +865,31 @@ def permute_gate_up(weight):
     return torch.cat((g, u), dim=1).reshape(n, k).contiguous()
 
 
+# DIAGNOSTIC ONLY (D-MOE-STREAM r6 lu2 timeline, never lands): DMS_LU2_DUMP=<prefix> dumps every prepared
+# plan's stamp region (the last call's per-CTA %globaltimer stamps) at process exit.
+_DIAG_PLANS = []
+
+
+def _diag_register(gemm, rows, n_pad, split, flags):
+    import os
+
+    prefix = os.environ.get("DMS_LU2_DUMP")
+    if not prefix:
+        return
+    if not _DIAG_PLANS:
+        import atexit
+
+        def dump():
+            out = []
+            for g, r, npad, sp, fl in _DIAG_PLANS:
+                out.append({"n": g.n, "k": g.k, "rows": r, "n_pad": npad, "split": sp, "flags": fl.cpu()})
+            rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+            torch.save(out, f"{prefix}.r{rank}.pt")
+
+        atexit.register(dump)
+    _DIAG_PLANS.append((gemm, rows, n_pad, split, flags))
+
+
 class PreparedWide:
     """``WideGemm`` per prepared row count on one weight (``silu``: a gate_up weight
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
@@ -917,6 +942,7 @@ class PreparedWide:
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
             self.kernels[rows] = _COMPILED[key]
             self.state[rows] = (ws, flags, self._ws(ws), self._ws(flags))
+            _diag_register(self, rows, n_pad, split, flags)
         self.w = w
         return self
 
