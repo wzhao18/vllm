@@ -99,6 +99,12 @@ class SymmetricBufferHost:
     rank: Int32
     max_ranks: cutlass.Constexpr[int]
 
+    def __cute_cache_key__(self):
+        """Kimi K3 CuTe cache key: base_address, offsets and rank are launch values
+        (the adapter passes them as runtime Int64 / Int32 fields); only the rank
+        count shapes the trace."""
+        return int(self.max_ranks), len(tuple(self.offsets))
+
     @staticmethod
     def _as_int64(value) -> Int64:
         return value if isinstance(value, Int64) else Int64(int(value))
