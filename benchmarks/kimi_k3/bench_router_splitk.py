@@ -68,7 +68,7 @@ def main():
         t = timed(lambda: lt.run(w, x, y), flush, cycles, args.iters, stream) - base
         err = (y.double() - ref).abs().max().item() / scale
         print(f"n{n} ltpin {t:.2f} us  rel_err {err:.1e}", flush=True)
-        modes = [("rot", splitk.ISSUE_LANES)] + ([("one", 1)] if args.legacy else [])
+        modes = [("rot", getattr(splitk, "ISSUE_LANES", 1))] + ([("one", 1)] if args.legacy else [])
         for spec in TACTICS[n].split(","):
             tactic = tuple(int(v) for v in spec.split("."))
             outs = {}

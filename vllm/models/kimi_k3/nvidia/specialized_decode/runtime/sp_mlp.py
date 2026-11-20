@@ -63,8 +63,15 @@ SHARED = ("shared_gu", "shared_down")
 # producer); in-step D3-32 NVFP4 slice r8 (fastab ABBA x2, same node) 3967.5 ->
 # 3902.8 us per 24-layer step (-65 us). n64 (64.64.2.6; 1 GPU 10.11 vs 9.74, but the
 # weights stream during the reduce in-step): r16 4639.5 -> 4605.8 (-34), r8 with both
-# -68.5 (another node), r24 unchanged.
-ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6"}
+# -68.5 (another node), r24 unchanged. n96 (64.96.2.5; 1 GPU 11.58 us vs ~9.9 for the
+# router || latent down pair, but in-step the concat also moves r24 onto route_stage):
+# r24 5344.5 -> 5312.2 us per 24-layer step (-32 us, fastab ABBA x2 same node, rhea).
+ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
+# Rows whose concatenated GEMM runs on ``prewait_gemm`` (weights streamed before the
+# PDL wait) instead of the ROUTER_LATENT kernel. Same-node in-step A/B, D3-32 NVFP4
+# slice, split-K front vs prewait (fastab xy1/xy2, Rhea): n32 split-K faster
+# (r8 +22 us/step on prewait), n64 prewait faster (r16 -19 us/step).
+PREWAIT_ROWS = (64,)
 
 
 class SplitKFront:
@@ -188,7 +195,9 @@ class SpMlp:
             self.route_stage = RouteStage(mlp, self.router_latent[1].plans)
             # Pre-wait weight-streaming GEMM at the token counts it serves (its own
             # tile-image copy: the stock linears stay views of the row-major concat).
-            if any(prewait_gemm.supported(r, k) for r in concat_rows):
+            if any(
+                r in PREWAIT_ROWS and prewait_gemm.supported(r, k) for r in concat_rows
+            ):
                 self.prewait_router_latent = prewait_gemm.pack_weight(packed)
         try:
             weights = {
@@ -313,7 +322,11 @@ class SpMlp:
             packed, gemm, _ = self.router_latent
             y = h.new_empty((n, packed.shape[0]), dtype=torch.float32)
             pw = self.prewait_router_latent
-            if pw is not None and prewait_gemm.supported(n, packed.shape[1]):
+            if (
+                pw is not None
+                and n in PREWAIT_ROWS
+                and prewait_gemm.supported(n, packed.shape[1])
+            ):
                 prewait_gemm.gemm(y, h, pw, packed.shape[0])
             else:
                 gemm.run(packed, h, y)
