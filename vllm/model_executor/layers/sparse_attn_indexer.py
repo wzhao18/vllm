@@ -540,10 +540,18 @@ def _use_deep_select_prefill(
     topk_backend: str,
 ) -> bool:
     """Whether DeepSelect ranks these prefill logits: SM100's BF16 logits under
-    the "auto" and "deep_select" top-k backends, with or without DCP."""
+    the "auto" and "deep_select" top-k backends, with or without DCP.
+
+    "balanced" is a decode-only top-k, and "trtllm_gvr2" ranks decode rows
+    only: its 16-bit prefill engine resolves ties at the top-k cutoff to a
+    different column set and emits each row in a different order on every call
+    (its deterministic mode is FP32-only). BF16 logits tie at the cutoff on
+    almost every long-context row, and the sparse MLA is order-sensitive, so a
+    prefill step was not reproducible (TP8 + DCP8 96K prefix: rel. RMS 0.24
+    between identical passes, BUG-DCP8-2). DeepSelect selects the same exact
+    top-k deterministically (set and order), so their prefill follows "auto"."""
     return (
-        # "balanced" is a decode-only top-k; its prefill follows "auto".
-        topk_backend in ("auto", "deep_select", "balanced")
+        topk_backend in ("auto", "deep_select", "balanced", "trtllm_gvr2")
         and logits.dtype == torch.bfloat16
         and row_starts is None
         and is_deep_select_available(logits, topk_tokens)
@@ -567,8 +575,17 @@ def _prefill_topk(
     if _use_deep_select_prefill(logits, row_starts, topk_tokens, topk_backend):
         deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
         return
-    if topk_backend != "trtllm_gvr2":
-        logits = as_fp32_logits(logits, row_ends)
+    if topk_backend == "trtllm_gvr2":
+        # No silent fallback: its own prefill engine and the FP32 kernels are
+        # not deterministic on tied BF16 logits. The model checks at load that
+        # DeepSelect takes every prefill chunk (deep_select_prefill_unsupported).
+        raise RuntimeError(
+            "sparse_indexer_topk_backend='trtllm_gvr2': DeepSelect cannot rank "
+            f"these prefill logits (dtype={logits.dtype}, shape="
+            f"{tuple(logits.shape)}, stride={tuple(logits.stride())}, row_starts "
+            f"{'set' if row_starts is not None else 'None'}, topk={topk_tokens})"
+        )
+    logits = as_fp32_logits(logits, row_ends)
     get_indexer_topk(topk_backend).forward_prefill(
         logits, row_starts, row_ends, topk_indices, topk_tokens
     )

@@ -1395,12 +1395,12 @@ class KimiMoE(nn.Module):
 
 
 def warm_prefill_indexer(model: nn.Module) -> None:
-    """Compile trtllm_gvr2's prefill top-k engines at load, on every rank, when
-    the model has DSA layers and sparse_indexer_topk_backend="trtllm_gvr2": the
-    engines never compile under CUDA graph capture (an uncompiled shape there
-    falls back to the FP32 per-row kernel), and one layer's (topk,
-    max_model_len) covers them all. A mid-serving JIT on one DCP rank would
-    also stall its peers in the next bounded DCP exchange.
+    """Check at load, when the model has DSA layers and
+    sparse_indexer_topk_backend="trtllm_gvr2", that DeepSelect ranks every
+    prefill chunk (up to max_model_len columns): that backend's prefill top-k is
+    DeepSelect, the only exact and deterministic one (the 16-bit GVR V2 prefill
+    engine changes cutoff ties and row order per call, BUG-DCP8-2). Raises
+    instead of serving with a fallback; no GVR V2 prefill engine is compiled.
 
     Kimi K3's DSA indexer (KimiK3DSAIndexer) is not a SparseAttnIndexer, so
     both are matched by their topk_backend attribute."""
@@ -1421,9 +1421,16 @@ def warm_prefill_indexer(model: nn.Module) -> None:
     )
     if indexer is None:
         return
-    from vllm.model_executor.layers.indexer_topk import warmup_trtllm_gvr2_prefill
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_prefill_unsupported,
+    )
 
-    warmup_trtllm_gvr2_prefill(indexer.topk_tokens, indexer.max_model_len)
+    why = deep_select_prefill_unsupported(indexer.topk_tokens, indexer.max_model_len)
+    if why is not None:
+        raise RuntimeError(
+            "sparse_indexer_topk_backend='trtllm_gvr2' ranks the prefill rows with "
+            f"DeepSelect, which cannot run here: {why}"
+        )
 
 
 class KimiDecoderLayer(nn.Module):
@@ -2604,7 +2611,7 @@ class KimiLinearForCausalLM(
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
         self.dcpx = build_dcpx(self.model, self.vllm_config)
-        # trtllm_gvr2 prefill top-k engines, built before any forward.
+        # trtllm_gvr2: DeepSelect must rank every prefill chunk (checked).
         warm_prefill_indexer(self.model)
 
     def build_specialized_decode(self) -> None:

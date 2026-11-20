@@ -423,9 +423,12 @@ class KernelConfig:
       without the FP32 upcast copy. Falls back to "auto" for FP32 logits.
     - "trtllm_gvr2": TensorRT-LLM's self-sampling GVR V2 top-k with native
       BF16 / FP16 logits (vendored in vllm/third_party/trtllm_gvr; SM100
-      family). Prefill: every chunk, BF16 logits with no FP32 copy and no row
-      minimum, also under DCP; its engines are compiled at model load. Decode:
-      the stock top-k on the BF16 decode logits ("auto" under DCP > 1).
+      family). Decode: the stock top-k on the BF16 decode logits ("auto"
+      under DCP > 1). Prefill follows "auto" (DeepSelect on SM100's BF16
+      logits, deterministic) wherever DeepSelect accepts the logits: the 16-bit
+      GVR V2 prefill engine breaks cutoff ties and orders each row differently
+      on every call. Elsewhere it ranks the prefill chunks (BF16, no FP32 copy);
+      its engines are compiled at model load.
       Unsupported layouts and uncompiled shapes under CUDA graph capture fall
       back to the FP32 kernels. Like gvr_2, its latency depends on the logit
       distribution.

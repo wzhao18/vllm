@@ -2943,49 +2943,43 @@ def _assert_topk_values(
     assert torch.equal(picked.sort(1).values, expected.sort(1).values)
 
 
-@requires_trtllm_gvr2
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "q_lens,ctx_lens,row_relative",
-    [
-        ([96], [40000], True),
-        ([1024, 700, 300], [0, 33000, 1500], True),
-        ([1024, 700, 300], [0, 33000, 1500], False),
-    ],
-)
+@requires_sm100
 @torch.inference_mode()
-def test_sparse_indexer_prefill_topk_trtllm_gvr2_16bit(
-    dtype: torch.dtype, q_lens: list[int], ctx_lens: list[int], row_relative: bool
-) -> None:
-    """trtllm_gvr2 ranks 16-bit prefill logits without an FP32 copy for every
-    chunk (no row minimum, row-relative or per-row starts), selecting
-    logits[r, ks[r]:ke[r]] into indices relative to ks[r]."""
-    set_random_seed(0)
-    top_k = 2048
-    ks, ke, k_off = [], [], 0
-    for q, c in zip(q_lens, ctx_lens):
-        for i in range(q):
-            ks.append(k_off)
-            ke.append(k_off + c + i + 1)
-        k_off += c + q
-    row_starts = torch.tensor(ks, dtype=torch.int32, device="cuda")
-    row_ends = torch.tensor(ke, dtype=torch.int32, device="cuda")
-    if row_relative:
-        row_ends -= row_starts
-        row_starts.zero_()
-    num_rows, width = len(ks), int(row_ends.max())
-    pitch = (width + 255) // 256 * 256
-    logits = torch.randn(num_rows, pitch, device="cuda", dtype=dtype)[:, :width]
-    cols = torch.arange(width, device="cuda")
-    outside = (cols < row_starts[:, None]) | (cols >= row_ends[:, None])
-    logits[outside] = torch.finfo(dtype).max
-    reference = logits.float().masked_fill(outside, float("-inf"))
-
-    indices = torch.full((num_rows, top_k), 7, dtype=torch.int32, device="cuda")
-    _make_topk("trtllm_gvr2").forward_prefill(
-        logits, None if row_relative else row_starts, row_ends, indices, top_k
+def test_sparse_indexer_prefill_topk_trtllm_gvr2_no_fallback() -> None:
+    """Under trtllm_gvr2 the prefill top-k is DeepSelect (exact, deterministic)
+    or an error: the 16-bit GVR V2 prefill engine and the FP32 kernels change
+    cutoff ties / row order per call (BUG-DCP8-2), so nothing falls back."""
+    from vllm.model_executor.layers.indexer_topk import (
+        deep_select_prefill_unsupported,
     )
-    _assert_topk_values(reference, indices, row_starts, row_ends, top_k)
+    from vllm.model_executor.layers.sparse_attn_indexer import _prefill_topk
+
+    set_random_seed(0)
+    top_k, rows, pitch = 2048, 64, 8192
+    logits = torch.randn(rows, pitch, device="cuda", dtype=torch.bfloat16)
+    row_ends = torch.full((rows,), pitch, dtype=torch.int32, device="cuda")
+    indices = torch.full((rows, top_k), 7, dtype=torch.int32, device="cuda")
+    assert deep_select_prefill_unsupported(top_k, 1 << 20) is None
+    assert deep_select_prefill_unsupported(8192, 1 << 20) is not None
+    # DeepSelect takes these rows: exact.
+    _prefill_topk(logits, None, row_ends, indices, top_k, "trtllm_gvr2")
+    _assert_topk_values(
+        logits.float(), indices, torch.zeros_like(row_ends), row_ends, top_k
+    )
+    # Rows DeepSelect declines (per-row starts, unaligned stride): an error.
+    with pytest.raises(RuntimeError, match="DeepSelect cannot rank"):
+        _prefill_topk(
+            logits, torch.zeros_like(row_ends), row_ends, indices, top_k, "trtllm_gvr2"
+        )
+    unaligned = torch.randn(rows, pitch + 8, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="DeepSelect cannot rank"):
+        _prefill_topk(
+            unaligned[:, :pitch], None, row_ends, indices, top_k, "trtllm_gvr2"
+        )
+    with pytest.raises(RuntimeError, match="has no prefill top-k"):
+        _make_topk("trtllm_gvr2").forward_prefill(
+            logits, None, row_ends, indices, top_k
+        )
 
 
 @requires_trtllm_gvr2
