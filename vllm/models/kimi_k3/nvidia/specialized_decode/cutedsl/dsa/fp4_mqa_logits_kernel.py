@@ -436,6 +436,7 @@ class FP4MQALogitsKernel:
         num_epi_subtiles: int = 1,
         num_umma_stages: int = 1,
         epi_math: bool = True,
+        num_kv_stages: int = 6,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         remove_online_sf_transpose: bool = False,
@@ -565,7 +566,7 @@ class FP4MQALogitsKernel:
         # Benchmarks only (False): skip the ReLU + weighted head sum (data path timing).
         self.epi_math = epi_math
         # KV pipeline depth
-        self.num_kv_stages = 6
+        self.num_kv_stages = num_kv_stages
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
 
         # acc_dtype is locked to fp32 for FP4 MXF4 SS (cannot be exposed).

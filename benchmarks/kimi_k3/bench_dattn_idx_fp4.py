@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--q", type=int, default=4)
     ap.add_argument("--uniform", action="store_true")
     ap.add_argument("--contig", action="store_true")
+    ap.add_argument("--kv-stages", default="", help="extra KV ring depths to time, e.g. 8,10")
     ap.add_argument("--ncu-nomath", action="store_true", help="one no-math launch only")
     a = ap.parse_args()
     for reqs in [int(x) for x in a.reqs.split(",")]:
@@ -103,6 +104,21 @@ def main():
                                                      args["kv_cache"], args["block_table"],
                                                      args["max_len"], rows, reqs))
         op.epi_math, op.sf_skip = True, False
+        launch = lambda: op.launch(args["query"], args["q_scale"], args["kv_cache"],  # noqa: E731
+                                   args["block_table"], args["max_len"], rows, reqs)
+        for st in [int(x) for x in a.kv_stages.split(",") if x]:
+            op.kv_stages = st
+            try:
+                got_st = op(**args)
+                _check(got_st, ref, lens, args, q)
+                t_st = graph_time(launch)
+                op.epi_math = False
+                t_st_nm = graph_time(launch)
+                print(f"R{rows} kv_stages {st}: kernel {t_st:6.2f} us, no-math {t_st_nm:6.2f}",
+                      flush=True)
+            except Exception as e:
+                print(f"R{rows} kv_stages {st}: ERROR {type(e).__name__}: {str(e)[:200]}")
+            op.epi_math, op.kv_stages = True, 6
         mb = float(lens.view(reqs, q).amax(1).sum()) * 68 / 1e6
         print(f"R{rows} keys {mb:6.1f} MB: stock DG {t_dg:6.2f} us | fp4_index_logits "
               f"{t_new:6.2f} us ({t_dg / t_new:4.2f}x, {mb / t_new:5.2f} TB/s) = prep "
