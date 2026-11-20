@@ -229,6 +229,7 @@ def _mla_pull_worker(dcp_rank: int, cache: torch.Tensor):
     w.dst_uses_region_group_mapping = {"P": False}
     w._uses_region_group_mapping = False
     w._remote_agents = {"P": {(0, r): f"P{r}" for r in range(8)}}
+    w._remote_registration_generations = {}
     w._read_blocks_mixed = MagicMock()
     w.nixl_wrapper = MagicMock()
     w.use_host_buffer = False
