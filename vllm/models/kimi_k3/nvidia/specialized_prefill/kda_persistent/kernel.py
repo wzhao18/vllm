@@ -1946,7 +1946,9 @@ def _pkd(
                                     bx = cutlass.Float32(beta[r0 + lane, hidx])
                                 btv = 0.5 + 0.5 * _tanhf(0.5 * bx)
                         if cutlass.const_expr(QK_ROWPAIR_ == 8):
-                            cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
+                            if cutlass.const_expr((PREP_ABL_ & 16) == 0):
+                                if cutlass.const_expr((PREP_ABL_ & 16) == 0):
+                                    cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
                             early_gv0 = cutlass.Float32(v_graw[0, ptl, inst])
                             early_gate0 = lb2h * _tanhf(ea2c * early_gv0 + dtbc) + lb2h
 
@@ -2007,7 +2009,8 @@ def _pkd(
                         # v99 note kept out: TMAs stay full-chunk-gated here.
                         if cutlass.const_expr((not static_full) or (QK_ROWPAIR_ != 8)):
                             if tma:
-                                cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
+                                if cutlass.const_expr((PREP_ABL_ & 16) == 0):
+                                    cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
                         accg = cutlass.Float32(0.0)
                         if tma:
                             if cutlass.const_expr(GATE_ROLL_ == 1):
@@ -2088,7 +2091,8 @@ def _pkd(
                     # (unroll=2 measured-closed: 1.569x -> 1.445x fixed_h96 —
                     # the 48-reg prep diet spills, reconfirming the v60 re-roll)
                     if tma:
-                        cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
+                        if cutlass.const_expr((PREP_ABL_ & 16) == 0):
+                            cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
                         # four-row half-warp pairing. QK_ROWPAIR_ only selects
