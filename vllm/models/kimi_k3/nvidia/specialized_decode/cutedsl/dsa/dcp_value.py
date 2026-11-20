@@ -668,14 +668,14 @@ class DcpValue:
 
     @cute.jit
     def merge_rows(self, args, scales, tid, y):
-        """merge_projected over every row of tiles y, y + grid[1], .. at once: thread
-        items (slot r = 16 j + i is row 16 (y + j grid[1]) + i, one 16 B chunk of it)
-        issue every LSE, value, gate and total load before waiting on any, so a row
-        merges one round trip after its pushes land; each item weights its row's
-        sources itself and the LSE words are re-armed after a CTA barrier. Same
-        arithmetic: the source weights exp2(lse - max) times the IEEE reciprocal of
-        their butterfly sum, the FP32 merge in source order, one BF16 rounding, the
-        gate."""
+        """merge_projected over every row of tiles y, y + grid[1], .. at once: slot
+        r = 16 j + i is row 16 (y + j grid[1]) + i. Each thread first issues the
+        value-chunk, gate and total loads of its items (r, 16 B chunk), then the
+        CTA polls the LSEs once per (row, source) (re-armed as read) and weights
+        each row, and the items merge their already loaded chunks (re-polled while
+        a sentinel). Same arithmetic: the source weights exp2(lse - max) times the
+        IEEE reciprocal of their butterfly sum, the FP32 merge in source order, one
+        BF16 rounding, the gate."""
         lbox, gate, totals, output = args[4], args[9], args[10], args[11]
         box = args[3]
         D, B = self.size, self.batch
@@ -683,7 +683,7 @@ class DcpValue:
         R: cutlass.Constexpr = 16 * self.merge_tiles
         step: cutlass.Constexpr = self.grid[1]
         N: cutlass.Constexpr = -(-R * 16 // 512)
-        oks, rows, swzs, lwords, vwords, gwords, tots = [], [], [], [], [], [], []
+        oks, rows, slots, swzs, vwords, gwords, tots = [], [], [], [], [], [], []
         for n in cutlass.range_constexpr(N):
             i = tid + 512 * n
             r, chunk = i // 16, i % 16
@@ -693,24 +693,30 @@ class DcpValue:
             swz = chunk ^ (t % 8)
             oks.append(ok)
             rows.append(t)
+            slots.append(cutlass.select_(ok, r, 0))
             swzs.append(swz)
-            lwords.append([load_volatile(at(lbox, s, head, t))[0] for s in range(D)])
             vwords.append(
                 [load_volatile(at(box, s, head, t, 8 * swz), count=4) for s in range(D)]
             )
-            col = head * 128 + 8 * chunk
-            gwords.append(load_words(at(gate, t, col), count=4, mutable=True))
+            gwords.append(load_words(at(gate, t, head * 128 + 8 * chunk), count=4,
+                                     mutable=True))  # fmt: skip
             tots.append(totals[t // self.q])
+        for i in range(tid, R * D, 512):  # LSE polls (re-armed as read)
+            r, s = i // D, i % D
+            t = (y + (r // 16) * step) * 16 + r % 16
+            lse = Float32(EMPTY_LSE)
+            if t < B:
+                source = at(lbox, s, head, t)
+                word = load_volatile(source)[0]
+                while word == Uint32(LSE_SENT):
+                    word = load_volatile(source)[0]
+                store_words(source, (Uint32(LSE_SENT),))
+                lse = bits_float(word)
+            scales[r, s] = lse
+        cute.arch.sync_threads()
         self.mark(y * self.heads + head, 9, tid)
-        for n in cutlass.range_constexpr(N):
-            ok, t, swz = oks[n], rows[n], swzs[n]
-            lses = []
-            for s in cutlass.range_constexpr(D):
-                word = lwords[n][s]
-                if ok:
-                    while word == Uint32(LSE_SENT):
-                        word = load_volatile(at(lbox, s, head, t))[0]
-                lses.append(bits_float(word))
+        if tid < R:
+            lses = [scales[tid, s] for s in range(D)]
             top = lses[0]
             for s in cutlass.range_constexpr(1, D):
                 top = max(top, lses[s])
@@ -730,33 +736,34 @@ class DcpValue:
             inverse = Float32(0)
             if total > 0:
                 inverse = div_rn(Float32(1), total)
-            merged = zeros(8, Float32)
             for s in cutlass.range_constexpr(D):
-                # no value row (LSE EMPTY): neither polled nor re-armed
-                if ok & (lses[s] > Float32(EMPTY_LSE)):
-                    self.poll_pair(at(box, s, head, t, 8 * swz), vwords[n][s],
-                                   weights[s] * inverse, merged)  # fmt: skip
-            words = []
-            for e in cutlass.range_constexpr(4):
-                # Padded rows may hold a NaN gate; keep inactive rows zero.
-                lo, hi = Float32(0), Float32(0)
-                if tots[n] > 0:
-                    g = unpack_bf16(gwords[n][e])
-                    lo, hi = (
-                        Float32(BFloat16(merged[2 * e + k])) * sigmoid(g[k], False)
-                        for k in range(2)
-                    )
-                words.append(bf16x2(lo, hi))
+                scale = weights[s] * inverse
+                if lses[s] <= Float32(EMPTY_LSE):
+                    scale = Float32(-1)  # no value row: neither polled nor re-armed
+                scales[tid, s] = scale
+        cute.arch.sync_threads()
+        for n in cutlass.range_constexpr(N):
+            ok, t, r, swz = oks[n], rows[n], slots[n], swzs[n]
             if ok:
+                merged = zeros(8, Float32)
+                for k in cutlass.range_constexpr(D):
+                    w = scales[r, k]
+                    if w >= Float32(0):
+                        self.poll_pair(at(box, k, head, t, 8 * swz), vwords[n][k], w,
+                                       merged)  # fmt: skip
+                words = []
+                for e in cutlass.range_constexpr(4):
+                    # Padded rows may hold a NaN gate; keep inactive rows zero.
+                    lo, hi = Float32(0), Float32(0)
+                    if tots[n] > 0:
+                        g = unpack_bf16(gwords[n][e])
+                        lo, hi = (
+                            Float32(BFloat16(merged[2 * e + k])) * sigmoid(g[k], False)
+                            for k in range(2)
+                        )
+                    words.append(bf16x2(lo, hi))
                 col = head * 128 + 8 * ((tid + 512 * n) % 16)
                 store_words(at(output, t, col), tuple(words))
-        cute.arch.sync_threads()
-        for i in range(tid, R * D, 512):  # re-arm the LSE words the items read
-            r, s = i // D, i % D
-            t = (y + (r // 16) * step) * 16 + r % 16
-            if t < B:
-                store_words(at(lbox, s, head, t), (Uint32(LSE_SENT),))
-
     @cute.jit
     def push_values(self, args, gh, tid):
         """``preprojected``: push gathered head ``gh``'s value rows (the W_UV
