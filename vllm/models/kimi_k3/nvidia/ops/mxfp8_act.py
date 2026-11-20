@@ -445,157 +445,6 @@ __global__ void __launch_bounds__(1024) situ4_row_kernel(
   sf[sf_off] = (uint8_t)e;
 }
 
-__device__ __forceinline__ uint32_t smem_u32(const void* p) {
-  return (uint32_t)__cvta_generic_to_shared(p);
-}
-__device__ __forceinline__ void mbar_init(uint64_t* b, int n) {
-#if __CUDA_ARCH__ >= 900
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(b)), "r"(n));
-#else
-  __trap();
-#endif
-}
-__device__ __forceinline__ void mbar_expect_tx(uint64_t* b, uint32_t tx) {
-#if __CUDA_ARCH__ >= 900
-  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(b)), "r"(tx)
-               : "memory");
-#else
-  __trap();
-#endif
-}
-__device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t parity) {
-#if __CUDA_ARCH__ >= 900
-  asm volatile(
-      "{\n .reg .pred p;\n LAB_WAIT:\n"
-      " mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-      " @!p bra LAB_WAIT;\n}\n" ::"r"(smem_u32(b)), "r"(parity) : "memory");
-#else
-  __trap();
-#endif
-}
-__device__ __forceinline__ void bulk_g2s(void* dst, const void* src, uint32_t bytes, uint64_t* b) {
-#if __CUDA_ARCH__ >= 900
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
-          smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(b)) : "memory");
-#else
-  __trap();
-#endif
-}
-
-// Mode 4 row kernel, bulk-copy form (sm_90+): one thread per CTA bulk-copies the
-// next row (gate | up, 4d bytes) into shared memory (mbarrier complete_tx), the
-// 192 threads read their 32-column block from it (rotated 16-byte chunks: no
-// bank conflicts) and run situ4_row_kernel's per-element steps (bitwise). The
-// copy engine keeps HBM reads in flight without holding registers; one stage
-// per CTA measured best (more stages cost occupancy). VR200 M16384 d6144:
-// 60.4 -> 54.6 us.
-template <int A_POW, bool CLAMP>
-__global__ void __launch_bounds__(1024) situ4_tma_kernel(
-    uint8_t* __restrict__ q, uint8_t* __restrict__ sf, const uint16_t* __restrict__ x,
-    const int64_t rows, const int64_t rows_pad, const int d, const int64_t x_stride,
-    const int64_t q_stride, const int sf_col_base, const int padded_cols, const float beta,
-    const float linear_beta) {
-  constexpr int S = 1;
-  constexpr bool ROT = true;
-  extern __shared__ __align__(128) uint8_t ring[];
-  __shared__ __align__(8) uint64_t full[S];
-  const float log2e = 1.4426950408889634f;
-  const float kb = -2.0f * log2e / beta;
-  const float kc = CLAMP ? -2.0f * log2e / linear_beta : 0.0f;
-  const float bbs = CLAMP ? beta * linear_beta : beta;
-  const float2 k_a = make_float2(-log2e, -log2e), k_b = make_float2(kb, kb);
-  const float2 k_c = make_float2(kc, kc), bb = make_float2(bbs, bbs);
-  const int blk = threadIdx.x;
-  const uint32_t row_bytes = (uint32_t)d * 2u;  // gate (or up) half of one row
-  if (blk == 0) {
-    for (int s = 0; s < S; ++s) mbar_init(&full[s], 1);
-#if __CUDA_ARCH__ >= 900
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-#endif
-  }
-  __syncthreads();
-  if (blk == 0) {
-    for (int s = 0; s < S; ++s) {
-      const int64_t r = blockIdx.x + (int64_t)s * gridDim.x;
-      if (r < rows) {
-        uint8_t* st = ring + (size_t)s * 2 * row_bytes;
-        mbar_expect_tx(&full[s], 2 * row_bytes);
-        bulk_g2s(st, x + r * x_stride, row_bytes, &full[s]);
-        bulk_g2s(st + row_bytes, x + r * x_stride + d, row_bytes, &full[s]);
-      }
-    }
-  }
-  const int rot = ROT ? ((blk >> 1) & 3) : 0;
-  int k = 0;
-  for (int64_t row = blockIdx.x; row < rows_pad; row += gridDim.x, ++k) {
-    const int64_t sf_off = swizzled_sf_offset(row, sf_col_base + blk, padded_cols);
-    if (row >= rows) {
-      sf[sf_off] = 0;
-      continue;
-    }
-    const int s = k % S;
-    mbar_wait(&full[s], (uint32_t)((k / S) & 1));
-    const uint8_t* st = ring + (size_t)s * 2 * row_bytes;
-    const uint4* gp = reinterpret_cast<const uint4*>(st + blk * 64);
-    const uint4* up = reinterpret_cast<const uint4*>(st + row_bytes + blk * 64);
-    uint4 a[4], b[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int j = (i + rot) & 3;
-      a[i] = gp[j];
-      b[i] = up[j];
-    }
-    __syncthreads();  // stage s fully read: refill it with row k + S
-    if (blk == 0) {
-      const int64_t nr = row + (int64_t)S * gridDim.x;
-      if (nr < rows) {
-#if __CUDA_ARCH__ >= 900
-        // generic-proxy reads of stage s before the async-proxy refill
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-#endif
-        uint8_t* dst = ring + (size_t)s * 2 * row_bytes;
-        mbar_expect_tx(&full[s], 2 * row_bytes);
-        bulk_g2s(dst, x + nr * x_stride, row_bytes, &full[s]);
-        bulk_g2s(dst + row_bytes, x + nr * x_stride + d, row_bytes, &full[s]);
-      }
-    }
-    uint32_t h[16];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      h[4 * i + 0] = situ4_pair_ct<A_POW, CLAMP>(a[i].x, b[i].x, k_a, k_b, k_c, bb);
-      h[4 * i + 1] = situ4_pair_ct<A_POW, CLAMP>(a[i].y, b[i].y, k_a, k_b, k_c, bb);
-      h[4 * i + 2] = situ4_pair_ct<A_POW, CLAMP>(a[i].z, b[i].z, k_a, k_b, k_c, bb);
-      h[4 * i + 3] = situ4_pair_ct<A_POW, CLAMP>(a[i].w, b[i].w, k_a, k_b, k_c, bb);
-    }
-    __nv_bfloat162 m = __habs2(*reinterpret_cast<const __nv_bfloat162*>(&h[0]));
-#pragma unroll
-    for (int i = 1; i < 16; ++i)
-      m = __hmax2(m, __habs2(*reinterpret_cast<const __nv_bfloat162*>(&h[i])));
-    const float amax = fmaxf(__low2float(m), __high2float(m));
-    const uint32_t e = float_to_ue8m0(amax * (1.0f / 448.0f));
-    const float inv = ue8m0_to_inv_scale(e);
-    const float2 inv2 = make_float2(inv, inv);
-    uint8_t* qrow = q + row * q_stride + blk * 32;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float2 v0 = f2mul(
-          __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[4 * i])), inv2);
-      const float2 v1 = f2mul(
-          __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[4 * i + 1])), inv2);
-      const float2 v2 = f2mul(
-          __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[4 * i + 2])), inv2);
-      const float2 v3 = f2mul(
-          __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[4 * i + 3])), inv2);
-      uint2 w;
-      w.x = (uint32_t)fp8x2(v0.x, v0.y) | ((uint32_t)fp8x2(v1.x, v1.y) << 16);
-      w.y = (uint32_t)fp8x2(v2.x, v2.y) | ((uint32_t)fp8x2(v3.x, v3.y) << 16);
-      *reinterpret_cast<uint2*>(qrow + ((i + rot) & 3) * 8) = w;
-    }
-    sf[sf_off] = (uint8_t)e;
-  }
-}
-
 // mode: 0 plain quant (x), 1 situ(x[:, :d], x[:, d:]), 4 the same with the
 //       routed experts' MUFU-light SiTU, 2 silu-and-mul,
 //       3 x * sigmoid(g)  (two inputs, both [rows, d])
@@ -824,34 +673,7 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
     const int a_pow =
         (half == floorf(half) && half >= 1.0f && half <= 4.0f) ? (int)half : 0;
     auto stream = c10::cuda::getCurrentCUDAStream();
-    int sm_major = 0, sms = 0;
-    cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, x.get_device());
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, x.get_device());
-    const size_t tma_smem = (size_t)4 * d;
-    const bool tma = sm_major >= 9 && x.stride(0) % 8 == 0 &&
-                     reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0;
-#define TMA_ROW_LAUNCH(P, C)                                                   \
-  {                                                                            \
-    auto kern = situ4_tma_kernel<P, C>;                                        \
-    static int occ_by_d[33] = {0};                                             \
-    int& occ = occ_by_d[d / 1024];                                             \
-    if (occ == 0) {                                                            \
-      cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
-                           (int)tma_smem);                                     \
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, (int)(d / 32), \
-                                                    tma_smem);                 \
-    }                                                                          \
-    const int64_t grid =                                                       \
-        std::min<int64_t>(rows_pad, (int64_t)sms * std::max(occ, 1));          \
-    kern<<<(unsigned)grid, (unsigned)(d / 32), tma_smem, stream>>>(            \
-        reinterpret_cast<uint8_t*>(q.data_ptr()),                              \
-        reinterpret_cast<uint8_t*>(sf.data_ptr()),                             \
-        reinterpret_cast<const uint16_t*>(x.data_ptr()), rows, rows_pad,       \
-        (int)d, x.stride(0), q.stride(0), (int)sf_col_base, (int)padded_cols,  \
-        (float)beta, (float)linear_beta);                                      \
-  }
 #define ROW_LAUNCH(P, C)                                                       \
-  if (tma) TMA_ROW_LAUNCH(P, C) else                                           \
   situ4_row_kernel<P, C><<<(unsigned)rows_pad, (unsigned)(d / 32), 0, stream>>>( \
       reinterpret_cast<uint8_t*>(q.data_ptr()),                                \
       reinterpret_cast<uint8_t*>(sf.data_ptr()),                               \
@@ -871,7 +693,6 @@ void act_quant(torch::Tensor& q, torch::Tensor& sf, const torch::Tensor& x,
       default: ROW_LAUNCH(4, true); break;
     }
 #undef ROW_LAUNCH
-#undef TMA_ROW_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
