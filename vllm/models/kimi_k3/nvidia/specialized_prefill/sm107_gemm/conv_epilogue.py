@@ -285,6 +285,47 @@ def b2i(c) -> Int32:
     return Int32(c)
 
 
+#: Microbench clock stamps (tactic flag "stamp"): 16 u64 slots per (CTA, tile).
+STAMP_TILES = 256
+
+
+@dsl_user_op
+def stamp_clk(addr: Int64, pred: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip)],
+        "{ .reg .pred p; .reg .u64 t; setp.ne.s32 p, $1, 0; mov.u64 t, %clock64; "
+        "@p st.global.u64 [$0], t; }",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+@dsl_user_op
+def stamp_gt(addr: Int64, pred: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [_v(addr, Int64, loc, ip), _v(pred, Int32, loc, ip)],
+        "{ .reg .pred p; .reg .u64 t; setp.ne.s32 p, $1, 0; mov.u64 t, %globaltimer; "
+        "@p st.global.u64 [$0], t; }",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM,
+    )
+
+
+def stamp_slot(base, tile, slot: int):
+    bidx, bidy, bidz = cute.arch.block_idx()
+    gdx, gdy, _ = cute.arch.grid_dim()
+    cta = bidx + bidy * gdx + bidz * gdx * gdy
+    return base + (Int64(cta) * STAMP_TILES + Int64(tile % STAMP_TILES)) * 128 + slot * 8
+
+
 @cute.jit
 def find_seq(qsl_addr: Int64, nseq: Int32, top: Int32, nsteps: Int32, row: Int32):
     """Largest s in [0, nseq) with qsl[s] <= row (qsl[0] <= row)."""
@@ -1373,6 +1414,11 @@ def epilogue_kda_conv_t2(
     p_dim = getattr(gemm_kernel, "conv_p_dim", None) or n_cols // 3
     n_blk = (m_rows + 127) // 128
     bar = 3 + g
+    stp = getattr(gemm_kernel, "conv_stamp", False)
+    st_tile = acc_consumer_state.count
+    st_pred = b2i(tidx == 0)
+    if cutlass.const_expr(stp):
+        stamp_clk(stamp_slot(norm_addr, st_tile, 3), st_pred)
 
     trow = tTR_cC[(None, None, None, g, 0)][0][0]
     blk0 = trow - trow % 128
@@ -1390,6 +1436,9 @@ def epilogue_kda_conv_t2(
     rb = trow % 128
 
     acc_pipeline.consumer_wait(acc_consumer_state)
+    if cutlass.const_expr(stp):
+        stamp_clk(stamp_slot(norm_addr, st_tile, 4), st_pred)
+        stamp_gt(stamp_slot(norm_addr, st_tile, 7), st_pred)
     xs_all = []
     for ni in cutlass.range_constexpr(epi_n):
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, g, ni)], tTR_rAcc)
@@ -1398,6 +1447,8 @@ def epilogue_kda_conv_t2(
     with cute.arch.elect_one():
         acc_pipeline.consumer_release(acc_consumer_state)
     acc_consumer_state.advance()
+    if cutlass.const_expr(stp):
+        stamp_clk(stamp_slot(norm_addr, st_tile, 5), st_pred)
 
     pb0 = b2i(rb < 3)
     pb1 = b2i(rb >= 125)
@@ -1460,4 +1511,6 @@ def epilogue_kda_conv_t2(
                 _t2_chunk(rc - 4, r0 - 64, *args)
         else:
             _t2_chunk(rc, r0, *args)
+    if cutlass.const_expr(stp):
+        stamp_clk(stamp_slot(norm_addr, st_tile, 6), st_pred)
     return acc_consumer_state

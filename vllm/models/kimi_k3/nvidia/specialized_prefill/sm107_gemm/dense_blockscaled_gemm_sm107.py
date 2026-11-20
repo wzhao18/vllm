@@ -50,6 +50,9 @@ from .conv_epilogue import (
     epilogue_kda_conv_t,
     epilogue_kda_conv_t2,
     setmaxnreg,
+    stamp_clk,
+    stamp_gt,
+    stamp_slot,
 )
 from .situ_epilogue import epilogue_situ_mxfp8, epilogue_situ_mxfp8_drain
 from .epilogue_utils import (
@@ -1989,8 +1992,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     #
                     # Wait for accumulator buffer empty
                     #
+                    if cutlass.const_expr(getattr(self, "conv_stamp", False)):
+                        stamp_clk(stamp_slot(conv_norm, acc_producer_state.count, 0), cutlass.Int32(is_leader_cta) * cutlass.Int32(tidx % 32 == 0))
                     if is_leader_cta:
                         acc_pipeline.producer_acquire(acc_producer_state)
+                    if cutlass.const_expr(getattr(self, "conv_stamp", False)):
+                        stamp_clk(stamp_slot(conv_norm, acc_producer_state.count, 1), cutlass.Int32(is_leader_cta) * cutlass.Int32(tidx % 32 == 0))
+                        stamp_gt(stamp_slot(conv_norm, acc_producer_state.count, 8), cutlass.Int32(is_leader_cta) * cutlass.Int32(tidx % 32 == 0))
 
                     # Apply TMEM pointer offset hack when cta_tile_shape_n=192 or 64
                     tCtSFB_mma = tCtSFB
@@ -2141,6 +2149,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     #
                     if is_leader_cta:
                         acc_pipeline.producer_commit(acc_producer_state)
+                    if cutlass.const_expr(getattr(self, "conv_stamp", False)):
+                        stamp_clk(stamp_slot(conv_norm, acc_producer_state.count, 2), cutlass.Int32(is_leader_cta) * cutlass.Int32(tidx % 32 == 0))
                     acc_producer_state.advance()
 
                     #

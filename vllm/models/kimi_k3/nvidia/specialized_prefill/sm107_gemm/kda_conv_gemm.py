@@ -63,6 +63,7 @@ class _Kernel(Sm107BlockScaledPersistentDenseGemmKernel):
         self.conv_scalar_silu = "sc" in flags
         self.conv_math_smsp23 = "c23" in flags
         self.conv_probe = 1 if "nolds" in flags else 2 if "nost" in flags else 0
+        self.conv_stamp = "stamp" in flags
         self.conv_loop_unroll = next((u for u in (1, 2, 4, 8) if f"lp{u}" in flags), 0)
         super().__init__(
             SF_VEC,
@@ -209,7 +210,15 @@ class KdaConvGemm:
             f.startswith("cskel") for f in flags
         )
         self.alpha = torch.ones(1, dtype=torch.float32, device=weight_nk.device)
+        # Microbench clock stamps (flag "stamp"): (CTA, tile, 8 slots) u64.
+        self._stamp = "stamp" in flags
+        self.stamps = None
         self._compiled = {}
+
+    def _stamp_buf(self, dev):
+        if self.stamps is None:
+            self.stamps = torch.zeros(1024 * 256 * 16, dtype=torch.int64, device=dev)
+        return self.stamps
 
     def _kernel(self, norms, args, problem, tail, conv, stream):
         key = ("conv", self.tactic, norms, self.drain, self.weight.device.index, self.n, self.k)
@@ -263,7 +272,10 @@ class KdaConvGemm:
             ),
             cutlass.Int64(side.data_ptr()),
             cutlass.Int64(qsl.data_ptr()),
-            cutlass.Int64(norms.data_ptr() if norms is not None else 0),
+            cutlass.Int64(
+                norms.data_ptr() if norms is not None
+                else self._stamp_buf(dev).data_ptr() if self._stamp else 0
+            ),
             cutlass.Int32(nseq),
             cutlass.Int32(top),
             cutlass.Int32(nsteps),
