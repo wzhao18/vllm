@@ -672,9 +672,11 @@ __device__ __forceinline__ int v2_row(const V2Params& p, const V2Sm& sm, const i
         if ((tid & 31) == 0 && best >= 0) atomicMax(&s_i[12], best);
         __syncthreads();
         tauh = s_i[12];
-        // the hot rank: its theta sits above the window around tau_hat; candidates again
-        const int thn = max(1, tauh - kV2Win / 2 - 64);
-        if (tauh >= 0 && regp && th > thn) {
+        // the hot rank: its theta lies above tau_hat (its candidates would miss tau); the
+        // candidate pass again from 32 keys under tau_hat. Other ranks keep their candidates:
+        // their window starts at max(theta, tau_hat - 128), every window key a candidate
+        const int thn = max(1, tauh - 32);
+        if (tauh >= 0 && regp && th > tauh) {
           V2STAT(6);
           th = thn;
           continue;
