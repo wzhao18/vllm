@@ -142,7 +142,7 @@ def main():
         h = torch.empty_like(src)
         y32 = torch.empty((n, E + LATENT), device=dev)
         yr = torch.empty((n, E), device=dev)
-        cnt = torch.zeros(64, dtype=torch.int32, device=dev)
+        cnt = torch.zeros(2048, dtype=torch.int32, device=dev)
         part = torch.empty(35 * 8 * n * 128, device=dev)
 
         def producer_only():
@@ -186,7 +186,7 @@ def main():
                                  True, 1.0, *c, nostamp)  # fmt: skip
 
             t_f = _time_graph(front)
-            line += f" | front{c} ring {plan[0]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
+            line += f" | front{c} ring {plan[0]} xslots {plan[3]} smemblk {plan[1]} smem {plan[2] // 1024}K {(t_f - t_p) / L:.2f}"
         print(line, flush=True)
         # Stamped single layer (graph): phase times after the producer's end, over CTAs.
         c = cfgs[0]

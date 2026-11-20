@@ -62,7 +62,7 @@ def test_moe_front_matches_route_stage(nvfp4, n, padded, tiles):
     # ks4ring3: 4 K splits (more shared-memory weight blocks) through a 3-slot ring
     cfg = moe_front.config_for(n, dev) if tiles == "config" else (4, 3)
     stamps = torch.empty(0, dtype=torch.int64, device=dev)
-    cnt = torch.zeros(64, dtype=torch.int32, device=dev)
+    cnt = torch.zeros(2048, dtype=torch.int32, device=dev)
     part = torch.empty(35 * cfg[0] * n * 128, device=dev)
     mod = moe_front._module()
 
@@ -120,7 +120,7 @@ def test_moe_front_rejects_bad_shapes():
     b = _buffers(True, dev)
     with pytest.raises(RuntimeError):
         moe_front._module().moe_front(
-            w, h, torch.zeros((32, E), device=dev), torch.zeros(64, dtype=torch.int32,
+            w, h, torch.zeros((32, E), device=dev), torch.zeros(2048, dtype=torch.int32,
             device=dev), torch.zeros(35 * 4 * 32 * 128, device=dev),
             torch.zeros(E, device=dev), *b, None, E, E, True, 1.0, True, 1.0, 4, 0,
             torch.empty(0, dtype=torch.int64, device=dev),

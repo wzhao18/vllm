@@ -60,7 +60,9 @@ constexpr int kSlot = 128 * 128;       // one 128 x 64 BF16 weight K block (or <
 constexpr int kMaxNS = 16;             // ring slots
 constexpr int kMaxT = 16;              // TMEM-resident weight K blocks
 constexpr int kMaxR = 8;               // shared-memory-resident weight K blocks
-constexpr int kTileCnt = 8;            // cnt[kTileCnt + t]: partials stored for tile t
+constexpr int kMaxX = 32;              // token ring slots (n x 128 B each, in the ring)
+constexpr int kLine = 32;              // one counter per 128 B line
+constexpr int kTileCnt = 3 * kLine;    // cnt[kTileCnt + kLine t]: partials stored for tile t
 constexpr int kStampStride = 8;
 constexpr int kSmemBudget = 214 * 1024;  // dynamic + static: co-resident with the AttnRes reduce
 
@@ -68,9 +70,9 @@ struct Params {
   Args a;            // route_stage's arguments (y = router logits rows, ldy)
   float* y;          // [n, ldy] FP32 router logits
   float* part;       // [grid][n][128] FP32 split-K partials
-  unsigned* cnt;     // [1] router CTAs done [2] CTAs finished [kTileCnt + t] tile partials
+  unsigned* cnt;     // [kLine] router CTAs done [2 kLine] CTAs finished [kTileCnt + kLine t] tile t
   unsigned long long* stamps;  // [grid][kStampStride] globaltimer or null
-  int kb, rtiles, ks, ns, na, nt_max, nr_max, yfull;
+  int kb, rtiles, ks, ns, xs, na, nt_max, nr_max, yfull;
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -203,7 +205,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   __shared__ float s_bias[kWarps * 32 * kPer];
   __shared__ float s_unb[kWarps * 32 * kPer];
   __shared__ uint64_t s_cand[kWarps * 32];
-  __shared__ __align__(8) uint64_t s_bar[2 * kMaxNS + kMaxT + 2];
+  __shared__ __align__(8) uint64_t s_bar[2 * kMaxNS + kMaxT + 2 + 2 * kMaxX];
   __shared__ uint32_t s_tmem;
   const Args& a = p.a;
   uint8_t* base = reinterpret_cast<uint8_t*>(
@@ -212,7 +214,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   const uint32_t ring_s = res_s + p.nr_max * kSlot;
   const uint32_t full0 = smem_u32(s_bar), empty0 = full0 + 8 * kMaxNS,
                  trdy0 = empty0 + 8 * kMaxNS, res_bar = trdy0 + 8 * kMaxT,
-                 acc_bar = res_bar + 8;
+                 acc_bar = res_bar + 8, xfull0 = acc_bar + 8, xempty0 = xfull0 + 8 * kMaxX;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int tile = static_cast<int>(blockIdx.x) / p.ks, split = static_cast<int>(blockIdx.x) % p.ks;
   const int kb0 = split * p.kb / p.ks, nk = (split + 1) * p.kb / p.ks - kb0;
@@ -227,6 +229,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       mbar_init(empty0 + 8 * s, 1);
     }
     for (int j = 0; j < kMaxT; ++j) mbar_init(trdy0 + 8 * j, 1);
+    for (int s = 0; s < p.xs; ++s) {
+      mbar_init(xfull0 + 8 * s, 1);
+      mbar_init(xempty0 + 8 * s, 1);
+    }
     mbar_init(res_bar, 1);
     mbar_init(acc_bar, 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -257,20 +263,22 @@ __global__ void __maxnreg__(96)  // launched with kThreads
         for (int r = 0; r < nr; ++r)
           tma_2d(res_s + r * kSlot, &tw, (kb0 + nt + r) * 64, wrow, res_bar);
       }
-      for (int i = 0; i < nt + nk; ++i) {
+      for (int i = 0; i < nt; ++i) {
         const int slot = i % p.ns;
         if (i >= p.ns) mbar_wait(empty0 + 8 * slot, ((i / p.ns) & 1) ^ 1);
-        if (i == nt) {
-          asm volatile("griddepcontrol.wait;" ::: "memory");
-          STAMP(1);
-        }
-        if (i < nt) {
-          mbar_expect_tx(full0 + 8 * slot, kSlot);
-          tma_2d(ring_s + slot * kSlot, &tw, (kb0 + i) * 64, wrow, full0 + 8 * slot);
-        } else {
-          mbar_expect_tx(full0 + 8 * slot, n * 128);
-          tma_2d(ring_s + slot * kSlot, &tx, (kb0 + i - nt) * 64, 0, full0 + 8 * slot);
-        }
+        mbar_expect_tx(full0 + 8 * slot, kSlot);
+        tma_2d(ring_s + slot * kSlot, &tw, (kb0 + i) * 64, wrow, full0 + 8 * slot);
+      }
+      // The token ring reuses the weight ring's memory in n x 128 B slots once the
+      // TMEM fill has read every weight slot (its commits complete in order).
+      mbar_wait(trdy0 + 8 * (nt - 1), 0);
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+      STAMP(1);
+      for (int j = 0; j < nk; ++j) {
+        const int xs = j % p.xs;
+        if (j >= p.xs) mbar_wait(xempty0 + 8 * xs, ((j / p.xs) & 1) ^ 1);
+        mbar_expect_tx(xfull0 + 8 * xs, n * 128);
+        tma_2d(ring_s + xs * n * 128, &tx, (kb0 + j) * 64, 0, xfull0 + 8 * xs);
       }
     }
   } else if (warp == 2) {
@@ -289,11 +297,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
     const uint32_t idesc = (1u << 4) | (1u << 7) | (1u << 10) |
                            (static_cast<uint32_t>(n >> 3) << 17) | (8u << 24);
     for (int j = 0; j < nk; ++j) {
-      const int i = nt + j, slot = i % p.ns;
-      // The slot's previous item may be a weight block (TMEM fill warp): wait until it
-      // is consumed so the parity below names item i's phase, not an older one.
-      if (i >= p.ns && i - p.ns < nt) mbar_wait(trdy0 + 8 * (i - p.ns), 0);
-      mbar_wait(full0 + 8 * slot, (i / p.ns) & 1);
+      const int xs = j % p.xs;
+      mbar_wait(xfull0 + 8 * xs, (j / p.xs) & 1);
       if (j < nt) {
         mbar_wait(trdy0 + 8 * j, 0);
       } else if (j == nt) {
@@ -301,7 +306,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
       }
       asm volatile("tcgen05.fence::after_thread_sync;");
       if (j == 0 && lane == 0) STAMP(6);
-      const uint64_t b0 = smem_desc(ring_s + slot * kSlot);
+      const uint64_t b0 = smem_desc(ring_s + xs * n * 128);
       if (j < nt) {
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk)
@@ -311,7 +316,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) mma_ss(tmem, a0 + 2 * kk, b0 + 2 * kk, idesc, (j | kk) != 0);
       }
-      commit_el(empty0 + 8 * slot);
+      commit_el(xempty0 + 8 * xs);
     }
     commit_el(acc_bar);
   } else if (warp >= 4) {
@@ -341,8 +346,8 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   if (threadIdx.x == 0) {
     STAMP(2);
     __threadfence();
-    atomicAdd(p.cnt + kTileCnt + tile, 1u);
-    while (ld_acquire(p.cnt + kTileCnt + tile) < static_cast<unsigned>(p.ks)) __nanosleep(32);
+    atomicAdd(p.cnt + kTileCnt + kLine * tile, 1u);
+    while (ld_acquire(p.cnt + kTileCnt + kLine * tile) < static_cast<unsigned>(p.ks)) __nanosleep(32);
     STAMP(3);
   }
   __syncthreads();
@@ -384,7 +389,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   __syncthreads();
   if (tile < p.rtiles && threadIdx.x == 0) {
     __threadfence();
-    atomicAdd(p.cnt + 1, 1u);
+    atomicAdd(p.cnt + kLine, 1u);
   }
   // Dead rows [n, capacity): routes -1 only (spread over the grid).
   {
@@ -397,7 +402,7 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   if (row < n) {
     if (threadIdx.x == 0) {
       const unsigned need = static_cast<unsigned>(p.rtiles * p.ks);
-      while (ld_acquire(p.cnt + 1) < need) __nanosleep(32);
+      while (ld_acquire(p.cnt + kLine) < need) __nanosleep(32);
       STAMP(4);
     }
     __syncthreads();
@@ -413,10 +418,10 @@ __global__ void __maxnreg__(96)  // launched with kThreads
   if (threadIdx.x == 0) {
     STAMP(5);
     // The last CTA of the grid (every CTA is past its waits) resets the counters.
-    if (atomicAdd(p.cnt + 2, 1u) == gridDim.x - 1) {
-      p.cnt[1] = 0;
-      p.cnt[2] = 0;
-      for (int t = 0; t < static_cast<int>(gridDim.x) / p.ks; ++t) p.cnt[kTileCnt + t] = 0;
+    if (atomicAdd(p.cnt + 2 * kLine, 1u) == gridDim.x - 1) {
+      p.cnt[kLine] = 0;
+      p.cnt[2 * kLine] = 0;
+      for (int t = 0; t < static_cast<int>(gridDim.x) / p.ks; ++t) p.cnt[kTileCnt + kLine * t] = 0;
     }
   }
 }
@@ -434,7 +439,7 @@ static void make_map(CUtensorMap* m, const void* ptr, int rows, int k, int box_r
 }
 
 struct Plan {
-  int na, nt_max, nr_max, ns, smem;
+  int na, nt_max, nr_max, ns, smem, xs;
 };
 
 static int static_smem() {
@@ -455,6 +460,7 @@ static Plan plan_for(int n, int kb, int ks, int ns) {
   const int room = (kSmemBudget - static_smem() - fixed) / kSlot;
   pl.ns = ns > 0 ? ns : std::min(kMaxNS, room);
   pl.smem = fixed + pl.ns * kSlot;
+  pl.xs = std::min({kMaxX, nk_max, pl.ns * kSlot / (n * 128)});
   return pl;
 }
 
@@ -492,7 +498,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
               "moe_front: logits buffer");
   const int64_t tiles = rows_w / 128, kb = k / 64, grid = tiles * ks;
   TORCH_CHECK(cnt.scalar_type() == at::kInt && cnt.is_contiguous() &&
-                  cnt.numel() >= kTileCnt + tiles,
+                  cnt.numel() >= kTileCnt + kLine * tiles,
               "moe_front: counters");
   TORCH_CHECK(part.scalar_type() == at::kFloat && part.is_contiguous() &&
                   part.numel() >= grid * n * 128,
@@ -566,6 +572,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
   p.na = pl.na;
   p.nt_max = pl.nt_max;
   p.nr_max = pl.nr_max;
+  p.xs = pl.xs;
   p.yfull = y.size(1) >= rows_w ? 1 : 0;
   CUtensorMap tw, tx;
   make_map(&tw, w.data_ptr(), (int)rows_w, (int)k, 128);
@@ -594,7 +601,7 @@ void moe_front(const torch::Tensor& w, const torch::Tensor& h, torch::Tensor& y,
 // (ring slots, shared-memory weight K blocks, dynamic smem bytes) at this shape.
 std::vector<int64_t> moe_front_plan(int64_t n, int64_t k, int64_t ks, int64_t ns) {
   const k3front::Plan pl = k3front::plan_for((int)n, (int)(k / 64), (int)ks, (int)ns);
-  return {pl.ns, pl.nr_max, pl.smem};
+  return {pl.ns, pl.nr_max, pl.smem, pl.xs};
 }
 
 std::vector<int64_t> moe_front_attrs() {
@@ -708,7 +715,7 @@ class MoeFront:
         n_max = max(rows)
         self.y = torch.empty((n_max, self.num_logits), dtype=torch.float32, device=dev)
         tiles = packed.shape[0] // 128
-        self.cnt = torch.zeros(8 + tiles, dtype=torch.int32, device=dev)
+        self.cnt = torch.zeros(32 * (3 + tiles), dtype=torch.int32, device=dev)
         ks = max(config_for(n, dev)[0] for n in rows)
         self.part = torch.empty(tiles * ks * n_max * 128, dtype=torch.float32, device=dev)
         self.no_stamps = torch.empty(0, dtype=torch.int64, device=dev)
