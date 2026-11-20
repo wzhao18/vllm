@@ -1120,6 +1120,7 @@ class SparseMlaPrefillH8:
             st_shared_u32(gm + Uint32(4 * sp), gw)
         if grow != 0:
             st_shared_f32(alb + Uint32(h * 4), alpha)
+        self.ss(base, cta, lane, u, 8 * wg + 7, 1)
         anyg = bar_red_or(Uint32(10 + wg), Uint32(128), Uint32(grow))
         self.ss(base, cta, lane, u, 8 * wg + 3, 1)
         if u >= NP:

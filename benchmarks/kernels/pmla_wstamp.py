@@ -42,4 +42,4 @@ for k in [k for k in d if k.startswith("sstamp")]:
     for r, row in enumerate(raw):
         rel = [((v - t0) & 0xFFFFFFFF) if v else -1 for v in row]
         print(f"u{16 + r} WG{r % 2}", " | ".join(
-            " ".join(f"{x:6d}" for x in rel[8 * w:8 * w + 7]) for w in range(4)))
+            " ".join(f"{x:6d}" for x in rel[8 * w:8 * w + 8]) for w in range(4)))
