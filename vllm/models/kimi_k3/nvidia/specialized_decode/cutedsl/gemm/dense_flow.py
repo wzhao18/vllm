@@ -112,12 +112,25 @@ WHOLE = 1024  # host: whole gate_up blocks per SM (flow_tables(whole=True))
 NO_EARLY_PDL = 512
 NO_PREWAIT = 2048  # A/B: first ring issued after the dependency wait
 OLD_FENCE = 4096  # A/B: fence.acq_rel.gpu before every ready / partial flag
+NO_L2HINT = 8192  # A/B: no L2 eviction hints on the TMA loads
 
 
 @asm(Int32)
 def _atom_cas(address, compare, value):
     code = "atom.relaxed.gpu.global.cas.b32 $0, [$1], $2, $3;"
     return code, "=r,l,r,r,~{memory}", (Int64(address), Int32(compare), Int32(value))
+
+
+@asm(Int64)
+def _evict_first_policy():
+    """L2 policy for a stream-once operand (the weights)."""
+    return "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;", "=l", ()
+
+
+@asm(Int64)
+def _evict_last_policy():
+    """L2 policy for an operand every SM re-reads (x, h)."""
+    return "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;", "=l", ()
 
 
 @asm(Int32)
@@ -479,6 +492,11 @@ class DenseFlow:
 
         if (warp < 4) & (warp != 2):  # TMA: stage g issued by producer g % PRODUCERS
             me = cutlass.min(warp, 2)
+            wpol = None
+            apol = None
+            if cutlass.const_expr(not (self.debug & NO_L2HINT)):
+                wpol = _evict_first_policy()
+                apol = _evict_last_policy()
             # The first ring of gate_up weight tiles depends on nothing: issued before
             # the dependency wait (x tiles after it), so a CTA resident under its
             # predecessor starts with a full ring.
@@ -498,7 +516,7 @@ class DenseFlow:
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(full + g, self.tx_bytes)
                     cute.copy(tma_a, tAgWa[(None, bbA + bp_, up - bp_ * ktA, 0)],
-                              tAsA[(None, g)], tma_bar_ptr=full + g)  # fmt: skip
+                              tAsA[(None, g)], tma_bar_ptr=full + g, cache_policy=wpol)  # fmt: skip
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.debug & ds.STAMPS):
                 if warp == 0:
@@ -512,7 +530,7 @@ class DenseFlow:
                     elif g < n1 + n2:
                         up = hlo + g - n1
                     cute.copy(tma_xa, tBgX[(None, 0, up - (up // ktA) * ktA, 0)],
-                              tBsB[(None, g)], tma_bar_ptr=full + g)  # fmt: skip
+                              tBsB[(None, g)], tma_bar_ptr=full + g, cache_policy=apol)  # fmt: skip
             gi = Int32(0)
             turn = Int32(0)
             s = Int32(0)
@@ -530,9 +548,9 @@ class DenseFlow:
                                 cute.arch.mbarrier_arrive_and_expect_tx(full + s,
                                                                         self.tx_bytes)  # fmt: skip
                             cute.copy(tma_a, tAgWa[(None, gb, kb, 0)], tAsA[(None, s)],
-                                      tma_bar_ptr=full + s)  # fmt: skip
+                                      tma_bar_ptr=full + s, cache_policy=wpol)  # fmt: skip
                             cute.copy(tma_xa, tBgX[(None, 0, kb, 0)], tBsB[(None, s)],
-                                      tma_bar_ptr=full + s)  # fmt: skip
+                                      tma_bar_ptr=full + s, cache_policy=apol)  # fmt: skip
                         gi += 1
                         turn += 1
                         if turn == PRODUCERS:
@@ -556,13 +574,13 @@ class DenseFlow:
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive_and_expect_tx(full + s, self.tx_bytes)
                         cute.copy(tma_b, tAgWb[(None, gob, k, 0)], tAsA[(None, s)],
-                                  tma_bar_ptr=full + s)  # fmt: skip
+                                  tma_bar_ptr=full + s, cache_policy=wpol)  # fmt: skip
                         if cutlass.const_expr(not (self.debug & NO_EPILOGUE)):
                             while _lds_acquire(hready) <= j:
                                 _sleep(256)
                             _fence_proxy_global()
                         cute.copy(tma_ha, tBgH[(None, 0, k, 0)], tBsB[(None, s)],
-                                  tma_bar_ptr=full + s)  # fmt: skip
+                                  tma_bar_ptr=full + s, cache_policy=apol)  # fmt: skip
                     turn += 1
                     if turn == PRODUCERS:
                         turn = Int32(0)
