@@ -33,6 +33,34 @@ from .primitives import asm
 MAX_SMID = 1024
 
 
+def per_sm_fit(compiled, index: int, threads: int, smem: int) -> int:
+    """CTAs of ``compiled`` (``threads`` each, ``smem`` dynamic shared memory bytes)
+    one SM holds, from the function's registers and the SM's limits (65536 registers
+    allocated per warp in 256s, the shared memory plus 1 KiB per CTA, the threads),
+    with the maximum shared memory carveout requested (cuOccupancy* reports 1 for
+    CuTe functions that demonstrably run two per SM)."""
+    import cuda.bindings.driver as cuda
+
+    _, function = resolve_kernel(compiled, index)
+    attribute = cuda.CUfunction_attribute
+    carveout = attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+    _checked(cuda.cuFuncSetAttribute(function, carveout, 100))
+    (regs,) = _checked(
+        cuda.cuFuncGetAttribute(attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, function)
+    )
+    (static,) = _checked(
+        cuda.cuFuncGetAttribute(attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function)
+    )
+    props = torch.cuda.get_device_properties(index)
+    warps = -(-threads // 32)
+    per_warp = -(-regs * 32 // 256) * 256
+    return min(
+        props.regs_per_multiprocessor // (warps * per_warp),
+        props.shared_memory_per_multiprocessor // (smem + static + 1024),
+        props.max_threads_per_multi_processor // (warps * 32),
+    )
+
+
 class ResidentGrid:
     """Host side: the SM table and counters of resident ``per_sm``-per-SM grids on
     ``device`` (shared by every kernel using it on the device's stream order)."""
@@ -62,19 +90,11 @@ class ResidentGrid:
         """Raise unless exactly ``per_sm`` CTAs of ``compiled`` (``threads`` each,
         ``smem`` dynamic shared memory bytes) fit an SM: the static assignment's
         completeness rests on it (module notes)."""
-        import cuda.bindings.driver as cuda
-
-        _, function = resolve_kernel(compiled, self.table.device.index)
-        attribute = cuda.CUfunction_attribute
-        carveout = attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
-        _checked(cuda.cuFuncSetAttribute(function, carveout, 100))
-        (per_sm,) = _checked(
-            cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(function, threads, smem)
-        )
-        if per_sm != self.per_sm:
+        fits = per_sm_fit(compiled, self.table.device.index, threads, smem)
+        if fits != self.per_sm:
             raise RuntimeError(
-                f"{what}: {per_sm} CTAs per SM fit ({threads} threads, {smem} B "
-                f"shared memory); the resident grid needs exactly {self.per_sm}"
+                f"{what}: {fits} CTAs per SM fit ({threads} threads, {smem} B shared "
+                f"memory); the resident grid needs exactly {self.per_sm}"
             )
 
     def addresses(self):

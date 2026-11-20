@@ -65,6 +65,33 @@ def _report(b):
     }
     merger = s[:, 10] > 0
     poll = med(s[merger, 10] - s[merger, 6]) if bool(merger.any()) else 0.0
+    # co-residency: per SM, the most CTAs whose [entry, end] overlap
+    entry, end, sm = s[:, 14], s[:, 11], s[:, 13].long()
+    most = 0
+    for one in sm.unique().tolist():
+        rows = (sm == one).nonzero().flatten().tolist()
+        for i in rows:
+            live = sum(1 for j in rows if entry[j] <= entry[i] < end[j])
+            most = max(most, live)
+    land_q = torch.quantile(entry - entry.min(), torch.tensor([0.1, 0.5, 0.9],
+                                                              dtype=torch.float64)) / 1e3
+    print(f"B{b}: co-resident CTAs per SM max {most}, SMs used {sm.unique().numel()}, "
+          f"entry q10/50/90 " + "/".join(f"{x:.1f}" for x in land_q.tolist()),
+          flush=True)
+    work = (s[:, 11] - s[:, 1]) / 1e3
+    after = (s[:, 1] - s[:, 1].min()) / 1e3
+    order = torch.argsort(s[:, 11], descending=True)[:6].tolist()
+    print(f"B{b}: work (end - wait) q50/q90/max {float(work.median()):.2f}/"
+          f"{float(torch.quantile(work, 0.9)):.2f}/{float(work.max()):.2f} | wait-pass "
+          f"q50/q90/max {float(after.median()):.2f}/{float(torch.quantile(after, 0.9)):.2f}"
+          f"/{float(after.max()):.2f}", flush=True)
+    for i in order:
+        r = s[i]
+        d = lambda a, b: float(r[b] - r[a]) / 1e3  # noqa: E731
+        mg = d(6, 10) if r[10] > 0 else -1.0
+        print(f"   slow cta {i}: pass {float(r[1] - s[:, 1].min()) / 1e3:.2f} setup "
+              f"{d(1, 2):.2f} p0loop {d(2, 4):.2f} p0merge {d(4, 5):.2f} p1loop {d(5, 6):.2f}"
+              f" p1merge {d(6, 7):.2f} poll {mg:.2f} stages {int(r[12])}", flush=True)
     q = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)
     endq = torch.quantile(s[:, 11] - t0, q) / 1e3
     startq = torch.quantile(s[:, 0] - t0, q) / 1e3

@@ -43,7 +43,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import dynamic_fake, fake
-from ..common.resident import land, wait_landed
+from ..common.resident import _smid, land, wait_landed
 from ..common.primitives import (
     alloc,
     asm,
@@ -110,6 +110,16 @@ from .gqa_window_umma import (
 SOFTMAX = 128  # the four softmax warps
 MAXP = 3  # pieces per CTA (units * slots / CTAs <= 2 slots-per-unit spans)
 OPITCH = 68  # FP32 words per merged row in the Q tile (bank spread)
+
+
+def smem_bytes(ring, q):
+    """The kernel's shared memory (its allocations in order, with their alignment)."""
+    up = lambda size, align: -(-size // align) * align  # noqa: E731
+    size = up(ring * SLOT, 1024) + 128 * 128
+    size = up(size, 16) + q * 256
+    size = up(size, 16) + q * 4
+    size = up(size, 8) + (ring + 4 * NS + 1) * 8
+    return up(size, 16) + 4 * 4
 
 
 def unit_slots(window, q):
@@ -190,7 +200,8 @@ class GqaWindowStream:
         # blocks one piece's stages touch (held one per producer lane)
         self.pages = -(-(window + q - 1 + 2 * KB) // page) + 1
         assert self.pages <= 32, self.pages
-        assert self.rows * OPITCH * 4 + 4 * 32 * 2 * 4 <= 128 * 128  # (merge in Q tile)
+        # (merge in the Q tile: two row regions, then the quarters' max / sum)
+        assert 2 * self.rows * OPITCH * 4 + 4 * 32 * 2 * 4 <= 128 * 128
         self.pstride = self.rows * (HEAD + 2)  # FP32 words per partial
 
     @cute.jit
@@ -200,7 +211,7 @@ class GqaWindowStream:
         ctas = min(units * self.slots, Int32(self.cap))
         if cutlass.const_expr(self.die_sms is not None):
             ctas = Int32(2 * self.sms)
-        launch(self.kernel, args, ctas, THREADS)
+        launch(self.kernel, args, ctas, THREADS, max_number_threads=[THREADS, 1, 1])
 
     @cute.jit
     def stages(self, length):
@@ -214,7 +225,7 @@ class GqaWindowStream:
         return lo, first, count
 
     @cute.jit
-    def plan(self, seq_lens, c, ctas, total, piece, die, heads, mask):
+    def plan(self, seq_lens, c, ctas, total, piece, die, heads, mask, lane):
         """Piece ``piece`` of CTA ``c`` (of ``ctas`` streaming the ``total`` virtual
         stages of the units of ``heads`` KV heads per request: the heads whose ``mask``
         bit is ``die``, all when ``die`` < 0): (valid, unit, request, head, length,
@@ -242,8 +253,9 @@ class GqaWindowStream:
                     seen = seen + 1
         u = request * HKV + head
         length = Int32(0)
-        if valid:
+        if valid & (lane == 0):  # (one load per warp: every CTA reads these lines)
             length = load_i32(seq_lens.iterator + request)
+        length = shfl_idx(length, Int32(0))
         lo, first, count = self.stages(length)
         n = Int32(0)
         if valid:
@@ -272,6 +284,8 @@ class GqaWindowStream:
 
         c, _, _ = cute.arch.block_idx()
         bid = c
+        self.rec(bid, 14, global_timer(), cute.arch.thread_idx()[0] == 0)
+        self.rec(bid, 13, Int64(_smid()), cute.arch.thread_idx()[0] == 0)
         ctas, _, _ = cute.arch.grid_dim()
         tid, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(tid // 32)
@@ -289,7 +303,9 @@ class GqaWindowStream:
         newkv = alloc(smem, cutlass.Uint8, Q * 256, align=16)
         newvalid = alloc(smem, Int32, Q, align=16)
         bars = alloc(smem, cutlass.Int64, R + 4 * NS + 1, align=8)
-        tslot = alloc(smem, Int32, 8, align=16)  # [0] TMEM, [1] redo, [2:5] landing
+        # [0] TMEM, [1] redo, [2] die << 16 | die-local CTA, [3] launch (the shared
+        # memory sits 8 B under two CTAs per SM: every byte here counts)
+        tslot = alloc(smem, Int32, 4, align=16)
         ring_base = Int32(shared_address(ring.iterator))
         q_base = Int32(shared_address(qtile.iterator))
         kv_new = Int32(shared_address(newkv.iterator))
@@ -304,9 +320,9 @@ class GqaWindowStream:
         # rows [ROWS, OPITCH] FP32, then (max, sum) per quarter and row
         merged = cute.make_tensor(
             cute.recast_ptr(qtile.iterator, dtype=Float32),
-            cute.make_layout(ROWS * OPITCH + 4 * 32 * 2),
+            cute.make_layout(2 * ROWS * OPITCH + 4 * 32 * 2),
         )  # fmt: skip
-        stats0 = ROWS * OPITCH
+        stats0 = 2 * ROWS * OPITCH
 
         if tid == 0:
             for i in cutlass.range_constexpr(R):
@@ -340,13 +356,12 @@ class GqaWindowStream:
             mask = args[20]
             if tid == 0:
                 d0, rank, slot, nth = land(args[17], args[18], args[19], 2)
-                tslot[2] = d0
-                tslot[3] = rank * 2 + slot
-                tslot[4] = nth
+                tslot[2] = (d0 << 16) | (rank * 2 + slot)
+                tslot[3] = nth
             cute.arch.sync_threads()
-            die = tslot[2]
-            c = tslot[3]
-            launch = tslot[4]
+            die = tslot[2] >> 16
+            c = tslot[2] & 0xFFFF
+            launch = tslot[3]
             ctas = Int32(2 * self.die_sms[0])
             if die != 0:
                 ctas = Int32(2 * self.die_sms[1])
@@ -357,14 +372,14 @@ class GqaWindowStream:
             total = (out.shape[0] // Q) * heads * HS
 
         # ---- the plan from the metadata as it stands (before the PDL wait)
-        pieces0 = [self.plan(seq_lens, c, ctas, total, p, die, heads, mask)
+        pieces0 = [self.plan(seq_lens, c, ctas, total, p, die, heads, mask, lane)
                    for p in range(MAXP)]  # fmt: skip
         pre0 = self.prep_load(qkv, positions, slots, cos_sin, group8, tid, pieces0[0],
                               False)  # fmt: skip
         # producer lanes hold one block table entry per piece (entry ``lane`` from
         # the piece's first page)
-        blk0 = [self.block_entry(table, pieces0[p], lane, table_last, blocks_max)
-                for p in range(MAXP)]  # fmt: skip
+        blk0 = [self.block_entry(table, pieces0[p], lane, warp, table_last,
+                                 blocks_max) for p in range(MAXP)]  # fmt: skip
         n_tot0 = pieces0[0][7] + pieces0[1][7] + pieces0[2][7]
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -381,9 +396,9 @@ class GqaWindowStream:
 
         # ---- after the wait: the plan again (confirming it); a moved plan drains the
         # speculated loads and reissues them (those slots' phases then start at 1)
-        pieces = [self.plan(seq_lens, c, ctas, total, p, die, heads, mask)
+        pieces = [self.plan(seq_lens, c, ctas, total, p, die, heads, mask, lane)
                   for p in range(MAXP)]  # fmt: skip
-        blk = [self.block_entry(table, pieces[p], lane, table_last, blocks_max)
+        blk = [self.block_entry(table, pieces[p], lane, warp, table_last, blocks_max)
                for p in range(MAXP)]  # fmt: skip
         moved = Int32(0)
         for p in cutlass.range_constexpr(MAXP):
@@ -426,7 +441,7 @@ class GqaWindowStream:
         if warp == PRODUCER:
             self.producer(kv_map, full, sready, pready, pvdone, sfree, qready,
                           ring_base, q_base, kv_new, newvalid, tmem, pieces, blk,
-                          lane, n_tot, offset_bits)  # fmt: skip
+                          lane, n_tot, offset_bits, counters)  # fmt: skip
             self.rec(bid, 3, global_timer(), lane == 0)
         else:
             self.softmax(qkv, positions, slots, cos_sin, q_w, k_w, eps, upper, group8,
@@ -444,11 +459,11 @@ class GqaWindowStream:
             free_tmem(tmem, TMEM_COLS)
 
     @cute.jit
-    def block_entry(self, table, piece, lane, table_last, blocks_max):
+    def block_entry(self, table, piece, lane, warp, table_last, blocks_max):
         """Block table entry lane of the piece's pages (from its first stage)."""
         valid, request, s0 = piece[0], piece[2], piece[6]
         entry = Int32(0)
-        if valid & (lane < self.pages):
+        if valid & (lane < self.pages) & (warp == PRODUCER):  # (the producer's only)
             row = table.iterator + request * table.layout.stride[0]
             entry = load_i32(row + min(s0 * KB // self.page + lane, table_last))
             entry = min(max(entry, Int32(0)), blocks_max)
@@ -701,7 +716,7 @@ class GqaWindowStream:
     @cute.jit
     def producer(self, kv_map, full, sready, pready, pvdone, sfree, qready, ring_base,
                  q_base, kv_new, newvalid, tmem, pieces, blk, lane, n_tot,
-                 offset_bits):  # fmt: skip
+                 offset_bits, counters):  # fmt: skip
         """S of stage t + 1 before stage t's PV waits on its P; ring refills behind the
         PVs, across pieces; a piece's first S waits for its Q tile (``qready``)."""
         q_desc = desc_sw128(q_base, 16)
@@ -736,6 +751,12 @@ class GqaWindowStream:
                 self.refill(kv_map, full, pvdone, ring_base, g + n - 1, pieces, blk,
                             lane, n_tot)  # fmt: skip
             g = g + n
+            if piece[0] & (piece[9] > 1) & (piece[8] > 0):
+                # a later piece of a split unit: once the softmax warps stored its
+                # partial (barrier 2), publish it to the unit's first piece
+                named_barrier(2, SOFTMAX + 32)
+                if lane == 0:
+                    counter_release(Int64(counters) + Int64(piece[1]) * 4)
 
     @cute.jit
     def softmax(self, qkv, positions, slots, cos_sin, q_w, k_w, eps, upper, group8,
@@ -768,7 +789,7 @@ class GqaWindowStream:
             nxt = None
             if cutlass.const_expr(p + 1 < MAXP):  # (the next piece's prep inputs)
                 nxt = self.prep_load(qkv, positions, slots, cos_sin, group8, tid,
-                                     pieces[p + 1], True)  # fmt: skip
+                                     pieces[p + 1], False)  # fmt: skip
             for t in cutlass.range(n, unroll=1):
                 gg = g + t
                 b = gg % NS
@@ -825,6 +846,10 @@ class GqaWindowStream:
             if cutlass.const_expr(p == 0):  # (the successor still waits for the end)
                 cute.arch.griddepcontrol_launch_dependents()
             self.rec(c, 4 + 2 * p, global_timer(), tid == 0)
+            fresh = None
+            if cutlass.const_expr(p + 1 < MAXP):  # (in flight during the merge)
+                fresh = self.prep_refresh(qkv, positions, slots, cos_sin, group8, tid,
+                                          pieces[p + 1], nxt)  # fmt: skip
             if piece[0]:
                 self.merge(warp, lane, tid, piece, n, g, tmem, lanes, pvdone, m_use,
                            l_run, q_base, merged, stats0, partials, counters, out,
@@ -835,7 +860,7 @@ class GqaWindowStream:
                 if pieces[p + 1][0]:
                     named_barrier(1, SOFTMAX)  # (the merge read the Q tile)
                     self.prep_store(q_w, k_w, eps, upper, group8, tid, pieces[p + 1],
-                                    nxt, q_base, kv_new, newvalid, kv_base,
+                                    fresh, q_base, kv_new, newvalid, kv_base,
                                     row_stride, head_stride)  # fmt: skip
                     fence_async_shared()
                     named_barrier(1, SOFTMAX)
@@ -845,26 +870,22 @@ class GqaWindowStream:
     @cute.jit
     def merge(self, warp, lane, tid, piece, n, g, tmem, lanes, pvdone, m_use, l_run,
               q_base, merged, stats0, partials, counters, out, c):  # fmt: skip
-        """The four quarters' rows into one (in the Q tile, quarters in order); then
-        the unit's output rows (one piece), or the piece's partial: a later piece of
-        the unit (k > 0) publishes it (release add); the unit's first piece (k = 0,
-        its CTA's last) waits for the others (acquire) and merges every partial in
-        piece order."""
+        """The four quarters' rows into two row regions of the Q tile (quarters 2, 3
+        stored, then 0, 1 added: region w % 2); then the unit's output rows (one
+        piece), or the piece's partial: a later piece of the unit (k > 0) stores it
+        and leaves the publication to the producer warp (barrier 2); the unit's first
+        piece (k = 0, its CTA's last) waits for the others (acquire) and merges every
+        partial in piece order."""
         ROWS: cutlass.Constexpr = self.rows
         PS: cutlass.Constexpr = self.pstride
         PM: cutlass.Constexpr = self.pmax
+        RB: cutlass.Constexpr = ROWS * OPITCH * 4  # bytes per row region
         u, k_p, p_u = piece[1], piece[8], piece[9]
         r = lane
-        ov = cute.make_rmem_tensor(64, Float32)
-        for e in cutlass.range_constexpr(64):
-            ov[e] = Float32(0)
         if n > 0:
             last = g + n - 1
             wait(pvdone + 8 * (last % NS), (last // NS) & 1, scope="cta")
             fence_tmem()
-            o = ld64(tmem + lanes + O_COL)
-            for e in cutlass.range_constexpr(64):
-                ov[e] = o[e]
         named_barrier(1, SOFTMAX)  # every warp past its last S: the Q tile is free
         if r < ROWS:
             merged[stats0 + (warp * 32 + r) * 2] = m_use
@@ -883,34 +904,41 @@ class GqaWindowStream:
                 wt = ex2(ms[w] - use)
                 total = fma(merged[stats0 + (w * 32 + r) * 2 + 1], wt, total)
             weight = ex2(m_use - use)
-        row_addr = q_base + r * (OPITCH * 4)
-        for w in cutlass.range_constexpr(4):
-            if (warp == w) & (r < ROWS):
-                for q4 in cutlass.range_constexpr(16):
-                    if cutlass.const_expr(w == 0):
-                        acc = tuple(float_word(ov[4 * q4 + e] * weight)
-                                    for e in range(4))  # fmt: skip
-                    else:
-                        cur = load_words(row_addr + 16 * q4, count=4, shared=True)
-                        acc = tuple(
-                            float_word(fma(ov[4 * q4 + e], weight, bits_float(cur[e])))
-                            for e in range(4)
-                        )  # fmt: skip
-                    store_words(row_addr + 16 * q4, acc, shared=True)
+        row_addr = q_base + (warp % 2) * RB + r * (OPITCH * 4)
+        for step in cutlass.range_constexpr(2):
+            if warp // 2 == 1 - step:  # (step 0: quarters 2, 3; step 1: 0, 1)
+                if n > 0:
+                    for ch in cutlass.range_constexpr(4):
+                        o = ld16(tmem + lanes + O_COL + Uint32(16 * ch))
+                        if r < ROWS:
+                            for q4 in cutlass.range_constexpr(4):
+                                at = row_addr + 64 * ch + 16 * q4
+                                if cutlass.const_expr(step == 0):
+                                    acc = tuple(float_word(o[4 * q4 + e] * weight)
+                                                for e in range(4))  # fmt: skip
+                                else:
+                                    cur = load_words(at, count=4, shared=True)
+                                    acc = tuple(
+                                        float_word(fma(o[4 * q4 + e], weight,
+                                                       bits_float(cur[e])))
+                                        for e in range(4)
+                                    )  # fmt: skip
+                                store_words(at, acc, shared=True)
+                if cutlass.const_expr(step == 0):
+                    if (n == 0) & (r < ROWS):  # (no PV in this piece: zero rows)
+                        for q4 in cutlass.range_constexpr(16):
+                            store_words(row_addr + 16 * q4, (Uint32(0),) * 4,
+                                        shared=True)  # fmt: skip
             named_barrier(1, SOFTMAX)
-        if (warp == 0) & (r < ROWS):  # (every warp's lane r holds the same top, total)
-            merged[stats0 + r * 2] = top
-            merged[stats0 + r * 2 + 1] = total
-        named_barrier(1, SOFTMAX)
         TASKS: cutlass.Constexpr = ROWS * 8
         if p_u == 1:
             for it in cutlass.range_constexpr(-(-TASKS // SOFTMAX)):
                 task = it * SOFTMAX + tid
                 if task < TASKS:
                     rr, d8 = task // 8, task % 8
-                    values = [merged[rr * OPITCH + 8 * d8 + e] for e in range(8)]
-                    self.store_row(out, piece, rr, d8, values,
-                                   merged[stats0 + rr * 2 + 1])  # fmt: skip
+                    values = self.own_row(q_base, rr, d8)
+                    _, total_r = self.own_stats(merged, stats0, rr)
+                    self.store_row(out, piece, rr, d8, values, total_r)
         else:
             unit_base = Int64(partials) + Int64(u) * (PM * PS * 4)
             ctr = Int64(counters) + Int64(u) * 4
@@ -920,17 +948,16 @@ class GqaWindowStream:
                     task = it * SOFTMAX + tid
                     if task < TASKS:
                         rr, d8 = task // 8, task % 8
-                        src = q_base + (rr * OPITCH + 8 * d8) * 4
+                        values = self.own_row(q_base, rr, d8)
                         dst = base + (rr * 64 + 8 * d8) * 4
-                        store_words(dst, load_words(src, count=4, shared=True))
-                        store_words(dst + 16, load_words(src + 16, count=4, shared=True))
+                        store_words(dst, tuple(float_word(values[e]) for e in range(4)))
+                        store_words(dst + 16, tuple(float_word(values[4 + e])
+                                                    for e in range(4)))  # fmt: skip
                 if tid < ROWS:
                     st = base + (ROWS * 64 + 2 * tid) * 4
-                    store_words(st, (float_word(merged[stats0 + tid * 2]),
-                                     float_word(merged[stats0 + tid * 2 + 1])))  # fmt: skip
-                named_barrier(1, SOFTMAX)
-                if tid == 0:
-                    counter_release(ctr)
+                    top_t, total_t = self.own_stats(merged, stats0, tid)
+                    store_words(st, (float_word(top_t), float_word(total_t)))
+                named_barrier(2, SOFTMAX + 32, arrive=True)  # (the producer publishes)
             else:
                 if tid == 0:
                     seen = counter_acquire(ctr)
@@ -942,52 +969,84 @@ class GqaWindowStream:
                     task = it * SOFTMAX + tid
                     if task < TASKS:
                         rr, d8 = task // 8, task % 8
-                        self.final_row(out, piece, rr, d8, unit_base, p_u, merged,
-                                       stats0)  # fmt: skip
+                        self.final_row(out, piece, rr, d8, unit_base, p_u, q_base,
+                                       merged, stats0)  # fmt: skip
                 if tid == 0:
                     counter_reset(ctr)
 
     @cute.jit
-    def final_row(self, out, piece, rr, d8, unit_base, p_u, merged, stats0):
+    def own_row(self, q_base, rr, d8):
+        """Dims 8 d8.. of merged row ``rr``: region 0 + region 1 (the quarters)."""
+        RB: cutlass.Constexpr = self.rows * OPITCH * 4
+        at = q_base + (rr * OPITCH + 8 * d8) * 4
+        a = load_words(at, count=4, shared=True) + load_words(at + 16, count=4,
+                                                              shared=True)  # fmt: skip
+        b = load_words(at + RB, count=4, shared=True) + load_words(
+            at + RB + 16, count=4, shared=True)  # fmt: skip
+        return [bits_float(a[e]) + bits_float(b[e]) for e in range(8)]
+
+    @cute.jit
+    def own_stats(self, merged, stats0, rr):
+        """(max, sum) of merged row ``rr``: the quarters' max and their sums at it."""
+        ms = [merged[stats0 + (w * 32 + rr) * 2] for w in range(4)]
+        top = fmax(fmax(ms[0], ms[1]), fmax(ms[2], ms[3]))
+        use = top
+        if top == Float32(NEG_INF):
+            use = Float32(0)
+        total = Float32(0)
+        for w in cutlass.range_constexpr(4):
+            total = fma(merged[stats0 + (w * 32 + rr) * 2 + 1], ex2(ms[w] - use), total)
+        return top, total
+
+    @cute.jit
+    def final_row(self, out, piece, rr, d8, unit_base, p_u, q_base, merged, stats0):
         """Output dims 8 d8.. of row ``rr``: the unit's pieces in order (piece 0 from
-        the Q tile, the others' partials loaded at once), an online LSE merge."""
+        the Q tile, the others' partials two at a time), an online LSE merge."""
         ROWS: cutlass.Constexpr = self.rows
         PS: cutlass.Constexpr = self.pstride
         PM: cutlass.Constexpr = self.pmax
-        buf = cute.make_rmem_tensor(PM * 10, Float32)
-        for k in cutlass.range_constexpr(1, PM):
-            if k < p_u:
-                pb = unit_base + k * (PS * 4)
-                st = load_words(pb + (ROWS * 64 + 2 * rr) * 4, count=2, scope="gpu")
-                w8 = load_words(pb + (rr * 64 + 8 * d8) * 4, count=4, scope="gpu")
-                w8b = load_words(pb + (rr * 64 + 8 * d8 + 4) * 4, count=4, scope="gpu")
-                buf[10 * k] = bits_float(st[0])
-                buf[10 * k + 1] = bits_float(st[1])
-                for e in cutlass.range_constexpr(4):
-                    buf[10 * k + 2 + e] = bits_float(w8[e])
-                    buf[10 * k + 6 + e] = bits_float(w8b[e])
-        top = merged[stats0 + rr * 2]
-        total = merged[stats0 + rr * 2 + 1]
+        top, total = self.own_stats(merged, stats0, rr)
+        own = self.own_row(q_base, rr, d8)
         values = cute.make_rmem_tensor(8, Float32)
         for e in cutlass.range_constexpr(8):
-            values[e] = merged[rr * OPITCH + 8 * d8 + e]
-        for k in cutlass.range_constexpr(1, PM):
-            if k < p_u:
-                m_k = buf[10 * k]
-                if m_k > top:  # (rescale the running rows to the new max)
-                    alpha = ex2(top - m_k)
-                    if top == Float32(NEG_INF):
-                        alpha = Float32(0)
-                    total = total * alpha
-                    for e in cutlass.range_constexpr(8):
-                        values[e] = values[e] * alpha
-                    top = m_k
-                wt = ex2(m_k - top)
-                if m_k == Float32(NEG_INF):
-                    wt = Float32(0)
-                total = fma(buf[10 * k + 1], wt, total)
-                for e in cutlass.range_constexpr(8):
-                    values[e] = fma(buf[10 * k + 2 + e], wt, values[e])
+            values[e] = own[e]
+        buf = cute.make_rmem_tensor(20, Float32)
+        for k0 in cutlass.range_constexpr(1, PM, 2):
+            for kk in cutlass.range_constexpr(2):
+                k = k0 + kk
+                if cutlass.const_expr(k < PM):
+                    if k < p_u:
+                        pb = unit_base + k * (PS * 4)
+                        st = load_words(pb + (ROWS * 64 + 2 * rr) * 4, count=2,
+                                        scope="gpu")  # fmt: skip
+                        w8 = load_words(pb + (rr * 64 + 8 * d8) * 4, count=4,
+                                        scope="gpu")  # fmt: skip
+                        w8b = load_words(pb + (rr * 64 + 8 * d8 + 4) * 4, count=4,
+                                         scope="gpu")  # fmt: skip
+                        buf[10 * kk] = bits_float(st[0])
+                        buf[10 * kk + 1] = bits_float(st[1])
+                        for e in cutlass.range_constexpr(4):
+                            buf[10 * kk + 2 + e] = bits_float(w8[e])
+                            buf[10 * kk + 6 + e] = bits_float(w8b[e])
+            for kk in cutlass.range_constexpr(2):
+                k = k0 + kk
+                if cutlass.const_expr(k < PM):
+                    if k < p_u:
+                        m_k = buf[10 * kk]
+                        if m_k > top:  # (rescale the running rows to the new max)
+                            alpha = ex2(top - m_k)
+                            if top == Float32(NEG_INF):
+                                alpha = Float32(0)
+                            total = total * alpha
+                            for e in cutlass.range_constexpr(8):
+                                values[e] = values[e] * alpha
+                            top = m_k
+                        wt = ex2(m_k - top)
+                        if m_k == Float32(NEG_INF):
+                            wt = Float32(0)
+                        total = fma(buf[10 * kk + 1], wt, total)
+                        for e in cutlass.range_constexpr(8):
+                            values[e] = fma(buf[10 * kk + 2 + e], wt, values[e])
         self.store_row(out, piece, rr, d8, [values[e] for e in range(8)], total)
 
     @cute.jit

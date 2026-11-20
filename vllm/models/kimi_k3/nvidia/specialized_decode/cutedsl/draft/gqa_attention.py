@@ -54,11 +54,13 @@ from ...shapes import refuse
 from ..common.host import dynamic_view, stream, tensor_maps, to_cute
 from .gqa_context_kv import compile_context_kv
 from .gqa_window import TB, compile_window
+from ..common.resident import per_sm_fit
 from .gqa_window_stream import (
     MAXP,
     compile_window_stream,
     grid_ctas,
     piece_bounds,
+    smem_bytes,
     unit_slots,
 )
 from .gqa_window_umma import KB, compile_window_umma, kv_map_5d
@@ -343,9 +345,13 @@ class GqaAttentionState:
                 round_norm=window_options().get("round_norm", False), cap=splits,
                 die_sms=die_sms,
             )  # fmt: skip
+            smem = smem_bytes(ring, self.q)
             if die_sms is not None:
-                smem = ring * 2 * KB * 128 + 16384 + self.q * 260 + (ring + 9) * 8 + 1056
                 self.resident.check(compiled, 160, smem, "GqaWindowStream die split")
+            elif per_sm_fit(compiled, self.device.index, 160, smem) < 2:
+                raise RuntimeError(
+                    f"GqaWindowStream {shape}: two CTAs per SM do not fit"
+                )
             return compiled
         if kgroups == 0:  # GqaWindowUmma (tcgen05): splits CTAs per (request, head)
             if page % KB:
