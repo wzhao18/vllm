@@ -4,8 +4,9 @@
 sm_107 CuTe DSL block-scaled GEMM, PDL launch, weight k-blocks issued before
 griddepcontrol.wait) on Rubin:
 
-* kda_in at the D3-32 rows: bitwise equal to cuBLASLt ``_scaled_mm`` (stock's kind above
-  16 rows: both sum K in order in FP32 with one BF16 rounding) and to the same kernel
+* kda_in at the D3-32 rows (R384 on a swap_ab tactic: weights on the M side, C stored
+  M-major into the row-major out): bitwise equal to cuBLASLt ``_scaled_mm`` (stock's kind
+  above 16 rows: both sum K in order in FP32 with one BF16 rounding) and to the same kernel
   without PDL / prologue;
 * a captured graph of back-to-back "pre" projections (PDL edges) replays bitwise;
 * tactics the host cannot serve raise.
@@ -94,7 +95,5 @@ def test_pre_graph_chain():
 
 
 def test_pre_rejects():
-    with pytest.raises(ValueError):
-        Mxfp8PreGemm(N, K, 128, ((256, 192), (2, 1), True, 256), device=DEVICE)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # more prologue k-blocks than K has
         Mxfp8PreGemm(N, 256, 128, ((128, 64), (1, 1), False, 128), prewait=8, device=DEVICE)
