@@ -295,8 +295,11 @@ class WideGemm:
 
     def __init__(self, rows, n, k, split, silu=False, act_warps=(1,), out_f32=False,
                  wstages=None, weight_warps=(0, 3), direct=False, rotate=False,
-                 partials=False):  # fmt: skip
+                 partials=False, maxreg=None):  # fmt: skip
         assert supports(rows, n, k, split, silu, out_f32), (rows, n, k, split, silu)
+        # Launch bound (CTAs per SM) capping ptxas at maxreg registers per thread:
+        # 64 K / (256 x bound) (48 -> 5), so the CTA fits beside a predecessor's.
+        self.min_blocks = 65536 // (256 * maxreg) if maxreg else 0
         self.act_warps = tuple(sorted(act_warps))
         assert self.act_warps[0] == 1 and set(act_warps) <= set(ACT_WARPS), act_warps
         self.rows, self.n, self.k, self.split, self.silu = rows, n, k, split, silu
@@ -384,6 +387,7 @@ class WideGemm:
             cluster=(2, 1, 1),
             stream=stream,
             use_pdl=True,
+            **({"min_blocks_per_mp": self.min_blocks} if self.min_blocks else {}),
         )
 
     @cute.kernel
@@ -884,8 +888,12 @@ class PreparedWide:
     in stock [gate; up] order, permuted here). ``run(x, out)``: out [T, N] (or
     [T, N / 2] with ``silu``)."""
 
-    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False):
+    def __init__(self, weight, policies, silu=False, out_f32=False, partials=False,
+                 maxreg=None):  # fmt: skip
         self.silu, self.out_f32, self.partials = silu, out_f32 or partials, partials
+        # ptxas register cap: a CTA that must co-reside with its PDL predecessor
+        # (e.g. 3-4 AttnRes CTAs of 13 K registers each) fits only at <= 48.
+        self.maxreg = maxreg
         self.weight = permute_gate_up(weight) if silu else weight.contiguous()
         self.n, self.k = self.weight.shape
         # rows -> split, or rows -> (split[, activation issuer warps[, weight stages
@@ -904,7 +912,7 @@ class PreparedWide:
         for rows, (split, act_warps, wst, w_warps, direct, rotate) in self.policies.items():
             gemm = WideGemm(
                 rows, self.n, self.k, split, self.silu, act_warps, self.out_f32, wst,
-                w_warps, direct, rotate, self.partials,
+                w_warps, direct, rotate, self.partials, self.maxreg,
             )  # fmt: skip
             n_pad = gemm.n_pad
             sms = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -925,7 +933,7 @@ class PreparedWide:
             )
             args = (w, self._x(x), self._y(y), self._ws(ws), self._ws(flags))
             key = (rows, self.n, self.k, split, self.silu, self.out_f32, self.partials)
-            key += self.policies[rows]
+            key += self.policies[rows] + (self.maxreg,)
             if key not in _COMPILED:
                 stream = _cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
                 _COMPILED[key] = cute.compile(gemm, *args, stream)
