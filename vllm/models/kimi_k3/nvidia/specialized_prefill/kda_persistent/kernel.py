@@ -142,8 +142,9 @@ MB_OEMPTY = 65
 MB_BRAW = 66
 MB_GRAM = 71
 MB_G1 = 76
-MB_WFULL = 81
-MB_WDONE = 83
+MB_WTM = 81
+MB_WDONE = 82
+WCOL = 432
 
 
 def _exp2f(x):
@@ -156,7 +157,7 @@ def _tanhf(x):
 
 @cute.struct
 class PkdStorage:
-    mbar: cute.struct.MemRange[cutlass.Int64, 85]
+    mbar: cute.struct.MemRange[cutlass.Int64, 84]
     tmem_holding: cutlass.Int32
 
 
@@ -167,7 +168,6 @@ def _pkd(
     mma_4a: cute.TiledMma,
     mma_4b: cute.TiledMma,
     mma_g: cute.TiledMma,
-    mma_f: cute.TiledMma,
     tma_q: cute.CopyAtom,
     mQ: cute.Tensor,
     tma_k: cute.CopyAtom,
@@ -176,8 +176,7 @@ def _pkd(
     mG: cute.Tensor,
     tma_fa: cute.CopyAtom,
     mFA: cute.Tensor,
-    tma_w: cute.CopyAtom,
-    mW: cute.Tensor,
+    wfb: cute.Tensor,
     tma_b: cute.CopyAtom,
     mB: cute.Tensor,
     tma_v: cute.CopyAtom,
@@ -218,7 +217,6 @@ def _pkd(
     lay_inv: cute.ComposedLayout,
     lay_ft: cute.ComposedLayout,
     lay_v: cute.ComposedLayout,
-    lay_w: cute.ComposedLayout,
     H_: cutlass.Constexpr[int],
     TPROBE_: cutlass.Constexpr[int] = 0,
     GATE2_: cutlass.Constexpr[int] = 0,
@@ -257,13 +255,6 @@ def _pkd(
     arena = smem.allocate_tensor(
         cutlass.Int8, cute.make_layout((STAGES * STAGE_BYTES,)), 1024
     )
-    if cutlass.const_expr(FAG_ == 1):
-        # gate-input weight W_fb[head] (M=128 channels x K=128 rank), one
-        # buffer per chain parity (warp 11 refills it, instances release it)
-        s_w = smem.allocate_tensor(
-            cutlass.BFloat16, lay_w.outer, 1024, swizzle=lay_w.inner
-        )
-        a_w = mma_f.make_fragment_A(s_w)
     s_out = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((2 * C * D,)), 1024)
     s_gt5 = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((D, STAGES), stride=(1, D)), 16
@@ -470,9 +461,8 @@ def _pkd(
             if cutlass.const_expr(FAG_ == 1):
                 for i in cutlass.range_constexpr(STAGES):
                     cute.arch.mbarrier_init(mb + MB_G1 + i, 1)
-                for j in cutlass.range_constexpr(2):
-                    cute.arch.mbarrier_init(mb + MB_WFULL + j, 1)
-                    cute.arch.mbarrier_init(mb + MB_WDONE + j, STAGES)
+                cute.arch.mbarrier_init(mb + MB_WTM, 1)
+                cute.arch.mbarrier_init(mb + MB_WDONE, STAGES)
         cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
@@ -1440,34 +1430,6 @@ def _pkd(
             cute.arch.warpgroup_reg_dealloc(24)
         else:
             cute.arch.warpgroup_reg_dealloc(32)
-        if cutlass.const_expr(FAG_ == 1):
-            if warp == 11:
-                thr_fw = mma_f.get_slice(0)
-                g_w = cute.local_tile(mW, (BM, D), (None, None, None))
-                w_d, w_s = cpasync.tma_partition(
-                    tma_w,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(s_w, 0, 3),
-                    cute.group_modes(thr_fw.partition_A(g_w), 0, 3),
-                )
-                for kx in cutlass.range(k1 - k0):
-                    chain_w = cute.arch.make_warp_uniform(schain[k0 + kx])
-                    wb = kx & 1
-                    if kx >= 2:
-                        cute.arch.mbarrier_wait(
-                            mb + MB_WDONE + wb, ((kx - 2) >> 1) & 1
-                        )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mb + MB_WFULL + wb, D * D * 2
-                        )
-                    cute.copy(
-                        tma_w,
-                        w_s[(None, chain_w % H_, 0, 0)],
-                        w_d[(None, wb)],
-                        tma_bar_ptr=mb + MB_WFULL + wb,
-                    )
         if cutlass.const_expr(GRAM_W9_ != 0):
             if warp == 9:
                 # The prep instances publish their complete Qd/Kd/Ki image
@@ -1776,7 +1738,30 @@ def _pkd(
                 cute.recast_ptr(p_g64 + inst * (C // 2), dtype=cutlass.Float32),
                 acc32_base.layout,
             )
-            b_fa = mma_f.make_fragment_B(t_bqd)
+            mma_fts = cute.make_tiled_mma(
+                tcgen05.MmaF16BF16Op(
+                    cutlass.BFloat16,
+                    cutlass.Float32,
+                    (BM, C, 16),
+                    tcgen05.CtaGroup.ONE,
+                    tcgen05.OperandSource.TMEM,
+                    tcgen05.OperandMajorMode.K,
+                    tcgen05.OperandMajorMode.K,
+                )
+            )
+            b_fa = mma_fts.make_fragment_B(t_bqd)
+            t_wa = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + WCOL, dtype=cutlass.BFloat16),
+                inp_base.layout,
+            )
+            w16b_thrp = w16b_st.get_slice(ptl)
+            rbw = cute.make_rmem_tensor(
+                w16b_thrp.partition_S(
+                    thr1.partition_A(cute.make_identity_tensor((BM, 32)))
+                ).shape,
+                cutlass.BFloat16,
+            )
+            wl32 = cute.make_rmem_tensor(cute.make_layout((32,)), cutlass.BFloat16)
             mma_t16 = cute.make_tiled_mma(
                 tcgen05.MmaF16BF16Op(
                     cutlass.BFloat16,
@@ -1876,14 +1861,7 @@ def _pkd(
                 gFA = cute.flat_divide(
                     cute.domain_offset((bos, 0, 0), mFA), (C, 1, D)
                 )
-                wbuf = kx & 1
-                wpar = (kx >> 1) & 1
-                if kx > 0:
-                    if plw == 0:
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(
-                                mb + MB_WDONE + ((kx - 1) & 1)
-                            )
+                wpar = kx & 1
             ea = cute.math.exp(a_log[hidx], fastmath=True)
             ea2c = 0.5 * ea
             dtbc = ea2c * cutlass.Float32(dt_bias[hidx, ptl])
@@ -1893,6 +1871,12 @@ def _pkd(
             if li0 < 0:
                 li0 += STAGES
             n_iters = (t_tiles - li0 + STAGES - 1) // STAGES
+            if cutlass.const_expr(FAG_ == 1):
+                # an instance with no chunk in this chain releases its W now
+                if n_iters <= 0:
+                    if plw == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(mb + MB_WDONE)
             ph0 += t_tiles
             ph0 = ph0 % STAGES
             n_full_iters = n_iters
@@ -2091,6 +2075,33 @@ def _pkd(
                             early_gv0 = cutlass.Float32(v_graw[0, ptl, inst])
                             early_gate0 = lb2h * _tanhf(ea2c * early_gv0 + dtbc) + lb2h
 
+                    if cutlass.const_expr(FAG_ == 1):
+                        if ci == 0:
+                            # owner of the chain's first chunk installs W_fb[head]
+                            # once every instance's last g1 MMA of the previous
+                            # chain has completed (MB_WDONE, one arrival each)
+                            if kx > 0:
+                                cute.arch.mbarrier_wait(mb + MB_WDONE, (kx - 1) & 1)
+                            for wwin in cutlass.range(D // 32, unroll=1):
+                                wsrc = cute.make_tensor(
+                                    wfb.iterator + ((hidx * D + ptl) * D + wwin * 32),
+                                    cute.make_layout((32,)),
+                                )
+                                cute.autovec_copy(wsrc, wl32)
+                                rbw.store(wl32.load())
+                                t_wwin = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        tmem_ptr + WCOL + wwin * 16,
+                                        dtype=cutlass.BFloat16,
+                                    ),
+                                    w32b_base.layout,
+                                )
+                                cute.copy(w16b_st, rbw, w16b_thrp.partition_D(t_wwin))
+                            cute.arch.fence_view_async_tmem_store()
+                            ibar.arrive_and_wait()
+                            if plw == 0:
+                                with cute.arch.elect_one():
+                                    cute.arch.mbarrier_arrive(mb + MB_WTM)
                     # -- phase 1: everything else waits MMA4(ci-5) --
                     # one poller per instance; the others sleep on its barrier
                     if plw == 0:
@@ -2150,36 +2161,29 @@ def _pkd(
                         if cutlass.const_expr(FAG_ == 1 and (FAGP_ & 8) == 0):
                             if plw == 1:
                                 if cutlass.const_expr((FAGP_ & 2) == 0):
-                                    cute.arch.mbarrier_wait(mb + MB_WFULL + wbuf, wpar)
+                                    cute.arch.mbarrier_wait(mb + MB_WTM, wpar)
                                 cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
-                                if cutlass.const_expr((FAGP_ & 1) == 0 and (FAGP_ & 64) != 0):
+                                if cutlass.const_expr((FAGP_ & 1) == 0):
                                     for kb in cutlass.range(D // 16, unroll=1):
-                                        mma_f.set(tcgen05.Field.ACCUMULATE, kb != 0)
+                                        mma_fts.set(tcgen05.Field.ACCUMULATE, kb != 0)
                                         cute.gemm(
-                                            mma_f,
+                                            mma_fts,
                                             t_g1,
-                                            a_w[None, None, kb, wbuf],
+                                            t_wa[None, None, kb],
                                             b_fa[None, None, kb, inst],
                                             t_g1,
                                         )
-                                if cutlass.const_expr((FAGP_ & 1) == 0 and (FAGP_ & 64) == 0):
-                                    mma_f.set(tcgen05.Field.ACCUMULATE, False)
-                                    for kb in cutlass.range_constexpr(D // 16):
-                                        cute.gemm(
-                                            mma_f,
-                                            t_g1,
-                                            a_w[None, None, kb, wbuf],
-                                            b_fa[None, None, kb, inst],
-                                            t_g1,
-                                        )
-                                        mma_f.set(tcgen05.Field.ACCUMULATE, True)
                                     with cute.arch.elect_one():
                                         tcgen05.commit(mb + MB_G1 + inst)
                                 else:
                                     with cute.arch.elect_one():
                                         cute.arch.mbarrier_arrive(mb + MB_G1 + inst)
                             cute.arch.mbarrier_wait(mb + MB_G1 + inst, pp_g1)
-                            for rp in cutlass.range(C // 16, unroll=1 if (FAGP_ & 32) else 2):
+                            if it == n_iters - 1:
+                                if plw == 0:
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive(mb + MB_WDONE)
+                            for rp in cutlass.range(C // 16, unroll=1):
                                 t_g1w = cute.make_tensor(
                                     cute.recast_ptr(
                                         p_g64 + inst * (C // 2) + rp * 8,
@@ -2814,28 +2818,6 @@ def _launch_pkd(
     tma_g, mG = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(), g, lg_qk, (C, 1, D)
     )
-    # gate input g1^T[128 ch, 32 tok] = W_fb[head] @ f_a[chunk]^T (SS, fp32 acc)
-    mma_f = cute.make_tiled_mma(
-        tcgen05.MmaF16BF16Op(
-            cutlass.BFloat16,
-            cutlass.Float32,
-            (BM, C, 16),
-            tcgen05.CtaGroup.ONE,
-            tcgen05.OperandSource.SMEM,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-        )
-    )
-    lay_w = sm100_utils.make_smem_layout_a(mma_f, (BM, C, D), cutlass.BFloat16, 2)
-    vmnk_f = cute.tiled_divide(cute.make_layout((1, 1, 1)), (mma_f.thr_id.shape,))
-    tma_w, mW = cute.nvgpu.make_tiled_tma_atom_A(
-        sm100_utils.cluster_shape_to_tma_atom_A((1, 1), mma_f.thr_id),
-        wfb,
-        cute.slice_(lay_w, (None, None, None, 0)),
-        (BM, C, D),
-        mma_f,
-        vmnk_f.shape,
-    )
     tma_fa, mFA = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(), fa, l3k_k, (C, 1, D)
     )
@@ -2871,7 +2853,6 @@ def _launch_pkd(
         mma_4a,
         mma_4b,
         mma_g,
-        mma_f,
         tma_q,
         mQ,
         tma_k,
@@ -2880,8 +2861,7 @@ def _launch_pkd(
         mG,
         tma_fa,
         mFA,
-        tma_w,
-        mW,
+        wfb,
         tma_b,
         mB,
         tma_v,
@@ -2922,7 +2902,6 @@ def _launch_pkd(
         lay_inv,
         lay_ft,
         lay_v,
-        lay_w,
         H_,
         TPROBE_,
         GATE2_,
