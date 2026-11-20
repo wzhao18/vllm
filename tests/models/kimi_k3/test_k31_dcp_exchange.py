@@ -107,6 +107,16 @@ def make_logits(case: str, T: int, G: torch.Tensor, gen: torch.Generator, device
         x = torch.where(sampled[None, :], torch.exp2(u - 4), torch.exp2(u - 20))
         x = torch.where(mid, 16.0 * (1 + u), x)
         x = torch.where(hi[None, :], torch.exp2(20 + u), x)
+    elif case == "sample_dense":
+        # every sampled key high (one octave), the rest octaves lower: the sample bound
+        # theta admits ~100 keys per rank (< q); the hot path re-thresholds from the SMEM
+        # row (no radix tier, no complete body)
+        pos = torch.arange(Gmax, device=device)
+        il, w = INTERLEAVE_CUR[0], WORLD[0]
+        g = ((pos // (il * w)) * il + pos % il) // 8
+        sampled = (g % 8) == ((g // 8) % 8)
+        u = torch.rand(T, Gmax, generator=gen, device=device)
+        x = torch.where(sampled[None, :], torch.exp2(10 + u), torch.exp2(u - 20))
     elif case == "neg":
         x = -torch.abs(x) * 100
     else:
@@ -207,11 +217,14 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
         if not (torch.equal(o2[:, :K], out[:, :K]) and torch.equal(c2, cnt)):
             nd = int(((o2[:, :K] != out[:, :K]).any(1) | (c2 != cnt)).sum())
             errs.append(f"topk_v2 differs from topk_merge in {nd} rows")
-    if case == "sample_high":
+    if case in ("sample_high", "sample_dense"):
         d = (V2_STATS[0] - v2_before).tolist()
-        # the hot path rebases (7) and stays on round 1: no radix (3), no full-pass message (5)
-        if d[7] == 0 or d[3] or d[5]:
-            errs.append(f"topk_v2 sample_high: rebase {d[7]} radix {d[3]} full-pass {d[5]}")
+        # the hot path rebases (7) / re-thresholds (6) and stays off the radix tier (3) and
+        # the full-pass message (5)
+        hot = d[7] if case == "sample_high" else d[6]
+        if hot == 0 or d[3] or d[5]:
+            errs.append(f"topk_v2 {case}: rebase {d[7]} rethreshold {d[6]} radix {d[3]} "
+                        f"full-pass {d[5]}")
 
     # ---- reference: K largest keys, ties by ascending global id
     fk = keys_of(full)
@@ -625,6 +638,7 @@ def main():
         ("ties", 4, 4, 50_000),
         ("neg", 2, 8, 30_000),
         ("sample_high", 1, 4, 24_000),  # topk_v2 fine range rebased down (hot path)
+        ("sample_dense", 1, 4, 24_000),  # topk_v2 sample bound too high (hot path)
         ("short", 8, 4, 4000),
         ("edge", 4, 4, 4000),
         ("normal", 64, 4, 190_000),
