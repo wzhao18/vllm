@@ -217,16 +217,13 @@ def main():
             tot["clip:" + k] = tot.get("clip:" + k, 0.0) + (s1 - c0) / args.iters
         return {k: round(v / 1e3, 3) for k, v in sorted(tot.items())}
 
-    if args.percall:
+    for pd in [int(x) for x in args.depths.split(",")] if args.percall else []:
+        attn_res_lp.RING_DEPTH = pd
         st = State(bool(args.dielocal))
         for c in calls:
             run_lp(st, c)
         torch.cuda.synchronize()
         groups = {}
-        for c in calls:
-            if c["c"] == 0:
-                for c2 in calls[:1]:
-                    pass
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             st = State(bool(args.dielocal))
             for c in calls:
@@ -243,7 +240,7 @@ def main():
             g[0] += 1
             g[1] += e.time_range.elapsed_us()
         for k, (n, us, rows) in sorted(groups.items()):
-            print(json.dumps({"call": k, "n": n, "us": round(us / n, 1),
+            print(json.dumps({"depth": pd, "call": k, "n": n, "us": round(us / n, 1),
                               "TBps": round(rows * T * H * 2 / (us / n) / 1e6, 2)}))
 
     def lp_arm(qa, pdl):
