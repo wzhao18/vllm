@@ -78,6 +78,7 @@ __device__ __forceinline__ float mfill(int n, float x) {
 // one chain hidden by the other. TMEM per chain c: S 128 | U 64 | OUT 64 at c*256 (512 cols). INP (bf16 S image)
 // lives in smem (MMA1u/MMA1o are SS). bf16 U legs (stock: v_new cast to bf16 before h += k^T v and o += A v).
 // warps 0-7 chain groups (c = warp>>2, issuer = first warp), 8-15 prep groups, 16-19 shared epilogue, 20 loader.
+// flags: 2048 loader issues from 4 lanes (one tensor each)
 // flags: 2 no out stores | 4 no pass | 8 no MMAs | 16 ideal prep (no image writes) | 64 no HBM loads
 __global__ void __launch_bounds__(NTHR, 1) skel(const __grid_constant__ Maps maps, Args A) {
   extern __shared__ __align__(1024) unsigned char smem[];
@@ -283,6 +284,19 @@ __global__ void __launch_bounds__(NTHR, 1) skel(const __grid_constant__ Maps map
     for (int j = 0; j < steps * 8; ++j) {
       const int r = j % NRAW, t = j >> 3, c = (j >> 2) & 1, qq = j & 3;
       if (j >= NRAW) mwait(MB(5 + r), ((j - NRAW) / NRAW) & 1);         // RAW_FREE
+      if (fl & 2048) {
+        // 4 issuing lanes (one tensor each): hw51b/04-tma: one issuing thread caps a ring at ~0.4 us per op
+        if ((fl & 64) && j >= NRAW) { if (lane == 0) arrive(MB(r)); }
+        else {
+          if (lane == 0) asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(MB(r)), "r"(RAWQ_B) : "memory");
+          __syncwarp();
+          if (lane < 4) {
+            const int tk = tok0(t) + qq * 16;
+            asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+                         :: "r"(raw + r * RAWQ_B + lane * 4096), "l"((uint64_t)&maps.in[lane]), "r"(0), "r"(headc(c)), "r"(tk), "r"(MB(r)) : "memory");
+          }
+        }
+      } else
       if (lane == 0) {
         if ((fl & 64) && j >= NRAW) arrive(MB(r));
         else {

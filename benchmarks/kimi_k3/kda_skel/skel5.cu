@@ -10,6 +10,7 @@
 // flags: 1024 stock-precision U legs: chain group converts U fp32 -> bf16 in place (stock casts v_new to bf16 before
 //   h += k^T v_new and o += A v_new), MMA4 / OUT intra become kind::f16 K16 (4 instr each, half the tf32 tensor time)
 // flags: 256 U double buffer (U1 at TMEM col 448; issuer A drops its OFIN(t-1) wait) | 512 packed (b32) out stores
+// flags: 2048 loader issues from 4 lanes (one tensor each)
 // flags: 2 no out stores | 4 no pass | 8 no MMAs | 16 ideal prep (no image writes) | 64 no HBM loads
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -332,6 +333,19 @@ __global__ void __launch_bounds__(NTHR, 1) skel(const __grid_constant__ Maps map
     for (int j = 0; j < 2 * steps; ++j) {
       const int r = j % 3;
       if (j >= 3) mwait(MB(3 + r), ((j - 3) / 3) & 1);                   // RAW_FREE[r]
+      if (fl & 2048) {
+        // 4 issuing lanes (one tensor each): hw51b/04-tma: one issuing thread caps a ring at ~0.4 us per op
+        if ((fl & 64) && j >= NRAW) { if (lane == 0) arrive(MB(r)); }
+        else {
+          if (lane == 0) asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(MB(r)), "r"(RAWH_B) : "memory");
+          __syncwarp();
+          if (lane < 4) {
+            const int tk = tok0(j >> 1) + (j & 1) * 32;
+            asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+                         :: "r"(raw + r * RAWH_B + lane * 8192), "l"((uint64_t)&maps.in[lane]), "r"(0), "r"(head), "r"(tk), "r"(MB(r)) : "memory");
+          }
+        }
+      } else
       if (lane == 0) {
         if ((fl & 64) && j >= 3) arrive(MB(r));
         else {
