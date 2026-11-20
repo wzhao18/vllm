@@ -63,7 +63,7 @@ SHARED = ("shared_gu", "shared_down")
 # 3902.8 us per 24-layer step (-65 us). n64 (64.64.2.6; 1 GPU 10.11 vs 9.74, but the
 # weights stream during the reduce in-step): r16 4639.5 -> 4605.8 (-34), r8 with both
 # -68.5 (another node), r24 unchanged.
-ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6"}
+ROUTER_LATENT = {"*": "25-40:64.32.2.9,41-72:64.64.2.6,73-96:64.96.2.5"}
 
 
 class SplitKFront:
